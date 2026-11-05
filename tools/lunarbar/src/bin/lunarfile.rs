@@ -54,6 +54,7 @@ use lunarbar::keys::{
 use lunarbar::list::{inside_rect, move_selection, row_at_geom, scroll_top, Step};
 use lunarbar::look::Look;
 use lunarbar::open;
+use lunarbar::preview::{self, Body};
 use lunarbar::proc::{self, free_buffer, map_shm_pool, spawn_detached, BUFFERS};
 use wayland_client::{
     protocol::{
@@ -167,7 +168,7 @@ fn palette(look: Look) -> &'static Palette {
 
 // ── geometry ─────────────────────────────────────────────────────────────────
 
-const PANEL_W: i32 = 860;
+const PANEL_W: i32 = 1120;
 const MIN_PANEL_W: i32 = 360;
 /// The path header.
 const HEAD_H: i32 = 32;
@@ -188,6 +189,13 @@ const COLS_H: i32 = 20;
 const RAIL_W: i32 = 168;
 const RAIL_MIN_PANEL: i32 = 620;
 const PLACE_H: i32 = 28;
+/// The preview column, right of the list, on a panel wide enough to give it
+/// up: see `preview_w`.
+const PREVIEW_W: i32 = 272;
+const PREVIEW_MIN_PANEL: i32 = 900;
+/// The rows a panel with a preview is tall enough for, however few the
+/// folder holds, so a picture or a text has somewhere to show.
+const PREVIEW_ROWS: usize = 10;
 /// The checkbox column `--multiple` puts in front of every row.
 const CHECK_W: i32 = 20;
 /// The footer's buttons in the choosers.
@@ -438,6 +446,9 @@ struct State {
     rows_shown: usize,
     scroll_acc: f64,
     done: bool,
+    /// What the preview column shows, read once per selection: the entry
+    /// it is of and the box its picture was scaled for (see `preview`).
+    preview: std::cell::RefCell<Option<(String, (u32, u32), preview::Preview)>>,
 }
 
 impl State {
@@ -951,7 +962,8 @@ fn panel_rect(w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
     // cross over in exactly that case, and it panics then.
     let roomy = PANEL_W.min(w - 96).max(MIN_PANEL_W);
     let pw = roomy.min(w.max(1));
-    let shown = rows.clamp(1, MAX_ROWS) as i32;
+    let least = if preview_w(pw) > 0 { PREVIEW_ROWS } else { 1 };
+    let shown = rows.clamp(least, MAX_ROWS) as i32;
     let want = PAD + HEAD_H + FIELD_H + PAD + COLS_H + shown * ROW_H + FOOT_H + PAD;
     // A short output caps the height, so the panel never hangs off an edge.
     let ph = want.min((h - 48).max(PAD * 2 + HEAD_H + FIELD_H + ROW_H + FOOT_H));
@@ -989,6 +1001,145 @@ fn rail_w(pw: i32) -> i32 {
         RAIL_W
     } else {
         0
+    }
+}
+
+/// The preview column's width in a panel `pw` wide: none on a narrow one,
+/// where the list would be what paid for it.
+fn preview_w(pw: i32) -> i32 {
+    if pw >= PREVIEW_MIN_PANEL {
+        PREVIEW_W
+    } else {
+        0
+    }
+}
+
+/// The path the preview is of: the selected entry, or on `..` (and in an
+/// empty folder) the folder itself, so the column says what is here.
+fn selected_path(st: &State) -> Option<String> {
+    match st.rows.get(st.sel) {
+        Some(Row::Entry(i)) => Some(files::join_child(&st.dir, &st.entries.get(*i)?.name)),
+        _ => Some(st.dir.clone()),
+    }
+}
+
+/// Paint the preview column at `x`, `y`, `w` x `h`: the selected entry's
+/// name, what it holds in a framed box, and its details under it.
+fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
+    let p = st.pal;
+    let hud = st.look == Look::Tecno;
+    let rad = |r: i32| if hud { 0 } else { r };
+    cv.text(if hud { "VISTA PREVIA" } else { "Vista previa" }, x + 8, y + 2, p.dim);
+    let line = GLYPH_H + 4;
+    let info_h = 4 * line + 4;
+    let (bx, by) = (x, y + GLYPH_H + 10 + line + 4);
+    let (bw, bh) = (w, (y + h - info_h - 8 - by).max(line));
+    let chars = |px: i32| ((px / GLYPH_W).max(1)) as usize;
+    let Some(path) = selected_path(st) else { return };
+    let want = ((bw - 16).max(1) as u32, (bh - 16).max(1) as u32);
+    {
+        let mut cache = st.preview.borrow_mut();
+        if !cache.as_ref().is_some_and(|(at, b, _)| *at == path && *b == want) {
+            *cache = Some((path.clone(), want, preview::of(&path, want.0, want.1)));
+        }
+    }
+    let cache = st.preview.borrow();
+    let Some((_, _, pv)) = cache.as_ref() else { return };
+
+    // The name, the way the list writes it.
+    let nc = if pv.is_dir && hud { GOLD } else { p.text };
+    cv.text_bold(&files::elide_middle(&pv.name, chars(w - 16)), x + 8, y + GLYPH_H + 10, nc);
+
+    // The box.
+    cv.round_rect(bx, by, bw, bh, rad(6), p.border);
+    cv.round_rect(bx + 1, by + 1, bw - 2, bh - 2, rad(5), p.field);
+    if hud {
+        cv.brackets(bx, by, bw, bh, 6, 1, p.accent);
+    }
+    let (ix, iy) = (bx + 8, by + 8);
+    let rows_fit = ((bh - 16) / (GLYPH_H + 2)).max(1) as usize;
+    match &pv.body {
+        Body::Image { pm, .. } => {
+            let px = bx + (bw - pm.width() as i32) / 2;
+            let py = by + (bh - pm.height() as i32) / 2;
+            cv.pixmap(px, py, pm);
+        }
+        Body::Text { lines, more } => {
+            let n = lines.len().min(rows_fit);
+            for (k, l) in lines.iter().take(n).enumerate() {
+                let s: String = l.chars().take(chars(bw - 16)).collect();
+                let last = k + 1 == n && (*more || lines.len() > n);
+                let c = if last { p.dim } else { p.text };
+                cv.text(if last { "..." } else { &s }, ix, iy + k as i32 * (GLYPH_H + 2), c);
+            }
+        }
+        Body::Dir { names, dirs, files: nf, .. } => {
+            let total = dirs + nf;
+            let n = names.len().min(rows_fit);
+            for (k, (name, d)) in names.iter().take(n).enumerate() {
+                let ly = iy + k as i32 * (GLYPH_H + 2);
+                let last = k + 1 == n && total > n;
+                if last {
+                    cv.text(&format!("+{} más", total - k), ix, ly, p.dim);
+                    break;
+                }
+                let c = if *d { if hud { GOLD } else { p.accent } } else { p.text };
+                if *d {
+                    cv.triangle_h(ix, ly + 4, 7, false, c);
+                }
+                cv.text(&files::elide_middle(name, chars(bw - 32)), ix + 12, ly, c);
+            }
+            if names.is_empty() {
+                let s = if total == 0 { "Carpeta vacía" } else { "Sólo ocultos" };
+                cv.text(s, bx + (bw - Canvas::text_width(s)) / 2, by + (bh - GLYPH_H) / 2, p.dim);
+            }
+        }
+        Body::Plain | Body::Unreadable => {
+            let s = 40;
+            let c = kind_color(pv.kind, p);
+            let cy = by + (bh - s - GLYPH_H - 12) / 2;
+            file_icon(cv, bx + (bw - s) / 2, cy, s, c);
+            let label = if matches!(pv.body, Body::Unreadable) {
+                "No se puede leer"
+            } else {
+                "Sin vista previa"
+            };
+            let lc = if matches!(pv.body, Body::Unreadable) { WARN } else { p.dim };
+            cv.text(label, bx + (bw - Canvas::text_width(label)) / 2, cy + s + 12, lc);
+        }
+    }
+
+    // The details: what it is and weighs, what it holds or measures, when
+    // it changed, who may touch it. Permissions keep their case in tecno:
+    // `RW-R--R--` is not how anyone reads them.
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut info: Vec<(String, bool)> = Vec::new();
+    match &pv.body {
+        Body::Dir { dirs, files: nf, bytes, more, .. } => {
+            info.push((format!("Carpeta · {}", files::human_size(*bytes)), true));
+            let plus = if *more { "+" } else { "" };
+            info.push((format!("{}{plus} · {}", plural(*dirs, "carpeta", "carpetas"), plural(*nf, "archivo", "archivos")), true));
+        }
+        Body::Image { w, h, .. } => {
+            info.push((format!("{} · {}", preview::kind_label(pv.kind, pv.is_dir), files::human_size(pv.size)), true));
+            info.push((format!("{w} × {h} px"), true));
+        }
+        _ => info.push((format!("{} · {}", preview::kind_label(pv.kind, pv.is_dir), files::human_size(pv.size)), true)),
+    }
+    if let Some(t) = pv.mtime {
+        let now = files::now_secs();
+        info.push((format!("Modificado {}", files::short_date(t, now, files::local_offset(now))), true));
+    }
+    let mut perm = pv.mode.clone().unwrap_or_default();
+    if let Some(l) = &pv.link {
+        perm = format!("{perm} → {l}");
+    }
+    info.push((perm, false));
+    let iy = y + h - info_h;
+    for (k, (s, caps)) in info.iter().enumerate() {
+        let s = files::elide_middle(s, chars(w - 16));
+        let s = if hud && *caps { s.to_uppercase() } else { s };
+        cv.text(&s, x + 8, iy + k as i32 * line, if k == 0 { p.text } else { p.dim });
     }
 }
 
@@ -1172,7 +1323,13 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
 
     // ── the list column: field, column titles, rows ──
     let lx = px + PAD + rail;
-    let lw = inner - rail;
+    let prev = preview_w(pw);
+    let lw = inner - rail - prev;
+    if prev > 0 {
+        let vx = lx + lw + 12;
+        cv.fill_rect_a(vx - 6, body_y, 1, foot_y - body_y - 6, p.border, 0.8);
+        draw_preview(cv, st, vx, body_y, prev - 12, foot_y - body_y - 8);
+    }
 
     let field_y = body_y;
     let field_c = if st.armed() { WARN } else { p.border };
@@ -1888,6 +2045,7 @@ fn new_state(cli: &Cli) -> State {
         rows_shown: MAX_ROWS,
         scroll_acc: 0.0,
         done: false,
+        preview: Default::default(),
     };
     let start = match cli.dir.as_deref() {
         Some(d) => files::normalize_dir(d),
@@ -1953,7 +2111,13 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let st = new_state(&cli);
+        let mut st = new_state(&cli);
+        // LUNARFILE_DUMP_SEL=name: the frame with that entry selected.
+        if let Ok(name) = std::env::var("LUNARFILE_DUMP_SEL") {
+            if let Some(r) = st.rows.iter().position(|r| matches!(r, Row::Entry(i) if st.entries[*i].name == name)) {
+                st.sel = r;
+            }
+        }
         // try_new, not new: refusing beats aborting (`panic = "abort"`).
         let Some(mut cv) = Canvas::try_new(w, h) else {
             eprintln!("lunarfile: cannot allocate a {w}x{h} canvas");
@@ -2306,10 +2470,18 @@ mod tests {
 
     #[test]
     fn the_panel_grows_one_row_at_a_time_up_to_the_row_cap() {
+        // On a panel too narrow for the preview column, from a single row.
+        let narrow = |rows| panel_rect(960, 1080, rows).3;
+        assert_eq!(preview_w(panel_rect(960, 1080, 1).2), 0);
+        assert_eq!(narrow(2), narrow(1) + ROW_H);
+        assert_eq!(narrow(5), narrow(1) + 4 * ROW_H);
+        // With the preview, from the rows it needs to show a picture or a
+        // text, however few the folder holds.
         let tall = |rows| panel_rect(1920, 1080, rows).3;
+        assert!(preview_w(panel_rect(1920, 1080, 1).2) > 0);
         let one = tall(1);
-        assert_eq!(tall(2), one + ROW_H);
-        assert_eq!(tall(5), one + 4 * ROW_H);
+        assert_eq!(tall(PREVIEW_ROWS), one);
+        assert_eq!(tall(PREVIEW_ROWS + 2), one + 2 * ROW_H);
         // Past the cap it stops growing and the list scrolls instead.
         assert_eq!(tall(MAX_ROWS), tall(MAX_ROWS + 1));
         assert_eq!(tall(MAX_ROWS), tall(5000));

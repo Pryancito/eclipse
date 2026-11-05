@@ -47,6 +47,7 @@ pub mod meter;
 pub mod obmenu;
 pub mod open;
 pub mod par;
+pub mod preview;
 pub mod proc;
 pub mod sysinfo;
 pub mod vtext;
