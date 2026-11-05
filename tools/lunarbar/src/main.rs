@@ -63,6 +63,7 @@ mod hunter_menu;
 mod info;
 mod launcher;
 mod taskmenu;
+mod powermenu;
 use launcher::Row;
 use info::*;
 mod workspaces;
@@ -577,8 +578,9 @@ enum PopupKind {
     },
     /// The month calendar, opened from the clock (bottom) or date (top) pill.
     Calendar { year: i32, month: u32 },
-    /// Power / Session menu popup.
-    PowerMenu,
+    /// Power / Session menu popup: the lit row, and the row waiting for
+    /// its confirming second press ([`powermenu`]).
+    PowerMenu { sel: usize, armed: Option<Action> },
     /// Right-click context menu for one window, keyed by its foreign-toplevel
     /// protocol id (never a list index — the window can close while the menu
     /// is open, and an index would then act on whoever took its slot).
@@ -1453,11 +1455,11 @@ impl State {
 
     /// Power button click: toggle the session power menu.
     fn toggle_power(&mut self, qh: &QueueHandle<State>, at_top: bool) {
-        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu)) {
+        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu { .. })) {
             self.close_popup();
             return;
         }
-        self.open_popup(qh, PopupKind::PowerMenu, at_top);
+        self.open_popup(qh, PopupKind::PowerMenu { sel: 0, armed: None }, at_top);
     }
 
     /// Right click on window button: toggle task context menu.
@@ -1495,7 +1497,7 @@ impl State {
         let (x0, x1) = match kind {
             PopupKind::Apps { .. } => bar.launcher_hit,
             PopupKind::Calendar { .. } => bar.clock_hit,
-            PopupKind::PowerMenu => bar.power_hit,
+            PopupKind::PowerMenu { .. } => bar.power_hit,
             PopupKind::Volume { .. } => bar.vol_hit,
             PopupKind::Hunter(_) => bar.hunter_hit,
             PopupKind::TaskMenu { tid, .. } => bar
@@ -1868,21 +1870,8 @@ impl State {
             }
             Some(Action::PrevMonth) => self.cal_shift(qh, -1),
             Some(Action::NextMonth) => self.cal_shift(qh, 1),
-            Some(Action::PowerLock) => {
-                self.close_popup();
-                self.spawn("eclipse-lock || swaylock || lock");
-            }
-            Some(Action::PowerLogout) => {
-                self.close_popup();
-                self.spawn("labwc --exit || killall labwc || pkill labwc");
-            }
-            Some(Action::PowerReboot) => {
-                self.close_popup();
-                self.request_power(true);
-            }
-            Some(Action::PowerShutdown) => {
-                self.close_popup();
-                self.request_power(false);
+            Some(a @ (Action::PowerLock | Action::PowerLogout | Action::PowerReboot | Action::PowerShutdown)) => {
+                self.power_act(qh, a)
             }
             Some(
                 a @ (Action::TaskFocus(_)
@@ -1934,6 +1923,15 @@ impl State {
                 if *sel != r {
                     *sel = r;
                     changed = true;
+                }
+            }
+            if let (PopupKind::PowerMenu { sel, armed }, Some(a)) = (&mut popup.kind, hit) {
+                if let Some(r) = powermenu::ROWS.iter().position(|&x| x == a) {
+                    if std::mem::replace(sel, r) != r {
+                        // Moving off an armed row disarms it.
+                        *armed = None;
+                        changed = true;
+                    }
                 }
             }
             if let (PopupKind::TaskMenu { tid, win, sel, .. }, Some(a)) = (&mut popup.kind, hit) {
@@ -1991,6 +1989,7 @@ impl State {
             Cal(i32),
             Render,
             Task(Action),
+            Power(Action),
         }
         let mut act = Do::Nothing;
         if let Some(popup) = self.popup.as_mut() {
@@ -2064,6 +2063,26 @@ impl State {
                         *scroll = *sel + 1 - rows_fit;
                     }
                 }
+                PopupKind::PowerMenu { sel, armed } => {
+                    let n = powermenu::ROWS.len();
+                    match key {
+                        KEY_ESC_WL if armed.is_some() => *armed = None,
+                        KEY_ESC_WL => act = Do::Close,
+                        KEY_UP_WL => {
+                            *sel = sel.saturating_sub(1);
+                            *armed = None;
+                        }
+                        KEY_DOWN_WL | KEY_TAB_WL => {
+                            *sel = (*sel + 1).min(n - 1);
+                            *armed = None;
+                        }
+                        KEY_ENTER_WL | KEY_KPENTER_WL => act = Do::Power(powermenu::ROWS[(*sel).min(n - 1)]),
+                        _ => {}
+                    }
+                    if matches!(act, Do::Nothing) {
+                        act = Do::Render;
+                    }
+                }
                 PopupKind::TaskMenu { tid, win, sel, .. } => {
                     let items = taskmenu::items(*tid, *win);
                     match key {
@@ -2095,6 +2114,7 @@ impl State {
             Do::Nothing => {}
             Do::Close => self.close_popup(),
             Do::Task(a) => self.task_act(a),
+            Do::Power(a) => self.power_act(qh, a),
             Do::Launch(cmd) => {
                 self.close_popup();
                 self.spawn(&cmd);
@@ -2863,7 +2883,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
             7 * CAL_CELL_W + 2 * CAL_PAD,
             CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD,
         ),
-        PopupKind::PowerMenu => (180, 160),
+        PopupKind::PowerMenu { .. } => powermenu::size(),
         PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
         PopupKind::Volume { .. } => (180, 80),
         PopupKind::Hunter(_) => hunter_menu::size(),
@@ -2936,7 +2956,9 @@ fn draw_popup(
             draw_apps(cv, px, py, pw, ph, all, visible, *cat, filter, *sel, *scroll, icons)
         }
         PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
-        PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
+        PopupKind::PowerMenu { sel, armed } => {
+            powermenu::draw(cv, px, py, pw, *sel, *armed, sysinfo::uptime().as_deref())
+        }
         PopupKind::TaskMenu { tid, title, win, sel } => taskmenu::draw(cv, px, py, pw, *tid, title, *win, *sel),
         PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
         PopupKind::Hunter(m) => hunter_menu::draw(cv, px, py, pw, ph, m),
@@ -3158,54 +3180,6 @@ fn draw_calendar(
 }
 
 // ── Power menu drawing ───────────────────────────────────────────────────────
-
-fn draw_power_menu(
-    cv: &mut Canvas,
-    px: i32,
-    py: i32,
-    pw: i32,
-    ph: i32,
-) -> Vec<(i32, i32, i32, i32, Action)> {
-    draw_panel(cv, px, py, pw, ph, 10);
-    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
-
-    let items = [
-        (i18n::Lang::current().power_lock(), Action::PowerLock),
-        (i18n::Lang::current().power_logout(), Action::PowerLogout),
-        (i18n::Lang::current().power_reboot(), Action::PowerReboot),
-        (
-            i18n::Lang::current().power_shutdown(),
-            Action::PowerShutdown,
-        ),
-    ];
-
-    let row_h = 34;
-    let mut hits = Vec::new();
-    let y0 = py + 12;
-
-    for (i, (label, act)) in items.iter().enumerate() {
-        let ry = y0 + i as i32 * row_h;
-        let ix = px + 16;
-        let iy = ry + (row_h - 14) / 2;
-        let tx = px + 42;
-        let ty = ry + (row_h - GLYPH_H) / 2;
-
-        // Tecno: the glyphs are dim instruments, and shutdown is the one in
-        // warn orange, like the bar's power button.
-        let (ic, off) = if tecno() { (pal().dim, pal().warn) } else { (pal().white, pal().white) };
-        match act {
-            Action::PowerLock => cv.lock_icon(ix, iy, 14, ic),
-            Action::PowerLogout => cv.exit_icon(ix, iy, 14, ic),
-            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, ic),
-            Action::PowerShutdown => cv.power_icon(ix, iy, 14, off),
-            _ => {}
-        }
-        cv.text(label, tx, ty, pal().text);
-        hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
-    }
-
-    hits
-}
 
 // ── Volume control popup drawing ─────────────────────────────────────────────
 
@@ -4412,9 +4386,12 @@ fn main() {
                 let (px, py, pw, _) = place(&PopupKind::TaskMenu { tid: 0, title: String::new(), win, sel }, true);
                 taskmenu::draw(&mut cv, px + 120, py, pw, 0, "foot · root@eclipse: ~", win, sel);
             } else if want_power {
-                let k = PopupKind::PowerMenu;
-                let (px, py, pw, ph) = place(&k, false);
-                draw_power_menu(&mut cv, px, py, pw, ph);
+                // LUNARBAR_DUMP_POWER=n lights row n; LUNARBAR_DUMP_POWER_ARMED arms it.
+                let sel = std::env::var("LUNARBAR_DUMP_POWER").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize).min(3);
+                let armed = std::env::var("LUNARBAR_DUMP_POWER_ARMED").is_ok().then_some(powermenu::ROWS[sel]);
+                let k = PopupKind::PowerMenu { sel, armed };
+                let (px, py, pw, _) = place(&k, false);
+                powermenu::draw(&mut cv, px, py, pw, sel, armed, Some("3h 12m"));
             } else if want_toast {
                 hunter_toast::draw_preview(&mut cv, w as i32, full_h as i32 - bh as i32);
             } else if want_hunter {
