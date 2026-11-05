@@ -103,10 +103,22 @@ fn write_theme(rootfs: &Path) {
 /// The window buttons of the "Orbital HUD" mockup: a 1px square with the
 /// glyph inside it. Generated once and vendored under `xtask/assets`.
 const BUTTONS: &[(&str, &[u8])] = &[
-    ("close.xbm", include_bytes!("../../../assets/tecno-buttons/close.xbm")),
-    ("iconify.xbm", include_bytes!("../../../assets/tecno-buttons/iconify.xbm")),
-    ("max.xbm", include_bytes!("../../../assets/tecno-buttons/max.xbm")),
-    ("max_toggled.xbm", include_bytes!("../../../assets/tecno-buttons/max_toggled.xbm")),
+    (
+        "close.xbm",
+        include_bytes!("../../../assets/tecno-buttons/close.xbm"),
+    ),
+    (
+        "iconify.xbm",
+        include_bytes!("../../../assets/tecno-buttons/iconify.xbm"),
+    ),
+    (
+        "max.xbm",
+        include_bytes!("../../../assets/tecno-buttons/max.xbm"),
+    ),
+    (
+        "max_toggled.xbm",
+        include_bytes!("../../../assets/tecno-buttons/max_toggled.xbm"),
+    ),
 ];
 
 /// `foot.tecno.ini`, which `eclipse-look` copies over `foot.ini` when the
@@ -197,7 +209,10 @@ mod tests {
             assert!(xbm.contains(&format!("#define {name}_height 16")), "{name}");
             // The first two bytes are the top row of the frame: all set.
             let first = xbm.split('{').nth(1).unwrap();
-            assert!(first.trim_start().starts_with("0xff, 0xff"), "{name} has no frame");
+            assert!(
+                first.trim_start().starts_with("0xff, 0xff"),
+                "{name} has no frame"
+            );
         }
         let rc = fs::read_to_string(dir.join("themerc")).unwrap();
         assert!(rc.contains("window.active.button.close.unpressed.image.color: #ff8a5c"));
