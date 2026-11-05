@@ -150,6 +150,12 @@
  *       that stack, did not get its own thread area in the slot it named,
  *       or its CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID words were not
  *       written and cleared --- the whole shape of a `pthread_create`
+ *   116 the robust list of a 32-bit thread: set_robust_list (311) refused
+ *       the twelve bytes this ABI's head is or took the native
+ *       twenty-four, get_robust_list (312) answered the wrong head or
+ *       wrote more than the two four-byte words it has room for, or a
+ *       thread that died holding a lock left it owned by a thread that no
+ *       longer exists
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3911,6 +3917,133 @@ spin91b:
 	jmp	bad_thread
 done91:
 
+	/* Step 92 (code 116): the robust list of a 32-bit thread, and what
+	 * happens to a lock whose owner dies.
+	 *
+	 * A robust mutex is the one thing in pthreads that needs the KERNEL
+	 * to notice a thread's death: the dying thread's list is walked, each
+	 * lock's word is marked `FUTEX_OWNER_DIED` and a waiter is woken, so
+	 * the next `pthread_mutex_lock` gets `EOWNERDEAD` instead of
+	 * blocking forever. Both glibc and musl register a list for every
+	 * thread they create, so this call is not a corner --- it is on the
+	 * path of every threaded program there is.
+	 *
+	 * Its structure is three words, and in this ABI a word is four bytes:
+	 *
+	 *   struct robust_list_head { void *list; long futex_offset;
+	 *                             void *list_op_pending; };
+	 *
+	 * so the head is TWELVE bytes, and `set_robust_list` takes that
+	 * length as an argument and refuses any other. The native head is
+	 * twenty-four, which is why the two calls refuse each other's length
+	 * and why the number cannot simply be forwarded: a kernel that
+	 * forwards it answers EINVAL to the only length a 32-bit libc ever
+	 * passes.
+	 *
+	 * The parent registers an EMPTY list of its own --- `list` pointing
+	 * back at the head, which is how both libcs initialise one --- and
+	 * reads it back through 312, whose two out-parameters are four bytes
+	 * each: the guard word after the length is what catches a kernel
+	 * writing a native `size_t` there, over whatever the caller keeps
+	 * next.
+	 *
+	 * Then a thread takes a lock and dies holding it. `futex_offset` is
+	 * NEGATIVE, as it is in both libcs --- the lock word sits before the
+	 * list node inside `pthread_mutex_t` --- and as a 32-bit `long` it is
+	 * `0xfffffffc`: read as a 64-bit quantity it would put the word four
+	 * gigabytes past the lock, which is the single most likely way for
+	 * this to go wrong without anything reporting it. */
+	movl	$rlp92, rlp92 + 0	/* an empty list: its own head */
+	movl	$-4, rlp92 + 4
+	movl	$0, rlp92 + 8
+	movl	$rlp92, %ebx
+	movl	$12, %ecx
+	movl	$311, %eax
+	int	$0x80
+	testl	%eax, %eax
+	jne	bad_robust
+	/* And the native length is refused: -EINVAL, which is -22. */
+	movl	$rlp92, %ebx
+	movl	$24, %ecx
+	movl	$311, %eax
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_robust
+	/* The refusal left the registration alone: 312 still answers the
+	 * head that was accepted, in four bytes, with the length of THIS
+	 * ABI's head. */
+	movl	$0xdeadbeef, gout92
+	movl	$0xdeadbeef, glen92
+	movl	$0xdeadbeef, gguard92
+	xorl	%ebx, %ebx		/* pid 0: this thread */
+	movl	$gout92, %ecx
+	movl	$glen92, %edx
+	movl	$312, %eax
+	int	$0x80
+	testl	%eax, %eax
+	jne	bad_robust
+	movl	gout92, %eax
+	cmpl	$rlp92, %eax
+	jne	bad_robust
+	cmpl	$12, glen92
+	jne	bad_robust
+	cmpl	$0xdeadbeef, gguard92
+	jne	bad_robust
+
+	/* Now the thread. No `CLONE_SETTLS` and no `CLONE_PARENT_SETTID`
+	 * this time --- step 91 measured those --- but `CLONE_CHILD_CLEARTID`
+	 * stays, because the parent has no other way to know the thread is
+	 * really gone before it reads the lock word. */
+	movl	$0, gflag92
+	movl	$0, gset92
+	movl	$0, lock92
+	movl	$0xffffffff, ctid92
+	movl	$0x210f00, %ebx		/* VM FS FILES SIGHAND THREAD
+					   CHILD_CLEARTID, no signal */
+	movl	$stack92top, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$ctid92, %edi
+	movl	$120, %eax
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_robust
+	jz	thread92
+	movl	$100000000, %ecx
+spin92:
+	cmpl	$1, gflag92
+	je	ran92
+	decl	%ecx
+	jnz	spin92
+	jmp	bad_robust
+ran92:
+	/* The thread's own `set_robust_list` was answered. */
+	cmpl	$0, gset92
+	jne	bad_robust
+	/* It is gone: the kernel cleared the word it was asked to. */
+	movl	$100000000, %ecx
+spin92b:
+	cmpl	$0, ctid92
+	je	died92
+	decl	%ecx
+	jnz	spin92b
+	jmp	bad_robust
+died92:
+	/* And the lock it held says so: the owner is dead and its tid is
+	 * gone. `FUTEX_OWNER_DIED` is bit 30. Measured on Linux: a word that
+	 * held nothing but the owner's tid comes out as exactly
+	 * `0x40000000`. A kernel that never walked the list leaves the tid
+	 * there, and every later `pthread_mutex_lock` on it blocks for
+	 * ever. */
+	movl	$1000000, %ecx
+spin92c:
+	cmpl	$0x40000000, lock92
+	je	done92
+	decl	%ecx
+	jnz	spin92c
+	jmp	bad_robust
+done92:
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -4306,6 +4439,31 @@ thread91:
 	int	$0x80
 bad_thread:
 	movl	$115, %ebx
+	jmp	die
+
+/* The thread of step 92. It takes a lock --- a word it writes its own tid
+ * into, which is what `pthread_mutex_lock` leaves there --- registers the
+ * list that names it, and dies without releasing it. Everything after that
+ * is the kernel's. */
+thread92:
+	movl	$224, %eax		/* gettid: the owner this word names */
+	int	$0x80
+	movl	%eax, lock92
+	movl	$rlp92, node92		/* the last node: back to the head */
+	movl	$node92, rl92 + 0
+	movl	$-4, rl92 + 4		/* the lock word is BEFORE the node */
+	movl	$0, rl92 + 8
+	movl	$rl92, %ebx
+	movl	$12, %ecx
+	movl	$311, %eax
+	int	$0x80
+	movl	%eax, gset92
+	movl	$1, gflag92
+	movl	$1, %eax		/* exit, not exit_group */
+	xorl	%ebx, %ebx
+	int	$0x80
+bad_robust:
+	movl	$116, %ebx
 	jmp	die
 bad_oldsigaction:
 	movl	$114, %ebx
@@ -4995,3 +5153,40 @@ cbase91:
 stack91:
 	.space	8192
 stack91top:
+
+	/* Step 92's robust lists. Two heads: the parent's, which stays empty,
+	 * and the thread's, which names one node with the lock word four
+	 * bytes BEFORE it --- `lock92` immediately before `node92`, which is
+	 * what the negative `futex_offset` means and what makes the offset's
+	 * sign measurable. Each head is three four-byte words, which is this
+	 * ABI's `sizeof(*head)` and the length the call takes. */
+	.balign	4
+rlp92:
+	.long	0, 0, 0			/* the parent's, empty */
+	.balign	4
+rl92:
+	.long	0, 0, 0			/* the thread's */
+	.balign	4
+lock92:
+	.long	0			/* the futex word: node92 - 4 */
+node92:
+	.long	0			/* the only entry's `next` */
+	.balign	4
+gflag92:
+	.long	0
+gset92:
+	.long	0
+ctid92:
+	.long	0
+gout92:
+	.long	0
+glen92:
+	.long	0
+	/* Right after the length, so eight bytes written where four belong
+	 * are visible. */
+gguard92:
+	.long	0
+	.balign	16
+stack92:
+	.space	8192
+stack92top:
