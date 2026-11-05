@@ -25,7 +25,7 @@ pub(super) use impl_event_scheme;
 use alloc::sync::Arc;
 
 pub use audio::AudioScheme;
-pub use block::BlockScheme;
+pub use block::{BlockScheme, IoSnapshot, IoStats};
 pub use display::{set_scanout_mirror_x, DisplayScheme};
 pub use drm::{
     ComputeLaunchResult, DrmScheme, COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY,

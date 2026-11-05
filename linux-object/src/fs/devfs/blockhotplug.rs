@@ -181,6 +181,12 @@ pub fn recorded_name(block: &Arc<dyn BlockScheme>) -> Option<String> {
     name_of(&CREATED.lock(), block)
 }
 
+/// Todos los discos con nodo en `/dev`, con su nombre y su menor: lo que
+/// lista `/proc/diskstats`.
+pub fn recorded_disks() -> Vec<HotDisk> {
+    CREATED.lock().clone()
+}
+
 /// El nombre libre que le toca a un disco, por la convención de Linux.
 ///
 /// Se le pasan los nombres ya ocupados y el del driver, y cuenta hacia adelante

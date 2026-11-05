@@ -303,6 +303,7 @@ fn una_unidad_sin_dar_de_alta_sale_con_guion_y_con_disco_con_su_nombre() {
 
     // Lo que hace el alta: el controlador se queda la `Arc` del disco.
     let disco = Arc::new(UsbDisk {
+        io: crate::scheme::IoStats::new(),
         ctrl: Arc::downgrade(&dev),
         disk_id: dev.inner.lock().as_ref().expect("el controlador").mscs[0].disk_id,
         name: alloc::string::String::from("usbdisk7"),
