@@ -1,5 +1,7 @@
 # hunter — Eclipse OS in-kernel security subsystem
 
+**English** · [Español](hunter-security.es.md)
+
 `hunter` is a small in-kernel **security solution** for Eclipse OS that combines
 an **LSM-style enforcement layer** (mandatory policy checks at well-defined
 kernel hook points) with a **behavioural intrusion-detection system** (IDS).
@@ -105,7 +107,7 @@ linker and `#!` interpreters, which pass through the same gate:
    ELF/script, not blacklisted, not from a world-writable location such as
    `/tmp`, `/var/tmp`, `/dev/shm` or a `/proc/*/fd/*` magic-link) is
    automatically added to the allowlist and **allowed without denial**. Merely
-   relative paths (e.g. a package manager exec'ing `lib/apk/.../busybox`) are
+   relative paths (e.g. a package manager exec'ing a helper by a relative path) are
    *not* treated as unsafe, so they are learned rather than warned about.
    The program is **allowed** here, but only **learned** once every other
    gate has passed too -- the resolved-path blacklist, the media lock, the
