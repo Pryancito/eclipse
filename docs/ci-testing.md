@@ -1,5 +1,7 @@
 # CI tests and kernel diagnostics
 
+**English** · [Español](ci-testing.es.md)
+
 Kernel diagnostics default to INFO. LibOS writes them to `kernel.log`, or to
 `ZCORE_KERNEL_LOG` when set. Its user console writes to stdout. Log output is
 buffered and flushed on normal exit, ERROR records, and Rust panics. Set

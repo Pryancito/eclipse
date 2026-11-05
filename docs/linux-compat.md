@@ -1,5 +1,7 @@
 # Compatibilidad con Linux guiada por `Documentation/`
 
+**Español** · [English](linux-compat.en.md)
+
 Eclipse OS implementa su capa Linux (`linux-syscall` + `linux-object`)
 tomando como referencia el árbol de documentación del kernel:
 <https://github.com/torvalds/linux/tree/master/Documentation> (junto con las

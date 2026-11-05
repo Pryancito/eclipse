@@ -1,5 +1,7 @@
 # Compatibilidad con FreeBSD (ABI FreeBSD/amd64)
 
+**Español** · [English](README-freebsd.en.md)
+
 Eclipse OS ejecuta binarios de Linux de forma nativa. Este documento describe la
 **capa de compatibilidad con FreeBSD/amd64**: la infraestructura que permite que
 un ejecutable etiquetado como FreeBSD entre al kernel por la misma instrucción

@@ -314,10 +314,10 @@ and the init system in [docs/README-init.en.md](docs/README-init.en.md).
 | Board | Command | Guide |
 |---|---|---|
 | Allwinner D1 / Nezha | `cargo bin -m nezha -o z.bin` | [README-D1](docs/README-D1.en.md) |
-| StarFive VisionFive | `cargo bin -m visionfive -o z.bin` | [README-visionfive](docs/README-visionfive.md) |
+| StarFive VisionFive | `cargo bin -m visionfive -o z.bin` | [README-visionfive](docs/README-visionfive.en.md) |
 | CVITEK CR1825 | `cargo bin -m cr1825 -o z.bin` | — |
 | SiFive FU740 (Unmatched) | `cargo bin -m fu740 -o z.bin` | [README-fu740](docs/README-fu740.en.md) |
-| T-Head C910 | — | [README-C910](docs/README-C910.md) |
+| T-Head C910 | — | [README-C910](docs/README-C910.en.md) |
 
 ## Packages (apt)
 

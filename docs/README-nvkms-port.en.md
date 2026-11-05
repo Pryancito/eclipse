@@ -2,7 +2,7 @@
 
 [Español](README-nvkms-port.md) · **English**
 
-A continuation of [README-nvidia-multigpu-diseno.md](README-nvidia-multigpu-diseno.md).
+A continuation of [README-nvidia-multigpu-diseno.md](README-nvidia-multigpu-diseno.en.md).
 Decision of 27 Oct 2026: the modeset of every card is done by **nvkms, the same
 code Linux uses**, not by a modeset written by hand in the shim.
 

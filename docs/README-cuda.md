@@ -1,5 +1,7 @@
 # CUDA en Eclipse OS
 
+**Español** · [English](README-cuda.en.md)
+
 Eclipse publica los mismos dispositivos de carácter que `nvidia.ko` en Linux
 para que un `libcuda.so` de la misma versión que el RM hable con el Resource
 Manager enlazado en el núcleo. El hatch de arranque es **`nvidia.cuda`**.

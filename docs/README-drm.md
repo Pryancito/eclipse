@@ -1,5 +1,7 @@
 # DRM / KMS en Eclipse OS — conformidad con la UAPI de Linux
 
+**Español** · [English](README-drm.en.md)
+
 Este documento mapea la implementación de DRM (Direct Rendering Manager) de
 Eclipse OS contra la documentación del kernel de Linux
 ([`Documentation/gpu`](https://github.com/torvalds/linux/tree/master/Documentation/gpu)),

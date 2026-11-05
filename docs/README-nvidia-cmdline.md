@@ -1,5 +1,7 @@
 # Parámetros de arranque NVIDIA
 
+**Español** · [English](README-nvidia-cmdline.en.md)
+
 Los flags `nvidia.*` de la línea de comandos (`cmdline=` en `zCore/rboot.conf`,
 separados por `:`) se leen en **un solo sitio**,
 [`kernel_hal::cmdline::NvidiaParams`](../kernel-hal/src/common/cmdline.rs), y

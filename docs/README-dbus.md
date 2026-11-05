@@ -1,5 +1,7 @@
 # D-Bus en Eclipse OS
 
+**Español** · [English](README-dbus.en.md)
+
 Eclipse arranca un **bus de sesión** de verdad. Hasta ahora no había ninguno:
 la dirección `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` estaba fijada
 a propósito apuntando a un socket **sin demonio**, para que `connect()` fallara

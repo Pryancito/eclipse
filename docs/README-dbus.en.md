@@ -133,7 +133,7 @@ the monitor), not only against `dbus-daemon`.
 
 What **still cannot run** is Plasma: `plasmashell`, `kded`, `krunner` and the
 polkit agent are D-Bus services, yes, but they also need Qt, KF6, polkit and
-logind, which are not there. See [README-desktop.md](README-desktop.md).
+logind, which are not there. See [README-desktop.md](README-desktop.en.md).
 
 ## Ruled out: the bus was NOT gzdoom's hang (28 Sep 2026)
 

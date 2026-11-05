@@ -1,5 +1,7 @@
 # Escritorio labwc de Eclipse OS
 
+**Español** · [English](README-desktop.en.md)
+
 Eclipse OS incluye de serie una sesión de escritorio Wayland basada en
 **labwc** (wlroots; renderizador pixman por software o GLES2/zink con GPU, ver
 [README-drm.md](README-drm.md)), con **cuatro apariencias** intercambiables
@@ -201,7 +203,7 @@ Independientes del renderer, en todas las sesiones:
   sintaxis con comas exige SDL >= 2.24 (Ubuntu 26.10 trae 2.30+).
 - `SDL_AUDIODRIVER=alsa` / `SDL_AUDIO_DRIVER=alsa`: SDL usa ALSA, y
   `/etc/asound.conf` lo enruta por PulseAudio para que varios clientes
-  compartan el PCM ([README-audio.md](README-audio.md)). `PULSE_SERVER`
+  compartan el PCM ([README-audio.md](README-audio.es.md)). `PULSE_SERVER`
   apunta a `unix:/run/pulse/native` para los que hablan libpulse.
 - Decoraciones: labwc ofrece decoración de servidor por `xdg-decoration`, que
   SDL prefiere; `libdecor` queda como respaldo del lado cliente.
@@ -357,7 +359,7 @@ resueltas:
   `ALSOFT_DRIVERS=pulse,alsa` y `PULSE_SERVER=unix:/run/pulse/native`:
   openal-soft usa libpulse contra el demonio de sistema, y si Pulse no
   está cae a ALSA (que `/etc/asound.conf` también enruta por Pulse).
-  Ver [README-audio.md](README-audio.md).
+  Ver [README-audio.md](README-audio.es.md).
 - **gzdoom** se quedaba colgado justo tras imprimir `GZDoom 4.14.2 - - SDL
   version / Compiled on ...`, sordo incluso a `^C`. **No era el bus de sesión**:
   con `DBUS_SESSION_BUS_ADDRESS=unix:path=/sin-bus` se colgaba igual. Eran dos

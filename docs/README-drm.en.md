@@ -460,7 +460,7 @@ the text VT keeps its mode and is repainted.
 
 ## How to test (Xorg)
 
-- **Xorg**: the `fbdev` driver on `/dev/fb0`. See [`README-xorg.md`](README-xorg.md).
+- **Xorg**: the `fbdev` driver on `/dev/fb0`. See [`README-xorg.md`](README-xorg.en.md).
 
 ## `fbdev` (`/dev/fb0`, legacy framebuffer API)
 

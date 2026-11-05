@@ -1,5 +1,7 @@
 # Ejecutar un servidor X (`startx`) en Eclipse OS
 
+**Español** · [English](README-xorg.en.md)
+
 Eclipse OS (zCore) expone la capa de consola/terminal virtual que un servidor X
 de Linux necesita para tomar el control de la pantalla. Este documento explica
 qué soporta el núcleo y cómo está configurado el espacio de usuario para que `startx` funcione.

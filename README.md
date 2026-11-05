@@ -155,7 +155,7 @@ Leyenda: A → B (A depende de B; ejecutar A ejecuta antes B)
 |---|---|---|
 | `update-all` | Actualiza toolchain, dependencias y submódulos | `cargo update-all` |
 | `check-style` | Comprueba que el código compila con varias combinaciones de features | `cargo check-style` |
-| `zircon-init` | Descarga los binarios precompilados del modo Zircon ([detalles](prebuilt/README.md)) | `cargo zircon-init` |
+| `zircon-init` | Descarga los binarios precompilados del modo Zircon ([detalles](prebuilt/README.es.md)) | `cargo zircon-init` |
 | `dump` | Imprime la configuración de build | `cargo xtask dump` |
 | `git-proxy` | Pone o quita un proxy para git | `cargo git-proxy --global --port 12345` |
 | `rootfs` | Reconstruye el rootfs de Linux de una arquitectura | `cargo rootfs --arch x86_64 [--variant minimal]` |
@@ -287,7 +287,7 @@ init en [docs/README-init.md](docs/README-init.md).
   [NVIDIA](docs/README-nouveau-uapi.md).
 - **Entrada**: teclado PS/2 y USB HID (xHCI), con distribución española completa
   (`ñ`, `@`, `€`, `{`, `}`… con AltGr y Shift).
-- **Audio**: Intel HDA con ALSA y PulseAudio ([guía](docs/README-audio.md)).
+- **Audio**: Intel HDA con ALSA y PulseAudio ([guía](docs/README-audio.es.md)).
 - **Red**: Intel e1000/e1000e/ixgbe, Realtek y otros ([`drivers/src/net`](drivers/src/net)), con DHCP propio (`edhcpc`).
 - **Instalador**: `install-eclipse` escribe el sistema en un disco físico o
   virtual, con detección del tamaño por `sysfs` y `BLKGETSIZE64`, y rellena
@@ -295,7 +295,7 @@ init en [docs/README-init.md](docs/README-init.md).
 - **Memoria**: syscalls de E/S troceadas y carga ELF con `VmObject`s paginados
   para no agotar el heap del núcleo; herramientas de diagnóstico en
   `/proc/memhogs` y [oops](docs/README-oops.md).
-- **Seguridad**: [hunter](docs/hunter-security.md), políticas estilo LSM + IDS
+- **Seguridad**: [hunter](docs/hunter-security.es.md), políticas estilo LSM + IDS
   por comportamiento, con log forense en `/proc/hunter` y arranque medido.
 
 ### aarch64 (QEMU virt)
@@ -335,9 +335,9 @@ El índice completo, con todas las guías en español e inglés, está en
 - [Escritorio labwc y apariencias](docs/README-desktop.md)
 - [Arranque](docs/README-boot.md) e [init](docs/README-init.md)
 - [Compatibilidad con Linux](docs/linux-compat.md) y [con FreeBSD](docs/README-freebsd.md)
-- [DRM/KMS](docs/README-drm.md), [Xorg](docs/README-xorg.md), [audio](docs/README-audio.md)
-- [hunter](docs/hunter-security.md)
-- [Notas para desarrolladores](docs/for-developers.md) y [CI](docs/ci-testing.md)
+- [DRM/KMS](docs/README-drm.md), [Xorg](docs/README-xorg.md), [audio](docs/README-audio.es.md)
+- [hunter](docs/hunter-security.es.md)
+- [Notas para desarrolladores](docs/for-developers.md) y [CI](docs/ci-testing.es.md)
 - [README original de zCore](README-arch.md)
 
 ## Licencia

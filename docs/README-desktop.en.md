@@ -4,7 +4,7 @@
 
 Eclipse OS ships out of the box with a Wayland desktop session based on
 **labwc** (wlroots; software pixman renderer, or GLES2/zink with a GPU, see
-[README-drm.md](README-drm.md)), with **four interchangeable looks** on top of
+[README-drm.md](README-drm.en.md)), with **four interchangeable looks** on top of
 exactly the same native pieces: `tecno` (the one the image ships with),
 Eclipse's original violet look, KDE Plasma's and Windows 11's. The wallpaper is
 always **lunarbg**, the panel is always **lunarbar** and the launcher is always
@@ -61,7 +61,7 @@ wallpaper is distributed: everything is drawn with our own colours.
 Plasma cannot run here, and it is worth knowing why before trying:
 `plasmashell`, `kded`, `krunner` and the polkit-kde agent are **D-Bus** services
 from top to bottom. That is no longer the obstacle — there is now a real session
-bus listening on `DBUS_SESSION_BUS_ADDRESS`, see [README-dbus.md](README-dbus.md)
+bus listening on `DBUS_SESSION_BUS_ADDRESS`, see [README-dbus.md](README-dbus.en.md)
 — but there is still no Qt or KF6 in the image, nor polkit, nor logind (seatd is
 used). What is recreated is the experience: theme, shortcuts, panel and
 launcher, with Eclipse's native pieces.
@@ -374,7 +374,7 @@ Both games failed on real hardware for different reasons, and both are fixed:
   never checked in. Both are fixed
   ([PR #1601](https://github.com/Pryancito/eclipse/pull/1601)) and gzdoom
   starts. The wrapper's D-Bus muzzle stays for hygiene, but it did not fix
-  anything; see [README-dbus.md](README-dbus.md).
+  anything; see [README-dbus.md](README-dbus.en.md).
 
 ## Keyboard shortcuts
 
