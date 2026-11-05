@@ -122,7 +122,7 @@ impl State {
     }
 
     /// Re-read this folder and put the selection on `name` when it is there.
-    fn reload_on(&mut self, name: Option<&str>) {
+    pub(crate) fn reload_on(&mut self, name: Option<&str>) {
         let (sel, dir) = (self.sel, self.dir.clone());
         self.chdir(&dir);
         self.sel = sel.min(self.rows.len().saturating_sub(1));
@@ -178,23 +178,7 @@ impl State {
                 );
                 self.held = Some((p, cut));
             }
-            Op::Paste => {
-                let Some((src, cut)) = self.held.clone() else { return };
-                let dir = std::path::Path::new(&self.dir).to_path_buf();
-                let src_p = std::path::Path::new(&src);
-                let r = if cut { fileops::move_into(src_p, &dir) } else { fileops::copy_into(src_p, &dir) };
-                match r {
-                    Ok(dst) => {
-                        let n = dst.file_name().map(|n| n.to_string_lossy().into_owned());
-                        if cut {
-                            self.held = None;
-                        }
-                        self.reload_on(n.as_deref());
-                        self.note = format!("Pegado: {}", n.unwrap_or_default());
-                    }
-                    Err(e) => self.fail("pegar", e),
-                }
-            }
+            Op::Paste => self.start_paste(),
             Op::Trash => {
                 let Some(p) = self.chosen() else { return };
                 let Some(trash) = fileops::trash_dir() else {
