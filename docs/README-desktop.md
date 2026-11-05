@@ -1,10 +1,10 @@
 # Escritorio labwc de Eclipse OS
 
 Eclipse OS incluye de serie una sesión de escritorio Wayland basada en
-**labwc** (wlroots + renderizador software pixman, ver
-[README-drm.md](README-drm.md)), con **tres apariencias** intercambiables
-sobre exactamente las mismas piezas nativas: la original de Eclipse (la que
-trae la imagen), la de KDE Plasma y la de Windows 11. El fondo siempre es
+**labwc** (wlroots; renderizador pixman por software o GLES2/zink con GPU, ver
+[README-drm.md](README-drm.md)), con **cuatro apariencias** intercambiables
+sobre exactamente las mismas piezas nativas: `tecno` (la que trae la imagen),
+la violeta original de Eclipse, la de KDE Plasma y la de Windows 11. El fondo siempre es
 **lunarbg**, el panel siempre es **lunarbar** y el lanzador siempre es
 **lunarrun**; lo que cambia es la paleta y la disposición.
 
@@ -86,8 +86,8 @@ arranque sin pasos manuales.
 |---|---|---|
 | **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf), con render por *scanline spans* (~2 ms/frame a 1080p) y solo redibuja/daña la región del logo por frame. La animación apunta a 24 fps (`--fps`/`LUNARBG_FPS=1..60`) pero **cada commit se regula con el frame callback del compositor**: nunca renderiza por delante de lo que éste composita (en stacks lentos degrada sola, y con el fondo tapado cae a 1 Hz). Soporta HiDPI (`wl_output.scale` + `set_buffer_scale`), multi-monitor con aspecto físico por salida, `--output NAME` para pintar salidas concretas, pausa/reanuda con `SIGUSR1` y salida limpia con `SIGTERM`. `--static`/`LUNARBG_STATIC=1` desactiva la animación; debug: `--dump /tmp/out.raw:1920x1080` (+`--dump-ms N`) y `--bench` para cronometrar el renderizador. `lunarbg --help` lista todo. |
 | Wallpaper estático | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Hoy ningún componente de la sesión la usa (swaybg no forma parte de ella); queda como imagen de respaldo para quien quiera un fondo estático. |
-| Temas de ventanas | `/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc` | Los tres temas openbox-3 que labwc aplica a bordes de ventana, menús y OSD. `eclipse-look` elige cuál nombra `rc.xml`. |
-| Config labwc | `/root/.config/labwc/rc.xml` | Tema de la apariencia activa (`Eclipse-Dark` de fábrica), esquinas redondeadas, 4 escritorios y los atajos de KDE/Windows. |
+| Temas de ventanas | `/usr/share/themes/{Tecno-Dark,Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc` | Los cuatro temas openbox-3 que labwc aplica a bordes de ventana, menús y OSD. `eclipse-look` elige cuál nombra `rc.xml`. |
+| Config labwc | `/root/.config/labwc/rc.xml` | Tema de la apariencia activa (`Tecno-Dark` de fábrica), esquinas redondeadas, 4 escritorios y los atajos de KDE/Windows. |
 | Menú de escritorio | `/root/.config/labwc/menu.xml` | Clic derecho en el fondo: terminal, editor, monitor, recargar y salir. |
 | Entorno de sesión | `/root/.config/labwc/environment` | Cursor Adwaita y `GTK_THEME=Adwaita:dark`. |
 | **lunarrun** | `/bin/lunarrun` | Lanzador tipo KRunner (`tools/lunarbar`, comparte biblioteca con el panel). Overlay centrado sobre wlr-layer-shell: se escribe para filtrar las aplicaciones instaladas (sin distinguir acentos), ↑/↓ o Tab para elegir, Intro para lanzar, Esc o clic fuera para cerrar. Una palabra que resuelva en `$PATH` sale como «ejecutar orden», así que `Alt+Espacio top` funciona como en KRunner. `lunarrun --toggle-desktop` es el Super+D de KDE: minimiza todas las ventanas por wlr-foreign-toplevel-management, o las restaura si ya lo estaban. `--dump RUTA:AnchoxAlto` lo dibuja a un fichero ARGB8888 sin compositor. Lo lanzan `eclipse-run` y `eclipse-showdesktop`. |
@@ -99,8 +99,8 @@ arranque sin pasos manuales.
 
 ## Paquetes de runtime
 
-El núcleo y el rootfs no incluyen los binarios Wayland; se instalan desde
-Alpine. Todos son opcionales — la sesión degrada con elegancia si falta
+El núcleo no incluye los binarios Wayland; salen de los paquetes de Ubuntu
+26.10 que el build instala en la variante de escritorio. Todos son opcionales — la sesión degrada con elegancia si falta
 alguno:
 
 ```sh
@@ -109,6 +109,7 @@ apt-get install libsdl2-2.0-0 libsdl3-0 libsdl1.2debian libsdl2-image-2.0-0 libs
 ```
 
 Desde `cargo xtask image` estos paquetes ya se instalan solos (ver
+`DESKTOP_UBUNTU` en `xtask/src/linux/apt_rootfs.rs`; con `ECLIPSE_PKG=apk`,
 `DEFAULT_PACKAGES` en `xtask/src/linux/xorg.rs`): `labwc` arrastra su cierre
 de runtime (wlroots, wayland-libs, libinput, pixman, libxkbcommon), `seatd`
 aporta `libseat.so` y el demonio `seatd`, y `foot` es el terminal.
@@ -116,12 +117,11 @@ aporta `libseat.so` y el demonio `seatd`, y `foot` es el terminal.
 - `labwc` — el compositor.
 - `seatd` — gestor de asientos; corre como **demonio** (servicio de init,
   socket `/run/seatd.sock`, sobre el que `labwc.service` espera). El wrapper
-  no fija `LIBSEAT_BACKEND=builtin`: la `libseat` de Alpine no compila ese
-  backend.
+  fija `LIBSEAT_BACKEND=seatd` (con `:=`, así que se puede pisar).
 - `lunarbg` y `lunarbar` — fondo y panel, incluidos en el rootfs (no son
-  paquetes de Alpine); no hace falta `swaybg` ni `waybar`.
+  paquetes externos); no hace falta `swaybg` ni `waybar`.
 - `foot` — terminal Wayland.
-- `font-dejavu` — tipografía usada por tema, panel y menús.
+- `fonts-dejavu` — tipografía usada por tema, panel y menús.
 - `adwaita-icon-theme` — tema de cursor e iconos (sin él no se ve el puntero
   con cursor software).
 
@@ -137,10 +137,10 @@ terminaba de arrancar, así que una app X11 se colgaba para siempre en vez de
 fallar. Está habilitado de serie:
 
 - El binario `Xwayland` se instala con el resto del stack (paquete `xwayland`
-  en `DEFAULT_PACKAGES`, `xtask/src/linux/xorg.rs`) y viaja tanto al sistema
+  en `DESKTOP_UBUNTU`, `xtask/src/linux/apt_rootfs.rs`) y viaja tanto al sistema
   instalado como al initramfs live/QEMU (`usr/bin` está en `LIVE_TREES`). El
   build lo verifica y avisa **en voz alta** si faltara.
-- labwc de Alpine trae el soporte compilado; con `xwaylandPersistence` el
+- El labwc empaquetado trae el soporte compilado; con `xwaylandPersistence` el
   servidor ya está en pie cuando arranca la sesión, y labwc exporta el número
   de display real a sus hijos (por eso una terminal de la sesión hereda
   `DISPLAY` sin que nadie lo fije a mano).
@@ -165,15 +165,15 @@ xterm                  # una terminal X11 clásica dentro del escritorio Wayland
 
 Si una app X11 falla con «can't open display» aun con `DISPLAY=:0`, revisa en
 la salida del build la línea `Xorg stack: Xwayland present …`: si dice que
-falta, `apk` no resolvió el paquete `xwayland` (lo más común, sin red al
-construir la imagen) y hay que reconstruir con red o `apt-get install xwayland` una vez.
+falta, el build no pudo descargar el paquete `xwayland` (lo más común, sin red
+al construir la imagen) y hay que reconstruir con red o `apt-get install xwayland` una vez.
 
 ## SDL (SDL 1.2 / SDL2 / SDL3)
 
-La sesión trae el runtime de **SDL** (`sdl2`, `sdl3`, `sdl12-compat`,
-`sdl2_image`, `sdl2_ttf`, `sdl2_mixer`, `sdl2_net`, `libpng`, `fluidsynth`,
-`libdecor`; ver `DEFAULT_PACKAGES` en
-`xtask/src/linux/xorg.rs`) y una **política de entorno** que elige el backend
+La sesión trae el runtime de **SDL** (`libsdl2-2.0-0`, `libsdl3-0`,
+`libsdl1.2debian`, `libsdl2-image`, `-ttf`, `-mixer`, `-net`, `libpng16`,
+`libfluidsynth3`, `libdecor-0-0`; ver `DESKTOP_UBUNTU` en
+`xtask/src/linux/apt_rootfs.rs`) y una **política de entorno** que elige el backend
 de vídeo y el *render driver* de SDL a juego con el renderer del compositor.
 Sin ella, SDL2 tomaba X11 siempre (elige X11 en cuanto `DISPLAY` está fijado, y
 aquí lo está: `:0`), es decir, todo pasaba por Xwayland, y el renderer lo
@@ -198,7 +198,7 @@ Independientes del renderer, en todas las sesiones:
 - `SDL_VIDEODRIVER=wayland,x11` (SDL2) y `SDL_VIDEO_DRIVER=wayland,x11`
   (SDL3): Wayland nativo primero, X11 como respaldo. La lista sirve también a
   la sesión `desktop=xorg` (sin `WAYLAND_DISPLAY`, SDL cae a X11 solo). La
-  sintaxis con comas exige SDL >= 2.24 (Alpine trae 2.30+).
+  sintaxis con comas exige SDL >= 2.24 (Ubuntu 26.10 trae 2.30+).
 - `SDL_AUDIODRIVER=alsa` / `SDL_AUDIO_DRIVER=alsa`: SDL usa ALSA, y
   `/etc/asound.conf` lo enruta por PulseAudio para que varios clientes
   compartan el PCM ([README-audio.md](README-audio.md)). `PULSE_SERVER`
@@ -306,8 +306,8 @@ su entorno se deja **byte por byte** como estaba.
 ## Juegos (freedoom, supertux2)
 
 **Freedoom viene instalado.** Los dos IWAD (`freedoom1.wad`, `freedoom2.wad`) y
-el motor `gzdoom` están en el conjunto de paquetes por defecto
-(`xtask/src/linux/xorg.rs`), porque un Eclipse recién instalado no tiene mirror
+el motor `chocolate-doom` están en el conjunto de paquetes por defecto
+(`freedoom` y `chocolate-doom` en `xtask/src/linux/apt_rootfs.rs`), porque un Eclipse recién instalado no tiene mirror
 a mano justo cuando a uno le apetece ver si el escritorio mueve un juego.
 
 Se lanza desde el menú del escritorio («Freedoom (Fase 1)» / «(Fase 2)»), desde
@@ -331,12 +331,11 @@ eclipse-freedoom /ruta/doom2.wad   # cualquier otro IWAD
 - **Deja rastro.** Todo va a `/tmp/freedoom.log`, porque un juego lanzado desde
   el panel escribe en un terminal que no mira nadie.
 
-Si hay instalado un motor por software (`chocolate-doom`, `crispy-doom`,
-`prboom-plus`), el wrapper lo prefiere a gzdoom: en este stack, cuyo mejor GL es
+El wrapper prefiere un motor por software (`chocolate-doom`, que viene
+instalado, `crispy-doom` o `prboom-plus`) a gzdoom: en este stack, cuyo mejor GL es
 llvmpipe, es el que va a velocidad completa.
 
 ```sh
-apt-get install chocolate-doom    # opcional; eclipse-freedoom lo usará solo
 apt-get install supertux          # binario: supertux2
 ```
 
@@ -442,7 +441,7 @@ borra `/etc/eclipse/services/labwc.service` o arranca con `desktop=xorg`).
   `tools/lunarbg/src/scene.rs`). El PNG de
   `/usr/share/backgrounds/eclipse/eclipse-night.png` se regenera fuera de
   un build completo con `cargo test -p xtask dump_wallpaper -- --ignored`.
-- **Apariencia completa**: `eclipse-look eclipse|kde|win11` (ver arriba).
+- **Apariencia completa**: `eclipse-look tecno|eclipse|kde|win11` (ver arriba).
 - **Retoques sin reconstruir**: labwc lee
   `~/.config/labwc/themerc-override` **encima** del tema, así que ahí puedes
   cambiar colores, bordes o sombras sin tocar el tema ni el build; `xtask` no
@@ -453,7 +452,7 @@ borra `/etc/eclipse/services/labwc.service` o arranca con `desktop=xorg`).
   `rc.xml`. Ten en cuenta que `eclipse-look` reescribe esa línea, así que un
   cambio de apariencia te lo sobreescribe.
 - **Colores del tema**: edita el `themerc` de la apariencia activa
-  (`/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc`)
+  (`/usr/share/themes/{Tecno-Dark,Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc`)
   y ejecuta la acción «Recargar labwc» del menú (o `labwc --reconfigure`).
 - **Panel**: `lunarbar` no tiene fichero de configuración; su paleta y su
   disposición salen de `/etc/eclipse/look` (`ECLIPSE_LOOK=` lo pisa para una
@@ -471,15 +470,16 @@ Eclipse trae dos sesiones de escritorio y `eclipse-init` (PID 1) arranca solo
 una, según este orden (gana el primero que aparezca):
 
 1. **Argumento de arranque** `desktop=<labwc|xorg>` en la cmdline del kernel
-   (`/proc/cmdline`). Es lo que usa `make qemu`, que fija `desktop=xorg` para
-   arrancar la sesión Xorg (framebuffer/`fbdev` sobre `/dev/fb0`) en QEMU.
-   Sobrescríbelo con `make qemu DESKTOP=labwc`.
+   (`/proc/cmdline`). Es lo que usa `make qemu`, que fija `desktop=labwc` por
+   defecto (`desktop=none` con `VARIANT=minimal`). Para la sesión Xorg
+   (framebuffer/`fbdev` sobre `/dev/fb0`): `make qemu DESKTOP=xorg`.
 2. **Fichero** `/etc/eclipse/desktop` (primer token): override persistente por
    instalación que puedes editar. Se instala con el valor `labwc`.
 3. Por defecto: **labwc**.
 
 Como el hardware real arranca con la cmdline instalada (sin `desktop=`), cae al
-fichero `/etc/eclipse/desktop` y usa **labwc**; `make qemu` usa **Xorg**. Los
+fichero `/etc/eclipse/desktop` y usa **labwc**; `make qemu` también, salvo que
+se le pase `DESKTOP=`. Los
 servicios de cada sesión llevan una etiqueta `desktop =` en su
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` son `desktop = labwc`,
 `xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `udhcpc`)

@@ -16,8 +16,9 @@ aceleración NVIDIA sobre paquetes de Ubuntu.
   paquetes de **Ubuntu 26.10** instalables con `apt`.
 - **Escritorio**: sesión Wayland con labwc, panel y fondo nativos (`lunarbar`,
   `lunarbg`) y varias apariencias; Xorg disponible como alternativa.
-- **Almacenamiento**: raíz **btrfs** con driver propio de lectura/escritura, más
-  ext2/3/4 y FAT32.
+- **Almacenamiento**: raíz en **EclipseFS**, un sistema de archivos propio
+  copy-on-write; **btrfs** con driver propio como alternativa, más ext2/3/4 y
+  FAT32.
 - **Seguridad**: `hunter`, subsistema in-kernel de políticas e IDS.
 
 La documentación técnica vive en [`docs/`](docs/README.md).
@@ -114,7 +115,7 @@ command -v cargo git make gcc tar wget curl qemu-system-x86_64 mkfs.vfat mcopy g
 rustup show
 ```
 
-No hace falta `btrfs-progs`: las imágenes btrfs las genera xtask. `cmake`,
+No hace falta `btrfs-progs`: las imágenes EclipseFS y btrfs las genera xtask. `cmake`,
 OpenCV y FFmpeg solo se necesitan para `cargo opencv` / `cargo ffmpeg`. Hay una
 imagen Docker de desarrollo en [`tools/docker`](tools/docker/README.md).
 
@@ -227,8 +228,9 @@ x86_64 en cada cambio (`scripts/iso-smoke.sh`).
 
 Particularidades por arquitectura:
 
-- **x86_64**: la ISO es live e instalador (`install-eclipse`). Necesita 4 GB de
-  RAM en QEMU.
+- **x86_64**: la ISO arranca el instalador en consola (`desktop=none`) y lleva
+  los payloads que `install-eclipse` escribe a disco. Necesita 4 GB de RAM en
+  QEMU.
 - **aarch64**: la imagen va **enlazada dentro del núcleo** (`LINK_USER_IMG=1`,
   feature `link-user-img`), porque el `rayboot` precompilado no sabe pasar un
   initramfs. Arráncala con `make qemu-iso-aarch64 ARCH=aarch64 VARIANT=minimal`
@@ -271,10 +273,13 @@ init en [docs/README-init.md](docs/README-init.md).
   PHY y Bus Mastering PCI) y NVMe (coherencia de caché DMA con `clflush`).
   Detección de particiones MBR y GPT; cada partición aparece en `devfs`
   (`/dev/sda1`, `/dev/nvme0n1p1`…).
-- **Sistemas de archivos**: raíz **btrfs** con driver propio
-  (`vendor/btrfs-rs`) y generación de imágenes integrada (sin `btrfs-progs`); se
-  expande al tamaño de la partición en el primer montaje y las imágenes pasan
-  `btrfs check`. También ext2/ext3/ext4 y vfat/FAT32 (partición EFI).
+- **Sistemas de archivos**: el sistema instalado usa por defecto **EclipseFS**
+  ([`vendor/eclipsefs-rs`](vendor/eclipsefs-rs/README.md)): árboles B+
+  copy-on-write, CRC32C en cada nodo y commits atómicos. Con
+  `ROOTFS_FS=btrfs` (o `ECLIPSE_ROOTFS_FS=btrfs` en xtask) se instala **btrfs**,
+  con driver propio (`vendor/btrfs-rs`) e imágenes que pasan `btrfs check`. Las
+  dos imágenes las genera xtask y se expanden al tamaño de la partición en el
+  primer montaje. También ext2/ext3/ext4 y vfat/FAT32 (partición EFI).
 - **Gráficos**: UAPI DRM/KMS de Linux con PRIME; Wayland (wlroots/labwc, con
   `pixman` si no hay GPU) y Xorg. GPUs NVIDIA con el driver RM, CUDA y una uAPI
   compatible con nouveau para NVK/zink. Ver

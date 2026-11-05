@@ -17,8 +17,9 @@ acceleration on top of Ubuntu packages.
 - **Desktop**: a labwc Wayland session with native panel and wallpaper
   (`lunarbar`, `lunarbg`) and several looks; Xorg is available as an
   alternative.
-- **Storage**: a **btrfs** root with an in-house read/write driver, plus
-  ext2/3/4 and FAT32.
+- **Storage**: an **EclipseFS** root, Eclipse's own copy-on-write file
+  system; **btrfs** with an in-house driver as an alternative, plus ext2/3/4
+  and FAT32.
 - **Security**: `hunter`, an in-kernel policy and IDS subsystem.
 
 Technical documentation lives in [`docs/`](docs/README.en.md).
@@ -117,7 +118,7 @@ command -v cargo git make gcc tar wget curl qemu-system-x86_64 mkfs.vfat mcopy g
 rustup show
 ```
 
-`btrfs-progs` is not needed: xtask generates the btrfs images itself. `cmake`,
+`btrfs-progs` is not needed: xtask generates the EclipseFS and btrfs images itself. `cmake`,
 OpenCV and FFmpeg are only needed for `cargo opencv` / `cargo ffmpeg`. A
 development Docker image is available in [`tools/docker`](tools/docker/README.en.md).
 
@@ -230,8 +231,9 @@ change (`scripts/iso-smoke.sh`).
 
 Per-architecture notes:
 
-- **x86_64**: the ISO is both a live system and an installer
-  (`install-eclipse`). It needs 4 GB of RAM in QEMU.
+- **x86_64**: the ISO boots the installer on the console (`desktop=none`) and
+  carries the payloads `install-eclipse` writes to disk. It needs 4 GB of RAM in
+  QEMU.
 - **aarch64**: the image is **linked into the kernel** (`LINK_USER_IMG=1`, the
   `link-user-img` feature), because the prebuilt `rayboot` cannot pass an
   initramfs. Boot it with `make qemu-iso-aarch64 ARCH=aarch64 VARIANT=minimal`
@@ -274,10 +276,13 @@ and the init system in [docs/README-init.en.md](docs/README-init.en.md).
   Bus Mastering) and NVMe (DMA cache coherency with `clflush`). MBR and GPT
   partition detection; each partition shows up in `devfs` (`/dev/sda1`,
   `/dev/nvme0n1p1`…).
-- **File systems**: a **btrfs** root with an in-house driver (`vendor/btrfs-rs`)
-  and built-in image generation (no `btrfs-progs`); it grows to the partition
-  size on first mount and the images pass `btrfs check`. Also ext2/ext3/ext4 and
-  vfat/FAT32 (EFI partition).
+- **File systems**: the installed system uses **EclipseFS** by default
+  ([`vendor/eclipsefs-rs`](vendor/eclipsefs-rs/README.md)): copy-on-write B+
+  trees, CRC32C on every node and atomic commits. With `ROOTFS_FS=btrfs` (or
+  `ECLIPSE_ROOTFS_FS=btrfs` for xtask) **btrfs** is installed instead, with an
+  in-house driver (`vendor/btrfs-rs`) and images that pass `btrfs check`. xtask
+  generates both images, and they grow to the partition size on first mount.
+  Also ext2/ext3/ext4 and vfat/FAT32 (EFI partition).
 - **Graphics**: the Linux DRM/KMS UAPI with PRIME; Wayland (wlroots/labwc, with
   `pixman` when there is no GPU) and Xorg. NVIDIA GPUs with the RM driver, CUDA
   and a nouveau-compatible uAPI for NVK/zink. See
