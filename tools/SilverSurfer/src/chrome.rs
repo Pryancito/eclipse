@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn every_look_paints_an_opaque_strip() {
-        for look in [Look::Eclipse, Look::Kde, Look::Win11] {
+        for look in [Look::Eclipse, Look::Kde, Look::Win11, Look::Tecno] {
             let title = "pestaña".to_string();
             let loading = [false];
             let pixels = render(&View {

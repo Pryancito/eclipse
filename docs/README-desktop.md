@@ -25,10 +25,11 @@ eclipse-look win11      # Windows 11
 | | `tecno` (por defecto) | `eclipse` | `kde` | `win11` |
 |---|---|---|---|---|
 | Tema de ventanas | `Tecno-Dark` (#0a1423, acento cian #38e1ff, oro #f2c14e al pulsar) | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) |
-| Panel | dos barras de 34 px, placas cuadradas con filete; arriba la ventana con foco centrada y `CPU`/`MEM` por segmentos, `NET` y `TEMP` en oro; escuadras doradas en los menús | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
-| Reloj | una línea abajo, fecha arriba | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
+| Panel | dos barras de 34 px, placas cuadradas con filete; arriba los escritorios 01–04 y la ventana con foco centrada y `CPU`/`MEM` por segmentos, `NET` y `TEMP` en oro; escuadras doradas en los menús | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
+| Reloj | abajo, grande y en negrita (10x20); fecha arriba | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
 | Terminal | paleta tecno (oro como amarillo) | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
 | Fondo | eclipse dorado sobre negro con halo verdoso, anillos finos y la leyenda `ECLIPSE · SYSTEM · KERNEL · ZCORE` | cosmos animado con estrellas, rejilla y anillo de texto | cosmos animado | cosmos animado |
+| Archivos y navegador | lunarfile recto, columnas en mayúsculas y carpetas en oro; SilverSurfer con la paleta de A | paleta violeta | paleta Breeze | paleta Windows 11 |
 | Lanzador | en el tercio superior, recto y con escuadras doradas | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
 
 `tecno` es el aspecto «Orbital HUD» de la maqueta que eligió Moebius (ver

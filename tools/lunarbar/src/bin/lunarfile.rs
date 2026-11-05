@@ -93,6 +93,8 @@ struct Palette {
 /// "careful" against all three panels and as nothing like the accent.
 const WARN: Rgb = (0xe0, 0xa8, 0x5e);
 const ON_WARN: Rgb = (0x1a, 0x10, 0x06);
+/// Tecno's folders: the gold of the crescent, as mockup A marks them.
+const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
 
 const PAL_KDE: Palette = Palette {
     scrim: (0x0d, 0x0f, 0x11),
@@ -1059,12 +1061,15 @@ fn primary_label(st: &State) -> String {
 /// Paint the scrim and the centred browser, and say where everything went.
 fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let p = st.pal;
+    // Tecno is mockup A: square plates, caps labels, gold folders.
+    let hud = st.look == Look::Tecno;
+    let rad = |r: i32| if hud { 0 } else { r };
     cv.fill_rect_a(0, 0, w as i32, h as i32, p.scrim, p.scrim_a);
 
     let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows.len());
-    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, 9, p.border, 0.9);
+    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, rad(9), p.border, 0.9);
     let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
-    cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
+    cv.round_rect_a(px, py, pw, ph, rad(8), p.panel, panel_a);
 
     let inner = pw - PAD * 2;
     let foot_y = py + ph - FOOT_H;
@@ -1075,7 +1080,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     if let Some(chip) = mode_chip(st.mode) {
         let cw = Canvas::text_width(chip) + 12;
         if cw * 3 < inner {
-            cv.round_rect(hx, head_y - 1, cw, GLYPH_H + 6, 4, p.accent);
+            cv.round_rect(hx, head_y - 1, cw, GLYPH_H + 6, rad(4), p.accent);
             cv.text_bold(chip, hx + 6, head_y + 2, p.on_accent);
             hx += cw + 10;
         }
@@ -1084,27 +1089,34 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     // is not ours to trust: the header shares its line with the path, and a
     // 500-character title would leave the path nowhere to go (`path_room` has a
     // floor, so what gets pushed off the panel is the path).
-    let title = files::elide_middle(
+    let mut title = files::elide_middle(
         st.title.as_deref().unwrap_or(match st.mode {
             Mode::Save => "Guardar en",
+            Mode::Browse if hud => "Lunarfile",
             Mode::Browse => "Archivos",
             _ => "Elegir archivo",
         }),
         MAX_TITLE,
     );
-    let title_c = if st.mode == Mode::Browse {
+    let title_c = if hud {
+        // `■ LUNARFILE · /path`: the window's marker, its name, its place.
+        cv.fill_rect_a(hx, head_y + 6, 6, 6, p.accent, 1.0);
+        hx += 14;
+        title = format!("{} ·", title.to_uppercase());
+        p.dim
+    } else if st.mode == Mode::Browse {
         p.accent
     } else {
         p.text
     };
     cv.text_bold(&title, hx, head_y + 2, title_c);
-    let title_w = Canvas::text_width(&title) + COL_GAP;
+    let title_w = Canvas::text_width(&title) + if hud { GLYPH_W } else { COL_GAP };
     let path_room = ((px + PAD + inner - hx - title_w) / GLYPH_W).max(8) as usize;
     cv.text(
         &files::elide_middle(&st.dir, path_room),
         hx + title_w,
         head_y + 2,
-        p.dim,
+        if hud { p.text } else { p.dim },
     );
     cv.hline(px + PAD, head_y + HEAD_H - 6, inner, p.border, 0.8);
 
@@ -1115,7 +1127,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     if rail > 0 {
         let rx = px + PAD;
         let rw = rail - 12;
-        cv.text("Lugares", rx + 8, body_y + 2, p.dim);
+        cv.text(if hud { "LUGARES" } else { "Lugares" }, rx + 8, body_y + 2, p.dim);
         let mut y = body_y + GLYPH_H + 10;
         let chars = ((rw - 16 - 14 - 8) / GLYPH_W).max(1) as usize;
         for pl in &st.places {
@@ -1125,16 +1137,23 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
             }
             let here = pl.path == st.dir;
             if here {
-                cv.round_rect_a(rx, y, rw, PLACE_H - 2, 5, p.sel, 0.95);
+                cv.round_rect_a(rx, y, rw, PLACE_H - 2, rad(5), p.sel, 0.95);
+                if hud {
+                    cv.fill_rect_a(rx, y, 2, PLACE_H - 2, p.accent, 1.0);
+                }
             }
             let (ic, tc) = if here {
                 (p.sel_text, p.sel_text)
             } else {
                 (p.accent, p.text)
             };
-            folder_icon(cv, rx + 8, y + (PLACE_H - 2 - 14) / 2, 14, ic);
+            // Tecno lists places as words, the way the mockup does.
+            if !hud {
+                folder_icon(cv, rx + 8, y + (PLACE_H - 2 - 14) / 2, 14, ic);
+            }
             let ty = y + (PLACE_H - 2 - GLYPH_H) / 2;
-            cv.text(&files::elide_middle(&pl.label, chars), rx + 30, ty, tc);
+            let tx = if hud { rx + 12 } else { rx + 30 };
+            cv.text(&files::elide_middle(&pl.label, chars), tx, ty, tc);
             places.push((rx, y, rw, PLACE_H - 2));
             y += PLACE_H;
         }
@@ -1154,8 +1173,8 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
 
     let field_y = body_y;
     let field_c = if st.armed() { WARN } else { p.border };
-    cv.round_rect(lx, field_y, lw, FIELD_H - 6, 6, field_c);
-    cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, 5, p.field);
+    cv.round_rect(lx, field_y, lw, FIELD_H - 6, rad(6), field_c);
+    cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, rad(5), p.field);
     let label = if st.mode == Mode::Save {
         "Nombre:"
     } else {
@@ -1186,11 +1205,15 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let row0_y = field_y + FIELD_H - 6 + PAD + cols;
     if cols > 0 {
         let cy = row0_y - cols;
-        cv.text("Nombre", name_x, cy, p.dim);
-        let tam = "Tamaño";
+        let [nom, tam, modi] = if hud {
+            ["NOMBRE", "TAMAÑO", "MODIFICADO"]
+        } else {
+            ["Nombre", "Tamaño", "Modificado"]
+        };
+        cv.text(nom, name_x, cy, p.dim);
         cv.text(tam, size_r - Canvas::text_width(tam), cy, p.dim);
         if dates {
-            cv.text("Modificado", date_x, cy, p.dim);
+            cv.text(modi, date_x, cy, p.dim);
         }
     }
 
@@ -1202,10 +1225,14 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         let y = row0_y + n as i32 * ROW_H;
         let selected = row == st.sel;
         let hovered = st.hover == Some(row);
-        if selected {
+        if selected && hud {
+            // A's selected row: the plate, framed in a cyan hairline.
+            cv.fill_rect_a(lx, y, lw, ROW_H - 2, p.accent, 0.9);
+            cv.fill_rect_a(lx + 1, y + 1, lw - 2, ROW_H - 4, p.sel, 1.0);
+        } else if selected {
             cv.round_rect_a(lx, y, lw, ROW_H - 2, 5, p.sel, 0.95);
         } else if hovered {
-            cv.round_rect_a(lx, y, lw, ROW_H - 2, 5, p.field, 0.9);
+            cv.round_rect_a(lx, y, lw, ROW_H - 2, rad(5), p.field, 0.9);
         }
         let (tc, dc) = if selected {
             (p.sel_text, p.sel_text)
@@ -1237,9 +1264,14 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                         cv.round_rect(lx + 8, cy + 2, 10, 10, 2, inside);
                     }
                 }
-                if e.is_dir {
+                if e.is_dir && hud {
+                    // `▸ name`, both gold: a folder is somewhere to go.
+                    cv.triangle_h(ix + 5, y + (ROW_H - 2 - 8) / 2, 8, false, GOLD);
+                } else if e.is_dir {
                     let c = if selected { p.sel_text } else { p.accent };
                     folder_icon(cv, ix + 2, iy, ICON - 4, c);
+                } else if hud {
+                    // Files carry no glyph in A; the name says enough.
                 } else {
                     let c = kind_color(files::kind_of(&e.name), p);
                     file_icon(cv, ix + 2, iy, ICON - 4, c);
@@ -1248,6 +1280,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                 if e.link {
                     name.push('@');
                 }
+                let tc = if hud && e.is_dir { GOLD } else { tc };
                 cv.text(&name, name_x, ty, tc);
                 // The size column, right-aligned. A directory has no
                 // meaningful one.
@@ -1287,10 +1320,10 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                 (p.accent, p.on_accent)
             };
             let bty = by + (BTN_H - GLYPH_H) / 2;
-            cv.round_rect(bx, by, pw_, BTN_H, 6, fill);
+            cv.round_rect(bx, by, pw_, BTN_H, rad(6), fill);
             cv.text_bold(&primary, bx + 14, bty, on);
-            cv.round_rect(cx, by, cw, BTN_H, 6, p.border);
-            cv.round_rect(cx + 1, by + 1, cw - 2, BTN_H - 2, 5, p.panel);
+            cv.round_rect(cx, by, cw, BTN_H, rad(6), p.border);
+            cv.round_rect(cx + 1, by + 1, cw - 2, BTN_H - 2, rad(5), p.panel);
             cv.text(cancel, cx + 14, bty, p.text);
             buttons.push(((cx, by, cw, BTN_H), Button::Cancel));
             buttons.push(((bx, by, pw_, BTN_H), Button::Primary));
@@ -2835,6 +2868,25 @@ mod tests {
         st.launch(&files::join_child(&base, "a.txt"));
         assert!(!st.done);
         assert!(st.note.contains("programa-que-no-existe"), "{}", st.note);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tecno_marks_folders_in_gold_and_the_other_looks_do_not() {
+        let base = tree("gold");
+        let golds = |look: Look| {
+            let mut st = state(Mode::Browse, &base);
+            st.look = look;
+            st.pal = palette(look);
+            let (w, h) = (900usize, 560usize);
+            let mut cv = Canvas::new(w, h);
+            let _ = draw_browser(&mut cv, w, h, &st);
+            let mut px = vec![0u8; w * h * 4];
+            assert!(cv.blit_xrgb(&mut px));
+            px.chunks(4).filter(|p| (p[2], p[1], p[0]) == GOLD).count()
+        };
+        assert!(golds(Look::Tecno) > 20, "no gold folder in tecno");
+        assert_eq!(golds(Look::Eclipse), 0, "gold leaked into eclipse");
         let _ = std::fs::remove_dir_all(&base);
     }
 
