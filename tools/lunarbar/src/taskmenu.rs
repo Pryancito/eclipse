@@ -5,8 +5,9 @@
 //! Now it is a complete window menu: every action wlr-foreign-toplevel offers
 //! — restore or minimise, maximise or restore the size, enter or leave
 //! fullscreen — labelled for the state the window is in, each with its own
-//! pictogram, the row under the pointer lit, ↑/↓ and Enter to drive it, and
-//! closing set apart under a rule in the warning colour.
+//! pictogram and, where labwc binds one, its shortcut, the row under the
+//! pointer lit, ↑/↓ and Enter to drive it, and closing set apart under a rule
+//! in the warning colour.
 //!
 //! A child of `main.rs` because that file is at its size ceiling (see
 //! `xtask/src/tamano.rs`).
@@ -33,7 +34,7 @@ const HEAD_H: i32 = 32;
 const PAD: i32 = 8;
 /// The rule between the window's actions and closing it.
 const GAP: i32 = 8;
-const PW: i32 = 264;
+const PW: i32 = 288;
 const ICON: i32 = 16;
 
 /// One row: label, action, pictogram, and whether it is the destructive one.
@@ -42,7 +43,37 @@ pub struct Item {
     pub act: Action,
     pub ink: &'static [Ink],
     pub danger: bool,
+    /// The labwc shortcut for the same action, shown at the row's end.
+    pub keys: Keys,
 }
+
+/// A shortcut as the row shows it. These are the bindings `rc.xml` gives
+/// every look (`xtask/src/linux/desktop.rs`: `W-Down` Iconify, `W-Up`
+/// ToggleMaximize, `A-F4` Close); the arrows are drawn, not typed, so the
+/// hint reads the same with the bitmap face, which has no arrow glyphs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keys {
+    None,
+    /// Super plus an arrow, up when true.
+    Super(bool),
+    Text(&'static str),
+}
+
+impl Keys {
+    /// Pixel width of the hint.
+    pub fn width(self) -> i32 {
+        match self {
+            Keys::None => 0,
+            Keys::Super(_) => Canvas::text_width(Self::SUPER) + ARROW,
+            Keys::Text(t) => Canvas::text_width(t),
+        }
+    }
+
+    const SUPER: &'static str = "Super+";
+}
+
+/// The drawn arrow of a [`Keys::Super`] hint.
+const ARROW: i32 = 8;
 
 const I_FOCUS: &[Ink] = &[
     Ink::Oval(2.0, 2.0, 8.0, 8.0),
@@ -90,25 +121,25 @@ pub fn items(tid: u32, w: Win) -> Vec<Item> {
     let t = |a: &'static str, b: &'static str| if es { a } else { b };
     let mut v = Vec::new();
     if w.minimized {
-        v.push(Item { label: t("restaurar", "restore"), act: Action::TaskFocus(tid), ink: I_RESTORE_UP, danger: false });
+        v.push(Item { label: t("restaurar", "restore"), act: Action::TaskFocus(tid), ink: I_RESTORE_UP, danger: false, keys: Keys::None });
     } else if !w.activated {
         // Offered only to a window that does not have the focus already.
-        v.push(Item { label: t("enfocar", "focus"), act: Action::TaskFocus(tid), ink: I_FOCUS, danger: false });
+        v.push(Item { label: t("enfocar", "focus"), act: Action::TaskFocus(tid), ink: I_FOCUS, danger: false, keys: Keys::None });
     }
     if !w.minimized {
-        v.push(Item { label: t("minimizar", "minimize"), act: Action::TaskMinimize(tid), ink: I_MIN, danger: false });
+        v.push(Item { label: t("minimizar", "minimize"), act: Action::TaskMinimize(tid), ink: I_MIN, danger: false, keys: Keys::Super(false) });
     }
     v.push(if w.maximized {
-        Item { label: t("restaurar tamaño", "unmaximize"), act: Action::TaskMaximize(tid), ink: I_UNMAX, danger: false }
+        Item { label: t("restaurar tamaño", "unmaximize"), act: Action::TaskMaximize(tid), ink: I_UNMAX, danger: false, keys: Keys::Super(true) }
     } else {
-        Item { label: t("maximizar", "maximize"), act: Action::TaskMaximize(tid), ink: I_MAX, danger: false }
+        Item { label: t("maximizar", "maximize"), act: Action::TaskMaximize(tid), ink: I_MAX, danger: false, keys: Keys::Super(true) }
     });
     v.push(if w.fullscreen {
-        Item { label: t("pantalla normal", "leave fullscreen"), act: Action::TaskFullscreen(tid), ink: I_UNFULL, danger: false }
+        Item { label: t("pantalla normal", "leave fullscreen"), act: Action::TaskFullscreen(tid), ink: I_UNFULL, danger: false, keys: Keys::None }
     } else {
-        Item { label: t("pantalla completa", "fullscreen"), act: Action::TaskFullscreen(tid), ink: I_FULL, danger: false }
+        Item { label: t("pantalla completa", "fullscreen"), act: Action::TaskFullscreen(tid), ink: I_FULL, danger: false, keys: Keys::None }
     });
-    v.push(Item { label: t("cerrar ventana", "close window"), act: Action::TaskClose(tid), ink: I_CLOSE, danger: true });
+    v.push(Item { label: t("cerrar ventana", "close window"), act: Action::TaskClose(tid), ink: I_CLOSE, danger: true, keys: Keys::Text("Alt+F4") });
     v
 }
 
@@ -174,7 +205,19 @@ pub fn draw(
         cv.line_icon(px + 14, ry + (ROW_H - ICON) / 2, ICON, it.ink, ic);
         let label = if tecno() { it.label.to_uppercase() } else { it.label.to_string() };
         let col = if lit { pal().text } else { pal().muted };
-        cv.text(&label, px + 14 + ICON + 12, ry + (ROW_H - GLYPH_H) / 2, col);
+        let ty = ry + (ROW_H - GLYPH_H) / 2;
+        cv.text(&label, px + 14 + ICON + 12, ty, col);
+        let kx = px + pw - 14 - it.keys.width();
+        match it.keys {
+            Keys::None => {}
+            Keys::Super(up) => {
+                let ax = kx + cv.text(Keys::SUPER, kx, ty, pal().dim);
+                cv.triangle(ax, ry + (ROW_H - ARROW) / 2, ARROW, up, pal().dim);
+            }
+            Keys::Text(t) => {
+                cv.text(t, kx, ty, pal().dim);
+            }
+        }
         hits.push((px + 5, ry, px + pw - 5, ry + ROW_H, it.act));
         ry += ROW_H;
     }
@@ -251,7 +294,9 @@ mod tests {
             let (pw, ph) = size(w);
             assert_eq!(ph, HEAD_H + items(0, w).len() as i32 * ROW_H + GAP + PAD);
             for it in items(0, w) {
-                assert!(14 + ICON + 12 + Canvas::text_width(it.label) <= pw - 8, "{}", it.label);
+                // Label, a gap of at least two cells, then the shortcut.
+                let end = 14 + ICON + 12 + Canvas::text_width(it.label) + 2 * GLYPH_W;
+                assert!(end <= pw - 14 - it.keys.width(), "{}", it.label);
             }
         }
     }
