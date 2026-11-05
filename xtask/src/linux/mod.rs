@@ -76,6 +76,8 @@ struct LunarTools {
     lock: PathBuf,
     /// Screenshots, behind Print and Shift+Print.
     shot: PathBuf,
+    /// The desktops overview, behind Super+Tab.
+    desk: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -3528,6 +3530,7 @@ impl LinuxRootfs {
             hunter: lunarhunter,
             lock: lunarlock,
             shot: lunarshot,
+            desk: lunardesk,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3605,6 +3608,15 @@ impl LinuxRootfs {
             fs::copy(&lunarshot, bin.join("lunarshot")).unwrap();
         } else {
             eprintln!("warning: lunarshot not built; Print does nothing");
+        }
+
+        // lunardesk: the desktops at a glance (Super+Tab), one plate per
+        // desktop with its windows, from the map the bar keeps.
+        if lunardesk.is_file() {
+            let _ = dir::rm(bin.join("lunardesk"));
+            fs::copy(&lunardesk, bin.join("lunardesk")).unwrap();
+        } else {
+            eprintln!("warning: lunardesk not built; Super+Tab does nothing");
         }
     }
 
@@ -3731,6 +3743,7 @@ impl LinuxRootfs {
         let hunter = out.join("lunarhunter");
         let lock = out.join("lunarlock");
         let shot = out.join("lunarshot");
+        let desk = out.join("lunardesk");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3750,7 +3763,7 @@ impl LinuxRootfs {
         // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
         // clipboard at all, and the stale-binary check would happily ship
         // that. (That is exactly what happened the day lunarfile arrived.)
-        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter, &lock, &shot]
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter, &lock, &shot, &desk]
             .iter()
             .map(|p| fs::metadata(p).ok()?.modified().ok())
             .collect();
@@ -3764,6 +3777,7 @@ impl LinuxRootfs {
                     hunter,
                     lock,
                     shot,
+                    desk,
                 };
             }
         }
@@ -3799,6 +3813,7 @@ impl LinuxRootfs {
             hunter,
             lock,
             shot,
+            desk,
         }
     }
 
