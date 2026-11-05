@@ -69,6 +69,7 @@ pub fn install(rootfs: &Path) {
     write_freedoom_desktop_entries(rootfs);
     write_files_desktop_entry(rootfs);
     write_hunter_desktop_entry(rootfs);
+    super::network::write_network_desktop_entry(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1177,8 +1178,9 @@ fn write_x11_prepare(rootfs: &Path) {
           # default route when the session starts -- which the SVG self-heal\n\
           # below then correctly reports as \"no network to fetch one\". A\n\
           # desktop wants the network anyway. Bounded retries so an isolated\n\
-          # machine costs a few seconds, not a stall.\n\
-          if ! have_default_route; then\n\
+          # machine costs a few seconds, not a stall. Not when the network\n\
+          # was set by hand in lunarnet: no route may be what was asked for.\n\
+          if ! have_default_route && [ ! -e /etc/eclipse/network ]; then\n\
           \x20 if command -v udhcpc >/dev/null 2>&1; then\n\
           \x20   echo '[prepare] no default route; running udhcpc'\n\
           \x20   for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
