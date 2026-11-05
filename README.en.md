@@ -1,7 +1,5 @@
 # Eclipse OS
 
-[![Total downloads](https://img.shields.io/github/downloads/Pryancito/eclipse/total)](https://github.com/Pryancito/eclipse/releases)
-[![Latest release downloads](https://img.shields.io/github/downloads/Pryancito/eclipse/latest/total)](https://github.com/Pryancito/eclipse/releases/latest)
 [![Repository clones](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones.json)](.github/workflows/clones-badge.yml)
 [![Unique clones](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones-uniques.json)](.github/workflows/clones-badge.yml)
 
