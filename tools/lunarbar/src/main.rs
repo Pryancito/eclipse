@@ -472,6 +472,8 @@ enum Hover {
     Kbd,
     /// hunter's shield (bottom bar); click for its menu.
     Hunter,
+    /// The notification history chip; click opens `lunarnotes`.
+    Notes,
 }
 
 /// Click/hover target for one taskbar button.
@@ -535,6 +537,8 @@ struct Bar {
     kbd_hit: (i32, i32),
     /// x-range [x0,x1) of hunter's shield.
     hunter_hit: (i32, i32),
+    /// x-range [x0,x1) of the notification chip.
+    notes_hit: (i32, i32),
     /// Click targets for each window button (Task bars).
     task_hits: Vec<TaskHit>,
     /// x-ranges of the desktop chips (tecno top bar), in chip order.
@@ -781,6 +785,8 @@ struct Metrics {
     kbd: String,
     /// hunter's shield; None (no hunter in this kernel) hides it.
     hunter: Option<hunter::Shield>,
+    /// Notifications not looked at yet (`lunarbar::notes`).
+    notes: usize,
     /// The last minute of the three metrics that move, so a meter can draw
     /// where a value came from and not only where it is. Held on `State` and
     /// cloned in here per tick, because the snapshot is rebuilt every time
@@ -895,6 +901,7 @@ impl State {
             vol_muted: self.vol_muted,
             kbd: sysinfo::kbd_layout(),
             hunter: self.metrics.hunter,
+            notes: self.toasts.unseen,
             cpu_hist: self.hist.0.clone(),
             mem_hist: self.hist.1.clone(),
             net_hist: self.hist.2.clone(),
@@ -983,6 +990,7 @@ impl State {
                     power_hit: (0, 0),
                     kbd_hit: (0, 0),
                     hunter_hit: (0, 0),
+                    notes_hit: (0, 0),
                     task_hits: Vec::new(),
                     ws_hits: Vec::new(),
                 };
@@ -1153,6 +1161,7 @@ impl State {
             bar.power_hit = (0, 0);
             bar.kbd_hit = (0, 0);
             bar.hunter_hit = (0, 0);
+            bar.notes_hit = (0, 0);
             bar.hover = Hover::None;
             bar.width = w;
             bar.height = h;
@@ -1264,7 +1273,7 @@ impl State {
                     bar.busy[i] = false;
                     return;
                 };
-                let (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit) =
+                let (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit, notes_hit) =
                     draw_task(&mut cv, w, h, &items, &m, hover, &mut self.icons);
                 let bar = &mut self.bars[idx];
                 let data: &mut [u8] = unsafe {
@@ -1280,6 +1289,7 @@ impl State {
                 bar.power_hit = power_hit;
                 bar.kbd_hit = kbd_hit;
                 bar.hunter_hit = hunter_hit;
+                bar.notes_hit = notes_hit;
                 bar.task_hits = hits;
                 commit_bar(bar, i);
             }
@@ -2198,6 +2208,8 @@ impl State {
             Hover::Kbd
         } else if x >= bar.hunter_hit.0 && x < bar.hunter_hit.1 {
             Hover::Hunter
+        } else if x >= bar.notes_hit.0 && x < bar.notes_hit.1 {
+            Hover::Notes
         } else if let Some(h) = bar.task_hits.iter().find(|h| x >= h.x0 && x < h.x1) {
             Hover::Task(h.tid)
         } else {
@@ -2568,6 +2580,7 @@ fn draw_task(
     (i32, i32),
     (i32, i32),
     (i32, i32),
+    (i32, i32),
 ) {
     clear_bar(cv, w, h);
     // border-top: 2px solid, or the tecno edge; see `bar_edge`.
@@ -2593,6 +2606,7 @@ fn draw_task(
     let mut power_hit = (0, 0);
     let mut kbd_hit = (0, 0);
     let mut hunter_hit = (0, 0);
+    let notes_hit;
 
     {
         // Power button: far right
@@ -2657,6 +2671,7 @@ fn draw_task(
             let hovered = hover == Hover::Hunter;
             hunter_hit = hunter_menu::draw_badge(cv, &mut rx, left_min, btn_y, btn_h, hovered, s);
         }
+        notes_hit = hunter_toast::draw_notes_badge(cv, &mut rx, left_min, btn_y, btn_h, hover == Hover::Notes, m.notes);
 
         // Volume module
         if let Some(v) = m.vol {
@@ -2818,7 +2833,7 @@ fn draw_task(
         x += bw + 4;
     }
 
-    (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit)
+    (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit, notes_hit)
 }
 
 /// The rule that closes a bar against the desktop: `y_edge` is the row that
@@ -3566,6 +3581,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let (px0, px1) = state.bars[idx].power_hit;
                 let (kx0, kx1) = state.bars[idx].kbd_hit;
                 let (hx0, hx1) = state.bars[idx].hunter_hit;
+                let (nx0, nx1) = state.bars[idx].notes_hit;
                 if button == BTN_LEFT && x >= lx0 && x < lx1 {
                     state.toggle_apps(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= cx0 && x < cx1 {
@@ -3576,6 +3592,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.toggle_power(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= kx0 && x < kx1 {
                     state.toggle_kbd();
+                } else if button == BTN_LEFT && x >= nx0 && x < nx1 {
+                    lunarbar::proc::spawn_detached("lunarnotes");
                 } else if button == BTN_LEFT && x >= hx0 && x < hx1 {
                     state.toggle_hunter(qh, role == Role::Info);
                 } else if let Some(n) = state.bars[idx].ws_hits.iter().position(|h| x >= h.0 && x < h.1) {
@@ -4274,6 +4292,7 @@ fn main() {
             kbd: sysinfo::kbd_layout(),
             // Shown even off Eclipse OS, so the preview has the shield in it.
             hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
+            notes: 3,
             cpu_hist: h.0,
             mem_hist: h.1,
             net_hist: h.2,

@@ -46,6 +46,8 @@ pub mod keys;
 pub mod list;
 pub mod look;
 pub mod meter;
+pub mod netconf;
+pub mod notes;
 pub mod obmenu;
 pub mod open;
 pub mod par;

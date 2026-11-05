@@ -7,6 +7,7 @@ mod hunterd;
 mod image;
 mod locales;
 mod logo;
+mod network;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
 mod nvidia_userspace;
@@ -78,6 +79,10 @@ struct LunarTools {
     shot: PathBuf,
     /// The desktops overview, behind Super+Tab.
     desk: PathBuf,
+    /// The notification history, behind Super+N and the bar's AVISOS chip.
+    notes: PathBuf,
+    /// The network settings ("Red"), and the boot network service.
+    net: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -216,15 +221,7 @@ impl LinuxRootfs {
                 let _ = dir::rm(bin.join("eclipse-sdl-probe"));
                 let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
             }
-            let (dbusd, portald) = self.eclipse_dbusd();
-            if dbusd.is_file() {
-                let _ = dir::rm(bin.join("eclipse-dbusd"));
-                let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
-            }
-            if portald.is_file() {
-                let _ = dir::rm(bin.join("eclipse-portald"));
-                let _ = fs::copy(&portald, bin.join("eclipse-portald"));
-            }
+            self.install_dbus_tools(&bin);
             self.install_thread_tests(&dir);
             // The desktop's own clients. They were copied only on a
             // from-scratch build, so an ordinary `make image` kept whatever
@@ -483,7 +480,7 @@ impl LinuxRootfs {
                       break\n\
                     done\n\
                   fi\n\
-                  if [ -n \"$dns\" ]; then\n\
+                  if [ -n \"$dns\" ] && [ ! -e /run/lunarnet/dns ]; then\n\
                     : > \"$RESOLV_CONF\"\n\
                     for d in $dns; do\n\
                       echo \"nameserver $d\" >> \"$RESOLV_CONF\"\n\
@@ -517,7 +514,7 @@ impl LinuxRootfs {
                   fi\n\
                   # Append IPv6 nameservers without truncating -> a full rewrite\n\
                   # would wipe DHCPv4 nameservers already written by udhcpc.\n\
-                  if [ -n \"$dns\" ]; then\n\
+                  if [ -n \"$dns\" ] && [ ! -e /run/lunarnet/dns ]; then\n\
                     touch \"$RESOLV_CONF\"\n\
                     for d in $dns; do\n\
                       grep -q \"^nameserver $d\\$\" \"$RESOLV_CONF\" 2>/dev/null \\\n\
@@ -669,22 +666,7 @@ impl LinuxRootfs {
         // package mirror in reach still gets a session bus -- which is what
         // SDL_Init(), GtkApplication and every RequestName-based single-
         // instance check need before they will run at all.
-        let (dbusd, portald) = self.eclipse_dbusd();
-        if dbusd.is_file() {
-            let _ = dir::rm(bin.join("eclipse-dbusd"));
-            fs::copy(&dbusd, bin.join("eclipse-dbusd")).unwrap();
-        } else {
-            eprintln!("warning: eclipse-dbusd not built; the session bus needs the dbus package");
-        }
-
-        // eclipse-portald: the XDG desktop portal, so that an application
-        // whose "Open file" is a D-Bus call gets a dialog at all.
-        if portald.is_file() {
-            let _ = dir::rm(bin.join("eclipse-portald"));
-            fs::copy(&portald, bin.join("eclipse-portald")).unwrap();
-        } else {
-            eprintln!("warning: eclipse-portald not built; there will be no file-chooser portal");
-        }
+        self.install_dbus_tools(&bin);
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
         // `wavplay --tone` is the smoke test for HDMI audio on the RTX cards.
@@ -3376,6 +3358,7 @@ impl LinuxRootfs {
         )
         .unwrap();
         portal::write_wrapper(localbin);
+        portal::write_notify_wrapper(localbin);
 
         // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
         // refuses uid 0), and in that mode its main.c connects to the system
@@ -3531,6 +3514,8 @@ impl LinuxRootfs {
             lock: lunarlock,
             shot: lunarshot,
             desk: lunardesk,
+            notes: lunarnotes,
+            net: lunarnet,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3617,6 +3602,20 @@ impl LinuxRootfs {
             fs::copy(&lunardesk, bin.join("lunardesk")).unwrap();
         } else {
             eprintln!("warning: lunardesk not built; Super+Tab does nothing");
+        }
+
+        // lunarnotes: the notification history (Super+N, the AVISOS chip).
+        if lunarnotes.is_file() {
+            let _ = dir::rm(bin.join("lunarnotes"));
+            fs::copy(&lunarnotes, bin.join("lunarnotes")).unwrap();
+        } else {
+            eprintln!("warning: lunarnotes not built; Super+N does nothing");
+        }
+        if lunarnet.is_file() {
+            let _ = dir::rm(bin.join("lunarnet"));
+            fs::copy(&lunarnet, bin.join("lunarnet")).unwrap();
+        } else {
+            eprintln!("warning: lunarnet not built; the network is DHCPv4 only");
         }
     }
 
@@ -3744,6 +3743,8 @@ impl LinuxRootfs {
         let lock = out.join("lunarlock");
         let shot = out.join("lunarshot");
         let desk = out.join("lunardesk");
+        let notes = out.join("lunarnotes");
+        let net = out.join("lunarnet");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3772,6 +3773,8 @@ impl LinuxRootfs {
             &lock,
             &shot,
             &desk,
+            &notes,
+            &net,
         ]
         .iter()
         .map(|p| fs::metadata(p).ok()?.modified().ok())
@@ -3787,6 +3790,8 @@ impl LinuxRootfs {
                     lock,
                     shot,
                     desk,
+                    notes,
+                    net,
                 };
             }
         }
@@ -3823,6 +3828,8 @@ impl LinuxRootfs {
             lock,
             shot,
             desk,
+            notes,
+            net,
         }
     }
 
@@ -4508,6 +4515,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         .unwrap();
 
         portal::write_service(svc_dir);
+        portal::write_notify_service(svc_dir);
 
         // D-Bus system bus, on libdbus's compiled-in default address. A second
         // bus, independent of the session one above; see eclipse-dbus-system
@@ -4885,31 +4893,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
         .unwrap();
 
-        fs::write(
-            localbin.join("eclipse-udhcpc"),
-            b"#!/bin/sh\n\
-              # Eclipse OS: foreground DHCP on the first real interface, for\n\
-              # eclipse-init. Runs udhcpc in the foreground (init supervises it)\n\
-              # and keeps renewing the lease; if it dies, init respawns it.\n\
-              command -v udhcpc >/dev/null 2>&1 || { echo 'eclipse-udhcpc: udhcpc not found' >&2; sleep 5; exit 127; }\n\
-              # -s is NOT optional: busybox udhcpc's compiled-in default script\n\
-              # path is not where Eclipse stages the script, so without -s the\n\
-              # lease is obtained but never APPLIED -- the address, resolv.conf\n\
-              # and route are all set by this script on the 'bound' event.\n\
-              SCRIPTv4=/usr/share/udhcpc/default.script\n\
-              [ -x \"$SCRIPTv4\" ] || SCRIPTv4=/etc/udhcpc/default.script\n\
-              # (udhcpc6 would need its own service: anything after an `exec`\n\
-              # that succeeds is unreachable, so only IPv4 DHCP runs here.)\n\
-              for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
-              \x20 exec udhcpc -i \"$i\" -f -R -s \"$SCRIPTv4\"\n\
-              done\n\
-              # `ip` may not have listed anything yet (netlink dump raced the\n\
-              # NIC probe). eth0 is the sequential name the kernel assigns to\n\
-              # the first Ethernet NIC.\n\
-              echo 'eclipse-udhcpc: no interface from ip link; trying eth0' >&2\n\
-              exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
-        )
-        .unwrap();
+        network::write_udhcpc_wrapper(localbin);
         Self::write_oopslog(localbin, svc_dir);
         Self::write_hunterd(localbin, svc_dir);
 
