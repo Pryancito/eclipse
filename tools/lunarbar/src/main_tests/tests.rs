@@ -462,8 +462,17 @@ fn the_weekend_columns_are_drawn_dimmer_than_the_weekdays() {
     let saturday = &cells[0][5];
     let sunday = &cells[0][6];
     assert!(!friday.is_empty() && !saturday.is_empty() && !sunday.is_empty());
-    assert_ne!(friday, saturday, "Saturday is drawn as a weekday");
-    assert_eq!(saturday, sunday, "the two weekend days differ");
+    // Compared by the full-strength ink of each cell, not by every colour in
+    // it: anti-aliased digits leave a different set of edge blends for a 2
+    // than for a 3 even when both are drawn in one colour. Every look is
+    // dark, so the full-strength ink is the brightest.
+    let core = |ink: &Ink| {
+        *ink.iter()
+            .max_by_key(|c| c.iter().map(|&v| v as u32).sum::<u32>())
+            .unwrap()
+    };
+    assert_ne!(core(friday), core(saturday), "Saturday is drawn as a weekday");
+    assert_eq!(core(saturday), core(sunday), "the two weekend days differ");
 }
 
 /// The month is named in full over the grid. The short form is the date
