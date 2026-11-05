@@ -706,7 +706,25 @@ fn syscall_num(ctx: &UserContext) -> usize {
         } else if #[cfg(target_arch = "aarch64")] {
             regs.x16
         } else if #[cfg(target_arch = "riscv64")] {
-            regs.a7
+            // `t0`, not `a7`. Fuchsia's riscv64 syscall ABI keeps the number
+            // out of the argument registers, exactly as aarch64 keeps it in
+            // `x16`: `a0`-`a7` are the eight arguments and `t0` is the
+            // number. Reading `a7` read the EIGHTH ARGUMENT as the syscall
+            // number, so every call with fewer than eight arguments
+            // dispatched on whatever junk `a7` happened to hold.
+            //
+            // Measured, not remembered -- the stubs in the prebuilt
+            // `libzircon.so` for riscv64 say so themselves:
+            //
+            // ```text
+            // 0000000000000cde4 <zx_channel_read>:
+            //     cde4: li   t0, 0x8      # CHANNEL_READ = 8
+            //     cde6: ecall
+            // 000000000000d12e <zx_process_exit>:
+            //     d12e: li   t0, 0x61     # PROCESS_EXIT = 97
+            //     d132: ecall
+            // ```
+            regs.t0
         } else {
             unimplemented!()
         }
@@ -1314,5 +1332,137 @@ mod vdso_time_redirect_tests {
     #[test]
     fn a_blob_that_is_not_an_elf_is_declined() {
         assert!(vdso_time_redirect_writes(b"not an elf at all", |_| Some(STUB)).is_none());
+    }
+}
+
+/// Every architecture's Zircon syscall ABI: the register the number arrives
+/// in, and the eight the arguments arrive in, spelled as names.
+///
+/// All three are listed unconditionally, and the test below checks all three,
+/// so the x86_64 the CI runs its tests on catches a mistake in the riscv64 or
+/// aarch64 rows. A table behind a `cfg` would have checked only the row of
+/// the machine running the test, which is exactly how this went unnoticed:
+/// `syscall_num` read `a7` on riscv64 while `syscall_args` passed that same
+/// `a7` as the eighth argument, so the kernel took **the eighth argument as
+/// the syscall number** and any call with fewer than eight arguments
+/// dispatched on whatever junk the register held. Measured against the
+/// prebuilt `libzircon.so`, whose riscv64 stubs are `li t0, <number>; ecall`.
+///
+/// This is documentation, and the test over it only proves the rows are
+/// self-consistent. What proves the *code* right is
+/// `the_syscall_number_is_never_read_from_an_argument_register`, which runs
+/// [`syscall_num`] and [`syscall_args`] themselves.
+#[cfg(test)]
+const SYSCALL_ABIS: [(&str, &str, [&str; 8]); 3] = [
+    // libos passes x86_64's last two arguments on the stack; the row below is
+    // the bare-metal one, which is what the invariant is about.
+    (
+        "x86_64",
+        "rax",
+        ["rdi", "rsi", "rdx", "r10", "r8", "r9", "r12", "r13"],
+    ),
+    (
+        "aarch64",
+        "x16",
+        ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+    ),
+    (
+        "riscv64",
+        "t0",
+        ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"],
+    ),
+];
+
+#[cfg(test)]
+mod syscall_abi_tests {
+    use super::{syscall_args, syscall_num, SYSCALL_ABIS};
+    use kernel_hal::context::UserContext;
+
+    /// The value written into general register slot `i`. Far from any real
+    /// syscall number, and unique per slot, so the number a register read
+    /// yields names the register it came from.
+    const MARK: usize = 0x5a5a_0000;
+
+    /// What the x86_64 libos path finds on the user stack. Distinct from
+    /// every `MARK`, so a stack-sourced argument cannot be mistaken for a
+    /// register-sourced one.
+    #[cfg(all(target_arch = "x86_64", feature = "libos"))]
+    const STACK_MARK: usize = 0x7b7b_0000;
+
+    /// Run the production accessors against a context whose every general
+    /// register holds a value unique to it, and check that the number did not
+    /// come out of an argument register.
+    ///
+    /// This is the test that would have caught the bug. The table above is
+    /// only a table: putting `a7` back in its riscv64 row fails
+    /// `no_architecture_takes_its_syscall_number_from_an_argument_register`,
+    /// but putting `regs.a7` back in `syscall_num` would not have, because
+    /// nothing there reads the code. This does.
+    #[test]
+    fn the_syscall_number_is_never_read_from_an_argument_register() {
+        let mut ctx = UserContext::default();
+        // Written as slots rather than by field name on purpose: naming them
+        // would mean one list per architecture, which is the duplication
+        // this test exists to remove. `GeneralRegs` is `#[repr(C)]` and
+        // every field is a `usize`, on all three architectures.
+        let slots = core::mem::size_of::<kernel_hal::context::GeneralRegs>()
+            / core::mem::size_of::<usize>();
+        #[allow(unsafe_code)]
+        // SAFETY: `GeneralRegs` is `#[repr(C)]` with `slots` fields, all of
+        // them `usize`, so it has the layout of `[usize; slots]` and the
+        // borrow of `ctx` keeps it alive and exclusive for the slice.
+        let regs: &mut [usize] = unsafe {
+            core::slice::from_raw_parts_mut(ctx.general_mut() as *mut _ as *mut usize, slots)
+        };
+        for (i, slot) in regs.iter_mut().enumerate() {
+            *slot = MARK + i;
+        }
+
+        // x86_64's libos path takes its last two arguments off the user
+        // stack, so the stack pointer has to point at memory this test owns.
+        #[cfg(all(target_arch = "x86_64", feature = "libos"))]
+        let stack = [STACK_MARK, STACK_MARK + 1];
+        #[cfg(all(target_arch = "x86_64", feature = "libos"))]
+        {
+            ctx.general_mut().rsp = stack.as_ptr() as usize;
+        }
+
+        let number = syscall_num(&ctx);
+        let args = syscall_args(&ctx);
+        assert!(
+            !args.contains(&number),
+            "syscall_num read the same register syscall_args passes as \
+             argument {}: the kernel takes an argument as the syscall number",
+            args.iter().position(|a| *a == number).unwrap_or(0) + 1,
+        );
+    }
+
+    #[test]
+    fn no_architecture_takes_its_syscall_number_from_an_argument_register() {
+        for (arch, number, args) in SYSCALL_ABIS {
+            assert!(
+                !args.contains(&number),
+                "on {} the syscall number register {} is also argument {}: \
+                 the kernel would read an argument as the number",
+                arch,
+                number,
+                args.iter().position(|a| *a == number).unwrap_or(0) + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn no_architecture_passes_one_register_as_two_arguments() {
+        for (arch, _, args) in SYSCALL_ABIS {
+            for (i, a) in args.iter().enumerate() {
+                assert!(
+                    !args[..i].contains(a),
+                    "on {} the register {} is passed as two different \
+                     arguments",
+                    arch,
+                    a
+                );
+            }
+        }
     }
 }
