@@ -20,7 +20,7 @@ fn apps(n: usize) -> PopupKind {
 }
 
 const KINDS: [fn() -> PopupKind; 4] = [
-    || PopupKind::Calendar { year: 2026, month: 8 },
+    || PopupKind::Calendar { year: 2026, month: 8, hover: None },
     || PopupKind::PowerMenu { sel: 0, armed: None },
     || PopupKind::TaskMenu { tid: 1, title: String::new(), win: taskmenu::Win::default(), sel: 0 },
     || PopupKind::Volume { level: 50, muted: false, devices: Vec::new() },
@@ -305,12 +305,14 @@ fn the_calendar_panel_holds_seven_columns_and_six_rows() {
         &PopupKind::Calendar {
             year: 2021,
             month: 0,
+            hover: None,
         },
         1080,
         34,
     );
-    assert_eq!(pw, 7 * CAL_CELL_W + 2 * CAL_PAD);
-    assert_eq!(ph, CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD);
+    assert_eq!((pw, ph), calmenu::size());
+    assert_eq!(pw, calmenu::WEEK_W + 7 * CAL_CELL_W + 2 * CAL_PAD);
+    assert_eq!(ph, CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD + calmenu::FOOT_H);
     // Six rows is the most any month needs, and every month there is
     // needs no more: the grid is drawn at a fixed six, so the panel
     // height does not change as the user walks through the months.
@@ -390,7 +392,7 @@ type Hits = Vec<(i32, i32, i32, i32, Action)>;
 /// empty and the 31st lands in the last column of the fifth row -- a month
 /// that pins the row, the column and both ends of the range at once.
 fn cal_cells(year: i32, month: u32) -> (Vec<Vec<Ink>>, Hits) {
-    let kind = PopupKind::Calendar { year, month };
+    let kind = PopupKind::Calendar { year, month, hover: None };
     let (pw, ph) = popup_size(&kind, 1080, 34);
     let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
     let (w, h) = (
@@ -412,7 +414,7 @@ fn cal_cells(year: i32, month: u32) -> (Vec<Vec<Ink>>, Hits) {
     for row in 0..6 {
         let mut cols = Vec::new();
         for col in 0..7 {
-            let x0 = px + CAL_PAD + col * CAL_CELL_W;
+            let x0 = calmenu::grid_x(px) + col * CAL_CELL_W;
             let y0 = gy + row * CAL_CELL_H;
             let mut ink: Ink = Vec::new();
             for y in (y0 + 3)..(y0 + CAL_CELL_H - 3) {
@@ -484,7 +486,7 @@ fn the_weekend_columns_are_drawn_dimmer_than_the_weekdays() {
 #[test]
 fn the_calendar_names_its_month_in_full() {
     let (year, month) = (2021, 0);
-    let kind = PopupKind::Calendar { year, month };
+    let kind = PopupKind::Calendar { year, month, hover: None };
     let (pw, ph) = popup_size(&kind, 1080, 34);
     let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
     let (w, h) = (

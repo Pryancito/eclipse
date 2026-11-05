@@ -66,13 +66,14 @@ mod taskmenu;
 mod powermenu;
 mod fx;
 mod volmenu;
+mod calmenu;
 use launcher::Row;
 use info::*;
 mod workspaces;
 mod hunter_toast;
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
-    KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
+    KEY_ESC_WL, KEY_HOME_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
     KEY_UP_WL, WHEEL_NOTCH,
 };
 
@@ -582,7 +583,7 @@ enum PopupKind {
         scroll: usize,
     },
     /// The month calendar, opened from the clock (bottom) or date (top) pill.
-    Calendar { year: i32, month: u32 },
+    Calendar { year: i32, month: u32, hover: Option<u32> },
     /// Power / Session menu popup: the lit row, and the row waiting for
     /// its confirming second press ([`powermenu`]).
     PowerMenu { sel: usize, armed: Option<Action> },
@@ -612,6 +613,10 @@ enum Action {
     Row(usize, Row),
     PrevMonth,
     NextMonth,
+    /// A day of the calendar's month (hover only).
+    CalDay(u8),
+    /// The calendar's way back to this month.
+    CalToday,
     PowerLock,
     PowerLogout,
     PowerReboot,
@@ -1467,7 +1472,7 @@ impl State {
         let Some((year, month, _)) = sysinfo::today() else {
             return;
         };
-        self.open_popup(qh, PopupKind::Calendar { year, month }, at_top);
+        self.open_popup(qh, PopupKind::Calendar { year, month, hover: None }, at_top);
     }
 
     /// Power button click: toggle the session power menu.
@@ -1896,6 +1901,8 @@ impl State {
             }
             Some(Action::PrevMonth) => self.cal_shift(qh, -1),
             Some(Action::NextMonth) => self.cal_shift(qh, 1),
+            Some(Action::CalToday) => self.cal_today(qh),
+            Some(Action::CalDay(_)) => {}
             Some(a @ (Action::PowerLock | Action::PowerLogout | Action::PowerReboot | Action::PowerShutdown)) => {
                 self.power_act(qh, a)
             }
@@ -1946,6 +1953,13 @@ impl State {
                     }
                 }
             }
+            if let PopupKind::Calendar { hover, .. } = &mut popup.kind {
+                let d = match hit {
+                    Some(Action::CalDay(d)) => Some(d as u32),
+                    _ => None,
+                };
+                changed |= std::mem::replace(hover, d) != d;
+            }
             if let (PopupKind::TaskMenu { tid, win, sel, .. }, Some(a)) = (&mut popup.kind, hit) {
                 if let Some(r) = taskmenu::items(*tid, *win).iter().position(|i| i.act == a) {
                     changed |= std::mem::replace(sel, r) != r;
@@ -1955,7 +1969,8 @@ impl State {
         if changed {
             self.render_popup(qh);
         }
-        self.set_cursor(if hit.is_some() { Shape::Pointer } else { Shape::Default });
+        let click = hit.is_some_and(|a| !matches!(a, Action::CalDay(_)));
+        self.set_cursor(if click { Shape::Pointer } else { Shape::Default });
     }
 
     /// Move the calendar by `dir` months (wrapping the year).
@@ -1963,9 +1978,10 @@ impl State {
         let Some(popup) = self.popup.as_mut() else {
             return;
         };
-        let PopupKind::Calendar { year, month, .. } = &mut popup.kind else {
+        let PopupKind::Calendar { year, month, hover } = &mut popup.kind else {
             return;
         };
+        *hover = None;
         let m = *month as i32 + dir;
         *year += m.div_euclid(12);
         *month = m.rem_euclid(12) as u32;
@@ -2004,6 +2020,7 @@ impl State {
             Close,
             Launch(String),
             Cal(i32),
+            CalToday,
             Render,
             Task(Action),
             Power(Action),
@@ -2127,6 +2144,8 @@ impl State {
                     KEY_RIGHT_WL | KEY_DOWN_WL => act = Do::Cal(1),
                     KEY_PGUP_WL => act = Do::Cal(-12),
                     KEY_PGDN_WL => act = Do::Cal(12),
+                    KEY_HOME_WL => act = Do::CalToday,
+                    k if key_char(k) == Some('t') => act = Do::CalToday,
                     _ => {}
                 },
                 _ => match key {
@@ -2146,6 +2165,7 @@ impl State {
                 self.spawn(&cmd);
             }
             Do::Cal(d) => self.cal_shift(qh, d),
+            Do::CalToday => self.cal_today(qh),
             // A keystroke that narrowed (or widened) the result list changes
             // how tall the panel has to be; the configure that answers the
             // reposition repaints it, so do not paint the old size first.
@@ -2905,10 +2925,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
                 APPS_HEADER_H + APPS_SEARCH_H + shown * APPS_ROW_H + APPS_PAD,
             )
         }
-        PopupKind::Calendar { .. } => (
-            7 * CAL_CELL_W + 2 * CAL_PAD,
-            CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD,
-        ),
+        PopupKind::Calendar { .. } => calmenu::size(),
         PopupKind::PowerMenu { .. } => powermenu::size(),
         PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
         PopupKind::Volume { .. } => volmenu::size(),
@@ -2982,7 +2999,7 @@ fn draw_popup(
             }
             draw_apps(cv, px, py, pw, ph, all, visible, *cat, filter, *sel, *scroll, icons)
         }
-        PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
+        PopupKind::Calendar { year, month, hover } => calmenu::draw(cv, px, py, pw, ph, *year, *month, *hover),
         PopupKind::PowerMenu { sel, armed } => {
             powermenu::draw(cv, px, py, pw, *sel, *armed, sysinfo::uptime().as_deref())
         }
@@ -3131,8 +3148,7 @@ fn draw_apps(
 
 // ── Calendar drawing ─────────────────────────────────────────────────────────
 
-/// Paint the month calendar into the panel rect. Today is highlighted; ◂/▸
-/// hitboxes shift the month. Returns the arrow hitboxes.
+/// Paint the month calendar with nothing under the pointer (see `calmenu`).
 fn draw_calendar(
     cv: &mut Canvas,
     px: i32,
@@ -3142,68 +3158,7 @@ fn draw_calendar(
     year: i32,
     month: u32,
 ) -> Vec<(i32, i32, i32, i32, Action)> {
-    let (cell_w, cell_h) = (CAL_CELL_W, CAL_CELL_H);
-    let pad = CAL_PAD;
-    let header_h = CAL_HEADER_H;
-    let wkd_h = CAL_WKD_H;
-    draw_panel(cv, px, py, pw, ph, 12);
-    cv.hline(px + 10, py + header_h - 1, pw - 20, pal().rule, 0.7);
-
-    // Header: ◂ month year ▸.
-    let ts = 10;
-    let ay = py + (header_h - ts) / 2;
-    cv.triangle_h(px + 16, ay, ts, true, pal().accent);
-    cv.triangle_h(px + pw - 16 - ts, ay, ts, false, pal().accent);
-    let title = format!(
-        "{} {}",
-        i18n::Lang::current().month_full()[month as usize % 12],
-        year
-    );
-    let title = if tecno() { title.to_uppercase() } else { title };
-    let tw = Canvas::text_width(&title);
-    cv.text_bold(&title, px + (pw - tw) / 2, py + (header_h - GLYPH_H) / 2, pal().text);
-    let hits = vec![
-        (px + 4, py, px + 44, py + header_h, Action::PrevMonth),
-        (px + pw - 44, py, px + pw - 4, py + header_h, Action::NextMonth),
-    ];
-
-    // Weekday header, Monday-first.
-    let wkd = i18n::Lang::current().weekday_mon_first();
-    for (i, wd) in wkd.iter().enumerate() {
-        let wd = &if tecno() { wd.to_uppercase() } else { wd.to_string() };
-        let x = px + pad + i as i32 * cell_w + (cell_w - Canvas::text_width(wd)) / 2;
-        cv.text(wd, x, py + header_h + (wkd_h - GLYPH_H) / 2, pal().dim);
-    }
-
-    // Day grid (6 rows always, so the panel height is stable across months).
-    let today = sysinfo::today();
-    let first = sysinfo::first_weekday_mon0(year, month) as i32;
-    let ndays = sysinfo::days_in_month(year, month) as i32;
-    let gy = py + header_h + wkd_h;
-    for d in 1..=ndays {
-        let idx = first + d - 1;
-        let (row, col) = (idx / 7, idx % 7);
-        let x = px + pad + col * cell_w;
-        let y = gy + row * cell_h;
-        let s = d.to_string();
-        let tx = x + (cell_w - Canvas::text_width(&s)) / 2;
-        let dy = y + (cell_h - GLYPH_H) / 2;
-        if today == Some((year, month, d as u32)) && tecno() {
-            // A's focus: the gold brackets, small, around today.
-            plate(cv, x + 2, y + 1, cell_w - 4, cell_h - 2, 0, pal().btn_active);
-            cv.brackets(x + 2, y + 1, cell_w - 4, cell_h - 2, 4, 1, TECNO_GOLD);
-            cv.text_bold(&s, tx, dy, pal().white);
-        } else if today == Some((year, month, d as u32)) {
-            plate(cv, x + 2, y + 1, cell_w - 4, cell_h - 2, 6, pal().rule);
-            cv.text_bold(&s, tx, dy, pal().white);
-        } else {
-            // Weekend columns slightly dimmed, like every desktop calendar.
-            let c = if col >= 5 { pal().dim } else { pal().muted };
-            cv.text(&s, tx, dy, c);
-        }
-    }
-
-    hits
+    calmenu::draw(cv, px, py, pw, ph, year, month, None)
 }
 
 // ── Power menu drawing ───────────────────────────────────────────────────────
@@ -4440,9 +4395,11 @@ fn main() {
                 draw_apps(&mut cv, px, py, pw, ph, &all, &visible, cat, "", sel, 0, &mut ic);
             } else {
                 let (y, mo, _) = sysinfo::today().unwrap_or((2026, 0, 1));
-                let k = PopupKind::Calendar { year: y, month: mo };
+                let hover = std::env::var("LUNARBAR_DUMP_CAL_HOVER").ok().and_then(|v| v.parse().ok());
+                let mo = std::env::var("LUNARBAR_DUMP_CAL_MONTH").ok().and_then(|v| v.parse().ok()).unwrap_or(mo);
+                let k = PopupKind::Calendar { year: y, month: mo, hover };
                 let (px, py, pw, ph) = place(&k, false);
-                draw_calendar(&mut cv, px, py, pw, ph, y, mo);
+                calmenu::draw(&mut cv, px, py, pw, ph, y, mo, hover);
             }
             // LUNARBAR_DUMP_FX_MS=t: the frame of the entrance t ms in.
             if let Some(ms) = std::env::var("LUNARBAR_DUMP_FX_MS").ok().and_then(|v| v.parse().ok()) {
