@@ -41,6 +41,8 @@
 //!
 //! Env: `ECLIPSE_LOOK=kde|eclipse|win11` overrides `/etc/eclipse/look`.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -56,6 +58,7 @@ use lunarbar::keys::{
 use lunarbar::list::{inside_rect, move_selection, row_at_geom, Step};
 use lunarbar::look::Look;
 use lunarbar::proc::{self, map_shm_pool, BUFFERS};
+use tiny_skia::Pixmap;
 use wayland_client::{
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
@@ -357,9 +360,9 @@ struct Clip {
     /// The selection as it stands, and what it offers.
     current: Option<(ZwlrDataControlOfferV1, Vec<String>)>,
     /// The source this program is serving, when it holds the selection, and
-    /// the bytes it serves.
+    /// the bytes it serves: the text, or the PNG of a picture.
     source: Option<ZwlrDataControlSourceV1>,
-    serving: Option<String>,
+    serving: Option<Vec<u8>>,
     /// A `selection` event that is the echo of this program's own
     /// `set_selection` and must NOT be read back.
     ///
@@ -372,6 +375,8 @@ struct Clip {
     history: History,
     /// Where the history is written.
     path: PathBuf,
+    /// Where its pictures are kept, beside it.
+    images: PathBuf,
     /// Re-offer the last entry when the selection goes away.
     persist: bool,
     /// True once a selection has been seen, whatever it was: `--paste` cannot
@@ -396,6 +401,7 @@ impl Clip {
             serving: None,
             expect_own: false,
             history: History::new(),
+            images: clip::image_dir(&path),
             path,
             persist,
             saw_selection: false,
@@ -411,22 +417,54 @@ impl Clip {
             .unwrap_or_default()
     }
 
+    /// Ask the selection for `mime` and read what it sends, up to `limit`
+    /// bytes plus one (so the caller can tell "too big" from "exactly full").
+    fn receive(&self, conn: &Connection, mime: &str, limit: usize) -> Option<Vec<u8>> {
+        let (offer, _) = self.current.as_ref()?;
+        let (r, w) = pipe().ok()?;
+        offer.receive(mime.to_string(), w.as_fd());
+        // The request sits in this client's write buffer, holding a copy of
+        // the pipe's write end, until it is flushed: reading before the flush
+        // waits on a pipe that no source has been given, and gives up only
+        // when the timeout runs out -- which is how a copy used to vanish
+        // from the history. Dropping `w` after the flush is what lets the read
+        // see EOF once the source has written everything.
+        let _ = conn.flush();
+        drop(w);
+        read_all(r, limit + 1).ok()
+    }
+
     /// Read the selection's text, or None when it carries none.
-    fn read_selection(&mut self) -> Option<String> {
-        let (offer, mimes) = self.current.clone()?;
+    fn read_selection(&mut self, conn: &Connection) -> Option<String> {
+        let (_, mimes) = self.current.clone()?;
         if clip::is_secret(&mimes) {
             return None;
         }
         let mime = clip::best_text_mime(&mimes)?;
-        let (r, w) = pipe().ok()?;
-        offer.receive(mime, w.as_fd());
-        // The `receive` has to reach the compositor before the write end is
-        // dropped here, or the source is handed a pipe nobody is waiting on.
-        // The flush is the caller's job through `roundtrip`; dropping `w`
-        // after it is what makes the read see EOF when the source is done.
-        drop(w);
-        let bytes = read_all(r, 8 * clip::MAX_ENTRY_BYTES).ok()?;
+        let bytes = self.receive(conn, &mime, 8 * clip::MAX_ENTRY_BYTES)?;
         String::from_utf8(bytes).ok()
+    }
+
+    /// The history entry for the selection: its text, or a picture stored
+    /// beside the history when it offers a PNG and no text.
+    ///
+    /// Text wins when a selection offers both, because the text is what the
+    /// user meant: a copy from a browser of a page with a picture in it offers
+    /// `image/png` too, and the picture is not what they will paste.
+    fn read_entry(&mut self, conn: &Connection) -> Option<String> {
+        let (_, mimes) = self.current.clone()?;
+        if clip::is_secret(&mimes) {
+            return None;
+        }
+        if clip::best_text_mime(&mimes).is_some() {
+            return self.read_selection(conn);
+        }
+        if !clip::offers_image(&mimes) {
+            return None;
+        }
+        let data = self.receive(conn, clip::IMAGE_MIME, clip::MAX_IMAGE_BYTES)?;
+        let img = clip::store_image(&self.images, &data)?;
+        Some(clip::image_entry(&img))
     }
 
     /// Take the selection, serving `text` for as long as this process lives.
@@ -434,11 +472,23 @@ impl Clip {
         let (Some(mgr), Some(dev)) = (self.manager.clone(), self.device.clone()) else {
             return;
         };
+        // A picture is offered as a PNG and nothing else: offering it as text
+        // would paste the bytes of a PNG into a terminal.
+        let (mimes, bytes): (&[&str], Vec<u8>) = match clip::own_image(&text, &self.images) {
+            Some(img) => match std::fs::read(&img.path) {
+                Ok(png) => (&[clip::IMAGE_MIME], png),
+                Err(e) => {
+                    eprintln!("lunarclip: {}: {e}", img.path.display());
+                    return;
+                }
+            },
+            None => (OFFER_MIMES, text.into_bytes()),
+        };
         let src = mgr.create_data_source(qh, ());
-        for m in OFFER_MIMES {
+        for m in mimes {
             src.offer((*m).to_string());
         }
-        self.serving = Some(text);
+        self.serving = Some(bytes);
         // Set the flag BEFORE the request: the echo can be dispatched as soon
         // as the next event is read, and a flag set afterwards would be set
         // after it was needed.
@@ -456,6 +506,8 @@ impl Clip {
         if let Err(e) = clip::save(&self.path, &self.history) {
             eprintln!("lunarclip: {}: {e}", self.path.display());
         }
+        // The pictures that fell off the end, or were cleared, go with them.
+        clip::prune_images(&self.images, self.history.items());
     }
 }
 
@@ -619,8 +671,8 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for Clip {
             // Somebody is pasting what this program holds.
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
                 let _ = mime_type; // every MIME we offer is the same bytes
-                if let Some(text) = st.serving.clone() {
-                    write_all_timeout(fd, text.as_bytes());
+                if let Some(bytes) = st.serving.clone() {
+                    write_all_timeout(fd, &bytes);
                 }
             }
             // Another client took the selection. Dropping the source here is
@@ -706,7 +758,9 @@ fn answer(req: Req, st: &mut Clip, qh: &QueueHandle<Clip>) -> Vec<u8> {
             None => b"ERR fuera de rango\n".to_vec(),
         },
         Req::Copy(text) => {
-            if !clip::worth_keeping(&text) {
+            // An entry shaped like a picture names a file, and a client that
+            // could copy one could have any file served as a picture.
+            if !clip::worth_keeping(&text) || clip::looks_like_image(&text) {
                 return b"ERR nada que copiar\n".to_vec();
             }
             st.history.push(&text);
@@ -961,7 +1015,7 @@ fn settle_selection(
         // request has to reach the compositor, which then asks the source for
         // the bytes.
         if let Some(text) = {
-            let out = st.read_selection();
+            let out = st.read_entry(conn);
             let _ = conn.flush();
             let _ = queue.roundtrip(st);
             out
@@ -1134,7 +1188,7 @@ fn paste() -> ! {
     if st.device.is_none() {
         no_protocol(&st);
     }
-    let text = st.read_selection();
+    let text = st.read_selection(&conn);
     let _ = conn.flush();
     let _ = queue.roundtrip(&mut st);
     // The read above issued `receive` and then read the pipe; the roundtrip is
@@ -1144,7 +1198,7 @@ fn paste() -> ! {
     // yet, so one retry after the roundtrip.
     let text = match text {
         Some(t) => Some(t),
-        None => st.read_selection(),
+        None => st.read_selection(&conn),
     };
     match text {
         Some(t) => {
@@ -1219,8 +1273,8 @@ fn list() -> ! {
         let _ = writeln!(
             out,
             "{i:>3}  {:>9}  {}",
-            clip::size_label(item.len()),
-            clip::preview(item, 120)
+            clip::size_label(clip::entry_bytes(item)),
+            clip::label(item, 120)
         );
     }
     let _ = out.flush();
@@ -1382,6 +1436,20 @@ const MAX_FIELD: usize = 128;
 /// The size column, in characters: "999,9 KiB".
 const SIZE_COL: i32 = 9;
 const COL_GAP: i32 = 16;
+/// The box a picture's thumbnail is fitted into, at the start of its row.
+const THUMB_W: i32 = 48;
+const THUMB_H: i32 = 20;
+/// Between the thumbnail's box and the label beside it.
+const THUMB_GAP: i32 = 8;
+/// The pane under the list that shows the chosen entry whole: the picture at a
+/// size that can be recognised, or the first lines of the text. Only when the
+/// history holds a picture, since a row of text already says most of what it
+/// is, and only on an output tall enough to spare it.
+const PANE_H: i32 = 168;
+const PANE_MIN_OUTPUT_H: i32 = 600;
+const PANE_PAD: i32 = 8;
+/// Between two lines of text in the pane.
+const LINE_GAP: i32 = 4;
 
 /// Everything the picker draws and answers with.
 struct Picker {
@@ -1417,6 +1485,15 @@ struct Picker {
     field: String,
     /// The visible rows: `(index into items, the preview)`.
     rows: Vec<(usize, String)>,
+    /// Where the history's pictures are; only a picture in here is drawn.
+    images: PathBuf,
+    /// The thumbnails decoded so far, by index into `items`, None for a
+    /// picture that could not be read. Decoding is the one slow thing a row
+    /// does, so it happens once, when the row is first drawn; a cell because
+    /// drawing only borrows the picker.
+    /// Keyed by `(index, big)`: the row's thumbnail and the pane's picture
+    /// are two sizes of the same file.
+    thumbs: RefCell<HashMap<(usize, bool), Option<Pixmap>>>,
     sel: usize,
     top: usize,
     hover: Option<usize>,
@@ -1459,6 +1536,11 @@ impl Picker {
             live,
             field: String::new(),
             rows: Vec::new(),
+            images: clip::image_dir(&clip::history_path(
+                std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            )),
+            thumbs: RefCell::new(HashMap::new()),
             sel: 0,
             top: 0,
             hover: None,
@@ -1486,8 +1568,10 @@ impl Picker {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, t)| needle.is_empty() || t.to_lowercase().contains(&needle))
-            .map(|(i, t)| (i, clip::preview(t, 512)))
+            .filter(|(_, t)| {
+                needle.is_empty() || clip::search_text(t).to_lowercase().contains(&needle)
+            })
+            .map(|(i, t)| (i, clip::label(t, 512)))
             .collect();
         self.sel = 0;
         self.top = 0;
@@ -1681,7 +1765,7 @@ fn surface_size(w: u32, h: u32) -> Option<(u32, u32)> {
 }
 
 /// The panel rect `(x, y, w, h)` for an output of `w` x `h` showing `rows`.
-fn panel_rect(w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
+fn panel_rect(w: i32, h: i32, rows: usize, pane: i32) -> (i32, i32, i32, i32) {
     // Clamp to the output AFTER the minimum: on an output narrower than
     // MIN_PANEL_W a plain `min` would make the panel wider than the screen and
     // `x` negative. `clamp` is not used because its floor and ceiling cross
@@ -1689,12 +1773,96 @@ fn panel_rect(w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
     let roomy = PANEL_W.min(w - 96).max(MIN_PANEL_W);
     let pw = roomy.min(w.max(1));
     let shown = rows.clamp(1, MAX_ROWS) as i32;
-    let want = PAD + HEAD_H + FIELD_H + PAD + shown * ROW_H + FOOT_H + PAD;
+    let want = PAD + HEAD_H + FIELD_H + PAD + shown * ROW_H + pane + FOOT_H + PAD;
     let ph = want.min((h - 48).max(PAD * 2 + HEAD_H + FIELD_H + ROW_H + FOOT_H));
     let ph = ph.min(h.max(1));
     let px = (w - pw) / 2;
     let py = ((h - ph) / 2).max(0);
     (px, py, pw, ph)
+}
+
+/// The pane's height for this picker on an output `h` tall: none when the
+/// history holds no picture, or the output cannot spare it.
+fn pane_height(st: &Picker, h: i32) -> i32 {
+    let any = st
+        .items
+        .iter()
+        .any(|e| clip::own_image(e, &st.images).is_some());
+    if any && h >= PANE_MIN_OUTPUT_H {
+        PANE_H
+    } else {
+        0
+    }
+}
+
+/// The chosen entry, whole: the picture beside its measurements, or the first
+/// lines of the text.
+fn draw_pane(cv: &mut Canvas, st: &Picker, x: i32, y: i32, w: i32, h: i32) {
+    let p = st.pal;
+    cv.fill_rect_a(x, y, w, h, p.field, 1.0);
+    cv.hline(x, y, w, p.border, 1.0);
+    let Some((index, entry)) = st
+        .rows
+        .get(st.sel)
+        .and_then(|(i, _)| st.items.get(*i).map(|e| (*i, e)))
+    else {
+        return;
+    };
+    let line = GLYPH_H + LINE_GAP;
+    let (ix, iy) = (x + PANE_PAD, y + PANE_PAD);
+    let (iw, ih) = (w - 2 * PANE_PAD, h - 2 * PANE_PAD);
+    if let Some(img) = clip::own_image(entry, &st.images) {
+        // The picture gets the height and at most two thirds of the width;
+        // the measurements sit to its right, one per line.
+        let (bw, bh) = ((iw * 2 / 3).max(1), ih.max(1));
+        let mut cache = st.thumbs.borrow_mut();
+        let pic = cache
+            .entry((index, true))
+            .or_insert_with(|| clip::thumbnail(&img.path, bw as u32, bh as u32));
+        let used = match pic {
+            Some(pm) => {
+                let oy = iy + (ih - pm.height() as i32) / 2;
+                cv.fill_rect_a(
+                    ix - 1,
+                    oy - 1,
+                    pm.width() as i32 + 2,
+                    pm.height() as i32 + 2,
+                    p.border,
+                    1.0,
+                );
+                cv.pixmap(ix, oy, pm);
+                pm.width() as i32
+            }
+            None => {
+                cv.text("no se puede leer", ix, iy, p.dim);
+                Canvas::text_width("no se puede leer")
+            }
+        };
+        let tx = ix + used + 16;
+        let facts = [
+            ("imagen".to_string(), p.text),
+            (format!("{} \u{d7} {} px", img.w, img.h), p.text),
+            (
+                format!("{} \u{b7} PNG", clip::size_label(img.bytes as usize)),
+                p.dim,
+            ),
+        ];
+        for (n, (t, c)) in facts.iter().enumerate() {
+            cv.text(t, tx, iy + n as i32 * line, *c);
+        }
+        return;
+    }
+    let chars = ((iw / GLYPH_W).max(1)) as usize;
+    let lines = (ih / line).max(1) as usize;
+    let all: Vec<&str> = entry.lines().collect();
+    for (n, l) in all.iter().take(lines).enumerate() {
+        let shown = if n + 1 == lines && all.len() > lines {
+            "...".to_string()
+        } else {
+            clip::preview(l, chars)
+        };
+        cv.text(&shown, ix, iy + n as i32 * line, p.text);
+    }
 }
 
 /// How many rows actually fit in a panel of height `ph`.
@@ -1729,7 +1897,8 @@ fn draw_picker(
     let p = st.pal;
     cv.fill_rect_a(0, 0, w as i32, h as i32, p.scrim, p.scrim_a);
 
-    let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows.len());
+    let pane = pane_height(st, h as i32);
+    let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows.len(), pane);
     cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, 9, p.border, 0.9);
     let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
     cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
@@ -1761,7 +1930,7 @@ fn draw_picker(
     }
 
     let row0 = fy + FIELD_BOX + PAD;
-    let fits = rows_fitting(ph);
+    let fits = rows_fitting(ph - pane);
     let avail = pw - 2 * PAD - 16;
 
     if st.rows.is_empty() {
@@ -1783,20 +1952,53 @@ fn draw_picker(
             cv.round_rect_a(px + PAD, ry, pw - 2 * PAD, ROW_H - 2, 5, p.sel, 0.45);
         }
         let ly = ry + (ROW_H - 2 - GLYPH_H) / 2;
-        let text = clip::preview(preview, preview_chars(avail));
-        cv.text(&text, px + PAD + 10, ly, p.text);
-        // The size on the right, from the ENTRY and not from the preview: the
-        // point of the column is to say that a one-line-looking row is a
-        // thousand lines.
-        let bytes = st
+        let entry = st
             .rows
             .get(absolute)
-            .and_then(|(i, _)| st.items.get(*i))
-            .map(String::len)
-            .unwrap_or(0);
+            .and_then(|(i, _)| st.items.get(*i).map(|e| (*i, e)));
+        let mut tx = px + PAD + 10;
+        let mut room = avail;
+        if let Some(img) = entry.and_then(|(_, e)| clip::own_image(e, &st.images)) {
+            // The picture itself, in a fixed box so every label lines up
+            // whatever the picture's shape.
+            let index = entry.map_or(0, |(i, _)| i);
+            let mut cache = st.thumbs.borrow_mut();
+            let thumb = cache
+                .entry((index, false))
+                .or_insert_with(|| clip::thumbnail(&img.path, THUMB_W as u32, THUMB_H as u32));
+            let by = ry + (ROW_H - 2 - THUMB_H) / 2;
+            // A well under it, so a picture of a black terminal on the black
+            // panel still reads as a picture.
+            cv.fill_rect_a(tx - 1, by - 1, THUMB_W + 2, THUMB_H + 2, p.border, 1.0);
+            cv.fill_rect_a(tx, by, THUMB_W, THUMB_H, p.field, 1.0);
+            match thumb {
+                Some(pm) => {
+                    let ox = tx + (THUMB_W - pm.width() as i32) / 2;
+                    let oy = by + (THUMB_H - pm.height() as i32) / 2;
+                    cv.pixmap(ox, oy, pm);
+                }
+                None => {
+                    let q = "?";
+                    cv.text(q, tx + (THUMB_W - GLYPH_W) / 2, ly, p.dim);
+                }
+            }
+            tx += THUMB_W + THUMB_GAP;
+            room -= THUMB_W + THUMB_GAP;
+        }
+        let text = clip::preview(preview, preview_chars(room));
+        cv.text(&text, tx, ly, p.text);
+        // The size on the right, from the ENTRY and not from the preview: the
+        // point of the column is to say that a one-line-looking row is a
+        // thousand lines, or a picture of four megabytes.
+        let bytes = entry.map_or(0, |(_, e)| clip::entry_bytes(e));
         let label = clip::size_label(bytes);
         let lw = Canvas::text_width(&label);
         cv.text(&label, px + pw - PAD - 10 - lw, ly, p.dim);
+    }
+
+    if pane > 0 {
+        let pane_y = py + ph - FOOT_H - pane;
+        draw_pane(cv, st, px + PAD, pane_y, pw - 2 * PAD, pane - PAD);
     }
 
     // Footer: the keys, and the warning when there is no daemon to set the
@@ -2371,7 +2573,7 @@ mod tests {
             (1280, 720),
             (3840, 2160),
         ] {
-            let (x, y, w, h) = panel_rect(ow, oh, 50);
+            let (x, y, w, h) = panel_rect(ow, oh, 50, 0);
             assert!(x >= 0 && y >= 0, "{ow}x{oh}: {x},{y}");
             assert!(x + w <= ow, "{ow}x{oh}: {x}+{w}");
             assert!(y + h <= oh, "{ow}x{oh}: {y}+{h}");
@@ -2385,7 +2587,7 @@ mod tests {
 
     #[test]
     fn a_tall_panel_shows_at_most_the_row_cap() {
-        let (_, _, _, h) = panel_rect(1920, 2000, 500);
+        let (_, _, _, h) = panel_rect(1920, 2000, 500, 0);
         assert_eq!(rows_fitting(h), MAX_ROWS);
     }
 
@@ -2557,5 +2759,38 @@ mod tests {
         let mut cv = Canvas::try_new(800, 600).unwrap();
         let (_, _, rows) = draw_picker(&mut cv, 800, 600, &p);
         assert_eq!(rows, rows.max(1));
+    }
+
+    #[test]
+    fn a_picture_row_draws_its_thumbnail_once_and_a_foreign_one_never() {
+        let dir = std::env::temp_dir().join(format!("lunarclip-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut pm = Pixmap::new(160, 90).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(242, 193, 78, 255));
+        let img = clip::store_image(&dir, &pm.encode_png().unwrap()).unwrap();
+        let foreign = clip::Image {
+            path: PathBuf::from("/etc/passwd"),
+            ..img.clone()
+        };
+        let items = vec![
+            clip::image_entry(&img),
+            "texto".to_string(),
+            clip::image_entry(&foreign),
+        ];
+        let mut p = Picker::new(items, true);
+        p.images = dir.clone();
+        assert_eq!(p.rows[0].1, "imagen 160 \u{d7} 90");
+        let mut cv = Canvas::try_new(800, 600).unwrap();
+        draw_picker(&mut cv, 800, 600, &p);
+        draw_picker(&mut cv, 800, 600, &p);
+        let cache = p.thumbs.borrow();
+        let rows = cache.keys().filter(|(_, big)| !big).count();
+        assert_eq!(rows, 1, "only the picture in the history directory");
+        assert!(cache.get(&(0, false)).is_some_and(|t| t.is_some()));
+        // And the pane under the list shows the chosen one bigger.
+        let big = cache.get(&(0, true)).and_then(|t| t.as_ref()).unwrap();
+        assert!(big.height() > THUMB_H as u32);
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
