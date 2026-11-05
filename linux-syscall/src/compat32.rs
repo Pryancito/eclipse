@@ -463,3 +463,8 @@ mod clone_tests;
 /// A `clone` refused AFTER the child was filed in its parent's table.
 #[cfg(test)]
 mod clone_unwind_tests;
+
+/// What a THREAD of a 32-bit process is handed to start with: its stack, its
+/// mode and its own thread area. Own file, own subject.
+#[cfg(test)]
+mod thread_context_tests;
