@@ -47,6 +47,9 @@ use std::os::fd::AsFd;
 #[path = "lunarfile/actions.rs"]
 mod actions;
 use actions::{Edit, Op};
+#[path = "lunarfile/job.rs"]
+mod job;
+use std::os::fd::AsRawFd;
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::{self, Entry};
@@ -461,6 +464,8 @@ struct State {
     kept_filter: String,
     /// What was copied (false) or cut (true), waiting to be pasted.
     held: Option<(String, bool)>,
+    /// The paste running in the background, if one is.
+    job: Option<job::Job>,
     row0_y: i32,
     /// How many rows the LAST frame actually drew, which on a short output is
     /// fewer than `MAX_ROWS`. Hit testing and the wheel both have to use this
@@ -1563,7 +1568,15 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     } else {
         p.accent
     };
-    cv.text(&status, px + PAD + 4, foot_y + 4 + GLYPH_H + 2, c);
+    let sy = foot_y + 4 + GLYPH_H + 2;
+    if let Some(j) = &st.job {
+        // A paste in progress: its bar, then how far and how to stop it.
+        let bw = job::draw_bar(cv, st, j, px + PAD + 4, sy + 2);
+        let room = ((text_r - (px + PAD + 4) - bw - 12) / GLYPH_W).max(8) as usize;
+        cv.text(&files::elide_middle(&j.line(), room), px + PAD + 4 + bw + 12, sy, p.text);
+    } else {
+        cv.text(&status, px + PAD + 4, sy, c);
+    }
 
     // The action menu, over everything, under the selected row.
     let sel_y = row0_y + (st.sel.saturating_sub(st.top)) as i32 * ROW_H + ROW_H - 2;
@@ -1737,6 +1750,11 @@ fn apply(st: &mut State, action: Action) {
             Action::Type(c) if st.field.chars().count() < MAX_FIELD => st.field.push(c),
             _ => {}
         }
+        st.render();
+        return;
+    }
+    // Esc stops a running paste before it closes anything.
+    if action == Action::Close && st.cancel_job() {
         st.render();
         return;
     }
@@ -2157,6 +2175,7 @@ fn new_state(cli: &Cli) -> State {
         edit: None,
         kept_filter: String::new(),
         held: None,
+        job: None,
         row0_y: 0,
         rows_shown: MAX_ROWS,
         scroll_acc: 0.0,
@@ -2236,6 +2255,13 @@ fn main() {
         }
         // LUNARFILE_DUMP_MENU=n: with the action menu open on row n.
         st.menu = std::env::var("LUNARFILE_DUMP_MENU").ok().and_then(|v| v.parse().ok());
+        // LUNARFILE_DUMP_JOB=0.45: a paste that far along (drawn, not run).
+        if let Some(f) = std::env::var("LUNARFILE_DUMP_JOB").ok().and_then(|v| v.parse::<f64>().ok()) {
+            let prog = std::sync::Arc::new(lunarbar::fileops::Progress::default());
+            prog.total.store(4_300_000_000, std::sync::atomic::Ordering::Relaxed);
+            prog.done.store((4_300_000_000.0 * f) as u64, std::sync::atomic::Ordering::Relaxed);
+            st.job = Some(job::Job { handle: None, prog, name: "eclipse.iso".into(), cut: false, dir: st.dir.clone() });
+        }
         // LUNARFILE_DUMP_KEYS=60: those key codes pressed first (F2 renames...).
         for k in std::env::var("LUNARFILE_DUMP_KEYS").unwrap_or_default().split(',').filter_map(|k| k.parse().ok()) {
             let a = key_action(k, st.mode);
@@ -2288,9 +2314,28 @@ fn main() {
         std::process::exit(1);
     }
     st.map_overlay(&qh);
+    // Blocking until the compositor says something, except while a paste
+    // runs: then the loop also wakes every tick to redraw its bar.
+    let tick = 100;
     while !st.done {
-        if queue.blocking_dispatch(&mut st).is_err() {
+        if queue.flush().is_err() {
             break;
+        }
+        if let Some(guard) = queue.prepare_read() {
+            let mut pfd = libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let timeout = if st.job.is_some() { tick } else { -1 };
+            // SAFETY: one valid pollfd for the length of the call.
+            if unsafe { libc::poll(&mut pfd, 1, timeout) } > 0 {
+                let _ = guard.read();
+            } else {
+                drop(guard);
+            }
+        }
+        if queue.dispatch_pending(&mut st).is_err() {
+            break;
+        }
+        if st.tick_job() {
+            st.render();
         }
     }
     let (picked, out, pick) = (
@@ -2786,6 +2831,14 @@ mod tests {
         apply(st, key_action(key, st.mode));
     }
 
+    /// Wait for a background paste to end, and take its result.
+    fn settle(st: &mut State) {
+        while st.job.as_ref().is_some_and(|j| j.running()) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        st.tick_job();
+    }
+
     fn typed(st: &mut State, s: &str) {
         for c in s.chars() {
             apply(st, Action::Type(c));
@@ -2828,10 +2881,12 @@ mod tests {
         st.sel = row_of(&st, "sub");
         st.activate(st.sel);
         press(&mut st, KEY_INSERT_WL);
+        settle(&mut st);
         let sub = std::path::Path::new(&base).join("sub");
         assert!(sub.join("a.txt").exists() && std::path::Path::new(&base).join("a.txt").exists());
         // Pasting again does not replace, it copies alongside.
         press(&mut st, KEY_INSERT_WL);
+        settle(&mut st);
         assert!(sub.join("a (copia).txt").exists());
         press(&mut st, 65); // F7
         assert_eq!(st.field, "Carpeta nueva");

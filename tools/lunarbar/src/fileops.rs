@@ -10,6 +10,69 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// How far a copy has got, shared between the thread doing it and the
+/// window drawing it: bytes `done` of `total`, and a flag the window raises
+/// to stop it.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
+    pub cancel: AtomicBool,
+}
+
+impl Progress {
+    /// The fraction done, 0 to 1; an empty copy is done.
+    pub fn frac(&self) -> f32 {
+        let (d, t) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        if t == 0 {
+            1.0
+        } else {
+            (d as f64 / t as f64).min(1.0) as f32
+        }
+    }
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "cancelado")
+}
+
+/// The bytes under `p`: a file's size, a folder's files' sizes added up. A
+/// link counts as nothing, since it is copied as a link.
+pub fn tree_size(p: &Path) -> u64 {
+    let Ok(md) = std::fs::symlink_metadata(p) else { return 0 };
+    if md.is_dir() {
+        std::fs::read_dir(p)
+            .map(|rd| rd.flatten().map(|e| tree_size(&e.path())).sum())
+            .unwrap_or(0)
+    } else if md.file_type().is_symlink() {
+        0
+    } else {
+        md.len()
+    }
+}
+
+/// Copy one file in 1 MiB steps, counting into `prog` and stopping when it
+/// is cancelled.
+fn copy_file(src: &Path, dst: &Path, prog: &Progress) -> io::Result<()> {
+    use std::io::{Read, Write};
+    let mut r = std::fs::File::open(src)?;
+    let mut w = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if prog.cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n])?;
+        prog.done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())
+}
 
 /// A name a file can have: not empty, not `.` or `..`, no `/`, no NUL.
 pub fn valid_name(name: &str) -> bool {
@@ -53,7 +116,10 @@ pub fn is_within(inner: &Path, outer: &Path) -> bool {
     inner == outer || inner.starts_with(outer)
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_tree(src: &Path, dst: &Path, prog: &Progress) -> io::Result<()> {
+    if prog.cancel.load(Ordering::Relaxed) {
+        return Err(cancelled());
+    }
     let md = std::fs::symlink_metadata(src)?;
     let ft = md.file_type();
     if ft.is_symlink() {
@@ -62,24 +128,31 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         std::fs::create_dir(dst)?;
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_tree(&e.path(), &dst.join(e.file_name()))?;
+            copy_tree(&e.path(), &dst.join(e.file_name()), prog)?;
         }
         std::fs::set_permissions(dst, md.permissions())
     } else {
-        std::fs::copy(src, dst).map(|_| ())
+        copy_file(src, dst, prog)
     }
 }
 
 /// Copy `src` (a file, a link or a whole folder) into `dir`, under a free
 /// name. Returns where it went.
 pub fn copy_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
+    copy_into_with(src, dir, &Progress::default())
+}
+
+/// [`copy_into`], counting into `prog` (its total set here) and stoppable
+/// through it. A cancelled copy leaves nothing behind.
+pub fn copy_into_with(src: &Path, dir: &Path, prog: &Progress) -> io::Result<PathBuf> {
     let name = src.file_name().ok_or_else(bad_name)?.to_string_lossy().into_owned();
     if is_within(dir, src) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "una carpeta no cabe dentro de sí misma"));
     }
     let is_dir = std::fs::symlink_metadata(src)?.is_dir();
     let dst = dir.join(free_name(dir, &name, is_dir));
-    match copy_tree(src, &dst) {
+    prog.total.store(tree_size(src), Ordering::Relaxed);
+    match copy_tree(src, &dst, prog) {
         Ok(()) => Ok(dst),
         Err(e) => {
             // Half a copy is worse than none.
@@ -93,6 +166,12 @@ pub fn copy_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
 /// copy and then a removal across disks. Moving something to where it
 /// already is does nothing.
 pub fn move_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
+    move_into_with(src, dir, &Progress::default())
+}
+
+/// [`move_into`], counting into `prog`. Only a move across disks copies, so
+/// only that one has anything to count; on the same disk it is one rename.
+pub fn move_into_with(src: &Path, dir: &Path, prog: &Progress) -> io::Result<PathBuf> {
     if src.parent() == Some(dir) {
         return Ok(src.to_path_buf());
     }
@@ -102,15 +181,20 @@ pub fn move_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
     }
     let is_dir = std::fs::symlink_metadata(src)?.is_dir();
     let dst = dir.join(free_name(dir, &name, is_dir));
-    relocate(src, &dst)?;
+    relocate(src, &dst, prog)?;
     Ok(dst)
 }
 
 /// `rename`, or copy-then-remove when `dst` is on another filesystem.
-fn relocate(src: &Path, dst: &Path) -> io::Result<()> {
+fn relocate(src: &Path, dst: &Path, prog: &Progress) -> io::Result<()> {
     match std::fs::rename(src, dst) {
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            copy_tree(src, dst)?;
+            prog.total.store(tree_size(src), Ordering::Relaxed);
+            if let Err(e) = copy_tree(src, dst, prog) {
+                // The original is still whole; drop the half copy.
+                let _ = std::fs::remove_dir_all(dst).or_else(|_| std::fs::remove_file(dst));
+                return Err(e);
+            }
             if std::fs::symlink_metadata(src)?.is_dir() {
                 std::fs::remove_dir_all(src)
             } else {
@@ -214,7 +298,7 @@ pub fn trash_into(path: &Path, trash: &Path, now: i64) -> io::Result<String> {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&info_path)?;
         f.write_all(body.as_bytes())?;
     }
-    if let Err(e) = relocate(path, &files.join(&free)) {
+    if let Err(e) = relocate(path, &files.join(&free), &Progress::default()) {
         let _ = std::fs::remove_file(&info_path);
         return Err(e);
     }
@@ -300,6 +384,28 @@ mod tests {
         // A second file of the same name does not replace the first.
         std::fs::write(d.join("mi nota.txt"), "y").unwrap();
         assert_eq!(trash_into(&d.join("mi nota.txt"), &t, 0).unwrap(), "mi nota (copia).txt");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_copy_counts_its_bytes_and_a_cancelled_one_leaves_nothing() {
+        let d = tmp("progress");
+        let (src, out) = (d.join("big"), d.join("out"));
+        std::fs::create_dir_all(src.join("in")).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(src.join("a"), vec![1u8; 3 << 20]).unwrap();
+        std::fs::write(src.join("in/b"), vec![2u8; 1000]).unwrap();
+        assert_eq!(tree_size(&src), (3 << 20) + 1000);
+        let p = Progress::default();
+        copy_into_with(&src, &out, &p).unwrap();
+        assert_eq!(p.done.load(Ordering::Relaxed), (3 << 20) + 1000);
+        assert_eq!(p.frac(), 1.0);
+        let p = Progress::default();
+        p.cancel.store(true, Ordering::Relaxed);
+        let e = copy_into_with(&src, &out, &p).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+        assert!(!out.join("big (copia)").exists(), "a cancelled copy leaves nothing");
+        assert_eq!(Progress::default().frac(), 1.0, "nothing to copy is done");
         let _ = std::fs::remove_dir_all(&d);
     }
 
