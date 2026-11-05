@@ -367,7 +367,17 @@ impl LinuxRootfs {
             root.join("bin").join("i386-interp"),
             root.join("bin").join("i386-pie"),
             root.join("bin").join("i386-interp-pie"),
+            // La sonda DINAMICA, y el interprete que nombra: el cargador de
+            // i386 de la glibc que `apt_rootfs::multilib32` mete en la
+            // imagen.
+            root.join("bin").join("i386-glibc"),
+            root.join("lib").join("ld-linux.so.2"),
         ];
+        // Y el runtime de 32 bits entero, que es un DIRECTORIO de veinte
+        // objetos compartidos de i386: se exime por su ruta, igual que los de
+        // arriba, y no por ser de i386 --- eximir «todo lo que sea i386»
+        // dejaria pasar justo el fallo que esto caza.
+        let el_runtime_de_32 = root.join("lib").join("i386-linux-gnu");
         let mut out = Vec::new();
         let mut checked = 0usize;
         let mut stack = vec![root.to_path_buf()];
@@ -415,7 +425,9 @@ impl LinuxRootfs {
                         // maquina: eximir «todo lo que sea i386» dejaria pasar el
                         // fallo que esta comprobacion existe para cazar, un
                         // binario enlazado con el toolchain equivocado.
-                        if los_deliberadamente_de_32.contains(&path) {
+                        if los_deliberadamente_de_32.contains(&path)
+                            || path.starts_with(&el_runtime_de_32)
+                        {
                             continue;
                         }
                         if let Some(machine) = elf_machine(&path) {
@@ -728,6 +740,48 @@ mod tests {
         assert!(p[0].0.contains("libajena.so"), "{}", p[0].0);
     }
 
+    /// El runtime de 32 bits que `apt_rootfs::multilib32` mete en la imagen:
+    /// veinte objetos compartidos de i386 en `lib/i386-linux-gnu`, el
+    /// cargador en `lib/ld-linux.so.2` y la sonda dinamica en
+    /// `bin/i386-glibc`. Son ELF de i386 A PROPOSITO --- son lo que hace que
+    /// un binario de 32 bits DINAMICO arranque --- y sin la excepcion esta
+    /// comprobacion falla la imagen entera por cada uno de los veintidos.
+    #[test]
+    fn el_runtime_de_32_bits_es_de_i386_a_proposito() {
+        let r = LinuxRootfs::new(Arch::X86_64);
+        let root = rootfs_sana("multilib32", Arch::X86_64, 62);
+        let mut i386 = elf64(EM_386);
+        i386[4] = 1; // ELFCLASS32
+        let libdir = root.join("lib").join("i386-linux-gnu");
+        fs::create_dir_all(&libdir).unwrap();
+        for name in ["libc.so.6", "libm.so.6", "ld-linux.so.2"] {
+            fs::write(libdir.join(name), &i386).unwrap();
+        }
+        fs::write(root.join("lib").join("ld-linux.so.2"), &i386).unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin").join("i386-glibc"), &i386).unwrap();
+        let p = r.check_elf_machines(&root);
+        assert!(
+            p.is_empty(),
+            "{:?}",
+            p.iter().map(|x| &x.0).collect::<Vec<_>>()
+        );
+
+        // Pero la excepcion es ESA ruta, no «todo lo que sea de i386»: un
+        // ELF de i386 en cualquier otro sitio sigue siendo el fallo que esto
+        // existe para cazar, un binario enlazado con el toolchain
+        // equivocado.
+        fs::write(root.join("lib").join("libajena32.so"), &i386).unwrap();
+        fs::write(root.join("bin").join("ajeno32"), &i386).unwrap();
+        let p = r.check_elf_machines(&root);
+        assert_eq!(
+            p.len(),
+            2,
+            "{:?}",
+            p.iter().map(|x| &x.0).collect::<Vec<_>>()
+        );
+    }
+
     /// RV32 y RV64 comparten `EM_RISCV`, asi que mirando solo la maquina un
     /// binario de 32 bits se colaba en una rootfs de riscv64.
     #[test]
@@ -1020,13 +1074,15 @@ mod cableado_tests {
     /// no tiene por que saber que la puerta existe, asi que la cuenta se
     /// comprueba aqui en vez de confiar en que se acuerde.
     ///
-    /// Se leen DOS ficheros: una cache que se mude a un modulo hermano
-    /// (`portal.rs` se llevo la de `eclipse-dbusd`) saldria de la cuenta sin
-    /// que nada lo dijera, que es justo el agujero que esto tapa.
+    /// Se leen VARIOS ficheros: una cache que se mude a un modulo hermano
+    /// (`portal.rs` se llevo la de `eclipse-dbusd`, `i386.rs` las tres de las
+    /// sondas de 32 bits) saldria de la cuenta sin que nada lo dijera, que es
+    /// justo el agujero que esto tapa --- y de hecho la mudanza de `i386.rs`
+    /// dejo este test rojo en la CI, que es lo que tenia que pasar.
     #[test]
     fn toda_cache_de_artefacto_pasa_por_la_puerta_del_arco() {
         let linux = crate::PROJECT_DIR.join("xtask").join("src").join("linux");
-        let src: String = ["mod.rs", "portal.rs"]
+        let src: String = ["mod.rs", "portal.rs", "i386.rs"]
             .iter()
             .map(|f| std::fs::read_to_string(linux.join(f)).unwrap())
             .collect::<Vec<_>>()
@@ -1080,8 +1136,9 @@ mod cableado_tests {
         assert_eq!(
             ajenas, 1,
             "las puertas de maquina ajena eran 1 y ahora son {ajenas}: la unica \
-             esta dentro de `fresh_i386`, que es por donde pasan las caches de \
-             `tools/i386-hello` y `tools/i386-dyn`, ELF32 a proposito las dos"
+             esta dentro de `fresh_i386` (en `i386.rs` desde la tanda 41), que \
+             es por donde pasan las caches de `tools/i386-hello`, \
+             `tools/i386-dyn` y `tools/i386-glibc`, ELF32 a proposito las tres"
         );
     }
 
