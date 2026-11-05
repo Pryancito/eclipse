@@ -3034,10 +3034,7 @@ fn draw_apps(
             let Some(e) = all.get(ai) else { continue };
             let iy = y + (APPS_ROW_H - is) / 2;
             if tecno() {
-                // The launcher's framed glyph boxes, not the app icons.
-                let t = e.exec.contains("term") || e.exec.split_whitespace().next() == Some("foot");
-                let ch: String = if t { ">".into() } else { e.name.chars().take(1).flat_map(char::to_uppercase).collect() };
-                cv.glyph_box(px + 12, iy, is, &ch, pal().pill, pal().rule, pal().accent);
+                launcher::app_marker(cv, px + 12, iy, is, e, icons);
             } else {
             // Icon slot: the entry's Icon=, else its name against the theme
             // index, else the letter badge.
@@ -4466,9 +4463,10 @@ fn main() {
                 if all.len() == 1 {
                     // No .desktop files in this environment: show sample rows
                     // so the preview still demonstrates the menu.
-                    for (n, c) in [("Ajustes", "Settings"), ("Archivos", "System"), ("Navegador web", "Network"), ("Correo", "Network"), ("Editor de texto", "Utility")] {
+                    for (n, c, i) in [("Ajustes", "Settings", "preferences-system"), ("Archivos", "System", "system-file-manager"), ("Navegador web", "Network", "web-browser"), ("Correo", "Network", "mail-send"), ("Editor de texto", "Utility", "accessories-text-editor")] {
                         all.push(apps::AppEntry {
                             name: n.into(),
+                            icon: Some(i.into()),
                             categories: vec![c.into()],
                             ..apps::AppEntry::default()
                         });

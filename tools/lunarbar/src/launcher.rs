@@ -12,6 +12,7 @@
 //! `xtask/src/tamano.rs`).
 
 use super::*;
+use draw::Ink;
 
 /// One row of the application menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,6 +154,115 @@ fn icon_name(slot: usize) -> &'static str {
     NAMES.get(slot).copied().unwrap_or("applications-other")
 }
 
+/// The hairline pictogram of category `slot` (schema order, catch-all last),
+/// on [`Canvas::line_icon`]'s 12-unit grid: drawn, not loaded, so tecno's
+/// menu has the same thin cyan instruments whatever icon theme is installed.
+pub fn pictogram(slot: usize) -> &'static [Ink] {
+    use Ink::*;
+    const P: [&[Ink]; 12] = [
+        // Games: a pad, its cross and two buttons.
+        &[
+            Line(&[(1.0, 4.0), (11.0, 4.0), (11.0, 9.0), (1.0, 9.0), (1.0, 4.0)]),
+            Line(&[(2.6, 6.5), (5.4, 6.5)]),
+            Line(&[(4.0, 5.1), (4.0, 7.9)]),
+            Dot(7.8, 5.9),
+            Dot(9.4, 7.3),
+        ],
+        // Multimedia: play.
+        &[Line(&[(3.5, 2.0), (10.0, 6.0), (3.5, 10.0), (3.5, 2.0)])],
+        // Graphics: a pen nib on its stroke.
+        &[
+            Line(&[(2.0, 10.0), (2.8, 7.2), (8.6, 1.4), (10.6, 3.4), (4.8, 9.2), (2.0, 10.0)]),
+            Line(&[(7.4, 2.6), (9.4, 4.6)]),
+        ],
+        // Office: a page of text.
+        &[
+            Line(&[(2.5, 1.0), (7.5, 1.0), (9.5, 3.0), (9.5, 11.0), (2.5, 11.0), (2.5, 1.0)]),
+            Line(&[(4.2, 5.0), (7.8, 5.0)]),
+            Line(&[(4.2, 7.0), (7.8, 7.0)]),
+            Line(&[(4.2, 9.0), (6.4, 9.0)]),
+        ],
+        // Development: </>.
+        &[
+            Line(&[(3.8, 3.0), (0.8, 6.0), (3.8, 9.0)]),
+            Line(&[(8.2, 3.0), (11.2, 6.0), (8.2, 9.0)]),
+            Line(&[(7.0, 2.0), (5.0, 10.0)]),
+        ],
+        // Education: a mortarboard.
+        &[
+            Line(&[(0.8, 4.6), (6.0, 2.2), (11.2, 4.6), (6.0, 7.0), (0.8, 4.6)]),
+            Line(&[(3.2, 5.8), (3.2, 8.6), (6.0, 9.8), (8.8, 8.6), (8.8, 5.8)]),
+        ],
+        // Science: a flask.
+        &[
+            Line(&[(4.6, 1.0), (4.6, 4.8), (1.6, 11.0), (10.4, 11.0), (7.4, 4.8), (7.4, 1.0)]),
+            Line(&[(3.6, 1.0), (8.4, 1.0)]),
+            Line(&[(3.0, 8.0), (9.0, 8.0)]),
+        ],
+        // Internet: a globe.
+        &[
+            Oval(1.0, 1.0, 10.0, 10.0),
+            Oval(3.8, 1.0, 4.4, 10.0),
+            Line(&[(1.0, 6.0), (11.0, 6.0)]),
+        ],
+        // Settings: two sliders.
+        &[
+            Line(&[(1.0, 3.5), (11.0, 3.5)]),
+            Line(&[(1.0, 8.5), (11.0, 8.5)]),
+            Oval(2.6, 2.0, 3.0, 3.0),
+            Oval(6.4, 7.0, 3.0, 3.0),
+        ],
+        // System: a monitor on its foot.
+        &[
+            Line(&[(1.0, 1.5), (11.0, 1.5), (11.0, 8.0), (1.0, 8.0), (1.0, 1.5)]),
+            Line(&[(6.0, 8.0), (6.0, 10.5)]),
+            Line(&[(3.5, 10.5), (8.5, 10.5)]),
+        ],
+        // Accessories: a toolbox.
+        &[
+            Line(&[(1.0, 4.0), (11.0, 4.0), (11.0, 10.5), (1.0, 10.5), (1.0, 4.0)]),
+            Line(&[(4.2, 4.0), (4.2, 1.8), (7.8, 1.8), (7.8, 4.0)]),
+            Line(&[(1.0, 7.0), (11.0, 7.0)]),
+        ],
+        // Other: four tiles.
+        &[
+            Line(&[(1.5, 1.5), (5.0, 1.5), (5.0, 5.0), (1.5, 5.0), (1.5, 1.5)]),
+            Line(&[(7.0, 1.5), (10.5, 1.5), (10.5, 5.0), (7.0, 5.0), (7.0, 1.5)]),
+            Line(&[(1.5, 7.0), (5.0, 7.0), (5.0, 10.5), (1.5, 10.5), (1.5, 7.0)]),
+            Line(&[(7.0, 7.0), (10.5, 7.0), (10.5, 10.5), (7.0, 10.5), (7.0, 7.0)]),
+        ],
+    ];
+    P.get(slot).copied().unwrap_or(P[11])
+}
+
+/// An empty framed well (the glyph box without its glyph).
+fn frame(cv: &mut Canvas, x: i32, y: i32, s: i32) {
+    cv.glyph_box(x, y, s, "", pal().pill, pal().rule, pal().accent);
+}
+
+/// Paint a program's marker in tecno: its theme icon set in the framed well,
+/// or, without one, the well with its initial (a terminal gets `>`).
+pub fn app_marker(cv: &mut Canvas, x: i32, y: i32, s: i32, e: &apps::AppEntry, icons: &mut IconCache) {
+    let inner = s - 6;
+    let pm = e
+        .icon
+        .as_deref()
+        .and_then(|n| icons.get(n, inner as u32))
+        .or_else(|| icons.get(&e.name, inner as u32));
+    if let Some(pm) = pm {
+        frame(cv, x, y, s);
+        cv.pixmap(x + 3, y + 3, &pm);
+        return;
+    }
+    let t = e.exec.contains("term") || e.exec.split_whitespace().next() == Some("foot");
+    let ch: String = if t {
+        ">".into()
+    } else {
+        e.name.chars().take(1).flat_map(char::to_uppercase).collect()
+    };
+    cv.glyph_box(x, y, s, &ch, pal().pill, pal().rule, pal().accent);
+}
+
 /// Paint a category or back row's content (the selection plate is already
 /// down) in the row rect starting at `y`. `is` is the icon slot.
 #[allow(clippy::too_many_arguments)]
@@ -186,13 +296,12 @@ pub fn draw_row(
         Row::Cat(s) => {
             let c = pal().accent;
             let label = obmenu::slot_label(s, lang);
-            if tecno() {
-                let ch: String = label.chars().take(1).collect();
-                cv.glyph_box(px + 12, iy, is, &ch, pal().pill, c, c);
-            } else {
-                match icons.get(icon_name(s), is as u32) {
-                    Some(pm) => cv.pixmap(px + 12, iy, &pm),
-                    None => cv.badge(px + 12, iy, is, label.chars().next().unwrap_or('?'), pal().pill, c),
+            let themed = if tecno() { None } else { icons.get(icon_name(s), is as u32) };
+            match themed {
+                Some(pm) => cv.pixmap(px + 12, iy, &pm),
+                None => {
+                    frame(cv, px + 12, iy, is);
+                    cv.line_icon(px + 12, iy, is, pictogram(s), c);
                 }
             }
             let label = if tecno() { label.to_uppercase() } else { label.to_string() };
@@ -259,6 +368,23 @@ mod tests {
     fn typing_searches_every_category_at_once() {
         let all = sample();
         assert_eq!(rows(&all, "or", Some(7)), [Row::App(2), Row::App(3)]);
+    }
+
+    #[test]
+    fn every_category_has_its_own_pictogram() {
+        let all: Vec<usize> = (0..=obmenu::SCHEMA.len()).collect();
+        for &a in &all {
+            for &b in &all[..a] {
+                assert!(!std::ptr::eq(pictogram(a), pictogram(b)), "{a} and {b} share one");
+            }
+            for op in pictogram(a) {
+                if let Ink::Line(pts) = op {
+                    for &(x, y) in *pts {
+                        assert!((0.0..=12.0).contains(&x) && (0.0..=12.0).contains(&y), "{a}: {x},{y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
