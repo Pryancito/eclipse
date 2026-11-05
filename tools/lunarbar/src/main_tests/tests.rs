@@ -122,8 +122,10 @@ fn the_panel_draws_a_shadow_that_fades_outward() {
     assert!(cv.blit_argb(&mut buf));
     let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
 
-    // Inside the panel: effectively opaque.
-    assert!(alpha(px + pw / 2, py + ph / 2) > 240);
+    // Inside the panel: effectively opaque, or in tecno the glass the
+    // effects ask for (fx::GLASS) -- see-through, but still a panel.
+    let floor = if tecno() && fx::on() { (fx::GLASS * 255.0) as u8 } else { 240 };
+    assert!(alpha(px + pw / 2, py + ph / 2) > floor);
     // Just outside its left edge: the shadow's dark core.
     let near = alpha(px - 2, py + ph / 2);
     // Out at the margin: still shadow, but faint.

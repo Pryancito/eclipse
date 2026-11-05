@@ -64,6 +64,7 @@ mod info;
 mod launcher;
 mod taskmenu;
 mod powermenu;
+mod fx;
 use launcher::Row;
 use info::*;
 mod workspaces;
@@ -683,6 +684,8 @@ struct Popup {
     /// wedge the menu: past [`FRAME_FALLBACK`] the gate opens anyway.
     frame_at: Option<Instant>,
     kind: PopupKind,
+    /// When the popup first drew: the clock of its entrance ([`fx`]).
+    born: Option<Instant>,
     /// Absolute hit rects (x0,y0,x1,y1) and what clicking them does.
     hits: Vec<(i32, i32, i32, i32, Action)>,
     /// Panel rect (x,y,w,h) — clicks outside it dismiss the popup.
@@ -1604,6 +1607,7 @@ impl State {
             frame_pending: false,
             frame_at: None,
             kind,
+            born: None,
             hits: Vec::new(),
             panel: (0, 0, 0, 0),
         });
@@ -1762,6 +1766,12 @@ impl State {
         let hits = draw_popup(&mut cv, px, py, pw, ph, &mut popup.kind, &mut self.icons);
         popup.panel = (px, py, pw, ph);
         popup.hits = hits;
+        // The entrance: faded and slid, then a repaint on the next frame.
+        let born = *popup.born.get_or_insert_with(Instant::now);
+        if let Some((k, dy)) = fx::opening(born.elapsed(), popup.at_top) {
+            cv.fade(k, dy);
+            popup.dirty = true;
+        }
 
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(popup.map.add(i * frame_size), frame_size) };
@@ -2898,7 +2908,8 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
 /// drawn, the way every other toolkit draws it.
 fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
     panel_shadow(cv, px, py, pw, ph, rad);
-    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, 0.98);
+    let glass = if tecno() && fx::on() { fx::GLASS } else { 0.98 };
+    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, glass);
     if tecno() {
         // Gold focus brackets (lunarbg's crescent), 3px out, inside the shadow.
         cv.brackets(px, py, pw, ph, 12, 2, TECNO_GOLD);
@@ -4434,9 +4445,19 @@ fn main() {
                 let (px, py, pw, ph) = place(&k, false);
                 draw_calendar(&mut cv, px, py, pw, ph, y, mo);
             }
+            // LUNARBAR_DUMP_FX_MS=t: the frame of the entrance t ms in.
+            if let Some(ms) = std::env::var("LUNARBAR_DUMP_FX_MS").ok().and_then(|v| v.parse().ok()) {
+                if let Some((k, dy)) = fx::opening(Duration::from_millis(ms), false) {
+                    cv.fade(k, dy);
+                }
+            }
             // Alpha-composite the overlay over the opaque preview.
             let mut over = vec![0u8; w * full_h * 4];
             let _ = cv.blit_argb(&mut over);
+            // LUNARBAR_DUMP_OVERLAY=path also writes the popup layer alone.
+            if let Ok(p) = std::env::var("LUNARBAR_DUMP_OVERLAY") {
+                let _ = std::fs::write(p, &over);
+            }
             for (dst, src) in buf.chunks_exact_mut(4).zip(over.chunks_exact(4)) {
                 let a = src[3] as u32;
                 if a == 0 {
