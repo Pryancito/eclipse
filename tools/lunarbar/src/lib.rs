@@ -28,6 +28,7 @@ pub mod clip;
 pub mod calc;
 pub mod draw;
 pub mod files;
+pub mod fileops;
 pub mod hunter;
 pub mod hunter_export;
 pub mod hunter_notify;

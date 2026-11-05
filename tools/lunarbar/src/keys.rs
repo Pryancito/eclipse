@@ -20,6 +20,7 @@ pub const KEY_RIGHT_WL: u32 = 106;
 pub const KEY_PGUP_WL: u32 = 104;
 pub const KEY_PGDN_WL: u32 = 109;
 pub const KEY_HOME_WL: u32 = 102;
+pub const KEY_INSERT_WL: u32 = 110;
 
 /// `wl_pointer.button` codes (`BTN_*`).
 pub const BTN_LEFT: u32 = 0x110;
