@@ -443,7 +443,7 @@ fn apk_cache_dir(arch: &str) -> PathBuf {
 }
 
 /// El cargador dinamico de musl, cuyo nombre lleva el arco dentro.
-fn musl_loader_name(arch: &str) -> String {
+pub(super) fn musl_loader_name(arch: &str) -> String {
     format!("ld-musl-{arch}.so.1")
 }
 

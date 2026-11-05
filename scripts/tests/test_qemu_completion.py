@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 import unittest
 import enum
 import subprocess
@@ -153,6 +154,131 @@ class CompletionProtocol(unittest.TestCase):
     def test_nonzero_exit_and_incomplete_marker(self):
         self.assertEqual(runner.exit_code("__CASE__:127\n", "__CASE__"), 127)
         self.assertIsNone(runner.exit_code("__CASE__:", "__CASE__"))
+
+
+class PromptSynchronisation(unittest.TestCase):
+    """A case may only be typed when the shell is back at its prompt. The
+    marker that ends the previous case is printed by `printf`, before the
+    shell has restored the console's termios, and that restore throws away
+    whatever is already queued: the command loses its leading bytes and the
+    shell runs the tail. See `PROMPT` in `scripts/qemu_completion.py` for the
+    four riscv64 cases this cost."""
+
+    class Console:
+        """Stands in for QEMU: records what was typed, and lets the test
+        decide what appears on screen in answer to it."""
+
+        def __init__(self, on_write):
+            self.writes = []
+            self.stdin = self
+            self._on_write = on_write
+
+        def write(self, data):
+            self.writes.append(data)
+            self._on_write(data)
+
+        def flush(self):
+            pass
+
+        def poll(self):
+            return None
+
+    @staticmethod
+    def status_enum():
+        class Status(enum.Enum):
+            OK = 0
+            FAILED = 1
+            TIMEOUT = 2
+
+        return Status
+
+    def runner_for(self, on_write):
+        status = self.status_enum()
+
+        class Base:
+            def check_output(self, output):
+                return status.OK
+
+        instance = runner.completion_runner(Base, status)()
+        instance.lk = threading.Lock()
+        instance.output = ""
+        instance.logger = SimpleNamespace(
+            println=lambda message: None, println_file_only=lambda message: None
+        )
+        instance.zcore_proc = self.Console(on_write)
+        return instance, status
+
+    def answer_marker(self, instance, data):
+        """Complete the case the way a guest shell does: the marker line, then
+        a fresh prompt."""
+        found = re.search(r"__ZCORE_DONE_[0-9a-f]+", data.decode())
+        if found is None:
+            return False
+        with instance.lk:
+            instance.output += found[0] + ":0\r\r\n/ # "
+        return True
+
+    def test_a_case_waits_for_a_prompt_that_is_not_on_screen_yet(self):
+        instance = None
+
+        def on_write(data):
+            if data == b"\n":
+                with instance.lk:
+                    instance.output += "/ # "
+                return
+            self.answer_marker(instance, data)
+
+        instance, status = self.runner_for(on_write)
+        instance.prompt_sync = True
+        self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
+        # The newline that asked for the prompt comes first, and the case is
+        # typed only after it answered.
+        self.assertEqual(instance.zcore_proc.writes[0], b"\n")
+        self.assertIn(b"/case.exe", instance.zcore_proc.writes[1])
+
+    def test_a_prompt_already_on_screen_is_not_asked_for_again(self):
+        instance = None
+
+        def on_write(data):
+            self.answer_marker(instance, data)
+
+        instance, status = self.runner_for(on_write)
+        instance.prompt_sync = True
+        with instance.lk:
+            instance.output = "/ # "
+        self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
+        self.assertIn(b"/case.exe", instance.zcore_proc.writes[0])
+
+    def test_a_console_that_never_shows_a_prompt_is_typed_at_anyway(self):
+        """What every run did before the wait existed, and what the unit tests
+        that drive a bare `sh` still need: a console with no prompt must not
+        turn into a timeout of its own."""
+        instance = None
+
+        def on_write(data):
+            self.answer_marker(instance, data)
+
+        instance, status = self.runner_for(on_write)
+        instance.prompt_sync = True
+        patched, runner.PROMPT_WAIT = runner.PROMPT_WAIT, 0.2
+        try:
+            self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
+        finally:
+            runner.PROMPT_WAIT = patched
+        self.assertTrue(any(b"/case.exe" in write for write in instance.zcore_proc.writes))
+
+    def test_a_console_without_prompts_declared_does_not_wait_at_all(self):
+        """`prompt_sync` is off until a runner has actually seen a prompt at
+        boot, so a console that has none pays nothing."""
+        instance = None
+
+        def on_write(data):
+            self.answer_marker(instance, data)
+
+        instance, status = self.runner_for(on_write)
+        self.assertFalse(instance.prompt_sync)
+        self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
+        self.assertIn(b"/case.exe", instance.zcore_proc.writes[0])
 
 
 if __name__ == "__main__":

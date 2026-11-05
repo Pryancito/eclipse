@@ -129,6 +129,11 @@ def main():
                     raise RuntimeError(
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
                     )
+                # This console does show a prompt, so from here on a case is
+                # typed only when it is back: see `PROMPT` in
+                # `scripts/qemu_completion.py` for the four cases that the
+                # shell's termios restore ate without it.
+                self.prompt_sync = True
 
             def classified_output(self, output):
                 return without_kernel_log(output)
