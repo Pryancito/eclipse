@@ -1737,7 +1737,8 @@ impl FileLike for File {
 
     fn is_input_device(&self) -> bool {
         use super::devfs::{EventDev, MiceDev};
-        let inode = self.inner.read().inode.clone();
+        let inner = self.inner.read();
+        let inode = &inner.inode;
         inode.downcast_ref::<MiceDev>().is_some() || inode.downcast_ref::<EventDev>().is_some()
     }
 
@@ -1768,7 +1769,8 @@ impl FileLike for File {
     fn is_terminal(&self) -> bool {
         use super::devfs::UartDev;
         use super::stdio::{CurrentVtTty, Stdin, Stdout};
-        let inode = self.inner.read().inode.clone();
+        let inner = self.inner.read();
+        let inode = &inner.inode;
         inode.downcast_ref::<Stdin>().is_some()
             || inode.downcast_ref::<Stdout>().is_some()
             || inode.downcast_ref::<CurrentVtTty>().is_some()

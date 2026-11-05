@@ -944,6 +944,9 @@ impl Epoll {
             // and a wait that misses it never pumps the network stack.
             let watch_net = interest_list.iter().any(|(_, _, f)| f.is_socket());
             let watch_interactive = interest_list.iter().any(|(_, _, f)| !f.is_socket());
+            // (`watch_hid`, below, is asked only once the scan found nothing
+            // and the wait is about to sleep: a call that returns at once has
+            // no wait to choose a wake source for.)
             // An evdev node carries no EventBus, so `subscribe_readiness`
             // answers `None` for it and this wait would learn about a key or a
             // mouse frame only on the next re-scan — the one device class
@@ -951,7 +954,6 @@ impl Epoll {
             // on the input waker list instead. `is_input_device` walks a
             // nested epoll, which is what a compositor actually watches:
             // `libinput_get_fd` hands out libinput's own epoll fd.
-            let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
             // Read BEFORE the scan below: a frame that lands between the scan
             // and the registration inside `IoMultiplexWait` drains a list this
             // task is not in yet, and would cost it the fallback tick. The
@@ -1114,6 +1116,7 @@ impl Epoll {
                     None => covered = false,
                 }
             }
+            let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
             let tick_ms = if covered {
                 crate::net::wait::IO_WAIT_COVERED_TICK_MS
             } else {
