@@ -94,7 +94,41 @@ global_asm!(
     mov fs:64, rsp
 .endm
 .macro PUSH_USER_FSBASE
-    push fs:0
+    push 0                  # a placeholder; FILL_USER_FSBASE writes the real
+                            # one once every register has been saved
+.endm
+# Ask the HOST for the guest's FS base, straight into the frame's slot for it.
+#
+# What was here was `push fs:0`, which reads the base out of the guest's own
+# thread structure: the base points at a `struct pthread` whose first field is
+# a pointer to itself. That holds while a guest's FS base points at a thread
+# structure, and a guest is under no obligation to keep it that way --
+# `zx_thread_write_state(ZX_THREAD_STATE_GENERAL_REGS)` sets `fs_base` to
+# whatever is asked, and `wrfsbase` is a user-mode instruction.
+#
+# Measured in a libos build in this container, from `Property.RegisterFs` of
+# the Zircon core tests, which sets a thread's FS base to `0xdead2` and then
+# expects the thread to run on:
+#
+#   fault_fn_entry+33:  push %fs:0x0
+#   si_addr   = 0xdead2
+#   fs_base   = 0xdead2
+#
+# The guest faulted, the catcher sent it to `fault_fn_entry`, and the way back
+# in faulted on the same bad base. The catcher dressed THAT fault as a guest
+# fault too and jumped to the entry again: one host thread spinning at 100% on
+# one instruction for ever. The run did not crash, it hung, and that is the
+# 1200-second timeout `Zircon Core Test Libos (x86_64)` died of.
+#
+# This costs one more `arch_prctl` per trip in, on a path that already issues
+# one on the way in (SWITCH_TO_KERNEL_FSBASE) and one on the way out
+# (POP_USER_FSBASE). It is also the only way to see a `wrfsbase` the guest did
+# behind the kernel's back, which reading a remembered value would miss.
+.macro FILL_USER_FSBASE
+    mov eax, 158            # SYS_arch_prctl
+    mov edi, 0x1003         # ARCH_GET_FS
+    lea rsi, [rsp + 18*8]   # &frame.fsbase (rsp is at frame.rax)
+    syscall
 .endm
 .macro SWITCH_TO_KERNEL_FSBASE
     mov eax, 158            # SYS_arch_prctl
@@ -151,6 +185,11 @@ global_asm!(
 .endm
 .macro PUSH_USER_FSBASE
     push gs:0
+.endm
+# Nothing to fill: the push above already read it. The Linux macro of the same
+# name explains why that read is not good enough there; nobody has measured
+# this path on darwin, so it keeps what it had.
+.macro FILL_USER_FSBASE
 .endm
 .macro SWITCH_TO_KERNEL_FSBASE
     mov rdi, gs:48          # rdi = kernel gsbase
@@ -213,6 +252,8 @@ syscall_fn_entry:
     push rcx
     push rbx
     push rax
+
+    FILL_USER_FSBASE
 
     # restore callee-saved registers
     SWITCH_TO_KERNEL_STACK
@@ -279,6 +320,8 @@ fault_fn_entry:
     push rcx
     push rbx
     push rax
+
+    FILL_USER_FSBASE
 
     # restore callee-saved registers
     SWITCH_TO_KERNEL_STACK
