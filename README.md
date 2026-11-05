@@ -117,7 +117,7 @@ rustup show
 
 No hace falta `btrfs-progs`: las imágenes EclipseFS y btrfs las genera xtask. `cmake`,
 OpenCV y FFmpeg solo se necesitan para `cargo opencv` / `cargo ffmpeg`. Hay una
-imagen Docker de desarrollo en [`tools/docker`](tools/docker/README.md).
+imagen Docker de desarrollo en [`tools/docker`](tools/docker/README.es.md).
 
 ## Compilar
 

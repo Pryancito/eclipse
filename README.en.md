@@ -120,7 +120,7 @@ rustup show
 
 `btrfs-progs` is not needed: xtask generates the EclipseFS and btrfs images itself. `cmake`,
 OpenCV and FFmpeg are only needed for `cargo opencv` / `cargo ffmpeg`. A
-development Docker image is available in [`tools/docker`](tools/docker/README.en.md).
+development Docker image is available in [`tools/docker`](tools/docker/README.md).
 
 ## Building
 

@@ -1,5 +1,7 @@
 # clock-probe
 
+**Español** · [English](README.en.md)
+
 Sonda de **integridad** de los relojes y los temporizadores de Eclipse OS. Un
 binario estatico de musl, sin dependencias, que se copia al rootfs y se corre
 desde la shell.

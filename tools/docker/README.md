@@ -1,17 +1,19 @@
-# zCore develop docker image
+# Docker image for developing Eclipse
 
-Build docker image
+**English** · [Español](README.es.md)
+
+Build the image (inherited from zCore; the base defaults to Ubuntu 20.04):
 
 ```
-git clone https://github.com/rcore-os/zCore --recursive
-cd tools/docker
+git clone --recursive https://github.com/Pryancito/eclipse.git
+cd eclipse/tools/docker
 OS_TYPE=ubuntu
 OS_TAG=20.04
 IMAGE_TAG=latest
 ./build_docker_image.sh ${OS_TYPE} ${OS_TAG} ${IMAGE_TAG}
 ```
 
-Start docker container
+Start a container:
 
 ```
 IMAGE_NAME=zcore:${OS_TYPE}-${OS_TAG}-${IMAGE_TAG}

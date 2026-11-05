@@ -1,5 +1,10 @@
 # Claves de firma de Alpine, por arquitectura
 
+**Español** · [English](README.en.md)
+
+> Solo para el camino heredado de apk (`ECLIPSE_PKG=apk`). La imagen por
+> defecto usa apt con Ubuntu y no necesita estas claves.
+
 **Alpine firma el `APKINDEX` de cada arquitectura con una clave distinta.** Un
 `etc/apk/keys` con solo las de x86_64 deja la compilacion de aarch64 en
 
