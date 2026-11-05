@@ -108,6 +108,75 @@ strings! {
     shot_open_folder => { es: "Abrir carpeta", en: "Open folder" },
     shot_copied => { es: "copiada al portapapeles", en: "copied to the clipboard" },
 
+    // ── lunarclip: the clipboard picker ──────────────────────────────────
+    clip_title => { es: "portapapeles", en: "clipboard" },
+    /// `12 entradas` / `12 entries` -- the number goes before it.
+    clip_entries => { es: "entradas", en: "entries" },
+    /// `3 de 12` / `3 of 12`, when the filter is narrowing the list.
+    clip_of => { es: "de", en: "of" },
+    clip_filter => { es: "filtrar...", en: "filter..." },
+    clip_empty => { es: "el historial está vacío", en: "the history is empty" },
+    clip_no_match => { es: "nada coincide", en: "nothing matches" },
+    clip_keys => {
+        es: "Intro copia  ^/v elige  Esc cierra",
+        en: "Enter copies  ^/v picks  Esc closes",
+    },
+    clip_read_only => {
+        es: "sin lunarclip --watch: solo lectura",
+        en: "no lunarclip --watch: read only",
+    },
+    clip_unreadable => { es: "no se puede leer", en: "cannot be read" },
+    clip_image => { es: "imagen", en: "image" },
+
+    // ── lunarclip: what it says in a terminal ────────────────────────────
+    // The `OK` and `ERR` that start a daemon answer are PROTOCOL -- the other
+    // end matches on them with `starts_with(b"OK")` -- so they stay as they
+    // are. What follows an `ERR ` is the reason, which is printed to whoever
+    // ran the command, so that part is translated.
+    clip_one_mode => { es: "solo un modo a la vez", en: "only one mode at a time" },
+    clip_dump_needs => {
+        es: "--dump necesita RUTA[:ANCHOxALTO]",
+        en: "--dump needs PATH[:WIDTHxHEIGHT]",
+    },
+    /// The option goes after it.
+    clip_unknown_option => { es: "opción desconocida", en: "unknown option" },
+    /// The words go before it.
+    clip_no_bare_args => {
+        es: "no toma argumentos sueltos",
+        en: "takes no bare arguments",
+    },
+    clip_source_silent => { es: "la fuente no contestó", en: "the source did not answer" },
+    clip_no_seat => {
+        es: "no hay wl_seat; sin asiento no hay selección",
+        en: "no wl_seat; without a seat there is no selection",
+    },
+    clip_out_of_range => { es: "fuera de rango", en: "out of range" },
+    clip_nothing_to_copy => { es: "nada que copiar", en: "nothing to copy" },
+    clip_already_watching => {
+        es: "ya hay un lunarclip --watch escuchando",
+        en: "a lunarclip --watch is already listening",
+    },
+    clip_no_compositor => { es: "no encuentro el compositor", en: "cannot find the compositor" },
+    /// Added to [`Key::clip_no_compositor`] when the session may simply be down.
+    clip_session_up => { es: "(¿está la sesión arriba?)", en: "(is the session up?)" },
+    /// `vigilando (socket X, historial Y con N entradas)`.
+    clip_watching => { es: "vigilando", en: "watching" },
+    clip_history => { es: "historial", en: "history" },
+    clip_control_withdrawn => {
+        es: "el compositor retiró el control de datos; saliendo",
+        en: "the compositor withdrew data control; exiting",
+    },
+    clip_connection_lost => {
+        es: "se perdió la conexión con el compositor",
+        en: "lost the connection to the compositor",
+    },
+    clip_stdin_failed => {
+        es: "no se pudo leer la entrada estándar",
+        en: "could not read standard input",
+    },
+    /// What the daemon answered, when it was not an `OK`.
+    clip_daemon_said => { es: "el demonio dijo", en: "the daemon said" },
+
     // ── lunarnet: the window ─────────────────────────────────────────────
     net_title => { es: "RED", en: "NETWORK" },
     /// The three things the window edits. The same in both: these are

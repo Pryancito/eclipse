@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use lunarbar::clip::{self, History, Req, ReqParse};
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, BTN_LEFT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
     KEY_PGDN_WL, KEY_PGUP_WL, KEY_TAB_WL, KEY_UP_WL, WHEEL_NOTCH,
@@ -172,7 +173,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     // *and* printing the selection is not a reading of it anybody wants.
     let set_mode = |m: Mode, mode: &mut Option<Mode>| -> Result<(), String> {
         match mode {
-            Some(prev) if *prev != m => Err("solo un modo a la vez".to_string()),
+            Some(prev) if *prev != m => Err(Lang::current().s(Key::clip_one_mode).to_string()),
             _ => {
                 *mode = Some(m);
                 Ok(())
@@ -195,10 +196,15 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             // to a file called `--trim` helps nobody.
             "--dump" => match args.peek() {
                 Some(v) if !v.starts_with("--") => cli.dump = args.next(),
-                _ => return Err("--dump necesita RUTA[:ANCHOxALTO]".to_string()),
+                _ => return Err(Lang::current().s(Key::clip_dump_needs).to_string()),
             },
             "-h" | "--help" => return Err("help".to_string()),
-            other if other.starts_with('-') => return Err(format!("opcion desconocida: {other}")),
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "{}: {other}",
+                    Lang::current().s(Key::clip_unknown_option)
+                ))
+            }
             // Bare words are the text of a `--copy`, so `lunarclip --copy hola
             // mundo` works like `wl-copy hola mundo` does.
             other => words.push(other.to_string()),
@@ -209,7 +215,11 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     cli.mode = mode.unwrap_or(Mode::Pick);
     if !words.is_empty() {
         if cli.mode != Mode::Copy {
-            return Err(format!("{} no toma argumentos sueltos", words.join(" ")));
+            return Err(format!(
+                "{} {}",
+                words.join(" "),
+                Lang::current().s(Key::clip_no_bare_args)
+            ));
         }
         cli.text = Some(words.join(" "));
     }
@@ -286,7 +296,7 @@ fn read_all(fd: OwnedFd, limit: usize) -> std::io::Result<Vec<u8>> {
         if !wait_fd(raw, libc::POLLIN, READ_TIMEOUT_MS) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "la fuente no contesto",
+                Lang::current().s(Key::clip_source_silent),
             ));
         }
         let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -727,7 +737,7 @@ fn no_protocol(st: &Clip) -> ! {
              \x20          sin ese protocolo no hay portapapeles que vigilar (lunarclip --check)"
         );
     } else {
-        eprintln!("lunarclip: no hay wl_seat; sin asiento no hay seleccion");
+        eprintln!("lunarclip: {}", Lang::current().s(Key::clip_no_seat));
     }
     std::process::exit(1)
 }
@@ -755,13 +765,16 @@ fn answer(req: Req, st: &mut Clip, qh: &QueueHandle<Clip>) -> Vec<u8> {
                 st.save();
                 b"OK\n".to_vec()
             }
-            None => b"ERR fuera de rango\n".to_vec(),
+            // `ERR` is protocol; what follows it is the reason, printed to
+            // whoever ran the command.
+            None => format!("ERR {}\n", Lang::current().s(Key::clip_out_of_range)).into_bytes(),
         },
         Req::Copy(text) => {
             // An entry shaped like a picture names a file, and a client that
             // could copy one could have any file served as a picture.
             if !clip::worth_keeping(&text) || clip::looks_like_image(&text) {
-                return b"ERR nada que copiar\n".to_vec();
+                return format!("ERR {}\n", Lang::current().s(Key::clip_nothing_to_copy))
+                    .into_bytes();
             }
             st.history.push(&text);
             st.serve(text, qh);
@@ -791,7 +804,7 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<UnixListener> {
         if UnixStream::connect(path).is_ok() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
-                "ya hay un lunarclip --watch escuchando",
+                Lang::current().s(Key::clip_already_watching),
             ));
         }
         let _ = std::fs::remove_file(path);
@@ -801,12 +814,17 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<UnixListener> {
 
 /// The `--watch` loop: the compositor's events and the socket's clients.
 fn watch(cli: &Cli) -> ! {
+    let lang = Lang::current();
     let hist_path = clip::history_path(
         std::env::var("XDG_CACHE_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     );
     let Some((conn, mut queue, mut st)) = connect(hist_path.clone(), !cli.no_persist) else {
-        eprintln!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
+        eprintln!(
+            "lunarclip: {} {}",
+            Lang::current().s(Key::clip_no_compositor),
+            Lang::current().s(Key::clip_session_up)
+        );
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -828,10 +846,13 @@ fn watch(cli: &Cli) -> ! {
     };
     let _ = listener.set_nonblocking(true);
     println!(
-        "lunarclip: vigilando (socket {}, historial {} con {} entradas)",
+        "lunarclip: {} (socket {}, {} {} con {} {})",
+        lang.s(Key::clip_watching),
         sock_path.display(),
+        lang.s(Key::clip_history),
         hist_path.display(),
-        st.history.len()
+        st.history.len(),
+        lang.s(Key::clip_entries)
     );
 
     let mut clients: Vec<Client> = Vec::new();
@@ -840,7 +861,7 @@ fn watch(cli: &Cli) -> ! {
         // sleeping: reading it, and re-offering it when it went away.
         settle_selection(&mut st, &qh, &conn, &mut queue);
         if st.finished {
-            eprintln!("lunarclip: el compositor retiro el control de datos; saliendo");
+            eprintln!("lunarclip: {}", lang.s(Key::clip_control_withdrawn));
             let _ = std::fs::remove_file(&sock_path);
             std::process::exit(1);
         }
@@ -890,7 +911,7 @@ fn watch(cli: &Cli) -> ! {
             drop(guard);
         }
         if queue.dispatch_pending(&mut st).is_err() {
-            eprintln!("lunarclip: se perdio la conexion con el compositor");
+            eprintln!("lunarclip: {}", lang.s(Key::clip_connection_lost));
             break;
         }
         // The clients the poll found ready, BY FILE DESCRIPTOR. The accept
@@ -1121,7 +1142,10 @@ fn copy(cli: &Cli) -> ! {
         None => {
             let mut buf = Vec::new();
             if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
-                eprintln!("lunarclip: no se pudo leer la entrada estandar: {e}");
+                eprintln!(
+                    "lunarclip: {}: {e}",
+                    Lang::current().s(Key::clip_stdin_failed)
+                );
                 std::process::exit(1);
             }
             match String::from_utf8(buf) {
@@ -1162,7 +1186,7 @@ fn copy(cli: &Cli) -> ! {
          \x20          (Ctrl-C la suelta; con el demonio esto vuelve al momento)"
     );
     let Some((conn, mut queue, mut st)) = connect(PathBuf::new(), false) else {
-        eprintln!("lunarclip: no encuentro el compositor");
+        eprintln!("lunarclip: {}", Lang::current().s(Key::clip_no_compositor));
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -1182,7 +1206,7 @@ fn copy(cli: &Cli) -> ! {
 /// `--paste`: the selection on stdout, with no trailing newline added.
 fn paste() -> ! {
     let Some((conn, mut queue, mut st)) = connect(PathBuf::new(), false) else {
-        eprintln!("lunarclip: no encuentro el compositor");
+        eprintln!("lunarclip: {}", Lang::current().s(Key::clip_no_compositor));
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -1222,7 +1246,11 @@ fn paste() -> ! {
 /// protocol is missing.
 fn check() -> ! {
     let Some((_conn, _queue, st)) = connect(PathBuf::new(), false) else {
-        println!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
+        println!(
+            "lunarclip: {} {}",
+            Lang::current().s(Key::clip_no_compositor),
+            Lang::current().s(Key::clip_session_up)
+        );
         std::process::exit(1);
     };
     let sock = clip::socket_path(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
@@ -1287,7 +1315,8 @@ fn clear() -> ! {
         Some(a) if a.starts_with(b"OK") => std::process::exit(0),
         Some(a) => {
             eprintln!(
-                "lunarclip: el demonio dijo: {}",
+                "lunarclip: {}: {}",
+                Lang::current().s(Key::clip_daemon_said),
                 String::from_utf8_lossy(&a).trim()
             );
             std::process::exit(1)
@@ -1507,11 +1536,15 @@ struct Picker {
     /// The index the user chose, once they have.
     picked: Option<usize>,
     done: bool,
+    /// Read once, at startup: the session's language does not change under a
+    /// window that is already open.
+    lang: Lang,
 }
 
 impl Picker {
     fn new(items: Vec<String>, live: bool) -> Self {
         let look = Look::current();
+        let lang = Lang::current();
         let mut p = Self {
             compositor: None,
             shm: None,
@@ -1551,6 +1584,7 @@ impl Picker {
             scroll_acc: 0.0,
             picked: None,
             done: false,
+            lang,
         };
         p.refilter();
         p
@@ -1834,13 +1868,14 @@ fn draw_pane(cv: &mut Canvas, st: &Picker, x: i32, y: i32, w: i32, h: i32) {
                 pm.width() as i32
             }
             None => {
-                cv.text("no se puede leer", ix, iy, p.dim);
-                Canvas::text_width("no se puede leer")
+                let msg = st.lang.s(Key::clip_unreadable);
+                cv.text(msg, ix, iy, p.dim);
+                Canvas::text_width(msg)
             }
         };
         let tx = ix + used + 16;
         let facts = [
-            ("imagen".to_string(), p.text),
+            (st.lang.s(Key::clip_image).to_string(), p.text),
             (format!("{} \u{d7} {} px", img.w, img.h), p.text),
             (
                 format!("{} \u{b7} PNG", clip::size_label(img.bytes as usize)),
@@ -1906,11 +1941,16 @@ fn draw_picker(
     // Header: what this is, and how many entries there are.
     let hx = px + PAD + 4;
     let hy = py + PAD + (HEAD_H - GLYPH_H) / 2;
-    cv.text_bold("portapapeles", hx, hy, p.text);
+    cv.text_bold(st.lang.s(Key::clip_title), hx, hy, p.text);
     let count = if st.field.is_empty() {
-        format!("{} entradas", st.items.len())
+        format!("{} {}", st.items.len(), st.lang.s(Key::clip_entries))
     } else {
-        format!("{} de {}", st.rows.len(), st.items.len())
+        format!(
+            "{} {} {}",
+            st.rows.len(),
+            st.lang.s(Key::clip_of),
+            st.items.len()
+        )
     };
     let cw = Canvas::text_width(&count);
     cv.text(&count, px + pw - PAD - 4 - cw, hy, p.dim);
@@ -1920,7 +1960,7 @@ fn draw_picker(
     cv.round_rect(px + PAD, fy, pw - 2 * PAD, FIELD_BOX, 6, p.field);
     let ty = fy + (FIELD_BOX - GLYPH_H) / 2;
     if st.field.is_empty() {
-        cv.text("filtrar...", px + PAD + 10, ty, p.dim);
+        cv.text(st.lang.s(Key::clip_filter), px + PAD + 10, ty, p.dim);
     } else {
         let shown = clip::preview(&st.field, MAX_FIELD);
         let end = cv.text(&shown, px + PAD + 10, ty, p.text);
@@ -1934,11 +1974,11 @@ fn draw_picker(
     let avail = pw - 2 * PAD - 16;
 
     if st.rows.is_empty() {
-        let msg = if st.items.is_empty() {
-            "el historial esta vacio"
+        let msg = st.lang.s(if st.items.is_empty() {
+            Key::clip_empty
         } else {
-            "nada coincide"
-        };
+            Key::clip_no_match
+        });
         cv.text(msg, px + PAD + 10, row0 + (ROW_H - GLYPH_H) / 2, p.dim);
     }
 
@@ -2006,15 +2046,10 @@ fn draw_picker(
     // that says why.
     let foot_y = py + ph - FOOT_H + (FOOT_H - GLYPH_H) / 2 - 2;
     if st.live {
-        cv.text(
-            "Enter copia  ^/v elige  Esc cierra",
-            px + PAD + 4,
-            foot_y,
-            p.dim,
-        );
+        cv.text(st.lang.s(Key::clip_keys), px + PAD + 4, foot_y, p.dim);
     } else {
         cv.text(
-            "sin lunarclip --watch: solo lectura",
+            st.lang.s(Key::clip_read_only),
             px + PAD + 4,
             foot_y,
             p.accent,
@@ -2326,7 +2361,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Picker {
 fn pick() -> ! {
     let (items, live) = history_for_picker();
     let Ok(conn) = lunarbar::wl::connect() else {
-        eprintln!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
+        eprintln!(
+            "lunarclip: {} {}",
+            Lang::current().s(Key::clip_no_compositor),
+            Lang::current().s(Key::clip_session_up)
+        );
         std::process::exit(1);
     };
     let mut queue = conn.new_event_queue();
@@ -2363,7 +2402,8 @@ fn pick() -> ! {
         Some(a) if a.starts_with(b"OK") => std::process::exit(0),
         Some(a) => {
             eprintln!(
-                "lunarclip: el demonio dijo: {}",
+                "lunarclip: {}: {}",
+                Lang::current().s(Key::clip_daemon_said),
                 String::from_utf8_lossy(&a).trim()
             );
             std::process::exit(1)
