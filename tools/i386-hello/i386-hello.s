@@ -146,6 +146,10 @@
  *   114 the pre-POSIX sigaction (67) was not answered at all, or its
  *       `struct old_sigaction` was read as the twenty bytes of number 174:
  *       it is SIXTEEN, with the mask second and one word wide
+ *   115 a THREAD with a stack of its own could not be made, did not run on
+ *       that stack, did not get its own thread area in the slot it named,
+ *       or its CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID words were not
+ *       written and cleared --- the whole shape of a `pthread_create`
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3815,6 +3819,98 @@ timer64_skipped:
 	cmpl	$0x5a5a5a5a, old90old + 16
 	jne	bad_oldsigaction
 
+	/* Step 91 (code 115): a THREAD, with its own stack --- the whole shape
+	 * of a `pthread_create` from a 32-bit process.
+	 *
+	 * Step 88 proved the `clone` ARGUMENTS come out in i386's order, but
+	 * it made a fork: `newsp` was zero and the child ran on the parent's
+	 * stack, and nothing about a thread was exercised. This is the other
+	 * call every threaded program really makes:
+	 *
+	 *   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
+	 *   | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+	 *
+	 * with a stack of its own in `%ecx`, and no signal in the low byte ---
+	 * a `CLONE_THREAD` clone reports to nobody.
+	 *
+	 * The `tls` names the SAME slot step 17 was given and a DIFFERENT
+	 * base, which is what makes the two halves of the TLS check
+	 * measurable: the child inherits `%gs` with that selector already in
+	 * it, so what it reads through `%gs:0` is whatever descriptor the
+	 * kernel put in ITS slot. A kernel that installed the child's
+	 * descriptor somewhere else, or that stored the POINTER as the base,
+	 * hands the child the parent's word or rubbish --- and a kernel whose
+	 * slots are not per-thread changes the PARENT's base too, which the
+	 * last check here reads back.
+	 *
+	 * The child cannot be waited for (`waitpid` does not see a thread), so
+	 * the parent spins on a word the child writes and then on the
+	 * `CHILD_CLEARTID` word the kernel clears when it dies. Both spins are
+	 * bounded: a thread that never runs reports 115 instead of hanging the
+	 * probe. */
+	movl	tls_desc + 0, %eax	/* the slot step 17 was given */
+	movl	%eax, cdesc91 + 0
+	movl	$0xffffffff, ptid91
+	movl	$0xffffffff, ctid91
+	movl	$0, cflag91
+	movl	$0, cesp91
+	movl	$0, cbase91
+	movl	$0x390f00, %ebx		/* VM FS FILES SIGHAND THREAD
+					   SETTLS PARENT_SETTID
+					   CHILD_CLEARTID, no signal */
+	movl	$stack91top, %ecx	/* the thread's own stack */
+	movl	$ptid91, %edx
+	movl	$cdesc91, %esi		/* fourth: the tls, as in step 88 */
+	movl	$ctid91, %edi		/* fifth: child_tid */
+	movl	$120, %eax
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_thread
+	jz	thread91		/* the child: runs and exits */
+	movl	%eax, tid91
+
+	movl	$100000000, %ecx
+spin91:
+	cmpl	$1, cflag91
+	je	ran91
+	decl	%ecx
+	jnz	spin91
+	jmp	bad_thread
+ran91:
+	/* `CLONE_PARENT_SETTID` wrote the thread's id where it was asked. */
+	movl	ptid91, %eax
+	cmpl	tid91, %eax
+	jne	bad_thread
+	/* And it is a THREAD: `getpid` still answers the process, not it. */
+	movl	$20, %eax
+	int	$0x80
+	cmpl	ptid91, %eax
+	je	bad_thread
+	/* It ran on ITS stack, not on this one. */
+	movl	cesp91, %eax
+	cmpl	$stack91, %eax
+	jbe	bad_thread
+	cmpl	$stack91top, %eax
+	ja	bad_thread
+	/* And with ITS thread area: the base the descriptor named, read
+	 * through the selector it inherited. */
+	cmpl	$0x5eed91, cbase91
+	jne	bad_thread
+	/* The parent's own slot is untouched, which is what says the
+	 * descriptor tables are per-thread. */
+	movl	%gs:0, %eax
+	cmpl	$0xc0ffee, %eax
+	jne	bad_thread
+	/* And the `CHILD_CLEARTID` word was cleared when it died. */
+	movl	$100000000, %ecx
+spin91b:
+	cmpl	$0, ctid91
+	je	done91
+	decl	%ecx
+	jnz	spin91b
+	jmp	bad_thread
+done91:
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -4195,6 +4291,22 @@ clone_child:
 	movl	$1, %eax
 	xorl	%ebx, %ebx
 	int	$0x80
+
+/* The thread of step 91. It runs on a stack of its own, so there is nothing
+ * to return to: it reports what it sees through shared memory --- which it
+ * has, `CLONE_VM` --- and leaves by `exit` (1) and NOT `exit_group` (252),
+ * which is the difference between a thread ending and the program ending. */
+thread91:
+	movl	%esp, cesp91
+	movl	%gs:0, %eax
+	movl	%eax, cbase91
+	movl	$1, cflag91
+	movl	$1, %eax
+	xorl	%ebx, %ebx
+	int	$0x80
+bad_thread:
+	movl	$115, %ebx
+	jmp	die
 bad_oldsigaction:
 	movl	$114, %ebx
 	jmp	die
@@ -4849,3 +4961,37 @@ flag90:
 	.balign	4
 hmask90:
 	.long	0, 0
+
+	/* Step 91's thread: the descriptor it is given, the word its thread
+	 * area holds, the three words it and the kernel report through, and
+	 * its stack. The descriptor names the slot step 17 was given --- the
+	 * step fills that in --- and a base of its own, so the child and the
+	 * parent read different words through the same selector. */
+	.balign	4
+cdesc91:
+	.long	0			/* entry_number: step 91 fills it in */
+	.long	ctls91			/* base_addr: the thread's own area */
+	.long	0xfffff			/* limit */
+	.long	0x51			/* seg_32bit|limit_in_pages|useable */
+	.balign	4
+ctls91:
+	.long	0x5eed91
+	.balign	4
+ptid91:
+	.long	0
+ctid91:
+	.long	0
+tid91:
+	.long	0
+cflag91:
+	.long	0
+cesp91:
+	.long	0
+cbase91:
+	.long	0
+	/* Sixteen-aligned, as every ABI wants a stack to be, and the step
+	 * checks the thread's `%esp` landed between the two symbols. */
+	.balign	16
+stack91:
+	.space	8192
+stack91top:
