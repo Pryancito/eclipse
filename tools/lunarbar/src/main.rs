@@ -61,6 +61,8 @@ use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysin
 
 mod hunter_menu;
 mod info;
+mod launcher;
+use launcher::Row;
 use info::*;
 mod workspaces;
 mod hunter_toast;
@@ -560,8 +562,11 @@ enum PopupKind {
     Apps {
         all: Vec<apps::AppEntry>,
         filter: String,
-        /// Indices into `all` that match `filter`.
-        visible: Vec<usize>,
+        /// The rows shown: programs matching `filter`, or the categories, or
+        /// one category's programs ([`launcher::rows`]).
+        visible: Vec<Row>,
+        /// The open category (an [`obmenu`] schema slot), or the top level.
+        cat: Option<usize>,
         /// Selected row (absolute index into `visible`).
         sel: usize,
         /// First visible row of the scroll window.
@@ -590,11 +595,11 @@ const POPUP_SHADOW: i32 = 12;
 /// A clickable region inside the popup panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
-    /// An app row: (absolute row in the filtered `visible` list, entry index
-    /// into `all`). Launching uses the entry index — stable across a
-    /// refilter — so a click racing a dirty-skipped repaint still launches
-    /// exactly the app whose name was drawn under the cursor.
-    Row(usize, usize),
+    /// A menu row: (absolute row in `visible`, what it is). A program is
+    /// keyed by its entry index into `all` — stable across a refilter — so a
+    /// click racing a dirty-skipped repaint still launches exactly the app
+    /// whose name was drawn under the cursor.
+    Row(usize, Row),
     PrevMonth,
     NextMonth,
     PowerLock,
@@ -1405,19 +1410,21 @@ impl State {
                 name: "Terminal".into(),
                 exec: self.terminal.clone(),
                 icon: Some("utilities-terminal".into()),
+                categories: vec!["System".into()],
                 ..apps::AppEntry::default()
             }];
             self.apps_cache.extend(apps::scan_apps(&self.terminal));
             self.apps_scanned = true;
         }
         let all: Vec<apps::AppEntry> = self.apps_cache.to_vec();
-        let visible = (0..all.len()).collect();
+        let visible = launcher::rows(&all, "", None);
         self.open_popup(
             qh,
             PopupKind::Apps {
                 all,
                 filter: String::new(),
                 visible,
+                cat: None,
                 sel: 0,
                 scroll: 0,
             },
@@ -1834,13 +1841,20 @@ impl State {
         };
         let panel = popup.panel;
         match self.popup_hit(x, y) {
-            Some(Action::Row(_, entry)) => {
-                if let PopupKind::Apps { all, .. } = &popup.kind {
-                    if let Some(e) = all.get(entry) {
-                        let cmd = e.exec.clone();
+            Some(Action::Row(_, row)) => {
+                let cmd = match self.popup.as_mut().map(|p| &mut p.kind) {
+                    Some(PopupKind::Apps { all, cat, visible, sel, scroll, .. }) => {
+                        launcher::activate(all, cat, visible, sel, scroll, row)
+                    }
+                    _ => return,
+                };
+                match cmd {
+                    Some(cmd) => {
                         self.close_popup();
                         self.spawn(&cmd);
                     }
+                    None if !self.reposition_popup(qh) => self.render_popup(qh),
+                    None => {}
                 }
             }
             Some(Action::PrevMonth) => self.cal_shift(qh, -1),
@@ -1998,23 +2012,30 @@ impl State {
                     all,
                     filter,
                     visible,
+                    cat,
                     sel,
                     scroll,
                 } => {
                     let rows_fit = panel_rows_fit(popup.panel_h as i32);
+                    let row = visible.get(*sel).copied();
                     match key {
                         KEY_ESC_WL if !filter.is_empty() => {
                             filter.clear();
-                            *visible = filter_apps(all, filter);
-                            *sel = 0;
-                            *scroll = 0;
+                            launcher::refresh(all, filter, *cat, visible, sel, scroll);
                             act = Do::Render;
                         }
+                        KEY_ESC_WL | KEY_LEFT_WL | KEY_BACKSPACE_WL
+                            if filter.is_empty() && launcher::back(all, cat, visible, sel, scroll) =>
+                        {
+                            act = Do::Render
+                        }
                         KEY_ESC_WL => act = Do::Close,
-                        KEY_ENTER_WL | KEY_KPENTER_WL => {
-                            if let Some(&ai) = visible.get(*sel) {
-                                act = Do::Launch(all[ai].exec.clone());
-                            }
+                        KEY_ENTER_WL | KEY_KPENTER_WL | KEY_RIGHT_WL if row.is_some() => {
+                            act = match launcher::activate(all, cat, visible, sel, scroll, row.unwrap()) {
+                                Some(cmd) if key != KEY_RIGHT_WL => Do::Launch(cmd),
+                                Some(_) => Do::Nothing,
+                                None => Do::Render,
+                            };
                         }
                         KEY_UP_WL => {
                             *sel = sel.saturating_sub(1);
@@ -2036,9 +2057,7 @@ impl State {
                         }
                         KEY_BACKSPACE_WL => {
                             if filter.pop().is_some() {
-                                *visible = filter_apps(all, filter);
-                                *sel = 0;
-                                *scroll = 0;
+                                launcher::refresh(all, filter, *cat, visible, sel, scroll);
                                 act = Do::Render;
                             }
                         }
@@ -2046,9 +2065,7 @@ impl State {
                             if let Some(c) = key_char(k) {
                                 if filter.chars().count() < APPS_FILTER_MAX {
                                     filter.push(c);
-                                    *visible = filter_apps(all, filter);
-                                    *sel = 0;
-                                    *scroll = 0;
+                                    launcher::refresh(all, filter, *cat, visible, sel, scroll);
                                     act = Do::Render;
                                 }
                             }
@@ -2901,6 +2918,7 @@ fn draw_popup(
             all,
             filter,
             visible,
+            cat,
             sel,
             scroll,
         } => {
@@ -2914,7 +2932,7 @@ fn draw_popup(
             if *scroll > max_scroll {
                 *scroll = max_scroll;
             }
-            draw_apps(cv, px, py, pw, ph, all, visible, filter, *sel, *scroll, icons)
+            draw_apps(cv, px, py, pw, ph, all, visible, *cat, filter, *sel, *scroll, icons)
         }
         PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
         PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
@@ -2937,7 +2955,8 @@ fn draw_apps(
     pw: i32,
     ph: i32,
     all: &[apps::AppEntry],
-    visible: &[usize],
+    visible: &[Row],
+    cat: Option<usize>,
     filter: &str,
     sel: usize,
     scroll: usize,
@@ -2953,14 +2972,13 @@ fn draw_apps(
     // Header: crescent + title + result count.
     let icon = 18;
     cv.crescent(px + 12, py + (APPS_HEADER_H - icon) / 2, icon, pal().accent);
-    let title = i18n::Lang::current().apps_title();
     cv.text_bold(
-        &if tecno() { title.to_uppercase() } else { title.to_string() },
+        &launcher::title(cat),
         px + 12 + icon + 10,
         py + (APPS_HEADER_H - GLYPH_H) / 2,
         pal().text,
     );
-    let count = visible.len().to_string();
+    let count = launcher::programs(all, visible).to_string();
     cv.text(
         &count,
         px + pw - 12 - Canvas::text_width(&count),
@@ -2999,7 +3017,7 @@ fn draw_apps(
         );
     } else {
         let is = 20; // row icon slot
-        for (row, &ai) in visible.iter().enumerate().skip(scroll).take(rows_fit) {
+        for (row, &r) in visible.iter().enumerate().skip(scroll).take(rows_fit) {
             let y = list_top + (row - scroll) as i32 * APPS_ROW_H;
             let selected = row == sel;
             if selected {
@@ -3008,6 +3026,11 @@ fn draw_apps(
                     cv.fill_rect_a(px + 5, y + 1, 2, APPS_ROW_H - 2, pal().accent, 1.0);
                 }
             }
+            hits.push((px + 5, y + 1, px + pw - 5, y + APPS_ROW_H - 1, Action::Row(row, r)));
+            let Row::App(ai) = r else {
+                launcher::draw_row(cv, px, y, pw, is, r, selected, all, icons);
+                continue;
+            };
             let Some(e) = all.get(ai) else { continue };
             let iy = y + (APPS_ROW_H - is) / 2;
             if tecno() {
@@ -3042,7 +3065,6 @@ fn draw_apps(
                 e.name.clone()
             };
             cv.text(&label, tx, y + (APPS_ROW_H - GLYPH_H) / 2, col);
-            hits.push((px + 5, y + 1, px + pw - 5, y + APPS_ROW_H - 1, Action::Row(row, ai)));
         }
         // Scrollbar when the list overflows the window.
         if visible.len() > rows_fit {
@@ -4437,30 +4459,30 @@ fn main() {
                     name: "Terminal".into(),
                     exec: terminal.clone(),
                     icon: Some("utilities-terminal".into()),
+                    categories: vec!["System".into()],
                     ..apps::AppEntry::default()
                 }];
                 all.extend(apps::scan_apps(&terminal));
                 if all.len() == 1 {
                     // No .desktop files in this environment: show sample rows
                     // so the preview still demonstrates the menu.
-                    for n in ["Ajustes", "Archivos", "Navegador web", "Editor de texto"] {
+                    for (n, c) in [("Ajustes", "Settings"), ("Archivos", "System"), ("Navegador web", "Network"), ("Correo", "Network"), ("Editor de texto", "Utility")] {
                         all.push(apps::AppEntry {
                             name: n.into(),
+                            categories: vec![c.into()],
                             ..apps::AppEntry::default()
                         });
                     }
                 }
-                let visible: Vec<usize> = (0..all.len()).collect();
+                // LUNARBAR_DUMP_CAT=slot previews that category's submenu.
+                let (mut cat, mut visible, mut sel, mut scroll) = (None, launcher::rows(&all, "", None), 1, 0);
+                if let Some(c) = std::env::var("LUNARBAR_DUMP_CAT").ok().and_then(|v| v.parse().ok()) {
+                    launcher::activate(&all, &mut cat, &mut visible, &mut sel, &mut scroll, Row::Cat(c));
+                }
                 let mut ic = IconCache::default();
-                let k = PopupKind::Apps {
-                    all: Vec::new(),
-                    filter: String::new(),
-                    visible: visible.clone(),
-                    sel: 0,
-                    scroll: 0,
-                };
+                let k = PopupKind::Apps { all: Vec::new(), filter: String::new(), visible: visible.clone(), cat, sel, scroll };
                 let (px, py, pw, ph) = place(&k, true);
-                draw_apps(&mut cv, px, py, pw, ph, &all, &visible, "", 1, 0, &mut ic);
+                draw_apps(&mut cv, px, py, pw, ph, &all, &visible, cat, "", sel, 0, &mut ic);
             } else {
                 let (y, mo, _) = sysinfo::today().unwrap_or((2026, 0, 1));
                 let k = PopupKind::Calendar { year: y, month: mo };

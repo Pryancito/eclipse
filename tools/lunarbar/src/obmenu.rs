@@ -59,33 +59,48 @@ fn empty_label(lang: Lang) -> &'static str {
     }
 }
 
-/// Group `apps` into the schema, in menu order: `(label, entries)` per
-/// non-empty submenu, with the catch-all last. Entries keep the order they
-/// came in, which [`crate::apps::scan_apps`] has already sorted by name.
+/// The schema row `app` is filed under: the first [`SCHEMA`] row whose
+/// category it declares, or `SCHEMA.len()` (the catch-all) when none.
+pub fn slot(app: &AppEntry) -> usize {
+    SCHEMA
+        .iter()
+        .position(|(fd, _, _)| app.categories.iter().any(|c| c == fd))
+        .unwrap_or(SCHEMA.len())
+}
+
+/// The label of schema row `slot` ([`slot`]), the catch-all past the end.
+pub fn slot_label(slot: usize, lang: Lang) -> &'static str {
+    match SCHEMA.get(slot) {
+        Some((_, es, en)) => match lang {
+            Lang::Es => es,
+            Lang::En => en,
+        },
+        None => other_label(lang),
+    }
+}
+
+/// Group `apps` into the schema, in menu order: `(slot, indices)` per
+/// non-empty submenu, with the catch-all last. Indices keep the order the
+/// entries came in, which [`crate::apps::scan_apps`] has already sorted by
+/// name. Shared by labwc's pipe menu and the panel's launcher.
+pub fn grouped_indices(apps: &[AppEntry]) -> Vec<(usize, Vec<usize>)> {
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); SCHEMA.len() + 1];
+    for (i, app) in apps.iter().enumerate() {
+        buckets[slot(app)].push(i);
+    }
+    buckets
+        .into_iter()
+        .enumerate()
+        .filter(|(_, b)| !b.is_empty())
+        .collect()
+}
+
+/// [`grouped_indices`] with labels and entries: `(label, entries)`.
 pub fn grouped(apps: &[AppEntry], lang: Lang) -> Vec<(&'static str, Vec<&AppEntry>)> {
-    let mut buckets: Vec<Vec<&AppEntry>> = vec![Vec::new(); SCHEMA.len() + 1];
-    for app in apps {
-        let slot = SCHEMA
-            .iter()
-            .position(|(fd, _, _)| app.categories.iter().any(|c| c == fd))
-            .unwrap_or(SCHEMA.len());
-        buckets[slot].push(app);
-    }
-    let mut out = Vec::new();
-    for (i, bucket) in buckets.into_iter().enumerate() {
-        if bucket.is_empty() {
-            continue;
-        }
-        let label = match SCHEMA.get(i) {
-            Some((_, es, en)) => match lang {
-                Lang::Es => *es,
-                Lang::En => *en,
-            },
-            None => other_label(lang),
-        };
-        out.push((label, bucket));
-    }
-    out
+    grouped_indices(apps)
+        .into_iter()
+        .map(|(s, b)| (slot_label(s, lang), b.into_iter().map(|i| &apps[i]).collect()))
+        .collect()
 }
 
 /// The `<openbox_pipe_menu>` document labwc reads from our stdout.
