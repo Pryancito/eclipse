@@ -1111,6 +1111,11 @@ impl UserContext {
     pub fn enter_uspace(&mut self) {
         cfg_if! {
             if #[cfg(feature = "libos")] {
+                // Before the trip out, while the kernel's own thread area is
+                // still loaded: the fault bridge's handler needs a stack of
+                // its own on this host thread. See `libos::fault_bridge`.
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                crate::fault_bridge::ensure_altstack();
                 self.0.run_fncall()
             } else {
                 #[cfg(target_arch = "x86_64")]

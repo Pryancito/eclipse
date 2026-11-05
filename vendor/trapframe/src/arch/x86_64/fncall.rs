@@ -24,7 +24,20 @@ extern "sysv64" {
     pub fn syscall_fn_entry();
 
     fn syscall_fn_return(regs: &mut UserContext);
+
+    /// The way back into the kernel for a guest that faulted.
+    ///
+    /// Not callable from Rust: it is the address a fault catcher points the
+    /// guest's instruction pointer at, after laying [`FAULT_FRAME_WORDS`]
+    /// words below the guest's stack pointer. See the asm for the layout.
+    pub fn fault_fn_entry();
 }
+
+/// How many words a fault catcher places below the guest's stack pointer
+/// before jumping to [`fault_fn_entry`], and so how far it must move that
+/// pointer down. The words are, from the guest's stack pointer downwards: the
+/// guest's `r11`, the faulting `rip`, the x86 trap vector, and the error code.
+pub const FAULT_FRAME_WORDS: usize = 4;
 
 impl UserContext {
     /// Go to user context by function return, within the same privilege level.
@@ -32,11 +45,16 @@ impl UserContext {
     /// User program should call `syscall_fn_entry()` to return back.
     /// Trap reason and error code will always be set to 0x100 and 0.
     pub fn run_fncall(&mut self) {
+        // Set before the trip out, not after it, because the way back is no
+        // longer only `syscall_fn_entry`: a guest that faults comes back
+        // through `fault_fn_entry`, which writes the real cause into these
+        // two fields itself. Overwriting them on return would turn every
+        // fault into a syscall numbered 0x100.
+        self.trap_num = 0x100;
+        self.error_code = 0;
         unsafe {
             syscall_fn_return(self);
         }
-        self.trap_num = 0x100;
-        self.error_code = 0;
     }
 }
 
@@ -102,6 +120,7 @@ global_asm!(
 
 .global syscall_fn_entry
 .global syscall_fn_return
+.global fault_fn_entry
 "#
 );
 
@@ -155,6 +174,9 @@ global_asm!(
 .global _syscall_fn_entry
 .global syscall_fn_entry
 .global _syscall_fn_return
+.global fault_fn_entry
+.global _fault_fn_entry
+.set _fault_fn_entry, fault_fn_entry
 .set _syscall_fn_entry, syscall_fn_entry
 .set _syscall_fn_return, syscall_fn_return
 "#
@@ -205,6 +227,72 @@ syscall_fn_entry:
     SWITCH_TO_KERNEL_FSBASE
 
     # go back to Rust
+    ret
+
+    # The way back for a guest that FAULTED rather than made a syscall.
+    #
+    # Jumped to (not called) with the guest's registers as they were at the
+    # fault, with four words placed below the guest's stack pointer by whoever
+    # caught the fault -- on a libos host, the signal handler, from the
+    # `ucontext` the kernel handed it:
+    #
+    #   [guest_rsp - 8]   guest r11      (this code needs r11 as scratch, and
+    #                                     the frame must still carry the real
+    #                                     one: a Zircon exception report hands
+    #                                     the thread's registers to a debugger)
+    #   [guest_rsp - 16]  guest rip      (where the fault happened)
+    #   [guest_rsp - 24]  trap_num       (the x86 vector: 6 for #UD, 13 for
+    #                                     #GP, and so on)
+    #   [guest_rsp - 32]  error_code
+    #
+    # and with rsp = guest_rsp - 32. Everything after that is `syscall_fn_entry`
+    # with the rip and r11 taken from those words instead of from the call, and
+    # with trap_num/error_code written into the frame on the way past them.
+fault_fn_entry:
+    lea r11, [rsp + 32]     # r11 = the guest's rsp at the fault
+
+    SWITCH_TO_KERNEL_STACK
+    pop rsp                 # rsp = &UserContext
+    lea rsp, [rsp + 22*8]   # one past error_code
+    push [r11 - 32]         # error_code
+    push [r11 - 24]         # trap_num
+                            # rsp = top of trap frame (struct GeneralRegs)
+
+    # push trap frame (struct GeneralRegs)
+    push 0                  # ignore gs_base
+    PUSH_USER_FSBASE
+    pushfq                  # push rflags
+    push [r11 - 16]         # push rip
+    push r15
+    push r14
+    push r13
+    push r12
+    push [r11 - 8]          # push the guest's own r11
+    push r10
+    push r9
+    push r8
+    push r11                # push rsp
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    # restore callee-saved registers
+    SWITCH_TO_KERNEL_STACK
+    pop rbx
+    pop rbx
+    pop rbp
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    SWITCH_TO_KERNEL_FSBASE
+
+    # go back to Rust, out of `syscall_fn_return` as if it had returned
     ret
 
     # extern "sysv64" fn syscall_fn_return(&mut UserContext)
@@ -385,5 +473,111 @@ dump_registers:
         );
         assert_eq!(cx.trap_num, 0x100);
         assert_eq!(cx.error_code, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    global_asm!(".set _fault_from_guest, fault_from_guest");
+
+    // Mock guest that does what a fault catcher does on its behalf: lay the
+    // four words below its own stack pointer and jump. `r11` is pushed BEFORE
+    // it is clobbered, so the frame still carries the guest's own value.
+    global_asm!(
+        r#"
+fault_from_guest:
+    push r11                # [guest_rsp - 8]  = the guest's own r11
+    lea r11, [rip + 2f]
+    push r11                # [guest_rsp - 16] = the faulting rip
+    push 6                  # [guest_rsp - 24] = trap_num: #UD
+    push 0                  # [guest_rsp - 32] = error_code
+    jmp fault_fn_entry
+2:
+"#
+    );
+
+    /// The way back for a guest that faulted: the frame must come back with
+    /// the fault's cause, the guest's registers as they were -- `r11`
+    /// included, which the entry needs as scratch -- and the guest's own stack
+    /// pointer, not the one with the catcher's four words under it.
+    #[test]
+    fn run_fncall_returning_from_a_fault() {
+        extern "sysv64" {
+            fn fault_from_guest();
+        }
+        let mut stack = [0u8; 0x1000];
+        let guest_rsp = stack.as_mut_ptr() as usize + 0x1000;
+        let mut cx = UserContext {
+            general: GeneralRegs {
+                rax: 0,
+                rbx: 1,
+                rcx: 2,
+                rdx: 3,
+                rsi: 4,
+                rdi: 5,
+                rbp: 6,
+                rsp: guest_rsp,
+                r8: 8,
+                r9: 9,
+                r10: 10,
+                r11: 11,
+                r12: 12,
+                r13: 13,
+                r14: 14,
+                r15: 15,
+                rip: fault_from_guest as *const () as usize,
+                rflags: 0,
+                fsbase: 0,
+                gsbase: 0,
+            },
+            trap_num: 0,
+            error_code: 0,
+            compat32: 0,
+            compat_gs: 0,
+            compat_tls: [0; 3],
+            fpstate: Default::default(),
+        };
+        cx.run_fncall();
+
+        // The cause, which `run_fncall` must NOT have overwritten with the
+        // syscall number it sets before the trip out.
+        assert_eq!(cx.trap_num, 6);
+        assert_eq!(cx.error_code, 0);
+        // Every register the guest held, with nothing of the catcher's frame
+        // left in it.
+        assert_eq!(
+            cx.general,
+            GeneralRegs {
+                rax: 0,
+                rbx: 1,
+                rcx: 2,
+                rdx: 3,
+                rsi: 4,
+                rdi: 5,
+                rbp: 6,
+                rsp: guest_rsp,
+                r8: 8,
+                r9: 9,
+                r10: 10,
+                // skip r11
+                r12: 12,
+                r13: 13,
+                r14: 14,
+                r15: 15,
+                ..cx.general
+            }
+        );
+        // `r11` is the one register the libos way OUT does not deliver: the
+        // tail of `syscall_fn_return` keeps the entry `rip` in it and jumps
+        // through it (its own FIXME), so the guest starts with that, not with
+        // the 11 this context asked for. What this test is about is that the
+        // way BACK carries whatever the guest actually held, rather than the
+        // scratch value `fault_fn_entry` needs: the catcher saved it before
+        // the entry clobbered it.
+        assert_eq!(cx.general.r11, fault_from_guest as *const () as usize);
+        // And where it was, which is inside the mock, past its jump.
+        assert!(
+            cx.general.rip > fault_from_guest as *const () as usize,
+            "rip {:#x} is not inside the mock guest",
+            cx.general.rip
+        );
     }
 }

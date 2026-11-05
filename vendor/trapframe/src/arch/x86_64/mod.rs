@@ -13,7 +13,7 @@ mod syscall;
 mod trap;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use fncall::syscall_fn_entry;
+pub use fncall::{fault_fn_entry, syscall_fn_entry, FAULT_FRAME_WORDS};
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use gdt::{
     compat_tls_index, compat_tls_selector, enable_user_fsgsbase, load_compat_tls,
