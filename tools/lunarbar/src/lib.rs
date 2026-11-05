@@ -37,6 +37,7 @@ pub mod hunter_report;
 pub mod hunter_scan;
 pub mod hunter_schedule;
 pub mod fill_guard;
+pub mod grid;
 pub mod i18n;
 pub mod icons;
 pub mod keys;

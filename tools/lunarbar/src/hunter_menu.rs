@@ -26,17 +26,17 @@ pub(super) struct Menu {
 }
 
 const PW: i32 = 380;
-const PAD: i32 = 14;
-const HEAD_H: i32 = 34;
+const PAD: i32 = 12;
+const HEAD_H: i32 = 32;
 const COUNT_H: i32 = 24;
-const ROW_H: i32 = 26;
+const ROW_H: i32 = 28;
 /// Six domains plus learning.
 const ROWS: i32 = hunter::DOMAINS.len() as i32 + 1;
 /// Wide enough for the longest mode name ("enforce", "bloqueo": 7 glyphs).
-const SEG_W: i32 = 74;
-const EVENT_H: i32 = 18;
+const SEG_W: i32 = 76;
+const EVENT_H: i32 = 20;
 /// The removable-media line, under the switches.
-const MEDIA_H: i32 = 22;
+const MEDIA_H: i32 = 24;
 const MSG_H: i32 = 20;
 const BTN_H: i32 = 28;
 

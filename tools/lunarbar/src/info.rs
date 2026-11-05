@@ -15,7 +15,7 @@ pub(crate) const METER_CELLS: i32 = 7;
 pub(crate) const METER_W: i32 = METER_CELLS * 4 - 1;
 /// Height of a module's history plot. Short enough to sit inside the row of
 /// text it belongs to, tall enough that a spike is a spike.
-pub(crate) const HIST_H: i32 = 11;
+pub(crate) const HIST_H: i32 = 12;
 
 /// Width a module has to reserve for its history, including the gap before
 /// the label — zero in the looks that do not draw one, and zero until there

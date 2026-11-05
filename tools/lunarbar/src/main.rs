@@ -2759,9 +2759,9 @@ fn bar_edge(cv: &mut Canvas, w: i32, y_edge: i32, y_in: i32, lead_left: bool) {
 // ── Launcher menu drawing ────────────────────────────────────────────────────
 
 const APPS_PW: i32 = 320; // menu panel width
-const APPS_HEADER_H: i32 = 34;
+const APPS_HEADER_H: i32 = 32;
 const APPS_SEARCH_H: i32 = 32;
-const APPS_ROW_H: i32 = 30;
+const APPS_ROW_H: i32 = 32;
 const APPS_PAD: i32 = 8;
 
 /// Characters the search field can show at once — and therefore the cap on
@@ -2770,7 +2770,7 @@ const APPS_PAD: i32 = 8;
 const APPS_FILTER_MAX: usize = ((APPS_PW - 20 - 24) / GLYPH_W) as usize;
 
 // Calendar panel geometry, shared by `popup_size` and `draw_calendar`.
-const CAL_CELL_W: i32 = 30;
+const CAL_CELL_W: i32 = 32;
 const CAL_CELL_H: i32 = 24;
 const CAL_PAD: i32 = 12;
 const CAL_HEADER_H: i32 = 36;

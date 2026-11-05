@@ -148,7 +148,7 @@ fn palette(look: Look) -> &'static Palette {
 const PANEL_W: i32 = 720;
 const FIELD_H: i32 = 52;
 const ROW_H: i32 = 40;
-const PAD: i32 = 10;
+const PAD: i32 = 12;
 const FOOT_H: i32 = 24;
 const ICON: i32 = 24;
 /// Rows drawn at most; longer result sets scroll.

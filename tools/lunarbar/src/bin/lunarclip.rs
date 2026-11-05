@@ -1366,11 +1366,14 @@ fn palette(look: Look) -> &'static Palette {
 
 const PANEL_W: i32 = 820;
 const MIN_PANEL_W: i32 = 360;
-const HEAD_H: i32 = 34;
+const HEAD_H: i32 = 32;
 const FIELD_H: i32 = 40;
-const ROW_H: i32 = 30;
-const PAD: i32 = 10;
-const FOOT_H: i32 = 26;
+/// The filter field drawn inside its `FIELD_H` slot: on the 4-px grid, like
+/// every other measure here.
+const FIELD_BOX: i32 = FIELD_H - 8;
+const ROW_H: i32 = 32;
+const PAD: i32 = 12;
+const FOOT_H: i32 = 28;
 /// At most this many rows on the screen at once; the rest is scrolled through.
 const MAX_ROWS: usize = 12;
 /// Characters of the filter kept. A filter longer than the field is a paste
@@ -1745,8 +1748,8 @@ fn draw_picker(
 
     // The filter field.
     let fy = py + PAD + HEAD_H;
-    cv.round_rect(px + PAD, fy, pw - 2 * PAD, FIELD_H - 6, 6, p.field);
-    let ty = fy + (FIELD_H - 6 - GLYPH_H) / 2;
+    cv.round_rect(px + PAD, fy, pw - 2 * PAD, FIELD_BOX, 6, p.field);
+    let ty = fy + (FIELD_BOX - GLYPH_H) / 2;
     if st.field.is_empty() {
         cv.text("filtrar...", px + PAD + 10, ty, p.dim);
     } else {
@@ -1757,7 +1760,7 @@ fn draw_picker(
         cv.hline(end + 2, ty + GLYPH_H - 1, GLYPH_W, p.accent, 1.0);
     }
 
-    let row0 = fy + FIELD_H + PAD - 6;
+    let row0 = fy + FIELD_BOX + PAD;
     let fits = rows_fitting(ph);
     let avail = pw - 2 * PAD - 16;
 
