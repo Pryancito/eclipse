@@ -59,6 +59,10 @@ embedded-graphics = "0.8"
 # Vector chrome labels (DejaVu Sans Mono outlines, anti-aliased at the device
 # scale), shared with the other Lunar clients; FONT_6X10 is the fallback.
 lunartext = { path = "../lunartext" }
+# Every string the browser draws, in Spanish and English, shared with the
+# panel and the other Lunar clients. Zero dependencies of its own; see its
+# Cargo.toml for the i18n crates that were measured and turned down.
+eclipse-i18n = { path = "../eclipse-i18n" }
 # `system` is the libwayland backend: Mesa needs the real `wl_display` and
 # `wl_surface` pointers, which the pure-Rust backend does not expose.
 # `dlopen` loads that library at run time instead of linking it.

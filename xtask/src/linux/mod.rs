@@ -3198,13 +3198,17 @@ impl LinuxRootfs {
             .join("lunarbg");
         // Rebuild when any source file (its own tree, the shared text crate
         // and the manifest) is newer than the binary.
-        let newest_src = [newest_mtime_under(&dir.join("src")), lunartext_mtime()]
-            .into_iter()
-            .chain([fs::metadata(dir.join("Cargo.toml"))
-                .ok()
-                .and_then(|m| m.modified().ok())])
-            .flatten()
-            .max();
+        let newest_src = [
+            newest_mtime_under(&dir.join("src")),
+            lunartext_mtime(),
+            eclipse_i18n_mtime(),
+        ]
+        .into_iter()
+        .chain([fs::metadata(dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|m| m.modified().ok())])
+        .flatten()
+        .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
                 if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
@@ -3639,6 +3643,7 @@ impl LinuxRootfs {
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
             lunartext_mtime(),
+            eclipse_i18n_mtime(),
             fs::metadata(dir.join("Cargo.toml"))
                 .ok()
                 .and_then(|m| m.modified().ok()),

@@ -428,7 +428,7 @@ pub const MAX_PLACES: usize = 10;
 /// session still has to find it. Only the label follows the language.
 const XDG_PLACES: [(Key, &[&str]); 4] = [
     (Key::file_place_documents, &["Documentos", "Documents"]),
-    (Key::file_place_downloads, &["Descargas", "Downloads"]),
+    (Key::word_downloads, &["Descargas", "Downloads"]),
     (Key::pictures_folder, &["Imágenes", "Imagenes", "Pictures"]),
     (Key::file_place_music, &["Música", "Musica", "Music"]),
 ];
@@ -447,7 +447,7 @@ pub fn places_in(home: &str, mount_bases: &[&str], lang: Lang) -> Vec<Place> {
     let mut out = Vec::new();
     if home != "/" {
         out.push(Place {
-            label: lang.s(Key::file_place_home).into(),
+            label: lang.s(Key::word_home).into(),
             path: home.to_string(),
         });
         for (label, names) in XDG_PLACES {

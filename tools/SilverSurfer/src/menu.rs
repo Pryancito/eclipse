@@ -1,5 +1,7 @@
 //! Menú contextual dibujado como overlay del cromo (popup opaco).
 
+use crate::Key;
+
 use embedded_graphics::mono_font::iso_8859_1::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -332,5 +334,83 @@ mod tests {
         .clamp_to(800, 600);
         assert!(p.x + p.width() <= 800);
         assert!(p.y + p.height() <= 600);
+    }
+}
+
+/// Servo's own label for a context-menu row, in the session's language.
+///
+/// Servo builds that menu itself and labels it in English, inside the
+/// vendored `servo-script` (`dom/document/document_embedder_controls.rs`).
+/// Translating it THERE would be a divergence from upstream to carry in every
+/// rebase, for strings that are not Servo's business anyway, so it happens
+/// here: at the one point where a Servo label becomes an Eclipse menu row.
+///
+/// A label Servo adds that this does not know keeps Servo's own text. That is
+/// the right failure -- a new row in English is readable, a row drawn empty
+/// is not -- and `every_label_servo_builds_has_a_translation` is what makes
+/// sure a rebase that adds one does not go unnoticed.
+pub fn translated_label(label: &str) -> String {
+    match key_for_label(label) {
+        Some(key) => crate::lang().s(key).to_string(),
+        None => label.to_string(),
+    }
+}
+
+/// The row of the string table a Servo context-menu label belongs to, or
+/// `None` for one this does not know.
+///
+/// Separate from [`translated_label`] so that it can be checked without a
+/// language: in English the translation of `Copy` IS `Copy`, so a test that
+/// asked whether the string had changed would pass in Spanish and fail in
+/// English on exactly the rows that are right.
+pub fn key_for_label(label: &str) -> Option<Key> {
+    Some(match label {
+        "Back" => Key::www_menu_back,
+        "Forward" => Key::www_menu_forward,
+        "Reload" => Key::www_menu_reload,
+        "Cut" => Key::word_cut,
+        "Copy" => Key::word_copy,
+        "Paste" => Key::www_menu_paste,
+        "Select All" => Key::www_menu_select_all,
+        "Copy Link" => Key::www_menu_copy_link,
+        "Copy Image Link" => Key::www_menu_copy_image_link,
+        "Open Link in New View" => Key::www_menu_open_link_new,
+        "Open Image in New View" => Key::www_menu_open_image_new,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod servo_labels {
+    use super::*;
+
+    /// Every row Servo's own context menu can carry has a translation here.
+    ///
+    /// Read out of the vendored source rather than written down again: the
+    /// list is Servo's, it changes when the vendor directory is rebased, and
+    /// a second copy of it in this file would go stale without saying so. A
+    /// row Servo adds would otherwise appear in English inside an otherwise
+    /// Spanish menu, which is exactly the kind of thing nobody notices until
+    /// they right-click on a page.
+    #[test]
+    fn every_label_servo_builds_has_a_translation() {
+        let src = include_str!("../vendor/servo-script/dom/document/document_embedder_controls.rs");
+        let mut seen = 0;
+        for rest in src.split("label: \"").skip(1) {
+            let Some(label) = rest.split('"').next() else {
+                continue;
+            };
+            seen += 1;
+            assert!(
+                key_for_label(label).is_some(),
+                "Servo's context menu says {label:?} and nothing translates it"
+            );
+        }
+        // If the vendored file ever stops holding the menu, the loop above
+        // passes by running zero times, which proves nothing.
+        assert!(
+            seen >= 11,
+            "only {seen} labels found in the vendored source"
+        );
     }
 }
