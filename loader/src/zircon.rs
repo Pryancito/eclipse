@@ -706,7 +706,25 @@ fn syscall_num(ctx: &UserContext) -> usize {
         } else if #[cfg(target_arch = "aarch64")] {
             regs.x16
         } else if #[cfg(target_arch = "riscv64")] {
-            regs.a7
+            // `t0`, not `a7`. Fuchsia's riscv64 syscall ABI keeps the number
+            // out of the argument registers, exactly as aarch64 keeps it in
+            // `x16`: `a0`-`a7` are the eight arguments and `t0` is the
+            // number. Reading `a7` read the EIGHTH ARGUMENT as the syscall
+            // number, so every call with fewer than eight arguments
+            // dispatched on whatever junk `a7` happened to hold.
+            //
+            // Measured, not remembered -- the stubs in the prebuilt
+            // `libzircon.so` for riscv64 say so themselves:
+            //
+            // ```text
+            // 0000000000000cde4 <zx_channel_read>:
+            //     cde4: li   t0, 0x8      # CHANNEL_READ = 8
+            //     cde6: ecall
+            // 000000000000d12e <zx_process_exit>:
+            //     d12e: li   t0, 0x61     # PROCESS_EXIT = 97
+            //     d132: ecall
+            // ```
+            regs.t0
         } else {
             unimplemented!()
         }
@@ -1314,5 +1332,74 @@ mod vdso_time_redirect_tests {
     #[test]
     fn a_blob_that_is_not_an_elf_is_declined() {
         assert!(vdso_time_redirect_writes(b"not an elf at all", |_| Some(STUB)).is_none());
+    }
+}
+
+/// Every architecture's Zircon syscall ABI: the register the number arrives
+/// in, and the eight the arguments arrive in, spelled as names.
+///
+/// All three are listed unconditionally, and the test below checks all three,
+/// so the x86_64 the CI runs its tests on catches a mistake in the riscv64 or
+/// aarch64 rows. A table behind a `cfg` would have checked only the row of
+/// the machine running the test, which is exactly how this went unnoticed:
+/// `syscall_num` read `a7` on riscv64 while `syscall_args` passed that same
+/// `a7` as the eighth argument, so the kernel took **the eighth argument as
+/// the syscall number** and any call with fewer than eight arguments
+/// dispatched on whatever junk the register held. Measured against the
+/// prebuilt `libzircon.so`, whose riscv64 stubs are `li t0, <number>; ecall`.
+///
+/// Keep the rows in step with [`syscall_num`] and [`syscall_args`].
+#[cfg(test)]
+const SYSCALL_ABIS: [(&str, &str, [&str; 8]); 3] = [
+    // libos passes x86_64's last two arguments on the stack; the row below is
+    // the bare-metal one, which is what the invariant is about.
+    (
+        "x86_64",
+        "rax",
+        ["rdi", "rsi", "rdx", "r10", "r8", "r9", "r12", "r13"],
+    ),
+    (
+        "aarch64",
+        "x16",
+        ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+    ),
+    (
+        "riscv64",
+        "t0",
+        ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"],
+    ),
+];
+
+#[cfg(test)]
+mod syscall_abi_tests {
+    use super::SYSCALL_ABIS;
+
+    #[test]
+    fn no_architecture_takes_its_syscall_number_from_an_argument_register() {
+        for (arch, number, args) in SYSCALL_ABIS {
+            assert!(
+                !args.contains(&number),
+                "on {} the syscall number register {} is also argument {}: \
+                 the kernel would read an argument as the number",
+                arch,
+                number,
+                args.iter().position(|a| *a == number).unwrap_or(0) + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn no_architecture_passes_one_register_as_two_arguments() {
+        for (arch, _, args) in SYSCALL_ABIS {
+            for (i, a) in args.iter().enumerate() {
+                assert!(
+                    !args[..i].contains(a),
+                    "on {} the register {} is passed as two different \
+                     arguments",
+                    arch,
+                    a
+                );
+            }
+        }
     }
 }
