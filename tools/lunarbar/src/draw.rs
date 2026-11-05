@@ -687,6 +687,28 @@ impl Canvas {
         }
     }
 
+    /// HUD focus brackets: an L of `len` px, `t` px thick, on each corner of
+    /// `x,y,rw,rh`, standing `t + 1` px outside it. The `tecno` look marks
+    /// the surface that has the keyboard (launcher, popups) with them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brackets(&mut self, x: i32, y: i32, rw: i32, rh: i32, len: i32, t: i32, c: Rgb) {
+        let o = t + 1;
+        let (l, r) = (x - o, x + rw + o - t);
+        let (top, bot) = (y - o, y + rh + o - t);
+        let len = len.max(t);
+        // Each corner: the horizontal arm, then the vertical one.
+        for (hx, vy, hy) in [
+            (l, top, top),
+            (r - len + t, top, top),
+            (l, bot - len + t, bot),
+            (r - len + t, bot - len + t, bot),
+        ] {
+            self.fill_rect_a(hx, hy, len, t, c, 1.0);
+            let vx = if hx == l { l } else { r };
+            self.fill_rect_a(vx, vy, t, len, c, 1.0);
+        }
+    }
+
     /// Filled rounded rect with explicit alpha.
     pub fn round_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb, a: f32) {
         if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
@@ -792,10 +814,9 @@ mod tests {
         (buf[o], buf[o + 1], buf[o + 2], buf[o + 3])
     }
 
-    /// The chamfer must actually CUT the corners: that diagonal is the only
-    /// shape difference between the `tecno` plates and every other look's, so
-    /// a chamfer that quietly fell back to a rectangle would land as "the look
-    /// did not apply" and not as a bug anyone could name.
+    /// The chamfer must actually CUT the corners, and a cut of 0 must be a
+    /// plain rectangle: `tecno` draws its plates through `chamfer_plate` with
+    /// a cut of 0 since it took the square "Orbital HUD" corners.
     #[test]
     fn a_chamfered_plate_has_its_corners_cut_and_its_middle_filled() {
         let mut cv = Canvas::try_new(20, 20).unwrap();
@@ -821,6 +842,32 @@ mod tests {
         let mut buf = vec![0u8; 8 * 8 * 4];
         assert!(cv.blit_xrgb(&mut buf));
         assert_eq!(px(&buf, 8, 0, 0).0, 255, "cut=0 cut a corner anyway");
+    }
+
+    /// `tecno`'s focus brackets: an L on each of the four corners, standing
+    /// `t + 1` px outside the rectangle, and nothing along the edges between
+    /// them -- they mark corners, they are not a second frame.
+    #[test]
+    fn brackets_mark_the_four_corners_and_leave_the_edges_alone() {
+        let mut cv = Canvas::try_new(40, 30).unwrap();
+        cv.clear((0, 0, 0));
+        let g = (0xf2, 0xc1, 0x4e);
+        cv.brackets(5, 5, 30, 20, 8, 2, g);
+        let mut buf = vec![0u8; 40 * 30 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        let rgb = |x, y| {
+            let (b, gg, r, _) = px(&buf, 40, x, y);
+            (r, gg, b)
+        };
+        // The outer corner pixel of each L, 3px outside the rectangle, and
+        // the far end of both of its arms.
+        for (x, y) in [(2, 2), (37, 2), (2, 27), (37, 27), (9, 2), (2, 9), (30, 27), (37, 20)] {
+            assert_eq!(rgb(x, y), g, "no bracket at ({x},{y})");
+        }
+        // Mid-edge and the inside stay untouched.
+        for (x, y) in [(20, 2), (2, 15), (20, 27), (37, 15), (20, 15)] {
+            assert_eq!(rgb(x, y), (0, 0, 0), "({x},{y}) is not a corner");
+        }
     }
 
     /// The bordered plate is two fills, not a stroke, so that the border stays

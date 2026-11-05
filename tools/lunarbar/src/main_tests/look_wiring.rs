@@ -26,9 +26,9 @@ fn each_look_wears_its_own_palette() {
             assert_ne!(pal_of(*a), pal_of(*b), "{a:?} and {b:?} share one palette");
         }
     }
-    // The default look reaches the palette the image is built around: the
-    // wallpaper, the icon theme and the accent are all drawn for this one.
-    assert_eq!(*pal_of(Look::default()), PAL_ECLIPSE);
+    // The default look reaches the palette the image ships with: `tecno`
+    // since Moebius made it the default (2026-11-05).
+    assert_eq!(*pal_of(Look::default()), PAL_TECNO);
 }
 
 #[test]
@@ -47,9 +47,9 @@ fn a_palette_keeps_the_colours_its_comment_cites() {
     assert_eq!(PAL_WIN11.accent, (0x00, 0x78, 0xd4), "Win11 accent");
     assert_eq!(PAL_WIN11.muted, (0xc5, 0xc5, 0xc5), "Win11 secondary text");
     assert_eq!(PAL_WIN11.warn, (0xe8, 0x11, 0x23), "Win11 critical");
-    assert_eq!(PAL_TECNO.bar_bg, (0x06, 0x0b, 0x12), "tecno ground");
-    assert_eq!(PAL_TECNO.accent, (0x3a, 0xd7, 0xe8), "tecno signal cyan");
-    assert_eq!(PAL_TECNO.rule, (0x1d, 0x5e, 0x6e), "tecno plate border");
+    assert_eq!(PAL_TECNO.bar_bg, (0x06, 0x0b, 0x14), "tecno ground");
+    assert_eq!(PAL_TECNO.accent, (0x38, 0xe1, 0xff), "tecno instrument cyan");
+    assert_eq!(PAL_TECNO.rule, (0x1d, 0x35, 0x50), "tecno plate hairline");
 }
 
 #[test]

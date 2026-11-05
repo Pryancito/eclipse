@@ -341,7 +341,9 @@ fn the_panel_shadow_falls_downward_and_on_every_side() {
         (pw + 2 * POPUP_SHADOW) as usize,
         (ph + 2 * POPUP_SHADOW) as usize,
     );
-    let buf = painted(w, h, |cv| draw_panel(cv, px, py, pw, ph, 10));
+    // The shadow alone: under `tecno` the panel adds gold brackets in this
+    // margin on purpose (see `the_tecno_panel_wears_gold_brackets`).
+    let buf = painted(w, h, |cv| panel_shadow(cv, px, py, pw, ph, 10));
     let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
 
     // Every side has shadow beside it, the right one included: the rects

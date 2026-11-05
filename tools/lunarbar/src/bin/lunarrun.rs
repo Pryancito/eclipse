@@ -106,17 +106,20 @@ const PAL_ECLIPSE: Palette = Palette {
 /// Eclipse `tecno`: the instrument-panel look. Same cold family as
 /// `PAL_ECLIPSE`, ground pushed nearly to black and the accent moved to a
 /// signal cyan, so it matches the panel the user switched with it.
+/// Lunar gold (lunarbg's crescent): `tecno`'s focus brackets.
+const TECNO_GOLD: Rgb = (0xf2, 0xc1, 0x4e);
+
 const PAL_TECNO: Palette = Palette {
     scrim: (0x03, 0x06, 0x0a),
     scrim_a: 0.45,
-    panel: (0x05, 0x0d, 0x13),
-    field: (0x08, 0x16, 0x1d),
-    text: (0xdf, 0xf4, 0xf7),
+    panel: (0x08, 0x0e, 0x1a),
+    field: (0x0a, 0x14, 0x23),
+    text: (0xe6, 0xf1, 0xff),
     // Secondary text, not decoration: 6.8:1 on the panel ground.
-    dim: (0x7f, 0x9c, 0xa5),
-    accent: (0x3a, 0xd7, 0xe8),
-    sel: (0x10, 0x28, 0x33),
-    border: (0x1d, 0x5e, 0x6e),
+    dim: (0x8a, 0xa4, 0xc2),
+    accent: (0x38, 0xe1, 0xff),
+    sel: (0x0c, 0x2a, 0x3a),
+    border: (0x1d, 0x35, 0x50),
 };
 
 const PAL_WIN11: Palette = Palette {
@@ -762,21 +765,33 @@ fn draw_overlay(
     cv.fill_rect_a(0, 0, w as i32, h as i32, p.scrim, p.scrim_a);
 
     let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows(), st.look);
+    // `tecno` is the "Orbital HUD" mockup: square corners, a hairline round
+    // the field, a cyan bar on the selected row and gold corner brackets.
+    let hud = st.look == Look::Tecno;
+    let r = |n: i32| if hud { 0 } else { n };
 
     // 1px accent-tinted border under the panel, drawn as a slightly larger
     // rounded rect: with no compositor shadows a borderless panel floats
     // shapelessly over the scrim.
-    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, 9, p.border, 0.9);
+    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, r(9), if hud { p.accent } else { p.border }, if hud { 0.55 } else { 0.9 });
     // Windows 11's flyouts are acrylic; with no blur available in labwc, flat
     // translucency is the honest approximation (see lunarbar's bar_alpha).
     let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
-    cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
+    cv.round_rect_a(px, py, pw, ph, r(8), p.panel, panel_a);
+    if hud {
+        cv.brackets(px - 1, py - 1, pw + 2, ph + 2, 14, 2, TECNO_GOLD);
+    }
 
     // ── search field ──
     let fx = px + PAD;
     let fw = pw - 2 * PAD;
     let fy = py + PAD;
-    cv.round_rect(fx, fy, fw, FIELD_H, 6, p.field);
+    if hud {
+        cv.fill_rect_a(fx, fy, fw, FIELD_H, p.border, 1.0);
+        cv.fill_rect_a(fx + 1, fy + 1, fw - 2, FIELD_H - 2, p.field, 1.0);
+    } else {
+        cv.round_rect(fx, fy, fw, FIELD_H, 6, p.field);
+    }
     let ty = fy + (FIELD_H - GLYPH_H) / 2;
     // A ">" prompt instead of a magnifier: the font is a bitmap ISO-8859-1
     // face with no icon glyphs, and a hand-drawn lens at 15px reads as dirt.
@@ -819,9 +834,12 @@ fn draw_overlay(
         let selected = row == st.sel;
         let hovered = st.hover == Some(row);
         if selected {
-            cv.round_rect(fx, y, fw, ROW_H - 2, 6, p.sel);
+            cv.round_rect(fx, y, fw, ROW_H - 2, r(6), p.sel);
+            if hud {
+                cv.fill_rect_a(fx, y, 2, ROW_H - 2, p.accent, 1.0);
+            }
         } else if hovered {
-            cv.round_rect_a(fx, y, fw, ROW_H - 2, 6, p.sel, 0.35);
+            cv.round_rect_a(fx, y, fw, ROW_H - 2, r(6), p.sel, 0.35);
         }
         let iy = y + (ROW_H - 2 - ICON) / 2;
         let ix = fx + 8;

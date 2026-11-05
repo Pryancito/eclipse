@@ -16,7 +16,7 @@ pub enum Look {
     /// Eclipse's instrument-panel look: the same two bars, but cut corners
     /// instead of rounded, modules labelled in capitals, and meters drawn as
     /// segments and history plots rather than as a number on its own.
-    /// `#060b12` ground, `#3ad7e8` accent.
+    /// `#060b14` ground, `#38e1ff` accent, `#f2c14e` gold.
     Tecno,
 }
 
@@ -54,11 +54,11 @@ impl Look {
 }
 
 impl Default for Look {
-    /// Eclipse's own look. Not a preference: the image's wallpaper, icons and
-    /// accent are all built for this one, so a client defaulting to another
-    /// comes up looking like it belongs to a different desktop.
+    /// `tecno`, the look the image ships with since Moebius made it the
+    /// default (2026-11-05). Not a preference: every client has to agree, or
+    /// one comes up dressed for a different desktop than the panel.
     fn default() -> Self {
-        Look::Eclipse
+        Look::Tecno
     }
 }
 
@@ -178,10 +178,10 @@ mod tests {
         // Not a preference: the image's wallpaper, panel and icons are all built
         // for this one, and a client that defaulted to another would come up
         // with a different accent from everything around it.
-        assert_eq!(Look::default(), Look::Eclipse);
+        assert_eq!(Look::default(), Look::Tecno);
         // With nothing set and no file, that is what a client gets.
-        assert_eq!(resolve(None, || None), Look::Eclipse);
-        assert_eq!(resolve(Some(""), || None), Look::Eclipse);
+        assert_eq!(resolve(None, || None), Look::Tecno);
+        assert_eq!(resolve(Some(""), || None), Look::Tecno);
     }
 
     #[test]

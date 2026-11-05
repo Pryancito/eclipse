@@ -2274,9 +2274,9 @@ fn write_labwc_rc(rootfs: &Path) {
        nothing else pins it (see write_labwc_environment). -->
   <core><gap>0</gap><xwaylandPersistence>yes</xwaylandPersistence></core>
   <theme>
-    <!-- Switched in place by `eclipse-look` (Eclipse-Dark / Breeze-Dark /
-         Win11-Dark). -->
-    <name>Eclipse-Dark</name>
+    <!-- Switched in place by `eclipse-look` (Tecno-Dark / Eclipse-Dark /
+         Breeze-Dark / Win11-Dark). Tecno-Dark is the shipped default. -->
+    <name>Tecno-Dark</name>
     <cornerRadius>8</cornerRadius>
     <font place="ActiveWindow"><name>DejaVu Sans</name><size>10</size><weight>bold</weight></font>
     <font place="InactiveWindow"><name>DejaVu Sans</name><size>10</size></font>

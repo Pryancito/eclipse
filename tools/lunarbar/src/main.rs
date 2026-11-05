@@ -203,27 +203,28 @@ const PAL_WIN11: Pal = Pal {
 ///
 /// `rule` is a BORDER here and not a 2px bar edge: in this look every plate
 /// is outlined rather than filled flat, which is what the cut corners are for.
+const TECNO_GOLD: Rgb = (0xf2, 0xc1, 0x4e); // focus brackets: lunarbg's crescent
 const PAL_TECNO: Pal = Pal {
-    bar_bg: (0x06, 0x0b, 0x12),     // bar ground, nearly black
-    rule: (0x1d, 0x5e, 0x6e),       // plate borders and separators, steel cyan
-    text: (0xdf, 0xf4, 0xf7),       // primary text
-    muted: (0x9c, 0xc2, 0xcc),      // module values
+    bar_bg: (0x06, 0x0b, 0x14),     // bar ground, nearly black
+    rule: (0x1d, 0x35, 0x50),       // plate borders and separators, steel cyan
+    text: (0xe6, 0xf1, 0xff),       // primary text
+    muted: (0xc9, 0xd8, 0xea),      // module values
     // Also paints ENABLED text -- search hints, clipboard metadata -- and
     // not only decoration, so it clears 4.5:1 on both the bar ground and a
-    // plate (6.8:1 and 6.3:1). The first draft was #4a6b75, at 3.4:1.
-    dim: (0x7f, 0x9c, 0xa5),        // module labels, minimized windows
+    // plate (6.8:1 and 6.3:1). The first draft was #8aa4c2, at 3.4:1.
+    dim: (0x8a, 0xa4, 0xc2),        // module labels, minimized windows
     warn: (0xff, 0x8a, 0x5c),       // hot cpu/temp, low battery (semantic)
-    accent: (0x3a, 0xd7, 0xe8),     // signal cyan: launcher, lit meters
-    pill: (0x08, 0x16, 0x1d),       // plate body
-    pill_hover: (0x10, 0x28, 0x33), // plate under the pointer
-    btn_active: (0x10, 0x28, 0x33), // active taskbar button
-    white: (0xf2, 0xfb, 0xfd),      // active button text: the brightest tier
+    accent: (0x38, 0xe1, 0xff),     // signal cyan: launcher, lit meters
+    pill: (0x0a, 0x14, 0x23),       // plate body
+    pill_hover: (0x0c, 0x2a, 0x3a), // plate under the pointer
+    btn_active: (0x0c, 0x2a, 0x3a), // active taskbar button
+    white: (0xf5, 0xf9, 0xff),      // active button text: the brightest tier
     // The ground, on a filled plate: this look's accent and warn are both
     // bright enough that white on them is 1.66:1 and 2.21:1. This way round
     // it is 11.3:1 and 8.5:1.
-    on_accent: (0x06, 0x0b, 0x12),
-    menu_panel: (0x05, 0x0d, 0x13), // menu panel ground
-    menu_hover: (0x10, 0x28, 0x33), // hovered menu row
+    on_accent: (0x06, 0x0b, 0x14),
+    menu_panel: (0x08, 0x0e, 0x1a), // menu panel ground
+    menu_hover: (0x0c, 0x2a, 0x3a), // hovered menu row
 };
 
 /// The look, resolved once. Every draw reads it through `pal()`; it cannot
@@ -311,10 +312,11 @@ fn tecno_of(look: Look) -> bool {
 }
 
 /// A solid plate in the look's own shape: a rounded pill, or -- under `tecno`
-/// -- a plate with its corners cut at 45° and a hairline border.
+/// -- a square plate with a hairline border (a chamfer of 0: the "Orbital
+/// HUD" mockup Moebius picked has square corners).
 fn plate(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb) {
     if tecno() {
-        cv.chamfer_plate(x, y, w, h, rad.min(5), pal().rule, c);
+        cv.chamfer_plate(x, y, w, h, 0, pal().rule, c);
     } else {
         cv.round_rect(x, y, w, h, rad, c);
     }
@@ -326,7 +328,7 @@ fn plate(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb) {
 #[allow(clippy::too_many_arguments)]
 fn plate_a(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb, a: f32) {
     if tecno() {
-        cv.chamfer_rect_a(x, y, w, h, rad.min(5), c, a);
+        cv.chamfer_rect_a(x, y, w, h, 0, c, a);
     } else {
         cv.round_rect_a(x, y, w, h, rad, c, a);
     }
@@ -3023,11 +3025,21 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
 /// — an xdg_popup is only as big as the menu, so the separation has to be
 /// drawn, the way every other toolkit draws it.
 fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
+    panel_shadow(cv, px, py, pw, ph, rad);
+    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, 0.98);
+    if tecno() {
+        // Gold focus brackets (lunarbg's crescent), 3px out, inside the shadow.
+        cv.brackets(px, py, pw, ph, 12, 2, TECNO_GOLD);
+    }
+}
+
+/// [`draw_panel`]'s drop shadow alone: rounded in every look.
+fn panel_shadow(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
     // Concentric rounded rects, each a thin veil: they accumulate to a dark
     // core at the panel's edge and fade to nothing at the margin. Offset down
     // by a couple of pixels so the light reads as coming from above.
     for i in (1..=POPUP_SHADOW).rev() {
-        plate_a(cv, 
+        cv.round_rect_a(
             px - i,
             py - i + 2,
             pw + 2 * i,
@@ -3037,7 +3049,6 @@ fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
             0.06,
         );
     }
-    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, 0.98);
 }
 
 /// Paint whichever popup is open into `cv` with its panel at `px`,`py`, and
