@@ -2135,6 +2135,8 @@ fn write_theme(rootfs: &Path) {
           osd.bg.color: #191430\n\
           osd.border.color: #6b5aa8\n\
           osd.label.text.color: #e8e4f8\n\
+          # Alt+Tab's outline around the window it will raise: the accent.\n\
+          osd.window-switcher.preview.border.color: #6b5aa8\n\
           \n\
           # Drop shadows (labwc >= 0.8; ignored by older builds).\n\
           window.active.shadow.size: 20\n\
@@ -2189,6 +2191,8 @@ fn write_win11_theme(rootfs: &Path) {
           osd.bg.color: #2b2b2b\n\
           osd.border.color: #0078d4\n\
           osd.label.text.color: #ffffff\n\
+          # Alt+Tab's outline around the window it will raise: the accent.\n\
+          osd.window-switcher.preview.border.color: #0078d4\n\
           \n\
           # Windows left-aligns window titles.\n\
           window.label.text.justify: Left\n\
@@ -2244,6 +2248,8 @@ fn write_breeze_theme(rootfs: &Path) {
           osd.bg.color: #31363b\n\
           osd.border.color: #3daee9\n\
           osd.label.text.color: #fcfcfc\n\
+          # Alt+Tab's outline around the window it will raise: the accent.\n\
+          osd.window-switcher.preview.border.color: #3daee9\n\
           \n\
           # Breeze centres window titles.\n\
           window.label.text.justify: Center\n\
@@ -2284,6 +2290,17 @@ fn write_labwc_rc(rootfs: &Path) {
     <font place="OnScreenDisplay"><name>DejaVu Sans Mono</name><size>11</size></font>
   </theme>
   <desktops number="4"/>
+  <!-- Alt+Tab: every window of every desktop, one row each with its icon,
+       its desktop, its application and its title (labwc >= 0.9 field names;
+       the look's themerc gives the plate its colours and measures). -->
+  <windowSwitcher show="yes" style="classic" preview="yes" outlines="yes" allWorkspaces="yes">
+    <fields>
+      <field content="icon" width="6%" />
+      <field content="workspace" width="8%" />
+      <field content="desktop_entry_name" width="26%" />
+      <field content="title" width="60%" />
+    </fields>
+  </windowSwitcher>
   <keyboard>
     <!-- Terminals -->
     <keybind key="W-Return"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></keybind>
