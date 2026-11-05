@@ -109,10 +109,12 @@ impl Lang {
     /// and rewrote the number even when there was nothing to change. English
     /// hands the string straight back here, so only Spanish pays anything.
     pub fn decimals(self, n: String) -> String {
-        match self {
-            Lang::Es => n.replace('.', ","),
-            Lang::En => n,
+        // `612 MiB` y `3 h 12 min` pasan por aquí igual que `2.1 GiB`, y no
+        // llevan punto: `replace` les daría una `String` nueva idéntica.
+        if self == Lang::En || !n.contains('.') {
+            return n;
         }
+        n.replace('.', ",")
     }
 
     // ── the named accessors the panel already called ─────────────────────

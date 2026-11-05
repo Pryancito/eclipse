@@ -242,4 +242,5 @@ fn decimals_rewrites_only_the_spanish_separator() {
     );
     // Sin punto no cambia nada en ninguno de los dos.
     assert_eq!(Lang::Es.decimals("612 MiB".to_string()), "612 MiB");
+    assert_eq!(Lang::En.decimals("612 MiB".to_string()), "612 MiB");
 }
