@@ -15,6 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # the rest is headroom for a slow runner, and a boot that never gets there
 # is reported as such rather than as 476 timeouts.
 PROMPT = re.compile(r"/ # ")
+# The prompt this runner asks the guest shell for, because the shell's own
+# carries no newline and a line-buffered reader cannot see it: see
+# `BootedRunner.adopt_newline_prompt`.
+GUEST_PROMPT = "__ZCORE_PROMPT__"
 PROMPT_TIMEOUT = 300
 
 # Cases that only mean something to a user the kernel can hold to a limit.
@@ -128,6 +132,48 @@ def main():
                 if not up:
                     raise RuntimeError(
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
+                    )
+                self.adopt_newline_prompt()
+
+            def adopt_newline_prompt(self):
+                """Give the guest shell a prompt that ends in a newline, and
+                from then on type a case only when that prompt is on screen.
+
+                Why a new prompt at all: the console reader is line-buffered,
+                and `/ # ` carries no newline, so the shell's own prompt is
+                invisible until the next line arrives -- the echo of a command
+                already typed. Waiting for it meant nudging the shell with a
+                bare newline, and each nudge is one more interactive read, one
+                more termios set, and one more chance to eat the command we
+                were in the middle of writing (measured: `nextafter.exe` came
+                back `sh: bc-test/src/math/nextafter.exe: not found`, with the
+                prompt sitting three bytes into the path). A prompt that ends
+                in a newline shows up the moment it is printed, which is after
+                that termios set, so seeing it IS the permission to type.
+
+                Best-effort: a guest that will not take the new prompt keeps
+                the old behaviour of typing straight after the marker."""
+                self.zcore_proc.stdin.write(b"PS1='" + GUEST_PROMPT.encode() + b"\n'\n")
+                self.zcore_proc.stdin.flush()
+                start = time.monotonic()
+                took = False
+                while time.monotonic() - start < PROMPT_TIMEOUT:
+                    with self.lk:
+                        took = GUEST_PROMPT in self.output
+                    if took or self.zcore_proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                with self.lk:
+                    self.output = ""
+                if took:
+                    self.prompt_pattern = re.compile(re.escape(GUEST_PROMPT))
+                    self.prompt_sync = True
+                else:
+                    print(
+                        f"warning: the guest would not take {GUEST_PROMPT} as its "
+                        "prompt; cases are typed straight after the marker, as "
+                        "they were before",
+                        file=sys.stderr,
                     )
 
             def classified_output(self, output):

@@ -152,6 +152,17 @@ impl LinuxRootfs {
             Self::install_ca_certs(&dir);
             let musl = self.0.linux_musl_cross();
             let bin = dir.join("bin");
+            // The dynamic loader, which the incremental path never installed:
+            // see `install_musl_loader`. Without it every dynamically linked
+            // binary in the tree exits 127 and reads as missing.
+            if !self.install_musl_loader(&musl, &dir.join("lib")) {
+                println!(
+                    "cargo:warning=no lib/libc.so in the musl toolchain for {}: \
+                     /lib/{} was left as it was",
+                    self.0.name(),
+                    xorg::musl_loader_name(self.0.name())
+                );
+            }
             // Ensure busybox applet symlinks are present even on incremental builds.
             // Without this, a rootfs built before symlink support was added (or from a
             // partial build) would produce a rootfs image where `ls`, `cat`, etc. are
@@ -416,13 +427,13 @@ impl LinuxRootfs {
         .unwrap();
 
         // 拷贝 libc.so
-        let from = musl
-            .join(format!("{}-linux-musl", self.0.name()))
-            .join("lib")
-            .join("libc.so");
-        let to = lib.join(format!("ld-musl-{arch}.so.1", arch = self.0.name()));
-        fs::copy(from, &to).unwrap();
-        Ext::new(self.strip(&musl)).arg("-s").arg(to).invoke();
+        assert!(
+            self.install_musl_loader(&musl, &lib),
+            "the musl toolchain for {} has no lib/libc.so to install as the \
+             dynamic loader, so no dynamically linked binary in this rootfs \
+             could start",
+            self.0.name()
+        );
         // 为 busybox 支持的所有 applets 建立符号链接
         Self::ensure_busybox_applets(&bin);
         // Create standard pseudo-filesystem mount points
@@ -3052,6 +3063,46 @@ impl LinuxRootfs {
         executable
     }
 
+    /// Installs musl's dynamic loader as `/lib/ld-musl-<arch>.so.1`.
+    ///
+    /// Every dynamically linked binary in the rootfs names that exact path in
+    /// its `PT_INTERP`, so with the file absent the kernel cannot start one at
+    /// all: resolving the interpreter fails and the program exits 127, which
+    /// userspace reports as "not found" -- the program itself is right there.
+    ///
+    /// It used to be installed only on the from-scratch (`clear`) path, so a
+    /// rootfs that already existed -- the common case, since `make image`
+    /// takes the incremental path -- kept whatever `lib` happened to hold, and
+    /// one built before the loader landed there, or by a step that stages
+    /// `lib` by itself, had no loader and no way to get one short of deleting
+    /// the tree. Measured in QEMU riscv64 on an incremental rootfs: 309 of the
+    /// 416 libc-test cases exited 127, and the 107 that passed were every one
+    /// of the `-static` cases.
+    ///
+    /// Returns `false` when the toolchain carries no `libc.so` to copy, which
+    /// the from-scratch path turns into a panic and the incremental path into
+    /// a warning: there, failing to refresh a loader that is already in place
+    /// must not take down a build that used to work.
+    #[must_use]
+    fn install_musl_loader(&self, musl: &Path, lib: &Path) -> bool {
+        let from = musl
+            .join(format!("{}-linux-musl", self.0.name()))
+            .join("lib")
+            .join("libc.so");
+        if !from.is_file() {
+            return false;
+        }
+        if fs::create_dir_all(lib).is_err() {
+            return false;
+        }
+        let to = lib.join(xorg::musl_loader_name(self.0.name()));
+        if fs::copy(&from, &to).is_err() {
+            return false;
+        }
+        Ext::new(self.strip(musl)).arg("-s").arg(to).invoke();
+        true
+    }
+
     fn strip(&self, musl: impl AsRef<Path>) -> PathBuf {
         musl.as_ref()
             .join("bin")
@@ -5350,47 +5401,7 @@ mod var_run_tests;
 mod installer_i18n_tests;
 
 #[cfg(test)]
-mod fstab_template_tests {
-    use super::*;
-
-    /// The btrfs template is patched in place by `install-eclipse`, which
-    /// looks for each line exactly as its `FSTAB_TEMPLATE_LINE_*` says: a
-    /// column moved by one space and the installed system boots with a
-    /// placeholder for a device.
-    #[test]
-    fn the_btrfs_template_has_the_lines_the_installer_patches() {
-        let installer =
-            fs::read_to_string(PROJECT_DIR.join("tools/install-eclipse/install-eclipse.c"))
-                .unwrap();
-        let template = LinuxRootfs::fstab_template(image::DiskFs::Btrfs);
-        let mut found = 0;
-        for line in installer.lines() {
-            let Some(rest) = line.strip_prefix("#define FSTAB_TEMPLATE_LINE_") else {
-                continue;
-            };
-            let quoted = rest.split('"').nth(1).unwrap();
-            assert!(
-                template.lines().any(|l| l == quoted),
-                "the template has no line {quoted:?}"
-            );
-            found += 1;
-        }
-        assert_eq!(found, 4, "ROOT, EFI, HOME and SWAP");
-    }
-
-    /// With EclipseFS images, the disk lines say so (the installer rewrites
-    /// the file by mounting the partition, so only the type matters).
-    #[test]
-    fn the_eclipsefs_template_names_eclipsefs_for_root_and_home() {
-        let template = LinuxRootfs::fstab_template(image::DiskFs::EclipseFs);
-        let types: Vec<&str> = template
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(|l| l.split_whitespace().nth(2).unwrap())
-            .collect();
-        assert_eq!(types, ["eclipsefs", "vfat", "eclipsefs", "swap"]);
-    }
-}
+mod fstab_template_tests;
 
 #[cfg(test)]
 mod lunar_client_tests;

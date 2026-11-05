@@ -33,6 +33,17 @@ class KernelLinesAreNotTheCase(unittest.TestCase):
     def test_the_guest_prompt_is_what_is_waited_for(self):
         self.assertIsNotNone(script.PROMPT.search("Eclipse OS 0.7.0 - x86_64 desktop\r\r\n\x1b[0m/ # "))
         self.assertIsNone(script.PROMPT.search("BdsDxe: starting Boot0002\r\n"))
+    def test_the_prompt_asked_of_the_guest_ends_in_a_newline(self):
+        """The whole point of `GUEST_PROMPT`: the console reader is
+        line-buffered, so a prompt without a trailing newline is invisible
+        until the next line arrives -- the echo of a command already typed.
+        The newline is in the PS1 assignment, not in the constant, so check
+        the two together the way `adopt_newline_prompt` writes them."""
+        assignment = b"PS1='" + script.GUEST_PROMPT.encode() + b"\n'\n"
+        self.assertTrue(assignment.endswith(b"\n'\n"))
+        self.assertNotIn(b"\n", script.GUEST_PROMPT.encode())
+        # And it cannot be mistaken for anything a case prints.
+        self.assertIsNone(script.PROMPT.search(script.GUEST_PROMPT))
 
 
 if __name__ == "__main__":

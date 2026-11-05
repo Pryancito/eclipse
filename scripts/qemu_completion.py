@@ -8,6 +8,35 @@ import time
 import uuid
 
 
+# The guest shell's prompt, and how long a case may wait for it to come back
+# before being typed anyway.
+#
+# A case must not be typed between the previous case's exit and the shell's
+# return to its interactive read: the shell sets the console's termios there,
+# and that set DISCARDS whatever is already queued on the serial line. The
+# command then loses its leading bytes and the shell runs the tail, which is
+# some suffix of a path and so "not found" -- an exit 127 that reads exactly
+# like a missing binary. Measured in QEMU riscv64 (this container,
+# 2026-11-05), 4 cases of 415:
+#
+#   Test 72: /libc-test/src/functional/string_strchr-static.exe
+#   /libc-test/src/functional/string_strchr-static./ # exe; printf '\n__ZCORE...
+#   sh: exe: not found
+#     FAILED (0.196s, guest exit=127)
+#
+# The marker that ends a case is printed by `printf`, before the shell gets
+# that far, so the marker alone is not permission to type the next one.
+#
+# The prompt is only usable as that permission if we can SEE it when it is
+# printed, and the console reader is line-buffered while `/ # ` carries no
+# newline: it surfaces only when the next line arrives, which is the echo of a
+# command already typed. A runner that can give the guest a prompt ending in a
+# newline (`scripts/linux_libc_test.py` does) points `prompt_pattern` at it and
+# turns `prompt_sync` on; the default stays the shell's own.
+PROMPT = re.compile(r"/ # ")
+PROMPT_WAIT = 5.0
+
+
 def exit_code(output, marker):
     # The guest's console ends the marker line in "\r\r\n" (measured on the
     # x86_64 serial console, 2026-11-05): one "\r" is not enough, and with
@@ -18,6 +47,33 @@ def exit_code(output, marker):
 
 def completion_runner(base, statuses):
     class CompletionRunner(base):
+        # Whether this console is known to show a shell prompt, and so whether
+        # a case may only be typed once that prompt is back (see `PROMPT`). The
+        # runner that waits for the prompt at boot sets it; a console that has
+        # no prompt at all leaves it False, where waiting could only burn the
+        # budget for nothing.
+        prompt_sync = False
+        # What a prompt looks like on this console. Overridden by a runner that
+        # has given the guest a newline-terminated one.
+        prompt_pattern = PROMPT
+
+        def await_prompt(self):
+            """Block until the guest shell's prompt is on screen, then clear
+            the console buffer. Returns whether it was seen; a console that
+            does not show one within `PROMPT_WAIT` is typed at anyway, which
+            is what every run did before this existed."""
+            start = time.monotonic()
+            while time.monotonic() - start < PROMPT_WAIT:
+                with self.lk:
+                    seen = self.prompt_pattern.search(self.output) is not None
+                if seen or self.zcore_proc.poll() is not None:
+                    break
+                time.sleep(0.005)
+            with self.lk:
+                seen = self.prompt_pattern.search(self.output) is not None
+                self.output = ""
+            return seen
+
         def guest_command(self, name):
             """What is typed at the guest shell for case `name`: its path,
             quoted. A subclass that has to run a case some other way (as
@@ -37,8 +93,11 @@ def completion_runner(base, statuses):
             # The echoed command contains the marker, but only printf produces
             # a complete marker line with the actual command's exit status.
             command = self.guest_command(name) + "; printf '\\n" + marker + ":%s\\n' \"$?\"\n"
-            with self.lk:
-                self.output = ""
+            if self.prompt_sync:
+                self.await_prompt()
+            else:
+                with self.lk:
+                    self.output = ""
             start = time.monotonic()
             self.zcore_proc.stdin.write(command.encode())
             self.zcore_proc.stdin.flush()
