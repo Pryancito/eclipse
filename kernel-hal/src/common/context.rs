@@ -1107,10 +1107,75 @@ impl UserContext {
         true
     }
 
+    /// Stands in for the trip to user mode when the HOST would refuse to load
+    /// a segment base this guest asked for. Returns whether it did.
+    ///
+    /// A libos guest's bases go out through `arch_prctl`, and Linux refuses a
+    /// base that is not a user address: `ARCH_SET_FS` answers `EPERM` for
+    /// anything in the kernel half. The asm that sets them has nowhere to
+    /// report that, so the base silently stayed whatever it was, the guest ran
+    /// on with the old one, and never took the fault it had asked for.
+    ///
+    /// Measured in a libos build in this container, from
+    /// `Property.RegisterFsNonuser` and `Property.RegisterGsNonuser` of the
+    /// Zircon core tests, which set a kernel-half base and then wait for the
+    /// exception the thread must raise:
+    ///
+    /// ```text
+    /// fsgsbase.cc:375: Expected wait_channel.pending & ZX_CHANNEL_READABLE
+    ///   Expected: true
+    ///   Which is: 0
+    /// ```
+    ///
+    /// On hardware this does not arise: `wrmsr` takes a canonical kernel-half
+    /// base, and the fault then comes from the guest's first FS-relative
+    /// access, which is what the test is waiting for. So this is the libos
+    /// path standing in for that fault, the same way
+    /// [`refuse_noncanonical_entry`](Self::refuse_noncanonical_entry) stands
+    /// in for the one the CPU would have raised on the way out.
+    #[cfg(all(feature = "libos", target_arch = "x86_64"))]
+    pub fn refuse_kernel_half_base(&mut self) -> bool {
+        /// One past the highest base the HOST will accept.
+        ///
+        /// Not `0x0000_8000_0000_0000`, the first non-canonical address, but a
+        /// page below it. Linux's `do_arch_prctl_64` refuses a base with
+        /// `-EPERM` when `arg2 >= TASK_SIZE_MAX`, and `TASK_SIZE_MAX` on a
+        /// four-level host is `(1 << 47) - PAGE_SIZE`: the last user page is
+        /// reserved. A base of exactly `0x7fff_ffff_f000` is canonical, is a
+        /// user address, and is still rejected -- which is precisely the case
+        /// this check exists for, because the assembly setter has no way to
+        /// report the refusal and would silently keep the previous base. A
+        /// five-level host would take it; being a page strict there only means
+        /// reporting the `#GP` that the guest's own 48-bit rules call for
+        /// anyway.
+        const USER_MAX: usize = 0x0000_7fff_ffff_f000;
+
+        let bases = [
+            ("fsbase", self.0.general.fsbase),
+            ("gsbase", self.0.general.gsbase),
+        ];
+        let Some((reg, value)) = bases.iter().copied().find(|&(_, value)| value >= USER_MAX) else {
+            return false;
+        };
+        warn!(
+            "not entering user mode: {} = {:#x} is not a user address; reporting #GP",
+            reg, value
+        );
+        self.0.trap_num = 13;
+        self.0.error_code = 0;
+        true
+    }
+
     /// Switch to user mode.
     pub fn enter_uspace(&mut self) {
         cfg_if! {
             if #[cfg(feature = "libos")] {
+                // The two the host would refuse, answered here instead of
+                // being dropped on the floor by the asm that loads them.
+                #[cfg(target_arch = "x86_64")]
+                if self.refuse_noncanonical_entry() || self.refuse_kernel_half_base() {
+                    return;
+                }
                 // Before the trip out, while the kernel's own thread area is
                 // still loaded: the fault bridge's handler needs a stack of
                 // its own on this host thread. See `libos::fault_bridge`.
