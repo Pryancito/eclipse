@@ -168,12 +168,19 @@ def main():
             # tests/testcases/linux_libc_test/x86_64_qemu.txt.
             "/libc-test/src/regression/sem_close-unmap.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
             "/libc-test/src/regression/sem_close-unmap-static.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
-            # Three in libm, not in the kernel: the value is right every time
-            # and it is the raised FP exceptions, or an out-parameter, that
-            # differ.
-            "/libc-test/src/math/fmal.exe": "special/fmal.h:46 wants INEXACT|UNDERFLOW, gets INEXACT; the value is exact",
-            "/libc-test/src/math/powf.exe": "ucb/powf.h: pow(x,1) raises INEXACT|OVERFLOW and INEXACT|UNDERFLOW where none is wanted, five cases, value right",
-            "/libc-test/src/math/remquol.exe": "remquol writes 0 into *quo in EVERY case while returning the right remainder",
+            # Three in libm that are not this kernel's, each run against the
+            # same binaries on a Linux host on 2026-11-05: `powf` and `fmal`
+            # fail the same way there natively (this musl's libm raises the
+            # wrong FP exceptions; the values are right), and `remquol`
+            # passes natively but fails identically under `qemu-x86_64` TCG
+            # -- musl's x86_64 remquol reads the quotient bits off `fprem1`'s
+            # condition codes (`fnstsw`), and QEMU 8.2 leaves C0/C1/C3 clear
+            # where the hardware sets them (a two-instruction probe: native
+            # 0x7000, TCG 0x3000). So it is the emulator the job runs on, and
+            # it would pass on real hardware.
+            "/libc-test/src/math/fmal.exe": "this musl's libm, same failure natively on Linux: special/fmal.h:46 wants INEXACT|UNDERFLOW, gets INEXACT",
+            "/libc-test/src/math/powf.exe": "this musl's libm, same failure natively on Linux: ucb/powf.h pow(x,1) raises INEXACT|OVERFLOW / INEXACT|UNDERFLOW, five cases",
+            "/libc-test/src/math/remquol.exe": "QEMU TCG: fprem1 leaves the quotient condition codes clear, so musl's remquol writes 0 into *quo (passes natively, fails the same under qemu-x86_64)",
         },
         ("aarch64", False): {
             "/libc-test/src/functional/pthread_tsd-static.exe": "thread-specific destructor test hangs (CI 34011543846)",
