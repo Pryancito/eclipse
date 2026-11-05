@@ -2,7 +2,7 @@
 #![deny(missing_docs)]
 
 use {
-    crate::error::LxResult,
+    crate::error::{LxError, LxResult},
     crate::fs::INodeExt,
     crate::process::Abi,
     alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec},
@@ -690,15 +690,64 @@ impl LinuxElfLoader {
                 error!("elf: cannot parse interp {:?}: {:?}", interp, e);
             })?;
             let interp_size = interp_elf.load_segment_size();
-            let interp_vmar = vmar
-                .allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-                .inspect_err(|&e| {
+            // An `ET_EXEC` interpreter carries absolute vaddrs, exactly as an
+            // `ET_EXEC` program does, and Linux honours them: `load_elf_interp`
+            // maps each of its segments `MAP_FIXED` at its own `p_vaddr` and
+            // leaves `interp_load_addr` -- the `AT_BASE` the program is handed
+            // -- at zero. Measured on a Linux 6.18 host with an `ET_EXEC`
+            // `PT_INTERP`: `AT_BASE` comes through as 0.
+            //
+            // Biasing one is no smaller a mistake than biasing an `ET_EXEC`
+            // program would be. Every absolute reference in it -- a string, a
+            // global, a jump table -- still names the address the linker gave
+            // it, and only the code moved, so the first such reference reads an
+            // unmapped page. A hand-written 32-bit `PT_INTERP` probe died that
+            // way here: placed 0x8048000 above where it asked to be, it took
+            // SIGSEGV reading its own `argv[0]` string at 0xa001001, before a
+            // line of it ran.
+            //
+            // So an `ET_EXEC` interpreter is mapped into the process VMAR
+            // itself, whose base is `USER_ASPACE_BASE` (0, asserted below),
+            // which is what makes an absolute vaddr land where it says. Only an
+            // `ET_DYN` one -- every real `ld.so` -- gets a sub-VMAR of its own
+            // and the non-zero `AT_BASE` that tells it so.
+            //
+            // Those two are the whole list, so the match is exhaustive on
+            // purpose rather than an `if` with an `else`. `load_elf_binary`
+            // asks `elf_ex->e_type != ET_EXEC && != ET_DYN` of an interpreter
+            // and gives ELIBBAD, and here the `else` of an `if` would hand a
+            // `ET_REL` or a `ET_CORE` to the `ET_DYN` path and let it fail
+            // further down, saying something else. The preflight already
+            // refuses one on `execve` -- `image_phdrs` bounds `e_type` to the
+            // two -- but the process this kernel starts itself
+            // (`loader/src/linux.rs`) loads with no preflight at all, so this
+            // path is reachable with any `e_type` on disk.
+            let (interp_vmar, interp_base) = match interp_elf.header.pt2.type_().as_type() {
+                xmas_elf::header::Type::Executable => (vmar.clone(), 0),
+                xmas_elf::header::Type::SharedObject => {
+                    let interp_vmar = vmar
+                        .allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                        .inspect_err(|&e| {
+                            error!(
+                                "elf: allocate vmar for interp {:?} size {:#x} failed: {:?}",
+                                interp, interp_size, e
+                            );
+                        })?;
+                    let interp_base = interp_vmar.addr();
+                    (interp_vmar, interp_base)
+                }
+                other => {
                     error!(
-                        "elf: allocate vmar for interp {:?} size {:#x} failed: {:?}",
-                        interp, interp_size, e
+                        "elf: PT_INTERP {:?} is e_type {:?}, neither ET_EXEC nor ET_DYN",
+                        interp, other
                     );
-                })?;
-            let interp_base = interp_vmar.addr();
+                    // The interpreter's image is mapped into the kernel's own
+                    // address space a few lines above, to be read; give it back
+                    // before leaving by this door.
+                    zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size_aligned)?;
+                    return Err(LxError::ELIBBAD);
+                }
+            };
             let _interp_vmo = interp_vmar
                 .load_from_elf_image(&interp_elf, &interp_vmo)
                 .inspect_err(|&e| {
@@ -792,7 +841,10 @@ impl LinuxElfLoader {
                     #[cfg(target_arch = "x86_64")]
                     {
                         // AT_BASE: interpreter load address; non-zero triggers interpreter
-                        // mode in musl/glibc.
+                        // mode in musl/glibc. Zero for an `ET_EXEC`
+                        // interpreter, which was loaded at its own absolute
+                        // vaddrs and so has no bias to report -- Linux's
+                        // `interp_load_addr`, measured.
                         map.insert(abi::AT_BASE, interp_base);
                         // AT_PHDR: virtual address of the main program's program-header
                         // table in memory.  Use get_phdr_vaddr() which handles both PIE

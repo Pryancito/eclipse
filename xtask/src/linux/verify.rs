@@ -131,6 +131,32 @@ pub(super) fn cached_for_i386(path: &Path) -> bool {
     header[4] == 1 && header[5] == 1 && u16::from_le_bytes([header[18], header[19]]) == EM_386
 }
 
+/// Lo que [`cached_for_i386`] NO contesta: si el fichero **es** de verdad un
+/// ELF32 / `EM_386`.
+///
+/// Las dos preguntas se parecen y no son la misma, y confundirlas es un modo
+/// de fallo silencioso. `cached_for_i386` contesta «no hay que reconstruirlo
+/// por venir de otro arco», y por eso deja pasar lo que no sabe leer: un
+/// fichero que no se abre, uno mas corto que una cabecera, uno que no es un
+/// ELF. Un artefacto corrupto --- un enlace que fallo a medias y dejo un
+/// fichero igual --- pasaba esa puerta, y con la fecha a su favor la caché lo
+/// daba por bueno y nadie reconstruia nada: la sonda que se mide en QEMU
+/// seria la vieja, o basura, y el arranque que lo descubre cuesta veinte
+/// minutos.
+///
+/// Asi que aqui un error de lectura o un formato que no se reconoce es
+/// **rancio**, al contrario que alli.
+pub(super) fn es_un_elf_de_i386(path: &Path) -> bool {
+    let mut header = [0u8; 20];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut header).is_err() || &header[..4] != b"\x7fELF" {
+        return false;
+    }
+    header[4] == 1 && header[5] == 1 && u16::from_le_bytes([header[18], header[19]]) == EM_386
+}
+
 /// Los `.pub` que hay en un directorio, por nombre.
 fn claves_pub(dir: &Path) -> Vec<OsString> {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -335,7 +361,11 @@ impl LinuxRootfs {
     /// no las construimos nosotros.
     fn check_elf_machines(&self, root: &Path) -> Vec<Problem> {
         let want = expected_machine(self.0);
-        let deliberadamente_de_32 = root.join("bin").join("i386-hello");
+        let los_deliberadamente_de_32 = [
+            root.join("bin").join("i386-hello"),
+            root.join("bin").join("i386-dyn"),
+            root.join("bin").join("i386-interp"),
+        ];
         let mut out = Vec::new();
         let mut checked = 0usize;
         let mut stack = vec![root.to_path_buf()];
@@ -373,14 +403,17 @@ impl LinuxRootfs {
                 match entry.file_type() {
                     Ok(t) if t.is_dir() => stack.push(path),
                     Ok(t) if t.is_file() => {
-                        // `bin/i386-hello` es un ELF de i386 A PROPOSITO: es la
-                        // unica prueba de que el nucleo ejecuta un binario de 32
-                        // bits, y no puede estar construida para la maquina del
-                        // anfitrion sin dejar de probar nada. Se exime POR RUTA
-                        // y no por maquina: eximir «todo lo que sea i386» dejaria
-                        // pasar el fallo que esta comprobacion existe para cazar,
-                        // un binario enlazado con el toolchain equivocado.
-                        if path == deliberadamente_de_32 {
+                        // `bin/i386-hello`, `bin/i386-dyn` y `bin/i386-interp`
+                        // son ELF de i386 A PROPOSITO: son las unicas pruebas de
+                        // que el nucleo ejecuta un binario de 32 bits --- el
+                        // primero estatico, los otros dos el par de la etapa 4,
+                        // un programa con `PT_INTERP` y su interprete --- y no
+                        // pueden estar construidas para la maquina del anfitrion
+                        // sin dejar de probar nada. Se eximen POR RUTA y no por
+                        // maquina: eximir «todo lo que sea i386» dejaria pasar el
+                        // fallo que esta comprobacion existe para cazar, un
+                        // binario enlazado con el toolchain equivocado.
+                        if los_deliberadamente_de_32.contains(&path) {
                             continue;
                         }
                         if let Some(machine) = elf_machine(&path) {
@@ -742,6 +775,43 @@ mod tests {
         assert!(cached_for_i386(Path::new("/no/existe/i386-hello")));
     }
 
+    /// Y la otra pregunta, la que `fresh_i386` necesita y aquella no contesta:
+    /// si el fichero ES un ELF32 / `EM_386`. Las dos difieren exactamente en
+    /// lo que no se puede leer, y ahi esta el fallo silencioso que esto cierra:
+    /// un artefacto a medio escribir pasaba la primera y la caché lo daba por
+    /// bueno.
+    #[test]
+    fn ser_un_elf_de_i386_es_otra_pregunta_que_no_venir_de_otro_arco() {
+        let mut i386 = elf64(EM_386);
+        i386[4] = 1;
+        let bueno = scratch("i386_estricto.elf", &i386);
+        assert!(es_un_elf_de_i386(&bueno));
+        assert!(cached_for_i386(&bueno));
+
+        // Donde se separan: lo que no se puede leer es RANCIO aqui y pasa alli.
+        for (nombre, bytes) in [
+            ("script_estricto", &b"#!/bin/sh\necho\n"[..]),
+            ("corto_estricto", &b"\x7fELF"[..]),
+            ("vacio_estricto", &b""[..]),
+        ] {
+            let p = scratch(nombre, bytes);
+            assert!(!es_un_elf_de_i386(&p), "{nombre}");
+            assert!(cached_for_i386(&p), "{nombre}");
+        }
+        assert!(!es_un_elf_de_i386(Path::new("/no/existe/i386-dyn")));
+
+        // Y donde coinciden: un ELF de otra clase o de otra maquina no es ni
+        // una cosa ni la otra.
+        assert!(!es_un_elf_de_i386(&scratch(
+            "i386_en_64_estricto.elf",
+            &elf64(EM_386)
+        )));
+        assert!(!es_un_elf_de_i386(&scratch(
+            "host_estricto.elf",
+            &elf64(EM_X86_64)
+        )));
+    }
+
     /// Solo la cabecera: con 20 bytes exactos ya se lee la maquina, asi que el
     /// barrido no carga en memoria el firmware ni los assets de la rootfs.
     #[test]
@@ -1007,8 +1077,9 @@ mod cableado_tests {
         let ajenas = src.matches("verify::cached_for_i386(").count();
         assert_eq!(
             ajenas, 1,
-            "las puertas de maquina ajena eran 1 y ahora son {ajenas}: solo \
-             `i386-hello` tiene motivo para una, porque es un ELF32 a proposito"
+            "las puertas de maquina ajena eran 1 y ahora son {ajenas}: la unica \
+             esta dentro de `fresh_i386`, que es por donde pasan las caches de \
+             `tools/i386-hello` y `tools/i386-dyn`, ELF32 a proposito las dos"
         );
     }
 
