@@ -814,9 +814,9 @@ fn every_writer_of_the_labwc_environment_takes_the_lock() {
     let dir = std::env::temp_dir().join(format!("eclipse-envlock-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     write_eclipse_kbd(&dir);
-    write_eclipse_locale(&dir);
+    super::language::write_eclipse_language(&dir);
     write_eclipse_tz(&dir);
-    for name in ["eclipse-kbd", "eclipse-locale", "eclipse-tz"] {
+    for name in ["eclipse-kbd", "eclipse-language", "eclipse-tz"] {
         let text = fs::read_to_string(dir.join("usr/local/bin").join(name)).unwrap();
         assert!(text.contains("env_lock"), "{name} upserts $ENVF unlocked");
         assert!(text.contains("env_unlock"), "{name} never drops the lock");
@@ -861,20 +861,25 @@ fn eclipse_kbd_script_and_xkb_default() {
 }
 
 #[test]
-fn eclipse_locale_script_and_lang_default() {
-    let dir = std::env::temp_dir().join(format!("eclipse-locale-test-{}", std::process::id()));
+fn eclipse_language_script_and_lang_default() {
+    let dir = std::env::temp_dir().join(format!("eclipse-language-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    write_eclipse_locale(&dir);
+    super::language::write_eclipse_language(&dir);
     write_labwc_menu(&dir);
     write_labwc_environment(&dir);
-    let script = dir.join("usr/local/bin/eclipse-locale");
-    assert!(script.is_file());
-    if let Ok(status) = std::process::Command::new("sh")
-        .arg("-n")
-        .arg(&script)
-        .status()
-    {
-        assert!(status.success(), "eclipse-locale does not parse as sh");
+    // Both names are installed and both parse: `eclipse-language` is the one
+    // this command is called, `eclipse-locale` the one /etc/profile and every
+    // machine already installed call.
+    for name in ["eclipse-language", "eclipse-locale"] {
+        let script = dir.join("usr/local/bin").join(name);
+        assert!(script.is_file(), "{name} was not installed");
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+        {
+            assert!(status.success(), "{name} does not parse as sh");
+        }
     }
     let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
     assert!(
@@ -885,10 +890,10 @@ fn eclipse_locale_script_and_lang_default() {
     let conf = fs::read_to_string(dir.join("etc/eclipse/locale")).unwrap();
     assert!(conf.contains("lang=es"));
     let menu = fs::read_to_string(dir.join("root/.config/labwc/menu.xml")).unwrap();
-    assert!(menu.contains("Teclado (es/us)"));
+    assert!(menu.contains("Teclado e idioma (es/us)"));
     let en = fs::read_to_string(dir.join("root/.config/labwc/menu.en.xml")).unwrap();
-    assert!(en.contains("Keyboard (es/us)"));
-    assert!(!en.contains("Teclado (es/us)"));
+    assert!(en.contains("Keyboard and language (es/us)"));
+    assert!(!en.contains("Teclado e idioma (es/us)"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -2518,6 +2523,183 @@ fn the_titlebar_face_follows_the_look_both_ways() {
         run("tecno"),
         shipped,
         "a second switch to tecno changed it again"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `eclipse-language` run for real, in every spelling of the two languages it
+/// accepts, with the files it writes checked after each one.
+///
+/// The command speaks `es|us` -- the two country names `eclipse-kbd` speaks --
+/// and STORES the language tag (`lang=es` / `lang=en`), because the tag is
+/// what `LANG`, `LANGUAGE`, the menu filenames and lunarbar's string table are
+/// all keyed by. Those two vocabularies meeting inside one script is exactly
+/// where a translation silently stops happening: a `lang=us` in the file is a
+/// value nothing else in the system knows, and the desktop comes back Spanish
+/// with no error anywhere.
+#[test]
+fn eclipse_language_speaks_es_and_us_and_stores_the_language_tag() {
+    let dir = std::env::temp_dir().join(format!("eclipse-lang-run-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    super::language::write_eclipse_language(&dir);
+    write_labwc_menu(&dir);
+    let home = dir.join("root");
+    let run = |arg: &str| -> Option<String> {
+        let out = std::process::Command::new("sh")
+            .arg(dir.join("usr/local/bin/eclipse-language"))
+            .arg(arg)
+            .env("HOME", &home)
+            // The script writes /etc/eclipse/locale by absolute path, which on
+            // this host is the host's. It is the labwc environment and the
+            // menu that this test can see, and they are what the session
+            // actually reads.
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let Some(first) = run("us") else {
+        eprintln!("skipping: no POSIX sh on this host");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    };
+    // What it prints is a country, in the same words it was asked in.
+    assert_eq!(first, "us", "eclipse-language us answered {first}");
+    let env = fs::read_to_string(home.join(".config/labwc/environment")).unwrap();
+    assert!(
+        env.lines().any(|l| l == "LANG=en_US.UTF-8"),
+        "us must export the English POSIX locale:\n{env}"
+    );
+    assert!(
+        env.lines().any(|l| l == "LANGUAGE=en"),
+        "us must export LANGUAGE=en:\n{env}"
+    );
+    // The menu it copies into place is the English one, named by tag.
+    let menu = fs::read_to_string(home.join(".config/labwc/menu.xml")).unwrap();
+    assert!(
+        menu.contains("Keyboard and language (es/us)"),
+        "us left the Spanish menu in place"
+    );
+
+    // Back to Spanish, and every other spelling that can reach the command:
+    // the two tags, the two POSIX locales, and the upper-case forms. Each one
+    // must land on the same pair of values as its canonical spelling, or the
+    // command answers differently depending on how it was asked.
+    for (spelt, country, lang, language) in [
+        ("es", "es", "es_ES.UTF-8", "es:en"),
+        ("ES", "es", "es_ES.UTF-8", "es:en"),
+        ("es_ES", "es", "es_ES.UTF-8", "es:en"),
+        ("en", "us", "en_US.UTF-8", "en"),
+        ("EN", "us", "en_US.UTF-8", "en"),
+        ("en_US", "us", "en_US.UTF-8", "en"),
+        ("US", "us", "en_US.UTF-8", "en"),
+    ] {
+        assert_eq!(run(spelt).unwrap(), country, "eclipse-language {spelt}");
+        let env = fs::read_to_string(home.join(".config/labwc/environment")).unwrap();
+        assert!(
+            env.lines().any(|l| l == format!("LANG={lang}")),
+            "{spelt} did not export LANG={lang}:\n{env}"
+        );
+        assert!(
+            env.lines().any(|l| l == format!("LANGUAGE={language}")),
+            "{spelt} did not export LANGUAGE={language}:\n{env}"
+        );
+        // One of each, however many times the command is run: these are
+        // upserts, and a file that grows a second LANG= line hands the
+        // session whichever one labwc reads last.
+        assert_eq!(
+            env.lines().filter(|l| l.starts_with("LANG=")).count(),
+            1,
+            "LANG= ended up in the file twice:\n{env}"
+        );
+    }
+
+    // A language this image does not have is refused, not quietly served
+    // Spanish: the caller asked for something and has to be told it is not
+    // there.
+    let out = std::process::Command::new("sh")
+        .arg(dir.join("usr/local/bin/eclipse-language"))
+        .arg("fr")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "eclipse-language fr was accepted");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("es|us"),
+        "the refusal must name the two languages there are"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The desktop's keyboard switch moves the UI language with it.
+///
+/// `eclipse-kbd toggle` is what W-K and the labwc menu item run, and es/us
+/// name the same two choices for the layout and for the language, so the one
+/// switch does both -- that is what the menu item now says it does. The three
+/// properties this pins: `toggle` switches the language, a plain
+/// `eclipse-kbd us` does NOT (so the two can still be set apart from a shell),
+/// and `language=no` in /etc/eclipse/keyboard turns the coupling off.
+#[test]
+fn the_desktop_keyboard_toggle_switches_the_language_too() {
+    let dir = std::env::temp_dir().join(format!("eclipse-kbd-lang-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_eclipse_kbd(&dir);
+    super::language::write_eclipse_language(&dir);
+    let kbd = fs::read_to_string(dir.join("usr/local/bin/eclipse-kbd")).unwrap();
+
+    // The language is set from the `toggle` arm and from nowhere else: an
+    // `eclipse-kbd us` that also moved the language would take away the only
+    // way to run a Spanish desktop on a US keyboard.
+    assert!(
+        kbd.contains("set_language \"$n\""),
+        "the toggle arm does not set the language"
+    );
+    // The layout file is UPSERTED, not truncated: it holds `language=` as well
+    // as `layout=`, and a plain `>` threw the decoupling flag away on the first
+    // switch -- the hatch worked exactly once and then was not there. Measured:
+    // with `language=no` in the file, a truncating apply switched the language
+    // anyway.
+    assert!(
+        !kbd.contains("echo \"layout=$layout\" > \"$CONF\"\n")
+            || kbd.contains("grep -v \"^[[:space:]]*layout[[:space:]]*=\""),
+        "eclipse-kbd truncates /etc/eclipse/keyboard and loses `language=`"
+    );
+    let toggle = kbd
+        .split("toggle)")
+        .nth(1)
+        .expect("eclipse-kbd has no toggle arm");
+    let explicit = toggle
+        .split("es|us)")
+        .nth(1)
+        .expect("eclipse-kbd has no explicit-layout arm");
+    assert!(
+        toggle.contains("set_language"),
+        "the toggle arm must set the language"
+    );
+    assert!(
+        !explicit.contains("set_language"),
+        "`eclipse-kbd us` must stay keyboard-only"
+    );
+    // The escape hatch, and the guard that keeps a rootfs without the language
+    // command from turning a layout switch into an error.
+    assert!(
+        kbd.contains("follow_language") && kbd.contains("language="),
+        "eclipse-kbd has no way to decouple the language"
+    );
+    assert!(
+        kbd.contains("[ -x /usr/local/bin/eclipse-language ]"),
+        "eclipse-kbd must tolerate a rootfs without eclipse-language"
+    );
+    // And nothing in the other direction: eclipse-language calling eclipse-kbd
+    // would make the pair recurse, each one re-triggering the other.
+    let lang = fs::read_to_string(dir.join("usr/local/bin/eclipse-language")).unwrap();
+    // By INVOCATION, not by mention: the script names eclipse-kbd in its own
+    // comments on purpose, to say which of the two settings it is not.
+    assert!(
+        !lang
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.contains("eclipse-kbd")),
+        "eclipse-language runs eclipse-kbd: the two would recurse"
     );
     let _ = fs::remove_dir_all(&dir);
 }

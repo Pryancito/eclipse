@@ -1293,7 +1293,7 @@ const SERIAL_SETUP: &str = "init.serial_setup";
 /// be adjacent.
 const BOOT_SETTINGS: [(&str, &str); 3] = [
     ("the keyboard layout", "/usr/local/bin/eclipse-kbd"),
-    ("the locale", "/usr/local/bin/eclipse-locale"),
+    ("the language", "/usr/local/bin/eclipse-language"),
     ("the timezone", "/usr/local/bin/eclipse-tz"),
 ];
 
@@ -1382,9 +1382,15 @@ fn resolved_ui_lang() -> &'static str {
 /// The two UI languages this image ships, by each spelling accepted for them. An
 /// unrecognised value is NOT a language: it falls through to the next source, so
 /// a stale `lang=fr` cannot pin the desktop to a locale with no translation.
+///
+/// `us` is accepted as a spelling of English because `eclipse-language` speaks
+/// `es|us`, the same two country names as `eclipse-kbd`: somebody who switched
+/// the desktop with that command writes `lang=us` on the kernel command line
+/// without a second thought, and the only wrong answer here is to ignore it
+/// and boot Spanish.
 fn ui_lang_token(value: &str) -> Option<&'static str> {
     match value.trim() {
-        "en" | "EN" | "en_US" => Some("en"),
+        "en" | "EN" | "en_US" | "us" | "US" => Some("en"),
         "es" | "ES" | "es_ES" => Some("es"),
         _ => None,
     }
