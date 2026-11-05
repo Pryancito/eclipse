@@ -889,6 +889,122 @@ impl<P: Policy> IoVec<P> {
     }
 }
 
+/// Read the 32-bit word at `vaddr` out of the *current* address space without
+/// letting a missing page take the kernel down with it.
+///
+/// This exists because of a crash that is not a race the kernel can close by
+/// being careful. Measured in a libos build in this container, from
+/// `FutexTest.WaitExitRace` of the Zircon core tests (reproducible on every
+/// run):
+///
+/// ```text
+/// Thread 5 received signal SIGSEGV
+/// zircon_object::signal::futex::...::poll at signal/futex.rs:288
+/// 288   let value = futex.value.load(Ordering::SeqCst);
+/// si_addr = 0x14d0271000   <- the futex word itself
+/// ```
+///
+/// Nobody unmapped that page. A `munmap` breakpoint conditioned on the
+/// address named the real caller: the GUEST issuing
+/// `zx_vmo_op_range(ZX_VMO_OP_DECOMMIT)` on the futex page while a waiter
+/// sleeps on it, which `VMObjectPaged::unmap_released` turns into a host
+/// `munmap`. On real hardware that is legal and harmless -- decommit releases
+/// the contents and the next access faults the page back in as zeroes -- but a
+/// libos guest has no page-fault path, so the page is simply absent from the
+/// host process and the kernel's own load dies on it. `libos::fault_bridge`
+/// cannot save it either: it deliberately bridges faults from GUEST code only
+/// and hands a kernel fault straight back to the host.
+///
+/// Pre-committing the page before the read does not fix it: that test
+/// decommits concurrently, on purpose, so the window is open however early the
+/// read happens. The read itself has to be able to fail.
+///
+/// `None` means "the host has no page here". A caller looking at memory that
+/// is still mapped in the guest's VMAR should read that as the zeroes decommit
+/// promises, which is what the futex does.
+#[cfg(feature = "libos")]
+pub fn try_read_u32(vaddr: VirtAddr) -> Option<u32> {
+    use nix::libc;
+    let mut out: u32 = 0;
+    let local = libc::iovec {
+        iov_base: (&mut out) as *mut u32 as *mut libc::c_void,
+        iov_len: core::mem::size_of::<u32>(),
+    };
+    let remote = libc::iovec {
+        iov_base: vaddr as *mut libc::c_void,
+        iov_len: core::mem::size_of::<u32>(),
+    };
+    // SAFETY: both iovecs describe four bytes. `local` is this frame's own
+    // slot. `remote` is never dereferenced here: the host kernel reads it on
+    // our behalf and answers EFAULT -- a short count -- instead of raising a
+    // signal, which is the whole point of going through a syscall. Reading
+    // one's own process needs no privilege: `__ptrace_may_access` lets a task
+    // through unconditionally when it is the target.
+    let read = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    (read == core::mem::size_of::<u32>() as isize).then_some(out)
+}
+
+/// Read the 32-bit word at `vaddr` out of the current address space.
+///
+/// On hardware the page-fault path is real, so this is the plain atomic load
+/// it has always been and the answer is always `Some`. The fallible shape is
+/// there for the libos build above, where it is not.
+///
+/// # Safety
+///
+/// `vaddr` must be a 4-byte-aligned address the caller has already validated
+/// as readable in the current address space.
+#[cfg(not(feature = "libos"))]
+pub fn try_read_u32(vaddr: VirtAddr) -> Option<u32> {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    // SAFETY: the caller validated the address; see above.
+    Some(unsafe { (*(vaddr as *const AtomicU32)).load(Ordering::SeqCst) })
+}
+
+#[cfg(all(test, feature = "libos"))]
+mod try_read_u32_tests {
+    use super::try_read_u32;
+
+    /// The fallible read is only useful if it still reads. A probe that
+    /// answered `None` for everything -- a denied `process_vm_readv`, say --
+    /// would look exactly like a decommitted page to every caller, and the
+    /// futex would then see zeroes where the guest had written a value.
+    #[test]
+    fn a_word_that_is_there_comes_back() {
+        let word: u32 = 0xfeed_face;
+        assert_eq!(
+            try_read_u32(&word as *const u32 as usize),
+            Some(0xfeed_face)
+        );
+    }
+
+    /// And the case it exists for: a page the host does not have. Mapped and
+    /// then unmapped, so the address is a plausible one rather than a
+    /// never-valid constant.
+    #[test]
+    fn a_page_the_host_no_longer_has_answers_none() {
+        use nix::libc;
+        let len = 4096;
+        // SAFETY: an anonymous private mapping of our own, read nowhere else.
+        let page = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "could not get a page to take away");
+        let addr = page as usize;
+        assert_eq!(try_read_u32(addr), Some(0), "a fresh page reads as zero");
+        // SAFETY: the mapping this very test made, with nothing left in it.
+        assert_eq!(unsafe { libc::munmap(page, len) }, 0);
+        assert_eq!(try_read_u32(addr), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Host tests for the user-pointer copy primitives.

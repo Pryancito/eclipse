@@ -149,6 +149,41 @@ impl Futex {
         woken
     }
 
+    /// Read the futex word.
+    ///
+    /// On hardware this is the plain atomic load it has always been, with the
+    /// caller's own ordering: nothing here changes for a bare-metal build.
+    ///
+    /// On a libos build it goes through [`kernel_hal::user::try_read_u32`],
+    /// which asks the host kernel for the four bytes instead of dereferencing
+    /// them. That is not caution for its own sake. `FutexTest.WaitExitRace`
+    /// has the guest issue `zx_vmo_op_range(ZX_VMO_OP_DECOMMIT)` on the futex
+    /// page while a waiter sleeps on it; libos has no page-fault path, so the
+    /// page leaves the host process and this load used to take the whole
+    /// kernel with it (`exit=-11`, measured in this container on every run --
+    /// see the probe's own documentation for the backtrace).
+    ///
+    /// A page the host no longer has reads as zero, which is exactly what
+    /// `DECOMMIT` promises userspace: the contents are released and the next
+    /// read sees zeroes. So the protocol sees the same value it would see on
+    /// hardware, and the comparison that follows is the one Zircon makes.
+    ///
+    /// The word-updating helpers below (the Linux PI ops) still dereference,
+    /// because a compare-and-swap cannot be done through a syscall and
+    /// nothing measured points at them.
+    fn read_value(&self, order: Ordering) -> i32 {
+        #[cfg(feature = "libos")]
+        {
+            let _ = order;
+            let addr = self.value as *const AtomicI32 as usize;
+            kernel_hal::user::try_read_u32(addr).unwrap_or(0) as i32
+        }
+        #[cfg(not(feature = "libos"))]
+        {
+            self.value.load(order)
+        }
+    }
+
     /// Fast comparison against the futex's current value, without taking the
     /// queue lock or allocating a waiter.
     ///
@@ -160,7 +195,7 @@ impl Futex {
         // `Acquire` suffices: the producer (FUTEX_WAKE side) Release-stores
         // the new value in userspace before issuing the wake; we only need
         // happens-before with that store, not full SeqCst.
-        self.value.load(Ordering::Acquire) == expected
+        self.read_value(Ordering::Acquire) == expected
     }
 
     // ------ Kernel-side word updates (Linux PI futexes) ------
@@ -175,7 +210,7 @@ impl Futex {
 
     /// Load the current value of the futex word.
     pub fn load(&self) -> i32 {
-        self.value.load(Ordering::SeqCst)
+        self.read_value(Ordering::SeqCst)
     }
 
     /// Compare-and-swap the futex word: `current -> new`. On failure the
@@ -285,7 +320,7 @@ impl Futex {
                     // to slip in between the check and the enqueue, leaving
                     // the waiter asleep forever (lost wakeup), which hung
                     // pthread barriers/condvars (e.g. sysbench startup).
-                    let value = futex.value.load(Ordering::SeqCst);
+                    let value = futex.read_value(Ordering::SeqCst);
                     if value != self.current_value {
                         return Poll::Ready(Err(ZxError::BAD_STATE));
                     }
@@ -445,7 +480,7 @@ impl Futex {
                 // a waiter that slips in between is merely woken too, which
                 // the API allows, whereas one skipped would be lost.
                 let _queue = self.inner.lock();
-                if check_value && self.value.load(Ordering::SeqCst) != current_value {
+                if check_value && self.read_value(Ordering::SeqCst) != current_value {
                     return Err(ZxError::BAD_STATE);
                 }
             }
@@ -469,7 +504,7 @@ impl Futex {
             }
             if check_value {
                 // check value (under the queue lock, like FUTEX_WAIT does)
-                if self.value.load(Ordering::SeqCst) != current_value {
+                if self.read_value(Ordering::SeqCst) != current_value {
                     return Err(ZxError::BAD_STATE);
                 }
             }
