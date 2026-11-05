@@ -174,7 +174,7 @@ impl State {
         }
         self.close_popup();
         match a {
-            Action::PowerLock => self.spawn("eclipse-lock || swaylock || lock"),
+            Action::PowerLock => self.spawn("lunarlock || swaylock"),
             Action::PowerLogout => self.spawn("labwc --exit || killall labwc || pkill labwc"),
             Action::PowerReboot => self.request_power(true),
             Action::PowerShutdown => self.request_power(false),
