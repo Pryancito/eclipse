@@ -2033,6 +2033,8 @@ fn each_theme_keeps_the_title_alignment_of_the_desktop_it_imitates() {
         ("Win11-Dark", Some("Left")),
         ("Breeze-Dark", Some("Center")),
         ("Eclipse-Dark", None),
+        // tecno reads like an instrument: titles flush left, as in the mockup.
+        ("Tecno-Dark", Some("Left")),
     ];
     for (theme, justify) in want {
         let rc = themerc(&dir, theme);
@@ -2078,7 +2080,11 @@ fn the_look_script_rewrites_every_place_the_old_look_is_named() {
         script.contains("if [ \"$boot\" != boot ]; then"),
         "the boot path is not told apart from a live change:\n{script}"
     );
-    for live in ["labwc --reconfigure", "pkill -x lunarbar"] {
+    for live in [
+        "labwc --reconfigure",
+        "pkill -x lunarbar",
+        "pkill -x lunarbg",
+    ] {
         assert!(
             script.contains(live),
             "a live look change does not {live}:\n{script}"
@@ -2466,4 +2472,52 @@ fn a_double_hyphen_in_a_comment_fails_the_build_not_the_desktop() {
         b"<item label=\"a -- b\"/>",
         "a double hyphen in an attribute",
     );
+}
+
+/// `eclipse-look` swaps the titlebar/menu face with the look: monospace for
+/// `tecno`, proportional DejaVu for every other one, both ways and as many
+/// times as the user switches. Runs the script's own face block over a copy
+/// of the shipped rc.xml rather than the whole script, which writes /etc.
+#[test]
+fn the_titlebar_face_follows_the_look_both_ways() {
+    let dir = look_rootfs("face");
+    let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
+    let start = script
+        .find("  face=")
+        .expect("no face block in eclipse-look");
+    let block = &script[start..];
+    let end = block
+        .find("\n  fi\n")
+        .expect("face block does not end the rc branch");
+    let block = &block[..end];
+    let rc = dir.join("root/.config/labwc/rc.xml");
+    let shipped = fs::read_to_string(&rc).unwrap();
+    assert!(
+        shipped.contains("<name>DejaVu Sans Mono</name>"),
+        "the default look is tecno"
+    );
+    let run = |look: &str| {
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("look={look}\nRC='{}'\n{block}\n", rc.display()))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "face block failed for {look}");
+        fs::read_to_string(&rc).unwrap()
+    };
+    let kde = run("kde");
+    assert!(
+        !kde.contains("DejaVu Sans Mono"),
+        "kde kept the monospace face"
+    );
+    assert_eq!(kde.matches("<name>DejaVu Sans</name>").count(), 4);
+    let tecno = run("tecno");
+    assert_eq!(tecno, shipped, "back to tecno is not the shipped rc.xml");
+    assert_eq!(
+        run("tecno"),
+        shipped,
+        "a second switch to tecno changed it again"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

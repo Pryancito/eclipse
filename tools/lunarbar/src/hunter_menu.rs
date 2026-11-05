@@ -69,7 +69,11 @@ pub(super) fn draw_badge(
     shield: Shield,
 ) -> (i32, i32) {
     let size = 14;
-    let w = size + 16;
+    // tecno writes the name beside the shield, as the mockup's tray does,
+    // and paints a guarded shield in the "all clear" green.
+    let label = if tecno() { "HUNTER" } else { "" };
+    let lw = if label.is_empty() { 0 } else { Canvas::text_width(label) + 6 };
+    let w = size + 16 + lw;
     if *rx - w < left_min {
         return (0, 0);
     }
@@ -83,10 +87,14 @@ pub(super) fn draw_badge(
     let (col, solid) = match shield {
         Shield::Alert => (pal().warn, true),
         Shield::Open => (pal().dim, false),
+        Shield::Guarded if tecno() => (TECNO_OK, true),
         Shield::Guarded => (pal().accent, true),
     };
+    if lw > 0 {
+        cv.text(label, *rx + 8 + size + 6, btn_y + (btn_h - GLYPH_H) / 2, col);
+    }
     cv.shield_icon(
-        *rx + (w - size) / 2,
+        *rx + 8, // (w - lw - size) / 2: the 8px pad either side of it
         btn_y + (btn_h - size) / 2,
         size,
         col,
@@ -96,6 +104,9 @@ pub(super) fn draw_badge(
     *rx -= 10;
     hit
 }
+
+/// tecno's "all clear" green: a guarded shield and its label.
+const TECNO_OK: Rgb = (0x6e, 0xe7, 0xa8);
 
 /// The x of segment `i` (0..3) of a row in a panel at `px`.
 fn seg_x(px: i32, i: usize) -> i32 {
@@ -616,11 +627,14 @@ mod tests {
             (0, 0)
         );
         assert_eq!(rx, 40);
-        let mut rx = 90;
+        // tecno writes HUNTER beside the shield, so its badge is wider.
+        let w = 30 + if tecno() { Canvas::text_width("HUNTER") + 6 } else { 0 };
+        let mut cv = Canvas::new(200, 30);
+        let mut rx = 190;
         assert_eq!(
             draw_badge(&mut cv, &mut rx, 30, 3, 24, false, Shield::Alert),
-            (60, 90)
+            (190 - w, 190)
         );
-        assert_eq!(rx, 50);
+        assert_eq!(rx, 190 - w - 10);
     }
 }

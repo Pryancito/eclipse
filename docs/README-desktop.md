@@ -25,9 +25,10 @@ eclipse-look win11      # Windows 11
 | | `tecno` (por defecto) | `eclipse` | `kde` | `win11` |
 |---|---|---|---|---|
 | Tema de ventanas | `Tecno-Dark` (#0a1423, acento cian #38e1ff, oro #f2c14e al pulsar) | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) |
-| Panel | dos barras de 34 px, placas cuadradas con filete, etiquetas en mayúsculas, medidores por segmentos con historial y escuadras doradas en los menús | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
+| Panel | dos barras de 34 px, placas cuadradas con filete; arriba la ventana con foco centrada y `CPU`/`MEM` por segmentos, `NET` y `TEMP` en oro; escuadras doradas en los menús | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
 | Reloj | una línea abajo, fecha arriba | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
 | Terminal | paleta tecno (oro como amarillo) | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
+| Fondo | eclipse dorado sobre negro con halo verdoso, anillos finos y la leyenda `ECLIPSE · SYSTEM · KERNEL · ZCORE` | cosmos animado con estrellas, rejilla y anillo de texto | cosmos animado | cosmos animado |
 | Lanzador | en el tercio superior, recto y con escuadras doradas | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
 
 `tecno` es el aspecto «Orbital HUD» de la maqueta que eligió Moebius (ver
@@ -35,9 +36,11 @@ eclipse-look win11      # Windows 11
 cian de instrumentación `#38e1ff`, filete `#1d3550` y el oro `#f2c14e` de la
 media luna de lunarbg para marcar lo que tiene el foco.
 
-Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml`, copia la
-paleta de foot correspondiente y reinicia el panel (init lo relanza al
-instante); `labwc --reconfigure` recarga el tema sin cerrar la sesión.
+Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml` (y la
+fuente de los títulos: `DejaVu Sans Mono` en `tecno`, `DejaVu Sans` en el
+resto), copia la paleta de foot correspondiente y reinicia el panel y el
+fondo (init los relanza al instante; los dos leen `/etc/eclipse/look` al
+arrancar); `labwc --reconfigure` recarga el tema sin cerrar la sesión.
 
 **Sombras**: los tres `themerc` piden sombra bajo las ventanas
 (`window.active.shadow.size`/`.color`), que labwc dibuja de verdad desde

@@ -325,6 +325,14 @@ fn the_themes_a_look_can_choose_all_name_the_same_colours() {
             .filter_map(|l| l.split_once(':'))
             .map(|(k, _)| k.trim().to_string())
             .filter(|k| k.ends_with(".color"))
+            // A per-button colour (`window.active.button.close.…`) refines a
+            // key every theme already names; a theme without it falls back
+            // to that key, not to openbox's palette.
+            .filter(|k| {
+                !["close", "max", "iconify", "menu", "shade", "desk"]
+                    .iter()
+                    .any(|b| k.contains(&format!(".button.{b}.")))
+            })
             .collect()
     };
     let mut names: Vec<&String> = themes

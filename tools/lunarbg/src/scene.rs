@@ -50,6 +50,18 @@ const TEXT_RING: &str = "ECLIPSE-SYSTEM-KERNEL-6.X-STABLE-LINK-ACTIVE-";
 
 type Rgb = (f32, f32, f32);
 
+mod tecno;
+pub use tecno::style_from;
+
+/// Which wallpaper the output shows: the animated cosmic original, or the
+/// `tecno` look's instrument face (see [`tecno`]). `eclipse-look` picks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Style {
+    #[default]
+    Cosmic,
+    Tecno,
+}
+
 // ---------------------------------------------------------------- layout
 
 /// Placement of the animated logo on an output.
@@ -79,6 +91,7 @@ pub struct Layout {
     pub px: f32,
     /// (x, y, w, h) of the rect that the animation redraws each frame.
     pub region: (usize, usize, usize, usize),
+    pub style: Style,
 }
 
 /// Parse an aspect spec: `"16:9"`, `"16:10"` or a decimal like `"1.778"`.
@@ -113,7 +126,20 @@ pub fn aspect_from_env() -> Option<f32> {
 /// caller (CLI / env override, else geometry). This function does not re-read
 /// the environment — that would let a fabricated geometry hide `LUNARBG_ASPECT`
 /// when callers passed `Some(geometry)` first.
+#[cfg(test)]
 pub fn layout(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) -> Layout {
+    layout_styled(w, h, monitor_aspect, scale, Style::Cosmic)
+}
+
+/// [`layout`] for a given [`Style`]: the tecno face reaches further out (its
+/// outer ring and the spaced caption under it), so its region is larger.
+pub fn layout_styled(
+    w: usize,
+    h: usize,
+    monitor_aspect: Option<f32>,
+    scale: u32,
+    style: Style,
+) -> Layout {
     let sc = scale.max(1) as f32;
     let (lw, lh) = (w as f32 / sc, h as f32 / sc);
     let logo_r = ((lw.min(lh) / 2.0) - 120.0).clamp(120.0, 280.0);
@@ -127,7 +153,10 @@ pub fn layout(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) -> La
         .unwrap_or(1.0);
     // Outermost animated element: ring 280 + 5 px oscillation, plus the
     // wordmark below at 170 + text height. Take a comfortable margin.
-    let reach = (300.0 * s).max(215.0 * s + 40.0 * sc) + 8.0 * sc;
+    let reach = match style {
+        Style::Cosmic => (300.0 * s).max(215.0 * s + 40.0 * sc) + 8.0 * sc,
+        Style::Tecno => tecno::REACH * s + 8.0 * sc,
+    };
     let x0 = ((cx - reach * sx).floor().max(0.0)) as usize;
     let y0 = ((cy - reach).floor().max(0.0)) as usize;
     let x1 = ((cx + reach * sx).ceil() as usize).min(w);
@@ -139,6 +168,7 @@ pub fn layout(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) -> La
         sx,
         px: sc,
         region: (x0, y0, x1 - x0, y1 - y0),
+        style,
     }
 }
 
@@ -148,8 +178,27 @@ pub fn layout(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) -> La
 ///
 /// Returns `None` on overflow or allocation failure instead of aborting via a
 /// giant `vec!` under `panic=abort`.
+#[cfg(test)]
 pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) -> Option<Vec<u8>> {
-    let lay = layout(w, h, monitor_aspect, scale);
+    render_base_styled(w, h, monitor_aspect, scale, Style::Cosmic)
+}
+
+/// [`render_base`] for a given [`Style`]. The tecno ground is flat and dark
+/// with a wide teal glow behind the face: no starfield and no grid.
+pub fn render_base_styled(
+    w: usize,
+    h: usize,
+    monitor_aspect: Option<f32>,
+    scale: u32,
+    style: Style,
+) -> Option<Vec<u8>> {
+    let lay = layout_styled(w, h, monitor_aspect, scale, style);
+    let cosmic = style == Style::Cosmic;
+    let (ground_top, ground_bottom, glow) = if cosmic {
+        (COSMIC_DEEP, COSMIC_MID, NEBULA_CYAN)
+    } else {
+        (tecno::GROUND_TOP, tecno::GROUND_BOTTOM, tecno::GLOW)
+    };
     let sc = scale.max(1) as f32;
     let n3 = w.checked_mul(h)?.checked_mul(3)?;
     let n4 = w.checked_mul(h)?.checked_mul(4)?;
@@ -166,7 +215,7 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
     crate::par::par_rows(&mut buf, h, w * 3, |y0, band| {
         for (ry, row) in band.chunks_mut(w * 3).enumerate() {
             let t = (y0 + ry) as f32 / fh;
-            let (r, g, b) = lerp3(COSMIC_DEEP, COSMIC_MID, t);
+            let (r, g, b) = lerp3(ground_top, ground_bottom, t);
             for x in 0..w {
                 row[x * 3] = r;
                 row[x * 3 + 1] = g;
@@ -178,7 +227,14 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
     // glow stays concentric with it on a stretching panel). Also a large
     // per-pixel pass (~1M px at 1080p), so it is band-split like the gradient:
     // each band writes disjoint rows and the result is byte-identical.
-    let neb_r = 420.0 * lay.s + 120.0 * sc;
+    let neb_r = if cosmic {
+        420.0 * lay.s + 120.0 * sc
+    } else {
+        tecno::GLOW_R * lay.s + 200.0 * sc
+    };
+    // The tecno glow is a broad wash (t^1.5, full strength), the cosmic one a
+    // tight nebula (t^2 at 22%).
+    let glow_a = |t: f32| if cosmic { t * t * 0.22 } else { t * t.sqrt() };
     let (nx0, nx1) = span(lay.cx, neb_r * lay.sx, w);
     let (ny0, ny1) = span(lay.cy, neb_r, h);
     let stride3 = w * 3;
@@ -198,11 +254,11 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
                     );
                     if d < neb_r {
                         let t = 1.0 - d / neb_r;
-                        let a = t * t * 0.22;
+                        let a = glow_a(t);
                         let i = x * 3;
-                        row[i] += NEBULA_CYAN.0 * a;
-                        row[i + 1] += NEBULA_CYAN.1 * a;
-                        row[i + 2] += NEBULA_CYAN.2 * a;
+                        row[i] += glow.0 * a;
+                        row[i + 1] += glow.1 * a;
+                        row[i + 2] += glow.2 * a;
                     }
                 }
             }
@@ -214,7 +270,11 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
     // and the stars' physical size match the scale-1 look exactly.
     let scu = scale.max(1) as usize;
     let (lw, lh) = (w / scu, h / scu);
-    let count = ((lw * lh) as f32 / 6000.0) as u32;
+    let count = if cosmic {
+        ((lw * lh) as f32 / 6000.0) as u32
+    } else {
+        0
+    };
     for i in 0..count {
         let x = (hash2(i, 1) % lw.max(1) as u32) as i32 * scu as i32;
         let y = (hash2(i, 2) % lh.max(1) as u32) as i32 * scu as i32;
@@ -238,7 +298,9 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
 
     // Blueprint grid, 48 logical px; each line is `scale` px wide so its
     // physical weight matches the scale-1 look.
-    grid_pass(&mut buf, w, h, 48 * scu, scu);
+    if cosmic {
+        grid_pass(&mut buf, w, h, 48 * scu, scu);
+    }
 
     // Quantise to XRGB8888 with light dithering noise. Also a full-surface
     // pass: split `out` by band, read the float buffer by absolute pixel index.
@@ -302,6 +364,10 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
         sx: lay.sx,
         px: lay.px,
     };
+    if lay.style == Style::Tecno {
+        tecno::frame(&mut pb, lay, t_ms);
+        return;
+    }
     // Accumulate the phase in f64 and fold each element to its own period
     // right before the trig call: after days of uptime an f32 phase loses
     // sub-frame resolution and the animation turns visibly steppy.
@@ -760,6 +826,9 @@ fn glyph5x7(c: char) -> [u8; 7] {
         ],
         'X' => [
             0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
         ],
         'Y' => [
             0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
