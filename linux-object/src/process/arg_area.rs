@@ -35,6 +35,20 @@ impl LinuxProcess {
         self.inner.lock().image_layout
     }
 
+    /// Record where the image just loaded got its `rt_sigreturn` trampoline,
+    /// 0 when it has none.
+    pub fn set_sigreturn_trampoline(&self, addr: usize) {
+        self.inner.lock().sigreturn_trampoline = addr;
+    }
+
+    /// The address a signal handler of this process must return to, and 0
+    /// when the kernel mapped no trampoline for it — on x86_64 always, and
+    /// elsewhere when the mapping could not be made. A handler then has to
+    /// return through the restorer its own libc passed.
+    pub fn sigreturn_trampoline(&self) -> usize {
+        self.inner.lock().sigreturn_trampoline
+    }
+
     /// Record the auxiliary vector the image just loaded was handed.
     pub fn set_auxv(&self, auxv: Arc<[usize]>) {
         self.inner.lock().auxv = auxv;

@@ -1701,19 +1701,20 @@ impl Syscall<'_> {
         // the task with SIGSEGV here rather than returning; do the same, so
         // the parent sees a dead child instead of a live one wandering through
         // an empty address space.
-        let (entry, sp, initial_brk, loaded_path, abi, arg_area, layout, auxv) = match load {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                error!(
-                    "execve: {:?} failed AFTER the address space was replaced; \
+        let (entry, sp, initial_brk, loaded_path, abi, arg_area, layout, auxv, sigreturn) =
+            match load {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    error!(
+                        "execve: {:?} failed AFTER the address space was replaced; \
                      killing pid {} (it has no image left to return to)",
-                    e,
-                    self.zircon_process().id()
-                );
-                self.zircon_process().exit(exit_code_after_failed_exec());
-                return Err(e);
-            }
-        };
+                        e,
+                        self.zircon_process().id()
+                    );
+                    self.zircon_process().exit(exit_code_after_failed_exec());
+                    return Err(e);
+                }
+            };
         // The new image may speak a different ABI than the caller (e.g. a Linux
         // shell exec'ing a FreeBSD binary); adopt the freshly-detected one.
         proc.set_abi(abi);
@@ -1733,6 +1734,8 @@ impl Syscall<'_> {
         proc.set_arg_area(arg_area);
         proc.set_image_layout(Some(layout));
         proc.set_auxv(auxv);
+        // The old image's trampoline went with the old address space.
+        proc.set_sigreturn_trampoline(sigreturn);
         proc.set_brk(initial_brk);
         // CRUCIAL: reset the heap's *mapped* upper bound too. `execve` replaced
         // the whole address space (`vmar.clear()` above), so the previous image's

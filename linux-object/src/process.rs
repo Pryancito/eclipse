@@ -1296,6 +1296,13 @@ struct LinuxProcessInner {
     image_layout: Option<crate::loader::ImageLayout>,
     /// The auxiliary vector its image was handed (`/proc/<pid>/auxv`).
     auxv: Arc<[usize]>,
+    /// Where the kernel's `rt_sigreturn` trampoline was mapped for this
+    /// image, and 0 when it has none. Set by every `execve` alongside
+    /// [`Self::image_layout`], because it is part of the address space that
+    /// `execve` replaced; copied by a fork, whose cloned address space holds
+    /// the same page at the same address. See
+    /// [`crate::signal::sigpage`][mod@crate::signal::sigpage].
+    sigreturn_trampoline: usize,
     /// What it asks of an OOM killer (`signal->oom_score_adj`).
     oom: OomAdj,
     /// Current Working Directory
@@ -4647,6 +4654,7 @@ impl LinuxProcessInner {
             arg_area: self.arg_area,
             image_layout: self.image_layout,
             auxv: self.auxv.clone(),
+            sigreturn_trampoline: self.sigreturn_trampoline,
             // `copy_signal` copies the adjustment and its floor.
             oom: self.oom,
             current_working_directory: self.current_working_directory.clone(),

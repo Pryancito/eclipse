@@ -285,7 +285,7 @@ fn spawn(
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     // Likewise, a malformed/incompatible ELF for the base program must fall
     // back rather than panic the kernel.
-    let (entry, sp, initial_brk, execute_path, abi, arg_area, layout, auxv) =
+    let (entry, sp, initial_brk, execute_path, abi, arg_area, layout, auxv, sigreturn) =
         match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -302,6 +302,7 @@ fn spawn(
     proc.linux().set_arg_area(arg_area);
     proc.linux().set_image_layout(Some(layout));
     proc.linux().set_auxv(auxv);
+    proc.linux().set_sigreturn_trampoline(sigreturn);
     proc.linux().set_brk(initial_brk);
     proc.set_name(comm_from_path(&execute_path));
 
@@ -1152,7 +1153,7 @@ fn handle_signal(
     // other handlers have been entered (and perhaps never left) since.
     thread.backup_context(*ctx, siginfo_ptr, uctx_ptr, sigreturn_sp(sp));
     #[cfg(not(target_arch = "x86_64"))]
-    ctx.set_ra(action.restorer);
+    ctx.set_ra(return_address(thread, &action));
     // set trapframe
     ctx.setup_uspace(
         action.handler,
@@ -1556,6 +1557,40 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
 /// `sigreturn` with. On x86_64 the handler's `ret` has popped the restorer's
 /// address by then; elsewhere the return address was in a register and the
 /// stack is as the handler found it.
+/// Where a signal handler of `thread` must return to.
+///
+/// The generic syscall ABI (aarch64, riscv64) has no `sa_restorer` field and
+/// no `SA_RESTORER`: Linux there writes its own `rt_sigreturn` stub into the
+/// return-address register and ignores whatever the libc passed. glibc on
+/// those architectures accordingly passes nothing, and so does any program
+/// that issues `rt_sigaction` itself — which this kernel turned into a jump
+/// to address 0 the moment such a handler returned. Measured in QEMU riscv64
+/// in this container: `/sbin/init` dying `pc=0 ra=0` sixty seconds into every
+/// boot, when its `SIGALRM` handler returned, and taking the guest with it
+/// because it is PID 1.
+///
+/// A restorer that *is* there is still used, so a libc that supplies one
+/// (musl, which defines `SA_RESTORER` for riscv64) keeps the path it had.
+/// The kernel's trampoline is the fallback, and the only thing that changes
+/// is that a zero is no longer entered as if it were code.
+#[cfg(not(target_arch = "x86_64"))]
+fn return_address(thread: &CurrentThread, action: &SignalAction) -> usize {
+    if action.restorer != 0 {
+        return action.restorer;
+    }
+    let trampoline = thread.proc().linux().sigreturn_trampoline();
+    if trampoline == 0 {
+        // Nothing to offer, which is what every build before the sigpage
+        // existed did: leave it as it was rather than invent an address.
+        warn!(
+            "pid={} has no restorer and no sigreturn trampoline: its handler \
+             will return to 0",
+            thread.proc().id()
+        );
+    }
+    trampoline
+}
+
 fn sigreturn_sp(handler_sp: usize) -> usize {
     if cfg!(target_arch = "x86_64") {
         handler_sp + core::mem::size_of::<usize>()
