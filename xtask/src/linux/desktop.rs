@@ -2329,6 +2329,11 @@ fn write_labwc_rc(rootfs: &Path) {
     <!-- Super+L: lock the screen (lunarlock, a clock over every output; no
          password by choice, a key or a click brings the desktop back). -->
     <keybind key="W-L"><action name="Execute"><command>lunarlock</command></action></keybind>
+    <!-- Print: a screenshot of the whole desktop; Shift+Print: of an area
+         chosen with the mouse. lunarshot saves it to the pictures folder and
+         puts it on the clipboard. -->
+    <keybind key="Print"><action name="Execute"><command>lunarshot</command></action></keybind>
+    <keybind key="S-Print"><action name="Execute"><command>lunarshot --region</command></action></keybind>
     <!-- Desktop menu also on a key, in case the mouse is missing -->
     <keybind key="W-space"><action name="ShowMenu"><menu>root-menu</menu></action></keybind>
     <!-- Window management -->

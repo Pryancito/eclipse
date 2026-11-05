@@ -74,6 +74,8 @@ struct LunarTools {
     hunter: PathBuf,
     /// The lock screen behind Super+L and the power menu's "bloquear".
     lock: PathBuf,
+    /// Screenshots, behind Print and Shift+Print.
+    shot: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -3525,6 +3527,7 @@ impl LinuxRootfs {
             clip: lunarclip,
             hunter: lunarhunter,
             lock: lunarlock,
+            shot: lunarshot,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3592,6 +3595,16 @@ impl LinuxRootfs {
             fs::copy(&lunarlock, bin.join("lunarlock")).unwrap();
         } else {
             eprintln!("warning: lunarlock not built; Super+L does nothing");
+        }
+
+        // lunarshot: screenshots (wlr-screencopy), the whole desktop on Print
+        // and a chosen area on Shift+Print, saved to the pictures folder and
+        // put on the clipboard.
+        if lunarshot.is_file() {
+            let _ = dir::rm(bin.join("lunarshot"));
+            fs::copy(&lunarshot, bin.join("lunarshot")).unwrap();
+        } else {
+            eprintln!("warning: lunarshot not built; Print does nothing");
         }
     }
 
@@ -3717,6 +3730,7 @@ impl LinuxRootfs {
         let clipboard = out.join("lunarclip");
         let hunter = out.join("lunarhunter");
         let lock = out.join("lunarlock");
+        let shot = out.join("lunarshot");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3736,7 +3750,7 @@ impl LinuxRootfs {
         // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
         // clipboard at all, and the stale-binary check would happily ship
         // that. (That is exactly what happened the day lunarfile arrived.)
-        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter, &lock]
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter, &lock, &shot]
             .iter()
             .map(|p| fs::metadata(p).ok()?.modified().ok())
             .collect();
@@ -3749,6 +3763,7 @@ impl LinuxRootfs {
                     clip: clipboard,
                     hunter,
                     lock,
+                    shot,
                 };
             }
         }
@@ -3783,6 +3798,7 @@ impl LinuxRootfs {
             clip: clipboard,
             hunter,
             lock,
+            shot,
         }
     }
 
