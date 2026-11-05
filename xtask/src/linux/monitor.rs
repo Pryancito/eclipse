@@ -33,9 +33,11 @@ pub(super) fn write_monitor_desktop_entry(rootfs: &Path) {
         "[Desktop Entry]\n\
          Version=1.0\n\
          Type=Application\n\
-         Name=Monitor del sistema\n\
+         Name=System monitor\n\
+         Name[es]=Monitor del sistema\n\
          GenericName=System Monitor\n\
-         Comment=Aplicaciones, procesos, CPU, memoria, red, disco y servicios del arranque\n\
+         Comment=Applications, processes, CPU, memory, network, disk and the boot services\n\
+         Comment[es]=Aplicaciones, procesos, CPU, memoria, red, disco y servicios del arranque\n\
          Exec=/usr/local/bin/eclipse-monitor\n\
          TryExec=/usr/local/bin/eclipse-monitor\n\
          Terminal=false\n\
