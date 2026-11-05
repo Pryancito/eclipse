@@ -7,6 +7,7 @@
 use lunarbar::draw::GLYPH_H;
 use lunarbar::draw::GLYPH_W;
 use lunarbar::hunter_net::{NetTable, Verdict};
+use lunarbar::i18n::Key;
 
 use super::{fit, fit_left, Act, JobKind, Paint, Rect, Style, BTN_H, CRIT, OK, ROW_H, WARN};
 
@@ -32,20 +33,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     let st = g.st;
     let p = g.p;
     let Some(t) = &st.net else {
-        g.bold(
-            st.t(
-                "Este núcleo no tiene monitor de red",
-                "This kernel has no network monitor",
-            ),
-            x,
-            y,
-            CRIT,
-        );
+        g.bold(st.lang.s(Key::hunt_net_no_network_monitor), x, y, CRIT);
         g.text(
-            st.t(
-                "No hay /proc/hunter_net: hace falta un hunter más nuevo.",
-                "No /proc/hunter_net: a newer hunter is needed.",
-            ),
+            st.lang.s(Key::hunt_net_no_netmon_proc_file),
             x,
             y + 28,
             p.dim,
@@ -60,17 +50,17 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     let alert_c = if unexpected > 0 { CRIT } else { OK };
     let stats = [
         (
-            st.t("en escucha", "listening"),
+            st.lang.s(Key::hunt_net_listening),
             t.listeners().to_string(),
             p.text,
         ),
         (
-            st.t("inesperados", "unexpected"),
+            st.lang.s(Key::hunt_net_unexpected),
             unexpected.to_string(),
             alert_c,
         ),
         (
-            st.t("conexiones", "connections"),
+            st.lang.s(Key::hunt_net_connections),
             t.socks
                 .iter()
                 .filter(|s| s.verdict == Verdict::Connected)
@@ -79,7 +69,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
             p.text,
         ),
         (
-            st.t("procesos", "processes"),
+            st.lang.s(Key::mon_processes_2),
             t.processes().to_string(),
             p.text,
         ),
@@ -98,9 +88,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
         free(Act::NetAlerts(true))
     };
     let label = if t.alerts {
-        st.t("Avisos: activados", "Alerts: on")
+        st.lang.s(Key::hunt_net_alerts_on)
     } else {
-        st.t("Avisos: desactivados", "Alerts: off")
+        st.lang.s(Key::hunt_net_alerts_off)
     };
     let look = if t.alerts {
         Style::Normal
@@ -109,15 +99,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     };
     let bw = g.button(x, cy, 0, label, look, alerts_act);
     let note = if t.ignore_loopback {
-        st.t(
-            "Los puertos solo de 127.0.0.1 no avisan: no se ven desde la red.",
-            "Ports on 127.0.0.1 only do not alert: the network cannot reach them.",
-        )
+        st.lang.s(Key::hunt_net_loopback_does_not_alert)
     } else {
-        st.t(
-            "También avisan los puertos solo de 127.0.0.1.",
-            "Ports on 127.0.0.1 only alert too.",
-        )
+        st.lang.s(Key::hunt_net_loopback_alerts_too)
     };
     g.text(
         &fit(note, w - bw - 16),
@@ -128,12 +112,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     cy += BTN_H + 16;
 
     // ── the sockets ──
-    g.section(
-        x,
-        cy,
-        w,
-        st.t("Conexiones por proceso", "Connections by process"),
-    );
+    g.section(x, cy, w, st.lang.s(Key::hunt_net_connections_by_process));
     cy += 26;
     let console_h = 3 * (GLYPH_H + 3) + 12;
     let show_console = st.job.as_ref().is_some_and(|j| j.kind == JobKind::Net);
@@ -145,15 +124,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     let max = list.len().saturating_sub(fits);
     let top = st.scroll.min(max);
     if list.is_empty() {
-        g.text(
-            st.t(
-                "ningún proceso tiene sockets de red",
-                "no process holds a network socket",
-            ),
-            x,
-            cy + 4,
-            p.dim,
-        );
+        g.text(st.lang.s(Key::hunt_net_no_socket_held), x, cy + 4, p.dim);
     }
     // Columns: verdict, pid, program, proto, local, remote; an alert's button
     // over the remote one, which a listener does not have. The pid goes first
@@ -169,9 +140,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
         let ry = cy + row as i32 * row_h;
         let ty = ry + (ROW_H - GLYPH_H) / 2 + 2;
         let (tag, c) = match s.verdict {
-            Verdict::Alert => (st.t("¡ALERTA!", "ALERT!"), CRIT),
-            Verdict::Listen => (st.t("escucha", "listen"), OK),
-            Verdict::Connected => (st.t("conexión", "connected"), p.dim),
+            Verdict::Alert => (st.lang.s(Key::hunt_net_alert), CRIT),
+            Verdict::Listen => (st.lang.s(Key::hunt_net_listen), OK),
+            Verdict::Connected => (st.lang.s(Key::hunt_net_connected), p.dim),
             Verdict::Idle => ("-", p.dim),
         };
         if s.verdict == Verdict::Alert {
@@ -200,7 +171,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
                 x + w - bw,
                 ry,
                 bw,
-                st.t("Permitir", "Allow"),
+                st.lang.s(Key::hunt_allow_2),
                 Style::Normal,
                 act,
             );
@@ -213,10 +184,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
         x,
         ry0,
         w,
-        st.t(
-            "Puertos esperados (/etc/hunter/ports)",
-            "Expected ports (/etc/hunter/ports)",
-        ),
+        st.lang.s(Key::hunt_net_expected_ports_etc_hunter_ports),
     );
     let fbw = 10 * GLYPH_W;
     for (i, rule) in t.rules.iter().take(4).enumerate() {
@@ -227,7 +195,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
             x + w - fbw,
             ry,
             fbw,
-            st.t("Quitar", "Remove"),
+            st.lang.s(Key::hunt_net_remove),
             Style::Normal,
             free(Act::ForgetRule(i)),
         );
@@ -236,14 +204,14 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
         let more = format!(
             "+{} {}",
             t.rules.len() - 4,
-            st.t("más (hunterctl net)", "more (hunterctl net)")
+            st.lang.s(Key::hunt_net_more_hunterctl_net)
         );
         g.text(&more, x + w / 2, ry0, p.dim);
     }
     if t.reported > 0 {
         let s = format!(
             "{}: {}",
-            st.t("avisos desde el arranque", "alerts since boot"),
+            st.lang.s(Key::hunt_net_alerts_since_boot),
             t.reported
         );
         let sw = lunarbar::draw::Canvas::text_width(&s);
