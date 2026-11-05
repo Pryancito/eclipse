@@ -23,6 +23,11 @@ numeric_enum! {
 pub enum SystemResource {
     Hypervisor = 0,
     Vmex = 1,
+    /// `ZX_RSRC_SYSTEM_POWER_BASE`. Measured, not remembered: userboot asks
+    /// for it by `zx_resource_create(parent, options=0x5 /* SYSTEM */,
+    /// base=0x5, size=0x1, "power")` before it ever calls
+    /// `zx_system_powerctl`.
+    Power = 5,
     Debuglog = 12,
 }
 
@@ -189,6 +194,54 @@ mod tests {
             root.validate_ranged_resource(ResourceKind::SYSTEM, usize::MAX, 2),
             Err(ZxError::OUT_OF_RANGE)
         );
+    }
+
+    /// `zx_system_powerctl` takes the POWER subrange of the system resource,
+    /// and userboot gets there by carving one out of the system resource the
+    /// loader hands it. Measured, not remembered: the libos run logged
+    /// `resource.create: parent=.., options=0x5, base=0x5, size=0x1` followed
+    /// by `name="power"`, next to `base=0x1`/`"vmex"` and `base=0xC` for the
+    /// debuglog, which are the two subranges this enum already named.
+    #[test]
+    fn the_power_subrange_is_where_powerctl_looks() {
+        // The system resource exactly as `loader::zircon` creates it.
+        let system = Resource::create(
+            "system",
+            ResourceKind::SYSTEM,
+            0,
+            SystemResource::Debuglog as usize + 1,
+            ResourceFlags::empty(),
+        );
+        assert!(system.validate_system(SystemResource::Power).is_ok());
+        // ... so the child userboot carves is in range and can be created.
+        assert!(system
+            .validate_ranged_resource(ResourceKind::SYSTEM, SystemResource::Power as usize, 1)
+            .is_ok());
+
+        // That child answers for POWER and for nothing else.
+        let power = Resource::create(
+            "power",
+            ResourceKind::SYSTEM,
+            SystemResource::Power as usize,
+            1,
+            ResourceFlags::empty(),
+        );
+        assert!(power.validate_system(SystemResource::Power).is_ok());
+        for other in [
+            SystemResource::Hypervisor,
+            SystemResource::Vmex,
+            SystemResource::Debuglog,
+        ] {
+            assert_eq!(
+                power.validate_system(other),
+                Err(ZxError::OUT_OF_RANGE),
+                "the power resource must not stand in for another subrange"
+            );
+        }
+
+        // And the check powerctl used to make -- "is this the root resource?"
+        // -- rejects it, which is the whole bug: `WRONG_TYPE`, every time.
+        assert_eq!(power.validate(ResourceKind::ROOT), Err(ZxError::WRONG_TYPE));
     }
 
     /// A resource validates for its own kind and for nothing else, and the
