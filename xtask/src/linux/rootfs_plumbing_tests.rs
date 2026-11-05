@@ -1197,6 +1197,39 @@ fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
     );
 }
 
+/// The settings window's service goes first: with `lunarnet` in the image the
+/// `udhcpc` service applies `/etc/eclipse/network` (static, off, DHCPv6) and
+/// not bare DHCPv4 on the first interface. And it is `exec`ed with
+/// `--service`, never run beside the fallback udhcpc: two clients for one
+/// interface would fight over its address.
+#[test]
+fn the_network_service_hands_over_to_lunarnet_before_bare_dhcp() {
+    let rootfs = init_rootfs("lunarnet");
+    let body = wrapper(&rootfs, "eclipse-udhcpc");
+    let first_exec = body
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("exec "))
+        .unwrap();
+    assert!(
+        first_exec.contains("lunarnet\" --service"),
+        "the first exec is not lunarnet: {first_exec}"
+    );
+    assert!(
+        first_exec.starts_with("[ -x "),
+        "exec'd unchecked: {first_exec}"
+    );
+    // Both lease scripts leave resolv.conf alone while the servers are fixed
+    // (they are written inline by the rootfs build, hence the source).
+    assert_eq!(
+        include_str!("mod.rs")
+            .matches("[ -n \\\"$dns\\\" ] && [ ! -e /run/lunarnet/dns ]")
+            .count(),
+        2,
+        "a DHCP lease would overwrite the DNS servers set in lunarnet"
+    );
+}
+
 /// A missing seatd is the most confusing thing this image can do: the
 /// whole Wayland session fails and init's `/dev/null` stdio swallows the
 /// reason. So the message goes to three places, and the back-off is long
