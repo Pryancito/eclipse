@@ -6,6 +6,7 @@
 # and publishes a shields.io endpoint file on the `badges` branch:
 #
 #   https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Pryancito/eclipse/badges/clones.json
+#   https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Pryancito/eclipse/badges/clones-uniques.json
 #
 # Setup: create a fine-grained personal access token for this repository with
 # "Administration: Read-only" and save it as the TRAFFIC_TOKEN secret.
@@ -77,16 +78,23 @@ jobs:
           hist = dict(sorted(hist.items()))
           json.dump(hist, open(hist_path, "w"), indent=1)
           total = sum(d["count"] for d in hist.values())
-          json.dump(
-              {"schemaVersion": 1, "label": "clones", "message": str(total), "color": "blue"},
-              open("clones.json", "w"),
-          )
-          print(f"total clones since tracking started: {total}")
+          # Daily uniques are summed: someone who clones on two different
+          # days counts twice, because GitHub only dedupes within a window.
+          uniques = sum(d["uniques"] for d in hist.values())
+          for name, label, value in (
+              ("clones.json", "clones", total),
+              ("clones-uniques.json", "unique clones", uniques),
+          ):
+              json.dump(
+                  {"schemaVersion": 1, "label": label, "message": str(value), "color": "blue"},
+                  open(name, "w"),
+              )
+          print(f"since tracking started: {total} clones, {uniques} unique (per day)")
           EOF
 
       - name: Publish
         run: |
-          git add clones.json clones-history.json
+          git add clones.json clones-uniques.json clones-history.json
           if git diff --cached --quiet; then
             echo "No change."
             exit 0

@@ -1,6 +1,7 @@
 # Eclipse OS
 
 [![Clones del repositorio](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones.json)](.github/workflows/clones-badge.yml)
+[![Clones únicos](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones-uniques.json)](.github/workflows/clones-badge.yml)
 
 **Español** · [English](README.en.md)
 
