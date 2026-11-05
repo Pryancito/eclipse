@@ -62,6 +62,7 @@ use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysin
 mod hunter_menu;
 mod info;
 mod launcher;
+mod taskmenu;
 use launcher::Row;
 use info::*;
 mod workspaces;
@@ -553,6 +554,8 @@ struct Toplevel {
     app_id: String,
     activated: bool,
     minimized: bool,
+    maximized: bool,
+    fullscreen: bool,
 }
 
 /// What the launcher/clock/power/volume popup currently shows.
@@ -579,7 +582,7 @@ enum PopupKind {
     /// Right-click context menu for one window, keyed by its foreign-toplevel
     /// protocol id (never a list index — the window can close while the menu
     /// is open, and an index would then act on whoever took its slot).
-    TaskMenu { tid: u32, title: String },
+    TaskMenu { tid: u32, title: String, win: taskmenu::Win, sel: usize },
     /// Volume control popup slider.
     Volume { level: u32 },
     /// hunter's menu: modes, alerts and actions.
@@ -609,6 +612,10 @@ enum Action {
     TaskFocus(u32),
     TaskMinimize(u32),
     TaskClose(u32),
+    /// Maximise the window, or restore its size when it is maximised.
+    TaskMaximize(u32),
+    /// Fullscreen the window, or bring it back when it is fullscreen.
+    TaskFullscreen(u32),
     /// Click anywhere on the volume gauge; percent derived from x.
     VolumeGauge,
     /// hunter: set a domain (index into `hunter::DOMAINS`) to a mode.
@@ -1459,13 +1466,14 @@ impl State {
             self.close_popup();
             return;
         }
-        let title = self
-            .toplevels
-            .iter()
-            .find(|t| t.handle.id().protocol_id() == tid)
-            .map(|t| t.title.clone())
-            .unwrap_or_default();
-        self.open_popup(qh, PopupKind::TaskMenu { tid, title }, at_top);
+        let t = self.toplevels.iter().find(|t| t.handle.id().protocol_id() == tid);
+        let title = t.map(|t| t.title.clone()).unwrap_or_default();
+        let win = t.map_or_else(taskmenu::Win::default, |t| taskmenu::Win {
+            minimized: t.minimized,
+            maximized: t.maximized,
+            fullscreen: t.fullscreen,
+        });
+        self.open_popup(qh, PopupKind::TaskMenu { tid, title, win, sel: 0 }, at_top);
     }
 
     /// Volume module click: toggle volume slider popup.
@@ -1875,41 +1883,13 @@ impl State {
                 self.close_popup();
                 self.request_power(false);
             }
-            Some(Action::TaskFocus(tid)) => {
-                self.close_popup();
-                if let Some(t) = self
-                    .toplevels
-                    .iter()
-                    .find(|t| t.handle.id().protocol_id() == tid)
-                {
-                    if t.minimized {
-                        t.handle.unset_minimized();
-                    }
-                    if let Some(seat) = &self.seat {
-                        t.handle.activate(seat);
-                    }
-                }
-            }
-            Some(Action::TaskMinimize(tid)) => {
-                self.close_popup();
-                if let Some(t) = self
-                    .toplevels
-                    .iter()
-                    .find(|t| t.handle.id().protocol_id() == tid)
-                {
-                    t.handle.set_minimized();
-                }
-            }
-            Some(Action::TaskClose(tid)) => {
-                self.close_popup();
-                if let Some(t) = self
-                    .toplevels
-                    .iter()
-                    .find(|t| t.handle.id().protocol_id() == tid)
-                {
-                    t.handle.close();
-                }
-            }
+            Some(
+                a @ (Action::TaskFocus(_)
+                | Action::TaskMinimize(_)
+                | Action::TaskMaximize(_)
+                | Action::TaskFullscreen(_)
+                | Action::TaskClose(_)),
+            ) => self.task_act(a),
             Some(Action::VolumeGauge) => {
                 let (px, _py, pw, _ph) = panel;
                 let gw = (pw - 30).max(1);
@@ -1953,6 +1933,11 @@ impl State {
                 if *sel != r {
                     *sel = r;
                     changed = true;
+                }
+            }
+            if let (PopupKind::TaskMenu { tid, win, sel, .. }, Some(a)) = (&mut popup.kind, hit) {
+                if let Some(r) = taskmenu::items(*tid, *win).iter().position(|i| i.act == a) {
+                    changed |= std::mem::replace(sel, r) != r;
                 }
             }
         }
@@ -2004,6 +1989,7 @@ impl State {
             Launch(String),
             Cal(i32),
             Render,
+            Task(Action),
         }
         let mut act = Do::Nothing;
         if let Some(popup) = self.popup.as_mut() {
@@ -2077,6 +2063,19 @@ impl State {
                         *scroll = *sel + 1 - rows_fit;
                     }
                 }
+                PopupKind::TaskMenu { tid, win, sel, .. } => {
+                    let items = taskmenu::items(*tid, *win);
+                    match key {
+                        KEY_ESC_WL => act = Do::Close,
+                        KEY_UP_WL => *sel = sel.saturating_sub(1),
+                        KEY_DOWN_WL | KEY_TAB_WL => *sel = (*sel + 1).min(items.len() - 1),
+                        KEY_ENTER_WL | KEY_KPENTER_WL => act = Do::Task(items[(*sel).min(items.len() - 1)].act),
+                        _ => {}
+                    }
+                    if matches!(act, Do::Nothing) {
+                        act = Do::Render;
+                    }
+                }
                 PopupKind::Calendar { .. } => match key {
                     KEY_ESC_WL => act = Do::Close,
                     KEY_LEFT_WL | KEY_UP_WL => act = Do::Cal(-1),
@@ -2094,6 +2093,7 @@ impl State {
         match act {
             Do::Nothing => {}
             Do::Close => self.close_popup(),
+            Do::Task(a) => self.task_act(a),
             Do::Launch(cmd) => {
                 self.close_popup();
                 self.spawn(&cmd);
@@ -2863,7 +2863,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
             CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD,
         ),
         PopupKind::PowerMenu => (180, 160),
-        PopupKind::TaskMenu { .. } => (200, 130),
+        PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
         PopupKind::Volume { .. } => (180, 80),
         PopupKind::Hunter(_) => hunter_menu::size(),
     }
@@ -2936,7 +2936,7 @@ fn draw_popup(
         }
         PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
         PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
-        PopupKind::TaskMenu { tid, title } => draw_task_menu(cv, px, py, pw, ph, *tid, title),
+        PopupKind::TaskMenu { tid, title, win, sel } => taskmenu::draw(cv, px, py, pw, *tid, title, *win, *sel),
         PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
         PopupKind::Hunter(m) => hunter_menu::draw(cv, px, py, pw, ph, m),
     }
@@ -3199,50 +3199,6 @@ fn draw_power_menu(
             Action::PowerShutdown => cv.power_icon(ix, iy, 14, off),
             _ => {}
         }
-        cv.text(label, tx, ty, pal().text);
-        hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
-    }
-
-    hits
-}
-
-// ── Window context menu drawing ──────────────────────────────────────────────
-
-fn draw_task_menu(
-    cv: &mut Canvas,
-    px: i32,
-    py: i32,
-    pw: i32,
-    ph: i32,
-    tid: u32,
-    title: &str,
-) -> Vec<(i32, i32, i32, i32, Action)> {
-    draw_panel(cv, px, py, pw, ph, 10);
-    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
-
-    let max_chars = ((pw - 24) / GLYPH_W) as usize;
-    let head: String = if title.chars().count() > max_chars {
-        title.chars().take(max_chars.saturating_sub(1)).chain(['.']).collect()
-    } else {
-        title.to_string()
-    };
-    cv.text_bold(&head, px + 12, py + 10, pal().dim);
-    cv.hline(px + 10, py + 30, pw - 20, pal().rule, 0.5);
-
-    let items = [
-        ("enfocar", Action::TaskFocus(tid)),
-        ("minimizar", Action::TaskMinimize(tid)),
-        ("cerrar ventana", Action::TaskClose(tid)),
-    ];
-
-    let row_h = 30;
-    let mut hits = Vec::new();
-    let y0 = py + 34;
-
-    for (i, (label, act)) in items.iter().enumerate() {
-        let ry = y0 + i as i32 * row_h;
-        let tx = px + 16;
-        let ty = ry + (row_h - GLYPH_H) / 2;
         cv.text(label, tx, ty, pal().text);
         hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
     }
@@ -3948,6 +3904,8 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
                     app_id: String::new(),
                     activated: false,
                     minimized: false,
+                    maximized: false,
+                    fullscreen: false,
                 });
             }
         }
@@ -3983,8 +3941,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                 }
             }
             E::State { state: bytes } => {
-                let mut activated = false;
-                let mut minimized = false;
+                let (mut activated, mut minimized, mut maximized, mut fullscreen) = (false, false, false, false);
                 for c in bytes.chunks_exact(4) {
                     let v = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
                     if v == TOPLEVEL_STATE_ACTIVATED {
@@ -3993,10 +3950,14 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                     if v == TOPLEVEL_STATE_MINIMIZED {
                         minimized = true;
                     }
+                    maximized |= v == taskmenu::STATE_MAXIMIZED;
+                    fullscreen |= v == taskmenu::STATE_FULLSCREEN;
                 }
                 if let Some(t) = state.toplevels.iter_mut().find(|t| t.handle.id() == id) {
                     t.activated = activated;
                     t.minimized = minimized;
+                    t.maximized = maximized;
+                    t.fullscreen = fullscreen;
                 }
             }
             E::Done => state.render_task_bars(),
@@ -4426,7 +4387,10 @@ fn main() {
         let want_power = std::env::var("LUNARBAR_DUMP_POWER").is_ok();
         let want_hunter = std::env::var("LUNARBAR_DUMP_HUNTER").is_ok();
         let want_toast = std::env::var("LUNARBAR_DUMP_TOAST").is_ok();
-        if want_menu || want_cal || want_power || want_hunter || want_toast {
+        // LUNARBAR_DUMP_TASK=n: the window menu, its n-th row lit, for a
+        // maximised window when LUNARBAR_DUMP_TASK_MAX is set.
+        let want_task: Option<usize> = std::env::var("LUNARBAR_DUMP_TASK").ok().and_then(|v| v.parse().ok());
+        if want_menu || want_cal || want_power || want_hunter || want_toast || want_task.is_some() {
             let mut cv = Canvas::new(w, full_h);
             // The compositor places the real thing; here the preview has to,
             // so it hangs the panel off the bottom bar the way the positioner
@@ -4441,7 +4405,11 @@ fn main() {
                 let py = (full_h as i32 - bh as i32 - POPUP_SHADOW - ph).max(POPUP_SHADOW);
                 (px, py, pw, ph)
             };
-            if want_power {
+            if let Some(sel) = want_task {
+                let win = taskmenu::Win { maximized: std::env::var("LUNARBAR_DUMP_TASK_MAX").is_ok(), ..Default::default() };
+                let (px, py, pw, _) = place(&PopupKind::TaskMenu { tid: 0, title: String::new(), win, sel }, true);
+                taskmenu::draw(&mut cv, px + 120, py, pw, 0, "foot · root@eclipse: ~", win, sel);
+            } else if want_power {
                 let k = PopupKind::PowerMenu;
                 let (px, py, pw, ph) = place(&k, false);
                 draw_power_menu(&mut cv, px, py, pw, ph);
