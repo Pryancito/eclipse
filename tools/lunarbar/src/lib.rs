@@ -25,6 +25,7 @@
 
 pub mod apps;
 pub mod clip;
+pub mod calc;
 pub mod draw;
 pub mod files;
 pub mod hunter;
@@ -49,6 +50,7 @@ pub mod open;
 pub mod par;
 pub mod preview;
 pub mod proc;
+pub mod runhist;
 pub mod sysinfo;
 pub mod vtext;
 pub mod wl;

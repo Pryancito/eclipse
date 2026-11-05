@@ -28,7 +28,10 @@
 use std::os::fd::AsFd;
 
 use lunarbar::apps::{norm_key, scan_apps};
+use lunarbar::calc;
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
+use lunarbar::files::now_secs;
+use lunarbar::runhist::History;
 use lunarbar::fill_guard;
 use lunarbar::i18n::Lang;
 use lunarbar::icons::IconCache;
@@ -172,6 +175,11 @@ enum Kind {
     App,
     /// "run what was typed", synthesised from the filter.
     Command,
+    /// A command typed at the prompt before and remembered: it comes back as
+    /// a row of its own, found like an application.
+    History,
+    /// The value of the sum in the field: Enter copies it.
+    Calc,
 }
 
 struct Item {
@@ -271,7 +279,7 @@ fn matches(items: &[Item], filter: &str) -> Vec<usize> {
     let mut head = Vec::new();
     let mut tail = Vec::new();
     for (i, it) in items.iter().enumerate() {
-        if it.kind == Kind::Command {
+        if matches!(it.kind, Kind::Command | Kind::Calc) {
             continue;
         }
         if it.name_key.starts_with(&f) {
@@ -282,6 +290,26 @@ fn matches(items: &[Item], filter: &str) -> Vec<usize> {
     }
     head.extend(tail);
     head
+}
+
+/// `hits` reordered by use: what was launched most, and most recently, first,
+/// within prefix matches and then within substring ones, so ranking by use
+/// never lifts a substring match above a prefix one. `scores` is per item.
+fn rank(items: &[Item], hits: &mut [usize], filter: &str, scores: &[f32]) {
+    let f = norm_key(filter);
+    let group = |i: usize| usize::from(!f.is_empty() && !items[i].name_key.starts_with(&f));
+    let score = |i: usize| scores.get(i).copied().unwrap_or(0.0);
+    hits.sort_by(|&a, &b| group(a).cmp(&group(b)).then(score(b).total_cmp(&score(a))));
+}
+
+/// The commands the history remembers that are not already an item (an
+/// application's own command is ranked, not repeated), and still run.
+fn history_items(hist: &History, items: &[Item]) -> Vec<Item> {
+    hist.uses
+        .iter()
+        .filter(|u| !items.iter().any(|it| it.exec == u.exec) && runnable(&u.exec))
+        .map(|u| Item::new(u.exec.clone(), u.exec.clone(), Some("system-run".into()), Kind::History))
+        .collect()
 }
 
 /// What the row shows on its right: the command's basename, with its arguments
@@ -416,6 +444,11 @@ struct State {
     hits: Vec<usize>,
     /// Synthetic "run this" item, rebuilt whenever the filter changes.
     typed: Option<Item>,
+    /// The value of the sum in the field, as the first row.
+    calc: Option<Item>,
+    /// What was launched before, and each item's rank by it.
+    hist: History,
+    scores: Vec<f32>,
     filter: String,
     sel: usize,
     top: usize,
@@ -435,12 +468,18 @@ struct State {
 }
 
 impl State {
-    /// Rows currently drawable: the matches, plus the typed command row.
+    /// Rows currently drawable: the sum's value, the matches, and the typed
+    /// command row.
     fn rows(&self) -> usize {
-        self.hits.len() + usize::from(self.typed.is_some())
+        usize::from(self.calc.is_some()) + self.hits.len() + usize::from(self.typed.is_some())
     }
 
     fn row_item(&self, row: usize) -> Option<&Item> {
+        let row = match (&self.calc, row) {
+            (Some(c), 0) => return Some(c),
+            (Some(_), r) => r - 1,
+            (None, r) => r,
+        };
         if row < self.hits.len() {
             self.items.get(self.hits[row])
         } else if row == self.hits.len() {
@@ -453,8 +492,15 @@ impl State {
     /// Recompute matches and the typed-command row after the filter changed.
     fn refilter(&mut self) {
         self.hits = matches(&self.items, &self.filter);
+        rank(&self.items, &mut self.hits, &self.filter, &self.scores);
         let f = self.filter.trim();
-        self.typed = if !f.is_empty() && runnable(f) {
+        self.calc = calc::answer(f, self.lang == Lang::Es).map(|v| {
+            // Only digits, a sign, a point or comma and an exponent reach
+            // here, so the single quotes cannot be broken out of.
+            Item::new(format!("= {v}"), format!("lunarclip --copy '{v}'"), None, Kind::Calc)
+        });
+        let remembered = self.items.iter().any(|it| it.kind == Kind::History && it.exec == f);
+        self.typed = if !f.is_empty() && !remembered && self.calc.is_none() && runnable(f) {
             Some(Item::new(
                 format!("{}: {f}", self.lang.run_command()),
                 f.to_string(),
@@ -469,6 +515,17 @@ impl State {
         self.hover = None;
     }
 
+    /// The index into `items` of drawable row `row`, or `usize::MAX` when it
+    /// is not an item (the sum, or the typed command).
+    fn item_index(&self, row: usize) -> usize {
+        let row = match (&self.calc, row) {
+            (Some(_), 0) => return usize::MAX,
+            (Some(_), r) => r - 1,
+            (None, r) => r,
+        };
+        self.hits.get(row).copied().unwrap_or(usize::MAX)
+    }
+
     fn move_sel(&mut self, delta: i32, step: Step) {
         let (sel, top) = move_selection(self.sel, self.top, self.rows(), delta, step, MAX_ROWS);
         self.sel = sel;
@@ -478,6 +535,10 @@ impl State {
     fn launch(&mut self, row: usize) {
         if let Some(it) = self.row_item(row) {
             let cmd = it.exec.clone();
+            if it.kind != Kind::Calc {
+                self.hist.record(&cmd, now_secs());
+                let _ = self.hist.save();
+            }
             spawn_detached(&cmd);
         }
         self.done = true;
@@ -862,8 +923,10 @@ fn draw_overlay(
                     for (x, y, w, h) in [(ix, iy, ICON, 1), (ix, iy + ICON - 1, ICON, 1), (ix, iy, 1, ICON), (ix + ICON - 1, iy, 1, ICON)] {
                         cv.fill_rect_a(x, y, w, h, p.border, 1.0);
                     }
-                    let up: String = if row >= st.hits.len() {
-                        "$".into() // the typed command, A's `$ Ejecutar orden`
+                    let up: String = if matches!(it.kind, Kind::Command | Kind::History) {
+                        "$".into() // a typed command, A's `$ Ejecutar orden`
+                    } else if it.kind == Kind::Calc {
+                        "=".into()
                     } else if is_terminal(&it.exec) {
                         ">".into()
                     } else {
@@ -875,6 +938,22 @@ fn draw_overlay(
         }
         let text_x = ix + ICON + 10;
         let ty = y + (ROW_H - 2 - GLYPH_H) / 2;
+        // Launched before: a gold mark at the row's edge, which is why it
+        // ranks where it does.
+        if st.scores.get(st.item_index(row)).is_some_and(|&s| s > 0.0) && !selected {
+            cv.fill_rect_a(fx + 2, y + (ROW_H - 2) / 2 - 2, 3, 4, TECNO_GOLD, 1.0);
+        }
+        if it.kind == Kind::Calc {
+            // The value, large in the row, and what Enter does with it.
+            cv.text_bold(&it.name, text_x, ty, if hud { TECNO_GOLD } else { p.accent });
+            let key = match st.lang {
+                Lang::Es => "Intro copia",
+                Lang::En => "Enter copies",
+            };
+            let key = if hud { key.to_uppercase() } else { key.to_string() };
+            cv.text(&key, fx + fw - Canvas::text_width(&key) - 12, ty, if selected { p.accent } else { p.dim });
+            continue;
+        }
         // Name on the left, command on the right in dim: KRunner's two-line
         // row does not fit a 15px bitmap font, one line does. Basename only —
         // a wrapped Terminal=true entry's full /usr/local/bin/... path says
@@ -1399,6 +1478,9 @@ fn new_state(toggle_desktop: bool) -> State {
         items,
         hits: Vec::new(),
         typed: None,
+        calc: None,
+        hist: History::default(),
+        scores: Vec::new(),
         filter: String::new(),
         sel: 0,
         top: 0,
@@ -1411,7 +1493,15 @@ fn new_state(toggle_desktop: bool) -> State {
         toplevels: Vec::new(),
         done: false,
     };
-    st.hits = matches(&st.items, "");
+    // Tests see no one's history but their own.
+    if !toggle_desktop && !cfg!(test) {
+        st.hist = History::load();
+    }
+    let extra = history_items(&st.hist, &st.items);
+    st.items.extend(extra);
+    let now = now_secs();
+    st.scores = st.items.iter().map(|it| st.hist.score(&it.exec, now)).collect();
+    st.refilter();
     st
 }
 
@@ -1575,6 +1665,57 @@ mod tests {
 
     fn item(name: &str, exec: &str) -> Item {
         Item::new(name.into(), exec.into(), None, Kind::App)
+    }
+
+    // ── what it remembers, and the sums ──────────────────────────────────────
+
+    #[test]
+    fn use_reorders_within_prefix_and_substring_matches_but_never_across() {
+        let items = vec![item("Gedit", "gedit"), item("Geany", "geany"), item("Vim edit", "vim")];
+        let mut hits = matches(&items, "ge");
+        // Vim is not a "ge" match at all; Geany, used, comes before Gedit.
+        rank(&items, &mut hits, "ge", &[0.0, 3.0, 0.0]);
+        assert_eq!(hits, [1, 0]);
+        // A used substring match stays under every prefix match.
+        let two = vec![item("Gedit", "gedit"), item("Editor", "ed")];
+        let mut hits = matches(&two, "edit");
+        rank(&two, &mut hits, "edit", &[9.0, 0.0]);
+        assert_eq!(hits, [1, 0]);
+        // With nothing typed, the most used is first of all.
+        let mut hits = matches(&items, "");
+        rank(&items, &mut hits, "", &[0.0, 1.0, 5.0]);
+        assert_eq!(hits, [2, 1, 0]);
+    }
+
+    #[test]
+    fn a_remembered_command_comes_back_once_and_an_app_is_not_repeated() {
+        let items = vec![item("Shell", "sh")];
+        let mut h = History::default();
+        h.record("sh", 10);
+        h.record("sh -c true", 10);
+        h.record("no-such-program-anywhere", 10);
+        let extra = history_items(&h, &items);
+        assert_eq!(extra.len(), 1, "an app's own command, and one that no longer runs, are not rows");
+        assert_eq!((extra[0].exec.as_str(), extra[0].kind), ("sh -c true", Kind::History));
+    }
+
+    #[test]
+    fn a_sum_answers_first_and_enter_copies_its_value() {
+        let mut st = new_state(false);
+        st.items = vec![item("Calculadora", "calc")];
+        st.scores = vec![0.0];
+        st.lang = Lang::Es;
+        st.filter = "3,5*2".into();
+        st.refilter();
+        let first = st.row_item(0).expect("a row");
+        assert_eq!((first.kind, first.name.as_str()), (Kind::Calc, "= 7"));
+        assert_eq!(first.exec, "lunarclip --copy '7'");
+        assert_eq!(st.item_index(0), usize::MAX, "the sum is no item to rank");
+        assert!(st.typed.is_none(), "a sum is not offered as a command too");
+        st.filter = "calc".into();
+        st.refilter();
+        assert!(st.calc.is_none());
+        assert_eq!(st.item_index(0), 0);
     }
 
     // ── the selection ────────────────────────────────────────────────────────
