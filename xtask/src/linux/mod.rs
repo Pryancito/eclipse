@@ -78,6 +78,8 @@ struct LunarTools {
     shot: PathBuf,
     /// The desktops overview, behind Super+Tab.
     desk: PathBuf,
+    /// The notification history, behind Super+N and the bar's AVISOS chip.
+    notes: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -216,15 +218,7 @@ impl LinuxRootfs {
                 let _ = dir::rm(bin.join("eclipse-sdl-probe"));
                 let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
             }
-            let (dbusd, portald) = self.eclipse_dbusd();
-            if dbusd.is_file() {
-                let _ = dir::rm(bin.join("eclipse-dbusd"));
-                let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
-            }
-            if portald.is_file() {
-                let _ = dir::rm(bin.join("eclipse-portald"));
-                let _ = fs::copy(&portald, bin.join("eclipse-portald"));
-            }
+            self.install_dbus_tools(&bin);
             self.install_thread_tests(&dir);
             // The desktop's own clients. They were copied only on a
             // from-scratch build, so an ordinary `make image` kept whatever
@@ -669,22 +663,7 @@ impl LinuxRootfs {
         // package mirror in reach still gets a session bus -- which is what
         // SDL_Init(), GtkApplication and every RequestName-based single-
         // instance check need before they will run at all.
-        let (dbusd, portald) = self.eclipse_dbusd();
-        if dbusd.is_file() {
-            let _ = dir::rm(bin.join("eclipse-dbusd"));
-            fs::copy(&dbusd, bin.join("eclipse-dbusd")).unwrap();
-        } else {
-            eprintln!("warning: eclipse-dbusd not built; the session bus needs the dbus package");
-        }
-
-        // eclipse-portald: the XDG desktop portal, so that an application
-        // whose "Open file" is a D-Bus call gets a dialog at all.
-        if portald.is_file() {
-            let _ = dir::rm(bin.join("eclipse-portald"));
-            fs::copy(&portald, bin.join("eclipse-portald")).unwrap();
-        } else {
-            eprintln!("warning: eclipse-portald not built; there will be no file-chooser portal");
-        }
+        self.install_dbus_tools(&bin);
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
         // `wavplay --tone` is the smoke test for HDMI audio on the RTX cards.
@@ -3376,6 +3355,7 @@ impl LinuxRootfs {
         )
         .unwrap();
         portal::write_wrapper(localbin);
+        portal::write_notify_wrapper(localbin);
 
         // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
         // refuses uid 0), and in that mode its main.c connects to the system
@@ -3531,6 +3511,7 @@ impl LinuxRootfs {
             lock: lunarlock,
             shot: lunarshot,
             desk: lunardesk,
+            notes: lunarnotes,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3617,6 +3598,14 @@ impl LinuxRootfs {
             fs::copy(&lunardesk, bin.join("lunardesk")).unwrap();
         } else {
             eprintln!("warning: lunardesk not built; Super+Tab does nothing");
+        }
+
+        // lunarnotes: the notification history (Super+N, the AVISOS chip).
+        if lunarnotes.is_file() {
+            let _ = dir::rm(bin.join("lunarnotes"));
+            fs::copy(&lunarnotes, bin.join("lunarnotes")).unwrap();
+        } else {
+            eprintln!("warning: lunarnotes not built; Super+N does nothing");
         }
     }
 
@@ -3744,6 +3733,7 @@ impl LinuxRootfs {
         let lock = out.join("lunarlock");
         let shot = out.join("lunarshot");
         let desk = out.join("lunardesk");
+        let notes = out.join("lunarnotes");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3772,6 +3762,7 @@ impl LinuxRootfs {
             &lock,
             &shot,
             &desk,
+            &notes,
         ]
         .iter()
         .map(|p| fs::metadata(p).ok()?.modified().ok())
@@ -3787,6 +3778,7 @@ impl LinuxRootfs {
                     lock,
                     shot,
                     desk,
+                    notes,
                 };
             }
         }
@@ -3823,6 +3815,7 @@ impl LinuxRootfs {
             lock,
             shot,
             desk,
+            notes,
         }
     }
 
@@ -4508,6 +4501,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         .unwrap();
 
         portal::write_service(svc_dir);
+        portal::write_notify_service(svc_dir);
 
         // D-Bus system bus, on libdbus's compiled-in default address. A second
         // bus, independent of the session one above; see eclipse-dbus-system

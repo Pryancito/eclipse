@@ -2341,6 +2341,9 @@ fn write_labwc_rc(rootfs: &Path) {
     <!-- Super+Tab: the desktops at a glance (lunardesk), each with its
          windows; pressed again, it closes. -->
     <keybind key="W-Tab"><action name="Execute"><command>lunardesk</command></action></keybind>
+    <!-- Super+N: the notifications that came in (lunarnotes); pressed
+         again, it closes. -->
+    <keybind key="W-N"><action name="Execute"><command>lunarnotes</command></action></keybind>
     <keybind key="A-Tab"><action name="NextWindow"/></keybind>
     <keybind key="A-S-Tab"><action name="PreviousWindow"/></keybind>
     <keybind key="W-Down"><action name="Iconify"/></keybind>

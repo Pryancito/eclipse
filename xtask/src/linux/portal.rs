@@ -24,7 +24,7 @@ impl LinuxRootfs {
     /// Cross-compile `tools/eclipse-dbusd` (Rust) as a static, non-PIE musl
     /// binary and return its path. Best-effort, like every other tool here: a
     /// failed build just means the image relies on Alpine's `dbus-daemon`.
-    pub(super) fn eclipse_dbusd(&self) -> (PathBuf, PathBuf) {
+    pub(super) fn eclipse_dbusd(&self) -> (PathBuf, PathBuf, PathBuf) {
         let dir = PROJECT_DIR.join("tools").join("eclipse-dbusd");
         let triple = self.musl_rust_triple();
         let out = dir.join("target").join(triple).join("release");
@@ -33,6 +33,9 @@ impl LinuxRootfs {
         // D-Bus, so it shares the marshaller and the client with the daemon
         // rather than carrying a copy.
         let portald = out.join("eclipse-portald");
+        // The notification server is the third: `org.freedesktop.Notifications`,
+        // shown as the bar's cards.
+        let notifyd = out.join("eclipse-notifyd");
         let newest_src = [
             "src/main.rs",
             "src/lib.rs",
@@ -40,7 +43,9 @@ impl LinuxRootfs {
             "src/message.rs",
             "src/client.rs",
             "src/portal.rs",
+            "src/notify.rs",
             "src/bin/eclipse-portald.rs",
+            "src/bin/eclipse-notifyd.rs",
             "Cargo.toml",
         ]
         .iter()
@@ -48,7 +53,7 @@ impl LinuxRootfs {
         .max();
         // BOTH have to be newer than the newest source: one missing or stale
         // is a rebuild, not a cache hit.
-        let oldest_bin = [&executable, &portald]
+        let oldest_bin = [&executable, &portald, &notifyd]
             .iter()
             .map(|b| fs::metadata(b).ok()?.modified().ok())
             .collect::<Option<Vec<_>>>()
@@ -57,8 +62,9 @@ impl LinuxRootfs {
             if bin_mtime >= src_mtime
                 && self.cached_for_target(&executable)
                 && self.cached_for_target(&portald)
+                && self.cached_for_target(&notifyd)
             {
-                return (executable, portald);
+                return (executable, portald, notifyd);
             }
         }
 
@@ -83,7 +89,43 @@ impl LinuxRootfs {
         if !status.success() {
             eprintln!("warning: eclipse-dbusd build failed; only dbus-daemon can serve the bus");
         }
-        (executable, portald)
+        (executable, portald, notifyd)
+    }
+}
+
+impl LinuxRootfs {
+    /// Build `tools/eclipse-dbusd` and copy its three binaries into `bin`:
+    /// the session bus, the file-chooser portal and the notification server.
+    /// A missing one is said and skipped: each has a fallback or a wrapper
+    /// that explains itself at boot.
+    pub(super) fn install_dbus_tools(&self, bin: &Path) {
+        let (dbusd, portald, notifyd) = self.eclipse_dbusd();
+        for (built, name, missing) in [
+            (
+                dbusd,
+                "eclipse-dbusd",
+                "the session bus needs the dbus package",
+            ),
+            (
+                portald,
+                "eclipse-portald",
+                "there will be no file-chooser portal",
+            ),
+            (
+                notifyd,
+                "eclipse-notifyd",
+                "programs' notifications go nowhere",
+            ),
+        ] {
+            if !built.is_file() {
+                eprintln!("warning: {name} not built; {missing}");
+                continue;
+            }
+            let _ = os_xtask_utils::dir::rm(bin.join(name));
+            if let Err(e) = fs::copy(&built, bin.join(name)) {
+                eprintln!("warning: {name}: {e}");
+            }
+        }
     }
 }
 
@@ -129,6 +171,53 @@ pub fn write_wrapper(localbin: &Path) {
           echo \"$MSG\" >&2\n\
           sleep 60\n\
           exit 127\n",
+    )
+    .unwrap();
+}
+
+/// `/usr/local/bin/eclipse-notify`.
+pub fn write_notify_wrapper(localbin: &Path) {
+    // The notification server, in the foreground so eclipse-init supervises
+    // it. Wherever the image put the binary; it stands aside by itself when
+    // another server (mako, dunst) already owns the name.
+    fs::write(
+        localbin.join("eclipse-notify"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: notification server for eclipse-init.\n\
+          : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
+          : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}\"\n\
+          export DBUS_SESSION_BUS_ADDRESS\n\
+          for d in /usr/local/bin /usr/bin /bin; do\n\
+          \x20 if [ -x \"$d/eclipse-notifyd\" ]; then\n\
+          \x20 \x20 echo \"eclipse-notify: $d/eclipse-notifyd on $DBUS_SESSION_BUS_ADDRESS\" > /dev/console 2>/dev/null\n\
+          \x20 \x20 exec \"$d/eclipse-notifyd\"\n\
+          \x20 fi\n\
+          done\n\
+          MSG='eclipse-notify: no eclipse-notifyd -- programs that send\n\
+          notifications get no answer. Rebuild the image so\n\
+          /usr/local/bin/eclipse-notifyd is installed.'\n\
+          echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          echo \"$MSG\" >&2\n\
+          sleep 60\n\
+          exit 127\n",
+    )
+    .unwrap();
+}
+
+/// `/etc/eclipse/services/notify.service`.
+pub fn write_notify_service(svc_dir: &Path) {
+    // Like the portal: nothing without the bus, so `requires = dbus` and
+    // `wait_socket`. Not tied to labwc: the cards are the bar's, but a program
+    // that notifies under any session should get its answer rather than a
+    // D-Bus error.
+    fs::write(
+        svc_dir.join("notify.service"),
+        b"# Notification server (org.freedesktop.Notifications). See /usr/local/bin/eclipse-notify.\n\
+          exec = /usr/local/bin/eclipse-notify\n\
+          type = respawn\n\
+          requires = dbus\n\
+          wait_socket = /run/user/0/bus\n\
+          log = /tmp/notify.log\n",
     )
     .unwrap();
 }
@@ -239,6 +328,34 @@ mod tests {
         assert!(src.contains("log = "), "{src}");
         // NOT tied to one session: an Xorg session wants a portal too.
         assert!(!src.contains("desktop = "), "{src}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_notification_server_starts_after_the_bus_in_the_foreground() {
+        let dir = scratch("notify");
+        write_notify_wrapper(&dir);
+        write_notify_service(&dir);
+        let path = dir.join("eclipse-notify");
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rechazo eclipse-notify");
+        assert_eq!(src.matches("exec \"").count(), 1, "{src}");
+        assert!(!src.contains(" &\n"), "nada en segundo plano bajo init");
+        assert!(src.contains("> /dev/console"), "{src}");
+        let svc = fs::read_to_string(dir.join("notify.service")).unwrap();
+        assert!(
+            svc.contains("exec = /usr/local/bin/eclipse-notify\n"),
+            "{svc}"
+        );
+        assert!(svc.contains("requires = dbus"), "{svc}");
+        assert!(svc.contains("wait_socket = /run/user/0/bus"), "{svc}");
+        assert!(svc.contains("type = respawn"), "{svc}");
         let _ = fs::remove_dir_all(&dir);
     }
 

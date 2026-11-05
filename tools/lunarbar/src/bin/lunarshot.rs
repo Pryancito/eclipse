@@ -227,6 +227,7 @@ fn announce(path: &Path, w: u32, h: u32, lang: Lang) {
         Lang::En => ("Screenshot saved", "Open folder", format!("{w} × {h} · copied to the clipboard")),
     };
     let alert = Alert {
+        app: String::new(),
         severity: Severity::Info,
         title: title.into(),
         body: format!("{}\n{size}", path.display()),
