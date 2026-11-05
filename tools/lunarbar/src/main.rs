@@ -3894,11 +3894,15 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                     }
                 }
             }
-            E::Done => state.render_task_bars(),
+            E::Done => {
+                state.track_desktops();
+                state.render_task_bars();
+            }
             E::Closed => {
                 handle.destroy();
                 let tid = id.protocol_id();
                 state.toplevels.retain(|t| t.handle.id() != id);
+                state.track_desktops();
                 // The window is gone: drop any tooltip or context menu bound
                 // to it. Leaving the menu up would strand it on a dead title,
                 // and since the compositor recycles object ids, a later window

@@ -28,6 +28,10 @@ pub(crate) struct Ws {
 pub(crate) struct Workspaces {
     pub(crate) mgr: Option<ExtWorkspaceManagerV1>,
     list: Vec<Ws>,
+    /// Which desktop (chip order) each window is on, by its protocol id.
+    desk: Vec<(u32, usize)>,
+    /// What was last written to [`DESKTOPS_FILE`], to skip identical writes.
+    written: String,
 }
 
 impl Workspaces {
@@ -51,6 +55,71 @@ impl Workspaces {
         let (Some(mgr), Some(&i)) = (&self.mgr, self.order().get(n)) else { return };
         self.list[i].handle.activate();
         mgr.commit();
+    }
+}
+
+/// Where the bar tells `lunardesk` (Super+Tab) which window is on which
+/// desktop, under `$XDG_RUNTIME_DIR`: neither wlr-foreign-toplevel nor
+/// ext-workspace says it, so the bar, which watches both all session long,
+/// keeps the answer. One `desktop<TAB>app_id<TAB>title` line per window.
+pub const DESKTOPS_FILE: &str = "lunar/desktops";
+
+/// The desktop a window is on, by what has been seen of it: a window that
+/// is active is on the current desktop (labwc focuses only windows there),
+/// and a window seen for the first time opened there. Otherwise it stays
+/// where it was last seen.
+pub(crate) fn place(known: Option<usize>, activated: bool, current: usize) -> usize {
+    match known {
+        Some(d) if !activated => d,
+        _ => current,
+    }
+}
+
+/// The file's text for `(desktop, app_id, title)` rows. Tabs and newlines in
+/// a title would break the line, so they become spaces.
+pub(crate) fn desktops_text(rows: &[(usize, &str, &str)]) -> String {
+    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    rows.iter().map(|(d, a, t)| format!("{d}\t{}\t{}\n", clean(a), clean(t))).collect()
+}
+
+impl State {
+    pub(crate) fn track_desktops(&mut self) {
+        self.track_desktops_with(true);
+    }
+
+    /// Bring the window-to-desktop map up to date and publish it.
+    /// `follow_active` is false right after a desktop switch, when the
+    /// window that was active a moment ago may still say so.
+    pub(crate) fn track_desktops_with(&mut self, follow_active: bool) {
+        let Some(current) = self.ws.order().iter().position(|&i| self.ws.list[i].active) else {
+            return;
+        };
+        let mut desk = Vec::with_capacity(self.toplevels.len());
+        for t in &self.toplevels {
+            let id = t.handle.id().protocol_id();
+            let known = self.ws.desk.iter().find(|(i, _)| *i == id).map(|(_, d)| *d);
+            desk.push((id, place(known, follow_active && t.activated, current)));
+        }
+        self.ws.desk = desk;
+        let rows: Vec<(usize, &str, &str)> = self
+            .toplevels
+            .iter()
+            .zip(&self.ws.desk)
+            .map(|(t, (_, d))| (*d, t.app_id.as_str(), t.title.as_str()))
+            .collect();
+        let text = desktops_text(&rows);
+        if text == self.ws.written {
+            return;
+        }
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/0".into());
+        let path = std::path::Path::new(&dir).join(DESKTOPS_FILE);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+            self.ws.written = text;
+        }
     }
 }
 
@@ -89,7 +158,10 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for State {
                     hidden: false,
                 });
             }
-            ext_workspace_manager_v1::Event::Done => state.render_task_bars(),
+            ext_workspace_manager_v1::Event::Done => {
+                state.track_desktops_with(false);
+                state.render_task_bars();
+            }
             ext_workspace_manager_v1::Event::Finished => {
                 state.ws = Workspaces::default();
                 state.render_task_bars();
@@ -162,6 +234,14 @@ mod tests {
         // No coordinates at all: announcement order.
         let flat = [k(false, &[]), k(false, &[])];
         assert_eq!(ordered(&flat), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_window_is_where_it_was_last_active_or_where_it_opened() {
+        assert_eq!(place(None, false, 2), 2, "a new window opened on the current desktop");
+        assert_eq!(place(Some(0), false, 2), 0, "an idle window stays where it was");
+        assert_eq!(place(Some(0), true, 2), 2, "an active one is on the current desktop");
+        assert_eq!(desktops_text(&[(1, "foot", "a\tb\nc")]), "1\tfoot\ta b c\n");
     }
 
     #[test]
