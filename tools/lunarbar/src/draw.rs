@@ -5,17 +5,18 @@
 //!   pills, the ◑/☾ launcher discs (vector paths + mask, no hand-rolled
 //!   coverage math), the ▼/▲ triangles, and the load gauges — which get a
 //!   green→amber→red linear gradient for free.
-//! - **embedded-graphics** supplies the text: mature ISO-8859-1 bitmap fonts
-//!   (FONT_9X15 + real bold), so lowercase, accents and eñes in window titles
-//!   render properly. tiny-skia has no text support; e-g has no AA shapes —
-//!   together they cover each other's blind spot.
+//! - **text** is DejaVu Sans Mono's outlines filled by tiny-skia, anti-aliased
+//!   and fitted to the bitmap faces' cells (see [`crate::vtext`]). The
+//!   **embedded-graphics** ISO-8859-1 bitmap fonts (FONT_9X15 + real bold)
+//!   are the fallback: for a machine without the face, `LUNAR_TEXT=bitmap`,
+//!   and any character the face has no outline for.
 //!
 //! `Canvas` owns an RGBA tiny-skia `Pixmap`; bars draw into it and then
 //! `blit_xrgb` swizzles the finished frame into the wl_shm XRGB8888 buffer.
 
 use embedded_graphics::{
     mono_font::{
-        iso_8859_1::{FONT_9X15, FONT_9X15_BOLD},
+        iso_8859_1::{FONT_10X20, FONT_9X15, FONT_9X15_BOLD},
         MonoTextStyle,
     },
     pixelcolor::Rgb888,
@@ -27,12 +28,28 @@ use tiny_skia::{
     PixmapPaint, Rect, SpreadMode, Stroke, Transform,
 };
 
+use crate::vtext::{Cell, Glyph, Weight};
+
 pub type Rgb = (u8, u8, u8);
+
+/// One shape of a [`Canvas::line_icon`] pictogram, on its 12-unit grid.
+#[derive(Clone, Copy, Debug)]
+pub enum Ink {
+    /// An open polyline (repeat the first point to close it).
+    Line(&'static [(f32, f32)]),
+    /// An ellipse in the box x, y, w, h.
+    Oval(f32, f32, f32, f32),
+    /// A filled dot.
+    Dot(f32, f32),
+}
 
 /// Glyph cell height of the bar font (FONT_9X15).
 pub const GLYPH_H: i32 = 15;
 /// Glyph advance (cell width) of the bar font.
 pub const GLYPH_W: i32 = 9;
+/// Cell of the readout font (FONT_10X20), for the tecno clock.
+pub const BIG_H: i32 = 20;
+pub const BIG_W: i32 = 10;
 
 /// Cubic-Bézier circle constant (approximates a 90° arc).
 const K: f32 = 0.552_284_8;
@@ -49,6 +66,9 @@ fn color(c: Rgb, a: f32) -> Color {
 /// (embedded-graphics), blitted to XRGB8888 when the frame is complete.
 pub struct Canvas {
     pix: Pixmap,
+    /// Every rounded rect drawn square: how a whole app takes the tecno
+    /// look's straight plates without touching each call site.
+    square: bool,
 }
 
 impl Canvas {
@@ -56,7 +76,7 @@ impl Canvas {
     /// (`panic = "abort"` in release).
     pub fn try_new(w: usize, h: usize) -> Option<Self> {
         let pix = Pixmap::new(w.max(1) as u32, h.max(1) as u32)?;
-        Some(Self { pix })
+        Some(Self { pix, square: false })
     }
 
     pub fn new(w: usize, h: usize) -> Self {
@@ -110,7 +130,13 @@ impl Canvas {
     /// A filled rounded rectangle, corner radius `rad`. Used for the clock and
     /// date pills and the active taskbar button, matching waybar's
     /// `border-radius: 6px` — now genuinely round thanks to tiny-skia's AA.
+    /// See [`Canvas::square`]. Off by default.
+    pub fn set_square(&mut self, on: bool) {
+        self.square = on;
+    }
+
     pub fn round_rect(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb) {
+        let rad = if self.square { 0 } else { rad };
         if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
             self.fill(&p, c, 1.0);
         }
@@ -279,6 +305,46 @@ impl Canvas {
         }
     }
 
+    /// A hairline pictogram drawn from `ops` on a 12-unit grid, fitted into
+    /// the `s`-pixel square at `x`,`y` inside a margin of `s / 6`. One stroke
+    /// width for every shape, so a set of these reads as one family.
+    pub fn line_icon(&mut self, x: i32, y: i32, s: i32, ops: &[Ink], c: Rgb) {
+        let m = s as f32 / 6.0;
+        let k = (s as f32 - 2.0 * m) / 12.0;
+        let (ox, oy) = (x as f32 + m, y as f32 + m);
+        let pt = |(px, py): (f32, f32)| (ox + px * k, oy + py * k);
+        let stroke = Stroke { width: 1.25, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() };
+        let paint = Self::paint(c, 1.0);
+        for op in ops {
+            let mut pb = PathBuilder::new();
+            match *op {
+                Ink::Line(pts) => {
+                    for (i, &p) in pts.iter().enumerate() {
+                        let (px, py) = pt(p);
+                        if i == 0 { pb.move_to(px, py) } else { pb.line_to(px, py) }
+                    }
+                }
+                Ink::Oval(ax, ay, w, h) => {
+                    let (px, py) = pt((ax, ay));
+                    if let Some(r) = Rect::from_xywh(px, py, w * k, h * k) {
+                        pb.push_oval(r);
+                    }
+                }
+                Ink::Dot(cx, cy) => {
+                    let (px, py) = pt((cx, cy));
+                    pb.push_circle(px, py, 1.1 * k.max(1.0));
+                    if let Some(p) = pb.finish() {
+                        self.pix.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                    continue;
+                }
+            }
+            if let Some(p) = pb.finish() {
+                self.pix.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+    }
+
     /// Vector power symbol (⏻): circle arc + top vertical line in white.
     pub fn power_icon(&mut self, x: i32, y: i32, s: i32, c: Rgb) {
         let (x, y, s) = (x as f32, y as f32, s as f32);
@@ -422,9 +488,50 @@ impl Canvas {
         }
     }
 
+    /// `s` from the vector face, one glyph per cell (see [`crate::vtext`]).
+    /// A character the face cannot draw is drawn from the bitmap face in its
+    /// cell, so a string never loses a letter. Returns the advance.
+    #[allow(clippy::too_many_arguments)]
+    fn vector_text(&mut self, s: &str, x: i32, y: i32, c: Rgb, weight: Weight, cell: Cell) -> i32 {
+        let cw = cell.width() as i32;
+        let paint = Self::paint(c, 1.0);
+        let mut n = 0;
+        for ch in s.chars() {
+            let cx = x + n * cw;
+            match crate::vtext::glyph(ch, weight, cell) {
+                Glyph::Ink(path) => {
+                    self.pix.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::from_translate(cx as f32, y as f32),
+                        None,
+                    );
+                }
+                Glyph::Blank => {}
+                Glyph::Missing => {
+                    let font = match (cell, weight) {
+                        (Cell::Big, _) => &FONT_10X20,
+                        (Cell::Text, Weight::Bold) => &FONT_9X15_BOLD,
+                        (Cell::Text, Weight::Regular) => &FONT_9X15,
+                    };
+                    let style = MonoTextStyle::new(font, Rgb888::new(c.0, c.1, c.2));
+                    let mut buf = [0u8; 4];
+                    let _ = Text::with_baseline(ch.encode_utf8(&mut buf), Point::new(cx, y), style, Baseline::Top)
+                        .draw(self);
+                }
+            }
+            n += 1;
+        }
+        n * cw
+    }
+
     /// Draw a left-aligned string (FONT_9X15, transparent background) with its
     /// cell top at `y`. Returns the advance in pixels.
     pub fn text(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            return self.vector_text(s, x, y, c, Weight::Regular, Cell::Text);
+        }
         let style = MonoTextStyle::new(&FONT_9X15, Rgb888::new(c.0, c.1, c.2));
         Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
             .draw(self)
@@ -435,11 +542,52 @@ impl Canvas {
     /// Bold variant of `text` (FONT_9X15_BOLD, same metrics). Matches waybar's
     /// `font-weight: bold` clock.
     pub fn text_bold(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            return self.vector_text(s, x, y, c, Weight::Bold, Cell::Text);
+        }
         let style = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb888::new(c.0, c.1, c.2));
         Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
             .draw(self)
             .map(|end| end.x - x)
             .unwrap_or(0)
+    }
+
+    /// The readout face: FONT_10X20 struck twice, one pixel apart, since it
+    /// has no bold cut. Returns the advance, the extra pixel included.
+    pub fn text_big(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            // The vector face has a real bold cut: no double strike.
+            self.vector_text(s, x, y, c, Weight::Bold, Cell::Big);
+            return Self::big_width(s);
+        }
+        let style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(c.0, c.1, c.2));
+        for dx in [0, 1] {
+            let _ = Text::with_baseline(s, Point::new(x + dx, y), style, Baseline::Top).draw(self);
+        }
+        Self::big_width(s)
+    }
+
+    pub fn big_width(s: &str) -> i32 {
+        s.chars().count() as i32 * BIG_W + 1
+    }
+
+    /// Mockup A's framed glyph box: a square well with a hairline edge and
+    /// one bold character centred in it (the launcher's `>`, `$`, initials).
+    pub fn glyph_box(&mut self, x: i32, y: i32, s: i32, ch: &str, well: Rgb, edge: Rgb, fg: Rgb) {
+        self.fill_rect_a(x, y, s, s, well, 1.0);
+        for (rx, ry, rw, rh) in [(x, y, s, 1), (x, y + s - 1, s, 1), (x, y, 1, s), (x + s - 1, y, 1, s)] {
+            self.fill_rect_a(rx, ry, rw, rh, edge, 1.0);
+        }
+        self.text_bold(ch, x + (s - GLYPH_W) / 2 + 1, y + (s - GLYPH_H) / 2, fg);
+    }
+
+    /// The tecno task marker: a hairline square with a lit core (A's `▣`).
+    pub fn task_square(&mut self, x: i32, y: i32, s: i32, edge: Rgb, core: Rgb) {
+        self.fill_rect_a(x, y, s, 1, edge, 1.0);
+        self.fill_rect_a(x, y + s - 1, s, 1, edge, 1.0);
+        self.fill_rect_a(x, y, 1, s, edge, 1.0);
+        self.fill_rect_a(x + s - 1, y, 1, s, edge, 1.0);
+        self.fill_rect_a(x + 3, y + 3, s - 6, s - 6, core, 1.0);
     }
 
     /// Pixel width a string will occupy (monospace: chars × cell width).
@@ -679,6 +827,30 @@ impl Canvas {
         true
     }
 
+    /// Fade the whole canvas to opacity `k` and slide it `dy` pixels down
+    /// (up when negative), leaving clear rows behind: one frame of a popup's
+    /// entrance. The canvas is premultiplied, so every channel scales.
+    pub fn fade(&mut self, k: f32, dy: i32) {
+        let w = self.pix.width() as usize * 4;
+        let h = self.pix.height() as usize;
+        let k = (k.clamp(0.0, 1.0) * 256.0) as u32;
+        let data = self.pix.data_mut();
+        for b in data.iter_mut() {
+            *b = ((*b as u32 * k) >> 8) as u8;
+        }
+        let d = (dy.unsigned_abs() as usize).min(h);
+        if d == 0 {
+            return;
+        }
+        if dy > 0 {
+            data.copy_within(0..(h - d) * w, d * w);
+            data[..d * w].fill(0);
+        } else {
+            data.copy_within(d * w.., 0);
+            data[(h - d) * w..].fill(0);
+        }
+    }
+
     /// Draw a filled path at the given RGB with explicit alpha — for the
     /// menu's translucent scrim and hover highlights.
     pub fn fill_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, c: Rgb, a: f32) {
@@ -711,6 +883,7 @@ impl Canvas {
 
     /// Filled rounded rect with explicit alpha.
     pub fn round_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb, a: f32) {
+        let rad = if self.square { 0 } else { rad };
         if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
             self.fill(&p, c, a);
         }
@@ -1053,6 +1226,22 @@ mod tests {
         let mut scaled = vec![0u8; 8 * 8 * 4 - 1];
         assert!(!cv.blit_argb_scaled(&mut scaled, 2));
         assert!(!cv.blit_xrgb_scaled(&mut scaled, 2));
+    }
+
+    /// A fade scales every premultiplied channel and a slide leaves clear rows.
+    #[test]
+    fn fade_dims_and_slides() {
+        let mut cv = Canvas::try_new(2, 4).unwrap();
+        cv.fill_rect_a(0, 0, 2, 1, (255, 255, 255), 1.0);
+        cv.fade(0.5, 2);
+        let mut buf = vec![0u8; 2 * 4 * 4];
+        assert!(cv.blit_argb(&mut buf));
+        assert_eq!(px(&buf, 2, 0, 0), (0, 0, 0, 0), "the top rows are cleared");
+        let (_, _, _, a) = px(&buf, 2, 0, 2);
+        assert!((a as i32 - 128).abs() <= 2, "the row moved down two and halved: {a}");
+        cv.fade(1.0, -2);
+        assert!(cv.blit_argb(&mut buf));
+        assert!(px(&buf, 2, 0, 0).3 > 100, "and back up");
     }
 
     /// Scale 0 would divide by zero in the nearest-neighbour walk.

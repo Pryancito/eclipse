@@ -26,17 +26,17 @@ pub(super) struct Menu {
 }
 
 const PW: i32 = 380;
-const PAD: i32 = 14;
-const HEAD_H: i32 = 34;
+const PAD: i32 = 12;
+const HEAD_H: i32 = 32;
 const COUNT_H: i32 = 24;
-const ROW_H: i32 = 26;
+const ROW_H: i32 = 28;
 /// Six domains plus learning.
 const ROWS: i32 = hunter::DOMAINS.len() as i32 + 1;
 /// Wide enough for the longest mode name ("enforce", "bloqueo": 7 glyphs).
-const SEG_W: i32 = 74;
-const EVENT_H: i32 = 18;
+const SEG_W: i32 = 76;
+const EVENT_H: i32 = 20;
 /// The removable-media line, under the switches.
-const MEDIA_H: i32 = 22;
+const MEDIA_H: i32 = 24;
 const MSG_H: i32 = 20;
 const BTN_H: i32 = 28;
 
@@ -69,7 +69,11 @@ pub(super) fn draw_badge(
     shield: Shield,
 ) -> (i32, i32) {
     let size = 14;
-    let w = size + 16;
+    // tecno writes the name beside the shield, as the mockup's tray does,
+    // and paints a guarded shield in the "all clear" green.
+    let label = if tecno() { "HUNTER" } else { "" };
+    let lw = if label.is_empty() { 0 } else { Canvas::text_width(label) + 6 };
+    let w = size + 16 + lw;
     if *rx - w < left_min {
         return (0, 0);
     }
@@ -83,10 +87,14 @@ pub(super) fn draw_badge(
     let (col, solid) = match shield {
         Shield::Alert => (pal().warn, true),
         Shield::Open => (pal().dim, false),
+        Shield::Guarded if tecno() => (TECNO_OK, true),
         Shield::Guarded => (pal().accent, true),
     };
+    if lw > 0 {
+        cv.text(label, *rx + 8 + size + 6, btn_y + (btn_h - GLYPH_H) / 2, col);
+    }
     cv.shield_icon(
-        *rx + (w - size) / 2,
+        *rx + 8, // (w - lw - size) / 2: the 8px pad either side of it
         btn_y + (btn_h - size) / 2,
         size,
         col,
@@ -96,6 +104,9 @@ pub(super) fn draw_badge(
     *rx -= 10;
     hit
 }
+
+/// tecno's "all clear" green: a guarded shield and its label.
+const TECNO_OK: Rgb = (0x6e, 0xe7, 0xa8);
 
 /// The x of segment `i` (0..3) of a row in a panel at `px`.
 fn seg_x(px: i32, i: usize) -> i32 {
@@ -131,14 +142,23 @@ fn segments(
         let x = seg_x(px, first + i) + 2;
         let w = SEG_W - 4;
         let ok = enabled(i);
-        let (bg, a, fg) = if i == on {
+        let (bg, a, fg) = if i == on && tecno() {
+            // A lights a choice, it does not flood it: the selected plate
+            // with a cyan hairline and cyan text.
+            plate(cv, x, sy, w, sh, 0, pal().accent);
+            (pal().btn_active, 1.0, pal().accent)
+        } else if i == on {
             (pal().accent, 1.0, pal().bar_bg)
         } else if ok {
             (pal().pill, 1.0, pal().muted)
         } else {
             (pal().pill, 0.4, pal().dim)
         };
-        plate_a(cv, x, sy, w, sh, 5, bg, a);
+        if i == on && tecno() {
+            plate_a(cv, x + 1, sy + 1, w - 2, sh - 2, 0, bg, a);
+        } else {
+            plate_a(cv, x, sy, w, sh, 5, bg, a);
+        }
         let label = fit(label, w - 4);
         let tx = x + (w - Canvas::text_width(&label)) / 2;
         cv.text(&label, tx, sy + (sh - GLYPH_H) / 2, fg);
@@ -616,11 +636,14 @@ mod tests {
             (0, 0)
         );
         assert_eq!(rx, 40);
-        let mut rx = 90;
+        // tecno writes HUNTER beside the shield, so its badge is wider.
+        let w = 30 + if tecno() { Canvas::text_width("HUNTER") + 6 } else { 0 };
+        let mut cv = Canvas::new(200, 30);
+        let mut rx = 190;
         assert_eq!(
             draw_badge(&mut cv, &mut rx, 30, 3, 24, false, Shield::Alert),
-            (60, 90)
+            (190 - w, 190)
         );
-        assert_eq!(rx, 50);
+        assert_eq!(rx, 190 - w - 10);
     }
 }

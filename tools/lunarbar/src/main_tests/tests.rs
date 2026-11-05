@@ -12,17 +12,18 @@ fn apps(n: usize) -> PopupKind {
             })
             .collect(),
         filter: String::new(),
-        visible: (0..n).collect(),
+        visible: (0..n).map(Row::App).collect(),
+        cat: None,
         sel: 0,
         scroll: 0,
     }
 }
 
 const KINDS: [fn() -> PopupKind; 4] = [
-    || PopupKind::Calendar { year: 2026, month: 8 },
-    || PopupKind::PowerMenu,
-    || PopupKind::TaskMenu { tid: 1, title: String::new() },
-    || PopupKind::Volume { level: 50 },
+    || PopupKind::Calendar { year: 2026, month: 8, hover: None },
+    || PopupKind::PowerMenu { sel: 0, armed: None },
+    || PopupKind::TaskMenu { tid: 1, title: String::new(), win: taskmenu::Win::default(), sel: 0 },
+    || PopupKind::Volume { level: 50, muted: false, devices: Vec::new() },
 ];
 
 /// The panel is sized from the result list, and the scroll clamp, the
@@ -121,8 +122,10 @@ fn the_panel_draws_a_shadow_that_fades_outward() {
     assert!(cv.blit_argb(&mut buf));
     let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
 
-    // Inside the panel: effectively opaque.
-    assert!(alpha(px + pw / 2, py + ph / 2) > 240);
+    // Inside the panel: effectively opaque, or in tecno the glass the
+    // effects ask for (fx::GLASS) -- see-through, but still a panel.
+    let floor = if tecno() && fx::on() { (fx::GLASS * 255.0) as u8 } else { 240 };
+    assert!(alpha(px + pw / 2, py + ph / 2) > floor);
     // Just outside its left edge: the shadow's dark core.
     let near = alpha(px - 2, py + ph / 2);
     // Out at the margin: still shadow, but faint.
@@ -302,12 +305,14 @@ fn the_calendar_panel_holds_seven_columns_and_six_rows() {
         &PopupKind::Calendar {
             year: 2021,
             month: 0,
+            hover: None,
         },
         1080,
         34,
     );
-    assert_eq!(pw, 7 * CAL_CELL_W + 2 * CAL_PAD);
-    assert_eq!(ph, CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD);
+    assert_eq!((pw, ph), calmenu::size());
+    assert_eq!(pw, calmenu::WEEK_W + 7 * CAL_CELL_W + 2 * CAL_PAD);
+    assert_eq!(ph, CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD + calmenu::FOOT_H);
     // Six rows is the most any month needs, and every month there is
     // needs no more: the grid is drawn at a fixed six, so the panel
     // height does not change as the user walks through the months.
@@ -387,7 +392,7 @@ type Hits = Vec<(i32, i32, i32, i32, Action)>;
 /// empty and the 31st lands in the last column of the fifth row -- a month
 /// that pins the row, the column and both ends of the range at once.
 fn cal_cells(year: i32, month: u32) -> (Vec<Vec<Ink>>, Hits) {
-    let kind = PopupKind::Calendar { year, month };
+    let kind = PopupKind::Calendar { year, month, hover: None };
     let (pw, ph) = popup_size(&kind, 1080, 34);
     let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
     let (w, h) = (
@@ -409,7 +414,7 @@ fn cal_cells(year: i32, month: u32) -> (Vec<Vec<Ink>>, Hits) {
     for row in 0..6 {
         let mut cols = Vec::new();
         for col in 0..7 {
-            let x0 = px + CAL_PAD + col * CAL_CELL_W;
+            let x0 = calmenu::grid_x(px) + col * CAL_CELL_W;
             let y0 = gy + row * CAL_CELL_H;
             let mut ink: Ink = Vec::new();
             for y in (y0 + 3)..(y0 + CAL_CELL_H - 3) {
@@ -462,8 +467,17 @@ fn the_weekend_columns_are_drawn_dimmer_than_the_weekdays() {
     let saturday = &cells[0][5];
     let sunday = &cells[0][6];
     assert!(!friday.is_empty() && !saturday.is_empty() && !sunday.is_empty());
-    assert_ne!(friday, saturday, "Saturday is drawn as a weekday");
-    assert_eq!(saturday, sunday, "the two weekend days differ");
+    // Compared by the full-strength ink of each cell, not by every colour in
+    // it: anti-aliased digits leave a different set of edge blends for a 2
+    // than for a 3 even when both are drawn in one colour. Every look is
+    // dark, so the full-strength ink is the brightest.
+    let core = |ink: &Ink| {
+        *ink.iter()
+            .max_by_key(|c| c.iter().map(|&v| v as u32).sum::<u32>())
+            .unwrap()
+    };
+    assert_ne!(core(friday), core(saturday), "Saturday is drawn as a weekday");
+    assert_eq!(core(saturday), core(sunday), "the two weekend days differ");
 }
 
 /// The month is named in full over the grid. The short form is the date
@@ -472,7 +486,7 @@ fn the_weekend_columns_are_drawn_dimmer_than_the_weekdays() {
 #[test]
 fn the_calendar_names_its_month_in_full() {
     let (year, month) = (2021, 0);
-    let kind = PopupKind::Calendar { year, month };
+    let kind = PopupKind::Calendar { year, month, hover: None };
     let (pw, ph) = popup_size(&kind, 1080, 34);
     let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
     let (w, h) = (
@@ -504,8 +518,11 @@ fn the_calendar_names_its_month_in_full() {
     );
     let want = Canvas::text_width(&title);
     assert!(hi > lo, "nothing written over the grid");
+    // Ink, not cells: the first and last glyph leave a few blank columns,
+    // more for capitals (tecno writes the month in caps). Under a cell either
+    // way, and the short form is three whole cells narrower.
     assert!(
-        (hi - lo + 1 - want).abs() <= 2,
+        (hi - lo + 1 - want).abs() < GLYPH_W,
         "{}px of title where {want}px was expected",
         hi - lo + 1
     );

@@ -23,8 +23,11 @@ use std::{fs, path::Path};
 /// D-Bus, no Qt, no KF6):
 ///   * the labwc window theme, by rewriting `<name>` in `rc.xml` in place;
 ///   * the foot palette, by copying `foot.kde.ini` / `foot.eclipse.ini`;
-///   * the panel, which reads `/etc/eclipse/look` itself on start -- so the
-///     switch restarts lunarbar (eclipse-init respawns it at once).
+///   * the GTK stylesheet, by copying `gtk.<look>.css` over `gtk.css` (or
+///     removing it for a look that has none);
+///   * the panel and the wallpaper, which read `/etc/eclipse/look` themselves
+///     on start -- so the switch restarts lunarbar and lunarbg (eclipse-init
+///     respawns both at once).
 pub(super) fn write_eclipse_look(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -104,19 +107,38 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20       -e \"s|<name>labAdwaita-dark</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>Tecno-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
+          # Titlebar, menu and OSD face: tecno is a monospace readout, every\n\
+          # other look the proportional DejaVu. Mono first, so Sans -> Mono\n\
+          # cannot be matched a second time.\n\
+          \x20   face=\"DejaVu Sans\"\n\
+          \x20   [ \"$look\" = tecno ] && face=\"DejaVu Sans Mono\"\n\
+          \x20   sed -e \"s|<name>DejaVu Sans Mono</name>|<name>$face</name>|\" \\\n\
+          \x20       -e \"s|<name>DejaVu Sans</name>|<name>$face</name>|\" \\\n\
+          \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
           \x20 fi\n\
           # foot palette for new terminals (a running foot keeps its colours).\n\
           \x20 src=\"$CFG/foot/foot.$look.ini\"\n\
           \x20 [ -f \"$src\" ] && cp -f \"$src\" \"$CFG/foot/foot.ini\"\n\
+          # GTK stylesheet for new GTK windows (Firefox included): the look's\n\
+          # own, or none at all -- stock Adwaita-dark -- for a look without one.\n\
+          \x20 for v in gtk-3.0 gtk-4.0; do\n\
+          \x20   if [ -f \"$CFG/$v/gtk.$look.css\" ]; then\n\
+          \x20     cp -f \"$CFG/$v/gtk.$look.css\" \"$CFG/$v/gtk.css\"\n\
+          \x20   else\n\
+          \x20     rm -f \"$CFG/$v/gtk.css\"\n\
+          \x20   fi\n\
+          \x20 done\n\
           \x20 if [ \"$boot\" != boot ]; then\n\
           \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
           \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
           \x20   elif [ -x /usr/bin/labwc ]; then\n\
           \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
           \x20   fi\n\
-          # The panel reads /etc/eclipse/look once at start; eclipse-init\n\
-          # respawns it with the new look immediately.\n\
+          # The panel and the wallpaper read /etc/eclipse/look once at start\n\
+          # (tecno has its own wallpaper); eclipse-init respawns both with\n\
+          # the new look immediately.\n\
           \x20   pkill -x lunarbar 2>/dev/null || true\n\
+          \x20   pkill -x lunarbg 2>/dev/null || true\n\
           \x20 fi\n\
           \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
           }\n\

@@ -22,8 +22,8 @@ pub fn draw_centered(display: &dyn DisplayScheme) {
         return;
     }
 
-    // Clear background (white) for the splash.
-    display.clear(RgbColor::new(255, 255, 255));
+    // Clear to the tecno ground the asset was composited on (#04070D).
+    display.clear(RgbColor::new(0x04, 0x07, 0x0d));
 
     let screen_width = info.width;
     let screen_height = info.height;

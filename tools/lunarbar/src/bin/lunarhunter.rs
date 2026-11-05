@@ -204,9 +204,9 @@ const PAD: i32 = 16;
 const HEAD_H: i32 = 56;
 const RAIL_W: i32 = 180;
 const TAB_H: i32 = 36;
-const FOOT_H: i32 = 30;
+const FOOT_H: i32 = 32;
 const ROW_H: i32 = 24;
-const BTN_H: i32 = 30;
+const BTN_H: i32 = 28;
 const SEG_W: i32 = 84;
 /// Lines of a job's output a tab shows.
 const CONSOLE_LINES: usize = 7;
@@ -1458,13 +1458,18 @@ impl Paint<'_> {
     fn stat(&mut self, x: i32, y: i32, w: i32, caption: &str, value: &str, c: Rgb) {
         let p = self.p;
         self.cv.round_rect(x, y, w, 58, 8, p.field);
-        self.text(&fit(caption, w - 20), x + 10, y + 8, p.dim);
+        let caption = if std::ptr::eq(p, &PAL_TECNO) { caption.to_uppercase() } else { caption.to_string() };
+        self.text(&fit(&caption, w - 20), x + 10, y + 8, p.dim);
         self.bold(&fit(value, w - 20), x + 10, y + 32, c);
     }
 
     fn section(&mut self, x: i32, y: i32, w: i32, title: &str) {
         let p = self.p;
-        self.bold(title, x, y, p.text);
+        if std::ptr::eq(p, &PAL_TECNO) {
+            self.bold(&title.to_uppercase(), x, y, p.dim);
+        } else {
+            self.bold(title, x, y, p.text);
+        }
         self.cv.hline(x, y + GLYPH_H + 5, w, p.border, 0.6);
     }
 
@@ -1528,6 +1533,9 @@ fn stance(st: &State, r: &Report) -> (String, Rgb) {
 /// Paint a whole frame of a `w` x `h` window.
 fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
     let p = st.pal;
+    // Tecno: mockup A's straight plates and caps headings.
+    let hud = std::ptr::eq(p, &PAL_TECNO);
+    cv.set_square(hud);
     cv.fill_rect_a(0, 0, w, h, p.bg, 1.0);
     let mut g = Paint {
         cv,
@@ -1549,7 +1557,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
         None => (p.dim, false),
     };
     g.cv.shield_icon(PAD, 16, 24, scol, solid);
-    g.bold("lunarhunter", PAD + 32, 20, p.text);
+    g.bold(if hud { "LUNARHUNTER" } else { "lunarhunter" }, PAD + 32, 20, p.text);
     let mut ty = HEAD_H + 8;
     for t in Tab::ALL {
         let act = Act::Tab(t);

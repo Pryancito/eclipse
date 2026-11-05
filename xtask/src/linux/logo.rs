@@ -196,10 +196,10 @@ const FASTFETCH_CONFIG: &str = "etc/fastfetch/config.jsonc";
 /// of [`mark`], so they cannot drift.
 const FASTFETCH_LOGO: &str = "usr/share/eclipse/logo.fastfetch.txt";
 
-/// What fastfetch is told `$1` means. The name and not `35`: fastfetch's
-/// colour parser takes names, `@n` for xterm-256 and `#rrggbb`, and a bare
-/// number is not one of them.
-const FASTFETCH_COLOUR: &str = "magenta";
+/// What fastfetch is told `$1` means: the `#rrggbb` spelling of
+/// [`os_release::ANSI_COLOR`]. fastfetch's colour parser takes names, `@n`
+/// for xterm-256 and `#rrggbb`, and an SGR string is not one of them.
+const FASTFETCH_COLOUR: &str = "#38e1ff";
 
 /// Every module fastfetch would print on its own.
 ///
@@ -289,6 +289,9 @@ fn fastfetch_config() -> String {
     )
 }
 
+/// The icon's stroke: the tecno cyan, the same colour as `ANSI_COLOR`.
+const ICON_COLOUR: &str = "#38e1ff";
+
 /// The icon: the same formula, read as vectors instead of as characters.
 ///
 /// The ASCII picks a character by how bright the corona is at that cell; here
@@ -297,10 +300,9 @@ fn fastfetch_config() -> String {
 /// [`LOBE_ANGLE`] says so in both -- not because someone drew two pictures
 /// and kept them in step by hand.
 ///
-/// `#aa00aa` is the classic ANSI magenta, which is what
-/// [`os_release::ANSI_COLOR`] (`0;35`) asks a terminal for: the console and
-/// the icon theme then show the same colour rather than two purples that
-/// nearly match.
+/// `#38e1ff` is the tecno cyan, which is what [`os_release::ANSI_COLOR`]
+/// asks a terminal for: the console and the icon theme then show the same
+/// colour rather than two cyans that nearly match.
 fn icon_svg() -> String {
     /// The limb, in the 48-unit box.
     const LIMB: f64 = 13.0;
@@ -336,7 +338,7 @@ fn icon_svg() -> String {
          opacity=\"0.45\"/>\n\
          {strokes}\x20 </g>\n\
          </svg>\n",
-        COLOUR = "#aa00aa",
+        COLOUR = ICON_COLOUR,
     )
 }
 
@@ -824,14 +826,22 @@ mod tests {
         );
     }
 
-    /// The console and fastfetch show the SAME colour. `/etc/profile` prints
-    /// the motd in `os_release::ANSI_COLOR`, and fastfetch is told a name;
-    /// this is what keeps the two from drifting into two different purples.
+    /// The console, fastfetch and the icon show the SAME colour.
+    /// `/etc/profile` prints the motd in `os_release::ANSI_COLOR`, fastfetch
+    /// is told a `#rrggbb` and the icon is stroked in one; this is what keeps
+    /// the three from drifting into three different cyans.
     #[test]
     fn fastfetch_is_given_the_colour_the_console_uses() {
-        // `0;35` is ANSI magenta, and `magenta` is what fastfetch calls it.
-        assert_eq!(os_release::ANSI_COLOR, "0;35");
-        assert_eq!(FASTFETCH_COLOUR, "magenta");
+        let rgb: Vec<u8> = os_release::ANSI_COLOR
+            .strip_prefix("0;38;2;")
+            .expect("ANSI_COLOR is a 24-bit SGR")
+            .split(';')
+            .map(|c| c.parse().unwrap())
+            .collect();
+        let hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        assert_eq!(hex, FASTFETCH_COLOUR);
+        assert_eq!(hex, ICON_COLOUR);
+        assert!(icon_svg().contains(&format!("stroke=\"{ICON_COLOUR}\"")));
         assert!(
             fastfetch_config().contains(&format!("\"1\": \"{FASTFETCH_COLOUR}\"")),
             "the config does not set the colour of the placeholder"

@@ -22,6 +22,7 @@ pub mod privacy;
 pub mod session;
 pub mod spa_compat;
 pub mod spawn;
+mod vtext;
 pub mod wl;
 
 #[cfg(feature = "engine")]

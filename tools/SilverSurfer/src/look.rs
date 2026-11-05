@@ -1,11 +1,14 @@
-//! Which look the desktop is wearing. The same three names `eclipse-look`
-//! writes to `/etc/eclipse/look`, so the chrome matches lunarbar.
+//! Which look the desktop is wearing. The same names `eclipse-look` writes to
+//! `/etc/eclipse/look`, so the chrome matches lunarbar. `gnome` only changes
+//! the window theme, so here it reads as the default, tecno.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
     Win11,
     Kde,
     Eclipse,
+    /// Mockup A, "Orbital HUD": the image's default look.
+    Tecno,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,17 +34,19 @@ impl Look {
             "win11" | "windows" | "windows11" => Some(Look::Win11),
             "kde" | "breeze" => Some(Look::Kde),
             "eclipse" => Some(Look::Eclipse),
+            "tecno" | "gnome" => Some(Look::Tecno),
             _ => None,
         }
     }
 
     /// `$ECLIPSE_LOOK` wins, then the first `look=` line of the file, then
-    /// Eclipse. An unrecognised environment value falls through to the file.
+    /// tecno, the image's default. An unrecognised environment value falls
+    /// through to the file.
     pub fn resolve(env: Option<&str>, file_text: Option<&str>) -> Self {
         if let Some(look) = env.and_then(Self::from_name) {
             return look;
         }
-        file_text.and_then(look_from_text).unwrap_or(Look::Eclipse)
+        file_text.and_then(look_from_text).unwrap_or(Look::Tecno)
     }
 
     pub fn current() -> Self {
@@ -70,6 +75,16 @@ impl Look {
                 dim: rgb(0x6d, 0x7f, 0xa3),
                 accent: rgb(0x6e, 0xa8, 0xff),
                 border: rgb(0x27, 0x5a, 0x9e),
+            },
+            // Mockup A: plate, the darker field, A's text/muted, signal
+            // cyan, the steel hairline.
+            Look::Tecno => Palette {
+                panel: rgb(0x06, 0x0b, 0x14),
+                field: rgb(0x0a, 0x14, 0x23),
+                text: rgb(0xe6, 0xf1, 0xff),
+                dim: rgb(0x8a, 0xa4, 0xc2),
+                accent: rgb(0x38, 0xe1, 0xff),
+                border: rgb(0x1d, 0x35, 0x50),
             },
             Look::Win11 => Palette {
                 panel: rgb(0x2b, 0x2b, 0x2b),
@@ -120,14 +135,15 @@ mod tests {
         assert_eq!(Look::resolve(Some("eclipse"), Some(file)), Look::Eclipse);
         assert_eq!(Look::resolve(Some("nope"), Some(file)), Look::Kde);
         assert_eq!(Look::resolve(None, Some("# c\nlook=win11\n")), Look::Win11);
-        assert_eq!(Look::resolve(None, None), Look::Eclipse);
+        assert_eq!(Look::resolve(None, None), Look::Tecno);
+        assert_eq!(Look::resolve(None, Some("look=tecno\n")), Look::Tecno);
     }
 
     #[test]
     fn a_typo_on_the_first_line_does_not_fall_through() {
         assert_eq!(
             Look::resolve(None, Some("look=nope\nlook=kde\n")),
-            Look::Eclipse
+            Look::Tecno
         );
     }
 
@@ -136,6 +152,9 @@ mod tests {
         let eclipse = Look::Eclipse.palette();
         let kde = Look::Kde.palette();
         let win = Look::Win11.palette();
+        let tecno = Look::Tecno.palette();
+        assert_eq!(tecno.accent, rgb(0x38, 0xe1, 0xff), "not lunarbar's cyan");
+        assert_ne!(tecno.accent, eclipse.accent);
         assert_ne!(eclipse.accent, kde.accent);
         assert_ne!(eclipse.accent, win.accent);
         assert_ne!(kde.accent, win.accent);

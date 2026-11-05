@@ -56,9 +56,12 @@ const ID: &str = "eclipse";
 const HOME_URL: &str = "https://github.com/Pryancito/eclipse";
 const BUG_REPORT_URL: &str = "https://github.com/Pryancito/eclipse/issues";
 
-/// `ANSI_COLOR`: how a terminal should tint the logo/name. Magenta, as the
-/// boot console and the wallpaper already are.
-pub(super) const ANSI_COLOR: &str = "0;35";
+/// `ANSI_COLOR`: how a terminal should tint the logo/name. The tecno cyan
+/// (#38E1FF), the accent of the default look and of the boot splash, as a
+/// 24-bit SGR so foot shows exactly that colour; the Linux console rounds it
+/// to its nearest cyan. (Fedora ships a `38;2;...` value here too: the spec
+/// only asks for something that fits in `ESC [ ... m`.)
+pub(super) const ANSI_COLOR: &str = "0;38;2;56;225;255";
 
 /// `LOGO`: the name of an ICON, not of the distribution.
 ///

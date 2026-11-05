@@ -64,6 +64,22 @@ impl Lang {
         }
     }
 
+    /// The runner's shortcut, as labwc's rc.xml binds it (`A-space`).
+    pub fn run_key(self) -> &'static str {
+        match self {
+            Lang::Es => "ALT+ESPACIO",
+            Lang::En => "ALT+SPACE",
+        }
+    }
+
+    /// The key the selected launcher row answers to, in caps (tecno).
+    pub fn enter_key(self) -> &'static str {
+        match self {
+            Lang::Es => "INTRO",
+            Lang::En => "ENTER",
+        }
+    }
+
     pub fn run_hint(self) -> &'static str {
         match self {
             Lang::Es => "escribe para buscar o ejecutar",

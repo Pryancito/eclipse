@@ -2278,10 +2278,10 @@ fn write_labwc_rc(rootfs: &Path) {
          Breeze-Dark / Win11-Dark). Tecno-Dark is the shipped default. -->
     <name>Tecno-Dark</name>
     <cornerRadius>8</cornerRadius>
-    <font place="ActiveWindow"><name>DejaVu Sans</name><size>10</size><weight>bold</weight></font>
-    <font place="InactiveWindow"><name>DejaVu Sans</name><size>10</size></font>
-    <font place="MenuItem"><name>DejaVu Sans</name><size>10</size></font>
-    <font place="OnScreenDisplay"><name>DejaVu Sans</name><size>11</size></font>
+    <font place="ActiveWindow"><name>DejaVu Sans Mono</name><size>10</size><weight>bold</weight></font>
+    <font place="InactiveWindow"><name>DejaVu Sans Mono</name><size>10</size></font>
+    <font place="MenuItem"><name>DejaVu Sans Mono</name><size>10</size></font>
+    <font place="OnScreenDisplay"><name>DejaVu Sans Mono</name><size>11</size></font>
   </theme>
   <desktops number="4"/>
   <keyboard>
