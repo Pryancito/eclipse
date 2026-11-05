@@ -73,7 +73,7 @@ use lunarbar::keys::{
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
+use draw::{Canvas, Rgb, BIG_H, GLYPH_H, GLYPH_W};
 use icons::IconCache;
 use sysinfo::{CpuMeter, NetMeter, NetRate};
 use wayland_client::{
@@ -2527,7 +2527,11 @@ fn draw_task(
         // is Plasma's digital clock — time over date, two lines — which is
         // also where the date goes when there is no top bar to carry it.
         let two_line = single_bar() && h as i32 >= 2 * GLYPH_H + 10;
-        let pw = if two_line {
+        // Tecno: mockup A's readout clock, big and bold, on no plate.
+        let big = tecno() && !two_line && h as i32 >= BIG_H + 6;
+        let pw = if big {
+            Canvas::big_width(&m.clock) + 16
+        } else if two_line {
             Canvas::text_width(&m.clock).max(Canvas::text_width(&m.date)) + 20
         } else {
             Canvas::text_width(&m.clock) + 20
@@ -2535,8 +2539,12 @@ fn draw_task(
         if rx - pw >= left_min {
             rx -= pw;
             let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
-            plate(cv, rx, btn_y, pw, btn_h, 6, pill);
-            if two_line {
+            if !big || hover == Hover::Clock {
+                plate(cv, rx, btn_y, pw, btn_h, 6, pill);
+            }
+            if big {
+                cv.text_big(&m.clock, rx + 8, (h as i32 - BIG_H) / 2 + 1, pal().text);
+            } else if two_line {
                 let y0 = (h as i32 - (2 * GLYPH_H + 2)) / 2;
                 let cw = Canvas::text_width(&m.clock);
                 let dw = Canvas::text_width(&m.date);
@@ -2615,7 +2623,9 @@ fn draw_task(
     let mut hits = Vec::new();
     let n = items.len() as i32;
     let is = (btn_h - 6).clamp(12, 24);
-    let icon_pad = is + 6;
+    // Tecno draws A's square marker, not the app's icon.
+    let sq = 11;
+    let icon_pad = if tecno() { sq + 8 } else { is + 6 };
     let mut widths: Vec<i32> = items
         .iter()
         .map(|it| Canvas::text_width(&it.label) + 16 + icon_pad)
@@ -2673,15 +2683,24 @@ fn draw_task(
         } else if hovered {
             plate_a(cv, x, btn_y, bw, btn_h, 6, pal().menu_hover, 0.55);
         }
+        if tecno() && !it.active && !it.minimized {
+            cv.fill_rect_a(x + 4, btn_y + btn_h - 2, bw - 8, 1, pal().rule, 1.0);
+        }
         let text_avail = bw - 16 - icon_pad;
         let icon_only = text_avail < GLYPH_W;
         let ix = if icon_only { x + (bw - is) / 2 } else { x + 8 };
         let iy = btn_y + (btn_h - is) / 2;
-        match icons.get(&it.app_id, is as u32) {
-            Some(pm) => cv.pixmap(ix, iy, &pm),
-            None => {
-                let ch = it.label.chars().next().unwrap_or('?');
-                cv.badge(ix, iy, is, ch, pal().pill, pal().accent);
+        if tecno() {
+            let (edge, core) = if it.active { (pal().accent, pal().accent) } else { (pal().dim, pal().pill) };
+            let sx = if icon_only { x + (bw - sq) / 2 } else { x + 8 };
+            cv.task_square(sx, btn_y + (btn_h - sq) / 2, sq, edge, core);
+        } else {
+            match icons.get(&it.app_id, is as u32) {
+                Some(pm) => cv.pixmap(ix, iy, &pm),
+                None => {
+                    let ch = it.label.chars().next().unwrap_or('?');
+                    cv.badge(ix, iy, is, ch, pal().pill, pal().accent);
+                }
             }
         }
         let mut cut = false;

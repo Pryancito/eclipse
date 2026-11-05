@@ -15,7 +15,7 @@
 
 use embedded_graphics::{
     mono_font::{
-        iso_8859_1::{FONT_9X15, FONT_9X15_BOLD},
+        iso_8859_1::{FONT_10X20, FONT_9X15, FONT_9X15_BOLD},
         MonoTextStyle,
     },
     pixelcolor::Rgb888,
@@ -33,6 +33,9 @@ pub type Rgb = (u8, u8, u8);
 pub const GLYPH_H: i32 = 15;
 /// Glyph advance (cell width) of the bar font.
 pub const GLYPH_W: i32 = 9;
+/// Cell of the readout font (FONT_10X20), for the tecno clock.
+pub const BIG_H: i32 = 20;
+pub const BIG_W: i32 = 10;
 
 /// Cubic-Bézier circle constant (approximates a 90° arc).
 const K: f32 = 0.552_284_8;
@@ -440,6 +443,29 @@ impl Canvas {
             .draw(self)
             .map(|end| end.x - x)
             .unwrap_or(0)
+    }
+
+    /// The readout face: FONT_10X20 struck twice, one pixel apart, since it
+    /// has no bold cut. Returns the advance, the extra pixel included.
+    pub fn text_big(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        let style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(c.0, c.1, c.2));
+        for dx in [0, 1] {
+            let _ = Text::with_baseline(s, Point::new(x + dx, y), style, Baseline::Top).draw(self);
+        }
+        Self::big_width(s)
+    }
+
+    pub fn big_width(s: &str) -> i32 {
+        s.chars().count() as i32 * BIG_W + 1
+    }
+
+    /// The tecno task marker: a hairline square with a lit core (A's `▣`).
+    pub fn task_square(&mut self, x: i32, y: i32, s: i32, edge: Rgb, core: Rgb) {
+        self.fill_rect_a(x, y, s, 1, edge, 1.0);
+        self.fill_rect_a(x, y + s - 1, s, 1, edge, 1.0);
+        self.fill_rect_a(x, y, 1, s, edge, 1.0);
+        self.fill_rect_a(x + s - 1, y, 1, s, edge, 1.0);
+        self.fill_rect_a(x + 3, y + 3, s - 6, s - 6, core, 1.0);
     }
 
     /// Pixel width a string will occupy (monospace: chars × cell width).
