@@ -16,9 +16,22 @@ const FONT8X8: [[u8; 8]; 96] = include!("font8x8_basic.in");
 const WHITE: u32 = 0x00FF_FFFF;
 const BLACK: u32 = 0x0000_0000;
 
-/// Bar geometry, in pixels.
+// The tecno boot (mockup A): the bar is a row of cells on the dark ground,
+// lit in signal cyan, unlit in the steel hairline, its percentage in muted
+// text. Kept in step with kernel-hal's `early_fb_console::draw_progress_bar`,
+// which carries on from the same picture after the handoff.
+pub(crate) const GROUND: u32 = 0x0004_070D;
+const LIT: u32 = 0x0038_E1FF;
+const UNLIT: u32 = 0x001D_3550;
+const MUTED: u32 = 0x008A_A4C2;
+
+/// Bar geometry, in pixels: `CELLS` cells of `CELL_W` lit pixels and a
+/// `CELL_GAP` of ground, `BAR_W` in all.
 pub const BAR_W: usize = 400;
-pub const BAR_H: usize = 20;
+pub const BAR_H: usize = 12;
+pub const CELLS: usize = 40;
+pub const CELL_W: usize = 8;
+pub const CELL_GAP: usize = BAR_W / CELLS - CELL_W;
 /// Glyph cell of the percentage text (the 8x8 font is drawn at 2x vertically).
 pub const CHAR_W: usize = 8;
 pub const CHAR_H: usize = 16;
@@ -136,26 +149,22 @@ pub fn bar_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize, progress: u32)
     }
 }
 
+/// How many of the [`CELLS`] are lit at `progress` percent.
+pub fn lit_cells(progress: u32) -> usize {
+    CELLS * progress.min(100) as usize / 100
+}
+
 fn draw_bar(s: &Screen, progress: u32) {
     let progress = progress.min(100);
     let (x, y) = bar_origin(s.width(), s.height());
 
-    // Border (black) and inner content (black fill / white remainder).
-    stroke_rect(
-        s,
-        x.saturating_sub(2),
-        y.saturating_sub(2),
-        BAR_W + 4,
-        BAR_H + 4,
-        1,
-        BLACK,
-    );
-    let fill_w = (BAR_W * progress as usize) / 100;
-    if fill_w > 0 {
-        fill_rect(s, x, y, fill_w, BAR_H, BLACK);
-    }
-    if fill_w < BAR_W {
-        fill_rect(s, x + fill_w, y, BAR_W - fill_w, BAR_H, WHITE);
+    // Every pixel of the band is painted, gaps included, so a lower value
+    // drawn over a higher one (or the kernel over rboot) leaves nothing.
+    let lit = lit_cells(progress);
+    for i in 0..CELLS {
+        let cx = x + i * (CELL_W + CELL_GAP);
+        fill_rect(s, cx, y, CELL_W, BAR_H, if i < lit { LIT } else { UNLIT });
+        fill_rect(s, cx + CELL_W, y, CELL_GAP, BAR_H, GROUND);
     }
 
     // Fixed-width percentage text (4 chars: "100%" or "  7%"/" 42%").
@@ -163,7 +172,7 @@ fn draw_bar(s: &Screen, progress: u32) {
     let text_w = buf.len() * CHAR_W;
     let tx = x + (BAR_W.saturating_sub(text_w)) / 2;
     let ty = y + BAR_H + 15;
-    draw_text_8x16(s, tx, ty, &buf, BLACK, WHITE);
+    draw_text_8x16(s, tx, ty, &buf, MUTED, GROUND);
 }
 
 /// Draw a small fault marker block at top-left, encoding `tag` and `code` as pixels.
@@ -229,6 +238,11 @@ mod tests {
         assert_eq!(&format_pct(u32::MAX), b"100%");
     }
 
+    /// The colour at the middle of cell `i`.
+    fn cell(c: &Canvas, x: usize, y: usize, i: usize) -> u32 {
+        c.get(x + i * (CELL_W + CELL_GAP) + CELL_W / 2, y + BAR_H / 2)
+    }
+
     #[test]
     fn the_bar_fills_left_to_right_and_the_boundary_is_exact() {
         let (sw, sh) = (1024usize, 768usize);
@@ -236,12 +250,14 @@ mod tests {
         let addr = c.addr();
         bar_raw(addr, sw, sw, sh, 25);
         let (x, y) = bar_origin(sw, sh);
-        let mid = y + BAR_H / 2;
-        let fill = BAR_W / 4;
-        assert_eq!(c.get(x, mid), BLACK, "first filled column");
-        assert_eq!(c.get(x + fill - 1, mid), BLACK, "last filled column");
-        assert_eq!(c.get(x + fill, mid), WHITE, "first empty column");
-        assert_eq!(c.get(x + BAR_W - 1, mid), WHITE, "last empty column");
+        let lit = CELLS / 4;
+        assert_eq!(lit_cells(25), lit);
+        assert_eq!(cell(&c, x, y, 0), LIT, "first cell");
+        assert_eq!(cell(&c, x, y, lit - 1), LIT, "last lit cell");
+        assert_eq!(cell(&c, x, y, lit), UNLIT, "first unlit cell");
+        assert_eq!(cell(&c, x, y, CELLS - 1), UNLIT, "last cell");
+        // A gap is ground, lit or not.
+        assert_eq!(c.get(x + CELL_W, y + BAR_H / 2), GROUND);
         c.assert_no_overrun();
     }
 
@@ -249,52 +265,52 @@ mod tests {
     fn zero_and_one_hundred_are_all_empty_and_all_full() {
         let (sw, sh) = (1024usize, 768usize);
         let (x, y) = bar_origin(sw, sh);
-        let mid = y + BAR_H / 2;
 
         let mut c = Canvas::new(sw, sh, sw);
         let addr = c.addr();
         bar_raw(addr, sw, sw, sh, 0);
-        assert!((0..BAR_W).all(|i| c.get(x + i, mid) == WHITE));
+        assert!((0..CELLS).all(|i| cell(&c, x, y, i) == UNLIT));
 
         let mut c = Canvas::new(sw, sh, sw);
         let addr = c.addr();
         bar_raw(addr, sw, sw, sh, 100);
-        assert!((0..BAR_W).all(|i| c.get(x + i, mid) == BLACK));
+        assert!((0..CELLS).all(|i| cell(&c, x, y, i) == LIT));
     }
 
     #[test]
     fn the_fill_never_goes_backwards() {
         let (sw, sh) = (1024usize, 768usize);
         let (x, y) = bar_origin(sw, sh);
-        let mid = y + BAR_H / 2;
         let mut last = 0usize;
         for p in 0..=100u32 {
             let mut c = Canvas::new(sw, sh, sw);
             let addr = c.addr();
             bar_raw(addr, sw, sw, sh, p);
-            let filled = (0..BAR_W).filter(|&i| c.get(x + i, mid) == BLACK).count();
+            let filled = (0..CELLS).filter(|&i| cell(&c, x, y, i) == LIT).count();
             assert!(filled >= last, "{p}% drew less than the previous step");
-            assert!(filled <= BAR_W);
+            assert!(filled <= CELLS);
             last = filled;
         }
-        assert_eq!(last, BAR_W);
+        assert_eq!(last, CELLS);
     }
 
     #[test]
-    fn the_bar_draws_a_one_pixel_border_around_itself() {
+    fn a_lower_value_over_a_higher_one_leaves_no_lit_cell_behind() {
+        // The kernel repaints the bar rboot left; every pixel of the band is
+        // its own, so 51% over a 100% frame reads as 51%.
         let (sw, sh) = (1024usize, 768usize);
         let mut c = Canvas::new(sw, sh, sw);
         let addr = c.addr();
-        bar_raw(addr, sw, sw, sh, 0);
+        bar_raw(addr, sw, sw, sh, 100);
+        bar_raw(addr, sw, sw, sh, 51);
         let (x, y) = bar_origin(sw, sh);
-        // Border at x-2 / y-2, one pixel thick, 404x24.
-        assert_eq!(c.get(x - 2, y - 2), BLACK);
-        assert_eq!(c.get(x + BAR_W + 1, y - 2), BLACK);
-        assert_eq!(c.get(x - 2, y + BAR_H + 1), BLACK);
-        assert_eq!(c.get(x + BAR_W + 1, y + BAR_H + 1), BLACK);
-        // The pixel just inside the border is bar, not border.
-        assert_eq!(c.get(x - 1, y - 1), UNTOUCHED);
-        c.assert_no_overrun();
+        let lit = (0..CELLS).filter(|&i| cell(&c, x, y, i) == LIT).count();
+        assert_eq!(lit, lit_cells(51));
+        assert_eq!(
+            CELLS * (CELL_W + CELL_GAP),
+            BAR_W,
+            "the cells do not fill the bar"
+        );
     }
 
     #[test]
@@ -325,7 +341,7 @@ mod tests {
         let addr = c.addr();
         bar_raw(addr, stride, sw, sh, 50);
         let (x, y) = bar_origin(sw, sh);
-        assert_eq!(c.get(x, y + BAR_H / 2), BLACK);
+        assert_eq!(c.get(x, y + BAR_H / 2), LIT);
         // The padding columns are not part of the visible screen.
         for yy in 0..sh {
             for xx in sw..stride {
@@ -339,10 +355,10 @@ mod tests {
     fn a_screen_that_cuts_through_the_last_text_row_clips_the_bottom_half() {
         // The 8x8 font is drawn at 2x vertically, so every glyph row is two
         // scanlines and the second one can be the first row past the screen.
-        // At 420 rows the bar lands so that it is: `bar_origin().1 + BAR_H +
-        // 15 + 15 == 420`. Without the clip in `Screen::put` that store lands
+        // At 404 rows the bar lands so that it is: `bar_origin().1 + BAR_H +
+        // 15 + 15 == 404`. Without the clip in `Screen::put` that store lands
         // one whole scanline past the framebuffer.
-        let (sw, sh) = (1024usize, 420usize);
+        let (sw, sh) = (1024usize, 404usize);
         let (_, y) = bar_origin(sw, sh);
         assert_eq!(
             y + BAR_H + 15 + CHAR_H - 1,
