@@ -2519,6 +2519,19 @@ impl Syscall<'_> {
         head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
+        let task = self.robust_list_target(pid)?;
+        task.get_robust_list(head_ptr, len_ptr)
+    }
+
+    /// Whose robust list `get_robust_list(pid, ..)` is asking about, once the
+    /// caller has been allowed to ask.
+    ///
+    /// Shared with the 32-bit entry (see
+    /// [`compat32::robust`](crate::compat32)), which differs only in how
+    /// wide the two words it writes are: the lookup and the permission check
+    /// are the same call's, and a second copy of them is a second place for
+    /// the `EPERM` to be forgotten.
+    pub(crate) fn robust_list_target(&self, pid: i32) -> LxResult<SchedTask> {
         let task = if pid == 0 {
             SchedTask::Thread(self.thread.inner())
         } else if pid < 0 {
@@ -2535,7 +2548,7 @@ impl Syscall<'_> {
         ) {
             return Err(LxError::EPERM);
         }
-        task.get_robust_list(head_ptr, len_ptr)
+        Ok(task)
     }
 
     /// Set robust list.
