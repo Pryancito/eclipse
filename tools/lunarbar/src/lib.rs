@@ -18,7 +18,7 @@
 //! - `lunarhunter` — hunter's window, opened from the bar's shield menu:
 //!   configuration, the event ring, scans, quarantine and signatures.
 //!
-//! All of them are single static musl binaries with their own bitmap font and
+//! All of them are single static musl binaries with their own text renderer and
 //! /proc readers — the first three over wlr-layer-shell + wl_shm, lunarclip
 //! over wlr-data-control, lunarhunter over xdg-shell + wl_shm: no GTK, no
 //! D-Bus, no gdk-pixbuf, no fontconfig, no locale.
@@ -48,4 +48,5 @@ pub mod open;
 pub mod par;
 pub mod proc;
 pub mod sysinfo;
+pub mod vtext;
 pub mod wl;

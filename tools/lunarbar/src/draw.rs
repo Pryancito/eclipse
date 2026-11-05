@@ -5,10 +5,11 @@
 //!   pills, the ◑/☾ launcher discs (vector paths + mask, no hand-rolled
 //!   coverage math), the ▼/▲ triangles, and the load gauges — which get a
 //!   green→amber→red linear gradient for free.
-//! - **embedded-graphics** supplies the text: mature ISO-8859-1 bitmap fonts
-//!   (FONT_9X15 + real bold), so lowercase, accents and eñes in window titles
-//!   render properly. tiny-skia has no text support; e-g has no AA shapes —
-//!   together they cover each other's blind spot.
+//! - **text** is DejaVu Sans Mono's outlines filled by tiny-skia, anti-aliased
+//!   and fitted to the bitmap faces' cells (see [`crate::vtext`]). The
+//!   **embedded-graphics** ISO-8859-1 bitmap fonts (FONT_9X15 + real bold)
+//!   are the fallback: for a machine without the face, `LUNAR_TEXT=bitmap`,
+//!   and any character the face has no outline for.
 //!
 //! `Canvas` owns an RGBA tiny-skia `Pixmap`; bars draw into it and then
 //! `blit_xrgb` swizzles the finished frame into the wl_shm XRGB8888 buffer.
@@ -26,6 +27,8 @@ use tiny_skia::{
     Color, FillRule, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap,
     PixmapPaint, Rect, SpreadMode, Stroke, Transform,
 };
+
+use crate::vtext::{Cell, Glyph, Weight};
 
 pub type Rgb = (u8, u8, u8);
 
@@ -434,9 +437,50 @@ impl Canvas {
         }
     }
 
+    /// `s` from the vector face, one glyph per cell (see [`crate::vtext`]).
+    /// A character the face cannot draw is drawn from the bitmap face in its
+    /// cell, so a string never loses a letter. Returns the advance.
+    #[allow(clippy::too_many_arguments)]
+    fn vector_text(&mut self, s: &str, x: i32, y: i32, c: Rgb, weight: Weight, cell: Cell) -> i32 {
+        let cw = cell.width() as i32;
+        let paint = Self::paint(c, 1.0);
+        let mut n = 0;
+        for ch in s.chars() {
+            let cx = x + n * cw;
+            match crate::vtext::glyph(ch, weight, cell) {
+                Glyph::Ink(path) => {
+                    self.pix.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::from_translate(cx as f32, y as f32),
+                        None,
+                    );
+                }
+                Glyph::Blank => {}
+                Glyph::Missing => {
+                    let font = match (cell, weight) {
+                        (Cell::Big, _) => &FONT_10X20,
+                        (Cell::Text, Weight::Bold) => &FONT_9X15_BOLD,
+                        (Cell::Text, Weight::Regular) => &FONT_9X15,
+                    };
+                    let style = MonoTextStyle::new(font, Rgb888::new(c.0, c.1, c.2));
+                    let mut buf = [0u8; 4];
+                    let _ = Text::with_baseline(ch.encode_utf8(&mut buf), Point::new(cx, y), style, Baseline::Top)
+                        .draw(self);
+                }
+            }
+            n += 1;
+        }
+        n * cw
+    }
+
     /// Draw a left-aligned string (FONT_9X15, transparent background) with its
     /// cell top at `y`. Returns the advance in pixels.
     pub fn text(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            return self.vector_text(s, x, y, c, Weight::Regular, Cell::Text);
+        }
         let style = MonoTextStyle::new(&FONT_9X15, Rgb888::new(c.0, c.1, c.2));
         Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
             .draw(self)
@@ -447,6 +491,9 @@ impl Canvas {
     /// Bold variant of `text` (FONT_9X15_BOLD, same metrics). Matches waybar's
     /// `font-weight: bold` clock.
     pub fn text_bold(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            return self.vector_text(s, x, y, c, Weight::Bold, Cell::Text);
+        }
         let style = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb888::new(c.0, c.1, c.2));
         Text::with_baseline(s, Point::new(x, y), style, Baseline::Top)
             .draw(self)
@@ -457,6 +504,11 @@ impl Canvas {
     /// The readout face: FONT_10X20 struck twice, one pixel apart, since it
     /// has no bold cut. Returns the advance, the extra pixel included.
     pub fn text_big(&mut self, s: &str, x: i32, y: i32, c: Rgb) -> i32 {
+        if crate::vtext::available() {
+            // The vector face has a real bold cut: no double strike.
+            self.vector_text(s, x, y, c, Weight::Bold, Cell::Big);
+            return Self::big_width(s);
+        }
         let style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(c.0, c.1, c.2));
         for dx in [0, 1] {
             let _ = Text::with_baseline(s, Point::new(x + dx, y), style, Baseline::Top).draw(self);
