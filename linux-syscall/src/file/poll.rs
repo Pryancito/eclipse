@@ -513,6 +513,15 @@ impl Syscall<'_> {
                 // Unsubscribe last pass's readiness wakers before re-scanning;
                 // fresh ones are parked below if we wait again.
                 this.subs.clear();
+                // Every descriptor of the set, resolved once for the whole
+                // pass under one lock (see `LinuxProcess::get_file_likes`):
+                // the classification, the scan and the subscriptions below
+                // all read from this instead of taking the table lock four
+                // times per fd.
+                let files = this
+                    .syscall
+                    .linux_process()
+                    .get_file_likes(this.polls.iter().map(|p| p.fd));
                 // Asked of the FILE and not of the fd number. Sockets are
                 // handed out from `SOCKET_FD` only while the process may
                 // hold a descriptor that high (see
@@ -522,17 +531,14 @@ impl Syscall<'_> {
                 // know it is watching a socket never pumps the stack
                 // underneath it.
                 let (watch_net, watch_interactive) = {
-                    let proc = this.syscall.linux_process();
                     // A negative fd is poll(2)'s "ignore this entry" and is
                     // skipped, not classified: counted as a non-socket it
                     // made a list of nothing but ignored entries ask for the
                     // interactive path, and a plain timeout then woke on
                     // every tty interrupt.
-                    let sockets = this.polls.iter().filter_map(|p| {
+                    let sockets = this.polls.iter().zip(&files).filter_map(|(p, f)| {
                         poll_entry_kind(p.fd.into(), || {
-                            proc.get_file_like(p.fd)
-                                .map(|f| f.is_socket())
-                                .unwrap_or(false)
+                            f.as_ref().map(|f| f.is_socket()).unwrap_or(false)
                         })
                     });
                     watch_kinds(sockets)
@@ -543,16 +549,10 @@ impl Syscall<'_> {
                 // this task is not in yet, and the wait would sleep out its
                 // fallback tick for an event that had already arrived.
                 let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
-                let watch_hid = {
-                    let proc = this.syscall.linux_process();
-                    this.polls.iter().any(|p| {
-                        <FileDesc as Into<i32>>::into(p.fd) >= 0
-                            && proc
-                                .get_file_like(p.fd)
-                                .map(|f| f.is_input_device())
-                                .unwrap_or(false)
-                    })
-                };
+                let watch_hid = this.polls.iter().zip(&files).any(|(p, f)| {
+                    <FileDesc as Into<i32>>::into(p.fd) >= 0
+                        && f.as_ref().map(|f| f.is_input_device()).unwrap_or(false)
+                });
                 this.watch_net = watch_net;
                 this.watch_interactive = watch_interactive;
                 this.watch_hid = watch_hid;
@@ -566,16 +566,11 @@ impl Syscall<'_> {
                     );
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
-                let proc = this.syscall.linux_process();
-                this.terminal_only = only_terminals(this.polls.iter().map(|p| {
+                this.terminal_only = only_terminals(this.polls.iter().zip(&files).map(|(p, f)| {
                     if <FileDesc as Into<i32>>::into(p.fd) < 0 {
                         None
                     } else {
-                        Some(
-                            proc.get_file_like(p.fd)
-                                .map(|f| f.is_terminal())
-                                .unwrap_or(false),
-                        )
+                        Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))
                     }
                 }));
                 let terminal_only = this.terminal_only;
@@ -583,9 +578,9 @@ impl Syscall<'_> {
                 let mut early_err = None;
 
                 // iterate each poll to check whether it is ready
-                for poll in this.polls.iter_mut() {
+                for (poll, file_like) in this.polls.iter_mut().zip(&files) {
                     poll.revents = PE::empty();
-                    if let Ok(file_like) = proc.get_file_like(poll.fd) {
+                    if let Some(file_like) = file_like {
                         debug!("get file like: {:?}", file_like);
                         // Sync poll only — see Epoll::wait. async_poll per fd
                         // here nested huge futures on the coroutine stack and
@@ -676,14 +671,13 @@ impl Syscall<'_> {
                     // way (`covered &= any_watched`).
                     let mut any_watched = false;
                     covered = true;
-                    for p in this.polls.iter() {
+                    for (p, f) in this.polls.iter().zip(&files) {
                         if <FileDesc as Into<i32>>::into(p.fd) < 0 {
                             continue; // ignored slot (POSIX): nothing to wake on
                         }
                         any_watched = true;
-                        match proc
-                            .get_file_like(p.fd)
-                            .ok()
+                        match f
+                            .as_ref()
                             .and_then(|f| f.subscribe_readiness(p.events, cx.waker()))
                         {
                             Some(sub) => this.subs.push(sub),
@@ -975,69 +969,59 @@ impl Syscall<'_> {
         let mut read_fds = FdSet::new(read, nfds)?;
         let mut write_fds = FdSet::new(write, nfds)?;
         let mut err_fds = FdSet::new(err, nfds)?;
+        // The descriptors the three sets name. Membership does not change
+        // while the call waits, so it is gathered once, and every per-call
+        // question below is answered from ONE resolution of it under one
+        // lock (`LinuxProcess::get_file_likes`) -- this used to clone the
+        // whole open-file table four times before the wait began and once
+        // more per pass.
+        let members: Vec<FileDesc> = (0..nfds)
+            .map(FileDesc::from)
+            .filter(|&fd| read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd))
+            .collect();
+        let files = self.linux_process().get_file_likes(members.iter().copied());
         // `max_select_fd`: a closed fd in any of the three sets is EBADF
         // before the wait begins. It used to be skipped, so a program that
         // closed a socket and left its bit set waited for the timeout (or for
         // ever) instead of learning which fd to drop.
-        {
-            let files = self.linux_process().get_files()?;
-            let in_any = |fd: usize| {
-                let fd = FileDesc::from(fd);
-                read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)
-            };
-            if select_closed_fd(nfds, in_any, |fd| files.contains_key(&FileDesc::from(fd)))
-                .is_some()
-            {
-                return Err(LxError::EBADF);
-            }
+        if select_closed_fd(members.len(), |_| true, |i| files[i].is_some()).is_some() {
+            return Err(LxError::EBADF);
         }
         let begin_time = mono_now();
 
-        // The select set membership (`origin`) does not change while the future
-        // is being polled, so whether we need to pump the network / interactive
-        // I/O is invariant. Compute it once here instead of on every wakeup.
-        // Asked of the FILE and not of the fd number: a socket lands on a
-        // low descriptor whenever the process may not hold one at
-        // `SOCKET_FD` (see `LinuxProcess::add_socket`).
-        let (watch_net, watch_interactive) = {
-            let files = self.linux_process().get_files()?;
-            watch_kinds((0..nfds).filter_map(|fd| {
-                let fd = FileDesc::from(fd);
-                (read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd))
-                    .then(|| files.get(&fd).map(|f| f.is_socket()).unwrap_or(false))
-            }))
-        };
+        // The select set membership does not change while the future is
+        // being polled, so whether we need to pump the network / interactive
+        // I/O is invariant. Asked of the FILE and not of the fd number: a
+        // socket lands on a low descriptor whenever the process may not hold
+        // one at `SOCKET_FD` (see `LinuxProcess::add_socket`).
+        let (watch_net, watch_interactive) = watch_kinds(
+            files
+                .iter()
+                .map(|f| f.as_ref().map(|f| f.is_socket()).unwrap_or(false)),
+        );
         // Same for whether the set holds an input device: an evdev node has
         // no event bus to subscribe to, so without this registration a key or
         // a mouse frame would be found only by the re-scan tick.
-        let watch_hid = {
-            let files = self.linux_process().get_files()?;
-            (0..nfds).any(|fd| {
-                let fd = FileDesc::from(fd);
-                (read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd))
-                    && files.get(&fd).map(|f| f.is_input_device()).unwrap_or(false)
-            })
-        };
+        let watch_hid = files
+            .iter()
+            .any(|f| f.as_ref().map(|f| f.is_input_device()).unwrap_or(false));
         // Membership is fixed, so the "only terminals" shape is too — the one
         // shape `io_wait_interval` may demote to the background-VT tick.
-        let terminal_only = {
-            let files = self.linux_process().get_files()?;
-            only_terminals((0..nfds).map(|fd| {
-                let fd = FileDesc::from(fd);
-                if !(read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)) {
-                    None
-                } else {
-                    Some(files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false))
-                }
-            }))
-        };
+        let terminal_only = only_terminals(
+            files
+                .iter()
+                .map(|f| Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))),
+        );
+        // The first pass polls the files resolved above; later passes (after
+        // a wake) resolve again, as Linux's `do_select` looks each fd up on
+        // every pass.
+        let first_files = Some(files);
 
         #[must_use = "future does nothing unless polled/`await`-ed"]
         struct SelectFuture<'a> {
             read_fds: &'a mut FdSet,
             write_fds: &'a mut FdSet,
             err_fds: &'a mut FdSet,
-            nfds: usize,
             watch_net: bool,
             watch_interactive: bool,
             /// This set holds an input device (directly, or inside a nested
@@ -1055,6 +1039,10 @@ impl Syscall<'_> {
             io_waker: Option<core::task::Waker>,
             /// Readiness wakers parked on the watched fds (see PollFuture).
             subs: Vec<linux_object::sync::ReadinessSub>,
+            /// The fds the three sets name, ascending.
+            members: Vec<FileDesc>,
+            /// `members` resolved by `select_core`, for the first pass.
+            first_files: Option<Vec<Option<Arc<dyn FileLike>>>>,
         }
 
         impl Drop for SelectFuture<'_> {
@@ -1090,21 +1078,20 @@ impl Syscall<'_> {
                     );
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
-                let files = this.syscall.linux_process().get_files()?;
+                let files = match this.first_files.take() {
+                    Some(files) => files,
+                    None => this
+                        .syscall
+                        .linux_process()
+                        .get_file_likes(this.members.iter().copied()),
+                };
 
                 let mut events = 0;
                 let mut early_err = None;
                 // Iterate only the fds in the select set instead of every open
                 // fd in the process.
-                for fd in 0..this.nfds {
-                    let fd = FileDesc::from(fd);
-                    if !this.err_fds.contains(fd)
-                        && !this.read_fds.contains(fd)
-                        && !this.write_fds.contains(fd)
-                    {
-                        continue;
-                    }
-                    let file_like = match files.get(&fd) {
+                for (&fd, file_like) in this.members.iter().zip(&files) {
+                    let file_like = match file_like {
                         Some(f) => f,
                         None => continue,
                     };
@@ -1173,8 +1160,7 @@ impl Syscall<'_> {
                 if this.timeout_msecs != 0 {
                     covered = true;
                     let mut any_watched = false;
-                    for fd in 0..this.nfds {
-                        let fd = FileDesc::from(fd);
+                    for (&fd, file) in this.members.iter().zip(&files) {
                         let mut interest = PollEvents::empty();
                         if this.read_fds.contains(fd) {
                             interest |= PollEvents::IN;
@@ -1186,8 +1172,8 @@ impl Syscall<'_> {
                             continue;
                         }
                         any_watched = true;
-                        match files
-                            .get(&fd)
+                        match file
+                            .as_ref()
                             .and_then(|f| f.subscribe_readiness(interest, cx.waker()))
                         {
                             Some(sub) => this.subs.push(sub),
@@ -1255,7 +1241,6 @@ impl Syscall<'_> {
             read_fds: &mut read_fds,
             write_fds: &mut write_fds,
             err_fds: &mut err_fds,
-            nfds,
             watch_net,
             watch_interactive,
             watch_hid,
@@ -1267,6 +1252,8 @@ impl Syscall<'_> {
             timer: None,
             io_waker: None,
             subs: Vec::new(),
+            members,
+            first_files,
         };
         future.await
     }
