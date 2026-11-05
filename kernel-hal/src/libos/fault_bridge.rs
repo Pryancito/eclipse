@@ -28,6 +28,7 @@
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
@@ -81,9 +82,29 @@ pub unsafe fn init() {
     }
 }
 
-/// This host thread's kernel FS base, from the word reserved under its
-/// alternate signal stack, or `None` when it has no stack registered and so
-/// has never been out to a guest.
+/// How many host threads the bridge can recognise at once.
+///
+/// One slot per thread that has ever gone out to a guest. They are never
+/// freed: a thread's alternate stack is leaked for the same reason (see
+/// `ensure_altstack`), so a stale slot stays truthful rather than dangling.
+const ANCHORS: usize = 256;
+
+/// The alternate-stack pointer of each registered thread, and the kernel FS
+/// base that goes with it. Two flat arrays of atomics rather than a map
+/// because the signal handler reads them: an atomic load is
+/// async-signal-safe, a lock or an allocation is not.
+static ANCHOR_STACK: [AtomicUsize; ANCHORS] = [const { AtomicUsize::new(0) }; ANCHORS];
+static ANCHOR_BASE: [AtomicU64; ANCHORS] = [const { AtomicU64::new(0) }; ANCHORS];
+
+/// Where a given alternate stack's slot starts. Linear probing from here, and
+/// nothing is ever removed, so an empty slot means "not registered" and ends
+/// the search.
+fn anchor_slot(ss_sp: usize) -> usize {
+    (ss_sp >> 12) % ANCHORS
+}
+
+/// This host thread's kernel FS base, or `None` when this thread has never
+/// been out to a guest.
 ///
 /// It used to come from `gs:0`, which `trapframe` keeps pointing at the
 /// kernel's own thread area. That read is a dereference of an address the
@@ -92,7 +113,18 @@ pub unsafe fn init() {
 /// the process with nothing said. The alternate stack is the one per-thread
 /// place the handler can find without a segment register at all --
 /// `sigaltstack` is async-signal-safe and hands back the pointer the thread
-/// registered -- so the base lives in a word just under it.
+/// registered.
+///
+/// # Why the base is in a table and not under the stack
+///
+/// It was in the word just below `ss_sp`, which is wrong on any thread whose
+/// alternate stack is not ours. Rust's own std registers a `sigaltstack` on
+/// every thread it spawns, for its stack-overflow handler, and those stacks
+/// are mapped with a guard page BELOW them -- so on an async-std worker that
+/// had not yet entered a guest, reading `ss_sp - 8` touched the guard page,
+/// faulted inside the handler, and with `SA_NODEFER` did it again on top of
+/// itself. The table is checked against `ss_sp` first, so a stack we did not
+/// register is simply not ours and no memory outside it is ever read.
 unsafe fn kernel_fsbase() -> Option<u64> {
     let mut current = libc::stack_t {
         ss_sp: ptr::null_mut(),
@@ -105,11 +137,43 @@ unsafe fn kernel_fsbase() -> Option<u64> {
     {
         return None;
     }
-    // SAFETY: `ensure_altstack` reserved this word below `ss_sp` and wrote the
-    // base into it, from kernel context, before this thread ever left for a
-    // guest. It is 8-byte aligned because the allocation is.
-    let base = (current.ss_sp as *const u64).sub(1).read();
-    (base != 0).then_some(base)
+    let ss_sp = current.ss_sp as usize;
+    let first = anchor_slot(ss_sp);
+    for step in 0..ANCHORS {
+        let slot = (first + step) % ANCHORS;
+        match ANCHOR_STACK[slot].load(Ordering::Acquire) {
+            // An empty slot: the probe for `ss_sp` would have stopped here
+            // when it was written, so it is not registered. Not our stack.
+            0 => return None,
+            found if found == ss_sp => {
+                let base = ANCHOR_BASE[slot].load(Ordering::Acquire);
+                return (base != 0).then_some(base);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Remember this thread's alternate stack and the kernel FS base that goes
+/// with it, so the handler can find the base from the stack alone. `false`
+/// when the table is full, which turns the bridge off for this thread rather
+/// than guessing.
+fn register_anchor(ss_sp: usize, base: u64) -> bool {
+    let first = anchor_slot(ss_sp);
+    for step in 0..ANCHORS {
+        let slot = (first + step) % ANCHORS;
+        // A thread registers once, and its `ss_sp` is an address no other
+        // live thread can also have, so claiming an empty slot is enough.
+        if ANCHOR_STACK[slot]
+            .compare_exchange(0, ss_sp, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            ANCHOR_BASE[slot].store(base, Ordering::Release);
+            return true;
+        }
+    }
+    false
 }
 
 /// Read one of this thread's segment bases.
@@ -181,7 +245,19 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     // is what happened before.
     if arch_get_base(ARCH_GET_GS) != Some(kernel_fsbase) {
         libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, kernel_fsbase);
-        return;
+        // `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE` are FAULTS: the host
+        // saved the rip of the instruction that faulted, so returning runs it
+        // again, now with `GS` right, and the next fault -- if there is one --
+        // takes the ordinary path below. This cannot loop.
+        //
+        // `SIGTRAP` is a TRAP: the host saved the rip AFTER the `int3`, so
+        // returning resumes past it and the guest's breakpoint exception
+        // vanishes, leaving whoever waits on the exception channel waiting
+        // for ever. `GS` is fixed either way; this one still has to be
+        // translated, so fall through.
+        if signal != libc::SIGTRAP {
+            return;
+        }
     }
     let Some(fsbase) = arch_get_base(ARCH_GET_FS) else {
         return leave_to_the_host(signal);
@@ -227,8 +303,8 @@ pub fn ensure_altstack() {
             return;
         }
         registered.set(true);
-        // Allocated as words, not bytes, so the first one is aligned: the
-        // handler reads this thread's kernel fsbase out of it.
+        // Allocated as words, not bytes, so it is aligned enough for a
+        // signal frame.
         //
         // Leaked on purpose: the host reads it on every signal for as long as
         // this thread lives, and a thread that is going away has nothing left
@@ -246,13 +322,18 @@ pub fn ensure_altstack() {
             warn!("libos: cannot record this host thread's own thread area");
             return;
         }
-        stack[0] = base;
+        let ss_sp: *mut libc::c_void = stack.as_mut_ptr().cast();
+        // The base goes in the bridge's own table, keyed by this pointer, not
+        // in a word under the stack: the handler must never read memory it
+        // did not itself reserve. See `kernel_fsbase`.
+        if !register_anchor(ss_sp as usize, base) {
+            warn!("libos: the fault bridge has no room left to recognise this host thread");
+            return;
+        }
         let altstack = libc::stack_t {
-            // Past the reserved word, so the host's signal frame cannot land
-            // on it. `kernel_fsbase` reads it back at `ss_sp - 8`.
-            ss_sp: unsafe { stack.as_mut_ptr().add(1) }.cast(),
+            ss_sp,
             ss_flags: 0,
-            ss_size: (STACK_WORDS - 1) * size_of::<u64>(),
+            ss_size: STACK_WORDS * size_of::<u64>(),
         };
         // SAFETY: a stack this thread owns for as long as it lives.
         if unsafe { libc::sigaltstack(&altstack, ptr::null_mut()) } != 0 {

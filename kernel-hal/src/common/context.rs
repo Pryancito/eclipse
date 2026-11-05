@@ -1135,8 +1135,20 @@ impl UserContext {
     /// in for the one the CPU would have raised on the way out.
     #[cfg(all(feature = "libos", target_arch = "x86_64"))]
     pub fn refuse_kernel_half_base(&mut self) -> bool {
-        /// One past the last user address under 4-level paging.
-        const USER_MAX: usize = 0x0000_8000_0000_0000;
+        /// One past the highest base the HOST will accept.
+        ///
+        /// Not `0x0000_8000_0000_0000`, the first non-canonical address, but a
+        /// page below it. Linux's `do_arch_prctl_64` refuses a base with
+        /// `-EPERM` when `arg2 >= TASK_SIZE_MAX`, and `TASK_SIZE_MAX` on a
+        /// four-level host is `(1 << 47) - PAGE_SIZE`: the last user page is
+        /// reserved. A base of exactly `0x7fff_ffff_f000` is canonical, is a
+        /// user address, and is still rejected -- which is precisely the case
+        /// this check exists for, because the assembly setter has no way to
+        /// report the refusal and would silently keep the previous base. A
+        /// five-level host would take it; being a page strict there only means
+        /// reporting the `#GP` that the guest's own 48-bit rules call for
+        /// anyway.
+        const USER_MAX: usize = 0x0000_7fff_ffff_f000;
 
         let bases = [
             ("fsbase", self.0.general.fsbase),
