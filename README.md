@@ -1,7 +1,5 @@
 # Eclipse OS
 
-[![Descargas totales](https://img.shields.io/github/downloads/Pryancito/eclipse/total)](https://github.com/Pryancito/eclipse/releases)
-[![Descargas de la última versión](https://img.shields.io/github/downloads/Pryancito/eclipse/latest/total)](https://github.com/Pryancito/eclipse/releases/latest)
 [![Clones del repositorio](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones.json)](.github/workflows/clones-badge.yml)
 
 **Español** · [English](README.en.md)
