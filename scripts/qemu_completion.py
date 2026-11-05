@@ -12,11 +12,11 @@ import uuid
 # before being typed anyway.
 #
 # A case must not be typed between the previous case's exit and the shell's
-# return to its interactive read: busybox ash restores the console's termios
-# there, and that restore DISCARDS whatever is already queued on the serial
-# line. The command then loses its leading bytes and the shell runs the tail,
-# which is some suffix of a path and so "not found" -- an exit 127 that reads
-# exactly like a missing binary. Measured in QEMU riscv64 (this container,
+# return to its interactive read: the shell sets the console's termios there,
+# and that set DISCARDS whatever is already queued on the serial line. The
+# command then loses its leading bytes and the shell runs the tail, which is
+# some suffix of a path and so "not found" -- an exit 127 that reads exactly
+# like a missing binary. Measured in QEMU riscv64 (this container,
 # 2026-11-05), 4 cases of 415:
 #
 #   Test 72: /libc-test/src/functional/string_strchr-static.exe
@@ -26,13 +26,15 @@ import uuid
 #
 # The marker that ends a case is printed by `printf`, before the shell gets
 # that far, so the marker alone is not permission to type the next one.
-# Waiting for the prompt costs milliseconds per case and takes the race out.
+#
+# The prompt is only usable as that permission if we can SEE it when it is
+# printed, and the console reader is line-buffered while `/ # ` carries no
+# newline: it surfaces only when the next line arrives, which is the echo of a
+# command already typed. A runner that can give the guest a prompt ending in a
+# newline (`scripts/linux_libc_test.py` does) points `prompt_pattern` at it and
+# turns `prompt_sync` on; the default stays the shell's own.
 PROMPT = re.compile(r"/ # ")
 PROMPT_WAIT = 5.0
-# How often to ask for a prompt with a bare newline while waiting. The prompt
-# we are owed is almost always gone already -- cleared away with the previous
-# case's output -- so asking is the normal path, not a fallback.
-PROMPT_NUDGE = 0.2
 
 
 def exit_code(output, marker):
@@ -51,36 +53,24 @@ def completion_runner(base, statuses):
         # no prompt at all leaves it False, where waiting could only burn the
         # budget for nothing.
         prompt_sync = False
+        # What a prompt looks like on this console. Overridden by a runner that
+        # has given the guest a newline-terminated one.
+        prompt_pattern = PROMPT
 
         def await_prompt(self):
-            """Block until the guest shell is back at its prompt, then clear
-            the console buffer. Returns whether the prompt was seen; a console
-            that does not produce one in `PROMPT_WAIT` is typed at anyway,
-            which is what every run did before this existed."""
+            """Block until the guest shell's prompt is on screen, then clear
+            the console buffer. Returns whether it was seen; a console that
+            does not show one within `PROMPT_WAIT` is typed at anyway, which
+            is what every run did before this existed."""
             start = time.monotonic()
-            asked = 0.0
-            while True:
+            while time.monotonic() - start < PROMPT_WAIT:
                 with self.lk:
-                    seen = PROMPT.search(self.output) is not None
+                    seen = self.prompt_pattern.search(self.output) is not None
                 if seen or self.zcore_proc.poll() is not None:
                     break
-                now = time.monotonic()
-                if now - start >= PROMPT_WAIT:
-                    break
-                if asked == 0.0 or now - asked >= PROMPT_NUDGE:
-                    # Ask for a prompt rather than wait for one: the one we
-                    # were owed has almost always been cleared away with the
-                    # previous case's output, and an idle shell answers a bare
-                    # newline at once. Asked again every `PROMPT_NUDGE`,
-                    # because a shell that is still mid-restore throws the
-                    # newline away with everything else that was queued --
-                    # which is the whole race this exists for.
-                    self.zcore_proc.stdin.write(b"\n")
-                    self.zcore_proc.stdin.flush()
-                    asked = now
                 time.sleep(0.005)
             with self.lk:
-                seen = PROMPT.search(self.output) is not None
+                seen = self.prompt_pattern.search(self.output) is not None
                 self.output = ""
             return seen
 

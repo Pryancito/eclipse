@@ -6,6 +6,7 @@ import enum
 import subprocess
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("qemu_completion", Path(__file__).parents[1] / "qemu_completion.py")
@@ -218,25 +219,36 @@ class PromptSynchronisation(unittest.TestCase):
             instance.output += found[0] + ":0\r\r\n/ # "
         return True
 
-    def test_a_case_waits_for_a_prompt_that_is_not_on_screen_yet(self):
+    def test_a_case_is_not_typed_until_the_prompt_arrives(self):
+        """And nothing is sent to the guest while waiting: a nudge is one more
+        interactive read, one more termios set, and one more chance to eat the
+        command being written."""
         instance = None
 
         def on_write(data):
-            if data == b"\n":
-                with instance.lk:
-                    instance.output += "/ # "
-                return
             self.answer_marker(instance, data)
 
         instance, status = self.runner_for(on_write)
         instance.prompt_sync = True
-        self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
-        # The newline that asked for the prompt comes first, and the case is
-        # typed only after it answered.
-        self.assertEqual(instance.zcore_proc.writes[0], b"\n")
-        self.assertIn(b"/case.exe", instance.zcore_proc.writes[1])
+        seen_while_waiting = []
 
-    def test_a_prompt_already_on_screen_is_not_asked_for_again(self):
+        def prompt_later():
+            # Long enough that a runner which did not wait would have typed.
+            time.sleep(0.2)
+            seen_while_waiting.append(list(instance.zcore_proc.writes))
+            with instance.lk:
+                instance.output += "/ # \n"
+
+        shell = threading.Thread(target=prompt_later)
+        shell.start()
+        try:
+            self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
+        finally:
+            shell.join()
+        self.assertEqual(seen_while_waiting, [[]], "the guest was written to while waiting")
+        self.assertIn(b"/case.exe", instance.zcore_proc.writes[0])
+
+    def test_a_prompt_already_on_screen_is_not_waited_for(self):
         instance = None
 
         def on_write(data):
