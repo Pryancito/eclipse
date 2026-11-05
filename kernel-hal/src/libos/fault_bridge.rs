@@ -27,6 +27,7 @@
 
 use core::convert::TryFrom;
 use core::mem::size_of;
+use core::ptr;
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
@@ -34,6 +35,7 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 /// kernel's own: `trapframe` enters the guest with `FS` pointing at the
 /// guest's thread area and `GS` at the kernel's, and leaves `GS` zero until a
 /// thread has gone out at least once.
+const ARCH_SET_GS: libc::c_int = 0x1001;
 const ARCH_GET_FS: libc::c_int = 0x1003;
 const ARCH_GET_GS: libc::c_int = 0x1004;
 
@@ -79,20 +81,41 @@ pub unsafe fn init() {
     }
 }
 
-/// The `arch_prctl` bases, or `None` when this thread has never been out to a
-/// guest (its `GS` base is still zero, so there is nothing to read there).
-unsafe fn thread_bases() -> Option<(u64, u64)> {
-    let mut gsbase: u64 = 0;
-    if libc::syscall(libc::SYS_arch_prctl, ARCH_GET_GS, &mut gsbase) != 0 || gsbase == 0 {
+/// This host thread's kernel FS base, from the word reserved under its
+/// alternate signal stack, or `None` when it has no stack registered and so
+/// has never been out to a guest.
+///
+/// It used to come from `gs:0`, which `trapframe` keeps pointing at the
+/// kernel's own thread area. That read is a dereference of an address the
+/// GUEST controls: `wrgsbase` is a user-mode instruction, so a guest that sets
+/// its own `GS` base makes this handler fault inside itself and the host kills
+/// the process with nothing said. The alternate stack is the one per-thread
+/// place the handler can find without a segment register at all --
+/// `sigaltstack` is async-signal-safe and hands back the pointer the thread
+/// registered -- so the base lives in a word just under it.
+unsafe fn kernel_fsbase() -> Option<u64> {
+    let mut current = libc::stack_t {
+        ss_sp: ptr::null_mut(),
+        ss_flags: 0,
+        ss_size: 0,
+    };
+    if libc::sigaltstack(ptr::null(), &mut current) != 0
+        || current.ss_sp.is_null()
+        || current.ss_flags & libc::SS_DISABLE != 0
+    {
         return None;
     }
-    let mut fsbase: u64 = 0;
-    if libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, &mut fsbase) != 0 {
-        return None;
-    }
-    // `trapframe` keeps the kernel's own fsbase at `gs:0` for the way back in.
-    let kernel_fsbase = (gsbase as *const u64).read();
-    Some((kernel_fsbase, fsbase))
+    // SAFETY: `ensure_altstack` reserved this word below `ss_sp` and wrote the
+    // base into it, from kernel context, before this thread ever left for a
+    // guest. It is 8-byte aligned because the allocation is.
+    let base = (current.ss_sp as *const u64).sub(1).read();
+    (base != 0).then_some(base)
+}
+
+/// Read one of this thread's segment bases.
+unsafe fn arch_get_base(which: libc::c_int) -> Option<u64> {
+    let mut base: u64 = 0;
+    (libc::syscall(libc::SYS_arch_prctl, which, &mut base) == 0).then_some(base)
 }
 
 /// Hand the signal back to the host: clear our handler and return, so the
@@ -134,7 +157,33 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     else {
         return leave_to_the_host(signal);
     };
-    let Some((kernel_fsbase, fsbase)) = thread_bases() else {
+    let Some(kernel_fsbase) = kernel_fsbase() else {
+        return leave_to_the_host(signal);
+    };
+    // A guest that set its own `GS` base. `trapframe` keeps the kernel's way
+    // back in there -- `SWITCH_TO_KERNEL_STACK` is `mov rsp, gs:64` -- and
+    // `wrgsbase` is a user-mode instruction, so the guest can take it away.
+    // Measured in a libos build in this container, from `Property.RegisterGs`
+    // of the Zircon core tests:
+    //
+    //   syscall_fn_entry+5:  mov %gs:0x40,%rsp
+    //   si_addr = 0xdeb12     (the guest's GS base + 0x40)
+    //   gs_base = 0xdead2     (the value the test asked for)
+    //
+    // Put the kernel's base back and let the instruction run again. The next
+    // fault, if there is one, finds `GS` already right and takes the ordinary
+    // path, so this cannot loop.
+    //
+    // The guest's own base is gone, which is a divergence: `trapframe`'s libos
+    // entry has nowhere else to keep the kernel's, and it already discards the
+    // guest's `gs_base` on every trip in (`push 0  # ignore gs_base`). Losing
+    // it beats killing the kernel, the guest and the harness together, which
+    // is what happened before.
+    if arch_get_base(ARCH_GET_GS) != Some(kernel_fsbase) {
+        libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, kernel_fsbase);
+        return;
+    }
+    let Some(fsbase) = arch_get_base(ARCH_GET_FS) else {
         return leave_to_the_host(signal);
     };
     if fsbase == kernel_fsbase || context.is_null() {
@@ -166,9 +215,8 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
 /// own, on each thread's first trip out to a guest.
 pub fn ensure_altstack() {
     use core::cell::Cell;
-    use core::ptr;
 
-    const STACK_SIZE: usize = 64 * 1024;
+    const STACK_WORDS: usize = 64 * 1024 / size_of::<u64>();
 
     thread_local! {
         static REGISTERED: Cell<bool> = const { Cell::new(false) };
@@ -179,17 +227,39 @@ pub fn ensure_altstack() {
             return;
         }
         registered.set(true);
+        // Allocated as words, not bytes, so the first one is aligned: the
+        // handler reads this thread's kernel fsbase out of it.
+        //
         // Leaked on purpose: the host reads it on every signal for as long as
         // this thread lives, and a thread that is going away has nothing left
         // to fault.
-        let stack = vec![0u8; STACK_SIZE].into_boxed_slice();
+        let stack = vec![0u64; STACK_WORDS].into_boxed_slice();
         let stack = Box::leak(stack);
+        // The kernel's own thread area, which is loaded right now -- this runs
+        // from `enter_uspace`, before the trip out. The handler cannot ask for
+        // it later: by then `FS` is the guest's and `GS` is whatever the guest
+        // left there. See `kernel_fsbase`.
+        let mut base: u64 = 0;
+        // SAFETY: a read of this thread's own FS base into a local.
+        if unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, &mut base) } != 0 || base == 0
+        {
+            warn!("libos: cannot record this host thread's own thread area");
+            return;
+        }
+        stack[0] = base;
         let altstack = libc::stack_t {
-            ss_sp: stack.as_mut_ptr().cast(),
+            // Past the reserved word, so the host's signal frame cannot land
+            // on it. `kernel_fsbase` reads it back at `ss_sp - 8`.
+            ss_sp: unsafe { stack.as_mut_ptr().add(1) }.cast(),
             ss_flags: 0,
-            ss_size: STACK_SIZE,
+            ss_size: (STACK_WORDS - 1) * size_of::<u64>(),
         };
+        // SAFETY: a stack this thread owns for as long as it lives.
         if unsafe { libc::sigaltstack(&altstack, ptr::null_mut()) } != 0 {
+            // Without it the bridge is off for this thread: the handler finds
+            // no base and hands the signal back to the host. That is the
+            // honest answer -- a handler running on a stack the guest just
+            // overflowed is the one case that cannot work anyway.
             warn!("libos: no alternate signal stack for this thread");
         }
     });
