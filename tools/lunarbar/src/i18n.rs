@@ -12,10 +12,15 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// `us` is a spelling of English here because `eclipse-locale` speaks
+    /// `es|us` -- the same two country names as `eclipse-kbd` -- so a
+    /// hand-edited `/etc/eclipse/locale` can say `lang=us` and mean English.
+    /// The command itself always writes the tag (`lang=en`); this arm is for
+    /// the file somebody edited with the command's own vocabulary.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim() {
             "es" | "ES" | "es_ES" => Some(Lang::Es),
-            "en" | "EN" | "en_US" => Some(Lang::En),
+            "en" | "EN" | "en_US" | "us" | "US" => Some(Lang::En),
             _ => None,
         }
     }
@@ -419,7 +424,7 @@ mod tests {
         for n in ["es", "ES", "es_ES"] {
             assert_eq!(Lang::from_name(n), Some(Lang::Es), "{n}");
         }
-        for n in ["en", "EN", "en_US"] {
+        for n in ["en", "EN", "en_US", "us", "US"] {
             assert_eq!(Lang::from_name(n), Some(Lang::En), "{n}");
         }
         // The file is read line by line, so the newline comes with it.

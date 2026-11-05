@@ -543,7 +543,8 @@ fn every_program_the_desktop_names_by_its_path_is_one_the_image_installs() {
 ///
 /// The fourth one was found by moving a test module out of `mod.rs`: until
 /// then `eclipse-locale` was reached here only because `mod.rs` happened to
-/// name it in its own TEST text, which is not a caller at all.
+/// name it in its own TEST text, which is not a caller at all. It is reached
+/// properly now, from init's `BOOT_SETTINGS`.
 #[test]
 fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
     let d = installed();

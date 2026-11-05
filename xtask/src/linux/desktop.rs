@@ -33,6 +33,7 @@
 use std::{fs, path::Path};
 
 mod firefox;
+mod locale;
 mod look;
 mod silversurfer;
 mod tecno;
@@ -89,7 +90,7 @@ pub fn install(rootfs: &Path) {
 /// variant (see `Variant`) calls only this one.
 pub(super) fn install_console(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
-    write_eclipse_locale(rootfs);
+    locale::write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
 }
 
@@ -385,7 +386,18 @@ fn write_eclipse_kbd(rootfs: &Path) {
           \x20     || echo \"eclipse-kbd: /proc/kbd write failed\" >>\"$LOG\"\n\
           \x20 fi\n\
           \x20 mkdir -p /etc/eclipse\n\
-          \x20 echo \"layout=$layout\" > \"$CONF\"\n\
+          # UPSERT, not truncate. This file holds `layout=` and it also holds\n\
+          # `language=`, the switch that decouples the UI language from the\n\
+          # layout, and a plain `>` threw that away on the first switch: the\n\
+          # hatch worked once and then silently was not there any more.\n\
+          \x20 if [ -f \"$CONF\" ]; then\n\
+          \x20   tmp=\"$CONF.$$\"\n\
+          \x20   grep -v \"^[[:space:]]*layout[[:space:]]*=\" \"$CONF\" > \"$tmp\" 2>/dev/null || :\n\
+          \x20   echo \"layout=$layout\" >> \"$tmp\"\n\
+          \x20   mv \"$tmp\" \"$CONF\"\n\
+          \x20 else\n\
+          \x20   echo \"layout=$layout\" > \"$CONF\"\n\
+          \x20 fi\n\
           \x20 upsert_env XKB_DEFAULT_LAYOUT \"$layout\"\n\
           \x20 if [ \"$boot\" != boot ]; then\n\
           \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
@@ -405,8 +417,33 @@ fn write_eclipse_kbd(rootfs: &Path) {
           \x20 echo \"[$(date '+%H:%M:%S')] layout=$layout boot=$boot\" >>\"$LOG\"\n\
           }\n\
           \n\
+          # The desktop switch (W-K and the menu item) is ONE switch: it moves\n\
+          # the keyboard layout and the UI language together, because es and us\n\
+          # name the same two choices in both. A plain `eclipse-kbd us` from a\n\
+          # shell stays keyboard-only, so the two can still be set apart, and\n\
+          # `language=no` in /etc/eclipse/keyboard turns the coupling off for\n\
+          # the desktop switch too. eclipse-locale never calls back here, so\n\
+          # there is no loop to break.\n\
+          follow_language() {\n\
+          \x20 [ -r \"$CONF\" ] || return 0\n\
+          \x20 v=$(awk '\n\
+          \x20   { sub(/\\r$/, \"\") }\n\
+          \x20   /^[[:space:]]*#/ { next }\n\
+          \x20   /^[[:space:]]*language[[:space:]]*=/ {\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20   }\n\
+          \x20 ' \"$CONF\")\n\
+          \x20 case \"$v\" in no|No|NO|0|off|false) return 1 ;; *) return 0 ;; esac\n\
+          }\n\
+          \n\
+          set_language() {\n\
+          \x20 [ -x /usr/local/bin/eclipse-locale ] || return 0\n\
+          \x20 /usr/local/bin/eclipse-locale \"$1\" >>\"$LOG\" 2>&1 || true\n\
+          }\n\
+          \n\
           usage() {\n\
           \x20 echo \"usage: eclipse-kbd [es|us|toggle|--boot]\" >&2\n\
+          \x20 echo \"  toggle also switches the UI language (eclipse-locale)\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -420,7 +457,11 @@ fn write_eclipse_kbd(rootfs: &Path) {
           \x20 ;;\n\
           toggle)\n\
           \x20 case \"$(current)\" in us) n=es ;; *) n=us ;; esac\n\
+          # The flag is read BEFORE apply touches the file, so the decision is\n\
+          # always taken from the file as the user left it.\n\
+          \x20 if follow_language; then follow=yes; else follow=no; fi\n\
           \x20 apply \"$n\"\n\
+          \x20 [ \"$follow\" = yes ] && set_language \"$n\"\n\
           \x20 echo \"$n\"\n\
           \x20 ;;\n\
           es|us)\n\
@@ -438,167 +479,6 @@ fn write_eclipse_kbd(rootfs: &Path) {
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
     fs::write(etc.join("keyboard"), b"layout=es\n").unwrap();
-}
-
-/// `/usr/local/bin/eclipse-locale`: persist UI language (`es` / `en`) to
-/// `/etc/eclipse/locale`, export `LANG`/`LANGUAGE` in labwc's environment,
-/// and swap `menu.xml` for the matching translation. `--boot` is what
-/// eclipse-init runs before the compositor (no SIGHUP).
-fn write_eclipse_locale(rootfs: &Path) {
-    let localbin = rootfs.join("usr/local/bin");
-    let _ = fs::create_dir_all(&localbin);
-    let script = localbin.join("eclipse-locale");
-    fs::write(
-        &script,
-        b"#!/bin/sh\n\
-          # Eclipse OS: UI language (not keyboard layout -- see eclipse-kbd).\n\
-          CONF=/etc/eclipse/locale\n\
-          ENVF=\"${HOME:-/root}/.config/labwc/environment\"\n\
-          MENUDIR=\"${HOME:-/root}/.config/labwc\"\n\
-          LOG=\"${HOME:-/root}/.eclipse-locale.log\"\n\
-          \n\
-          lang_ok() {\n\
-          \x20 case \"$1\" in es|en) return 0 ;; *) return 1 ;; esac\n\
-          }\n\
-          \n\
-          posix_for() {\n\
-          \x20 case \"$1\" in en) echo en_US.UTF-8 ;; *) echo es_ES.UTF-8 ;; esac\n\
-          }\n\
-          \n\
-          language_for() {\n\
-          \x20 case \"$1\" in en) echo en ;; *) echo es:en ;; esac\n\
-          }\n\
-          \n\
-          file_lang() {\n\
-          \x20 [ -r \"$CONF\" ] || return\n\
-          \x20 awk '\n\
-          \x20   { sub(/\\r$/, \"\") }\n\
-          \x20   /^[[:space:]]*#/ { next }\n\
-          \x20   /^[[:space:]]*lang[[:space:]]*=/ {\n\
-          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
-          \x20   }\n\
-          \x20 ' \"$CONF\"\n\
-          }\n\
-          \n\
-          cmdline_lang() {\n\
-          \x20 [ -r /proc/cmdline ] || return\n\
-          \x20 awk '{\n\
-          \x20   n=split($0,a,/[: \\t]/)\n\
-          \x20   for(i=1;i<=n;i++) if(a[i] ~ /^lang=/){ sub(/^lang=/,\"\",a[i]); print a[i]; exit }\n\
-          \x20 }' /proc/cmdline\n\
-          }\n\
-          \n\
-          current() {\n\
-          \x20 f=$(file_lang)\n\
-          \x20 if lang_ok \"$f\"; then echo \"$f\"; return; fi\n\
-          \x20 echo es\n\
-          }\n\
-          \n\
-          resolve_boot() {\n\
-          \x20 c=$(cmdline_lang)\n\
-          \x20 if lang_ok \"$c\"; then echo \"$c\"; return; fi\n\
-          \x20 current\n\
-          }\n\
-          \n\
-          # One writer at a time for $ENVF. The three boot steps that write it\n\
-          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
-          # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
-          # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
-          # the way back to one after another). Three read-modify-writes of one\n\
-          # file at once lose keys: each reads the old file and the last mv\n\
-          # wins. A directory is the lock because mkdir either creates it or\n\
-          # fails, atomically, on every filesystem this runs on -- no busybox\n\
-          # applet needed, and nothing left behind by a crash but an empty\n\
-          # directory.\n\
-          env_lock() {\n\
-          \x20 i=0\n\
-          \x20 while ! mkdir \"$ENVF.lock\" 2>/dev/null; do\n\
-          \x20   i=$((i+1))\n\
-          \x20   # BOUNDED, and then it takes the lock anyway. A boot step that\n\
-          \x20   # waits for ever on a stale lock directory is how one hanging\n\
-          \x20   # script wedges a whole machine (the reason a oneshot has a\n\
-          \x20   # timeout at all); losing one key on one boot is the cheaper\n\
-          \x20   # failure by a wide margin.\n\
-          \x20   if [ \"$i\" -ge 60 ]; then\n\
-          \x20     rm -rf \"$ENVF.lock\" 2>/dev/null\n\
-          \x20     mkdir \"$ENVF.lock\" 2>/dev/null\n\
-          \x20     break\n\
-          \x20   fi\n\
-          \x20   sleep 0.05 2>/dev/null || sleep 1\n\
-          \x20 done\n\
-          }\n\
-          \n\
-          env_unlock() {\n\
-          \x20 rmdir \"$ENVF.lock\" 2>/dev/null || rm -rf \"$ENVF.lock\" 2>/dev/null\n\
-          }\n\
-          \n\
-          upsert_env() {\n\
-          \x20 key=$1; val=$2\n\
-          \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
-          \x20 env_lock\n\
-          \x20 # The temporary carries the pid: a fixed \"$ENVF.new\" is a second\n\
-          \x20 # collision between concurrent writers, and it lands inside the\n\
-          \x20 # blind spot above if the lock is ever stolen.\n\
-          \x20 tmp=\"$ENVF.$$\"\n\
-          \x20 if [ -f \"$ENVF\" ]; then\n\
-          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$tmp\" 2>/dev/null || :\n\
-          \x20   echo \"${key}=$val\" >> \"$tmp\"\n\
-          \x20   mv \"$tmp\" \"$ENVF\"\n\
-          \x20 else\n\
-          \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
-          \x20 fi\n\
-          \x20 env_unlock\n\
-          }\n\
-          \n\
-          apply() {\n\
-          \x20 lang=$1\n\
-          \x20 boot=$2\n\
-          \x20 mkdir -p /etc/eclipse\n\
-          \x20 echo \"lang=$lang\" > \"$CONF\"\n\
-          \x20 upsert_env LANG \"$(posix_for \"$lang\")\"\n\
-          \x20 upsert_env LANGUAGE \"$(language_for \"$lang\")\"\n\
-          \x20 src=\"$MENUDIR/menu.$lang.xml\"\n\
-          \x20 if [ -f \"$src\" ]; then\n\
-          \x20   cp -f \"$src\" \"$MENUDIR/menu.xml\"\n\
-          \x20 fi\n\
-          \x20 if [ \"$boot\" != boot ]; then\n\
-          \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
-          \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
-          \x20   elif [ -x /usr/bin/labwc ]; then\n\
-          \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
-          \x20   fi\n\
-          \x20 fi\n\
-          \x20 echo \"[$(date '+%H:%M:%S')] lang=$lang boot=$boot\" >>\"$LOG\"\n\
-          }\n\
-          \n\
-          usage() {\n\
-          \x20 echo \"usage: eclipse-locale [es|en|--boot]\" >&2\n\
-          \x20 exit 2\n\
-          }\n\
-          \n\
-          case \"${1:-}\" in\n\
-          '' ) current; exit 0 ;;\n\
-          -h|--help) usage ;;\n\
-          --boot)\n\
-          \x20 apply \"$(resolve_boot)\" boot\n\
-          \x20 current\n\
-          \x20 exit 0\n\
-          \x20 ;;\n\
-          es|en)\n\
-          \x20 apply \"$1\"\n\
-          \x20 echo \"$1\"\n\
-          \x20 ;;\n\
-          *) usage ;;\n\
-          esac\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let etc = rootfs.join("etc/eclipse");
-    let _ = fs::create_dir_all(&etc);
-    fs::write(etc.join("locale"), b"lang=es\n").unwrap();
 }
 
 /// `/usr/local/bin/eclipse-tz`: persist country/timezone (`ES` → Europe/Madrid,
@@ -2453,7 +2333,7 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Freedoom (Fase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
     <item label="Freedoom (Fase 2)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 2</command></action></item>
     <separator/>
-    <item label="Teclado (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
+    <item label="Teclado e idioma (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
     <item label="Recargar labwc"><action name="Reconfigure"/></item>
     <item label="Salir de la sesion"><action name="Exit"/></item>
   </menu>
@@ -2482,7 +2362,7 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Freedoom (Phase 1)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 1</command></action></item>
     <item label="Freedoom (Phase 2)"><action name="Execute"><command>/usr/local/bin/eclipse-freedoom 2</command></action></item>
     <separator/>
-    <item label="Keyboard (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
+    <item label="Keyboard and language (es/us)"><action name="Execute"><command>/usr/local/bin/eclipse-kbd toggle</command></action></item>
     <item label="Reload labwc"><action name="Reconfigure"/></item>
     <item label="Exit session"><action name="Exit"/></item>
   </menu>
