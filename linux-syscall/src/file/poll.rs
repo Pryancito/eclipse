@@ -488,9 +488,6 @@ impl Syscall<'_> {
             /// leaving it to the re-scan tick. See
             /// `linux_object::fs::devfs::input::wait`.
             watch_hid: bool,
-            /// Every fd in the set is a terminal: the only shape that may be
-            /// demoted to the slow background-VT tick (see `io_wait_interval`).
-            terminal_only: bool,
             io_waker: Option<core::task::Waker>,
             /// Readiness wakers parked on the watched fds' event buses
             /// (pipes, unix sockets, ptys, eventfd/timerfd, DRM). Refreshed
@@ -549,31 +546,20 @@ impl Syscall<'_> {
                 // this task is not in yet, and the wait would sleep out its
                 // fallback tick for an event that had already arrived.
                 let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
-                let watch_hid = this.polls.iter().zip(&files).any(|(p, f)| {
-                    <FileDesc as Into<i32>>::into(p.fd) >= 0
-                        && f.as_ref().map(|f| f.is_input_device()).unwrap_or(false)
-                });
                 this.watch_net = watch_net;
                 this.watch_interactive = watch_interactive;
-                this.watch_hid = watch_hid;
                 if this.io_armed {
+                    // A re-pass after a wake: the registration the last
+                    // pass's sleep made, with the flags that pass computed.
                     arm_io_wait(
                         cx,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
+                        this.watch_hid,
                         &mut this.io_armed,
                     );
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
-                this.terminal_only = only_terminals(this.polls.iter().zip(&files).map(|(p, f)| {
-                    if <FileDesc as Into<i32>>::into(p.fd) < 0 {
-                        None
-                    } else {
-                        Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))
-                    }
-                }));
-                let terminal_only = this.terminal_only;
                 let mut events = 0;
                 let mut early_err = None;
 
@@ -700,6 +686,25 @@ impl Syscall<'_> {
                         return Poll::Ready(Ok(0));
                     }
                     PollWait::Sleep(limit) => {
+                        // Asked only of a pass that is going to sleep: whether
+                        // an input device is in the set and whether it is all
+                        // terminals choose how the wait is woken, and a call
+                        // that returns at once (a ready fd, a zero timeout)
+                        // has no wait to choose for. Each question takes the
+                        // file's lock and a chain of downcasts per fd.
+                        let watch_hid = this.polls.iter().zip(&files).any(|(p, f)| {
+                            <FileDesc as Into<i32>>::into(p.fd) >= 0
+                                && f.as_ref().map(|f| f.is_input_device()).unwrap_or(false)
+                        });
+                        this.watch_hid = watch_hid;
+                        let terminal_only =
+                            only_terminals(this.polls.iter().zip(&files).map(|(p, f)| {
+                                if <FileDesc as Into<i32>>::into(p.fd) < 0 {
+                                    None
+                                } else {
+                                    Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))
+                                }
+                            }));
                         let tick = if covered {
                             covered_tick
                         } else {
@@ -748,7 +753,7 @@ impl Syscall<'_> {
             watch_net: false,
             watch_interactive: false,
             watch_hid: false,
-            terminal_only: false,
+
             io_waker: None,
             subs: Vec::new(),
         };
@@ -999,19 +1004,6 @@ impl Syscall<'_> {
                 .iter()
                 .map(|f| f.as_ref().map(|f| f.is_socket()).unwrap_or(false)),
         );
-        // Same for whether the set holds an input device: an evdev node has
-        // no event bus to subscribe to, so without this registration a key or
-        // a mouse frame would be found only by the re-scan tick.
-        let watch_hid = files
-            .iter()
-            .any(|f| f.as_ref().map(|f| f.is_input_device()).unwrap_or(false));
-        // Membership is fixed, so the "only terminals" shape is too — the one
-        // shape `io_wait_interval` may demote to the background-VT tick.
-        let terminal_only = only_terminals(
-            files
-                .iter()
-                .map(|f| Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))),
-        );
         // The first pass polls the files resolved above; later passes (after
         // a wake) resolve again, as Linux's `do_select` looks each fd up on
         // every pass.
@@ -1029,8 +1021,14 @@ impl Syscall<'_> {
             /// leaving it to the re-scan tick. See
             /// `linux_object::fs::devfs::input::wait`.
             watch_hid: bool,
-            /// See `PollFuture::terminal_only`.
+            /// Every fd in the set is a terminal: the only shape that may be
+            /// demoted to the slow background-VT tick (see `io_wait_interval`).
             terminal_only: bool,
+            /// `watch_hid` and `terminal_only` have been worked out. Only a
+            /// select that is going to sleep needs them (they choose how it
+            /// is woken), so a zero timeout or a ready set never pays for
+            /// them; membership is fixed, so the first sleep answers for all.
+            classified: bool,
             timeout_msecs: isize,
             begin_time: Duration,
             syscall: &'a Syscall<'a>,
@@ -1067,7 +1065,6 @@ impl Syscall<'_> {
                 // of this line gives: a frame between the scan and the arming
                 // drains a list this task is not in yet.
                 let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
-                let terminal_only = this.terminal_only;
                 if this.io_armed {
                     arm_io_wait(
                         cx,
@@ -1201,6 +1198,21 @@ impl Syscall<'_> {
                         return Poll::Ready(Ok(0));
                     }
                     PollWait::Sleep(limit) => {
+                        if !this.classified {
+                            // Same for whether the set holds an input device:
+                            // an evdev node has no event bus to subscribe to,
+                            // so without this registration a key or a mouse
+                            // frame would be found only by the re-scan tick.
+                            this.watch_hid = files
+                                .iter()
+                                .any(|f| f.as_ref().map(|f| f.is_input_device()).unwrap_or(false));
+                            this.terminal_only = only_terminals(files.iter().map(|f| {
+                                Some(f.as_ref().map(|f| f.is_terminal()).unwrap_or(false))
+                            }));
+                            this.classified = true;
+                        }
+                        let watch_hid = this.watch_hid;
+                        let terminal_only = this.terminal_only;
                         let tick = if covered {
                             covered_tick
                         } else {
@@ -1243,8 +1255,9 @@ impl Syscall<'_> {
             err_fds: &mut err_fds,
             watch_net,
             watch_interactive,
-            watch_hid,
-            terminal_only,
+            watch_hid: false,
+            terminal_only: false,
+            classified: false,
             timeout_msecs,
             begin_time,
             syscall: self,
