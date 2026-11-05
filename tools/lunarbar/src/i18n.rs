@@ -12,7 +12,7 @@ pub enum Lang {
 }
 
 impl Lang {
-    /// `us` is a spelling of English here because `eclipse-language` speaks
+    /// `us` is a spelling of English here because `eclipse-locale` speaks
     /// `es|us` -- the same two country names as `eclipse-kbd` -- so a
     /// hand-edited `/etc/eclipse/locale` can say `lang=us` and mean English.
     /// The command itself always writes the tag (`lang=en`); this arm is for

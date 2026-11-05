@@ -543,29 +543,8 @@ fn every_program_the_desktop_names_by_its_path_is_one_the_image_installs() {
 ///
 /// The fourth one was found by moving a test module out of `mod.rs`: until
 /// then `eclipse-locale` was reached here only because `mod.rs` happened to
-/// name it in its own TEST text, which is not a caller at all.
-/// The wrapper `name` forwards to, if its whole body is one `exec` of another
-/// wrapper under `/usr/local/bin` -- that is, if it is an alias and nothing
-/// else. A script with any other command in it is a wrapper in its own right
-/// and has to be reached like one.
-fn pure_alias_target(d: &Installed, name: &str) -> Option<String> {
-    let body = fs::read_to_string(d.root.join(format!("usr/local/bin/{name}"))).ok()?;
-    let mut target = None;
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let rest = line.strip_prefix("exec /usr/local/bin/")?;
-        if target.is_some() {
-            // Two commands: not an alias.
-            return None;
-        }
-        target = Some(rest.split_whitespace().next()?.to_string());
-    }
-    target
-}
-
+/// name it in its own TEST text, which is not a caller at all. It is reached
+/// properly now, from init's `BOOT_SETTINGS`.
 #[test]
 fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
     let d = installed();
@@ -584,20 +563,6 @@ fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
         + &source("tools/eclipse-init/src/main.rs");
     for name in d.wrappers() {
         if by_path.contains_key(name) {
-            continue;
-        }
-        // An ALIAS is reached by a person typing it, not by a file: its whole
-        // body is one `exec` of another wrapper, kept because the old name is
-        // what an already-installed root and a habit both still use. Nothing
-        // in the image names it, and nothing should -- callers are moved to
-        // the real name. What this test can still check is that the name it
-        // forwards to exists, which is the way an alias actually breaks.
-        if let Some(target) = pure_alias_target(d, name) {
-            assert!(
-                d.wrappers().contains(&target.as_str()),
-                "{name} is an alias for /usr/local/bin/{target}, which the \
-                 desktop does not install"
-            );
             continue;
         }
         // Not its own file: nearly every wrapper prints its own name in an

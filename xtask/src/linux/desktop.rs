@@ -33,7 +33,7 @@
 use std::{fs, path::Path};
 
 mod firefox;
-mod language;
+mod locale;
 mod look;
 mod silversurfer;
 mod tecno;
@@ -90,7 +90,7 @@ pub fn install(rootfs: &Path) {
 /// variant (see `Variant`) calls only this one.
 pub(super) fn install_console(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
-    language::write_eclipse_language(rootfs);
+    locale::write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
 }
 
@@ -326,7 +326,7 @@ fn write_eclipse_kbd(rootfs: &Path) {
           }\n\
           \n\
           # One writer at a time for $ENVF. The three boot steps that write it\n\
-          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-language (LANG) and\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
           # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
           # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
           # the way back to one after another). Three read-modify-writes of one\n\
@@ -422,7 +422,7 @@ fn write_eclipse_kbd(rootfs: &Path) {
           # name the same two choices in both. A plain `eclipse-kbd us` from a\n\
           # shell stays keyboard-only, so the two can still be set apart, and\n\
           # `language=no` in /etc/eclipse/keyboard turns the coupling off for\n\
-          # the desktop switch too. eclipse-language never calls back here, so\n\
+          # the desktop switch too. eclipse-locale never calls back here, so\n\
           # there is no loop to break.\n\
           follow_language() {\n\
           \x20 [ -r \"$CONF\" ] || return 0\n\
@@ -437,13 +437,13 @@ fn write_eclipse_kbd(rootfs: &Path) {
           }\n\
           \n\
           set_language() {\n\
-          \x20 [ -x /usr/local/bin/eclipse-language ] || return 0\n\
-          \x20 /usr/local/bin/eclipse-language \"$1\" >>\"$LOG\" 2>&1 || true\n\
+          \x20 [ -x /usr/local/bin/eclipse-locale ] || return 0\n\
+          \x20 /usr/local/bin/eclipse-locale \"$1\" >>\"$LOG\" 2>&1 || true\n\
           }\n\
           \n\
           usage() {\n\
           \x20 echo \"usage: eclipse-kbd [es|us|toggle|--boot]\" >&2\n\
-          \x20 echo \"  toggle also switches the UI language (eclipse-language)\" >&2\n\
+          \x20 echo \"  toggle also switches the UI language (eclipse-locale)\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -551,7 +551,7 @@ fn write_eclipse_tz(rootfs: &Path) {
           }\n\
           \n\
           # One writer at a time for $ENVF. The three boot steps that write it\n\
-          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-language (LANG) and\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
           # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
           # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
           # the way back to one after another). Three read-modify-writes of one\n\
@@ -2305,7 +2305,7 @@ fn write_labwc_menu(rootfs: &Path) {
     let _ = fs::create_dir_all(&cfg);
     fs::write(cfg.join("menu.es.xml"), MENU_ES).unwrap();
     fs::write(cfg.join("menu.en.xml"), MENU_EN).unwrap();
-    // Default language is Spanish; eclipse-language --boot copies the active one.
+    // Default language is Spanish; eclipse-locale --boot copies the active one.
     fs::write(cfg.join("menu.xml"), MENU_ES).unwrap();
 }
 
@@ -2409,7 +2409,7 @@ fn write_labwc_environment(rootfs: &Path) {
           LUNARBG_ASPECT=16:9\n\
           XCURSOR_SIZE=24\n\
           GTK_THEME=Adwaita:dark\n\
-          # UI language. eclipse-language updates LANG/LANGUAGE in-place.\n\
+          # UI language. eclipse-locale updates LANG/LANGUAGE in-place.\n\
           # UTF-8 is required: foot refuses a plain C locale. Do not set LC_ALL.\n\
           LANG=es_ES.UTF-8\n\
           LANGUAGE=es:en\n\

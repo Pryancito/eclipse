@@ -1,4 +1,4 @@
-//! `/usr/local/bin/eclipse-language`: the UI language of the whole session.
+//! `/usr/local/bin/eclipse-locale`: the UI language of the whole session.
 //!
 //! Split out of `desktop.rs` because the script is the longest of the three
 //! boot settings and `desktop.rs` was the file growing around it.
@@ -10,25 +10,23 @@
 //! is what `LANG`, `LANGUAGE` and lunarbar's own string table are keyed by:
 //! `us` is a country, `en` is its language, and the file holds the one the
 //! rest of the system can act on. The script prints back the country name it
-//! was given, so `eclipse-language` and `eclipse-kbd` answer in the same
-//! words.
+//! was given, so `eclipse-locale` and `eclipse-kbd` answer in the same words.
 //!
-//! `eclipse-locale` stays as a name: it is what `/etc/profile`, the labwc
-//! menu and every machine already installed call. It is now a wrapper that
-//! execs this one, so there is exactly one implementation.
+//! One name, not two: `eclipse-locale` is what `/etc/profile`, the labwc menu,
+//! init's boot settings and every machine already installed call, and a second
+//! name for the same script is a second thing to keep in step.
 
 use std::{fs, path::Path};
 
-/// Write `eclipse-language`, its `eclipse-locale` alias, and the default
-/// `/etc/eclipse/locale`.
+/// Write `eclipse-locale` and the default `/etc/eclipse/locale`.
 ///
 /// `--boot` is what eclipse-init runs before the compositor: it resolves the
 /// language from the kernel command line (`lang=`) or the file, applies it,
 /// and skips the SIGHUP, because there is no compositor yet to reconfigure.
-pub(super) fn write_eclipse_language(rootfs: &Path) {
+pub(super) fn write_eclipse_locale(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
-    let script = localbin.join("eclipse-language");
+    let script = localbin.join("eclipse-locale");
     fs::write(
         &script,
         b"#!/bin/sh\n\
@@ -38,7 +36,7 @@ pub(super) fn write_eclipse_language(rootfs: &Path) {
           CONF=/etc/eclipse/locale\n\
           ENVF=\"${HOME:-/root}/.config/labwc/environment\"\n\
           MENUDIR=\"${HOME:-/root}/.config/labwc\"\n\
-          LOG=\"${HOME:-/root}/.eclipse-language.log\"\n\
+          LOG=\"${HOME:-/root}/.eclipse-locale.log\"\n\
           \n\
           # The country names this command speaks.\n\
           country_ok() {\n\
@@ -108,7 +106,7 @@ pub(super) fn write_eclipse_language(rootfs: &Path) {
           }\n\
           \n\
           # One writer at a time for $ENVF. The three boot steps that write it\n\
-          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-language (LANG) and\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
           # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
           # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
           # the way back to one after another). Three read-modify-writes of one\n\
@@ -182,7 +180,7 @@ pub(super) fn write_eclipse_language(rootfs: &Path) {
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-language [es|us|toggle|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-locale [es|us|toggle|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -210,22 +208,6 @@ pub(super) fn write_eclipse_language(rootfs: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // `eclipse-locale` is the name /etc/profile, the labwc menu and every
-    // already-installed machine call. It stays, as one line that execs the
-    // real script: two copies of this logic is how the two names drift apart.
-    let alias = localbin.join("eclipse-locale");
-    fs::write(
-        &alias,
-        b"#!/bin/sh\n\
-          # Eclipse OS: the older name of eclipse-language. One implementation.\n\
-          exec /usr/local/bin/eclipse-language \"$@\"\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&alias, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     let etc = rootfs.join("etc/eclipse");

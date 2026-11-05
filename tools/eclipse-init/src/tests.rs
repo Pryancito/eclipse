@@ -2676,12 +2676,12 @@ fn a_symlinked_exec_is_repaired_through_the_link() {
 }
 
 /// Every spelling of the two languages this image ships. The locale file
-/// is written by `eclipse-language` and by hand, so `es_ES` and `ES` reach
+/// is written by `eclipse-locale` and by hand, so `es_ES` and `ES` reach
 /// here as readily as `es` does -- and a spelling that falls through
 /// silently leaves a user who asked for English with a Spanish desktop.
 ///
 /// `us` and `US` are in the list because that is the word the command the
-/// user types is spelt with: `eclipse-language es|us`, the same two country
+/// user types is spelt with: `eclipse-locale es|us`, the same two country
 /// names as `eclipse-kbd`. Somebody who switches the desktop that way writes
 /// `lang=us` on the kernel command line without a second thought, and the
 /// only wrong answer is to ignore it and boot Spanish.
