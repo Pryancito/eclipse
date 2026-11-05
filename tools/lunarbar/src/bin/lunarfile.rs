@@ -44,11 +44,18 @@
 
 use std::os::fd::AsFd;
 
+#[path = "lunarfile/actions.rs"]
+mod actions;
+use actions::{Edit, Op};
+#[path = "lunarfile/job.rs"]
+mod job;
+use std::os::fd::AsRawFd;
+
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::{self, Entry};
 use lunarbar::fill_guard;
 use lunarbar::keys::{
-    key_char, BTN_LEFT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
+    key_char, BTN_LEFT, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_INSERT_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
     KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL, KEY_UP_WL, WHEEL_NOTCH,
 };
 use lunarbar::list::{inside_rect, move_selection, row_at_geom, scroll_top, Step};
@@ -316,6 +323,10 @@ enum Action {
     /// Space in `--multiple`: mark or unmark the selected row.
     Mark,
     Type(char),
+    /// F2, F5, F6, Insert, F7, Supr: an action on the selection.
+    Op(Op),
+    /// The Menu key: the action menu.
+    Menu,
     Ignore,
 }
 
@@ -330,6 +341,11 @@ fn key_action(key: u32, mode: Mode) -> Action {
         KEY_DOWN_WL | KEY_TAB_WL => Action::Move(1, Step::Wrap),
         KEY_PGUP_WL => Action::Page(-1),
         KEY_PGDN_WL => Action::Page(1),
+        // Only the browser changes files; a chooser answers a caller.
+        k if mode == Mode::Browse && actions::op_for_key(k).is_some() => {
+            actions::op_for_key(k).map_or(Action::Ignore, Action::Op)
+        }
+        k if mode == Mode::Browse && actions::is_menu_key(k) => Action::Menu,
         k => match key_char(k) {
             // Space marks when marking is what Space is for. In every other
             // mode it is a character, because filenames have spaces in them and
@@ -366,6 +382,8 @@ struct Frame {
     rows_shown: usize,
     /// One rect per place the rail drew, in `State::places` order.
     places: Vec<Rect>,
+    /// The action menu's rows, when it is open.
+    menu: Vec<(Rect, Op)>,
     buttons: Vec<(Rect, Button)>,
 }
 
@@ -437,6 +455,17 @@ struct State {
     list_rect: Rect,
     place_rects: Vec<Rect>,
     buttons: Vec<(Rect, Button)>,
+    /// The action menu, open on this row of `actions::OPS`.
+    menu: Option<usize>,
+    menu_rects: Vec<(Rect, Op)>,
+    /// A name being typed for a rename or a new folder; the filter it put
+    /// aside comes back when it is done.
+    edit: Option<Edit>,
+    kept_filter: String,
+    /// What was copied (false) or cut (true), waiting to be pasted.
+    held: Option<(String, bool)>,
+    /// The paste running in the background, if one is.
+    job: Option<job::Job>,
     row0_y: i32,
     /// How many rows the LAST frame actually drew, which on a short output is
     /// fewer than `MAX_ROWS`. Hit testing and the wheel both have to use this
@@ -487,7 +516,7 @@ impl State {
         // In Save the field is a filename, not a filter: narrowing the listing
         // as the user types a NEW name would empty the panel by the third
         // letter, since nothing in the directory is called that yet.
-        let filter = if self.mode == Mode::Save {
+        let filter = if self.mode == Mode::Save || self.edit.is_some() {
             ""
         } else {
             &self.field
@@ -892,6 +921,11 @@ impl State {
         self.rows_shown = f.rows_shown;
         self.place_rects = f.places;
         self.buttons = f.buttons;
+        self.menu_rects = f.menu;
+    }
+
+    fn menu_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.menu_rects.iter().position(|(r, _)| inside_rect(*r, x, y))
     }
 
     fn button_at(&self, x: f64, y: f64) -> Option<Button> {
@@ -1332,10 +1366,21 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     }
 
     let field_y = body_y;
-    let field_c = if st.armed() { WARN } else { p.border };
+    let field_c = if st.armed() {
+        WARN
+    } else if st.edit.is_some() {
+        p.accent
+    } else {
+        p.border
+    };
     cv.round_rect(lx, field_y, lw, FIELD_BOX, rad(6), field_c);
     cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, rad(5), p.field);
-    let label = if st.mode == Mode::Save {
+    let label = if let Some(e) = &st.edit {
+        match e {
+            Edit::Rename(_) => "Renombrar:",
+            Edit::NewDir => "Carpeta:",
+        }
+    } else if st.mode == Mode::Save {
         "Nombre:"
     } else {
         "Filtro:"
@@ -1495,7 +1540,8 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         Mode::Save => "Intro guardar  Esc cancelar  <- subir  . ocultos",
         Mode::OpenMany => "Espacio marcar  Intro aceptar  Esc cancelar  <- subir",
         Mode::Open => "Intro elegir  Esc cancelar  <- subir  . ocultos",
-        Mode::Browse => "Intro abrir  Esc cerrar  <- subir  . ocultos",
+        Mode::Browse if st.edit.is_some() => "Intro aceptar  Esc cancelar",
+        Mode::Browse => "Intro abrir  F2 renombrar  F5/F6 copiar/cortar  Insert pegar  F7 carpeta  Supr papelera  Menú acciones",
     };
     cv.text(
         &files::elide_middle(hint, text_chars),
@@ -1508,6 +1554,9 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         files::elide_middle(&st.note, text_chars)
     } else if st.mode == Mode::OpenMany && !st.marked.is_empty() {
         format!("{} marcados", st.marked.len())
+    } else if let Some((h, cut)) = &st.held {
+        let n = h.rsplit('/').next().unwrap_or(h);
+        format!("{}: {n} · Insert pega aquí", if *cut { "Cortado" } else { "Copiado" })
     } else {
         let files_n = st.rows.iter().filter(|r| !matches!(r, Row::Parent)).count();
         format!("{files_n} elementos")
@@ -1519,7 +1568,19 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     } else {
         p.accent
     };
-    cv.text(&status, px + PAD + 4, foot_y + 4 + GLYPH_H + 2, c);
+    let sy = foot_y + 4 + GLYPH_H + 2;
+    if let Some(j) = &st.job {
+        // A paste in progress: its bar, then how far and how to stop it.
+        let bw = job::draw_bar(cv, st, j, px + PAD + 4, sy + 2);
+        let room = ((text_r - (px + PAD + 4) - bw - 12) / GLYPH_W).max(8) as usize;
+        cv.text(&files::elide_middle(&j.line(), room), px + PAD + 4 + bw + 12, sy, p.text);
+    } else {
+        cv.text(&status, px + PAD + 4, sy, c);
+    }
+
+    // The action menu, over everything, under the selected row.
+    let sel_y = row0_y + (st.sel.saturating_sub(st.top)) as i32 * ROW_H + ROW_H - 2;
+    let menu = actions::draw_menu(cv, st, lx, lw, sel_y, foot_y);
 
     Frame {
         panel: (px, py, pw, ph),
@@ -1528,6 +1589,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         rows_shown: fits,
         places,
         buttons,
+        menu,
     }
 }
 
@@ -1663,7 +1725,48 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 /// a compositor to deliver them: everything here goes through `State`, and
 /// `render` is a no-op until a surface is configured.
 fn apply(st: &mut State, action: Action) {
+    // The action menu, while it is open, takes the keys.
+    if let Some(m) = st.menu {
+        let n = actions::OPS.len() as i32;
+        match action {
+            Action::Close | Action::Menu => st.menu = None,
+            Action::Move(d, _) => st.menu = Some((m as i32 + d).rem_euclid(n) as usize),
+            Action::Activate | Action::Commit => st.op(actions::OPS[m]),
+            Action::Op(o) => st.op(o),
+            _ => {}
+        }
+        st.render();
+        return;
+    }
+    // So does a name being typed: Enter does it, Esc drops it, and the keys
+    // that would move or act elsewhere do nothing until then.
+    if st.edit.is_some() {
+        match action {
+            Action::Close => st.cancel_edit(),
+            Action::Activate | Action::Commit => st.finish_edit(),
+            Action::Rub => {
+                st.field.pop();
+            }
+            Action::Type(c) if st.field.chars().count() < MAX_FIELD => st.field.push(c),
+            _ => {}
+        }
+        st.render();
+        return;
+    }
+    // Esc stops a running paste before it closes anything.
+    if action == Action::Close && st.cancel_job() {
+        st.render();
+        return;
+    }
     match action {
+        Action::Op(o) => {
+            st.op(o);
+            st.render();
+        }
+        Action::Menu => {
+            st.menu = Some(0);
+            st.render();
+        }
         Action::Close => st.done = true,
         Action::Activate => {
             let sel = st.sel;
@@ -1741,6 +1844,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => {
                 st.ptr = (surface_x, surface_y);
+                if st.menu.is_some() {
+                    if let Some(i) = st.menu_at(surface_x, surface_y) {
+                        if st.menu != Some(i) {
+                            st.menu = Some(i);
+                            st.render();
+                        }
+                    }
+                    return;
+                }
                 let row = st.row_at(surface_x, surface_y);
                 if row != st.hover {
                     st.hover = row;
@@ -1759,10 +1871,27 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state: WEnum::Value(wl_pointer::ButtonState::Pressed),
                 ..
             } => {
+                let (x, y) = st.ptr;
+                if st.menu.is_some() {
+                    // A click on an action does it; anywhere else closes the menu.
+                    match st.menu_at(x, y) {
+                        Some(i) if button == BTN_LEFT => st.op(st.menu_rects[i].1),
+                        _ => st.menu = None,
+                    }
+                    st.render();
+                    return;
+                }
+                if button == BTN_RIGHT && st.mode == Mode::Browse && st.edit.is_none() {
+                    if let Some(row) = st.row_at(x, y) {
+                        st.sel = row;
+                        st.menu = Some(0);
+                        st.render();
+                    }
+                    return;
+                }
                 if button != BTN_LEFT {
                     return;
                 }
-                let (x, y) = st.ptr;
                 if let Some(b) = st.button_at(x, y) {
                     st.press(b);
                     st.render();
@@ -2041,6 +2170,12 @@ fn new_state(cli: &Cli) -> State {
         list_rect: (0, 0, 0, 0),
         place_rects: Vec::new(),
         buttons: Vec::new(),
+        menu: None,
+        menu_rects: Vec::new(),
+        edit: None,
+        kept_filter: String::new(),
+        held: None,
+        job: None,
         row0_y: 0,
         rows_shown: MAX_ROWS,
         scroll_acc: 0.0,
@@ -2118,6 +2253,20 @@ fn main() {
                 st.sel = r;
             }
         }
+        // LUNARFILE_DUMP_MENU=n: with the action menu open on row n.
+        st.menu = std::env::var("LUNARFILE_DUMP_MENU").ok().and_then(|v| v.parse().ok());
+        // LUNARFILE_DUMP_JOB=0.45: a paste that far along (drawn, not run).
+        if let Some(f) = std::env::var("LUNARFILE_DUMP_JOB").ok().and_then(|v| v.parse::<f64>().ok()) {
+            let prog = std::sync::Arc::new(lunarbar::fileops::Progress::default());
+            prog.total.store(4_300_000_000, std::sync::atomic::Ordering::Relaxed);
+            prog.done.store((4_300_000_000.0 * f) as u64, std::sync::atomic::Ordering::Relaxed);
+            st.job = Some(job::Job { handle: None, prog, name: "eclipse.iso".into(), cut: false, dir: st.dir.clone() });
+        }
+        // LUNARFILE_DUMP_KEYS=60: those key codes pressed first (F2 renames...).
+        for k in std::env::var("LUNARFILE_DUMP_KEYS").unwrap_or_default().split(',').filter_map(|k| k.parse().ok()) {
+            let a = key_action(k, st.mode);
+            apply(&mut st, a);
+        }
         // try_new, not new: refusing beats aborting (`panic = "abort"`).
         let Some(mut cv) = Canvas::try_new(w, h) else {
             eprintln!("lunarfile: cannot allocate a {w}x{h} canvas");
@@ -2165,9 +2314,28 @@ fn main() {
         std::process::exit(1);
     }
     st.map_overlay(&qh);
+    // Blocking until the compositor says something, except while a paste
+    // runs: then the loop also wakes every tick to redraw its bar.
+    let tick = 100;
     while !st.done {
-        if queue.blocking_dispatch(&mut st).is_err() {
+        if queue.flush().is_err() {
             break;
+        }
+        if let Some(guard) = queue.prepare_read() {
+            let mut pfd = libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let timeout = if st.job.is_some() { tick } else { -1 };
+            // SAFETY: one valid pollfd for the length of the call.
+            if unsafe { libc::poll(&mut pfd, 1, timeout) } > 0 {
+                let _ = guard.read();
+            } else {
+                drop(guard);
+            }
+        }
+        if queue.dispatch_pending(&mut st).is_err() {
+            break;
+        }
+        if st.tick_job() {
+            st.render();
         }
     }
     let (picked, out, pick) = (
@@ -2655,6 +2823,103 @@ mod tests {
         std::fs::write(base.join("b.wav"), vec![0u8; 2048]).unwrap();
         std::fs::write(base.join(".oculto"), b"x").unwrap();
         base.to_str().unwrap().to_string()
+    }
+
+    // ── acting on files ──────────────────────────────────────────────────────
+
+    fn press(st: &mut State, key: u32) {
+        apply(st, key_action(key, st.mode));
+    }
+
+    /// Wait for a background paste to end, and take its result.
+    fn settle(st: &mut State) {
+        while st.job.as_ref().is_some_and(|j| j.running()) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        st.tick_job();
+    }
+
+    fn typed(st: &mut State, s: &str) {
+        for c in s.chars() {
+            apply(st, Action::Type(c));
+        }
+    }
+
+    #[test]
+    fn f2_renames_in_place_and_esc_puts_the_filter_back() {
+        let base = tree("rename");
+        let mut st = state(Mode::Browse, &base);
+        st.sel = row_of(&st, "a.txt");
+        press(&mut st, 60); // F2
+        assert_eq!(st.field, "a.txt", "the field starts with the old name");
+        assert_eq!(st.rows.len(), 4, "the list is not filtered by the name being typed");
+        for _ in 0..3 {
+            press(&mut st, KEY_BACKSPACE_WL);
+        }
+        typed(&mut st, "md");
+        press(&mut st, KEY_ENTER_WL);
+        assert!(std::path::Path::new(&base).join("a.md").exists());
+        assert!(st.edit.is_none() && st.field.is_empty());
+        assert_eq!(st.entry(st.sel).unwrap().name, "a.md", "the selection follows the file");
+        // Esc while renaming leaves everything as it was.
+        typed(&mut st, "b");
+        st.sel = row_of(&st, "b.wav");
+        press(&mut st, 60);
+        press(&mut st, KEY_ESC_WL);
+        assert_eq!((st.field.as_str(), st.done), ("b", false), "Esc closed the rename, not the browser");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_then_paste_elsewhere_and_a_new_folder_from_the_keys() {
+        let base = tree("paste");
+        let mut st = state(Mode::Browse, &base);
+        press(&mut st, KEY_INSERT_WL);
+        assert!(st.note.starts_with("Nada que pegar"), "{}", st.note);
+        st.sel = row_of(&st, "a.txt");
+        press(&mut st, 63); // F5
+        st.sel = row_of(&st, "sub");
+        st.activate(st.sel);
+        press(&mut st, KEY_INSERT_WL);
+        settle(&mut st);
+        let sub = std::path::Path::new(&base).join("sub");
+        assert!(sub.join("a.txt").exists() && std::path::Path::new(&base).join("a.txt").exists());
+        // Pasting again does not replace, it copies alongside.
+        press(&mut st, KEY_INSERT_WL);
+        settle(&mut st);
+        assert!(sub.join("a (copia).txt").exists());
+        press(&mut st, 65); // F7
+        assert_eq!(st.field, "Carpeta nueva");
+        press(&mut st, KEY_ENTER_WL);
+        assert!(sub.join("Carpeta nueva").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_menu_is_driven_like_the_list_and_only_the_browser_has_it() {
+        let base = tree("menu");
+        let mut st = state(Mode::Browse, &base);
+        st.sel = row_of(&st, "a.txt");
+        press(&mut st, 127); // Menu
+        assert_eq!(st.menu, Some(0));
+        press(&mut st, KEY_UP_WL);
+        assert_eq!(st.menu, Some(actions::OPS.len() - 1), "it wraps");
+        press(&mut st, KEY_DOWN_WL);
+        press(&mut st, KEY_DOWN_WL); // Renombrar
+        press(&mut st, KEY_ENTER_WL);
+        assert!(st.menu.is_none());
+        assert!(matches!(st.edit, Some(Edit::Rename(_))));
+        press(&mut st, KEY_ESC_WL);
+        // Drawn, the menu hands back a rect per action.
+        st.menu = Some(0);
+        let mut cv = Canvas::try_new(1280, 720).unwrap();
+        let f = draw_browser(&mut cv, 1280, 720, &st);
+        assert_eq!(f.menu.len(), actions::OPS.len());
+        for m in [Mode::Open, Mode::OpenMany, Mode::Save] {
+            assert_eq!(key_action(60, m), Action::Ignore, "{m:?}");
+            assert_eq!(key_action(127, m), Action::Ignore, "{m:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
