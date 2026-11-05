@@ -506,8 +506,10 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
         0x1_0000_0000,
         ResourceFlags::empty(),
     );
-    // No "power" resource: `zx_system_powerctl` is not implemented here, and
-    // userboot only reaches for it when the kernel offers one.
+    // No "power" resource is handed over, and none is needed: userboot carves
+    // its own out of the system resource above with `zx_resource_create(..,
+    // base = SystemResource::Power, size = 1, "power")` and passes that to
+    // `zx_system_powerctl`.
 
     // stack
     //
