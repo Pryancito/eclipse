@@ -36,7 +36,7 @@ const PAD: i32 = 12;
 const LINE: i32 = GLYPH_H + 4;
 const BTN_H: i32 = 24;
 const MORE_H: i32 = 24;
-const CLOSE: i32 = 18;
+const CLOSE: i32 = 20;
 
 /// Where a card came from, which is what its buttons have to answer.
 #[derive(Clone, Debug, PartialEq, Eq)]

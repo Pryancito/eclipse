@@ -170,17 +170,20 @@ fn palette(look: Look) -> &'static Palette {
 const PANEL_W: i32 = 860;
 const MIN_PANEL_W: i32 = 360;
 /// The path header.
-const HEAD_H: i32 = 34;
+const HEAD_H: i32 = 32;
 /// The filter / filename field.
 const FIELD_H: i32 = 40;
-const ROW_H: i32 = 30;
-const PAD: i32 = 10;
+/// The filter field drawn inside its `FIELD_H` slot: on the 4-px grid, like
+/// every other measure here.
+const FIELD_BOX: i32 = FIELD_H - 8;
+const ROW_H: i32 = 32;
+const PAD: i32 = 12;
 /// Two lines: the key hints and whatever the last action had to say.
 const FOOT_H: i32 = 40;
 const ICON: i32 = 20;
 /// The column titles above the rows (Nombre / Tamaño / Modificado). Dropped
 /// on a panel too short to also show a few rows: see `cols_h`.
-const COLS_H: i32 = 18;
+const COLS_H: i32 = 20;
 /// The places rail, on a panel wide enough to give it up: see `rail_w`.
 const RAIL_W: i32 = 168;
 const RAIL_MIN_PANEL: i32 = 620;
@@ -1173,14 +1176,14 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
 
     let field_y = body_y;
     let field_c = if st.armed() { WARN } else { p.border };
-    cv.round_rect(lx, field_y, lw, FIELD_H - 6, rad(6), field_c);
+    cv.round_rect(lx, field_y, lw, FIELD_BOX, rad(6), field_c);
     cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, rad(5), p.field);
     let label = if st.mode == Mode::Save {
         "Nombre:"
     } else {
         "Filtro:"
     };
-    let ty = field_y + (FIELD_H - 6 - GLYPH_H) / 2;
+    let ty = field_y + (FIELD_BOX - GLYPH_H) / 2;
     cv.text(label, lx + 8, ty, p.dim);
     let lbw = Canvas::text_width(label) + 8;
     // A caret, so an empty field reads as one waiting for typing rather than as
@@ -1202,7 +1205,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let size_r = if dates { date_x - COL_GAP } else { lx + lw - 8 };
 
     let cols = cols_h(ph);
-    let row0_y = field_y + FIELD_H - 6 + PAD + cols;
+    let row0_y = field_y + FIELD_BOX + PAD + cols;
     if cols > 0 {
         let cy = row0_y - cols;
         let [nom, tam, modi] = if hud {

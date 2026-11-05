@@ -204,9 +204,9 @@ const PAD: i32 = 16;
 const HEAD_H: i32 = 56;
 const RAIL_W: i32 = 180;
 const TAB_H: i32 = 36;
-const FOOT_H: i32 = 30;
+const FOOT_H: i32 = 32;
 const ROW_H: i32 = 24;
-const BTN_H: i32 = 30;
+const BTN_H: i32 = 28;
 const SEG_W: i32 = 84;
 /// Lines of a job's output a tab shows.
 const CONSOLE_LINES: usize = 7;
