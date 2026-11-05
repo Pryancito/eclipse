@@ -64,6 +64,16 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
+/// The wallpaper the current look wants, read once: `eclipse-look` restarts
+/// lunarbg when it switches, so a running instance never has to re-read it.
+fn look_style() -> scene::Style {
+    static STYLE: std::sync::OnceLock<scene::Style> = std::sync::OnceLock::new();
+    *STYLE.get_or_init(|| {
+        let file = std::fs::read_to_string("/etc/eclipse/look").ok();
+        scene::style_from(std::env::var("ECLIPSE_LOOK").ok().as_deref(), file.as_deref())
+    })
+}
+
 /// Two persistent frame buffers per output, alternated each frame.
 const BUFFERS: usize = 2;
 
@@ -618,8 +628,8 @@ impl State {
         pool.destroy();
 
         ckpt!("configure {w}x{h}: mmap ok; rendering base scene");
-        let layout = scene::layout(w, h, aspect, scale);
-        let Some(base) = scene::render_base(w, h, aspect, scale) else {
+        let layout = scene::layout_styled(w, h, aspect, scale, look_style());
+        let Some(base) = scene::render_base_styled(w, h, aspect, scale, look_style()) else {
             eprintln!("lunarbg: render_base failed for {w}x{h} (alloc)");
             for b in &buffers {
                 b.destroy();
@@ -1469,8 +1479,8 @@ fn run_dump(spec: &str, t_ms: u64, aspect: Option<f32>) {
     }
     // Offscreen: honour only the CLI/env aspect override (no geometry).
     let aspect = aspect.or_else(scene::aspect_from_env);
-    let lay = scene::layout(w, h, aspect, 1);
-    let Some(base) = scene::render_base(w, h, aspect, 1) else {
+    let lay = scene::layout_styled(w, h, aspect, 1, look_style());
+    let Some(base) = scene::render_base_styled(w, h, aspect, 1, look_style()) else {
         eprintln!("lunarbg: render_base failed for dump {w}x{h}");
         std::process::exit(1);
     };
@@ -1489,8 +1499,8 @@ fn run_bench(n: u32) {
     let (w, h) = (1920usize, 1080usize);
     let t0 = Instant::now();
     // Explicit None: do not let LUNARBG_ASPECT skew bench timings.
-    let lay = scene::layout(w, h, None, 1);
-    let Some(base) = scene::render_base(w, h, None, 1) else {
+    let lay = scene::layout_styled(w, h, None, 1, look_style());
+    let Some(base) = scene::render_base_styled(w, h, None, 1, look_style()) else {
         eprintln!("lunarbg: render_base failed for bench");
         std::process::exit(1);
     };

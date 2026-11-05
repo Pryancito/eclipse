@@ -23,8 +23,9 @@ use std::{fs, path::Path};
 /// D-Bus, no Qt, no KF6):
 ///   * the labwc window theme, by rewriting `<name>` in `rc.xml` in place;
 ///   * the foot palette, by copying `foot.kde.ini` / `foot.eclipse.ini`;
-///   * the panel, which reads `/etc/eclipse/look` itself on start -- so the
-///     switch restarts lunarbar (eclipse-init respawns it at once).
+///   * the panel and the wallpaper, which read `/etc/eclipse/look` themselves
+///     on start -- so the switch restarts lunarbar and lunarbg (eclipse-init
+///     respawns both at once).
 pub(super) fn write_eclipse_look(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -122,9 +123,11 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20   elif [ -x /usr/bin/labwc ]; then\n\
           \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
           \x20   fi\n\
-          # The panel reads /etc/eclipse/look once at start; eclipse-init\n\
-          # respawns it with the new look immediately.\n\
+          # The panel and the wallpaper read /etc/eclipse/look once at start\n\
+          # (tecno has its own wallpaper); eclipse-init respawns both with\n\
+          # the new look immediately.\n\
           \x20   pkill -x lunarbar 2>/dev/null || true\n\
+          \x20   pkill -x lunarbg 2>/dev/null || true\n\
           \x20 fi\n\
           \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
           }\n\

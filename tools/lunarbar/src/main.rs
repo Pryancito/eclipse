@@ -60,6 +60,8 @@ use lunarbar::look::Look;
 use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysinfo};
 
 mod hunter_menu;
+mod info;
+use info::*;
 mod hunter_toast;
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
@@ -751,6 +753,8 @@ struct Metrics {
     /// Download rate in bytes/s — raw units, scaled to its own window at the
     /// moment it is drawn.
     net_hist: meter::Ring,
+    /// The focused window, as the tecno top bar centres it (empty: none).
+    title: String,
 }
 
 #[derive(Default)]
@@ -852,6 +856,7 @@ impl State {
             cpu_hist: self.hist.0.clone(),
             mem_hist: self.hist.1.clone(),
             net_hist: self.hist.2.clone(),
+            title: String::new(), // filled per render, from the toplevels
         };
         if self.tick.is_multiple_of(hunter_menu::REFRESH_TICKS) {
             self.refresh_hunter();
@@ -1152,7 +1157,8 @@ impl State {
         if !self.bars[idx].configured || self.bars[idx].map.is_null() {
             return;
         }
-        let m = self.metrics.clone();
+        let mut m = self.metrics.clone();
+        m.title = active_title(&self.toplevels);
         match self.bars[idx].role {
             Role::Info => {
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
@@ -1249,7 +1255,7 @@ impl State {
         let ids: Vec<u32> = self
             .bars
             .iter()
-            .filter(|b| b.configured && b.role == Role::Task)
+            .filter(|b| b.configured && (b.role == Role::Task || tecno()))
             .map(|b| b.layer.id().protocol_id())
             .collect();
         for id in ids {
@@ -2562,9 +2568,10 @@ fn draw_task(
             }
         }
 
+        // Under tecno CPU and MEM are on the top bar, as in mockup A.
         let mem_s = cap(&format!("mem {}%", opt(m.mem)));
         let mw = Canvas::text_width(&mem_s) + 10 + hist_w(&m.mem_hist);
-        if rx - mw >= left_min {
+        if !tecno() && rx - mw >= left_min {
             rx -= mw;
             let col = if m.mem.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
             let hw = hist(cv, rx, h as i32, &m.mem_hist, false);
@@ -2574,7 +2581,7 @@ fn draw_task(
 
         let cpu_s = cap(&format!("cpu {}%", opt(m.cpu)));
         let cw = Canvas::text_width(&cpu_s) + 10 + hist_w(&m.cpu_hist);
-        if rx - cw >= left_min {
+        if !tecno() && rx - cw >= left_min {
             rx -= cw;
             let col = if m.cpu.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
             let hw = hist(cv, rx, h as i32, &m.cpu_hist, false);
@@ -2718,210 +2725,6 @@ fn bar_edge(cv: &mut Canvas, w: i32, y_edge: i32, y_in: i32, lead_left: bool) {
 
 // ── Top bar: system info ─────────────────────────────────────────────────────
 
-/// Cells in a segmented meter, and the width both meters occupy. Seven cells
-/// of 3px with a 1px gap come to 27, one over the continuous gauge's 26, so
-/// the gauge is the one that gives: the modules are laid out from the right
-/// edge and a meter that measured differently per look would move everything
-/// to its left.
-const METER_CELLS: i32 = 7;
-const METER_W: i32 = METER_CELLS * 4 - 1;
-/// Height of a module's history plot. Short enough to sit inside the row of
-/// text it belongs to, tall enough that a spike is a spike.
-const HIST_H: i32 = 11;
-
-/// Width a module has to reserve for its history, including the gap before
-/// the label — zero in the looks that do not draw one, and zero until there
-/// is something to draw.
-fn hist_w(r: &meter::Ring) -> i32 {
-    if tecno() && !r.is_empty() {
-        METER_W + 6
-    } else {
-        0
-    }
-}
-
-/// Draw that history. The slot is exactly as wide as the segmented meter, so
-/// a module that gains a past does not move the modules to its left.
-fn hist(cv: &mut Canvas, x: i32, h: i32, r: &meter::Ring, scaled: bool) -> i32 {
-    let w = hist_w(r);
-    if w == 0 {
-        return 0;
-    }
-    let p = pal();
-    meter::plot(cv, x, (h - HIST_H) / 2, METER_W, HIST_H, r, scaled, p.pill, p.accent, p.warn);
-    w
-}
-
-fn metric(
-    cv: &mut Canvas,
-    right: i32,
-    min_x: i32,
-    ty: i32,
-    h: i32,
-    label: &str,
-    gauge: Option<f32>,
-    col: Rgb,
-) -> Option<i32> {
-    let tw = Canvas::text_width(label);
-    // The two meters must measure the SAME, or switching looks would shift
-    // every module on the bar by a few pixels and the hit boxes with them.
-    let (gw, gpad) = if gauge.is_some() { (METER_W, 6) } else { (0, 0) };
-    let total = gw + gpad + tw;
-    let x = right - total;
-    if x < min_x {
-        return None;
-    }
-    if let Some(f) = gauge {
-        let ghh = 7;
-        let gy = (h - ghh) / 2;
-        if tecno() {
-            // Segments, not a continuous bar: a meter with a scale on it is
-            // the one piece of this look that is not just a colour change.
-            // And the lit colour is the sample's, not the theme's: one
-            // ramp, no thresholds to argue about.
-            let c = meter::ramp(f, pal().accent, pal().warn);
-            cv.blocks(x, gy, METER_CELLS, f, ghh, c, pal().dim);
-        } else {
-            cv.gauge(x, gy, gw, ghh, f, pal().pill);
-        }
-    }
-    cv.text(label, x + gw + gpad, ty, col);
-    Some(x)
-}
-
-fn net_module(
-    cv: &mut Canvas,
-    right: i32,
-    min_x: i32,
-    ty: i32,
-    h: i32,
-    n: &NetRate,
-    hd: &meter::Ring,
-) -> Option<i32> {
-    let down = sysinfo::fmt_rate(n.down);
-    let up = sysinfo::fmt_rate(n.up);
-    let ts = 9;
-    let ty_tri = (h - ts) / 2;
-    let dw = Canvas::text_width(&down);
-    let uw = Canvas::text_width(&up);
-    let total = hist_w(hd) + ts + 4 + dw + 10 + ts + 4 + uw;
-    let x = right - total;
-    if x < min_x {
-        return None;
-    }
-    let mut cx = x;
-    // Scaled to its own window: a link that idles at 2 kB/s and bursts to 2
-    // MB/s has no useful fixed axis, so the plot picks one every tick.
-    cx += hist(cv, cx, h, hd, true);
-    cv.triangle(cx, ty_tri, ts, false, pal().accent);
-    cx += ts + 4;
-    cx += cv.text(&down, cx, ty, pal().muted);
-    cx += 10;
-    cv.triangle(cx, ty_tri, ts, true, pal().accent);
-    cx += ts + 4;
-    cv.text(&up, cx, ty, pal().muted);
-    Some(x)
-}
-
-fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> ((i32, i32), (i32, i32), (i32, i32)) {
-    clear_bar(cv, w, h);
-    bar_edge(cv, w as i32, h as i32 - 2, h as i32 - 1, true);
-
-    let ty = (h as i32 - 2 - GLYPH_H) / 2;
-    let hi = h as i32;
-    let btn_h = hi - 10;
-    let btn_y = (hi - btn_h) / 2;
-
-    let d = (hi * 18) / 34;
-    let ly = (hi - d) / 2;
-    let mut lx = 10 + d + 8;
-    let wordmark = cap("eclipse");
-    let wordmark_w = Canvas::text_width(&wordmark);
-    let launcher_hit = (0, lx + wordmark_w + 4);
-    if hover == Hover::Launcher {
-        plate_a(cv, 2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
-    }
-    cv.crescent(10, ly, d, pal().accent);
-    lx += cv.text_bold(&wordmark, lx, ty, if tecno() { pal().accent } else { pal().text });
-
-    if let Some(up) = &m.uptime {
-        lx += 12;
-        cv.vrule(lx, hi, pal().rule);
-        lx += 12;
-        lx += cv.text(&cap(&format!("up {up}")), lx, ty, pal().muted);
-    }
-    if let Some(load) = m.load {
-        lx += 12;
-        cv.vrule(lx, hi, pal().rule);
-        lx += 12;
-        lx += cv.text(&cap(&format!("load {load:.2}")), lx, ty, pal().muted);
-    }
-
-    let min_x = lx + 12;
-    let mut rx = w as i32 - 4;
-    let mut clock_hit = (0, 0);
-    let mut power_hit = (0, 0);
-
-    {
-        let pw_size = 14;
-        let pw_w = pw_size + 16;
-        if rx - pw_w >= min_x {
-            rx -= pw_w;
-            let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
-            plate(cv, rx, btn_y, pw_w, btn_h, 6, pill);
-            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, if tecno() { pal().warn } else { pal().white });
-            power_hit = (rx, rx + pw_w);
-            rx -= 10;
-        }
-
-        let pw = Canvas::text_width(&cap(&m.date)) + 20;
-        if rx - pw >= min_x {
-            rx -= pw;
-            let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
-            plate(cv, rx, btn_y, pw, btn_h, 6, pill);
-            cv.text_bold(&cap(&m.date), rx + 10, ty, pal().text);
-            clock_hit = (rx, rx + pw);
-            rx -= 10;
-        }
-    }
-    if let Some((b, ch)) = m.batt {
-        let label = cap(&if ch { format!("bat {b}% +") } else { format!("bat {b}%") });
-        let col = if b < 15 && !ch { pal().warn } else { pal().muted };
-        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &label, Some(b as f32 / 100.0), col) {
-            rx = x - 12;
-            cv.vrule(rx, hi, pal().rule);
-        }
-    }
-    if let Some(t) = m.temp {
-        let col = if t >= 85 { pal().warn } else { pal().muted };
-        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &cap(&format!("{t}°c")), None, col) {
-            rx = x - 12;
-            cv.vrule(rx, hi, pal().rule);
-        }
-    }
-    if let Some(dk) = m.disk {
-        if let Some(x) = metric(
-            cv,
-            rx - 10,
-            min_x,
-            ty,
-            hi,
-            &cap(&format!("disk {dk}%")),
-            Some(dk as f32 / 100.0),
-            pal().muted,
-        ) {
-            rx = x - 12;
-            cv.vrule(rx, hi, pal().rule);
-        }
-    }
-    if let Some(n) = &m.net {
-        if n.link {
-            net_module(cv, rx - 10, min_x, ty, hi, n, &m.net_hist);
-        }
-    }
-
-    (launcher_hit, clock_hit, power_hit)
-}
 
 // ── Launcher menu drawing ────────────────────────────────────────────────────
 
@@ -3478,6 +3281,20 @@ fn short_label(title: &str, app_id: &str) -> (String, bool) {
 /// each render as a full-width '?' — and a stray '\n' would draw a second
 /// text line bleeding out of the button — so translate what has an ASCII
 /// cousin, drop what is invisible, and collapse the rest into a single '?'.
+/// `app · title` of the activated window, for the tecno top bar.
+fn active_title(tl: &[Toplevel]) -> String {
+    tl.iter().find(|t| t.activated).map_or_else(String::new, |t| title_of(&t.app_id, &t.title))
+}
+
+fn title_of(app_id: &str, title: &str) -> String {
+    let (app, title) = (sanitize_title(app_id), sanitize_title(title));
+    match (app.trim(), title.trim()) {
+        ("", t) | (t, "") => t.to_string(),
+        (a, t) if a.eq_ignore_ascii_case(t) => t.to_string(),
+        (a, t) => format!("{a} · {t}"),
+    }
+}
+
 fn sanitize_title(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for ch in src.chars() {
@@ -4481,6 +4298,7 @@ fn main() {
             cpu_hist: h.0,
             mem_hist: h.1,
             net_hist: h.2,
+            title: "foot · root@eclipse: ~".into(),
         };
 
         // Top info bar occupies rows [0, bh) — in the KDE look there is no

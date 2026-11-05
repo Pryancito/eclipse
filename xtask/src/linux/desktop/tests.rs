@@ -2080,7 +2080,7 @@ fn the_look_script_rewrites_every_place_the_old_look_is_named() {
         script.contains("if [ \"$boot\" != boot ]; then"),
         "the boot path is not told apart from a live change:\n{script}"
     );
-    for live in ["labwc --reconfigure", "pkill -x lunarbar"] {
+    for live in ["labwc --reconfigure", "pkill -x lunarbar", "pkill -x lunarbg"] {
         assert!(
             script.contains(live),
             "a live look change does not {live}:\n{script}"
