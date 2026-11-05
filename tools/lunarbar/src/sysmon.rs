@@ -6,6 +6,7 @@
 //! share from two samples of tick counters, a rate from two sector counts)
 //! is tested without a `/proc`.
 
+use crate::i18n::Lang;
 use std::path::Path;
 
 /// `USER_HZ`: the unit of the tick counters in `/proc/stat` and
@@ -324,9 +325,10 @@ pub fn log_tail(path: &Path, n: usize) -> Vec<String> {
 // ── words ────────────────────────────────────────────────────────────────────
 
 /// `612 MiB`, `2,1 GiB`, from KiB.
-pub fn fmt_kib(kib: u64) -> String {
+pub fn fmt_kib(kib: u64, lang: Lang) -> String {
     if kib >= 1024 * 1024 {
-        format!("{:.1} GiB", kib as f64 / (1024.0 * 1024.0)).replace('.', ",")
+        format!("{:.1} GiB", kib as f64 / (1024.0 * 1024.0))
+            .replace('.', &lang.decimal_point().to_string())
     } else if kib >= 1024 {
         format!("{} MiB", kib / 1024)
     } else {
@@ -438,9 +440,12 @@ mod tests {
 
     #[test]
     fn the_numbers_read_like_a_person_says_them() {
-        assert_eq!(fmt_kib(612 * 1024), "612 MiB");
-        assert_eq!(fmt_kib(2_202_009), "2,1 GiB");
-        assert_eq!(fmt_kib(900), "900 KiB");
+        assert_eq!(fmt_kib(612 * 1024, Lang::Es), "612 MiB");
+        assert_eq!(fmt_kib(2_202_009, Lang::Es), "2,1 GiB");
+        assert_eq!(fmt_kib(900, Lang::Es), "900 KiB");
+        // La fracción se escribe como la escribe el idioma: `2,1` y `2.1`.
+        assert_eq!(fmt_kib(2_202_009, Lang::En), "2.1 GiB");
+        assert_eq!(fmt_kib(612 * 1024, Lang::En), "612 MiB");
         assert_eq!(fmt_secs(3 * 3600 + 12 * 60), "3 h 12 min");
         assert_eq!(fmt_ticks(25_100), "0:04:11");
         assert_eq!(cmdline_text(b"/usr/bin/foot\0-e\0sh\0"), "/usr/bin/foot -e sh");

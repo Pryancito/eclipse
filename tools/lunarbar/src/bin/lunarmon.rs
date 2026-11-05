@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ESC_WL, KEY_HOME_WL, KEY_PGDN_WL, KEY_PGUP_WL,
     KEY_TAB_WL, KEY_UP_WL,
@@ -155,15 +155,6 @@ struct Prev {
     net: (u64, u64),
 }
 
-/// The Spanish or the English of one text, by the desktop's language.
-fn tr(l: Lang, es: &'static str, en: &'static str) -> &'static str {
-    if l == Lang::En {
-        en
-    } else {
-        es
-    }
-}
-
 struct Mon {
     /// Spanish unless the desktop says English; the tests keep Spanish.
     lang: Lang,
@@ -242,11 +233,11 @@ impl Mon {
         sort(&mut sys);
         let mut out = Vec::new();
         if !apps.is_empty() {
-            out.push(Item::Section(tr(self.lang, "APLICACIONES · con ventana", "APPLICATIONS · with a window")));
+            out.push(Item::Section(self.lang.s(Key::mon_applications_with_a_window)));
             out.extend(apps.into_iter().map(Item::Proc));
         }
         if !sys.is_empty() {
-            out.push(Item::Section(tr(self.lang, "SISTEMA", "SYSTEM")));
+            out.push(Item::Section(self.lang.s(Key::mon_system)));
             out.extend(sys.into_iter().map(Item::Proc));
         }
         out
@@ -328,10 +319,7 @@ impl Mon {
             .is_some_and(|(p, at)| *p == what && at.elapsed() < Duration::from_secs(4));
         if critical && !fresh {
             let who = target_name(self, &what);
-            self.status = match self.lang {
-                Lang::En => format!("{who} is part of the desktop: press again to confirm"),
-                Lang::Es => format!("{who} es parte del escritorio: pulsa otra vez para confirmar"),
-            };
+            self.status = format!("{who} {}", self.lang.s(Key::mon_part_of_the_desktop));
             self.bad = true;
             self.pending = Some((what, Instant::now()));
             return;
@@ -343,7 +331,7 @@ impl Mon {
                 self.bad = false;
             }
             Err(e) => {
-                self.status = format!("{}: {e}", tr(self.lang, "no se pudo", "could not"));
+                self.status = format!("{}: {e}", self.lang.s(Key::mon_could_not));
                 self.bad = true;
             }
         }
@@ -351,12 +339,12 @@ impl Mon {
 
     fn signal_selected(&mut self, kill: bool, act: &mut dyn FnMut(&Pending) -> std::io::Result<()>) {
         let Some(r) = self.selected_row().cloned() else {
-            self.status = tr(self.lang, "elige un proceso de la lista", "pick a process from the list").into();
+            self.status = self.lang.s(Key::mon_pick_a_process_from_the_list).into();
             self.bad = true;
             return;
         };
         if r.pid == 1 {
-            self.status = tr(self.lang, "eclipse-init no se termina desde aquí", "eclipse-init is not ended from here").into();
+            self.status = self.lang.s(Key::mon_eclipse_init_is_not_ended_from_her).into();
             self.bad = true;
             return;
         }
@@ -367,10 +355,7 @@ impl Mon {
     fn service_verb(&mut self, verb: Verb, act: &mut dyn FnMut(&Pending) -> std::io::Result<()>) {
         let Some(s) = self.svcs.get(self.sel_svc).cloned() else { return };
         if s.kind != "respawn" {
-            self.status = match self.lang {
-                Lang::En => format!("{} runs once at boot: it is not started or stopped", s.name),
-                Lang::Es => format!("{} se ejecuta una vez al arrancar: no se inicia ni se para", s.name),
-            };
+            self.status = format!("{} {}", s.name, self.lang.s(Key::mon_runs_once_at_boot));
             self.bad = true;
             return;
         }
@@ -418,7 +403,7 @@ impl Mon {
         self.m.disk_name = match disks.len() {
             0 => String::new(),
             1 => disks[0].0.clone(),
-            n => format!("{} {}", n, tr(self.lang, "discos", "disks")),
+            n => format!("{} {}", n, self.lang.s(Key::mon_disks)),
         };
 
         let mut ticks = HashMap::with_capacity(procs.len());
@@ -477,7 +462,12 @@ impl Mon {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|s| sysmon::fmt_secs(s as u64))
             .unwrap_or_default();
-        self.m.load = read("/proc/loadavg").split_whitespace().take(3).collect::<Vec<_>>().join(" ").replace('.', ",");
+        self.m.load = read("/proc/loadavg")
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('.', &self.lang.decimal_point().to_string());
         let (iface, addr) = first_iface();
         self.m.iface = iface;
         self.m.addr = addr;
@@ -500,11 +490,11 @@ fn done_text(m: &Mon, p: &Pending) -> String {
     let who = target_name(m, p);
     let l = m.lang;
     match p {
-        Pending::Signal(pid, false) => format!("{who} ({pid}): {}", tr(l, "pedido que termine", "asked to end")),
-        Pending::Signal(pid, true) => format!("{who} ({pid}): {}", tr(l, "terminado a la fuerza", "killed")),
-        Pending::Service(_, Verb::Start) => format!("{who}: {}", tr(l, "pedido a eclipse-init que lo inicie", "eclipse-init asked to start it")),
-        Pending::Service(_, Verb::Stop) => format!("{who}: {}", tr(l, "parado hasta que se inicie o se reinicie el equipo", "stopped until started again or the next boot")),
-        Pending::Service(_, Verb::Restart) => format!("{who}: {}", tr(l, "reiniciando", "restarting")),
+        Pending::Signal(pid, false) => format!("{who} ({pid}): {}", l.s(Key::mon_asked_to_end)),
+        Pending::Signal(pid, true) => format!("{who} ({pid}): {}", l.s(Key::mon_killed)),
+        Pending::Service(_, Verb::Start) => format!("{who}: {}", l.s(Key::mon_eclipse_init_asked_to_start_it)),
+        Pending::Service(_, Verb::Stop) => format!("{who}: {}", l.s(Key::mon_stopped_until_started_again_or_the)),
+        Pending::Service(_, Verb::Restart) => format!("{who}: {}", l.s(Key::mon_restarting)),
     }
 }
 
@@ -573,6 +563,14 @@ fn svc_list_w(w: i32) -> i32 {
 
 // ── drawing ──────────────────────────────────────────────────────────────────
 
+/// `14,2 %` en castellano y `14.2 %` en inglés. La coma estaba fija, así que
+/// una sesión en inglés leía los decimales de todo el panel --- la CPU por
+/// proceso, la media de carga y los GiB de memoria --- escritos a la
+/// castellana.
+fn pct(v: f32, lang: Lang) -> String {
+    format!("{v:.1} %").replace('.', &lang.decimal_point().to_string())
+}
+
 fn fit(s: &str, px: i32) -> String {
     let cols = (px / GLYPH_W).max(1) as usize;
     if s.chars().count() <= cols {
@@ -620,7 +618,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     // Head.
     let hy = (HEAD_H - GLYPH_H) / 2;
     cv.text_bold("MONITOR", PAD, hy, CYAN);
-    for (k, (r, label)) in tabs(w).iter().zip([tr(m.lang, "PROCESOS", "PROCESSES"), tr(m.lang, "SERVICIOS", "SERVICES")]).enumerate() {
+    for (k, (r, label)) in tabs(w).iter().zip([m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services)]).enumerate() {
         let on = (k == 0) == (m.tab == Tab::Procs);
         cv.fill_rect_a(r.0, r.1, r.2, r.3, if on { CYAN } else { WELL }, if on { 0.16 } else { 1.0 });
         frame(cv, *r, if on { CYAN } else { HAIRLINE });
@@ -634,18 +632,18 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     }
     let summary = match m.tab {
         Tab::Procs => {
-            let mut s = format!("{} {}", tr(m.lang, "encendido", "up"), m.m.uptime);
+            let mut s = format!("{} {}", m.lang.s(Key::mon_up), m.m.uptime);
             if !m.m.load.is_empty() {
-                s += &format!(" · {} {}", tr(m.lang, "carga", "load"), m.m.load);
+                s += &format!(" · {} {}", m.lang.s(Key::mon_load), m.m.load);
             }
             s
         }
         Tab::Svcs => {
             let run = m.svcs.iter().filter(|s| s.state == "running").count();
             let bad = m.svcs.iter().filter(|s| sysmon::state_word(&s.state, m.lang).1).count();
-            let mut s = format!("eclipse-init · {} {} · {run} {}", m.svcs.len(), tr(m.lang, "servicios", "services"), tr(m.lang, "en marcha", "running"));
+            let mut s = format!("eclipse-init · {} {} · {run} {}", m.svcs.len(), m.lang.s(Key::mon_services_2), m.lang.s(Key::mon_running));
             if bad > 0 {
-                s += &format!(" · {bad} {}", tr(m.lang, "con problemas", "in trouble"));
+                s += &format!(" · {bad} {}", m.lang.s(Key::mon_in_trouble));
             }
             s
         }
@@ -694,34 +692,34 @@ fn draw_strip(cv: &mut Canvas, w: i32, m: &Mon) {
 
     // Memory.
     let mem = &m.m.mem;
-    plate_head(cv, xs[1], top, pw, tr(m.lang, "MEMORIA", "MEMORY"), &format!("{} / {}", sysmon::fmt_kib(mem.used()), sysmon::fmt_kib(mem.total)));
+    plate_head(cv, xs[1], top, pw, m.lang.s(Key::mon_memory), &format!("{} / {}", sysmon::fmt_kib(mem.used(), m.lang), sysmon::fmt_kib(mem.total, m.lang)));
     let frac = if mem.total > 0 { mem.used() as f32 / mem.total as f32 } else { 0.0 };
     bar(cv, xs[1], top + line + (GLYPH_H - BAR_H) / 2, pw, frac, CYAN);
-    cv.text(&fit(&format!("{} {} · {} {}", tr(m.lang, "en caché", "cached"), sysmon::fmt_kib(mem.cached), tr(m.lang, "libre", "free"), sysmon::fmt_kib(mem.free)), pw), xs[1], top + 2 * line, MUTED);
+    cv.text(&fit(&format!("{} {} · {} {}", m.lang.s(Key::mon_cached), sysmon::fmt_kib(mem.cached, m.lang), m.lang.s(Key::mon_free), sysmon::fmt_kib(mem.free, m.lang)), pw), xs[1], top + 2 * line, MUTED);
     let swap = if mem.swap_total > 0 {
-        format!("{} {} / {}", tr(m.lang, "intercambio", "swap"), sysmon::fmt_kib(mem.swap_total - mem.swap_free), sysmon::fmt_kib(mem.swap_total))
+        format!("{} {} / {}", m.lang.s(Key::mon_swap), sysmon::fmt_kib(mem.swap_total - mem.swap_free, m.lang), sysmon::fmt_kib(mem.swap_total, m.lang))
     } else {
-        tr(m.lang, "sin intercambio", "no swap").into()
+        m.lang.s(Key::mon_no_swap).into()
     };
     cv.text(&fit(&swap, pw), xs[1], top + 3 * line, MUTED);
 
     // Network.
-    plate_head(cv, xs[2], top, pw, tr(m.lang, "RED", "NETWORK"), if m.m.iface.is_empty() { "—" } else { &m.m.iface });
-    cv.text(tr(m.lang, "▼ recibe", "▼ in"), xs[2], top + line, MUTED);
+    plate_head(cv, xs[2], top, pw, m.lang.s(Key::net_title), if m.m.iface.is_empty() { "—" } else { &m.m.iface });
+    cv.text(m.lang.s(Key::mon_in), xs[2], top + line, MUTED);
     text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_down)), xs[2] + pw, top + line, TEXT);
-    cv.text(tr(m.lang, "▲ envía", "▲ out"), xs[2], top + 2 * line, MUTED);
+    cv.text(m.lang.s(Key::mon_out), xs[2], top + 2 * line, MUTED);
     text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_up)), xs[2] + pw, top + 2 * line, TEXT);
-    cv.text(&fit(if m.m.addr.is_empty() { tr(m.lang, "sin dirección IPv4", "no IPv4 address") } else { &m.m.addr }, pw), xs[2], top + 3 * line, MUTED);
+    cv.text(&fit(if m.m.addr.is_empty() { m.lang.s(Key::mon_no_ipv4_address) } else { &m.m.addr }, pw), xs[2], top + 3 * line, MUTED);
 
     // Disk.
     let root = m.m.root_pct.map(|p| format!("/ {p} %")).unwrap_or_default();
-    plate_head(cv, xs[3], top, pw, tr(m.lang, "DISCO", "DISK"), &root);
+    plate_head(cv, xs[3], top, pw, m.lang.s(Key::mon_disk), &root);
     if m.m.disk_name.is_empty() {
-        cv.text(&fit(tr(m.lang, "el kernel no da /proc/diskstats", "the kernel gives no /proc/diskstats"), pw), xs[3], top + line, DIM);
+        cv.text(&fit(m.lang.s(Key::mon_the_kernel_gives_no_proc_diskstats), pw), xs[3], top + line, DIM);
     } else {
-        cv.text(tr(m.lang, "lee", "read"), xs[3], top + line, MUTED);
+        cv.text(m.lang.s(Key::mon_read), xs[3], top + line, MUTED);
         text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_read)), xs[3] + pw, top + line, TEXT);
-        cv.text(tr(m.lang, "escribe", "write"), xs[3], top + 2 * line, MUTED);
+        cv.text(m.lang.s(Key::mon_write), xs[3], top + 2 * line, MUTED);
         text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_write)), xs[3] + pw, top + 2 * line, TEXT);
         cv.text(&fit(&m.m.disk_name, pw), xs[3], top + 3 * line, MUTED);
     }
@@ -733,25 +731,25 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     // Search.
     let sy = HEAD_H + STRIP_H;
     let ty = sy + (SEARCH_H - GLYPH_H) / 2;
-    let lw = cv.text(tr(m.lang, "Buscar", "Search"), PAD, ty, MUTED);
+    let lw = cv.text(m.lang.s(Key::mon_search), PAD, ty, MUTED);
     let field = (PAD + lw + 12, sy + (SEARCH_H - 28) / 2, 264, 28);
     cv.fill_rect_a(field.0, field.1, field.2, field.3, WELL, 1.0);
     frame(cv, field, if m.filter.is_empty() { HAIRLINE } else { CYAN });
     if m.filter.is_empty() {
-        cv.text(tr(m.lang, "escribe un nombre o un PID", "type a name or a PID"), field.0 + 8, ty, DIM);
+        cv.text(m.lang.s(Key::mon_type_a_name_or_a_pid), field.0 + 8, ty, DIM);
     } else {
         let adv = cv.text(&m.filter, field.0 + 8, ty, TEXT);
         cv.fill_rect_a(field.0 + 8 + adv + 1, field.1 + 6, 2, 16, CYAN, 1.0);
     }
     let sort = match m.sort {
         Sort::Pid => "PID",
-        Sort::Name => tr(m.lang, "nombre", "name"),
+        Sort::Name => m.lang.s(Key::mon_name),
         Sort::Cpu => "CPU",
-        Sort::Mem => tr(m.lang, "memoria", "memory"),
+        Sort::Mem => m.lang.s(Key::mon_memory_2),
     };
-    cv.text(&format!("{}: {sort}", tr(m.lang, "orden", "sort")), field.0 + field.2 + 16, ty, MUTED);
+    cv.text(&format!("{}: {sort}", m.lang.s(Key::mon_sort)), field.0 + field.2 + 16, ty, MUTED);
     let apps = m.rows.iter().filter(|r| r.window.is_some()).count();
-    text_right(cv, &format!("{} {} · {apps} {}", m.rows.len(), tr(m.lang, "procesos", "processes"), tr(m.lang, "con ventana", "with a window")), w - PAD, ty, MUTED);
+    text_right(cv, &format!("{} {} · {apps} {}", m.rows.len(), m.lang.s(Key::mon_processes_2), m.lang.s(Key::mon_with_a_window)), w - PAD, ty, MUTED);
 
     // Column heads.
     let cy = sy + SEARCH_H;
@@ -759,12 +757,12 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let hy = cy + (COLS_H - GLYPH_H) / 2;
     let head = |s: Sort| if m.sort == s { CYAN } else { MUTED };
     cv.text("PID", PAD, hy, head(Sort::Pid));
-    cv.text(tr(m.lang, "NOMBRE", "NAME"), PAD + PID_W, hy, head(Sort::Name));
+    cv.text(m.lang.s(Key::mon_name_2), PAD + PID_W, hy, head(Sort::Name));
     text_right(cv, "CPU", c[4], hy, head(Sort::Cpu));
-    text_right(cv, tr(m.lang, "MEMORIA", "MEMORY"), c[3], hy, head(Sort::Mem));
-    text_right(cv, tr(m.lang, "HILOS", "THREADS"), c[2], hy, MUTED);
-    text_right(cv, tr(m.lang, "ESTADO", "STATE"), c[1], hy, MUTED);
-    text_right(cv, tr(m.lang, "TIEMPO", "TIME"), c[0], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_memory), c[3], hy, head(Sort::Mem));
+    text_right(cv, m.lang.s(Key::mon_threads), c[2], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_state), c[1], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_time), c[0], hy, MUTED);
     cv.hline(PAD, cy + COLS_H - 1, w - 2 * PAD, HAIRLINE, 1.0);
 
     // Rows.
@@ -792,9 +790,9 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
                         cv.text(&fit(&format!("· {t}"), room), PAD + PID_W + adv + 8, ty, DIM);
                     }
                 }
-                let cpu = format!("{:.1} %", r.cpu).replace('.', ",");
+                let cpu = pct(r.cpu, m.lang);
                 text_right(cv, &cpu, c[4], ty, if r.cpu >= 50.0 { GOLD } else { TEXT });
-                text_right(cv, &sysmon::fmt_kib(r.mem_kib), c[3], ty, TEXT);
+                text_right(cv, &sysmon::fmt_kib(r.mem_kib, m.lang), c[3], ty, TEXT);
                 text_right(cv, &r.threads.to_string(), c[2], ty, MUTED);
                 text_right(cv, &r.state.to_string(), c[1], ty, if r.state == 'Z' || r.state == 'D' { WARN } else { MUTED });
                 text_right(cv, &sysmon::fmt_ticks(r.ticks), c[0], ty, MUTED);
@@ -802,7 +800,7 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         }
     }
     if items.is_empty() {
-        cv.text(tr(m.lang, "ningún proceso coincide", "no process matches"), PAD, top + 8, MUTED);
+        cv.text(m.lang.s(Key::mon_no_process_matches), PAD, top + 8, MUTED);
     }
 
     // Foot.
@@ -811,14 +809,14 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let b = foot_buttons(w, h);
     let info = match m.selected_row() {
         Some(r) => format!("{} · PID {} · {}", r.name, r.pid, if r.cmd.is_empty() { "—" } else { &r.cmd }),
-        None => tr(m.lang, "↑↓ elegir · Supr terminar · Mayús+Supr matar · Tab servicios", "↑↓ pick · Del end · Shift+Del kill · Tab services").into(),
+        None => m.lang.s(Key::mon_pick_del_end_shift_del_kill_tab_se).into(),
     };
     let text = if m.status.is_empty() { info } else { m.status.clone() };
     let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
     cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
     let sel = m.selected_row().is_some();
-    button(cv, b[1], tr(m.lang, "TERMINAR", "END"), if sel { GOLD } else { MUTED }, sel);
-    button(cv, b[2], tr(m.lang, "MATAR", "KILL"), if sel { WARN } else { MUTED }, false);
+    button(cv, b[1], m.lang.s(Key::mon_end), if sel { GOLD } else { MUTED }, sel);
+    button(cv, b[2], m.lang.s(Key::mon_kill), if sel { WARN } else { MUTED }, false);
 }
 
 fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
@@ -830,18 +828,18 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let x0 = PAD;
     let cols = [x0, x0 + 168, x0 + 168 + 104, x0 + lw - 216, x0 + lw - 120, x0 + lw - 8];
     let hy = top + (COLS_H - GLYPH_H) / 2 + 4;
-    cv.text(tr(m.lang, "SERVICIO", "SERVICE"), cols[0], hy, MUTED);
-    cv.text(tr(m.lang, "TIPO", "KIND"), cols[1], hy, MUTED);
-    cv.text(tr(m.lang, "ESTADO", "STATE"), cols[2], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_service), cols[0], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_kind), cols[1], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_state), cols[2], hy, MUTED);
     text_right(cv, "PID", cols[3], hy, MUTED);
-    text_right(cv, tr(m.lang, "ARRANQUES", "STARTS"), cols[4], hy, MUTED);
-    text_right(cv, tr(m.lang, "DESDE", "FOR"), cols[5], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_starts), cols[4], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_for), cols[5], hy, MUTED);
     let ry = top + COLS_H + 8;
     cv.hline(PAD, ry - 1, lw - 8, HAIRLINE, 1.0);
     let n = ((body_h - COLS_H - 8) / ROW_H).max(1) as usize;
     let first = m.sel_svc.saturating_sub(n.saturating_sub(1));
     if m.svcs.is_empty() {
-        cv.text(&fit(tr(m.lang, "eclipse-init no ha escrito /run/eclipse-init/services", "eclipse-init has not written /run/eclipse-init/services"), lw - 16), PAD, ry + 8, MUTED);
+        cv.text(&fit(m.lang.s(Key::mon_eclipse_init_has_not_written_run_e), lw - 16), PAD, ry + 8, MUTED);
     }
     for (k, s) in m.svcs.iter().enumerate().skip(first).take(n) {
         let y = ry + (k - first) as i32 * ROW_H;
@@ -851,7 +849,7 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
             cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, CYAN, 1.0);
         }
         cv.text(&fit(&s.name, 160), cols[0], ty, TEXT);
-        cv.text(if s.kind == "respawn" { tr(m.lang, "continuo", "respawn") } else { tr(m.lang, "una vez", "once") }, cols[1], ty, MUTED);
+        cv.text(if s.kind == "respawn" { m.lang.s(Key::mon_respawn) } else { m.lang.s(Key::mon_once) }, cols[1], ty, MUTED);
         let (word, bad) = sysmon::state_word(&s.state, m.lang);
         let col = state_col(&s.state, bad);
         cv.fill_rect_a(cols[2], ty + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
@@ -879,14 +877,14 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let proc_cost = s
             .pid
             .and_then(|p| m.rows.iter().find(|r| r.pid == p))
-            .map(|r| format!("{} · {}", format!("{:.1} %", r.cpu).replace('.', ","), sysmon::fmt_kib(r.mem_kib)))
+            .map(|r| format!("{} · {}", pct(r.cpu, m.lang), sysmon::fmt_kib(r.mem_kib, m.lang)))
             .unwrap_or("—".into());
-        let kind = if s.kind == "respawn" { tr(m.lang, "continuo: se reinicia si termina", "respawn: restarted when it ends") } else { tr(m.lang, "una vez, al arrancar", "once, at boot") };
+        let kind = if s.kind == "respawn" { m.lang.s(Key::mon_respawn_restarted_when_it_ends) } else { m.lang.s(Key::mon_once_at_boot) };
         for (k, (a, b)) in [
-            (tr(m.lang, "ejecuta", "runs"), s.exec.as_str()),
-            (tr(m.lang, "tipo", "kind"), kind),
-            (tr(m.lang, "registro", "log"), s.log.as_deref().unwrap_or("—")),
-            (tr(m.lang, "CPU · memoria", "CPU · memory"), proc_cost.as_str()),
+            (m.lang.s(Key::mon_runs), s.exec.as_str()),
+            (m.lang.s(Key::mon_kind_2), kind),
+            (m.lang.s(Key::mon_log), s.log.as_deref().unwrap_or("—")),
+            (m.lang.s(Key::mon_cpu_memory), proc_cost.as_str()),
         ]
         .iter()
         .enumerate()
@@ -896,14 +894,14 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
             cv.text(&fit(b, dw - lab), dx + lab, ly, TEXT);
         }
         let ly = y + 5 * line + 12;
-        cv.text(tr(m.lang, "ÚLTIMAS LÍNEAS DEL REGISTRO", "LAST LINES OF THE LOG"), dx, ly, MUTED);
+        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, MUTED);
         cv.hline(dx, ly + GLYPH_H + 4, dw, HAIRLINE, 1.0);
         let lb = (dx, ly + GLYPH_H + 12, dw, h - FOOT_H - PAD - (ly + GLYPH_H + 12));
         cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, WELL, 1.0);
         frame(cv, lb, HAIRLINE);
         let fits = ((lb.3 - 16) / (GLYPH_H + 4)).max(0) as usize;
         if m.log.is_empty() {
-            let why = if s.log.is_none() { tr(m.lang, "este servicio no guarda registro", "this service keeps no log") } else { tr(m.lang, "el registro está vacío", "the log is empty") };
+            let why = if s.log.is_none() { m.lang.s(Key::mon_this_service_keeps_no_log) } else { m.lang.s(Key::mon_the_log_is_empty) };
             cv.text(why, lb.0 + 8, lb.1 + 8, DIM);
         }
         for (k, l) in m.log.iter().skip(m.log.len().saturating_sub(fits)).enumerate() {
@@ -916,7 +914,7 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     cv.hline(0, fy, w, HAIRLINE, 1.0);
     let b = foot_buttons(w, h);
     let text = if m.status.is_empty() {
-        tr(m.lang, "↑↓ elegir · I iniciar · R reiniciar · P parar (hasta el próximo arranque) · Tab procesos", "↑↓ pick · I start · R restart · P stop (until the next boot) · Tab processes").to_string()
+        m.lang.s(Key::mon_pick_i_start_r_restart_p_stop_unti).to_string()
     } else {
         m.status.clone()
     };
@@ -925,9 +923,9 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let s = m.svcs.get(m.sel_svc);
     let ctl = s.is_some_and(|s| s.kind == "respawn");
     let running = s.is_some_and(|s| s.pid.is_some());
-    button(cv, b[0], tr(m.lang, "INICIAR", "START"), if ctl && !running { CYAN } else { MUTED }, false);
-    button(cv, b[1], tr(m.lang, "REINICIAR", "RESTART"), if ctl { GOLD } else { MUTED }, ctl);
-    button(cv, b[2], tr(m.lang, "PARAR", "STOP"), if ctl && running { WARN } else { MUTED }, false);
+    button(cv, b[0], m.lang.s(Key::mon_start), if ctl && !running { CYAN } else { MUTED }, false);
+    button(cv, b[1], m.lang.s(Key::mon_restart), if ctl { GOLD } else { MUTED }, ctl);
+    button(cv, b[2], m.lang.s(Key::mon_stop), if ctl && running { WARN } else { MUTED }, false);
 }
 
 fn state_col(state: &str, bad: bool) -> Rgb {
@@ -1250,6 +1248,7 @@ wayland_client::delegate_noop!(State: ignore ZxdgToplevelDecorationV1);
 /// A made-up machine, for `--dump` and the tests: two samples a second apart.
 fn sample_mon() -> Mon {
     let mut m = Mon::new();
+    m.lang = Lang::current();
     let mut prev = Prev::default();
     let p = |pid: i32, comm: &str, ticks: u64, threads: u32, rss_mib: u64, cmd: &str| {
         (
@@ -1291,7 +1290,10 @@ fn sample_mon() -> Mon {
     m.m.addr = "10.0.2.15/24".into();
     m.m.root_pct = Some(41);
     m.m.uptime = "3 h 12 min".into();
-    m.m.load = "0,84 0,61 0,52".into();
+    // Los decimales del volcado se escriben como los escribe el idioma, igual
+    // que los de la máquina de verdad: si no, el volcado en inglés enseña una
+    // coma castellana que el panel ya no pinta.
+    m.m.load = "0.84 0.61 0.52".replace('.', &m.lang.decimal_point().to_string());
     m.now_wall = 1_793_865_520;
     m.sel_pid = Some(1412);
     m.sel_svc = 2;
@@ -1316,7 +1318,6 @@ fn dump(spec: &str) -> ! {
         std::process::exit(1);
     }
     let mut m = sample_mon();
-    m.lang = Lang::current();
     if parts.next() == Some("servicios") {
         m.tab = Tab::Svcs;
     }
@@ -1391,7 +1392,7 @@ fn main() {
     let surface = comp.create_surface(&qh, ());
     let xs = wm.get_xdg_surface(&surface, &qh, ());
     let top = xs.get_toplevel(&qh, ());
-    top.set_title(tr(Lang::current(), "Monitor del sistema", "System monitor").into());
+    top.set_title(Lang::current().s(Key::mon_system_monitor).into());
     top.set_app_id("lunarmon".into());
     top.set_min_size(MIN_W, MIN_H);
     if let Some(mgr) = &st.deco_mgr {
@@ -1472,14 +1473,17 @@ mod tests {
         assert!((m.m.net_down - 1_258_291.0).abs() < 1.0);
         assert!((m.m.disk_read - 6963.0 * 512.0).abs() < 1.0);
         let items = m.items();
-        assert_eq!(items[0], Item::Section("APLICACIONES · con ventana"));
+        assert_eq!(
+            items[0],
+            Item::Section(m.lang.s(Key::mon_applications_with_a_window))
+        );
         let first = match &items[1] {
             Item::Proc(i) => &m.rows[*i],
             _ => panic!(),
         };
         assert_eq!(first.name, "firefox", "the busiest application first");
         assert!(first.window.as_deref().unwrap().contains("Firefox"));
-        assert!(items.contains(&Item::Section("SISTEMA")));
+        assert!(items.contains(&Item::Section(m.lang.s(Key::mon_system))));
         assert_eq!(m.svcs.len(), 12);
     }
 
@@ -1562,7 +1566,7 @@ mod tests {
         // A failure says so.
         m.sel_svc = m.svcs.iter().position(|s| s.name == "ntpd").unwrap();
         m.service_verb(Verb::Restart, &mut |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-        assert!(m.bad && m.status.starts_with("no se pudo"));
+        assert!(m.bad && m.status.starts_with(m.lang.s(Key::mon_could_not)));
     }
 
     #[test]
@@ -1625,5 +1629,26 @@ mod tests {
             m.tab = tab;
             draw(&mut Canvas::new(1180, 760), 1180, 760, &m);
         }
+    }
+
+    /// Los decimales del panel llevaban la coma castellana fija, así que una
+    /// sesión en inglés leía `2,1 GiB` y `14,2 %`. Es el mismo reparto que ya
+    /// hace lunarfile con los tamaños de fichero.
+    #[test]
+    fn the_numbers_are_written_the_way_the_language_writes_them() {
+        assert_eq!(pct(14.25, Lang::Es), "14,2 %");
+        assert_eq!(pct(14.25, Lang::En), "14.2 %");
+        assert_eq!(sysmon::fmt_kib(2_202_009, Lang::Es), "2,1 GiB");
+        assert_eq!(sysmon::fmt_kib(2_202_009, Lang::En), "2.1 GiB");
+
+        // Y el volcado se arma con el idioma ya puesto, porque si no enseña
+        // una coma que el panel de verdad ya no pinta.
+        let m = sample_mon();
+        let point = m.lang.decimal_point();
+        assert!(
+            m.m.load.contains(point),
+            "la media de carga {:?} no usa el separador {point:?}",
+            m.m.load
+        );
     }
 }
