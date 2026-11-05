@@ -12,6 +12,44 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::i18n::{Key, Lang};
+
+// ── what this module refuses, said without a language ────────────────────────
+//
+// The four errors fileops raises ITSELF carry a tag rather than a sentence,
+// and [`message`] turns a tag into the session's language. It is the same
+// split `netconf::check` uses: the operation decides WHAT is wrong, the window
+// decides how to say it. The alternative -- a Spanish sentence inside
+// `io::Error` -- put Spanish on an English panel under an English label, which
+// is worse than either language on its own.
+//
+// The tags are not shown to anybody, so they are ASCII and stable; they are
+// matched on, so they must not collide with a message the C library produces.
+
+const T_CANCELLED: &str = "eclipse-fileops:cancelled";
+const T_BAD_NAME: &str = "eclipse-fileops:bad-name";
+const T_SELF_NEST: &str = "eclipse-fileops:self-nest";
+const T_EXISTS: &str = "eclipse-fileops:exists";
+
+/// `e` as the panel should say it: the row of the string table for an error
+/// this module raised, and the system's own text for anything else.
+///
+/// An `io::Error` from the kernel (`Permission denied`, `No space left on
+/// device`) is NOT translated: it is the C library's string, it is what the
+/// same failure says in every log on the machine, and inventing a Spanish
+/// wording for each `errno` is a translation of the C library, not of Eclipse.
+pub fn message(e: &io::Error, lang: Lang) -> String {
+    let text = e.to_string();
+    let key = match text.as_str() {
+        T_CANCELLED => Key::file_err_cancelled,
+        T_BAD_NAME => Key::file_err_bad_name,
+        T_SELF_NEST => Key::file_err_self_nest,
+        T_EXISTS => Key::file_err_exists,
+        _ => return text,
+    };
+    lang.s(key).to_string()
+}
+
 /// How far a copy has got, shared between the thread doing it and the
 /// window drawing it: bytes `done` of `total`, and a flag the window raises
 /// to stop it.
@@ -35,7 +73,7 @@ impl Progress {
 }
 
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "cancelado")
+    io::Error::new(io::ErrorKind::Interrupted, T_CANCELLED)
 }
 
 /// The bytes under `p`: a file's size, a folder's files' sizes added up. A
@@ -80,7 +118,7 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 fn bad_name() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, "nombre no válido")
+    io::Error::new(io::ErrorKind::InvalidInput, T_BAD_NAME)
 }
 
 fn exists(p: &Path) -> bool {
@@ -90,6 +128,12 @@ fn exists(p: &Path) -> bool {
 /// `name`, or the first of `stem (copia).ext`, `stem (copia 2).ext`, ... not
 /// taken in `dir`. The extension stays last so the copy still opens with
 /// what opened the original; a folder or a dotfile has none.
+///
+/// `(copia)` is NOT translated, and that is on purpose: it is a name written
+/// to disk, not a label on the screen. A session in English would otherwise
+/// make `foto (copy).png` next to the `foto (copia).png` an earlier session
+/// made, and then the file the user is looking for is called whichever
+/// language they happened to be in that day.
 pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
     if !exists(&dir.join(name)) {
         return name.to_string();
@@ -147,7 +191,7 @@ pub fn copy_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
 pub fn copy_into_with(src: &Path, dir: &Path, prog: &Progress) -> io::Result<PathBuf> {
     let name = src.file_name().ok_or_else(bad_name)?.to_string_lossy().into_owned();
     if is_within(dir, src) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "una carpeta no cabe dentro de sí misma"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, T_SELF_NEST));
     }
     let is_dir = std::fs::symlink_metadata(src)?.is_dir();
     let dst = dir.join(free_name(dir, &name, is_dir));
@@ -177,7 +221,7 @@ pub fn move_into_with(src: &Path, dir: &Path, prog: &Progress) -> io::Result<Pat
     }
     let name = src.file_name().ok_or_else(bad_name)?.to_string_lossy().into_owned();
     if is_within(dir, src) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "una carpeta no cabe dentro de sí misma"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, T_SELF_NEST));
     }
     let is_dir = std::fs::symlink_metadata(src)?.is_dir();
     let dst = dir.join(free_name(dir, &name, is_dir));
@@ -215,7 +259,7 @@ pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
         return Ok(dst);
     }
     if exists(&dst) {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "ese nombre ya existe"));
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, T_EXISTS));
     }
     std::fs::rename(path, &dst)?;
     Ok(dst)

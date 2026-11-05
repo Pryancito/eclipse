@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
 use crate::files::{self, Kind};
+use crate::i18n::{Key, Lang};
 
 /// How much of a text is read: enough for every line the column can show.
 pub const TEXT_BYTES: usize = 8 * 1024;
@@ -71,19 +72,19 @@ pub fn perms(mode: u32) -> String {
 }
 
 /// The name of a kind, as the preview's details say it.
-pub fn kind_label(kind: Kind, is_dir: bool) -> &'static str {
+pub fn kind_label(kind: Kind, is_dir: bool, lang: Lang) -> &'static str {
     if is_dir {
-        return "Carpeta";
+        return lang.s(Key::file_folder);
     }
-    match kind {
-        Kind::Image => "Imagen",
-        Kind::Document => "Documento",
-        Kind::Archive => "Archivo comprimido",
-        Kind::Disk => "Imagen de disco",
-        Kind::Media => "Multimedia",
-        Kind::Code => "Código",
-        Kind::Other => "Archivo",
-    }
+    lang.s(match kind {
+        Kind::Image => Key::file_kind_image,
+        Kind::Document => Key::file_kind_document,
+        Kind::Archive => Key::file_kind_archive,
+        Kind::Disk => Key::file_kind_disk,
+        Kind::Media => Key::file_kind_media,
+        Kind::Code => Key::file_kind_code,
+        Kind::Other => Key::file_kind_other,
+    })
 }
 
 /// Whether `head` (the start of a file) reads as text: no NUL byte, and UTF-8

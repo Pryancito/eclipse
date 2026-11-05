@@ -54,6 +54,7 @@ use std::os::fd::AsRawFd;
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::{self, Entry};
 use lunarbar::fill_guard;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_INSERT_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
     KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL, KEY_UP_WL, WHEEL_NOTCH,
@@ -223,8 +224,13 @@ const MAX_FIELD: usize = 256;
 /// The size column, in characters, plus the gap before it.
 const SIZE_COL: i32 = 9;
 const COL_GAP: i32 = 16;
-/// The date column, in characters: `files::short_date` is never wider.
-const DATE_COL: i32 = files::DATE_CHARS as i32;
+/// The date column, in characters: `files::short_date` is never wider. It is
+/// one width per language (English says `yesterday 18:03`, Spanish `ayer
+/// 18:03`), so it is a function and not a constant, and everything that
+/// measures the row takes it as an argument.
+fn date_col(lang: Lang) -> i32 {
+    files::date_chars(lang) as i32
+}
 /// The narrowest a name may get before the date column is dropped for it.
 const NAME_MIN: i32 = 16;
 
@@ -418,6 +424,13 @@ struct State {
 
     pal: &'static Palette,
     look: Look,
+    /// The language every string on the panel comes from, read ONCE at start.
+    ///
+    /// Once, and not per frame: `Lang::current` reads `/etc/eclipse/locale`
+    /// and `$LANG`, and a window that re-read them while it was open could
+    /// draw half its labels in one language if `eclipse-locale` ran between
+    /// two frames.
+    lang: Lang,
     mode: Mode,
     /// Where `--pick` writes its answer, or None for stdout.
     out: Option<String>,
@@ -629,7 +642,7 @@ impl State {
             // given and armed at once: one Enter replaces it.
             Mode::Save => {
                 if let Some(name) = self.entry(row).map(|e| e.name.clone()) {
-                    self.note = format!("{name} ya existe: Intro para reemplazarlo");
+                    self.note = format!("{name} {}", self.lang.s(Key::file_exists_enter));
                     self.field = name;
                     self.confirm = Some(path);
                     self.refilter();
@@ -663,7 +676,7 @@ impl State {
     fn save_answer(&mut self) {
         let name = self.field.trim();
         if name.is_empty() {
-            self.note = String::from("escribe un nombre");
+            self.note = self.lang.s(Key::file_type_a_name).to_string();
             return;
         }
         let path = files::join_child(&self.dir, name);
@@ -672,11 +685,11 @@ impl State {
         // one already there is how a week of work goes.
         match std::fs::metadata(&path) {
             Ok(m) if m.is_dir() => {
-                self.note = format!("{name} es una carpeta: -> para entrar");
+                self.note = format!("{name} {}", self.lang.s(Key::file_is_a_folder));
                 return;
             }
             Ok(_) if self.confirm.as_deref() != Some(path.as_str()) => {
-                self.note = format!("{name} ya existe: Intro otra vez para reemplazarlo");
+                self.note = format!("{name} {}", self.lang.s(Key::file_exists_enter_again));
                 self.confirm = Some(path);
                 return;
             }
@@ -721,7 +734,11 @@ impl State {
         if let Some(i) = self.marked.iter().position(|p| *p == path) {
             self.marked.remove(i);
         } else if !fill_guard::try_push_bounded(&mut self.marked, path, MAX_MARKED) {
-            self.note = format!("como mucho {MAX_MARKED} archivos");
+            self.note = format!(
+                "{} {MAX_MARKED} {}",
+                self.lang.s(Key::file_at_most),
+                self.lang.s(Key::file_n_files)
+            );
         }
     }
 
@@ -731,8 +748,8 @@ impl State {
         let name = path.rsplit('/').next().unwrap_or(path);
         let Some(template) = open::handler_for(name, &self.openers) else {
             self.note = match open::extension_of(name) {
-                Some(ext) => format!("nada abre un .{ext} (ver /etc/eclipse/openers)"),
-                None => String::from("sin extensión: nada sabe abrirlo"),
+                Some(ext) => self.lang.s(Key::file_no_opener).replace("{}", &ext),
+                None => self.lang.s(Key::file_no_extension).to_string(),
             };
             return;
         };
@@ -741,7 +758,7 @@ impl State {
         // watching -- the file would appear to open into nothing at all.
         if let Some(prog) = open::program_of(&template) {
             if !lunarbar::apps::executable_exists(prog) {
-                self.note = format!("{prog} no está instalado");
+                self.note = self.lang.s(Key::file_not_installed).replace("{}", prog);
                 return;
             }
         }
@@ -1063,7 +1080,7 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
     let p = st.pal;
     let hud = st.look == Look::Tecno;
     let rad = |r: i32| if hud { 0 } else { r };
-    cv.text(if hud { "VISTA PREVIA" } else { "Vista previa" }, x + 8, y + 2, p.dim);
+    cv.text(&cased(st, Key::file_preview), x + 8, y + 2, p.dim);
     let line = GLYPH_H + 4;
     let info_h = 4 * line + 4;
     let (bx, by) = (x, y + GLYPH_H + 10 + line + 4);
@@ -1114,7 +1131,7 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
                 let ly = iy + k as i32 * (GLYPH_H + 2);
                 let last = k + 1 == n && total > n;
                 if last {
-                    cv.text(&format!("+{} más", total - k), ix, ly, p.dim);
+                    cv.text(&format!("+{} {}", total - k, st.lang.s(Key::file_more)), ix, ly, p.dim);
                     break;
                 }
                 let c = if *d { if hud { GOLD } else { p.accent } } else { p.text };
@@ -1124,7 +1141,7 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
                 cv.text(&files::elide_middle(name, chars(bw - 32)), ix + 12, ly, c);
             }
             if names.is_empty() {
-                let s = if total == 0 { "Carpeta vacía" } else { "Sólo ocultos" };
+                let s = st.lang.s(if total == 0 { Key::file_dir_empty } else { Key::file_dir_hidden_only });
                 cv.text(s, bx + (bw - Canvas::text_width(s)) / 2, by + (bh - GLYPH_H) / 2, p.dim);
             }
         }
@@ -1133,11 +1150,11 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
             let c = kind_color(pv.kind, p);
             let cy = by + (bh - s - GLYPH_H - 12) / 2;
             file_icon(cv, bx + (bw - s) / 2, cy, s, c);
-            let label = if matches!(pv.body, Body::Unreadable) {
-                "No se puede leer"
+            let label = st.lang.s(if matches!(pv.body, Body::Unreadable) {
+                Key::file_unreadable
             } else {
-                "Sin vista previa"
-            };
+                Key::file_no_preview
+            });
             let lc = if matches!(pv.body, Body::Unreadable) { WARN } else { p.dim };
             cv.text(label, bx + (bw - Canvas::text_width(label)) / 2, cy + s + 12, lc);
         }
@@ -1146,23 +1163,50 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
     // The details: what it is and weighs, what it holds or measures, when
     // it changed, who may touch it. Permissions keep their case in tecno:
     // `RW-R--R--` is not how anyone reads them.
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let plural = |n: usize, one: Key, many: Key| {
+        format!("{n} {}", st.lang.s(if n == 1 { one } else { many }))
+    };
     let mut info: Vec<(String, bool)> = Vec::new();
     match &pv.body {
         Body::Dir { dirs, files: nf, bytes, more, .. } => {
-            info.push((format!("Carpeta · {}", files::human_size(*bytes)), true));
+            info.push((
+                format!("{} · {}", st.lang.s(Key::file_folder), files::human_size(*bytes, st.lang)),
+                true,
+            ));
             let plus = if *more { "+" } else { "" };
-            info.push((format!("{}{plus} · {}", plural(*dirs, "carpeta", "carpetas"), plural(*nf, "archivo", "archivos")), true));
+            info.push((
+                format!(
+                    "{}{plus} · {}",
+                    plural(*dirs, Key::file_n_folder, Key::file_n_folders),
+                    plural(*nf, Key::file_n_file, Key::file_n_files)
+                ),
+                true,
+            ));
         }
         Body::Image { w, h, .. } => {
-            info.push((format!("{} · {}", preview::kind_label(pv.kind, pv.is_dir), files::human_size(pv.size)), true));
+            info.push((format!(
+            "{} · {}",
+            preview::kind_label(pv.kind, pv.is_dir, st.lang),
+            files::human_size(pv.size, st.lang)
+        ), true));
             info.push((format!("{w} × {h} px"), true));
         }
-        _ => info.push((format!("{} · {}", preview::kind_label(pv.kind, pv.is_dir), files::human_size(pv.size)), true)),
+        _ => info.push((format!(
+            "{} · {}",
+            preview::kind_label(pv.kind, pv.is_dir, st.lang),
+            files::human_size(pv.size, st.lang)
+        ), true)),
     }
     if let Some(t) = pv.mtime {
         let now = files::now_secs();
-        info.push((format!("Modificado {}", files::short_date(t, now, files::local_offset(now))), true));
+        info.push((
+            format!(
+                "{} {}",
+                st.lang.s(Key::file_col_modified),
+                files::short_date(t, now, files::local_offset(now), st.lang)
+            ),
+            true,
+        ));
     }
     let mut perm = pv.mode.clone().unwrap_or_default();
     if let Some(l) = &pv.link {
@@ -1178,15 +1222,15 @@ fn draw_preview(cv: &mut Canvas, st: &State, x: i32, y: i32, w: i32, h: i32) {
 }
 
 /// Does a list column `avail` px wide (after the icon) show the date column?
-fn shows_dates(avail: i32) -> bool {
-    avail - (SIZE_COL + DATE_COL) * GLYPH_W - 2 * COL_GAP >= NAME_MIN * GLYPH_W
+fn shows_dates(avail: i32, lang: Lang) -> bool {
+    avail - (SIZE_COL + date_col(lang)) * GLYPH_W - 2 * COL_GAP >= NAME_MIN * GLYPH_W
 }
 
 /// How many characters of a name fit beside the size column, and beside the
 /// date column too when `dates`.
-fn name_chars(avail: i32, dates: bool) -> usize {
+fn name_chars(avail: i32, dates: bool, lang: Lang) -> usize {
     let date = if dates {
-        DATE_COL * GLYPH_W + COL_GAP
+        date_col(lang) * GLYPH_W + COL_GAP
     } else {
         0
     };
@@ -1226,23 +1270,39 @@ fn file_icon(cv: &mut Canvas, x: i32, y: i32, s: i32, c: Rgb) {
 }
 
 /// What the header chip says, in the modes that answer a caller.
-fn mode_chip(mode: Mode) -> Option<&'static str> {
-    match mode {
+fn mode_chip(st: &State) -> Option<&'static str> {
+    match st.mode {
         Mode::Browse => None,
-        Mode::Open | Mode::OpenMany => Some("SELECTOR"),
-        Mode::Save => Some("GUARDAR"),
+        Mode::Open | Mode::OpenMany => Some(st.lang.s(Key::file_chip_pick)),
+        Mode::Save => Some(st.lang.s(Key::file_chip_save)),
+    }
+}
+
+/// A string of the table as THIS look writes it: tecno is a readout and puts
+/// its headings in capitals, every other look leaves them as they are.
+///
+/// One function rather than a second row per heading: the capitals are a
+/// property of the look, not of the language, and `TAMAÑO` is what
+/// `Tamaño.to_uppercase()` gives in Rust.
+fn cased(st: &State, key: Key) -> String {
+    let s = st.lang.s(key);
+    if st.look == Look::Tecno {
+        s.to_uppercase()
+    } else {
+        s.to_string()
     }
 }
 
 /// The primary button's label: what Enter would do right now.
 fn primary_label(st: &State) -> String {
+    let s = |k: Key| st.lang.s(k).to_string();
     match st.mode {
         Mode::Browse => String::new(),
-        Mode::Open => "Abrir".into(),
-        Mode::OpenMany if st.marked.is_empty() => "Abrir".into(),
-        Mode::OpenMany => format!("Abrir {}", st.marked.len()),
-        Mode::Save if st.armed() => "Reemplazar".into(),
-        Mode::Save => "Guardar".into(),
+        Mode::Open => s(Key::file_btn_open),
+        Mode::OpenMany if st.marked.is_empty() => s(Key::file_btn_open),
+        Mode::OpenMany => format!("{} {}", s(Key::file_btn_open), st.marked.len()),
+        Mode::Save if st.armed() => s(Key::file_btn_replace),
+        Mode::Save => s(Key::file_btn_save),
     }
 }
 
@@ -1265,7 +1325,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     // ── the header: [chip] title  path ──
     let head_y = py + PAD;
     let mut hx = px + PAD;
-    if let Some(chip) = mode_chip(st.mode) {
+    if let Some(chip) = mode_chip(st) {
         let cw = Canvas::text_width(chip) + 12;
         if cw * 3 < inner {
             cv.round_rect(hx, head_y - 1, cw, GLYPH_H + 6, rad(4), p.accent);
@@ -1279,10 +1339,11 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     // floor, so what gets pushed off the panel is the path).
     let mut title = files::elide_middle(
         st.title.as_deref().unwrap_or(match st.mode {
-            Mode::Save => "Guardar en",
+            Mode::Save => st.lang.s(Key::file_title_save),
+            // The program's own name, which is not translated.
             Mode::Browse if hud => "Lunarfile",
-            Mode::Browse => "Archivos",
-            _ => "Elegir archivo",
+            Mode::Browse => st.lang.s(Key::file_title_browse),
+            _ => st.lang.s(Key::file_title_pick),
         }),
         MAX_TITLE,
     );
@@ -1315,7 +1376,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     if rail > 0 {
         let rx = px + PAD;
         let rw = rail - 12;
-        cv.text(if hud { "LUGARES" } else { "Lugares" }, rx + 8, body_y + 2, p.dim);
+        cv.text(&cased(st, Key::file_places), rx + 8, body_y + 2, p.dim);
         let mut y = body_y + GLYPH_H + 10;
         let chars = ((rw - 16 - 14 - 8) / GLYPH_W).max(1) as usize;
         for pl in &st.places {
@@ -1375,16 +1436,16 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     };
     cv.round_rect(lx, field_y, lw, FIELD_BOX, rad(6), field_c);
     cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, rad(5), p.field);
-    let label = if let Some(e) = &st.edit {
+    let label = st.lang.s(if let Some(e) = &st.edit {
         match e {
-            Edit::Rename(_) => "Renombrar:",
-            Edit::NewDir => "Carpeta:",
+            Edit::Rename(_) => Key::file_label_rename,
+            Edit::NewDir => Key::file_label_newdir,
         }
     } else if st.mode == Mode::Save {
-        "Nombre:"
+        Key::file_label_name
     } else {
-        "Filtro:"
-    };
+        Key::file_label_filter
+    });
     let ty = field_y + (FIELD_BOX - GLYPH_H) / 2;
     cv.text(label, lx + 8, ty, p.dim);
     let lbw = Canvas::text_width(label) + 8;
@@ -1402,23 +1463,20 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let ix = lx + 6 + check;
     let name_x = ix + ICON + 8;
     let avail = lw - (ICON + 14) - check;
-    let dates = shows_dates(avail);
-    let date_x = lx + lw - 8 - DATE_COL * GLYPH_W;
+    let dates = shows_dates(avail, st.lang);
+    let date_x = lx + lw - 8 - date_col(st.lang) * GLYPH_W;
     let size_r = if dates { date_x - COL_GAP } else { lx + lw - 8 };
 
     let cols = cols_h(ph);
     let row0_y = field_y + FIELD_BOX + PAD + cols;
     if cols > 0 {
         let cy = row0_y - cols;
-        let [nom, tam, modi] = if hud {
-            ["NOMBRE", "TAMAÑO", "MODIFICADO"]
-        } else {
-            ["Nombre", "Tamaño", "Modificado"]
-        };
-        cv.text(nom, name_x, cy, p.dim);
-        cv.text(tam, size_r - Canvas::text_width(tam), cy, p.dim);
+        let [nom, tam, modi] = [Key::file_col_name, Key::file_col_size, Key::file_col_modified]
+            .map(|k| cased(st, k));
+        cv.text(&nom, name_x, cy, p.dim);
+        cv.text(&tam, size_r - Canvas::text_width(&tam), cy, p.dim);
         if dates {
-            cv.text(modi, date_x, cy, p.dim);
+            cv.text(&modi, date_x, cy, p.dim);
         }
     }
 
@@ -1481,7 +1539,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                     let c = kind_color(files::kind_of(&e.name), p);
                     file_icon(cv, ix + 2, iy, ICON - 4, c);
                 }
-                let mut name = files::elide_middle(&e.name, name_chars(avail, dates));
+                let mut name = files::elide_middle(&e.name, name_chars(avail, dates, st.lang));
                 if e.link {
                     name.push('@');
                 }
@@ -1492,13 +1550,13 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                 let size = if e.is_dir {
                     String::from("--")
                 } else {
-                    files::human_size(e.size)
+                    files::human_size(e.size, st.lang)
                 };
                 let sw = Canvas::text_width(&size);
                 cv.text(&size, size_r - sw, ty, dc);
                 if dates {
                     if let Some(t) = e.mtime {
-                        cv.text(&files::short_date(t, now, offset), date_x, ty, dc);
+                        cv.text(&files::short_date(t, now, offset, st.lang), date_x, ty, dc);
                     }
                 }
             }
@@ -1512,7 +1570,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     if st.mode.is_pick() {
         let primary = primary_label(st);
         let pw_ = Canvas::text_width(&primary) + 28;
-        let cancel = "Cancelar";
+        let cancel = st.lang.s(Key::file_btn_cancel);
         let cw = Canvas::text_width(cancel) + 28;
         let by = foot_y + (FOOT_H - BTN_H) / 2 + 1;
         let bx = px + PAD + inner - pw_;
@@ -1536,13 +1594,13 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         }
     }
     let text_chars = ((text_r - (px + PAD + 4)) / GLYPH_W).max(8) as usize;
-    let hint = match st.mode {
-        Mode::Save => "Intro guardar  Esc cancelar  <- subir  . ocultos",
-        Mode::OpenMany => "Espacio marcar  Intro aceptar  Esc cancelar  <- subir",
-        Mode::Open => "Intro elegir  Esc cancelar  <- subir  . ocultos",
-        Mode::Browse if st.edit.is_some() => "Intro aceptar  Esc cancelar",
-        Mode::Browse => "Intro abrir  F2 renombrar  F5/F6 copiar/cortar  Insert pegar  F7 carpeta  Supr papelera  Menú acciones",
-    };
+    let hint = st.lang.s(match st.mode {
+        Mode::Save => Key::file_hint_save,
+        Mode::OpenMany => Key::file_hint_many,
+        Mode::Open => Key::file_hint_open,
+        Mode::Browse if st.edit.is_some() => Key::file_hint_edit,
+        Mode::Browse => Key::file_hint_browse,
+    });
     cv.text(
         &files::elide_middle(hint, text_chars),
         px + PAD + 4,
@@ -1553,13 +1611,17 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let status = if !st.note.is_empty() {
         files::elide_middle(&st.note, text_chars)
     } else if st.mode == Mode::OpenMany && !st.marked.is_empty() {
-        format!("{} marcados", st.marked.len())
+        format!("{} {}", st.marked.len(), st.lang.s(Key::file_marked))
     } else if let Some((h, cut)) = &st.held {
         let n = h.rsplit('/').next().unwrap_or(h);
-        format!("{}: {n} · Insert pega aquí", if *cut { "Cortado" } else { "Copiado" })
+        format!(
+            "{}: {n} · {}",
+            st.lang.s(if *cut { Key::file_cut } else { Key::file_copied }),
+            st.lang.s(Key::file_paste_here)
+        )
     } else {
         let files_n = st.rows.iter().filter(|r| !matches!(r, Row::Parent)).count();
-        format!("{files_n} elementos")
+        format!("{files_n} {}", st.lang.s(Key::file_items))
     };
     let c = if st.armed() {
         WARN
@@ -1573,7 +1635,7 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
         // A paste in progress: its bar, then how far and how to stop it.
         let bw = job::draw_bar(cv, st, j, px + PAD + 4, sy + 2);
         let room = ((text_r - (px + PAD + 4) - bw - 12) / GLYPH_W).max(8) as usize;
-        cv.text(&files::elide_middle(&j.line(), room), px + PAD + 4 + bw + 12, sy, p.text);
+        cv.text(&files::elide_middle(&j.line(st.lang), room), px + PAD + 4 + bw + 12, sy, p.text);
     } else {
         cv.text(&status, px + PAD + 4, sy, c);
     }
@@ -2145,6 +2207,7 @@ fn new_state(cli: &Cli) -> State {
         configured: false,
         pal: palette(look),
         look,
+        lang: Lang::current(),
         mode,
         out: cli.out.clone(),
         openers: open::load_openers(),
@@ -2160,6 +2223,7 @@ fn new_state(cli: &Cli) -> State {
         places: files::places(
             std::env::var("HOME").ok().as_deref(),
             std::env::var("USER").ok().as_deref(),
+            Lang::current(),
         ),
         confirm: None,
         sel: 0,
@@ -2676,36 +2740,76 @@ mod tests {
         assert_eq!(rows_fitting(ph), MAX_ROWS);
     }
 
+    /// Each column heading fits the column it sits over, in both languages
+    /// and in both cases.
+    ///
+    /// This is the failure a translation makes in a client that draws its own
+    /// text: the heading is the ONE string in the row that nothing elides,
+    /// because it is written once per frame and not per entry, so a word
+    /// wider than its column is simply drawn over the heading beside it. The
+    /// Spanish headings were measured against these columns when they were
+    /// written; nothing had measured a second language's.
+    #[test]
+    fn every_column_heading_fits_its_column_in_both_languages() {
+        for lang in [Lang::Es, Lang::En] {
+            for caps in [false, true] {
+                let w = |k: Key| {
+                    let s = lang.s(k);
+                    let s = if caps { s.to_uppercase() } else { s.to_string() };
+                    Canvas::text_width(&s)
+                };
+                // The name heading is over the name column, whose width is
+                // whatever is left; `NAME_MIN` is the least it can be.
+                assert!(w(Key::file_col_name) <= NAME_MIN * GLYPH_W, "{lang:?} {caps}");
+                assert!(w(Key::file_col_size) <= SIZE_COL * GLYPH_W, "{lang:?} {caps}");
+                assert!(
+                    w(Key::file_col_modified) <= date_col(lang) * GLYPH_W,
+                    "{lang:?} {caps}: the date heading is wider than its column"
+                );
+                // And the two chips, which sit in a box drawn to their own
+                // width but are only drawn where three of them fit the panel.
+                for k in [Key::file_chip_pick, Key::file_chip_save] {
+                    assert!((w(k) + 12) * 3 <= PANEL_W, "{lang:?} {k:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_name_is_never_charged_for_a_size_column_that_is_not_drawn() {
         // The same trap `lunarrun`'s row layout had: charging the name for a
         // column the row is too narrow to draw leaves it one character.
-        assert!(name_chars(800, false) > name_chars(400, false));
-        for avail in [0, 1, 20, 60, 100, 200, 400, 800, 4000] {
-            for dates in [false, true] {
-                let n = name_chars(avail, dates);
-                assert!(n >= 1, "{avail} px left no room for a single character");
+        // Both languages: the English date column is four characters wider,
+        // and the name is charged for whichever one the session draws.
+        for lang in [Lang::Es, Lang::En] {
+            assert!(name_chars(800, false, lang) > name_chars(400, false, lang));
+            for avail in [0, 1, 20, 60, 100, 200, 400, 800, 4000] {
+                for dates in [false, true] {
+                    let n = name_chars(avail, dates, lang);
+                    assert!(n >= 1, "{avail} px left no room for a single character");
+                }
             }
-        }
-        // With room for both, the name gets what is left after the size column.
-        let wide = name_chars(800, false);
-        assert!(
-            (wide as i32) * GLYPH_W <= 800 - SIZE_COL * GLYPH_W - COL_GAP + GLYPH_W,
-            "the name overlaps the size column"
-        );
-        // And after the date column as well when that is drawn.
-        let dated = name_chars(800, true);
-        assert!(
-            (dated as i32) * GLYPH_W
-                <= 800 - (SIZE_COL + DATE_COL) * GLYPH_W - 2 * COL_GAP + GLYPH_W,
-            "the name overlaps the date column"
-        );
-        // The date column is only drawn where the name keeps its minimum.
-        assert!(!shows_dates(300));
-        assert!(shows_dates(600));
-        for avail in [0, 100, 300, 400, 500, 600, 800] {
-            if shows_dates(avail) {
-                assert!(name_chars(avail, true) as i32 >= NAME_MIN, "{avail}");
+            // With room for both, the name gets what is left after the size
+            // column.
+            let wide = name_chars(800, false, lang);
+            assert!(
+                (wide as i32) * GLYPH_W <= 800 - SIZE_COL * GLYPH_W - COL_GAP + GLYPH_W,
+                "the name overlaps the size column"
+            );
+            // And after the date column as well when that is drawn.
+            let dated = name_chars(800, true, lang);
+            assert!(
+                (dated as i32) * GLYPH_W
+                    <= 800 - (SIZE_COL + date_col(lang)) * GLYPH_W - 2 * COL_GAP + GLYPH_W,
+                "the name overlaps the date column"
+            );
+            // The date column is only drawn where the name keeps its minimum.
+            assert!(!shows_dates(300, lang));
+            assert!(shows_dates(700, lang));
+            for avail in [0, 100, 300, 400, 500, 600, 700, 800] {
+                if shows_dates(avail, lang) {
+                    assert!(name_chars(avail, true, lang) as i32 >= NAME_MIN, "{avail}");
+                }
             }
         }
     }
@@ -2875,7 +2979,7 @@ mod tests {
         let base = tree("paste");
         let mut st = state(Mode::Browse, &base);
         press(&mut st, KEY_INSERT_WL);
-        assert!(st.note.starts_with("Nada que pegar"), "{}", st.note);
+        assert_eq!(st.note, st.lang.s(Key::file_nothing_to_paste), "{}", st.note);
         st.sel = row_of(&st, "a.txt");
         press(&mut st, 63); // F5
         st.sel = row_of(&st, "sub");
@@ -2889,9 +2993,12 @@ mod tests {
         settle(&mut st);
         assert!(sub.join("a (copia).txt").exists());
         press(&mut st, 65); // F7
-        assert_eq!(st.field, "Carpeta nueva");
+        // The proposed name is in the session's language, and it is also the
+        // name the folder ends up with on disk.
+        let new_dir = st.lang.s(Key::file_new_folder_name).to_string();
+        assert_eq!(st.field, new_dir);
         press(&mut st, KEY_ENTER_WL);
-        assert!(sub.join("Carpeta nueva").is_dir());
+        assert!(sub.join(&new_dir).is_dir());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3434,8 +3541,12 @@ mod tests {
         apply(&mut st, Action::Commit);
         assert!(!st.done, "one Enter replaced an existing file");
         assert!(st.armed());
-        assert!(st.note.contains("ya existe"), "{}", st.note);
-        assert_eq!(primary_label(&st), "Reemplazar");
+        assert!(
+            st.note.contains(st.lang.s(Key::file_exists_enter_again)),
+            "{}",
+            st.note
+        );
+        assert_eq!(primary_label(&st), st.lang.s(Key::file_btn_replace));
         apply(&mut st, Action::Commit);
         assert!(st.done);
         assert_eq!(st.picked, vec![files::join_child(&base, "a.txt")]);
@@ -3465,7 +3576,7 @@ mod tests {
         apply(&mut st, Action::Commit);
         apply(&mut st, Action::Commit);
         assert!(!st.done, "saved over a directory");
-        assert!(st.note.contains("carpeta"), "{}", st.note);
+        assert!(st.note.contains(st.lang.s(Key::file_is_a_folder)), "{}", st.note);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3534,7 +3645,7 @@ mod tests {
         let mut st = state(Mode::OpenMany, &base);
         st.sel = row_of(&st, "a.txt");
         apply(&mut st, Action::Mark);
-        assert_eq!(primary_label(&st), "Abrir 1");
+        assert_eq!(primary_label(&st), format!("{} 1", st.lang.s(Key::file_btn_open)));
         let _ = std::fs::remove_dir_all(&base);
     }
 

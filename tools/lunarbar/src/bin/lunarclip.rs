@@ -1948,7 +1948,7 @@ fn draw_picker(
         format!(
             "{} {} {}",
             st.rows.len(),
-            st.lang.s(Key::clip_of),
+            st.lang.s(Key::word_of),
             st.items.len()
         )
     };

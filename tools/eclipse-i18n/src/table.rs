@@ -8,6 +8,16 @@
 //! allow-list kept somewhere else, which is one more thing to forget, and a row
 //! whose English column was copied from the Spanish one is invisible until
 //! somebody runs the client in English.
+//!
+//! A row may carry `{}` where a name, a count or an error text goes, and the
+//! caller fills it in with `str::replace`. That is for a value in the MIDDLE of
+//! a sentence, where the two languages do not agree on the order: the English
+//! of `nada abre un .{ext}` puts the extension in the same place, but
+//! `{prog} no está instalado` and `{prog} is not installed` would not survive
+//! being cut into "before" and "after" fragments in every language. A row with
+//! a value at one END of it is still written as the fragment and formatted by
+//! the caller. `every_row_fills_the_same_holes_in_both_languages` checks that
+//! the two columns of a row hold the same number of `{}`.
 
 macro_rules! strings {
     ($(
@@ -86,7 +96,9 @@ strings! {
     // ── the calendar ─────────────────────────────────────────────────────
     /// Header of the week-number column, one letter.
     cal_week => { es: "s", en: "w" },
-    cal_today => { es: "hoy", en: "today" },
+    /// The calendar's today button, and lunarfile's date column (`hoy
+    /// 10:40`). Shared for the reason `word_of` is: one word, one row.
+    word_today => { es: "hoy", en: "today" },
     /// `día 203` / `day 203`, the day-of-year label.
     cal_day_of_year => { es: "día", en: "day" },
 
@@ -99,9 +111,11 @@ strings! {
     lock_just_now => { es: "ahora mismo", en: "just now" },
 
     // ── screenshots ──────────────────────────────────────────────────────
-    /// The directory, as XDG names it; this is a PATH component, so it has to
-    /// match whatever `xdg-user-dirs` wrote for the language.
-    shot_pictures_dir => { es: "Imágenes", en: "Pictures" },
+    /// The pictures folder. This is a PATH component -- it has to match
+    /// whatever `xdg-user-dirs` wrote for the language -- and it is also the
+    /// label lunarfile's rail puts on that folder, which is why it is one row
+    /// rather than two saying the same word.
+    pictures_folder => { es: "Imágenes", en: "Pictures" },
     /// The filename stem: `captura-2026-11-05-053112.png`.
     shot_stem => { es: "captura", en: "screenshot" },
     shot_saved => { es: "Captura guardada", en: "Screenshot saved" },
@@ -112,8 +126,10 @@ strings! {
     clip_title => { es: "portapapeles", en: "clipboard" },
     /// `12 entradas` / `12 entries` -- the number goes before it.
     clip_entries => { es: "entradas", en: "entries" },
-    /// `3 de 12` / `3 of 12`, when the filter is narrowing the list.
-    clip_of => { es: "de", en: "of" },
+    /// `3 de 12` / `3 of 12`, when the filter is narrowing the list -- and
+    /// `90 M de 200 M` in lunarfile's progress line. Shared, hence the name:
+    /// it is one word, and two rows holding it would be two places to change.
+    word_of => { es: "de", en: "of" },
     clip_filter => { es: "filtrar...", en: "filter..." },
     clip_empty => { es: "el historial está vacío", en: "the history is empty" },
     clip_no_match => { es: "nada coincide", en: "nothing matches" },
@@ -296,4 +312,199 @@ strings! {
         es: "hay un servidor DNS que no es una dirección",
         en: "one of the DNS servers is not an address",
     },
+    // ── lunarfile: the browser and the file chooser ──────────────────────
+    file_preview => { es: "Vista previa", en: "Preview" },
+    file_places => { es: "Lugares", en: "Places" },
+    file_col_name => { es: "Nombre", en: "Name" },
+    file_col_size => { es: "Tamaño", en: "Size" },
+    /// Also `Modificado 3 oct` under the preview, with the date after it.
+    file_col_modified => { es: "Modificado", en: "Modified" },
+    /// The header chip of `--pick`. Capitals in both languages: it is a chip.
+    file_chip_pick => { es: "SELECTOR", en: "CHOOSER" },
+    file_chip_save => { es: "GUARDAR", en: "SAVE" },
+    file_title_save => { es: "Guardar en", en: "Save in" },
+    file_title_browse => { es: "Archivos", en: "Files" },
+    file_title_pick => { es: "Elegir archivo", en: "Choose file" },
+    file_label_rename => { es: "Renombrar:", en: "Rename:" },
+    file_label_newdir => { es: "Carpeta:", en: "Folder:" },
+    file_label_name => { es: "Nombre:", en: "Name:" },
+    file_label_filter => { es: "Filtro:", en: "Filter:" },
+    file_btn_cancel => { es: "Cancelar", en: "Cancel" },
+    /// The primary button, and the menu's first action. `--multiple` puts the
+    /// number of marked files after it.
+    file_btn_open => { es: "Abrir", en: "Open" },
+    file_btn_replace => { es: "Reemplazar", en: "Replace" },
+    file_btn_save => { es: "Guardar", en: "Save" },
+
+    // ── lunarfile: the preview column ────────────────────────────────────
+    /// A folder with nothing in it, and one whose only entries are dotfiles.
+    file_dir_empty => { es: "Carpeta vacía", en: "Empty folder" },
+    file_dir_hidden_only => { es: "Sólo ocultos", en: "Hidden only" },
+    file_unreadable => { es: "No se puede leer", en: "Cannot be read" },
+    file_no_preview => { es: "Sin vista previa", en: "No preview" },
+    /// `+12 más`: the count goes before it.
+    file_more => { es: "más", en: "more" },
+    /// What something is, as the preview names it. `file_folder` is also the
+    /// rail's and the details' word for a directory.
+    file_folder => { es: "Carpeta", en: "Folder" },
+    file_kind_image => { es: "Imagen", en: "Image" },
+    file_kind_document => { es: "Documento", en: "Document" },
+    file_kind_archive => { es: "Archivo comprimido", en: "Compressed archive" },
+    file_kind_disk => { es: "Imagen de disco", en: "Disk image" },
+    file_kind_media => { es: "Multimedia", en: "Media" },
+    file_kind_code => { es: "Código", en: "Code" },
+    file_kind_other => { es: "Archivo", en: "File" },
+    /// Counted: `3 carpetas · 12 archivos`.
+    file_n_folder => { es: "carpeta", en: "folder" },
+    file_n_folders => { es: "carpetas", en: "folders" },
+    file_n_file => { es: "archivo", en: "file" },
+    file_n_files => { es: "archivos", en: "files" },
+
+    // ── lunarfile: the footer ────────────────────────────────────────────
+    file_hint_save => {
+        es: "Intro guardar  Esc cancelar  <- subir  . ocultos",
+        en: "Enter save  Esc cancel  <- up  . hidden",
+    },
+    file_hint_many => {
+        es: "Espacio marcar  Intro aceptar  Esc cancelar  <- subir",
+        en: "Space mark  Enter accept  Esc cancel  <- up",
+    },
+    file_hint_open => {
+        es: "Intro elegir  Esc cancelar  <- subir  . ocultos",
+        en: "Enter choose  Esc cancel  <- up  . hidden",
+    },
+    file_hint_edit => {
+        es: "Intro aceptar  Esc cancelar",
+        en: "Enter accept  Esc cancel",
+    },
+    file_hint_browse => {
+        es: "Intro abrir  F2 renombrar  F5/F6 copiar/cortar  Insert pegar  F7 carpeta  Supr papelera  Menú acciones",
+        en: "Enter open  F2 rename  F5/F6 copy/cut  Insert paste  F7 folder  Del trash  Menu actions",
+    },
+    /// `3 marcados`, `12 elementos`: the count goes before them.
+    file_marked => { es: "marcados", en: "marked" },
+    file_items => { es: "elementos", en: "items" },
+    file_cut => { es: "Cortado", en: "Cut" },
+    file_copied => { es: "Copiado", en: "Copied" },
+    file_paste_here => { es: "Insert pega aquí", en: "Insert pastes here" },
+
+    // ── lunarfile: what it says went wrong ───────────────────────────────
+    /// The filename goes before these three.
+    file_exists_enter => {
+        es: "ya existe: Intro para reemplazarlo",
+        en: "already exists: Enter to replace it",
+    },
+    file_exists_enter_again => {
+        es: "ya existe: Intro otra vez para reemplazarlo",
+        en: "already exists: Enter again to replace it",
+    },
+    file_is_a_folder => {
+        es: "es una carpeta: -> para entrar",
+        en: "is a folder: -> to enter it",
+    },
+    file_type_a_name => { es: "escribe un nombre", en: "type a name" },
+    /// `como mucho 64 archivos`: the count and `file_n_files` go after it.
+    file_at_most => { es: "como mucho", en: "at most" },
+    file_no_opener => {
+        es: "nada abre un .{} (ver /etc/eclipse/openers)",
+        en: "nothing opens a .{} (see /etc/eclipse/openers)",
+    },
+    file_no_extension => {
+        es: "sin extensión: nada sabe abrirlo",
+        en: "no extension: nothing knows how to open it",
+    },
+    file_not_installed => { es: "{} no está instalado", en: "{} is not installed" },
+
+    // ── lunarfile: the action menu ───────────────────────────────────────
+    file_op_rename => { es: "Renombrar", en: "Rename" },
+    file_op_copy => { es: "Copiar", en: "Copy" },
+    file_op_cut => { es: "Cortar", en: "Cut" },
+    file_op_paste => { es: "Pegar aquí", en: "Paste here" },
+    file_op_newdir => { es: "Nueva carpeta", en: "New folder" },
+    /// Also `A la papelera: notas.txt` once it is gone.
+    file_op_trash => { es: "A la papelera", en: "To the trash" },
+    /// The keycaps the menu prints beside the actions. The function keys are
+    /// named the same in both languages; these two are not.
+    file_key_enter => { es: "Intro", en: "Enter" },
+    file_key_del => { es: "Supr", en: "Del" },
+    /// `No se pudo mover a la papelera: ...` / `No se pudo: ...`: what failed
+    /// and the error go after it.
+    file_could_not => { es: "No se pudo", en: "Could not" },
+    file_what_trash => { es: "mover a la papelera", en: "move to the trash" },
+    file_nothing_to_paste => {
+        es: "Nada que pegar: copia o corta algo antes (F5, F6)",
+        en: "Nothing to paste: copy or cut something first (F5, F6)",
+    },
+    file_pick_something => {
+        es: "Elige un archivo o una carpeta primero",
+        en: "Choose a file or a folder first",
+    },
+    file_rename_prompt => {
+        es: "Escribe el nombre nuevo · Intro renombra · Esc cancela",
+        en: "Type the new name · Enter renames · Esc cancels",
+    },
+    file_newdir_prompt => {
+        es: "Nombre de la carpeta · Intro la crea · Esc cancela",
+        en: "The folder's name · Enter creates it · Esc cancels",
+    },
+    /// The name the new-folder field is filled with, which the user then
+    /// edits. A name on disk, so it is written in the session's language and
+    /// not translated afterwards: the folder keeps the name it was made with.
+    file_new_folder_name => { es: "Carpeta nueva", en: "New folder" },
+    /// `Copiado: notas.txt · ve a otra carpeta e Insert lo pega`.
+    file_held_tail => {
+        es: "ve a otra carpeta e Insert lo pega",
+        en: "go to another folder and Insert pastes it",
+    },
+    file_renamed => { es: "Renombrado", en: "Renamed" },
+    file_dir_created => { es: "Carpeta creada", en: "Folder created" },
+
+    // ── lunarfile: the paste that runs in the background ─────────────────
+    file_job_cancelling => { es: "Cancelando", en: "Cancelling" },
+    file_job_moving => { es: "Moviendo", en: "Moving" },
+    file_job_copying => { es: "Copiando", en: "Copying" },
+    file_job_esc => { es: "Esc cancela", en: "Esc cancels" },
+    file_job_wait => {
+        es: "Espera a que termine la copia en curso (Esc la cancela)",
+        en: "Wait for the copy in progress to finish (Esc cancels it)",
+    },
+    /// The name goes after these two.
+    file_pasted => { es: "Pegado", en: "Pasted" },
+    file_cancelled => { es: "Cancelado", en: "Cancelled" },
+    /// The error goes after it.
+    file_paste_failed => { es: "No se pudo pegar", en: "Could not paste" },
+    file_copy_error => {
+        es: "La copia se detuvo por un error",
+        en: "The copy stopped on an error",
+    },
+
+    // ── lunarfile: what `fileops` itself refuses ─────────────────────────
+    // These are the errors fileops RAISES, as opposed to the system's. They
+    // live here for the reason the `net_bad_*` rows do: the file operations
+    // stay language-free, and `fileops::message` renders them in the
+    // session's language.
+    file_err_cancelled => { es: "cancelado", en: "cancelled" },
+    file_err_bad_name => { es: "nombre no válido", en: "not a valid name" },
+    file_err_self_nest => {
+        es: "una carpeta no cabe dentro de sí misma",
+        en: "a folder does not fit inside itself",
+    },
+    file_err_exists => {
+        es: "ese nombre ya existe",
+        en: "that name is already taken",
+    },
+
+    // ── lunarfile: the places rail ───────────────────────────────────────
+    // The LABEL only. Which directory each one is stays a list of names in
+    // `files::XDG_PLACES`, and that list holds both languages' spellings
+    // whatever the session is in: an imported home has `Pictures` in it and a
+    // Spanish session still has to find it.
+    file_place_home => { es: "Inicio", en: "Home" },
+    file_place_root => { es: "Raíz /", en: "Root /" },
+    file_place_documents => { es: "Documentos", en: "Documents" },
+    file_place_downloads => { es: "Descargas", en: "Downloads" },
+    file_place_music => { es: "Música", en: "Music" },
+
+    // ── lunarfile: the date column (`hoy 10:40` is `word_today`) ─────────
+    word_yesterday => { es: "ayer", en: "yesterday" },
 }
