@@ -125,6 +125,12 @@ const PASADOS: &[(&str, usize)] = &[
     // `var_run_tests` salió a `linux/var_run_tests.rs` --- 348 líneas, ni una
     // de producción --- y quedó en 5725. Le siguen quedando cuatro `mod` de
     // test de primer nivel aquí para la próxima vez.
+    //
+    // Y la próxima vez fue el 5-nov, con la SEGUNDA pareja de sondas del
+    // `PT_INTERP` (la del intérprete `ET_DYN`): 5765. Mismo remedio,
+    // `apk_arch_tests` a `linux/apk_arch_tests.rs`, y queda en 5689. El techo
+    // se queda en 5750 porque es el múltiplo de 250 que le viene justo;
+    // quedan TRES `mod` de test de primer nivel aquí.
     ("xtask/src/linux/mod.rs", 5750),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
