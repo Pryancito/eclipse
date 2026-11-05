@@ -72,6 +72,14 @@ impl Lang {
         }
     }
 
+    /// The key the selected launcher row answers to, in caps (tecno).
+    pub fn enter_key(self) -> &'static str {
+        match self {
+            Lang::Es => "INTRO",
+            Lang::En => "ENTER",
+        }
+    }
+
     pub fn run_hint(self) -> &'static str {
         match self {
             Lang::Es => "escribe para buscar o ejecutar",

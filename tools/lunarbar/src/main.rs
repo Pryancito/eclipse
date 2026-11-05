@@ -2953,8 +2953,9 @@ fn draw_apps(
     // Header: crescent + title + result count.
     let icon = 18;
     cv.crescent(px + 12, py + (APPS_HEADER_H - icon) / 2, icon, pal().accent);
+    let title = i18n::Lang::current().apps_title();
     cv.text_bold(
-        i18n::Lang::current().apps_title(),
+        &if tecno() { title.to_uppercase() } else { title.to_string() },
         px + 12 + icon + 10,
         py + (APPS_HEADER_H - GLYPH_H) / 2,
         pal().text,
@@ -3003,11 +3004,20 @@ fn draw_apps(
             let selected = row == sel;
             if selected {
                 plate_a(cv, px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, pal().menu_hover, 1.0);
+                if tecno() {
+                    cv.fill_rect_a(px + 5, y + 1, 2, APPS_ROW_H - 2, pal().accent, 1.0);
+                }
             }
             let Some(e) = all.get(ai) else { continue };
+            let iy = y + (APPS_ROW_H - is) / 2;
+            if tecno() {
+                // The launcher's framed glyph boxes, not the app icons.
+                let t = e.exec.contains("term") || e.exec.split_whitespace().next() == Some("foot");
+                let ch: String = if t { ">".into() } else { e.name.chars().take(1).flat_map(char::to_uppercase).collect() };
+                cv.glyph_box(px + 12, iy, is, &ch, pal().pill, pal().rule, pal().accent);
+            } else {
             // Icon slot: the entry's Icon=, else its name against the theme
             // index, else the letter badge.
-            let iy = y + (APPS_ROW_H - is) / 2;
             let pm = e
                 .icon
                 .as_deref()
@@ -3019,6 +3029,7 @@ fn draw_apps(
                     let ch = e.name.chars().next().unwrap_or('?');
                     cv.badge(px + 12, iy, is, ch, pal().pill, pal().accent);
                 }
+            }
             }
             let col = if selected { pal().text } else { pal().muted };
             // Truncate long names to the panel width (font is ISO-8859-1, so a
@@ -3079,6 +3090,7 @@ fn draw_calendar(
         i18n::Lang::current().month_full()[month as usize % 12],
         year
     );
+    let title = if tecno() { title.to_uppercase() } else { title };
     let tw = Canvas::text_width(&title);
     cv.text_bold(&title, px + (pw - tw) / 2, py + (header_h - GLYPH_H) / 2, pal().text);
     let hits = vec![
@@ -3089,6 +3101,7 @@ fn draw_calendar(
     // Weekday header, Monday-first.
     let wkd = i18n::Lang::current().weekday_mon_first();
     for (i, wd) in wkd.iter().enumerate() {
+        let wd = &if tecno() { wd.to_uppercase() } else { wd.to_string() };
         let x = px + pad + i as i32 * cell_w + (cell_w - Canvas::text_width(wd)) / 2;
         cv.text(wd, x, py + header_h + (wkd_h - GLYPH_H) / 2, pal().dim);
     }
@@ -3106,7 +3119,12 @@ fn draw_calendar(
         let s = d.to_string();
         let tx = x + (cell_w - Canvas::text_width(&s)) / 2;
         let dy = y + (cell_h - GLYPH_H) / 2;
-        if today == Some((year, month, d as u32)) {
+        if today == Some((year, month, d as u32)) && tecno() {
+            // A's focus: the gold brackets, small, around today.
+            plate(cv, x + 2, y + 1, cell_w - 4, cell_h - 2, 0, pal().btn_active);
+            cv.brackets(x + 2, y + 1, cell_w - 4, cell_h - 2, 4, 1, TECNO_GOLD);
+            cv.text_bold(&s, tx, dy, pal().white);
+        } else if today == Some((year, month, d as u32)) {
             plate(cv, x + 2, y + 1, cell_w - 4, cell_h - 2, 6, pal().rule);
             cv.text_bold(&s, tx, dy, pal().white);
         } else {
@@ -3152,11 +3170,14 @@ fn draw_power_menu(
         let tx = px + 42;
         let ty = ry + (row_h - GLYPH_H) / 2;
 
+        // Tecno: the glyphs are dim instruments, and shutdown is the one in
+        // warn orange, like the bar's power button.
+        let (ic, off) = if tecno() { (pal().dim, pal().warn) } else { (pal().white, pal().white) };
         match act {
-            Action::PowerLock => cv.lock_icon(ix, iy, 14, pal().white),
-            Action::PowerLogout => cv.exit_icon(ix, iy, 14, pal().white),
-            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, pal().white),
-            Action::PowerShutdown => cv.power_icon(ix, iy, 14, pal().white),
+            Action::PowerLock => cv.lock_icon(ix, iy, 14, ic),
+            Action::PowerLogout => cv.exit_icon(ix, iy, 14, ic),
+            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, ic),
+            Action::PowerShutdown => cv.power_icon(ix, iy, 14, off),
             _ => {}
         }
         cv.text(label, tx, ty, pal().text);
@@ -3223,13 +3244,19 @@ fn draw_volume_menu(
     draw_panel(cv, px, py, pw, ph, 10);
 
     cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
-    let label = format!("volumen {}%", vol);
+    let label = cap(&format!("volumen {}%", vol));
     cv.text_bold(&label, px + 40, py + 16, pal().text);
 
     let mut hits = Vec::new();
     let gw = pw - 30;
     let gy = py + 48;
-    cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, pal().pill);
+    if tecno() {
+        // The panel's segmented meter, one cell per 4px of the slider.
+        let c = meter::ramp(vol as f32 / 100.0, pal().accent, pal().warn);
+        cv.blocks(px + 15, gy, (gw + 1) / 4, vol as f32 / 100.0, 10, c, pal().dim);
+    } else {
+        cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, pal().pill);
+    }
     // One continuous hitbox — percent is derived from the click x.
     hits.push((px + 15, gy - 10, px + 15 + gw, gy + 20, Action::VolumeGauge));
 

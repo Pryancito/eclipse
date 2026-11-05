@@ -142,14 +142,23 @@ fn segments(
         let x = seg_x(px, first + i) + 2;
         let w = SEG_W - 4;
         let ok = enabled(i);
-        let (bg, a, fg) = if i == on {
+        let (bg, a, fg) = if i == on && tecno() {
+            // A lights a choice, it does not flood it: the selected plate
+            // with a cyan hairline and cyan text.
+            plate(cv, x, sy, w, sh, 0, pal().accent);
+            (pal().btn_active, 1.0, pal().accent)
+        } else if i == on {
             (pal().accent, 1.0, pal().bar_bg)
         } else if ok {
             (pal().pill, 1.0, pal().muted)
         } else {
             (pal().pill, 0.4, pal().dim)
         };
-        plate_a(cv, x, sy, w, sh, 5, bg, a);
+        if i == on && tecno() {
+            plate_a(cv, x + 1, sy + 1, w - 2, sh - 2, 0, bg, a);
+        } else {
+            plate_a(cv, x, sy, w, sh, 5, bg, a);
+        }
         let label = fit(label, w - 4);
         let tx = x + (w - Canvas::text_width(&label)) / 2;
         cv.text(&label, tx, sy + (sh - GLYPH_H) / 2, fg);

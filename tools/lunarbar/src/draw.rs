@@ -52,6 +52,9 @@ fn color(c: Rgb, a: f32) -> Color {
 /// (embedded-graphics), blitted to XRGB8888 when the frame is complete.
 pub struct Canvas {
     pix: Pixmap,
+    /// Every rounded rect drawn square: how a whole app takes the tecno
+    /// look's straight plates without touching each call site.
+    square: bool,
 }
 
 impl Canvas {
@@ -59,7 +62,7 @@ impl Canvas {
     /// (`panic = "abort"` in release).
     pub fn try_new(w: usize, h: usize) -> Option<Self> {
         let pix = Pixmap::new(w.max(1) as u32, h.max(1) as u32)?;
-        Some(Self { pix })
+        Some(Self { pix, square: false })
     }
 
     pub fn new(w: usize, h: usize) -> Self {
@@ -113,7 +116,13 @@ impl Canvas {
     /// A filled rounded rectangle, corner radius `rad`. Used for the clock and
     /// date pills and the active taskbar button, matching waybar's
     /// `border-radius: 6px` — now genuinely round thanks to tiny-skia's AA.
+    /// See [`Canvas::square`]. Off by default.
+    pub fn set_square(&mut self, on: bool) {
+        self.square = on;
+    }
+
     pub fn round_rect(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb) {
+        let rad = if self.square { 0 } else { rad };
         if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
             self.fill(&p, c, 1.0);
         }
@@ -459,6 +468,16 @@ impl Canvas {
         s.chars().count() as i32 * BIG_W + 1
     }
 
+    /// Mockup A's framed glyph box: a square well with a hairline edge and
+    /// one bold character centred in it (the launcher's `>`, `$`, initials).
+    pub fn glyph_box(&mut self, x: i32, y: i32, s: i32, ch: &str, well: Rgb, edge: Rgb, fg: Rgb) {
+        self.fill_rect_a(x, y, s, s, well, 1.0);
+        for (rx, ry, rw, rh) in [(x, y, s, 1), (x, y + s - 1, s, 1), (x, y, 1, s), (x + s - 1, y, 1, s)] {
+            self.fill_rect_a(rx, ry, rw, rh, edge, 1.0);
+        }
+        self.text_bold(ch, x + (s - GLYPH_W) / 2 + 1, y + (s - GLYPH_H) / 2, fg);
+    }
+
     /// The tecno task marker: a hairline square with a lit core (A's `▣`).
     pub fn task_square(&mut self, x: i32, y: i32, s: i32, edge: Rgb, core: Rgb) {
         self.fill_rect_a(x, y, s, 1, edge, 1.0);
@@ -737,6 +756,7 @@ impl Canvas {
 
     /// Filled rounded rect with explicit alpha.
     pub fn round_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, rad: i32, c: Rgb, a: f32) {
+        let rad = if self.square { 0 } else { rad };
         if let Some(p) = rounded_rect_path(x as f32, y as f32, rw as f32, rh as f32, rad as f32) {
             self.fill(&p, c, a);
         }

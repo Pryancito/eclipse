@@ -504,8 +504,11 @@ fn the_calendar_names_its_month_in_full() {
     );
     let want = Canvas::text_width(&title);
     assert!(hi > lo, "nothing written over the grid");
+    // Ink, not cells: the first and last glyph leave a few blank columns,
+    // more for capitals (tecno writes the month in caps). Under a cell either
+    // way, and the short form is three whole cells narrower.
     assert!(
-        (hi - lo + 1 - want).abs() <= 2,
+        (hi - lo + 1 - want).abs() < GLYPH_W,
         "{}px of title where {want}px was expected",
         hi - lo + 1
     );

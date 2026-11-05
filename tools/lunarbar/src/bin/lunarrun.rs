@@ -848,11 +848,10 @@ fn draw_overlay(
         }
         let iy = y + (ROW_H - 2 - ICON) / 2;
         let ix = fx + 8;
-        match it
-            .icon
-            .as_deref()
-            .and_then(|name| icons.get(name, ICON as u32))
-        {
+        // Tecno never shows the app's own icon: every row gets A's framed
+        // glyph box, so the list reads as one instrument and not a collage.
+        let icon = if hud { None } else { it.icon.as_deref().and_then(|name| icons.get(name, ICON as u32)) };
+        match icon {
             Some(pm) => cv.pixmap(ix, iy, &pm),
             None => {
                 let ch = it.name.chars().next().unwrap_or('?');
@@ -863,7 +862,13 @@ fn draw_overlay(
                     for (x, y, w, h) in [(ix, iy, ICON, 1), (ix, iy + ICON - 1, ICON, 1), (ix, iy, 1, ICON), (ix + ICON - 1, iy, 1, ICON)] {
                         cv.fill_rect_a(x, y, w, h, p.border, 1.0);
                     }
-                    let up: String = ch.to_uppercase().take(1).collect();
+                    let up: String = if row >= st.hits.len() {
+                        "$".into() // the typed command, A's `$ Ejecutar orden`
+                    } else if is_terminal(&it.exec) {
+                        ">".into()
+                    } else {
+                        ch.to_uppercase().take(1).collect()
+                    };
                     cv.text_bold(&up, ix + (ICON - GLYPH_W) / 2 + 1, iy + (ICON - GLYPH_H) / 2, p.accent);
                 }
             }
@@ -875,6 +880,31 @@ fn draw_overlay(
         // a wrapped Terminal=true entry's full /usr/local/bin/... path says
         // nothing and eats the row.
         let cmd = cmd_basename(&it.exec);
+        if hud {
+            // A's row: `Name · cmd` in one run, and only the selected row
+            // says what Enter does, on the right.
+            let key = st.lang.enter_key();
+            let key_w = if selected { Canvas::text_width(key) + 16 } else { 0 };
+            let room = ((fw - (text_x - fx) - key_w - 10) / GLYPH_W).max(1) as usize;
+            let full = format!("{} · {}", it.name, cmd);
+            let nlen = it.name.chars().count();
+            let shown: String = if full.chars().count() <= room {
+                full
+            } else if nlen <= room {
+                it.name.clone()
+            } else {
+                it.name.chars().take(room.saturating_sub(1)).chain(['.']).collect()
+            };
+            let w = cv.text(&shown.chars().take(nlen).collect::<String>(), text_x, ty, p.text);
+            let rest: String = shown.chars().skip(nlen).collect();
+            if !rest.is_empty() {
+                cv.text(&rest, text_x + w, ty, p.dim);
+            }
+            if selected {
+                cv.text(key, fx + fw - key_w - 6, ty, p.accent);
+            }
+            continue;
+        }
         let cmd_w = Canvas::text_width(cmd);
         let (max_chars, show_cmd) = row_text_layout(fw - (text_x - fx), cmd_w);
         let name: String = if it.name.chars().count() > max_chars {
@@ -922,6 +952,12 @@ fn draw_overlay(
     );
 
     ((px, py, pw, ph), row0)
+}
+
+/// A row that opens a terminal gets A's `>` box.
+fn is_terminal(exec: &str) -> bool {
+    let b = cmd_basename(exec);
+    b == "foot" || b.contains("term")
 }
 
 // ── hit testing and the wheel ──────────────────────────────────────
@@ -1544,6 +1580,14 @@ mod tests {
     // ── the selection ────────────────────────────────────────────────────────
 
     // ── the frame that was owed ──────────────────────────────────────────────
+
+    #[test]
+    fn a_terminal_row_is_marked_by_its_command_and_not_its_name() {
+        assert!(is_terminal("eclipse-terminal"));
+        assert!(is_terminal("/usr/bin/foot"));
+        assert!(is_terminal("xterm -e top"));
+        assert!(!is_terminal("libreoffice --calc"));
+    }
 
     #[test]
     fn a_frame_owed_while_both_buffers_are_held_is_drawn_when_one_comes_back() {
