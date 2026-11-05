@@ -350,6 +350,33 @@ const LIVE_FILE_CAP: u64 = 16 * 1024 * 1024;
 /// and any other heavy or user-added component) is intentionally omitted: it
 /// ships in `rootfs.btrfs.gz` and runs from the btrfs disk on the installed
 /// system, which pivots root onto it.
+/// The out-of-tree libc suite (`cargo libc-test`), copied into the QEMU live
+/// root and into nothing else.
+///
+/// It is deliberately absent from [`LIVE_KEEP`]: the EFI bootstrap initramfs
+/// and the ISO installer SFS are loaded whole into RAM, and a test suite has
+/// no business in either. But on x86_64 -- and only on x86_64 -- the image
+/// `make qemu`/`make justrun` boots is built from that same lean root
+/// (`fuse(&live_root, ..)` in step 6 below), while every other architecture
+/// packs the full rootfs (`fuse(self.path(), ..)`). So `/libc-test` was
+/// missing from the only image the `Linux Libc Test Baremetal (x86_64)` job
+/// ever boots.
+///
+/// That did not show up as a red. The harness types the case's path at the
+/// guest shell and classifies the output by substring; its failure patterns
+/// are "failed", "ERROR", "Error", "panicked", "Hangup" and "Unknown signal",
+/// and `sh: /libc-test/src/math/log.exe: not found` (status 127) matches none
+/// of them -- so all 476 cases of `tests/testcases/linux_libc_test/
+/// x86_64_qemu.txt` reported OK without one of them having run.
+///
+/// Measured in QEMU on 2026-11-05 against `d42bc22`: at the guest prompt,
+/// `ls /libc-test/src` answers "No such file or directory".
+///
+/// Copied after the two lean images are frozen, so neither grows by it, and
+/// through [`copy_tree_capped`] like everything else, so the 16 MiB file cap
+/// still applies.
+const LIVE_TEST_SUITE: &str = "libc-test";
+
 const LIVE_KEEP: [&str; 9] = [
     "bin",              // busybox + applets + install-eclipse + e2fsprogs + net tools + rc-*
     "lib",              // ld-musl + libeclipse_dns + apk db + OpenRC /lib/rc helpers (capped)
@@ -405,6 +432,22 @@ fn copy_tree_capped(src: &Path, dst: &Path) {
     }
     let _ = fs::remove_file(dst);
     fs::copy(src, dst).unwrap();
+}
+
+/// Add [`LIVE_TEST_SUITE`] to `live` if the full rootfs carries it.
+///
+/// A rootfs built without `cargo libc-test` simply has no such directory, and
+/// then this is a no-op: the suite is not something a desktop image needs.
+fn copy_test_suite_into_live(full: &Path, live: &Path) {
+    let src = full.join(LIVE_TEST_SUITE);
+    if !src.is_dir() {
+        return;
+    }
+    println!(
+        "  live-rootfs: adding {LIVE_TEST_SUITE} ({} MiB) for the baremetal test job",
+        sfs_payload_bytes(&src) / (1024 * 1024)
+    );
+    copy_tree_capped(&src, &live.join(LIVE_TEST_SUITE));
 }
 
 /// Build the *minimal live/installer* root at `out` from the full `full` rootfs.
@@ -789,6 +832,11 @@ impl super::LinuxRootfs {
             } else {
                 println!("minimal variant: not copying the desktop into the live root");
             }
+
+            // The libc suite, when this rootfs carries one. Here and not in
+            // `LIVE_KEEP`, so the two images frozen above stay lean: see
+            // `LIVE_TEST_SUITE` for what its absence cost.
+            copy_test_suite_into_live(&rootfs_path, &live_root);
 
             // 6. QEMU live SFS: installer payloads + desktop. Not written to
             // the installed ESP or the ISO — those carry the lean images from
@@ -1191,6 +1239,52 @@ mod image_size_tests {
         }
         let _ = fs::remove_dir_all(&full);
         let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The libc suite reaches the QEMU live root, and only through
+    /// `copy_test_suite_into_live` -- never through `build_live_rootfs`, whose
+    /// output is also frozen into the ESP bootstrap and the ISO installer.
+    ///
+    /// This is the check the x86_64 `Linux Libc Test Baremetal` job did not
+    /// have: with `/libc-test` absent from the image, the harness read `sh:
+    /// ...: not found` as a pass and all 476 cases reported OK without
+    /// running. See [`LIVE_TEST_SUITE`].
+    #[test]
+    fn the_libc_suite_reaches_the_qemu_root_and_not_the_lean_ones() {
+        let full = scratch("suite-full");
+        let out = scratch("suite-out");
+        fs::create_dir_all(full.join("bin")).unwrap();
+        fs::create_dir_all(full.join("libc-test/src/math")).unwrap();
+        fs::write(full.join("bin/busybox"), b"busybox").unwrap();
+        fs::write(full.join("libc-test/src/math/log.exe"), b"elf").unwrap();
+
+        // The lean root -- what the ESP bootstrap and the ISO installer are
+        // built from -- must NOT carry it.
+        build_live_rootfs(&full, &out);
+        assert!(
+            !out.join("libc-test").exists(),
+            "the suite would be loaded into RAM at boot from the ESP initramfs"
+        );
+
+        // The QEMU image's root, built from that same tree one step later,
+        // must.
+        copy_test_suite_into_live(&full, &out);
+        assert!(
+            out.join("libc-test/src/math/log.exe").is_file(),
+            "the baremetal job boots this image and finds no case to run"
+        );
+
+        // A rootfs built without `cargo libc-test` is not an error.
+        let bare = scratch("suite-bare");
+        let bare_out = scratch("suite-bare-out");
+        fs::create_dir_all(&bare).unwrap();
+        fs::create_dir_all(&bare_out).unwrap();
+        copy_test_suite_into_live(&bare, &bare_out);
+        assert!(!bare_out.join("libc-test").exists());
+
+        for d in [&full, &out, &bare, &bare_out] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     /// Applet links must arrive as LINKS. Copying the target instead would put
