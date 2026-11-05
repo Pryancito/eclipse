@@ -584,6 +584,24 @@ impl<T, P: Write> UserPtr<T, P> {
         }
     }
 
+    /// [`write_if_not_null`](Self::write_if_not_null) with **no** alignment
+    /// requirement: the pair of
+    /// [`write_unaligned`](UserPtr::write_unaligned) for an out-parameter
+    /// that a caller is allowed to leave out.
+    ///
+    /// Every structure a 32-bit process passes is reachable at any offset ---
+    /// Linux's `put_user` asks `access_ok` and nothing about alignment, and a
+    /// `struct sigaction` one byte off a word boundary is accepted there and
+    /// was `EFAULT` here. Measured on a Linux host, for all three of the
+    /// narrow signal structures: see `linux_syscall::compat32::signal`.
+    pub fn write_if_not_null_unaligned(&mut self, value: T) -> Result<()> {
+        if !self.0.is_null() {
+            self.write_unaligned(value)
+        } else {
+            Ok(())
+        }
+    }
+
     // 写入 `values.len() * size_of<T>` 字节到指针位置。
     // 写入的区间与目标区间不可重叠。
     /// Copies `values.len() * size_of<T>` bytes from `values` to `self`.

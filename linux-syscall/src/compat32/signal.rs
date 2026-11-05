@@ -23,12 +23,25 @@
 //! not: 24 become 12, which happens to be half, by way of a member that did
 //! not change and padding that vanished.
 //!
+//! | `struct old_sigaction` | --- | 16 |
+//!
+//! the third being the pre-POSIX `sigaction` (67), whose `sa_mask` is a
+//! single `u32` and whose members are in a different ORDER: it is not the
+//! twenty above with four taken off. x86_64 has no such call at all, which
+//! is what the dash in that row says.
+//!
+//! ## Alignment
+//!
+//! All three are read and written with the **unaligned** pair of
+//! [`UserInPtr`]/[`UserOutPtr`]. Linux's `copy_from_user` and `put_user` ask
+//! `access_ok` and nothing about alignment, so a `struct sigaction` one byte
+//! off a word boundary is accepted there; the typed `read` refuses it.
+//! Measured on a Linux host for all three numbers (67, 174 and 186): every
+//! one of them answers 0 for a structure at 1 modulo 4, where this kernel
+//! answered `EFAULT`.
+//!
 //! ## And what is still missing
 //!
-//! `sigaction` (67) and `sigreturn` (119), the pre-POSIX pair, are not here.
-//! Their `struct old_sigaction` keeps a 32-bit `sa_mask` and their frame is a
-//! `struct sigframe_ia32` with no `siginfo` --- a second layout, reached only
-//! by a libc that does not use `rt_sigaction`, which musl and glibc both do.
 //! `rt_sigqueueinfo` (178) passes a `siginfo_t` **inwards**, which needs the
 //! conversion of [`linux_object::signal::siginfo32`] run backwards and is not
 //! written yet. `rt_sigtimedwait` (177) is **not** here and needs no handler
@@ -43,6 +56,12 @@ use linux_object::signal::{SignalAction, SignalActionFlags, Sigset};
 
 /// i386's number for `rt_sigaction`.
 pub(super) const I386_RT_SIGACTION: u32 = 174;
+/// And for the pre-POSIX `sigaction`, which is a second call with a
+/// structure of its own and not a flag on the one above. It is what a libc
+/// that does not use `rt_sigaction` installs a handler with, and what
+/// `signal(2)`'s own manual page calls the "original" call; x86_64 has no
+/// number for it.
+pub(super) const I386_SIGACTION: u32 = 67;
 /// i386's number for `sigaltstack`.
 pub(super) const I386_SIGALTSTACK: u32 = 186;
 /// i386's number for `rt_sigreturn`, which has no native twin: the native
@@ -103,6 +122,79 @@ impl SignalAction32 {
     }
 }
 
+/// `struct compat_old_sigaction` (`include/linux/compat.h`): sixteen bytes,
+/// and NOT the twenty of [`SignalAction32`] with a word taken off.
+///
+/// Two things move at once, which is why this is its own type and not a
+/// narrower spelling of the one above:
+///
+/// | | `compat_sigaction` | `compat_old_sigaction` |
+/// |---|---|---|
+/// | 0 | `sa_handler` | `sa_handler` |
+/// | 4 | `sa_flags` | **`sa_mask`** |
+/// | 8 | `sa_restorer` | `sa_flags` |
+/// | 12 | `sa_mask` (two words) | `sa_restorer` |
+///
+/// The mask is `compat_old_sigset_t`, **one** `u32` where the `rt_` form has
+/// the whole eight-byte `sigset_t`, so this layout can only ever name the
+/// first 32 signals --- and it is the SECOND member, not the last. A kernel
+/// that read these sixteen bytes in the `rt_` order would take the mask for
+/// the flags and the flags for the restorer, and a handler installed by
+/// `signal(3)` would come back through an address of 0.
+///
+/// Measured on a Linux host, not read off a header: an i386 program installs
+/// an action through 67 and reads it back through 174, and the handler, the
+/// flags, the restorer and the mask each come out of the offset this table
+/// gives. The same measurement showed nothing written past byte sixteen.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub struct OldSignalAction32 {
+    pub handler: u32,
+    pub mask: u32,
+    pub flags: u32,
+    pub restorer: u32,
+}
+
+impl OldSignalAction32 {
+    /// The action as the kernel keeps it, with the mask WIDENED BY ZEROS.
+    ///
+    /// `compat_sys_sigaction` finishes with `siginitset(&new_ka.sa.sa_mask,
+    /// mask)`, which sets the low word and clears the high one: an action
+    /// installed through 67 blocks no signal above 32 **even if the action
+    /// it replaces blocked some**. That is not a rounding of the old value,
+    /// it is a replacement, and it is measured: an action installed through
+    /// 174 with a realtime signal in its mask, re-installed through 67,
+    /// reads back through 174 with that half zero.
+    pub fn to_native(self) -> SignalAction {
+        SignalAction {
+            handler: self.handler as usize,
+            flags: SignalActionFlags::from_bits_truncate(self.flags as usize),
+            restorer: self.restorer as usize,
+            mask: Sigset::new(self.mask as u64),
+        }
+    }
+
+    /// And what `sigaction(sig, NULL, &old)` reads back, with the high half
+    /// of the mask DROPPED without a word.
+    ///
+    /// `put_user(old_ka.sa.sa_mask.sig[0], &oact->sa_mask)`: there is
+    /// nowhere in sixteen bytes to report the other 32 signals, and Linux
+    /// does not refuse the call over it. Measured the same way round: an
+    /// action installed through 174 with a realtime signal in its mask comes
+    /// back through 67 with only the low word, and the call answers 0.
+    ///
+    /// The handler and the restorer are truncated for the reason
+    /// [`SignalAction32::from_native`] gives: the process lives below 4 GiB.
+    pub fn from_native(action: SignalAction) -> Self {
+        Self {
+            handler: action.handler as u32,
+            mask: action.mask.val() as u32,
+            flags: action.flags.bits() as u32,
+            restorer: action.restorer as u32,
+        }
+    }
+}
+
 impl Syscall<'_> {
     /// `compat_sys_rt_sigaction`: the same call as the native one, with
     /// twenty bytes in and twenty bytes out.
@@ -129,8 +221,43 @@ impl Syscall<'_> {
             signum,
             act.is_null(),
             sigsetsize,
-            || Ok(act.read()?.to_native()),
-            |old| Ok(oldact.write_if_not_null(SignalAction32::from_native(old))?),
+            || Ok(act.read_unaligned()?.to_native()),
+            |old| Ok(oldact.write_if_not_null_unaligned(SignalAction32::from_native(old))?),
+        )
+    }
+
+    /// `compat_sys_sigaction`: the pre-POSIX call, sixteen bytes in and
+    /// sixteen out.
+    ///
+    /// The same `do_sigaction` as the two above --- every check, and the
+    /// order they are made in, is [`Syscall::sigaction_with`]'s. The
+    /// `sigsetsize` it is handed is `size_of::<Sigset>()` and not a number
+    /// this caller supplied, because **this call has no such argument**:
+    /// `compat_sys_sigaction` takes three, and the check lives in the `rt_`
+    /// entry point in Linux too (`sys_rt_sigaction` is where
+    /// `sigsetsize != sizeof(sigset_t)` is refused). Passing the size that
+    /// passes is how a shared `do_sigaction` says "no check here", and it
+    /// is measured: `sigaction(SIGUSR1, &act, NULL)` from an i386 program
+    /// answers 0, with nothing in any register that could be a size.
+    pub fn sys_sigaction32(
+        &self,
+        signum: usize,
+        act: UserInPtr<OldSignalAction32>,
+        mut oldact: UserOutPtr<OldSignalAction32>,
+    ) -> SysResult {
+        info!(
+            "sigaction32: signum={}, act={:?}, oldact={:?}, thread={}",
+            signum,
+            act,
+            oldact,
+            self.thread.id()
+        );
+        self.sigaction_with(
+            signum,
+            act.is_null(),
+            core::mem::size_of::<Sigset>(),
+            || Ok(act.read_unaligned()?.to_native()),
+            |old| Ok(oldact.write_if_not_null_unaligned(OldSignalAction32::from_native(old))?),
         )
     }
 
@@ -148,8 +275,8 @@ impl Syscall<'_> {
         info!("sigaltstack32: ss={:?}, old_ss={:?}", ss, old_ss);
         self.sigaltstack_with(
             ss.is_null(),
-            || Ok(ss.read()?.to_native()),
-            |old| Ok(old_ss.write_if_not_null(SignalStack32::from_native(&old))?),
+            || Ok(ss.read_unaligned()?.to_native()),
+            |old| Ok(old_ss.write_if_not_null_unaligned(SignalStack32::from_native(&old))?),
         )
     }
 }
@@ -161,6 +288,11 @@ mod tests;
 /// thing that differs is the ALIGNMENT. Own file, own subject.
 #[cfg(test)]
 mod mask_tests;
+
+/// The pre-POSIX `sigaction` (67), whose structure is the OTHER one: own
+/// file, because its subject is that layout and not the `rt_` pair's.
+#[cfg(test)]
+mod old_sigaction_tests;
 
 /// The two that read a `siginfo_t` INWARDS (178 and 335), whose subject is
 /// the conversion run backwards: own file, so the mask's ceiling and this

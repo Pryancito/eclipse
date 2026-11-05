@@ -178,7 +178,9 @@ const I386_SOCKETCALL: u32 = 102;
 /// a `struct sigaction`'s `sa_mask` does not change width while its other
 /// three members do, a `struct sigaltstack` loses padding rather than bytes,
 /// and `rt_sigreturn` reads a 32-bit frame. See [`signal`].
-use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK, I386_SIGRETURN};
+use signal::{
+    I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGACTION, I386_SIGALTSTACK, I386_SIGRETURN,
+};
 use tls::I386_CLONE;
 
 /// And the `*_time64` calls, the one family where the width of a structure is
@@ -319,6 +321,13 @@ impl Syscall<'_> {
             // `Syscall::sys_rt_sigreturn`.
             I386_RT_SIGACTION => {
                 return syscall_ret(self.sys_rt_sigaction32(a0, a1.into(), a2.into(), a3));
+            }
+            // And the pre-POSIX `sigaction`, whose `struct old_sigaction` is
+            // sixteen bytes with the members in another ORDER --- not the
+            // twenty of the call above with a word taken off. It takes three
+            // arguments and not four: there is no `sigsetsize` to read.
+            I386_SIGACTION => {
+                return syscall_ret(self.sys_sigaction32(a0, a1.into(), a2.into()));
             }
             I386_SIGALTSTACK => {
                 return syscall_ret(self.sys_sigaltstack32(a0.into(), a1.into()));

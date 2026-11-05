@@ -2,7 +2,8 @@
 //!
 //! Everything process-level here goes through `compat32_syscall` **by
 //! number**, not by calling `sys_rt_sigaction32` directly: what is being
-//! pinned is that the arm exists. Call the handler by name and deleting the
+//! pinned is that the arm exists. The pre-POSIX `sigaction` (67) has its own
+//! file, `old_sigaction_tests`, its structure being another one. Call the handler by name and deleting the
 //! arm from [`crate::compat32`] leaves every test green and every 32-bit
 //! `sigaction` answering `ENOSYS` again, which is what it answered before
 //! this batch.
@@ -402,9 +403,10 @@ fn the_three_numbers_are_not_in_the_translation_table() {
             n
         );
     }
-    // And the pre-POSIX pair has no row either, for two different reasons
-    // now: 119 is answered by the dispatch, like the three above, and 67 is
-    // not answered at all. See this module's documentation.
+    // And the pre-POSIX pair has no row either, for the same reason as the
+    // three above now that both are answered by the dispatch: 67's
+    // `old_sigaction` is sixteen bytes and x86_64's 67 is `shmdt`. See
+    // `old_sigaction_tests`.
     for n in [67u32, 119] {
         assert_eq!(crate::compat32::native_number(n), None);
     }

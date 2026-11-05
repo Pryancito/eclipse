@@ -143,6 +143,9 @@
  *       took its `tls` for a base instead of a `struct user_desc *`
  *   113 uname (122) was not callable at all from 32 bits, or a process in
  *       the PER_LINUX32 domain was not told it is on an `i686`
+ *   114 the pre-POSIX sigaction (67) was not answered at all, or its
+ *       `struct old_sigaction` was read as the twenty bytes of number 174:
+ *       it is SIXTEEN, with the mask second and one word wide
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3704,6 +3707,114 @@ timer64_skipped:
 	cmpl	$0x36383669, utsbuf + 260
 	je	bad_uname
 
+	/* Step 90 (code 114): the pre-POSIX `sigaction` (67), whose
+	 * `struct old_sigaction` is SIXTEEN bytes with its members in another
+	 * order --- not the twenty of number 174 with a word taken off.
+	 *
+	 *   offset   174 (`sigaction`)      67 (`old_sigaction`)
+	 *   0        sa_handler             sa_handler
+	 *   4        sa_flags               **sa_mask**, ONE word
+	 *   8        sa_restorer            sa_flags
+	 *   12       sa_mask, TWO words     sa_restorer
+	 *
+	 * So the mask can only name the first 32 signals, and a kernel that
+	 * read these sixteen bytes in the order above them would take the
+	 * mask for the flags and the flags for the restorer: the handler would
+	 * be installed with a restorer of zero and come back through address
+	 * 0. The step reads the action back through 174, which is what makes
+	 * the offsets visible --- and then through 67, which is what makes its
+	 * SIZE visible.
+	 *
+	 * The mask going in names SIGUSR2 and the one that was there before
+	 * named signal 40, which 67 cannot name at all: Linux's
+	 * `siginitset(&new_ka.sa.sa_mask, mask)` REPLACES the whole mask, so
+	 * that half must come back zero. A kernel that merged instead of
+	 * replacing leaves it set, and a program that asked to block one
+	 * signal would be running with two.
+	 *
+	 * Before this batch the number answered `ENOSYS`, so every handler a
+	 * libc installs through 67 --- `signal(2)`'s own "original" call ---
+	 * was never installed. */
+	movl	$0, flag90
+	movl	$174, %eax		/* prime the half 67 cannot name */
+	movl	$10, %ebx		/* SIGUSR1 */
+	movl	$act90rt, %ecx
+	xorl	%edx, %edx
+	movl	$8, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldsigaction
+
+	movl	$67, %eax		/* sigaction */
+	movl	$10, %ebx
+	movl	$act90old, %ecx
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldsigaction
+
+	/* Read it back the OTHER way: the offsets of the sixteen bytes. */
+	movl	$174, %eax
+	movl	$10, %ebx
+	xorl	%ecx, %ecx
+	movl	$old90rt, %edx
+	movl	$8, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldsigaction
+	cmpl	$sa67handler, old90rt + 0
+	jne	bad_oldsigaction
+	cmpl	$0x04000000, old90rt + 4	/* SA_RESTORER, from byte 8 */
+	jne	bad_oldsigaction
+	cmpl	$oldrest, old90rt + 8		/* the restorer, from byte 12 */
+	jne	bad_oldsigaction
+	cmpl	$0x800, old90rt + 12		/* SIGUSR2, from byte 4 */
+	jne	bad_oldsigaction
+	cmpl	$0, old90rt + 16		/* and signal 40 is gone */
+	jne	bad_oldsigaction
+
+	/* The handler really runs and really comes back --- through 119, the
+	 * old frame, because the action has no `SA_SIGINFO`. And while it
+	 * runs, the two signals that must be blocked are: the one in the mask
+	 * and the one being delivered. */
+	movl	$20, %eax		/* getpid */
+	int	$0x80
+	movl	%eax, %ebx
+	movl	$37, %eax		/* kill(self, SIGUSR1) */
+	movl	$10, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldsigaction
+	cmpl	$1, flag90
+	jne	bad_oldsigaction
+	movl	hmask90, %eax
+	andl	$0x800, %eax		/* SIGUSR2, from the mask */
+	jz	bad_oldsigaction
+	movl	hmask90, %eax
+	andl	$0x200, %eax		/* SIGUSR1, blocked by delivery */
+	jz	bad_oldsigaction
+
+	/* And through 67 itself: sixteen bytes, in ITS order, and not one
+	 * byte more. `old90old` is poisoned with 0x5a, so a kernel that
+	 * wrote the twenty of number 174 is seen. */
+	movl	$67, %eax
+	movl	$10, %ebx
+	xorl	%ecx, %ecx
+	movl	$old90old, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldsigaction
+	cmpl	$sa67handler, old90old + 0
+	jne	bad_oldsigaction
+	cmpl	$0x800, old90old + 4		/* the mask is the SECOND member */
+	jne	bad_oldsigaction
+	cmpl	$0x04000000, old90old + 8
+	jne	bad_oldsigaction
+	cmpl	$oldrest, old90old + 12
+	jne	bad_oldsigaction
+	cmpl	$0x5a5a5a5a, old90old + 16
+	jne	bad_oldsigaction
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -4064,12 +4175,29 @@ oldrest:
 	movl	$119, %eax		/* sigreturn */
 	int	$0x80
 
+/* Step 90's handler, which also answers "which signals are blocked while it
+ * runs": the mask going in named SIGUSR2 and delivery blocks SIGUSR1, so
+ * both must be in what `rt_sigprocmask` reports HERE --- asking after the
+ * handler has returned measures nothing, the mask having been put back. */
+sa67handler:
+	movl	$1, flag90
+	movl	$175, %eax		/* rt_sigprocmask(SIG_BLOCK, NULL, &old, 8) */
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	movl	$hmask90, %edx
+	movl	$8, %esi
+	int	$0x80
+	ret
+
 clone_child:
 	/* The child of step 88, whichever call made it: exit 0 and let the
 	 * parent's `waitpid` be the one that reports. */
 	movl	$1, %eax
 	xorl	%ebx, %ebx
 	int	$0x80
+bad_oldsigaction:
+	movl	$114, %ebx
+	jmp	die
 bad_uname:
 	movl	$113, %ebx
 	jmp	die
@@ -4688,3 +4816,36 @@ utsbuf:
 	.balign	4
 oldpersona:
 	.long	0
+
+	/* Step 90's two actions and the two places it reads them back, which
+	 * go here for the reason the block above gives: new buffers at the
+	 * END, each with its own `.balign`. `act90rt` is the twenty bytes of
+	 * number 174 with signal 40 in the half that 67 cannot name;
+	 * `act90old` is the SIXTEEN of number 67, mask second. */
+	.balign	4
+act90rt:
+	.long	sa67handler
+	.long	0x04000000		/* SA_RESTORER, no SA_SIGINFO */
+	.long	oldrest
+	.long	0, 0x80			/* sa_mask: signal 40 and nothing else */
+	.balign	4
+act90old:
+	.long	sa67handler
+	.long	0x800			/* sa_mask: SIGUSR2, ONE word */
+	.long	0x04000000
+	.long	oldrest
+	/* Twenty-four bytes for each readback, poisoned: the first four past
+	 * the structure are what says the kernel wrote its own width and not
+	 * the other one's. */
+	.balign	4
+old90rt:
+	.fill	24, 1, 0x5a
+	.balign	4
+old90old:
+	.fill	24, 1, 0x5a
+	.balign	4
+flag90:
+	.long	0
+	.balign	4
+hmask90:
+	.long	0, 0
