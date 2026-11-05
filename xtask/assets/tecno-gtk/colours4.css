@@ -1,0 +1,54 @@
+/* Eclipse OS - tecno look for GTK 4 (generated into ~/.config/gtk-4.0/gtk.css
+ * by xtask: edit xtask/assets/tecno-gtk/ and rebuild, not this file).
+ *
+ * libadwaita builds every widget from these named colours, so for its apps
+ * this block alone repaints them; the rules after it are for plain GTK 4. */
+@define-color accent_color #38e1ff;
+@define-color accent_bg_color #38e1ff;
+@define-color accent_fg_color #04070d;
+@define-color destructive_color #ff8a5c;
+@define-color destructive_bg_color #ff8a5c;
+@define-color destructive_fg_color #04070d;
+@define-color success_color #6ee7a8;
+@define-color success_bg_color #6ee7a8;
+@define-color success_fg_color #04070d;
+@define-color warning_color #f2c14e;
+@define-color warning_bg_color #f2c14e;
+@define-color warning_fg_color #04070d;
+@define-color error_color #ff8a5c;
+@define-color error_bg_color #ff8a5c;
+@define-color error_fg_color #04070d;
+@define-color window_bg_color #060b14;
+@define-color window_fg_color #e6f1ff;
+@define-color view_bg_color #060b14;
+@define-color view_fg_color #e6f1ff;
+@define-color headerbar_bg_color #0a1423;
+@define-color headerbar_fg_color #e6f1ff;
+@define-color headerbar_border_color #1d3550;
+@define-color headerbar_backdrop_color #0a1423;
+@define-color headerbar_shade_color #1d3550;
+@define-color sidebar_bg_color #0a1423;
+@define-color sidebar_fg_color #e6f1ff;
+@define-color sidebar_backdrop_color #0a1423;
+@define-color sidebar_shade_color #1d3550;
+@define-color card_bg_color #0a1423;
+@define-color card_fg_color #e6f1ff;
+@define-color card_shade_color #1d3550;
+@define-color dialog_bg_color #0a1423;
+@define-color dialog_fg_color #e6f1ff;
+@define-color popover_bg_color #0a1423;
+@define-color popover_fg_color #e6f1ff;
+@define-color popover_shade_color #1d3550;
+@define-color thumbnail_bg_color #0a1423;
+@define-color thumbnail_fg_color #e6f1ff;
+@define-color shade_color #1d3550;
+@define-color scrollbar_outline_color #04070d;
+/* The GTK 3 names too: GTK 4's own Adwaita still reads several of them. */
+@define-color theme_bg_color #0a1423;
+@define-color theme_fg_color #e6f1ff;
+@define-color theme_base_color #060b14;
+@define-color theme_text_color #e6f1ff;
+@define-color theme_selected_bg_color #38e1ff;
+@define-color theme_selected_fg_color #04070d;
+@define-color borders #1d3550;
+
