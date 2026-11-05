@@ -23,6 +23,8 @@ mod arg_area;
 mod comm_tests;
 #[cfg(test)]
 mod cwd_tests;
+/// `/proc/diskstats`: what each disk has read and written.
+mod diskstats;
 #[cfg(test)]
 mod exited_leader_tests;
 #[cfg(test)]
@@ -66,7 +68,7 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 58] = [
+const PROC_ROOT_STATIC: [&str; 59] = [
     "net",
     "gpuready",
     "present",
@@ -85,6 +87,7 @@ const PROC_ROOT_STATIC: [&str; 58] = [
     "thread-self",
     "stat",
     "loadavg",
+    "diskstats",
     "sys",
     "version",
     "perf",
@@ -786,6 +789,7 @@ impl INode for ProcRootINode {
             "mounts" => Ok(PROC_MOUNTS.clone()),
             "stat" => Ok(PROC_STAT.clone()),
             "loadavg" => Ok(PROC_LOADAVG.clone()),
+            "diskstats" => Ok(PROC_DISKSTATS.clone()),
             "sys" => Ok(PROC_SYS_DIR.clone()),
             "version" => Ok(PROC_VERSION.clone()),
             "perf" => Ok(PROC_PERF_DIR.clone()),
@@ -4420,6 +4424,10 @@ lazy_static! {
     static ref PROC_LOADAVG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 16,
         generate: proc_loadavg_content,
+    });
+    static ref PROC_DISKSTATS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 164,
+        generate: diskstats::proc_diskstats_content,
     });
     static ref PROC_FILESYSTEMS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 49,

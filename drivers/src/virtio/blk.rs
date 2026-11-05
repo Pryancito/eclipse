@@ -5,6 +5,8 @@ use crate::scheme::{BlockScheme, Scheme};
 use crate::DeviceResult;
 
 pub struct VirtIoBlk<'a> {
+    /// What it has transferred, for `/proc/diskstats`.
+    io: crate::scheme::IoStats,
     inner: Mutex<InnerDriver<'a>>,
     capacity: usize,
 }
@@ -21,6 +23,7 @@ impl<'a> VirtIoBlk<'a> {
         let inner = InnerDriver::new(header)?;
         let capacity = inner.capacity();
         Ok(Self {
+            io: crate::scheme::IoStats::new(),
             inner: Mutex::new(inner),
             capacity,
         })
@@ -72,8 +75,9 @@ fn sectors_of(block_id: usize, len: usize, capacity: usize) -> DeviceResult<usiz
     Ok(sectors)
 }
 
-impl<'a> BlockScheme for VirtIoBlk<'a> {
-    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+impl<'a> VirtIoBlk<'a> {
+    // The transfers themselves; the trait's methods count them ([`crate::scheme::IoStats`]).
+    fn read_uncounted(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         sectors_of(block_id, buf.len(), self.capacity)?;
         let mut inner = self.inner.lock();
         for (i, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
@@ -82,13 +86,31 @@ impl<'a> BlockScheme for VirtIoBlk<'a> {
         Ok(())
     }
 
-    fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+    fn write_uncounted(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
         sectors_of(block_id, buf.len(), self.capacity)?;
         let mut inner = self.inner.lock();
         for (i, chunk) in buf.chunks(SECTOR_SIZE).enumerate() {
             inner.write_block(block_id + i, chunk)?;
         }
         Ok(())
+    }
+}
+
+impl<'a> BlockScheme for VirtIoBlk<'a> {
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let r = self.read_uncounted(block_id, buf);
+        self.io.note_read(&r, buf.len());
+        r
+    }
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        let r = self.write_uncounted(block_id, buf);
+        self.io.note_write(&r, buf.len());
+        r
+    }
+
+    fn io_stats(&self) -> Option<crate::scheme::IoSnapshot> {
+        Some(self.io.snapshot())
     }
 
     /// Nothing to do, and that is not the same as "the data is on the disk".

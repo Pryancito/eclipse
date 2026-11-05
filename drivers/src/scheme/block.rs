@@ -1,5 +1,69 @@
 use super::Scheme;
 use crate::DeviceResult;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// What a disk has transferred since boot, for `/proc/diskstats`: requests
+/// and 512-byte sectors, each way. Only the ones that succeeded count, as in
+/// Linux, where the counters are bumped on completion.
+///
+/// Kept by the driver itself and not by a wrapper around it: every consumer
+/// (the filesystems, `/dev`, the hot-plug path) holds the driver's own `Arc`
+/// and matches it by identity, so a wrapper would have to be the one thing
+/// everybody holds.
+#[derive(Debug, Default)]
+pub struct IoStats {
+    reads: AtomicU64,
+    read_sectors: AtomicU64,
+    writes: AtomicU64,
+    write_sectors: AtomicU64,
+}
+
+/// One reading of an [`IoStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoSnapshot {
+    pub reads: u64,
+    pub read_sectors: u64,
+    pub writes: u64,
+    pub write_sectors: u64,
+}
+
+impl IoStats {
+    pub const fn new() -> Self {
+        Self {
+            reads: AtomicU64::new(0),
+            read_sectors: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            write_sectors: AtomicU64::new(0),
+        }
+    }
+
+    /// Count a read of `bytes` that ended in `r`.
+    pub fn note_read(&self, r: &DeviceResult, bytes: usize) {
+        if r.is_ok() {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.read_sectors
+                .fetch_add((bytes / 512) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Count a write of `bytes` that ended in `r`.
+    pub fn note_write(&self, r: &DeviceResult, bytes: usize) {
+        if r.is_ok() {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.write_sectors
+                .fetch_add((bytes / 512) as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> IoSnapshot {
+        IoSnapshot {
+            reads: self.reads.load(Ordering::Relaxed),
+            read_sectors: self.read_sectors.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            write_sectors: self.write_sectors.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Block device interface.
 ///
@@ -39,6 +103,12 @@ pub trait BlockScheme: Scheme {
     /// best-effort and time-bounded — it runs on the reboot path.
     fn quiesce_for_reboot(&self) {
         let _ = self.flush();
+    }
+    /// What this disk has transferred, when its driver counts it ([`IoStats`]).
+    /// `None` for what is not a disk of its own: a partition is counted in its
+    /// disk.
+    fn io_stats(&self) -> Option<IoSnapshot> {
+        None
     }
 }
 
@@ -115,6 +185,29 @@ mod tests {
     /// about its logical block size: every implementation addresses `block_id`
     /// in 512-byte sectors, so a default of anything else would make the
     /// partition scanner read a 4Kn offset off a 512-byte disk.
+    #[test]
+    fn io_stats_count_what_succeeded_in_sectors() {
+        let st = IoStats::new();
+        st.note_read(&Ok(()), 4096);
+        st.note_read(&Err(DeviceError::IoError), 4096);
+        st.note_write(&Ok(()), 512);
+        st.note_write(&Ok(()), 1024);
+        assert_eq!(
+            st.snapshot(),
+            IoSnapshot {
+                reads: 1,
+                read_sectors: 8,
+                writes: 2,
+                write_sectors: 3
+            }
+        );
+        assert_eq!(
+            BareBlock::new().io_stats(),
+            None,
+            "a driver that does not count says so"
+        );
+    }
+
     #[test]
     fn the_default_logical_block_size_is_a_512_byte_sector() {
         assert_eq!(BareBlock::new().logical_block_size(), 512);
