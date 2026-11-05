@@ -7,6 +7,7 @@ mod hunterd;
 mod image;
 mod locales;
 mod logo;
+mod monitor;
 mod network;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
@@ -83,6 +84,8 @@ struct LunarTools {
     notes: PathBuf,
     /// The network settings ("Red"), and the boot network service.
     net: PathBuf,
+    /// The system monitor: processes, load and the init services.
+    mon: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -3516,6 +3519,7 @@ impl LinuxRootfs {
             desk: lunardesk,
             notes: lunarnotes,
             net: lunarnet,
+            mon: lunarmon,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3616,6 +3620,12 @@ impl LinuxRootfs {
             fs::copy(&lunarnet, bin.join("lunarnet")).unwrap();
         } else {
             eprintln!("warning: lunarnet not built; the network is DHCPv4 only");
+        }
+        if lunarmon.is_file() {
+            let _ = dir::rm(bin.join("lunarmon"));
+            fs::copy(&lunarmon, bin.join("lunarmon")).unwrap();
+        } else {
+            eprintln!("warning: lunarmon not built; the monitor opens a terminal on top");
         }
     }
 
@@ -3745,6 +3755,7 @@ impl LinuxRootfs {
         let desk = out.join("lunardesk");
         let notes = out.join("lunarnotes");
         let net = out.join("lunarnet");
+        let mon = out.join("lunarmon");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3775,6 +3786,7 @@ impl LinuxRootfs {
             &desk,
             &notes,
             &net,
+            &mon,
         ]
         .iter()
         .map(|p| fs::metadata(p).ok()?.modified().ok())
@@ -3792,6 +3804,7 @@ impl LinuxRootfs {
                     desk,
                     notes,
                     net,
+                    mon,
                 };
             }
         }
@@ -3830,6 +3843,7 @@ impl LinuxRootfs {
             desk,
             notes,
             net,
+            mon,
         }
     }
 

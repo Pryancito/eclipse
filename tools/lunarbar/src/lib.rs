@@ -47,6 +47,7 @@ pub mod list;
 pub mod look;
 pub mod meter;
 pub mod netconf;
+pub mod sysmon;
 pub mod notes;
 pub mod obmenu;
 pub mod open;
