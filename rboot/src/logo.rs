@@ -13,7 +13,8 @@ pub const LOGO_HEIGHT: usize = 250;
 // NOTE: absolute path per request. Consider vendoring into `rboot/src/` later.
 const LOGO_DATA: &[u8] = include_bytes!("logo.raw");
 
-const WHITE: u32 = 0x00FF_FFFF;
+/// The tecno ground the logo (light, drawn on this very colour) sits on.
+const GROUND: u32 = crate::progress::GROUND;
 
 pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     // One question, asked in one place (`fb::is_direct`, via `Screen`). This
@@ -28,7 +29,7 @@ pub fn draw_centered(mode: ModeInfo, fb_addr: u64) {
     }
 }
 
-/// Clear the screen to white and draw the logo centered on it.
+/// Clear the screen to the dark ground and draw the logo centered on it.
 pub fn draw_centered_raw(fb_addr: u64, stride: usize, sw: usize, sh: usize) {
     // SAFETY: as above.
     if let Some(s) = unsafe { Screen::new(fb_addr, stride, sw, sh) } {
@@ -41,10 +42,11 @@ fn draw(s: &Screen) {
     let start_x = sw.saturating_sub(LOGO_WIDTH) / 2;
     let start_y = sh.saturating_sub(LOGO_HEIGHT) / 2;
 
-    // Clear to white (match the asset background expectation).
+    // Clear to the ground the asset was composited on, so its edge is
+    // invisible.
     for y in 0..sh {
         for x in 0..sw {
-            s.put(x, y, WHITE);
+            s.put(x, y, GROUND);
         }
     }
 
@@ -107,13 +109,13 @@ mod tests {
         draw_centered_raw(addr, sw, sw, sh);
         let x0 = (sw - LOGO_WIDTH) / 2;
         let y0 = (sh - LOGO_HEIGHT) / 2;
-        // Outside the logo rect it is the white background.
-        assert_eq!(c.get(0, 0), WHITE);
-        assert_eq!(c.get(x0 - 1, y0), WHITE);
+        // Outside the logo rect it is the dark ground.
+        assert_eq!(c.get(0, 0), GROUND);
+        assert_eq!(c.get(x0 - 1, y0), GROUND);
         // Inside it, the asset really was copied.
         let drawn = (0..LOGO_HEIGHT)
             .flat_map(|y| (0..LOGO_WIDTH).map(move |x| (x, y)))
-            .filter(|&(x, y)| c.get(x0 + x, y0 + y) != WHITE)
+            .filter(|&(x, y)| c.get(x0 + x, y0 + y) != GROUND)
             .count();
         assert!(
             drawn > 1000,

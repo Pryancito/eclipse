@@ -166,30 +166,6 @@ fn fill_rect(x: u32, y: u32, w: u32, h: u32, argb: u32) {
     }
 }
 
-fn stroke_rect(x: u32, y: u32, w: u32, h: u32, thickness: u32, argb: u32) {
-    if w == 0 || h == 0 || thickness == 0 {
-        return;
-    }
-    // Top / bottom
-    fill_rect(x, y, w, thickness, argb);
-    if h > thickness {
-        fill_rect(x, y + h - thickness, w, thickness, argb);
-    }
-    // Left / right
-    if h > thickness * 2 {
-        fill_rect(x, y + thickness, thickness, h - thickness * 2, argb);
-        if w > thickness {
-            fill_rect(
-                x + w - thickness,
-                y + thickness,
-                thickness,
-                h - thickness * 2,
-                argb,
-            );
-        }
-    }
-}
-
 /// Clear one text row to black, so the line about to be written there does not
 /// show the tail of the line this console wrote a page ago.
 ///
@@ -401,7 +377,7 @@ pub fn panic_banner(text: &str) {
 
 /// Draw a centered boot progress bar (0..=100) on the early framebuffer.
 ///
-/// White border + white fill, black background inside bar area.
+/// Cyan segmented cells on the dark tecno ground, as rboot draws it.
 pub fn draw_progress_bar(progress: u32) {
     if !try_init() {
         return;
@@ -416,29 +392,28 @@ pub fn draw_progress_bar(progress: u32) {
     if progress >= 100 {
         CLEAR_ON_NEXT_TEXT_WRITE.store(true, Ordering::SeqCst);
     }
-    let bar_w: u32 = 400;
-    let bar_h: u32 = 20;
+    // The tecno boot bar, cell for cell the one rboot drew before the handoff
+    // (rboot/src/progress.rs): 40 cells of 8px + 2px of ground, lit cyan,
+    // unlit steel, the percentage in muted text on the ground.
+    const GROUND: u32 = 0xFF04_070D;
+    const LIT: u32 = 0xFF38_E1FF;
+    const UNLIT: u32 = 0xFF1D_3550;
+    const MUTED: u32 = 0xFF8A_A4C2;
+    const CELLS: u32 = 40;
+    const CELL_W: u32 = 8;
+    const CELL_GAP: u32 = 2;
+    let bar_w: u32 = CELLS * (CELL_W + CELL_GAP);
+    let bar_h: u32 = 12;
     let x = sw.saturating_sub(bar_w) / 2;
     // Position below the centered logo (LOGO_HEIGHT=250, so bottom is sh/2 + 125).
     // Offset sh/2 + 160 puts the bar 35px below the logo.
     let y = (sh / 2).saturating_add(160);
 
-    // Outer border (1px) with 2px margin like the reference.
-    stroke_rect(
-        x.saturating_sub(2),
-        y.saturating_sub(2),
-        bar_w + 4,
-        bar_h + 4,
-        1,
-        0xFF00_0000, // Black border
-    );
-    // Inner fill.
-    let fill_w = (bar_w * progress) / 100;
-    if fill_w > 0 {
-        fill_rect(x, y, fill_w, bar_h, 0xFF00_0000); // Black fill
-    }
-    if fill_w < bar_w {
-        fill_rect(x + fill_w, y, bar_w - fill_w, bar_h, 0xFFFF_FFFF); // White remainder
+    let lit = CELLS * progress / 100;
+    for i in 0..CELLS {
+        let cx = x + i * (CELL_W + CELL_GAP);
+        fill_rect(cx, y, CELL_W, bar_h, if i < lit { LIT } else { UNLIT });
+        fill_rect(cx + CELL_W, y, CELL_GAP, bar_h, GROUND);
     }
 
     // Fixed-width percentage text (4 chars).
@@ -459,6 +434,6 @@ pub fn draw_progress_bar(progress: u32) {
     let tx = x + (bar_w.saturating_sub(text_w)) / 2;
     let ty = y + bar_h + 15;
     for (i, ch) in buf.iter().copied().enumerate() {
-        draw_char_at(tx + (i as u32) * 8, ty, ch, 0xFF00_0000, 0xFFFF_FFFF); // Black text on white
+        draw_char_at(tx + (i as u32) * 8, ty, ch, MUTED, GROUND);
     }
 }
