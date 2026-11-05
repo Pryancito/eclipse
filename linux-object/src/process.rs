@@ -2866,6 +2866,28 @@ impl LinuxProcess {
         inner.files.get(&fd).cloned().ok_or(LxError::EBADF)
     }
 
+    /// Resolve several descriptors under ONE acquisition of the table lock.
+    ///
+    /// `poll(2)` and `select(2)` asked for every fd of the set one by one,
+    /// and more than once per pass (is it a socket? a terminal? an input
+    /// device? then the readiness scan, then the subscriptions): four or
+    /// five lock round-trips per descriptor, and `select` cloned the whole
+    /// table five times per call. With 64 pipes in the set that was the
+    /// whole cost of the call. The answer is positional: entry `i` is the
+    /// file `fds[i]` names, or `None` for a closed (or negative) one.
+    pub fn get_file_likes<I>(&self, fds: I) -> Vec<Option<Arc<dyn FileLike>>>
+    where
+        I: IntoIterator<Item = FileDesc>,
+    {
+        let fds = fds.into_iter();
+        let mut out = Vec::with_capacity(fds.size_hint().0);
+        let inner = self.inner.lock();
+        for fd in fds {
+            out.push(inner.files.get(&fd).cloned());
+        }
+        out
+    }
+
     /// get all files
     pub fn get_files(&self) -> LxResult<HashMap<FileDesc, Arc<dyn FileLike>>> {
         let inner = self.inner.lock();
