@@ -6,6 +6,7 @@ use numeric_enum_macro::numeric_enum;
 mod action;
 pub mod queue;
 pub mod siginfo32;
+pub mod sigpage;
 pub mod ucontext;
 
 pub use action::*;

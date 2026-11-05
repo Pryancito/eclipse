@@ -358,6 +358,9 @@ pub type Loaded = (
     Option<ArgArea>,
     ImageLayout,
     Arc<[usize]>,
+    // Where this image's `rt_sigreturn` trampoline was mapped, 0 when it has
+    // none. See `crate::signal::sigpage`.
+    VirtAddr,
 );
 
 /// How many symbolic links an interpreter's path may go through, a `#!`
@@ -826,6 +829,13 @@ impl LinuxElfLoader {
             let vdso_base = (abi == Abi::Linux)
                 .then(|| crate::vdso::map_into(vmar, stack_bottom))
                 .flatten();
+            // Under the vDSO when there is one, under the stack when there is
+            // not: both leave the sigpage out of the way of `brk` and of a
+            // kernel-chosen `mmap`.
+            let sigreturn = (abi == Abi::Linux)
+                .then(|| crate::signal::sigpage::map_into(vmar, vdso_base.unwrap_or(stack_bottom)))
+                .flatten()
+                .unwrap_or(0);
 
             let info = abi::ProcInitInfo {
                 args,
@@ -919,6 +929,7 @@ impl LinuxElfLoader {
                 init_stack.arg_area(),
                 layout,
                 init_stack.auxv().into(),
+                sigreturn,
             ));
         }
 
@@ -990,6 +1001,11 @@ impl LinuxElfLoader {
         let vdso_base = (abi == Abi::Linux)
             .then(|| crate::vdso::map_into(vmar, stack_bottom))
             .flatten();
+        // See the interpreter path above.
+        let sigreturn = (abi == Abi::Linux)
+            .then(|| crate::signal::sigpage::map_into(vmar, vdso_base.unwrap_or(stack_bottom)))
+            .flatten()
+            .unwrap_or(0);
 
         let info = abi::ProcInitInfo {
             args,
@@ -1094,6 +1110,7 @@ impl LinuxElfLoader {
             init_stack.arg_area(),
             layout,
             init_stack.auxv().into(),
+            sigreturn,
         ))
     }
 }
