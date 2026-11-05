@@ -2367,3 +2367,47 @@ fn both_make_paths_install_silversurfer_with_the_desktop_binaries() {
         "installing into /bin is what the 16 MiB cap drops"
     );
 }
+
+/// The loader's name is not a convention we are free to pick: it is the exact
+/// string in the `PT_INTERP` of every dynamically linked binary the musl
+/// toolchain produces, so the file in `/lib` has to be named this and nothing
+/// else. Checked here because `install_musl_loader` and the Alpine install in
+/// `xorg` have to agree on it -- two names means one of them installs a file
+/// nothing looks for.
+#[test]
+fn the_loader_is_named_what_pt_interp_names() {
+    for (arch, pt_interp) in [
+        (Arch::Riscv64, "/lib/ld-musl-riscv64.so.1"),
+        (Arch::X86_64, "/lib/ld-musl-x86_64.so.1"),
+        (Arch::Aarch64, "/lib/ld-musl-aarch64.so.1"),
+    ] {
+        assert_eq!(
+            format!("/lib/{}", xorg::musl_loader_name(arch.name())),
+            pt_interp,
+            "the loader installed for {} is not the one its binaries ask for",
+            arch.name()
+        );
+    }
+}
+
+/// The incremental path calls `install_musl_loader` on every build, including
+/// builds where the toolchain was never downloaded. It must say no and leave
+/// the tree alone rather than panic: a rootfs that already has its loader
+/// still builds, and that is the case this call exists not to break.
+#[test]
+fn a_toolchain_without_a_libc_so_installs_nothing() {
+    let dir = scratch("musl-loader");
+    let musl = dir.join("toolchain");
+    let lib = dir.join("lib");
+    fs::create_dir_all(&musl).unwrap();
+
+    let rootfs = LinuxRootfs(Arch::Riscv64, Variant::Minimal);
+    assert!(
+        !rootfs.install_musl_loader(&musl, &lib),
+        "a toolchain with no libc.so reported a loader installed"
+    );
+    assert!(
+        !lib.join(xorg::musl_loader_name("riscv64")).exists(),
+        "no loader was copied, yet the file is there"
+    );
+}
