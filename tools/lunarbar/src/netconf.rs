@@ -23,6 +23,8 @@
 //! is what the image did before this file existed.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use crate::i18n::Key;
 use std::path::Path;
 
 pub const CONF: &str = "/etc/eclipse/network";
@@ -105,11 +107,16 @@ impl Iface {
     }
 }
 
-/// A field that does not make sense, and why, in the user's language.
+/// A field that does not make sense, and why.
+///
+/// `why` is a KEY, not a string: the check runs the same whatever language the
+/// session is in, and the window renders the reason with `lang.s(p.why)`. When
+/// this held a `&'static str` the validation carried Spanish, which is how the
+/// English session ended up with Spanish error text under English labels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {
     pub field: Field,
-    pub why: &'static str,
+    pub why: Key,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -166,19 +173,19 @@ pub fn check(i: &Iface) -> Vec<Problem> {
     let mut bad = |field, why| out.push(Problem { field, why });
     if i.v4 == V4::Static {
         match cidr4(&i.address4) {
-            None => bad(Field::Address4, "no es una dirección IPv4 con prefijo (192.168.1.20/24)"),
+            None => bad(Field::Address4, Key::net_bad_v4_cidr),
             Some((a, p)) => {
                 if a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_loopback() {
-                    bad(Field::Address4, "esa dirección no se puede dar a una interfaz");
+                    bad(Field::Address4, Key::net_bad_addr_reserved);
                 } else if p == 0 || p > 31 && p != 32 {
-                    bad(Field::Address4, "el prefijo tiene que estar entre 1 y 32");
+                    bad(Field::Address4, Key::net_bad_prefix4);
                 }
                 if !i.gateway4.trim().is_empty() {
                     match i.gateway4.trim().parse::<Ipv4Addr>() {
-                        Err(_) => bad(Field::Gateway4, "no es una dirección IPv4"),
-                        Ok(g) if g == a => bad(Field::Gateway4, "la puerta de enlace no puede ser la propia dirección"),
+                        Err(_) => bad(Field::Gateway4, Key::net_bad_gw4),
+                        Ok(g) if g == a => bad(Field::Gateway4, Key::net_bad_gw_is_self),
                         Ok(g) if p < 32 && !same_net4(a, g, p) => {
-                            bad(Field::Gateway4, "la puerta de enlace no está en la red de la dirección")
+                            bad(Field::Gateway4, Key::net_bad_gw_offnet)
                         }
                         Ok(_) => {}
                     }
@@ -188,24 +195,24 @@ pub fn check(i: &Iface) -> Vec<Problem> {
     }
     if i.v6 == V6::Static {
         match cidr6(&i.address6) {
-            None => bad(Field::Address6, "no es una dirección IPv6 con prefijo (2001:db8::20/64)"),
+            None => bad(Field::Address6, Key::net_bad_v6_cidr),
             Some((a, p)) => {
                 if a.is_unspecified() || a.is_loopback() || a.is_multicast() {
-                    bad(Field::Address6, "esa dirección no se puede dar a una interfaz");
+                    bad(Field::Address6, Key::net_bad_addr_reserved);
                 } else if p == 0 {
-                    bad(Field::Address6, "el prefijo tiene que estar entre 1 y 128");
+                    bad(Field::Address6, Key::net_bad_prefix6);
                 }
             }
         }
         if !i.gateway6.trim().is_empty() && i.gateway6.trim().parse::<Ipv6Addr>().is_err() {
-            bad(Field::Gateway6, "no es una dirección IPv6");
+            bad(Field::Gateway6, Key::net_bad_gw6);
         }
     }
     if let Err(w) = dns_list(&i.dns) {
         // `bad` borrows `out` mutably; the message carries no copy of `w`
         // because a Problem's text is fixed, and the field says where.
         let _ = w;
-        bad(Field::Dns, "hay un servidor DNS que no es una dirección");
+        bad(Field::Dns, Key::net_bad_dns);
     }
     out
 }

@@ -3753,6 +3753,11 @@ impl LinuxRootfs {
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
             lunartext_mtime(),
+            // The UI strings live in another crate, so a translation changed
+            // there is a source change HERE: without this line the binaries
+            // are up to date against their own `src/` and the image ships the
+            // old wording, which looks like the change never happened.
+            eclipse_i18n_mtime(),
             fs::metadata(dir.join("Cargo.toml"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
@@ -5690,26 +5695,5 @@ mod hunter_schedule_tests;
 #[cfg(test)]
 mod apk_closure_tests;
 
-/// The newest modification time of any file under `dir`, recursively.
-/// `tools/lunartext`, the vector text every Lunar client links by path.
-fn lunartext_mtime() -> Option<std::time::SystemTime> {
-    newest_mtime_under(&PROJECT_DIR.join("tools/lunartext/src"))
-}
-
-fn newest_mtime_under(dir: &Path) -> Option<std::time::SystemTime> {
-    fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let ty = e.file_type().ok()?;
-            if ty.is_dir() {
-                newest_mtime_under(&e.path())
-            } else {
-                e.metadata().ok()?.modified().ok()
-            }
-        })
-        .max()
-}
-
-#[cfg(test)]
-mod newest_mtime_tests;
+mod mtime;
+use mtime::{eclipse_i18n_mtime, lunartext_mtime, newest_mtime_under};

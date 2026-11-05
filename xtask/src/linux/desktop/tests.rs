@@ -2705,3 +2705,43 @@ fn the_desktop_keyboard_toggle_switches_the_language_too() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Every client that links the shared string table has that table's mtime in
+/// its staleness check.
+///
+/// A client's rebuild check walks its own `src/`. The strings are in another
+/// crate, so a translation changed there leaves every binary "up to date"
+/// against a tree that no longer says what it says, and the image ships the
+/// old wording -- which reads as the change never having happened, with
+/// nothing in any log. `lunartext_mtime` exists for exactly this reason and
+/// this is the second crate to need it.
+#[test]
+fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
+    let mod_rs = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/linux/mod.rs"),
+    )
+    .expect("xtask/src/linux/mod.rs");
+    let lunarbar_toml = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/lunarbar/Cargo.toml"),
+    )
+    .expect("tools/lunarbar/Cargo.toml");
+    assert!(
+        lunarbar_toml.contains("eclipse-i18n"),
+        "lunarbar no longer links eclipse-i18n: drop this test with the dep"
+    );
+    let mtime_rs = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/linux/mtime.rs"),
+    )
+    .expect("xtask/src/linux/mtime.rs");
+    assert!(
+        mtime_rs.contains("fn eclipse_i18n_mtime()"),
+        "there is no eclipse_i18n_mtime to fold into a staleness check"
+    );
+    // Defined in one file and CALLED in the other: a helper that exists and
+    // nothing calls is exactly the bug this test is about, and it would read
+    // as wired up to anyone grepping for the name.
+    assert!(
+        mod_rs.contains("eclipse_i18n_mtime()"),
+        "eclipse_i18n_mtime is defined but folded into no staleness check"
+    );
+}
