@@ -2656,8 +2656,20 @@ impl LinuxRootfs {
     /// whole reason this is not the ordinary freshness check: what these
     /// caches build is a 32-bit x86 binary whatever architecture the image is
     /// for, and the ordinary check would reject it outright.
+    ///
+    /// And `verify::es_un_elf_de_i386` as well as it, because the two answer
+    /// different questions and only the second one is the claim this doc makes.
+    /// `cached_for_i386` says "not from another arch" and so lets through
+    /// everything it cannot read -- a file that does not open, one shorter
+    /// than a header, one that is not an ELF at all. Asking only that, a
+    /// half-written artifact with a good mtime counted as fresh, nothing was
+    /// rebuilt, and the probe measured in QEMU was the stale or broken one.
+    /// Pointed out by Copilot.
     fn fresh_i386(artifact: &Path, sources: &[&Path]) -> bool {
-        if !artifact.is_file() || !verify::cached_for_i386(artifact) {
+        if !artifact.is_file()
+            || !verify::cached_for_i386(artifact)
+            || !verify::es_un_elf_de_i386(artifact)
+        {
             return false;
         }
         let Ok(artifact_mtime) = fs::metadata(artifact).and_then(|m| m.modified()) else {

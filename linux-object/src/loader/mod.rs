@@ -2,7 +2,7 @@
 #![deny(missing_docs)]
 
 use {
-    crate::error::LxResult,
+    crate::error::{LxError, LxResult},
     crate::fs::INodeExt,
     crate::process::Abi,
     alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec},
@@ -711,10 +711,20 @@ impl LinuxElfLoader {
             // which is what makes an absolute vaddr land where it says. Only an
             // `ET_DYN` one -- every real `ld.so` -- gets a sub-VMAR of its own
             // and the non-zero `AT_BASE` that tells it so.
-            let (interp_vmar, interp_base) =
-                if interp_elf.header.pt2.type_().as_type() == xmas_elf::header::Type::Executable {
-                    (vmar.clone(), 0)
-                } else {
+            //
+            // Those two are the whole list, so the match is exhaustive on
+            // purpose rather than an `if` with an `else`. `load_elf_binary`
+            // asks `elf_ex->e_type != ET_EXEC && != ET_DYN` of an interpreter
+            // and gives ELIBBAD, and here the `else` of an `if` would hand a
+            // `ET_REL` or a `ET_CORE` to the `ET_DYN` path and let it fail
+            // further down, saying something else. The preflight already
+            // refuses one on `execve` -- `image_phdrs` bounds `e_type` to the
+            // two -- but the process this kernel starts itself
+            // (`loader/src/linux.rs`) loads with no preflight at all, so this
+            // path is reachable with any `e_type` on disk.
+            let (interp_vmar, interp_base) = match interp_elf.header.pt2.type_().as_type() {
+                xmas_elf::header::Type::Executable => (vmar.clone(), 0),
+                xmas_elf::header::Type::SharedObject => {
                     let interp_vmar = vmar
                         .allocate(None, interp_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
                         .inspect_err(|&e| {
@@ -725,7 +735,19 @@ impl LinuxElfLoader {
                         })?;
                     let interp_base = interp_vmar.addr();
                     (interp_vmar, interp_base)
-                };
+                }
+                other => {
+                    error!(
+                        "elf: PT_INTERP {:?} is e_type {:?}, neither ET_EXEC nor ET_DYN",
+                        interp, other
+                    );
+                    // The interpreter's image is mapped into the kernel's own
+                    // address space a few lines above, to be read; give it back
+                    // before leaving by this door.
+                    zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size_aligned)?;
+                    return Err(LxError::ELIBBAD);
+                }
+            };
             let _interp_vmo = interp_vmar
                 .load_from_elf_image(&interp_elf, &interp_vmo)
                 .inspect_err(|&e| {

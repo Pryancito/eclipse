@@ -527,6 +527,18 @@ mod tests {
         let len = v.len() as u32;
         put32(&mut v, phdr32(0), PT_LOAD);
         put32(&mut v, phdr32(0) + 16, len);
+        // `p_vaddr`, `p_memsz` and `p_align` as a 32-bit image really carries
+        // them, although nothing in the preflight reads any of the three: it
+        // measures a segment by `p_offset` and `p_filesz` alone. A zero vaddr
+        // with a non-zero `p_filesz` is not a thing a linker emits, and a test
+        // image that is only as well-formed as today's reader demands is one
+        // that starts failing for the wrong reason the day the reader asks for
+        // more (`p_memsz >= p_filesz`, a load not at page zero). 0x08048000 is
+        // the base the real probe in `tools/i386-dyn` is linked at.
+        put32(&mut v, phdr32(0) + 8, 0x0804_8000);
+        put32(&mut v, phdr32(0) + 12, 0x0804_8000);
+        put32(&mut v, phdr32(0) + 20, len);
+        put32(&mut v, phdr32(0) + 28, 0x1000);
         v
     }
 
