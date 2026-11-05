@@ -3,6 +3,15 @@ use riscv::register::scause;
 use trapframe::TrapFrame;
 pub(super) const SUPERVISOR_TIMER_INT_VEC: usize = 5; // scause::Interrupt::SupervisorTimer
 
+/// `sstatus.SPP`: the privilege level the trap was taken from. Set means
+/// supervisor (the kernel faulted on itself), clear means user.
+const SSTATUS_SPP: usize = 1 << 8;
+
+/// The x86 ring-0 and ring-3 code selectors, which is the vocabulary
+/// `kstats::last_fault_from_kernel` speaks. See the call in `trap_handler`.
+const KERNEL_CS_EQUIVALENT: u64 = 0x08;
+const USER_CS_EQUIVALENT: u64 = 0x23;
+
 fn breakpoint(sepc: &mut usize) {
     info!("Exception::Breakpoint: A breakpoint set @0x{:x} ", sepc);
 
@@ -47,7 +56,65 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
     );
     match TrapReason::from(scause) {
         TrapReason::SoftwareBreakpoint => breakpoint(&mut tf.sepc),
-        TrapReason::PageFault(vaddr, flags) => crate::KHANDLER.handle_page_fault(vaddr, flags),
+        TrapReason::PageFault(vaddr, flags) => {
+            // [diag] Stash the faulting register file, exactly as the x86_64
+            // entry does. `handle_page_fault` receives only vaddr+flags, and
+            // every diagnostic the kernel #PF reporter prints -- the faulting
+            // pc, the call chain, "which register held the bad address", even
+            // "was this fault taken in the kernel" -- reads back from here.
+            //
+            // Nothing recorded it on this architecture. `note_fault_regs` had
+            // no caller outside x86_64, so a riscv64 kernel fault reported
+            // `rip=0x0` and `no register file was recorded for this fault`,
+            // and that is the whole reason the `null-range #PF` this job takes
+            // inside the heap allocator has never been readable: the report
+            // names the victim address and nothing that could name the
+            // culprit.
+            let _fault_scope = crate::kstats::note_fault_regs(
+                tf.sepc as u64,
+                tf.general.s0 as u64,
+                tf.general.sp as u64,
+                // `FAULT_CS` is read only through `last_fault_from_kernel`,
+                // which asks "nonzero, and low two bits clear". riscv has no
+                // CS; the equivalent fact is `sstatus.SPP`, the privilege the
+                // trap came *from*. Encode it in the values that predicate was
+                // written for, so one reader keeps working on both: x86's
+                // ring-0 selector when SPP says supervisor, its ring-3 one
+                // when SPP says user. A plain `sstatus` would have answered
+                // "kernel" for a user fault, because its low bits are clear.
+                if tf.sstatus & SSTATUS_SPP != 0 {
+                    KERNEL_CS_EQUIVALENT
+                } else {
+                    USER_CS_EQUIVALENT
+                },
+            );
+            // The rest of the register file, in `kstats::GPR_NAMES` order for
+            // this architecture: the argument registers carry the pointers the
+            // faulting call had in hand, which is what turns "a read of 0x1"
+            // into "this object's field was null".
+            crate::kstats::note_fault_gprs(&[
+                tf.general.ra as u64,
+                tf.general.sp as u64,
+                tf.general.gp as u64,
+                tf.general.s0 as u64,
+                tf.general.s1 as u64,
+                tf.general.a0 as u64,
+                tf.general.a1 as u64,
+                tf.general.a2 as u64,
+                tf.general.a3 as u64,
+                tf.general.a4 as u64,
+                tf.general.a5 as u64,
+                tf.general.a6 as u64,
+                tf.general.a7 as u64,
+                tf.general.t0 as u64,
+                tf.general.t1 as u64,
+                tf.general.t2 as u64,
+            ]);
+            // No `note_fault_rflags`: riscv has no flags register, and
+            // `last_fault_rflags` reads zero, which the reporter already
+            // treats as "nothing recorded" rather than printing a bogus line.
+            crate::KHANDLER.handle_page_fault(vaddr, flags)
+        }
         TrapReason::Interrupt(vector) => {
             crate::interrupt::handle_irq(vector);
             // Timer preemption: see thread trap path — do not context-switch here.
