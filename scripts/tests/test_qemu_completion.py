@@ -291,6 +291,42 @@ class PromptSynchronisation(unittest.TestCase):
         self.assertFalse(instance.prompt_sync)
         self.assertEqual(instance.run_one("/case.exe", timeout=5), status.OK)
         self.assertIn(b"/case.exe", instance.zcore_proc.writes[0])
+    def test_a_dead_guest_is_a_failed_case_and_not_a_traceback(self):
+        """A `BrokenPipeError` out of `run_one` takes down the whole run and
+        prints no console output at all, so the panic that killed the guest is
+        nowhere to be found. Report the case and carry on to the summary."""
+
+        class Dead:
+            def __init__(self):
+                self.stdin = self
+
+            def write(self, data):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                pass
+
+            def poll(self):
+                return 1
+
+        printed = []
+        status = self.status_enum()
+
+        class Base:
+            def check_output(self, output):
+                return status.OK
+
+        instance = runner.completion_runner(Base, status)()
+        instance.lk = threading.Lock()
+        instance.output = "[KERNEL PANIC] the last words\n"
+        instance.logger = SimpleNamespace(
+            println=printed.append, println_file_only=printed.append
+        )
+        instance.zcore_proc = Dead()
+
+        self.assertEqual(instance.run_one("/case.exe", timeout=5), status.FAILED)
+        self.assertIn("[KERNEL PANIC] the last words\n", printed)
+        self.assertTrue(any("no longer running" in line for line in printed))
 
 
 if __name__ == "__main__":

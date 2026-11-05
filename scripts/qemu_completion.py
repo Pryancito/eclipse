@@ -71,7 +71,13 @@ def completion_runner(base, statuses):
                 time.sleep(0.005)
             with self.lk:
                 seen = self.prompt_pattern.search(self.output) is not None
-                self.output = ""
+                if seen:
+                    self.output = ""
+            # Not seen means something went wrong -- a guest that died owes us
+            # its last words, and clearing the buffer here would throw away
+            # the panic that explains the case about to be reported. Measured:
+            # a kernel that died between two cases reported the next one as a
+            # bare BrokenPipeError with no console output at all.
             return seen
 
         def guest_command(self, name):
@@ -88,19 +94,38 @@ def completion_runner(base, statuses):
             `check_output` here is never called."""
             return output
 
+        def report_dead_guest(self):
+            """The guest is gone -- it died on, or between, earlier cases.
+            Report this one as failed WITH whatever it left on the console and
+            let the run carry on to its summary: a `BrokenPipeError` out of
+            `run_one` takes down the whole run and prints no console output at
+            all, so the panic that caused it is nowhere to be found (measured
+            on riscv64, a kernel that died between cases 11 and 12)."""
+            with self.lk:
+                output = self.output
+                self.output = ""
+            self.logger.println(output)
+            self.logger.println(f"  {statuses.FAILED.name} (the guest is no longer running)\n")
+            return statuses.FAILED
+
         def run_one(self, name, fast=False, timeout=10):
             marker = "__ZCORE_DONE_" + uuid.uuid4().hex
             # The echoed command contains the marker, but only printf produces
             # a complete marker line with the actual command's exit status.
             command = self.guest_command(name) + "; printf '\\n" + marker + ":%s\\n' \"$?\"\n"
+            if self.zcore_proc.poll() is not None:
+                return self.report_dead_guest()
             if self.prompt_sync:
                 self.await_prompt()
             else:
                 with self.lk:
                     self.output = ""
             start = time.monotonic()
-            self.zcore_proc.stdin.write(command.encode())
-            self.zcore_proc.stdin.flush()
+            try:
+                self.zcore_proc.stdin.write(command.encode())
+                self.zcore_proc.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                return self.report_dead_guest()
             code = None
             while time.monotonic() - start < timeout:
                 with self.lk:
