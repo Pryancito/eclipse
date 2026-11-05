@@ -365,6 +365,8 @@ impl LinuxRootfs {
             root.join("bin").join("i386-hello"),
             root.join("bin").join("i386-dyn"),
             root.join("bin").join("i386-interp"),
+            root.join("bin").join("i386-pie"),
+            root.join("bin").join("i386-interp-pie"),
         ];
         let mut out = Vec::new();
         let mut checked = 0usize;

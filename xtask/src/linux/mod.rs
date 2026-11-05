@@ -172,13 +172,14 @@ impl LinuxRootfs {
                 if i386_hello.is_file() {
                     let _ = fs::copy(&i386_hello, bin.join("i386-hello"));
                 }
-                // The pair goes in together or not at all: the program names
+                // Each pair goes in together or not at all: the program names
                 // the interpreter by an absolute path, so one without the
-                // other is a probe that can only fail.
-                let (i386_dyn, i386_interp) = self.i386_dyn();
-                if i386_dyn.is_file() && i386_interp.is_file() {
-                    let _ = fs::copy(&i386_dyn, bin.join("i386-dyn"));
-                    let _ = fs::copy(&i386_interp, bin.join("i386-interp"));
+                // other is a probe that can only fail. `i386_dyn_pairs`
+                // returns only the pairs that are whole.
+                for pair in self.i386_dyn_pairs() {
+                    for (built, name) in pair {
+                        let _ = fs::copy(&built, bin.join(name));
+                    }
                 }
             }
             self.install_signal_probe(&musl, &bin);
@@ -2686,87 +2687,114 @@ impl LinuxRootfs {
         })
     }
 
-    /// Assemble `tools/i386-dyn`: a 32-bit program with a `PT_INTERP` and the
-    /// interpreter it names, which together are the kernel's half of stage 4
-    /// of the 32-bit compatibility work.
+    /// Assemble the `PT_INTERP` pairs of `tools/i386-dyn`, which together are
+    /// the kernel's half of stage 4 of the 32-bit compatibility work.
     ///
-    /// Two artifacts, built the same way `i386_hello` is --- host binutils,
-    /// no cross toolchain, no libc --- and returned as a pair because the
-    /// program names the interpreter by an absolute path and neither half
-    /// tests anything on its own.
+    /// Each pair is a 32-bit program and the interpreter its `PT_INTERP`
+    /// names, and the two halves go in together or not at all: the program
+    /// names the interpreter by an absolute path, so one without the other is
+    /// a probe that can only fail. Returns the pairs that are there, as
+    /// `(what was built, the name it takes in the rootfs)`.
     ///
-    /// The program is linked with `--oformat binary` against
-    /// `i386-dyn.ld`: its ELF header and program headers are assembled by
-    /// hand, because `ld` drops `--dynamic-linker` when the output needs no
-    /// dynamic linking and there is no 32-bit libc in this image to need one.
-    /// The interpreter is `ET_EXEC` at `0x0a00_0000`, clear of the program's
-    /// own fixed address.
-    fn i386_dyn(&self) -> (PathBuf, PathBuf) {
+    /// There are two pairs because the kernel has two paths, and a boot that
+    /// runs one of them says nothing about the other:
+    ///
+    /// - `i386-dyn` with `i386-interp`, an **`ET_EXEC`** interpreter at
+    ///   `0x0a00_0000`, clear of the program's own fixed address. Loaded at
+    ///   the absolute vaddrs it asks for, with `AT_BASE` zero.
+    /// - `i386-pie` with `i386-interp-pie`, an **`ET_DYN`** one, which is what
+    ///   every real `ld.so` is. Relocated wherever the loader puts it, with
+    ///   `AT_BASE` the bias it was given.
+    ///
+    /// Built the way `i386_hello` is --- host binutils, no cross toolchain, no
+    /// libc --- and every program header written out by hand against a linker
+    /// script with `--oformat binary`, because `ld` drops `--dynamic-linker`
+    /// when the output needs no dynamic linking and there is no 32-bit libc in
+    /// this image to need one, so there is no way to ask it for a bare
+    /// `PT_INTERP`.
+    fn i386_dyn_pairs(&self) -> Vec<[(PathBuf, &'static str); 2]> {
+        /// Each half as `(name, the `ld` arguments after `-m elf_i386`)`. The
+        /// name is the source (`<name>.s`), the output, and the name in the
+        /// rootfs, all three, which is what keeps this table readable.
+        const PAIRS: [[(&str, &[&str]); 2]; 2] = [
+            [
+                ("i386-dyn", &["-T", "i386-dyn.ld", "--oformat", "binary"]),
+                ("i386-interp", &["-static", "-Ttext", "0x0a000000"]),
+            ],
+            [
+                ("i386-pie", &["-T", "i386-dyn.ld", "--oformat", "binary"]),
+                (
+                    "i386-interp-pie",
+                    &["-T", "i386-pie.ld", "--oformat", "binary"],
+                ),
+            ],
+        ];
+
         let dir = PROJECT_DIR.join("tools").join("i386-dyn");
-        let program = dir.join("i386-dyn");
-        let interp = dir.join("i386-interp");
-        let program_src = dir.join("i386-dyn.s");
-        let interp_src = dir.join("i386-interp.s");
-        let script = dir.join("i386-dyn.ld");
-        // `verify::cached_for_i386` for the same reason as in `i386_hello`:
-        // what this cache builds is an ELF32 whatever the image's
-        // architecture. The linker script counts as a source: a change to it
-        // moves every address in the program.
-        if Self::fresh_i386(&program, &[&program_src, &script])
-            && Self::fresh_i386(&interp, &[&interp_src])
-        {
-            return (program, interp);
+        PAIRS
+            .iter()
+            .filter_map(|[(program, program_link), (interp, interp_link)]| {
+                // Both are attempted before either answer is read, and not
+                // short-circuited: a host that cannot build one of them
+                // cannot build the other either, and the point of the attempt
+                // is the line it prints saying which tool is missing.
+                let has_program = Self::assemble_i386(&dir, program, program_link);
+                let has_interp = Self::assemble_i386(&dir, interp, interp_link);
+                (has_program && has_interp)
+                    .then(|| [(dir.join(program), *program), (dir.join(interp), *interp)])
+            })
+            .collect()
+    }
+
+    /// One hand-written i386 artifact of `tools/i386-dyn`: assembled with
+    /// `as --32` and linked with `ld -m elf_i386` plus `link`, unless what is
+    /// on disk is already current. `false` if it could not be built, which a
+    /// host without 32-bit binutils is entitled to be --- `make image` is not
+    /// failed over a probe, the probe is simply not installed.
+    ///
+    /// Every `.ld` among the link arguments counts as a source alongside
+    /// `<name>.s`: a change to a linker script moves every address in what it
+    /// links, and the whole point of these two is the addresses.
+    fn assemble_i386(dir: &Path, name: &str, link: &[&str]) -> bool {
+        let out = dir.join(name);
+        let src = dir.join(format!("{name}.s"));
+        let scripts: Vec<PathBuf> = link
+            .iter()
+            .filter(|a| a.ends_with(".ld"))
+            .map(|a| dir.join(a))
+            .collect();
+        let mut sources: Vec<&Path> = vec![src.as_path()];
+        sources.extend(scripts.iter().map(PathBuf::as_path));
+        if Self::fresh_i386(&out, &sources) {
+            return true;
         }
 
-        println!("Assembling i386-dyn and i386-interp...");
-        let program_obj = dir.join("i386-dyn.o");
-        let interp_obj = dir.join("i386-interp.o");
-        for (src, obj) in [(&program_src, &program_obj), (&interp_src, &interp_obj)] {
-            if !Ext::new("as")
-                .current_dir(&dir)
-                .arg("--32")
-                .arg(src)
-                .arg("-o")
-                .arg(obj)
-                .status()
-                .success()
-            {
-                println!(
-                    "Failed to assemble {} (does `as` support --32?)",
-                    src.display()
-                );
-                return (program, interp);
-            }
-        }
-        let linked_program = Ext::new("ld")
-            .current_dir(&dir)
-            .arg("-m")
-            .arg("elf_i386")
-            .arg("-T")
-            .arg(&script)
-            .arg("--oformat")
-            .arg("binary")
+        println!("Assembling {name}...");
+        let obj = dir.join(format!("{name}.o"));
+        if !Ext::new("as")
+            .current_dir(dir)
+            .arg("--32")
+            .arg(&src)
             .arg("-o")
-            .arg(&program)
-            .arg(&program_obj)
-            .status();
-        let linked_interp = Ext::new("ld")
-            .current_dir(&dir)
-            .arg("-m")
-            .arg("elf_i386")
-            .arg("-static")
-            .arg("-Ttext")
-            .arg("0x0a000000")
-            .arg("-o")
-            .arg(&interp)
-            .arg(&interp_obj)
-            .status();
-        let _ = fs::remove_file(&program_obj);
-        let _ = fs::remove_file(&interp_obj);
-        if !linked_program.success() || !linked_interp.success() {
-            println!("Failed to link i386-dyn (does `ld` support -m elf_i386?)");
+            .arg(&obj)
+            .status()
+            .success()
+        {
+            println!("Failed to assemble {name} (does `as` support --32?)");
+            return false;
         }
-        (program, interp)
+        let mut cmd = Ext::new("ld");
+        cmd.current_dir(dir).arg("-m").arg("elf_i386");
+        for a in link {
+            cmd.arg(a);
+        }
+        let linked = cmd.arg("-o").arg(&out).arg(&obj).status();
+        let _ = fs::remove_file(&obj);
+        if !linked.success() {
+            println!("Failed to link {name} (does `ld` support -m elf_i386?)");
+            return false;
+        }
+        out.is_file()
     }
 
     /// Cross-compile `clock-probe` (tools/clock-probe): the integrity probe for
@@ -5628,83 +5656,7 @@ mod apk_keys_tests {
 }
 
 #[cfg(test)]
-mod apk_arch_tests {
-    use super::*;
-
-    /// Misma convencion que `xorg::scratch`: el arbol en /tmp va etiquetado
-    /// por proceso e hilo para que dos tests en paralelo no se pisen.
-    fn scratch(que: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "eclipse-apk-arch-{que}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    /// Lo que se escribe es el arco objetivo, tal cual y con salto de linea,
-    /// que es como lo lee apk.
-    #[test]
-    fn el_arco_escrito_es_el_del_objetivo() {
-        for arch in ["x86_64", "aarch64", "riscv64"] {
-            let etc = scratch(arch).join("etc");
-            LinuxRootfs::write_apk_arch(&etc, arch);
-            let leido = fs::read_to_string(etc.join("apk").join("arch")).unwrap();
-            assert_eq!(leido, format!("{arch}\n"), "arco de {arch}");
-        }
-    }
-
-    /// Se escribe aunque `etc/apk` no exista todavia: en la ruta desde cero el
-    /// directorio lo crea el bloque de apk, pero en la incremental no hay quien
-    /// lo cree, y un `return` silencioso ahi dejaba el rootfs sin arco.
-    #[test]
-    fn crea_el_directorio_si_hace_falta() {
-        let etc = scratch("crea").join("etc");
-        assert!(!etc.exists());
-        LinuxRootfs::write_apk_arch(&etc, "aarch64");
-        assert!(etc.join("apk").join("arch").is_file());
-    }
-
-    /// Un segundo `cargo rootfs` para otro arco tiene que PISAR el valor, no
-    /// dejar el de la tirada anterior de `make release`.
-    #[test]
-    fn una_segunda_tirada_pisa_el_arco_de_la_primera() {
-        let etc = scratch("pisa").join("etc");
-        LinuxRootfs::write_apk_arch(&etc, "x86_64");
-        LinuxRootfs::write_apk_arch(&etc, "aarch64");
-        assert_eq!(
-            fs::read_to_string(etc.join("apk").join("arch")).unwrap(),
-            "aarch64\n"
-        );
-    }
-
-    /// La configuracion de apk no puede volver a colgar de que exista el
-    /// estatico del objetivo: ese es best-effort (aqui mismo el de aarch64 no
-    /// se baja) y lo que arma el cierre de paquetes es el apk del host. Iban
-    /// juntos dentro de un `if apk.is_file()`, asi que un objetivo sin
-    /// estatico salia ademas sin `/etc/apk/repositories`.
-    #[test]
-    fn la_configuracion_de_apk_no_cuelga_del_estatico_del_objetivo() {
-        let src = include_str!("mod.rs");
-        let i = src
-            .find("if apk.is_file() {")
-            .expect("sigue habiendo una comprobacion del estatico");
-        let bloque = &src[i..];
-        let fin = bloque
-            .find("\n            }")
-            .or_else(|| bloque.find("\n        }"))
-            .unwrap_or(bloque.len());
-        let dentro = &bloque[..fin];
-        for aguja in ["repositories", "write_apk_arch", "install_apk_keys"] {
-            assert!(
-                !dentro.contains(aguja),
-                "{aguja} ha vuelto a quedar dentro del `if apk.is_file()`"
-            );
-        }
-    }
-}
+mod apk_arch_tests;
 
 /// How the Rust musl userspace tools get linked. The whole batch exists
 /// because `make release` on aarch64 printed five linker errors and carried

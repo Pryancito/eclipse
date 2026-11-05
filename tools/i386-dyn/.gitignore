@@ -1,3 +1,5 @@
 i386-dyn
 i386-interp
+i386-pie
+i386-interp-pie
 *.o
