@@ -104,9 +104,26 @@ fn write_theme(rootfs: &Path) {
           menu.separator.color: #1d3550\n\
           menu.separator.padding.height: 4\n\
           \n\
-          osd.bg.color: #080e1a\n\
-          osd.border.color: #38e1ff\n\
+          osd.bg.color: #060b14\n\
+          osd.border.color: #1d3550\n\
+          osd.border.width: 1\n\
           osd.label.text.color: #e6f1ff\n\
+          # Alt+Tab (labwc >= 0.9 names; older builds ignore them): a square\n\
+          # plate with a hairline edge, rows on the 4 px grid, the selected\n\
+          # row boxed by a 1 px line, and the window it will raise outlined\n\
+          # in the gold of the focus brackets.\n\
+          osd.window-switcher.style-classic.width: 640\n\
+          osd.window-switcher.style-classic.padding: 8\n\
+          osd.window-switcher.style-classic.item.padding.x: 12\n\
+          osd.window-switcher.style-classic.item.padding.y: 4\n\
+          osd.window-switcher.style-classic.item.active.border.width: 1\n\
+          osd.window-switcher.style-classic.item.icon.size: 20\n\
+          osd.window-switcher.preview.border.width: 2\n\
+          osd.window-switcher.preview.border.color: #f2c14e\n\
+          # The desktop switcher's boxes, as the bar's desktop chips.\n\
+          osd.workspace-switcher.boxes.width: 16\n\
+          osd.workspace-switcher.boxes.height: 16\n\
+          osd.workspace-switcher.boxes.border.width: 1\n\
           \n\
           # Drop shadows (labwc >= 0.8; ignored by older builds). Kept tight\n\
           # and dark: this look leans on a hairline border, and a soft wide\n\
