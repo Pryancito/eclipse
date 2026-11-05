@@ -18,7 +18,7 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::icons::IconCache;
 use lunarbar::keys::{KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL, KEY_TAB_WL};
 use lunarbar::proc::{self, map_shm_pool};
@@ -190,10 +190,12 @@ fn hit_test(s: &Scene, w: i32, h: i32, x: i32, y: i32) -> Option<Hit> {
 fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene, icons: &mut IconCache) {
     // Translucent: the desktop shows through, dimmed, behind the plates.
     cv.fill_rect_a(0, 0, w, h, GROUND, 0.9);
-    let (title, keys, empty, more) = match s.lang {
-        Lang::Es => ("ESCRITORIOS", "1–9 o ←→ elegir · Intro ir · clic en una ventana · Esc cerrar", "vacío", "más"),
-        Lang::En => ("DESKTOPS", "1–9 or ←→ pick · Enter go · click a window · Esc close", "empty", "more"),
-    };
+    let (title, keys, empty, more) = (
+        s.lang.s(Key::desk_desktops),
+        s.lang.s(Key::desk_keys),
+        s.lang.s(Key::desk_empty),
+        s.lang.s(Key::file_more),
+    );
     let adv = cv.text_bold(title, MARGIN, MARGIN, CYAN);
     cv.text(keys, MARGIN + adv + 16, MARGIN, MUTED);
     cv.hline(MARGIN, MARGIN + GLYPH_H + 12, w - 2 * MARGIN, HAIRLINE, 1.0);

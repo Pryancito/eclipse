@@ -15,7 +15,7 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{KEY_DOWN_WL, KEY_ESC_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_UP_WL};
 use lunarbar::notes::{self, Entry};
 use lunarbar::proc::{self, map_shm_pool};
@@ -115,20 +115,12 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
     cv.brackets(px, py, pw, ph, 16, 2, GOLD);
 
     let new = notes::unseen(s.entries, s.seen);
-    let (title, empty, keys, fresh) = match s.lang {
-        Lang::Es => (
-            "AVISOS",
-            "no ha llegado ningún aviso",
-            "↑↓ recorrer · Supr borrar todo · Esc cerrar",
-            "nuevos",
-        ),
-        Lang::En => (
-            "NOTIFICATIONS",
-            "no notifications yet",
-            "↑↓ scroll · Del clear all · Esc close",
-            "new",
-        ),
-    };
+    let (title, empty, keys, fresh) = (
+        s.lang.s(Key::notes_notifications),
+        s.lang.s(Key::notes_no_notifications_yet),
+        s.lang.s(Key::notes_keys),
+        s.lang.s(Key::notes_new),
+    );
     let hy = py + (HEAD_H - GLYPH_H) / 2;
     cv.text_bold(title, px + PAD + 4, hy, CYAN);
     let count = if new > 0 {

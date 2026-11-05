@@ -178,6 +178,51 @@ impl Lang {
         }
     }
 
+    /// Sunday-first, written out whole: the date line of the lock screen
+    /// (`jueves 5 de noviembre de 2026` / `Thursday 5 November 2026`).
+    ///
+    /// Sunday-first because that is how a `tm_wday` comes out of the clock,
+    /// and whole because the lock screen has the width of the display.
+    pub fn weekday_full(self) -> [&'static str; 7] {
+        match self {
+            Lang::Es => [
+                "domingo",
+                "lunes",
+                "martes",
+                "miércoles",
+                "jueves",
+                "viernes",
+                "sábado",
+            ],
+            Lang::En => [
+                "Sunday",
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+            ],
+        }
+    }
+
+    /// Monday-first, written out: what a scheduled scan says it runs on
+    /// (`cada lunes` / `every Monday`).
+    ///
+    /// `miérc.` and `Wednes.` are cut on purpose: the card they go on is the
+    /// width of a scan job and the longest day name does not fit it in either
+    /// language.
+    pub fn weekday_long(self) -> [&'static str; 7] {
+        match self {
+            Lang::Es => [
+                "lunes", "martes", "miérc.", "jueves", "viernes", "sábado", "domingo",
+            ],
+            Lang::En => [
+                "Monday", "Tuesday", "Wednes.", "Thursday", "Friday", "Saturday", "Sunday",
+            ],
+        }
+    }
+
     /// Monday-first, two-letter calendar header.
     pub fn weekday_mon_first(self) -> [&'static str; 7] {
         match self {

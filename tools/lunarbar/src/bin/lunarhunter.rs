@@ -68,7 +68,7 @@ use lunarbar::hunter_report::{
     self as report, Feed, Quarantined, Report, Severity, SigFile, Switch,
 };
 use lunarbar::hunter_scan::{self as scan, Progress};
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, BTN_LEFT, KEY_DOWN_WL, KEY_ESC_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_TAB_WL, KEY_UP_WL,
     WHEEL_NOTCH,
@@ -246,19 +246,19 @@ impl Tab {
     ];
 
     fn label(self, lang: Lang) -> &'static str {
-        let (es, en) = match self {
-            Tab::Overview => ("Resumen", "Overview"),
-            Tab::Protection => ("Protección", "Protection"),
-            Tab::Events => ("Eventos", "Events"),
-            Tab::Scan => ("Escaneo", "Scan"),
-            Tab::Quarantine => ("Cuarentena", "Quarantine"),
-            Tab::Signatures => ("Firmas", "Signatures"),
-            Tab::Programs => ("Programas", "Programs"),
-            Tab::Schedule => ("Programados", "Scheduled"),
-            Tab::Network => ("Red", "Network"),
-            Tab::Firewall => ("Cortafuegos", "Firewall"),
+        let key = match self {
+            Tab::Overview => Key::hunt_tab_overview,
+            Tab::Protection => Key::hunt_tab_protection,
+            Tab::Events => Key::hunt_tab_events,
+            Tab::Scan => Key::hunt_tab_scan,
+            Tab::Quarantine => Key::hunt_tab_quarantine,
+            Tab::Signatures => Key::hunt_tab_signatures,
+            Tab::Programs => Key::hunt_tab_programs,
+            Tab::Schedule => Key::hunt_tab_scheduled,
+            Tab::Network => Key::hunt_tab_network,
+            Tab::Firewall => Key::hunt_tab_firewall,
         };
-        tr(lang, es, en)
+        lang.s(key)
     }
 
     /// `--tab NAME`: either language's word, without accents, or the index.
@@ -516,7 +516,7 @@ struct Target {
 fn targets(lang: Lang, home: &str, extra: &[String]) -> Vec<Target> {
     let mut t = vec![
         Target {
-            label: tr(lang, "Inicio", "Home").into(),
+            label: lang.s(Key::word_home).into(),
             roots: vec![home.to_string()],
         },
         Target {
@@ -524,7 +524,7 @@ fn targets(lang: Lang, home: &str, extra: &[String]) -> Vec<Target> {
             roots: vec!["/tmp".into(), "/var/tmp".into()],
         },
         Target {
-            label: tr(lang, "Programas", "Programs").into(),
+            label: lang.s(Key::hunt_tab_programs).into(),
             roots: [
                 "/bin",
                 "/sbin",
@@ -538,7 +538,7 @@ fn targets(lang: Lang, home: &str, extra: &[String]) -> Vec<Target> {
             .collect(),
         },
         Target {
-            label: tr(lang, "Todo (/)", "All (/)").into(),
+            label: lang.s(Key::hunt_target_all).into(),
             roots: vec!["/".into()],
         },
     ];
@@ -549,7 +549,7 @@ fn targets(lang: Lang, home: &str, extra: &[String]) -> Vec<Target> {
                 .find(|s| !s.is_empty())
                 .unwrap_or(one)
                 .to_string(),
-            _ => format!("{} {}", extra.len(), tr(lang, "rutas", "paths")),
+            _ => format!("{} {}", extra.len(), lang.s(Key::hunt_target_paths)),
         };
         t.push(Target {
             label,
@@ -698,10 +698,6 @@ impl State {
         st
     }
 
-    fn t(&self, es: &'static str, en: &'static str) -> &'static str {
-        tr(self.lang, es, en)
-    }
-
     /// Re-read the report and the firewall (a question has to show up while
     /// its program is still waiting), and the network table when its tab is
     /// open (a read of it is a fresh walk of every process's sockets: not
@@ -754,13 +750,10 @@ impl State {
 
     fn send_error(&self, e: SendError) -> &'static str {
         match e {
-            SendError::Denied => self.t("hace falta root", "root required"),
-            SendError::Rejected => self.t(
-                "hunter rechazó el cambio; no se aplicó nada",
-                "hunter rejected the change; nothing was applied",
-            ),
+            SendError::Denied => self.lang.s(Key::hunt_root_required),
+            SendError::Rejected => self.lang.s(Key::hunt_hunter_rejected_the_change_nothing),
             SendError::Unavailable => {
-                self.t("/proc/hunter no responde", "/proc/hunter not responding")
+                self.lang.s(Key::hunt_proc_hunter_not_responding)
             }
         }
     }
@@ -778,10 +771,10 @@ impl State {
                     _ => false,
                 };
                 if expect_change && same(&before, &self.report) {
-                    let m = self.t("sellado: no se puede relajar", "sealed: cannot relax");
+                    let m = self.lang.s(Key::hunt_sealed_cannot_relax);
                     self.say(m, true);
                 } else {
-                    let m = self.t("aplicado", "applied");
+                    let m = self.lang.s(Key::hunt_applied);
                     self.say(m, false);
                 }
             }
@@ -838,21 +831,21 @@ impl State {
         if kind == JobKind::Scan {
             let p = j.prog();
             let msg = if p.cancelled {
-                self.t("escaneo cancelado", "scan cancelled").to_string()
+                self.lang.s(Key::hunt_scan_cancelled).to_string()
             } else if let Some(why) = &p.failure {
                 why.clone()
             } else if p.found.is_empty() {
                 format!(
                     "{} {} {}",
-                    self.t("sin amenazas en", "no threats in"),
+                    self.lang.s(Key::hunt_no_threats_in),
                     p.done,
-                    self.t("archivos", "files")
+                    self.lang.s(Key::file_n_files)
                 )
             } else {
                 format!(
                     "{} {}",
                     p.found.len(),
-                    self.t("amenazas encontradas", "threats found")
+                    self.lang.s(Key::hunt_threats_found)
                 )
             };
             self.say(msg, p.failure.is_some() || !p.found.is_empty());
@@ -868,10 +861,7 @@ impl State {
                 .to_string();
             self.say(last, !out.ok);
         } else if !out.ok {
-            let m = self.t(
-                "la orden falló (ver la consola)",
-                "the command failed (see the console)",
-            );
+            let m = self.lang.s(Key::hunt_the_command_failed_see_the_console);
             self.say(m, true);
         }
         self.reload_all();
@@ -881,7 +871,7 @@ impl State {
     fn act(&mut self, a: Act) {
         if a.needs_confirm() && self.confirm != Some(a) {
             self.confirm = Some(a);
-            let m = self.t("pulsa otra vez para confirmar", "click again to confirm");
+            let m = self.lang.s(Key::hunt_click_again_to_confirm);
             self.say(m, true);
             return;
         }
@@ -1008,7 +998,7 @@ impl State {
                 match net::send(script) {
                     Ok(()) => {
                         self.reload_report();
-                        let m = self.t("aplicado", "applied");
+                        let m = self.lang.s(Key::hunt_applied);
                         self.say(m, false);
                     }
                     Err(e) => self.say(format!("{}: {e}", net::PROC_NET), true),
@@ -1022,7 +1012,7 @@ impl State {
                     // kernel, so it is checked here: the question is still
                     // open.
                     if allow && self.has_question(&q) {
-                        let m = self.t("sellado: no se puede permitir", "sealed: cannot allow");
+                        let m = self.lang.s(Key::hunt_sealed_cannot_allow);
                         self.say(m, true);
                     }
                 }
@@ -1051,7 +1041,7 @@ impl State {
     /// kernel says now and not what the window last drew.
     fn export(&mut self) {
         let Some(inp) = export::gather(export::DEFAULT_DAYS) else {
-            let m = self.t("no hay hunter que leer", "there is no hunter to read");
+            let m = self.lang.s(Key::hunt_there_is_no_hunter_to_read);
             self.say(m, true);
             return;
         };
@@ -1068,7 +1058,7 @@ impl State {
             Ok(path) => {
                 let m = format!(
                     "{} {path}",
-                    self.t("informe guardado en", "report saved to")
+                    self.lang.s(Key::hunt_report_saved_to)
                 );
                 self.say(m, false);
             }
@@ -1100,10 +1090,7 @@ impl State {
         let Some(f) = &self.firewall else { return };
         match fw::save(f, &civil_time(now_secs()), fw::RULES_FILE) {
             Ok(()) => {
-                let m = self.t(
-                    "aplicado y guardado en /etc/hunter/firewall",
-                    "applied and saved to /etc/hunter/firewall",
-                );
+                let m = self.lang.s(Key::hunt_applied_and_saved_to_etc_hunter_fi);
                 self.say(m, false);
             }
             Err(e) => self.say(format!("{}: {e}", fw::RULES_FILE), true),
@@ -1126,10 +1113,7 @@ impl State {
         });
         match res {
             Ok(()) => {
-                let m = self.t(
-                    "guardado en /etc/hunter/policy.conf: se aplicará al arrancar",
-                    "saved to /etc/hunter/policy.conf: applied at boot",
-                );
+                let m = self.lang.s(Key::hunt_saved_to_etc_hunter_policy_conf_ap);
                 self.say(m, false);
             }
             Err(e) => {
@@ -1301,13 +1285,6 @@ impl Drop for State {
 
 // ── small helpers ────────────────────────────────────────────────────────────
 
-fn tr(lang: Lang, es: &'static str, en: &'static str) -> &'static str {
-    match lang {
-        Lang::Es => es,
-        Lang::En => en,
-    }
-}
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1397,7 +1374,7 @@ impl Paint<'_> {
             self.cv.round_rect_a(x, y, w, BTN_H, 6, p.border, 0.25);
         }
         let label = if armed {
-            self.st.t("¿seguro?", "sure?").to_string()
+            self.st.lang.s(Key::hunt_sure).to_string()
         } else {
             fit(label, w - 10)
         };
@@ -1506,14 +1483,14 @@ fn stance(st: &State, r: &Report) -> (String, Rgb) {
         (
             format!(
                 "{} {off} {}",
-                st.t("Expuesto:", "Exposed:"),
-                st.t("dominio(s) apagado(s)", "domain(s) off")
+                st.lang.s(Key::hunt_exposed),
+                st.lang.s(Key::hunt_domain_s_off)
             ),
             CRIT,
         )
     } else if enforcing == DOMAINS.len() {
         (
-            st.t("Protegido: todo bloquea", "Protected: everything enforces")
+            st.lang.s(Key::hunt_protected_everything_enforces)
                 .into(),
             OK,
         )
@@ -1521,9 +1498,9 @@ fn stance(st: &State, r: &Report) -> (String, Rgb) {
         (
             format!(
                 "{} {} {}",
-                st.t("Vigilando:", "Watching:"),
+                st.lang.s(Key::hunt_watching),
                 DOMAINS.len() - enforcing,
-                st.t("dominio(s) solo avisan", "domain(s) only report")
+                st.lang.s(Key::hunt_domain_s_only_report)
             ),
             WARN,
         )
@@ -1625,7 +1602,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
     g.bold(st.tab.label(st.lang), cx, 20, p.text);
     let mut hx = w - PAD - 4;
     if st.report.as_ref().is_some_and(|r| r.status.sealed) {
-        let s = st.t("sellado", "sealed");
+        let s = st.lang.s(Key::hunt_sealed);
         hx -= Canvas::text_width(s);
         g.text(s, hx, 20, WARN);
         hx -= 20;
@@ -1633,7 +1610,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
         hx -= 16;
     }
     if !st.root {
-        let s = st.t("solo lectura (no eres root)", "read only (not root)");
+        let s = st.lang.s(Key::hunt_read_only_not_root);
         hx -= Canvas::text_width(s);
         g.text(s, hx, 20, p.dim);
     }
@@ -1644,16 +1621,13 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
     match &st.report {
         None => {
             g.bold(
-                st.t("Este núcleo no tiene hunter", "This kernel has no hunter"),
+                st.lang.s(Key::hunt_this_kernel_has_no_hunter),
                 body.0,
                 body.1,
                 CRIT,
             );
             g.text(
-                st.t(
-                    "No hay /proc/hunter. lunarhunter necesita el núcleo de Eclipse OS.",
-                    "No /proc/hunter. lunarhunter needs the Eclipse OS kernel.",
-                ),
+                st.lang.s(Key::hunt_no_proc_hunter_lunarhunter_needs_t),
                 body.0,
                 body.1 + 28,
                 p.dim,
@@ -1700,15 +1674,15 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     g.bold(&fit(&headline, w), x, y, hc);
     let sub = format!(
         "{} {} · {} {} · {} {}",
-        st.t("aprendizaje", "learning"),
+        st.lang.s(Key::hunt_sw_learning),
         if s.learning { "on" } else { "off" },
-        st.t("lista de ejecución", "exec allowlist"),
+        st.lang.s(Key::hunt_exec_allowlist),
         if r.allowlist_active {
-            st.t("activa", "active")
+            st.lang.s(Key::hunt_active)
         } else {
-            st.t("inactiva", "inactive")
+            st.lang.s(Key::hunt_inactive)
         },
-        st.t("sello", "seal"),
+        st.lang.s(Key::hunt_seal),
         if s.sealed { "on" } else { "off" },
     );
     g.text(&fit(&sub, w), x, y + 22, p.dim);
@@ -1718,27 +1692,27 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     let cw = (w - 3 * gap) / 4;
     let crit = if s.criticals > 0 { CRIT } else { p.text };
     let cards: [(&str, String, Rgb); 8] = [
-        (st.t("eventos", "events"), r.total.to_string(), p.text),
-        (st.t("bloqueos", "blocked"), s.blocked.to_string(), p.text),
-        (st.t("avisos", "warnings"), s.warnings.to_string(), p.text),
-        (st.t("críticos", "critical"), s.criticals.to_string(), crit),
+        (st.lang.s(Key::hunt_events), r.total.to_string(), p.text),
+        (st.lang.s(Key::hunt_blocked), s.blocked.to_string(), p.text),
+        (st.lang.s(Key::hunt_warnings), s.warnings.to_string(), p.text),
+        (st.lang.s(Key::hunt_critical), s.criticals.to_string(), crit),
         (
-            st.t("firmas", "signatures"),
+            st.lang.s(Key::hunt_signatures),
             s.signatures.to_string(),
             p.text,
         ),
         (
-            st.t("detecciones", "detections"),
+            st.lang.s(Key::hunt_detections),
             s.detections.to_string(),
             if s.detections > 0 { CRIT } else { p.text },
         ),
         (
-            st.t("programas fijados", "pinned programs"),
+            st.lang.s(Key::hunt_pinned_programs),
             s.pinned.to_string(),
             p.text,
         ),
         (
-            st.t("en cuarentena", "quarantined"),
+            st.lang.s(Key::hunt_quarantined),
             st.quarantine.len().to_string(),
             p.text,
         ),
@@ -1754,7 +1728,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     cy += 58 + 22;
 
     // Quick actions.
-    g.section(x, cy, w, st.t("Acciones rápidas", "Quick actions"));
+    g.section(x, cy, w, st.lang.s(Key::hunt_quick_actions));
     cy += 30;
     let busy = st.busy();
     let free = |a: Act| (!busy && st.root).then_some(a);
@@ -1763,7 +1737,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         bx,
         cy,
         0,
-        st.t("Escanear inicio", "Scan home"),
+        st.lang.s(Key::hunt_scan_home),
         Style::Primary,
         free(Act::QuickScan),
     ) + 8;
@@ -1771,7 +1745,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         bx,
         cy,
         0,
-        st.t("Actualizar firmas", "Update signatures"),
+        st.lang.s(Key::hunt_update_signatures),
         Style::Normal,
         free(Act::Update),
     ) + 8;
@@ -1781,11 +1755,11 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
             && s.modes[4] == Mode::Enforce
             && s.modes[5] == Mode::Enforce))
         .then_some(Act::Lockdown);
-    bx += g.button(bx, cy, 0, st.t("Blindar", "Lockdown"), Style::Danger, lock) + 8;
+    bx += g.button(bx, cy, 0, st.lang.s(Key::hunt_lockdown), Style::Danger, lock) + 8;
     // Reading only, so it needs no root; and not while a job runs, so the
     // report is not taken halfway through a scan's quarantine. On a row of
     // its own when the window is too narrow for four buttons.
-    let label = st.t("Exportar informe", "Export report");
+    let label = st.lang.s(Key::hunt_export_report);
     if bx + Canvas::text_width(label) + 24 > x + w {
         bx = x;
         cy += BTN_H + 8;
@@ -1805,7 +1779,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     }
 
     // The newest alerts.
-    g.section(x, cy, w, st.t("Últimas alertas", "Latest alerts"));
+    g.section(x, cy, w, st.lang.s(Key::hunt_latest_alerts));
     cy += 30;
     let alerts: Vec<_> = r
         .events
@@ -1814,7 +1788,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         .filter(|e| e.sev >= Severity::Warn)
         .collect();
     if alerts.is_empty() {
-        g.text(st.t("sin alertas", "no alerts"), x, cy, p.dim);
+        g.text(st.lang.s(Key::hunt_no_alerts), x, cy, p.dim);
     }
     let room = ((y + h - cy) / ROW_H).max(0) as usize;
     for e in alerts.into_iter().take(room) {
@@ -1840,21 +1814,15 @@ fn media_section(
         x,
         cy,
         w,
-        st.t("Dispositivos extraíbles", "Removable devices"),
+        st.lang.s(Key::hunt_removable_devices),
     );
     cy += 30;
     let devs = &r.status.media;
     if devs.is_empty() {
         let none = if r.status.media_scan {
-            st.t(
-                "ningún dispositivo montado: se escanean al conectarlos",
-                "no device mounted: they are scanned when plugged in",
-            )
+            st.lang.s(Key::hunt_no_device_mounted_they_are_scanned)
         } else {
-            st.t(
-                "ningún dispositivo montado (escanear USB está apagado)",
-                "no device mounted (scan USB is off)",
-            )
+            st.lang.s(Key::hunt_no_device_mounted_scan_usb_is_off)
         };
         g.text(&fit(none, w), x, cy, p.dim);
         return cy + ROW_H + 14;
@@ -1867,7 +1835,7 @@ fn media_section(
             MediaState::Skipped => p.dim,
             MediaState::Pending | MediaState::Scanning => p.accent,
         };
-        let label = st.t("Escanear", "Scan");
+        let label = st.lang.s(Key::hunt_scan);
         let bw = Canvas::text_width(label) + 24;
         let busy = matches!(d.state, MediaState::Pending | MediaState::Scanning);
         g.button(
@@ -1919,76 +1887,28 @@ fn event_row(g: &mut Paint, x: i32, y: i32, w: i32, e: &report::RingEvent) {
 
 /// What each domain guards, for the Protección tab.
 fn domain_help(lang: Lang, d: usize) -> &'static str {
-    let (es, en) = match d {
-        0 => (
-            "llamadas al sistema por proceso",
-            "per-process system calls",
-        ),
-        1 => (
-            "memoria escribible y ejecutable (W^X)",
-            "writable + executable memory (W^X)",
-        ),
-        2 => ("qué programas pueden ejecutarse", "which programs may run"),
-        3 => (
-            "heurísticas: floods, fork-bombs",
-            "heuristics: floods, fork bombs",
-        ),
-        4 => (
-            "SHA-256 de los programas fijados",
-            "SHA-256 of pinned programs",
-        ),
-        5 => (
-            "antivirus por firmas al ejecutar",
-            "signature antivirus at exec",
-        ),
-        _ => (
-            "ransomware e inyección en procesos",
-            "ransomware and process injection",
-        ),
+    let key = match d {
+        0 => Key::hunt_dom_per_process_system_calls,
+        1 => Key::hunt_dom_writable_executable_memory_w_x,
+        2 => Key::hunt_dom_which_programs_may_run,
+        3 => Key::hunt_dom_heuristics_floods_fork_bombs,
+        4 => Key::hunt_dom_sha_256_of_pinned_programs,
+        5 => Key::hunt_dom_signature_antivirus_at_exec,
+        _ => Key::hunt_dom_ransomware_and_process_injection,
     };
-    tr(lang, es, en)
+    lang.s(key)
 }
 
 fn switch_text(lang: Lang, sw: Switch) -> (&'static str, &'static str) {
-    let (es, en, hes, hen) = match sw {
-        Switch::Learning => (
-            "aprendizaje",
-            "learning",
-            "confiar en lo nuevo al primer uso",
-            "trust new programs on first use",
-        ),
-        Switch::AnomalyDetection => (
-            "detección de anomalías",
-            "anomaly detection",
-            "contadores de floods y fork-bombs",
-            "flood and fork-bomb counters",
-        ),
-        Switch::PrivilegedDeny => (
-            "denegar privilegiadas",
-            "privileged deny",
-            "módulos, bpf, kexec, ptrace",
-            "modules, bpf, kexec, ptrace",
-        ),
-        Switch::RequireHash => (
-            "exigir hash",
-            "require hash",
-            "un programa sin fijar es una violación",
-            "an unpinned program is a violation",
-        ),
-        Switch::MediaScan => (
-            "escanear USB",
-            "scan USB",
-            "escanear cada pendrive al montarlo",
-            "scan every stick or disk when mounted",
-        ),
-        Switch::MediaLock => (
-            "bloquear USB",
-            "lock USB",
-            "nada se ejecuta del USB sin escanear",
-            "nothing runs from USB until scanned",
-        ),
+    let (name, help) = match sw {
+        Switch::Learning => (Key::hunt_sw_learning, Key::hunt_sw_trust_new_programs_on_first_use),
+        Switch::AnomalyDetection => (Key::hunt_sw_anomaly_detection, Key::hunt_sw_flood_and_fork_bomb_counters),
+        Switch::PrivilegedDeny => (Key::hunt_sw_privileged_deny, Key::hunt_sw_modules_bpf_kexec_ptrace),
+        Switch::RequireHash => (Key::hunt_sw_require_hash, Key::hunt_sw_an_unpinned_program_is_a_violation),
+        Switch::MediaScan => (Key::hunt_sw_scan_usb, Key::hunt_sw_scan_every_stick_on_mount),
+        Switch::MediaLock => (Key::hunt_sw_lock_usb, Key::hunt_sw_nothing_runs_from_usb_unscanned),
     };
-    (tr(lang, es, en), tr(lang, hes, hen))
+    (lang.s(name), lang.s(help))
 }
 
 /// Protección: the modes, the switches, the policy and the seal.
@@ -1999,7 +1919,7 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
     let modes = hunter::text(st.lang).modes;
     let seg_x = x + w - 3 * SEG_W;
     let mut cy = y;
-    g.section(x, cy, w, st.t("Dominios", "Domains"));
+    g.section(x, cy, w, st.lang.s(Key::hunt_domains));
     cy += 30;
     for (d, name) in DOMAINS.iter().enumerate() {
         g.bold(name, x, cy + 5, p.text);
@@ -2021,7 +1941,7 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
         cy += ROW_H + 10;
     }
     cy += 10;
-    g.section(x, cy, w, st.t("Interruptores", "Switches"));
+    g.section(x, cy, w, st.lang.s(Key::hunt_switches));
     cy += 30;
     let seg2 = x + w - 2 * SEG_W;
     for sw in Switch::ALL {
@@ -2047,7 +1967,7 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
         bx,
         cy,
         0,
-        st.t("Guardar como política de arranque", "Save as boot policy"),
+        st.lang.s(Key::hunt_save_as_boot_policy),
         Style::Primary,
         ok(Act::SavePolicy),
     ) + 8;
@@ -2055,19 +1975,16 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
         bx,
         cy,
         0,
-        st.t("Aplicar policy.conf", "Apply policy.conf"),
+        st.lang.s(Key::hunt_apply_policy_conf),
         Style::Normal,
         ok(Act::ApplyPolicy),
     ) + 8;
     let seal = (st.root && !s.sealed).then_some(Act::Seal);
-    g.button(bx, cy, 0, st.t("Sellar", "Seal"), Style::Danger, seal);
+    g.button(bx, cy, 0, st.lang.s(Key::hunt_seal_2), Style::Danger, seal);
     cy += BTN_H + 8;
     g.text(
         &fit(
-            st.t(
-                "Sellar es de un solo sentido: hasta reiniciar solo se puede endurecer.",
-                "Sealing is one way: until reboot, settings can only tighten.",
-            ),
+            st.lang.s(Key::hunt_sealing_is_one_way_until_reboot_se),
             w,
         ),
         x,
@@ -2083,9 +2000,9 @@ fn tab_events(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) {
     let p = g.p;
     let mut bx = x;
     for (f, label) in [
-        (Filter::All, st.t("Todos", "All")),
-        (Filter::Alerts, st.t("Alertas", "Alerts")),
-        (Filter::Critical, st.t("Críticos", "Critical")),
+        (Filter::All, st.lang.s(Key::hunt_all)),
+        (Filter::Alerts, st.lang.s(Key::hunt_alerts)),
+        (Filter::Critical, st.lang.s(Key::hunt_critical_2)),
     ] {
         let look = if st.filter == f {
             Style::Primary
@@ -2104,7 +2021,7 @@ fn tab_events(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) {
         format!(
             " · {} {}",
             r.dropped + r.critical_dropped,
-            st.t("descartados", "dropped")
+            st.lang.s(Key::hunt_dropped)
         )
     } else {
         String::new()
@@ -2113,7 +2030,7 @@ fn tab_events(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) {
         "{} / {} {}{dropped}",
         events.len(),
         r.events.len(),
-        st.t("en el anillo", "in the ring")
+        st.lang.s(Key::hunt_in_the_ring)
     );
     g.text(&count, bx + 10, y + (BTN_H - GLYPH_H) / 2, p.dim);
 
@@ -2124,7 +2041,7 @@ fn tab_events(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) {
     let max = events.len().saturating_sub(rows);
     let top = st.scroll.min(max);
     if events.is_empty() {
-        g.text(st.t("sin eventos", "no events"), x, ly, p.dim);
+        g.text(st.lang.s(Key::hunt_no_events), x, ly, p.dim);
     }
     for (i, e) in events.iter().skip(top).take(rows).enumerate() {
         event_row(g, x, ly + i as i32 * ROW_H, w, e);
@@ -2139,7 +2056,7 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let busy = st.busy();
     let mut cy = y;
     g.text(
-        st.t("Qué escanear:", "What to scan:"),
+        st.lang.s(Key::hunt_what_to_scan),
         x,
         cy + (BTN_H - GLYPH_H) / 2,
         p.dim,
@@ -2159,7 +2076,7 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     cy += GLYPH_H + 14;
 
     g.text(
-        st.t("Cuarentena automática", "Automatic quarantine"),
+        st.lang.s(Key::hunt_automatic_quarantine),
         x,
         cy + 6,
         p.text,
@@ -2174,17 +2091,17 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     );
     let bxx = x + w;
     if busy && st.job.as_ref().is_some_and(|j| j.kind == JobKind::Scan) {
-        let bw = Canvas::text_width(st.t("Cancelar", "Cancel")) + 24;
+        let bw = Canvas::text_width(st.lang.s(Key::file_btn_cancel)) + 24;
         g.button(
             bxx - bw,
             cy - 2,
             bw,
-            st.t("Cancelar", "Cancel"),
+            st.lang.s(Key::file_btn_cancel),
             Style::Danger,
             Some(Act::Cancel),
         );
     } else {
-        let label = st.t("Escanear", "Scan");
+        let label = st.lang.s(Key::hunt_scan);
         let bw = Canvas::text_width(label) + 48;
         g.button(
             bxx - bw,
@@ -2218,17 +2135,17 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         }
         cy += 18;
         let line = if pr.walking {
-            st.t("listando archivos...", "listing files...").to_string()
+            st.lang.s(Key::hunt_listing_files).to_string()
         } else {
             format!(
                 "{} / {} {} · {} {} · {} {}",
                 pr.done,
                 pr.total,
-                st.t("archivos", "files"),
+                st.lang.s(Key::file_n_files),
                 pr.found.len(),
-                st.t("amenazas", "threats"),
+                st.lang.s(Key::hunt_threats),
                 pr.errors,
-                st.t("ilegibles", "unreadable")
+                st.lang.s(Key::hunt_unreadable)
             )
         };
         g.text(
@@ -2245,7 +2162,7 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         // One finding has its own button; this is for when there are many.
         if pending > 1 {
             let all = (!busy && st.root).then_some(Act::QuarantineAll);
-            let label = st.t("Cuarentena a todo", "Quarantine all");
+            let label = st.lang.s(Key::hunt_quarantine_all);
             let bw = Canvas::text_width(label) + 24;
             g.button(x + w - bw, cy, bw, label, Style::Danger, all);
         }
@@ -2276,14 +2193,14 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             p.text,
         );
         if done {
-            g.text(st.t("en cuarentena", "quarantined"), x + w - bw, ry + 5, OK);
+            g.text(st.lang.s(Key::hunt_quarantined), x + w - bw, ry + 5, OK);
         } else {
             let act = (!busy && st.root).then_some(Act::QuarantineFound(i));
             g.button(
                 x + w - bw - 4,
                 ry - 1,
                 bw,
-                st.t("Cuarentena", "Quarantine"),
+                st.lang.s(Key::hunt_tab_quarantine),
                 Style::Normal,
                 act,
             );
@@ -2303,14 +2220,8 @@ fn tab_quarantine(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let st = g.st;
     let p = g.p;
     let help = [
-        st.t(
-            "Los archivos están en /var/lib/hunter/quarantine, con permisos 000.",
-            "Files live in /var/lib/hunter/quarantine, mode 000.",
-        ),
-        st.t(
-            "Restaurar no quita la denegación de su ruta hasta reiniciar.",
-            "Restoring does not lift the deny on its path until reboot.",
-        ),
+        st.lang.s(Key::hunt_files_live_in_var_lib_hunter_quara),
+        st.lang.s(Key::hunt_restoring_does_not_lift_the_deny_o),
     ];
     for (i, l) in help.iter().enumerate() {
         g.text(&fit(l, w), x, y + i as i32 * (GLYPH_H + 4), p.dim);
@@ -2325,7 +2236,7 @@ fn tab_quarantine(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let top = st.scroll.min(max);
     if items.is_empty() {
         g.text(
-            st.t("la cuarentena está vacía", "the quarantine is empty"),
+            st.lang.s(Key::hunt_the_quarantine_is_empty),
             x,
             ly + 6,
             p.dim,
@@ -2354,7 +2265,7 @@ fn tab_quarantine(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             x + w - bw - 4,
             ry - 1,
             bw,
-            st.t("Restaurar", "Restore"),
+            st.lang.s(Key::hunt_restore),
             Style::Normal,
             act,
         );
@@ -2384,7 +2295,7 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x,
         y,
         cw,
-        st.t("firmas cargadas", "signatures loaded"),
+        st.lang.s(Key::hunt_signatures_loaded),
         &r.status.signatures.to_string(),
         p.text,
     );
@@ -2392,7 +2303,7 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x + cw + gap,
         y,
         cw,
-        st.t("por hash SHA-256", "by SHA-256 hash"),
+        st.lang.s(Key::hunt_by_sha_256_hash),
         &r.sig_hash.to_string(),
         p.text,
     );
@@ -2400,7 +2311,7 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x + 2 * (cw + gap),
         y,
         cw,
-        st.t("patrones de bytes", "byte patterns"),
+        st.lang.s(Key::hunt_byte_patterns),
         &r.sig_bytes.to_string(),
         p.text,
     );
@@ -2413,7 +2324,7 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x + 3 * (cw + gap),
         y,
         cw,
-        st.t("detecciones", "detections"),
+        st.lang.s(Key::hunt_detections),
         &r.status.detections.to_string(),
         dc,
     );
@@ -2425,7 +2336,7 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x,
         cy,
         0,
-        st.t("Actualizar ahora", "Update now"),
+        st.lang.s(Key::hunt_update_now),
         Style::Primary,
         free(Act::Update),
     );
@@ -2435,14 +2346,11 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x,
         cy,
         w,
-        st.t(
-            "Archivos de firmas (se cargan al arrancar)",
-            "Signature files (loaded at boot)",
-        ),
+        st.lang.s(Key::hunt_signature_files_loaded_at_boot),
     );
     cy += 28;
     if st.sig_files.is_empty() {
-        g.text(st.t("ninguno", "none"), x, cy, p.dim);
+        g.text(st.lang.s(Key::net_dns_none), x, cy, p.dim);
         cy += ROW_H;
     }
     for f in st.sig_files.iter().take(5) {
@@ -2458,11 +2366,11 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         x,
         cy,
         w,
-        st.t("Fuentes (/etc/hunter/feeds)", "Feeds (/etc/hunter/feeds)"),
+        st.lang.s(Key::hunt_feeds_etc_hunter_feeds),
     );
     cy += 28;
     if st.feeds.is_empty() {
-        g.text(st.t("ninguna", "none"), x, cy, p.dim);
+        g.text(st.lang.s(Key::hunt_none), x, cy, p.dim);
         cy += ROW_H;
     }
     for f in st.feeds.iter().take(3) {
@@ -2488,7 +2396,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x,
         y,
         cw,
-        st.t("de confianza", "trusted"),
+        st.lang.s(Key::hunt_trusted),
         &r.trusted.to_string(),
         p.text,
     );
@@ -2496,7 +2404,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x + cw + gap,
         y,
         cw,
-        st.t("aprendidos", "learned"),
+        st.lang.s(Key::hunt_learned),
         &r.learned.to_string(),
         p.text,
     );
@@ -2504,7 +2412,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x + 2 * (cw + gap),
         y,
         cw,
-        st.t("lista negra", "blacklisted"),
+        st.lang.s(Key::hunt_blacklisted),
         &r.blacklisted.to_string(),
         p.text,
     );
@@ -2513,7 +2421,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x + 3 * (cw + gap),
         y,
         cw,
-        st.t("fijados núcleo/disco", "pinned kernel/disk"),
+        st.lang.s(Key::hunt_pinned_kernel_disk),
         &pins,
         p.text,
     );
@@ -2528,10 +2436,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         bx,
         cy,
         0,
-        st.t(
-            "Guardar aprendidos en la whitelist",
-            "Save learned to the whitelist",
-        ),
+        st.lang.s(Key::hunt_save_learned_to_the_whitelist),
         Style::Primary,
         save,
     ) + 8;
@@ -2539,7 +2444,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         bx,
         cy,
         0,
-        st.t("Verificar integridad", "Verify integrity"),
+        st.lang.s(Key::hunt_verify_integrity),
         Style::Normal,
         free(Act::Verify),
     );
@@ -2548,10 +2453,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x,
         cy,
         w,
-        st.t(
-            "Programas aprendidos (confiados al primer uso)",
-            "Learned programs (trusted on first use)",
-        ),
+        st.lang.s(Key::hunt_learned_programs_trusted_on_first),
     );
     cy += 28;
     let console_h = 5 * (GLYPH_H + 3) + 12;
@@ -2565,7 +2467,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
     let max = progs.len().saturating_sub(rows);
     let top = st.scroll.min(max);
     if progs.is_empty() {
-        g.text(st.t("ninguno", "none"), x, cy, p.dim);
+        g.text(st.lang.s(Key::net_dns_none), x, cy, p.dim);
     }
     for (i, prog) in progs.iter().skip(top).take(rows).enumerate() {
         g.text(&fit_left(prog, w), x, cy + i as i32 * ROW_H, p.text);
@@ -2588,23 +2490,15 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
 /// One line on what the firewall's mode does, for the person choosing it.
 fn net_mode_help(st: &State, f: &Firewall) -> String {
     match f.mode {
-        Mode::Off => st
-            .t(
-                "Apagado: no se comprueba nada.",
-                "Off: nothing is checked.",
-            )
+        Mode::Off => st.lang.s(Key::hunt_fw_off)
             .into(),
-        Mode::Report => st
-            .t(
-                "Aviso: deja pasar y pregunta.",
-                "Report: lets it through and asks.",
-            )
+        Mode::Report => st.lang.s(Key::hunt_fw_report)
             .into(),
         Mode::Enforce => format!(
             "{} {} s{}",
-            st.t("Bloqueo: espera tu respuesta", "Enforce: waits for you"),
+            st.lang.s(Key::hunt_enforce_waits_for_you),
             f.timeout,
-            st.t(", si no, bloquea.", ", then blocks."),
+            st.lang.s(Key::hunt_then_blocks),
         ),
     }
 }
@@ -2615,19 +2509,13 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let p = g.p;
     let Some(f) = &st.firewall else {
         g.bold(
-            st.t(
-                "Este núcleo no tiene cortafuegos",
-                "This kernel has no firewall",
-            ),
+            st.lang.s(Key::hunt_this_kernel_has_no_firewall),
             x,
             y,
             CRIT,
         );
         g.text(
-            st.t(
-                "No hay /proc/hunter_firewall: hace falta un hunter más nuevo.",
-                "No /proc/hunter_firewall: a newer hunter is needed.",
-            ),
+            st.lang.s(Key::hunt_no_proc_hunter_firewall_a_newer_hu),
             x,
             y + 28,
             p.dim,
@@ -2638,7 +2526,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let modes = hunter::text(st.lang).modes;
     let seg_x = x + w - 3 * SEG_W;
     let mut cy = y;
-    g.bold(st.t("Modo", "Mode"), x, cy + 5, p.text);
+    g.bold(st.lang.s(Key::net_mode), x, cy + 5, p.text);
     g.text(&fit(&net_mode_help(st, f), seg_x - x - 70), x + 60, cy + 5, p.dim);
     let on = Mode::ALL.iter().position(|&m| m == f.mode).unwrap_or(0);
     g.segments(seg_x, cy, &modes, on, |_| st.root, |i| Act::NetMode(Mode::ALL[i]));
@@ -2647,7 +2535,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     // ── the questions ──
     let title = format!(
         "{} ({})",
-        st.t("Preguntas", "Questions"),
+        st.lang.s(Key::hunt_questions),
         f.questions.len()
     );
     g.section(x, cy, w, &title);
@@ -2659,10 +2547,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let room = ((y + h - cy) / 2 / (card_h + 6)).max(1) as usize;
     if f.questions.is_empty() {
         g.text(
-            st.t(
-                "Ningún programa espera respuesta.",
-                "No program is waiting for an answer.",
-            ),
+            st.lang.s(Key::hunt_no_program_is_waiting_for_an_answe),
             x,
             cy,
             p.dim,
@@ -2678,29 +2563,29 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         let ask = match q.dir {
             Dir::Out => format!(
                 "{} {} {}",
-                st.t("¿Permitir que", "Allow"),
+                st.lang.s(Key::hunt_allow),
                 q.name(),
-                st.t("se conecte a la red?", "to connect to the network?")
+                st.lang.s(Key::hunt_to_connect_to_the_network)
             ),
             Dir::In => format!(
                 "{} {} {} {}?",
-                st.t("¿Permitir que", "Allow"),
+                st.lang.s(Key::hunt_allow),
                 q.name(),
-                st.t("escuche en el puerto", "to listen on port"),
+                st.lang.s(Key::hunt_to_listen_on_port),
                 q.port()
             ),
         };
         let mut bx = x + w - 10;
-        let deny_w = Canvas::text_width(st.t("Bloquear", "Block")) + 24;
-        let allow_w = Canvas::text_width(st.t("Permitir", "Allow")) + 24;
-        let skip_w = Canvas::text_width(st.t("Ignorar", "Ignore")) + 24;
+        let deny_w = Canvas::text_width(st.lang.s(Key::hunt_block)) + 24;
+        let allow_w = Canvas::text_width(st.lang.s(Key::hunt_allow_2)) + 24;
+        let skip_w = Canvas::text_width(st.lang.s(Key::hunt_ignore)) + 24;
         bx -= skip_w;
         let by = cy + ROW_H + 10;
         g.button(
             bx,
             by,
             skip_w,
-            st.t("Ignorar", "Ignore"),
+            st.lang.s(Key::hunt_ignore),
             Style::Normal,
             ok(Act::NetDismiss(i)),
         );
@@ -2709,7 +2594,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             bx,
             by,
             deny_w,
-            st.t("Bloquear", "Block"),
+            st.lang.s(Key::hunt_block),
             Style::Danger,
             ok(Act::NetAnswer(i, false)),
         );
@@ -2718,7 +2603,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             bx,
             by,
             allow_w,
-            st.t("Permitir", "Allow"),
+            st.lang.s(Key::hunt_allow_2),
             Style::Primary,
             ok(Act::NetAnswer(i, true)),
         );
@@ -2731,9 +2616,9 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             "{} · {} {} · pid {} · {} {} s · {}",
             q.peer,
             q.count,
-            st.t("intento(s)", "attempt(s)"),
+            st.lang.s(Key::hunt_attempt_s),
             q.pid,
-            st.t("hace", "ago"),
+            st.lang.s(Key::hunt_ago),
             ago,
             q.program,
         );
@@ -2743,9 +2628,9 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     if f.questions.len() > room {
         let more = format!(
             "{} {} {}",
-            st.t("y", "and"),
+            st.lang.s(Key::hunt_and),
             f.questions.len() - room,
-            st.t("más", "more")
+            st.lang.s(Key::file_more)
         );
         g.text(&more, x, cy, p.dim);
         cy += ROW_H;
@@ -2753,7 +2638,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     cy += 10;
 
     // ── the rules ──
-    let title = format!("{} ({})", st.t("Reglas", "Rules"), f.rules.len());
+    let title = format!("{} ({})", st.lang.s(Key::hunt_rules), f.rules.len());
     g.section(x, cy, w, &title);
     cy += 28;
     let row_h = BTN_H + 6;
@@ -2763,10 +2648,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let top = st.scroll.min(max);
     if f.rules.is_empty() {
         g.text(
-            st.t(
-                "Todavía no hay reglas: se crean al responder.",
-                "No rules yet: answering a question makes one.",
-            ),
+            st.lang.s(Key::hunt_no_rules_yet_answering_a_question),
             x,
             cy,
             p.dim,
@@ -2776,24 +2658,24 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         let ry = cy + (k - top) as i32 * row_h;
         let ty = ry + (BTN_H - GLYPH_H) / 2;
         let (word, c) = if r.allow {
-            (st.t("permitido", "allowed"), OK)
+            (st.lang.s(Key::hunt_allowed), OK)
         } else {
-            (st.t("bloqueado", "blocked"), CRIT)
+            (st.lang.s(Key::hunt_blocked_2), CRIT)
         };
         g.bold(word, x, ty, c);
         let dir = match r.dir {
-            None => st.t("ambas", "both"),
-            Some(Dir::Out) => st.t("salida", "out"),
-            Some(Dir::In) => st.t("entrada", "in"),
+            None => st.lang.s(Key::hunt_both),
+            Some(Dir::Out) => st.lang.s(Key::hunt_out),
+            Some(Dir::In) => st.lang.s(Key::hunt_in),
         };
         g.text(dir, x + 110, ty, p.dim);
-        let fw_w = Canvas::text_width(st.t("Olvidar", "Forget")) + 24;
+        let fw_w = Canvas::text_width(st.lang.s(Key::hunt_forget)) + 24;
         g.text(&fit_left(&r.program, w - 200 - fw_w), x + 190, ty, p.text);
         g.button(
             x + w - fw_w,
             ry,
             fw_w,
-            st.t("Olvidar", "Forget"),
+            st.lang.s(Key::hunt_forget),
             Style::Normal,
             ok(Act::NetForget(k)),
         );

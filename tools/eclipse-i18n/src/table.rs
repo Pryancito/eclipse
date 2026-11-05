@@ -108,7 +108,14 @@ strings! {
         es: "pulsa una tecla o haz clic para volver",
         en: "press a key or click to return",
     },
+    /// `desde las 10:24 · hace 12 min` / `since 10:24 · for 12 min`.
+    lock_since => { es: "desde las {} · {}", en: "since {} · {}" },
     lock_just_now => { es: "ahora mismo", en: "just now" },
+    /// `jueves 5 de noviembre de 2026` / `Thursday 5 November 2026`: el día,
+    /// el mes y el año, que no van en el mismo orden en los dos idiomas.
+    lock_date => { es: "{} de {} de {}", en: "{} {} {}" },
+    /// `hace 1 h 05 min` / `for 1 h 05 min`.
+    lock_for => { es: "hace {}", en: "for {}" },
 
     // ── screenshots ──────────────────────────────────────────────────────
     /// The pictures folder. This is a PATH component -- it has to match
@@ -639,6 +646,397 @@ strings! {
     moon_waning_gibbous => { es: "GIBOSA MENGUANTE", en: "WANING GIBBOUS" },
     moon_last_quarter => { es: "CUARTO MENGUANTE", en: "LAST QUARTER" },
     moon_waning_crescent => { es: "LUNA MENGUANTE", en: "WANING CRESCENT" },
+
+    // ── lunardesk: the desktop switcher ──────────────────────────────────
+    desk_desktops => { es: "ESCRITORIOS", en: "DESKTOPS" },
+    desk_keys => {
+        es: "1–9 o ←→ elegir · Intro ir · clic en una ventana · Esc cerrar",
+        en: "1–9 or ←→ pick · Enter go · click a window · Esc close",
+    },
+    /// Un escritorio sin ninguna ventana.
+    desk_empty => { es: "vacío", en: "empty" },
+
+    // ── lunarnotes: the notification history ─────────────────────────────
+    notes_notifications => { es: "AVISOS", en: "NOTIFICATIONS" },
+    notes_no_notifications_yet => {
+        es: "no ha llegado ningún aviso",
+        en: "no notifications yet",
+    },
+    notes_keys => {
+        es: "↑↓ recorrer · Supr borrar todo · Esc cerrar",
+        en: "↑↓ scroll · Del clear all · Esc close",
+    },
+    /// `7 · 2 nuevos` / `7 · 2 new`: el número va delante.
+    notes_new => { es: "nuevos", en: "new" },
+
+    // ── lunarhunter: the security panel ──────────────────────────────────
+    // Its tabs, the seven domains and their switches, the network tab, the
+    // scheduled scans, and what each firewall mode does.
+    // Los escaneos programados: el nombre del trabajo, lo que dio y de dónde
+    // salió la ejecución.
+    hunt_sched_quick => { es: "Rápido", en: "Quick" },
+    hunt_sched_full => { es: "Completo", en: "Full" },
+    hunt_sched_clean => { es: "limpio", en: "clean" },
+    /// `amenazas: 3` / `threats: 3`: el número va detrás.
+    hunt_sched_threats => { es: "amenazas:", en: "threats:" },
+    hunt_sched_quarantined => { es: "aisladas:", en: "quarantined:" },
+    hunt_sched_failed => { es: "falló", en: "failed" },
+    /// Quién lanzó la ejecución.
+    hunt_sched_manual => { es: "a mano", en: "manual" },
+    hunt_sched_clock => { es: "reloj", en: "clock" },
+    /// `1.204 arch.` / `1,204 files`: cortado porque la tarjeta no da más.
+    hunt_sched_files => { es: "arch.", en: "files" },
+    /// Los dos destinos del escaneo que no son una carpeta del usuario.
+    hunt_target_all => { es: "Todo (/)", en: "All (/)" },
+    /// `3 rutas` / `3 paths`: el número va delante.
+    hunt_target_paths => { es: "rutas", en: "paths" },
+    hunt_fw_off => { es: "Apagado: no se comprueba nada.", en: "Off: nothing is checked." },
+    hunt_fw_report => {
+        es: "Aviso: deja pasar y pregunta.",
+        en: "Report: lets it through and asks.",
+    },
+    hunt_net_this_kernel_has_no_network_monitor => {
+        es: "Este núcleo no tiene monitor de red",
+        en: "This kernel has no network monitor",
+    },
+    hunt_net_no_proc_hunter_net_a_newer_hunter => {
+        es: "No hay /proc/hunter_net: hace falta un hunter más nuevo.",
+        en: "No /proc/hunter_net: a newer hunter is needed.",
+    },
+    hunt_net_listening => { es: "en escucha", en: "listening" },
+    hunt_net_unexpected => { es: "inesperados", en: "unexpected" },
+    hunt_net_connections => { es: "conexiones", en: "connections" },
+    hunt_net_alerts_on => { es: "Avisos: activados", en: "Alerts: on" },
+    hunt_net_alerts_off => { es: "Avisos: desactivados", en: "Alerts: off" },
+    hunt_net_ports_on_127_0_0_1_only_do_not_ale => {
+        es: "Los puertos solo de 127.0.0.1 no avisan: no se ven desde la red.",
+        en: "Ports on 127.0.0.1 only do not alert: the network cannot reach them.",
+    },
+    hunt_net_ports_on_127_0_0_1_only_alert_too => {
+        es: "También avisan los puertos solo de 127.0.0.1.",
+        en: "Ports on 127.0.0.1 only alert too.",
+    },
+    hunt_net_connections_by_process => {
+        es: "Conexiones por proceso",
+        en: "Connections by process",
+    },
+    hunt_net_no_process_holds_a_network_socket => {
+        es: "ningún proceso tiene sockets de red",
+        en: "no process holds a network socket",
+    },
+    hunt_net_alert => { es: "¡ALERTA!", en: "ALERT!" },
+    hunt_net_listen => { es: "escucha", en: "listen" },
+    hunt_net_connected => { es: "conexión", en: "connected" },
+    hunt_net_expected_ports_etc_hunter_ports => {
+        es: "Puertos esperados (/etc/hunter/ports)",
+        en: "Expected ports (/etc/hunter/ports)",
+    },
+    hunt_net_remove => { es: "Quitar", en: "Remove" },
+    hunt_net_more_hunterctl_net => { es: "más (hunterctl net)", en: "more (hunterctl net)" },
+    hunt_net_alerts_since_boot => { es: "avisos desde el arranque", en: "alerts since boot" },
+    hunt_sched_schedule_saved => { es: "programación guardada", en: "schedule saved" },
+    hunt_sched_no_etc_hunter_schedule => {
+        es: "No hay /etc/hunter/schedule",
+        en: "No /etc/hunter/schedule",
+    },
+    hunt_sched_this_image_predates_scheduled_scan => {
+        es: "Esta imagen es anterior a los escaneos programados.",
+        en: "This image predates scheduled scans.",
+    },
+    hunt_sched_the_hunter_scheduler_service_runs => {
+        es: "Los lanza el servicio hunter-scheduler, sin esta ventana.",
+        en: "The hunter-scheduler service runs them, window or not.",
+    },
+    hunt_sched_if_the_machine_is_off_then_they_ru => {
+        es: "Si el equipo está apagado a esa hora, se hacen al volver.",
+        en: "If the machine is off then, they run when it is back.",
+    },
+    hunt_sched_scheduled_scan_running => {
+        es: "escaneo programado en curso",
+        en: "scheduled scan running",
+    },
+    hunt_sched_none_has_run_yet => {
+        es: "todavía no se ha hecho ninguno",
+        en: "none has run yet",
+    },
+    hunt_sched_run_now => { es: "Ejecutar ahora", en: "Run now" },
+    hunt_sched_disabled => { es: "desactivado", en: "disabled" },
+    hunt_sched_next_now => { es: "próximo: ahora", en: "next: now" },
+    hunt_sched_next => { es: "próximo:", en: "next:" },
+    hunt_sched_off => { es: "no", en: "off" },
+    hunt_sched_daily => { es: "diario", en: "daily" },
+    hunt_sched_weekly => { es: "semanal", en: "weekly" },
+    hunt_sched_on_a_finding => { es: "Si encuentra algo:", en: "On a finding:" },
+    hunt_sched_alert => { es: "avisar", en: "alert" },
+    hunt_sched_quarantine => { es: "cuarentena", en: "quarantine" },
+
+    hunt_tab_overview => { es: "Resumen", en: "Overview" },
+    hunt_tab_protection => { es: "Protección", en: "Protection" },
+    hunt_tab_events => { es: "Eventos", en: "Events" },
+    hunt_tab_scan => { es: "Escaneo", en: "Scan" },
+    hunt_tab_quarantine => { es: "Cuarentena", en: "Quarantine" },
+    hunt_tab_signatures => { es: "Firmas", en: "Signatures" },
+    hunt_tab_programs => { es: "Programas", en: "Programs" },
+    hunt_tab_scheduled => { es: "Programados", en: "Scheduled" },
+    hunt_tab_network => { es: "Red", en: "Network" },
+    hunt_tab_firewall => { es: "Cortafuegos", en: "Firewall" },
+    hunt_dom_per_process_system_calls => {
+        es: "llamadas al sistema por proceso",
+        en: "per-process system calls",
+    },
+    hunt_dom_writable_executable_memory_w_x => {
+        es: "memoria escribible y ejecutable (W^X)",
+        en: "writable + executable memory (W^X)",
+    },
+    hunt_dom_which_programs_may_run => {
+        es: "qué programas pueden ejecutarse",
+        en: "which programs may run",
+    },
+    hunt_dom_heuristics_floods_fork_bombs => {
+        es: "heurísticas: floods, fork-bombs",
+        en: "heuristics: floods, fork bombs",
+    },
+    hunt_dom_sha_256_of_pinned_programs => {
+        es: "SHA-256 de los programas fijados",
+        en: "SHA-256 of pinned programs",
+    },
+    hunt_dom_signature_antivirus_at_exec => {
+        es: "antivirus por firmas al ejecutar",
+        en: "signature antivirus at exec",
+    },
+    hunt_dom_ransomware_and_process_injection => {
+        es: "ransomware e inyección en procesos",
+        en: "ransomware and process injection",
+    },
+    hunt_sw_learning => { es: "aprendizaje", en: "learning" },
+    hunt_sw_trust_new_programs_on_first_use => {
+        es: "confiar en lo nuevo al primer uso",
+        en: "trust new programs on first use",
+    },
+    hunt_sw_anomaly_detection => { es: "detección de anomalías", en: "anomaly detection" },
+    hunt_sw_flood_and_fork_bomb_counters => {
+        es: "contadores de floods y fork-bombs",
+        en: "flood and fork-bomb counters",
+    },
+    hunt_sw_privileged_deny => { es: "denegar privilegiadas", en: "privileged deny" },
+    hunt_sw_modules_bpf_kexec_ptrace => {
+        es: "módulos, bpf, kexec, ptrace",
+        en: "modules, bpf, kexec, ptrace",
+    },
+    hunt_sw_require_hash => { es: "exigir hash", en: "require hash" },
+    hunt_sw_an_unpinned_program_is_a_violation => {
+        es: "un programa sin fijar es una violación",
+        en: "an unpinned program is a violation",
+    },
+    hunt_sw_scan_usb => { es: "escanear USB", en: "scan USB" },
+    hunt_sw_scan_every_stick_on_mount => {
+        es: "escanear cada pendrive al montarlo",
+        en: "scan every stick or disk when mounted",
+    },
+    hunt_sw_lock_usb => { es: "bloquear USB", en: "lock USB" },
+    hunt_sw_nothing_runs_from_usb_unscanned => {
+        es: "nada se ejecuta del USB sin escanear",
+        en: "nothing runs from USB until scanned",
+    },
+
+    hunt_root_required => { es: "hace falta root", en: "root required" },
+    hunt_proc_hunter_not_responding => {
+        es: "/proc/hunter no responde",
+        en: "/proc/hunter not responding",
+    },
+    hunt_sealed_cannot_relax => {
+        es: "sellado: no se puede relajar",
+        en: "sealed: cannot relax",
+    },
+    hunt_applied => { es: "aplicado", en: "applied" },
+    hunt_scan_cancelled => { es: "escaneo cancelado", en: "scan cancelled" },
+    hunt_no_threats_in => { es: "sin amenazas en", en: "no threats in" },
+    hunt_threats_found => { es: "amenazas encontradas", en: "threats found" },
+    hunt_click_again_to_confirm => {
+        es: "pulsa otra vez para confirmar",
+        en: "click again to confirm",
+    },
+    hunt_sealed_cannot_allow => {
+        es: "sellado: no se puede permitir",
+        en: "sealed: cannot allow",
+    },
+    hunt_there_is_no_hunter_to_read => {
+        es: "no hay hunter que leer",
+        en: "there is no hunter to read",
+    },
+    hunt_report_saved_to => { es: "informe guardado en", en: "report saved to" },
+    hunt_sure => { es: "¿seguro?", en: "sure?" },
+    hunt_exposed => { es: "Expuesto:", en: "Exposed:" },
+    hunt_domain_s_off => { es: "dominio(s) apagado(s)", en: "domain(s) off" },
+    hunt_protected_everything_enforces => {
+        es: "Protegido: todo bloquea",
+        en: "Protected: everything enforces",
+    },
+    hunt_watching => { es: "Vigilando:", en: "Watching:" },
+    hunt_domain_s_only_report => { es: "dominio(s) solo avisan", en: "domain(s) only report" },
+    hunt_sealed => { es: "sellado", en: "sealed" },
+    hunt_read_only_not_root => {
+        es: "solo lectura (no eres root)",
+        en: "read only (not root)",
+    },
+    hunt_this_kernel_has_no_hunter => {
+        es: "Este núcleo no tiene hunter",
+        en: "This kernel has no hunter",
+    },
+    hunt_exec_allowlist => { es: "lista de ejecución", en: "exec allowlist" },
+    hunt_active => { es: "activa", en: "active" },
+    hunt_inactive => { es: "inactiva", en: "inactive" },
+    hunt_seal => { es: "sello", en: "seal" },
+    hunt_events => { es: "eventos", en: "events" },
+    hunt_blocked => { es: "bloqueos", en: "blocked" },
+    hunt_warnings => { es: "avisos", en: "warnings" },
+    hunt_critical => { es: "críticos", en: "critical" },
+    hunt_signatures => { es: "firmas", en: "signatures" },
+    hunt_detections => { es: "detecciones", en: "detections" },
+    hunt_pinned_programs => { es: "programas fijados", en: "pinned programs" },
+    hunt_quarantined => { es: "en cuarentena", en: "quarantined" },
+    hunt_quick_actions => { es: "Acciones rápidas", en: "Quick actions" },
+    hunt_scan_home => { es: "Escanear inicio", en: "Scan home" },
+    hunt_update_signatures => { es: "Actualizar firmas", en: "Update signatures" },
+    hunt_lockdown => { es: "Blindar", en: "Lockdown" },
+    hunt_export_report => { es: "Exportar informe", en: "Export report" },
+    hunt_latest_alerts => { es: "Últimas alertas", en: "Latest alerts" },
+    hunt_no_alerts => { es: "sin alertas", en: "no alerts" },
+    hunt_removable_devices => { es: "Dispositivos extraíbles", en: "Removable devices" },
+    hunt_scan => { es: "Escanear", en: "Scan" },
+    hunt_domains => { es: "Dominios", en: "Domains" },
+    hunt_switches => { es: "Interruptores", en: "Switches" },
+    hunt_save_as_boot_policy => {
+        es: "Guardar como política de arranque",
+        en: "Save as boot policy",
+    },
+    hunt_apply_policy_conf => { es: "Aplicar policy.conf", en: "Apply policy.conf" },
+    hunt_seal_2 => { es: "Sellar", en: "Seal" },
+    hunt_all => { es: "Todos", en: "All" },
+    hunt_alerts => { es: "Alertas", en: "Alerts" },
+    hunt_critical_2 => { es: "Críticos", en: "Critical" },
+    hunt_dropped => { es: "descartados", en: "dropped" },
+    hunt_in_the_ring => { es: "en el anillo", en: "in the ring" },
+    hunt_no_events => { es: "sin eventos", en: "no events" },
+    hunt_what_to_scan => { es: "Qué escanear:", en: "What to scan:" },
+    hunt_automatic_quarantine => { es: "Cuarentena automática", en: "Automatic quarantine" },
+    hunt_listing_files => { es: "listando archivos...", en: "listing files..." },
+    hunt_threats => { es: "amenazas", en: "threats" },
+    hunt_unreadable => { es: "ilegibles", en: "unreadable" },
+    hunt_quarantine_all => { es: "Cuarentena a todo", en: "Quarantine all" },
+    hunt_the_quarantine_is_empty => {
+        es: "la cuarentena está vacía",
+        en: "the quarantine is empty",
+    },
+    hunt_restore => { es: "Restaurar", en: "Restore" },
+    hunt_signatures_loaded => { es: "firmas cargadas", en: "signatures loaded" },
+    hunt_by_sha_256_hash => { es: "por hash SHA-256", en: "by SHA-256 hash" },
+    hunt_byte_patterns => { es: "patrones de bytes", en: "byte patterns" },
+    hunt_update_now => { es: "Actualizar ahora", en: "Update now" },
+    hunt_feeds_etc_hunter_feeds => {
+        es: "Fuentes (/etc/hunter/feeds)",
+        en: "Feeds (/etc/hunter/feeds)",
+    },
+    hunt_none => { es: "ninguna", en: "none" },
+    hunt_trusted => { es: "de confianza", en: "trusted" },
+    hunt_learned => { es: "aprendidos", en: "learned" },
+    hunt_blacklisted => { es: "lista negra", en: "blacklisted" },
+    hunt_pinned_kernel_disk => { es: "fijados núcleo/disco", en: "pinned kernel/disk" },
+    hunt_verify_integrity => { es: "Verificar integridad", en: "Verify integrity" },
+    hunt_enforce_waits_for_you => {
+        es: "Bloqueo: espera tu respuesta",
+        en: "Enforce: waits for you",
+    },
+    hunt_then_blocks => { es: ", si no, bloquea.", en: ", then blocks." },
+    hunt_questions => { es: "Preguntas", en: "Questions" },
+    hunt_allow => { es: "¿Permitir que", en: "Allow" },
+    hunt_to_connect_to_the_network => {
+        es: "se conecte a la red?",
+        en: "to connect to the network?",
+    },
+    hunt_to_listen_on_port => { es: "escuche en el puerto", en: "to listen on port" },
+    hunt_block => { es: "Bloquear", en: "Block" },
+    hunt_allow_2 => { es: "Permitir", en: "Allow" },
+    hunt_ignore => { es: "Ignorar", en: "Ignore" },
+    hunt_attempt_s => { es: "intento(s)", en: "attempt(s)" },
+    hunt_ago => { es: "hace", en: "ago" },
+    hunt_and => { es: "y", en: "and" },
+    hunt_rules => { es: "Reglas", en: "Rules" },
+    hunt_allowed => { es: "permitido", en: "allowed" },
+    hunt_blocked_2 => { es: "bloqueado", en: "blocked" },
+    hunt_both => { es: "ambas", en: "both" },
+    hunt_out => { es: "salida", en: "out" },
+    hunt_in => { es: "entrada", en: "in" },
+    hunt_forget => { es: "Olvidar", en: "Forget" },
+    hunt_hunter_rejected_the_change_nothing => {
+        es: "hunter rechazó el cambio; no se aplicó nada",
+        en: "hunter rejected the change; nothing was applied",
+    },
+    hunt_the_command_failed_see_the_console => {
+        es: "la orden falló (ver la consola)",
+        en: "the command failed (see the console)",
+    },
+    hunt_applied_and_saved_to_etc_hunter_fi => {
+        es: "aplicado y guardado en /etc/hunter/firewall",
+        en: "applied and saved to /etc/hunter/firewall",
+    },
+    hunt_saved_to_etc_hunter_policy_conf_ap => {
+        es: "guardado en /etc/hunter/policy.conf: se aplicará al arrancar",
+        en: "saved to /etc/hunter/policy.conf: applied at boot",
+    },
+    hunt_no_proc_hunter_lunarhunter_needs_t => {
+        es: "No hay /proc/hunter. lunarhunter necesita el núcleo de Eclipse OS.",
+        en: "No /proc/hunter. lunarhunter needs the Eclipse OS kernel.",
+    },
+    hunt_no_device_mounted_they_are_scanned => {
+        es: "ningún dispositivo montado: se escanean al conectarlos",
+        en: "no device mounted: they are scanned when plugged in",
+    },
+    hunt_no_device_mounted_scan_usb_is_off => {
+        es: "ningún dispositivo montado (escanear USB está apagado)",
+        en: "no device mounted (scan USB is off)",
+    },
+    hunt_sealing_is_one_way_until_reboot_se => {
+        es: "Sellar es de un solo sentido: hasta reiniciar solo se puede endurecer.",
+        en: "Sealing is one way: until reboot, settings can only tighten.",
+    },
+    hunt_files_live_in_var_lib_hunter_quara => {
+        es: "Los archivos están en /var/lib/hunter/quarantine, con permisos 000.",
+        en: "Files live in /var/lib/hunter/quarantine, mode 000.",
+    },
+    hunt_restoring_does_not_lift_the_deny_o => {
+        es: "Restaurar no quita la denegación de su ruta hasta reiniciar.",
+        en: "Restoring does not lift the deny on its path until reboot.",
+    },
+    hunt_signature_files_loaded_at_boot => {
+        es: "Archivos de firmas (se cargan al arrancar)",
+        en: "Signature files (loaded at boot)",
+    },
+    hunt_save_learned_to_the_whitelist => {
+        es: "Guardar aprendidos en la whitelist",
+        en: "Save learned to the whitelist",
+    },
+    hunt_learned_programs_trusted_on_first => {
+        es: "Programas aprendidos (confiados al primer uso)",
+        en: "Learned programs (trusted on first use)",
+    },
+    hunt_this_kernel_has_no_firewall => {
+        es: "Este núcleo no tiene cortafuegos",
+        en: "This kernel has no firewall",
+    },
+    hunt_no_proc_hunter_firewall_a_newer_hu => {
+        es: "No hay /proc/hunter_firewall: hace falta un hunter más nuevo.",
+        en: "No /proc/hunter_firewall: a newer hunter is needed.",
+    },
+    hunt_no_program_is_waiting_for_an_answe => {
+        es: "Ningún programa espera respuesta.",
+        en: "No program is waiting for an answer.",
+    },
+    hunt_no_rules_yet_answering_a_question => {
+        es: "Todavía no hay reglas: se crean al responder.",
+        en: "No rules yet: answering a question makes one.",
+    },
+
 
     // ── lunarmon: the system monitor ──────────────────────────────────────
     /// `firefox es parte del escritorio: pulsa otra vez para confirmar`. The

@@ -47,21 +47,14 @@ fn local_time(secs: u64, off: i64) -> String {
 
 fn job_label(lang: Lang, name: &str) -> String {
     match name {
-        "quick" => tr(lang, "Rápido", "Quick").into(),
-        "full" => tr(lang, "Completo", "Full").into(),
+        "quick" => lang.s(Key::hunt_sched_quick).into(),
+        "full" => lang.s(Key::hunt_sched_full).into(),
         _ => name.into(),
     }
 }
 
 fn day_label(lang: Lang, d: u8) -> &'static str {
-    const ES: [&str; 7] = [
-        "lunes", "martes", "miérc.", "jueves", "viernes", "sábado", "domingo",
-    ];
-    const EN: [&str; 7] = [
-        "Monday", "Tuesday", "Wednes.", "Thursday", "Friday", "Saturday", "Sunday",
-    ];
-    let d = d as usize % 7;
-    tr(lang, ES[d], EN[d])
+    lang.weekday_long()[d as usize % 7]
 }
 
 /// The words `hunterctl schedule` takes for `job` with one field changed.
@@ -131,14 +124,11 @@ impl State {
             }
             Some(l) if !out.ok => self.say(l.trim_start_matches("hunterctl: ").to_string(), true),
             _ if !out.ok => {
-                let m = self.t(
-                    "la orden falló (ver la consola)",
-                    "the command failed (see the console)",
-                );
+                let m = self.lang.s(Key::hunt_the_command_failed_see_the_console);
                 self.say(m, true);
             }
             _ => {
-                let m = self.t("programación guardada", "schedule saved");
+                let m = self.lang.s(Key::hunt_sched_schedule_saved);
                 self.say(m, false);
             }
         }
@@ -148,22 +138,22 @@ impl State {
 /// A run's outcome in a few words, and its colour.
 fn run_status(lang: Lang, r: &sched::Run) -> (String, Rgb) {
     match r.status.as_str() {
-        "clean" => (tr(lang, "limpio", "clean").to_string(), OK),
+        "clean" => (lang.s(Key::hunt_sched_clean).to_string(), OK),
         "infected" if r.quarantined > 0 => (
             format!(
                 "{} {}, {} {}",
-                tr(lang, "amenazas:", "threats:"),
+                lang.s(Key::hunt_sched_threats),
                 r.infected,
-                tr(lang, "aisladas:", "quarantined:"),
+                lang.s(Key::hunt_sched_quarantined),
                 r.quarantined
             ),
             CRIT,
         ),
         "infected" => (
-            format!("{} {}", tr(lang, "amenazas:", "threats:"), r.infected),
+            format!("{} {}", lang.s(Key::hunt_sched_threats), r.infected),
             CRIT,
         ),
-        _ => (tr(lang, "falló", "failed").to_string(), WARN),
+        _ => (lang.s(Key::hunt_sched_failed).to_string(), WARN),
     }
 }
 
@@ -177,17 +167,15 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let off = local_offset(now);
     if !s.present {
         g.bold(
-            st.t("No hay /etc/hunter/schedule", "No /etc/hunter/schedule"),
+            st.lang.s(Key::hunt_sched_no_etc_hunter_schedule),
             x,
             y,
             CRIT,
         );
         g.text(
             &fit(
-                st.t(
-                    "Esta imagen es anterior a los escaneos programados.",
-                    "This image predates scheduled scans.",
-                ),
+                st.lang
+                    .s(Key::hunt_sched_this_image_predates_scheduled_scan),
                 w,
             ),
             x,
@@ -197,14 +185,9 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         return ((x, y, w, 0), 0);
     }
     let help = [
-        st.t(
-            "Los lanza el servicio hunter-scheduler, sin esta ventana.",
-            "The hunter-scheduler service runs them, window or not.",
-        ),
-        st.t(
-            "Si el equipo está apagado a esa hora, se hacen al volver.",
-            "If the machine is off then, they run when it is back.",
-        ),
+        st.lang.s(Key::hunt_sched_the_hunter_scheduler_service_runs),
+        st.lang
+            .s(Key::hunt_sched_if_the_machine_is_off_then_they_ru),
     ];
     for (k, l) in help.iter().enumerate() {
         g.text(&fit(l, w), x, y + k as i32 * (GLYPH_H + 4), p.dim);
@@ -219,11 +202,11 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
 
     // ── the history ──
     cy += 4;
-    g.section(x, cy, w, st.t("Historial", "History"));
+    g.section(x, cy, w, st.lang.s(Key::www_history));
     if let Some(pid) = s.running {
         let m = format!(
             "{} (pid {pid})",
-            st.t("escaneo programado en curso", "scheduled scan running")
+            st.lang.s(Key::hunt_sched_scheduled_scan_running)
         );
         let mw = Canvas::text_width(&m);
         g.text(&m, x + w - mw, cy, WARN);
@@ -237,7 +220,7 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let top = st.scroll.min(max);
     if s.history.is_empty() {
         g.text(
-            st.t("todavía no se ha hecho ninguno", "none has run yet"),
+            st.lang.s(Key::hunt_sched_none_has_run_yet),
             x,
             cy + 4,
             p.dim,
@@ -265,15 +248,15 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         let mut cx = 28;
         if wide {
             let how = if r.trigger == "manual" {
-                tr(lang, "a mano", "manual")
+                lang.s(Key::hunt_sched_manual)
             } else {
-                tr(lang, "reloj", "clock")
+                lang.s(Key::hunt_sched_clock)
             };
             g.text(how, col(cx), ry, p.dim);
             cx += 7;
         }
         g.text(
-            &format!("{} {}", r.files, tr(lang, "arch.", "files")),
+            &format!("{} {}", r.files, lang.s(Key::hunt_sched_files)),
             col(cx),
             ry,
             p.text,
@@ -327,14 +310,14 @@ fn job_card(
     // Row 1: the name, the next run, run now.
     let name = job_label(lang, &j.name);
     g.bold(&name, ix, mid(0), p.text);
-    let run = st.t("Ejecutar ahora", "Run now");
+    let run = st.lang.s(Key::hunt_sched_run_now);
     let rw = Canvas::text_width(run) + 24;
     let nx = ix + Canvas::text_width(&name) + 16;
     let next = match sched::next_slot(j.last.unwrap_or(now), j.when, j.at, off) {
-        None => st.t("desactivado", "disabled").to_string(),
+        None => st.lang.s(Key::hunt_sched_disabled).to_string(),
         // Due already: the scheduler looks once a minute.
-        Some(n) if n <= now => st.t("próximo: ahora", "next: now").to_string(),
-        Some(n) => format!("{} {}", st.t("próximo:", "next:"), local_time(n, off)),
+        Some(n) if n <= now => st.lang.s(Key::hunt_sched_next_now).to_string(),
+        Some(n) => format!("{} {}", st.lang.s(Key::hunt_sched_next), local_time(n, off)),
     };
     let nc = if j.when == When::Off { WARN } else { p.text };
     g.text(&fit(&next, ix + iw - rw - 12 - nx), nx, mid(0), nc);
@@ -359,9 +342,9 @@ fn job_card(
         _ => 6,
     };
     let labels = [
-        st.t("no", "off"),
-        st.t("diario", "daily"),
-        st.t("semanal", "weekly"),
+        st.lang.s(Key::hunt_sched_off),
+        st.lang.s(Key::hunt_sched_daily),
+        st.lang.s(Key::hunt_sched_weekly),
     ];
     let whens = [When::Off, When::Daily, When::Weekly(day)];
     g.segments(
@@ -409,12 +392,15 @@ fn job_card(
 
     // Row 3: what a finding gets; the paths. (The last run is the history's
     // top line, right under the cards.)
-    let lead = st.t("Si encuentra algo:", "On a finding:");
+    let lead = st.lang.s(Key::hunt_sched_on_a_finding);
     g.text(lead, ix, mid(2), p.dim);
     let mut bx = ix + Canvas::text_width(lead) + 10;
-    for (k, label) in [st.t("avisar", "alert"), st.t("cuarentena", "quarantine")]
-        .into_iter()
-        .enumerate()
+    for (k, label) in [
+        st.lang.s(Key::hunt_sched_alert),
+        st.lang.s(Key::hunt_sched_quarantine),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let on = j.quarantine == (k == 1);
         let look = if on { Style::Primary } else { Style::Normal };
