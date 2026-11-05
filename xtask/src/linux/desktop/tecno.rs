@@ -9,7 +9,8 @@
 //! blue, so today the frame and the bar do not match.
 //!
 //! What makes it "tecno" is not the hue. The panel draws the same layout as
-//! `eclipse` with its plates cut at 45° instead of rounded, its module labels
+//! `eclipse` with square plates framed by a 1px hairline instead of rounded,
+//! gold focus brackets on its popups and launcher, its module labels
 //! in capitals and its meters segmented (see `Look::Tecno` in
 //! `tools/lunarbar`). This file supplies the two pieces the panel cannot
 //! draw: the window frame, which belongs to labwc, and foot's palette.
@@ -18,12 +19,12 @@
 //!
 //! | role | hex |
 //! |---|---|
-//! | ground | `#060b12` |
-//! | plate / titlebar | `#08161d` |
-//! | border, separators | `#1d5e6e` |
-//! | accent (focus, selection) | `#3ad7e8` |
-//! | text | `#dff4f7` |
-//! | dim text | `#4a6b75` |
+//! | ground | `#060b14` |
+//! | plate / titlebar | `#0a1423` |
+//! | border, separators | `#1d3550` |
+//! | accent (focus, selection) | `#38e1ff` |
+//! | text | `#e6f1ff` |
+//! | dim text | `#8aa4c2` |
 
 use std::{fs, path::Path};
 
@@ -51,30 +52,30 @@ fn write_theme(rootfs: &Path) {
           padding.width: 8\n\
           padding.height: 5\n\
           \n\
-          window.active.border.color: #3ad7e8\n\
-          window.inactive.border.color: #163c45\n\
-          window.active.title.bg.color: #08161d\n\
-          window.inactive.title.bg.color: #060b12\n\
-          window.active.label.text.color: #dff4f7\n\
-          window.inactive.label.text.color: #4a6b75\n\
-          window.active.button.unpressed.image.color: #dff4f7\n\
-          window.active.button.pressed.image.color: #3ad7e8\n\
-          window.active.button.hover.image.color: #f2fbfd\n\
-          window.inactive.button.unpressed.image.color: #4a6b75\n\
+          window.active.border.color: #38e1ff\n\
+          window.inactive.border.color: #1d3550\n\
+          window.active.title.bg.color: #0a1423\n\
+          window.inactive.title.bg.color: #060b14\n\
+          window.active.label.text.color: #e6f1ff\n\
+          window.inactive.label.text.color: #8aa4c2\n\
+          window.active.button.unpressed.image.color: #e6f1ff\n\
+          window.active.button.pressed.image.color: #f2c14e\n\
+          window.active.button.hover.image.color: #f5f9ff\n\
+          window.inactive.button.unpressed.image.color: #8aa4c2\n\
           \n\
-          menu.title.bg.color: #08161d\n\
-          menu.title.text.color: #3ad7e8\n\
-          menu.items.bg.color: #050d13\n\
-          menu.items.text.color: #dff4f7\n\
-          menu.items.disabled.text.color: #3b545c\n\
-          menu.items.active.bg.color: #102833\n\
-          menu.items.active.text.color: #3ad7e8\n\
-          menu.separator.color: #1d5e6e\n\
+          menu.title.bg.color: #0a1423\n\
+          menu.title.text.color: #38e1ff\n\
+          menu.items.bg.color: #080e1a\n\
+          menu.items.text.color: #e6f1ff\n\
+          menu.items.disabled.text.color: #3a5878\n\
+          menu.items.active.bg.color: #0c2a3a\n\
+          menu.items.active.text.color: #38e1ff\n\
+          menu.separator.color: #1d3550\n\
           menu.separator.padding.height: 4\n\
           \n\
-          osd.bg.color: #050d13\n\
-          osd.border.color: #3ad7e8\n\
-          osd.label.text.color: #dff4f7\n\
+          osd.bg.color: #080e1a\n\
+          osd.border.color: #38e1ff\n\
+          osd.label.text.color: #e6f1ff\n\
           \n\
           # Drop shadows (labwc >= 0.8; ignored by older builds). Kept tight\n\
           # and dark: this look leans on a hairline border, and a soft wide\n\
@@ -95,6 +96,9 @@ fn write_foot(rootfs: &Path) {
     let dir = rootfs.join("root/.config/foot");
     let _ = fs::create_dir_all(&dir);
     fs::write(dir.join("foot.tecno.ini"), super::foot_ini(FOOT_TECNO)).unwrap();
+    // tecno is the default look, so the terminal starts in it too
+    // (`write_foot_config` ran first and wrote eclipse's).
+    fs::write(dir.join("foot.ini"), super::foot_ini(FOOT_TECNO)).unwrap();
 }
 
 /// The terminal palette. Cyan and mint carry the "live" end of the ramp
@@ -102,11 +106,11 @@ fn write_foot(rootfs: &Path) {
 /// kept as the warm orange `#ff8a5c` the panel warns in, so "bad" means the
 /// same colour in the bar and in the terminal.
 const FOOT_TECNO: &str = "\
-background=060b12\nforeground=dff4f7\n\
-regular0=0a141b\nregular1=ff8a5c\nregular2=7af0c8\nregular3=ffd27a\n\
-regular4=3ad7e8\nregular5=9ab8ff\nregular6=5fe0d8\nregular7=bcd8de\n\
-bright0=1d5e6e\nbright1=ffa98a\nbright2=a8ffe0\nbright3=ffe3a8\n\
-bright4=7ae8f5\nbright5=bcd0ff\nbright6=9af0ea\nbright7=f2fbfd\n";
+background=060b14\nforeground=e6f1ff\n\
+regular0=0a1423\nregular1=ff8a5c\nregular2=7af0c8\nregular3=f2c14e\n\
+regular4=38e1ff\nregular5=9ab8ff\nregular6=5fe0d8\nregular7=bcd8de\n\
+bright0=1d3550\nbright1=ffa98a\nbright2=a8ffe0\nbright3=f7d685\n\
+bright4=7ae8f5\nbright5=bcd0ff\nbright6=9af0ea\nbright7=f5f9ff\n";
 
 #[cfg(test)]
 mod tests {
@@ -136,12 +140,12 @@ mod tests {
         let rc = fs::read_to_string(dir.join("usr/share/themes/Tecno-Dark/openbox-3/themerc"))
             .expect("Tecno-Dark themerc");
         for (role, hex) in [
-            ("the accent on the focused border", "#3ad7e8"),
-            ("the titlebar plate", "#08161d"),
-            ("the ground behind an unfocused title", "#060b12"),
-            ("the text", "#dff4f7"),
-            ("the dim text", "#4a6b75"),
-            ("the separator", "#1d5e6e"),
+            ("the accent on the focused border", "#38e1ff"),
+            ("the titlebar plate", "#0a1423"),
+            ("the ground behind an unfocused title", "#060b14"),
+            ("the text", "#e6f1ff"),
+            ("the dim text", "#8aa4c2"),
+            ("the separator", "#1d3550"),
         ] {
             assert!(
                 rc.contains(hex),
@@ -151,10 +155,10 @@ mod tests {
         // The focused window is told apart by TWO things, not one: this stack
         // only draws shadows on labwc >= 0.8 and the image's labwc comes from
         // the rootfs's package manager, so a single cue can be the only cue.
-        assert!(rc.contains("window.active.border.color: #3ad7e8"));
-        assert!(rc.contains("window.inactive.border.color: #163c45"));
-        assert!(rc.contains("window.active.title.bg.color: #08161d"));
-        assert!(rc.contains("window.inactive.title.bg.color: #060b12"));
+        assert!(rc.contains("window.active.border.color: #38e1ff"));
+        assert!(rc.contains("window.inactive.border.color: #1d3550"));
+        assert!(rc.contains("window.active.title.bg.color: #0a1423"));
+        assert!(rc.contains("window.inactive.title.bg.color: #060b14"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -205,15 +209,15 @@ mod tests {
         let ini = fs::read_to_string(dir.join("root/.config/foot/foot.tecno.ini"))
             .expect("foot.tecno.ini");
         assert!(
-            ini.contains("background=060b12"),
+            ini.contains("background=060b14"),
             "not the tecno ground:\n{ini}"
         );
         assert!(
-            ini.contains("foreground=dff4f7"),
+            ini.contains("foreground=e6f1ff"),
             "not the tecno text:\n{ini}"
         );
         assert!(
-            ini.contains("regular4=3ad7e8"),
+            ini.contains("regular4=38e1ff"),
             "the accent is not in the ramp:\n{ini}"
         );
         // Through `foot_ini`, so it inherits the single render worker and the

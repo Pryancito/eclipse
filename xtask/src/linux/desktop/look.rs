@@ -77,7 +77,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           current() {\n\
           \x20 f=$(file_look)\n\
           \x20 if look_ok \"$f\"; then echo \"$f\"; return; fi\n\
-          \x20 echo eclipse\n\
+          \x20 echo tecno\n\
           }\n\
           \n\
           resolve_boot() {\n\
@@ -148,5 +148,5 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
     }
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
-    fs::write(etc.join("look"), b"look=eclipse\n").unwrap();
+    fs::write(etc.join("look"), b"look=tecno\n").unwrap();
 }

@@ -190,7 +190,7 @@ pub fn plot(
 mod tests {
     use super::*;
 
-    const CALM: Rgb = (0x3a, 0xd7, 0xe8);
+    const CALM: Rgb = (0x38, 0xe1, 0xff);
     const HOT: Rgb = (0xff, 0x8a, 0x5c);
 
     fn ring_of(v: &[f32]) -> Ring {
