@@ -354,15 +354,16 @@ pub fn fmt_ticks(t: u64) -> String {
 }
 
 /// The state word a person reads, and whether it is a problem.
-pub fn state_word(state: &str) -> (&'static str, bool) {
-    match state {
-        "running" => ("en marcha", false),
-        "waiting" => ("reintentando", true),
-        "stopped" => ("parado", false),
-        "given-up" => ("abandonado", true),
-        "idle" => ("sin proceso", false),
-        _ => ("desconocido", true),
-    }
+pub fn state_word(state: &str, lang: crate::i18n::Lang) -> (&'static str, bool) {
+    let (es, en, bad) = match state {
+        "running" => ("en marcha", "running", false),
+        "waiting" => ("reintentando", "retrying", true),
+        "stopped" => ("parado", "stopped", false),
+        "given-up" => ("abandonado", "given up", true),
+        "idle" => ("sin proceso", "no process", false),
+        _ => ("desconocido", "unknown", true),
+    };
+    (if lang == crate::i18n::Lang::En { en } else { es }, bad)
 }
 
 #[cfg(test)]
@@ -410,7 +411,8 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!((s[0].pid, s[0].started, s[0].log.as_deref()), (Some(455), Some(1793865120), Some("/tmp/ntpd.log")));
         assert_eq!((s[1].pid, s[1].log.clone(), s[1].exec.as_str()), (None, None, "/bin/mount -a"));
-        assert_eq!(state_word("given-up"), ("abandonado", true));
+        assert_eq!(state_word("given-up", crate::i18n::Lang::Es), ("abandonado", true));
+        assert_eq!(state_word("given-up", crate::i18n::Lang::En), ("given up", true));
     }
 
     #[test]
