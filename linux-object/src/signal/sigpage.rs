@@ -131,14 +131,21 @@ pub fn map_into(vmar: &Arc<VmAddressRegion>, below: VirtAddr) -> Option<VirtAddr
         let (base, offset) = placement(below, vmar.addr())?;
         let vmo = VmObject::new_paged(1);
         if let Err(e) = vmo.write(0, &trampoline()) {
-            warn!("sigpage: no se pudo escribir el trampolín: {:?}", e);
+            warn!("sigpage: cannot write the trampoline: {:?}", e);
             return None;
         }
         // Read and execute, never write: a process that could write it could
         // only lie to itself, but there is no reason to allow even that.
         let flags = MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER;
-        // `map_range: true` — one PTE, installed now. The alternative is a
-        // page fault on the way out of every first signal handler.
+        // Named rather than passed positionally: `map_ext` takes three
+        // bare booleans in a row, and which one is which is not visible at
+        // the call site.
+        //
+        // `map_range` installs the PTE now. The alternative is a page fault
+        // on the way out of every first signal handler.
+        let overwrite = false;
+        let map_range = true;
+        let allow_faults = false;
         match vmar.map_ext(
             Some(offset),
             vmo,
@@ -146,16 +153,16 @@ pub fn map_into(vmar: &Arc<VmAddressRegion>, below: VirtAddr) -> Option<VirtAddr
             PAGE_SIZE,
             flags,
             flags,
-            false,
-            true,
-            false,
+            overwrite,
+            map_range,
+            allow_faults,
         ) {
             Ok(addr) => {
-                debug!("sigpage: mapeada en {:#x}", addr);
+                debug!("sigpage: mapped at {:#x}", addr);
                 Some(addr)
             }
             Err(e) => {
-                warn!("sigpage: no se pudo mapear en {:#x}: {:?}", base, e);
+                warn!("sigpage: cannot map at {:#x}: {:?}", base, e);
                 None
             }
         }

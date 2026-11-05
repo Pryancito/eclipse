@@ -1120,6 +1120,31 @@ fn handle_signal(
             return ctx;
         }
     };
+    // Work out the return address before anything is pushed: a handler we
+    // cannot bring back is one we must not enter. Without a restorer and
+    // without the kernel's trampoline its `ret` goes to address 0, which is
+    // the fault this whole path exists to stop (`/sbin/init` dying `pc=0
+    // ra=0`). Dying here instead costs the process the same life but names
+    // the reason, and it is what the "nowhere to put the frame" case above
+    // already does.
+    #[cfg(not(target_arch = "x86_64"))]
+    let ra = match return_address(thread, &action) {
+        Some(ra) => ra,
+        None => {
+            error!(
+                "[exit] pid={} no way back from the {:?} handler: no restorer \
+                 and no sigreturn trampoline (forcing SIGSEGV)",
+                thread.proc().id(),
+                signal,
+            );
+            thread
+                .proc()
+                .exit(linux_object::process::exit_code_killed_by(
+                    Signal::SIGSEGV as u8,
+                ));
+            return ctx;
+        }
+    };
     #[cfg(target_arch = "x86_64")]
     if thread.proc().linux().abi().is_32bit() {
         if !want_siginfo {
@@ -1153,7 +1178,7 @@ fn handle_signal(
     // other handlers have been entered (and perhaps never left) since.
     thread.backup_context(*ctx, siginfo_ptr, uctx_ptr, sigreturn_sp(sp));
     #[cfg(not(target_arch = "x86_64"))]
-    ctx.set_ra(return_address(thread, &action));
+    ctx.set_ra(ra);
     // set trapframe
     ctx.setup_uspace(
         action.handler,
@@ -1573,22 +1598,28 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
 /// (musl, which defines `SA_RESTORER` for riscv64) keeps the path it had.
 /// The kernel's trampoline is the fallback, and the only thing that changes
 /// is that a zero is no longer entered as if it were code.
+/// `None` means there is no way back out of the handler: no restorer and no
+/// trampoline. The caller must not enter the handler then — see the call
+/// site. Returning 0 and entering it anyway is the bug this function exists
+/// to remove, just moved one frame later.
 #[cfg(not(target_arch = "x86_64"))]
-fn return_address(thread: &CurrentThread, action: &SignalAction) -> usize {
-    if action.restorer != 0 {
-        return action.restorer;
+fn return_address(thread: &CurrentThread, action: &SignalAction) -> Option<usize> {
+    handler_return_address(
+        action.restorer,
+        thread.proc().linux().sigreturn_trampoline(),
+    )
+}
+
+/// The choice itself, with no thread to reach into, so the x86_64 the CI runs
+/// its tests on can check it. Unused on x86_64 outside those tests: there the
+/// ABI requires `SA_RESTORER` and the kernel answers `EINVAL` without one.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn handler_return_address(restorer: usize, trampoline: usize) -> Option<usize> {
+    match (restorer, trampoline) {
+        (0, 0) => None,
+        (0, trampoline) => Some(trampoline),
+        (restorer, _) => Some(restorer),
     }
-    let trampoline = thread.proc().linux().sigreturn_trampoline();
-    if trampoline == 0 {
-        // Nothing to offer, which is what every build before the sigpage
-        // existed did: leave it as it was rather than invent an address.
-        warn!(
-            "pid={} has no restorer and no sigreturn trampoline: its handler \
-             will return to 0",
-            thread.proc().id()
-        );
-    }
-    trampoline
 }
 
 fn sigreturn_sp(handler_sp: usize) -> usize {
@@ -3275,5 +3306,38 @@ mod syscall_restart_tests {
     fn the_six_argument_registers_are_read_in_abi_order() {
         let ctx = a_call_with_distinct_registers();
         assert_eq!(syscall_args(&ctx), SIX);
+    }
+}
+
+#[cfg(test)]
+mod handler_return_address_tests {
+    //! Which address a signal handler returns through, and the one case where
+    //! there is none. The caller must not enter a handler it cannot bring
+    //! back: without a return address its `ret` goes to 0, which is exactly
+    //! the fault the kernel's trampoline exists to stop.
+
+    use super::handler_return_address;
+
+    #[test]
+    fn a_restorer_from_the_libc_wins() {
+        // musl defines `SA_RESTORER` for riscv64 and points it at its own
+        // `__restore`, so that path must not change.
+        assert_eq!(
+            handler_return_address(0x16f052, 0x7fff_0000),
+            Some(0x16f052)
+        );
+    }
+
+    #[test]
+    fn without_a_restorer_the_kernels_trampoline_is_used() {
+        // What glibc, and any program issuing `rt_sigaction` itself, leaves.
+        assert_eq!(handler_return_address(0, 0x7fff_0000), Some(0x7fff_0000));
+    }
+
+    #[test]
+    fn with_neither_there_is_no_address_at_all() {
+        // Not `Some(0)`: a zero here used to be loaded into the return
+        // register and jumped to, which is how `/sbin/init` died `pc=0 ra=0`.
+        assert_eq!(handler_return_address(0, 0), None);
     }
 }
