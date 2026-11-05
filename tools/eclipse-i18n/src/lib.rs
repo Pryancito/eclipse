@@ -101,6 +101,22 @@ impl Lang {
         }
     }
 
+    /// The same number, written the way the language writes it: `2.1` stays
+    /// `2.1` in English and becomes `2,1` in Spanish.
+    ///
+    /// Every caller had the same `replace('.', &lang.decimal_point()
+    /// .to_string())` line, which built a one-character `String` on each call
+    /// and rewrote the number even when there was nothing to change. English
+    /// hands the string straight back here, so only Spanish pays anything.
+    pub fn decimals(self, n: String) -> String {
+        // `612 MiB` y `3 h 12 min` pasan por aquí igual que `2.1 GiB`, y no
+        // llevan punto: `replace` les daría una `String` nueva idéntica.
+        if self == Lang::En || !n.contains('.') {
+            return n;
+        }
+        n.replace('.', ",")
+    }
+
     // ── the named accessors the panel already called ─────────────────────
     //
     // Before the table existed, lunarbar's `i18n.rs` had one method per
@@ -175,6 +191,51 @@ impl Lang {
         match self {
             Lang::Es => ["dom", "lun", "mar", "mié", "jue", "vie", "sáb"],
             Lang::En => ["sun", "mon", "tue", "wed", "thu", "fri", "sat"],
+        }
+    }
+
+    /// Sunday-first, written out whole: the date line of the lock screen
+    /// (`jueves 5 de noviembre de 2026` / `Thursday 5 November 2026`).
+    ///
+    /// Sunday-first because that is how a `tm_wday` comes out of the clock,
+    /// and whole because the lock screen has the width of the display.
+    pub fn weekday_full(self) -> [&'static str; 7] {
+        match self {
+            Lang::Es => [
+                "domingo",
+                "lunes",
+                "martes",
+                "miércoles",
+                "jueves",
+                "viernes",
+                "sábado",
+            ],
+            Lang::En => [
+                "Sunday",
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+            ],
+        }
+    }
+
+    /// Monday-first, written out: what a scheduled scan says it runs on
+    /// (`cada lunes` / `every Monday`).
+    ///
+    /// `miérc.` and `Wednes.` are cut on purpose: the card they go on is the
+    /// width of a scan job and the longest day name does not fit it in either
+    /// language.
+    pub fn weekday_long(self) -> [&'static str; 7] {
+        match self {
+            Lang::Es => [
+                "lunes", "martes", "miérc.", "jueves", "viernes", "sábado", "domingo",
+            ],
+            Lang::En => [
+                "Monday", "Tuesday", "Wednes.", "Thursday", "Friday", "Saturday", "Sunday",
+            ],
         }
     }
 

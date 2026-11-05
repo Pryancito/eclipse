@@ -223,3 +223,24 @@ fn each_language_has_its_own_decimal_point() {
     assert_eq!(Lang::Es.decimal_point(), ',');
     assert_eq!(Lang::En.decimal_point(), '.');
 }
+
+/// `decimals` writes a whole number the way the language writes it, and leaves
+/// the English one alone: every panel that prints a fraction goes through it,
+/// so a second separator creeping in here would show up in all of them.
+#[test]
+fn decimals_rewrites_only_the_spanish_separator() {
+    assert_eq!(Lang::Es.decimals("2.1 GiB".to_string()), "2,1 GiB");
+    assert_eq!(Lang::En.decimals("2.1 GiB".to_string()), "2.1 GiB");
+    // La media de carga son tres números en la misma cadena.
+    assert_eq!(
+        Lang::Es.decimals("0.84 0.61 0.52".to_string()),
+        "0,84 0,61 0,52"
+    );
+    assert_eq!(
+        Lang::En.decimals("0.84 0.61 0.52".to_string()),
+        "0.84 0.61 0.52"
+    );
+    // Sin punto no cambia nada en ninguno de los dos.
+    assert_eq!(Lang::Es.decimals("612 MiB".to_string()), "612 MiB");
+    assert_eq!(Lang::En.decimals("612 MiB".to_string()), "612 MiB");
+}

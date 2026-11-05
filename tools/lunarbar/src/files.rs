@@ -214,7 +214,7 @@ pub fn human_size(bytes: u64, lang: Lang) -> String {
         u += 1;
     }
     if v < 10.0 {
-        format!("{:.1} {}", v, UNITS[u]).replace('.', &lang.decimal_point().to_string())
+        lang.decimals(format!("{:.1} {}", v, UNITS[u]))
     } else {
         format!("{:.0} {}", v, UNITS[u])
     }

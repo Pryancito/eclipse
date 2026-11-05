@@ -33,7 +33,7 @@ use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::now_secs;
 use lunarbar::runhist::History;
 use lunarbar::fill_guard;
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::icons::IconCache;
 use lunarbar::keys::{
     key_char, BTN_LEFT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
@@ -946,10 +946,7 @@ fn draw_overlay(
         if it.kind == Kind::Calc {
             // The value, large in the row, and what Enter does with it.
             cv.text_bold(&it.name, text_x, ty, if hud { TECNO_GOLD } else { p.accent });
-            let key = match st.lang {
-                Lang::Es => "Intro copia",
-                Lang::En => "Enter copies",
-            };
+            let key = st.lang.s(Key::run_copies);
             let key = if hud { key.to_uppercase() } else { key.to_string() };
             cv.text(&key, fx + fw - Canvas::text_width(&key) - 12, ty, if selected { p.accent } else { p.dim });
             continue;

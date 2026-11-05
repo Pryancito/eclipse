@@ -30,7 +30,7 @@ use std::time::Instant;
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H};
 use lunarbar::files::now_secs;
 use lunarbar::fill_guard;
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::look::Look;
 use lunarbar::proc::{self, free_buffer, map_shm_pool, BUFFERS};
 use wayland_client::{
@@ -148,19 +148,14 @@ fn now() -> i64 {
 
 /// "jueves 5 de noviembre de 2026" / "Thursday 5 November 2026".
 fn date_line(c: &Clock, lang: Lang) -> String {
-    const ES_DAYS: [&str; 7] = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
-    const EN_DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let day = lang.weekday_full()[c.wday];
     let month = lang.month_full()[c.month];
-    match lang {
-        Lang::Es => format!("{} {} de {month} de {}", ES_DAYS[c.wday], c.day, c.year),
-        Lang::En => {
-            let mut m = month.to_string();
-            if let Some(f) = m.get_mut(0..1) {
-                f.make_ascii_uppercase();
-            }
-            format!("{} {} {m} {}", EN_DAYS[c.wday], c.day, c.year)
-        }
-    }
+    // El orden de la fecha no es el mismo en los dos idiomas, así que la frase
+    // entera es la fila y los tres huecos son el día, el mes y el año.
+    lang.s(Key::lock_date)
+        .replacen("{}", &format!("{day} {}", c.day), 1)
+        .replacen("{}", &capitalized(lang, month), 1)
+        .replacen("{}", &c.year.to_string(), 1)
 }
 
 fn hm(c: &Clock) -> String {
@@ -171,19 +166,25 @@ fn hm(c: &Clock) -> String {
 fn locked_for(secs: i64, lang: Lang) -> String {
     let m = secs.max(0) / 60;
     let span = if m < 1 {
-        return match lang {
-            Lang::Es => "ahora mismo".into(),
-            Lang::En => "just now".into(),
-        };
+        return lang.s(Key::lock_just_now).into();
     } else if m < 60 {
         format!("{m} min")
     } else {
         format!("{} h {:02} min", m / 60, m % 60)
     };
-    match lang {
-        Lang::Es => format!("hace {span}"),
-        Lang::En => format!("for {span}"),
+    lang.s(Key::lock_for).replace("{}", &span)
+}
+
+/// El mes en inglés se escribe con mayúscula y en castellano no.
+fn capitalized(lang: Lang, word: &str) -> String {
+    if lang == Lang::Es {
+        return word.to_string();
     }
+    let mut out = word.to_string();
+    if let Some(first) = out.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    out
 }
 
 fn user_at_host() -> String {
@@ -275,17 +276,14 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, f: &Face) {
     // Top left: the state, and since when.
     let lock_s = 16;
     cv.lock_icon(MARGIN, MARGIN, lock_s, p.accent);
-    let state = match f.lang {
-        Lang::Es => "BLOQUEADO",
-        Lang::En => "LOCKED",
-    };
+    let state = f.lang.s(Key::lock_state);
     let tx = MARGIN + lock_s + 8;
     let ty = MARGIN + (lock_s - GLYPH_H) / 2;
     let adv = cv.text_bold(state, tx, ty, p.text);
-    let since = match f.lang {
-        Lang::Es => format!("desde las {} · {}", hm(&f.since), locked_for(f.locked_secs, f.lang)),
-        Lang::En => format!("since {} · {}", hm(&f.since), locked_for(f.locked_secs, f.lang)),
-    };
+    let since = f.lang
+        .s(Key::lock_since)
+        .replacen("{}", &hm(&f.since), 1)
+        .replacen("{}", &locked_for(f.locked_secs, f.lang), 1);
     cv.text(&since, tx + adv + 12, ty, p.dim);
 
     // Top right: whose session this is.
@@ -293,10 +291,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, f: &Face) {
     cv.text(f.who, w - MARGIN - who_w, ty, p.dim);
 
     // Bottom: how to come back, over a hairline.
-    let hint = match f.lang {
-        Lang::Es => "pulsa una tecla o haz clic para volver",
-        Lang::En => "press a key or click to return",
-    };
+    let hint = f.lang.s(Key::lock_hint);
     let hy = h - MARGIN - GLYPH_H;
     cv.hline(MARGIN, hy - 16, w - 2 * MARGIN, p.hairline, 1.0);
     cv.text(hint, (w - Canvas::text_width(hint)) / 2, hy, p.dim);
