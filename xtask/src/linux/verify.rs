@@ -1074,13 +1074,15 @@ mod cableado_tests {
     /// no tiene por que saber que la puerta existe, asi que la cuenta se
     /// comprueba aqui en vez de confiar en que se acuerde.
     ///
-    /// Se leen DOS ficheros: una cache que se mude a un modulo hermano
-    /// (`portal.rs` se llevo la de `eclipse-dbusd`) saldria de la cuenta sin
-    /// que nada lo dijera, que es justo el agujero que esto tapa.
+    /// Se leen VARIOS ficheros: una cache que se mude a un modulo hermano
+    /// (`portal.rs` se llevo la de `eclipse-dbusd`, `i386.rs` las tres de las
+    /// sondas de 32 bits) saldria de la cuenta sin que nada lo dijera, que es
+    /// justo el agujero que esto tapa --- y de hecho la mudanza de `i386.rs`
+    /// dejo este test rojo en la CI, que es lo que tenia que pasar.
     #[test]
     fn toda_cache_de_artefacto_pasa_por_la_puerta_del_arco() {
         let linux = crate::PROJECT_DIR.join("xtask").join("src").join("linux");
-        let src: String = ["mod.rs", "portal.rs"]
+        let src: String = ["mod.rs", "portal.rs", "i386.rs"]
             .iter()
             .map(|f| std::fs::read_to_string(linux.join(f)).unwrap())
             .collect::<Vec<_>>()
@@ -1134,8 +1136,9 @@ mod cableado_tests {
         assert_eq!(
             ajenas, 1,
             "las puertas de maquina ajena eran 1 y ahora son {ajenas}: la unica \
-             esta dentro de `fresh_i386`, que es por donde pasan las caches de \
-             `tools/i386-hello` y `tools/i386-dyn`, ELF32 a proposito las dos"
+             esta dentro de `fresh_i386` (en `i386.rs` desde la tanda 41), que \
+             es por donde pasan las caches de `tools/i386-hello`, \
+             `tools/i386-dyn` y `tools/i386-glibc`, ELF32 a proposito las tres"
         );
     }
 
