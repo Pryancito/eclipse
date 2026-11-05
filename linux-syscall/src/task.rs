@@ -1053,19 +1053,28 @@ impl Syscall<'_> {
         Ok(())
     }
 
-    /// see there for what a created-but-never-started thread costs.
-    #[allow(clippy::too_many_arguments)]
-    fn clone_start(
+    /// The context a new thread starts with: this thread's, with the stack,
+    /// the thread pointer and the return value its ABI asks for.
+    ///
+    /// Its own function so that a test can ask what a thread WOULD start
+    /// with without starting one. A started thread runs the caller's context
+    /// on the host's executor, which in a test is the test harness itself:
+    /// the only honest unit claim about a thread is the context it is handed,
+    /// and the end-to-end claim belongs to the probe (`tools/i386-hello`,
+    /// step 91, where a 32-bit thread really runs on a stack of its own).
+    ///
+    /// Everything a thread inherits is in `context_cloned`, and for a 32-bit
+    /// process that includes the one bit that decides how it comes back:
+    /// `compat32`, which is what `iret` reads to enter compatibility mode.
+    /// A thread of a 32-bit process whose context lost it would return to
+    /// ring 3 in 64-bit mode and decode its own first instruction as
+    /// something else.
+    pub(crate) fn thread_start_context(
         &self,
-        new_thread: &Arc<Thread>,
-        tid: KoID,
         clone_flags: CloneFlags,
         newsp: usize,
         newtls: usize,
-        mut parent_tid: UserOutPtr<i32>,
-        pidfd_slot: UserOutPtr<i32>,
-        mut child_tid: UserOutPtr<i32>,
-    ) -> LxResult<usize> {
+    ) -> LxResult<kernel_hal::context::UserContext> {
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         if clone_flags.contains(CloneFlags::SETTLS) {
@@ -1082,6 +1091,23 @@ impl Syscall<'_> {
             g.rdx = 1;
             g.rflags &= !1;
         }
+        Ok(new_ctx)
+    }
+
+    /// see there for what a created-but-never-started thread costs.
+    #[allow(clippy::too_many_arguments)]
+    fn clone_start(
+        &self,
+        new_thread: &Arc<Thread>,
+        tid: KoID,
+        clone_flags: CloneFlags,
+        newsp: usize,
+        newtls: usize,
+        mut parent_tid: UserOutPtr<i32>,
+        pidfd_slot: UserOutPtr<i32>,
+        mut child_tid: UserOutPtr<i32>,
+    ) -> LxResult<usize> {
+        let new_ctx = self.thread_start_context(clone_flags, newsp, newtls)?;
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
 
         info!("clone: {} -> {}", self.thread.id(), tid);
