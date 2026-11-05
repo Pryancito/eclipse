@@ -1979,6 +1979,10 @@ impl Executor {
         let mut _cr3_pin: Option<(Arc<Task>, usize)> = None;
         let mut polls_since_weak = 0u64;
         let mut barren_weak_turns = 0u32;
+        // The last task this loop released still runnable (preempted or
+        // yielded), until the next pick says whether it was set aside for a
+        // different one. See `runtime::kick_idle_for_set_aside`.
+        let mut set_aside: Option<alloc::sync::Arc<WakerRef>> = None;
         // Entry attribution (see `runtime::WAKE_ENTRY_RESUMED`): this CPU is
         // about to look at its run queue having just arrived on this stack,
         // which is neither "waited for an interrupt" nor "waited out someone
@@ -2083,6 +2087,14 @@ impl Executor {
                 task_info = crate::runtime::steal_task_from_other_cpu();
             }
             if let Some((_key, task, waker_ref)) = task_info {
+                if let Some(prev) = set_aside.take() {
+                    if !alloc::sync::Arc::ptr_eq(&prev, &waker_ref) && prev.waiting_for_cpu() {
+                        crate::runtime::kick_idle_for_set_aside(
+                            prev.allowed_mask(),
+                            prev.owner_cpu(),
+                        );
+                    }
+                }
                 // `waker_ref` is the task's one shared waker (built at insert):
                 // no per-poll `Arc::new`, and the borrowed bit was already set
                 // atomically by the generator under the collection lock —
@@ -2177,6 +2189,12 @@ impl Executor {
                         waker_ref.mark_borrowed(false);
                     }
                 };
+                // Still runnable: preempted or yielded rather than blocked.
+                // Whether it was set aside is known only once the next pick
+                // is made. Only this case pays for the clone.
+                if waker_ref.waiting_for_cpu() {
+                    set_aside = Some(waker_ref.clone());
+                }
                 polls_since_weak = polls_since_weak.saturating_add(1);
                 // The next scan is reached by a poll returning, so a wake it
                 // serves waited for a CPU that was busy running this task.
@@ -2194,6 +2212,7 @@ impl Executor {
                     return;
                 }
             } else {
+                set_aside = None;
                 // Our run queue is drained (and stealing found nothing), so a
                 // request raised *during* the scan above has also been satisfied
                 // by simply running out of work.
@@ -2336,6 +2355,7 @@ impl Executor {
                         );
                     }
                     crate::runtime::set_cpu_sleeping(cpu, false);
+                    crate::runtime::note_idle_kick_served(cpu);
                     if intr_was_on {
                         crate::arch::intr_on();
                     }

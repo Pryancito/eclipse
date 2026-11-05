@@ -433,6 +433,17 @@ pub fn sched_rescue_kick_stats() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+/// IPIs sent to an idle CPU because the sender had a backlog it could take.
+#[cfg(target_os = "none")]
+pub fn sched_idle_backlog_kicks() -> u64 {
+    executor::idle_backlog_kick_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_idle_backlog_kicks() -> u64 {
+    0
+}
+
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
 /// rebalance pulls, scans skipped by the stealable hint, rescue pulls)`.
 #[cfg(target_os = "none")]
