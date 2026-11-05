@@ -887,10 +887,53 @@ static FAULT_GPRS: [[AtomicU64; 16]; MAX_CORE_NUM] =
 static FAULT_RFLAGS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
 /// The register names, in the order `FAULT_GPRS` stores them.
+///
+/// Per architecture, because the table is what the `[kfault-regs]` report
+/// labels its values with and what `RegNames`/`RegValues` render. Sixteen on
+/// every target: the slot count is `FAULT_GPRS`'s, and a report that labelled
+/// riscv values `rax`/`rdi` would be worse than no report -- it would send the
+/// reader to the wrong operand with full confidence.
+///
+/// Which sixteen, on the targets that have more than sixteen: the argument
+/// registers, because they carry the object pointers the faulting call had in
+/// hand; the frame and stack pointers, for the call chain; the return address,
+/// which names the caller when the faulting code is a leaf like `memset`; and
+/// the first few callee-saved and temporaries, which is where a loaded pointer
+/// usually still is.
+#[cfg(target_arch = "riscv64")]
+pub const GPR_NAMES: [&str; 16] = [
+    "ra", "sp", "gp", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "t0", "t1", "t2",
+];
+
+/// See the riscv64 table above.
+#[cfg(target_arch = "aarch64")]
+pub const GPR_NAMES: [&str; 16] = [
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x19", "x20", "x29", "x30",
+    "sp",
+];
+
+/// See the riscv64 table above.
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
 pub const GPR_NAMES: [&str; 16] = [
     "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13",
     "r14", "r15",
 ];
+
+/// Whether `GPR_NAMES[i]` is this architecture's stack or frame pointer.
+///
+/// The `[kfault-regs]` report asks "which registers held a kernel object the
+/// faulting code had in hand", and the stack and frame pointers always hold
+/// one without meaning anything: they are the stack. Naming them by string
+/// here, rather than at the one call site, is what keeps that call site from
+/// quietly going arch-wrong again -- it compared against the literals `"rsp"`
+/// and `"rbp"`, which no riscv or aarch64 table contains, so on those targets
+/// every fault listed its own stack pointer among the suspects.
+pub fn gpr_is_stack_or_frame(index: usize) -> bool {
+    matches!(
+        GPR_NAMES.get(index),
+        Some(&"rsp" | &"rbp" | &"sp" | &"s0" | &"x29")
+    )
+}
 
 /// Keeps fault-stack provenance valid only while its trap handler is active.
 #[must_use]
@@ -1283,6 +1326,94 @@ mod tests {
     use spin::Mutex;
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Every slot of `FAULT_GPRS` has a name, on whichever target this is.
+    ///
+    /// `print_fault_registers` indexes `GPR_NAMES` for all sixteen slots, so a
+    /// table one entry short is a panic on the fault path -- while reporting a
+    /// fault, which is the worst possible place for a second one.
+    #[test]
+    fn every_fault_register_slot_has_a_name() {
+        assert_eq!(GPR_NAMES.len(), 16);
+        for (i, name) in GPR_NAMES.iter().enumerate() {
+            assert!(!name.is_empty(), "slot {} has an empty name", i);
+        }
+    }
+
+    /// No name appears twice.
+    ///
+    /// The report's per-value lines group the slots that hold the same value
+    /// and print their names, so a duplicated name reads as one register
+    /// holding two things.
+    #[test]
+    fn the_fault_register_names_are_distinct() {
+        for (i, a) in GPR_NAMES.iter().enumerate() {
+            for b in GPR_NAMES.iter().skip(i + 1) {
+                assert_ne!(a, b, "{} appears twice in GPR_NAMES", a);
+            }
+        }
+    }
+
+    /// This target's table names a stack pointer and a frame pointer, and
+    /// `gpr_is_stack_or_frame` finds exactly those.
+    ///
+    /// The call site used to compare against the literals `"rsp"` and `"rbp"`,
+    /// which only the x86 table contains: on every other target the predicate
+    /// was constant `false` and the fault report listed the faulting code's own
+    /// stack pointer among the objects it "had in hand". A table that names no
+    /// stack pointer at all would put that silence back.
+    #[test]
+    fn the_stack_and_frame_registers_are_recognized() {
+        let flagged: Vec<&str> = GPR_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| gpr_is_stack_or_frame(*i))
+            .map(|(_, name)| *name)
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            2,
+            "expected exactly a stack and a frame register, got {:?}",
+            flagged
+        );
+        for (i, _) in GPR_NAMES.iter().enumerate() {
+            assert_eq!(
+                gpr_is_stack_or_frame(i),
+                flagged.contains(&GPR_NAMES[i]),
+                "slot {} ({}) disagrees with itself",
+                i,
+                GPR_NAMES[i]
+            );
+        }
+    }
+
+    /// Past the end is not a stack pointer.
+    #[test]
+    fn an_index_past_the_table_is_not_a_stack_register() {
+        assert!(!gpr_is_stack_or_frame(GPR_NAMES.len()));
+        assert!(!gpr_is_stack_or_frame(usize::MAX));
+    }
+
+    /// `last_fault_from_kernel` reads the selector vocabulary the riscv and
+    /// aarch64 trap entries encode their privilege level into.
+    ///
+    /// Those entries have no CS to pass, so they translate `sstatus.SPP` /
+    /// `spsr_el1.M` into x86's ring-0 and ring-3 selectors. If this predicate
+    /// ever stops speaking that vocabulary, those two call sites go silently
+    /// wrong -- a user fault would be read as a kernel one, which is the
+    /// difference between demand-paging a page and declaring a kernel bug.
+    #[test]
+    fn the_privilege_encoding_the_arch_entries_use_still_reads_back() {
+        let _guard = SERIAL.lock();
+        {
+            let _kernel = note_fault_regs(0x1000, 0x2000, 0x3000, 0x08);
+            assert!(last_fault_from_kernel(), "0x08 must read as kernel");
+        }
+        {
+            let _user = note_fault_regs(0x1000, 0x2000, 0x3000, 0x23);
+            assert!(!last_fault_from_kernel(), "0x23 must read as user");
+        }
+    }
 
     #[test]
     fn handled_fault_registers_are_not_current_fault_provenance() {

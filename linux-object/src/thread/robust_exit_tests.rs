@@ -16,6 +16,13 @@
 //! The walk is driven here through [`release_robust_locks_of`], which takes a
 //! plain `Thread`; [`CurrentThreadExt::release_robust_locks`] is that call on
 //! the current thread, and the run loop makes it on every way a thread dies.
+//!
+//! The same death in a **32-bit** thread --- where every word of the list is
+//! four bytes wide --- is in `linux-syscall`'s `compat32::robust::tests`, and
+//! not here: a 32-bit list's pointers have to fit in a `u32`, so it cannot
+//! live at a host heap address like the ones below, and reading it needs the
+//! process's own low page to be the current address space. That harness
+//! (`on_a_thread`) is over there.
 
 extern crate std;
 

@@ -56,6 +56,11 @@ pub trait ThreadExt {
     ) -> SysResult;
     /// Set robust list.
     fn set_robust_list(&self, head: UserInPtr<RobustList>, len: usize);
+    /// The head `set_robust_list` registered, as the bare address it is:
+    /// what `get_robust_list` answers, before either ABI has said how many
+    /// bytes a pointer takes. The 32-bit `get_robust_list` writes four of
+    /// them where the native one writes eight.
+    fn robust_list_head(&self) -> usize;
     /// `execve` from a thread that is not the leader, once `de_thread` has
     /// left it alone in its process: the thread the new image is to run in.
     ///
@@ -401,7 +406,7 @@ impl ThreadExt for Thread {
         mut head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         mut len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        let head: UserOutPtr<RobustList> = self.lock_linux().robust_list.as_addr().into();
+        let head: UserOutPtr<RobustList> = self.robust_list_head().into();
         // `sizeof(*head)`, whatever was registered: Linux 6.18 answers 24
         // for a thread that never called `set_robust_list` (musl, which
         // only does for a robust mutex), and this answered 0.
@@ -413,6 +418,10 @@ impl ThreadExt for Thread {
     fn set_robust_list(&self, head: UserInPtr<RobustList>, len: usize) {
         self.lock_linux().robust_list = head;
         self.lock_linux().robust_list_len = len;
+    }
+
+    fn robust_list_head(&self) -> usize {
+        self.lock_linux().robust_list.as_addr()
     }
 }
 
@@ -433,9 +442,15 @@ fn release_robust_locks_of(thread: &Thread) {
         linux.robust_list_len = 0;
         taken
     };
-    // A length other than the struct's own is what `set_robust_list`
-    // refuses, so it can only be the never-registered zero.
-    if head_addr == 0 || len != core::mem::size_of::<RobustList>() {
+    // A length other than one of the two structs' own is what
+    // `set_robust_list` refuses, so it can only be the never-registered zero.
+    // And the length is what says how wide the list's words are: a 32-bit
+    // process registers twelve bytes and a native one twenty-four, which is
+    // the same question Linux answers by keeping the two lists in two fields.
+    let Some(word_bytes) = robust_word_bytes(len) else {
+        return;
+    };
+    if head_addr == 0 {
         return;
     }
     // Every read here is a `get_user` on the dying thread's own address
@@ -447,8 +462,11 @@ fn release_robust_locks_of(thread: &Thread) {
     // faults its page in for the same reason). So: inside the process's
     // own mappings, and faulted in first.
     let vmar = thread.proc().vmar();
-    let held = walk_robust_list(head_addr, |addr| {
-        if !addr.is_multiple_of(core::mem::align_of::<usize>()) {
+    let held = walk_robust_list(head_addr, word_bytes, |addr| {
+        // The alignment a read of THAT width needs, not this kernel's: a
+        // 32-bit list is 4-aligned, and asking it for eight would refuse to
+        // walk every list a 32-bit libc ever registers.
+        if !addr.is_multiple_of(word_bytes) {
             return None;
         }
         #[cfg(target_os = "none")]
@@ -465,8 +483,13 @@ fn release_robust_locks_of(thread: &Thread) {
                 return None;
             }
         }
-        let word: UserInPtr<usize> = addr.into();
-        word.read().ok()
+        if word_bytes == 4 {
+            let word: UserInPtr<u32> = addr.into();
+            word.read().ok().map(|w| w as usize)
+        } else {
+            let word: UserInPtr<usize> = addr.into();
+            word.read().ok()
+        }
     });
     drop(vmar);
     if held.is_empty() {
@@ -630,6 +653,31 @@ pub struct RobustList {
     pub pending: usize,
 }
 
+/// The size of a 32-bit process's `struct robust_list_head`: the same three
+/// fields, four bytes each.
+///
+/// Measured against this container's Linux with an i386 program:
+/// `set_robust_list(head, 12)` answers 0 and `set_robust_list(head, 24)`
+/// answers `EINVAL` -- the exact opposite of the native call, and the reason
+/// the number cannot simply be forwarded.
+pub const ROBUST_LIST32_SIZE: usize = 12;
+
+/// How wide the words of a robust list registered with length `len` are, or
+/// `None` for a length no `set_robust_list` would have accepted.
+///
+/// The length is the only thing that says it. Both calls take the size of
+/// *their own* head and refuse anything else, so twelve can only have come
+/// from a 32-bit process and twenty-four from a native one.
+pub fn robust_word_bytes(len: usize) -> Option<usize> {
+    if len == core::mem::size_of::<RobustList>() {
+        Some(core::mem::size_of::<usize>())
+    } else if len == ROBUST_LIST32_SIZE {
+        Some(4)
+    } else {
+        None
+    }
+}
+
 /// Linux's `ROBUST_LIST_LIMIT`. The list lives in user memory and is walked at
 /// every thread exit, so a program that builds a circular one -- by accident
 /// or on purpose -- would otherwise keep a CPU in the kernel forever.
@@ -645,16 +693,41 @@ pub struct RobustFutex {
     pub pi: bool,
 }
 
+/// A word read out of a robust list head, as the signed quantity its ABI
+/// declares: `futex_offset` is a `long`, and in a 32-bit process a `long` is
+/// four bytes.
+///
+/// A width this kernel does not know is taken as its own, which is what the
+/// two callers already guarantee -- the walk is reached only through a length
+/// `set_robust_list` accepted.
+fn sign_extend(word: usize, word_bytes: usize) -> isize {
+    if word_bytes == 4 {
+        word as u32 as i32 as isize
+    } else {
+        word as isize
+    }
+}
+
 /// Walk the robust list a dying thread registered, newest lock first.
 ///
-/// `read_word` reads one machine word of the thread's memory, or returns
-/// `None` when that address cannot be read -- which ends the walk, exactly as
-/// a failed `get_user` ends Linux's. The list is userspace's, so every part of
-/// it is untrusted: the length is capped, the terminator is the head's own
-/// address, and the offset is applied as the signed quantity it is declared to
-/// be.
+/// `read_word` reads one word of the thread's memory, or returns `None` when
+/// that address cannot be read -- which ends the walk, exactly as a failed
+/// `get_user` ends Linux's. The list is userspace's, so every part of it is
+/// untrusted: the length is capped, the terminator is the head's own address,
+/// and the offset is applied as the signed quantity it is declared to be.
+///
+/// `word_bytes` is how wide one of those words is **in the thread that wrote
+/// the list**, which is not always this kernel's width: a 32-bit process's
+/// `struct robust_list_head` is three 4-byte words and its `futex_offset` is
+/// a 32-bit `long`. That is the whole difference between Linux's
+/// `exit_robust_list` and its `compat_exit_robust_list`, and the reason it is
+/// a parameter here rather than `size_of::<usize>()`: the stride between the
+/// head's three fields, and the width the offset's sign lives at. Read as a
+/// 64-bit quantity, the `-4` a 32-bit libc writes is `0xfffffffc`, and the
+/// address the walk would mark is four gigabytes past the lock.
 pub fn walk_robust_list(
     head_addr: usize,
+    word_bytes: usize,
     mut read_word: impl FnMut(usize) -> Option<usize>,
 ) -> Vec<RobustFutex> {
     let mut found = Vec::new();
@@ -667,11 +740,11 @@ pub fn walk_robust_list(
         Some(word) => split(word),
         None => return found,
     };
-    let offset = match read_word(head_addr + core::mem::size_of::<usize>()) {
-        Some(word) => word as isize,
+    let offset = match read_word(head_addr + word_bytes) {
+        Some(word) => sign_extend(word, word_bytes),
         None => return found,
     };
-    let (pending, pending_pi) = match read_word(head_addr + 2 * core::mem::size_of::<usize>()) {
+    let (pending, pending_pi) = match read_word(head_addr + 2 * word_bytes) {
         Some(word) => split(word),
         None => return found,
     };
@@ -2163,7 +2236,7 @@ mod robust_list_tests {
     }
 
     fn walk(mem: &BTreeMap<usize, usize>) -> Vec<RobustFutex> {
-        walk_robust_list(HEAD, |addr| mem.get(&addr).copied())
+        walk_robust_list(HEAD, W, |addr| mem.get(&addr).copied())
     }
 
     #[test]
@@ -2178,7 +2251,7 @@ mod robust_list_tests {
     fn a_list_that_was_never_linked_up_is_empty() {
         assert!(walk(&memory(0, -16, 0)).is_empty());
         // And a thread that never called `set_robust_list` at all.
-        assert!(walk_robust_list(0, |_| panic!("must not read anything")).is_empty());
+        assert!(walk_robust_list(0, W, |_| panic!("must not read anything")).is_empty());
     }
 
     #[test]
@@ -2365,6 +2438,90 @@ mod robust_list_tests {
                 missing
             );
         }
+    }
+
+    // ---- the same list at HALF the width --------------------------------
+
+    /// A 32-bit process's head: the same three fields, four bytes each, and
+    /// a `futex_offset` whose sign lives in bit 31.
+    ///
+    /// This is Linux's `compat_exit_robust_list`, and it runs at the exit of
+    /// every thread of every 32-bit program --- glibc and musl both register
+    /// a list per thread.
+    fn memory32(next: u32, offset: i32, pending: u32) -> BTreeMap<usize, usize> {
+        BTreeMap::from([
+            (HEAD, next as usize),
+            (HEAD + 4, offset as u32 as usize),
+            (HEAD + 8, pending as usize),
+        ])
+    }
+
+    fn walk32(mem: &BTreeMap<usize, usize>) -> Vec<RobustFutex> {
+        walk_robust_list(HEAD, 4, |addr| mem.get(&addr).copied())
+    }
+
+    /// **The head's three fields are four bytes apart**, so the offset is
+    /// read at `head + 4` and the pending entry at `head + 8`.
+    ///
+    /// Walked at the native stride, the offset read would be the pending
+    /// pointer and the pending read would be past the structure altogether.
+    #[test]
+    fn a_32_bit_head_is_read_at_its_own_stride() {
+        let node = (HEAD + 0x1000) as u32;
+        let mut mem = memory32(node, -4, 0);
+        mem.insert(node as usize, HEAD);
+        let held = walk32(&mem);
+        assert_eq!(held.len(), 1, "one lock was held");
+        assert_eq!(held[0].addr, node as usize - 4);
+        // The same bytes at the native stride: `head + 8` holds the pending
+        // field, so the offset comes out as zero and the lock is reported at
+        // the list node instead of at the word four bytes before it.
+        let wide = walk(&mem);
+        assert!(
+            wide.is_empty() || wide[0].addr != node as usize - 4,
+            "the native stride must not happen to read a 32-bit head right"
+        );
+    }
+
+    /// **And its `futex_offset` is a 32-bit `long`**: the `-4` both libcs
+    /// write is `0xfffffffc`, which read as a 64-bit quantity puts the lock
+    /// word four gigabytes past the mutex.
+    #[test]
+    fn the_offset_of_a_32_bit_head_is_signed_at_thirty_two_bits() {
+        let node = (HEAD + 0x1000) as u32;
+        let mut mem = memory32(node, -4, 0);
+        mem.insert(node as usize, HEAD);
+        assert_eq!(walk32(&mem)[0].addr, node as usize - 4);
+        // What not sign-extending would have given.
+        assert_eq!(
+            (node as usize).wrapping_add(0xffff_fffc),
+            node as usize + 0xffff_fffc,
+            "the unsigned reading is a different address entirely"
+        );
+        // A positive offset is itself at either width.
+        let mut plus = memory32(node, 16, 0);
+        plus.insert(node as usize, HEAD);
+        assert_eq!(walk32(&plus)[0].addr, node as usize + 16);
+    }
+
+    /// The rest of the walk is the same walk: the terminator is still the
+    /// head's own address, the PI flag is still bit 0, and the pending entry
+    /// is still handled once and last.
+    #[test]
+    fn a_32_bit_list_ends_flags_and_pends_like_any_other() {
+        assert!(walk32(&memory32(HEAD as u32, -4, 0)).is_empty());
+        assert!(walk32(&memory32(0, -4, 0)).is_empty());
+        let (a, b) = ((HEAD + 0x1000) as u32, (HEAD + 0x2000) as u32);
+        let mut mem = memory32(a | 1, -4, b);
+        mem.insert(a as usize, b as usize);
+        mem.insert(b as usize, HEAD);
+        let held = walk32(&mem);
+        assert_eq!(
+            held.iter().map(|f| f.addr).collect::<Vec<_>>(),
+            vec![a as usize - 4, b as usize - 4],
+            "b is the pending entry and comes once, at the end"
+        );
+        assert!(held[0].pi, "bit 0 is the PI flag at this width too");
     }
 
     // ---- what to write into each word -----------------------------------
@@ -2587,9 +2744,11 @@ mod exec_reset_tests {
         t.reset_for_exec();
         assert_eq!(t.robust_list.as_addr(), 0);
         assert_eq!(t.robust_list_len, 0);
-        assert!(walk_robust_list(t.robust_list.as_addr(), |_| {
-            panic!("a thread that has just exec'd must read no user memory")
-        })
+        assert!(walk_robust_list(
+            t.robust_list.as_addr(),
+            core::mem::size_of::<usize>(),
+            |_| { panic!("a thread that has just exec'd must read no user memory") }
+        )
         .is_empty());
     }
 

@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod control;
+
 /// A respawn service that exits sooner than this after starting is treated as
 /// "crashing", not "finished a unit of work", and its restart is delayed.
 const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
@@ -458,6 +460,13 @@ struct Service {
     /// point is to put the first failure on screen, not to replay every
     /// retry of a crash loop.
     tail_shown: bool,
+    /// Stopped on request ([`control`]): not restarted until started again.
+    held: bool,
+    /// Killed by a restart request: started again as soon as it is reaped,
+    /// without the crash accounting a quick death earns.
+    restart_now: bool,
+    /// How many times this boot has started it, for the state file.
+    total_starts: u32,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -947,6 +956,7 @@ fn main() {
     // over, so this is where its timeline is complete.
     report_boot_timeline();
     log("entering supervision loop");
+    control::prepare();
     // PID 1 may not return and may not die, so a panic in here is caught and
     // the loop re-entered. The pause is what keeps a panic on the first
     // statement from becoming a console-filling hot loop.
@@ -1212,6 +1222,8 @@ fn install_signal_handlers() {
     // to rotate the logs (see MAX_LOG_BYTES); the handler does nothing but set
     // the flag, and the loop re-arms it.
     install_handler(libc::SIGALRM, on_sigalrm as *const () as usize);
+    // SIGHUP: a start/stop/restart request is waiting ([`control`]).
+    install_handler(libc::SIGHUP, control::on_sighup as *const () as usize);
     arm_log_sweep();
     // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
     // loop reaps children directly, so no handler is needed for reaping.
@@ -1695,6 +1707,9 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         starts: VecDeque::new(),
         crash_starts: 0,
         tail_shown: false,
+        held: false,
+        restart_now: false,
+        total_starts: 0,
     })
 }
 
@@ -2301,6 +2316,7 @@ fn start_service(svc: &mut Service) {
             log(&format!("respawn: {} (starting)", svc.name));
             svc.pid = spawn(&svc.exec, svc.log.as_deref());
             svc.started_at = Some(now);
+            svc.total_starts += 1;
             svc.restart_at = None;
         }
     }
@@ -3176,6 +3192,12 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
         for exit in take_pending() {
             note_exit(services, exit.pid, exit.status, exit.at);
         }
+        if control::WANT_CONTROL.swap(false, Ordering::SeqCst) {
+            control::take_requests(services);
+            control::settle_restarts(services);
+            restart_due(services);
+        }
+        control::write_state(services);
         // The alarm is PID 1's only clock, and this is all it is for: keep the
         // services' logs from eating the tmpfs they live in.
         if WANT_LOG_SWEEP.swap(false, Ordering::SeqCst) {
@@ -3251,6 +3273,7 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
         }
 
         note_exit(services, pid, status, Instant::now());
+        control::settle_restarts(services);
         restart_due(services);
     }
 }
@@ -3537,6 +3560,7 @@ fn due_names(services: &BTreeMap<String, Service>, now: Instant) -> Vec<String> 
             services.get(name).is_some_and(|svc| {
                 svc.kind == Kind::Respawn
                     && !svc.given_up
+                    && !svc.held
                     && svc.pid.is_none()
                     && svc.restart_at.is_none_or(|t| t <= now)
             })

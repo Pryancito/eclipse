@@ -99,7 +99,10 @@
 //! [`rlimit`](rlimit)); and `rt_sigaction` (174) and `sigaltstack` (186),
 //! whose structures lose a pointer's width in some members and not in
 //! others, next to the `rt_sigreturn` (173) that reads the frame they set up
-//! (see [`signal`](signal)).
+//! (see [`signal`](signal)); and `set_robust_list` (311) with
+//! `get_robust_list` (312), whose head is three words of a pointer's width
+//! and whose LENGTH is an argument the call checks, so the native handler and
+//! this one refuse each other's (see [`robust`](robust)).
 //!
 //! ## The renames
 //!
@@ -124,6 +127,7 @@ mod ioctl;
 mod iovec;
 mod ipc;
 mod rlimit;
+mod robust;
 mod signal;
 mod socketcall;
 mod stat;
@@ -196,6 +200,7 @@ use time64::{
 /// MULTIPLEXER itself reads and writes the caller's memory in three places.
 /// See [`ipc`].
 use ipc::I386_IPC;
+use robust::{I386_GET_ROBUST_LIST, I386_SET_ROBUST_LIST};
 
 /// `waitpid`, which x86_64 does not have AT ALL --- it kept only `wait4`
 /// (61) and `waitid` (247), so there is no native number for this one to be
@@ -403,6 +408,14 @@ impl Syscall<'_> {
             }
             I386_IPC => {
                 return syscall_ret(self.sys_ipc32(a0 as u32, a1, a2, a3, a4, a5).await);
+            }
+            // The robust list, whose head is three words wide in the ABI
+            // that registered it --- and whose LENGTH is an argument, so the
+            // native handler refuses the only length a 32-bit libc passes.
+            // See [`robust`].
+            I386_SET_ROBUST_LIST => return syscall_ret(self.sys_set_robust_list32(a0, a1)),
+            I386_GET_ROBUST_LIST => {
+                return syscall_ret(self.sys_get_robust_list32(a0 as i32, a1, a2));
             }
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),

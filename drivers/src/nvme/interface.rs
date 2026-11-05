@@ -18,6 +18,8 @@ use super::nvme_queue::*;
 const SECTOR_SIZE: usize = 512;
 
 pub struct NvmeInterface {
+    /// What it has transferred, for `/proc/diskstats`.
+    io: crate::scheme::IoStats,
     name: String,
 
     admin_queue: Arc<Mutex<NvmeQueue<ProviderImpl>>>,
@@ -141,6 +143,7 @@ impl NvmeInterface {
         )?))];
 
         let mut interface = NvmeInterface {
+            io: crate::scheme::IoStats::new(),
             name: String::from("nvme"),
             admin_queue,
             io_queues,
@@ -822,10 +825,9 @@ fn udelay(us: u64) {
     }
 }
 
-impl BlockScheme for NvmeInterface {
-    // `block_id` indexes 512-byte sectors (same convention as the AHCI
-    // driver); `buf.len()` may be any multiple of 512.
-    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+impl NvmeInterface {
+    // The transfers themselves; the trait's methods count them ([`crate::scheme::IoStats`]).
+    fn read_uncounted(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         self.check_request(block_id, read_buf.len())?;
         let lba_bytes = 1usize << self.lba_shift;
         let mut queue = self.io_queues[0].lock();
@@ -858,7 +860,7 @@ impl BlockScheme for NvmeInterface {
         Ok(())
     }
 
-    fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
+    fn write_uncounted(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
         self.check_request(block_id, write_buf.len())?;
         let lba_bytes = 1usize << self.lba_shift;
         let mut queue = self.io_queues[0].lock();
@@ -902,6 +904,26 @@ impl BlockScheme for NvmeInterface {
             byte_addr += take;
         }
         Ok(())
+    }
+}
+
+impl BlockScheme for NvmeInterface {
+    // `block_id` indexes 512-byte sectors (same convention as the AHCI
+    // driver); `buf.len()` may be any multiple of 512.
+    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+        let r = self.read_uncounted(block_id, read_buf);
+        self.io.note_read(&r, read_buf.len());
+        r
+    }
+
+    fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
+        let r = self.write_uncounted(block_id, write_buf);
+        self.io.note_write(&r, write_buf.len());
+        r
+    }
+
+    fn io_stats(&self) -> Option<crate::scheme::IoSnapshot> {
+        Some(self.io.snapshot())
     }
 
     fn flush(&self) -> DeviceResult {
@@ -2017,6 +2039,7 @@ mod controller_tests {
     /// queues built, nothing asked of the controller yet.
     fn a_drive_not_yet_brought_up(base: usize) -> NvmeInterface {
         NvmeInterface {
+            io: crate::scheme::IoStats::new(),
             name: String::from("nvme"),
             admin_queue: a_queue(0),
             io_queues: alloc::vec![a_queue(1)],

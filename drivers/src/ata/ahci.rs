@@ -1291,6 +1291,8 @@ fn build_prds_with<F: Fn(usize) -> u64>(
 }
 
 pub struct AhciInterface {
+    /// What it has transferred, for `/proc/diskstats`.
+    io: crate::scheme::IoStats,
     name: String,
     port: Mutex<AhciPort>,
     /// Capacity in 512-byte sectors (the `BlockScheme` unit), not in device
@@ -1509,6 +1511,7 @@ impl AhciInterface {
                             if supports_64bit { 64 } else { 32 },
                         );
                         disks.push(Self {
+                            io: crate::scheme::IoStats::new(),
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
                             capacity: capacity_512,
@@ -1581,13 +1584,9 @@ fn max_chunk(lba48: bool, path_max: usize, sector_bytes: usize) -> usize {
     cap - cap % sector_bytes
 }
 
-impl BlockScheme for AhciInterface {
-    // `block_id` indexes 512-byte sectors; `buf.len()` may be any multiple of
-    // 512 and is transferred in as few commands as possible. A 4Kn disk cannot
-    // address anything smaller than its own 4096-byte sector, so a request
-    // that begins or ends inside one is completed by read-modify-write through
-    // the bounce buffer, exactly as the NVMe driver does for a large LBA.
-    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+impl AhciInterface {
+    // The transfers themselves; the trait's methods count them ([`crate::scheme::IoStats`]).
+    fn read_uncounted(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
         self.check_request(block_id, read_buf.len())?;
         let port = self.port.lock();
         let sector_bytes = self.sector_bytes;
@@ -1654,7 +1653,7 @@ impl BlockScheme for AhciInterface {
         Ok(())
     }
 
-    fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
+    fn write_uncounted(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
         self.check_request(block_id, write_buf.len())?;
         let port = self.port.lock();
         let sector_bytes = self.sector_bytes;
@@ -1716,6 +1715,29 @@ impl BlockScheme for AhciInterface {
             byte_addr += chunk;
         }
         Ok(())
+    }
+}
+
+impl BlockScheme for AhciInterface {
+    // `block_id` indexes 512-byte sectors; `buf.len()` may be any multiple of
+    // 512 and is transferred in as few commands as possible. A 4Kn disk cannot
+    // address anything smaller than its own 4096-byte sector, so a request
+    // that begins or ends inside one is completed by read-modify-write through
+    // the bounce buffer, exactly as the NVMe driver does for a large LBA.
+    fn read_block(&self, block_id: usize, read_buf: &mut [u8]) -> DeviceResult {
+        let r = self.read_uncounted(block_id, read_buf);
+        self.io.note_read(&r, read_buf.len());
+        r
+    }
+
+    fn write_block(&self, block_id: usize, write_buf: &[u8]) -> DeviceResult {
+        let r = self.write_uncounted(block_id, write_buf);
+        self.io.note_write(&r, write_buf.len());
+        r
+    }
+
+    fn io_stats(&self) -> Option<crate::scheme::IoSnapshot> {
+        Some(self.io.snapshot())
     }
 
     fn flush(&self) -> DeviceResult {

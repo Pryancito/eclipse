@@ -197,6 +197,21 @@ impl SchedTask {
             }
         }
     }
+
+    /// The head alone, for the 32-bit `get_robust_list`, which writes it as
+    /// four bytes rather than eight. A gone leader's is null for the same
+    /// reason as above.
+    ///
+    /// x86_64-only, like the compatibility entry that is its only caller:
+    /// `compat32` is not built for the other two architectures, where this
+    /// would be dead code and `deny(warnings)` says so.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn robust_list_head(&self) -> usize {
+        match self {
+            SchedTask::Thread(thread) => thread.robust_list_head(),
+            SchedTask::Leader(_) => 0,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6800,6 +6800,8 @@ fn emit_keyboard_delta(
 /// 4096. La traduccion vive aqui, y es la razon de que esta capa exista en vez
 /// de llamar a `msc_rw` desde fuera.
 pub struct UsbDisk {
+    /// What it has transferred, for `/proc/diskstats`.
+    io: crate::scheme::IoStats,
     /// El controlador, en debil: el disco lo tiene el sistema de archivos y
     /// puede sobrevivir al controlador. Un `Arc` aqui seria un ciclo.
     ctrl: Weak<XhciUsbHid>,
@@ -6848,8 +6850,9 @@ impl Scheme for UsbDisk {
     }
 }
 
-impl BlockScheme for UsbDisk {
-    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+impl UsbDisk {
+    // The transfers themselves; the trait's methods count them ([`crate::scheme::IoStats`]).
+    fn read_uncounted(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         if buf.is_empty() || !buf.len().is_multiple_of(512) {
             return Err(DeviceError::InvalidParam);
         }
@@ -6871,7 +6874,7 @@ impl BlockScheme for UsbDisk {
         Ok(())
     }
 
-    fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+    fn write_uncounted(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
         if buf.is_empty() || !buf.len().is_multiple_of(512) {
             return Err(DeviceError::InvalidParam);
         }
@@ -6893,6 +6896,24 @@ impl BlockScheme for UsbDisk {
         self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Read(&mut stage)))?;
         stage[skip..skip + buf.len()].copy_from_slice(buf);
         self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Write(&stage)))
+    }
+}
+
+impl BlockScheme for UsbDisk {
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let r = self.read_uncounted(block_id, buf);
+        self.io.note_read(&r, buf.len());
+        r
+    }
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        let r = self.write_uncounted(block_id, buf);
+        self.io.note_write(&r, buf.len());
+        r
+    }
+
+    fn io_stats(&self) -> Option<crate::scheme::IoSnapshot> {
+        Some(self.io.snapshot())
     }
 
     fn flush(&self) -> DeviceResult {
@@ -7002,6 +7023,7 @@ fn drain_disk_changes(dev: &Arc<XhciUsbHid>) {
     }
     for (id, dev_blocks, dev_block_size, name) in to_add {
         let disk = Arc::new(UsbDisk {
+            io: crate::scheme::IoStats::new(),
             ctrl: Arc::downgrade(dev),
             disk_id: id,
             name: name.clone(),

@@ -71,6 +71,7 @@ pub fn install(rootfs: &Path) {
     write_files_desktop_entry(rootfs);
     write_hunter_desktop_entry(rootfs);
     super::network::write_network_desktop_entry(rootfs);
+    super::monitor::write_monitor_desktop_entry(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -2226,6 +2227,8 @@ fn write_labwc_rc(rootfs: &Path) {
     <!-- Super+N: the notifications that came in (lunarnotes); pressed
          again, it closes. -->
     <keybind key="W-N"><action name="Execute"><command>lunarnotes</command></action></keybind>
+    <!-- Ctrl+Shift+Esc: the system monitor (lunarmon), as on other desktops. -->
+    <keybind key="C-S-Escape"><action name="Execute"><command>/usr/local/bin/eclipse-monitor</command></action></keybind>
     <keybind key="A-Tab"><action name="NextWindow"/></keybind>
     <keybind key="A-S-Tab"><action name="PreviousWindow"/></keybind>
     <keybind key="W-Down"><action name="Iconify"/></keybind>

@@ -1166,28 +1166,24 @@ fn print_fault_registers(fault_vaddr: usize, access_flags: MMUFlags) {
         return;
     }
     // Raw values first, in the layout of the `[null-exec] regs:` block so the
-    // two can be read side by side.
-    kernel_hal::oops_log::report(format_args!(
-        "[kfault-regs] rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}\n\
-         [kfault-regs] rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n\
-         [kfault-regs] r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
-        gprs[0],
-        gprs[1],
-        gprs[2],
-        gprs[3],
-        gprs[4],
-        gprs[5],
-        gprs[6],
-        gprs[7],
-        gprs[8],
-        gprs[9],
-        gprs[10],
-        gprs[11],
-        gprs[12],
-        gprs[13],
-        gprs[14],
-        gprs[15],
-    ));
+    // two can be read side by side. Labelled from `GPR_NAMES`, never from
+    // literals: this block spelled the sixteen x86 names inline, so on riscv64
+    // and aarch64 -- where the slots hold `a0`, `s0`, `x29` -- it would have
+    // printed every value under the name of a register that does not exist on
+    // the machine that faulted.
+    for row in 0..4 {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs] {}={:#x} {}={:#x} {}={:#x} {}={:#x}\n",
+            kernel_hal::kstats::GPR_NAMES[row * 4],
+            gprs[row * 4],
+            kernel_hal::kstats::GPR_NAMES[row * 4 + 1],
+            gprs[row * 4 + 1],
+            kernel_hal::kstats::GPR_NAMES[row * 4 + 2],
+            gprs[row * 4 + 2],
+            kernel_hal::kstats::GPR_NAMES[row * 4 + 3],
+            gprs[row * 4 + 3],
+        ));
+    }
     // RFLAGS, and the one bit of it that has turned out to matter most. Every
     // RFLAGS the long hunt printed had DF set, in a raw hex value nobody
     // decoded, while the kernel's memcpy/memset were running backwards.
@@ -1256,8 +1252,7 @@ fn print_fault_registers(fault_vaddr: usize, access_flags: MMUFlags) {
     // was loaded from.
     let mut objects: u16 = 0;
     for (i, &v) in gprs.iter().enumerate() {
-        let stack_or_frame =
-            kernel_hal::kstats::GPR_NAMES[i] == "rsp" || kernel_hal::kstats::GPR_NAMES[i] == "rbp";
+        let stack_or_frame = kernel_hal::kstats::gpr_is_stack_or_frame(i);
         if !stack_or_frame
             && kernel_hal::kaddr::word_shape(v) == kernel_hal::kaddr::WordShape::KernelNonText
         {

@@ -6,6 +6,7 @@ use crate::scheme::BlockScheme;
 /// traduccion sin tocar hardware.
 fn fake_disk(dev_blocks: u64, dev_block_size: u32) -> UsbDisk {
     UsbDisk {
+        io: crate::scheme::IoStats::new(),
         ctrl: Weak::new(),
         disk_id: 1,
         name: alloc::string::String::from("usbdisk-test"),

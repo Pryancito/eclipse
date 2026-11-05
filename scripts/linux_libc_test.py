@@ -6,8 +6,53 @@ import runpy
 import re
 import shlex
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The guest shell's prompt, and how long one QEMU start may take to show it.
+# Boot to userspace is ~30 s on x86_64 and ~15 s on aarch64 under TCG here;
+# the rest is headroom for a slow runner, and a boot that never gets there
+# is reported as such rather than as 476 timeouts.
+PROMPT = re.compile(r"/ # ")
+PROMPT_TIMEOUT = 300
+
+# Cases that only mean something to a user the kernel can hold to a limit.
+# `pthread_atfork-errno-clobber` sets RLIMIT_NPROC to 0 and expects `fork` to
+# fail with EAGAIN; root is exempt from that limit here as in Linux (the same
+# binary fails the same way on a Linux host when run as root, and passes as
+# `nobody`), and the guest shell is root. So they run as `nobody`, where
+# `may_start_task` is what they measure, and they are expected to pass.
+# Measured in QEMU x86_64 on 2026-11-05: both pass, and `ulimit -u 1` leaves
+# that shell unable to fork at all. Every arch's busybox is built from the same
+# source here, `su` included.
+UNPRIVILEGED = {
+    "/libc-test/src/regression/pthread_atfork-errno-clobber.exe",
+    "/libc-test/src/regression/pthread_atfork-errno-clobber-static.exe",
+}
+
+# A kernel log line on the console: `[ <secs>.<us> LEVEL <cpu> <pid>:<tid>
+# <target>] <message>`, once its colours are stripped. Not anchored to a line
+# start: the console interleaves it with whatever userspace was printing, and
+# the one measured landed in the middle of the echo of the typed command.
+KERNEL_LOG_LINE = re.compile(
+    r"\[ *\d+\.\d{6} (?:ERROR|WARN |INFO |DEBUG|TRACE) \d+ \d+:\d+ \S+\] [^\r\n]*"
+)
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def without_kernel_log(output):
+    """`output` with the kernel's own console lines taken out.
+
+    The submodule classifies a case by substring, and one of its failure
+    patterns is "ERROR" -- the level the kernel prints every signal death at,
+    on purpose, so that it survives `LOG=error`. A `grep` of eclipse-init's
+    dying of SIGPIPE while `utime-static.exe` ran (QEMU x86_64, 2026-11-05:
+    `[ 19.252076 ERROR 1 0:0 zcore_loader::linux] [exit] pid=1033 (grep)
+    killed by signal SIGPIPE`) was enough to fail a case that had exited 0.
+    The case's own words stay: libc-test prints `... failed` for a failing
+    check, and exits non-zero besides."""
+    return KERNEL_LOG_LINE.sub("", ANSI.sub("", output))
 
 
 def main():
@@ -50,30 +95,50 @@ def main():
         from qemu_completion import completion_runner
         framework.TestRunner = completion_runner(framework.TestRunner, framework.TestStatus)
 
-        # A case the image does not carry must be a FAILED, not an OK.
-        #
-        # The submodule's runner types the case's path at the guest shell and
-        # classifies whatever comes back by substring, and its failure
-        # patterns are "failed", "ERROR", "Error", "panicked", "Hangup" and
-        # "Unknown signal". `sh: /libc-test/src/math/log.exe: not found`
-        # (status 127) matches none of them, so an image without the suite
-        # reported every one of the 476 cases OK -- which is exactly what the
-        # x86_64 job did, because `cargo image` builds that arch's image from
-        # the lean live root and `libc-test` is not in `LIVE_KEEP`
-        # (xtask `LIVE_TEST_SUITE` carries the measurement and the fix).
-        #
-        # Named here rather than in the submodule for the reason the module
-        # docstring gives: `tests/` is upstream and cannot be edited.
-        missing = re.compile(r"^sh: \S*: not found", re.M)
         completed = framework.TestRunner
 
-        class MissingCaseIsAFailure(completed):
-            def check_output(self, output):
-                if missing.search(output):
-                    return framework.TestStatus.FAILED
-                return super().check_output(output)
+        class BootedRunner(completed):
+            """The submodule's `run_qemu` gives the guest 5 s to show its
+            prompt, then types the first case at it. Booting to the shell
+            takes ~30 s on x86_64 and ~15 s on aarch64 under TCG (the busybox
+            job, one boot per case, measures the first: ~30 s each), so every
+            case of the x86_64 and aarch64 jobs was typed into a guest that
+            was still in the firmware, waited 10 s, and came back TIMEOUT with
+            no output -- 410 of 410 and 313 of 313 on CI 41946889764 (2026-11-05),
+            twice each, with a QEMU restart in between. Wait for the prompt
+            itself, within a budget a slow runner can still meet."""
 
-        framework.TestRunner = MissingCaseIsAFailure
+            def run_qemu(self):
+                super().run_qemu()
+                # A newline makes a shell that is already up print a fresh
+                # prompt, and one that is not yet up print it on arrival.
+                self.zcore_proc.stdin.write(b"\n")
+                self.zcore_proc.stdin.flush()
+                start = time.monotonic()
+                up = False
+                while time.monotonic() - start < PROMPT_TIMEOUT:
+                    with self.lk:
+                        up = PROMPT.search(self.output) is not None
+                    if up or self.zcore_proc.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                with self.lk:
+                    output = self.output
+                    self.output = ""
+                if not up:
+                    raise RuntimeError(
+                        f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
+                    )
+
+            def classified_output(self, output):
+                return without_kernel_log(output)
+
+            def guest_command(self, name):
+                if name in unprivileged:
+                    return "su -s /bin/sh nobody -c " + shlex.quote(name)
+                return super().guest_command(name)
+
+        framework.TestRunner = BootedRunner
         script = "linux_libc_test-qemu.py"
         forwarded = ["--arch", args.arch]
     original = framework.load_testcases
@@ -83,13 +148,14 @@ def main():
             "/libc-test/src/math/log.exe": "log result and FP exception mismatch (CI 34016355478)",
             "/libc-test/src/functional/ipc_sem-static.exe": "SysV semaphore test hangs (CI 34016355478)",
             "/libc-test/src/regression/pthread_rwlock-ebusy-static.exe": "rwlock test hangs after a clean restart (CI 34022646551)",
-            # The ten below are what this job reports now that the image
-            # actually carries the suite (before the xtask `LIVE_TEST_SUITE`
-            # fix it carried none of it, and every case passed by not
-            # running). Measured on 2026-11-05 against d42bc22, all 476 cases
-            # in one boot, nothing hanging: 466 pass, these ten do not.
-            # Each reason is the guest's own words, so the next tanda can
-            # start from the message rather than from a rerun.
+            # The eight below are what the suite reports now that the image
+            # carries it (before the xtask `LIVE_TEST_SUITE` fix the x86_64
+            # image had none of it). Measured on 2026-11-05 against d42bc22,
+            # all 476 cases typed at one booted guest, nothing hanging: 466
+            # pass, these eight do not, and the two `RLIMIT_NPROC` cases pass
+            # once run as `nobody` (`UNPRIVILEGED`). Each reason is the
+            # guest's own words, so the next tanda can start from the message
+            # rather than from a rerun.
             #
             # Three that the harness cannot run from `/`: the DSO is named by
             # a path relative to the working directory, and every case is
@@ -102,16 +168,19 @@ def main():
             # tests/testcases/linux_libc_test/x86_64_qemu.txt.
             "/libc-test/src/regression/sem_close-unmap.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
             "/libc-test/src/regression/sem_close-unmap-static.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
-            # Three in libm, not in the kernel: the value is right every time
-            # and it is the raised FP exceptions, or an out-parameter, that
-            # differ.
-            "/libc-test/src/math/fmal.exe": "special/fmal.h:46 wants INEXACT|UNDERFLOW, gets INEXACT; the value is exact",
-            "/libc-test/src/math/powf.exe": "ucb/powf.h: pow(x,1) raises INEXACT|OVERFLOW and INEXACT|UNDERFLOW where none is wanted, five cases, value right",
-            "/libc-test/src/math/remquol.exe": "remquol writes 0 into *quo in EVERY case while returning the right remainder",
-            # And two that are the kernel's: `fork` does not look at
-            # RLIMIT_NPROC, so a process whose limit is 0 still forks.
-            "/libc-test/src/regression/pthread_atfork-errno-clobber.exe": "fork succeeds with RLIMIT_NPROC=0: fork does not enforce the limit (should be -EAGAIN)",
-            "/libc-test/src/regression/pthread_atfork-errno-clobber-static.exe": "fork succeeds with RLIMIT_NPROC=0: fork does not enforce the limit (should be -EAGAIN)",
+            # Three in libm that are not this kernel's, each run against the
+            # same binaries on a Linux host on 2026-11-05: `powf` and `fmal`
+            # fail the same way there natively (this musl's libm raises the
+            # wrong FP exceptions; the values are right), and `remquol`
+            # passes natively but fails identically under `qemu-x86_64` TCG
+            # -- musl's x86_64 remquol reads the quotient bits off `fprem1`'s
+            # condition codes (`fnstsw`), and QEMU 8.2 leaves C0/C1/C3 clear
+            # where the hardware sets them (a two-instruction probe: native
+            # 0x7000, TCG 0x3000). So it is the emulator the job runs on, and
+            # it would pass on real hardware.
+            "/libc-test/src/math/fmal.exe": "this musl's libm, same failure natively on Linux: special/fmal.h:46 wants INEXACT|UNDERFLOW, gets INEXACT",
+            "/libc-test/src/math/powf.exe": "this musl's libm, same failure natively on Linux: ucb/powf.h pow(x,1) raises INEXACT|OVERFLOW / INEXACT|UNDERFLOW, five cases",
+            "/libc-test/src/math/remquol.exe": "QEMU TCG: fprem1 leaves the quotient condition codes clear, so musl's remquol writes 0 into *quo (passes natively, fails the same under qemu-x86_64)",
         },
         ("aarch64", False): {
             "/libc-test/src/functional/pthread_tsd-static.exe": "thread-specific destructor test hangs (CI 34011543846)",
@@ -141,9 +210,13 @@ def main():
                     "thread cancellation/exit/join test hangs in fresh QEMU (CI 34016355478, 34018139132)"
                 )
 
+    unprivileged = UNPRIVILEGED if not args.libos else set()
+
     def load_testcases(filename):
         selected = []
         for name, status in original(filename):
+            if name in unprivileged:
+                status = framework.TestStatus.OK
             reason = regressions.get(name)
             if status != framework.TestStatus.OK:
                 reason = reason or f"Existing classification: {status.name}"

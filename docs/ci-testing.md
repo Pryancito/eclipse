@@ -38,7 +38,13 @@ lifecycle cases unless a suffix is given. CI uploads the guest,
 kernel, and host diagnostic files even if a test job fails. LibOS libc tests
 also use INFO and keep a separate kernel/host log for each case. The QEMU libc
 runner waits for a unique guest completion marker and checks its exit code;
-shell prompts and echoed commands cannot count as successful completion.
+shell prompts and echoed commands cannot count as successful completion. It
+also waits for the guest's prompt before the first case (up to 300 s): the
+submodule gives the boot 5 s, and under TCG the shell is ~30 s away on x86_64
+and ~15 s on aarch64, so every case of both jobs timed out with no output. The
+two `pthread_atfork-errno-clobber` cases run as `nobody`, because `RLIMIT_NPROC`
+does not bind root here any more than it does on Linux, and are expected to
+pass.
 
 The trapframe dependency is pinned to `codex/zcore-fncall-integration`, based
 on upstream `codex/fncall`. zCore enables `fncall-preserve-x18` because Fuchsia
