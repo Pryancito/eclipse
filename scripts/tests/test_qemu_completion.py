@@ -59,6 +59,97 @@ class CompletionProtocol(unittest.TestCase):
             instance.zcore_proc.stdout.close()
         self.assertFalse(instance.receiver_thread.is_alive())
 
+    def test_a_subclass_chooses_what_is_typed_for_a_case(self):
+        """`guest_command` is the hook `scripts/linux_libc_test.py` uses to
+        run a case as `nobody`: the marker still follows whatever it typed."""
+
+        class Status(enum.Enum):
+            OK = 0
+            FAILED = 1
+            TIMEOUT = 2
+
+        class Base:
+            def check_output(self, output):
+                return Status.OK
+
+        class AsSomeoneElse(runner.completion_runner(Base, Status)):
+            def guest_command(self, name):
+                return "env WHO=nobody " + super().guest_command(name)
+
+        instance = AsSomeoneElse()
+        instance.lk = threading.Lock()
+        instance.output = ""
+        instance.thread_stop_flag = False
+        instance.logger = SimpleNamespace(println=lambda message: None, println_file_only=lambda message: None)
+        instance.zcore_proc = subprocess.Popen(["sh"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+
+        def read():
+            for line in instance.zcore_proc.stdout:
+                with instance.lk:
+                    instance.output += line.decode()
+
+        instance.receiver_thread = threading.Thread(target=read)
+        instance.receiver_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                script = Path(directory) / "who am i.sh"
+                script.write_text("#!/bin/sh\n[ \"$WHO\" = nobody ]\n")
+                script.chmod(0o755)
+                self.assertEqual(instance.run_one(str(script), timeout=2), Status.OK)
+        finally:
+            instance.stop_qemu()
+            instance.zcore_proc.stdin.close()
+            instance.zcore_proc.stdout.close()
+
+    def test_a_subclass_chooses_what_the_classifier_sees(self):
+        """The hook for `scripts/linux_libc_test.py` to take the kernel's own
+        console lines out before the submodule's substring check."""
+
+        class Status(enum.Enum):
+            OK = 0
+            FAILED = 1
+            TIMEOUT = 2
+
+        class Base:
+            def check_output(self, output):
+                return Status.FAILED if "ERROR" in output else Status.OK
+
+        class WithoutKernelLines(runner.completion_runner(Base, Status)):
+            def classified_output(self, output):
+                return output.replace("[kernel] ERROR", "")
+
+        instance = WithoutKernelLines()
+        instance.lk = threading.Lock()
+        instance.output = ""
+        instance.thread_stop_flag = False
+        instance.logger = SimpleNamespace(println=lambda message: None, println_file_only=lambda message: None)
+        instance.zcore_proc = subprocess.Popen(["sh"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+
+        def read():
+            for line in instance.zcore_proc.stdout:
+                with instance.lk:
+                    instance.output += line.decode()
+
+        instance.receiver_thread = threading.Thread(target=read)
+        instance.receiver_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                script = Path(directory) / "case.sh"
+                script.write_text("#!/bin/sh\necho '[kernel] ERROR something else died'\n")
+                script.chmod(0o755)
+                self.assertEqual(instance.run_one(str(script), timeout=2), Status.OK)
+                script.write_text("#!/bin/sh\necho 'ERROR in the case itself'\n")
+                self.assertEqual(instance.run_one(str(script), timeout=2), Status.FAILED)
+        finally:
+            instance.stop_qemu()
+            instance.zcore_proc.stdin.close()
+            instance.zcore_proc.stdout.close()
+
+    def test_the_guest_console_ends_the_marker_line_in_two_returns(self):
+        # What the serial console of a booted x86_64 guest actually sends.
+        self.assertEqual(runner.exit_code("\r\r\n__CASE__:0\r\r\n/ # ", "__CASE__"), 0)
+        self.assertEqual(runner.exit_code("__CASE__:3\r\n", "__CASE__"), 3)
+
     def test_nonzero_exit_and_incomplete_marker(self):
         self.assertEqual(runner.exit_code("__CASE__:127\n", "__CASE__"), 127)
         self.assertIsNone(runner.exit_code("__CASE__:", "__CASE__"))
