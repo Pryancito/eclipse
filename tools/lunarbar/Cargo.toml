@@ -33,10 +33,10 @@ libc = "0.2"
 # png+miniz_oxide, still a static binary — no gdk-pixbuf).
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 embedded-graphics = "0.8"
-# The vector text face: parses DejaVu Sans Mono's outlines, which tiny-skia
-# then fills anti-aliased (see src/vtext.rs). Pure Rust, no dependencies,
-# so the binaries stay static; the bitmap face is the fallback.
-ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+# The vector text face (DejaVu Sans Mono outlines as tiny-skia paths), shared
+# with lunarbg and SilverSurfer; see src/vtext.rs. Pure Rust, so the binaries
+# stay static; the bitmap face is the fallback.
+lunartext = { path = "../lunartext" }
 # Pure-Rust Wayland stack (no libwayland-client.so): the default wayland-backend
 # is the Rust implementation, so the binary is fully static. NO GTK, NO D-Bus,
 # NO gdk-pixbuf, NO fontconfig — the whole reason lunarbar exists as waybar's

@@ -783,6 +783,10 @@ fn icon_close(pixmap: &mut Pixmap, tab: RectI, scale: i32, rgb: Rgb) {
 }
 
 fn label_scaled(target: &mut ArgbTarget<'_>, x: i32, y: i32, text: &str, rgb: Rgb, scale: i32) {
+    let (w, h) = (target.width, target.height);
+    if crate::vtext::label(target.data, w, h, x, y, text, (rgb.r, rgb.g, rgb.b), scale) {
+        return;
+    }
     let scale = scale.max(1);
     // Draw into a 1× logical buffer then stamp scale×scale blocks so glyphs
     // stay sharp on HiDPI instead of nearest-neighbour upscaling the strip.

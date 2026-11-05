@@ -19,6 +19,9 @@ libc = "0.2"
 # wayland-backend is the Rust implementation, so the binary is fully static.
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Vector text for the tecno caption (DejaVu Sans Mono outlines, anti-aliased),
+# shared with the other Lunar clients. Pure Rust: the binary stays static.
+lunartext = { path = "../lunartext" }
 
 [profile.release]
 # opt-level 3 (not "z"): the scene renderer is per-pixel float math over the
