@@ -135,22 +135,31 @@ fn js_string_literal(s: &str) -> String {
 }
 
 pub fn status_page_url(blocked_hint: usize) -> Url {
-    let on = if enabled() {
-        "activo"
+    let l = crate::lang();
+    let on = l.s(if enabled() {
+        crate::Key::www_filter_on
     } else {
-        "desactivado (SILVERSURFER_ADBLOCK=0)"
-    };
+        crate::Key::www_filter_off
+    });
+    let n = BLOCK_DOMAINS.len() + BLOCK_FILES.len() + BLOCK_DIRS.len() + BLOCK_PATH_PREFIXES.len();
+    // Three values in the middle of one sentence, so the row carries three
+    // `{}` holes and they are filled left to right: the two languages do not
+    // put them in the same places.
+    let state = l
+        .s(crate::Key::www_filter_state)
+        .replacen("{}", on, 1)
+        .replacen("{}", &n.to_string(), 1)
+        .replacen("{}", &blocked_hint.to_string(), 1);
     let body = format!(
-        "<!doctype html><meta charset=utf-8><title>Filtro — SilverSurfer</title>\
+        "<!doctype html><meta charset=utf-8><title>{tab} — SilverSurfer</title>\
 <style>body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;background:#111;color:#eee;max-width:40rem}}\
 code{{background:#222;padding:.1rem .35rem}}h1{{font-size:1.35rem}}</style>\
-<h1>Bloqueo de anuncios (lite)</h1>\
-<p>Estado: <strong>{on}</strong>. Reglas embebidas: {n}. \
-Cancelaciones de red en esta sesión (aprox.): {blocked}.</p>\
-<p>No es uBlock: solo hosts/paths frecuentes + CSS hide. Sin WebExtensions.</p>",
-        on = on,
-        n = BLOCK_DOMAINS.len() + BLOCK_FILES.len() + BLOCK_DIRS.len() + BLOCK_PATH_PREFIXES.len(),
-        blocked = blocked_hint
+<h1>{head}</h1>\
+<p>{state}</p>\
+<p>{tail}</p>",
+        tab = l.s(crate::Key::www_filter),
+        head = l.s(crate::Key::www_filter_title),
+        tail = l.s(crate::Key::www_filter_not_ublock),
     );
     let path = std::env::temp_dir().join("silversurfer-filters.html");
     let _ = std::fs::write(&path, body);

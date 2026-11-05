@@ -138,15 +138,17 @@ pub fn record(url: &str, title: &str) {
 /// Página `about:history` como fichero temporal.
 pub fn page_url() -> url::Url {
     let history = load();
-    let mut body = String::from(
-        "<!doctype html><meta charset=utf-8><title>Historial — SilverSurfer</title>\
-<style>body{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}\
-a{color:#7ec8ff;text-decoration:none}a:hover{text-decoration:underline}\
-li{margin:.4rem 0}.t{color:#999;margin-left:.5rem;font-size:12px}\
-h1{font-size:1.4rem}</style><h1>Historial</h1>",
+    let l = crate::lang();
+    let head = l.s(crate::Key::www_history);
+    let mut body = format!(
+        "<!doctype html><meta charset=utf-8><title>{head} — SilverSurfer</title>\
+<style>body{{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}}\
+a{{color:#7ec8ff;text-decoration:none}}a:hover{{text-decoration:underline}}\
+li{{margin:.4rem 0}}.t{{color:#999;margin-left:.5rem;font-size:12px}}\
+h1{{font-size:1.4rem}}</style><h1>{head}</h1>",
     );
     if history.visits.is_empty() {
-        body.push_str("<p>Aún no hay visitas.</p>");
+        body.push_str(&format!("<p>{}</p>", l.s(crate::Key::www_history_empty)));
     } else {
         body.push_str("<ol>");
         for visit in &history.visits {

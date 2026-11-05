@@ -280,17 +280,17 @@ fn curl_args(url: &url::Url, dest: &Path, request: &Request) -> Vec<std::ffi::Os
 
 pub fn page_url() -> url::Url {
     let log = load();
-    let mut body = String::from(
-        "<!doctype html><meta charset=utf-8><title>Descargas — SilverSurfer</title>\
-<style>body{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}\
-a{color:#7ec8ff;text-decoration:none}.ok{color:#8f8}.fail{color:#f88}\
-li{margin:.45rem 0}.t{color:#999;font-size:12px;display:block}\
-h1{font-size:1.4rem}</style><h1>Descargas</h1>",
+    let l = crate::lang();
+    let head = l.s(crate::Key::word_downloads);
+    let mut body = format!(
+        "<!doctype html><meta charset=utf-8><title>{head} — SilverSurfer</title>\
+<style>body{{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}}\
+a{{color:#7ec8ff;text-decoration:none}}.ok{{color:#8f8}}.fail{{color:#f88}}\
+li{{margin:.45rem 0}}.t{{color:#999;font-size:12px;display:block}}\
+h1{{font-size:1.4rem}}</style><h1>{head}</h1>",
     );
     if log.entries.is_empty() {
-        body.push_str(
-            "<p>Aún no hay descargas. Navega a un PDF/ZIP o usa Ctrl+S sobre una URL.</p>",
-        );
+        body.push_str(&format!("<p>{}</p>", l.s(crate::Key::www_downloads_empty)));
     } else {
         body.push_str("<ol>");
         for entry in &log.entries {

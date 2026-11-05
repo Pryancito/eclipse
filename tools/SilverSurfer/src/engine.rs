@@ -435,7 +435,10 @@ impl Delegate {
         if tab.loading && !tab.title.is_empty() {
             format!("…{} — SilverSurfer", tab.title)
         } else if tab.loading {
-            "Cargando — SilverSurfer".into()
+            format!(
+                "{} — SilverSurfer",
+                crate::lang().s(crate::Key::www_loading)
+            )
         } else if tab.title.is_empty() {
             "SilverSurfer".into()
         } else {
@@ -1258,7 +1261,7 @@ impl WebViewDelegate for Delegate {
                             separator: true,
                         },
                         ContextMenuItem::Item { label, enabled, .. } => menu::Item {
-                            label: label.clone(),
+                            label: menu::translated_label(label),
                             enabled: *enabled,
                             separator: false,
                         },

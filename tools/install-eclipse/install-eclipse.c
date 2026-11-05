@@ -97,6 +97,8 @@ static const char *disk_fs(void) {
 
 #define BG_BLUE       "\x1b[44m"
 
+#include "i18n.h"
+
 #define log installer_log
 
 enum install_mode {
@@ -415,7 +417,7 @@ static int sha256_file_path(const char *path, char *hex_out) {
                 pct = 100;
             }
             if (pct > last_pct) {
-                fprintf(stdout, "\rVerificando %s: %d%%...", disk_basename(path), pct);
+                fprintf(stdout, T(S_PROGRESS_VERIFY), disk_basename(path), pct);
                 fflush(stdout);
                 last_pct = pct;
             }
@@ -495,18 +497,14 @@ static int verify_efi_image_fits_partition(const struct partition_plan *efi_part
     }
     part_bytes = efi_part->sectors * SECTOR_SIZE;
     if (gzip_uncompressed_size(efi_part->image_path, &unc) != 0) {
-        log(COLOR_YELLOW
-            "ADVERTENCIA: No se pudo leer el tamaño de %s; se omite comprobación de capacidad EFI."
-            COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_WARN_NO_EFI_SIZE),
             efi_part->image_path);
         return 0;
     }
     if (unc > part_bytes) {
-        log(COLOR_RED COLOR_BOLD
-            "ERROR: efi.img.gz descomprimido (%llu MiB) excede la partición EFI (%llu MiB)."
-            COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_EFI_TOO_BIG),
             (unsigned long long)(unc / MIB), (unsigned long long)(part_bytes / MIB));
-        log("Reconstruya la imagen live (`make image`) con efi.img del mismo tamaño o aumente PART1_SIZE_MIB.");
+        log(T(S_REBUILD_IMAGE));
         return -1;
     }
     return 0;
@@ -791,11 +789,11 @@ static void format_size(char *buf, size_t buf_size, uint64_t size_bytes) {
 static const char *mode_label(enum install_mode mode) {
     switch (mode) {
         case MODE_NEW:
-            return "Nueva instalación";
+            return T(S_MODE_NEW);
         case MODE_UPGRADE:
-            return "Actualización";
+            return T(S_MODE_UPGRADE);
         default:
-            return "Sin definir";
+            return T(S_UNSET);
     }
 }
 
@@ -815,25 +813,25 @@ static const char *layout_label(enum layout_mode layout) {
     part1_size_label(efi_label, sizeof(efi_label));
     switch (layout) {
         case LAYOUT_SIMPLE:
-            snprintf(simple_buf, sizeof(simple_buf), "Simple (EFI %s + ROOT resto)", efi_label);
+            snprintf(simple_buf, sizeof(simple_buf), T(S_LAYOUT_SIMPLE), efi_label);
             return simple_buf;
         case LAYOUT_ADVANCED:
             snprintf(advanced_buf, sizeof(advanced_buf),
-                      "Avanzado (EFI %s + ROOT + HOME + SWAP)", efi_label);
+                      T(S_LAYOUT_ADVANCED), efi_label);
             return advanced_buf;
         default:
-            return "Sin definir";
+            return T(S_UNSET);
     }
 }
 
 static const char *table_label(enum table_mode table) {
     switch (table) {
         case TABLE_MBR:
-            return "MBR/BIOS";
+            return T(S_TABLE_MBR);
         case TABLE_GPT:
-            return "GPT/UEFI";
+            return T(S_TABLE_GPT);
         default:
-            return "Sin cambios";
+            return T(S_TABLE_UNCHANGED);
     }
 }
 
@@ -865,7 +863,7 @@ static int detect_existing_install(const char *disk_path, struct existing_instal
 
     int fd = open(disk_path, O_RDONLY);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para detectar instalaciones previas (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_PREV),
             disk_path, strerror(errno));
         return -1;
     }
@@ -873,7 +871,7 @@ static int detect_existing_install(const char *disk_path, struct existing_instal
     unsigned char sector0[SECTOR_SIZE];
     ssize_t nread = pread(fd, sector0, sizeof(sector0), 0);
     if (nread != (ssize_t)sizeof(sector0)) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer el sector 0 de %s." COLOR_RESET, disk_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ_SECTOR0), disk_path);
         close(fd);
         return -1;
     }
@@ -1008,7 +1006,7 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--disk") == 0) {
             if (i + 1 >= argc) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --disk requiere una ruta." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_NEEDS_PATH));
                 return -1;
             }
             strncpy(cfg->disk_path, argv[++i], sizeof(cfg->disk_path) - 1);
@@ -1016,7 +1014,7 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
             cfg->disk_set = 1;
         } else if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --mode requiere new o upgrade." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_MODE_NEEDS_VALUE));
                 return -1;
             }
             const char *value = argv[++i];
@@ -1025,7 +1023,7 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
             } else if (strcmp(value, "upgrade") == 0) {
                 cfg->mode = MODE_UPGRADE;
             } else {
-                log(COLOR_RED COLOR_BOLD "ERROR: modo inválido: %s" COLOR_RESET, value);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_BAD_MODE), value);
                 return -1;
             }
             cfg->mode_set = 1;
@@ -1035,34 +1033,46 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
             cfg->dry_run = 1;
         } else if (strcmp(argv[i], "--simple") == 0) {
             if (cfg->layout_set && cfg->layout != LAYOUT_SIMPLE) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --simple y --advanced son mutuamente excluyentes." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_LAYOUT_EXCLUSIVE));
                 return -1;
             }
             cfg->layout = LAYOUT_SIMPLE;
             cfg->layout_set = 1;
         } else if (strcmp(argv[i], "--advanced") == 0) {
             if (cfg->layout_set && cfg->layout != LAYOUT_ADVANCED) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --simple y --advanced son mutuamente excluyentes." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_LAYOUT_EXCLUSIVE));
                 return -1;
             }
             cfg->layout = LAYOUT_ADVANCED;
             cfg->layout_set = 1;
         } else if (strcmp(argv[i], "--mbr") == 0) {
             if (cfg->table_set && cfg->table != TABLE_MBR) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --mbr y --gpt son mutuamente excluyentes." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_TABLE_EXCLUSIVE));
                 return -1;
             }
             cfg->table = TABLE_MBR;
             cfg->table_set = 1;
         } else if (strcmp(argv[i], "--gpt") == 0) {
             if (cfg->table_set && cfg->table != TABLE_GPT) {
-                log(COLOR_RED COLOR_BOLD "ERROR: --mbr y --gpt son mutuamente excluyentes." COLOR_RESET);
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_TABLE_EXCLUSIVE));
                 return -1;
             }
             cfg->table = TABLE_GPT;
             cfg->table_set = 1;
+        } else if (strcmp(argv[i], "--lang") == 0) {
+            /* El idioma ya lo ha fijado `installer_lang_init` antes de
+             * `parse_args`, para que estos mismos errores salgan traducidos.
+             * Aqui solo se valida y se consume el valor. */
+            if (i + 1 >= argc) {
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_LANG_NEEDS_VALUE));
+                return -1;
+            }
+            if (installer_lang_from_name(argv[++i]) < 0) {
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_BAD_LANG), argv[i]);
+                return -1;
+            }
         } else {
-            log(COLOR_RED COLOR_BOLD "ERROR: argumento no reconocido: %s" COLOR_RESET, argv[i]);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_BAD_ARG), argv[i]);
             return -1;
         }
     }
@@ -1072,12 +1082,12 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
 
 static int prompt_disk_selection(struct config *cfg, struct disk_info disks[MAX_DISKS], char disk_list[MAX_DISKS][128], int found_disks) {
     if (cfg->disk_set) {
-        log("Disco preseleccionado por CLI: " COLOR_YELLOW "%s" COLOR_RESET, cfg->disk_path);
+        log(T(S_DISK_FROM_CLI), cfg->disk_path);
         return 0;
     }
 
     if (found_disks <= 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se detectaron discos de almacenamiento." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_DISKS));
         return -1;
     }
 
@@ -1085,14 +1095,14 @@ static int prompt_disk_selection(struct config *cfg, struct disk_info disks[MAX_
     cfg->disk_path[sizeof(cfg->disk_path) - 1] = 0;
 
     if (cfg->auto_yes) {
-        log("--yes activo: usando el primer disco detectado (%s).", cfg->disk_path);
+        log(T(S_YES_FIRST_DISK), cfg->disk_path);
         return 0;
     }
 
     char input[64];
-    log("Seleccione el disco de destino [por defecto: %s]:", cfg->disk_path);
+    log(T(S_ASK_DISK), cfg->disk_path);
     if (safe_flush_input(input, sizeof(input)) != 0) {
-        log("Entrada vacía: usando %s.", cfg->disk_path);
+        log(T(S_EMPTY_INPUT_USING), cfg->disk_path);
         return 0;
     }
 
@@ -1109,7 +1119,7 @@ static int prompt_disk_selection(struct config *cfg, struct disk_info disks[MAX_
             return 0;
         }
         if (parsed == -1 && strspn(input, "0123456789") == strlen(input)) {
-            log(COLOR_RED "Opción numérica fuera de rango o inválida." COLOR_RESET);
+            log(TC(COLOR_RED, S_BAD_CHOICE));
             return 0;
         }
     }
@@ -1122,28 +1132,28 @@ static int prompt_disk_selection(struct config *cfg, struct disk_info disks[MAX_
 
 static int prompt_install_mode(struct config *cfg, const struct existing_install_info *info) {
     if (cfg->mode_set) {
-        log("Modo preseleccionado por CLI: %s", mode_label(cfg->mode));
+        log(T(S_MODE_FROM_CLI), mode_label(cfg->mode));
         return 0;
     }
 
     enum install_mode suggested = info->suggest_upgrade ? MODE_UPGRADE : MODE_NEW;
     if (info->suggest_upgrade) {
-        log(COLOR_YELLOW COLOR_BOLD "Se detectó una instalación existente compatible; se recomienda ACTUALIZACIÓN." COLOR_RESET);
+        log(TC(COLOR_YELLOW COLOR_BOLD, S_FOUND_INSTALL));
     } else {
-        log("No se detectó instalación previa conocida; se recomienda NUEVA instalación.");
+        log(T(S_NO_INSTALL));
     }
 
     if (cfg->auto_yes) {
         cfg->mode = suggested;
-        log("--yes activo: usando modo sugerido (%s).", mode_label(cfg->mode));
+        log(T(S_YES_MODE), mode_label(cfg->mode));
         return 0;
     }
 
     char input[32];
-    log("Seleccione el modo de instalación:");
-    log("  [1] Nueva instalación (reparticiona y reescribe imágenes)");
-    log("  [2] Actualización (Sin reparticionado ni reinstalacion de sistema.)");
-    log("Opción recomendada [%d]:", suggested == MODE_NEW ? 1 : 2);
+    log(T(S_ASK_MODE));
+    log(T(S_MODE_OPT_NEW));
+    log(T(S_MODE_OPT_UPGRADE));
+    log(T(S_ASK_RECOMMENDED_N), suggested == MODE_NEW ? 1 : 2);
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->mode = suggested;
         return 0;
@@ -1166,23 +1176,23 @@ static int prompt_install_mode(struct config *cfg, const struct existing_install
 
 static int prompt_layout(struct config *cfg) {
     if (cfg->layout_set) {
-        log("Esquema de particiones preseleccionado por CLI: %s", layout_label(cfg->layout));
+        log(T(S_LAYOUT_FROM_CLI), layout_label(cfg->layout));
         return 0;
     }
 
     if (cfg->auto_yes) {
         cfg->layout = LAYOUT_SIMPLE;
-        log("--yes activo: usando esquema simple por defecto.");
+        log(T(S_YES_LAYOUT));
         return 0;
     }
 
     char input[32];
     char efi_label[16];
     part1_size_label(efi_label, sizeof(efi_label));
-    log("Seleccione el esquema de particiones:");
-    log("  [1] Simple    -> EFI %s + ROOT resto", efi_label);
-    log("  [2] Avanzado  -> EFI %s + ROOT + HOME + SWAP", efi_label);
-    log("Opción recomendada [1]:");
+    log(T(S_ASK_LAYOUT));
+    log(T(S_LAYOUT_OPT_SIMPLE), efi_label);
+    log(T(S_LAYOUT_OPT_ADVANCED), efi_label);
+    log(T(S_ASK_RECOMMENDED_1));
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->layout = LAYOUT_SIMPLE;
         return 0;
@@ -1209,19 +1219,13 @@ static int prompt_layout(struct config *cfg) {
  * aviso hace falta. Lo que hay que cambiar es el modo del firmware, no la
  * tabla de particiones. */
 static void warn_boot_environment(int running_on_efi) {
-    log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
+    log(T(S_BOOT_ENV), running_on_efi ? T(S_BOOT_EFI) : T(S_BOOT_BIOS));
     if (running_on_efi) {
         return;
     }
-    log(COLOR_YELLOW COLOR_BOLD
-        "AVISO: Eclipse arranca únicamente por UEFI; no existe un cargador para BIOS."
-        COLOR_RESET);
-    log(COLOR_YELLOW
-        "  Arranque el medio de instalación en modo UEFI (desactive CSM/Legacy en el"
-        COLOR_RESET);
-    log(COLOR_YELLOW
-        "  firmware) o el disco instalado no aparecerá como opción de arranque."
-        COLOR_RESET);
+    log(TC(COLOR_YELLOW COLOR_BOLD, S_WARN_UEFI_ONLY));
+    log(TC(COLOR_YELLOW, S_WARN_UEFI_ONLY2));
+    log(TC(COLOR_YELLOW, S_WARN_UEFI_ONLY3));
 }
 
 /* El aviso de MBR va en TODA salida de `prompt_table` -- la de `--mbr`, la de
@@ -1234,17 +1238,15 @@ static void warn_if_mbr(enum table_mode table) {
     /* La partición 1 se marca de tipo 0xEF (EFI System), así que un firmware
      * en modo UEFI puede arrancar este disco; muchos lo hacen, pero no todos,
      * y en modo BIOS no arranca ninguno. */
-    log(COLOR_YELLOW COLOR_BOLD
-        "AVISO: con MBR el disco sólo arranca si el firmware está en modo UEFI y acepta"
-        COLOR_RESET);
-    log(COLOR_YELLOW "  una ESP en MBR. GPT/UEFI es lo seguro." COLOR_RESET);
+    log(TC(COLOR_YELLOW COLOR_BOLD, S_WARN_MBR));
+    log(TC(COLOR_YELLOW, S_WARN_MBR2));
 }
 
 static int prompt_table(struct config *cfg, int running_on_efi) {
     warn_boot_environment(running_on_efi);
 
     if (cfg->table_set) {
-        log("Tabla de particiones preseleccionada por CLI: %s", table_label(cfg->table));
+        log(T(S_TABLE_FROM_CLI), table_label(cfg->table));
         warn_if_mbr(cfg->table);
         return 0;
     }
@@ -1253,20 +1255,20 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
      * arrancado: es la única tabla con la que el disco instalado aparece como
      * opción de arranque. */
     enum table_mode suggested = TABLE_GPT;
-    log("Se recomienda %s.", table_label(suggested));
+    log(T(S_RECOMMENDED), table_label(suggested));
 
     if (cfg->auto_yes) {
         cfg->table = suggested;
-        log("--yes activo: usando tabla sugerida (%s).", table_label(cfg->table));
+        log(T(S_YES_TABLE), table_label(cfg->table));
         warn_if_mbr(cfg->table);
         return 0;
     }
 
     char input[32];
-    log("Seleccione la tabla de particiones:");
-    log("  [1] MBR/BIOS");
-    log("  [2] GPT/UEFI");
-    log("Opción recomendada [%d]:", suggested == TABLE_MBR ? 1 : 2);
+    log(T(S_ASK_TABLE));
+    log(T(S_TABLE_OPT_MBR));
+    log(T(S_TABLE_OPT_GPT));
+    log(T(S_ASK_RECOMMENDED_N), suggested == TABLE_MBR ? 1 : 2);
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->table = suggested;
         warn_if_mbr(cfg->table);
@@ -1291,7 +1293,8 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
 
 static int ask_yes_no(const char *prompt, int default_yes, int auto_yes) {
     if (auto_yes) {
-        log("%s %s (--yes)", prompt, default_yes ? "Sí" : "Sí");
+        (void)default_yes;
+        log("%s %s (--yes)", prompt, T(S_WORD_YES));
         return 1;
     }
 
@@ -1337,7 +1340,7 @@ static int run_command_logged(const char *cmd, int dry_run) {
     snprintf(full_cmd, sizeof(full_cmd), "%s 2>&1", cmd);
     FILE *pipe = popen(full_cmd, "r");
     if (pipe == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo ejecutar comando: %s" COLOR_RESET, cmd);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_RUN), cmd);
         return -1;
     }
 
@@ -1351,11 +1354,11 @@ static int run_command_logged(const char *cmd, int dry_run) {
 
     int status = pclose(pipe);
     if (status == -1) {
-        log(COLOR_RED COLOR_BOLD "ERROR: pclose() falló para: %s" COLOR_RESET, cmd);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_PCLOSE), cmd);
         return -1;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: comando falló (%d): %s" COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CMD_FAILED),
             WIFEXITED(status) ? WEXITSTATUS(status) : status, cmd);
         return -1;
     }
@@ -1386,38 +1389,38 @@ static int verify_sha256_file(const char *image_path) {
     snprintf(sha_path, sizeof(sha_path), "%s.sha256", image_path);
 
     if (!struct_file_exists(sha_path)) {
-        log(COLOR_YELLOW "ADVERTENCIA: No existe %s; se omite verificación SHA-256 previa." COLOR_RESET, sha_path);
+        log(TC(COLOR_YELLOW, S_WARN_NO_SHA_FILE), sha_path);
         return 0;
     }
 
     FILE *fp = fopen(sha_path, "r");
     if (fp == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s." COLOR_RESET, sha_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_PLAIN), sha_path);
         return -1;
     }
 
     char expected[SHA256_HEX_LEN + 1];
     if (fscanf(fp, "%64s", expected) != 1) {
         fclose(fp);
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer el hash esperado de %s." COLOR_RESET, sha_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_SHA_EXPECTED), sha_path);
         return -1;
     }
     fclose(fp);
 
     char actual[SHA256_HEX_LEN + 1];
     if (sha256_file_path(image_path, actual) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo calcular SHA-256 de %s." COLOR_RESET, image_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_SHA_COMPUTE), image_path);
         return -1;
     }
 
     if (strcasecmp(expected, actual) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: SHA-256 no coincide para %s." COLOR_RESET, image_path);
-        log("  Esperado: %s", expected);
-        log("  Actual:   %s", actual);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_SHA_MISMATCH), image_path);
+        log(T(S_HASH_EXPECTED), expected);
+        log(T(S_HASH_ACTUAL), actual);
         return -1;
     }
 
-    log(COLOR_GREEN "SHA-256 verificado correctamente para %s." COLOR_RESET, image_path);
+    log(TC(COLOR_GREEN, S_SHA_OK), image_path);
     return 0;
 }
 
@@ -1445,12 +1448,11 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     memset(parts, 0, sizeof(struct partition_plan) * 4);
 
     if (disk_sectors < PART1_START + PART1_SECTORS + 4096ULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para instalar Eclipse OS." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_TOO_SMALL));
         return -1;
     }
     if (table == TABLE_GPT && last_lba < PART1_START + PART1_SECTORS + 2048ULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para GPT (se reservan %llu sectores al final)."
-            COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_TOO_SMALL_GPT_TAIL),
             (unsigned long long)GPT_BACKUP_RESERVED_SECTORS);
         return -1;
     }
@@ -1471,7 +1473,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         parts[1].start_sector = next_start;
         parts[1].sectors = sectors_from_start(disk_sectors, parts[1].start_sector, table);
         if (parts[1].sectors < 2048ULL) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No hay espacio suficiente para ROOT." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_ROOM_ROOT));
             return -1;
         }
         parts[1].mbr_type = 0x83;
@@ -1483,7 +1485,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         {
             char efi_label[16];
             part1_size_label(efi_label, sizeof(efi_label));
-            snprintf(summary, summary_size, "Simple (EFI %s + ROOT resto)", efi_label);
+            snprintf(summary, summary_size, T(S_LAYOUT_SIMPLE), efi_label);
         }
         return 0;
     }
@@ -1506,7 +1508,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
 
     uint64_t swap_start = align_down_u64(last_lba + 1ULL - swap_target, 2048ULL);
     if (swap_start <= next_start + 4096ULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para el esquema avanzado." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_TOO_SMALL_ADV));
         return -1;
     }
 
@@ -1514,7 +1516,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
         root_target = align_down_u64((swap_start - next_start) / 2ULL, 2048ULL);
     }
     if (root_target < 2048ULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No hay espacio suficiente para ROOT en el esquema avanzado." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_ROOM_ROOT_ADV));
         return -1;
     }
 
@@ -1530,7 +1532,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     strcpy(parts[2].name, "HOME");
     parts[2].start_sector = align_up_u64(parts[1].start_sector + parts[1].sectors, 2048ULL);
     if (parts[2].start_sector >= swap_start) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No hay espacio suficiente para HOME en el esquema avanzado." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_ROOM_HOME_ADV));
         return -1;
     }
     parts[2].sectors = swap_start - parts[2].start_sector;
@@ -1553,7 +1555,7 @@ static int build_partition_plan(enum layout_mode layout, enum table_mode table, 
     {
         char efi_label[16];
         part1_size_label(efi_label, sizeof(efi_label));
-        snprintf(summary, summary_size, "Avanzado (EFI %s + ROOT + HOME + SWAP)", efi_label);
+        snprintf(summary, summary_size, T(S_LAYOUT_ADVANCED), efi_label);
     }
     return 0;
 }
@@ -1718,17 +1720,17 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
     int i;
 
     if (disk_bytes < (PART1_START + PART1_SECTORS + 4096ULL) * SECTOR_SIZE) {
-        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para GPT." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_TOO_SMALL_GPT));
         return -1;
     }
     if (part_count <= 0 || part_count > (int)GPT_NUM_ENTRIES) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Número de particiones GPT inválido." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_COUNT));
         return -1;
     }
 
     last_lba = (disk_bytes / SECTOR_SIZE) - 1ULL;
     if (last_lba < GPT_ENTRY_SECTORS + 34ULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: El disco es demasiado pequeño para la cabecera GPT de respaldo." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_TOO_SMALL_BACKUP));
         return -1;
     }
 
@@ -1752,12 +1754,12 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
         uint64_t end_lba = parts[i].start_sector + parts[i].sectors - 1ULL;
 
         if (parts[i].start_sector < first_usable || end_lba > last_usable) {
-            log(COLOR_RED COLOR_BOLD "ERROR: La partición %s queda fuera del rango GPT utilizable." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_OUT_GPT),
                 parts[i].name);
             return -1;
         }
         if (parse_gpt_uuid(parts[i].gpt_type, entries[i].type_guid) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: GUID GPT inválido para %s." COLOR_RESET, parts[i].name);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_GUID), parts[i].name);
             return -1;
         }
         generate_guid(entries[i].partition_guid, (uint64_t)i + 1ULL);
@@ -1799,7 +1801,7 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
 
     fd = open(disk_path, O_RDWR);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET, disk_path, strerror(errno));
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN), disk_path, strerror(errno));
         return -1;
     }
 
@@ -1808,20 +1810,20 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
         write_disk_lba(fd, 2, entries, sizeof(entries)) != 0 ||
         write_disk_lba(fd, backup_entries_lba, entries, sizeof(entries)) != 0 ||
         write_disk_lba(fd, last_lba, &backup, sizeof(backup)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Falló la escritura de la tabla GPT en %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_WRITE_DEV),
             disk_path, strerror(errno));
         close(fd);
         return -1;
     }
 
     if (fsync(fd) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: fsync falló tras escribir GPT (%s)." COLOR_RESET, strerror(errno));
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_FSYNC), strerror(errno));
         close(fd);
         return -1;
     }
 
     close(fd);
-    log(COLOR_GREEN "Tabla GPT escrita correctamente (escritor integrado)." COLOR_RESET);
+    log(TC(COLOR_GREEN, S_GPT_OK));
     return 0;
 }
 
@@ -1832,7 +1834,7 @@ static int prepare_gpt_or_fallback(enum table_mode *table) {
 
 static int write_mbr_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Se escribiría tabla MBR en %s." COLOR_RESET, disk_path);
+        log(TC(COLOR_YELLOW, S_DRY_MBR), disk_path);
         return 0;
     }
 
@@ -1841,7 +1843,7 @@ static int write_mbr_partition_table(const char *disk_path, const struct partiti
 
     for (int i = 0; i < part_count && i < 4; i++) {
         if (parts[i].start_sector > UINT32_MAX || parts[i].sectors > UINT32_MAX) {
-            log(COLOR_RED COLOR_BOLD "ERROR: La partición %s excede los límites de MBR." COLOR_RESET, parts[i].name);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_OUT_MBR), parts[i].name);
             return -1;
         }
 
@@ -1863,32 +1865,32 @@ static int write_mbr_partition_table(const char *disk_path, const struct partiti
 
     int fd = open(disk_path, O_RDWR);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET, disk_path, strerror(errno));
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN), disk_path, strerror(errno));
         return -1;
     }
 
     ssize_t written = write(fd, mbr, sizeof(mbr));
     if (written != (ssize_t)sizeof(mbr)) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Falló la escritura del MBR en %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_MBR_WRITE_DEV),
             disk_path, strerror(errno));
         close(fd);
         return -1;
     }
 
     if (fsync(fd) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: fsync falló tras escribir MBR (%s)." COLOR_RESET, strerror(errno));
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_MBR_FSYNC), strerror(errno));
         close(fd);
         return -1;
     }
 
     close(fd);
-    log(COLOR_GREEN "Tabla MBR escrita correctamente." COLOR_RESET);
+    log(TC(COLOR_GREEN, S_MBR_OK));
     return 0;
 }
 
 static int write_gpt_partition_table(const char *disk_path, const struct partition_plan *parts, int part_count, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Se escribiría tabla GPT en %s." COLOR_RESET, disk_path);
+        log(TC(COLOR_YELLOW, S_DRY_GPT), disk_path);
         return 0;
     }
 
@@ -1908,7 +1910,7 @@ static int write_gpt_partition_table(const char *disk_path, const struct partiti
                             i + 1, parts[i].name);
         }
         snprintf(cmd + strlen(cmd), sizeof(cmd) - strlen(cmd), " %s", disk_path);
-        log(COLOR_YELLOW "Reintentando GPT con sgdisk externo..." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_GPT_RETRY_SGDISK));
         return run_command_logged(cmd, dry_run);
     }
 
@@ -1926,11 +1928,11 @@ static int write_gpt_partition_table(const char *disk_path, const struct partiti
         }
         snprintf(script + strlen(script), sizeof(script) - strlen(script), "w\\ny\\n");
         snprintf(cmd, sizeof(cmd), "sh -c \"printf %%b %s | gdisk %s\"", script, disk_path);
-        log(COLOR_YELLOW "Reintentando GPT con gdisk externo..." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_GPT_RETRY_GDISK));
         return run_command_logged(cmd, dry_run);
     }
 
-    log(COLOR_RED COLOR_BOLD "ERROR: No se pudo escribir la tabla GPT." COLOR_RESET);
+    log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_WRITE));
     return -1;
 }
 
@@ -1951,7 +1953,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     int last_pct = -1;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s" COLOR_RESET, gz_path, out_path);
+        log(TC(COLOR_YELLOW, S_DRY_GUNZIP), gz_path, out_path);
         return 0;
     }
 
@@ -1962,13 +1964,13 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
 
     gz = gzopen(gz_path, "rb");
     if (gz == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para descompresión." COLOR_RESET, gz_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_GUNZIP), gz_path);
         return -1;
     }
 
     out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out_fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CREATE),
             out_path, strerror(errno));
         gzclose(gz);
         return -1;
@@ -1978,7 +1980,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
         int nread = gzread(gz, buf, sizeof(buf));
         if (nread < 0) {
             clear_progress_line(last_pct);
-            log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_GUNZIP),
                 gz_path, gzerror(gz, NULL));
             close(out_fd);
             gzclose(gz);
@@ -1991,7 +1993,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
         ssize_t nwritten = write(out_fd, buf, (size_t)nread);
         if (nwritten < 0 || (size_t)nwritten != (size_t)nread) {
             clear_progress_line(last_pct);
-            log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_WRITE),
                 out_path, strerror(errno));
             close(out_fd);
             gzclose(gz);
@@ -2007,7 +2009,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
                     pct = 100;
                 }
                 if (pct > last_pct) {
-                    fprintf(stdout, "\rDescomprimiendo %s: %d%%...", disk_basename(gz_path), pct);
+                    fprintf(stdout, T(S_PROGRESS_GUNZIP), disk_basename(gz_path), pct);
                     fflush(stdout);
                     last_pct = pct;
                 }
@@ -2018,15 +2020,15 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     clear_progress_line(last_pct);
 
     if (fsync(out_fd) != 0) {
-        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, out_path, strerror(errno));
+        log(TC(COLOR_YELLOW, S_WARN_FSYNC), out_path, strerror(errno));
     }
     close(out_fd);
     if (gzclose(gz) != Z_OK) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Cierre de %s falló." COLOR_RESET, gz_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CLOSE), gz_path);
         return -1;
     }
 
-    log("Descomprimidos %zu bytes de %s a %s.", total, gz_path, out_path);
+    log(T(S_GUNZIPPED_BYTES), total, gz_path, out_path);
     return 0;
 }
 
@@ -2060,7 +2062,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
     int last_pct = -1;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s @ sector %" PRIu64 COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_DRY_GUNZIP_SECTOR),
             gz_path, disk_path, start_sector);
         return 0;
     }
@@ -2092,7 +2094,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
 
     gz = gzopen(gz_path, "rb");
     if (gz == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para descompresión." COLOR_RESET, gz_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_GUNZIP), gz_path);
         if (buf != fallback_buf) {
             free(buf);
         }
@@ -2101,7 +2103,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
 
     disk_fd = open(disk_path, O_RDWR | O_CLOEXEC);
     if (disk_fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para escritura (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_WRITE),
             disk_path, strerror(errno));
         gzclose(gz);
         if (buf != fallback_buf) {
@@ -2115,7 +2117,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         int nread = gzread(gz, buf, (unsigned)chunk);
         if (nread < 0) {
             clear_progress_line(last_pct);
-            log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_GUNZIP),
                 gz_path, gzerror(gz, NULL));
             close(disk_fd);
             gzclose(gz);
@@ -2130,7 +2132,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
 
         if (disk_pwrite_all(disk_fd, buf, (size_t)nread, offset) != nread) {
             clear_progress_line(last_pct);
-            log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s @ %" PRIu64 " falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_WRITE_AT),
                 disk_path, offset, strerror(errno));
             close(disk_fd);
             gzclose(gz);
@@ -2160,7 +2162,7 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
                 pct = 100;
             }
             if (pct > last_pct) {
-                fprintf(stdout, "\rEscribiendo %s en %s: %d%% (%llu MiB)...",
+                fprintf(stdout, T(S_PROGRESS_WRITE),
                         disk_basename(gz_path), disk_basename(disk_path), pct,
                         (unsigned long long)(total / MIB));
                 fflush(stdout);
@@ -2176,34 +2178,34 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
 
     /* El fsync de cientos de MiB es otro silencio largo, y cae justo cuando
      * la barra acaba de llegar al 100 %. */
-    fprintf(stdout, "\rSincronizando %s (%llu MiB)...", disk_basename(disk_path),
+    fprintf(stdout, T(S_PROGRESS_SYNC), disk_basename(disk_path),
             (unsigned long long)(total / MIB));
     fflush(stdout);
     if (fsync(disk_fd) != 0) {
         clear_progress_line(0);
-        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, disk_path, strerror(errno));
+        log(TC(COLOR_YELLOW, S_WARN_FSYNC), disk_path, strerror(errno));
     }
     clear_progress_line(0);
     close(disk_fd);
     if (gzclose(gz) != Z_OK) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Cierre de %s falló." COLOR_RESET, gz_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CLOSE), gz_path);
         return -1;
     }
 
-    log("Escritos %zu bytes en %s (sector inicial %" PRIu64 ").", total, disk_path, start_sector);
+    log(T(S_WROTE_BYTES), total, disk_path, start_sector);
     return 0;
 }
 
 static int write_partition_image_with_retry(const char *part_path, const struct partition_plan *part, int dry_run) {
     for (int attempt = 1; attempt <= 3; attempt++) {
         if (write_gz_image_to_disk(part->image_path, part_path, 0, dry_run) == 0) {
-            log(COLOR_GREEN "%s escrita correctamente en intento %d." COLOR_RESET, part->name, attempt);
+            log(TC(COLOR_GREEN, S_WRITE_OK_ATTEMPT), part->name, attempt);
             return 0;
         }
-        log(COLOR_YELLOW "Intento %d/3 falló al escribir %s; reintentando..." COLOR_RESET, attempt, part->name);
+        log(TC(COLOR_YELLOW, S_RETRY_WRITE), attempt, part->name);
     }
 
-    log(COLOR_RED COLOR_BOLD "ERROR: Se agotaron los reintentos al escribir %s." COLOR_RESET, part->name);
+    log(TC(COLOR_RED COLOR_BOLD, S_ERR_RETRIES), part->name);
     return -1;
 }
 
@@ -2216,7 +2218,7 @@ static int verify_partition_write(const char *part_path, const struct partition_
     int fd;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Verificación posterior de %s (primeros %u bytes)." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_DRY_VERIFY),
             part->name, VERIFY_PREFIX_BYTES);
         return 0;
     }
@@ -2227,14 +2229,14 @@ static int verify_partition_write(const char *part_path, const struct partition_
 
     fd = open(part_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para verificación (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_VERIFY),
             part_path, strerror(errno));
         return -1;
     }
 
     offset = 0;
     if (disk_pread_all(fd, disk_buf, sizeof(disk_buf), offset) != (ssize_t)sizeof(disk_buf)) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer %s @ %" PRIu64 " para verificación (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ_AT_VERIFY),
             part_path, offset, strerror(errno));
         close(fd);
         return -1;
@@ -2242,7 +2244,7 @@ static int verify_partition_write(const char *part_path, const struct partition_
     close(fd);
 
     if (read_gz_prefix(part->image_path, src_buf, sizeof(src_buf)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer %s para verificación." COLOR_RESET, part->image_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ_VERIFY), part->image_path);
         return -1;
     }
 
@@ -2250,13 +2252,13 @@ static int verify_partition_write(const char *part_path, const struct partition_
     sha256_hex_buffer(src_buf, sizeof(src_buf), src_sha);
 
     if (strcasecmp(disk_sha, src_sha) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Verificación post-escritura falló para %s." COLOR_RESET, part->name);
-        log("  source64k: %s", src_sha);
-        log("  disk64k:   %s", disk_sha);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_VERIFY), part->name);
+        log(T(S_HASH_SOURCE64K), src_sha);
+        log(T(S_HASH_DISK64K), disk_sha);
         return -1;
     }
 
-    log(COLOR_GREEN "Verificación post-escritura correcta para %s." COLOR_RESET, part->name);
+    log(TC(COLOR_GREEN, S_VERIFY_OK), part->name);
     return 0;
 }
 
@@ -2297,7 +2299,7 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
 
     fd = open(disk_path, O_RDONLY);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para localizar particiones (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_FOR_PARTS),
             disk_path, strerror(errno));
         return -1;
     }
@@ -2314,7 +2316,7 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
 
         if (entry_size < sizeof(gpt_partition_entry) || num_entries == 0 || num_entries > GPT_NUM_ENTRIES) {
             close(fd);
-            log(COLOR_YELLOW "Tabla GPT inválida; usando particiones 1 (EFI) y 2 (ROOT) por defecto." COLOR_RESET);
+            log(TC(COLOR_YELLOW, S_GPT_INVALID));
             out->efi_part_num = 1;
             out->root_part_num = 2;
             return 0;
@@ -2324,7 +2326,7 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
         table = calloc(1, table_bytes);
         if (table == NULL) {
             close(fd);
-            log(COLOR_RED COLOR_BOLD "ERROR: Sin memoria para leer entradas GPT." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_GPT_MEM));
             return -1;
         }
 
@@ -2332,7 +2334,7 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
         close(fd);
         if (nread != (ssize_t)table_bytes) {
             free(table);
-            log(COLOR_YELLOW "No se pudieron leer entradas GPT; usando particiones 1/2 por defecto." COLOR_RESET);
+            log(TC(COLOR_YELLOW, S_GPT_UNREADABLE));
             out->efi_part_num = 1;
             out->root_part_num = 2;
             return 0;
@@ -2356,7 +2358,7 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
         nread = pread(fd, sector0, sizeof(sector0), 0);
         close(fd);
         if (nread != (ssize_t)sizeof(sector0)) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo leer el MBR de %s." COLOR_RESET, disk_path);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ_MBR), disk_path);
             return -1;
         }
 
@@ -2376,11 +2378,11 @@ static int discover_partitions(const char *disk_path, struct discovered_partitio
 
     if (out->efi_part_num == 0) {
         out->efi_part_num = 1;
-        log(COLOR_YELLOW "No se encontró partición EFI; se asume la partición %d." COLOR_RESET, out->efi_part_num);
+        log(TC(COLOR_YELLOW, S_PART_EFI_ASSUMED), out->efi_part_num);
     }
     if (out->root_part_num == 0) {
         out->root_part_num = 2;
-        log(COLOR_YELLOW "No se encontró partición ROOT; se asume la partición %d." COLOR_RESET, out->root_part_num);
+        log(TC(COLOR_YELLOW, S_PART_ROOT_ASSUMED), out->root_part_num);
     }
 
     return 0;
@@ -2398,7 +2400,7 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
     ssize_t nread;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] copiar %s -> %s" COLOR_RESET, src, dst);
+        log(TC(COLOR_YELLOW, S_DRY_COPY), src, dst);
         return 0;
     }
 
@@ -2408,14 +2410,14 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
      * evita por completo esa heurística. */
     in_fd = open(src, O_RDONLY | O_CLOEXEC);
     if (in_fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir origen %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN_SOURCE),
             src, strerror(errno));
         return -1;
     }
 
     out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (out_fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo crear destino %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CREATE_DEST),
             dst, strerror(errno));
         close(in_fd);
         return -1;
@@ -2429,7 +2431,7 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
                 if (errno == EINTR) {
                     continue;
                 }
-                log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_WRITE),
                     dst, strerror(errno));
                 close(in_fd);
                 close(out_fd);
@@ -2440,7 +2442,7 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
     }
 
     if (nread < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ),
             src, strerror(errno));
         close(in_fd);
         close(out_fd);
@@ -2448,7 +2450,7 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
     }
 
     if (fsync(out_fd) != 0) {
-        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, dst, strerror(errno));
+        log(TC(COLOR_YELLOW, S_WARN_FSYNC), dst, strerror(errno));
     }
     close(in_fd);
     close(out_fd);
@@ -2457,13 +2459,13 @@ static int shell_copy_file(const char *src, const char *dst, int dry_run) {
 
 static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] mount -t %s %s -> %s" COLOR_RESET, fstype ? fstype : "auto", source, target);
+        log(TC(COLOR_YELLOW, S_DRY_MOUNT), fstype ? fstype : "auto", source, target);
         return 0;
     }
     (void)loop; /* zCore mounts files/block-devices directly without loop devices */
-    log("Montando %s en %s (tipo: %s)...", source, target, fstype ? fstype : "auto");
+    log(T(S_MOUNTING), source, target, fstype ? fstype : "auto");
     if (mount(source, target, fstype, 0, NULL) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: mount(%s, %s, %s) falló: %s" COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_MOUNT),
             source, target, fstype ? fstype : "auto", strerror(errno));
         return -1;
     }
@@ -2472,13 +2474,13 @@ static int shell_mount(const char *source, const char *target, const char *fstyp
 
 static int shell_umount(const char *target, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] umount %s" COLOR_RESET, target);
+        log(TC(COLOR_YELLOW, S_DRY_UMOUNT), target);
         return 0;
     }
-    log("Desmontando %s...", target);
+    log(T(S_UNMOUNTING), target);
     if (umount(target) != 0) {
         if (errno != EINVAL) {
-            log(COLOR_YELLOW "ADVERTENCIA: umount(%s) falló: %s" COLOR_RESET, target, strerror(errno));
+            log(TC(COLOR_YELLOW, S_WARN_UMOUNT), target, strerror(errno));
         }
     }
     return 0;
@@ -2547,7 +2549,7 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
     off_t file_pos = 0;
     ssize_t nread;
 
-    log("Buscando placeholders de fstab en %s...", block_dev);
+    log(T(S_FSTAB_LOOKING), block_dev);
     while (file_pos < (off_t)FSTAB_PATCH_MAX_SCAN) {
         size_t room = sizeof(window) - carry_len;
         size_t chunk = room < FSTAB_PATCH_CHUNK ? room : FSTAB_PATCH_CHUNK;
@@ -2558,7 +2560,7 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
          * side-effects on Eclipse OS block devices. */
         nread = pread(fd, window + carry_len, chunk, file_pos);
         if (nread < 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: Lectura de %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_READ),
                 block_dev, strerror(errno));
             return -1;
         }
@@ -2607,11 +2609,9 @@ static int scan_fstab_targets(int fd, const char *block_dev, struct fstab_patch_
     }
 
     if (!fstab_targets_ready(targets, target_count)) {
-        log(COLOR_RED COLOR_BOLD
-            "ERROR: No se encontraron placeholders de fstab en %s (escaneados %lld bytes)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_NO_PLACEHOLDER),
             block_dev, (long long)file_pos);
-        log(COLOR_YELLOW
-            "Reconstruya el medio de instalación (cargo rootfs && cargo image) para incluir /etc/fstab con placeholders." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_FSTAB_REBUILD_MEDIUM));
         return -1;
     }
     return 0;
@@ -2632,19 +2632,19 @@ static int apply_fstab_targets(int fd, const char *block_dev, uint64_t partition
          * avoid any seek-position issues on Eclipse OS block devices. */
         if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
             if (pwrite(fd, "#", 1, (off_t)at) != 1) {
-                log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_WRITE),
                     block_dev, strerror(errno));
                 return -1;
             }
         } else if (pwrite(fd, slot->replacement, FSTAB_PLACEHOLDER_LEN, (off_t)at) !=
                    (ssize_t)FSTAB_PLACEHOLDER_LEN) {
-            log(COLOR_RED COLOR_BOLD "ERROR: Escritura de fstab en %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_WRITE),
                 block_dev, strerror(errno));
             return -1;
         }
     }
     if (fsync(fd) != 0) {
-        log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, block_dev, strerror(errno));
+        log(TC(COLOR_YELLOW, S_WARN_FSYNC), block_dev, strerror(errno));
     }
     return 0;
 }
@@ -2669,20 +2669,18 @@ static int verify_fstab_targets(int fd, const char *block_dev, uint64_t partitio
         want = (slot->kind == FSTAB_PATCH_COMMENT_LINE) ? 1U : (size_t)FSTAB_PLACEHOLDER_LEN;
         at = partition_offset + (uint64_t)slot->offset;
         if (disk_pread_all(fd, buf, want, at) != (ssize_t)want) {
-            log(COLOR_RED COLOR_BOLD "ERROR: lectura de verificación de fstab en %s falló (%s)." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_READBACK),
                 block_dev, strerror(errno));
             return -1;
         }
         if (slot->kind == FSTAB_PATCH_COMMENT_LINE) {
             if (buf[0] != '#') {
-                log(COLOR_RED COLOR_BOLD
-                    "ERROR: verificación de fstab: la línea de %s no quedó comentada en %s." COLOR_RESET,
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_NOT_COMMENTED),
                     slot->placeholder, block_dev);
                 return -1;
             }
         } else if (memcmp(buf, slot->replacement, FSTAB_PLACEHOLDER_LEN) != 0) {
-            log(COLOR_RED COLOR_BOLD
-                "ERROR: verificación de fstab: %s no se sustituyó en %s." COLOR_RESET,
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_FSTAB_NOT_REPLACED),
                 slot->placeholder, block_dev);
             return -1;
         }
@@ -2696,13 +2694,13 @@ static int write_fstab_file(const char *path, const char *efi_dev, const char *r
     FILE *f;
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Escribiría fstab en %s." COLOR_RESET, path);
+        log(TC(COLOR_YELLOW, S_DRY_FSTAB_WRITE), path);
         return 0;
     }
 
     f = fopen(path, "w");
     if (f == NULL) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN),
             path, strerror(errno));
         return -1;
     }
@@ -2719,7 +2717,7 @@ static int write_fstab_file(const char *path, const char *efi_dev, const char *r
     }
 
     if (fclose(f) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo cerrar %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_CLOSE_ERRNO),
             path, strerror(errno));
         return -1;
     }
@@ -2746,7 +2744,7 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     }
 
     shell_umount(INST_ROOT_MNT, dry_run);
-    log(COLOR_GREEN "fstab actualizado en %s (vía mount)." COLOR_RESET, root_dev);
+    log(TC(COLOR_GREEN, S_FSTAB_OK_MOUNT), root_dev);
     return 0;
 }
 
@@ -2769,7 +2767,7 @@ static int patch_fstab_on_block_device(const char *block_dev,
     format_fstab_device_field(swap_dev, swap_field);
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Parchearía fstab en %s (ROOT=%s, EFI=%s)." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_DRY_FSTAB_PATCH),
             block_dev, root_dev, efi_dev);
         return 0;
     }
@@ -2798,7 +2796,7 @@ static int patch_fstab_on_block_device(const char *block_dev,
 
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s (%s)." COLOR_RESET,
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_OPEN),
             block_dev, strerror(errno));
         return -1;
     }
@@ -2822,14 +2820,14 @@ static int patch_fstab_on_block_device(const char *block_dev,
      * avisamos ante errores inesperados. */
     if (ioctl(fd, BLKFLSBUF, 0) != 0 &&
         errno != ENOSYS && errno != ENOTTY && errno != EOPNOTSUPP) {
-        log(COLOR_YELLOW "ADVERTENCIA: BLKFLSBUF en %s: %s" COLOR_RESET, block_dev, strerror(errno));
+        log(TC(COLOR_YELLOW, S_WARN_BLKFLSBUF), block_dev, strerror(errno));
     }
 
     if (verify_fstab_targets(fd, block_dev, partition_offset, targets, target_count) != 0) {
         goto cleanup;
     }
 
-    log(COLOR_GREEN "fstab actualizado y verificado (en disco) en %s (sin montar)." COLOR_RESET, block_dev);
+    log(TC(COLOR_GREEN, S_FSTAB_OK_RAW), block_dev);
     rc = 0;
 
 cleanup:
@@ -2839,14 +2837,14 @@ cleanup:
 
 static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run) {
     if (!struct_file_exists(src)) {
-        log(COLOR_YELLOW "Omitido (no presente en el medio de instalación): %s" COLOR_RESET, src);
+        log(TC(COLOR_YELLOW, S_SKIPPED_FILE), src);
         return 0;
     }
     if (shell_copy_file(src, dst, dry_run) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo copiar %s -> %s." COLOR_RESET, src, dst);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_COPY), src, dst);
         return -1;
     }
-    log(COLOR_GREEN "Actualizado: %s" COLOR_RESET, dst);
+    log(TC(COLOR_GREEN, S_UPDATED_FILE), dst);
     return 0;
 }
 
@@ -2858,37 +2856,36 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     /* EFI = part 1, ROOT = part 2, HOME = part 3, SWAP = part 4 */
     if (partition_dev_path(disk_path, 1, efi_dev,  sizeof(efi_dev))  != 0 ||
         partition_dev_path(disk_path, 2, root_dev, sizeof(root_dev)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de las particiones." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_PATH));
         return -1;
     }
 
     if (layout == LAYOUT_ADVANCED && part_count >= 4) {
         if (partition_dev_path(disk_path, 3, home_dev, sizeof(home_dev)) != 0 ||
             partition_dev_path(disk_path, 4, swap_dev, sizeof(swap_dev)) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de HOME/SWAP." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_PATH_HOME));
             return -1;
         }
 
-        log(COLOR_GREEN "[4/5] Formateando partición HOME (%s)..." COLOR_RESET, disk_fs());
+        log(TC(COLOR_GREEN, S_STEP_HOME), disk_fs());
         /* Se vuelca una plantilla btrfs/EclipseFS vacía generada en build; el kernel la
          * expande a toda la partición en el primer montaje. */
         if (!struct_file_exists(HOME_IMAGE_GZ)) {
-            log(COLOR_YELLOW
-                "ADVERTENCIA: falta %s; HOME quedará sin formatear." COLOR_RESET, HOME_IMAGE_GZ);
+            log(TC(COLOR_YELLOW, S_WARN_NO_HOME_IMAGE), HOME_IMAGE_GZ);
         } else if (write_gz_image_to_disk(HOME_IMAGE_GZ, home_dev, 0, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo formatear HOME." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_FORMAT_HOME));
             return -1;
         }
 
-        log(COLOR_GREEN "[5/5] Inicializando partición SWAP..." COLOR_RESET);
+        log(TC(COLOR_GREEN, S_STEP_SWAP));
         snprintf(cmd, sizeof(cmd), "sh -c \"mkswap -L SWAP '%s'\"", swap_dev);
         if (run_command_logged(cmd, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo inicializar SWAP." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_INIT_SWAP));
             return -1;
         }
     }
 
-    log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
+    log(TC(COLOR_GREEN, S_FSTAB_UPDATING));
     /* EclipseFS verifica checksums de nodos y datos: un parche en bruto lo
      * corrompería, así que fstab se escribe siempre montando la partición. */
     if (disk_fs_is_eclipsefs()) {
@@ -2903,15 +2900,13 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
                                         layout, dry_run) == 0) {
             return 0;
         }
-        log(COLOR_YELLOW
-            "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_WARN_FSTAB_RAW_FAILED));
         return write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run);
     }
     if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, "", "", LAYOUT_SIMPLE, dry_run) == 0) {
         return 0;
     }
-    log(COLOR_YELLOW
-        "ADVERTENCIA: parche en bruto falló; intentando escribir fstab vía mount." COLOR_RESET);
+    log(TC(COLOR_YELLOW, S_WARN_FSTAB_RAW_FAILED));
     return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
@@ -2921,13 +2916,12 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
  * lo escrito esté en disco. */
 static int resize_root_to_partition(const char *root_dev, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] ROOT (%s) se expandirá en el primer montaje." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_DRY_ROOT_WILL_GROW),
             disk_fs());
         return 0;
     }
     sync();
-    log(COLOR_GREEN
-        "ROOT (%s, %s) se expandirá a toda la partición en el primer arranque." COLOR_RESET,
+    log(TC(COLOR_GREEN, S_ROOT_WILL_GROW),
         disk_fs(), root_dev);
     return 0;
 }
@@ -2946,7 +2940,7 @@ static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, 
     format_fstab_device_field(root_dev, root_field);
 
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] Fijaría ROOT=%s en rboot.conf de %s." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_DRY_RBOOT),
             root_dev, block_dev);
         return 0;
     }
@@ -2957,27 +2951,25 @@ static int patch_rboot_root_on_efi(const char *block_dev, const char *root_dev, 
 
     fd = open(block_dev, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        log(COLOR_YELLOW
-            "ADVERTENCIA: no se pudo abrir %s para fijar ROOT= en rboot.conf (%s); se usará auto-detección." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_WARN_RBOOT_OPEN),
             block_dev, strerror(errno));
         return 0;
     }
 
     if (scan_fstab_targets(fd, block_dev, targets, 1) != 0) {
-        log(COLOR_YELLOW
-            "ADVERTENCIA: rboot.conf sin placeholder ROOT en %s; se usará auto-detección del root." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_WARN_RBOOT_NO_PLACEHOLDER),
             block_dev);
         close(fd);
         return 0;
     }
     if (apply_fstab_targets(fd, block_dev, partition_offset, targets, 1) != 0) {
-        log(COLOR_YELLOW "ADVERTENCIA: no se pudo escribir ROOT= en rboot.conf de %s." COLOR_RESET,
+        log(TC(COLOR_YELLOW, S_WARN_RBOOT_WRITE),
             block_dev);
         close(fd);
         return 0;
     }
 
-    log(COLOR_GREEN "rboot.conf: ROOT=%s fijado en %s (cmdline del kernel)." COLOR_RESET,
+    log(TC(COLOR_GREEN, S_RBOOT_OK),
         root_dev, block_dev);
     close(fd);
     return 0;
@@ -3082,7 +3074,7 @@ static void report_missing_payload(const char *path) {
     char root_dev[160];
     DIR *d;
 
-    log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, path);
+    log(TC(COLOR_RED COLOR_BOLD, S_ERR_NOT_FOUND), path);
 
     slash = strrchr(path, '/');
     if (slash == NULL || slash == path) {
@@ -3098,7 +3090,7 @@ static void report_missing_payload(const char *path) {
 
     d = opendir(dir);
     if (d == NULL) {
-        log("  %s no se puede leer (%s).", dir, strerror(errno));
+        log(T(S_FILE_UNREADABLE), dir, strerror(errno));
     } else {
         struct dirent *e;
         char linea[512];
@@ -3119,7 +3111,7 @@ static void report_missing_payload(const char *path) {
         }
         closedir(d);
         if (n == 0) {
-            log("  %s está vacío.", dir);
+            log(T(S_FILE_EMPTY), dir);
         } else {
             log("%s%s", linea, (n > 16) ? " ..." : "");
         }
@@ -3130,15 +3122,9 @@ static void report_missing_payload(const char *path) {
      * esta corriendo desde un sistema instalado. */
     if (find_mount_device("/", root_dev, sizeof(root_dev)) == 0 &&
         strncmp(root_dev, "/dev/", 5) == 0) {
-        log(COLOR_YELLOW COLOR_BOLD
-            "AVISO: la raíz (/) es %s, o sea un Eclipse YA INSTALADO, no el medio live."
-            COLOR_RESET, root_dev);
-        log(COLOR_YELLOW
-            "  Las imágenes de instalación viajan sólo dentro del medio de instalación;"
-            COLOR_RESET);
-        log(COLOR_YELLOW
-            "  la raíz instalada se deja sin ellas a propósito. Arranque el USB o el ISO."
-            COLOR_RESET);
+        log(TC(COLOR_YELLOW COLOR_BOLD, S_WARN_ROOT_IS_INSTALLED), root_dev);
+        log(TC(COLOR_YELLOW, S_WARN_IMAGES_LIVE_ONLY));
+        log(TC(COLOR_YELLOW, S_WARN_IMAGES_LIVE_ONLY2));
     }
 }
 
@@ -3157,20 +3143,20 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     }
     if (partition_dev_path(disk_path, parts.efi_part_num, efi_dev, sizeof(efi_dev)) != 0 ||
         partition_dev_path(disk_path, parts.root_part_num, root_dev, sizeof(root_dev)) != 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: Ruta de partición demasiado larga." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_PATH_LONG));
         return -1;
     }
 
-    log("Partición EFI detectada:  %s", efi_dev);
-    log("Partición ROOT detectada: %s", root_dev);
+    log(T(S_PART_EFI), efi_dev);
+    log(T(S_PART_ROOT), root_dev);
 
     if (struct_file_exists("/boot/efi-staging/EFI/Boot/BootX64.efi")) {
-        log("Se detectaron archivos de actualización pre-extraídos en /boot/efi-staging.");
+        log(T(S_EFI_STAGING));
         src_mnt = "/boot/efi-staging";
     } else {
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
             report_missing_payload(EFI_IMAGE_GZ);
-            log("  Es la fuente del cargador y del kernel: sin ella no hay actualización.");
+            log(T(S_NEED_LIVE_MEDIUM));
             return -1;
         }
 
@@ -3181,7 +3167,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         /* El ROOT ya instalado puede ser EclipseFS o btrfs: se prueban ambos. */
         if (shell_mount(root_dev, UPD_ROOT_MNT, "eclipsefs", 0, dry_run) != 0 &&
             shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_MOUNT_ROOT), root_dev);
             return -1;
         }
         root_mounted = 1;
@@ -3189,7 +3175,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         snprintf(root_img_path, sizeof(root_img_path), "%s/eclipse-upd-efi.img", UPD_ROOT_MNT);
 
         if (decompress_gz_to_path(EFI_IMAGE_GZ, root_img_path, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo extraer %s a la partición ROOT." COLOR_RESET, EFI_IMAGE_GZ);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_EXTRACT_ROOT), EFI_IMAGE_GZ);
             rc = -1;
             goto cleanup;
         }
@@ -3200,7 +3186,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         }
 
         if (shell_mount(root_img_path, UPD_STAGING_MNT, "vfat", 1, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la imagen EFI extraída en disco." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_MOUNT_EFI_IMG));
             rc = -1;
             goto cleanup;
         }
@@ -3217,7 +3203,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     int efi_we_mounted = 0;
     if (find_mount_device("/boot/efi", mounted_dev, sizeof(mounted_dev)) == 0) {
         snprintf(efi_dest, sizeof(efi_dest), "/boot/efi");
-        log(COLOR_GREEN "ESP ya montada en /boot/efi (origen %s); se escribe directamente sin re-montar." COLOR_RESET,
+        log(TC(COLOR_GREEN, S_ESP_ALREADY_MOUNTED),
             mounted_dev[0] ? mounted_dev : efi_dev);
     } else {
         if (shell_mkdir_p(UPD_EFI_MNT, dry_run) != 0) {
@@ -3225,7 +3211,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
             goto cleanup;
         }
         if (shell_mount(efi_dev, UPD_EFI_MNT, "vfat", 0, dry_run) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar %s." COLOR_RESET, efi_dev);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_MOUNT_PLAIN), efi_dev);
             rc = -1;
             goto cleanup;
         }
@@ -3233,7 +3219,7 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         efi_we_mounted = 1;
     }
 
-    log(COLOR_GREEN "Actualizando bootloader, kernel e initramfs en EFI (copia selectiva, sin dd)..." COLOR_RESET);
+    log(TC(COLOR_GREEN, S_UPGRADE_EFI));
 
     char dst_boot_dir[320], dst_zcore_dir[320];
     char dst_boot[400], dst_zcore[400], dst_initramfs[400];
@@ -3295,9 +3281,9 @@ static void trigger_partition_rescan(const char *disk_path) {
 #define BLKRRPART 0x125f
 #endif
         if (ioctl(fd, BLKRRPART, 0) == 0) {
-            log(COLOR_GREEN "Solicitada recarga de tabla de particiones para %s." COLOR_RESET, disk_path);
+            log(TC(COLOR_GREEN, S_PARTPROBE_OK), disk_path);
         } else {
-            log(COLOR_YELLOW "ADVERTENCIA: No se pudo solicitar recarga de tabla de particiones para %s (%s)." COLOR_RESET,
+            log(TC(COLOR_YELLOW, S_WARN_PARTPROBE),
                 disk_path, strerror(errno));
         }
         close(fd);
@@ -3307,6 +3293,8 @@ static void trigger_partition_rescan(const char *disk_path) {
 int main(int argc, char **argv) {
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+    installer_lang_init(argc, argv);
 
     g_log_file = fopen("/tmp/eclipse-install.log", "a");
     if (g_log_file != NULL) {
@@ -3320,7 +3308,7 @@ int main(int argc, char **argv) {
     }
 
     print_header();
-    log(COLOR_WHITE "Buscando dispositivos de almacenamiento disponibles...\n" COLOR_RESET);
+    log(TC(COLOR_WHITE, S_LOOKING_FOR_DISKS));
 
     struct disk_info disks[MAX_DISKS];
     memset(disks, 0, sizeof(disks));
@@ -3329,8 +3317,8 @@ int main(int argc, char **argv) {
     int found_disks = scan_disks(disks, disk_list);
 
     if (found_disks == 0 && !cfg.disk_set) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se detectaron discos de almacenamiento." COLOR_RESET);
-        log("Asegúrese de haber iniciado la máquina con un disco adjunto.");
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_DISKS));
+        log(T(S_ATTACH_A_DISK));
         return 1;
     }
 
@@ -3340,7 +3328,7 @@ int main(int argc, char **argv) {
 
     uint64_t disk_size_bytes = get_disk_size_bytes(cfg.disk_path);
     if (disk_size_bytes == 0) {
-        log(COLOR_RED COLOR_BOLD "ERROR: No se pudo acceder al disco %s." COLOR_RESET, cfg.disk_path);
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_DISK_UNREACHABLE), cfg.disk_path);
         return 1;
     }
     uint64_t disk_sectors = disk_size_bytes / SECTOR_SIZE;
@@ -3348,7 +3336,7 @@ int main(int argc, char **argv) {
     print_header();
     char disk_size_str[64];
     format_size(disk_size_str, sizeof(disk_size_str), disk_size_bytes);
-    log("Disco seleccionado: " COLOR_YELLOW "%s" COLOR_RESET " (%s)", cfg.disk_path, disk_size_str);
+    log(T(S_DISK_CHOSEN), cfg.disk_path, disk_size_str);
 
     struct existing_install_info existing;
     if (detect_existing_install(cfg.disk_path, &existing) != 0) {
@@ -3356,10 +3344,10 @@ int main(int argc, char **argv) {
     }
 
     if (existing.has_valid_mbr && existing.has_efi_partition) {
-        log(COLOR_YELLOW "Se detectó MBR válido con partición EFI en el disco." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_FOUND_MBR_ESP));
     }
     if (existing.has_gpt_header) {
-        log(COLOR_YELLOW "Se detectó cabecera GPT existente en el disco." COLOR_RESET);
+        log(TC(COLOR_YELLOW, S_FOUND_GPT));
     }
 
     if (prompt_install_mode(&cfg, &existing) != 0) {
@@ -3367,7 +3355,7 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.mode == MODE_NEW) {
-        log(COLOR_RED COLOR_BOLD "¡ADVERTENCIA! La nueva instalación reparticionará el disco y borrará datos existentes." COLOR_RESET);
+        log(TC(COLOR_RED COLOR_BOLD, S_WARN_WIPE));
         if (prompt_layout(&cfg) != 0) {
             return 1;
         }
@@ -3378,30 +3366,22 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        log(COLOR_GREEN "Modo actualización: copia selectiva de archivos (sin dd ni reparticionado)." COLOR_RESET);
+        log(TC(COLOR_GREEN, S_UPGRADE_MODE));
     }
 
     {
         char en_uso[512];
         if (mountpoints_on_disk(cfg.disk_path, en_uso, sizeof(en_uso)) > 0) {
-            log(COLOR_RED COLOR_BOLD
-                "ADVERTENCIA: %s es el medio del que ha arrancado: %s."
-                COLOR_RESET, cfg.disk_path, en_uso);
-            log(COLOR_YELLOW
-                "  Instalar aquí se lleva por delante la sesión live, y el medio deja de"
-                COLOR_RESET);
-            log(COLOR_YELLOW
-                "  servir para instalar. Lo normal es elegir el disco interno."
-                COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_WARN_BOOT_MEDIUM), cfg.disk_path, en_uso);
+            log(TC(COLOR_YELLOW, S_WARN_REMOVABLE_HINT));
+            log(TC(COLOR_YELLOW, S_WARN_REMOVABLE_HINT2));
             if (cfg.auto_yes) {
-                log(COLOR_RED COLOR_BOLD
-                    "ERROR: con --yes no se instala sobre el propio medio de arranque."
-                    COLOR_RESET);
-                log("  Indique otro disco con --disk.");
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_YES_OVER_BOOT_MEDIUM));
+                log(T(S_WARN_PICK_OTHER));
                 return 2;
             }
-            if (!ask_yes_no("¿Instalar de todos modos sobre el medio de arranque? (y/N):", 0, 0)) {
-                log("Instalación cancelada por el usuario.");
+            if (!ask_yes_no(T(S_ASK_OVER_BOOT_MEDIUM), 0, 0)) {
+                log(T(S_CANCELLED));
                 return 2;
             }
         }
@@ -3409,15 +3389,15 @@ int main(int argc, char **argv) {
 
     int removable = is_removable_disk(cfg.disk_path);
     if (removable) {
-        log(COLOR_YELLOW COLOR_BOLD "ADVERTENCIA: %s es un dispositivo extraíble (/sys/block/.../removable=1)." COLOR_RESET,
+        log(TC(COLOR_YELLOW COLOR_BOLD, S_WARN_REMOVABLE),
             cfg.disk_path);
         if (!cfg.auto_yes) {
-            if (!ask_yes_no("¿Desea continuar con este disco extraíble? (y/N):", 0, 0)) {
-                log("Instalación cancelada por el usuario.");
+            if (!ask_yes_no(T(S_ASK_REMOVABLE), 0, 0)) {
+                log(T(S_CANCELLED));
                 return 2;
             }
         } else {
-            log(COLOR_YELLOW "--yes activo: se continúa pese a la advertencia de disco extraíble." COLOR_RESET);
+            log(TC(COLOR_YELLOW, S_YES_REMOVABLE));
         }
     }
 
@@ -3455,29 +3435,29 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        snprintf(partition_summary, sizeof(partition_summary),
-                 "Actualización selectiva (EFI: bootloader + kernel + initramfs)");
+        snprintf(partition_summary, sizeof(partition_summary), "%s",
+                 T(S_UPGRADE_SUMMARY));
     }
 
     log("========================================");
-    log(" RESUMEN DE INSTALACIÓN");
+    log(T(S_SUMMARY_TITLE));
     log("========================================");
-    log(" Disco:        %s  (%s)", cfg.disk_path, disk_size_str);
-    log(" Modo:         %s", mode_label(cfg.mode));
-    log(" Tabla:        %s", cfg.mode == MODE_NEW ? table_label(cfg.table) : "Sin cambios");
-    log(" Particiones:  %s", partition_summary);
-    log(" Dry-run:      %s", cfg.dry_run ? "Sí" : "No");
+    log(T(S_SUMMARY_DISK), cfg.disk_path, disk_size_str);
+    log(T(S_SUMMARY_MODE), mode_label(cfg.mode));
+    log(T(S_SUMMARY_TABLE), cfg.mode == MODE_NEW ? table_label(cfg.table) : T(S_TABLE_UNCHANGED));
+    log(T(S_SUMMARY_PARTS), partition_summary);
+    log(T(S_SUMMARY_DRYRUN), cfg.dry_run ? T(S_WORD_YES) : T(S_WORD_NO));
     log("========================================");
 
     if (cfg.auto_yes) {
-        log("¿Confirmar y ejecutar? (y/N): y (--yes)");
-    } else if (!ask_yes_no("¿Confirmar y ejecutar? (y/N):", 0, 0)) {
-        log("Instalación cancelada por el usuario.");
+        log("%s %s (--yes)", T(S_ASK_CONFIRM), T(S_WORD_YES));
+    } else if (!ask_yes_no(T(S_ASK_CONFIRM), 0, 0)) {
+        log(T(S_CANCELLED));
         return 2;
     }
 
     if (cfg.mode == MODE_NEW) {
-        log(COLOR_GREEN "[1/3] Preparando tabla de particiones..." COLOR_RESET);
+        log(TC(COLOR_GREEN, S_STEP_TABLE));
         int table_rc = (cfg.table == TABLE_GPT)
                        ? write_gpt_partition_table(cfg.disk_path, parts, part_count, cfg.dry_run)
                        : write_mbr_partition_table(cfg.disk_path, parts, part_count, cfg.dry_run);
@@ -3489,7 +3469,7 @@ int main(int argc, char **argv) {
         char efi_dev[160], root_dev[160];
         if (partition_dev_path(cfg.disk_path, 1, efi_dev, sizeof(efi_dev)) != 0 ||
             partition_dev_path(cfg.disk_path, 2, root_dev, sizeof(root_dev)) != 0) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se pudo construir la ruta de las particiones." COLOR_RESET);
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_PART_PATH));
             return 1;
         }
 
@@ -3499,7 +3479,7 @@ int main(int argc, char **argv) {
         {
             char efi_label[16];
             part1_size_label(efi_label, sizeof(efi_label));
-            log(COLOR_GREEN "[2/%d] Escribiendo partición EFI (%s)..." COLOR_RESET,
+            log(TC(COLOR_GREEN, S_STEP_EFI),
                 (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3, efi_label);
         }
         if (verify_efi_image_fits_partition(&parts[0]) != 0) {
@@ -3512,7 +3492,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        log(COLOR_GREEN "[3/%d] Escribiendo partición ROOT..." COLOR_RESET,
+        log(TC(COLOR_GREEN, S_STEP_ROOT),
             (cfg.layout == LAYOUT_ADVANCED) ? 5 : 3);
         if (write_partition_image_with_retry(root_dev, &parts[1], cfg.dry_run) != 0) {
             return 1;
@@ -3555,16 +3535,16 @@ int main(int argc, char **argv) {
 
     log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
     if (cfg.mode == MODE_UPGRADE) {
-        log(COLOR_GREEN COLOR_BOLD " *         ACTUALIZACIÓN COMPLETADA CON ÉXITO         *" COLOR_RESET);
+        log(TC(COLOR_GREEN COLOR_BOLD, S_DONE_UPGRADE));
         log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
-        log("Eclipse OS se ha actualizado correctamente en %s.", cfg.disk_path);
-        log("El resto del sistema puede actualizarse con apt (p. ej. apt-get update && apt-get upgrade).");
+        log(T(S_UPGRADED_OK), cfg.disk_path);
+        log(T(S_APT_HINT));
     } else {
-        log(COLOR_GREEN COLOR_BOLD " *          INSTALACIÓN COMPLETADA CON ÉXITO          *" COLOR_RESET);
+        log(TC(COLOR_GREEN COLOR_BOLD, S_DONE_INSTALL));
         log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
-        log("Eclipse OS se ha instalado correctamente en %s.", cfg.disk_path);
+        log(T(S_INSTALLED_OK), cfg.disk_path);
     }
-    log("Tiempo total transcurrido: %02d:%02d:%02d", hours, minutes, seconds);
+    log(T(S_ELAPSED), hours, minutes, seconds);
 
     return 0;
 }

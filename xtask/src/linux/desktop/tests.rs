@@ -2721,14 +2721,20 @@ fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/linux/mod.rs"),
     )
     .expect("xtask/src/linux/mod.rs");
-    let lunarbar_toml = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/lunarbar/Cargo.toml"),
-    )
-    .expect("tools/lunarbar/Cargo.toml");
-    assert!(
-        lunarbar_toml.contains("eclipse-i18n"),
-        "lunarbar no longer links eclipse-i18n: drop this test with the dep"
-    );
+    // EVERY crate that links the strings, not just the first one: each is a
+    // separate staleness check, and the one that is forgotten ships the old
+    // text with nothing in any log to say so.
+    for crate_dir in ["lunarbar", "SilverSurfer"] {
+        let toml = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../tools/{crate_dir}/Cargo.toml")),
+        )
+        .unwrap_or_else(|_| panic!("tools/{crate_dir}/Cargo.toml"));
+        assert!(
+            toml.contains("eclipse-i18n"),
+            "{crate_dir} no longer links eclipse-i18n: drop it from this test with the dep"
+        );
+    }
     let mtime_rs = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/linux/mtime.rs"),
     )
@@ -2743,5 +2749,13 @@ fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
     assert!(
         mod_rs.contains("eclipse_i18n_mtime()"),
         "eclipse_i18n_mtime is defined but folded into no staleness check"
+    );
+    // And folded in once per client that links the strings. Counting is the
+    // only way to catch the second crate being left out, since the first one
+    // already satisfies the check above.
+    assert!(
+        mod_rs.matches("eclipse_i18n_mtime()").count() >= 3,
+        "eclipse_i18n_mtime is not in every client's staleness check \
+         (lunarbar, lunarbg, silversurfer)"
     );
 }

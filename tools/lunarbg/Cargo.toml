@@ -22,6 +22,8 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # Vector text for the tecno caption (DejaVu Sans Mono outlines, anti-aliased),
 # shared with the other Lunar clients. Pure Rust: the binary stays static.
 lunartext = { path = "../lunartext" }
+# The readout's words, in Spanish and English; shared with the panel.
+eclipse-i18n = { path = "../eclipse-i18n" }
 
 [profile.release]
 # opt-level 3 (not "z"): the scene renderer is per-pixel float math over the

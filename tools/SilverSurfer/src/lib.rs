@@ -4,6 +4,22 @@
 //! engine and the Wayland window are behind the `engine` feature, so the unit
 //! tests and the benchmarks run without compiling the engine.
 
+pub use eclipse_i18n::{Key, Lang};
+
+/// The language the browser draws in, read ONCE per process.
+///
+/// A function over a field because the strings are built by free functions
+/// (`history::page_url`, `privacy::cookies_page_html`, the chrome renderer)
+/// that have no state object to hang a language on; threading one through all
+/// of them would be a wider change than the strings themselves. Once, and not
+/// per call, because `Lang::current` reads `/etc/eclipse/locale` and `$LANG`:
+/// a browser that re-read them could render `about:history` in one language
+/// and its own title bar in the other if `eclipse-locale` ran in between.
+pub fn lang() -> Lang {
+    static LANG: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
+    *LANG.get_or_init(Lang::current)
+}
+
 pub mod about;
 pub mod bookmarks;
 pub mod chrome;

@@ -417,8 +417,9 @@ strings! {
 
     // ── lunarfile: the action menu ───────────────────────────────────────
     file_op_rename => { es: "Renombrar", en: "Rename" },
-    file_op_copy => { es: "Copiar", en: "Copy" },
-    file_op_cut => { es: "Cortar", en: "Cut" },
+    /// Also the browser's context menu, which Servo hands over in English.
+    word_copy => { es: "Copiar", en: "Copy" },
+    word_cut => { es: "Cortar", en: "Cut" },
     file_op_paste => { es: "Pegar aquí", en: "Paste here" },
     file_op_newdir => { es: "Nueva carpeta", en: "New folder" },
     /// Also `A la papelera: notas.txt` once it is gone.
@@ -499,12 +500,143 @@ strings! {
     // `files::XDG_PLACES`, and that list holds both languages' spellings
     // whatever the session is in: an imported home has `Pictures` in it and a
     // Spanish session still has to find it.
-    file_place_home => { es: "Inicio", en: "Home" },
+    /// The rail's first entry, and the browser's link back to `about:home`.
+    word_home => { es: "Inicio", en: "Home" },
     file_place_root => { es: "Raíz /", en: "Root /" },
     file_place_documents => { es: "Documentos", en: "Documents" },
-    file_place_downloads => { es: "Descargas", en: "Downloads" },
+    /// The folder in the rail, and the title of `about:downloads`.
+    word_downloads => { es: "Descargas", en: "Downloads" },
     file_place_music => { es: "Música", en: "Music" },
 
     // ── lunarfile: the date column (`hoy 10:40` is `word_today`) ─────────
     word_yesterday => { es: "ayer", en: "yesterday" },
+    // ── SilverSurfer: the chrome ─────────────────────────────────────────
+    www_new_tab => { es: "Nueva pestaña", en: "New tab" },
+    www_find_in_page => { es: "Buscar en la página", en: "Find in page" },
+    www_search_or_url => {
+        es: "Buscar o escribir una dirección",
+        en: "Search or enter an address",
+    },
+    /// The xdg window title: `Privado — Eclipse OS`, `Cargando — SilverSurfer`.
+    www_private => { es: "Privado", en: "Private" },
+    www_loading => { es: "Cargando", en: "Loading" },
+
+    // ── SilverSurfer: the context menu ───────────────────────────────────
+    // Servo builds this menu itself and labels it in English (see
+    // `vendor/servo-script/.../document_embedder_controls.rs`). Translating
+    // it in the vendored copy would be a divergence to carry forever, so
+    // `engine.rs` maps the label Servo hands over onto one of these rows on
+    // its way into Eclipse's own menu widget.
+    www_menu_back => { es: "Atrás", en: "Back" },
+    www_menu_forward => { es: "Adelante", en: "Forward" },
+    www_menu_reload => { es: "Recargar", en: "Reload" },
+    www_menu_paste => { es: "Pegar", en: "Paste" },
+    www_menu_select_all => { es: "Seleccionar todo", en: "Select All" },
+    www_menu_copy_link => { es: "Copiar enlace", en: "Copy Link" },
+    www_menu_copy_image_link => {
+        es: "Copiar enlace de la imagen",
+        en: "Copy Image Link",
+    },
+    www_menu_open_link_new => {
+        es: "Abrir enlace en una vista nueva",
+        en: "Open Link in New View",
+    },
+    www_menu_open_image_new => {
+        es: "Abrir imagen en una vista nueva",
+        en: "Open Image in New View",
+    },
+
+    // ── SilverSurfer: the about: pages ───────────────────────────────────
+    www_history => { es: "Historial", en: "History" },
+    www_history_empty => { es: "Aún no hay visitas.", en: "No visits yet." },
+    www_bookmarks => { es: "Marcadores", en: "Bookmarks" },
+    www_bookmarks_empty => {
+        es: "No hay marcadores. Usa Ctrl+D en una página.",
+        en: "No bookmarks yet. Use Ctrl+D on a page.",
+    },
+    www_downloads_empty => {
+        es: "Aún no hay descargas. Navega a un PDF/ZIP o usa Ctrl+S sobre una URL.",
+        en: "No downloads yet. Browse to a PDF/ZIP or use Ctrl+S on a URL.",
+    },
+    www_privacy => { es: "Privacidad", en: "Privacy" },
+    www_privacy_window => {
+        es: "La <strong>ventana privada</strong> (<code>--private</code> o Ctrl+Shift+P) no restaura pestañas ni escribe <code>session.json</code>. Al cerrarla se borran cookies, almacenamiento web y caché HTTP de esa instancia.",
+        en: "The <strong>private window</strong> (<code>--private</code> or Ctrl+Shift+P) restores no tabs and writes no <code>session.json</code>. Closing it clears that instance's cookies, web storage and HTTP cache.",
+    },
+    www_privacy_servo => {
+        es: "Servo 0.7 no aísla aún el almacenamiento privado por WebView; el proceso dedicado es el aislamiento práctico en Eclipse.",
+        en: "Servo 0.7 does not isolate private storage per WebView yet; the separate process is what isolation means in Eclipse.",
+    },
+    www_privacy_clear_now => {
+        es: "borrar cookies y datos de sitio ahora",
+        en: "clear cookies and site data now",
+    },
+    www_privacy_same_via_page => {
+        es: "misma acción vía página",
+        en: "the same thing from a page",
+    },
+    www_privacy_site_list => {
+        es: "lista de sitios con datos",
+        en: "the list of sites holding data",
+    },
+    www_privacy_logins => {
+        es: "logins guardados (no en privado)",
+        en: "saved logins (not in a private window)",
+    },
+    www_cleared => { es: "Datos borrados", en: "Data cleared" },
+    www_back_to_privacy => { es: "Volver a privacidad", en: "Back to privacy" },
+    www_cookies_and_data => { es: "Cookies y datos", en: "Cookies and data" },
+    www_cookies_title => {
+        es: "Cookies y datos de sitio",
+        en: "Cookies and site data",
+    },
+    www_cookies_empty => {
+        es: "No hay sitios con cookies ni almacenamiento local.",
+        en: "No sites with cookies or local storage.",
+    },
+    /// `12 sitios:` -- the count goes before it.
+    www_sites => { es: "sitios:", en: "sites:" },
+    www_clear_all => { es: "Borrar todo", en: "Clear all" },
+    www_passwords => { es: "Contraseñas", en: "Passwords" },
+    www_passwords_saved => {
+        es: "Contraseñas guardadas",
+        en: "Saved passwords",
+    },
+    www_passwords_how => {
+        es: "Ctrl+Shift+L guarda el login visible. Autocompletado al cargar el origen. Cifrado con ChaCha20-Poly1305 en <code>passwords.json</code>; la clave está en <code>passwords.key</code>.",
+        en: "Ctrl+Shift+L saves the login on screen. Filled in again when the origin loads. Encrypted with ChaCha20-Poly1305 in <code>passwords.json</code>; the key is in <code>passwords.key</code>.",
+    },
+    www_empty => { es: "Vacío.", en: "Empty." },
+    www_filter => { es: "Filtro", en: "Filter" },
+    www_filter_title => {
+        es: "Bloqueo de anuncios (lite)",
+        en: "Ad blocking (lite)",
+    },
+    www_filter_on => { es: "activo", en: "on" },
+    www_filter_off => {
+        es: "desactivado (SILVERSURFER_ADBLOCK=0)",
+        en: "off (SILVERSURFER_ADBLOCK=0)",
+    },
+    /// `Estado: activo. Reglas embebidas: 412. Cancelaciones de red en esta
+    /// sesión (aprox.): 7.` -- the three numbers fill the three holes.
+    www_filter_state => {
+        es: "Estado: <strong>{}</strong>. Reglas embebidas: {}. Cancelaciones de red en esta sesión (aprox.): {}.",
+        en: "Status: <strong>{}</strong>. Rules built in: {}. Network cancellations this session (approx.): {}.",
+    },
+    www_filter_not_ublock => {
+        es: "No es uBlock: solo hosts/paths frecuentes + CSS hide. Sin WebExtensions.",
+        en: "This is not uBlock: common hosts and paths plus CSS hiding, and no WebExtensions.",
+    },
+    // ── lunarbg: the tecno wallpaper's readout ───────────────────────────
+    // The eight phases of the Moon, as the instrument panel prints them.
+    // Written in capitals in both columns because the face has no lower
+    // case: it draws capitals the height of a 5x7 cell and nothing else.
+    moon_new => { es: "LUNA NUEVA", en: "NEW MOON" },
+    moon_waxing_crescent => { es: "LUNA CRECIENTE", en: "WAXING CRESCENT" },
+    moon_first_quarter => { es: "CUARTO CRECIENTE", en: "FIRST QUARTER" },
+    moon_waxing_gibbous => { es: "GIBOSA CRECIENTE", en: "WAXING GIBBOUS" },
+    moon_full => { es: "LUNA LLENA", en: "FULL MOON" },
+    moon_waning_gibbous => { es: "GIBOSA MENGUANTE", en: "WANING GIBBOUS" },
+    moon_last_quarter => { es: "CUARTO MENGUANTE", en: "LAST QUARTER" },
+    moon_waning_crescent => { es: "LUNA MENGUANTE", en: "WANING CRESCENT" },
 }

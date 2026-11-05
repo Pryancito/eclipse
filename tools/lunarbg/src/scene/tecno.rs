@@ -20,7 +20,21 @@
 //! Radii are design units on the same 280 px logo as the cosmic scene, so
 //! the face scales with the output exactly like the original does.
 
+use eclipse_i18n::{Key, Lang};
+
 use super::{Layout, PixBuf, Rgb, Style};
+
+/// The language the wallpaper's readout is in, read ONCE per process.
+///
+/// lunarbg is a daemon that redraws the face every second: `Lang::current`
+/// reads `/etc/eclipse/locale` and `$LANG`, and doing that per frame would be
+/// a file read a second for a string that cannot change without the
+/// wallpaper being restarted anyway. `eclipse-locale` restarts it, which is
+/// how the new language gets on the screen.
+fn lang() -> Lang {
+    static LANG: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
+    *LANG.get_or_init(Lang::current)
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
@@ -71,19 +85,19 @@ pub fn moon_lit(age: f64) -> f64 {
 }
 
 /// The phase's name, one of the eight, each centred on its moment.
-pub fn moon_name(age: f64) -> &'static str {
-    const NAMES: [&str; 8] = [
-        "LUNA NUEVA",
-        "LUNA CRECIENTE",
-        "CUARTO CRECIENTE",
-        "GIBOSA CRECIENTE",
-        "LUNA LLENA",
-        "GIBOSA MENGUANTE",
-        "CUARTO MENGUANTE",
-        "LUNA MENGUANTE",
+pub fn moon_name(age: f64, lang: Lang) -> &'static str {
+    const NAMES: [Key; 8] = [
+        Key::moon_new,
+        Key::moon_waxing_crescent,
+        Key::moon_first_quarter,
+        Key::moon_waxing_gibbous,
+        Key::moon_full,
+        Key::moon_waning_gibbous,
+        Key::moon_last_quarter,
+        Key::moon_waning_crescent,
     ];
     let k = ((age / SYNODIC * 8.0 + 0.5).floor() as usize) % 8;
-    NAMES[k]
+    lang.s(NAMES[k])
 }
 
 /// Seconds since the epoch, as the face reads them: `LUNARBG_TIME` (epoch
@@ -132,16 +146,21 @@ fn civil(days: i64) -> (i64, u32, u32, u32) {
 
 /// The line under the caption for local time `local` (seconds since the
 /// epoch, already in the local zone) and real time `t`.
-pub fn date_line(local: i64, t: i64) -> String {
-    const WD: [&str; 7] = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"];
-    const MO: [&str; 12] = ["ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"];
+pub fn date_line(local: i64, t: i64, lang: Lang) -> String {
+    // The shared tables, in capitals: this face draws capitals and nothing
+    // else. `civil` counts the weekday from Monday and the shared table is
+    // Sunday-first, hence the shift. The Spanish accents that come with them
+    // (`MIÉ`, `SÁB`) are drawn by lunartext like the digits already are --
+    // the 5x7 fallback has neither.
+    let wds = lang.weekday_sun_first();
+    let months = lang.month_short();
     let (y, m, d, wd) = civil(local.div_euclid(86_400));
     let age = moon_age(t);
     format!(
         "{} {d} {} {y} · {} {}%",
-        WD[wd as usize],
-        MO[(m - 1) as usize],
-        moon_name(age),
+        wds[((wd + 1) % 7) as usize].to_uppercase(),
+        months[(m - 1) as usize].to_uppercase(),
+        moon_name(age, lang),
         (moon_lit(age) * 100.0).round() as u32
     )
 }
@@ -240,7 +259,7 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
     }
 
     // The date and today's Moon, smaller and dimmer than the caption.
-    let line = date_line(local, t);
+    let line = date_line(local, t, lang());
     let adv = LINE_ADV * s;
     let n = line.chars().count() as f32;
     let left = cx - (n - 1.0) * adv / 2.0;
@@ -403,23 +422,91 @@ mod tests {
         let full = 1_706_205_240;
         assert!(moon_lit(moon_age(new)) < 0.01, "{}", moon_lit(moon_age(new)));
         assert!(moon_lit(moon_age(full)) > 0.99, "{}", moon_lit(moon_age(full)));
-        assert_eq!(moon_name(moon_age(new)), "LUNA NUEVA");
-        assert_eq!(moon_name(moon_age(full)), "LUNA LLENA");
+        assert_eq!(moon_name(moon_age(new), Lang::Es), "LUNA NUEVA");
+        assert_eq!(moon_name(moon_age(new), Lang::En), "NEW MOON");
+        assert_eq!(moon_name(moon_age(full), Lang::Es), "LUNA LLENA");
+        assert_eq!(moon_name(moon_age(full), Lang::En), "FULL MOON");
         // A week after new it is the first quarter, half lit.
         let q = new + 7 * 86_400 + 9 * 3600;
-        assert_eq!(moon_name(moon_age(q)), "CUARTO CRECIENTE");
+        assert_eq!(moon_name(moon_age(q), Lang::Es), "CUARTO CRECIENTE");
+        assert_eq!(moon_name(moon_age(q), Lang::En), "FIRST QUARTER");
         assert!((moon_lit(moon_age(q)) - 0.5).abs() < 0.08);
     }
+
+    /// Seconds from 2026-01-01 to the first of each month of 2026.
+    const MONTH_STARTS: [i64; 12] = [
+        0,
+        31 * 86_400,
+        59 * 86_400,
+        90 * 86_400,
+        120 * 86_400,
+        151 * 86_400,
+        181 * 86_400,
+        212 * 86_400,
+        243 * 86_400,
+        273 * 86_400,
+        304 * 86_400,
+        334 * 86_400,
+    ];
 
     #[test]
     fn the_date_line_names_the_day_the_calendar_does() {
         // 2026-11-05 was a Thursday.
         let t = 1_793_836_800 + 3 * 3600; // 03:00 UTC that day
-        let line = date_line(t, t);
+        let line = date_line(t, t, Lang::Es);
         assert!(line.starts_with("JUE 5 NOV 2026 · "), "{line}");
         assert!(line.ends_with('%'));
+        let en = date_line(t, t, Lang::En);
+        assert!(en.starts_with("THU 5 NOV 2026 · "), "{en}");
+        // Every weekday of a week and every month of a year, in both
+        // languages: the shared tables are Sunday-first and `civil` counts
+        // from Monday, so an off-by-one here would name Tuesday's files
+        // Wednesday and nothing else would ever say so.
+        for lang in [Lang::Es, Lang::En] {
+            let wds = lang.weekday_sun_first();
+            for day in 0..7i64 {
+                let d = t + day * 86_400;
+                let (_, _, _, wd) = civil(d.div_euclid(86_400));
+                let want = wds[((wd + 1) % 7) as usize].to_uppercase();
+                assert!(date_line(d, d, lang).starts_with(&want), "{lang:?} +{day}");
+            }
+            for month in 0..12usize {
+                let want = lang.month_short()[month].to_uppercase();
+                let d = 1_767_225_600 + MONTH_STARTS[month];
+                assert!(
+                    date_line(d, d, lang).contains(&format!(" {want} 2026 ")),
+                    "{lang:?} month {month}: {}",
+                    date_line(d, d, lang)
+                );
+            }
+        }
         assert_eq!(civil(0), (1970, 1, 1, 3));
         assert_eq!(civil(-1).0, 1969);
+    }
+
+    /// The English readout is no wider than the Spanish one, which is the
+    /// width the face was drawn around.
+    ///
+    /// The line is centred under the caption and nothing clips it: a longer
+    /// phase name in a language nobody measured would simply run out past the
+    /// outer ring. Counted in characters because the face draws one fixed
+    /// cell per character.
+    #[test]
+    fn the_english_readout_is_no_wider_than_the_spanish_one() {
+        let widest = |lang: Lang| {
+            // Every phase, on the widest weekday and month of that language.
+            (0..8)
+                .map(|k| {
+                    let age = k as f64 * SYNODIC / 8.0;
+                    let wd = lang.weekday_sun_first().iter().map(|w| w.chars().count()).max().unwrap();
+                    let mo = lang.month_short().iter().map(|m| m.chars().count()).max().unwrap();
+                    wd + mo + moon_name(age, lang).chars().count()
+                })
+                .max()
+                .unwrap()
+        };
+        let (es, en) = (widest(Lang::Es), widest(Lang::En));
+        assert!(en <= es, "the English readout is {en} cells and the Spanish {es}");
     }
 
     #[test]
