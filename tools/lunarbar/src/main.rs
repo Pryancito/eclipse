@@ -62,6 +62,7 @@ use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysin
 mod hunter_menu;
 mod info;
 use info::*;
+mod workspaces;
 mod hunter_toast;
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
@@ -526,6 +527,8 @@ struct Bar {
     hunter_hit: (i32, i32),
     /// Click targets for each window button (Task bars).
     task_hits: Vec<TaskHit>,
+    /// x-ranges of the desktop chips (tecno top bar), in chip order.
+    ws_hits: Vec<(i32, i32)>,
 }
 
 impl Drop for Bar {
@@ -755,6 +758,8 @@ struct Metrics {
     net_hist: meter::Ring,
     /// The focused window, as the tecno top bar centres it (empty: none).
     title: String,
+    /// `(chip label, active)` per desktop, for the tecno top bar.
+    workspaces: Vec<(String, bool)>,
 }
 
 #[derive(Default)]
@@ -766,6 +771,7 @@ struct State {
     /// launcher, clock, power and volume buttons simply do nothing.
     xdg_wm_base: Option<XdgWmBase>,
     foreign_mgr: Option<ZwlrForeignToplevelManagerV1>,
+    ws: workspaces::Workspaces,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -857,6 +863,7 @@ impl State {
             mem_hist: self.hist.1.clone(),
             net_hist: self.hist.2.clone(),
             title: String::new(), // filled per render, from the toplevels
+            workspaces: Vec::new(), // likewise, from ext-workspace
         };
         if self.tick.is_multiple_of(hunter_menu::REFRESH_TICKS) {
             self.refresh_hunter();
@@ -941,6 +948,7 @@ impl State {
                     kbd_hit: (0, 0),
                     hunter_hit: (0, 0),
                     task_hits: Vec::new(),
+                    ws_hits: Vec::new(),
                 };
                 if !fill_guard::try_push_bounded(&mut self.bars, bar, fill_guard::MAX_BARS) {
                     // unreachable given the check above; keep for symmetry
@@ -1102,6 +1110,7 @@ impl State {
             }
             let old = (bar.map, bar.map_len);
             bar.task_hits.clear();
+            bar.ws_hits.clear();
             bar.launcher_hit = (0, 0);
             bar.clock_hit = (0, 0);
             bar.vol_hit = (0, 0);
@@ -1159,6 +1168,7 @@ impl State {
         }
         let mut m = self.metrics.clone();
         m.title = active_title(&self.toplevels);
+        m.workspaces = self.ws.chips();
         match self.bars[idx].role {
             Role::Info => {
                 let (w, h) = (self.bars[idx].width as usize, self.bars[idx].height as usize);
@@ -1174,7 +1184,7 @@ impl State {
                     bar.busy[i] = false;
                     return;
                 };
-                let (launcher_hit, clock_hit, power_hit) = draw_info(&mut cv, w, h, &m, hover);
+                let ((launcher_hit, clock_hit, power_hit), ws_hits) = draw_info(&mut cv, w, h, &m, hover);
                 let bar = &mut self.bars[idx];
                 let data: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(bar.map.add(i * frame_size), frame_size)
@@ -1186,6 +1196,7 @@ impl State {
                 bar.launcher_hit = launcher_hit;
                 bar.clock_hit = clock_hit;
                 bar.power_hit = power_hit;
+                bar.ws_hits = ws_hits;
                 commit_bar(bar, i);
             }
             Role::Task => {
@@ -3352,6 +3363,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     "xdg_wm_base" => {
                         state.xdg_wm_base = Some(registry.bind(name, version.min(3), qh, ()))
                     }
+                    "ext_workspace_manager_v1" => state.ws.mgr = Some(registry.bind(name, 1, qh, ())),
                     "zwlr_foreign_toplevel_manager_v1" => {
                         state.foreign_mgr = Some(registry.bind(name, version.min(3), qh, ()))
                     }
@@ -3620,6 +3632,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.toggle_kbd();
                 } else if button == BTN_LEFT && x >= hx0 && x < hx1 {
                     state.toggle_hunter(qh, role == Role::Info);
+                } else if let Some(n) = state.bars[idx].ws_hits.iter().position(|h| x >= h.0 && x < h.1) {
+                    state.ws.activate(n);
                 } else if role == Role::Task {
                     let hit = state.bars[idx]
                         .task_hits
@@ -4299,6 +4313,7 @@ fn main() {
             mem_hist: h.1,
             net_hist: h.2,
             title: "foot · root@eclipse: ~".into(),
+            workspaces: ["01", "02", "03", "04"].iter().enumerate().map(|(i, s)| (s.to_string(), i == 0)).collect(),
         };
 
         // Top info bar occupies rows [0, bh) — in the KDE look there is no

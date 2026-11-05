@@ -111,7 +111,10 @@ pub(crate) fn net_module(
     Some(x)
 }
 
-pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> ((i32, i32), (i32, i32), (i32, i32)) {
+/// The three button hit boxes, plus the desktop chips' (tecno only).
+type InfoHits = (((i32, i32), (i32, i32), (i32, i32)), Vec<(i32, i32)>);
+
+pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> InfoHits {
     if tecno() {
         return draw_info_tecno(cv, w, h, m, hover);
     }
@@ -211,7 +214,7 @@ pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover:
         }
     }
 
-    (launcher_hit, clock_hit, power_hit)
+    ((launcher_hit, clock_hit, power_hit), Vec::new())
 }
 
 /// Mockup A's top bar: wordmark on the left, the focused window centred, and
@@ -226,7 +229,7 @@ pub(crate) fn draw_info_tecno(
     h: usize,
     m: &Metrics,
     hover: Hover,
-) -> ((i32, i32), (i32, i32), (i32, i32)) {
+) -> InfoHits {
     clear_bar(cv, w, h);
     bar_edge(cv, w as i32, h as i32 - 2, h as i32 - 1, true);
     let p = pal();
@@ -247,7 +250,31 @@ pub(crate) fn draw_info_tecno(
         cv.crescent(10, (hi - d) / 2, d, p.accent);
     }
     cv.text_bold(wordmark, lx, ty, p.accent);
-    let min_x = launcher_hit.1 + 16;
+    let mut min_x = launcher_hit.1 + 16;
+
+    // Desktop chips: square, hairline, the current one lit. Only as many as
+    // leave half the bar to everything else.
+    let mut ws_hits = Vec::new();
+    for (label, active) in &m.workspaces {
+        let cw = Canvas::text_width(label) + 12;
+        if min_x + cw > w as i32 / 2 {
+            break;
+        }
+        let (y, ch) = (btn_y + 2, btn_h - 4);
+        let fill = if *active { p.btn_active } else { p.bar_bg };
+        cv.fill_rect_a(min_x, y, cw, ch, fill, 1.0);
+        let edge = if *active { p.accent } else { p.rule };
+        cv.fill_rect_a(min_x, y, cw, 1, edge, 1.0);
+        cv.fill_rect_a(min_x, y + ch - 1, cw, 1, edge, 1.0);
+        cv.fill_rect_a(min_x, y, 1, ch, edge, 1.0);
+        cv.fill_rect_a(min_x + cw - 1, y, 1, ch, edge, 1.0);
+        cv.text(label, min_x + 6, ty, if *active { p.text } else { p.dim });
+        ws_hits.push((min_x, min_x + cw));
+        min_x += cw + 4;
+    }
+    if !ws_hits.is_empty() {
+        min_x += 12;
+    }
 
     let mut rx = w as i32 - 4;
     let (mut clock_hit, mut power_hit) = ((0, 0), (0, 0));
@@ -306,7 +333,7 @@ pub(crate) fn draw_info_tecno(
         cv.text(&title, tx, ty, p.dim);
     }
 
-    (launcher_hit, clock_hit, power_hit)
+    ((launcher_hit, clock_hit, power_hit), ws_hits)
 }
 
 /// `LABEL [meter] value`, right-aligned at `right`; the new right edge (with
@@ -384,6 +411,23 @@ mod tests {
             let last_title = (0..w).rev().find(|&x| column_differs(&none, &long, w, x)).expect("no title");
             assert!(last_title + 8 < first, "{w}: title reaches x={last_title}, readouts start at {first}");
         }
+    }
+
+    #[test]
+    fn desktop_chips_are_clickable_in_order_and_stay_left_of_centre() {
+        let w = 1440;
+        let m = Metrics {
+            workspaces: (1..=4).map(|i| (format!("{i:02}"), i == 2)).collect(),
+            ..Default::default()
+        };
+        let mut cv = Canvas::new(w, 34);
+        let (_, hits) = draw_info_tecno(&mut cv, w, 34, &m, Hover::None);
+        assert_eq!(hits.len(), 4);
+        assert!(hits.windows(2).all(|p| p[0].1 < p[1].0), "{hits:?}");
+        assert!(hits[3].1 <= w as i32 / 2);
+        // A bar too narrow for any chip shows none rather than overlapping.
+        let mut cv = Canvas::new(300, 34);
+        assert!(draw_info_tecno(&mut cv, 300, 34, &m, Hover::None).1.is_empty());
     }
 
     #[test]
