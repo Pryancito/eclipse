@@ -22,7 +22,7 @@ fn apps(n: usize) -> PopupKind {
 const KINDS: [fn() -> PopupKind; 4] = [
     || PopupKind::Calendar { year: 2026, month: 8 },
     || PopupKind::PowerMenu,
-    || PopupKind::TaskMenu { tid: 1, title: String::new() },
+    || PopupKind::TaskMenu { tid: 1, title: String::new(), win: taskmenu::Win::default(), sel: 0 },
     || PopupKind::Volume { level: 50 },
 ];
 
