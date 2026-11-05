@@ -130,7 +130,8 @@ pub fn draw(
         let is_armed = armed == Some(a);
         let c = colour(a);
         if lit || is_armed {
-            plate_a(cv, px + 5, ry + 1, pw - 10, ROW_H - 2, 6, pal().menu_hover, 1.0);
+            // Lit in the row's own colour, not the shared hover blue.
+            plate_a(cv, px + 5, ry + 1, pw - 10, ROW_H - 2, 6, c, 0.16);
             if tecno() {
                 cv.fill_rect_a(px + 5, ry + 1, 2, ROW_H - 2, c, 1.0);
             }
