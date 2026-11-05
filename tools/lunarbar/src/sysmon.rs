@@ -327,8 +327,7 @@ pub fn log_tail(path: &Path, n: usize) -> Vec<String> {
 /// `612 MiB`, `2,1 GiB`, from KiB.
 pub fn fmt_kib(kib: u64, lang: Lang) -> String {
     if kib >= 1024 * 1024 {
-        format!("{:.1} GiB", kib as f64 / (1024.0 * 1024.0))
-            .replace('.', &lang.decimal_point().to_string())
+        lang.decimals(format!("{:.1} GiB", kib as f64 / (1024.0 * 1024.0)))
     } else if kib >= 1024 {
         format!("{} MiB", kib / 1024)
     } else {

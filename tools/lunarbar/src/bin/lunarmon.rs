@@ -344,7 +344,7 @@ impl Mon {
             return;
         };
         if r.pid == 1 {
-            self.status = self.lang.s(Key::mon_eclipse_init_is_not_ended_from_her).into();
+            self.status = self.lang.s(Key::mon_eclipse_init_is_not_ended_here).into();
             self.bad = true;
             return;
         }
@@ -462,12 +462,13 @@ impl Mon {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|s| sysmon::fmt_secs(s as u64))
             .unwrap_or_default();
-        self.m.load = read("/proc/loadavg")
-            .split_whitespace()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .replace('.', &self.lang.decimal_point().to_string());
+        self.m.load = self.lang.decimals(
+            read("/proc/loadavg")
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         let (iface, addr) = first_iface();
         self.m.iface = iface;
         self.m.addr = addr;
@@ -493,7 +494,7 @@ fn done_text(m: &Mon, p: &Pending) -> String {
         Pending::Signal(pid, false) => format!("{who} ({pid}): {}", l.s(Key::mon_asked_to_end)),
         Pending::Signal(pid, true) => format!("{who} ({pid}): {}", l.s(Key::mon_killed)),
         Pending::Service(_, Verb::Start) => format!("{who}: {}", l.s(Key::mon_eclipse_init_asked_to_start_it)),
-        Pending::Service(_, Verb::Stop) => format!("{who}: {}", l.s(Key::mon_stopped_until_started_again_or_the)),
+        Pending::Service(_, Verb::Stop) => format!("{who}: {}", l.s(Key::mon_stopped_until_next_boot)),
         Pending::Service(_, Verb::Restart) => format!("{who}: {}", l.s(Key::mon_restarting)),
     }
 }
@@ -568,7 +569,7 @@ fn svc_list_w(w: i32) -> i32 {
 /// proceso, la media de carga y los GiB de memoria --- escritos a la
 /// castellana.
 fn pct(v: f32, lang: Lang) -> String {
-    format!("{v:.1} %").replace('.', &lang.decimal_point().to_string())
+    lang.decimals(format!("{v:.1} %"))
 }
 
 fn fit(s: &str, px: i32) -> String {
@@ -715,7 +716,7 @@ fn draw_strip(cv: &mut Canvas, w: i32, m: &Mon) {
     let root = m.m.root_pct.map(|p| format!("/ {p} %")).unwrap_or_default();
     plate_head(cv, xs[3], top, pw, m.lang.s(Key::mon_disk), &root);
     if m.m.disk_name.is_empty() {
-        cv.text(&fit(m.lang.s(Key::mon_the_kernel_gives_no_proc_diskstats), pw), xs[3], top + line, DIM);
+        cv.text(&fit(m.lang.s(Key::mon_no_proc_diskstats), pw), xs[3], top + line, DIM);
     } else {
         cv.text(m.lang.s(Key::mon_read), xs[3], top + line, MUTED);
         text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_read)), xs[3] + pw, top + line, TEXT);
@@ -809,7 +810,7 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let b = foot_buttons(w, h);
     let info = match m.selected_row() {
         Some(r) => format!("{} · PID {} · {}", r.name, r.pid, if r.cmd.is_empty() { "—" } else { &r.cmd }),
-        None => m.lang.s(Key::mon_pick_del_end_shift_del_kill_tab_se).into(),
+        None => m.lang.s(Key::mon_footer_processes_keys).into(),
     };
     let text = if m.status.is_empty() { info } else { m.status.clone() };
     let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
@@ -839,7 +840,7 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let n = ((body_h - COLS_H - 8) / ROW_H).max(1) as usize;
     let first = m.sel_svc.saturating_sub(n.saturating_sub(1));
     if m.svcs.is_empty() {
-        cv.text(&fit(m.lang.s(Key::mon_eclipse_init_has_not_written_run_e), lw - 16), PAD, ry + 8, MUTED);
+        cv.text(&fit(m.lang.s(Key::mon_no_services_file_yet), lw - 16), PAD, ry + 8, MUTED);
     }
     for (k, s) in m.svcs.iter().enumerate().skip(first).take(n) {
         let y = ry + (k - first) as i32 * ROW_H;
@@ -914,7 +915,7 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     cv.hline(0, fy, w, HAIRLINE, 1.0);
     let b = foot_buttons(w, h);
     let text = if m.status.is_empty() {
-        m.lang.s(Key::mon_pick_i_start_r_restart_p_stop_unti).to_string()
+        m.lang.s(Key::mon_footer_services_keys).to_string()
     } else {
         m.status.clone()
     };
@@ -1246,9 +1247,14 @@ wayland_client::delegate_noop!(State: ignore ZxdgToplevelDecorationV1);
 // ── main ─────────────────────────────────────────────────────────────────────
 
 /// A made-up machine, for `--dump` and the tests: two samples a second apart.
-fn sample_mon() -> Mon {
+///
+/// The language is an argument and not `Lang::current()` so that a test says
+/// which language it is reading: the host's `/etc/eclipse/locale` decides what
+/// `Lang::current()` answers, and a fixture that asked it would make every
+/// test here depend on the machine it runs on. `--dump` passes the real one.
+fn sample_mon(lang: Lang) -> Mon {
     let mut m = Mon::new();
-    m.lang = Lang::current();
+    m.lang = lang;
     let mut prev = Prev::default();
     let p = |pid: i32, comm: &str, ticks: u64, threads: u32, rss_mib: u64, cmd: &str| {
         (
@@ -1293,7 +1299,7 @@ fn sample_mon() -> Mon {
     // Los decimales del volcado se escriben como los escribe el idioma, igual
     // que los de la máquina de verdad: si no, el volcado en inglés enseña una
     // coma castellana que el panel ya no pinta.
-    m.m.load = "0.84 0.61 0.52".replace('.', &m.lang.decimal_point().to_string());
+    m.m.load = m.lang.decimals("0.84 0.61 0.52".to_string());
     m.now_wall = 1_793_865_520;
     m.sel_pid = Some(1412);
     m.sel_svc = 2;
@@ -1317,7 +1323,7 @@ fn dump(spec: &str) -> ! {
     if fill_guard::check_buffer(w, h).is_err() {
         std::process::exit(1);
     }
-    let mut m = sample_mon();
+    let mut m = sample_mon(Lang::current());
     if parts.next() == Some("servicios") {
         m.tab = Tab::Svcs;
     }
@@ -1464,7 +1470,7 @@ mod tests {
 
     #[test]
     fn two_samples_give_shares_rates_and_the_windows_first() {
-        let m = sample_mon();
+        let m = sample_mon(Lang::Es);
         // labwc: 15 ticks in a second on 4 CPUs.
         let labwc = m.rows.iter().find(|r| r.name == "labwc").unwrap();
         assert!((labwc.cpu - 3.75).abs() < 0.01, "{}", labwc.cpu);
@@ -1489,7 +1495,7 @@ mod tests {
 
     #[test]
     fn typing_filters_and_esc_clears_then_closes() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         for c in "hunt".chars() {
             m.filter.push(c);
         }
@@ -1505,7 +1511,7 @@ mod tests {
 
     #[test]
     fn ending_what_the_desktop_stands_on_asks_twice() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         let mut done = Vec::new();
         m.sel_pid = Some(612); // labwc
         m.signal_selected(false, &mut |p| {
@@ -1536,7 +1542,7 @@ mod tests {
 
     #[test]
     fn services_take_start_stop_restart_and_a_oneshot_none() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         m.tab = Tab::Svcs;
         let mut asked = Vec::new();
         m.sel_svc = m.svcs.iter().position(|s| s.name == "ntpd").unwrap();
@@ -1572,7 +1578,7 @@ mod tests {
     #[test]
     fn a_click_picks_the_tab_the_sort_and_the_row() {
         let (w, h) = (1180, 760);
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         let t = tabs(w);
         m.click(w, h, t[1].0 + 4, t[1].1 + 4, &mut nothing);
         assert_eq!(m.tab, Tab::Svcs);
@@ -1590,7 +1596,7 @@ mod tests {
 
     #[test]
     fn arrows_walk_the_list_and_keep_the_selection_on_screen() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         m.sel_pid = None;
         m.move_sel(1, 3);
         let first = m.sel_pid;
@@ -1605,7 +1611,7 @@ mod tests {
 
     #[test]
     fn every_size_and_tab_draws_without_a_panic() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         for tab in [Tab::Procs, Tab::Svcs] {
             m.tab = tab;
             for (w, h) in [(1180, 760), (800, 560), (1920, 1080)] {
@@ -1618,7 +1624,7 @@ mod tests {
 
     #[test]
     fn english_is_the_same_monitor_in_other_words() {
-        let mut m = sample_mon();
+        let mut m = sample_mon(Lang::Es);
         m.lang = Lang::En;
         let sections: Vec<_> = m.items().into_iter().filter_map(|i| if let Item::Section(s) = i { Some(s) } else { None }).collect();
         assert_eq!(sections, ["APPLICATIONS · with a window", "SYSTEM"]);
@@ -1642,13 +1648,17 @@ mod tests {
         assert_eq!(sysmon::fmt_kib(2_202_009, Lang::En), "2.1 GiB");
 
         // Y el volcado se arma con el idioma ya puesto, porque si no enseña
-        // una coma que el panel de verdad ya no pinta.
-        let m = sample_mon();
-        let point = m.lang.decimal_point();
-        assert!(
-            m.m.load.contains(point),
-            "la media de carga {:?} no usa el separador {point:?}",
-            m.m.load
-        );
+        // una coma que el panel de verdad ya no pinta. Se comprueban los dos
+        // idiomas aquí mismo, que es lo que el `Lang::current()` de antes no
+        // podía: solo medía el idioma de la máquina que corre el test.
+        for lang in [Lang::Es, Lang::En] {
+            let m = sample_mon(lang);
+            let point = lang.decimal_point();
+            assert!(
+                m.m.load.contains(point),
+                "la media de carga {:?} no usa el separador {point:?}",
+                m.m.load
+            );
+        }
     }
 }

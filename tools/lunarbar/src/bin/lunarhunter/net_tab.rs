@@ -33,14 +33,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     let st = g.st;
     let p = g.p;
     let Some(t) = &st.net else {
-        g.bold(
-            st.lang.s(Key::hunt_net_this_kernel_has_no_network_monitor),
-            x,
-            y,
-            CRIT,
-        );
+        g.bold(st.lang.s(Key::hunt_net_no_network_monitor), x, y, CRIT);
         g.text(
-            st.lang.s(Key::hunt_net_no_proc_hunter_net_a_newer_hunter),
+            st.lang.s(Key::hunt_net_no_netmon_proc_file),
             x,
             y + 28,
             p.dim,
@@ -104,9 +99,9 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     };
     let bw = g.button(x, cy, 0, label, look, alerts_act);
     let note = if t.ignore_loopback {
-        st.lang.s(Key::hunt_net_ports_on_127_0_0_1_only_do_not_ale)
+        st.lang.s(Key::hunt_net_loopback_does_not_alert)
     } else {
-        st.lang.s(Key::hunt_net_ports_on_127_0_0_1_only_alert_too)
+        st.lang.s(Key::hunt_net_loopback_alerts_too)
     };
     g.text(
         &fit(note, w - bw - 16),
@@ -129,12 +124,7 @@ pub(super) fn tab_network(g: &mut Paint, (x, y, w, h): Rect, sealed: bool) -> (R
     let max = list.len().saturating_sub(fits);
     let top = st.scroll.min(max);
     if list.is_empty() {
-        g.text(
-            st.lang.s(Key::hunt_net_no_process_holds_a_network_socket),
-            x,
-            cy + 4,
-            p.dim,
-        );
+        g.text(st.lang.s(Key::hunt_net_no_socket_held), x, cy + 4, p.dim);
     }
     // Columns: verdict, pid, program, proto, local, remote; an alert's button
     // over the remote one, which a listener does not have. The pid goes first

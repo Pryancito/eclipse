@@ -173,11 +173,7 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             CRIT,
         );
         g.text(
-            &fit(
-                st.lang
-                    .s(Key::hunt_sched_this_image_predates_scheduled_scan),
-                w,
-            ),
+            &fit(st.lang.s(Key::hunt_sched_image_predates_scans), w),
             x,
             y + 28,
             p.dim,
@@ -185,9 +181,8 @@ pub(super) fn tab_schedule(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
         return ((x, y, w, 0), 0);
     }
     let help = [
-        st.lang.s(Key::hunt_sched_the_hunter_scheduler_service_runs),
-        st.lang
-            .s(Key::hunt_sched_if_the_machine_is_off_then_they_ru),
+        st.lang.s(Key::hunt_sched_service_runs_them),
+        st.lang.s(Key::hunt_sched_runs_when_back),
     ];
     for (k, l) in help.iter().enumerate() {
         g.text(&fit(l, w), x, y + k as i32 * (GLYPH_H + 4), p.dim);

@@ -101,6 +101,20 @@ impl Lang {
         }
     }
 
+    /// The same number, written the way the language writes it: `2.1` stays
+    /// `2.1` in English and becomes `2,1` in Spanish.
+    ///
+    /// Every caller had the same `replace('.', &lang.decimal_point()
+    /// .to_string())` line, which built a one-character `String` on each call
+    /// and rewrote the number even when there was nothing to change. English
+    /// hands the string straight back here, so only Spanish pays anything.
+    pub fn decimals(self, n: String) -> String {
+        match self {
+            Lang::Es => n.replace('.', ","),
+            Lang::En => n,
+        }
+    }
+
     // ── the named accessors the panel already called ─────────────────────
     //
     // Before the table existed, lunarbar's `i18n.rs` had one method per

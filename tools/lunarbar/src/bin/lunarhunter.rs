@@ -751,7 +751,7 @@ impl State {
     fn send_error(&self, e: SendError) -> &'static str {
         match e {
             SendError::Denied => self.lang.s(Key::hunt_root_required),
-            SendError::Rejected => self.lang.s(Key::hunt_hunter_rejected_the_change_nothing),
+            SendError::Rejected => self.lang.s(Key::hunt_hunter_rejected_the_change),
             SendError::Unavailable => {
                 self.lang.s(Key::hunt_proc_hunter_not_responding)
             }
@@ -1090,7 +1090,7 @@ impl State {
         let Some(f) = &self.firewall else { return };
         match fw::save(f, &civil_time(now_secs()), fw::RULES_FILE) {
             Ok(()) => {
-                let m = self.lang.s(Key::hunt_applied_and_saved_to_etc_hunter_fi);
+                let m = self.lang.s(Key::hunt_fw_applied_and_saved);
                 self.say(m, false);
             }
             Err(e) => self.say(format!("{}: {e}", fw::RULES_FILE), true),
@@ -1113,7 +1113,7 @@ impl State {
         });
         match res {
             Ok(()) => {
-                let m = self.lang.s(Key::hunt_saved_to_etc_hunter_policy_conf_ap);
+                let m = self.lang.s(Key::hunt_saved_applied_at_boot);
                 self.say(m, false);
             }
             Err(e) => {
@@ -1627,7 +1627,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
                 CRIT,
             );
             g.text(
-                st.lang.s(Key::hunt_no_proc_hunter_lunarhunter_needs_t),
+                st.lang.s(Key::hunt_no_hunter_proc_file),
                 body.0,
                 body.1 + 28,
                 p.dim,
@@ -1984,7 +1984,7 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
     cy += BTN_H + 8;
     g.text(
         &fit(
-            st.lang.s(Key::hunt_sealing_is_one_way_until_reboot_se),
+            st.lang.s(Key::hunt_sealing_is_one_way),
             w,
         ),
         x,
@@ -2220,8 +2220,8 @@ fn tab_quarantine(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let st = g.st;
     let p = g.p;
     let help = [
-        st.lang.s(Key::hunt_files_live_in_var_lib_hunter_quara),
-        st.lang.s(Key::hunt_restoring_does_not_lift_the_deny_o),
+        st.lang.s(Key::hunt_quarantine_dir_and_mode),
+        st.lang.s(Key::hunt_restore_keeps_the_deny),
     ];
     for (i, l) in help.iter().enumerate() {
         g.text(&fit(l, w), x, y + i as i32 * (GLYPH_H + 4), p.dim);
@@ -2453,7 +2453,7 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
         x,
         cy,
         w,
-        st.lang.s(Key::hunt_learned_programs_trusted_on_first),
+        st.lang.s(Key::hunt_learned_programs_section),
     );
     cy += 28;
     let console_h = 5 * (GLYPH_H + 3) + 12;
@@ -2515,7 +2515,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
             CRIT,
         );
         g.text(
-            st.lang.s(Key::hunt_no_proc_hunter_firewall_a_newer_hu),
+            st.lang.s(Key::hunt_no_firewall_proc_file),
             x,
             y + 28,
             p.dim,
@@ -2547,7 +2547,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let room = ((y + h - cy) / 2 / (card_h + 6)).max(1) as usize;
     if f.questions.is_empty() {
         g.text(
-            st.lang.s(Key::hunt_no_program_is_waiting_for_an_answe),
+            st.lang.s(Key::hunt_no_program_awaits_an_answer),
             x,
             cy,
             p.dim,
@@ -2648,7 +2648,7 @@ fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
     let top = st.scroll.min(max);
     if f.rules.is_empty() {
         g.text(
-            st.lang.s(Key::hunt_no_rules_yet_answering_a_question),
+            st.lang.s(Key::hunt_no_rules_yet),
             x,
             cy,
             p.dim,

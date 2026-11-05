@@ -695,11 +695,11 @@ strings! {
         es: "Aviso: deja pasar y pregunta.",
         en: "Report: lets it through and asks.",
     },
-    hunt_net_this_kernel_has_no_network_monitor => {
+    hunt_net_no_network_monitor => {
         es: "Este núcleo no tiene monitor de red",
         en: "This kernel has no network monitor",
     },
-    hunt_net_no_proc_hunter_net_a_newer_hunter => {
+    hunt_net_no_netmon_proc_file => {
         es: "No hay /proc/hunter_net: hace falta un hunter más nuevo.",
         en: "No /proc/hunter_net: a newer hunter is needed.",
     },
@@ -708,11 +708,11 @@ strings! {
     hunt_net_connections => { es: "conexiones", en: "connections" },
     hunt_net_alerts_on => { es: "Avisos: activados", en: "Alerts: on" },
     hunt_net_alerts_off => { es: "Avisos: desactivados", en: "Alerts: off" },
-    hunt_net_ports_on_127_0_0_1_only_do_not_ale => {
+    hunt_net_loopback_does_not_alert => {
         es: "Los puertos solo de 127.0.0.1 no avisan: no se ven desde la red.",
         en: "Ports on 127.0.0.1 only do not alert: the network cannot reach them.",
     },
-    hunt_net_ports_on_127_0_0_1_only_alert_too => {
+    hunt_net_loopback_alerts_too => {
         es: "También avisan los puertos solo de 127.0.0.1.",
         en: "Ports on 127.0.0.1 only alert too.",
     },
@@ -720,7 +720,7 @@ strings! {
         es: "Conexiones por proceso",
         en: "Connections by process",
     },
-    hunt_net_no_process_holds_a_network_socket => {
+    hunt_net_no_socket_held => {
         es: "ningún proceso tiene sockets de red",
         en: "no process holds a network socket",
     },
@@ -739,15 +739,15 @@ strings! {
         es: "No hay /etc/hunter/schedule",
         en: "No /etc/hunter/schedule",
     },
-    hunt_sched_this_image_predates_scheduled_scan => {
+    hunt_sched_image_predates_scans => {
         es: "Esta imagen es anterior a los escaneos programados.",
         en: "This image predates scheduled scans.",
     },
-    hunt_sched_the_hunter_scheduler_service_runs => {
+    hunt_sched_service_runs_them => {
         es: "Los lanza el servicio hunter-scheduler, sin esta ventana.",
         en: "The hunter-scheduler service runs them, window or not.",
     },
-    hunt_sched_if_the_machine_is_off_then_they_ru => {
+    hunt_sched_runs_when_back => {
         es: "Si el equipo está apagado a esa hora, se hacen al volver.",
         en: "If the machine is off then, they run when it is back.",
     },
@@ -968,7 +968,7 @@ strings! {
     hunt_out => { es: "salida", en: "out" },
     hunt_in => { es: "entrada", en: "in" },
     hunt_forget => { es: "Olvidar", en: "Forget" },
-    hunt_hunter_rejected_the_change_nothing => {
+    hunt_hunter_rejected_the_change => {
         es: "hunter rechazó el cambio; no se aplicó nada",
         en: "hunter rejected the change; nothing was applied",
     },
@@ -976,15 +976,15 @@ strings! {
         es: "la orden falló (ver la consola)",
         en: "the command failed (see the console)",
     },
-    hunt_applied_and_saved_to_etc_hunter_fi => {
+    hunt_fw_applied_and_saved => {
         es: "aplicado y guardado en /etc/hunter/firewall",
         en: "applied and saved to /etc/hunter/firewall",
     },
-    hunt_saved_to_etc_hunter_policy_conf_ap => {
+    hunt_saved_applied_at_boot => {
         es: "guardado en /etc/hunter/policy.conf: se aplicará al arrancar",
         en: "saved to /etc/hunter/policy.conf: applied at boot",
     },
-    hunt_no_proc_hunter_lunarhunter_needs_t => {
+    hunt_no_hunter_proc_file => {
         es: "No hay /proc/hunter. lunarhunter necesita el núcleo de Eclipse OS.",
         en: "No /proc/hunter. lunarhunter needs the Eclipse OS kernel.",
     },
@@ -996,15 +996,15 @@ strings! {
         es: "ningún dispositivo montado (escanear USB está apagado)",
         en: "no device mounted (scan USB is off)",
     },
-    hunt_sealing_is_one_way_until_reboot_se => {
+    hunt_sealing_is_one_way => {
         es: "Sellar es de un solo sentido: hasta reiniciar solo se puede endurecer.",
         en: "Sealing is one way: until reboot, settings can only tighten.",
     },
-    hunt_files_live_in_var_lib_hunter_quara => {
+    hunt_quarantine_dir_and_mode => {
         es: "Los archivos están en /var/lib/hunter/quarantine, con permisos 000.",
         en: "Files live in /var/lib/hunter/quarantine, mode 000.",
     },
-    hunt_restoring_does_not_lift_the_deny_o => {
+    hunt_restore_keeps_the_deny => {
         es: "Restaurar no quita la denegación de su ruta hasta reiniciar.",
         en: "Restoring does not lift the deny on its path until reboot.",
     },
@@ -1016,7 +1016,7 @@ strings! {
         es: "Guardar aprendidos en la whitelist",
         en: "Save learned to the whitelist",
     },
-    hunt_learned_programs_trusted_on_first => {
+    hunt_learned_programs_section => {
         es: "Programas aprendidos (confiados al primer uso)",
         en: "Learned programs (trusted on first use)",
     },
@@ -1024,15 +1024,15 @@ strings! {
         es: "Este núcleo no tiene cortafuegos",
         en: "This kernel has no firewall",
     },
-    hunt_no_proc_hunter_firewall_a_newer_hu => {
+    hunt_no_firewall_proc_file => {
         es: "No hay /proc/hunter_firewall: hace falta un hunter más nuevo.",
         en: "No /proc/hunter_firewall: a newer hunter is needed.",
     },
-    hunt_no_program_is_waiting_for_an_answe => {
+    hunt_no_program_awaits_an_answer => {
         es: "Ningún programa espera respuesta.",
         en: "No program is waiting for an answer.",
     },
-    hunt_no_rules_yet_answering_a_question => {
+    hunt_no_rules_yet => {
         es: "Todavía no hay reglas: se crean al responder.",
         en: "No rules yet: answering a question makes one.",
     },
@@ -1061,7 +1061,7 @@ strings! {
         es: "elige un proceso de la lista",
         en: "pick a process from the list",
     },
-    mon_eclipse_init_is_not_ended_from_her => {
+    mon_eclipse_init_is_not_ended_here => {
         es: "eclipse-init no se termina desde aquí",
         en: "eclipse-init is not ended from here",
     },
@@ -1072,7 +1072,7 @@ strings! {
         es: "pedido a eclipse-init que lo inicie",
         en: "eclipse-init asked to start it",
     },
-    mon_stopped_until_started_again_or_the => {
+    mon_stopped_until_next_boot => {
         es: "parado hasta que se inicie o se reinicie el equipo",
         en: "stopped until started again or the next boot",
     },
@@ -1093,7 +1093,7 @@ strings! {
     mon_out => { es: "▲ envía", en: "▲ out" },
     mon_no_ipv4_address => { es: "sin dirección IPv4", en: "no IPv4 address" },
     mon_disk => { es: "DISCO", en: "DISK" },
-    mon_the_kernel_gives_no_proc_diskstats => {
+    mon_no_proc_diskstats => {
         es: "el kernel no da /proc/diskstats",
         en: "the kernel gives no /proc/diskstats",
     },
@@ -1114,7 +1114,7 @@ strings! {
     mon_state => { es: "ESTADO", en: "STATE" },
     mon_time => { es: "TIEMPO", en: "TIME" },
     mon_no_process_matches => { es: "ningún proceso coincide", en: "no process matches" },
-    mon_pick_del_end_shift_del_kill_tab_se => {
+    mon_footer_processes_keys => {
         es: "↑↓ elegir · Supr terminar · Mayús+Supr matar · Tab servicios",
         en: "↑↓ pick · Del end · Shift+Del kill · Tab services",
     },
@@ -1124,7 +1124,7 @@ strings! {
     mon_kind => { es: "TIPO", en: "KIND" },
     mon_starts => { es: "ARRANQUES", en: "STARTS" },
     mon_for => { es: "DESDE", en: "FOR" },
-    mon_eclipse_init_has_not_written_run_e => {
+    mon_no_services_file_yet => {
         es: "eclipse-init no ha escrito /run/eclipse-init/services",
         en: "eclipse-init has not written /run/eclipse-init/services",
     },
@@ -1148,7 +1148,7 @@ strings! {
         en: "this service keeps no log",
     },
     mon_the_log_is_empty => { es: "el registro está vacío", en: "the log is empty" },
-    mon_pick_i_start_r_restart_p_stop_unti => {
+    mon_footer_services_keys => {
         es: "↑↓ elegir · I iniciar · R reiniciar · P parar (hasta el próximo arranque) · Tab procesos",
         en: "↑↓ pick · I start · R restart · P stop (until the next boot) · Tab processes",
     },
