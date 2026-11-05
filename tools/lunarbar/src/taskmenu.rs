@@ -17,6 +17,8 @@ use draw::Ink;
 /// The window's state when the menu opened: which way each toggle goes.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Win {
+    /// The window already has the focus: focusing it would do nothing.
+    pub activated: bool,
     pub minimized: bool,
     pub maximized: bool,
     pub fullscreen: bool,
@@ -31,7 +33,7 @@ const HEAD_H: i32 = 32;
 const PAD: i32 = 8;
 /// The rule between the window's actions and closing it.
 const GAP: i32 = 8;
-const PW: i32 = 240;
+const PW: i32 = 264;
 const ICON: i32 = 16;
 
 /// One row: label, action, pictogram, and whether it is the destructive one.
@@ -50,10 +52,15 @@ const I_FOCUS: &[Ink] = &[
     Ink::Line(&[(0.0, 6.0), (2.0, 6.0)]),
     Ink::Line(&[(10.0, 6.0), (12.0, 6.0)]),
 ];
-const I_MIN: &[Ink] = &[Ink::Line(&[(2.0, 9.5), (10.0, 9.5)])];
+const I_MIN: &[Ink] = &[
+    Ink::Line(&[(2.0, 10.5), (10.0, 10.5)]),
+    Ink::Line(&[(6.0, 1.5), (6.0, 7.5)]),
+    Ink::Line(&[(3.5, 5.0), (6.0, 7.5), (8.5, 5.0)]),
+];
 const I_RESTORE_UP: &[Ink] = &[
-    Ink::Line(&[(2.0, 9.5), (10.0, 9.5)]),
-    Ink::Line(&[(3.5, 5.5), (6.0, 3.0), (8.5, 5.5)]),
+    Ink::Line(&[(2.0, 10.5), (10.0, 10.5)]),
+    Ink::Line(&[(6.0, 7.5), (6.0, 1.5)]),
+    Ink::Line(&[(3.5, 4.0), (6.0, 1.5), (8.5, 4.0)]),
 ];
 const I_MAX: &[Ink] = &[Ink::Line(&[(1.5, 1.5), (10.5, 1.5), (10.5, 10.5), (1.5, 10.5), (1.5, 1.5)])];
 const I_UNMAX: &[Ink] = &[
@@ -81,11 +88,13 @@ const I_CLOSE: &[Ink] = &[
 pub fn items(tid: u32, w: Win) -> Vec<Item> {
     let es = i18n::Lang::current() == i18n::Lang::Es;
     let t = |a: &'static str, b: &'static str| if es { a } else { b };
-    let mut v = vec![if w.minimized {
-        Item { label: t("restaurar", "restore"), act: Action::TaskFocus(tid), ink: I_RESTORE_UP, danger: false }
-    } else {
-        Item { label: t("enfocar", "focus"), act: Action::TaskFocus(tid), ink: I_FOCUS, danger: false }
-    }];
+    let mut v = Vec::new();
+    if w.minimized {
+        v.push(Item { label: t("restaurar", "restore"), act: Action::TaskFocus(tid), ink: I_RESTORE_UP, danger: false });
+    } else if !w.activated {
+        // Offered only to a window that does not have the focus already.
+        v.push(Item { label: t("enfocar", "focus"), act: Action::TaskFocus(tid), ink: I_FOCUS, danger: false });
+    }
     if !w.minimized {
         v.push(Item { label: t("minimizar", "minimize"), act: Action::TaskMinimize(tid), ink: I_MIN, danger: false });
     }
@@ -123,13 +132,22 @@ pub fn draw(
     let ph = size(w).1;
     draw_panel(cv, px, py, pw, ph, 10);
 
-    let max_chars = ((pw - 24) / GLYPH_W) as usize;
+    // The window's marker as the taskbar draws it, then its title.
+    let ms = 12;
+    let my = py + (HEAD_H - ms) / 2;
+    if tecno() {
+        cv.task_square(px + 16, my, ms, pal().rule, if w.activated { pal().accent } else { pal().dim });
+    } else {
+        cv.fill_rect_a(px + 16, my, ms, ms, if w.activated { pal().accent } else { pal().dim }, 0.8);
+    }
+    let tx = px + 14 + ICON + 12;
+    let max_chars = ((px + pw - 12 - tx) / GLYPH_W) as usize;
     let head: String = if title.chars().count() > max_chars {
         title.chars().take(max_chars.saturating_sub(1)).chain(['.']).collect()
     } else {
         title.to_string()
     };
-    cv.text_bold(&head, px + 12, py + (HEAD_H - GLYPH_H) / 2, pal().dim);
+    cv.text_bold(&head, tx, py + (HEAD_H - GLYPH_H) / 2, if w.activated { pal().text } else { pal().muted });
     cv.hline(px + 10, py + HEAD_H - 1, pw - 20, pal().rule, 0.7);
 
     let mut hits = Vec::new();
@@ -201,6 +219,9 @@ mod tests {
 
     #[test]
     fn the_rows_follow_the_windows_state() {
+        // An active window is not offered focus it already has.
+        let active = items(7, Win { activated: true, ..Win::default() });
+        assert!(!active.iter().any(|i| i.act == Action::TaskFocus(7)));
         let plain = items(7, Win::default());
         let acts: Vec<Action> = plain.iter().map(|i| i.act).collect();
         assert!(
@@ -226,7 +247,7 @@ mod tests {
 
     #[test]
     fn the_panel_fits_its_rows_and_the_longest_label() {
-        for w in [Win::default(), Win { minimized: true, maximized: true, fullscreen: true }] {
+        for w in [Win::default(), Win { activated: true, minimized: true, maximized: true, fullscreen: true }] {
             let (pw, ph) = size(w);
             assert_eq!(ph, HEAD_H + items(0, w).len() as i32 * ROW_H + GAP + PAD);
             for it in items(0, w) {

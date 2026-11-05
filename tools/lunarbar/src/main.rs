@@ -1469,6 +1469,7 @@ impl State {
         let t = self.toplevels.iter().find(|t| t.handle.id().protocol_id() == tid);
         let title = t.map(|t| t.title.clone()).unwrap_or_default();
         let win = t.map_or_else(taskmenu::Win::default, |t| taskmenu::Win {
+            activated: t.activated,
             minimized: t.minimized,
             maximized: t.maximized,
             fullscreen: t.fullscreen,
@@ -4406,7 +4407,8 @@ fn main() {
                 (px, py, pw, ph)
             };
             if let Some(sel) = want_task {
-                let win = taskmenu::Win { maximized: std::env::var("LUNARBAR_DUMP_TASK_MAX").is_ok(), ..Default::default() };
+                let max = std::env::var("LUNARBAR_DUMP_TASK_MAX").is_ok();
+                let win = taskmenu::Win { activated: max, maximized: max, ..Default::default() };
                 let (px, py, pw, _) = place(&PopupKind::TaskMenu { tid: 0, title: String::new(), win, sel }, true);
                 taskmenu::draw(&mut cv, px + 120, py, pw, 0, "foot · root@eclipse: ~", win, sel);
             } else if want_power {
