@@ -5356,32 +5356,7 @@ mod fstab_template_tests {
 }
 
 #[cfg(test)]
-mod lunar_client_tests {
-    use super::*;
-
-    /// Every Wayland client that binds the foreign-toplevel manager must tell
-    /// wayland-client what object its `toplevel` event creates. Without that
-    /// specialization the client aborts on the first window it is told about,
-    /// which is a crash that only shows up under a real compositor: it needs
-    /// another window to exist, so neither a build nor a `--dump` catches it.
-    #[test]
-    fn wayland_clients_specialize_the_toplevel_event() {
-        let dir = PROJECT_DIR.join("tools").join("lunarbar").join("src");
-        for rel in ["main.rs", "bin/lunarrun.rs"] {
-            let src = fs::read_to_string(dir.join(rel)).unwrap();
-            if !src.contains("ZwlrForeignToplevelManagerV1") {
-                continue;
-            }
-            assert!(
-                src.contains("event_created_child!"),
-                "{rel} binds zwlr_foreign_toplevel_manager_v1 without an \
-                 event_created_child! specialization; it will abort as soon \
-                 as a window exists"
-            );
-        }
-    }
-}
-
+mod lunar_client_tests;
 #[cfg(test)]
 mod variant_layout_tests {
     use super::*;

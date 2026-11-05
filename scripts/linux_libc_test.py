@@ -49,6 +49,31 @@ def main():
         from utils import test_qemu as framework
         from qemu_completion import completion_runner
         framework.TestRunner = completion_runner(framework.TestRunner, framework.TestStatus)
+
+        # A case the image does not carry must be a FAILED, not an OK.
+        #
+        # The submodule's runner types the case's path at the guest shell and
+        # classifies whatever comes back by substring, and its failure
+        # patterns are "failed", "ERROR", "Error", "panicked", "Hangup" and
+        # "Unknown signal". `sh: /libc-test/src/math/log.exe: not found`
+        # (status 127) matches none of them, so an image without the suite
+        # reported every one of the 476 cases OK -- which is exactly what the
+        # x86_64 job did, because `cargo image` builds that arch's image from
+        # the lean live root and `libc-test` is not in `LIVE_KEEP`
+        # (xtask `LIVE_TEST_SUITE` carries the measurement and the fix).
+        #
+        # Named here rather than in the submodule for the reason the module
+        # docstring gives: `tests/` is upstream and cannot be edited.
+        missing = re.compile(r"^sh: \S*: not found", re.M)
+        completed = framework.TestRunner
+
+        class MissingCaseIsAFailure(completed):
+            def check_output(self, output):
+                if missing.search(output):
+                    return framework.TestStatus.FAILED
+                return super().check_output(output)
+
+        framework.TestRunner = MissingCaseIsAFailure
         script = "linux_libc_test-qemu.py"
         forwarded = ["--arch", args.arch]
     original = framework.load_testcases
@@ -58,6 +83,35 @@ def main():
             "/libc-test/src/math/log.exe": "log result and FP exception mismatch (CI 34016355478)",
             "/libc-test/src/functional/ipc_sem-static.exe": "SysV semaphore test hangs (CI 34016355478)",
             "/libc-test/src/regression/pthread_rwlock-ebusy-static.exe": "rwlock test hangs after a clean restart (CI 34022646551)",
+            # The ten below are what this job reports now that the image
+            # actually carries the suite (before the xtask `LIVE_TEST_SUITE`
+            # fix it carried none of it, and every case passed by not
+            # running). Measured on 2026-11-05 against d42bc22, all 476 cases
+            # in one boot, nothing hanging: 466 pass, these ten do not.
+            # Each reason is the guest's own words, so the next tanda can
+            # start from the message rather than from a rerun.
+            #
+            # Three that the harness cannot run from `/`: the DSO is named by
+            # a path relative to the working directory, and every case is
+            # typed at a shell whose cwd is `/`.
+            "/libc-test/src/functional/tls_align.exe": "needs src/functional/tls_align_dso.so, a cwd-relative DT_NEEDED, and the harness runs from / (exit 127)",
+            "/libc-test/src/functional/tls_align_dlopen.exe": "dlopen of a cwd-relative src/functional/tls_align_dso.so, and the harness runs from /",
+            "/libc-test/src/functional/tls_init_dlopen.exe": "same cwd-relative dlopen; then calls the NULL dlsym result and dies at rip=0 (SIGSEGV), which the kernel reports correctly",
+            # Two the suite does not build on this musl at all: absent from
+            # rootfs/x86_64/libc-test/src/regression, yet listed OK in
+            # tests/testcases/linux_libc_test/x86_64_qemu.txt.
+            "/libc-test/src/regression/sem_close-unmap.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
+            "/libc-test/src/regression/sem_close-unmap-static.exe": "not built by libc-test on this musl; the binary is not in the rootfs (exit 127)",
+            # Three in libm, not in the kernel: the value is right every time
+            # and it is the raised FP exceptions, or an out-parameter, that
+            # differ.
+            "/libc-test/src/math/fmal.exe": "special/fmal.h:46 wants INEXACT|UNDERFLOW, gets INEXACT; the value is exact",
+            "/libc-test/src/math/powf.exe": "ucb/powf.h: pow(x,1) raises INEXACT|OVERFLOW and INEXACT|UNDERFLOW where none is wanted, five cases, value right",
+            "/libc-test/src/math/remquol.exe": "remquol writes 0 into *quo in EVERY case while returning the right remainder",
+            # And two that are the kernel's: `fork` does not look at
+            # RLIMIT_NPROC, so a process whose limit is 0 still forks.
+            "/libc-test/src/regression/pthread_atfork-errno-clobber.exe": "fork succeeds with RLIMIT_NPROC=0: fork does not enforce the limit (should be -EAGAIN)",
+            "/libc-test/src/regression/pthread_atfork-errno-clobber-static.exe": "fork succeeds with RLIMIT_NPROC=0: fork does not enforce the limit (should be -EAGAIN)",
         },
         ("aarch64", False): {
             "/libc-test/src/functional/pthread_tsd-static.exe": "thread-specific destructor test hangs (CI 34011543846)",
