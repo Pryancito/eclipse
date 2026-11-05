@@ -3763,10 +3763,19 @@ impl LinuxRootfs {
         // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
         // clipboard at all, and the stale-binary check would happily ship
         // that. (That is exactly what happened the day lunarfile arrived.)
-        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter, &lock, &shot, &desk]
-            .iter()
-            .map(|p| fs::metadata(p).ok()?.modified().ok())
-            .collect();
+        let mtimes: Option<Vec<_>> = [
+            &executable,
+            &runner,
+            &browser,
+            &clipboard,
+            &hunter,
+            &lock,
+            &shot,
+            &desk,
+        ]
+        .iter()
+        .map(|p| fs::metadata(p).ok()?.modified().ok())
+        .collect();
         if let (Some(bins), Some(src_mtime)) = (mtimes, newest_src) {
             if bins.iter().all(|m| *m >= src_mtime) {
                 return LunarTools {

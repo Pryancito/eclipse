@@ -191,7 +191,7 @@ impl History {
         self.items
             .iter()
             .enumerate()
-            .filter(|(_, t)| needle.is_empty() || t.to_lowercase().contains(&needle))
+            .filter(|(_, t)| needle.is_empty() || search_text(t).to_lowercase().contains(&needle))
             .map(|(i, t)| (i, t.as_str()))
             .collect()
     }
@@ -267,6 +267,234 @@ pub fn size_label(bytes: usize) -> String {
         return format!("{} KiB", kib.round() as u64);
     }
     format!("{:.1} MiB", kib / 1024.0).replace('.', ",")
+}
+
+// ── images ───────────────────────────────────────────────────────────────────
+
+/// The MIME an image selection is read and offered under.
+///
+/// PNG and nothing else: it is what every Wayland client that copies a picture
+/// offers (a browser, an image viewer, `lunarshot`), it is lossless, and it is
+/// the one format this crate already decodes. A selection offering only JPEG
+/// or BMP is left alone, like any other selection this history does not handle.
+pub const IMAGE_MIME: &str = "image/png";
+
+/// The biggest image that is remembered, in bytes. A screenshot of a 4K
+/// screen is a few MiB; past this it is a copy nobody will pick from a list.
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// What opens an image entry.
+///
+/// Image entries live in the same `Vec<String>` as text, so the file format,
+/// the wire and the move-to-front logic stay exactly as they are: the entry is
+/// one short line that names the PNG on disk. SOH cannot start a selection
+/// worth keeping that a person typed, and `answer` refuses a `COPY` that
+/// starts with it, so no client can forge an entry that serves an arbitrary
+/// file as a picture.
+const IMAGE_MARK: &str = "\u{1}img ";
+
+/// An image entry: its size in pixels and in bytes, and where the PNG is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub w: u32,
+    pub h: u32,
+    pub bytes: u64,
+    pub path: PathBuf,
+}
+
+/// The history line for `img`.
+pub fn image_entry(img: &Image) -> String {
+    format!(
+        "{IMAGE_MARK}{} {} {} {}",
+        img.w,
+        img.h,
+        img.bytes,
+        img.path.display()
+    )
+}
+
+/// The image an entry names, or None for a text entry.
+pub fn parse_image(entry: &str) -> Option<Image> {
+    let rest = entry.strip_prefix(IMAGE_MARK)?;
+    let mut it = rest.splitn(4, ' ');
+    let w = it.next()?.parse().ok()?;
+    let h = it.next()?.parse().ok()?;
+    let bytes = it.next()?.parse().ok()?;
+    let path = PathBuf::from(it.next()?);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(Image { w, h, bytes, path })
+}
+
+/// Whether `text` is shaped like an image entry, which a client may not copy.
+pub fn looks_like_image(text: &str) -> bool {
+    text.starts_with('\u{1}')
+}
+
+/// Whether an offer can be taken as a picture.
+pub fn offers_image(mimes: &[String]) -> bool {
+    mimes.iter().any(|m| m.eq_ignore_ascii_case(IMAGE_MIME))
+}
+
+/// The width and height a PNG declares, or None when `data` is not a PNG.
+///
+/// Only the signature and the IHDR chunk, which the format requires to come
+/// first: enough to refuse a selection that says `image/png` and is not one
+/// before it is written to disk, without decoding a 4K picture to learn that.
+pub fn png_size(data: &[u8]) -> Option<(u32, u32)> {
+    const SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 24 || !data.starts_with(SIG) || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// The directory the history's pictures are kept in, beside the history file.
+pub fn image_dir(history: &Path) -> PathBuf {
+    history
+        .parent()
+        .unwrap_or_else(|| Path::new(FALLBACK_DIR))
+        .join("clipboard-images")
+}
+
+/// FNV-1a, 64 bits: the file name of a picture is its content, so copying the
+/// same screenshot twice is one file and one entry, as copying the same text
+/// twice is.
+fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Write `data` into `dir` as a picture of the history, and return its entry.
+///
+/// None when it is not a PNG, is empty or is bigger than the cap. The file is
+/// written beside its final name and renamed, like the history itself, so a
+/// picker never reads half a picture.
+pub fn store_image(dir: &Path, data: &[u8]) -> Option<Image> {
+    if data.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let (w, h) = png_size(data)?;
+    let path = dir.join(format!("{:016x}.png", fnv64(data)));
+    let same = std::fs::metadata(&path).is_ok_and(|m| m.len() == data.len() as u64);
+    if !same {
+        std::fs::create_dir_all(dir).ok()?;
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, data).ok()?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    }
+    Some(Image {
+        w,
+        h,
+        bytes: data.len() as u64,
+        path,
+    })
+}
+
+/// The picture an entry names, if it is one this history wrote.
+///
+/// The path has to sit directly in `dir`: the history file is plain text, and
+/// a line edited to name `/etc/shadow` must not be served as a picture.
+pub fn own_image(entry: &str, dir: &Path) -> Option<Image> {
+    let img = parse_image(entry)?;
+    (img.path.parent() == Some(dir)).then_some(img)
+}
+
+/// Remove the pictures in `dir` that no entry of `items` names any more, and
+/// say how many went.
+///
+/// The history drops its oldest entry at the cap and forgets everything on
+/// `--clear`; without this the pictures would stay on disk for ever.
+pub fn prune_images(dir: &Path, items: &[String]) -> usize {
+    let keep: Vec<PathBuf> = items
+        .iter()
+        .filter_map(|i| parse_image(i))
+        .map(|i| i.path)
+        .collect();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut gone = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        let ours = path.extension().is_some_and(|x| x == "png");
+        if ours && !keep.contains(&path) && std::fs::remove_file(&path).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// An entry as a line of the picker or of `--list`: the text's preview, or
+/// "imagen W × H" for a picture.
+pub fn label(entry: &str, max_chars: usize) -> String {
+    match parse_image(entry) {
+        Some(img) => preview(&format!("imagen {} \u{d7} {}", img.w, img.h), max_chars),
+        None => preview(entry, max_chars),
+    }
+}
+
+/// How big an entry is: the text's bytes, or the picture's.
+pub fn entry_bytes(entry: &str) -> usize {
+    match parse_image(entry) {
+        Some(img) => img.bytes as usize,
+        None => entry.len(),
+    }
+}
+
+/// What a filter is matched against: the text, or the picture's label, so
+/// typing "imagen" finds every picture and nothing matches the file path.
+pub fn search_text(entry: &str) -> String {
+    match parse_image(entry) {
+        Some(img) => format!("imagen {}x{} {} \u{d7} {}", img.w, img.h, img.w, img.h),
+        None => entry.to_string(),
+    }
+}
+
+/// A picture scaled down to fit `bw` x `bh`, aspect kept, for a picker row.
+///
+/// The file is checked before it is decoded: a PNG of 30000 x 30000 is a few
+/// KiB on disk and gigabytes once decoded, and the picker decodes every
+/// picture it shows.
+pub fn thumbnail(path: &Path, bw: u32, bh: u32) -> Option<tiny_skia::Pixmap> {
+    use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+    const MAX_DIM: u32 = 8192;
+    let data = std::fs::read(path).ok()?;
+    let (w, h) = png_size(&data)?;
+    if data.len() > MAX_IMAGE_BYTES || w > MAX_DIM || h > MAX_DIM || bw == 0 || bh == 0 {
+        return None;
+    }
+    let src = Pixmap::decode_png(&data).ok()?;
+    let s = (bw as f32 / w as f32).min(bh as f32 / h as f32).min(1.0);
+    let dw = ((w as f32 * s).round() as u32).max(1);
+    let dh = ((h as f32 * s).round() as u32).max(1);
+    let mut dst = Pixmap::new(dw, dh)?;
+    let paint = PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    dst.draw_pixmap(
+        0,
+        0,
+        src.as_ref(),
+        &paint,
+        Transform::from_scale(s, s),
+        None,
+    );
+    Some(dst)
 }
 
 // ── the file on disk ─────────────────────────────────────────────────────────
@@ -1135,5 +1363,137 @@ mod tests {
         assert_eq!(parse_req(b"LIST\r\n"), ReqParse::Done(Req::List, 6));
         assert_eq!(parse_req(b"CLEAR\r\n"), ReqParse::Done(Req::Clear, 7));
         assert_eq!(parse_req(b"SET 3\r\n"), ReqParse::Done(Req::Set(3), 7));
+    }
+
+    fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let mut pm = tiny_skia::Pixmap::new(w, h).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(30, 160, 220, 255));
+        pm.encode_png().unwrap()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lunarclip-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn an_image_entry_round_trips_and_text_is_not_one() {
+        let img = Image {
+            w: 1920,
+            h: 1080,
+            bytes: 51234,
+            path: PathBuf::from("/c/eclipse/clipboard-images/a b.png"),
+        };
+        let e = image_entry(&img);
+        assert_eq!(parse_image(&e), Some(img));
+        assert!(looks_like_image(&e));
+        assert_eq!(parse_image("img 1 2 3 /x.png"), None);
+        assert_eq!(parse_image("\u{1}img 1 2 /x.png"), None);
+        assert!(!looks_like_image("hola"));
+    }
+
+    #[test]
+    fn png_size_reads_the_header_and_refuses_what_is_not_a_png() {
+        assert_eq!(png_size(&tiny_png(37, 5)), Some((37, 5)));
+        assert_eq!(png_size(b"GIF89a.................."), None);
+        assert_eq!(png_size(&tiny_png(4, 4)[..20]), None);
+    }
+
+    #[test]
+    fn a_stored_image_is_named_by_its_content_and_kept_once() {
+        let dir = scratch("store");
+        let png = tiny_png(8, 6);
+        let a = store_image(&dir, &png).unwrap();
+        let b = store_image(&dir, &png).unwrap();
+        assert_eq!(a, b);
+        assert_eq!((a.w, a.h, a.bytes), (8, 6, png.len() as u64));
+        assert_eq!(std::fs::read(&a.path).unwrap(), png);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(store_image(&dir, b"not a png at all, sorry"), None);
+        // And the history moves a re-copied picture to the front like text.
+        let mut h = History::new();
+        assert!(h.push(&image_entry(&a)));
+        assert!(h.push("texto"));
+        assert!(h.push(&image_entry(&b)));
+        assert_eq!(h.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_picture_in_the_history_directory_is_its_own() {
+        let dir = PathBuf::from("/c/eclipse/clipboard-images");
+        let ours = image_entry(&Image {
+            w: 1,
+            h: 1,
+            bytes: 1,
+            path: dir.join("x.png"),
+        });
+        let theirs = image_entry(&Image {
+            w: 1,
+            h: 1,
+            bytes: 1,
+            path: PathBuf::from("/etc/shadow"),
+        });
+        assert!(own_image(&ours, &dir).is_some());
+        assert_eq!(own_image(&theirs, &dir), None);
+        assert_eq!(own_image("texto", &dir), None);
+        assert_eq!(image_dir(Path::new("/c/eclipse/clipboard")), dir);
+    }
+
+    #[test]
+    fn pruning_removes_the_pictures_no_entry_names() {
+        let dir = scratch("prune");
+        let keep = store_image(&dir, &tiny_png(2, 2)).unwrap();
+        let drop = store_image(&dir, &tiny_png(3, 3)).unwrap();
+        let items = vec!["texto".to_string(), image_entry(&keep)];
+        assert_eq!(prune_images(&dir, &items), 1);
+        assert!(keep.path.exists());
+        assert!(!drop.path.exists());
+        // A cleared history keeps nothing.
+        assert_eq!(prune_images(&dir, &[]), 1);
+        assert_eq!(prune_images(&scratch("prune-none"), &[]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picture_reads_as_its_size_in_the_list_and_is_found_by_it() {
+        let e = image_entry(&Image {
+            w: 1600,
+            h: 900,
+            bytes: 4096,
+            path: PathBuf::from("/d/secreto.png"),
+        });
+        assert_eq!(label(&e, 40), "imagen 1600 \u{d7} 900");
+        assert_eq!(label("uno\ndos", 40), "uno¶dos");
+        assert_eq!(entry_bytes(&e), 4096);
+        assert_eq!(entry_bytes("abc"), 3);
+        let mut h = History::new();
+        h.push(&e);
+        h.push("una imagen no");
+        assert_eq!(h.search("1600").len(), 1);
+        assert_eq!(h.search("imagen").len(), 2);
+        // The file name is not something the user sees, so it does not match.
+        assert!(h.search("secreto").is_empty());
+    }
+
+    #[test]
+    fn a_thumbnail_fits_the_box_and_keeps_the_aspect() {
+        let dir = scratch("thumb");
+        let img = store_image(&dir, &tiny_png(160, 90)).unwrap();
+        let t = thumbnail(&img.path, 48, 20).unwrap();
+        assert!(
+            t.width() <= 48 && t.height() <= 20,
+            "{}x{}",
+            t.width(),
+            t.height()
+        );
+        assert_eq!(t.height(), 20);
+        assert_eq!(t.width(), 36);
+        // Never scaled up.
+        let small = store_image(&dir, &tiny_png(4, 4)).unwrap();
+        assert_eq!(thumbnail(&small.path, 48, 20).map(|t| t.width()), Some(4));
+        assert!(thumbnail(&dir.join("nope.png"), 48, 20).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
