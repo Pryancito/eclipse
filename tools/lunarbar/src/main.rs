@@ -436,8 +436,11 @@ struct OutputInfo {
 
 /// state values from wlr-foreign-toplevel-management-unstable-v1
 /// (the `state` array carries u32 enum values).
+// zwlr_foreign_toplevel_handle_v1 `state` values, all in one place.
+const TOPLEVEL_STATE_MAXIMIZED: u32 = 0;
 const TOPLEVEL_STATE_MINIMIZED: u32 = 1;
 const TOPLEVEL_STATE_ACTIVATED: u32 = 2;
+const TOPLEVEL_STATE_FULLSCREEN: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -3892,7 +3895,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
         event: zwlr_foreign_toplevel_handle_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         use zwlr_foreign_toplevel_handle_v1::Event as E;
         let id = handle.id();
@@ -3917,14 +3920,23 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                     if v == TOPLEVEL_STATE_MINIMIZED {
                         minimized = true;
                     }
-                    maximized |= v == taskmenu::STATE_MAXIMIZED;
-                    fullscreen |= v == taskmenu::STATE_FULLSCREEN;
+                    maximized |= v == TOPLEVEL_STATE_MAXIMIZED;
+                    fullscreen |= v == TOPLEVEL_STATE_FULLSCREEN;
                 }
                 if let Some(t) = state.toplevels.iter_mut().find(|t| t.handle.id() == id) {
                     t.activated = activated;
                     t.minimized = minimized;
                     t.maximized = maximized;
                     t.fullscreen = fullscreen;
+                }
+                // A window menu open on this window follows it: its rows
+                // name what each toggle will do NOW, not when it opened.
+                let tid = id.protocol_id();
+                if let Some(Popup { kind: PopupKind::TaskMenu { tid: t, win, .. }, .. }) = state.popup.as_mut() {
+                    if *t == tid {
+                        *win = taskmenu::Win { activated, minimized, maximized, fullscreen };
+                        state.render_popup(qh);
+                    }
                 }
             }
             E::Done => state.render_task_bars(),
@@ -4505,6 +4517,8 @@ fn main() {
     // Build the icon indexes before the bars map, so the first taskbar paint
     // does not stall the event loop on a cold-cache theme walk.
     state.vol = sysinfo::volume();
+    // The level (and mute) the last session left wins over the card's own.
+    state.restore_volume();
     state.icons.prewarm();
     state.refresh_metrics();
 

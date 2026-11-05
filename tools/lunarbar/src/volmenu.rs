@@ -4,7 +4,9 @@
 //! it is a complete volume control: the level and its colour in the header,
 //! the name of the device the sound is going to, a mute switch, − and + steps either side of the meter, the usual levels
 //! (0, 25, 50, 75, 100) one click away under it, ←/→ (or ↑/↓, or the wheel)
-//! to step and M to mute. The meter's colour climbs from the accent to the
+//! to step and M to mute. The level and the mute survive the session: each
+//! change is written to `$XDG_STATE_HOME/lunar/volume` (default
+//! `~/.local/state/lunar/volume`), and the next session puts them back. The meter's colour climbs from the accent to the
 //! warning as the level does, and the whole control goes dim when muted.
 //!
 //! A child of `main.rs` because that file is at its size ceiling (see
@@ -211,7 +213,75 @@ pub fn draw(
     hits
 }
 
+/// Where the last level and mute are kept between sessions.
+fn saved_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/state")))?;
+    Some(std::path::Path::new(&base).join("lunar").join("volume"))
+}
+
+/// The saved file's text for level `v` and `muted`.
+fn encode(v: u32, muted: bool) -> String {
+    format!("level={v}\nmuted={}\n", u8::from(muted))
+}
+
+/// The level and mute in a saved file; `None` when it says nothing usable.
+fn decode(s: &str) -> Option<(u32, bool)> {
+    let mut level = None;
+    let mut muted = false;
+    for l in s.lines() {
+        match l.split_once('=') {
+            Some(("level", v)) => level = v.trim().parse::<u32>().ok().filter(|v| *v <= 100),
+            Some(("muted", v)) => muted = v.trim() == "1",
+            _ => {}
+        }
+    }
+    level.map(|v| (v, muted))
+}
+
+/// Remember `v` and `muted` for the next session.
+fn save(v: u32, muted: bool) {
+    if let Some(p) = saved_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, encode(v, muted));
+    }
+}
+
+/// What the last session left, if anything.
+pub fn saved() -> Option<(u32, bool)> {
+    decode(&std::fs::read_to_string(saved_path()?).ok()?)
+}
+
+/// The commands that set level `v` and mute `on` on whichever tool exists.
+fn set_cmd(v: u32) -> String {
+    format!(
+        "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
+    )
+}
+
+fn mute_cmd(on: bool) -> String {
+    let (p, a, w) = if on { ("1", "mute", "1") } else { ("0", "unmute", "0") };
+    format!(
+        "pactl set-sink-mute @DEFAULT_SINK@ {p} >/dev/null 2>&1 || amixer set Master {a} >/dev/null 2>&1 || wpctl set-mute @DEFAULT_AUDIO_SINK@ {w}"
+    )
+}
+
 impl State {
+    /// At start: put back the level and mute the last session left, so the
+    /// volume is where the user set it, not wherever the card woke up.
+    pub(crate) fn restore_volume(&mut self) {
+        let Some((v, m)) = saved() else {
+            return;
+        };
+        self.vol = Some(v);
+        self.vol_muted = m;
+        self.spawn(&format!("{} ; {}", set_cmd(v), mute_cmd(m)));
+    }
+
     /// Set the volume to `v` (unmuting it), on the machine and on screen.
     pub(crate) fn set_volume(&mut self, qh: &QueueHandle<State>, v: u32) {
         if self.vol_muted {
@@ -221,9 +291,8 @@ impl State {
         if let Some(Popup { kind: PopupKind::Volume { level, .. }, .. }) = self.popup.as_mut() {
             *level = v;
         }
-        self.spawn(&format!(
-            "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
-        ));
+        self.spawn(&set_cmd(v));
+        save(v, self.vol_muted);
         self.render_popup(qh);
         self.render_all();
     }
@@ -234,10 +303,8 @@ impl State {
         if let Some(Popup { kind: PopupKind::Volume { muted, .. }, .. }) = self.popup.as_mut() {
             *muted = on;
         }
-        let (p, a, w) = if on { ("1", "mute", "1") } else { ("0", "unmute", "0") };
-        self.spawn(&format!(
-            "pactl set-sink-mute @DEFAULT_SINK@ {p} >/dev/null 2>&1 || amixer set Master {a} >/dev/null 2>&1 || wpctl set-mute @DEFAULT_AUDIO_SINK@ {w}"
-        ));
+        self.spawn(&mute_cmd(on));
+        save(self.vol.unwrap_or(0), on);
         self.render_popup(qh);
         self.render_all();
     }
@@ -280,6 +347,15 @@ mod tests {
         assert_eq!(prop(w, "node.description").as_deref(), Some("Built-in Audio Analog Stereo"));
         let cards = " 0 [PCH            ]: HDA-Intel - HDA Intel PCH\n                      HDA Intel PCH at 0xf7f10000 irq 32\n 1 [Device         ]: USB-Audio - USB Audio Device\n";
         assert_eq!(alsa_cards(cards), ["HDA Intel PCH", "USB Audio Device"]);
+    }
+
+    #[test]
+    fn the_saved_volume_reads_back_and_refuses_nonsense() {
+        assert_eq!(decode(&encode(42, true)), Some((42, true)));
+        assert_eq!(decode(&encode(0, false)), Some((0, false)));
+        assert_eq!(decode("level=250\n"), None);
+        assert_eq!(decode("garbage"), None);
+        assert_eq!(decode("muted=1\nlevel=7\n"), Some((7, true)));
     }
 
     #[test]

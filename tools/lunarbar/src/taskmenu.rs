@@ -25,9 +25,6 @@ pub struct Win {
     pub fullscreen: bool,
 }
 
-/// The wlr-foreign-toplevel `state` values this menu reads.
-pub const STATE_MAXIMIZED: u32 = 0;
-pub const STATE_FULLSCREEN: u32 = 3;
 
 const ROW_H: i32 = 32;
 const HEAD_H: i32 = 32;
