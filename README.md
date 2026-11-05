@@ -1,5 +1,8 @@
 # Eclipse OS
 
+[![Descargas totales](https://img.shields.io/github/downloads/Pryancito/eclipse/total)](https://github.com/Pryancito/eclipse/releases)
+[![Descargas de la última versión](https://img.shields.io/github/downloads/Pryancito/eclipse/latest/total)](https://github.com/Pryancito/eclipse/releases/latest)
+
 **Español** · [English](README.en.md)
 
 Eclipse OS es un sistema operativo completo escrito en Rust. Su núcleo nace de
