@@ -237,15 +237,17 @@ impl Socket for UdpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         info!("udp read");
-        let (handle, non_block, remote, read_closed) = {
+        let (handle, non_block, remote, read_closed, rcv_timeo) = {
             let inner = self.inner.lock();
             (
                 inner.handle.0,
                 inner.flags.contains(OpenFlags::NON_BLOCK),
                 inner.remote_endpoint,
                 inner.read_closed,
+                inner.rcv_timeo,
             )
         };
+        let deadline = crate::net::sockopt_deadline(&rcv_timeo);
         loop {
             let sets = get_sockets();
             let mut sets = sets.lock();
@@ -291,9 +293,13 @@ impl Socket for UdpSocketState {
                     if non_block {
                         debug!("NON_BLOCK: Try again later...");
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-                    } else {
-                        trace!("udp Exhausted. try again")
                     }
+                    // `SO_RCVTIMEO` run out: `__skb_wait_for_more_packets`
+                    // answers EAGAIN, the same word as a non-blocking socket.
+                    if crate::net::sockopt_deadline_passed(deadline) {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                    trace!("udp Exhausted. try again")
                 }
                 Err(err) => {
                     error!("udp socket recv_slice error: {:?}", err);
@@ -315,15 +321,17 @@ impl Socket for UdpSocketState {
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let (handle, non_block, remote, read_closed) = {
+        let (handle, non_block, remote, read_closed, rcv_timeo) = {
             let inner = self.inner.lock();
             (
                 inner.handle.0,
                 inner.flags.contains(OpenFlags::NON_BLOCK),
                 inner.remote_endpoint,
                 inner.read_closed,
+                inner.rcv_timeo,
             )
         };
+        let deadline = crate::net::sockopt_deadline(&rcv_timeo);
         loop {
             let sets = get_sockets();
             let mut sets = sets.lock();
@@ -365,7 +373,7 @@ impl Socket for UdpSocketState {
                         return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                     drain_net_poll(4);
-                    if non_block {
+                    if non_block || crate::net::sockopt_deadline_passed(deadline) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                 }
@@ -1124,6 +1132,67 @@ mod tests {
         assert_eq!(&buf, b"segu");
         assert_eq!(Socket::take_msg_flags(&b), 0x20, "MSG_TRUNC on recv");
         assert_eq!(recv(&b, &mut whole).0, Err(LxError::EAGAIN));
+    }
+
+    /// Drives a blocking read by hand: the host build's net-RX park returns
+    /// `Pending` without a waker, so `block_on` would never poll it again.
+    fn read_by_hand(s: &UdpSocketState, buf: &mut [u8]) -> SysResult {
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let mut fut = alloc::boxed::Box::pin(Socket::read(s, buf));
+        for _ in 0..1000 {
+            if let core::task::Poll::Ready((r, _)) =
+                core::future::Future::poll(fut.as_mut(), &mut cx)
+            {
+                return r;
+            }
+            let until = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1);
+            while kernel_hal::timer::timer_now() < until {
+                core::hint::spin_loop();
+            }
+        }
+        panic!("the read never came back");
+    }
+
+    /// `SO_RCVTIMEO` on a blocking socket: a datagram already queued is handed
+    /// out whatever the timeout says, and with nothing queued the call ends
+    /// in EAGAIN when the time runs out (`__skb_wait_for_more_packets`),
+    /// instead of waiting for ever as it did while the option was only
+    /// stored for `getsockopt`.
+    #[test]
+    fn a_receive_timeout_run_out_is_eagain_and_a_queued_datagram_still_arrives() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let blocking = UdpSocketState::new(false).unwrap();
+        assert_eq!(Socket::bind(&blocking, v4(40040)), Ok(0));
+        let mut tv = [0u8; 16];
+        // tv_usec = 1, what libc-test's socket.c sets: one jiffy, not one
+        // microsecond.
+        tv[8..16].copy_from_slice(&1i64.to_ne_bytes());
+        assert_eq!(Socket::setsockopt(&blocking, 1, 20, &tv), Ok(0));
+        let a = sock();
+        assert_eq!(Socket::write(&a, b"x", Some(lo(40040))), Ok(1));
+        deliver(&mut iface);
+        let mut buf = [0u8; 8];
+        assert_eq!(read_by_hand(&blocking, &mut buf), Ok(1));
+        assert_eq!(&buf[..1], b"x");
+        let started = kernel_hal::timer::timer_now();
+        assert_eq!(read_by_hand(&blocking, &mut buf), Err(LxError::EAGAIN));
+        assert!(
+            kernel_hal::timer::timer_now() - started < core::time::Duration::from_secs(2),
+            "a millisecond's timeout took {:?}",
+            kernel_hal::timer::timer_now() - started
+        );
+        // A zero timeout is the default: no deadline at all.
+        assert!(crate::net::sockopt_deadline(&[0u8; 16]).is_none());
+        // Whole seconds and microseconds add up, rounded up to the millisecond.
+        let mut tv = [0u8; 16];
+        tv[0..8].copy_from_slice(&2i64.to_ne_bytes());
+        tv[8..16].copy_from_slice(&1500i64.to_ne_bytes());
+        let before = kernel_hal::timer::timer_now();
+        let deadline = crate::net::sockopt_deadline(&tv).unwrap();
+        assert!(deadline >= before + core::time::Duration::from_millis(2002));
+        assert!(deadline < before + core::time::Duration::from_millis(2102));
     }
 
     #[test]

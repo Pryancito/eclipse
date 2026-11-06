@@ -377,10 +377,16 @@ impl TcpSocketState {
 impl Socket for TcpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let (handle, flags, read_closed) = {
+        let (handle, flags, read_closed, rcv_timeo) = {
             let inner = self.inner.lock();
-            (inner.handle.0, inner.flags, inner.read_closed)
+            (
+                inner.handle.0,
+                inner.flags,
+                inner.read_closed,
+                inner.rcv_timeo,
+            )
         };
+        let rcv_deadline = crate::net::sockopt_deadline(&rcv_timeo);
         debug!(
             "tcp read handle={} req_len={} nonblock={}",
             handle,
@@ -458,6 +464,11 @@ impl Socket for TcpSocketState {
             match copied_len {
                 Err(smoltcp::Error::Exhausted) => {
                     if flags.contains(OpenFlags::NON_BLOCK) {
+                        return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
+                    // `SO_RCVTIMEO` run out (`tcp_recvmsg` with `timeo` at
+                    // zero): EAGAIN, as for a non-blocking socket.
+                    if crate::net::sockopt_deadline_passed(rcv_deadline) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                     // Hard timeout: avoid blocking forever if the peer goes
@@ -925,14 +936,18 @@ impl Socket for TcpSocketState {
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        let (endpoint, non_block, is_ipv6) = {
+        let (endpoint, non_block, is_ipv6, rcv_timeo) = {
             let inner = self.inner.lock();
             (
                 inner.local_endpoint.ok_or(LxError::EINVAL)?,
                 inner.flags.contains(OpenFlags::NON_BLOCK),
                 inner.ipv6,
+                inner.rcv_timeo,
             )
         };
+        // `inet_csk_accept` waits `sock_rcvtimeo` for a connection: the
+        // listener's `SO_RCVTIMEO`, EAGAIN when it runs out.
+        let deadline = crate::net::sockopt_deadline(&rcv_timeo);
 
         loop {
             crate::net::drain_net_tick();
@@ -1023,7 +1038,7 @@ impl Socket for TcpSocketState {
                 });
                 return Ok((new_socket as Arc<dyn FileLike>, Endpoint::Ip(remote)));
             } else {
-                if non_block {
+                if non_block || crate::net::sockopt_deadline_passed(deadline) {
                     return Err(LxError::EAGAIN);
                 }
                 // `inet_csk_wait_for_connect` sleeps interruptibly: a signal
@@ -1767,6 +1782,65 @@ mod port_tests {
         // accept() hands out a blocking child; a test must never park.
         child.set_flags(OpenFlags::NON_BLOCK).unwrap();
         (server, client, child)
+    }
+
+    /// Polls a blocking call by hand: the host build's net-RX park returns
+    /// `Pending` without a waker, so `block_on` would never poll it again.
+    fn by_hand<T>(fut: impl core::future::Future<Output = T>) -> T {
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let mut fut = alloc::boxed::Box::pin(fut);
+        for _ in 0..1000 {
+            if let core::task::Poll::Ready(r) = core::future::Future::poll(fut.as_mut(), &mut cx) {
+                return r;
+            }
+            let until = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(1);
+            while kernel_hal::timer::timer_now() < until {
+                core::hint::spin_loop();
+            }
+        }
+        panic!("the call never came back");
+    }
+
+    fn rcvtimeo_one_jiffy(s: &dyn Socket) {
+        let mut tv = [0u8; 16];
+        tv[8..16].copy_from_slice(&1i64.to_ne_bytes());
+        assert_eq!(s.setsockopt(1, 20, &tv), Ok(0));
+    }
+
+    /// `inet_csk_accept` waits the listener's `SO_RCVTIMEO` and answers
+    /// EAGAIN when it runs out; `tcp_recvmsg` does the same with the
+    /// connection's. Both used to wait for ever on a blocking socket.
+    #[test]
+    fn accept_and_read_honour_so_rcvtimeo() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let server = TcpSocketState::new(false).unwrap();
+        assert_eq!(Socket::bind(&server, v4(41093)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        rcvtimeo_one_jiffy(&server);
+        let started = kernel_hal::timer::timer_now();
+        assert_eq!(
+            by_hand(Socket::accept(&server)).err(),
+            Some(LxError::EAGAIN)
+        );
+        assert!(kernel_hal::timer::timer_now() - started < core::time::Duration::from_secs(2));
+        // A connection that is there is accepted whatever the timeout says.
+        let client = sock();
+        assert_eq!(connect(&client, lo(41093)), Err(LxError::EINPROGRESS));
+        deliver(&mut iface);
+        assert_eq!(state_of(&client), TcpState::Established);
+        let (child, _) = by_hand(Socket::accept(&server)).unwrap();
+        let child = child.as_socket().unwrap();
+        rcvtimeo_one_jiffy(child);
+        let mut buf = [0u8; 8];
+        let started = kernel_hal::timer::timer_now();
+        assert_eq!(by_hand(child.read(&mut buf)).0, Err(LxError::EAGAIN));
+        assert!(kernel_hal::timer::timer_now() - started < core::time::Duration::from_secs(2));
+        assert_eq!(Socket::write(&client, b"hola", None), Ok(4));
+        deliver(&mut iface);
+        assert_eq!(by_hand(child.read(&mut buf)).0, Ok(4));
+        assert_eq!(&buf[..4], b"hola");
     }
 
     #[test]
