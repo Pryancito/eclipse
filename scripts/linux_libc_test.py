@@ -25,6 +25,8 @@ INIT_SETTLED = re.compile(r"\[eclipse-init\] \[ *[\d.]+s\] entering supervision 
 # `BootedRunner.adopt_newline_prompt`.
 GUEST_PROMPT = "__ZCORE_PROMPT__"
 PROMPT_TIMEOUT = 300
+# The budget of a case run alone with `--test`, in seconds.
+SINGLE_CASE_TIMEOUT = 180
 
 # Cases that only mean something to a user the kernel can hold to a limit.
 # `pthread_atfork-errno-clobber` sets RLIMIT_NPROC to 0 and expects `fork` to
@@ -90,6 +92,12 @@ def main():
     parser.add_argument("--arch", default="x86_64", choices=["x86_64", "aarch64", "riscv64"])
     parser.add_argument("--libos", action="store_true")
     parser.add_argument("--fast", action="store_true")
+    parser.add_argument(
+        "--test",
+        metavar="NAME",
+        help="run only this case (the submodule's -t): a path in the guest, typed "
+        "at its shell as one word, so a script in the rootfs works too",
+    )
     args = parser.parse_args()
     os.chdir(ROOT / "tests")
     sys.path.insert(0, str(ROOT / "tests"))
@@ -139,6 +147,14 @@ def main():
             itself, within a budget a slow runner can still meet."""
 
             pid1_is_eclipse_init = init_is_eclipse_init(args.arch)
+
+            def run_one(self, name, fast=False, timeout=None):
+                # A case named with `--test` is run by hand, usually a script
+                # that loops a flaky case to measure it, so it gets the
+                # single-case budget rather than the suite's 10 s.
+                if args.test:
+                    timeout = SINGLE_CASE_TIMEOUT
+                return super().run_one(name, fast, timeout)
 
             def run_qemu(self):
                 super().run_qemu()
@@ -339,6 +355,8 @@ def main():
     framework.load_testcases = load_testcases
     # The allowlist above applies equally to PR and manual runs.
     sys.argv = [script] + forwarded + (["--fast"] if args.fast else [])
+    if args.test:
+        sys.argv += ["--test", args.test]
     runpy.run_path(script, run_name="__main__")
 
 
