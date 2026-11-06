@@ -436,21 +436,62 @@ pub fn decode_post_op_attr(dec: &mut XdrDecoder<'_>) -> RpcResult<PostOpAttr> {
     }
 }
 
-/// Skip a `wcc_data`: the before-and-after attributes a modifying call
-/// returns.
+/// A `pre_op_attr`: the three fields of the object as it was *before* a
+/// modifying call.
 ///
-/// Read past rather than modelled, because nothing in the read path uses it
-/// — but it has to be *consumed*, since a decoder that stopped short of it
-/// would be however many fields out of step for whatever follows.
-pub fn skip_wcc_data(dec: &mut XdrDecoder<'_>) -> RpcResult<()> {
-    // pre_op_attr: size, mtime, ctime.
-    if dec.bool().map_err(RpcError::Xdr)? {
-        dec.u64().map_err(RpcError::Xdr)?;
-        decode_time(dec)?;
-        decode_time(dec)?;
-    }
-    decode_post_op_attr(dec)?;
-    Ok(())
+/// Three and not the whole `fattr3`, because these three are the ones a cache
+/// check needs: if they still match what the client has cached, nothing else
+/// changed the object in between and the client's cached *data* is still
+/// good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreOpAttr {
+    /// The size it had.
+    pub size: u64,
+    /// The modification time it had.
+    pub mtime: Timespec,
+    /// The attribute-change time it had.
+    pub ctime: Timespec,
+}
+
+/// A `wcc_data`: weak cache consistency data, the before-and-after a
+/// modifying call returns.
+///
+/// The name is the specification's and it says what it is for. The client
+/// compares `before` with the attributes it had cached: if they are equal,
+/// *this call* is the only thing that changed the object, so the client can
+/// keep its cached data and just take `after`. If they differ, somebody else
+/// wrote to it and the cache has to go. A client that threw `wcc_data` away
+/// would have to invalidate on every write instead — which is why it is
+/// returned rather than skipped, on the failure arm too: a call that failed
+/// is exactly when the client's idea of the object is most likely wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WccData {
+    /// What the object was, if the server said.
+    pub before: Option<PreOpAttr>,
+    /// What the object is now, if the server said.
+    pub after: PostOpAttr,
+}
+
+/// Decode a `wcc_data`.
+///
+/// Both halves are optional and both absent is the legal, shortest form: two
+/// booleans. It must be decoded whole in any case, since a decoder that
+/// stopped short would be however many fields out of step for whatever
+/// follows.
+pub fn decode_wcc_data(dec: &mut XdrDecoder<'_>) -> RpcResult<WccData> {
+    let before = if dec.bool().map_err(RpcError::Xdr)? {
+        Some(PreOpAttr {
+            size: dec.u64().map_err(RpcError::Xdr)?,
+            mtime: decode_time(dec)?,
+            ctime: decode_time(dec)?,
+        })
+    } else {
+        None
+    };
+    Ok(WccData {
+        before,
+        after: decode_post_op_attr(dec)?,
+    })
 }
 
 /// The arguments of a call that takes only a filehandle: `GETATTR`,

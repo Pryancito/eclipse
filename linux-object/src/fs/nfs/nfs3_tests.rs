@@ -460,7 +460,16 @@ fn wcc_data_is_consumed_in_both_its_forms() {
         enc.u32(0x1234_5678);
         let bytes = enc.into_bytes();
         let mut dec = XdrDecoder::new(&bytes);
-        skip_wcc_data(&mut dec).unwrap();
+        let wcc = decode_wcc_data(&mut dec).unwrap();
+        assert_eq!(
+            wcc.before,
+            present.then_some(PreOpAttr {
+                size: 4097,
+                mtime: Timespec { sec: 1, nsec: 2 },
+                ctime: Timespec { sec: 3, nsec: 4 },
+            })
+        );
+        assert_eq!(wcc.after, Some(sample_fattr()));
         assert_eq!(
             dec.u32().unwrap(),
             0x1234_5678,
@@ -468,6 +477,59 @@ fn wcc_data_is_consumed_in_both_its_forms() {
             present
         );
     }
+}
+
+#[test]
+fn a_wcc_data_with_neither_half_is_two_booleans() {
+    // The shortest legal form, and the one a client meets from a server that
+    // sends no attributes at all.
+    let mut enc = XdrEncoder::new();
+    enc.bool(false);
+    enc.bool(false);
+    enc.u32(0xfeed_face);
+    let bytes = enc.into_bytes();
+    let mut dec = XdrDecoder::new(&bytes);
+    assert_eq!(
+        decode_wcc_data(&mut dec).unwrap(),
+        WccData {
+            before: None,
+            after: None
+        }
+    );
+    assert_eq!(dec.u32().unwrap(), 0xfeed_face);
+}
+
+#[test]
+fn the_before_half_of_a_wcc_data_is_what_a_cache_check_compares() {
+    // Three fields and not a whole fattr3: size, mtime, ctime. Reading a
+    // fattr3 there would take the post half's fields as the pre half's and
+    // leave the decoder twenty-one words out of step.
+    let mut enc = XdrEncoder::new();
+    enc.bool(true);
+    enc.u64(1 << 33); // a size over 32 bits
+    put_time(&mut enc, 700, 800); // mtime
+    put_time(&mut enc, 900, 1000); // ctime
+    enc.bool(false); // no post half
+    let bytes = enc.into_bytes();
+    assert_eq!(bytes.len(), 4 + 8 + 16 + 4, "a pre_op_attr is five words");
+    let mut dec = XdrDecoder::new(&bytes);
+    let wcc = decode_wcc_data(&mut dec).unwrap();
+    assert_eq!(
+        wcc.before,
+        Some(PreOpAttr {
+            size: 1 << 33,
+            mtime: Timespec {
+                sec: 700,
+                nsec: 800
+            },
+            ctime: Timespec {
+                sec: 900,
+                nsec: 1000
+            },
+        })
+    );
+    assert_eq!(wcc.after, None);
+    assert_eq!(dec.remaining(), 0);
 }
 
 // ------------------------------------------------------------------- GETATTR
