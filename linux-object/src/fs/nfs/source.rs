@@ -7,20 +7,39 @@
 //! path and the first thing that can go wrong, so it is a separate, tested
 //! function rather than an `rsplit` inline somewhere.
 //!
-//! # Why the split is from the right, and why IPv6 is the reason
+//! # Where the separator is, which took three tries
 //!
 //! A naive `split(':')` works for every IPv4 address and hostname and breaks
 //! on the first IPv6 one, because an IPv6 literal is *full* of colons.
-//! `mount(8)` resolves this with brackets — `[fe80::1]:/export` — and so the
-//! parse has to look at the first character before it decides where the
-//! separator is. Getting this wrong does not fail cleanly: `[fe80::1]:/export`
-//! split on the first colon gives host `"[fe80"`, which then fails to parse
-//! as an address and reports a bad hostname for a perfectly good one.
+//! `mount(8)` resolves that with brackets — `[fe80::1]:/export` — so the
+//! parse has to look at the first character before it decides anything, or
+//! `[fe80::1]:/export` yields host `"[fe80"` and reports a bad hostname for a
+//! perfectly good one.
 //!
-//! Splitting from the *right* is what handles the unbracketed forms, since an
-//! export path has no colon in it. Both rules together are four lines of code
-//! and six tests, which is the right ratio for a function whose failures all
-//! look like something else.
+//! For the unbracketed forms there are three candidate rules, and two of them
+//! are wrong:
+//!
+//! - **The first colon**, which is what Linux does (`strchr` in
+//!   `nfs_parse_devname`). Correct for every hostname and IPv4 literal, and
+//!   for an export path with a colon in it — which is legal, since a colon is
+//!   an ordinary character in a path. It breaks an unbracketed IPv6 literal,
+//!   which Linux simply does not accept.
+//! - **The last colon**, which this module did at first, to accept
+//!   unbracketed IPv6 as well. It breaks a path with a colon in it, and
+//!   breaks it *silently*: `nas:/srv/team:/data` splits into host
+//!   `"nas:/srv/team"` and export `"/data"`, and that host is then resolved
+//!   and mounted from. A mount against the wrong machine, with no error
+//!   anywhere. Found by review.
+//! - **The first colon that is followed by a slash**, which is what this does
+//!   now. The export path is absolute, so the separator is always such a
+//!   colon; taking the first means a colon later in the path stays in the
+//!   path, and the colons inside an IPv6 literal are never followed by a
+//!   slash, so they are never mistaken for it. `fe80::1:/export` and
+//!   `nas:/srv/a:/b` both come out right.
+//!
+//! Accepting an unbracketed IPv6 literal at all is a deliberate divergence
+//! from Linux. It costs nothing here — the rule that makes paths with colons
+//! work handles it for free — and it is what someone types.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -54,10 +73,15 @@ impl NfsSource {
             let end = after.find(']').ok_or(LxError::EINVAL)?;
             (&after[..end], &after[end + 1..])
         } else {
-            // From the RIGHT: an export path has no colon, so the last colon
-            // is the separator even when the host is an unbracketed IPv6
-            // literal that someone typed by hand.
-            let idx = source.rfind(':').ok_or(LxError::EINVAL)?;
+            // The first colon followed by a slash. See the module docs: the
+            // first colon alone keeps a path's own colons out of the host but
+            // refuses an unbracketed IPv6 literal, and the last colon
+            // silently mounts the wrong machine for a path that has one.
+            let idx = source
+                .as_bytes()
+                .windows(2)
+                .position(|w| w == b":/")
+                .ok_or(LxError::EINVAL)?;
             (&source[..idx], &source[idx..])
         };
         let export = rest.strip_prefix(':').ok_or(LxError::EINVAL)?;
