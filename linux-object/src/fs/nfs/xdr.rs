@@ -76,6 +76,15 @@ pub enum XdrError {
     /// A boolean was neither 0 nor 1, or a union tag named no arm this
     /// decoder knows.
     BadDiscriminant(u32),
+    /// A `filename3` was not one path component: empty, longer than
+    /// `NFS3_MAXNAMLEN`, or holding a `/`.
+    ///
+    /// It is its own variant because it is the only error in here that can be
+    /// *the server's* fault in a way that matters for safety rather than for
+    /// framing. These names get joined onto paths, so one holding `/` is a
+    /// directory listing that escapes its mount, and calling that "bad
+    /// padding" buries the one error worth recognising on sight.
+    NotOneComponent,
 }
 
 /// A successful read or write of XDR, or [`XdrError`].

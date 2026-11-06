@@ -45,7 +45,7 @@ use rcore_fs::vfs::Timespec;
 
 use super::mount3::{FileHandle, FHSIZE3};
 use super::nfs3::{
-    decode_post_op_attr, decode_wcc_data, Nfs3Status, PostOpAttr, WccData, MAXNAMLEN,
+    decode_post_op_attr, decode_wcc_data, is_one_component, Nfs3Status, PostOpAttr, WccData,
 };
 use super::rpc::{RpcError, RpcResult};
 use super::xdr::{XdrDecoder, XdrEncoder, XdrError};
@@ -631,11 +631,8 @@ pub fn decode_link(results: &[u8]) -> WccResult<LinkReply> {
 
 /// Append a `diropargs3`, refusing a name that is not one component.
 fn encode_dir_and_name(enc: &mut XdrEncoder, dir: &FileHandle, name: &str) -> Result<(), XdrError> {
-    if name.is_empty() || name.len() > MAXNAMLEN {
-        return Err(XdrError::LengthTooLarge);
-    }
-    if name.contains('/') {
-        return Err(XdrError::BadPadding);
+    if !is_one_component(name) {
+        return Err(XdrError::NotOneComponent);
     }
     enc.opaque(dir.as_bytes());
     enc.string(name);

@@ -14,6 +14,7 @@
 //!   socket or a FIFO.
 //! - `RENAME`'s reply carries *two* `wcc_data`.
 
+use super::super::nfs3::MAXNAMLEN;
 use super::*;
 use crate::error::LxError;
 use alloc::vec;
