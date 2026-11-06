@@ -43,10 +43,14 @@ KERNEL_LOG_LINE = re.compile(
     r"\[ *\d+\.\d{6} (?:ERROR|WARN |INFO |DEBUG|TRACE) \d+ \d+:\d+ \S+\] [^\r\n]*"
 )
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# A line of eclipse-init's own on the console: `[eclipse-init] [<secs>s]
+# <message>`. The supervisor shares the serial line with the shell the cases
+# run in, and what it says about its services is not the case's output.
+INIT_LOG_LINE = re.compile(r"\[eclipse-init\] \[ *\d+\.\d+s\] [^\r\n]*")
 
 
 def without_kernel_log(output):
-    """`output` with the kernel's own console lines taken out.
+    """`output` with the kernel's and eclipse-init's console lines taken out.
 
     The submodule classifies a case by substring, and one of its failure
     patterns is "ERROR" -- the level the kernel prints every signal death at,
@@ -55,8 +59,16 @@ def without_kernel_log(output):
     `[ 19.252076 ERROR 1 0:0 zcore_loader::linux] [exit] pid=1033 (grep)
     killed by signal SIGPIPE`) was enough to fail a case that had exited 0.
     The case's own words stay: libc-test prints `... failed` for a failing
-    check, and exits non-zero besides."""
-    return KERNEL_LOG_LINE.sub("", ANSI.sub("", output))
+    check, and exits non-zero besides.
+
+    eclipse-init's lines go for the same reason. On riscv64 (QEMU,
+    2026-11-06) the image carried a labwc session with no labwc behind it,
+    and every minute the supervisor wrote `respawn: seatd exited after
+    60.27s (exit 127 -- command not found, or execve failed; ...)` on the
+    console: 50 cases that had exited 0 were FAILED on that `failed`. The
+    image is fixed (`desktop_lands_in_image` in the xtask), and this keeps
+    whatever init says next from being read as a case's verdict."""
+    return INIT_LOG_LINE.sub("", KERNEL_LOG_LINE.sub("", ANSI.sub("", output)))
 
 
 def main():

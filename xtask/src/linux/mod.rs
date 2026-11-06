@@ -4239,7 +4239,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // boot services: DHCP, the seat manager and the labwc session.
         let svc_dir = rootfs.join("etc").join("eclipse").join("services");
         let _ = fs::create_dir_all(&svc_dir);
-        Self::write_init_services(&svc_dir, self.1.has_desktop());
+        let desktop = desktop_lands_in_image(self.0.name(), self.1);
+        Self::write_init_services(&svc_dir, desktop);
 
         // The startup chime's asset, which a oneshot below plays.
         let share = rootfs.join("usr").join("share").join("eclipse");
@@ -4272,13 +4273,25 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // `labwc` behind and only a following `cargo image` corrected it: a
         // minimal rootfs that boots hunting for a compositor it does not carry,
         // depending on which of the two commands ran last.
-        Self::write_desktop_session(rootfs, self.1.default_session());
+        //
+        // And the session follows the desktop that is actually in the image,
+        // not the variant's name: see `desktop_lands_in_image`.
+        Self::write_desktop_session(
+            rootfs,
+            if desktop {
+                self.1.default_session()
+            } else {
+                Variant::Minimal.default_session()
+            },
+        );
 
         println!(
             "Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg{} and \
              boot-sound services.",
-            if self.1.has_desktop() {
+            if desktop {
                 ", pulseaudio"
+            } else if self.1.has_desktop() {
+                " (no pulseaudio, session `none`: no apk closure fits this architecture's image)"
             } else {
                 " (no pulseaudio: the minimal variant installs no apk closure)"
             }
@@ -4586,6 +4599,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
                   log = /tmp/pulseaudio.log\n",
             )
             .unwrap();
+        } else {
+            // The incremental path rewrites this table over an existing
+            // rootfs, and a row that is not written is not removed either: a
+            // riscv64 rootfs built before `desktop_lands_in_image` kept its
+            // `pulseaudio.service` and respawned it, 8 s at a time, for ever.
+            let _ = fs::remove_file(svc_dir.join("pulseaudio.service"));
         }
 
         // Boot chime: play once after the session is up so NVIDIA HDMI audio
@@ -5076,6 +5095,34 @@ fn apk_closure_fits_image(arch: &str) -> bool {
     arch != "riscv64"
 }
 
+/// Whether the image this rootfs becomes carries a desktop to start: the
+/// variant asks for one AND the apk closure that is the desktop fits the
+/// architecture's image.
+///
+/// The two used to be read as one. `install_desktop_stack` already skipped
+/// the closure on riscv64 (`apk_closure_fits_image`), but the service table
+/// and `/etc/eclipse/desktop` were written from the variant alone, so the
+/// default (desktop) riscv64 image booted `eclipse-init` into a `labwc`
+/// session with no labwc, no seatd and no pulseaudio behind the wrappers.
+/// Each one lived its wrapper's sleep, exited 127 and was restarted, and the
+/// supervisor said so on the serial console every minute for the whole boot:
+///
+/// ```text
+/// [eclipse-init] [418.996s] respawn: seatd exited after 60.2799281s (exit 127 -- command not found, or execve failed; see /tmp/seatd.log), restarting
+/// ```
+///
+/// Measured on `Linux Libc Test Baremetal (riscv64)` (QEMU, 2026-11-06, with
+/// the kernel no longer faulting): 50 of the 52 cases marked FAILED had
+/// exited 0 and carried one of those lines, whose `failed` is one of the
+/// harness's failure substrings, and 3 of the 4 TIMEOUTs were that line
+/// splitting the end-of-case marker. Which cases that hit was whichever ran
+/// when a wrapper gave up, so two runs of the same tree disagreed on ~50
+/// cases in each direction. An image with no desktop boots as the minimal
+/// variant does: session `none`, no pulseaudio row.
+fn desktop_lands_in_image(arch: &str, variant: Variant) -> bool {
+    variant.has_desktop() && apk_closure_fits_image(arch)
+}
+
 fn join_path_env<I, S>(paths: I) -> OsString
 where
     I: IntoIterator<Item = S>,
@@ -5545,3 +5592,21 @@ mod apk_closure_tests;
 
 mod mtime;
 use mtime::{eclipse_i18n_mtime, lunartext_mtime, newest_mtime_under};
+
+#[cfg(test)]
+mod desktop_lands_tests {
+    use crate::variant::Variant;
+
+    /// A desktop variant on an architecture whose image cannot carry the apk
+    /// closure boots as the minimal one: `none` session, no pulseaudio row.
+    /// Otherwise the variant decides.
+    #[test]
+    fn el_escritorio_solo_cuenta_si_su_closure_cabe_en_la_imagen() {
+        assert!(super::desktop_lands_in_image("x86_64", Variant::Desktop));
+        assert!(super::desktop_lands_in_image("aarch64", Variant::Desktop));
+        assert!(!super::desktop_lands_in_image("riscv64", Variant::Desktop));
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(!super::desktop_lands_in_image(arch, Variant::Minimal));
+        }
+    }
+}
