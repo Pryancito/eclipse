@@ -225,6 +225,8 @@ pub mod errno {
     pub const EHOSTUNREACH: i32 = 65;
     pub const ENOTEMPTY: i32 = 66;
     pub const EDQUOT: i32 = 69;
+    pub const ESTALE: i32 = 70;
+    pub const EREMOTE: i32 = 71;
     pub const ENOLCK: i32 = 77;
     pub const ENOSYS: i32 = 78;
     pub const EIDRM: i32 = 82;
