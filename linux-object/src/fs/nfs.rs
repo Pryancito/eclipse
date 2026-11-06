@@ -12,11 +12,13 @@
 //!   root filehandle every NFS call starts from.
 //! - [`nfs3`]: the NFSv3 types (RFC 1813) and the procedures of the read
 //!   path.
+//! - [`nfs3_write`]: the NFSv3 procedures that change something on the
+//!   server.
 //! - [`client`]: one call out, one reply back, with transaction ids,
 //!   timeouts and retries, over a four-method transport trait.
 //! - [`source`]: the `host:/export` string `mount(8)` passes as the device.
 //!
-//! What is deliberately *not* here yet is the socket, the write path and the
+//! What is deliberately *not* here yet is the socket, `READDIRPLUS` and the
 //! VFS types. The split is not arbitrary: everything in this batch is
 //! a pure function from bytes to bytes, so all of it is tested on the host,
 //! by tests that build a reply byte by byte and assert what the decoder makes
@@ -52,6 +54,7 @@
 pub mod client;
 pub mod mount3;
 pub mod nfs3;
+pub mod nfs3_write;
 pub mod portmap;
 pub mod rpc;
 pub mod source;
