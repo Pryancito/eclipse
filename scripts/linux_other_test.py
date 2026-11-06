@@ -14,6 +14,13 @@ Two things have to be adjusted for them to run against this kernel:
 * The submodule's 10 s budget covers the whole `make ... justrun`, UEFI and
   kernel boot included. A passing case takes ~14 s here, so every one of them
   was killed as a TIMEOUT before it could finish.
+
+The ESP image of x86_64 (`target/x86_64/release/esp.img`, ~3 GiB with the
+desktop rootfs) is built by the untimed `make ... build` the submodule runs
+first, not by the first case's `justrun`: while it was, the first case of
+every run (`/bin/busybox?cal`) spent its whole budget on `dd`, `mkfs.vfat`
+and `mcopy` and was a TIMEOUT on a cold runner. See `build_esp_img` in
+`zCore/Makefile`.
 """
 import argparse
 import os

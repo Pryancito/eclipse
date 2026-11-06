@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # the rest is headroom for a slow runner, and a boot that never gets there
 # is reported as such rather than as 476 timeouts.
 PROMPT = re.compile(r"/ # ")
+# What eclipse-init logs once every service of the boot has been started: from
+# here on it only speaks when a service dies. Until then its lines land on the
+# serial console on top of whatever the shell is printing, and that is what
+# the case needs intact: `BootedRunner.wait_for_init_to_settle`.
+INIT_SETTLED = re.compile(r"\[eclipse-init\] \[ *[\d.]+s\] entering supervision loop")
 # The prompt this runner asks the guest shell for, because the shell's own
 # carries no newline and a line-buffered reader cannot see it: see
 # `BootedRunner.adopt_newline_prompt`.
@@ -71,6 +76,15 @@ def without_kernel_log(output):
     return INIT_LOG_LINE.sub("", KERNEL_LOG_LINE.sub("", ANSI.sub("", output)))
 
 
+def init_is_eclipse_init(arch):
+    """Whether the image's PID 1 is eclipse-init: the xtask installs it as
+    `/sbin/eclipse-init` and points `/sbin/init` at it by name."""
+    try:
+        return os.readlink(ROOT / "rootfs" / arch / "sbin" / "init") == "eclipse-init"
+    except OSError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", default="x86_64", choices=["x86_64", "aarch64", "riscv64"])
@@ -124,6 +138,8 @@ def main():
             twice each, with a QEMU restart in between. Wait for the prompt
             itself, within a budget a slow runner can still meet."""
 
+            pid1_is_eclipse_init = init_is_eclipse_init(args.arch)
+
             def run_qemu(self):
                 super().run_qemu()
                 # A newline makes a shell that is already up print a fresh
@@ -145,7 +161,41 @@ def main():
                     raise RuntimeError(
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
                     )
+                self.wait_for_init_to_settle(output, PROMPT_TIMEOUT - (time.monotonic() - start))
                 self.adopt_newline_prompt()
+
+            def wait_for_init_to_settle(self, seen, budget):
+                """The shell's prompt comes up while eclipse-init is still
+                starting services (dbus, hunter, notify, portal, ntpd,
+                udhcpc...; the desktop too before `TEST=1` booted with
+                `desktop=none`), and each start is a line on the serial
+                console. On a loaded runner that goes on for a minute or
+                more, and a line that lands in the middle of a case splits
+                its end-of-case marker: the case comes back TIMEOUT, QEMU is
+                restarted, and the next boot does it again. `Linux Libc Test
+                Baremetal (aarch64)` lost one case in eight that way, and the
+                restarts ended in a boot that showed no prompt in time.
+
+                So wait for the line it logs after its last service start,
+                within what is left of the prompt budget. Whether PID 1 is
+                eclipse-init is read off the rootfs on the host (`/sbin/init`
+                is a link named for it), not off the console: the submodule's
+                `run_qemu` clears everything the guest printed in its first
+                5 s, init's own `starting` line with it, and its next word can
+                be half a minute away (the keyboard, locale and timezone step
+                took 32 s under load here)."""
+                if not self.pid1_is_eclipse_init:
+                    return
+                deadline = time.monotonic() + max(budget, 0)
+                settled = INIT_SETTLED.search(seen) is not None
+                while not settled and time.monotonic() < deadline:
+                    with self.lk:
+                        settled = INIT_SETTLED.search(self.output) is not None
+                    if settled or self.zcore_proc.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                with self.lk:
+                    self.output = ""
 
             def adopt_newline_prompt(self):
                 """Give the guest shell a prompt that ends in a newline, and

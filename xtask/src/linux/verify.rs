@@ -1057,6 +1057,109 @@ mod cableado_tests {
         }
     }
 
+    /// Lo que `make` haria DE VERDAD para un objetivo, en seco (`-n`), con
+    /// `have_vfat` forzado para que el test no dependa de que el runner tenga
+    /// mtools. Las recetas salen con los `ifeq` ya aplicados, que es lo que
+    /// importa: un `define` colocado fuera del `ifeq` del arco grepea igual
+    /// de bien y no entra en el objetivo.
+    fn zcore_dry_run(target: &str) -> String {
+        let out = Command::new("make")
+            .current_dir(crate::PROJECT_DIR.join("zCore"))
+            .arg("--no-print-directory")
+            .arg("-n")
+            .args([
+                "ARCH=x86_64",
+                "MODE=release",
+                "LINUX=1",
+                "TEST=1",
+                "have_vfat=yes",
+            ])
+            .arg(target)
+            .output()
+            .expect("make no se ha podido ejecutar");
+        assert!(
+            out.status.success(),
+            "make -n {target} fallo: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// La imagen ESP de x86_64 (`esp.img`, un `dd` de ~3 GiB, `mkfs.vfat` y
+    /// un `mcopy` del arbol entero) la tiene que construir `build`, DESPUES
+    /// de copiar el initramfs al arbol, y no solo `justrun`. Los arneses
+    /// (`scripts/linux_other_test.py`, `scripts/linux_libc_test.py`) hacen un
+    /// `build` sin cronometrar y luego un `justrun` POR CASO bajo un
+    /// presupuesto de 60 s que tambien paga UEFI y el arranque del nucleo
+    /// (~22 s en un runner): mientras la imagen solo se construia en
+    /// `justrun`, el primer caso de `Linux Other Test Baremetal (x86_64)`
+    /// (`/bin/busybox?cal`) era un TIMEOUT en cada tirada y los otros nueve
+    /// pasaban en 21-27 s.
+    #[test]
+    fn la_imagen_esp_se_construye_en_build_y_no_solo_en_cada_justrun() {
+        let build = zcore_dry_run("build");
+        let copia = build
+            .find("esp/EFI/zCore/initramfs.img")
+            .expect("build no copia el initramfs al arbol de la ESP");
+        let imagen = build
+            .find("mkfs.vfat -F 32")
+            .expect("build no construye esp.img: el primer caso de cada tirada la pagaria");
+        assert!(
+            copia < imagen,
+            "build construye esp.img ANTES de copiar el initramfs, asi que la imagen sale sin el"
+        );
+        // Y `justrun` sigue llevando la receta, por un `make run` tras tocar
+        // el arbol a mano: con la imagen ya hecha toma la rama barata.
+        assert!(
+            zcore_dry_run("justrun").contains("mkfs.vfat -F 32"),
+            "justrun ya no refresca esp.img"
+        );
+    }
+
+    /// El valor que `make` resuelve para `CMDLINE`, con los `ifeq` aplicados.
+    fn zcore_cmdline(extra: &[&str]) -> String {
+        let out = Command::new("make")
+            .current_dir(crate::PROJECT_DIR.join("zCore"))
+            .arg("--no-print-directory")
+            .arg("--eval=print-%: ; @echo $($*)")
+            .arg("print-CMDLINE")
+            .args(extra)
+            .output()
+            .expect("make no se ha podido ejecutar");
+        assert!(
+            out.status.success(),
+            "make print-CMDLINE {extra:?} fallo: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Un arranque de pruebas (`TEST=1`) no levanta escritorio: la cmdline
+    /// lleva `desktop=none` en las tres arquitecturas, y un arranque normal
+    /// no lleva `desktop=` (en hardware real manda `/etc/eclipse/desktop`).
+    /// `DESKTOP=` explicito sigue ganando, que es lo que usa `make qemu`.
+    #[test]
+    fn un_arranque_de_pruebas_no_levanta_escritorio() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let arch = format!("ARCH={arch}");
+            let test = zcore_cmdline(&[&arch, "LINUX=1", "TEST=1"]);
+            assert!(
+                test.split(':').any(|t| t == "desktop=none"),
+                "TEST=1 {arch} arranca con escritorio: {test}"
+            );
+            let normal = zcore_cmdline(&[&arch, "LINUX=1"]);
+            assert!(
+                !normal.contains("desktop="),
+                "sin TEST=1 {arch} fuerza una sesion: {normal}"
+            );
+            let xorg = zcore_cmdline(&[&arch, "LINUX=1", "TEST=1", "DESKTOP=xorg"]);
+            assert!(
+                xorg.split(':').any(|t| t == "desktop=xorg"),
+                "DESKTOP=xorg no gana a TEST=1 en {arch}: {xorg}"
+            );
+        }
+    }
+
     /// Las 22 caches de artefactos tienen que seguir pasando por
     /// `cached_for_target`. Perder una no falla nada: simplemente esa
     /// herramienta vuelve a poder llegar a la rootfs con el arco del build
