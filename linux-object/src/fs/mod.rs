@@ -28,6 +28,7 @@ mod kbd_layout;
 mod mount_ops;
 mod mount_state;
 mod mountinfo;
+pub mod nfs;
 mod perf;
 mod pidfd;
 mod pipe;
