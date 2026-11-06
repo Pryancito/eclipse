@@ -168,7 +168,7 @@ impl LinuxRootfs {
             // Without this, a rootfs built before symlink support was added (or from a
             // partial build) would produce a rootfs image where `ls`, `cat`, etc. are
             // missing, making the installed system unusable.
-            Self::ensure_busybox_applets(&bin);
+            Self::ensure_busybox_applets_with(&bin, Some(&self.busybox_links()));
             let nl_dump = self.nl_dump(&musl);
             if nl_dump.is_file() {
                 let _ = fs::copy(&nl_dump, bin.join("nl_dump"));
@@ -446,7 +446,7 @@ impl LinuxRootfs {
             self.0.name()
         );
         // 为 busybox 支持的所有 applets 建立符号链接
-        Self::ensure_busybox_applets(&bin);
+        Self::ensure_busybox_applets_with(&bin, Some(&self.busybox_links()));
         // Create standard pseudo-filesystem mount points
         let _ = fs::create_dir_all(dir.join("run"));
         let _ = fs::create_dir_all(dir.join("proc"));
@@ -1558,6 +1558,12 @@ impl LinuxRootfs {
     /// stderr to /dev/null. `applets_cover_what_the_generated_scripts_call` is
     /// the test that keeps this in step with those scripts.
     const BASE_APPLETS: &[&str] = &[
+        // `scripts/linux_libc_test.py` runs its UNPRIVILEGED cases through
+        // `su -s /bin/sh nobody`. The riscv64 image had no `/bin/su` link
+        // (the host cannot run that busybox, and the links file of its build
+        // is gone by the time the incremental path relinks), so both
+        // `pthread_atfork-errno-clobber*` cases died on `sh: su: not found`.
+        "su",
         "cat",
         "cp",
         "echo",
@@ -1640,8 +1646,39 @@ impl LinuxRootfs {
     /// created before this feature existed (or after a partial build) still ends
     /// up with all applet symlinks in the final ext2 image.  Existing entries
     /// (real binaries like `nl_dump`) are never overwritten.
-    fn ensure_busybox_applets(bin: &Path) {
+    /// The applet names in a `busybox.links` file: the basename of each
+    /// non-empty line. Every link lives in `/bin` here whatever directory the
+    /// file says, because busybox dispatches on `basename(argv[0])` and the
+    /// guest's PATH has `/bin` first; `/usr/bin/env` is the one exception and
+    /// is handled on its own below.
+    fn applets_in_links_file(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| l.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Links every applet of the fallback list, plus the applets named in `links`: the
+    /// `busybox.links` file that busybox's own build writes next to the
+    /// binary, one installed path per applet (`/bin/su`, `/usr/bin/awk`,
+    /// `/sbin/init`). It is the only complete list a CROSS build has, since
+    /// `busybox --list` below needs a busybox the host can run; the x86_64
+    /// image got every applet that way and the aarch64 and riscv64 images got
+    /// `BASE_APPLETS` and nothing else. A missing or unreadable file is not an
+    /// error: the fallback list still applies.
+    fn ensure_busybox_applets_with(bin: &Path, links: Option<&Path>) {
         let mut applets: Vec<String> = Self::BASE_APPLETS.iter().map(|a| a.to_string()).collect();
+
+        if let Some(text) = links.and_then(|p| fs::read_to_string(p).ok()) {
+            for applet in Self::applets_in_links_file(&text) {
+                if !applets.contains(&applet) {
+                    applets.push(applet);
+                }
+            }
+        }
 
         // Complement the list with `busybox --list` when it runs on the host.
         let busybox_bin = bin.join("busybox");
@@ -1920,6 +1957,15 @@ impl LinuxRootfs {
     }
 
     /// 编译 busybox。
+    /// Where busybox's build leaves its `busybox.links`, beside the binary
+    /// [`busybox`] returns. Only there while that build directory exists:
+    /// `cargo libc-test --arch riscv64` clears the whole target directory to
+    /// unpack its prebuilt tarball, so the incremental `cargo image` after
+    /// it finds no file and keeps the links the fresh build already made.
+    fn busybox_links(&self) -> PathBuf {
+        self.0.target().join("busybox").join("busybox.links")
+    }
+
     fn busybox(&self, musl: impl AsRef<Path>) -> PathBuf {
         // 最终文件路径
         let target = self.0.target().join("busybox");

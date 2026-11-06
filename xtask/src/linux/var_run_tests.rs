@@ -19,7 +19,7 @@ fn usr_bin_env_is_linked_to_busybox() {
     let _ = fs::remove_dir_all(&dir);
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    LinuxRootfs::ensure_busybox_applets(&bin);
+    LinuxRootfs::ensure_busybox_applets_with(&bin, None);
 
     let link = dir.join("usr/bin/env");
     assert!(
