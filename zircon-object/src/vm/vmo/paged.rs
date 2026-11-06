@@ -136,6 +136,25 @@ impl Drop for DecommitGuard<'_> {
     }
 }
 
+/// Frames a range operation took away from a VMO, kept alive until every
+/// PTE that pointed at them is gone.
+///
+/// `zero`, `decommit` and `set_len` remove `PageState`s under the family lock
+/// and tear the mappings down only afterwards (`apply_deferred_range_changes`,
+/// `unmap_released`), because the mapping locks cannot be taken under it. A
+/// removed `PageState` used to drop right there, and dropping one is
+/// `frame_dealloc`: the frame went back to the allocator while userspace, on
+/// another cpu, still had it mapped. On riscv64 the frame arena IS the kernel
+/// heap, and the allocator's first act on a freed frame is to write a free-list
+/// node into its first word -- so a store from userspace through the stale PTE
+/// landed on the free list. That is the `ld s2, 0(s2)` fault inside
+/// `Node::insert` with ASCII in the register, and the reason no two runs of
+/// the riscv64 libc-test failed the same cases.
+///
+/// Every frame the inner helpers remove goes here instead, and the caller
+/// drops the vector once its unmap passes have returned.
+type Graveyard = Vec<PhysFrame>;
+
 fn apply_deferred_range_changes(range_changes: Vec<DeferredRangeChange>) {
     for range_change in range_changes {
         range_change.apply();
@@ -987,6 +1006,7 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
         let mut range_changes = Vec::new();
+        let mut graveyard = Graveyard::new();
         // The whole-page path below drops frames, so it releases memory just
         // like `decommit` does and takes the same window. See `set_len`.
         let _decommit_guard = DecommitGuard::begin(self);
@@ -1014,7 +1034,7 @@ impl VMObjectTrait for VMObjectPaged {
                 if block.len() == PAGE_SIZE && !inner.is_contiguous() {
                     let _ = inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
                     unwanted.push_back(block.block + inner.parent_offset / PAGE_SIZE);
-                    inner.frames.remove(&block.block);
+                    graveyard.extend(inner.frames.remove(&block.block).map(PageState::take));
                     released = Some(match released {
                         None => (block.block, 1),
                         Some((first, _)) => (first, block.block + 1 - first),
@@ -1028,7 +1048,7 @@ impl VMObjectTrait for VMObjectPaged {
                     kernel_hal::mem::pmem_zero(paddr + block.begin, block.len());
                 }
             }
-            inner.release_unwanted_pages_in_parent(unwanted);
+            inner.release_unwanted_pages_in_parent(unwanted, &mut graveyard);
             Ok(())
         })();
         apply_deferred_range_changes(range_changes);
@@ -1040,6 +1060,8 @@ impl VMObjectTrait for VMObjectPaged {
         if let Some((first, pages)) = released {
             self.unmap_released(self.live_mappings(), first, pages);
         }
+        // Only now: both passes above are done, no PTE names these frames.
+        drop(graveyard);
         ret
     }
 
@@ -1058,13 +1080,14 @@ impl VMObjectTrait for VMObjectPaged {
         // guard that depends on which way the object is about to be resized
         // would have to read `size` before taking the lock that decides it.
         let _decommit_guard = DecommitGuard::begin(self);
+        let mut graveyard = Graveyard::new();
         let released = {
             let mut inner = self.get_inner_mut();
             if inner.pin_count > 0 {
                 return Err(ZxError::BAD_STATE);
             }
             let old_len = inner.size;
-            inner.resize(len, &mut deferred);
+            inner.resize(len, &mut deferred, &mut graveyard);
             old_len.saturating_sub(len) / PAGE_SIZE
         };
         drop(deferred);
@@ -1074,6 +1097,7 @@ impl VMObjectTrait for VMObjectPaged {
         // mapping that arrives after this point faults for its PTEs, and the
         // frames are already gone by then.
         self.unmap_released(self.live_mappings(), len / PAGE_SIZE, released);
+        drop(graveyard);
         Ok(())
     }
 
@@ -1155,6 +1179,7 @@ impl VMObjectTrait for VMObjectPaged {
         // hand back to the allocator -- it cannot be reached through the unmap
         // passes, because its PTE does not exist yet. See `decommit_seq`.
         let _decommit_guard = DecommitGuard::begin(self);
+        let mut graveyard = Graveyard::new();
         let mappings = {
             let mut inner = self.get_inner_mut();
             if inner.parent.is_some() {
@@ -1185,7 +1210,7 @@ impl VMObjectTrait for VMObjectPaged {
                 }
             }
             for i in 0..pages {
-                inner.decommit(start_page + i);
+                inner.decommit(start_page + i, &mut graveyard);
             }
             inner
                 .mappings
@@ -1193,8 +1218,10 @@ impl VMObjectTrait for VMObjectPaged {
                 .filter_map(|map| map.upgrade())
                 .collect::<Vec<_>>()
         };
-        // The frames are gone; no PTE may keep pointing at them.
+        // No PTE may keep pointing at the frames, and they go back to the
+        // allocator only once none does.
         self.unmap_released(mappings, start_page, pages);
+        drop(graveyard);
         Ok(())
     }
 
@@ -1844,8 +1871,8 @@ impl VMObjectPagedInner {
         Ok(CommitResult::Ref(frame.frame.paddr()))
     }
 
-    fn decommit(&mut self, page_idx: usize) {
-        self.frames.remove(&page_idx);
+    fn decommit(&mut self, page_idx: usize, graveyard: &mut Graveyard) {
+        graveyard.extend(self.frames.remove(&page_idx).map(PageState::take));
     }
 
     fn collect_mapping_range_changes(
@@ -2026,7 +2053,12 @@ impl VMObjectPagedInner {
     /// the same rule applied to the reference this function itself creates.
     /// Every `Arc` this path upgrades or clones lands in `deferred`, which the
     /// outermost frame drops only after releasing the family lock.
-    fn remove_child(&mut self, child: &WeakRef, deferred: &mut Vec<Arc<VMObjectPaged>>) {
+    fn remove_child(
+        &mut self,
+        child: &WeakRef,
+        deferred: &mut Vec<Arc<VMObjectPaged>>,
+        graveyard: &mut Graveyard,
+    ) {
         drop_crumb(2); // remove_child entered
                        // a child slice do not have to belong to a hidden parent
         if !self.type_.is_hidden() {
@@ -2059,6 +2091,7 @@ impl VMObjectPagedInner {
         // merge nodes to the child
         for (key, mut value) in core::mem::take(&mut self.frames) {
             if key < start || key >= end {
+                graveyard.push(value.take());
                 continue;
             }
             if self.contiguous && !child.contiguous && value.pin_count >= 1 {
@@ -2068,6 +2101,8 @@ impl VMObjectPagedInner {
             if !child.frames.contains_key(&idx) && value.tag != tag.negate() {
                 value.tag = PageStateTag::Owned;
                 child.frames.insert(idx, value);
+            } else {
+                graveyard.push(value.take());
             }
         }
         // connect child to my parent
@@ -2080,6 +2115,7 @@ impl VMObjectPagedInner {
                 other_child,
                 Some((child.parent_offset, child.parent_limit)),
                 deferred,
+                graveyard,
             );
         }
         // The surviving child takes over as root; carry the demand-paging source
@@ -2191,6 +2227,7 @@ impl VMObjectPagedInner {
         new: WeakRef,
         new_range: Option<(usize, usize)>,
         deferred: &mut Vec<Arc<VMObjectPaged>>,
+        graveyard: &mut Graveyard,
     ) {
         let (tag, other) = self.type_.get_tag_and_other(old);
         let Some(arc_other_child) = other.upgrade() else {
@@ -2215,9 +2252,9 @@ impl VMObjectPagedInner {
                     !((start <= i && end > i) || (other_start <= i && other_end > i));
                 if not_in_range {
                     // if not in this node's range
-                    if self.frames.contains_key(&i) {
+                    if let Some(gone) = self.frames.remove(&i) {
                         // if the frame is in our, remove it
-                        assert!(self.frames.remove(&i).is_some());
+                        graveyard.push(gone.take());
                     } else {
                         // or it is in our ancestor, tell them we do not need it.
                         unwanted.push_back(i + self.parent_offset / PAGE_SIZE);
@@ -2244,7 +2281,7 @@ impl VMObjectPagedInner {
             }
         }
 
-        self.release_unwanted_pages_in_parent(unwanted);
+        self.release_unwanted_pages_in_parent(unwanted, graveyard);
 
         if old_id == self.owner {
             let mut option_parent = self.parent.clone();
@@ -2321,7 +2358,11 @@ impl VMObjectPagedInner {
         info.populated_scaled_bytes = info.populated_bytes;
     }
 
-    fn release_unwanted_pages_in_parent(&mut self, mut unwanted: VecDeque<usize>) {
+    fn release_unwanted_pages_in_parent(
+        &mut self,
+        mut unwanted: VecDeque<usize>,
+        graveyard: &mut Graveyard,
+    ) {
         let mut option_parent = self.parent.clone();
         let mut child = self.self_ref.clone();
         while let Some(parent) = option_parent {
@@ -2357,8 +2398,8 @@ impl VMObjectPagedInner {
                     }
                 } else {
                     // otherwise, if it exists in our frames, remove it; if not, push_back it again
-                    if parent_inner.frames.contains_key(&idx) {
-                        parent_inner.frames.remove(&idx);
+                    if let Some(gone) = parent_inner.frames.remove(&idx) {
+                        graveyard.push(gone.take());
                     } else {
                         unwanted.push_back(idx + parent_inner.parent_offset / PAGE_SIZE);
                     }
@@ -2375,14 +2416,23 @@ impl VMObjectPagedInner {
         }
     }
 
-    fn resize(&mut self, new_size: usize, deferred: &mut Vec<Arc<VMObjectPaged>>) {
+    fn resize(
+        &mut self,
+        new_size: usize,
+        deferred: &mut Vec<Arc<VMObjectPaged>>,
+        graveyard: &mut Graveyard,
+    ) {
         if new_size == 0 && new_size < self.size {
-            self.frames.clear();
+            graveyard.extend(
+                core::mem::take(&mut self.frames)
+                    .into_values()
+                    .map(PageState::take),
+            );
             if let Some(parent) = self.parent.as_ref() {
                 parent
                     .inner
                     .borrow_mut()
-                    .remove_child(&self.self_ref, deferred);
+                    .remove_child(&self.self_ref, deferred, graveyard);
             }
             // We cannot drop the parent Arc here since we are holding the lock
             // pass it to caller who can drop it after unlocking the lock
@@ -2395,12 +2445,12 @@ impl VMObjectPagedInner {
             let mut unwanted = VecDeque::<usize>::new();
             let parent_end = (self.parent_limit - self.parent_offset) / PAGE_SIZE;
             for i in new_size / PAGE_SIZE..self.size / PAGE_SIZE {
-                self.decommit(i);
+                self.decommit(i, graveyard);
                 if parent_end > i {
                     unwanted.push_back(i + self.parent_offset / PAGE_SIZE);
                 }
             }
-            self.release_unwanted_pages_in_parent(unwanted);
+            self.release_unwanted_pages_in_parent(unwanted, graveyard);
             if new_size < self.parent_limit - self.parent_offset {
                 self.parent_limit = self.parent_offset + new_size;
             }
@@ -2518,6 +2568,11 @@ impl Drop for VMObjectPaged {
         // under the lock is the re-entrant self-deadlock described on
         // `remove_child`.
         let mut deferred: Vec<Arc<VMObjectPaged>> = Vec::new();
+        // Frames the collapse takes out of the hidden parent. Nothing can map
+        // them any more (this object's mappings died before it did), but they
+        // are handed back after the lock all the same: one rule for every
+        // removal, and `frame_dealloc` is not something to run under it.
+        let mut graveyard = Graveyard::new();
         {
             let mut inner = self.get_inner_mut();
             drop_crumb(0); // scope entered, family lock held
@@ -2527,10 +2582,11 @@ impl Drop for VMObjectPaged {
             // remove self from parent
             if let Some(parent) = &inner.parent {
                 drop_crumb(1); // parent present, about to borrow it
-                parent
-                    .inner
-                    .borrow_mut()
-                    .remove_child(&inner.self_ref, &mut deferred);
+                parent.inner.borrow_mut().remove_child(
+                    &inner.self_ref,
+                    &mut deferred,
+                    &mut graveyard,
+                );
                 drop_crumb(7); // remove_child returned, parent RefMut dropped
             }
             drop_crumb(8); // entering the frame pin sweep

@@ -902,7 +902,7 @@ static FAULT_RFLAGS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; M
 /// usually still is.
 #[cfg(target_arch = "riscv64")]
 pub const GPR_NAMES: [&str; 16] = [
-    "ra", "sp", "gp", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "t0", "t1", "t2",
+    "ra", "sp", "s0", "s1", "s2", "s3", "s4", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "t0",
 ];
 
 /// See the riscv64 table above.

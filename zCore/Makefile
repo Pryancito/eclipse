@@ -300,12 +300,16 @@ endif
 # the last two corruptions arrived. Off by default: it costs a SeqCst RMW per
 # frame on the hottest path in the memory system.
 #
-# x86_64 only. No other architecture has the probes, so asking for it there
-# would quietly build a kernel with no memory debugging that looks like it has
-# some -- hence an error rather than a silence.
+# x86_64 has the full set (zCore/src/memory_x86_64.rs); riscv64 and aarch64
+# share zCore/src/memory.rs and get its own: a quarantine that poisons every
+# freed block and reports a write to it, a canary after each heap block, a
+# check that two CPUs are never inside the heap lock, and a walk of the buddy's
+# free lists on every heap operation that names a clobbered node. Any other
+# architecture would quietly build a kernel with no memory debugging that looks
+# like it has some -- hence an error rather than a silence.
 ifeq ($(MEM_DEBUG), 1)
-  ifneq ($(ARCH), x86_64)
-    $(error MEM_DEBUG=1 only exists for ARCH=x86_64 (the probes live in zCore/src/memory_x86_64.rs))
+  ifeq ($(filter $(ARCH), x86_64 riscv64 aarch64),)
+    $(error MEM_DEBUG=1 only exists for ARCH=x86_64, riscv64 and aarch64)
   endif
   features += mem-debug
 endif

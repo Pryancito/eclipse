@@ -25,9 +25,29 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Base of the kernel half: `KERNEL_BEGIN` in the linker script, and the
 /// bottom of the physmap window the coroutine stacks live in.
+///
+/// Per architecture, because every fault-path probe is gated on this pair and
+/// it used to be the x86_64 literal for all three: on riscv64 (kernel half at
+/// `0xffff_ffc0_...`) and aarch64 (`0xffff_0000_...`) no address was ever "a
+/// kernel address", so the backtrace walker declined its own stack pointer
+/// ("rsp0 is itself out of the plausible kernel range") and every report on
+/// those two ended without a caller.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_LO: u64 = 0xffff_ffc0_0000_0000;
+#[cfg(target_arch = "aarch64")]
+pub const KERNEL_LO: u64 = 0xffff_0000_0000_0000;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
 pub const KERNEL_LO: u64 = 0xffff_ff00_0000_0000;
 /// Four gigabytes up: the widest of the windows the probes used, and the one
 /// that has to hold, since it is the stacks and the physmap it bounds.
+///
+/// riscv64's physmap puts RAM at `KERNEL_LO + paddr`, and QEMU's RAM starts
+/// at 2 GiB, so a 4 GiB window would end before the heap: sixteen there.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_HI: u64 = 0xffff_ffc4_0000_0000;
+#[cfg(target_arch = "aarch64")]
+pub const KERNEL_HI: u64 = 0xffff_0004_0000_0000;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
 pub const KERNEL_HI: u64 = 0xffff_ff01_0000_0000;
 
 /// The literal `.text` window the x86_64 probes carried before the linker's

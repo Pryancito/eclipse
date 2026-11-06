@@ -1247,6 +1247,29 @@ impl UserContext {
                     crate::common::ipi::tlb_shootdown_ack_nmi();
                     self.dbg_validate_user_ctx("after NMI from user");
                 }
+                // Interrupts OFF before `run_user`. The riscv trap entry
+                // decides "from user?" by `sscratch != 0`, and `run_user`
+                // sets `sscratch` to this context some seventy instructions
+                // before its `sret` -- the whole register restore runs with
+                // the flag already raised. A timer or IPI landing in that
+                // window (the idle loop re-enables `SIE` on every hart but
+                // the boot one, and nothing turned it off again before the
+                // trip out) takes the from-user path: `sp` is set to this
+                // `UserContext`, the kernel's registers are saved over the
+                // user's, and the handler then runs with the context as its
+                // stack, pushing frames into the heap below the `Box` -- over
+                // the buddy's free-list nodes and whatever else lives there.
+                // That was the `#PF` in `Node::insert` on riscv64 bare metal
+                // under SMP, with trap_return addresses in the clobbered
+                // words. The hardware clears `SIE` on the trap back in, so
+                // the state after `run()` is unchanged.
+                #[cfg(target_arch = "riscv64")]
+                // SAFETY: masks interrupts on this hart for the register
+                // restore and `sret`; the trap that returns here has already
+                // cleared `SIE` itself, so nothing is left masked.
+                unsafe {
+                    riscv::register::sstatus::clear_sie();
+                }
                 #[cfg(not(target_arch = "x86_64"))]
                 self.0.run();
                 self.dbg_validate_user_ctx("after trap from user");

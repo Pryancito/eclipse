@@ -30,6 +30,18 @@ SECTIONS
         edata = .;
     }
 
+    /* The in-kernel symbol table, patched in after the link by
+       tools/gen_ksyms.py. Was an orphan section the linker put here on its
+       own, between `edata` and .bss, which `remap_the_kernel` never maps:
+       the first `ksyms::Addr` a crash report printed re-faulted and the
+       report stopped there. Same fix as zCore/src/platform/riscv/linker.ld. */
+    .ksyms ALIGN(4K) : {
+        sksyms = .;
+        KEEP(*(.ksyms))
+        . = ALIGN(4K);
+        eksyms = .;
+    }
+
     .bss : {
         boot_stack = .;
         *(.bss.stack)

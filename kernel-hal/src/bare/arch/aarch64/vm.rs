@@ -26,6 +26,8 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         fn srodata();
         fn erodata();
         fn sdata();
+        fn sksyms();
+        fn eksyms();
         fn edata();
         fn sbss();
         fn ebss();
@@ -57,6 +59,13 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         sdata as *const () as usize,
         edata as *const () as usize,
         MMUFlags::READ | MMUFlags::WRITE,
+    )?;
+    // The symbol table the crash reporters read; its own section, outside
+    // every range above. See `.ksyms` in zCore/src/platform/aarch64/linker.ld.
+    map_range(
+        sksyms as *const () as usize,
+        eksyms as *const () as usize,
+        MMUFlags::READ,
     )?;
     map_range(
         sbss as *const () as usize,
