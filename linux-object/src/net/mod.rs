@@ -1313,6 +1313,35 @@ pub fn flush_socket_egress() {
     drain_net_poll(4);
 }
 
+/// A `SO_RCVTIMEO` / `SO_SNDTIMEO` value (`struct timeval`, 16 bytes) as the
+/// deadline of a call that starts now: `None` when it is zero, which is the
+/// default and means "wait for as long as it takes".
+///
+/// Rounded UP to whole milliseconds with a floor of one, as `sock_set_timeout`
+/// rounds up to jiffies: the `tv_usec = 1` that libc-test's `socket.c` sets
+/// is one jiffy on Linux, not one microsecond, and a datagram the loopback
+/// has already queued is still found. Before this the value was stored for
+/// `getsockopt` and never looked at by `recv`, `recvfrom` or `accept`: a
+/// receive with nothing coming waited forever, timeout or no timeout, and in
+/// the libc-test that is a case with no output at all instead of one that
+/// says `recvfrom ... failed: errno = EAGAIN` and goes on to its TCP half.
+pub(crate) fn sockopt_deadline(tv: &[u8; 16]) -> Option<core::time::Duration> {
+    let (mut sec, mut usec) = ([0u8; 8], [0u8; 8]);
+    sec.copy_from_slice(&tv[0..8]);
+    usec.copy_from_slice(&tv[8..16]);
+    let (sec, usec) = (i64::from_ne_bytes(sec), i64::from_ne_bytes(usec));
+    if sec <= 0 && usec <= 0 {
+        return None;
+    }
+    let ms = sec.max(0) as u64 * 1000 + (usec.max(0) as u64).div_ceil(1000);
+    Some(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(ms.max(1)))
+}
+
+/// Whether a deadline from [`sockopt_deadline`] has passed. `None` never has.
+pub(crate) fn sockopt_deadline_passed(deadline: Option<core::time::Duration>) -> bool {
+    deadline.is_some_and(|d| kernel_hal::timer::timer_now() >= d)
+}
+
 fn is_ipv4_on_link(
     dev: &dyn zcore_drivers::scheme::NetScheme,
     dst: smoltcp::wire::Ipv4Address,
