@@ -71,6 +71,8 @@ cfg_if::cfg_if! {
         };
         pub mod ticket;
         pub use ticket::{TicketMutex as Mutex, TicketMutexGuard as MutexGuard};
+        pub mod spin;
+        pub use spin::{SpinMutex as UnfairMutex, SpinMutexGuard as UnfairMutexGuard};
     } else if #[cfg(target_os = "none")] {
         extern crate alloc;
         mod interrupt;
@@ -93,10 +95,12 @@ cfg_if::cfg_if! {
         };
         pub mod spin;
         pub use spin::{SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
+        pub use spin::{SpinMutex as UnfairMutex, SpinMutexGuard as UnfairMutexGuard};
     } else {
         // `::spin` — the external crate, not this crate's `spin` module, which
         // a `cargo test` build declares at crate root (see KERNEL_LOCKS_ON_HOST).
         pub use ::spin::*;
+        pub use ::spin::{Mutex as UnfairMutex, MutexGuard as UnfairMutexGuard};
 
         /// Hosted (libos) no-op twin of the bare-metal stuck-lock reporter.
         /// The preemptive executor's diagnostics call it unconditionally, and
@@ -187,6 +191,18 @@ cfg_if::cfg_if! {
             #[inline]
             fn held_by_current_cpu_via_apic(&self) -> bool {
                 ticket::TicketMutex::holder_is_cpu(self, crate::interrupt::current_cpu_id_via_apic())
+            }
+        }
+
+        impl<T: ?Sized> HeldByCurrentCpu for UnfairMutex<T> {
+            #[inline]
+            fn held_by_current_cpu(&self) -> bool {
+                spin::SpinMutex::holder_is_current_cpu(self)
+            }
+
+            #[inline]
+            fn held_by_current_cpu_via_apic(&self) -> bool {
+                spin::SpinMutex::holder_is_cpu(self, crate::interrupt::current_cpu_id_via_apic())
             }
         }
     } else if #[cfg(target_os = "none")] {

@@ -10,8 +10,8 @@ use core::{
     ptr::NonNull,
 };
 use customizable_buddy::{BuddyAllocator, LinkedListBuddy, UsizeBuddy};
-use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
+use lock::UnfairMutex;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
@@ -19,7 +19,41 @@ static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
 /// 堆分配器。
 ///
 /// 27 + 6 + 3 = 36 -> 64 GiB
-struct LockedHeap(Mutex<BuddyAllocator<27, UsizeBuddy, LinkedListBuddy>>);
+/// Behind an UNFAIR lock (test-and-set, `lock::UnfairMutex`), not the ticket
+/// lock the rest of the kernel uses, and on purpose.
+///
+/// A ticket lock hands the lock to ONE named waiter, the next ticket. When
+/// that waiter is a vCPU the host has descheduled, every other CPU spins
+/// until the host runs it again, however free the lock is. This allocator
+/// is the kernel's hottest lock on riscv64 and aarch64 (every `Box`, every
+/// `Vec` growth, every frame of an eager `fork` copy comes through here with
+/// no per-CPU front cache, unlike `memory_x86_64.rs`), so once the CPUs
+/// queue on it the convoy feeds itself.
+///
+/// Measured on `Linux Libc Test Baremetal (aarch64)`'s own configuration,
+/// `-smp 6` on a 4-core host, reproduced here on an idle machine: with the
+/// ticket lock the lock was FREE in 85% of samples with all 6 CPUs holding a
+/// ticket, 93% of all CPU time went to spins of 16k+ turns averaging 9 ms
+/// per acquisition, `fork` copied memory at 6 MB/s and `eclipse-init` took
+/// 236-261 s to settle, past the harness's 300 s prompt budget once the
+/// kernel boot is added. With 1 or 2 CPUs (no oversubscription) the same
+/// kernel copied at 1.3 GB/s and settled in 8 s, so the work was never the
+/// problem, the handoff was. With this lock, `-smp 6`: 255 MB/s, settled
+/// in 19 s, 12k idle naps where there had been 1.7k -- the riscv64 figures.
+///
+/// Linux reaches the same conclusion for the same reason: on a hypervisor
+/// without paravirt spinlock support it drops its fair qspinlock for a plain
+/// test-and-set one, "because fair locks have terrible lock 'holder'
+/// preemption issues" (`virt_spin_lock`, arch/x86/include/asm/qspinlock.h).
+/// riscv64 and aarch64 Eclipse run under QEMU; x86_64 has its own allocator
+/// and keeps its ticket lock.
+///
+/// Unfair means a CPU can lose the race repeatedly, never for ever: the
+/// critical sections here are short (a buddy allocate or free) and the
+/// contending CPUs all go on to do other work between acquisitions. The
+/// `SpinMutex` keeps the deadlock forensics (holder file:line, the 8 s
+/// stuck report) and the shootdown pump the ticket lock has.
+struct LockedHeap(UnfairMutex<BuddyAllocator<27, UsizeBuddy, LinkedListBuddy>>);
 
 // Not the global allocator in the test binary: the harness allocates long
 // before anything calls `init()`, so installing this over the 2 MiB static
@@ -27,7 +61,7 @@ struct LockedHeap(Mutex<BuddyAllocator<27, UsizeBuddy, LinkedListBuddy>>);
 // compiled and still reachable -- the tests call `init()` and then drive
 // `HEAP` directly, which is what the kernel's own `GlobalAlloc` impl does.
 #[cfg_attr(not(test), global_allocator)]
-static HEAP: LockedHeap = LockedHeap(Mutex::new(BuddyAllocator::new()));
+static HEAP: LockedHeap = LockedHeap(UnfairMutex::new(BuddyAllocator::new()));
 
 /// 单页地址位数。
 const PAGE_BITS: usize = 12;
