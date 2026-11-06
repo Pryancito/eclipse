@@ -42,6 +42,40 @@ UNPRIVILEGED = {
     "/libc-test/src/regression/pthread_atfork-errno-clobber-static.exe",
 }
 
+# Cases that get an autopsy when they hang: run in the background, and if
+# still alive after AUTOPSY_AFTER_S the guest prints the process's state and
+# the socket tables BEFORE the suite's 10 s budget kills the boot. A TIMEOUT
+# alone says nothing about where the case stopped, and these two were TIMEOUT
+# on every run of `Linux Libc Test Baremetal (x86_64)` -- the CI's desktop
+# image only, never in QEMU here with the minimal one, nor on riscv64 and
+# aarch64 -- with no output at all. The case does UDP and then TCP over
+# 127.0.0.1, so `/proc/net/udp` and `/proc/net/tcp` say which half it is in
+# (a datagram never queued, a SYN never answered) and `/proc/net/dev` whether
+# the loopback moved anything. The exit status of the wrapped command is the
+# case's own: the subshell ends in `wait` on it.
+AUTOPSY = {
+    "/libc-test/src/functional/socket.exe",
+    "/libc-test/src/functional/socket-static.exe",
+}
+AUTOPSY_AFTER_S = 6
+
+
+def autopsy_command(name):
+    """The shell line that runs `name` with the watchdog of `AUTOPSY`.
+
+    Nothing it prints may contain the submodule's failure substrings
+    (`failed`, `ERROR`, `Error`, `panicked`, `Hangup`, `Unknown signal`), or
+    the dump itself would turn a case that then finishes into a FAILED."""
+    ticks = AUTOPSY_AFTER_S * 10
+    return (
+        f"( {name} & p=$!; i=0; "
+        f"while [ $i -lt {ticks} ] && kill -0 $p 2>/dev/null; do usleep 100000; i=$((i+1)); done; "
+        "if kill -0 $p 2>/dev/null; then "
+        f'echo "== autopsy: pid $p still running after {AUTOPSY_AFTER_S} s"; '
+        "cat /proc/$p/status; echo == udp; cat /proc/net/udp; echo == tcp; cat /proc/net/tcp; "
+        "echo == dev; cat /proc/net/dev; fi; wait $p )"
+    )
+
 # A kernel log line on the console: `[ <secs>.<us> LEVEL <cpu> <pid>:<tid>
 # <target>] <message>`, once its colours are stripped. Not anchored to a line
 # start: the console interleaves it with whatever userspace was printing, and
@@ -260,6 +294,8 @@ def main():
             def guest_command(self, name):
                 if name in unprivileged:
                     return "su -s /bin/sh nobody -c " + shlex.quote(name)
+                if name in AUTOPSY:
+                    return autopsy_command(name)
                 return super().guest_command(name)
 
         framework.TestRunner = BootedRunner
