@@ -1040,29 +1040,19 @@ mod cableado_tests {
         );
     }
 
-    /// Y fuera de x86_64 tiene que ser un error, no un silencio: las sondas
-    /// viven en `memory_x86_64.rs`, asi que pedirla en otro arco daria una
-    /// imagen sin depuracion de memoria y con cara de tenerla.
+    /// Y en las otras dos arquitecturas tiene que llegar igual: hasta la
+    /// tanda 16 las sondas solo vivian en `memory_x86_64.rs` y pedirla en
+    /// aarch64 o riscv64 era un `$(error)`; ahora `memory.rs` lleva las suyas
+    /// (cuarentena, canario, candado y validador del buddy), asi que un
+    /// `MEM_DEBUG=1` en riscv64 que NO encendiera la feature daria una imagen
+    /// sin depuracion de memoria y con cara de tenerla.
     #[test]
-    fn mem_debug_fuera_de_x86_64_es_un_error() {
-        for arch in ["aarch64", "riscv64"] {
-            let out = Command::new("make")
-                .current_dir(crate::PROJECT_DIR.join("zCore"))
-                .arg("--no-print-directory")
-                .arg("--eval=print-%: ; @echo $($*)")
-                .arg("print-features")
-                .args([&format!("ARCH={arch}"), "MEM_DEBUG=1"])
-                .output()
-                .expect("make no se ha podido ejecutar");
+    fn mem_debug_llega_a_la_feature_en_las_tres_arquitecturas() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let con = zcore_features(&[&format!("ARCH={arch}"), "MEM_DEBUG=1"]);
             assert!(
-                !out.status.success(),
-                "MEM_DEBUG=1 ARCH={arch} tenia que fallar y salio bien: {}",
-                String::from_utf8_lossy(&out.stdout)
-            );
-            let err = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                err.contains("MEM_DEBUG"),
-                "el error no nombra MEM_DEBUG: {err}"
+                con.split_whitespace().any(|f| f == "mem-debug"),
+                "MEM_DEBUG=1 ARCH={arch} no llego a la feature: {con}"
             );
         }
     }
