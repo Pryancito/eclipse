@@ -14,7 +14,7 @@ trap_entry:
     bnez sp, trap_from_user
 trap_from_kernel:
     csrr sp, sscratch
-    addi sp, sp, -34 * XLENB
+    addi sp, sp, -FRAME_WORDS * XLENB
     # sscratch = previous-sp, sp = kernel-sp
 trap_from_user:
     # save general registers except sp(x2)
@@ -56,6 +56,53 @@ trap_from_user:
     STORE_SP t0, 2          # save sp
     STORE_SP t1, 32         # save sstatus
     STORE_SP t2, 33         # save sepc
+
+.ifdef HAS_FP
+    # Save the floating-point state. Nothing saved it before, and user mode
+    # runs with `sstatus.FS` set, so two guest threads on one hart overwrote
+    # each other's `f` registers and `fcsr`. See `FpRegs`.
+    #
+    # `t1` still holds the sstatus just read, and the branch below reuses it
+    # for the SPP test, so `fcsr` goes through `t0`, which is free now that
+    # the saved sp is in the frame.
+    STORE_FP f0, 34
+    STORE_FP f1, 35
+    STORE_FP f2, 36
+    STORE_FP f3, 37
+    STORE_FP f4, 38
+    STORE_FP f5, 39
+    STORE_FP f6, 40
+    STORE_FP f7, 41
+    STORE_FP f8, 42
+    STORE_FP f9, 43
+    STORE_FP f10, 44
+    STORE_FP f11, 45
+    STORE_FP f12, 46
+    STORE_FP f13, 47
+    STORE_FP f14, 48
+    STORE_FP f15, 49
+    STORE_FP f16, 50
+    STORE_FP f17, 51
+    STORE_FP f18, 52
+    STORE_FP f19, 53
+    STORE_FP f20, 54
+    STORE_FP f21, 55
+    STORE_FP f22, 56
+    STORE_FP f23, 57
+    STORE_FP f24, 58
+    STORE_FP f25, 59
+    STORE_FP f26, 60
+    STORE_FP f27, 61
+    STORE_FP f28, 62
+    STORE_FP f29, 63
+    STORE_FP f30, 64
+    STORE_FP f31, 65
+    .option push
+    .option arch, +f
+    frcsr t0
+    .option pop
+    STORE_SP t0, 66
+.endif
 
     andi t1, t1, 1 << 8     # sstatus.SPP = 1
     beqz t1, end_trap_from_user
@@ -120,6 +167,49 @@ run_user:
     csrw sscratch, sp       # sscratch = bottom of trap frame
 
 trap_return:
+.ifdef HAS_FP
+    # Restore the floating-point state saved on the way in, before `sstatus`
+    # is written: these instructions need THIS hart's `FS`, which the kernel
+    # has set, not the one the frame is about to install. Restoring after the
+    # write would fault for any context whose own `FS` is Off.
+    LOAD_SP t0, 66
+    .option push
+    .option arch, +f
+    fscsr t0
+    .option pop
+    LOAD_FP f0, 34
+    LOAD_FP f1, 35
+    LOAD_FP f2, 36
+    LOAD_FP f3, 37
+    LOAD_FP f4, 38
+    LOAD_FP f5, 39
+    LOAD_FP f6, 40
+    LOAD_FP f7, 41
+    LOAD_FP f8, 42
+    LOAD_FP f9, 43
+    LOAD_FP f10, 44
+    LOAD_FP f11, 45
+    LOAD_FP f12, 46
+    LOAD_FP f13, 47
+    LOAD_FP f14, 48
+    LOAD_FP f15, 49
+    LOAD_FP f16, 50
+    LOAD_FP f17, 51
+    LOAD_FP f18, 52
+    LOAD_FP f19, 53
+    LOAD_FP f20, 54
+    LOAD_FP f21, 55
+    LOAD_FP f22, 56
+    LOAD_FP f23, 57
+    LOAD_FP f24, 58
+    LOAD_FP f25, 59
+    LOAD_FP f26, 60
+    LOAD_FP f27, 61
+    LOAD_FP f28, 62
+    LOAD_FP f29, 63
+    LOAD_FP f30, 64
+    LOAD_FP f31, 65
+.endif
     LOAD_SP t0, 32          # t0 = sstatus
     LOAD_SP t1, 33          # t1 = sepc
     csrw sstatus, t0        # load sstatus
