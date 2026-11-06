@@ -75,7 +75,9 @@ unsafe impl GlobalAlloc for LockedHeap {
         // See `redzone`: with `mem-debug` every block carries a canary after
         // its payload, checked when the block is freed.
         #[cfg(feature = "mem-debug")]
-        let padded = redzone::grow(layout);
+        let Some(padded) = redzone::grow(layout) else {
+            handle_alloc_error(layout)
+        };
         #[cfg(not(feature = "mem-debug"))]
         let padded = layout;
         // Bind the allocation to a local so the heap lock (a temporary
@@ -129,7 +131,8 @@ unsafe impl GlobalAlloc for LockedHeap {
         #[cfg(feature = "mem-debug")]
         let layout = {
             redzone::check(ptr, layout);
-            redzone::grow(layout)
+            // The block was handed out with this padded layout, so it exists.
+            redzone::grow(layout).expect("a freed block was allocated with its redzone")
         };
         // See `quarantine`: with `mem-debug` the block is poisoned and parked,
         // and what reaches the buddy is whatever the parking evicted.
@@ -688,10 +691,12 @@ mod redzone {
     const CANARY: u8 = 0xAB;
 
     /// The layout the buddy is asked for: the caller's, plus the canary.
-    pub fn grow(layout: Layout) -> Layout {
-        // SAFETY: the size cannot overflow `isize` by adding 16 to a size the
-        // caller already built a valid layout from, short of the pathological.
-        unsafe { Layout::from_size_align_unchecked(layout.size() + REDZONE, layout.align()) }
+    /// `None` when the padded size is not a layout any more (a request
+    /// within 16 bytes of `isize::MAX`): the caller takes the
+    /// allocation-failure path, as the buddy would have.
+    pub fn grow(layout: Layout) -> Option<Layout> {
+        let size = layout.size().checked_add(REDZONE)?;
+        Layout::from_size_align(size, layout.align()).ok()
     }
 
     /// Write the canary after `size` payload bytes at `ptr`.
@@ -953,14 +958,25 @@ mod quarantine {
     /// a ring switched off for good: 1024 parked frames reached the 4 MiB
     /// budget early in boot and every free after that went straight to the
     /// buddy unchecked. Evicting instead keeps the ring turning.
+    ///
+    /// The oldest block is the first occupied slot from `next` onwards: the
+    /// slot `next` itself once the ring has wrapped, and slot 0 while it is
+    /// still filling, when `next` and everything after it are empty. The
+    /// first version took `next` unconditionally, so during the fill it hit
+    /// an empty slot, returned `None` and stopped draining: 1025 parked
+    /// 64 KiB frames passed the budget long before 4096 parkings, and the
+    /// ring kept growing to its full 256 MiB. The slot is emptied in place,
+    /// without moving `next`: the parking that lands on that hole later
+    /// evicts `EMPTY`, which `park` already treats as nothing.
     pub fn over_budget() -> Option<Parked> {
         if HELD.load(Ordering::Relaxed) <= BUDGET {
             return None;
         }
         let oldest = {
             let mut ring = RING.lock();
-            let slot = ring.next;
-            ring.next = (slot + 1) % SLOTS;
+            let slot = (0..SLOTS)
+                .map(|i| (ring.next + i) % SLOTS)
+                .find(|&i| ring.slots[i].addr != 0)?;
             let oldest = core::mem::replace(&mut ring.slots[slot], EMPTY);
             if is_frame(&oldest) {
                 mark_page(oldest.addr, false);
@@ -1216,12 +1232,17 @@ pub fn heap_wild_bytes() -> usize {
 
 /// Freed frames found written after their free (mirrors
 /// `memory_x86_64::heap_written_after_free`). Counted by the `mem-debug`
-/// frame quarantine; the default build does not check.
+/// frame quarantine, both ways it can notice: at eviction
+/// (`WRITTEN_AFTER_FREE`) and by the rolling sweep (`WRITTEN_WHILE_PARKED`),
+/// which re-poisons the block so the eviction will not count that write
+/// again. The default build does not check.
 #[allow(dead_code)]
 pub fn heap_written_after_free() -> u32 {
     #[cfg(feature = "mem-debug")]
     {
-        quarantine::WRITTEN_AFTER_FREE.load(Ordering::Relaxed)
+        quarantine::WRITTEN_AFTER_FREE
+            .load(Ordering::Relaxed)
+            .saturating_add(quarantine::WRITTEN_WHILE_PARKED.load(Ordering::Relaxed))
     }
     #[cfg(not(feature = "mem-debug"))]
     {

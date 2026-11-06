@@ -2274,6 +2274,12 @@ impl VMObjectPagedInner {
                                 new_frame.tag = PageStateTag::Owned;
                                 let new_key = i - other_child.parent_offset / PAGE_SIZE;
                                 other_child.frames.insert(new_key, new_frame);
+                            } else {
+                                // Not the sibling's to keep, but possibly
+                                // still in a leaf's page table until the
+                                // caller's unmap pass: same grave as the
+                                // out-of-range frames above.
+                                graveyard.push(new_frame.take());
                             }
                         }
                     }
@@ -2393,6 +2399,12 @@ impl VMObjectPagedInner {
                         if to_insert.tag != tag.negate() {
                             to_insert.tag = PageStateTag::Owned;
                             other_inner.frames.insert(idx - start, to_insert);
+                        } else {
+                            // The sibling already split its own copy, so this
+                            // frame is nobody's -- but the mapping that is
+                            // shrinking may still point at it until the
+                            // caller unmaps. Into the grave, not dropped here.
+                            graveyard.push(to_insert.take());
                         }
                         unwanted.push_back(idx + parent_inner.parent_offset / PAGE_SIZE);
                     }
