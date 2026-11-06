@@ -47,8 +47,11 @@ pub struct TrapFrame {
     /// Software Thread ID Register, tpidr_el1
     pub tpidr: usize,
     /// General registers
-    /// Must be last in this struct
     pub general: GeneralRegs,
+    /// Floating-point and SIMD registers, `fpcr` and `fpsr`. See [`FpRegs`].
+    /// Must be last in this struct: the top of the frame (`FP_OFF` in
+    /// `trap.S`).
+    pub fp: FpRegs,
 }
 
 /// The contract between [`TrapFrame`] and `trap.S`.
@@ -56,7 +59,8 @@ pub struct TrapFrame {
 /// `__alltraps` builds this frame with `stp` pairs and then reaches into it at
 /// *literal* byte offsets: `[sp, #32]` for `sp`, `[sp, #40]` for `tpidr`,
 /// `[sp, #8]` for the kernel stack pointer that `run_user` stashes in
-/// `__reserved`, and `add x1, sp, #38*8` for the whole frame. Reorder two
+/// `__reserved`, `add x1, sp, #FP_OFF` (38 words) for the floating-point area
+/// and `add x1, sp, #FRAME_BYTES` (104 words) for the whole frame. Reorder two
 /// fields and the assembler keeps assembling, while every trap starts reading
 /// and writing the wrong words.
 ///
@@ -98,16 +102,34 @@ const _: () = {
         "the general registers start at byte 48"
     );
 
-    // `add x1, sp, #38*8` computes the interrupted sp from the top of the
-    // frame, so a field added anywhere makes it point into the frame instead.
+    // `SAVE_FP`/`LOAD_FP` reach the floating-point area at `FP_OFF` = 38
+    // words, right after the general registers, and `HANDLER` reserves
+    // `FP_BYTES` = 66 words for it at the top of the frame.
     assert!(
-        size_of::<TrapFrame>() == 38 * 8,
-        "the frame is no longer the 38 words the `add x1, sp, #38*8` steps over"
+        offset_of!(TrapFrame, fp) == 38 * 8,
+        "the floating-point area is no longer at the `FP_OFF` trap.S uses"
+    );
+    assert!(
+        size_of::<FpRegs>() == 66 * 8,
+        "the floating-point area is no longer the `FP_BYTES` trap.S reserves"
+    );
+    assert!(
+        offset_of!(FpRegs, q) == 0
+            && offset_of!(FpRegs, fpcr) == 64 * 8
+            && offset_of!(FpRegs, fpsr) == 65 * 8,
+        "fpcr and fpsr are stored as the pair after the 64 doublewords of q0-q31"
+    );
+    // `add x1, sp, #FRAME_BYTES` computes the interrupted sp from the top of
+    // the frame, so a field added anywhere makes it point into the frame
+    // instead.
+    assert!(
+        size_of::<TrapFrame>() == 104 * 8,
+        "the frame is no longer the 104 words the `add x1, sp, #FRAME_BYTES` steps over"
     );
     // What the doc comment above asks for in prose, checked.
     assert!(
-        offset_of!(TrapFrame, general) + size_of::<GeneralRegs>() == size_of::<TrapFrame>(),
-        "the general registers are no longer last in the struct"
+        offset_of!(TrapFrame, fp) + size_of::<FpRegs>() == size_of::<TrapFrame>(),
+        "the floating-point area is no longer last in the struct"
     );
 
     // `run_user` is declared here as taking `&mut UserContext`, while `trap.S`
@@ -145,6 +167,10 @@ const _: () = {
     assert!(
         offset_of!(TrapFrame, general) == offset_of!(UserContext, general),
         "general"
+    );
+    assert!(
+        offset_of!(TrapFrame, fp) == offset_of!(UserContext, fp),
+        "fp"
     );
 };
 

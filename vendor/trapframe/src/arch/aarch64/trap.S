@@ -1,5 +1,75 @@
 .section .text
 
+# The frame: 38 words (trap num, kernel sp, elr, spsr, sp, tpidr and the 32
+# general registers) and then the floating-point area, 66 words: q0-q31 as
+# 64 doublewords, fpcr, fpsr. FP_OFF is where the area starts, FP_BYTES its
+# size, FRAME_BYTES the whole thing -- `TrapFrame`/`UserContext` in trap.rs
+# assert the same numbers.
+#
+# Why the floating-point registers are saved on EVERY trap, user or kernel:
+# the kernel is built with `+neon,+fp-armv8` (zCore/aarch64.json) and the
+# compiler hands q registers to its memcpy, struct copies and loops --
+# thirty-eight thousand SIMD instructions in the release kernel -- while
+# CPACR_EL1 leaves the unit untrapped, so every syscall and every interrupt
+# used to clobber whatever the interrupted code, user or kernel, had in
+# q0-q31. musl's memcpy/strlen/memchr on aarch64 live in those registers;
+# a timer tick in the middle of one came back with another thread's halves.
+.equ FP_OFF, 38 * 8
+.equ FP_BYTES, 66 * 8
+.equ FRAME_BYTES, FP_OFF + FP_BYTES
+
+# Save q0-q31, fpcr and fpsr into the area at FP_OFF(sp). Clobbers x1-x3,
+# which are already in the frame when this runs.
+.macro SAVE_FP
+    add     x1, sp, #FP_OFF
+    stp     q0, q1, [x1, #0]
+    stp     q2, q3, [x1, #32]
+    stp     q4, q5, [x1, #64]
+    stp     q6, q7, [x1, #96]
+    stp     q8, q9, [x1, #128]
+    stp     q10, q11, [x1, #160]
+    stp     q12, q13, [x1, #192]
+    stp     q14, q15, [x1, #224]
+    stp     q16, q17, [x1, #256]
+    stp     q18, q19, [x1, #288]
+    stp     q20, q21, [x1, #320]
+    stp     q22, q23, [x1, #352]
+    stp     q24, q25, [x1, #384]
+    stp     q26, q27, [x1, #416]
+    stp     q28, q29, [x1, #448]
+    stp     q30, q31, [x1, #480]
+    mrs     x2, fpcr
+    mrs     x3, fpsr
+    # `stp` takes a signed 7-bit scaled offset (at most 504): two `str`s.
+    str     x2, [x1, #512]
+    str     x3, [x1, #520]
+.endm
+
+# The mirror of SAVE_FP. Clobbers x1-x3, which are restored afterwards.
+.macro LOAD_FP
+    add     x1, sp, #FP_OFF
+    ldr     x2, [x1, #512]
+    ldr     x3, [x1, #520]
+    msr     fpcr, x2
+    msr     fpsr, x3
+    ldp     q0, q1, [x1, #0]
+    ldp     q2, q3, [x1, #32]
+    ldp     q4, q5, [x1, #64]
+    ldp     q6, q7, [x1, #96]
+    ldp     q8, q9, [x1, #128]
+    ldp     q10, q11, [x1, #160]
+    ldp     q12, q13, [x1, #192]
+    ldp     q14, q15, [x1, #224]
+    ldp     q16, q17, [x1, #256]
+    ldp     q18, q19, [x1, #288]
+    ldp     q20, q21, [x1, #320]
+    ldp     q22, q23, [x1, #352]
+    ldp     q24, q25, [x1, #384]
+    ldp     q26, q27, [x1, #416]
+    ldp     q28, q29, [x1, #448]
+    ldp     q30, q31, [x1, #480]
+.endm
+
 .global __alltraps
 __alltraps:
     # x30 and x0 are saved in __vectors
@@ -32,6 +102,9 @@ __alltraps:
     # save trap num
     str     x0, [sp, #-16]!
 
+    # the floating-point state, user's or kernel's
+    SAVE_FP
+
     # check source is 2
     mov     x1, #0x3
     and     x1, x1, x0
@@ -41,7 +114,7 @@ __alltraps:
 trap_from_kernel:
     # read tpidr and sp
     mrs     x2, tpidr_el1
-    add     x1, sp, #38*8
+    add     x1, sp, #FRAME_BYTES
     stp     x1, x2, [sp, #32]
     # go to rust
     mov     x0, sp
@@ -73,7 +146,9 @@ trap_from_user:
 
 .macro HANDLER source kind
     .align 7
-    # sp is set to SP_EL1 upon trap
+    # sp is set to SP_EL1 upon trap. Reserve the floating-point area first
+    # (see FP_BYTES): it is the top of the frame, above `lr, x0`.
+    sub     sp, sp, #FP_BYTES
     stp     lr, x0, [sp, #-16]!
     mov     x0, #\source
     movk    x0, #\kind, lsl #16
@@ -123,6 +198,9 @@ run_user:
 
 trap_return:
     # sp points to TrapFrame
+    # the floating-point state first, while sp is still the frame base
+    LOAD_FP
+
     # skip trap num, don't restore
     add     sp, sp, #16
 
@@ -151,6 +229,9 @@ trap_return:
     ldp     x27, x28, [sp], #16
     ldr     x29, [sp], #16
     ldp     lr, x0, [sp], #16
+
+    # step over the floating-point area: sp is the top of the frame again
+    add     sp, sp, #FP_BYTES
 
     # return
     eret

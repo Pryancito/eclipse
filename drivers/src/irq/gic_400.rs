@@ -187,7 +187,16 @@ impl IntController {
     /// `0xffff_ffff` to EOIR. SPIs are unaffected either way: their CPUID
     /// field is zero, so the word *is* the id.
     pub fn pending_irq(&self) -> usize {
-        let iar = unsafe { self.gicc.read(GICC_IAR) as usize };
+        self.gicc.pending_irq()
+    }
+}
+
+impl GicCpuIf {
+    /// Acknowledge the highest-priority pending interrupt (`GICC_IAR`) and
+    /// return its id word, or `usize::MAX` for a spurious one. See
+    /// [`IntController::pending_irq`] for the shape of the word.
+    fn pending_irq(&self) -> usize {
+        let iar = unsafe { self.read(GICC_IAR) as usize };
         if iar & 0x3ff >= 0x3fe {
             usize::MAX
         } else {
@@ -300,8 +309,19 @@ pub fn init(gicc_base: usize, gicd_base: usize) -> IntController {
     controller
 }
 
-pub fn get_irq_num(gicc_base: usize, gicd_base: usize) -> usize {
-    IntController::new(gicc_base, gicd_base).pending_irq()
+/// The id of the interrupt being taken, straight from the CPU interface.
+///
+/// Reached from `trap_handler` on EVERY interrupt. It used to build a whole
+/// `IntController` to ask it: a 16 KiB handler table on the interrupt stack,
+/// an `IdAllocator` on the heap, a `Mutex`, and the free of all that on the
+/// way out -- two trips through the global heap lock per interrupt, taken
+/// with interrupts masked, on the path that every timer tick and every
+/// console byte goes through. Sampled on the aarch64 libc-test image under
+/// QEMU (6 CPUs on a 4-core host), the buddy allocator called from here was
+/// one of the three places the heap lock was found HELD while the other five
+/// CPUs spun on it. The question needs one register read.
+pub fn get_irq_num(gicc_base: usize, _gicd_base: usize) -> usize {
+    GicCpuIf { address: gicc_base }.pending_irq()
 }
 
 #[cfg(test)]
@@ -618,6 +638,37 @@ mod tests {
         let ctrl = gic.controller();
         ctrl.handle_irq(UART_SPI as usize);
         assert_eq!(gic.gicc_reg(GICC_EOIR), UART_SPI);
+    }
+
+    #[test]
+    fn the_trap_entry_reads_the_pending_id_off_the_cpu_interface_alone() {
+        // `get_irq_num` is what `trap_handler` calls on every interrupt. It
+        // answers from GICC_IAR and nothing else: no controller, no handler
+        // table, no allocation. The fake's distributor is left zeroed on
+        // purpose, so a `get_irq_num` that went back to building an
+        // `IntController` would still assemble, but would be doing the
+        // 16 KiB table and the heap trip again on every tick.
+        let mut gic = FakeGic::new();
+        let gicc = gic.gicc.as_mut_ptr() as usize;
+        let gicd = gic.gicd.as_ptr() as usize;
+
+        gic.gicc[GICC_IAR as usize / 4] = UART_SPI;
+        assert_eq!(get_irq_num(gicc, gicd), UART_SPI as usize);
+
+        // An SGI's word carries the sender in bits [12:10] and is returned
+        // whole, the way `handle_irq` wants it back at EOIR.
+        gic.gicc[GICC_IAR as usize / 4] = 0x400 | IPI_SGI;
+        assert_eq!(get_irq_num(gicc, gicd), (0x400 | IPI_SGI) as usize);
+
+        // 1022 and 1023 are the spurious ids, whatever the CPUID field says.
+        for spurious in [0x3fe, 0x3ff, 0x400 | 0x3ff] {
+            gic.gicc[GICC_IAR as usize / 4] = spurious;
+            assert_eq!(
+                get_irq_num(gicc, gicd),
+                usize::MAX,
+                "IAR {spurious:#x} is spurious"
+            );
+        }
     }
 
     /// A handler that counts its calls.
