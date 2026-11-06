@@ -28,16 +28,27 @@ extern "sysv64" {
     /// The way back into the kernel for a guest that faulted.
     ///
     /// Not callable from Rust: it is the address a fault catcher points the
-    /// guest's instruction pointer at, after laying [`FAULT_FRAME_WORDS`]
-    /// words below the guest's stack pointer. See the asm for the layout.
+    /// guest's instruction pointer at, with the stack pointer at a frame of
+    /// [`FAULT_FRAME_WORDS`] words it laid somewhere of its own. See the asm
+    /// for the layout.
     pub fn fault_fn_entry();
 }
 
-/// How many words a fault catcher places below the guest's stack pointer
-/// before jumping to [`fault_fn_entry`], and so how far it must move that
-/// pointer down. The words are, from the guest's stack pointer downwards: the
-/// guest's `r11`, the faulting `rip`, the x86 trap vector, and the error code.
-pub const FAULT_FRAME_WORDS: usize = 4;
+/// How many words a fault catcher lays before jumping to [`fault_fn_entry`],
+/// with the stack pointer at the first. In order: the error code, the x86
+/// trap vector, the faulting `rip`, the guest's `r11`, and the guest's own
+/// `rsp`.
+///
+/// The frame is NOT on the guest's stack. It used to be laid just below the
+/// guest's stack pointer, which is memory the guest owns twice over: the
+/// SysV ABI gives a leaf function the 128 bytes under `rsp` as a red zone, so
+/// a fault in one lost whatever lived there; and a Zircon thread that exits
+/// detached unmaps its own stack first and makes the exit syscall with `rsp`
+/// still pointing into the hole (`C11ThreadTest.SelfDetachAndFree`), so the
+/// catcher's write faulted inside the catcher and the whole process went.
+/// Real hardware writes a trap frame on the KERNEL's stack and touches the
+/// guest's not at all; the catcher now does the same with a stack of its own.
+pub const FAULT_FRAME_WORDS: usize = 5;
 
 impl UserContext {
     /// Go to user context by function return, within the same privilege level.
@@ -273,46 +284,48 @@ syscall_fn_entry:
     # The way back for a guest that FAULTED rather than made a syscall.
     #
     # Jumped to (not called) with the guest's registers as they were at the
-    # fault, with four words placed below the guest's stack pointer by whoever
-    # caught the fault -- on a libos host, the signal handler, from the
-    # `ucontext` the kernel handed it:
+    # fault, except rsp, which points at five words laid by whoever caught the
+    # fault -- on a libos host, the signal handler, from the `ucontext` the
+    # kernel handed it -- on memory of the catcher's own, never the guest's
+    # (see `FAULT_FRAME_WORDS` for why):
     #
-    #   [guest_rsp - 8]   guest r11      (this code needs r11 as scratch, and
-    #                                     the frame must still carry the real
-    #                                     one: a Zircon exception report hands
-    #                                     the thread's registers to a debugger)
-    #   [guest_rsp - 16]  guest rip      (where the fault happened)
-    #   [guest_rsp - 24]  trap_num       (the x86 vector: 6 for #UD, 13 for
-    #                                     #GP, and so on)
-    #   [guest_rsp - 32]  error_code
+    #   [rsp]        error_code
+    #   [rsp + 8]    trap_num       (the x86 vector: 6 for #UD, 13 for #GP,
+    #                                and so on)
+    #   [rsp + 16]   guest rip      (where the fault happened)
+    #   [rsp + 24]   guest r11      (this code needs r11 as scratch, and the
+    #                                frame must still carry the real one: a
+    #                                Zircon exception report hands the
+    #                                thread's registers to a debugger)
+    #   [rsp + 32]   guest rsp      (as it was at the fault)
     #
-    # and with rsp = guest_rsp - 32. Everything after that is `syscall_fn_entry`
-    # with the rip and r11 taken from those words instead of from the call, and
-    # with trap_num/error_code written into the frame on the way past them.
+    # Everything after that is `syscall_fn_entry` with the rip, r11 and rsp
+    # taken from those words instead of from the call, and with
+    # trap_num/error_code written into the frame on the way past them.
 fault_fn_entry:
-    lea r11, [rsp + 32]     # r11 = the guest's rsp at the fault
+    mov r11, rsp            # r11 = the catcher's frame
 
     SWITCH_TO_KERNEL_STACK
     pop rsp                 # rsp = &UserContext
     lea rsp, [rsp + 22*8]   # one past error_code
-    push [r11 - 32]         # error_code
-    push [r11 - 24]         # trap_num
+    push [r11]              # error_code
+    push [r11 + 8]          # trap_num
                             # rsp = top of trap frame (struct GeneralRegs)
 
     # push trap frame (struct GeneralRegs)
     push 0                  # ignore gs_base
     PUSH_USER_FSBASE
     pushfq                  # push rflags
-    push [r11 - 16]         # push rip
+    push [r11 + 16]         # push rip
     push r15
     push r14
     push r13
     push r12
-    push [r11 - 8]          # push the guest's own r11
+    push [r11 + 24]         # push the guest's own r11
     push r10
     push r9
     push r8
-    push r11                # push rsp
+    push [r11 + 32]         # push the guest's own rsp
     push rbp
     push rdi
     push rsi
@@ -522,25 +535,32 @@ dump_registers:
     global_asm!(".set _fault_from_guest, fault_from_guest");
 
     // Mock guest that does what a fault catcher does on its behalf: lay the
-    // four words below its own stack pointer and jump. `r11` is pushed BEFORE
-    // it is clobbered, so the frame still carries the guest's own value.
+    // five words on a stack of its own (`fault_frame`, which is not the
+    // guest's) and jump with rsp at them. `r11` is stored BEFORE it is
+    // clobbered, so the frame still carries the guest's own value.
     global_asm!(
         r#"
 fault_from_guest:
-    push r11                # [guest_rsp - 8]  = the guest's own r11
+    mov [rip + fault_frame + 32], rsp    # the guest's own rsp
+    mov [rip + fault_frame + 24], r11    # the guest's own r11
     lea r11, [rip + 2f]
-    push r11                # [guest_rsp - 16] = the faulting rip
-    push 6                  # [guest_rsp - 24] = trap_num: #UD
-    push 0                  # [guest_rsp - 32] = error_code
+    mov [rip + fault_frame + 16], r11    # the faulting rip
+    mov qword ptr [rip + fault_frame + 8], 6   # trap_num: #UD
+    mov qword ptr [rip + fault_frame], 0       # error_code
+    lea rsp, [rip + fault_frame]
     jmp fault_fn_entry
 2:
 "#
     );
 
+    #[no_mangle]
+    #[allow(non_upper_case_globals)]
+    static mut fault_frame: [u64; FAULT_FRAME_WORDS] = [0; FAULT_FRAME_WORDS];
+
     /// The way back for a guest that faulted: the frame must come back with
     /// the fault's cause, the guest's registers as they were -- `r11`
     /// included, which the entry needs as scratch -- and the guest's own stack
-    /// pointer, not the one with the catcher's four words under it.
+    /// pointer, not the catcher's frame the entry was reached with.
     #[test]
     fn run_fncall_returning_from_a_fault() {
         extern "sysv64" {

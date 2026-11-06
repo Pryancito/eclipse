@@ -38,9 +38,17 @@ pub struct Channel {
 type T = MessagePacket;
 type TxID = u32;
 
-/// How many messages one endpoint holds unread before a writer is told to
-/// wait: Zircon's `kMaxPendingMessageCount`. Without it a process that
-/// nobody reads from could put the whole kernel heap into one channel.
+/// How many messages one endpoint may hold unread before the writer that
+/// put one more there is told about it: Zircon's `kMaxPendingMessageCount`.
+///
+/// The message past the limit is still queued -- `zx_channel_write` succeeds
+/// -- and the writing thread gets a `ZX_EXCP_POLICY_ERROR` with
+/// `ZX_EXCP_POLICY_CODE_CHANNEL_FULL_WRITE`, which kills the process unless
+/// a handler lets it carry on. That is what keeps a process nobody reads from
+/// out of the kernel heap: `ChannelTest.ChannelFullException` writes until
+/// it is killed and then waits for the process to be gone. Refusing the
+/// write with `SHOULD_WAIT`, which is what this used to do, left that test
+/// waiting for ever: the writer stopped and nobody killed it.
 pub const MAX_PENDING_MESSAGE_COUNT: usize = 3500;
 
 /// Transaction ids the kernel hands out for `call` live in the upper half;
@@ -108,6 +116,14 @@ impl Channel {
 
     /// Write a packet to the channel
     pub fn write(&self, msg: T) -> ZxResult {
+        self.write_counted(msg).map(|_| ())
+    }
+
+    /// Write a packet to the channel and say how many the peer now holds
+    /// unread, so the caller can tell whether this one went past
+    /// [`MAX_PENDING_MESSAGE_COUNT`]. A reply that a parked `call` took
+    /// counts as nothing pending.
+    pub fn write_counted(&self, msg: T) -> ZxResult<usize> {
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         // check first 4 bytes: whether it is a call reply?
         let txid = msg.get_txid();
@@ -126,7 +142,7 @@ impl Channel {
             // that is where it goes. The answer used to be `let _ =`: the
             // message vanished and the endpoint never saw it.
             return match sender.send(Ok(msg)) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(0),
                 // The value comes back exactly as it was sent.
                 Err(Ok(msg)) => peer.push_general(msg),
                 Err(Err(e)) => Err(e),
@@ -173,17 +189,16 @@ impl Channel {
         reply
     }
 
-    /// Push a message to general queue, called from peer.
-    fn push_general(&self, msg: T) -> ZxResult {
+    /// Push a message to general queue, called from peer. Answers how many
+    /// are queued with it, the limit included: see
+    /// [`MAX_PENDING_MESSAGE_COUNT`] for why none is ever refused.
+    fn push_general(&self, msg: T) -> ZxResult<usize> {
         let mut send_queue = self.recv_queue.lock();
-        if send_queue.len() >= MAX_PENDING_MESSAGE_COUNT {
-            return Err(ZxError::SHOULD_WAIT);
-        }
         send_queue.push_back(msg);
         if send_queue.len() == 1 {
             self.base.signal_set(Signal::READABLE);
         }
-        Ok(())
+        Ok(send_queue.len())
     }
 
     /// Generate a new transaction ID for `call`.
@@ -522,36 +537,42 @@ mod tests {
         );
     }
 
-    /// A writer whose peer never reads used to grow the kernel heap without
-    /// limit; the endpoint now holds `MAX_PENDING_MESSAGE_COUNT` unread and
-    /// tells the writer to wait, for `write` and `call` alike, and a `call`
-    /// that was refused leaves no reply slot behind.
+    /// A writer whose peer never reads is not refused -- Zircon queues the
+    /// message and raises a policy exception in the writer instead, which is
+    /// the syscall layer's job -- but every write says how many the peer
+    /// holds, so the one past `MAX_PENDING_MESSAGE_COUNT` can be told apart.
+    /// The count is of the peer's unread messages: reading one makes room,
+    /// and a reply a parked `call` takes is never pending.
     #[test]
-    fn an_endpoint_holds_at_most_the_pending_limit_unread() {
+    fn every_write_reports_how_many_the_peer_holds_unread() {
         let (channel0, channel1) = Channel::create();
-        for _ in 0..MAX_PENDING_MESSAGE_COUNT {
-            channel0.write(message(b"fill")).unwrap();
+        for n in 1..=MAX_PENDING_MESSAGE_COUNT {
+            assert_eq!(channel0.write_counted(message(b"fill")).unwrap(), n);
         }
         assert_eq!(
-            channel0.write(message(b"one too many")),
-            Err(ZxError::SHOULD_WAIT)
-        );
-        let mut call: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>>>> =
-            Box::pin(channel0.call(message(b"call")));
-        assert_eq!(
-            call.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .map(|r| r.map(|_| ())),
-            Poll::Ready(Err(ZxError::SHOULD_WAIT))
-        );
-        drop(call);
-        assert!(
-            channel0.call_reply.lock().is_empty(),
-            "a refused call keeps no reply slot"
+            channel0.write_counted(message(b"one too many")).unwrap(),
+            MAX_PENDING_MESSAGE_COUNT + 1,
+            "the message past the limit is queued, not refused"
         );
         assert_eq!(channel1.read().unwrap().data, b"fill");
-        channel0.write(message(b"room again")).unwrap();
-        assert_eq!(channel1.recv_queue.lock().len(), MAX_PENDING_MESSAGE_COUNT);
+        assert_eq!(
+            channel0.write_counted(message(b"room again")).unwrap(),
+            MAX_PENDING_MESSAGE_COUNT + 1
+        );
+
+        let (caller, callee) = Channel::create();
+        let mut call: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>>>> =
+            Box::pin(caller.call(message(b"call")));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let request = callee.read().unwrap();
+        assert_eq!(
+            callee.write_counted(request).unwrap(),
+            0,
+            "a reply the parked call takes is not pending on the endpoint"
+        );
     }
 
     /// Every timed-out `zx_channel_call` used to leave its reply slot in the

@@ -24,7 +24,43 @@
 //! turns `UndefinedInstruction` into an exception on exactly that channel.
 //! The only missing piece is the one here -- the handler that catches the
 //! host signal and makes the guest's return look like a trap.
+//!
+//! # The guest's `syscall` instructions
+//!
+//! The same bridge carries the guest's system calls. A Zircon guest reaches
+//! its kernel through the vDSO, and the real vDSO's stubs are `mov eax, N;
+//! syscall; ret`. On a libos host a `syscall` instruction is a HOST system
+//! call, so the libos build used to boot a vDSO rebuilt with every stub
+//! turned into `mov eax, N; jmp [entry]` -- eleven bytes each where the real
+//! ones are eight. Fuchsia's core tests do not all go through a stub's
+//! public symbol: the internal syscalls (`zx_channel_call_finish` and its
+//! three siblings) have no public symbol, and the test that exercises them
+//! finds its stub by *distance from a public one*, with the distance baked in
+//! from the real vDSO's layout (`vdso-code.h`). On the rebuilt vDSO that
+//! distance lands one byte short, in the last byte of the previous stub's
+//! immediate, and the guest executes `add %bh, %bh` before the jump: `rbx`
+//! comes back from the call corrupted, the SafeStack canary check at the
+//! test's return fails, and the abort takes the whole test binary with it.
+//! Measured with gdb in this container on
+//! `ChannelInternalTest.CallFinishWithoutPreviouslyCallingCallReturnsBadState`:
+//! `rbx` `0x1200269df0` before the call, `0x1200263af0` after.
+//!
+//! So the libos build boots the real vDSO, byte for byte the one baremetal
+//! boots, and [`trap_guest_syscalls`] makes the host refuse every `syscall`
+//! instruction executed from a guest address: a seccomp filter keyed on the
+//! instruction pointer answers `SECCOMP_RET_TRAP`, the host delivers
+//! `SIGSYS` with the guest's registers, and the handler here lays the same
+//! frame it lays for a fault, with the x86 syscall vector in it and
+//! [`SYSCALL_INSTRUCTION`] for the error code, so that the kernel reads the
+//! arguments where a `syscall` instruction leaves them (`r10`, `r12`, `r13`
+//! for the fourth, seventh and eighth) rather than where a `call`ed stub
+//! does. The kernel's own syscalls are never from a guest address and pass
+//! the filter untouched.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::ptr;
@@ -49,13 +85,37 @@ const ARCH_GET_GS: libc::c_int = 0x1004;
 /// one of these is fatal to the thread. `#GP` says "this thread did something
 /// the machine refused" without claiming an address the frame cannot carry,
 /// and the Zircon run loop answers both with a fatal exception.
-const SIGNAL_VECTORS: [(Signal, usize); 5] = [
+///
+/// `SIGSYS` is not a fault: it is what the seccomp filter of
+/// [`trap_guest_syscalls`] turns a guest's `syscall` instruction into, and it
+/// carries the vector the kernel's own `syscall` entry would have written.
+const SIGNAL_VECTORS: [(Signal, usize); 6] = [
     (Signal::SIGILL, 6),   // #UD, invalid opcode
     (Signal::SIGSEGV, 13), // #GP, general protection
     (Signal::SIGBUS, 17),  // #AC, alignment check
     (Signal::SIGFPE, 0),   // #DE, divide error
     (Signal::SIGTRAP, 3),  // #BP, breakpoint
+    (Signal::SIGSYS, SYSCALL_VECTOR),
 ];
+
+/// The `trap_num` the kernel reads as "a system call": what `run_fncall`
+/// writes before every trip out and what `TrapReason::from_x86` answers
+/// `Syscall` to.
+const SYSCALL_VECTOR: usize = 0x100;
+
+/// The error code the bridge writes next to [`SYSCALL_VECTOR`] for a syscall
+/// that arrived through a `syscall` instruction, as opposed to the zero
+/// `run_fncall` writes for one that jumped into the fncall entry from a
+/// `call`ed stub.
+///
+/// The two leave the arguments in different places. A `call`ed stub keeps
+/// the C calling convention: the fourth argument in `rcx`, the seventh and
+/// eighth on the stack where the caller pushed them. The real vDSO's stubs
+/// follow Zircon's x86-64 syscall ABI instead -- `mov %rcx, %r10` because
+/// the instruction overwrites `rcx`, and the seventh and eighth arguments
+/// moved into `r12` and `r13` (saved and restored around the `syscall`) --
+/// and the loader has to know which one it is reading.
+pub const SYSCALL_INSTRUCTION: usize = 1;
 
 /// Install the bridge. Idempotent in effect, and the only thing it does to a
 /// signal the guest cannot have raised is nothing: a fault that did not come
@@ -125,7 +185,24 @@ fn anchor_slot(ss_sp: usize) -> usize {
 /// faulted inside the handler, and with `SA_NODEFER` did it again on top of
 /// itself. The table is checked against `ss_sp` first, so a stack we did not
 /// register is simply not ours and no memory outside it is ever read.
-unsafe fn kernel_fsbase() -> Option<u64> {
+/// What the bridge knows about the host thread the handler runs on.
+struct Anchor {
+    /// The alternate stack `ensure_altstack` registered for it.
+    ss_sp: usize,
+    /// The kernel's own FS base on it.
+    base: u64,
+}
+
+/// The fault frame `fault_fn_entry` reads, for the thread whose alternate
+/// stack starts at `ss_sp`: the words `ensure_altstack` reserved just under
+/// that stack. Only for a stack the bridge registered itself.
+fn fault_frame(ss_sp: usize) -> *mut u64 {
+    (ss_sp - FAULT_FRAME_BYTES) as *mut u64
+}
+
+const FAULT_FRAME_BYTES: usize = trapframe::FAULT_FRAME_WORDS * size_of::<u64>();
+
+unsafe fn anchor() -> Option<Anchor> {
     let mut current = libc::stack_t {
         ss_sp: ptr::null_mut(),
         ss_flags: 0,
@@ -147,7 +224,7 @@ unsafe fn kernel_fsbase() -> Option<u64> {
             0 => return None,
             found if found == ss_sp => {
                 let base = ANCHOR_BASE[slot].load(Ordering::Acquire);
-                return (base != 0).then_some(base);
+                return (base != 0).then_some(Anchor { ss_sp, base });
             }
             _ => {}
         }
@@ -196,10 +273,11 @@ unsafe fn leave_to_the_host(signal: libc::c_int) {
 }
 
 /// The handler. Everything it does is on the `ucontext` the host handed it:
-/// it lays the four words `trapframe::fault_fn_entry` expects below the
-/// guest's stack pointer and points the instruction pointer at that entry, so
-/// the ordinary return from this handler lands in the entry with the guest's
-/// registers still in place, and the entry walks back into the kernel.
+/// it lays the words `trapframe::fault_fn_entry` expects on this thread's
+/// fault frame (`fault_frame`), points the stack pointer at them and the
+/// instruction pointer at that entry, so the ordinary return from this
+/// handler lands in the entry with the guest's registers still in place, and
+/// the entry walks back into the kernel.
 ///
 /// It reads no Rust thread-local and takes no lock, because it runs with the
 /// GUEST's `FS` base: a `thread_local!` here would read the guest's memory.
@@ -221,7 +299,11 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     else {
         return leave_to_the_host(signal);
     };
-    let Some(kernel_fsbase) = kernel_fsbase() else {
+    let Some(Anchor {
+        ss_sp,
+        base: kernel_fsbase,
+    }) = anchor()
+    else {
         return leave_to_the_host(signal);
     };
     // A guest that set its own `GS` base. `trapframe` keeps the kernel's way
@@ -255,7 +337,10 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
         // vanishes, leaving whoever waits on the exception channel waiting
         // for ever. `GS` is fixed either way; this one still has to be
         // translated, so fall through.
-        if signal != libc::SIGTRAP {
+        //
+        // `SIGSYS` is the same: the `syscall` instruction is behind the saved
+        // rip and was never executed, so returning would skip it.
+        if signal != libc::SIGTRAP && signal != libc::SIGSYS {
             return;
         }
     }
@@ -268,17 +353,116 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     }
 
     let gregs = &mut (*(context as *mut libc::ucontext_t)).uc_mcontext.gregs;
-    let rsp = gregs[libc::REG_RSP as usize] as u64;
-    let frame = rsp - (trapframe::FAULT_FRAME_WORDS * size_of::<u64>()) as u64;
-    // From the guest's stack pointer downwards: its own r11 (the entry needs
-    // that register as scratch), the faulting rip, the vector, the error code.
-    let words = frame as *mut u64;
-    words.add(3).write(gregs[libc::REG_R11 as usize] as u64);
-    words.add(2).write(gregs[libc::REG_RIP as usize] as u64);
+    // The frame goes on memory of this bridge's own -- the words reserved
+    // under this thread's alternate stack, see `ensure_altstack` -- and not
+    // under the guest's stack pointer: that is the guest's red zone, and a
+    // Zircon thread exiting detached has already unmapped its stack by the
+    // time its `syscall` traps (`C11ThreadTest.SelfDetachAndFree`), so a
+    // write there faulted inside this handler and took the process down.
+    //
+    // Nothing runs on these words between here and `fault_fn_entry` reading
+    // them: the only signals the bridge handles are the synchronous ones,
+    // and the entry's first instructions cannot raise any. An asynchronous
+    // signal arriving there finds `rsp` OUTSIDE the alternate stack, so the
+    // host switches to that stack's top for it and leaves the frame alone.
+    let words = fault_frame(ss_sp);
+    // In the order the entry reads them: the error code, the vector, the
+    // faulting rip, the guest's own r11 (the entry needs that register as
+    // scratch) and the guest's own rsp.
+    //
+    // A trapped `syscall` says so in the error code; the saved rip is already
+    // the instruction after it, where the stub's own tail carries on.
+    let error_code = if signal == libc::SIGSYS {
+        SYSCALL_INSTRUCTION
+    } else {
+        0
+    };
+    words.write(error_code as u64);
     words.add(1).write(vector as u64);
-    words.write(0);
-    gregs[libc::REG_RSP as usize] = frame as i64;
+    words.add(2).write(gregs[libc::REG_RIP as usize] as u64);
+    words.add(3).write(gregs[libc::REG_R11 as usize] as u64);
+    words.add(4).write(gregs[libc::REG_RSP as usize] as u64);
+    gregs[libc::REG_RSP as usize] = words as i64;
     gregs[libc::REG_RIP as usize] = trapframe::fault_fn_entry as *const () as i64;
+}
+
+/// Make the host refuse every `syscall` instruction executed from a guest
+/// address, so that it reaches the kernel through the bridge instead.
+///
+/// `guest` is the whole range a guest can ever execute from -- every hosted
+/// address-space window -- and nothing the kernel itself runs from may lie
+/// inside it: a kernel syscall caught by this filter would be dressed up as
+/// a guest's and the kernel would wait for ever on its own futex. The seccomp
+/// filter is installed on every thread of the process (`TSYNC`) and
+/// inherited by every thread created after; `PR_SET_NO_NEW_PRIVS` is the
+/// price the host asks for installing one unprivileged.
+///
+/// # Safety
+///
+/// Process-wide: from here on a `syscall` from inside `guest` arrives at
+/// [`on_fault`] as `SIGSYS`, so [`init`] must have run first.
+pub unsafe fn trap_guest_syscalls(guest: core::ops::Range<usize>) -> Result<(), String> {
+    let mut filter = guest_syscall_filter(guest);
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        return Err(format!("PR_SET_NO_NEW_PRIVS: {}", last_os_error()));
+    }
+    if libc::syscall(
+        libc::SYS_seccomp,
+        libc::SECCOMP_SET_MODE_FILTER,
+        libc::SECCOMP_FILTER_FLAG_TSYNC,
+        &prog as *const libc::sock_fprog,
+    ) != 0
+    {
+        return Err(format!("SECCOMP_SET_MODE_FILTER: {}", last_os_error()));
+    }
+    Ok(())
+}
+
+fn last_os_error() -> String {
+    format!("{}", nix::errno::Errno::last())
+}
+
+/// Offset of the instruction pointer's high half inside `seccomp_data`:
+/// `nr` (u32), `arch` (u32), then `instruction_pointer` (u64), little-endian.
+const SECCOMP_DATA_IP_HIGH: u32 = 12;
+
+/// The filter: trap a syscall whose instruction pointer is inside `guest`,
+/// allow every other.
+///
+/// Classic BPF compares 32-bit words, so the range is read in units of
+/// 4 GiB: only the high half of the pointer is loaded, and the range's ends
+/// are rounded outwards to the nearest multiple -- the start down, the end
+/// up -- so that nothing inside the range can slip past. The hosted windows
+/// are 64 GiB apiece from a 4 GiB-aligned base, so for them the rounding
+/// changes nothing.
+fn guest_syscall_filter(guest: core::ops::Range<usize>) -> Vec<libc::sock_filter> {
+    let low = (guest.start >> 32) as u32;
+    let high = ((guest.end + 0xffff_ffff) >> 32) as u32;
+    let insn = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt,
+        jf,
+        k,
+    };
+    vec![
+        // A = instruction_pointer >> 32
+        insn(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            0,
+            0,
+            SECCOMP_DATA_IP_HIGH,
+        ),
+        // below the range: allow
+        insn(libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K, 0, 2, low),
+        // at or past its end: allow
+        insn(libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K, 1, 0, high),
+        insn(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_TRAP),
+        insn(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ]
 }
 
 /// The per-thread alternate stack the handler runs on.
@@ -309,12 +493,17 @@ pub fn ensure_altstack() {
         // Leaked on purpose: the host reads it on every signal for as long as
         // this thread lives, and a thread that is going away has nothing left
         // to fault.
-        let stack = vec![0u64; STACK_WORDS].into_boxed_slice();
-        let stack = Box::leak(stack);
+        //
+        // The first `FAULT_FRAME_WORDS` words are NOT part of the stack the
+        // host is told about: they are the bridge's fault frame for this
+        // thread (`fault_frame`), kept just under `ss_sp` so the handler finds
+        // them from the stack pointer alone. See `bridge_fault`.
+        let stack = vec![0u64; trapframe::FAULT_FRAME_WORDS + STACK_WORDS].into_boxed_slice();
+        let stack = &mut Box::leak(stack)[trapframe::FAULT_FRAME_WORDS..];
         // The kernel's own thread area, which is loaded right now -- this runs
         // from `enter_uspace`, before the trip out. The handler cannot ask for
         // it later: by then `FS` is the guest's and `GS` is whatever the guest
-        // left there. See `kernel_fsbase`.
+        // left there. See `anchor`.
         let mut base: u64 = 0;
         // SAFETY: a read of this thread's own FS base into a local.
         if unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, &mut base) } != 0 || base == 0
@@ -325,7 +514,7 @@ pub fn ensure_altstack() {
         let ss_sp: *mut libc::c_void = stack.as_mut_ptr().cast();
         // The base goes in the bridge's own table, keyed by this pointer, not
         // in a word under the stack: the handler must never read memory it
-        // did not itself reserve. See `kernel_fsbase`.
+        // did not itself reserve. See `anchor`.
         if !register_anchor(ss_sp as usize, base) {
             warn!("libos: the fault bridge has no room left to recognise this host thread");
             return;
@@ -344,4 +533,96 @@ pub fn ensure_altstack() {
             warn!("libos: no alternate signal stack for this thread");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run a classic-BPF program over a `seccomp_data` whose instruction
+    /// pointer is `ip`, the way the host would. Only the four instruction
+    /// kinds the filter uses are implemented; anything else is a failure of
+    /// the test, not an allow.
+    fn run(filter: &[libc::sock_filter], ip: u64) -> u32 {
+        let mut data = [0u8; 64];
+        data[8..16].copy_from_slice(&ip.to_le_bytes());
+        let mut a: u32 = 0;
+        let mut pc = 0usize;
+        loop {
+            let i = &filter[pc];
+            let code = i.code as u32;
+            pc += 1;
+            match code {
+                c if c == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
+                    let at = i.k as usize;
+                    a = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+                }
+                c if c == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K => {
+                    pc += if a >= i.k { i.jt } else { i.jf } as usize;
+                }
+                c if c == libc::BPF_RET | libc::BPF_K => return i.k,
+                other => panic!(
+                    "the filter uses an instruction the test cannot run: {:#x}",
+                    other
+                ),
+            }
+        }
+    }
+
+    const WINDOWS: core::ops::Range<usize> = 0x2_0000_0000..0x4000_0000_0000;
+
+    #[test]
+    fn a_syscall_from_a_guest_address_traps_and_one_from_the_kernel_s_does_not() {
+        let filter = guest_syscall_filter(WINDOWS);
+        // Both ends of the range, inclusive-exclusive.
+        assert_eq!(run(&filter, 0x2_0000_0000), libc::SECCOMP_RET_TRAP);
+        assert_eq!(run(&filter, 0x1a00_0ea0_4c), libc::SECCOMP_RET_TRAP);
+        assert_eq!(run(&filter, 0x3fff_ffff_ffff), libc::SECCOMP_RET_TRAP);
+        assert_eq!(run(&filter, 0x4000_0000_0000), libc::SECCOMP_RET_ALLOW);
+        assert_eq!(run(&filter, 0x1_ffff_ffff), libc::SECCOMP_RET_ALLOW);
+        // Where the kernel's own syscalls come from: a PIE binary, its libc,
+        // a non-PIE binary, the host vDSO.
+        for kernel in [
+            0x5555_5555_4000u64,
+            0x7fff_f7ca_b144,
+            0x40_1000,
+            0x7fff_ffff_e000,
+        ] {
+            assert_eq!(
+                run(&filter, kernel),
+                libc::SECCOMP_RET_ALLOW,
+                "{:#x}",
+                kernel
+            );
+        }
+        // And from this very test, which is kernel code too.
+        let here = run as fn(&[libc::sock_filter], u64) -> u32 as *const () as u64;
+        assert_eq!(run(&filter, here), libc::SECCOMP_RET_ALLOW);
+    }
+
+    /// A range that does not start or end on a 4 GiB multiple is widened,
+    /// never narrowed: the filter must not let a guest address through.
+    #[test]
+    fn a_range_off_the_4_gib_grid_is_rounded_outwards() {
+        let filter = guest_syscall_filter(0x2_8000_0000..0x3_8000_0000);
+        assert_eq!(run(&filter, 0x2_0000_0000), libc::SECCOMP_RET_TRAP);
+        assert_eq!(run(&filter, 0x3_ffff_ffff), libc::SECCOMP_RET_TRAP);
+        assert_eq!(run(&filter, 0x4_0000_0000), libc::SECCOMP_RET_ALLOW);
+        assert_eq!(run(&filter, 0x1_ffff_ffff), libc::SECCOMP_RET_ALLOW);
+    }
+
+    /// The vector the bridge writes for a trapped syscall is the one the
+    /// kernel's syscall path writes for itself, so `TrapReason` cannot tell
+    /// them apart.
+    #[test]
+    fn a_trapped_syscall_carries_the_syscall_vector() {
+        let (_, vector) = SIGNAL_VECTORS
+            .iter()
+            .find(|(signal, _)| *signal == Signal::SIGSYS)
+            .expect("SIGSYS is bridged");
+        assert_eq!(*vector, 0x100);
+        // And the error code tells it from a `call`ed stub's entry, whose
+        // `run_fncall` writes zero.
+        assert_ne!(SYSCALL_INSTRUCTION, 0);
+    }
 }

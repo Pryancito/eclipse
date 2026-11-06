@@ -388,9 +388,31 @@ mod aspace_window {
     /// `ENOMEM`, from inside a page fault, in whatever unrelated code ran next.
     pub const WINDOWS: usize = (USER_ASPACE_TOP - BASE) / SIZE;
 
-    /// The top of the host's user address space. 47 bits on x86_64 and on a
-    /// conventional aarch64 host; the macOS window is far below it either way.
+    /// Where the windows stop. Below the host's own code on purpose.
+    ///
+    /// A 47-bit user address space tops out at 128 TiB, but a hosted guest
+    /// must not share an address range with the kernel it runs inside of:
+    /// the libos fault bridge tells a guest's `syscall` instruction from the
+    /// kernel's own by the instruction pointer alone (a seccomp filter on the
+    /// address, see `kernel_hal::libos::fault_bridge::trap_guest_syscalls`),
+    /// so every address a guest can execute from has to be one the kernel
+    /// never executes from. On Linux x86_64 a PIE kernel is loaded at
+    /// `0x5555_5555_4000` plus the ASLR offset, its shared libraries and
+    /// stacks sit near `0x7fff_...`, and a non-PIE one at `0x40_0000`, below
+    /// [`BASE`]: 64 TiB leaves 1023 windows of 64 GiB, every one of them
+    /// below all of that.
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    const USER_ASPACE_TOP: usize = 0x4000_0000_0000;
+    /// The macOS window is far below the host's code either way.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     const USER_ASPACE_TOP: usize = 0x8000_0000_0000;
+
+    /// Every address a hosted guest can be given, as one range: from the
+    /// first window's base to the top of the last. What the host-side trap
+    /// on guest `syscall` instructions is keyed on.
+    pub const fn range() -> core::ops::Range<usize> {
+        BASE..BASE + SIZE * WINDOWS
+    }
 
     /// Windows handed out and given back. **The counter alone is a leak**: a
     /// system that creates processes over its life must reuse the windows of
@@ -455,6 +477,15 @@ impl VmAddressRegion {
         #[cfg(not(feature = "aspace-separate"))]
         let (addr, size) = (USER_ASPACE_BASE as usize, USER_ASPACE_SIZE as usize);
         Self::new_root_at(addr, size)
+    }
+
+    /// The range every hosted (`aspace-separate`) root VMAR is carved from:
+    /// an address outside it is never a guest's, and an address inside it is
+    /// never the kernel's own code. The libos fault bridge keys its trap on
+    /// guest `syscall` instructions on exactly this.
+    #[cfg(feature = "aspace-separate")]
+    pub const fn hosted_windows() -> core::ops::Range<usize> {
+        aspace_window::range()
     }
 
     /// Create a new root VMAR for a Zircon process.
@@ -3933,8 +3964,8 @@ mod tests {
         for round in 0..aspace_window::WINDOWS + 8 {
             let vmar = VmAddressRegion::new_root();
             assert!(
-                vmar.addr() + vmar.size <= 0x8000_0000_0000,
-                "round {} got a window at {:#x}, past the top of userspace",
+                vmar.addr() + vmar.size <= VmAddressRegion::hosted_windows().end,
+                "round {} got a window at {:#x}, past the top of the hosted range",
                 round,
                 vmar.addr()
             );
@@ -3943,6 +3974,55 @@ mod tests {
             vmar.map_at(0, vmo, 0, 0x1000, flags)
                 .expect("a reused window has to still be mappable");
         }
+    }
+
+    /// The hosted range is where guests live and nowhere the kernel runs:
+    /// the libos fault bridge turns a `syscall` instruction into a guest
+    /// trap by its address alone, so this process's own code -- the test
+    /// binary, its libc, its stack -- must all lie outside the range, or a
+    /// kernel syscall would be dressed up as a guest's and the kernel would
+    /// hang on its own futex.
+    #[test]
+    #[cfg(feature = "aspace-separate")]
+    fn the_hosted_windows_never_overlap_the_kernel_s_own_code() {
+        let range = VmAddressRegion::hosted_windows();
+        assert_eq!(range.start, aspace_window::BASE);
+        assert_eq!(
+            range.end,
+            aspace_window::BASE + aspace_window::SIZE * aspace_window::WINDOWS
+        );
+        let here =
+            the_hosted_windows_never_overlap_the_kernel_s_own_code as fn() as *const () as usize;
+        assert!(
+            !range.contains(&here),
+            "this binary at {:#x} is inside {:#x?}",
+            here,
+            range
+        );
+        let on_the_stack = &range as *const _ as usize;
+        assert!(
+            !range.contains(&on_the_stack),
+            "the stack at {:#x} is inside {:#x?}",
+            on_the_stack,
+            range
+        );
+        let in_libc = libc_address();
+        assert!(
+            !range.contains(&in_libc),
+            "libc at {:#x} is inside {:#x?}",
+            in_libc,
+            range
+        );
+    }
+
+    /// An address inside the host's C library, which is where the kernel's
+    /// own syscalls come from.
+    #[cfg(feature = "aspace-separate")]
+    fn libc_address() -> usize {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        getpid as unsafe extern "C" fn() -> i32 as *const () as usize
     }
 
     /// `ZX_VM_ALIGN_*` names where a sub-region STARTS, not how long it is.

@@ -252,14 +252,43 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     } else {
         boot_library!("userboot")
     };
-    // Only the vDSO has a libos build. scripts/gen-prebuilt.sh generates
-    // `libzircon-libos.so` alone and says so outright -- "Userboot and ZBI
-    // artifacts must remain the unmodified upstream builds" -- because the
-    // libos patch reworks the syscall entry the vDSO makes, nothing else.
-    #[cfg(feature = "libos")]
+    // The vDSO. On x86_64 the libos build boots the same blob baremetal
+    // does: its stubs are `mov eax, N; syscall; ret`, and the host turns
+    // every `syscall` a guest executes into a trap the fault bridge carries
+    // into the kernel (`trap_guest_syscalls`, below). It used to boot
+    // `libzircon-libos.so`, a rebuild with every stub routed through a
+    // `jmp [entry]` instead -- eleven bytes per stub where the real ones are
+    // eight -- and the core tests that reach an *internal* syscall
+    // (`zx_channel_call_finish` has no public symbol) find its stub by its
+    // distance from `zx_handle_close` in the real layout, so on the rebuilt
+    // blob they landed one byte short, inside the previous stub's immediate,
+    // and aborted on a SafeStack canary after `add %bh, %bh` had corrupted
+    // `rbx`. See `kernel_hal::fault_bridge`.
+    //
+    // aarch64 libos has no fault bridge yet and keeps the rebuilt blob:
+    // scripts/gen-prebuilt.sh generates `libzircon-libos.so` alone and says
+    // so outright -- "Userboot and ZBI artifacts must remain the unmodified
+    // upstream builds" -- because the libos patch reworks the syscall entry
+    // the vDSO makes, nothing else.
+    #[cfg(all(feature = "libos", not(target_arch = "x86_64")))]
     let vdso = boot_library!("libzircon-libos");
-    #[cfg(not(feature = "libos"))]
+    #[cfg(not(all(feature = "libos", not(target_arch = "x86_64"))))]
     let vdso = boot_library!("libzircon");
+    #[cfg(all(feature = "libos", target_os = "linux", target_arch = "x86_64"))]
+    {
+        let guest = zircon_object::vm::VmAddressRegion::hosted_windows();
+        // SAFETY: the bridge's handlers were installed at boot
+        // (`kernel_hal::libos::boot`), and no guest has run yet.
+        if let Err(err) = unsafe { kernel_hal::fault_bridge::trap_guest_syscalls(guest) } {
+            // Without the trap a guest's first `syscall` instruction would be a
+            // HOST system call, with the guest's registers: not a kernel that
+            // can be reasoned about. Stop here, where the cause is visible.
+            panic!(
+                "libos: cannot trap the guest's syscall instructions: {}",
+                err
+            );
+        }
+    }
 
     let job = zircon_object::task::ROOT_JOB.clone();
     // The bootstrap protocol identifies handles by object type and name: the
@@ -320,7 +349,9 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             elf.get_symbol_address("DATA_CONSTANTS")
                 .expect("vDSO has no DATA_CONSTANTS symbol") as usize;
         vmar.map_from_elf(&elf, vdso_vmo.clone()).unwrap();
-        #[cfg(feature = "libos")]
+        // The rebuilt libos vDSO jumps through a slot the kernel fills.
+        // The real one, which x86_64 libos boots too now, has no such slot.
+        #[cfg(all(feature = "libos", not(target_arch = "x86_64")))]
         {
             let offset = elf
                 .get_symbol_address("zcore_syscall_entry")
@@ -736,9 +767,7 @@ fn syscall_args(ctx: &UserContext) -> [usize; 8] {
     cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
             if cfg!(feature = "libos") {
-                let arg7 = unsafe{ (regs.rsp as *const usize).read() };
-                let arg8 = unsafe{ (regs.rsp as *const usize).add(1).read() };
-                [regs.rdi, regs.rsi, regs.rdx, regs.rcx, regs.r8, regs.r9, arg7, arg8]
+                x86_64_libos_args(regs, ctx.error_code() == SYSCALL_INSTRUCTION)
             } else {
                 [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9, regs.r12, regs.r13]
             }
@@ -750,6 +779,45 @@ fn syscall_args(ctx: &UserContext) -> [usize; 8] {
             unimplemented!()
         }
     }
+}
+
+/// The error code the libos fault bridge writes for a syscall that arrived
+/// through a `syscall` instruction, which is every syscall of a guest that
+/// boots the real vDSO. Zero for one that jumped into the fncall entry from
+/// a `call`ed stub, which is what the Linux personality's patched musl and
+/// aarch64's rebuilt vDSO do.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "libos"))]
+const SYSCALL_INSTRUCTION: usize = kernel_hal::fault_bridge::SYSCALL_INSTRUCTION;
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_os = "linux", feature = "libos"))
+))]
+const SYSCALL_INSTRUCTION: usize = usize::MAX;
+
+/// Where a libos guest's eight arguments are, which depends on how it came in.
+///
+/// Through a `syscall` instruction (the real vDSO, trapped by the host), the
+/// stub has already followed Zircon's x86-64 syscall ABI: the fourth argument
+/// moved to `r10` (the instruction overwrites `rcx`), the seventh and eighth
+/// into `r12` and `r13`. Through a `call`ed stub that jumped into the fncall
+/// entry, the C calling convention still holds: the fourth in `rcx`, the
+/// last two on the stack, which the entry has already popped the return
+/// address off.
+#[cfg(target_arch = "x86_64")]
+fn x86_64_libos_args(
+    regs: &kernel_hal::context::GeneralRegs,
+    from_syscall_instruction: bool,
+) -> [usize; 8] {
+    if from_syscall_instruction {
+        return [
+            regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9, regs.r12, regs.r13,
+        ];
+    }
+    let arg7 = unsafe { (regs.rsp as *const usize).read() };
+    let arg8 = unsafe { (regs.rsp as *const usize).add(1).read() };
+    [
+        regs.rdi, regs.rsi, regs.rdx, regs.rcx, regs.r8, regs.r9, arg7, arg8,
+    ]
 }
 
 /// The seven vDSO entry points that build a time out of `DATA_TIME_VALUES`
@@ -1122,12 +1190,12 @@ mod vdso_time_redirect_tests {
     use alloc::string::String;
     use alloc::vec;
 
-    /// The libos vDSO carries every symbol the redirect needs.
+    /// The vDSO the libos build boots carries every symbol the redirect needs.
     ///
     /// This is what the libos build now depends on. `write_vdso_time_values`
     /// was gated `not(feature = "libos")` on the grounds that "libos has no
     /// vDSO -- processes are host threads", which is not true of the Zircon
-    /// personality: `main` maps `libzircon-libos.so` and the guest thread
+    /// personality: `main` maps a vDSO and the guest thread
     /// executes its code. With the gate on, `DATA_TIME_VALUES` stayed on the
     /// `0xDEADBEEFDEADBEEF` marker the blob ships, so every deadline
     /// userspace computed was that marker plus the elapsed ticks. Measured in
@@ -1142,12 +1210,27 @@ mod vdso_time_redirect_tests {
     /// one would put the clock back on the marker with nothing but an `info!`
     /// to say so. Hence a test on the real blob, not on a synthetic ELF: this
     /// one checks the bytes that actually ship.
+    ///
+    /// Checked on both blobs: the real one, which x86_64 libos boots since
+    /// its `syscall` instructions are trapped by the host, and the rebuilt
+    /// one aarch64 libos still boots.
     #[test]
     fn the_libos_vdso_carries_every_stub_the_redirect_needs() {
+        for name in ["libzircon", "libzircon-libos"] {
+            the_vdso_carries_every_stub_the_redirect_needs(
+                name,
+                match name {
+                    "libzircon" => boot_library!("libzircon"),
+                    _ => boot_library!("libzircon-libos"),
+                },
+            );
+        }
+    }
+
+    fn the_vdso_carries_every_stub_the_redirect_needs(name: &str, vdso: &[u8]) {
         // Aligned, like the boot path's: `xmas-elf` reads the section
         // table in place and an unaligned image finds no symbols at all.
-        let vdso: &[u8] = boot_library!("libzircon-libos");
-        let elf = ElfFile::new(vdso).expect("the libos vDSO is an ELF");
+        let elf = ElfFile::new(vdso).unwrap_or_else(|e| panic!("{} is not an ELF: {}", name, e));
         assert!(
             elf.get_symbol_address("DATA_TIME_VALUES").is_some(),
             "no DATA_TIME_VALUES: the clock page cannot be written at all"
@@ -1167,7 +1250,8 @@ mod vdso_time_redirect_tests {
         }
         assert!(
             vdso_time_redirect_writes(vdso, |name| elf.get_symbol_address(name)).is_some(),
-            "the redirect declines on the real libos blob"
+            "the redirect declines on {}",
+            name
         );
     }
 
@@ -1375,6 +1459,8 @@ const SYSCALL_ABIS: [(&str, &str, [&str; 8]); 3] = [
 
 #[cfg(test)]
 mod syscall_abi_tests {
+    #[cfg(target_arch = "x86_64")]
+    use super::x86_64_libos_args;
     use super::{syscall_args, syscall_num, SYSCALL_ABIS};
     use kernel_hal::context::UserContext;
 
@@ -1434,6 +1520,41 @@ mod syscall_abi_tests {
             "syscall_num read the same register syscall_args passes as \
              argument {}: the kernel takes an argument as the syscall number",
             args.iter().position(|a| *a == number).unwrap_or(0) + 1,
+        );
+    }
+
+    /// The two ways into a libos kernel leave the arguments in different
+    /// places, and the loader reads each where its stub put them: a `syscall`
+    /// instruction's in `r10`/`r12`/`r13`, a `call`ed stub's in `rcx` and on
+    /// the stack. Reading a trapped `syscall`'s arguments the `call`ed way
+    /// hands the kernel the stub's saved `r12`/`r13` as the seventh and
+    /// eighth argument -- `zx_channel_read_etc`'s `actual_bytes` pointer --
+    /// which is how userboot answered `INVALID_ARGS` to its first read and
+    /// died in `memset` on a pointer of `0xaa`s before this split existed.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_libos_guest_s_arguments_are_read_where_its_stub_left_them() {
+        let mut regs = kernel_hal::context::GeneralRegs::default();
+        regs.rdi = 1;
+        regs.rsi = 2;
+        regs.rdx = 3;
+        regs.rcx = 0x4c;
+        regs.r10 = 0x4a;
+        regs.r8 = 5;
+        regs.r9 = 6;
+        regs.r12 = 0x7a;
+        regs.r13 = 0x8a;
+        let stack = [0x7c_usize, 0x8c];
+        regs.rsp = stack.as_ptr() as usize;
+        assert_eq!(
+            x86_64_libos_args(&regs, true),
+            [1, 2, 3, 0x4a, 5, 6, 0x7a, 0x8a],
+            "a syscall instruction: Zircon's register ABI"
+        );
+        assert_eq!(
+            x86_64_libos_args(&regs, false),
+            [1, 2, 3, 0x4c, 5, 6, 0x7c, 0x8c],
+            "a called stub: the C calling convention"
         );
     }
 

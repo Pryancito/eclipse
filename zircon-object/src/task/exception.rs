@@ -303,6 +303,21 @@ impl ExceptionType {
     pub fn is_synth(self) -> bool {
         (self as u32) & (ExceptionType::Synth as u32) != 0
     }
+
+    /// Does an exception of this type that no handler takes kill the
+    /// process?
+    ///
+    /// The hardware ones do, and so does a policy error: Zircon sends both
+    /// down the same `dispatch_user_exception` and kills with
+    /// `ZX_TASK_RETCODE_EXCEPTION_KILL` when it comes back unhandled --
+    /// `ChannelTest.ChannelFullException` writes until exactly that happens
+    /// and then waits for the process to be gone. The other synthetic ones
+    /// are the kernel telling a debugger that something happened (a thread
+    /// started, a thread exited, a process is starting, a thread raised one
+    /// itself), and nobody is obliged to listen.
+    pub fn kills_when_unhandled(self) -> bool {
+        !self.is_synth() || self == ExceptionType::PolicyError
+    }
 }
 
 /// Type of the exception channel
@@ -529,7 +544,7 @@ impl Exception {
             // path already does, so `run_user` leaves the loop on its next
             // turn and runs the `ThreadExiting` exception as usual.
             Ok(ExceptionState::ThreadExit) => self.thread.exit_from_exception(),
-            Err(ZxError::NEXT) if !self.type_.is_synth() => {
+            Err(ZxError::NEXT) if self.type_.kills_when_unhandled() => {
                 // Nobody handled the exception, kill myself
                 self.thread.proc().exit(super::TASK_RETCODE_SYSCALL_KILL);
             }
@@ -1414,16 +1429,30 @@ mod tests {
         );
     }
 
-    /// An exception nobody handled kills the process -- but only if it came
-    /// from the hardware. The synthetic ones are the kernel telling a
-    /// debugger something happened (a thread started, a thread exited), and
-    /// nobody is obliged to listen.
+    /// An exception nobody handled kills the process -- if it came from the
+    /// hardware, or is a policy error, which Zircon treats the same way. The
+    /// other synthetic ones are the kernel telling a debugger something
+    /// happened (a thread started, a thread exited), and nobody is obliged
+    /// to listen.
     ///
-    /// Both halves matter and the guard reads them from one `!`: with it
-    /// dropped, a thread starting under no debugger kills the process it is
-    /// starting in, and a page fault nobody handles resumes and faults again.
+    /// All three matter: with the guard dropped, a thread starting under no
+    /// debugger kills the process it is starting in; with it reading only
+    /// `is_synth`, a page fault nobody handles resumes and faults again, and
+    /// a process that fills a channel with nobody reading is never killed,
+    /// which is what `ChannelTest.ChannelFullException` waits for.
     #[async_std::test]
     async fn only_an_unhandled_hardware_fault_kills_the_process() {
+        let full = a_thread();
+        let full_proc = full.proc().clone();
+        Exception::new_synth(&full, ExceptionType::PolicyError, 16, 0)
+            .handle()
+            .await;
+        assert_eq!(
+            full_proc.status(),
+            Status::Exited(TASK_RETCODE_SYSCALL_KILL),
+            "a policy error nobody handled left the process running"
+        );
+
         let quiet = a_thread();
         let quiet_proc = quiet.proc().clone();
         Exception::new(&quiet, ExceptionType::ThreadStarting, None)

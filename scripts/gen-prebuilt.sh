@@ -1,6 +1,13 @@
 #!/bin/sh
 # Build only the LibOS vDSO from a configured Fuchsia checkout.
 #
+# x86_64 libos no longer loads it: there the kernel maps the upstream
+# `libzircon.so` and traps the guest's own `syscall` instructions with
+# seccomp (see `trap_guest_syscalls` in kernel-hal's fault bridge), because
+# the core tests locate internal vDSO stubs by their distance from a public
+# symbol and the rebuilt library lays them out differently. aarch64 libos
+# still needs this one.
+#
 # Userboot and ZBI artifacts must remain the unmodified upstream builds.  Run
 # this script from the Fuchsia source root, optionally setting BUILD_DIR and
 # OUTDIR when they differ from `fx get-build-dir` and `zcore_prebuilt`.

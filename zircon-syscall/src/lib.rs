@@ -212,9 +212,11 @@ impl Syscall<'_> {
             ),
             Sys::CHANNEL_WRITE => {
                 self.sys_channel_write(a0 as _, a1 as _, a2.into(), a3 as _, a4.into(), a5 as _)
+                    .await
             }
             Sys::CHANNEL_WRITE_ETC => {
                 self.sys_channel_write_etc(a0 as _, a1 as _, a2.into(), a3 as _, a4.into(), a5 as _)
+                    .await
             }
             Sys::CHANNEL_CALL_NORETRY => {
                 self.sys_channel_call_noretry(
