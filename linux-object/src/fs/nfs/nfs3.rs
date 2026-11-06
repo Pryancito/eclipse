@@ -516,6 +516,20 @@ pub fn decode_getattr(results: &[u8]) -> RpcResult<Result<Fattr3, Nfs3Status>> {
     Fattr3::decode(&mut dec).map(Ok)
 }
 
+/// Whether this is one path component, which is all a `filename3` may ever
+/// be.
+///
+/// The same three rules in both directions: not empty, no longer than
+/// [`MAXNAMLEN`], and no `/` anywhere in it. `.` and `..` pass, because each
+/// is one legitimate component and every directory has both.
+///
+/// Checking it on the way *in* is the half that is easy to forget and is the
+/// half that matters: an NFS server is whatever answered on port 2049, and a
+/// name of its choosing is about to be joined onto a path.
+pub fn is_one_component(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAXNAMLEN && !name.contains('/')
+}
+
 /// The arguments of a call that takes a directory handle and a name:
 /// `LOOKUP`, and in a later batch `REMOVE`, `RMDIR` and the create calls.
 ///
@@ -524,11 +538,8 @@ pub fn decode_getattr(results: &[u8]) -> RpcResult<Result<Fattr3, Nfs3Status>> {
 /// — resolve it, which would let a path escape the directory the client
 /// thinks it is looking in.
 pub fn encode_dir_op(dir: &FileHandle, name: &str) -> Result<Vec<u8>, XdrError> {
-    if name.len() > MAXNAMLEN || name.is_empty() {
-        return Err(XdrError::LengthTooLarge);
-    }
-    if name.contains('/') {
-        return Err(XdrError::BadPadding);
+    if !is_one_component(name) {
+        return Err(XdrError::NotOneComponent);
     }
     let mut enc = XdrEncoder::with_capacity(dir.len() + name.len() + 16);
     enc.opaque(dir.as_bytes());
