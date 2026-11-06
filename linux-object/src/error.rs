@@ -102,6 +102,10 @@ pub enum LxError {
     /// Invalid request descriptor -- `FS_IOC_FIEMAP` with a flag the
     /// filesystem does not know (`fiemap_prep`).
     EBADR = 53,
+    /// Object is remote -- NFSv3's `NFS3ERR_REMOTE`: the name resolved to
+    /// something the server exports from somewhere else and will not follow
+    /// on the client's behalf.
+    EREMOTE = 66,
     /// No data available (e.g. no such extended attribute)
     ENODATA = 61,
     /// Timer expired -- the errno `drm_syncobj_wait` returns on timeout, which
@@ -156,6 +160,14 @@ pub enum LxError {
     ENOKEY = 126,
     /// Operation already in progress
     EALREADY = 114,
+    /// Stale file handle -- the handle was valid and the object it named is
+    /// gone. A network filesystem's own error, with no local equivalent: a
+    /// local inode cannot vanish from under an open file, and an NFS one can
+    /// (`NFS3ERR_STALE`).
+    ESTALE = 116,
+    /// Quota exceeded -- the server's limit for this user, not the
+    /// filesystem's for everyone, which is `ENOSPC`.
+    EDQUOT = 122,
 }
 
 #[allow(non_snake_case)]
@@ -229,6 +241,9 @@ impl fmt::Display for LxError {
             EMSGSIZE => "Message too long",
             EALREADY => "Operation already in progress",
             ENOKEY => "Required key not available",
+            EREMOTE => "Object is remote",
+            ESTALE => "Stale file handle",
+            EDQUOT => "Quota exceeded",
             _ => "Unknown error",
         };
         write!(f, "{}", explain)
@@ -369,7 +384,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 67] = [
+    const EVERY_ERRNO: [(LxError, isize); 70] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -415,6 +430,7 @@ mod errno_tests {
         (LxError::EIDRM, 43),
         (LxError::EBADR, 53),
         (LxError::ENODATA, 61),
+        (LxError::EREMOTE, 66),
         (LxError::ETIME, 62),
         (LxError::EOVERFLOW, 75),
         (LxError::EBADFD, 77),
@@ -436,6 +452,8 @@ mod errno_tests {
         (LxError::ECONNREFUSED, 111),
         (LxError::EALREADY, 114),
         (LxError::EINPROGRESS, 115),
+        (LxError::ESTALE, 116),
+        (LxError::EDQUOT, 122),
         (LxError::ENOKEY, 126),
     ];
 
@@ -500,6 +518,7 @@ mod errno_tests {
                 | LxError::EIDRM
                 | LxError::EBADR
                 | LxError::ENODATA
+                | LxError::EREMOTE
                 | LxError::ETIME
                 | LxError::EOVERFLOW
                 | LxError::EBADFD
@@ -521,13 +540,15 @@ mod errno_tests {
                 | LxError::ECONNREFUSED
                 | LxError::EALREADY
                 | LxError::EINPROGRESS
+                | LxError::ESTALE
+                | LxError::EDQUOT
                 | LxError::ENOKEY => true,
             };
             assert!(named, "{:?}", err);
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            67,
+            70,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }

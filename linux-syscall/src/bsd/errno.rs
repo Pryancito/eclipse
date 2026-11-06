@@ -97,6 +97,15 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         // there) and no fscrypt; what the program meets is a file it may
         // not read.
         LxError::ENOKEY => bsd::EACCES,
+        // The three NFS errors. Their FreeBSD numbers are 69, 70 and 71 --
+        // and `nfsstat3`'s own NFS3ERR_DQUOT, _STALE and _REMOTE are 69, 70
+        // and 71 as well, because the protocol took its status numbers from
+        // BSD's errno table. The coincidence is not a reason to pass the
+        // value through: Linux's numbers for these three (122, 116, 66) are
+        // the ones this kernel holds, and 66 over there is `ENOTEMPTY`.
+        LxError::EDQUOT => bsd::EDQUOT,
+        LxError::ESTALE => bsd::ESTALE,
+        LxError::EREMOTE => bsd::EREMOTE,
         LxError::EOVERFLOW => bsd::EOVERFLOW,
         // FreeBSD has no `EBADFD` ("the descriptor is fine, the object behind
         // it is not"). Its number over there is `ENOLCK`. `EBADF` would be
@@ -180,6 +189,9 @@ mod tests {
         LxError::ENOMSG,
         LxError::EIDRM,
         LxError::ENODATA,
+        LxError::EDQUOT,
+        LxError::ESTALE,
+        LxError::EREMOTE,
         LxError::ETIME,
         LxError::EBADR,
         LxError::EBADFD,
@@ -220,6 +232,21 @@ mod tests {
                 assert_eq!(lx_to_freebsd(e), lin, "{:?}", e);
             }
         }
+    }
+
+    /// The three NFS errors, where a pass-through is tempting and wrong.
+    #[test]
+    fn the_nfs_errors_are_translated_and_not_passed_through() {
+        // `nfsstat3` numbers these 69, 70 and 71 -- which are also their
+        // FreeBSD numbers, because the protocol took its statuses from BSD's
+        // errno table. Linux's numbers are 122, 116 and 66, and 66 over there
+        // is `ENOTEMPTY`, so passing the kernel's value through would report
+        // "directory not empty" for an export the server moved elsewhere.
+        assert_eq!(lx_to_freebsd(LxError::EDQUOT), 69);
+        assert_eq!(lx_to_freebsd(LxError::ESTALE), 70);
+        assert_eq!(lx_to_freebsd(LxError::EREMOTE), 71);
+        assert_ne!(lx_to_freebsd(LxError::EREMOTE), LxError::EREMOTE as i32);
+        assert_eq!(lx_to_freebsd(LxError::ENOTEMPTY), 66);
     }
 
     #[test]
