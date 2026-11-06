@@ -51,13 +51,45 @@ fn a_full_length_ipv6_literal_keeps_every_colon() {
     assert_eq!(s.export, "/srv");
 }
 
-/// Splitting from the right is what makes an unbracketed IPv6 literal work
-/// too — which is not valid `mount(8)` syntax, but is what someone types.
+/// An unbracketed IPv6 literal works too — not valid `mount(8)` syntax, but
+/// what someone types, and it costs nothing to accept. A deliberate
+/// divergence from Linux, which refuses it.
 #[test]
-fn an_unbracketed_ipv6_literal_splits_at_the_last_colon() {
+fn an_unbracketed_ipv6_literal_is_accepted() {
     let s = NfsSource::parse("fe80::1:/export").unwrap();
     assert_eq!(s.host, "fe80::1");
     assert_eq!(s.export, "/export");
+}
+
+/// A colon is an ordinary character in a path, so an export path may hold
+/// one. Splitting at the LAST colon made this mount the wrong machine in
+/// silence: host `"nas:/srv/team"`, export `"/data"`, both plausible enough
+/// to be resolved and mounted from with no error anywhere. Found by review.
+#[test]
+fn a_colon_inside_the_export_path_stays_in_the_path() {
+    let s = NfsSource::parse("nas:/srv/team:/data").unwrap();
+    assert_eq!(s.host, "nas", "the host is NOT nas:/srv/team");
+    assert_eq!(s.export, "/srv/team:/data");
+}
+
+#[test]
+fn a_colon_inside_the_export_path_without_a_following_slash_stays_too() {
+    let s = NfsSource::parse("nas:/srv/team:data").unwrap();
+    assert_eq!(s.host, "nas");
+    assert_eq!(s.export, "/srv/team:data");
+}
+
+/// Several colons in the path, and an IPv6 host as well: the separator is
+/// still the first colon followed by a slash.
+#[test]
+fn an_ipv6_host_and_a_path_full_of_colons_both_survive() {
+    let s = NfsSource::parse("fe80::1:/srv/a:/b:/c").unwrap();
+    assert_eq!(s.host, "fe80::1");
+    assert_eq!(s.export, "/srv/a:/b:/c");
+
+    let s = NfsSource::parse("[fe80::1]:/srv/a:/b").unwrap();
+    assert_eq!(s.host, "fe80::1");
+    assert_eq!(s.export, "/srv/a:/b");
 }
 
 #[test]
@@ -89,10 +121,19 @@ fn an_empty_export_is_refused() {
 }
 
 /// Linux refuses a relative export path: the server names its exports
-/// absolutely, so a relative one has nothing to be relative to.
+/// absolutely, so a relative one has nothing to be relative to. With the
+/// separator defined as "the first colon followed by a slash", a relative
+/// path means there is no separator to find at all, and the two refusals meet
+/// at the same `EINVAL`.
 #[test]
 fn a_relative_export_path_is_refused() {
     assert_eq!(NfsSource::parse("nas:srv/media"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("nas:media"), Err(LxError::EINVAL));
+    assert_eq!(
+        NfsSource::parse("[fe80::1]:srv/media"),
+        Err(LxError::EINVAL),
+        "and bracketed, where the separator IS found"
+    );
 }
 
 #[test]

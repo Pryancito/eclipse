@@ -10,6 +10,8 @@
 //!   `mountd`.
 //! - [`mount3`]: the MOUNT v3 `MNT` call, which turns an export path into the
 //!   root filehandle every NFS call starts from.
+//! - [`client`]: one call out, one reply back, with transaction ids,
+//!   timeouts and retries, over a four-method transport trait.
 //! - [`source`]: the `host:/export` string `mount(8)` passes as the device.
 //!
 //! What is deliberately *not* here yet is the socket, the NFSv3 procedures
@@ -45,6 +47,7 @@
 //! and no arithmetic on one may wrap. [`xdr`] documents the reasoning and the
 //! tests hold it at the boundary.
 
+pub mod client;
 pub mod mount3;
 pub mod portmap;
 pub mod rpc;

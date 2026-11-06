@@ -314,8 +314,14 @@ pub fn frame_message(message: &[u8]) -> Vec<u8> {
 /// time. See the module docs for why this cannot be skipped.
 #[derive(Debug, Default)]
 pub struct RecordAssembler {
-    /// Bytes received and not yet consumed as a message.
+    /// Bytes received from the connection. The ones before [`Self::read_pos`]
+    /// have been consumed and are waiting to be dropped.
     pending: Vec<u8>,
+    /// How far into `pending` the fragments consumed so far reach.
+    ///
+    /// A cursor rather than a `drain` per fragment: see
+    /// [`Self::compact_if_worthwhile`] for the copying that cost.
+    read_pos: usize,
     /// Payload of the fragments of the message being assembled, in order.
     message: Vec<u8>,
 }
@@ -328,7 +334,37 @@ impl RecordAssembler {
 
     /// Add bytes that arrived from the connection.
     pub fn feed(&mut self, data: &[u8]) {
+        self.compact_if_worthwhile();
         self.pending.extend_from_slice(data);
+    }
+
+    /// Bytes of `pending` not yet consumed.
+    fn unread(&self) -> &[u8] {
+        &self.pending[self.read_pos..]
+    }
+
+    /// Drop the consumed prefix of `pending`, but only when it is worth the
+    /// copy.
+    ///
+    /// This is the amortisation that keeps assembly linear. Consuming a
+    /// fragment moves [`Self::read_pos`] forward and copies nothing; the
+    /// prefix is dropped here, at most once per [`Self::feed`], and only when
+    /// it is at least half the buffer. So each byte is moved at most a
+    /// constant number of times over its life in the buffer.
+    ///
+    /// The first version of this instead did `pending.drain(..4 + len)` per
+    /// fragment, which shifts every remaining byte each time — quadratic in
+    /// the number of fragments, and the number of fragments is the server's
+    /// choice. A one-mebibyte message split into one-byte fragments is about
+    /// five mebibytes on the wire, under `MAX_MESSAGE_LEN`, and would have
+    /// cost on the order of terabytes of copying inside the kernel. A hostile
+    /// server could spend this machine's CPU without exceeding a single one
+    /// of this module's limits. Found by review on the batch that added it.
+    fn compact_if_worthwhile(&mut self) {
+        if self.read_pos != 0 && self.read_pos * 2 >= self.pending.len() {
+            self.pending.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
     }
 
     /// How many bytes are buffered but not yet part of a complete message.
@@ -337,7 +373,7 @@ impl RecordAssembler {
     /// left here when the peer closes mean a truncated reply, which must not
     /// be reported as a clean end of stream.
     pub fn buffered(&self) -> usize {
-        self.pending.len() + self.message.len()
+        self.unread().len() + self.message.len()
     }
 
     /// Whether a message is part-assembled.
@@ -345,6 +381,15 @@ impl RecordAssembler {
     /// A connection that closes while this is true closed mid-message.
     pub fn in_progress(&self) -> bool {
         self.buffered() != 0
+    }
+
+    /// How many bytes the receive buffer holds, consumed prefix included.
+    ///
+    /// For the test that holds the amortisation down: consuming a message
+    /// must not change this, because a cursor moves instead of the bytes.
+    #[cfg(test)]
+    pub(crate) fn raw_buffer_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// Take the next complete message, or `None` if more bytes are needed.
@@ -355,26 +400,14 @@ impl RecordAssembler {
     /// server that has already answered.
     pub fn next_message(&mut self) -> RpcResult<Option<Vec<u8>>> {
         loop {
-            if self.pending.len() < 4 {
+            let unread = self.unread();
+            if unread.len() < 4 {
                 return Ok(None);
             }
-            let header = u32::from_be_bytes([
-                self.pending[0],
-                self.pending[1],
-                self.pending[2],
-                self.pending[3],
-            ]);
+            let header = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]);
             let last = header & LAST_FRAGMENT != 0;
             let len = (header & FRAGMENT_LEN_MASK) as usize;
 
-            // A zero-length fragment that is not the last one advances
-            // nothing: a server that sent them forever would spin this loop
-            // without the buffer ever growing or shrinking. A zero-length
-            // FINAL fragment is legal (it ends a message), so only the
-            // non-final case is refused.
-            if len == 0 && !last {
-                return Err(RpcError::BadFraming);
-            }
             // Checked before anything is copied, so a server cannot make this
             // buffer without bound. `checked_add` because `len` comes off the
             // wire.
@@ -386,15 +419,24 @@ impl RecordAssembler {
             {
                 return Err(RpcError::BadFraming);
             }
-            if self.pending.len() < 4 + len {
+            if unread.len() < 4 + len {
                 // The fragment's payload has not all arrived. Leave the
                 // header in place: re-reading it next time is free, and
                 // removing it would mean remembering it somewhere else.
                 return Ok(None);
             }
 
-            self.message.extend_from_slice(&self.pending[4..4 + len]);
-            self.pending.drain(..4 + len);
+            // A zero-length fragment, final or not, is legal: RFC 1831
+            // section 10 puts no floor on a fragment's length. A non-final
+            // one carries nothing, but it does consume its four-byte header,
+            // so the loop advances and a server sending them forever is
+            // bounded by the bytes it is willing to send. An earlier version
+            // refused it on the reasoning that it "advances nothing", which
+            // was simply wrong, and refused a conforming server. Found by
+            // review on the batch that added it.
+            self.message
+                .extend_from_slice(&self.pending[self.read_pos + 4..self.read_pos + 4 + len]);
+            self.read_pos += 4 + len;
 
             if last {
                 return Ok(Some(core::mem::take(&mut self.message)));
@@ -411,6 +453,18 @@ pub struct ReplyBody<'a> {
     pub xid: u32,
     /// The procedure's encoded results, positioned past the RPC envelope.
     pub results: &'a [u8],
+}
+
+/// The transaction id at the front of a message, without parsing the rest.
+///
+/// A client that has timed out and moved on has to decide what to do with a
+/// message *before* it knows whether the message is for the call it is
+/// waiting on, and [`decode_reply`] cannot answer that: it takes the expected
+/// id and fails on a mismatch. Reading the first four bytes separately is
+/// what lets a stale reply be discarded rather than treated as a protocol
+/// violation (see [`xid_is_older`](super::client::xid_is_older)).
+pub fn peek_xid(message: &[u8]) -> RpcResult<u32> {
+    XdrDecoder::new(message).u32().map_err(RpcError::Xdr)
 }
 
 /// Parse an RPC reply envelope, checking it answers `expected_xid`.
@@ -442,13 +496,22 @@ pub fn decode_reply(message: &[u8], expected_xid: u32) -> RpcResult<ReplyBody<'_
     // answer with a flavour of their own still frame it as an `opaque_auth`.
     let _flavor = dec.u32()?;
     let _body = dec.opaque()?;
-    // accept_stat.
+    // accept_stat. The numbers are RFC 5531 section 9's, and the only arm
+    // that carries anything after the status is `PROG_MISMATCH`, whose
+    // version range follows it. They were swapped here at first -- 1 read as
+    // mismatch -- so a conforming "that program is not registered" reply,
+    // which ends at the status word, had two absent fields read off the end
+    // of it and came back as `Xdr(Truncated)`: the error said the server was
+    // broken when what it had said was that it does not run NFS. That is the
+    // commonest answer a misconfigured server gives, so the wrong one was in
+    // the way of the most likely failure. Found by review.
     match dec.u32()? {
         0 => Ok(ReplyBody {
             xid,
             results: dec.rest(),
         }),
-        1 => {
+        1 => Err(RpcError::Rejected(RpcRejection::ProgramUnavailable)),
+        2 => {
             let low = dec.u32()?;
             let high = dec.u32()?;
             Err(RpcError::Rejected(RpcRejection::ProgramMismatch {
@@ -456,7 +519,6 @@ pub fn decode_reply(message: &[u8], expected_xid: u32) -> RpcResult<ReplyBody<'_
                 high,
             }))
         }
-        2 => Err(RpcError::Rejected(RpcRejection::ProgramUnavailable)),
         3 => Err(RpcError::Rejected(RpcRejection::ProcedureUnavailable)),
         4 => Err(RpcError::Rejected(RpcRejection::GarbageArgs)),
         5 => Err(RpcError::Rejected(RpcRejection::SystemError)),
