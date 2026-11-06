@@ -26,6 +26,8 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         fn srodata();
         fn erodata();
         fn sdata();
+        fn sksyms();
+        fn eksyms();
         fn edata();
         fn sbss();
         fn ebss();
@@ -57,6 +59,13 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         sdata as *const () as usize,
         edata as *const () as usize,
         MMUFlags::READ | MMUFlags::WRITE,
+    )?;
+    // The symbol table the crash reporters read; its own section, outside
+    // every range above. See `.ksyms` in zCore/src/platform/aarch64/linker.ld.
+    map_range(
+        sksyms as *const () as usize,
+        eksyms as *const () as usize,
+        MMUFlags::READ,
     )?;
     map_range(
         sbss as *const () as usize,
@@ -205,7 +214,28 @@ hal_fn_impl! {
             } else {
                 TTBR1_EL1.set(vmtoken as _);
             }
-            flush_tlb_all();
+            // LOCAL, not inner-shareable, for the reason `activate_kernel_paging`
+            // gives: the entries that go stale on a switch are this core's
+            // own (user leaves are not tagged by ASID, so the TTBR0 write
+            // alone does not retire them), and the other cores' entries for
+            // the table being left are theirs to retire on their own switch,
+            // or the shootdown's when the table itself changes. This was
+            // `flush_tlb_all()`, i.e. `tlbi vmalle1is`: EVERY address-space
+            // switch on any core wiped the TLB of ALL cores. Under QEMU that
+            // is `tlb_flush_all_cpus_synced`, which stops every vCPU; with
+            // six vCPUs, six shells and init's boot scripts switching, the
+            // aarch64 libc-test image spent 99.9% of its CPU time in the
+            // kernel and init took longer than the harness's 300 s to start
+            // its services (CI 42197041420). riscv's `activate_paging` has
+            // always flushed locally (`sfence.vma` with no broadcast).
+            unsafe {
+                core::arch::asm!(
+                    "dsb nshst
+                     tlbi vmalle1
+                     dsb nsh
+                     isb"
+                );
+            }
         }
 
         fn current_vmtoken() -> PhysAddr {
@@ -261,21 +291,37 @@ hal_fn_impl! {
             crate::common::ipi::note_active_vmtoken(token);
         }
 
+        /// THIS core's TLB, as on x86_64 (`invlpg`/CR3 reload) and riscv
+        /// (`sfence.vma`): the HAL contract is a local flush, and the
+        /// cross-core half is `common::ipi`'s shootdown protocol, whose
+        /// acknowledgers call this very function. Both arms used the
+        /// inner-shareable forms (`vaae1is`, `vmalle1is`), so every
+        /// acknowledger of a shootdown re-broadcast the flush to every
+        /// other core, and every page unmapped cost the whole machine N
+        /// flushes instead of one each. Under QEMU an `is` flush stops all
+        /// vCPUs (`tlb_flush_all_cpus_synced`); see `activate_paging`.
         fn flush_tlb(vaddr: Option<VirtAddr>) {
-            // Translations used at EL1 for the specified address, for all ASID values,
-            // in the Inner Shareable shareability domain.
+            // Translations used at EL1 for the specified address, for all
+            // ASID values, on this core.
             if let Some(vaddr) = vaddr {
                 unsafe {
                     core::arch::asm!(
-                        "dsb ishst
-                        tlbi vaae1is, {0}
-                        dsb ish
+                        "dsb nshst
+                        tlbi vaae1, {0}
+                        dsb nsh
                         isb",
                         in(reg) vaddr >> 12
                     );
                 }
             } else {
-                flush_tlb_all();
+                unsafe {
+                    core::arch::asm!(
+                        "dsb nshst
+                         tlbi vmalle1
+                         dsb nsh
+                         isb"
+                    );
+                }
             }
         }
 

@@ -44,6 +44,21 @@ SECTIONS
         edata = .;
     }
 
+    /* Reserved slot for the in-kernel symbol table, patched in after the link
+       by tools/gen_ksyms.py (see zCore/src/platform/x86/linker.ld). It used to
+       be an ORPHAN here: the linker dropped it after .data, past `edata`, and
+       `remap_the_kernel` maps the image section by section, so the table was
+       never mapped. Every `ksyms::lookup` -- i.e. every crash report, which
+       prints its first address through `ksyms::Addr` -- faulted, and the
+       report ended in "re-entrant fault while diagnosing" with nothing else
+       said. Named here so the kernel can map it. */
+    .ksyms ALIGN(4K) : {
+        sksyms = .;
+        KEEP(*(.ksyms))
+        . = ALIGN(4K);
+        eksyms = .;
+    }
+
     .stack ALIGN(4K) : {
         sstack = .;
         *(.bss.stack)

@@ -92,12 +92,19 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // this architecture: the argument registers carry the pointers the
             // faulting call had in hand, which is what turns "a read of 0x1"
             // into "this object's field was null".
+            // `s2..s4` rather than `gp`/`t1`/`t2`: `gp` is a constant, and
+            // the free-list walk this file was instrumented for keeps its
+            // cursor in `s2` (`ld s2, 0(s2)`), which the first table did not
+            // record -- the one register the report needed was the one it
+            // did not have.
             crate::kstats::note_fault_gprs(&[
                 tf.general.ra as u64,
                 tf.general.sp as u64,
-                tf.general.gp as u64,
                 tf.general.s0 as u64,
                 tf.general.s1 as u64,
+                tf.general.s2 as u64,
+                tf.general.s3 as u64,
+                tf.general.s4 as u64,
                 tf.general.a0 as u64,
                 tf.general.a1 as u64,
                 tf.general.a2 as u64,
@@ -107,8 +114,6 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 tf.general.a6 as u64,
                 tf.general.a7 as u64,
                 tf.general.t0 as u64,
-                tf.general.t1 as u64,
-                tf.general.t2 as u64,
             ]);
             // No `note_fault_rflags`: riscv has no flags register, and
             // `last_fault_rflags` reads zero, which the reporter already

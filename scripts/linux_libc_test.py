@@ -15,11 +15,18 @@ ROOT = Path(__file__).resolve().parents[1]
 # the rest is headroom for a slow runner, and a boot that never gets there
 # is reported as such rather than as 476 timeouts.
 PROMPT = re.compile(r"/ # ")
+# What eclipse-init logs once every service of the boot has been started: from
+# here on it only speaks when a service dies. Until then its lines land on the
+# serial console on top of whatever the shell is printing, and that is what
+# the case needs intact: `BootedRunner.wait_for_init_to_settle`.
+INIT_SETTLED = re.compile(r"\[eclipse-init\] \[ *[\d.]+s\] entering supervision loop")
 # The prompt this runner asks the guest shell for, because the shell's own
 # carries no newline and a line-buffered reader cannot see it: see
 # `BootedRunner.adopt_newline_prompt`.
 GUEST_PROMPT = "__ZCORE_PROMPT__"
 PROMPT_TIMEOUT = 300
+# The budget of a case run alone with `--test`, in seconds.
+SINGLE_CASE_TIMEOUT = 180
 
 # Cases that only mean something to a user the kernel can hold to a limit.
 # `pthread_atfork-errno-clobber` sets RLIMIT_NPROC to 0 and expects `fork` to
@@ -43,10 +50,14 @@ KERNEL_LOG_LINE = re.compile(
     r"\[ *\d+\.\d{6} (?:ERROR|WARN |INFO |DEBUG|TRACE) \d+ \d+:\d+ \S+\] [^\r\n]*"
 )
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# A line of eclipse-init's own on the console: `[eclipse-init] [<secs>s]
+# <message>`. The supervisor shares the serial line with the shell the cases
+# run in, and what it says about its services is not the case's output.
+INIT_LOG_LINE = re.compile(r"\[eclipse-init\] \[ *\d+\.\d+s\] [^\r\n]*")
 
 
 def without_kernel_log(output):
-    """`output` with the kernel's own console lines taken out.
+    """`output` with the kernel's and eclipse-init's console lines taken out.
 
     The submodule classifies a case by substring, and one of its failure
     patterns is "ERROR" -- the level the kernel prints every signal death at,
@@ -55,8 +66,25 @@ def without_kernel_log(output):
     `[ 19.252076 ERROR 1 0:0 zcore_loader::linux] [exit] pid=1033 (grep)
     killed by signal SIGPIPE`) was enough to fail a case that had exited 0.
     The case's own words stay: libc-test prints `... failed` for a failing
-    check, and exits non-zero besides."""
-    return KERNEL_LOG_LINE.sub("", ANSI.sub("", output))
+    check, and exits non-zero besides.
+
+    eclipse-init's lines go for the same reason. On riscv64 (QEMU,
+    2026-11-06) the image carried a labwc session with no labwc behind it,
+    and every minute the supervisor wrote `respawn: seatd exited after
+    60.27s (exit 127 -- command not found, or execve failed; ...)` on the
+    console: 50 cases that had exited 0 were FAILED on that `failed`. The
+    image is fixed (`desktop_lands_in_image` in the xtask), and this keeps
+    whatever init says next from being read as a case's verdict."""
+    return INIT_LOG_LINE.sub("", KERNEL_LOG_LINE.sub("", ANSI.sub("", output)))
+
+
+def init_is_eclipse_init(arch):
+    """Whether the image's PID 1 is eclipse-init: the xtask installs it as
+    `/sbin/eclipse-init` and points `/sbin/init` at it by name."""
+    try:
+        return os.readlink(ROOT / "rootfs" / arch / "sbin" / "init") == "eclipse-init"
+    except OSError:
+        return False
 
 
 def main():
@@ -64,6 +92,12 @@ def main():
     parser.add_argument("--arch", default="x86_64", choices=["x86_64", "aarch64", "riscv64"])
     parser.add_argument("--libos", action="store_true")
     parser.add_argument("--fast", action="store_true")
+    parser.add_argument(
+        "--test",
+        metavar="NAME",
+        help="run only this case (the submodule's -t): a path in the guest, typed "
+        "at its shell as one word, so a script in the rootfs works too",
+    )
     args = parser.parse_args()
     os.chdir(ROOT / "tests")
     sys.path.insert(0, str(ROOT / "tests"))
@@ -112,6 +146,16 @@ def main():
             twice each, with a QEMU restart in between. Wait for the prompt
             itself, within a budget a slow runner can still meet."""
 
+            pid1_is_eclipse_init = init_is_eclipse_init(args.arch)
+
+            def run_one(self, name, fast=False, timeout=None):
+                # A case named with `--test` is run by hand, usually a script
+                # that loops a flaky case to measure it, so it gets the
+                # single-case budget rather than the suite's 10 s.
+                if args.test:
+                    timeout = SINGLE_CASE_TIMEOUT
+                return super().run_one(name, fast, timeout)
+
             def run_qemu(self):
                 super().run_qemu()
                 # A newline makes a shell that is already up print a fresh
@@ -133,7 +177,41 @@ def main():
                     raise RuntimeError(
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
                     )
+                self.wait_for_init_to_settle(output, PROMPT_TIMEOUT - (time.monotonic() - start))
                 self.adopt_newline_prompt()
+
+            def wait_for_init_to_settle(self, seen, budget):
+                """The shell's prompt comes up while eclipse-init is still
+                starting services (dbus, hunter, notify, portal, ntpd,
+                udhcpc...; the desktop too before `TEST=1` booted with
+                `desktop=none`), and each start is a line on the serial
+                console. On a loaded runner that goes on for a minute or
+                more, and a line that lands in the middle of a case splits
+                its end-of-case marker: the case comes back TIMEOUT, QEMU is
+                restarted, and the next boot does it again. `Linux Libc Test
+                Baremetal (aarch64)` lost one case in eight that way, and the
+                restarts ended in a boot that showed no prompt in time.
+
+                So wait for the line it logs after its last service start,
+                within what is left of the prompt budget. Whether PID 1 is
+                eclipse-init is read off the rootfs on the host (`/sbin/init`
+                is a link named for it), not off the console: the submodule's
+                `run_qemu` clears everything the guest printed in its first
+                5 s, init's own `starting` line with it, and its next word can
+                be half a minute away (the keyboard, locale and timezone step
+                took 32 s under load here)."""
+                if not self.pid1_is_eclipse_init:
+                    return
+                deadline = time.monotonic() + max(budget, 0)
+                settled = INIT_SETTLED.search(seen) is not None
+                while not settled and time.monotonic() < deadline:
+                    with self.lk:
+                        settled = INIT_SETTLED.search(self.output) is not None
+                    if settled or self.zcore_proc.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                with self.lk:
+                    self.output = ""
 
             def adopt_newline_prompt(self):
                 """Give the guest shell a prompt that ends in a newline, and
@@ -277,6 +355,8 @@ def main():
     framework.load_testcases = load_testcases
     # The allowlist above applies equally to PR and manual runs.
     sys.argv = [script] + forwarded + (["--fast"] if args.fast else [])
+    if args.test:
+        sys.argv += ["--test", args.test]
     runpy.run_path(script, run_name="__main__")
 
 

@@ -28,6 +28,8 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         fn erodata();
         fn sdata();
         fn edata();
+        fn sksyms();
+        fn eksyms();
         fn sbss();
         fn ebss();
 
@@ -59,6 +61,14 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
         sdata as *const () as usize,
         edata as *const () as usize,
         MMUFlags::READ | MMUFlags::WRITE,
+    )?;
+    // The symbol table the crash reporters read. Its own section (the
+    // post-link patch needs a section to update), and not covered by any of
+    // the ranges above: see `.ksyms` in zCore/src/platform/riscv/linker.ld.
+    map_range(
+        sksyms as *const () as usize,
+        eksyms as *const () as usize,
+        MMUFlags::READ,
     )?;
     map_range(
         sbss as *const () as usize,

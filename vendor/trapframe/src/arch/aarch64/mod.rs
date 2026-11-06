@@ -27,8 +27,63 @@ pub struct UserContext {
     /// Software Thread ID Register, tpidr_el0
     pub tpidr: usize,
     /// General registers
-    /// Must be last in this struct
     pub general: GeneralRegs,
+    /// Floating-point and SIMD registers, `fpcr` and `fpsr`. See [`FpRegs`].
+    /// Must be last in this struct: `trap.S` reserves it at the top of the
+    /// frame (`sub sp, sp, #FP_BYTES` in `HANDLER`) and steps over it at the
+    /// end of `trap_return`.
+    pub fp: FpRegs,
+}
+
+/// The floating-point and SIMD state a trap has to preserve on aarch64.
+///
+/// `q0`-`q31` as sixty-four doublewords (each `q` is 128 bits: slot `2n` is the
+/// low half of `qn`, slot `2n + 1` the high half, the order `stp qn, qn+1`
+/// writes them), then `fpcr` (rounding mode, trap enables) and `fpsr` (the
+/// accrued exception flags and the NZCV of a floating-point compare).
+///
+/// # Why this is saved at all
+///
+/// Nothing saved it before, and nothing needed to as long as only user code
+/// used the unit. But the kernel is built with `+neon,+fp-armv8`
+/// (`zCore/aarch64.json`), so the compiler hands `q` registers to its memcpy,
+/// struct copies and loops -- thirty-eight thousand SIMD instructions in the
+/// release kernel -- and `CPACR_EL1` leaves the unit untrapped. So every
+/// syscall and every interrupt clobbered whatever the interrupted code had
+/// in `q0`-`q31`: musl's memcpy, strlen and memchr on aarch64 live there, and
+/// a timer tick in the middle of one came back with the kernel's halves.
+/// Measured as `awk` dying on a read of address 2 inside init's boot scripts
+/// on the aarch64 libc-test image, and as the `cos`/`sin` cases of libc-test
+/// failing on riscv64 for the same reason (its own batch).
+///
+/// # Divergence from Linux, deliberate
+///
+/// Linux saves this lazily (`CPACR_EL1.FPEN` traps the first use after a
+/// switch) and only for threads that touched the unit. That is the
+/// optimisation, not the correctness, and it needs a trap-to-enable path
+/// this kernel does not have. This saves eagerly: thirty-two `stp`/`ldp`
+/// pairs on every trap, and right on all of them. On every trap and not just
+/// the user ones, because the kernel code an interrupt lands in uses the
+/// registers too.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[repr(C)]
+pub struct FpRegs {
+    /// `q0`-`q31`, two doublewords each, low half first.
+    pub q: [u64; 64],
+    /// `fpcr`: rounding mode and trap enables.
+    pub fpcr: usize,
+    /// `fpsr`: accrued exception flags and compare flags.
+    pub fpsr: usize,
+}
+
+impl Default for FpRegs {
+    fn default() -> Self {
+        Self {
+            q: [0; 64],
+            fpcr: 0,
+            fpsr: 0,
+        }
+    }
 }
 
 /// General registers
@@ -167,8 +222,16 @@ const _: () = {
         "the general registers start at byte 48"
     );
     assert!(
-        offset_of!(UserContext, general) + size_of::<GeneralRegs>() == size_of::<UserContext>(),
-        "the general registers are no longer last in the struct"
+        offset_of!(UserContext, general) + size_of::<GeneralRegs>() == offset_of!(UserContext, fp),
+        "the floating-point area no longer follows the general registers"
+    );
+    assert!(
+        offset_of!(UserContext, fp) == 38 * 8,
+        "`FP_OFF` in trap.S is 38 * 8"
+    );
+    assert!(
+        offset_of!(UserContext, fp) + size_of::<FpRegs>() == size_of::<UserContext>(),
+        "the floating-point area is no longer last in the struct"
     );
 };
 

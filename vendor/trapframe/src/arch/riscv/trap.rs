@@ -5,6 +5,7 @@ use core::mem::{offset_of, size_of};
 global_asm!(
     r"
     .equ XLENB, 4
+    .equ FRAME_WORDS, 34
     .macro LOAD_SP a1, a2
         lw \a1, \a2*XLENB(sp)
     .endm
@@ -17,11 +18,36 @@ global_asm!(
 global_asm!(
     r"
     .equ XLENB, 8
+    .equ FRAME_WORDS, 67
+    # `.ifdef HAS_FP` in trap.S guards the floating-point save/restore. Only
+    # defined here, for riscv64: the riscv32 block above leaves it undefined
+    # and that path keeps the 34-word frame it always had.
+    HAS_FP = 1
     .macro LOAD_SP a1, a2
         ld \a1, \a2*XLENB(sp)
     .endm
     .macro STORE_SP a1, a2
         sd \a1, \a2*XLENB(sp)
+    .endm
+    # The kernel itself is built for a soft-float target (no F/D), so the
+    # assembler refuses `fsd`/`fld` without being told the hardware has them
+    # (it says: instruction requires the following: D). `.option arch, +d` says so
+    # for these two instructions only, pushed and popped so nothing else in
+    # the file sees a different arch. The guest is the one using the unit;
+    # the kernel never touches an `f` register except to save and restore it,
+    # which is exactly why a soft-float kernel is the right choice and why
+    # this override is safe.
+    .macro LOAD_FP a1, a2
+        .option push
+        .option arch, +d
+        fld \a1, \a2*XLENB(sp)
+        .option pop
+    .endm
+    .macro STORE_FP a1, a2
+        .option push
+        .option arch, +d
+        fsd \a1, \a2*XLENB(sp)
+        .option pop
     .endm
 "
 );
@@ -74,6 +100,9 @@ pub struct TrapFrame {
     pub sstatus: usize,
     /// Supervisor Exception Program Counter
     pub sepc: usize,
+    /// Floating-point registers and `fcsr`. See [`FpRegs`].
+    #[cfg(target_arch = "riscv64")]
+    pub fp: FpRegs,
 }
 
 /// Saved registers on a trap.
@@ -86,6 +115,9 @@ pub struct UserContext {
     pub sstatus: usize,
     /// Supervisor Exception Program Counter
     pub sepc: usize,
+    /// Floating-point registers and `fcsr`. See [`FpRegs`].
+    #[cfg(target_arch = "riscv64")]
+    pub fp: FpRegs,
 }
 
 impl UserContext {
@@ -155,11 +187,46 @@ pub struct GeneralRegs {
     pub t6: usize,
 }
 
+/// The floating-point state a trap has to preserve on riscv64.
+///
+/// The thirty-two `f` registers plus `fcsr`, which carries the rounding mode
+/// and the accrued exception flags. Thirty-three words, saved and restored
+/// with the integer registers.
+///
+/// # Why this is saved at all
+///
+/// Nothing saved it before, and user mode runs with `sstatus.FS` set (see
+/// `setup_uspace`), so the guest uses `f0`-`f31` freely. Two guest threads
+/// multiplexed onto one hart therefore overwrote each other's floating-point
+/// state, and so did any kernel code the compiler gave `f` registers to. The
+/// measured symptom was `libc-test`'s `sin.exe` failing intermittently under
+/// riscv64 with an `INVALID` flag the case never raised and a result whose
+/// exponent was +378 where -1 was expected: not a precision bug, another
+/// thread's `fcsr` and `f` registers.
+///
+/// # Divergence from Linux, deliberate
+///
+/// Linux switches this lazily: a thread starts with `FS = Off`, the first
+/// floating-point instruction traps, and only a thread that has actually used
+/// the unit pays for saving it. That is the optimisation, not the
+/// correctness; it also needs a trap-to-enable path that this kernel does not
+/// have yet. This saves eagerly, which costs thirty-three loads and
+/// thirty-three stores on every trap and is right on all of them.
+#[cfg(target_arch = "riscv64")]
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+pub struct FpRegs {
+    /// `f0`-`f31`, as raw doubles.
+    pub f: [usize; 32],
+    /// `fcsr`: rounding mode and accrued exception flags.
+    pub fcsr: usize,
+}
+
 /// The contract between these structs and `trap.S`.
 ///
 /// `trap_entry` saves the registers with `STORE_SP xN, N` -- the slot number
 /// *is* the architectural register number -- and the frame is carved out with
-/// `addi sp, sp, -34 * XLENB`. So the whole layout is written into the
+/// `addi sp, sp, -FRAME_WORDS * XLENB`. So the whole layout is written into the
 /// assembly, and `mv a0, sp` hands that same stack address to
 /// `trap_handler(tf: &mut TrapFrame)`: the general registers have to start at
 /// the frame base, and each one has to sit at its own register number.
@@ -176,6 +243,14 @@ pub struct GeneralRegs {
 /// `cargo test` builds.
 const _: () = {
     const W: usize = size_of::<usize>();
+    /// Words in the trap frame: 32 general registers, `sstatus`, `sepc`, and
+    /// on riscv64 the 32 floating-point registers plus `fcsr`. Must match the
+    /// `addi sp, sp, -FRAME_WORDS * XLENB` in `trap.S`, which gets it from the
+    /// `.equ` that `global_asm!` emits next to `XLENB`.
+    #[cfg(target_arch = "riscv64")]
+    const FRAME_WORDS: usize = 67;
+    #[cfg(not(target_arch = "riscv64"))]
+    const FRAME_WORDS: usize = 34;
 
     assert!(offset_of!(GeneralRegs, zero) == 0 * W, "zero is x0");
     assert!(offset_of!(GeneralRegs, ra) == 1 * W, "ra is x1");
@@ -230,9 +305,28 @@ const _: () = {
         offset_of!(TrapFrame, sepc) == 33 * W,
         "the `STORE_SP t2, 33` writes sepc"
     );
+    // The floating-point area the `STORE_FP fN, 34 + N` run indexes, with
+    // `fcsr` the word after it. Only riscv64 has it: the riscv32 path of this
+    // file is untouched, because this tree never builds it and inventing
+    // `fsw` sequences nothing exercises would be worse than leaving it alone.
+    #[cfg(target_arch = "riscv64")]
     assert!(
-        size_of::<TrapFrame>() == 34 * W,
-        "the frame is no longer the 34 words the `addi sp, sp, -34 * XLENB` carves out"
+        offset_of!(TrapFrame, fp) == 34 * W,
+        "the `STORE_FP f0, 34` writes the first floating-point register"
+    );
+    #[cfg(target_arch = "riscv64")]
+    assert!(
+        offset_of!(FpRegs, f) == 0,
+        "the floating-point registers start their area"
+    );
+    #[cfg(target_arch = "riscv64")]
+    assert!(
+        offset_of!(TrapFrame, fp) + offset_of!(FpRegs, fcsr) == 66 * W,
+        "the `STORE_SP t0, 66` writes fcsr"
+    );
+    assert!(
+        size_of::<TrapFrame>() == FRAME_WORDS * W,
+        "the frame is no longer the words `addi sp, sp, -FRAME_WORDS * XLENB` carves out"
     );
 
     // `run_user` takes a `&mut UserContext` while the trap path builds a

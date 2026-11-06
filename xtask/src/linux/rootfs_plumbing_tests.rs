@@ -132,7 +132,7 @@ fn every_applet_gets_a_relative_link_to_busybox() {
     let dir = scratch("applets");
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    LinuxRootfs::ensure_busybox_applets(&bin);
+    LinuxRootfs::ensure_busybox_applets_with(&bin, None);
 
     for applet in LinuxRootfs::BASE_APPLETS {
         let link = bin.join(applet);
@@ -143,6 +143,41 @@ fn every_applet_gets_a_relative_link_to_busybox() {
             "the `{applet}` link must be a relative link to busybox"
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A cross build cannot run its busybox, so the build's own `busybox.links`
+/// is where the full applet list comes from: every path in it becomes a
+/// relative link in `/bin`, whatever directory the file names, and the
+/// fallback list still applies. The riscv64 image had no `/bin/su` for want
+/// of exactly this, and the libc-test harness runs its unprivileged cases
+/// through `su`.
+#[test]
+fn the_links_file_of_a_cross_build_names_the_applets() {
+    let dir = scratch("links");
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let links = dir.join("busybox.links");
+    fs::write(
+        &links,
+        "/bin/su\n/usr/bin/awk\n/sbin/init\n\n/usr/sbin/ntpd\n",
+    )
+    .unwrap();
+
+    LinuxRootfs::ensure_busybox_applets_with(&bin, Some(&links));
+
+    for applet in ["su", "awk", "init", "ntpd", "cat"] {
+        let link = bin.join(applet);
+        assert!(link.is_symlink(), "no link for the `{applet}` applet");
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("busybox"));
+    }
+    assert!(
+        !dir.join("usr/bin/awk").exists(),
+        "an applet was linked where the links file says instead of in /bin"
+    );
+    // And without the file (the incremental path after the build directory
+    // is gone) the fallback list still carries `su`.
+    assert!(LinuxRootfs::BASE_APPLETS.contains(&"su"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -159,7 +194,7 @@ fn a_real_binary_keeps_its_place_and_so_does_a_dangling_link() {
     fs::write(bin.join("ls"), b"#!/bin/sh\necho not busybox\n").unwrap();
     unix::fs::symlink("nowhere-at-all", bin.join("ps")).unwrap();
 
-    LinuxRootfs::ensure_busybox_applets(&bin);
+    LinuxRootfs::ensure_busybox_applets_with(&bin, None);
 
     assert!(
         !bin.join("ls").is_symlink(),

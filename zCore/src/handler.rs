@@ -844,9 +844,39 @@ fn report_unresolved_kernel_fault(
         kernel_hal::ksyms::Addr(rip),
         have_thread,
     ));
+    // The raw register file before anything that could fault again. On
+    // riscv64 every capture of this job's heap-walk `#PF` ended one line
+    // later in "re-entrant fault while diagnosing", with no register and no
+    // caller printed, so the walk below is bracketed with one literal line per
+    // step: whichever line is the last one out names the step that re-faulted.
+    {
+        let gprs = kernel_hal::kstats::last_fault_gprs();
+        for row in 0..4 {
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "[kfault-raw] {}={:#x} {}={:#x} {}={:#x} {}={:#x}\n",
+                kernel_hal::kstats::GPR_NAMES[row * 4],
+                gprs[row * 4],
+                kernel_hal::kstats::GPR_NAMES[row * 4 + 1],
+                gprs[row * 4 + 1],
+                kernel_hal::kstats::GPR_NAMES[row * 4 + 2],
+                gprs[row * 4 + 2],
+                kernel_hal::kstats::GPR_NAMES[row * 4 + 3],
+                gprs[row * 4 + 3],
+            ));
+        }
+        kernel_hal::console::serial_write_fmt_spin(format_args!(
+            "[kfault-raw] sp={:#x} fp={:#x}\n",
+            kernel_hal::kstats::last_fault_rsp(),
+            kernel_hal::kstats::last_fault_rbp(),
+        ));
+    }
+    serial_literal_spin("[kfault-step] heap lock\n");
     report_heap_lock_held();
+    serial_literal_spin("[kfault-step] registers\n");
     print_fault_registers(fault_vaddr, access_flags);
+    serial_literal_spin("[kfault-step] backtrace\n");
     print_fault_backtrace(access_flags);
+    serial_literal_spin("[kfault-step] containment\n");
     // Release the latch before containment: a successful `try_contain` retires
     // just this coroutine and resumes scheduling, so a LATER fault must be free
     // to diagnose. `try_contain` keeps its own per-CPU guard for a fault

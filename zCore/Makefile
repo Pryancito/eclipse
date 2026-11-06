@@ -46,6 +46,20 @@ endif
 # eclipse-init reads it from /proc/cmdline to pick the session (labwc vs xorg).
 # Unset by default so real hardware falls through to /etc/eclipse/desktop; the
 # top-level `make qemu` sets DESKTOP=xorg to boot the framebuffer X session.
+#
+# A test boot (`TEST=1`, what `scripts/linux_libc_test.py` and the `tests`
+# submodule pass) starts NO desktop session unless asked. The libc-test image
+# of aarch64 and x86_64 is the desktop variant, and with the default session
+# eclipse-init brought labwc, dbus, hunter, notify and gtk-caches up WHILE the
+# suite was typing cases at the console shell: their log lines on the serial
+# port split the end-of-case marker (`__ZC[eclipse-init] ... ORE_DONE_`), one
+# case in eight came back TIMEOUT and was retried on a fresh QEMU, and after
+# enough restarts one boot showed no prompt within 300 s and the job died
+# (`Linux Libc Test Baremetal (aarch64)`, every run). `desktop=none` is what
+# the ISO installer already boots with: console shell only.
+ifeq ($(TEST), 1)
+  DESKTOP ?= none
+endif
 desktop_arg := $(if $(DESKTOP),:desktop=$(DESKTOP))
 
 # Optional boot-time file-access recorder appended as `BOOTTRACE=<comm>`.
@@ -300,12 +314,16 @@ endif
 # the last two corruptions arrived. Off by default: it costs a SeqCst RMW per
 # frame on the hottest path in the memory system.
 #
-# x86_64 only. No other architecture has the probes, so asking for it there
-# would quietly build a kernel with no memory debugging that looks like it has
-# some -- hence an error rather than a silence.
+# x86_64 has the full set (zCore/src/memory_x86_64.rs); riscv64 and aarch64
+# share zCore/src/memory.rs and get its own: a quarantine that poisons every
+# freed block and reports a write to it, a canary after each heap block, a
+# check that two CPUs are never inside the heap lock, and a walk of the buddy's
+# free lists on every heap operation that names a clobbered node. Any other
+# architecture would quietly build a kernel with no memory debugging that looks
+# like it has some -- hence an error rather than a silence.
 ifeq ($(MEM_DEBUG), 1)
-  ifneq ($(ARCH), x86_64)
-    $(error MEM_DEBUG=1 only exists for ARCH=x86_64 (the probes live in zCore/src/memory_x86_64.rs))
+  ifeq ($(filter $(ARCH), x86_64 riscv64 aarch64),)
+    $(error MEM_DEBUG=1 only exists for ARCH=x86_64, riscv64 and aarch64)
   endif
   features += mem-debug
 endif
@@ -591,11 +609,21 @@ ifeq ($(DISK), on)
   run_disk := $(qemu_disk)
 endif
 
-.PHONY: justrun
-justrun: $(run_disk)
-ifeq ($(ARCH), x86_64)
-	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
-  ifeq ($(have_vfat),yes)
+# The ESP image, built once and refreshed only when the tree under $(esp)/EFI
+# changes. The recipe is a `define` because two targets need it: `build`
+# (through `$(kernel_img)`, right after the initramfs is copied into the
+# tree) and `justrun` (for a `make run` after editing the tree by hand).
+#
+# It used to live in `justrun` only. `scripts/linux_other_test.py` runs
+# `make ... build` once, untimed, and then `make ... justrun` once PER CASE
+# under a 60 s budget that also has to cover UEFI and the kernel boot
+# (~22 s on a CI runner). With the desktop rootfs the image is ~3 GiB, and
+# its first build (a 3 GiB `dd`, `mkfs.vfat` and an `mcopy` of the whole
+# tree, on a runner's cold disk) landed inside the FIRST case's budget, so
+# `/bin/busybox?cal`, the first case of the suite, was a TIMEOUT on every
+# run of `Linux Other Test Baremetal (x86_64)` while the other nine passed
+# in 21-27 s each. Building it in `build` moves that cost to where nothing
+# is timing it; `justrun` then always takes the cheap branch.
 # Size by APPARENT size: the initramfs SFS is written sparse (xtask `fuse`
 # does `set_len`, and the free blocks -- 256 MiB of them on the QEMU live
 # image -- are never touched), so plain `du` under-reports it by that much
@@ -635,6 +663,7 @@ ifeq ($(ARCH), x86_64)
 # sidecar a killed build leaves nothing to trust and the retry rebuilds.
 # The `&&` chain covers the other way this goes wrong: a step that FAILS
 # without being killed must not publish a half-written image either.
+define build_esp_img
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
 	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
 	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128) || exit 1; \
@@ -649,6 +678,14 @@ ifeq ($(ARCH), x86_64)
 	else \
 	  mcopy -i "$(esp_img)" -o "$(esp)/EFI/Boot/rboot.conf" ::/EFI/Boot/rboot.conf; \
 	fi
+endef
+
+.PHONY: justrun
+justrun: $(run_disk)
+ifeq ($(ARCH), x86_64)
+	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
+  ifeq ($(have_vfat),yes)
+	$(build_esp_img)
   endif
 endif
 ifeq ($(ARCH), aarch64)
@@ -785,6 +822,9 @@ ifeq ($(ARCH), x86_64)
 	else \
 	  echo "initramfs '$(INITRAMFS_IMG)' not present; skipping (build-only, no rootfs image)"; \
 	fi
+  ifeq ($(have_vfat),yes)
+	$(build_esp_img)
+  endif
 else ifeq ($(ARCH), riscv64)
 	$(OBJCOPY) $(kernel_elf) --strip-all -O binary $@
 endif

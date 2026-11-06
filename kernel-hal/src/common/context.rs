@@ -1247,6 +1247,50 @@ impl UserContext {
                     crate::common::ipi::tlb_shootdown_ack_nmi();
                     self.dbg_validate_user_ctx("after NMI from user");
                 }
+                // Interrupts OFF before `run_user`. The riscv trap entry
+                // decides "from user?" by `sscratch != 0`, and `run_user`
+                // sets `sscratch` to this context some seventy instructions
+                // before its `sret` -- the whole register restore runs with
+                // the flag already raised. A timer or IPI landing in that
+                // window (the idle loop re-enables `SIE` on every hart but
+                // the boot one, and nothing turned it off again before the
+                // trip out) takes the from-user path: `sp` is set to this
+                // `UserContext`, the kernel's registers are saved over the
+                // user's, and the handler then runs with the context as its
+                // stack, pushing frames into the heap below the `Box` -- over
+                // the buddy's free-list nodes and whatever else lives there.
+                // That was the `#PF` in `Node::insert` on riscv64 bare metal
+                // under SMP, with trap_return addresses in the clobbered
+                // words. The hardware clears `SIE` on the trap back in, so
+                // the state after `run()` is unchanged.
+                #[cfg(target_arch = "riscv64")]
+                // SAFETY: masks interrupts on this hart for the register
+                // restore and `sret`; the trap that returns here has already
+                // cleared `SIE` itself, so nothing is left masked.
+                unsafe {
+                    riscv::register::sstatus::clear_sie();
+                }
+                // The same window on aarch64, with no flag to misread: the
+                // first thing `run_user` does is `mov sp, x0`, so SP_EL1 IS
+                // this `UserContext` for the forty-odd instructions up to the
+                // `eret`. An IRQ taken there (PSTATE.I clear: the idle loop
+                // and every kernel-mode `eret` leave it clear) goes through
+                // the current-EL vector, which pushes its frame at `sp - 16`
+                // and `__alltraps` another 38 words below that -- below the
+                // `Box` when it lands early in the restore -- and
+                // `trap_handler` then runs with the heap as its stack. That
+                // was the `#PF` in `BuddyAllocator::deallocate` with a
+                // non-kernel word where the return address should be, on the
+                // aarch64 libc-test job (CI 42197041420). Taking the trap
+                // back in sets PSTATE.I, so the state after `run()` is the
+                // same as before.
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: masks IRQs on this CPU for the register restore and
+                // `eret`; the exception that returns here has set PSTATE.I
+                // itself, so nothing is left masked that was not already.
+                unsafe {
+                    core::arch::asm!("msr daifset, #2");
+                }
                 #[cfg(not(target_arch = "x86_64"))]
                 self.0.run();
                 self.dbg_validate_user_ctx("after trap from user");
