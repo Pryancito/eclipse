@@ -621,6 +621,17 @@ pub enum FsError {
     /// "invalid CRTC coordinates"). NOT E_INVAL: Linux keeps the two apart
     /// and a client that tells them apart is told which it was.
     OutOfRange,
+    /// E_STALE (116): the handle this inode holds no longer names anything on
+    /// the server -- the file was deleted or replaced by somebody else.
+    ///
+    /// For a network file system this is an ordinary outcome and not an I/O
+    /// error: the mount is fine, the connection is fine, and what the caller
+    /// has to do about it is give up this file and look the name up again.
+    /// Reported as `DeviceError` it reads as "the disk is broken", and a
+    /// program that would have re-opened instead retries for ever or gives
+    /// up on the whole mount. NFSv3 has a status of its own for it
+    /// (`NFS3ERR_STALE`), so it must have an errno of its own here.
+    StaleHandle,
 }
 
 impl fmt::Display for FsError {

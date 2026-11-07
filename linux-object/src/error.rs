@@ -348,6 +348,7 @@ impl From<&FsError> for LxError {
             FsError::NoSuchDeviceOrAddress => LxError::ENXIO,
             FsError::NoKey => LxError::ENOKEY,
             FsError::OutOfRange => LxError::ERANGE,
+            FsError::StaleHandle => LxError::ESTALE,
         }
     }
 }

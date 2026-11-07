@@ -56,6 +56,9 @@
 
 pub mod client;
 pub mod connect;
+#[cfg(test)]
+pub(crate) mod fake;
+pub mod fs;
 pub mod greeting;
 pub mod mount3;
 pub mod nfs3;
