@@ -990,6 +990,15 @@ impl UserContext {
                 self.0.general.a2 = args[2];
                 // SUM = 1, FS = 0b11, SPIE = 1
                 self.0.sstatus = 1 << 18 | 0b11 << 13 | 1 << 5;
+                // VS = Initial when the hart has a vector unit the context
+                // can hold, Off otherwise: Fuchsia's riscv64 libc uses vector
+                // instructions in its start-up, and with VS Off `userboot`
+                // died on its first one. The state is saved and restored
+                // lazily around `run`, by the Dirty bit: see `enter_uspace`
+                // and `trapframe::VectorState`.
+                if crate::imp::cpu::vector_vlenb() != 0 {
+                    self.0.sstatus |= trapframe::SSTATUS_VS_INITIAL;
+                }
             }
         }
     }
@@ -1314,8 +1323,37 @@ impl UserContext {
                 unsafe {
                     core::arch::asm!("msr daifset, #2");
                 }
+                // The vector register file is the one piece of user state
+                // that neither `trap.S` nor the trip out touches: it is
+                // switched here, around `run`, and only for the threads that
+                // use it. In: a thread with saved state gets it back, since
+                // whatever ran on this hart since may have loaded its own.
+                // Out: `trap_entry` stored the hart's `sstatus` in the
+                // context, and its `VS` says Dirty exactly when user code
+                // wrote a vector register or CSR since the last save -- so
+                // the state is saved then, and only then, and the field is
+                // set back to Clean so the next trip can tell again. The
+                // kernel is built without V and runs no vector instruction
+                // of its own, so between the trap and this save nothing has
+                // disturbed the registers.
+                #[cfg(target_arch = "riscv64")]
+                if self.0.vector.live {
+                    // SAFETY: `live` is only set by `vector_save` below, which
+                    // runs only on a hart `vector_vlenb()` vouched for.
+                    unsafe { trapframe::vector_restore(&self.0.vector) };
+                }
                 #[cfg(not(target_arch = "x86_64"))]
                 self.0.run();
+                #[cfg(target_arch = "riscv64")]
+                if self.0.sstatus & trapframe::SSTATUS_VS_MASK == trapframe::SSTATUS_VS_DIRTY {
+                    // SAFETY: Dirty is only reachable from a context entered
+                    // with VS Initial, which `setup_uspace` gives only on a
+                    // hart with a unit the state can hold; and this is the
+                    // first thing after `run` returned, on the same hart.
+                    unsafe { trapframe::vector_save(&mut self.0.vector) };
+                    self.0.sstatus = (self.0.sstatus & !trapframe::SSTATUS_VS_MASK)
+                        | trapframe::SSTATUS_VS_CLEAN;
+                }
                 self.dbg_validate_user_ctx("after trap from user");
             }
         }

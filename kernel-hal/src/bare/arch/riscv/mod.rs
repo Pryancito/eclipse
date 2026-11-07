@@ -59,6 +59,9 @@ pub fn primary_init_early() {
         info!("Load timebase frequency from DTB: {} Hz", time_freq);
         super::cpu::TIMEBASE_HZ.init_once_by(time_freq as u64);
     }
+    // Before any user context is set up: `setup_uspace` asks this for the
+    // `sstatus.VS` it enters user mode with.
+    cpu::init_vector(dt.riscv_isa());
     if let Some(initrd_region) = dt.initrd_region() {
         info!("Load initrd regions from DTB: {:#x?}", initrd_region);
         INITRD_REGION.init_once_by(Some(initrd_region));

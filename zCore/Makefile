@@ -415,8 +415,16 @@ ifeq ($(ARCH), x86_64)
 		$(x86_esp_drive) \
 		-nic none
 else ifeq ($(ARCH), riscv64)
+  # `v=true`: the vector unit. QEMU 8.2's `virt` leaves it off, and Fuchsia's
+  # riscv64 libc uses vector instructions in its start-up, so without it
+  # `userboot` dies on its first one. The kernel saves the state lazily
+  # (`trapframe::VectorState`) and switches it on for user mode only when
+  # the device tree says the hart has it, so a QEMU without this is still a
+  # working machine, just one whose Zircon user space cannot start. `vlen`
+  # is well inside the width the user context is sized for (VLEN 256).
   qemu_opts += \
 		-machine virt \
+		-cpu rv64,v=true,vlen=128,vext_spec=v1.0 \
 		-bios default \
 		-m 1G \
 		-no-reboot \

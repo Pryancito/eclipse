@@ -17,6 +17,51 @@ pub(super) fn timebase_hz() -> u64 {
     *TIMEBASE_HZ
 }
 
+/// `VLENB` of the harts, in bytes, or zero when user mode is not given the
+/// vector unit: the device tree names no `v`, or the registers are wider
+/// than the `UserContext` can hold. Set once by `primary_init_early`.
+static VECTOR_VLENB: InitOnce<usize> = InitOnce::new_with_default(0);
+
+/// The width of one vector register in bytes, or zero when user mode runs
+/// with `sstatus.VS` Off. See [`trapframe::VectorState`].
+pub fn vector_vlenb() -> usize {
+    *VECTOR_VLENB
+}
+
+/// Decide from the `riscv,isa` string whether user mode gets the vector
+/// unit, and remember its `VLENB`.
+///
+/// Only a hart the device tree says has V is asked for `vlenb`: on any
+/// other the CSR does not exist and the read is an illegal instruction in
+/// supervisor mode, which the kernel cannot survive. A unit wider than
+/// [`trapframe::VLENB_MAX`] stays Off, as it was before this existed, and
+/// says so.
+pub(super) fn init_vector(isa: Option<&str>) {
+    let Some(isa) = isa else {
+        info!("riscv: no `riscv,isa` in the device tree, vector unit stays Off for user mode");
+        return;
+    };
+    if !zcore_drivers::utils::devicetree::isa_has_vector(isa) {
+        info!("riscv: `{isa}` has no V, vector unit stays Off for user mode");
+        return;
+    }
+    // SAFETY: the device tree just said this hart implements V.
+    let vlenb = unsafe { trapframe::vlenb() };
+    if vlenb == 0 || vlenb > trapframe::VLENB_MAX {
+        warn!(
+            "riscv: VLENB = {vlenb} bytes is more than the {} the user context holds, \
+             vector unit stays Off for user mode",
+            trapframe::VLENB_MAX
+        );
+        return;
+    }
+    info!(
+        "riscv: vector unit on for user mode, VLENB = {vlenb} bytes (VLEN = {} bits)",
+        vlenb * 8
+    );
+    VECTOR_VLENB.init_once_by(vlenb);
+}
+
 // ─── CPU topology: dense logical id  <->  hart id ───────────────────────────────
 //
 // Hart ids (in `tp`) may be sparse (some boards reserve hart 0), so they cannot be

@@ -492,6 +492,19 @@ impl Devicetree {
         self.0.find("/chosen")?.prop_str("bootargs").ok()
     }
 
+    /// The `riscv,isa` string of the first hart under `/cpus` that has one:
+    /// `"rv64imafdcvh_zicsr_..."`. Which extensions the kernel may switch on
+    /// for user mode comes from here, never from trying an instruction: a
+    /// CSR of an extension the hart lacks is an illegal instruction in
+    /// supervisor mode, and the kernel has no probe that survives it.
+    pub fn riscv_isa(&self) -> Option<&str> {
+        self.0
+            .find("/cpus")?
+            .children
+            .iter()
+            .find_map(|cpu| cpu.prop_str("riscv,isa").ok())
+    }
+
     /// Returns the `timebase-frequency` property in the `/cpus` node, as timer
     pub fn timebase_frequency(&self) -> Option<u32> {
         self.0.find("/cpus")?.prop_u32("timebase-frequency").ok()
@@ -566,6 +579,27 @@ fn from_cells(cells: &[u32], cell_num: u32) -> DeviceResult<u64> {
     Ok(value)
 }
 
+/// Whether a `riscv,isa` string names the V extension.
+///
+/// The string is the base (`rv64` or `rv32`) followed by the single-letter
+/// extensions, then `_`-separated multi-letter ones (`zicsr`, `zve32x`...).
+/// `v` is a single-letter extension, so it counts only in that first run;
+/// a `v` inside `_zvl128b` or `_svpbmt` is not the unit. Case does not
+/// matter (the spec says the string is lower case, some firmware shouts).
+pub fn isa_has_vector(isa: &str) -> bool {
+    let isa = isa.trim();
+    let base = isa
+        .get(..4)
+        .map(|b| b.eq_ignore_ascii_case("rv64") || b.eq_ignore_ascii_case("rv32"));
+    if base != Some(true) {
+        return false;
+    }
+    isa[4..]
+        .split('_')
+        .next()
+        .is_some_and(|single| single.chars().any(|c| c.eq_ignore_ascii_case(&'v')))
+}
+
 /// Parse the `reg` property, about `reg`: <https://elinux.org/Device_Tree_Usage#How_Addressing_Works>.
 ///
 /// Lo que devuelve es una direccion **de CPU**, no la del `reg`. Las dos
@@ -628,6 +662,27 @@ mod tests {
         string::{String, ToString},
         vec,
     };
+
+    /// QEMU's `virt` reports `rv64imafdch_...` without `v=true` and
+    /// `rv64imafdcvh_...` with it; the `v` counts only in the single-letter
+    /// run, never inside a `z`/`s` extension name.
+    #[test]
+    fn the_isa_string_says_whether_the_hart_has_vector() {
+        assert!(!isa_has_vector("rv64imafdch_zicbom_zicboz_zicntr_zicsr"));
+        assert!(isa_has_vector(
+            "rv64imafdcvh_zicbom_zicboz_zicntr_zicsr_zvl128b"
+        ));
+        assert!(isa_has_vector("rv64imafdcv"));
+        assert!(isa_has_vector("RV64IMAFDCV"));
+        assert!(
+            !isa_has_vector("rv64imafdc_zve32x_zvl128b"),
+            "a z-extension is not the V unit"
+        );
+        assert!(!isa_has_vector("rv64imafdc_svpbmt"));
+        assert!(!isa_has_vector(""));
+        assert!(!isa_has_vector("rv6"));
+        assert!(!isa_has_vector("x86_64v"));
+    }
 
     /// The ten words of a v17 FDT header that agrees with itself.
     ///
