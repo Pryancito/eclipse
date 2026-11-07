@@ -42,8 +42,11 @@ UNCLASSIFIED = "Not yet classified for this core-tests image"
 # What the verdict reads out of a run: the gtest markers, the listing, and the
 # exit line. Everything else the guest prints -- the kernel's own log at the
 # level asked for, which is most of it -- goes to the guest log on disk and
-# nowhere else.
-KEPT_LINE = re.compile(rb"^(\[ *(RUN|OK|FAILED|SKIPPED|-+|=+) *\]|\*\*\* Exit status|[\w/]+$|  \.[\w/]+$)")
+# nowhere else. A bare-metal guest talks over a serial console that ends its
+# lines with `\r\n`, and `$` only looks past a trailing `\n`: anchored without
+# the `\r?`, the listing of a QEMU run was dropped whole and discovery came
+# back empty while the libos run, which prints bare `\n`, was fine.
+KEPT_LINE = re.compile(rb"^(\[ *(RUN|OK|FAILED|SKIPPED|-+|=+) *\]|\*\*\* Exit status|[\w/]+\r?$|  \.[\w/]+\r?$)")
 
 # How many of the guest's last lines a failed run shows.
 TAIL_LINES = 60

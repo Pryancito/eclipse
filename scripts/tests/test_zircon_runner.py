@@ -1,4 +1,5 @@
 import importlib.util
+import io
 from pathlib import Path
 import unittest
 
@@ -40,6 +41,20 @@ class SiftingTheGuestLog(unittest.TestCase):
         self.assertEqual(outcomes(kept), {"A.One": "OK", "A.Two": "SKIPPED", "A.Three": "FAILED"})
         self.assertIn("*** Exit status -1028 ***", kept)
         self.assertEqual(tail, "*** Exit status -1028 ***\nProcess exited, executing poweroff\n")
+
+    def test_a_serial_console_ends_its_lines_with_crlf_and_the_listing_still_counts(self):
+        guest = (
+            b"[  0.1 INFO 0 0:0 zcore] kernel noise\r\n"
+            b"Timer\r\n"
+            b"  .Basic\r\n"
+            b"[ RUN      ] Timer.Basic\r\n"
+            b"[       OK ] Timer.Basic (1 ms)\r\n"
+            b"*** Exit status 0 ***\r\n"
+        )
+        kept, _ = runner.sift(io.BytesIO(guest))
+        self.assertEqual(runner.discovered_tests(kept), ["Timer.Basic"])
+        self.assertEqual(outcomes(kept), {"Timer.Basic": "OK"})
+        self.assertEqual(runner.verdict("-l", kept, [], 0, False)[0], "OK")
 
 
 class PerTestOutcomes(unittest.TestCase):
