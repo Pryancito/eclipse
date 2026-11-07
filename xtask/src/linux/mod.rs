@@ -3559,9 +3559,58 @@ impl LinuxRootfs {
     /// of the desktop (`copy_into_live`), which is the path Firefox takes.
     /// The lean installer snapshots are taken before that copy, so the
     /// browser stays out of the EFI initramfs.
+    ///
+    /// **Only on a native build.** This is the one tool here built for the
+    /// HOST and not for the target: `cargo build --release` with no
+    /// `--target`, because Servo links against the host's Mesa, GStreamer,
+    /// fontconfig and a dozen more `pkg-config` libraries, and there is no
+    /// cross sysroot in this tree to point it at. On a cross build the
+    /// binary that comes out is an x86_64 ELF, and it used to be copied into
+    /// the aarch64 rootfs all the same — where `verify::check_elf_machines`
+    /// (rightly) refuses it:
+    ///
+    /// ```text
+    /// usr/bin/silversurfer es un ELF de x86_64 y la rootfs es de aarch64:
+    /// se enlazo con el toolchain equivocado
+    /// ```
+    ///
+    /// which aborted `make iso ARCH=aarch64` and, with it, the arm64 half of
+    /// `make release` (riscv64 the same way, through `make image`). So a
+    /// cross build installs nothing and the menu takes the fallback that
+    /// `write_silversurfer_wrapper` was written for. It also DELETES a
+    /// wrong-arch copy an earlier build left behind: `rootfs/<arch>` is
+    /// preserved between builds, so skipping alone would keep failing the
+    /// verifier forever on a tree that once built an arm64 image.
     fn install_silversurfer(&self, rootfs: &Path) {
         let dir = PROJECT_DIR.join("tools").join("SilverSurfer");
         let executable = dir.join("target").join("release").join("silversurfer");
+        if self.needs_cross_linker() {
+            // The rootfs is preserved, so the leftover has to go. Only one
+            // of the wrong arch: a native build of this same tree leaves a
+            // perfectly good binary that the next native build reuses.
+            for leftover in [
+                rootfs.join("usr/bin").join("silversurfer"),
+                rootfs.join("bin").join("silversurfer"),
+            ] {
+                if leftover.is_file() && !self.cached_for_target(&leftover) {
+                    let _ = fs::remove_file(&leftover);
+                    println!(
+                        "silversurfer: quito {} (ELF del anfitrion en una rootfs de {})",
+                        leftover.display(),
+                        self.0.name()
+                    );
+                }
+            }
+            eprintln!(
+                "warning: silversurfer no viaja a una imagen de {} construida en un \
+                 anfitrion de {} (Servo se enlaza contra la Mesa/GStreamer del \
+                 anfitrion y aqui no hay sysroot cruzado); el menu usa \
+                 eclipse-browser → Firefox",
+                self.0.name(),
+                std::env::consts::ARCH
+            );
+            return;
+        }
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
             lunartext_mtime(),
@@ -3622,7 +3671,12 @@ impl LinuxRootfs {
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if executable.is_file() {
+        // Y la puerta del arco incluso aqui, donde el arco del anfitrion ES
+        // el del objetivo: `target/release/` no lleva el arco en la ruta, asi
+        // que un binario que quedara de otro arbol --- o de antes de cambiar
+        // de anfitrion --- se copiaria sin mirar nada, que es justo el agujero
+        // que `cached_for_target` cierra en las otras veintitres caches.
+        if executable.is_file() && self.cached_for_target(&executable) {
             let _ = fs::remove_file(&dest);
             if let Err(err) = fs::copy(&executable, &dest) {
                 eprintln!("warning: could not install silversurfer: {err}");
