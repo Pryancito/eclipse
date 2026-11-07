@@ -39,7 +39,7 @@ pub trait NetScheme: Scheme {
     }
     /// Returns whether this interface is loopback without allocating heap memory.
     fn is_loopback(&self) -> bool {
-        self.ifname() == "loopback"
+        self.ifname() == "lo"
     }
     fn get_ifname(&self) -> String {
         self.ifname().into()
@@ -313,7 +313,7 @@ mod tests {
             EthernetAddress::default()
         }
         fn ifname(&self) -> &str {
-            "loopback"
+            "lo"
         }
         fn is_loopback(&self) -> bool {
             true
@@ -334,8 +334,8 @@ mod tests {
         assert!(!bare.is_loopback());
 
         let lo = MockLoopback;
-        assert_eq!(lo.ifname(), "loopback");
-        assert_eq!(lo.get_ifname(), "loopback");
+        assert_eq!(lo.ifname(), "lo");
+        assert_eq!(lo.get_ifname(), "lo");
         assert!(lo.is_loopback());
 
         let def = DefaultNic;

@@ -224,10 +224,10 @@ impl Scheme for LoopbackInterface {
 impl NetScheme for LoopbackInterface {
     fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
         // The loopback has no hardware RX ring; frames are delivered through
-        // `poll`. `netdev_drain_rx` skips this device by comparing its name
-        // against the literal "loopback", so `unimplemented!()` here turned a
-        // future rename (to the Linux-conventional "lo", say) into a kernel
-        // panic on a routine RX drain.
+        // `poll`. `netdev_drain_rx` skips this device through `is_loopback`,
+        // and before that by its name, so `unimplemented!()` here turned the
+        // rename to the Linux-conventional "lo" into a kernel panic on a
+        // routine RX drain.
         Err(DeviceError::NotSupported)
     }
     fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
@@ -435,7 +435,7 @@ mod tests {
             .finalize();
         LoopbackInterface {
             iface: Arc::new(Mutex::new(iface)),
-            name: String::from("loopback"),
+            name: String::from("lo"),
             stats,
             routes: Arc::new(Mutex::new(Vec::new())),
             ip_addrs: Arc::new(Mutex::new(ip_addrs)),
@@ -593,8 +593,8 @@ mod tests {
     }
 
     /// `recv` answers `NotSupported` rather than panicking: `netdev_drain_rx`
-    /// skips this device by comparing its name against the literal "loopback",
-    /// so an `unimplemented!()` here turned a rename into a kernel panic on a
+    /// used to skip this device by comparing its name against a literal, so an
+    /// `unimplemented!()` here turned a rename into a kernel panic on a
     /// routine RX drain.
     #[test]
     fn the_raw_receive_path_refuses_instead_of_panicking() {
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn the_interface_reports_the_name_it_was_given() {
         let iface = interface(stats());
-        assert_eq!(iface.get_ifname(), "loopback");
+        assert_eq!(iface.get_ifname(), "lo");
         assert_eq!(Scheme::name(&iface), "loopback");
     }
 
@@ -945,12 +945,12 @@ mod tests {
 
     /// `NetScheme` asks for the name twice, through `ifname` and through
     /// `get_ifname`, and only the second one was tested. The two have to agree:
-    /// `netdev_drain_rx` skips the loopback by comparing a name against the
-    /// literal "loopback", and it does not go through `get_ifname`.
+    /// the default `is_loopback` compares `ifname` against "lo", the name Linux
+    /// gives the loopback, and it does not go through `get_ifname`.
     #[test]
     fn the_interface_answers_to_the_same_name_both_ways() {
         let iface = interface(stats());
-        assert_eq!(iface.ifname(), "loopback");
+        assert_eq!(iface.ifname(), "lo");
         assert_eq!(iface.ifname(), iface.get_ifname());
         assert!(
             iface.is_loopback(),
@@ -1111,7 +1111,7 @@ mod tests {
             .finalize();
         LoopbackInterface {
             iface: Arc::new(Mutex::new(iface)),
-            name: String::from("loopback"),
+            name: String::from("lo"),
             stats,
             routes: Arc::new(Mutex::new(Vec::new())),
             ip_addrs: Arc::new(Mutex::new(seen)),
