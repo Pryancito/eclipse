@@ -2,7 +2,7 @@
 
 use super::*;
 use alloc::string::String;
-use linux_object::fs::{mount_fs, nfs_host_to_resolve, umount_fs, with_addr_option};
+use linux_object::fs::{mount_fs, umount_fs, with_resolved_addr};
 use linux_object::process::CAP_SYS_ADMIN;
 
 /// Whether the caller may touch the mount table at all.
@@ -89,19 +89,13 @@ impl Syscall<'_> {
         // helper resolves the name in userspace and the kernel is handed
         // `addr=`. There is no helper here, so the kernel does it, in the
         // one layer that can await.
-        let resolved;
-        let data = match nfs_host_to_resolve(fstype, source, data) {
-            None => data,
-            Some(host) => {
-                use linux_object::fs::dns_vfs_root;
-                use linux_object::net::dns::{self, DnsFamily};
-                let root = dns_vfs_root().ok_or(LxError::ENOENT)?;
-                let addrs = dns::resolve(&root, &host, DnsFamily::Unspec).await?;
-                let addr = *addrs.first().ok_or(LxError::ENOENT)?;
-                resolved = with_addr_option(data, addr);
-                resolved.as_str()
-            }
-        };
+        //
+        // Shared with the `/etc/fstab` path rather than written twice: the
+        // two mount their lines from the same option strings, so a
+        // difference of opinion about when a name is looked up would mean a
+        // line that mounts by hand and not at boot, or the reverse.
+        let resolved = with_resolved_addr(fstype, source, data).await?;
+        let data = resolved.as_deref().unwrap_or(data);
         mount_fs(proc, source, &target, fstype, flags, data)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)

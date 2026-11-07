@@ -20,6 +20,7 @@ mod fat_wrong_fs_tests;
 mod file;
 mod flagged_fs;
 pub mod flock;
+mod fstab_line;
 pub mod hunter_config;
 pub mod hunter_feeds;
 mod inotify;
@@ -2344,8 +2345,8 @@ fn resolve_or_create_dir(root: &Arc<MNode>, path: &str) -> LxResult<Arc<MNode>> 
 }
 
 /// Mount entries from `/etc/fstab` (except `/`). Call after init is up.
-pub fn mount_vfs_fstab(root: &Arc<MNode>) {
-    mount_fstab(root);
+pub async fn mount_vfs_fstab(root: &Arc<MNode>) {
+    mount_fstab(root).await;
 }
 
 /// Process `/etc/fstab` using the VFS root remembered by `create_root_fs`.
@@ -2354,18 +2355,30 @@ pub fn mount_vfs_fstab(root: &Arc<MNode>) {
 /// task), since mounting extra filesystems (/boot/efi vfat, /home, …) does
 /// blocking block-device I/O that must not run on the early-boot path before
 /// the shell appears.
-pub fn mount_fstab_deferred() {
+///
+/// `async` because a network line may name a server by a name only DNS
+/// knows; see [`mount_fstab_network`]. The caller already runs this inside
+/// an executor, which is what makes resolving from here possible at all —
+/// `mount_fs` itself is synchronous and is called from places that have no
+/// executor, which is why `addr=` exists.
+pub async fn mount_fstab_deferred() {
     match mount_ops::vfs_root() {
         Some(root) => {
             warn!("[boot] mount_fstab_deferred: processing /etc/fstab");
-            mount_fstab(&root);
+            mount_fstab(&root).await;
         }
         None => warn!("[boot] mount_fstab_deferred: no VFS root set; skipping"),
     }
 }
 
-fn mount_fstab(root: &Arc<MNode>) {
+use fstab_line::{fstab_flags, fstab_line_action, mount_fstab_network, run_budget, FstabAction};
+
+async fn mount_fstab(root: &Arc<MNode>) {
     info!("mount_fstab: parsing /etc/fstab");
+    // Built on the first network line and not before, so a fstab with no
+    // network line spends none of it and the clock starts when the first
+    // server is actually dialled.
+    let mut net_budget: Option<Budget> = None;
     if let Ok(etc) = root.find(true, "etc") {
         if let Ok(fstab_inode) = etc.find(true, "fstab") {
             let fstab_dyn: Arc<dyn INode> = fstab_inode;
@@ -2385,9 +2398,32 @@ fn mount_fstab(root: &Arc<MNode>) {
                         let fstype = parts[2];
                         let options = parts.get(3).copied().unwrap_or("defaults");
 
-                        if target == "/" || target == "none" || fstype == "swap" {
-                            continue;
-                        }
+                        // What the line means, decided in one place so it
+                        // can be tested without a root filesystem and an
+                        // fstab in it: see `fstab_line_action`.
+                        let fstype_parsed = match fstab_line_action(target, fstype, options) {
+                            FstabAction::Skip(why) => {
+                                info!("mount_fstab: skipping {:?} ({})", target, why);
+                                continue;
+                            }
+                            FstabAction::Unsupported(e) => {
+                                warn!("mount_fstab: unsupported fstype {:?}: {:?}", fstype, e);
+                                continue;
+                            }
+                            FstabAction::Network(fstype_parsed) => {
+                                mount_fstab_network(
+                                    root,
+                                    source,
+                                    target,
+                                    fstype_parsed,
+                                    options,
+                                    run_budget(&mut net_budget),
+                                )
+                                .await;
+                                continue;
+                            }
+                            FstabAction::Block(fstype_parsed) => fstype_parsed,
+                        };
 
                         // Resolve the source inode using coerced root_dyn
                         let source_rel = source.trim_start_matches('/');
@@ -2455,14 +2491,6 @@ fn mount_fstab(root: &Arc<MNode>) {
                             }
                         };
 
-                        let fstype_parsed = match mount_ops::parse_fstype(fstype) {
-                            Ok(ft) => ft,
-                            Err(e) => {
-                                warn!("mount_fstab: unsupported fstype {:?}: {:?}", fstype, e);
-                                continue;
-                            }
-                        };
-
                         let target_node = match resolve_or_create_dir(root, target) {
                             Ok(node) => node,
                             Err(e) => {
@@ -2479,18 +2507,7 @@ fn mount_fstab(root: &Arc<MNode>) {
                             continue;
                         }
 
-                        // Parse options for flags
-                        let mut flags = 0;
-                        for opt in options.split(',') {
-                            match opt.trim() {
-                                "ro" => flags |= mount_state::MS_RDONLY,
-                                "rw" => flags &= !mount_state::MS_RDONLY,
-                                "nosuid" => flags |= mount_state::MS_NOSUID,
-                                "nodev" => flags |= mount_state::MS_NODEV,
-                                "noexec" => flags |= mount_state::MS_NOEXEC,
-                                _ => {}
-                            }
-                        }
+                        let flags = fstab_flags(options);
 
                         let fs = match mount_ops::open_filesystem(
                             backend,
@@ -2558,10 +2575,13 @@ fn efi_dev_from_root_cmdline() -> Option<String> {
     }
 }
 
-pub use mount_ops::{mount_fs, nfs_host_to_resolve, umount_fs, with_addr_option};
+pub use mount_ops::{
+    mount_fs, nfs_host_to_resolve, umount_fs, with_addr_option, with_resolved_addr,
+};
 pub use mount_state::{
     check_umount_flags, MS_BIND, MS_MOVE, MS_REMOUNT, ST_VALID, UMOUNT_NOFOLLOW,
 };
+use nfs::greeting::Budget;
 
 /// VFS root for kernel services that need to read `/etc/*` (e.g. DNS/hosts).
 pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {

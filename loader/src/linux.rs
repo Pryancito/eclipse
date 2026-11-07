@@ -359,7 +359,7 @@ fn spawn(
     // shows. Done once, by whoever performs the boot work.
     if boot_work {
         kernel_hal::thread::spawn(async {
-            linux_object::fs::mount_fstab_deferred();
+            linux_object::fs::mount_fstab_deferred().await;
         });
         // Periodic load-average sampler (Linux samples from the scheduler
         // tick): keeps /proc/loadavg honest by sampling the run queue at
