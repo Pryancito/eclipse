@@ -69,13 +69,20 @@ use super::client::{RpcTransport, TransportError};
 /// down, and a slow server is not a broken one.
 pub const SEND_TIMEOUT_MS: u64 = 60_000;
 
-/// The most consecutive passes [`KernelTransport::send`] will make over a
-/// send buffer that takes nothing, however little the clock has moved.
+/// The most consecutive passes [`KernelTransport::send`] will make **without
+/// the clock advancing at all**.
 ///
-/// Each pass is a park, so on a working clock the deadline is reached long
-/// before this is: at the 1 ms tight park, ten thousand of them is ten
-/// seconds, and the default deadline is sixty. It exists for the clock that
-/// stops.
+/// Only passes over a frozen clock count, and the counter is reset the moment
+/// time moves. That distinction is the whole point of the bound and the first
+/// version of it got it wrong: counting every stalled pass made this a second,
+/// shorter deadline, because at the 1 ms tight park ten thousand parks are ten
+/// seconds while the real deadline is sixty — so a merely slow peer was torn
+/// down six times sooner than the timeout said, and the timeout was the
+/// documented limit. Counting only frozen passes leaves the deadline as the
+/// one limit on patience and leaves this as what it was for: an exit for a
+/// clock that has stopped, since a loop whose only exit is the clock does not
+/// terminate without one, and this loop runs on the thread that drives the
+/// network stack.
 pub const MAX_SEND_STALLS: u32 = 10_000;
 
 /// The most passes [`KernelTransport::poll`] will make round its park loop,
@@ -86,6 +93,15 @@ pub const MAX_SEND_STALLS: u32 = 10_000;
 /// them is well past the 5 ms longest park — and finite so that a clock which
 /// stops cannot wedge the thread that drives the network stack.
 pub const MAX_PARK_PASSES: u32 = 5_000;
+
+/// The most consecutive turns [`recv_at_least`] will take **without the clock
+/// advancing at all**.
+///
+/// The same exit, one level up. Each turn is a read plus a park, so on a
+/// working clock the deadline ends the wait long before this does, and the
+/// counter resets whenever time moves. Without it a bounded park just returns
+/// into an unbounded loop, which is not a bound.
+pub const MAX_RECV_PASSES: u32 = 5_000;
 
 /// How long to park between read attempts, by how many came back empty.
 ///
@@ -194,6 +210,26 @@ pub struct KernelTransport<D: StackDriver = KernelDriver> {
     /// behaviour without waiting a minute for it. The default is
     /// [`SEND_TIMEOUT_MS`].
     send_timeout_ms: u64,
+    /// The stall bound in force. See [`MAX_SEND_STALLS`].
+    ///
+    /// A field for the same reason `send_timeout_ms` is one: the bound is
+    /// deliberately wide enough that a test cannot reach it in a suite, and a
+    /// bound nothing can reach is a bound nothing measures.
+    max_send_stalls: u32,
+    /// Whether this connection has been given up on, and why it had to be.
+    ///
+    /// A `send` that fails having already handed *part* of a record to the
+    /// socket leaves the server waiting for the rest of a message. The client
+    /// above only sees an error and keeps the transport, so its next call
+    /// writes a record header where the server expects the previous payload:
+    /// not a lost call but a stream out of step, surfacing in some later call
+    /// that had nothing to do with it.
+    ///
+    /// Half a record cannot be withdrawn from the server's buffer, so the
+    /// only honest repair is to stop using the connection. Once this is set
+    /// the socket has been aborted and every operation answers
+    /// [`TransportError::NotConnected`].
+    poisoned: bool,
 }
 
 // Nothing in the kernel builds a transport yet: the mount path that will is
@@ -221,6 +257,8 @@ impl<D: StackDriver> KernelTransport<D> {
             empty_polls: 0,
             driver,
             send_timeout_ms: SEND_TIMEOUT_MS,
+            max_send_stalls: MAX_SEND_STALLS,
+            poisoned: false,
         }
     }
 
@@ -230,6 +268,14 @@ impl<D: StackDriver> KernelTransport<D> {
     #[cfg(test)]
     pub(crate) fn with_send_timeout(mut self, ms: u64) -> Self {
         self.send_timeout_ms = ms;
+        self
+    }
+
+    /// Lower the stall bound, so a test can show what it does and does not
+    /// count. See [`MAX_SEND_STALLS`].
+    #[cfg(test)]
+    pub(crate) fn with_max_send_stalls(mut self, stalls: u32) -> Self {
+        self.max_send_stalls = stalls;
         self
     }
 
@@ -252,6 +298,48 @@ impl<D: StackDriver> KernelTransport<D> {
         &self.driver
     }
 
+    /// Whether this connection has been given up on. See
+    /// [`Self::poisoned`].
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Give the connection up: abort the socket and refuse every later
+    /// operation.
+    ///
+    /// `abort` and not `close`: a close is a FIN, which tells the server
+    /// "that is all I have to say" about a message this client left half
+    /// sent, and the server would wait out its own timeout on the rest. A
+    /// reset says the connection is gone, which is true.
+    fn poison(&mut self) {
+        if self.poisoned {
+            return;
+        }
+        self.poisoned = true;
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        sets.get::<TcpSocket>(self.sock()).abort();
+        drop(sets);
+        // Push the reset out rather than leaving it queued behind the bytes
+        // that caused this.
+        self.drive();
+    }
+
+    /// The error to report for a failed `send`, giving the connection up
+    /// first if part of the message had already gone out.
+    ///
+    /// `sent == 0` is an ordinary failure: nothing reached the server, so the
+    /// connection is still in step and the caller may try again on it. Any
+    /// other value left a partial record in the server's buffer, and from
+    /// there the connection can only mislead -- see [`Self::poisoned`].
+    fn give_up_if_partial(&mut self, sent: usize, err: TransportError) -> TransportError {
+        if sent == 0 {
+            return err;
+        }
+        self.poison();
+        err
+    }
+
     /// Drive the network stack so anything that has arrived is in the socket
     /// before it is read, and anything queued goes out.
     fn drive(&mut self) {
@@ -261,19 +349,25 @@ impl<D: StackDriver> KernelTransport<D> {
 
 impl<D: StackDriver> RpcTransport for KernelTransport<D> {
     fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
+        if self.poisoned {
+            return Err(TransportError::NotConnected);
+        }
         let deadline = self.now_ms() + self.send_timeout_ms;
         let mut sent = 0;
-        // Passes that moved no bytes. The deadline is the real limit, but a
-        // loop whose only exit is the clock does not terminate if the clock
-        // stops -- and this one runs on the thread that drives the network
-        // stack, so a stalled timer would wedge the machine's networking and
-        // not just this mount. Both bounds, and whichever trips first ends it.
-        let mut stalls = 0u32;
+        // Passes over a send buffer that took nothing **and a clock that did
+        // not move**. The deadline is the real limit on patience; this is the
+        // exit for a clock that has stopped, because a loop whose only exit
+        // is the clock does not terminate without one -- and this one runs on
+        // the thread that drives the network stack, so a stalled timer would
+        // wedge the machine's networking and not just this mount.
+        //
+        // Counting *every* stalled pass, as the first version did, made this
+        // a second and much shorter deadline: ten thousand 1 ms parks is ten
+        // seconds against a documented sixty. So time advancing resets it,
+        // and a merely slow peer is bounded by the deadline alone.
+        let mut frozen_passes = 0u32;
 
         while sent < data.len() {
-            if stalls >= MAX_SEND_STALLS {
-                return Err(TransportError::Other);
-            }
             self.drive();
 
             let taken = {
@@ -283,10 +377,15 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
                 if !socket.may_send() {
                     // The send half is gone. Whatever is already queued will
                     // not be delivered, so reporting a partial success would
-                    // be a lie the caller cannot detect.
-                    return Err(TransportError::Closed);
+                    // be a lie the caller cannot detect. Reported outside the
+                    // block, because giving the connection up takes the set.
+                    None
+                } else {
+                    Some(socket.send_slice(&data[sent..]))
                 }
-                socket.send_slice(&data[sent..])
+            };
+            let Some(taken) = taken else {
+                return Err(self.give_up_if_partial(sent, TransportError::Closed));
             };
 
             match taken {
@@ -294,27 +393,38 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
                     // The buffer is full: the peer is not reading, or its
                     // window is shut. Wait, having first pushed what is
                     // already queued out onto the wire.
-                    if self.now_ms() >= deadline {
-                        return Err(TransportError::Other);
+                    let before = self.now_ms();
+                    if before >= deadline {
+                        return Err(self.give_up_if_partial(sent, TransportError::Other));
                     }
-                    stalls += 1;
                     self.poll();
+                    if self.now_ms() > before {
+                        frozen_passes = 0;
+                    } else {
+                        frozen_passes += 1;
+                        if frozen_passes >= self.max_send_stalls {
+                            return Err(self.give_up_if_partial(sent, TransportError::Other));
+                        }
+                    }
                 }
                 Ok(n) => {
                     sent += n;
-                    stalls = 0;
+                    frozen_passes = 0;
                     // Push it out now rather than waiting for the next tick:
                     // the client is about to start waiting for the reply to
                     // bytes still sitting in a buffer.
                     self.drive();
                 }
-                Err(e) => return Err(classify_write(e)),
+                Err(e) => return Err(self.give_up_if_partial(sent, classify_write(e))),
             }
         }
         Ok(())
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        if self.poisoned {
+            return Err(TransportError::NotConnected);
+        }
         self.drive();
 
         let (taken, may_recv) = {
@@ -364,11 +474,16 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
         // would take the machine's networking with it. Whatever the clock
         // says, this returns, and the caller is a loop that can come back.
         let until = self.now_ms() + park_ms(self.empty_polls);
-        let mut passes = 0u32;
-        while self.now_ms() < until && passes < MAX_PARK_PASSES {
-            passes += 1;
+        let mut frozen_passes = 0u32;
+        while self.now_ms() < until && frozen_passes < MAX_PARK_PASSES {
+            let before = self.now_ms();
             kernel_hal::thread::yield_now_sync();
             self.drive();
+            if self.now_ms() > before {
+                frozen_passes = 0;
+            } else {
+                frozen_passes += 1;
+            }
         }
     }
 }
@@ -378,6 +493,24 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
 ///
 /// Exists for the tests and for `MOUNT`, which is one call-and-reply before
 /// there is a mount to hang a client off.
+///
+/// # The deadline is checked every turn, not only on an empty read
+///
+/// Checking it only when `recv` returned nothing is a deadline a dribbling
+/// server walks straight past: a byte at a time keeps taking the other arm,
+/// and if the message eventually completes this returns **success** long
+/// after the caller's deadline expired. That is worse than a missed timeout,
+/// because a caller that set a deadline is told it was honoured.
+/// [`RpcClient::wait_for_reply`](super::client::RpcClient) checks it every
+/// turn, and so does this.
+///
+/// # And a bound for the clock that stops
+///
+/// The park inside [`KernelTransport::poll`] is bounded, but a bounded park
+/// that returns into an unbounded loop is not a bound at all: with a frozen
+/// clock, `now_ms() >= deadline_ms` is false forever and this spins. So the
+/// turns that the clock does not move are counted here too, and running out
+/// of them is a terminal transport error rather than another turn.
 pub fn recv_at_least<T: RpcTransport>(
     transport: &mut T,
     want: usize,
@@ -385,16 +518,24 @@ pub fn recv_at_least<T: RpcTransport>(
 ) -> Result<Vec<u8>, TransportError> {
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 512];
+    let mut frozen_passes = 0u32;
     while out.len() < want {
+        let before = transport.now_ms();
+        if before >= deadline_ms {
+            return Err(TransportError::Other);
+        }
         let room = core::cmp::min(chunk.len(), want - out.len());
         match transport.recv(&mut chunk[..room])? {
-            0 => {
-                if transport.now_ms() >= deadline_ms {
-                    return Err(TransportError::Other);
-                }
-                transport.poll();
-            }
+            0 => transport.poll(),
             n => out.extend_from_slice(&chunk[..n]),
+        }
+        if transport.now_ms() > before {
+            frozen_passes = 0;
+        } else {
+            frozen_passes += 1;
+            if frozen_passes >= MAX_RECV_PASSES {
+                return Err(TransportError::Other);
+            }
         }
     }
     Ok(out)
