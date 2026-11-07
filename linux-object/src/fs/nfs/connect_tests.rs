@@ -197,3 +197,54 @@ fn the_connector_hands_back_a_transport_on_the_port_it_was_asked_for() {
     assert!(!transport.is_poisoned());
     assert_eq!(state_of(&server), TcpState::Established);
 }
+
+#[test]
+fn the_connector_waits_the_budget_it_was_given_and_not_its_own_ceiling() {
+    // The budget is an argument because the greeting spends one deadline
+    // across three steps, and a connector that waits its own thirty seconds
+    // whatever is left of that budget is how the deadline stops meaning
+    // anything. Measured by the clock and not by the errno: a ceiling that
+    // ignored the argument would answer `ETIMEDOUT` too, just much later.
+    //
+    // Nothing drives the stack here, so the SYN is never carried and the
+    // wait runs to whichever of the two numbers is in force.
+    let _g = LOCK.lock();
+    let mut connector = TcpConnector::new(IpAddress::v4(127, 0, 0, 1)).with_timeout(30_000);
+
+    let started = kernel_hal::timer::timer_now();
+    let err = match connector.connect(41306, 50) {
+        Ok(_) => panic!("a handshake nothing carried reported success"),
+        Err(e) => e,
+    };
+    let took = kernel_hal::timer::timer_now() - started;
+
+    assert_eq!(err, LxError::ETIMEDOUT);
+    assert!(
+        took < core::time::Duration::from_secs(1),
+        "it waited {:?} for a 50 ms budget under a 30 s ceiling",
+        took
+    );
+}
+
+#[test]
+fn the_connectors_own_ceiling_still_caps_a_bigger_budget() {
+    // The other half: the argument is a budget, not a licence. A connector
+    // built with `with_timeout` promised that ceiling, and a caller with a
+    // minute to spend does not get to hold the handshake for a minute.
+    let _g = LOCK.lock();
+    let mut connector = TcpConnector::new(IpAddress::v4(127, 0, 0, 1)).with_timeout(50);
+
+    let started = kernel_hal::timer::timer_now();
+    let err = match connector.connect(41307, 60_000) {
+        Ok(_) => panic!("a handshake nothing carried reported success"),
+        Err(e) => e,
+    };
+    let took = kernel_hal::timer::timer_now() - started;
+
+    assert_eq!(err, LxError::ETIMEDOUT);
+    assert!(
+        took < core::time::Duration::from_secs(1),
+        "it waited {:?} for a 50 ms ceiling",
+        took
+    );
+}

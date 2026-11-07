@@ -68,8 +68,16 @@ pub trait Connector {
     /// What a connection is, once made.
     type Transport: RpcTransport;
 
-    /// Connect to `port` on the server this connector was built for.
-    fn connect(&mut self, port: u16) -> LxResult<Self::Transport>;
+    /// Connect to `port` on the server this connector was built for, taking
+    /// no longer than `timeout_ms`.
+    ///
+    /// The timeout is an argument and not a property of the connector
+    /// because the caller is spending a budget: the greeting has one
+    /// deadline for all three of its steps, and a connection that may take
+    /// the connector's own thirty seconds whatever is left of that budget is
+    /// how three steps inside their own timeouts add up to a `mount(2)` that
+    /// hangs for minutes. A connector may still impose its own ceiling.
+    fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport>;
 }
 
 /// The real one: a kernel TCP socket to a fixed address.
@@ -103,9 +111,14 @@ impl TcpConnector {
 impl Connector for TcpConnector {
     type Transport = KernelTransport<KernelDriver>;
 
-    fn connect(&mut self, port: u16) -> LxResult<Self::Transport> {
+    fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport> {
         let mut driver = KernelDriver;
-        let handle = connect_sync(self.addr, port, self.timeout_ms, &mut driver)?;
+        // The caller's budget and this connector's ceiling, whichever is
+        // shorter: the ceiling is what a connector built with
+        // `with_timeout` promised, and the budget is what is left of the
+        // caller's deadline.
+        let ms = timeout_ms.min(self.timeout_ms);
+        let handle = connect_sync(self.addr, port, ms, &mut driver)?;
         Ok(KernelTransport::new(handle))
     }
 }
