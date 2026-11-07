@@ -84,6 +84,14 @@ class PerTestOutcomes(unittest.TestCase):
         self.assertEqual(runner.outcomes(""), {})
         self.assertEqual(runner.unmet(["Suite.Case"], {}), ["Suite.Case"])
 
+    def test_a_verdict_whose_run_line_was_spliced_still_counts(self):
+        """Six harts share one serial line, and a `[ RUN ]` line comes out
+        spliced now and then; the case's own verdict, with its timing, is
+        the result."""
+        output = "[ RUN      ] Suite.A\n[       OK ] Suite.A (1 ms)\n[ RUN   [  0.1 WARN kernel] noise\n[       OK ] Suite.B (844 ms)\n"
+        self.assertEqual(runner.outcomes(output), {"Suite.A": "OK", "Suite.B": "OK"})
+        self.assertEqual(runner.unmet(["Suite.A", "Suite.B"], runner.outcomes(output)), [])
+
     def test_the_summary_tally_is_not_what_decides(self):
         """A run sweeps up tests nobody asked for, so the guest's own total and
         its `[  FAILED  ]` lines cannot be the verdict: only the requested

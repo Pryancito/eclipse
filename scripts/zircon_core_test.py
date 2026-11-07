@@ -78,8 +78,16 @@ def outcomes(output):
     is named rather than counted as absent.
     """
     results = {name: "DID-NOT-FINISH" for name in re.findall(r"\[ RUN      \] (\S+)", output)}
-    for status, name in re.findall(r"\[(       OK |  FAILED  |  SKIPPED )\] (\S+\.\S+)", output):
-        if name in results:
+    for status, name, timed in re.findall(
+        r"\[(       OK |  FAILED  |  SKIPPED )\] (\S+\.\S+)( \(\d+ ms\))?", output
+    ):
+        # A per-case verdict carries its timing; the `[  FAILED  ]` lines of
+        # gtest's closing list do not, and they name cases nobody asked for.
+        # The verdict stands on its own: with six harts writing one serial
+        # line, a `[ RUN ]` line comes out spliced now and then (measured
+        # here, 3 boots of 12: `ProcessTest.KillChannelHandleCycle` had its
+        # `[ OK ]` and no `[ RUN ]`, and was reported NOT-RUN).
+        if name in results or timed:
             results[name] = status.strip()
     return results
 

@@ -887,12 +887,12 @@ mod tests {
         assert!(!root_job.signal().contains(Signal::JOB_TERMINATED));
         assert!(job.signal().contains(Signal::JOB_TERMINATED)); // but the lonely job is terminated
 
-        // PROCESS_TERMINATED is asserted the moment the exit status is
-        // published (`Process::exit`), not when the last thread finishes
-        // dying: Linux `wait4` semantics — a killed process is waitable as a
-        // zombie right away, even while a thread is parked in a blocking
-        // syscall. See the comment in `Process::exit`.
-        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+        // A Zircon process (no extension) is terminated when its last thread
+        // is gone, as Zircon's is and as its runtime tests read it; a Linux
+        // one publishes PROCESS_TERMINATED the moment its status is (`wait4`
+        // semantics, a zombie right away). See the comment in `Process::exit`
+        // and the two tests beside `exiting_publishes_termination_at_once`.
+        assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
         assert!(!thread.signal().contains(Signal::THREAD_TERMINATED));
 
         // wait for killing...

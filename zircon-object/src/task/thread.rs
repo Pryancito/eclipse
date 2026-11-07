@@ -2174,8 +2174,21 @@ impl Future for ThreadSwitchFuture {
             // The poll that finishes the thread already took it off its
             // process's list, with its clocks: what this poll spent in the
             // kernel goes straight to the process, or nobody counts it.
+            //
+            // Unless the process is Zircon's: it was terminated in this very
+            // poll, when its last thread left, and ZX_INFO_TASK_RUNTIME is
+            // frozen from ZX_PROCESS_TERMINATED on. Credited here, the
+            // teardown's kernel time landed AFTER the signal, and
+            // `ProcessTest.GetInfoRuntimeV1` read 3651000 ns and then
+            // 20742600 ns from a process it had already seen terminate (1
+            // boot of 12 here, riscv64 TCG). Linux hands an exiting task's
+            // clocks over before the parent's `wait` too (`__exit_signal`),
+            // but its `getrusage` is not held to a frozen figure, so the
+            // sliver stays counted there.
             if ret.is_ready() {
-                self.thread.proc().dead_threads_sys_time_add(sys_ns);
+                if self.thread.proc().has_ext() {
+                    self.thread.proc().dead_threads_sys_time_add(sys_ns);
+                }
             } else {
                 self.thread.sys_time_add(sys_ns);
             }

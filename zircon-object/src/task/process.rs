@@ -472,6 +472,10 @@ impl Process {
     }
 }
 
+/// The queue length at which [`ProcessInner::get_cancel_token`] first sweeps
+/// out the senders whose waits are over; after that at every power of two.
+const PRUNE_CANCEL_TOKENS_AT: usize = 16;
+
 #[derive(Default)]
 struct ProcessInner {
     status: Status,
@@ -903,7 +907,25 @@ impl Process {
         // signal here wakes wait_child/wait_child_any and fires the
         // fork-time SIGCHLD callback exactly once (signal_set on an
         // already-set bit does not refire when `terminate()` runs later).
-        self.base.signal_set(Signal::PROCESS_TERMINATED);
+        //
+        // Linux processes only. A Zircon process is terminated when its last
+        // thread is gone, and its tests hold the kernel to that: with the
+        // signal published here, `ProcessTest.GetInfoRuntime` saw
+        // ZX_PROCESS_TERMINATED while the killed thread was still running
+        // down, and two reads of ZX_INFO_TASK_RUNTIME straddling its death
+        // disagreed (1568900 then 4881500 ns, 2 boots of 12 here). A Zircon
+        // thread's kill always lands, so nothing waits for ever on
+        // `terminate()`.
+        if self.has_ext() {
+            self.base.signal_set(Signal::PROCESS_TERMINATED);
+        }
+    }
+
+    /// Whether this process carries an extension (a Linux process does; a
+    /// Zircon one is created with `()`). The two differ on when termination
+    /// is published: see [`exit`](Self::exit).
+    pub(crate) fn has_ext(&self) -> bool {
+        !self.ext.is::<()>()
     }
 
     /// The process finally terminates.
@@ -1808,9 +1830,26 @@ impl ProcessInner {
             .handles
             .get_mut(&handle_value)
             .ok_or(ZxError::BAD_HANDLE)?;
+        // A token's sender stays in the handle's queue until the handle is
+        // closed or moved, but the wait that took it is usually long over by
+        // then: every `zx_object_wait_one` and `zx_object_wait_async` on a
+        // long-lived handle pushed one and nothing ever took one out, and the
+        // x86_64 core-tests boot died of it 458 cases in -- a kernel OOM with
+        // 4.2 million 72-byte senders live (~288 MiB) and the queue's own
+        // buffer at 64 MiB, from `grow_one` right here. A sender whose
+        // receiver is gone has nothing left to tell, so it goes; at powers of
+        // two, so the sweep stays amortised constant per token.
+        if queue.len() >= PRUNE_CANCEL_TOKENS_AT && queue.len().is_power_of_two() {
+            queue.retain(|sender| !sender.is_canceled());
+        }
         let (sender, receiver) = oneshot::channel();
         queue.push(sender);
         Ok(receiver)
+    }
+
+    #[cfg(test)]
+    fn pending_cancel_tokens(&self, handle_value: HandleValue) -> usize {
+        self.handles[&handle_value].1.len()
     }
 
     fn get_handle(&mut self, handle_value: HandleValue) -> ZxResult<Handle> {
@@ -2989,6 +3028,37 @@ mod ext_and_lifecycle_tests {
         );
     }
 
+    /// ... for a Linux process, which is the one whose threads can sit in a
+    /// blocking syscall: with a thread still alive the signal is up as soon
+    /// as the status is.
+    #[test]
+    fn a_linux_process_publishes_termination_before_its_threads_are_gone() {
+        struct LinuxExt;
+        let root = Job::root();
+        let proc = Process::create_with_ext(&root, "linux", LinuxExt).expect("process");
+        let _thread = Thread::create(&proc, "t").expect("thread");
+        proc.exit(0);
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+    }
+
+    /// A Zircon process is terminated when its last thread is gone, and its
+    /// tests read the kernel by that: `ProcessTest.GetInfoRuntime` waits for
+    /// ZX_PROCESS_TERMINATED and then expects ZX_INFO_TASK_RUNTIME to be
+    /// stable, which it is not while a killed thread is still running down.
+    #[test]
+    fn a_zircon_process_publishes_termination_when_its_last_thread_is_gone() {
+        let root = Job::root();
+        let proc = Process::create(&root, "zircon").expect("process");
+        let thread = Thread::create(&proc, "t").expect("thread");
+        proc.exit(0);
+        assert!(
+            !proc.signal().contains(Signal::PROCESS_TERMINATED),
+            "terminated with a thread still alive"
+        );
+        thread.terminate_abandoned();
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+    }
+
     // ------------------------------------------------------- the handle table
 
     /// Every id the mask admits still fits in a handle value. The value is the
@@ -3027,6 +3097,44 @@ mod ext_and_lifecycle_tests {
             token.try_recv(),
             Ok(Some(())),
             "the wait parked on that handle was never told"
+        );
+    }
+
+    /// A token whose wait is over leaves the handle's queue instead of
+    /// staying there until the handle closes: a long-lived handle waited on
+    /// in a loop used to keep every sender ever taken (4.2 million of them
+    /// by the time the x86_64 core-tests boot ran out of heap).
+    #[test]
+    fn finished_waits_do_not_pile_up_on_their_handle() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        for _ in 0..10_000 {
+            drop(proc.get_cancel_token(value).unwrap());
+        }
+        let pending = proc.inner.lock().pending_cancel_tokens(value);
+        assert!(
+            pending <= 2 * super::PRUNE_CANCEL_TOKENS_AT,
+            "{} senders kept for waits that are over",
+            pending
+        );
+    }
+
+    /// The sweep only takes what is finished: a token whose wait is still
+    /// parked is still told when its handle closes.
+    #[test]
+    fn a_live_wait_survives_the_sweep_and_is_still_cancelled() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let mut live = proc.get_cancel_token(value).unwrap();
+        for _ in 0..10_000 {
+            drop(proc.get_cancel_token(value).unwrap());
+        }
+        assert_eq!(live.try_recv(), Ok(None));
+        proc.remove_handle(value).unwrap();
+        assert_eq!(
+            live.try_recv(),
+            Ok(Some(())),
+            "the sweep took a wait that was still parked"
         );
     }
 
