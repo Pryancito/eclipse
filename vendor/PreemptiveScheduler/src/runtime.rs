@@ -544,12 +544,70 @@ pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     )
 }
 
+/// Each CPU's SMT siblings: bit `j` set means logical CPU `j` shares a
+/// physical core with this one. Published once at bring-up by the HAL, which
+/// is the only layer that can see a hardware id (see
+/// `kernel_hal::common::cpu_topology::CpuTopology::siblings_mask`).
+///
+/// All zero until then, and all zero for ever on a machine with one thread
+/// per core or an architecture with no SMT at all — so everything that reads
+/// it must behave exactly as it did before siblings existed when it reads a
+/// zero. "No siblings known" and "no siblings" are deliberately the same
+/// answer here: the only thing either can buy is a tie-break.
+static SMT_SIBLINGS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// Publish `cpu`'s SMT siblings. Called by the HAL as CPUs come up; a later
+/// call replaces the earlier one, because the mask grows as the rest of the
+/// machine registers. Out-of-range ids are dropped rather than wrapped.
+pub fn set_smt_siblings(cpu: usize, mask: u64) {
+    if cpu < MAX_CORE_NUM {
+        SMT_SIBLINGS[cpu].store(mask & !(1u64 << cpu), Ordering::Release);
+    }
+}
+
+/// The CPUs sharing a physical core with `cpu`, as the HAL last published
+/// them. Zero means "nothing known", which is also what a machine without SMT
+/// says.
+pub(crate) fn smt_siblings(cpu: usize) -> u64 {
+    if cpu < MAX_CORE_NUM {
+        SMT_SIBLINGS[cpu].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Where a new task goes, ranked: fewest runnable tasks first, and between
+/// two CPUs that are carrying the same amount, the one whose SMT sibling is
+/// **not** already busy.
+///
+/// The tie-break is the whole of the SMT change, and it is a tie-break on
+/// purpose. Two threads of one core share its execution units, so a pair put
+/// on one core runs at roughly the speed of one thread and a half while the
+/// core next to it idles; the placement scan ranked purely by queue length,
+/// which on an idle machine is a tie between every CPU, and the lowest id
+/// won. On firmware that numbers an APIC id's thread in bit 0 — the usual
+/// numbering — that put the second task on CPU 1, the sibling of CPU 0.
+///
+/// Load still comes first. A CPU with less work is the better home even when
+/// its sibling is busy, because a queue the task has to wait in costs more
+/// than a core it has to share.
+pub(crate) fn placement_score(load: usize, siblings: u64, busy: u64) -> (usize, bool) {
+    (load, siblings & busy != 0)
+}
+
 /// How often a non-idle CPU may scan for a balance pull. Idle steal (empty
 /// local queue) is unchanged and not gated by this.
 const REBALANCE_EVERY: u32 = 32;
 /// A peer must be ahead by this many runnable tasks before a CPU that still
 /// has local work pulls one. Stops two lightly loaded CPUs from ping-ponging.
 pub(crate) const REBALANCE_MARGIN: usize = 2;
+/// The proportional half of [`balance_victim_min`]: a peer must be ahead by
+/// a **ninth** of what the thief already holds (`x >> 3` added to `x`, so
+/// 112,5 % of it) before the difference is worth a migration. Below sixteen
+/// runnable tasks it never binds — [`REBALANCE_MARGIN`] is larger — so it
+/// only shows up on a machine that is genuinely piled up, which is where
+/// moving a task costs more than the imbalance does.
+pub(crate) const REBALANCE_SLACK_SHIFT: u32 = 3;
 
 /// One counter with a cache line to itself.
 ///
@@ -598,10 +656,42 @@ pub(crate) fn rebalance_due() -> bool {
     REBALANCE_TICK[cpu].0.fetch_add(1, Ordering::Relaxed) % REBALANCE_EVERY as u64 == 0
 }
 
-/// Pull while we still have local work only when that work is a single task
-/// and some peer is clearly ahead. `local_ready == 0` is the idle-steal path.
+/// How many runnable tasks a peer must hold before a CPU that already has
+/// `local_ready` of its own takes one off it.
+///
+/// `local_ready` plus a slack, and the slack is the larger of two:
+///
+/// * **[`REBALANCE_MARGIN`]** — moving one task must not invert the pair. At
+///   a difference of one, the thief ends up ahead of its victim and the next
+///   tick hands the task straight back; the margin is what stops that.
+/// * **`local_ready / REBALANCE_SLACK_SHIFT`** — the proportional part, which
+///   is Linux's `imbalance_pct` in spirit: a difference of two tasks between
+///   two CPUs that are each running forty is noise, and chasing it costs a
+///   migration's worth of cold cache for nothing.
+///
+/// The reason this function exists at all is the condition it replaces. The
+/// pull used to require `local_ready == 1`, so a CPU with two or more
+/// runnable tasks never pulled — which makes a lopsided split a **fixed
+/// point** rather than a transient. Under the old rule `24/2/2/2` and
+/// `12/3/3/2` stand for ever, and a run that starts `16/0/0/0` settles at
+/// `10/2/2/2`, because the three light CPUs stop pulling the moment they
+/// reach two. Only the idle steal (`local_ready == 0`) and the stranded
+/// rescue moved anything after that. Those same splits now settle to within
+/// the slack; `settling_a_lopsided_split` runs them.
+///
+/// It stays self-limiting at the top: the threshold grows with the thief's
+/// own backlog, so the busiest CPU never qualifies as a thief and the pull
+/// cannot become the ping-pong the margin was added to prevent.
+pub(crate) fn balance_victim_min(local_ready: usize) -> usize {
+    let slack = REBALANCE_MARGIN.max(local_ready >> REBALANCE_SLACK_SHIFT);
+    local_ready.saturating_add(slack)
+}
+
+/// Pull while we still have local work only when some peer is clearly ahead:
+/// at least [`balance_victim_min`] runnable tasks. `local_ready == 0` is the
+/// idle-steal path and is not this predicate's business.
 pub(crate) fn should_pull_for_balance(local_ready: usize, richest_victim: usize) -> bool {
-    local_ready == 1 && richest_victim >= local_ready + REBALANCE_MARGIN
+    local_ready >= 1 && richest_victim >= balance_victim_min(local_ready)
 }
 
 /// Weak-executor accounting: `(created, peak live per CPU, soft-cap hits)`.
@@ -1902,10 +1992,13 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, Arc<WakerRe
 }
 
 /// One pull from a clearly richer peer. Caller has already checked
-/// [`rebalance_due`] and that the local queue has exactly one runnable task.
-/// Does not migrate the waker page — same ownership rules as idle steal.
-pub(crate) fn steal_for_balance() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
-    let task = steal_task_min(1 + REBALANCE_MARGIN, true);
+/// [`rebalance_due`] and that the local queue holds `local_ready` runnable
+/// tasks, at least one. The victim floor is [`balance_victim_min`] of that,
+/// so the scan and the predicate cannot disagree about who is "clearly
+/// richer". Does not migrate the waker page — same ownership rules as idle
+/// steal.
+pub(crate) fn steal_for_balance(local_ready: usize) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+    let task = steal_task_min(balance_victim_min(local_ready), true);
     if task.is_some() {
         STEAL_REBALANCE.fetch_add(1, Ordering::Relaxed);
     }
@@ -2525,15 +2618,22 @@ pub fn spawn_task(
         // not allowed to poll it is skipped on every pass of that CPU's
         // generator.
         let mut best = affinity_home(mask, executor_ready_mask()).unwrap_or(0);
-        let mut best_count = usize::MAX;
+        let mut best_score = (usize::MAX, true);
+        // One load, outside the loop: `STEALABLE` is a single atomic and the
+        // question it answers here -- "is this candidate's SMT sibling
+        // already carrying runnable work?" -- is a tie-break, so a reading
+        // that goes stale mid-scan costs nothing. It is read instead of
+        // `try_lock`ing each sibling because that would double the scan's
+        // lock traffic to settle a tie.
+        let busy = STEALABLE.load(Ordering::Acquire);
         for i in 0..online {
             if !is_executor_ready(i) || (mask >> i) & 1 == 0 {
                 continue;
             }
             if let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(i) {
-                let count = placement_load(&rt);
-                if count < best_count {
-                    best_count = count;
+                let score = placement_score(placement_load(&rt), smt_siblings(i), busy);
+                if score < best_score {
+                    best_score = score;
                     best = i;
                 }
             }
@@ -3505,6 +3605,52 @@ mod affinity_tests {
         assert_eq!(park_cpu_if_cold(0, cpus(&[0])), 0);
     }
 
+    /// The placement scan's ranking. Load decides; the sibling only breaks a
+    /// tie, and a machine that never published a sibling mask ranks exactly
+    /// as it did before.
+    #[test]
+    fn placement_prefers_a_quiet_core_only_between_equal_queues() {
+        let pair = |cpu: usize| 1u64 << (cpu ^ 1);
+        // CPU 0 and CPU 2 are both empty; CPU 0's sibling (CPU 1) is busy and
+        // CPU 2's (CPU 3) is not, so the second task goes to the other core.
+        let busy = 1 << 1;
+        assert!(placement_score(0, pair(2), busy) < placement_score(0, pair(0), busy));
+        // But a shorter queue still wins, sibling or no sibling: waiting in a
+        // queue costs more than sharing a core.
+        assert!(placement_score(0, pair(0), busy) < placement_score(1, pair(2), busy));
+        // No mask published: every CPU scores on load alone.
+        assert_eq!(placement_score(3, 0, u64::MAX), placement_score(3, 0, 0));
+        for load in 0..4 {
+            assert_eq!(placement_score(load, 0, u64::MAX).1, false);
+        }
+    }
+
+    /// Eight CPUs, two threads per core, every queue empty: placing four
+    /// tasks one after another must fill four distinct cores instead of
+    /// stacking two of them onto core 0. This is the scan's ranking run by
+    /// hand, with the same `(load, sibling busy)` key the real loop uses.
+    #[test]
+    fn four_tasks_on_a_quiet_machine_land_on_four_different_cores() {
+        let siblings = |cpu: usize| 1u64 << (cpu ^ 1);
+        let mut load = [0usize; 8];
+        let mut busy = 0u64;
+        let mut chosen = Vec::new();
+        for _ in 0..4 {
+            let pick = (0..8)
+                .min_by_key(|&i| placement_score(load[i], siblings(i), busy))
+                .unwrap();
+            load[pick] += 1;
+            busy |= 1 << pick;
+            chosen.push(pick);
+        }
+        let cores: alloc::collections::BTreeSet<usize> = chosen.iter().map(|c| c >> 1).collect();
+        assert_eq!(cores.len(), 4, "landed on {chosen:?}");
+        assert!(
+            load.iter().all(|&n| n <= 1),
+            "and never doubled up: {load:?}"
+        );
+    }
+
     #[test]
     fn balance_pull_only_when_a_peer_is_clearly_ahead() {
         // Idle steal is a different path: an empty CPU always scans, so this
@@ -3514,8 +3660,113 @@ mod affinity_tests {
         assert!(!should_pull_for_balance(1, 1));
         assert!(!should_pull_for_balance(1, 2));
         assert!(should_pull_for_balance(1, 1 + REBALANCE_MARGIN));
-        // A CPU with its own backlog keeps running it.
-        assert!(!should_pull_for_balance(2, 100));
+        // A CPU with a backlog of its own still pulls, but only off a peer
+        // that is ahead by the slack: this is what `local_ready == 1` used to
+        // forbid outright, whatever the peer held.
+        assert!(should_pull_for_balance(2, 100));
+        assert!(should_pull_for_balance(2, 4));
+        assert!(!should_pull_for_balance(2, 3));
+        assert!(should_pull_for_balance(5, 7));
+        assert!(!should_pull_for_balance(5, 6));
+        // Past sixteen the proportional half takes over from the margin.
+        assert!(!should_pull_for_balance(40, 44));
+        assert!(should_pull_for_balance(40, 45));
+    }
+
+    /// The floor the scan asks for and the floor the predicate checks are the
+    /// same number, or a CPU scans for a victim it then refuses.
+    #[test]
+    fn the_victim_floor_is_the_margin_until_the_proportional_slack_is_bigger() {
+        assert_eq!(
+            balance_victim_min(1),
+            1 + REBALANCE_MARGIN,
+            "the old rule, unchanged"
+        );
+        assert_eq!(balance_victim_min(2), 4);
+        assert_eq!(balance_victim_min(15), 17, "still the flat margin");
+        assert_eq!(balance_victim_min(16), 18, "the two meet here");
+        assert_eq!(balance_victim_min(40), 45, "40 + 40/8");
+        assert_eq!(balance_victim_min(usize::MAX), usize::MAX, "no overflow");
+        for local in 1..1024usize {
+            let min = balance_victim_min(local);
+            assert!(should_pull_for_balance(local, min));
+            assert!(!should_pull_for_balance(local, min - 1));
+            // Moving one task may not invert the pair, or the next tick hands
+            // it straight back.
+            assert!(min - 1 >= local + 1, "local {local}, victim {min}");
+        }
+    }
+
+    /// The old rule left lopsided splits standing, so settling them is the
+    /// whole point of the change and is checked rather than argued: run the
+    /// predicate to a fixed point and look at the spread that remains.
+    ///
+    /// This models the decision, not the scheduler: one pull per CPU per
+    /// pass, off whoever is richest, with the `local_ready == 0` case standing
+    /// in for the idle steal. Real queues also drain and refill, which only
+    /// ever gives the balancer *more* chances to pull.
+    #[test]
+    fn settling_a_lopsided_split() {
+        fn settle(start: &[usize]) -> Vec<usize> {
+            let mut q = start.to_vec();
+            // Every pass moves at most one task per CPU and the spread only
+            // shrinks, so this is a loose bound on "until nothing moves" and
+            // never an unbounded loop.
+            for _ in 0..100_000 {
+                let mut moved = false;
+                for i in 0..q.len() {
+                    let (rich, most) = q
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, n)| **n)
+                        .map(|(k, n)| (k, *n))
+                        .unwrap();
+                    let pull = if q[i] == 0 {
+                        most > 1
+                    } else {
+                        should_pull_for_balance(q[i], most)
+                    };
+                    if rich != i && pull {
+                        q[rich] -= 1;
+                        q[i] += 1;
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            q
+        }
+        // `was` is where the same split settled under `local_ready == 1`.
+        for (start, was) in [
+            (vec![8, 0, 0, 0], 0),
+            (vec![16, 0, 0, 0], 8),
+            (vec![24, 2, 2, 2], 22),
+            (vec![12, 3, 3, 2], 10),
+            (vec![40, 2, 2, 2, 2, 2, 2, 2], 38),
+            (vec![200, 50, 50, 50], 150),
+        ] {
+            let total: usize = start.iter().sum();
+            let end = settle(&start);
+            assert_eq!(
+                end.iter().sum::<usize>(),
+                total,
+                "tasks are moved, not made"
+            );
+            let (lo, hi) = (*end.iter().min().unwrap(), *end.iter().max().unwrap());
+            // Perfectly even is not the promise and would cost a migration a
+            // tick for ever; inside the slack is, and it is a long way under
+            // what the old rule left behind.
+            assert!(
+                hi - lo <= balance_victim_min(lo) - lo,
+                "{start:?} settled at {end:?}"
+            );
+            assert!(
+                hi - lo < was.max(1),
+                "{start:?} settled at {end:?}, no better than {was}"
+            );
+        }
     }
 
     #[test]

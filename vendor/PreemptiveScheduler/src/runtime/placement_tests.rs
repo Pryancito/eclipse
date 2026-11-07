@@ -404,12 +404,53 @@ fn el_tiron_de_reparto_es_el_mismo_barrido_con_el_listo_mas_alto() {
     }
     let (_, _, _, _, rebalance_before, _, _) = sched_steal_stats();
     assert!(
-        steal_for_balance().is_some(),
+        steal_for_balance(1).is_some(),
         "con {} tareas el igual es claramente mas rico",
         1 + REBALANCE_MARGIN
     );
     let (_, _, _, _, rebalance, _, _) = sched_steal_stats();
     assert_eq!(rebalance, rebalance_before + 1);
+}
+
+/// **Un ladron con cola propia ya puede tirar.** Con la regla vieja
+/// (`ready_num() == Some(1)`) una CPU con dos tareas listas no tiraba nunca,
+/// por muy cargado que estuviese el vecino: el reparto desigual se quedaba
+/// como estaba. Ahora el suelo de la victima sube con la cola del ladron,
+/// que es lo unico que cambia.
+#[test]
+fn con_cola_propia_se_tira_del_vecino_que_va_por_delante() {
+    let _p = placed(0b11, 1);
+    note_stealable(0);
+    {
+        let rt = GLOBAL_RUNTIME.force(0).lock();
+        for _ in 0..balance_victim_min(2) {
+            rt.add_task(DEFAULT_PRIORITY, parked(), None);
+        }
+    }
+    assert!(
+        steal_for_balance(2).is_some(),
+        "con {} tareas el vecino va claramente por delante de nuestras 2",
+        balance_victim_min(2)
+    );
+}
+
+/// Y el mismo vecino, una tarea por debajo del suelo, no es candidato: el
+/// barrido y el predicado piden el mismo numero.
+#[test]
+fn con_cola_propia_un_vecino_justo_por_debajo_del_suelo_no_vale() {
+    let _p = placed(0b11, 1);
+    note_stealable(0);
+    {
+        let rt = GLOBAL_RUNTIME.force(0).lock();
+        for _ in 0..(balance_victim_min(2) - 1) {
+            rt.add_task(DEFAULT_PRIORITY, parked(), None);
+        }
+    }
+    assert!(
+        steal_for_balance(2).is_none(),
+        "{} tareas no bastan frente a nuestras 2",
+        balance_victim_min(2) - 1
+    );
 }
 
 /// **A rescue pull is the idle scan, run by a CPU that is not idle.**
@@ -710,7 +751,7 @@ fn un_igual_con_menos_trabajo_del_que_se_pide_no_es_candidato() {
     }
     let (_, probed_before, _, _, _, _, _) = sched_steal_stats();
     assert!(
-        steal_for_balance().is_none(),
+        steal_for_balance(1).is_none(),
         "una tarea no es «claramente mas rico» que ninguna"
     );
     assert_eq!(

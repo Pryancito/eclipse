@@ -331,7 +331,7 @@ fn nobody_steals_from_a_machine_with_no_runtimes() {
 
     assert!(steal_task_from_other_cpu().is_none());
     let before = STEAL_REBALANCE.load(Ordering::SeqCst);
-    assert!(steal_for_balance().is_none());
+    assert!(steal_for_balance(1).is_none());
     assert_eq!(
         STEAL_REBALANCE.load(Ordering::SeqCst),
         before,

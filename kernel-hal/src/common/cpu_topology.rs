@@ -66,7 +66,21 @@ pub struct CpuTopology {
     registered: AtomicU64,
     /// logical id -> hardware id. Meaningful only where `registered` says so.
     hw_of_logical: [AtomicU32; MAX_CORE_NUM],
+    /// How many low bits of a hardware id name the thread *within* a core,
+    /// or [`SMT_SHIFT_UNKNOWN`] until bring-up works it out.
+    ///
+    /// On x86_64 this is CPUID leaf 0x0B subleaf 0's `EAX[4:0]`: shifting an
+    /// APIC id right by it yields the id of the physical core the thread sits
+    /// on. riscv harts and aarch64 MPIDRs have no such field, so it stays
+    /// zero there and [`siblings_mask`](Self::siblings_mask) answers "no
+    /// siblings", which is the truth on those machines.
+    smt_shift: AtomicU32,
 }
+
+/// `smt_shift` before anybody has measured it. Distinct from a shift of 0
+/// ("measured, and there is one thread per core"), because the two want
+/// different behaviour the day a caller wants to warn about the first.
+pub const SMT_SHIFT_UNKNOWN: u32 = u32::MAX;
 
 impl Default for CpuTopology {
     fn default() -> Self {
@@ -80,7 +94,58 @@ impl CpuTopology {
             count: AtomicUsize::new(0),
             registered: AtomicU64::new(0),
             hw_of_logical: [const { AtomicU32::new(0) }; MAX_CORE_NUM],
+            smt_shift: AtomicU32::new(SMT_SHIFT_UNKNOWN),
         }
+    }
+
+    /// Record how many low bits of a hardware id name the thread within its
+    /// core. Anything from 32 up is refused and left unknown: a shift that
+    /// wide moves every bit out of a `u32` hardware id, so every CPU would
+    /// come back as core 0 and the whole machine would look like one core's
+    /// worth of SMT siblings.
+    pub fn set_smt_shift(&self, shift: u32) -> bool {
+        if shift >= u32::BITS {
+            return false;
+        }
+        self.smt_shift.store(shift, Ordering::Release);
+        true
+    }
+
+    /// The shift [`set_smt_shift`](Self::set_smt_shift) recorded, or
+    /// [`SMT_SHIFT_UNKNOWN`].
+    pub fn smt_shift(&self) -> u32 {
+        self.smt_shift.load(Ordering::Acquire)
+    }
+
+    /// The other logical CPUs that share a physical core with `logical`:
+    /// the registered ones whose hardware id agrees with this one's above
+    /// [`smt_shift`](Self::smt_shift) bits. `logical` itself is never in the
+    /// mask.
+    ///
+    /// Zero when the shift is unknown or zero, when `logical` is not wired,
+    /// or simply when the core has one thread. A caller reading zero must
+    /// treat it as "nothing known about this CPU's siblings" and behave as it
+    /// did before siblings existed — not as "this core is definitely alone",
+    /// because an unmeasured machine answers zero for every CPU.
+    pub fn siblings_mask(&self, logical: usize) -> u64 {
+        let shift = self.smt_shift.load(Ordering::Acquire);
+        if shift == 0 || shift >= u32::BITS || logical >= MAX_CORE_NUM {
+            return 0;
+        }
+        let Some(mine) = self.hw_id(logical) else {
+            return 0;
+        };
+        let core = mine >> shift;
+        let mut wired = self.registered.load(Ordering::Acquire) & !(1u64 << logical);
+        let mut out = 0u64;
+        while wired != 0 {
+            let other = wired.trailing_zeros() as usize;
+            wired &= wired - 1;
+            if self.hw_of_logical[other].load(Ordering::Acquire) >> shift == core {
+                out |= 1u64 << other;
+            }
+        }
+        out
     }
 
     /// Hand out the next dense logical id to the CPU whose hardware id is
@@ -965,5 +1030,94 @@ mod one_cpu_one_id_tests {
         assert_eq!(ids.resolve(0x20), 1);
         assert_eq!(ids.resolve(0x21), NO_CPU);
         assert_eq!(topo.count(), 2);
+    }
+
+    /// A sixteen-thread machine numbered the way firmware numbers one: APIC
+    /// id bit 0 is the thread within the core, so 0 and 1 are one core's two
+    /// threads, 2 and 3 the next core's, and so on.
+    #[test]
+    fn two_threads_per_core_pair_up_by_the_smt_bit() {
+        let topo = CpuTopology::new();
+        for apic in 0..16u32 {
+            assert_eq!(topo.register(apic), Some(apic as usize));
+        }
+        assert!(topo.set_smt_shift(1));
+        for logical in 0..16usize {
+            let sibling = logical ^ 1;
+            assert_eq!(
+                topo.siblings_mask(logical),
+                1u64 << sibling,
+                "logical {logical} should pair with {sibling}"
+            );
+        }
+    }
+
+    /// Firmware that enumerates every core's first thread before any second
+    /// thread (APIC ids 0,2,4,… then 1,3,5,…) pairs up by the same rule: the
+    /// mask is over hardware ids, never over logical ones.
+    #[test]
+    fn the_pairing_is_by_hardware_id_and_not_by_logical_order() {
+        let topo = CpuTopology::new();
+        let order = [0u32, 2, 4, 6, 1, 3, 5, 7];
+        for (logical, apic) in order.iter().enumerate() {
+            assert_eq!(topo.register(*apic), Some(logical));
+        }
+        assert!(topo.set_smt_shift(1));
+        // Logical 0 holds APIC 0; its sibling is APIC 1, which is logical 4.
+        assert_eq!(topo.siblings_mask(0), 1u64 << 4);
+        assert_eq!(topo.siblings_mask(4), 1u64 << 0);
+        assert_eq!(topo.siblings_mask(3), 1u64 << 7, "APIC 6 pairs with APIC 7");
+    }
+
+    /// Four threads per core, which is a shift of two: the mask holds the
+    /// other three and never the CPU asking.
+    #[test]
+    fn four_threads_per_core_leave_three_siblings_each() {
+        let topo = CpuTopology::new();
+        for apic in 0..8u32 {
+            topo.register(apic).unwrap();
+        }
+        assert!(topo.set_smt_shift(2));
+        assert_eq!(topo.siblings_mask(1), 0b1101);
+        assert_eq!(topo.siblings_mask(6), 0b1111_0000 & !(1 << 6));
+    }
+
+    /// Everything that means "nothing known": an unmeasured machine, one
+    /// thread per core, a CPU nobody wired, and a shift wide enough to move
+    /// every bit out of a hardware id — which would otherwise make the whole
+    /// machine one core.
+    #[test]
+    fn an_unknown_or_flat_topology_reports_no_siblings() {
+        let topo = CpuTopology::new();
+        for apic in 0..4u32 {
+            topo.register(apic).unwrap();
+        }
+        assert_eq!(topo.smt_shift(), SMT_SHIFT_UNKNOWN);
+        assert_eq!(topo.siblings_mask(0), 0, "unmeasured");
+        assert!(topo.set_smt_shift(0));
+        assert_eq!(topo.siblings_mask(0), 0, "one thread per core");
+        assert!(topo.set_smt_shift(1));
+        assert_eq!(topo.siblings_mask(MAX_CORE_NUM), 0, "out of range");
+        assert_eq!(topo.siblings_mask(9), 0, "never registered");
+        assert!(
+            !topo.set_smt_shift(32),
+            "a shift that empties the id is refused"
+        );
+        assert_eq!(topo.smt_shift(), 1, "and leaves the measured one alone");
+    }
+
+    /// A CPU given its id back stops being anybody's sibling: it is a core
+    /// that will never run, and placing work beside it is placing work beside
+    /// nothing.
+    #[test]
+    fn a_cpu_that_gave_its_id_back_is_nobodys_sibling() {
+        let topo = CpuTopology::new();
+        for apic in 0..4u32 {
+            topo.register(apic).unwrap();
+        }
+        assert!(topo.set_smt_shift(1));
+        assert_eq!(topo.siblings_mask(2), 1 << 3);
+        assert!(topo.unregister(3));
+        assert_eq!(topo.siblings_mask(2), 0);
     }
 }

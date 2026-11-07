@@ -369,6 +369,96 @@ pub fn ap_confirm_apic_id(logical: u8) {
     lock::set_logical_cpu_id(actual, logical);
 }
 
+/// How many low bits of a Local APIC id name the **thread within its core**,
+/// read from CPUID.
+///
+/// Leaf 0x1F (the V2 extended topology enumeration) first and leaf 0x0B as
+/// the fallback: both enumerate levels in subleaves, each reporting the shift
+/// that reaches the *next* level up and the type of the level it describes
+/// (`ECX[15:8]`: 1 = SMT, 2 = core). The SMT level's shift is exactly the
+/// question here. A machine that enumerates no SMT level has one thread per
+/// core, which is a shift of zero and not a failure.
+///
+/// Leaf 0x1F is preferred because leaf 0x0B is deprecated on parts that have
+/// levels 0x0B cannot name (modules, tiles, dies); where both exist they
+/// agree about the SMT level, so this only matters on the newer ones.
+fn measure_smt_shift() -> Option<u32> {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // CPUID is unprivileged and has no side effects, so these are safe calls.
+    // The one way they can misbehave is an unsupported leaf, which returns
+    // another leaf's contents rather than faulting — hence the `max_leaf`
+    // check before anything above leaf 0 is asked for.
+    let max_leaf = __cpuid(0).eax;
+    for leaf in [0x1Fu32, 0x0B] {
+        if max_leaf < leaf {
+            continue;
+        }
+        // Subleaf 0 of either leaf is level 0; a zero `ECX[15:8]` means
+        // "invalid" and ends the enumeration. Bounded at 8 levels: the
+        // hardware list is short (SMT, core, module, tile, die, package) and
+        // a CPU that answered forever would hang bring-up.
+        let mut any = false;
+        for sub in 0..8u32 {
+            let r = __cpuid_count(leaf, sub);
+            let level_type = (r.ecx >> 8) & 0xff;
+            if level_type == 0 {
+                break;
+            }
+            any = true;
+            if level_type == 1 {
+                return Some(r.eax & 0x1f);
+            }
+        }
+        // The leaf exists and enumerated levels, but none of them is SMT:
+        // one thread per core. That is an answer, not a gap, so do not fall
+        // through to the older leaf and ask again.
+        if any {
+            return Some(0);
+        }
+    }
+    None
+}
+
+/// Work out this machine's SMT layout and hand the scheduler each CPU's
+/// siblings, so a new task is placed on a core whose other thread is idle
+/// before it is placed beside a thread that is already working.
+///
+/// Called once the APs are up, because a sibling mask is only as complete as
+/// the registry it is read from: a CPU that has not registered yet is nobody's
+/// sibling, and publishing early would leave half the machine looking like
+/// single-threaded cores for the rest of the boot.
+///
+/// Best effort by design. A machine whose CPUID says nothing about topology,
+/// or one thread per core, publishes nothing and the scheduler keeps ranking
+/// placement by queue length alone, exactly as it did before.
+fn publish_smt_topology() {
+    let Some(shift) = measure_smt_shift() else {
+        crate::klog_info!("[smp] CPUID has no topology leaf — placement stays load-only");
+        return;
+    };
+    if !TOPOLOGY.set_smt_shift(shift) || shift == 0 {
+        crate::klog_info!("[smp] one thread per core — placement stays load-only");
+        return;
+    }
+    let mut wired = TOPOLOGY.registered_mask();
+    let mut paired = 0usize;
+    while wired != 0 {
+        let logical = wired.trailing_zeros() as usize;
+        wired &= wired - 1;
+        let mask = TOPOLOGY.siblings_mask(logical);
+        executor::set_smt_siblings(logical, mask);
+        if mask != 0 {
+            paired += 1;
+        }
+    }
+    crate::klog_info!(
+        "[smp] SMT: {} thread(s) per core, {} CPU(s) with a sibling — placement fills \
+         distinct cores first",
+        1usize << shift,
+        paired
+    );
+}
+
 /// Translate a dense logical CPU id back to its Local APIC ID (for IPI delivery).
 /// Returns `None` if the logical id was never registered — callers must **not**
 /// fall back to APIC 0 (that would kick the BSP by mistake).
@@ -714,6 +804,10 @@ pub fn start_application_processors() {
         }
         delay_us(1_000);
     }
+
+    // Every AP that is coming has registered by now, so the sibling masks
+    // this publishes are the whole machine's.
+    publish_smt_topology();
 
     let online = AP_ONLINE_COUNT.load(Ordering::Acquire);
     crate::klog_info!(
