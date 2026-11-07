@@ -17,6 +17,9 @@
 //! - [`nfs3_dir`]: `READDIR` and `READDIRPLUS`, which read a directory.
 //! - [`client`]: one call out, one reply back, with transaction ids,
 //!   timeouts and retries, over a four-method transport trait.
+//! - [`session`]: one mounted export's conversation with its server: the
+//!   errno every failure becomes, and the loops `READ`, `WRITE` and `READDIR`
+//!   make mandatory.
 //! - [`source`]: the `host:/export` string `mount(8)` passes as the device.
 //!
 //! What is deliberately *not* here yet is the socket and the VFS types. The split is not arbitrary: everything in this batch is
@@ -58,6 +61,7 @@ pub mod nfs3_dir;
 pub mod nfs3_write;
 pub mod portmap;
 pub mod rpc;
+pub mod session;
 pub mod source;
 pub mod transport;
 pub mod xdr;
