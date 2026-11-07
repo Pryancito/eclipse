@@ -1904,6 +1904,68 @@ static NvBool g_grChanDone[ECLIPSE_MAX_GPUS];
 #define ECLIPSE_CHAN_GPFIFO_OFF  0xC000   /* ring lives at +48 KiB */
 #define ECLIPSE_CHAN_GPFIFO_ENTRIES 128   /* 128 * 8B = 1 KiB */
 
+/*
+ * Un control del RM, con el cerrojo de GPU tomado SOLO para esa llamada.
+ *
+ * Por que hace falta: `rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL)` (rmapi.c,
+ * bGpuLockInternal = NV_TRUE) no toma ni el API lock ni el de GPU: da por
+ * hecho que el que llama ya tiene el de GPU de ese dispositivo. En las
+ * escaleras de canal de aqui solo se tiene el API lock -- a proposito, porque
+ * los constructores de canal y de TSG del RM (kernel_channel.c,
+ * kernel_channel_group_api.c) toman el de GPU ellos mismos y con el ya tomado
+ * fallan con NV_ERR_STATE_IN_USE: eso fue el commit f8a5d56, el GPFIFO volvio
+ * 0x63 y NVK se quedo sin GPU. Asi que el cerrojo no puede envolver la
+ * escalera entera.
+ *
+ * Pero un `Control` que acaba en el GSP si lo necesita. `rpcRmApiControl_GSP`
+ * (vgpu/rpc.c) empieza por `if (!rmDeviceGpuLockIsOwner(...))`, y por ahi
+ * salen las dos cosas que se ven en la maquina de Moebius:
+ *
+ *   - el aviso, que es la linea `NVRM: nvAssertFailedNoLog: Assertion failed:
+ *     RPC locking violation - see kernel_log.txt @ rpc.c:10891` de su consola;
+ *   - y, detras del aviso, un `rmGpuGroupLockAcquire(..., SAFE_LOCK_UPGRADE,
+ *     ...)` A MEDIA RPC. Esa subida toma el cerrojo de GPU en un punto en el
+ *     que ya se han tomado cerrojos del nucleo (el del VMAR), o sea en orden
+ *     contrario al del resto del arbol, que es API lock -> GPU lock -> VMAR.
+ *     Es el mismo razonamiento que ya esta escrito en `eclipse_rm_gem_alloc`,
+ *     donde el arreglo fue tomarlo por delante.
+ *
+ * Tomarlo aqui, alrededor de la llamada y nada mas, deja las dos cosas bien:
+ * el orden es siempre el del resto del arbol y la escalera sigue corriendo sin
+ * el cerrojo, que es lo que f8a5d56 no podia hacer.
+ *
+ * `GPU_LOCK_FLAGS_SAFE_LOCK_UPGRADE` es lo que usa el propio RM en ese mismo
+ * sitio: si ya se tiene, locks.c devuelve mascara 0 y no hay nada que soltar,
+ * asi que la funcion es segura la tenga el que llama o no.
+ */
+static NV_STATUS _eclipse_rm_control_locked(RM_API *pRmApi, OBJGPU *pGpu,
+                                            NvHandle hClient, NvHandle hObject,
+                                            NvU32 cmd, void *pParams,
+                                            NvU32 paramsSize)
+{
+    NvU32 gpusLockedMask = 0;
+    NV_STATUS lockStatus;
+    NV_STATUS status;
+
+    lockStatus = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_SUBDEVICE,
+                                       GPU_LOCK_FLAGS_SAFE_LOCK_UPGRADE,
+                                       RM_LOCK_MODULES_RPC, &gpusLockedMask);
+    if (lockStatus != NV_OK)
+    {
+        nv_printf(0, "[eclipse-rm-trace] control 0x%08x: gpu lock -> 0x%x\n",
+                  cmd, lockStatus);
+        return lockStatus;
+    }
+
+    status = pRmApi->Control(pRmApi, hClient, hObject, cmd, pParams, paramsSize);
+
+    if (gpusLockedMask != 0)
+    {
+        rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    }
+    return status;
+}
+
 NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
 {
     OBJGPU *pGpu;
@@ -1960,10 +2022,11 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
      * (kernel_channel.c:497, kernel_channel_group_api.c), so holding it
      * already fails them with NV_ERR_STATE_IN_USE: commit f8a5d56 did that,
      * the GPFIFO channel came back 0x63, CHANNEL_ALLOC returned ENODEV and
-     * NVK saw no GPU ("ZINK: failed to choose pdev"). The "RPC locking
-     * violation" assert that commit chased is the RM noticing a control
-     * without the GPU lock and upgrading to it itself -- noisy but safe.
-     * Same lock state as eclipse_rm_step16. */
+     * NVK saw no GPU ("ZINK: failed to choose pdev").
+     * Lo que SI necesita el cerrojo es cada `Control` que acaba en el GSP, y
+     * por eso van por `_eclipse_rm_control_locked`: dejarselo coger al RM a
+     * media RPC es la "RPC locking violation" de rpc.c y una subida de cerrojo
+     * fuera de orden. Same lock state as eclipse_rm_step16. */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -2155,7 +2218,8 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS params;
         portMemSet(&params, 0, sizeof(params));
         params.bEnable = NV_TRUE;
-        pOut->schedStatus = pRmApi->Control(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        pOut->schedStatus = _eclipse_rm_control_locked(pRmApi, pGpu,
+                                            g_grAllocCache[gpuInstance].hClient,
                                             pOut->hChannel,
                                             NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
                                             &params, sizeof(params));
@@ -2655,7 +2719,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
-    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. Los
+     * controles que van al GSP lo toman por su cuenta
+     * (`_eclipse_rm_control_locked`). */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -2897,7 +2963,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS params;
         portMemSet(&params, 0, sizeof(params));
         params.bEnable = NV_TRUE;
-        pOut->schedStatus = pRmApi->Control(pRmApi, hCtxClient, pOut->hChannel,
+        pOut->schedStatus = _eclipse_rm_control_locked(pRmApi, pGpu, hCtxClient, pOut->hChannel,
                                             NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: GPFIFO_SCHEDULE -> 0x%x\n", ctxIdx, pOut->schedStatus);
         if (pOut->schedStatus != NV_OK) { failed = NV_TRUE; goto done; }
@@ -2989,7 +3055,9 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
-    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. Los
+     * controles que van al GSP lo toman por su cuenta
+     * (`_eclipse_rm_control_locked`). */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -3009,7 +3077,7 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sched;
         portMemSet(&sched, 0, sizeof(sched));
         sched.bEnable = NV_FALSE;
-        (void)pRmApi->Control(pRmApi, hCtxClient, pCtx->hChannel,
+        (void)_eclipse_rm_control_locked(pRmApi, pGpu, hCtxClient, pCtx->hChannel,
                               NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
     }
     /*
@@ -3131,7 +3199,9 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
-    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. Los
+     * controles que van al GSP lo toman por su cuenta
+     * (`_eclipse_rm_control_locked`). */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -3175,7 +3245,8 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         NV_STATUS schedStatus;
         portMemSet(&sched, 0, sizeof(sched));
         sched.bEnable = NV_FALSE;
-        schedStatus = pRmApi->Control(pRmApi, g_grAllocCache[gpuInstance].hClient, g_grChanCache[gpuInstance].hChannel,
+        schedStatus = _eclipse_rm_control_locked(pRmApi, pGpu,
+                                      g_grAllocCache[gpuInstance].hClient, g_grChanCache[gpuInstance].hChannel,
                                       NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
         if (schedStatus != NV_OK)
         {

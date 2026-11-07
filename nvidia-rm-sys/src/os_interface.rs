@@ -1195,6 +1195,7 @@ pub extern "C" fn os_free_semaphore(handle: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn os_acquire_semaphore(handle: *mut c_void) -> NV_STATUS {
     let sem = unsafe { &*(handle as *const AtomicU32) };
+    let mut spins: u64 = 0;
     loop {
         let cur = sem.load(Ordering::Acquire);
         if cur > 0
@@ -1205,6 +1206,19 @@ pub extern "C" fn os_acquire_semaphore(handle: *mut c_void) -> NV_STATUS {
             return NV_OK;
         }
         core::hint::spin_loop();
+        spins += 1;
+        // Same cadence, and for the same reason, as `os_acquire_spinlock`
+        // above -- and here it matters more, because THIS is the wait of the
+        // RM's GPU lock: `_rmGpuLocksAcquire` (locks.c) parks a contender on
+        // `pGpuLock->pWaitSema`, which is this semaphore. A CPU spinning here
+        // with interrupts disabled cannot ack a peer's TLB shootdown, so an
+        // unrelated `munmap` on another CPU -- spinning for our ack while it
+        // holds the VMAR lock -- wedges behind a lock it has nothing to do
+        // with. The spinlock one function up already drains at this cadence;
+        // this one did not, and it is the one a contended GPU lock lands on.
+        if spins & 511 == 0 {
+            lock::pump();
+        }
     }
 }
 #[no_mangle]
