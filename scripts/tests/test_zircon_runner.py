@@ -273,6 +273,14 @@ class HangingCases(unittest.TestCase):
             [("*,-Threads.X86Ac*", ["Threads.Good"])],
         )
 
+    def test_a_supported_entry_may_name_the_platforms_it_was_measured_on(self):
+        overrides = {"supported": [
+            "CounterTest.*",
+            {"test": "Threads.*", "platforms": ["*-libos"], "reason": "libos only"},
+        ]}
+        self.assertEqual(runner.supported_patterns(overrides, "x86_64-libos"), ["CounterTest.*", "Threads.*"])
+        self.assertEqual(runner.supported_patterns(overrides, "x86_64-bare"), ["CounterTest.*"])
+
     def test_the_flag_is_read_off_the_skip_entry_for_the_platform(self):
         overrides = {"skips": [
             {"test": "Threads.Hangs", "platforms": ["*-libos"], "reason": "why", "hangs": True},

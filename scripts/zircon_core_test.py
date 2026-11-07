@@ -197,12 +197,36 @@ def load_expectations(arch, libos):
         if len(fields) == 2 and not line.startswith("#"):
             cases[fields[0]] = None if fields[1] == "OK" else f"Existing classification: {fields[1]}"
     overrides = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
-    for pattern in overrides.get("supported", []):
+    supported = supported_patterns(overrides, platform)
+    for pattern in supported:
         for name in cases:
             if fnmatch.fnmatchcase(name, pattern):
                 cases[name] = None
     cases.update(platform_entries(overrides["skips"], platform))
-    return cases, platform_entries(overrides.get("needs_hardware", []), platform), hanging_cases(overrides, platform)
+    return (
+        cases,
+        platform_entries(overrides.get("needs_hardware", []), platform),
+        hanging_cases(overrides, platform),
+        supported,
+    )
+
+
+def supported_patterns(overrides, platform):
+    """The `supported` patterns that apply to `platform`: a bare string applies
+    everywhere, a `{test, platforms}` entry only where it says.
+
+    A pattern promoted on the strength of one platform's runs must not reach
+    the others: the 284 cases measured green on libos x86_64 (#2499) went in
+    as bare strings and the bare-metal x86_64 job, which cannot run most of
+    them, asked for 744 cases instead of 468 and died in
+    `Property.RegisterGsNoncanonical`, which QEMU cannot pass."""
+    patterns = []
+    for entry in overrides.get("supported", []):
+        if isinstance(entry, str):
+            patterns.append(entry)
+        elif any(fnmatch.fnmatchcase(platform, pattern) for pattern in entry["platforms"]):
+            patterns.append(entry["test"])
+    return patterns
 
 
 def platform_entries(entries, platform):
@@ -421,11 +445,10 @@ def main():
         runner.finish({})
         return 1
     available = discovered_tests(runner.output)
-    expectations, hardware, hangs = load_expectations(args.arch, args.libos)
-    config = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
+    expectations, hardware, hangs, supported = load_expectations(args.arch, args.libos)
     selection = args.test or (GROUPS[args.group] if args.group else "*")
     selected, skipped, needs_hardware = triage(
-        available, selection.split(","), expectations, hardware, config.get("supported", []), args.include_skipped, hangs
+        available, selection.split(","), expectations, hardware, supported, args.include_skipped, hangs
     )
     for name, reason in sorted(needs_hardware.items()):
         print(f"NEEDS-HARDWARE: {name}: {reason}")

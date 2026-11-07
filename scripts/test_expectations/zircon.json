@@ -714,289 +714,1981 @@
     "PortStressTest.CancelKeyDuringRegistrationRace",
     "PortStressTest.QueuePacketAfterPortClosedConcurrentRace",
     "PortStressTest.CancelKeyDestructorReentersPortLock",
-    "ZxAssertCppTest.*",
-    "BadSegselTest.*",
-    "TestInterrupt.*",
-    "UserExceptionsTest.*",
+    {
+      "test": "ZxAssertCppTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "BadSegselTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "TestInterrupt.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "UserExceptionsTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
     "HandleInfoTest.*",
-    "HandleTransferTest.*",
-    "MembarrierSyncProcessData.*",
-    "MembarrierSyncProcessInsn.*",
-    "ObjectWaitManyTest.*",
-    "PageSize.*",
-    "StandaloneElfLoadTests.*",
-    "SyncMutex.*",
-    "SyscallGenerationTest.*",
-    "ThreadInitialStateTests.*",
-    "VersionTest.*",
-    "ChannelWriteTest.*",
-    "VmoCloneResizeTests.*",
-    "ProgressiveCloneDiscardTests.*",
-    "VmoZeroTestCase.*",
-    "TopByteIgnoreTests.*",
-    "JobGetInfoTest.*",
-    "VmarGetInfoTest.*",
-    "ProcessDebugTest.*",
-    "ProcessDebugVDSO.*",
-    "BadAccessTest.*",
-    "MsiTest.*",
-    "ZxAssertCTest.*",
-    "PthreadTls.*",
-    "Bti.Clone",
-    "Bti.Create",
-    "Bti.DecommitRace",
-    "Bti.GetInfoTest",
-    "Bti.InvalidPinArgs",
-    "Bti.NameSupport",
-    "Bti.NoDelayedUnpin",
-    "Bti.Pin",
-    "Bti.PinContigFlag",
-    "Bti.PinContiguous",
-    "Bti.PinTooManyAddresses",
-    "Bti.Resize",
-    "ChannelTest.ChannelFullException",
-    "ChannelTest.ReadFaultDoesNotLeakHandles",
-    "DebugLogTest.InvalidOptions",
-    "DebugLogTest.InvalidResourceHandleReturnsWrongType",
-    "DebugLogTest.ReadDataCopyFault",
-    "DebugLogTest.WriteErrors",
-    "DefaultExceptionHandlerTest.UnhandledHardwareException",
-    "FutexTest.EventSignaling",
-    "FutexTest.Requeue",
-    "FutexTest.RequeueCycleStressTest",
-    "FutexTest.RequeueInvalidOwner",
-    "FutexTest.RequeueUnqueuedOnTimeout",
-    "FutexTest.RequeueWithWakeCountZero",
-    "FutexTest.ThreadSuspended",
-    "FutexTest.WaitExitRace",
-    "FutexTest.WaitInvalidOwner",
-    "FutexTest.WaitTimeoutElapsed",
-    "FutexTest.WakeWithWakeCountZero",
-    "FutexTest.Wakeup",
-    "FutexTest.WakeupAddress",
-    "FutexTest.WakeupLimit",
-    "InterruptTest.BindPort",
-    "InterruptTest.BindTriggeredIrqToPort",
-    "InterruptTest.NonBindablePort",
-    "InterruptTest.NullOutputTimestamp",
-    "InterruptTest.PortUnbindPurgesQueuedPacket",
-    "InterruptTest.UnBindPort",
-    "InterruptTest.UserSignals",
-    "InterruptTest.VirtualInterrupts",
-    "InterruptTest.WaitThreadFunctionsAfterSuspendResume",
-    "JobTest.CloseJobRemovesFromTree",
-    "JobTest.KillJobChain",
-    "JobTest.KillJobRemovesFromTree",
-    "JobTest.MaxHeightSmoke",
-    "JobTest.OneCriticalProcessKillsOneJobIfRetcodeNonzero",
-    "JobTest.PolicyTimerSlackInvalidPolicyTest",
-    "JobTest.WaitTest",
-    "KernelStatsGetInfoTest.CpuStatsBadHandleType",
-    "KernelStatsGetInfoTest.CpuStatsInvalidHandle",
-    "MemoryMappingTest.MmapProtExecTest",
-    "PortStressTest.CancelKeyCloseRace",
+    {
+      "test": "HandleTransferTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "MembarrierSyncProcessData.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "MembarrierSyncProcessInsn.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ObjectWaitManyTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PageSize.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "StandaloneElfLoadTests.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SyncMutex.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SyscallGenerationTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ThreadInitialStateTests.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VersionTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ChannelWriteTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoCloneResizeTests.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProgressiveCloneDiscardTests.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoZeroTestCase.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "TopByteIgnoreTests.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobGetInfoTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmarGetInfoTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessDebugTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessDebugVDSO.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "BadAccessTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "MsiTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ZxAssertCTest.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PthreadTls.*",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.Clone",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.Create",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.DecommitRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.GetInfoTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.InvalidPinArgs",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.NameSupport",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.NoDelayedUnpin",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.Pin",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.PinContigFlag",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.PinContiguous",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.PinTooManyAddresses",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Bti.Resize",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ChannelTest.ChannelFullException",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ChannelTest.ReadFaultDoesNotLeakHandles",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "DebugLogTest.InvalidOptions",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "DebugLogTest.InvalidResourceHandleReturnsWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "DebugLogTest.ReadDataCopyFault",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "DebugLogTest.WriteErrors",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "DefaultExceptionHandlerTest.UnhandledHardwareException",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.EventSignaling",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.Requeue",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.RequeueCycleStressTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.RequeueInvalidOwner",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.RequeueUnqueuedOnTimeout",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.RequeueWithWakeCountZero",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.ThreadSuspended",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WaitExitRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WaitInvalidOwner",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WaitTimeoutElapsed",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WakeWithWakeCountZero",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.Wakeup",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WakeupAddress",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "FutexTest.WakeupLimit",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.BindPort",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.BindTriggeredIrqToPort",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.NonBindablePort",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.NullOutputTimestamp",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.PortUnbindPurgesQueuedPacket",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.UnBindPort",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.UserSignals",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.VirtualInterrupts",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "InterruptTest.WaitThreadFunctionsAfterSuspendResume",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.CloseJobRemovesFromTree",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.KillJobChain",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.KillJobRemovesFromTree",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.MaxHeightSmoke",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.OneCriticalProcessKillsOneJobIfRetcodeNonzero",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.PolicyTimerSlackInvalidPolicyTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "JobTest.WaitTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "KernelStatsGetInfoTest.CpuStatsBadHandleType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "KernelStatsGetInfoTest.CpuStatsInvalidHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "MemoryMappingTest.MmapProtExecTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortStressTest.CancelKeyCloseRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
     "PortStressTest.CancelKeyDuringRegistrationRace",
-    "PortStressTest.ChannelCallWaitQueuePanicRepro",
-    "PortStressTest.CloseWaitRace",
-    "PortStressTest.MatchHandleCloseRace",
-    "PortStressTest.SignalCloseWait",
-    "PortStressTest.WaitSignalCancel",
-    "PortTest.AsyncWaitEventManyAllProcessed",
-    "PortTest.AsyncWaitEventRepeat",
-    "PortTest.AsyncWaitInvalidOption",
-    "PortTest.CancelAccessDenied",
-    "PortTest.CancelBadSourceHandle",
-    "PortTest.CancelEventKey",
-    "PortTest.CancelEventKeyAfter",
-    "PortTest.CancelKey",
-    "PortTest.CancelKeyAccessDenied",
-    "PortTest.CancelKeyInvalidOptions",
-    "PortTest.CancelKeyQueuedUserPacket",
-    "PortTest.CancelKeyWrongType",
-    "PortTest.CancelWrongType",
-    "PortTest.CreateInvalidOptions",
-    "PortTest.EdgeTriggerCancel",
-    "PortTest.EdgeTriggerDetected",
-    "PortTest.EdgeTriggerTimeout",
-    "PortTest.EventAsyncSignalWaitSingle",
-    "PortTest.QueueAccessDenied",
-    "PortTest.QueueWrongType",
-    "PortTest.ThreadEvents",
-    "PortTest.Timestamp",
-    "PortTest.TooManyObservers",
-    "PortTest.WaitAccessDenied",
-    "PortTest.WaitAsyncBootTimestamp",
-    "PortTest.WaitAsyncPortAccessDenied",
-    "PortTest.WaitAsyncPortWrongType",
-    "PortTest.WaitAsyncTargetAccessDenied",
-    "PortTest.WaitNullPacket",
-    "PortTest.WaitWrongType",
-    "ProcessGetInfoTest.InfoHandleBasicBadAvailIsInvalidArg",
-    "ProcessGetInfoTest.InfoHandleBasicInvalidBufferPointerFails",
-    "ProcessGetInfoTest.InfoHandleBasicInvalidHandleFails",
-    "ProcessGetInfoTest.InfoHandleBasicNullActualAndAvailSucceeds",
-    "ProcessGetInfoTest.InfoHandleBasicNullActualSucceeds",
-    "ProcessGetInfoTest.InfoHandleBasicNullAvailSucceeds",
-    "ProcessGetInfoTest.InfoProcessBadAvailIsInvalidArg",
-    "ProcessGetInfoTest.InfoProcessHandleTableInvalidHandleFails",
-    "ProcessGetInfoTest.InfoProcessInvalidBufferPointerFails",
-    "ProcessGetInfoTest.InfoProcessInvalidHandleFails",
-    "ProcessGetInfoTest.InfoProcessJobHandleIsBadHandle",
-    "ProcessGetInfoTest.InfoProcessMapsInvalidHandleFails",
-    "ProcessGetInfoTest.InfoProcessNullActualAndAvailSucceeds",
-    "ProcessGetInfoTest.InfoProcessNullActualSucceeds",
-    "ProcessGetInfoTest.InfoProcessNullAvailSucceeds",
-    "ProcessGetInfoTest.InfoProcessThreadHandleIsBadHandle",
-    "ProcessGetInfoTest.InfoProcessThreadsInvalidHandleFails",
-    "ProcessGetInfoTest.InfoProcessThreadsZeroSizedBufferSucceeds",
-    "ProcessGetInfoTest.InfoProcessVmosInvalidHandleFails",
-    "ProcessTest.CreateAndKillJobRaceStress",
-    "ProcessTest.GetInfoRuntime",
-    "ProcessTest.GetInfoRuntimeV1",
-    "ProcessTest.InfoProcessNoProcessHandles",
-    "ProcessTest.ProcessStartNoHandle",
-    "ProcessTest.ProcessStartWriteThreadState",
-    "Property.JobName",
-    "Property.ProcessName",
-    "Property.RegisterFs",
-    "Property.RegisterFsFault",
-    "Property.RegisterFsNonThread",
-    "Property.RegisterFsNoncanonical",
-    "Property.RegisterFsOtherThread",
-    "Property.RegisterFsTooSmall",
-    "Property.RegisterGsNonThread",
-    "Property.RegisterGsOtherThread",
-    "Property.RegisterGsTooSmall",
-    "Property.SocketBuffer",
-    "Property.ThreadName",
-    "Property.VmoName",
-    "ProtectTestCase.CreateCowClone",
-    "SocketTest/DatagramSocketBadBufferTest.Read/1",
-    "SocketTest/DatagramSocketBadBufferTest.Read/3",
-    "StallGetInfoTest.MemoryStallBadActualIsInvalidArg",
-    "StallGetInfoTest.MemoryStallBadAvailIsInvalidArg",
-    "StallGetInfoTest.MemoryStallInvalidBufferPointerFails",
-    "StallGetInfoTest.MemoryStallInvalidHandleFails",
-    "SystemCpu.ScaleBandwidth",
-    "SystemCpu.TargetPreemptionTimeAssert",
-    "SystemEvent.CannotSignalImminentOomFromUserspace",
-    "SystemEvent.CannotSignalMempressureCriticalFromUserspace",
-    "SystemEvent.CannotSignalMempressureNormalFromUserspace",
-    "SystemEvent.CannotSignalMempressureWarningFromUserspace",
-    "SystemEvent.CannotSignalOomFromUserspace",
-    "SystemEvent.ExactlyOneMemoryEventSignaled",
-    "SystemEvent.RetreiveMempressureWarning",
-    "SystemEvent.RetrieveImminentOom",
-    "SystemEvent.RetrieveMempressureCritical",
-    "SystemEvent.RetrieveMempressureNormal",
-    "SystemEvent.RetrieveOom",
-    "Threads.BadSyscallCaller",
-    "Threads.BadSyscallNumber",
-    "Threads.EmptyNameSucceeds",
-    "Threads.ExitViaException",
-    "Threads.GetAffinity",
-    "Threads.GetInfoRuntime",
-    "Threads.GetInfoRuntimeV1",
-    "Threads.GetLastScheduledCpu",
-    "Threads.InfoThreadStatsFails",
-    "Threads.LongNameSucceeds",
-    "Threads.NoncanonicalRipAddressIRETQ",
-    "Threads.NoncanonicalRipAddressSyscall",
-    "Threads.NonstartedThread",
-    "Threads.ProcessStartOnSecondThread",
-    "Threads.ReadingFpRegisterState",
-    "Threads.ReadingGeneralRegisterState",
-    "Threads.ReadingVectorRegisterState",
-    "Threads.StartRegs",
-    "Threads.StartRegsNoncanonicalTp",
-    "Threads.StartRegsSuspended",
-    "Threads.StartSuspendedAndResumedThread",
-    "Threads.StartSuspendedThread",
-    "Threads.SuspendAfterDeath",
-    "Threads.SuspendInvalidTargets",
-    "Threads.SuspendMultiple",
-    "Threads.SuspendSingleWaitAsyncSignalDelivery",
-    "Threads.SuspendSleeping",
-    "Threads.SuspendStopsThread",
-    "Threads.ThreadStartInvalidEntry",
-    "Threads.ThreadStartOnInitialThread",
-    "Threads.ThreadStartWithZeroInstructionPointer",
-    "Threads.WriteThreadStateWithInvalidMxcsrIsInvalidArgs",
-    "Threads.WritingFpRegisterState",
-    "Threads.WritingGeneralRegisterState",
-    "Threads.WritingSingleStepState",
-    "Threads.WritingVectorRegisterState",
-    "Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored",
-    "Threads.YieldWithNonZeroOptionIsInvalidArgs",
-    "Threads.YieldWithZeroOptionIsOk",
-    "Vmar.AllowFaultsTest",
-    "Vmar.ConcurrentUnmapReadMemory",
-    "Vmar.DestroyedVmarTest",
-    "Vmar.MapOverDestroyedTest",
-    "Vmar.PartialUnmapAndRead",
-    "Vmar.PartialUnmapAndWrite",
-    "Vmar.PartialUnmapWithVmarOffset",
-    "Vmar.ProtectCowWritable",
-    "Vmar.ProtectLargeUncomittedTest",
-    "Vmar.ProtectMultipleTest",
-    "Vmar.ProtectOverDemandPagedTest",
-    "Vmar.UnalignedLenMapTest",
-    "Vmar.UnalignedLenTest",
-    "Vmar.UnmapMultipleTest",
-    "Vmar.UnmapSplitTest",
-    "Vmar.WriteReadOnlyMemory",
-    "VmarMapsGetInfoTest.InfoVmarMapsBadActualIsInvalidArg",
-    "VmarMapsGetInfoTest.InfoVmarMapsBadAvailIsInvalidArg",
-    "VmarMapsGetInfoTest.InfoVmarMapsInvalidBufferPointerFails",
-    "VmarMapsGetInfoTest.InfoVmarMapsInvalidHandleFails",
-    "VmoClone2TestCase.DropChildrenInParallel",
-    "VmoClone2TestCase.DropParentCommittedBytes",
-    "VmoClone2TestCase.ForbidContiguousVmo",
-    "VmoClone2TestCase.MapRangeReadOnly",
-    "VmoClone2TestCase.MarkerClearsSplitBits",
-    "VmoClone2TestCase.NoAccumulatedOverflow",
-    "VmoClone2TestCase.NoPhysical",
-    "VmoClone2TestCase.ObjMemAccounting",
-    "VmoClone2TestCase.Offset",
-    "VmoClone2TestCase.OffsetTest2",
-    "VmoClone2TestCase.OutOfBounds",
-    "VmoClone2TestCase.Overflow",
-    "VmoClone2TestCase.ParentVmarWrite",
-    "VmoClone2TestCase.PinBeforeCreateFailure",
-    "VmoClone2TestCase.PinClonePages",
-    "VmoClone2TestCase.ResizeDisjointChild",
-    "VmoClone2TestCase.ResizeGrow",
-    "VmoClone2TestCase.ResizeMultipleProgressive",
-    "VmoClone2TestCase.SmallClone",
-    "VmoClone2TestCase.SmallClones",
-    "VmoCloneTestCase.Commit",
-    "VmoCloneTestCase.NotImmutableMissingNoWrite",
-    "VmoCloneTestCase.NotImmutableMissingSnapshot",
-    "VmoSliceTestCase.ChildSliceOfContiguousParentIsContiguous",
-    "VmoSliceTestCase.DeepHierarchy",
-    "VmoSliceTestCase.ParentContiguousVmoStaysPinnedWithoutHandle",
-    "VmoSliceTestCase.Pin",
-    "VmoSliceTestCase.RoundUpSizePhysical",
-    "VmoTestCase.Cache",
-    "VmoTestCase.CacheFlush",
-    "VmoTestCase.CacheOpLargeVmo",
-    "VmoTestCase.CacheOpOutOfRange",
-    "VmoTestCase.CachePolicyRace",
-    "VmoTestCase.Commit",
-    "VmoTestCase.CompressedContiguous",
-    "VmoTestCase.ContiguousRequireNonzeroSize",
-    "VmoTestCase.DecommitChildSliceTests",
-    "VmoTestCase.GrowMappedVmo",
-    "VmoTestCase.Info",
-    "VmoTestCase.NoPermMap",
-    "VmoTestCase.NoPermProtect",
-    "VmoTestCase.ParallelWriteAndDecommit",
-    "VmoTestCase.PhysicalSlice",
-    "VmoTestCase.ProtectToWrite",
-    "VmoTestCase.ReadOnlyMap",
-    "VmoTestCase.ReadWriteInvalidKernelBuffer",
-    "VmoTestCase.ReadWriteInvalidNullBuffer",
-    "VmoTestCase.ReadWriteInvalidUserBuffer",
-    "VmoTestCase.SetStreamSizePinnedPages"
+    {
+      "test": "PortStressTest.ChannelCallWaitQueuePanicRepro",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortStressTest.CloseWaitRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortStressTest.MatchHandleCloseRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortStressTest.SignalCloseWait",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortStressTest.WaitSignalCancel",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.AsyncWaitEventManyAllProcessed",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.AsyncWaitEventRepeat",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.AsyncWaitInvalidOption",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelBadSourceHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelEventKey",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelEventKeyAfter",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelKey",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelKeyAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelKeyInvalidOptions",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelKeyQueuedUserPacket",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelKeyWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CancelWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.CreateInvalidOptions",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.EdgeTriggerCancel",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.EdgeTriggerDetected",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.EdgeTriggerTimeout",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.EventAsyncSignalWaitSingle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.QueueAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.QueueWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.ThreadEvents",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.Timestamp",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.TooManyObservers",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitAsyncBootTimestamp",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitAsyncPortAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitAsyncPortWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitAsyncTargetAccessDenied",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitNullPacket",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "PortTest.WaitWrongType",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicBadAvailIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicInvalidBufferPointerFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicNullActualAndAvailSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicNullActualSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoHandleBasicNullAvailSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessBadAvailIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessHandleTableInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessInvalidBufferPointerFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessJobHandleIsBadHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessMapsInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessNullActualAndAvailSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessNullActualSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessNullAvailSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessThreadHandleIsBadHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessThreadsInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessThreadsZeroSizedBufferSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessGetInfoTest.InfoProcessVmosInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.CreateAndKillJobRaceStress",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.GetInfoRuntime",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.GetInfoRuntimeV1",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.InfoProcessNoProcessHandles",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.ProcessStartNoHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProcessTest.ProcessStartWriteThreadState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.JobName",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.ProcessName",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFs",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFsFault",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFsNonThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFsNoncanonical",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFsOtherThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterFsTooSmall",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterGsNonThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterGsOtherThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.RegisterGsTooSmall",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.SocketBuffer",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.ThreadName",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Property.VmoName",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "ProtectTestCase.CreateCowClone",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SocketTest/DatagramSocketBadBufferTest.Read/1",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SocketTest/DatagramSocketBadBufferTest.Read/3",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "StallGetInfoTest.MemoryStallBadActualIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "StallGetInfoTest.MemoryStallBadAvailIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "StallGetInfoTest.MemoryStallInvalidBufferPointerFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "StallGetInfoTest.MemoryStallInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemCpu.ScaleBandwidth",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemCpu.TargetPreemptionTimeAssert",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.CannotSignalImminentOomFromUserspace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.CannotSignalMempressureCriticalFromUserspace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.CannotSignalMempressureNormalFromUserspace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.CannotSignalMempressureWarningFromUserspace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.CannotSignalOomFromUserspace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.ExactlyOneMemoryEventSignaled",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.RetreiveMempressureWarning",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.RetrieveImminentOom",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.RetrieveMempressureCritical",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.RetrieveMempressureNormal",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "SystemEvent.RetrieveOom",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.BadSyscallCaller",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.BadSyscallNumber",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.EmptyNameSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ExitViaException",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.GetAffinity",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.GetInfoRuntime",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.GetInfoRuntimeV1",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.GetLastScheduledCpu",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.InfoThreadStatsFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.LongNameSucceeds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.NoncanonicalRipAddressIRETQ",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.NoncanonicalRipAddressSyscall",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.NonstartedThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ProcessStartOnSecondThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ReadingFpRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ReadingGeneralRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ReadingVectorRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.StartRegs",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.StartRegsNoncanonicalTp",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.StartRegsSuspended",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.StartSuspendedAndResumedThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.StartSuspendedThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendAfterDeath",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendInvalidTargets",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendMultiple",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendSingleWaitAsyncSignalDelivery",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendSleeping",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.SuspendStopsThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ThreadStartInvalidEntry",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ThreadStartOnInitialThread",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.ThreadStartWithZeroInstructionPointer",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WriteThreadStateWithInvalidMxcsrIsInvalidArgs",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WritingFpRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WritingGeneralRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WritingSingleStepState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WritingVectorRegisterState",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.YieldWithNonZeroOptionIsInvalidArgs",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Threads.YieldWithZeroOptionIsOk",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.AllowFaultsTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.ConcurrentUnmapReadMemory",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.DestroyedVmarTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.MapOverDestroyedTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.PartialUnmapAndRead",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.PartialUnmapAndWrite",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.PartialUnmapWithVmarOffset",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.ProtectCowWritable",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.ProtectLargeUncomittedTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.ProtectMultipleTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.ProtectOverDemandPagedTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.UnalignedLenMapTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.UnalignedLenTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.UnmapMultipleTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.UnmapSplitTest",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "Vmar.WriteReadOnlyMemory",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmarMapsGetInfoTest.InfoVmarMapsBadActualIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmarMapsGetInfoTest.InfoVmarMapsBadAvailIsInvalidArg",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmarMapsGetInfoTest.InfoVmarMapsInvalidBufferPointerFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmarMapsGetInfoTest.InfoVmarMapsInvalidHandleFails",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.DropChildrenInParallel",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.DropParentCommittedBytes",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ForbidContiguousVmo",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.MapRangeReadOnly",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.MarkerClearsSplitBits",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.NoAccumulatedOverflow",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.NoPhysical",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ObjMemAccounting",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.Offset",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.OffsetTest2",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.OutOfBounds",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.Overflow",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ParentVmarWrite",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.PinBeforeCreateFailure",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.PinClonePages",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ResizeDisjointChild",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ResizeGrow",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.ResizeMultipleProgressive",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.SmallClone",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoClone2TestCase.SmallClones",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoCloneTestCase.Commit",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoCloneTestCase.NotImmutableMissingNoWrite",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoCloneTestCase.NotImmutableMissingSnapshot",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoSliceTestCase.ChildSliceOfContiguousParentIsContiguous",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoSliceTestCase.DeepHierarchy",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoSliceTestCase.ParentContiguousVmoStaysPinnedWithoutHandle",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoSliceTestCase.Pin",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoSliceTestCase.RoundUpSizePhysical",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.Cache",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.CacheFlush",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.CacheOpLargeVmo",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.CacheOpOutOfRange",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.CachePolicyRace",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.Commit",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.CompressedContiguous",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ContiguousRequireNonzeroSize",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.DecommitChildSliceTests",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.GrowMappedVmo",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.Info",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.NoPermMap",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.NoPermProtect",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ParallelWriteAndDecommit",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.PhysicalSlice",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ProtectToWrite",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ReadOnlyMap",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ReadWriteInvalidKernelBuffer",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ReadWriteInvalidNullBuffer",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.ReadWriteInvalidUserBuffer",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    },
+    {
+      "test": "VmoTestCase.SetStreamSizePinnedPages",
+      "platforms": [
+        "*-libos"
+      ],
+      "reason": "measured green on libos x86_64 only (#2499)"
+    }
   ]
 }
