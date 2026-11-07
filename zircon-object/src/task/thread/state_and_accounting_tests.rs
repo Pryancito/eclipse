@@ -374,6 +374,41 @@ fn process_runtime_info_sums_its_threads() {
     assert_eq!(info.queue_time, 3_000);
 }
 
+/// `ZX_INFO_TASK_RUNTIME` counts kernel-mode time as CPU time, as Zircon's
+/// `cpu_time` does: a thread is on the CPU in a syscall too.
+#[test]
+fn runtime_info_counts_kernel_mode_time_as_cpu_time() {
+    let t = a_thread();
+    t.time_add(5_000);
+    t.sys_time_add(700);
+    let info = t.get_runtime_info();
+    assert_eq!(info.cpu_time, 5_700);
+    assert_eq!(info.queue_time, 5_700);
+}
+
+/// `ZX_INFO_TASK_RUNTIME` on a process still counts a thread that has
+/// exited: its clocks moved to the process when it left the list, and a
+/// process read after its last thread died used to answer zero
+/// (`ProcessTest.GetInfoRuntimeV1`, intermittently, in CI and here).
+#[test]
+fn process_runtime_info_keeps_the_time_of_its_dead_threads() {
+    let root = Job::root();
+    let proc = Process::create(&root, "proc").expect("process");
+    let dead = Thread::create(&proc, "dead").expect("thread");
+    let live = Thread::create(&proc, "live").expect("thread");
+    dead.time_add(9_000);
+    dead.sys_time_add(1_500);
+    live.time_add(400);
+    dead.terminate_abandoned();
+    assert!(
+        !proc.threads().iter().any(|t| t.id() == dead.id()),
+        "the dead thread is still listed"
+    );
+    let info = proc.get_runtime_info();
+    assert_eq!(info.cpu_time, 10_900);
+    assert_eq!(info.queue_time, 10_900);
+}
+
 /// A thread that exits hands both of its clocks to its process before it
 /// leaves the thread list, so `getrusage`, `times` and the parent's
 /// `wait4` still see the time it burned.

@@ -132,10 +132,11 @@
     {
       "test": "CpuMaskProfile.A*",
       "platforms": [
-        "*-libos"
+        "*-libos",
+        "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "ApplyProfile: zx_profile_create is unimplemented and the test ASSERTs on it with a ZX_ASSERT (ud2), which kills the whole test process and with it every suite gtest had still to run."
+      "reason": "ApplyProfile: zx_profile_create is unimplemented and the test ASSERTs on it with a ZX_ASSERT (ud2 on x86_64, an UndefinedInstruction trap on riscv64), which kills the whole test process and with it every suite gtest had still to run. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG) `ASSERT FAILED at profile.cc:74: status == ZX_OK` then `User mode exception: UndefinedInstruction` and `Exit status -1028`, and in CI it took the 50 requested cases of the suites behind it (952/1003) with it."
     },
     {
       "test": "Sync*.SignalR*",
@@ -690,12 +691,12 @@
       "reason": "SMP child-process teardown can reboot the kernel after assertions pass (CI 34018139132; reproduced with InfoProcessBadAvailIsInvalidArg)."
     },
     {
-      "test": "PortStressTest.ChannelCallWaitQueuePanicRepro",
+      "test": "PortStressTest.ChannelCallW*",
       "platforms": [
         "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "Never finishes under QEMU TCG on riscv64: measured here (2026-11-07) still running after 700 s with the rest of the suite behind it, in a boot whose other 605 cases had taken 500 s. It is a stress repro of a wait-queue panic, not a correctness case; the three PortStressTest cases before it pass. Kept out so the suites after it are measured at all."
+      "reason": "PortStressTest.ChannelCallWaitQueuePanicRepro, the one case this prefix covers; a prefix because the platform's hang list rides in one guest option of at most 187 characters, and the names spelled out ran it to 204. Never finishes under QEMU TCG on riscv64: measured here (2026-11-07) still running after 700 s with the rest of the suite behind it, in a boot whose other 605 cases had taken 500 s. It is a stress repro of a wait-queue panic, not a correctness case; the three PortStressTest cases before it pass. Kept out so the suites after it are measured at all."
     },
     {
       "test": "Property.RegisterFsNoncanonical",
@@ -730,20 +731,20 @@
       "reason": "See Threads.WritingF*: the same hang for the two vector-state cases, Threads.WritingVectorRegisterState and Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored."
     },
     {
-      "test": "ChannelCallMutexTest.MutexHeldAcrossCallChain",
+      "test": "ChannelCallMutexTest.MutexH*",
       "platforms": [
         "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "Never finishes on riscv64: PROFILE_CREATE is an unimplemented syscall there (`syscall unimplemented: PROFILE_CREATE`), SetDeadlineProfile() fails with ZX_ERR_NOT_SUPPORTED at channel_call_mutex.cc:60, and the case then sits until the boot's budget runs out. Measured here (2026-11-07, QEMU TCG): the failure printed at 2781 s of the boot and nothing else until the 3600 s cut, with the 22 suites behind it never run."
+      "reason": "ChannelCallMutexTest.MutexHeldAcrossCallChain, the one case this prefix covers; a prefix because the platform's hang list rides in one guest option of at most 187 characters, and the names spelled out ran it to 204. Never finishes on riscv64: PROFILE_CREATE is an unimplemented syscall there (`syscall unimplemented: PROFILE_CREATE`), SetDeadlineProfile() fails with ZX_ERR_NOT_SUPPORTED at channel_call_mutex.cc:60, and the case then sits until the boot's budget runs out. Measured here (2026-11-07, QEMU TCG): the failure printed at 2781 s of the boot and nothing else until the 3600 s cut, with the 22 suites behind it never run."
     },
     {
-      "test": "Bti.NoDelayedUnpin",
+      "test": "Bti.NoD*",
       "platforms": [
         "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "Passes on riscv64 but takes 1169 s under QEMU TCG (measured here 2026-11-07: `[ OK ] Bti.NoDelayedUnpin (1168935 ms)`, the next slowest case in the boot is 492 s), and with it the full boot does not fit in the hour it has: the run was cut at 3600 s with 22 suites still to go. Kept out of the boot so the rest is measured; it comes back the day the budget or the emulation allows it."
+      "reason": "Bti.NoDelayedUnpin, the one case this prefix covers; a prefix because the platform's hang list rides in one guest option of at most 187 characters, and the names spelled out ran it to 204. Passes on riscv64 but takes 1169 s under QEMU TCG (measured here 2026-11-07: `[ OK ] Bti.NoDelayedUnpin (1168935 ms)`, the next slowest case in the boot is 492 s), and with it the full boot does not fit in the hour it has: the run was cut at 3600 s with 22 suites still to go. Kept out of the boot so the rest is measured; it comes back the day the budget or the emulation allows it."
     }
   ],
   "needs_hardware": [

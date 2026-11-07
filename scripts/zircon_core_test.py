@@ -309,6 +309,29 @@ def summary_line(passed, requested, runs, failures, skipped, needs_hardware, log
     )
 
 
+def budget(selection, arch, libos, timeout):
+    """Seconds one boot may take before it is killed.
+
+    A wildcard run is a different animal from the old one-name batches:
+    `PortStressTest.*` took 511 s here in one boot, so the floor is set well
+    clear of that rather than at it. Bare metal riscv64 runs under QEMU TCG
+    (no KVM for a foreign architecture): the same whole-suite boot that takes
+    60 s hosted was 1200 s in and still inside the Port suites here (PortTest
+    alone 264 s, `PortTest.TooManyObservers` 196 s), so its floor is an hour.
+    The cases that never finish stay out by the hang entries; a floor is for
+    the ones that do.
+
+    The whole suite is still the whole suite when hang entries trail it as
+    negative patterns (`*,-Property.RegisterFsNoncanonical,...`): the first
+    x86_64 boot with such a list was cut at the 90 s default with 284 of 468
+    cases passed and the guest in the middle of `PortStressTest`, because the
+    selection no longer compared equal to `*`."""
+    whole = selection.split(",", 1)[0] in ("-l", "*")
+    slow = whole or "PortStressTest." in selection
+    floor = 3600 if arch == "riscv64" and not libos else 1200
+    return max(timeout, floor) if slow else timeout
+
+
 class Runner:
     def __init__(self, args):
         self.args = args
@@ -371,18 +394,7 @@ class Runner:
         else:
             command = self.make + [f"KERNEL_LOG={kernel_log}", f"CMDLINE={cmdline}", "justrun"]
         start = time.monotonic()
-        # A wildcard run is a different animal from the old one-name batches:
-        # `PortStressTest.*` took 511 s here in one boot, so the floor is set
-        # well clear of that rather than at it.
-        slow = selection in ("-l", "*") or "PortStressTest." in selection
-        # Bare metal riscv64 runs under QEMU TCG (no KVM for a foreign
-        # architecture): the same whole-suite boot that takes 60 s hosted
-        # was 1200 s in and still inside the Port suites here (PortTest alone
-        # 264 s, `PortTest.TooManyObservers` 196 s), so its floor is an hour.
-        # The cases that never finish stay out by the hang entries; a floor
-        # is for the ones that do.
-        floor = 3600 if self.args.arch == "riscv64" and not self.args.libos else 1200
-        limit = max(self.args.timeout, floor) if slow else self.args.timeout
+        limit = budget(selection, self.args.arch, self.args.libos, self.args.timeout)
         # The guest writes its log straight to disk; see `sift` for why it is
         # not read back whole.
         guest_log = str(prefix) + ".guest.log"
