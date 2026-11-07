@@ -84,6 +84,45 @@ class PerTestOutcomes(unittest.TestCase):
         self.assertEqual(runner.outcomes(""), {})
         self.assertEqual(runner.unmet(["Suite.Case"], {}), ["Suite.Case"])
 
+    def test_a_verdict_whose_run_line_was_spliced_still_counts(self):
+        """Six harts share one serial line, and a `[ RUN ]` line comes out
+        spliced now and then; the case's own verdict, with its timing, is
+        the result."""
+        output = "[ RUN      ] Suite.A\n[       OK ] Suite.A (1 ms)\n[ RUN   [  0.1 WARN kernel] noise\n[       OK ] Suite.B (844 ms)\n"
+        self.assertEqual(runner.outcomes(output), {"Suite.A": "OK", "Suite.B": "OK"})
+        self.assertEqual(runner.unmet(["Suite.A", "Suite.B"], runner.outcomes(output)), [])
+
+    def test_a_verdict_line_the_kernel_cut_in_two_is_put_back_together(self):
+        """Six harts, one serial: a kernel log line lands in the middle of a
+        gtest line and the gtest line goes on after it. The verdict reads the
+        two halves as one (CI on 2150924: `Threads.ProcessStartOnSecondThread`
+        had its `[ OK ]` cut and was DID-NOT-FINISH with 1002 cases passed)."""
+        kernel = b"\x1b[37m[ 12.345678 \x1b[93mWARN \x1b[m \x1b[37m3 0:0 zircon_syscall]\x1b[m \x1b[33mnoise\x1b[m\r\n"
+        stream = [
+            b"[ RUN      ] Threads.ProcessStartOnSecondThread\r\n",
+            b"[       OK ] Threads.ProcessStart" + kernel,
+            b"OnSecondThread (1 ms)\r\n",
+            b"[ RUN      ] Thr" + kernel,
+            kernel,
+            b"eads.Next\r\n",
+            b"[  FAILED  ] Threads.Next (2 ms)\r\n",
+            b"[ RUN      ] Suite.Cut" + kernel,
+        ]
+        text, _ = runner.sift(iter(stream))
+        self.assertEqual(
+            runner.outcomes(text),
+            {"Threads.ProcessStartOnSecondThread": "OK", "Threads.Next": "FAILED", "Suite.Cut": "DID-NOT-FINISH"},
+        )
+
+    def test_a_kernel_line_on_its_own_is_not_kept(self):
+        """The kernel's own lines go to the log on disk, not to the verdict,
+        and a whole one does not glue itself to anything."""
+        kernel = b"\x1b[37m[  0.132603 \x1b[93mWARN \x1b[m \x1b[37m0 0:0 kernel_hal]\x1b[m \x1b[33m[tsc] ok\x1b[m\r\n"
+        stream = [b"[ RUN      ] A.B\r\n", kernel, b"[       OK ] A.B (0 ms)\r\n"]
+        text, tail = runner.sift(iter(stream))
+        self.assertEqual(runner.outcomes(text), {"A.B": "OK"})
+        self.assertIn("[tsc] ok", tail)
+
     def test_the_summary_tally_is_not_what_decides(self):
         """A run sweeps up tests nobody asked for, so the guest's own total and
         its `[  FAILED  ]` lines cannot be the verdict: only the requested

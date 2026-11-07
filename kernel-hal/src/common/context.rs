@@ -959,6 +959,11 @@ impl UserContext {
         })
     }
 
+    /// The `rflags` a user thread starts with on x86_64: interrupts enabled,
+    /// IOPL 0, bit 1 (always set). The same `0x202` Zircon and Linux use.
+    #[cfg(target_arch = "x86_64")]
+    pub const USER_RFLAGS: usize = 0x200 | 0x2;
+
     /// Initialize the context for entry into userspace.
     /// Note: if the number of args < 3, please fill with zeros
     /// Eg: ctx.setup_uspace(pc_, sp_, &[arg1, arg2, 0])
@@ -970,9 +975,15 @@ impl UserContext {
                 self.0.general.rdi = args[0];
                 self.0.general.rsi = args[1];
                 self.0.general.rdx = args[2];
-                // IOPL = 3, IF = 1
-                // FIXME: set IOPL = 0 when IO port bitmap is supporte
-                self.0.general.rflags = 0x3000 | 0x200 | 0x2;
+                // IF = 1, IOPL = 0 and the always-set bit 1: what Linux and
+                // Zircon start a user thread with. IOPL 3 used to stand in
+                // for an I/O permission bitmap, and it also let user code
+                // run `cli`/`sti`; a thread's `rflags` written through
+                // `zx_thread_write_state` keeps the kernel's bits, so with
+                // IOPL 3 the value read back never matched the one written
+                // (`Threads.WritingGeneralRegisterState`). Port I/O from
+                // user space is `iopl(2)`/`ioperm(2)`'s to grant, like Linux.
+                self.0.general.rflags = Self::USER_RFLAGS;
             } else if #[cfg(target_arch = "aarch64")] {
                 self.0.elr = pc;
                 self.0.sp = sp;
@@ -1930,6 +1941,28 @@ mod tests {
                 assert_eq!(ctx.general().gp, 0xfeed_face_dead_beef);
             }
         }
+    }
+
+    /// A thread enters user mode with IOPL 0: `zx_thread_write_state`
+    /// keeps the kernel's `rflags` bits, so a thread started with IOPL 3
+    /// read back IOPL 3 whatever was written (`Threads.
+    /// WritingGeneralRegisterState`, x86_64 bare metal, 2026-11-07), and
+    /// could run `cli`, `sti` and port I/O that Linux reserves for
+    /// `iopl(2)`/`ioperm(2)`. Interrupts stay enabled.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_user_thread_starts_with_interrupts_on_and_iopl_zero() {
+        let mut ctx = UserContext::new();
+        ctx.setup_uspace(0x1000, 0x2000, &[1, 2, 3]);
+        let rflags = ctx.general().rflags;
+        assert_eq!(rflags & 0x3000, 0, "IOPL {:#x}", rflags);
+        assert_ne!(rflags & 0x200, 0, "IF {:#x}", rflags);
+        assert_eq!(rflags, 0x202);
+        assert_eq!((ctx.general().rip, ctx.general().rsp), (0x1000, 0x2000));
+        assert_eq!(
+            (ctx.general().rdi, ctx.general().rsi, ctx.general().rdx),
+            (1, 2, 3)
+        );
     }
 
     // ---- x86 error codes --------------------------------------------------

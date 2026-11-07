@@ -1554,8 +1554,12 @@ mod tests {
             assert_ne!(rflags & RFLAGS_DF, 0, "{:#x}", rflags);
             assert_eq!(rflags & 0x3000, 0x3000, "{:#x}", rflags);
         }
-        // What user mode is entered with here (`0x3000 | 0x200 | 0x2`) has it
-        // clear: DF=1 is something a user program did, not the kernel.
-        assert_eq!(0x3202 & RFLAGS_DF, 0);
+        // What user mode is entered with here (`0x202`, IOPL 0 since the
+        // captures above were taken) has it clear: DF=1 is something a user
+        // program did, not the kernel.
+        assert_eq!(
+            crate::context::UserContext::USER_RFLAGS as u64 & RFLAGS_DF,
+            0
+        );
     }
 }

@@ -261,7 +261,8 @@ fn two_threads_of_the_same_process_publish_separately() {
     a.lock_inner().change_state(ThreadState::Running, &a.base);
     b.kill();
     assert_eq!(a.state(), ThreadState::Running);
-    assert_eq!(b.state(), ThreadState::Dying);
+    // `b` never started, so the kill is its death.
+    assert_eq!(b.state(), ThreadState::Dead);
     assert_published_agrees(&a, "the live sibling");
     assert_published_agrees(&b, "the dead sibling");
 }

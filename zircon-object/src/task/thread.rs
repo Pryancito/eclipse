@@ -54,7 +54,7 @@ use self::signal_frames::SignalFrames;
 use self::thread_state::ContextAccessState;
 use super::process::{ext_drift, ExtDrift, EXT_CANARY};
 use super::{exception::*, Process, Task};
-use crate::object::{KObjectBase, KoID, Signal};
+use crate::object::{KObjectBase, KernelObject, KoID, Signal};
 use crate::{define_count_helper, impl_kobject, ZxError, ZxResult};
 
 /// A callback run once, when a thread starts dying, for the waits of crates
@@ -941,11 +941,13 @@ impl Thread {
     /// context at home -- and its registers were rewritten on the way in, which
     /// is why `setup` runs here, behind the same check, and not before it.
     ///
-    /// A thread killed before it ever ran stays `Dying`. Its body is still
-    /// spawned, because leaving through that body is the only way a thread
-    /// gets out of its process's list; the run loops check for `Dying` before
-    /// they enter user mode, so it leaves without running a user instruction.
-    /// It used to be stamped `Running` here, which undid the kill: a thread
+    /// A Zircon thread killed before it ever ran is terminated by the kill
+    /// (`stop`) and is `BAD_STATE` to start from then on, as in Zircon. A
+    /// Linux thread killed before it ever ran stays `Dying`, and its body is
+    /// still spawned, because leaving through that body is how it gets out
+    /// of its process's list; the run loops check for `Dying` before they
+    /// enter user mode, so it leaves without running a user instruction. It
+    /// used to be stamped `Running` here, which undid the kill: a thread
     /// that `clone` had created but not yet started when `exit_group` came
     /// through ran user code in a process that had already exited, and that
     /// its parent may already have reaped.
@@ -1281,7 +1283,8 @@ impl Thread {
         // woke the task with this thread's own spin lock still held, taken with
         // interrupts off. A woken task that reaches back for `inner` -- reading
         // its state, or terminating -- is a CPU that does not come back.
-        let (waker, killer, now_dying) = {
+        let zircon = !self.proc().has_ext();
+        let (waker, killer, now_dying, never_started) = {
             let mut inner = self.lock_inner();
             if inner.state == ThreadState::Dead {
                 return;
@@ -1291,11 +1294,33 @@ impl Thread {
             }
             if inner.state == ThreadState::Dying {
                 // Already dying: only the killer, and only for a kill.
-                (None, if killed { inner.killer.take() } else { None }, false)
+                (
+                    None,
+                    if killed { inner.killer.take() } else { None },
+                    false,
+                    false,
+                )
             } else {
+                // A Zircon thread that never started has no body to leave
+                // its process's list through: it is terminated right here
+                // (below, with the lock let go), and `started` is taken under
+                // this same hold so that a `zx_thread_start` racing the kill
+                // gets BAD_STATE instead of a body for a thread that is gone.
+                // Left `Dying`, it kept its process from ever terminating: no
+                // PROCESS_TERMINATED, and an address space never released.
+                //
+                // A Linux thread is left `Dying`: `clone` creates it and
+                // starts it a few steps later, and an `exit_group` in between
+                // must not turn that start into an error; the body it gets
+                // leaves without entering user mode, and through it the
+                // thread leaves the list.
+                let never_started = zircon && inner.state == ThreadState::New && !inner.started;
+                if never_started {
+                    inner.started = true;
+                }
                 inner.change_state(ThreadState::Dying, &self.base);
                 // For a blocking thread, the killer is what gets it out.
-                (inner.waker.take(), inner.killer.take(), true)
+                (inner.waker.take(), inner.killer.take(), true, never_started)
             }
         };
         if let Some(waker) = waker {
@@ -1312,6 +1337,9 @@ impl Thread {
             if let Some(hook) = hook {
                 hook(self);
             }
+        }
+        if never_started {
+            self.terminate();
         }
     }
 
@@ -1588,6 +1616,14 @@ impl Thread {
     #[cfg(test)]
     pub fn set_waker_for_test(&self, waker: core::task::Waker) {
         self.lock_inner().waker = Some(waker);
+    }
+
+    /// Mark the thread as started without giving it a body: for tests that
+    /// drive a thread's states by hand and need a kill to leave it `Dying`,
+    /// the way a kill does to a thread that has a body to die through.
+    #[cfg(test)]
+    pub fn mark_started_for_test(&self) {
+        self.lock_inner().started = true;
     }
 }
 
@@ -2174,8 +2210,28 @@ impl Future for ThreadSwitchFuture {
             // The poll that finishes the thread already took it off its
             // process's list, with its clocks: what this poll spent in the
             // kernel goes straight to the process, or nobody counts it.
+            //
+            // Unless the process is Zircon's and this poll terminated it,
+            // when its last thread left: ZX_INFO_TASK_RUNTIME is frozen from
+            // ZX_PROCESS_TERMINATED on. Credited here, the
+            // teardown's kernel time landed AFTER the signal, and
+            // `ProcessTest.GetInfoRuntimeV1` read 3651000 ns and then
+            // 20742600 ns from a process it had already seen terminate (1
+            // boot of 12 here, riscv64 TCG). Linux hands an exiting task's
+            // clocks over before the parent's `wait` too (`__exit_signal`),
+            // but its `getrusage` is not held to a frozen figure, so the
+            // sliver stays counted there.
+            //
+            // A ready poll ends a thread, not necessarily its process: the
+            // kernel time of a worker that leaves siblings behind is still
+            // the process's, and only the poll that terminated the process
+            // (the signal is up by now, raised inside it) leaves its sliver
+            // out.
             if ret.is_ready() {
-                self.thread.proc().dead_threads_sys_time_add(sys_ns);
+                let proc = self.thread.proc();
+                if proc.has_ext() || !proc.signal().contains(Signal::PROCESS_TERMINATED) {
+                    proc.dead_threads_sys_time_add(sys_ns);
+                }
             } else {
                 self.thread.sys_time_add(sys_ns);
             }
@@ -2793,12 +2849,44 @@ mod tests {
         terminated(&thread).await;
     }
 
-    /// A thread killed before it starts is still dying when it does. `clone`
-    /// creates the thread and starts it a few steps later, and an `exit_group`
-    /// in between kills it; the start used to stamp it `Running` over that, so
-    /// it ran user code in a process that had already exited.
+    /// A Zircon thread killed before it starts has no body to die through,
+    /// so the kill is its death: it leaves its process at once, and a start
+    /// after it is `BAD_STATE`. Left `Dying` with no body, it kept its
+    /// process from ever terminating.
+    #[test]
+    fn a_zircon_thread_killed_before_it_starts_is_dead_and_will_not_start() {
+        static REACHED_USER_MODE: AtomicBool = AtomicBool::new(false);
+        async fn run_user(thread: CurrentThread) {
+            let _cx = thread.wait_for_run().await;
+            REACHED_USER_MODE.store(true, Ordering::SeqCst);
+        }
+        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        proc.exit(9);
+
+        assert_eq!(thread.state(), ThreadState::Dead);
+        assert_eq!(
+            thread.start(|thread| Box::pin(run_user(thread))),
+            Err(ZxError::BAD_STATE)
+        );
+        assert!(
+            !REACHED_USER_MODE.load(Ordering::SeqCst),
+            "the start undid the kill"
+        );
+        assert_eq!(proc.exit_code(), Some(9));
+        assert!(
+            proc.signal().contains(Signal::PROCESS_TERMINATED),
+            "a thread that never ran kept the process from terminating"
+        );
+    }
+
+    /// A Linux thread killed before it starts is still dying when it does.
+    /// `clone` creates the thread and starts it a few steps later, and an
+    /// `exit_group` in between kills it; the start used to stamp it
+    /// `Running` over that, so it ran user code in a process that had already
+    /// exited. It leaves through its body, without entering user mode.
     #[async_std::test]
-    async fn a_thread_killed_before_it_starts_never_reaches_user_mode() {
+    async fn a_linux_thread_killed_before_it_starts_never_reaches_user_mode() {
         static REACHED_USER_MODE: AtomicBool = AtomicBool::new(false);
         // What `run_user` does first, in both loaders: take the context, and
         // leave without entering user mode if the thread is dying.
@@ -2808,9 +2896,12 @@ mod tests {
                 REACHED_USER_MODE.store(true, Ordering::SeqCst);
             }
         }
-        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        struct LinuxExt;
+        let proc = Process::create_with_ext(&Job::root(), "proc", LinuxExt)
+            .expect("failed to create process");
         let thread = Thread::create(&proc, "thread").expect("failed to create thread");
         proc.exit(9);
+        assert_eq!(thread.state(), ThreadState::Dying);
 
         thread.start(|thread| Box::pin(run_user(thread))).unwrap();
 

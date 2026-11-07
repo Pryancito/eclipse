@@ -1486,6 +1486,9 @@ mod tests {
     #[async_std::test]
     async fn the_thread_exit_state_ends_the_thread_and_not_the_process() {
         let thread = a_thread();
+        // A thread in an exception is a started one: the exit the handler
+        // asks for leaves it dying, with its body to die through.
+        thread.mark_started_for_test();
         let proc = thread.proc().clone();
 
         let reached = Arc::new(Mutex::new(false));

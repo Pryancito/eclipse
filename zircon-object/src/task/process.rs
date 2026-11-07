@@ -472,11 +472,56 @@ impl Process {
     }
 }
 
+/// The queue length at which [`ProcessInner::get_cancel_token`] first sweeps
+/// out the senders whose waits are over; after that at every power of two.
+const PRUNE_CANCEL_TOKENS_AT: usize = 16;
+
+/// The cancel tokens parked on one handle value: a `oneshot::Sender` per
+/// `zx_object_wait_one`/`zx_object_wait_async` still waiting, fired when the
+/// handle is closed or moved.
+///
+/// A token's sender stays here until then, but the wait that took it is
+/// usually long over: every wait on a long-lived handle pushed one and
+/// nothing ever took one out, and the x86_64 core-tests boot died of it 458
+/// cases in -- a kernel OOM with 4.2 million 72-byte senders live (~288 MiB)
+/// and the queue's own buffer at 64 MiB, from `grow_one` in `take`. A sender
+/// whose receiver is gone has nothing left to tell, so it is swept out.
+///
+/// The sweep runs when the queue has grown to `sweep_at`, and the next one
+/// is set at twice what that sweep kept: as many new tokens again as there
+/// are live waits, so each token costs amortised constant time whatever the
+/// queue holds. Sweeping at every power of two of the live length did not:
+/// with 4095 live waits every push took the length to 4096 and the next
+/// call scanned them all again, under the process lock.
+#[derive(Default)]
+struct CancelQueue {
+    senders: Vec<Sender<()>>,
+    sweep_at: usize,
+    #[cfg(test)]
+    sweeps: usize,
+}
+
+impl CancelQueue {
+    fn take(&mut self) -> Receiver<()> {
+        if self.senders.len() >= self.sweep_at.max(PRUNE_CANCEL_TOKENS_AT) {
+            self.senders.retain(|sender| !sender.is_canceled());
+            self.sweep_at = (2 * self.senders.len()).max(PRUNE_CANCEL_TOKENS_AT);
+            #[cfg(test)]
+            {
+                self.sweeps += 1;
+            }
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.senders.push(sender);
+        receiver
+    }
+}
+
 #[derive(Default)]
 struct ProcessInner {
     status: Status,
     max_handle_id: u32,
-    handles: HashMap<HandleValue, (Handle, Vec<Sender<()>>)>,
+    handles: HashMap<HandleValue, (Handle, CancelQueue)>,
     threads: Vec<Arc<Thread>>,
 
     // special info
@@ -784,6 +829,11 @@ impl Process {
     ) -> ZxResult {
         let became_running = {
             let mut inner = self.inner.lock();
+            // An exited process answers BAD_STATE before the membership
+            // check: the kill took its never-started threads off the list.
+            if matches!(inner.status, Status::Exited(_)) {
+                return Err(ZxError::BAD_STATE);
+            }
             if !inner.contains_thread(thread) {
                 return Err(ZxError::ACCESS_DENIED);
             }
@@ -792,8 +842,7 @@ impl Process {
                     inner.status = Status::Running;
                     true
                 }
-                Status::Running => false,
-                Status::Exited(_) => return Err(ZxError::BAD_STATE),
+                Status::Running | Status::Exited(_) => false,
             }
         };
         if became_running {
@@ -903,7 +952,25 @@ impl Process {
         // signal here wakes wait_child/wait_child_any and fires the
         // fork-time SIGCHLD callback exactly once (signal_set on an
         // already-set bit does not refire when `terminate()` runs later).
-        self.base.signal_set(Signal::PROCESS_TERMINATED);
+        //
+        // Linux processes only. A Zircon process is terminated when its last
+        // thread is gone, and its tests hold the kernel to that: with the
+        // signal published here, `ProcessTest.GetInfoRuntime` saw
+        // ZX_PROCESS_TERMINATED while the killed thread was still running
+        // down, and two reads of ZX_INFO_TASK_RUNTIME straddling its death
+        // disagreed (1568900 then 4881500 ns, 2 boots of 12 here). A Zircon
+        // thread's kill always lands, so nothing waits for ever on
+        // `terminate()`.
+        if self.has_ext() {
+            self.base.signal_set(Signal::PROCESS_TERMINATED);
+        }
+    }
+
+    /// Whether this process carries an extension (a Linux process does; a
+    /// Zircon one is created with `()`). The two differ on when termination
+    /// is published: see [`exit`](Self::exit).
+    pub(crate) fn has_ext(&self) -> bool {
+        !self.ext.is::<()>()
     }
 
     /// The process finally terminates.
@@ -1776,7 +1843,7 @@ impl ProcessInner {
         // value ends here -- see `KObjectBase::on_handle_lost`.
         let mut handle = handle;
         handle.attach();
-        self.handles.insert(key, (handle, Vec::new()));
+        self.handles.insert(key, (handle, CancelQueue::default()));
         key
     }
 
@@ -1796,7 +1863,7 @@ impl ProcessInner {
         // to go off here, which cancelled a wait at the WRITE of its handle
         // into a channel, where Zircon keeps it blocked until the read
         // (`HandleTransferTest.CancelsWait`).
-        handle.carry_waits(queue);
+        handle.carry_waits(queue.senders);
         // The handle itself lives on -- the caller may be moving it into a
         // channel message -- so mark it as being between tables.
         handle.detach();
@@ -1808,9 +1875,17 @@ impl ProcessInner {
             .handles
             .get_mut(&handle_value)
             .ok_or(ZxError::BAD_HANDLE)?;
-        let (sender, receiver) = oneshot::channel();
-        queue.push(sender);
-        Ok(receiver)
+        Ok(queue.take())
+    }
+
+    #[cfg(test)]
+    fn pending_cancel_tokens(&self, handle_value: HandleValue) -> usize {
+        self.handles[&handle_value].1.senders.len()
+    }
+
+    #[cfg(test)]
+    fn cancel_token_sweeps(&self, handle_value: HandleValue) -> usize {
+        self.handles[&handle_value].1.sweeps
     }
 
     fn get_handle(&mut self, handle_value: HandleValue) -> ZxResult<Handle> {
@@ -2289,8 +2364,9 @@ mod tests {
         proc.exit(666);
         let info = proc.get_info();
         assert!(info.has_exited && info.started && info.return_code == 666);
-        assert_eq!(thread.state(), ThreadState::Dying);
-        // TODO: when is the thread dead?
+        // Never started, so there is no body to die through: the kill is
+        // its death.
+        assert_eq!(thread.state(), ThreadState::Dead);
 
         assert_eq!(
             Thread::create(&proc, "thread1").err(),
@@ -2989,6 +3065,86 @@ mod ext_and_lifecycle_tests {
         );
     }
 
+    /// ... for a Linux process, which is the one whose threads can sit in a
+    /// blocking syscall: with a thread still alive the signal is up as soon
+    /// as the status is.
+    #[test]
+    fn a_linux_process_publishes_termination_before_its_threads_are_gone() {
+        struct LinuxExt;
+        let root = Job::root();
+        let proc = Process::create_with_ext(&root, "linux", LinuxExt).expect("process");
+        let _thread = Thread::create(&proc, "t").expect("thread");
+        proc.exit(0);
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+    }
+
+    /// A Zircon process is terminated when its last thread is gone, and its
+    /// tests read the kernel by that: `ProcessTest.GetInfoRuntime` waits for
+    /// ZX_PROCESS_TERMINATED and then expects ZX_INFO_TASK_RUNTIME to be
+    /// stable, which it is not while a killed thread is still running down.
+    #[test]
+    fn a_zircon_process_publishes_termination_when_its_last_thread_is_gone() {
+        extern crate std;
+        let root = Job::root();
+        let proc = Process::create(&root, "zircon").expect("process");
+        let thread = Thread::create(&proc, "t").expect("thread");
+        // A running thread, parked in the kernel until released: the kill
+        // marks it dying but it only leaves when its body does. (A thread's
+        // body is a plain `fn`, so the receiver travels through a static.)
+        static PARKED: Mutex<Option<Receiver<()>>> = Mutex::new(None);
+        fn parked_body(
+            current: CurrentThread,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'static>> {
+            Box::pin(async move {
+                if let Some(parked) = PARKED.lock().take() {
+                    let _ = parked.await;
+                }
+                drop(current);
+            })
+        }
+        let (release, parked) = oneshot::channel::<()>();
+        *PARKED.lock() = Some(parked);
+        proc.start(&thread, 1, 4, None, 2, parked_body)
+            .expect("start");
+        proc.exit(0);
+        assert!(
+            !proc.signal().contains(Signal::PROCESS_TERMINATED),
+            "terminated with a thread still alive"
+        );
+        release.send(()).expect("the body is parked on this");
+        let start = std::time::Instant::now();
+        while !proc.signal().contains(Signal::PROCESS_TERMINATED)
+            && start.elapsed() < core::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(core::time::Duration::from_millis(5));
+        }
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+        assert_eq!(thread.state(), ThreadState::Dead);
+    }
+
+    /// A Zircon thread that was created but never started has no body to
+    /// leave the process through. Killed, it goes at once, so the process it
+    /// was the last member of terminates; and starting it afterwards is
+    /// BAD_STATE, as in Zircon, never a body for a thread that is gone. (A
+    /// Linux one stays `Dying` and leaves through the body `clone` gives it
+    /// a few steps later: `a_linux_thread_killed_before_it_starts_never_reaches_user_mode`.)
+    #[test]
+    fn killing_a_process_terminates_the_threads_it_never_started() {
+        let root = Job::root();
+        let proc = Process::create(&root, "zircon").expect("process");
+        let thread = Thread::create(&proc, "unstarted").expect("thread");
+        proc.exit(0);
+        assert!(
+            proc.signal().contains(Signal::PROCESS_TERMINATED),
+            "a thread that never ran kept the process alive"
+        );
+        assert_eq!(thread.state(), ThreadState::Dead);
+        assert_eq!(
+            thread.start(|current| Box::pin(async move { drop(current) })),
+            Err(ZxError::BAD_STATE)
+        );
+    }
+
     // ------------------------------------------------------- the handle table
 
     /// Every id the mask admits still fits in a handle value. The value is the
@@ -3027,6 +3183,69 @@ mod ext_and_lifecycle_tests {
             token.try_recv(),
             Ok(Some(())),
             "the wait parked on that handle was never told"
+        );
+    }
+
+    /// A token whose wait is over leaves the handle's queue instead of
+    /// staying there until the handle closes: a long-lived handle waited on
+    /// in a loop used to keep every sender ever taken (4.2 million of them
+    /// by the time the x86_64 core-tests boot ran out of heap).
+    #[test]
+    fn finished_waits_do_not_pile_up_on_their_handle() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        for _ in 0..10_000 {
+            drop(proc.get_cancel_token(value).unwrap());
+        }
+        let pending = proc.inner.lock().pending_cancel_tokens(value);
+        assert!(
+            pending <= 2 * super::PRUNE_CANCEL_TOKENS_AT,
+            "{} senders kept for waits that are over",
+            pending
+        );
+    }
+
+    /// With many live waits on one handle, finished tokens still cost
+    /// constant time each: the sweep is scheduled by what the last one kept,
+    /// not by the queue's length, which with 4095 live waits sat at a power
+    /// of two after every push and was scanned whole on every call.
+    #[test]
+    fn live_waits_do_not_make_every_new_token_a_sweep() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let live: Vec<_> = (0..4095)
+            .map(|_| proc.get_cancel_token(value).unwrap())
+            .collect();
+        for _ in 0..10_000 {
+            drop(proc.get_cancel_token(value).unwrap());
+        }
+        let inner = proc.inner.lock();
+        let sweeps = inner.cancel_token_sweeps(value);
+        assert!(sweeps <= 12, "{} sweeps for 14095 tokens", sweeps);
+        assert!(
+            inner.pending_cancel_tokens(value) < 4095 * 3,
+            "{} senders kept for {} live waits",
+            inner.pending_cancel_tokens(value),
+            live.len()
+        );
+    }
+
+    /// The sweep only takes what is finished: a token whose wait is still
+    /// parked is still told when its handle closes.
+    #[test]
+    fn a_live_wait_survives_the_sweep_and_is_still_cancelled() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let mut live = proc.get_cancel_token(value).unwrap();
+        for _ in 0..10_000 {
+            drop(proc.get_cancel_token(value).unwrap());
+        }
+        assert_eq!(live.try_recv(), Ok(None));
+        proc.remove_handle(value).unwrap();
+        assert_eq!(
+            live.try_recv(),
+            Ok(Some(())),
+            "the sweep took a wait that was still parked"
         );
     }
 

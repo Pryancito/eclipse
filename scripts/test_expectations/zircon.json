@@ -133,10 +133,11 @@
       "test": "CpuMaskProfile.A*",
       "platforms": [
         "*-libos",
-        "riscv64-bare"
+        "riscv64-bare",
+        "x86_64-bare"
       ],
       "hangs": true,
-      "reason": "ApplyProfile: zx_profile_create is unimplemented and the test ASSERTs on it with a ZX_ASSERT (ud2 on x86_64, an UndefinedInstruction trap on riscv64), which kills the whole test process and with it every suite gtest had still to run. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG) `ASSERT FAILED at profile.cc:74: status == ZX_OK` then `User mode exception: UndefinedInstruction` and `Exit status -1028`, and in CI it took the 50 requested cases of the suites behind it (952/1003) with it."
+      "reason": "ApplyProfile: zx_profile_create is unimplemented and the test ASSERTs on it with a ZX_ASSERT (ud2 on x86_64, an UndefinedInstruction trap on riscv64), which kills the whole test process and with it every suite gtest had still to run. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG) `ASSERT FAILED at profile.cc:74: status == ZX_OK` then `User mode exception: UndefinedInstruction` and `Exit status -1028`, and in CI it took the 50 requested cases of the suites behind it (952/1003) with it. x86_64 bare metal the same (`ud2`): measured here (2026-11-07, QEMU TCG) at 310 s of the whole-suite boot, with 1032 cases passed before it and the 3 requested ones behind it never run."
     },
     {
       "test": "Sync*.SignalR*",
@@ -145,6 +146,14 @@
       ],
       "hangs": true,
       "reason": "SignalRequeue, INTERMITTENT (1 run in 6): after sync_completion_signal_requeue moved the waiters to the second futex, one of them was no longer reported BLOCKED_FUTEX (a spurious wake, or a state flip under the requeue), the test asserts and its destructor joins threads that nobody wakes. A real bug to chase; kept out so one bad run does not lose the suites gtest had still to run."
+    },
+    {
+      "test": "Resource.Io*",
+      "platforms": [
+        "x86_64-bare"
+      ],
+      "hangs": true,
+      "reason": "Resource.Ioports, the one case this prefix covers (a prefix because the platform's hang list rides in one guest option of at most 187 characters). It does port I/O after zx_ioports_request, and this kernel has no I/O permission bitmap: the request is a stub, and since user threads enter with IOPL 0 (as Linux and Zircon start them; IOPL 3 was the stand-in for the bitmap and made rflags unwritable through zx_thread_write_state) the `in` is a #GP that kills the whole test process. Measured here (2026-11-07, QEMU TCG): `User mode exception: General` at 299 s of the whole-suite boot, `Exit status -1028`, with the 2 requested HandleWaitTest cases behind it never run. The table has it as FAILED; a real zx_ioports_request would be a TSS I/O bitmap switched with the process."
     },
     {
       "test": "Resource.*",
@@ -158,26 +167,30 @@
       "test": "InterruptTest.*U*Wait",
       "platforms": [
         "*-libos",
-        "riscv64-bare"
+        "riscv64-bare",
+        "x86_64-bare"
       ],
       "hangs": true,
-      "reason": "PacketFollowsUnbindToWait and UntriggeredSignalInterruptWait, and only those two. Both need ZX_VIRTUAL_INTERRUPT_UNTRIGGERED (asserted while a virtual interrupt is idle, cleared from trigger to ack) and an unbind that hands the untaken packet's timestamp back to zx_interrupt_wait; here a zx_interrupt_wait that should return at once, or re-arm and block for the next trigger, never returns. Patterns, not names: the guest option is capped at 187 characters. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG), an InterruptTest.* boot printed `[ RUN ] InterruptTest.PacketFollowsUnbindToWait` after 8 cases OK and nothing else until its 600 s budget, so the zx_interrupt_wait that never returns is the kernel's, not the host bridge's."
+      "reason": "PacketFollowsUnbindToWait and UntriggeredSignalInterruptWait, and only those two. Both need ZX_VIRTUAL_INTERRUPT_UNTRIGGERED (asserted while a virtual interrupt is idle, cleared from trigger to ack) and an unbind that hands the untaken packet's timestamp back to zx_interrupt_wait; here a zx_interrupt_wait that should return at once, or re-arm and block for the next trigger, never returns. Patterns, not names: the guest option is capped at 187 characters. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG), an InterruptTest.* boot printed `[ RUN ] InterruptTest.PacketFollowsUnbindToWait` after 8 cases OK and nothing else until its 600 s budget, so the zx_interrupt_wait that never returns is the kernel's, not the host bridge's. x86_64 bare metal the same: measured here (2026-11-07, QEMU TCG) the whole-suite boot printed `[ RUN ] InterruptTest.PacketFollowsUnbindToWait` with 1027 cases passed and nothing else until the 1200 s cut."
     },
     {
       "test": "/Restr*",
       "platforms": [
-        "*-libos"
+        "*-libos",
+        "x86_64-bare",
+        "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "/RestrictedMode.*: restricted mode (zx_restricted_bind_state and friends) is unimplemented, and FloatingPointState, after its Initialize fails, never returns, so the run times out with every requested case already passed."
+      "reason": "/RestrictedMode.*: restricted mode (zx_restricted_bind_state and friends) is unimplemented, and FloatingPointState, after its Initialize fails, never returns, so the run times out with every requested case already passed. Bare metal the same: the riscv64 CI boot on 13710b0 reached the suite at 1131 s (`syscall unimplemented: RESTRICTED_BIND_STATE`, `Initialize: failed to reset restricted state`) and printed nothing more until the 3600 s cut, 999/1003 in; the suite is the last one gtest runs, so nothing requested is behind it, only the exit."
     },
     {
       "test": "Threads.X86Ac*",
       "platforms": [
-        "*-libos"
+        "*-libos",
+        "x86_64-bare"
       ],
       "hangs": true,
-      "reason": "Suspends a thread blocked in a syscall and writes rip=0 to it. Zircon interrupts the blocked syscall on suspend (INTERNAL_INTR_RETRY) and the resumed thread runs at rip 0 and dies; this kernel keeps the syscall blocked, so the written rip is never reached and the test waits for a termination that never comes."
+      "reason": "Suspends a thread blocked in a syscall and writes rip=0 to it. Zircon interrupts the blocked syscall on suspend (INTERNAL_INTR_RETRY) and the resumed thread runs at rip 0 and dies; this kernel keeps the syscall blocked, so the written rip is never reached and the test waits for a termination that never comes. Bare metal x86_64 the same (the table has it as TIMEOUT): measured here (2026-11-07, QEMU TCG) the whole-suite boot reached it at 211 s and sat on it until the 1200 s cut, with the 10 requested cases behind it never run (458/468)."
     },
     {
       "test": "Vmar.AllocateUnsatisfiableTest",
@@ -733,10 +746,11 @@
     {
       "test": "ChannelCallMutexTest.MutexH*",
       "platforms": [
-        "riscv64-bare"
+        "riscv64-bare",
+        "x86_64-bare"
       ],
       "hangs": true,
-      "reason": "ChannelCallMutexTest.MutexHeldAcrossCallChain, the one case this prefix covers; a prefix because the platform's hang list rides in one guest option of at most 187 characters, and the names spelled out ran it to 204. Never finishes on riscv64: PROFILE_CREATE is an unimplemented syscall there (`syscall unimplemented: PROFILE_CREATE`), SetDeadlineProfile() fails with ZX_ERR_NOT_SUPPORTED at channel_call_mutex.cc:60, and the case then sits until the boot's budget runs out. Measured here (2026-11-07, QEMU TCG): the failure printed at 2781 s of the boot and nothing else until the 3600 s cut, with the 22 suites behind it never run."
+      "reason": "ChannelCallMutexTest.MutexHeldAcrossCallChain, the one case this prefix covers; a prefix because the platform's hang list rides in one guest option of at most 187 characters, and the names spelled out ran it to 204. Never finishes on riscv64: PROFILE_CREATE is an unimplemented syscall there (`syscall unimplemented: PROFILE_CREATE`), SetDeadlineProfile() fails with ZX_ERR_NOT_SUPPORTED at channel_call_mutex.cc:60, and the case then sits until the boot's budget runs out. Measured here (2026-11-07, QEMU TCG): the failure printed at 2781 s of the boot and nothing else until the 3600 s cut, with the 22 suites behind it never run. x86_64 bare metal the same (the libos entry is `ChannelCallMutex*`): measured here (2026-11-07, QEMU TCG) the whole-suite boot printed the `SetDeadlineProfile()` failure at 258 s and nothing else for the six minutes it was left, with 1015 cases passed before it."
     },
     {
       "test": "Bti.NoD*",
