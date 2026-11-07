@@ -698,12 +698,20 @@
       "reason": "Never finishes under QEMU TCG on riscv64: measured here (2026-11-07) still running after 700 s with the rest of the suite behind it, in a boot whose other 605 cases had taken 500 s. It is a stress repro of a wait-queue panic, not a correctness case; the three PortStressTest cases before it pass. Kept out so the suites after it are measured at all."
     },
     {
+      "test": "Property.RegisterFsNoncanonical",
+      "platforms": [
+        "x86_64-bare"
+      ],
+      "hangs": true,
+      "reason": "Kills the whole guest under QEMU TCG, so it has to stay out of the boot and not just out of the tally (needs_hardware only keeps a case out of the count; the positive filter is still `*`). TCG does not #GP on the non-canonical WRFSBASE, the write takes effect and the #GP arrives later on an FS-relative access with fsbase 0x1010101010101010 already in the saved context (trap_num 0xd, error_code 0x0, regs.rip 0x4000008ea34d, not the write instruction); the test then tries to put the thread back with zx_thread_write_state and the kernel refuses the non-canonical base (ZX_ERR_INVALID_ARGS, correct: it would #GP in ring 0 on the way out), the exception is left unhandled and the test process is killed with ZX_TASK_RETCODE_EXCEPTION_KILL (-1028), which lands on whichever [ RUN ] line is current: on master c665878 and #2506 b26d21d after Property.RegisterGsNoncanonical, on #2506 ddc5d7774 (Gs already out) after Property.RegisterFsNoncanonical itself. 173/468 every time, the 295 cases behind it never run. Needs real hardware, where WRFSBASE itself faults."
+    },
+    {
       "test": "Property.RegisterGsNoncanonical",
       "platforms": [
         "x86_64-bare"
       ],
       "hangs": true,
-      "reason": "Kills the whole guest under QEMU TCG, so it has to stay out of the boot and not just out of the tally: like Property.RegisterFsNoncanonical (needs_hardware), TCG does not #GP on the non-canonical WRGSBASE, the write takes effect and the #GP arrives later on a GS-relative access (regs.rip 0x4000008ea34d is not the write instruction, trap_num 0xd error_code 0x0, gsbase 0x1010101010101010 already in the saved context); the thread then dies and the test process exits -1028 with the 295 cases behind it never run. Measured in Test CI, Zircon Core Test Baremetal (x86_64), on master c665878 and on #2506 b26d21d: 173/468, 'Exit status -1028' right after '[ RUN ] Property.RegisterGsNoncanonical'. Needs real hardware."
+      "reason": "Same test body as Property.RegisterFsNoncanonical with GS (fsgsbase.cc, TestInThread), and the same kernel path refuses the non-canonical gsbase on write_state, so it kills the test process the same way; kept out of the boot with it. Measured in Test CI, Zircon Core Test Baremetal (x86_64): on master c665878 and #2506 b26d21d the -1028 landed right after '[ RUN ] Property.RegisterGsNoncanonical' (173/468); with this entry alone (#2506 ddc5d7774) the kill landed on the Fs case instead, which is why both are here. Needs real hardware."
     },
     {
       "test": "Threads.WritingF*",
