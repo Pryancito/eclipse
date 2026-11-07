@@ -162,7 +162,7 @@ fn tcp_port_taken(set: &SocketSet<'_>, want: IpEndpoint, reuse_addr: bool) -> bo
 /// a daemon listened on, and the listener answered the SYN-ACK with a RST.
 /// The search never leans on `SO_REUSEADDR` (`inet_csk_find_open_port`
 /// with `relax` off): a port shared that way is a poor pick.
-fn free_ephemeral_port(set: &SocketSet<'_>, addr: IpAddress) -> Option<u16> {
+pub(crate) fn free_ephemeral_port(set: &SocketSet<'_>, addr: IpAddress) -> Option<u16> {
     const RANGE: usize = 65535 - 49152;
     (0..RANGE)
         .map(|_| get_ephemeral_port())
@@ -171,7 +171,7 @@ fn free_ephemeral_port(set: &SocketSet<'_>, addr: IpAddress) -> Option<u16> {
 
 /// smoltcp refuses to connect to port 0; on Linux the SYN goes out and the
 /// answer is a RST, so the caller sees `ECONNREFUSED`, not `ENOBUFS`.
-fn connect_error(e: smoltcp::Error) -> LxError {
+pub(crate) fn connect_error(e: smoltcp::Error) -> LxError {
     match e {
         smoltcp::Error::Unaddressable => LxError::ECONNREFUSED,
         smoltcp::Error::Illegal => LxError::EISCONN,

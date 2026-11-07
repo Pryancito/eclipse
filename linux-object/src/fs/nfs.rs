@@ -55,6 +55,8 @@
 //! tests hold it at the boundary.
 
 pub mod client;
+pub mod connect;
+pub mod greeting;
 pub mod mount3;
 pub mod nfs3;
 pub mod nfs3_dir;
