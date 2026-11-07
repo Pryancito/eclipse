@@ -4,6 +4,8 @@ use crate::{MMUFlags, VirtAddr};
 use core::fmt;
 use trapframe::UserContext as UserContextInner;
 
+#[cfg(target_arch = "aarch64")]
+pub use trapframe::FpRegs;
 pub use trapframe::GeneralRegs;
 
 cfg_if! {
@@ -1636,6 +1638,20 @@ impl UserContext {
     #[doc(cfg(target_arch = "x86_64"))]
     pub fn xsave_components() -> u32 {
         trapframe::xsave_components()
+    }
+
+    /// The thread's vector registers `q0`-`q31` with `fpcr` and `fpsr`, as
+    /// the trap path saved them. See [`trapframe::FpRegs`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn vector_state(&self) -> &FpRegs {
+        &self.0.fp
+    }
+
+    /// The thread's vector registers, to write registers into: what the
+    /// thread runs with next. See [`trapframe::FpRegs`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn vector_state_mut(&mut self) -> &mut FpRegs {
+        &mut self.0.fp
     }
 
     /// Returns the reference of general registers.

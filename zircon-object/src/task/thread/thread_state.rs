@@ -10,6 +10,10 @@ use numeric_enum_macro::numeric_enum;
 #[path = "thread_state_x86.rs"]
 mod thread_state_x86;
 
+#[cfg(any(target_arch = "aarch64", test))]
+#[path = "thread_state_aarch64.rs"]
+mod thread_state_aarch64;
+
 numeric_enum! {
     #[repr(u32)]
     /// Possible values for "kind" in zx_thread_read_state and zx_thread_write_state.
@@ -84,6 +88,11 @@ impl ContextAccessState for UserContext {
             #[cfg(target_arch = "x86_64")]
             ThreadStateKind::SingleStep => {
                 thread_state_x86::read_single_step(self.general().rflags, buf)
+            }
+            #[cfg(target_arch = "aarch64")]
+            ThreadStateKind::Vector => {
+                let fp = self.vector_state();
+                thread_state_aarch64::read_vector_regs(&fp.q, fp.fpcr, fp.fpsr, buf)
             }
             _ => Err(ZxError::NOT_SUPPORTED),
         }
@@ -176,6 +185,11 @@ impl ContextAccessState for UserContext {
             #[cfg(target_arch = "x86_64")]
             ThreadStateKind::SingleStep => {
                 thread_state_x86::write_single_step(&mut self.general_mut().rflags, buf)?
+            }
+            #[cfg(target_arch = "aarch64")]
+            ThreadStateKind::Vector => {
+                let fp = self.vector_state_mut();
+                thread_state_aarch64::write_vector_regs(&mut fp.q, &mut fp.fpcr, &mut fp.fpsr, buf)?
             }
             _ => return Err(ZxError::NOT_SUPPORTED),
         }
