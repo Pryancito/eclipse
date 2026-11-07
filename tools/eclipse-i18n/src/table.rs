@@ -266,8 +266,8 @@ strings! {
     },
     net_saved_applied => { es: "guardado y aplicado", en: "saved and applied" },
     net_saved_no_service => {
-        es: "guardado; el servicio de red no está en marcha, se aplicará al arrancar",
-        en: "saved; the network service is not running, it will be applied at boot",
+        es: "guardado; el servicio de red no arranca, se aplicará al arrancar",
+        en: "saved; the network service will not start, it will be applied at boot",
     },
     /// `wlan0: vuelve a lo que dice el archivo` -- the interface name goes
     /// before it.

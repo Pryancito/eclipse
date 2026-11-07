@@ -8,7 +8,7 @@
 //! network service to read it again.
 //!
 //! `lunarnet --service` is that service. eclipse-init runs it (through
-//! `eclipse-udhcpc`, the `udhcpc` service the image always had) at boot: it
+//! `eclipse-network-up`, the `network` service of the image) at boot: it
 //! sets the static addresses and routes with `ip`, runs `udhcpc` / `udhcpc6`
 //! for the interfaces that want DHCP, writes `resolv.conf` when the servers are
 //! fixed, and on SIGHUP stops all of it and starts again from the file.
@@ -873,7 +873,7 @@ impl Editor {
             KEY_ENTER_WL | KEY_KPENTER_WL => match self.focus {
                 Focus::List => self.focus = Focus::Mode4,
                 Focus::Revert => self.revert(),
-                _ => self.apply(|a| netconf::save(Path::new(netconf::CONF), a), signal_service),
+                _ => self.apply(|a| netconf::save(Path::new(netconf::CONF), a), apply_now),
             },
             KEY_BACKSPACE_WL => self.backspace(),
             _ => {
@@ -927,7 +927,7 @@ impl Editor {
             self.revert();
         } else if hit(l.apply, x, y) {
             self.focus = Focus::Apply;
-            self.apply(|a| netconf::save(Path::new(netconf::CONF), a), signal_service);
+            self.apply(|a| netconf::save(Path::new(netconf::CONF), a), apply_now);
         }
         true
     }
@@ -955,6 +955,84 @@ fn signal_service() -> bool {
         Some(pid) => unsafe { libc::kill(pid, libc::SIGHUP) == 0 },
         None => false,
     }
+}
+
+/// Start `lunarnet --service` when there is none, and wait for it to say so.
+///
+/// Without this the window is a no-op on a machine whose network service is
+/// not running: `APLICAR` wrote `/etc/eclipse/network`, found nobody to
+/// `SIGHUP`, and left the interface exactly as it was --- no `ip` command, no
+/// DHCP client, no address, and a NIC whose TX counter stays at zero because
+/// nothing ever asked it to transmit. The service is this same binary, so
+/// starting it here needs no other file in the image to have survived.
+fn start_service() -> bool {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut c = std::process::Command::new(exe);
+    c.arg("--service")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and touches nothing but the child.
+    unsafe {
+        c.pre_exec(|| {
+            // Its own session: the service outlives this window, and closing
+            // the window's terminal does not take the network down with it.
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let Ok(mut child) = c.spawn() else {
+        return false;
+    };
+    // `service()` writes the pidfile before it touches anything, so the file
+    // appearing is the signal that it came up; a child that exited instead is
+    // the signal that it did not, and neither needs a fixed wait.
+    let mut came_up = false;
+    for _ in 0..100 {
+        if service_pid().is_some() {
+            came_up = true;
+            break;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !came_up {
+        // It never published its pid, and it is still running: it may already
+        // be configuring interfaces and starting DHCP clients that nothing can
+        // find again, and every retry would leave another one behind. Stop it.
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    }
+    // Whichever way it went, the child is this process's to reap. A window
+    // that stays open outlives a service that later dies, and the zombie keeps
+    // its name in `/proc/<pid>/comm`, so `service_pid` goes on finding it and
+    // `signal_service` goes on "succeeding" against a process that stopped
+    // running the network: APLICAR would say "guardado y aplicado" and change
+    // nothing. The wait runs on a thread of its own because the service it
+    // waits for is meant to outlive this window.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    came_up
+}
+
+/// What `APLICAR` does with the saved file: tell the running service, or start
+/// one. Either way the settings take effect now and not at the next boot.
+fn apply_now() -> bool {
+    apply_with(signal_service, start_service)
+}
+
+/// The decision behind [`apply_now`], with the outside world passed in.
+///
+/// Starting a service is tried ONLY when there was none to signal: a second
+/// `lunarnet --service` beside the first would put a second `udhcpc` on the
+/// same interface, and two DHCP clients fight over its address.
+fn apply_with(signal: impl FnOnce() -> bool, start: impl FnOnce() -> bool) -> bool {
+    signal() || start()
 }
 
 // ── the service ──────────────────────────────────────────────────────────────
@@ -1050,7 +1128,51 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> Vec<Client> {
     clients
 }
 
+/// `/run/lunarnet.service.lock`, held for as long as the service runs.
+const SERVICE_LOCK: &str = "/run/lunarnet.service.lock";
+
+/// Claim the right to be THE network service, or hand the job to the one that
+/// already has it.
+///
+/// `service()` used to publish its pid unconditionally, so two launches that
+/// crossed --- eclipse-init respawning its service while a window's `APLICAR`
+/// started one, or two windows applying at once --- left two daemons running
+/// `udhcpc` on the same interfaces, with only the one that wrote the pidfile
+/// last reachable by SIGHUP. The other kept renewing a lease nobody could stop,
+/// which is two DHCP clients fighting over one address. The loser of the race
+/// does what the winner would have been told to do anyway: re-read the file.
+///
+/// Returns the locked file, which the caller must keep: dropping it closes the
+/// descriptor and releases the lock.
+fn claim_service_lock() -> Option<std::fs::File> {
+    claim_service_lock_at(Path::new(SERVICE_LOCK))
+}
+
+/// [`claim_service_lock`] on a named file, so the tests do not need `/run`.
+fn claim_service_lock_at(path: &Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // SAFETY: flock on a descriptor this process owns.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(f)
+}
+
 fn service() -> ! {
+    let Some(_lock) = claim_service_lock() else {
+        // Someone else is the service. Make this launch mean what it was for:
+        // apply the file again, in the daemon that is already running.
+        if let Some(pid) = service_pid() {
+            unsafe { libc::kill(pid, libc::SIGHUP) };
+        }
+        std::process::exit(0);
+    };
     let _ = std::fs::write(PIDFILE, format!("{}\n", std::process::id()));
     // SAFETY: the handlers only store to atomics.
     unsafe {
@@ -1557,6 +1679,55 @@ mod tests {
         e.focus = Focus::Addr4;
         e.type_char('1');
         assert_eq!(e.edit[0].address4, "");
+    }
+
+    /// Only one service at a time, however the launches cross: eclipse-init
+    /// respawning its own while a window's APLICAR starts one, or two windows
+    /// applying at once. Two daemons mean two `udhcpc` on one interface.
+    #[test]
+    fn only_one_service_can_hold_the_lock_at_a_time() {
+        let path = std::env::temp_dir().join(format!("lunarnet-test-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let first = claim_service_lock_at(&path).expect("the first launch takes the lock");
+        assert!(
+            claim_service_lock_at(&path).is_none(),
+            "a second service ran beside the first"
+        );
+        // The lock lives as long as the file is held, and no longer: the next
+        // service after this one exits has to be able to take it.
+        drop(first);
+        assert!(
+            claim_service_lock_at(&path).is_some(),
+            "the lock outlived the service that held it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A running service is signalled and nothing else is started: a second
+    /// `lunarnet --service` means a second `udhcpc` on the same interface.
+    #[test]
+    fn applying_starts_a_service_only_when_there_is_none_to_signal() {
+        let mut started = false;
+        assert!(apply_with(|| true, || {
+            started = true;
+            true
+        }));
+        assert!(!started, "a second service beside the one already running");
+
+        // No service: one is started, and that is what makes the window
+        // apply the file now instead of leaving it for the next boot.
+        let mut started = false;
+        assert!(apply_with(
+            || false,
+            || {
+                started = true;
+                true
+            }
+        ));
+        assert!(started);
+
+        // Neither worked: the window has to say so, not claim it applied.
+        assert!(!apply_with(|| false, || false));
     }
 
     #[test]

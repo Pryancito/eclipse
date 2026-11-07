@@ -484,7 +484,7 @@ fichero `/etc/eclipse/desktop` y usa **labwc**; `make qemu` también, salvo que
 se le pase `DESKTOP=`. Los
 servicios de cada sesión llevan una etiqueta `desktop =` en su
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` son `desktop = labwc`,
-`xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `udhcpc`)
+`xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `network`)
 arrancan siempre.
 
 `make vbox` arranca la **misma** sesión live que `make qemu` (`desktop=labwc`,

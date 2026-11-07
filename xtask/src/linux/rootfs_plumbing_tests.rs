@@ -686,8 +686,14 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-lunarclip",
             "labwc",
         ),
+        (
+            "network",
+            "respawn",
+            "/usr/local/bin/eclipse-network-up",
+            "",
+        ),
         ("notify", "respawn", "/usr/local/bin/eclipse-notify", ""),
-        ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
+        ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "network"),
         ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
         // No `after`: `requires = dbus` implies it (#1744).
         ("portal", "respawn", "/usr/local/bin/eclipse-portal", ""),
@@ -698,7 +704,6 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "dbus-system",
         ),
         ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
-        ("udhcpc", "respawn", "/usr/local/bin/eclipse-udhcpc", ""),
         (
             "xkbmap",
             "oneshot",
@@ -1042,7 +1047,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "notify",
         "portal",
         "pulseaudio",
-        "udhcpc",
+        "network",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
@@ -1199,7 +1204,7 @@ fn each_of_the_three_halt_wrappers_forces_its_own_verb() {
 #[test]
 fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
     let rootfs = init_rootfs("dhcp");
-    let body = wrapper(&rootfs, "eclipse-udhcpc");
+    let body = wrapper(&rootfs, "eclipse-network-up");
     let execs: Vec<&str> = body
         .lines()
         .map(str::trim)
@@ -1233,14 +1238,14 @@ fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
 }
 
 /// The settings window's service goes first: with `lunarnet` in the image the
-/// `udhcpc` service applies `/etc/eclipse/network` (static, off, DHCPv6) and
+/// `network` service applies `/etc/eclipse/network` (static, off, DHCPv6) and
 /// not bare DHCPv4 on the first interface. And it is `exec`ed with
 /// `--service`, never run beside the fallback udhcpc: two clients for one
 /// interface would fight over its address.
 #[test]
 fn the_network_service_hands_over_to_lunarnet_before_bare_dhcp() {
     let rootfs = init_rootfs("lunarnet");
-    let body = wrapper(&rootfs, "eclipse-udhcpc");
+    let body = wrapper(&rootfs, "eclipse-network-up");
     let first_exec = body
         .lines()
         .map(str::trim)

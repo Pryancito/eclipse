@@ -1,7 +1,7 @@
 //! The network at boot and its settings window.
 //!
-//! `eclipse-udhcpc` is what the `udhcpc` service runs, as it always was (ntpd
-//! is ordered after that name). It hands over to `lunarnet --service` when
+//! `eclipse-network-up` is what the `network` service runs (ntpd is ordered
+//! after that name). It hands over to `lunarnet --service` when
 //! the image has it: that applies `/etc/eclipse/network` (static addresses,
 //! routes, DNS servers, IPv4 off) and runs `udhcpc` / `udhcpc6` for the
 //! interfaces that want DHCP. Without it, DHCPv4 on the first interface, as
@@ -11,10 +11,20 @@
 use std::fs;
 use std::path::Path;
 
-/// `/usr/local/bin/eclipse-udhcpc`.
-pub(super) fn write_udhcpc_wrapper(localbin: &Path) {
+/// `/usr/local/bin/eclipse-network-up`.
+///
+/// Named after what it brings up, not after the client it falls back to. It
+/// was `eclipse-udhcpc`, run by a service called `udhcpc`, long after lunarnet
+/// took the job over --- and a name that says "the old bare DHCP client" is a
+/// name that gets deleted as dead weight, which takes the whole network with
+/// it: without this service nothing applies `/etc/eclipse/network`, nothing
+/// runs a DHCP client, and the NIC sits there with no address.
+pub(super) fn write_network_wrapper(localbin: &Path) {
+    // The old name, left behind by an incremental rootfs, is dead weight that
+    // still looks runnable.
+    let _ = fs::remove_file(localbin.join("eclipse-udhcpc"));
     fs::write(
-        localbin.join("eclipse-udhcpc"),
+        localbin.join("eclipse-network-up"),
         b"#!/bin/sh\n\
           # Eclipse OS: the network at boot, in the foreground for eclipse-init.\n\
           # lunarnet --service applies /etc/eclipse/network and supervises the\n\
@@ -24,7 +34,7 @@ pub(super) fn write_udhcpc_wrapper(localbin: &Path) {
           done\n\
           # Without it: foreground DHCPv4 on the first real interface; init\n\
           # respawns the client if it dies.\n\
-          command -v udhcpc >/dev/null 2>&1 || { echo 'eclipse-udhcpc: udhcpc not found' >&2; sleep 5; exit 127; }\n\
+          command -v udhcpc >/dev/null 2>&1 || { echo 'eclipse-network-up: udhcpc not found' >&2; sleep 5; exit 127; }\n\
           # -s is NOT optional: busybox udhcpc's compiled-in default script\n\
           # path is not where Eclipse stages the script, so without -s the\n\
           # lease is obtained but never APPLIED -- the address, resolv.conf\n\
@@ -37,7 +47,7 @@ pub(super) fn write_udhcpc_wrapper(localbin: &Path) {
           # `ip` may not have listed anything yet (netlink dump raced the\n\
           # NIC probe). eth0 is the sequential name the kernel assigns to\n\
           # the first Ethernet NIC.\n\
-          echo 'eclipse-udhcpc: no interface from ip link; trying eth0' >&2\n\
+          echo 'eclipse-network-up: no interface from ip link; trying eth0' >&2\n\
           exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
     )
     .unwrap();
