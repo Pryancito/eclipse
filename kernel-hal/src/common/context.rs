@@ -1204,7 +1204,10 @@ impl UserContext {
                 // Before the trip out, while the kernel's own thread area is
                 // still loaded: the fault bridge's handler needs a stack of
                 // its own on this host thread. See `libos::fault_bridge`.
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
                 crate::fault_bridge::ensure_altstack();
                 // The time slice: a host timer that ticks this thread every
                 // 10 ms. A tick that lands out in the guest comes back as
@@ -1212,15 +1215,26 @@ impl UserContext {
                 // since the last trip is honoured here, before going out, as
                 // that same interrupt with nothing run. See
                 // `libos::fault_bridge::PREEMPT_VECTOR`.
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
                 {
                     crate::fault_bridge::ensure_tick();
                     if crate::fault_bridge::take_resched() {
                         self.0.trap_num = crate::fault_bridge::PREEMPT_VECTOR;
-                        self.0.error_code = 0;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            self.0.error_code = 0;
+                        }
                         return;
                     }
                 }
+                // On aarch64 the guest never walks back into the kernel: every
+                // way back is a host signal, and the handler fills THIS context
+                // from the signal's. It has to be told which one is out.
+                #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+                crate::fault_bridge::publish_context(&mut self.0);
                 self.0.run_fncall()
             } else {
                 #[cfg(target_arch = "x86_64")]
@@ -1554,6 +1568,16 @@ impl UserContext {
                     return TrapReason::Syscall;
                 }
                 TrapReason::from(self.0.trap_num, self.0.error_code)
+            } else if #[cfg(all(target_arch = "aarch64", feature = "libos"))] {
+                // No `ESR_EL1` to read at EL0 (`mrs` of it is SIGILL on the
+                // host): the fault bridge wrote the syndrome and the address
+                // into the context from what the host's signal said.
+                TrapReason::from_aarch64(
+                    self.0.trap_num,
+                    self.0.esr as u32,
+                    self.0.far,
+                    || usize::MAX,
+                )
             } else if #[cfg(target_arch = "aarch64")] {
                 TrapReason::from(self.0.trap_num)
             } else if #[cfg(target_arch = "riscv64")] {
@@ -1568,6 +1592,8 @@ impl UserContext {
         cfg_if! {
             if #[cfg(target_arch = "x86_64")] {
                 self.0.trap_num
+            } else if #[cfg(all(target_arch = "aarch64", feature = "libos"))] {
+                self.0.esr
             } else if #[cfg(target_arch = "aarch64")] {
                 // `trap_num` is the vector table entry -- source and kind --
                 // not the syndrome, so this is the same read `TrapReason::from`

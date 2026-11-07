@@ -164,6 +164,14 @@
       "reason": "The suite drives what a hosted kernel cannot have: Ioports does outb(0x80) after zx_ioports_request, which is a #GP in a host process and kills the whole test process (exit -1028, every suite gtest had still to run lost); PcInterruptVectorPoolLeak never returns; the Mexec cases want a kernel to replace. Its three requested cases (ProbeAddressSpace, VmoCreation, VmoReplaceAsExecutable) go with it; the first two had skip entries already."
     },
     {
+      "test": "TopByteIgnoreTests.*",
+      "platforms": [
+        "aarch64-libos"
+      ],
+      "hangs": true,
+      "reason": "Address tagging (TBI) is not plumbed through the hosted aarch64 kernel: user pointers with a top byte are rejected (VmarTaggedAddress gets INVALID_ARGS from zx_vmo_create), the debug registers the segfault case reads back are NOT_SUPPORTED, and FutexWaitWake kills the whole test process (exit -1028: measured on the arm64 CI runner, #2516, run 42412571869, with the 375 requested cases behind it never run). Stripping the tag from user pointers on aarch64 is its own change."
+    },
+    {
       "test": "InterruptTest.*U*Wait",
       "platforms": [
         "*-libos",

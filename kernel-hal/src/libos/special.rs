@@ -1,5 +1,9 @@
 //! Functions only available on the libos mode.
 
+/// Where the hosted "physical" memory window starts in this process. See
+/// `zCore/src/platform/libos/consts.rs`.
+pub use super::mem::PMEM_MAP_VADDR;
+
 #[cfg(feature = "graphic")]
 pub fn run_graphic_service() {
     use crate::drivers::{all_display, all_input};

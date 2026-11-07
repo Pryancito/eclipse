@@ -28,6 +28,11 @@ mod macos;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod fault_bridge;
+/// The same bridge for the other Linux host, under the same name so the
+/// callers (`context.rs`, `boot.rs`, the loader) read one module path.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[path = "fault_bridge_aarch64.rs"]
+pub mod fault_bridge;
 
 /// Non-SMP initialization.
 pub fn init() {

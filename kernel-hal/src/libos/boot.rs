@@ -22,7 +22,10 @@ hal_fn_impl! {
             // this very process. Without this the host kills the lot --
             // kernel, guest and harness -- and a test that was waiting for
             // the exception never hears anything. See `fault_bridge`.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             unsafe {
                 super::fault_bridge::init();
             }

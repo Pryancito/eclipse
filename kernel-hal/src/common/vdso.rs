@@ -108,8 +108,8 @@ pub(crate) fn vdso_constants_template() -> VdsoConstants {
             address_tagging: 0,
             vm: 0,
         },
-        dcache_line_size: cache_line_size(),
-        icache_line_size: cache_line_size(),
+        dcache_line_size: cache_line_size(CacheSide::Data),
+        icache_line_size: cache_line_size(CacheSide::Instruction),
         page_size: crate::PAGE_SIZE as u32,
         padding: 0,
         physmem: 0,
@@ -123,20 +123,44 @@ pub(crate) fn vdso_constants_template() -> VdsoConstants {
     constants
 }
 
+/// Which cache the line length is asked for. AArch64 reports the two apart
+/// (`CTR_EL0.DminLine` and `IminLine`), and the vDSO keeps them apart too.
+#[derive(Clone, Copy)]
+enum CacheSide {
+    Data,
+    Instruction,
+}
+
 /// The cache line size the vDSO's `zx_cache_flush` walks with. Zero is not
-/// "unknown" to it but "no cache": `_zx_cache_flush` answers
+/// "unknown" to it but "no cache": on x86 `_zx_cache_flush` answers
 /// `ZX_ERR_NOT_SUPPORTED` without flushing a line, and every core test that
 /// cleans a VMO before using it (`GetTestPhysVmo`, so the whole physical
-/// family) failed on that one call. On x86 it is what Zircon reads too: the
-/// `CLFLUSH` line size from CPUID leaf 1, in eight-byte units. The other
-/// architectures keep their own value until they report one.
-fn cache_line_size() -> u32 {
+/// family) failed on that one call. On arm64 it is worse: the vDSO strides
+/// its `dc cvac` loop by this number without looking at it, so a zero spins
+/// the thread for ever on the first line (measured in an arm64 VM:
+/// `StreamTestCase.NoStreamFromContiguousOrPhysicalVmo` never came back from
+/// `zx_cache_flush` on the physical VMO it had just mapped). On x86 it is what
+/// Zircon reads too: the `CLFLUSH` line size from CPUID leaf 1, in eight-byte
+/// units. On AArch64 it comes from `CTR_EL0`, readable at EL0 as well as EL1
+/// (Linux leaves `SCTLR.UCT` set, and traps and emulates the read where it is
+/// not). The other architectures keep their own value until they report one.
+fn cache_line_size(side: CacheSide) -> u32 {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
+            let _ = side;
             // CPUID leaf 1 exists on every x86_64 processor.
             let leaf = core::arch::x86_64::__cpuid(1);
             ((leaf.ebx >> 8) & 0xff) * 8
+        } else if #[cfg(target_arch = "aarch64")] {
+            let ctr: u64;
+            // SAFETY: a read of a system register with no side effects.
+            unsafe { core::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+            match side {
+                CacheSide::Data => super::cache_maint::dcache_line_size(ctr) as u32,
+                CacheSide::Instruction => super::cache_maint::icache_line_size(ctr) as u32,
+            }
         } else {
+            let _ = side;
             0
         }
     }
