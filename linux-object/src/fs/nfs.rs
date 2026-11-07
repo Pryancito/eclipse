@@ -55,11 +55,21 @@
 //! tests hold it at the boundary.
 
 pub mod client;
+pub mod connect;
+#[cfg(test)]
+pub(crate) mod dialer;
+#[cfg(test)]
+pub(crate) mod fake;
+pub mod fs;
+pub mod greeting;
+pub mod mount;
 pub mod mount3;
 pub mod nfs3;
 pub mod nfs3_dir;
 pub mod nfs3_write;
 pub mod portmap;
+#[cfg(test)]
+mod real_server_tests;
 pub mod rpc;
 pub mod session;
 pub mod source;

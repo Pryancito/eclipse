@@ -59,15 +59,18 @@ fn ptr(s: &Option<String>) -> UserInPtr<u8> {
 }
 
 /// A tmpfs on `target` with `flags`.
-fn tmpfs(sys: &Syscall<'_>, target: &str, flags: usize) {
+async fn tmpfs(sys: &Syscall<'_>, target: &str, flags: usize) {
     let (source, target, fstype) = (Some(c("sf")), Some(c(target)), Some(c("tmpfs")));
-    let got = sys.sys_mount(ptr(&source), ptr(&target), ptr(&fstype), flags, ptr(&None));
+    let got = sys
+        .sys_mount(ptr(&source), ptr(&target), ptr(&fstype), flags, ptr(&None))
+        .await;
     assert_eq!(got, Ok(0), "the tmpfs on {:?}", target);
 }
 
-fn mount(sys: &Syscall<'_>, source: Option<&str>, target: &str, flags: usize) -> SysResult {
+async fn mount(sys: &Syscall<'_>, source: Option<&str>, target: &str, flags: usize) -> SysResult {
     let (source, target) = (source.map(c), Some(c(target)));
     sys.sys_mount(ptr(&source), ptr(&target), ptr(&None), flags, ptr(&None))
+        .await
 }
 
 fn umount(sys: &Syscall<'_>, target: &str) {
@@ -118,14 +121,15 @@ fn flags_of_fd(sys: &Syscall<'_>, path: &str, flags: usize) -> LxResult<usize> {
 
 /// The tree [`a_process`] makes, with `n` mounted nosuid,nodev,noexec, `r`
 /// read-only and `e` with none of them.
-fn mounted(sys: &Syscall<'_>, top: &str) {
+async fn mounted(sys: &Syscall<'_>, top: &str) {
     tmpfs(
         sys,
         &format!("/{}/n", top),
         MS_NOSUID | MS_NODEV | MS_NOEXEC,
-    );
-    tmpfs(sys, &format!("/{}/r", top), MS_RDONLY);
-    tmpfs(sys, &format!("/{}/e", top), 0);
+    )
+    .await;
+    tmpfs(sys, &format!("/{}/r", top), MS_RDONLY).await;
+    tmpfs(sys, &format!("/{}/e", top), 0).await;
 }
 
 fn unmounted(sys: &Syscall<'_>, top: &str) {
@@ -139,7 +143,7 @@ fn statfs_of_a_nosuid_nodev_noexec_mount_says_so() {
     let proc = a_process(45_630, "sf_n");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_n");
+            mounted(sys, "sf_n").await;
             let got = (flags_at(sys, "/sf_n/n/f"), flags_at(sys, "/sf_n/n/d"));
             unmounted(sys, "sf_n");
             got
@@ -155,7 +159,7 @@ fn statfs_of_a_read_only_mount_has_st_rdonly_and_a_plain_one_none() {
     let proc = a_process(45_631, "sf_r");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_r");
+            mounted(sys, "sf_r").await;
             let got = (flags_at(sys, "/sf_r/r/f"), flags_at(sys, "/sf_r/e/f"));
             unmounted(sys, "sf_r");
             got
@@ -172,7 +176,7 @@ fn fstatfs_says_what_statfs_says() {
     let proc = a_process(45_632, "sf_fd");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_fd");
+            mounted(sys, "sf_fd").await;
             let got = (
                 flags_of_fd(sys, "/sf_fd/n/f", O_RDONLY),
                 flags_of_fd(sys, "/sf_fd/r/d", O_DIRECTORY),
@@ -194,9 +198,9 @@ fn a_bind_remounted_read_only_is_st_rdonly_and_its_source_is_not() {
     let proc = a_process(45_633, "sf_b");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_b");
-            let bind = mount(sys, Some("/sf_b/e/d"), "/sf_b/b", MS_BIND);
-            let remount = mount(sys, None, "/sf_b/b", MS_REMOUNT | MS_BIND | MS_RDONLY);
+            mounted(sys, "sf_b").await;
+            let bind = mount(sys, Some("/sf_b/e/d"), "/sf_b/b", MS_BIND).await;
+            let remount = mount(sys, None, "/sf_b/b", MS_REMOUNT | MS_BIND | MS_RDONLY).await;
             let got = (flags_at(sys, "/sf_b/b"), flags_at(sys, "/sf_b/e/d"));
             unmounted(sys, "sf_b");
             (bind, remount, got)
@@ -212,7 +216,7 @@ fn statfs_through_a_link_is_of_the_mount_it_leads_to() {
     let proc = a_process(45_634, "sf_l");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_l");
+            mounted(sys, "sf_l").await;
             let got = (flags_at(sys, "/sf_l/l/f"), flags_at(sys, "/sf_l/l"));
             unmounted(sys, "sf_l");
             got
@@ -228,7 +232,7 @@ fn statfs_of_a_relative_path_is_of_the_working_directorys_mount() {
     let proc = a_process(45_635, "sf_rel");
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            mounted(sys, "sf_rel");
+            mounted(sys, "sf_rel").await;
             let dir = Some(c("/sf_rel/r"));
             sys.sys_chdir(ptr(&dir)).unwrap();
             let got = (flags_at(sys, "f"), flags_at(sys, "."));
@@ -248,7 +252,7 @@ fn nosuid_nodev_and_noexec_are_each_their_own_bit() {
         Box::pin(async move {
             let mut got = [Ok(0); 3];
             for (i, &flag) in [MS_NOSUID, MS_NODEV, MS_NOEXEC].iter().enumerate() {
-                tmpfs(sys, "/sf_bit/e", flag);
+                tmpfs(sys, "/sf_bit/e", flag).await;
                 got[i] = flags_at(sys, "/sf_bit/e/f");
                 umount(sys, "/sf_bit/e");
             }

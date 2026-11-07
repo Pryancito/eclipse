@@ -13,7 +13,7 @@ const MS_RDONLY: usize = 1;
 const MS_NOEXEC: usize = 8;
 
 /// `mount --bind source target` with `flags` and `data` asked for as well.
-fn bind_asking(
+async fn bind_asking(
     sys: &Syscall<'_>,
     source: &str,
     target: &str,
@@ -28,6 +28,7 @@ fn bind_asking(
         MS_BIND | flags,
         at(&data),
     )
+    .await
 }
 
 #[test]
@@ -41,7 +42,8 @@ fn a_plain_bind_takes_no_flags_and_no_options_from_the_call() {
                 "/mp_bo/run/b",
                 MS_RDONLY | MS_NOEXEC,
                 "nosuid",
-            );
+            )
+            .await;
             let made = sys
                 .linux_process()
                 .lookup_inode("/mp_bo/run/b")

@@ -2558,7 +2558,7 @@ fn efi_dev_from_root_cmdline() -> Option<String> {
     }
 }
 
-pub use mount_ops::{mount_fs, umount_fs};
+pub use mount_ops::{mount_fs, nfs_host_to_resolve, umount_fs, with_addr_option};
 pub use mount_state::{
     check_umount_flags, MS_BIND, MS_MOVE, MS_REMOUNT, ST_VALID, UMOUNT_NOFOLLOW,
 };

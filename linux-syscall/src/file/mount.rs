@@ -2,7 +2,7 @@
 
 use super::*;
 use alloc::string::String;
-use linux_object::fs::{mount_fs, umount_fs};
+use linux_object::fs::{mount_fs, nfs_host_to_resolve, umount_fs, with_addr_option};
 use linux_object::process::CAP_SYS_ADMIN;
 
 /// Whether the caller may touch the mount table at all.
@@ -30,7 +30,15 @@ fn may_mount(syscall: &Syscall<'_>) -> linux_object::error::LxResult<()> {
 
 impl Syscall<'_> {
     /// Mount a filesystem.
-    pub fn sys_mount(
+    ///
+    /// `async` for one case: a network mount whose server is named and whose
+    /// name nothing local knows. Resolving it is a DNS query, the query
+    /// waits, and the synchronous version of that wait spins a CPU — so the
+    /// await happens here, where there is an executor, and `mount_fs` stays
+    /// synchronous and is handed an address. See
+    /// `nfs_host_to_resolve`: every other mount, this one included when the
+    /// server is a literal or in `/etc/hosts`, awaits nothing.
+    pub async fn sys_mount(
         &self,
         source: UserInPtr<u8>,
         target: UserInPtr<u8>,
@@ -76,6 +84,23 @@ impl Syscall<'_> {
                 Some(path_source.as_str())
             }
             source => source,
+        };
+        // Linux has no equivalent because Linux has `mount.nfs(8)`: the
+        // helper resolves the name in userspace and the kernel is handed
+        // `addr=`. There is no helper here, so the kernel does it, in the
+        // one layer that can await.
+        let resolved;
+        let data = match nfs_host_to_resolve(fstype, source, data) {
+            None => data,
+            Some(host) => {
+                use linux_object::fs::dns_vfs_root;
+                use linux_object::net::dns::{self, DnsFamily};
+                let root = dns_vfs_root().ok_or(LxError::ENOENT)?;
+                let addrs = dns::resolve(&root, &host, DnsFamily::Unspec).await?;
+                let addr = *addrs.first().ok_or(LxError::ENOENT)?;
+                resolved = with_addr_option(data, addr);
+                resolved.as_str()
+            }
         };
         mount_fs(proc, source, &target, fstype, flags, data)?;
         linux_object::fs::dcache_invalidate();
@@ -194,10 +219,20 @@ mod tests {
             Box::pin(async move {
                 // `UserInPtr` is not `Copy`, so the null `data` pointer is
                 // built again for each call rather than shared.
-                let empty_fstype =
-                    sys.sys_mount(at(&none), at(&slash), at(&empty), 0, UserInPtr::from(0));
-                let unknown_fstype =
-                    sys.sys_mount(at(&none), at(&slash), at(&unknown), 0, UserInPtr::from(0));
+                let empty_fstype = async_std::task::block_on(sys.sys_mount(
+                    at(&none),
+                    at(&slash),
+                    at(&empty),
+                    0,
+                    UserInPtr::from(0),
+                ));
+                let unknown_fstype = async_std::task::block_on(sys.sys_mount(
+                    at(&none),
+                    at(&slash),
+                    at(&unknown),
+                    0,
+                    UserInPtr::from(0),
+                ));
                 let unknown_flag = sys.sys_umount2(at(&slash), AN_UNKNOWN_UMOUNT_FLAG);
                 (empty_fstype, unknown_fstype, unknown_flag)
             })
@@ -214,7 +249,13 @@ mod tests {
         // written to the mount table on the way out.
         let got = on_a_thread(&proc, move |sys| {
             Box::pin(async move {
-                sys.sys_mount(at(&none), at(&slash), at(&fstype), 0, UserInPtr::from(0))
+                async_std::task::block_on(sys.sys_mount(
+                    at(&none),
+                    at(&slash),
+                    at(&fstype),
+                    0,
+                    UserInPtr::from(0),
+                ))
             })
         });
 
@@ -240,7 +281,13 @@ mod tests {
         let (none, target, fstype) = (c("none"), c(A_TARGET_OF_ITS_OWN), c("proc"));
         let (got, mounts) = on_a_thread(&proc, move |sys| {
             Box::pin(async move {
-                let got = sys.sys_mount(at(&none), at(&target), at(&fstype), 0, UserInPtr::from(0));
+                let got = async_std::task::block_on(sys.sys_mount(
+                    at(&none),
+                    at(&target),
+                    at(&fstype),
+                    0,
+                    UserInPtr::from(0),
+                ));
                 let inode = sys.linux_process().lookup_inode("/proc/mounts").unwrap();
                 let mut buf = vec![0u8; 8192];
                 let read = inode.read_at(0, &mut buf).unwrap();
@@ -341,20 +388,62 @@ mod tests {
             Box::pin(async move {
                 [
                     // `do_loopback` and `do_move_mount_old` want a name.
-                    sys.sys_mount(null(), at(&target), null(), MS_BIND, null()),
-                    sys.sys_mount(null(), at(&target), null(), MS_MOVE, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        null(),
+                        at(&target),
+                        null(),
+                        MS_BIND,
+                        null(),
+                    )),
+                    async_std::task::block_on(sys.sys_mount(
+                        null(),
+                        at(&target),
+                        null(),
+                        MS_MOVE,
+                        null(),
+                    )),
                     // A new mount with no type at all.
-                    sys.sys_mount(at(&source), at(&target), null(), 0, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        at(&source),
+                        at(&target),
+                        null(),
+                        0,
+                        null(),
+                    )),
                     // A remount reads neither; this target is mounted nowhere.
-                    sys.sys_mount(null(), at(&target), null(), MS_REMOUNT, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        null(),
+                        at(&target),
+                        null(),
+                        MS_REMOUNT,
+                        null(),
+                    )),
                     // And the type of a bind is not looked at.
-                    sys.sys_mount(at(&source), at(&target), null(), MS_BIND, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        at(&source),
+                        at(&target),
+                        null(),
+                        MS_BIND,
+                        null(),
+                    )),
                     // A pseudo-filesystem with no source, which Linux shows as
                     // `none`.
-                    sys.sys_mount(null(), at(&target), at(&fstype), 0, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        null(),
+                        at(&target),
+                        at(&fstype),
+                        0,
+                        null(),
+                    )),
                     // A filesystem on a device with none named: "No source
                     // specified" (`get_tree_bdev`), not a lookup of "".
-                    sys.sys_mount(null(), at(&slash), at(&vfat), 0, null()),
+                    async_std::task::block_on(sys.sys_mount(
+                        null(),
+                        at(&slash),
+                        at(&vfat),
+                        0,
+                        null(),
+                    )),
                 ]
             })
         });
