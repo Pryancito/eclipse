@@ -2242,6 +2242,95 @@ impl INode for SysClassNetDirINode {
     }
 }
 
+/// Which of the two link files [`NetLinkAttrINode`] is.
+#[derive(Clone, Copy)]
+enum NetLinkAttr {
+    Operstate,
+    Carrier,
+}
+
+/// `/sys/class/net/<if>/operstate` and `.../carrier`, answered when they are
+/// READ and not when they are looked up.
+///
+/// A [`Pseudo`] freezes its text at `find` time, so a program that opens one
+/// of these once and polls it --- which is exactly how a cable is watched ---
+/// would read the same answer for ever. `ThermalAttrINode` above is the same
+/// shape for the same reason.
+struct NetLinkAttrINode {
+    name: String,
+    attr: NetLinkAttr,
+}
+
+impl NetLinkAttrINode {
+    fn value(&self) -> String {
+        // The loopback has no carrier of its own: Linux reports `unknown` for
+        // its `operstate` and 1 for its `carrier`.
+        let loopback = self.name == "lo" || self.name == "loopback";
+        let carrier = loopback || net_iface_carrier(&self.name);
+        let text = match (self.attr, loopback, carrier) {
+            (NetLinkAttr::Carrier, _, true) => "1",
+            (NetLinkAttr::Carrier, _, false) => "0",
+            (NetLinkAttr::Operstate, true, _) => "unknown",
+            (NetLinkAttr::Operstate, false, true) => "up",
+            (NetLinkAttr::Operstate, false, false) => "down",
+        };
+        alloc::format!("{text}\n")
+    }
+}
+
+impl INode for NetLinkAttrINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let content = self.value();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = (bytes.len() - offset).min(buf.len());
+        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            dev: SYSFS_DEV,
+            inode: 0,
+            size: self.value().len(),
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o444,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
+
 /// Whether `name` has carrier, as its driver reports it.
 ///
 /// `operstate` and `carrier` used to be the fixed strings `up` and `1` for
@@ -2297,29 +2386,14 @@ impl INode for SysNetIfaceINode {
                 name: self.name.clone(),
             })),
             ".." => Ok(Arc::new(SysClassNetDirINode)),
-            "operstate" => {
-                // The loopback has no carrier of its own, and Linux reports
-                // `unknown` for it rather than `up`.
-                let state = if self.name == "lo" || self.name == "loopback" {
-                    "unknown"
-                } else if net_iface_carrier(&self.name) {
-                    "up"
-                } else {
-                    "down"
-                };
-                Ok(Arc::new(Pseudo::new(
-                    &format!("{}\n", state),
-                    FileType::File,
-                )))
-            }
-            "carrier" => {
-                let carrier =
-                    self.name == "lo" || self.name == "loopback" || net_iface_carrier(&self.name);
-                Ok(Arc::new(Pseudo::new(
-                    if carrier { "1\n" } else { "0\n" },
-                    FileType::File,
-                )))
-            }
+            "operstate" => Ok(Arc::new(NetLinkAttrINode {
+                name: self.name.clone(),
+                attr: NetLinkAttr::Operstate,
+            })),
+            "carrier" => Ok(Arc::new(NetLinkAttrINode {
+                name: self.name.clone(),
+                attr: NetLinkAttr::Carrier,
+            })),
             "address" => {
                 let mac = get_net_device()
                     .iter()
@@ -3393,6 +3467,28 @@ mod net_carrier_tests {
         assert!(net_iface_carrier("eth0"));
         assert_eq!(read(&iface("eth0").find("operstate").unwrap()), "up\n");
         assert_eq!(read(&iface("eth0").find("carrier").unwrap()), "1\n");
+    }
+
+    /// The two link files have to be answered when they are READ: a program
+    /// that opens `carrier` once and polls it is exactly how a cable is
+    /// watched, and a `Pseudo` would hand it the value frozen at `find` time
+    /// for ever.
+    #[test]
+    fn the_link_files_are_answered_at_read_time_and_not_at_lookup() {
+        for attr in ["carrier", "operstate"] {
+            let node = iface("eth0").find(attr).unwrap();
+            assert!(
+                node.as_any_ref()
+                    .downcast_ref::<NetLinkAttrINode>()
+                    .is_some(),
+                "{} is a frozen snapshot again",
+                attr
+            );
+            // Read-only, like Linux: a write must not look like it took.
+            assert!(node.write_at(0, b"0\n").is_err());
+            // And its size agrees with what a read gives, or `cat` truncates.
+            assert_eq!(node.metadata().unwrap().size, read(&node).len());
+        }
     }
 
     /// The loopback has no carrier of its own. Linux reports `unknown` for its
