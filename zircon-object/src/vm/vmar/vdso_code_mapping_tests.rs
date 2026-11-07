@@ -37,6 +37,20 @@ fn the_vdso_code_is_neither_unmapped_nor_protected() {
     assert!(root.syscall_may_come_from(at + 8));
 }
 
+/// A range whose end wraps the address space is refused outright: a wrapped
+/// end would pass the vDSO check and misplace every cut after it.
+#[test]
+fn a_range_that_wraps_the_address_space_is_invalid() {
+    let (root, at) = root_with_vdso_code();
+    let len = usize::MAX - at + 1; // page aligned, and `at + len` is exactly 2^64
+    assert_eq!(root.unmap(at, len), Err(ZxError::INVALID_ARGS));
+    assert_eq!(
+        root.protect(at, len, MMUFlags::READ),
+        Err(ZxError::INVALID_ARGS)
+    );
+    assert!(root.syscall_may_come_from(at + 8));
+}
+
 #[test]
 fn nothing_is_mapped_over_the_vdso_code() {
     let (root, at) = root_with_vdso_code();

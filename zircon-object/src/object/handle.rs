@@ -74,7 +74,7 @@ impl Handle {
 
     /// Carry the waits parked on the table value this handle just left, to
     /// go off when it is closed or arrives in a table (see `wakes_on_arrival`).
-    pub fn carry_waits(&mut self, wakes: Vec<Sender<()>>) {
+    pub(crate) fn carry_waits(&mut self, wakes: Vec<Sender<()>>) {
         self.wakes_on_arrival.extend(wakes);
     }
 

@@ -956,7 +956,10 @@ impl VmAddressRegion {
         if !page_aligned(addr) || !page_aligned(len) || len == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        if self.touches_vdso_code(addr, addr + len) {
+        // A range that wraps the address space names nothing; a wrapped end
+        // would also pass the vDSO check below and misplace the cut.
+        let end = addr.checked_add(len).ok_or(ZxError::INVALID_ARGS)?;
+        if self.touches_vdso_code(addr, end) {
             return Err(ZxError::ACCESS_DENIED);
         }
         // Allocation-free ring write (see `VmarInner::recent_unmaps`).
@@ -964,7 +967,6 @@ impl VmAddressRegion {
         inner.unmap_head = (inner.unmap_head + 1) % UNMAP_HISTORY;
 
         let begin = addr;
-        let end = addr + len;
         // check partial overlapped sub-regions
         for vmar in inner.children.iter() {
             if vmar.partial_overlap(begin, end) {
@@ -1027,7 +1029,7 @@ impl VmAddressRegion {
         if !page_aligned(addr) || !page_aligned(len) || len == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let end_addr = addr + len;
+        let end_addr = addr.checked_add(len).ok_or(ZxError::INVALID_ARGS)?;
         if self.touches_vdso_code(addr, end_addr) {
             return Err(ZxError::ACCESS_DENIED);
         }
