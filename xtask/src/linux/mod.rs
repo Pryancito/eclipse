@@ -1638,6 +1638,15 @@ impl LinuxRootfs {
         "dirname", // eclipse-xkbmap, eclipse-look: the mkdir -p of the file they upsert
         "pkill",  // eclipse-look, lunarrun: respawn the panel, refuse a second instance
         "setsid", // eclipse-init: detaches a oneshot so it does not hold up the panel
+        // `startx`'s own path, which is shell and reaches for these three by
+        // name. They come with busybox's defconfig, so an x86_64 image (where
+        // `busybox --list` runs on the host) already links them -- but a CROSS
+        // build only gets this list plus whatever survived in `busybox.links`,
+        // and a missing one here is `startx` dying on "not found" with nothing
+        // on screen to say which piece is absent.
+        "mktemp",  // startx: `mktemp --tmpdir serverauth.XXXXXXXXXX`, the -auth file
+        "od",      // /usr/bin/mcookie (write_mcookie): /dev/urandom -> 32 hex digits
+        "hexdump", // the same, when the build left `od` out
     ];
 
     /// Creates symlinks in `bin/` for every busybox applet.

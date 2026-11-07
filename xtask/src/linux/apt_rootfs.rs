@@ -1681,6 +1681,16 @@ const DESKTOP_UBUNTU: &[&str] = &[
     "xserver-xorg-video-fbdev",
     "xserver-xorg-input-libinput",
     "xinit",
+    // `startx` is NOT just the server: with `enable_xauth=1` hard-coded it
+    // runs `xauth -q -f <tmp>` to write the cookie file it then passes as
+    // `-auth`. On Ubuntu `xauth` is its own package — NOT part of
+    // `x11-xserver-utils` — and without it startx hands the server an `-auth`
+    // file that was never written, the server rejects every client
+    // ("Authorization required, but no authorization protocol specified")
+    // and startx spins on "waiting for X server to begin accepting
+    // connections". `-ac` in root/.xserverrc covers the server side; this
+    // covers startx's own side so nothing in that path fails silently.
+    "xauth",
     "libgl1-mesa-dri",
     "libgl1",
     "libegl1",
@@ -1944,6 +1954,29 @@ mod tests {
         assert!(
             MERGE_TREES.contains(&"etc/alsa"),
             "etc/alsa must be in MERGE_TREES so /etc/alsa/conf.d reaches the rootfs"
+        );
+    }
+
+    /// Everything `startx` reaches for on its way to the server, which is NOT
+    /// just the server. `enable_xauth=1` is hard-coded in the script, so it
+    /// runs `xauth` to write the `-auth` file it then passes along -- and on
+    /// Ubuntu `xauth` is its own package, not part of `x11-xserver-utils` or
+    /// of `xinit`. The cookie itself comes from `/usr/bin/mcookie`, which this
+    /// list deliberately does NOT cover: `util-linux` would drop its own
+    /// mount/umount/dmesg/kill/su over busybox's through the `usr/bin` merge,
+    /// so `desktop::write_mcookie` ships a script instead.
+    #[test]
+    fn the_desktop_set_covers_every_binary_startx_runs() {
+        for pkg in ["xinit", "xauth", "xserver-xorg-core", "xterm"] {
+            assert!(
+                DESKTOP_UBUNTU.contains(&pkg),
+                "{pkg} is on startx's path to a running X session"
+            );
+        }
+        assert!(
+            !DESKTOP_UBUNTU.contains(&"util-linux"),
+            "util-linux's /usr/bin lands on top of busybox's applets via X_TREES; \
+             mcookie is shipped as a script by desktop::write_mcookie instead"
         );
     }
 
