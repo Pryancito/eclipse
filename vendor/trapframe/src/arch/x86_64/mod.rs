@@ -302,6 +302,44 @@ impl core::fmt::Debug for FpState {
     }
 }
 
+impl FpState {
+    /// The save area as the CPU laid it out: the 512-byte legacy FXSAVE
+    /// region, the XSAVE header at 512 (`XSTATE_BV` first) and the extended
+    /// components at their standard-format offsets (AVX `YMM_Hi128` at 576).
+    ///
+    /// For a debugger's `zx_thread_read_state`, which picks the x87 and SSE
+    /// registers out of it. A component whose `XSTATE_BV` bit is clear is in
+    /// its initial state and its bytes here may be stale: see
+    /// [`xsave_components`].
+    pub fn as_bytes(&self) -> &[u8; 2688] {
+        &self.0
+    }
+
+    /// The save area, to write registers into before the next XRSTOR.
+    ///
+    /// A component written here is only loaded if its `XSTATE_BV` bit is set
+    /// too, and `XRSTOR` faults (#GP) on a bit set for a component the CPU
+    /// has not enabled in `XCR0`: set only bits of [`xsave_components`].
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; 2688] {
+        &mut self.0
+    }
+}
+
+/// The `XSAVE` components this kernel saves and restores in [`FpState`]:
+/// the `XCR0` mask it hands to `XSAVE`/`XRSTOR`, or zero when it runs the
+/// `FXSAVE` path, in which case the legacy region is always current and the
+/// header is never written.
+pub fn xsave_components() -> u32 {
+    #[cfg(any(target_os = "none", target_os = "uefi"))]
+    {
+        XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        fncall::hosted_xsave_mask()
+    }
+}
+
 impl Default for FpState {
     fn default() -> Self {
         let mut s = [0u8; 2688];

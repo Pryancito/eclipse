@@ -48,8 +48,13 @@ impl Syscall<'_> {
             resource, type_, desc, desc_size, out
         );
         let proc = self.thread.proc();
+        // The IOMMU subrange of the SYSTEM resource, as Zircon takes it (the
+        // root resource still passes, as for every kind). Asking for ROOT
+        // alone turned every BTI and contiguous-VMO case of the core tests
+        // away with `WRONG_TYPE`, and `VmoZeroTestCase.Contiguous` then
+        // went on without its BTI and took the whole test process down.
         proc.get_object::<Resource>(resource)?
-            .validate(ResourceKind::ROOT)?;
+            .validate_system(SystemResource::Iommu)?;
         if desc_size > IOMMU_MAX_DESC_LEN {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -117,6 +122,11 @@ impl Syscall<'_> {
         // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let options = bti_options(options)?;
         if !page_aligned(offset) || !page_aligned(size) {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        // The most addresses a pin hands back, as Zircon bounds it: sixty-four
+        // pages of them (`Bti.PinTooManyAddresses`).
+        if addrs_count > MAX_PIN_ADDRS {
             return Err(ZxError::INVALID_ARGS);
         }
         let vmo = proc.get_object_with_rights::<VmObject>(vmo, options.to_vmo_rights())?;
@@ -318,6 +328,8 @@ impl Syscall<'_> {
 }
 
 const IOMMU_TYPE_DUMMY: u32 = 0;
+/// `zx_bti_pin`: the most addresses it will write out.
+const MAX_PIN_ADDRS: usize = 64 * PAGE_SIZE / core::mem::size_of::<DevVAddr>();
 const IOMMU_MAX_DESC_LEN: usize = 4096;
 const IOMMU_DESC_SIZE: usize = 1;
 
@@ -378,6 +390,43 @@ mod tests {
     //! something to drop on the floor and carry on as if it had been asked for
     //! what was left.
     use super::*;
+
+    /// `zx_iommu_create` takes the IOMMU subrange of the SYSTEM resource,
+    /// which is what the core tests carve out of it, and any other subrange
+    /// or kind does not.
+    #[test]
+    fn iommu_create_takes_the_iommu_subrange_of_the_system_resource() {
+        let iommu = Resource::create(
+            "iommu",
+            ResourceKind::SYSTEM,
+            SystemResource::Iommu as usize,
+            1,
+            ResourceFlags::empty(),
+        );
+        assert!(iommu.validate_system(SystemResource::Iommu).is_ok());
+        let power = Resource::create(
+            "power",
+            ResourceKind::SYSTEM,
+            SystemResource::Power as usize,
+            1,
+            ResourceFlags::empty(),
+        );
+        assert_eq!(
+            power.validate_system(SystemResource::Iommu).err(),
+            Some(ZxError::OUT_OF_RANGE)
+        );
+        let mmio = Resource::create(
+            "mmio",
+            ResourceKind::MMIO,
+            0,
+            0x1000,
+            ResourceFlags::empty(),
+        );
+        assert_eq!(
+            mmio.validate_system(SystemResource::Iommu).err(),
+            Some(ZxError::WRONG_TYPE)
+        );
+    }
 
     #[test]
     fn bti_pin_takes_the_bits_it_knows_and_no_others() {

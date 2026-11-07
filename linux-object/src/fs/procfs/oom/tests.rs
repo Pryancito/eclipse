@@ -215,13 +215,16 @@ fn the_files_are_written_through_the_directory() {
 
 #[test]
 fn the_memory_a_process_holds_counts() {
-    // 2 MiB is two thousandths of the host's 1 GiB, one point of the
-    // badness's thousand: enough to lift a process of no adjustment off
-    // 666. At an address of its own, because `None` is page 0 on the host
-    // and only root may map that.
+    // Two thousandths of the host's memory, one point of the badness's
+    // thousand: enough to lift a process of no adjustment off 666. Sized
+    // from what the host reports, not a constant: the libos physical memory
+    // went from 1 GiB to 4 GiB once and a fixed 2 MiB stopped counting. At
+    // an address of its own, because `None` is page 0 on the host and only
+    // root may map that.
     use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
     let proc = a_process(49_546);
-    let pages = 512;
+    let (_, total) = kernel_hal::mem::memory_usage();
+    let pages = total / PAGE_SIZE / 500;
     let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
     let at = proc
         .vmar()

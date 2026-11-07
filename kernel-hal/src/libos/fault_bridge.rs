@@ -64,7 +64,7 @@ use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
@@ -79,24 +79,47 @@ const ARCH_GET_GS: libc::c_int = 0x1004;
 /// The signals a guest fault can arrive as, and the x86 vector each one
 /// stands for.
 ///
-/// `SIGSEGV` becomes `#GP` rather than `#PF` on purpose: a page fault is only
-/// meaningful with the address that caused it, which the trap frame has no
-/// room for, and a libos guest has no demand paging to serve anyway -- every
-/// one of these is fatal to the thread. `#GP` says "this thread did something
-/// the machine refused" without claiming an address the frame cannot carry,
-/// and the Zircon run loop answers both with a fatal exception.
+/// `SIGSEGV` is listed as `#GP`, which is what it stays for a fault the host
+/// itself took as one (a non-canonical address). The ones the host took as a
+/// page fault go on as `#PF`, with the CPU's error code and the faulting
+/// address (`fault_address`), because a hosted guest does have faults to
+/// serve: a write to a page that lost `WRITE` to a copy-on-write child. See
+/// `bridge_fault`.
 ///
 /// `SIGSYS` is not a fault: it is what the seccomp filter of
 /// [`trap_guest_syscalls`] turns a guest's `syscall` instruction into, and it
 /// carries the vector the kernel's own `syscall` entry would have written.
-const SIGNAL_VECTORS: [(Signal, usize); 6] = [
+const SIGNAL_VECTORS: [(Signal, usize); 7] = [
     (Signal::SIGILL, 6),   // #UD, invalid opcode
     (Signal::SIGSEGV, 13), // #GP, general protection
     (Signal::SIGBUS, 17),  // #AC, alignment check
     (Signal::SIGFPE, 0),   // #DE, divide error
     (Signal::SIGTRAP, 3),  // #BP, breakpoint
     (Signal::SIGSYS, SYSCALL_VECTOR),
+    (Signal::SIGALRM, PREEMPT_VECTOR),
 ];
+
+/// The vector a guest's time slice ends with: the first external interrupt
+/// vector, which `TrapReason::from_x86` reads as `Interrupt`, and which the
+/// run loops answer by giving the CPU to the next thread.
+///
+/// A guest thread runs on its host thread until it makes a syscall or
+/// faults; nothing else took the CPU from it. A guest that spins waiting for
+/// another guest thread that has no CPU to run on therefore waited for
+/// ever, once there were more spinners than host CPUs:
+/// `PortStressTest.CloseWaitRace` starts five threads that busy-wait on a
+/// counter the fifth increments, on a four-CPU host, and hung every libos run
+/// that reached it. Real hardware has a timer interrupt; this is it.
+pub const PREEMPT_VECTOR: usize = 0x20;
+
+/// The slice: the host timer's period on a thread that has been out in a guest.
+const PREEMPT_SLICE_NS: libc::c_long = 10_000_000;
+
+/// Where the guest's code is, for telling a tick that landed on it from one
+/// that landed on the kernel's own way in or out, which runs with the
+/// guest's `FS` base loaded (see `tick`).
+static GUEST_START: AtomicUsize = AtomicUsize::new(0);
+static GUEST_END: AtomicUsize = AtomicUsize::new(0);
 
 /// The `trap_num` the kernel reads as "a system call": what `run_fncall`
 /// writes before every trip out and what `TrapReason::from_x86` answers
@@ -117,6 +140,26 @@ const SYSCALL_VECTOR: usize = 0x100;
 /// and the loader has to know which one it is reading.
 pub const SYSCALL_INSTRUCTION: usize = 1;
 
+/// `#PF`, as the host reports it in `REG_TRAPNO` and as the kernel reads it
+/// from the trap frame.
+const PAGE_FAULT_VECTOR: i64 = 14;
+
+/// The bits of a `#PF` error code the kernel decodes: present, write, user,
+/// reserved, instruction fetch. The host's `REG_ERR` carries them as the
+/// CPU wrote them; anything above is not for the kernel.
+const PAGE_FAULT_ERROR_BITS: usize = 0x1f;
+
+/// The faulting linear address of the page fault this host thread last
+/// bridged: the kernel's `CR2`, which a hosted kernel cannot read as a
+/// register. Kernel context only, right after the trap, before another one
+/// on this thread.
+pub fn fault_address() -> Option<usize> {
+    ANCHOR_ROW.with(|row| {
+        row.get()
+            .map(|slot| ANCHOR_FAULT_ADDR[slot].load(Ordering::Acquire))
+    })
+}
+
 /// Install the bridge. Idempotent in effect, and the only thing it does to a
 /// signal the guest cannot have raised is nothing: a fault that did not come
 /// from guest code is handed straight back to the default action, so a kernel
@@ -126,16 +169,32 @@ pub const SYSCALL_INSTRUCTION: usize = 1;
 ///
 /// Installs process-wide signal handlers. Must run before any guest does.
 pub unsafe fn init() {
+    // The tick must not land inside a fault handler: it would dress the
+    // handler's own context up as the guest's. The fault handlers block it,
+    // and it blocks itself (no NODEFER).
+    let mut without_tick = SigSet::empty();
+    without_tick.add(Signal::SIGALRM);
     for (signal, _) in SIGNAL_VECTORS {
-        let action = SigAction::new(
-            SigHandler::SigAction(on_fault),
-            // ONSTACK so a guest that faulted with a stack pointer it cannot
-            // write through -- the stack-overflow case -- still reaches the
-            // handler. NODEFER so the handler's own mistakes are not hidden
-            // behind a blocked signal.
-            SaFlags::SA_SIGINFO | SaFlags::SA_ONSTACK | SaFlags::SA_NODEFER,
-            SigSet::empty(),
-        );
+        let action = if signal == Signal::SIGALRM {
+            SigAction::new(
+                SigHandler::SigAction(on_fault),
+                // RESTART: a tick that reaches the kernel's own side anyway
+                // (the window between the timer being disarmed and the
+                // signal arriving) must not fail its blocking syscall.
+                SaFlags::SA_SIGINFO | SaFlags::SA_ONSTACK | SaFlags::SA_RESTART,
+                SigSet::empty(),
+            )
+        } else {
+            SigAction::new(
+                SigHandler::SigAction(on_fault),
+                // ONSTACK so a guest that faulted with a stack pointer it
+                // cannot write through -- the stack-overflow case -- still
+                // reaches the handler. NODEFER so the handler's own mistakes
+                // are not hidden behind a blocked signal.
+                SaFlags::SA_SIGINFO | SaFlags::SA_ONSTACK | SaFlags::SA_NODEFER,
+                without_tick,
+            )
+        };
         if let Err(err) = sigaction(signal, &action) {
             error!("libos: cannot bridge {:?} to the guest: {}", signal, err);
         }
@@ -155,6 +214,14 @@ const ANCHORS: usize = 256;
 /// async-signal-safe, a lock or an allocation is not.
 static ANCHOR_STACK: [AtomicUsize; ANCHORS] = [const { AtomicUsize::new(0) }; ANCHORS];
 static ANCHOR_BASE: [AtomicU64; ANCHORS] = [const { AtomicU64::new(0) }; ANCHORS];
+/// Whether a tick landed on this thread while it was NOT out in the guest
+/// (see `note_tick_off_guest`): the kernel's own `need_resched`, read and
+/// cleared by `take_resched` before the next trip out.
+static ANCHOR_RESCHED: [AtomicBool; ANCHORS] = [const { AtomicBool::new(false) }; ANCHORS];
+/// The linear address of the last page fault bridged on this thread: the
+/// `CR2` the kernel reads back through `fault_address` when the trap frame
+/// says `#PF`. One per thread, written only by the handler on that thread.
+static ANCHOR_FAULT_ADDR: [AtomicUsize; ANCHORS] = [const { AtomicUsize::new(0) }; ANCHORS];
 
 /// Where a given alternate stack's slot starts. Linear probing from here, and
 /// nothing is ever removed, so an empty slot means "not registered" and ends
@@ -191,6 +258,8 @@ struct Anchor {
     ss_sp: usize,
     /// The kernel's own FS base on it.
     base: u64,
+    /// Its row in the anchor tables.
+    slot: usize,
 }
 
 /// The fault frame `fault_fn_entry` reads, for the thread whose alternate
@@ -224,7 +293,7 @@ unsafe fn anchor() -> Option<Anchor> {
             0 => return None,
             found if found == ss_sp => {
                 let base = ANCHOR_BASE[slot].load(Ordering::Acquire);
-                return (base != 0).then_some(Anchor { ss_sp, base });
+                return (base != 0).then_some(Anchor { ss_sp, base, slot });
             }
             _ => {}
         }
@@ -233,10 +302,10 @@ unsafe fn anchor() -> Option<Anchor> {
 }
 
 /// Remember this thread's alternate stack and the kernel FS base that goes
-/// with it, so the handler can find the base from the stack alone. `false`
-/// when the table is full, which turns the bridge off for this thread rather
-/// than guessing.
-fn register_anchor(ss_sp: usize, base: u64) -> bool {
+/// with it, so the handler can find the base from the stack alone: its row.
+/// `None` when the table is full, which turns the bridge off for this thread
+/// rather than guessing.
+fn register_anchor(ss_sp: usize, base: u64) -> Option<usize> {
     let first = anchor_slot(ss_sp);
     for step in 0..ANCHORS {
         let slot = (first + step) % ANCHORS;
@@ -247,10 +316,10 @@ fn register_anchor(ss_sp: usize, base: u64) -> bool {
             .is_ok()
         {
             ANCHOR_BASE[slot].store(base, Ordering::Release);
-            return true;
+            return Some(slot);
         }
     }
-    false
+    None
 }
 
 /// Read one of this thread's segment bases.
@@ -299,9 +368,16 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     else {
         return leave_to_the_host(signal);
     };
+    if signal == libc::SIGALRM && !tick_is_the_guest_s(context) {
+        // A tick is the one signal the kernel's own side can get without
+        // anything being wrong. It is not lost: the thread's slice is over
+        // all the same, and the next trip out is told so.
+        return note_tick_off_guest();
+    }
     let Some(Anchor {
         ss_sp,
         base: kernel_fsbase,
+        slot,
     }) = anchor()
     else {
         return leave_to_the_host(signal);
@@ -349,6 +425,9 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     };
     if fsbase == kernel_fsbase || context.is_null() {
         // The kernel's own fault: it runs with its own fsbase loaded.
+        if signal == libc::SIGALRM {
+            return note_tick_off_guest();
+        }
         return leave_to_the_host(signal);
     }
 
@@ -368,22 +447,173 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     let words = fault_frame(ss_sp);
     // In the order the entry reads them: the error code, the vector, the
     // faulting rip, the guest's own r11 (the entry needs that register as
-    // scratch) and the guest's own rsp.
+    // scratch), the guest's own rsp and its rflags.
     //
     // A trapped `syscall` says so in the error code; the saved rip is already
     // the instruction after it, where the stub's own tail carries on.
-    let error_code = if signal == libc::SIGSYS {
-        SYSCALL_INSTRUCTION
+    //
+    // A `SIGSEGV` the host took as a page fault (`REG_TRAPNO` is the vector
+    // the CPU raised) is handed on as one, with the CPU's own error code and
+    // the faulting address kept for `fault_address`: the kernel's page-fault
+    // handler serves it, which is what a write to a page `create_child`
+    // just took `WRITE` from needs (`VmoCloneTestCase.Commit` died here as
+    // a `#GP`). What the host took as `#GP` -- a non-canonical address --
+    // stays one.
+    let (vector, error_code) = if signal == libc::SIGSYS {
+        (vector, SYSCALL_INSTRUCTION)
+    } else if signal == libc::SIGSEGV && gregs[libc::REG_TRAPNO as usize] == PAGE_FAULT_VECTOR {
+        ANCHOR_FAULT_ADDR[slot].store(gregs[libc::REG_CR2 as usize] as usize, Ordering::Release);
+        (
+            PAGE_FAULT_VECTOR as usize,
+            gregs[libc::REG_ERR as usize] as usize & PAGE_FAULT_ERROR_BITS,
+        )
     } else {
-        0
+        (vector, 0)
     };
     words.write(error_code as u64);
     words.add(1).write(vector as u64);
     words.add(2).write(gregs[libc::REG_RIP as usize] as u64);
     words.add(3).write(gregs[libc::REG_R11 as usize] as u64);
     words.add(4).write(gregs[libc::REG_RSP as usize] as u64);
+    // The guest's flags, for the record: the entry scrubs the live ones (DF,
+    // AC, TF) before the kernel runs, so this is the only copy that survives.
+    words.add(5).write(gregs[libc::REG_EFL as usize] as u64);
     gregs[libc::REG_RSP as usize] = words as i64;
     gregs[libc::REG_RIP as usize] = trapframe::fault_fn_entry as *const () as i64;
+}
+
+/// Did this tick land on the guest's own code?
+///
+/// The alternatives are the kernel proper, which runs with its own `FS` base
+/// and is told apart by that below, and `trapframe`'s way in and out
+/// (`syscall_fn_entry`, `fault_fn_entry`, the tail of `syscall_fn_return`),
+/// which run with the GUEST's base loaded and are told apart only by their
+/// address. A tick there is not an interrupt: the way in has the catcher's frame
+/// under its feet and the way out has the guest's registers half restored;
+/// dressing either up as an interrupt would lose the trap being delivered,
+/// so it marks the thread for a reschedule instead.
+unsafe fn tick_is_the_guest_s(context: *mut libc::c_void) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    let rip =
+        (*(context as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+    let start = GUEST_START.load(Ordering::Relaxed);
+    let end = GUEST_END.load(Ordering::Relaxed);
+    start < end && (start..end).contains(&rip)
+}
+
+/// A tick landed on this host thread while it was on the kernel's side --
+/// in a syscall, on the way in or out, or parked. The thread's slice is up
+/// just the same, so the next `enter_uspace` on it yields first instead of
+/// going out: Linux's `TIF_NEED_RESCHED`, set from the timer interrupt and
+/// honoured on the way back to user mode.
+///
+/// Why it cannot be dropped: a guest that makes a syscall every few
+/// microseconds is never out in the guest for a whole 10 ms, so a tick that
+/// only counted when it landed on guest code never counted at all.
+/// `PortStressTest.CloseWaitRace` has four threads doing exactly that on a
+/// four-CPU host, and the fifth thread, which is meant to end the test,
+/// never got a CPU back.
+///
+/// Written through the anchor tables, not a thread-local: this runs with
+/// whatever `FS` base the signal found, which may be the guest's.
+unsafe fn note_tick_off_guest() {
+    if let Some(anchor) = anchor() {
+        ANCHOR_RESCHED[anchor.slot].store(true, Ordering::Release);
+    }
+}
+
+/// Whether a tick landed on this host thread since the last trip out, and
+/// clear it. Kernel context only: it goes through this thread's own cached
+/// anchor row.
+pub fn take_resched() -> bool {
+    ANCHOR_ROW.with(|row| {
+        row.get()
+            .is_some_and(|slot| ANCHOR_RESCHED[slot].swap(false, Ordering::AcqRel))
+    })
+}
+
+thread_local! {
+    /// This host thread's row in the anchor tables, from `ensure_altstack`.
+    static ANCHOR_ROW: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Arm this host thread's slice timer, once: a periodic `SIGALRM` every
+/// `PREEMPT_SLICE_NS`, delivered to THIS thread (`SIGEV_THREAD_ID`; a
+/// process-wide timer lands on whichever thread the host picks, which is as
+/// likely parked as out in a guest). A tick that finds the thread out in the
+/// guest is bridged as the timer interrupt; one that finds it anywhere else
+/// marks the thread for a reschedule (`take_resched`).
+///
+/// It used to be armed for the trip out and disarmed on the way back, so the
+/// kernel's own side never saw a tick. That was two `timer_settime` per
+/// system call and, worse, a countdown that started over on every trip: see
+/// `note_tick_off_guest`. The kernel's blocking host calls see `SIGALRM`
+/// with `SA_RESTART` instead, which restarts the ones that can be and hands
+/// `EINTR` to the pollers, which retry.
+pub fn ensure_tick() {
+    use core::cell::Cell;
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    ARMED.with(|armed| {
+        if armed.get() {
+            return;
+        }
+        armed.set(true);
+        // SAFETY: a zeroed `sigevent` is a valid one; every field read by
+        // the host is set below.
+        let mut event: libc::sigevent = unsafe { core::mem::zeroed() };
+        event.sigev_notify = libc::SIGEV_THREAD_ID;
+        event.sigev_signo = libc::SIGALRM;
+        // SAFETY: `gettid` takes nothing and cannot fail.
+        event.sigev_notify_thread_id = unsafe { libc::syscall(libc::SYS_gettid) } as libc::c_int;
+        let mut timer: libc::c_int = 0;
+        // SAFETY: the raw syscall, with the kernel's own `int` timer id
+        // rather than glibc's pointer-sized one, which is why the libc
+        // wrapper is not used.
+        let created = unsafe {
+            libc::syscall(
+                libc::SYS_timer_create,
+                libc::CLOCK_MONOTONIC,
+                &event as *const libc::sigevent,
+                &mut timer as *mut libc::c_int,
+            )
+        };
+        if created != 0 {
+            warn!(
+                "libos: no slice timer for this host thread; its guests run unpreempted: {}",
+                last_os_error()
+            );
+            return;
+        }
+        let slice = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: PREEMPT_SLICE_NS,
+        };
+        let spec = libc::itimerspec {
+            it_interval: slice,
+            it_value: slice,
+        };
+        // SAFETY: a timer this thread created, and a spec that lives for the
+        // call.
+        let armed_now = unsafe {
+            libc::syscall(
+                libc::SYS_timer_settime,
+                timer,
+                0,
+                &spec as *const libc::itimerspec,
+                ptr::null_mut::<libc::itimerspec>(),
+            )
+        };
+        if armed_now != 0 {
+            warn!(
+                "libos: cannot arm this host thread's slice timer; its guests run unpreempted: {}",
+                last_os_error()
+            );
+        }
+    });
 }
 
 /// Make the host refuse every `syscall` instruction executed from a guest
@@ -402,6 +632,8 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
 /// Process-wide: from here on a `syscall` from inside `guest` arrives at
 /// [`on_fault`] as `SIGSYS`, so [`init`] must have run first.
 pub unsafe fn trap_guest_syscalls(guest: core::ops::Range<usize>) -> Result<(), String> {
+    GUEST_START.store(guest.start, Ordering::Relaxed);
+    GUEST_END.store(guest.end, Ordering::Relaxed);
     let mut filter = guest_syscall_filter(guest);
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
@@ -515,10 +747,11 @@ pub fn ensure_altstack() {
         // The base goes in the bridge's own table, keyed by this pointer, not
         // in a word under the stack: the handler must never read memory it
         // did not itself reserve. See `anchor`.
-        if !register_anchor(ss_sp as usize, base) {
+        let Some(slot) = register_anchor(ss_sp as usize, base) else {
             warn!("libos: the fault bridge has no room left to recognise this host thread");
             return;
-        }
+        };
+        ANCHOR_ROW.with(|row| row.set(Some(slot)));
         let altstack = libc::stack_t {
             ss_sp,
             ss_flags: 0,
@@ -624,5 +857,35 @@ mod tests {
         // And the error code tells it from a `call`ed stub's entry, whose
         // `run_fncall` writes zero.
         assert_ne!(SYSCALL_INSTRUCTION, 0);
+    }
+
+    /// A tick that lands on the kernel's side of a thread is kept for that
+    /// thread's next trip out, and for that one only: it is cleared by being
+    /// taken, and a thread that has never been out has nothing to take.
+    #[test]
+    fn a_tick_off_the_guest_is_taken_once_on_the_next_trip_out() {
+        std::thread::spawn(|| {
+            assert!(
+                !take_resched(),
+                "a thread that never went out owes no yield"
+            );
+            // SAFETY: the handler's own path, run from kernel context on a
+            // thread that only ever runs this test.
+            unsafe { note_tick_off_guest() };
+            assert!(
+                !take_resched(),
+                "a tick on a thread the bridge does not know is nobody's"
+            );
+            ensure_altstack();
+            unsafe { note_tick_off_guest() };
+            unsafe { note_tick_off_guest() };
+            assert!(
+                take_resched(),
+                "the tick was not kept for the next trip out"
+            );
+            assert!(!take_resched(), "one yield per slice, not one per tick");
+        })
+        .join()
+        .unwrap();
     }
 }

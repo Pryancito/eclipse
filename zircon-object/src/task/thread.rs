@@ -649,6 +649,8 @@ pub struct Thread {
     minor_faults: MinorFaults,
     /// Logical CPU core this thread last ran on (field 39, `processor`, of
     /// `/proc/[pid]/stat`). Updated on every poll from `ThreadSwitchFuture`.
+    /// The logical CPU this thread last ran on; [`NEVER_SCHEDULED`] until it
+    /// runs once.
     last_cpu: AtomicU32,
 }
 
@@ -815,7 +817,7 @@ impl Thread {
             sys_time_ns: AtomicU64::new(0),
             switches: ContextSwitches::default(),
             minor_faults: MinorFaults::default(),
-            last_cpu: AtomicU32::new(0),
+            last_cpu: AtomicU32::new(NEVER_SCHEDULED),
         });
         thread.record_ext_birth();
         proc.add_thread(thread.clone())?;
@@ -1329,6 +1331,8 @@ impl Thread {
 
     /// Write one aspect of thread state.
     pub fn write_state(&self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult {
+        // Read before the thread's own lock: the VMAR has its own.
+        let user_end = self.proc().vmar().user_limit();
         let mut inner = self.lock_inner();
         let state = inner.state();
         if state != ThreadState::BlockedException && state != ThreadState::Suspended {
@@ -1338,7 +1342,7 @@ impl Thread {
             return Err(ZxError::BAD_STATE);
         }
         let context = inner.context.as_mut().ok_or(ZxError::BAD_STATE)?;
-        context.write_state(kind, buf)
+        context.write_state(kind, buf, user_end)
     }
 
     /// Get the thread's information.
@@ -1499,9 +1503,20 @@ impl Thread {
         self.last_cpu.store(cpu, Ordering::Relaxed);
     }
 
-    /// Get the logical CPU core this thread last ran on.
+    /// Get the logical CPU core this thread last ran on; `0` if it never
+    /// ran, which is what Linux's `/proc` shows for such a task.
     pub fn last_cpu(&self) -> u32 {
-        self.last_cpu.load(Ordering::Relaxed)
+        self.last_scheduled_cpu().unwrap_or(0)
+    }
+
+    /// The logical CPU core this thread last ran on, or `None` if it was
+    /// never scheduled: `ZX_INFO_THREAD_STATS` reports `ZX_INFO_INVALID_CPU`
+    /// then, and a CPU once the thread has run (`Threads.GetLastScheduledCpu`).
+    pub fn last_scheduled_cpu(&self) -> Option<u32> {
+        match self.last_cpu.load(Ordering::Relaxed) {
+            NEVER_SCHEDULED => None,
+            cpu => Some(cpu),
+        }
     }
 
     /// Get scheduler runtime statistics for this thread.
@@ -2094,6 +2109,9 @@ pub(super) fn activate_user_paging(table: kernel_hal::PhysAddr) {
     }
 }
 
+/// `last_cpu` of a thread that was never scheduled.
+const NEVER_SCHEDULED: u32 = u32::MAX;
+
 impl Future for ThreadSwitchFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2183,6 +2201,22 @@ mod tests {
     use crate::task::*;
     use kernel_hal::context::UserContextField;
     use kernel_hal::timer::timer_now;
+
+    /// `ZX_INFO_THREAD_STATS.last_scheduled_cpu` is `ZX_INFO_INVALID_CPU`
+    /// until the thread first runs, and a CPU after
+    /// (`Threads.GetLastScheduledCpu`); Linux's `/proc` shows `0` for a task
+    /// that never ran.
+    #[test]
+    fn a_thread_that_never_ran_has_no_last_cpu() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+        assert_eq!(thread.last_scheduled_cpu(), None);
+        assert_eq!(thread.last_cpu(), 0);
+        thread.set_last_cpu(3);
+        assert_eq!(thread.last_scheduled_cpu(), Some(3));
+        assert_eq!(thread.last_cpu(), 3);
+    }
 
     /// A waker that answers one question: was the thread's own lock free when
     /// it was woken?

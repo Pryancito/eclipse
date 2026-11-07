@@ -485,6 +485,45 @@ struct ProcessInner {
     critical_to_job: Option<(Arc<Job>, bool)>,
 }
 
+/// The KoIDs of the vDSO VMOs, once the loader has made them; zero while
+/// unset. Zircon has one base vDSO and a few variants (`vdso/test1`,
+/// `vdso/test2`), all of which count as the vDSO for the syscall policy.
+static VDSO_VMO_KOIDS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Name a VMO that holds a vDSO, so that mapping it executable into a
+/// process records the vDSO code range of that process
+/// ([`Process::set_vdso_code`]). Every process maps one of them: userboot
+/// hands the handle down and `zx_vmar_map`s it, as Zircon's `VDso` does.
+/// Only the first four distinct VMOs are remembered.
+pub fn register_vdso_vmo(koid: KoID) {
+    for slot in VDSO_VMO_KOIDS.iter() {
+        let seen = slot.load(Ordering::Acquire);
+        if seen == koid {
+            return;
+        }
+        if seen == 0
+            && slot
+                .compare_exchange(0, koid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Whether `koid` is a vDSO VMO's. See [`register_vdso_vmo`].
+pub fn is_vdso_vmo(koid: KoID) -> bool {
+    koid != 0
+        && VDSO_VMO_KOIDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) == koid)
+}
+
 /// Status of a process.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum Status {
@@ -725,6 +764,47 @@ impl Process {
         );
         if res.is_err() && handle_value != INVALID_HANDLE {
             self.inner.lock().remove_handle(handle_value).ok();
+        }
+        res
+    }
+
+    /// Start `thread`, one of this process's, by `zx_thread_start`.
+    ///
+    /// A thread started this way in a process nothing has started yet is
+    /// the process's initial thread, and the process is running from then
+    /// on (`Threads.ThreadStartOnInitialThread`): `zx_process_start` is
+    /// `BAD_STATE` afterwards (`ProcessStartOnSecondThread`). It used to be
+    /// the other way round, the thread refused with `BAD_STATE` until
+    /// `zx_process_start` had run. A process that exited starts nothing.
+    pub fn start_thread(
+        &self,
+        thread: &Arc<Thread>,
+        setup: impl FnOnce(&mut kernel_hal::context::UserContext),
+        thread_fn: ThreadFn,
+    ) -> ZxResult {
+        let became_running = {
+            let mut inner = self.inner.lock();
+            if !inner.contains_thread(thread) {
+                return Err(ZxError::ACCESS_DENIED);
+            }
+            match inner.status {
+                Status::Init => {
+                    inner.status = Status::Running;
+                    true
+                }
+                Status::Running => false,
+                Status::Exited(_) => return Err(ZxError::BAD_STATE),
+            }
+        };
+        if became_running {
+            thread.set_first_thread();
+        }
+        let res = thread.start_with(setup, thread_fn);
+        if res.is_err() && became_running {
+            let mut inner = self.inner.lock();
+            if inner.status == Status::Running {
+                inner.status = Status::Init;
+            }
         }
         res
     }
@@ -1444,6 +1524,18 @@ impl Process {
             }
         }
         info
+    }
+
+    /// Record where the vDSO's code was mapped in this process, if nothing
+    /// did yet. See [`VmAddressRegion::set_vdso_code`].
+    pub fn set_vdso_code(&self, start: usize, len: usize) {
+        self.vmar().set_vdso_code(start, len);
+    }
+
+    /// Whether a syscall whose instruction sits at `pc` is one the vDSO
+    /// issued. See [`VmAddressRegion::syscall_may_come_from`].
+    pub fn syscall_may_come_from(&self, pc: usize) -> bool {
+        self.vmar().syscall_may_come_from(pc)
     }
 
     /// Set the debug address.
@@ -3248,5 +3340,116 @@ mod threads_walk_tests {
             made.iter().map(|t| t.id()).collect::<Vec<_>>(),
             "the list taken before is still whole and still usable"
         );
+    }
+}
+
+#[cfg(test)]
+mod start_thread_tests {
+    use super::*;
+
+    fn thread_fn(
+        thread: super::super::CurrentThread,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'static>> {
+        // Never finishes, and keeps the `CurrentThread`: dropping it is the
+        // thread's exit, and the process's with its last thread, before the
+        // test looked.
+        Box::pin(async move {
+            let _running = thread;
+            futures::future::pending::<()>().await
+        })
+    }
+
+    #[test]
+    fn zx_thread_start_on_an_unstarted_process_makes_it_run() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+        assert_eq!(proc.status(), Status::Init);
+        proc.start_thread(&thread, |_| {}, thread_fn).unwrap();
+        assert_eq!(proc.status(), Status::Running);
+        assert!(thread.is_first_thread());
+        // Not twice, through either door.
+        assert_eq!(
+            proc.start_thread(&thread, |_| {}, thread_fn),
+            Err(ZxError::BAD_STATE)
+        );
+        let second = Thread::create(&proc, "second").unwrap();
+        assert_eq!(
+            proc.start(&second, 1, 1, None, 1, thread_fn),
+            Err(ZxError::BAD_STATE)
+        );
+        // But a second thread of a running process starts, as before.
+        proc.start_thread(&second, |_| {}, thread_fn).unwrap();
+        assert!(!second.is_first_thread());
+    }
+
+    #[test]
+    fn a_thread_of_another_process_or_an_exited_process_is_refused() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").unwrap();
+        let other = Process::create(&root_job, "other").unwrap();
+        let stranger = Thread::create(&other, "stranger").unwrap();
+        assert_eq!(
+            proc.start_thread(&stranger, |_| {}, thread_fn),
+            Err(ZxError::ACCESS_DENIED)
+        );
+        let thread = Thread::create(&proc, "thread").unwrap();
+        proc.exit(0);
+        assert_eq!(
+            proc.start_thread(&thread, |_| {}, thread_fn),
+            Err(ZxError::BAD_STATE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod vdso_code_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_executable_vdso_mapping_is_the_one_that_counts() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "vdso").unwrap();
+        assert!(
+            proc.syscall_may_come_from(0x1234),
+            "no vDSO yet: anything goes"
+        );
+        proc.set_vdso_code(0x1000, 0x3000);
+        proc.set_vdso_code(0x9000, 0x1000);
+        assert!(proc.syscall_may_come_from(0x1000));
+        assert!(proc.syscall_may_come_from(0x3ffe));
+        // The saved pc sits just past the `syscall`, which may be the last
+        // instruction of the mapping.
+        assert!(proc.syscall_may_come_from(0x4000));
+        assert!(!proc.syscall_may_come_from(0x4001));
+        assert!(!proc.syscall_may_come_from(0xfff));
+        assert!(!proc.syscall_may_come_from(0x9800));
+    }
+
+    /// userboot maps the vDSO into a child VMAR of the process it launches,
+    /// from its own process: the record has to land on the owner's tree.
+    #[test]
+    fn a_vdso_mapped_into_a_child_vmar_counts_for_the_owning_process() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "vdso").unwrap();
+        let child = proc
+            .vmar()
+            .allocate(None, 0x10000, crate::vm::VmarFlags::CAN_MAP_RXW, 0x1000)
+            .unwrap();
+        child.set_vdso_code(child.addr(), 0x2000);
+        assert!(proc.syscall_may_come_from(child.addr() + 0x1000));
+        assert!(!proc.syscall_may_come_from(child.addr() + 0x3000));
+    }
+
+    #[test]
+    fn vdso_vmos_are_remembered_by_koid_without_duplicates() {
+        assert!(!is_vdso_vmo(0));
+        register_vdso_vmo(0x7_7777_0001);
+        register_vdso_vmo(0x7_7777_0001);
+        register_vdso_vmo(0x7_7777_0002);
+        assert!(is_vdso_vmo(0x7_7777_0001));
+        assert!(is_vdso_vmo(0x7_7777_0002));
+        assert!(!is_vdso_vmo(0x7_7777_0003));
+        assert!(!is_vdso_vmo(0));
     }
 }

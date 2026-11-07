@@ -209,20 +209,37 @@ mod pcp {
         // order is always this way round -- list outer, bitmap inner -- in
         // every function here, which is what keeps the pair deadlock-free.
         let mut g = FRAME_ALLOCATOR.lock();
-        let first = g.alloc()?;
-        let mut parked = 0;
-        for _ in 1..BATCH {
+        let mut batch = [0usize; BATCH];
+        let mut taken = 0;
+        for slot in batch.iter_mut() {
             let Some(f) = g.alloc() else { break };
+            *slot = f;
+            taken += 1;
+        }
+        if taken == 0 {
+            return None;
+        }
+        // Parked HIGHEST FIRST, so the pops that follow hand the batch out in
+        // ascending order: the bitmap gave it ascending, and a list that is
+        // popped from the top would reverse it. The order matters to libos,
+        // where a guest page is one host `mmap` of the frame file at the
+        // frame's offset and the host merges neighbouring mappings only when
+        // their offsets ascend with the addresses. Handed out in reverse,
+        // every page of a 64-page thread stack was a host VMA of its own and
+        // `vm.max_map_count` (65530) ran out 2048 threads into
+        // `RseqTest.ManyConcurrent`; ascending, a batch is one VMA.
+        let mut parked = 0;
+        for &f in batch[1..taken].iter().rev() {
             if !p.push(f) {
                 g.dealloc(f);
-                break;
+                continue;
             }
             parked += 1;
         }
         if parked > 0 {
             FRAMES_CACHED.add(parked << PAGE_BITS);
         }
-        Some(first)
+        Some(batch[0])
     }
 
     /// Park a freed frame, or `false` when the caller must free it to the

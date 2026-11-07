@@ -58,10 +58,12 @@ impl Syscall<'_> {
         mut out1: UserOutPtr<HandleValue>,
     ) -> ZxResult {
         info!("eventpair.create: options={:#x}", options);
-        // Same as event/fifo/channel create: unknown options are INVALID_ARGS,
-        // not NOT_SUPPORTED (Fuchsia ABI).
+        // Unlike event/fifo/channel create, whose unknown options are
+        // INVALID_ARGS: an eventpair has no options at all yet, and Zircon
+        // says so with NOT_SUPPORTED. `EventPairTest.CheckNoFlagsSupported`
+        // asks for exactly that.
         if options != 0 {
-            return Err(ZxError::INVALID_ARGS);
+            return Err(ZxError::NOT_SUPPORTED);
         }
         let proc = self.thread.proc();
         proc.check_policy(PolicyCondition::NewEvent)?;

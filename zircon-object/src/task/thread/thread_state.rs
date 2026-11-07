@@ -6,6 +6,10 @@ use kernel_hal::context::UserContext;
 use kernel_hal::context::UserContextField;
 use numeric_enum_macro::numeric_enum;
 
+#[cfg(any(target_arch = "x86_64", test))]
+#[path = "thread_state_x86.rs"]
+mod thread_state_x86;
+
 numeric_enum! {
     #[repr(u32)]
     /// Possible values for "kind" in zx_thread_read_state and zx_thread_write_state.
@@ -22,7 +26,9 @@ numeric_enum! {
 
 pub(super) trait ContextAccessState {
     fn read_state(&self, kind: ThreadStateKind, buf: &mut [u8]) -> ZxResult<usize>;
-    fn write_state(&mut self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult;
+    /// `user_end` is the top of the thread's address space: a register that
+    /// is an address may not point past it.
+    fn write_state(&mut self, kind: ThreadStateKind, buf: &[u8], user_end: usize) -> ZxResult;
 }
 
 impl ContextAccessState for UserContext {
@@ -63,11 +69,27 @@ impl ContextAccessState for UserContext {
                     buf.write_struct(self.general())
                 }
             }
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::FloatPoint => thread_state_x86::read_fp_regs(
+                self.extended_state(),
+                UserContext::xsave_components(),
+                buf,
+            ),
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::Vector => thread_state_x86::read_vector_regs(
+                self.extended_state(),
+                UserContext::xsave_components(),
+                buf,
+            ),
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::SingleStep => {
+                thread_state_x86::read_single_step(self.general().rflags, buf)
+            }
             _ => Err(ZxError::NOT_SUPPORTED),
         }
     }
 
-    fn write_state(&mut self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult {
+    fn write_state(&mut self, kind: ThreadStateKind, buf: &[u8], user_end: usize) -> ZxResult {
         match kind {
             ThreadStateKind::General => {
                 #[cfg(target_arch = "aarch64")]
@@ -123,11 +145,42 @@ impl ContextAccessState for UserContext {
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    *self.general_mut() = buf.read_struct()?;
+                    // The thread's own flags from the request, the kernel's
+                    // kept: a write of `rflags` with IF clear would otherwise
+                    // return the thread to user mode with interrupts off.
+                    let requested: kernel_hal::context::GeneralRegs = buf.read_struct()?;
+                    thread_state_x86::addresses_are_writable(
+                        requested.rip,
+                        requested.fsbase,
+                        requested.gsbase,
+                        user_end,
+                    )?;
+                    let regs = self.general_mut();
+                    let saved = regs.rflags;
+                    *regs = requested;
+                    regs.rflags = thread_state_x86::user_rflags(saved, requested.rflags);
                 }
+            }
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::FloatPoint => thread_state_x86::write_fp_regs(
+                self.extended_state_mut(),
+                UserContext::xsave_components(),
+                buf,
+            )?,
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::Vector => thread_state_x86::write_vector_regs(
+                self.extended_state_mut(),
+                UserContext::xsave_components(),
+                buf,
+            )?,
+            #[cfg(target_arch = "x86_64")]
+            ThreadStateKind::SingleStep => {
+                thread_state_x86::write_single_step(&mut self.general_mut().rflags, buf)?
             }
             _ => return Err(ZxError::NOT_SUPPORTED),
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = user_end;
         Ok(())
     }
 }
@@ -272,12 +325,18 @@ mod tests {
         let mut ctx = UserContext::default();
         let mut buf = [0u8; 512];
 
-        for kind in [
+        // x86-64 keeps the x87, vector and single-step state
+        // (`thread_state_x86`); the debug registers it does not.
+        #[cfg(target_arch = "x86_64")]
+        let refused = [ThreadStateKind::Debug];
+        #[cfg(not(target_arch = "x86_64"))]
+        let refused = [
             ThreadStateKind::FloatPoint,
             ThreadStateKind::Vector,
             ThreadStateKind::Debug,
             ThreadStateKind::SingleStep,
-        ] {
+        ];
+        for kind in refused {
             assert_eq!(
                 ctx.read_state(kind, &mut buf),
                 Err(ZxError::NOT_SUPPORTED),
@@ -285,7 +344,7 @@ mod tests {
                 kind
             );
             assert_eq!(
-                ctx.write_state(kind, &buf),
+                ctx.write_state(kind, &buf, usize::MAX),
                 Err(ZxError::NOT_SUPPORTED),
                 "y escribir {:?} no se traga en silencio",
                 kind

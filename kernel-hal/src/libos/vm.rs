@@ -167,7 +167,9 @@ impl GenericPageTable for PageTable {
         debug_assert!(page.size as usize == PAGE_SIZE);
         debug_assert!(is_aligned(paddr));
         if paddr < PMEM_SIZE {
-            MOCK_PHYS_MEM.mmap(page.vaddr, PAGE_SIZE, paddr, flags);
+            if !MOCK_PHYS_MEM.mmap(page.vaddr, PAGE_SIZE, paddr, flags) {
+                return Err(PagingError::NoMemory);
+            }
             // A host mmap replaces whatever was there, where a real table
             // answers `AlreadyMapped`: count the page it replaced out first,
             // of this table, whichever table mapped it (see the struct's doc).

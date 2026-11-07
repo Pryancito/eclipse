@@ -8,7 +8,7 @@
 //! needs `KHANDLER` installs it through [`install`].
 //!
 //! The frames come from the tail of the mock physical memory
-//! (`libos::mem::PMEM_SIZE` is 1 GiB), well above the addresses the other
+//! (`libos::mem::PMEM_SIZE` is 4 GiB), well above the addresses the other
 //! host tests hard-code, and are recycled through a free list so a long run
 //! cannot exhaust the window.
 
@@ -18,8 +18,8 @@ use alloc::vec::Vec;
 use crate::sync::Mutex;
 use crate::{kernel_handler::KernelHandler, MMUFlags, PhysAddr, PAGE_SIZE};
 
-/// First frame handed out. The mock physical memory is 1 GiB; the half above
-/// 512 MiB is not used by anything else in this crate's tests.
+/// First frame handed out. The mock physical memory is 4 GiB; the range from
+/// 512 MiB to 1 GiB is not used by anything else in this crate's tests.
 const ARENA_BASE: PhysAddr = 0x2000_0000;
 /// One past the last frame.
 const ARENA_END: PhysAddr = 0x4000_0000;

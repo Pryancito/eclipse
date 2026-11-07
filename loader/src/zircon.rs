@@ -326,7 +326,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     };
 
     // vdso
-    let (vdso_vmo, vdso_base, vdso_constants_offset) = {
+    let (vdso_vmo, vdso_base, vdso_size, vdso_constants_offset) = {
         let elf = ElfFile::new(vdso).unwrap();
         let vdso_vmo = VmObject::new_paged(vdso.len() / PAGE_SIZE + 1);
         vdso_vmo.write(0, vdso).unwrap();
@@ -363,8 +363,13 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
             vdso_vmo.write(offset + 8, syscall_entry).unwrap();
             vdso_vmo.write(offset + 16, syscall_entry).unwrap();
         }
-        (vdso_vmo, vdso_base, vdso_constants_offset)
+        (vdso_vmo, vdso_base, size, vdso_constants_offset)
     };
+    // The loader mapped the vDSO itself, so the mapping hook in
+    // `zx_vmar_map` never saw it: record the range by hand. Every later
+    // process gets it from the hook, which needs the VMOs' KoIDs.
+    proc.set_vdso_code(vdso_base, vdso_size);
+    zircon_object::task::register_vdso_vmo(vdso_vmo.id());
 
     // zbi
     //
@@ -372,7 +377,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // `CMDLINE` item: see `zbi_with_extra_cmdline` for why that is the only
     // route that reaches the guest. The kernel's separator is `:` and the
     // ZBI's is a space.
-    let guest_cmdline = cmdline.replace(':', " ");
+    let guest_cmdline = guest_options(cmdline, ' ');
     let extended_zbi = zbi_with_extra_cmdline(zbi, guest_cmdline.trim());
     let zbi_bytes: &[u8] = extended_zbi.as_deref().unwrap_or(zbi);
     let zbi_vmo = {
@@ -438,6 +443,8 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     vdso_test1.set_name("vdso/test1");
     let vdso_test2 = vdso_vmo.create_child(false, 0, vdso_vmo.len()).unwrap();
     vdso_test2.set_name("vdso/test2");
+    zircon_object::task::register_vdso_vmo(vdso_test1.id());
+    zircon_object::task::register_vdso_vmo(vdso_test2.id());
 
     // TODO: use correct CrashLogVmo handle
     let crash_log_vmo = VmObject::new_paged(1);
@@ -458,16 +465,21 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     //
     // The line format is the boot options' own, one `key=value` per line;
     // this kernel's command line is the same pairs separated by colons.
-    let boot_options_text = cmdline.replace(':', "\n");
+    //
+    // The content size goes on BEFORE the text: a fresh VMO's content size
+    // is zero, and `set_content_size` zeroes the bytes between the old size
+    // and the new one, so the other order left the file full of zeros and
+    // every option in it unread.
+    let boot_options_text = reserve_test_ram(&guest_options(cmdline, '\n'));
     let boot_options_vmo = VmObject::new_paged(pages(boot_options_text.len().max(1)));
+    boot_options_vmo
+        .set_content_size(boot_options_text.len())
+        .unwrap();
     if !boot_options_text.is_empty() {
         boot_options_vmo
             .write(0, boot_options_text.as_bytes())
             .unwrap();
     }
-    boot_options_vmo
-        .set_content_size(boot_options_text.len())
-        .unwrap();
     boot_options_vmo.set_name("boot-options.txt");
 
     // kcounter
@@ -497,7 +509,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
         "system",
         ResourceKind::SYSTEM,
         0,
-        SystemResource::Debuglog as usize + 1,
+        zircon_object::dev::SYSTEM_RESOURCE_SUBRANGES,
         ResourceFlags::empty(),
     );
     let vmex_resource = Resource::create(
@@ -683,9 +695,22 @@ async fn handler_user_trap(
     if let TrapReason::Syscall = reason {
         let num = syscall_num(&ctx);
         let args = syscall_args(&ctx);
+        let from_vdso = thread
+            .proc()
+            .syscall_may_come_from(ctx.get_field(UserContextField::InstrPointer));
         ctx.advance_pc(reason);
         thread.put_context(ctx);
         let mut syscall = zircon_syscall::Syscall { thread, thread_fn };
+        if !from_vdso {
+            // Zircon takes syscalls from the vDSO only: a `syscall`
+            // instruction elsewhere is `ZX_EXCP_POLICY_ERROR` with
+            // `ZX_EXCP_POLICY_CODE_BAD_SYSCALL`, never dispatched
+            // (`Threads.BadSyscallCaller`). Without this, such a syscall ran
+            // -- and `BadSyscallCaller`'s number 1 (`zx_bti_pin` here)
+            // hung the guest.
+            syscall.bad_syscall(num as u32).await;
+            return Ok(());
+        }
         let ret = syscall.syscall(num as u32, args).await as usize;
         thread
             .with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))
@@ -1072,6 +1097,170 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>, cmdline: &str) 
             "vdso: time values set (offset={:#x}, {}/{} ns per tick, {} ticks/s)",
             offset, numerator, denominator, ticks_per_second
         );
+    }
+}
+
+/// The boot option that asks for a chunk of RAM to be set aside for the
+/// physical-VMO tests: `kernel.test.ram.reserve=SIZE`.
+const TEST_RAM_RESERVE: &str = "kernel.test.ram.reserve=";
+
+/// Serve `kernel.test.ram.reserve=SIZE` the way Zircon does: take `SIZE`
+/// bytes of contiguous RAM out of the allocator for good and publish where
+/// they are as `kernel.test.ram.reserve=SIZE,PADDR`, which is what the
+/// core tests read back out of `boot-options.txt`.
+///
+/// `GetTestPhysVmo` in the core tests' helpers is all-or-nothing: with the
+/// mmio resource in hand -- which the standalone test always has -- it
+/// `EXPECT`s the reservation to be there and then dereferences it anyway, so
+/// `VmoClone2TestCase.NoPhysical` did not fail, it took the whole test
+/// process down with `#UD` and every case shuffled after it with it. A line
+/// that already names a `PADDR` is left alone, and so is one whose `SIZE`
+/// cannot be read; if the RAM is not there, the line stays as asked and the
+/// test dies as before, with a warning saying why.
+fn reserve_test_ram(boot_options: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(boot_options.len() + 24);
+    for (n, line) in boot_options.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let Some(size) = line
+            .strip_prefix(TEST_RAM_RESERVE)
+            .filter(|value| !value.contains(','))
+            .and_then(parse_boot_int)
+        else {
+            out.push_str(line);
+            continue;
+        };
+        let frames = kernel_hal::mem::PhysFrame::new_contiguous(pages(size as usize), 0);
+        let Some(first) = frames.first() else {
+            warn!(
+                "kernel.test.ram.reserve: no {:#x} contiguous bytes to set aside",
+                size
+            );
+            out.push_str(line);
+            continue;
+        };
+        let paddr = first.paddr();
+        // For the life of the kernel: the test process maps it as physical
+        // memory whenever it likes, and nothing else may ever be handed it.
+        core::mem::forget(frames);
+        use core::fmt::Write;
+        let _ = write!(out, "{}{:#x},{:#x}", TEST_RAM_RESERVE, size, paddr);
+    }
+    out
+}
+
+/// An integer the way Zircon's boot options read one: decimal, or hex with
+/// a `0x` prefix, with an optional sign.
+fn parse_boot_int(value: &str) -> Option<u64> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    }
+}
+
+/// This kernel's command line (options separated by `:`) as the guest reads
+/// it, with `separator` between the options.
+///
+/// A `--gtest_filter=` carries one exception. gtest separates patterns with
+/// `:` too -- `Suite.*:-Suite.A:Suite.B` runs a suite minus two cases -- and
+/// that colon cannot travel through this kernel's own separator. A comma
+/// stands in for it: a comma is no part of any gtest pattern (gtest gives it
+/// no meaning, and a test name cannot contain one), so inside that one option
+/// it is turned back into the colon gtest wants. What the harness gets out of
+/// it is a way to keep a case that never finishes OUT of the guest while the
+/// rest of its suite runs; before, one such case ate the suite's whole run.
+fn guest_options(cmdline: &str, separator: char) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(cmdline.len());
+    for (i, option) in cmdline.split(':').enumerate() {
+        if i > 0 {
+            out.push(separator);
+        }
+        if option.starts_with("--gtest_filter=") {
+            out.push_str(&option.replace(',', ":"));
+        } else {
+            out.push_str(option);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod guest_options_tests {
+    use super::guest_options;
+
+    #[test]
+    fn the_kernel_s_colons_become_the_guest_s_separator() {
+        assert_eq!(
+            guest_options("LOG=warn:userboot.shutdown:k=v", ' '),
+            "LOG=warn userboot.shutdown k=v"
+        );
+        assert_eq!(guest_options("LOG=warn:k=v", '\n'), "LOG=warn\nk=v");
+        assert_eq!(guest_options("", ' '), "");
+        assert_eq!(guest_options("single", '\n'), "single");
+    }
+
+    #[test]
+    fn a_comma_in_the_gtest_filter_is_gtest_s_colon_and_nowhere_else() {
+        assert_eq!(
+            guest_options(
+                "LOG=warn:--gtest_filter=Threads.*,-Threads.A,Threads.B:k=a,b",
+                '\n'
+            ),
+            "LOG=warn\n--gtest_filter=Threads.*:-Threads.A:Threads.B\nk=a,b"
+        );
+        // A reservation keeps its `size,address` pair whole.
+        assert_eq!(
+            guest_options(
+                "kernel.test.ram.reserve=0x1000,0x5000:--gtest_filter=A.*",
+                ' '
+            ),
+            "kernel.test.ram.reserve=0x1000,0x5000 --gtest_filter=A.*"
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_ram_reserve_tests {
+    use super::*;
+
+    #[test]
+    fn the_size_is_read_as_the_boot_options_read_it() {
+        assert_eq!(parse_boot_int("0x200000"), Some(0x20_0000));
+        assert_eq!(parse_boot_int("0X10"), Some(16));
+        assert_eq!(parse_boot_int("4096"), Some(4096));
+        assert_eq!(parse_boot_int("+8"), Some(8));
+        assert_eq!(parse_boot_int("lots"), None);
+        assert_eq!(parse_boot_int(""), None);
+    }
+
+    /// The option gets its RAM and its address; every other line, and a
+    /// line that already carries an address, goes through untouched.
+    #[test]
+    fn the_reservation_is_made_once_and_published_with_its_address() {
+        let out = reserve_test_ram(
+            "LOG=warn\nkernel.test.ram.reserve=0x4000\nkernel.test.ram.reserve=0x1000,0x5000\n--gtest_filter=A.*",
+        );
+        let mut lines = out.split('\n');
+        assert_eq!(lines.next(), Some("LOG=warn"));
+        let reserved = lines.next().unwrap();
+        let (size, paddr) = reserved
+            .strip_prefix(TEST_RAM_RESERVE)
+            .and_then(|v| v.split_once(','))
+            .expect("the reservation names its size and its address");
+        assert_eq!(size, "0x4000");
+        let paddr = parse_boot_int(paddr).expect("an address");
+        assert_eq!(paddr % PAGE_SIZE as u64, 0, "page aligned");
+        assert_eq!(lines.next(), Some("kernel.test.ram.reserve=0x1000,0x5000"));
+        assert_eq!(lines.next(), Some("--gtest_filter=A.*"));
+        assert_eq!(lines.next(), None);
+        // The RAM stays taken: a second reservation lands elsewhere.
+        let again = reserve_test_ram("kernel.test.ram.reserve=0x4000");
+        assert_ne!(again, reserved, "the same frames were handed out twice");
     }
 }
 

@@ -18,7 +18,7 @@ use futures::pin_mut;
 use kernel_hal::user::{IoVecIn, IoVecOut, UserInOutPtr, UserInPtr, UserOutPtr};
 use zircon_object::object::{wait_signal_many, Clock, KernelObject, KoID, Rights, Signal};
 use zircon_object::object::{Handle, HandleValue, INVALID_HANDLE};
-use zircon_object::task::{CurrentThread, ThreadFn};
+use zircon_object::task::{CurrentThread, ExceptionType, ThreadFn};
 use zircon_object::{ZxError, ZxResult};
 
 use self::consts::SyscallType as Sys;
@@ -53,19 +53,37 @@ mod user_memory;
 mod vmar;
 mod vmo;
 
+/// `ZX_EXCP_POLICY_CODE_BAD_SYSCALL`: the `synth_data` is the number.
+const POLICY_CODE_BAD_SYSCALL: u32 = 18;
+
 pub struct Syscall<'a> {
     pub thread: &'a CurrentThread,
     pub thread_fn: ThreadFn,
 }
 
 impl Syscall<'_> {
+    /// Raise `ZX_EXCP_POLICY_ERROR` with `ZX_EXCP_POLICY_CODE_BAD_SYSCALL`
+    /// on the current thread, for a syscall that did not come from the vDSO
+    /// or has no number the kernel knows. The thread blocks until a handler
+    /// resolves the exception, or dies with its process if nobody does.
+    pub async fn bad_syscall(&self, num: u32) {
+        self.thread
+            .raise_synth_exception(ExceptionType::PolicyError, POLICY_CODE_BAD_SYSCALL, num)
+            .await;
+    }
+
     pub async fn syscall(&mut self, num: u32, args: [usize; 8]) -> isize {
         let thread_name = self.thread.name();
         let proc_name = self.thread.proc().name();
         let sys_type = match Sys::try_from(num) {
             Ok(t) => t,
             Err(_) => {
+                // A number the vDSO would never issue: a policy violation,
+                // reported as Zircon reports it (`Threads.BadSyscallNumber`
+                // waits for exactly this exception), and refused only once
+                // the handler has let the thread go on.
                 error!("invalid syscall number: {}", num);
+                self.bad_syscall(num).await;
                 return ZxError::INVALID_ARGS as _;
             }
         };
@@ -147,6 +165,7 @@ impl Syscall<'_> {
             }
             Sys::OBJECT_WAIT_ASYNC => {
                 self.sys_object_wait_async(a0 as _, a1 as _, a2 as _, a3 as _, a4 as _)
+                    .await
             }
             Sys::THREAD_CREATE => {
                 self.sys_thread_create(a0 as _, a1.into(), a2 as _, a3 as _, a4.into())

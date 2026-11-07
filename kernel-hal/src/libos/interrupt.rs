@@ -28,5 +28,10 @@ hal_fn_impl! {
         fn ipi_reason() -> Vec<usize> {
             Vec::new()
         }
+        /// The only interrupt a libos guest ever takes is the end of its
+        /// time slice (`fault_bridge::PREEMPT_VECTOR`), and the run loops
+        /// yield on their own after this. There is no handler table to
+        /// consult: nothing here registers one.
+        fn handle_irq(_vector: usize) {}
     }
 }

@@ -768,7 +768,12 @@ impl VMObjectPaged {
 // skipping a stash_defer() a caller depends on to avoid a reentrant-lock
 // deadlock (see the stash mechanism's own doc comment above).
 const STASH_CPUS: usize = kernel_hal::config::MAX_CORE_NUM;
-const STASH_CAP: usize = 128;
+// Not the depth of nested COW operations, which is single digits, but the
+// width of one tree walk under one guard: `collect_range_change` parks every
+// child of a hidden tree it crosses, and userboot's bootfs has hundreds of
+// snapshot children (one per ELF segment it maps), so a cap of 128 leaked
+// thousands of them at every boot. A leaked `Arc` is a VMO that never dies.
+const STASH_CAP: usize = 1 << 16;
 
 struct StashSlot(UnsafeCell<Vec<Arc<VMObjectPaged>>>);
 // SAFETY: each slot is only touched by its own cpu, with IRQs off.
@@ -872,10 +877,26 @@ fn stash_defer(arc: Arc<VMObjectPaged>) {
         v.push(arc);
     } else {
         // Overflow: leaking is recoverable and diagnosable; dropping under the
-        // lock is the deadlock this exists to prevent. Never expected — depth
-        // here is the nesting of COW operations, single digits.
+        // lock is the deadlock this exists to prevent. Never expected: see
+        // `STASH_CAP`.
         error!("vmo drop stash overflow; leaking one Arc");
         core::mem::forget(arc);
+    }
+}
+
+/// [`stash_defer`] for a reference that is taken over and over under one
+/// guard -- the tree walks of `readers_below` upgrade the same few children
+/// once per page. A second reference to an object the stash already holds
+/// cannot be the last one, since the stash's own keeps it alive until the
+/// lock is released, so it is dropped on the spot instead of taking a slot:
+/// one walk over a few hundred pages used to overflow the stash and leak.
+fn stash_defer_once(arc: Arc<VMObjectPaged>) {
+    // SAFETY: per-cpu, IRQs off under the family lock; see `DropStashes`.
+    let v = unsafe { &*DROP_STASH.0[stash_cpu()].0.get() };
+    if v.iter().any(|held| Arc::ptr_eq(held, &arc)) {
+        drop(arc);
+    } else {
+        stash_defer(arc);
     }
 }
 
@@ -1071,6 +1092,12 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn set_len(&self, len: usize) -> ZxResult {
         assert!(page_aligned(len));
+        // A child's end, counted from the root, has to fit the address too
+        // (`VmoClone2TestCase.NoAccumulatedOverflow`).
+        self.get_inner()
+            .root_offset()
+            .and_then(|root| root.checked_add(len))
+            .ok_or(ZxError::INVALID_ARGS)?;
         let mut deferred: Vec<Arc<VMObjectPaged>> = Vec::new();
         // Shrinking hands frames back to the allocator, so this opens the
         // decommit window too: a fault that is between `commit_page` and
@@ -1231,6 +1258,14 @@ impl VMObjectTrait for VMObjectPaged {
         let (mappings, dead, cow_fault_guard) = loop {
             let inner = self.get_inner();
             inner.validate_create_child()?;
+            // The offset is the child's into THIS object; into the root it is
+            // the sum of every offset down the chain, and a sum that wraps
+            // would name a window that is not there. Zircon refuses it as
+            // `INVALID_ARGS` (`VmoClone2TestCase.NoAccumulatedOverflow`).
+            inner
+                .root_offset()
+                .and_then(|root| root.checked_add(offset))
+                .ok_or(ZxError::INVALID_ARGS)?;
             if let Some(cow_fault_guard) = CowFaultSeqGuard::try_begin(&self.cow_fault_seq) {
                 let len_before = inner.mappings.len() as u64;
                 MAP_LIST_SCANS.fetch_add(1, Ordering::Relaxed);
@@ -1401,33 +1436,45 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn pin(&self, offset: usize, len: usize) -> ZxResult {
-        let mut inner = self.get_inner_mut();
-        if offset + len > inner.size {
-            return Err(ZxError::OUT_OF_RANGE);
-        }
-        if len == 0 {
-            return Ok(());
-        }
-        let start_page = offset / PAGE_SIZE;
-        let end_page = pages(offset + len);
-        for i in start_page..end_page {
-            // Not `unwrap`: `zx_bti_pin` commits the range and then pins it,
-            // and those are two turns of this lock. A `zx_vmo_op_range`
-            // decommit in between -- which nothing refuses, because the pages
-            // are not pinned yet -- left this looking for a frame that is no
-            // longer there, and that was a kernel panic.
-            let frame = inner.frames.get(&i).ok_or(ZxError::BAD_STATE)?;
-            if frame.pin_count == VM_PAGE_OBJECT_MAX_PIN_COUNT {
-                return Err(ZxError::UNAVAILABLE);
+        let mut range_changes = Vec::new();
+        let ret = (|| {
+            let mut inner = self.get_inner_mut();
+            if offset + len > inner.size {
+                return Err(ZxError::OUT_OF_RANGE);
             }
-        }
-        // Every frame in the range was there a moment ago and this lock has
-        // not been let go of since.
-        for i in start_page..end_page {
-            inner.frames.get_mut(&i).unwrap().pin_count += 1;
-            inner.pin_count += 1;
-        }
-        Ok(())
+            if len == 0 {
+                return Ok(());
+            }
+            let start_page = offset / PAGE_SIZE;
+            let end_page = pages(offset + len);
+            for i in start_page..end_page {
+                // `zx_bti_pin` commits the range and then pins it, and those
+                // are two turns of this lock. A `zx_vmo_op_range` decommit in
+                // between -- which nothing refuses, because the pages are not
+                // pinned yet -- leaves this looking for a frame that is no
+                // longer there. That was a kernel panic, then `BAD_STATE`,
+                // which `Bti.DecommitRace` spins on until it sees one. Zircon
+                // commits as it pins, under the one lock, so the page is
+                // brought back here: as a page of this object's own, the way
+                // a pinned page has to be, which is what a write would get.
+                if !inner.frames.contains_key(&i) {
+                    inner.commit_page(i, MMUFlags::WRITE, &mut range_changes)?;
+                }
+                let frame = inner.frames.get(&i).ok_or(ZxError::BAD_STATE)?;
+                if frame.pin_count == VM_PAGE_OBJECT_MAX_PIN_COUNT {
+                    return Err(ZxError::UNAVAILABLE);
+                }
+            }
+            // Every frame in the range was there a moment ago and this lock
+            // has not been let go of since.
+            for i in start_page..end_page {
+                inner.frames.get_mut(&i).unwrap().pin_count += 1;
+                inner.pin_count += 1;
+            }
+            Ok(())
+        })();
+        apply_deferred_range_changes(range_changes);
+        ret
     }
 
     fn unpin(&self, offset: usize, len: usize) -> ZxResult {
@@ -1522,6 +1569,11 @@ enum CommitResult {
     /// A new page copied-on-write.
     /// the bool value indicate should we unmap the page after the copy
     CopyOnWrite(PhysFrame, bool),
+    /// The ancestor's own page, handed down because nobody on the other
+    /// side of it reads it any more. A hidden node on the way keeps it when
+    /// ITS other child still reads it there; a leaf, or a hidden node whose
+    /// other child does not, passes it on.
+    Moved(PhysFrame, bool),
     /// A new zero page.
     NewPage(PhysFrame),
 }
@@ -1765,7 +1817,16 @@ impl VMObjectPagedInner {
                     CommitResult::NewPage(frame) if !self.type_.is_hidden() => {
                         self.frames.insert(page_idx, PageState::new(frame));
                     }
-                    CommitResult::CopyOnWrite(frame, unmap) => {
+                    // A hidden node passes a forked page up to the leaf that
+                    // asked, like a new one. It used to keep a copy of its
+                    // own at every level between the ancestor and the leaf,
+                    // so a snapshot's snapshot writing one page cost two,
+                    // and the original was then blamed for the whole
+                    // ancestor page the cousin still read through the
+                    // hidden copy (`VmoClone2TestCase.OffsetTest2`).
+                    CommitResult::CopyOnWrite(frame, unmap) | CommitResult::Moved(frame, unmap)
+                        if !self.type_.is_hidden() =>
+                    {
                         let mut new_frame = PageState::new(frame);
                         // Cloning a contiguous vmo: original frames are stored in hidden parent nodes.
                         // In order to make sure original vmo (now is a child of hidden parent)
@@ -1793,6 +1854,20 @@ impl VMObjectPagedInner {
                             need_unmap = need_unmap || unmap;
                         }
                         self.frames.insert(page_idx, new_frame);
+                    }
+                    // A page handed down from above lands in this hidden
+                    // node when the requester's sibling side still reads it
+                    // here: `many_clones` has a snapshot's snapshot take a
+                    // page the original and its other snapshot had both
+                    // forked, and the middle snapshot must go on reading it.
+                    CommitResult::Moved(frame, unmap)
+                        if self.side_reads(
+                            self.type_.get_tag_and_other(child).0.negate(),
+                            page_idx,
+                        ) =>
+                    {
+                        self.frames.insert(page_idx, PageState::new(frame));
+                        need_unmap = need_unmap || unmap;
                     }
                     r => return Ok(r),
                 }
@@ -1846,7 +1921,7 @@ impl VMObjectPagedInner {
                 // a possibly-last ref dying under the family lock.
                 stash_defer(arc_other);
                 if let Some(frame) = early_return {
-                    return Ok(CommitResult::CopyOnWrite(frame, need_unmap));
+                    return Ok(CommitResult::Moved(frame, need_unmap));
                 }
             }
             // Sibling VMO already dropped (fork/COW tree reshaped): skip hidden
@@ -1855,12 +1930,18 @@ impl VMObjectPagedInner {
         if need_unmap {
             self.collect_mapping_range_changes(page_idx, 1, RangeChangeOp::Unmap, range_changes);
         }
-        let frame = self.frames.get_mut(&page_idx).unwrap();
-        if frame.tag.is_split() {
-            // has split, take out
+        // Nobody on the other side reads this frame any more -- every leaf
+        // there has its own page, or it is out of their range: it is the
+        // asking side's alone, so hand it over rather than copy it. Decided
+        // by looking, not by the split tag: a tag set by one leaf's fork
+        // used to hand a frame to the other side while that leaf's cousin
+        // still read it (see `readers_below`).
+        if child_tag.is_split() && !self.side_reads(child_tag.negate(), page_idx) {
             let target_frame = self.frames.remove(&page_idx).unwrap().take();
-            return Ok(CommitResult::CopyOnWrite(target_frame, need_unmap));
-        } else if flags.contains(MMUFlags::WRITE) && child_tag.is_split() {
+            return Ok(CommitResult::Moved(target_frame, need_unmap));
+        }
+        let frame = self.frames.get_mut(&page_idx).unwrap();
+        if flags.contains(MMUFlags::WRITE) && child_tag.is_split() {
             // copy-on-write
             let target_frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
             kernel_hal::mem::pmem_copy(target_frame.paddr(), frame.frame.paddr(), PAGE_SIZE);
@@ -2098,7 +2179,9 @@ impl VMObjectPagedInner {
                 value.pin_count -= 1;
             }
             let idx = key - start;
-            if !child.frames.contains_key(&idx) && value.tag != tag.negate() {
+            // The survivor keeps every frame some leaf of its own still
+            // reads -- asked, not read off the tag (see `readers_below`).
+            if !child.frames.contains_key(&idx) && child.readers_below(idx) > 0 {
                 value.tag = PageStateTag::Owned;
                 child.frames.insert(idx, value);
             } else {
@@ -2229,7 +2312,7 @@ impl VMObjectPagedInner {
         deferred: &mut Vec<Arc<VMObjectPaged>>,
         graveyard: &mut Graveyard,
     ) {
-        let (tag, other) = self.type_.get_tag_and_other(old);
+        let (_, other) = self.type_.get_tag_and_other(old);
         let Some(arc_other_child) = other.upgrade() else {
             if let VMOType::Hidden { left, right, .. } = &mut self.type_ {
                 if left.ptr_eq(old) {
@@ -2270,7 +2353,11 @@ impl VMObjectPagedInner {
                             {
                                 new_frame.pin_count -= 1;
                             }
-                            if new_frame.tag == tag && other_start <= i && other_end > i {
+                            let other_reads = other_start <= i
+                                && other_end > i
+                                && !other_child.frames.contains_key(&(i - other_start))
+                                && other_child.readers_below(i - other_start) > 0;
+                            if other_reads {
                                 new_frame.tag = PageStateTag::Owned;
                                 let new_key = i - other_child.parent_offset / PAGE_SIZE;
                                 other_child.frames.insert(new_key, new_frame);
@@ -2360,8 +2447,149 @@ impl VMObjectPagedInner {
         info.populated_bytes = info.committed_bytes;
         info.committed_private_bytes = info.committed_bytes;
         info.populated_private_bytes = info.populated_bytes;
-        info.committed_scaled_bytes = info.committed_bytes;
-        info.populated_scaled_bytes = info.populated_bytes;
+        let (scaled, fraction) = self.scaled_bytes();
+        info.committed_scaled_bytes = scaled;
+        info.populated_scaled_bytes = scaled;
+        info.committed_fractional_scaled_bytes = fraction;
+        info.populated_fractional_scaled_bytes = fraction;
+    }
+
+    /// The bytes attributed to this VMO with every shared page split
+    /// equally between the VMOs that can see it: Zircon's
+    /// `committed_scaled_bytes`, as whole bytes and the fraction of a byte
+    /// left over (in units of 2^-64 of a byte).
+    ///
+    /// A page of this VMO's own counts whole. A page it reads through a
+    /// hidden ancestor counts `1 / n`, where `n` is how many leaf VMOs under
+    /// that ancestor read that same page (`readers_below`): the original and
+    /// its snapshot share the pages neither has written, a page one of them
+    /// forked is that one's alone, and a snapshot's snapshot shares three
+    /// ways. The core tests (`VmoClone2TestCase.ObjMemAccounting`,
+    /// `Offset`, `OffsetTest2`) poll `populated_scaled_bytes` for exactly
+    /// these halves and quarters, and `OffsetTest2` polls for ever when they
+    /// are not there.
+    ///
+    /// Read-only, under the family lock like every walk of the tree; the
+    /// child `Arc`s it upgrades are parked with `stash_defer`, since any of
+    /// them may be the last.
+    fn scaled_bytes(&self) -> (u64, u64) {
+        /// One byte, in the fixed point the fractional field is read in: the
+        /// core tests compute a third of a byte as `0x8000000000000000 / 3`
+        /// (`VmoClone2TestCase.Overflow`), so the fraction is in units of
+        /// 2^-63 of a byte, and a page shared `n` ways is exactly
+        /// `(PAGE_SIZE * BYTE) / n` of them, with the floor Zircon takes.
+        const BYTE: u128 = 1 << 63;
+        let mut total: u128 = 0;
+        for i in 0..self.size / PAGE_SIZE {
+            if self.frames.contains_key(&i) {
+                total += PAGE_SIZE as u128 * BYTE;
+                continue;
+            }
+            if let Some(readers) = self.readers_of_page_seen_through_parents(i) {
+                total += PAGE_SIZE as u128 * BYTE / readers.max(1) as u128;
+            }
+        }
+        ((total >> 63) as u64, (total & (BYTE - 1)) as u64)
+    }
+
+    /// This object's offset into the root of its tree: its own offset into
+    /// its parent plus every one up the chain, or `None` when the sum does
+    /// not fit. The root itself is at zero.
+    fn root_offset(&self) -> Option<usize> {
+        let mut offset = self.parent_offset;
+        let mut current = self.parent.clone();
+        while let Some(node) = current {
+            let inner = node.inner.borrow();
+            offset = offset.checked_add(inner.parent_offset)?;
+            current = inner.parent.clone();
+        }
+        Some(offset)
+    }
+
+    /// For page `idx` of this leaf, which it does not hold itself: how many
+    /// leaf VMOs read the frame it reads, or `None` when nothing up the
+    /// chain holds one for it.
+    fn readers_of_page_seen_through_parents(&self, idx: usize) -> Option<usize> {
+        if self.parent_offset + idx * PAGE_SIZE >= self.parent_limit {
+            return None;
+        }
+        let mut current = self.parent.clone();
+        let mut idx = idx + self.parent_offset / PAGE_SIZE;
+        while let Some(node) = current {
+            let inner = node.inner.borrow();
+            if inner.frames.contains_key(&idx) {
+                return Some(inner.readers_below(idx));
+            }
+            if inner.parent_offset + idx * PAGE_SIZE >= inner.parent_limit {
+                return None;
+            }
+            idx += inner.parent_offset / PAGE_SIZE;
+            current = inner.parent.clone();
+        }
+        None
+    }
+
+    /// How many leaf VMOs at or under this node read the frame that the
+    /// node holding it -- this one, or an ancestor -- has at this node's
+    /// `idx`: one for a leaf, and for a hidden node every descendant that
+    /// does not hold its own page there, on both sides.
+    ///
+    /// This is the fact the split tags approximate. A tag says which side
+    /// forked the page, which is right when that side is one leaf; when it
+    /// is a hidden node, only ONE of its leaves forked, and its cousin still
+    /// reads the page through it. Every decision that used to read the tag
+    /// as "that whole side has its own copy" -- handing the frame to the
+    /// other side on a read, dropping it when a hidden node collapses --
+    /// lost the cousin its page (`VmoClone2TestCase.OffsetTest2`: a
+    /// snapshot's snapshot read zeros, and the original's attribution never
+    /// settled). They ask this instead.
+    fn readers_below(&self, idx: usize) -> usize {
+        match &self.type_ {
+            VMOType::Hidden { left, right } => {
+                self.readers_via(left, idx) + self.readers_via(right, idx)
+            }
+            _ => 1,
+        }
+    }
+
+    /// [`Self::readers_below`] through one child of this hidden node.
+    fn readers_via(&self, child: &WeakRef, idx: usize) -> usize {
+        let Some(child) = child.upgrade() else {
+            return 0;
+        };
+        let readers = {
+            let inner = child.inner.borrow();
+            let byte = idx * PAGE_SIZE;
+            if byte >= inner.parent_offset && byte < inner.parent_limit {
+                let child_idx = idx - inner.parent_offset / PAGE_SIZE;
+                if inner.frames.contains_key(&child_idx) {
+                    0
+                } else {
+                    inner.readers_below(child_idx)
+                }
+            } else {
+                0
+            }
+        };
+        // Possibly-last ref, held under the family lock: defer its drop.
+        stash_defer_once(child);
+        readers
+    }
+
+    /// Whether any leaf on the side of this hidden node that `side` names
+    /// (the tag that side's forks carry) still reads the frame at `idx`.
+    fn side_reads(&self, side: PageStateTag, idx: usize) -> bool {
+        match &self.type_ {
+            VMOType::Hidden { left, right } => {
+                let child = if side == PageStateTag::LeftSplit {
+                    left
+                } else {
+                    right
+                };
+                self.readers_via(child, idx) > 0
+            }
+            _ => false,
+        }
     }
 
     fn release_unwanted_pages_in_parent(
@@ -2373,7 +2601,7 @@ impl VMObjectPagedInner {
         let mut child = self.self_ref.clone();
         while let Some(parent) = option_parent {
             let mut parent_inner = parent.inner.borrow_mut();
-            let (tag, other) = parent_inner.type_.get_tag_and_other(&child);
+            let (_, other) = parent_inner.type_.get_tag_and_other(&child);
             let Some(arc_other) = other.upgrade() else {
                 // `parent` (and any earlier ancestor still in `option_parent`)
                 // is a possibly-last ref about to die under the family lock.
@@ -2396,12 +2624,14 @@ impl VMObjectPagedInner {
                         {
                             to_insert.pin_count -= 1;
                         }
-                        if to_insert.tag != tag.negate() {
+                        if !other_inner.frames.contains_key(&(idx - start))
+                            && other_inner.readers_below(idx - start) > 0
+                        {
                             to_insert.tag = PageStateTag::Owned;
                             other_inner.frames.insert(idx - start, to_insert);
                         } else {
-                            // The sibling already split its own copy, so this
-                            // frame is nobody's -- but the mapping that is
+                            // Every leaf on the sibling's side has its own
+                            // copy, so this frame is nobody's -- but the mapping that is
                             // shrinking may still point at it until the
                             // caller unmaps. Into the grave, not dropped here.
                             graveyard.push(to_insert.take());
@@ -2927,6 +3157,113 @@ mod tests {
         }
     }
 
+    /// `VmoClone2TestCase.ObjMemAccounting` and `OffsetTest2`, on the
+    /// scaled figure: a shared page is half each side's, a forked page is
+    /// its forker's, and a snapshot's snapshots share their grandparent's
+    /// pages with the original by halves once the middle one is gone. And
+    /// the cousin's data: the snapshot's snapshot still reads what it saw.
+    /// A page read three ways is a third of a page each, and the third of
+    /// a byte left over is reported in the fraction field, in the units the
+    /// core tests read it in (`VmoClone2TestCase.Overflow`): a whole byte is
+    /// `1 << 63`.
+    #[test]
+    fn a_third_of_a_byte_is_reported_in_units_of_two_to_the_minus_63() {
+        let vmo = VmObject::new_paged(1);
+        vmo.test_write(0, 1);
+        let clone = vmo.create_child(false, 0, PAGE_SIZE).unwrap();
+        let clone2 = clone.create_child(false, 0, PAGE_SIZE).unwrap();
+        for v in [&vmo, &clone, &clone2] {
+            let info = v.get_info();
+            assert_eq!(info.populated_scaled_bytes as usize, PAGE_SIZE / 3);
+            assert_eq!(
+                info.populated_fractional_scaled_bytes,
+                0x8000_0000_0000_0000u64 / 3
+            );
+            assert_eq!(
+                info.committed_fractional_scaled_bytes,
+                0x8000_0000_0000_0000u64 / 3
+            );
+        }
+        drop(clone2);
+        for v in [&vmo, &clone] {
+            let info = v.get_info();
+            assert_eq!(info.populated_scaled_bytes as usize, PAGE_SIZE / 2);
+            assert_eq!(info.populated_fractional_scaled_bytes, 0);
+        }
+    }
+
+    /// A child's offset is counted from the root of its tree, and a chain
+    /// of offsets whose sum wraps around is refused where the wrap happens,
+    /// at `create_child` or at `set_size` (`VmoClone2TestCase.NoAccumulatedOverflow`).
+    #[test]
+    fn an_offset_that_wraps_counted_from_the_root_is_invalid() {
+        let vmo = VmObject::new_paged(0);
+        let child1 = vmo.create_child(false, 0xffff_ffff_ffff_8000, 0).unwrap();
+        assert_eq!(
+            child1.create_child(false, 0x8000, 0).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        let child2 = child1.create_child(true, 0x4000, 0).unwrap();
+        assert_eq!(child2.set_len(0x8000).err(), Some(ZxError::INVALID_ARGS));
+        assert!(child2.set_len(0x2000).is_ok());
+    }
+
+    #[test]
+    fn a_shared_page_is_split_equally_between_the_vmos_that_read_it() {
+        let scaled = |vmo: &Arc<VmObject>| vmo.get_info().populated_scaled_bytes as usize;
+        let vmo = VmObject::new_paged(2);
+        vmo.test_write(0, 1);
+        vmo.test_write(1, 1);
+        assert_eq!(scaled(&vmo), 2 * PAGE_SIZE);
+        let clone = vmo.create_child(false, 0, 2 * PAGE_SIZE).unwrap();
+        assert_eq!((scaled(&vmo), scaled(&clone)), (PAGE_SIZE, PAGE_SIZE));
+        // The original forks page 0: that one is its own, the old one is the
+        // clone's alone, and page 1 stays shared.
+        vmo.test_write(0, 2);
+        assert_eq!(
+            (scaled(&vmo), scaled(&clone)),
+            (3 * PAGE_SIZE / 2, 3 * PAGE_SIZE / 2)
+        );
+        clone.test_write(1, 2);
+        assert_eq!(
+            (scaled(&vmo), scaled(&clone)),
+            (2 * PAGE_SIZE, 2 * PAGE_SIZE)
+        );
+
+        // OffsetTest2: four pages; a clone of pages 1..4; two clones of that
+        // one covering its pages 0..2 and 2..3; the middle clone writes its
+        // page 1 and is closed.
+        let vmo = VmObject::new_paged(4);
+        for i in 0..4 {
+            vmo.test_write(i, i as u8 + 1);
+        }
+        let offset_clone = vmo.create_child(false, PAGE_SIZE, 3 * PAGE_SIZE).unwrap();
+        let clone1 = offset_clone.create_child(false, 0, 2 * PAGE_SIZE).unwrap();
+        let clone2 = offset_clone
+            .create_child(false, 2 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        offset_clone.test_write(1, 9);
+        drop(offset_clone);
+        assert_eq!((clone1.test_read(0), clone1.test_read(1)), (2, 3));
+        assert_eq!(clone2.test_read(0), 4);
+        assert_eq!(
+            vmo.test_read(2),
+            3,
+            "the original lost the page its grandchild forked"
+        );
+        assert_eq!(scaled(&vmo), 5 * PAGE_SIZE / 2, "1 + 1/2 + 1/2 + 1/2");
+        assert_eq!(scaled(&clone1), PAGE_SIZE, "1/2 + 1/2");
+        assert_eq!(scaled(&clone2), PAGE_SIZE / 2);
+        drop(clone1);
+        assert_eq!(scaled(&vmo), 7 * PAGE_SIZE / 2, "1 + 1 + 1 + 1/2");
+        assert_eq!(scaled(&clone2), PAGE_SIZE / 2);
+        assert_eq!(clone2.test_read(0), 4);
+        drop(clone2);
+        assert_eq!(scaled(&vmo), 4 * PAGE_SIZE);
+        assert_eq!(vmo.test_read(3), 4);
+        assert_ne!(vmo.get_info().populated_fractional_scaled_bytes, u64::MAX);
+    }
+
     #[test]
     fn overflow() {
         let vmo0 = VmObject::new_paged(2);
@@ -3229,21 +3566,42 @@ mod pin_tests {
     }
 
     #[test]
-    /// Pinning a page the object does not have is an error, not a panic.
-    /// `zx_bti_pin` commits the range and then pins it, and those are two
-    /// turns of the object's lock: a decommit in between is allowed, because
-    /// the pages are not pinned yet, and this is where it lands.
-    fn pinning_a_page_that_is_not_there_is_an_error_not_a_panic() {
+    /// Pinning a page the object does not have commits it on the spot, as
+    /// Zircon does. `zx_bti_pin` commits the range and then pins it, and
+    /// those are two turns of the object's lock: a decommit in between is
+    /// allowed, because the pages are not pinned yet, and this is where it
+    /// lands. It used to be a kernel panic, then `BAD_STATE`, which
+    /// `Bti.DecommitRace` races a decommitting thread to provoke.
+    fn pinning_a_page_that_is_not_there_commits_it() {
         let vmo = VmObject::new_paged(4);
-        assert_eq!(vmo.pin(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        vmo.pin(0, PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [true, false, false, false]);
+        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        vmo.unpin(0, PAGE_SIZE).unwrap();
 
         let vmo = committed();
         vmo.decommit(2 * PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert_eq!(vmo.pin(0, 4 * PAGE_SIZE), Err(ZxError::BAD_STATE));
-        // Nothing was half-pinned on the way to that answer: the pages before
-        // the missing one are still free to go.
+        vmo.pin(0, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [true, true, true, true]);
+        assert_eq!(
+            vmo.decommit(2 * PAGE_SIZE, PAGE_SIZE),
+            Err(ZxError::BAD_STATE)
+        );
+        vmo.unpin(0, 4 * PAGE_SIZE).unwrap();
         vmo.decommit(0, PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [false, true, false, true]);
+        assert_eq!(held(&vmo), [false, true, true, true]);
+    }
+
+    #[test]
+    /// A pinned page of a snapshot child is the child's own: pinning forks
+    /// it off the parent instead of pinning the page they share.
+    fn pinning_a_page_a_child_shares_forks_it() {
+        let vmo = committed();
+        let child = vmo.create_child(false, 0, 4 * PAGE_SIZE).unwrap();
+        child.pin(PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(child.committed_pages_in_range(1, 2), 1);
+        assert_eq!(vmo.test_read(1), child.test_read(1));
+        child.unpin(PAGE_SIZE, PAGE_SIZE).unwrap();
     }
 
     #[test]

@@ -755,6 +755,16 @@ impl VmObject {
         self.set_content_size(size)
     }
 
+    /// Whether a direct write reaching `end` can be served: it is inside the
+    /// object, or the object is unbounded and grows to fit. The answer
+    /// `grow_for_write` would give, without the growth: `zx_vmo_write`
+    /// decides the range BEFORE it looks at the caller's buffer, as Zircon
+    /// does (`OUT_OF_RANGE` for a length that leaves the object, whatever the
+    /// buffer), and must not grow the object before the buffer is checked.
+    pub fn can_write_to(&self, end: usize) -> bool {
+        end <= self.trait_.len() || self.unbounded
+    }
+
     /// Grow an unbounded VMO so a direct write can reach `end`.
     pub fn grow_for_write(&self, end: usize) -> ZxResult {
         if end <= self.trait_.len() {
