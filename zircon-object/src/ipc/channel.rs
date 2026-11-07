@@ -347,6 +347,43 @@ mod tests {
         future
     }
 
+    /// Baseline for the microkernel IPC work: cost of the channel object
+    /// alone (no trap, no context switch) for a 32-byte message written on
+    /// one end and read on the other, and for a full `call` + reply.
+    /// Run with `cargo test -p zircon-object --lib --features
+    /// libos,aspace-separate,elf --release ipc_baseline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ipc_baseline() {
+        extern crate std;
+        use std::time::Instant;
+        const N: u32 = 200_000;
+        let (end0, end1) = Channel::create();
+        let payload = [0u8; 32];
+
+        let start = Instant::now();
+        for _ in 0..N {
+            end0.write(message(&payload)).unwrap();
+            core::hint::black_box(end1.read().unwrap());
+        }
+        let oneway = start.elapsed().as_nanos() as f64 / N as f64;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let start = Instant::now();
+        for _ in 0..N {
+            let mut fut = Box::pin(end0.call(message(&payload)));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let req = end1.read().unwrap();
+            end1.write(reply_to(req.get_txid(), &payload)).unwrap();
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(r) => drop(core::hint::black_box(r.unwrap())),
+                Poll::Pending => panic!("reply not delivered"),
+            }
+        }
+        let call = start.elapsed().as_nanos() as f64 / N as f64;
+        std::println!("ipc_baseline: write+read {oneway:.1} ns, call+reply {call:.1} ns");
+    }
+
     #[test]
     fn test_basics() {
         let (end0, end1) = Channel::create();
