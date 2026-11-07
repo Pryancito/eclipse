@@ -774,6 +774,8 @@ struct Trickle {
     bytes_per_recv: usize,
     /// How many times `recv` was called.
     recvs: u32,
+    /// Whether the caller gave the connection up on this transport.
+    gave_up: bool,
 }
 
 impl Trickle {
@@ -783,6 +785,7 @@ impl Trickle {
             advance_per_call,
             bytes_per_recv,
             recvs: 0,
+            gave_up: false,
         }
     }
 }
@@ -808,6 +811,10 @@ impl RpcTransport for Trickle {
 
     fn poll(&mut self) {
         self.now = self.now.saturating_add(self.advance_per_call);
+    }
+
+    fn give_up(&mut self) {
+        self.gave_up = true;
     }
 }
 
@@ -1062,6 +1069,84 @@ fn the_stall_bound_counts_only_the_passes_the_clock_did_not_move() {
         took >= core::time::Duration::from_millis(150),
         "it gave up after {:?}, so the stall count ended it and not the 200 ms deadline",
         took
+    );
+}
+
+#[test]
+fn a_read_that_delivers_bytes_is_progress_whatever_the_clock_says() {
+    // The second review round's finding, and the sharper half of it. The
+    // stopped-clock bound is for a loop making no progress; a read that hands
+    // over bytes IS progress, and a server that dribbles eight bytes a read
+    // into a 64 KiB reply makes far more passes than the bound allows. The
+    // first version compared two clock readings taken inside one pass, so
+    // every one of those fast passes looked frozen and the bound fired on a
+    // connection whose deadline was nowhere near: a working clock -- or in
+    // this test no clock at all -- must not be able to trigger the
+    // stopped-clock exit.
+    let want = 8 * (MAX_RECV_PASSES as usize + 10);
+    let mut t = Trickle::new(0, 8);
+    let got = recv_at_least(&mut t, want, 1_000_000).expect("a dribbling read is not a stall");
+    assert_eq!(got.len(), want);
+    assert!(
+        t.recvs > MAX_RECV_PASSES,
+        "it took {} reads, which is not past the bound and so measures nothing",
+        t.recvs
+    );
+    assert_eq!(
+        t.now_ms(),
+        1_000,
+        "the clock was supposed to be the stopped one"
+    );
+}
+
+#[test]
+fn a_record_whose_last_chunk_lands_late_is_still_returned() {
+    // Deliberate, and pinned here so it cannot drift: the deadline bounds
+    // how long this waits, not when the bytes are allowed to arrive. A
+    // *complete* reply that landed late is not improved by waiting longer,
+    // and discarding it costs a retransmit of a call the server has already
+    // run -- which for `REMOVE` or `RENAME` is not a free thing to do twice.
+    let mut t = Trickle::new(200, 1);
+    let got = recv_at_least(&mut t, 1, 1_100).expect("a complete record is not a timeout");
+    assert_eq!(got.len(), 1);
+    assert!(
+        t.now_ms() > 1_100,
+        "the last chunk was supposed to land after the deadline"
+    );
+    assert!(
+        !t.gave_up,
+        "a record that completed left the stream in step, so there is nothing to give up"
+    );
+}
+
+#[test]
+fn walking_away_from_half_a_record_gives_the_connection_up() {
+    // The receive side of the partial send. The bytes already taken are gone
+    // from the socket, so the next read on this connection would start in the
+    // middle of a message and take a length field out of somebody's payload.
+    // The stream cannot be put back, so the connection must not be reused.
+    let mut t = Trickle::new(200, 1);
+    assert!(
+        recv_at_least(&mut t, 10, 1_100).is_err(),
+        "the deadline was supposed to end this read"
+    );
+    assert!(
+        t.gave_up,
+        "part of a record was read and the connection was kept anyway"
+    );
+}
+
+#[test]
+fn a_read_that_took_nothing_leaves_the_connection_usable() {
+    // The other half of the same rule, and the reason it is not simply "give
+    // up on any failed read": nothing was taken from the socket, so the
+    // stream is still in step and the caller may retry on this connection.
+    // Giving up here would turn every ordinary timeout into a dead mount.
+    let mut t = Trickle::new(200, 0);
+    assert!(recv_at_least(&mut t, 10, 1_100).is_err());
+    assert!(
+        !t.gave_up,
+        "a read that got no bytes cannot have left a record half read"
     );
 }
 

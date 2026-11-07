@@ -78,6 +78,21 @@ pub trait RpcTransport {
     /// waits nor yields turns the client's wait into a busy loop, which is
     /// correct but burns a core — so the kernel one must park.
     fn poll(&mut self);
+
+    /// Stop using this connection: its byte stream is out of step with the
+    /// server's and nothing can put it back.
+    ///
+    /// Called by code that had to walk away from a message it had only part
+    /// of — half a record written, or half a record read. Neither half can be
+    /// withdrawn, so the next call on this connection would read or write at
+    /// an offset the server does not agree with, and the symptom would appear
+    /// in some later call that had nothing to do with it.
+    ///
+    /// Does nothing by default: a transport with no connection to give up —
+    /// every fake in the tests — has nothing to do here, while
+    /// [`KernelTransport`](super::transport::KernelTransport) aborts the
+    /// socket and refuses everything afterwards.
+    fn give_up(&mut self) {}
 }
 
 /// Whether `candidate` is an earlier transaction id than `current`.
