@@ -180,3 +180,65 @@ fn a_mount_with_no_budget_left_never_reaches_the_session() {
     assert_eq!(err, LxError::ETIMEDOUT);
     assert!(log.lock().dialled.is_empty());
 }
+
+/// Two mounts under one deadline: the second gets what the first left, not
+/// a minute of its own.
+///
+/// This is what `/etc/fstab` does with its network lines, and the reason it
+/// does: a deadline per line means a boot that waits a minute *per*
+/// unreachable server before the shell appears, so the bound has to be on
+/// the run. Measured the same way the three-step version is — a step made
+/// to cost real time, and the later dial checked for having **less** —
+/// because an absolute deadline read from the real clock is indis-
+/// tinguishable from a fresh one until time passes.
+#[test]
+fn a_second_mount_under_the_same_deadline_gets_what_the_first_left_of_it() {
+    const BURN_MS: u64 = 40;
+    let budget = Budget::new(greeting::greeting_budget(&quick_options()));
+
+    let mut first = a_mountable_server();
+    first.slow(MOUNTD_PORT, BURN_MS);
+    let first_log = first.log();
+    connect_export_with_deadline(&mut first, &a_source(), &quick_options(), &budget)
+        .expect("the first line mounts");
+
+    let mut second = a_mountable_server();
+    let second_log = second.log();
+    connect_export_with_deadline(&mut second, &a_source(), &quick_options(), &budget)
+        .expect("the second line mounts");
+
+    let opened = first_log.lock().budgets[0];
+    let inherited = second_log.lock().budgets[0];
+    assert!(
+        opened >= inherited + BURN_MS / 2,
+        "the second line's first dial got {} ms of a deadline that started \
+         at {} ms, after a line that spent {} ms: a fresh minute per fstab \
+         line, which is the arithmetic the shared deadline exists to stop",
+        inherited,
+        opened,
+        BURN_MS
+    );
+}
+
+/// A deadline already spent mounts nothing and, above all, dials nothing.
+///
+/// The state an fstab run reaches after its budget has gone on servers that
+/// never answered: every line after that point has to be cheap, because
+/// the point of the bound is that boot stops waiting — not that it waits
+/// the same amount in smaller pieces.
+#[test]
+fn a_line_whose_deadline_is_already_spent_dials_nobody() {
+    let budget = Budget::new(0);
+    let mut d = a_mountable_server();
+    let log = d.log();
+    let err = match connect_export_with_deadline(&mut d, &a_source(), &quick_options(), &budget) {
+        Ok(_) => panic!("a spent deadline cannot mount"),
+        Err(e) => e,
+    };
+    assert_eq!(err, LxError::ETIMEDOUT);
+    assert!(
+        log.lock().dialled.is_empty(),
+        "dialled {:?} with no time left to hear an answer in",
+        log.lock().dialled
+    );
+}

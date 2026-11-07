@@ -21,7 +21,8 @@ use super::eclipsefs_mount::open_eclipsefs;
 use super::fat_mount::open_fat;
 use super::flagged_fs::{wrap_fs, wrap_fs_at};
 use super::nfs::connect::TcpConnector;
-use super::nfs::mount::connect_export;
+use super::nfs::greeting::Budget;
+use super::nfs::mount::{connect_export, connect_export_with_deadline};
 use super::nfs::source::{NfsOptions, NfsSource};
 use crate::net::dns::{self, DnsFamily};
 
@@ -66,7 +67,7 @@ pub(crate) fn vfs_root() -> Option<Arc<MNode>> {
 /// It also trimmed whitespace. A directory may be called `" "`, and Linux
 /// mounts on the path it was given, so trimming silently mounted somewhere
 /// else. Splitting on the separator and rebuilding is all three at once.
-fn normalize_target(path: &str) -> String {
+pub(crate) fn normalize_target(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for comp in path.split('/').filter(|s| !s.is_empty()) {
         out.push('/');
@@ -298,12 +299,30 @@ pub fn mount_fs(
 /// and wrong for an export: the scan would read the whole of a remote
 /// filesystem over the network at mount time, and the thing it guards
 /// against — a stick carried in and plugged in — is not what an export is.
-fn mount_nfs(
+pub(crate) fn mount_nfs(
     source: &str,
     target: &str,
     mount_node: &Arc<MNode>,
     flags: usize,
     data: &str,
+) -> LxResult<()> {
+    mount_nfs_with_deadline(source, target, mount_node, flags, data, None)
+}
+
+/// [`mount_nfs`] with the deadline given rather than derived from the
+/// options.
+///
+/// `None` is [`mount_nfs`]'s own behaviour: a fresh budget sized by
+/// [`greeting_budget`](super::nfs::greeting::greeting_budget). `Some` is for
+/// `/etc/fstab`, which shares one deadline across every network line in the
+/// run — see [`connect_export_with_deadline`].
+pub(crate) fn mount_nfs_with_deadline(
+    source: &str,
+    target: &str,
+    mount_node: &Arc<MNode>,
+    flags: usize,
+    data: &str,
+    budget: Option<&Budget>,
 ) -> LxResult<()> {
     let parsed = NfsSource::parse(source)?;
     let opts = nfs_options_for(flags, data)?;
@@ -315,7 +334,10 @@ fn mount_nfs(
         None => server_address(&parsed.host)?,
     };
     let mut connector = TcpConnector::new(addr);
-    let mounted = connect_export(&mut connector, &parsed, &opts)?;
+    let mounted = match budget {
+        Some(budget) => connect_export_with_deadline(&mut connector, &parsed, &opts, budget)?,
+        None => connect_export(&mut connector, &parsed, &opts)?,
+    };
     let (fs, state) = prepare_fs(mounted.fs, flags, data);
     mount_node.mount(fs).map_err(LxError::from)?;
     let line = build_options_string(flags, data);
@@ -335,7 +357,7 @@ fn mount_nfs(
 /// looked up as a file. That is a silent `ENOENT` on a mount that should
 /// have worked, and it is the kind of mismatch only a test that reads both
 /// ends catches.
-fn is_network_fstype(fstype: &str) -> bool {
+pub(crate) fn is_network_fstype(fstype: &str) -> bool {
     fstype == "nfs"
 }
 
@@ -410,6 +432,41 @@ pub fn nfs_host_to_resolve(fstype: &str, source: Option<&str>, data: &str) -> Op
         }
     }
     Some(parsed.host)
+}
+
+/// The option string a mount should be given: `data` with `addr=<ip>` added
+/// when the server has to be resolved, or `None` when `data` already says
+/// everything.
+///
+/// The one place the resolving happens, shared by the two callers that mount
+/// from an option string -- `mount(2)` and `/etc/fstab` -- so the two cannot
+/// disagree about when a name is looked up. `async` only because of the
+/// lookup: see [`nfs_host_to_resolve`], which answers `None` for every case
+/// that needs no network, and that is every case but one.
+pub async fn with_resolved_addr(
+    fstype: &str,
+    source: Option<&str>,
+    data: &str,
+) -> LxResult<Option<String>> {
+    let Some(host) = nfs_host_to_resolve(fstype, source, data) else {
+        return Ok(None);
+    };
+    let root = super::dns_vfs_root().ok_or(LxError::ENOENT)?;
+    let addrs = dns::resolve(&root, &host, DnsFamily::Unspec).await?;
+    Ok(Some(with_addr_option(data, first_address(&addrs)?)))
+}
+
+/// The address a resolver's answer names, or `ENOENT`.
+///
+/// A function because an empty answer is a real shape: `dns::resolve` can
+/// succeed and return nothing — a reply that carried no address of the
+/// family asked for, a `/etc/hosts` line with a name and no address. The
+/// reading to avoid is treating "resolved to nothing" as resolved, because
+/// what the mount then dials is whatever an empty list defaults to, and
+/// `0.0.0.0` is a connection attempt to the local host rather than a
+/// mount that says the name could not be found.
+fn first_address(addrs: &[IpAddress]) -> LxResult<IpAddress> {
+    addrs.first().copied().ok_or(LxError::ENOENT)
 }
 
 /// `data` with `addr=<ip>` added, which is how a resolved address reaches
@@ -702,6 +759,68 @@ mod tests {
             nfs_host_to_resolve("nfs3", Some("nas:/srv"), ""),
             Some(String::from("nas")),
             "the other spelling of the same type is resolved too"
+        );
+    }
+
+    /// Every mount that needs no lookup is handed its options back
+    /// untouched, and `with_resolved_addr` and `nfs_host_to_resolve` agree
+    /// on which those are.
+    ///
+    /// The agreement is the thing worth measuring. `with_resolved_addr` is
+    /// what both `mount(2)` and `/etc/fstab` call, and it `await`s only on
+    /// the cases `nfs_host_to_resolve` picks out; if it awaited on a case
+    /// that one calls settled, boot would make a DNS query for every `vfat`
+    /// line in the fstab, before the network is necessarily up.
+    #[test]
+    fn a_mount_with_nothing_to_resolve_awaits_nothing_and_changes_nothing() {
+        use async_std::task::block_on;
+        for (fstype, source, data) in [
+            ("vfat", Some("nas:/srv"), "rw"),
+            ("btrfs", Some("nas:/srv"), "rw"),
+            ("tmpfs", Some("nas:/srv"), ""),
+            ("nfs", None, ""),
+            ("nfs", Some("nas:/srv"), "addr=10.0.0.4"),
+            ("nfs", Some("192.168.1.10:/srv"), ""),
+        ] {
+            assert_eq!(
+                nfs_host_to_resolve(fstype, source, data),
+                None,
+                "{:?} {:?} {:?}: this case is meant to need no lookup",
+                fstype,
+                source,
+                data
+            );
+            assert_eq!(
+                block_on(super::with_resolved_addr(fstype, source, data)),
+                Ok(None),
+                "{:?} {:?} {:?}: nothing to resolve must be no new options, \
+                 not options rebuilt the same",
+                fstype,
+                source,
+                data
+            );
+        }
+    }
+
+    /// A resolver that succeeded and named nothing has not resolved the
+    /// name.
+    ///
+    /// `dns::resolve` can do exactly that: a reply carrying no address of
+    /// the family asked for, or an `/etc/hosts` line with a name and no
+    /// address. Treating it as resolved hands the mount whatever an empty
+    /// list falls back to, and every candidate for that is a connection to
+    /// somewhere other than the server — `0.0.0.0` is the local host.
+    #[test]
+    fn a_resolver_that_names_nothing_has_not_resolved_the_name() {
+        assert_eq!(super::first_address(&[]), Err(LxError::ENOENT));
+        assert_eq!(
+            super::first_address(&[IpAddress::v4(10, 0, 0, 4)]),
+            Ok(IpAddress::v4(10, 0, 0, 4))
+        );
+        assert_eq!(
+            super::first_address(&[IpAddress::v4(10, 0, 0, 4), IpAddress::v4(10, 0, 0, 5)]),
+            Ok(IpAddress::v4(10, 0, 0, 4)),
+            "the first the resolver named, as Linux takes it"
         );
     }
 

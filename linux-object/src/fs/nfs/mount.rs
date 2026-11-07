@@ -76,8 +76,33 @@ pub fn connect_export<C: Connector>(
 where
     C::Transport: Send + 'static,
 {
-    let budget = Budget::new(greeting::greeting_budget(opts));
-    let greeting = greeting::greet_with_deadline(connector, source, opts, &budget)?;
+    connect_export_with_deadline(
+        connector,
+        source,
+        opts,
+        &Budget::new(greeting::greeting_budget(opts)),
+    )
+}
+
+/// [`connect_export`] against a deadline the caller owns.
+///
+/// Separate for the same reason [`greet_with_deadline`] is, plus one this
+/// level adds: `/etc/fstab` can name several exports, and a deadline per
+/// line means a boot that waits a minute *per* unreachable server before the
+/// shell appears. The fstab path passes one deadline for the whole run so
+/// the bound is on the run and not on the line.
+///
+/// [`greet_with_deadline`]: greeting::greet_with_deadline
+pub fn connect_export_with_deadline<C: Connector>(
+    connector: &mut C,
+    source: &NfsSource,
+    opts: &NfsOptions,
+    budget: &Budget,
+) -> LxResult<MountedExport<C::Transport>>
+where
+    C::Transport: Send + 'static,
+{
+    let greeting = greeting::greet_with_deadline(connector, source, opts, budget)?;
     let transport = connector.connect(greeting.nfs_port, budget.left()?)?;
     let mut session = NfsSession::new(
         transport,
