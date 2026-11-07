@@ -1,4 +1,4 @@
-//! The paths `mount(2)` and `umount2(2)` act on, as Linux 6.18 finds them
+//! The paths `mount(2).await` and `umount2(2)` act on, as Linux 6.18 finds them
 //! (measured there with glibc and musl): from the working directory,
 //! through symbolic links, with `..` read where the walk is and not as
 //! text; and in what order each call looks at what it was given.
@@ -53,7 +53,7 @@ pub(super) fn at(s: &Option<String>) -> UserInPtr<u8> {
     UserInPtr::from(s.as_ref().map_or(0, |s| s.as_ptr() as usize))
 }
 
-pub(super) fn mount(
+pub(super) async fn mount(
     sys: &Syscall<'_>,
     source: Option<&str>,
     target: &str,
@@ -68,10 +68,11 @@ pub(super) fn mount(
         flags,
         UserInPtr::from(0),
     )
+    .await
 }
 
-pub(super) fn bind(sys: &Syscall<'_>, source: &str, target: &str) -> SysResult {
-    mount(sys, Some(source), target, None, MS_BIND)
+pub(super) async fn bind(sys: &Syscall<'_>, source: &str, target: &str) -> SysResult {
+    mount(sys, Some(source), target, None, MS_BIND).await
 }
 
 pub(super) fn umount(sys: &Syscall<'_>, target: &str, flags: usize) -> SysResult {
@@ -163,7 +164,10 @@ fn a_relative_target_is_taken_from_the_working_directory() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             chdir(sys, "/mp_rt/run");
-            (bind(sys, "/mp_rt/src/d", "b"), bound_at_b(sys, "mp_rt"))
+            (
+                bind(sys, "/mp_rt/src/d", "b").await,
+                bound_at_b(sys, "mp_rt"),
+            )
         })
     });
     assert_bound_at_b(got, "mp_rt", "a relative target");
@@ -175,7 +179,10 @@ fn a_relative_source_is_taken_from_the_working_directory() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             chdir(sys, "/mp_rs/src");
-            (bind(sys, "d", "/mp_rs/run/b"), bound_at_b(sys, "mp_rs"))
+            (
+                bind(sys, "d", "/mp_rs/run/b").await,
+                bound_at_b(sys, "mp_rs"),
+            )
         })
     });
     assert_bound_at_b(got, "mp_rs", "a relative source");
@@ -187,7 +194,7 @@ fn a_target_through_a_symbolic_link_is_where_the_link_leads() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             (
-                bind(sys, "/mp_lt/src/d", "/mp_lt/run/link"),
+                bind(sys, "/mp_lt/src/d", "/mp_lt/run/link").await,
                 bound_at_b(sys, "mp_lt"),
             )
         })
@@ -203,7 +210,10 @@ fn a_relative_link_in_the_target_is_read_from_its_own_directory() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             chdir(sys, "/mp_rl/src");
-            (bind(sys, "d", "/mp_rl/run/rel"), bound_at_b(sys, "mp_rl"))
+            (
+                bind(sys, "d", "/mp_rl/run/rel").await,
+                bound_at_b(sys, "mp_rl"),
+            )
         })
     });
     assert_bound_at_b(got, "mp_rl", "a target through a relative link");
@@ -215,7 +225,7 @@ fn a_source_through_a_symbolic_link_is_where_the_link_leads() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             (
-                bind(sys, "/mp_ls/run/srclink", "/mp_ls/run/b"),
+                bind(sys, "/mp_ls/run/srclink", "/mp_ls/run/b").await,
                 bound_at_b(sys, "mp_ls"),
             )
         })
@@ -229,7 +239,7 @@ fn a_target_with_dot_dot_in_it_is_the_directory_it_names() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             (
-                bind(sys, "/mp_dd/src/d", "/mp_dd/run/c/../b"),
+                bind(sys, "/mp_dd/src/d", "/mp_dd/run/c/../b").await,
                 bound_at_b(sys, "mp_dd"),
             )
         })
@@ -245,7 +255,7 @@ fn a_dot_dot_after_a_link_climbs_out_of_where_the_link_leads() {
     let got = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             (
-                bind(sys, "/mp_ld/run/srclink/../d", "/mp_ld/run/b"),
+                bind(sys, "/mp_ld/run/srclink/../d", "/mp_ld/run/b").await,
                 bound_at_b(sys, "mp_ld"),
             )
         })
@@ -258,7 +268,7 @@ fn umount_of_a_relative_path() {
     let proc = a_process(45_617, "mp_ur");
     let (bound, got, left, seen) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "/mp_ur/src/d", "/mp_ur/run/b");
+            let bound = bind(sys, "/mp_ur/src/d", "/mp_ur/run/b").await;
             chdir(sys, "/mp_ur/run");
             let got = umount(sys, "b", 0);
             (
@@ -280,7 +290,7 @@ fn umount_through_a_symbolic_link_follows_it() {
     let proc = a_process(45_618, "mp_ul");
     let (bound, got, left) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "/mp_ul/src/d", "/mp_ul/run/b");
+            let bound = bind(sys, "/mp_ul/src/d", "/mp_ul/run/b").await;
             let got = umount(sys, "/mp_ul/run/link", 0);
             (bound, got, roots_at(sys, "/mp_ul/run/b"))
         })
@@ -297,7 +307,7 @@ fn umount_nofollow_of_a_link_is_einval_and_a_trailing_slash_follows_it() {
     let proc = a_process(45_619, "mp_un");
     let (bound, kept, left, slashed, gone) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "/mp_un/src/d", "/mp_un/run/b");
+            let bound = bind(sys, "/mp_un/src/d", "/mp_un/run/b").await;
             let kept = umount(sys, "/mp_un/run/link", UMOUNT_NOFOLLOW);
             let left = roots_at(sys, "/mp_un/run/b");
             let slashed = umount(sys, "/mp_un/run/link/", UMOUNT_NOFOLLOW);
@@ -316,9 +326,9 @@ fn a_move_between_relative_paths() {
     let proc = a_process(45_620, "mp_mv");
     let (bound, got, at_c, at_b, named, seen) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "/mp_mv/src/d", "/mp_mv/run/b");
+            let bound = bind(sys, "/mp_mv/src/d", "/mp_mv/run/b").await;
             chdir(sys, "/mp_mv/run");
-            let got = mount(sys, Some("b"), "c", None, MS_MOVE);
+            let got = mount(sys, Some("b"), "c", None, MS_MOVE).await;
             let seen = exists(sys, "/mp_mv/run/c/mark");
             let lines = (
                 roots_at(sys, "/mp_mv/run/c"),
@@ -343,7 +353,7 @@ fn a_tmpfs_on_a_relative_path_is_listed_and_unmounted_by_its_full_path() {
     let (got, at_c, named, gone, left) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             chdir(sys, "/mp_tf/run");
-            let got = mount(sys, Some("t58"), "c", Some("tmpfs"), 0);
+            let got = mount(sys, Some("t58"), "c", Some("tmpfs"), 0).await;
             let at_c = roots_at(sys, "/mp_tf/run/c");
             let named = roots_at(sys, "c");
             let gone = umount(sys, "c", 0);
@@ -362,7 +372,7 @@ fn a_target_that_is_a_dangling_link_is_enoent() {
     let proc = a_process(45_622, "mp_dl");
     let (got, named) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let got = bind(sys, "/mp_dl/src/d", "/mp_dl/run/dangling");
+            let got = bind(sys, "/mp_dl/src/d", "/mp_dl/run/dangling").await;
             (got, roots_at(sys, "/mp_dl/run/dangling"))
         })
     });
@@ -377,8 +387,8 @@ fn a_bind_or_a_move_of_an_empty_name_is_einval() {
     let proc = a_process(45_623, "mp_es");
     let (bound, moved, left) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "", "/mp_es/run/b");
-            let moved = mount(sys, Some(""), "/mp_es/run/b", None, MS_MOVE);
+            let bound = bind(sys, "", "/mp_es/run/b").await;
+            let moved = mount(sys, Some(""), "/mp_es/run/b", None, MS_MOVE).await;
             let left = roots_at(sys, "/mp_es/run/b");
             let _ = umount(sys, "/mp_es/run/b", MNT_DETACH);
             (bound, moved, left)
@@ -397,8 +407,8 @@ fn the_target_is_looked_up_before_the_type_and_the_source() {
     let (typed, bound) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             (
-                mount(sys, Some("t58"), "/mp_tg/run/nowhere", Some("nosuchfs"), 0),
-                bind(sys, "", "/mp_tg/run/nowhere"),
+                mount(sys, Some("t58"), "/mp_tg/run/nowhere", Some("nosuchfs"), 0).await,
+                bind(sys, "", "/mp_tg/run/nowhere").await,
             )
         })
     });
@@ -441,14 +451,15 @@ fn a_remount_does_not_look_its_source_up() {
     let proc = a_process(45_626, "mp_rm");
     let (bound, got, opts) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
-            let bound = bind(sys, "/mp_rm/src/d", "/mp_rm/run/b");
+            let bound = bind(sys, "/mp_rm/src/d", "/mp_rm/run/b").await;
             let got = mount(
                 sys,
                 Some("/mp_rm/no-such-source"),
                 "/mp_rm/run/b",
                 None,
                 MS_REMOUNT | MS_BIND | MS_RDONLY,
-            );
+            )
+            .await;
             let opts = options_at(sys, "/mp_rm/run/b");
             let _ = umount(sys, "/mp_rm/run/b", MNT_DETACH);
             (bound, got, opts)

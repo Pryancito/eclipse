@@ -482,7 +482,10 @@ impl Syscall<'_> {
             Sys::FSTATFS => self.sys_fstatfs(a0.into(), a1.into()),
             Sys::SYNC => self.sys_sync(),
             Sys::SYNCFS => self.sys_syncfs(a0.into()),
-            Sys::MOUNT => self.sys_mount(a0.into(), a1.into(), a2.into(), a3, a4.into()),
+            Sys::MOUNT => {
+                self.sys_mount(a0.into(), a1.into(), a2.into(), a3, a4.into())
+                    .await
+            }
             Sys::UMOUNT2 => self.sys_umount2(a0.into(), a1),
 
             // memory

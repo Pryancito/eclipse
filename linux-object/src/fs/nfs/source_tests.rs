@@ -212,12 +212,49 @@ fn ro_and_rw_set_read_only() {
     assert!(!NfsOptions::parse("ro,rw").unwrap().read_only);
 }
 
+/// `addr=` is Linux's "the server is at this address, do not resolve it".
+#[test]
+fn addr_takes_an_address_literal() {
+    use smoltcp::wire::Ipv4Address;
+    let o = NfsOptions::parse("addr=10.0.0.3").unwrap();
+    assert_eq!(o.addr, Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 3))));
+    assert_eq!(
+        NfsOptions::parse("").unwrap().addr,
+        None,
+        "no addr= is not an address of zero"
+    );
+}
+
+/// The brackets the device string takes for an IPv6 literal are taken here
+/// too, because a person who writes them there writes them here.
+#[test]
+fn an_ipv6_addr_is_accepted_bracketed_or_bare() {
+    let bare = NfsOptions::parse("addr=fe80::1").unwrap().addr;
+    let bracketed = NfsOptions::parse("addr=[fe80::1]").unwrap().addr;
+    assert!(bare.is_some());
+    assert_eq!(bare, bracketed);
+    // A bracket that does not close is a mistake in the line, as it is in
+    // the device string.
+    assert_eq!(NfsOptions::parse("addr=[fe80::1"), Err(LxError::EINVAL));
+}
+
+/// A name in `addr=` is refused rather than resolved. `addr=` means "do not
+/// resolve", so looking it up would make the option mean nothing -- and
+/// silently mounting without it would mount somewhere else.
+#[test]
+fn a_name_in_addr_is_refused_rather_than_resolved() {
+    assert_eq!(NfsOptions::parse("addr=nas"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("addr="), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("addr"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("addr=1.2.3"), Err(LxError::EINVAL));
+}
+
 /// Unknown options are ignored, not refused. `mount(8)` passes along a dozen
 /// options this client has no opinion about, and refusing them would fail a
 /// mount over a flag that changes nothing.
 #[test]
 fn unknown_options_are_ignored() {
-    let o = NfsOptions::parse("relatime,nosuid,vers=3,proto=tcp,rsize=4096,addr=1.2.3.4").unwrap();
+    let o = NfsOptions::parse("relatime,nosuid,vers=3,proto=tcp,rsize=4096,sec=sys").unwrap();
     assert_eq!(o.rsize, 4096, "the one it knows is still parsed");
     assert_eq!(o.timeout_ms, 60_000);
 }

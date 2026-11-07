@@ -44,6 +44,8 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use smoltcp::wire::IpAddress;
+
 use crate::error::LxError;
 
 /// A parsed `host:/export` device string.
@@ -166,6 +168,17 @@ pub struct NfsOptions {
     pub soft: bool,
     /// Mount read-only regardless of what the server would allow.
     pub read_only: bool,
+    /// The server's address, when the caller already knew it.
+    ///
+    /// This is Linux's `addr=`, and it is there for the same reason: the
+    /// kernel's NFS client does not resolve names. `mount.nfs(8)` resolves
+    /// the hostname in userspace and passes the result in the option string,
+    /// so the kernel is handed an address and a name it only has to record.
+    /// Eclipse's `mount(2)` does resolve a name it is given -- there is no
+    /// `mount.nfs` helper here -- but a caller that passes `addr=` is taken
+    /// at its word and nothing is looked up, which is what makes a mount
+    /// against a literal address work on a machine with no resolver.
+    pub addr: Option<IpAddress>,
 }
 
 impl Default for NfsOptions {
@@ -179,6 +192,7 @@ impl Default for NfsOptions {
             retrans: 3,
             soft: true,
             read_only: false,
+            addr: None,
         }
     }
 }
@@ -218,6 +232,7 @@ impl NfsOptions {
                 "retrans" => out.retrans = parse_u64(value)?.min(u64::from(u32::MAX)) as u32,
                 "soft" => out.soft = true,
                 "hard" => out.soft = false,
+                "addr" => out.addr = Some(parse_addr(value)?),
                 "ro" => out.read_only = true,
                 "rw" => out.read_only = false,
                 // Everything else is the VFS's or another client's.
@@ -226,6 +241,22 @@ impl NfsOptions {
         }
         Ok(out)
     }
+}
+
+/// An `addr=` option: an address literal, bracketed or not.
+///
+/// Brackets are accepted because the device string takes them for an IPv6
+/// literal (`[fe80::1]:/export`) and a person who writes them there writes
+/// them here. A name is refused: `addr=` means "do not resolve", so a name
+/// in it is a mistake in the line rather than something to look up, and
+/// looking it up anyway would make `addr=` mean nothing.
+fn parse_addr(value: Option<&str>) -> Result<IpAddress, LxError> {
+    let s = value.ok_or(LxError::EINVAL)?;
+    let s = match s.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').ok_or(LxError::EINVAL)?,
+        None => s,
+    };
+    crate::net::dns::parse_literal(s).ok_or(LxError::EINVAL)
 }
 
 /// A port number option: 1 to 65535. Zero is refused — it is not a port, and

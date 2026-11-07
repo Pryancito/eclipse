@@ -117,6 +117,48 @@ pub async fn resolve(
     }
 }
 
+/// An address literal, as a person writes one: `10.0.0.3` or `fe80::1`.
+///
+/// Separate from [`resolve`] because the two are asked at different moments.
+/// A mount names its server in a string that may be either a name or a
+/// literal, and a literal must not go to a nameserver: there is nothing to
+/// ask about, the query would fail, and the mount would fail with it on a
+/// machine that has no resolver at all. `resolve` does not look at the
+/// hostname this way -- `lookup_hosts` reads `/etc/hosts` and nothing parses
+/// the name itself -- so the check lives here and callers who need it ask
+/// for it.
+pub(crate) fn parse_literal(s: &str) -> Option<IpAddress> {
+    parse_ipv4(s)
+        .map(IpAddress::Ipv4)
+        .or_else(|| parse_ipv6(s).map(IpAddress::Ipv6))
+}
+
+/// Resolve `hostname` without touching the network: a literal, or a name
+/// `/etc/hosts` knows.
+///
+/// `None` means "not answerable from here", which is a different thing from
+/// "no such host": the caller's next move is to await [`resolve`], and only
+/// that can say the name does not exist. Synchronous so a synchronous caller
+/// -- the mount path, which is not `async` below the syscall -- can take the
+/// common cases without being rewritten around an executor.
+pub(crate) fn resolve_local(
+    root: &Arc<dyn INode>,
+    hostname: &str,
+    family: DnsFamily,
+) -> Option<IpAddress> {
+    if let Some(ip) = parse_literal(hostname) {
+        // A literal of the wrong family is not an answer to what was asked.
+        let ok = matches!(
+            (&ip, family),
+            (_, DnsFamily::Unspec)
+                | (IpAddress::Ipv4(_), DnsFamily::V4)
+                | (IpAddress::Ipv6(_), DnsFamily::V6)
+        );
+        return if ok { Some(ip) } else { None };
+    }
+    lookup_hosts(root, hostname, family).into_iter().next()
+}
+
 fn lookup_hosts(root: &Arc<dyn INode>, hostname: &str, family: DnsFamily) -> Vec<IpAddress> {
     let Ok(inode) = root.lookup("/etc/hosts") else {
         return Vec::new();
@@ -1002,5 +1044,56 @@ mod dns_tests {
             got,
             alloc::vec![IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 7))]
         );
+    }
+
+    /// An address literal is an answer on its own, and the whole point of
+    /// `resolve_local` is that it is one **without a resolver**: the mount
+    /// path takes it synchronously, and a machine with no nameserver still
+    /// mounts from `192.168.1.10:/srv`.
+    #[test]
+    fn an_address_literal_resolves_locally_with_nothing_configured() {
+        use rcore_fs::vfs::FileSystem;
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        assert_eq!(
+            resolve_local(&root, "192.168.1.10", DnsFamily::Unspec),
+            Some(IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 10)))
+        );
+        assert!(
+            resolve_local(&root, "fe80::1", DnsFamily::Unspec).is_some(),
+            "an IPv6 literal too"
+        );
+    }
+
+    /// A literal of the wrong family is not an answer to what was asked, and
+    /// answering with it anyway would hand a `connect` an address of a
+    /// family the caller said it could not use.
+    #[test]
+    fn a_literal_of_the_wrong_family_is_not_an_answer() {
+        use rcore_fs::vfs::FileSystem;
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        assert_eq!(resolve_local(&root, "10.0.0.3", DnsFamily::V6), None);
+        assert_eq!(resolve_local(&root, "fe80::1", DnsFamily::V4), None);
+        assert!(resolve_local(&root, "10.0.0.3", DnsFamily::V4).is_some());
+        assert!(resolve_local(&root, "fe80::1", DnsFamily::V6).is_some());
+    }
+
+    /// A name `/etc/hosts` knows is answerable locally; one it does not know
+    /// is `None`, which is "ask the network", not "no such host".
+    #[test]
+    fn a_name_is_answered_locally_only_when_etc_hosts_knows_it() {
+        use rcore_fs::vfs::{FileSystem, FileType};
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let hosts = etc.create("hosts", FileType::File, 0o644).unwrap();
+        hosts.write_at(0, b"10.0.0.7 nas.local nas\n").unwrap();
+        assert_eq!(
+            resolve_local(&root, "nas", DnsFamily::Unspec),
+            Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 7))),
+            "an alias counts, as it does for `resolve`"
+        );
+        assert_eq!(resolve_local(&root, "elsewhere", DnsFamily::Unspec), None);
     }
 }

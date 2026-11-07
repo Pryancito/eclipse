@@ -93,12 +93,17 @@ pub const GREETING_TIMEOUT_MS: u64 = 60_000;
 /// Absolute and read fresh, for the reason the transport's waits are: a
 /// budget kept as "how much is left" and decremented by what each step
 /// *thought* it would take does not notice a step that overran.
-struct Budget {
+/// Public so the step *after* the greeting can share its deadline: the
+/// session's own connection to `nfsd` is a fourth step on the same
+/// `mount(2)`, and giving it a fresh sixty seconds is the very thing the
+/// one-deadline rule exists to stop.
+pub struct Budget {
     deadline: u64,
 }
 
 impl Budget {
-    fn new(total_ms: u64) -> Self {
+    /// A deadline `total_ms` from now.
+    pub fn new(total_ms: u64) -> Self {
         Self {
             deadline: now_ms().saturating_add(total_ms),
         }
@@ -106,7 +111,7 @@ impl Budget {
 
     /// The milliseconds the next step may take, or `ETIMEDOUT` if the
     /// greeting is already out of time.
-    fn left(&self) -> LxResult<u64> {
+    pub fn left(&self) -> LxResult<u64> {
         let now = now_ms();
         if now >= self.deadline {
             return Err(LxError::ETIMEDOUT);
@@ -325,7 +330,19 @@ pub fn greet_with_budget<C: Connector>(
     opts: &NfsOptions,
     budget_ms: u64,
 ) -> LxResult<Greeting> {
-    let budget = Budget::new(budget_ms);
+    greet_with_deadline(connector, source, opts, &Budget::new(budget_ms))
+}
+
+/// [`greet`] against a deadline the caller owns.
+///
+/// The mount path owns one: it greets and then opens the session's
+/// connection, and both are inside the `mount(2)` the person is waiting on.
+pub fn greet_with_deadline<C: Connector>(
+    connector: &mut C,
+    source: &NfsSource,
+    opts: &NfsOptions,
+    budget: &Budget,
+) -> LxResult<Greeting> {
     let mount_port = match opts.mountport {
         Some(port) => port,
         // No fallback: there is no well-known port for `mountd`, and a
@@ -382,7 +399,7 @@ pub fn greet_with_budget<C: Connector>(
 /// A caller who raised `timeo` asked for more patience per call, which is
 /// not a request for a shorter mount -- so their number becomes the floor
 /// rather than being overridden by it.
-fn greeting_budget(opts: &NfsOptions) -> u64 {
+pub fn greeting_budget(opts: &NfsOptions) -> u64 {
     opts.timeout_ms.max(GREETING_TIMEOUT_MS)
 }
 
@@ -481,7 +498,7 @@ fn policy(opts: &NfsOptions, timeout_ms: u64) -> super::client::RetryPolicy {
 /// Derived from the clock for the reason [`RpcClient::new`] gives: a reply
 /// from a previous connection to the same server, arriving on a reused local
 /// port, must not carry an id this client is waiting for.
-fn first_xid() -> u32 {
+pub(crate) fn first_xid() -> u32 {
     kernel_hal::timer::timer_now().as_nanos() as u32
 }
 

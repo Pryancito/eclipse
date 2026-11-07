@@ -1,8 +1,11 @@
 //! Linux mount(2) / umount2(2) helpers.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use smoltcp::wire::IpAddress;
 
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -17,6 +20,11 @@ use super::btrfs_mount::open_btrfs;
 use super::eclipsefs_mount::open_eclipsefs;
 use super::fat_mount::open_fat;
 use super::flagged_fs::{wrap_fs, wrap_fs_at};
+use super::nfs::connect::TcpConnector;
+use super::nfs::mount::connect_export;
+use super::nfs::source::{NfsOptions, NfsSource};
+use crate::net::dns::{self, DnsFamily};
+
 use super::mount_state::{
     self, build_options_string, flags_read_only, MNT_DETACH, MNT_FORCE, MS_BIND, MS_MOVE,
     MS_REMOUNT,
@@ -129,6 +137,12 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
         || fstype.eq_ignore_ascii_case("fat16")
     {
         Ok("vfat")
+    } else if fstype.eq_ignore_ascii_case("nfs") || fstype.eq_ignore_ascii_case("nfs3") {
+        // One name for both: `nfs3` is not a filesystem type Linux
+        // registers, but it is what someone writes when they mean "v3 and
+        // not v4", and this client speaks only v3 — so it is the same mount
+        // and `/proc/mounts` says `nfs`, as Linux's does for a v3 mount.
+        Ok("nfs")
     } else {
         Err(LxError::ENODEV)
     }
@@ -244,6 +258,18 @@ pub fn mount_fs(
     let fstype = parse_fstype(fstype)?;
     let mount_node = resolve_mnode(&target_norm)?;
     let source = source.ok_or(LxError::EINVAL)?;
+
+    // A network filesystem leaves the block path here, before the source is
+    // looked up as a file. This is Linux's `FS_REQUIRES_DEV`: a type that
+    // has the flag gets `mount_bdev` and its source opened as a device, and
+    // one that does not gets `mount_nodev` and its source handed over as an
+    // uninterpreted string. `nfs` is the second kind — `192.168.1.10:/srv`
+    // is not a path and `lookup_inode` on it is `ENOENT` — so the branch has
+    // to come before the lookup and not after it.
+    if is_network_fstype(fstype) {
+        return mount_nfs(source, &target_norm, &mount_node, flags, data);
+    }
+
     let source_inode = proc.lookup_inode(source)?;
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
     let read_only = flags_read_only(flags, data);
@@ -258,6 +284,148 @@ pub fn mount_fs(
     // scan is clean). The boot mounts from fstab do not come through here.
     hunter::media::note_mount(source, &target_norm, fstype);
     Ok(())
+}
+
+/// `mount -t nfs host:/export target`.
+///
+/// Everything network-specific is here and nothing of it leaks into the
+/// block path: the device string is split, the options are parsed, the
+/// server is dialled, and what comes back goes into the tree and the table
+/// the same way a block filesystem does.
+///
+/// `hunter::media::note_mount` is deliberately not called. It queues a newly
+/// mounted filesystem for an antivirus scan, which is right for a USB stick
+/// and wrong for an export: the scan would read the whole of a remote
+/// filesystem over the network at mount time, and the thing it guards
+/// against — a stick carried in and plugged in — is not what an export is.
+fn mount_nfs(
+    source: &str,
+    target: &str,
+    mount_node: &Arc<MNode>,
+    flags: usize,
+    data: &str,
+) -> LxResult<()> {
+    let parsed = NfsSource::parse(source)?;
+    let opts = nfs_options_for(flags, data)?;
+    let addr = match opts.addr {
+        Some(addr) => addr,
+        // No resolver reachable from here: see `nfs_host_to_resolve`, which
+        // is how the syscall layer resolves a name before this runs. A name
+        // that gets this far is one nothing local knows.
+        None => server_address(&parsed.host)?,
+    };
+    let mut connector = TcpConnector::new(addr);
+    let mounted = connect_export(&mut connector, &parsed, &opts)?;
+    let (fs, state) = prepare_fs(mounted.fs, flags, data);
+    mount_node.mount(fs).map_err(LxError::from)?;
+    let line = build_options_string(flags, data);
+    // The device column keeps `host:/export` as it was written, which is
+    // what Linux records (`fc->source`) and what an `umount` names.
+    super::register_mount(source, target, "nfs", &line, Some(state));
+    Ok(())
+}
+
+/// Whether `fstype`, as [`parse_fstype`] spells it, is mounted over the
+/// network rather than from a block device.
+///
+/// A function and not an `==` inside [`mount_fs`] so the two cannot drift:
+/// what routes a mount to the network path is the *output* of
+/// `parse_fstype`, and a branch written against the input (`nfs3`, say)
+/// would send `mount -t nfs3` down the block path to have its `host:/export`
+/// looked up as a file. That is a silent `ENOENT` on a mount that should
+/// have worked, and it is the kind of mismatch only a test that reads both
+/// ends catches.
+fn is_network_fstype(fstype: &str) -> bool {
+    fstype == "nfs"
+}
+
+/// The NFS options a `mount(2)` asked for, with the flags folded in.
+///
+/// `MS_RDONLY` and `ro` in the option string are one request made two ways,
+/// and the flagged-fs wrapper would refuse the writes either way. Telling
+/// the *session* too is what keeps a write from being sent to the server and
+/// refused there instead of refused here -- and what keeps a read-only mount
+/// from needing the server's cooperation to be read-only.
+fn nfs_options_for(flags: usize, data: &str) -> LxResult<NfsOptions> {
+    let mut opts = NfsOptions::parse(data)?;
+    if flags_read_only(flags, data) {
+        opts.read_only = true;
+    }
+    Ok(opts)
+}
+
+/// The server's address without asking the network: a literal, or a name
+/// `/etc/hosts` knows.
+///
+/// `ENOENT` when it is neither, which is the errno [`dns::resolve`] answers
+/// for a name that does not resolve: a name that reaches here has already
+/// been through the syscall layer's resolver, or has come from a caller that
+/// has none, and either way nothing local knows it.
+fn server_address(host: &str) -> LxResult<IpAddress> {
+    let root = super::dns_vfs_root().ok_or(LxError::ENOENT)?;
+    dns::resolve_local(&root, host, DnsFamily::Unspec).ok_or(LxError::ENOENT)
+}
+
+/// The hostname a network mount names and cannot resolve by itself, or
+/// `None` when there is nothing to resolve.
+///
+/// This exists because of where the two halves of the work can run.
+/// `mount_fs` is synchronous and is called from places that have no
+/// executor, while a DNS query is `async` — it waits for a reply, and the
+/// synchronous version of that wait used to spin a CPU at 100%. So the
+/// kernel does what Linux's userspace does: resolve the name outside the
+/// mount and hand the mount an address, which is what `addr=` is for.
+///
+/// `None` covers every case the mount can finish on its own — not an NFS
+/// mount, `addr=` already given, an address literal, a name in `/etc/hosts`
+/// — so the syscall layer awaits a resolver only when there is genuinely no
+/// other way, and a mount against a literal works on a machine that has no
+/// resolver at all.
+///
+/// A device string or option string this cannot parse is `None` as well. It
+/// is not this function's business to report it: `mount_fs` parses the same
+/// strings and refuses them with the right errno, and a second opinion here
+/// would only be a second place for the two to disagree.
+pub fn nfs_host_to_resolve(fstype: &str, source: Option<&str>, data: &str) -> Option<String> {
+    if parse_fstype(fstype).ok() != Some("nfs") {
+        return None;
+    }
+    let parsed = NfsSource::parse(source?).ok()?;
+    if NfsOptions::parse(data).ok()?.addr.is_some() {
+        return None;
+    }
+    // The literal before `/etc/hosts`, and both before the VFS root is
+    // asked for: a literal needs no files at all, so a mount against one
+    // works whether or not there is a root to read `/etc/hosts` from. With
+    // no root there is nothing local left to try, and the name goes back as
+    // one to resolve -- the syscall layer needs the same root and reports
+    // its absence there, rather than this quietly saying "nothing to do"
+    // and leaving the mount to fail further in.
+    if dns::parse_literal(&parsed.host).is_some() {
+        return None;
+    }
+    if let Some(root) = super::dns_vfs_root() {
+        if dns::resolve_local(&root, &parsed.host, DnsFamily::Unspec).is_some() {
+            return None;
+        }
+    }
+    Some(parsed.host)
+}
+
+/// `data` with `addr=<ip>` added, which is how a resolved address reaches
+/// [`mount_fs`].
+///
+/// Appended rather than inserted, and nothing already in the string is
+/// removed: an `addr=` the caller wrote is theirs, and the parse takes the
+/// last occurrence of a repeated option, so appending would override it. So
+/// the one caller asks [`nfs_host_to_resolve`] first, which says `None` when
+/// `addr=` is already there.
+pub fn with_addr_option(data: &str, addr: IpAddress) -> String {
+    if data.is_empty() {
+        format!("addr={addr}")
+    } else {
+        format!("{data},addr={addr}")
+    }
 }
 
 /// `mount --bind source target`, on the tree under `root` and the table
@@ -402,8 +570,14 @@ mod tests {
     //! and whether this kernel already provides it. Everything past them needs
     //! a block device.
 
-    use super::{is_virtual_fstype, normalize_target, parse_fstype};
+    use super::mount_state::MS_RDONLY;
+    use super::{
+        is_network_fstype, is_virtual_fstype, nfs_host_to_resolve, nfs_options_for,
+        normalize_target, parse_fstype, with_addr_option,
+    };
     use crate::error::LxError;
+    use alloc::string::String;
+    use smoltcp::wire::{IpAddress, Ipv4Address};
 
     #[test]
     fn a_path_spelled_with_extra_slashes_is_one_path() {
@@ -468,6 +642,123 @@ mod tests {
         assert!(!is_virtual_fstype("btrfs"));
         assert!(!is_virtual_fstype("vfat"));
         assert!(!is_virtual_fstype(""));
+    }
+
+    /// `nfs` is a type this kernel mounts now, and `nfs3` is the same
+    /// mount: this client speaks only v3, and `nfs3` is what someone writes
+    /// when they mean to say so.
+    #[test]
+    fn nfs_and_nfs3_are_one_type_and_are_spelled_nfs_in_the_table() {
+        assert_eq!(parse_fstype("nfs"), Ok("nfs"));
+        assert_eq!(parse_fstype("nfs3"), Ok("nfs"));
+        assert_eq!(parse_fstype("NFS"), Ok("nfs"));
+        // Still not this client's: v4 is a different protocol, not a
+        // version of this one, and accepting the name would mount it with a
+        // v3 client.
+        assert_eq!(parse_fstype("nfs4"), Err(LxError::ENODEV));
+    }
+
+    /// A literal server needs no resolver, which is the whole reason the
+    /// literal is checked before `/etc/hosts` and before the VFS root.
+    #[test]
+    fn an_address_literal_is_not_a_name_to_resolve() {
+        assert_eq!(
+            nfs_host_to_resolve("nfs", Some("192.168.1.10:/srv/media"), ""),
+            None
+        );
+        assert_eq!(nfs_host_to_resolve("nfs", Some("[fe80::1]:/srv"), ""), None);
+    }
+
+    /// `addr=` means "do not resolve", so a name beside it is a name the
+    /// caller has already resolved and does not want looked up again.
+    #[test]
+    fn an_addr_option_takes_the_place_of_resolving_the_name() {
+        assert_eq!(
+            nfs_host_to_resolve("nfs", Some("nas:/srv"), "addr=10.0.0.3"),
+            None
+        );
+        assert_eq!(
+            nfs_host_to_resolve("nfs", Some("nas:/srv"), ""),
+            Some(String::from("nas")),
+            "with no addr= and nothing local, the name goes back to be \
+             resolved"
+        );
+    }
+
+    /// Only an NFS mount has a server to resolve, and the question is asked
+    /// of every mount.
+    #[test]
+    fn nothing_is_resolved_for_a_mount_that_is_not_nfs() {
+        // The device string here is a perfectly good `host:/export`, which
+        // is the point: a test that passed `/dev/sda1` would pass however
+        // the type was checked, because the device string alone would stop
+        // it. What has to be measured is that the **type** is what decides.
+        assert_eq!(nfs_host_to_resolve("vfat", Some("nas:/srv"), ""), None);
+        assert_eq!(nfs_host_to_resolve("btrfs", Some("nas:/srv"), ""), None);
+        assert_eq!(nfs_host_to_resolve("tmpfs", Some("nas:/srv"), ""), None);
+        assert_eq!(nfs_host_to_resolve("", Some("nas:/srv"), ""), None);
+        assert_eq!(nfs_host_to_resolve("nfs", None, ""), None);
+        assert_eq!(
+            nfs_host_to_resolve("nfs3", Some("nas:/srv"), ""),
+            Some(String::from("nas")),
+            "the other spelling of the same type is resolved too"
+        );
+    }
+
+    /// What routes a mount to the network path and what `parse_fstype`
+    /// answers have to be the same string, in both directions.
+    #[test]
+    fn every_spelling_of_nfs_reaches_the_network_path_and_nothing_else_does() {
+        for name in ["nfs", "nfs3", "NFS"] {
+            let parsed = parse_fstype(name).expect(name);
+            assert!(is_network_fstype(parsed), "{} -> {}", name, parsed);
+        }
+        for name in ["btrfs", "eclipsefs", "vfat", "msdos"] {
+            let parsed = parse_fstype(name).expect(name);
+            assert!(!is_network_fstype(parsed), "{} -> {}", name, parsed);
+        }
+        // Not the *input* spelling: the branch reads what `parse_fstype`
+        // produced, and `nfs3` is not that.
+        assert!(!is_network_fstype("nfs3"));
+    }
+
+    /// A read-only mount is read-only in the session as well, so a write is
+    /// refused here rather than sent to the server to be refused there.
+    #[test]
+    fn a_read_only_mount_is_read_only_for_the_session_too() {
+        assert!(nfs_options_for(MS_RDONLY, "").unwrap().read_only);
+        assert!(nfs_options_for(0, "ro").unwrap().read_only);
+        assert!(!nfs_options_for(0, "").unwrap().read_only);
+        assert!(!nfs_options_for(0, "rw").unwrap().read_only);
+        // The option string is still parsed, and a bad value in it is still
+        // a refused mount.
+        assert_eq!(nfs_options_for(0, "rsize=0"), Err(LxError::EINVAL));
+    }
+
+    /// A device string this cannot parse is not reported here: `mount_fs`
+    /// parses the same string and refuses it with the right errno, and a
+    /// second opinion would only be a second place for the two to disagree.
+    #[test]
+    fn a_device_string_that_is_not_host_colon_export_is_left_to_mount_fs() {
+        assert_eq!(nfs_host_to_resolve("nfs", Some("nas"), ""), None);
+        assert_eq!(
+            nfs_host_to_resolve("nfs", Some("nas:/srv"), "port=abc"),
+            None
+        );
+    }
+
+    /// The resolved address reaches `mount_fs` through the option string,
+    /// which is also what puts it in `/proc/mounts` -- as Linux's NFS mounts
+    /// show it.
+    #[test]
+    fn a_resolved_address_is_appended_to_the_options_it_was_asked_about() {
+        let addr = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 3));
+        assert_eq!(with_addr_option("", addr), "addr=10.0.0.3");
+        assert_eq!(
+            with_addr_option("rw,vers=3", addr),
+            "rw,vers=3,addr=10.0.0.3",
+            "appended, and nothing already there is dropped"
+        );
     }
 }
 
