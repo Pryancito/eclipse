@@ -2541,3 +2541,88 @@ fn el_cruce_se_decide_antes_de_compilar_servo() {
          arco: un build cruzado compilaria para el anfitrion y tiraria el binario"
     );
 }
+
+/// Y en un build NATIVO: ahi lo que puede estar rancio no es solo la rootfs,
+/// es el arbol. `tools/SilverSurfer/target/release/` no lleva el arco en la
+/// ruta, asi que un binario de otro arbol --- o de este mismo antes de cambiar
+/// de anfitrion --- se reutilizaba por la mtime a secas. Con la puerta puesta,
+/// ese binario ya no se instala; sin esta limpieza, la copia del arco
+/// equivocado que hubiera en la rootfs se quedaba donde estaba y el
+/// verificador seguia abortando la imagen.
+#[test]
+fn las_copias_ajenas_se_quitan_tambien_en_un_build_nativo() {
+    let anfitrion = std::env::consts::ARCH
+        .parse::<Arch>()
+        .unwrap_or(Arch::X86_64);
+    let ajeno = if anfitrion.name() == "x86_64" {
+        Arch::Aarch64
+    } else {
+        Arch::X86_64
+    };
+
+    let root = scratch("silversurfer-nativo");
+    let usrbin = root.join("usr/bin").join("silversurfer");
+    let bin = root.join("bin").join("silversurfer");
+    elf64_de(verify::expected_machine(ajeno), &usrbin);
+    elf64_de(verify::expected_machine(ajeno), &bin);
+    let bueno = root.join("usr/bin").join("algo-del-objetivo");
+    elf64_de(verify::expected_machine(anfitrion), &bueno);
+
+    LinuxRootfs(anfitrion, Variant::Minimal).drop_foreign_silversurfer(&root);
+
+    assert!(
+        !usrbin.exists() && !bin.exists(),
+        "una copia del arco equivocado sobrevivio a un build nativo de {}",
+        anfitrion.name()
+    );
+    assert!(
+        bueno.exists(),
+        "se llevo por delante un binario del arco correcto"
+    );
+
+    // Y al contrario: el silversurfer del arco BUENO se queda. Un barrido a
+    // ciegas de esas dos rutas obligaria a recompilar Servo en cada tirada,
+    // que es media hora, y es la razon de que la limpieza mire el arco en vez
+    // de borrar por nombre.
+    let otra = scratch("silversurfer-nativo-bueno");
+    let suyo = otra.join("usr/bin").join("silversurfer");
+    elf64_de(verify::expected_machine(anfitrion), &suyo);
+    LinuxRootfs(anfitrion, Variant::Minimal).drop_foreign_silversurfer(&otra);
+    assert!(
+        suyo.exists(),
+        "la limpieza borro el silversurfer del arco bueno: la siguiente tirada \
+         se pasa media hora recompilando Servo"
+    );
+}
+
+/// Las dos puertas que faltaban en el camino nativo, y que no se pueden probar
+/// corriendo la funcion porque el camino nativo COMPILA SERVO:
+///
+/// - `needs_build` tiene que mirar el arco. Un binario del arco equivocado mas
+///   nuevo que las fuentes pasaba por al dia, no se reconstruia, y la puerta
+///   de la copia se quedaba sin nada que instalar.
+/// - el rescate de `/bin/silversurfer` tambien. Ese brazo lo alcanza ahora un
+///   `executable` rechazado por la puerta, asi que sin comprobar el arco
+///   ascendia a `usr/bin/` justo el binario que el verificador rechaza.
+#[test]
+fn el_camino_nativo_mira_el_arco_al_reconstruir_y_al_rescatar_de_bin() {
+    let src = include_str!("mod.rs");
+    let install = src
+        .split("fn install_silversurfer(&self, rootfs: &Path) {")
+        .nth(1)
+        .expect("install_silversurfer moved")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    let junta = install.replace('\n', " ");
+    assert!(
+        junta.contains("let needs_build = !self.cached_for_target(&executable)"),
+        "`needs_build` no mira el arco: un binario del arco equivocado mas nuevo \
+         que las fuentes suprime la reconstruccion"
+    );
+    assert!(
+        junta.contains("stale.is_file() && self.cached_for_target(&stale)"),
+        "el rescate de /bin/silversurfer no mira el arco: ascenderia a usr/bin/ \
+         el binario que el verificador rechaza"
+    );
+}
