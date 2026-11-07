@@ -2088,11 +2088,20 @@ impl Executor {
                 if rescue_kicked && task_info.is_none() && !last_rescued {
                     crate::runtime::note_rescue_kick_empty();
                 }
-                // Balance pull, unchanged: only on the rebalance tick, and only
-                // when we have exactly one task. A rescue kick is not a reason
-                // to rebalance.
-                if rebalance && task_info.is_none() && self.task_collection.ready_num() == Some(1) {
-                    task_info = crate::runtime::steal_for_balance();
+                // Balance pull: only on the rebalance tick, and only off a
+                // peer that is ahead of us proportionally (see
+                // `runtime::balance_victim_min`). A rescue kick is not a
+                // reason to rebalance.
+                //
+                // This used to read `ready_num() == Some(1)`, so a CPU with
+                // two or more runnable tasks never pulled and a lopsided
+                // split was a fixed point rather than a transient.
+                if rebalance && task_info.is_none() {
+                    if let Some(local) = self.task_collection.ready_num() {
+                        if local >= 1 {
+                            task_info = crate::runtime::steal_for_balance(local);
+                        }
+                    }
                 }
             }
             last_rescued = task_info.is_some();
