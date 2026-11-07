@@ -41,6 +41,14 @@ pub struct Job {
     /// How many more levels of jobs may hang under this one.
     max_height: u32,
     inner: Mutex<JobInner>,
+    /// Held from a change to the child lists until the `ZX_JOB_NO_*` signals
+    /// that follow from it are published (`publish_emptiness`), so two
+    /// changes publish in the order they were made. The signals are
+    /// published with `inner` dropped; without this the last process leaving
+    /// could publish its empty snapshot after a concurrent addition had
+    /// published the full one, and an occupied job would say
+    /// `JOB_NO_PROCESSES` for good. Never taken while holding `inner`.
+    publishing: Mutex<()>,
 }
 
 /// How deep the job tree goes under the root: Zircon's `kRootJobMaxHeight`.
@@ -111,6 +119,7 @@ impl Job {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
             max_height: ROOT_JOB_MAX_HEIGHT,
             inner: Mutex::new(JobInner::default()),
+            publishing: Mutex::new(()),
         });
         job.inner.lock().self_ref = Arc::downgrade(&job);
         job.base.signal_set(JobInner::default().emptiness_signals());
@@ -125,6 +134,7 @@ impl Job {
         if self.max_height == 0 {
             return Err(ZxError::OUT_OF_RANGE);
         }
+        let _in_order = self.publishing.lock();
         let mut inner = self.inner.lock();
         if inner.killed {
             return Err(ZxError::BAD_STATE);
@@ -138,6 +148,7 @@ impl Job {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
             max_height: self.max_height - 1,
             inner: Mutex::new(JobInner::default()),
+            publishing: Mutex::new(()),
         });
         let child_weak = Arc::downgrade(&child);
         child.inner.lock().self_ref = child_weak.clone();
@@ -152,6 +163,7 @@ impl Job {
     }
 
     fn remove_child(&self, to_remove: &Weak<Job>) {
+        let _in_order = self.publishing.lock();
         let mut inner = self.inner.lock();
         inner.children.retain(|child| !to_remove.ptr_eq(child));
         let signals = inner.emptiness_signals();
@@ -171,7 +183,8 @@ impl Job {
     /// child jobs (`JobTest.WaitTest`) waited forever and took the whole
     /// core-test run with it. Called with the job lock DROPPED: the waiters'
     /// callbacks run under the object's own lock, and a port's may look back
-    /// at the job.
+    /// at the job. Called with `publishing` HELD, so the snapshots go out in
+    /// the order the lists changed.
     fn publish_emptiness(&self, signals: Signal) {
         const ALL: Signal = Signal::JOB_NO_JOBS
             .union(Signal::JOB_NO_PROCESSES)
@@ -254,6 +267,7 @@ impl Job {
 
     /// Add a process to the job.
     pub(super) fn add_process(&self, process: Arc<Process>) -> ZxResult {
+        let _in_order = self.publishing.lock();
         let mut inner = self.inner.lock();
         if inner.killed {
             return Err(ZxError::BAD_STATE);
@@ -267,6 +281,7 @@ impl Job {
 
     /// Remove a process from the job.
     pub(super) fn remove_process(&self, id: KoID) {
+        let _in_order = self.publishing.lock();
         let mut inner = self.inner.lock();
         inner.processes.retain(|proc| proc.id() != id);
         let signals = inner.emptiness_signals();

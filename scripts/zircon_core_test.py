@@ -145,7 +145,15 @@ def guest_filters(patterns, keep_out=()):
     filters = []
     for suite in suites or ["*"]:
         positive = "*" if suite == "*" else suite + ".*"
-        negatives = [name for name in keep_out if suite == "*" or name.startswith(suite + ".")]
+        # A hanger may be a pattern on the suite side too (`Sync*.SignalR*`),
+        # so it is the suite that is matched against it, not the other way
+        # round: a prefix test left `SyncCompletionTest.*` without its
+        # negative, and the run hung on the very case the entry names.
+        negatives = [
+            name
+            for name in keep_out
+            if suite == "*" or fnmatch.fnmatchcase(suite, name.split(".", 1)[0])
+        ]
         # `POSITIVE:-NEGATIVE`, with the colon BEFORE the minus. zxtest's
         # matcher walks the whole option as one C string and only `:` or the
         # end stops a pattern, so in `Suite.*-Suite.A` the positive wildcard
@@ -189,12 +197,36 @@ def load_expectations(arch, libos):
         if len(fields) == 2 and not line.startswith("#"):
             cases[fields[0]] = None if fields[1] == "OK" else f"Existing classification: {fields[1]}"
     overrides = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
-    for pattern in overrides.get("supported", []):
+    supported = supported_patterns(overrides, platform)
+    for pattern in supported:
         for name in cases:
             if fnmatch.fnmatchcase(name, pattern):
                 cases[name] = None
     cases.update(platform_entries(overrides["skips"], platform))
-    return cases, platform_entries(overrides.get("needs_hardware", []), platform), hanging_cases(overrides, platform)
+    return (
+        cases,
+        platform_entries(overrides.get("needs_hardware", []), platform),
+        hanging_cases(overrides, platform),
+        supported,
+    )
+
+
+def supported_patterns(overrides, platform):
+    """The `supported` patterns that apply to `platform`: a bare string applies
+    everywhere, a `{test, platforms}` entry only where it says.
+
+    A pattern promoted on the strength of one platform's runs must not reach
+    the others: the 284 cases measured green on libos x86_64 (#2499) went in
+    as bare strings and the bare-metal x86_64 job, which cannot run most of
+    them, asked for 744 cases instead of 468 and died in
+    `Property.RegisterGsNoncanonical`, which QEMU cannot pass."""
+    patterns = []
+    for entry in overrides.get("supported", []):
+        if isinstance(entry, str):
+            patterns.append(entry)
+        elif any(fnmatch.fnmatchcase(platform, pattern) for pattern in entry["platforms"]):
+            patterns.append(entry["test"])
+    return patterns
 
 
 def platform_entries(entries, platform):
@@ -413,11 +445,10 @@ def main():
         runner.finish({})
         return 1
     available = discovered_tests(runner.output)
-    expectations, hardware, hangs = load_expectations(args.arch, args.libos)
-    config = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
+    expectations, hardware, hangs, supported = load_expectations(args.arch, args.libos)
     selection = args.test or (GROUPS[args.group] if args.group else "*")
     selected, skipped, needs_hardware = triage(
-        available, selection.split(","), expectations, hardware, config.get("supported", []), args.include_skipped, hangs
+        available, selection.split(","), expectations, hardware, supported, args.include_skipped, hangs
     )
     for name, reason in sorted(needs_hardware.items()):
         print(f"NEEDS-HARDWARE: {name}: {reason}")
@@ -431,17 +462,34 @@ def main():
     # selection names. Individual names cannot be batched into one run (see
     # `guest_filters`), so each run also sweeps up tests nobody asked for; they
     # are reported but they do not decide the run.
-    # The cases that never finish stay out of the guest's filter; the ones
-    # the selection asked for by name (and that triage therefore selected)
-    # are the exception.
-    keep_out = sorted(name for name in hangs if name not in selected)
-    for pattern in guest_filters(selection.split(","), keep_out):
+    for pattern, covered in planned_runs(selected, selection.split(","), hangs):
+        runner.run(pattern, expected=covered)
+    return 0 if runner.finish(skipped, needs_hardware) else 1
+
+
+def planned_runs(selected, patterns, hangs):
+    """The guest runs that cover `selected`, as `(filter, expected)` pairs.
+
+    The cases that never finish stay out of the guest's filter. The ones
+    the selection asked for by name (and that triage therefore selected)
+    are the exception, and each gets a run of its own with its exact name
+    as the filter: a hang entry is a pattern, and the pattern stays in the
+    suite's negative filter so the other cases it covers keep out. Dropping
+    the pattern instead let the opted-in case run but every other hanger
+    under it too; keeping it with the case among `selected` left the case
+    filtered out of the guest and reported missing.
+    """
+    opted_in = [
+        name for name in selected if any(fnmatch.fnmatchcase(name, pattern) for pattern in hangs)
+    ]
+    runs = [(name, [name]) for name in opted_in]
+    for pattern in guest_filters(patterns, sorted(hangs)):
         positive = pattern.split(",", 1)[0]
         prefix = positive[:-1] if positive.endswith(".*") else ""
-        covered = [name for name in selected if name.startswith(prefix)]
+        covered = [name for name in selected if name.startswith(prefix) and name not in opted_in]
         if covered:
-            runner.run(pattern, expected=covered)
-    return 0 if runner.finish(skipped, needs_hardware) else 1
+            runs.append((pattern, covered))
+    return runs
 
 
 if __name__ == "__main__":

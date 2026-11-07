@@ -149,6 +149,9 @@ const PAGE_FAULT_VECTOR: i64 = 14;
 /// CPU wrote them; anything above is not for the kernel.
 const PAGE_FAULT_ERROR_BITS: usize = 0x1f;
 
+/// `rflags.TF`: the trap flag, which single-steps the code it is live in.
+const X86_FLAGS_TF: u64 = 0x100;
+
 /// The faulting linear address of the page fault this host thread last
 /// bridged: the kernel's `CR2`, which a hosted kernel cannot read as a
 /// register. Kernel context only, right after the trap, before another one
@@ -478,6 +481,14 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     // The guest's flags, for the record: the entry scrubs the live ones (DF,
     // AC, TF) before the kernel runs, so this is the only copy that survives.
     words.add(5).write(gregs[libc::REG_EFL as usize] as u64);
+    // And TF comes off the live ones HERE, not in the entry: the host
+    // restores these flags on its way out, and a guest that was being
+    // single-stepped (the trap that brought it here was its own `TF`) would
+    // step the entry's first instruction and trap again before the entry's
+    // own scrub, with the guest's `fs` still loaded, so the bridge would
+    // take that trap for another fault of the guest's, at an address inside
+    // the entry, and never get out.
+    gregs[libc::REG_EFL as usize] &= !(X86_FLAGS_TF as i64);
     gregs[libc::REG_RSP as usize] = words as i64;
     gregs[libc::REG_RIP as usize] = trapframe::fault_fn_entry as *const () as i64;
 }

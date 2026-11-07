@@ -573,7 +573,7 @@ impl Syscall<'_> {
             return Err(ZxError::INVALID_ARGS);
         }
         let cancel = proc.get_cancel_token(handle_value)?;
-        port.wait_async(
+        let observers = port.wait_async(
             &object,
             (proc.id(), handle_value),
             key,
@@ -584,7 +584,8 @@ impl Syscall<'_> {
         // Registered, and past the limit: the observer stays and the thread
         // gets the policy exception, which kills the process unless a
         // handler resumes it -- as Zircon's `PortDispatcher::MakeObserver`.
-        let observers = port.observer_count();
+        // The count is the one at registration, so a registration that was
+        // within the limit is never blamed for one that was not.
         if observers > MAX_PORT_OBSERVERS {
             warn!(
                 "port: {} observers on one port ({}): raising the policy exception",

@@ -265,14 +265,22 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // and aborted on a SafeStack canary after `add %bh, %bh` had corrupted
     // `rbx`. See `kernel_hal::fault_bridge`.
     //
-    // aarch64 libos has no fault bridge yet and keeps the rebuilt blob:
-    // scripts/gen-prebuilt.sh generates `libzircon-libos.so` alone and says
-    // so outright -- "Userboot and ZBI artifacts must remain the unmodified
-    // upstream builds" -- because the libos patch reworks the syscall entry
-    // the vDSO makes, nothing else.
-    #[cfg(all(feature = "libos", not(target_arch = "x86_64")))]
+    // Every other hosted build keeps the rebuilt blob, because the trap is a
+    // Linux x86_64 thing: aarch64 libos has no fault bridge yet, and on
+    // macOS a `syscall` the host does not trap is a Darwin system call made
+    // with the guest's registers. scripts/gen-prebuilt.sh generates
+    // `libzircon-libos.so` alone and says so outright -- "Userboot and ZBI
+    // artifacts must remain the unmodified upstream builds" -- because the
+    // libos patch reworks the syscall entry the vDSO makes, nothing else.
+    #[cfg(all(
+        feature = "libos",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    ))]
     let vdso = boot_library!("libzircon-libos");
-    #[cfg(not(all(feature = "libos", not(target_arch = "x86_64"))))]
+    #[cfg(not(all(
+        feature = "libos",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    )))]
     let vdso = boot_library!("libzircon");
     #[cfg(all(feature = "libos", target_os = "linux", target_arch = "x86_64"))]
     {
@@ -350,8 +358,12 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
                 .expect("vDSO has no DATA_CONSTANTS symbol") as usize;
         vmar.map_from_elf(&elf, vdso_vmo.clone()).unwrap();
         // The rebuilt libos vDSO jumps through a slot the kernel fills.
-        // The real one, which x86_64 libos boots too now, has no such slot.
-        #[cfg(all(feature = "libos", not(target_arch = "x86_64")))]
+        // The real one, which Linux x86_64 libos boots too now, has no such
+        // slot.
+        #[cfg(all(
+            feature = "libos",
+            not(all(target_os = "linux", target_arch = "x86_64"))
+        ))]
         {
             let offset = elf
                 .get_symbol_address("zcore_syscall_entry")

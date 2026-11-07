@@ -625,6 +625,26 @@ impl VmAddressRegion {
         }
     }
 
+    /// Whether this address space already has its vDSO code mapped: Zircon
+    /// allows one executable mapping of the vDSO per process, and refuses
+    /// the second with `ACCESS_DENIED` before mapping anything.
+    pub fn has_vdso_code(&self) -> bool {
+        self.vdso_code.lock().is_some()
+    }
+
+    /// Whether `[begin, end)` touches the vDSO's code mapping. Nothing is
+    /// allowed to unmap, protect or map over that range (`ACCESS_DENIED`, as
+    /// Zircon's `VmAddressRegion` answers): [`syscall_may_come_from`] trusts
+    /// the recorded range, so what is mapped there has to stay the vDSO.
+    ///
+    /// [`syscall_may_come_from`]: VmAddressRegion::syscall_may_come_from
+    fn touches_vdso_code(&self, begin: usize, end: usize) -> bool {
+        match *self.vdso_code.lock() {
+            Some((start, stop)) => begin < stop && start < end,
+            None => false,
+        }
+    }
+
     /// Whether a syscall whose instruction sits at `pc` -- the address the
     /// trap saved, just past it -- is one the vDSO issued.
     ///
@@ -936,12 +956,17 @@ impl VmAddressRegion {
         if !page_aligned(addr) || !page_aligned(len) || len == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
+        // A range that wraps the address space names nothing; a wrapped end
+        // would also pass the vDSO check below and misplace the cut.
+        let end = addr.checked_add(len).ok_or(ZxError::INVALID_ARGS)?;
+        if self.touches_vdso_code(addr, end) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
         // Allocation-free ring write (see `VmarInner::recent_unmaps`).
         inner.recent_unmaps[inner.unmap_head] = (addr, len, why);
         inner.unmap_head = (inner.unmap_head + 1) % UNMAP_HISTORY;
 
         let begin = addr;
-        let end = addr + len;
         // check partial overlapped sub-regions
         for vmar in inner.children.iter() {
             if vmar.partial_overlap(begin, end) {
@@ -1004,7 +1029,10 @@ impl VmAddressRegion {
         if !page_aligned(addr) || !page_aligned(len) || len == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let end_addr = addr + len;
+        let end_addr = addr.checked_add(len).ok_or(ZxError::INVALID_ARGS)?;
+        if self.touches_vdso_code(addr, end_addr) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
 
         // Collect work items under the VMAR lock, then apply without holding it.
         let (children, mappings) = {
@@ -5363,6 +5391,9 @@ mod range_allows_benches;
 
 #[cfg(test)]
 mod past_end_tests;
+
+#[cfg(test)]
+mod vdso_code_mapping_tests;
 
 #[cfg(test)]
 mod process_memory_tests {

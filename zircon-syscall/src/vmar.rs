@@ -199,6 +199,12 @@ impl Syscall<'_> {
         }
         let vmar_offset = if is_specific { Some(vmar_offset) } else { None };
         let vmo_is_vdso = zircon_object::task::is_vdso_vmo(vmo.id());
+        if vmo_is_vdso && mapping_flags.contains(MMUFlags::EXECUTE) && vmar.has_vdso_code() {
+            // One executable mapping of the vDSO per process, as Zircon's
+            // `VmAddressRegion::CreateSubVmarInternal`: the recorded range is
+            // what `syscall_may_come_from` trusts.
+            return Err(ZxError::ACCESS_DENIED);
+        }
         let vaddr = vmar.map_ext(
             vmar_offset,
             vmo,

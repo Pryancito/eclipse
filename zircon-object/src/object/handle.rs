@@ -1,4 +1,4 @@
-use {super::*, alloc::sync::Arc};
+use {super::*, alloc::sync::Arc, alloc::vec::Vec, futures::channel::oneshot::Sender};
 
 /// The value refers to a Handle in user space.
 pub type HandleValue = u32;
@@ -27,23 +27,35 @@ pub struct Handle {
     /// other thing that ends a parked `zx_channel_call` -- see
     /// [`KObjectBase::on_handle_lost`].
     detached: bool,
+    /// The waits parked on the value this handle had in the table it was
+    /// taken out of (`zx_object_wait_one` leaves one token per wait), kept
+    /// with the handle while it travels in a channel message. They go off
+    /// when the handle is closed, or when it lands in a table again -- that
+    /// is Zircon, where reading a handle out of a channel makes a new one
+    /// and destroys the one the wait was on, and where writing it in does
+    /// not (`HandleTransferTest.CancelsWait`: the waiter is still
+    /// `BLOCKED_WAIT_ONE` after the write, and cancelled by the read). They
+    /// used to go off at the write, which left that test to a race.
+    wakes_on_arrival: Vec<Sender<()>>,
 }
 
 impl Clone for Handle {
     fn clone(&self) -> Self {
         self.object.handle_opened();
         // A clone is a NEW handle. It inherits nothing of the original's
-        // place in a table, so it is never a re-home.
+        // place in a table, so it is never a re-home, and nobody waits on it.
         Handle {
             object: self.object.clone(),
             rights: self.rights,
             detached: false,
+            wakes_on_arrival: Vec::new(),
         }
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        self.wake_the_waits();
         self.object.handle_closed();
     }
 }
@@ -56,6 +68,19 @@ impl Handle {
             object,
             rights,
             detached: false,
+            wakes_on_arrival: Vec::new(),
+        }
+    }
+
+    /// Carry the waits parked on the table value this handle just left, to
+    /// go off when it is closed or arrives in a table (see `wakes_on_arrival`).
+    pub(crate) fn carry_waits(&mut self, wakes: Vec<Sender<()>>) {
+        self.wakes_on_arrival.extend(wakes);
+    }
+
+    fn wake_the_waits(&mut self) {
+        for wake in self.wakes_on_arrival.drain(..) {
+            let _ = wake.send(());
         }
     }
 
@@ -71,6 +96,7 @@ impl Handle {
     /// Put this handle back in a handle table, telling the object if it is
     /// arriving from somewhere else rather than being brand new.
     pub(crate) fn attach(&mut self) {
+        self.wake_the_waits();
         if self.detached {
             self.detached = false;
             self.object.handle_rehomed();

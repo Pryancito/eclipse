@@ -10,7 +10,7 @@ use kernel_hal::sync::Mutex;
 
 use super::exception::{ExceptionChannelType, Exceptionate};
 use super::job_policy::{JobPolicy, PolicyAction, PolicyCondition};
-use super::{Job, Task, Thread, ThreadFn};
+use super::{Job, Task, Thread, ThreadFn, ThreadState};
 use crate::object::{Handle, HandleBasicInfo, HandleValue, INVALID_HANDLE};
 use crate::object::{KObjectBase, KernelObject, KoID, Rights, Signal};
 use crate::{define_count_helper, impl_kobject};
@@ -800,11 +800,26 @@ impl Process {
             thread.set_first_thread();
         }
         let res = thread.start_with(setup, thread_fn);
-        if res.is_err() && became_running {
-            let mut inner = self.inner.lock();
-            if inner.status == Status::Running {
-                inner.status = Status::Init;
+        // Two starts of the same new thread at once: the one that moved the
+        // process to `Running` may be the one `start_with` refuses, because
+        // the other got there first. Its transition stands then, since the
+        // thread IS running; what goes back to `Init` is only a transition
+        // nothing came of. And the start that won re-asserts `Running`, in
+        // case the loser's roll-back slipped in between.
+        match &res {
+            Ok(()) => {
+                let mut inner = self.inner.lock();
+                if inner.status == Status::Init {
+                    inner.status = Status::Running;
+                }
             }
+            Err(_) if became_running => {
+                let mut inner = self.inner.lock();
+                if inner.status == Status::Running && thread.state() == ThreadState::New {
+                    inner.status = Status::Init;
+                }
+            }
+            Err(_) => {}
         }
         res
     }
@@ -1769,12 +1784,13 @@ impl ProcessInner {
             .handles
             .remove(&handle_value)
             .ok_or(ZxError::BAD_HANDLE)?;
-        // The per-handle-value tokens (`zx_object_wait_one`) go off here, as
-        // they always have: that wait is over the moment its handle value
-        // stops naming anything, closed or transferred.
-        for sender in queue {
-            let _ = sender.send(());
-        }
+        // The per-handle-value tokens (`zx_object_wait_one`) travel with the
+        // handle: a closed handle fires them when it is dropped, a moved one
+        // when it is read out of its channel into a table again. They used
+        // to go off here, which cancelled a wait at the WRITE of its handle
+        // into a channel, where Zircon keeps it blocked until the read
+        // (`HandleTransferTest.CancelsWait`).
+        handle.carry_waits(queue);
         // The handle itself lives on -- the caller may be moving it into a
         // channel message -- so mark it as being between tables.
         handle.detach();
@@ -3005,6 +3021,40 @@ mod ext_and_lifecycle_tests {
             token.try_recv(),
             Ok(Some(())),
             "the wait parked on that handle was never told"
+        );
+    }
+
+    /// A handle written into a channel is still a live handle, and the wait
+    /// parked on it goes on: it ends when the handle is read out into a
+    /// table again (Zircon makes a new handle there and destroys the one
+    /// the wait was on), or when the message carrying it is thrown away.
+    /// `HandleTransferTest.CancelsWait` checks the waiter is still blocked
+    /// after the write and cancelled by the read.
+    #[test]
+    fn a_handle_in_transit_keeps_its_wait_until_it_arrives_or_dies() {
+        let writer = proc();
+        let reader = proc();
+        let value = writer.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let mut token = writer.get_cancel_token(value).unwrap();
+        let in_transit = writer.remove_handle(value).unwrap();
+        assert_eq!(
+            token.try_recv(),
+            Ok(None),
+            "written into a channel: still waiting"
+        );
+
+        reader.add_handle(in_transit);
+        assert_eq!(token.try_recv(), Ok(Some(())), "read out: the wait is over");
+
+        let value = writer.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let mut token = writer.get_cancel_token(value).unwrap();
+        let in_transit = writer.remove_handle(value).unwrap();
+        assert_eq!(token.try_recv(), Ok(None));
+        drop(in_transit);
+        assert_eq!(
+            token.try_recv(),
+            Ok(Some(())),
+            "the message was thrown away: over too"
         );
     }
 
