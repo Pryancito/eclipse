@@ -249,6 +249,30 @@ class HangingCases(unittest.TestCase):
         self.assertEqual(skipped, {"Threads.Hangs": "cut short"})
         self.assertEqual(runner.guest_filters(["*"], sorted(hangs)), ["*,-Threads.Ha*"])
 
+    def test_a_hang_pattern_with_a_wildcard_suite_still_keeps_out_of_the_suite_it_names(self):
+        keep_out = ["Sync*.SignalR*", "Threads.ThreadL*"]
+        self.assertEqual(
+            runner.guest_filters(["SyncCompletionTest.*"], keep_out),
+            ["SyncCompletionTest.*,-Sync*.SignalR*"],
+        )
+        self.assertEqual(runner.guest_filters(["Threads.One"], keep_out), ["Threads.*,-Threads.ThreadL*"])
+        self.assertEqual(runner.guest_filters(["FifoTest.*"], keep_out), ["FifoTest.*"])
+
+    def test_a_hanger_asked_for_by_name_runs_alone_and_its_pattern_still_keeps_the_others_out(self):
+        hangs = {"Threads.X86Ac*": "kills the guest"}
+        selected = ["Threads.Good", "Threads.X86AcFlagUserCopy"]
+        self.assertEqual(
+            runner.planned_runs(selected, ["Threads.X86AcFlagUserCopy", "Threads.Good"], hangs),
+            [
+                ("Threads.X86AcFlagUserCopy", ["Threads.X86AcFlagUserCopy"]),
+                ("Threads.*,-Threads.X86Ac*", ["Threads.Good"]),
+            ],
+        )
+        self.assertEqual(
+            runner.planned_runs(["Threads.Good"], ["*"], hangs),
+            [("*,-Threads.X86Ac*", ["Threads.Good"])],
+        )
+
     def test_the_flag_is_read_off_the_skip_entry_for_the_platform(self):
         overrides = {"skips": [
             {"test": "Threads.Hangs", "platforms": ["*-libos"], "reason": "why", "hangs": True},

@@ -223,7 +223,10 @@ impl Syscall<'_> {
         // well as on the close, which made the test a coin flip decided by
         // which of the two happened within the millisecond.
         let cancel_token = channel.on_handle_lost();
-        let future = channel.call(message);
+        let (pending, future) = channel.call_counted(message)?;
+        // The request is on the peer's queue before the wait, so the one
+        // that went past the limit owes the exception now, as a write would.
+        self.report_channel_full(pending).await;
         pin_mut!(future);
         let reply = self
             .thread
@@ -290,7 +293,10 @@ impl Syscall<'_> {
         // well as on the close, which made the test a coin flip decided by
         // which of the two happened within the millisecond.
         let cancel_token = channel.on_handle_lost();
-        let future = channel.call(message);
+        let (pending, future) = channel.call_counted(message)?;
+        // The request is on the peer's queue before the wait, so the one
+        // that went past the limit owes the exception now, as a write would.
+        self.report_channel_full(pending).await;
         pin_mut!(future);
         let reply = self
             .thread

@@ -164,7 +164,26 @@ impl Channel {
     /// arrives later is an ordinary message on this endpoint, as in Zircon.
     /// The slot used to outlive the future, so every timed-out call left one
     /// behind for good and swallowed its late reply.
-    pub async fn call(self: &Arc<Self>, mut msg: T) -> ZxResult<T> {
+    pub async fn call(self: &Arc<Self>, msg: T) -> ZxResult<T> {
+        self.call_counted(msg)?.1.await
+    }
+
+    /// `call`, split where the syscall layer needs it: the request is queued
+    /// here and now, and what comes back is how many messages the peer holds
+    /// unread with it -- the same count [`write_counted`] answers, for the
+    /// same policy exception past [`MAX_PENDING_MESSAGE_COUNT`] -- plus the
+    /// future that waits for the reply. A `call` is a write as far as the
+    /// peer's queue is concerned, and Zircon raises
+    /// `ZX_EXCP_POLICY_CODE_CHANNEL_FULL_WRITE` for it too: without that a
+    /// caller whose peer never answers, each call timing out in turn, would
+    /// grow the peer's queue without end and nothing would ever say so.
+    ///
+    /// [`write_counted`]: Channel::write_counted
+    #[allow(clippy::type_complexity)]
+    pub fn call_counted(
+        self: &Arc<Self>,
+        mut msg: T,
+    ) -> ZxResult<(usize, impl core::future::Future<Output = ZxResult<T>> + '_)> {
         assert!(msg.data.len() >= 4);
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         let txid = self.new_txid();
@@ -176,17 +195,20 @@ impl Channel {
             txid,
             receiver: Some(receiver),
         };
-        peer.push_general(msg)?;
+        let pending = peer.push_general(msg)?;
         drop(peer);
-        let reply = {
-            let receiver = slot.receiver.as_mut().expect("just set");
-            receiver.await.unwrap_or(Err(ZxError::INTERNAL))
+        let reply = async move {
+            let reply = {
+                let receiver = slot.receiver.as_mut().expect("just set");
+                receiver.await.unwrap_or(Err(ZxError::INTERNAL))
+            };
+            // The reply is in hand, so there is nothing left for `Drop` to
+            // put back on the endpoint.
+            slot.receiver = None;
+            drop(slot);
+            reply
         };
-        // The reply is in hand, so there is nothing left for `Drop` to put
-        // back on the endpoint.
-        slot.receiver = None;
-        drop(slot);
-        reply
+        Ok((pending, reply))
     }
 
     /// Push a message to general queue, called from peer. Answers how many
@@ -573,6 +595,35 @@ mod tests {
             0,
             "a reply the parked call takes is not pending on the endpoint"
         );
+    }
+
+    /// A `call` is a write to the peer, and the one past the limit says so
+    /// the same way: the count comes back before the reply is waited for,
+    /// so the syscall layer can raise the policy exception that keeps a
+    /// caller whose peer never answers out of the kernel heap.
+    #[test]
+    fn a_call_reports_how_many_the_peer_holds_unread_before_waiting() {
+        let (caller, callee) = Channel::create();
+        for _ in 0..MAX_PENDING_MESSAGE_COUNT {
+            caller.write(message(b"fill")).unwrap();
+        }
+        let (pending, reply) = caller.call_counted(message(b"call")).unwrap();
+        assert_eq!(
+            pending,
+            MAX_PENDING_MESSAGE_COUNT + 1,
+            "the request past the limit is queued and counted, not refused"
+        );
+        let mut reply: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>>>> = Box::pin(reply);
+        assert!(reply
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(reply);
+        assert!(
+            caller.call_reply.lock().is_empty(),
+            "a call given up frees its reply slot"
+        );
+        assert_eq!(callee.read().unwrap().data, b"fill");
     }
 
     /// Every timed-out `zx_channel_call` used to leave its reply slot in the

@@ -145,7 +145,15 @@ def guest_filters(patterns, keep_out=()):
     filters = []
     for suite in suites or ["*"]:
         positive = "*" if suite == "*" else suite + ".*"
-        negatives = [name for name in keep_out if suite == "*" or name.startswith(suite + ".")]
+        # A hanger may be a pattern on the suite side too (`Sync*.SignalR*`),
+        # so it is the suite that is matched against it, not the other way
+        # round: a prefix test left `SyncCompletionTest.*` without its
+        # negative, and the run hung on the very case the entry names.
+        negatives = [
+            name
+            for name in keep_out
+            if suite == "*" or fnmatch.fnmatchcase(suite, name.split(".", 1)[0])
+        ]
         # `POSITIVE:-NEGATIVE`, with the colon BEFORE the minus. zxtest's
         # matcher walks the whole option as one C string and only `:` or the
         # end stops a pattern, so in `Suite.*-Suite.A` the positive wildcard
@@ -431,17 +439,34 @@ def main():
     # selection names. Individual names cannot be batched into one run (see
     # `guest_filters`), so each run also sweeps up tests nobody asked for; they
     # are reported but they do not decide the run.
-    # The cases that never finish stay out of the guest's filter; the ones
-    # the selection asked for by name (and that triage therefore selected)
-    # are the exception.
-    keep_out = sorted(name for name in hangs if name not in selected)
-    for pattern in guest_filters(selection.split(","), keep_out):
+    for pattern, covered in planned_runs(selected, selection.split(","), hangs):
+        runner.run(pattern, expected=covered)
+    return 0 if runner.finish(skipped, needs_hardware) else 1
+
+
+def planned_runs(selected, patterns, hangs):
+    """The guest runs that cover `selected`, as `(filter, expected)` pairs.
+
+    The cases that never finish stay out of the guest's filter. The ones
+    the selection asked for by name (and that triage therefore selected)
+    are the exception, and each gets a run of its own with its exact name
+    as the filter: a hang entry is a pattern, and the pattern stays in the
+    suite's negative filter so the other cases it covers keep out. Dropping
+    the pattern instead let the opted-in case run but every other hanger
+    under it too; keeping it with the case among `selected` left the case
+    filtered out of the guest and reported missing.
+    """
+    opted_in = [
+        name for name in selected if any(fnmatch.fnmatchcase(name, pattern) for pattern in hangs)
+    ]
+    runs = [(name, [name]) for name in opted_in]
+    for pattern in guest_filters(patterns, sorted(hangs)):
         positive = pattern.split(",", 1)[0]
         prefix = positive[:-1] if positive.endswith(".*") else ""
-        covered = [name for name in selected if name.startswith(prefix)]
+        covered = [name for name in selected if name.startswith(prefix) and name not in opted_in]
         if covered:
-            runner.run(pattern, expected=covered)
-    return 0 if runner.finish(skipped, needs_hardware) else 1
+            runs.append((pattern, covered))
+    return runs
 
 
 if __name__ == "__main__":

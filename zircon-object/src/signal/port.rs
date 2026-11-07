@@ -170,11 +170,11 @@ impl Port {
         signals: Signal,
         options: WaitAsyncOptions,
         cancel: Option<Receiver<()>>,
-    ) -> ZxResult {
+    ) -> ZxResult<usize> {
         if object.id() == self.base.id {
             return Err(ZxError::NOT_SUPPORTED);
         }
-        let id = {
+        let (id, observers) = {
             let mut inner = self.inner.lock();
             inner.next_observer += 1;
             let id = inner.next_observer;
@@ -202,7 +202,7 @@ impl Port {
                     .observers
                     .retain(|_, observer| !observer.handle_closed());
             }
-            id
+            (id, inner.observers.len())
         };
         let port = Arc::downgrade(self);
         object.add_signal_callback(Box::new(move |observed| {
@@ -211,7 +211,11 @@ impl Port {
             };
             port.signal_observer(id, observed)
         }));
-        Ok(())
+        // How many the port holds with this one, counted while it was being
+        // put in: the registration that went past `MAX_PORT_OBSERVERS` is
+        // the one that owes its thread the policy exception, and a count
+        // read afterwards could blame a registration that was within it.
+        Ok(observers)
     }
 
     /// How many observers this port holds right now, [`MAX_PORT_OBSERVERS`]
