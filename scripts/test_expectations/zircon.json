@@ -164,20 +164,20 @@
       "reason": "The suite drives what a hosted kernel cannot have: Ioports does outb(0x80) after zx_ioports_request, which is a #GP in a host process and kills the whole test process (exit -1028, every suite gtest had still to run lost); PcInterruptVectorPoolLeak never returns; the Mexec cases want a kernel to replace. Its three requested cases (ProbeAddressSpace, VmoCreation, VmoReplaceAsExecutable) go with it; the first two had skip entries already."
     },
     {
-      "test": "TopByteIgnoreTests.*",
+      "test": "TopB*",
       "platforms": [
         "aarch64-libos"
       ],
       "hangs": true,
-      "reason": "Address tagging (TBI) is not plumbed through the hosted aarch64 kernel: user pointers with a top byte are rejected (VmarTaggedAddress gets INVALID_ARGS from zx_vmo_create), the debug registers the segfault case reads back are NOT_SUPPORTED, and FutexWaitWake kills the whole test process (exit -1028: measured on the arm64 CI runner, #2516, run 42412571869, with the 375 requested cases behind it never run). Stripping the tag from user pointers on aarch64 is its own change."
+      "reason": "Address tagging (TBI) is not plumbed through the hosted aarch64 kernel: user pointers with a top byte are rejected (VmarTaggedAddress gets INVALID_ARGS from zx_vmo_create), the debug registers the segfault case reads back are NOT_SUPPORTED, and FutexWaitWake kills the whole test process (exit -1028: measured on the arm64 CI runner, #2516, run 42412571869, with the 375 requested cases behind it never run). Stripping the tag from user pointers on aarch64 is its own change. Spelled TopB* (TopByteIgnoreTests is the only suite with that prefix in the arm64 image) because the platform's hang list rides in one guest option of at most 187 characters."
     },
     {
-      "test": "Threads.WritingSingleS*",
+      "test": "Threads.WritingS*",
       "platforms": [
         "aarch64-libos"
       ],
       "hangs": true,
-      "reason": "Threads.WritingSingleStepState: zx_thread_write_state(ZX_THREAD_STATE_SINGLE_STEP) answers NOT_SUPPORTED on the hosted aarch64 kernel (single-stepping a guest needs MDSCR_EL1.SS and PSTATE.SS, which a host process cannot set), the test registers the fatal failure before ExitThread() and then waits on the suspended thread for ever: the whole-suite boot was cut at the 1200 s budget with 942 of 1051 requested cases passed and the suites behind it never run (arm64 CI runner, run 42415557086, after #2516). A prefix because the platform's hang list rides in one guest option of at most 187 characters."
+      "reason": "Threads.WritingSingleStepState: zx_thread_write_state(ZX_THREAD_STATE_SINGLE_STEP) answers NOT_SUPPORTED on the hosted aarch64 kernel (single-stepping a guest needs MDSCR_EL1.SS and PSTATE.SS, which a host process cannot set), the test registers the fatal failure before ExitThread() and then waits on the suspended thread for ever: the whole-suite boot was cut at the 1200 s budget with 942 of 1051 requested cases passed and the suites behind it never run (arm64 CI runner, run 42415557086, after #2516). A prefix (the only Threads.WritingS* case in the arm64 image) because the platform's hang list rides in one guest option of at most 187 characters."
     },
     {
       "test": "InterruptTest.*U*Wait",
@@ -754,10 +754,11 @@
     {
       "test": "Threads.WritingV*",
       "platforms": [
-        "riscv64-bare"
+        "riscv64-bare",
+        "aarch64-libos"
       ],
       "hangs": true,
-      "reason": "See Threads.WritingF*: the same hang for the two vector-state cases, Threads.WritingVectorRegisterState and Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored."
+      "reason": "See Threads.WritingF*: the same hang for the two vector-state cases, Threads.WritingVectorRegisterState and Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored. The hosted aarch64 kernel hangs the same way: ZX_THREAD_STATE_VECTOR_REGS is NOT_SUPPORTED there too (the arm64 test asserts ZX_OK at threads.cc:1297 and then waits on the suspended thread for ever), and the whole-suite boot was cut at the 1200 s budget in Threads.WritingVectorRegisterState with 939 of 1050 requested cases passed (arm64 CI runner, run 42417746615, after #2516 with Threads.WritingS* out). Threads.WritingF* stays in for aarch64 until it is measured there (on arm64 the FP state kind is unsupported by design, so the test does not expect ZX_OK). Reading the v registers back on aarch64, and the thread that never exits once resumed, are a tanda of their own."
     },
     {
       "test": "ChannelCallMutexTest.MutexH*",
