@@ -510,7 +510,15 @@ brk_location:
             fn brk_location();
         }
         unsafe { catch_sigtrap() };
-        let mut stack = [0u8; 0x1000];
+        // The mock guest pushes with `stp ... [sp, #-16]!`, and AArch64
+        // checks the stack pointer's alignment on every use of it as a base
+        // (`SCTLR_EL1.SA0`): a stack that is not 16-aligned is a `SIGBUS`
+        // on hardware. A `[u8; N]` has no alignment of its own, and the one
+        // the CI runner handed out was not aligned (QEMU TCG does not check,
+        // which is why it passed there).
+        #[repr(C, align(16))]
+        struct GuestStack([u8; 0x1000]);
+        let mut stack = GuestStack([0u8; 0x1000]);
         let general = GeneralRegs {
             x0: 0,
             x1: 1,
@@ -551,7 +559,7 @@ brk_location:
         fp.q[62] = 0xdead_beef;
         let mut cx = UserContext {
             general,
-            sp: stack.as_mut_ptr() as usize + 0x1000,
+            sp: stack.0.as_mut_ptr() as usize + 0x1000,
             elr: dump_registers as *const () as usize,
             tpidr: 0x7777_0000,
             fp,
