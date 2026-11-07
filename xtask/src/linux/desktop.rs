@@ -72,6 +72,7 @@ pub fn install(rootfs: &Path) {
     write_hunter_desktop_entry(rootfs);
     super::network::write_network_desktop_entry(rootfs);
     super::monitor::write_monitor_desktop_entry(rootfs);
+    write_mcookie(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1757,6 +1758,83 @@ fn write_freedoom_desktop_entries(rootfs: &Path) {
              StartupNotify=false\n"
         );
         fs::write(dir.join(file), body).unwrap();
+    }
+}
+
+/// `/usr/bin/mcookie` — `startx`'s magic-cookie generator, as a shell script.
+///
+/// `startx` (xinit) has `enable_xauth=1` hard-coded with no env override, and
+/// line 144 of Ubuntu's copy runs `` mcookie=`/usr/bin/mcookie` `` by ABSOLUTE
+/// path: not `command -v`, not `$PATH`. `mcookie` is a util-linux binary and
+/// util-linux is in NEITHER package list (`DESKTOP_UBUNTU` in apt_rootfs.rs,
+/// `DEFAULT_PACKAGES` in xorg.rs), and busybox has no `mcookie` applet — so on
+/// a real desktop image the very first thing `startx` does is
+///
+///     /usr/bin/startx: line 144: /usr/bin/mcookie: not found
+///     Couldn't create cookie
+///
+/// and it exits 1 before the server is ever launched. (Reported on Moebius's
+/// x86_64 desktop box, Eclipse OS 0.7.1.) `-ac` in `root/.xserverrc` does not
+/// help: that only matters once `startx` gets as far as spawning the server.
+///
+/// Pulling in all of `util-linux` for this one file is the wrong trade: its
+/// `/usr/bin` carries `mount`, `umount`, `dmesg`, `kill`, `more`, `su` and
+/// `login`, and `X_TREES` merges `usr/bin` over the image, so it would quietly
+/// replace a row of applets the base boots with. A cookie is 128 random bits
+/// printed as 32 lowercase hex digits; `/dev/urandom` plus `od` gives exactly
+/// that, and both are in the base.
+///
+/// Three sources, in order, so the script cannot come back empty (an empty
+/// stdout is precisely what `startx` turns into "Couldn't create cookie"):
+/// `/dev/urandom` via `od`/`hexdump`, the kernel's UUID node, and finally a
+/// time+pid digest, which is weak but keeps the session coming up — and with
+/// `-ac` on the server the cookie is not what guards the display anyway.
+fn write_mcookie(rootfs: &Path) {
+    let bin = rootfs.join("usr/bin");
+    let _ = fs::create_dir_all(&bin);
+    let script = bin.join("mcookie");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: stand-in for util-linux's mcookie(1), which is not in\n\
+          # the image. Prints 128 bits as 32 lowercase hex digits, which is\n\
+          # what `startx` expects to hand to `xauth add`.\n\
+          emit() {\n\
+          \x20 # 32 hex digits and nothing else, or nothing at all.\n\
+          \x20 case \"$1\" in\n\
+          \x20   *[!0-9a-f]* | '') return 1 ;;\n\
+          \x20 esac\n\
+          \x20 [ \"${#1}\" -eq 32 ] || return 1\n\
+          \x20 printf '%s\\n' \"$1\"\n\
+          \x20 exit 0\n\
+          }\n\
+          # 1. The real thing: 16 bytes of kernel entropy.\n\
+          if [ -r /dev/urandom ]; then\n\
+          \x20 c=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -A n -v -t x1 2>/dev/null | tr -d ' \\n\\t')\n\
+          \x20 emit \"$c\"\n\
+          \x20 c=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '/1 \"%02x\"' 2>/dev/null)\n\
+          \x20 emit \"$c\"\n\
+          fi\n\
+          # 2. The kernel's own UUID source, minus its dashes.\n\
+          if [ -r /proc/sys/kernel/random/uuid ]; then\n\
+          \x20 c=$(tr -d '\\n-' < /proc/sys/kernel/random/uuid 2>/dev/null)\n\
+          \x20 emit \"$c\"\n\
+          fi\n\
+          # 3. Nothing random is reachable. Weak, but a weak cookie still\n\
+          #    brings the session up, and .xserverrc runs the server with -ac.\n\
+          c=$(awk -v s=\"$(date +%s 2>/dev/null)$$\" 'BEGIN{\n\
+          \x20 srand(s+0); o=\"\";\n\
+          \x20 for (i = 0; i < 32; i++) o = o sprintf(\"%x\", int(rand()*16));\n\
+          \x20 print o\n\
+          }' 2>/dev/null)\n\
+          emit \"$c\"\n\
+          echo 'mcookie: no entropy source available' >&2\n\
+          exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 

@@ -60,6 +60,11 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "xf86-input-libinput",
     // `startx` / `xinit`.
     "xinit",
+    // Alpine's counterpart of the `xauth` note in apt_rootfs.rs: `startx`
+    // has `enable_xauth=1` hard-coded and shells out to `xauth` to write the
+    // `-auth` file it hands the server. Alpine ships it in its own `xauth`
+    // package, not in the server or in xinit.
+    "xauth",
     // Software GL (`swrast_dri.so` / llvmpipe): the AIGLX log line
     // "dlopen of /usr/lib/dri/swrast_dri.so failed" came from this being
     // absent, leaving GLX with "no usable GL providers". Needed by GL clients
@@ -2946,6 +2951,12 @@ mod tests {
             "xf86-video-fbdev",
             "xf86-input-libinput",
             "xinit",
+            // `startx` is more than the server: `enable_xauth=1` is hard-coded
+            // in it, so it shells out to `xauth` to write the `-auth` file it
+            // then hands the server. Alpine ships `xauth` on its own, not with
+            // xinit or the server, and without it startx passes an `-auth`
+            // file nobody wrote.
+            "xauth",
             "font-misc-misc",
             "font-cursor-misc",
             "encodings",

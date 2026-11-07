@@ -83,14 +83,19 @@ impl Installed {
             & 0o777
     }
 
-    /// The files that are meant to be run: the wrappers in `/usr/local/bin`
-    /// and the two scripts `startx` sources.
+    /// The files that are meant to be run: the wrappers in `/usr/local/bin`,
+    /// the two scripts `startx` sources, and `/usr/bin/mcookie`, which is the
+    /// one executable the desktop writes OUTSIDE `/usr/local/bin` -- it has to
+    /// be at the absolute path startx has baked in.
     fn scripts(&self) -> Vec<&str> {
         self.files
             .iter()
             .map(String::as_str)
             .filter(|f| {
-                f.starts_with("usr/local/bin/") || *f == "root/.xinitrc" || *f == "root/.xserverrc"
+                f.starts_with("usr/local/bin/")
+                    || *f == "root/.xinitrc"
+                    || *f == "root/.xserverrc"
+                    || *f == "usr/bin/mcookie"
             })
             .collect()
     }
@@ -750,10 +755,14 @@ fn xorg_is_pinned_to_the_framebuffer_and_never_probes_drm() {
     );
 }
 
-/// busybox ships no `mcookie`, so `startx` cannot mint a magic cookie and the
-/// server rejects every client while startx spins. `-ac` is what gets a client
-/// connected on the first try, and it has to be on the exec line rather than
-/// in a comment.
+/// `-ac` is what gets a client connected on the first try, and it has to be on
+/// the exec line rather than in a comment.
+///
+/// It stays even now that [`super::write_mcookie`] ships a `mcookie`: the two
+/// cover different halves. `mcookie` is what lets `startx` get *past* line 144
+/// at all; `-ac` is what keeps the server from rejecting clients afterwards if
+/// anything else in that auth path (xauth, the `mktemp` of the `-auth` file)
+/// comes up short on an image where neither is guaranteed.
 #[test]
 fn the_x_server_is_started_without_the_cookie_startx_cannot_mint() {
     let d = installed();
@@ -778,6 +787,79 @@ fn the_x_server_is_started_without_the_cookie_startx_cannot_mint() {
             ".xserverrc drops the display and vt arguments startx appends: {line}"
         );
     }
+}
+
+/// `/usr/bin/mcookie`, which `startx` runs by ABSOLUTE path on line 144 and
+/// which neither busybox nor any package in the two lists provides.
+///
+/// Reported from Moebius's x86_64 desktop box (Eclipse OS 0.7.1):
+/// `/usr/bin/startx: line 144: /usr/bin/mcookie: not found` / `Couldn't create
+/// cookie`, and `startx` exits 1 before the server is ever started.
+#[test]
+fn startx_finds_a_mcookie_where_it_looks_for_one() {
+    let d = installed();
+    // The path is not negotiable: startx has `/usr/bin/mcookie` written out,
+    // so /usr/local/bin (which is first on the guest's PATH) would not do.
+    let rel = "usr/bin/mcookie";
+    assert!(
+        d.files.iter().any(|f| f == rel),
+        "the install leaves no {rel}, which is the path startx runs"
+    );
+    assert_eq!(d.mode(rel), 0o755, "{rel} is not executable");
+    let text = d.text(rel);
+    assert!(
+        text.starts_with("#!/bin/sh\n"),
+        "{rel} has no /bin/sh shebang:\n{text}"
+    );
+    // util-linux's `mcookie` is not what we ship, and the whole package is
+    // not something to pull in for one file: its /usr/bin would land on top
+    // of busybox's mount/umount/dmesg/kill/su through `X_TREES`.
+    assert!(
+        text.contains("/dev/urandom"),
+        "{rel} never reads the kernel's entropy source:\n{text}"
+    );
+}
+
+/// And it has to actually PRINT one: an empty stdout is exactly what `startx`
+/// turns into "Couldn't create cookie", so a script that exists but says
+/// nothing fails in the same way as no script at all. Run it.
+#[test]
+fn the_mcookie_prints_thirty_two_hex_digits() {
+    let d = installed();
+    let script = d.root.join("usr/bin/mcookie");
+    let out = match std::process::Command::new("/bin/sh").arg(&script).output() {
+        Ok(o) => o,
+        // No /bin/sh on the host that runs the test suite: nothing to assert.
+        Err(_) => return,
+    };
+    assert!(
+        out.status.success(),
+        "mcookie exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cookie = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        cookie.len(),
+        32,
+        "a magic cookie is 128 bits as 32 hex digits, got {cookie:?}"
+    );
+    assert!(
+        cookie
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "not lower-case hex: {cookie:?}"
+    );
+    // Twice, so a constant does not pass as a cookie.
+    let again = std::process::Command::new("/bin/sh")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert_ne!(
+        cookie,
+        String::from_utf8_lossy(&again.stdout).trim(),
+        "two runs minted the same cookie"
+    );
 }
 
 /// The pinned Freedoom archive is checked against this, so a digest that comes
