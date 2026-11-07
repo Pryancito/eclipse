@@ -8,7 +8,7 @@
 //! network service to read it again.
 //!
 //! `lunarnet --service` is that service. eclipse-init runs it (through
-//! `eclipse-udhcpc`, the `udhcpc` service the image always had) at boot: it
+//! `eclipse-network-up`, the `network` service of the image) at boot: it
 //! sets the static addresses and routes with `ip`, runs `udhcpc` / `udhcpc6`
 //! for the interfaces that want DHCP, writes `resolv.conf` when the servers are
 //! fixed, and on SIGHUP stops all of it and starts again from the file.
@@ -873,7 +873,7 @@ impl Editor {
             KEY_ENTER_WL | KEY_KPENTER_WL => match self.focus {
                 Focus::List => self.focus = Focus::Mode4,
                 Focus::Revert => self.revert(),
-                _ => self.apply(|a| netconf::save(Path::new(netconf::CONF), a), signal_service),
+                _ => self.apply(|a| netconf::save(Path::new(netconf::CONF), a), apply_now),
             },
             KEY_BACKSPACE_WL => self.backspace(),
             _ => {
@@ -927,7 +927,7 @@ impl Editor {
             self.revert();
         } else if hit(l.apply, x, y) {
             self.focus = Focus::Apply;
-            self.apply(|a| netconf::save(Path::new(netconf::CONF), a), signal_service);
+            self.apply(|a| netconf::save(Path::new(netconf::CONF), a), apply_now);
         }
         true
     }
@@ -955,6 +955,66 @@ fn signal_service() -> bool {
         Some(pid) => unsafe { libc::kill(pid, libc::SIGHUP) == 0 },
         None => false,
     }
+}
+
+/// Start `lunarnet --service` when there is none, and wait for it to say so.
+///
+/// Without this the window is a no-op on a machine whose network service is
+/// not running: `APLICAR` wrote `/etc/eclipse/network`, found nobody to
+/// `SIGHUP`, and left the interface exactly as it was --- no `ip` command, no
+/// DHCP client, no address, and a NIC whose TX counter stays at zero because
+/// nothing ever asked it to transmit. The service is this same binary, so
+/// starting it here needs no other file in the image to have survived.
+fn start_service() -> bool {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut c = std::process::Command::new(exe);
+    c.arg("--service")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and touches nothing but the child.
+    unsafe {
+        c.pre_exec(|| {
+            // Its own session: the service outlives this window, and closing
+            // the window's terminal does not take the network down with it.
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let Ok(mut child) = c.spawn() else {
+        return false;
+    };
+    // `service()` writes the pidfile before it touches anything, so the file
+    // appearing is the signal that it came up; a child that exited instead is
+    // the signal that it did not, and neither needs a fixed wait.
+    for _ in 0..100 {
+        if service_pid().is_some() {
+            return true;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// What `APLICAR` does with the saved file: tell the running service, or start
+/// one. Either way the settings take effect now and not at the next boot.
+fn apply_now() -> bool {
+    apply_with(signal_service, start_service)
+}
+
+/// The decision behind [`apply_now`], with the outside world passed in.
+///
+/// Starting a service is tried ONLY when there was none to signal: a second
+/// `lunarnet --service` beside the first would put a second `udhcpc` on the
+/// same interface, and two DHCP clients fight over its address.
+fn apply_with(signal: impl FnOnce() -> bool, start: impl FnOnce() -> bool) -> bool {
+    signal() || start()
 }
 
 // ── the service ──────────────────────────────────────────────────────────────
@@ -1557,6 +1617,33 @@ mod tests {
         e.focus = Focus::Addr4;
         e.type_char('1');
         assert_eq!(e.edit[0].address4, "");
+    }
+
+    /// A running service is signalled and nothing else is started: a second
+    /// `lunarnet --service` means a second `udhcpc` on the same interface.
+    #[test]
+    fn applying_starts_a_service_only_when_there_is_none_to_signal() {
+        let mut started = false;
+        assert!(apply_with(|| true, || {
+            started = true;
+            true
+        }));
+        assert!(!started, "a second service beside the one already running");
+
+        // No service: one is started, and that is what makes the window
+        // apply the file now instead of leaving it for the next boot.
+        let mut started = false;
+        assert!(apply_with(
+            || false,
+            || {
+                started = true;
+                true
+            }
+        ));
+        assert!(started);
+
+        // Neither worked: the window has to say so, not claim it applied.
+        assert!(!apply_with(|| false, || false));
     }
 
     #[test]

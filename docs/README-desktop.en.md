@@ -483,7 +483,7 @@ Since real hardware boots with the installed cmdline (no `desktop=`), it falls
 back to the `/etc/eclipse/desktop` file and uses **labwc**; `make qemu` does too,
 unless given `DESKTOP=`. Each session's services carry a `desktop =` tag in their
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` are `desktop = labwc`,
-`xorg` is `desktop = xorg`, and untagged services (e.g. `udhcpc`) always start.
+`xorg` is `desktop = xorg`, and untagged services (e.g. `network`) always start.
 
 `make vbox` boots the **same** live session as `make qemu` (`desktop=labwc`, an
 initramfs with Mesa/labwc). The ISO (`make iso` / `./scripts/vbox-eclipse.sh --iso`)

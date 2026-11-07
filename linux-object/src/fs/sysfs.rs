@@ -2242,6 +2242,21 @@ impl INode for SysClassNetDirINode {
     }
 }
 
+/// Whether `name` has carrier, as its driver reports it.
+///
+/// `operstate` and `carrier` used to be the fixed strings `up` and `1` for
+/// every interface that was not the loopback, so a NIC with no cable in it
+/// read exactly like a working one: lunarnet's panel said "conectada" and
+/// `ifconfig` said `RUNNING` whatever the PHY thought. An interface that is
+/// not in the list keeps the old answer, so a name sysfs knows and the netdev
+/// registry does not is not reported as unplugged.
+fn net_iface_carrier(name: &str) -> bool {
+    get_net_device()
+        .iter()
+        .find(|i| i.ifname() == name)
+        .is_none_or(|i| i.link_carrier_up())
+}
+
 struct SysNetIfaceINode {
     name: String,
 }
@@ -2283,17 +2298,28 @@ impl INode for SysNetIfaceINode {
             })),
             ".." => Ok(Arc::new(SysClassNetDirINode)),
             "operstate" => {
+                // The loopback has no carrier of its own, and Linux reports
+                // `unknown` for it rather than `up`.
                 let state = if self.name == "lo" || self.name == "loopback" {
                     "unknown"
-                } else {
+                } else if net_iface_carrier(&self.name) {
                     "up"
+                } else {
+                    "down"
                 };
                 Ok(Arc::new(Pseudo::new(
                     &format!("{}\n", state),
                     FileType::File,
                 )))
             }
-            "carrier" => Ok(Arc::new(Pseudo::new("1\n", FileType::File))),
+            "carrier" => {
+                let carrier =
+                    self.name == "lo" || self.name == "loopback" || net_iface_carrier(&self.name);
+                Ok(Arc::new(Pseudo::new(
+                    if carrier { "1\n" } else { "0\n" },
+                    FileType::File,
+                )))
+            }
             "address" => {
                 let mac = get_net_device()
                     .iter()
@@ -3338,6 +3364,46 @@ mod compute_alias_inode_tests {
             assert_ne!(ino::DRM_DIR + index, ino::DRM_DIR_COMPUTE_ALIAS);
         }
         assert_ne!(ino::PCI_DEV_COMPUTE_ALIAS, ino::DRM_DIR_COMPUTE_ALIAS);
+    }
+}
+
+#[cfg(test)]
+mod net_carrier_tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    fn read(node: &Arc<dyn INode>) -> String {
+        let mut buf = [0u8; 16];
+        let n = node.read_at(0, &mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    fn iface(name: &str) -> SysNetIfaceINode {
+        SysNetIfaceINode {
+            name: name.to_string(),
+        }
+    }
+
+    /// With no netdev registered --- every host test --- the answer is the one
+    /// these files always gave. An interface sysfs knows and the registry does
+    /// not must not read as unplugged: that would put every desktop that lists
+    /// interfaces into "sin cable" for a bookkeeping gap.
+    #[test]
+    fn an_interface_the_registry_does_not_know_still_reads_as_up() {
+        assert!(net_iface_carrier("eth0"));
+        assert_eq!(read(&iface("eth0").find("operstate").unwrap()), "up\n");
+        assert_eq!(read(&iface("eth0").find("carrier").unwrap()), "1\n");
+    }
+
+    /// The loopback has no carrier of its own. Linux reports `unknown` for its
+    /// `operstate` and 1 for its `carrier`, and both names the kernel has used
+    /// for it answer the same.
+    #[test]
+    fn the_loopback_answers_unknown_under_either_name() {
+        for name in ["lo", "loopback"] {
+            assert_eq!(read(&iface(name).find("operstate").unwrap()), "unknown\n");
+            assert_eq!(read(&iface(name).find("carrier").unwrap()), "1\n");
+        }
     }
 }
 

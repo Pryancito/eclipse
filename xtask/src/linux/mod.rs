@@ -4474,15 +4474,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
         .unwrap();
 
-        // udhcpc: the kernel brings the link up but sets no address, so DHCP is
-        // what gives the machine an IP and default route at boot -- before, it
-        // only happened when the desktop's prepare step ran udhcpc by hand.
-        // Supervised: the foreground client keeps renewing the lease, and init
-        // restarts it (with backoff) if it dies.
+        // network: the kernel brings the link up but sets no address, so this
+        // is what gives the machine an IP and default route at boot. With
+        // lunarnet in the image it IS lunarnet (`--service`), which applies
+        // `/etc/eclipse/network` per interface and supervises the DHCP
+        // clients; without it, a bare `udhcpc`. Supervised either way: the
+        // foreground client keeps renewing the lease, and init restarts it
+        // (with backoff) if it dies.
+        //
+        // A rootfs built before the rename still has the old `udhcpc.service`
+        // beside this one, and two services both bringing the same interface
+        // up means two DHCP clients fighting over it, so it goes.
+        let _ = fs::remove_file(svc_dir.join("udhcpc.service"));
         fs::write(
-            svc_dir.join("udhcpc.service"),
-            b"# DHCP client (foreground). See /usr/local/bin/eclipse-udhcpc.\n\
-              exec = /usr/local/bin/eclipse-udhcpc\n\
+            svc_dir.join("network.service"),
+            b"# The network at boot. See /usr/local/bin/eclipse-network-up.\n\
+              exec = /usr/local/bin/eclipse-network-up\n\
               type = respawn\n",
         )
         .unwrap();
@@ -4493,7 +4500,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
             b"# NTP client (foreground). See /usr/local/bin/eclipse-ntpd.\n\
               exec = /usr/local/bin/eclipse-ntpd\n\
               type = respawn\n\
-              after = udhcpc\n\
+              after = network\n\
               log = /tmp/ntpd.log\n",
         )
         .unwrap();
@@ -4919,7 +4926,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
         .unwrap();
 
-        network::write_udhcpc_wrapper(localbin);
+        network::write_network_wrapper(localbin);
         Self::write_oopslog(localbin, svc_dir);
         Self::write_hunterd(localbin, svc_dir);
 
@@ -5115,7 +5122,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         {
             use std::os::unix::fs::PermissionsExt;
             for w in [
-                "eclipse-udhcpc",
+                "eclipse-network-up",
                 "eclipse-dbus",
                 "eclipse-dbus-system",
                 "eclipse-seatd",
