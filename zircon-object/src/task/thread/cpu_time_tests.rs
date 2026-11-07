@@ -97,3 +97,37 @@ fn the_poll_that_ends_a_zircon_process_leaves_its_runtime_where_the_signal_found
         "the last poll's kernel time moved a terminated process's runtime"
     );
 }
+
+/// ... and only that poll: a worker that leaves siblings behind ends in a
+/// ready poll too, and its kernel time is the process's like any other
+/// thread's. Dropped, a Zircon process of short-lived workers reported no
+/// kernel time at all.
+#[test]
+fn the_poll_that_ends_a_worker_still_counts_for_its_zircon_process() {
+    let proc = Process::create(&Job::root(), "cpu").unwrap();
+    let main = Thread::create(&proc, "main").unwrap();
+    let worker = Thread::create(&proc, "worker").unwrap();
+    let current = CurrentThread(worker.clone());
+    let mut switch = ThreadSwitchFuture::new(
+        worker,
+        Box::pin(async move {
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_millis(2) {}
+            drop(current);
+        }),
+    );
+    let polled = async_std::task::block_on(core::future::poll_fn(|cx| {
+        Poll::Ready(Pin::new(&mut switch).poll(cx))
+    }));
+    assert!(polled.is_ready());
+    assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
+    let (_, kernel) = proc.cpu_time_ns();
+    assert!(
+        kernel >= 2_000_000,
+        "the worker's last poll's {} ns of kernel time went nowhere",
+        kernel
+    );
+    main.terminate_abandoned();
+    assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+    assert_eq!(proc.cpu_time_ns().1, kernel, "moved after termination");
+}

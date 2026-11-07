@@ -148,6 +148,14 @@
       "reason": "SignalRequeue, INTERMITTENT (1 run in 6): after sync_completion_signal_requeue moved the waiters to the second futex, one of them was no longer reported BLOCKED_FUTEX (a spurious wake, or a state flip under the requeue), the test asserts and its destructor joins threads that nobody wakes. A real bug to chase; kept out so one bad run does not lose the suites gtest had still to run."
     },
     {
+      "test": "Resource.Io*",
+      "platforms": [
+        "x86_64-bare"
+      ],
+      "hangs": true,
+      "reason": "Resource.Ioports, the one case this prefix covers (a prefix because the platform's hang list rides in one guest option of at most 187 characters). It does port I/O after zx_ioports_request, and this kernel has no I/O permission bitmap: the request is a stub, and since user threads enter with IOPL 0 (as Linux and Zircon start them; IOPL 3 was the stand-in for the bitmap and made rflags unwritable through zx_thread_write_state) the `in` is a #GP that kills the whole test process. Measured here (2026-11-07, QEMU TCG): `User mode exception: General` at 299 s of the whole-suite boot, `Exit status -1028`, with the 2 requested HandleWaitTest cases behind it never run. The table has it as FAILED; a real zx_ioports_request would be a TSS I/O bitmap switched with the process."
+    },
+    {
       "test": "Resource.*",
       "platforms": [
         "*-libos"

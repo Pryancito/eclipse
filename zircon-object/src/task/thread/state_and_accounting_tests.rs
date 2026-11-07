@@ -97,6 +97,9 @@ fn a_suspend_taken_while_running_shows_when_the_context_comes_back() {
 #[test]
 fn a_dying_thread_drops_the_running_and_suspended_signals() {
     let t = a_thread();
+    // Started, so the kill leaves it dying; a never-started thread dies at
+    // the kill.
+    t.mark_started_for_test();
     t.suspend();
     assert!(t.signal().contains(Signal::THREAD_SUSPENDED));
 
