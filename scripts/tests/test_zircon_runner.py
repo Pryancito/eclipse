@@ -297,3 +297,48 @@ class Catalog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhereATableComesFrom(unittest.TestCase):
+    """`expectations_file`: this repository's own table first, then the
+    submodule's, then the submodule's x86_64 table for the same mode."""
+
+    def a_tree(self):
+        import tempfile
+
+        root = Path(tempfile.mkdtemp())
+        (root / "scripts/test_expectations").mkdir(parents=True)
+        (root / "tests/testcases/zircon_core_test").mkdir(parents=True)
+        (root / "tests/testcases/zircon_core_test/x86_64_bare.txt").write_text("A.B  OK\n")
+        (root / "tests/testcases/zircon_core_test/x86_64_libos.txt").write_text("A.B  OK\n")
+        return root
+
+    def test_an_architecture_without_a_table_falls_back_to_x86_64_of_its_mode(self):
+        root = self.a_tree()
+        self.assertEqual(
+            runner.expectations_file("riscv64-bare", root),
+            root / "tests/testcases/zircon_core_test/x86_64_bare.txt",
+        )
+        self.assertEqual(
+            runner.expectations_file("aarch64-libos", root),
+            root / "tests/testcases/zircon_core_test/x86_64_libos.txt",
+        )
+
+    def test_the_submodule_table_is_used_when_it_has_one(self):
+        root = self.a_tree()
+        theirs = root / "tests/testcases/zircon_core_test/riscv64_bare.txt"
+        theirs.write_text("A.B  FAILED\n")
+        self.assertEqual(runner.expectations_file("riscv64-bare", root), theirs)
+
+    def test_this_repositorys_table_wins_over_the_submodules(self):
+        root = self.a_tree()
+        (root / "tests/testcases/zircon_core_test/riscv64_bare.txt").write_text("A.B  FAILED\n")
+        ours = root / "scripts/test_expectations/riscv64_bare.txt"
+        ours.write_text("A.B  OK\n")
+        self.assertEqual(runner.expectations_file("riscv64-bare", root), ours)
+        # And the x86_64 tables keep coming from the submodule: this
+        # repository carries none of its own.
+        self.assertEqual(
+            runner.expectations_file("x86_64-bare", root),
+            root / "tests/testcases/zircon_core_test/x86_64_bare.txt",
+        )

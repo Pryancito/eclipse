@@ -56,6 +56,37 @@ pub fn free_pmem_regions() -> Vec<Range<PhysAddr>> {
     FREE_PMEM_REGIONS.clone()
 }
 
-pub fn frame_flush(_target: crate::PhysAddr) {
-    unimplemented!()
+/// Write one page of a frame back from every cache and drop it, before the
+/// frame changes cache policy (`zx_vmo_set_cache_policy`) and the next
+/// access goes to memory directly.
+///
+/// RISC-V has no base cache-maintenance instruction: `cbo.flush` is the
+/// Zicbom extension, and whether the harts have it, and how many bytes one
+/// instruction covers, comes from the device tree (`cpu::init_cbom`). Without
+/// it this is the `fence` it always amounted to on a `virt` machine, whose
+/// memory is coherent anyway. This used to be `unimplemented!()`, so the
+/// first `set_cache_policy` on a VMO with pages (`VmoTestCase.Cache` is one)
+/// was a kernel panic that took the whole guest with it.
+pub fn frame_flush(target: PhysAddr) {
+    let block = super::cpu::cbom_block_size();
+    if block != 0 {
+        let base = crate::mem::phys_to_virt(target);
+        crate::common::cache_maint::for_each_line(base, PAGE_SIZE, block, |addr| {
+            // SAFETY: `cbo.flush` takes a virtual address inside a block to
+            // flush; `addr` is in the direct map of `target`, a frame the
+            // caller owns. The device tree said every hart has Zicbom.
+            unsafe {
+                core::arch::asm!(
+                    ".option push",
+                    ".option arch, +zicbom",
+                    "cbo.flush 0({0})",
+                    ".option pop",
+                    in(reg) addr,
+                    options(nostack, preserves_flags)
+                );
+            }
+        });
+    }
+    // SAFETY: a full memory fence has no preconditions.
+    unsafe { core::arch::asm!("fence rw, rw", options(nostack, preserves_flags)) };
 }

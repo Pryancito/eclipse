@@ -156,10 +156,11 @@
     {
       "test": "InterruptTest.*U*Wait",
       "platforms": [
-        "*-libos"
+        "*-libos",
+        "riscv64-bare"
       ],
       "hangs": true,
-      "reason": "PacketFollowsUnbindToWait and UntriggeredSignalInterruptWait, and only those two. Both need ZX_VIRTUAL_INTERRUPT_UNTRIGGERED (asserted while a virtual interrupt is idle, cleared from trigger to ack) and an unbind that hands the untaken packet's timestamp back to zx_interrupt_wait; here a zx_interrupt_wait that should return at once, or re-arm and block for the next trigger, never returns. Patterns, not names: the guest option is capped at 187 characters."
+      "reason": "PacketFollowsUnbindToWait and UntriggeredSignalInterruptWait, and only those two. Both need ZX_VIRTUAL_INTERRUPT_UNTRIGGERED (asserted while a virtual interrupt is idle, cleared from trigger to ack) and an unbind that hands the untaken packet's timestamp back to zx_interrupt_wait; here a zx_interrupt_wait that should return at once, or re-arm and block for the next trigger, never returns. Patterns, not names: the guest option is capped at 187 characters. On riscv64 bare metal too: measured here (2026-11-07, QEMU TCG), an InterruptTest.* boot printed `[ RUN ] InterruptTest.PacketFollowsUnbindToWait` after 8 cases OK and nothing else until its 600 s budget, so the zx_interrupt_wait that never returns is the kernel's, not the host bridge's."
     },
     {
       "test": "/Restr*",
@@ -687,6 +688,54 @@
         "x86_64-bare"
       ],
       "reason": "SMP child-process teardown can reboot the kernel after assertions pass (CI 34018139132; reproduced with InfoProcessBadAvailIsInvalidArg)."
+    },
+    {
+      "test": "PortStressTest.ChannelCallWaitQueuePanicRepro",
+      "platforms": [
+        "riscv64-bare"
+      ],
+      "hangs": true,
+      "reason": "Never finishes under QEMU TCG on riscv64: measured here (2026-11-07) still running after 700 s with the rest of the suite behind it, in a boot whose other 605 cases had taken 500 s. It is a stress repro of a wait-queue panic, not a correctness case; the three PortStressTest cases before it pass. Kept out so the suites after it are measured at all."
+    },
+    {
+      "test": "Property.RegisterGsNoncanonical",
+      "platforms": [
+        "x86_64-bare"
+      ],
+      "hangs": true,
+      "reason": "Kills the whole guest under QEMU TCG, so it has to stay out of the boot and not just out of the tally: like Property.RegisterFsNoncanonical (needs_hardware), TCG does not #GP on the non-canonical WRGSBASE, the write takes effect and the #GP arrives later on a GS-relative access (regs.rip 0x4000008ea34d is not the write instruction, trap_num 0xd error_code 0x0, gsbase 0x1010101010101010 already in the saved context); the thread then dies and the test process exits -1028 with the 295 cases behind it never run. Measured in Test CI, Zircon Core Test Baremetal (x86_64), on master c665878 and on #2506 b26d21d: 173/468, 'Exit status -1028' right after '[ RUN ] Property.RegisterGsNoncanonical'. Needs real hardware."
+    },
+    {
+      "test": "Threads.WritingF*",
+      "platforms": [
+        "riscv64-bare"
+      ],
+      "hangs": true,
+      "reason": "Never finishes on riscv64: zx_thread_write_state answers ZX_ERR_NOT_SUPPORTED for ZX_THREAD_STATE_FP_REGS and ZX_THREAD_STATE_VECTOR_REGS there (thread_state.rs implements those kinds for x86_64 only), threads.cc asserts ZX_OK on riscv (1275, 1297), and the RegisterWriteSetup destructor then resumes the suspended thread and waits for it to exit, which it never does. Measured here (2026-11-07, QEMU TCG): the full boot stood 30 minutes in Threads.WritingFpRegisterState after 939 cases OK; Threads.* boots then hung the same way in Threads.WritingVectorRegisterState and Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored, one per boot, and completed 8/8 with the three out. Two patterns rather than three names because the guest option that carries the hangers is capped at 187 characters; WritingF* and WritingV* match exactly these three in this image (the Reading* cases only fail, their ExitThread redirects the pc to zx_thread_exit). The FP and vector state kinds for riscv64, and why the resumed thread does not exit, are a tanda of their own."
+    },
+    {
+      "test": "Threads.WritingV*",
+      "platforms": [
+        "riscv64-bare"
+      ],
+      "hangs": true,
+      "reason": "See Threads.WritingF*: the same hang for the two vector-state cases, Threads.WritingVectorRegisterState and Threads.WritingVectorRegisterStateUnsupportedFieldsIgnored."
+    },
+    {
+      "test": "ChannelCallMutexTest.MutexHeldAcrossCallChain",
+      "platforms": [
+        "riscv64-bare"
+      ],
+      "hangs": true,
+      "reason": "Never finishes on riscv64: PROFILE_CREATE is an unimplemented syscall there (`syscall unimplemented: PROFILE_CREATE`), SetDeadlineProfile() fails with ZX_ERR_NOT_SUPPORTED at channel_call_mutex.cc:60, and the case then sits until the boot's budget runs out. Measured here (2026-11-07, QEMU TCG): the failure printed at 2781 s of the boot and nothing else until the 3600 s cut, with the 22 suites behind it never run."
+    },
+    {
+      "test": "Bti.NoDelayedUnpin",
+      "platforms": [
+        "riscv64-bare"
+      ],
+      "hangs": true,
+      "reason": "Passes on riscv64 but takes 1169 s under QEMU TCG (measured here 2026-11-07: `[ OK ] Bti.NoDelayedUnpin (1168935 ms)`, the next slowest case in the boot is 492 s), and with it the full boot does not fit in the hour it has: the run was cut at 3600 s with 22 suites still to go. Kept out of the boot so the rest is measured; it comes back the day the budget or the emulation allows it."
     }
   ],
   "needs_hardware": [

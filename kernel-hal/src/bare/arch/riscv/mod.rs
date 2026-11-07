@@ -61,7 +61,9 @@ pub fn primary_init_early() {
     }
     // Before any user context is set up: `setup_uspace` asks this for the
     // `sstatus.VS` it enters user mode with.
-    cpu::init_vector(dt.riscv_isa());
+    let harts = dt.riscv_harts();
+    cpu::init_vector(&harts);
+    cpu::init_cbom(&harts);
     if let Some(initrd_region) = dt.initrd_region() {
         info!("Load initrd regions from DTB: {:#x?}", initrd_region);
         INITRD_REGION.init_once_by(Some(initrd_region));
@@ -105,6 +107,7 @@ pub fn secondary_init() {
     while !DRIVERS_READY.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    cpu::check_vector_on_this_hart();
     info!("cpu {} drivers init ...", crate::cpu::cpu_id());
     drivers::intc_init().unwrap();
     let plic = crate::drivers::all_irq()
