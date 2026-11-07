@@ -113,6 +113,7 @@ impl Job {
             inner: Mutex::new(JobInner::default()),
         });
         job.inner.lock().self_ref = Arc::downgrade(&job);
+        job.base.signal_set(JobInner::default().emptiness_signals());
         job
     }
 
@@ -140,17 +141,42 @@ impl Job {
         });
         let child_weak = Arc::downgrade(&child);
         child.inner.lock().self_ref = child_weak.clone();
+        child
+            .base
+            .signal_set(JobInner::default().emptiness_signals());
         inner.children.push(child_weak);
+        let signals = inner.emptiness_signals();
+        drop(inner);
+        self.publish_emptiness(signals);
         Ok(child)
     }
 
     fn remove_child(&self, to_remove: &Weak<Job>) {
         let mut inner = self.inner.lock();
         inner.children.retain(|child| !to_remove.ptr_eq(child));
-        if inner.killed && inner.processes.is_empty() && inner.children.is_empty() {
-            drop(inner);
+        let signals = inner.emptiness_signals();
+        let terminate = inner.killed && inner.is_empty();
+        drop(inner);
+        self.publish_emptiness(signals);
+        if terminate {
             self.terminate()
         }
+    }
+
+    /// Publish `ZX_JOB_NO_JOBS`, `ZX_JOB_NO_PROCESSES` and `ZX_JOB_NO_CHILDREN`
+    /// as the job's child lists stand, the way Zircon keeps them: a new job
+    /// carries all three, adding a process or a child job clears the ones it
+    /// contradicts, and the last one leaving sets them back. Nobody set them
+    /// at all, so a `zx_object_wait_one(job, ZX_JOB_NO_JOBS)` on a job with no
+    /// child jobs (`JobTest.WaitTest`) waited forever and took the whole
+    /// core-test run with it. Called with the job lock DROPPED: the waiters'
+    /// callbacks run under the object's own lock, and a port's may look back
+    /// at the job.
+    fn publish_emptiness(&self, signals: Signal) {
+        const ALL: Signal = Signal::JOB_NO_JOBS
+            .union(Signal::JOB_NO_PROCESSES)
+            .union(Signal::JOB_NO_CHILDREN);
+        self.base.signal_change(ALL.difference(signals), signals);
     }
 
     /// Get the policy of the job.
@@ -233,6 +259,9 @@ impl Job {
             return Err(ZxError::BAD_STATE);
         }
         inner.processes.push(process);
+        let signals = inner.emptiness_signals();
+        drop(inner);
+        self.publish_emptiness(signals);
         Ok(())
     }
 
@@ -240,8 +269,11 @@ impl Job {
     pub(super) fn remove_process(&self, id: KoID) {
         let mut inner = self.inner.lock();
         inner.processes.retain(|proc| proc.id() != id);
-        if inner.killed && inner.processes.is_empty() && inner.children.is_empty() {
-            drop(inner);
+        let signals = inner.emptiness_signals();
+        let terminate = inner.killed && inner.is_empty();
+        drop(inner);
+        self.publish_emptiness(signals);
+        if terminate {
             self.terminate()
         }
     }
@@ -380,6 +412,15 @@ impl Task for Job {
 impl JobInner {
     fn is_empty(&self) -> bool {
         self.processes.is_empty() && self.children.is_empty()
+    }
+
+    /// The `ZX_JOB_NO_*` signals these lists justify right now.
+    fn emptiness_signals(&self) -> Signal {
+        let mut signals = Signal::empty();
+        signals.set(Signal::JOB_NO_JOBS, self.children.is_empty());
+        signals.set(Signal::JOB_NO_PROCESSES, self.processes.is_empty());
+        signals.set(Signal::JOB_NO_CHILDREN, self.is_empty());
+        signals
     }
 }
 
@@ -947,5 +988,48 @@ mod job_info_layout_tests {
         assert_eq!(&bytes[0..8], &(-9i64).to_le_bytes());
         assert_eq!(&bytes[8..11], &[1, 0, 1]);
         assert_eq!(&bytes[11..16], &[0; 5]);
+    }
+}
+
+#[cfg(test)]
+mod emptiness_tests {
+    //! `ZX_JOB_NO_JOBS`, `ZX_JOB_NO_PROCESSES` and `ZX_JOB_NO_CHILDREN` follow
+    //! the child lists, as `JobTest.WaitTest` waits for them.
+    use super::*;
+
+    const ALL: Signal = Signal::JOB_NO_JOBS
+        .union(Signal::JOB_NO_PROCESSES)
+        .union(Signal::JOB_NO_CHILDREN);
+
+    fn job_signals(job: &Job) -> Signal {
+        job.signal() & ALL
+    }
+
+    #[test]
+    fn a_new_job_has_no_jobs_no_processes_and_no_children() {
+        let root = Job::root();
+        assert_eq!(job_signals(&root), ALL);
+        let child = root.create_child().unwrap();
+        assert_eq!(job_signals(&child), ALL);
+        assert_eq!(job_signals(&root), Signal::JOB_NO_PROCESSES);
+    }
+
+    #[test]
+    fn a_process_clears_no_processes_and_its_exit_sets_it_back() {
+        let root = Job::root();
+        let job = root.create_child().unwrap();
+        let proc = Process::create(&job, "p").unwrap();
+        assert_eq!(job_signals(&job), Signal::JOB_NO_JOBS);
+        proc.exit(0);
+        assert_eq!(job_signals(&job), ALL);
+    }
+
+    #[test]
+    fn the_last_child_job_leaving_sets_no_jobs_back() {
+        let root = Job::root();
+        let child = root.create_child().unwrap();
+        assert!(!root.signal().contains(Signal::JOB_NO_JOBS));
+        drop(child);
+        assert_eq!(job_signals(&root), ALL);
     }
 }

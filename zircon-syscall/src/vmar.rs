@@ -198,6 +198,7 @@ impl Syscall<'_> {
             return Err(ZxError::INVALID_ARGS);
         }
         let vmar_offset = if is_specific { Some(vmar_offset) } else { None };
+        let vmo_is_vdso = zircon_object::task::is_vdso_vmo(vmo.id());
         let vaddr = vmar.map_ext(
             vmar_offset,
             vmo,
@@ -210,6 +211,12 @@ impl Syscall<'_> {
             options.contains(VmOptions::ALLOW_FAULTS),
         )?;
         info!("vmar.map: at {:#x?}", vaddr);
+        if vmo_is_vdso && mapping_flags.contains(MMUFlags::EXECUTE) {
+            // The vDSO's code: where the syscalls of the process that owns
+            // `vmar` must come from. That is not the caller: userboot maps
+            // the vDSO into the processes it launches.
+            vmar.set_vdso_code(vaddr, len);
+        }
         mapped_addr.write(vaddr)?;
         Ok(())
     }

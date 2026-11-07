@@ -4,13 +4,39 @@ use {
     alloc::vec::Vec,
     kernel_hal::MMUFlags,
     zircon_object::{
-        ipc::{Channel, MessagePacket},
+        ipc::{Channel, MessagePacket, MAX_PENDING_MESSAGE_COUNT},
         object::{obj_type, HandleInfo},
-        task::{Process, ThreadState},
+        task::{ExceptionType, Process, ThreadState},
     },
 };
 
+/// `ZX_EXCP_POLICY_CODE_CHANNEL_FULL_WRITE`: the `synth_code` of the policy
+/// exception a thread gets for writing past [`MAX_PENDING_MESSAGE_COUNT`].
+pub const POLICY_CODE_CHANNEL_FULL_WRITE: u32 = 16;
+
 impl Syscall<'_> {
+    /// What a write that left `pending` messages unread on the peer owes the
+    /// writer: nothing, unless it went past the limit, in which case the
+    /// policy exception. The message is already queued and the write still
+    /// answers `ZX_OK` when the exception is handled and the thread resumed;
+    /// unhandled, it kills the process and the answer never arrives.
+    async fn report_channel_full(&self, pending: usize) {
+        if pending > MAX_PENDING_MESSAGE_COUNT {
+            warn!(
+                "channel: {} messages pending on the peer ({}): raising the policy exception",
+                pending,
+                self.thread.proc().name()
+            );
+            self.thread
+                .raise_synth_exception(
+                    ExceptionType::PolicyError,
+                    POLICY_CODE_CHANNEL_FULL_WRITE,
+                    0,
+                )
+                .await;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Read/Receive a message from a channel.
     pub fn sys_channel_read(
@@ -47,6 +73,15 @@ impl Syscall<'_> {
                     core::mem::size_of::<u32>(),
                     MMUFlags::WRITE,
                 )?;
+                // Only the sizes decide whether the message stays on the
+                // channel: a buffer too small leaves it there to be read
+                // again. Whether the buffers can actually be written to is
+                // found out below, with the message already taken -- as
+                // Zircon does, where a copy-out that faults loses the message
+                // and closes its handles (`ChannelTest.ReadFaultDoesNotLeakHandles`
+                // reads 263K messages into a bad pointer and expects each one
+                // gone: checking the pointers first kept every one of them
+                // queued, and the writer was told about a full channel).
                 if num_bytes < front_msg.data.len() as u32
                     || num_handles < front_msg.handles.len() as u32
                 {
@@ -54,27 +89,6 @@ impl Syscall<'_> {
                     actual_handles.write_if_not_null(front_msg.handles.len() as u32)?;
                     Err(ZxError::BUFFER_TOO_SMALL)
                 } else {
-                    validate_user_range(
-                        proc,
-                        bytes.as_addr(),
-                        front_msg.data.len(),
-                        MMUFlags::WRITE,
-                    )?;
-                    let handle_size = if is_etc {
-                        core::mem::size_of::<HandleInfo>()
-                    } else {
-                        core::mem::size_of::<HandleValue>()
-                    };
-                    validate_user_range(
-                        proc,
-                        handles,
-                        front_msg
-                            .handles
-                            .len()
-                            .checked_mul(handle_size)
-                            .ok_or(ZxError::INVALID_ARGS)?,
-                        MMUFlags::WRITE,
-                    )?;
                     Ok(())
                 }
             })?
@@ -119,7 +133,7 @@ impl Syscall<'_> {
         Ok(())
     }
     /// Write a message to a channel.
-    pub fn sys_channel_write(
+    pub async fn sys_channel_write(
         &self,
         handle_value: HandleValue,
         options: u32,
@@ -139,7 +153,9 @@ impl Syscall<'_> {
             num_handles,
             false,
         )?;
-        channel.write(message)
+        let pending = channel.write_counted(message)?;
+        self.report_channel_full(pending).await;
+        Ok(())
     }
     /// Create a new channel.
     pub fn sys_channel_create(
@@ -349,7 +365,7 @@ impl Syscall<'_> {
     }
 
     /// Write a message to a channel.
-    pub fn sys_channel_write_etc(
+    pub async fn sys_channel_write_etc(
         &self,
         handle: HandleValue,
         options: u32,
@@ -369,7 +385,9 @@ impl Syscall<'_> {
             num_handles,
             false,
         )?;
-        channel.write(message)
+        let pending = channel.write_counted(message)?;
+        self.report_channel_full(pending).await;
+        Ok(())
     }
 }
 
@@ -702,11 +720,16 @@ fn read_channel_iovecs(proc: &Process, ptr: UserInPtr<u8>, count: u32) -> ZxResu
 }
 
 /// `zx_channel_read` options: only `ZX_CHANNEL_READ_MAY_DISCARD` (bit 0).
-/// Unknown bits are `INVALID_ARGS`, not `NOT_SUPPORTED` — same as write/call.
+///
+/// Unknown bits are `NOT_SUPPORTED`, which is what Zircon's `sys_channel_read`
+/// answers (`if (options & ~ZX_CHANNEL_READ_MAY_DISCARD) return
+/// ZX_ERR_NOT_SUPPORTED`) and what `ChannelTest.ReadInvalidOptionsReturnsNotSupported`
+/// asserts. Write and call answer `INVALID_ARGS` for theirs; the read is the
+/// odd one out, and it used to be made to match them, which failed the test.
 fn channel_read_options(options: u32) -> ZxResult<bool> {
     const MAY_DISCARD: u32 = 1;
     if options & !MAY_DISCARD != 0 {
-        return Err(ZxError::INVALID_ARGS);
+        return Err(ZxError::NOT_SUPPORTED);
     }
     Ok(options & MAY_DISCARD == 0)
 }
@@ -757,12 +780,12 @@ mod channel_read_options_tests {
         assert_eq!(channel_read_options(1), Ok(false));
         assert_eq!(
             channel_read_options(2),
-            Err(ZxError::INVALID_ARGS),
-            "unknown bits used to be NOT_SUPPORTED"
+            Err(ZxError::NOT_SUPPORTED),
+            "unknown bits are NOT_SUPPORTED on a read, as in Zircon; INVALID_ARGS is write's answer"
         );
         assert_eq!(
             channel_read_options(1 | (1 << 8)),
-            Err(ZxError::INVALID_ARGS)
+            Err(ZxError::NOT_SUPPORTED)
         );
     }
 }

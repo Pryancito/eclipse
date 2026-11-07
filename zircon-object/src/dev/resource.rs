@@ -28,8 +28,25 @@ pub enum SystemResource {
     /// base=0x5, size=0x1, "power")` before it ever calls
     /// `zx_system_powerctl`.
     Power = 5,
+    /// `ZX_RSRC_SYSTEM_IOMMU_BASE`, what `zx_iommu_create` takes. Measured
+    /// like `Power`: the core tests ask for `zx_resource_create(system,
+    /// options=0x5, base=0x8, size=0x1)` before every `zx_iommu_create`.
+    Iommu = 8,
     Debuglog = 12,
+    /// `ZX_RSRC_SYSTEM_STALL_BASE`. Measured like the others:
+    /// `StallGetInfoTest`'s suite set-up asks for `zx_resource_create(system,
+    /// options=0x5, base=13, size=1)`, and a system resource that ended at
+    /// `Debuglog` answered OUT_OF_RANGE -- after which zxtest ran NO further
+    /// suite at all: `Vmar`, `Threads`, `Pager`, `Timer`, `Resource` and the
+    /// rest of the second half of the core tests were listed with 0 ms.
+    Stall = 13,
+    /// `ZX_RSRC_SYSTEM_TRACING_BASE`, the last subrange Zircon defines.
+    Tracing = 14,
 }
+
+/// One past the last subrange of the SYSTEM resource: what the root system
+/// resource the loader hands userboot spans.
+pub const SYSTEM_RESOURCE_SUBRANGES: usize = SystemResource::Tracing as usize + 1;
 
 bitflags! {
     /// Bits for Resource.flags.
@@ -92,6 +109,16 @@ impl Resource {
         len: usize,
     ) -> ZxResult {
         self.validate(kind)?;
+        // The root resource stands for every range of every kind: the one
+        // the loader hands userboot is `[0, 0)`, and the subranges it carves
+        // out of it are checked against it as a kind, not as a range. A
+        // range that does not even fit the address space is still nonsense.
+        if self.kind == ResourceKind::ROOT {
+            return addr
+                .checked_add(len)
+                .map(|_| ())
+                .ok_or(ZxError::OUT_OF_RANGE);
+        }
         if addr >= self.addr && len <= self.len && addr - self.addr <= self.len - len {
             Ok(())
         } else {
@@ -194,6 +221,11 @@ mod tests {
             root.validate_ranged_resource(ResourceKind::SYSTEM, usize::MAX, 2),
             Err(ZxError::OUT_OF_RANGE)
         );
+        // The root resource as the loader creates it, with no range of its
+        // own, still stands for every subrange (`zx_iommu_create` with it).
+        let bare_root = Resource::create("root", ResourceKind::ROOT, 0, 0, ResourceFlags::empty());
+        assert!(bare_root.validate_system(SystemResource::Iommu).is_ok());
+        assert!(bare_root.validate_system(SystemResource::Power).is_ok());
     }
 
     /// `zx_system_powerctl` takes the POWER subrange of the system resource,
@@ -419,5 +451,42 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ResourceInfo, base), 8);
         assert_eq!(core::mem::offset_of!(ResourceInfo, size), 16);
         assert_eq!(core::mem::offset_of!(ResourceInfo, name), 24);
+    }
+}
+
+#[cfg(test)]
+mod system_subranges_tests {
+    use super::*;
+
+    /// The root system resource spans every subrange Zircon defines, the
+    /// stall one included: `StallGetInfoTest`'s suite set-up carves it out,
+    /// and a refusal there stopped zxtest from running any later suite.
+    #[test]
+    fn the_root_system_resource_reaches_the_stall_and_tracing_subranges() {
+        let system = Resource::create(
+            "system",
+            ResourceKind::SYSTEM,
+            0,
+            SYSTEM_RESOURCE_SUBRANGES,
+            ResourceFlags::empty(),
+        );
+        for sub in [
+            SystemResource::Power,
+            SystemResource::Iommu,
+            SystemResource::Debuglog,
+            SystemResource::Stall,
+            SystemResource::Tracing,
+        ] {
+            assert_eq!(
+                system.validate_ranged_resource(ResourceKind::SYSTEM, sub as usize, 1),
+                Ok(()),
+                "{:?} is outside the system resource",
+                sub
+            );
+        }
+        assert_eq!(
+            system.validate_ranged_resource(ResourceKind::SYSTEM, SYSTEM_RESOURCE_SUBRANGES, 1),
+            Err(ZxError::OUT_OF_RANGE)
+        );
     }
 }

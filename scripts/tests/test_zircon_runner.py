@@ -1,4 +1,5 @@
 import importlib.util
+import io
 from pathlib import Path
 import unittest
 
@@ -10,6 +11,50 @@ outcomes, unmet, verdict = runner.outcomes, runner.unmet, runner.verdict
 triage, platform_entries, summary_line = runner.triage, runner.platform_entries, runner.summary_line
 
 HARDWARE = {"Property.RegisterFsNoncanonical": "QEMU TCG lets the non-canonical WRFSBASE through"}
+
+
+class SiftingTheGuestLog(unittest.TestCase):
+    """The driver no longer holds a run's output in memory: a whole-suite run
+    at `LOG=info` is gigabytes, and the host killed the driver for memory
+    before it could give a verdict. What the verdict reads is kept; the
+    kernel's own log is not; and the last lines come back for the human."""
+
+    def test_only_the_markers_the_listing_and_the_exit_line_are_kept(self):
+        import io
+        guest = (
+            b"\x1b[37m[1970-01-01 00:00:00 INFO zircon_syscall] channel.write\n"
+            b"C11ThreadTest\n"
+            b"  .SelfDetachAndFree\n"
+            b"[ RUN      ] A.One\n"
+            b"[       OK ] A.One (1 ms)\n"
+            b"[ RUN      ] A.Two\n"
+            b"[  SKIPPED ] A.Two (0 ms)\n"
+            b"[ RUN      ] A.Three\n"
+            b"[  FAILED  ] A.Three (0 ms)\n"
+            b"[----------] 3 tests from A (1 ms total)\n"
+            b"*** Exit status -1028 ***\n"
+            b"Process exited, executing poweroff\n"
+        )
+        kept, tail = runner.sift(io.BytesIO(guest), tail=2)
+        self.assertNotIn("channel.write", kept)
+        self.assertEqual(runner.discovered_tests(kept), ["C11ThreadTest.SelfDetachAndFree"])
+        self.assertEqual(outcomes(kept), {"A.One": "OK", "A.Two": "SKIPPED", "A.Three": "FAILED"})
+        self.assertIn("*** Exit status -1028 ***", kept)
+        self.assertEqual(tail, "*** Exit status -1028 ***\nProcess exited, executing poweroff\n")
+
+    def test_a_serial_console_ends_its_lines_with_crlf_and_the_listing_still_counts(self):
+        guest = (
+            b"[  0.1 INFO 0 0:0 zcore] kernel noise\r\n"
+            b"Timer\r\n"
+            b"  .Basic\r\n"
+            b"[ RUN      ] Timer.Basic\r\n"
+            b"[       OK ] Timer.Basic (1 ms)\r\n"
+            b"*** Exit status 0 ***\r\n"
+        )
+        kept, _ = runner.sift(io.BytesIO(guest))
+        self.assertEqual(runner.discovered_tests(kept), ["Timer.Basic"])
+        self.assertEqual(outcomes(kept), {"Timer.Basic": "OK"})
+        self.assertEqual(runner.verdict("-l", kept, [], 0, False)[0], "OK")
 
 
 class PerTestOutcomes(unittest.TestCase):
@@ -157,9 +202,60 @@ class GuestFilters(unittest.TestCase):
                 option = "--gtest_filter=" + pattern
                 self.assertLessEqual(len(option), runner.MAX_OPTION_VALUE, f"{name}: {option}")
 
+    def test_a_case_that_never_finishes_is_kept_out_of_its_suite_s_run(self):
+        """gtest's `POSITIVE-NEGATIVE` form, with the loader's comma for the
+        colon that cannot travel through the kernel's command line."""
+        keep_out = ["Threads.ThreadLocalRegisterState", "Threads.X86AcFlagUserCopy"]
+        self.assertEqual(
+            runner.guest_filters(["Threads.One", "FifoTest.*"], keep_out),
+            ["Threads.*,-Threads.ThreadLocalRegisterState,Threads.X86AcFlagUserCopy", "FifoTest.*"],
+        )
+        self.assertEqual(runner.guest_filters(["*"], keep_out), ["*,-" + ",".join(keep_out)])
+        self.assertEqual(runner.guest_filters(["FifoTest.*"], keep_out), ["FifoTest.*"])
+
     def test_port_stress_is_one_run_and_ipc_port_is_one_per_test_case(self):
         self.assertEqual(runner.guest_filters(runner.GROUPS["port-stress"].split(",")), ["PortStressTest.*"])
         self.assertIn("FifoTest.*", runner.guest_filters(runner.GROUPS["ipc-port"].split(",")))
+
+
+class HangingCases(unittest.TestCase):
+    """A case that never finishes in the guest costs the rest of its suite's
+    run (gtest shuffles, so everything after it in the boot is lost): it is
+    skipped even when the known failures are opted into, and the only way to
+    run it is to ask for it by its full name."""
+
+    catalog = ["Threads.Good", "Threads.Hangs"]
+    hangs = {"Threads.Hangs": "never comes back from a suspended syscall"}
+
+    def test_it_is_skipped_with_its_reason(self):
+        selected, skipped, _ = triage(self.catalog, ["*"], {}, {}, ["*"], False, self.hangs)
+        self.assertEqual(selected, ["Threads.Good"])
+        self.assertEqual(skipped, self.hangs)
+
+    def test_opting_into_the_known_failures_does_not_run_it(self):
+        selected, skipped, _ = triage(self.catalog, ["Threads.*"], {}, {}, ["*"], True, self.hangs)
+        self.assertEqual(selected, ["Threads.Good"])
+        self.assertEqual(skipped, self.hangs)
+
+    def test_naming_it_in_full_does(self):
+        selected, skipped, _ = triage(self.catalog, ["Threads.Hangs"], {}, {}, ["*"], True, self.hangs)
+        self.assertEqual(selected, ["Threads.Hangs"])
+        self.assertEqual(skipped, {})
+
+    def test_a_hang_entry_may_be_a_pattern_so_the_guest_option_stays_short(self):
+        hangs = {"Threads.Ha*": "cut short"}
+        selected, skipped, _ = triage(self.catalog, ["*"], {}, {}, ["*"], False, hangs)
+        self.assertEqual(selected, ["Threads.Good"])
+        self.assertEqual(skipped, {"Threads.Hangs": "cut short"})
+        self.assertEqual(runner.guest_filters(["*"], sorted(hangs)), ["*,-Threads.Ha*"])
+
+    def test_the_flag_is_read_off_the_skip_entry_for_the_platform(self):
+        overrides = {"skips": [
+            {"test": "Threads.Hangs", "platforms": ["*-libos"], "reason": "why", "hangs": True},
+            {"test": "Threads.Slow", "platforms": ["*"], "reason": "fails"},
+        ]}
+        self.assertEqual(runner.hanging_cases(overrides, "x86_64-libos"), {"Threads.Hangs": "why"})
+        self.assertEqual(runner.hanging_cases(overrides, "x86_64-bare"), {})
 
 
 class Catalog(unittest.TestCase):

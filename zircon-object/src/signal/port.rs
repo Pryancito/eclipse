@@ -29,6 +29,17 @@ pub struct Port {
 
 impl_kobject!(Port);
 
+/// How many observers one port may hold before the thread registering one
+/// more is told about it: Zircon's `kernel.port.max-observers`, at its
+/// default. The observer is still registered -- the call succeeds -- and the
+/// thread gets a `ZX_EXCP_POLICY_ERROR` with
+/// `ZX_EXCP_POLICY_CODE_PORT_TOO_MANY_OBSERVERS`, which kills the process
+/// unless a handler lets it carry on; that is the syscall layer's job.
+/// `PortTest.TooManyObservers` registers observers in a loop until exactly
+/// that happens and then waits for the process to be gone: without it the
+/// loop never ended.
+pub const MAX_PORT_OBSERVERS: usize = 50_000;
+
 #[derive(Default, Debug)]
 struct PortInner {
     queue: VecDeque<QueuedPacket>,
@@ -178,6 +189,19 @@ impl Port {
                     cancel,
                 },
             );
+            // An observer whose handle closed is only ever noticed when its
+            // signal fires, so a port can carry thousands that are dead;
+            // Zircon drops them at the close. They must not count against
+            // `MAX_PORT_OBSERVERS`: `PortStressTest.CloseWaitRace` registers
+            // waits on an event, closes it every hundred, and never fires
+            // one, and was killed for too many observers that were all
+            // dead. The sweep is O(n), so it runs only when the limit is
+            // reached, which makes it amortised O(1) per registration.
+            if inner.observers.len() > MAX_PORT_OBSERVERS {
+                inner
+                    .observers
+                    .retain(|_, observer| !observer.handle_closed());
+            }
             id
         };
         let port = Arc::downgrade(self);
@@ -188,6 +212,13 @@ impl Port {
             port.signal_observer(id, observed)
         }));
         Ok(())
+    }
+
+    /// How many observers this port holds right now, [`MAX_PORT_OBSERVERS`]
+    /// being the number past which a registration owes its thread the
+    /// policy exception.
+    pub fn observer_count(&self) -> usize {
+        self.inner.lock().observers.len()
     }
 
     fn signal_observer(&self, id: u64, observed: Signal) -> bool {
@@ -413,6 +444,79 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+
+    /// Past the limit, the observers whose handle has closed are swept
+    /// before the count is read: they are not observers any more, only
+    /// entries nobody has had a reason to remove.
+    #[test]
+    fn a_closed_handle_s_observers_do_not_count_against_the_limit() {
+        use alloc::vec::Vec;
+        use futures::channel::oneshot;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        let mut closers = Vec::new();
+        for n in 0..MAX_PORT_OBSERVERS {
+            let (closer, closed) = oneshot::channel();
+            closers.push(closer);
+            port.wait_async(
+                &object,
+                (0, n as HandleValue),
+                42,
+                Signal::READABLE,
+                WaitAsyncOptions::empty(),
+                Some(closed),
+            )
+            .unwrap();
+        }
+        assert_eq!(port.observer_count(), MAX_PORT_OBSERVERS);
+        // Close every handle but the first; nothing fires, so nothing
+        // notices until the next registration pushes the port over.
+        for closer in closers.drain(1..) {
+            drop(closer);
+        }
+        assert_eq!(port.observer_count(), MAX_PORT_OBSERVERS);
+        port.wait_async(
+            &object,
+            (0, 0),
+            42,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            port.observer_count(),
+            2,
+            "the one still open and the one just registered"
+        );
+    }
+
+    /// The count a registration is judged by is the port's, across every
+    /// object it watches, and the one past `MAX_PORT_OBSERVERS` is still
+    /// registered: the exception is the syscall's business, not a refusal.
+    #[test]
+    fn every_registration_counts_against_the_port_and_none_is_refused() {
+        let port = Port::new(0).unwrap();
+        let one = DummyObject::new() as Arc<dyn KernelObject>;
+        let other = DummyObject::new() as Arc<dyn KernelObject>;
+        assert_eq!(port.observer_count(), 0);
+        for (n, object) in IntoIterator::into_iter([&one, &other, &one]).enumerate() {
+            port.wait_async(
+                object,
+                (0, n as HandleValue),
+                42,
+                Signal::READABLE,
+                WaitAsyncOptions::empty(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(port.observer_count(), n + 1);
+        }
+        assert!(
+            MAX_PORT_OBSERVERS > 3,
+            "the limit is the kernel's, not this test's three"
+        );
+    }
 
     /// `ZX_WAIT_ASYNC_EDGE` asks for the packet on an inactive→active
     /// transition *after* the call, so a signal that was already asserted

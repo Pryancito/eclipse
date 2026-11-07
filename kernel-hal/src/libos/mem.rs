@@ -13,8 +13,16 @@ type FrameAlloc = bitmap_allocator::BitAlloc1M;
 
 /// Map physical memory from here.
 pub(super) const PMEM_MAP_VADDR: VirtAddr = 0x8_0000_0000;
-/// Physical memory size = 1GiB
-pub(super) const PMEM_SIZE: usize = 0x4000_0000;
+/// Physical memory size = 4 GiB, the most `BitAlloc1M` can keep track of.
+///
+/// A sparse file, so only the frames a guest touches cost the host anything.
+/// It was 1 GiB, and that is what `RseqTest.ManyConcurrent` ran out of: a
+/// guest page that is accessible is committed as soon as it is mapped here
+/// (there is no demand paging in libos), so each of its 2048 threads cost its
+/// whole 256 KiB stack and 256 KiB unsafe stack up front, and the 1888th
+/// thread's `zx_vmar_map` came back NO_MEMORY with 1023 MiB used. Zircon
+/// commits a stack page when it is first touched, and the test assumes it.
+pub(super) const PMEM_SIZE: usize = 0x1_0000_0000;
 
 lazy_static! {
     pub(super) static ref FRAME_ALLOCATOR: Mutex<FrameAlloc> = {

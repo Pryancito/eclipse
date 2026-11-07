@@ -323,7 +323,17 @@ impl Drop for KObjectBase {
     }
 }
 
-const MAX_SIGNAL_CALLBACKS: usize = 1024;
+/// Live signal callbacks one object may hold before a new one is refused.
+///
+/// Zircon has no such limit, and a program can legitimately park thousands of
+/// waiters on one object: `RseqTest.ManyConcurrent` blocks 2048 threads in
+/// `zx_object_wait_one` on a single event, and at 1024 the 1025th was
+/// "refused -- whoever registered it will never be woken", so the test hung
+/// for the whole harness timeout. The dead ones are swept before the count
+/// is believed (see `add_signal_callback`), so this only bounds LIVE
+/// waiters, and a boxed closure is a few dozen bytes: 65536 of them is a
+/// couple of megabytes on an object that is clearly being leaned on.
+const MAX_SIGNAL_CALLBACKS: usize = 1 << 16;
 
 /// The mutable part of `KObjectBase`.
 #[derive(Default)]

@@ -219,12 +219,11 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let thread = proc.get_object_with_rights::<Thread>(handle_value, Rights::MANAGE_THREAD)?;
-        if thread.proc().status() != Status::Running {
-            return Err(ZxError::BAD_STATE);
-        }
         // One step, so a thread that has already started is refused before
-        // its registers are touched. See `Thread::start_with`.
-        thread.start_with(
+        // its registers are touched. See `Thread::start_with`. The thread's
+        // process need not have been started: see `Process::start_thread`.
+        thread.proc().start_thread(
+            &thread,
             |ctx| {
                 ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
                 // Match process startup: every Zircon thread can use FP/vector
@@ -254,10 +253,22 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let thread = proc.get_object_with_rights::<Thread>(handle_value, Rights::MANAGE_THREAD)?;
-        if thread.proc().status() != Status::Running {
+        if let Status::Exited(_) = thread.proc().status() {
             return Err(ZxError::BAD_STATE);
         }
-        thread.start_with(
+        // An entry point past the thread's address space is refused before
+        // the thread exists to fault on it (`Threads.ThreadStartWithNonUserPc`:
+        // bit 55, a kernel address, the power of two past the root VMAR);
+        // `0` is below it and starts a thread that faults at once, which
+        // `ThreadStartWithZeroInstructionPointer` counts on. The thread
+        // pointer is an address too, and one past the space can never be
+        // loaded through (`StartRegsNoncanonicalTp`).
+        let user_end = thread.proc().vmar().user_limit();
+        if entry >= user_end || tp >= user_end {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        thread.proc().start_thread(
+            &thread,
             |ctx| {
                 ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
                 ctx.set_field(UserContextField::ThreadPointer, tp);

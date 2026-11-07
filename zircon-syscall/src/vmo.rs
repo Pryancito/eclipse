@@ -89,6 +89,12 @@ impl Syscall<'_> {
         let end = (offset as usize)
             .checked_add(buf_size)
             .ok_or(ZxError::OUT_OF_RANGE)?;
+        // The range comes first, as in Zircon: `VmoTestCase.ReadWriteBadLen`
+        // writes `usize::MAX - page` bytes from a 4-page buffer and expects
+        // OUT_OF_RANGE, not the NOT_FOUND the buffer check would give.
+        if !vmo.can_write_to(end) {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
         // The caller's buffer is checked BEFORE the object is grown. An
         // unbounded or resizable VMO grows to fit a write, and this used to
         // grow it first: a `zx_vmo_write` naming a buffer the caller does not

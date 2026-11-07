@@ -1,5 +1,6 @@
 """Run Zircon core-tests with explicit skips and separate kernel/guest logs."""
 import argparse
+import collections
 import fnmatch
 import json
 import os
@@ -36,6 +37,37 @@ MAX_OPTION_VALUE = 187
 
 
 UNCLASSIFIED = "Not yet classified for this core-tests image"
+
+
+# What the verdict reads out of a run: the gtest markers, the listing, and the
+# exit line. Everything else the guest prints -- the kernel's own log at the
+# level asked for, which is most of it -- goes to the guest log on disk and
+# nowhere else. A bare-metal guest talks over a serial console that ends its
+# lines with `\r\n`, and `$` only looks past a trailing `\n`: anchored without
+# the `\r?`, the listing of a QEMU run was dropped whole and discovery came
+# back empty while the libos run, which prints bare `\n`, was fine.
+KEPT_LINE = re.compile(rb"^(\[ *(RUN|OK|FAILED|SKIPPED|-+|=+) *\]|\*\*\* Exit status|[\w/]+\r?$|  \.[\w/]+\r?$)")
+
+# How many of the guest's last lines a failed run shows.
+TAIL_LINES = 60
+
+
+def sift(stream, tail=TAIL_LINES):
+    """Read a guest's output to its end, keeping only what the verdict needs
+    and the last `tail` lines for the human.
+
+    Everything used to be held in memory and then decoded, searched and sliced
+    whole. A full libos run at `LOG=info` prints several gigabytes -- one
+    `ChannelTest.*` run alone was 286 MB, `ReadFaultDoesNotLeakHandles` logs
+    263K reads -- and the host killed the driver for memory (12 GB resident)
+    before it could say what the guest had done.
+    """
+    kept, last = [], collections.deque(maxlen=tail)
+    for line in stream:
+        if KEPT_LINE.match(line):
+            kept.append(line)
+        last.append(line)
+    return b"".join(kept).decode(errors="replace"), b"".join(last).decode(errors="replace")
 
 
 def outcomes(output):
@@ -82,15 +114,22 @@ def verdict(selection, text, expected, returncode, timed_out):
     return ("OK" if returncode == 0 and complete else "FAILED"), results, missing
 
 
-def guest_filters(patterns):
+def guest_filters(patterns, keep_out=()):
     """One `--gtest_filter` pattern per run, because the guest takes ONE.
 
-    `--gtest_filter` is a single pattern there: a comma does not separate
-    patterns (measured -- a comma-joined list of 40 real test names matched
-    nothing), and a colon, which is what gtest itself separates with, cannot
-    travel because this kernel's command line separates its own options with
-    colons. So a batch of individual names cannot be expressed at all. What can
-    is one wildcard per test case, which is what this returns.
+    `--gtest_filter` is a single positive pattern there: a colon, which is
+    what gtest separates patterns with, cannot travel because this kernel's
+    command line separates its own options with colons. So a batch of
+    individual names cannot be expressed. What can is one wildcard per test
+    case, which is what this returns.
+
+    `keep_out` names the cases that must not run in the guest at all -- the
+    ones that never finish, which with gtest's shuffle take the rest of
+    their suite's run with them. gtest's `POSITIVE-NEGATIVE:NEGATIVE` form
+    carries them, with a comma for the colon: the loader turns a comma in
+    this one option back into gtest's colon (`guest_options` in
+    `loader/src/zircon.rs`), which is why a comma-joined list of real names
+    used to match nothing: gtest never saw a separator.
     """
     suites = []
     for pattern in patterns:
@@ -99,10 +138,32 @@ def guest_filters(patterns):
             # A pattern with no literal test case to stand on (`*` among them):
             # nothing narrower is expressible, so ask for everything and let
             # the host sort the answers out.
-            return ["*"]
+            suites = ["*"]
+            break
         if suite not in suites:
             suites.append(suite)
-    return [suite + ".*" for suite in suites] or ["*"]
+    filters = []
+    for suite in suites or ["*"]:
+        positive = "*" if suite == "*" else suite + ".*"
+        negatives = [name for name in keep_out if suite == "*" or name.startswith(suite + ".")]
+        # `POSITIVE:-NEGATIVE`, with the colon BEFORE the minus. zxtest's
+        # matcher walks the whole option as one C string and only `:` or the
+        # end stops a pattern, so in `Suite.*-Suite.A` the positive wildcard
+        # has to swallow `-Suite.A` too and matches nothing (measured: 0
+        # tests from 0 test cases). With the colon the positive ends where
+        # it should.
+        filters.append(positive + (",-" + ",".join(negatives) if negatives else ""))
+    return filters
+
+
+def hanging_cases(overrides, platform):
+    """The skips that must stay out of the guest, not just out of the tally:
+    `"hangs": true` on a skip entry says the case never finishes here."""
+    return {
+        entry["test"]: entry["reason"]
+        for entry in overrides.get("skips", [])
+        if entry.get("hangs") and any(fnmatch.fnmatchcase(platform, pattern) for pattern in entry["platforms"])
+    }
 
 
 def discovered_tests(output):
@@ -133,7 +194,7 @@ def load_expectations(arch, libos):
             if fnmatch.fnmatchcase(name, pattern):
                 cases[name] = None
     cases.update(platform_entries(overrides["skips"], platform))
-    return cases, platform_entries(overrides.get("needs_hardware", []), platform)
+    return cases, platform_entries(overrides.get("needs_hardware", []), platform), hanging_cases(overrides, platform)
 
 
 def platform_entries(entries, platform):
@@ -145,20 +206,33 @@ def platform_entries(entries, platform):
     }
 
 
-def triage(available, patterns, expectations, hardware, supported, include_skipped):
+def triage(available, patterns, expectations, hardware, supported, include_skipped, hangs=None):
     """Split the catalog into what this run asks the guest for, what it skips,
     and what it cannot even attempt here.
 
     A test in `hardware` is one measured to be unreachable on an emulated CPU,
     not one that fails: it is never run and never counted as passed, but it
     keeps its own name and reason so it does not vanish from the tally.
+
+    A test in `hangs` never finishes in the guest, and one of those costs the
+    rest of its suite's run; it stays skipped even when the known failures are
+    opted into, unless a pattern names it by its full name -- which is someone
+    debugging that very case.
     """
+    hangs = hangs or {}
     selected, skipped, needs_hardware = [], {}, {}
     for name in sorted(available):
         if not any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
             continue
         if name in hardware and not include_skipped:
             needs_hardware[name] = hardware[name]
+            continue
+        # A hang entry may be a pattern (`InterruptTest.Untriggered*Wait`):
+        # the guest option that keeps the hangers out is capped at
+        # MAX_OPTION_VALUE characters, and a pattern is shorter than the name.
+        hang = next((why for pattern, why in hangs.items() if fnmatch.fnmatchcase(name, pattern)), None)
+        if hang is not None and not (include_skipped and name in patterns):
+            skipped[name] = hang
             continue
         reason = expectations.get(name, UNCLASSIFIED)
         if name not in expectations and any(fnmatch.fnmatchcase(name, pattern) for pattern in supported):
@@ -228,7 +302,15 @@ class Runner:
         option = "--gtest_list_tests" if selection == "-l" else "--gtest_filter=" + selection
         if len(option) > MAX_OPTION_VALUE:
             raise ValueError(f"the guest would cut this option off: {option}")
-        cmdline = "LOG=info:userboot.shutdown:" + option
+        # `kernel.test.ram.reserve`: RAM for the physical-VMO cases, which
+        # otherwise take the test process down (see the loader's
+        # `reserve_test_ram`). The size is the one the ZBI's own command line
+        # asks for; the test reads the option back from `boot-options.txt`,
+        # which this kernel builds from ITS command line, so it has to be
+        # said here too. Hosted only until the bare-metal builds have been
+        # measured with it.
+        reserve = "kernel.test.ram.reserve=0x8000:" if self.args.libos else ""
+        cmdline = f"LOG={self.args.guest_log}:userboot.shutdown:{reserve}" + option
         env = dict(os.environ, ZCORE_KERNEL_LOG=kernel_log)
         if self.args.libos:
             zircon_arch = {"x86_64": "x64", "aarch64": "arm64", "riscv64": "riscv64"}[self.args.arch]
@@ -241,20 +323,23 @@ class Runner:
         # well clear of that rather than at it.
         slow = selection in ("-l", "*") or "PortStressTest." in selection
         limit = max(self.args.timeout, 1200) if slow else self.args.timeout
-        with open(str(prefix) + ".host.log", "wb") as errors:
-            proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=errors, start_new_session=True)
+        # The guest writes its log straight to disk; see `sift` for why it is
+        # not read back whole.
+        guest_log = str(prefix) + ".guest.log"
+        with open(str(prefix) + ".host.log", "wb") as errors, open(guest_log, "wb") as guest:
+            proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=guest, stderr=errors, start_new_session=True)
             try:
-                output, _ = proc.communicate(timeout=limit)
+                proc.wait(timeout=limit)
                 timed_out = False
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
-                output, _ = proc.communicate()
+                proc.wait()
                 timed_out = True
-        self.output = output.decode(errors="replace")
+        with open(guest_log, "rb") as guest:
+            self.output, tail = sift(guest)
         status, results, missing = verdict(
             selection, self.output, expected, proc.returncode, timed_out
         )
-        Path(str(prefix) + ".guest.log").write_bytes(output)
         record = {
             "selection": selection,
             "status": status,
@@ -279,8 +364,8 @@ class Runner:
                 print(f"  {outcome}: {name}", flush=True)
             if len(missing) > 20:
                 print(f"  ... and {len(missing) - 20} more", flush=True)
-            print(output.decode(errors="replace")[-5000:], flush=True)
-            print(f"Diagnostics: {prefix}.kernel.log and {prefix}.host.log", flush=True)
+            print(tail, flush=True)
+            print(f"Diagnostics: {guest_log} and {prefix}.host.log", flush=True)
         return status == "OK"
 
     def finish(self, skipped, needs_hardware=None):
@@ -314,6 +399,12 @@ def main():
     parser.add_argument("--x64-cpu")
     parser.add_argument("--qemu")
     parser.add_argument("--log-dir")
+    # `warn` by default: at `info` the kernel traces every syscall, which for a
+    # whole-suite run is gigabytes of guest log (and the artifact CI uploads),
+    # and most of the run's wall time is spent printing it. `info` is for
+    # reproducing one case: `-t Suite.Case --guest-log info`.
+    parser.add_argument("--guest-log", choices=["error", "warn", "info", "debug", "trace"], default="warn",
+                        help="the kernel's log level inside the guest (default: warn)")
     args = parser.parse_args()
     runner = Runner(args)
     if not args.skip_build:
@@ -322,11 +413,11 @@ def main():
         runner.finish({})
         return 1
     available = discovered_tests(runner.output)
-    expectations, hardware = load_expectations(args.arch, args.libos)
+    expectations, hardware, hangs = load_expectations(args.arch, args.libos)
     config = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
     selection = args.test or (GROUPS[args.group] if args.group else "*")
     selected, skipped, needs_hardware = triage(
-        available, selection.split(","), expectations, hardware, config.get("supported", []), args.include_skipped
+        available, selection.split(","), expectations, hardware, config.get("supported", []), args.include_skipped, hangs
     )
     for name, reason in sorted(needs_hardware.items()):
         print(f"NEEDS-HARDWARE: {name}: {reason}")
@@ -340,8 +431,13 @@ def main():
     # selection names. Individual names cannot be batched into one run (see
     # `guest_filters`), so each run also sweeps up tests nobody asked for; they
     # are reported but they do not decide the run.
-    for pattern in guest_filters(selection.split(",")):
-        prefix = pattern[:-1] if pattern.endswith(".*") else ""
+    # The cases that never finish stay out of the guest's filter; the ones
+    # the selection asked for by name (and that triage therefore selected)
+    # are the exception.
+    keep_out = sorted(name for name in hangs if name not in selected)
+    for pattern in guest_filters(selection.split(","), keep_out):
+        positive = pattern.split(",", 1)[0]
+        prefix = positive[:-1] if positive.endswith(".*") else ""
         covered = [name for name in selected if name.startswith(prefix)]
         if covered:
             runner.run(pattern, expected=covered)

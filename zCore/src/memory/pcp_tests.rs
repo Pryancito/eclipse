@@ -182,3 +182,29 @@ fn an_allocation_is_served_from_what_the_lists_had_parked() {
     }
     frame_drain_percpu();
 }
+
+/// A refill is handed out in ascending order, the way the bitmap gave it.
+/// libos depends on it: consecutive frames are consecutive offsets in the
+/// frame file, and only then does the host merge the per-page mappings of a
+/// thread stack into one VMA (`RseqTest.ManyConcurrent`, 2048 stacks, hit
+/// `vm.max_map_count` when the list reversed every batch).
+#[test]
+fn a_refill_comes_out_in_ascending_order() {
+    let _alone = alone();
+    let base = 0x90_0000;
+    const N: usize = 64;
+    insert_regions(core::slice::from_ref(&(base..base + N * PAGE)));
+    let mut got = alloc::vec::Vec::new();
+    for _ in 0..pcp::BATCH {
+        got.push(frame_alloc(1, 0).expect("the region has frames"));
+    }
+    let mut sorted = got.clone();
+    sorted.sort_unstable();
+    // Ascending, not necessarily contiguous: other tests' regions may have
+    // left lower free frames behind, and the bitmap hands out the lowest.
+    assert_eq!(got, sorted, "a batch must come out ascending: {:#x?}", got);
+    for addr in got {
+        frame_dealloc(addr);
+    }
+    frame_drain_percpu();
+}

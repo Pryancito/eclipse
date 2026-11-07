@@ -700,9 +700,17 @@ impl TrapReason {
     #[cfg(target_arch = "x86_64")]
     pub fn from(trap_num: usize, error_code: usize) -> Self {
         Self::from_x86(trap_num, error_code, || {
-            x86_64::registers::control::Cr2::read()
-                .ok()
-                .map(|addr| addr.as_u64() as VirtAddr)
+            cfg_if! {
+                if #[cfg(all(feature = "libos", target_os = "linux"))] {
+                    // A hosted kernel cannot read `CR2`; the fault bridge
+                    // kept the address the host reported.
+                    crate::fault_bridge::fault_address()
+                } else {
+                    x86_64::registers::control::Cr2::read()
+                        .ok()
+                        .map(|addr| addr.as_u64() as VirtAddr)
+                }
+            }
         })
     }
 
@@ -1181,6 +1189,21 @@ impl UserContext {
                 // its own on this host thread. See `libos::fault_bridge`.
                 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                 crate::fault_bridge::ensure_altstack();
+                // The time slice: a host timer that ticks this thread every
+                // 10 ms. A tick that lands out in the guest comes back as
+                // the timer interrupt; one that landed on the kernel's side
+                // since the last trip is honoured here, before going out, as
+                // that same interrupt with nothing run. See
+                // `libos::fault_bridge::PREEMPT_VECTOR`.
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                {
+                    crate::fault_bridge::ensure_tick();
+                    if crate::fault_bridge::take_resched() {
+                        self.0.trap_num = crate::fault_bridge::PREEMPT_VECTOR;
+                        self.0.error_code = 0;
+                        return;
+                    }
+                }
                 self.0.run_fncall()
             } else {
                 #[cfg(target_arch = "x86_64")]
@@ -1465,6 +1488,31 @@ impl UserContext {
         }
     }
 
+    /// The thread's extended register save area (x87, SSE, AVX...), as the
+    /// CPU laid it out with XSAVE or FXSAVE. See
+    /// [`trapframe::FpState::as_bytes`].
+    #[cfg(any(target_arch = "x86_64", doc))]
+    #[doc(cfg(target_arch = "x86_64"))]
+    pub fn extended_state(&self) -> &[u8] {
+        self.0.fpstate.as_bytes()
+    }
+
+    /// The thread's extended register save area, to write registers into.
+    /// See [`trapframe::FpState::as_bytes_mut`].
+    #[cfg(any(target_arch = "x86_64", doc))]
+    #[doc(cfg(target_arch = "x86_64"))]
+    pub fn extended_state_mut(&mut self) -> &mut [u8] {
+        self.0.fpstate.as_bytes_mut()
+    }
+
+    /// The XSAVE components the kernel saves and restores for a thread; zero
+    /// on the FXSAVE path. See [`trapframe::xsave_components`].
+    #[cfg(any(target_arch = "x86_64", doc))]
+    #[doc(cfg(target_arch = "x86_64"))]
+    pub fn xsave_components() -> u32 {
+        trapframe::xsave_components()
+    }
+
     /// Returns the reference of general registers.
     pub fn general(&self) -> &GeneralRegs {
         &self.0.general
@@ -1482,7 +1530,7 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.general.rip,
                     UserContextField::StackPointer => &mut self.0.general.rsp,
                     UserContextField::ThreadPointer => &mut self.0.general.fsbase,
-                    UserContextField::AbiRegister => &mut self.0.general.r10,
+                    UserContextField::AbiRegister => &mut self.0.general.r15,
                     UserContextField::ReturnValue => &mut self.0.general.rax,
                     UserContextField::CpuFlags => &mut self.0.general.rflags,
                 }
@@ -1500,7 +1548,7 @@ impl UserContext {
                     UserContextField::InstrPointer => &mut self.0.sepc,
                     UserContextField::StackPointer => &mut self.0.general.sp,
                     UserContextField::ThreadPointer => &mut self.0.general.tp,
-                    UserContextField::AbiRegister => &mut self.0.general.a7,
+                    UserContextField::AbiRegister => &mut self.0.general.gp,
                     UserContextField::ReturnValue => &mut self.0.general.a0,
                     UserContextField::CpuFlags => &mut self.0.sstatus,
                 }
@@ -1776,6 +1824,25 @@ mod compat_tls_tests {
 mod tests {
     use super::*;
     use crate::{Kind, Source};
+
+    /// `zx_thread_start_regs`'s `abi_reg` is the architecture's reserved
+    /// register, which the core tests read back from the general registers:
+    /// `r15` on x86_64, `x18` on aarch64, `gp` on riscv64
+    /// (`Threads.StartRegsSuspended`). It was `r10`/`a7` here.
+    #[test]
+    fn the_abi_register_is_the_one_the_thread_state_abi_names() {
+        let mut ctx = UserContext::new();
+        ctx.set_field(UserContextField::AbiRegister, 0xfeed_face_dead_beef);
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                assert_eq!(ctx.general().r15, 0xfeed_face_dead_beef);
+            } else if #[cfg(target_arch = "aarch64")] {
+                assert_eq!(ctx.general().x18, 0xfeed_face_dead_beef);
+            } else if #[cfg(target_arch = "riscv64")] {
+                assert_eq!(ctx.general().gp, 0xfeed_face_dead_beef);
+            }
+        }
+    }
 
     // ---- x86 error codes --------------------------------------------------
 

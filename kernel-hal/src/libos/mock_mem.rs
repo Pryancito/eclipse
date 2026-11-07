@@ -26,12 +26,23 @@ impl MockMemory {
         unistd::ftruncate(fd, size as _).expect("failed to set size of shared memory!");
 
         let mem = Self { size, fd };
-        mem.mmap(PMEM_MAP_VADDR, size, 0, MMUFlags::READ | MMUFlags::WRITE);
+        assert!(
+            mem.mmap(PMEM_MAP_VADDR, size, 0, MMUFlags::READ | MMUFlags::WRITE),
+            "no room for the physical memory window"
+        );
         mem
     }
 
     /// Mmap `paddr` to `vaddr` in frame file.
-    pub fn mmap(&self, vaddr: VirtAddr, len: usize, paddr: PhysAddr, prot: MMUFlags) {
+    ///
+    /// `false` when the host has no room for one more mapping (`ENOMEM`:
+    /// `vm.max_map_count` reached, 65530 by default). That is the guest's
+    /// problem to report (`NO_MEMORY` from the mapping), not a kernel panic:
+    /// as a panic it killed one executor thread and left the guest hung for
+    /// the rest of the harness timeout. Any other failure is a mock bug and
+    /// still panics.
+    #[must_use]
+    pub fn mmap(&self, vaddr: VirtAddr, len: usize, paddr: PhysAddr, prot: MMUFlags) -> bool {
         assert!(paddr < self.size);
         assert!(paddr + len <= self.size);
 
@@ -59,14 +70,20 @@ impl MockMemory {
             prot,
         );
 
-        unsafe { mman::mmap(vaddr as _, len, prot_noexec, flags, fd, offset) }.unwrap_or_else(
-            |err| {
-                panic!(
-                    "failed to mmap: fd={}, offset={:#x}, len={:#x}, vaddr={:#x}, prot={:?}: {:?}",
-                    fd, offset, len, vaddr, prot, err
-                )
-            },
-        );
+        match unsafe { mman::mmap(vaddr as _, len, prot_noexec, flags, fd, offset) } {
+            Ok(_) => {}
+            Err(nix::Error::ENOMEM) => {
+                warn!(
+                    "mmap refused by the host (ENOMEM, vm.max_map_count?): offset={:#x}, len={:#x}, vaddr={:#x}",
+                    offset, len, vaddr
+                );
+                return false;
+            }
+            Err(err) => panic!(
+                "failed to mmap: fd={}, offset={:#x}, len={:#x}, vaddr={:#x}, prot={:?}: {:?}",
+                fd, offset, len, vaddr, prot, err
+            ),
+        }
         if prot.contains(MMUFlags::EXECUTE) {
             // The range was mapped just above, so a "not mapped" answer here
             // would be a mock bug, not a lazy page.
@@ -76,6 +93,7 @@ impl MockMemory {
                 vaddr
             );
         }
+        true
     }
 
     pub fn munmap(&self, vaddr: VirtAddr, len: usize) {

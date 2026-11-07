@@ -35,6 +35,7 @@ bitflags! {
         const JOB_TERMINATED                = Self::SIGNALED.bits;
         const JOB_NO_JOBS                   = 1 << 4;
         const JOB_NO_PROCESSES              = 1 << 5;
+        const JOB_NO_CHILDREN               = 1 << 6;
 
         const PROCESS_TERMINATED            = Self::SIGNALED.bits;
 
@@ -146,6 +147,7 @@ mod tests {
             ),
             ("ZX_JOB_NO_JOBS", Signal::JOB_NO_JOBS, 1 << 4),
             ("ZX_JOB_NO_PROCESSES", Signal::JOB_NO_PROCESSES, 1 << 5),
+            ("ZX_JOB_NO_CHILDREN", Signal::JOB_NO_CHILDREN, 1 << 6),
             ("ZX_THREAD_RUNNING", Signal::THREAD_RUNNING, 1 << 4),
             ("ZX_THREAD_SUSPENDED", Signal::THREAD_SUSPENDED, 1 << 5),
             ("ZX_INTERRUPT_SIGNAL", Signal::INTERRUPT_SIGNAL, 1 << 4),
@@ -218,6 +220,7 @@ mod tests {
             ("SOCKET_WRITE_THRESHOLD", Signal::SOCKET_WRITE_THRESHOLD),
             ("JOB_NO_JOBS", Signal::JOB_NO_JOBS),
             ("JOB_NO_PROCESSES", Signal::JOB_NO_PROCESSES),
+            ("JOB_NO_CHILDREN", Signal::JOB_NO_CHILDREN),
             ("THREAD_RUNNING", Signal::THREAD_RUNNING),
             ("THREAD_SUSPENDED", Signal::THREAD_SUSPENDED),
             ("INTERRUPT_SIGNAL", Signal::INTERRUPT_SIGNAL),

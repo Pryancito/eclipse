@@ -258,6 +258,11 @@ pub struct VmAddressRegion {
     max_height: u32,
     /// If inner is None, this region is destroyed, all operations are invalid.
     inner: Mutex<Option<VmarInner>>,
+    /// `[start, end)` of the vDSO's code in this address space, once it is
+    /// mapped executable. Shared by the whole tree under a root, since the
+    /// mapping lands in whichever sub-region userboot or the loader picked.
+    /// See [`VmAddressRegion::syscall_may_come_from`].
+    vdso_code: Arc<Mutex<Option<(usize, usize)>>>,
 }
 
 /// How deep sub-regions nest under a root VMAR.
@@ -388,9 +393,31 @@ mod aspace_window {
     /// `ENOMEM`, from inside a page fault, in whatever unrelated code ran next.
     pub const WINDOWS: usize = (USER_ASPACE_TOP - BASE) / SIZE;
 
-    /// The top of the host's user address space. 47 bits on x86_64 and on a
-    /// conventional aarch64 host; the macOS window is far below it either way.
+    /// Where the windows stop. Below the host's own code on purpose.
+    ///
+    /// A 47-bit user address space tops out at 128 TiB, but a hosted guest
+    /// must not share an address range with the kernel it runs inside of:
+    /// the libos fault bridge tells a guest's `syscall` instruction from the
+    /// kernel's own by the instruction pointer alone (a seccomp filter on the
+    /// address, see `kernel_hal::libos::fault_bridge::trap_guest_syscalls`),
+    /// so every address a guest can execute from has to be one the kernel
+    /// never executes from. On Linux x86_64 a PIE kernel is loaded at
+    /// `0x5555_5555_4000` plus the ASLR offset, its shared libraries and
+    /// stacks sit near `0x7fff_...`, and a non-PIE one at `0x40_0000`, below
+    /// [`BASE`]: 64 TiB leaves 1023 windows of 64 GiB, every one of them
+    /// below all of that.
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    const USER_ASPACE_TOP: usize = 0x4000_0000_0000;
+    /// The macOS window is far below the host's code either way.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     const USER_ASPACE_TOP: usize = 0x8000_0000_0000;
+
+    /// Every address a hosted guest can be given, as one range: from the
+    /// first window's base to the top of the last. What the host-side trap
+    /// on guest `syscall` instructions is keyed on.
+    pub const fn range() -> core::ops::Range<usize> {
+        BASE..BASE + SIZE * WINDOWS
+    }
 
     /// Windows handed out and given back. **The counter alone is a leak**: a
     /// system that creates processes over its life must reuse the windows of
@@ -457,6 +484,15 @@ impl VmAddressRegion {
         Self::new_root_at(addr, size)
     }
 
+    /// The range every hosted (`aspace-separate`) root VMAR is carved from:
+    /// an address outside it is never a guest's, and an address inside it is
+    /// never the kernel's own code. The libos fault bridge keys its trap on
+    /// guest `syscall` instructions on exactly this.
+    #[cfg(feature = "aspace-separate")]
+    pub const fn hosted_windows() -> core::ops::Range<usize> {
+        aspace_window::range()
+    }
+
     /// Create a new root VMAR for a Zircon process.
     ///
     /// The Linux personality needs [`USER_ASPACE_BASE`] to be zero so that a
@@ -486,6 +522,7 @@ impl VmAddressRegion {
             addr,
             size,
             parent: None,
+            vdso_code: Arc::new(Mutex::new(None)),
             max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(PageTable::from_current().clone_kernel())), //hal PageTable
             inner: Mutex::new(Some(VmarInner::default())),
@@ -503,6 +540,7 @@ impl VmAddressRegion {
             addr: kernel_vmar_base,
             size: kernel_vmar_size,
             parent: None,
+            vdso_code: Arc::new(Mutex::new(None)),
             max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(PageTable::from_current().clone_kernel())),
             inner: Mutex::new(Some(VmarInner::default())),
@@ -521,6 +559,7 @@ impl VmAddressRegion {
             addr: guest_vmar_base,
             size: guest_vmar_size,
             parent: None,
+            vdso_code: Arc::new(Mutex::new(None)),
             max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(crate::hypervisor::VmmPageTable::new())),
             inner: Mutex::new(Some(VmarInner::default())),
@@ -567,12 +606,42 @@ impl VmAddressRegion {
             addr: self.addr + offset,
             size: len,
             parent: Some(self.clone()),
+            vdso_code: self.vdso_code.clone(),
             page_table: self.page_table.clone(),
             max_height: self.max_height - 1,
             inner: Mutex::new(Some(child_inner)),
         });
         inner.children.push(child.clone());
         Ok(child)
+    }
+
+    /// Record where the vDSO's code was mapped in this address space, if
+    /// nothing did yet: the first executable mapping of a vDSO VMO is the
+    /// one the process makes its syscalls from.
+    pub fn set_vdso_code(&self, start: usize, len: usize) {
+        let mut code = self.vdso_code.lock();
+        if code.is_none() {
+            *code = Some((start, start + len));
+        }
+    }
+
+    /// Whether a syscall whose instruction sits at `pc` -- the address the
+    /// trap saved, just past it -- is one the vDSO issued.
+    ///
+    /// Zircon lets only the vDSO make syscalls: a `syscall` instruction
+    /// anywhere else is a policy violation, `ZX_EXCP_POLICY_CODE_BAD_SYSCALL`
+    /// with the number as data, and is never dispatched
+    /// (`Threads.BadSyscallCaller`). The check is by the mapping of the
+    /// vDSO's code, which is why [`set_vdso_code`] exists. An address space
+    /// with no vDSO mapped yet takes syscalls from anywhere, which is what
+    /// the loader-built first process needs before its mapping is recorded.
+    ///
+    /// [`set_vdso_code`]: VmAddressRegion::set_vdso_code
+    pub fn syscall_may_come_from(&self, pc: usize) -> bool {
+        match *self.vdso_code.lock() {
+            Some((start, end)) => (start..=end).contains(&pc),
+            None => true,
+        }
     }
 
     /// Map the `vmo` into this VMAR at given `offset`.
@@ -725,9 +794,15 @@ impl VmAddressRegion {
         if !permissions.contains(flags & MMUFlags::RXW) {
             return Err(ZxError::ACCESS_DENIED);
         }
-        if !allow_faults && (vmo_offset > vmo.len() || len > vmo.len() - vmo_offset) {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        // A window that reaches past the object's end is a valid mapping, with
+        // or without `ALLOW_FAULTS`: Zircon only refuses an offset+len that
+        // overflows (checked above) and lets the pages beyond the end fault
+        // when touched. `VmoTestCase.Commit` maps a 4-page VMO at offsets
+        // page_size and 2*size with len=size and expects both to succeed;
+        // answering INVALID_ARGS left it dereferencing a null address, which
+        // killed the whole core-test process. The pages past the end are
+        // simply left unmapped (see `VmMapping::map`).
+        let _allow_faults = allow_faults;
         let mut guard = self.inner.lock();
         let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
         // `determine_offset` refuses an explicit offset whose range is not FREE
@@ -1847,14 +1922,31 @@ impl VmAddressRegion {
         let limit = base + max_offset.min(self.size);
         let floor = base + min_offset;
 
-        // Fast path: just above the highest mapping (or the floor, if higher).
-        let top = inner
+        // Fast path: just above the highest mapping OR child region (or the
+        // floor, if higher). The children count: a thread stack is a child
+        // VMAR with a mapping inside, so after a few hundred threads the top
+        // mapping of THIS region sits far below the top child, and a
+        // candidate taken from the mappings alone collided every time. The
+        // fallback below then jumps past the children one at a time, each
+        // jump a scan of all of them, so one allocation cost O(children^2):
+        // `RseqTest.ManyConcurrent` (2048 stacks) spent its whole timeout in
+        // here at 100% CPU.
+        let top_mapping = inner
             .mappings
             .values()
             .next_back()
             .map(|m| m.end_addr())
             .unwrap_or(base);
-        let cand = floor.max(top).next_multiple_of(align);
+        let top_child = inner
+            .children
+            .iter()
+            .map(|ch| ch.end_addr())
+            .max()
+            .unwrap_or(base);
+        let cand = floor
+            .max(top_mapping)
+            .max(top_child)
+            .next_multiple_of(align);
         if cand.checked_add(len).is_some_and(|e| e <= limit)
             && !inner
                 .children
@@ -1905,6 +1997,21 @@ impl VmAddressRegion {
     /// Get the end address (base + size) of this VMAR.
     pub fn end_addr(&self) -> VirtAddr {
         self.addr + self.size
+    }
+
+    /// The first address a thread of this address space may never run at:
+    /// the smallest power of two at or past the region's end.
+    ///
+    /// Zircon bounds a thread's instruction pointer by the canonical user
+    /// half of the address space; the core tests compute that bound from the
+    /// root VMAR as `bit_ceil(base + len)` (`X86LowestNonCanonicalAddr`),
+    /// which is the same number there. On this kernel a hosted process gets
+    /// a window out of the host's address space, whose end is no power of
+    /// two, so the bound is drawn the way the tests draw it: a thread set to
+    /// run just below it faults when it gets there, and that is Zircon's
+    /// behaviour too for the pages of the user half nobody mapped.
+    pub fn user_limit(&self) -> VirtAddr {
+        self.end_addr().next_power_of_two()
     }
 
     fn overlap(&self, begin: VirtAddr, end: VirtAddr) -> bool {
@@ -2357,10 +2464,12 @@ impl VmAddressRegion {
 
     /// Read from address space.
     ///
-    /// Return the actual number of bytes read.
+    /// Return the actual number of bytes read. `NOT_FOUND` where nothing is
+    /// mapped, as `zx_process_read_memory` answers
+    /// (`ProcessDebugTest.ReadMemoryAtInvalidOffsetReturnsErrorNotFound`).
     pub fn read_memory(&self, vaddr: usize, buf: &mut [u8]) -> ZxResult<usize> {
         // TODO: support multiple VMOs
-        let map = self.find_mapping(vaddr).ok_or(ZxError::NO_MEMORY)?;
+        let map = self.find_mapping(vaddr).ok_or(ZxError::NOT_FOUND)?;
         let map_inner = map.inner.lock();
         let vmo_offset = vaddr - map_inner.addr + map_inner.vmo_offset;
         let size_limit = map_inner.addr + map_inner.size - vaddr;
@@ -2371,10 +2480,18 @@ impl VmAddressRegion {
 
     /// Write to address space.
     ///
-    /// Return the actual number of bytes written.
+    /// Return the actual number of bytes written. `NOT_FOUND` where nothing
+    /// is mapped, and `ACCESS_DENIED` on a mapping of the vDSO, as Zircon
+    /// answers (`ProcessDebugVDSO.WriteToVdsoAddressReturnsAccessDenied`):
+    /// the write goes to the VMO, which every process maps, so a byte put
+    /// into `zx_channel_write` broke the syscall for the whole machine, and
+    /// the core tests hung right there.
     pub fn write_memory(&self, vaddr: usize, buf: &[u8]) -> ZxResult<usize> {
         // TODO: support multiple VMOs
-        let map = self.find_mapping(vaddr).ok_or(ZxError::NO_MEMORY)?;
+        let map = self.find_mapping(vaddr).ok_or(ZxError::NOT_FOUND)?;
+        if crate::task::is_vdso_vmo(map.vmo.id()) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
         let map_inner = map.inner.lock();
         let vmo_offset = vaddr - map_inner.addr + map_inner.vmo_offset;
         let size_limit = map_inner.addr + map_inner.size - vaddr;
@@ -2704,6 +2821,11 @@ impl VmMapping {
     /// minutes-long "frozen" fork. Physical windows (framebuffer/dumb buffers)
     /// report every page committed, so they still map fully and eagerly.
     fn map_committed(self: &Arc<Self>) -> ZxResult {
+        // A page table that cannot take the page answers NO_MEMORY, as
+        // `zx_vmar_map` does in Zircon. In libos that is the host refusing
+        // one more mapping (`vm.max_map_count`, 65530 by default): a kernel
+        // panic there took the whole core-test down in
+        // `RseqTest.ManyConcurrent` (2048 threads, one host VMA per page).
         let inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         let page_num = inner.size / PAGE_SIZE;
@@ -2716,7 +2838,7 @@ impl VmMapping {
                         paddr,
                         inner.flags[i],
                     )
-                    .expect("failed to map");
+                    .map_err(|_| ZxError::NO_MEMORY)?;
             }
         }
         Ok(())
@@ -2738,7 +2860,7 @@ impl VmMapping {
     /// the mapping call. The guest took SIGSEGV on the other one before the
     /// test binary said a word.
     #[cfg(feature = "libos")]
-    fn remap_pages_dropped_by_commit(self: &Arc<Self>) {
+    fn remap_pages_dropped_by_commit(self: &Arc<Self>) -> ZxResult {
         let inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         let page_num = inner.size / PAGE_SIZE;
@@ -2758,18 +2880,30 @@ impl VmMapping {
                         paddr,
                         inner.flags[i],
                     )
-                    .expect("failed to map");
+                    .map_err(|_| ZxError::NO_MEMORY)?;
             }
         }
+        Ok(())
     }
 
     fn map(self: &Arc<Self>) -> ZxResult {
+        // Read before `commit_pages_with` takes the object's lock: `len()`
+        // takes it too.
+        let vmo_pages = self.vmo.len() / PAGE_SIZE;
         self.vmo.commit_pages_with(&mut |commit| {
             let inner = self.inner.lock();
             let mut page_table = self.page_table.lock();
             let page_num = inner.size / PAGE_SIZE;
             let vmo_offset = inner.vmo_offset / PAGE_SIZE;
             for i in 0..page_num {
+                // The window may extend past the object's end (`map_ext_within`
+                // allows it, as Zircon does). There is nothing to commit there:
+                // the page stays unmapped and a touch faults, which is what a
+                // non-resizable VMO answers in Zircon too. Asking `commit` for
+                // it would fail the whole mapping with OUT_OF_RANGE.
+                if vmo_offset + i >= vmo_pages {
+                    continue;
+                }
                 // A page with no access bits cannot be touched, so it needs no
                 // PTE and no frame. Skipping it is what makes a large PROT_NONE
                 // reservation affordable: libos maps eagerly (it has no page
@@ -2787,12 +2921,12 @@ impl VmMapping {
                         paddr,
                         leaf_flags(paddr, inner.flags[i]),
                     )
-                    .expect("failed to map");
+                    .map_err(|_| ZxError::NO_MEMORY)?;
             }
             Ok(())
         })?;
         #[cfg(feature = "libos")]
-        self.remap_pages_dropped_by_commit();
+        self.remap_pages_dropped_by_commit()?;
         Ok(())
     }
 
@@ -3095,7 +3229,7 @@ impl VmMapping {
                         paddr,
                         leaf_flags(paddr, inner.flags[i]),
                     )
-                    .expect("failed to map");
+                    .map_err(|_| ZxError::NO_MEMORY)?;
             }
             Ok(())
         });
@@ -3933,8 +4067,8 @@ mod tests {
         for round in 0..aspace_window::WINDOWS + 8 {
             let vmar = VmAddressRegion::new_root();
             assert!(
-                vmar.addr() + vmar.size <= 0x8000_0000_0000,
-                "round {} got a window at {:#x}, past the top of userspace",
+                vmar.addr() + vmar.size <= VmAddressRegion::hosted_windows().end,
+                "round {} got a window at {:#x}, past the top of the hosted range",
                 round,
                 vmar.addr()
             );
@@ -3943,6 +4077,55 @@ mod tests {
             vmar.map_at(0, vmo, 0, 0x1000, flags)
                 .expect("a reused window has to still be mappable");
         }
+    }
+
+    /// The hosted range is where guests live and nowhere the kernel runs:
+    /// the libos fault bridge turns a `syscall` instruction into a guest
+    /// trap by its address alone, so this process's own code -- the test
+    /// binary, its libc, its stack -- must all lie outside the range, or a
+    /// kernel syscall would be dressed up as a guest's and the kernel would
+    /// hang on its own futex.
+    #[test]
+    #[cfg(feature = "aspace-separate")]
+    fn the_hosted_windows_never_overlap_the_kernel_s_own_code() {
+        let range = VmAddressRegion::hosted_windows();
+        assert_eq!(range.start, aspace_window::BASE);
+        assert_eq!(
+            range.end,
+            aspace_window::BASE + aspace_window::SIZE * aspace_window::WINDOWS
+        );
+        let here =
+            the_hosted_windows_never_overlap_the_kernel_s_own_code as fn() as *const () as usize;
+        assert!(
+            !range.contains(&here),
+            "this binary at {:#x} is inside {:#x?}",
+            here,
+            range
+        );
+        let on_the_stack = &range as *const _ as usize;
+        assert!(
+            !range.contains(&on_the_stack),
+            "the stack at {:#x} is inside {:#x?}",
+            on_the_stack,
+            range
+        );
+        let in_libc = libc_address();
+        assert!(
+            !range.contains(&in_libc),
+            "libc at {:#x} is inside {:#x?}",
+            in_libc,
+            range
+        );
+    }
+
+    /// An address inside the host's C library, which is where the kernel's
+    /// own syscalls come from.
+    #[cfg(feature = "aspace-separate")]
+    fn libc_address() -> usize {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        getpid as unsafe extern "C" fn() -> i32 as *const () as usize
     }
 
     /// `ZX_VM_ALIGN_*` names where a sub-region STARTS, not how long it is.
@@ -4163,15 +4346,8 @@ mod tests {
         let vmo = VmObject::new_paged(4);
         let flags = MMUFlags::READ | MMUFlags::WRITE;
 
-        // invalid argument
-        assert_eq!(
-            vmar.map_at(0, vmo.clone(), 0x4000, 0x1000, flags),
-            Err(ZxError::INVALID_ARGS)
-        );
-        assert_eq!(
-            vmar.map_at(0, vmo.clone(), 0, 0x5000, flags),
-            Err(ZxError::INVALID_ARGS)
-        );
+        // A window past the end of the VMO is valid (Zircon maps it and lets
+        // it fault); see `past_end_tests`. Misalignment is not.
         assert_eq!(
             vmar.map_at(0, vmo.clone(), 0x1000, 1, flags),
             Err(ZxError::INVALID_ARGS)
@@ -5184,3 +5360,64 @@ mod range_allows_tests;
 
 #[cfg(test)]
 mod range_allows_benches;
+
+#[cfg(test)]
+mod past_end_tests;
+
+#[cfg(test)]
+mod process_memory_tests {
+    use super::*;
+
+    #[test]
+    fn an_unmapped_address_is_not_found_and_the_vdso_is_not_written() {
+        let root = VmAddressRegion::new_root();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            root.read_memory(root.addr(), &mut buf),
+            Err(ZxError::NOT_FOUND)
+        );
+        assert_eq!(
+            root.write_memory(root.addr(), &buf),
+            Err(ZxError::NOT_FOUND)
+        );
+
+        let vdso = VmObject::new_paged(1);
+        crate::task::register_vdso_vmo(vdso.id());
+        let at = root
+            .map(
+                None,
+                vdso.clone(),
+                0,
+                PAGE_SIZE,
+                MMUFlags::READ | MMUFlags::EXECUTE,
+            )
+            .unwrap();
+        assert_eq!(root.write_memory(at, &buf), Err(ZxError::ACCESS_DENIED));
+        assert_eq!(root.read_memory(at, &mut buf), Ok(8));
+
+        let plain = VmObject::new_paged(1);
+        let at = root
+            .map(None, plain, 0, PAGE_SIZE, MMUFlags::READ | MMUFlags::WRITE)
+            .unwrap();
+        assert_eq!(root.write_memory(at, &[1, 2, 3]), Ok(3));
+    }
+}
+
+#[cfg(test)]
+mod user_limit_tests {
+    use super::*;
+
+    /// The core tests' `X86LowestNonCanonicalAddr` is `bit_ceil(base + len)`
+    /// of the root VMAR, and they expect the address just below it to be a
+    /// legal instruction pointer. A window whose end is not a power of two
+    /// must not refuse that address.
+    #[test]
+    fn the_user_limit_is_the_power_of_two_at_or_past_the_root_vmar_end() {
+        let root = VmAddressRegion::new_root();
+        let end = root.end_addr();
+        let limit = root.user_limit();
+        assert!(limit.is_power_of_two());
+        assert!(limit >= end);
+        assert!(limit / 2 < end);
+    }
+}

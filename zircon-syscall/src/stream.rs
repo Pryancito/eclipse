@@ -139,11 +139,12 @@ impl Syscall<'_> {
         let (vmo, available) = proc.get_object_and_rights::<VmObject>(vmo_handle)?;
         // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let options = StreamOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
-        // Fuchsia requires at least MODE_READ or MODE_WRITE; append alone (or
-        // zero) used to create a stream with empty VMO rights.
-        if !options.intersects(StreamOptions::MODE_READ | StreamOptions::MODE_WRITE) {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        // No mode at all, or append alone, is a stream with the default
+        // rights and neither READ nor WRITE: what the 2026 core tests ask for
+        // (`StreamTestCase.Create`: `create(0, vmo, 0)` is OK, and
+        // `create(ZX_STREAM_MODE_APPEND, vmo, 0)` carries no READ/WRITE).
+        // Refusing it with INVALID_ARGS, as this did, failed every stream
+        // test that starts from `create(0, ...)`: `Seek`, `ReadV`, `WriteV`.
         let mut rights = Rights::DEFAULT_STREAM;
         let mut need = Rights::empty();
         if options.contains(StreamOptions::MODE_READ) {
@@ -477,19 +478,35 @@ mod read_gather_tests {
         assert_eq!(got, Err(ZxError::INVALID_ARGS));
     }
 
+    /// Rights follow the mode bits and nothing else: `create(0, ...)` and
+    /// `create(MODE_APPEND, ...)` make a stream with the default rights,
+    /// neither readable nor writable (`StreamTestCase.Create`).
     #[test]
-    fn stream_create_requires_read_or_write_mode() {
+    fn stream_rights_follow_the_mode_bits_and_no_mode_is_a_stream_too() {
         use zircon_object::vm::StreamOptions;
-        let modes = StreamOptions::MODE_READ | StreamOptions::MODE_WRITE;
-        assert!(
-            !StreamOptions::empty().intersects(modes),
-            "options=0 must be refused"
+        let rights_for = |options: StreamOptions| {
+            let mut rights = Rights::DEFAULT_STREAM;
+            if options.contains(StreamOptions::MODE_READ) {
+                rights |= Rights::READ;
+            }
+            if options.contains(StreamOptions::MODE_WRITE) {
+                rights |= Rights::WRITE;
+            }
+            rights
+        };
+        assert_eq!(rights_for(StreamOptions::empty()), Rights::DEFAULT_STREAM);
+        assert_eq!(
+            rights_for(StreamOptions::MODE_APPEND),
+            Rights::DEFAULT_STREAM
         );
-        assert!(
-            !StreamOptions::MODE_APPEND.intersects(modes),
-            "append alone must be refused"
+        assert_eq!(
+            rights_for(StreamOptions::MODE_READ),
+            Rights::DEFAULT_STREAM | Rights::READ
         );
-        assert!(StreamOptions::MODE_READ.intersects(modes));
-        assert!(StreamOptions::MODE_WRITE.intersects(modes));
+        assert_eq!(
+            rights_for(StreamOptions::MODE_READ | StreamOptions::MODE_WRITE),
+            Rights::DEFAULT_STREAM | Rights::READ | Rights::WRITE
+        );
+        assert!(!Rights::DEFAULT_STREAM.intersects(Rights::READ | Rights::WRITE));
     }
 }

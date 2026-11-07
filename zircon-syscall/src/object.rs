@@ -6,11 +6,16 @@ use {
     zircon_object::{
         dev::*,
         ipc::*,
-        signal::{Port, Timer, WaitAsyncOptions},
+        signal::{Port, Timer, WaitAsyncOptions, MAX_PORT_OBSERVERS},
         task::*,
         vm::*,
     },
 };
+
+/// `ZX_EXCP_POLICY_CODE_PORT_TOO_MANY_OBSERVERS`: the `synth_code` of the
+/// policy exception a thread gets for registering the observer past
+/// [`MAX_PORT_OBSERVERS`] on one port.
+pub const POLICY_CODE_PORT_TOO_MANY_OBSERVERS: u32 = 19;
 
 impl Syscall<'_> {
     /// Ask for various properties of various kernel objects.
@@ -337,9 +342,15 @@ impl Syscall<'_> {
             }
             Topic::ThreadStats => {
                 let thread = proc.get_object_with_rights::<Thread>(handle, Rights::INSPECT)?;
+                // Nothing to report on a thread that is gone
+                // (`Threads.InfoThreadStatsFails`).
+                if thread.state() == ThreadState::Dead {
+                    return Err(ZxError::BAD_STATE);
+                }
                 output.write(ThreadStatsInfo {
                     total_runtime: thread.get_time(),
-                    last_scheduled_cpu: u32::MAX,
+                    // `ZX_INFO_INVALID_CPU` until the thread first runs.
+                    last_scheduled_cpu: thread.last_scheduled_cpu().unwrap_or(u32::MAX),
                     padding: [0; 4],
                 })?;
             }
@@ -540,7 +551,7 @@ impl Syscall<'_> {
     }
 
     /// A non-blocking syscall subscribes for signals on an object.
-    pub fn sys_object_wait_async(
+    pub async fn sys_object_wait_async(
         &self,
         handle_value: HandleValue,
         port_handle_value: HandleValue,
@@ -569,7 +580,26 @@ impl Syscall<'_> {
             signals,
             options,
             Some(cancel),
-        )
+        )?;
+        // Registered, and past the limit: the observer stays and the thread
+        // gets the policy exception, which kills the process unless a
+        // handler resumes it -- as Zircon's `PortDispatcher::MakeObserver`.
+        let observers = port.observer_count();
+        if observers > MAX_PORT_OBSERVERS {
+            warn!(
+                "port: {} observers on one port ({}): raising the policy exception",
+                observers,
+                proc.name()
+            );
+            self.thread
+                .raise_synth_exception(
+                    ExceptionType::PolicyError,
+                    POLICY_CODE_PORT_TOO_MANY_OBSERVERS,
+                    0,
+                )
+                .await;
+        }
+        Ok(())
     }
 
     /// Signal an object.
