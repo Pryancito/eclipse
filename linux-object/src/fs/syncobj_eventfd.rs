@@ -171,18 +171,53 @@ fn arm_poller() {
             }
             continue;
         }
-        kernel_hal::timer::timer_set(
-            kernel_hal::timer::deadline_after(POLL_INTERVAL),
-            alloc::boxed::Box::new(|_| {
-                POLLER_ARMED.store(false, Ordering::Release);
-                // Resolves landed fences and fires the signal hook (below)
-                // for every point that advanced, which delivers the eventfds
-                // / wakes sync_file EventBuses.
-                zcore_drivers::scheme::syncobj::poll_pending();
-                arm_poller();
-            }),
-        );
+        schedule_tick();
         return;
+    }
+}
+
+/// One tick of the armed poller, `POLL_INTERVAL` from now. The claim is held
+/// by whoever calls this and stays held: [`tick`] keeps it across the poll
+/// and the re-arm, and only gives it back when it genuinely stands down.
+fn schedule_tick() {
+    kernel_hal::timer::timer_set(
+        kernel_hal::timer::deadline_after(POLL_INTERVAL),
+        alloc::boxed::Box::new(|_| tick()),
+    );
+}
+
+/// The timer callback: poll the hardware fences, then either tick again or
+/// stand down.
+///
+/// The claim is NOT released before polling. This used to clear
+/// `POLLER_ARMED`, poll, and call [`arm_poller`] to claim again, so a ticking
+/// poller looked unarmed for the length of `poll_pending` on every tick, on
+/// the timer thread (async-std's pool in libos). Nobody loses a wake-up in
+/// that window -- a publisher that claims it arms its own timer, and this
+/// one's re-claim then loses the swap -- but a reader of the claim does see
+/// a lie: `hardware_fence_tests` asserts "the poller is armed" right after a
+/// submit, and with a tick left running by the test before (its fence never
+/// lands, so the timer keeps going) that assertion raced the window and the
+/// serial suite went red once in a while, with nothing in the test to blame.
+/// Keeping the claim across the tick makes "armed" mean "a timer exists",
+/// which is what every reader takes it to mean.
+///
+/// `seen` is read BEFORE the poll: the signal hook that `poll_pending` fires
+/// for a landed fence goes through [`publish_and_arm`], loses the swap to
+/// this claim and returns, counting on the holder to look again. The
+/// `should_tick()` read below is that look; the generation covers a publisher
+/// on another cpu in the same way, exactly as in [`arm_poller`].
+fn tick() {
+    let seen = PUBLISH_GEN.load(Ordering::SeqCst);
+    // Resolves landed fences and fires the signal hook for every point that
+    // advanced, which delivers the eventfds / wakes sync_file EventBuses.
+    zcore_drivers::scheme::syncobj::poll_pending();
+    if should_tick() {
+        schedule_tick();
+        return;
+    }
+    if release_and_recheck(seen) {
+        arm_poller();
     }
 }
 
@@ -718,6 +753,67 @@ pub(crate) mod hardware_fence_tests {
         assert!(
             POLLER_ARMED.load(Ordering::Acquire),
             "poller must stay armed until the fence lands"
+        );
+
+        reset();
+    }
+
+    /// What the probe hook below saw in `POLLER_ARMED` while `tick` was
+    /// inside `poll_pending`.
+    static ARMED_DURING_POLL: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    fn probe_claim_during_poll(_handle: u32, _point: u64) {
+        ARMED_DURING_POLL.store(POLLER_ARMED.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// A tick keeps the claim while it polls. The callback used to give the
+    /// claim back BEFORE polling and take it again after, so a ticking poller
+    /// read as unarmed for the length of every poll, on the timer thread; the
+    /// two tests above assert "armed" right after a submit and raced that
+    /// window whenever a tick from an earlier test was still running. The
+    /// signal hook runs inside the poll, so it is the one place that can see
+    /// the order.
+    #[test]
+    fn a_tick_keeps_the_claim_while_it_polls() {
+        let _serial = TEST_SERIAL.lock();
+        reset();
+        super::set_signal_hook_checked(probe_claim_during_poll);
+        ARMED_DURING_POLL.store(false, Ordering::Release);
+        let handle = syncobj::create(false);
+        let ev = CountingEventfd::new();
+        register(handle, 1, ev.clone(), false);
+
+        // Submitted, not landed: the poller has something to watch.
+        let landing_zone = AtomicU32::new(0);
+        syncobj::attach_hw_fence(handle, 1, landing_zone.as_ptr() as usize, 0, 1, 0, false);
+        POLLER_ARMED.store(true, Ordering::Release);
+
+        // The GPU lands it, and the next tick resolves it: the hook fires
+        // from inside the poll and reads the claim.
+        landing_zone.store(1, Ordering::SeqCst);
+        super::tick();
+
+        assert!(
+            ARMED_DURING_POLL.load(Ordering::Acquire),
+            "the claim must be held across the poll: a reader that finds it \
+             released while a timer still exists is being told the poller is \
+             off when it is not"
+        );
+        // The probe is not `on_syncobj_signaled`, so nothing delivered the
+        // waiter: it is still registered. Whether the tick re-armed depends
+        // on the process-wide fence table: the fences of the tests above
+        // never land (their landing zones were stack slots) and stay
+        // pending, but which of those tests ran before this one depends on
+        // the feature set of the build, so the question is only asked the
+        // way the poller asks it -- armed exactly when there is something
+        // left to poll.
+        assert_eq!(ev.delivered(), 0, "the probe hook delivers nothing");
+        assert_eq!(
+            poller_is_armed(),
+            syncobj::has_pending(),
+            "a waiter is registered, so the tick re-arms (claim in hand) \
+             exactly when a fence is still pending, and stands down otherwise"
         );
 
         reset();
