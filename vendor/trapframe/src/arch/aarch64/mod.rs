@@ -33,6 +33,17 @@ pub struct UserContext {
     /// frame (`sub sp, sp, #FP_BYTES` in `HANDLER`) and steps over it at the
     /// end of `trap_return`.
     pub fp: FpRegs,
+    /// The syndrome (`ESR_EL1`) the trap arrived with, on a hosted kernel.
+    ///
+    /// Bare metal reads the register; a hosted kernel has no register to
+    /// read, so the fault bridge writes here what the host's signal said.
+    /// After `fp` on purpose: `trap.S` lays `fp` at the top of its frame and
+    /// these two exist only where there is no `trap.S`.
+    #[cfg(target_os = "linux")]
+    pub esr: usize,
+    /// The faulting address (`FAR_EL1`) of a hosted trap. See `esr`.
+    #[cfg(target_os = "linux")]
+    pub far: usize,
 }
 
 /// The floating-point and SIMD state a trap has to preserve on aarch64.
@@ -229,9 +240,17 @@ const _: () = {
         offset_of!(UserContext, fp) == 38 * 8,
         "`FP_OFF` in trap.S is 38 * 8"
     );
+    // Last of what `trap.S` lays: the hosted build (`target_os = "linux"`)
+    // keeps its syndrome fields after it, where no assembly reaches.
+    #[cfg(not(target_os = "linux"))]
     assert!(
         offset_of!(UserContext, fp) + size_of::<FpRegs>() == size_of::<UserContext>(),
         "the floating-point area is no longer last in the struct"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        offset_of!(UserContext, fp) + size_of::<FpRegs>() == offset_of!(UserContext, esr),
+        "the floating-point area no longer ends where the hosted syndrome starts"
     );
 };
 

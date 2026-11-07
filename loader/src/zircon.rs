@@ -265,24 +265,35 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // and aborted on a SafeStack canary after `add %bh, %bh` had corrupted
     // `rbx`. See `kernel_hal::fault_bridge`.
     //
-    // Every other hosted build keeps the rebuilt blob, because the trap is a
-    // Linux x86_64 thing: aarch64 libos has no fault bridge yet, and on
-    // macOS a `syscall` the host does not trap is a Darwin system call made
-    // with the guest's registers. scripts/gen-prebuilt.sh generates
+    // Linux aarch64 does the same with `svc`, through the bridge's aarch64
+    // port, and for a stronger reason: there the old way in trusted a
+    // register the guest can write (`tpidr_el0`). macOS keeps the rebuilt
+    // blob, because a `svc` the host does not trap is a Darwin system call
+    // made with the guest's registers. scripts/gen-prebuilt.sh generates
     // `libzircon-libos.so` alone and says so outright -- "Userboot and ZBI
     // artifacts must remain the unmodified upstream builds" -- because the
     // libos patch reworks the syscall entry the vDSO makes, nothing else.
     #[cfg(all(
         feature = "libos",
-        not(all(target_os = "linux", target_arch = "x86_64"))
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
     ))]
     let vdso = boot_library!("libzircon-libos");
     #[cfg(not(all(
         feature = "libos",
-        not(all(target_os = "linux", target_arch = "x86_64"))
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
     )))]
     let vdso = boot_library!("libzircon");
-    #[cfg(all(feature = "libos", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "libos",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         let guest = zircon_object::vm::VmAddressRegion::hosted_windows();
         // SAFETY: the bridge's handlers were installed at boot
@@ -358,11 +369,14 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
                 .expect("vDSO has no DATA_CONSTANTS symbol") as usize;
         vmar.map_from_elf(&elf, vdso_vmo.clone()).unwrap();
         // The rebuilt libos vDSO jumps through a slot the kernel fills.
-        // The real one, which Linux x86_64 libos boots too now, has no such
-        // slot.
+        // The real one, which Linux libos boots too now on x86_64 and
+        // aarch64, has no such slot.
         #[cfg(all(
             feature = "libos",
-            not(all(target_os = "linux", target_arch = "x86_64"))
+            not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
         ))]
         {
             let offset = elf
@@ -711,6 +725,10 @@ async fn handler_user_trap(
             .proc()
             .syscall_may_come_from(ctx.get_field(UserContextField::InstrPointer));
         ctx.advance_pc(reason);
+        #[cfg(target_arch = "aarch64")]
+        if from_vdso {
+            skip_sysret_barrier(thread, &mut ctx);
+        }
         thread.put_context(ctx);
         let mut syscall = zircon_syscall::Syscall { thread, thread_fn };
         if !from_vdso {
@@ -763,6 +781,40 @@ async fn handler_user_trap(
         TrapReason::UnalignedAccess => Err(ExceptionType::UnalignedAccess),
         TrapReason::GernelFault(_) => Err(ExceptionType::General),
         _ => unreachable!(),
+    }
+}
+
+/// The three words the arm64 vDSO lays after every `svc`, at the
+/// `CODE_SYSRET_*` return site the kernel lands on: `dsb nsh`, `isb` and
+/// `brk #0`, then the stub's `ret`.
+#[cfg(target_arch = "aarch64")]
+const SYSRET_BARRIER: [u32; 3] = [0xd503_379f, 0xd503_3fdf, 0xd420_0000];
+
+/// Resume a vDSO syscall past its return-site barrier.
+///
+/// The arm64 vDSO's stubs are `mov x16, #N; svc #0; dsb nsh; isb; brk #0;
+/// ret` (every one of them: `llvm-objdump -d prebuilt/zircon/arm64/libzircon.so`).
+/// Resumed at the word after the `svc`, as the hardware's `ELR` says, the
+/// thread runs the two barriers and then the `brk`, which is a software
+/// breakpoint: with no debugger attached that kills the process after its
+/// first syscall. Measured on the hosted aarch64 build in an arm64 VM, on
+/// userboot's first `zx_object_wait_one`. Nothing architectural happens
+/// between the `svc` and the `ret` -- the barriers order speculation, the
+/// `brk` is never meant to run -- so the kernel resumes at the `ret`, which
+/// is what the guest observes of a syscall that returned: `x0` and control
+/// back at the caller. Only for a pc that carries exactly those three
+/// words, read through the address space, so a `brk` anywhere else is still
+/// the breakpoint it is.
+#[cfg(target_arch = "aarch64")]
+fn skip_sysret_barrier(thread: &CurrentThread, ctx: &mut UserContext) {
+    let pc = ctx.get_field(UserContextField::InstrPointer);
+    let mut words = [0u8; 12];
+    if thread.proc().vmar().read_memory(pc, &mut words) != Ok(words.len()) {
+        return;
+    }
+    let read = |at: usize| u32::from_le_bytes(words[at..at + 4].try_into().unwrap());
+    if [read(0), read(4), read(8)] == SYSRET_BARRIER {
+        ctx.set_field(UserContextField::InstrPointer, pc + words.len());
     }
 }
 
@@ -880,7 +932,12 @@ fn x86_64_libos_args(
 /// `VDso::Create` redirects these names when the platform's tick counter
 /// cannot be read from userspace. The stubs are the blob's; all we choose is
 /// which variant each public name resolves to.
-#[cfg(any(test, target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
 const VDSO_KERNEL_CLOCK_REDIRECTS: [(&str, &str); 7] = [
     (
         "zx_clock_get_monotonic",
@@ -918,7 +975,12 @@ const VDSO_KERNEL_CLOCK_REDIRECTS: [(&str, &str); 7] = [
 /// them answers `None`, so the caller keeps the old behaviour rather than a
 /// half-redirected vDSO where `zx_deadline_after` and
 /// `zx_clock_get_monotonic` disagree about which clock they are on.
-#[cfg(any(test, target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
 fn vdso_time_redirect_writes(
     vdso: &[u8],
     resolve: impl Fn(&str) -> Option<u64>,
@@ -987,7 +1049,11 @@ fn vdso_time_redirect_writes(
 
 /// Apply [`vdso_time_redirect_writes`] to the vDSO's image. `false` means
 /// nothing was written and the caller must keep the old behaviour.
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
 fn redirect_vdso_time_to_kernel(vdso: &[u8], vdso_vmo: &Arc<VmObject>) -> bool {
     let Ok(elf) = ElfFile::new(vdso) else {
         return false;
@@ -1042,7 +1108,11 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>, cmdline: &str) 
     // only, every riscv64 program read the marker: `get_monotonic` answered
     // `-2401053088661560045`, so the futex and clock tests failed and every
     // wait with a deadline hung the suite.
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    ))]
     {
         /// Offsets within `DATA_TIME_VALUES`. See the call site for what each
         /// one is and which vDSO entry point reads it.

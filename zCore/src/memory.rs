@@ -60,7 +60,15 @@ struct LockedHeap(UnfairMutex<BuddyAllocator<27, UsizeBuddy, LinkedListBuddy>>);
 // would hand the test runner an empty heap. The allocator itself is still
 // compiled and still reachable -- the tests call `init()` and then drive
 // `HEAP` directly, which is what the kernel's own `GlobalAlloc` impl does.
-#[cfg_attr(not(test), global_allocator)]
+// Not the global allocator under libos: there the kernel's heap is the host's
+// (`std`), as in `memory_x86_64.rs`, and this buddy serves FRAMES only. Making
+// it the heap as well put the 2 MiB boot pool -- a static of this binary,
+// nowhere near the hosted "physical" window -- in the same pool as the window,
+// so `frame_alloc` could answer a request with a block of the static and the
+// paddr it computed (`base - window`) wrapped: `assertion failed:
+// paddr + len <= PMEM_SIZE` in `pmem_zero`, from `PhysFrame::new_zero` while
+// loading userboot, measured in an arm64 VM.
+#[cfg_attr(all(not(test), not(feature = "libos")), global_allocator)]
 static HEAP: LockedHeap = LockedHeap(UnfairMutex::new(BuddyAllocator::new()));
 
 /// 单页地址位数。
@@ -75,6 +83,7 @@ const PAGE_BITS: usize = 12;
 /// | qemu,virt SMP 1 |  16 KiB
 /// | qemu,virt SMP 4 |  32 KiB
 /// | allwinner,nezha | 256 KiB
+#[cfg(not(feature = "libos"))]
 const MEMORY_SIZE: usize = 2 * 1024 * 1024;
 
 /// Page-aligned on purpose, and the alignment is load-bearing.
@@ -94,6 +103,7 @@ const MEMORY_SIZE: usize = 2 * 1024 * 1024;
 ///
 /// Page alignment rather than word alignment because the same pool backs
 /// `frame_alloc`, and its callers are handed addresses they take to be pages.
+#[cfg(not(feature = "libos"))]
 #[repr(align(4096))]
 // The field is never read *through the type*: `init()` takes the static's
 // address with `addr_of_mut!` (a `&mut` to a `static mut` is what that macro
@@ -101,6 +111,7 @@ const MEMORY_SIZE: usize = 2 * 1024 * 1024;
 // reserve the space and to carry the alignment, which is the whole point.
 struct BootPool(#[allow(dead_code)] [u8; MEMORY_SIZE]);
 
+#[cfg(not(feature = "libos"))]
 static mut MEMORY: BootPool = BootPool([0u8; MEMORY_SIZE]);
 
 unsafe impl GlobalAlloc for LockedHeap {
@@ -188,6 +199,18 @@ unsafe impl GlobalAlloc for LockedHeap {
 
 /// 初始化分配器，并将一个小的内存块注册到分配器中，用于启动需要的动态内存。
 pub fn init() {
+    // Under libos the buddy keeps no boot pool: the heap is the host's, and
+    // the window `insert_regions` hands over later is the only memory it will
+    // ever own, so its base is the window's. See `HEAP`.
+    #[cfg(feature = "libos")]
+    unsafe {
+        let base = phys_to_virt_offset() as *mut u8;
+        HEAP.0.lock().init(
+            core::mem::size_of::<usize>().trailing_zeros() as _,
+            NonNull::new_unchecked(base),
+        );
+    }
+    #[cfg(not(feature = "libos"))]
     unsafe {
         let start = core::ptr::addr_of_mut!(MEMORY).cast::<u8>();
         // `MEMORY_SIZE`, not the size written out a second time: the constant
@@ -216,8 +239,10 @@ pub fn init() {
 
 /// 将一些内存区域注册到分配器。
 pub fn insert_regions(regions: &[Range<PhysAddr>]) {
-    let mut heap = HEAP.0.lock();
+    // Before the lock: nothing that could allocate runs under the heap's own
+    // lock, and a platform's offset is allowed to be lazily initialised.
     let offset = phys_to_virt_offset();
+    let mut heap = HEAP.0.lock();
     regions
         .iter()
         // Not just tidiness: an empty range's `len()` is 0, so the `transfer`
@@ -1340,9 +1365,19 @@ mod heap_tests {
                 base != 0,
                 "the host allocator would not give us a test region"
             );
-            insert_regions(&[base..base + REGION_SIZE]);
+            insert_regions(&[physical(base)..physical(base) + REGION_SIZE]);
         });
         guard
+    }
+
+    /// The physical address a host block would have: `insert_regions` maps
+    /// what it is given through `phys_to_virt_offset`, which is zero on the
+    /// bare-metal arms this suite stands in for and the mock-memory window's
+    /// base under libos. The host's addresses sit far above that base, so
+    /// the subtraction is exact and the allocator gets the block back at the
+    /// address it really has.
+    fn physical(host_vaddr: usize) -> PhysAddr {
+        host_vaddr - phys_to_virt_offset()
     }
 
     /// Frees a run `frame_alloc` handed out, the way the kernel does it: one
@@ -1365,6 +1400,7 @@ mod heap_tests {
     /// `init()`, before there is a heap to format a panic with. The kernel
     /// links were getting away with it on the linker's goodwill; on the host
     /// the static landed on an odd address and `init()` died.
+    #[cfg(not(feature = "libos"))]
     #[test]
     fn the_boot_pool_is_aligned_for_the_allocator_that_receives_it() {
         let base = core::ptr::addr_of!(MEMORY) as usize;
@@ -1388,6 +1424,7 @@ mod heap_tests {
     /// the length out by hand beside `MEMORY_SIZE`; the buddy's own `capacity`
     /// is the answer that does not go through this file's counters, so it says
     /// what was really transferred.
+    #[cfg(not(feature = "libos"))]
     #[test]
     fn the_whole_boot_pool_reaches_the_allocator() {
         let _alone = alone_with_the_heap();
@@ -1405,6 +1442,24 @@ mod heap_tests {
         );
     }
 
+    /// Under libos there is no boot pool: the heap is the host's until
+    /// `insert_regions` hands over the mock-memory window, so `init()` must
+    /// leave the allocator empty -- a pool here was the `pmem_zero`
+    /// assertion on the aarch64 libos boot, a frame handed out from a static
+    /// that is not inside the window -- and its base must be the window's,
+    /// which `phys_to_virt_offset` is. Measured in an arm64 VM: an offset of
+    /// zero was `str x3, [x18]` at `0x1000`, the first of the six causes of
+    /// that job's red.
+    #[cfg(feature = "libos")]
+    #[test]
+    fn under_libos_init_keeps_no_boot_pool_and_the_offset_is_the_window() {
+        let _alone = alone_with_the_heap();
+        assert_eq!(TOTAL_AFTER_INIT.load(Ordering::Relaxed), 0);
+        assert_eq!(CAPACITY_AFTER_INIT.load(Ordering::Relaxed), 0);
+        assert_eq!(phys_to_virt_offset(), kernel_hal::libos::PMEM_MAP_VADDR);
+        assert_ne!(phys_to_virt_offset(), 0);
+    }
+
     // --- what the heap says it manages -----------------------------------
 
     /// The bug. `init()` transferred the 2 MiB boot pool to the buddy and did
@@ -1412,6 +1467,7 @@ mod heap_tests {
     /// writer -- runs later in boot. So `heap_total()` was **0** for the whole
     /// early window, and the reader is the OOM banner in `lang.rs`: a failed
     /// allocation there printed "used N / total 0 MiB".
+    #[cfg(not(feature = "libos"))]
     #[test]
     fn the_boot_pool_counts_as_memory_the_heap_manages() {
         let _alone = alone_with_the_heap();
@@ -1440,7 +1496,7 @@ mod heap_tests {
         let layout = Layout::from_size_align(2 * PAGE, PAGE).unwrap();
         let base = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(base != 0);
-        insert_regions(&[base..base + 2 * PAGE]);
+        insert_regions(&[physical(base)..physical(base) + 2 * PAGE]);
         assert_eq!(heap_total(), before + 2 * PAGE);
     }
 
@@ -1451,7 +1507,8 @@ mod heap_tests {
     fn an_empty_or_reversed_region_is_not_handed_to_the_allocator() {
         let _alone = alone_with_the_heap();
         let before = heap_total();
-        let somewhere = core::ptr::addr_of!(MEMORY) as usize;
+        // Any address at all: an empty range's pointer must never be read.
+        let somewhere = physical(core::ptr::addr_of!(TOTAL_MEMORY) as usize);
         insert_regions(&[somewhere..somewhere, (somewhere + PAGE)..somewhere]);
         assert_eq!(
             heap_total(),

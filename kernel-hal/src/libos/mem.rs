@@ -12,7 +12,13 @@ use crate::{PhysAddr, VirtAddr, PAGE_SIZE};
 type FrameAlloc = bitmap_allocator::BitAlloc1M;
 
 /// Map physical memory from here.
-pub(super) const PMEM_MAP_VADDR: VirtAddr = 0x8_0000_0000;
+///
+/// `pub` (re-exported as `kernel_hal::libos::PMEM_MAP_VADDR`) because the
+/// generic kernel allocator needs the "physical"-to-virtual offset as a plain
+/// constant: it reads it with its heap lock held, and anything that could
+/// allocate there -- the lazy `MOCK_PHYS_MEM`, whose first use creates a temp
+/// file -- re-enters the allocator and deadlocks on its own lock.
+pub const PMEM_MAP_VADDR: VirtAddr = 0x8_0000_0000;
 /// Physical memory size = 4 GiB, the most `BitAlloc1M` can keep track of.
 ///
 /// A sparse file, so only the frames a guest touches cost the host anything.
@@ -49,6 +55,17 @@ hal_fn_impl! {
 
         #[allow(clippy::single_range_in_vec_init)]
         fn free_pmem_regions() -> Vec<Range<PhysAddr>> {
+            // The window has to exist before anyone acts on the answer: the
+            // generic kernel allocator (`zCore/src/memory.rs`, aarch64 and
+            // riscv64) writes its free-list nodes into the region it is
+            // handed, and the window is a lazy static that nothing else
+            // touched by then -- so on an aarch64 libos the first node write
+            // went to `PMEM_MAP_VADDR + 0x1000` with nothing mapped there
+            // (SIGSEGV in `Node::insert` from `insert_regions`, measured in
+            // an arm64 VM). Forcing it HERE, outside any lock, is also what
+            // keeps the allocator from initialising it later from under its
+            // own heap lock, which allocates (a temp file) and deadlocks.
+            lazy_static::initialize(&MOCK_PHYS_MEM);
             vec![PAGE_SIZE..PMEM_SIZE]
         }
 

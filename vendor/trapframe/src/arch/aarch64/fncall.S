@@ -1,119 +1,78 @@
-# User: (musl)
-# - tp:0  (pthread.self)       = user tp
-# - tp:48 (pthread.canary2)    = user context
+# The hosted (Linux) way out to a guest and back, on aarch64.
 #
-# Kernel: (glibc)
-# - tp:0  (pthread.self)       = kernel tp
-# - tp:72 (pthread.???)        = init user tp
+# Out: `syscall_fn_return(ctx, frame)` parks the kernel's callee-saved
+# registers on the kernel stack, notes that stack in `ctx.__reserved`, loads
+# the guest's thread pointer and asks the host to "return from a signal" into
+# the frame `run_fncall` laid out with the guest's registers in it. The host
+# loads every register from that frame, the floating-point ones included, and
+# the guest runs.
+#
+# Back: a guest never calls into the kernel. Everything it does that the
+# kernel has to answer -- a `svc`, a fault, a `brk`, the end of its time
+# slice -- arrives as a host signal, and the signal handler (the fault bridge
+# in kernel-hal) copies the guest's registers out of the signal context, puts
+# the kernel's thread pointer back, and points the context's `pc` at
+# `fault_fn_entry` with `sp` at the frame this file parked. The host's own
+# return from the handler lands here, and `fault_fn_entry` unparks the
+# registers and returns to whoever called `syscall_fn_return`.
+#
+# No register the guest controls is trusted on the way back: the kernel's
+# stack is found through the handler's own bookkeeping (keyed on the host
+# thread's alternate signal stack), never through the guest's `tpidr_el0`.
+# The previous entry read the context pointer from `tpidr_el0 + 48`, which a
+# guest can point anywhere with one `msr`.
 
 .global syscall_fn_entry
 .global syscall_fn_return
+.global fault_fn_entry
 
-syscall_fn_entry:
-    # save 2 registers for scratch
-    stp     x0, x30, [sp, #-16] // save x0, x30 at user stack
-
-    # switch to kernel sp
-    mrs     x0, tpidr_el0       // x0 = user tp
-    ldr     x0, [x0, #48]       // x0 = user context
-    mov     x30, sp             // x30 = user stack
-    str     x30, [x0, #4 * 8]   // save user stack
-    add     sp, x0, #38 * 8     // sp = top of user context
-
-    # recover x0, x30
-    ldp     x0, x30, [x30, #-16]
-
-    # save general registers
-    stp     x30, x0, [sp, #-16]!
-    str     x29, [sp, #-16]!
-    stp     x27, x28, [sp, #-16]!
-    stp     x25, x26, [sp, #-16]!
-    stp     x23, x24, [sp, #-16]!
-    stp     x21, x22, [sp, #-16]!
-    stp     x19, x20, [sp, #-16]!
-    stp     x17, x18, [sp, #-16]!
-    stp     x15, x16, [sp, #-16]!
-    stp     x13, x14, [sp, #-16]!
-    stp     x11, x12, [sp, #-16]!
-    stp     x9, x10, [sp, #-16]!
-    stp     x7, x8, [sp, #-16]!
-    stp     x5, x6, [sp, #-16]!
-    stp     x3, x4, [sp, #-16]!
-    stp     x1, x2, [sp, #-16]!
-
-    # skip sp and save tpidr
-    mrs     x1, tpidr_el0
-    str     x1, [sp, #-8]
-    add     sp, sp, #-16
-
-    # skip spsr and save elr(lr)
-    ldr     x1, [sp, #32*8]
-    str     x1, [sp, #-16]!
-
-    # skip trap num and read kernel sp
-    ldr     x1, [sp, #-8]
-    mov     sp, x1
-
-    # load kernel tp
-    ldr     x1, [sp], #16
-    msr     tpidr_el0, x1
-
-    # load callee-saved registers
-    ldp     x19, x20, [sp], #16
-    ldp     x21, x22, [sp], #16
-    ldp     x23, x24, [sp], #16
-    ldp     x25, x26, [sp], #16
-    ldp     x27, x28, [sp], #16
-    ldp     x29, x30, [sp], #16
-
-    ret
-
-    # extern "C" fn syscall_fn_return(&mut UserContext)
+# extern "C" fn syscall_fn_return(ctx: &mut UserContext, frame: *const u8)
 syscall_fn_return:
-    # save callee-saved registers
+    # The AAPCS callee-saved set: x19-x29, x30, and the low halves of v8-v15.
     stp     x29, x30, [sp, #-16]!
     stp     x27, x28, [sp, #-16]!
     stp     x25, x26, [sp, #-16]!
     stp     x23, x24, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
     stp     x19, x20, [sp, #-16]!
+    stp     d14, d15, [sp, #-16]!
+    stp     d12, d13, [sp, #-16]!
+    stp     d10, d11, [sp, #-16]!
+    stp     d8, d9, [sp, #-16]!
 
-    # save kernel tp
-    mrs     x8, tpidr_el0   // x8 = kernel tp
-    str     x8, [sp, #-16]!
-
-    # save kernel sp to UserContext
+    # ctx.__reserved = the kernel stack to come back to
     mov     x9, sp
     str     x9, [x0, #8]
 
-    # pop tpidr
-    ldr     x9, [x0, #5*8]  // x9 = user tp
-    cbnz    x9, 1f          // if not 0, goto set
-    add     x9, x8, #72     // x9 = init user tp
-1:  msr     tpidr_el0, x9   // tp = x9
-    str     x0, [x9, #48]   // user_tp:48 = user context
+    # The guest's thread pointer. The host does not keep it in the signal
+    # frame, so it goes in by hand, last, after the last memory access this
+    # side makes that could want the kernel's.
+    ldr     x9, [x0, #40]
+    msr     tpidr_el0, x9
 
-    # pop elr, sp
-    ldr     x30, [x0, #2*8]
-    ldr     x8, [x0, #4*8]
-    mov     sp, x8
+    # rt_sigreturn(frame): every other register comes from the frame.
+    mov     sp, x1
+    mov     x8, #139
+    svc     #0
+    # Not reached: a sigreturn the host refused killed the process.
+    brk     #0
 
-    # pop general registers
-    add     x0, x0, #6*8
-    ldp     x1, x2, [x0], #16
-    ldp     x3, x4, [x0], #16
-    ldp     x5, x6, [x0], #16
-    ldp     x7, x8, [x0], #16
-    ldp     x9, x10, [x0], #16
-    ldp     x11, x12, [x0], #16
-    ldp     x13, x14, [x0], #16
-    ldp     x15, x16, [x0], #16
-    ldp     x17, x18, [x0], #16
-    ldp     x19, x20, [x0], #16
-    ldp     x21, x22, [x0], #16
-    ldp     x23, x24, [x0], #16
-    ldp     x25, x26, [x0], #16
-    ldp     x27, x28, [x0], #16
-    ldr     x29, [x0], #16
-    ldr     x0, [x0, #8]
+fault_fn_entry:
+    ldp     d8, d9, [sp], #16
+    ldp     d10, d11, [sp], #16
+    ldp     d12, d13, [sp], #16
+    ldp     d14, d15, [sp], #16
+    ldp     x19, x20, [sp], #16
+    ldp     x21, x22, [sp], #16
+    ldp     x23, x24, [sp], #16
+    ldp     x25, x26, [sp], #16
+    ldp     x27, x28, [sp], #16
+    ldp     x29, x30, [sp], #16
     ret
+
+# The old way in, kept as a symbol because the hosted vDSO rebuild
+# (`libzircon-libos.so`) is linked against it on the hosts that still boot it.
+# On Linux aarch64 the real vDSO boots and its `svc` is trapped by the host,
+# so nothing reaches here: a guest that does is stopped where it stands.
+syscall_fn_entry:
+    brk     #0
