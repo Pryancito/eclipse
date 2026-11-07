@@ -462,6 +462,9 @@ impl App {
         let top = xdg.get_toplevel(&qh, ());
         top.set_title("SilverSurfer".into());
         top.set_app_id("silversurfer".into());
+        // Abre maximizada: el compositor le da toda la pantalla menos la
+        // zona exclusiva de lunarbar (layer-shell), sin calcular nada aquí.
+        top.set_maximized();
         parent.commit();
         self.parent = Some(parent);
         self.page = Some(page);
