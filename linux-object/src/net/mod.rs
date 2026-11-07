@@ -800,6 +800,19 @@ where
 #[derive(Debug)]
 pub(super) struct GlobalSocketHandle(SocketHandle);
 
+impl GlobalSocketHandle {
+    /// The smoltcp handle inside, for a holder outside this module.
+    ///
+    /// The wrapper is what owns the socket — it is reference counted and its
+    /// `Drop` releases the set's slot — so a caller that wants the raw handle
+    /// must keep the wrapper alive for as long as it uses the handle. Which is
+    /// why this is a borrow of `self` and not a `into`: the handle alone is
+    /// not ownership of anything.
+    pub(crate) fn inner(&self) -> SocketHandle {
+        self.0
+    }
+}
+
 impl Clone for GlobalSocketHandle {
     fn clone(&self) -> Self {
         get_sockets().lock().retain(self.0);

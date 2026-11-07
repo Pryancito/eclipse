@@ -28,6 +28,42 @@ pub async fn preempt_now() {
     YieldFuture::involuntary().await
 }
 
+/// Gives the CPU back from a **synchronous** caller, which cannot `.await`.
+///
+/// Every other yield in this module is a future, and a future is no use to a
+/// path that is synchronous all the way down. The VFS is such a path:
+/// `INode::read_at` and `find` are plain methods, the kernel's `Socket` is
+/// `async`, and on bare metal there is no `block_on` to bridge them (the
+/// tree's `async_std::task::block_on` calls are all tests or libos). So a
+/// filesystem that waits on the network — NFS — needs a way to wait that is
+/// not a future.
+///
+/// On bare metal this parks the current executor and returns to the runtime,
+/// which picks another one: the same thing `.await` would have achieved,
+/// reached without one. Off bare metal (libos, and the host test build) there
+/// is no executor to park, so it hands the CPU to the host scheduler.
+///
+/// # It may do nothing, and a caller must cope
+///
+/// `executor::sched_yield` carries a guard: if the current stack pointer is
+/// not on the running executor's stack, the call arrived from an interrupt
+/// that landed inside the runtime's resume/return window, and parking from
+/// there would corrupt both the executor's saved context and the runtime's
+/// own parked frame. It refuses and returns immediately.
+///
+/// That is not an error, and it is not rare enough to ignore: a caller must be
+/// a loop that can go round again, not code that assumes time passed. Which is
+/// also why this is not a `sleep` — it makes no promise about how long it
+/// took, including none at all.
+pub fn yield_now_sync() {
+    #[cfg(target_os = "none")]
+    executor::sched_yield();
+    #[cfg(all(not(target_os = "none"), feature = "libos"))]
+    std::thread::yield_now();
+    #[cfg(all(not(target_os = "none"), not(feature = "libos")))]
+    core::hint::spin_loop();
+}
+
 /// Whether the task each CPU is polling has given the CPU back still
 /// runnable: [`yield_now`] and [`preempt_now`] wake the task before they
 /// return `Pending`, and every other `Pending` waits for something to wake it.
