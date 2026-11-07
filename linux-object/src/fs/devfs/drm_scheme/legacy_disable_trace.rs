@@ -1,5 +1,15 @@
 //! The four ioctls of wlroots' legacy CRTC-disable, as they arrive and as
 //! they end. Out of `drm_scheme.rs` for its size ceiling.
+//!
+//! Two outputs, because the lines answer two different questions. A call
+//! that was REFUSED is an anomaly and goes to `log::warn!`, which the
+//! kernel's default max level (`Warn`, `zCore/src/logging.rs`) still shows:
+//! that line names which of the four failed, and it is the reason this file
+//! exists. The narration of a call that SUCCEEDED goes to the dmesg ring
+//! buffer through [`klog`] instead, so one `dmesg` still reconstructs the
+//! whole sequence while a routine modeset at startup prints nothing to the
+//! console. Neither is `error!` any more: none of these lines is an error,
+//! and at `error!` a successful modeset looked like four of them.
 
 use super::*;
 
@@ -9,6 +19,17 @@ use super::*;
 /// compositor coming and going.
 const TRACE_BUDGET: u32 = 48;
 static TRACED: AtomicU32 = AtomicU32::new(0);
+
+/// The refusals keep a budget of their OWN, and not a share of
+/// [`TRACE_BUDGET`].
+///
+/// A refusal is the line the whole file is for, and the narration around it
+/// is the chatty half: a compositor that comes and goes a few times spends
+/// the shared budget on calls that all answered 0, and then the one refusal
+/// that explains the failure arrives with nothing left to print it with.
+/// Separate counters mean the narration can never starve it.
+const REFUSED_BUDGET: u32 = 16;
+static REFUSED: AtomicU32 = AtomicU32::new(0);
 
 /// A cursor BITMAP line is spent on a CHANGE of state, never on a repeat.
 ///
@@ -64,15 +85,19 @@ fn pack_bo(handle: u32, w: u32, h: u32) -> u64 {
 /// So name the check here. One `dmesg` then decides which of the four it is,
 /// instead of the four being indistinguishable from outside.
 pub(super) fn kms_refused(op: &str, id: u32, why: &str, err: FsError) -> FsError {
-    let n = TRACED.fetch_add(1, Ordering::Relaxed);
-    if n < TRACE_BUDGET {
-        log::error!(
+    let n = REFUSED.fetch_add(1, Ordering::Relaxed);
+    if n < REFUSED_BUDGET {
+        log::warn!(
             "[drm] {} id={} refused: {} -> {:?}{}",
             op,
             id,
             why,
             err,
-            tail(n)
+            if n + 1 == REFUSED_BUDGET {
+                " [further legacy-disable refusals not traced]"
+            } else {
+                ""
+            }
         );
     }
     err
@@ -85,11 +110,11 @@ pub(super) fn kms_refused(op: &str, id: u32, why: &str, err: FsError) -> FsError
 pub(super) fn kms_disabled(crtc_id: u32) {
     let n = TRACED.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_BUDGET {
-        log::error!(
+        klog(&alloc::format!(
             "[drm] SETCRTC crtc={} disable (no mode, no connectors) -> OK, pipe off{}",
             crtc_id,
             tail(n)
-        );
+        ));
     }
 }
 
@@ -98,12 +123,12 @@ pub(super) fn kms_disabled(crtc_id: u32) {
 pub(super) fn dpms_set(connector_id: u32, value: u64) {
     let n = TRACED.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_BUDGET {
-        log::error!(
+        klog(&alloc::format!(
             "[drm] SETPROPERTY connector={} DPMS={} -> OK{}",
             connector_id,
             value,
             tail(n)
-        );
+        ));
     }
 }
 
@@ -133,14 +158,14 @@ pub(super) fn setproperty_refused(obj_id: u32, why: &str, err: FsError) -> FsErr
 pub(super) fn setproperty_called(obj_id: u32, obj_type: u32, prop_id: u32, value: u64) {
     let n = TRACED.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_BUDGET {
-        log::error!(
+        klog(&alloc::format!(
             "[drm] SETPROPERTY obj={} type={:#x} prop={} value={} arrived{}",
             obj_id,
             obj_type,
             prop_id,
             value,
             tail(n)
-        );
+        ));
     }
 }
 
@@ -149,14 +174,14 @@ pub(super) fn setproperty_called(obj_id: u32, obj_type: u32, prop_id: u32, value
 pub(super) fn setcrtc_called(crtc_id: u32, fb_id: u32, mode_valid: u32, conns: u32) {
     let n = TRACED.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_BUDGET {
-        log::error!(
+        klog(&alloc::format!(
             "[drm] SETCRTC crtc={} fb={} mode_valid={} connectors={}{}",
             crtc_id,
             fb_id,
             mode_valid,
             conns,
             tail(n)
-        );
+        ));
     }
 }
 
@@ -166,7 +191,12 @@ pub(super) fn setcrtc_called(crtc_id: u32, fb_id: u32, mode_valid: u32, conns: u
 pub(super) fn getfb_served(fb_id: u32, handle: u32) {
     let n = TRACED.fetch_add(1, Ordering::Relaxed);
     if n < TRACE_BUDGET {
-        log::error!("[drm] GETFB fb={} -> handle={}{}", fb_id, handle, tail(n));
+        klog(&alloc::format!(
+            "[drm] GETFB fb={} -> handle={}{}",
+            fb_id,
+            handle,
+            tail(n)
+        ));
     }
 }
 
@@ -185,7 +215,7 @@ pub(super) fn cursor_bo_called(crtc_id: u32, handle: u32, w: u32, h: u32) {
     let repeats = CURSOR_BO_REPEATS.swap(0, Ordering::Relaxed);
     let n = CURSOR_BO_TRACED.fetch_add(1, Ordering::Relaxed);
     if n < CURSOR_BO_BUDGET {
-        log::error!(
+        klog(&alloc::format!(
             "[drm] CURSOR crtc={} bitmap handle={} {}x{}{}{}",
             crtc_id,
             handle,
@@ -201,8 +231,25 @@ pub(super) fn cursor_bo_called(crtc_id: u32, handle: u32, w: u32, h: u32) {
             } else {
                 ""
             }
-        );
+        ));
     }
+}
+
+/// One narration line into the dmesg ring buffer, at `LOG_INFO`.
+///
+/// Not `log::info!`: the kernel's default max level is `Warn`
+/// (`logging::init`), so an `info!` would be dropped and the narration would
+/// say nothing at all without `LOG=info` on the cmdline -- while the calls
+/// it watches happen at startup, before anyone can ask for that. And not
+/// `error!` either, which is where these lines were and what made a routine
+/// modeset print four red lines.
+///
+/// `klog_emit` is the output that fits: it is not gated by the `log` max
+/// level, so the line is always recorded, and it does not reach the console,
+/// so it is never on the screen. The budgets above still apply -- being
+/// ungated is exactly why they have to.
+fn klog(msg: &str) {
+    kernel_hal::console::klog_emit(kernel_hal::console::LOG_INFO, msg);
 }
 
 fn tail(n: u32) -> &'static str {
