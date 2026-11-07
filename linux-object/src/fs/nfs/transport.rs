@@ -103,6 +103,65 @@ pub const MAX_PARK_PASSES: u32 = 5_000;
 /// into an unbounded loop, which is not a bound.
 pub const MAX_RECV_PASSES: u32 = 5_000;
 
+/// Consecutive passes of a loop that the clock did not move through.
+///
+/// Every bounded loop in this file has the same two exits: a deadline, which
+/// is the real limit on patience, and this, which is the exit for a clock
+/// that has stopped — because a loop whose only exit is the clock does not
+/// terminate without one, and these loops run on the thread that drives the
+/// network stack.
+///
+/// # Why the clock reading outlives the pass
+///
+/// The first version sampled the clock twice inside one pass and compared
+/// those two readings. That only sees time that passes *between the samples*,
+/// so time passing anywhere else in the loop — in the parts of a pass that
+/// are not being timed, or at a granularity coarser than one pass — looked
+/// like a frozen clock. A server dribbling eight bytes a read into a 64 KiB
+/// reply makes thousands of fast passes, each too short to move a
+/// millisecond clock, and the bound would fire on a connection whose deadline
+/// was nowhere near: a working clock must not be able to trigger the
+/// stopped-clock exit. So the newest reading is kept *across* passes as a
+/// high-water mark, and any advance against it — wherever it happened —
+/// resets the count.
+struct StallCount {
+    /// The newest clock reading seen so far, from any pass.
+    seen: u64,
+    /// Passes since that reading changed.
+    passes: u32,
+}
+
+impl StallCount {
+    fn new(now: u64) -> Self {
+        Self {
+            seen: now,
+            passes: 0,
+        }
+    }
+
+    /// Note real progress — bytes moved — which is not a stall whatever the
+    /// clock says.
+    fn progress(&mut self, now: u64) {
+        if now > self.seen {
+            self.seen = now;
+        }
+        self.passes = 0;
+    }
+
+    /// One pass, with the clock as it read before and after the work the pass
+    /// did. True when the loop has run out of passes and must give up.
+    fn turn(&mut self, before: u64, after: u64, limit: u32) -> bool {
+        let newest = if before > after { before } else { after };
+        if newest > self.seen {
+            self.seen = newest;
+            self.passes = 0;
+            return false;
+        }
+        self.passes += 1;
+        self.passes >= limit
+    }
+}
+
 /// How long to park between read attempts, by how many came back empty.
 ///
 /// Lifted from `tcp.rs`'s own policy, and for its reason: parking loosely
@@ -364,8 +423,9 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
         // Counting *every* stalled pass, as the first version did, made this
         // a second and much shorter deadline: ten thousand 1 ms parks is ten
         // seconds against a documented sixty. So time advancing resets it,
-        // and a merely slow peer is bounded by the deadline alone.
-        let mut frozen_passes = 0u32;
+        // and a merely slow peer is bounded by the deadline alone. See
+        // [`StallCount`] for why the reading outlives the pass.
+        let mut stalls = StallCount::new(self.now_ms());
 
         while sent < data.len() {
             self.drive();
@@ -398,18 +458,14 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
                         return Err(self.give_up_if_partial(sent, TransportError::Other));
                     }
                     self.poll();
-                    if self.now_ms() > before {
-                        frozen_passes = 0;
-                    } else {
-                        frozen_passes += 1;
-                        if frozen_passes >= self.max_send_stalls {
-                            return Err(self.give_up_if_partial(sent, TransportError::Other));
-                        }
+                    let after = self.now_ms();
+                    if stalls.turn(before, after, self.max_send_stalls) {
+                        return Err(self.give_up_if_partial(sent, TransportError::Other));
                     }
                 }
                 Ok(n) => {
                     sent += n;
-                    frozen_passes = 0;
+                    stalls.progress(self.now_ms());
                     // Push it out now rather than waiting for the next tick:
                     // the client is about to start waiting for the reply to
                     // bytes still sitting in a buffer.
@@ -460,6 +516,10 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
         kernel_hal::timer::timer_now().as_millis() as u64
     }
 
+    fn give_up(&mut self) {
+        self.poison();
+    }
+
     fn poll(&mut self) {
         self.drive();
         // Hand the CPU over for roughly the park this many empty reads asks
@@ -474,15 +534,14 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
         // would take the machine's networking with it. Whatever the clock
         // says, this returns, and the caller is a loop that can come back.
         let until = self.now_ms() + park_ms(self.empty_polls);
-        let mut frozen_passes = 0u32;
-        while self.now_ms() < until && frozen_passes < MAX_PARK_PASSES {
+        let mut stalls = StallCount::new(self.now_ms());
+        while self.now_ms() < until {
             let before = self.now_ms();
             kernel_hal::thread::yield_now_sync();
             self.drive();
-            if self.now_ms() > before {
-                frozen_passes = 0;
-            } else {
-                frozen_passes += 1;
+            let after = self.now_ms();
+            if stalls.turn(before, after, MAX_PARK_PASSES) {
+                return;
             }
         }
     }
@@ -504,6 +563,20 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
 /// [`RpcClient::wait_for_reply`](super::client::RpcClient) checks it every
 /// turn, and so does this.
 ///
+/// # The deadline bounds the waiting, not when the bytes may have arrived
+///
+/// It is checked at the top of a turn and not again after the read that
+/// completes the record, so a record whose last chunk lands late is still
+/// returned. That is deliberate. The deadline exists to stop this waiting,
+/// and a *complete* reply that arrived late is not something waiting longer
+/// would improve: throwing it away costs a retransmit of a call the server
+/// has already executed, and NFSv3 has procedures that are not idempotent
+/// (`CREATE` with `GUARDED`, `REMOVE`, `RENAME`). Linux's RPC does the same —
+/// the timer requeues the task for retransmission, but a reply that arrives
+/// is matched by its xid and processed. So the deadline is honoured to within
+/// one read, and the dribbling server that never completes a record still
+/// dies at the top of the turn that starts past it.
+///
 /// # And a bound for the clock that stops
 ///
 /// The park inside [`KernelTransport::poll`] is bounded, but a bounded park
@@ -518,27 +591,48 @@ pub fn recv_at_least<T: RpcTransport>(
 ) -> Result<Vec<u8>, TransportError> {
     let mut out = Vec::with_capacity(want);
     let mut chunk = [0u8; 512];
-    let mut frozen_passes = 0u32;
+    let mut stalls = StallCount::new(transport.now_ms());
     while out.len() < want {
         let before = transport.now_ms();
         if before >= deadline_ms {
-            return Err(TransportError::Other);
+            return Err(abandon(transport, out.len(), TransportError::Other));
         }
         let room = core::cmp::min(chunk.len(), want - out.len());
-        match transport.recv(&mut chunk[..room])? {
+        let taken = match transport.recv(&mut chunk[..room]) {
+            Ok(n) => n,
+            Err(e) => return Err(abandon(transport, out.len(), e)),
+        };
+        match taken {
             0 => transport.poll(),
             n => out.extend_from_slice(&chunk[..n]),
         }
-        if transport.now_ms() > before {
-            frozen_passes = 0;
-        } else {
-            frozen_passes += 1;
-            if frozen_passes >= MAX_RECV_PASSES {
-                return Err(TransportError::Other);
-            }
+        let after = transport.now_ms();
+        if taken != 0 {
+            stalls.progress(after);
+        } else if stalls.turn(before, after, MAX_RECV_PASSES) {
+            return Err(abandon(transport, out.len(), TransportError::Other));
         }
     }
     Ok(out)
+}
+
+/// The error to report when [`recv_at_least`] walks away from a record it
+/// had only part of.
+///
+/// Giving up partway through a record is the receive side of the partial
+/// `send`: the bytes already taken are gone from the socket, so the next read
+/// on this connection starts in the middle of a message and reads a length
+/// field out of somebody's payload. The stream cannot be put back, so the
+/// connection is given up on — which [`KernelTransport`] does by aborting the
+/// socket, and the fakes do not need to do at all.
+///
+/// Nothing read means nothing lost: the connection is still in step and the
+/// caller may try again on it.
+fn abandon<T: RpcTransport>(transport: &mut T, read: usize, err: TransportError) -> TransportError {
+    if read != 0 {
+        transport.give_up();
+    }
+    err
 }
 
 #[cfg(test)]
