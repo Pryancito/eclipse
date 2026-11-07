@@ -48,6 +48,15 @@ UNCLASSIFIED = "Not yet classified for this core-tests image"
 # back empty while the libos run, which prints bare `\n`, was fine.
 KEPT_LINE = re.compile(rb"^(\[ *(RUN|OK|FAILED|SKIPPED|-+|=+) *\]|\*\*\* Exit status|[\w/]+\r?$|  \.[\w/]+\r?$)")
 
+# Where a line of the kernel's own log begins: the logger's grey escape, the
+# bracket and the uptime. Six harts write one serial line, and a gtest line
+# comes out cut in two by a kernel line now and then (measured here, 3 boots
+# of 12 on riscv64: `ProcessTest.KillChannelHandleCycle` lost its `[ RUN ]`;
+# and in CI on 2150924, `Threads.ProcessStartOnSecondThread` lost its `[ OK ]`
+# and was reported DID-NOT-FINISH with 1002 cases passed around it). The two
+# halves are put back together before the verdict reads them.
+KERNEL_LINE_START = re.compile(rb"\x1b\[37m\[ *\d+\.\d+ ")
+
 # How many of the guest's last lines a failed run shows.
 TAIL_LINES = 60
 
@@ -63,10 +72,24 @@ def sift(stream, tail=TAIL_LINES):
     before it could say what the guest had done.
     """
     kept, last = [], collections.deque(maxlen=tail)
+    cut = b""
     for line in stream:
-        if KEPT_LINE.match(line):
-            kept.append(line)
         last.append(line)
+        if cut:
+            # The rest of a gtest line the kernel interrupted: a whole
+            # kernel line in between is skipped, anything else is its tail.
+            if KERNEL_LINE_START.match(line):
+                continue
+            line, cut = cut + line, b""
+        if not KEPT_LINE.match(line):
+            continue
+        interrupted = KERNEL_LINE_START.search(line, 1)
+        if interrupted:
+            cut = line[: interrupted.start()]
+            continue
+        kept.append(line)
+    if cut:
+        kept.append(cut + b"\n")
     return b"".join(kept).decode(errors="replace"), b"".join(last).decode(errors="replace")
 
 

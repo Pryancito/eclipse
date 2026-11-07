@@ -1,6 +1,6 @@
 //! Console input and output.
 
-use crate::common::panic_lock::{ConsoleLock, PANIC_SPIN_BUDGET};
+use crate::common::panic_lock::{ConsoleLock, PANIC_SPIN_BUDGET, WRITE_SPIN_BUDGET};
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -776,9 +776,23 @@ fn me() -> u32 {
     crate::cpu::cpu_id() as u32
 }
 
+/// Take the serial lock for an ordinary write: wait for another CPU to finish
+/// its line, up to [`WRITE_SPIN_BUDGET`] spins, and only then drop the output.
+///
+/// This used to be `try_acquire`, and that lost user output for real: a
+/// process printing its gtest verdict while another hart dumped a page-fault
+/// report found the lock held on every write, and the `[       OK ]` line (and
+/// the `[ RUN      ]` after it) never reached the console, so the harness
+/// counted the case as never finished. A nested write from the CPU that already
+/// holds the lock still gives up at once, and nothing short of a panic ever
+/// takes the lock away.
+fn serial_lock_for_write() -> Option<crate::common::panic_lock::Acquired> {
+    SERIAL_LOCK.acquire_bounded(me(), WRITE_SPIN_BUDGET, core::hint::spin_loop)
+}
+
 /// Writes a string slice into the serial.
 pub fn serial_write_str(s: &str) {
-    if let Some(how) = SERIAL_LOCK.try_acquire(me()) {
+    if let Some(how) = serial_lock_for_write() {
         let _ = SerialWriter.write_str(s);
         SERIAL_LOCK.release(how);
     }
@@ -786,7 +800,7 @@ pub fn serial_write_str(s: &str) {
 
 /// Writes formatted data into the serial.
 pub fn serial_write_fmt(fmt: Arguments) {
-    if let Some(how) = SERIAL_LOCK.try_acquire(me()) {
+    if let Some(how) = serial_lock_for_write() {
         let _ = SerialWriter.write_fmt(fmt);
         SERIAL_LOCK.release(how);
     }

@@ -44,6 +44,19 @@ pub const NOBODY: u32 = u32::MAX;
 /// a human waiting at a frozen screen.
 pub const PANIC_SPIN_BUDGET: u32 = 40_000_000;
 
+/// How many times an ordinary console write waits for another CPU before it
+/// drops its output.
+///
+/// Ordinary writes used to give up at once (`try_lock`), and that lost real
+/// output: a user process printing its test verdict while another hart dumped
+/// a page-fault report lost whole lines, because every one of its writes found
+/// the lock held. A write that waits for the holder to finish *its* line gets
+/// through; a write that waits for a holder that died mid-line must still end,
+/// so the wait is bounded. A quarter of the panic budget: long enough for a
+/// couple of full lines on a slow emulated UART, short enough that a dead
+/// holder does not turn every CPU's logging into a freeze.
+pub const WRITE_SPIN_BUDGET: u32 = PANIC_SPIN_BUDGET / 4;
+
 /// What a failed attempt to take the lock means, given who actually holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blocked {
@@ -135,6 +148,40 @@ impl ConsoleLock {
             .compare_exchange(NOBODY, me, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| Acquired::Taken)
+    }
+
+    /// Take the lock for an ordinary write, waiting a bounded time for another
+    /// CPU to finish its line. **Always returns.**
+    ///
+    /// `None` means the caller drops its output, as with [`try_acquire`]
+    /// (`ConsoleLock::try_acquire`), but only after another CPU has held the
+    /// lock for the whole `budget`. A nested call from the CPU that already
+    /// holds it still gets `None` at once: that is a writer re-entering itself,
+    /// and no amount of waiting resolves it. Unlike the panic path, this never
+    /// takes the lock away: a dropped line is better than two CPUs writing
+    /// the same UART at the same time while nothing is wrong.
+    pub fn acquire_bounded(
+        &self,
+        me: u32,
+        budget: u32,
+        mut pause: impl FnMut(),
+    ) -> Option<Acquired> {
+        let mut spun: u32 = 0;
+        loop {
+            match self
+                .owner
+                .compare_exchange(NOBODY, me, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(Acquired::Taken),
+                Err(owner) => match blocked_by(owner, me, spun, budget) {
+                    Blocked::Ourselves | Blocked::Steal => return None,
+                    Blocked::Wait => {
+                        pause();
+                        spun = spun.saturating_add(1);
+                    }
+                },
+            }
+        }
     }
 
     /// Take the lock for a panic-context write. **Always returns.**
@@ -314,6 +361,79 @@ mod tests {
         let how = l.try_acquire(ME).unwrap();
         l.release(how);
         assert_eq!(l.owner(), NOBODY);
+    }
+
+    // -- the ordinary path -------------------------------------------------
+
+    #[test]
+    fn an_ordinary_write_on_a_free_lock_does_not_wait() {
+        let l = ConsoleLock::new();
+        let spins = Cell::new(0);
+        assert_eq!(
+            l.acquire_bounded(ME, 10, bounded(&spins, 0)),
+            Some(Acquired::Taken)
+        );
+        assert_eq!(spins.get(), 0);
+        assert_eq!(l.owner(), ME);
+    }
+
+    #[test]
+    fn an_ordinary_write_waits_for_a_holder_that_finishes_its_line() {
+        // The lost verdict: a user process wrote `[ OK ]` while another hart
+        // was printing a fault report, and `try_acquire` dropped it on the
+        // floor. Waiting for the holder's line gets the write through.
+        let l = ConsoleLock::new();
+        let held = l.try_acquire(OTHER).unwrap();
+        let spins = Cell::new(0);
+        let how = l.acquire_bounded(ME, 1000, || {
+            spins.set(spins.get() + 1);
+            assert!(spins.get() <= 4, "the holder let go and we kept waiting");
+            if spins.get() == 4 {
+                l.release(held);
+            }
+        });
+        assert_eq!(how, Some(Acquired::Taken));
+        assert_eq!(spins.get(), 4);
+        assert_eq!(l.owner(), ME);
+    }
+
+    #[test]
+    fn an_ordinary_write_drops_its_output_once_the_budget_is_spent() {
+        let l = ConsoleLock::new();
+        l.try_acquire(OTHER).unwrap();
+        let spins = Cell::new(0);
+        assert_eq!(l.acquire_bounded(ME, 7, bounded(&spins, 7)), None);
+        assert_eq!(spins.get(), 7);
+    }
+
+    #[test]
+    fn an_ordinary_write_never_takes_the_lock_away() {
+        // Only the panic path may steal: nothing is wrong, the holder is
+        // merely slow, and two CPUs on one UART is worse than one lost line.
+        let l = ConsoleLock::new();
+        l.try_acquire(OTHER).unwrap();
+        assert_eq!(l.acquire_bounded(ME, 3, at_most(3)), None);
+        assert_eq!(l.owner(), OTHER, "an ordinary write stole the lock");
+        assert_eq!(l.steals(), 0);
+    }
+
+    #[test]
+    fn an_ordinary_write_that_re_enters_itself_gives_up_without_waiting() {
+        let l = ConsoleLock::new();
+        l.try_acquire(ME).unwrap();
+        let spins = Cell::new(0);
+        assert_eq!(l.acquire_bounded(ME, u32::MAX, bounded(&spins, 0)), None);
+        assert_eq!(spins.get(), 0, "waited for itself");
+        assert_eq!(l.owner(), ME);
+    }
+
+    #[test]
+    fn the_write_budget_is_bounded_and_shorter_than_the_panic_one() {
+        // Zero would be `try_acquire` again and lose the lines this exists
+        // for; longer than the panic budget would let a dead holder freeze
+        // ordinary logging for longer than a panic is willing to wait.
+        assert!(WRITE_SPIN_BUDGET > 0);
+        assert!(WRITE_SPIN_BUDGET < PANIC_SPIN_BUDGET);
     }
 
     // -- the panic path ----------------------------------------------------
