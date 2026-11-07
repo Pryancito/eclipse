@@ -755,3 +755,316 @@ fn a_park_comes_back_even_if_the_clock_does_not_move() {
         "four parks must not take seconds"
     );
 }
+
+// ------------------------------------------------- the Copilot round of #2498
+
+/// A transport that is nothing but a clock and a trickle, for the two things
+/// [`recv_at_least`] has to get right that a real socket cannot be made to do
+/// on demand: a clock that has stopped, and a server that dribbles.
+///
+/// It is not a stand-in for [`KernelTransport`] — everything else in this file
+/// measures the real one over real TCP. `recv_at_least` is generic over the
+/// trait, and these two behaviours are a property of *its* loop.
+struct Trickle {
+    /// Milliseconds, moved by `advance_per_call` on every operation.
+    now: u64,
+    /// How much the clock moves per call. Zero is the stopped clock.
+    advance_per_call: u64,
+    /// How many bytes each `recv` hands over. Zero never delivers anything.
+    bytes_per_recv: usize,
+    /// How many times `recv` was called.
+    recvs: u32,
+}
+
+impl Trickle {
+    fn new(advance_per_call: u64, bytes_per_recv: usize) -> Self {
+        Self {
+            now: 1_000,
+            advance_per_call,
+            bytes_per_recv,
+            recvs: 0,
+        }
+    }
+}
+
+impl RpcTransport for Trickle {
+    fn send(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        self.recvs = self.recvs.saturating_add(1);
+        self.now = self.now.saturating_add(self.advance_per_call);
+        let n = self.bytes_per_recv.min(buf.len());
+        for b in buf[..n].iter_mut() {
+            *b = 0xA5;
+        }
+        Ok(n)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now
+    }
+
+    fn poll(&mut self) {
+        self.now = self.now.saturating_add(self.advance_per_call);
+    }
+}
+
+#[test]
+fn a_dribbling_server_cannot_walk_past_the_deadline() {
+    // The deadline used to be checked only when `recv` returned nothing, so a
+    // server handing over one byte at a time always took the other arm. If
+    // the message eventually completed, `recv_at_least` returned SUCCESS long
+    // after the deadline had expired -- worse than a missed timeout, because
+    // a caller that set a deadline is told it was honoured.
+    let mut t = Trickle::new(10, 1);
+    let deadline = t.now_ms() + 100;
+    let outcome = recv_at_least(&mut t, 10_000, deadline);
+    assert_eq!(
+        outcome,
+        Err(TransportError::Other),
+        "a trickle completed the read past its own deadline"
+    );
+    assert!(
+        t.now_ms() <= deadline + 50,
+        "it ran {} ms past the deadline before noticing",
+        t.now_ms() - deadline
+    );
+}
+
+#[test]
+fn a_dribbling_server_that_finishes_inside_the_deadline_still_succeeds() {
+    // The other half of the previous test: checking the deadline every turn
+    // must not fail a read that is simply arriving in small pieces.
+    // Far more turns than the pass bound allows, which is the point: the
+    // bound counts only the turns the clock did not move, and a read arriving
+    // in small pieces with time passing must reset it on every turn. Without
+    // that reset this read dies of the frozen-clock bound while the clock is
+    // working perfectly.
+    let mut t = Trickle::new(1, 8);
+    let deadline = t.now_ms() + 20_000;
+    let want = (MAX_RECV_PASSES as usize + 2_000) * 8;
+    let got = recv_at_least(&mut t, want, deadline).expect("a trickle inside the deadline");
+    assert_eq!(got.len(), want);
+    assert!(
+        t.recvs > MAX_RECV_PASSES,
+        "the read finished in {} turns, which is too few to prove the reset",
+        t.recvs
+    );
+    assert!(got.iter().all(|&b| b == 0xA5));
+}
+
+#[test]
+fn a_receive_comes_back_even_if_the_clock_does_not_move() {
+    // A bounded park that returns into an unbounded loop is not a bound. With
+    // a stopped clock, `now_ms() >= deadline_ms` is false for ever, so the
+    // turns the clock does not move are counted here too.
+    let mut t = Trickle::new(0, 0);
+    let deadline = t.now_ms() + 1_000;
+    assert_eq!(
+        recv_at_least(&mut t, 16, deadline),
+        Err(TransportError::Other),
+        "a stopped clock left the receive loop spinning"
+    );
+    assert!(
+        t.recvs <= MAX_RECV_PASSES + 1,
+        "it turned {} times, so the pass bound is not holding",
+        t.recvs
+    );
+}
+
+#[test]
+fn a_send_that_got_part_of_a_record_out_gives_the_connection_up() {
+    // The worst of the round. A send that fails having already handed PART of
+    // a record to the socket leaves the server waiting for the rest of a
+    // message. The client above only sees an error and keeps the transport,
+    // so its next call writes a record header where the server expects the
+    // previous payload: not a lost call but a stream out of step, surfacing
+    // in some later call that had nothing to do with it.
+    //
+    // Half a record cannot be withdrawn from the server's buffer, so the only
+    // honest repair is to stop using the connection.
+    let _g = LOCK.lock();
+    let mut iface = loopback();
+    let (_server, client) = connected_pair(&mut iface, 41218);
+    let mut t = KernelTransport::new(client).with_send_timeout(200);
+
+    // Larger than the send buffer and a far end that never reads: the first
+    // chunk goes into the buffer, the rest cannot, and the deadline ends it.
+    let big = bigger_than_the_send_buffer();
+    assert!(
+        t.send(&big).is_err(),
+        "a send that never got the bytes out must not report success"
+    );
+    assert!(
+        t.is_poisoned(),
+        "the connection carried half a record and was kept anyway"
+    );
+    // And the socket is really gone, not merely flagged: a flag that left the
+    // connection open would keep the server waiting out its own timeout on
+    // the rest of a message that is never coming.
+    assert_eq!(
+        socket_state(t.sock_for_test()),
+        smoltcp::socket::TcpState::Closed,
+        "giving the connection up left the socket alive"
+    );
+}
+
+/// The smoltcp state of a socket in the kernel's set.
+fn socket_state(handle: SocketHandle) -> smoltcp::socket::TcpState {
+    let sets = get_sockets();
+    let mut sets = sets.lock();
+    let state = sets.get::<TcpSocket>(handle).state();
+    state
+}
+
+#[test]
+fn nothing_reaches_the_wire_on_a_connection_that_was_given_up_on() {
+    // What giving it up is for: every later operation has to refuse, because
+    // the stream is out of step and the next record would be framed against
+    // the tail of the last one.
+    let _g = LOCK.lock();
+    let mut iface = loopback();
+    let (server, client) = connected_pair(&mut iface, 41219);
+    let mut t = KernelTransport::new(client).with_send_timeout(200);
+
+    let big = bigger_than_the_send_buffer();
+    let _ = t.send(&big);
+    assert!(t.is_poisoned());
+
+    assert_eq!(
+        t.send(b"la llamada siguiente"),
+        Err(TransportError::NotConnected),
+        "a later call was framed onto a stream that is out of step"
+    );
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        t.recv(&mut buf),
+        Err(TransportError::NotConnected),
+        "a read on a connection given up on must refuse too"
+    );
+    pump(&mut iface);
+    let _ = server;
+}
+
+#[test]
+fn a_send_that_got_nothing_out_leaves_the_connection_usable() {
+    // The other side of it, and the reason this is not just "give up on any
+    // error". With `sent == 0` nothing reached the server, so the stream is
+    // still in step and the caller may try the same connection again. Giving
+    // it up there would turn every refused write into a dead mount.
+    let _g = LOCK.lock();
+    let mut iface = loopback();
+    let (server, client) = connected_pair(&mut iface, 41220);
+    let mut t = KernelTransport::new(client);
+
+    // The peer resets, so the very first `send_slice` fails with nothing
+    // sent.
+    server_aborts(&server);
+    pump(&mut iface);
+    let outcome = t.send(b"una peticion");
+    assert!(outcome.is_err(), "a send to a reset peer must not succeed");
+    assert!(
+        !t.is_poisoned(),
+        "a send that handed over no bytes gave the connection up anyway"
+    );
+}
+
+/// A driver that resets the far end part-way through the send loop.
+///
+/// The only way to reach the `may_send` arm of that loop *with bytes already
+/// gone*: the peer has to go away between one turn and the next, and on the
+/// host nothing else moves while the loop is running. That is what the
+/// `StackDriver` seam is for.
+struct AbortAfter {
+    iface: Interface<'static, Loopback>,
+    far: SocketHandle,
+    drives: u32,
+    /// The drive on which the far end resets.
+    at: u32,
+}
+
+impl StackDriver for AbortAfter {
+    fn drive(&mut self) {
+        self.drives = self.drives.saturating_add(1);
+        if self.drives == self.at {
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            sets.get::<TcpSocket>(self.far).abort();
+        }
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        for _ in 0..16 {
+            let ms = kernel_hal::timer::timer_now().as_millis() as i64;
+            let _ = self.iface.poll(&mut sets, Instant::from_millis(ms));
+        }
+    }
+}
+
+#[test]
+fn a_send_half_done_when_the_peer_goes_away_gives_the_connection_up_too() {
+    // The other way out of the send loop with bytes already gone: the first
+    // chunk lands, then the peer resets, so the next turn finds `may_send`
+    // false. The record is half sent either way, so this path has to give the
+    // connection up for the same reason the deadline path does -- and it did
+    // not, which a mutation of the deadline path alone would never have
+    // shown.
+    let _g = LOCK.lock();
+    let mut iface = loopback();
+    let (server, client) = connected_pair(&mut iface, 41223);
+    let far = server.inner();
+    let mut t = KernelTransport::with_driver(
+        client,
+        AbortAfter {
+            iface: loopback(),
+            far,
+            drives: 0,
+            at: 2,
+        },
+    )
+    .with_send_timeout(2_000);
+
+    // Bigger than the send buffer, so the loop has to turn again after the
+    // first chunk -- and by then the driver has reset the far end.
+    let big = bigger_than_the_send_buffer();
+    assert!(
+        t.send(&big).is_err(),
+        "a send whose peer went away must not report success"
+    );
+    assert!(
+        t.is_poisoned(),
+        "the send half went away with part of a record out, and the connection was kept"
+    );
+    let _ = server;
+}
+
+#[test]
+fn the_stall_bound_counts_only_the_passes_the_clock_did_not_move() {
+    // With the bound lowered to five, a send against a far end that never
+    // reads still has to run to its deadline: the clock is working, so every
+    // park advances it and the counter never gets past one. Counting every
+    // stalled pass -- which is what the first version did -- would end this
+    // send after five parks, in a handful of milliseconds.
+    let _g = LOCK.lock();
+    let mut iface = loopback();
+    let (_server, client) = connected_pair(&mut iface, 41222);
+    let mut t = KernelTransport::new(client)
+        .with_send_timeout(200)
+        .with_max_send_stalls(5);
+
+    let big = bigger_than_the_send_buffer();
+    let started = kernel_hal::timer::timer_now();
+    assert!(t.send(&big).is_err());
+    let took = kernel_hal::timer::timer_now() - started;
+
+    assert!(
+        took >= core::time::Duration::from_millis(150),
+        "it gave up after {:?}, so the stall count ended it and not the 200 ms deadline",
+        took
+    );
+}
+
+/// The receive bound has to be wide enough never to cut short a read that is
+/// merely slow, for the same reason the other two do.
+const _: () = assert!(MAX_RECV_PASSES >= 1_000);
