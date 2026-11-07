@@ -78,10 +78,6 @@ const FSC_TRANSLATION_L3: usize = 0b000111;
 /// `ESR_EL1.WnR` of a data abort: the access was a write.
 const ESR_WNR: usize = 1 << 6;
 
-/// The `brk #imm16` encoding: `0xd420_0000 | imm16 << 5`.
-const BRK_OPCODE_MASK: u32 = 0xffe0_001f;
-const BRK_OPCODE: u32 = 0xd420_0000;
-
 /// The signals a guest can come back on.
 const SIGNALS: [Signal; 7] = [
     Signal::SIGILL,
@@ -243,6 +239,14 @@ unsafe fn leave_to_the_host(signal: libc::c_int) {
 
 /// Tell the kernel the context this host thread is about to go out in, so
 /// the handler can fill it. Kernel context, right before `run_fncall`.
+///
+/// A published context is also what says the thread is OUT: the handler
+/// takes it back (`ANCHOR_CTX` goes to zero) the moment the guest's trip
+/// ends, so a fault that finds one belongs to the guest whatever its `pc`
+/// is. A guest that branches to zero, or anywhere outside its own code,
+/// faults with a `pc` the guest window does not contain; by the window
+/// alone that read as the kernel's own fault and killed the whole libos
+/// instead of handing the guest a `FatalPageFault`.
 pub fn publish_context(ctx: *mut UserContext) {
     ANCHOR_ROW.with(|row| {
         if let Some(slot) = row.get() {
@@ -264,6 +268,13 @@ extern "C" fn on_fault(
 /// Is `pc` the guest's? Its own code, or the old fncall entry, which is the
 /// one kernel address a guest jumps to on purpose (the hosted Linux
 /// personality's musl, with `rcore_syscall_entry` patched to it).
+///
+/// Only a TICK is classified by this: a tick on the kernel's side is a
+/// reschedule noted for the next trip out, not a trap, and the kernel's
+/// side includes the two stretches of `fncall.S` that run between the
+/// published context and the guest proper. A fault is classified by the
+/// published context instead (see [`publish_context`]), because a guest can
+/// fault at any `pc` it likes.
 fn is_guest_pc(pc: usize) -> bool {
     let start = GUEST_START.load(Ordering::Relaxed);
     let end = GUEST_END.load(Ordering::Relaxed);
@@ -278,18 +289,17 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
     let uc = &mut *(context as *mut libc::ucontext_t);
     let mc = &mut *(ptr::addr_of_mut!(uc.uc_mcontext) as *mut HostSigContext);
     let pc = mc.pc as usize;
-    if !is_guest_pc(pc) {
-        // The kernel's own. A tick is the one signal it can get without
-        // anything being wrong: the thread's slice is over all the same,
-        // and the next trip out is told so.
-        if signal == libc::SIGALRM {
-            return note_tick_off_guest();
-        }
-        return leave_to_the_host(signal);
+    // A tick on the kernel's side -- in a syscall, on the way in or out, or
+    // parked -- is the one signal that side can get without anything being
+    // wrong: the thread's slice is over all the same, and the next trip out
+    // is told so.
+    if signal == libc::SIGALRM && !is_guest_pc(pc) {
+        return note_tick_off_guest();
     }
     // A thread the bridge does not know, or one that is not out: a tick is
     // dropped (its default action would kill the process), a fault is the
-    // host's.
+    // host's. A thread that IS out owns the fault whatever `pc` says: a
+    // guest that branched to zero faults at zero.
     let Some(Anchor { tp, slot }) = anchor() else {
         return if signal == libc::SIGALRM {
             note_tick_off_guest()
@@ -305,6 +315,9 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
             leave_to_the_host(signal)
         };
     }
+    // The trip is over: from here the thread is the kernel's again, and the
+    // next signal on it is the kernel's unless a new context is published.
+    ANCHOR_CTX[slot].store(0, Ordering::Release);
     let ctx = &mut *ctx;
     // The guest's registers out, and the way back in: from here the
     // handler's return lands in `fault_fn_entry`.
@@ -327,18 +340,15 @@ unsafe fn bridge_fault(signal: libc::c_int, context: *mut libc::c_void) {
             ctx.elr = ctx.general.x30;
             (SYNC_FROM_USER, EC_SVC64 | ESR_IL, 0)
         }
-        // `brk #imm`: the pc is AT the instruction, so the immediate can be
-        // read back from it. The guest just executed the word, so it is
-        // mapped and readable.
-        libc::SIGTRAP => {
-            let word = (pc as *const u32).read_unaligned();
-            let imm = if word & BRK_OPCODE_MASK == BRK_OPCODE {
-                ((word >> 5) & 0xffff) as usize
-            } else {
-                0
-            };
-            (SYNC_FROM_USER, EC_BRK | ESR_IL | imm, pc)
-        }
+        // `brk #imm`: the pc is AT the instruction. The immediate is NOT
+        // read back from it here: nothing in the kernel wants it
+        // (`Syndrome::Brk(_)` is the software breakpoint whatever the
+        // number), and the guest's page is not guaranteed to still be
+        // mapped by the time the handler runs -- another guest thread can
+        // unmap it between the `brk` and the load, and a fault inside the
+        // handler is the kernel's own, which ends the libos. Whoever needs
+        // the number reads it through the VMAR, in kernel context.
+        libc::SIGTRAP => (SYNC_FROM_USER, EC_BRK | ESR_IL, pc),
         libc::SIGILL => (SYNC_FROM_USER, EC_UNKNOWN | ESR_IL, pc),
         libc::SIGFPE => (SYNC_FROM_USER, EC_TRAPPED_FPU | ESR_IL, pc),
         // A memory fault: the host recorded the syndrome the CPU gave it,
@@ -645,16 +655,6 @@ mod tests {
                 level: 3
             }
         ));
-    }
-
-    #[test]
-    fn a_brk_immediate_is_read_back_from_the_instruction() {
-        // `brk #0x1234` as the assembler encodes it.
-        let word: u32 = BRK_OPCODE | (0x1234 << 5);
-        assert_eq!(word & BRK_OPCODE_MASK, BRK_OPCODE);
-        assert_eq!((word >> 5) & 0xffff, 0x1234);
-        // `nop` is not a brk.
-        assert_ne!(0xd503_201f & BRK_OPCODE_MASK, BRK_OPCODE);
     }
 
     #[test]
