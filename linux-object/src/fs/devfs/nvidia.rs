@@ -633,6 +633,9 @@ impl NvidiaOpen {
                 if status == NV_OK && nr == esc::RM_ALLOC_MEMORY {
                     alloc_memory_refused(payload);
                 }
+                if status == NV_OK && nr == esc::RM_VID_HEAP_CONTROL {
+                    os_descriptor_refused(payload);
+                }
                 escape_result(nr, status)
             }
             esc::RM_FREE
@@ -903,6 +906,7 @@ const ALLOC_USER_READ_ONLY: u32 = 1 << 21;
 const VID_HEAP_CONTROL_SIZE: usize = 184;
 const VID_HEAP_FUNCTION: usize = 8;
 const VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
+const VID_HEAP_STATUS: usize = 20;
 const VID_HEAP_ATTR2: usize = 56;
 const VID_HEAP_DESCRIPTOR: usize = 64;
 const VID_HEAP_LIMIT: usize = 72;
@@ -911,13 +915,16 @@ const VID_HEAP_ATTR2_PROTECTION_USER_RO: u32 = 0x400000;
 /// The pages an RM_ALLOC_MEMORY or RM_VID_HEAP_CONTROL payload has the RM pin,
 /// as RmCreateOsDescriptor asks `os_lock_user_pages` for them: `(address,
 /// pages, for writing)`. `None` for a call that never gets that far: a
-/// payload of the wrong size, the control device, another class/function, an
+/// payload of the wrong size, the wrong device, another class/function, an
 /// address that is not page aligned, or a limit that overflows.
+///
+/// The RM serves each escape on one device only, as escape.c does:
+/// RM_ALLOC_MEMORY on a GPU's `/dev/nvidia<N>` (`NV_ACTUAL_DEVICE_ONLY`; how
+/// cuMemAllocHost hands its pages over) and RM_VID_HEAP_CONTROL on
+/// `/dev/nvidiactl` (`NV_CTL_DEVICE_ONLY`; how cuMemHostRegister does).
 fn os_descriptor_pages(payload: &[u8], ctl: bool) -> Option<(usize, usize, bool)> {
-    if ctl {
-        return None;
-    }
-    if payload.len() == ALLOC_MEMORY_SIZE
+    if !ctl
+        && payload.len() == ALLOC_MEMORY_SIZE
         && u32_at(payload, ALLOC_MEMORY_CLASS) == OS_DESCRIPTOR_CLASS
     {
         let address = u64_at(payload, ALLOC_MEMORY_PMEMORY);
@@ -933,7 +940,8 @@ fn os_descriptor_pages(payload: &[u8], ctl: bool) -> Option<(usize, usize, bool)
             write,
         ));
     }
-    if payload.len() == VID_HEAP_CONTROL_SIZE
+    if ctl
+        && payload.len() == VID_HEAP_CONTROL_SIZE
         && u32_at(payload, VID_HEAP_FUNCTION) == VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR
     {
         let address = u64_at(payload, VID_HEAP_DESCRIPTOR);
@@ -994,6 +1002,26 @@ fn alloc_memory_refused(payload: &[u8]) {
         u64_at(payload, ALLOC_MEMORY_LIMIT),
         u64_at(payload, ALLOC_MEMORY_PMEMORY),
         u32_at(payload, ALLOC_MEMORY_STATUS)
+    );
+}
+
+/// One log line for an RM_VID_HEAP_CONTROL of an OS descriptor (what
+/// cuMemHostRegister asks for) that the RM refused in its status, which no
+/// failed syscall shows: libcuda reports any such refusal as
+/// CUDA_ERROR_OUT_OF_MEMORY.
+fn os_descriptor_refused(payload: &[u8]) {
+    if payload.len() != VID_HEAP_CONTROL_SIZE
+        || u32_at(payload, VID_HEAP_FUNCTION) != VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR
+        || u32_at(payload, VID_HEAP_STATUS) == NV_OK
+    {
+        return;
+    }
+    zcore_drivers::klog_warn!(
+        "[nvidiactl] RM_VID_HEAP_CONTROL ALLOC_OS_DESCRIPTOR of limit {:#x} at {:#x}, attr2 {:#x}: RM status {:#x}",
+        u64_at(payload, VID_HEAP_LIMIT),
+        u64_at(payload, VID_HEAP_DESCRIPTOR),
+        u32_at(payload, VID_HEAP_ATTR2),
+        u32_at(payload, VID_HEAP_STATUS)
     );
 }
 

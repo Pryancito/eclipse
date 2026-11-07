@@ -1266,7 +1266,9 @@ fn an_os_descriptor_is_pinned_as_the_payload_asks() {
     vid_heap[VID_HEAP_DESCRIPTOR..VID_HEAP_DESCRIPTOR + 8]
         .copy_from_slice(&0x8000_0000u64.to_ne_bytes());
     vid_heap[VID_HEAP_LIMIT..VID_HEAP_LIMIT + 8].copy_from_slice(&0x1fffu64.to_ne_bytes());
-    let pages = pin_os_descriptor(&vid_heap, false, &caller).expect("pinned vid_heap");
+    // ... on the control device, the only one the RM serves it on.
+    assert!(pin_os_descriptor(&vid_heap, false, &caller).is_none());
+    let pages = pin_os_descriptor(&vid_heap, true, &caller).expect("pinned vid_heap");
     assert_eq!(
         (pages.va, pages.phys.len(), pages.writable),
         (0x8000_0000, 2, true)
