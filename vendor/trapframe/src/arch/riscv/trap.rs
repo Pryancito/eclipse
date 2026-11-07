@@ -118,6 +118,12 @@ pub struct UserContext {
     /// Floating-point registers and `fcsr`. See [`FpRegs`].
     #[cfg(target_arch = "riscv64")]
     pub fp: FpRegs,
+    /// The vector state, saved lazily by the kernel around `run`: see
+    /// [`VectorState`](super::VectorState). Not part of the trap frame, so
+    /// `trap.S` never touches it; it sits after everything the assembly
+    /// addresses by slot.
+    #[cfg(target_arch = "riscv64")]
+    pub vector: super::VectorState,
 }
 
 impl UserContext {
@@ -331,7 +337,15 @@ const _: () = {
 
     // `run_user` takes a `&mut UserContext` while the trap path builds a
     // `TrapFrame`, and both reach the same `trap_return`, so the two have to
-    // agree word for word. Nothing but this makes them.
+    // agree word for word over the frame. Nothing but this makes them. The
+    // `UserContext` carries the vector state after the frame, which the
+    // assembly never addresses: the frame has to be exactly its prefix.
+    #[cfg(target_arch = "riscv64")]
+    assert!(
+        offset_of!(UserContext, vector) == size_of::<TrapFrame>(),
+        "TrapFrame is no longer the prefix of UserContext that trap.S addresses by slot"
+    );
+    #[cfg(not(target_arch = "riscv64"))]
     assert!(
         size_of::<TrapFrame>() == size_of::<UserContext>(),
         "TrapFrame and UserContext no longer agree, and trap.S uses them interchangeably"

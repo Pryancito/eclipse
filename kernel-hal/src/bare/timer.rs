@@ -575,7 +575,11 @@ pub fn vdso_tsc_ratio() -> Option<(u32, u32, u64)> {
     {
         super::arch::timer::vdso_tsc_ratio()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "riscv64")]
+    {
+        super::arch::timer::vdso_time_ratio()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     {
         None
     }
@@ -585,8 +589,8 @@ pub fn vdso_tsc_ratio() -> Option<(u32, u32, u64)> {
 /// subtract before scaling by [`vdso_tsc_mult`] to get the same monotonic
 /// nanoseconds the kernel reports.
 ///
-/// Meaningless when `vdso_tsc_mult` answers `None`, which is every
-/// architecture but x86_64.
+/// Meaningless when `vdso_tsc_ratio` answers `None`. Zero on riscv64, where
+/// the kernel scales the raw `time` CSR with no base of its own.
 pub fn vdso_tsc_base() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {

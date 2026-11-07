@@ -1608,13 +1608,19 @@ impl Process {
         self.inner.lock().threads.clone()
     }
 
-    /// Sum of per-thread `ZX_INFO_TASK_RUNTIME` for this process.
+    /// `ZX_INFO_TASK_RUNTIME` for this process: the CPU time of its exited
+    /// threads and of its live ones, read the way
+    /// [`cpu_time_ns`](Self::cpu_time_ns) reads it.
+    ///
+    /// It used to sum the live threads only. A thread that has exited hands
+    /// its clocks to the process and leaves the list, so a process read
+    /// after its last thread died reported `cpu_time == 0`: that is what
+    /// `ProcessTest.GetInfoRuntimeV1` saw, in 1 boot of 3 here and in CI,
+    /// when the killed child's thread had already gone by the time the test
+    /// asked.
     pub fn get_runtime_info(&self) -> crate::task::TaskRuntimeInfo {
-        let mut total = crate::task::TaskRuntimeInfo::default();
-        for thread in self.inner.lock().threads.iter() {
-            total = total.saturating_add(thread.get_runtime_info());
-        }
-        total
+        let (user, sys) = self.cpu_time_ns();
+        crate::task::TaskRuntimeInfo::from_cpu_time(user.saturating_add(sys))
     }
 
     /// Wait for process exit and get return code.

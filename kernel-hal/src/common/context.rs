@@ -990,6 +990,12 @@ impl UserContext {
                 self.0.general.a2 = args[2];
                 // SUM = 1, FS = 0b11, SPIE = 1
                 self.0.sstatus = 1 << 18 | 0b11 << 13 | 1 << 5;
+                // VS = Off: the vector unit is switched on for this thread
+                // by its first vector instruction, which traps as illegal
+                // and is retried with a zeroed state (`vector_first_use`).
+                // Entering with it on would hand a new thread whatever the
+                // last thread left in the register file. See `enter_uspace`
+                // and `trapframe::VectorState`.
             }
         }
     }
@@ -1314,11 +1320,93 @@ impl UserContext {
                 unsafe {
                     core::arch::asm!("msr daifset, #2");
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                // The vector register file is the one piece of user state
+                // that neither `trap.S` nor the trip out touches: it is
+                // switched here, around `run`, and only for the threads that
+                // use it. In: a thread with saved state gets it back, since
+                // whatever ran on this hart since may have loaded its own.
+                // Out: `trap_entry` stored the hart's `sstatus` in the
+                // context, and its `VS` says Dirty exactly when user code
+                // wrote a vector register or CSR since the last save -- so
+                // the state is saved then, and only then, and the field is
+                // set back to Clean so the next trip can tell again. The
+                // kernel is built without V and runs no vector instruction
+                // of its own, so between the trap and this save nothing has
+                // disturbed the registers.
+                //
+                // A thread starts with VS Off and no state. Its first vector
+                // instruction traps as illegal; `vector_first_use` then gives
+                // it a zeroed state, turns VS on in its `sstatus`, and the
+                // instruction is retried. From then on the thread is `live`
+                // and gets its own state put back before every trip out,
+                // whether or not it wrote: a read of a register this thread
+                // never loaded would otherwise see what the last thread on
+                // this hart left there, and reads do not set Dirty. So the
+                // register file never carries one thread's values into
+                // another: a thread with VS Off cannot touch it, and a live
+                // one always loads its own first.
+                #[cfg(target_arch = "riscv64")]
+                loop {
+                    if self.0.vector.live {
+                        // SAFETY: `live` is only set here and by `vector_save`
+                        // below, both only on a hart `vector_vlenb()` vouched
+                        // for.
+                        unsafe { trapframe::vector_restore(&self.0.vector) };
+                    }
+                    self.0.run();
+                    if self.0.sstatus & trapframe::SSTATUS_VS_MASK == trapframe::SSTATUS_VS_DIRTY {
+                        // SAFETY: Dirty is only reachable from a context
+                        // entered with VS on, which `vector_first_use` gives
+                        // only on a hart with a unit the state can hold; and
+                        // this is the first thing after `run` returned, on
+                        // the same hart.
+                        unsafe { trapframe::vector_save(&mut self.0.vector) };
+                        self.0.sstatus = (self.0.sstatus & !trapframe::SSTATUS_VS_MASK)
+                            | trapframe::SSTATUS_VS_CLEAN;
+                    } else if self.vector_first_use() {
+                        // The trap was the unit being Off: retry the
+                        // instruction with it on. `SIE` is still clear from
+                        // the trap in, as the restore above needs.
+                        continue;
+                    }
+                    break;
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
                 self.0.run();
                 self.dbg_validate_user_ctx("after trap from user");
             }
         }
+    }
+
+    /// riscv64: whether the trap `run` just came back from was this thread's
+    /// first vector instruction, and if so, switch the unit on for it.
+    ///
+    /// The conditions are all three of: the hart has a unit the context can
+    /// hold (`vector_vlenb() != 0`), this context's `VS` is still Off, and
+    /// the trap is an illegal instruction. Then the state is zeroed and
+    /// marked live, `VS` goes to Initial in the context's `sstatus`, and the
+    /// caller retries the instruction, which the loader of the zeroed state
+    /// precedes. An instruction that is illegal for another reason traps
+    /// again on the retry, with `VS` no longer Off, and is reported as it
+    /// would have been. This is Linux's `riscv_v_first_use_handler`, with a
+    /// zeroed state in place of its allocation.
+    #[cfg(target_arch = "riscv64")]
+    fn vector_first_use(&mut self) -> bool {
+        use riscv::register::scause::{self, Exception, Trap};
+        if crate::imp::cpu::vector_vlenb() == 0 {
+            return false;
+        }
+        if self.0.sstatus & trapframe::SSTATUS_VS_MASK != 0 {
+            return false;
+        }
+        if scause::read().cause() != Trap::Exception(Exception::IllegalInstruction) {
+            return false;
+        }
+        self.0.vector = trapframe::VectorState::default();
+        self.0.vector.live = true;
+        self.0.sstatus =
+            (self.0.sstatus & !trapframe::SSTATUS_VS_MASK) | trapframe::SSTATUS_VS_INITIAL;
+        true
     }
 
     /// DEBUG instrumentation: catch a corrupted saved user context (rip/rsp/rbp

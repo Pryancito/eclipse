@@ -979,8 +979,15 @@ mod try_read_u32_tests {
     }
 
     /// And the case it exists for: a page the host does not have. Mapped and
-    /// then unmapped, so the address is a plausible one rather than a
+    /// then taken away, so the address is a plausible one rather than a
     /// never-valid constant.
+    ///
+    /// Taken away with `PROT_NONE`, not `munmap`: the suite runs its tests
+    /// on parallel threads, and an unmapped page is one any of them can get
+    /// back from the host's next `mmap`, after which the probe read a fresh
+    /// zero where it should have failed (seen here, 1 in ~1230 host tests).
+    /// A mapping with no permissions stays this test's own and still answers
+    /// `EFAULT`, which is what a decommitted guest page looks like too.
     #[test]
     fn a_page_the_host_no_longer_has_answers_none() {
         use nix::libc;
@@ -1000,8 +1007,10 @@ mod try_read_u32_tests {
         let addr = page as usize;
         assert_eq!(try_read_u32(addr), Some(0), "a fresh page reads as zero");
         // SAFETY: the mapping this very test made, with nothing left in it.
-        assert_eq!(unsafe { libc::munmap(page, len) }, 0);
+        assert_eq!(unsafe { libc::mprotect(page, len, libc::PROT_NONE) }, 0);
         assert_eq!(try_read_u32(addr), None);
+        // SAFETY: still ours, and nothing reads it after this.
+        assert_eq!(unsafe { libc::munmap(page, len) }, 0);
     }
 }
 

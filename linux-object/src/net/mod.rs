@@ -1959,10 +1959,9 @@ pub fn handle_net_ioctl(
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let flags = if ifname == "loopback" {
+            let flags = if iface_by_name(ifname)?.is_loopback() {
                 IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
             } else {
-                let _ = iface_by_name(ifname)?;
                 // Do not hide the NIC behind STATUS.LU. udhcpc uses
                 // SIOCGIFFLAGS and waits forever without IFF_RUNNING if the
                 // PHY report lags the actual link (the v0.5.0 netlink path
@@ -2107,7 +2106,7 @@ pub fn handle_net_ioctl(
             let iface = iface_by_name(ifname)?;
             let mac = iface.get_mac();
             unsafe {
-                if ifname == "loopback" {
+                if iface.is_loopback() {
                     ifr.ifr_ifru.hwaddr.sa_family = ARPHRD_LOOPBACK;
                     ifr.ifr_ifru.hwaddr.sa_data[..6].copy_from_slice(&[0; 6]);
                 } else {

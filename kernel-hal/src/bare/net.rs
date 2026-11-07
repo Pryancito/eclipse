@@ -22,7 +22,7 @@ use zcore_drivers::scheme::{NetScheme, NetStats};
 use zcore_drivers::Device;
 
 pub fn init() {
-    let name = String::from("loopback");
+    let name = String::from("lo");
     warn!("name : {}", name);
     // 初始化 一个 协议栈
     // 从外界 接受 一些 配置 参数 如果 没有 选择 默认 的

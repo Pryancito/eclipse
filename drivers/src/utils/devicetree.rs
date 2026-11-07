@@ -46,6 +46,20 @@ impl InterruptsProp {
 }
 
 /// A wrapper structure of `device_tree::DeviceTree`.
+/// One enabled hart of `/cpus`, as [`Devicetree::riscv_harts`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiscvHart<'a> {
+    /// Its `reg`: the hardware hart id, as `mhartid` reports it.
+    pub hart_id: Option<u64>,
+    /// Its `riscv,isa` string, when the node carries one.
+    pub isa: Option<&'a str>,
+    /// Its `riscv,cbom-block-size`: the bytes one `cbo.*` instruction covers,
+    /// when the node carries it. Zicbom says nothing about the size itself,
+    /// so a hart that advertises the extension without this is one whose
+    /// cache nobody can walk.
+    pub cbom_block_size: Option<u32>,
+}
+
 pub struct Devicetree(DeviceTreeInner);
 
 /// El codigo de espacio de una direccion del binding de PCI.
@@ -492,6 +506,37 @@ impl Devicetree {
         self.0.find("/chosen")?.prop_str("bootargs").ok()
     }
 
+    /// The harts under `/cpus` that are not `status = "disabled"`, each with
+    /// its hart id (`reg`) and its `riscv,isa` string, `"rv64imafdcvh_zicsr_..."`.
+    ///
+    /// Which extensions the kernel may switch on for user mode comes from
+    /// here, never from trying an instruction: a CSR of an extension the hart
+    /// lacks is an illegal instruction in supervisor mode, and the kernel has
+    /// no probe that survives it. All the harts are listed, not just the
+    /// first: a user context migrates between them, so what is switched on
+    /// has to be true of every one that will run it.
+    pub fn riscv_harts(&self) -> Vec<RiscvHart<'_>> {
+        let Some(cpus) = self.0.find("/cpus") else {
+            return Vec::new();
+        };
+        cpus.children
+            .iter()
+            .filter(|cpu| cpu.name.starts_with("cpu@") || cpu.name == "cpu")
+            .filter(|cpu| {
+                cpu.prop_str("status")
+                    .map_or(true, |status| status != "disabled")
+            })
+            .map(|cpu| RiscvHart {
+                hart_id: cpu
+                    .prop_cells("reg")
+                    .ok()
+                    .and_then(|cells| from_cells(&cells, cells.len() as u32).ok()),
+                isa: cpu.prop_str("riscv,isa").ok(),
+                cbom_block_size: cpu.prop_u32("riscv,cbom-block-size").ok(),
+            })
+            .collect()
+    }
+
     /// Returns the `timebase-frequency` property in the `/cpus` node, as timer
     pub fn timebase_frequency(&self) -> Option<u32> {
         self.0.find("/cpus")?.prop_u32("timebase-frequency").ok()
@@ -566,6 +611,70 @@ fn from_cells(cells: &[u32], cell_num: u32) -> DeviceResult<u64> {
     Ok(value)
 }
 
+/// Whether a `riscv,isa` string names the V extension.
+///
+/// The string is the base (`rv64` or `rv32`) followed by extensions. The
+/// single-letter ones may run together (`imafdcv`), each may carry a version
+/// (`v1p0`), and `_` may separate any two of them (`rv64imafdc_v`); the
+/// multi-letter ones start with `z`, `s` or `x` (`zicsr`, `zve32x`, `sv39`,
+/// `xtheadba`) and are always `_`-separated. So a `v` counts when it is a
+/// letter of a single-letter segment, outside a version number, and never
+/// inside a `z`/`s`/`x` name (`_zvl128b`, `_svpbmt`). Case does not matter:
+/// the spec says the string is lower case, some firmware shouts.
+pub fn isa_has_vector(isa: &str) -> bool {
+    let isa = isa.trim();
+    let base = isa
+        .get(..4)
+        .map(|b| b.eq_ignore_ascii_case("rv64") || b.eq_ignore_ascii_case("rv32"));
+    if base != Some(true) {
+        return false;
+    }
+    isa[4..]
+        .split('_')
+        .filter(|segment| !segment.starts_with(['z', 'Z', 's', 'S', 'x', 'X']))
+        .any(|segment| {
+            // A version is digits, optionally `p` and more digits, right
+            // after the letter it belongs to: the `p` of `1p0` is not the P
+            // extension, and the `v` the next letter starts is still V.
+            let mut after_digit = false;
+            let mut in_version = false;
+            for c in segment.chars() {
+                if c.is_ascii_digit() {
+                    after_digit = true;
+                    in_version = true;
+                    continue;
+                }
+                if (c == 'p' || c == 'P') && after_digit && in_version {
+                    after_digit = false;
+                    continue;
+                }
+                in_version = false;
+                after_digit = false;
+                if c.eq_ignore_ascii_case(&'v') {
+                    return true;
+                }
+            }
+            false
+        })
+}
+
+/// Whether a `riscv,isa` string advertises Zicbom, the cache-block management
+/// extension `cbo.clean`/`cbo.flush`/`cbo.inval` belong to.
+///
+/// Multi-letter extensions are their own `_` segments, with an optional
+/// version right after the name (`zicbom1p0`). A segment that merely starts
+/// with the name (`zicbomx` is not a thing, but the parser should not guess)
+/// does not count.
+pub fn isa_has_zicbom(isa: &str) -> bool {
+    isa.trim().split('_').skip(1).any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        match lower.strip_prefix("zicbom") {
+            Some(rest) => rest.chars().all(|c| c.is_ascii_digit() || c == 'p'),
+            None => false,
+        }
+    })
+}
+
 /// Parse the `reg` property, about `reg`: <https://elinux.org/Device_Tree_Usage#How_Addressing_Works>.
 ///
 /// Lo que devuelve es una direccion **de CPU**, no la del `reg`. Las dos
@@ -628,6 +737,54 @@ mod tests {
         string::{String, ToString},
         vec,
     };
+
+    /// QEMU's `virt` reports `rv64imafdch_...` without `v=true` and
+    /// `rv64imafdcvh_...` with it; the `v` counts only in the single-letter
+    /// run, never inside a `z`/`s` extension name.
+    #[test]
+    fn the_isa_string_says_whether_the_hart_has_vector() {
+        assert!(!isa_has_vector("rv64imafdch_zicbom_zicboz_zicntr_zicsr"));
+        assert!(isa_has_vector(
+            "rv64imafdcvh_zicbom_zicboz_zicntr_zicsr_zvl128b"
+        ));
+        assert!(isa_has_vector("rv64imafdcv"));
+        assert!(isa_has_vector("RV64IMAFDCV"));
+        assert!(
+            !isa_has_vector("rv64imafdc_zve32x_zvl128b"),
+            "a z-extension is not the V unit"
+        );
+        assert!(!isa_has_vector("rv64imafdc_svpbmt"));
+        assert!(!isa_has_vector("rv64imafdc_xtheadvector"));
+        assert!(!isa_has_vector(""));
+        assert!(!isa_has_vector("rv6"));
+        assert!(!isa_has_vector("x86_64v"));
+    }
+
+    /// Single-letter extensions may be `_`-separated and carry versions:
+    /// `rv64imafdc_v`, `rv64imafdc_v1p0` and `rv64i2p1m2p0a2p1f2p2d2p2c2p0v1p0`
+    /// all advertise V, and the `p` of a version is not the P extension.
+    #[test]
+    fn a_separated_or_versioned_v_still_counts() {
+        assert!(isa_has_vector("rv64imafdc_v"));
+        assert!(isa_has_vector("rv64imafdc_v1p0"));
+        assert!(isa_has_vector("rv64imafdc_v1p0_zicsr"));
+        assert!(isa_has_vector("rv64i2p1m2p0a2p1f2p2d2p2c2p0v1p0_zicsr2p0"));
+        assert!(isa_has_vector("rv64imafdc_h_v"));
+        assert!(!isa_has_vector("rv64i2p1m2p0a2p1f2p2d2p2c2p0_zicsr2p0"));
+        assert!(!isa_has_vector("rv64imafdcp"), "P (packed SIMD) is not V");
+    }
+
+    #[test]
+    fn zicbom_is_its_own_segment_with_an_optional_version() {
+        assert!(isa_has_zicbom("rv64imafdc_zicbom_zicsr"));
+        assert!(isa_has_zicbom("rv64imafdc_zicbom1p0"));
+        assert!(isa_has_zicbom("rv64imafdcv_ZICBOM"));
+        // The single-letter block never spells it, and QEMU's other
+        // cache-block extensions are not this one.
+        assert!(!isa_has_zicbom("rv64imafdc"));
+        assert!(!isa_has_zicbom("rv64imafdc_zicboz_zicbop"));
+        assert!(!isa_has_zicbom("rv64imafdc_zicbomx"));
+    }
 
     /// The ten words of a v17 FDT header that agrees with itself.
     ///

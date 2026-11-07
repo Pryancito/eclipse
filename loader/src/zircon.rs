@@ -880,7 +880,7 @@ fn x86_64_libos_args(
 /// `VDso::Create` redirects these names when the platform's tick counter
 /// cannot be read from userspace. The stubs are the blob's; all we choose is
 /// which variant each public name resolves to.
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, target_arch = "x86_64", target_arch = "riscv64"))]
 const VDSO_KERNEL_CLOCK_REDIRECTS: [(&str, &str); 7] = [
     (
         "zx_clock_get_monotonic",
@@ -918,7 +918,7 @@ const VDSO_KERNEL_CLOCK_REDIRECTS: [(&str, &str); 7] = [
 /// them answers `None`, so the caller keeps the old behaviour rather than a
 /// half-redirected vDSO where `zx_deadline_after` and
 /// `zx_clock_get_monotonic` disagree about which clock they are on.
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, target_arch = "x86_64", target_arch = "riscv64"))]
 fn vdso_time_redirect_writes(
     vdso: &[u8],
     resolve: impl Fn(&str) -> Option<u64>,
@@ -987,7 +987,7 @@ fn vdso_time_redirect_writes(
 
 /// Apply [`vdso_time_redirect_writes`] to the vDSO's image. `false` means
 /// nothing was written and the caller must keep the old behaviour.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 fn redirect_vdso_time_to_kernel(vdso: &[u8], vdso_vmo: &Arc<VmObject>) -> bool {
     let Ok(elf) = ElfFile::new(vdso) else {
         return false;
@@ -1034,7 +1034,15 @@ fn redirect_vdso_time_to_kernel(vdso: &[u8], vdso_vmo: &Arc<VmObject>) -> bool {
 /// wrong clock.
 #[allow(unused_variables)]
 fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>, cmdline: &str) {
-    #[cfg(target_arch = "x86_64")]
+    // riscv64 as well as x86_64: its vDSO reads `rdtime` through the same
+    // page, with the same layout (checked instruction by instruction in
+    // `prebuilt/zircon/riscv64/libzircon.so`: `zx_clock_get_monotonic` is
+    // `ld +0x18; rdtime; ld +0x18; bne; lw +0x24; lw +0x20; add; j Scale`,
+    // and `zx_ticks_per_second` a single `ld +0x08`). While this was x86_64
+    // only, every riscv64 program read the marker: `get_monotonic` answered
+    // `-2401053088661560045`, so the futex and clock tests failed and every
+    // wait with a deadline hung the suite.
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     {
         /// Offsets within `DATA_TIME_VALUES`. See the call site for what each
         /// one is and which vDSO entry point reads it.

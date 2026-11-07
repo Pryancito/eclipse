@@ -185,14 +185,33 @@ def discovered_tests(output):
     return tests
 
 
+def expectations_file(platform, root=None):
+    """The `Name  OK|FAILED` table for `platform` (`riscv64-bare`): this
+    repository's `scripts/test_expectations/<platform>.txt` when it has one,
+    else the `tests` submodule's, else the submodule's x86_64 table for the
+    same mode.
+
+    The submodule is upstream's (`rcore-os/zcore-tests`), so a table this
+    repository measures on its own -- riscv64 bare metal, which upstream never
+    classified -- lives here, next to `zircon.json`, where a tanda can commit
+    it. With no table of its own an architecture used to fall back to x86_64's
+    silently, and count only the cases x86_64 happened to pass."""
+    root = root or ROOT
+    name = platform.replace("-", "_") + ".txt"
+    own = root / "scripts/test_expectations" / name
+    if own.exists():
+        return own
+    path = root / "tests/testcases/zircon_core_test" / name
+    if path.exists():
+        return path
+    return path.with_name(f"x86_64_{platform.split('-', 1)[1]}.txt")
+
+
 def load_expectations(arch, libos):
     mode = "libos" if libos else "bare"
     platform = f"{arch}-{mode}"
-    path = ROOT / "tests/testcases/zircon_core_test" / f"{platform.replace('-', '_')}.txt"
-    if not path.exists():
-        path = path.with_name(f"x86_64_{mode}.txt")
     cases = {}
-    for line in path.read_text().splitlines():
+    for line in expectations_file(platform).read_text().splitlines():
         fields = line.split()
         if len(fields) == 2 and not line.startswith("#"):
             cases[fields[0]] = None if fields[1] == "OK" else f"Existing classification: {fields[1]}"
@@ -290,6 +309,29 @@ def summary_line(passed, requested, runs, failures, skipped, needs_hardware, log
     )
 
 
+def budget(selection, arch, libos, timeout):
+    """Seconds one boot may take before it is killed.
+
+    A wildcard run is a different animal from the old one-name batches:
+    `PortStressTest.*` took 511 s here in one boot, so the floor is set well
+    clear of that rather than at it. Bare metal riscv64 runs under QEMU TCG
+    (no KVM for a foreign architecture): the same whole-suite boot that takes
+    60 s hosted was 1200 s in and still inside the Port suites here (PortTest
+    alone 264 s, `PortTest.TooManyObservers` 196 s), so its floor is an hour.
+    The cases that never finish stay out by the hang entries; a floor is for
+    the ones that do.
+
+    The whole suite is still the whole suite when hang entries trail it as
+    negative patterns (`*,-Property.RegisterFsNoncanonical,...`): the first
+    x86_64 boot with such a list was cut at the 90 s default with 284 of 468
+    cases passed and the guest in the middle of `PortStressTest`, because the
+    selection no longer compared equal to `*`."""
+    whole = selection.split(",", 1)[0] in ("-l", "*")
+    slow = whole or "PortStressTest." in selection
+    floor = 3600 if arch == "riscv64" and not libos else 1200
+    return max(timeout, floor) if slow else timeout
+
+
 class Runner:
     def __init__(self, args):
         self.args = args
@@ -339,9 +381,11 @@ class Runner:
         # `reserve_test_ram`). The size is the one the ZBI's own command line
         # asks for; the test reads the option back from `boot-options.txt`,
         # which this kernel builds from ITS command line, so it has to be
-        # said here too. Hosted only until the bare-metal builds have been
-        # measured with it.
-        reserve = "kernel.test.ram.reserve=0x8000:" if self.args.libos else ""
+        # said here too. Bare metal as well: without it the riscv64 run died
+        # in `StreamTestCase.NoStreamFromContiguousOrPhysicalVmo` (an
+        # `EXPECT` on `boot_options->test_ram_reserve`, then the dereference
+        # anyway) with 80 cases still to run.
+        reserve = "kernel.test.ram.reserve=0x8000:"
         cmdline = f"LOG={self.args.guest_log}:userboot.shutdown:{reserve}" + option
         env = dict(os.environ, ZCORE_KERNEL_LOG=kernel_log)
         if self.args.libos:
@@ -350,11 +394,7 @@ class Runner:
         else:
             command = self.make + [f"KERNEL_LOG={kernel_log}", f"CMDLINE={cmdline}", "justrun"]
         start = time.monotonic()
-        # A wildcard run is a different animal from the old one-name batches:
-        # `PortStressTest.*` took 511 s here in one boot, so the floor is set
-        # well clear of that rather than at it.
-        slow = selection in ("-l", "*") or "PortStressTest." in selection
-        limit = max(self.args.timeout, 1200) if slow else self.args.timeout
+        limit = budget(selection, self.args.arch, self.args.libos, self.args.timeout)
         # The guest writes its log straight to disk; see `sift` for why it is
         # not read back whole.
         guest_log = str(prefix) + ".guest.log"

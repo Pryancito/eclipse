@@ -1520,16 +1520,11 @@ impl Thread {
     }
 
     /// Get scheduler runtime statistics for this thread.
+    ///
+    /// `cpu_time` is what Zircon's is: the time the thread spent on a CPU
+    /// in either mode, so the kernel-mode clock counts too.
     pub fn get_runtime_info(&self) -> TaskRuntimeInfo {
-        let runtime = self.get_time();
-        TaskRuntimeInfo {
-            cpu_time: runtime,
-            // zCore does not track run-queue latency separately yet.  Report
-            // elapsed scheduled time so callers can still observe progress.
-            queue_time: runtime,
-            page_fault_time: 0,
-            lock_contention_time: 0,
-        }
+        TaskRuntimeInfo::from_cpu_time(self.get_time().saturating_add(self.get_sys_time()))
     }
 
     /// Set this thread as the first thread of a process.
@@ -2040,6 +2035,19 @@ pub struct TaskRuntimeInfo {
 }
 
 impl TaskRuntimeInfo {
+    /// The info for `cpu_time` nanoseconds on a CPU. zCore does not track
+    /// run-queue latency separately yet, so `queue_time` reports the same
+    /// figure and callers can still observe progress; the two timings it
+    /// never measures stay zero.
+    pub fn from_cpu_time(cpu_time: u64) -> Self {
+        Self {
+            cpu_time,
+            queue_time: cpu_time,
+            page_fault_time: 0,
+            lock_contention_time: 0,
+        }
+    }
+
     /// Saturating sum of two runtime samples (process/job aggregation).
     pub fn saturating_add(self, other: Self) -> Self {
         Self {

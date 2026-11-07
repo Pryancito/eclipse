@@ -1407,7 +1407,7 @@ mod registry_tests {
 
     fn net_loopback() -> Arc<dyn NetScheme> {
         Arc::new(FakeNet {
-            name: String::from("loopback"),
+            name: String::from("lo"),
             is_loopback: true,
         })
     }
@@ -1599,7 +1599,7 @@ mod registry_tests {
         assert_eq!(devs1.len(), 3);
         assert_eq!(devs1[0].ifname(), "eth0");
         assert_eq!(devs1[1].ifname(), "eth1");
-        assert_eq!(devs1[2].ifname(), "loopback");
+        assert_eq!(devs1[2].ifname(), "lo");
         drop(devs1);
 
         // Caso 2: Registrar NICs reales primero, luego loopback
@@ -1612,7 +1612,7 @@ mod registry_tests {
         assert_eq!(devs2.len(), 3);
         assert_eq!(devs2[0].ifname(), "eth0");
         assert_eq!(devs2[1].ifname(), "eth1");
-        assert_eq!(devs2[2].ifname(), "loopback");
+        assert_eq!(devs2[2].ifname(), "lo");
         drop(devs2);
 
         // Caso 3: Intercalados (eth0, loopback, eth1)
@@ -1625,7 +1625,7 @@ mod registry_tests {
         assert_eq!(devs3.len(), 3);
         assert_eq!(devs3[0].ifname(), "eth0");
         assert_eq!(devs3[1].ifname(), "eth1");
-        assert_eq!(devs3[2].ifname(), "loopback");
+        assert_eq!(devs3[2].ifname(), "lo");
     }
 
     // ── primary_irq's one-shot cache ────────────────────────────────────────
