@@ -172,6 +172,14 @@
       "reason": "Address tagging (TBI) is not plumbed through the hosted aarch64 kernel: user pointers with a top byte are rejected (VmarTaggedAddress gets INVALID_ARGS from zx_vmo_create), the debug registers the segfault case reads back are NOT_SUPPORTED, and FutexWaitWake kills the whole test process (exit -1028: measured on the arm64 CI runner, #2516, run 42412571869, with the 375 requested cases behind it never run). Stripping the tag from user pointers on aarch64 is its own change."
     },
     {
+      "test": "Threads.WritingSingleS*",
+      "platforms": [
+        "aarch64-libos"
+      ],
+      "hangs": true,
+      "reason": "Threads.WritingSingleStepState: zx_thread_write_state(ZX_THREAD_STATE_SINGLE_STEP) answers NOT_SUPPORTED on the hosted aarch64 kernel (single-stepping a guest needs MDSCR_EL1.SS and PSTATE.SS, which a host process cannot set), the test registers the fatal failure before ExitThread() and then waits on the suspended thread for ever: the whole-suite boot was cut at the 1200 s budget with 942 of 1051 requested cases passed and the suites behind it never run (arm64 CI runner, run 42415557086, after #2516). A prefix because the platform's hang list rides in one guest option of at most 187 characters."
+    },
+    {
       "test": "InterruptTest.*U*Wait",
       "platforms": [
         "*-libos",
