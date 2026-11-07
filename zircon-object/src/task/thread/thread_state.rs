@@ -343,7 +343,16 @@ mod tests {
         // (`thread_state_x86`); the debug registers it does not.
         #[cfg(target_arch = "x86_64")]
         let refused = [ThreadStateKind::Debug];
-        #[cfg(not(target_arch = "x86_64"))]
+        // aarch64 keeps the vector state (`thread_state_aarch64`); there is
+        // no separate floating-point state on arm64, and no single-step or
+        // debug registers for a thread yet.
+        #[cfg(target_arch = "aarch64")]
+        let refused = [
+            ThreadStateKind::FloatPoint,
+            ThreadStateKind::Debug,
+            ThreadStateKind::SingleStep,
+        ];
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let refused = [
             ThreadStateKind::FloatPoint,
             ThreadStateKind::Vector,
