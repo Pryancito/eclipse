@@ -8,10 +8,11 @@
 // It also checks the handle fd calls (poll on a channel fd, take, refusal
 // to duplicate a channel end).
 //
-//   zx-ipc-bench [ROUNDS]        (default 20000)
+//   zx-ipc-bench [ROUNDS [CPU]]  (default 20000, unpinned)
 //
 // Exit status: 0 on success, 2 when the gateway is off (ENOSYS), 1 on error.
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -217,6 +219,17 @@ int main(int argc, char **argv) {
     long rounds = argc > 1 ? atol(argv[1]) : 20000;
     if (rounds <= 0)
         rounds = 20000;
+    // `zx-ipc-bench N 0`: everything on CPU 0, to tell wake-up cost on one
+    // CPU apart from the cost of waking a thread on the other.
+    if (argc > 2) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(atoi(argv[2]), &set);
+        if (sched_setaffinity(0, sizeof set, &set) != 0)
+            perror("sched_setaffinity");
+        else
+            printf("zx-ipc-bench: pinned to CPU %d\n", atoi(argv[2]));
+    }
 
     zx_handle_t client = 0, server = 0;
     long r = zx_status(zx(ZX_SYS_channel_create, 0, (long)&client, (long)&server, 0, 0, 0));
