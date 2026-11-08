@@ -200,6 +200,36 @@ pub fn wakeup_preempt_enabled() -> bool {
     WAKEUP_PREEMPT.load(Ordering::Relaxed)
 }
 
+/// Direct hand-off: a task woken by code running on its own CPU is polled
+/// next there (see `waker_page::HANDOFF_PAGE`), up to
+/// `task_collection::HANDOFF_LIMIT` times in a row. Off by default:
+/// `HANDOFF=1` on the kernel command line turns it on, for A/B runs on one
+/// build. Under QEMU/TCG it took ~89 % of same-CPU wakes and changed the
+/// channel round trip by nothing measurable; whether it pays off is a
+/// question for real hardware.
+static HANDOFF: AtomicBool = AtomicBool::new(false);
+/// Hand-offs taken, for [`handoff_stats`].
+static HANDOFFS_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Enable/disable direct hand-off. Called once at boot from the command line.
+pub fn set_handoff(enabled: bool) {
+    HANDOFF.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether direct hand-off is enabled.
+pub fn handoff_enabled() -> bool {
+    HANDOFF.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_handoff() {
+    HANDOFFS_TAKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many direct hand-offs the schedulers have taken since boot.
+pub fn handoff_stats() -> u64 {
+    HANDOFFS_TAKEN.load(Ordering::Relaxed)
+}
+
 /// Wake-up preemption accounting, surfaced through [`wakeup_preempt_stats`]:
 /// `(requests published, requests actually consumed by a yielding thread)`.
 /// A large gap means requests are being raised on CPUs that are not in user

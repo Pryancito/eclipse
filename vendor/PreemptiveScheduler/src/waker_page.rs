@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 // use core::task::{RawWaker, RawWakerVTable};
 use woke::Woke;
 
@@ -521,6 +521,32 @@ impl WakerPage {
 
 pub type DroperRef = WakerRef;
 
+/// Direct hand-off hint, one per CPU: the task last woken on this CPU by
+/// code running on it (its page and slot), which the scheduler polls next
+/// instead of scanning the bitmaps -- the client of a channel call gives its
+/// CPU straight to the server it just woke, and the reply comes back the
+/// same way. Only a hint: [`TaskCollection::schedule`] checks the slot is
+/// still runnable here before taking it, and caps consecutive hand-offs so a
+/// busy pair cannot keep the rest of the CPU's tasks waiting.
+///
+/// Written and read only on the CPU it belongs to; `0` = no hint.
+///
+/// [`TaskCollection::schedule`]: crate::task_collection::TaskCollection
+pub(crate) static HANDOFF_PAGE: [AtomicUsize; lock::MAX_CORE_NUM] =
+    [const { AtomicUsize::new(0) }; lock::MAX_CORE_NUM];
+/// The slot within [`HANDOFF_PAGE`]'s page.
+pub(crate) static HANDOFF_IDX: [AtomicUsize; lock::MAX_CORE_NUM] =
+    [const { AtomicUsize::new(0) }; lock::MAX_CORE_NUM];
+
+/// Take this CPU's hand-off hint, leaving none: `(page address, slot)`.
+pub(crate) fn take_handoff(cpu: usize) -> Option<(usize, usize)> {
+    let page = HANDOFF_PAGE.get(cpu)?.swap(0, Ordering::Relaxed);
+    if page == 0 {
+        return None;
+    }
+    Some((page, HANDOFF_IDX[cpu].load(Ordering::Relaxed)))
+}
+
 pub struct WakerRef {
     page: Arc<WakerPage>,
     idx: usize,
@@ -682,6 +708,16 @@ impl WakerRef {
                 crate::runtime::note_stranded(owner);
                 crate::runtime::kick_for_affinity(mask, owner);
             } else {
+                // Woken by code running on its own CPU: the scheduler there
+                // may hand that CPU straight to it (see `HANDOFF_PAGE`).
+                let owner = self.page.owner_cpu as usize;
+                if crate::runtime::handoff_enabled()
+                    && owner < lock::MAX_CORE_NUM
+                    && crate::arch::cpu_id() as usize == owner
+                {
+                    HANDOFF_IDX[owner].store(self.idx, Ordering::Relaxed);
+                    HANDOFF_PAGE[owner].store(Arc::as_ptr(&self.page) as usize, Ordering::Relaxed);
+                }
                 crate::runtime::request_resched(self.page.owner_cpu);
             }
         }

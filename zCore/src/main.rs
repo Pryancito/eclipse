@@ -352,6 +352,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             executor::set_wakeup_preempt(false);
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
+        // Direct hand-off (see `executor::set_handoff`): off by default until
+        // it is shown to pay off on real hardware; under QEMU/TCG it made no
+        // measurable difference to `eclipse.ipcbench`.
+        if kernel_hal::cmdline::flag(&options.cmdline, "HANDOFF") {
+            executor::set_handoff(true);
+            klog_info!("Eclipse: direct hand-off ENABLED (HANDOFF=1)");
+        }
         // The wake-to-run latency probe (`/proc/perf/kernel`'s `wake latency`
         // line). Sampled one wake in sixteen, so it costs an external wake
         // nothing measurable, but it is still a diagnostic and a measurement

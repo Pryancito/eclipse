@@ -74,17 +74,19 @@ async fn server(end: Arc<Channel>) {
 }
 
 /// Run `n` calls on `end` and answer the mean time per round trip.
-async fn client(end: &Arc<Channel>, n: u64) -> Option<u64> {
+async fn client(end: &Arc<Channel>, n: u64) -> Option<(u64, u64)> {
     // Warm-up: first wake-ups pay for cold caches and run-queue setup.
     for _ in 0..(n / 10).max(1) {
         end.call(message()).await.ok()?;
     }
+    let handoffs = executor::handoff_stats();
     let start = timer_now();
     for _ in 0..n {
         end.call(message()).await.ok()?;
     }
     let elapsed: Duration = timer_now() - start;
-    Some(elapsed.as_nanos() as u64 / n)
+    let handoffs = executor::handoff_stats() - handoffs;
+    Some((elapsed.as_nanos() as u64 / n, handoffs))
 }
 
 /// Spawn `fut` pinned to `cpu`, or free to run anywhere with `None`.
@@ -112,9 +114,9 @@ async fn run_case(
     spawn_on(
         async move {
             match client(&client_end, n).await {
-                Some(ns) => bench_log(format_args!(
-                    "ipcbench: {} {} calls, {} ns/call",
-                    name, n, ns
+                Some((ns, handoffs)) => bench_log(format_args!(
+                    "ipcbench: {} {} calls, {} ns/call, {} hand-offs",
+                    name, n, ns, handoffs
                 )),
                 None => bench_log(format_args!(
                     "ipcbench: {} FAILED (call returned an error)",
