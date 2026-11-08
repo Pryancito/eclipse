@@ -27,6 +27,9 @@
 //!  24  u64 syscall number
 //!  32  u64 args[6]
 //! ```
+//!
+//! A syscall's pointer arguments point into the client: the server reaches
+//! that memory with `eclipse_redirect_memory`, which [`client_of`] gates.
 
 use super::*;
 use core::convert::TryInto;
@@ -66,6 +69,16 @@ impl SyscallRedirect {
     /// `channel`.
     pub fn new(channel: Arc<Channel>, mask: [u64; MAX_REDIRECTED / 64]) -> Arc<Self> {
         Arc::new(SyscallRedirect { channel, mask })
+    }
+
+    /// Whether `server_end` is the server's end of this redirect: the peer
+    /// of the kernel's. Holding it is the authority to answer for the
+    /// process, and so to reach its memory ([`client_of`]).
+    pub fn served_by(&self, server_end: &dyn KernelObject) -> bool {
+        match server_end.peer() {
+            Ok(peer) => peer.id() == self.channel.id(),
+            Err(_) => false,
+        }
     }
 
     /// Whether syscall `num` goes to the server.
@@ -122,6 +135,29 @@ impl SyscallRedirect {
         if self.channel.signal().contains(Signal::READABLE) {
             while self.channel.read().is_ok() {}
         }
+    }
+}
+
+/// The process `pid` (or the process of thread `pid`) if its syscalls are
+/// redirected to `server_end`, for the server to read and write its memory:
+/// a syscall's pointer arguments point there. `NOT_FOUND` if there is no
+/// such live process, `ACCESS_DENIED` if it is not this server's.
+///
+/// The channel is the whole authority, as a handle is in Zircon: the client
+/// gave its syscalls to whoever holds that end, and answering `read` means
+/// writing into its buffer. No ptrace-style credential check applies, the
+/// same way none applies to the kernel doing it.
+pub fn client_of(server_end: &Arc<Channel>, pid: KoID) -> ZxResult<Arc<Process>> {
+    let target = find_task(pid)
+        .or_else(|| process_of_thread(pid))
+        .ok_or(ZxError::NOT_FOUND)?;
+    if matches!(target.status(), Status::Exited(_)) {
+        return Err(ZxError::NOT_FOUND);
+    }
+    let linux = target.try_linux().ok_or(ZxError::NOT_FOUND)?;
+    match linux.syscall_redirect.get() {
+        Some(r) if r.served_by(server_end.as_ref()) => Ok(target),
+        _ => Err(ZxError::ACCESS_DENIED),
     }
 }
 
@@ -279,6 +315,21 @@ mod tests {
         let (_, answer) = round_trip(&r, &b, |req| reply(req, 0, 2));
         assert_eq!(answer, Forwarded::Return(2));
         assert!(!a.signal().contains(Signal::READABLE));
+    }
+
+    #[test]
+    fn only_the_peer_of_the_kernels_end_serves_the_redirect() {
+        let (a, b) = Channel::create();
+        let (c, d) = Channel::create();
+        let r = SyscallRedirect::new(a.clone(), mask_of(&[39]));
+        assert!(r.served_by(b.as_ref()));
+        assert!(!r.served_by(a.as_ref()));
+        assert!(!r.served_by(c.as_ref()));
+        assert!(!r.served_by(d.as_ref()));
+        drop(a);
+        // The kernel's end lives in the redirect, whatever became of the
+        // Arc it was made from.
+        assert!(r.served_by(b.as_ref()));
     }
 
     #[test]
