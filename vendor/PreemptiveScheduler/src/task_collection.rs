@@ -342,11 +342,19 @@ pub struct TaskCollection {
 
 const URGENT_QUOTA: usize = 8;
 
+/// How many direct hand-offs in a row a CPU takes before it goes back to
+/// its round-robin pick: a client and a server calling each other hand the
+/// CPU back and forth, and without a cap every other task on that CPU would
+/// wait for the pair to stop.
+pub(crate) const HANDOFF_LIMIT: usize = 8;
+
 #[derive(Default)]
 struct SchedulingCursor {
     urgent_next: usize,
     yielded_next: usize,
     urgent_turns: usize,
+    /// Direct hand-offs taken in a row (see [`HANDOFF_LIMIT`]).
+    handoff_streak: usize,
 }
 
 /// One line naming a collection whose generator field is gone.
@@ -762,7 +770,10 @@ impl TaskCollection {
             }
         }
 
-        let (slot, serve_yielded) = if inner.affine == 0 {
+        let handoff = self.handoff_candidate(cursor, inner);
+        let (slot, serve_yielded) = if let Some(slot) = handoff {
+            (slot, false)
+        } else if inner.affine == 0 {
             crate::runtime::note_not_stranded(self.cpu_id as usize);
             if cursor.urgent_turns >= URGENT_QUOTA {
                 Self::bitmap_candidate(inner, cursor.yielded_next, true)
@@ -901,10 +912,17 @@ impl TaskCollection {
         if !serve_yielded {
             crate::runtime::note_wake_serviced(stamp);
         }
-        if serve_yielded {
+        if handoff.is_some() {
+            // A hand-off is taken out of turn: the round-robin cursors stay
+            // where they were, so the tasks it jumped are next.
+            cursor.handoff_streak += 1;
+            crate::runtime::note_handoff();
+        } else if serve_yielded {
+            cursor.handoff_streak = 0;
             cursor.yielded_next = slot + 1;
             cursor.urgent_turns = 0;
         } else {
+            cursor.handoff_streak = 0;
             cursor.urgent_next = slot + 1;
             cursor.urgent_turns = cursor.urgent_turns.saturating_add(1).min(URGENT_QUOTA);
         }
@@ -936,6 +954,51 @@ impl TaskCollection {
     /// knowing before trusting a mutation that survives in the masks.
     ///
     /// [`consider_slot`]: Self::consider_slot
+    /// The slot this CPU's hand-off hint names, if it is still runnable here
+    /// and the streak is under [`HANDOFF_LIMIT`]. The hint is consumed either
+    /// way. Only for this CPU's own collection: a steal from a peer's never
+    /// takes the peer's hint.
+    fn handoff_candidate(
+        &self,
+        cursor: &mut SchedulingCursor,
+        inner: &mut FutureCollection,
+    ) -> Option<usize> {
+        let cpu = crate::arch::cpu_id() as usize;
+        if self.cpu_id as usize != cpu {
+            return None;
+        }
+        let (page_addr, subpage_idx) = crate::waker_page::take_handoff(cpu)?;
+        if cursor.handoff_streak >= HANDOFF_LIMIT {
+            cursor.handoff_streak = 0;
+            return None;
+        }
+        if subpage_idx >= WAKER_PAGE_SIZE {
+            return None;
+        }
+        let page_idx = inner
+            .pages
+            .iter()
+            .position(|page| Arc::as_ptr(page) as usize == page_addr)?;
+        let page = &inner.pages[page_idx];
+        let bit = 1u64 << subpage_idx;
+        let (notified, _voluntary, dropped, borrowed) = page.peek_lanes();
+        if notified & !dropped & !borrowed & bit == 0 {
+            return None;
+        }
+        let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+        if page.affine_bits() & bit != 0 {
+            let allowed = inner
+                .slab
+                .get(slot)
+                .map(|task| task.allowed_on(cpu))
+                .unwrap_or(false);
+            if !allowed {
+                return None;
+            }
+        }
+        Some(slot)
+    }
+
     fn consider_bits(best: &mut Option<usize>, bits: u64, page_idx: usize, next: usize) {
         if bits == 0 {
             return;
@@ -1813,6 +1876,76 @@ mod collection_tests {
             }
         }
         assert_eq!(seen, [true, true]);
+    }
+
+    /// Point this CPU's hand-off hint at `key` the way a same-CPU wake does.
+    fn hint(tc: &TaskCollection, key: Key) {
+        let (_, page_idx, idx) = unpack_key(key);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[page_idx].clone();
+        crate::waker_page::HANDOFF_IDX[0].store(idx, Ordering::Relaxed);
+        crate::waker_page::HANDOFF_PAGE[0].store(Arc::as_ptr(&page) as usize, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_hinted_wake_is_polled_before_the_round_robin_pick() {
+        let tc = TaskCollection::new(0);
+        let a = tc.add_task(pending(), None);
+        let _b = tc.add_task(pending(), None);
+        let c = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(a).2);
+        page.notify(unpack_key(c).2);
+        hint(&tc, c);
+        let (key, _, waker) = tc.take_task().unwrap();
+        assert_eq!(key, c, "the hinted task jumps the queue");
+        waker.mark_borrowed(false);
+        assert_eq!(
+            tc.take_task().unwrap().0,
+            a,
+            "and the queue resumes where it was"
+        );
+    }
+
+    #[test]
+    fn a_stale_hint_falls_back_to_the_round_robin_pick() {
+        let tc = TaskCollection::new(0);
+        let a = tc.add_task(pending(), None);
+        let b = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(a).2);
+        // `b` is not runnable: the hint must not hand it a poll.
+        hint(&tc, b);
+        assert_eq!(tc.take_task().unwrap().0, a);
+        assert!(
+            crate::waker_page::take_handoff(0).is_none(),
+            "the hint was consumed"
+        );
+    }
+
+    #[test]
+    fn hand_offs_stop_after_the_limit_and_the_queue_gets_a_turn() {
+        let tc = TaskCollection::new(0);
+        let other = tc.add_task(pending(), None);
+        let pair = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(other).2);
+        for _ in 0..HANDOFF_LIMIT {
+            page.notify(unpack_key(pair).2);
+            hint(&tc, pair);
+            let (key, _, waker) = tc.take_task().unwrap();
+            assert_eq!(key, pair);
+            waker.mark_borrowed(false);
+        }
+        page.notify(unpack_key(pair).2);
+        hint(&tc, pair);
+        assert_eq!(
+            tc.take_task().unwrap().0,
+            other,
+            "past the limit the waiting task runs first"
+        );
     }
 
     #[test]

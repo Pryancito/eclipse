@@ -57,6 +57,8 @@ mod reclaimd;
 // which is a string, which is the one thing a host test answers for exactly as
 // a boot does. Nothing here calls it under `cfg(test)`; the crate-wide
 // `allow(dead_code)` at the top covers that.
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+mod ipc_bench;
 #[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
 mod utils;
@@ -84,6 +86,9 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(feature = "linux", not(feature = "libos")))]
 static TLBHAMMER_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Round trips per case for `eclipse.ipcbench=N` (see ipc_bench.rs); 0 = off.
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+static IPCBENCH_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(not(any(feature = "libos")), feature = "mock-disk"))]
 static MOCK_CORE: AtomicBool = AtomicBool::new(false);
@@ -347,6 +352,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             executor::set_wakeup_preempt(false);
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
+        // Direct hand-off (see `executor::set_handoff`): off by default until
+        // it is shown to pay off on real hardware; under QEMU/TCG it made no
+        // measurable difference to `eclipse.ipcbench`.
+        if kernel_hal::cmdline::flag(&options.cmdline, "HANDOFF") {
+            executor::set_handoff(true);
+            klog_info!("Eclipse: direct hand-off ENABLED (HANDOFF=1)");
+        }
         // The wake-to-run latency probe (`/proc/perf/kernel`'s `wake latency`
         // line). Sampled one wake in sixteen, so it costs an external wake
         // nothing measurable, but it is still a diagnostic and a measurement
@@ -600,6 +612,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         if let Some(n) = tlb_hammer::parse_tlbhammer(&options.cmdline) {
             // Stash N in a static; spawn after primary_init / executor is live.
             TLBHAMMER_N.store(n as u64, Ordering::Relaxed);
+        }
+        // Kernel channel call/reply benchmark (see ipc_bench.rs).
+        #[cfg(all(feature = "linux", not(feature = "libos")))]
+        if let Some(n) = ipc_bench::parse_ipcbench(&options.cmdline) {
+            IPCBENCH_N.store(n as u64, Ordering::Relaxed);
         }
     }
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
@@ -1503,6 +1520,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 let n = TLBHAMMER_N.load(Ordering::Relaxed);
                 if n > 0 {
                     tlb_hammer::start(n as usize);
+                }
+                let n = IPCBENCH_N.load(Ordering::Relaxed);
+                if n > 0 {
+                    ipc_bench::start(n as usize);
                 }
             }
             // Under `baremetal-test` the run ends when the lifetime process

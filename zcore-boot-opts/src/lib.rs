@@ -103,9 +103,29 @@ pub fn parse_tlbhammer(cmdline: &str) -> Option<usize> {
     Some(n.max(3))
 }
 
+/// Parse `eclipse.ipcbench=N` from the cmdline: the number of channel
+/// round trips per case of the kernel IPC benchmark. `None` = disabled
+/// (missing, non-numeric or `0`).
+pub fn parse_ipcbench(cmdline: &str) -> Option<usize> {
+    let n = parse_number(value(cmdline, "eclipse.ipcbench")?)?;
+    usize::try_from(n).ok().filter(|&n| n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ipcbench_reads_a_positive_count() {
+        assert_eq!(
+            parse_ipcbench("LOG=warn:eclipse.ipcbench=100000"),
+            Some(100_000)
+        );
+        assert_eq!(parse_ipcbench("eclipse.ipcbench=0x10"), Some(16));
+        assert_eq!(parse_ipcbench("eclipse.ipcbench=0"), None);
+        assert_eq!(parse_ipcbench("eclipse.ipcbench=lots"), None);
+        assert_eq!(parse_ipcbench("LOG=warn"), None);
+    }
 
     #[test]
     fn parse_cmdline_splits_colon_key_values() {
