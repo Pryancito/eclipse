@@ -416,6 +416,44 @@ fn zircon_gateway_number(num: usize) -> Option<u32> {
     (n < ZIRCON_GATEWAY_LEN).then_some(n as u32)
 }
 
+/// Whether a Linux process may make Zircon syscall `zx_num` through the
+/// gateway: the objects a userspace server needs (channels, ports, events,
+/// FIFOs, sockets, timers, VMOs, handles, waits) and nothing else.
+///
+/// Left out on purpose: thread and process lifecycle (`thread_exit` and the
+/// like would skip the Linux teardown: `clear_child_tid`, the exit
+/// futex, the parent's `wait`), VMAR mappings (the Linux memory map owns the
+/// address space), resources, interrupts and the DDK (the driver phase
+/// will open those with their own checks).
+#[cfg(feature = "zircon-gateway")]
+fn zircon_gateway_allows(zx_num: u32) -> bool {
+    matches!(
+        zx_num,
+        // channel_call_etc_noretry, channel_call_noretry, channel_create,
+        // channel_read, channel_read_etc, channel_write, channel_write_etc
+        4 | 6..=11
+        // event_create, eventpair_create
+        | 30 | 31
+        // fifo_create, fifo_read, fifo_write
+        | 34..=36
+        // handle_close, handle_close_many, handle_duplicate, handle_replace
+        | 45..=48
+        // object_get_info, object_signal, object_signal_peer,
+        // object_wait_async, object_wait_many, object_wait_one
+        | 73 | 77..=81
+        // port_cancel, port_cancel_key, port_create, port_queue, port_wait
+        | 90..=94
+        // socket_create, socket_read, socket_set_disposition, socket_write,
+        // socket_shutdown
+        | 112..=115 | 1001
+        // timer_cancel, timer_create, timer_set
+        | 174..=176
+        // vmo_create, vmo_create_child, vmo_get_size, vmo_read,
+        // vmo_set_size, vmo_write
+        | 191 | 192 | 195 | 198 | 201 | 204
+    )
+}
+
 fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
     Box::pin(run_user(thread))
 }
@@ -1785,6 +1823,15 @@ async fn handle_user_trap(
         }
         #[cfg(feature = "zircon-gateway")]
         if let Some(zx_num) = zircon_gateway_number(num) {
+            // The same security hook as every Linux syscall, on the gateway
+            // number as the process spelled it: a syscall whitelist that
+            // leaves the gateway out keeps it out.
+            let pid = thread.proc().id();
+            if hunter::check_syscall(pid, num as u32, &args).is_err() {
+                let ret = -(linux_object::error::LxError::EPERM as isize) as usize;
+                thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
+                return Ok(None);
+            }
             let mut zx = zircon_syscall::Syscall { thread, thread_fn };
             let zx_args = if zx_num & ZIRCON_GATEWAY_INDIRECT != 0 {
                 // Seven or eight arguments do not fit the Linux registers:
@@ -1801,8 +1848,19 @@ async fn handle_user_trap(
             let zx_num = zx_num & !ZIRCON_GATEWAY_INDIRECT;
             trace!("Zircon gateway syscall: {} {:x?}", zx_num, zx_args);
             let ret = match zx_args {
+                _ if !zircon_gateway_allows(zx_num) => {
+                    zircon_object::ZxError::NOT_SUPPORTED as isize as usize
+                }
+                // A blocking wait or call gives way to a Linux signal, like
+                // any Linux syscall: the thread returns to userspace, runs the
+                // handler, and the call answers `ZX_ERR_INTERNAL_INTR_RETRY`
+                // for the caller to retry. A channel call's reply, if it
+                // arrives later, waits in the channel to be read.
                 Some(zx_args) => run_with_irq_enable! {
-                    zx.syscall(zx_num, zx_args).await as usize
+                    match linux_object::process::interruptible(zx.syscall(zx_num, zx_args)).await {
+                        Ok(ret) => ret as usize,
+                        Err(_) => zircon_object::ZxError::INTERNAL_INTR_RETRY as isize as usize,
+                    }
                 },
                 None => zircon_object::ZxError::INVALID_ARGS as isize as usize,
             };
@@ -3413,5 +3471,43 @@ mod handler_return_address_tests {
         // Not `Some(0)`: a zero here used to be loaded into the return
         // register and jumped to, which is how `/sbin/init` died `pc=0 ra=0`.
         assert_eq!(handler_return_address(0, 0), None);
+    }
+}
+
+#[cfg(all(test, feature = "zircon-gateway"))]
+mod zircon_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_numbers_name_zircon_syscalls_only_while_it_is_on() {
+        set_zircon_gateway(false);
+        assert_eq!(zircon_gateway_number(ZIRCON_GATEWAY_BASE + 6), None);
+        set_zircon_gateway(true);
+        assert_eq!(zircon_gateway_number(ZIRCON_GATEWAY_BASE + 6), Some(6));
+        assert_eq!(
+            zircon_gateway_number(ZIRCON_GATEWAY_BASE + (ZIRCON_GATEWAY_INDIRECT as usize | 4)),
+            Some(ZIRCON_GATEWAY_INDIRECT | 4)
+        );
+        // Linux's own numbers and the ones past the range stay Linux's.
+        assert_eq!(zircon_gateway_number(1), None);
+        assert_eq!(zircon_gateway_number(ZIRCON_GATEWAY_BASE - 1), None);
+        assert_eq!(
+            zircon_gateway_number(ZIRCON_GATEWAY_BASE + ZIRCON_GATEWAY_LEN),
+            None
+        );
+        set_zircon_gateway(false);
+    }
+
+    #[test]
+    fn the_gateway_lets_through_ipc_and_not_thread_or_process_lifecycle() {
+        // channel_call_noretry, channel_create, object_wait_one, handle_close
+        for n in [6, 7, 81, 45] {
+            assert!(zircon_gateway_allows(n), "{} should pass", n);
+        }
+        // thread_exit, process_exit, the composite thread exits,
+        // thread_create, process_create, vmar_map, interrupt_create
+        for n in [165, 97, 1004, 1005, 164, 95, 185, 51] {
+            assert!(!zircon_gateway_allows(n), "{} should be refused", n);
+        }
     }
 }

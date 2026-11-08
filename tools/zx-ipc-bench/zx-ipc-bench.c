@@ -129,7 +129,11 @@ int main(int argc, char **argv) {
     }
 
     pthread_t t;
-    pthread_create(&t, NULL, zx_server, (void *)(uintptr_t)server);
+    int err = pthread_create(&t, NULL, zx_server, (void *)(uintptr_t)server);
+    if (err != 0) {
+        fprintf(stderr, "zx-ipc-bench: pthread_create: %s\n", strerror(err));
+        return 1;
+    }
     uint8_t out[32] = {0}, in[64];
     uint32_t got_bytes = 0, got_handles = 0;
     zx_channel_call_args_t args = {
@@ -156,7 +160,11 @@ int main(int argc, char **argv) {
         perror("pipe");
         return 1;
     }
-    pthread_create(&t, NULL, pipe_server, &p);
+    err = pthread_create(&t, NULL, pipe_server, &p);
+    if (err != 0) {
+        fprintf(stderr, "zx-ipc-bench: pthread_create: %s\n", strerror(err));
+        return 1;
+    }
     for (long i = -rounds / 10; i < rounds; i++) {
         if (i == 0)
             t0 = now_ns();
