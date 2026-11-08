@@ -416,6 +416,104 @@ fn zircon_gateway_number(num: usize) -> Option<u32> {
     (n < ZIRCON_GATEWAY_LEN).then_some(n as u32)
 }
 
+/// First gateway number past Zircon's own: calls Eclipse adds for Linux
+/// processes, which have no Zircon counterpart.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_GATEWAY_EXT: u32 = 0x4000;
+
+/// `eclipse_handle_to_fd(handle, flags) -> fd`: move `handle` (it needs
+/// `ZX_RIGHT_TRANSFER`) out of the handle table into a new file descriptor,
+/// a [`linux_object::fs::HandleFd`]. `flags` takes `O_CLOEXEC` and
+/// `O_NONBLOCK`. The handle is consumed even when the call fails, as with
+/// `zx_channel_write`.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_HANDLE_TO_FD: u32 = ECLIPSE_GATEWAY_EXT;
+
+/// `eclipse_fd_to_handle(fd, flags, *handle_out) -> status`: put the handle
+/// an fd holds into the handle table. With [`ECLIPSE_FD_TAKE`] the fd gives
+/// it up (for every process sharing that open file); without, the handle
+/// is duplicated, which needs `ZX_RIGHT_DUPLICATE`.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_FD_TO_HANDLE: u32 = ECLIPSE_GATEWAY_EXT + 1;
+
+/// [`ECLIPSE_FD_TO_HANDLE`] flag: move the handle out of the fd.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_FD_TAKE: usize = 1;
+
+/// The Eclipse extension calls ([`ECLIPSE_GATEWAY_EXT`] and up), answering
+/// a Zircon status or, for `handle_to_fd`, the new fd.
+#[cfg(feature = "zircon-gateway")]
+fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isize {
+    use linux_object::fs::{FileDesc, HandleFd, OpenFlags};
+    use zircon_object::object::Rights;
+    let status = |e: ZxError| e as isize;
+    match num {
+        ECLIPSE_HANDLE_TO_FD => {
+            let allowed = OpenFlags::CLOEXEC | OpenFlags::NON_BLOCK;
+            let flags = match OpenFlags::from_bits(args[1]) {
+                Some(f) if allowed.contains(f) => f,
+                _ => return status(ZxError::INVALID_ARGS),
+            };
+            let value = args[0] as u32;
+            if let Err(e) = proc.get_dyn_object_with_rights(value, Rights::TRANSFER) {
+                // Without the right the handle stays where it is; a bad
+                // value names nothing to consume.
+                return status(e);
+            }
+            let handle = match proc.remove_handle(value) {
+                Ok(h) => h,
+                Err(e) => return status(e),
+            };
+            let cloexec = flags.contains(OpenFlags::CLOEXEC);
+            match proc
+                .linux()
+                .add_file_cloexec(HandleFd::new(handle, flags), cloexec)
+            {
+                Ok(fd) => i32::from(fd) as isize,
+                Err(_) => status(ZxError::NO_RESOURCES),
+            }
+        }
+        ECLIPSE_FD_TO_HANDLE => {
+            if args[1] & !ECLIPSE_FD_TAKE != 0 {
+                return status(ZxError::INVALID_ARGS);
+            }
+            let mut out = kernel_hal::user::UserOutPtr::<u32>::from(args[2]);
+            // Look before taking anything: a bad pointer must not cost the
+            // fd its handle.
+            if out.write(0).is_err() {
+                return status(ZxError::INVALID_ARGS);
+            }
+            let file = match proc.linux().get_file_like(FileDesc::from(args[0])) {
+                Ok(f) => f,
+                Err(_) => return status(ZxError::BAD_HANDLE),
+            };
+            let holder = match file.downcast_arc::<HandleFd>() {
+                Ok(h) => h,
+                Err(_) => return status(ZxError::WRONG_TYPE),
+            };
+            let handle = if args[1] & ECLIPSE_FD_TAKE != 0 {
+                holder.take()
+            } else {
+                holder.duplicate()
+            };
+            match handle {
+                Ok(handle) => {
+                    let value = proc.add_handle(handle);
+                    match out.write(value) {
+                        Ok(()) => 0,
+                        Err(_) => {
+                            let _ = proc.remove_handle(value);
+                            status(ZxError::INVALID_ARGS)
+                        }
+                    }
+                }
+                Err(e) => status(e),
+            }
+        }
+        _ => status(ZxError::NOT_SUPPORTED),
+    }
+}
+
 /// Whether a Linux process may make Zircon syscall `zx_num` through the
 /// gateway: the objects a userspace server needs (channels, ports, events,
 /// FIFOs, sockets, timers, VMOs, handles, waits) and nothing else.
@@ -1848,6 +1946,9 @@ async fn handle_user_trap(
             let zx_num = zx_num & !ZIRCON_GATEWAY_INDIRECT;
             trace!("Zircon gateway syscall: {} {:x?}", zx_num, zx_args);
             let ret = match zx_args {
+                _ if zx_num >= ECLIPSE_GATEWAY_EXT => {
+                    eclipse_gateway_call(thread.proc(), zx_num, &args) as usize
+                }
                 _ if !zircon_gateway_allows(zx_num) => {
                     zircon_object::ZxError::NOT_SUPPORTED as isize as usize
                 }
