@@ -1380,6 +1380,15 @@ pub fn kernel_report() -> String {
             irq_note(v)
         );
     }
+    // Linux syscalls answered by a userspace server: where each round trip's
+    // time goes (nothing until the first one).
+    let _ = write!(
+        out,
+        "{}",
+        crate::process::syscall_redirect::phases::report(
+            &crate::process::syscall_redirect::phases::snapshot()
+        )
+    );
     // The kernel's boot timeline, last: it does not change after boot, so it is
     // reference material at the bottom of a live report rather than something
     // to read first. It is also printed to the console at the end of the boot,

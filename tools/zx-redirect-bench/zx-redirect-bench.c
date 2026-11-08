@@ -17,7 +17,12 @@
 // the ratio redirected/pipe means much: both are one round trip between two
 // processes, one through the kernel's redirect, the other through pipes.
 //
-//   zx-redirect-bench [ROUNDS]  (default 20000)
+//   zx-redirect-bench [ROUNDS [phases]]  (default 20000)
+//
+// With `phases` the server stamps each reply with when it received the
+// request and when it replied, and the run ends with the kernel's split of
+// a round trip into its phases (the redirect lines of /proc/perf/kernel).
+// The stamps cost the server two clock reads per request.
 //
 // Run it on Eclipse booted with `zircon.gateway=1`. Exit status: 0 on
 // success, 2 when the gateway is off (ENOSYS), 1 on error.
@@ -76,6 +81,8 @@ struct request {
 struct reply {
     uint32_t txid, flags;
     int64_t ret;
+    // CLOCK_MONOTONIC ns, only with `phases` (REPLY_LEN 32 then, else 16).
+    uint64_t received, replied;
 };
 
 static long zx(long n, long a, long b, long c, long d, long e, long f) {
@@ -107,6 +114,7 @@ static long redirect(zx_handle_t h, const uint64_t *mask) {
 // The server: answer getppid with the caller's pid, send anything else back
 // to the kernel. Counts what it served; returns when the peer is gone.
 static zx_handle_t server_handle;
+static int stamp;
 static volatile long served, bad_requests;
 
 static long client_memory(uint64_t pid, uint64_t addr, void *buf, long len, int to_client) {
@@ -154,6 +162,8 @@ static void *server(void *unused) {
         if (r < 0)
             break;
         struct reply rep = {.txid = req.txid};
+        if (stamp)
+            rep.received = now_ns();
         if (got != sizeof req || req.kind != REDIRECT_KIND_SYSCALL) {
             bad_requests++;
             rep.ret = -EIO;
@@ -167,8 +177,10 @@ static void *server(void *unused) {
             rep.flags = REDIRECT_REPLY_NATIVE;
         }
         served++;
-        if (zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)&rep, sizeof rep,
-                         0, 0)) < 0)
+        if (stamp)
+            rep.replied = now_ns();
+        if (zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)&rep,
+                         stamp ? sizeof rep : 16, 0, 0)) < 0)
             break;
     }
     return NULL;
@@ -275,6 +287,7 @@ static int child(int fd, int rounds, int ping[2], int pong[2]) {
 
 int main(int argc, char **argv) {
     int rounds = argc > 1 ? atoi(argv[1]) : 20000;
+    stamp = argc > 2 && strcmp(argv[2], "phases") == 0;
     if (rounds <= 0)
         rounds = 20000;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -357,5 +370,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("zx-redirect-bench: served %ld requests, peer closed on reap: ok\n", -served - 1);
+    if (stamp) {
+        FILE *f = fopen("/proc/perf/kernel", "r");
+        char line[512];
+        while (f && fgets(line, sizeof line, f))
+            if (strstr(line, "redirect"))
+                printf("zx-redirect-bench: kernel: %s", line[0] == ' ' ? line + 2 : line);
+        if (f)
+            fclose(f);
+    }
     return 0;
 }
