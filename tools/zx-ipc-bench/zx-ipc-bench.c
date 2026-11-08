@@ -165,6 +165,19 @@ static uint64_t pipe_rounds(int req, int rep, long rounds) {
     return (now_ns() - t0) / rounds;
 }
 
+// The scheduler's wake lines from /proc/perf/kernel (they count since boot:
+// compare two dumps), with `zx-ipc-bench: [label]` in front.
+static void dump_wake_stats(const char *label) {
+    FILE *f = fopen("/proc/perf/kernel", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, "wake") || strstr(line, "resched"))
+            printf("zx-ipc-bench: [%s] %s", label, line);
+    fclose(f);
+}
+
 static int child_status(pid_t pid) {
     int st = 0;
     if (waitpid(pid, &st, 0) != pid)
@@ -221,7 +234,10 @@ int main(int argc, char **argv) {
         rounds = 20000;
     // `zx-ipc-bench N 0`: everything on CPU 0, to tell wake-up cost on one
     // CPU apart from the cost of waking a thread on the other.
-    if (argc > 2) {
+    // `zx-ipc-bench N CPU stats` (CPU -1: unpinned): the scheduler's wake
+    // statistics around the two-process runs.
+    int stats = argc > 3 && strcmp(argv[3], "stats") == 0;
+    if (argc > 2 && atoi(argv[2]) >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(atoi(argv[2]), &set);
@@ -307,7 +323,11 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     close((int)sfd);
+    if (stats)
+        dump_wake_stats("before channel");
     uint64_t zx2_ns = channel_rounds(client, rounds);
+    if (stats)
+        dump_wake_stats("after channel");
     zx(ZX_SYS_handle_close, client, 0, 0, 0, 0, 0);
     if (child_status(pid) != 0 || !zx2_ns) {
         fprintf(stderr, "zx-ipc-bench: the channel server process failed\n");
@@ -332,6 +352,8 @@ int main(int argc, char **argv) {
     close(p.req[0]);
     close(p.rep[1]);
     uint64_t pipe2_ns = pipe_rounds(p.req[1], p.rep[0], rounds);
+    if (stats)
+        dump_wake_stats("after pipe");
     close(p.req[1]);
     if (child_status(pid) != 0 || !pipe2_ns)
         return 1;

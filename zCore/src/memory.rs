@@ -129,11 +129,40 @@ unsafe impl GlobalAlloc for LockedHeap {
         // `MutexGuard`) is dropped at the end of THIS statement, before the
         // alias check runs. `heap_alias_check` may panic into the BSOD painter,
         // which must never re-enter this lock.
-        let alloc = {
-            let mut heap = self.0.lock();
-            #[cfg(feature = "mem-debug")]
-            let _inside = lockcheck::Inside::enter();
-            heap.allocate_layout(padded)
+        // Small blocks come from this CPU's front cache when it has one of
+        // the size, and otherwise from the buddy at the cache's size class,
+        // so that every small block the buddy hands out can be cached on its
+        // way back. See `front`.
+        #[cfg(not(feature = "mem-debug"))]
+        let padded = front::class_layout(padded).unwrap_or(padded);
+        #[cfg(not(feature = "mem-debug"))]
+        let cached = front::try_alloc(padded);
+        #[cfg(feature = "mem-debug")]
+        let cached: Option<(NonNull<u8>, usize)> = None;
+        let alloc = match cached {
+            Some(block) => Ok(block),
+            None => {
+                let first = {
+                    let mut heap = self.0.lock();
+                    #[cfg(feature = "mem-debug")]
+                    let _inside = lockcheck::Inside::enter();
+                    heap.allocate_layout(padded)
+                };
+                // Out of memory with blocks parked in the caches: give them
+                // back to the buddy, where they can merge, and ask once more.
+                #[cfg(not(feature = "mem-debug"))]
+                let first = match first {
+                    Err(_)
+                        if front::drain(|block, layout| {
+                            self.0.lock().deallocate_layout(block, layout)
+                        }) > 0 =>
+                    {
+                        self.0.lock().allocate_layout(padded)
+                    }
+                    other => other,
+                };
+                first
+            }
         };
         match alloc {
             Ok((ptr, size)) => {
@@ -191,9 +220,189 @@ unsafe impl GlobalAlloc for LockedHeap {
             give_back_to_buddy,
         );
         #[cfg(not(feature = "mem-debug"))]
-        self.0
-            .lock()
-            .deallocate_layout(NonNull::new(ptr).unwrap(), layout)
+        {
+            let layout = front::class_layout(layout).unwrap_or(layout);
+            let block = NonNull::new(ptr).unwrap();
+            if !front::try_free(block, layout) {
+                self.0.lock().deallocate_layout(block, layout)
+            }
+        }
+    }
+}
+
+/// Per-CPU caches of small free blocks in front of the buddy.
+///
+/// Every `Box`, `Arc` and small `Vec` on aarch64 and riscv64 used to take the
+/// one heap lock, and a free in the buddy is a sorted insert into its free
+/// list, linear in the list's length. Two CPUs exchanging channel messages
+/// spent about 60% of their time there (QMP PC sampling of `zx-ipc-bench`
+/// with two processes on `-smp 2`), half of it spinning on the lock the other
+/// CPU held for its walk. `memory_x86_64.rs` has had a front cache for the
+/// same reason; this is the plain version of it.
+///
+/// A block from 8 bytes to 4 KiB is allocated at its size class (the next
+/// power of two of its size and alignment) on both the alloc and the free
+/// side, so any block of a class can serve any request of that class and
+/// goes back to the buddy with the layout it came out with. A cache is a
+/// LIFO of free blocks per class, linked through the blocks' first word,
+/// capped per class so a CPU parks at most a few tens of KiB.
+///
+/// Each CPU's cache is taken with `try_lock`: an interrupt that allocates
+/// while its CPU is inside its own cache finds it busy and goes to the
+/// buddy, and so does a CPU that lands on another's slot after a migration
+/// or during a drain. Nothing waits on a cache.
+#[cfg(not(feature = "mem-debug"))]
+mod front {
+    use core::alloc::Layout;
+    use core::ptr::NonNull;
+
+    /// Classes 2^3 (8 B, a link's size and the buddy's smallest block) to
+    /// 2^12 (4 KiB).
+    const MIN_CLASS: usize = 3;
+    const MAX_CLASS: usize = 12;
+    const CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
+    /// Bytes a CPU may park in one class; the count is this over the size,
+    /// between [`MIN_CAP`] and [`MAX_CAP`].
+    const CLASS_BUDGET: usize = 16 * 1024;
+    const MIN_CAP: usize = 4;
+    const MAX_CAP: usize = 64;
+
+    const fn cap(class: usize) -> usize {
+        let n = CLASS_BUDGET >> (class + MIN_CLASS);
+        if n < MIN_CAP {
+            MIN_CAP
+        } else if n > MAX_CAP {
+            MAX_CAP
+        } else {
+            n
+        }
+    }
+
+    struct Cache {
+        head: [usize; CLASSES],
+        count: [usize; CLASSES],
+    }
+
+    impl Cache {
+        const fn new() -> Self {
+            Cache {
+                head: [0; CLASSES],
+                count: [0; CLASSES],
+            }
+        }
+
+        fn pop(&mut self, class: usize) -> Option<NonNull<u8>> {
+            let block = NonNull::new(self.head[class] as *mut u8)?;
+            // SAFETY: a block is in the list only between its free and its
+            // next alloc, its first word is the link `push` wrote, and the
+            // class is at least 8 bytes aligned to its size.
+            self.head[class] = unsafe { block.as_ptr().cast::<usize>().read() };
+            self.count[class] -= 1;
+            Some(block)
+        }
+
+        fn push(&mut self, class: usize, block: NonNull<u8>) -> bool {
+            if self.count[class] >= cap(class) {
+                return false;
+            }
+            // SAFETY: the caller frees the block, so its bytes are ours.
+            unsafe { block.as_ptr().cast::<usize>().write(self.head[class]) };
+            self.head[class] = block.as_ptr() as usize;
+            self.count[class] += 1;
+            true
+        }
+    }
+
+    static CACHES: [spin::Mutex<Cache>; lock::MAX_CORE_NUM] =
+        [const { spin::Mutex::new(Cache::new()) }; lock::MAX_CORE_NUM];
+
+    fn class_of(layout: Layout) -> Option<usize> {
+        let size = layout.size().max(layout.align()).max(1 << MIN_CLASS);
+        if size > 1 << MAX_CLASS {
+            return None;
+        }
+        Some(size.next_power_of_two().trailing_zeros() as usize - MIN_CLASS)
+    }
+
+    /// The layout a small block is allocated and freed with: its class's
+    /// size, aligned to that size. `None` for a block too big to cache.
+    pub fn class_layout(layout: Layout) -> Option<Layout> {
+        let size = 1usize << (class_of(layout)? + MIN_CLASS);
+        Layout::from_size_align(size, size).ok()
+    }
+
+    fn mine() -> Option<spin::MutexGuard<'static, Cache>> {
+        CACHES.get(kernel_hal::cpu::cpu_id() as usize)?.try_lock()
+    }
+
+    /// A cached block for `layout` (already a class layout) and its size.
+    pub fn try_alloc(layout: Layout) -> Option<(NonNull<u8>, usize)> {
+        let class = class_of(layout)?;
+        let block = mine()?.pop(class)?;
+        Some((block, layout.size()))
+    }
+
+    /// Keep a freed block of `layout` (already a class layout); `false`
+    /// means the caller must give it to the buddy.
+    pub fn try_free(block: NonNull<u8>, layout: Layout) -> bool {
+        match (class_of(layout), mine()) {
+            (Some(class), Some(mut cache)) => cache.push(class, block),
+            _ => false,
+        }
+    }
+
+    /// Hand every cached block to `give` with its layout, and answer how
+    /// many there were. A cache busy right now is skipped.
+    pub fn drain(mut give: impl FnMut(NonNull<u8>, Layout)) -> usize {
+        let mut given = 0;
+        for cache in CACHES.iter() {
+            let Some(mut cache) = cache.try_lock() else {
+                continue;
+            };
+            for class in 0..CLASSES {
+                let size = 1usize << (class + MIN_CLASS);
+                let layout = Layout::from_size_align(size, size).unwrap();
+                while let Some(block) = cache.pop(class) {
+                    give(block, layout);
+                    given += 1;
+                }
+            }
+        }
+        given
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_layout_goes_to_the_class_of_its_size_and_alignment() {
+            let class = |s, a| class_layout(Layout::from_size_align(s, a).unwrap());
+            assert_eq!(class(1, 1), Layout::from_size_align(8, 8).ok());
+            assert_eq!(class(24, 8), Layout::from_size_align(32, 32).ok());
+            assert_eq!(class(8, 64), Layout::from_size_align(64, 64).ok());
+            assert_eq!(class(4096, 8), Layout::from_size_align(4096, 4096).ok());
+            assert_eq!(class(4097, 8), None);
+        }
+
+        #[test]
+        fn a_cache_hands_back_what_it_kept_last_first_up_to_its_cap() {
+            let mut cache = Cache::new();
+            let class = 9; // 4 KiB: the smallest cap
+            let mut blocks = alloc::vec::Vec::new();
+            for _ in 0..cap(class) + 1 {
+                let b = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 512]));
+                blocks.push(NonNull::new(b.as_mut_ptr().cast::<u8>()).unwrap());
+            }
+            for b in &blocks[..cap(class)] {
+                assert!(cache.push(class, *b));
+            }
+            assert!(!cache.push(class, blocks[cap(class)]), "past the cap");
+            for b in blocks[..cap(class)].iter().rev() {
+                assert_eq!(cache.pop(class), Some(*b));
+            }
+            assert_eq!(cache.pop(class), None);
+        }
     }
 }
 
