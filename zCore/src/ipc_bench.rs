@@ -148,10 +148,13 @@ pub fn start(n: usize) {
             for round in 1..=ROUNDS {
                 bench_log(format_args!("ipcbench: round {}/{}", round, ROUNDS));
                 run_case("same-cpu", n, Some(0), Some(0)).await;
-                if online > 1 {
+                // CPU 1 itself must be up: more than one CPU online does not
+                // say which (a partial SMP bring-up can leave CPU 1 out), and
+                // a server pinned to a CPU that never runs never answers.
+                if kernel_hal::cpu_online_mask() & 0b10 != 0 {
                     run_case("cross-cpu", n, Some(0), Some(1)).await;
                 } else {
-                    bench_log(format_args!("ipcbench: cross-cpu skipped (1 CPU)"));
+                    bench_log(format_args!("ipcbench: cross-cpu skipped (CPU 1 offline)"));
                 }
                 run_case("unpinned", n, None, None).await;
             }
