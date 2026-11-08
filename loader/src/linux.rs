@@ -451,6 +451,66 @@ pub const ECLIPSE_FD_TAKE: usize = 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_REDIRECT_SYSCALLS: u32 = ECLIPSE_GATEWAY_EXT + 2;
 
+/// `eclipse_redirect_memory(server, pid, addr, buf, len, flags) -> copied`:
+/// the server of a redirect reaching its client's memory, where a
+/// redirected syscall's pointer arguments point. `server` is the server's
+/// end of the redirect channel (`READ` and `WRITE`); `pid` is the client
+/// process, or one of its threads, as the request names it. Without
+/// [`ECLIPSE_MEMORY_TO_CLIENT`] it copies `len` bytes from the client's
+/// `addr` into the caller's `buf`; with it, the other way. It stops at the
+/// first client page the client could not read (or write) itself and
+/// answers how many bytes it copied, or a Zircon status: `NOT_FOUND` for no
+/// such live process, `ACCESS_DENIED` for one this server does not serve,
+/// `INVALID_ARGS` for a `buf` the caller cannot use.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_REDIRECT_MEMORY: u32 = ECLIPSE_GATEWAY_EXT + 3;
+
+/// [`ECLIPSE_REDIRECT_MEMORY`] flag: copy from the server into the client.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_MEMORY_TO_CLIENT: usize = 1;
+
+/// The copy of [`ECLIPSE_REDIRECT_MEMORY`], a page at a time through the
+/// kernel: `Err` only when the caller's own buffer fails.
+#[cfg(feature = "zircon-gateway")]
+fn copy_client_memory(
+    client: &Arc<Process>,
+    addr: usize,
+    buf: usize,
+    len: usize,
+    to_client: bool,
+) -> ZxResult<usize> {
+    use kernel_hal::user::{UserInPtr, UserOutPtr};
+    use linux_object::process::remote_memory;
+    use zircon_object::vm::PAGE_SIZE;
+    let vmar = client.vmar();
+    let mut page = alloc::vec![0u8; PAGE_SIZE];
+    let mut done = 0;
+    while done < len {
+        let there = addr.checked_add(done).ok_or(ZxError::INVALID_ARGS)?;
+        let here = buf.checked_add(done).ok_or(ZxError::INVALID_ARGS)?;
+        let n = (len - done).min(PAGE_SIZE - there % PAGE_SIZE);
+        let chunk = &mut page[..n];
+        let moved = if to_client {
+            let bytes = UserInPtr::<u8>::from(here)
+                .read_array(n)
+                .map_err(|_| ZxError::INVALID_ARGS)?;
+            chunk.copy_from_slice(&bytes);
+            remote_memory::write(&vmar, there, chunk)
+        } else {
+            let got = remote_memory::read(&vmar, there, chunk);
+            UserOutPtr::<u8>::from(here)
+                .write_array(&chunk[..got])
+                .map_err(|_| ZxError::INVALID_ARGS)?;
+            got
+        };
+        done += moved;
+        if moved < n {
+            break;
+        }
+    }
+    Ok(done)
+}
+
 /// The Eclipse extension calls ([`ECLIPSE_GATEWAY_EXT`] and up), answering
 /// a Zircon status or, for `handle_to_fd`, the new fd.
 #[cfg(feature = "zircon-gateway")]
@@ -554,6 +614,28 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             }
             match slot.set(SyscallRedirect::new(channel, mask)) {
                 Ok(()) => 0,
+                Err(e) => status(e),
+            }
+        }
+        ECLIPSE_REDIRECT_MEMORY => {
+            use linux_object::process::syscall_redirect::client_of;
+            if args[5] & !ECLIPSE_MEMORY_TO_CLIENT != 0 {
+                return status(ZxError::INVALID_ARGS);
+            }
+            let server = match proc.get_object_with_rights::<zircon_object::ipc::Channel>(
+                args[0] as u32,
+                Rights::READ | Rights::WRITE,
+            ) {
+                Ok(c) => c,
+                Err(e) => return status(e),
+            };
+            let client = match client_of(&server, args[1] as u64) {
+                Ok(p) => p,
+                Err(e) => return status(e),
+            };
+            let to_client = args[5] & ECLIPSE_MEMORY_TO_CLIENT != 0;
+            match copy_client_memory(&client, args[2], args[3], args[4], to_client) {
+                Ok(n) => n as isize,
                 Err(e) => status(e),
             }
         }
