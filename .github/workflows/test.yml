@@ -148,6 +148,7 @@ jobs:
           cargo bench -p linux-object --bench signal --features mock-disk --no-run
           cargo bench -p linux-object --bench process --features mock-disk --no-run
           cargo bench -p linux-object --bench process_census --features mock-disk --no-run
+          cargo bench -p linux-object --bench ipc --features mock-disk --no-run
           # `linux-object`'s syscall-accounting rows are not a `benches/`
           # target either: `ProcPerf::record` is private to `perf`, and the
           # contention rows need the statics themselves.
@@ -155,6 +156,7 @@ jobs:
           cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
           cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
           cargo bench -p zircon-object --bench task --features libos,aspace-separate --no-run
+          cargo bench -p zircon-object --bench ipc --features libos,aspace-separate --no-run
           # `linux-syscall`'s benches are not a `benches/` target: every
           # submodule of that crate is private, so they live in `#[cfg(test)]`
           # modules beside the syscalls and build with the lib. Same for

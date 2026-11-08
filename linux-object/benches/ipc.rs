@@ -29,6 +29,12 @@
 //!    are one round trip, so the C suite's figure minus twice this row is what
 //!    the scheduler and the switch cost.
 //!
+//! The last two rows are the same questions for a Zircon channel end held in
+//! a file descriptor (`HandleFd`), which is what a userspace server polls:
+//! `handle_fd_poll_channel` is one readiness check, and
+//! `handle_fd_async_poll_park_then_wake` the park, the wake by a message and
+//! the read. See `zircon-object/benches/ipc.rs` for the channel itself.
+//!
 //! What is deliberately NOT in row 4, because the host cannot have it: the
 //! `process::interruptible` wrapper `File::read` puts around the park. With no
 //! Linux thread on the CPU it awaits the inner future directly, so the
@@ -423,5 +429,60 @@ fn file_read_park_then_wake_with_thread(b: &mut Bencher) {
             count.0.load(Ordering::Relaxed) > before,
             "every pass must have parked and been woken"
         );
+    });
+}
+
+// --- a Zircon channel end in a file descriptor ---------------------------
+
+/// A `HandleFd` over one end of a channel, that end (to drain it), and the
+/// other end to write with.
+fn channel_fd() -> (
+    Arc<linux_object::fs::HandleFd>,
+    Arc<zircon_object::ipc::Channel>,
+    Arc<zircon_object::ipc::Channel>,
+) {
+    use zircon_object::object::{Handle, Rights};
+    let (a, z) = zircon_object::ipc::Channel::create();
+    let fd = linux_object::fs::HandleFd::new(
+        Handle::new(a.clone(), Rights::DEFAULT_CHANNEL),
+        OpenFlags::empty(),
+    );
+    (fd, a, z)
+}
+
+fn zx_message() -> zircon_object::ipc::MessagePacket {
+    zircon_object::ipc::MessagePacket {
+        data: vec![0u8; 32],
+        handles: Vec::new(),
+    }
+}
+
+/// What `poll(2)` and `epoll` pay per channel fd per scan: the object's
+/// signals read and turned into a `PollStatus`. The sibling of the pipe's
+/// readiness rows above, for the fd a userspace server waits on.
+#[bench]
+fn handle_fd_poll_channel(b: &mut Bencher) {
+    use linux_object::fs::PollEvents;
+    let (fd, _end, _peer) = channel_fd();
+    b.iter(|| black_box(&fd).poll(black_box(PollEvents::IN)).unwrap());
+}
+
+/// A blocking wait on a channel fd that parks, the message that wakes it,
+/// the poll that answers readable, and the read that empties the channel
+/// for the next pass: the fd half of a server's wait for its next request.
+#[bench]
+fn handle_fd_async_poll_park_then_wake(b: &mut Bencher) {
+    use linux_object::fs::PollEvents;
+    let (fd, end, peer) = channel_fd();
+    let mut cx = Context::from_waker(Waker::noop());
+    b.iter(|| {
+        let mut wait = Box::pin(black_box(&fd).async_poll(PollEvents::IN));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        peer.write(zx_message()).unwrap();
+        match wait.as_mut().poll(&mut cx) {
+            Poll::Ready(status) => assert!(status.unwrap().read),
+            Poll::Pending => panic!("the message did not wake the fd"),
+        }
+        black_box(end.read().unwrap())
     });
 }
