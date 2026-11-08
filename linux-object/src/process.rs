@@ -38,6 +38,8 @@ mod arg_area;
 /// The thread a child was forked by, and what its exit tells the child.
 mod forking_thread;
 pub mod remote_memory;
+/// Linux syscalls answered by a userspace server.
+pub mod syscall_redirect;
 pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
@@ -652,6 +654,9 @@ impl NewChild for Process {
             futexes: Default::default(),
             itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
             aspace_lock: Mutex::new(()),
+            syscall_redirect: syscall_redirect::RedirectSlot::forked(
+                &linux_parent.syscall_redirect,
+            ),
             inner: Mutex::new(linux_parent_inner.forked_child(
                 parent_pgid,
                 parent_sid,
@@ -1279,6 +1284,9 @@ pub struct LinuxProcess {
     /// layout — so a fault on another thread cannot deadlock against a fork
     /// holding this.
     aspace_lock: Mutex<()>,
+    /// Where this process's redirected syscalls go, if anywhere: see
+    /// [`syscall_redirect`]. Outside `inner` because every syscall reads it.
+    syscall_redirect: syscall_redirect::RedirectSlot,
 }
 
 /// Linux process mut inner data
@@ -1898,6 +1906,7 @@ impl LinuxProcess {
             futexes: Default::default(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
+            syscall_redirect: Default::default(),
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 start_ns: monotonic_now_ns(),

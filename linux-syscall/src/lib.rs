@@ -57,6 +57,18 @@ mod consts {
     include!(concat!(env!("OUT_DIR"), "/consts.rs"));
 }
 
+/// Whether Linux syscall `num` must always run in the kernel, even for a
+/// process whose syscalls a userspace server answers
+/// (`linux_object::process::syscall_redirect`): leaving the process, and
+/// returning from a signal handler, which rewrites the thread's own
+/// registers and so is the kernel's to do.
+pub fn never_redirected(num: u32) -> bool {
+    matches!(
+        Sys::try_from(num),
+        Ok(Sys::EXIT | Sys::EXIT_GROUP | Sys::RT_SIGRETURN)
+    )
+}
+
 /// Glue for Eclipse's own perf accounting (`/proc/perf`, `/proc/<pid>/perf`).
 ///
 /// Resolves a syscall number to its name via the generated [`Sys`] enum and
