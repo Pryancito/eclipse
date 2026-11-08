@@ -440,6 +440,17 @@ pub const ECLIPSE_FD_TO_HANDLE: u32 = ECLIPSE_GATEWAY_EXT + 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_FD_TAKE: usize = 1;
 
+/// `eclipse_redirect_syscalls(channel, *mask) -> status`: from now on, the
+/// Linux syscalls whose bits are set in `mask` (`u64[8]`, bit `n` for
+/// syscall `n`) become calls on `channel`, answered by whoever holds its
+/// peer (see [`linux_object::process::syscall_redirect`] for the messages).
+/// The handle needs `READ`, `WRITE` and `TRANSFER` and is consumed: the
+/// process can no longer reach that end. Once per process, inherited by
+/// `fork`, kept by `execve`; `exit`, `exit_group` and `rt_sigreturn` cannot
+/// be redirected.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_REDIRECT_SYSCALLS: u32 = ECLIPSE_GATEWAY_EXT + 2;
+
 /// The Eclipse extension calls ([`ECLIPSE_GATEWAY_EXT`] and up), answering
 /// a Zircon status or, for `handle_to_fd`, the new fd.
 #[cfg(feature = "zircon-gateway")]
@@ -507,6 +518,42 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
                         }
                     }
                 }
+                Err(e) => status(e),
+            }
+        }
+        ECLIPSE_REDIRECT_SYSCALLS => {
+            use linux_object::process::syscall_redirect::{SyscallRedirect, MAX_REDIRECTED};
+            let words = match kernel_hal::user::UserInPtr::<u64>::from(args[1])
+                .read_array(MAX_REDIRECTED / 64)
+            {
+                Ok(v) => v,
+                Err(_) => return status(ZxError::INVALID_ARGS),
+            };
+            let mut mask = [0u64; MAX_REDIRECTED / 64];
+            mask.copy_from_slice(&words);
+            let kept = (0..MAX_REDIRECTED as u32).any(|n| {
+                mask[n as usize / 64] & (1 << (n % 64)) != 0 && linux_syscall::never_redirected(n)
+            });
+            if kept {
+                return status(ZxError::INVALID_ARGS);
+            }
+            let value = args[0] as u32;
+            let channel = match proc.get_object_with_rights::<zircon_object::ipc::Channel>(
+                value,
+                Rights::READ | Rights::WRITE | Rights::TRANSFER,
+            ) {
+                Ok(c) => c,
+                Err(e) => return status(e),
+            };
+            let slot = proc.linux().syscall_redirect();
+            if slot.get().is_some() {
+                return status(ZxError::ALREADY_BOUND);
+            }
+            if let Err(e) = proc.remove_handle(value) {
+                return status(e);
+            }
+            match slot.set(SyscallRedirect::new(channel, mask)) {
+                Ok(()) => 0,
                 Err(e) => status(e),
             }
         }
@@ -1969,6 +2016,40 @@ async fn handle_user_trap(
             #[cfg(not(feature = "libos"))]
             honour_wake_preempt_on_syscall_exit(thread).await;
             return Ok(None);
+        }
+        // A syscall a userspace server answers: the kernel sends it there and
+        // gives back what it says, or runs it here if it says so.
+        #[cfg(feature = "zircon-gateway")]
+        if let Some(redirect) = thread.proc().linux().syscall_redirect().get() {
+            if redirect.covers(num) {
+                use linux_object::error::LxError;
+                use linux_object::process::syscall_redirect::Forwarded;
+                let pid = thread.proc().id();
+                let answer = if hunter::check_syscall(pid, num as u32, &args).is_err() {
+                    Forwarded::Return(-(LxError::EPERM as isize))
+                } else {
+                    let redirect = redirect.clone();
+                    let tid = thread.id();
+                    run_with_irq_enable! {
+                        match linux_object::process::interruptible(
+                            redirect.forward(pid, tid, num, &args),
+                        )
+                        .await
+                        {
+                            Ok(answer) => answer,
+                            Err(_) => Forwarded::Return(-(LxError::EINTR as isize)),
+                        }
+                    }
+                };
+                if let Forwarded::Return(ret) = answer {
+                    thread.with_context(|ctx| {
+                        ctx.set_field(UserContextField::ReturnValue, ret as usize)
+                    })?;
+                    #[cfg(not(feature = "libos"))]
+                    honour_wake_preempt_on_syscall_exit(thread).await;
+                    return Ok(None);
+                }
+            }
         }
         trace!("Syscall: {} {:x?}", num as u32, args);
         let ret = run_with_irq_enable! {

@@ -89,6 +89,7 @@ pub(super) fn a_process() -> LinuxProcess {
         futexes: Default::default(),
         itimers: Default::default(),
         aspace_lock: Mutex::new(()),
+        syscall_redirect: Default::default(),
         inner: Mutex::new(LinuxProcessInner::default()),
     }
 }

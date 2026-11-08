@@ -305,3 +305,18 @@ mod x86_64 {
         assert_eq!(got, ((1234, 99), (0, 0)));
     }
 }
+
+/// What a userspace server may not take over: leaving the process and
+/// returning from a signal handler. Everything else it may.
+#[test]
+fn only_exit_and_sigreturn_are_never_redirected() {
+    for sys in [Sys::EXIT, Sys::EXIT_GROUP, Sys::RT_SIGRETURN] {
+        let n = sys as u32;
+        assert!(never_redirected(n), "{}", n);
+    }
+    for sys in [Sys::GETPPID, Sys::READ, Sys::OPENAT, Sys::CLONE] {
+        let n = sys as u32;
+        assert!(!never_redirected(n), "{}", n);
+    }
+    assert!(!never_redirected(0x5a00_0000));
+}

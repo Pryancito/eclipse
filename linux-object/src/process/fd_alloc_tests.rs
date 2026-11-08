@@ -291,6 +291,7 @@ fn a_forked_child_sees_its_parent_hole() {
             futexes: Default::default(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
+            syscall_redirect: Default::default(),
             inner: Mutex::new(forked),
         }
     };
