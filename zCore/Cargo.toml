@@ -46,6 +46,7 @@ zircon = ["zcore-loader/zircon"]
 # Run as Linux mode
 linux = [
   "zcore-loader/linux",
+  "zcore-loader/zircon-gateway",
   "linux-object",
   "rcore-fs",
   "rcore-fs-sfs",

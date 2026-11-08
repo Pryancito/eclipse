@@ -352,6 +352,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             executor::set_wakeup_preempt(false);
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
+        // Zircon syscalls for Linux processes (see
+        // `zcore_loader::linux::ZIRCON_GATEWAY_BASE`): off by default.
+        #[cfg(feature = "linux")]
+        if kernel_hal::cmdline::flag(&options.cmdline, "zircon.gateway") {
+            zcore_loader::linux::set_zircon_gateway(true);
+            klog_info!("Eclipse: Zircon syscall gateway ENABLED (zircon.gateway=1)");
+        }
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
         // measurable difference to `eclipse.ipcbench`.

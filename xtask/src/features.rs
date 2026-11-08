@@ -309,6 +309,7 @@ pub(crate) const LIBRO: &[(&str, &str, Veredicto)] = &[
         ),
     ),
     ("zcore-loader", "linux", Probada),
+    ("zcore-loader", "zircon-gateway", Probada),
     ("zcore-loader", "zircon", Construida),
     ("zcore-loader", "libos", Probada),
     // --- rboot ---
