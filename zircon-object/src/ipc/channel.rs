@@ -4,9 +4,10 @@ use {
     alloc::sync::{Arc, Weak},
     alloc::vec::Vec,
     core::convert::TryInto,
+    core::future::Future,
+    core::pin::Pin,
     core::sync::atomic::{AtomicU32, Ordering},
-    futures::channel::oneshot::{self, Sender},
-    hashbrown::HashMap,
+    core::task::{Context, Poll, Waker},
     kernel_hal::sync::Mutex,
 };
 
@@ -31,8 +32,80 @@ pub struct Channel {
     _counter: CountHelper,
     peer: Weak<Channel>,
     recv_queue: Mutex<VecDeque<T>>,
-    call_reply: Mutex<HashMap<TxID, Sender<ZxResult<T>>>>,
+    call_reply: Mutex<ReplyTable>,
     next_txid: AtomicU32,
+}
+
+/// The `call`s an endpoint has in flight, each waiting for the reply that
+/// carries its txid.
+///
+/// This used to be a `HashMap` of `oneshot` senders: every call allocated
+/// the oneshot's shared state and hashed its txid twice, which was most of
+/// the cost of a call+reply on the object (see `ipc_baseline`). An endpoint
+/// has a handful of calls in flight at most -- usually one -- so a vector
+/// searched from the end is faster than hashing, and the entries' storage is
+/// reused: a steady stream of calls allocates nothing after the first.
+///
+/// Every state change happens under the one lock that guards the table, so
+/// the window the oneshot had (a writer holding the sender of a call that
+/// was being cancelled) does not exist: a reply either reaches a call that
+/// is still there, or finds no entry and is queued as an ordinary message.
+#[derive(Default)]
+struct ReplyTable {
+    slots: Vec<ReplySlot>,
+}
+
+struct ReplySlot {
+    txid: TxID,
+    state: SlotState,
+}
+
+enum SlotState {
+    /// No reply yet; the waker of the last poll, if it was polled.
+    Waiting(Option<Waker>),
+    /// The reply (or `PEER_CLOSED`), not yet taken by the call.
+    Ready(ZxResult<T>),
+}
+
+impl ReplyTable {
+    fn position(&self, txid: TxID) -> Option<usize> {
+        self.slots.iter().rposition(|slot| slot.txid == txid)
+    }
+
+    /// Hand `msg` to the call waiting for `txid`, answering the waker to wake
+    /// once the lock is released. `Err(msg)` when there is none, or its reply
+    /// is already in.
+    fn deliver(&mut self, txid: TxID, msg: T) -> Result<Option<Waker>, T> {
+        let Some(i) = self.position(txid) else {
+            return Err(msg);
+        };
+        let slot = &mut self.slots[i];
+        let SlotState::Waiting(waker) = &mut slot.state else {
+            return Err(msg);
+        };
+        let waker = waker.take();
+        slot.state = SlotState::Ready(Ok(msg));
+        Ok(waker)
+    }
+
+    /// Remove the slot of `txid`, answering the reply it held, if any.
+    fn remove(&mut self, txid: TxID) -> Option<ZxResult<T>> {
+        let i = self.position(txid)?;
+        match self.slots.swap_remove(i).state {
+            SlotState::Ready(reply) => Some(reply),
+            SlotState::Waiting(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
 }
 
 type T = MessagePacket;
@@ -127,27 +200,24 @@ impl Channel {
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         // check first 4 bytes: whether it is a call reply?
         let txid = msg.get_txid();
-        // Out of the map before anything else is locked: `push_general` below
-        // takes the peer's queue, and nothing may hold both.
-        let waiting = if txid != 0 {
-            peer.call_reply.lock().remove(&txid)
+        // The reply table's lock is released before `push_general` takes the
+        // peer's queue: nothing may hold both.
+        let msg = if txid != 0 {
+            let delivered = peer.call_reply.lock().deliver(txid, msg);
+            match delivered {
+                Ok(waker) => {
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                    return Ok(0);
+                }
+                // No call is waiting for it (never was, or it was cancelled):
+                // Zircon leaves it on the endpoint as an ordinary message.
+                Err(msg) => msg,
+            }
         } else {
-            None
+            msg
         };
-        if let Some(sender) = waiting {
-            // A reply the caller can no longer take is not lost. The send
-            // fails when the call was cancelled between the lookup above and
-            // here (`ReplySlot::drop` closes the receiving half), and Zircon
-            // leaves a late reply on the endpoint as an ordinary message, so
-            // that is where it goes. The answer used to be `let _ =`: the
-            // message vanished and the endpoint never saw it.
-            return match sender.send(Ok(msg)) {
-                Ok(()) => Ok(0),
-                // The value comes back exactly as it was sent.
-                Err(Ok(msg)) => peer.push_general(msg),
-                Err(Err(e)) => Err(e),
-            };
-        }
         peer.push_general(msg)
     }
 
@@ -183,31 +253,23 @@ impl Channel {
     pub fn call_counted(
         self: &Arc<Self>,
         mut msg: T,
-    ) -> ZxResult<(usize, impl core::future::Future<Output = ZxResult<T>> + '_)> {
+    ) -> ZxResult<(usize, impl Future<Output = ZxResult<T>> + '_)> {
         assert!(msg.data.len() >= 4);
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         let txid = self.new_txid();
         msg.set_txid(txid);
-        let (sender, receiver) = oneshot::channel();
-        self.call_reply.lock().insert(txid, sender);
-        let mut slot = ReplySlot {
+        self.call_reply.lock().slots.push(ReplySlot {
+            txid,
+            state: SlotState::Waiting(None),
+        });
+        // From here on the slot belongs to the future: dropping it (an error
+        // below, a deadline, a killed thread) removes the slot.
+        let reply = ReplyFuture {
             channel: self,
             txid,
-            receiver: Some(receiver),
+            done: false,
         };
         let pending = peer.push_general(msg)?;
-        drop(peer);
-        let reply = async move {
-            let reply = {
-                let receiver = slot.receiver.as_mut().expect("just set");
-                receiver.await.unwrap_or(Err(ZxError::INTERNAL))
-            };
-            // The reply is in hand, so there is nothing left for `Drop` to
-            // put back on the endpoint.
-            slot.receiver = None;
-            drop(slot);
-            reply
-        };
         Ok((pending, reply))
     }
 
@@ -238,32 +300,53 @@ impl Channel {
     }
 }
 
-/// The reply slot of one `call`, removed when the call ends however it
+/// The reply of one `call`. Its slot goes when the call ends however it
 /// ends, so a cancelled call does not keep it.
-struct ReplySlot<'a> {
+struct ReplyFuture<'a> {
     channel: &'a Channel,
     txid: TxID,
-    /// The receiving half, held only so that a cancelled call can put back a
-    /// reply that had already been handed over to it. `None` once the call
-    /// has taken the reply itself.
-    receiver: Option<oneshot::Receiver<ZxResult<T>>>,
+    /// The reply has been taken, and the slot with it.
+    done: bool,
 }
 
-impl Drop for ReplySlot<'_> {
-    fn drop(&mut self) {
-        self.channel.call_reply.lock().remove(&self.txid);
-        let Some(mut receiver) = self.receiver.take() else {
-            return;
+impl Future for ReplyFuture<'_> {
+    type Output = ZxResult<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut table = self.channel.call_reply.lock();
+        let Some(i) = table.position(self.txid) else {
+            // Only `done` futures have no slot, and those are not polled.
+            return Poll::Ready(Err(ZxError::INTERNAL));
         };
-        // Closing first shuts the window the other way round: a writer that
-        // took the sender out of the map but has not sent yet now fails, and
-        // `write` queues its reply as an ordinary message.
-        receiver.close();
-        // And a reply that made it in before all that is put on the endpoint,
-        // where Zircon leaves a late reply. Dropping the receiver with a
-        // message inside it was a lost reply: the peer's `write` had answered
-        // `Ok`, and the endpoint never held anything.
-        if let Ok(Some(Ok(msg))) = receiver.try_recv() {
+        match &mut table.slots[i].state {
+            SlotState::Waiting(waker) => {
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                Poll::Pending
+            }
+            SlotState::Ready(_) => {
+                let reply = table.remove(self.txid).expect("just found");
+                drop(table);
+                self.done = true;
+                Poll::Ready(reply)
+            }
+        }
+    }
+}
+
+impl Drop for ReplyFuture<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let reply = self.channel.call_reply.lock().remove(self.txid);
+        // A reply that made it in before the call gave up is put on the
+        // endpoint, where Zircon leaves a late reply: dropping it was a lost
+        // reply, since the peer's `write` had answered `Ok`. The table's
+        // lock is released first; `push_general` takes the queue.
+        if let Some(Ok(msg)) = reply {
             // A full queue is the one case with nowhere to put it.
             let _ = self.channel.push_general(msg);
         }
@@ -275,8 +358,17 @@ impl Drop for Channel {
         if let Some(peer) = self.peer.upgrade() {
             peer.base
                 .signal_change(Signal::WRITABLE, Signal::PEER_CLOSED);
-            for (_, sender) in core::mem::take(&mut *peer.call_reply.lock()).into_iter() {
-                let _ = sender.send(Err(ZxError::PEER_CLOSED));
+            // Only the calls still waiting: one whose reply is already in
+            // keeps it. Woken once the table's lock is released.
+            let mut wakers = Vec::new();
+            for slot in peer.call_reply.lock().slots.iter_mut() {
+                if let SlotState::Waiting(waker) = &mut slot.state {
+                    wakers.extend(waker.take());
+                    slot.state = SlotState::Ready(Err(ZxError::PEER_CLOSED));
+                }
+            }
+            for waker in wakers {
+                waker.wake();
             }
         }
     }
@@ -719,27 +811,81 @@ mod tests {
         assert_eq!(&late.data[4..], b"pong");
     }
 
-    /// And the window in between: the writer has taken the sender out of the
-    /// map but has not sent yet when the call gives up, so the send fails.
-    /// `write` must not swallow that either -- it queues the reply as an
-    /// ordinary message.
+    /// A reply carrying a txid nobody is waiting for -- a call long gone, or
+    /// one that never was -- is an ordinary message, not dropped.
     ///
-    /// The state is built by hand, because reaching it for real needs two
-    /// threads: a slot in the map whose receiving half is already gone is
-    /// exactly what the writer finds if it loses that race.
+    /// (The oneshot this table replaced had a window where the writer held
+    /// the sender of a call being cancelled; every state change now happens
+    /// under the table's lock, so that window does not exist.)
     #[test]
-    fn a_reply_whose_send_finds_nobody_is_queued_instead_of_dropped() {
+    fn a_reply_nobody_waits_for_is_queued_instead_of_dropped() {
         let (channel0, channel1) = Channel::create();
-        let txid = 0x8000_0001;
-        let (sender, receiver) = oneshot::channel();
-        channel0.call_reply.lock().insert(txid, sender);
-        drop(receiver);
-        // `write` finds the slot, the send fails, and the reply has to land
-        // somewhere. It used to land nowhere and the call answered `Ok`.
-        channel1.write(reply_to(txid, b"pong")).unwrap();
+        channel1.write(reply_to(0x8000_0001, b"pong")).unwrap();
         let late = channel0.read().expect("the reply is on the endpoint");
-        assert_eq!(late.get_txid(), txid);
+        assert_eq!(late.get_txid(), 0x8000_0001);
         assert_eq!(&late.data[4..], b"pong");
+    }
+
+    /// A second reply for the same txid, after the first was handed to the
+    /// call but before the call took it, is not swallowed either.
+    #[test]
+    fn a_second_reply_for_the_same_call_is_queued() {
+        let (channel0, channel1) = Channel::create();
+        let mut call = call_in_flight(&channel0, b"txidping");
+        let txid = channel1.read().unwrap().get_txid();
+        channel1.write(reply_to(txid, b"one")).unwrap();
+        channel1.write(reply_to(txid, b"two")).unwrap();
+        match call.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(reply)) => assert_eq!(&reply.data[4..], b"one"),
+            _ => panic!("the call did not get the first reply"),
+        }
+        assert_eq!(&channel0.read().unwrap().data[4..], b"two");
+    }
+
+    /// A reply already handed to the call survives the peer closing before
+    /// the call takes it.
+    #[test]
+    fn a_delivered_reply_survives_the_peer_closing() {
+        let (channel0, channel1) = Channel::create();
+        let mut call = call_in_flight(&channel0, b"txidping");
+        let txid = channel1.read().unwrap().get_txid();
+        channel1.write(reply_to(txid, b"pong")).unwrap();
+        drop(channel1);
+        match call.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(reply)) => assert_eq!(&reply.data[4..], b"pong"),
+            _ => panic!("the delivered reply was lost"),
+        }
+    }
+
+    /// A call whose peer goes away while it waits is woken with
+    /// `PEER_CLOSED`, not left waiting.
+    #[test]
+    fn a_waiting_call_is_woken_when_the_peer_closes() {
+        extern crate std;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc as StdArc;
+        use std::task::Wake;
+        struct Flag(AtomicBool);
+        impl Wake for Flag {
+            fn wake(self: StdArc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = StdArc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let (channel0, channel1) = Channel::create();
+        let mut call: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>>>> =
+            Box::pin(channel0.call(message(b"txidping")));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        drop(channel1);
+        assert!(flag.0.load(Ordering::SeqCst), "the waiting call was woken");
+        match call.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(Err(ZxError::PEER_CLOSED)) => {}
+            _ => panic!("expected PEER_CLOSED"),
+        }
     }
 
     /// The txid counter wraps inside the kernel's half. It used to run off
