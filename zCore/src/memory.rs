@@ -525,12 +525,27 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // it is what the caller needs: these frames back `zx_vmo_create_contiguous`
     // and DMA buffers, where an unaligned buffer is worse than a refusal.
     let bytes = NonZeroUsize::new(want.max(align))?;
-    let (ptr, size) = {
+    let first = {
         let mut heap = HEAP.0.lock();
         #[cfg(feature = "mem-debug")]
         let _inside = lockcheck::Inside::enter();
-        heap.allocate::<u8>(align_order, bytes).ok()?
+        heap.allocate::<u8>(align_order, bytes).ok()
     };
+    // Small blocks parked in the heap's front caches are buddy memory too:
+    // give them back, off the heap lock, so they can merge into frames, and
+    // ask once more. The same recovery as the heap's own `alloc`.
+    #[cfg(not(feature = "mem-debug"))]
+    let first = first.or_else(|| {
+        // SAFETY: every drained block came out of this buddy with this
+        // layout (see `front`) and is free: nobody holds it while it is cached.
+        let given =
+            front::drain(|block, layout| unsafe { HEAP.0.lock().deallocate_layout(block, layout) });
+        if given == 0 {
+            return None;
+        }
+        HEAP.0.lock().allocate::<u8>(align_order, bytes).ok()
+    });
+    let (ptr, size) = first?;
     assert_eq!(size, bytes.get());
     let base = ptr.as_ptr() as usize;
     #[cfg(feature = "mem-debug")]
