@@ -21,6 +21,7 @@ mod file;
 mod flagged_fs;
 pub mod flock;
 mod fstab_line;
+mod handle_fd;
 pub mod hunter_config;
 pub mod hunter_feeds;
 mod inotify;
@@ -196,6 +197,7 @@ pub use eventfd::EventFd;
 pub use file::{
     cache_truncate, fs_grow_error, sync_shared_file_vmo, File, OpenFlags, PollEvents, SeekFrom,
 };
+pub use handle_fd::HandleFd;
 pub use inotify::{inotify_watch_lookup, Inotify, WatchLookup};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
