@@ -63,3 +63,8 @@ required-features = ["libos", "aspace-separate"]
 name = "task"
 harness = true
 required-features = ["libos", "aspace-separate"]
+
+[[bench]]
+name = "ipc"
+harness = true
+required-features = ["libos", "aspace-separate"]
