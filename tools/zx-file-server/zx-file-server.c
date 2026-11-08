@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +126,13 @@ struct open_file {
 
 static struct open_file table[MAX_OPEN];
 static zx_handle_t server_handle;
-static volatile long served, handed_back, bad_requests, done;
+// Written by the server thread, read by main after the join.
+static long served, handed_back, bad_requests;
+
+// How the server loop ended: still running, the peer closed (the only good
+// end), or an error from the channel.
+enum { RUNNING, PEER_CLOSED, FAILED };
+static atomic_int server_end = RUNNING;
 
 static long client_memory(uint64_t pid, uint64_t addr, void *buf, long len, int to_client) {
     return zx_status(zx(ECLIPSE_SYS_redirect_memory, server_handle, (long)pid, (long)addr,
@@ -218,11 +225,12 @@ static int serve(const struct request *req, int64_t *ret) {
                        : a[2] == SEEK_CUR ? (int64_t)f->off
                        : a[2] == SEEK_END ? (int64_t)f->file->size
                                           : -1;
-        int64_t to = base + (int64_t)a[1];
-        if (base < 0 || to < 0) {
+        int64_t delta = (int64_t)a[1];
+        if (base < 0 || delta < -base || (delta > 0 && delta > INT64_MAX - base)) {
             *ret = -EINVAL;
             return 1;
         }
+        int64_t to = base + delta;
         f->off = (uint64_t)to; // past the end reads 0 bytes, as on Linux
         *ret = to;
         return 1;
@@ -249,12 +257,20 @@ static void *server(void *unused) {
             r = zx_status(zx(ZX_SYS_object_wait_one, server_handle,
                              ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
                              ZX_TIME_INFINITE, (long)&observed, 0, 0));
-            if (r < 0 || !(observed & ZX_CHANNEL_READABLE))
-                break;
+            if (r < 0) {
+                atomic_store(&server_end, FAILED);
+                return NULL;
+            }
+            if (!(observed & ZX_CHANNEL_READABLE)) {
+                atomic_store(&server_end, PEER_CLOSED);
+                return NULL;
+            }
             continue;
         }
-        if (r < 0)
-            break;
+        if (r < 0) {
+            atomic_store(&server_end, FAILED);
+            return NULL;
+        }
         struct reply rep = {.txid = req.txid};
         if (got != sizeof req || req.kind != REDIRECT_KIND_SYSCALL) {
             bad_requests++;
@@ -266,11 +282,11 @@ static void *server(void *unused) {
             handed_back++;
         }
         if (zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)&rep, sizeof rep,
-                         0, 0)) < 0)
-            break;
+                         0, 0)) < 0) {
+            atomic_store(&server_end, FAILED);
+            return NULL;
+        }
     }
-    done = 1;
-    return NULL;
 }
 
 // ---- the client ------------------------------------------------------------
@@ -401,15 +417,6 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof big; i++)
         big[i] = (unsigned char)(i * 7);
 
-    // The native file to compare with, the same size as /srv/page.
-    const char *native = "/tmp/zx-file-server.native";
-    int nfd = open(native, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (nfd < 0 || write(nfd, page, sizeof page) != (ssize_t)sizeof page) {
-        fprintf(stderr, "zx-file-server: cannot make %s: %s\n", native, strerror(errno));
-        return 1;
-    }
-    close(nfd);
-
     zx_handle_t a = 0, b = 0;
     long r = zx_status(zx(ZX_SYS_channel_create, 0, (long)&a, (long)&b, 0, 0, 0));
     if (r == -ENOSYS) {
@@ -420,14 +427,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "zx-file-server: channel_create failed: %ld\n", r);
         return 1;
     }
+    // The native file to compare with, the same size as /srv/page: a new
+    // file of our own, never one that was already there.
+    char native[] = "/tmp/zx-file-server.XXXXXX";
+    int nfd = mkstemp(native);
+    if (nfd < 0 || write(nfd, page, sizeof page) != (ssize_t)sizeof page) {
+        fprintf(stderr, "zx-file-server: cannot make %s: %s\n", native, strerror(errno));
+        if (nfd >= 0)
+            unlink(native);
+        return 1;
+    }
+    close(nfd);
+
     long fd = zx_status(zx(ECLIPSE_SYS_handle_to_fd, a, 0, 0, 0, 0, 0));
     if (fd < 0) {
         fprintf(stderr, "zx-file-server: handle_to_fd failed: %ld\n", fd);
+        unlink(native);
         return 1;
     }
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
+        unlink(native);
         return 1;
     }
     if (pid == 0)
@@ -442,14 +463,19 @@ int main(int argc, char **argv) {
     }
     int status = 0;
     waitpid(pid, &status, 0);
-    for (int i = 0; i < 200 && !done; i++)
+    for (int i = 0; i < 200 && atomic_load(&server_end) == RUNNING; i++)
         usleep(10000);
     unlink(native);
-    if (!done) {
+    int end = atomic_load(&server_end);
+    if (end == RUNNING) {
         fprintf(stderr, "zx-file-server: the server's peer did not close after the child was reaped\n");
         return 1;
     }
     pthread_join(t, NULL);
+    if (end != PEER_CLOSED) {
+        fprintf(stderr, "zx-file-server: the server stopped on a channel error\n");
+        return 1;
+    }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "zx-file-server: the child failed (status %#x)\n", status);
         return 1;
