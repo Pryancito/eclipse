@@ -59,6 +59,8 @@ mod reclaimd;
 // `allow(dead_code)` at the top covers that.
 #[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+mod ipc_bench;
 mod utils;
 
 cfg_if! {
@@ -84,6 +86,9 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(feature = "linux", not(feature = "libos")))]
 static TLBHAMMER_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Round trips per case for `eclipse.ipcbench=N` (see ipc_bench.rs); 0 = off.
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+static IPCBENCH_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(not(any(feature = "libos")), feature = "mock-disk"))]
 static MOCK_CORE: AtomicBool = AtomicBool::new(false);
@@ -600,6 +605,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         if let Some(n) = tlb_hammer::parse_tlbhammer(&options.cmdline) {
             // Stash N in a static; spawn after primary_init / executor is live.
             TLBHAMMER_N.store(n as u64, Ordering::Relaxed);
+        }
+        // Kernel channel call/reply benchmark (see ipc_bench.rs).
+        #[cfg(all(feature = "linux", not(feature = "libos")))]
+        if let Some(n) = ipc_bench::parse_ipcbench(&options.cmdline) {
+            IPCBENCH_N.store(n as u64, Ordering::Relaxed);
         }
     }
     // Deadlock self-report: any CPU spinning >~8s on a kernel spinlock paints
@@ -1503,6 +1513,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 let n = TLBHAMMER_N.load(Ordering::Relaxed);
                 if n > 0 {
                     tlb_hammer::start(n as usize);
+                }
+                let n = IPCBENCH_N.load(Ordering::Relaxed);
+                if n > 0 {
+                    ipc_bench::start(n as usize);
                 }
             }
             // Under `baremetal-test` the run ends when the lifetime process
