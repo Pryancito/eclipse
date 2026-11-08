@@ -26,6 +26,11 @@ executor = { path = "../vendor/PreemptiveScheduler" }
 default = ["libos", "linux", "zircon"]
 linux = ["linux-object", "linux-syscall"]
 zircon = ["zircon-syscall", "xmas-elf"]
+# Zircon syscalls for Linux-personality processes, behind a reserved number
+# range (see `linux::ZIRCON_GATEWAY_BASE`): what a userspace server or driver
+# needs to hold channels, ports, VMOs and interrupts. Off at run time unless
+# the kernel command line says `zircon.gateway=1`.
+zircon-gateway = ["linux", "zircon-syscall"]
 # `zircon-object/libos` is what lets `vmar.rs` know it must map eagerly (see
 # the `map_range || cfg!(feature = "libos")` there); it only forwards
 # `kernel-hal/libos`, which this list already turns on.
