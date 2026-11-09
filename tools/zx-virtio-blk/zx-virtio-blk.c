@@ -16,9 +16,12 @@
 // lost, so give it a scratch image.
 //
 //   zx-virtio-blk [N [ROUNDS]]  (defaults: disk 0, 2 passes)
+//   zx-virtio-blk serve [N [ROUNDS]]
 //   zx-virtio-blk /dev/vdX [OFFSET_MIB]
 //
-// The second form is the baseline: the same reads through the kernel's
+// With `serve` the driver goes on to serve the disk to another process,
+// over a FIFO and a window of its DMA memory, and that process checks and
+// times it (see "Serving another process" below). The third form is the baseline: the same reads through the kernel's
 // driver, with pread on its block device, starting OFFSET_MIB into it
 // (default 0). The first pass is what reaches the device (the kernel
 // caches what it reads, and reads ahead); the second is served from the
@@ -27,7 +30,7 @@
 // Run it on Eclipse booted with `zircon.gateway=1` and the udriver
 // option. Exit status: 0 on success, 2 when the gateway is off, 1 on error.
 //
-// A prototype: one queue, one request in flight.
+// A prototype: one queue, one request in flight, one client.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,6 +40,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +52,19 @@
 #define ZX_SYS_interrupt_wait 54
 #define ZX_SYS_handle_close 45
 #define ZX_SYS_vmo_create_contiguous 193
+#define ZX_SYS_vmo_create_child 192
+#define ZX_SYS_fifo_create 34
+#define ZX_SYS_fifo_read 35
+#define ZX_SYS_fifo_write 36
+#define ZX_SYS_object_wait_one 81
+#define ZX_VMO_CHILD_SLICE (1u << 3)
+#define ZX_FIFO_READABLE (1u << 0)
+#define ZX_FIFO_PEER_CLOSED (1u << 2)
+#define ZX_TIME_INFINITE INT64_MAX
+#define ZX_ERR_SHOULD_WAIT (-22)
+#define ZX_ERR_PEER_CLOSED (-24)
+#define ECLIPSE_SYS_fd_to_handle 0x4001
+#define ECLIPSE_FD_TAKE 1
 
 #define ECLIPSE_SYS_handle_to_fd 0x4000
 #define ECLIPSE_SYS_device_claim 0x4005
@@ -150,6 +167,9 @@ typedef uint32_t zx_handle_t;
 
 static long zx(long n, long a, long b, long c, long d) {
     return syscall(ZX_GATEWAY_BASE + n, a, b, c, d);
+}
+static long zx6(long n, long a, long b, long c, long d, long e, long f) {
+    return syscall(ZX_GATEWAY_BASE + n, a, b, c, d, e, f);
 }
 static long zx8(long n, const long args[8]) {
     return syscall(ZX_GATEWAY_BASE + (n | ZX_GATEWAY_INDIRECT), args);
@@ -288,7 +308,7 @@ static void ack_device(void) {
 // One request, start to end: three descriptors (header, data, status),
 // one notify, then either waits on the interrupt or a spin on the used
 // ring until the device has put it there.
-static int do_io(uint32_t type, uint64_t sector, size_t len) {
+static int do_io_at(uint32_t type, uint64_t sector, size_t len, size_t off) {
     struct blk_req *req = (struct blk_req *)(dma + DMA_REQ);
     volatile uint8_t *status = dma + DMA_REQ + sizeof *req;
     req->type = type;
@@ -296,7 +316,7 @@ static int do_io(uint32_t type, uint64_t sector, size_t len) {
     req->sector = sector;
     *status = 0xff;
     desc[0] = (struct virtq_desc){daddr + DMA_REQ, sizeof *req, VIRTQ_DESC_F_NEXT, 1};
-    desc[1] = (struct virtq_desc){daddr + DMA_DATA, (uint32_t)len,
+    desc[1] = (struct virtq_desc){daddr + DMA_DATA + off, (uint32_t)len,
                                   VIRTQ_DESC_F_NEXT |
                                       (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0),
                                   2};
@@ -340,6 +360,10 @@ static int do_io(uint32_t type, uint64_t sector, size_t len) {
     mb();
     last_used++;
     return *status == VIRTIO_BLK_S_OK ? 0 : -1;
+}
+
+static int do_io(uint32_t type, uint64_t sector, size_t len) {
+    return do_io_at(type, sector, len, 0);
 }
 
 struct claim {
@@ -391,10 +415,259 @@ static int kernel_baseline(const char *path, long offset_mib) {
     return 0;
 }
 
+// ---- Serving another process ------------------------------------------
+//
+// `zx-virtio-blk serve N` brings the disk up as above and then serves it
+// to a client: a process of its own (this program again, exec'd with
+// `client`) that holds no device, no BTI and none of the driver's memory,
+// only two descriptors. One is the data window, a slice of the driver's
+// DMA memory that the device reads and writes directly -- no copy on
+// either side. The other is one end of a FIFO of 32-byte messages, the
+// shape of Zircon's block FIFO: a request names an operation, a range of
+// sectors and where in the window the data is; the same message comes
+// back with a status.
+//
+// Each side either sleeps on the FIFO (zx_object_wait_one) or spins on
+// zx_fifo_read; a MODE message from the client picks how the driver
+// waits, on the FIFO and on the device, so that one run times every
+// combination.
+
+#define BLK_OP_READ 1
+#define BLK_OP_WRITE 2
+#define BLK_OP_MODE 3 // sector: BLK_MODE_* bits; no data
+#define BLK_MODE_SPIN 1 // the driver spins on the FIFO instead of sleeping
+#define BLK_MODE_IRQ 2  // the driver sleeps on the device's interrupt
+#define FIFO_DEPTH 16
+
+struct blk_msg {
+    uint32_t op, reqid;
+    uint32_t sectors, buf_off; // buf_off: bytes into the data window
+    uint64_t sector;
+    int64_t status; // 0 or a negative zx_status_t, on the way back
+};
+_Static_assert(sizeof(struct blk_msg) == 32, "a FIFO element is 32 bytes");
+
+#define ZX_ERR_INVALID_ARGS (-10)
+#define ZX_ERR_OUT_OF_RANGE (-14)
+#define ZX_ERR_IO (-40)
+
+static long fifo_read(zx_handle_t f, struct blk_msg *m, size_t n, size_t *got) {
+    return zx_status(zx6(ZX_SYS_fifo_read, f, sizeof *m, (long)m, n, (long)got, 0));
+}
+static long fifo_write(zx_handle_t f, const struct blk_msg *m, size_t n, size_t *put) {
+    return zx_status(zx6(ZX_SYS_fifo_write, f, sizeof *m, (long)m, n, (long)put, 0));
+}
+
+// Wait for something to read on `f`, sleeping or spinning; 0 once there is,
+// -1 once the other side has gone.
+static int fifo_wait(zx_handle_t f, int spin, struct blk_msg *m, size_t n, size_t *got) {
+    for (;;) {
+        long r = fifo_read(f, m, n, got);
+        if (r == 0)
+            return 0;
+        if (r != ZX_ERR_SHOULD_WAIT)
+            return -1;
+        if (spin)
+            continue;
+        uint32_t observed = 0;
+        r = zx_status(zx6(ZX_SYS_object_wait_one, f, ZX_FIFO_READABLE | ZX_FIFO_PEER_CLOSED,
+                          ZX_TIME_INFINITE, (long)&observed, 0, 0));
+        if (r < 0 || !(observed & ZX_FIFO_READABLE))
+            return -1;
+    }
+}
+
+static int64_t serve_one(struct blk_msg *m, int *spin) {
+    if (m->op == BLK_OP_MODE) {
+        *spin = (m->sector & BLK_MODE_SPIN) != 0;
+        use_irq = (m->sector & BLK_MODE_IRQ) && irq_handle;
+        return 0;
+    }
+    if (m->op != BLK_OP_READ && m->op != BLK_OP_WRITE)
+        return ZX_ERR_INVALID_ARGS;
+    uint64_t len = (uint64_t)m->sectors * SECTOR;
+    // The client's word, all of it: nothing reaches the device that does
+    // not fit the window and the disk.
+    if (m->sectors == 0 || m->buf_off % SECTOR || len > DATA_MAX ||
+        m->buf_off > DATA_MAX - len)
+        return ZX_ERR_OUT_OF_RANGE;
+    if (m->sector > capacity || m->sectors > capacity - m->sector)
+        return ZX_ERR_OUT_OF_RANGE;
+    uint32_t type = m->op == BLK_OP_READ ? VIRTIO_BLK_T_IN : VIRTIO_BLK_T_OUT;
+    return do_io_at(type, m->sector, len, m->buf_off) ? ZX_ERR_IO : 0;
+}
+
+// Serve `f` until the client closes it. Returns the requests served.
+static uint64_t serve(zx_handle_t f) {
+    struct blk_msg m[FIFO_DEPTH];
+    int spin = 0;
+    uint64_t served = 0;
+    size_t got;
+    use_irq = 0;
+    while (fifo_wait(f, spin, m, FIFO_DEPTH, &got) == 0) {
+        for (size_t i = 0; i < got; i++)
+            m[i].status = serve_one(&m[i], &spin);
+        served += got;
+        size_t put = 0;
+        // The client never has more than FIFO_DEPTH outstanding, so the
+        // replies always fit.
+        if (fifo_write(f, m, got, &put) != 0 || put != got)
+            break;
+    }
+    return served;
+}
+
+// The client side: the FIFO and the window come as descriptors.
+static zx_handle_t cfifo;
+static uint8_t *window;
+static uint32_t next_id;
+
+static int64_t client_call(uint32_t op, uint64_t sector, uint32_t sectors, uint32_t off,
+                           int spin) {
+    struct blk_msg m = {op, ++next_id, sectors, off, sector, 0};
+    size_t n = 0;
+    if (fifo_write(cfifo, &m, 1, &n) != 0 || n != 1)
+        die("fifo_write", 0);
+    struct blk_msg back;
+    if (fifo_wait(cfifo, spin, &back, 1, &n) != 0)
+        die("the driver went away", 0);
+    if (back.reqid != m.reqid)
+        die("a reply to another request", back.reqid);
+    return back.status;
+}
+
+static double client_time(uint32_t sectors, uint64_t span, int rounds, int spin) {
+    uint64_t n = 0, t0 = now_ns();
+    for (int r = 0; r < rounds; r++)
+        for (uint64_t s = 0; s + sectors <= span; s += sectors, n++)
+            if (client_call(BLK_OP_READ, s, sectors, 0, spin))
+                die("served read failed at sector", (long)s);
+    return (double)(now_ns() - t0) / n;
+}
+
+static int client_main(int fifo_fd, int data_fd, uint64_t disk_sectors, int rounds) {
+    if (zx_status(zx(ECLIPSE_SYS_fd_to_handle, fifo_fd, ECLIPSE_FD_TAKE, (long)&cfifo, 0)) < 0)
+        die("client: fd_to_handle", errno);
+    close(fifo_fd);
+    window = mmap(NULL, DATA_MAX, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0);
+    close(data_fd);
+    if (window == MAP_FAILED)
+        die("client: mmap the window", errno);
+
+    // What the driver wrote over the tail, read back through it: a sector
+    // at a time into different places in the window, then in one piece.
+    uint64_t tail = disk_sectors - 32;
+    int bad = 0;
+    memset(window, 0, DATA_MAX);
+    for (int s = 0; s < 32; s++)
+        if (client_call(BLK_OP_READ, tail + s, 1, (uint32_t)(s * SECTOR), 0))
+            die("client: read failed", s);
+    for (size_t i = 0; i < 32 * SECTOR; i++)
+        if (window[i] != (uint8_t)(i * 7 + (i >> 9)))
+            bad++;
+    // A write from the window, and the read that brings it back.
+    for (size_t i = 0; i < 8 * SECTOR; i++)
+        window[DATA_MAX / 2 + i] = (uint8_t)(i * 13 + 5);
+    if (client_call(BLK_OP_WRITE, tail, 8, DATA_MAX / 2, 0))
+        die("client: write failed", 0);
+    memset(window, 0, 8 * SECTOR);
+    if (client_call(BLK_OP_READ, tail, 8, 0, 0))
+        die("client: read failed", 0);
+    for (size_t i = 0; i < 8 * SECTOR; i++)
+        if (window[i] != (uint8_t)(i * 13 + 5))
+            bad++;
+    if (bad) {
+        printf("zx-virtio-blk: FAIL: %d bytes served wrong\n", bad);
+        return 1;
+    }
+    // And what the driver must refuse rather than hand to the device.
+    if (client_call(BLK_OP_READ, disk_sectors - 1, 2, 0, 0) != ZX_ERR_OUT_OF_RANGE ||
+        client_call(BLK_OP_READ, 0, 1, DATA_MAX, 0) != ZX_ERR_OUT_OF_RANGE ||
+        client_call(BLK_OP_READ, 0, 1, 100, 0) != ZX_ERR_OUT_OF_RANGE ||
+        client_call(BLK_OP_READ, 0, 0, 0, 0) != ZX_ERR_OUT_OF_RANGE ||
+        client_call(9, 0, 1, 0, 0) != ZX_ERR_INVALID_ARGS)
+        die("client: a bad request was not refused", 0);
+    printf("zx-virtio-blk: served from another process: reads, a write, bad requests refused\n");
+
+    uint64_t span = disk_sectors < 2048 ? disk_sectors : 2048;
+    static const struct {
+        uint32_t mode;
+        int spin;
+        const char *name;
+    } modes[] = {
+        {BLK_MODE_IRQ, 0, "all asleep (irq, FIFO)"},
+        {0, 0, "device polled, FIFO asleep"},
+        {BLK_MODE_SPIN, 1, "all spinning"},
+    };
+    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+        if (client_call(BLK_OP_MODE, modes[i].mode, 0, 0, 0))
+            die("client: mode refused", (long)i);
+        double one = client_time(1, span, rounds, modes[i].spin);
+        double four = client_time(8, span, rounds, modes[i].spin);
+        printf("zx-virtio-blk: served, %-28s read 512 B %7.1f us, 4 KiB %7.1f us\n",
+               modes[i].name, one / 1000, four / 1000);
+        // Back to sleeping before the next mode, or a spinning driver would
+        // spin through the client's next MODE message's wake.
+        if (modes[i].spin && client_call(BLK_OP_MODE, 0, 0, 0, 1))
+            die("client: mode refused", (long)i);
+    }
+    return 0;
+}
+
+// Hand the disk to a client process and serve it until the client is done.
+//
+// `data_fd` is the data window, cut from the DMA memory before that was
+// mapped (mapping it takes the handle).
+static int serve_client(const char *self, int data_fd, int rounds) {
+    zx_handle_t ends[2];
+    long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct blk_msg), 0, (long)&ends[0],
+                      (long)&ends[1], 0));
+    if (r != 0)
+        die("fifo_create", r);
+    long fifo_fd = zx_status(zx(ECLIPSE_SYS_handle_to_fd, ends[1], 0, 0, 0));
+    if (fifo_fd < 0)
+        die("handle_to_fd (fifo)", fifo_fd);
+    char a_fifo[16], a_data[16], a_cap[24], a_rounds[16];
+    snprintf(a_fifo, sizeof a_fifo, "%ld", fifo_fd);
+    snprintf(a_data, sizeof a_data, "%d", data_fd);
+    snprintf(a_cap, sizeof a_cap, "%llu", (unsigned long long)capacity);
+    snprintf(a_rounds, sizeof a_rounds, "%d", rounds);
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork", errno);
+    if (pid == 0) {
+        // exec, not just fork: the client starts with none of the driver's
+        // mappings -- registers, queue, the whole DMA area -- only the two
+        // descriptors it was given.
+        execl(self, self, "client", a_fifo, a_data, a_cap, a_rounds, (char *)NULL);
+        printf("zx-virtio-blk: exec %s: %s\n", self, strerror(errno));
+        _exit(1);
+    }
+    close((int)fifo_fd);
+    close(data_fd);
+    uint64_t served = serve(ends[0]);
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        printf("zx-virtio-blk: FAIL: the client failed (status %#x)\n", st);
+        return 1;
+    }
+    printf("zx-virtio-blk: served %llu requests\n", (unsigned long long)served);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    const char *self = strchr(argv[0], '/') ? argv[0] : "/bin/zx-virtio-blk";
     if (argc > 1 && argv[1][0] == '/')
         return kernel_baseline(argv[1], argc > 2 ? atol(argv[2]) : 0);
+    if (argc == 6 && !strcmp(argv[1], "client"))
+        return client_main(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 0),
+                           atoi(argv[5]));
+    int serving = argc > 1 && !strcmp(argv[1], "serve");
+    if (serving) {
+        argv++;
+        argc--;
+    }
     long index = argc > 1 ? atol(argv[1]) : 0;
     int rounds = argc > 2 ? atoi(argv[2]) : 2;
     struct claim c;
@@ -420,6 +693,19 @@ int main(int argc, char **argv) {
     r = zx_status(zx8(ZX_SYS_bti_pin, pin));
     if (r != 0)
         die("bti_pin", r);
+    int slice = -1; // the data window, as a descriptor
+    if (serving) {
+        zx_handle_t h;
+        r = zx_status(zx6(ZX_SYS_vmo_create_child, vmo, ZX_VMO_CHILD_SLICE, DMA_DATA, DATA_MAX,
+                          (long)&h, 0));
+        if (r != 0)
+            die("vmo_create_child (slice)", r);
+        // Into a descriptor now: that is how it travels.
+        long fd = zx_status(zx(ECLIPSE_SYS_handle_to_fd, h, 0, 0, 0));
+        if (fd < 0)
+            die("handle_to_fd (slice)", fd);
+        slice = (int)fd;
+    }
     dma = map_handle(vmo, DMA_SIZE);
     memset(dma, 0, DMA_SIZE);
     desc = (struct virtq_desc *)(dma + DMA_QUEUE);
@@ -514,6 +800,8 @@ int main(int argc, char **argv) {
                        to_wake_ns / 1000.0 / slept);
         }
     }
+    if (serving && serve_client(self, slice, rounds))
+        return 1;
     printf("zx-virtio-blk: all checks passed\n");
     return 0;
 }
