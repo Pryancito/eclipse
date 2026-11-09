@@ -209,6 +209,15 @@ hal_fn_impl! {
                 // that address space would filter it out -- a missed
                 // invalidation, which is the one failure this whole mechanism
                 // is arranged to never have.
+                // Already the one loaded: nothing to switch, and nothing on
+                // this core to retire (what goes stale while a table stays
+                // loaded is the shootdowns' to invalidate, as on x86_64 and
+                // riscv64, which have always skipped a reload of the root
+                // they hold). This used to flush the whole TLB on every poll
+                // of a user thread, resumed on the core it ran on or not.
+                if TTBR0_EL1.get() as usize & PHYS_ADDR_MASK == vmtoken {
+                    return;
+                }
                 crate::common::ipi::note_active_vmtoken(vmtoken);
                 TTBR0_EL1.set(vmtoken as _);
             } else {
@@ -240,6 +249,10 @@ hal_fn_impl! {
 
         fn current_vmtoken() -> PhysAddr {
             TTBR1_EL1.get() as _
+        }
+
+        fn loaded_user_vmtoken() -> PhysAddr {
+            TTBR0_EL1.get() as usize & PHYS_ADDR_MASK
         }
 
         fn pin_kernel_vmtoken() {

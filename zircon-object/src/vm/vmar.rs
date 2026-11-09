@@ -1562,6 +1562,14 @@ impl VmAddressRegion {
         self.page_table.lock().table_phys()
     }
 
+    /// The underlying page table itself, for a CPU that keeps it loaded
+    /// and must keep it from being freed meanwhile (see
+    /// `kernel_hal::vm::pin_user_root`).
+    #[cfg(target_os = "none")]
+    pub(crate) fn page_table(&self) -> Arc<Mutex<dyn GenericPageTable>> {
+        self.page_table.clone()
+    }
+
     /// Get start address of this VMAR.
     pub fn addr(&self) -> usize {
         self.addr

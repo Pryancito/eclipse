@@ -194,12 +194,14 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         // read when there is nothing to undo.
         kernel_hal::timer::timer_idle_exit();
         // Lazy-TLB restore point: this CPU is about to idle (or steal work),
-        // so drop any lingering user CR3 and return to the kernel page table.
+        // so drop any lingering user CR3 and return to the kernel page table,
+        // unless the table loaded is one the thread switch holds alive
+        // (`kernel_hal::vm::pin_user_root`): then no process exit can free it
+        // under this CPU, and keeping it saves the flush here and the one
+        // when the thread that slept is woken and its table loaded again.
         // `ThreadSwitchFuture::poll` no longer restores the kernel CR3 after
-        // every poll (that TLB flush dominated yield/syscall latency); it is
-        // restored here instead, before the CPU can halt with a user CR3 that
-        // a concurrent process exit might later free.
-        kernel_hal::vm::activate_kernel_paging();
+        // every poll (that TLB flush dominated yield/syscall latency).
+        kernel_hal::vm::release_user_paging_for_idle();
         let had_jobs = kernel_hal::deferred_job::pending_deferred_jobs() > 0;
         // Record the idle-callback hit rate so `/proc/perf/kernel` can show
         // whether the CPUs keep finding deferred work (busy-spin = heat) or

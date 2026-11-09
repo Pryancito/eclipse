@@ -377,6 +377,56 @@ pub fn should_restore_kernel_table(loaded_user_root: PhysAddr, kernel_root: Phys
         && loaded_user_root & !0xfff != kernel_root & !0xfff
 }
 
+/// The user root each CPU may keep loaded while it idles, 0 for none.
+static PINNED_USER_ROOT: [core::sync::atomic::AtomicUsize; crate::config::MAX_CORE_NUM] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::config::MAX_CORE_NUM];
+
+/// Say that the caller holds the user page table rooted at `root` alive
+/// for as long as this CPU may have it loaded (0: nothing is held).
+///
+/// That is what [`release_user_paging_for_idle`] needs to keep the table
+/// loaded instead of dropping it, and the whole of the promise
+/// [`should_restore_kernel_table`] keeps by dropping it: a table cannot be
+/// freed while a CPU translates through it. With the table pinned, a
+/// process exit elsewhere unmaps what it maps (with the shootdowns every
+/// CPU noted as running that address space receives, this one included)
+/// but cannot free the root, so this CPU's registers never point at freed
+/// memory.
+///
+/// The caller must publish the pin only after it holds the reference, and
+/// clear or replace it before it lets the reference go.
+pub fn pin_user_root(root: PhysAddr) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if let Some(slot) = PINNED_USER_ROOT.get(cpu) {
+        slot.store(root, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether the idle restore point has to drop `loaded`, the user root this
+/// CPU translates through: only when it is not the one pinned here.
+pub fn idle_must_drop(loaded: PhysAddr, pinned: PhysAddr) -> bool {
+    loaded & !0xfff == 0 || pinned & !0xfff == 0 || loaded & !0xfff != pinned & !0xfff
+}
+
+/// The idle restore point: [`crate::vm::activate_kernel_paging`], unless
+/// the user table this CPU has loaded is one [`pin_user_root`] keeps alive.
+///
+/// Dropping it costs two full TLB flushes per sleep: one here, and one when
+/// the thread that slept comes back and its table is loaded again. A
+/// thread that blocks and is woken by an interrupt pays both on every
+/// wake, and under QEMU a full flush is tens of microseconds of refills
+/// (the userspace virtio-blk driver's interrupt-to-driver time went from
+/// about 90 to about 40 us on aarch64 without them).
+pub fn release_user_paging_for_idle() {
+    let cpu = crate::cpu::cpu_id() as usize;
+    let pinned = PINNED_USER_ROOT
+        .get(cpu)
+        .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Acquire));
+    if idle_must_drop(crate::vm::loaded_user_vmtoken(), pinned) {
+        crate::vm::activate_kernel_paging();
+    }
+}
+
 /// Every [`PageSize`] is used as a mask: `align_down` and `page_offset` do
 /// `addr & !(size - 1)` and `addr & (size - 1)`, which is only the intended
 /// arithmetic while each value is a power of two. A new variant that is not
@@ -887,6 +937,22 @@ mod lazy_tlb_restore_tests {
         assert!(!should_restore_kernel_table(0xfff, KERNEL));
         // One frame along really is another table.
         assert!(should_restore_kernel_table(KERNEL + 0x1000, KERNEL));
+    }
+
+    #[test]
+    fn idle_keeps_only_the_table_this_cpu_holds() {
+        const OTHER: usize = 0x9_0000;
+        // The one pinned stays loaded, flag bits or not.
+        assert!(!idle_must_drop(USER, USER));
+        assert!(!idle_must_drop(USER | 0x5, USER));
+        // Anything else goes: another process's table, which nothing here
+        // keeps alive, or any table when nothing is pinned.
+        assert!(idle_must_drop(OTHER, USER));
+        assert!(idle_must_drop(USER, 0));
+        // Nothing loaded is never "the pinned one": the restore point then
+        // decides on its own that there is nothing to drop.
+        assert!(idle_must_drop(0, 0));
+        assert!(idle_must_drop(0, USER));
     }
 
     #[test]

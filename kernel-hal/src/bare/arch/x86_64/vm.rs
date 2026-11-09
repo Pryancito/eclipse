@@ -34,6 +34,10 @@ hal_fn_impl! {
             }
         }
 
+        fn loaded_user_vmtoken() -> PhysAddr {
+            current_vmtoken()
+        }
+
         fn current_vmtoken() -> PhysAddr {
             Cr3::read().0.start_address().as_u64() as _
         }

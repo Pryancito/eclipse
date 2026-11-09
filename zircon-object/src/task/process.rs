@@ -1175,6 +1175,19 @@ impl Process {
         self.space.lock().vmar.table_phys()
     }
 
+    /// [`user_table`](Self::user_table), and the page table it is the root
+    /// of, which the caller keeps alive while a CPU may have it loaded.
+    #[cfg(target_os = "none")]
+    pub(super) fn user_table_pinned(
+        &self,
+    ) -> (
+        kernel_hal::PhysAddr,
+        Arc<lock::Mutex<dyn kernel_hal::vm::GenericPageTable>>,
+    ) {
+        let space = self.space.lock();
+        (space.vmar.table_phys(), space.vmar.page_table())
+    }
+
     /// The address space an `execve` loads its new image into: this
     /// process's own, as it is. One it shares -- a `vfork` child's, or the
     /// parent's while that child has not exec'd -- is left to the other and
