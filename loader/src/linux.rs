@@ -495,12 +495,17 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   register window, and maps through `eclipse_handle_to_fd` and `mmap`.
 ///   The BTI is what `zx_vmo_create_contiguous` and `zx_bti_pin` want for
 ///   DMA memory and its device addresses.
-/// - word 1: the transport (low half: 1 = legacy virtio-mmio) and the
+/// - word 1: the transport (low half: 1 = legacy virtio-mmio, 2 = modern
+///   virtio-pci) and the
 ///   interrupt line (high half, `u32::MAX` when unknown).
 /// - word 2: where the window starts inside the VMO.
 /// - word 3: the window's size.
-/// - words 4 to 7: what the transport needs besides; zero for virtio-mmio,
-///   which keeps everything in its one window.
+/// - words 4 to 7: what the transport needs besides. Zero for virtio-mmio,
+///   which keeps everything in its one window. For modern virtio-pci (2),
+///   where the window is the memory BAR holding the four structures: the
+///   offsets in the window of the common (low) and notify (high)
+///   structures, of the ISR (low) and device (high) ones, then
+///   `notify_off_multiplier`, then zero.
 ///
 /// `kind` 1 is a virtio block device. `NOT_FOUND` when no such device was
 /// reserved, `ALREADY_BOUND` once something has claimed it: one driver per
@@ -525,6 +530,10 @@ pub const ECLIPSE_DEVICE_VIRTIO_BLK: usize = 1;
 /// [`ECLIPSE_DEVICE_CLAIM`] transport: legacy virtio over MMIO.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_TRANSPORT_VIRTIO_MMIO: u64 = 1;
+
+/// [`ECLIPSE_DEVICE_CLAIM`] transport: modern virtio over PCI.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_TRANSPORT_VIRTIO_PCI: u64 = 2;
 
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
 /// `ZX_CHANNEL_MAX_MSG_BYTES`.
@@ -818,19 +827,35 @@ fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let bti = BusTransactionInitiator::create(Iommu::create(), 0);
     let regs = proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO));
     let bti = proc.add_handle(Handle::new(bti, Rights::DEFAULT_BTI));
-    let transport = match device.transport {
-        Transport::VirtioMmio => ECLIPSE_TRANSPORT_VIRTIO_MMIO,
+    let pair = |lo: u32, hi: u32| lo as u64 | (hi as u64) << 32;
+    let (transport, extra) = match device.transport {
+        Transport::VirtioMmio => (ECLIPSE_TRANSPORT_VIRTIO_MMIO, [0; 4]),
+        Transport::VirtioPci {
+            common,
+            notify,
+            isr,
+            device,
+            notify_multiplier,
+        } => (
+            ECLIPSE_TRANSPORT_VIRTIO_PCI,
+            [
+                pair(common, notify),
+                pair(isr, device),
+                notify_multiplier as u64,
+                0,
+            ],
+        ),
     };
     let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
     let words: [u64; CLAIM_WORDS] = [
-        regs as u64 | (bti as u64) << 32,
+        pair(regs, bti),
         transport | (irq as u64) << 32,
         (device.paddr - base) as u64,
         device.size as u64,
-        0,
-        0,
-        0,
-        0,
+        extra[0],
+        extra[1],
+        extra[2],
+        extra[3],
     ];
     if out.write_array(&words).is_err() {
         let _ = proc.remove_handle(regs);

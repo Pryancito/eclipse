@@ -36,6 +36,7 @@
 #define ECLIPSE_SYS_device_claim 0x4005
 #define ECLIPSE_DEVICE_VIRTIO_BLK 1
 #define ECLIPSE_TRANSPORT_VIRTIO_MMIO 1
+#define ECLIPSE_TRANSPORT_VIRTIO_PCI 2
 
 #define ZX_BTI_PERM_READ (1u << 0)
 #define ZX_BTI_PERM_WRITE (1u << 1)
@@ -52,6 +53,9 @@
 #define VIRTIO_MMIO_CONFIG 0x100
 #define VIRTIO_MAGIC 0x74726976
 #define VIRTIO_ID_BLOCK 2
+
+// Modern virtio-pci common configuration (virtio 1.1 §4.1.4.3).
+#define VIRTIO_PCI_NUM_QUEUES 0x12
 
 #define PAGE 4096
 
@@ -82,7 +86,9 @@ struct claim {
     uint32_t regs, bti;
     uint32_t transport, irq;
     uint64_t offset, size;
-    uint64_t transport_words[4]; // zero for virtio-mmio
+    // Zero for virtio-mmio. Modern virtio-pci: common | notify << 32,
+    // isr | device << 32, notify_off_multiplier, 0.
+    uint64_t transport_words[4];
 };
 
 static long claim(long index, struct claim *c) {
@@ -132,25 +138,46 @@ int main(int argc, char **argv) {
     }
     check(claim(index, &(struct claim){0}) == ZX_ERR_ALREADY_BOUND,
           "a second claim is ALREADY_BOUND");
-    check(c.transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO, "the transport is virtio-mmio");
-    check(!c.transport_words[0] && !c.transport_words[1] && !c.transport_words[2] &&
-              !c.transport_words[3],
-          "virtio-mmio needs no more words");
-    printf("zx-device-claim: virtio-blk #%ld: window +%#llx size %#llx irq %d\n", index,
-           (unsigned long long)c.offset, (unsigned long long)c.size, (int)c.irq);
+    printf("zx-device-claim: virtio-blk #%ld: transport %u, window +%#llx size %#llx irq %d\n",
+           index, c.transport, (unsigned long long)c.offset, (unsigned long long)c.size,
+           (int)c.irq);
 
     // The registers, read through the mapping.
     size_t span = (c.offset + c.size + PAGE - 1) / PAGE * PAGE;
     volatile uint8_t *regs = (volatile uint8_t *)map_handle(c.regs, span) + c.offset;
-    uint32_t magic = reg32(regs, VIRTIO_MMIO_MAGIC);
-    uint32_t version = reg32(regs, VIRTIO_MMIO_VERSION);
-    uint32_t id = reg32(regs, VIRTIO_MMIO_DEVICE_ID);
-    check(magic == VIRTIO_MAGIC, "the registers say virt");
-    check(id == VIRTIO_ID_BLOCK, "the device is a block device");
-    uint64_t sectors = reg32(regs, VIRTIO_MMIO_CONFIG) |
-                       (uint64_t)reg32(regs, VIRTIO_MMIO_CONFIG + 4) << 32;
-    printf("zx-device-claim: magic %#x version %u device %u, %llu sectors (%llu KiB)\n", magic,
-           version, id, (unsigned long long)sectors, (unsigned long long)sectors / 2);
+    uint64_t sectors = 0;
+    if (c.transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO) {
+        check(!c.transport_words[0] && !c.transport_words[1] && !c.transport_words[2] &&
+                  !c.transport_words[3],
+              "virtio-mmio needs no more words");
+        uint32_t magic = reg32(regs, VIRTIO_MMIO_MAGIC);
+        uint32_t version = reg32(regs, VIRTIO_MMIO_VERSION);
+        uint32_t id = reg32(regs, VIRTIO_MMIO_DEVICE_ID);
+        check(magic == VIRTIO_MAGIC, "the registers say virt");
+        check(id == VIRTIO_ID_BLOCK, "the device is a block device");
+        sectors = reg32(regs, VIRTIO_MMIO_CONFIG) |
+                  (uint64_t)reg32(regs, VIRTIO_MMIO_CONFIG + 4) << 32;
+        printf("zx-device-claim: virtio-mmio magic %#x version %u device %u\n", magic, version,
+               id);
+    } else if (c.transport == ECLIPSE_TRANSPORT_VIRTIO_PCI) {
+        uint32_t common = (uint32_t)c.transport_words[0];
+        uint32_t notify = (uint32_t)(c.transport_words[0] >> 32);
+        uint32_t isr = (uint32_t)c.transport_words[1];
+        uint32_t device = (uint32_t)(c.transport_words[1] >> 32);
+        uint32_t mult = (uint32_t)c.transport_words[2];
+        check(common < c.size && notify < c.size && isr < c.size && device < c.size,
+              "the four structures lie in the window");
+        uint16_t queues = *(volatile uint16_t *)(regs + common + VIRTIO_PCI_NUM_QUEUES);
+        check(queues > 0, "the device has a queue");
+        sectors = reg32(regs, device) | (uint64_t)reg32(regs, device + 4) << 32;
+        printf("zx-device-claim: virtio-pci common +%#x notify +%#x (x%u) isr +%#x device +%#x, "
+               "%u queues\n",
+               common, notify, mult, isr, device, queues);
+    } else {
+        check(0, "a transport this test knows");
+    }
+    printf("zx-device-claim: %llu sectors (%llu KiB)\n", (unsigned long long)sectors,
+           (unsigned long long)sectors / 2);
     check(sectors > 0, "the disk has a capacity");
 
     // DMA memory: contiguous, pinned for its device address, mapped.
