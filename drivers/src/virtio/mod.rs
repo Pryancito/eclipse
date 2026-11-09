@@ -11,6 +11,7 @@ pub use gpu::VirtIoGpu;
 pub use input::VirtIoInput;
 pub mod virtio_pci;
 pub use virtio_drivers::{DeviceType, VirtIOHeader};
+pub use virtio_pci::UserVirtioBlkPci;
 
 use crate::DeviceError;
 use core::convert::From;

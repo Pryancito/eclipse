@@ -22,8 +22,22 @@ pub const VIRTIO_BLK: &str = "virtio-blk";
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// virtio over MMIO (spec 1.1 §4.2): the whole register window.
+    /// Legacy virtio over MMIO (spec 1.1 §4.2): the whole register window.
     VirtioMmio,
+    /// Modern virtio over PCI (spec 1.1 §4.1): the window is the memory
+    /// BAR holding all four structures, at these offsets in it.
+    VirtioPci {
+        /// `VIRTIO_PCI_CAP_COMMON_CFG`.
+        common: u32,
+        /// `VIRTIO_PCI_CAP_NOTIFY_CFG`.
+        notify: u32,
+        /// `VIRTIO_PCI_CAP_ISR_CFG`.
+        isr: u32,
+        /// `VIRTIO_PCI_CAP_DEVICE_CFG`.
+        device: u32,
+        /// `notify_off_multiplier`.
+        notify_multiplier: u32,
+    },
 }
 
 /// A device reserved for userspace.
@@ -99,9 +113,27 @@ pub fn reserve_virtio_blk(
     size: usize,
     irq: Option<usize>,
 ) -> bool {
+    reserve_virtio_blk_if(true, transport, paddr, size, irq)
+}
+
+/// [`reserve_virtio_blk`] for a disk that may not be fit to hand over
+/// (`usable` false: a PCI disk without a modern transport). It is counted
+/// all the same, so the index of every later disk stays put, and the
+/// kernel keeps it.
+pub fn reserve_virtio_blk_if(
+    usable: bool,
+    transport: Transport,
+    paddr: usize,
+    size: usize,
+    irq: Option<usize>,
+) -> bool {
     let index = SEEN_BLK.fetch_add(1, Ordering::AcqRel);
     let wanted = WANTED.get().copied().flatten();
     if wanted != Some((VIRTIO_BLK, index)) {
+        return false;
+    }
+    if !usable {
+        warn!("udriver: {VIRTIO_BLK} #{index} has no transport a userspace driver can use; the kernel keeps it");
         return false;
     }
     info!(
