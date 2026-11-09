@@ -17,12 +17,15 @@
 // the ratio redirected/pipe means much: both are one round trip between two
 // processes, one through the kernel's redirect, the other through pipes.
 //
-//   zx-redirect-bench [ROUNDS [phases]]  (default 20000)
+//   zx-redirect-bench [ROUNDS [phases] [classic]]  (default 20000)
 //
 // With `phases` the server stamps each reply with when it received the
 // request and when it replied, and the run ends with the kernel's split of
 // a round trip into its phases (the redirect lines of /proc/perf/kernel).
-// The stamps cost the server two clock reads per request.
+// The stamps cost the server two clock reads per request. The server
+// takes each request with one eclipse_channel_reply_wait (reply, wait and
+// read in one syscall); with `classic` it uses the four Zircon syscalls
+// that replaces instead.
 //
 // Run it on Eclipse booted with `zircon.gateway=1`. Exit status: 0 on
 // success, 2 when the gateway is off (ENOSYS), 1 on error.
@@ -31,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +58,7 @@
 #define ECLIPSE_SYS_fd_to_handle 0x4001
 #define ECLIPSE_SYS_redirect_syscalls 0x4002
 #define ECLIPSE_SYS_redirect_memory 0x4003
+#define ECLIPSE_SYS_channel_reply_wait 0x4004
 #define ECLIPSE_MEMORY_TO_CLIENT 1
 #define ECLIPSE_FD_TAKE 1
 
@@ -64,8 +69,10 @@
 #define ZX_CHANNEL_READABLE (1u << 0)
 #define ZX_CHANNEL_PEER_CLOSED (1u << 2)
 #define ZX_TIME_INFINITE INT64_MAX
+#define ZX_ERR_INTERNAL_INTR_RETRY (-6)
 #define ZX_ERR_INVALID_ARGS (-10)
 #define ZX_ERR_SHOULD_WAIT (-22)
+#define ZX_ERR_PEER_CLOSED (-24)
 #define ZX_ERR_ALREADY_BOUND (-27)
 #define ZX_ERR_ACCESS_DENIED (-30)
 
@@ -114,7 +121,9 @@ static long redirect(zx_handle_t h, const uint64_t *mask) {
 // The server: answer getppid with the caller's pid, send anything else back
 // to the kernel. Counts what it served; returns when the peer is gone.
 static zx_handle_t server_handle;
-static int stamp;
+static int stamp, classic;
+// Whether the server loop ended the one good way: its peer went away.
+static atomic_int server_saw_peer_close;
 static volatile long served, bad_requests;
 
 static long client_memory(uint64_t pid, uint64_t addr, void *buf, long len, int to_client) {
@@ -143,25 +152,53 @@ static int64_t serve_write(const struct request *req) {
     return write(1, buf, (size_t)n);
 }
 
+// The next request into `req`, sending `rep` first when `rep_len` is not 0.
+// One eclipse_channel_reply_wait, or, `classic`, the four Zircon syscalls it
+// replaces: write, a read that finds nothing, wait, read.
+static long next_request(struct request *req, uint32_t *got, const struct reply *rep,
+                         long rep_len) {
+    if (!classic) {
+        long r;
+        do {
+            r = zx_status(zx(ECLIPSE_SYS_channel_reply_wait, server_handle, (long)rep, rep_len,
+                             (long)req, sizeof *req, (long)got));
+            rep_len = 0; // sent, even when a signal cut the wait short
+        } while (r == ZX_ERR_INTERNAL_INTR_RETRY);
+        return r;
+    }
+    if (rep_len && zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)rep, rep_len,
+                                0, 0)) < 0)
+        return -1;
+    for (;;) {
+        uint32_t nh = 0;
+        long r = zx_status(zx8(ZX_SYS_channel_read, server_handle, 0, (long)req, 0,
+                               sizeof *req, 0, (long)got, (long)&nh));
+        if (r != ZX_ERR_SHOULD_WAIT)
+            return r;
+        uint32_t observed = 0;
+        r = zx_status(zx(ZX_SYS_object_wait_one, server_handle,
+                         ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE,
+                         (long)&observed, 0, 0));
+        if (r < 0)
+            return r;
+        if (!(observed & ZX_CHANNEL_READABLE))
+            return ZX_ERR_PEER_CLOSED;
+    }
+}
+
 static void *server(void *unused) {
     (void)unused;
     struct request req;
+    struct reply rep;
+    long rep_len = 0;
     for (;;) {
-        uint32_t got = 0, nh = 0;
-        long r = zx_status(zx8(ZX_SYS_channel_read, server_handle, 0, (long)&req, 0,
-                               sizeof req, 0, (long)&got, (long)&nh));
-        if (r == ZX_ERR_SHOULD_WAIT) {
-            uint32_t observed = 0;
-            r = zx_status(zx(ZX_SYS_object_wait_one, server_handle,
-                             ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-                             ZX_TIME_INFINITE, (long)&observed, 0, 0));
-            if (r < 0 || !(observed & ZX_CHANNEL_READABLE))
-                break;
-            continue;
-        }
+        uint32_t got = 0;
+        long r = next_request(&req, &got, &rep, rep_len);
+        if (r == ZX_ERR_PEER_CLOSED)
+            atomic_store(&server_saw_peer_close, 1);
         if (r < 0)
             break;
-        struct reply rep = {.txid = req.txid};
+        rep = (struct reply){.txid = req.txid};
         if (stamp)
             rep.received = now_ns();
         if (got != sizeof req || req.kind != REDIRECT_KIND_SYSCALL) {
@@ -179,9 +216,7 @@ static void *server(void *unused) {
         served++;
         if (stamp)
             rep.replied = now_ns();
-        if (zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)&rep,
-                         stamp ? sizeof rep : 16, 0, 0)) < 0)
-            break;
+        rep_len = stamp ? sizeof rep : 16;
     }
     return NULL;
 }
@@ -287,7 +322,12 @@ static int child(int fd, int rounds, int ping[2], int pong[2]) {
 
 int main(int argc, char **argv) {
     int rounds = argc > 1 ? atoi(argv[1]) : 20000;
-    stamp = argc > 2 && strcmp(argv[2], "phases") == 0;
+    for (int i = 2; i < argc; i++) {
+        stamp |= strcmp(argv[i], "phases") == 0;
+        classic |= strcmp(argv[i], "classic") == 0;
+    }
+    printf("zx-redirect-bench: server loop: %s\n",
+           classic ? "classic (write, read, wait, read)" : "eclipse_channel_reply_wait");
     if (rounds <= 0)
         rounds = 20000;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -361,6 +401,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "zx-redirect-bench: the server's peer did not close after the child was reaped\n");
         return 1;
     }
+    if (!atomic_load(&server_saw_peer_close)) {
+        fprintf(stderr, "zx-redirect-bench: the server stopped on a channel error\n");
+        return 1;
+    }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "zx-redirect-bench: the child failed (status %#x)\n", status);
         return 1;
@@ -374,7 +418,8 @@ int main(int argc, char **argv) {
         FILE *f = fopen("/proc/perf/kernel", "r");
         char line[512];
         while (f && fgets(line, sizeof line, f))
-            if (strstr(line, "redirect"))
+            if (strstr(line, "redirect") || strstr(line, "wake latency") ||
+                strstr(line, "IPIs") || strstr(line, "wakeup preempt"))
                 printf("zx-redirect-bench: kernel: %s", line[0] == ' ' ? line + 2 : line);
         if (f)
             fclose(f);

@@ -40,19 +40,16 @@
 #include <unistd.h>
 
 #define ZX_GATEWAY_BASE 0x5a000000L
-#define ZX_GATEWAY_INDIRECT 0x8000L
 
 // zircon-syscall/src/zx-syscall-numbers.h
 #define ZX_SYS_channel_create 7
-#define ZX_SYS_channel_read 8
-#define ZX_SYS_channel_write 10
-#define ZX_SYS_object_wait_one 81
 
 // Eclipse's own gateway calls (loader/src/linux.rs, ECLIPSE_GATEWAY_EXT).
 #define ECLIPSE_SYS_handle_to_fd 0x4000
 #define ECLIPSE_SYS_fd_to_handle 0x4001
 #define ECLIPSE_SYS_redirect_syscalls 0x4002
 #define ECLIPSE_SYS_redirect_memory 0x4003
+#define ECLIPSE_SYS_channel_reply_wait 0x4004
 #define ECLIPSE_FD_TAKE 1
 #define ECLIPSE_MEMORY_TO_CLIENT 1
 
@@ -63,7 +60,9 @@
 #define ZX_CHANNEL_READABLE (1u << 0)
 #define ZX_CHANNEL_PEER_CLOSED (1u << 2)
 #define ZX_TIME_INFINITE INT64_MAX
+#define ZX_ERR_INTERNAL_INTR_RETRY (-6)
 #define ZX_ERR_SHOULD_WAIT (-22)
+#define ZX_ERR_PEER_CLOSED (-24)
 
 #define SERVED_FD_BASE 1000
 #define MAX_OPEN 64
@@ -83,12 +82,6 @@ struct reply {
 
 static long zx(long n, long a, long b, long c, long d, long e, long f) {
     return syscall(ZX_GATEWAY_BASE + n, a, b, c, d, e, f);
-}
-
-static long zx8(long n, long a0, long a1, long a2, long a3, long a4, long a5,
-                long a6, long a7) {
-    long args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
-    return syscall(ZX_GATEWAY_BASE + (ZX_GATEWAY_INDIRECT | n), (long)args);
 }
 
 // musl's syscall() turns a negative return into errno for the -4095..-1
@@ -245,33 +238,25 @@ static int serve(const struct request *req, int64_t *ret) {
     return 0;
 }
 
+// One syscall per request: send the last reply, wait for the next request
+// and read it (eclipse_channel_reply_wait).
 static void *server(void *unused) {
     (void)unused;
     struct request req;
+    struct reply rep;
+    long rep_len = 0;
     for (;;) {
-        uint32_t got = 0, nh = 0;
-        long r = zx_status(zx8(ZX_SYS_channel_read, server_handle, 0, (long)&req, 0,
-                               sizeof req, 0, (long)&got, (long)&nh));
-        if (r == ZX_ERR_SHOULD_WAIT) {
-            uint32_t observed = 0;
-            r = zx_status(zx(ZX_SYS_object_wait_one, server_handle,
-                             ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-                             ZX_TIME_INFINITE, (long)&observed, 0, 0));
-            if (r < 0) {
-                atomic_store(&server_end, FAILED);
-                return NULL;
-            }
-            if (!(observed & ZX_CHANNEL_READABLE)) {
-                atomic_store(&server_end, PEER_CLOSED);
-                return NULL;
-            }
+        uint32_t got = 0;
+        long r = zx_status(zx(ECLIPSE_SYS_channel_reply_wait, server_handle, (long)&rep,
+                              rep_len, (long)&req, sizeof req, (long)&got));
+        rep_len = 0; // sent, even when a signal cut the wait short
+        if (r == ZX_ERR_INTERNAL_INTR_RETRY)
             continue;
-        }
         if (r < 0) {
-            atomic_store(&server_end, FAILED);
+            atomic_store(&server_end, r == ZX_ERR_PEER_CLOSED ? PEER_CLOSED : FAILED);
             return NULL;
         }
-        struct reply rep = {.txid = req.txid};
+        rep = (struct reply){.txid = req.txid};
         if (got != sizeof req || req.kind != REDIRECT_KIND_SYSCALL) {
             bad_requests++;
             rep.ret = -EIO;
@@ -281,11 +266,7 @@ static void *server(void *unused) {
             rep.flags = REDIRECT_REPLY_NATIVE;
             handed_back++;
         }
-        if (zx_status(zx(ZX_SYS_channel_write, server_handle, 0, (long)&rep, sizeof rep,
-                         0, 0)) < 0) {
-            atomic_store(&server_end, FAILED);
-            return NULL;
-        }
+        rep_len = sizeof rep;
     }
 }
 
