@@ -2208,7 +2208,7 @@ const NEVER_SCHEDULED: u32 = u32::MAX;
 impl Future for ThreadSwitchFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        activate_process_paging(&self.thread.proc());
+        activate_process_paging(self.thread.proc());
         // Resuming real work on this CPU: undo any tickless-idle tick stretch so
         // preemption/HID polling run at full rate again. Cheap no-op (one
         // per-CPU flag read) unless this is the first poll after an idle stretch.
