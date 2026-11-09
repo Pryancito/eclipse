@@ -487,6 +487,19 @@ impl Syscall<'_> {
             } else {
                 (ceiling, prot)
             };
+            // A Zircon VMO held by an fd (`HandleFd`): its handle's rights
+            // are the ceiling, and a `prot` past them is `EACCES`, as for a
+            // read-only file mapped shared and writable.
+            let ceiling = match file_like
+                .downcast_ref::<linux_object::fs::HandleFd>()
+                .and_then(|h| h.map_ceiling())
+            {
+                Some(rights) if !rights.contains(prot.to_flags()) => {
+                    return Err(LxError::EACCES);
+                }
+                Some(rights) => ceiling & rights,
+                None => ceiling,
+            };
             // Map without committing the range up front (`map_range = false`):
             // the VMO returned by `get_vmo` is demand-paged from the file, so its
             // pages are read in on the faults that first touch them. Eagerly

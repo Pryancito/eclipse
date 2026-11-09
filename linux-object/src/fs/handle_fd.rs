@@ -11,9 +11,19 @@
 //! The fd also polls: readable while the object says `READABLE`, writable
 //! while it says `WRITABLE`, hung up once the peer is gone, so a Linux event
 //! loop can wait on a channel with `poll` or `epoll`.
+//!
+//! An fd holding a VMO also maps: `mmap(MAP_SHARED)` on it maps that VMO,
+//! the way `zx_vmar_map` would, with the Linux memory map in charge of the
+//! address space. This is how a userspace server or driver reaches memory
+//! that a VMO names -- a buffer shared with a client, a device's registers,
+//! memory pinned for DMA. The handle's rights are the ceiling: it needs
+//! `MAP` and `READ` to map at all, `WRITE` for a writable mapping and
+//! `EXECUTE` for an executable one, and `mprotect` cannot raise a mapping
+//! past them ([`HandleFd::map_ceiling`]).
 
 use super::*;
 use alloc::sync::Arc;
+use kernel_hal::MMUFlags;
 use lock::Mutex;
 use zircon_object::object::*;
 
@@ -65,6 +75,47 @@ impl HandleFd {
 
     fn held(&self) -> bool {
         self.handle.lock().is_some()
+    }
+
+    /// The VMO the fd holds, if it holds one and its handle may be mapped
+    /// (`MAP` and `READ`). `ENODEV` for an fd holding anything else, as
+    /// Linux answers for a file that cannot be mapped; `EACCES` for a VMO
+    /// handle without those rights; `EBADF` once the handle is taken.
+    fn mappable_vmo(&self) -> LxResult<Arc<VmObject>> {
+        let guard = self.handle.lock();
+        let handle = guard.as_ref().ok_or(LxError::EBADF)?;
+        let vmo = handle
+            .object
+            .clone()
+            .downcast_arc::<VmObject>()
+            .map_err(|_| LxError::ENODEV)?;
+        if !handle.rights.contains(Rights::MAP | Rights::READ) {
+            return Err(LxError::EACCES);
+        }
+        Ok(vmo)
+    }
+
+    /// The most a mapping of this fd may ever allow, `None` for an fd that
+    /// does not hold a VMO. `mmap` refuses a `prot` past it and installs it
+    /// as the mapping's ceiling, so `mprotect` cannot go past it later
+    /// either: a read-only VMO handle stays read-only however it is mapped.
+    pub fn map_ceiling(&self) -> Option<MMUFlags> {
+        let guard = self.handle.lock();
+        let handle = guard.as_ref()?;
+        if handle.object.clone().downcast_arc::<VmObject>().is_err() {
+            return None;
+        }
+        let mut flags = MMUFlags::USER;
+        if handle.rights.contains(Rights::MAP | Rights::READ) {
+            flags |= MMUFlags::READ;
+            if handle.rights.contains(Rights::WRITE) {
+                flags |= MMUFlags::WRITE;
+            }
+            if handle.rights.contains(Rights::EXECUTE) {
+                flags |= MMUFlags::EXECUTE;
+            }
+        }
+        Some(flags)
     }
 
     fn status(&self, signal: Signal) -> PollStatus {
@@ -149,12 +200,35 @@ impl FileLike for HandleFd {
         let signal = self.object.wait_signal(wanted).await;
         Ok(self.status(signal))
     }
+
+    /// `MAP_PRIVATE` is refused (`EINVAL`): the mapping would be the VMO
+    /// itself, so a "private" store would reach every other holder, and a
+    /// copy-on-write child does not exist for every VMO (a physical one has
+    /// none). A server that wants a private copy makes the child itself.
+    fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
+        self.mappable_vmo()?;
+        Err(LxError::EINVAL)
+    }
+
+    /// `MAP_SHARED`: the VMO itself, at `offset`. The window has to lie
+    /// inside it (`ENXIO`, as for a device mapped past its end): past the
+    /// end the mapping would otherwise be padded with anonymous zero pages
+    /// that nobody else sees, which for a device's registers or a DMA
+    /// buffer is a silent wrong answer.
+    fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
+        let vmo = self.mappable_vmo()?;
+        match offset.checked_add(len) {
+            Some(end) if end <= vmo.len() => Ok((vmo, offset)),
+            _ => Err(LxError::ENXIO),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_std::task::block_on;
+    use kernel_hal::PAGE_SIZE;
     use zircon_object::ipc::{Channel, MessagePacket};
 
     fn channel_fd() -> (Arc<HandleFd>, Arc<Channel>) {
@@ -199,6 +273,63 @@ mod tests {
         assert!(block_on(fd.async_poll(PollEvents::IN)).unwrap().read);
         drop(peer);
         assert!(fd.poll(PollEvents::IN).unwrap().hangup);
+    }
+
+    fn vmo_fd(pages: usize, rights: Rights) -> (Arc<HandleFd>, Arc<VmObject>) {
+        let vmo = VmObject::new_paged(pages);
+        let fd = HandleFd::new(Handle::new(vmo.clone(), rights), OpenFlags::empty());
+        (fd, vmo)
+    }
+
+    #[test]
+    fn a_vmo_fd_maps_shared_as_the_vmo_itself_inside_its_bounds() {
+        let (fd, vmo) = vmo_fd(2, Rights::DEFAULT_VMO);
+        let (mapped, offset) = fd.get_vmo_shared(PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(Arc::ptr_eq(&mapped, &vmo));
+        assert_eq!(offset, PAGE_SIZE);
+        assert!(fd.get_vmo_shared(0, 2 * PAGE_SIZE).is_ok());
+        assert_eq!(
+            fd.get_vmo_shared(PAGE_SIZE, 2 * PAGE_SIZE).err(),
+            Some(LxError::ENXIO)
+        );
+        assert_eq!(
+            fd.get_vmo_shared(usize::MAX, PAGE_SIZE).err(),
+            Some(LxError::ENXIO)
+        );
+    }
+
+    #[test]
+    fn a_vmo_fd_refuses_a_private_mapping() {
+        let (fd, _vmo) = vmo_fd(1, Rights::DEFAULT_VMO);
+        assert_eq!(fd.get_vmo(0, PAGE_SIZE).err(), Some(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_handle_rights_are_the_mapping_ceiling() {
+        let (fd, _vmo) = vmo_fd(1, Rights::DEFAULT_VMO);
+        assert_eq!(
+            fd.map_ceiling(),
+            Some(MMUFlags::USER | MMUFlags::READ | MMUFlags::WRITE)
+        );
+        let (fd, _vmo) = vmo_fd(1, Rights::MAP | Rights::READ);
+        assert_eq!(fd.map_ceiling(), Some(MMUFlags::USER | MMUFlags::READ));
+        let (fd, _vmo) = vmo_fd(1, Rights::DEFAULT_VMO | Rights::EXECUTE);
+        assert!(fd.map_ceiling().unwrap().contains(MMUFlags::EXECUTE));
+        // Without MAP nothing at all, and the mapping itself is refused.
+        let (fd, _vmo) = vmo_fd(1, Rights::READ | Rights::WRITE);
+        assert_eq!(fd.map_ceiling(), Some(MMUFlags::USER));
+        assert_eq!(fd.get_vmo_shared(0, PAGE_SIZE).err(), Some(LxError::EACCES));
+    }
+
+    #[test]
+    fn only_a_held_vmo_maps() {
+        let (fd, _peer) = channel_fd();
+        assert_eq!(fd.map_ceiling(), None);
+        assert_eq!(fd.get_vmo_shared(0, PAGE_SIZE).err(), Some(LxError::ENODEV));
+        let (fd, _vmo) = vmo_fd(1, Rights::DEFAULT_VMO);
+        fd.take().unwrap();
+        assert_eq!(fd.map_ceiling(), None);
+        assert_eq!(fd.get_vmo_shared(0, PAGE_SIZE).err(), Some(LxError::EBADF));
     }
 
     #[test]
