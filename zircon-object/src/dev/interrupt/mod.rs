@@ -961,17 +961,23 @@ mod tests {
 
     impl IrqLine for Arc<FakeLine> {
         fn mask(&self) {
-            self.masked.store(true, core::sync::atomic::Ordering::SeqCst);
+            self.masked
+                .store(true, core::sync::atomic::Ordering::SeqCst);
         }
         fn unmask(&self) {
-            self.masked.store(false, core::sync::atomic::Ordering::SeqCst);
+            self.masked
+                .store(false, core::sync::atomic::Ordering::SeqCst);
         }
         fn register_handler(&self, handler: Box<dyn Fn() + Send + Sync>) -> ZxResult {
             *self.handler.lock() = Some(handler);
             Ok(())
         }
         fn unregister_handler(&self) -> ZxResult {
-            self.handler.lock().take().map(|_| ()).ok_or(ZxError::NOT_FOUND)
+            self.handler
+                .lock()
+                .take()
+                .map(|_| ())
+                .ok_or(ZxError::NOT_FOUND)
         }
     }
 
@@ -990,9 +996,15 @@ mod tests {
         let interrupt = Interrupt::new_line(Box::new(line.clone()), true).unwrap();
         assert!(!line.is_masked(), "taken unmasked");
         line.fire();
-        assert!(line.is_masked(), "masked until the driver has quieted the device");
+        assert!(
+            line.is_masked(),
+            "masked until the driver has quieted the device"
+        );
         assert!(answers("a fired line", interrupt.wait()).await.is_ok());
-        assert!(line.is_masked(), "a wait that returns at once does not unmask");
+        assert!(
+            line.is_masked(),
+            "a wait that returns at once does not unmask"
+        );
         // The next wait unmasks before it sleeps.
         let waiter = {
             let interrupt = interrupt.clone();
