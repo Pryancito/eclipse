@@ -469,6 +469,104 @@ pub const ECLIPSE_REDIRECT_MEMORY: u32 = ECLIPSE_GATEWAY_EXT + 3;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_MEMORY_TO_CLIENT: usize = 1;
 
+/// `eclipse_channel_reply_wait(channel, reply, reply_len, buf, buf_len,
+/// *actual) -> status`: a server's whole turn in one syscall, as seL4's
+/// `ReplyRecv`. Writes `reply` (bytes only; none when `reply_len` is 0) to
+/// `channel`, then waits for the next message and reads it into `buf`,
+/// with its length in `*actual`. Without it a server makes four syscalls
+/// per request (write, a read that finds nothing, wait, read), and under a
+/// syscall redirect each of those is on the client's critical path.
+///
+/// `channel` needs `READ` and `WRITE`. A message bigger than `buf_len`, or
+/// carrying handles, stays queued: `BUFFER_TOO_SMALL`, its length in
+/// `*actual`. `PEER_CLOSED` once the queue is empty and the peer gone. A
+/// signal during the wait answers `ZX_ERR_INTERNAL_INTR_RETRY` with the
+/// reply already sent: retry with `reply_len` 0.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
+
+/// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
+/// `ZX_CHANNEL_MAX_MSG_BYTES`.
+#[cfg(feature = "zircon-gateway")]
+const CHANNEL_MAX_MSG_BYTES: usize = 65536;
+
+/// [`ECLIPSE_CHANNEL_REPLY_WAIT`] up to the wait: the channel, the reply
+/// sent. What it answers is the error that ends the call before the wait.
+#[cfg(feature = "zircon-gateway")]
+fn reply_then(
+    proc: &Arc<Process>,
+    args: &[usize; 6],
+) -> ZxResult<Arc<zircon_object::ipc::Channel>> {
+    use kernel_hal::user::{UserInPtr, UserOutPtr};
+    use zircon_object::object::Rights;
+    let channel = proc.get_object_with_rights::<zircon_object::ipc::Channel>(
+        args[0] as u32,
+        Rights::READ | Rights::WRITE,
+    )?;
+    // Look at `actual` before sending anything: a bad pointer must not cost
+    // a reply that then cannot be followed by a read.
+    UserOutPtr::<u32>::from(args[5])
+        .write(0)
+        .map_err(|_| ZxError::INVALID_ARGS)?;
+    let len = args[2];
+    if len > CHANNEL_MAX_MSG_BYTES {
+        return Err(ZxError::OUT_OF_RANGE);
+    }
+    if len != 0 {
+        let data = UserInPtr::<u8>::from(args[1])
+            .read_array(len)
+            .map_err(|_| ZxError::INVALID_ARGS)?;
+        channel.write(zircon_object::ipc::MessagePacket {
+            data,
+            handles: Vec::new(),
+        })?;
+    }
+    Ok(channel)
+}
+
+/// [`ECLIPSE_CHANNEL_REPLY_WAIT`] from the wait on: the next message into
+/// the caller's buffer.
+#[cfg(feature = "zircon-gateway")]
+async fn wait_then_read(channel: Arc<zircon_object::ipc::Channel>, args: [usize; 6]) -> ZxResult {
+    use kernel_hal::user::UserOutPtr;
+    use zircon_object::object::{KernelObject, Signal};
+    let cap = args[4];
+    let mut actual = UserOutPtr::<u32>::from(args[5]);
+    loop {
+        let mut too_big = None;
+        match channel.check_and_read(|m| {
+            if m.data.len() > cap || !m.handles.is_empty() {
+                too_big = Some(m.data.len());
+                Err(ZxError::BUFFER_TOO_SMALL)
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(msg) => {
+                // As `zx_channel_read`: the message is taken, and a buffer
+                // that faults loses it.
+                UserOutPtr::<u8>::from(args[3])
+                    .write_array(&msg.data)
+                    .map_err(|_| ZxError::INVALID_ARGS)?;
+                return actual
+                    .write(msg.data.len() as u32)
+                    .map_err(|_| ZxError::INVALID_ARGS);
+            }
+            Err(ZxError::SHOULD_WAIT) => {
+                let object: Arc<dyn KernelObject> = channel.clone();
+                object
+                    .wait_signal(Signal::READABLE | Signal::PEER_CLOSED)
+                    .await;
+            }
+            Err(ZxError::BUFFER_TOO_SMALL) => {
+                let _ = actual.write(too_big.unwrap_or(0) as u32);
+                return Err(ZxError::BUFFER_TOO_SMALL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The copy of [`ECLIPSE_REDIRECT_MEMORY`], a page at a time through the
 /// kernel: `Err` only when the caller's own buffer fails.
 #[cfg(feature = "zircon-gateway")]
@@ -2075,6 +2173,16 @@ async fn handle_user_trap(
             let zx_num = zx_num & !ZIRCON_GATEWAY_INDIRECT;
             trace!("Zircon gateway syscall: {} {:x?}", zx_num, zx_args);
             let ret = match zx_args {
+                _ if zx_num == ECLIPSE_CHANNEL_REPLY_WAIT => match reply_then(thread.proc(), &args) {
+                    Err(e) => e as isize as usize,
+                    Ok(channel) => run_with_irq_enable! {
+                        match linux_object::process::interruptible(wait_then_read(channel, args)).await {
+                            Ok(Ok(())) => 0,
+                            Ok(Err(e)) => e as isize as usize,
+                            Err(_) => zircon_object::ZxError::INTERNAL_INTR_RETRY as isize as usize,
+                        }
+                    },
+                },
                 _ if zx_num >= ECLIPSE_GATEWAY_EXT => {
                     eclipse_gateway_call(thread.proc(), zx_num, &args) as usize
                 }
