@@ -1160,6 +1160,16 @@ pub fn kernel_report() -> String {
             kernel_hal::kstats::resched_ipis_sent(),
             rate(kernel_hal::kstats::resched_ipis_sent())
         );
+        // How often the idle poll caught a wake before the halt: each hit is
+        // an IPI not sent and a halt not taken.
+        let (window, hits, misses) = kernel_hal::kstats::halt_poll_stats();
+        let _ = writeln!(
+            out,
+            "  idle poll before halt: {} us window, {} caught a wake, {} halted",
+            window / 1000,
+            hits,
+            misses
+        );
     }
     // How long a task that became runnable waited for a CPU. The one interval
     // no other line here can see: both ends of it are in the scheduler, on
@@ -1252,6 +1262,7 @@ pub fn kernel_report() -> String {
                     "out of halt, kicked",
                     "resumed",
                     "out of halt, not kicked",
+                    "idle poll",
                 ]
                 .iter()
                 .enumerate()

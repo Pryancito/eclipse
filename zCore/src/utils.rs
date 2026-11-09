@@ -223,6 +223,10 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
         }
         had_jobs
     });
+    // What the idle poll asks between looks at its queue (see
+    // `executor::set_idle_work_hook`): a deferred job waiting is work for the
+    // callback above, so the poll stops and lets it run.
+    executor::set_idle_work_hook(|| kernel_hal::deferred_job::pending_deferred_jobs() > 0);
     info!("executor run!");
     // Build this CPU's lazily-constructed runtime (multi-MiB executor stack,
     // guard-page unmaps with their TLB shootdowns) BEFORE announcing IPI

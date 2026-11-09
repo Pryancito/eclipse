@@ -2258,6 +2258,17 @@ impl Executor {
                     critical.set(false);
                     crate::runtime::sched_yield();
                     critical.set(true);
+                } else if crate::runtime::halt_poll(
+                    crate::arch::cpu_id() as usize,
+                    || self.task_collection.has_ready(),
+                    crate::runtime::idle_work_pending,
+                ) {
+                    // Polled the queue for a moment before getting ready to
+                    // halt, and a wake came inside the window: served without
+                    // an IPI, a halt or a tick to stretch and restore (see
+                    // `runtime::halt_poll`).
+                    crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_HALT_POLLED);
+                    continue;
                 } else if crate::runtime::run_idle_callback() {
                     // The idle callback made progress (e.g. drained deferred
                     // driver jobs that may have woken tasks): re-check the run

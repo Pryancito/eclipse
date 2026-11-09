@@ -538,12 +538,21 @@ pub(crate) static HANDOFF_PAGE: [AtomicUsize; lock::MAX_CORE_NUM] =
 pub(crate) static HANDOFF_IDX: [AtomicUsize; lock::MAX_CORE_NUM] =
     [const { AtomicUsize::new(0) }; lock::MAX_CORE_NUM];
 
-/// Take this CPU's hand-off hint, leaving none: `(page address, slot)`.
-pub(crate) fn take_handoff(cpu: usize) -> Option<(usize, usize)> {
-    let page = HANDOFF_PAGE.get(cpu)?.swap(0, Ordering::Relaxed);
-    if page == 0 {
+/// Take this CPU's hand-off hint, leaving none: `(page address, slot)` --
+/// but only a hint for one of `is_mine`'s pages. A hint for a page of another
+/// collection is left where it is, for that collection: taking it would only
+/// throw it away. (This crate's tests run many collections on "CPU 0" at once,
+/// and each one's `take_task` used to eat the hint another had just set.)
+pub(crate) fn take_handoff(cpu: usize, is_mine: impl Fn(usize) -> bool) -> Option<(usize, usize)> {
+    let slot = HANDOFF_PAGE.get(cpu)?;
+    let page = slot.load(Ordering::Relaxed);
+    if page == 0 || !is_mine(page) {
         return None;
     }
+    // Lost to a newer hint stored in between: that one is for whoever looks
+    // next, and this look takes none.
+    slot.compare_exchange(page, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .ok()?;
     Some((page, HANDOFF_IDX[cpu].load(Ordering::Relaxed)))
 }
 

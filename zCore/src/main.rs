@@ -366,6 +366,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             executor::set_handoff(true);
             klog_info!("Eclipse: direct hand-off ENABLED (HANDOFF=1)");
         }
+        // The idle poll before a halt (see `executor::set_halt_poll_ns`): on by
+        // default; `HALTPOLL=N` sets the window to N microseconds, 0 turns it
+        // off.
+        if let Some(us) = kernel_hal::cmdline::value(&options.cmdline, "HALTPOLL")
+            .and_then(kernel_hal::cmdline::parse_number)
+        {
+            executor::set_halt_poll_ns(us.saturating_mul(1000));
+            klog_info!("Eclipse: idle poll before halting: {} us (HALTPOLL)", us);
+        }
         // The wake-to-run latency probe (`/proc/perf/kernel`'s `wake latency`
         // line). Sampled one wake in sixteen, so it costs an external wake
         // nothing measurable, but it is still a diagnostic and a measurement
