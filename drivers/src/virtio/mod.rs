@@ -10,7 +10,7 @@ pub use console::VirtIoConsole;
 pub use gpu::VirtIoGpu;
 pub use input::VirtIoInput;
 pub mod virtio_pci;
-pub use virtio_drivers::VirtIOHeader;
+pub use virtio_drivers::{DeviceType, VirtIOHeader};
 
 use crate::DeviceError;
 use core::convert::From;

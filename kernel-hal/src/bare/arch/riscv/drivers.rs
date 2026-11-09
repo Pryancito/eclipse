@@ -80,6 +80,8 @@ pub(super) fn init() -> DeviceResult {
             warn!("failed to map the PCIe config space at {:#x}", PCI_BASE);
         }
     }
+    // Before the probe: a disk it finds may be one to leave alone.
+    zcore_drivers::user::set_reservation(crate::cmdline::value(&super::cmdline(), "udriver"));
     // prase DTB and probe devices
     let dev_list =
         DevicetreeDriverBuilder::new(phys_to_virt(crate::KCONFIG.dtb_paddr), IoMapperImpl)?

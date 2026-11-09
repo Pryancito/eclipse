@@ -426,10 +426,22 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         use virtio_drivers::{DeviceType, VirtIOHeader};
 
         let interrupts = parse_interrupts(node, props)?;
-        let base_vaddr =
-            parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _))?;
+        let (paddr, size) = parse_reg(node, props)?;
+        let base_vaddr = self.mmap(paddr as _, size as _)?;
         let header = unsafe { &mut *(base_vaddr as *mut VirtIOHeader) };
         if !header.verify() {
+            return Err(DeviceError::NotSupported);
+        }
+        // A disk left to a userspace driver (`udriver=`): recorded and not
+        // touched, not even reset, which `VirtIoBlk::new` would do.
+        if header.device_type() == DeviceType::Block
+            && crate::user::reserve_virtio_blk(
+                crate::user::Transport::VirtioMmio,
+                paddr as usize,
+                size as usize,
+                interrupts.first_irq().map(|irq| irq as usize),
+            )
+        {
             return Err(DeviceError::NotSupported);
         }
         info!(

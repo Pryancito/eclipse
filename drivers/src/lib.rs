@@ -106,6 +106,7 @@ pub(crate) mod test_globals {
     }
 }
 pub mod uart;
+pub mod user;
 pub mod utils;
 
 #[cfg(all(
