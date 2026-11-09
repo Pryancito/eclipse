@@ -23,10 +23,16 @@
 //!   0  u32 txid (the kernel's)             0  u32 txid (the request's)
 //!   4  u32 kind = KIND_SYSCALL             4  u32 flags (REPLY_NATIVE)
 //!   8  u64 pid                             8  i64 return value
-//!  16  u64 tid
-//!  24  u64 syscall number
+//!  16  u64 tid                           16  u64 received (optional)
+//!  24  u64 syscall number                 24  u64 replied (optional)
 //!  32  u64 args[6]
 //! ```
+//!
+//! `received` and `replied` are when the server read the request and when
+//! it sent the reply, in `CLOCK_MONOTONIC` nanoseconds; a server that fills
+//! them in (a reply of TIMED_REPLY_LEN bytes, both non-zero) lets the kernel
+//! split each round trip into its phases ([`phases`]), shown in
+//! `/proc/perf/kernel`.
 //!
 //! A syscall's pointer arguments point into the client: the server reaches
 //! that memory with `eclipse_redirect_memory`, which [`client_of`] gates.
@@ -42,6 +48,9 @@ pub const MAX_REDIRECTED: usize = 512;
 pub const REQUEST_LEN: usize = 80;
 /// The shortest reply the kernel takes.
 pub const REPLY_LEN: usize = 16;
+/// The length of a reply that says when the server received the request
+/// and when it replied.
+pub const TIMED_REPLY_LEN: usize = 32;
 /// `kind` of a syscall request, the only one so far.
 pub const KIND_SYSCALL: u32 = 1;
 /// Reply flag: run the syscall in the kernel after all; the reply's return
@@ -110,8 +119,17 @@ impl SyscallRedirect {
             data,
             handles: Vec::new(),
         };
-        match self.channel.call(request).await {
-            Ok(reply) => Self::answer(&reply),
+        let start = phases::now();
+        let reply = match self.channel.call_counted(request) {
+            Ok((_, reply)) => reply,
+            Err(_) => return Forwarded::Return(-(LxError::ENOSYS as isize)),
+        };
+        let sent = phases::now();
+        match reply.await {
+            Ok(reply) => {
+                phases::record(start, sent, phases::server_stamps(&reply), phases::now());
+                Self::answer(&reply)
+            }
             Err(_) => Forwarded::Return(-(LxError::ENOSYS as isize)),
         }
     }
@@ -158,6 +176,136 @@ pub fn client_of(server_end: &Arc<Channel>, pid: KoID) -> ZxResult<Arc<Process>>
     match linux.syscall_redirect.get() {
         Some(r) if r.served_by(server_end.as_ref()) => Ok(target),
         _ => Err(ZxError::ACCESS_DENIED),
+    }
+}
+
+/// Where the time of a redirected syscall goes, summed over every one the
+/// kernel forwarded since boot.
+///
+/// A round trip, as the kernel sees it from the client's side:
+///
+/// ```text
+/// start -- send --> sent -- to server --> received -- in server --> replied -- back --> done
+///          (kernel)        (wake, switch,              (the server's           (its write,
+///                           server's read)               own work)               wake, switch)
+/// ```
+///
+/// `send` and the total are the kernel's own clock and always counted. The
+/// middle three need the server's `received` and `replied` stamps, and are
+/// counted only when the stamps fall in order between `sent` and `done`: a
+/// clock that is not in step across CPUs would put them out of order, and
+/// that is counted too, as `skewed`.
+pub mod phases {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The phases, in the order of [`Snapshot::sum_ns`].
+    pub const NAMES: [&str; 5] = ["send", "to server", "in server", "back", "total"];
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static TIMED: AtomicU64 = AtomicU64::new(0);
+    static SKEWED: AtomicU64 = AtomicU64::new(0);
+    static SUM_NS: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// What [`snapshot`] answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Snapshot {
+        /// Round trips that got a reply.
+        pub calls: u64,
+        /// Of those, the ones whose server stamps were in order.
+        pub timed: u64,
+        /// The ones whose stamps were there but out of order.
+        pub skewed: u64,
+        /// Nanoseconds per phase ([`NAMES`]): `send` and `total` over
+        /// `calls`, the other three over `timed`.
+        pub sum_ns: [u64; 5],
+    }
+
+    pub(super) fn now() -> u64 {
+        kernel_hal::timer::timer_now().as_nanos() as u64
+    }
+
+    /// The server's `(received, replied)` stamps, if the reply has them.
+    pub fn server_stamps(reply: &MessagePacket) -> Option<(u64, u64)> {
+        if reply.data.len() < TIMED_REPLY_LEN {
+            return None;
+        }
+        let at = |i: usize| u64::from_le_bytes(reply.data[i..i + 8].try_into().unwrap());
+        let (received, replied) = (at(16), at(24));
+        if received != 0 && replied != 0 {
+            Some((received, replied))
+        } else {
+            None
+        }
+    }
+
+    /// Count one round trip.
+    pub fn record(start: u64, sent: u64, stamps: Option<(u64, u64)>, done: u64) {
+        CALLS.fetch_add(1, Relaxed);
+        SUM_NS[0].fetch_add(sent.saturating_sub(start), Relaxed);
+        SUM_NS[4].fetch_add(done.saturating_sub(start), Relaxed);
+        match stamps {
+            Some((received, replied))
+                if sent <= received && received <= replied && replied <= done =>
+            {
+                TIMED.fetch_add(1, Relaxed);
+                SUM_NS[1].fetch_add(received - sent, Relaxed);
+                SUM_NS[2].fetch_add(replied - received, Relaxed);
+                SUM_NS[3].fetch_add(done - replied, Relaxed);
+            }
+            Some(_) => {
+                SKEWED.fetch_add(1, Relaxed);
+            }
+            None => {}
+        }
+    }
+
+    /// The counts since boot.
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            calls: CALLS.load(Relaxed),
+            timed: TIMED.load(Relaxed),
+            skewed: SKEWED.load(Relaxed),
+            sum_ns: core::array::from_fn(|i| SUM_NS[i].load(Relaxed)),
+        }
+    }
+
+    /// The `/proc/perf/kernel` lines, or nothing before the first call.
+    pub fn report(s: &Snapshot) -> String {
+        if s.calls == 0 {
+            return String::new();
+        }
+        let mean = |sum: u64, n: u64| {
+            if n == 0 {
+                0.0
+            } else {
+                sum as f64 / n as f64 / 1000.0
+            }
+        };
+        let mut out = alloc::format!(
+            "syscall redirect: {} round trips, mean {:.1} us (send {:.1} us); \
+             {} timed by the server, {} skewed\n",
+            s.calls,
+            mean(s.sum_ns[4], s.calls),
+            mean(s.sum_ns[0], s.calls),
+            s.timed,
+            s.skewed
+        );
+        if s.timed != 0 {
+            out += &alloc::format!(
+                "  redirect phases (mean us): to server {:.1}, in server {:.1}, back {:.1}\n",
+                mean(s.sum_ns[1], s.timed),
+                mean(s.sum_ns[2], s.timed),
+                mean(s.sum_ns[3], s.timed)
+            );
+        }
+        out
     }
 }
 
@@ -315,6 +463,61 @@ mod tests {
         let (_, answer) = round_trip(&r, &b, |req| reply(req, 0, 2));
         assert_eq!(answer, Forwarded::Return(2));
         assert!(!a.signal().contains(Signal::READABLE));
+    }
+
+    #[test]
+    fn the_phases_count_what_is_in_order_and_only_that() {
+        // `record` adds to counters other tests add to as well: compare
+        // differences, of what only this test puts in.
+        let before = phases::snapshot();
+        phases::record(100, 110, Some((130, 170)), 200);
+        phases::record(100, 110, Some((90, 170)), 200); // received before sent
+        phases::record(100, 120, None, 150);
+        let after = phases::snapshot();
+        assert!(after.calls - before.calls >= 3);
+        assert!(after.timed - before.timed >= 1);
+        assert!(after.skewed - before.skewed >= 1);
+    }
+
+    #[test]
+    fn the_report_splits_the_phases_once_a_server_stamps_its_replies() {
+        let mut s = phases::Snapshot {
+            calls: 4,
+            timed: 0,
+            skewed: 0,
+            sum_ns: [4_000, 0, 0, 0, 40_000],
+        };
+        let r = phases::report(&s);
+        assert!(
+            r.contains("4 round trips, mean 10.0 us (send 1.0 us)"),
+            "{}",
+            r
+        );
+        assert!(!r.contains("phases"), "{}", r);
+        s.timed = 2;
+        s.sum_ns[1..4].copy_from_slice(&[6_000, 2_000, 8_000]);
+        let r = phases::report(&s);
+        assert!(
+            r.contains("to server 3.0, in server 1.0, back 4.0"),
+            "{}",
+            r
+        );
+        assert_eq!(phases::report(&phases::Snapshot { calls: 0, ..s }), "");
+    }
+
+    #[test]
+    fn a_timed_reply_carries_the_servers_stamps_and_a_plain_one_none() {
+        let (a, b) = Channel::create();
+        let r = SyscallRedirect::new(a, mask_of(&[39]));
+        let (_, answer) = round_trip(&r, &b, |req| {
+            let mut timed = reply(req, 0, 5);
+            timed.data.extend_from_slice(&11u64.to_le_bytes());
+            timed.data.extend_from_slice(&12u64.to_le_bytes());
+            assert_eq!(phases::server_stamps(&timed), Some((11, 12)));
+            assert_eq!(phases::server_stamps(&reply(req, 0, 5)), None);
+            timed
+        });
+        assert_eq!(answer, Forwarded::Return(5));
     }
 
     #[test]
