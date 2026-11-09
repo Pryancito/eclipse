@@ -475,6 +475,22 @@ ifeq ($(DISK), on)
   qemu_opts += -drive format=qcow2,id=userdisk,if=none,file=$(qemu_disk)
 endif
 
+# UDISK=<raw image>: one more virtio disk, for a driver in userspace. Boot
+# with `udriver=virtio-blk@N` in KOPTS to have the kernel leave it alone, N
+# being its place among the virtio disks (on aarch64 the root disk is the
+# first, so this one is 1; riscv64 boots from the initrd, so it is 0).
+# `tools/zx-device-claim` checks that a process can take it.
+ifneq ($(UDISK),)
+  qemu_opts += -drive file=$(UDISK),if=none,format=raw,id=udisk
+  ifeq ($(ARCH), aarch64)
+    qemu_opts += -device virtio-blk-device,drive=udisk,bus=virtio-mmio-bus.1
+  else ifeq ($(ARCH), riscv64)
+    qemu_opts += -device virtio-blk-device,drive=udisk
+  else
+    qemu_opts += -device virtio-blk-pci,drive=udisk
+  endif
+endif
+
 ifeq ($(GRAPHIC), on)
   ifeq ($(ARCH), x86_64)
     ifeq ($(GL), 1)

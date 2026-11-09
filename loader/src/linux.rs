@@ -485,6 +485,47 @@ pub const ECLIPSE_MEMORY_TO_CLIENT: usize = 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 
+/// `eclipse_device_claim(kind, index, *claim) -> status`: take a device the
+/// kernel left to userspace (`udriver=` on the command line, see
+/// `zcore_drivers::user`) and get what driving it takes, written to
+/// `claim` as eight `u64`s:
+///
+/// - word 0: the registers' VMO handle (low half) and a BTI handle (high
+///   half). The VMO is physical and uncached, covers the pages holding the
+///   register window, and maps through `eclipse_handle_to_fd` and `mmap`.
+///   The BTI is what `zx_vmo_create_contiguous` and `zx_bti_pin` want for
+///   DMA memory and its device addresses.
+/// - word 1: the transport (low half: 1 = legacy virtio-mmio) and the
+///   interrupt line (high half, `u32::MAX` when unknown).
+/// - word 2: where the window starts inside the VMO.
+/// - word 3: the window's size.
+/// - words 4 to 7: what the transport needs besides; zero for virtio-mmio,
+///   which keeps everything in its one window.
+///
+/// `kind` 1 is a virtio block device. `NOT_FOUND` when no such device was
+/// reserved, `ALREADY_BOUND` once something has claimed it: one driver per
+/// device, for the life of the kernel.
+///
+/// What this does not isolate yet: without an IOMMU the BTI hands out
+/// physical addresses, so the device can be told to DMA anywhere; and a
+/// window smaller than a page shares its page with its neighbours (QEMU
+/// `virt` on aarch64 packs eight transports into one). It is for a driver
+/// the system trusts, run in a process of its own.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_DEVICE_CLAIM: u32 = ECLIPSE_GATEWAY_EXT + 5;
+
+/// How many `u64`s [`ECLIPSE_DEVICE_CLAIM`] writes.
+#[cfg(feature = "zircon-gateway")]
+const CLAIM_WORDS: usize = 8;
+
+/// [`ECLIPSE_DEVICE_CLAIM`] kind: a virtio block device.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_DEVICE_VIRTIO_BLK: usize = 1;
+
+/// [`ECLIPSE_DEVICE_CLAIM`] transport: legacy virtio over MMIO.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_TRANSPORT_VIRTIO_MMIO: u64 = 1;
+
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
 /// `ZX_CHANNEL_MAX_MSG_BYTES`.
 #[cfg(feature = "zircon-gateway")]
@@ -737,8 +778,66 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
                 Err(e) => status(e),
             }
         }
+        ECLIPSE_DEVICE_CLAIM => match claim_device(proc, args) {
+            Ok(()) => 0,
+            Err(e) => status(e),
+        },
         _ => status(ZxError::NOT_SUPPORTED),
     }
+}
+
+/// [`ECLIPSE_DEVICE_CLAIM`].
+#[cfg(feature = "zircon-gateway")]
+fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use kernel_hal::drivers::user::{self, Transport};
+    use kernel_hal::{CachePolicy, PAGE_SIZE};
+    use zircon_object::dev::{BusTransactionInitiator, Iommu};
+    use zircon_object::object::{Handle, Rights};
+    use zircon_object::vm::VmObject;
+    let kind = match args[0] {
+        ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
+        _ => return Err(ZxError::INVALID_ARGS),
+    };
+    let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
+    // Look before taking anything: a bad pointer must not cost the device.
+    out.write_array(&[0; CLAIM_WORDS])
+        .map_err(|_| ZxError::INVALID_ARGS)?;
+    let device = user::find(kind, args[1]).ok_or(ZxError::NOT_FOUND)?;
+    let base = device.paddr & !(PAGE_SIZE - 1);
+    let end = device
+        .paddr
+        .checked_add(device.size)
+        .and_then(|end| end.checked_add(PAGE_SIZE - 1))
+        .ok_or(ZxError::OUT_OF_RANGE)?
+        & !(PAGE_SIZE - 1);
+    if !device.claim() {
+        return Err(ZxError::ALREADY_BOUND);
+    }
+    let regs = VmObject::new_physical(base, (end - base) / PAGE_SIZE);
+    regs.set_cache_policy(CachePolicy::UncachedDevice)?;
+    let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+    let regs = proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO));
+    let bti = proc.add_handle(Handle::new(bti, Rights::DEFAULT_BTI));
+    let transport = match device.transport {
+        Transport::VirtioMmio => ECLIPSE_TRANSPORT_VIRTIO_MMIO,
+    };
+    let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
+    let words: [u64; CLAIM_WORDS] = [
+        regs as u64 | (bti as u64) << 32,
+        transport | (irq as u64) << 32,
+        (device.paddr - base) as u64,
+        device.size as u64,
+        0,
+        0,
+        0,
+        0,
+    ];
+    if out.write_array(&words).is_err() {
+        let _ = proc.remove_handle(regs);
+        let _ = proc.remove_handle(bti);
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(())
 }
 
 /// Whether a Linux process may make Zircon syscall `zx_num` through the
@@ -748,8 +847,9 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
 /// Left out on purpose: thread and process lifecycle (`thread_exit` and the
 /// like would skip the Linux teardown: `clear_child_tid`, the exit
 /// futex, the parent's `wait`), VMAR mappings (the Linux memory map owns the
-/// address space), resources, interrupts and the DDK (the driver phase
-/// will open those with their own checks).
+/// address space), resources and interrupts. Of the DDK only what DMA
+/// memory takes is let through, and all of it needs the BTI that
+/// [`ECLIPSE_DEVICE_CLAIM`] hands out with a claimed device.
 #[cfg(feature = "zircon-gateway")]
 fn zircon_gateway_allows(zx_num: u32) -> bool {
     matches!(
@@ -776,6 +876,10 @@ fn zircon_gateway_allows(zx_num: u32) -> bool {
         // vmo_create, vmo_create_child, vmo_get_size, vmo_read,
         // vmo_set_size, vmo_write
         | 191 | 192 | 195 | 198 | 201 | 204
+        // DMA memory for a claimed device (`eclipse_device_claim`): each
+        // takes the BTI only that call hands out. bti_pin,
+        // bti_release_quarantine, pmt_unpin, vmo_create_contiguous
+        | 1 | 2 | 89 | 193
     )
 }
 
@@ -2173,7 +2277,8 @@ async fn handle_user_trap(
             let zx_num = zx_num & !ZIRCON_GATEWAY_INDIRECT;
             trace!("Zircon gateway syscall: {} {:x?}", zx_num, zx_args);
             let ret = match zx_args {
-                _ if zx_num == ECLIPSE_CHANNEL_REPLY_WAIT => match reply_then(thread.proc(), &args) {
+                _ if zx_num == ECLIPSE_CHANNEL_REPLY_WAIT => match reply_then(thread.proc(), &args)
+                {
                     Err(e) => e as isize as usize,
                     Ok(channel) => run_with_irq_enable! {
                         match linux_object::process::interruptible(wait_then_read(channel, args)).await {
@@ -3879,6 +3984,18 @@ mod zircon_gateway_tests {
         // thread_exit, process_exit, the composite thread exits,
         // thread_create, process_create, vmar_map, interrupt_create
         for n in [165, 97, 1004, 1005, 164, 95, 185, 51] {
+            assert!(!zircon_gateway_allows(n), "{} should be refused", n);
+        }
+    }
+
+    #[test]
+    fn the_gateway_lets_through_dma_memory_but_not_a_bti_of_its_own() {
+        // bti_pin, bti_release_quarantine, pmt_unpin, vmo_create_contiguous
+        for n in [1, 2, 89, 193] {
+            assert!(zircon_gateway_allows(n), "{} should pass", n);
+        }
+        // bti_create, iommu_create, resource_create, vmo_create_physical
+        for n in [0, 59, 102, 194] {
             assert!(!zircon_gateway_allows(n), "{} should be refused", n);
         }
     }

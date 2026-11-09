@@ -39,12 +39,44 @@ pub fn init() {
     // firmware boot disk is not guaranteed to occupy the first one.  A block
     // device is optional (the Zircon ZBI is linked into the kernel), so do not
     // abort boot when this slot is empty.
-    if let Ok(virtio_blk) =
-        VirtIoBlk::new(unsafe { &mut *(phys_to_virt(VIRTIO_BASE) as *mut VirtIOHeader) })
-    {
-        drivers::add_device(Device::Block(Arc::new(virtio_blk)));
+    zcore_drivers::user::set_reservation(crate::cmdline::value(&super::cmdline(), "udriver"));
+    let slot0 = unsafe { &mut *(phys_to_virt(VIRTIO_BASE) as *mut VirtIOHeader) };
+    if !reserved_for_userspace(slot0, 0) {
+        if let Ok(virtio_blk) = VirtIoBlk::new(slot0) {
+            drivers::add_device(Device::Block(Arc::new(virtio_blk)));
+        }
+    }
+    // The other transports of the bank are never bound by the kernel; they
+    // are only looked at, so that a disk on one of them can be left to a
+    // userspace driver (`udriver=virtio-blk@N`, counting the disk above as
+    // the first).
+    for slot in 1..VIRTIO_SLOTS_MAPPED {
+        let header =
+            unsafe { &mut *(phys_to_virt(VIRTIO_BASE + slot * VIRTIO_SLOT) as *mut VirtIOHeader) };
+        reserved_for_userspace(header, slot);
     }
     probe_devicetree();
+}
+
+/// The stride of QEMU `virt`'s bank of virtio-mmio transports.
+const VIRTIO_SLOT: usize = 0x200;
+/// The transports reachable through the one page `vm.rs` maps at
+/// [`VIRTIO_BASE`]: QEMU puts `virtio-mmio-bus.N` at slot `N`.
+const VIRTIO_SLOTS_MAPPED: usize = crate::PAGE_SIZE / VIRTIO_SLOT;
+/// QEMU `virt` wires transport `N` to SPI `16 + N`, GIC INTID `48 + N`.
+const VIRTIO_FIRST_INTID: usize = 48;
+
+/// Whether the transport at `slot` holds a virtio disk that the command
+/// line leaves to userspace. Every disk seen is counted, reserved or not.
+fn reserved_for_userspace(header: &VirtIOHeader, slot: usize) -> bool {
+    header.verify()
+        && header.device_type() == zcore_drivers::virtio::DeviceType::Block
+        && zcore_drivers::user::reserve_virtio_blk(
+            zcore_drivers::user::Transport::VirtioMmio,
+            VIRTIO_BASE + slot * VIRTIO_SLOT,
+            VIRTIO_SLOT,
+            Some(VIRTIO_FIRST_INTID + slot),
+        )
 }
 
 struct IoMapperImpl;
