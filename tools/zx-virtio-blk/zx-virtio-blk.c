@@ -2,11 +2,13 @@
 //
 // The disk is one the kernel left alone (`udriver=virtio-blk@N`), claimed
 // with eclipse_device_claim: its registers come as a physical VMO, mapped
-// through an fd, and its DMA memory is a contiguous VMO pinned through the
-// BTI the claim hands out. The driver brings the device up on either
-// transport -- legacy virtio-mmio (aarch64, riscv64 under QEMU virt) or
-// modern virtio-pci (x86_64 q35) -- sets up one split virtqueue and
-// polls it, as the kernel's own virtio drivers do.
+// through an fd, its DMA memory is a contiguous VMO pinned through the
+// BTI the claim hands out, and its interrupt is an interrupt object. The
+// driver brings the device up on either transport -- legacy virtio-mmio
+// (aarch64, riscv64 under QEMU virt) or modern virtio-pci (x86_64 q35,
+// MSI-X vector 0) -- and sets up one split virtqueue. It waits for each
+// request with zx_interrupt_wait, and times reads that way and by
+// polling the used ring, as the kernel's own virtio drivers do.
 //
 // It writes a pattern over the last sectors of the disk, reads it back
 // and checks it, then times reads: one sector at a time and 4 KiB at a
@@ -25,7 +27,7 @@
 // Run it on Eclipse booted with `zircon.gateway=1` and the udriver
 // option. Exit status: 0 on success, 2 when the gateway is off, 1 on error.
 //
-// A prototype: one queue, one request in flight, no interrupts yet.
+// A prototype: one queue, one request in flight.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -43,6 +45,7 @@
 
 // zircon-syscall/src/zx-syscall-numbers.h
 #define ZX_SYS_bti_pin 1
+#define ZX_SYS_interrupt_wait 54
 #define ZX_SYS_vmo_create_contiguous 193
 
 #define ECLIPSE_SYS_handle_to_fd 0x4000
@@ -187,6 +190,9 @@ static struct virtq_desc *desc;
 static struct virtq_avail *avail;
 static volatile struct virtq_used *used;
 static uint16_t last_used;
+static zx_handle_t irq_handle; // 0: none, poll
+static int use_irq;            // wait on it, or poll anyway
+static uint64_t irq_waits;     // waits that came back, for the report
 
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
 static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(regs + off); }
@@ -238,7 +244,14 @@ static void init_pci(void) {
     if (max < QUEUE_SIZE)
         die("queue too small", max);
     wr16(c + PCI_QUEUE_SIZE, QUEUE_SIZE);
-    wr16(c + PCI_QUEUE_MSIX_VECTOR, VIRTIO_MSI_NO_VECTOR);
+    // MSI-X vector 0 is the one the kernel armed, and the one the claim's
+    // interrupt object listens on. The device answers NO_VECTOR when it
+    // cannot take it; then there is nothing to wait on.
+    wr16(c + PCI_QUEUE_MSIX_VECTOR, irq_handle ? 0 : VIRTIO_MSI_NO_VECTOR);
+    if (irq_handle && rd16(c + PCI_QUEUE_MSIX_VECTOR) != 0) {
+        printf("zx-virtio-blk: the device refused MSI-X vector 0; polling\n");
+        irq_handle = 0;
+    }
     uint64_t d = daddr + DMA_QUEUE;
     uint64_t a = d + QUEUE_SIZE * sizeof(struct virtq_desc);
     uint64_t u = daddr + DMA_USED;
@@ -256,8 +269,20 @@ static void init_pci(void) {
     notify_reg = regs + pci_notify + (uint32_t)notify_off * pci_mult;
 }
 
+// Quiet the device's interrupt. virtio-mmio holds its line up until the
+// status is acked, and the kernel unmasks the line on the next wait; an
+// MSI-X message needs nothing.
+static void ack_device(void) {
+    if (transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO) {
+        uint32_t isr = rd32(MMIO_INTERRUPT_STATUS);
+        if (isr)
+            wr32(MMIO_INTERRUPT_ACK, isr);
+    }
+}
+
 // One request, start to end: three descriptors (header, data, status),
-// one notify, then a spin on the used ring.
+// one notify, then either waits on the interrupt or a spin on the used
+// ring until the device has put it there.
 static int do_io(uint32_t type, uint64_t sector, size_t len) {
     struct blk_req *req = (struct blk_req *)(dma + DMA_REQ);
     volatile uint8_t *status = dma + DMA_REQ + sizeof *req;
@@ -281,16 +306,24 @@ static int do_io(uint32_t type, uint64_t sector, size_t len) {
         *(volatile uint32_t *)notify_reg = 0;
     else
         *(volatile uint16_t *)notify_reg = 0;
-    while (used->idx == last_used)
-        ;
+    if (use_irq) {
+        // A wake is not a completion (a stale one from a polled request, a
+        // config change): look at the ring after each.
+        while (used->idx == last_used) {
+            long r = zx_status(zx(ZX_SYS_interrupt_wait, irq_handle, 0, 0, 0));
+            if (r != 0)
+                die("interrupt_wait", r);
+            irq_waits++;
+            ack_device();
+        }
+    } else {
+        while (used->idx == last_used)
+            ;
+        // Nobody waits on the interrupt, but the line stays up until acked.
+        ack_device();
+    }
     mb();
     last_used++;
-    if (transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO) {
-        // Nobody takes the interrupt, but the line stays up until acked.
-        uint32_t isr = rd32(MMIO_INTERRUPT_STATUS);
-        if (isr)
-            wr32(MMIO_INTERRUPT_ACK, isr);
-    }
     return *status == VIRTIO_BLK_S_OK ? 0 : -1;
 }
 
@@ -298,7 +331,8 @@ struct claim {
     uint32_t regs, bti;
     uint32_t transport, irq;
     uint64_t offset, size;
-    uint64_t transport_words[4];
+    uint64_t transport_words[3];
+    uint64_t interrupt;
 };
 
 static double time_reads(size_t chunk, uint64_t sectors, int rounds) {
@@ -357,6 +391,7 @@ int main(int argc, char **argv) {
     if (r != 0)
         die("claim (boot with udriver=virtio-blk@N and a disk there)", r);
     transport = c.transport;
+    irq_handle = (zx_handle_t)c.interrupt;
     size_t span = (c.offset + c.size + PAGE - 1) / PAGE * PAGE;
     regs = (volatile uint8_t *)map_handle(c.regs, span) + c.offset;
 
@@ -387,9 +422,11 @@ int main(int argc, char **argv) {
     } else {
         die("unknown transport", transport);
     }
-    printf("zx-virtio-blk: disk #%ld up (%s), %llu sectors, DMA at %#llx\n", index,
+    printf("zx-virtio-blk: disk #%ld up (%s), %llu sectors, DMA at %#llx, irq %d%s\n", index,
            transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO ? "virtio-mmio" : "virtio-pci",
-           (unsigned long long)capacity, (unsigned long long)daddr);
+           (unsigned long long)capacity, (unsigned long long)daddr, (int)c.irq,
+           irq_handle ? "" : " (no interrupt object: polling only)");
+    use_irq = irq_handle != 0;
     if (capacity < 64)
         die("disk too small, sectors", (long)capacity);
 
@@ -421,14 +458,24 @@ int main(int argc, char **argv) {
         printf("zx-virtio-blk: FAIL: %d bytes read back wrong\n", bad);
         return 1;
     }
-    printf("zx-virtio-blk: 16 KiB written and read back right\n");
+    printf("zx-virtio-blk: 16 KiB written and read back right%s\n",
+           use_irq ? ", waiting on the interrupt" : "");
+    if (use_irq && irq_waits == 0)
+        die("the interrupt never came", 0);
 
     uint64_t sectors = capacity < 2048 ? capacity : 2048; // the first MiB
-    double one = time_reads(SECTOR, sectors, rounds);
-    double four = time_reads(4096, sectors, rounds);
-    printf("zx-virtio-blk: read 512 B  %8.1f us per request\n", one / 1000);
-    printf("zx-virtio-blk: read 4 KiB  %8.1f us per request (%.1f MiB/s)\n", four / 1000,
-           4096.0 / four * 1e9 / (1 << 20));
+    for (int mode = irq_handle ? 1 : 0; mode >= 0; mode--) {
+        use_irq = mode;
+        irq_waits = 0;
+        double one = time_reads(SECTOR, sectors, rounds);
+        double four = time_reads(4096, sectors, rounds);
+        const char *how = mode ? "interrupt" : "polling  ";
+        printf("zx-virtio-blk: %s read 512 B  %8.1f us per request\n", how, one / 1000);
+        printf("zx-virtio-blk: %s read 4 KiB  %8.1f us per request (%.1f MiB/s)\n", how,
+               four / 1000, 4096.0 / four * 1e9 / (1 << 20));
+        if (mode)
+            printf("zx-virtio-blk: %llu interrupt waits\n", (unsigned long long)irq_waits);
+    }
     printf("zx-virtio-blk: all checks passed\n");
     return 0;
 }

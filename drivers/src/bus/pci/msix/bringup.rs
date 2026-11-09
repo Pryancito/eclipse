@@ -205,6 +205,24 @@ pub unsafe fn arm_first_vector<T: PortOps, B: BarInfo>(
     if !enabled() {
         return Err(NoHubo::Escotilla);
     }
+    unsafe { arm_first_vector_sin_escotilla(ops, am, loc, dest, irq, bar) }
+}
+
+/// [`arm_first_vector`] sin mirar la escotilla: para el disco que el kernel
+/// deja a un driver en usuario (`crate::user`), que no tiene otro driver al
+/// que la escotilla proteja ni otra interrupción.
+///
+/// # Safety
+///
+/// La misma que [`arm_first_vector`].
+pub unsafe fn arm_first_vector_sin_escotilla<T: PortOps, B: BarInfo>(
+    ops: &T,
+    am: CSpaceAccessMethod,
+    loc: Location,
+    dest: u32,
+    irq: u32,
+    bar: &mut B,
+) -> Result<Armado, NoHubo> {
     let caps = unsafe { find_caps(ops, am, loc) };
     let cap_ptr = caps.msix.ok_or(NoHubo::SinCapacidad)?;
     let cap = unsafe { MsixCap::read(ops, am, loc, cap_ptr) }.ok_or(NoHubo::BirReservado)?;

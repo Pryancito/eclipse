@@ -152,6 +152,17 @@ pub(super) fn intc_init() -> DeviceResult {
     )?;
     irq.unmask(ScauseIntCode::SupervisorSoft as _)?;
     irq.unmask(ScauseIntCode::SupervisorTimer as _)?;
+    // And external interrupts, which are the PLIC's. The device tree wires
+    // the PLIC to every hart's local controller, but it does so from the
+    // boot hart, and `sie` is a per-hart CSR: the `unmask` that wiring does
+    // sets the boot hart's bit, once, whichever hart's controller it was
+    // called on. The other harts never took an external interrupt. Nothing
+    // showed while every source was enabled from the boot hart; a source
+    // unmasked from another hart (the PLIC enables per hart: the userspace
+    // driver's interrupt, `udriver=`, waited on from hart 1) went to a hart
+    // that never looked, and stayed pending for good. A hart whose PLIC
+    // context has no source enabled is not disturbed by this.
+    irq.unmask(ScauseIntCode::SupervisorExternal as _)?;
 
     Ok(())
 }

@@ -53,7 +53,8 @@ pub struct UserDevice {
     pub paddr: usize,
     /// Size of that window, in bytes.
     pub size: usize,
-    /// Its interrupt line on the controller it is wired to, when known.
+    /// Its interrupt, as the number its controller's `IrqScheme` takes,
+    /// when known: the line on a GIC or PLIC, the vector of an MSI on x86.
     pub irq: Option<usize>,
     claimed: AtomicBool,
 }
@@ -113,19 +114,20 @@ pub fn reserve_virtio_blk(
     size: usize,
     irq: Option<usize>,
 ) -> bool {
-    reserve_virtio_blk_if(true, transport, paddr, size, irq)
+    reserve_virtio_blk_if(true, transport, paddr, size, || irq)
 }
 
 /// [`reserve_virtio_blk`] for a disk that may not be fit to hand over
 /// (`usable` false: a PCI disk without a modern transport). It is counted
 /// all the same, so the index of every later disk stays put, and the
-/// kernel keeps it.
+/// kernel keeps it. `irq` is asked only for the disk that is handed over,
+/// so a bus can set up the interrupt of that one disk and no other.
 pub fn reserve_virtio_blk_if(
     usable: bool,
     transport: Transport,
     paddr: usize,
     size: usize,
-    irq: Option<usize>,
+    irq: impl FnOnce() -> Option<usize>,
 ) -> bool {
     let index = SEEN_BLK.fetch_add(1, Ordering::AcqRel);
     let wanted = WANTED.get().copied().flatten();
@@ -136,6 +138,7 @@ pub fn reserve_virtio_blk_if(
         warn!("udriver: {VIRTIO_BLK} #{index} has no transport a userspace driver can use; the kernel keeps it");
         return false;
     }
+    let irq = irq();
     info!(
         "udriver: {VIRTIO_BLK} #{index} at {paddr:#x} (+{size:#x}, irq {irq:?}) left to userspace"
     );

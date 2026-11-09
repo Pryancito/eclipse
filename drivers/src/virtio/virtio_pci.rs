@@ -222,7 +222,7 @@ impl PciDriver for UserVirtioBlkPci {
     fn init(
         &self,
         dev: &PCIDevice,
-        _mapper: &Option<Arc<dyn IoMapper>>,
+        mapper: &Option<Arc<dyn IoMapper>>,
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
         use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
@@ -235,7 +235,22 @@ impl PciDriver for UserVirtioBlkPci {
         // same disk either way.
         let window = user_pci_window(&dev.bars, &caps);
         let (paddr, size, transport) = window.unwrap_or((0, 0, crate::user::Transport::VirtioMmio));
-        crate::user::reserve_virtio_blk_if(window.is_some(), transport, paddr, size, irq);
+        // The handed-over disk gets MSI-X vector 0 armed, hatch or no hatch:
+        // its driver is not the kernel's, and it has no other interrupt (no
+        // MSI, and INTx is not routed). The number recorded is the vector,
+        // which is what the APIC's `register_handler` takes.
+        let loc = dev.loc;
+        crate::user::reserve_virtio_blk_if(window.is_some(), transport, paddr, size, || {
+            let irq = crate::bus::pci::arm_msix_now(loc, mapper, irq).or(irq);
+            // x86 MSI numbers sit 32 below their vectors (`bus::pci::enable`).
+            irq.map(|irq| {
+                if cfg!(target_arch = "x86_64") {
+                    irq + 32
+                } else {
+                    irq
+                }
+            })
+        });
         Err(DeviceError::NotSupported)
     }
 }

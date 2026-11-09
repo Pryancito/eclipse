@@ -274,8 +274,11 @@ impl IrqScheme for IntController {
             .map(|_| ())
     }
 
-    fn unregister(&self, _irq_num: usize) -> DeviceResult {
-        todo!()
+    fn unregister(&self, irq_num: usize) -> DeviceResult {
+        // Off at the distributor first, so the id cannot fire between the
+        // table forgetting its handler and whoever registers it next.
+        self.irq_disable(irq_num as u32);
+        self.manager.lock().unregister_handler(irq_num)
     }
 
     fn init_hart(&self) {

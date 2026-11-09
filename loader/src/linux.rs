@@ -500,12 +500,17 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   interrupt line (high half, `u32::MAX` when unknown).
 /// - word 2: where the window starts inside the VMO.
 /// - word 3: the window's size.
-/// - words 4 to 7: what the transport needs besides. Zero for virtio-mmio,
+/// - words 4 to 6: what the transport needs besides. Zero for virtio-mmio,
 ///   which keeps everything in its one window. For modern virtio-pci (2),
 ///   where the window is the memory BAR holding the four structures: the
 ///   offsets in the window of the common (low) and notify (high)
 ///   structures, of the ISR (low) and device (high) ones, then
-///   `notify_off_multiplier`, then zero.
+///   `notify_off_multiplier`. Word 7, on either transport, is a handle to
+///   the device's interrupt (0 when there is none to give: no line known,
+///   or no controller to take it), for `zx_interrupt_wait` and
+///   `zx_interrupt_bind`. A level-triggered line (virtio-mmio) is masked
+///   when it fires and unmasked by the next wait or ack, so the driver
+///   quiets the device in between; an MSI (virtio-pci) is not masked.
 ///
 /// `kind` 1 is a virtio block device. `NOT_FOUND` when no such device was
 /// reserved, `ALREADY_BOUND` once something has claimed it: one driver per
@@ -795,76 +800,6 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
     }
 }
 
-/// [`ECLIPSE_DEVICE_CLAIM`].
-#[cfg(feature = "zircon-gateway")]
-fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
-    use kernel_hal::drivers::user::{self, Transport};
-    use kernel_hal::{CachePolicy, PAGE_SIZE};
-    use zircon_object::dev::{BusTransactionInitiator, Iommu};
-    use zircon_object::object::{Handle, Rights};
-    use zircon_object::vm::VmObject;
-    let kind = match args[0] {
-        ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
-        _ => return Err(ZxError::INVALID_ARGS),
-    };
-    let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
-    // Look before taking anything: a bad pointer must not cost the device.
-    out.write_array(&[0; CLAIM_WORDS])
-        .map_err(|_| ZxError::INVALID_ARGS)?;
-    let device = user::find(kind, args[1]).ok_or(ZxError::NOT_FOUND)?;
-    let base = device.paddr & !(PAGE_SIZE - 1);
-    let end = device
-        .paddr
-        .checked_add(device.size)
-        .and_then(|end| end.checked_add(PAGE_SIZE - 1))
-        .ok_or(ZxError::OUT_OF_RANGE)?
-        & !(PAGE_SIZE - 1);
-    if !device.claim() {
-        return Err(ZxError::ALREADY_BOUND);
-    }
-    let regs = VmObject::new_physical(base, (end - base) / PAGE_SIZE);
-    regs.set_cache_policy(CachePolicy::UncachedDevice)?;
-    let bti = BusTransactionInitiator::create(Iommu::create(), 0);
-    let regs = proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO));
-    let bti = proc.add_handle(Handle::new(bti, Rights::DEFAULT_BTI));
-    let pair = |lo: u32, hi: u32| lo as u64 | (hi as u64) << 32;
-    let (transport, extra) = match device.transport {
-        Transport::VirtioMmio => (ECLIPSE_TRANSPORT_VIRTIO_MMIO, [0; 4]),
-        Transport::VirtioPci {
-            common,
-            notify,
-            isr,
-            device,
-            notify_multiplier,
-        } => (
-            ECLIPSE_TRANSPORT_VIRTIO_PCI,
-            [
-                pair(common, notify),
-                pair(isr, device),
-                notify_multiplier as u64,
-                0,
-            ],
-        ),
-    };
-    let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
-    let words: [u64; CLAIM_WORDS] = [
-        pair(regs, bti),
-        transport | (irq as u64) << 32,
-        (device.paddr - base) as u64,
-        device.size as u64,
-        extra[0],
-        extra[1],
-        extra[2],
-        extra[3],
-    ];
-    if out.write_array(&words).is_err() {
-        let _ = proc.remove_handle(regs);
-        let _ = proc.remove_handle(bti);
-        return Err(ZxError::INVALID_ARGS);
-    }
-    Ok(())
-}
-
 /// Whether a Linux process may make Zircon syscall `zx_num` through the
 /// gateway: the objects a userspace server needs (channels, ports, events,
 /// FIFOs, sockets, timers, VMOs, handles, waits) and nothing else.
@@ -872,9 +807,10 @@ fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 /// Left out on purpose: thread and process lifecycle (`thread_exit` and the
 /// like would skip the Linux teardown: `clear_child_tid`, the exit
 /// futex, the parent's `wait`), VMAR mappings (the Linux memory map owns the
-/// address space), resources and interrupts. Of the DDK only what DMA
-/// memory takes is let through, and all of it needs the BTI that
-/// [`ECLIPSE_DEVICE_CLAIM`] hands out with a claimed device.
+/// address space), resources, and making interrupts. Of the DDK only what
+/// DMA memory and waiting on an interrupt take is let through, and all of
+/// it needs the BTI or the interrupt that [`ECLIPSE_DEVICE_CLAIM`] hands
+/// out with a claimed device.
 #[cfg(feature = "zircon-gateway")]
 fn zircon_gateway_allows(zx_num: u32) -> bool {
     matches!(
@@ -905,6 +841,9 @@ fn zircon_gateway_allows(zx_num: u32) -> bool {
         // takes the BTI only that call hands out. bti_pin,
         // bti_release_quarantine, pmt_unpin, vmo_create_contiguous
         | 1 | 2 | 89 | 193
+        // Its interrupt: interrupt_ack, interrupt_bind, interrupt_destroy,
+        // interrupt_wait
+        | 49 | 50 | 52 | 54
     )
 }
 
@@ -2840,6 +2779,11 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
 #[cfg(target_arch = "x86_64")]
 mod sigframe32;
 
+#[cfg(feature = "zircon-gateway")]
+mod device_claim;
+#[cfg(feature = "zircon-gateway")]
+use device_claim::claim_device;
+
 #[cfg(test)]
 mod user_trap_tests;
 
@@ -3733,6 +3677,18 @@ mod zircon_gateway_tests {
         }
         // bti_create, iommu_create, resource_create, vmo_create_physical
         for n in [0, 59, 102, 194] {
+            assert!(!zircon_gateway_allows(n), "{} should be refused", n);
+        }
+    }
+
+    #[test]
+    fn the_gateway_lets_a_driver_wait_on_its_interrupt_but_not_make_one() {
+        // interrupt_ack, interrupt_bind, interrupt_destroy, interrupt_wait
+        for n in [49, 50, 52, 54] {
+            assert!(zircon_gateway_allows(n), "{} should pass", n);
+        }
+        // interrupt_create, interrupt_trigger
+        for n in [51, 53] {
             assert!(!zircon_gateway_allows(n), "{} should be refused", n);
         }
     }
