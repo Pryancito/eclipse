@@ -94,6 +94,27 @@ pub fn set_idle_callback(f: fn() -> bool) {
     IDLE_CALLBACK.store(f as usize, Ordering::Release);
 }
 
+/// "Is there idle work waiting?" -- the cheap question the idle poll asks
+/// between looks at the queue, so that work the idle callback would do (a
+/// driver job pushed from an interrupt) ends the poll instead of waiting out
+/// the window. Registered by the kernel next to the idle callback.
+static IDLE_WORK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_idle_work_hook(f: fn() -> bool) {
+    IDLE_WORK_HOOK.store(f as usize, Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn idle_work_pending() -> bool {
+    let Some(f) = lock::fn_slot::live_fn(IDLE_WORK_HOOK.load(Ordering::Acquire)) else {
+        return false;
+    };
+    // SAFETY: the word came from `set_idle_work_hook`, which only takes a
+    // `fn() -> bool`, and `live_fn` has judged it to be inside the kernel text.
+    let f: fn() -> bool = unsafe { core::mem::transmute(f) };
+    f()
+}
+
 pub(crate) fn run_idle_callback() -> bool {
     let f = IDLE_CALLBACK.load(Ordering::Acquire);
     if f != 0 {
@@ -1065,7 +1086,7 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
 /// delivered the CPU separates them, and costs one relaxed store per entry.
 ///
 /// Values, as published by [`note_entry_reason`]:
-pub const WAKE_ENTRY_REASONS: usize = 6;
+pub const WAKE_ENTRY_REASONS: usize = 7;
 /// No entry point has published a reason on this CPU yet, or the claim came
 /// from somewhere this crate does not instrument (a steal by a peer, the
 /// collection's own maintenance). Not an error: a bucket that is supposed to
@@ -1107,6 +1128,10 @@ pub const WAKE_ENTRY_HALT_TIMER: u8 = 5;
 /// waiting out a slice, so it is kept apart from both rather than folded into
 /// whichever looked closest.
 pub const WAKE_ENTRY_RESUMED: u8 = 4;
+/// The scan follows the idle poll finding work ([`halt_poll`]): the CPU had
+/// run out of tasks and was polling its queue before halting, and the wake
+/// came inside the window. No IPI, no halt and no interrupt exit.
+pub const WAKE_ENTRY_HALT_POLLED: u8 = 6;
 
 /// The last entry reason published by each CPU.
 ///
@@ -1219,6 +1244,131 @@ pub fn set_resched_ipi_sender(f: fn(usize)) {
     RESCHED_IPI_SENDER.store(f as usize, Ordering::Release);
 }
 
+// ─── Idle poll before halting ──────────────────────────────────────────────
+//
+// A CPU that runs out of work polls its own run queue for a short window
+// before it halts, as Linux's `cpuidle-haltpoll` does in a guest. A wake that
+// lands in the window costs a store and a load: no reschedule IPI is sent to a
+// polling CPU (see `POLLING_CPUS`), and there is no halt to come out of.
+//
+// It is for request/reply traffic between CPUs, where every message is a
+// cross-CPU wake: a client writes to a server's FIFO and sleeps waiting for
+// the reply, which comes back tens of microseconds later. Each of those wakes
+// used to be an IPI into a halted CPU, and under QEMU that is the slow path:
+// a two-process FIFO ping-pong cost 193 us asleep against 71 us with both
+// sides spinning in user space.
+//
+// The price is the window itself, spent spinning whenever a CPU goes idle --
+// on an idle machine once per timer tick. `HALTPOLL=0` on the command line
+// turns it off; `HALTPOLL=N` sets it to N microseconds.
+
+/// Default idle poll window, in nanoseconds.
+pub const HALT_POLL_DEFAULT_NS: u64 = 100_000;
+
+/// The idle poll window in nanoseconds; 0 halts straight away.
+///
+/// Off in this crate's own tests: their executors share CPU 0's queue and
+/// hand-off slot, and an executor spinning in the poll looks at them far more
+/// often than one that halts. The poll's own tests turn it on.
+static HALT_POLL_NS: AtomicU64 = AtomicU64::new(if cfg!(test) { 0 } else { HALT_POLL_DEFAULT_NS });
+
+/// CPUs inside the idle poll (bit i = CPU i). A waker that sees the bit sends
+/// no IPI: the poller is looking at its queue anyway.
+static POLLING_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Idle polls that found work, and idle polls that ran out and halted.
+static HALT_POLL_HITS: AtomicU64 = AtomicU64::new(0);
+static HALT_POLL_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Set the idle poll window; 0 turns it off.
+pub fn set_halt_poll_ns(ns: u64) {
+    HALT_POLL_NS.store(ns, Ordering::Relaxed);
+}
+
+/// `(window ns, polls that found work, polls that halted)` for `/proc/perf`.
+pub fn halt_poll_stats() -> (u64, u64, u64) {
+    (
+        HALT_POLL_NS.load(Ordering::Relaxed),
+        HALT_POLL_HITS.load(Ordering::Relaxed),
+        HALT_POLL_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether `cpu` is in the idle poll.
+#[inline]
+fn cpu_polling(cpu: usize) -> bool {
+    cpu < MAX_CORE_NUM && POLLING_CPUS.load(Ordering::SeqCst) & (1 << cpu) != 0
+}
+
+/// How many looks at the queue [`halt_poll`] takes between clock reads.
+const HALT_POLL_CLOCK_EVERY: u32 = 64;
+
+/// Poll `ready` for up to the idle poll window. True when it said yes (or a
+/// reschedule request for this CPU came in), and the caller goes back to its
+/// queue instead of halting. False when the window ran out, or `stop` said
+/// there is other work to do first -- the idle callback's.
+///
+/// It runs before the idle callback, not after: the callback is what gets a
+/// CPU ready to halt (it stretches the scheduler tick, which is a timer write
+/// on the way in and another on the way out), and a wake caught in the poll
+/// needs none of that.
+///
+/// The bit is published before the first look and cleared after the last,
+/// both SeqCst, against the waker's notify-then-load: a waker that saw the
+/// bit and sent nothing had published its wake before its load, so either a
+/// look inside the window sees it, or it is ordered before the clear and the
+/// caller's pre-halt recheck sees it.
+pub(crate) fn halt_poll(cpu: usize, ready: impl Fn() -> bool, stop: impl Fn() -> bool) -> bool {
+    let window = HALT_POLL_NS.load(Ordering::Relaxed);
+    if window == 0 || cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    let Some(start) = now_ns() else {
+        return false;
+    };
+    // Interrupts open for the window, as the halt it stands in for has them:
+    // a device interrupt that lands while this CPU polls is the very wake it
+    // is polling for. The executor loop reaches here with them masked more
+    // often than not, and then every interrupt-driven wake waited out the
+    // whole window. Put back before returning.
+    let _interrupts = crate::InterruptGuard::new(true);
+    let bit = 1u64 << cpu;
+    POLLING_CPUS.fetch_or(bit, Ordering::SeqCst);
+    let mut found = ready();
+    let mut spins = 0u32;
+    while !found {
+        // Something else asked this CPU to look (an IRQ-raised wake, a
+        // preemption request): stop polling and let the loop take it.
+        if NEED_RESCHED.load(Ordering::Relaxed) & bit != 0 {
+            found = true;
+            break;
+        }
+        if stop() {
+            break;
+        }
+        // The clock only every `HALT_POLL_CLOCK_EVERY` looks: it is the
+        // costliest thing in the loop (a barrier and a counter read on
+        // aarch64, a trapped CSR under some hypervisors on riscv), and the
+        // window does not need nanosecond edges.
+        spins += 1;
+        if spins % HALT_POLL_CLOCK_EVERY == 0 {
+            match now_ns() {
+                Some(now) if now.wrapping_sub(start) < window => {}
+                _ => break,
+            }
+        }
+        core::hint::spin_loop();
+        found = ready();
+    }
+    POLLING_CPUS.fetch_and(!bit, Ordering::SeqCst);
+    if found {
+        HALT_POLL_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        HALT_POLL_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    found
+}
+
 /// Executor-side: publish/clear this CPU's "about to halt" flag. SeqCst so the
 /// flag RMW orders against the subsequent queue recheck (see `Executor::run`).
 pub(crate) fn set_cpu_sleeping(cpu: usize, sleeping: bool) {
@@ -1312,6 +1462,12 @@ pub(crate) fn request_resched(owner: u8) {
         RESCHED_REQUESTED.fetch_add(1, Ordering::Relaxed);
     } else if !sleeping && owner != crate::arch::cpu_id() as usize {
         RESCHED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+    // A CPU in the idle poll is looking at its queue already: an IPI would
+    // only interrupt the look. Its pre-halt recheck covers the race with the
+    // end of the poll (see `halt_poll`).
+    if !sleeping && cpu_polling(owner) {
+        return;
     }
     if sleeping || (!already_pending && owner != crate::arch::cpu_id() as usize) {
         send_resched_ipi(owner);
@@ -4689,6 +4845,7 @@ mod wake_latency_tests {
             WAKE_ENTRY_HALT_KICKED,
             WAKE_ENTRY_RESUMED,
             WAKE_ENTRY_HALT_TIMER,
+            WAKE_ENTRY_HALT_POLLED,
         ];
         assert_eq!(all.len(), WAKE_ENTRY_REASONS, "a reason without a counter");
         for (i, r) in all.iter().enumerate() {
@@ -4870,6 +5027,7 @@ mod resched_tests {
         let guard = test_lock();
         NEED_RESCHED.store(0, Ordering::SeqCst);
         SLEEPING_CPUS.store(0, Ordering::SeqCst);
+        POLLING_CPUS.store(0, Ordering::SeqCst);
         KICKED.store(0, Ordering::SeqCst);
         KICK_COUNT.store(0, Ordering::SeqCst);
         WAKEUP_PREEMPT.store(true, Ordering::SeqCst);
@@ -4896,6 +5054,161 @@ mod resched_tests {
         assert!(pending(2), "CPU 2 was never told to look at its run queue");
         assert_eq!(kicked(), 1 << 2);
         assert_eq!(kicks(), 1);
+    }
+
+    /// A clock for the idle poll tests: each read is 10 us after the last.
+    static FAKE_NOW: AtomicU64 = AtomicU64::new(0);
+    fn ticking_clock() -> u64 {
+        FAKE_NOW.fetch_add(10_000, Ordering::SeqCst)
+    }
+
+    /// Run `body` with the idle poll window set to `ns` and the ticking clock
+    /// installed, putting both back after.
+    fn with_halt_poll<T>(ns: u64, body: impl FnOnce() -> T) -> T {
+        let saved_clock = NOW_NS_HOOK.swap(ticking_clock as usize, Ordering::SeqCst);
+        let saved_window = HALT_POLL_NS.swap(ns, Ordering::SeqCst);
+        let r = body();
+        HALT_POLL_NS.store(saved_window, Ordering::SeqCst);
+        NOW_NS_HOOK.store(saved_clock, Ordering::SeqCst);
+        r
+    }
+
+    #[test]
+    fn the_idle_poll_takes_work_that_is_already_there_without_spinning() {
+        let _g = fresh();
+        let (_, hits, _) = halt_poll_stats();
+        let looks = AtomicU64::new(0);
+        let found = with_halt_poll(100_000, || {
+            halt_poll(
+                3,
+                || {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+                || false,
+            )
+        });
+        assert!(found);
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+        assert_eq!(halt_poll_stats().1, hits + 1);
+        assert_eq!(
+            POLLING_CPUS.load(Ordering::SeqCst),
+            0,
+            "the bit outlived the poll"
+        );
+    }
+
+    #[test]
+    fn the_idle_poll_catches_a_wake_inside_the_window() {
+        let _g = fresh();
+        let looks = AtomicU64::new(0);
+        // The third look sees the task, 20 us in: well inside 100 us.
+        let found = with_halt_poll(100_000, || {
+            halt_poll(3, || looks.fetch_add(1, Ordering::SeqCst) == 2, || false)
+        });
+        assert!(found);
+        assert_eq!(looks.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn the_idle_poll_gives_up_at_the_end_of_the_window() {
+        let _g = fresh();
+        let (_, _, misses) = halt_poll_stats();
+        let looks = AtomicU64::new(0);
+        let found = with_halt_poll(50_000, || {
+            halt_poll(
+                3,
+                || {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+                || false,
+            )
+        });
+        assert!(!found, "nothing was ever ready");
+        // A clock read every HALT_POLL_CLOCK_EVERY looks, 10 us apart,
+        // against a 50 us window: a handful of reads, not an unbounded spin.
+        let n = looks.load(Ordering::SeqCst);
+        let every = HALT_POLL_CLOCK_EVERY as u64;
+        assert!(
+            (2 * every..=7 * every).contains(&n),
+            "{} looks in a 50 us window",
+            n
+        );
+        assert_eq!(halt_poll_stats().2, misses + 1);
+        assert_eq!(POLLING_CPUS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_idle_poll_of_no_time_does_not_look_at_all() {
+        let _g = fresh();
+        let looked = AtomicBool::new(false);
+        let found = with_halt_poll(0, || {
+            halt_poll(
+                3,
+                || {
+                    looked.store(true, Ordering::SeqCst);
+                    true
+                },
+                || false,
+            )
+        });
+        assert!(!found && !looked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn idle_work_ends_the_idle_poll_without_claiming_a_task() {
+        let _g = fresh();
+        let looks = AtomicU64::new(0);
+        let found = with_halt_poll(1_000_000_000, || {
+            halt_poll(
+                3,
+                || {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+                || true,
+            )
+        });
+        // False: the caller is to run the idle callback, not look at its
+        // queue again -- the queue is empty, and looking again would poll
+        // straight back into the same idle work.
+        assert!(!found);
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_reschedule_request_ends_the_idle_poll() {
+        let _g = fresh();
+        NEED_RESCHED.store(1 << 3, Ordering::SeqCst);
+        let looks = AtomicU64::new(0);
+        let found = with_halt_poll(1_000_000_000, || {
+            halt_poll(
+                3,
+                || {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+                || false,
+            )
+        });
+        assert!(found, "the poll sat out a second with a request pending");
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_wake_for_a_polling_cpu_sends_no_ipi_but_one_for_a_halted_cpu_does() {
+        let _g = fresh();
+        POLLING_CPUS.store(1 << 3, Ordering::SeqCst);
+        request_resched(3);
+        assert!(pending(3), "the poller is told through the request bit");
+        assert_eq!(kicks(), 0, "an IPI was sent to a CPU polling its queue");
+        // Past the poll and into the halt: the kick is needed again.
+        POLLING_CPUS.store(0, Ordering::SeqCst);
+        set_cpu_sleeping(3, true);
+        request_resched(3);
+        assert_eq!(kicks(), 1, "a halted CPU slept through the wake");
+        set_cpu_sleeping(3, false);
     }
 
     #[test]

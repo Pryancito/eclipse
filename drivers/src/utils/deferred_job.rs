@@ -62,8 +62,21 @@ std::thread_local! {
 #[cfg(not(test))]
 fn with_jobs<R>(f: impl FnOnce(&mut VecDeque<Job>) -> R) -> R {
     let mut q = JOBS.lock();
-    f(&mut q)
+    let r = f(&mut q);
+    QUEUED.store(q.len(), Ordering::Release);
+    r
 }
+
+/// The queue's length as of its last change, for [`pending_deferred_jobs`].
+///
+/// Kept beside the queue so the question "is there any?" takes no lock. The
+/// idle CPU's poll asks it on every look, and through the queue's lock --
+/// which masks interrupts while held and is shared by every CPU -- that poll
+/// spent nearly all its time with interrupts off and fighting the other idle
+/// CPU for the line: the device interrupt it was waiting for could not land
+/// until the poll gave up.
+#[cfg(not(test))]
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 fn with_jobs<R>(f: impl FnOnce(&mut VecDeque<Job>) -> R) -> R {
@@ -200,6 +213,9 @@ pub fn drain_deferred_jobs_max(max: usize) {
 
 /// Number of queued jobs (best-effort snapshot).
 pub fn pending_deferred_jobs() -> usize {
+    #[cfg(not(test))]
+    return QUEUED.load(Ordering::Acquire);
+    #[cfg(test)]
     with_jobs(|q| q.len())
 }
 

@@ -306,7 +306,7 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
 ///
 /// Spelled and asserted here for the same reason as the bucket count above:
 /// the libos build has to name the same width for its zeros.
-pub const WAKE_ENTRY_REASONS: usize = 6;
+pub const WAKE_ENTRY_REASONS: usize = 7;
 
 #[cfg(target_os = "none")]
 const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
@@ -362,6 +362,18 @@ pub fn resched_ipis_sent() -> u64 {
 #[cfg(not(target_os = "none"))]
 pub fn resched_ipis_sent() -> u64 {
     0
+}
+
+/// `(window ns, idle polls that found work, idle polls that halted)`: the
+/// poll a CPU does before halting (`HALTPOLL`).
+#[cfg(target_os = "none")]
+pub fn halt_poll_stats() -> (u64, u64, u64) {
+    executor::halt_poll_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn halt_poll_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 /// `(deadline timer enabled, wake-up preemption enabled)`.

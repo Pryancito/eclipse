@@ -967,7 +967,12 @@ impl TaskCollection {
         if self.cpu_id as usize != cpu {
             return None;
         }
-        let (page_addr, subpage_idx) = crate::waker_page::take_handoff(cpu)?;
+        let (page_addr, subpage_idx) = crate::waker_page::take_handoff(cpu, |addr| {
+            inner
+                .pages
+                .iter()
+                .any(|page| Arc::as_ptr(page) as usize == addr)
+        })?;
         if cursor.handoff_streak >= HANDOFF_LIMIT {
             cursor.handoff_streak = 0;
             return None;
@@ -1919,7 +1924,8 @@ mod collection_tests {
         hint(&tc, b);
         assert_eq!(tc.take_task().unwrap().0, a);
         assert!(
-            crate::waker_page::take_handoff(0).is_none(),
+            crate::waker_page::take_handoff(0, |addr| addr == Arc::as_ptr(&page) as usize)
+                .is_none(),
             "the hint was consumed"
         );
     }

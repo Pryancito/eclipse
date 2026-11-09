@@ -479,6 +479,14 @@ static int fifo_wait(zx_handle_t f, int spin, struct blk_msg *m, size_t n, size_
 
 static int64_t serve_one(struct blk_msg *m, int *spin) {
     if (m->op == BLK_OP_MODE) {
+        // Where the requests of the mode that just ended spent their time
+        // waiting on the device, as the driver's own timing above says it.
+        if (use_irq && slept)
+            printf("zx-virtio-blk: served, %llu slept on the device: notify to interrupt "
+                   "%.1f us, interrupt to driver %.1f us\n",
+                   (unsigned long long)slept, to_irq_ns / 1000.0 / slept,
+                   to_wake_ns / 1000.0 / slept);
+        slept = to_irq_ns = to_wake_ns = 0;
         *spin = (m->sector & BLK_MODE_SPIN) != 0;
         use_irq = (m->sector & BLK_MODE_IRQ) && irq_handle;
         return 0;

@@ -36,6 +36,9 @@
 #define ZX_SYS_channel_create 7
 #define ZX_SYS_channel_read 8
 #define ZX_SYS_channel_write 10
+#define ZX_SYS_fifo_create 34
+#define ZX_SYS_fifo_read 35
+#define ZX_SYS_fifo_write 36
 #define ZX_SYS_handle_close 45
 #define ZX_SYS_object_wait_one 81
 
@@ -159,6 +162,67 @@ static uint64_t pipe_rounds(int req, int rep, long rounds) {
         if (write(req, buf, sizeof buf) != (ssize_t)sizeof buf ||
             read(rep, buf, sizeof buf) != (ssize_t)sizeof buf) {
             perror("pipe round trip");
+            return 0;
+        }
+    }
+    return (now_ns() - t0) / rounds;
+}
+
+// A FIFO element's worth, as a block FIFO request is.
+#define FIFO_ELEM 32
+
+static long fifo_read1(zx_handle_t h, void *buf) {
+    size_t n = 0;
+    return zx_status(zx(ZX_SYS_fifo_read, h, FIFO_ELEM, (long)buf, 1, (long)&n, 0));
+}
+
+static long fifo_write1(zx_handle_t h, const void *buf) {
+    size_t n = 0;
+    return zx_status(zx(ZX_SYS_fifo_write, h, FIFO_ELEM, (long)buf, 1, (long)&n, 0));
+}
+
+// One element out of `h`, sleeping in zx_object_wait_one while there is
+// none, as a block client or server does. 0, or <0 once the peer is gone.
+static long fifo_take(zx_handle_t h, void *buf) {
+    for (;;) {
+        long r = fifo_read1(h, buf);
+        if (r != ZX_ERR_SHOULD_WAIT)
+            return r;
+        uint32_t observed = 0;
+        r = zx_status(zx(ZX_SYS_object_wait_one, h, ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
+                         ZX_TIME_INFINITE, (long)&observed, 0, 0));
+        if (r < 0 || !(observed & ZX_CHANNEL_READABLE))
+            return -1;
+    }
+}
+
+// The same, spinning on zx_fifo_read instead of sleeping: what the round
+// trip costs without the sleep and the wake.
+static long fifo_spin(zx_handle_t h, void *buf) {
+    long r;
+    while ((r = fifo_read1(h, buf)) == ZX_ERR_SHOULD_WAIT)
+        ;
+    return r;
+}
+
+// Echo until the peer goes. The first byte of each element says how to wait
+// for the next one: 0 sleeps, 1 spins.
+static void fifo_server(zx_handle_t h) {
+    uint8_t buf[FIFO_ELEM] = {0};
+    while ((buf[0] ? fifo_spin(h, buf) : fifo_take(h, buf)) == 0)
+        if (fifo_write1(h, buf) < 0)
+            break;
+}
+
+// Mean ns per FIFO write+read pair against an echoing server; 0 on failure.
+static uint64_t fifo_rounds(zx_handle_t h, long rounds, int spin) {
+    uint8_t buf[FIFO_ELEM] = {(uint8_t)spin};
+    uint64_t t0 = 0;
+    for (long i = -rounds / 10; i < rounds; i++) {
+        if (i == 0)
+            t0 = now_ns();
+        if (fifo_write1(h, buf) < 0 || (spin ? fifo_spin(h, buf) : fifo_take(h, buf)) < 0) {
+            fprintf(stderr, "zx-ipc-bench: fifo round trip failed\n");
             return 0;
         }
     }
@@ -358,7 +422,46 @@ int main(int argc, char **argv) {
     if (child_status(pid) != 0 || !pipe2_ns)
         return 1;
 
+    // A FIFO, as the block driver serves its client: write, then read,
+    // sleeping in object_wait_one when there is nothing yet.
+    zx_handle_t f0 = 0, f1 = 0;
+    if (zx_status(zx(ZX_SYS_fifo_create, 16, FIFO_ELEM, 0, (long)&f0, (long)&f1, 0)) < 0)
+        return 1;
+    long ffd = zx_status(zx(ECLIPSE_SYS_handle_to_fd, f1, 0, 0, 0, 0, 0));
+    if (ffd < 0)
+        return 1;
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        zx_handle_t h = 0;
+        if (zx_status(zx(ECLIPSE_SYS_fd_to_handle, ffd, ECLIPSE_FD_TAKE, (long)&h, 0, 0, 0)) < 0)
+            _exit(1);
+        close((int)ffd);
+        fifo_server(h);
+        _exit(0);
+    }
+    close((int)ffd);
+    if (stats)
+        dump_wake_stats("before fifo");
+    uint64_t fifo2_ns = fifo_rounds(f0, rounds, 0);
+    uint64_t fifo2_spin_ns = fifo_rounds(f0, rounds, 1);
+    // Back to sleeping, so the server is not left spinning on the close.
+    if (!fifo_rounds(f0, 1, 0))
+        fifo2_ns = 0;
+    if (stats)
+        dump_wake_stats("after fifo");
+    zx(ZX_SYS_handle_close, f0, 0, 0, 0, 0, 0);
+    if (child_status(pid) != 0 || !fifo2_ns) {
+        fprintf(stderr, "zx-ipc-bench: the fifo server process failed\n");
+        return 1;
+    }
+
     printf("zx-ipc-bench: %ld round trips, 32 bytes, two processes\n", rounds);
+    printf("zx-ipc-bench: fifo ping-pong %8llu ns (2 procs)\n", (unsigned long long)fifo2_ns);
+    printf("zx-ipc-bench: fifo spinning  %8llu ns (2 procs)\n", (unsigned long long)fifo2_spin_ns);
     printf("zx-ipc-bench: channel call   %8llu ns (2 procs)\n", (unsigned long long)zx2_ns);
     printf("zx-ipc-bench: pipe ping-pong %8llu ns (2 procs)\n", (unsigned long long)pipe2_ns);
     printf("zx-ipc-bench: channel/pipe   %8.2f (2 procs)\n", (double)zx2_ns / (double)pipe2_ns);
