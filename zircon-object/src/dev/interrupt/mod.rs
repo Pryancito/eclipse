@@ -25,6 +25,37 @@ trait InterruptTrait: Sync + Send {
     fn unregister_handler(&self) -> ZxResult;
 }
 
+/// An interrupt line some other code owns, for [`Interrupt::new_line`]:
+/// the controller of a device handed to a userspace driver, say. The
+/// handler runs in interrupt context.
+pub trait IrqLine: Sync + Send {
+    /// Stop the line from interrupting.
+    fn mask(&self);
+    /// Let it interrupt again.
+    fn unmask(&self);
+    /// Run `handler` on every interrupt of the line, from now on.
+    fn register_handler(&self, handler: Box<dyn Fn() + Send + Sync>) -> ZxResult;
+    /// Stop running it.
+    fn unregister_handler(&self) -> ZxResult;
+}
+
+struct LineInterrupt(Box<dyn IrqLine>);
+
+impl InterruptTrait for LineInterrupt {
+    fn mask(&self) {
+        self.0.mask()
+    }
+    fn unmask(&self) {
+        self.0.unmask()
+    }
+    fn register_handler(&self, handler: Box<dyn Fn() + Send + Sync>) -> ZxResult {
+        self.0.register_handler(handler)
+    }
+    fn unregister_handler(&self) -> ZxResult {
+        self.0.unregister_handler()
+    }
+}
+
 impl_kobject!(Interrupt);
 
 /// Interrupts - Usermode I/O interrupt delivery.
@@ -98,6 +129,36 @@ impl Interrupt {
             flags: InterruptFlags::empty(),
             inner: Default::default(),
             trait_: EventInterrupt::new(vector),
+        });
+        let interrupt_clone = interrupt.clone();
+        interrupt
+            .trait_
+            .register_handler(Box::new(move || interrupt_clone.handle_interrupt()))?;
+        interrupt.trait_.unmask();
+        Ok(interrupt)
+    }
+
+    /// An interrupt object over a line another driver owns ([`IrqLine`]).
+    ///
+    /// A `level` line stays asserted until the device is serviced, which
+    /// here happens in userspace, long after the handler has returned: so
+    /// the handler masks it (`MASK_POSTWAIT`) and the next wait or ack
+    /// unmasks it (`UNMASK_PREWAIT`), once the driver has had its chance to
+    /// quiet the device. Without that the line would interrupt again the
+    /// moment the handler returned, forever. An edge line (an MSI) is left
+    /// unmasked throughout.
+    pub fn new_line(line: Box<dyn IrqLine>, level: bool) -> ZxResult<Arc<Self>> {
+        let flags = if level {
+            InterruptFlags::MASK_POSTWAIT | InterruptFlags::UNMASK_PREWAIT
+        } else {
+            InterruptFlags::empty()
+        };
+        let interrupt = Arc::new(Interrupt {
+            base: KObjectBase::new(),
+            has_vcpu: false,
+            flags,
+            inner: Default::default(),
+            trait_: Box::new(LineInterrupt(line)),
         });
         let interrupt_clone = interrupt.clone();
         interrupt
@@ -889,5 +950,70 @@ mod tests {
         // And the first one is still there, and still gets its interrupt.
         interrupt.trigger(4242).unwrap();
         assert_eq!(answers("the first waiter", first).await, Ok(4242));
+    }
+
+    /// A line that records what was done to it, and fires on demand.
+    #[derive(Default)]
+    struct FakeLine {
+        masked: core::sync::atomic::AtomicBool,
+        handler: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl IrqLine for Arc<FakeLine> {
+        fn mask(&self) {
+            self.masked.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
+        fn unmask(&self) {
+            self.masked.store(false, core::sync::atomic::Ordering::SeqCst);
+        }
+        fn register_handler(&self, handler: Box<dyn Fn() + Send + Sync>) -> ZxResult {
+            *self.handler.lock() = Some(handler);
+            Ok(())
+        }
+        fn unregister_handler(&self) -> ZxResult {
+            self.handler.lock().take().map(|_| ()).ok_or(ZxError::NOT_FOUND)
+        }
+    }
+
+    impl FakeLine {
+        fn fire(&self) {
+            (self.handler.lock().as_ref().unwrap())();
+        }
+        fn is_masked(&self) -> bool {
+            self.masked.load(core::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_std::test]
+    async fn a_level_line_is_masked_when_it_fires_and_unmasked_by_the_next_wait() {
+        let line = Arc::new(FakeLine::default());
+        let interrupt = Interrupt::new_line(Box::new(line.clone()), true).unwrap();
+        assert!(!line.is_masked(), "taken unmasked");
+        line.fire();
+        assert!(line.is_masked(), "masked until the driver has quieted the device");
+        assert!(answers("a fired line", interrupt.wait()).await.is_ok());
+        assert!(line.is_masked(), "a wait that returns at once does not unmask");
+        // The next wait unmasks before it sleeps.
+        let waiter = {
+            let interrupt = interrupt.clone();
+            async_std::task::spawn(async move { interrupt.wait().await })
+        };
+        while line.is_masked() {
+            async_std::task::yield_now().await;
+        }
+        line.fire();
+        assert!(answers("the second interrupt", waiter).await.is_ok());
+        interrupt.destroy().unwrap();
+        assert!(line.handler.lock().is_none(), "destroy gives the line back");
+    }
+
+    #[async_std::test]
+    async fn an_edge_line_is_never_masked() {
+        let line = Arc::new(FakeLine::default());
+        let interrupt = Interrupt::new_line(Box::new(line.clone()), false).unwrap();
+        line.fire();
+        assert!(!line.is_masked());
+        assert!(answers("a fired line", interrupt.wait()).await.is_ok());
+        assert!(!line.is_masked());
     }
 }

@@ -98,7 +98,6 @@ impl<const IRQ_COUNT: usize> IrqManager<IRQ_COUNT> {
         Ok(irq_num)
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
     pub fn unregister_handler(&mut self, irq_num: usize) -> DeviceResult {
         info!("IRQ unregister handler {}", irq_num);
         if !self.allocator.is_alloced(irq_num) {

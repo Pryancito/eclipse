@@ -417,10 +417,31 @@ fn arm_msix(
     if !msix::bringup::enabled() {
         return None;
     }
+    arm_msix_now(loc, mapper, irq)
+}
+
+/// [`arm_msix`] with the hatch ignored: for a device the kernel hands to a
+/// userspace driver (`crate::user`), which has no kernel driver for the
+/// hatch to protect and gets no interrupt at all otherwise -- QEMU's
+/// virtio-blk-pci offers MSI-X and no MSI. Only vector 0 is armed; the
+/// table stays in a BAR the driver is not given.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn arm_msix_now(
+    loc: Location,
+    mapper: &Option<Arc<dyn IoMapper>>,
+    irq: Option<usize>,
+) -> Option<usize> {
     let irq = irq.map(|i| i as u32).unwrap_or_else(next_msi_irq);
     let mut bar = MachineBar { loc, mapper };
     match unsafe {
-        msix::bringup::arm_first_vector(&PortOpsImpl, PCI_ACCESS, loc, msi_dest(), irq, &mut bar)
+        msix::bringup::arm_first_vector_sin_escotilla(
+            &PortOpsImpl,
+            PCI_ACCESS,
+            loc,
+            msi_dest(),
+            irq,
+            &mut bar,
+        )
     } {
         Ok(armado) => {
             // El releído de la entrada va en el log a propósito: es lo único
@@ -451,6 +472,16 @@ fn arm_msix(
 /// nothing is armed and nothing is logged.
 #[cfg(not(target_arch = "x86_64"))]
 fn arm_msix(
+    _loc: Location,
+    _mapper: &Option<Arc<dyn IoMapper>>,
+    _irq: Option<usize>,
+) -> Option<usize> {
+    None
+}
+
+/// The non-x86_64 stub of [`arm_msix_now`].
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn arm_msix_now(
     _loc: Location,
     _mapper: &Option<Arc<dyn IoMapper>>,
     _irq: Option<usize>,

@@ -62,6 +62,19 @@ impl PlicUnlocked {
         let mask = 1 << (irq_num % 32);
         if enable {
             mmio.write(mmio.read() | mask);
+            // Have the PLIC look again at what is pending. QEMU's (8.2,
+            // `hw/intc/sifive_plic.c`) re-evaluates on a write to a
+            // priority, a threshold or a claim register, but not on one to
+            // an enable: a level source that went up while it was masked
+            // then stays pending, enabled and undelivered until something
+            // else happens to touch the PLIC. A driver that masks its line
+            // in the handler and unmasks it when it next waits -- the
+            // userspace driver's interrupt, `udriver=` -- hung on exactly
+            // that, the request done and nobody told. Writing the priority
+            // back as it is changes nothing on hardware, which evaluates
+            // continuously.
+            let priority = self.priority_base.add(irq_num);
+            priority.write(priority.read());
         } else {
             mmio.write(mmio.read() & !mask);
         }
