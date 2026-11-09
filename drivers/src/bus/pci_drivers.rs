@@ -99,6 +99,11 @@ pub fn init_all() {
     #[cfg(all(target_arch = "x86_64", not(test)))]
     register(&crate::display::NvidiaGpuDriverPci);
 
+    // A virtio disk left to a userspace driver (`udriver=virtio-blk@N`):
+    // recorded and always declined, so nothing changes without the option.
+    #[cfg(feature = "virtio")]
+    register(&crate::virtio::UserVirtioBlkPci);
+
     // HD Audio (PCH onboard + NVIDIA GPU HDMI audio functions)
     register(&crate::audio::hda::HdaDriverPci);
 

@@ -255,6 +255,8 @@ fn boot_progress(p: u32) {
 
 pub(super) fn init() -> DeviceResult {
     boot_progress(81);
+    // Before any bus is probed: a disk it finds may be one to leave alone.
+    zcore_drivers::user::set_reservation(crate::cmdline::value(crate::KCONFIG.cmdline, "udriver"));
     // First thing, before the APs and the tick derive anything from it: the
     // firmware tables are reachable now, so the provisional TSC frequency can
     // be measured against the ACPI PM timer.

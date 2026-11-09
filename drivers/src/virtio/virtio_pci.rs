@@ -44,7 +44,11 @@ pub const DEVICE_CFG_MIN_LEN: u32 = 1;
 const CAP_ID_VENDOR: u8 = 0x09;
 const CFG_TYPE_COMMON: u8 = 1;
 const CFG_TYPE_NOTIFY: u8 = 2;
+const CFG_TYPE_ISR: u8 = 3;
 const CFG_TYPE_DEVICE: u8 = 4;
+/// `virtio_pci_notify_cap` is the plain capability plus one dword, the
+/// queue notify offset multiplier (spec 1.1 §4.1.4.4).
+const NOTIFY_CAP_LEN: u16 = 20;
 
 /// The window a virtio PCI capability points at, exactly as the device
 /// describes it. None of the three numbers has been checked yet.
@@ -68,6 +72,12 @@ pub struct VirtioCaps {
     pub notify: Option<CapWindow>,
     /// Device-specific configuration (`VIRTIO_PCI_CAP_DEVICE_CFG`).
     pub device: Option<CapWindow>,
+    /// ISR status (`VIRTIO_PCI_CAP_ISR_CFG`). The kernel's drivers do not
+    /// read it; a userspace driver handed the device does.
+    pub isr: Option<CapWindow>,
+    /// `notify_off_multiplier` of the notification capability: queue `q`
+    /// is notified at `notify.offset + queue_notify_off(q) * this`.
+    pub notify_multiplier: u32,
 }
 
 /// Walk a device's PCI capability chain and collect the virtio structures.
@@ -114,7 +124,14 @@ where
             };
             match cfg_type {
                 CFG_TYPE_COMMON => caps.common = Some(window),
-                CFG_TYPE_NOTIFY => caps.notify = Some(window),
+                CFG_TYPE_NOTIFY => {
+                    caps.notify = Some(window);
+                    // The extra dword has to fit in config space too.
+                    if cap_ptr + NOTIFY_CAP_LEN <= 0x100 {
+                        caps.notify_multiplier = read32(cap_ptr + 16);
+                    }
+                }
+                CFG_TYPE_ISR => caps.isr = Some(window),
                 CFG_TYPE_DEVICE => caps.device = Some(window),
                 _ => {}
             }
@@ -183,6 +200,101 @@ pub fn cap_window(
 }
 
 pub struct VirtIoPciDriver;
+
+/// Leaves a virtio block disk on PCI to a userspace driver when the
+/// command line asks for it (`udriver=virtio-blk@N`, see [`crate::user`]).
+///
+/// It never drives anything: it counts the disk, records it when it is the
+/// one asked for, and declines it either way. [`VirtIoPciDriver`] is not in
+/// the PCI registry, so a virtio disk on PCI has never had a kernel driver,
+/// and declining keeps it that way.
+pub struct UserVirtioBlkPci;
+
+impl PciDriver for UserVirtioBlkPci {
+    fn name(&self) -> &str {
+        "virtio-blk-pci (udriver)"
+    }
+
+    fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
+        vendor_id == 0x1af4 && is_virtio_blk(device_id)
+    }
+
+    fn init(
+        &self,
+        dev: &PCIDevice,
+        _mapper: &Option<Arc<dyn IoMapper>>,
+        irq: Option<usize>,
+    ) -> DeviceResult<Device> {
+        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        let (ops, am) = (&PortOpsImpl, PCI_ACCESS);
+        let caps = scan_virtio_caps(
+            |off| unsafe { am.read8(ops, dev.loc, off) },
+            |off| unsafe { am.read32(ops, dev.loc, off) },
+        );
+        // Counted whether or not it can be handed over, so `@N` names the
+        // same disk either way.
+        let window = user_pci_window(&dev.bars, &caps);
+        let (paddr, size, transport) = window.unwrap_or((0, 0, crate::user::Transport::VirtioMmio));
+        crate::user::reserve_virtio_blk_if(window.is_some(), transport, paddr, size, irq);
+        Err(DeviceError::NotSupported)
+    }
+}
+
+/// A memory BAR with the length the device decodes.
+///
+/// The `pci` crate reports two bytes short: it computes the length as
+/// `!(encoded & !0xF).wrapping_add(1)`, where the method call binds before
+/// the `!`, so a 16 KiB BAR comes back as `0x3ffe`. A window that ends at
+/// the end of its BAR -- QEMU's virtio-blk puts its notify structure in
+/// the last page of BAR 4 -- then looks like it runs off the end. The
+/// kernel's own drivers live with it; what is handed to userspace is the
+/// real length. A length that is not that pattern is left as it is.
+fn true_bar_len(bar: BAR) -> BAR {
+    match bar {
+        BAR::Memory(addr, len, prefetch, ty) if (len as u64 + 2).is_power_of_two() => {
+            BAR::Memory(addr, len + 2, prefetch, ty)
+        }
+        other => other,
+    }
+}
+
+/// A virtio block device: transitional (`0x1001`) or modern (`0x1042`).
+fn is_virtio_blk(device_id: u16) -> bool {
+    matches!(device_id, 0x1001 | 0x1042)
+}
+
+/// What a userspace driver of this device is handed: one memory BAR that
+/// holds the four structures of a modern device, and their places in it.
+/// `None` when the device does not advertise all four in one BAR.
+fn user_pci_window(
+    bars: &[Option<BAR>; BAR_COUNT as usize],
+    caps: &VirtioCaps,
+) -> Option<(usize, usize, crate::user::Transport)> {
+    let bars = &bars.map(|bar| bar.map(true_bar_len));
+    let common = cap_window(bars, caps.common?, COMMON_CFG_LEN)?;
+    let notify = cap_window(bars, caps.notify?, NOTIFY_CFG_MIN_LEN)?;
+    let isr = cap_window(bars, caps.isr?, 1)?;
+    let device = cap_window(bars, caps.device?, DEVICE_CFG_MIN_LEN)?;
+    let bar = caps.common?.bar;
+    if [caps.notify?.bar, caps.isr?.bar, caps.device?.bar]
+        .iter()
+        .any(|b| *b != bar)
+    {
+        return None;
+    }
+    let (paddr, size, _) = common;
+    Some((
+        paddr,
+        size,
+        crate::user::Transport::VirtioPci {
+            common: common.2 as u32,
+            notify: notify.2 as u32,
+            isr: isr.2 as u32,
+            device: device.2 as u32,
+            notify_multiplier: caps.notify_multiplier,
+        },
+    ))
+}
 
 impl PciDriver for VirtIoPciDriver {
     fn name(&self) -> &str {
@@ -457,11 +569,91 @@ mod tests {
 
     #[test]
     fn a_cfg_type_the_driver_does_not_use_is_ignored() {
-        // 3 is the ISR status structure: read by nobody here.
+        // 5 is the PCI configuration access structure: read by nobody here.
         let caps = ConfigSpace::new(0x40)
-            .cap(0x40, 0x00, 3, 2, 0x3000, 0x1000)
+            .cap(0x40, 0x00, 5, 2, 0x3000, 0x1000)
             .scan();
         assert_eq!(caps, VirtioCaps::default());
+    }
+
+    /// What QEMU's virtio-blk-pci advertises: the four structures in BAR 4,
+    /// with a notify multiplier of 4.
+    fn qemu_blk_like() -> ConfigSpace {
+        let mut space = ConfigSpace::new(0x40)
+            .cap(0x40, 0x50, CFG_TYPE_COMMON, 4, 0x0000, 0x1000)
+            .cap(0x50, 0x60, CFG_TYPE_ISR, 4, 0x1000, 0x1000)
+            .cap(0x60, 0x78, CFG_TYPE_DEVICE, 4, 0x2000, 0x1000)
+            .cap(0x78, 0x00, CFG_TYPE_NOTIFY, 4, 0x3000, 0x1000);
+        space.bytes[0x78 + 16..0x78 + 20].copy_from_slice(&4u32.to_le_bytes());
+        space
+    }
+
+    fn blk_bars() -> [Option<BAR>; 6] {
+        let mut bars = [None; 6];
+        bars[0] = Some(BAR::IO(0xc000, 0x80));
+        // What the `pci` crate reports for a 16 KiB BAR: two bytes short.
+        bars[4] = Some(BAR::Memory(
+            0xfe00_0000,
+            0x3ffe,
+            Prefetchable::Yes,
+            Type::Bits64,
+        ));
+        bars
+    }
+
+    #[test]
+    fn a_memory_bar_gets_back_the_two_bytes_the_pci_crate_loses() {
+        let bar = |len| BAR::Memory(0xfe00_0000, len, Prefetchable::No, Type::Bits32);
+        assert_eq!(true_bar_len(bar(0x3ffe)), bar(0x4000));
+        assert_eq!(true_bar_len(bar(0xffe)), bar(0x1000));
+        assert_eq!(true_bar_len(bar(0x1000)), bar(0x1000));
+        assert_eq!(true_bar_len(BAR::IO(0xc000, 0x80)), BAR::IO(0xc000, 0x80));
+    }
+
+    #[test]
+    fn the_isr_window_and_the_notify_multiplier_are_read() {
+        let caps = qemu_blk_like().scan();
+        assert_eq!(
+            caps.isr,
+            Some(CapWindow {
+                bar: 4,
+                offset: 0x1000,
+                length: 0x1000
+            })
+        );
+        assert_eq!(caps.notify_multiplier, 4);
+    }
+
+    #[test]
+    fn a_modern_disk_is_handed_over_as_its_bar_and_four_offsets() {
+        let caps = qemu_blk_like().scan();
+        assert_eq!(
+            user_pci_window(&blk_bars(), &caps),
+            Some((
+                0xfe00_0000,
+                0x4000,
+                crate::user::Transport::VirtioPci {
+                    common: 0,
+                    notify: 0x3000,
+                    isr: 0x1000,
+                    device: 0x2000,
+                    notify_multiplier: 4,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_disk_with_its_structures_in_two_bars_is_not_handed_over() {
+        let mut caps = qemu_blk_like().scan();
+        caps.isr = Some(CapWindow {
+            bar: 0,
+            offset: 0,
+            length: 4,
+        });
+        assert_eq!(user_pci_window(&blk_bars(), &caps), None);
+        caps.isr = None;
+        assert_eq!(user_pci_window(&blk_bars(), &caps), None);
     }
 
     #[test]
