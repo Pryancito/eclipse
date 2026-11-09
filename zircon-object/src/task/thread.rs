@@ -2153,13 +2153,62 @@ pub(super) fn activate_user_paging(table: kernel_hal::PhysAddr) {
     }
 }
 
+/// The page table each CPU has loaded for a user thread, and its root,
+/// held so that it cannot be freed while the CPU may still translate
+/// through it -- which lets the CPU keep it loaded while it idles, rather
+/// than drop it (a full TLB flush) and load it again (another) on every
+/// sleep and wake.
+#[cfg(target_os = "none")]
+type HeldTable = (
+    kernel_hal::PhysAddr,
+    Arc<lock::Mutex<dyn kernel_hal::vm::GenericPageTable>>,
+);
+#[cfg(target_os = "none")]
+static LOADED_TABLE: [Mutex<Option<HeldTable>>; kernel_hal::config::MAX_CORE_NUM] =
+    [const { Mutex::new(None) }; kernel_hal::config::MAX_CORE_NUM];
+
+/// Load `proc`'s page table on this CPU for one of its threads, and hold it.
+fn activate_process_paging(proc: &Process) {
+    let root = proc.user_table();
+    #[cfg(target_os = "none")]
+    {
+        let Some(slot) = LOADED_TABLE.get(kernel_hal::cpu::cpu_id() as usize) else {
+            activate_user_paging(root);
+            return;
+        };
+        let mut slot = slot.lock();
+        // The held table's root cannot have been reused by another table
+        // while it is held, so the same root is the same table, and the
+        // common case -- the thread this CPU ran last -- takes no reference.
+        if slot.as_ref().is_some_and(|(held, _)| *held == root) {
+            drop(slot);
+            activate_user_paging(root);
+            return;
+        }
+        // Root and table read together: an `execve` may have swapped the
+        // address space since `root` was read.
+        let (root, table) = proc.user_table_pinned();
+        activate_user_paging(root);
+        // Held before the pin says so, and the pin moved before the old
+        // table may go: the pin never names a table nobody holds.
+        let old = slot.replace((root, table));
+        kernel_hal::vm::pin_user_root(root);
+        drop(slot);
+        // Last, with this CPU on the new table already: if this was the
+        // last reference to the old one, it is freed here.
+        drop(old);
+    }
+    #[cfg(not(target_os = "none"))]
+    activate_user_paging(root);
+}
+
 /// `last_cpu` of a thread that was never scheduled.
 const NEVER_SCHEDULED: u32 = u32::MAX;
 
 impl Future for ThreadSwitchFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        activate_user_paging(self.thread.proc().user_table());
+        activate_process_paging(&self.thread.proc());
         // Resuming real work on this CPU: undo any tickless-idle tick stretch so
         // preemption/HID polling run at full rate again. Cheap no-op (one
         // per-CPU flag read) unless this is the first poll after an idle stretch.

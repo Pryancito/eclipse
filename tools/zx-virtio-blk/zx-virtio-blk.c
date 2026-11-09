@@ -46,6 +46,7 @@
 // zircon-syscall/src/zx-syscall-numbers.h
 #define ZX_SYS_bti_pin 1
 #define ZX_SYS_interrupt_wait 54
+#define ZX_SYS_handle_close 45
 #define ZX_SYS_vmo_create_contiguous 193
 
 #define ECLIPSE_SYS_handle_to_fd 0x4000
@@ -193,6 +194,10 @@ static uint16_t last_used;
 static zx_handle_t irq_handle; // 0: none, poll
 static int use_irq;            // wait on it, or poll anyway
 static uint64_t irq_waits;     // waits that came back, for the report
+// Where an interrupt-driven request's time goes, summed over the requests
+// that slept: notify to the kernel's interrupt timestamp (the device and
+// the controller), and that timestamp to the wait's return (the wake).
+static uint64_t slept, to_irq_ns, to_wake_ns;
 
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
 static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(regs + off); }
@@ -302,6 +307,7 @@ static int do_io(uint32_t type, uint64_t sector, size_t len) {
     mb();
     // virtio-mmio registers take 32-bit accesses only; QEMU drops a 16-bit
     // store to QueueNotify. The PCI notify register is 16 bits wide.
+    uint64_t t_notify = now_ns();
     if (transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO)
         *(volatile uint32_t *)notify_reg = 0;
     else
@@ -310,10 +316,19 @@ static int do_io(uint32_t type, uint64_t sector, size_t len) {
         // A wake is not a completion (a stale one from a polled request, a
         // config change): look at the ring after each.
         while (used->idx == last_used) {
-            long r = zx_status(zx(ZX_SYS_interrupt_wait, irq_handle, 0, 0, 0));
+            int64_t ts = 0;
+            long r = zx_status(zx(ZX_SYS_interrupt_wait, irq_handle, (long)&ts, 0, 0));
             if (r != 0)
                 die("interrupt_wait", r);
+            uint64_t t_back = now_ns();
             irq_waits++;
+            // Only a wake for this request says anything about it: a stale
+            // one carries a timestamp from before the notify.
+            if ((uint64_t)ts >= t_notify && (uint64_t)ts <= t_back) {
+                slept++;
+                to_irq_ns += (uint64_t)ts - t_notify;
+                to_wake_ns += t_back - (uint64_t)ts;
+            }
             ack_device();
         }
     } else {
@@ -463,18 +478,41 @@ int main(int argc, char **argv) {
     if (use_irq && irq_waits == 0)
         die("the interrupt never came", 0);
 
+    // Let the boot settle first: as init, this runs while the shell is
+    // still starting, and that time lands in whichever pass runs first.
+    sleep(2);
+    {
+        // What a gateway syscall that does not block costs, and reading the
+        // clock, to read the numbers below against: handle_close of no
+        // handle.
+        uint64_t t0 = now_ns();
+        for (int i = 0; i < 1000; i++)
+            zx(ZX_SYS_handle_close, 0, 0, 0, 0);
+        uint64_t t1 = now_ns();
+        for (int i = 0; i < 1000; i++)
+            (void)now_ns();
+        uint64_t t2 = now_ns();
+        printf("zx-virtio-blk: a gateway syscall %.1f us, clock_gettime %.1f us\n",
+               (t1 - t0) / 1000.0 / 1000, (t2 - t1) / 1000.0 / 1000);
+    }
     uint64_t sectors = capacity < 2048 ? capacity : 2048; // the first MiB
     for (int mode = irq_handle ? 1 : 0; mode >= 0; mode--) {
         use_irq = mode;
-        irq_waits = 0;
+        irq_waits = slept = to_irq_ns = to_wake_ns = 0;
         double one = time_reads(SECTOR, sectors, rounds);
         double four = time_reads(4096, sectors, rounds);
         const char *how = mode ? "interrupt" : "polling  ";
         printf("zx-virtio-blk: %s read 512 B  %8.1f us per request\n", how, one / 1000);
         printf("zx-virtio-blk: %s read 4 KiB  %8.1f us per request (%.1f MiB/s)\n", how,
                four / 1000, 4096.0 / four * 1e9 / (1 << 20));
-        if (mode)
+        if (mode) {
             printf("zx-virtio-blk: %llu interrupt waits\n", (unsigned long long)irq_waits);
+            if (slept)
+                printf("zx-virtio-blk: %llu slept: notify to interrupt %.1f us, interrupt to "
+                       "driver %.1f us\n",
+                       (unsigned long long)slept, to_irq_ns / 1000.0 / slept,
+                       to_wake_ns / 1000.0 / slept);
+        }
     }
     printf("zx-virtio-blk: all checks passed\n");
     return 0;

@@ -157,6 +157,16 @@ hal_fn_def! {
         /// architectures — and aarch64 asked the wrong one.
         pub fn activate_kernel_paging() {}
 
+        /// The root of the user page table this CPU translates user
+        /// addresses through, or 0 when it has none loaded: `TTBR0_EL1` on
+        /// aarch64, and the one root register on x86_64 and riscv64, which
+        /// then holds the kernel root and reads as that. 0 by default, which
+        /// makes [`crate::common::vm::release_user_paging_for_idle`] drop
+        /// whatever is loaded, as it always did.
+        pub fn loaded_user_vmtoken() -> PhysAddr {
+            0
+        }
+
         /// Flush TLB by the associated `vaddr`, or flush the entire TLB. (`vaddr` is `None`).
         pub(crate) fn flush_tlb(vaddr: Option<VirtAddr>);
 

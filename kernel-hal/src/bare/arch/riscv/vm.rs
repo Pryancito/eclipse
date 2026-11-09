@@ -208,6 +208,10 @@ hal_fn_impl! {
             }
         }
 
+        fn loaded_user_vmtoken() -> PhysAddr {
+            current_vmtoken()
+        }
+
         fn current_vmtoken() -> PhysAddr {
             satp::read().ppn() << 12
         }
