@@ -17,7 +17,7 @@
 // the ratio redirected/pipe means much: both are one round trip between two
 // processes, one through the kernel's redirect, the other through pipes.
 //
-//   zx-redirect-bench [ROUNDS [phases] [classic]]  (default 20000)
+//   zx-redirect-bench [ROUNDS [phases] [classic] [pin]]  (default 20000)
 //
 // With `phases` the server stamps each reply with when it received the
 // request and when it replied, and the run ends with the kernel's split of
@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -121,7 +122,7 @@ static long redirect(zx_handle_t h, const uint64_t *mask) {
 // The server: answer getppid with the caller's pid, send anything else back
 // to the kernel. Counts what it served; returns when the peer is gone.
 static zx_handle_t server_handle;
-static int stamp, classic;
+static int stamp, classic, pin;
 // Whether the server loop ended the one good way: its peer went away.
 static atomic_int server_saw_peer_close;
 static volatile long served, bad_requests;
@@ -325,6 +326,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         stamp |= strcmp(argv[i], "phases") == 0;
         classic |= strcmp(argv[i], "classic") == 0;
+        pin |= strcmp(argv[i], "pin") == 0;
     }
     printf("zx-redirect-bench: server loop: %s\n",
            classic ? "classic (write, read, wait, read)" : "eclipse_channel_reply_wait");
@@ -332,6 +334,17 @@ int main(int argc, char **argv) {
         rounds = 20000;
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    if (pin) {
+        // Client and server on one CPU: what a redirected syscall costs
+        // without a wake crossing CPUs. Inherited by the child and the
+        // server thread.
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(0, &set);
+        if (sched_setaffinity(0, sizeof set, &set) != 0)
+            perror("sched_setaffinity");
+        printf("zx-redirect-bench: client and server pinned to CPU 0\n");
+    }
     zx_handle_t a = 0, b = 0;
     long r = zx_status(zx(ZX_SYS_channel_create, 0, (long)&a, (long)&b, 0, 0, 0));
     if (r == -ENOSYS) {
