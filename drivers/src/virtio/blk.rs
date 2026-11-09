@@ -40,9 +40,8 @@ impl<'a> Scheme for VirtIoBlk<'a> {
     }
 }
 
-/// Sector size assumed by the underlying `virtio-drivers` crate, whose
-/// `VirtIOBlk::{read,write}_block` hard-assert `buf.len() == 512` and only
-/// ever transfer one sector per call.
+/// Sector size of the underlying `virtio-drivers` crate, whose
+/// `VirtIOBlk::{read,write}_blocks` take any whole number of them.
 const SECTOR_SIZE: usize = 512;
 
 /// How many sectors a request covers, or why it cannot be served.
@@ -50,8 +49,8 @@ const SECTOR_SIZE: usize = 512;
 /// `block_id` indexes 512-byte sectors and `buf.len()` may be any multiple of
 /// 512 (the `BlockScheme` contract, and what the cache and read-ahead layer in
 /// `linux-object`'s `BlockByteDevice` relies on for multi-sector transfers).
-/// The driver underneath moves exactly one sector per call and `assert!`s on
-/// anything else, so a longer request is split here.
+/// The driver underneath refuses anything else, and splits what it cannot
+/// carry in one request itself.
 ///
 /// Every request is also checked against the disk. It used to go straight
 /// through: a `block_id` past the end reached the device, and one close enough
@@ -79,19 +78,16 @@ impl<'a> VirtIoBlk<'a> {
     // The transfers themselves; the trait's methods count them ([`crate::scheme::IoStats`]).
     fn read_uncounted(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         sectors_of(block_id, buf.len(), self.capacity)?;
-        let mut inner = self.inner.lock();
-        for (i, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
-            inner.read_block(block_id + i, chunk)?;
-        }
+        // One request for the lot (or as few as the queue allows), not one
+        // per sector: a 4 KiB page used to be eight round trips to the
+        // device.
+        self.inner.lock().read_blocks(block_id, buf)?;
         Ok(())
     }
 
     fn write_uncounted(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
         sectors_of(block_id, buf.len(), self.capacity)?;
-        let mut inner = self.inner.lock();
-        for (i, chunk) in buf.chunks(SECTOR_SIZE).enumerate() {
-            inner.write_block(block_id + i, chunk)?;
-        }
+        self.inner.lock().write_blocks(block_id, buf)?;
         Ok(())
     }
 }
