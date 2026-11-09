@@ -1,6 +1,7 @@
 use super::*;
 use crate::header::VirtIOHeader;
 use crate::queue::VirtQueue;
+use alloc::vec::Vec;
 use bitflags::*;
 use core::hint::spin_loop;
 use log::*;
@@ -35,7 +36,7 @@ impl VirtIOBlk<'_> {
             config.capacity.read() / 2
         );
 
-        let queue = VirtQueue::new(header, 0, 16)?;
+        let queue = VirtQueue::new(header, 0, QUEUE_SIZE as u16)?;
         header.finish_init();
 
         Ok(VirtIOBlk {
@@ -60,6 +61,79 @@ impl VirtIOBlk<'_> {
     /// before this driver had even initialised the device.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Read `buf.len() / 512` consecutive sectors from `block_id`, in as few
+    /// requests as the queue allows.
+    ///
+    /// `read_block` is one sector per request, and a request is a notify, a
+    /// trip through the device and a wait: reading a 4 KiB page that way was
+    /// eight of them, which cost the same whether the host had the data cached
+    /// or not. Here the buffer goes out as one request of up to
+    /// [`MAX_REQUEST_BYTES`], cut at page boundaries because each segment is
+    /// handed to the device by the physical address of its first byte, and a
+    /// virtually contiguous buffer need not be physically contiguous.
+    pub fn read_blocks(&mut self, block_id: usize, buf: &mut [u8]) -> Result {
+        if !buf.len().is_multiple_of(BLK_SIZE) {
+            return Err(Error::InvalidParam);
+        }
+        let mut sector = block_id;
+        for chunk in buf.chunks_mut(MAX_REQUEST_BYTES) {
+            let req = BlkReq {
+                type_: ReqType::In,
+                reserved: 0,
+                sector: sector as u64,
+            };
+            let mut resp = BlkResp::default();
+            let mut outputs: Vec<&mut [u8]> = page_segments_mut(chunk);
+            outputs.push(resp.as_buf_mut());
+            self.queue.add(&[req.as_buf()], &outputs)?;
+            drop(outputs);
+            self.wait_one()?;
+            if resp.status != RespStatus::Ok {
+                return Err(Error::IoError);
+            }
+            sector += chunk.len() / BLK_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len() / 512` consecutive sectors from `block_id`: the
+    /// counterpart of [`read_blocks`](Self::read_blocks), cut the same way.
+    pub fn write_blocks(&mut self, block_id: usize, buf: &[u8]) -> Result {
+        if !buf.len().is_multiple_of(BLK_SIZE) {
+            return Err(Error::InvalidParam);
+        }
+        let mut sector = block_id;
+        for chunk in buf.chunks(MAX_REQUEST_BYTES) {
+            let req = BlkReq {
+                type_: ReqType::Out,
+                reserved: 0,
+                sector: sector as u64,
+            };
+            let mut resp = BlkResp::default();
+            let mut inputs: Vec<&[u8]> = Vec::with_capacity(MAX_SEGMENTS + 1);
+            inputs.push(req.as_buf());
+            inputs.extend(page_segments(chunk));
+            self.queue.add(&inputs, &[resp.as_buf_mut()])?;
+            drop(inputs);
+            self.wait_one()?;
+            if resp.status != RespStatus::Ok {
+                return Err(Error::IoError);
+            }
+            sector += chunk.len() / BLK_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Tell the device there is a request and spin until it is back.
+    fn wait_one(&mut self) -> Result {
+        self.header.notify(0);
+        while !self.queue.can_pop() {
+            spin_loop();
+        }
+        self.queue.pop_used()?;
+        Ok(())
     }
 
     /// Read a block.
@@ -165,6 +239,47 @@ impl Default for BlkResp {
 }
 
 const BLK_SIZE: usize = 512;
+
+/// Descriptors in the request queue (`VirtQueue::new` in [`VirtIOBlk::new`]).
+const QUEUE_SIZE: usize = 16;
+
+/// Data segments one request can carry: the queue less the header and the
+/// status byte.
+const MAX_SEGMENTS: usize = QUEUE_SIZE - 2;
+
+/// The most one request moves. A span of this many bytes, wherever it
+/// starts, touches at most [`MAX_SEGMENTS`] pages; and it is a whole number
+/// of sectors, so every request but the last of a buffer is full.
+const MAX_REQUEST_BYTES: usize = (MAX_SEGMENTS - 1) * PAGE_SIZE;
+
+/// The length of the first segment of a buffer at `addr`: up to the next page
+/// boundary, or all of it.
+fn first_segment(addr: usize, len: usize) -> usize {
+    (PAGE_SIZE - addr % PAGE_SIZE).min(len)
+}
+
+/// `buf`, cut at page boundaries.
+fn page_segments(mut buf: &[u8]) -> Vec<&[u8]> {
+    let mut segments = Vec::with_capacity(MAX_SEGMENTS);
+    while !buf.is_empty() {
+        let (head, rest) = buf.split_at(first_segment(buf.as_ptr() as usize, buf.len()));
+        segments.push(head);
+        buf = rest;
+    }
+    segments
+}
+
+/// `buf`, cut at page boundaries, writable.
+fn page_segments_mut(mut buf: &mut [u8]) -> Vec<&mut [u8]> {
+    let mut segments = Vec::with_capacity(MAX_SEGMENTS + 1);
+    while !buf.is_empty() {
+        let at = first_segment(buf.as_ptr() as usize, buf.len());
+        let (head, rest) = buf.split_at_mut(at);
+        segments.push(head);
+        buf = rest;
+    }
+    segments
+}
 
 bitflags! {
     struct BlkFeature: u64 {
@@ -368,11 +483,133 @@ mod tests {
         });
     }
 
+    /// A buffer that starts `offset` bytes into a page, `len` bytes long.
+    fn straddling(offset: usize, len: usize) -> (Vec<u8>, usize) {
+        let backing = vec![0u8; len + 2 * PAGE_SIZE];
+        let base = backing.as_ptr() as usize;
+        let start = (PAGE_SIZE - base % PAGE_SIZE) % PAGE_SIZE + offset;
+        (backing, start)
+    }
+
+    #[test]
+    fn a_multi_sector_read_is_one_request_cut_at_the_page() {
+        within("a read of eight sectors across a page", 20, || {
+            let mut attached = Attached::of(64);
+            // 4 KiB starting 512 bytes before a page boundary: two segments
+            // on the device's side, one request.
+            let (mut backing, start) = straddling(PAGE_SIZE - 512, 4096);
+            let buf = &mut backing[start..start + 4096];
+            attached.blk.read_blocks(10, buf).unwrap();
+            for i in 0..8 {
+                assert_eq!(
+                    &buf[i * 512..(i + 1) * 512],
+                    &attached.disk.sector(10 + i)[..]
+                );
+            }
+            assert_eq!(attached.disk.served(), 1);
+        });
+    }
+
+    #[test]
+    fn a_multi_sector_write_lands_where_it_was_asked() {
+        within("a write of eight sectors across a page", 20, || {
+            let mut attached = Attached::of(64);
+            let (mut backing, start) = straddling(PAGE_SIZE - 1024, 4096);
+            let buf = &mut backing[start..start + 4096];
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = (i % 253) as u8;
+            }
+            attached.blk.write_blocks(20, buf).unwrap();
+            for i in 0..8 {
+                assert_eq!(
+                    &attached.disk.sector(20 + i)[..],
+                    &buf[i * 512..(i + 1) * 512]
+                );
+            }
+            assert_eq!(
+                u32::from_le_bytes(attached.disk.sector(28)[0..4].try_into().unwrap()),
+                28,
+                "the sector after the write was touched"
+            );
+            assert_eq!(attached.disk.served(), 1);
+        });
+    }
+
+    #[test]
+    fn a_read_larger_than_one_request_is_split_and_still_right() {
+        within("a read of more than the queue carries", 30, || {
+            let sectors = 2 * MAX_REQUEST_BYTES / 512 + 3;
+            let mut attached = Attached::of(sectors + 4);
+            let len = sectors * 512;
+            let (mut backing, start) = straddling(512, len);
+            let buf = &mut backing[start..start + len];
+            attached.blk.read_blocks(1, buf).unwrap();
+            for i in 0..sectors {
+                assert_eq!(
+                    &buf[i * 512..(i + 1) * 512],
+                    &attached.disk.sector(1 + i)[..]
+                );
+            }
+            assert_eq!(attached.disk.served(), 3);
+        });
+    }
+
+    #[test]
+    fn no_segment_crosses_a_page() {
+        // The device gets each segment by the physical address of its first
+        // byte, and the fake disk maps virtual to physical one to one, so the
+        // requests above cannot catch a segment that runs into the next page.
+        for offset in [0, 1, 511, 512, PAGE_SIZE - 1] {
+            let len = MAX_REQUEST_BYTES;
+            let (backing, start) = straddling(offset, len);
+            let segments = page_segments(&backing[start..start + len]);
+            assert!(
+                segments.len() <= MAX_SEGMENTS,
+                "{} segments",
+                segments.len()
+            );
+            assert_eq!(segments.iter().map(|s| s.len()).sum::<usize>(), len);
+            for segment in &segments {
+                let first = segment.as_ptr() as usize / PAGE_SIZE;
+                let last = (segment.as_ptr() as usize + segment.len() - 1) / PAGE_SIZE;
+                assert_eq!(first, last, "a segment crosses a page at offset {}", offset);
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_sector_buffer_that_is_not_whole_sectors_is_refused() {
+        let header = fake_header(2, 256);
+        set_config_u64(header, 8);
+        let mut blk = VirtIOBlk::new(header).unwrap();
+        let mut buf = [0u8; 700];
+        assert_eq!(
+            blk.read_blocks(0, &mut buf).err(),
+            Some(Error::InvalidParam)
+        );
+        assert_eq!(blk.write_blocks(0, &buf).err(), Some(Error::InvalidParam));
+    }
+
+    #[test]
+    fn a_failing_disk_fails_a_multi_sector_read() {
+        within("a multi-sector read of a failing disk", 20, || {
+            let mut attached = Attached::of(16);
+            attached
+                .disk
+                .fail
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 2048];
+            assert_eq!(
+                attached.blk.read_blocks(0, &mut buf).err(),
+                Some(Error::IoError)
+            );
+        });
+    }
+
     #[test]
     fn a_buffer_that_is_not_a_sector_is_refused_by_the_assert() {
-        // The driver asserts rather than returning an error, which is why the
-        // wrapper in `zcore-drivers` has to split a multi-sector request
-        // instead of forwarding it.
+        // The one-sector call asserts rather than returning an error; a
+        // multi-sector request goes through `read_blocks` instead.
         let header = fake_header(2, 256);
         set_config_u64(header, 8);
         let mut blk = VirtIOBlk::new(header).unwrap();
