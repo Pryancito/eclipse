@@ -494,6 +494,18 @@ static double time_preads(int fd, size_t chunk, off_t base, size_t span) {
     return (double)(now_ns() - t0) / n;
 }
 
+// The same, writing: every write goes to the disk, nothing is cached.
+static double time_pwrites(int fd, size_t chunk, off_t base, size_t span) {
+    static char buf[4096];
+    uint64_t n = 0, t0 = now_ns();
+    for (off_t off = 0; off + (off_t)chunk <= (off_t)span; off += chunk, n++) {
+        memset(buf, (int)n, chunk);
+        if (pwrite(fd, buf, chunk, base + off) != (ssize_t)chunk)
+            die("pwrite failed, errno", errno);
+    }
+    return (double)(now_ns() - t0) / n;
+}
+
 #include <pthread.h>
 
 // MAX_INFLIGHT threads reading 4 KiB at a time, each over its own part of
@@ -543,6 +555,10 @@ static int kernel_baseline(const char *path, long offset_mib) {
            one_cold / 1000, one_warm / 1000);
     printf("zx-virtio-blk: kernel %s read 4 KiB  %8.1f us cold, %8.1f us cached\n", path,
            four_cold / 1000, four_warm / 1000);
+    // Off the sector grid: the node reads the sectors around the request
+    // one call at a time, the way a filesystem reads its disk.
+    double odd = time_preads(fd, 4096, base + (1 << 20) + 256, (1 << 20) - 4096);
+    printf("zx-virtio-blk: kernel %s read 4 KiB off the grid %6.1f us\n", path, odd / 1000);
     double deep = time_preads_parallel(fd, base + (2 << 20));
     printf("zx-virtio-blk: kernel %s read 4 KiB x%d threads %6.1f us per request cold "
            "(%.1f MiB/s)\n",
@@ -1050,8 +1066,14 @@ static int kclient_main(const char *before, uint64_t disk_sectors) {
         printf("zx-virtio-blk: FAIL: the write or the end of %s is wrong\n", path);
         return 1;
     }
-    close(fd);
     printf("zx-virtio-blk: %s: the driver's pattern, a write that reached it, the end\n", path);
+    // Writes, timed, on a part of the disk nothing else here reads: the
+    // fourth MiB, short of the pattern at the tail.
+    if (disk_sectors >= 4 * 2048) {
+        double w = time_pwrites(fd, 4096, (off_t)3 << 20, 1 << 19);
+        printf("zx-virtio-blk: kernel %s write 4 KiB %8.1f us\n", path, w / 1000);
+    }
+    close(fd);
     return kernel_baseline(path, 0);
 }
 

@@ -336,6 +336,12 @@ impl ServedDisk {
     /// Wait until every one of `parts` is answered: `Ok` only if all of them
     /// went right.
     fn wait(&self, parts: &[Part], deadline: u64) -> DeviceResult {
+        // A look first, as the sleeping wait does: each turn of the loop
+        // below gives the CPU away, and getting it back costs more than a
+        // driver on another CPU takes to answer.
+        if let Some(r) = self.look(parts) {
+            return r;
+        }
         loop {
             let mut pending = false;
             let mut failed = false;
