@@ -69,6 +69,26 @@ const MIN_SLOT: usize = 4096;
 const SLOTS: usize = 16;
 const SLOT_BITS: u32 = SLOTS.trailing_zeros();
 
+/// How long a lone request looks for its reply before it sleeps: a sleep and
+/// the wake behind it cost more than a driver on another CPU takes to answer.
+const LOOK_US: u64 = 300;
+/// The most sleeps in a row after looks that found nothing.
+const LOOK_SKIP_MAX: u32 = 64;
+
+/// What follows a look: how many of the next waits sleep at once, and the
+/// run of them after the next miss. A look that pays keeps every wait
+/// looking; one that does not (one CPU: the driver cannot run meanwhile; a
+/// slow device) doubles the sleeps before the next try, up to
+/// [`LOOK_SKIP_MAX`].
+pub(super) fn after_look(hit: bool, backoff: u32) -> (u32, u32) {
+    if hit {
+        (0, 1)
+    } else {
+        let run = backoff.clamp(1, LOOK_SKIP_MAX);
+        (run, (run * 2).min(LOOK_SKIP_MAX))
+    }
+}
+
 /// A slot's answer, as [`ServedDisk::answers`] holds it.
 const PENDING: u8 = 0;
 const ANSWERED: u8 = 1;
@@ -93,6 +113,11 @@ pub(super) struct ServedDisk {
     /// The driver closed its end: nothing will be answered again.
     dead: AtomicBool,
     next_id: AtomicU32,
+    /// Waits left to sleep through before the next look, and the run after
+    /// the next miss: see [`after_look`]. Racy on purpose: a lost update
+    /// costs a look or saves one.
+    look_skip: AtomicU32,
+    look_backoff: AtomicU32,
     stats: IoStats,
 }
 
@@ -161,6 +186,12 @@ pub(super) fn in_range(sector: u64, len: usize, sectors: u64) -> bool {
 /// deadline. So each look opens a window, the same one the idle loop's poll
 /// opens, and closes it again: the caller's state is what it was.
 fn between_looks() {
+    open_interrupt_window();
+    kernel_hal::thread::yield_now_sync();
+}
+
+/// The interrupt half of [`between_looks`], for a spin that keeps the CPU.
+fn open_interrupt_window() {
     use kernel_hal::interrupt::{intr_get, intr_off, intr_on};
     if !intr_get() {
         intr_on();
@@ -169,8 +200,9 @@ fn between_looks() {
         // And a TLB shootdown another CPU is waiting on: what every spin
         // with interrupts off does.
         kernel_hal::tlb_shootdown_pump();
+    } else {
+        core::hint::spin_loop();
     }
-    kernel_hal::thread::yield_now_sync();
 }
 
 fn now_ms() -> u64 {
@@ -206,6 +238,8 @@ impl ServedDisk {
             wakers: [const { lock::Mutex::new(None) }; SLOTS],
             dead: AtomicBool::new(false),
             next_id: AtomicU32::new(0),
+            look_skip: AtomicU32::new(0),
+            look_backoff: AtomicU32::new(1),
             stats: IoStats::new(),
         })
     }
@@ -496,9 +530,49 @@ impl ServedDisk {
         })
     }
 
+    /// The start of a wait: for [`LOOK_US`], keep reading replies instead of
+    /// sleeping. Only while these are the only requests out (with more, one
+    /// wake brings a batch, and the CPU is better spent on the others), and
+    /// only when the last looks paid: see [`after_look`]. `None` when the
+    /// answer is still out.
+    fn look(&self, parts: &[Part]) -> Option<DeviceResult> {
+        let skip = self.look_skip.load(Ordering::Relaxed);
+        if skip > 0 {
+            self.look_skip.store(skip - 1, Ordering::Relaxed);
+            return None;
+        }
+        let all = ((1u64 << self.slots) - 1) as u32;
+        let until = kernel_hal::timer::timer_now() + Duration::from_micros(LOOK_US);
+        let found = loop {
+            if let Some(r) = self.verdict(parts) {
+                break Some(r);
+            }
+            if self.pump() > 0 {
+                continue;
+            }
+            let out = (!self.free.load(Ordering::Relaxed) & all).count_ones() as usize;
+            if out > parts.len() {
+                // Not a miss: nothing was learnt about the driver.
+                return None;
+            }
+            if self.dead.load(Ordering::Acquire) || kernel_hal::timer::timer_now() > until {
+                break None;
+            }
+            open_interrupt_window();
+        };
+        let (skip, backoff) =
+            after_look(found.is_some(), self.look_backoff.load(Ordering::Relaxed));
+        self.look_skip.store(skip, Ordering::Relaxed);
+        self.look_backoff.store(backoff, Ordering::Relaxed);
+        found
+    }
+
     /// [`ServedDisk::wait`], asleep: on the FIFO's replies, and on whichever
     /// other waiter reads ours first.
     async fn wait_async(&self, parts: &[Part], deadline: u64) -> DeviceResult {
+        if let Some(r) = self.look(parts) {
+            return r;
+        }
         let fifo: Arc<dyn KernelObject> = self.fifo.clone();
         loop {
             if let Some(r) = self.verdict(parts) {
@@ -650,6 +724,27 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_look_that_pays_keeps_every_wait_looking() {
+        assert_eq!(after_look(true, 1), (0, 1));
+        assert_eq!(after_look(true, LOOK_SKIP_MAX), (0, 1));
+    }
+
+    #[test]
+    fn misses_in_a_row_double_the_sleeps_up_to_the_cap() {
+        let (mut skip, mut backoff) = after_look(false, 1);
+        assert_eq!((skip, backoff), (1, 2));
+        let mut runs = alloc::vec![skip];
+        for _ in 0..10 {
+            (skip, backoff) = after_look(false, backoff);
+            runs.push(skip);
+        }
+        assert_eq!(&runs[..7], &[1, 2, 4, 8, 16, 32, 64]);
+        assert!(runs[7..].iter().all(|&r| r == LOOK_SKIP_MAX));
+        // And a backoff nobody set still sleeps at least once.
+        assert_eq!(after_look(false, 0).0, 1);
+    }
 
     #[test]
     fn a_message_is_the_drivers_layout() {
