@@ -540,6 +540,15 @@ pub const ECLIPSE_TRANSPORT_VIRTIO_MMIO: u64 = 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_TRANSPORT_VIRTIO_PCI: u64 = 2;
 
+/// `eclipse_block_serve(fifo, window, sectors)`: give the kernel a disk that
+/// this process drives. `fifo` is the end of a FIFO of 32-byte block
+/// messages the kernel keeps, `window` a VMO the data passes through, and
+/// `sectors` the disk's size in 512-byte sectors. The disk appears under
+/// `/dev` (a `vdX`) like any hot-plugged one; the process answers each
+/// message on the other end of the FIFO. Both handles go to the kernel.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
+
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
 /// `ZX_CHANNEL_MAX_MSG_BYTES`.
 #[cfg(feature = "zircon-gateway")]
@@ -793,6 +802,10 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             }
         }
         ECLIPSE_DEVICE_CLAIM => match claim_device(proc, args) {
+            Ok(()) => 0,
+            Err(e) => status(e),
+        },
+        ECLIPSE_BLOCK_SERVE => match block_serve::block_serve(proc, args) {
             Ok(()) => 0,
             Err(e) => status(e),
         },
@@ -2783,6 +2796,8 @@ mod sigframe32;
 mod device_claim;
 #[cfg(feature = "zircon-gateway")]
 use device_claim::claim_device;
+#[cfg(feature = "zircon-gateway")]
+mod block_serve;
 
 #[cfg(test)]
 mod user_trap_tests;

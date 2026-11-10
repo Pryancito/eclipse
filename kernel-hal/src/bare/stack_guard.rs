@@ -329,7 +329,17 @@ pub fn split_pool_stats() -> (usize, usize, usize) {
 /// leaves the mapping describing exactly the same memory, so a band that is
 /// refused afterwards costs nothing but the frames.
 fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), BandRefusal> {
-    let _guard = SPLIT_LOCK.lock();
+    // Taken by spinning with the shootdown queue pumped, not with `lock()`:
+    // the holder flushes every CPU before it lets go (below), and this runs
+    // from `Executor::new` with interrupts off, so a waiter that only spun
+    // would never answer the holder's shootdown and neither would move.
+    let _guard = loop {
+        if let Some(g) = SPLIT_LOCK.try_lock() {
+            break g;
+        }
+        crate::common::ipi::tlb_shootdown_pump();
+        core::hint::spin_loop();
+    };
     let mut split_any = false;
     for off in (0..size).step_by(PAGE_SIZE) {
         let vaddr = base + off;
