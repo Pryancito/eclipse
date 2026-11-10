@@ -569,6 +569,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.qemu_package }}
+          # Ubuntu 26.04 moved qemu-system-riscv64 out of qemu-system-misc
+          # into a package of its own, which 24.04 does not have: take it
+          # from wherever this runner's release keeps it.
+          command -v ${{ matrix.qemu_binary }} || sudo apt-get install -y qemu-system-riscv
           ${{ matrix.qemu_binary }} --version
 
       - name: Install cargo-binutils
