@@ -20,7 +20,8 @@
 //   zx-virtio-blk export [N [IRQ]]  (IRQ 0: poll the device; 2: sleep on its
 //                                    interrupt at once; default 1: look at
 //                                    it for a while, then sleep)
-//   zx-virtio-blk /dev/vdX [OFFSET_MIB]
+//   zx-virtio-blk /dev/vdX [OFFSET_MIB [w]]  (w: time writes there too)
+//   zx-virtio-blk fs /dev/vdXN  (mount the vfat there, read and write it)
 //
 // With `serve` the driver goes on to serve the disk to another process,
 // over a FIFO and a window of its DMA memory, and that process checks and
@@ -32,6 +33,11 @@
 // (default 0). The first pass is what reaches the device (the kernel
 // caches what it reads, and reads ahead); the second is served from the
 // cache.
+//
+// With `export`, a disk whose first partition is a vfat holding
+// `pattern.bin` (see fs_test) also gets mounted, read and written through
+// the served node; `fs` does the same on any node, the kernel's driver's
+// included, to compare.
 //
 // Run it on Eclipse booted with `zircon.gateway=1` and the udriver
 // option. Exit status: 0 on success, 2 when the gateway is off, 1 on error.
@@ -131,6 +137,11 @@
 // virtio-blk requests (virtio 1.1 §5.2.6).
 #define VIRTIO_BLK_T_IN 0
 #define VIRTIO_BLK_T_OUT 1
+#define VIRTIO_BLK_T_FLUSH 4
+// Feature bit 9: the device has a write cache and takes VIRTIO_BLK_T_FLUSH.
+// A driver that does not accept it gets a device that syncs every write
+// (QEMU does exactly that), which makes each one cost a flush.
+#define VIRTIO_BLK_F_FLUSH (1u << 9)
 #define VIRTIO_BLK_S_OK 0
 
 // Split virtqueue (virtio 1.1 §2.6).
@@ -276,14 +287,16 @@ static inline void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(regs 
 static inline void wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(regs + off) = v; }
 
 static uint64_t capacity;
+static int has_flush; // VIRTIO_BLK_F_FLUSH negotiated
 
 static void init_mmio(void) {
     if (rd32(MMIO_MAGIC) != 0x74726976 || rd32(MMIO_VERSION) != 1 || rd32(MMIO_DEVICE_ID) != 2)
         die("not a legacy virtio-mmio block device, version", rd32(MMIO_VERSION));
     wr32(MMIO_STATUS, 0);
     wr32(MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-    (void)rd32(MMIO_HOST_FEATURES);
-    wr32(MMIO_GUEST_FEATURES, 0);
+    uint32_t take = rd32(MMIO_HOST_FEATURES) & VIRTIO_BLK_F_FLUSH;
+    wr32(MMIO_GUEST_FEATURES, take);
+    has_flush = take != 0;
     wr32(MMIO_GUEST_PAGE_SIZE, PAGE);
     wr32(MMIO_QUEUE_SEL, 0);
     uint32_t max = rd32(MMIO_QUEUE_NUM_MAX);
@@ -306,8 +319,11 @@ static void init_pci(void) {
     wr32(c + PCI_DEVICE_FEATURE_SELECT, 1);
     if (!(rd32(c + PCI_DEVICE_FEATURE) & VIRTIO_F_VERSION_1_HI))
         die("device without VIRTIO_F_VERSION_1", 0);
+    wr32(c + PCI_DEVICE_FEATURE_SELECT, 0);
+    uint32_t take = rd32(c + PCI_DEVICE_FEATURE) & VIRTIO_BLK_F_FLUSH;
     wr32(c + PCI_DRIVER_FEATURE_SELECT, 0);
-    wr32(c + PCI_DRIVER_FEATURE, 0);
+    wr32(c + PCI_DRIVER_FEATURE, take);
+    has_flush = take != 0;
     wr32(c + PCI_DRIVER_FEATURE_SELECT, 1);
     wr32(c + PCI_DRIVER_FEATURE, VIRTIO_F_VERSION_1_HI);
     wr8(c + PCI_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
@@ -375,7 +391,10 @@ static void do_batch(struct io *ios, int n) {
         req->sector = ios[i].sector;
         dma[DMA_REQ + i * REQ_SLOT + sizeof *req] = 0xff;
         uint16_t d = (uint16_t)(3 * i);
-        desc[d] = (struct virtq_desc){hdr, sizeof *req, VIRTQ_DESC_F_NEXT, (uint16_t)(d + 1)};
+        // A flush carries no data: its header chains straight to its status.
+        desc[d] = (struct virtq_desc){
+            hdr, sizeof *req, VIRTQ_DESC_F_NEXT,
+            (uint16_t)(ios[i].type == VIRTIO_BLK_T_FLUSH ? d + 2 : d + 1)};
         desc[d + 1] = (struct virtq_desc){
             daddr + DMA_DATA + ios[i].off, (uint32_t)ios[i].len,
             VIRTQ_DESC_F_NEXT | (ios[i].type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0),
@@ -394,7 +413,10 @@ static void do_batch(struct io *ios, int n) {
         *(volatile uint32_t *)notify_reg = 0;
     else
         *(volatile uint16_t *)notify_reg = 0;
-    if (use_irq && hybrid_try(&device_look)) {
+    // A flush takes as long as the disk under the device does: no look for
+    // it, and nothing learnt from it about how fast the device answers.
+    int slow = ios[0].type == VIRTIO_BLK_T_FLUSH;
+    if (use_irq && !slow && hybrid_try(&device_look)) {
         // The clock is a system call: look at it now and then, not on
         // every turn, or the look is mostly trips into the kernel.
         for (unsigned k = 1; used->idx != want; k++)
@@ -587,6 +609,7 @@ static int kernel_baseline(const char *path, long offset_mib) {
 #define BLK_OP_READ 1
 #define BLK_OP_WRITE 2
 #define BLK_OP_MODE 3 // sector: BLK_MODE_* bits; no data
+#define BLK_OP_FLUSH 4 // what was written, onto the disk; no sectors, no data
 #define BLK_MODE_SPIN 1 // the driver spins on the FIFO instead of sleeping
 #define BLK_MODE_IRQ 2  // the driver sleeps on the device's interrupt
 #define FIFO_DEPTH 16
@@ -665,6 +688,12 @@ static void serve_mode(struct blk_msg *m, int *spin) {
 // A read or a write, checked: 0 and the request for the device, or the
 // status to send back without going near it.
 static int64_t serve_check(const struct blk_msg *m, struct io *io) {
+    if (m->op == BLK_OP_FLUSH) {
+        if (m->sectors != 0)
+            return ZX_ERR_INVALID_ARGS;
+        *io = (struct io){VIRTIO_BLK_T_FLUSH, 0, 0, 0, 0};
+        return 0;
+    }
     if (m->op != BLK_OP_READ && m->op != BLK_OP_WRITE)
         return ZX_ERR_INVALID_ARGS;
     uint64_t len = (uint64_t)m->sectors * SECTOR;
@@ -701,8 +730,12 @@ static uint64_t serve(zx_handle_t f, int irq, int hybrid) {
     while (fifo_wait_look(f, spin, &fifo_look, m, FIFO_DEPTH, &got) == 0) {
         int n = 0;
         for (size_t i = 0; i <= got; i++) {
-            int flush = i == got || m[i].op == BLK_OP_MODE || n == MAX_INFLIGHT;
-            if (flush && n) {
+            // A flush goes to the device alone, after everything before it
+            // has come back: it is those writes it is asked to put on disk.
+            int alone = n == 1 && ios[0].type == VIRTIO_BLK_T_FLUSH;
+            int cut = i == got || m[i].op == BLK_OP_MODE || m[i].op == BLK_OP_FLUSH ||
+                      alone || n == MAX_INFLIGHT;
+            if (cut && n) {
                 do_batch(ios, n);
                 for (int k = 0; k < n; k++)
                     m[at[k]].status = ios[k].status ? ZX_ERR_IO : 0;
@@ -715,7 +748,9 @@ static uint64_t serve(zx_handle_t f, int irq, int hybrid) {
                 continue;
             }
             m[i].status = serve_check(&m[i], &ios[n]);
-            if (m[i].status == 0)
+            // A device without a write cache has nothing to flush: every
+            // write it answered is already on the disk.
+            if (m[i].status == 0 && !(ios[n].type == VIRTIO_BLK_T_FLUSH && !has_flush))
                 at[n++] = (int)i;
         }
         served += got;
@@ -1008,6 +1043,89 @@ static long disk_writes(const char *name) {
     return writes;
 }
 
+#include <sys/mount.h>
+#include <sys/stat.h>
+
+// One pass over `path` 4 KiB at a time, each byte checked against the
+// pattern `byte(i)`: ns per read, or a negative count of wrong bytes.
+static double fs_read_pass(const char *path, size_t size, uint8_t (*byte)(size_t)) {
+    static uint8_t buf[4096];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("fs: open for reading, errno", errno);
+    long bad = 0;
+    uint64_t t0 = now_ns();
+    for (size_t off = 0; off < size; off += sizeof buf) {
+        if (read(fd, buf, sizeof buf) != (ssize_t)sizeof buf)
+            die("fs: read, errno", errno);
+        for (size_t i = 0; i < sizeof buf; i++)
+            bad += buf[i] != byte(off + i);
+    }
+    uint64_t t1 = now_ns();
+    close(fd);
+    return bad ? -(double)bad : (double)(t1 - t0) / (size / sizeof buf);
+}
+
+static uint8_t fs_given(size_t i) { return (uint8_t)(i * 31 + (i >> 12)); }
+static uint8_t fs_made(size_t i) { return (uint8_t)(i * 17 + (i >> 9) + 3); }
+
+// A filesystem on `part`, the way anything else would use the disk: mount
+// it (vfat), read a file that came with the image and check every byte,
+// write a new one, sync it, and read that back after a remount, so that
+// what is checked came off the disk and not out of a cache.
+//
+// The image: a vfat partition holding `pattern.bin`, 1 MiB of fs_given().
+#define FS_GIVEN_SIZE ((size_t)1 << 20)
+#define FS_MADE_SIZE ((size_t)256 << 10)
+static int fs_test(const char *part) {
+    const char *dir = "/mnt/served";
+    mkdir("/mnt", 0755);
+    mkdir(dir, 0755);
+    if (mount(part, dir, "vfat", 0, NULL) != 0) {
+        printf("zx-virtio-blk: FAIL: mount %s: %s\n", part, strerror(errno));
+        return 1;
+    }
+    char given[64], made[64];
+    snprintf(given, sizeof given, "%s/pattern.bin", dir);
+    snprintf(made, sizeof made, "%s/made.bin", dir);
+    double cold = fs_read_pass(given, FS_GIVEN_SIZE, fs_given);
+    double warm = fs_read_pass(given, FS_GIVEN_SIZE, fs_given);
+    if (cold < 0 || warm < 0) {
+        printf("zx-virtio-blk: FAIL: %s reads wrong through the filesystem\n", given);
+        return 1;
+    }
+    static uint8_t buf[4096];
+    int fd = open(made, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        die("fs: create, errno", errno);
+    uint64_t t0 = now_ns();
+    for (size_t off = 0; off < FS_MADE_SIZE; off += sizeof buf) {
+        for (size_t i = 0; i < sizeof buf; i++)
+            buf[i] = fs_made(off + i);
+        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf)
+            die("fs: write, errno", errno);
+    }
+    if (fsync(fd) != 0)
+        die("fs: fsync, errno", errno);
+    double wrote = (double)(now_ns() - t0) / (FS_MADE_SIZE / sizeof buf);
+    close(fd);
+    if (umount(dir) != 0 || mount(part, dir, "vfat", 0, NULL) != 0) {
+        printf("zx-virtio-blk: FAIL: remount %s: %s\n", part, strerror(errno));
+        return 1;
+    }
+    double back = fs_read_pass(made, FS_MADE_SIZE, fs_made);
+    if (back < 0 || unlink(made) != 0 || umount(dir) != 0) {
+        printf("zx-virtio-blk: FAIL: the file written to %s did not come back right\n", part);
+        return 1;
+    }
+    printf("zx-virtio-blk: vfat on %s read 4 KiB %8.1f us cold, %8.1f us cached\n", part,
+           cold / 1000, warm / 1000);
+    printf("zx-virtio-blk: vfat on %s write 4 KiB %7.1f us with the sync, %8.1f us read "
+           "back\n",
+           part, wrote / 1000, back / 1000);
+    return 0;
+}
+
 static int kclient_main(const char *before, uint64_t disk_sectors) {
     char now[128], name[4] = "", path[16];
     // The node appears once the kernel's hot-plug task has run, which also
@@ -1074,14 +1192,41 @@ static int kclient_main(const char *before, uint64_t disk_sectors) {
         printf("zx-virtio-blk: kernel %s write 4 KiB %8.1f us\n", path, w / 1000);
     }
     close(fd);
+    // A filesystem, when the disk carries one in its first partition.
+    char part[20];
+    snprintf(part, sizeof part, "%s1", path);
+    if (access(part, F_OK) == 0 && fs_test(part) != 0)
+        return 1;
     return kernel_baseline(path, 0);
 }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const char *self = strchr(argv[0], '/') ? argv[0] : "/bin/zx-virtio-blk";
+    if (argc == 3 && !strcmp(argv[1], "fs")) {
+        if (fs_test(argv[2]) != 0) {
+            char have[128];
+            list_vd(have, sizeof have);
+            printf("zx-virtio-blk: the disks here:%s\n", have);
+            return 1;
+        }
+        printf("zx-virtio-blk: all checks passed\n");
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == '/')
+    {
+        // `w` after the offset: time writes too, over the fourth MiB from
+        // it. Only for a disk whose contents there nobody wants.
+        if (argc > 3 && !strcmp(argv[3], "w")) {
+            int fd = open(argv[1], O_RDWR);
+            if (fd < 0)
+                die("open the block device to write, errno", errno);
+            double w = time_pwrites(fd, 4096, ((off_t)atol(argv[2]) + 3) << 20, 1 << 19);
+            printf("zx-virtio-blk: kernel %s write 4 KiB %8.1f us\n", argv[1], w / 1000);
+            close(fd);
+        }
         return kernel_baseline(argv[1], argc > 2 ? atol(argv[2]) : 0);
+    }
     if (argc == 6 && !strcmp(argv[1], "client"))
         return client_main(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 0),
                            atoi(argv[5]));
@@ -1157,6 +1302,9 @@ int main(int argc, char **argv) {
            transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO ? "virtio-mmio" : "virtio-pci",
            (unsigned long long)capacity, (unsigned long long)daddr, (int)c.irq,
            irq_handle ? "" : " (no interrupt object: polling only)");
+    printf("zx-virtio-blk: the device %s\n",
+           has_flush ? "has a write cache: writes stay in it until a flush"
+                     : "has no write cache: every write is on the disk when answered");
     use_irq = irq_handle != 0;
     if (capacity < 64)
         die("disk too small, sectors", (long)capacity);

@@ -59,6 +59,9 @@ use zircon_object::{ZxError, ZxResult};
 pub(super) const BLOCK_MSG: usize = 32;
 const OP_READ: u32 = 1;
 const OP_WRITE: u32 = 2;
+/// Have the device put what it was given on stable storage: no sectors, no
+/// data. (3 is the driver's own, for its tests.)
+const OP_FLUSH: u32 = 4;
 const SECTOR: usize = 512;
 /// How long a request waits for its reply before it is an I/O error.
 pub(super) const REPLY_TIMEOUT_MS: u64 = 30_000;
@@ -342,6 +345,12 @@ impl ServedDisk {
         if let Some(r) = self.look(parts) {
             return r;
         }
+        self.wait_yielding(parts, deadline)
+    }
+
+    /// [`ServedDisk::wait`] without the look, for what is known to take
+    /// long: a look that finds nothing makes the next waits sleep at once.
+    fn wait_yielding(&self, parts: &[Part], deadline: u64) -> DeviceResult {
         loop {
             let mut pending = false;
             let mut failed = false;
@@ -436,6 +445,27 @@ impl ServedDisk {
         // On failure some may be on their way: none of these slots comes back.
         self.send(&msgs, k, deadline)?;
         Ok((parts, k))
+    }
+
+    /// Ask the driver to flush the device, and wait until it has.
+    fn flush_device(&self) -> DeviceResult {
+        let deadline = now_ms() + REPLY_TIMEOUT_MS;
+        let taken = self.claim(1, deadline).ok_or(DeviceError::IoError)?;
+        let slot = taken.trailing_zeros() as usize;
+        let part = [Part {
+            slot,
+            at: 0,
+            len: 0,
+        }];
+        let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = (seq << SLOT_BITS) | slot as u32;
+        self.answers[slot].store(PENDING, Ordering::Relaxed);
+        self.expect[slot].store(id, Ordering::Release);
+        // On failure it may be on its way: the slot does not come back.
+        self.send(&encode(OP_FLUSH, id, 0, 0, 0), 1, deadline)?;
+        let answered = self.wait_yielding(&part, deadline);
+        self.release(&part);
+        answered
     }
 
     /// Empty the answered parts with `after` (a read) and give their slots
@@ -696,8 +726,10 @@ impl BlockScheme for ServedDisk {
     }
 
     fn flush(&self) -> DeviceResult {
-        // The driver answers a write once the device has it.
-        Ok(())
+        // The driver answers a write once the device has taken it, which
+        // with a write cache is before it is on the disk: this is what puts
+        // it there. A driver whose device has no cache answers at once.
+        self.flush_device()
     }
 
     fn block_count(&self) -> usize {

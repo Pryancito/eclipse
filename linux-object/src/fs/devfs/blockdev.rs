@@ -214,12 +214,15 @@ impl INode for BlockDev {
         self
     }
 
+    /// `fsync(2)` on the node: the node itself caches nothing, but the disk
+    /// may (a write cache it was told it could keep), and this is the call
+    /// that promises the data is on it.
     fn sync_all(&self) -> Result<()> {
-        Ok(())
+        self.block.flush().map_err(convert_error)
     }
 
     fn sync_data(&self) -> Result<()> {
-        Ok(())
+        self.block.flush().map_err(convert_error)
     }
 }
 
@@ -1197,6 +1200,18 @@ mod tests {
             0
         );
         assert_eq!(sectors, 8);
+    }
+
+    #[test]
+    fn fsync_on_the_node_flushes_the_disk() {
+        // It used to say yes without asking the disk, which is only true of
+        // a disk with no write cache.
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        dev.sync_all().unwrap();
+        assert_eq!(disk.flushes(), 1);
+        dev.sync_data().unwrap();
+        assert_eq!(disk.flushes(), 2);
     }
 
     #[test]
