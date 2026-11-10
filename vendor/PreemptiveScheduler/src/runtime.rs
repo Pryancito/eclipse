@@ -550,6 +550,15 @@ pub(crate) fn note_rescue_kick(cpu: usize) {
     }
 }
 
+/// Whether a rescue request for `cpu` is waiting for its next pass. Read by
+/// the idle poll and the pre-halt recheck: the request bit that came with the
+/// kick can be cleared by a scan already past its rescue, and then this is
+/// the only trace left of a task that nobody else will come for.
+#[inline]
+pub(crate) fn rescue_kick_pending(cpu: usize) -> bool {
+    cpu < MAX_CORE_NUM && RESCUE_KICK[cpu].0.load(Ordering::Acquire) != 0
+}
+
 /// Consume this CPU's rescue request, if any.
 #[inline]
 pub(crate) fn take_rescue_kick() -> bool {
@@ -1302,6 +1311,8 @@ fn cpu_polling(cpu: usize) -> bool {
 
 /// How many looks at the queue [`halt_poll`] takes between clock reads.
 const HALT_POLL_CLOCK_EVERY: u32 = 64;
+/// How many turns of [`halt_poll`]'s loop pass between looks at the queue.
+const HALT_POLL_LOOK_EVERY: u32 = 16;
 
 /// Poll `ready` for up to the idle poll window. True when it said yes (or a
 /// reschedule request for this CPU came in), and the caller goes back to its
@@ -1339,7 +1350,7 @@ pub(crate) fn halt_poll(cpu: usize, ready: impl Fn() -> bool, stop: impl Fn() ->
     while !found {
         // Something else asked this CPU to look (an IRQ-raised wake, a
         // preemption request): stop polling and let the loop take it.
-        if NEED_RESCHED.load(Ordering::Relaxed) & bit != 0 {
+        if NEED_RESCHED.load(Ordering::Relaxed) & bit != 0 || rescue_kick_pending(cpu) {
             found = true;
             break;
         }
@@ -1358,7 +1369,15 @@ pub(crate) fn halt_poll(cpu: usize, ready: impl Fn() -> bool, stop: impl Fn() ->
             }
         }
         core::hint::spin_loop();
-        found = ready();
+        // The queue itself only every `HALT_POLL_LOOK_EVERY` turns: a look
+        // takes the queue's lock, and a CPU taking it back to back holds it
+        // most of the time, against every peer that comes to take a task off
+        // this queue (one pinned elsewhere, which this CPU may not run) and
+        // gives up on a lock it finds held. A wake for this CPU is seen
+        // sooner anyway, by the request bit above.
+        if spins % HALT_POLL_LOOK_EVERY == 0 {
+            found = ready();
+        }
     }
     POLLING_CPUS.fetch_and(!bit, Ordering::SeqCst);
     if found {
@@ -1519,7 +1538,13 @@ pub(crate) fn kick_idle_for_set_aside(mask: u64, owner: usize) {
     if cpu >= MAX_CORE_NUM || !WAKEUP_PREEMPT.load(Ordering::Relaxed) {
         return;
     }
-    let idle = SLEEPING_CPUS.load(Ordering::Relaxed)
+    // A CPU in the idle poll is as idle as a halted one, but it is looking
+    // only at its own queue: unless it is told, it polls past this backlog
+    // and halts with nobody left to kick it -- a set-aside task then waited
+    // for the next tick. It is told with its reschedule bit, which ends the
+    // poll and sends it through the steal scan, instead of an IPI.
+    let polling = POLLING_CPUS.load(Ordering::SeqCst);
+    let idle = (SLEEPING_CPUS.load(Ordering::Relaxed) | polling)
         & executor_ready_mask()
         & mask
         & !(1u64 << cpu)
@@ -1531,6 +1556,18 @@ pub(crate) fn kick_idle_for_set_aside(mask: u64, owner: usize) {
         return;
     };
     let bit = 1u64 << target;
+    if polling & bit != 0 && SLEEPING_CPUS.load(Ordering::SeqCst) & bit == 0 {
+        note_stealable(owner);
+        IDLE_BACKLOG_KICKS.fetch_add(1, Ordering::Relaxed);
+        NEED_RESCHED.fetch_or(bit, Ordering::SeqCst);
+        // It may have given up the poll since: its pre-halt recheck sees
+        // the bit (see `Executor::run`), unless it is past it and halted, in
+        // which case this load sees it sleeping.
+        if SLEEPING_CPUS.load(Ordering::SeqCst) & bit != 0 {
+            send_resched_ipi(target);
+        }
+        return;
+    }
     if IDLE_KICK_PENDING.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
         return;
     }
@@ -1829,7 +1866,7 @@ pub(crate) fn resched_pending_for(cpu: usize) -> bool {
     if cpu >= MAX_CORE_NUM {
         return false;
     }
-    NEED_RESCHED.load(Ordering::Relaxed) & (1u64 << cpu) != 0
+    NEED_RESCHED.load(Ordering::SeqCst) & (1u64 << cpu) != 0
 }
 
 /// Executor-side: drop any pending request for this CPU.
@@ -5129,9 +5166,9 @@ mod resched_tests {
         // A clock read every HALT_POLL_CLOCK_EVERY looks, 10 us apart,
         // against a 50 us window: a handful of reads, not an unbounded spin.
         let n = looks.load(Ordering::SeqCst);
-        let every = HALT_POLL_CLOCK_EVERY as u64;
+        let every = (HALT_POLL_CLOCK_EVERY / HALT_POLL_LOOK_EVERY) as u64;
         assert!(
-            (2 * every..=7 * every).contains(&n),
+            (2 * every..=7 * every + 1).contains(&n),
             "{} looks in a 50 us window",
             n
         );
@@ -5209,6 +5246,45 @@ mod resched_tests {
         request_resched(3);
         assert_eq!(kicks(), 1, "a halted CPU slept through the wake");
         set_cpu_sleeping(3, false);
+    }
+
+    #[test]
+    fn a_rescue_request_ends_the_idle_poll() {
+        let _g = fresh();
+        // A peer asked this CPU to come for a task pinned here but queued on
+        // the peer, and the request bit that came with it was already
+        // cleared by a scan past its rescue: the poll must not sit out the
+        // window and halt with only the rescue request left to show for it.
+        note_rescue_kick(3);
+        let found = with_halt_poll(1_000_000_000, || halt_poll(3, || false, || false));
+        RESCUE_KICK[3].0.store(0, Ordering::SeqCst);
+        assert!(found, "the poll sat out a second with a rescue pending");
+    }
+
+    #[test]
+    fn a_backlog_kick_reaches_a_polling_cpu_through_its_request_bit() {
+        let _g = fresh();
+        let saved = set_executor_ready_mask_for_test(0b1111);
+        IDLE_KICK_PENDING.store(0, Ordering::SeqCst);
+        let me = crate::arch::cpu_id() as usize;
+        let peer = if me == 3 { 2 } else { 3 };
+        // Polling, so not in the sleeping set: before, the kick skipped it,
+        // and it polled past the backlog and halted with nobody to wake it.
+        POLLING_CPUS.store(1 << peer, Ordering::SeqCst);
+        kick_idle_for_set_aside(1 << peer, me);
+        assert!(
+            pending(peer),
+            "the polling CPU was never told of the backlog"
+        );
+        assert_eq!(kicks(), 0, "an IPI was sent to a CPU polling its queue");
+        // Halted by the time the bit lands: then the IPI is still owed.
+        NEED_RESCHED.store(0, Ordering::SeqCst);
+        set_cpu_sleeping(peer, true);
+        kick_idle_for_set_aside(1 << peer, me);
+        assert_eq!(kicks(), 1, "a halted CPU slept through the backlog");
+        set_cpu_sleeping(peer, false);
+        IDLE_KICK_PENDING.store(0, Ordering::SeqCst);
+        set_executor_ready_mask_for_test(saved);
     }
 
     #[test]

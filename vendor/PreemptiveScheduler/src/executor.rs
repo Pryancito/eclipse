@@ -2361,7 +2361,17 @@ impl Executor {
                     // `runtime::STEALABLE`. BEFORE the recheck below, so a wake
                     // that races either sets the bit again or is seen there.
                     crate::runtime::note_not_stealable(cpu);
-                    if self.task_collection.has_ready() {
+                    // A reschedule request raised since the scan cleared it,
+                    // or a rescue request the scan's pass came too early
+                    // for, is a peer pointing at work this CPU has yet to
+                    // look for (a backlog it can steal, a task pinned here
+                    // on a peer's queue: see `runtime::kick_idle_for_set_aside`
+                    // and `runtime::kick_for_affinity`), so it counts as
+                    // ready too.
+                    if self.task_collection.has_ready()
+                        || crate::runtime::resched_pending_for(cpu)
+                        || crate::runtime::rescue_kick_pending(cpu)
+                    {
                         // The wake landed in the check-then-halt window and
                         // the recheck caught it: no interrupt was waited for.
                         crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_SKIPPED_HALT);
