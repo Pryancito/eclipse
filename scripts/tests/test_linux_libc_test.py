@@ -46,5 +46,22 @@ class KernelLinesAreNotTheCase(unittest.TestCase):
         self.assertIsNone(script.PROMPT.search(script.GUEST_PROMPT))
 
 
+class TheGuestGetsNoMoreCpusThanTheHostCanRun(unittest.TestCase):
+    def test_one_host_cpu_is_left_for_qemu_and_the_runner(self):
+        self.assertEqual(script.guest_cpus(4), 3)
+        self.assertEqual(script.guest_cpus(7), 6)
+
+    def test_a_large_host_gives_the_makefile_default(self):
+        self.assertEqual(script.guest_cpus(8), script.MAX_GUEST_CPUS)
+        self.assertEqual(script.guest_cpus(64), script.MAX_GUEST_CPUS)
+
+    def test_a_small_host_still_boots_one_cpu(self):
+        self.assertEqual(script.guest_cpus(2), 1)
+        self.assertEqual(script.guest_cpus(1), 1)
+
+    def test_the_host_count_is_what_this_process_may_use(self):
+        self.assertGreaterEqual(script.host_cpus(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,8 @@ GUEST_PROMPT = "__ZCORE_PROMPT__"
 PROMPT_TIMEOUT = 300
 # The budget of a case run alone with `--test`, in seconds.
 SINGLE_CASE_TIMEOUT = 180
+# The most CPUs the guest is given: the Makefile's own default (`SMP ?= 6`).
+MAX_GUEST_CPUS = 6
 
 # Cases that only mean something to a user the kernel can hold to a limit.
 # `pthread_atfork-errno-clobber` sets RLIMIT_NPROC to 0 and expects `fork` to
@@ -112,6 +114,36 @@ def without_kernel_log(output):
     return INIT_LOG_LINE.sub("", KERNEL_LOG_LINE.sub("", ANSI.sub("", output)))
 
 
+def host_cpus():
+    """The CPUs this process may run on: what `taskset` or a container left
+    it, not what the machine has."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def guest_cpus(host):
+    """How many CPUs to give the guest on a host that can run `host` threads
+    at once: one fewer, so that QEMU's own threads and this runner have
+    somewhere to go, and never more than the Makefile's default.
+
+    QEMU runs every guest CPU as a host thread, and the kernel's spin locks
+    are ticket locks: they are handed over in arrival order, to one waiter in
+    particular. With more guest CPUs than host CPUs that waiter is, most of
+    the time, a thread the host is not running, and everyone else spins until
+    its next time slice. Measured on aarch64 with 6 guest CPUs on 2 host CPUs
+    (QEMU monitor, 2026-11-10): all six guest CPUs queued on the family lock
+    of one paged VMO, which every page fault of the boot takes, and the lock
+    changed hands ~200 times a second. The shell's prompt had not come up
+    after 100 s, in 4 boots of 4; with 2 guest CPUs on the same 2 host CPUs it
+    was up in 7.8 s, 2 boots of 2, and with 1 in 7.6 s. That is what `Linux
+    Libc Test Baremetal
+    (aarch64)` did on a 4-CPU runner about every other run: the guest stopped
+    answering, the first case came back TIMEOUT, and the job died."""
+    return max(1, min(MAX_GUEST_CPUS, host - 1))
+
+
 def init_is_eclipse_init(arch):
     """Whether the image's PID 1 is eclipse-init: the xtask installs it as
     `/sbin/eclipse-init` and points `/sbin/init` at it by name."""
@@ -163,6 +195,11 @@ def main():
         script = "linux_libc_test.py"
         forwarded = ["--libos"]
     else:
+        # Read by the Makefile for the build and for `-smp` alike. Someone who
+        # sets SMP by hand is asking for that many.
+        if "SMP" not in os.environ:
+            os.environ["SMP"] = str(guest_cpus(host_cpus()))
+        print(f"guest CPUs: {os.environ['SMP']} (host: {host_cpus()})", flush=True)
         from utils import test_qemu as framework
         from qemu_completion import completion_runner
         framework.TestRunner = completion_runner(framework.TestRunner, framework.TestStatus)
@@ -181,6 +218,9 @@ def main():
             itself, within a budget a slow runner can still meet."""
 
             pid1_is_eclipse_init = init_is_eclipse_init(args.arch)
+            # What the console showed while init settled, for the report of a
+            # guest that died there.
+            settling_output = ""
 
             def run_one(self, name, fast=False, timeout=None):
                 # A case named with `--test` is run by hand, usually a script
@@ -212,6 +252,14 @@ def main():
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
                     )
                 self.wait_for_init_to_settle(output, PROMPT_TIMEOUT - (time.monotonic() - start))
+                if self.zcore_proc.poll() is not None:
+                    # It showed a prompt and then died, a kernel panic most
+                    # likely. Typing at it is a bare BrokenPipeError and the
+                    # panic is lost with the console: say what it said.
+                    raise RuntimeError(
+                        "the guest died after showing its prompt, with status "
+                        f"{self.zcore_proc.returncode}:\n{output}{self.settling_output}"
+                    )
                 self.adopt_newline_prompt()
 
             def wait_for_init_to_settle(self, seen, budget):
@@ -245,6 +293,7 @@ def main():
                         break
                     time.sleep(0.2)
                 with self.lk:
+                    self.settling_output = self.output
                     self.output = ""
 
             def adopt_newline_prompt(self):

@@ -434,6 +434,15 @@ else ifeq ($(ARCH), riscv64)
 		-initrd $(USER_IMG) \
 		-append "$(CMDLINE)"
 else ifeq ($(ARCH), aarch64)
+  # The root filesystem is a writable image that outlives the boot, and a
+  # test run kills QEMU whenever a case times out. SFS has no journal: the
+  # boot after such a kill panicked on the image it was left
+  # (`rcore-fs-sfs/src/lib.rs:1285 assertion failed:
+  # !self.free_map.read()[id]`, or `:658 Unknown file type`), and the suite
+  # died on a broken pipe to a QEMU that was gone. A test boot writes to a
+  # throwaway overlay instead, so every restart finds the image as built.
+  comma := ,
+  aarch64_rootfs_opts := $(if $(filter 1,$(TEST)),$(comma)snapshot=on)
 	qemu_opts += \
 		-machine virt \
 		-cpu cortex-a72 \
@@ -442,7 +451,7 @@ else ifeq ($(ARCH), aarch64)
 		-serial file:/tmp/serial.out \
 		-bios ../ignored/target/aarch64/firmware/QEMU_EFI.fd \
 		-hda fat:rw:disk \
-		-drive file=aarch64.img,if=none,format=raw,id=x0 \
+		-drive file=aarch64.img,if=none,format=raw,id=x0$(aarch64_rootfs_opts) \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 endif
 
