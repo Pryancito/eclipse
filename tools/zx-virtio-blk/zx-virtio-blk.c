@@ -17,11 +17,15 @@
 //
 //   zx-virtio-blk [N [ROUNDS]]  (defaults: disk 0, 2 passes)
 //   zx-virtio-blk serve [N [ROUNDS]]
+//   zx-virtio-blk export [N [IRQ]]  (IRQ 0: poll the device; default 1)
 //   zx-virtio-blk /dev/vdX [OFFSET_MIB]
 //
 // With `serve` the driver goes on to serve the disk to another process,
 // over a FIFO and a window of its DMA memory, and that process checks and
-// times it (see "Serving another process" below). The third form is the baseline: the same reads through the kernel's
+// times it (see "Serving another process" below). With `export` it serves
+// the kernel instead: the disk becomes a block device of the kernel's, a
+// new /dev/vdX, and a child process checks and times it with pread (see
+// "Serving the kernel"). The fourth form is the baseline: the same reads through the kernel's
 // driver, with pread on its block device, starting OFFSET_MIB into it
 // (default 0). The first pass is what reaches the device (the kernel
 // caches what it reads, and reads ahead); the second is served from the
@@ -68,6 +72,7 @@
 
 #define ECLIPSE_SYS_handle_to_fd 0x4000
 #define ECLIPSE_SYS_device_claim 0x4005
+#define ECLIPSE_SYS_block_serve 0x4006
 #define ECLIPSE_DEVICE_VIRTIO_BLK 1
 #define ECLIPSE_TRANSPORT_VIRTIO_MMIO 1
 #define ECLIPSE_TRANSPORT_VIRTIO_PCI 2
@@ -601,14 +606,14 @@ static int64_t serve_check(const struct blk_msg *m, struct io *io) {
 // MAX_INFLIGHT, in order), so a client with several requests outstanding
 // pays one notify, one interrupt and one wake for all of them. A MODE
 // message takes effect between the requests before it and after it.
-static uint64_t serve(zx_handle_t f) {
+static uint64_t serve(zx_handle_t f, int irq) {
     struct blk_msg m[FIFO_DEPTH];
     struct io ios[MAX_INFLIGHT];
     int at[MAX_INFLIGHT]; // which message each of `ios` answers
     int spin = 0;
     uint64_t served = 0;
     size_t got;
-    use_irq = 0;
+    use_irq = irq && irq_handle;
     while (fifo_wait(f, spin, m, FIFO_DEPTH, &got) == 0) {
         int n = 0;
         for (size_t i = 0; i <= got; i++) {
@@ -829,7 +834,7 @@ static int serve_client(const char *self, int data_fd, int rounds) {
     }
     close((int)fifo_fd);
     close(data_fd);
-    uint64_t served = serve(ends[0]);
+    uint64_t served = serve(ends[0], 0);
     int st = 0;
     if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
         printf("zx-virtio-blk: FAIL: the client failed (status %#x)\n", st);
@@ -837,6 +842,148 @@ static int serve_client(const char *self, int data_fd, int rounds) {
     }
     printf("zx-virtio-blk: served %llu requests\n", (unsigned long long)served);
     return 0;
+}
+
+// ---- Serving the kernel -----------------------------------------------
+//
+// `zx-virtio-blk export N` hands the kernel one end of the same FIFO and a
+// window of the DMA memory (eclipse_block_serve), and the kernel puts a
+// block device of its own on it: a new /dev/vdX, with the page cache and
+// everything else above it. The kernel copies between its buffers and the
+// window, and sends one request at a time, always at the window's start.
+// The driver then serves the other end forever, asleep on the FIFO and on
+// the device, while a child (this program again, exec'd with `kclient`)
+// finds the new node and reads it as any process would.
+
+#include <dirent.h>
+
+// The vdX nodes in /dev, as " vda vdb ".
+static void list_vd(char *out, size_t len) {
+    size_t at = 0;
+    out[at++] = ' ';
+    out[at] = 0;
+    DIR *d = opendir("/dev");
+    if (!d)
+        die("opendir /dev, errno", errno);
+    struct dirent *e;
+    while ((e = readdir(d)))
+        if (!strncmp(e->d_name, "vd", 2) && strlen(e->d_name) == 3 && at + 5 < len) {
+            memcpy(out + at, e->d_name, 3);
+            at += 3;
+            out[at++] = ' ';
+            out[at] = 0;
+        }
+    closedir(d);
+}
+
+static int export_disk(const char *self, zx_handle_t window, int irq) {
+    char before[128];
+    list_vd(before, sizeof before);
+    zx_handle_t ends[2];
+    long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct blk_msg), 0,
+                           (long)&ends[0], (long)&ends[1], 0));
+    if (r != 0)
+        die("fifo_create", r);
+    r = zx_status(zx(ECLIPSE_SYS_block_serve, ends[1], window, (long)capacity, 0));
+    if (r != 0)
+        die("block_serve", r);
+    printf("zx-virtio-blk: disk handed to the kernel, %llu sectors\n",
+           (unsigned long long)capacity);
+    char a_cap[24];
+    snprintf(a_cap, sizeof a_cap, "%llu", (unsigned long long)capacity);
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork", errno);
+    if (pid == 0) {
+        execl(self, self, "kclient", before, a_cap, (char *)NULL);
+        printf("zx-virtio-blk: exec %s: %s\n", self, strerror(errno));
+        _exit(1);
+    }
+    // The kernel never closes its end: serve for as long as the system runs.
+    serve(ends[0], irq);
+    printf("zx-virtio-blk: FAIL: the kernel's end of the FIFO went away\n");
+    return 1;
+}
+
+// The writes /proc/diskstats has seen on `name`, or -1.
+static long disk_writes(const char *name) {
+    FILE *f = fopen("/proc/diskstats", "r");
+    if (!f)
+        return -1;
+    char line[256], dev[32];
+    long writes = -1;
+    unsigned maj, min;
+    unsigned long rd, rdm, rds, rdt, wr;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%u %u %31s %lu %lu %lu %lu %lu", &maj, &min, dev, &rd, &rdm, &rds,
+                   &rdt, &wr) == 8 &&
+            !strcmp(dev, name))
+            writes = (long)wr;
+    fclose(f);
+    return writes;
+}
+
+static int kclient_main(const char *before, uint64_t disk_sectors) {
+    char now[128], name[4] = "", path[16];
+    // The node appears once the kernel's hot-plug task has run, which also
+    // reads the partition table through the driver.
+    for (int i = 0; i < 200 && !name[0]; i++) {
+        list_vd(now, sizeof now);
+        for (char *p = now + 1; *p; p += 4) {
+            char probe[6] = {' ', p[0], p[1], p[2], ' ', 0};
+            if (!strstr(before, probe)) {
+                memcpy(name, p, 3);
+                name[3] = 0;
+                break;
+            }
+        }
+        if (!name[0])
+            usleep(50000);
+    }
+    if (!name[0])
+        die("kclient: no new /dev/vdX appeared", 0);
+    snprintf(path, sizeof path, "/dev/%s", name);
+    printf("zx-virtio-blk: the kernel put the served disk at %s\n", path);
+    int fd = open(path, O_RDWR);
+    if (fd < 0)
+        die("kclient: open, errno", errno);
+
+    // The pattern the driver wrote over the tail, through the kernel.
+    static uint8_t buf[32 * SECTOR];
+    off_t tail = (off_t)(disk_sectors - 32) * SECTOR;
+    if (pread(fd, buf, sizeof buf, tail) != (ssize_t)sizeof buf)
+        die("kclient: pread the tail, errno", errno);
+    int bad = 0;
+    for (size_t i = 0; i < sizeof buf; i++)
+        if (buf[i] != (uint8_t)(i * 7 + (i >> 9)))
+            bad++;
+    if (bad) {
+        printf("zx-virtio-blk: FAIL: %d bytes of the tail read wrong through %s\n", bad, path);
+        return 1;
+    }
+    // A write, which must reach the driver: the disk's own count says so.
+    long w0 = disk_writes(name);
+    for (size_t i = 0; i < 4096; i++)
+        buf[i] = (uint8_t)(i * 13 + 5);
+    if (pwrite(fd, buf, 4096, tail) != 4096 || fsync(fd) != 0)
+        die("kclient: pwrite, errno", errno);
+    long w1 = disk_writes(name);
+    if (w0 < 0 || w1 <= w0)
+        die("kclient: the write never reached the disk, writes", w1);
+    memset(buf, 0, 4096);
+    if (pread(fd, buf, 4096, tail) != 4096)
+        die("kclient: pread, errno", errno);
+    for (size_t i = 0; i < 4096; i++)
+        if (buf[i] != (uint8_t)(i * 13 + 5))
+            bad++;
+    // Past the end, refused by the kernel before the driver sees it.
+    if (bad || pread(fd, buf, 4096, (off_t)disk_sectors * SECTOR) > 0) {
+        printf("zx-virtio-blk: FAIL: the write or the end of %s is wrong\n", path);
+        return 1;
+    }
+    close(fd);
+    printf("zx-virtio-blk: %s: the driver's pattern, a write that reached it, the end\n", path);
+    return kernel_baseline(path, 0);
 }
 
 int main(int argc, char **argv) {
@@ -847,7 +994,10 @@ int main(int argc, char **argv) {
     if (argc == 6 && !strcmp(argv[1], "client"))
         return client_main(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 0),
                            atoi(argv[5]));
-    int serving = argc > 1 && !strcmp(argv[1], "serve");
+    if (argc == 4 && !strcmp(argv[1], "kclient"))
+        return kclient_main(argv[2], strtoull(argv[3], NULL, 0));
+    int exporting = argc > 1 && !strcmp(argv[1], "export");
+    int serving = exporting || (argc > 1 && !strcmp(argv[1], "serve"));
     if (serving) {
         argv++;
         argc--;
@@ -878,12 +1028,17 @@ int main(int argc, char **argv) {
     if (r != 0)
         die("bti_pin", r);
     int slice = -1; // the data window, as a descriptor
+    zx_handle_t window = 0; // or as a handle, for the kernel
     if (serving) {
         zx_handle_t h;
         r = zx_status(zx6(ZX_SYS_vmo_create_child, vmo, ZX_VMO_CHILD_SLICE, DMA_DATA, DATA_MAX,
                           (long)&h, 0));
         if (r != 0)
             die("vmo_create_child (slice)", r);
+        window = h;
+    }
+    if (serving && !exporting) {
+        zx_handle_t h = window;
         // Into a descriptor now: that is how it travels.
         long fd = zx_status(zx(ECLIPSE_SYS_handle_to_fd, h, 0, 0, 0));
         if (fd < 0)
@@ -951,6 +1106,10 @@ int main(int argc, char **argv) {
     // Let the boot settle first: as init, this runs while the shell is
     // still starting, and that time lands in whichever pass runs first.
     sleep(2);
+    // The driver's own numbers are the serve runs'; this one is about the
+    // kernel's side.
+    if (exporting)
+        return export_disk(self, window, rounds != 0);
     {
         // What a gateway syscall that does not block costs, and reading the
         // clock, to read the numbers below against: handle_close of no

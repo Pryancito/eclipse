@@ -1045,13 +1045,49 @@ fn quar_ring_push(alloc_base: usize) -> usize {
     QUAR_RING_SLOTS[idx].swap(alloc_base, Ordering::AcqRel)
 }
 
+/// Keep `base` in [`STACK_OVERFLOW`], never growing the list with its lock
+/// held.
+///
+/// Growing it is an allocation, and an allocation can map memory and send a
+/// TLB shootdown; a CPU spinning on this lock -- `Executor::new` pops from it
+/// -- has interrupts off and never answers, and the two wait on each other
+/// forever. So the bigger buffer is made with the lock let go, and the old
+/// one freed the same way.
+fn overflow_push(base: usize) {
+    loop {
+        let mut list = STACK_OVERFLOW.lock();
+        if list.len() < list.capacity() {
+            list.push(base);
+            return;
+        }
+        let want = (list.capacity() * 2).max(16);
+        drop(list);
+        let mut bigger = alloc::vec::Vec::with_capacity(want);
+        let mut list = STACK_OVERFLOW.lock();
+        if list.capacity() >= want {
+            // Someone else grew it meanwhile: try again with theirs.
+            drop(list);
+            drop(bigger);
+            continue;
+        }
+        bigger.extend_from_slice(&list);
+        let old = core::mem::replace(&mut *list, bigger);
+        drop(list);
+        drop(old);
+    }
+}
+
 fn reclaim_retired_stack(slot: &mut RetiredStack) {
     let retired = *slot;
     if retired.alloc_base == 0 {
         return;
     }
     if retired.protected {
-        if let Some(unprotect) = *STACK_QUAR_UNPROTECT.lock() {
+        // Copied out before the call, for the reason `Executor::new` copies
+        // its guard hook: an `if let` on `*lock()` would hold the lock
+        // through the shootdown.
+        let unprotect = *STACK_QUAR_UNPROTECT.lock();
+        if let Some(unprotect) = unprotect {
             unprotect(retired.alloc_base + GUARD_SIZE, STACK_SIZE);
         }
     }
@@ -1065,7 +1101,7 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     // list, both with guards installed so reuse is a cheap re-poison.
     if retired.hard_guard_bottom && retired.hard_guard_top {
         if !stack_pool_push(retired.alloc_base) {
-            STACK_OVERFLOW.lock().push(retired.alloc_base);
+            overflow_push(retired.alloc_base);
         }
         *slot = RetiredStack::EMPTY;
         return;
@@ -1086,36 +1122,87 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     *slot = RetiredStack::EMPTY;
 }
 
-fn observe_cpu_quiescent_locked(retired: &mut [RetiredStack; RETIRED_STACKS_CAP], cpu: usize) {
-    if cpu >= 64 {
-        return;
-    }
-    // Nada esperando: no hay nada que un recorrido pudiera encontrar. Ver
+/// Stacks [`observe_cpu_quiescent_locked`] takes out of the table in one
+/// pass, to be reclaimed once the lock is let go.
+const RECLAIM_BATCH: usize = 8;
+
+/// What one pass took out of the table: the stacks, how many, and whether
+/// more were ready than fit.
+struct ReclaimBatch {
+    stacks: [RetiredStack; RECLAIM_BATCH],
+    len: usize,
+    more: bool,
+}
+
+/// Note that `cpu` has passed a quiescent point, and take out of the table
+/// (up to [`RECLAIM_BATCH`]) the stacks no CPU is waited on for any more.
+///
+/// They are reclaimed by the caller, **after** it lets the lock go: reclaiming
+/// a protected stack unprotects its guard pages, which is a page-table change
+/// and a TLB shootdown, and a CPU spinning on this lock -- a `spin::Mutex`,
+/// with interrupts off -- never answers one. Both CPUs then wait on each other
+/// forever.
+fn observe_cpu_quiescent_locked(
+    retired: &mut [RetiredStack; RETIRED_STACKS_CAP],
+    cpu: Option<usize>,
+) -> ReclaimBatch {
+    let mut batch = ReclaimBatch {
+        stacks: [RetiredStack::EMPTY; RECLAIM_BATCH],
+        len: 0,
+        more: false,
+    };
+    // Salida rapida: con la tabla vacia no hay nada que mirar. Lee
     // [`RETIRED_OCCUPIED`] -- el contador se mueve bajo este mismo cerrojo, que
     // el llamante ya tiene tomado, asi que aqui vale el numero exacto.
     if RETIRED_OCCUPIED.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-        return;
+        return batch;
     }
-    let bit = 1u64 << cpu;
+    let bit = match cpu {
+        Some(cpu) if cpu < 64 => 1u64 << cpu,
+        Some(_) => return batch,
+        None => 0,
+    };
     for slot in retired.iter_mut() {
-        if slot.alloc_base == 0 || slot.pending_cpus & bit == 0 {
+        if slot.alloc_base == 0 {
             continue;
         }
         slot.pending_cpus &= !bit;
-        if slot.pending_cpus == 0 {
-            reclaim_retired_stack(slot);
-            // El hueco queda vacio: `reclaim_retired_stack` lo pone a `EMPTY`
-            // por los dos caminos. El decremento va aqui y no dentro porque esa
-            // funcion tambien se llama sobre un hueco LOCAL que nunca estuvo en
-            // la tabla (ver `retire_stack_after_grace`).
-            RETIRED_OCCUPIED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if slot.pending_cpus != 0 {
+            continue;
         }
+        if batch.len == RECLAIM_BATCH {
+            // Ready, and left in the table with nothing pending: the next
+            // pass (`cpu` None) takes it.
+            batch.more = true;
+            continue;
+        }
+        batch.stacks[batch.len] = *slot;
+        batch.len += 1;
+        *slot = RetiredStack::EMPTY;
+        RETIRED_OCCUPIED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    batch
+}
+
+/// Reclaim what [`observe_cpu_quiescent_locked`] took out, with the lock let go.
+fn reclaim_batch(batch: &mut ReclaimBatch) {
+    for slot in batch.stacks[..batch.len].iter_mut() {
+        reclaim_retired_stack(slot);
     }
 }
 
 pub(crate) fn note_cpu_quiescent(cpu: usize) {
-    let mut retired = RETIRED_STACKS.lock();
-    observe_cpu_quiescent_locked(&mut retired, cpu);
+    let mut cpu = Some(cpu);
+    loop {
+        let mut batch = observe_cpu_quiescent_locked(&mut RETIRED_STACKS.lock(), cpu);
+        reclaim_batch(&mut batch);
+        if !batch.more {
+            return;
+        }
+        // This CPU's bit is gone from every slot already; what is left is
+        // the ready ones that did not fit.
+        cpu = None;
+    }
 }
 
 fn retire_stack_after_grace(
@@ -1133,8 +1220,7 @@ fn retire_stack_after_grace(
         pending &= !(1u64 << cpu);
     }
 
-    let mut retired = RETIRED_STACKS.lock();
-    observe_cpu_quiescent_locked(&mut retired, cpu);
+    note_cpu_quiescent(cpu);
 
     if pending == 0 {
         let mut slot = RetiredStack {
@@ -1148,6 +1234,7 @@ fn retire_stack_after_grace(
         return;
     }
 
+    let mut retired = RETIRED_STACKS.lock();
     for slot in retired.iter_mut() {
         if slot.alloc_base == 0 {
             *slot = RetiredStack {
@@ -1786,7 +1873,12 @@ impl Executor {
         let (hard_guard_bottom, hard_guard_top) = if pooled.is_some() {
             (true, true)
         } else {
-            match *STACK_GUARD_INSTALL.lock() {
+            // The hook out of its lock first: a `match` on `*lock()` keeps
+            // the guard for the whole match, and installing a guard unmaps a
+            // page -- a TLB shootdown -- while another CPU's `Executor::new`
+            // spins on this lock with interrupts off and never answers it.
+            let install = *STACK_GUARD_INSTALL.lock();
+            match install {
                 Some(f) => {
                     let ok_bottom = f(alloc_base, GUARD_SIZE);
                     if !ok_bottom {
@@ -3049,6 +3141,55 @@ mod grace_period_tests {
             protected: false,
             pending_cpus,
         };
+    }
+
+    #[test]
+    fn more_ready_blocks_than_one_batch_are_all_reclaimed() {
+        let _f = fresh(0b0011);
+        let n = 3 * RECLAIM_BATCH + 1;
+        for i in 0..n {
+            park_as(0x7000_0000 + i * 0x10_0000, 0b0010);
+        }
+        note_cpu_quiescent(1);
+        for i in 0..n {
+            assert!(
+                pooled(0x7000_0000 + i * 0x10_0000),
+                "block {} left behind",
+                i
+            );
+        }
+        assert_eq!(RETIRED_OCCUPIED.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_guard_is_unprotected_with_the_table_let_go() {
+        // Unprotecting is a page-table change and a TLB shootdown; a CPU
+        // spinning on the table's lock with interrupts off never answers it.
+        use core::sync::atomic::AtomicBool;
+        static FREE: AtomicBool = AtomicBool::new(false);
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        fn unprotect(_base: usize, _len: usize) {
+            CALLED.store(true, Ordering::SeqCst);
+            let free =
+                RETIRED_STACKS.try_lock().is_some() && STACK_QUAR_UNPROTECT.try_lock().is_some();
+            FREE.store(free, Ordering::SeqCst);
+        }
+        let _f = fresh(0b0011);
+        let saved = STACK_QUAR_UNPROTECT.lock().replace(unprotect);
+        park_as(0x7800_0000, 0b0010);
+        for slot in RETIRED_STACKS.lock().iter_mut() {
+            if slot.alloc_base == 0x7800_0000 {
+                slot.protected = true;
+            }
+        }
+        note_cpu_quiescent(1);
+        *STACK_QUAR_UNPROTECT.lock() = saved;
+        assert!(CALLED.load(Ordering::SeqCst));
+        assert!(
+            FREE.load(Ordering::SeqCst),
+            "unprotected under the table's lock"
+        );
+        assert!(pooled(0x7800_0000));
     }
 
     #[test]

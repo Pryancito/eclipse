@@ -3544,7 +3544,11 @@ pub fn rescan_partitions(
     block: &Arc<dyn zcore_drivers::scheme::BlockScheme>,
     base_index: usize,
 ) -> LxResult<()> {
-    if let Some(devfs_root) = DEVFS_ROOT.lock().as_ref() {
+    // The `Arc` out of the lock before any I/O: a disk whose reads sleep (one
+    // served by a process) gives the CPU away in the middle of the scan, and
+    // whoever runs next and touches `/dev` would spin on this lock forever.
+    let root = DEVFS_ROOT.lock().clone();
+    if let Some(devfs_root) = root.as_ref() {
         // First, remove existing partition nodes (e.g. sda1..=sda15)
         for part_num in 1..=devfs::blockdev::MAX_PARTITIONS {
             let part_name = devfs::blockdev::partition_node_name(fname, part_num);
