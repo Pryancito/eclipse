@@ -173,9 +173,7 @@ pub fn reserve_if(
         return false;
     };
     let index = SEEN[slot].fetch_add(1, Ordering::AcqRel);
-    let wanted = WANTED
-        .get()
-        .is_some_and(|w| w.iter().any(|w| *w == (kind, index)));
+    let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)));
     if !wanted {
         return false;
     }
