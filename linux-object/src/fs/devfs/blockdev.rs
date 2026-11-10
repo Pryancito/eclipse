@@ -296,7 +296,8 @@ impl BlockScheme for PartitionBlock {
             // The sync path says why, the same way.
             return None;
         }
-        self.parent.read_block_async(self.start_block + block_id, buf)
+        self.parent
+            .read_block_async(self.start_block + block_id, buf)
     }
 
     fn flush(&self) -> zcore_drivers::DeviceResult {

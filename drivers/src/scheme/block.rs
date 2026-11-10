@@ -67,9 +67,8 @@ impl IoStats {
 
 /// A read to wait for without holding the CPU: see
 /// [`BlockScheme::read_block_async`].
-pub type BlockReadFuture<'a> = core::pin::Pin<
-    alloc::boxed::Box<dyn core::future::Future<Output = DeviceResult> + Send + 'a>,
->;
+pub type BlockReadFuture<'a> =
+    core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = DeviceResult> + Send + 'a>>;
 
 /// Block device interface.
 ///
