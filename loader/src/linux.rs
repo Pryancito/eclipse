@@ -512,7 +512,7 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   when it fires and unmasked by the next wait or ack, so the driver
 ///   quiets the device in between; an MSI (virtio-pci) is not masked.
 ///
-/// `kind` 1 is a virtio block device. `NOT_FOUND` when no such device was
+/// `kind` 1 is a virtio block device, 2 a virtio network card. `NOT_FOUND` when no such device was
 /// reserved, `ALREADY_BOUND` once something has claimed it: one driver per
 /// device, for the life of the kernel.
 ///
@@ -531,6 +531,10 @@ const CLAIM_WORDS: usize = 8;
 /// [`ECLIPSE_DEVICE_CLAIM`] kind: a virtio block device.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_DEVICE_VIRTIO_BLK: usize = 1;
+
+/// [`ECLIPSE_DEVICE_CLAIM`] kind: a virtio network card.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_DEVICE_VIRTIO_NET: usize = 2;
 
 /// [`ECLIPSE_DEVICE_CLAIM`] transport: legacy virtio over MMIO.
 #[cfg(feature = "zircon-gateway")]

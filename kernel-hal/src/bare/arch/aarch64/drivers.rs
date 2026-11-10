@@ -66,17 +66,27 @@ const VIRTIO_SLOTS_MAPPED: usize = crate::PAGE_SIZE / VIRTIO_SLOT;
 /// QEMU `virt` wires transport `N` to SPI `16 + N`, GIC INTID `48 + N`.
 const VIRTIO_FIRST_INTID: usize = 48;
 
-/// Whether the transport at `slot` holds a virtio disk that the command
-/// line leaves to userspace. Every disk seen is counted, reserved or not.
+/// Whether the transport at `slot` holds a virtio disk or network card that
+/// the command line leaves to userspace. Every one seen is counted in its
+/// kind, reserved or not.
 fn reserved_for_userspace(header: &VirtIOHeader, slot: usize) -> bool {
-    header.verify()
-        && header.device_type() == zcore_drivers::virtio::DeviceType::Block
-        && zcore_drivers::user::reserve_virtio_blk(
-            zcore_drivers::user::Transport::VirtioMmio,
-            VIRTIO_BASE + slot * VIRTIO_SLOT,
-            VIRTIO_SLOT,
-            Some(VIRTIO_FIRST_INTID + slot),
-        )
+    use zcore_drivers::virtio::DeviceType;
+    if !header.verify() {
+        return false;
+    }
+    let kind = match header.device_type() {
+        DeviceType::Block => zcore_drivers::user::VIRTIO_BLK,
+        DeviceType::Network => zcore_drivers::user::VIRTIO_NET,
+        _ => return false,
+    };
+    zcore_drivers::user::reserve_if(
+        kind,
+        true,
+        zcore_drivers::user::Transport::VirtioMmio,
+        VIRTIO_BASE + slot * VIRTIO_SLOT,
+        VIRTIO_SLOT,
+        || Some(VIRTIO_FIRST_INTID + slot),
+    )
 }
 
 struct IoMapperImpl;

@@ -2,8 +2,8 @@
 //! the kernel left alone to the process that will drive it.
 
 use super::{
-    CLAIM_WORDS, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_TRANSPORT_VIRTIO_MMIO,
-    ECLIPSE_TRANSPORT_VIRTIO_PCI,
+    CLAIM_WORDS, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
+    ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
 };
 use alloc::{boxed::Box, sync::Arc};
 use kernel_hal::drivers::scheme::IrqScheme;
@@ -80,6 +80,7 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
 pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let kind = match args[0] {
         ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
+        ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
