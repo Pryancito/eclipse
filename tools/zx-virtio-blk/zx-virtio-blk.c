@@ -17,7 +17,9 @@
 //
 //   zx-virtio-blk [N [ROUNDS]]  (defaults: disk 0, 2 passes)
 //   zx-virtio-blk serve [N [ROUNDS]]
-//   zx-virtio-blk export [N [IRQ]]  (IRQ 0: poll the device; default 1)
+//   zx-virtio-blk export [N [IRQ]]  (IRQ 0: poll the device; 2: sleep on its
+//                                    interrupt at once; default 1: look at
+//                                    it for a while, then sleep)
 //   zx-virtio-blk /dev/vdX [OFFSET_MIB]
 //
 // With `serve` the driver goes on to serve the disk to another process,
@@ -229,6 +231,43 @@ static uint64_t irq_waits;     // waits that came back, for the report
 // the controller), and that timestamp to the wait's return (the wake).
 static uint64_t slept, to_irq_ns, to_wake_ns;
 
+// Hybrid waiting, for serve(): look for a while before sleeping, because
+// a sleep and the wake behind it cost more than a fast device, or a client
+// with its next request ready, takes to answer. A look that runs out was
+// wasted (and on one CPU it always is: nobody else ran meanwhile), so after
+// one the next waits sleep straight away, twice as many after each miss in
+// a row (up to HYBRID_SKIP_MAX), until a look is tried again and pays.
+#define HYBRID_SKIP_MAX 64
+#define DEVICE_LOOK_NS 200000ull // on the used ring, before the interrupt
+#define FIFO_LOOK_NS 300000ull   // on the FIFO, before sleeping on it
+struct hybrid {
+    int on;
+    unsigned skip, backoff; // waits left to sleep through; the next run of them
+};
+static struct hybrid device_look, fifo_look;
+
+// Whether this wait starts with a look.
+static int hybrid_try(struct hybrid *h) {
+    if (!h->on)
+        return 0;
+    if (h->skip) {
+        h->skip--;
+        return 0;
+    }
+    return 1;
+}
+
+// How the look hybrid_try allowed went.
+static void hybrid_done(struct hybrid *h, int hit) {
+    if (hit) {
+        h->backoff = 1;
+        return;
+    }
+    h->skip = h->backoff ? h->backoff : 1;
+    if (h->backoff < HYBRID_SKIP_MAX)
+        h->backoff = h->backoff ? h->backoff * 2 : 2;
+}
+
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
 static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(regs + off); }
 static inline uint8_t rd8(uint32_t off) { return *(volatile uint8_t *)(regs + off); }
@@ -355,6 +394,14 @@ static void do_batch(struct io *ios, int n) {
         *(volatile uint32_t *)notify_reg = 0;
     else
         *(volatile uint16_t *)notify_reg = 0;
+    if (use_irq && hybrid_try(&device_look)) {
+        // The clock is a system call: look at it now and then, not on
+        // every turn, or the look is mostly trips into the kernel.
+        for (unsigned k = 1; used->idx != want; k++)
+            if (k % 4096 == 0 && now_ns() - t_notify >= DEVICE_LOOK_NS)
+                break;
+        hybrid_done(&device_look, used->idx == want);
+    }
     if (use_irq) {
         // A wake is not a completion (a stale one from a polled request, a
         // config change, one interrupt for part of the batch): look at the
@@ -547,23 +594,40 @@ static long fifo_write(zx_handle_t f, const struct blk_msg *m, size_t n, size_t 
     return zx_status(zx6(ZX_SYS_fifo_write, f, sizeof *m, (long)m, n, (long)put, 0));
 }
 
-// Wait for something to read on `f`, sleeping or spinning; 0 once there is,
-// -1 once the other side has gone.
-static int fifo_wait(zx_handle_t f, int spin, struct blk_msg *m, size_t n, size_t *got) {
-    for (;;) {
+// Wait for something to read on `f`, sleeping or spinning (or, with `look`,
+// spinning for a while first); 0 once there is, -1 once the other side has
+// gone.
+static int fifo_wait_look(zx_handle_t f, int spin, struct hybrid *look, struct blk_msg *m,
+                          size_t n, size_t *got) {
+    int looking = look && !spin && hybrid_try(look);
+    uint64_t t0 = looking ? now_ns() : 0;
+    for (unsigned k = 1;; k++) {
         long r = fifo_read(f, m, n, got);
-        if (r == 0)
+        if (r == 0) {
+            if (looking)
+                hybrid_done(look, 1);
             return 0;
+        }
         if (r != ZX_ERR_SHOULD_WAIT)
             return -1;
         if (spin)
             continue;
+        if (looking) {
+            if (k % 16 || now_ns() - t0 < FIFO_LOOK_NS)
+                continue;
+            hybrid_done(look, 0);
+            looking = 0;
+        }
         uint32_t observed = 0;
         r = zx_status(zx6(ZX_SYS_object_wait_one, f, ZX_FIFO_READABLE | ZX_FIFO_PEER_CLOSED,
                           ZX_TIME_INFINITE, (long)&observed, 0, 0));
         if (r < 0 || !(observed & ZX_FIFO_READABLE))
             return -1;
     }
+}
+
+static int fifo_wait(zx_handle_t f, int spin, struct blk_msg *m, size_t n, size_t *got) {
+    return fifo_wait_look(f, spin, NULL, m, n, got);
 }
 
 // A MODE message: how the driver waits from now on, on the FIFO and on the
@@ -606,7 +670,10 @@ static int64_t serve_check(const struct blk_msg *m, struct io *io) {
 // MAX_INFLIGHT, in order), so a client with several requests outstanding
 // pays one notify, one interrupt and one wake for all of them. A MODE
 // message takes effect between the requests before it and after it.
-static uint64_t serve(zx_handle_t f, int irq) {
+//
+// With `hybrid`, both waits (for a request, for the device) start with a
+// look: see `struct hybrid`.
+static uint64_t serve(zx_handle_t f, int irq, int hybrid) {
     struct blk_msg m[FIFO_DEPTH];
     struct io ios[MAX_INFLIGHT];
     int at[MAX_INFLIGHT]; // which message each of `ios` answers
@@ -614,7 +681,8 @@ static uint64_t serve(zx_handle_t f, int irq) {
     uint64_t served = 0;
     size_t got;
     use_irq = irq && irq_handle;
-    while (fifo_wait(f, spin, m, FIFO_DEPTH, &got) == 0) {
+    device_look = fifo_look = (struct hybrid){hybrid, 0, 1};
+    while (fifo_wait_look(f, spin, &fifo_look, m, FIFO_DEPTH, &got) == 0) {
         int n = 0;
         for (size_t i = 0; i <= got; i++) {
             int flush = i == got || m[i].op == BLK_OP_MODE || n == MAX_INFLIGHT;
@@ -834,7 +902,7 @@ static int serve_client(const char *self, int data_fd, int rounds) {
     }
     close((int)fifo_fd);
     close(data_fd);
-    uint64_t served = serve(ends[0], 0);
+    uint64_t served = serve(ends[0], 0, 0);
     int st = 0;
     if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
         printf("zx-virtio-blk: FAIL: the client failed (status %#x)\n", st);
@@ -901,7 +969,7 @@ static int export_disk(const char *self, zx_handle_t window, int irq) {
         _exit(1);
     }
     // The kernel never closes its end: serve for as long as the system runs.
-    serve(ends[0], irq);
+    serve(ends[0], irq, irq != 2);
     printf("zx-virtio-blk: FAIL: the kernel's end of the FIFO went away\n");
     return 1;
 }
@@ -1110,7 +1178,7 @@ int main(int argc, char **argv) {
     // The driver's own numbers are the serve runs'; this one is about the
     // kernel's side.
     if (exporting)
-        return export_disk(self, window, rounds != 0);
+        return export_disk(self, window, rounds);
     {
         // What a gateway syscall that does not block costs, and reading the
         // clock, to read the numbers below against: handle_close of no
