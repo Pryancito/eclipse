@@ -127,7 +127,9 @@
 #define VIRTIO_BLK_S_OK 0
 
 // Split virtqueue (virtio 1.1 §2.6).
-#define QUEUE_SIZE 8
+// Room for MAX_INFLIGHT requests of three descriptors each.
+#define QUEUE_SIZE 64
+#define MAX_INFLIGHT 16
 #define VIRTQ_DESC_F_NEXT 1
 #define VIRTQ_DESC_F_WRITE 2
 
@@ -154,14 +156,17 @@ struct blk_req {
 
 // The DMA area, one contiguous VMO: the queue in the first two pages laid
 // out as legacy virtio wants it (descriptors and available ring, then the
-// used ring on the next page), a page of request header and status, then
-// the data buffer.
+// used ring on the next page), a page of request headers and statuses (one
+// REQ_SLOT per request in flight), then the data buffer.
 #define DMA_QUEUE 0
 #define DMA_USED PAGE
 #define DMA_REQ (2 * PAGE)
 #define DMA_DATA (3 * PAGE)
 #define DATA_MAX (64 * 1024)
 #define DMA_SIZE (DMA_DATA + DATA_MAX)
+#define REQ_SLOT 32
+_Static_assert(MAX_INFLIGHT * REQ_SLOT <= PAGE, "the headers fit their page");
+_Static_assert(3 * MAX_INFLIGHT <= QUEUE_SIZE, "the descriptors fit the queue");
 
 typedef uint32_t zx_handle_t;
 
@@ -305,26 +310,39 @@ static void ack_device(void) {
     }
 }
 
-// One request, start to end: three descriptors (header, data, status),
-// one notify, then either waits on the interrupt or a spin on the used
-// ring until the device has put it there.
-static int do_io_at(uint32_t type, uint64_t sector, size_t len, size_t off) {
-    struct blk_req *req = (struct blk_req *)(dma + DMA_REQ);
-    volatile uint8_t *status = dma + DMA_REQ + sizeof *req;
-    req->type = type;
-    req->reserved = 0;
-    req->sector = sector;
-    *status = 0xff;
-    desc[0] = (struct virtq_desc){daddr + DMA_REQ, sizeof *req, VIRTQ_DESC_F_NEXT, 1};
-    desc[1] = (struct virtq_desc){daddr + DMA_DATA + off, (uint32_t)len,
-                                  VIRTQ_DESC_F_NEXT |
-                                      (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0),
-                                  2};
-    desc[2] = (struct virtq_desc){daddr + DMA_REQ + sizeof *req, 1, VIRTQ_DESC_F_WRITE, 0};
-    avail->ring[avail->idx % QUEUE_SIZE] = 0;
+// One request for the device: `off` is where its data is in the data buffer.
+struct io {
+    uint32_t type;
+    uint64_t sector;
+    size_t len, off;
+    int status; // 0 once the device says so
+};
+
+// Up to MAX_INFLIGHT requests at once: three descriptors each (header,
+// data, status), all on the available ring before one notify, then either
+// waits on the interrupt or a spin on the used ring until the device has
+// put every one of them there.
+static void do_batch(struct io *ios, int n) {
+    for (int i = 0; i < n; i++) {
+        struct blk_req *req = (struct blk_req *)(dma + DMA_REQ + i * REQ_SLOT);
+        uint64_t hdr = daddr + DMA_REQ + (uint64_t)i * REQ_SLOT;
+        req->type = ios[i].type;
+        req->reserved = 0;
+        req->sector = ios[i].sector;
+        dma[DMA_REQ + i * REQ_SLOT + sizeof *req] = 0xff;
+        uint16_t d = (uint16_t)(3 * i);
+        desc[d] = (struct virtq_desc){hdr, sizeof *req, VIRTQ_DESC_F_NEXT, (uint16_t)(d + 1)};
+        desc[d + 1] = (struct virtq_desc){
+            daddr + DMA_DATA + ios[i].off, (uint32_t)ios[i].len,
+            VIRTQ_DESC_F_NEXT | (ios[i].type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0),
+            (uint16_t)(d + 2)};
+        desc[d + 2] = (struct virtq_desc){hdr + sizeof *req, 1, VIRTQ_DESC_F_WRITE, 0};
+        avail->ring[(uint16_t)(avail->idx + i) % QUEUE_SIZE] = d;
+    }
     mb();
-    avail->idx++;
+    avail->idx += (uint16_t)n;
     mb();
+    uint16_t want = (uint16_t)(last_used + n);
     // virtio-mmio registers take 32-bit accesses only; QEMU drops a 16-bit
     // store to QueueNotify. The PCI notify register is 16 bits wide.
     uint64_t t_notify = now_ns();
@@ -334,32 +352,43 @@ static int do_io_at(uint32_t type, uint64_t sector, size_t len, size_t off) {
         *(volatile uint16_t *)notify_reg = 0;
     if (use_irq) {
         // A wake is not a completion (a stale one from a polled request, a
-        // config change): look at the ring after each.
-        while (used->idx == last_used) {
+        // config change, one interrupt for part of the batch): look at the
+        // ring after each.
+        int first = 1;
+        while (used->idx != want) {
             int64_t ts = 0;
             long r = zx_status(zx(ZX_SYS_interrupt_wait, irq_handle, (long)&ts, 0, 0));
             if (r != 0)
                 die("interrupt_wait", r);
             uint64_t t_back = now_ns();
             irq_waits++;
-            // Only a wake for this request says anything about it: a stale
-            // one carries a timestamp from before the notify.
-            if ((uint64_t)ts >= t_notify && (uint64_t)ts <= t_back) {
+            // Only the first wake for this batch says anything about it: a
+            // stale one carries a timestamp from before the notify.
+            if (first && (uint64_t)ts >= t_notify && (uint64_t)ts <= t_back) {
                 slept++;
                 to_irq_ns += (uint64_t)ts - t_notify;
                 to_wake_ns += t_back - (uint64_t)ts;
+                first = 0;
             }
             ack_device();
         }
     } else {
-        while (used->idx == last_used)
+        while (used->idx != want)
             ;
         // Nobody waits on the interrupt, but the line stays up until acked.
         ack_device();
     }
     mb();
-    last_used++;
-    return *status == VIRTIO_BLK_S_OK ? 0 : -1;
+    last_used = want;
+    for (int i = 0; i < n; i++)
+        ios[i].status =
+            dma[DMA_REQ + i * REQ_SLOT + sizeof(struct blk_req)] == VIRTIO_BLK_S_OK ? 0 : -1;
+}
+
+static int do_io_at(uint32_t type, uint64_t sector, size_t len, size_t off) {
+    struct io one = {type, sector, len, off, 0};
+    do_batch(&one, 1);
+    return one.status;
 }
 
 static int do_io(uint32_t type, uint64_t sector, size_t len) {
@@ -384,6 +413,24 @@ static double time_reads(size_t chunk, uint64_t sectors, int rounds) {
     return (double)(now_ns() - t0) / n;
 }
 
+// `depth` requests of `chunk` bytes at a time, each into its own part of
+// the data buffer, over the same span.
+static double time_reads_batch(size_t chunk, uint64_t sectors, int rounds, int depth) {
+    uint64_t per = chunk / SECTOR, n = 0;
+    struct io ios[MAX_INFLIGHT];
+    uint64_t t0 = now_ns();
+    for (int r = 0; r < rounds; r++)
+        for (uint64_t s = 0; s + per * depth <= sectors; s += per * depth, n += depth) {
+            for (int i = 0; i < depth; i++)
+                ios[i] = (struct io){VIRTIO_BLK_T_IN, s + per * i, chunk, chunk * i, 0};
+            do_batch(ios, depth);
+            for (int i = 0; i < depth; i++)
+                if (ios[i].status)
+                    die("read failed at sector", (long)(s + per * i));
+        }
+    return (double)(now_ns() - t0) / n;
+}
+
 #include <fcntl.h>
 
 static double time_preads(int fd, size_t chunk, off_t base, size_t span) {
@@ -393,6 +440,39 @@ static double time_preads(int fd, size_t chunk, off_t base, size_t span) {
         if (pread(fd, buf, chunk, base + off) != (ssize_t)chunk)
             die("pread failed, errno", errno);
     return (double)(now_ns() - t0) / n;
+}
+
+#include <pthread.h>
+
+// MAX_INFLIGHT threads reading 4 KiB at a time, each over its own part of
+// a MiB: what the kernel's driver does with as many requests outstanding
+// as the served one is given.
+struct pread_job {
+    int fd;
+    off_t base;
+    size_t span;
+};
+static void *pread_thread(void *arg) {
+    struct pread_job *j = arg;
+    char buf[4096];
+    for (off_t off = 0; off + 4096 <= (off_t)j->span; off += 4096)
+        if (pread(j->fd, buf, 4096, j->base + off) != 4096)
+            die("pread failed, errno", errno);
+    return NULL;
+}
+static double time_preads_parallel(int fd, off_t base) {
+    pthread_t t[MAX_INFLIGHT];
+    struct pread_job jobs[MAX_INFLIGHT];
+    size_t each = (1 << 20) / MAX_INFLIGHT;
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < MAX_INFLIGHT; i++) {
+        jobs[i] = (struct pread_job){fd, base + (off_t)(i * each), each};
+        if (pthread_create(&t[i], NULL, pread_thread, &jobs[i]))
+            die("pthread_create", i);
+    }
+    for (int i = 0; i < MAX_INFLIGHT; i++)
+        pthread_join(t[i], NULL);
+    return (double)(now_ns() - t0) / ((1 << 20) / 4096);
 }
 
 // The kernel's driver, through its block device: a cold pass over one MiB
@@ -411,6 +491,10 @@ static int kernel_baseline(const char *path, long offset_mib) {
            one_cold / 1000, one_warm / 1000);
     printf("zx-virtio-blk: kernel %s read 4 KiB  %8.1f us cold, %8.1f us cached\n", path,
            four_cold / 1000, four_warm / 1000);
+    double deep = time_preads_parallel(fd, base + (2 << 20));
+    printf("zx-virtio-blk: kernel %s read 4 KiB x%d threads %6.1f us per request cold "
+           "(%.1f MiB/s)\n",
+           path, MAX_INFLIGHT, deep / 1000, 4096.0 / deep * 1e9 / (1 << 20));
     printf("zx-virtio-blk: all checks passed\n");
     return 0;
 }
@@ -477,20 +561,25 @@ static int fifo_wait(zx_handle_t f, int spin, struct blk_msg *m, size_t n, size_
     }
 }
 
-static int64_t serve_one(struct blk_msg *m, int *spin) {
-    if (m->op == BLK_OP_MODE) {
-        // Where the requests of the mode that just ended spent their time
-        // waiting on the device, as the driver's own timing above says it.
-        if (use_irq && slept)
-            printf("zx-virtio-blk: served, %llu slept on the device: notify to interrupt "
-                   "%.1f us, interrupt to driver %.1f us\n",
-                   (unsigned long long)slept, to_irq_ns / 1000.0 / slept,
-                   to_wake_ns / 1000.0 / slept);
-        slept = to_irq_ns = to_wake_ns = 0;
-        *spin = (m->sector & BLK_MODE_SPIN) != 0;
-        use_irq = (m->sector & BLK_MODE_IRQ) && irq_handle;
-        return 0;
-    }
+// A MODE message: how the driver waits from now on, on the FIFO and on the
+// device.
+static void serve_mode(struct blk_msg *m, int *spin) {
+    // Where the requests of the mode that just ended spent their time
+    // waiting on the device, as the driver's own timing above says it.
+    if (use_irq && slept)
+        printf("zx-virtio-blk: served, %llu slept on the device: notify to interrupt "
+               "%.1f us, interrupt to driver %.1f us\n",
+               (unsigned long long)slept, to_irq_ns / 1000.0 / slept,
+               to_wake_ns / 1000.0 / slept);
+    slept = to_irq_ns = to_wake_ns = 0;
+    *spin = (m->sector & BLK_MODE_SPIN) != 0;
+    use_irq = (m->sector & BLK_MODE_IRQ) && irq_handle;
+    m->status = 0;
+}
+
+// A read or a write, checked: 0 and the request for the device, or the
+// status to send back without going near it.
+static int64_t serve_check(const struct blk_msg *m, struct io *io) {
     if (m->op != BLK_OP_READ && m->op != BLK_OP_WRITE)
         return ZX_ERR_INVALID_ARGS;
     uint64_t len = (uint64_t)m->sectors * SECTOR;
@@ -501,20 +590,45 @@ static int64_t serve_one(struct blk_msg *m, int *spin) {
         return ZX_ERR_OUT_OF_RANGE;
     if (m->sector > capacity || m->sectors > capacity - m->sector)
         return ZX_ERR_OUT_OF_RANGE;
-    uint32_t type = m->op == BLK_OP_READ ? VIRTIO_BLK_T_IN : VIRTIO_BLK_T_OUT;
-    return do_io_at(type, m->sector, len, m->buf_off) ? ZX_ERR_IO : 0;
+    *io = (struct io){m->op == BLK_OP_READ ? VIRTIO_BLK_T_IN : VIRTIO_BLK_T_OUT, m->sector,
+                      len, m->buf_off, 0};
+    return 0;
 }
 
 // Serve `f` until the client closes it. Returns the requests served.
+//
+// Everything one read of the FIFO brings is on the device at once (up to
+// MAX_INFLIGHT, in order), so a client with several requests outstanding
+// pays one notify, one interrupt and one wake for all of them. A MODE
+// message takes effect between the requests before it and after it.
 static uint64_t serve(zx_handle_t f) {
     struct blk_msg m[FIFO_DEPTH];
+    struct io ios[MAX_INFLIGHT];
+    int at[MAX_INFLIGHT]; // which message each of `ios` answers
     int spin = 0;
     uint64_t served = 0;
     size_t got;
     use_irq = 0;
     while (fifo_wait(f, spin, m, FIFO_DEPTH, &got) == 0) {
-        for (size_t i = 0; i < got; i++)
-            m[i].status = serve_one(&m[i], &spin);
+        int n = 0;
+        for (size_t i = 0; i <= got; i++) {
+            int flush = i == got || m[i].op == BLK_OP_MODE || n == MAX_INFLIGHT;
+            if (flush && n) {
+                do_batch(ios, n);
+                for (int k = 0; k < n; k++)
+                    m[at[k]].status = ios[k].status ? ZX_ERR_IO : 0;
+                n = 0;
+            }
+            if (i == got)
+                break;
+            if (m[i].op == BLK_OP_MODE) {
+                serve_mode(&m[i], &spin);
+                continue;
+            }
+            m[i].status = serve_check(&m[i], &ios[n]);
+            if (m[i].status == 0)
+                at[n++] = (int)i;
+        }
         served += got;
         size_t put = 0;
         // The client never has more than FIFO_DEPTH outstanding, so the
@@ -553,6 +667,36 @@ static double client_time(uint32_t sectors, uint64_t span, int rounds, int spin)
     return (double)(now_ns() - t0) / n;
 }
 
+// `depth` requests of `sectors` each outstanding at a time, each into its
+// own part of the window; all sent, then every reply waited for.
+static double client_time_depth(uint32_t sectors, uint64_t span, int rounds, int spin,
+                                int depth) {
+    struct blk_msg m[FIFO_DEPTH], back[FIFO_DEPTH];
+    uint64_t n = 0, t0 = now_ns();
+    for (int r = 0; r < rounds; r++)
+        for (uint64_t s = 0; s + (uint64_t)sectors * depth <= span;
+             s += (uint64_t)sectors * depth) {
+            for (int i = 0; i < depth; i++)
+                m[i] = (struct blk_msg){BLK_OP_READ, ++next_id, sectors,
+                                        (uint32_t)(i * sectors * SECTOR),
+                                        s + (uint64_t)i * sectors, 0};
+            size_t put = 0;
+            if (fifo_write(cfifo, m, depth, &put) != 0 || put != (size_t)depth)
+                die("fifo_write", (long)put);
+            for (int have = 0; have < depth;) {
+                size_t got = 0;
+                if (fifo_wait(cfifo, spin, back, depth - have, &got) != 0)
+                    die("the driver went away", 0);
+                for (size_t k = 0; k < got; k++)
+                    if (back[k].status)
+                        die("served read failed, status", (long)back[k].status);
+                have += (int)got;
+            }
+            n += depth;
+        }
+    return (double)(now_ns() - t0) / n;
+}
+
 static int client_main(int fifo_fd, int data_fd, uint64_t disk_sectors, int rounds) {
     if (zx_status(zx(ECLIPSE_SYS_fd_to_handle, fifo_fd, ECLIPSE_FD_TAKE, (long)&cfifo, 0)) < 0)
         die("client: fd_to_handle", errno);
@@ -584,6 +728,34 @@ static int client_main(int fifo_fd, int data_fd, uint64_t disk_sectors, int roun
     for (size_t i = 0; i < 8 * SECTOR; i++)
         if (window[i] != (uint8_t)(i * 13 + 5))
             bad++;
+    // Several at once, each into its own place, in the reverse of the
+    // order they lie on the disk: sectors 8..31 of the tail, which still
+    // hold the driver's pattern.
+    {
+        struct blk_msg m[3], back[3];
+        memset(window, 0, DATA_MAX);
+        for (int i = 0; i < 3; i++)
+            m[i] = (struct blk_msg){BLK_OP_READ, ++next_id, 8, (uint32_t)((2 - i) * 8 * SECTOR),
+                                    tail + 8 + 8 * (uint64_t)i, 0};
+        size_t put = 0, have = 0;
+        if (fifo_write(cfifo, m, 3, &put) != 0 || put != 3)
+            die("client: fifo_write", (long)put);
+        while (have < 3) {
+            size_t got = 0;
+            if (fifo_wait(cfifo, 0, back + have, 3 - have, &got) != 0)
+                die("the driver went away", 0);
+            have += got;
+        }
+        for (int i = 0; i < 3; i++)
+            if (back[i].status || back[i].reqid != m[i].reqid)
+                die("client: a batched read failed", i);
+        for (int i = 0; i < 3; i++)
+            for (size_t k = 0; k < 8 * SECTOR; k++) {
+                size_t at = (size_t)(8 + 8 * i) * SECTOR + k; // into the pattern
+                if (window[(size_t)(2 - i) * 8 * SECTOR + k] != (uint8_t)(at * 7 + (at >> 9)))
+                    bad++;
+            }
+    }
     if (bad) {
         printf("zx-virtio-blk: FAIL: %d bytes served wrong\n", bad);
         return 1;
@@ -595,7 +767,7 @@ static int client_main(int fifo_fd, int data_fd, uint64_t disk_sectors, int roun
         client_call(BLK_OP_READ, 0, 0, 0, 0) != ZX_ERR_OUT_OF_RANGE ||
         client_call(9, 0, 1, 0, 0) != ZX_ERR_INVALID_ARGS)
         die("client: a bad request was not refused", 0);
-    printf("zx-virtio-blk: served from another process: reads, a write, bad requests refused\n");
+    printf("zx-virtio-blk: served from another process: reads, a write, three at once, bad requests refused\n");
 
     uint64_t span = disk_sectors < 2048 ? disk_sectors : 2048;
     static const struct {
@@ -614,6 +786,10 @@ static int client_main(int fifo_fd, int data_fd, uint64_t disk_sectors, int roun
         double four = client_time(8, span, rounds, modes[i].spin);
         printf("zx-virtio-blk: served, %-28s read 512 B %7.1f us, 4 KiB %7.1f us\n",
                modes[i].name, one / 1000, four / 1000);
+        double deep = client_time_depth(8, span, rounds, modes[i].spin, MAX_INFLIGHT);
+        printf("zx-virtio-blk: served, %-28s 4 KiB x%d in flight %7.1f us per request "
+               "(%.1f MiB/s)\n",
+               modes[i].name, MAX_INFLIGHT, deep / 1000, 4096.0 / deep * 1e9 / (1 << 20));
         // Back to sleeping before the next mode, or a spinning driver would
         // spin through the client's next MODE message's wake.
         if (modes[i].spin && client_call(BLK_OP_MODE, 0, 0, 0, 1))
@@ -799,6 +975,9 @@ int main(int argc, char **argv) {
         printf("zx-virtio-blk: %s read 512 B  %8.1f us per request\n", how, one / 1000);
         printf("zx-virtio-blk: %s read 4 KiB  %8.1f us per request (%.1f MiB/s)\n", how,
                four / 1000, 4096.0 / four * 1e9 / (1 << 20));
+        double deep = time_reads_batch(4096, sectors, rounds, MAX_INFLIGHT);
+        printf("zx-virtio-blk: %s read 4 KiB x%d in flight %5.1f us per request (%.1f MiB/s)\n",
+               how, MAX_INFLIGHT, deep / 1000, 4096.0 / deep * 1e9 / (1 << 20));
         if (mode) {
             printf("zx-virtio-blk: %llu interrupt waits\n", (unsigned long long)irq_waits);
             if (slept)
