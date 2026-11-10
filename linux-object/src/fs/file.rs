@@ -1539,6 +1539,14 @@ impl FileLike for File {
             }
         }
 
+        // A disk that answers asynchronously (one served by a process): the
+        // task sleeps on the answer instead of holding its CPU.
+        if let Some(dev) = inode.downcast_ref::<super::devfs::BlockDev>() {
+            if let Some(read) = dev.read_at_async(offset as usize, buf) {
+                return Ok(read.await?);
+            }
+        }
+
         if !flags.non_block() {
             // block
             loop {

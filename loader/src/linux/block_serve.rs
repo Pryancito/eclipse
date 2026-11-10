@@ -17,20 +17,39 @@
 //! wait for the reply parks the calling executor with
 //! [`yield_now_sync`](kernel_hal::thread::yield_now_sync) between looks,
 //! as the NFS transport does, and opens a window for interrupts each time
-//! (see `between_looks`). One request is outstanding at a time.
+//! (see `between_looks`).
+//!
+//! The window is cut into slots, one request in flight on each, up to the
+//! driver's FIFO depth: the callers of the moment -- several threads, or one
+//! read longer than a slot -- each take the slots they need and put their
+//! messages on the FIFO together, so the driver sees them in one read and
+//! puts them on its device at once. Whoever waits reads the replies, all of
+//! them, and marks each slot answered; a reply's slot is in its `reqid`.
+//!
+//! `pread` on the node does not wait like that: it takes
+//! [`read_block_async`](BlockScheme::read_block_async), and its task sleeps
+//! on the FIFO until the reply comes. Keeping the CPU in a loop that yields
+//! costs a fresh executor each time the task gives the CPU back mid-poll --
+//! its stack, guard pages and TLB shootdown -- which with sixteen readers was
+//! most of the machine's time.
 //!
 //! What this trusts: the driver is a process the system started for the
 //! purpose. It can answer wrongly (the data is whatever it put in the window)
 //! or slowly (a request gives up after [`REPLY_TIMEOUT_MS`]); it cannot make
 //! the kernel read or write anything but the window.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::convert::TryInto;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use kernel_hal::drivers::prelude::{Device, DeviceError, DeviceResult};
-use kernel_hal::drivers::scheme::{BlockScheme, IoSnapshot, IoStats, Scheme};
+use kernel_hal::drivers::scheme::{BlockReadFuture, BlockScheme, IoSnapshot, IoStats, Scheme};
 use zircon_object::ipc::Fifo;
-use zircon_object::object::Rights;
+use zircon_object::object::{KernelObject, Rights, Signal};
 use zircon_object::task::Process;
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
@@ -43,31 +62,80 @@ const OP_WRITE: u32 = 2;
 const SECTOR: usize = 512;
 /// How long a request waits for its reply before it is an I/O error.
 pub(super) const REPLY_TIMEOUT_MS: u64 = 30_000;
-/// The smallest window worth serving through: one page.
-const MIN_WINDOW: usize = 4096;
+/// The smallest slot worth serving through: one page.
+const MIN_SLOT: usize = 4096;
+/// The most slots, and so the most requests in flight: the driver's FIFO
+/// depth. A power of two: a `reqid`'s low bits are its slot.
+const SLOTS: usize = 16;
+const SLOT_BITS: u32 = SLOTS.trailing_zeros();
+
+/// A slot's answer, as [`ServedDisk::answers`] holds it.
+const PENDING: u8 = 0;
+const ANSWERED: u8 = 1;
+const FAILED: u8 = 2;
 
 /// A disk behind a FIFO.
 pub(super) struct ServedDisk {
     fifo: Arc<Fifo>,
     window: Arc<VmObject>,
-    /// Bytes of the window a request may use, a whole number of sectors.
-    window_len: usize,
+    /// How many slots the window has, at most [`SLOTS`].
+    slots: usize,
+    /// Bytes of the window each slot owns, a whole number of sectors.
+    slot_len: usize,
     sectors: u64,
-    /// Held for the whole of a request: one outstanding at a time.
-    busy: AtomicBool,
+    /// The slots no request holds, one bit each.
+    free: AtomicU32,
+    /// The `reqid` each slot waits for, and what came back for it.
+    expect: [AtomicU32; SLOTS],
+    answers: [AtomicU8; SLOTS],
+    /// The task asleep on each slot's answer, if any.
+    wakers: [lock::Mutex<Option<Waker>>; SLOTS],
+    /// The driver closed its end: nothing will be answered again.
+    dead: AtomicBool,
     next_id: AtomicU32,
     stats: IoStats,
 }
 
 /// A message, as bytes.
-pub(super) fn encode(op: u32, reqid: u32, sectors: u32, sector: u64) -> [u8; BLOCK_MSG] {
+pub(super) fn encode(
+    op: u32,
+    reqid: u32,
+    sectors: u32,
+    buf_off: u32,
+    sector: u64,
+) -> [u8; BLOCK_MSG] {
     let mut m = [0u8; BLOCK_MSG];
     m[0..4].copy_from_slice(&op.to_ne_bytes());
     m[4..8].copy_from_slice(&reqid.to_ne_bytes());
     m[8..12].copy_from_slice(&sectors.to_ne_bytes());
-    // buf_off stays 0: the kernel uses the window from its start.
+    m[12..16].copy_from_slice(&buf_off.to_ne_bytes());
     m[16..24].copy_from_slice(&sector.to_ne_bytes());
     m
+}
+
+/// How a window of `len` bytes is cut: `(slots, bytes per slot)`, or `None`
+/// when not even one slot fits.
+pub(super) fn cut_window(len: usize) -> Option<(usize, usize)> {
+    let slots = (len / MIN_SLOT).min(SLOTS);
+    if slots == 0 {
+        return None;
+    }
+    Some((slots, len / slots / SECTOR * SECTOR))
+}
+
+/// Up to `want` of the slots in `free`, lowest first.
+pub(super) fn pick_slots(free: u32, want: usize) -> u32 {
+    let mut left = free;
+    let mut take = 0;
+    for _ in 0..want {
+        if left == 0 {
+            break;
+        }
+        let low = left.isolate_lowest_one();
+        take |= low;
+        left &= !low;
+    }
+    take
 }
 
 /// The reply's `(reqid, status)`.
@@ -109,10 +177,19 @@ fn now_ms() -> u64 {
     kernel_hal::timer::timer_now().as_millis() as u64
 }
 
+/// One chunk of a request: its slot, where in the caller's buffer it
+/// starts, and its length.
+#[derive(Clone, Copy, Default)]
+struct Part {
+    slot: usize,
+    at: usize,
+    len: usize,
+}
+
 impl ServedDisk {
     pub(super) fn new(fifo: Arc<Fifo>, window: Arc<VmObject>, sectors: u64) -> ZxResult<Self> {
-        let window_len = window.len() / SECTOR * SECTOR;
-        if window_len < MIN_WINDOW || sectors == 0 {
+        let (slots, slot_len) = cut_window(window.len()).ok_or(ZxError::INVALID_ARGS)?;
+        if sectors == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
         // The FIFO must carry the driver's messages, or every write fails.
@@ -120,102 +197,361 @@ impl ServedDisk {
         Ok(Self {
             fifo,
             window,
-            window_len,
+            slots,
+            slot_len,
             sectors,
-            busy: AtomicBool::new(false),
+            free: AtomicU32::new(((1u64 << slots) - 1) as u32),
+            expect: [const { AtomicU32::new(0) }; SLOTS],
+            answers: [const { AtomicU8::new(PENDING) }; SLOTS],
+            wakers: [const { lock::Mutex::new(None) }; SLOTS],
+            dead: AtomicBool::new(false),
             next_id: AtomicU32::new(0),
             stats: IoStats::new(),
         })
     }
 
-    /// One request of at most `window_len` bytes, start to end: the window
-    /// already holds what a write writes.
-    fn call(&self, op: u32, sector: u64, len: usize) -> DeviceResult {
-        let reqid = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        let msg = encode(op, reqid, (len / SECTOR) as u32, sector);
-        let deadline = now_ms() + REPLY_TIMEOUT_MS;
+    /// Read whatever replies have come back and mark their slots. Returns
+    /// how many there were.
+    fn pump(&self) -> usize {
+        let mut back = [0u8; BLOCK_MSG * SLOTS];
+        let n = match self.fifo.read(BLOCK_MSG, &mut back, SLOTS) {
+            Ok(n) => n,
+            Err(ZxError::SHOULD_WAIT) => return 0,
+            Err(e) => {
+                if !self.dead.swap(true, Ordering::AcqRel) {
+                    warn!("served disk: the driver is gone ({e:?})");
+                }
+                return 0;
+            }
+        };
+        for m in back.as_chunks::<BLOCK_MSG>().0.iter().take(n) {
+            let (id, status) = decode(m);
+            let slot = (id as usize) & (SLOTS - 1);
+            let mine = slot < self.slots
+                && self.expect[slot].load(Ordering::Acquire) == id
+                && self.answers[slot].load(Ordering::Acquire) == PENDING;
+            if !mine {
+                // A reply to nothing in flight: a driver answering twice, or
+                // late, after its request gave up and left the slot.
+                warn!("served disk: an answer to no request ({id}, status {status})");
+                continue;
+            }
+            let answer = if status == 0 { ANSWERED } else { FAILED };
+            self.answers[slot].store(answer, Ordering::Release);
+            let asleep = self.wakers[slot].lock().take();
+            if let Some(w) = asleep {
+                w.wake();
+            }
+        }
+        n
+    }
+
+    /// Up to `want` free slots, waiting for one while there are none.
+    fn claim(&self, want: usize, deadline: u64) -> Option<u32> {
         loop {
-            match self.fifo.write(BLOCK_MSG, &msg, 1) {
-                Ok(1) => break,
-                Ok(_) | Err(ZxError::SHOULD_WAIT) => {}
+            let free = self.free.load(Ordering::Acquire);
+            let take = pick_slots(free, want);
+            if take != 0 {
+                if self
+                    .free
+                    .compare_exchange(free, free & !take, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(take);
+                }
+                continue;
+            }
+            if self.dead.load(Ordering::Acquire) || now_ms() > deadline {
+                return None;
+            }
+            // The holders may be parked: their replies are read by whoever
+            // is here.
+            if self.pump() == 0 {
+                between_looks();
+            }
+        }
+    }
+
+    /// Put `n` messages on the FIFO, all of them.
+    fn send(&self, msgs: &[u8], n: usize, deadline: u64) -> DeviceResult {
+        let mut sent = 0;
+        while sent < n {
+            match self
+                .fifo
+                .write(BLOCK_MSG, &msgs[sent * BLOCK_MSG..n * BLOCK_MSG], n - sent)
+            {
+                Ok(k) => sent += k,
+                Err(ZxError::SHOULD_WAIT) => {}
                 Err(e) => {
-                    warn!("served disk: sending request {reqid}: {e:?}");
+                    self.dead.store(true, Ordering::Release);
+                    warn!("served disk: sending a request: {e:?}");
                     return Err(DeviceError::IoError);
                 }
             }
-            if now_ms() > deadline {
-                warn!("served disk: request {reqid} could not be sent in time");
-                return Err(DeviceError::IoError);
-            }
-            between_looks();
-        }
-        let mut back = [0u8; BLOCK_MSG];
-        loop {
-            match self.fifo.read(BLOCK_MSG, &mut back, 1) {
-                Ok(1) => {
-                    let (id, status) = decode(&back);
-                    // One request at a time, so anything else is a driver
-                    // answering a request it was never sent.
-                    if id != reqid || status != 0 {
-                        warn!(
-                            "served disk: request {reqid} (op {op}, sector {sector}, {len} bytes): \
-                             answered as {id}, status {status}"
-                        );
-                        return Err(DeviceError::IoError);
-                    }
-                    return Ok(());
-                }
-                Ok(_) | Err(ZxError::SHOULD_WAIT) => {}
-                Err(e) => {
-                    warn!("served disk: waiting for request {reqid}: {e:?}");
+            if sent < n {
+                if now_ms() > deadline {
+                    warn!("served disk: a request could not be sent in time");
                     return Err(DeviceError::IoError);
                 }
+                between_looks();
             }
-            if now_ms() > deadline {
-                warn!("served disk: request {reqid} was not answered in time");
+        }
+        Ok(())
+    }
+
+    /// Wait until every one of `parts` is answered: `Ok` only if all of them
+    /// went right.
+    fn wait(&self, parts: &[Part], deadline: u64) -> DeviceResult {
+        loop {
+            let mut pending = false;
+            let mut failed = false;
+            for p in parts {
+                match self.answers[p.slot].load(Ordering::Acquire) {
+                    PENDING => pending = true,
+                    FAILED => failed = true,
+                    _ => {}
+                }
+            }
+            if !pending {
+                return if failed {
+                    Err(DeviceError::IoError)
+                } else {
+                    Ok(())
+                };
+            }
+            if self.dead.load(Ordering::Acquire) {
                 return Err(DeviceError::IoError);
             }
-            between_looks();
+            if now_ms() > deadline {
+                warn!("served disk: a request was not answered in time");
+                return Err(DeviceError::IoError);
+            }
+            if self.pump() == 0 {
+                between_looks();
+            }
         }
     }
 
-    /// Take the disk for one request. A loop that yields, not a lock: the
-    /// holder may itself be parked in [`ServedDisk::call`], and a waiter
-    /// spinning on the same CPU would never let it back.
-    fn take(&self) {
-        while self
-            .busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            between_looks();
+    /// Give back the slots of `parts` that were answered. One still waiting
+    /// stays taken for good: the driver may yet write into it.
+    fn release(&self, parts: &[Part]) {
+        let mut back = 0;
+        for p in parts {
+            if self.answers[p.slot].load(Ordering::Acquire) != PENDING {
+                back |= 1 << p.slot;
+            }
         }
+        self.free.fetch_or(back, Ordering::AcqRel);
     }
 
-    fn give_back(&self) {
-        self.busy.store(false, Ordering::Release);
-    }
-
-    fn transfer(
+    /// The next piece of a `len`-byte request at `block_id`, `*done` bytes
+    /// in: as many slots as are free, filled by `before` (a write) and sent.
+    /// Returns the parts in flight; `*done` moves past them.
+    fn submit(
         &self,
+        op: u32,
         block_id: usize,
         len: usize,
-        mut each: impl FnMut(u64, usize, usize) -> DeviceResult,
+        done: &mut usize,
+        deadline: u64,
+        before: &mut impl FnMut(usize, usize, usize) -> DeviceResult,
+    ) -> Result<([Part; SLOTS], usize), DeviceError> {
+        let chunks = (len - *done).div_ceil(self.slot_len).min(self.slots);
+        let mut taken = self.claim(chunks, deadline).ok_or(DeviceError::IoError)?;
+        let mut parts = [Part::default(); SLOTS];
+        let mut msgs = [0u8; BLOCK_MSG * SLOTS];
+        let mut k = 0;
+        let mut r = Ok(());
+        while taken != 0 {
+            let slot = taken.trailing_zeros() as usize;
+            taken &= taken - 1;
+            let part = Part {
+                slot,
+                at: *done,
+                len: (len - *done).min(self.slot_len),
+            };
+            let off = slot * self.slot_len;
+            if r.is_ok() {
+                r = before(off, part.at, part.len);
+            }
+            let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let id = (seq << SLOT_BITS) | slot as u32;
+            self.answers[slot].store(PENDING, Ordering::Relaxed);
+            self.expect[slot].store(id, Ordering::Release);
+            let sector = block_id as u64 + (part.at / SECTOR) as u64;
+            let m = encode(op, id, (part.len / SECTOR) as u32, off as u32, sector);
+            msgs[k * BLOCK_MSG..(k + 1) * BLOCK_MSG].copy_from_slice(&m);
+            parts[k] = part;
+            k += 1;
+            *done += part.len;
+        }
+        if let Err(e) = r {
+            // Nothing went out: every slot is free again.
+            for p in &parts[..k] {
+                self.answers[p.slot].store(FAILED, Ordering::Release);
+            }
+            self.release(&parts[..k]);
+            return Err(e);
+        }
+        // On failure some may be on their way: none of these slots comes back.
+        self.send(&msgs, k, deadline)?;
+        Ok((parts, k))
+    }
+
+    /// Empty the answered parts with `after` (a read) and give their slots
+    /// back.
+    fn finish(
+        &self,
+        parts: &[Part],
+        answered: DeviceResult,
+        after: &mut impl FnMut(usize, usize, usize) -> DeviceResult,
+    ) -> DeviceResult {
+        let mut r = answered;
+        if r.is_ok() {
+            for p in parts {
+                r = after(p.slot * self.slot_len, p.at, p.len);
+                if r.is_err() {
+                    break;
+                }
+            }
+        }
+        self.release(parts);
+        r
+    }
+
+    /// `len` bytes at `block_id`, in as many slots at once as are free,
+    /// waiting with the CPU kept. `before` fills a slot's part of the window
+    /// (a write), `after` empties it (a read): `(window offset, offset in the
+    /// caller's buffer, length)`.
+    fn transfer(
+        &self,
+        op: u32,
+        block_id: usize,
+        len: usize,
+        mut before: impl FnMut(usize, usize, usize) -> DeviceResult,
+        mut after: impl FnMut(usize, usize, usize) -> DeviceResult,
     ) -> DeviceResult {
         if !in_range(block_id as u64, len, self.sectors) {
             debug!("served disk: {len} bytes at sector {block_id} refused");
             return Err(DeviceError::InvalidParam);
         }
-        self.take();
+        let deadline = now_ms() + REPLY_TIMEOUT_MS;
         let mut done = 0;
-        let mut r = Ok(());
-        while done < len && r.is_ok() {
-            let n = (len - done).min(self.window_len);
-            r = each(block_id as u64 + (done / SECTOR) as u64, done, n);
-            done += n;
+        while done < len {
+            let (parts, k) = self.submit(op, block_id, len, &mut done, deadline, &mut before)?;
+            let parts = &parts[..k];
+            let answered = self.wait(parts, deadline);
+            self.finish(parts, answered, &mut after)?;
         }
-        self.give_back();
-        r
+        Ok(())
+    }
+
+    /// A read, the task asleep while the driver works: what `pread` on the
+    /// node awaits.
+    async fn read_async(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let len = buf.len();
+        if !in_range(block_id as u64, len, self.sectors) {
+            debug!("served disk: {len} bytes at sector {block_id} refused");
+            return Err(DeviceError::InvalidParam);
+        }
+        let window = &self.window;
+        let mut after = |off: usize, at: usize, n: usize| {
+            window.read(off, &mut buf[at..at + n]).map_err(|e| {
+                warn!("served disk: reading the window: {e:?}");
+                DeviceError::IoError
+            })
+        };
+        let deadline = now_ms() + REPLY_TIMEOUT_MS;
+        let mut done = 0;
+        while done < len {
+            let (parts, k) = self.submit(
+                OP_READ,
+                block_id,
+                len,
+                &mut done,
+                deadline,
+                &mut |_, _, _| Ok(()),
+            )?;
+            let parts = &parts[..k];
+            let answered = self.wait_async(parts, deadline).await;
+            self.finish(parts, answered, &mut after)?;
+        }
+        Ok(())
+    }
+
+    /// What `parts` came back as: `None` while any is still out.
+    fn verdict(&self, parts: &[Part]) -> Option<DeviceResult> {
+        let mut failed = false;
+        for p in parts {
+            match self.answers[p.slot].load(Ordering::Acquire) {
+                PENDING => return None,
+                FAILED => failed = true,
+                _ => {}
+            }
+        }
+        Some(if failed {
+            Err(DeviceError::IoError)
+        } else {
+            Ok(())
+        })
+    }
+
+    /// [`ServedDisk::wait`], asleep: on the FIFO's replies, and on whichever
+    /// other waiter reads ours first.
+    async fn wait_async(&self, parts: &[Part], deadline: u64) -> DeviceResult {
+        let fifo: Arc<dyn KernelObject> = self.fifo.clone();
+        loop {
+            if let Some(r) = self.verdict(parts) {
+                return r;
+            }
+            if self.pump() > 0 {
+                continue;
+            }
+            if self.dead.load(Ordering::Acquire) {
+                return Err(DeviceError::IoError);
+            }
+            if now_ms() > deadline {
+                warn!("served disk: a request was not answered in time");
+                return Err(DeviceError::IoError);
+            }
+            Asleep {
+                disk: self,
+                parts,
+                replies: Box::pin(fifo.wait_signal(Signal::READABLE | Signal::PEER_CLOSED)),
+                timeout: Box::pin(kernel_hal::thread::sleep_until(Duration::from_millis(
+                    deadline,
+                ))),
+            }
+            .await;
+        }
+    }
+}
+
+/// One sleep of [`ServedDisk::wait_async`]: over when a reply is there to
+/// read, when another waiter has read one of ours, or at the deadline.
+struct Asleep<'a, R, T> {
+    disk: &'a ServedDisk,
+    parts: &'a [Part],
+    replies: Pin<Box<R>>,
+    timeout: Pin<Box<T>>,
+}
+
+impl<R: Future, T: Future> Future for Asleep<'_, R, T> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Waker first, then the look: a reply read by another waiter between
+        // the two is seen here, and one read after wakes this task.
+        for p in self.parts {
+            *self.disk.wakers[p.slot].lock() = Some(cx.waker().clone());
+        }
+        if self.disk.verdict(self.parts).is_some() {
+            return Poll::Ready(());
+        }
+        if self.replies.as_mut().poll(cx).is_ready() || self.timeout.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
     }
 }
 
@@ -230,28 +566,53 @@ impl Scheme for ServedDisk {
 impl BlockScheme for ServedDisk {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         let len = buf.len();
-        let r = self.transfer(block_id, len, |sector, at, n| {
-            self.call(OP_READ, sector, n)?;
-            self.window.read(0, &mut buf[at..at + n]).map_err(|e| {
-                warn!("served disk: reading the window: {e:?}");
-                DeviceError::IoError
-            })
-        });
+        let window = &self.window;
+        let r = self.transfer(
+            OP_READ,
+            block_id,
+            len,
+            |_, _, _| Ok(()),
+            |off, at, n| {
+                window.read(off, &mut buf[at..at + n]).map_err(|e| {
+                    warn!("served disk: reading the window: {e:?}");
+                    DeviceError::IoError
+                })
+            },
+        );
         self.stats.note_read(&r, len);
         r
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
         let len = buf.len();
-        let r = self.transfer(block_id, len, |sector, at, n| {
-            self.window.write(0, &buf[at..at + n]).map_err(|e| {
-                warn!("served disk: writing the window: {e:?}");
-                DeviceError::IoError
-            })?;
-            self.call(OP_WRITE, sector, n)
-        });
+        let window = &self.window;
+        let r = self.transfer(
+            OP_WRITE,
+            block_id,
+            len,
+            |off, at, n| {
+                window.write(off, &buf[at..at + n]).map_err(|e| {
+                    warn!("served disk: writing the window: {e:?}");
+                    DeviceError::IoError
+                })
+            },
+            |_, _, _| Ok(()),
+        );
         self.stats.note_write(&r, len);
         r
+    }
+
+    fn read_block_async<'a>(
+        &'a self,
+        block_id: usize,
+        buf: &'a mut [u8],
+    ) -> Option<BlockReadFuture<'a>> {
+        Some(Box::pin(async move {
+            let len = buf.len();
+            let r = self.read_async(block_id, buf).await;
+            self.stats.note_read(&r, len);
+            r
+        }))
     }
 
     fn flush(&self) -> DeviceResult {
@@ -292,7 +653,7 @@ mod tests {
 
     #[test]
     fn a_message_is_the_drivers_layout() {
-        let m = encode(OP_READ, 7, 8, 0x1_0000_0002);
+        let m = encode(OP_READ, 7, 8, 0, 0x1_0000_0002);
         assert_eq!(u32::from_ne_bytes(m[0..4].try_into().unwrap()), OP_READ);
         assert_eq!(u32::from_ne_bytes(m[8..12].try_into().unwrap()), 8);
         assert_eq!(u32::from_ne_bytes(m[12..16].try_into().unwrap()), 0);
@@ -303,6 +664,38 @@ mod tests {
         let mut back = m;
         back[24..32].copy_from_slice(&(-40i64).to_ne_bytes());
         assert_eq!(decode(&back), (7, -40));
+    }
+
+    #[test]
+    fn a_message_carries_its_place_in_the_window() {
+        let m = encode(OP_WRITE, 0x31, 8, 3 * 4096, 9);
+        assert_eq!(u32::from_ne_bytes(m[12..16].try_into().unwrap()), 3 * 4096);
+        assert_eq!(
+            decode(&m).0 as usize & (SLOTS - 1),
+            1,
+            "the slot is in the id"
+        );
+    }
+
+    #[test]
+    fn the_window_is_cut_into_whole_page_slots() {
+        assert_eq!(cut_window(64 * 1024), Some((16, 4096)));
+        assert_eq!(
+            cut_window(1024 * 1024),
+            Some((16, 65536)),
+            "no more than the FIFO holds"
+        );
+        assert_eq!(cut_window(3 * 4096 + 100), Some((3, 4096)));
+        assert_eq!(cut_window(4096), Some((1, 4096)));
+        assert_eq!(cut_window(4095), None);
+    }
+
+    #[test]
+    fn slots_are_taken_lowest_first_and_only_free_ones() {
+        assert_eq!(pick_slots(0b1011_0100, 2), 0b0001_0100);
+        assert_eq!(pick_slots(0b1011_0100, 9), 0b1011_0100);
+        assert_eq!(pick_slots(0, 3), 0);
+        assert_eq!(pick_slots(0b1, 0), 0);
     }
 
     #[test]
