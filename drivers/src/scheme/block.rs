@@ -65,6 +65,12 @@ impl IoStats {
     }
 }
 
+/// A read to wait for without holding the CPU: see
+/// [`BlockScheme::read_block_async`].
+pub type BlockReadFuture<'a> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = DeviceResult> + Send + 'a>,
+>;
+
 /// Block device interface.
 ///
 /// Convention shared by all implementations (AHCI, NVMe, partitions):
@@ -103,6 +109,19 @@ pub trait BlockScheme: Scheme {
     /// best-effort and time-bounded — it runs on the reboot path.
     fn quiesce_for_reboot(&self) {
         let _ = self.flush();
+    }
+    /// The read [`read_block`](Self::read_block) does, as a future, from a
+    /// disk whose reads wait on something other than this CPU -- one served
+    /// by a process, which answers when it is scheduled. A task that awaits
+    /// it sleeps until the answer, where `read_block` keeps its CPU looking.
+    /// `None`, the default, is a disk that only reads synchronously: the
+    /// caller uses `read_block`.
+    fn read_block_async<'a>(
+        &'a self,
+        _block_id: usize,
+        _buf: &'a mut [u8],
+    ) -> Option<BlockReadFuture<'a>> {
+        None
     }
     /// What this disk has transferred, when its driver counts it ([`IoStats`]).
     /// `None` for what is not a disk of its own: a partition is counted in its

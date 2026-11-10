@@ -850,7 +850,8 @@ static int serve_client(const char *self, int data_fd, int rounds) {
 // window of the DMA memory (eclipse_block_serve), and the kernel puts a
 // block device of its own on it: a new /dev/vdX, with the page cache and
 // everything else above it. The kernel copies between its buffers and the
-// window, and sends one request at a time, always at the window's start.
+// window, which it cuts into 4 KiB slots, one request in flight on each:
+// several threads at once, or one long read, reach the driver as one batch.
 // The driver then serves the other end forever, asleep on the FIFO and on
 // the device, while a child (this program again, exec'd with `kclient`)
 // finds the new node and reads it as any process would.

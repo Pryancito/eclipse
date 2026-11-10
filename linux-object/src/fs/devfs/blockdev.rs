@@ -33,6 +33,23 @@ impl BlockDev {
     pub fn block_scheme(&self) -> Arc<dyn BlockScheme> {
         self.block.clone()
     }
+
+    /// `read_at`, as a future, when the disk has an asynchronous read and the
+    /// request is whole sectors: what `pread` on the node awaits instead of
+    /// blocking its CPU. `None` sends the caller to `read_at`.
+    pub fn read_at_async<'a>(
+        &'a self,
+        offset: usize,
+        buf: &'a mut [u8],
+    ) -> Option<impl core::future::Future<Output = Result<usize>> + 'a> {
+        const BS: usize = 512;
+        if buf.is_empty() || !offset.is_multiple_of(BS) || !buf.len().is_multiple_of(BS) {
+            return None;
+        }
+        let len = buf.len();
+        let read = self.block.read_block_async(offset / BS, buf)?;
+        Some(async move { read.await.map(|()| len).map_err(convert_error) })
+    }
 }
 
 impl INode for BlockDev {
@@ -267,6 +284,19 @@ impl BlockScheme for PartitionBlock {
             return Err(zcore_drivers::DeviceError::InvalidParam);
         }
         self.parent.write_block(self.start_block + block_id, buf)
+    }
+
+    fn read_block_async<'a>(
+        &'a self,
+        block_id: usize,
+        buf: &'a mut [u8],
+    ) -> Option<zcore_drivers::scheme::BlockReadFuture<'a>> {
+        let nsectors = buf.len() / 512;
+        if block_id + nsectors > self.block_count {
+            // The sync path says why, the same way.
+            return None;
+        }
+        self.parent.read_block_async(self.start_block + block_id, buf)
     }
 
     fn flush(&self) -> zcore_drivers::DeviceResult {

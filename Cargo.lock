@@ -3184,6 +3184,7 @@ dependencies = [
  "kernel-hal",
  "linux-object",
  "linux-syscall",
+ "lock",
  "log",
  "rcore-fs-hostfs",
  "rcore-fs-ramfs",
