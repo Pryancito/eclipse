@@ -201,8 +201,9 @@ pub fn cap_window(
 
 pub struct VirtIoPciDriver;
 
-/// Leaves a virtio block disk on PCI to a userspace driver when the
-/// command line asks for it (`udriver=virtio-blk@N`, see [`crate::user`]).
+/// Leaves a virtio block disk or network card on PCI to a userspace driver
+/// when the command line asks for it (`udriver=virtio-blk@N`,
+/// `udriver=virtio-net@N`, see [`crate::user`]).
 ///
 /// It never drives anything: it counts the disk, records it when it is the
 /// one asked for, and declines it either way. [`VirtIoPciDriver`] is not in
@@ -216,7 +217,7 @@ impl PciDriver for UserVirtioBlkPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        vendor_id == 0x1af4 && is_virtio_blk(device_id)
+        vendor_id == 0x1af4 && user_kind(device_id).is_some()
     }
 
     fn init(
@@ -240,7 +241,10 @@ impl PciDriver for UserVirtioBlkPci {
         // MSI, and INTx is not routed). The number recorded is the vector,
         // which is what the APIC's `register_handler` takes.
         let loc = dev.loc;
-        crate::user::reserve_virtio_blk_if(window.is_some(), transport, paddr, size, || {
+        let Some(kind) = user_kind(dev.id.device_id) else {
+            return Err(DeviceError::NotSupported);
+        };
+        crate::user::reserve_if(kind, window.is_some(), transport, paddr, size, || {
             let irq = crate::bus::pci::arm_msix_now(loc, mapper, irq).or(irq);
             // x86 MSI numbers sit 32 below their vectors (`bus::pci::enable`).
             irq.map(|irq| {
@@ -273,9 +277,15 @@ fn true_bar_len(bar: BAR) -> BAR {
     }
 }
 
-/// A virtio block device: transitional (`0x1001`) or modern (`0x1042`).
-fn is_virtio_blk(device_id: u16) -> bool {
-    matches!(device_id, 0x1001 | 0x1042)
+/// The kind of device a userspace driver can be handed, by PCI device id:
+/// a block device, transitional (`0x1001`) or modern (`0x1042`), or a
+/// network card, transitional (`0x1000`) or modern (`0x1041`).
+fn user_kind(device_id: u16) -> Option<&'static str> {
+    match device_id {
+        0x1001 | 0x1042 => Some(crate::user::VIRTIO_BLK),
+        0x1000 | 0x1041 => Some(crate::user::VIRTIO_NET),
+        _ => None,
+    }
 }
 
 /// What a userspace driver of this device is handed: one memory BAR that

@@ -444,6 +444,17 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         {
             return Err(DeviceError::NotSupported);
         }
+        // A network card has no driver in the kernel: it is counted, and
+        // recorded when the command line hands it to userspace.
+        if header.device_type() == DeviceType::Network {
+            crate::user::reserve_virtio_net(
+                crate::user::Transport::VirtioMmio,
+                paddr as usize,
+                size as usize,
+                interrupts.first_irq().map(|irq| irq as usize),
+            );
+            return Err(DeviceError::NotSupported);
+        }
         info!(
             "{MODULE}: detected virtio device: vendor_id={:#X}, type={:?}",
             header.vendor_id(),

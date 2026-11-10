@@ -500,6 +500,22 @@ ifneq ($(UDISK),)
   endif
 endif
 
+# UNET=1: a virtio network card on a user-mode network of its own, for a
+# driver in userspace. The kernel has no virtio-net driver: boot with
+# `udriver=virtio-net@0` in KOPTS to have it recorded for a process to
+# claim (`tools/zx-virtio-net`). With UDISK as well, both go in one option:
+# `udriver=virtio-blk@N,virtio-net@0`.
+ifneq ($(UNET),)
+  qemu_opts += -netdev user,id=unet
+  ifeq ($(ARCH), aarch64)
+    qemu_opts += -device virtio-net-device,netdev=unet,bus=virtio-mmio-bus.2
+  else ifeq ($(ARCH), riscv64)
+    qemu_opts += -device virtio-net-device,netdev=unet
+  else
+    qemu_opts += -device virtio-net-pci,netdev=unet
+  endif
+endif
+
 ifeq ($(GRAPHIC), on)
   ifeq ($(ARCH), x86_64)
     ifeq ($(GL), 1)
