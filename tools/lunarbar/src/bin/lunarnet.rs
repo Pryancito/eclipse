@@ -1084,12 +1084,16 @@ struct Client {
 /// One pass over the file: the commands now, the DHCP clients to keep alive,
 /// and the static IPv6 addresses added (the next pass takes them away: the
 /// kernel's own SLAAC addresses are not this service's to flush).
-fn bring_up(added6: &mut Vec<(String, String)>) -> Vec<Client> {
+///
+/// Also the interfaces there were to bring up, as sysfs listed them: the
+/// service compares that against what is there later (see [`service`]).
+fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, Vec<String>) {
     for (dev, cidr) in added6.drain(..) {
         let _ = run(&["ip", "-6", "addr", "del", &cidr, "dev", &dev]);
     }
     let conf = netconf::load(Path::new(netconf::CONF));
-    let mut names = netconf::interfaces(Path::new("/sys/class/net"));
+    let seen = netconf::interfaces(Path::new(SYS_NET));
+    let mut names = seen.clone();
     if names.is_empty() {
         // The NIC may not have probed yet; eth0 is the first one's name.
         names.push("eth0".into());
@@ -1125,8 +1129,11 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> Vec<Client> {
         }
     }
     eprintln!("lunarnet: {} interfaz(es), {} cliente(s) DHCP", names.len(), clients.len());
-    clients
+    (clients, seen)
 }
+
+/// Where the kernel lists its interfaces.
+const SYS_NET: &str = "/sys/class/net";
 
 /// `/run/lunarnet.service.lock`, held for as long as the service runs.
 const SERVICE_LOCK: &str = "/run/lunarnet.service.lock";
@@ -1184,8 +1191,18 @@ fn service() -> ! {
     let mut added6 = Vec::new();
     loop {
         RELOAD.store(false, Ordering::SeqCst);
-        let mut clients = bring_up(&mut added6);
+        let (mut clients, seen) = bring_up(&mut added6);
         while !RELOAD.load(Ordering::SeqCst) && !STOP.load(Ordering::SeqCst) {
+            // An interface that was not there when the file was applied has
+            // had none of it: a card whose driver is a process (`unet`) comes
+            // up a moment after this service starts, and one that is plugged
+            // in comes whenever it likes. One that went takes its DHCP
+            // client's reason to run with it. Either way, start over from
+            // what there is now.
+            if netconf::interfaces(Path::new(SYS_NET)) != seen {
+                eprintln!("lunarnet: las interfaces han cambiado, aplicando de nuevo");
+                break;
+            }
             for c in &mut clients {
                 let dead = match &mut c.child {
                     None => true,
@@ -1213,7 +1230,9 @@ fn service() -> ! {
             let _ = std::fs::remove_file(PIDFILE);
             std::process::exit(0);
         }
-        eprintln!("lunarnet: SIGHUP, aplicando /etc/eclipse/network de nuevo");
+        if RELOAD.load(Ordering::SeqCst) {
+            eprintln!("lunarnet: SIGHUP, aplicando /etc/eclipse/network de nuevo");
+        }
     }
 }
 

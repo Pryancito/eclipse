@@ -9,7 +9,11 @@
 //! launcher).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use super::LinuxRootfs;
+use crate::PROJECT_DIR;
+use os_xtask_utils::{CommandExt, Ext};
 
 /// `/usr/local/bin/eclipse-network-up`.
 ///
@@ -51,6 +55,101 @@ pub(super) fn write_network_wrapper(localbin: &Path) {
           exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
     )
     .unwrap();
+}
+
+/// The `unet` service and `/usr/local/bin/eclipse-unet`, which it runs: the
+/// driver of the first virtio network card, as a process.
+///
+/// `udriver =` keeps the service out of every boot where the kernel drives
+/// its own cards, which is all of them unless the command line says
+/// `udriver=virtio-net@0`. Supervised: when the driver dies the kernel resets
+/// the card and keeps the interface, addresses and connections included, for
+/// the next one, which init starts at once -- so `network` is ordered after
+/// it only for the first start, and has nothing to do on any later one.
+///
+/// `service` is the driver doing its job and nothing else: it hands the card
+/// to the kernel as an interface and carries its frames until it is killed.
+pub(super) fn write_unet(localbin: &Path, svc_dir: &Path) {
+    fs::write(
+        svc_dir.join("unet.service"),
+        b"# Driver of the network card left to userspace (boot with\n\
+          # udriver=virtio-net@0). See /usr/local/bin/eclipse-unet.\n\
+          exec = /usr/local/bin/eclipse-unet\n\
+          type = respawn\n\
+          udriver = virtio-net@0\n",
+    )
+    .unwrap();
+    fs::write(
+        localbin.join("eclipse-unet"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of the network card the kernel\n\
+          # left alone (udriver=virtio-net@0), in the foreground for\n\
+          # eclipse-init, which starts it again if it dies. The kernel keeps\n\
+          # the interface meanwhile. See tools/zx-virtio-net.\n\
+          [ -x /bin/zx-virtio-net ] || { echo 'eclipse-unet: /bin/zx-virtio-net is not in this image' >&2; sleep 5; exit 127; }\n\
+          exec /bin/zx-virtio-net service 0\n",
+    )
+    .unwrap();
+}
+
+impl LinuxRootfs {
+    /// Put the driver `unet` runs in the image's `/bin`, built for its
+    /// architecture.
+    pub(super) fn install_zx_virtio_net(&self, musl: &Path, bin: &Path) {
+        let built = self.zx_virtio_net(musl);
+        if built.is_file() {
+            let dst = bin.join("zx-virtio-net");
+            let _ = fs::remove_file(&dst);
+            let _ = fs::copy(&built, &dst);
+        }
+    }
+
+    /// Compile zx-virtio-net (`tools/zx-virtio-net`): the driver, in
+    /// userspace, of a virtio network card the kernel was told to leave
+    /// alone (`udriver=virtio-net@N`).
+    fn zx_virtio_net(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("zx-virtio-net");
+        let executable = dir.join("zx-virtio-net");
+        let source = dir.join("zx-virtio-net.c");
+        // Rebuild if missing, if the source is newer, or if the binary there
+        // is another architecture's.
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
+            let newer = |a: &Path, b: &Path| {
+                let at = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+                matches!((at(a), at(b)), (Some(a), Some(b)) if a >= b)
+            };
+            if newer(&executable, &source) {
+                return executable;
+            }
+        }
+
+        println!("Compiling zx-virtio-net...");
+        let musl = musl.canonicalize().unwrap();
+        let cc = musl
+            .join("bin")
+            .join(format!("{}-linux-musl-gcc", self.0.name()));
+        let strip = self.strip(&musl);
+
+        // A build that fails must not leave the last one, for whatever
+        // architecture it was, to be copied in its place.
+        let _ = fs::remove_file(&executable);
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-pthread")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile zx-virtio-net");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
 }
 
 /// "Red" in the launcher: `eclipse-network`, and its `.desktop` entry.

@@ -353,11 +353,28 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
         // Zircon syscalls for Linux processes (see
-        // `zcore_loader::linux::ZIRCON_GATEWAY_BASE`): off by default.
+        // `zcore_loader::linux::ZIRCON_GATEWAY_BASE`): off by default, and on
+        // when asked for. A boot that leaves a device to a userspace driver
+        // (`udriver=`) has asked: the gateway is the only way a process can
+        // take the device, and without it the device is nobody's until the
+        // next boot. `zircon.gateway=0` still wins.
         #[cfg(feature = "linux")]
-        if kernel_hal::cmdline::flag(&options.cmdline, "zircon.gateway") {
-            zcore_loader::linux::set_zircon_gateway(true);
-            klog_info!("Eclipse: Zircon syscall gateway ENABLED (zircon.gateway=1)");
+        {
+            let asked = kernel_hal::cmdline::flag(&options.cmdline, "zircon.gateway");
+            let needed = kernel_hal::cmdline::value(&options.cmdline, "udriver")
+                .is_some_and(|devices| !devices.is_empty())
+                && !kernel_hal::cmdline::is_off(&options.cmdline, "zircon.gateway");
+            if asked || needed {
+                zcore_loader::linux::set_zircon_gateway(true);
+                klog_info!(
+                    "Eclipse: Zircon syscall gateway ENABLED ({})",
+                    if asked {
+                        "zircon.gateway=1"
+                    } else {
+                        "udriver="
+                    }
+                );
+            }
         }
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
