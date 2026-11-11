@@ -63,5 +63,22 @@ class TheGuestGetsNoMoreCpusThanTheHostCanRun(unittest.TestCase):
         self.assertGreaterEqual(script.host_cpus(), 1)
 
 
+
+
+class AGuestThatRefusesItsPromptShowsItsConsole(unittest.TestCase):
+    def test_the_tail_is_the_last_lines_and_says_how_many(self):
+        console = "".join(f"line {i}\r\n" for i in range(200))
+        tail = script.console_tail(console)
+        self.assertIn(f"the last {script.CONSOLE_TAIL_LINES} lines", tail)
+        self.assertIn("line 199", tail)
+        self.assertNotIn(f"line {199 - script.CONSOLE_TAIL_LINES}\n", tail + "\n")
+
+    def test_a_short_console_is_shown_whole(self):
+        self.assertIn("the last 2 lines", script.console_tail("a\nb\n"))
+
+    def test_a_silent_guest_is_said_to_be_silent(self):
+        self.assertIn("printed nothing", script.console_tail(""))
+
+
 if __name__ == "__main__":
     unittest.main()
