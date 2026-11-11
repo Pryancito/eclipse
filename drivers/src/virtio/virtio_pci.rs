@@ -247,13 +247,17 @@ impl PciDriver for UserVirtioBlkPci {
         crate::user::reserve_if(kind, window.is_some(), transport, paddr, size, || {
             let irq = crate::bus::pci::arm_msix_now(loc, mapper, irq).or(irq);
             // x86 MSI numbers sit 32 below their vectors (`bus::pci::enable`).
-            irq.map(|irq| {
+            let irq = irq.map(|irq| {
                 if cfg!(target_arch = "x86_64") {
                     irq + 32
                 } else {
                     irq
                 }
-            })
+            });
+            // The kernel's own view of the BAR, for the one thing it does
+            // to the device: reset it when its driver dies.
+            let vaddr = mapper.as_ref().and_then(|m| m.query_or_map(paddr, size));
+            crate::user::Wiring { irq, vaddr }
         });
         Err(DeviceError::NotSupported)
     }

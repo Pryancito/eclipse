@@ -85,7 +85,12 @@ fn reserved_for_userspace(header: &VirtIOHeader, slot: usize) -> bool {
         zcore_drivers::user::Transport::VirtioMmio,
         VIRTIO_BASE + slot * VIRTIO_SLOT,
         VIRTIO_SLOT,
-        || Some(VIRTIO_FIRST_INTID + slot),
+        || zcore_drivers::user::Wiring {
+            irq: Some(VIRTIO_FIRST_INTID + slot),
+            // The page `vm.rs` maps for the whole bank; the kernel resets
+            // the device through it when its driver dies.
+            vaddr: Some(header as *const VirtIOHeader as usize),
+        },
     )
 }
 

@@ -26,6 +26,25 @@
 // gives the interface an address and pings the gateway through the
 // kernel's own stack.
 //
+//   zx-virtio-net service [N]
+//
+// The driver as what it is for: the card goes to the kernel and the
+// process carries its frames until it is killed, checking nothing. This is
+// what a supervisor runs (eclipse-init, `type = respawn`). When it dies
+// the kernel resets the card and keeps the interface for ten seconds, with
+// its addresses and the connections through it; the next `service` gets
+// the same card and the same interface, and what was waiting goes out.
+//
+//   zx-virtio-net restart [N [ROUNDS [PORT [KILLS]]]]
+//
+// The check of that: starts the driver as a child, gives the interface an
+// address and pings; then KILLS times (default 2) kills the driver with
+// SIGKILL -- in the middle of a download of http://10.0.3.2:PORT/blob when
+// PORT is given -- and starts it again: the interface must still be there
+// under the same name, the download must finish, and the gateway must
+// answer pings with no address set again. At the end the driver is killed
+// and not started again, and the interface must go.
+//
 //   zx-virtio-net ping IFACE ADDRESS GATEWAY [ROUNDS]
 //
 // The baseline: the same pings through an interface the kernel drives
@@ -44,6 +63,7 @@
 #include <errno.h>
 #include <net/if.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +92,7 @@
 #define ZX_FIFO_PEER_CLOSED (1u << 2)
 #define ZX_TIME_INFINITE INT64_MAX
 #define ZX_ERR_SHOULD_WAIT (-22)
+#define ZX_ERR_ALREADY_BOUND (-27)
 #define ECLIPSE_SYS_net_serve 0x4007
 #define ECLIPSE_SYS_handle_to_fd 0x4000
 #define ECLIPSE_SYS_device_claim 0x4005
@@ -742,26 +763,46 @@ static int export_check(int rounds, int port) {
     return ping_through(name, "driver in userspace", "10.0.3.15", "10.0.3.2", rounds, port);
 }
 
+// How long the kernel keeps an interface whose driver died, for the next
+// driver to pick up (DRIVER_GRACE in loader/src/linux/net_serve.rs), and a
+// margin to look for it gone.
+#define DRIVER_GRACE_MS 10000
+#define GONE_MARGIN_MS 5000
+
+// Wait for the card's interface to go once its driver is dead for good.
+// 0 when it went, and not before the kernel's grace was nearly up.
+static int interface_goes(void) {
+    char name[16] = "";
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < (DRIVER_GRACE_MS + GONE_MARGIN_MS) / 10; i++) {
+        if (find_ifname(name, sizeof name) != 0) {
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            double s = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+            printf("zx-virtio-net: no driver came back and the interface went, after %.1f s\n", s);
+            return 0;
+        }
+        usleep(10000);
+    }
+    printf("zx-virtio-net: FAIL: the driver is gone for good and %s is still there\n", name);
+    return 1;
+}
+
 // What outlives the driver: it sleeps until the driver is gone (the pipe
 // closes), and then the interface must go too.
 static void watch_the_end(int pipe_rd) {
     char c;
     while (read(pipe_rd, &c, 1) > 0) {
     }
-    char name[16];
-    for (int i = 0; i < 200; i++) {
-        if (find_ifname(name, sizeof name) != 0) {
-            printf("zx-virtio-net: the driver is gone and so is its interface\n");
-            printf("zx-virtio-net: all checks passed\n");
-            _exit(0);
-        }
-        usleep(10000);
-    }
-    printf("zx-virtio-net: FAIL: the driver is gone and %s is still there\n", name);
-    _exit(1);
+    if (interface_goes() != 0)
+        _exit(1);
+    printf("zx-virtio-net: all checks passed\n");
+    _exit(0);
 }
 
-static int export_card(zx_handle_t window, int rounds, int port) {
+// Hand the card to the kernel and run the two threads that carry its
+// frames. From here on it is an interface of the kernel's.
+static void serve_card(zx_handle_t window) {
     zx_handle_t ends[2];
     long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct net_msg), 0,
                            (long)&ends[0], (long)&ends[1], 0));
@@ -778,6 +819,10 @@ static int export_card(zx_handle_t window, int rounds, int port) {
     pthread_t card, msgs;
     if (pthread_create(&card, NULL, card_thread, NULL) || pthread_create(&msgs, NULL, fifo_thread, NULL))
         die("pthread_create", errno);
+}
+
+static int export_card(zx_handle_t window, int rounds, int port) {
+    serve_card(window);
     int end[2];
     if (pipe(end) != 0)
         die("pipe", errno);
@@ -810,28 +855,22 @@ struct claim {
     uint64_t interrupt;
 };
 
-int main(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc >= 5 && !strcmp(argv[1], "ping")) {
-        int bad = ping_through(argv[2], "the kernel's driver", argv[3], argv[4],
-                               argc > 5 ? atoi(argv[5]) : 200, argc > 6 ? atoi(argv[6]) : 0);
-        if (!bad)
-            printf("zx-virtio-net: all checks passed\n");
-        return bad;
-    }
-    int exporting = argc > 1 && !strcmp(argv[1], "export");
-    if (exporting) {
-        argv++;
-        argc--;
-    }
-    tx_irq = exporting;
-    long index = argc > 1 ? atol(argv[1]) : 0;
-    int rounds = argc > 2 ? atoi(argv[2]) : 200;
+// Claim card `index` and set it up: queues, features, receive buffers
+// posted. Returns the window of slots the kernel is to reach (0 unless
+// `exporting`). `patient`: a claim refused because the card has a driver
+// is tried again for a while -- the driver before this one may have died
+// a moment ago, and the kernel resets the card before it gives it out.
+static zx_handle_t card_up(long index, int exporting, int patient) {
     struct claim c;
-    long r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_VIRTIO_NET, index, (long)&c, 0));
+    long r;
+    for (int tries = patient ? 300 : 1;; usleep(10000)) {
+        r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_VIRTIO_NET, index, (long)&c, 0));
+        if (r != ZX_ERR_ALREADY_BOUND || --tries <= 0)
+            break;
+    }
     if (r == -ENOSYS) {
         printf("zx-virtio-net: the gateway is off (boot with zircon.gateway=1)\n");
-        return 2;
+        exit(2);
     }
     if (r != 0)
         die("claim (boot with udriver=virtio-net@N and a card there)", r);
@@ -882,6 +921,164 @@ int main(int argc, char **argv) {
     printf("zx-virtio-net: card %ld up (%s), mac %02x:%02x:%02x:%02x:%02x:%02x, interrupt %s\n",
            index, transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO ? "virtio-mmio" : "virtio-pci",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], irq_handle ? "yes" : "no");
+    return window;
+}
+
+// The driver as a service: the card goes to the kernel and this process
+// carries its frames until it is killed. Whoever started it starts it
+// again if it dies (eclipse-init, with `type = respawn`), and the kernel
+// gives the next one the same card and the same interface. `report` >= 0
+// is a pipe that is told the card's address once it is up.
+static int service(long index, int report) {
+    tx_irq = 1;
+    serve_card(card_up(index, 1, 1));
+    if (report >= 0) {
+        if (write(report, mac, sizeof mac) != sizeof mac)
+            die("write (report)", errno);
+        close(report);
+    }
+    // Until a signal ends the process: there is nothing to return to.
+    while (pause() != 0) {
+    }
+    return 0;
+}
+
+// Start the driver as a child, the way a supervisor would, and wait until
+// it says the card is up. Its pid, or -1.
+static pid_t start_driver(long index) {
+    int up[2];
+    if (pipe(up) != 0)
+        die("pipe", errno);
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork", errno);
+    if (pid == 0) {
+        close(up[0]);
+        _exit(service(index, up[1]));
+    }
+    close(up[1]);
+    ssize_t n = read(up[0], mac, sizeof mac);
+    close(up[0]);
+    if (n != sizeof mac) {
+        printf("zx-virtio-net: FAIL: the driver did not come up\n");
+        return -1;
+    }
+    return pid;
+}
+
+static void kill_driver(pid_t pid) {
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+}
+
+static int ping_once(const char *what, const char *gw, int rounds, int size) {
+    char cmd[256];
+    printf("zx-virtio-net: %s, ping %d bytes x%d:\n", what, size, rounds);
+    snprintf(cmd, sizeof cmd, PING_CMD, rounds, size, gw);
+    if (sh(cmd) != 0) {
+        printf("zx-virtio-net: FAIL: %s\n", cmd);
+        return 1;
+    }
+    return 0;
+}
+
+// The check of what a supervisor counts on: the driver is killed `kills`
+// times, each time in the middle of a download when there is a server to
+// download from, and started again. The interface must keep its name and
+// its address, the download must finish, and when the driver is killed and
+// not started again the interface must go.
+static int restart_check(long index, int rounds, int port, int kills) {
+    const char *ip = "10.0.3.15", *gw = "10.0.3.2";
+    char name[16], now[16], cmd[256];
+    pid_t driver = start_driver(index);
+    if (driver < 0)
+        return 1;
+    if (find_ifname(name, sizeof name) != 0) {
+        printf("zx-virtio-net: FAIL: no interface has the card's address\n");
+        return 1;
+    }
+    printf("zx-virtio-net: the card is %s\n", name);
+    snprintf(cmd, sizeof cmd, "ifconfig %s %s netmask 255.255.255.0 up", name, ip);
+    if (sh(cmd) != 0 || ping_once("first driver", gw, rounds, 56) != 0)
+        return 1;
+    for (int k = 1; k <= kills; k++) {
+        pid_t wget = -1;
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        if (port) {
+            snprintf(cmd, sizeof cmd, "http://%s:%d/blob", gw, port);
+            wget = fork();
+            if (wget < 0)
+                die("fork", errno);
+            if (wget == 0) {
+                execlp("wget", "wget", "-q", "-O", "/tmp/blob", cmd, (char *)NULL);
+                _exit(127);
+            }
+            usleep(300000); // into the download
+        }
+        kill_driver(driver);
+        // Nothing above the driver went with it.
+        if (find_ifname(now, sizeof now) != 0 || strcmp(now, name) != 0) {
+            printf("zx-virtio-net: FAIL: %s went with its driver\n", name);
+            return 1;
+        }
+        driver = start_driver(index);
+        if (driver < 0)
+            return 1;
+        if (find_ifname(now, sizeof now) != 0 || strcmp(now, name) != 0) {
+            printf("zx-virtio-net: FAIL: the new driver's card is not %s\n", name);
+            return 1;
+        }
+        printf("zx-virtio-net: driver killed and started again (%d of %d), still %s\n", k, kills,
+               name);
+        if (wget > 0) {
+            int st = 0;
+            struct stat sb;
+            waitpid(wget, &st, 0);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || stat("/tmp/blob", &sb) != 0) {
+                printf("zx-virtio-net: FAIL: the download did not survive the driver\n");
+                return 1;
+            }
+            double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+            printf("zx-virtio-net: the download across it finished: %ld KiB in %.0f ms\n",
+                   (long)(sb.st_size / 1024), ms);
+            unlink("/tmp/blob");
+        }
+        // The address was the interface's, not the driver's: no ifconfig.
+        if (ping_once("driver started again", gw, rounds, 56) != 0)
+            return 1;
+    }
+    kill_driver(driver);
+    if (interface_goes() != 0)
+        return 1;
+    printf("zx-virtio-net: all checks passed\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc >= 5 && !strcmp(argv[1], "ping")) {
+        int bad = ping_through(argv[2], "the kernel's driver", argv[3], argv[4],
+                               argc > 5 ? atoi(argv[5]) : 200, argc > 6 ? atoi(argv[6]) : 0);
+        if (!bad)
+            printf("zx-virtio-net: all checks passed\n");
+        return bad;
+    }
+    if (argc > 1 && !strcmp(argv[1], "service"))
+        return service(argc > 2 ? atol(argv[2]) : 0, -1);
+    if (argc > 1 && !strcmp(argv[1], "restart"))
+        return restart_check(argc > 2 ? atol(argv[2]) : 0, argc > 3 ? atoi(argv[3]) : 20,
+                             argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 2);
+    int exporting = argc > 1 && !strcmp(argv[1], "export");
+    if (exporting) {
+        argv++;
+        argc--;
+    }
+    tx_irq = exporting;
+    long index = argc > 1 ? atol(argv[1]) : 0;
+    int rounds = argc > 2 ? atoi(argv[2]) : 200;
+    zx_handle_t window = card_up(index, exporting, 0);
 
     if (exporting)
         return export_card(window, rounds, argc > 3 ? atoi(argv[3]) : 0);

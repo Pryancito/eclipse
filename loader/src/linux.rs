@@ -513,8 +513,11 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   quiets the device in between; an MSI (virtio-pci) is not masked.
 ///
 /// `kind` 1 is a virtio block device, 2 a virtio network card. `NOT_FOUND` when no such device was
-/// reserved, `ALREADY_BOUND` once something has claimed it: one driver per
-/// device, for the life of the kernel.
+/// reserved, `ALREADY_BOUND` while a process has it: one driver per device
+/// at a time. When that process terminates the kernel resets the device,
+/// lets go of what was pinned for it and of its interrupt, and the device
+/// can be claimed again -- a moment later, so a driver started on the heels
+/// of another may see `ALREADY_BOUND` a few times first.
 ///
 /// What this does not isolate yet: without an IOMMU the BTI hands out
 /// physical addresses, so the device can be told to DMA anywhere; and a
@@ -559,7 +562,11 @@ pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
 /// slots the frames pass through (the first `rx_slots` for frames coming
 /// in), and `mac` the card's address, its first byte in the low byte. The
 /// card appears as an `ethN` interface; the process passes frames on the
-/// other end of the FIFO. Both handles go to the kernel.
+/// other end of the FIFO. Both handles go to the kernel. The interface
+/// outlasts the process by ten seconds, carrying nothing: a process that
+/// serves a card with the same `mac` within them gets that interface, with
+/// its addresses and the connections through it. `ALREADY_BOUND` when the
+/// card with that `mac` has a driver.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
 

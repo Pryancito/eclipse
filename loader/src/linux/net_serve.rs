@@ -26,6 +26,14 @@
 //! window directly. Nothing here blocks: a frame that finds no free slot is
 //! refused and the stack sends it again.
 //!
+//! A driver that dies takes nothing above it with it. The interface stays,
+//! with its addresses, its routes and the connections going through it, and
+//! simply carries nothing for a while (its port is taken away,
+//! `ServedInterface::unplug`): a driver that then serves
+//! a card with the same MAC gets the same interface, and what was waiting
+//! goes out. Only when none comes within [`DRIVER_GRACE`] is the interface
+//! removed.
+//!
 //! What this trusts: the driver is a process the system started for the
 //! purpose. It sees and can forge every frame of the interface, as a card
 //! could; it cannot make the kernel read or write anything but the window,
@@ -35,6 +43,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 use kernel_hal::drivers::net::served::{FramePort, ServedInterface, MAX_FRAME};
 use kernel_hal::drivers::prelude::Device;
 use zircon_object::ipc::Fifo;
@@ -58,6 +67,12 @@ const BATCH: usize = 32;
 /// The most received frames kept for the stack; past it the newest is
 /// dropped, as a card with a full ring drops.
 const RX_BACKLOG: usize = 256;
+
+/// How long an interface outlasts its driver, for the next one to pick it
+/// up. Longer than the longest pause `eclipse-init` puts between two starts
+/// of a service that keeps dying (8 s); short enough that a card nobody
+/// drives any more does not sit in the routing for long.
+const DRIVER_GRACE: Duration = Duration::from_secs(10);
 
 /// A message, as bytes.
 pub(super) fn encode(op: u32, slot: u32, len: u32, off: u32) -> [u8; NET_MSG] {
@@ -286,6 +301,125 @@ impl FramePort for ServedNic {
     }
 }
 
+/// Whose turn it is to drive a card: the port of the driver that has it,
+/// or nothing while there is none.
+pub(super) struct Seat<P> {
+    port: Option<Arc<P>>,
+    /// How many drivers have sat here: tells a seat nobody came back to
+    /// from one that was taken and left again.
+    turns: usize,
+}
+
+impl<P> Seat<P> {
+    pub(super) const fn new() -> Self {
+        Self {
+            port: None,
+            turns: 0,
+        }
+    }
+
+    /// A driver takes the seat. Its turn, or `None` when another has it.
+    pub(super) fn sit(&mut self, port: Arc<P>) -> Option<usize> {
+        if self.port.is_some() {
+            return None;
+        }
+        self.port = Some(port);
+        self.turns += 1;
+        Some(self.turns)
+    }
+
+    /// The driver whose port this is has gone: whether the seat was its to
+    /// leave. Somebody else's port is left where it is.
+    pub(super) fn leave(&mut self, port: &Arc<P>) -> bool {
+        let its = self.port.as_ref().is_some_and(|p| Arc::ptr_eq(p, port));
+        if its {
+            self.port = None;
+        }
+        its
+    }
+
+    /// Whether the seat is empty and nobody has sat since `turn`.
+    pub(super) fn empty_since(&self, turn: usize) -> bool {
+        self.port.is_none() && self.turns == turn
+    }
+}
+
+/// A card that has been served, by its MAC.
+struct Card {
+    mac: [u8; 6],
+    seat: Seat<ServedNic>,
+    iface: Arc<ServedInterface>,
+}
+
+/// The cards with an interface: one being driven, or one within
+/// [`DRIVER_GRACE`] of having been. Every change of driver happens under
+/// this lock, the interface's port included, so the seat and the port
+/// never disagree.
+static CARDS: lock::Mutex<Vec<Card>> = lock::Mutex::new(Vec::new());
+
+/// Seat `nic` behind the interface of the card with this MAC: the one it
+/// had under its last driver, or a new `ethN`. The interface and the turn.
+fn seat_card(mac: [u8; 6], nic: Arc<ServedNic>) -> ZxResult<(Arc<ServedInterface>, usize)> {
+    use kernel_hal::drivers::scheme::NetScheme;
+    let mut cards = CARDS.lock();
+    if let Some(card) = cards.iter_mut().find(|c| c.mac == mac) {
+        // The driver it had may have died a moment ago, with its task not
+        // yet there to say so: ask the FIFO.
+        if let Some(last) = card.seat.port.clone() {
+            last.pump();
+            if last.is_dead() {
+                card.seat.leave(&last);
+            }
+        }
+        // Two drivers for one card: the second is refused.
+        let turn = card.seat.sit(nic.clone()).ok_or(ZxError::ALREADY_BOUND)?;
+        card.iface.set_port(nic);
+        info!(
+            "served card: {} has a driver again",
+            card.iface.get_ifname()
+        );
+        return Ok((card.iface.clone(), turn));
+    }
+    let mut seat = Seat::new();
+    let turn = seat.sit(nic.clone()).ok_or(ZxError::BAD_STATE)?;
+    let name = kernel_hal::drivers::net::next_eth_ifname();
+    let iface = Arc::new(ServedInterface::new(name, mac, nic));
+    if !kernel_hal::drivers::hotplug::add(Device::Net(iface.clone())) {
+        return Err(ZxError::NOT_SUPPORTED);
+    }
+    cards.push(Card {
+        mac,
+        seat,
+        iface: iface.clone(),
+    });
+    Ok((iface, turn))
+}
+
+/// The driver behind `nic` is gone: its interface carries nothing from
+/// here on, unless another driver has the card already.
+fn unseat_card(iface: &Arc<ServedInterface>, nic: &Arc<ServedNic>) {
+    let mut cards = CARDS.lock();
+    if let Some(card) = cards.iter_mut().find(|c| Arc::ptr_eq(&c.iface, iface)) {
+        if card.seat.leave(nic) {
+            iface.unplug();
+        }
+    }
+}
+
+/// [`DRIVER_GRACE`] after the driver of turn `turn` went: when no other
+/// came, the card is forgotten and the answer is `true`.
+fn forget_card(iface: &Arc<ServedInterface>, turn: usize) -> bool {
+    let mut cards = CARDS.lock();
+    let Some(at) = cards.iter().position(|c| Arc::ptr_eq(&c.iface, iface)) else {
+        return false;
+    };
+    if !cards[at].seat.empty_since(turn) {
+        return false;
+    }
+    cards.remove(at);
+    true
+}
+
 /// [`ECLIPSE_NET_SERVE`](super::ECLIPSE_NET_SERVE): `args[0]` is the FIFO
 /// end the kernel keeps, `args[1]` the window, `args[2]` the card's MAC
 /// (its six bytes, the first in the low byte), `args[3]` how many of the
@@ -304,11 +438,10 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         return Err(ZxError::INVALID_ARGS);
     }
     let nic = Arc::new(ServedNic::new(fifo.clone(), window, args[3])?);
-    let name = kernel_hal::drivers::net::next_eth_ifname();
-    let iface = Arc::new(ServedInterface::new(name, mac, nic.clone()));
-    if !kernel_hal::drivers::hotplug::add(Device::Net(iface.clone())) {
-        return Err(ZxError::NOT_SUPPORTED);
-    }
+    let (iface, turn) = seat_card(mac, nic.clone())?;
+    // Once through the stack straight away: an interface that had no
+    // driver for a while has things waiting to go out.
+    fifo.signal_set(Signal::USER_SIGNAL_0);
     // The card's interrupt, in effect: sleep on the FIFO, and run what
     // arrives through the stack.
     kernel_hal::thread::spawn(async move {
@@ -335,7 +468,16 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 kernel_hal::net::wake_net_rx_waiters_now();
             }
         }
-        // No driver, no card: the interface goes, so nothing routes into it.
+        // No driver: the interface carries nothing, and waits for the next.
+        unseat_card(&iface, &nic);
+        drop(nic);
+        kernel_hal::net::wake_net_rx_waiters_now();
+        kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + DRIVER_GRACE).await;
+        if !forget_card(&iface, turn) {
+            return;
+        }
+        // Nobody came: no driver, no card. The interface goes, so nothing
+        // routes into it.
         let gone = Device::Net(iface);
         if !kernel_hal::drivers::hotplug::remove(&gone) {
             warn!("served card: its interface was not registered any more");
@@ -348,6 +490,39 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seat_takes_one_driver_at_a_time() {
+        let mut seat = Seat::new();
+        let (first, second) = (Arc::new(1), Arc::new(2));
+        assert_eq!(seat.sit(first.clone()), Some(1));
+        assert_eq!(seat.sit(second.clone()), None);
+        // A driver that never had the seat does not empty it by leaving.
+        assert!(!seat.leave(&second));
+        assert_eq!(seat.sit(second.clone()), None);
+        // The one that has it does, and then the next can sit.
+        assert!(seat.leave(&first));
+        assert!(!seat.leave(&first), "it left once");
+        assert_eq!(seat.sit(second), Some(2));
+    }
+
+    #[test]
+    fn a_seat_knows_whether_anybody_came_back() {
+        let mut seat = Seat::new();
+        let first = Arc::new(1);
+        let turn = seat.sit(first.clone()).unwrap();
+        assert!(!seat.empty_since(turn), "its driver is still there");
+        seat.leave(&first);
+        assert!(seat.empty_since(turn));
+        // Another came and went in the meantime: the first driver's wait
+        // is over, and it is the second's to give the interface up.
+        let second = Arc::new(2);
+        let next = seat.sit(second.clone()).unwrap();
+        assert!(!seat.empty_since(turn));
+        seat.leave(&second);
+        assert!(!seat.empty_since(turn));
+        assert!(seat.empty_since(next));
+    }
 
     #[test]
     fn a_message_is_four_words() {
