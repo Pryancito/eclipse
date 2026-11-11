@@ -436,7 +436,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         // for the kernel to reset it when that driver dies.
         let wiring = crate::user::Wiring {
             irq: interrupts.first_irq().map(|irq| irq as usize),
-            vaddr: Some(base_vaddr as usize),
+            vaddr: Some(base_vaddr),
         };
         // A disk left to a userspace driver (`udriver=`): recorded and not
         // touched, not even reset, which `VirtIoBlk::new` would do.
