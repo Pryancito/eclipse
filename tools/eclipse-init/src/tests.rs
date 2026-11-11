@@ -267,6 +267,13 @@ fn a_driver_starts_only_when_the_kernel_left_it_its_device() {
         "virtio-net@10"
     ));
     assert!(!cmdline_udriver_in("udriver=", "virtio-net@0"));
+    // A kind with no number: any device of that kind, and of no other.
+    assert!(cmdline_udriver_in("udriver=virtio-blk@1", "virtio-blk"));
+    assert!(cmdline_udriver_in(listed, "virtio-blk"));
+    assert!(cmdline_udriver_in(listed, "virtio-net"));
+    assert!(!cmdline_udriver_in(alone, "virtio-blk"));
+    assert!(!cmdline_udriver_in("udriver=virtio-blk@1", "virtio"));
+    assert!(!cmdline_udriver_in("udriver=virtio-blk", "virtio-blk@0"));
     // The key is a field of its own in the service file.
     let svc = parse_service(
         "unet",

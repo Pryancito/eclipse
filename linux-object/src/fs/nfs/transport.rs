@@ -535,9 +535,13 @@ impl<D: StackDriver> RpcTransport for KernelTransport<D> {
         // says, this returns, and the caller is a loop that can come back.
         let until = self.now_ms() + park_ms(self.empty_polls);
         let mut stalls = StallCount::new(self.now_ms());
+        // One wait, of as many turns as it takes: the thread gets its address
+        // space back once, when this returns, and the turns in between only
+        // drive the network stack.
+        let mut away = kernel_hal::thread::SyncWait::new();
         while self.now_ms() < until {
             let before = self.now_ms();
-            kernel_hal::thread::yield_now_sync();
+            away.yield_now();
             self.drive();
             let after = self.now_ms();
             if stalls.turn(before, after, MAX_PARK_PASSES) {

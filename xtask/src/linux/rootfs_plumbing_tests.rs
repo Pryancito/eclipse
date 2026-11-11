@@ -704,6 +704,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "dbus-system",
         ),
         ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+        ("ublk", "respawn", "/usr/local/bin/eclipse-ublk", ""),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         (
             "xkbmap",
@@ -906,11 +907,11 @@ fn only_the_bus_probe_is_gated_on_the_kernel_cmdline() {
 }
 
 /// `udriver =` keeps a driver out of every boot where the kernel drives the
-/// device itself. Only the network card's driver has it, it names the card
-/// its wrapper drives, and it is supervised: a driver that is not started
-/// again leaves the machine without the card until it reboots.
+/// device itself. Only the two drivers that run as processes have it, each
+/// names what its wrapper drives, and each is supervised: a driver that is
+/// not started again leaves the machine without the device until it reboots.
 #[test]
-fn only_the_card_driver_is_gated_on_a_device_left_to_userspace() {
+fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     let rootfs = init_rootfs("udriver");
     let gated: Vec<(String, String)> = services(&rootfs)
         .into_iter()
@@ -918,16 +919,29 @@ fn only_the_card_driver_is_gated_on_a_device_left_to_userspace() {
         .collect();
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["unet"],
+        ["ublk", "unet"],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
-    let body = &gated[0].1;
-    assert_eq!(field(body, "udriver"), Some("virtio-net@0"));
-    assert_eq!(field(body, "type"), Some("respawn"));
-    let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-unet")).unwrap();
+    for (_, body) in &gated {
+        assert_eq!(field(body, "type"), Some("respawn"));
+    }
+    let wrapper = |name: &str| fs::read_to_string(rootfs.join("usr/local/bin").join(name)).unwrap();
+    // The card: the first one, by number.
+    assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-net@0"));
+    let unet = wrapper("eclipse-unet");
     assert!(
-        wrapper.contains("exec /bin/zx-virtio-net service 0"),
-        "the wrapper no longer runs the driver of card 0 as a service:\n{wrapper}"
+        unet.contains("exec /bin/zx-virtio-net service 0"),
+        "the wrapper no longer runs the driver of card 0 as a service:\n{unet}"
+    );
+    // The disk: any, by kind, and the wrapper takes the number from where
+    // the kernel took it.
+    assert_eq!(field(&gated[0].1, "udriver"), Some("virtio-blk"));
+    let ublk = wrapper("eclipse-ublk");
+    assert!(
+        ublk.contains("/proc/cmdline")
+            && ublk.contains("s/^virtio-blk@//p")
+            && ublk.contains("exec /bin/zx-virtio-blk service \"$n\""),
+        "the wrapper no longer runs the driver of the disk the kernel left:\n{ublk}"
     );
     // The network is set up once the card has a driver to bring it.
     let network = services(&rootfs)
@@ -936,6 +950,39 @@ fn only_the_card_driver_is_gated_on_a_device_left_to_userspace() {
         .unwrap()
         .1;
     assert_eq!(field(&network, "after"), Some("unet"));
+}
+
+/// What the disk's wrapper makes of a kernel command line: the number of
+/// the first virtio disk in `udriver=`, wherever in the line and the list
+/// it is. The pipeline is the wrapper's own, run here on a line from a file.
+#[test]
+fn the_disk_wrapper_reads_its_number_off_the_command_line() {
+    let rootfs = init_rootfs("ublk-number");
+    let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-ublk")).unwrap();
+    let line = wrapper
+        .lines()
+        .find(|l| l.starts_with("n=$("))
+        .expect("no `n=$(...)` line in the wrapper");
+    let dir = scratch("ublk-number-run");
+    let number = |cmdline: &str| {
+        let file = dir.join("cmdline");
+        fs::write(&file, format!("{cmdline}\n")).unwrap();
+        let script = format!(
+            "{}\nprintf %s \"$n\"",
+            line.replace("/proc/cmdline", &format!("'{}'", file.display()))
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(number("LOG=warn:udriver=virtio-blk@1:desktop=labwc"), "1");
+    assert_eq!(number("LOG=warn:udriver=virtio-net@0,virtio-blk@2"), "2");
+    assert_eq!(number("LOG=warn udriver=virtio-blk@0,virtio-blk@3"), "0");
+    assert_eq!(number("LOG=warn:udriver=virtio-net@0"), "");
+    assert_eq!(number("LOG=warn:noudriver=virtio-blk@4"), "");
 }
 
 /// The one `wait_path` in the table is the compositor's `/dev/input`.
@@ -1082,8 +1129,9 @@ fn the_two_sessions_never_start_each_others_clients() {
         "portal",
         "pulseaudio",
         "network",
-        // A card's driver; no session needed.
+        // A card's driver and a disk's; no session needed.
         "unet",
+        "ublk",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {

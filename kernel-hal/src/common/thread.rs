@@ -55,13 +55,95 @@ pub async fn preempt_now() {
 /// a loop that can go round again, not code that assumes time passed. Which is
 /// also why this is not a `sleep` — it makes no promise about how long it
 /// took, including none at all.
+///
+/// # It comes back as the thread that called
+///
+/// A poll of a thread starts by saying, to its CPU, which thread it is and
+/// by loading its address space, and ends by taking the first back. Parked
+/// here, the caller is in the middle of its poll while the CPU starts and
+/// ends other threads' polls, so what it would come back to is no current
+/// thread and the address space of whoever ran last. A `read` that waited
+/// for its file's blocks and then copied them to the user's buffer copied
+/// them into another process, or took a page fault nobody could resolve,
+/// there being no thread to ask whose pages those were:
+///
+/// ```text
+/// [KERNEL PAGE FAULT] vaddr=0x7d3000 flags=WRITE rip=<memcpy+0x27> have_thread=false
+/// ```
+///
+/// So this is a [`SyncWait`] of one turn: the thread is put down before the
+/// park and taken up again after it, with its address space. A wait of
+/// many turns should be one `SyncWait`, which loads the address space once
+/// at its end and not after every turn.
 pub fn yield_now_sync() {
+    SyncWait::new().yield_now();
+}
+
+/// A wait of a **synchronous** caller, of as many turns as it takes: see
+/// [`yield_now_sync`], which is one of a single turn.
+///
+/// From its first [`yield_now`](Self::yield_now) until it is dropped the
+/// thread that waits is not its CPU's current thread and its address space
+/// may not be the one loaded: the tasks that run between the turns are not
+/// it, and loading its address space after each turn, only for the next to
+/// load another's, is two flushes of the TLB per turn. What runs between the
+/// turns must not touch user memory -- it looks at the kernel's own state,
+/// to see whether the wait is over. Dropping it takes the thread up again,
+/// address space and all, so everything after the wait is as before it.
+///
+/// A parked executor is resumed by the runtime it parked in, so the thread
+/// is taken up on the CPU it was put down on.
+///
+/// A wait that never yields costs nothing.
+#[derive(Default)]
+pub struct SyncWait {
+    /// The thread put down, from the first turn on.
     #[cfg(target_os = "none")]
-    executor::sched_yield();
-    #[cfg(all(not(target_os = "none"), feature = "libos"))]
-    std::thread::yield_now();
-    #[cfg(all(not(target_os = "none"), not(feature = "libos")))]
-    core::hint::spin_loop();
+    thread: Option<alloc::sync::Arc<dyn core::any::Any + Send + Sync>>,
+    #[cfg(target_os = "none")]
+    away: bool,
+}
+
+impl SyncWait {
+    /// A wait that has not given the CPU away yet.
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(target_os = "none")]
+            thread: None,
+            #[cfg(target_os = "none")]
+            away: false,
+        }
+    }
+
+    /// One turn: give the CPU back, and return when it comes again -- at
+    /// once, possibly (see [`yield_now_sync`]).
+    pub fn yield_now(&mut self) {
+        #[cfg(target_os = "none")]
+        {
+            if !self.away {
+                self.away = true;
+                self.thread = crate::thread::get_current_thread();
+                if self.thread.is_some() {
+                    crate::thread::set_current_thread(None);
+                }
+            }
+            executor::sched_yield();
+        }
+        #[cfg(all(not(target_os = "none"), feature = "libos"))]
+        std::thread::yield_now();
+        #[cfg(all(not(target_os = "none"), not(feature = "libos")))]
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_os = "none")]
+impl Drop for SyncWait {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            crate::KHANDLER.resume_thread(&thread);
+            crate::thread::set_current_thread(Some(thread));
+        }
+    }
 }
 
 /// Whether the task each CPU is polling has given the CPU back still

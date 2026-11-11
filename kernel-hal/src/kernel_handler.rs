@@ -1,5 +1,8 @@
 //! Handlers implemented in kernel and called by HAL.
 
+use alloc::sync::Arc;
+use core::any::Any;
+
 use crate::{utils::init_once::InitOnce, MMUFlags, PhysAddr, VirtAddr};
 
 /// Functions implemented in the kernel and used by HAL funtions.
@@ -21,6 +24,14 @@ pub trait KernelHandler: Send + Sync + 'static {
 
     /// Handle kernel mode page fault.
     fn handle_page_fault(&self, _fault_vaddr: VirtAddr, _access_flags: MMUFlags) {}
+
+    /// A thread that gave the CPU back from the middle of its poll
+    /// ([`SyncWait`](crate::thread::SyncWait)) has it again: load its
+    /// address space on this CPU, as the start of a poll does.
+    ///
+    /// Defaults to nothing, for a handler with one address space (libos,
+    /// tests).
+    fn resume_thread(&self, _thread: &Arc<dyn Any + Send + Sync>) {}
 
     /// Get memory usage: (used_bytes, total_bytes)
     fn memory_usage(&self) -> (usize, usize) {

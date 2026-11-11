@@ -22,6 +22,25 @@
 //                                    it for a while, then sleep)
 //   zx-virtio-blk /dev/vdX [OFFSET_MIB [w]]  (w: time writes there too)
 //   zx-virtio-blk fs /dev/vdXN  (mount the vfat there, read and write it)
+//   zx-virtio-blk service [N]
+//   zx-virtio-blk restart [N [KILLS]]
+//
+// `service` is the driver as what it is for: the disk goes to the kernel
+// and the process serves it until it is killed, checking and writing
+// nothing of its own. This is what a supervisor runs (eclipse-init, `type =
+// respawn`). When it dies the kernel resets the device and keeps the disk:
+// the node stays, with whatever is mounted on it, and requests wait up to
+// ten seconds for the next `service`, which gets the same disk; what was
+// out with the dead driver is asked again.
+//
+// `restart` is the check of that, on the image `export` wants (a vfat in
+// the first partition holding `pattern.bin`): it starts the driver as a
+// child, mounts the filesystem, and KILLS times (default 2) kills the
+// driver with SIGKILL in the middle of a file being written and synced and
+// starts it again -- the write must finish and read back right after a
+// remount. Then the same under a process reading the node, then a kill
+// with nobody started after it: a write must fail once the ten seconds are
+// up, and work again when a driver does come.
 //
 // With `serve` the driver goes on to serve the disk to another process,
 // over a FIFO and a window of its DMA memory, and that process checks and
@@ -39,13 +58,15 @@
 // the served node; `fs` does the same on any node, the kernel's driver's
 // included, to compare.
 //
-// Run it on Eclipse booted with `zircon.gateway=1` and the udriver
-// option. Exit status: 0 on success, 2 when the gateway is off, 1 on error.
+// Run it on Eclipse booted with the udriver option, which turns the Zircon
+// gateway on unless `zircon.gateway=0` says otherwise. Exit status: 0 on
+// success, 2 when the gateway is off, 1 on error.
 //
 // A prototype: one queue, one request in flight, one client.
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,6 +96,7 @@
 #define ZX_TIME_INFINITE INT64_MAX
 #define ZX_ERR_SHOULD_WAIT (-22)
 #define ZX_ERR_PEER_CLOSED (-24)
+#define ZX_ERR_ALREADY_BOUND (-27)
 #define ECLIPSE_SYS_fd_to_handle 0x4001
 #define ECLIPSE_FD_TAKE 1
 
@@ -1126,8 +1148,10 @@ static int fs_test(const char *part) {
     return 0;
 }
 
-static int kclient_main(const char *before, uint64_t disk_sectors) {
-    char now[128], name[4] = "", path[16];
+// The vdX that was not in `before`, waiting for it: 0 when there is one.
+static int new_vd(const char *before, char name[4]) {
+    char now[128];
+    name[0] = 0;
     // The node appears once the kernel's hot-plug task has run, which also
     // reads the partition table through the driver.
     for (int i = 0; i < 200 && !name[0]; i++) {
@@ -1143,7 +1167,12 @@ static int kclient_main(const char *before, uint64_t disk_sectors) {
         if (!name[0])
             usleep(50000);
     }
-    if (!name[0])
+    return name[0] ? 0 : -1;
+}
+
+static int kclient_main(const char *before, uint64_t disk_sectors) {
+    char name[4], path[16];
+    if (new_vd(before, name) != 0)
         die("kclient: no new /dev/vdX appeared", 0);
     snprintf(path, sizeof path, "/dev/%s", name);
     printf("zx-virtio-blk: the kernel put the served disk at %s\n", path);
@@ -1200,9 +1229,263 @@ static int kclient_main(const char *before, uint64_t disk_sectors) {
     return kernel_baseline(path, 0);
 }
 
+// The driver and nothing else: the disk to the kernel, a byte down
+// `report` (when there is one) once it is the kernel's, and its requests
+// until a signal ends the process.
+static int service_disk(zx_handle_t window, int report) {
+    zx_handle_t ends[2];
+    long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct blk_msg), 0,
+                           (long)&ends[0], (long)&ends[1], 0));
+    if (r != 0)
+        die("fifo_create", r);
+    r = zx_status(zx(ECLIPSE_SYS_block_serve, ends[1], window, (long)capacity, 0));
+    if (r != 0)
+        die("block_serve", r);
+    if (report >= 0) {
+        if (write(report, "u", 1) != 1)
+            die("write (report), errno", errno);
+        close(report);
+    }
+    serve(ends[0], 1, 1);
+    printf("zx-virtio-blk: the kernel's end of the FIFO went away\n");
+    return 1;
+}
+
+// Start the driver as a child, the way a supervisor would, and wait until
+// it says the disk is the kernel's. Its pid, or -1.
+static pid_t start_service(const char *self, long index) {
+    int up[2];
+    if (pipe(up) != 0)
+        die("pipe, errno", errno);
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork, errno", errno);
+    if (pid == 0) {
+        char a_index[24], a_report[24];
+        close(up[0]);
+        snprintf(a_index, sizeof a_index, "%ld", index);
+        snprintf(a_report, sizeof a_report, "%d", up[1]);
+        execl(self, self, "service", a_index, a_report, (char *)NULL);
+        printf("zx-virtio-blk: exec %s: %s\n", self, strerror(errno));
+        _exit(127);
+    }
+    close(up[1]);
+    char c;
+    ssize_t n = read(up[0], &c, 1);
+    close(up[0]);
+    if (n != 1) {
+        printf("zx-virtio-blk: FAIL: the driver did not come up\n");
+        return -1;
+    }
+    return pid;
+}
+
+static void kill_service(pid_t pid) {
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+}
+
+// What `restart` writes while the driver is killed: long enough that the
+// kill lands in the middle of it.
+#define RESTART_SIZE ((size_t)512 << 10)
+#define RESTART_KILL_US 100000
+// The kernel's wait for the next driver, and how far past it a request may
+// take to fail.
+#define DRIVER_GRACE_MS 10000
+#define GRACE_MARGIN_MS 5000
+
+// `path` created, filled with fs_made() and synced: 0 when all of it went.
+static int write_made(const char *path, size_t size) {
+    static uint8_t buf[4096];
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return 1;
+    for (size_t off = 0; off < size; off += sizeof buf) {
+        for (size_t i = 0; i < sizeof buf; i++)
+            buf[i] = fs_made(off + i);
+        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf)
+            return 2;
+    }
+    if (fsync(fd) != 0)
+        return 3;
+    return close(fd) != 0 ? 4 : 0;
+}
+
+// Read `span` bytes of `path` from `base` over and over for `ms`, each pass
+// against the first: 0 when every pass read the same. A byte goes down
+// `ready` once the first pass is in.
+static int read_same(const char *path, off_t base, size_t span, int ms, int ready) {
+    uint8_t *first = malloc(span), *again = malloc(span);
+    int fd = open(path, O_RDONLY);
+    if (!first || !again || fd < 0)
+        return 1;
+    if (pread(fd, first, span, base) != (ssize_t)span)
+        return 2;
+    if (write(ready, "r", 1) != 1)
+        return 3;
+    uint64_t until = now_ns() + (uint64_t)ms * 1000000;
+    while (now_ns() < until) {
+        for (size_t off = 0; off < span; off += 4096)
+            if (pread(fd, again + off, 4096, base + (off_t)off) != 4096)
+                return 4;
+        if (memcmp(first, again, span) != 0)
+            return 5;
+    }
+    return 0;
+}
+
+static int restart_check(const char *self, long index, int kills) {
+    char before[128], name[4], node[16], part[20];
+    list_vd(before, sizeof before);
+    pid_t driver = start_service(self, index);
+    if (driver < 0)
+        return 1;
+    if (new_vd(before, name) != 0)
+        die("restart: no new /dev/vdX appeared", 0);
+    snprintf(node, sizeof node, "/dev/%s", name);
+    snprintf(part, sizeof part, "%s1", node);
+    printf("zx-virtio-blk: the driver is pid %d and its disk is %s\n", (int)driver, node);
+    // The partitions' nodes come a moment after the disk's, once the
+    // kernel has read the table through the driver.
+    for (int i = 0; i < 100 && access(part, F_OK) != 0; i++)
+        usleep(50000);
+    const char *dir = "/mnt/served";
+    mkdir("/mnt", 0755);
+    mkdir(dir, 0755);
+    if (mount(part, dir, "vfat", 0, NULL) != 0) {
+        printf("zx-virtio-blk: FAIL: mount %s: %s\n", part, strerror(errno));
+        return 1;
+    }
+    char given[64], made[64];
+    snprintf(given, sizeof given, "%s/pattern.bin", dir);
+    snprintf(made, sizeof made, "%s/made.bin", dir);
+    if (fs_read_pass(given, FS_GIVEN_SIZE, fs_given) < 0) {
+        printf("zx-virtio-blk: FAIL: %s reads wrong before any kill\n", given);
+        return 1;
+    }
+
+    // A file being written and synced, and the driver killed under it.
+    for (int k = 1; k <= kills; k++) {
+        pid_t writer = fork();
+        if (writer < 0)
+            die("fork, errno", errno);
+        if (writer == 0)
+            _exit(write_made(made, RESTART_SIZE));
+        usleep(RESTART_KILL_US);
+        int status;
+        if (waitpid(writer, &status, WNOHANG) != 0) {
+            printf("zx-virtio-blk: FAIL: the write was over before the kill\n");
+            return 1;
+        }
+        uint64_t t0 = now_ns();
+        kill_service(driver);
+        driver = start_service(self, index);
+        if (driver < 0)
+            return 1;
+        double back_ms = (now_ns() - t0) / 1e6;
+        if (waitpid(writer, &status, 0) != writer || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0) {
+            printf("zx-virtio-blk: FAIL: the write the driver died under did not finish "
+                   "(status %#x)\n",
+                   status);
+            return 1;
+        }
+        double done_ms = (now_ns() - t0) / 1e6;
+        // Off the disk, not out of a cache.
+        if (umount(dir) != 0 || mount(part, dir, "vfat", 0, NULL) != 0) {
+            printf("zx-virtio-blk: FAIL: remount %s: %s\n", part, strerror(errno));
+            return 1;
+        }
+        if (fs_read_pass(made, RESTART_SIZE, fs_made) < 0 ||
+            fs_read_pass(given, FS_GIVEN_SIZE, fs_given) < 0 || unlink(made) != 0) {
+            printf("zx-virtio-blk: FAIL: kill %d: the files do not read back right\n", k);
+            return 1;
+        }
+        printf("zx-virtio-blk: kill %d, %d ms into a %zu KiB write: driver back in %.0f ms "
+               "(pid %d), the write done %.0f ms after the kill and right on the disk\n",
+               k, RESTART_KILL_US / 1000, RESTART_SIZE >> 10, back_ms, (int)driver, done_ms);
+    }
+
+    // The same under a process reading the node, whose reads sleep on the
+    // driver's answers instead of looking for them.
+    {
+        int ready[2];
+        if (pipe(ready) != 0)
+            die("pipe, errno", errno);
+        pid_t reader = fork();
+        if (reader < 0)
+            die("fork, errno", errno);
+        if (reader == 0) {
+            close(ready[0]);
+            _exit(read_same(node, (off_t)8 << 20, 1 << 20, 1500, ready[1]));
+        }
+        close(ready[1]);
+        char c;
+        if (read(ready[0], &c, 1) != 1)
+            die("restart: the reader did not start", 0);
+        close(ready[0]);
+        usleep(RESTART_KILL_US);
+        kill_service(driver);
+        driver = start_service(self, index);
+        if (driver < 0)
+            return 1;
+        int status;
+        if (waitpid(reader, &status, 0) != reader || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0) {
+            printf("zx-virtio-blk: FAIL: reads of %s across a kill went wrong (status %#x)\n",
+                   node, status);
+            return 1;
+        }
+        printf("zx-virtio-blk: reads of %s went on across a kill, every pass the same\n", node);
+    }
+
+    // Nobody after this one: a write waits for a driver, and then fails.
+    int fd = open(node, O_RDWR);
+    if (fd < 0)
+        die("restart: open the node, errno", errno);
+    static uint8_t buf[4096], back[4096];
+    off_t spare = (off_t)3 << 20; // the fourth MiB: before the partition
+    for (size_t i = 0; i < sizeof buf; i++)
+        buf[i] = (uint8_t)(i * 13 + 5);
+    kill_service(driver);
+    uint64_t t0 = now_ns();
+    int wrote = pwrite(fd, buf, sizeof buf, spare) == (ssize_t)sizeof buf && fsync(fd) == 0;
+    double waited_ms = (now_ns() - t0) / 1e6;
+    if (wrote || waited_ms < DRIVER_GRACE_MS - 1000 ||
+        waited_ms > DRIVER_GRACE_MS + GRACE_MARGIN_MS) {
+        printf("zx-virtio-blk: FAIL: with no driver a write %s after %.1f s\n",
+               wrote ? "went through" : "failed", waited_ms / 1000);
+        return 1;
+    }
+    printf("zx-virtio-blk: no driver came back and a write failed, after %.1f s\n",
+           waited_ms / 1000);
+    // A driver that comes late still finds its disk.
+    driver = start_service(self, index);
+    if (driver < 0)
+        return 1;
+    if (pwrite(fd, buf, sizeof buf, spare) != (ssize_t)sizeof buf || fsync(fd) != 0 ||
+        pread(fd, back, sizeof back, spare) != (ssize_t)sizeof back ||
+        memcmp(buf, back, sizeof buf) != 0) {
+        printf("zx-virtio-blk: FAIL: %s does not work again with a late driver: %s\n", node,
+               strerror(errno));
+        return 1;
+    }
+    close(fd);
+    if (fs_read_pass(given, FS_GIVEN_SIZE, fs_given) < 0 || umount(dir) != 0) {
+        printf("zx-virtio-blk: FAIL: the filesystem is not right after the late driver\n");
+        return 1;
+    }
+    printf("zx-virtio-blk: a driver that came late has the same %s, and it works\n", node);
+    kill_service(driver);
+    printf("zx-virtio-blk: all checks passed\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const char *self = strchr(argv[0], '/') ? argv[0] : "/bin/zx-virtio-blk";
+    if (argc > 1 && !strcmp(argv[1], "restart"))
+        return restart_check(self, argc > 2 ? atol(argv[2]) : 0, argc > 3 ? atoi(argv[3]) : 2);
     if (argc == 3 && !strcmp(argv[1], "fs")) {
         if (fs_test(argv[2]) != 0) {
             char have[128];
@@ -1232,7 +1515,8 @@ int main(int argc, char **argv) {
                            atoi(argv[5]));
     if (argc == 4 && !strcmp(argv[1], "kclient"))
         return kclient_main(argv[2], strtoull(argv[3], NULL, 0));
-    int exporting = argc > 1 && !strcmp(argv[1], "export");
+    int service = argc > 1 && !strcmp(argv[1], "service");
+    int exporting = service || (argc > 1 && !strcmp(argv[1], "export"));
     int serving = exporting || (argc > 1 && !strcmp(argv[1], "serve"));
     if (serving) {
         argv++;
@@ -1241,9 +1525,17 @@ int main(int argc, char **argv) {
     long index = argc > 1 ? atol(argv[1]) : 0;
     int rounds = argc > 2 ? atoi(argv[2]) : 2;
     struct claim c;
-    long r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_VIRTIO_BLK, index, (long)&c, 0));
+    long r;
+    // As a service, a claim refused because the disk has a driver is tried
+    // again for a while: the driver before this one may have died a moment
+    // ago, and the kernel resets the device before it gives it out.
+    for (int tries = service ? 300 : 1;; usleep(10000)) {
+        r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_VIRTIO_BLK, index, (long)&c, 0));
+        if (r != ZX_ERR_ALREADY_BOUND || --tries <= 0)
+            break;
+    }
     if (r == -ENOSYS) {
-        printf("zx-virtio-blk: the gateway is off (boot with zircon.gateway=1)\n");
+        printf("zx-virtio-blk: the gateway is off (zircon.gateway=0 on the command line?)\n");
         return 2;
     }
     if (r != 0)
@@ -1297,6 +1589,12 @@ int main(int argc, char **argv) {
         init_pci();
     } else {
         die("unknown transport", transport);
+    }
+    // A service says nothing and touches nothing: the disk is somebody's.
+    if (service) {
+        if (capacity < 64)
+            die("disk too small, sectors", (long)capacity);
+        return service_disk(window, argc > 2 ? atoi(argv[2]) : -1);
     }
     printf("zx-virtio-blk: disk #%ld up (%s), %llu sectors, DMA at %#llx, irq %d%s\n", index,
            transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO ? "virtio-mmio" : "virtio-pci",

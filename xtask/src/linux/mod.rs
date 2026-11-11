@@ -20,6 +20,7 @@ mod portal;
 mod signal_probe;
 mod test;
 mod tree_image;
+mod udriver;
 mod usb_probe;
 mod verify;
 mod xorg;
@@ -177,7 +178,7 @@ impl LinuxRootfs {
             if edhcpc.is_file() {
                 let _ = fs::copy(&edhcpc, bin.join("edhcpc"));
             }
-            self.install_zx_virtio_net(&musl, &bin);
+            self.install_udrivers(&musl, &bin);
             let install_eclipse = self.install_eclipse(&musl);
             if install_eclipse.is_file() {
                 let _ = fs::copy(&install_eclipse, bin.join("install-eclipse"));
@@ -662,7 +663,7 @@ impl LinuxRootfs {
             fs::copy(&edhcpc, &dst).unwrap();
         }
 
-        self.install_zx_virtio_net(&musl, &bin);
+        self.install_udrivers(&musl, &bin);
         // DNS/hosts resolver shim (dynamic) + CLI helper.
         let eclipse_resolv = self.eclipse_resolv(&musl);
         if eclipse_resolv.is_file() {
@@ -4468,7 +4469,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               # cmdline = dbus.selftest                     (optional; start only when\n\
               #                                              this token is on the\n\
               #                                              kernel command line)\n\
-              # udriver = virtio-net@0   (optional; start only when the kernel's udriver option names it)\n\
+              # udriver = virtio-net@0                    (optional; start only when\n\
+              #                                             the kernel command line\n\
+              #                                             leaves this device to a\n\
+              #                                             userspace driver; a kind\n\
+              #                                             alone, virtio-blk, is any\n\
+              #                                             device of that kind)\n\
               # desktop = labwc                             (optional; start only under\n\
               #                                             this session: labwc | xorg)\n\
               # log = /tmp/mysvc.log                        (optional; where the service's\n\
@@ -4486,26 +4492,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
         .unwrap();
 
-        // network: the kernel brings the link up but sets no address, so this
-        // is what gives the machine an IP and default route at boot. With
-        // lunarnet in the image it IS lunarnet (`--service`), which applies
-        // `/etc/eclipse/network` per interface and supervises the DHCP
-        // clients; without it, a bare `udhcpc`. Supervised either way: the
-        // foreground client keeps renewing the lease, and init restarts it
-        // (with backoff) if it dies.
-        //
-        // A rootfs built before the rename still has the old `udhcpc.service`
-        // beside this one, and two services both bringing the same interface
-        // up means two DHCP clients fighting over it, so it goes.
-        let _ = fs::remove_file(svc_dir.join("udhcpc.service"));
-        fs::write(
-            svc_dir.join("network.service"),
-            b"# The network at boot. See /usr/local/bin/eclipse-network-up.\n\
-              exec = /usr/local/bin/eclipse-network-up\n\
-              type = respawn\n\
-              after = unet\n",
-        )
-        .unwrap();
+        network::write_network_service(svc_dir);
 
         // NTP: after DHCP so pool.ntp.org resolves. Foreground wrapper.
         fs::write(
@@ -4940,7 +4927,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         .unwrap();
 
         network::write_network_wrapper(localbin);
-        network::write_unet(localbin, svc_dir);
+        udriver::write_services(localbin, svc_dir);
         Self::write_oopslog(localbin, svc_dir);
         Self::write_hunterd(localbin, svc_dir);
 
