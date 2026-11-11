@@ -462,17 +462,23 @@ endif
 # `qemu-system-x86_64 -device help` lists them.
 NIC ?= e1000e
 
-qemu_opts += \
+# `NIC=none`: no such card at all, for a machine whose only network card is
+# the one a userspace driver takes (`UNET=1`).
+ifneq ($(NIC), none)
+  qemu_opts += \
 	-netdev user,id=net1 \
 	-device $(NIC),netdev=net1 \
-	-object filter-dump,id=f0,netdev=net1,file=/tmp/eclipse.pcap \
-	-no-reboot
+	-object filter-dump,id=f0,netdev=net1,file=/tmp/eclipse.pcap
+endif
+qemu_opts += -no-reboot
 
 # Capture packets to dump.pcap only when explicitly requested (PCAP=on).
 # The filter-dump hook adds a synchronous disk write per packet and can
 # reduce bulk-download throughput by an order of magnitude.
 ifeq ($(PCAP), on)
-  qemu_opts += -object filter-dump,id=f1,netdev=net1,file=dump.pcap
+  ifneq ($(NIC), none)
+    qemu_opts += -object filter-dump,id=f1,netdev=net1,file=dump.pcap
+  endif
 endif
 
 ifeq ($(DISK), on)
@@ -500,13 +506,14 @@ ifneq ($(UDISK),)
   endif
 endif
 
-# UNET=1: a virtio network card on a user-mode network of its own, for a
+# UNET=1: a virtio network card on a user-mode network of its own
+# (10.0.3.0/24, so that it is not the kernel card's 10.0.2.0/24), for a
 # driver in userspace. The kernel has no virtio-net driver: boot with
 # `udriver=virtio-net@0` in KOPTS to have it recorded for a process to
 # claim (`tools/zx-virtio-net`). With UDISK as well, both go in one option:
 # `udriver=virtio-blk@N,virtio-net@0`.
 ifneq ($(UNET),)
-  qemu_opts += -netdev user,id=unet
+  qemu_opts += -netdev user,id=unet,net=10.0.3.0/24
   ifeq ($(ARCH), aarch64)
     qemu_opts += -device virtio-net-device,netdev=unet,bus=virtio-mmio-bus.2
   else ifeq ($(ARCH), riscv64)

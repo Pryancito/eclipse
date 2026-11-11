@@ -8,30 +8,51 @@
 // the device up on either transport -- legacy virtio-mmio (aarch64,
 // riscv64 under QEMU virt) or modern virtio-pci (x86_64 q35, MSI-X vector
 // 0) -- with a receive and a transmit queue, and then talks to whatever is
-// on the wire as 10.0.2.15, the address QEMU's user network expects:
+// on the wire as 10.0.3.15, on the user network `make UNET=1` gives it:
 //
-//   - asks who has 10.0.2.2 (the gateway QEMU emulates) and takes the
+//   - asks who has 10.0.3.2 (the gateway QEMU emulates) and takes the
 //     answer, which proves a frame out and a frame in;
 //   - pings it, ROUNDS times with 56 bytes and ROUNDS times with 1400,
 //     first polling the receive queue and then sleeping on the interrupt,
 //     and reports the round trip of each.
 //
 //   zx-virtio-net [N [ROUNDS]]  (defaults: card 0, 200 pings)
+//   zx-virtio-net export [N [ROUNDS]]
+//
+// With `export` the driver gives the card to the kernel instead
+// (eclipse_net_serve): it becomes an interface of the kernel's, a new ethN,
+// with frames passed over a FIFO and a window of the DMA memory that the
+// card reads and writes directly (see "Serving the kernel"). A child then
+// gives the interface an address and pings the gateway through the
+// kernel's own stack.
+//
+//   zx-virtio-net ping IFACE ADDRESS GATEWAY [ROUNDS]
+//
+// The baseline: the same pings through an interface the kernel drives
+// itself (on x86_64, `ping eth0 10.0.2.15 10.0.2.2` with the default
+// e1000e). In a boot of its own: with two cards the kernel's sockets go
+// out through whichever interface is polled first, so boot the served
+// card alone (`NIC=none`).
 //
 // Run it on Eclipse booted with `zircon.gateway=1` and the udriver option
 // (`make ... UNET=1` adds the card). Exit status: 0 on success, 2 when the
 // gateway is off, 1 on error.
 //
-// A prototype: no stack above it yet, one frame in flight.
+// A prototype: without `export`, no stack above it and one frame in flight.
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <net/if.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,6 +61,17 @@
 #define ZX_SYS_bti_pin 1
 #define ZX_SYS_interrupt_wait 54
 #define ZX_SYS_vmo_create_contiguous 193
+#define ZX_SYS_vmo_create_child 192
+#define ZX_SYS_fifo_create 34
+#define ZX_SYS_fifo_read 35
+#define ZX_SYS_fifo_write 36
+#define ZX_SYS_object_wait_one 81
+#define ZX_VMO_CHILD_SLICE (1u << 3)
+#define ZX_FIFO_READABLE (1u << 0)
+#define ZX_FIFO_PEER_CLOSED (1u << 2)
+#define ZX_TIME_INFINITE INT64_MAX
+#define ZX_ERR_SHOULD_WAIT (-22)
+#define ECLIPSE_SYS_net_serve 0x4007
 #define ECLIPSE_SYS_handle_to_fd 0x4000
 #define ECLIPSE_SYS_device_claim 0x4005
 #define ECLIPSE_DEVICE_VIRTIO_NET 2
@@ -118,19 +150,30 @@ struct virtq_used {
 
 // The DMA area: each queue's descriptors and avail ring in one page and
 // its used ring in the next (the legacy layout, which the modern transport
-// is simply told about), then the receive buffers and the transmit buffer.
+// is simply told about), then the window: the receive buffers and the
+// transmit buffers, a slot each. With `export` the kernel reaches the
+// window too, and that is all of the driver's memory it reaches.
 #define DMA_Q(q) ((q) * 2 * PAGE)
 #define RX_BUFS 32
+#define TX_BUFS 16
 #define BUF_SIZE 2048 // a header and a 1514-byte frame, with room
-#define DMA_RX (4 * PAGE)
-#define DMA_TX (DMA_RX + RX_BUFS * BUF_SIZE)
-#define DMA_SIZE (DMA_TX + PAGE)
+#define TX_HEADROOM 16 // where a frame starts in a transmit slot
+#define DMA_WIN (4 * PAGE)
+#define DMA_RX DMA_WIN
+#define DMA_TX(i) (DMA_WIN + (RX_BUFS + (i)) * BUF_SIZE)
+#define WIN_SIZE ((RX_BUFS + TX_BUFS) * BUF_SIZE)
+#define DMA_SIZE (DMA_WIN + WIN_SIZE)
 _Static_assert(RX_BUFS <= QUEUE_SIZE, "a descriptor per receive buffer");
+_Static_assert(TX_BUFS <= QUEUE_SIZE, "a descriptor per transmit buffer");
+_Static_assert(WIN_SIZE % PAGE == 0, "the window is whole pages");
 
 typedef uint32_t zx_handle_t;
 
 static long zx(long n, long a, long b, long c, long d) {
     return syscall(ZX_GATEWAY_BASE + n, a, b, c, d);
+}
+static long zx6(long n, long a, long b, long c, long d, long e, long f) {
+    return syscall(ZX_GATEWAY_BASE + n, a, b, c, d, e, f);
 }
 static long zx8(long n, const long args[8]) {
     return syscall(ZX_GATEWAY_BASE + (n | ZX_GATEWAY_INDIRECT), args);
@@ -177,6 +220,9 @@ static uint8_t mac[6];
 // The header in front of every frame: 10 bytes on a legacy device that was
 // not offered mergeable buffers, 12 on a modern one (spec 1.1 §5.1.6).
 static size_t net_hdr;
+// With `export` the transmit queue interrupts too: its completions are
+// what frees the kernel's transmit slots.
+static int tx_irq;
 
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
 static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(regs + off); }
@@ -239,9 +285,10 @@ static void init_pci(void) {
             die("queue too small", max);
         wr16(c + PCI_QUEUE_SIZE, QUEUE_SIZE);
         // MSI-X vector 0 is the one the kernel armed, and the one the
-        // claim's interrupt object listens on. Only the receive queue
-        // raises it: a sent frame is reclaimed before the next is sent.
-        uint16_t vector = irq_handle && q == RXQ ? 0 : VIRTIO_MSI_NO_VECTOR;
+        // claim's interrupt object listens on. Without `export` only the
+        // receive queue raises it: a sent frame is reclaimed before the
+        // next is sent.
+        uint16_t vector = irq_handle && (q == RXQ || tx_irq) ? 0 : VIRTIO_MSI_NO_VECTOR;
         wr16(c + PCI_QUEUE_MSIX_VECTOR, vector);
         if (vector == 0 && rd16(c + PCI_QUEUE_MSIX_VECTOR) != 0) {
             printf("zx-virtio-net: the device refused MSI-X vector 0; polling\n");
@@ -298,18 +345,25 @@ static void rx_post(uint16_t i) {
     mb();
 }
 
-// Send the `len`-byte frame at the transmit buffer (after its header),
-// and wait for the device to take it: one frame in flight.
-static void tx_send(size_t len) {
-    memset(dma + DMA_TX, 0, net_hdr);
-    desc[TXQ][0].addr = daddr + DMA_TX;
-    desc[TXQ][0].len = (uint32_t)(net_hdr + len);
-    desc[TXQ][0].flags = 0;
-    desc[TXQ][0].next = 0;
-    avail[TXQ]->ring[avail[TXQ]->idx % QUEUE_SIZE] = 0;
+// Hand the `len`-byte frame in transmit slot `i` (descriptor `i`) to the
+// device, its header in the headroom before it.
+static void tx_post(uint16_t i, size_t len) {
+    size_t at = DMA_TX(i) + TX_HEADROOM - net_hdr;
+    memset(dma + at, 0, net_hdr);
+    desc[TXQ][i].addr = daddr + at;
+    desc[TXQ][i].len = (uint32_t)(net_hdr + len);
+    desc[TXQ][i].flags = 0;
+    desc[TXQ][i].next = 0;
+    avail[TXQ]->ring[avail[TXQ]->idx % QUEUE_SIZE] = i;
     mb();
     avail[TXQ]->idx++;
     mb();
+}
+
+// Send the `len`-byte frame in transmit slot 0, and wait for the device to
+// take it: one frame in flight.
+static void tx_send(size_t len) {
+    tx_post(0, len);
     notify(TXQ);
     uint16_t want = (uint16_t)(last_used[TXQ] + 1);
     uint64_t t0 = now_ns();
@@ -319,7 +373,7 @@ static void tx_send(size_t len) {
     last_used[TXQ] = want;
 }
 
-static uint8_t *tx_frame(void) { return dma + DMA_TX + net_hdr; }
+static uint8_t *tx_frame(void) { return dma + DMA_TX(0) + TX_HEADROOM; }
 
 // The next received frame, or NULL after `timeout_ns` without one. With
 // `sleep` the wait is on the interrupt (and then has no timeout: the
@@ -358,8 +412,8 @@ static const uint8_t *rx_next(size_t *len, int sleep, uint64_t timeout_ns) {
 
 // ---- The little that is said on the wire ----
 
-static const uint8_t MY_IP[4] = {10, 0, 2, 15};
-static const uint8_t GW_IP[4] = {10, 0, 2, 2};
+static const uint8_t MY_IP[4] = {10, 0, 3, 15};
+static const uint8_t GW_IP[4] = {10, 0, 3, 2};
 static uint8_t gw_mac[6];
 
 static uint16_t checksum(const uint8_t *p, size_t n) {
@@ -478,6 +532,215 @@ static int ping_series(const char *how, size_t payload, int rounds, int sleep) {
     return 0;
 }
 
+// ---- Serving the kernel ----
+//
+// The card becomes an interface of the kernel's. Frames pass through the
+// window, where the card's buffers already are, and a FIFO of 16-byte
+// messages says which: `op, slot, len, off`.
+//
+//   NET_RX, to the kernel: a frame of `len` bytes is in receive slot
+//     `slot`, `off` bytes in. The kernel sends the message back when it has
+//     copied the frame out, and the slot goes back to the card.
+//   NET_TX, from the kernel: a frame of `len` bytes is in transmit slot
+//     `slot`, TX_HEADROOM bytes in. It goes back once the card has taken
+//     the frame, and the kernel may use the slot again.
+//
+// Two threads, each with one side of both queues: the one that sleeps on
+// the card's interrupt reads the used rings and writes to the FIFO, and
+// the one that sleeps on the FIFO fills the avail rings. Neither can find
+// the FIFO full: it holds as many messages as there are slots.
+
+#define NET_RX 1
+#define NET_TX 2
+#define FIFO_DEPTH 64
+_Static_assert(RX_BUFS + TX_BUFS <= FIFO_DEPTH, "a message per slot fits the FIFO");
+
+struct net_msg {
+    uint32_t op, slot, len, off;
+};
+
+static zx_handle_t fifo;
+
+static void fifo_put(const struct net_msg *m) {
+    size_t put = 0;
+    long r = zx_status(zx6(ZX_SYS_fifo_write, fifo, sizeof *m, (long)m, 1, (long)&put, 0));
+    if (r != 0)
+        die("fifo_write", r);
+}
+
+// What the card has finished, to the kernel. Returns how much there was.
+static int drain_used(void) {
+    int n = 0;
+    mb();
+    while (used[RXQ]->idx != last_used[RXQ]) {
+        volatile struct virtq_used_elem *e = &used[RXQ]->ring[last_used[RXQ] % QUEUE_SIZE];
+        last_used[RXQ]++;
+        if (e->id >= RX_BUFS || e->len < net_hdr || e->len > BUF_SIZE)
+            die("the device returned a receive buffer that is not one of ours, id", e->id);
+        struct net_msg m = {NET_RX, e->id, e->len - (uint32_t)net_hdr, (uint32_t)net_hdr};
+        fifo_put(&m);
+        n++;
+    }
+    while (used[TXQ]->idx != last_used[TXQ]) {
+        volatile struct virtq_used_elem *e = &used[TXQ]->ring[last_used[TXQ] % QUEUE_SIZE];
+        last_used[TXQ]++;
+        struct net_msg m = {NET_TX, e->id, 0, 0};
+        fifo_put(&m);
+        n++;
+    }
+    return n;
+}
+
+static void *card_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (irq_handle) {
+            int64_t ts = 0;
+            long r = zx_status(zx(ZX_SYS_interrupt_wait, irq_handle, (long)&ts, 0, 0));
+            if (r != 0)
+                die("interrupt_wait", r);
+            ack_device();
+            drain_used();
+        } else if (!drain_used()) {
+            ack_device();
+            usleep(200); // no interrupt to sleep on
+        }
+    }
+    return NULL;
+}
+
+static void *fifo_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct net_msg m[RX_BUFS + TX_BUFS];
+        size_t got = 0;
+        long r = zx_status(
+            zx6(ZX_SYS_fifo_read, fifo, sizeof m[0], (long)m, sizeof m / sizeof m[0], (long)&got, 0));
+        if (r == ZX_ERR_SHOULD_WAIT) {
+            uint32_t observed = 0;
+            r = zx_status(zx6(ZX_SYS_object_wait_one, fifo, ZX_FIFO_READABLE | ZX_FIFO_PEER_CLOSED,
+                              ZX_TIME_INFINITE, (long)&observed, 0, 0));
+            if (r < 0 || !(observed & ZX_FIFO_READABLE))
+                die("the kernel closed the FIFO", r);
+            continue;
+        }
+        if (r != 0)
+            die("fifo_read", r);
+        int rx = 0, tx = 0;
+        for (size_t i = 0; i < got; i++) {
+            if (m[i].op == NET_RX && m[i].slot < RX_BUFS) {
+                rx_post((uint16_t)m[i].slot);
+                rx = 1;
+            } else if (m[i].op == NET_TX && m[i].slot < TX_BUFS && m[i].len <= 1514 &&
+                       m[i].off == TX_HEADROOM) {
+                tx_post((uint16_t)m[i].slot, m[i].len);
+                tx = 1;
+            } else {
+                die("a message from the kernel that means nothing, op", m[i].op);
+            }
+        }
+        if (rx)
+            notify(RXQ);
+        if (tx)
+            notify(TXQ);
+    }
+    return NULL;
+}
+
+// The interface whose address is `mac`, by asking each ethN for its own.
+static int find_ifname(char *name, size_t len) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0)
+        return -1;
+    for (int i = 0; i < 8; i++) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof ifr);
+        snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "eth%d", i);
+        if (ioctl(s, SIOCGIFHWADDR, &ifr) == 0 && !memcmp(ifr.ifr_hwaddr.sa_data, mac, 6)) {
+            snprintf(name, len, "eth%d", i);
+            close(s);
+            return 0;
+        }
+    }
+    close(s);
+    return -1;
+}
+
+static int sh(const char *cmd) {
+    fflush(stdout);
+    int st = system(cmd);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+// The larger ping: the kernel's ICMP path keeps replies of up to 1280 bytes.
+#define PING_BIG 1200
+// The summary of a run of pings, and the status of the ping itself: 0 only
+// when replies came back.
+#define PING_CMD "ping -c %d -i 0.01 -s %d -W 2 %s > /tmp/ping.out; rc=$?; tail -2 /tmp/ping.out; exit $rc"
+
+// Give `name` the address `ip` and ping `gw` through the kernel's stack,
+// with 56 bytes and with PING_BIG. 0 when replies came back to both.
+static int ping_through(const char *name, const char *what, const char *ip, const char *gw,
+                        int rounds) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ifconfig %s %s netmask 255.255.255.0 up", name, ip);
+    if (sh(cmd) != 0) {
+        printf("zx-virtio-net: FAIL: %s\n", cmd);
+        return 1;
+    }
+    for (int size = 56; size <= PING_BIG; size += PING_BIG - 56) {
+        printf("zx-virtio-net: %s (%s), ping %d bytes x%d:\n", name, what, size, rounds);
+        snprintf(cmd, sizeof cmd, PING_CMD, rounds, size, gw);
+        if (sh(cmd) != 0) {
+            printf("zx-virtio-net: FAIL: %s\n", cmd);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The check, in a child: the interface is the kernel's now, so it is used
+// the way anything else uses the network.
+static int export_check(int rounds) {
+    char name[16];
+    if (find_ifname(name, sizeof name) != 0) {
+        printf("zx-virtio-net: FAIL: no interface has the card's address\n");
+        return 1;
+    }
+    printf("zx-virtio-net: the card is %s\n", name);
+    return ping_through(name, "driver in userspace", "10.0.3.15", "10.0.3.2", rounds);
+}
+
+static int export_card(zx_handle_t window, int rounds) {
+    zx_handle_t ends[2];
+    long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct net_msg), 0,
+                           (long)&ends[0], (long)&ends[1], 0));
+    if (r != 0)
+        die("fifo_create", r);
+    fifo = ends[0];
+    uint64_t mac64 = 0;
+    for (int i = 0; i < 6; i++)
+        mac64 |= (uint64_t)mac[i] << (8 * i);
+    r = zx_status(zx(ECLIPSE_SYS_net_serve, ends[1], window, (long)mac64, RX_BUFS));
+    if (r != 0)
+        die("net_serve", r);
+    printf("zx-virtio-net: card handed to the kernel\n");
+    pthread_t card, msgs;
+    if (pthread_create(&card, NULL, card_thread, NULL) || pthread_create(&msgs, NULL, fifo_thread, NULL))
+        die("pthread_create", errno);
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork", errno);
+    if (pid == 0)
+        _exit(export_check(rounds));
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        return 1;
+    printf("zx-virtio-net: all checks passed\n");
+    return 0;
+}
+
 struct claim {
     uint32_t regs, bti;
     uint32_t transport, irq;
@@ -488,6 +751,19 @@ struct claim {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc >= 5 && !strcmp(argv[1], "ping")) {
+        int bad = ping_through(argv[2], "the kernel's driver", argv[3], argv[4],
+                               argc > 5 ? atoi(argv[5]) : 200);
+        if (!bad)
+            printf("zx-virtio-net: all checks passed\n");
+        return bad;
+    }
+    int exporting = argc > 1 && !strcmp(argv[1], "export");
+    if (exporting) {
+        argv++;
+        argc--;
+    }
+    tx_irq = exporting;
     long index = argc > 1 ? atol(argv[1]) : 0;
     int rounds = argc > 2 ? atoi(argv[2]) : 200;
     struct claim c;
@@ -513,6 +789,13 @@ int main(int argc, char **argv) {
     r = zx_status(zx8(ZX_SYS_bti_pin, pin));
     if (r != 0)
         die("bti_pin", r);
+    zx_handle_t window = 0; // the slots, as the kernel will reach them
+    if (exporting) {
+        r = zx_status(zx6(ZX_SYS_vmo_create_child, vmo, ZX_VMO_CHILD_SLICE, DMA_WIN, WIN_SIZE,
+                          (long)&window, 0));
+        if (r != 0)
+            die("vmo_create_child (slice)", r);
+    }
     dma = map_handle(vmo, DMA_SIZE);
     memset(dma, 0, DMA_SIZE);
     for (int q = 0; q < 2; q++) {
@@ -539,11 +822,14 @@ int main(int argc, char **argv) {
            index, transport == ECLIPSE_TRANSPORT_VIRTIO_MMIO ? "virtio-mmio" : "virtio-pci",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], irq_handle ? "yes" : "no");
 
+    if (exporting)
+        return export_card(window, rounds);
+
     if (arp_gateway() != 0) {
-        printf("zx-virtio-net: FAIL: nobody answered for 10.0.2.2\n");
+        printf("zx-virtio-net: FAIL: nobody answered for 10.0.3.2\n");
         return 1;
     }
-    printf("zx-virtio-net: 10.0.2.2 is at %02x:%02x:%02x:%02x:%02x:%02x\n", gw_mac[0], gw_mac[1],
+    printf("zx-virtio-net: 10.0.3.2 is at %02x:%02x:%02x:%02x:%02x:%02x\n", gw_mac[0], gw_mac[1],
            gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]);
     int bad = 0;
     bad |= ping_series("polling", 56, rounds, 0);

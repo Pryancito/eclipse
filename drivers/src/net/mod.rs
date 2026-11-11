@@ -19,6 +19,8 @@ pub mod mii;
 /// x86 has, so the module is not built elsewhere.
 #[cfg(target_arch = "x86_64")]
 pub mod pcnet32;
+/// An interface whose card is driven outside the kernel.
+pub mod served;
 /// AMD XGMAC 10GbE (`amd-xgbe`). MMIO, so it builds everywhere; see the
 /// module docs for what it does and does not do.
 pub mod xgbe;
