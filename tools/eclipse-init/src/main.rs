@@ -406,7 +406,8 @@ struct Service {
     cmdline: Option<String>,
     /// If set (`virtio-net@0`), the service starts only when the kernel
     /// command line leaves that device to a userspace driver: `udriver=`
-    /// names it, alone or among others. It is how a driver ships in every
+    /// names it, alone or among others. Without a number (`virtio-blk`), any
+    /// device of that kind. It is how a driver ships in every
     /// image and runs only on the boots where the kernel stood back from its
     /// device -- on any other the device is the kernel's, or not there, and
     /// the driver would die at its claim twenty times over.
@@ -1616,7 +1617,8 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///                                      command line carries this token)
 ///   udriver = virtio-net@0            (optional; only start when the kernel
 ///                                      command line's `udriver=` names
-///                                      this device)
+///                                      this device, or one of this kind
+///                                      when there is no number)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
@@ -2672,12 +2674,19 @@ fn cmdline_has_in(cmdline: &str, token: &str) -> bool {
     cmdline.split([':', ' ', '\t', '\n']).any(|t| t == token)
 }
 
-/// Does `cmdline` leave `device` (`virtio-net@0`) to a userspace driver? The
-/// kernel's `udriver=` takes one device or several with commas
+/// Does `cmdline` leave `device` to a userspace driver? The kernel's
+/// `udriver=` takes one device or several with commas
 /// (`udriver=virtio-blk@1,virtio-net@0`), so this is not a whole-token match:
-/// the device is looked for in that list, whole.
+/// the device is looked for in that list, whole. A `device` with no number
+/// (`virtio-blk`) is a kind, and any device of that kind in the list will do:
+/// which disk is spare depends on the machine, and the driver's own wrapper
+/// reads the number.
 fn cmdline_udriver_in(cmdline: &str, device: &str) -> bool {
-    cmdline_value(cmdline, "udriver=").is_some_and(|list| list.split(',').any(|d| d == device))
+    cmdline_value(cmdline, "udriver=").is_some_and(|list| {
+        list.split(',').any(|d| {
+            d == device || (!device.contains('@') && d.split_once('@').map(|(kind, _)| kind) == Some(device))
+        })
+    })
 }
 
 /// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the
