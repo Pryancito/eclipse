@@ -41,7 +41,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::time::Duration;
 use kernel_hal::drivers::net::served::{FramePort, ServedInterface, MAX_FRAME};
 use kernel_hal::drivers::prelude::Device;
@@ -302,8 +302,18 @@ impl FramePort for ServedNic {
 
 /// The wire of an interface across the drivers its card has had: the port
 /// of the one serving it now, or nothing while there is none.
+///
+/// Every frame goes through here, so reaching the port takes no lock: the
+/// one seated is a pointer, and a call counts itself in and out around its
+/// use of it. A port that has left is only let go once no call is counted,
+/// which is what makes the pointer safe to follow.
 pub(super) struct Seat<P> {
-    port: lock::Mutex<Option<Arc<P>>>,
+    /// The seated port: it points into one of `held`, or is null.
+    now: AtomicPtr<P>,
+    /// The calls that may be using what `now` held when they read it.
+    calls: AtomicUsize,
+    /// The seated port, and those that left while a call was counted.
+    held: lock::Mutex<Vec<Arc<P>>>,
     /// How many drivers have sat here: tells a seat nobody came back to
     /// from one that was taken and left again.
     turns: AtomicUsize,
@@ -312,51 +322,101 @@ pub(super) struct Seat<P> {
 impl<P> Seat<P> {
     pub(super) const fn new() -> Self {
         Self {
-            port: lock::Mutex::new(None),
+            now: AtomicPtr::new(core::ptr::null_mut()),
+            calls: AtomicUsize::new(0),
+            held: lock::Mutex::new(Vec::new()),
             turns: AtomicUsize::new(0),
         }
     }
 
     /// A driver takes the seat. Its turn, or `None` when another has it.
     pub(super) fn sit(&self, port: Arc<P>) -> Option<usize> {
-        let mut seat = self.port.lock();
-        if seat.is_some() {
+        let mut held = self.held.lock();
+        if !self.now.load(Ordering::SeqCst).is_null() {
             return None;
         }
-        *seat = Some(port);
+        self.now
+            .store(Arc::as_ptr(&port) as *mut P, Ordering::SeqCst);
+        held.push(port);
+        self.sweep(&mut held);
         Some(self.turns.fetch_add(1, Ordering::AcqRel) + 1)
     }
 
     /// The driver whose port this is has gone. Somebody else's port is
     /// left where it is.
     pub(super) fn leave(&self, port: &Arc<P>) {
-        let mut seat = self.port.lock();
-        if seat.as_ref().is_some_and(|p| Arc::ptr_eq(p, port)) {
-            *seat = None;
-        }
+        let mut held = self.held.lock();
+        let gone = Arc::as_ptr(port) as *mut P;
+        let _ = self.now.compare_exchange(
+            gone,
+            core::ptr::null_mut(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        self.sweep(&mut held);
     }
 
     /// Whether the seat is empty and nobody has sat since `turn`.
     pub(super) fn empty_since(&self, turn: usize) -> bool {
-        self.port.lock().is_none() && self.turns.load(Ordering::Acquire) == turn
+        let mut held = self.held.lock();
+        self.sweep(&mut held);
+        self.now.load(Ordering::SeqCst).is_null() && self.turns.load(Ordering::Acquire) == turn
     }
 
+    /// The seated port, to keep.
     fn port(&self) -> Option<Arc<P>> {
-        self.port.lock().clone()
+        let held = self.held.lock();
+        let now = self.now.load(Ordering::SeqCst) as *const P;
+        held.iter().find(|p| Arc::as_ptr(p) == now).cloned()
+    }
+
+    /// Let go of the ports that have left, when no call can be using one.
+    ///
+    /// A call counts itself before it reads `now`. So with the count seen at
+    /// zero here, after `now` stopped pointing at a port, every call that
+    /// read that port has finished and every later one reads something else.
+    fn sweep(&self, held: &mut Vec<Arc<P>>) {
+        if self.calls.load(Ordering::SeqCst) == 0 {
+            let now = self.now.load(Ordering::SeqCst) as *const P;
+            held.retain(|p| Arc::as_ptr(p) == now);
+        }
+    }
+
+    /// Run `f` on the seated port, if there is one.
+    fn with<R>(&self, f: impl FnOnce(&P) -> R) -> Option<R> {
+        /// Counts the call out however it ends.
+        struct Counted<'a>(&'a AtomicUsize);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _counted = Counted(&self.calls);
+        let now = self.now.load(Ordering::SeqCst);
+        // SAFETY: `now` points into an `Arc` in `held`, and `sweep` drops
+        // none while this call is counted: it was counted before the read.
+        unsafe { now.as_ref() }.map(f)
+    }
+
+    /// How many ports the seat still holds on to.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.held.lock().len()
     }
 }
 
 impl<P: FramePort> FramePort for Seat<P> {
     fn receive(&self) -> Option<Vec<u8>> {
-        self.port()?.receive()
+        self.with(|p| p.receive()).flatten()
     }
 
     fn can_send(&self) -> bool {
-        self.port().is_some_and(|p| p.can_send())
+        self.with(|p| p.can_send()).unwrap_or(false)
     }
 
     fn send(&self, frame: &[u8]) -> bool {
-        self.port().is_some_and(|p| p.send(frame))
+        self.with(|p| p.send(frame)).unwrap_or(false)
     }
 }
 
@@ -556,6 +616,45 @@ mod tests {
         seat.leave(&second);
         assert!(!seat.empty_since(turn));
         assert!(seat.empty_since(next));
+    }
+
+    /// A port that says when it is dropped.
+    struct Tracked(Arc<AtomicUsize>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn a_port_that_left_is_let_go_and_only_when_no_call_is_using_it() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let seat = Seat::new();
+        let first = Arc::new(Tracked(dropped.clone()));
+        seat.sit(first.clone()).unwrap();
+        // In the middle of a call through the seat, the driver goes and
+        // the caller's own `Arc` with it: the seat's is the last.
+        seat.with(|port| {
+            seat.leave(&first);
+            assert_eq!(seat.held(), 1, "the port a call is using was let go");
+            assert_eq!(dropped.load(Ordering::Acquire), 0);
+            // Still good to use.
+            assert_eq!(port.0.load(Ordering::Acquire), 0);
+        });
+        drop(first);
+        assert_eq!(dropped.load(Ordering::Acquire), 0);
+        // The next thing that happens to the seat finds no call counted.
+        let second = Arc::new(Tracked(dropped.clone()));
+        seat.sit(second.clone()).unwrap();
+        assert_eq!(seat.held(), 1);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        // With no call in the way it goes at once.
+        seat.leave(&second);
+        assert_eq!(seat.held(), 0);
+        drop(second);
+        assert_eq!(dropped.load(Ordering::Acquire), 2);
+        assert!(seat.with(|_| ()).is_none());
     }
 
     #[test]
