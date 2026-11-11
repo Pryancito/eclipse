@@ -26,6 +26,13 @@
 //! window directly. Nothing here blocks: a frame that finds no free slot is
 //! refused and the stack sends it again.
 //!
+//! A driver that dies takes nothing above it with it. The interface stays,
+//! with its addresses, its routes and the connections going through it, and
+//! simply carries nothing for a while ([`Seat`]): a driver that then serves
+//! a card with the same MAC gets the same interface, and what was waiting
+//! goes out. Only when none comes within [`DRIVER_GRACE`] is the interface
+//! removed.
+//!
 //! What this trusts: the driver is a process the system started for the
 //! purpose. It sees and can forge every frame of the interface, as a card
 //! could; it cannot make the kernel read or write anything but the window,
@@ -34,7 +41,8 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::time::Duration;
 use kernel_hal::drivers::net::served::{FramePort, ServedInterface, MAX_FRAME};
 use kernel_hal::drivers::prelude::Device;
 use zircon_object::ipc::Fifo;
@@ -58,6 +66,12 @@ const BATCH: usize = 32;
 /// The most received frames kept for the stack; past it the newest is
 /// dropped, as a card with a full ring drops.
 const RX_BACKLOG: usize = 256;
+
+/// How long an interface outlasts its driver, for the next one to pick it
+/// up. Longer than the longest pause `eclipse-init` puts between two starts
+/// of a service that keeps dying (8 s); short enough that a card nobody
+/// drives any more does not sit in the routing for long.
+const DRIVER_GRACE: Duration = Duration::from_secs(10);
 
 /// A message, as bytes.
 pub(super) fn encode(op: u32, slot: u32, len: u32, off: u32) -> [u8; NET_MSG] {
@@ -286,6 +300,114 @@ impl FramePort for ServedNic {
     }
 }
 
+/// The wire of an interface across the drivers its card has had: the port
+/// of the one serving it now, or nothing while there is none.
+pub(super) struct Seat<P> {
+    port: lock::Mutex<Option<Arc<P>>>,
+    /// How many drivers have sat here: tells a seat nobody came back to
+    /// from one that was taken and left again.
+    turns: AtomicUsize,
+}
+
+impl<P> Seat<P> {
+    pub(super) const fn new() -> Self {
+        Self {
+            port: lock::Mutex::new(None),
+            turns: AtomicUsize::new(0),
+        }
+    }
+
+    /// A driver takes the seat. Its turn, or `None` when another has it.
+    pub(super) fn sit(&self, port: Arc<P>) -> Option<usize> {
+        let mut seat = self.port.lock();
+        if seat.is_some() {
+            return None;
+        }
+        *seat = Some(port);
+        Some(self.turns.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// The driver whose port this is has gone. Somebody else's port is
+    /// left where it is.
+    pub(super) fn leave(&self, port: &Arc<P>) {
+        let mut seat = self.port.lock();
+        if seat.as_ref().is_some_and(|p| Arc::ptr_eq(p, port)) {
+            *seat = None;
+        }
+    }
+
+    /// Whether the seat is empty and nobody has sat since `turn`.
+    pub(super) fn empty_since(&self, turn: usize) -> bool {
+        self.port.lock().is_none() && self.turns.load(Ordering::Acquire) == turn
+    }
+
+    fn port(&self) -> Option<Arc<P>> {
+        self.port.lock().clone()
+    }
+}
+
+impl<P: FramePort> FramePort for Seat<P> {
+    fn receive(&self) -> Option<Vec<u8>> {
+        self.port()?.receive()
+    }
+
+    fn can_send(&self) -> bool {
+        self.port().is_some_and(|p| p.can_send())
+    }
+
+    fn send(&self, frame: &[u8]) -> bool {
+        self.port().is_some_and(|p| p.send(frame))
+    }
+}
+
+/// A card that has been served, by its MAC.
+struct Card {
+    mac: [u8; 6],
+    seat: Arc<Seat<ServedNic>>,
+    iface: Arc<ServedInterface>,
+}
+
+/// The cards with an interface: one being driven, or one within
+/// [`DRIVER_GRACE`] of having been.
+static CARDS: lock::Mutex<Vec<Card>> = lock::Mutex::new(Vec::new());
+
+/// Seat `nic` behind the interface of the card with this MAC: the one it
+/// had under its last driver, or a new `ethN`.
+fn seat_card(
+    mac: [u8; 6],
+    nic: Arc<ServedNic>,
+) -> ZxResult<(Arc<Seat<ServedNic>>, Arc<ServedInterface>, usize)> {
+    use kernel_hal::drivers::scheme::NetScheme;
+    let mut cards = CARDS.lock();
+    if let Some(card) = cards.iter().find(|c| c.mac == mac) {
+        // The driver it had may have died a moment ago, with its task not
+        // yet there to say so: ask the FIFO.
+        if let Some(last) = card.seat.port() {
+            last.pump();
+            if last.is_dead() {
+                card.seat.leave(&last);
+            }
+        }
+        // Two drivers for one card: the second is refused.
+        let turn = card.seat.sit(nic).ok_or(ZxError::ALREADY_BOUND)?;
+        info!("served card: {} has a driver again", card.iface.get_ifname());
+        return Ok((card.seat.clone(), card.iface.clone(), turn));
+    }
+    let seat = Arc::new(Seat::new());
+    let turn = seat.sit(nic).ok_or(ZxError::BAD_STATE)?;
+    let name = kernel_hal::drivers::net::next_eth_ifname();
+    let iface = Arc::new(ServedInterface::new(name, mac, seat.clone()));
+    if !kernel_hal::drivers::hotplug::add(Device::Net(iface.clone())) {
+        return Err(ZxError::NOT_SUPPORTED);
+    }
+    cards.push(Card {
+        mac,
+        seat: seat.clone(),
+        iface: iface.clone(),
+    });
+    Ok((seat, iface, turn))
+}
+
 /// [`ECLIPSE_NET_SERVE`](super::ECLIPSE_NET_SERVE): `args[0]` is the FIFO
 /// end the kernel keeps, `args[1]` the window, `args[2]` the card's MAC
 /// (its six bytes, the first in the low byte), `args[3]` how many of the
@@ -304,11 +426,10 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         return Err(ZxError::INVALID_ARGS);
     }
     let nic = Arc::new(ServedNic::new(fifo.clone(), window, args[3])?);
-    let name = kernel_hal::drivers::net::next_eth_ifname();
-    let iface = Arc::new(ServedInterface::new(name, mac, nic.clone()));
-    if !kernel_hal::drivers::hotplug::add(Device::Net(iface.clone())) {
-        return Err(ZxError::NOT_SUPPORTED);
-    }
+    let (seat, iface, turn) = seat_card(mac, nic.clone())?;
+    // Once through the stack straight away: an interface that had no
+    // driver for a while has things waiting to go out.
+    fifo.signal_set(Signal::USER_SIGNAL_0);
     // The card's interrupt, in effect: sleep on the FIFO, and run what
     // arrives through the stack.
     kernel_hal::thread::spawn(async move {
@@ -335,7 +456,19 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 kernel_hal::net::wake_net_rx_waiters_now();
             }
         }
-        // No driver, no card: the interface goes, so nothing routes into it.
+        // No driver: the interface carries nothing, and waits for the next.
+        seat.leave(&nic);
+        drop(nic);
+        kernel_hal::net::wake_net_rx_waiters_now();
+        kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + DRIVER_GRACE).await;
+        let mut cards = CARDS.lock();
+        if !seat.empty_since(turn) {
+            return;
+        }
+        // Nobody came: no driver, no card. The interface goes, so nothing
+        // routes into it.
+        cards.retain(|c| !Arc::ptr_eq(&c.seat, &seat));
+        drop(cards);
         let gone = Device::Net(iface);
         if !kernel_hal::drivers::hotplug::remove(&gone) {
             warn!("served card: its interface was not registered any more");
@@ -348,6 +481,79 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port that counts what it is asked to send.
+    #[derive(Default)]
+    struct Wire(AtomicUsize);
+
+    impl FramePort for Wire {
+        fn receive(&self) -> Option<Vec<u8>> {
+            Some(alloc::vec![7])
+        }
+        fn can_send(&self) -> bool {
+            true
+        }
+        fn send(&self, _frame: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+    }
+
+    #[test]
+    fn a_seat_with_no_driver_carries_nothing() {
+        let seat = Seat::<Wire>::new();
+        assert!(seat.receive().is_none());
+        assert!(!seat.can_send());
+        assert!(!seat.send(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_seat_passes_frames_to_the_driver_that_has_it() {
+        let seat = Seat::new();
+        let first = Arc::new(Wire::default());
+        assert_eq!(seat.sit(first.clone()), Some(1));
+        assert!(seat.can_send() && seat.send(&[1]));
+        assert_eq!(seat.receive(), Some(alloc::vec![7]));
+        assert_eq!(first.0.load(Ordering::Acquire), 1);
+        // The next driver, once the first has gone: frames go to it alone.
+        seat.leave(&first);
+        assert!(!seat.send(&[1]));
+        let second = Arc::new(Wire::default());
+        assert_eq!(seat.sit(second.clone()), Some(2));
+        assert!(seat.send(&[1]));
+        assert_eq!(first.0.load(Ordering::Acquire), 1);
+        assert_eq!(second.0.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_seat_takes_one_driver_at_a_time() {
+        let seat = Seat::new();
+        let first = Arc::new(Wire::default());
+        let second = Arc::new(Wire::default());
+        assert_eq!(seat.sit(first.clone()), Some(1));
+        assert_eq!(seat.sit(second.clone()), None);
+        // A driver that never had the seat does not empty it by leaving.
+        seat.leave(&second);
+        assert!(seat.send(&[1]));
+        assert_eq!(first.0.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_seat_knows_whether_anybody_came_back() {
+        let seat = Seat::new();
+        let first = Arc::new(Wire::default());
+        let turn = seat.sit(first.clone()).unwrap();
+        assert!(!seat.empty_since(turn), "its driver is still there");
+        seat.leave(&first);
+        assert!(seat.empty_since(turn));
+        // Another came and went in the meantime: the first driver's wait
+        // is over, and it is the second's to give the interface up.
+        let second = Arc::new(Wire::default());
+        let next = seat.sit(second.clone()).unwrap();
+        seat.leave(&second);
+        assert!(!seat.empty_since(turn));
+        assert!(seat.empty_since(next));
+    }
 
     #[test]
     fn a_message_is_four_words() {

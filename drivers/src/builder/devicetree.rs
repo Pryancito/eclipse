@@ -432,6 +432,12 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         if !header.verify() {
             return Err(DeviceError::NotSupported);
         }
+        // What a userspace driver would need of it, and the mapping above
+        // for the kernel to reset it when that driver dies.
+        let wiring = crate::user::Wiring {
+            irq: interrupts.first_irq().map(|irq| irq as usize),
+            vaddr: Some(base_vaddr as usize),
+        };
         // A disk left to a userspace driver (`udriver=`): recorded and not
         // touched, not even reset, which `VirtIoBlk::new` would do.
         if header.device_type() == DeviceType::Block
@@ -439,7 +445,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                 crate::user::Transport::VirtioMmio,
                 paddr as usize,
                 size as usize,
-                interrupts.first_irq().map(|irq| irq as usize),
+                wiring,
             )
         {
             return Err(DeviceError::NotSupported);
@@ -451,7 +457,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                 crate::user::Transport::VirtioMmio,
                 paddr as usize,
                 size as usize,
-                interrupts.first_irq().map(|irq| irq as usize),
+                wiring,
             );
             return Err(DeviceError::NotSupported);
         }
