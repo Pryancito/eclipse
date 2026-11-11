@@ -7,6 +7,13 @@
 //! driven by a userspace process is in the loader (`eclipse_net_serve`); this
 //! half knows nothing about processes.
 //!
+//! The port can be changed under a live interface
+//! ([`ServedInterface::set_port`]), and taken away
+//! ([`ServedInterface::unplug`]): the addresses, routes, neighbours and
+//! sockets stay, and carry nothing until there is a port again. That is what
+//! lets the driver of a card die and be started again with nothing above it
+//! noticing more than a pause.
+//!
 //! There is no interrupt here. Whoever owns the port calls
 //! [`ServedInterface::frames_arrived`] when it has frames to give (and then
 //! wakes the tasks asleep on sockets), and the socket paths poll the
@@ -50,6 +57,24 @@ pub trait FramePort: Send + Sync {
     /// Put a frame on the wire. `false` when it could not be taken: the
     /// caller keeps it and tries again.
     fn send(&self, frame: &[u8]) -> bool;
+}
+
+/// The port of an interface whose card has no driver: nothing comes in and
+/// nothing is taken, so what the stack has to send it keeps.
+pub struct Unplugged;
+
+impl FramePort for Unplugged {
+    fn receive(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn can_send(&self) -> bool {
+        false
+    }
+
+    fn send(&self, _frame: &[u8]) -> bool {
+        false
+    }
 }
 
 /// The link-local IPv6 address of a card with this MAC (modified EUI-64).
@@ -166,8 +191,11 @@ impl phy::TxToken for ServedTxToken {
 /// The interface: a [`NetScheme`] like any card's.
 #[derive(Clone)]
 pub struct ServedInterface {
+    /// The stack. Its device holds the port every frame of a socket goes
+    /// through, reached under this lock and no other.
     iface: Arc<Mutex<Interface<'static, ServedDriver>>>,
-    driver: ServedDriver,
+    /// The same port, for the frames that go round the stack (`AF_PACKET`).
+    port: Arc<Mutex<Arc<dyn FramePort>>>,
     name: String,
     stats: Arc<Mutex<NetStats>>,
     routes: Arc<Mutex<Vec<RouteInfo>>>,
@@ -179,7 +207,7 @@ impl ServedInterface {
     pub fn new(name: String, mac: [u8; 6], port: Arc<dyn FramePort>) -> Self {
         let stats = Arc::new(Mutex::new(NetStats::default()));
         let driver = ServedDriver {
-            port,
+            port: port.clone(),
             stats: stats.clone(),
         };
         let ip_addrs = vec![
@@ -191,7 +219,7 @@ impl ServedInterface {
         // Each interface its own route storage, for the life of the kernel.
         let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
             Box::leak(vec![None; 4].into_boxed_slice());
-        let iface = InterfaceBuilder::new(driver.clone())
+        let iface = InterfaceBuilder::new(driver)
             .ethernet_addr(EthernetAddress(mac))
             .neighbor_cache(NeighborCache::new(BTreeMap::new()))
             .ip_addrs(ip_addrs.clone())
@@ -199,12 +227,35 @@ impl ServedInterface {
             .finalize();
         Self {
             iface: Arc::new(Mutex::new(iface)),
-            driver,
+            port: Arc::new(Mutex::new(port)),
             name,
             stats,
             routes: Arc::new(Mutex::new(vec![])),
             ip_addrs: Arc::new(Mutex::new(ip_addrs)),
         }
+    }
+
+    /// Put the interface on another port: the card has a new driver. What
+    /// the old port still held is lost, as frames on a wire that was pulled
+    /// are; everything above the port stays as it was.
+    ///
+    /// The stack's copy changes under the stack's lock, so a poll that is
+    /// running finishes on the port it started with and the next one uses
+    /// this. Nothing is added to what a frame costs: the port is reached
+    /// exactly as before.
+    pub fn set_port(&self, port: Arc<dyn FramePort>) {
+        self.iface.lock().device_mut().port = port.clone();
+        *self.port.lock() = port;
+    }
+
+    /// Take the port away: the card has no driver. See [`Unplugged`].
+    pub fn unplug(&self) {
+        self.set_port(Arc::new(Unplugged));
+    }
+
+    /// The port, for a frame that goes round the stack.
+    fn port(&self) -> Arc<dyn FramePort> {
+        self.port.lock().clone()
     }
 
     /// The port has frames to give: run them through the stack. Waking
@@ -280,7 +331,7 @@ impl NetScheme for ServedInterface {
     }
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
-        match self.driver.port.receive() {
+        match self.port().receive() {
             Some(frame) => {
                 let n = frame.len().min(buf.len());
                 buf[..n].copy_from_slice(&frame[..n]);
@@ -294,7 +345,7 @@ impl NetScheme for ServedInterface {
         if !frame_len_ok(data.len()) {
             return Err(DeviceError::InvalidParam);
         }
-        if self.driver.port.send(data) {
+        if self.port().send(data) {
             Ok(data.len())
         } else {
             Err(DeviceError::NotReady)
@@ -306,7 +357,7 @@ impl NetScheme for ServedInterface {
     }
 
     fn can_send(&self) -> bool {
-        self.driver.port.can_send()
+        self.port().can_send()
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
@@ -448,6 +499,45 @@ mod tests {
             .store(false, core::sync::atomic::Ordering::Relaxed);
         assert!(driver.receive().is_some());
         assert!(wire.incoming.lock().is_empty());
+    }
+
+    #[test]
+    fn a_new_port_takes_over_under_the_same_interface() {
+        let first = Arc::new(Wire::default());
+        let nic = ServedInterface::new("eth7".into(), MAC, first.clone());
+        let cidr = Ipv4Cidr::new(Ipv4Address::new(10, 0, 3, 15), 24);
+        nic.set_ipv4_address(cidr).unwrap();
+        assert_eq!(nic.send(&[1; 60]), Ok(60));
+        // No driver: nothing is taken and nothing comes, round the stack
+        // and through it, and the address is still the interface's.
+        nic.unplug();
+        first.incoming.lock().push_back(vec![7; 60]);
+        assert_eq!(nic.send(&[2; 60]), Err(DeviceError::NotReady));
+        assert!(!nic.can_send());
+        assert_eq!(nic.recv(&mut [0; 64]), Err(DeviceError::NotReady));
+        assert!(nic.frames_arrived());
+        assert_eq!(
+            first.incoming.lock().len(),
+            1,
+            "the stack read a port that was taken away"
+        );
+        assert!(nic.get_ip_address().contains(&IpCidr::Ipv4(cidr)));
+        // The next driver's port: frames go to it and come from it, and
+        // the first sees no more of them.
+        let second = Arc::new(Wire::default());
+        nic.set_port(second.clone());
+        assert_eq!(nic.send(&[3; 60]), Ok(60));
+        assert_eq!(first.sent.lock().len(), 1);
+        assert_eq!(*second.sent.lock(), [vec![3u8; 60]]);
+        second.incoming.lock().push_back(vec![9; 60]);
+        assert!(nic.frames_arrived());
+        assert!(
+            second.incoming.lock().is_empty(),
+            "the stack did not read the new port"
+        );
+        assert_eq!(first.incoming.lock().len(), 1);
+        assert!(nic.get_ip_address().contains(&IpCidr::Ipv4(cidr)));
+        assert_eq!(nic.ifname(), "eth7");
     }
 
     #[test]
