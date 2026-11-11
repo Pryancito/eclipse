@@ -25,6 +25,10 @@ INIT_SETTLED = re.compile(r"\[eclipse-init\] \[ *[\d.]+s\] entering supervision 
 # `BootedRunner.adopt_newline_prompt`.
 GUEST_PROMPT = "__ZCORE_PROMPT__"
 PROMPT_TIMEOUT = 300
+# How many times a run prints the console of a guest that refused its prompt,
+# and how much of it.
+REFUSALS_SHOWN = 3
+CONSOLE_TAIL_LINES = 80
 # The budget of a case run alone with `--test`, in seconds.
 SINGLE_CASE_TIMEOUT = 180
 # The most CPUs the guest is given: the Makefile's own default (`SMP ?= 6`).
@@ -90,6 +94,16 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # <message>`. The supervisor shares the serial line with the shell the cases
 # run in, and what it says about its services is not the case's output.
 INIT_LOG_LINE = re.compile(r"\[eclipse-init\] \[ *\d+\.\d+s\] [^\r\n]*")
+
+
+def console_tail(console, lines=CONSOLE_TAIL_LINES):
+    """The last `lines` lines of what the guest printed, framed for a job log."""
+    kept = console.splitlines()[-lines:]
+    if not kept:
+        return "---- the guest printed nothing ----"
+    return "\n".join(
+        [f"---- the last {len(kept)} lines of the guest's console ----", *kept, "---- end ----"]
+    )
 
 
 def without_kernel_log(output):
@@ -221,6 +235,9 @@ def main():
             # What the console showed while init settled, for the report of a
             # guest that died there.
             settling_output = ""
+            boot_output = ""
+            # How many refused prompts have had their console printed.
+            refusals_shown = 0
 
             def run_one(self, name, fast=False, timeout=None):
                 # A case named with `--test` is run by hand, usually a script
@@ -251,6 +268,7 @@ def main():
                     raise RuntimeError(
                         f"no guest prompt within {PROMPT_TIMEOUT}s of QEMU starting:\n{output}"
                     )
+                self.boot_output = output
                 self.wait_for_init_to_settle(output, PROMPT_TIMEOUT - (time.monotonic() - start))
                 if self.zcore_proc.poll() is not None:
                     # It showed a prompt and then died, a kernel panic most
@@ -325,6 +343,7 @@ def main():
                         break
                     time.sleep(0.05)
                 with self.lk:
+                    refused = self.output
                     self.output = ""
                 if took:
                     self.prompt_pattern = re.compile(re.escape(GUEST_PROMPT))
@@ -336,6 +355,18 @@ def main():
                         "they were before",
                         file=sys.stderr,
                     )
+                    # A guest that shows a prompt and then answers nothing
+                    # fails every case typed at it, and all the job says is
+                    # TIMEOUT. What it printed is the only lead, and it is
+                    # gone with the next restart: show it, the first few
+                    # times (a job that goes wrong this way does it at every
+                    # boot for a while).
+                    if self.refusals_shown < REFUSALS_SHOWN:
+                        type(self).refusals_shown = self.refusals_shown + 1
+                        print(
+                            console_tail(self.boot_output + self.settling_output + refused),
+                            file=sys.stderr,
+                        )
 
             def classified_output(self, output):
                 return without_kernel_log(output)
