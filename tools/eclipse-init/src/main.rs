@@ -404,6 +404,13 @@ struct Service {
     /// still cost a normal boot nothing: `cmdline = dbus.selftest` runs the
     /// session-bus probe only on a boot that asked for it.
     cmdline: Option<String>,
+    /// If set (`virtio-net@0`), the service starts only when the kernel
+    /// command line leaves that device to a userspace driver: `udriver=`
+    /// names it, alone or among others. It is how a driver ships in every
+    /// image and runs only on the boots where the kernel stood back from its
+    /// device -- on any other the device is the kernel's, or not there, and
+    /// the driver would die at its claim twenty times over.
+    udriver: Option<String>,
     /// If set, child stdout/stderr append here instead of `/dev/null`.
     log: Option<String>,
     /// `timeout = <seconds>` from the service file: how long a `oneshot` may
@@ -907,6 +914,22 @@ fn main() {
             if !on {
                 log(&format!(
                     "{name}: skipped (needs '{token}' on the kernel cmdline)"
+                ));
+            }
+            on
+        }
+    });
+
+    // `udriver = <device>`: a driver for a device the kernel left to
+    // userspace runs only on a boot where it did.
+    let boot_cmdline = read_cmdline();
+    services.retain(|name, s| match s.udriver.as_deref() {
+        None => true,
+        Some(device) => {
+            let on = cmdline_udriver_in(&boot_cmdline, device);
+            if !on {
+                log(&format!(
+                    "{name}: skipped (needs 'udriver={device}' on the kernel cmdline)"
                 ));
             }
             on
@@ -1591,6 +1614,9 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///   desktop = labwc | xorg            (optional; only start under that session)
 ///   cmdline = dbus.selftest           (optional; only start when the kernel
 ///                                      command line carries this token)
+///   udriver = virtio-net@0            (optional; only start when the kernel
+///                                      command line's `udriver=` names
+///                                      this device)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
@@ -1599,6 +1625,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut requires: Vec<String> = Vec::new();
     let mut desktop: Option<String> = None;
     let mut cmdline: Option<String> = None;
+    let mut udriver: Option<String> = None;
     let mut log_path: Option<String> = None;
     let mut wait_socket: Option<String> = None;
     let mut wait_path: Option<String> = None;
@@ -1639,6 +1666,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
             "requires" => requires = value.split_whitespace().map(String::from).collect(),
             "desktop" => desktop = Some(value.to_string()),
             "cmdline" => cmdline = Some(value.to_string()),
+            "udriver" => udriver = Some(value.to_string()),
             "log" => log_path = Some(value.to_string()),
             "timeout" => match parse_limit(value) {
                 Some(limit) => timeout = Some(limit),
@@ -1694,6 +1722,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         requires,
         desktop,
         cmdline,
+        udriver,
         log: log_path,
         timeout,
         wait_socket,
@@ -2641,6 +2670,14 @@ fn read_cmdline() -> String {
 /// matching is what keeps `renderer=gl` from also firing on `renderer=gl-sw`.
 fn cmdline_has_in(cmdline: &str, token: &str) -> bool {
     cmdline.split([':', ' ', '\t', '\n']).any(|t| t == token)
+}
+
+/// Does `cmdline` leave `device` (`virtio-net@0`) to a userspace driver? The
+/// kernel's `udriver=` takes one device or several with commas
+/// (`udriver=virtio-blk@1,virtio-net@0`), so this is not a whole-token match:
+/// the device is looked for in that list, whole.
+fn cmdline_udriver_in(cmdline: &str, device: &str) -> bool {
+    cmdline_value(cmdline, "udriver=").is_some_and(|list| list.split(',').any(|d| d == device))
 }
 
 /// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the

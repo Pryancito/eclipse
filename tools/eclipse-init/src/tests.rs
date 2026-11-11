@@ -236,6 +236,48 @@ fn an_empty_boot_argument_value_is_not_a_value() {
     assert_eq!(cmdline_value("desktop=xorg", "desktop="), Some("xorg"));
 }
 
+/// `udriver = virtio-net@0` gates a driver on the kernel having left it its
+/// device. The kernel's option takes a comma list, so the device is found in
+/// the list rather than matched as a token -- and found whole: `virtio-net@1`
+/// on the command line does not start the driver of `virtio-net@10`, nor the
+/// other way round.
+#[test]
+fn a_driver_starts_only_when_the_kernel_left_it_its_device() {
+    let alone = "LOG=warn:udriver=virtio-net@0:desktop=labwc";
+    assert!(cmdline_udriver_in(alone, "virtio-net@0"));
+    let listed = "LOG=warn:udriver=virtio-blk@1,virtio-net@0";
+    assert!(cmdline_udriver_in(listed, "virtio-net@0"));
+    assert!(cmdline_udriver_in(listed, "virtio-blk@1"));
+    assert!(cmdline_udriver_in(
+        "LOG=warn udriver=virtio-net@0",
+        "virtio-net@0"
+    ));
+    // Not handed over: no option, another device, or a longer name.
+    assert!(!cmdline_udriver_in("LOG=warn:desktop=labwc", "virtio-net@0"));
+    assert!(!cmdline_udriver_in(
+        "udriver=virtio-blk@1",
+        "virtio-net@0"
+    ));
+    assert!(!cmdline_udriver_in(
+        "udriver=virtio-net@10",
+        "virtio-net@1"
+    ));
+    assert!(!cmdline_udriver_in(
+        "udriver=virtio-net@1",
+        "virtio-net@10"
+    ));
+    assert!(!cmdline_udriver_in("udriver=", "virtio-net@0"));
+    // The key is a field of its own in the service file.
+    let svc = parse_service(
+        "unet",
+        "exec = /bin/zx-virtio-net service 0\ntype = respawn\nudriver = virtio-net@0\n",
+    )
+    .expect("the service was refused");
+    assert_eq!(svc.udriver.as_deref(), Some("virtio-net@0"));
+    assert_eq!(svc.cmdline, None);
+    assert_eq!(svc.exec, ["/bin/zx-virtio-net", "service", "0"]);
+}
+
 // -- Which session boots -----------------------------------------------
 
 #[test]
@@ -2622,6 +2664,7 @@ wait_path = /dev/input/event0
     assert_eq!(typo.wait_socket, None, "a misspelled key set the real one");
     assert_eq!(typo.wait_path, None);
     assert_eq!(typo.cmdline, None);
+    assert_eq!(typo.udriver, None);
     assert_eq!(typo.desktop, None);
     assert_eq!(typo.log, None);
 }

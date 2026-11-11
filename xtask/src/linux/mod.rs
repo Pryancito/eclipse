@@ -177,6 +177,7 @@ impl LinuxRootfs {
             if edhcpc.is_file() {
                 let _ = fs::copy(&edhcpc, bin.join("edhcpc"));
             }
+            self.install_zx_virtio_net(&musl, &bin);
             let install_eclipse = self.install_eclipse(&musl);
             if install_eclipse.is_file() {
                 let _ = fs::copy(&install_eclipse, bin.join("install-eclipse"));
@@ -661,6 +662,7 @@ impl LinuxRootfs {
             fs::copy(&edhcpc, &dst).unwrap();
         }
 
+        self.install_zx_virtio_net(&musl, &bin);
         // DNS/hosts resolver shim (dynamic) + CLI helper.
         let eclipse_resolv = self.eclipse_resolv(&musl);
         if eclipse_resolv.is_file() {
@@ -4466,6 +4468,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               # cmdline = dbus.selftest                     (optional; start only when\n\
               #                                              this token is on the\n\
               #                                              kernel command line)\n\
+              # udriver = virtio-net@0   (optional; start only when the kernel's udriver option names it)\n\
               # desktop = labwc                             (optional; start only under\n\
               #                                             this session: labwc | xorg)\n\
               # log = /tmp/mysvc.log                        (optional; where the service's\n\
@@ -4499,7 +4502,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
             svc_dir.join("network.service"),
             b"# The network at boot. See /usr/local/bin/eclipse-network-up.\n\
               exec = /usr/local/bin/eclipse-network-up\n\
-              type = respawn\n",
+              type = respawn\n\
+              after = unet\n",
         )
         .unwrap();
 
@@ -4936,6 +4940,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         .unwrap();
 
         network::write_network_wrapper(localbin);
+        network::write_unet(localbin, svc_dir);
         Self::write_oopslog(localbin, svc_dir);
         Self::write_hunterd(localbin, svc_dir);
 

@@ -53,9 +53,10 @@
 // out through whichever interface is polled first, so boot the served
 // card alone (`NIC=none`).
 //
-// Run it on Eclipse booted with `zircon.gateway=1` and the udriver option
-// (`make ... UNET=1` adds the card). Exit status: 0 on success, 2 when the
-// gateway is off, 1 on error.
+// Run it on Eclipse booted with the udriver option, which turns the Zircon
+// gateway on unless `zircon.gateway=0` says otherwise (`make ... UNET=1`
+// adds the card). Exit status: 0 on success, 2 when the gateway is off, 1
+// on error.
 //
 // A prototype: without `export`, no stack above it and one frame in flight.
 
@@ -869,7 +870,7 @@ static zx_handle_t card_up(long index, int exporting, int patient) {
             break;
     }
     if (r == -ENOSYS) {
-        printf("zx-virtio-net: the gateway is off (boot with zircon.gateway=1)\n");
+        printf("zx-virtio-net: the gateway is off (zircon.gateway=0 on the command line?)\n");
         exit(2);
     }
     if (r != 0)

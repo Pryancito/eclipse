@@ -690,7 +690,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "network",
             "respawn",
             "/usr/local/bin/eclipse-network-up",
-            "",
+            "unet",
         ),
         ("notify", "respawn", "/usr/local/bin/eclipse-notify", ""),
         ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "network"),
@@ -704,6 +704,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "dbus-system",
         ),
         ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+        ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         (
             "xkbmap",
             "oneshot",
@@ -904,6 +905,39 @@ fn only_the_bus_probe_is_gated_on_the_kernel_cmdline() {
     );
 }
 
+/// `udriver =` keeps a driver out of every boot where the kernel drives the
+/// device itself. Only the network card's driver has it, it names the card
+/// its wrapper drives, and it is supervised: a driver that is not started
+/// again leaves the machine without the card until it reboots.
+#[test]
+fn only_the_card_driver_is_gated_on_a_device_left_to_userspace() {
+    let rootfs = init_rootfs("udriver");
+    let gated: Vec<(String, String)> = services(&rootfs)
+        .into_iter()
+        .filter(|(_, b)| field(b, "udriver").is_some())
+        .collect();
+    assert_eq!(
+        gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["unet"],
+        "a boot service gated on `udriver=` does not run on an ordinary boot"
+    );
+    let body = &gated[0].1;
+    assert_eq!(field(body, "udriver"), Some("virtio-net@0"));
+    assert_eq!(field(body, "type"), Some("respawn"));
+    let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-unet")).unwrap();
+    assert!(
+        wrapper.contains("exec /bin/zx-virtio-net service 0"),
+        "the wrapper no longer runs the driver of card 0 as a service:\n{wrapper}"
+    );
+    // The network is set up once the card has a driver to bring it.
+    let network = services(&rootfs)
+        .into_iter()
+        .find(|(n, _)| n == "network")
+        .unwrap()
+        .1;
+    assert_eq!(field(&network, "after"), Some("unet"));
+}
+
 /// The one `wait_path` in the table is the compositor's `/dev/input`.
 /// `wait_path = /dev/snd/pcmC0D0p` was in here once: starts are ordered
 /// alphabetically, so it sat ahead of seatd and labwc and spent the full
@@ -1048,6 +1082,8 @@ fn the_two_sessions_never_start_each_others_clients() {
         "portal",
         "pulseaudio",
         "network",
+        // A card's driver; no session needed.
+        "unet",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
