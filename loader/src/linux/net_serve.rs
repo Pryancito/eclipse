@@ -390,7 +390,10 @@ fn seat_card(
         }
         // Two drivers for one card: the second is refused.
         let turn = card.seat.sit(nic).ok_or(ZxError::ALREADY_BOUND)?;
-        info!("served card: {} has a driver again", card.iface.get_ifname());
+        info!(
+            "served card: {} has a driver again",
+            card.iface.get_ifname()
+        );
         return Ok((card.seat.clone(), card.iface.clone(), turn));
     }
     let seat = Arc::new(Seat::new());

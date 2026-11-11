@@ -313,7 +313,10 @@ mod tests {
         assert!(dev.is_claimed());
         dev.release();
         assert!(!dev.is_claimed());
-        assert!(dev.claim(), "a released device is there for the next driver");
+        assert!(
+            dev.claim(),
+            "a released device is there for the next driver"
+        );
         assert!(!dev.claim());
     }
 
@@ -383,11 +386,23 @@ mod tests {
             vaddr: None,
         };
         assert!(!reserve_virtio_blk(
-            Transport::VirtioMmio, 0x1000, 0x200, wired(1)));
+            Transport::VirtioMmio,
+            0x1000,
+            0x200,
+            wired(1)
+        ));
         assert!(reserve_virtio_blk(
-            Transport::VirtioMmio, 0x2000, 0x200, wired(2)));
+            Transport::VirtioMmio,
+            0x2000,
+            0x200,
+            wired(2)
+        ));
         assert!(!reserve_virtio_blk(
-            Transport::VirtioMmio, 0x3000, 0x200, wired(3)));
+            Transport::VirtioMmio,
+            0x3000,
+            0x200,
+            wired(3)
+        ));
         let dev = find(VIRTIO_BLK, 1).unwrap();
         assert_eq!((dev.paddr, dev.size, dev.irq), (0x2000, 0x200, Some(2)));
         assert!(find(VIRTIO_BLK, 0).is_none());
@@ -395,9 +410,17 @@ mod tests {
         // Each kind counts its own devices: the first card is #0 whatever
         // number of disks came before it.
         assert!(reserve_virtio_net(
-            Transport::VirtioMmio, 0x4000, 0x200, wired(4)));
+            Transport::VirtioMmio,
+            0x4000,
+            0x200,
+            wired(4)
+        ));
         assert!(!reserve_virtio_net(
-            Transport::VirtioMmio, 0x5000, 0x200, wired(5)));
+            Transport::VirtioMmio,
+            0x5000,
+            0x200,
+            wired(5)
+        ));
         let card = find(VIRTIO_NET, 0).unwrap();
         assert_eq!((card.paddr, card.irq), (0x4000, Some(4)));
         assert!(find(VIRTIO_NET, 1).is_none());

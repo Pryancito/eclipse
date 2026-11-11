@@ -937,8 +937,10 @@ static int service(long index, int report) {
             die("write (report)", errno);
         close(report);
     }
-    for (;;)
-        pause();
+    // Until a signal ends the process: there is nothing to return to.
+    while (pause() != 0) {
+    }
+    return 0;
 }
 
 // Start the driver as a child, the way a supervisor would, and wait until
