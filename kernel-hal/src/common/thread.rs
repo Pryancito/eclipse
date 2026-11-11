@@ -55,9 +55,38 @@ pub async fn preempt_now() {
 /// a loop that can go round again, not code that assumes time passed. Which is
 /// also why this is not a `sleep` — it makes no promise about how long it
 /// took, including none at all.
+///
+/// # It comes back as the thread that called
+///
+/// A poll of a thread starts by saying, to its CPU, which thread it is and
+/// by loading its address space, and ends by taking the first back. Parked
+/// here, the caller is in the middle of its poll while the CPU starts and
+/// ends other threads' polls, so what it comes back to is no current thread
+/// and the address space of whoever ran last. A `read` that waited for its
+/// file's blocks and then copied them to the user's buffer copied them into
+/// another process, or took a page fault nobody could resolve, there being
+/// no thread to ask whose pages those were:
+///
+/// ```text
+/// [KERNEL PAGE FAULT] vaddr=0x7d3000 flags=WRITE rip=<memcpy+0x27> have_thread=false
+/// ```
+///
+/// So the thread is put down before the park (the tasks that run meanwhile
+/// are not it) and taken up again after, with its address space. A parked
+/// executor is resumed by the runtime it parked in, so that is the same CPU.
 pub fn yield_now_sync() {
     #[cfg(target_os = "none")]
-    executor::sched_yield();
+    {
+        let me = crate::thread::get_current_thread();
+        if me.is_some() {
+            crate::thread::set_current_thread(None);
+        }
+        executor::sched_yield();
+        if let Some(me) = me {
+            crate::KHANDLER.resume_thread(&me);
+            crate::thread::set_current_thread(Some(me));
+        }
+    }
     #[cfg(all(not(target_os = "none"), feature = "libos"))]
     std::thread::yield_now();
     #[cfg(all(not(target_os = "none"), not(feature = "libos")))]

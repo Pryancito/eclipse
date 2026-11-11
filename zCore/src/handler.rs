@@ -235,6 +235,12 @@ impl KernelHandler for ZcoreKernelHandler {
         memory::frame_dealloc(paddr)
     }
 
+    fn resume_thread(&self, thread: &alloc::sync::Arc<dyn core::any::Any + Send + Sync>) {
+        if let Some(thread) = thread.downcast_ref::<Thread>() {
+            thread.resume_on_this_cpu();
+        }
+    }
+
     fn handle_page_fault(&self, fault_vaddr: usize, access_flags: MMUFlags) {
         // Unmapped coroutine stack guard: overflow hit the hard guard instead of
         // smashing heap into a later null fn-ptr (`rip=0x3`). Report and halt —
