@@ -521,6 +521,10 @@ ifneq ($(UNET),)
   else
     qemu_opts += -device virtio-net-pci,netdev=unet
   endif
+  # PCAP=on: what crosses that card, to unet.pcap.
+  ifeq ($(PCAP), on)
+    qemu_opts += -object filter-dump,id=f2,netdev=unet,file=unet.pcap
+  endif
 endif
 
 ifeq ($(GRAPHIC), on)
