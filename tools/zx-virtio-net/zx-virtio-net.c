@@ -51,6 +51,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -155,7 +156,7 @@ struct virtq_used {
 // window too, and that is all of the driver's memory it reaches.
 #define DMA_Q(q) ((q) * 2 * PAGE)
 #define RX_BUFS 32
-#define TX_BUFS 16
+#define TX_BUFS 32
 #define BUF_SIZE 2048 // a header and a 1514-byte frame, with room
 #define TX_HEADROOM 16 // where a frame starts in a transmit slot
 #define DMA_WIN (4 * PAGE)
@@ -561,33 +562,37 @@ struct net_msg {
 
 static zx_handle_t fifo;
 
-static void fifo_put(const struct net_msg *m) {
-    size_t put = 0;
-    long r = zx_status(zx6(ZX_SYS_fifo_write, fifo, sizeof *m, (long)m, 1, (long)&put, 0));
-    if (r != 0)
-        die("fifo_write", r);
+// `n` messages to the kernel, in as few calls as the FIFO takes them in.
+// It has room for all of them: a message per slot, and no slot is in two.
+static void fifo_put(const struct net_msg *m, size_t n) {
+    while (n) {
+        size_t put = 0;
+        long r = zx_status(zx6(ZX_SYS_fifo_write, fifo, sizeof *m, (long)m, n, (long)&put, 0));
+        if (r != 0 || put == 0 || put > n)
+            die("fifo_write", r);
+        m += put;
+        n -= put;
+    }
 }
 
 // What the card has finished, to the kernel. Returns how much there was.
 static int drain_used(void) {
+    struct net_msg m[RX_BUFS + TX_BUFS];
     int n = 0;
     mb();
-    while (used[RXQ]->idx != last_used[RXQ]) {
+    while (used[RXQ]->idx != last_used[RXQ] && n < RX_BUFS) {
         volatile struct virtq_used_elem *e = &used[RXQ]->ring[last_used[RXQ] % QUEUE_SIZE];
         last_used[RXQ]++;
         if (e->id >= RX_BUFS || e->len < net_hdr || e->len > BUF_SIZE)
             die("the device returned a receive buffer that is not one of ours, id", e->id);
-        struct net_msg m = {NET_RX, e->id, e->len - (uint32_t)net_hdr, (uint32_t)net_hdr};
-        fifo_put(&m);
-        n++;
+        m[n++] = (struct net_msg){NET_RX, e->id, e->len - (uint32_t)net_hdr, (uint32_t)net_hdr};
     }
-    while (used[TXQ]->idx != last_used[TXQ]) {
+    for (int tx = 0; used[TXQ]->idx != last_used[TXQ] && tx < TX_BUFS; tx++) {
         volatile struct virtq_used_elem *e = &used[TXQ]->ring[last_used[TXQ] % QUEUE_SIZE];
         last_used[TXQ]++;
-        struct net_msg m = {NET_TX, e->id, 0, 0};
-        fifo_put(&m);
-        n++;
+        m[n++] = (struct net_msg){NET_TX, e->id, 0, 0};
     }
+    fifo_put(m, (size_t)n);
     return n;
 }
 
@@ -600,7 +605,8 @@ static void *card_thread(void *arg) {
             if (r != 0)
                 die("interrupt_wait", r);
             ack_device();
-            drain_used();
+            while (drain_used()) {
+            }
         } else if (!drain_used()) {
             ack_device();
             usleep(200); // no interrupt to sleep on
@@ -678,10 +684,35 @@ static int sh(const char *cmd) {
 // when replies came back.
 #define PING_CMD "ping -c %d -i 0.01 -s %d -W 2 %s > /tmp/ping.out; rc=$?; tail -2 /tmp/ping.out; exit $rc"
 
+// Fetch http://GW:PORT/blob three times over TCP and say how fast it came:
+// what a download through the interface is worth. The server is whatever
+// listens on that port of the host (QEMU's user network hands the
+// gateway's ports to it).
+static int fetch_through(const char *name, const char *what, const char *gw, int port) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "wget -q -O /tmp/blob http://%s:%d/blob", gw, port);
+    for (int i = 0; i < 3; i++) {
+        struct timespec a, b;
+        struct stat st;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        int rc = sh(cmd);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (rc != 0 || stat("/tmp/blob", &st) != 0 || st.st_size == 0) {
+            printf("zx-virtio-net: FAIL: %s\n", cmd);
+            return 1;
+        }
+        double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+        printf("zx-virtio-net: %s (%s), tcp: %ld KiB in %.0f ms, %.1f MiB/s\n", name, what,
+               (long)(st.st_size / 1024), ms, st.st_size / 1048576.0 / (ms / 1e3));
+        unlink("/tmp/blob");
+    }
+    return 0;
+}
+
 // Give `name` the address `ip` and ping `gw` through the kernel's stack,
 // with 56 bytes and with PING_BIG. 0 when replies came back to both.
 static int ping_through(const char *name, const char *what, const char *ip, const char *gw,
-                        int rounds) {
+                        int rounds, int port) {
     char cmd[256];
     snprintf(cmd, sizeof cmd, "ifconfig %s %s netmask 255.255.255.0 up", name, ip);
     if (sh(cmd) != 0) {
@@ -696,22 +727,41 @@ static int ping_through(const char *name, const char *what, const char *ip, cons
             return 1;
         }
     }
-    return 0;
+    return port ? fetch_through(name, what, gw, port) : 0;
 }
 
 // The check, in a child: the interface is the kernel's now, so it is used
 // the way anything else uses the network.
-static int export_check(int rounds) {
+static int export_check(int rounds, int port) {
     char name[16];
     if (find_ifname(name, sizeof name) != 0) {
         printf("zx-virtio-net: FAIL: no interface has the card's address\n");
         return 1;
     }
     printf("zx-virtio-net: the card is %s\n", name);
-    return ping_through(name, "driver in userspace", "10.0.3.15", "10.0.3.2", rounds);
+    return ping_through(name, "driver in userspace", "10.0.3.15", "10.0.3.2", rounds, port);
 }
 
-static int export_card(zx_handle_t window, int rounds) {
+// What outlives the driver: it sleeps until the driver is gone (the pipe
+// closes), and then the interface must go too.
+static void watch_the_end(int pipe_rd) {
+    char c;
+    while (read(pipe_rd, &c, 1) > 0) {
+    }
+    char name[16];
+    for (int i = 0; i < 200; i++) {
+        if (find_ifname(name, sizeof name) != 0) {
+            printf("zx-virtio-net: the driver is gone and so is its interface\n");
+            printf("zx-virtio-net: all checks passed\n");
+            _exit(0);
+        }
+        usleep(10000);
+    }
+    printf("zx-virtio-net: FAIL: the driver is gone and %s is still there\n", name);
+    _exit(1);
+}
+
+static int export_card(zx_handle_t window, int rounds, int port) {
     zx_handle_t ends[2];
     long r = zx_status(zx6(ZX_SYS_fifo_create, FIFO_DEPTH, sizeof(struct net_msg), 0,
                            (long)&ends[0], (long)&ends[1], 0));
@@ -728,17 +778,28 @@ static int export_card(zx_handle_t window, int rounds) {
     pthread_t card, msgs;
     if (pthread_create(&card, NULL, card_thread, NULL) || pthread_create(&msgs, NULL, fifo_thread, NULL))
         die("pthread_create", errno);
+    int end[2];
+    if (pipe(end) != 0)
+        die("pipe", errno);
     pid_t pid = fork();
     if (pid < 0)
         die("fork", errno);
-    if (pid == 0)
-        _exit(export_check(rounds));
+    if (pid == 0) {
+        close(end[1]);
+        watch_the_end(end[0]);
+    }
+    close(end[0]);
+    pid = fork();
+    if (pid < 0)
+        die("fork", errno);
+    if (pid == 0) {
+        close(end[1]);
+        _exit(export_check(rounds, port));
+    }
     int st = 0;
     waitpid(pid, &st, 0);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
-        return 1;
-    printf("zx-virtio-net: all checks passed\n");
-    return 0;
+    // Leaving closes the pipe and, with the process, its end of the FIFO.
+    return !WIFEXITED(st) || WEXITSTATUS(st) != 0;
 }
 
 struct claim {
@@ -753,7 +814,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc >= 5 && !strcmp(argv[1], "ping")) {
         int bad = ping_through(argv[2], "the kernel's driver", argv[3], argv[4],
-                               argc > 5 ? atoi(argv[5]) : 200);
+                               argc > 5 ? atoi(argv[5]) : 200, argc > 6 ? atoi(argv[6]) : 0);
         if (!bad)
             printf("zx-virtio-net: all checks passed\n");
         return bad;
@@ -823,7 +884,7 @@ int main(int argc, char **argv) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], irq_handle ? "yes" : "no");
 
     if (exporting)
-        return export_card(window, rounds);
+        return export_card(window, rounds, argc > 3 ? atoi(argv[3]) : 0);
 
     if (arp_gateway() != 0) {
         printf("zx-virtio-net: FAIL: nobody answered for 10.0.3.2\n");

@@ -87,6 +87,15 @@ impl phy::Device<'_> for ServedDriver {
     type TxToken = ServedTxToken;
 
     fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
+        // No frame without room to answer it. smoltcp answers some frames
+        // on the spot, through the token handed out here (a TCP segment's
+        // ACK among them), and counts the answer as sent whatever becomes
+        // of it: a burst that outran the transmit slots lost its ACKs for
+        // good, and the peer sat out its retransmit timer, 1.5 s at a time.
+        // The frame waits in the port until a slot comes back.
+        if !self.port.can_send() {
+            return None;
+        }
         self.port.receive().map(|data| {
             (
                 ServedRxToken {
@@ -420,6 +429,25 @@ mod tests {
         wire.incoming.lock().push_back(vec![7; 42]);
         assert_eq!(nic.recv(&mut buf), Ok(42));
         assert_eq!(&buf[..42], &[7; 42]);
+    }
+
+    #[test]
+    fn the_stack_takes_no_frame_it_could_not_answer() {
+        use smoltcp::phy::Device as _;
+        let wire = Arc::new(Wire::default());
+        let mut driver = ServedDriver {
+            port: wire.clone(),
+            stats: Arc::new(Mutex::new(NetStats::default())),
+        };
+        wire.incoming.lock().push_back(vec![7; 60]);
+        wire.full.store(true, core::sync::atomic::Ordering::Relaxed);
+        assert!(driver.receive().is_none());
+        // Held back, not dropped.
+        assert_eq!(wire.incoming.lock().len(), 1);
+        wire.full
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+        assert!(driver.receive().is_some());
+        assert!(wire.incoming.lock().is_empty());
     }
 
     #[test]

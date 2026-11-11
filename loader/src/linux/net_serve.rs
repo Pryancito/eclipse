@@ -58,9 +58,6 @@ const BATCH: usize = 32;
 /// The most received frames kept for the stack; past it the newest is
 /// dropped, as a card with a full ring drops.
 const RX_BACKLOG: usize = 256;
-/// How many times the card's task offers its frames to a busy stack before
-/// it leaves them for the next poll.
-const STACK_TRIES: usize = 4;
 
 /// A message, as bytes.
 pub(super) fn encode(op: u32, slot: u32, len: u32, off: u32) -> [u8; NET_MSG] {
@@ -223,6 +220,11 @@ impl ServedNic {
         }
     }
 
+    /// Whether frames wait for the stack.
+    fn has_frames(&self) -> bool {
+        !self.state.lock().incoming.is_empty()
+    }
+
     fn take_tx_slot(&self) -> Option<u32> {
         let mut state = self.state.lock();
         if state.tx_free == 0 {
@@ -251,6 +253,12 @@ impl FramePort for ServedNic {
             return true;
         }
         self.pump();
+        // The pump may have read frames too, and this is the sending half
+        // of a poll: the receiving half is over. The FIFO is empty now, so
+        // nothing else would bring the card's task to them.
+        if self.has_frames() {
+            self.fifo.signal_set(Signal::USER_SIGNAL_0);
+        }
         self.state.lock().tx_free != 0
     }
 
@@ -306,19 +314,33 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     kernel_hal::thread::spawn(async move {
         let wire: Arc<dyn KernelObject> = fifo;
         while !nic.is_dead() {
-            wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED)
+            wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED | Signal::USER_SIGNAL_0)
                 .await;
+            wire.signal_clear(Signal::USER_SIGNAL_0);
             nic.pump();
-            // A socket call that has the stack will not be long: let it
-            // finish rather than leave the frames for whoever polls next.
-            for _ in 0..STACK_TRIES {
-                if iface.frames_arrived() {
-                    break;
-                }
+            let frames = nic.has_frames();
+            // Every time, frames or not: transmit slots that came back are
+            // what the stack was waiting for to send, or to take the frames
+            // it held back for want of one. A socket call that has the
+            // stack will not be long, so wait for it rather than leave this
+            // to whoever polls next.
+            while !iface.frames_arrived() {
                 kernel_hal::thread::yield_now().await;
             }
-            kernel_hal::net::wake_net_rx_waiters();
+            // Without the rate limit of the interrupt path, which drops a
+            // wake that follows another by under 250 us and leaves that
+            // reader to its park timer. This is once per batch delivered,
+            // not per interrupt, so no storm can come of it.
+            if frames {
+                kernel_hal::net::wake_net_rx_waiters_now();
+            }
         }
+        // No driver, no card: the interface goes, so nothing routes into it.
+        let gone = Device::Net(iface);
+        if !kernel_hal::drivers::hotplug::remove(&gone) {
+            warn!("served card: its interface was not registered any more");
+        }
+        kernel_hal::net::wake_net_rx_waiters_now();
     });
     Ok(())
 }
