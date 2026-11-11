@@ -38,8 +38,10 @@
 //! or slowly (a request gives up after [`REPLY_TIMEOUT_MS`]); it cannot make
 //! the kernel read or write anything but the window.
 
+use super::net_serve::Seat;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::future::Future;
 use core::pin::Pin;
@@ -92,13 +94,14 @@ pub(super) fn after_look(hit: bool, backoff: u32) -> (u32, u32) {
     }
 }
 
-/// A slot's answer, as [`ServedDisk::answers`] holds it.
+/// A slot's answer, as [`Link::answers`] holds it.
 const PENDING: u8 = 0;
 const ANSWERED: u8 = 1;
 const FAILED: u8 = 2;
 
-/// A disk behind a FIFO.
-pub(super) struct ServedDisk {
+/// One driver's end of a served disk: its FIFO, its window, and what is in
+/// flight between the two.
+struct Link {
     fifo: Arc<Fifo>,
     window: Arc<VmObject>,
     /// How many slots the window has, at most [`SLOTS`].
@@ -121,7 +124,6 @@ pub(super) struct ServedDisk {
     /// costs a look or saves one.
     look_skip: AtomicU32,
     look_backoff: AtomicU32,
-    stats: IoStats,
 }
 
 /// A message, as bytes.
@@ -221,8 +223,8 @@ struct Part {
     len: usize,
 }
 
-impl ServedDisk {
-    pub(super) fn new(fifo: Arc<Fifo>, window: Arc<VmObject>, sectors: u64) -> ZxResult<Self> {
+impl Link {
+    fn new(fifo: Arc<Fifo>, window: Arc<VmObject>, sectors: u64) -> ZxResult<Self> {
         let (slots, slot_len) = cut_window(window.len()).ok_or(ZxError::INVALID_ARGS)?;
         if sectors == 0 {
             return Err(ZxError::INVALID_ARGS);
@@ -243,7 +245,6 @@ impl ServedDisk {
             next_id: AtomicU32::new(0),
             look_skip: AtomicU32::new(0),
             look_backoff: AtomicU32::new(1),
-            stats: IoStats::new(),
         })
     }
 
@@ -348,7 +349,7 @@ impl ServedDisk {
         self.wait_yielding(parts, deadline)
     }
 
-    /// [`ServedDisk::wait`] without the look, for what is known to take
+    /// [`Link::wait`] without the look, for what is known to take
     /// long: a look that finds nothing makes the next waits sleep at once.
     fn wait_yielding(&self, parts: &[Part], deadline: u64) -> DeviceResult {
         loop {
@@ -603,7 +604,7 @@ impl ServedDisk {
         found
     }
 
-    /// [`ServedDisk::wait`], asleep: on the FIFO's replies, and on whichever
+    /// [`Link::wait`], asleep: on the FIFO's replies, and on whichever
     /// other waiter reads ours first.
     async fn wait_async(&self, parts: &[Part], deadline: u64) -> DeviceResult {
         if let Some(r) = self.look(parts) {
@@ -637,10 +638,10 @@ impl ServedDisk {
     }
 }
 
-/// One sleep of [`ServedDisk::wait_async`]: over when a reply is there to
+/// One sleep of [`Link::wait_async`]: over when a reply is there to
 /// read, when another waiter has read one of ours, or at the deadline.
 struct Asleep<'a, R, T> {
-    disk: &'a ServedDisk,
+    disk: &'a Link,
     parts: &'a [Part],
     replies: Pin<Box<R>>,
     timeout: Pin<Box<T>>,
@@ -665,6 +666,176 @@ impl<R: Future, T: Future> Future for Asleep<'_, R, T> {
     }
 }
 
+impl Link {
+    /// Nothing will be answered on this link again: its driver is gone.
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// The driver is gone: say so to whoever sleeps on an answer.
+    fn close(&self) {
+        self.dead.store(true, Ordering::Release);
+        for waker in &self.wakers[..self.slots] {
+            let asleep = waker.lock().take();
+            if let Some(w) = asleep {
+                w.wake();
+            }
+        }
+    }
+
+    fn read(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        let window = &self.window;
+        self.transfer(
+            OP_READ,
+            block_id,
+            buf.len(),
+            |_, _, _| Ok(()),
+            |off, at, n| {
+                window.read(off, &mut buf[at..at + n]).map_err(|e| {
+                    warn!("served disk: reading the window: {e:?}");
+                    DeviceError::IoError
+                })
+            },
+        )
+    }
+
+    fn write(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        let window = &self.window;
+        self.transfer(
+            OP_WRITE,
+            block_id,
+            buf.len(),
+            |off, at, n| {
+                window.write(off, &buf[at..at + n]).map_err(|e| {
+                    warn!("served disk: writing the window: {e:?}");
+                    DeviceError::IoError
+                })
+            },
+            |_, _, _| Ok(()),
+        )
+    }
+}
+
+/// How long a disk whose driver died waits for the next one before it
+/// starts refusing requests. The same as a served network card's wait, for
+/// the same reason: longer than the longest pause `eclipse-init` puts
+/// between two starts of a service that keeps dying (8 s).
+const DRIVER_GRACE: Duration = Duration::from_secs(10);
+
+/// The link of the moment, and whose turn it is.
+struct Driven {
+    link: Arc<Link>,
+    seat: Seat<Link>,
+}
+
+/// A disk behind a FIFO: a [`Link`] at a time, one per driver.
+///
+/// When its driver dies the disk stays, with the device node and whatever
+/// is mounted on it: a request that was out with the dead driver, and any
+/// that comes while there is none, waits for the next driver and is made
+/// again from the start with it. Reading twice is reading; a write made
+/// twice writes the same bytes to the same sectors, and none after it was
+/// acknowledged in between, because the first never was. Only when no driver
+/// comes within [`DRIVER_GRACE`] do requests fail, as they did at once
+/// before -- and a driver that comes later still finds the disk.
+pub(super) struct ServedDisk {
+    sectors: u64,
+    driven: lock::Mutex<Driven>,
+    /// No driver, and none came in time: requests fail instead of waiting.
+    gone: AtomicBool,
+    stats: IoStats,
+}
+
+impl ServedDisk {
+    fn new(link: Arc<Link>) -> (Self, usize) {
+        let mut seat = Seat::new();
+        let turn = seat.sit(link.clone()).unwrap_or(0);
+        let disk = Self {
+            sectors: link.sectors,
+            driven: lock::Mutex::new(Driven { link, seat }),
+            gone: AtomicBool::new(false),
+            stats: IoStats::new(),
+        };
+        (disk, turn)
+    }
+
+    fn link(&self) -> Arc<Link> {
+        self.driven.lock().link.clone()
+    }
+
+    /// The next driver's link takes over. Its turn, or why not: the disk
+    /// has a driver, or this is another disk.
+    fn drive(&self, link: Arc<Link>) -> ZxResult<usize> {
+        if link.sectors != self.sectors {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        let mut driven = self.driven.lock();
+        // Its end of the FIFO may have closed a moment ago, with nothing
+        // on this side having looked yet.
+        driven.link.pump();
+        if driven.link.is_dead() {
+            let last = driven.link.clone();
+            driven.seat.leave(&last);
+        }
+        let turn = driven
+            .seat
+            .sit(link.clone())
+            .ok_or(ZxError::ALREADY_BOUND)?;
+        driven.link = link;
+        self.gone.store(false, Ordering::Release);
+        Ok(turn)
+    }
+
+    /// The driver behind `link` is gone.
+    fn undrive(&self, link: &Arc<Link>) {
+        link.close();
+        self.driven.lock().seat.leave(link);
+    }
+
+    /// Nobody took the disk since the driver of turn `turn` went: stop
+    /// making requests wait.
+    fn give_up(&self, turn: usize) {
+        let driven = self.driven.lock();
+        if driven.seat.empty_since(turn) {
+            self.gone.store(true, Ordering::Release);
+        }
+    }
+
+    /// The link that took over from `old`, if one has; `Err` when none
+    /// will, `Ok(None)` while that is not known.
+    fn after(&self, old: &Arc<Link>) -> Result<Option<Arc<Link>>, DeviceError> {
+        let link = self.link();
+        if !Arc::ptr_eq(&link, old) {
+            return Ok(Some(link));
+        }
+        if self.gone.load(Ordering::Acquire) {
+            return Err(DeviceError::IoError);
+        }
+        Ok(None)
+    }
+
+    /// `request` on the driver of the moment, and again on the next one
+    /// each time the driver dies under it.
+    fn retried<T>(
+        &self,
+        mut request: impl FnMut(&Link) -> Result<T, DeviceError>,
+    ) -> Result<T, DeviceError> {
+        let mut link = self.link();
+        loop {
+            let r = request(&link);
+            if r.is_ok() || !link.is_dead() {
+                return r;
+            }
+            link = loop {
+                match self.after(&link)? {
+                    Some(next) => break next,
+                    None => between_looks(),
+                }
+            };
+        }
+    }
+}
+
 impl Scheme for ServedDisk {
     fn name(&self) -> &str {
         // The `virtio` family, so the node is a `vdX`: what is behind it is
@@ -676,39 +847,14 @@ impl Scheme for ServedDisk {
 impl BlockScheme for ServedDisk {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
         let len = buf.len();
-        let window = &self.window;
-        let r = self.transfer(
-            OP_READ,
-            block_id,
-            len,
-            |_, _, _| Ok(()),
-            |off, at, n| {
-                window.read(off, &mut buf[at..at + n]).map_err(|e| {
-                    warn!("served disk: reading the window: {e:?}");
-                    DeviceError::IoError
-                })
-            },
-        );
+        let r = self.retried(|link| link.read(block_id, buf));
         self.stats.note_read(&r, len);
         r
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
-        let len = buf.len();
-        let window = &self.window;
-        let r = self.transfer(
-            OP_WRITE,
-            block_id,
-            len,
-            |off, at, n| {
-                window.write(off, &buf[at..at + n]).map_err(|e| {
-                    warn!("served disk: writing the window: {e:?}");
-                    DeviceError::IoError
-                })
-            },
-            |_, _, _| Ok(()),
-        );
-        self.stats.note_write(&r, len);
+        let r = self.retried(|link| link.write(block_id, buf));
+        self.stats.note_write(&r, buf.len());
         r
     }
 
@@ -719,7 +865,27 @@ impl BlockScheme for ServedDisk {
     ) -> Option<BlockReadFuture<'a>> {
         Some(Box::pin(async move {
             let len = buf.len();
-            let r = self.read_async(block_id, buf).await;
+            let mut link = self.link();
+            let r = loop {
+                let r = link.read_async(block_id, buf).await;
+                if r.is_ok() || !link.is_dead() {
+                    break r;
+                }
+                // The driver died under the read: asleep until the next.
+                link = loop {
+                    match self.after(&link) {
+                        Ok(Some(next)) => break next,
+                        Ok(None) => {
+                            let soon = kernel_hal::timer::timer_now() + NEXT_DRIVER_STEP;
+                            kernel_hal::thread::sleep_until(soon).await;
+                        }
+                        Err(e) => {
+                            self.stats.note_read(&Err(e), len);
+                            return Err(e);
+                        }
+                    }
+                };
+            };
             self.stats.note_read(&r, len);
             r
         }))
@@ -728,8 +894,10 @@ impl BlockScheme for ServedDisk {
     fn flush(&self) -> DeviceResult {
         // The driver answers a write once the device has taken it, which
         // with a write cache is before it is on the disk: this is what puts
-        // it there. A driver whose device has no cache answers at once.
-        self.flush_device()
+        // it there. A driver whose device has no cache answers at once. One
+        // that died took its device's cache with it only as far as the
+        // reset: what it had acknowledged, the device had.
+        self.retried(|link| link.flush_device())
     }
 
     fn block_count(&self) -> usize {
@@ -741,9 +909,22 @@ impl BlockScheme for ServedDisk {
     }
 }
 
+/// How often a sleeping read looks for the next driver.
+const NEXT_DRIVER_STEP: Duration = Duration::from_millis(5);
+
+/// The disks that have been served from a device the kernel left to
+/// userspace, by that device's place among the reserved disks: what a
+/// second driver of the same device is given instead of a new disk.
+static DISKS: lock::Mutex<Vec<(usize, Arc<ServedDisk>)>> = lock::Mutex::new(Vec::new());
+
 /// [`ECLIPSE_BLOCK_SERVE`](super::ECLIPSE_BLOCK_SERVE): `args[0]` the FIFO end
 /// the kernel keeps, `args[1]` the data window, `args[2]` the disk's size in
 /// sectors. Both handles are the kernel's from here on, whatever the answer.
+///
+/// A process that holds a reserved disk (`udriver=virtio-blk@N`, claimed)
+/// serves that disk: the first time it becomes a device node, and every
+/// driver after the first takes the node over, with what is mounted on it.
+/// A disk served by a process that holds none has no next driver.
 pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let fifo = proc.get_object_with_rights::<Fifo>(args[0] as u32, Rights::READ | Rights::WRITE);
     let window =
@@ -751,17 +932,155 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let (fifo, window) = (fifo?, window?);
     let _ = proc.remove_handle(args[0] as u32);
     let _ = proc.remove_handle(args[1] as u32);
-    let disk = ServedDisk::new(fifo, window, args[2] as u64)?;
-    if kernel_hal::drivers::hotplug::add(Device::Block(Arc::new(disk))) {
-        Ok(())
-    } else {
-        Err(ZxError::NOT_SUPPORTED)
-    }
+    let link = Arc::new(Link::new(fifo.clone(), window, args[2] as u64)?);
+    let device = super::device_claim::held_by(proc, kernel_hal::drivers::user::VIRTIO_BLK);
+    let known = device.and_then(|index| {
+        let disks = DISKS.lock();
+        disks
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, d)| d.clone())
+    });
+    let (disk, turn) = match known {
+        Some(disk) => {
+            let turn = disk.drive(link.clone())?;
+            info!("served disk: it has a driver again");
+            (disk, turn)
+        }
+        None => {
+            let (disk, turn) = ServedDisk::new(link.clone());
+            let disk = Arc::new(disk);
+            if !kernel_hal::drivers::hotplug::add(Device::Block(disk.clone())) {
+                return Err(ZxError::NOT_SUPPORTED);
+            }
+            if let Some(index) = device {
+                DISKS.lock().push((index, disk.clone()));
+            }
+            (disk, turn)
+        }
+    };
+    // Nothing reads the FIFO while no request is out, so nothing would
+    // notice the driver going: this does, and starts the wait for the next.
+    kernel_hal::thread::spawn(async move {
+        let wire: Arc<dyn KernelObject> = fifo;
+        wire.wait_signal(Signal::PEER_CLOSED).await;
+        disk.undrive(&link);
+        drop(link);
+        if device.is_some() {
+            warn!("served disk: the driver is gone; waiting for the next");
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + DRIVER_GRACE).await;
+        }
+        disk.give_up(turn);
+    });
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link with its driver's end of the FIFO, for a disk of `sectors`.
+    fn link(sectors: u64) -> (Arc<Link>, Arc<Fifo>) {
+        let (ours, drivers) = Fifo::create(SLOTS, BLOCK_MSG);
+        let window = VmObject::new_paged(SLOTS);
+        (Arc::new(Link::new(ours, window, sectors).unwrap()), drivers)
+    }
+
+    #[test]
+    fn a_disk_has_one_driver_at_a_time_and_the_next_takes_it_over() {
+        let (first, first_end) = link(64);
+        let (disk, turn) = ServedDisk::new(first.clone());
+        assert_eq!(turn, 1);
+        // While the first driver lives, nobody else gets the disk, and a
+        // request has nowhere else to go.
+        let (second, _second_end) = link(64);
+        assert_eq!(
+            disk.drive(second.clone()).err(),
+            Some(ZxError::ALREADY_BOUND)
+        );
+        assert!(matches!(disk.after(&first), Ok(None)));
+        // It dies, with nothing having looked at the FIFO since: the next
+        // one is let in all the same, and requests are sent its way.
+        drop(first_end);
+        assert_eq!(disk.drive(second.clone()), Ok(2));
+        let next = disk
+            .after(&first)
+            .unwrap()
+            .expect("no link after the dead one");
+        assert!(Arc::ptr_eq(&next, &second));
+        assert!(first.is_dead());
+    }
+
+    #[test]
+    fn another_disk_is_not_let_in() {
+        let (first, first_end) = link(64);
+        let (disk, _) = ServedDisk::new(first.clone());
+        drop(first_end);
+        disk.undrive(&first);
+        let (other, _end) = link(128);
+        assert_eq!(disk.drive(other).err(), Some(ZxError::INVALID_ARGS));
+    }
+
+    #[test]
+    fn requests_wait_for_the_next_driver_only_until_the_disk_gives_up() {
+        let (first, first_end) = link(64);
+        let (disk, turn) = ServedDisk::new(first.clone());
+        drop(first_end);
+        disk.undrive(&first);
+        // Within the grace: not known yet.
+        assert!(matches!(disk.after(&first), Ok(None)));
+        // Nobody came: requests fail from here on.
+        disk.give_up(turn);
+        assert!(disk.after(&first).is_err());
+        assert_eq!(
+            disk.retried(|link| link.read(0, &mut [0u8; SECTOR])),
+            Err(DeviceError::IoError)
+        );
+        // A driver that comes late still finds the disk, and it works again.
+        let (late, _late_end) = link(64);
+        assert_eq!(disk.drive(late.clone()), Ok(2));
+        assert!(Arc::ptr_eq(&disk.after(&first).unwrap().unwrap(), &late));
+        // And the wait that ended for the first driver does not end it for
+        // this one.
+        disk.give_up(turn);
+        assert!(matches!(disk.after(&late), Ok(None)));
+    }
+
+    #[test]
+    fn a_driver_that_came_in_time_is_not_given_up_on() {
+        let (first, first_end) = link(64);
+        let (disk, turn) = ServedDisk::new(first.clone());
+        drop(first_end);
+        disk.undrive(&first);
+        let (second, _second_end) = link(64);
+        disk.drive(second).unwrap();
+        disk.give_up(turn);
+        assert!(!disk.gone.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_request_the_driver_died_under_is_made_again_with_the_next() {
+        let (first, first_end) = link(64);
+        let (disk, _) = ServedDisk::new(first.clone());
+        drop(first_end);
+        disk.undrive(&first);
+        let (second, _second_end) = link(64);
+        // The request fails on the dead link, the second driver arrives
+        // meanwhile, and it is asked again. What it answers -- here a
+        // refusal, the sector being past the end -- is the request's answer,
+        // and an answer is not asked for twice.
+        let mut asked = 0;
+        let r = disk.retried(|link| {
+            asked += 1;
+            if asked == 1 {
+                assert!(link.is_dead());
+                disk.drive(second.clone()).unwrap();
+            }
+            link.read(1000, &mut [0u8; SECTOR])
+        });
+        assert_eq!(r, Err(DeviceError::InvalidParam));
+        assert_eq!(asked, 2);
+    }
 
     #[test]
     fn a_look_that_pays_keeps_every_wait_looking() {

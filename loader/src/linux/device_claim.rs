@@ -13,13 +13,13 @@ use super::{
     CLAIM_WORDS, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
     ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
 };
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::time::Duration;
 use kernel_hal::drivers::scheme::IrqScheme;
 use kernel_hal::drivers::user::{self, Transport};
 use kernel_hal::{CachePolicy, PAGE_SIZE};
 use zircon_object::dev::{BusTransactionInitiator, Interrupt, Iommu, IrqLine};
-use zircon_object::object::{Handle, HandleValue, KernelObject, Rights, Signal};
+use zircon_object::object::{Handle, HandleValue, KernelObject, KoID, Rights, Signal};
 use zircon_object::task::Process;
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
@@ -90,9 +90,27 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
 const THREADS_GRACE: Duration = Duration::from_millis(500);
 const THREADS_STEP: Duration = Duration::from_millis(1);
 
+/// Which process has which device: `(process, kind, index)`, from the claim
+/// until the device is taken back.
+static HOLDERS: lock::Mutex<Vec<(KoID, &'static str, usize)>> = lock::Mutex::new(Vec::new());
+
+/// The device of `kind` that `proc` holds, by its place among the reserved
+/// ones of that kind. What a driver serves to the kernel is known by this:
+/// the next driver of the same device is the same disk's.
+pub(super) fn held_by(proc: &Arc<Process>, kind: &str) -> Option<usize> {
+    let id = proc.id();
+    let holders = HOLDERS.lock();
+    holders
+        .iter()
+        .find(|(holder, k, _)| *holder == id && *k == kind)
+        .map(|(_, _, index)| *index)
+}
+
 /// What a driver was given of its device, kept by the kernel as well so it
 /// outlasts the driver.
 struct Held {
+    /// The process it was handed to.
+    holder: KoID,
     device: Arc<user::UserDevice>,
     /// Through this the driver pinned what the device reads and writes; the
     /// pins live as long as it does.
@@ -116,6 +134,9 @@ impl Held {
     /// The driver is gone: stop the device and make it claimable again.
     fn take_back(self) {
         let (kind, index) = (self.device.kind, self.device.index);
+        HOLDERS
+            .lock()
+            .retain(|held| *held != (self.holder, kind, index));
         self.silence();
         if !self.device.reset() {
             // It may still be writing to what it was given, so that stays
@@ -178,6 +199,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let regs = VmObject::new_physical(base, (end - base) / PAGE_SIZE);
     regs.set_cache_policy(CachePolicy::UncachedDevice)?;
     let held = Held {
+        holder: proc.id(),
         bti: BusTransactionInitiator::create(Iommu::create(), 0),
         interrupt: device_interrupt(&device),
         device: device.clone(),
@@ -227,6 +249,9 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         held.take_back();
         return Err(ZxError::INVALID_ARGS);
     }
+    HOLDERS
+        .lock()
+        .push((held.holder, device.kind, device.index));
     held.until_gone(proc);
     Ok(())
 }
