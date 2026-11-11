@@ -553,6 +553,16 @@ pub const ECLIPSE_TRANSPORT_VIRTIO_PCI: u64 = 2;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
 
+/// `eclipse_net_serve(fifo, window, mac, rx_slots)`: give the kernel a
+/// network card that this process drives. `fifo` is the end of a FIFO of
+/// 16-byte frame messages the kernel keeps, `window` a VMO of 2048-byte
+/// slots the frames pass through (the first `rx_slots` for frames coming
+/// in), and `mac` the card's address, its first byte in the low byte. The
+/// card appears as an `ethN` interface; the process passes frames on the
+/// other end of the FIFO. Both handles go to the kernel.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
+
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
 /// `ZX_CHANNEL_MAX_MSG_BYTES`.
 #[cfg(feature = "zircon-gateway")]
@@ -810,6 +820,10 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Err(e) => status(e),
         },
         ECLIPSE_BLOCK_SERVE => match block_serve::block_serve(proc, args) {
+            Ok(()) => 0,
+            Err(e) => status(e),
+        },
+        ECLIPSE_NET_SERVE => match net_serve::net_serve(proc, args) {
             Ok(()) => 0,
             Err(e) => status(e),
         },
@@ -2802,6 +2816,8 @@ mod device_claim;
 use device_claim::claim_device;
 #[cfg(feature = "zircon-gateway")]
 mod block_serve;
+#[cfg(feature = "zircon-gateway")]
+mod net_serve;
 
 #[cfg(test)]
 mod user_trap_tests;

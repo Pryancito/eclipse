@@ -173,10 +173,11 @@ impl Socket for RawSocketState {
                     if non_block {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
-                    kernel_hal::thread::sleep_until(
-                        kernel_hal::timer::timer_now() + core::time::Duration::from_millis(10),
-                    )
-                    .await;
+                    // A reply wakes this as soon as a card delivers it; the
+                    // 10 ms is what a missed wake costs, and all there was
+                    // before, when a reply that took over a poll to come
+                    // back waited out the whole sleep.
+                    kernel_hal::net::NetRxOrTimeoutFuture::new(10).await;
                     continue;
                 }
             }
