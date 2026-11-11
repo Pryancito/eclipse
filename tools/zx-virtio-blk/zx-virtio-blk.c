@@ -1345,6 +1345,10 @@ static int restart_check(const char *self, long index, int kills) {
     snprintf(node, sizeof node, "/dev/%s", name);
     snprintf(part, sizeof part, "%s1", node);
     printf("zx-virtio-blk: the driver is pid %d and its disk is %s\n", (int)driver, node);
+    // The partitions' nodes come a moment after the disk's, once the
+    // kernel has read the table through the driver.
+    for (int i = 0; i < 100 && access(part, F_OK) != 0; i++)
+        usleep(50000);
     const char *dir = "/mnt/served";
     mkdir("/mnt", 0755);
     mkdir(dir, 0755);
