@@ -14,9 +14,9 @@
 //! side, and the driver never sees kernel memory.
 //!
 //! [`BlockScheme`] is synchronous and bare metal has no `block_on`, so the
-//! wait for the reply parks the calling executor with
-//! [`yield_now_sync`](kernel_hal::thread::yield_now_sync) between looks,
-//! as the NFS transport does, and opens a window for interrupts each time
+//! wait for the reply parks the calling executor between looks, as the NFS
+//! transport does (a [`SyncWait`], which gives the thread its address space
+//! back when the wait is over), and opens a window for interrupts each time
 //! (see `between_looks`).
 //!
 //! The window is cut into slots, one request in flight on each, up to the
@@ -50,6 +50,7 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use kernel_hal::drivers::prelude::{Device, DeviceError, DeviceResult};
 use kernel_hal::drivers::scheme::{BlockReadFuture, BlockScheme, IoSnapshot, IoStats, Scheme};
+use kernel_hal::thread::SyncWait;
 use zircon_object::ipc::Fifo;
 use zircon_object::object::{KernelObject, Rights, Signal};
 use zircon_object::task::Process;
@@ -190,9 +191,13 @@ pub(super) fn in_range(sector: u64, len: usize, sectors: u64) -> bool {
 /// land on this CPU, and the driver sleeps through the request until the
 /// deadline. So each look opens a window, the same one the idle loop's poll
 /// opens, and closes it again: the caller's state is what it was.
-fn between_looks() {
+///
+/// `wait` is the whole wait these looks are turns of: the thread that waits
+/// is put down at the first and taken up when the wait is over (see
+/// [`SyncWait`]), so nothing between two looks may touch user memory.
+fn between_looks(wait: &mut SyncWait) {
     open_interrupt_window();
-    kernel_hal::thread::yield_now_sync();
+    wait.yield_now();
 }
 
 /// The interrupt half of [`between_looks`], for a spin that keeps the CPU.
@@ -286,6 +291,7 @@ impl Link {
 
     /// Up to `want` free slots, waiting for one while there are none.
     fn claim(&self, want: usize, deadline: u64) -> Option<u32> {
+        let mut away = SyncWait::new();
         loop {
             let free = self.free.load(Ordering::Acquire);
             let take = pick_slots(free, want);
@@ -305,7 +311,7 @@ impl Link {
             // The holders may be parked: their replies are read by whoever
             // is here.
             if self.pump() == 0 {
-                between_looks();
+                between_looks(&mut away);
             }
         }
     }
@@ -313,6 +319,7 @@ impl Link {
     /// Put `n` messages on the FIFO, all of them.
     fn send(&self, msgs: &[u8], n: usize, deadline: u64) -> DeviceResult {
         let mut sent = 0;
+        let mut away = SyncWait::new();
         while sent < n {
             match self
                 .fifo
@@ -331,7 +338,7 @@ impl Link {
                     warn!("served disk: a request could not be sent in time");
                     return Err(DeviceError::IoError);
                 }
-                between_looks();
+                between_looks(&mut away);
             }
         }
         Ok(())
@@ -352,6 +359,7 @@ impl Link {
     /// [`Link::wait`] without the look, for what is known to take
     /// long: a look that finds nothing makes the next waits sleep at once.
     fn wait_yielding(&self, parts: &[Part], deadline: u64) -> DeviceResult {
+        let mut away = SyncWait::new();
         loop {
             let mut pending = false;
             let mut failed = false;
@@ -377,7 +385,7 @@ impl Link {
                 return Err(DeviceError::IoError);
             }
             if self.pump() == 0 {
-                between_looks();
+                between_looks(&mut away);
             }
         }
     }
@@ -826,10 +834,13 @@ impl ServedDisk {
             if r.is_ok() || !link.is_dead() {
                 return r;
             }
-            link = loop {
-                match self.after(&link)? {
-                    Some(next) => break next,
-                    None => between_looks(),
+            link = {
+                let mut away = SyncWait::new();
+                loop {
+                    match self.after(&link)? {
+                        Some(next) => break next,
+                        None => between_looks(&mut away),
+                    }
                 }
             };
         }

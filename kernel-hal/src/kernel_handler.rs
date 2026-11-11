@@ -26,8 +26,8 @@ pub trait KernelHandler: Send + Sync + 'static {
     fn handle_page_fault(&self, _fault_vaddr: VirtAddr, _access_flags: MMUFlags) {}
 
     /// A thread that gave the CPU back from the middle of its poll
-    /// ([`yield_now_sync`](crate::thread::yield_now_sync)) has it again: load
-    /// its address space on this CPU, as the start of a poll does.
+    /// ([`SyncWait`](crate::thread::SyncWait)) has it again: load its
+    /// address space on this CPU, as the start of a poll does.
     ///
     /// Defaults to nothing, for a handler with one address space (libos,
     /// tests).

@@ -825,8 +825,8 @@ impl Thread {
     }
 
     /// Take this CPU up again for the thread, in the middle of a poll that
-    /// gave it back (`kernel_hal::thread::yield_now_sync`): other threads'
-    /// polls ran here meanwhile and left their address space loaded.
+    /// gave it back (`kernel_hal::thread::SyncWait`): other threads' polls
+    /// ran here meanwhile and left their address space loaded.
     pub fn resume_on_this_cpu(&self) {
         activate_process_paging(self.proc());
     }
