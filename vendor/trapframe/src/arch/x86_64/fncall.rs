@@ -756,7 +756,7 @@ store_xmm7_then_syscall:
         }
         // The FXSAVE legacy area keeps `xmm7` at 160 + 7 * 16, with or
         // without `XSAVE`.
-        let saved = &cx.fpstate.0[272..288];
+        let saved = &cx.fpstate.as_bytes()[272..288];
         let pattern = unsafe { core::ptr::addr_of!(xmm7_pattern).read() };
         assert_eq!(&saved[..8], &pattern[0].to_le_bytes());
         assert_eq!(&saved[8..], &pattern[1].to_le_bytes());

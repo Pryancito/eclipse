@@ -73,12 +73,15 @@ impl UserContext {
     /// ```
     pub fn run(&mut self) {
         unsafe {
-            // Restore this thread's user FPU state immediately before entering
-            // user mode, and save it immediately after the trap returns. The
-            // syscall_return / syscall_entry asm paths use no SSE/AVX, and this
-            // Rust wrapper has no float work, so the vector registers cannot be
-            // clobbered in between. `fpstate` is 64-aligned (XSAVE requirement,
-            // and satisfies FXSAVE's 16).
+            // This thread's x87/SSE/AVX registers are saved into `fpstate`
+            // right after every trap, and loaded back right before the way
+            // out -- unless this CPU still holds them, which it does whenever
+            // no other thread has been out through here since they were
+            // saved: the kernel is built without them (see `FpState`), and
+            // neither this wrapper nor the syscall_return / syscall_entry
+            // asm touches one. See `FpOwner` for how that is known.
+            // `fpstate` is 64-aligned (XSAVE requirement, and satisfies
+            // FXSAVE's 16).
             //
             // When the CPU has XSAVE + AVX (see `init_fpu`), use XSAVE/XRSTOR so
             // the AVX YMM upper halves are preserved too — a preempted user AVX
@@ -88,13 +91,16 @@ impl UserContext {
             // keep the FXSAVE/FXRSTOR path.
             let mask = super::XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed);
             let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
+            let held = super::gdt::fp_owner().holds(self.fpstate.stamp);
             if mask != 0 {
-                core::arch::asm!(
-                    "xrstor [{}]",
-                    in(reg) fp,
-                    in("eax") mask, in("edx") 0u32,
-                    options(readonly, nostack, preserves_flags),
-                );
+                if !held {
+                    core::arch::asm!(
+                        "xrstor [{}]",
+                        in(reg) fp,
+                        in("eax") mask, in("edx") 0u32,
+                        options(readonly, nostack, preserves_flags),
+                    );
+                }
                 syscall_return(self);
                 let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
                 if super::XSAVEOPT.load(core::sync::atomic::Ordering::Relaxed) {
@@ -113,11 +119,18 @@ impl UserContext {
                     );
                 }
             } else {
-                core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
+                if !held {
+                    core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
+                }
                 syscall_return(self);
                 let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
                 core::arch::asm!("fxsave [{}]", in(reg) fp, options(nostack, preserves_flags));
             }
+            // The same CPU as on the way out: a thread changes CPU only
+            // between two calls of `run`.
+            let mut owner = super::gdt::fp_owner();
+            self.fpstate.stamp = owner.saved();
+            super::gdt::set_fp_owner(owner);
         }
     }
 }

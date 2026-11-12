@@ -13,6 +13,8 @@ use x86_64::structures::gdt::{Descriptor, SegmentSelector};
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
+use super::fpown::FpOwner;
+
 /// Base address and entry count of the GDT created by the BSP's [`init`].
 /// APs read this instead of their own `sgdt()` (which points at the trampoline's
 /// 3-entry mini-GDT and is therefore missing all user-space segments).
@@ -79,6 +81,59 @@ struct CpuLocalRegion {
     /// The same for the user `GSBASE`, which sits in `KERNEL_GS_BASE` while
     /// the CPU is in the kernel.
     user_gsbase: u64,
+    /// Whose x87/SSE/AVX registers this CPU holds: the two words of an
+    /// [`FpOwner`], read and written through `gs:` by [`fp_owner`] and
+    /// [`set_fp_owner`].
+    fp_loaded: u64,
+    fp_next: u64,
+}
+
+/// How many CPUs have set up their [`CpuLocalRegion`]: each takes the next
+/// number for its [`FpOwner`], so that no two give the same stamp.
+static FP_OWNERS: AtomicU64 = AtomicU64::new(0);
+
+/// The `fp_loaded` and `fp_next` of a CPU coming up.
+fn new_fp_owner() -> (u64, u64) {
+    FpOwner::new(FP_OWNERS.fetch_add(1, Ordering::Relaxed)).words()
+}
+
+/// What this CPU knows of the vector registers it holds.
+///
+/// # Safety
+/// `GSBASE` must point to a [`CpuLocalRegion`], i.e. [`init`] must have run on
+/// this CPU; and the caller stays on this CPU until it is done with the
+/// answer (it is not moved while in `UserContext::run`).
+#[inline(always)]
+pub(crate) unsafe fn fp_owner() -> FpOwner {
+    let (loaded, next): (u64, u64);
+    asm!(
+        "mov {loaded}, gs:[{loaded_off}]",
+        "mov {next}, gs:[{next_off}]",
+        loaded = out(reg) loaded,
+        next = out(reg) next,
+        loaded_off = const core::mem::offset_of!(CpuLocalRegion, fp_loaded),
+        next_off = const core::mem::offset_of!(CpuLocalRegion, fp_next),
+        options(nostack, readonly, preserves_flags),
+    );
+    FpOwner::from_words(loaded, next)
+}
+
+/// Put back what [`fp_owner`] gave, after a save.
+///
+/// # Safety
+/// As [`fp_owner`], on the CPU that gave it.
+#[inline(always)]
+pub(crate) unsafe fn set_fp_owner(owner: FpOwner) {
+    let (loaded, next) = owner.words();
+    asm!(
+        "mov gs:[{loaded_off}], {loaded}",
+        "mov gs:[{next_off}], {next}",
+        loaded = in(reg) loaded,
+        next = in(reg) next,
+        loaded_off = const core::mem::offset_of!(CpuLocalRegion, fp_loaded),
+        next_off = const core::mem::offset_of!(CpuLocalRegion, fp_next),
+        options(nostack, preserves_flags),
+    );
 }
 
 /// A base no user context can hold -- it is not canonical, and
@@ -303,7 +358,10 @@ pub fn init() {
         dbg_save: 0,
         user_fsbase: UNKNOWN_BASE,
         user_gsbase: UNKNOWN_BASE,
+        fp_loaded: 0,
+        fp_next: 0,
     });
+    (region.fp_loaded, region.fp_next) = new_fp_owner();
     // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
     // dangerously small for deep user-trap handling (page-fault -> VMO commit ->
     // smoltcp ...): an overflow silently corrupts the adjacent heap (observed as
@@ -445,7 +503,10 @@ pub fn init_ap() {
         dbg_save: 0,
         user_fsbase: UNKNOWN_BASE,
         user_gsbase: UNKNOWN_BASE,
+        fp_loaded: 0,
+        fp_next: 0,
     });
+    (region.fp_loaded, region.fp_next) = new_fp_owner();
     // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
     // dangerously small for deep user-trap handling (page-fault -> VMO commit ->
     // smoltcp ...): an overflow silently corrupts the adjacent heap (observed as

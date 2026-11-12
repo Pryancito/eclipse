@@ -3,6 +3,7 @@ mod btrfs_image;
 mod cuda_probe;
 mod desktop;
 mod eclipsefs_image;
+mod fp_probe;
 mod hunterd;
 mod i386;
 mod image;
@@ -211,6 +212,7 @@ impl LinuxRootfs {
                 }
             }
             self.install_signal_probe(&musl, &bin);
+            self.install_fp_probe(&musl, &bin);
             self.install_usb_probe(&musl, &bin);
             let firefox_probe = self.firefox_probe(&musl);
             if firefox_probe.is_file() {
@@ -768,6 +770,7 @@ impl LinuxRootfs {
 
         // signal-probe: whether a signal puts the program back as it found it.
         self.install_signal_probe(&musl, &bin);
+        self.install_fp_probe(&musl, &bin);
         self.install_usb_probe(&musl, &bin);
 
         // firefox-probe: the kernel interfaces Firefox depends on.
