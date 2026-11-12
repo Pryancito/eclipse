@@ -157,6 +157,11 @@ pub fn servers(svcs: &[Svc], said: &[Said], kernel: &Kernel, alive: &dyn Fn(i32)
     };
     svcs.iter()
         .filter_map(|svc| {
+            // A oneshot with a device (`ublk-mounts`, which mounts what the
+            // driver serves) runs at boot and is no server.
+            if svc.kind != "respawn" {
+                return None;
+            }
             let device = svc.udriver.clone()?;
             let running = svc.pid.is_some();
             let stack = live(&format!("stack.{device}")).filter(|s| running && s.pid() == svc.pid);
@@ -222,6 +227,7 @@ mod tests {
     const SVCS: &str = "# x\n\
         ntpd\trespawn\trunning\t455\t1\t100\t-\t/usr/local/bin/eclipse-ntpd\t-\n\
         ublk\trespawn\trunning\t231\t3\t100\t-\t/usr/local/bin/eclipse-ublk\tvirtio-blk@1\n\
+        ublk-mounts\toneshot\tidle\t-\t0\t-\t-\t/usr/local/bin/eclipse-ublk-mounts\tvirtio-blk@1\n\
         unet\trespawn\trunning\t240\t1\t100\t-\t/usr/local/bin/eclipse-unet\tvirtio-net@0\n";
 
     fn kernel() -> Kernel {
@@ -279,6 +285,33 @@ mod tests {
         let s = servers(&parse_services(SVCS), &said, &kernel(), &|p| p != 99);
         assert_eq!(s[1].program, "eclipse-unet", "the service's exec, then");
         assert_eq!(s[1].gives, Gives::Unknown);
+    }
+
+    /// What an x86_64 boot under QEMU with `udriver=virtio-blk@0,virtio-net@0`
+    /// wrote after one `kill -9` of both drivers.
+    #[test]
+    fn the_files_of_a_real_boot() {
+        let svcs = "# name\tkind\tstate\tpid\tstarts\tstarted\tlog\texec\tudriver\n\
+            ublk\trespawn\trunning\t1029\t2\t1794500433\t/tmp/ublk.log\t/usr/local/bin/eclipse-ublk\tvirtio-blk@0\n\
+            ublk-mounts\toneshot\tidle\t-\t0\t-\t-\t/usr/local/bin/eclipse-ublk-mounts\tvirtio-blk@0\n\
+            unet\trespawn\trunning\t1038\t2\t1794500433\t/tmp/unet.log\t/usr/local/bin/eclipse-unet\tvirtio-net@0\n";
+        let said = vec![
+            Said::parse("driver.virtio-blk@0", "pid=1029\nprogram=udrv-virtio-blk\ndevice=virtio-blk@0\nserves=kernel\nsectors=65536\n"),
+            Said::parse("driver.virtio-net@0", "pid=1038\nprogram=udrv-virtio-net\ndevice=virtio-net@0\nserves=kernel\nmac=52:54:00:12:34:57\n"),
+        ];
+        let k = Kernel {
+            ifaces: vec![
+                ("eth0".into(), "52:54:00:12:34:56".into()),
+                ("eth1".into(), "52:54:00:12:34:57".into()),
+                ("lo".into(), "00:00:00:00:00:00".into()),
+            ],
+            disks: vec![("sda".into(), "1323008".into()), ("vda".into(), "65536".into())],
+        };
+        let s = servers(&parse_services(svcs), &said, &k, &|_| true);
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[0].gives.clone(), s[0].restarts()), (Gives::Disk(Some("vda".into()), 65536), 1));
+        assert_eq!((s[1].gives.clone(), s[1].restarts()), (Gives::Iface(Some("eth1".into()), "52:54:00:12:34:57".into()), 1));
+        assert_eq!(s[1].program, "udrv-virtio-net");
     }
 
     #[test]
