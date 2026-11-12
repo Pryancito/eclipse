@@ -570,6 +570,24 @@ pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
 
+/// `eclipse_fifo_reply_wait(fifo, elem_size, buf, replies, room, *actual)
+/// -> status`: [`ECLIPSE_CHANNEL_REPLY_WAIT`] for a FIFO, the turn of a
+/// process that serves a device to the kernel ([`ECLIPSE_BLOCK_SERVE`],
+/// [`ECLIPSE_NET_SERVE`]). Writes the first `replies` elements of `buf` to
+/// `fifo` (none when `replies` is 0), then waits until there is something
+/// to read and reads up to `room` elements into the same `buf`, with their
+/// count in `*actual` (a `usize`).
+///
+/// `fifo` needs `READ` and `WRITE`; `elem_size` is the FIFO's and `room` is
+/// not zero, or `OUT_OF_RANGE`, which is also the answer to more replies
+/// than the FIFO holds. Replies that do not all fit the other side's queue
+/// end the call before the wait with `SHOULD_WAIT` and the number that went
+/// in `*actual`. `PEER_CLOSED` once the queue is empty and the peer gone. A
+/// signal during the wait answers `ZX_ERR_INTERNAL_INTR_RETRY` with the
+/// replies already sent: retry with `replies` 0.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
+
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's
 /// `ZX_CHANNEL_MAX_MSG_BYTES`.
 #[cfg(feature = "zircon-gateway")]
@@ -2290,6 +2308,18 @@ async fn handle_user_trap(
                         }
                     },
                 },
+                _ if zx_num == ECLIPSE_FIFO_REPLY_WAIT => {
+                    match fifo_turn::reply_then(thread.proc(), &args) {
+                        Err(e) => e as isize as usize,
+                        Ok(turn) => run_with_irq_enable! {
+                            match linux_object::process::interruptible(turn.wait_then_read()).await {
+                                Ok(Ok(())) => 0,
+                                Ok(Err(e)) => e as isize as usize,
+                                Err(_) => zircon_object::ZxError::INTERNAL_INTR_RETRY as isize as usize,
+                            }
+                        },
+                    }
+                }
                 _ if zx_num >= ECLIPSE_GATEWAY_EXT => {
                     eclipse_gateway_call(thread.proc(), zx_num, &args) as usize
                 }
@@ -2823,6 +2853,8 @@ mod device_claim;
 use device_claim::claim_device;
 #[cfg(feature = "zircon-gateway")]
 mod block_serve;
+#[cfg(feature = "zircon-gateway")]
+mod fifo_turn;
 #[cfg(feature = "zircon-gateway")]
 mod net_serve;
 
