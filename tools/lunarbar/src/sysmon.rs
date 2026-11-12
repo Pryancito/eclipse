@@ -227,6 +227,9 @@ pub struct Svc {
     pub started: Option<u64>,
     pub log: Option<String>,
     pub exec: String,
+    /// The device a driver service drives (`virtio-blk@1`): the ninth
+    /// column, which an older init does not write.
+    pub udriver: Option<String>,
 }
 
 pub fn parse_services(text: &str) -> Vec<Svc> {
@@ -247,6 +250,7 @@ pub fn parse_services(text: &str) -> Vec<Svc> {
                 started: f[5].parse().ok(),
                 log: opt(f[6]),
                 exec: f[7].to_string(),
+                udriver: f.get(8).and_then(|d| opt(d)),
             })
         })
         .collect()

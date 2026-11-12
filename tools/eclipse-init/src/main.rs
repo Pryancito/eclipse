@@ -924,17 +924,22 @@ fn main() {
     // `udriver = <device>`: a driver for a device the kernel left to
     // userspace runs only on a boot where it did.
     let boot_cmdline = read_cmdline();
+    // What stays drives the device the list names: that is what the state
+    // file says of it.
     services.retain(|name, s| match s.udriver.as_deref() {
         None => true,
-        Some(device) => {
-            let on = cmdline_udriver_in(&boot_cmdline, device);
-            if !on {
+        Some(device) => match cmdline_udriver_device(&boot_cmdline, device) {
+            Some(listed) => {
+                s.udriver = Some(listed.to_string());
+                true
+            }
+            None => {
                 log(&format!(
                     "{name}: skipped (needs 'udriver={device}' on the kernel cmdline)"
                 ));
+                false
             }
-            on
-        }
+        },
     });
 
     // Move the display to the dedicated graphics VT (tty7) BEFORE starting the
@@ -2682,10 +2687,16 @@ fn cmdline_has_in(cmdline: &str, token: &str) -> bool {
 /// which disk is spare depends on the machine, and the driver's own wrapper
 /// reads the number.
 fn cmdline_udriver_in(cmdline: &str, device: &str) -> bool {
-    cmdline_value(cmdline, "udriver=").is_some_and(|list| {
-        list.split(',').any(|d| {
-            d == device || (!device.contains('@') && d.split_once('@').map(|(kind, _)| kind) == Some(device))
-        })
+    cmdline_udriver_device(cmdline, device).is_some()
+}
+
+/// The device of `udriver=` that `device` names: itself (`virtio-net@0`),
+/// or for a bare kind (`virtio-blk`) the first of that kind in the list
+/// (`virtio-blk@1`), which is the one the service's driver takes. What the
+/// state file says the service drives.
+fn cmdline_udriver_device<'a>(cmdline: &'a str, device: &str) -> Option<&'a str> {
+    cmdline_value(cmdline, "udriver=")?.split(',').find(|d| {
+        *d == device || (!device.contains('@') && d.split_once('@').map(|(kind, _)| kind) == Some(device))
     })
 }
 

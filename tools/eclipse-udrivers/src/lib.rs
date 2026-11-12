@@ -21,6 +21,7 @@ pub mod fifo;
 pub mod hybrid;
 pub mod net;
 pub mod queue;
+pub mod status;
 pub mod virtio;
 pub mod zx;
 

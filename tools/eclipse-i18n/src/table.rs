@@ -1149,6 +1149,37 @@ strings! {
     },
     mon_the_log_is_empty => { es: "el registro está vacío", en: "the log is empty" },
     mon_footer_services_keys => {
+        es: "↑↓ elegir · I iniciar · R reiniciar · P parar (hasta el próximo arranque) · Tab servidores",
+        en: "↑↓ pick · I start · R restart · P stop (until the next boot) · Tab servers",
+    },
+    // The SERVIDORES list: the microkernel's servers, the processes that
+    // drive a device the kernel left to userspace.
+    mon_servers => { es: "SERVIDORES", en: "SERVERS" },
+    mon_servers_2 => { es: "servidores", en: "servers" },
+    mon_server => { es: "SERVIDOR", en: "SERVER" },
+    mon_device => { es: "DISPOSITIVO", en: "DEVICE" },
+    mon_gives => { es: "DA", en: "GIVES" },
+    mon_restarts => { es: "REINICIOS", en: "RESTARTS" },
+    mon_no_servers => {
+        es: "ningún servidor: el núcleo lleva todos sus dispositivos (arranca con udriver= para dejarle uno a un proceso)",
+        en: "no servers: the kernel drives all its devices (boot with udriver= to leave one to a process)",
+    },
+    mon_service_2 => { es: "servicio", en: "service" },
+    mon_program => { es: "programa", en: "program" },
+    mon_device_2 => { es: "dispositivo", en: "device" },
+    mon_gives_2 => { es: "da al sistema", en: "gives" },
+    mon_driver => { both: "driver" },
+    mon_restarts_by_init => { es: "reinicios (init)", en: "restarts (init)" },
+    mon_restarts_by_stack => { es: "reinicios (pila)", en: "restarts (stack)" },
+    /// `eth0 · 52:54:00:12:34:56`, when no interface has the card's MAC yet.
+    mon_no_interface_yet => { es: "sin interfaz todavía", en: "no interface yet" },
+    mon_no_disk_node => { es: "sin nodo de disco claro", en: "no clear disk node" },
+    /// A stack with an address of its own: the kernel has no interface for it.
+    mon_own_stack => { es: "pila propia", en: "own stack" },
+    /// The same, short, for the list: `pila 10.0.9.15/24`.
+    mon_stack => { es: "pila", en: "stack" },
+    mon_not_said_yet => { es: "aún no lo ha dicho", en: "not said yet" },
+    mon_footer_servers_keys => {
         es: "↑↓ elegir · I iniciar · R reiniciar · P parar (hasta el próximo arranque) · Tab procesos",
         en: "↑↓ pick · I start · R restart · P stop (until the next boot) · Tab processes",
     },

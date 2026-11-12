@@ -55,6 +55,7 @@ pub mod par;
 pub mod preview;
 pub mod proc;
 pub mod runhist;
+pub mod servers;
 pub mod sysinfo;
 pub mod vtext;
 pub mod wl;
