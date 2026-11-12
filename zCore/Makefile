@@ -519,7 +519,10 @@ endif
 # `UNET_NET=socket,udp=127.0.0.1:5700,localaddr=127.0.0.1:5701` every frame
 # the card sends is a datagram to port 5700 of this machine and every
 # datagram to port 5701 a frame it receives, which is what
-# `scripts/udp_ping.py` speaks.
+# `scripts/udp_ping.py` speaks. For TCP, QEMU's own is the other end: with
+# `UNET_NET=user,net=10.0.9.0/24,host=10.0.9.1,hostfwd=tcp:127.0.0.1:5800-10.0.9.15:7000`
+# a connection to port 5800 of this machine is one to port 7000 of the
+# guest, which is what `scripts/tcp_bench.py` makes.
 UNET_NET ?= user,net=10.0.3.0/24
 ifneq ($(UNET),)
   qemu_opts += -netdev $(UNET_NET),id=unet

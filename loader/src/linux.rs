@@ -588,24 +588,28 @@ pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 
-/// `eclipse_netstack_serve(channel, max_datagram)`: this process is a
-/// network stack, and `channel` is the end of a channel on which the kernel
-/// tells it what the sockets it serves do and takes what arrives for them
-/// ([`linux_object::net::user_stack`] has the messages). The handle needs
-/// `READ` and `WRITE` and goes to the kernel. `max_datagram` is the longest
-/// datagram the stack carries, from 1 to 65507 bytes: a longer one is
-/// `EMSGSIZE` to the program that sends it. One stack at a time:
-/// `ALREADY_BOUND` while another process serves one; when the process dies
-/// its sockets answer `ENETDOWN` and the next can be served.
+/// `eclipse_netstack_serve(channel, max_datagram, address)`: this process
+/// is a network stack, and `channel` is the end of a channel on which the
+/// kernel tells it what the sockets it serves do and takes what arrives for
+/// them ([`linux_object::net::user_stack`] has the messages). The handle
+/// needs `READ` and `WRITE` and goes to the kernel. `max_datagram` is the
+/// longest datagram the stack carries, from 1 to 65507 bytes: a longer one
+/// is `EMSGSIZE` to the program that sends it. `address` is the stack's
+/// IPv4 address, its four bytes in the order they are written as the bytes
+/// of a big-endian number (10.0.9.15 is 0x0a00090f), or 0 for a stack that
+/// does not say: what `getsockname` answers for a connection. One stack at
+/// a time: `ALREADY_BOUND` while another process serves one; when the
+/// process dies its sockets answer `ENETDOWN` and the next can be served.
 ///
-/// Which sockets: the IPv4 datagram sockets of the processes that asked
-/// for this stack with [`ECLIPSE_NETSTACK_USE`]. Every other socket is the
-/// kernel's, as before.
+/// Which sockets: the IPv4 datagram and stream sockets of the processes
+/// that asked for this stack with [`ECLIPSE_NETSTACK_USE`]. Every other
+/// socket is the kernel's, as before.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 
-/// `eclipse_netstack_use()`: from now on the IPv4 datagram sockets this
-/// process opens are those of the network stack that runs as a process
+/// `eclipse_netstack_use()`: from now on the IPv4 datagram and stream
+/// sockets this process opens are those of the network stack that runs as
+/// a process
 /// ([`ECLIPSE_NETSTACK_SERVE`]), not the kernel's. Inherited by `fork` and
 /// kept across `execve`: a program is given that stack by whatever starts
 /// it. A socket opened while no stack is served fails with `ENETDOWN`; the
@@ -622,7 +626,8 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let channel =
         proc.get_object_with_rights::<Channel>(args[0] as u32, Rights::READ | Rights::WRITE)?;
     let _ = proc.remove_handle(args[0] as u32);
-    let link = linux_object::net::user_stack::serve(channel, args[1])?;
+    let address = (args[2] as u32).to_be_bytes();
+    let link = linux_object::net::user_stack::serve(channel, args[1], address)?;
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them.
     kernel_hal::thread::spawn(async move {

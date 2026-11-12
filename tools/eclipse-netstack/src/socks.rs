@@ -24,6 +24,10 @@
 //! all the datagrams of a turn of the stack, for whichever sockets (its
 //! header's socket is zero): the kernel is woken once for them all.
 //!
+//! A stream socket is the same bargain with more to say, and [`tcp`] has
+//! it: the connection is a smoltcp socket here, and an `EVENTS` carries
+//! what a turn made of every connection.
+//!
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
 
@@ -32,8 +36,11 @@ use std::collections::BTreeMap;
 use smoltcp::iface::Interface;
 use smoltcp::phy::Device;
 use smoltcp::socket::{SocketHandle, SocketSet, UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+
+pub mod tcp;
+use tcp::{OP_CONNECT, OP_LISTEN, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 
 /// The operations of a message.
 pub const OP_BIND: u32 = 1;
@@ -64,15 +71,18 @@ const TX_DATAGRAMS: usize = 32;
 pub enum Refused {
     /// Too short, or an operation that is not one.
     Malformed,
-    /// A `BIND` for a socket that has a port, or to port 0.
+    /// A `BIND` for a socket that has a port, or to port 0; a `CONNECT`
+    /// or a `LISTEN` for a socket that is one already.
     Bind,
-    /// A `SEND` or `CLOSE` for a socket never bound.
+    /// A message for a socket there is none of: never bound, or a
+    /// connection that is over.
     NoSocket,
     /// A datagram longer than one frame carries.
     TooLong,
     /// A destination that is not on the card's network.
     Unreachable,
-    /// The socket has [`TX_DATAGRAMS`] waiting already.
+    /// The socket has [`TX_DATAGRAMS`] waiting already, or a `WRITE`
+    /// carries more than the connection was said to take.
     Full,
 }
 
@@ -107,11 +117,12 @@ pub fn push_record(m: &mut Vec<u8>, sock: u64, addr: [u8; 4], port: u16, data: &
 /// What [`Stack::arrived`] put in its message.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Arrived {
-    /// No datagram had arrived: there is no message to send.
+    /// Nothing had arrived: there is no message to send.
     Nothing,
-    /// Every datagram that had arrived.
+    /// Everything that had arrived.
     All,
-    /// As many as one message holds: there are more to ask for.
+    /// As much as one message holds, or all there was of one kind: there
+    /// is more to ask for.
     More,
 }
 
@@ -119,7 +130,11 @@ pub enum Arrived {
 pub struct Stack<D: for<'d> Device<'d>> {
     iface: Interface<'static, D>,
     set: SocketSet<'static>,
+    /// The datagram sockets.
     socks: BTreeMap<u64, SocketHandle>,
+    streams: tcp::Streams,
+    /// When the last [`poll`](Self::poll) was.
+    now: Instant,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -129,6 +144,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             iface,
             set: SocketSet::new(vec![]),
             socks: BTreeMap::new(),
+            streams: tcp::Streams::default(),
+            now: Instant::from_millis(0),
         }
     }
 
@@ -148,9 +165,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         self.iface.device().capabilities().ip_mtu() - HEADERS
     }
 
-    /// How many sockets the kernel has here.
+    /// How many datagram sockets the kernel has here.
     pub fn sockets(&self) -> usize {
         self.socks.len()
+    }
+
+    /// Whether `sock` is a socket here, of either kind.
+    fn knows(&self, sock: u64) -> bool {
+        self.socks.contains_key(&sock) || self.streams.knows(sock)
     }
 
     /// Whether `addr` can be sent to: it is on the card's network, or
@@ -166,15 +188,21 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             })
     }
 
-    /// Do what a message from the kernel says. `Ok(true)` when there is a
-    /// datagram to send, which the next [`poll`](Self::poll) does.
+    /// Do what a message from the kernel says. `Ok(true)` when that left
+    /// something to send or to tell the kernel, which the next
+    /// [`poll`](Self::poll) and [`arrived`](Self::arrived) do.
     pub fn request(&mut self, m: &[u8]) -> Result<bool, Refused> {
         let (op, sock) = parse_header(m).ok_or(Refused::Malformed)?;
         match op {
+            OP_CONNECT => self.connect(sock, m),
+            OP_LISTEN => self.listen(sock, m),
+            OP_WRITE => self.write(sock, m),
+            OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
+            OP_WINDOW => self.window(sock, m),
             OP_BIND => {
                 let port: [u8; 2] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
                 let port = u16::from_le_bytes(port);
-                if port == 0 || self.socks.contains_key(&sock) {
+                if port == 0 || self.knows(sock) {
                     return Err(Refused::Bind);
                 }
                 let room = self.max_datagram();
@@ -216,8 +244,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 // A socket closed before it had a port was never told here.
                 if let Some(handle) = self.socks.remove(&sock) {
                     self.set.remove(handle);
+                    return Ok(false);
                 }
-                Ok(false)
+                Ok(self.close_stream(sock).unwrap_or(false))
             }
             _ => Err(Refused::Malformed),
         }
@@ -227,15 +256,29 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// for a socket waits for [`arrived`](Self::arrived), which whoever
     /// polls calls next.
     pub fn poll(&mut self, now: Instant) {
+        self.now = now;
         // What poll has to say about a frame it did not understand is not
         // news.
         let _ = self.iface.poll(&mut self.set, now);
     }
 
+    /// Make `m` the next message for the kernel of what the last
+    /// [`poll`](Self::poll) brought: a `DATA` of the datagrams that
+    /// arrived, taken off their sockets, and once there are no more of
+    /// those an `EVENTS` of what became of the connections.
+    pub fn arrived(&mut self, m: &mut Vec<u8>) -> Arrived {
+        match self.datagrams(m) {
+            Arrived::Nothing => self.events(m),
+            // The connections have not been asked yet.
+            Arrived::All if !self.streams.is_empty() => Arrived::More,
+            arrived => arrived,
+        }
+    }
+
     /// Make `m` the `DATA` of the datagrams that arrived for the sockets,
     /// taking them off the sockets: all of them, or as many as fit one
     /// message.
-    pub fn arrived(&mut self, m: &mut Vec<u8>) -> Arrived {
+    fn datagrams(&mut self, m: &mut Vec<u8>) -> Arrived {
         start_data(m);
         for (&sock, &handle) in &self.socks {
             let mut socket = self.set.get::<UdpSocket>(handle);
@@ -258,10 +301,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         }
     }
 
-    /// Whether the stack has something to do that no frame will remind it
-    /// of: a datagram that waits for a neighbour to be asked again.
-    pub fn restless(&self, now: Instant) -> bool {
-        self.iface.poll_delay(&self.set, now).is_some()
+    /// How long until the stack has something to do that no frame and no
+    /// message will remind it of: a neighbour to ask again, a segment to
+    /// send again, a connection to give up on. `None` when there is
+    /// nothing of the kind.
+    pub fn idle_for(&self, now: Instant) -> Option<Duration> {
+        self.iface.poll_delay(&self.set, now)
     }
 }
 
@@ -496,7 +541,7 @@ mod tests {
             Err(Refused::Unreachable)
         );
         assert_eq!(stack.sockets(), 1);
-        assert!(!stack.restless(Instant::from_millis(1)));
+        assert_eq!(stack.idle_for(Instant::from_millis(1)), None);
         assert!(turn(stack.device()).is_empty());
     }
 
@@ -598,7 +643,7 @@ mod tests {
         window.done(stack.device(), &asked[0]);
         // The datagram is still to go: the stack must be polled again
         // without a frame to make it.
-        assert!(stack.restless(Instant::from_millis(1)));
+        assert!(stack.idle_for(Instant::from_millis(1)).is_some());
         // THEIRS answers, and the datagram follows.
         window.deliver(stack.device(), 0, &arp_reply());
         poll(&mut stack);
@@ -611,6 +656,6 @@ mod tests {
             udp_of(&window.sent(&sent[0])),
             (7000, 4000, b"wait".to_vec())
         );
-        assert!(!stack.restless(Instant::from_millis(2)));
+        assert_eq!(stack.idle_for(Instant::from_millis(2)), None);
     }
 }

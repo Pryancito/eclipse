@@ -433,6 +433,9 @@ jobs:
           # told to the kernel, a send leaves by the card, and the messages
           # are laid out as `linux-object/src/net/user_stack.rs` lays them
           # out (whose own tests, in the linux-object job, say the same).
+          # And the TCP ones, against a peer that says its segments by
+          # hand: a connect and a listener's connections, the bytes each
+          # side said it takes and no more, a reset, both ways of closing.
           cargo test --manifest-path tools/eclipse-netstack/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
