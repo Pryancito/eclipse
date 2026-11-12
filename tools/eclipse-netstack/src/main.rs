@@ -11,22 +11,22 @@
 //!
 //! The kernel has no interface for this card. The stack answers for its
 //! address by itself (ARP, ICMP echo), and serves the kernel the datagram
-//! sockets of the programs that asked for this stack
+//! and stream sockets of the programs that asked for this stack
 //! (`eclipse_netstack_serve`; `netstack::socks` has what the two say to
 //! each other). On a kernel that has no such call it answers for its
 //! address and nothing else.
 //!
 //! Three threads share the stack, under one lock. The card's takes what
-//! the driver says, a turn in one system call, and sends the kernel the
-//! datagrams that arrived, all in one message. The sockets' takes what
-//! the kernel says, every message that is waiting, and tells the driver of
-//! the frames that made, all in one write. The third wakes once a second
-//! for what no message brings about: asking again for a neighbour that did
-//! not answer.
+//! the driver says, a turn in one system call, and sends the kernel what
+//! arrived, all in one message. The sockets' takes what the kernel says,
+//! every message that is waiting, and tells the driver of the frames that
+//! made, all in one write. The third sleeps until the stack has something
+//! to do that no message brings about: asking again for a neighbour that
+//! did not answer, sending again a segment nobody acknowledged.
 //!
-//! One message for many datagrams is what keeps this from costing a
-//! change of process for each: whoever is woken runs at once, so a wake
-//! for every datagram is a datagram at a time through four processes.
+//! One message for all that arrived is what keeps this from costing a
+//! change of process for each datagram or segment: whoever is woken runs
+//! at once, so a wake for each is one at a time through four processes.
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the driver
 //! cannot be started or gives no card.
@@ -40,7 +40,7 @@ use netstack::port::Port;
 use netstack::socks::{Arrived, Stack, MESSAGE_MAX};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
 use udrivers::fifo::Fifo;
 use udrivers::net::{Msg, Offer, BUF_SIZE};
@@ -315,16 +315,26 @@ fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
     }
 }
 
-/// Once a second, do what the stack has pending that no frame and no
+/// The longest the clock's thread sleeps: what was not pending when it
+/// went to sleep is at most this late.
+const TICK_MAX: Duration = Duration::from_secs(1);
+/// The shortest: a stack that always has something due does not spin.
+const TICK_MIN: Duration = Duration::from_millis(1);
+
+/// When it is due, do what the stack has pending that no frame and no
 /// message will make it do.
 fn keep_time(shared: Lock, kernel: Option<Arc<Kernel>>) {
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        let idle = locked(&shared).stack.idle_for(now());
+        let nap = idle.map_or(TICK_MAX, |d| Duration::from_micros(d.total_micros()));
+        std::thread::sleep(nap.clamp(TICK_MIN, TICK_MAX));
         {
             let guard = locked(&shared);
-            if !guard.stack.restless(now()) {
+            // Another thread's turn may have done it meanwhile, or put it
+            // off: an acknowledgement that arrived, say.
+            if guard.stack.idle_for(now()) != Some(smoltcp::time::Duration::ZERO) {
                 continue;
             }
             turn(guard, kernel.as_deref(), &mut data);
@@ -335,14 +345,21 @@ fn keep_time(shared: Lock, kernel: Option<Arc<Kernel>>) {
 
 /// Become the stack the kernel's served sockets use: the channel it will
 /// speak on, or why there is none.
-fn register(max_datagram: usize) -> Result<Arc<Kernel>, String> {
+fn register(max_datagram: usize, address: Ipv4Address) -> Result<Arc<Kernel>, String> {
     let (ours, theirs) = Channel::create().map_err(|e| format!("channel_create: {e}"))?;
     let theirs = theirs.into_handle();
     // SAFETY: no pointers. The handle is the kernel's when the call works.
     let served = unsafe {
         zx::call(
             nr::ECLIPSE_NETSTACK_SERVE,
-            [theirs as usize, max_datagram, 0, 0, 0, 0],
+            [
+                theirs as usize,
+                max_datagram,
+                u32::from_be_bytes(address.0) as usize,
+                0,
+                0,
+                0,
+            ],
         )
     };
     match served {
@@ -382,7 +399,7 @@ fn main() {
         .ip_addrs(vec![IpCidr::Ipv4(addr)])
         .finalize();
     let stack = Stack::new(iface);
-    let kernel: Option<Arc<Kernel>> = match register(stack.max_datagram()) {
+    let kernel: Option<Arc<Kernel>> = match register(stack.max_datagram(), addr.address()) {
         Ok(kernel) => Some(kernel),
         Err(why) => {
             println!("{NAME}: no sockets, only the address: {why}");

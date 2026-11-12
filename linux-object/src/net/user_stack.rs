@@ -37,7 +37,40 @@
 //! what they receive, as a card's driver can; a message it sends that names
 //! no socket, or is no message, is dropped.
 //!
-//! IPv4 datagram sockets only, so far.
+//! A stream socket ([`ServedTcpSocket`], in `tcp`) is the same bargain: the
+//! connection is the stack's, a smoltcp socket there, and what the program
+//! has read from and may write to is counted here, so `read`, `write` and
+//! `poll` answer without a trip:
+//!
+//! ```text
+//! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window
+//! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
+//! WRITE    (kernel to stack)  16  the bytes
+//! SHUTDOWN (kernel to stack)
+//! WINDOW   (kernel to stack)  16  u32 bytes
+//! EVENTS   (stack to kernel)  16  one record after another, to the end:
+//!              0  u64 socket  8  u16 what  10  u16 length  12  u32 number  16  `length` bytes
+//!     CONNECTED  number: the bytes the stack takes
+//!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
+//!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
+//!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
+//!     BYTES      bytes: what arrived
+//!     EOF        the peer will send no more
+//!     CREDIT     number: more bytes the stack takes
+//! ```
+//!
+//! Bytes are counted both ways, so neither side holds more than it said
+//! it would. The stack says how many bytes it takes (`CONNECTED`,
+//! `ACCEPTED`, then `CREDIT` as the peer acknowledges them) and a `WRITE`
+//! never carries more: a program that writes faster than the peer reads
+//! finds its socket not writable. The kernel says how many bytes it
+//! takes (`window`, then `WINDOW` as the program reads them) and the
+//! stack sends no more `BYTES` than that: a program that does not read
+//! closes the peer's window, as it should. A connection that arrives on
+//! a listener is numbered by the stack, with [`ACCEPTED_BIT`] set, so its
+//! numbers never meet the kernel's.
+//!
+//! IPv4 only, so far.
 
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
@@ -58,11 +91,49 @@ use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
+mod tcp;
+pub use tcp::ServedTcpSocket;
+
 /// The operations of a message.
 pub const OP_BIND: u32 = 1;
 pub const OP_SEND: u32 = 2;
 pub const OP_CLOSE: u32 = 3;
 pub const OP_DATA: u32 = 4;
+pub const OP_CONNECT: u32 = 5;
+pub const OP_LISTEN: u32 = 6;
+pub const OP_WRITE: u32 = 7;
+pub const OP_SHUTDOWN: u32 = 8;
+pub const OP_WINDOW: u32 = 9;
+pub const OP_EVENTS: u32 = 10;
+
+/// What a record of an `EVENTS` says.
+pub const EV_CONNECTED: u16 = 1;
+pub const EV_FAILED: u16 = 2;
+pub const EV_ACCEPTED: u16 = 3;
+pub const EV_BYTES: u16 = 4;
+pub const EV_EOF: u16 = 5;
+pub const EV_CREDIT: u16 = 6;
+
+/// Why a connection `FAILED`.
+pub const WHY_REFUSED: u32 = 1;
+pub const WHY_TIMED_OUT: u32 = 2;
+pub const WHY_RESET: u32 = 3;
+pub const WHY_UNREACHABLE: u32 = 4;
+pub const WHY_NO_ROOM: u32 = 5;
+
+/// Set in the number of a socket the stack numbered: a connection that
+/// arrived on a listener.
+pub const ACCEPTED_BIT: u64 = 1 << 63;
+/// The bytes of an `ACCEPTED` record.
+pub const ACCEPTED_LEN: usize = 16;
+/// The bytes of a stream the kernel holds unread: what `CONNECT` and
+/// `LISTEN` say as their window.
+pub const STREAM_WINDOW: usize = 256 * 1024;
+/// The most bytes of one `WRITE`: what fits a channel message.
+pub const WRITE_MAX: usize = 65536 - HEADER_LEN;
+/// The connections a listener asks the stack to have ready to take. The
+/// `Socket` trait does not carry what `listen(2)` was told.
+pub const LISTEN_BACKLOG: u16 = 8;
 
 /// What every message starts with.
 pub const HEADER_LEN: usize = 16;
@@ -171,6 +242,93 @@ pub fn parse_record(records: &[u8]) -> Option<(Record<'_>, &[u8])> {
     Some(((sock, addr, port, &rest[..len]), &rest[len..]))
 }
 
+/// `CONNECT`: socket `sock`, from port `local`, to `addr:port`; the kernel
+/// takes `window` bytes of what arrives.
+pub fn connect_message(sock: u64, addr: [u8; 4], port: u16, local: u16, window: u32) -> Vec<u8> {
+    let mut m = header(OP_CONNECT, sock, 12);
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&local.to_le_bytes());
+    m.extend_from_slice(&window.to_le_bytes());
+    m
+}
+
+/// `LISTEN`: socket `sock` takes connections to `port`, `backlog` of them
+/// ready at a time, and `window` bytes of what arrives on each.
+pub fn listen_message(sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
+    let mut m = header(OP_LISTEN, sock, 8);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&backlog.to_le_bytes());
+    m.extend_from_slice(&window.to_le_bytes());
+    m
+}
+
+/// `WRITE`: `data` for the peer of socket `sock`.
+pub fn write_message(sock: u64, data: &[u8]) -> Vec<u8> {
+    debug_assert!(data.len() <= WRITE_MAX);
+    let mut m = header(OP_WRITE, sock, data.len());
+    m.extend_from_slice(data);
+    m
+}
+
+/// `SHUTDOWN`: socket `sock` will write no more.
+pub fn shutdown_message(sock: u64) -> Vec<u8> {
+    header(OP_SHUTDOWN, sock, 0)
+}
+
+/// `WINDOW`: the kernel takes `bytes` more for socket `sock`.
+pub fn window_message(sock: u64, bytes: u32) -> Vec<u8> {
+    let mut m = header(OP_WINDOW, sock, 4);
+    m.extend_from_slice(&bytes.to_le_bytes());
+    m
+}
+
+/// An `EVENTS` with no records yet.
+pub fn events_message() -> Vec<u8> {
+    header(OP_EVENTS, 0, 0)
+}
+
+/// Add a record to the `EVENTS` message `m`.
+pub fn push_event(m: &mut Vec<u8>, sock: u64, what: u16, number: u32, bytes: &[u8]) {
+    debug_assert!(bytes.len() <= u16::MAX as usize);
+    m.extend_from_slice(&sock.to_le_bytes());
+    m.extend_from_slice(&what.to_le_bytes());
+    m.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    m.extend_from_slice(&number.to_le_bytes());
+    m.extend_from_slice(bytes);
+}
+
+/// The bytes of an `ACCEPTED`: the new socket `sock`, connected from
+/// `addr:port`.
+pub fn accepted_bytes(sock: u64, addr: [u8; 4], port: u16) -> [u8; ACCEPTED_LEN] {
+    let mut b = [0u8; ACCEPTED_LEN];
+    b[..8].copy_from_slice(&sock.to_le_bytes());
+    b[8..12].copy_from_slice(&addr);
+    b[12..14].copy_from_slice(&port.to_le_bytes());
+    b
+}
+
+/// One record of an `EVENTS`: its socket, what it says, its number and
+/// its bytes.
+pub type EventRecord<'a> = (u64, u16, u32, &'a [u8]);
+
+/// The first record of `records`, the rest of an `EVENTS` message, and
+/// what follows it. `None` when what is there is not a whole record.
+pub fn parse_event(records: &[u8]) -> Option<(EventRecord<'_>, &[u8])> {
+    if records.len() < RECORD_LEN {
+        return None;
+    }
+    let sock = u64::from_le_bytes(records[..8].try_into().ok()?);
+    let what = u16::from_le_bytes(records[8..10].try_into().ok()?);
+    let len = u16::from_le_bytes(records[10..12].try_into().ok()?) as usize;
+    let number = u32::from_le_bytes(records[12..16].try_into().ok()?);
+    let rest = &records[RECORD_LEN..];
+    if len > rest.len() {
+        return None;
+    }
+    Some(((sock, what, number, &rest[..len]), &rest[len..]))
+}
+
 /// What a socket shares with the stack's link: where datagrams are queued
 /// and what says so.
 struct Shared {
@@ -223,12 +381,60 @@ impl Shared {
     }
 }
 
+/// The ports of one protocol: which are taken, and where the search for
+/// a free one starts.
+struct Ports {
+    taken: BTreeSet<u16>,
+    next: u16,
+}
+
+impl Default for Ports {
+    fn default() -> Self {
+        Ports {
+            taken: BTreeSet::new(),
+            next: *EPHEMERAL.start(),
+        }
+    }
+}
+
+impl Ports {
+    /// Take the port `wanted`, or any when it is 0. `EADDRINUSE` when
+    /// another socket has it or none is left.
+    fn take(&mut self, wanted: u16) -> LxResult<u16> {
+        if wanted != 0 {
+            if !self.taken.insert(wanted) {
+                return Err(LxError::EADDRINUSE);
+            }
+            return Ok(wanted);
+        }
+        let span = EPHEMERAL.len() as u32;
+        let first = self.next;
+        let port = (0..span)
+            .map(|i| {
+                let at = (first - EPHEMERAL.start()) as u32 + i;
+                EPHEMERAL.start() + (at % span) as u16
+            })
+            .find(|p| !self.taken.contains(p))
+            .ok_or(LxError::EADDRINUSE)?;
+        self.taken.insert(port);
+        self.next = if port == *EPHEMERAL.end() {
+            *EPHEMERAL.start()
+        } else {
+            port + 1
+        };
+        Ok(port)
+    }
+}
+
 #[derive(Default)]
 struct Table {
     socks: BTreeMap<u64, Weak<Shared>>,
-    ports: BTreeSet<u16>,
+    /// The stream sockets, the kernel's and the ones the stack numbered.
+    streams: BTreeMap<u64, Weak<tcp::Stream>>,
+    ports: Ports,
+    /// TCP's ports, which are not UDP's.
+    stream_ports: Ports,
     next_sock: u64,
-    next_port: u16,
 }
 
 /// The kernel's end of a stack that runs as a process.
@@ -237,6 +443,9 @@ pub struct StackLink {
     /// The longest datagram the stack carries: what fits one frame of its
     /// card, for a stack that does not fragment.
     max_datagram: usize,
+    /// The stack's address, which is the local address of every
+    /// connection: unspecified when the stack did not say.
+    address: Ipv4Address,
     table: Mutex<Table>,
     dead: AtomicBool,
 }
@@ -246,8 +455,14 @@ static STACK: Mutex<Option<Arc<StackLink>>> = Mutex::new(None);
 
 /// A process serves a stack on `channel`, the kernel's end, that carries
 /// datagrams of up to `max_datagram` bytes: a longer one is `EMSGSIZE` to
-/// who sends it. `ALREADY_BOUND` while another process serves one.
-pub fn serve(channel: Arc<Channel>, max_datagram: usize) -> ZxResult<Arc<StackLink>> {
+/// who sends it. `address` is the stack's own, which a connected socket
+/// answers `getsockname` with. `ALREADY_BOUND` while another process
+/// serves one.
+pub fn serve(
+    channel: Arc<Channel>,
+    max_datagram: usize,
+    address: [u8; 4],
+) -> ZxResult<Arc<StackLink>> {
     if !(1..=MAX_DATAGRAM).contains(&max_datagram) {
         return Err(ZxError::INVALID_ARGS);
     }
@@ -263,10 +478,8 @@ pub fn serve(channel: Arc<Channel>, max_datagram: usize) -> ZxResult<Arc<StackLi
     let link = Arc::new(StackLink {
         channel,
         max_datagram,
-        table: Mutex::new(Table {
-            next_port: *EPHEMERAL.start(),
-            ..Table::default()
-        }),
+        address: Ipv4Address(address),
+        table: Mutex::new(Table::default()),
         dead: AtomicBool::new(false),
     });
     *stack = Some(link.clone());
@@ -302,14 +515,31 @@ impl StackLink {
     }
 
     fn take(&self, m: &[u8]) {
-        let Some((OP_DATA, _)) = parse_header(m) else {
-            warn!(
+        match parse_header(m) {
+            Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
+            Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
+            _ => warn!(
                 "user stack: a message that means nothing ({} bytes)",
                 m.len()
-            );
-            return;
-        };
-        let mut records = &m[HEADER_LEN..];
+            ),
+        }
+    }
+
+    fn take_events(&self, mut records: &[u8]) {
+        while !records.is_empty() {
+            let Some(((sock, what, number, bytes), rest)) = parse_event(records) else {
+                warn!(
+                    "user stack: {} bytes that are no record of an event",
+                    records.len()
+                );
+                return;
+            };
+            records = rest;
+            self.event(sock, what, number, bytes);
+        }
+    }
+
+    fn take_datagrams(&self, mut records: &[u8]) {
         while !records.is_empty() {
             let Some(((sock, addr, port, data), rest)) = parse_record(records) else {
                 warn!(
@@ -336,9 +566,18 @@ impl StackLink {
             return;
         }
         warn!("user stack: the process is gone");
-        let socks: Vec<Weak<Shared>> = self.table.lock().socks.values().cloned().collect();
+        let (socks, streams): (Vec<Weak<Shared>>, Vec<Weak<tcp::Stream>>) = {
+            let table = self.table.lock();
+            (
+                table.socks.values().cloned().collect(),
+                table.streams.values().cloned().collect(),
+            )
+        };
         for shared in socks.iter().filter_map(Weak::upgrade) {
             shared.wake();
+        }
+        for stream in streams.iter().filter_map(Weak::upgrade) {
+            stream.wake();
         }
     }
 
@@ -364,36 +603,9 @@ impl StackLink {
     /// Give a socket the port `wanted`, or any when it is 0, and tell the
     /// stack. `EADDRINUSE` when another has it or none is left.
     fn bind(&self, sock: u64, wanted: u16) -> LxResult<u16> {
-        let port = {
-            let mut table = self.table.lock();
-            let port = if wanted != 0 {
-                if table.ports.contains(&wanted) {
-                    return Err(LxError::EADDRINUSE);
-                }
-                wanted
-            } else {
-                let span = EPHEMERAL.len() as u32;
-                let first = table.next_port;
-                (0..span)
-                    .map(|i| {
-                        let at = (first - EPHEMERAL.start()) as u32 + i;
-                        EPHEMERAL.start() + (at % span) as u16
-                    })
-                    .find(|p| !table.ports.contains(p))
-                    .ok_or(LxError::EADDRINUSE)?
-            };
-            table.ports.insert(port);
-            if wanted == 0 {
-                table.next_port = if port == *EPHEMERAL.end() {
-                    *EPHEMERAL.start()
-                } else {
-                    port + 1
-                };
-            }
-            port
-        };
+        let port = self.table.lock().ports.take(wanted)?;
         if let Err(e) = self.tell(bind_message(sock, port), true) {
-            self.table.lock().ports.remove(&port);
+            self.table.lock().ports.taken.remove(&port);
             return Err(e);
         }
         Ok(port)
@@ -406,7 +618,7 @@ impl StackLink {
             let mut table = self.table.lock();
             table.socks.remove(&sock);
             if let Some(port) = port {
-                table.ports.remove(&port);
+                table.ports.taken.remove(&port);
             }
         }
         let _ = self.tell(close_message(sock), true);
@@ -744,14 +956,14 @@ mod tests {
     use crate::net::NET_TEST_LOCK as LOCK;
 
     /// The process's end of the channel.
-    struct Stack {
-        link: Arc<StackLink>,
-        end: Arc<Channel>,
+    pub(super) struct Stack {
+        pub(super) link: Arc<StackLink>,
+        pub(super) end: Arc<Channel>,
     }
 
-    fn stack() -> Stack {
+    pub(super) fn stack() -> Stack {
         let (kernel, end) = Channel::create();
-        let link = serve(kernel, MAX_FOR_TESTS).expect("the stack before is gone");
+        let link = serve(kernel, MAX_FOR_TESTS, STACK_ADDR).expect("the stack before is gone");
         Stack { link, end }
     }
 
@@ -763,7 +975,7 @@ mod tests {
         }
 
         /// The next message the kernel sent, if it sent one.
-        fn told(&self) -> Option<Vec<u8>> {
+        pub(super) fn told(&self) -> Option<Vec<u8>> {
             self.end.read().ok().map(|m| m.data)
         }
 
@@ -774,7 +986,7 @@ mod tests {
             self.say(m);
         }
 
-        fn say(&self, data: Vec<u8>) {
+        pub(super) fn say(&self, data: Vec<u8>) {
             let msg = MessagePacket {
                 data,
                 handles: Vec::new(),
@@ -784,14 +996,14 @@ mod tests {
         }
     }
 
-    fn any(port: u16) -> Endpoint {
+    pub(super) fn any(port: u16) -> Endpoint {
         Endpoint::Ip(IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
             port,
         ))
     }
 
-    fn at(addr: [u8; 4], port: u16) -> IpEndpoint {
+    pub(super) fn at(addr: [u8; 4], port: u16) -> IpEndpoint {
         IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port)
     }
 
@@ -800,7 +1012,7 @@ mod tests {
         Some(Endpoint::Ip(at(addr, port)))
     }
 
-    fn ip(endpoint: Endpoint) -> IpEndpoint {
+    pub(super) fn ip(endpoint: Endpoint) -> IpEndpoint {
         match endpoint {
             Endpoint::Ip(ip) => ip,
             _ => panic!("not an IP endpoint"),
@@ -826,7 +1038,9 @@ mod tests {
         Socket::poll(s, PollEvents::IN).0
     }
 
-    const HOST: [u8; 4] = [10, 0, 9, 1];
+    pub(super) const HOST: [u8; 4] = [10, 0, 9, 1];
+    /// The address the stack of the tests says it has.
+    pub(super) const STACK_ADDR: [u8; 4] = [10, 0, 9, 15];
     /// What a stack over Ethernet carries: a frame's 1500 bytes less the
     /// IP and UDP headers.
     const MAX_FOR_TESTS: usize = 1472;
@@ -980,7 +1194,7 @@ mod tests {
         assert_eq!(Socket::bind(&a, any(0)), Ok(0));
         assert_eq!(port(&a), first + 1);
         // From the last of the range the next is the first one free.
-        stack.link.table.lock().next_port = *EPHEMERAL.end();
+        stack.link.table.lock().ports.next = *EPHEMERAL.end();
         let b = stack.socket();
         let c = stack.socket();
         assert_eq!(Socket::bind(&b, any(0)), Ok(0));
@@ -1164,13 +1378,16 @@ mod tests {
         // One stack at a time.
         let (other, _other_end) = Channel::create();
         assert_eq!(
-            serve(other, MAX_FOR_TESTS).err(),
+            serve(other, MAX_FOR_TESTS, STACK_ADDR).err(),
             Some(ZxError::ALREADY_BOUND)
         );
         // And one that carries nothing, or more than UDP does, is none.
         for bad in [0, MAX_DATAGRAM + 1] {
             let (other, _other_end) = Channel::create();
-            assert_eq!(serve(other, bad).err(), Some(ZxError::INVALID_ARGS));
+            assert_eq!(
+                serve(other, bad, STACK_ADDR).err(),
+                Some(ZxError::INVALID_ARGS)
+            );
         }
         assert!(current().is_some());
 
@@ -1194,7 +1411,7 @@ mod tests {
         assert_eq!(Socket::write(&a, b"x", to(HOST, 9)), Err(LxError::ENETDOWN));
         assert_eq!(Socket::bind(&a, any(7000)), Err(LxError::ENETDOWN));
         // The port a refused bind took is not kept.
-        assert!(link.table.lock().ports.is_empty());
+        assert!(link.table.lock().ports.taken.is_empty());
 
         // The next stack is served, and the old socket is not its.
         let next = self::stack();

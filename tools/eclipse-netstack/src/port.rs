@@ -266,7 +266,7 @@ pub(crate) mod testing {
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
         EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
+        Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
     };
     use std::collections::BTreeMap;
 
@@ -508,6 +508,80 @@ pub(crate) mod testing {
                 &ChecksumCapabilities::default(),
             )
         })
+    }
+
+    /// A TCP segment: its ports, what it does, its numbers and what it
+    /// carries.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Segment {
+        pub from: u16,
+        pub to: u16,
+        pub control: TcpControl,
+        pub seq: u32,
+        pub ack: Option<u32>,
+        pub data: Vec<u8>,
+    }
+
+    impl Segment {
+        /// The sequence number after this segment.
+        pub fn end(&self) -> u32 {
+            let flag = matches!(self.control, TcpControl::Syn | TcpControl::Fin) as u32;
+            self.seq
+                .wrapping_add(self.data.len() as u32)
+                .wrapping_add(flag)
+        }
+    }
+
+    /// The frame of a TCP segment from THEIRS to us, with a window of
+    /// 65535 bytes.
+    pub fn tcp_frame(segment: &Segment) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port: segment.from,
+            dst_port: segment.to,
+            control: segment.control,
+            seq_number: TcpSeqNumber(segment.seq as i32),
+            ack_number: segment.ack.map(|ack| TcpSeqNumber(ack as i32)),
+            window_len: u16::MAX,
+            window_scale: None,
+            max_seg_size: (segment.control == TcpControl::Syn).then_some(1460),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            payload: &segment.data,
+        };
+        ipv4_frame(OUR_IP, IpProtocol::Tcp, tcp.buffer_len(), |payload| {
+            tcp.emit(
+                &mut TcpPacket::new_unchecked(payload),
+                &THEIR_IP.into(),
+                &OUR_IP.into(),
+                &ChecksumCapabilities::default(),
+            )
+        })
+    }
+
+    /// The TCP segment `frame` carries from us to THEIRS, when its
+    /// checksums hold.
+    pub fn tcp_of(frame: &[u8]) -> Segment {
+        let ip = ipv4_of(frame);
+        let ip = Ipv4Packet::new_checked(&ip[..]).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.protocol(), IpProtocol::Tcp);
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (OUR_IP, THEIR_IP));
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let tcp = TcpRepr::parse(
+            &tcp,
+            &OUR_IP.into(),
+            &THEIR_IP.into(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        Segment {
+            from: tcp.src_port,
+            to: tcp.dst_port,
+            control: tcp.control,
+            seq: tcp.seq_number.0 as u32,
+            ack: tcp.ack_number.map(|ack| ack.0 as u32),
+            data: tcp.payload.to_vec(),
+        }
     }
 
     /// The IPv4 packet `frame` carries from us to THEIRS.

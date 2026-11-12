@@ -18,7 +18,7 @@ path = "src/lib.rs"
 name = "eclipse-netstack"
 path = "src/main.rs"
 
-# Runs a program with its datagram sockets on this stack.
+# Runs a program with its sockets on this stack.
 [[bin]]
 name = "eclipse-netstack-use"
 path = "src/bin/eclipse-netstack-use.rs"
@@ -27,6 +27,11 @@ path = "src/bin/eclipse-netstack-use.rs"
 [[bin]]
 name = "eclipse-udp-echo"
 path = "src/bin/eclipse-udp-echo.rs"
+
+# A test program: a TCP echo server, likewise.
+[[bin]]
+name = "eclipse-tcp-echo"
+path = "src/bin/eclipse-tcp-echo.rs"
 
 [dependencies]
 libc = "0.2"

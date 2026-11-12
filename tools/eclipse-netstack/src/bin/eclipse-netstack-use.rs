@@ -2,8 +2,8 @@
 //! stack that runs as a process.
 //!
 //! Which stack a program's sockets are is not the program's business: it
-//! is decided by whatever starts it. This asks the kernel that the
-//! datagram sockets of this process be those of `eclipse-netstack`
+//! is decided by whatever starts it. This asks the kernel that the IPv4
+//! datagram and stream sockets of this process be those of `eclipse-netstack`
 //! (`eclipse_netstack_use`), which `fork` and `execve` carry on, and
 //! becomes the program. The program opens its sockets as it always did.
 //!

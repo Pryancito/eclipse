@@ -30,10 +30,15 @@ fn scm_rights_cloexec(flags: usize) -> bool {
 }
 
 /// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
-/// peer buffer) and UDP (smoltcp's transmit ring). TCP waits on its own.
+/// peer buffer), UDP (smoltcp's transmit ring) and a stream socket of the
+/// stack that runs as a process (what that stack still takes). The
+/// kernel's TCP waits on its own.
 pub(crate) fn queue_is_bounded(file_like: &Arc<dyn FileLike>) -> bool {
     file_like.downcast_ref::<UnixSocketState>().is_some()
         || file_like.downcast_ref::<UdpSocketState>().is_some()
+        || file_like
+            .downcast_ref::<linux_object::net::user_stack::ServedTcpSocket>()
+            .is_some()
 }
 
 /// How a `send`-family call treats the two things its flags decide.
@@ -446,6 +451,17 @@ impl Syscall<'_> {
         );
 
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
+            // A process that asked for the stack that runs as a process
+            // gets its IPv4 sockets from it, or none while there is no
+            // such stack: never the kernel's behind its back.
+            (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP))
+                if self.linux_process().uses_user_netstack() =>
+            {
+                use linux_object::net::user_stack;
+                let link = user_stack::current().ok_or(LxError::ENETDOWN)?;
+                Arc::new(user_stack::ServedTcpSocket::new(link)?)
+            }
             (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
                 Arc::new(TcpSocketState::new(false)?)
@@ -454,9 +470,7 @@ impl Syscall<'_> {
             | (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
                 Arc::new(TcpSocketState::new(true)?)
             }
-            // A process that asked for the stack that runs as a process
-            // gets its datagram sockets from it, or none while there is no
-            // such stack: never the kernel's behind its back.
+            // The same for its datagram sockets.
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP))
                 if self.linux_process().uses_user_netstack() =>
