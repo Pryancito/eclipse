@@ -13,8 +13,9 @@
 //! `udrv-virtio-net` for a virtio network card. The C programs in
 //! `tools/zx-virtio-blk` and `tools/zx-virtio-net` are the tools that check
 //! and time a driver; each also carries a driver of its own (`service`),
-//! which is what a service falls back to in an image whose Rust build
-//! failed.
+//! which its tests start to compare against (`bench ... c`) and which no
+//! boot service runs: an image whose Rust build failed has no driver for
+//! a device left to userspace, and the service's wrapper says so.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,11 +63,10 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # left alone (udriver=virtio-net@0), in the foreground for\n\
           # eclipse-init, which starts it again if it dies. The kernel keeps\n\
           # the interface meanwhile. See tools/eclipse-udrivers.\n\
-          [ -x /bin/udrv-virtio-net ] && exec /bin/udrv-virtio-net 0\n\
-          # An image whose Rust build failed: the C tool carries a driver too.\n\
-          echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image, trying zx-virtio-net' >&2\n\
-          [ -x /bin/zx-virtio-net ] || { echo 'eclipse-unet: /bin/zx-virtio-net is not in this image either' >&2; sleep 5; exit 127; }\n\
-          exec /bin/zx-virtio-net service 0\n",
+          # The driver is the Rust one and only that one: the C tool's own\n\
+          # driver is for checking and timing, never the system's.\n\
+          [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-virtio-net 0\n",
     )
     .unwrap();
 
@@ -94,11 +94,10 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # Which disk: the first virtio-blk@N in the kernel's udriver= list.\n\
           n=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^udriver=//p' | tr ',' '\\n' | sed -n 's/^virtio-blk@//p' | head -n 1)\n\
           [ -n \"$n\" ] || { echo 'eclipse-ublk: no virtio-blk@N in udriver= on the kernel command line' >&2; sleep 5; exit 1; }\n\
-          [ -x /bin/udrv-virtio-blk ] && exec /bin/udrv-virtio-blk \"$n\"\n\
-          # An image whose Rust build failed: the C tool carries a driver too.\n\
-          echo 'eclipse-ublk: /bin/udrv-virtio-blk is not in this image, trying zx-virtio-blk' >&2\n\
-          [ -x /bin/zx-virtio-blk ] || { echo 'eclipse-ublk: /bin/zx-virtio-blk is not in this image either' >&2; sleep 5; exit 127; }\n\
-          exec /bin/zx-virtio-blk service \"$n\"\n",
+          # The driver is the Rust one and only that one: the C tool's own\n\
+          # driver is for checking and timing, never the system's.\n\
+          [ -x /bin/udrv-virtio-blk ] || { echo 'eclipse-ublk: /bin/udrv-virtio-blk is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-virtio-blk \"$n\"\n",
     )
     .unwrap();
 

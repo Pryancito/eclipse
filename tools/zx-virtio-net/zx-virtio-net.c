@@ -30,7 +30,9 @@
 //
 // The driver as what it is for: the card goes to the kernel and the
 // process carries its frames until it is killed, checking nothing. This is
-// what a supervisor runs (eclipse-init, `type = respawn`). When it dies
+// how a supervisor runs a driver; the system's own service runs the Rust
+// one (tools/eclipse-udrivers), and this one is what `restart ... c` and
+// `bench ... c` start, to compare against. When it dies
 // the kernel resets the card and keeps the interface for ten seconds, with
 // its addresses and the connections through it; the next `service` gets
 // the same card and the same interface, and what was waiting goes out.
@@ -950,8 +952,8 @@ static zx_handle_t card_up(long index, int exporting, int patient) {
 
 // The driver as a service: the card goes to the kernel and this process
 // carries its frames until it is killed. Whoever started it starts it
-// again if it dies (eclipse-init, with `type = respawn`), and the kernel
-// gives the next one the same card and the same interface. `report` >= 0
+// again if it dies, and the kernel gives the next one the same card and
+// the same interface. `report` >= 0
 // is a pipe that is told the card's address once it is up.
 static int service(long index, int report) {
     tx_irq = 1;

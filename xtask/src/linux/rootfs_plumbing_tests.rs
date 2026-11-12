@@ -948,11 +948,12 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         unet.contains("exec /bin/udrv-virtio-net 0"),
         "the wrapper no longer runs the driver of card 0 as a service:\n{unet}"
     );
-    // The Rust driver first; the C tool's only where that one is missing.
-    let unet_at = |what: &str| unet.find(what).unwrap_or(usize::MAX);
+    // The Rust driver and no other: the C tool's own driver is for its
+    // tests, and a service that ran it would be a system on a driver nobody
+    // meant to ship.
     assert!(
-        unet_at("exec /bin/udrv-virtio-net") < unet_at("exec /bin/zx-virtio-net service 0"),
-        "the card's wrapper no longer prefers the Rust driver:\n{unet}"
+        !unet.contains("zx-virtio-net"),
+        "the card's wrapper runs the C tool again:\n{unet}"
     );
     // The disk: any, by kind, and the wrapper takes the number from where
     // the kernel took it.
@@ -964,12 +965,24 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
             && ublk.contains("exec /bin/udrv-virtio-blk \"$n\""),
         "the wrapper no longer runs the driver of the disk the kernel left:\n{ublk}"
     );
-    // The Rust driver first; the C tool's only where that one is missing.
-    let at = |what: &str| ublk.find(what).unwrap_or(usize::MAX);
     assert!(
-        at("exec /bin/udrv-virtio-blk") < at("exec /bin/zx-virtio-blk service \"$n\""),
-        "the disk's wrapper no longer prefers the Rust driver:\n{ublk}"
+        !ublk.contains("zx-virtio-blk"),
+        "the disk's wrapper runs the C tool again:\n{ublk}"
     );
+    // A missing driver is said, with where to look, and is not a spin: the
+    // wrapper sleeps before it gives init its 127.
+    for (wrapper, driver) in [(&unet, "udrv-virtio-net"), (&ublk, "udrv-virtio-blk")] {
+        let missing = wrapper
+            .lines()
+            .find(|l| l.contains(&format!("[ -x /bin/{driver} ] ||")))
+            .unwrap_or_else(|| panic!("no check for /bin/{driver}:\n{wrapper}"));
+        assert!(
+            missing.contains("is not in this image")
+                && missing.contains("sleep 5")
+                && missing.contains("exit 127"),
+            "{missing}"
+        );
+    }
     // The network is set up once the card has a driver to bring it.
     let network = services(&rootfs)
         .into_iter()
