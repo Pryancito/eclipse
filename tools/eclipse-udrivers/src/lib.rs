@@ -18,6 +18,7 @@ pub mod blk;
 pub mod claim;
 pub mod fifo;
 pub mod hybrid;
+pub mod net;
 pub mod queue;
 pub mod virtio;
 pub mod zx;

@@ -39,12 +39,33 @@ pub const fn avail_offset(size: u16) -> usize {
 /// Where the used ring starts, from the start of the queue.
 pub const USED_OFFSET: usize = PAGE;
 
-/// The driver's side of one queue.
-pub struct Queue {
+/// The half of a queue that gives the device its buffers: the descriptor
+/// table and the available ring.
+pub struct Offers {
+    mem: *mut u8,
+    size: u16,
+}
+
+/// The half of a queue that takes what the device has finished: the used
+/// ring.
+pub struct Answers {
     mem: *mut u8,
     size: u16,
     /// The used ring up to here has been taken.
     last_used: u16,
+}
+
+// SAFETY: each half is the only one that touches its part of the queue's
+// memory (`Queue::new`), wherever it runs: that is what lets two threads
+// have one each.
+unsafe impl Send for Offers {}
+unsafe impl Send for Answers {}
+
+/// The driver's side of one queue: both halves, for a driver with one
+/// thread.
+pub struct Queue {
+    offers: Offers,
+    answers: Answers,
 }
 
 impl Queue {
@@ -52,25 +73,83 @@ impl Queue {
     ///
     /// # Safety
     /// `mem` is the start of two zeroed pages, aligned to a page, that stay
-    /// mapped and are this queue's alone for as long as it lives.
+    /// mapped and are this queue's alone for as long as it, or either half
+    /// of it, lives.
     pub unsafe fn new(mem: *mut u8, size: u16) -> Queue {
         let (first, second) = footprint(size);
         assert!(size.is_power_of_two() && first <= PAGE && second <= PAGE);
         Queue {
-            mem,
-            size,
-            last_used: 0,
+            offers: Offers { mem, size },
+            answers: Answers {
+                mem,
+                size,
+                last_used: 0,
+            },
         }
     }
 
-    pub fn size(&self) -> u16 {
-        self.size
+    /// The two halves, for a driver that offers from one thread and takes
+    /// from another.
+    pub fn split(self) -> (Offers, Answers) {
+        (self.offers, self.answers)
     }
 
+    pub fn size(&self) -> u16 {
+        self.offers.size
+    }
+
+    /// See [`Offers::set_desc`].
+    pub fn set_desc(&mut self, i: u16, desc: Desc) {
+        self.offers.set_desc(i, desc)
+    }
+
+    /// See [`Offers::desc`].
+    pub fn desc(&self, i: u16) -> Desc {
+        self.offers.desc(i)
+    }
+
+    /// See [`Offers::avail_idx`].
+    pub fn avail_idx(&self) -> u16 {
+        self.offers.avail_idx()
+    }
+
+    /// See [`Offers::offer`].
+    pub fn offer(&mut self, ahead: u16, head: u16) {
+        self.offers.offer(ahead, head)
+    }
+
+    /// See [`Offers::publish`].
+    pub fn publish(&mut self, n: u16) {
+        self.offers.publish(n)
+    }
+
+    /// See [`Answers::used_idx`].
+    pub fn used_idx(&self) -> u16 {
+        self.answers.used_idx()
+    }
+
+    /// See [`Answers::last_used`].
+    pub fn last_used(&self) -> u16 {
+        self.answers.last_used()
+    }
+
+    /// See [`Answers::take_used`].
+    pub fn take_used(&mut self) -> Option<(u32, u32)> {
+        self.answers.take_used()
+    }
+
+    /// See [`Answers::take_upto`].
+    pub fn take_upto(&mut self, upto: u16) {
+        self.answers.take_upto(upto)
+    }
+}
+
+impl Offers {
     /// Write descriptor `i`.
     pub fn set_desc(&mut self, i: u16, desc: Desc) {
         assert!(i < self.size);
-        // SAFETY: inside the descriptor table (`new`), which is aligned.
+        // SAFETY: inside the descriptor table (`Queue::new`), which is
+        // aligned.
         unsafe { ptr::write_volatile((self.mem as *mut Desc).add(i as usize), desc) }
     }
 
@@ -84,11 +163,6 @@ impl Queue {
     fn avail_word(&self, word: usize) -> *mut u16 {
         // SAFETY: the available ring is `2 + size + 1` words in the first page.
         unsafe { (self.mem.add(avail_offset(self.size)) as *mut u16).add(word) }
-    }
-
-    fn used_word(&self, word: usize) -> *const u16 {
-        // SAFETY: the used ring's two leading words, in the second page.
-        unsafe { (self.mem.add(USED_OFFSET) as *const u16).add(word) }
     }
 
     /// How far the driver has offered: the available ring's index.
@@ -113,6 +187,13 @@ impl Queue {
         // SAFETY: word 1 of the available ring.
         unsafe { ptr::write_volatile(self.avail_word(1), idx) };
         fence(Ordering::SeqCst);
+    }
+}
+
+impl Answers {
+    fn used_word(&self, word: usize) -> *const u16 {
+        // SAFETY: the used ring's two leading words, in the second page.
+        unsafe { (self.mem.add(USED_OFFSET) as *const u16).add(word) }
     }
 
     /// How far the device has answered: the used ring's index.

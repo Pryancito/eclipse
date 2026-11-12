@@ -23,6 +23,7 @@ pub mod nr {
     pub const FIFO_READ: i64 = 35;
     pub const FIFO_WRITE: i64 = 36;
     pub const INTERRUPT_WAIT: i64 = 54;
+    pub const OBJECT_WAIT_ONE: i64 = 81;
     pub const VMO_CREATE_CHILD: i64 = 192;
     pub const VMO_CREATE_CONTIGUOUS: i64 = 193;
     pub const ECLIPSE_HANDLE_TO_FD: i64 = 0x4000;

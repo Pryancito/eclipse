@@ -88,6 +88,32 @@ impl<M: Message> Fifo<M> {
         Ok(put)
     }
 
+    /// Sleep until there is something to read. `PEER_CLOSED` when the
+    /// other end is gone and left nothing.
+    pub fn wait_readable(&self) -> Result<(), Status> {
+        const READABLE: u32 = 1 << 0;
+        const PEER_CLOSED: u32 = 1 << 2;
+        let mut observed: u32 = 0;
+        // SAFETY: the kernel writes the signals it saw into `observed`.
+        unsafe {
+            zx::call(
+                nr::OBJECT_WAIT_ONE,
+                [
+                    self.handle as usize,
+                    (READABLE | PEER_CLOSED) as usize,
+                    i64::MAX as usize, // no deadline
+                    &mut observed as *mut u32 as usize,
+                    0,
+                    0,
+                ],
+            )?;
+        }
+        if observed & READABLE == 0 {
+            return Err(Status::PEER_CLOSED);
+        }
+        Ok(())
+    }
+
     /// A whole turn in one call (`eclipse_fifo_reply_wait`): the first
     /// `replies` messages of `buf` go out, then the call sleeps until there
     /// is something to read and reads up to `buf.len()` messages into

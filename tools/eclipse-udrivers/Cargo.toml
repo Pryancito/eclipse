@@ -17,6 +17,10 @@ path = "src/lib.rs"
 name = "udrv-virtio-blk"
 path = "src/bin/udrv-virtio-blk.rs"
 
+[[bin]]
+name = "udrv-virtio-net"
+path = "src/bin/udrv-virtio-net.rs"
+
 [dependencies]
 libc = "0.2"
 
