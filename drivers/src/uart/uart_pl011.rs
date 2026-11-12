@@ -58,6 +58,10 @@ bitflags! {
     }
 }
 
+/// The most bytes `init` reads out of the receiver before it gives up on it
+/// ever running dry: twice the deepest FIFO a PL011 has (32, in r1p5).
+const RX_DRAIN_MAX: usize = 64;
+
 #[allow(dead_code)]
 pub struct Pl011Uart {
     inner: Pl011Inner,
@@ -149,9 +153,44 @@ impl Pl011Inner {
         let lcrh = self.read_reg(self.line_ctrl_reg);
         self.write_reg(self.line_ctrl_reg, lcrh & !UartLcrhFlags::FEN.bits());
 
+        // Read out whatever is already waiting, AFTER the clear above and
+        // BEFORE the receive interrupt is unmasked below.
+        //
+        // The receive interrupt is raised when a byte ARRIVES in an empty
+        // receiver, not for as long as one sits there. A byte that came in
+        // before this function ran -- a key pressed during the boot, or the
+        // newline a test harness types at a guest it hopes is up -- had its
+        // interrupt wiped by the clear, and with the FIFOs off it fills the
+        // one-byte receiver: nothing further can arrive, so nothing raises the
+        // interrupt again, so nobody ever reads it. The console printed and
+        // was deaf for the rest of the boot. That is what `Linux Libc Test
+        // Baremetal (aarch64)` kept dying of: its harness types a newline 5 s
+        // after starting QEMU, and on a runner slow enough for that to land
+        // before this function, the guest showed its prompt and answered
+        // nothing for 300 s, boot after boot.
+        //
+        // In this order no byte can be stranded: one that was waiting is read
+        // here; one that arrives during or after this loop raises the
+        // interrupt afresh, and is delivered the moment it is unmasked.
+        self.drain_receiver();
+
         // Enable IRQs
         let flags = UartImscFlags::RXIM;
         self.write_reg(self.intr_mask_setclr_reg, flags.bits());
+    }
+
+    /// Read and drop every byte the receiver holds. They were typed at the
+    /// firmware, or at nobody: there is no console to hand them to yet.
+    ///
+    /// Bounded, as `putchar` is and for its reason: a port whose flag register
+    /// never reports "empty" must not hang the boot before its first line.
+    fn drain_receiver(&self) {
+        for _ in 0..RX_DRAIN_MAX {
+            if self.line_sts().contains(UartFrFlags::RXFE) {
+                return;
+            }
+            let _ = self.read_reg(self.data_reg);
+        }
     }
 
     fn line_sts(&self) -> UartFrFlags {
@@ -360,6 +399,34 @@ mod tests {
             "UARTIMSC must arm RXIM"
         );
         assert_eq!(fake.get(0x44), 0x7ff, "UARTICR must have been written");
+    }
+
+    /// `init` reads out what the receiver holds before it arms the
+    /// interrupt (a byte left there, its interrupt cleared, is a console deaf
+    /// for the whole boot). The read must be bounded: a port that never
+    /// reports an empty receiver costs `RX_DRAIN_MAX` reads, not the boot,
+    /// and comes out armed all the same.
+    #[test]
+    fn init_gives_up_on_a_receiver_that_never_runs_dry_and_still_arms_it() {
+        let fake = Fake::new();
+        fake.set(0x18, 0); // RXFE never set: "a byte is waiting", for ever
+        fake.uart().init();
+        assert_eq!(
+            fake.get(0x38) & UartImscFlags::RXIM.bits(),
+            UartImscFlags::RXIM.bits(),
+            "the receive interrupt is armed after the drain, not instead of it"
+        );
+    }
+
+    /// An empty receiver is left alone: the data register is not read when
+    /// the port says there is nothing in it. (Reading UARTDR pops the FIFO;
+    /// on a port with nothing waiting that is a read of garbage at best.)
+    #[test]
+    fn draining_an_empty_receiver_returns_at_once() {
+        let fake = Fake::new();
+        fake.set(0x18, UartFrFlags::RXFE.bits());
+        fake.uart().drain_receiver();
+        assert_eq!(fake.get(0x18), UartFrFlags::RXFE.bits());
     }
 
     /// A byte only goes out once the port says the transmitter is empty.
