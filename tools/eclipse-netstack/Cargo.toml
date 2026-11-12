@@ -1,0 +1,42 @@
+[package]
+name = "eclipse-netstack"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS network stack that runs as a process"
+
+# Standalone: NOT a workspace member. It targets userspace
+# (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
+# builds it on its own (see `xtask/src/linux/udriver.rs`), like the drivers
+# it talks to.
+[workspace]
+
+[lib]
+name = "netstack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eclipse-netstack"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+# The system calls, the FIFO, the channel, and what a card's driver offers.
+udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
+# The kernel's own stack: the tree's copy, the same code the kernel links,
+# so that what runs here and what runs there differ in where, not in what.
+smoltcp = { path = "../../smoltcp", default-features = false, features = [
+    "std",
+    "proto-ipv4",
+    "medium-ethernet",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+# Nothing to unwind into: whoever started the stack starts it again.
+panic = "abort"
+strip = true

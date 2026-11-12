@@ -1,6 +1,6 @@
-//! `udrv-virtio-net [N [REPORT_FD]]`: the driver of virtio network card `N`
-//! (default 0) that the kernel left to userspace (`udriver=virtio-net@N` on
-//! its command line).
+//! `udrv-virtio-net [N [REPORT_FD | stack=FD]]`: the driver of virtio
+//! network card `N` (default 0) that the kernel left to userspace
+//! (`udriver=virtio-net@N` on its command line).
 //!
 //! The card goes to the kernel -- an interface, `ethN` -- and this process
 //! carries its frames until it is killed. It is what a supervisor runs
@@ -13,19 +13,36 @@
 //! descriptor once the card is the kernel's, for a parent that waits for
 //! it.
 //!
+//! With `stack=FD`, the card does not go to the kernel at all. `FD` holds
+//! one end of a channel, which the process that started this one made
+//! (`tools/eclipse-netstack`), and what the kernel would have been given
+//! goes down it instead: an [`Offer`] with the far end of the FIFO and the
+//! window. That process is then the only one that sees the card's frames,
+//! and they pass between the two without the kernel touching them.
+//!
 //! Exit status: 2 when the Zircon gateway is off, 1 on any other error and
-//! when the kernel's end of the FIFO goes away.
+//! when the other end of the FIFO goes away.
 
 use std::process::exit;
 
+use udrivers::channel::Channel;
 use udrivers::claim::{self, Dma};
 use udrivers::fifo::Fifo;
-use udrivers::net::{self, Card, Feeder, Msg};
+use udrivers::net::{self, Card, Feeder, Msg, Offer};
 use udrivers::queue::Queue;
 use udrivers::virtio::{self, Device, Setup};
 use udrivers::zx::{self, nr, Status};
 
 const NAME: &str = "udrv-virtio-net";
+const USAGE: &str = "usage: udrv-virtio-net [N [REPORT_FD | stack=FD]]";
+
+/// Who the card is served to.
+enum Taker {
+    /// The kernel, and the descriptor to report the address on, if any.
+    Kernel(Option<i32>),
+    /// The process at the other end of this channel.
+    Stack(Channel),
+}
 
 fn die(what: impl std::fmt::Display) -> ! {
     println!("{NAME}: {what}");
@@ -37,9 +54,21 @@ fn main() {
     let index: usize = match args.get(1).map(|a| a.parse()) {
         None => 0,
         Some(Ok(index)) => index,
-        Some(Err(_)) => die("usage: udrv-virtio-net [N [REPORT_FD]]"),
+        Some(Err(_)) => die(USAGE),
     };
-    let report: Option<i32> = args.get(2).and_then(|a| a.parse().ok());
+    // The channel is taken out of its descriptor before anything else: a
+    // driver started for a stack must never fall back to the kernel.
+    let taker = match args.get(2).map(|a| a.strip_prefix("stack=").ok_or(a)) {
+        None => Taker::Kernel(None),
+        Some(Err(report)) => Taker::Kernel(report.parse().ok()),
+        Some(Ok(fd)) => match fd.parse().map(Channel::from_fd) {
+            Ok(Ok(channel)) => Taker::Stack(channel),
+            Ok(Err(e)) => die(format_args!(
+                "stack={fd}: no channel in that descriptor: {e}"
+            )),
+            Err(_) => die(USAGE),
+        },
+    };
 
     // The driver before this one may have died a moment ago: three seconds
     // of patience.
@@ -112,31 +141,42 @@ fn main() {
 
     let (fifo, kernels) = Fifo::<Msg>::create(net::FIFO_DEPTH)
         .unwrap_or_else(|e| die(format_args!("fifo_create: {e}")));
-    // SAFETY: no pointers: two handles, which go to the kernel, the address
-    // and a count.
-    if let Err(e) = unsafe {
-        zx::call(
-            nr::ECLIPSE_NET_SERVE,
-            [
-                kernels as usize,
-                window as usize,
-                net::mac_word(mac) as usize,
-                net::RX_BUFS,
-                0,
-                0,
-            ],
-        )
-    } {
-        die(format_args!("net_serve: {e}"));
-    }
-    if let Some(fd) = report {
-        // SAFETY: the six bytes of `mac` to a descriptor the parent passed
-        // for this.
-        unsafe {
-            if libc::write(fd, mac.as_ptr().cast(), mac.len()) != mac.len() as isize {
-                die("write (report)");
+    match taker {
+        Taker::Kernel(report) => {
+            // SAFETY: no pointers: two handles, which go to the kernel, the
+            // address and a count.
+            if let Err(e) = unsafe {
+                zx::call(
+                    nr::ECLIPSE_NET_SERVE,
+                    [
+                        kernels as usize,
+                        window as usize,
+                        net::mac_word(mac) as usize,
+                        net::RX_BUFS,
+                        0,
+                        0,
+                    ],
+                )
+            } {
+                die(format_args!("net_serve: {e}"));
             }
-            libc::close(fd);
+            if let Some(fd) = report {
+                // SAFETY: the six bytes of `mac` to a descriptor the parent
+                // passed for this.
+                unsafe {
+                    if libc::write(fd, mac.as_ptr().cast(), mac.len()) != mac.len() as isize {
+                        die("write (report)");
+                    }
+                    libc::close(fd);
+                }
+            }
+        }
+        Taker::Stack(channel) => {
+            // The channel is closed once the offer is in it: the FIFO is
+            // what tells each side that the other has gone.
+            if let Err(e) = channel.write(&Offer::of(mac).to_bytes(), &[kernels, window]) {
+                die(format_args!("the stack did not take the card: {e}"));
+            }
         }
     }
 

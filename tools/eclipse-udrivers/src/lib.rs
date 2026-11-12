@@ -15,6 +15,7 @@
 //! `cargo test`.
 
 pub mod blk;
+pub mod channel;
 pub mod claim;
 pub mod fifo;
 pub mod hybrid;

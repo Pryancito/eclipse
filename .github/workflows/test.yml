@@ -411,7 +411,7 @@ jobs:
           # disk's and the virtio network card's): a standalone package like
           # the ones above, built best-effort by `xtask` for the image's musl
           # target, where a break only means the `ublk` and `unet` services
-          # fall back to the C tools' drivers.
+          # have no driver to run and say so.
           # What the tests cover is what a driver decides without a device or
           # a kernel in reach: the words of a claim, the virtio bring-up on
           # both transports against registers made of memory, the split
@@ -420,6 +420,16 @@ jobs:
           # batches -- and the card's: which messages reach it and what its
           # buffers turn into.
           cargo test --manifest-path tools/eclipse-udrivers/Cargo.toml
+          # eclipse-netstack, the network stack that runs as a process: one
+          # more standalone package built best-effort for the image, which
+          # takes the drivers' library and the tree's smoltcp by path, so
+          # a change to either can break it where no other job would see.
+          # The tests put smoltcp over the stack's side of a served card,
+          # with the card's window made of memory: who has our address is
+          # answered, a ping comes back with what it carried, a frame waits
+          # in its slot while there is no room to answer it, and a message
+          # that names a place outside the window is refused.
+          cargo test --manifest-path tools/eclipse-netstack/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the

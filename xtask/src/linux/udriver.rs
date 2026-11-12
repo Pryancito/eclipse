@@ -16,6 +16,12 @@
 //! which its tests start to compare against (`bench ... c`) and which no
 //! boot service runs: an image whose Rust build failed has no driver for
 //! a device left to userspace, and the service's wrapper says so.
+//!
+//! `eclipse-netstack` (`tools/eclipse-netstack`) is the network stack as a
+//! process: on a boot that asks for it (`unetstack=ADDR/PREFIX` next to
+//! `udriver=virtio-net@0`) the `unet` service runs it in place of the
+//! driver, and it runs the driver itself and takes the card's frames
+//! instead of the kernel.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +39,13 @@ const TOOLS: [&str; 2] = ["zx-virtio-net", "zx-virtio-blk"];
 /// The Rust drivers' package, under `tools/`, and its binaries.
 const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
 const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
+
+/// The network stack that runs as a process: its package, under `tools/`,
+/// its binary, and what it is built from besides its own sources (the
+/// drivers' library and the tree's smoltcp, both by path).
+const NETSTACK_PACKAGE: &str = "eclipse-netstack";
+const NETSTACK: [&str; 1] = ["eclipse-netstack"];
+const NETSTACK_USES: [&str; 2] = ["tools/eclipse-udrivers/src", "smoltcp/src"];
 
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk.
@@ -66,6 +79,15 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # The driver is the Rust one and only that one: the C tool's own\n\
           # driver is for checking and timing, never the system's.\n\
           [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          # unetstack=ADDR/PREFIX on the kernel command line: the card does\n\
+          # not go to the kernel. The network stack that runs as a process\n\
+          # takes it, with that address, and runs the driver itself. See\n\
+          # tools/eclipse-netstack.\n\
+          stack=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^unetstack=//p' | head -n 1)\n\
+          if [ -n \"$stack\" ]; then\n\
+          \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          \x20   exec /bin/eclipse-netstack 0 \"$stack\"\n\
+          fi\n\
           exec /bin/udrv-virtio-net 0\n",
     )
     .unwrap();
@@ -184,48 +206,56 @@ impl LinuxRootfs {
         for name in TOOLS {
             put(&self.udriver_tool(musl, name), name);
         }
-        let built = self.udrivers();
+        let built = self.rust_tools(DRIVERS_PACKAGE, &DRIVERS, &[]);
         for name in DRIVERS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(NETSTACK_PACKAGE, &NETSTACK, &NETSTACK_USES);
+        for name in NETSTACK {
             put(&built.join(name), name);
         }
     }
 
-    /// Build `tools/eclipse-udrivers` (Rust) as static, non-PIE musl
-    /// binaries, like `eclipse-init`, and return the directory they are in.
-    /// Best-effort: a binary that did not build is not there, and the
-    /// service's wrapper says so on the boot that wanted it.
-    fn udrivers(&self) -> PathBuf {
-        let dir = PROJECT_DIR.join("tools").join(DRIVERS_PACKAGE);
+    /// Build the binaries `bins` of `tools/<package>` (Rust) as static,
+    /// non-PIE musl binaries, like `eclipse-init`, and return the directory
+    /// they are in. `uses` are the directories, from the top of the tree,
+    /// of what the package takes by path. Best-effort: a binary that did
+    /// not build is not there, and whatever wanted it says so on the boot
+    /// that did.
+    fn rust_tools(&self, package: &str, bins: &[&str], uses: &[&str]) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join(package);
         let triple = self.musl_rust_triple();
         let out = dir.join("target").join(triple).join("release");
         // Rebuild when a source file or the manifest is newer than any of
         // the binaries, or one is missing. The directory is the target's
         // own, so what is in it is never another architecture's.
-        let newest = [
-            newest_mtime_under(&dir.join("src")),
-            fs::metadata(dir.join("Cargo.toml"))
-                .and_then(|m| m.modified())
-                .ok(),
-        ]
-        .into_iter()
-        .flatten()
-        .max();
+        let newest = uses
+            .iter()
+            .map(|used| newest_mtime_under(&PROJECT_DIR.join(used)))
+            .chain([
+                newest_mtime_under(&dir.join("src")),
+                fs::metadata(dir.join("Cargo.toml"))
+                    .and_then(|m| m.modified())
+                    .ok(),
+            ])
+            .flatten()
+            .max();
         let fresh = |name: &str| {
             let built = fs::metadata(out.join(name)).and_then(|m| m.modified()).ok();
             matches!((built, newest), (Some(b), Some(s)) if b >= s)
         };
-        if DRIVERS.into_iter().all(fresh) {
+        if bins.iter().copied().all(fresh) {
             return out;
         }
 
-        println!("Compiling {DRIVERS_PACKAGE} (Rust, {triple})...");
+        println!("Compiling {package} (Rust, {triple})...");
         let _ = optional_status(
             Ext::new("rustup").arg("target").arg("add").arg(triple),
             "install rustup so the musl target can be added",
         );
         // A build that fails must not leave the last one to be copied in
         // its place.
-        for name in DRIVERS {
+        for name in bins {
             let _ = fs::remove_file(out.join(name));
         }
         let mut cargo = Ext::new("cargo");
@@ -241,7 +271,7 @@ impl LinuxRootfs {
             cargo.env(k, v);
         }
         if !cargo.status().success() {
-            println!("Failed to compile {DRIVERS_PACKAGE}");
+            println!("Failed to compile {package}");
         }
         out
     }
