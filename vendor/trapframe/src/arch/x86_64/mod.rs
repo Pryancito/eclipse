@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fncall;
+mod fpown;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 mod gdt;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
@@ -54,11 +55,15 @@ pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic
 /// when the CPU has it (`CPUID.(EAX=0DH,ECX=1):EAX[0]`) and XSAVE is in use.
 ///
 /// XSAVEOPT skips the components the program has not touched since the
-/// XRSTOR that loaded them, and those in their initial state. `run` restores
-/// and saves the same buffer on the same CPU with nothing in between but user
-/// code, which is the pattern the optimisation is defined for; a syscall loop
-/// that never touches AVX no longer writes the whole save area back on every
-/// return to the kernel. The buffer is only ever read back by XRSTOR (and
+/// XRSTOR that loaded them from this same buffer, and those in their initial
+/// state; a syscall loop that never touches AVX no longer writes the whole
+/// save area back on every return to the kernel. What it needs is that the
+/// buffer and the registers agree when the thread goes out to user mode, so
+/// that a component it does not write is one the buffer already has. `run`
+/// goes out either right after an XRSTOR of the buffer or, when it skips
+/// that, because the registers are known to be what the buffer holds (see
+/// [`FpOwner`](fpown::FpOwner)), and there is nothing but user code between
+/// there and the save. The buffer is only ever read back by XRSTOR (and
 /// copied whole on fork), which honours XSTATE_BV, so the bytes left unwritten
 /// for an initial-state component are never seen.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
@@ -270,11 +275,16 @@ pub struct UserContext {
     /// Not read by the assembly --- the kernel loads them before entering ---
     /// so this one carries no offset assertion.
     pub compat_tls: [u64; 3],
-    /// FXSAVE area holding this thread's x87/SSE (FPU/MMX/XMM) state. The kernel
-    /// is compiled with SSE2 (`+sse2`) and freely uses XMM (memcpy, etc.), so the
-    /// per-thread user FPU state MUST be saved on every kernel entry and restored
-    /// on every kernel exit, otherwise a user SSE computation (e.g. musl memcpy)
-    /// that is preempted mid-way resumes with clobbered XMM -> corrupted data.
+    /// This thread's x87/SSE/AVX registers, as they were at its last entry to
+    /// the kernel: `run` saves them there on every way in, so what is here is
+    /// always what the thread has.
+    ///
+    /// On the way out they are loaded back only when the CPU's registers hold
+    /// something else -- another thread's, or this one's from before the area
+    /// was written. The kernel itself is built without x87, SSE or AVX (see
+    /// the check next to [`FpState`]), so a thread that comes in and goes back
+    /// out with no other thread in between finds its registers as it left
+    /// them. See [`FpOwner`](fpown::FpOwner).
     pub fpstate: FpState,
 }
 
@@ -292,9 +302,36 @@ pub struct UserContext {
 ///
 /// CPUs with only AVX/AVX2 use bytes 0..832; CPUs without XSAVE use only the
 /// legacy 512 bytes.
-#[derive(Clone, Copy, Eq, PartialEq)]
+///
+/// Behind the area goes the stamp of the save that filled it (see
+/// [`FpOwner`](fpown::FpOwner)): it is copied with the area and dropped when
+/// the area is written by hand, so it never says more than the bytes do.
+#[derive(Clone, Copy)]
 #[repr(C, align(64))]
-pub struct FpState([u8; 2688]);
+pub struct FpState {
+    area: [u8; 2688],
+    /// Which save left `area` as it is, or [`fpown::NO_STAMP`] when no save
+    /// did: a fresh thread's, or one somebody has written registers into.
+    stamp: u64,
+}
+
+/// Two areas are the same when they hold the same registers, whichever save
+/// put them there.
+impl PartialEq for FpState {
+    fn eq(&self, other: &Self) -> bool {
+        self.area == other.area
+    }
+}
+impl Eq for FpState {}
+
+// `run` leaves a thread's registers in the CPU across its time in the kernel.
+// That holds only while no kernel code touches them: with SSE on, the compiler
+// is free to copy a structure through `xmm0` anywhere.
+#[cfg(all(target_os = "none", target_feature = "sse"))]
+compile_error!(
+    "the kernel must be built without SSE (soft-float): UserContext::run keeps user \
+     vector registers live while the kernel runs"
+);
 
 impl core::fmt::Debug for FpState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -312,7 +349,7 @@ impl FpState {
     /// its initial state and its bytes here may be stale: see
     /// [`xsave_components`].
     pub fn as_bytes(&self) -> &[u8; 2688] {
-        &self.0
+        &self.area
     }
 
     /// The save area, to write registers into before the next XRSTOR.
@@ -320,8 +357,12 @@ impl FpState {
     /// A component written here is only loaded if its `XSTATE_BV` bit is set
     /// too, and `XRSTOR` faults (#GP) on a bit set for a component the CPU
     /// has not enabled in `XCR0`: set only bits of [`xsave_components`].
+    ///
+    /// The area stops being what any CPU's registers hold, so the thread's
+    /// next way out loads it whatever ran in between.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; 2688] {
-        &mut self.0
+        self.stamp = fpown::NO_STAMP;
+        &mut self.area
     }
 }
 
@@ -353,7 +394,10 @@ impl Default for FpState {
         // The XSAVE header (bytes 512..576) stays zero: XSTATE_BV = 0 (every
         // component in its init state) and XCOMP_BV = 0 (standard, non-compacted
         // format). A fresh thread's first XRSTOR then loads init x87/SSE/AVX/AVX-512.
-        FpState(s)
+        FpState {
+            area: s,
+            stamp: fpown::NO_STAMP,
+        }
     }
 }
 
@@ -573,6 +617,11 @@ mod layout_tests {
         assert_eq!(align_of::<FpState>(), 64);
         assert_eq!(align_of::<UserContext>(), 64);
         assert_eq!(
+            offset_of!(FpState, area),
+            0,
+            "the instructions are given the address of the whole FpState"
+        );
+        assert_eq!(
             offset_of!(UserContext, fpstate) % 64,
             0,
             "xsave sobre este contexto lanza #GP"
@@ -588,7 +637,7 @@ mod layout_tests {
     #[test]
     fn a_fresh_context_starts_with_the_control_words_the_cpu_demands() {
         let fresh = UserContext::default();
-        let area = &fresh.fpstate.0;
+        let area = fresh.fpstate.as_bytes();
         // FXRSTOR and XRSTOR load these straight into the CPU. A zeroed FCW
         // unmasks every x87 exception and a zeroed MXCSR unmasks every SSE
         // one, so the first user floating-point instruction traps.
