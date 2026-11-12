@@ -41,10 +41,15 @@ const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
 const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
 
 /// The network stack that runs as a process: its package, under `tools/`,
-/// its binary, and what it is built from besides its own sources (the
-/// drivers' library and the tree's smoltcp, both by path).
+/// its binaries -- the stack, what runs a program on it, and the UDP echo
+/// server it is measured with -- and what it is built from besides its own
+/// sources (the drivers' library and the tree's smoltcp, both by path).
 const NETSTACK_PACKAGE: &str = "eclipse-netstack";
-const NETSTACK: [&str; 1] = ["eclipse-netstack"];
+const NETSTACK: [&str; 3] = [
+    "eclipse-netstack",
+    "eclipse-netstack-use",
+    "eclipse-udp-echo",
+];
 const NETSTACK_USES: [&str; 2] = ["tools/eclipse-udrivers/src", "smoltcp/src"];
 
 /// The `unet` and `ublk` services and the wrappers they run, and

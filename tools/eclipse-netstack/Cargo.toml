@@ -18,6 +18,16 @@ path = "src/lib.rs"
 name = "eclipse-netstack"
 path = "src/main.rs"
 
+# Runs a program with its datagram sockets on this stack.
+[[bin]]
+name = "eclipse-netstack-use"
+path = "src/bin/eclipse-netstack-use.rs"
+
+# A test program: a UDP echo server, which the stack is measured with.
+[[bin]]
+name = "eclipse-udp-echo"
+path = "src/bin/eclipse-udp-echo.rs"
+
 [dependencies]
 libc = "0.2"
 # The system calls, the FIFO, the channel, and what a card's driver offers.

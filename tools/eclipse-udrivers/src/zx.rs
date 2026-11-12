@@ -32,10 +32,13 @@ pub mod nr {
     pub const VMO_CREATE_CONTIGUOUS: i64 = 193;
     pub const ECLIPSE_HANDLE_TO_FD: i64 = 0x4000;
     pub const ECLIPSE_FD_TO_HANDLE: i64 = 0x4001;
+    pub const ECLIPSE_CHANNEL_REPLY_WAIT: i64 = 0x4004;
     pub const ECLIPSE_DEVICE_CLAIM: i64 = 0x4005;
     pub const ECLIPSE_BLOCK_SERVE: i64 = 0x4006;
     pub const ECLIPSE_NET_SERVE: i64 = 0x4007;
     pub const ECLIPSE_FIFO_REPLY_WAIT: i64 = 0x4008;
+    pub const ECLIPSE_NETSTACK_SERVE: i64 = 0x4009;
+    pub const ECLIPSE_NETSTACK_USE: i64 = 0x400a;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

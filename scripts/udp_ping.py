@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Ping a guest through a QEMU network card whose frames are UDP datagrams.
+"""Ping a guest through a QEMU network card whose frames are UDP datagrams,
+with ICMP echo or with UDP datagrams that a program in the guest echoes.
 
 A card plugged into `-netdev socket,udp=127.0.0.1:5700,localaddr=127.0.0.1:5701`
 (`UNET_NET=...` in zCore/Makefile) sends every frame as a datagram to port
 5700 and takes every datagram that arrives on 5701 as a frame. This program
 is the only other machine on that wire: it asks who has the guest's address
-(ARP), then sends ICMP echo requests and times the answers.
+(ARP), then sends ICMP echo requests and times the answers. With `--udp PORT`
+it sends UDP datagrams to that port instead, which times a program's socket
+as well as the stack: `eclipse-udp-echo PORT` in the guest sends them back.
 
 It is how the network stack that runs as a process (tools/eclipse-netstack)
 is measured against the kernel's: the same card, the same driver, the same
@@ -13,6 +16,7 @@ pings, and whichever stack has the address answers them.
 
     scripts/udp_ping.py 10.0.9.15 -c 2000          # one at a time: round trips
     scripts/udp_ping.py 10.0.9.15 -c 20000 -w 16   # sixteen in flight: pings a second
+    scripts/udp_ping.py 10.0.9.15 --udp 7000       # through a program's UDP socket
 
 Exit status: 0 when every ping was answered, 1 when some were lost, 2 when
 nobody has the address.
@@ -82,6 +86,44 @@ def echo_reply(frame: bytes, our_ip: bytes, from_ip: bytes, ident: int):
     return seq, icmp[8:]
 
 
+OUR_PORT = 40000
+
+
+def udp_datagram(to_mac: bytes, our_ip: bytes, to_ip: bytes, port: int, seq: int, data: bytes) -> bytes:
+    """A UDP datagram from us to `port`, in its IP packet and Ethernet frame."""
+    length = 8 + len(data)
+    udp = struct.pack("!HHHH", OUR_PORT, port, length, 0) + data
+    pseudo = our_ip + to_ip + struct.pack("!BBH", 0, 17, length)
+    # A checksum that comes out 0 is sent as all ones: 0 says there is none.
+    udp = udp[:6] + struct.pack("!H", checksum(pseudo + udp) or 0xFFFF) + udp[8:]
+    ip = struct.pack("!BBHHHBBH", 0x45, 0, 20 + length, seq & 0xFFFF, 0x4000, 64, 17, 0) + our_ip + to_ip
+    ip = ip[:10] + struct.pack("!H", checksum(ip)) + ip[12:]
+    return pad(to_mac + OUR_MAC + struct.pack("!H", ETH_IPV4) + ip + udp)
+
+
+def udp_reply(frame: bytes, our_ip: bytes, from_ip: bytes, port: int):
+    """What the UDP datagram `frame` is carries, or None when it is not one
+    from `port` for us whose checksums hold."""
+    if len(frame) < 42 or frame[12:14] != struct.pack("!H", ETH_IPV4):
+        return None
+    ip = frame[14:]
+    header = (ip[0] & 0xF) * 4
+    total = struct.unpack("!H", ip[2:4])[0]
+    if ip[0] >> 4 != 4 or ip[9] != 17 or ip[12:16] != from_ip or ip[16:20] != our_ip:
+        return None
+    if total > len(ip) or checksum(ip[:header]) != 0:
+        return None
+    udp = ip[header:total]
+    if len(udp) < 8:
+        return None
+    src, dst, length, check = struct.unpack("!HHHH", udp[:8])
+    if src != port or dst != OUR_PORT or length != len(udp):
+        return None
+    if check and checksum(from_ip + our_ip + struct.pack("!BBH", 0, 17, length) + udp) != 0:
+        return None
+    return udp[8:]
+
+
 class Wire:
     """The other end of the card."""
 
@@ -138,6 +180,7 @@ def main() -> int:
     ap.add_argument("--send", type=int, default=5701, help="the port the card listens on (default 5701)")
     ap.add_argument("-c", "--count", type=int, default=1000, help="pings to send (default 1000)")
     ap.add_argument("-s", "--size", type=int, default=56, help="bytes each carries (default 56, at most 1472)")
+    ap.add_argument("--udp", type=int, default=None, metavar="PORT", help="send UDP datagrams to an echo server on this port, not ICMP echo (4 bytes each at least)")
     ap.add_argument("-w", "--window", type=int, default=1, help="pings in flight at once (default 1)")
     ap.add_argument("--warmup", type=int, default=50, help="pings sent first and not counted (default 50)")
     ap.add_argument("--patience", type=float, default=30.0, help="seconds to wait for the guest to have the address")
@@ -145,6 +188,8 @@ def main() -> int:
     args = ap.parse_args()
     if not 0 <= args.size <= 1472 or args.count < 1 or args.window < 1:
         ap.error("a size from 0 to 1472, and at least one ping and one in flight")
+    if args.udp is not None and (not 0 < args.udp < 65536 or args.size < 4):
+        ap.error("a port from 1 to 65535, and datagrams of 4 bytes at least")
 
     guest = socket.inet_aton(args.address)
     ours = socket.inet_aton(args.ours) if args.ours else guest[:3] + b"\x01"
@@ -158,6 +203,23 @@ def main() -> int:
     ident = 0x4543
     data = bytes(i & 0xFF for i in range(args.size))
 
+    # A UDP datagram has no sequence number, so its first four bytes are
+    # one: which of the datagrams in flight an echo is.
+    def request(seq: int) -> bytes:
+        if args.udp is None:
+            return echo_request(mac, ours, guest, ident, seq, data)
+        return udp_datagram(mac, ours, guest, args.udp, seq, struct.pack("!I", seq) + data[4:])
+
+    def answer(frame: bytes):
+        """The sequence number `frame` answers, or None when it answers none."""
+        if args.udp is None:
+            reply = echo_reply(frame, ours, guest, ident)
+            return reply[0] if reply is not None and reply[1] == data else None
+        got = udp_reply(frame, ours, guest, args.udp)
+        if got is None or len(got) != len(data) or got[4:] != data[4:]:
+            return None
+        return struct.unpack("!I", got[:4])[0]
+
     def run(count: int):
         """`count` pings, `window` in flight: the round trips in ns of the
         ones answered, how many were lost, and how long it all took."""
@@ -168,7 +230,7 @@ def main() -> int:
         start = time.perf_counter_ns()
         while next_seq < count or sent_at:
             while next_seq < count and len(sent_at) < args.window:
-                wire.send(echo_request(mac, ours, guest, ident, next_seq & 0xFFFF, data))
+                wire.send(request(next_seq & 0xFFFF))
                 sent_at[next_seq & 0xFFFF] = time.perf_counter_ns()
                 next_seq += 1
             oldest = min(sent_at.values())
@@ -180,18 +242,16 @@ def main() -> int:
                     del sent_at[seq]
                     lost += 1
                 continue
-            reply = echo_reply(frame, ours, guest, ident)
-            if reply is None:
-                continue
-            seq, got = reply
-            if seq in sent_at and got == data:
+            seq = answer(frame)
+            if seq in sent_at:
                 trips.append(now - sent_at.pop(seq))
         return trips, lost, time.perf_counter_ns() - start
 
     if args.warmup:
         run(args.warmup)
     trips, lost, took = run(args.count)
-    print(f"{args.count} pings of {args.size} bytes, {args.window} in flight: {len(trips)} answered, {lost} lost, {took / 1e9:.3f} s")
+    what = "pings" if args.udp is None else f"datagrams to port {args.udp}"
+    print(f"{args.count} {what} of {args.size} bytes, {args.window} in flight: {len(trips)} answered, {lost} lost, {took / 1e9:.3f} s")
     if trips:
         us = sorted(t / 1000 for t in trips)
         nth = lambda p: us[min(len(us) - 1, int(len(us) * p))]
@@ -199,7 +259,7 @@ def main() -> int:
             f"round trip, us: min {us[0]:.0f}  median {statistics.median(us):.0f}  mean {statistics.fmean(us):.0f}"
             f"  p90 {nth(0.90):.0f}  p99 {nth(0.99):.0f}  max {us[-1]:.0f}"
         )
-        print(f"pings a second: {len(trips) / (took / 1e9):.0f}")
+        print(f"{'pings' if args.udp is None else 'datagrams'} a second: {len(trips) / (took / 1e9):.0f}")
     return 1 if lost else 0
 
 

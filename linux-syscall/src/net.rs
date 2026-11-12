@@ -454,6 +454,17 @@ impl Syscall<'_> {
             | (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
                 Arc::new(TcpSocketState::new(true)?)
             }
+            // A process that asked for the stack that runs as a process
+            // gets its datagram sockets from it, or none while there is no
+            // such stack: never the kernel's behind its back.
+            (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
+            | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP))
+                if self.linux_process().uses_user_netstack() =>
+            {
+                use linux_object::net::user_stack;
+                let link = user_stack::current().ok_or(LxError::ENETDOWN)?;
+                Arc::new(user_stack::ServedUdpSocket::new(link)?)
+            }
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
             | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
                 Arc::new(UdpSocketState::new(false)?)

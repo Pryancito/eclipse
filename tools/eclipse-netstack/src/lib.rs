@@ -11,12 +11,17 @@
 //! messages and wakes whoever waits on them, and that is all: it has no
 //! interface for this card, and none of its frames pass through it.
 //!
-//! What there is so far is the bottom of a stack: the card, an address,
-//! and what smoltcp answers by itself -- ARP for that address and ICMP
-//! echo. No sockets yet, so no program can use this interface; it exists
-//! to be measured against the kernel's (`scripts/udp_ping.py`).
+//! What there is so far: the card, an address, what smoltcp answers by
+//! itself -- ARP for that address and ICMP echo -- and UDP sockets. A
+//! program's socket stays the kernel's object, and the kernel asks this
+//! process, over a channel, to send its datagrams and is told of the ones
+//! that arrive (`eclipse_netstack_serve`). Which programs: the ones started
+//! by `eclipse-netstack-use`; every other socket is the kernel's stack's.
+//! No TCP, no routes beyond the card's network, and no fragments.
 //!
-//! [`port`] is the stack's side of a served card, which is all of this
-//! that can be tested without one.
+//! [`port`] is the stack's side of a served card and [`socks`] the sockets
+//! over it: all of this that can be tested without a card or a kernel.
+//! `scripts/udp_ping.py` measures it against the kernel's stack.
 
 pub mod port;
+pub mod socks;

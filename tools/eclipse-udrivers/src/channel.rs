@@ -116,6 +116,75 @@ impl Channel {
         }
         Ok((nbytes as usize, nhandles as usize))
     }
+
+    /// Wait for the next message of bytes alone and read it into `buf`, in
+    /// one call (`eclipse_channel_reply_wait`, with no reply): how many
+    /// bytes it had. `PEER_CLOSED` when the other end went and left
+    /// nothing. A message that does not fit `buf`, or that carries
+    /// handles, is `BUFFER_TOO_SMALL` and stays queued.
+    pub fn wait_read(&self, buf: &mut [u8]) -> Result<usize, Status> {
+        loop {
+            let mut actual: u32 = 0;
+            // SAFETY: the kernel writes at most `buf.len()` bytes into
+            // `buf` and the length into `actual`.
+            let r = unsafe {
+                zx::call(
+                    nr::ECLIPSE_CHANNEL_REPLY_WAIT,
+                    [
+                        self.0 as usize,
+                        0,
+                        0,
+                        buf.as_mut_ptr() as usize,
+                        buf.len(),
+                        &mut actual as *mut u32 as usize,
+                    ],
+                )
+            };
+            match r {
+                Ok(_) => return Ok(actual as usize),
+                // A signal cut the wait short.
+                Err(Status::INTERNAL_INTR_RETRY) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read the next message of bytes alone into `buf`, if there is one,
+    /// without waiting: how many bytes it had, or `None` when nothing is
+    /// queued. `PEER_CLOSED` when the other end went and left nothing.
+    pub fn try_read(&self, buf: &mut [u8]) -> Result<Option<usize>, Status> {
+        let (mut nbytes, mut nhandles): (u32, u32) = (0, 0);
+        // SAFETY: the kernel writes at most `buf.len()` bytes and the two
+        // counts; it is given room for no handles.
+        let read = unsafe {
+            zx::call8(
+                nr::CHANNEL_READ,
+                [
+                    self.0 as usize,
+                    0,
+                    buf.as_mut_ptr() as usize,
+                    0,
+                    buf.len(),
+                    0,
+                    &mut nbytes as *mut u32 as usize,
+                    &mut nhandles as *mut u32 as usize,
+                ],
+            )
+        };
+        match read {
+            Ok(_) => Ok(Some(nbytes as usize)),
+            Err(Status::SHOULD_WAIT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// This end as its handle, to give to a call that takes it: the
+    /// caller's to close if the call does not.
+    pub fn into_handle(self) -> Handle {
+        let handle = self.0;
+        core::mem::forget(self);
+        handle
+    }
 }
 
 impl Drop for Channel {

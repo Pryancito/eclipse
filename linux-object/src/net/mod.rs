@@ -294,6 +294,9 @@ pub use tcp::*;
 pub mod udp;
 pub use udp::*;
 
+/// Sockets served by a network stack that runs as a process.
+pub mod user_stack;
+
 /// missing documentation
 pub mod raw;
 pub use raw::*;

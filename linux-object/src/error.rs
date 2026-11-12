@@ -135,6 +135,8 @@ pub enum LxError {
     EPFNOSUPPORT = 96,
     /// Address family not supported by protocol
     EAFNOSUPPORT = 97,
+    /// Network is down
+    ENETDOWN = 100,
     /// Connection reset by peer
     ECONNRESET = 104,
     /// No buffer space available
@@ -229,6 +231,7 @@ impl fmt::Display for LxError {
             EOPNOTSUPP => "Operation not supported",
             EPFNOSUPPORT => "Protocol family not supported",
             EAFNOSUPPORT => "Address family not supported by protocol",
+            ENETDOWN => "Network is down",
             ECONNRESET => "Connection reset by peer",
             ENOBUFS => "No buffer space available",
             EISCONN => "Transport endpoint is already connected",
@@ -385,7 +388,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 70] = [
+    const EVERY_ERRNO: [(LxError, isize); 71] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -445,6 +448,7 @@ mod errno_tests {
         (LxError::EAFNOSUPPORT, 97),
         (LxError::EADDRINUSE, 98),
         (LxError::EADDRNOTAVAIL, 99),
+        (LxError::ENETDOWN, 100),
         (LxError::ECONNRESET, 104),
         (LxError::ENOBUFS, 105),
         (LxError::EISCONN, 106),
@@ -533,6 +537,7 @@ mod errno_tests {
                 | LxError::EAFNOSUPPORT
                 | LxError::EADDRINUSE
                 | LxError::EADDRNOTAVAIL
+                | LxError::ENETDOWN
                 | LxError::ECONNRESET
                 | LxError::ENOBUFS
                 | LxError::EISCONN
@@ -549,7 +554,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            70,
+            71,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }
