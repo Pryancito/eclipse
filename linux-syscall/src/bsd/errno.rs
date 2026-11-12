@@ -213,6 +213,7 @@ mod tests {
         LxError::EINPROGRESS,
         LxError::EADDRINUSE,
         LxError::EADDRNOTAVAIL,
+        LxError::ENETDOWN,
         LxError::EMSGSIZE,
         LxError::EALREADY,
         LxError::ENOKEY,
