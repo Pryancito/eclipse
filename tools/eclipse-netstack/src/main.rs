@@ -27,6 +27,10 @@
 //! One message for all that arrived is what keeps this from costing a
 //! change of process for each datagram or segment: whoever is woken runs
 //! at once, so a wake for each is one at a time through four processes.
+//! The driver is woken as seldom, for the same reason: a receive slot to
+//! give back waits for a frame to go with, and the acknowledgement of
+//! what a program was just told waits a moment for the program's answer
+//! (`HOLD`).
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the driver
 //! cannot be started or gives no card.
@@ -37,7 +41,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use netstack::port::Port;
-use netstack::socks::{Arrived, Stack, MESSAGE_MAX};
+use netstack::socks::tcp::OP_WRITE;
+use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_SEND};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
@@ -163,6 +168,10 @@ struct Shared {
     /// The FIFO of the driver the card has now, for the threads that are
     /// not the card's to tell it of a frame to send.
     fifo: Arc<Fifo<Msg>>,
+    /// Whether the programs answer what arrives for them: one has sent
+    /// something since the card's thread last waited for an answer to
+    /// send its frames with (see [`HOLD`]).
+    answering: bool,
 }
 
 type Lock = Arc<Mutex<Shared>>;
@@ -184,24 +193,27 @@ struct Kernel {
 }
 
 /// Carry the frames through the stack and tell the kernel what arrived
-/// for its sockets. Takes the lock, which it lets go before the kernel is
-/// told: that write wakes whoever reads the socket, who runs at once and
-/// has something to send before this thread is back.
-fn turn(mut shared: MutexGuard<'_, Shared>, kernel: Option<&Kernel>, data: &mut Vec<u8>) {
+/// for its sockets: whether there were bytes for a program in it. Takes
+/// the lock, which it lets go before the kernel is told: that write wakes
+/// whoever reads the socket, who runs at once and has something to send
+/// before this thread is back.
+fn turn(mut shared: MutexGuard<'_, Shared>, kernel: Option<&Kernel>, data: &mut Vec<u8>) -> bool {
     shared.stack.poll(now());
     // Without the kernel there are no sockets for anything to arrive on.
-    let Some(kernel) = kernel else { return };
+    let Some(kernel) = kernel else { return false };
+    let mut bytes = false;
     loop {
         let arrived = shared.stack.arrived(data);
+        bytes |= shared.stack.brought_bytes();
         if arrived == Arrived::Nothing {
-            return;
+            return bytes;
         }
         let sending = locked(&kernel.sending);
         if arrived == Arrived::All {
             drop(shared);
             // A kernel that is gone took the machine with it.
             let _ = kernel.channel.write(data, &[]);
-            return;
+            return bytes;
         }
         // More than a message holds, which a card's turn rarely brings:
         // this one goes under the lock, and the next is asked for.
@@ -237,30 +249,74 @@ fn tell_driver(shared: &Lock, msgs: &mut [Msg; TURN]) {
     }
 }
 
+/// How long the card's thread keeps the frames of a turn that brought a
+/// program bytes, for the program's answer to go to the driver with them:
+/// in nanoseconds.
+///
+/// What such a turn has to send is an acknowledgement, and the program is
+/// awake with the bytes before this thread is back. Sent now, the
+/// acknowledgement wakes the driver for itself, and the answer wakes it
+/// again; kept, the two are one wake and the driver puts them on the wire
+/// together. The price when no answer comes is an acknowledgement late,
+/// by this much or until the driver has more to say, once: after that the
+/// programs are taken not to be answering ([`Shared::answering`]) until
+/// one sends again, so what a program only reads is acknowledged as it
+/// arrives.
+const HOLD: u64 = 2_000_000;
+
 /// Carry the card's frames through the stack until its driver is gone. Why
 /// it stopped.
 ///
 /// One system call a turn (`eclipse_fifo_reply_wait`): what the last turn
 /// left to say -- the receive slots that were read, the frames to send --
 /// goes out, and the call comes back with what the card did meanwhile.
-/// One more when a datagram arrived for a socket, to tell the kernel.
+/// One more when something arrived for a socket, to tell the kernel, and
+/// then one to wait for the answer ([`HOLD`]).
+///
+/// The driver is told only of what is worth waking it for
+/// ([`Port::due`]): a receive slot to give back waits for a frame to go
+/// with.
 fn serve(shared: &Lock, kernel: Option<&Kernel>, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
-        let replies = locked(shared).stack.device().outgoing(&mut msgs);
+        let replies = {
+            let shared = locked(shared);
+            let port = shared.stack.device();
+            if port.due() {
+                port.outgoing(&mut msgs)
+            } else {
+                0
+            }
+        };
         let got = match fifo.reply_wait(&mut msgs, replies) {
             Ok(got) => got,
             Err(e) => return e,
         };
-        let shared = locked(shared);
+        let guard = locked(shared);
         for m in &msgs[..got] {
-            if !shared.stack.device().take(m) {
+            if !guard.stack.device().take(m) {
                 println!("{NAME}: a message from the driver that means nothing: {m:?}");
             }
         }
         // Every frame that has room for its answer, in one go.
-        turn(shared, kernel, &mut data);
+        if !turn(guard, kernel, &mut data) {
+            continue;
+        }
+        let hold = {
+            let mut shared = locked(shared);
+            let hold = shared.answering && shared.stack.device().has_frames();
+            // Until a program sends again.
+            shared.answering &= !hold;
+            hold
+        };
+        if hold {
+            // Time up, or the driver has more to say: either way what is
+            // left to send goes with the next turn's call.
+            if let Err(e) = fifo.wait_readable_for(HOLD) {
+                return e;
+            }
+        }
     }
 }
 
@@ -289,10 +345,16 @@ fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
                 return;
             }
         };
-        let mut sends = false;
+        let (mut sends, mut answers) = (false, false);
         for done in 1.. {
             match locked(&shared).stack.request(&message[..len]) {
-                Ok(send) => sends |= send,
+                Ok(send) => {
+                    sends |= send;
+                    // A program with something to say, which is what the
+                    // card's thread waits for ([`HOLD`]).
+                    answers |=
+                        matches!(parse_header(&message[..len]), Some((OP_WRITE | OP_SEND, _)));
+                }
                 // A datagram that cannot go is dropped, as on any network;
                 // anything else the kernel does not send.
                 Err(why) if debug => {
@@ -310,7 +372,9 @@ fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
             }
         }
         if sends {
-            turn(locked(&shared), Some(&kernel), &mut data);
+            let mut guard = locked(&shared);
+            guard.answering |= answers;
+            turn(guard, Some(&kernel), &mut data);
             tell_driver(&shared, &mut msgs);
         }
     }
@@ -410,6 +474,7 @@ fn main() {
     let shared: Lock = Arc::new(Mutex::new(Shared {
         stack,
         fifo: link.fifo.clone(),
+        answering: false,
     }));
     println!(
         "{NAME}: card {index} ({}) is {addr}{}",

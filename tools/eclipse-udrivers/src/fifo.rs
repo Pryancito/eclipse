@@ -108,6 +108,20 @@ impl<M: Message> Fifo<M> {
         Ok(())
     }
 
+    /// Sleep until there is something to read, for `ns` nanoseconds at
+    /// most: whether there is. `PEER_CLOSED` when the other end is gone
+    /// and left nothing.
+    pub fn wait_readable_for(&self, ns: u64) -> Result<bool, Status> {
+        let deadline = crate::now_ns().saturating_add(ns).min(i64::MAX as u64 - 1) as i64;
+        match zx::wait_one_until(self.handle, zx::READABLE | zx::PEER_CLOSED, deadline) {
+            Ok(observed) if observed & zx::READABLE != 0 => Ok(true),
+            Ok(_) => Err(Status::PEER_CLOSED),
+            // A signal cut the wait short: as good as the time being up.
+            Err(Status::TIMED_OUT) | Err(Status::INTERNAL_INTR_RETRY) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// A whole turn in one call (`eclipse_fifo_reply_wait`): the first
     /// `replies` messages of `buf` go out, then the call sleeps until there
     /// is something to read and reads up to `buf.len()` messages into

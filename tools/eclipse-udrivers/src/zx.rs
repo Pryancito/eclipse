@@ -49,6 +49,7 @@ impl Status {
     pub const INTERNAL_INTR_RETRY: Status = Status(-6);
     pub const INVALID_ARGS: Status = Status(-10);
     pub const OUT_OF_RANGE: Status = Status(-14);
+    pub const TIMED_OUT: Status = Status(-21);
     pub const SHOULD_WAIT: Status = Status(-22);
     pub const PEER_CLOSED: Status = Status(-24);
     pub const ALREADY_BOUND: Status = Status(-27);
@@ -114,6 +115,13 @@ pub const PEER_CLOSED: u32 = 1 << 2;
 
 /// Sleep until `handle` has one of `signals`. The ones it has.
 pub fn wait_one(handle: Handle, signals: u32) -> Result<u32, Status> {
+    wait_one_until(handle, signals, i64::MAX) // no deadline
+}
+
+/// Sleep until `handle` has one of `signals` or the monotonic clock
+/// ([`crate::now_ns`]) reads `deadline`, which is `TIMED_OUT`. The signals
+/// it has.
+pub fn wait_one_until(handle: Handle, signals: u32, deadline: i64) -> Result<u32, Status> {
     let mut observed: u32 = 0;
     // SAFETY: the kernel writes the signals it saw into `observed`.
     unsafe {
@@ -122,7 +130,7 @@ pub fn wait_one(handle: Handle, signals: u32) -> Result<u32, Status> {
             [
                 handle as usize,
                 signals as usize,
-                i64::MAX as usize, // no deadline
+                deadline as usize,
                 &mut observed as *mut u32 as usize,
                 0,
                 0,
