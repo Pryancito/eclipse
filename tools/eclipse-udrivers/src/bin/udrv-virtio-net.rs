@@ -30,6 +30,7 @@ use udrivers::claim::{self, Dma};
 use udrivers::fifo::Fifo;
 use udrivers::net::{self, Card, Feeder, Msg, Offer};
 use udrivers::queue::Queue;
+use udrivers::status;
 use udrivers::virtio::{self, Device, Setup};
 use udrivers::zx::{self, nr, Status};
 
@@ -141,6 +142,7 @@ fn main() {
 
     let (fifo, kernels) = Fifo::<Msg>::create(net::FIFO_DEPTH)
         .unwrap_or_else(|e| die(format_args!("fifo_create: {e}")));
+    let stack = matches!(taker, Taker::Stack(_));
     match taker {
         Taker::Kernel(report) => {
             // SAFETY: no pointers: two handles, which go to the kernel, the
@@ -179,6 +181,17 @@ fn main() {
             }
         }
     }
+
+    let place = format!("virtio-net@{index}");
+    status::publish(
+        &format!("driver.{place}"),
+        &[
+            ("program", NAME),
+            ("device", &place),
+            ("serves", if stack { "stack" } else { "kernel" }),
+            ("mac", &status::mac_text(mac)),
+        ],
+    );
 
     // Two threads until one of them has a reason to stop, which ends the
     // process: there is nothing to return to. The card's first, then the

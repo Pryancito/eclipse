@@ -16,9 +16,17 @@
 //! Ending something the desktop stands on (labwc, the bar, seatd, D-Bus)
 //! asks for the same press again within four seconds.
 //!
+//! **Servidores**: the microkernel's servers, the services that drive a
+//! device the kernel left to userspace (`udriver=` on its command line):
+//! the program, the device, what the system got from it (`eth0`, `vdb`, or
+//! the address of a stack of its own), its driver's PID and how many times
+//! it was started again, by init and, under a stack, by the stack
+//! (`lunarbar::servers`). The same three buttons act on its service.
+//!
 //! An ordinary xdg-shell window with a server-side frame, refreshed every
-//! second. Tab switches between the two lists, Esc clears the filter or
-//! closes. `--dump PATH:WxH[:servicios]` renders a made-up machine.
+//! second. Tab goes round the three lists, Esc clears the filter or
+//! closes. `--dump PATH:WxH[:servicios|:servidores]` renders a made-up
+//! machine.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
@@ -33,6 +41,7 @@ use lunarbar::keys::{
     KEY_TAB_WL, KEY_UP_WL,
 };
 use lunarbar::proc::{self as lproc, map_shm_pool};
+use lunarbar::servers::{self, Gives, Said, Server};
 use lunarbar::sysinfo;
 use lunarbar::sysmon::{self, Mem, ProcStat, Svc, Verb};
 use wayland_client::{
@@ -91,6 +100,19 @@ const CRITICAL: &[&str] = &[
 enum Tab {
     Procs,
     Svcs,
+    Servers,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Procs, Tab::Svcs, Tab::Servers];
+
+    fn next(self) -> Tab {
+        match self {
+            Tab::Procs => Tab::Svcs,
+            Tab::Svcs => Tab::Servers,
+            Tab::Servers => Tab::Procs,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,12 +184,14 @@ struct Mon {
     m: Machine,
     rows: Vec<Row>,
     svcs: Vec<Svc>,
+    servers: Vec<Server>,
     log: Vec<String>,
     sort: Sort,
     filter: String,
     /// The process selected, by PID, so a refresh does not move it.
     sel_pid: Option<i32>,
     sel_svc: usize,
+    sel_srv: usize,
     top: usize,
     status: String,
     bad: bool,
@@ -183,11 +207,13 @@ impl Mon {
             m: Machine::default(),
             rows: Vec::new(),
             svcs: Vec::new(),
+            servers: Vec::new(),
             log: Vec::new(),
             sort: Sort::Cpu,
             filter: String::new(),
             sel_pid: None,
             sel_svc: 0,
+            sel_srv: 0,
             top: 0,
             status: String::new(),
             bad: false,
@@ -280,6 +306,24 @@ impl Mon {
                     self.reload_log();
                 }
             }
+            Tab::Servers => {
+                if !self.servers.is_empty() {
+                    self.sel_srv = (self.sel_srv as i32 + delta).clamp(0, self.servers.len() as i32 - 1) as usize;
+                    self.reload_log();
+                }
+            }
+        }
+    }
+
+    /// The service the buttons and the log are about: the one selected, or
+    /// on SERVIDORES the selected server's.
+    fn chosen_svc(&self) -> Option<&Svc> {
+        match self.tab {
+            Tab::Servers => {
+                let name = &self.servers.get(self.sel_srv)?.service;
+                self.svcs.iter().find(|s| &s.name == name)
+            }
+            _ => self.svcs.get(self.sel_svc),
         }
     }
 
@@ -303,8 +347,7 @@ impl Mon {
 
     fn reload_log(&mut self) {
         self.log = self
-            .svcs
-            .get(self.sel_svc)
+            .chosen_svc()
             .and_then(|s| s.log.clone())
             .map(|p| sysmon::log_tail(Path::new(&p), LOG_LINES))
             .unwrap_or_default();
@@ -353,7 +396,7 @@ impl Mon {
     }
 
     fn service_verb(&mut self, verb: Verb, act: &mut dyn FnMut(&Pending) -> std::io::Result<()>) {
-        let Some(s) = self.svcs.get(self.sel_svc).cloned() else { return };
+        let Some(s) = self.chosen_svc().cloned() else { return };
         if s.kind != "respawn" {
             self.status = format!("{} {}", s.name, self.lang.s(Key::mon_runs_once_at_boot));
             self.bad = true;
@@ -440,6 +483,19 @@ impl Mon {
         self.sel_svc = self.sel_svc.min(self.svcs.len().saturating_sub(1));
     }
 
+    /// Put the servers together from the services just read, what the
+    /// servers said of themselves and what the kernel shows. A server's
+    /// file counts while its PID is among the processes just read.
+    fn fold_servers(&mut self, said: &[Said], kernel: &servers::Kernel) {
+        let name = self.servers.get(self.sel_srv).map(|s| s.service.clone());
+        let rows = &self.rows;
+        self.servers = servers::servers(&self.svcs, said, kernel, &|pid| rows.iter().any(|r| r.pid == pid));
+        if let Some(n) = name {
+            self.sel_srv = self.servers.iter().position(|s| s.service == n).unwrap_or(0);
+        }
+        self.sel_srv = self.sel_srv.min(self.servers.len().saturating_sub(1));
+    }
+
     fn sample_live(&mut self, prev: &mut Prev) {
         let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
         let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/0".into());
@@ -455,6 +511,7 @@ impl Mon {
             &windows,
             &read(sysmon::SERVICES_FILE),
         );
+        self.fold_servers(&servers::read_dir(Path::new(servers::DIR)), &servers::Kernel::read());
         self.m.root_pct = sysinfo::disk_root_percent();
         self.m.uptime = read("/proc/uptime")
             .split_whitespace()
@@ -529,11 +586,11 @@ fn hit(r: Rect, x: i32, y: i32) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
-fn tabs(w: i32) -> [Rect; 2] {
+fn tabs(w: i32) -> [Rect; 3] {
     let _ = w;
     let x = PAD + 96;
     let y = (HEAD_H - TAB_H) / 2;
-    [(x, y, TAB_W, TAB_H), (x + TAB_W, y, TAB_W, TAB_H)]
+    [(x, y, TAB_W, TAB_H), (x + TAB_W, y, TAB_W, TAB_H), (x + 2 * TAB_W, y, TAB_W, TAB_H)]
 }
 
 /// The top of the process rows, and how many fit.
@@ -619,8 +676,9 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     // Head.
     let hy = (HEAD_H - GLYPH_H) / 2;
     cv.text_bold("MONITOR", PAD, hy, CYAN);
-    for (k, (r, label)) in tabs(w).iter().zip([m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services)]).enumerate() {
-        let on = (k == 0) == (m.tab == Tab::Procs);
+    let labels = [m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services), m.lang.s(Key::mon_servers)];
+    for ((r, label), tab) in tabs(w).iter().zip(labels).zip(Tab::ALL) {
+        let on = tab == m.tab;
         cv.fill_rect_a(r.0, r.1, r.2, r.3, if on { CYAN } else { WELL }, if on { 0.16 } else { 1.0 });
         frame(cv, *r, if on { CYAN } else { HAIRLINE });
         let tx = r.0 + (r.2 - Canvas::text_width(label)) / 2;
@@ -648,8 +706,19 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
             }
             s
         }
+        Tab::Servers => {
+            let run = m.servers.iter().filter(|s| s.state == "running").count();
+            let restarts: u32 = m.servers.iter().map(Server::restarts).sum();
+            format!(
+                "{} {} · {run} {} · {restarts} {}",
+                m.servers.len(),
+                m.lang.s(Key::mon_servers_2),
+                m.lang.s(Key::mon_running),
+                m.lang.s(Key::mon_restarts).to_lowercase()
+            )
+        }
     };
-    let room = w - (tabs(w)[1].0 + TAB_W) - 2 * PAD;
+    let room = w - (tabs(w)[2].0 + TAB_W) - 2 * PAD;
     let summary = fit(&summary, room);
     text_right(cv, &summary, w - PAD, hy, MUTED);
     cv.hline(0, HEAD_H - 1, w, HAIRLINE, 1.0);
@@ -657,6 +726,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     match m.tab {
         Tab::Procs => draw_procs(cv, w, h, m),
         Tab::Svcs => draw_svcs(cv, w, h, m),
+        Tab::Servers => draw_servers(cv, w, h, m),
     }
 }
 
@@ -921,12 +991,159 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     };
     let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
     cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
-    let s = m.svcs.get(m.sel_svc);
+    service_buttons(cv, b, m);
+}
+
+/// INICIAR / REINICIAR / PARAR, lit as the chosen service allows.
+fn service_buttons(cv: &mut Canvas, b: [Rect; 3], m: &Mon) {
+    let s = m.chosen_svc();
     let ctl = s.is_some_and(|s| s.kind == "respawn");
     let running = s.is_some_and(|s| s.pid.is_some());
     button(cv, b[0], m.lang.s(Key::mon_start), if ctl && !running { CYAN } else { MUTED }, false);
     button(cv, b[1], m.lang.s(Key::mon_restart), if ctl { GOLD } else { MUTED }, ctl);
     button(cv, b[2], m.lang.s(Key::mon_stop), if ctl && running { WARN } else { MUTED }, false);
+}
+
+/// What the system got from a server, in a few words.
+fn gives_text(g: &Gives, lang: Lang) -> String {
+    match g {
+        Gives::Iface(Some(n), _) => n.clone(),
+        Gives::Iface(None, _) => lang.s(Key::mon_no_interface_yet).into(),
+        Gives::Stack(addr, _) => format!("{} {addr}", lang.s(Key::mon_stack)),
+        Gives::Disk(Some(n), _) => format!("/dev/{n}"),
+        Gives::Disk(None, _) => lang.s(Key::mon_no_disk_node).into(),
+        Gives::Unknown => "—".into(),
+    }
+}
+
+/// The same, with the card's MAC or the disk's size.
+fn gives_long(g: &Gives, lang: Lang) -> String {
+    let short = gives_text(g, lang);
+    match g {
+        Gives::Stack(addr, mac) => {
+            let own = format!("{} {addr}", lang.s(Key::mon_own_stack));
+            if mac.is_empty() { own } else { format!("{own} · {mac}") }
+        }
+        Gives::Iface(_, mac) if !mac.is_empty() => format!("{short} · {mac}"),
+        Gives::Disk(_, sectors) => format!("{short} · {}", sysmon::fmt_kib(sectors / 2, lang)),
+        Gives::Unknown => lang.s(Key::mon_not_said_yet).into(),
+        _ => short,
+    }
+}
+
+fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
+    let lw = svc_list_w(w);
+    let top = HEAD_H;
+    let body_h = h - HEAD_H - FOOT_H;
+    cv.fill_rect_a(PAD + lw, top, 1, body_h, HAIRLINE, 1.0);
+    // Columns: SERVIDOR, DISPOSITIVO, DA, ESTADO, REINICIOS.
+    let x0 = PAD;
+    let cols = [x0, x0 + 96, x0 + 96 + 128, x0 + lw - 224, x0 + lw - 8];
+    let hy = top + (COLS_H - GLYPH_H) / 2 + 4;
+    cv.text(m.lang.s(Key::mon_server), cols[0], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_device), cols[1], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_gives), cols[2], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_state), cols[3], hy, MUTED);
+    text_right(cv, m.lang.s(Key::mon_restarts), cols[4], hy, MUTED);
+    let ry = top + COLS_H + 8;
+    cv.hline(PAD, ry - 1, lw - 8, HAIRLINE, 1.0);
+    let n = ((body_h - COLS_H - 8) / ROW_H).max(1) as usize;
+    let first = m.sel_srv.saturating_sub(n.saturating_sub(1));
+    if m.servers.is_empty() {
+        // Two lines: the reason is long.
+        let why = m.lang.s(Key::mon_no_servers);
+        let (a, b) = why.split_once(" (").map(|(a, b)| (a.to_string(), format!("({b}"))).unwrap_or((why.into(), String::new()));
+        cv.text(&fit(&a, lw - 16), PAD, ry + 8, MUTED);
+        cv.text(&fit(&b, lw - 16), PAD, ry + 8 + GLYPH_H + 6, DIM);
+    }
+    for (k, s) in m.servers.iter().enumerate().skip(first).take(n) {
+        let y = ry + (k - first) as i32 * ROW_H;
+        let ty = y + (ROW_H - GLYPH_H) / 2;
+        if k == m.sel_srv {
+            cv.fill_rect_a(0, y, PAD + lw, ROW_H, CYAN, 0.08);
+            cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, CYAN, 1.0);
+        }
+        cv.text(&fit(&s.service, cols[1] - cols[0] - 8), cols[0], ty, TEXT);
+        cv.text(&fit(&s.device, cols[2] - cols[1] - 8), cols[1], ty, MUTED);
+        cv.text(&fit(&gives_text(&s.gives, m.lang), cols[3] - cols[2] - 8), cols[2], ty, TEXT);
+        let (word, bad) = sysmon::state_word(&s.state, m.lang);
+        let col = state_col(&s.state, bad);
+        cv.fill_rect_a(cols[3], ty + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
+        cv.text(word, cols[3] + 12, ty, col);
+        let r = s.restarts();
+        text_right(cv, &r.to_string(), cols[4], ty, if r > 0 { GOLD } else { MUTED });
+    }
+
+    // Detail.
+    let dx = PAD + lw + PAD;
+    let dw = w - dx - PAD;
+    if let Some(s) = m.servers.get(m.sel_srv) {
+        let y = top + PAD;
+        let (word, bad) = sysmon::state_word(&s.state, m.lang);
+        let st = match s.pid {
+            Some(p) => format!("{word} · PID {p}"),
+            None => word.to_string(),
+        };
+        text_right(cv, &st, dx + dw, y, state_col(&s.state, bad));
+        let room = dw - Canvas::text_width(&st) - 16;
+        cv.text_bold(&fit(&s.program.to_uppercase(), room), dx, y, CYAN);
+        let line = GLYPH_H + 8;
+        let lab = 18 * GLYPH_W;
+        let cost = |pid: Option<i32>| {
+            pid.and_then(|p| m.rows.iter().find(|r| r.pid == p))
+                .map(|r| format!("{} · {}", pct(r.cpu, m.lang), sysmon::fmt_kib(r.mem_kib, m.lang)))
+        };
+        let mut lines: Vec<(&str, String)> = vec![
+            (m.lang.s(Key::mon_service_2), s.service.clone()),
+            (m.lang.s(Key::mon_device_2), s.device.clone()),
+            (m.lang.s(Key::mon_gives_2), gives_long(&s.gives, m.lang)),
+            (m.lang.s(Key::mon_cpu_memory), cost(s.pid).unwrap_or("—".into())),
+        ];
+        if let Some(d) = s.driver_pid {
+            let what = match cost(Some(d)) {
+                Some(c) => format!("PID {d} · {c}"),
+                None => format!("PID {d}"),
+            };
+            lines.push((m.lang.s(Key::mon_driver), what));
+        }
+        lines.push((m.lang.s(Key::mon_restarts_by_init), s.init_restarts.to_string()));
+        if matches!(s.gives, Gives::Stack(..)) {
+            lines.push((m.lang.s(Key::mon_restarts_by_stack), s.driver_restarts.to_string()));
+        }
+        for (k, (a, b)) in lines.iter().enumerate() {
+            let ly = y + (k as i32 + 1) * line + 4;
+            cv.text(a, dx, ly, MUTED);
+            cv.text(&fit(b, dw - lab), dx + lab, ly, TEXT);
+        }
+        let ly = y + (lines.len() as i32 + 1) * line + 12;
+        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, MUTED);
+        cv.hline(dx, ly + GLYPH_H + 4, dw, HAIRLINE, 1.0);
+        let lb = (dx, ly + GLYPH_H + 12, dw, (h - FOOT_H - PAD - (ly + GLYPH_H + 12)).max(0));
+        cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, WELL, 1.0);
+        frame(cv, lb, HAIRLINE);
+        let fits = ((lb.3 - 16) / (GLYPH_H + 4)).max(0) as usize;
+        if m.log.is_empty() {
+            let keeps = m.chosen_svc().is_some_and(|s| s.log.is_some());
+            let why = if keeps { m.lang.s(Key::mon_the_log_is_empty) } else { m.lang.s(Key::mon_this_service_keeps_no_log) };
+            cv.text(why, lb.0 + 8, lb.1 + 8, DIM);
+        }
+        for (k, l) in m.log.iter().skip(m.log.len().saturating_sub(fits)).enumerate() {
+            cv.text(&fit(l, lb.2 - 16), lb.0 + 8, lb.1 + 8 + k as i32 * (GLYPH_H + 4), MUTED);
+        }
+    }
+
+    // Foot.
+    let fy = h - FOOT_H;
+    cv.hline(0, fy, w, HAIRLINE, 1.0);
+    let b = foot_buttons(w, h);
+    let text = if m.status.is_empty() {
+        m.lang.s(Key::mon_footer_servers_keys).to_string()
+    } else {
+        m.status.clone()
+    };
+    let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
+    cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
+    service_buttons(cv, b, m);
 }
 
 fn state_col(state: &str, bad: bool) -> Rgb {
@@ -961,8 +1178,9 @@ impl Mon {
                 }
             }
             KEY_TAB_WL => {
-                self.tab = if self.tab == Tab::Procs { Tab::Svcs } else { Tab::Procs };
+                self.tab = self.tab.next();
                 self.status.clear();
+                self.reload_log();
             }
             KEY_UP_WL => self.move_sel(-1, rows_visible),
             KEY_DOWN_WL => self.move_sel(1, rows_visible),
@@ -980,9 +1198,9 @@ impl Mon {
                     self.filter.push(c);
                     self.top = 0;
                 }
-                (Tab::Svcs, Some('i')) => self.service_verb(Verb::Start, act),
-                (Tab::Svcs, Some('r')) => self.service_verb(Verb::Restart, act),
-                (Tab::Svcs, Some('p')) => self.service_verb(Verb::Stop, act),
+                (Tab::Svcs | Tab::Servers, Some('i')) => self.service_verb(Verb::Start, act),
+                (Tab::Svcs | Tab::Servers, Some('r')) => self.service_verb(Verb::Restart, act),
+                (Tab::Svcs | Tab::Servers, Some('p')) => self.service_verb(Verb::Stop, act),
                 _ => {}
             },
         }
@@ -990,16 +1208,13 @@ impl Mon {
     }
 
     fn click(&mut self, w: i32, h: i32, x: i32, y: i32, act: &mut dyn FnMut(&Pending) -> std::io::Result<()>) {
-        let t = tabs(w);
-        if hit(t[0], x, y) {
-            self.tab = Tab::Procs;
-            self.status.clear();
-            return;
-        }
-        if hit(t[1], x, y) {
-            self.tab = Tab::Svcs;
-            self.status.clear();
-            return;
+        for (r, tab) in tabs(w).into_iter().zip(Tab::ALL) {
+            if hit(r, x, y) {
+                self.tab = tab;
+                self.status.clear();
+                self.reload_log();
+                return;
+            }
         }
         let b = foot_buttons(w, h);
         match self.tab {
@@ -1050,6 +1265,25 @@ impl Mon {
                     let k = first + ((y - ry) / ROW_H) as usize;
                     if k < self.svcs.len() {
                         self.sel_svc = k;
+                        self.pending = None;
+                        self.reload_log();
+                    }
+                }
+            }
+            Tab::Servers => {
+                for (r, v) in b.iter().zip([Verb::Start, Verb::Restart, Verb::Stop]) {
+                    if hit(*r, x, y) {
+                        return self.service_verb(v, act);
+                    }
+                }
+                let lw = svc_list_w(w);
+                let ry = HEAD_H + COLS_H + 8;
+                let n = ((h - HEAD_H - FOOT_H - COLS_H - 8) / ROW_H).max(1) as usize;
+                let first = self.sel_srv.saturating_sub(n.saturating_sub(1));
+                if x < PAD + lw && y >= ry {
+                    let k = first + ((y - ry) / ROW_H) as usize;
+                    if k < self.servers.len() {
+                        self.sel_srv = k;
                         self.pending = None;
                         self.reload_log();
                     }
@@ -1227,7 +1461,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let n = st.rows_visible();
                 match st.mon.tab {
                     Tab::Procs => st.mon.scroll(if value > 0.0 { 3 } else { -3 }, n),
-                    Tab::Svcs => st.mon.move_sel(if value > 0.0 { 1 } else { -1 }, n),
+                    Tab::Svcs | Tab::Servers => st.mon.move_sel(if value > 0.0 { 1 } else { -1 }, n),
                 }
                 st.render();
             }
@@ -1276,6 +1510,9 @@ fn sample_mon(lang: Lang) -> Mon {
             p(1450, "Web Content", 9000 + k * 30, 22, 310, "/usr/lib/firefox/firefox -contentproc"),
             p(1520, "lunarfile", 100, 2, 18, "lunarfile"),
             p(1601, "lunarnet", 2, 1, 9, "lunarnet"),
+            p(231, "udrv-virtio-blk", 900 + k * 3, 3, 4, "/bin/udrv-virtio-blk 1"),
+            p(240, "eclipse-netstack", 700 + k * 2, 1, 6, "/bin/eclipse-netstack 0 10.0.9.15/24"),
+            p(263, "udrv-virtio-net", 400 + k, 3, 3, "/bin/udrv-virtio-net 0 stack=3"),
         ]
     };
     let stat = |k: u64| {
@@ -1288,10 +1525,23 @@ fn sample_mon(lang: Lang) -> Mon {
     let net = |k: u64| format!("Inter-|\n face |\n    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n  eth0: {} 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0\n", k * 1_258_291, k * 86_016);
     let disk = |k: u64| format!("   3       0 sda {} 0 {} 0 {} 0 {} 0 0 0 0\n", k * 10, k * 6963, k * 3, k * 440);
     let windows = vec![("firefox".to_string(), "Inicio — Mozilla Firefox".to_string()), ("foot".to_string(), "~".to_string()), ("lunarfile".to_string(), "/root".to_string())];
-    let svcs = "# x\nmounts\toneshot\tidle\t-\t1\t-\t-\t/usr/local/bin/eclipse-mounts\nudhcpc\trespawn\trunning\t401\t1\t1793854000\t-\t/usr/local/bin/eclipse-udhcpc\nntpd\trespawn\trunning\t455\t1\t1793854060\t/tmp/ntpd.log\t/usr/local/bin/eclipse-ntpd\ndbus\trespawn\trunning\t470\t1\t1793854000\t-\t/usr/local/bin/eclipse-dbus\nnotify\trespawn\trunning\t488\t1\t1793854000\t-\t/usr/local/bin/eclipse-notify\nseatd\trespawn\trunning\t502\t1\t1793854000\t-\t/usr/local/bin/eclipse-seatd\nlabwc\trespawn\trunning\t612\t1\t1793854000\t/tmp/labwc.log\t/usr/local/bin/labwc\npulseaudio\trespawn\trunning\t598\t2\t1793856000\t-\t/usr/local/bin/eclipse-pulseaudio\nhunterd\trespawn\trunning\t433\t1\t1793854000\t-\t/sbin/hunterd\nportal\trespawn\twaiting\t-\t4\t-\t-\t/usr/local/bin/eclipse-portal\nollama\trespawn\tgiven-up\t-\t20\t-\t/tmp/ollama.log\t/usr/local/bin/eclipse-ollama\nsshd\trespawn\tstopped\t-\t1\t-\t-\t/usr/sbin/sshd -D\n";
+    let svcs = "# x\nmounts\toneshot\tidle\t-\t1\t-\t-\t/usr/local/bin/eclipse-mounts\nudhcpc\trespawn\trunning\t401\t1\t1793854000\t-\t/usr/local/bin/eclipse-udhcpc\nntpd\trespawn\trunning\t455\t1\t1793854060\t/tmp/ntpd.log\t/usr/local/bin/eclipse-ntpd\ndbus\trespawn\trunning\t470\t1\t1793854000\t-\t/usr/local/bin/eclipse-dbus\nnotify\trespawn\trunning\t488\t1\t1793854000\t-\t/usr/local/bin/eclipse-notify\nseatd\trespawn\trunning\t502\t1\t1793854000\t-\t/usr/local/bin/eclipse-seatd\nlabwc\trespawn\trunning\t612\t1\t1793854000\t/tmp/labwc.log\t/usr/local/bin/labwc\npulseaudio\trespawn\trunning\t598\t2\t1793856000\t-\t/usr/local/bin/eclipse-pulseaudio\nhunterd\trespawn\trunning\t433\t1\t1793854000\t-\t/sbin/hunterd\nportal\trespawn\twaiting\t-\t4\t-\t-\t/usr/local/bin/eclipse-portal\nollama\trespawn\tgiven-up\t-\t20\t-\t/tmp/ollama.log\t/usr/local/bin/eclipse-ollama\nsshd\trespawn\tstopped\t-\t1\t-\t-\t/usr/sbin/sshd -D\nublk\trespawn\trunning\t231\t2\t1793865100\t/tmp/ublk.log\t/usr/local/bin/eclipse-ublk\tvirtio-blk@1\nunet\trespawn\trunning\t240\t1\t1793854000\t/tmp/unet.log\t/usr/local/bin/eclipse-unet\tvirtio-net@0\n";
     let t0 = Instant::now();
     m.sample(&mut prev, t0, &stat(0), mem, &net(0), &disk(0), procs(0), &windows, svcs);
     m.sample(&mut prev, t0 + Duration::from_secs(1), &stat(1), mem, &net(1), &disk(1), procs(1), &windows, svcs);
+    let said = [
+        Said::parse("driver.virtio-blk@1", "pid=231\nprogram=udrv-virtio-blk\ndevice=virtio-blk@1\nserves=kernel\nsectors=1048576\n"),
+        Said::parse(
+            "stack.virtio-net@0",
+            "pid=240\nprogram=eclipse-netstack\ndevice=virtio-net@0\nmac=52:54:00:12:34:57\naddr=10.0.9.15/24\ndriver_pid=263\ndriver_starts=3\n",
+        ),
+        Said::parse("driver.virtio-net@0", "pid=263\nprogram=udrv-virtio-net\ndevice=virtio-net@0\nserves=stack\nmac=52:54:00:12:34:57\n"),
+    ];
+    let kernel = servers::Kernel {
+        ifaces: vec![("eth0".into(), "52:54:00:12:34:56".into())],
+        disks: vec![("sda".into(), "67108864".into()), ("vdb".into(), "1048576".into())],
+    };
+    m.fold_servers(&said, &kernel);
     m.m.iface = "eth0".into();
     m.m.addr = "10.0.2.15/24".into();
     m.m.root_pct = Some(41);
@@ -1324,8 +1574,18 @@ fn dump(spec: &str) -> ! {
         std::process::exit(1);
     }
     let mut m = sample_mon(Lang::current());
-    if parts.next() == Some("servicios") {
-        m.tab = Tab::Svcs;
+    match parts.next() {
+        Some("servicios") => m.tab = Tab::Svcs,
+        Some("servidores") => {
+            m.tab = Tab::Servers;
+            m.sel_srv = m.servers.iter().position(|s| s.service == "unet").unwrap_or(0);
+            m.log = vec![
+                "eclipse-netstack: card 0 (52-54-00-12-34-57) is 10.0.9.15/24".into(),
+                "eclipse-netstack: the driver is gone (PEER_CLOSED, signal: 9 (SIGKILL)); starting another".into(),
+                "eclipse-netstack: the driver is gone (PEER_CLOSED, signal: 9 (SIGKILL)); starting another".into(),
+            ];
+        }
+        _ => {}
     }
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
     cv.set_square(true);
@@ -1344,16 +1604,18 @@ fn main() {
     match args.next().as_deref() {
         None => {}
         Some("--dump") => dump(&args.next().unwrap_or_else(|| "lunarmon.raw".into())),
-        Some("--servicios") => {}
+        Some("--servicios" | "--servidores") => {}
         Some(_) => {
-            eprintln!("usage: lunarmon [--servicios | --dump PATH:WxH[:servicios]]");
+            eprintln!("usage: lunarmon [--servicios | --servidores | --dump PATH:WxH[:servicios|:servidores]]");
             std::process::exit(2);
         }
     }
     let mut mon = Mon::new();
     mon.lang = Lang::current();
-    if std::env::args().nth(1).as_deref() == Some("--servicios") {
-        mon.tab = Tab::Svcs;
+    match std::env::args().nth(1).as_deref() {
+        Some("--servicios") => mon.tab = Tab::Svcs,
+        Some("--servidores") => mon.tab = Tab::Servers,
+        _ => {}
     }
     let mut prev = Prev::default();
     mon.sample_live(&mut prev);
@@ -1490,7 +1752,7 @@ mod tests {
         assert_eq!(first.name, "firefox", "the busiest application first");
         assert!(first.window.as_deref().unwrap().contains("Firefox"));
         assert!(items.contains(&Item::Section(m.lang.s(Key::mon_system))));
-        assert_eq!(m.svcs.len(), 12);
+        assert_eq!(m.svcs.len(), 14);
     }
 
     #[test]
@@ -1576,6 +1838,33 @@ mod tests {
     }
 
     #[test]
+    fn the_servers_are_the_services_with_a_device_and_their_buttons_act_on_the_service() {
+        let mut m = sample_mon(Lang::Es);
+        assert_eq!(m.servers.iter().map(|s| s.service.as_str()).collect::<Vec<_>>(), ["ublk", "unet"]);
+        let blk = &m.servers[0];
+        assert_eq!(blk.gives, Gives::Disk(Some("vdb".into()), 1_048_576));
+        assert_eq!(blk.restarts(), 1);
+        let net = &m.servers[1];
+        assert_eq!(net.program, "eclipse-netstack");
+        assert_eq!((net.driver_pid, net.driver_restarts), (Some(263), 2));
+        assert_eq!(gives_long(&net.gives, Lang::Es), "pila propia 10.0.9.15/24 · 52:54:00:12:34:57");
+        // Tab goes round all three lists.
+        m.key(KEY_TAB_WL, false, 10, &mut nothing);
+        assert_eq!(m.tab, Tab::Svcs);
+        m.key(KEY_TAB_WL, false, 10, &mut nothing);
+        assert_eq!(m.tab, Tab::Servers);
+        m.move_sel(1, 10);
+        let mut asked = Vec::new();
+        m.key(19, false, 10, &mut |p| {
+            asked.push(p.clone());
+            Ok(())
+        }); // R
+        assert_eq!(asked, vec![Pending::Service("unet".into(), Verb::Restart)]);
+        m.key(KEY_TAB_WL, false, 10, &mut nothing);
+        assert_eq!(m.tab, Tab::Procs);
+    }
+
+    #[test]
     fn a_click_picks_the_tab_the_sort_and_the_row() {
         let (w, h) = (1180, 760);
         let mut m = sample_mon(Lang::Es);
@@ -1612,14 +1901,17 @@ mod tests {
     #[test]
     fn every_size_and_tab_draws_without_a_panic() {
         let mut m = sample_mon(Lang::Es);
-        for tab in [Tab::Procs, Tab::Svcs] {
+        for tab in Tab::ALL {
             m.tab = tab;
             for (w, h) in [(1180, 760), (800, 560), (1920, 1080)] {
                 draw(&mut Canvas::new(w as usize, h as usize), w, h, &m);
             }
         }
-        let empty = Mon::new();
-        draw(&mut Canvas::new(800, 560), 800, 560, &empty);
+        let mut empty = Mon::new();
+        for tab in Tab::ALL {
+            empty.tab = tab;
+            draw(&mut Canvas::new(800, 560), 800, 560, &empty);
+        }
     }
 
     #[test]
@@ -1631,7 +1923,7 @@ mod tests {
         m.sel_pid = None;
         m.signal_selected(false, &mut |_| Ok(()));
         assert_eq!(m.status, "pick a process from the list");
-        for tab in [Tab::Procs, Tab::Svcs] {
+        for tab in Tab::ALL {
             m.tab = tab;
             draw(&mut Canvas::new(1180, 760), 1180, 760, &m);
         }
