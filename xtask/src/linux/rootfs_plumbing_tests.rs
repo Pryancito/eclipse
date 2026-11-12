@@ -705,6 +705,12 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ),
         ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
         ("ublk", "respawn", "/usr/local/bin/eclipse-ublk", ""),
+        (
+            "ublk-mounts",
+            "oneshot",
+            "/usr/local/bin/eclipse-ublk-mounts",
+            "ublk",
+        ),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         (
             "xkbmap",
@@ -907,9 +913,10 @@ fn only_the_bus_probe_is_gated_on_the_kernel_cmdline() {
 }
 
 /// `udriver =` keeps a driver out of every boot where the kernel drives the
-/// device itself. Only the two drivers that run as processes have it, each
-/// names what its wrapper drives, and each is supervised: a driver that is
-/// not started again leaves the machine without the device until it reboots.
+/// device itself. Only the two drivers that run as processes have it, and
+/// what mounts the served disk; each driver names what its wrapper drives,
+/// and each is supervised: a driver that is not started again leaves the
+/// machine without the device until it reboots.
 #[test]
 fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     let rootfs = init_rootfs("udriver");
@@ -919,15 +926,23 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .collect();
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["ublk", "unet"],
+        ["ublk", "ublk-mounts", "unet"],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
-    for (_, body) in &gated {
-        assert_eq!(field(body, "type"), Some("respawn"));
+    for (name, body) in &gated {
+        let kind = if name == "ublk-mounts" {
+            "oneshot"
+        } else {
+            "respawn"
+        };
+        assert_eq!(field(body, "type"), Some(kind), "{name}");
     }
+    // The mounts: on the boots the disk's driver runs on, after its start.
+    assert_eq!(field(&gated[1].1, "udriver"), field(&gated[0].1, "udriver"));
+    assert_eq!(field(&gated[1].1, "after"), Some("ublk"));
     let wrapper = |name: &str| fs::read_to_string(rootfs.join("usr/local/bin").join(name)).unwrap();
     // The card: the first one, by number.
-    assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-net@0"));
+    assert_eq!(field(&gated[2].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
         unet.contains("exec /bin/udrv-virtio-net 0"),
@@ -995,6 +1010,121 @@ fn the_disk_wrapper_reads_its_number_off_the_command_line() {
     assert_eq!(number("LOG=warn udriver=virtio-blk@0,virtio-blk@3"), "0");
     assert_eq!(number("LOG=warn:udriver=virtio-net@0"), "");
     assert_eq!(number("LOG=warn:noudriver=virtio-blk@4"), "");
+}
+
+/// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run
+/// here with the three things it reaches for swapped for files of this
+/// test's -- fstab, the mount table, and `busybox mount`, which only says
+/// what it was asked. `/dev/null` stands for a disk that is there.
+#[test]
+fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
+    let rootfs = init_rootfs("ublk-mounts");
+    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-ublk-mounts")).unwrap();
+    for needle in [
+        "fstab=/etc/fstab",
+        "< /proc/mounts",
+        "busybox mount -t",
+        "left=50",
+    ] {
+        assert_eq!(
+            script.matches(needle).count(),
+            1,
+            "{needle:?} is no longer in the script exactly once:\n{script}"
+        );
+    }
+    let dir = scratch("ublk-mounts-run");
+    let run = |fstab: &str, mounts: &str| {
+        let (f, m) = (dir.join("fstab"), dir.join("mounts"));
+        fs::write(&f, fstab).unwrap();
+        fs::write(&m, mounts).unwrap();
+        let script = script
+            .replace("fstab=/etc/fstab", &format!("fstab='{}'", f.display()))
+            .replace("< /proc/mounts", &format!("< '{}'", m.display()))
+            .replace("busybox mount -t", "echo mount -t")
+            // Two tenths of a second, not fifty: the wait is what is tested,
+            // not its length.
+            .replace("left=50", "left=2");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+            out.status.code(),
+        )
+    };
+    let at = |name: &str| dir.join(name).display().to_string();
+    let (data, taken, absent) = (at("data"), at("taken"), at("absent"));
+    let fstab = format!(
+        "# /etc/fstab\n\
+         __ECLIPSE_ROOT_DEV__  /          eclipsefs defaults 0 1\n\
+         __ECLIPSE_EFI_DEV___  /boot/efi  vfat defaults,noatime 0 0\n\
+         /dev/null  /  vfat defaults 0 0\n\
+         /dev/null  none  swap sw 0 0\n\
+         /dev/null  {}  vfat defaults,noauto 0 0\n\
+         /dev/null  {taken}  vfat defaults 0 0\n\
+         /dev/null  {data}  vfat defaults,noatime 0 0\n\
+         server:/export  {}  nfs defaults 0 0\n",
+        at("noauto"),
+        at("nfs"),
+    );
+    let mounts = format!("rootfs / rootfs rw 0 0\n/dev/vdb2 {taken} vfat rw 0 0\n");
+
+    // Only the line with a device, a place of its own, no `noauto`, and
+    // nothing mounted there yet.
+    let (out, err, code) = run(&fstab, &mounts);
+    assert_eq!(
+        out,
+        format!("mount -t vfat -o defaults,noatime /dev/null {data}\n"),
+        "stderr: {err}"
+    );
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert!(dir.join("data").is_dir(), "the mount point is made");
+    for name in ["noauto", "taken", "nfs"] {
+        assert!(!dir.join(name).exists(), "{name} was not this script's");
+    }
+
+    // A device that never comes: said, left, and the others still mounted.
+    let late = format!(
+        "/dev/eclipse-no-such-disk1  {absent}  vfat defaults 0 0\n\
+         /dev/eclipse-no-such-disk2  {absent}2  vfat defaults 0 0\n{fstab}"
+    );
+    let started = std::time::Instant::now();
+    let (out, err, code) = run(&late, &mounts);
+    let took = started.elapsed();
+    assert_eq!(
+        out,
+        format!("mount -t vfat -o defaults,noatime /dev/null {data}\n")
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains("/dev/eclipse-no-such-disk1") && err.contains("/dev/eclipse-no-such-disk2"),
+        "a device that did not appear is not named: {err}"
+    );
+    assert!(!dir.join("absent").exists());
+    // One budget for every line: the second missing device costs nothing.
+    assert!(
+        took >= std::time::Duration::from_millis(200),
+        "the script did not wait for the device: {took:?}"
+    );
+
+    // An image with no fstab at all (riscv64's has none): nothing to do,
+    // and nothing to complain about.
+    let none = script
+        .replace("fstab=/etc/fstab", &format!("fstab='{}'", at("no-fstab")))
+        .replace("busybox mount -t", "echo mount -t");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(none)
+        .output()
+        .unwrap();
+    assert_eq!(
+        (out.stdout.len(), out.stderr.len(), out.status.code()),
+        (0, 0, Some(0))
+    );
 }
 
 /// The one `wait_path` in the table is the compositor's `/dev/input`.
@@ -1141,9 +1271,11 @@ fn the_two_sessions_never_start_each_others_clients() {
         "portal",
         "pulseaudio",
         "network",
-        // A card's driver and a disk's; no session needed.
+        // A card's driver and a disk's, and the disk's mounts; no session
+        // needed.
         "unet",
         "ublk",
+        "ublk-mounts",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
