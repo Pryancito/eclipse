@@ -18,6 +18,12 @@ takes the connections.
     scripts/tcp_bench.py 5800 --bulk 8           # 8 MB there and back at once
     scripts/tcp_bench.py 5800 --connections 300  # connect, one echo, close
 
+One direction at a time, against `eclipse-tcp-echo 7001 sink` and
+`eclipse-tcp-echo 7002 source` behind two more forwarded ports:
+
+    scripts/tcp_bench.py 5801 --down 8           # 8 MB to the guest
+    scripts/tcp_bench.py 5802 --up 8             # 8 MB from the guest
+
 Exit status: 0 when everything came back as it was sent, 1 when it did not
 or a connection failed.
 """
@@ -123,6 +129,61 @@ def bulk(args) -> int:
     return 0 if good and got == total and not failed else 1
 
 
+def down(args) -> int:
+    """`down` megabytes to a guest that only reads: done when the guest,
+    having read the end, closes."""
+    total = args.down * 1024 * 1024
+    piece = bytes(i * 7 & 0xFF for i in range(64 * 1024))
+    s = connect(args)
+    s.settimeout(args.patience)
+    start = time.monotonic_ns()
+    sent, extra = 0, 0
+    try:
+        for _ in range(total // len(piece)):
+            s.sendall(piece)
+            sent += len(piece)
+        s.shutdown(socket.SHUT_WR)
+        while True:
+            more = s.recv(65536)
+            if not more:
+                break
+            extra += len(more)
+    except OSError as e:
+        print(f"tcp_bench: {e}")
+        sent = -1
+    took = time.monotonic_ns() - start
+    s.close()
+    print(f"{args.down} MB to the guest: {max(sent, 0)} of {total} bytes taken, {took / 1e9:.3f} s")
+    print(f"megabytes a second, to the guest: {max(sent, 0) / (1024 * 1024) / (took / 1e9):.2f}")
+    return 0 if sent == total and not extra else 1
+
+
+def up(args) -> int:
+    """`up` megabytes from a guest that only writes."""
+    total = args.up * 1024 * 1024
+    piece = bytes(i * 7 & 0xFF for i in range(64 * 1024))
+    s = connect(args)
+    s.settimeout(args.patience)
+    start = time.monotonic_ns()
+    got, good = 0, True
+    try:
+        while got < total:
+            more = s.recv(min(256 * 1024, total - got))
+            if not more:
+                break
+            at = got % len(piece)
+            if more != (piece[at:] + piece * (len(more) // len(piece) + 1))[: len(more)]:
+                good = False
+            got += len(more)
+    except OSError as e:
+        print(f"tcp_bench: {e}")
+    took = time.monotonic_ns() - start
+    s.close()
+    print(f"{args.up} MB from the guest: {got} of {total} bytes, {'intact' if good else 'DAMAGED'}, {took / 1e9:.3f} s")
+    print(f"megabytes a second, from the guest: {got / (1024 * 1024) / (took / 1e9):.2f}")
+    return 0 if good and got == total else 1
+
+
 def connections(args) -> int:
     """`connections` times: connect, one echo of `size` bytes, close."""
     data = bytes(i & 0xFF for i in range(args.size))
@@ -157,12 +218,18 @@ def main() -> int:
     p.add_argument("-c", "--count", type=int, default=1000, help="echoes on one connection")
     p.add_argument("-s", "--size", type=int, default=56, help="bytes of each echo")
     p.add_argument("--bulk", type=int, metavar="MB", help="megabytes to send and read back at once")
+    p.add_argument("--down", type=int, metavar="MB", help="megabytes to send to a guest that only reads")
+    p.add_argument("--up", type=int, metavar="MB", help="megabytes to read from a guest that only writes")
     p.add_argument("--connections", type=int, metavar="N", help="connections, one echo each")
     p.add_argument("--patience", type=float, default=30.0, help="seconds to wait for anything")
     args = p.parse_args()
     try:
         if args.bulk is not None:
             return bulk(args)
+        if args.down is not None:
+            return down(args)
+        if args.up is not None:
+            return up(args)
         if args.connections is not None:
             return connections(args)
         return echoes(args)
