@@ -940,8 +940,14 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert!(
         ublk.contains("/proc/cmdline")
             && ublk.contains("s/^virtio-blk@//p")
-            && ublk.contains("exec /bin/zx-virtio-blk service \"$n\""),
+            && ublk.contains("exec /bin/udrv-virtio-blk \"$n\""),
         "the wrapper no longer runs the driver of the disk the kernel left:\n{ublk}"
+    );
+    // The Rust driver first; the C tool's only where that one is missing.
+    let at = |what: &str| ublk.find(what).unwrap_or(usize::MAX);
+    assert!(
+        at("exec /bin/udrv-virtio-blk") < at("exec /bin/zx-virtio-blk service \"$n\""),
+        "the disk's wrapper no longer prefers the Rust driver:\n{ublk}"
     );
     // The network is set up once the card has a driver to bring it.
     let network = services(&rootfs)

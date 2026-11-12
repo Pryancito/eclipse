@@ -407,6 +407,17 @@ jobs:
           # `default-features = false`, so this builds and tests without libfuse
           # present; only actually mounting needs it.
           cargo test --manifest-path tools/eclipsefs-fuse/Cargo.toml
+          # eclipse-udrivers, the drivers that run as processes (the virtio
+          # disk's so far): a standalone package like the ones above, built
+          # best-effort by `xtask` for the image's musl target, where a break
+          # only means the `ublk` service falls back to the C tool's driver.
+          # What the tests cover is what a driver decides without a device or
+          # a kernel in reach: the words of a claim, the virtio bring-up on
+          # both transports against registers made of memory, the split
+          # queue's rings, and the disk protocol -- which requests are refused
+          # before the device sees them and how a FIFO's worth is cut into
+          # batches.
+          cargo test --manifest-path tools/eclipse-udrivers/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the
