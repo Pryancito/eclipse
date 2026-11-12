@@ -90,6 +90,7 @@ pub(super) fn a_process() -> LinuxProcess {
         itimers: Default::default(),
         aspace_lock: Mutex::new(()),
         syscall_redirect: Default::default(),
+        user_netstack: Default::default(),
         inner: Mutex::new(LinuxProcessInner::default()),
     }
 }

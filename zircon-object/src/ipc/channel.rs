@@ -187,6 +187,15 @@ impl Channel {
         self.check_and_read(|_| Ok(()))
     }
 
+    /// How many messages the peer holds unread: what a writer that must
+    /// not grow the peer's queue without end asks before it writes. None
+    /// when the peer is gone, whose queue went with it.
+    pub fn peer_pending(&self) -> usize {
+        self.peer
+            .upgrade()
+            .map_or(0, |peer| peer.recv_queue.lock().len())
+    }
+
     /// Write a packet to the channel
     pub fn write(&self, msg: T) -> ZxResult {
         self.write_counted(msg).map(|_| ())
@@ -519,6 +528,22 @@ mod tests {
         // read more message should fail.
         assert_eq!(channel0.read().err(), Some(ZxError::SHOULD_WAIT));
         assert_eq!(channel1.read().err(), Some(ZxError::SHOULD_WAIT));
+    }
+
+    #[test]
+    fn a_writer_can_ask_how_many_messages_the_peer_has_unread() {
+        let (channel0, channel1) = Channel::create();
+        assert_eq!(channel0.peer_pending(), 0);
+        channel0.write(message(b"one")).unwrap();
+        channel0.write(message(b"two")).unwrap();
+        // What this end wrote is the other end's to read, not its own.
+        assert_eq!(channel0.peer_pending(), 2);
+        assert_eq!(channel1.peer_pending(), 0);
+        channel1.read().unwrap();
+        assert_eq!(channel0.peer_pending(), 1);
+        // A peer that is gone has nothing unread.
+        drop(channel1);
+        assert_eq!(channel0.peer_pending(), 0);
     }
 
     /// `check_and_read` exists so that a read whose check fails **keeps** the
