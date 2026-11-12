@@ -1,0 +1,30 @@
+[package]
+name = "eclipse-udrivers"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS drivers that run as processes: virtio disk and network card"
+
+# Standalone: NOT a workspace member. It targets userspace
+# (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
+# builds it on its own (see `xtask/src/linux/udriver.rs`), like eclipse-init.
+[workspace]
+
+[lib]
+name = "udrivers"
+path = "src/lib.rs"
+
+[[bin]]
+name = "udrv-virtio-blk"
+path = "src/bin/udrv-virtio-blk.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+# A driver that panics has nothing to unwind into: the kernel resets its
+# device when the process dies and init starts the next one.
+panic = "abort"
+strip = true

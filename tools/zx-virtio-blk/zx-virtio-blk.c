@@ -23,7 +23,8 @@
 //   zx-virtio-blk /dev/vdX [OFFSET_MIB [w]]  (w: time writes there too)
 //   zx-virtio-blk fs /dev/vdXN  (mount the vfat there, read and write it)
 //   zx-virtio-blk service [N]
-//   zx-virtio-blk restart [N [KILLS]]
+//   zx-virtio-blk restart [N [KILLS [c]]]
+//   zx-virtio-blk bench [N [c]]
 //
 // `service` is the driver as what it is for: the disk goes to the kernel
 // and the process serves it until it is killed, checking and writing
@@ -41,6 +42,13 @@
 // remount. Then the same under a process reading the node, then a kill
 // with nobody started after it: a write must fail once the ten seconds are
 // up, and work again when a driver does come.
+//
+// The driver `restart` starts is the one the system runs: the Rust one,
+// /bin/udrv-virtio-blk (tools/eclipse-udrivers), where the image has it,
+// and this program's own `service` where it does not, or with `c`. `bench`
+// starts the same and times it through its node: 4 KiB writes, the vfat
+// when there is one, then the reads of the baseline. It is how the two
+// drivers are compared, one boot each.
 //
 // With `serve` the driver goes on to serve the disk to another process,
 // over a FIFO and a window of its DMA memory, and that process checks and
@@ -1279,6 +1287,11 @@ static int service_disk(zx_handle_t window, int report) {
     return 1;
 }
 
+// The driver the system runs, when the image has it.
+#define SYSTEM_DRIVER "/bin/udrv-virtio-blk"
+// Set by `c`: start this program's own `service` whatever the image has.
+static int own_driver;
+
 // Start the driver as a child, the way a supervisor would, and wait until
 // it says the disk is the kernel's. Its pid, or -1.
 static pid_t start_service(const char *self, long index) {
@@ -1293,6 +1306,11 @@ static pid_t start_service(const char *self, long index) {
         close(up[0]);
         snprintf(a_index, sizeof a_index, "%ld", index);
         snprintf(a_report, sizeof a_report, "%d", up[1]);
+        if (!own_driver && access(SYSTEM_DRIVER, X_OK) == 0) {
+            execl(SYSTEM_DRIVER, SYSTEM_DRIVER, a_index, a_report, (char *)NULL);
+            printf("zx-virtio-blk: exec %s: %s\n", SYSTEM_DRIVER, strerror(errno));
+            _exit(127);
+        }
         execl(self, self, "service", a_index, a_report, (char *)NULL);
         printf("zx-virtio-blk: exec %s: %s\n", self, strerror(errno));
         _exit(127);
@@ -1362,6 +1380,38 @@ static int read_same(const char *path, off_t base, size_t span, int ms, int read
     return 0;
 }
 
+// Which driver start_service() starts, for the log.
+static const char *service_name(void) {
+    return !own_driver && access(SYSTEM_DRIVER, X_OK) == 0 ? SYSTEM_DRIVER : "this program's";
+}
+
+// The driver started as a child, and its disk timed through its node.
+static int bench(const char *self, long index) {
+    char before[128], name[4], node[16], part[20];
+    list_vd(before, sizeof before);
+    pid_t driver = start_service(self, index);
+    if (driver < 0)
+        return 1;
+    if (new_vd(before, name) != 0)
+        die("bench: no new /dev/vdX appeared", 0);
+    snprintf(node, sizeof node, "/dev/%s", name);
+    snprintf(part, sizeof part, "%s1", node);
+    printf("zx-virtio-blk: the driver (%s) is pid %d and its disk is %s\n", service_name(),
+           (int)driver, node);
+    for (int i = 0; i < 100 && access(part, F_OK) != 0; i++)
+        usleep(50000);
+    int fd = open(node, O_RDWR);
+    if (fd < 0)
+        die("bench: open the node, errno", errno);
+    // The fourth MiB: before the partition.
+    double w = time_pwrites(fd, 4096, (off_t)3 << 20, 1 << 19);
+    printf("zx-virtio-blk: kernel %s write 4 KiB %8.1f us\n", node, w / 1000);
+    close(fd);
+    int bad = (access(part, F_OK) == 0 && fs_test(part) != 0) || kernel_baseline(node, 0) != 0;
+    kill_service(driver);
+    return bad;
+}
+
 static int restart_check(const char *self, long index, int kills) {
     char before[128], name[4], node[16], part[20];
     list_vd(before, sizeof before);
@@ -1372,7 +1422,8 @@ static int restart_check(const char *self, long index, int kills) {
         die("restart: no new /dev/vdX appeared", 0);
     snprintf(node, sizeof node, "/dev/%s", name);
     snprintf(part, sizeof part, "%s1", node);
-    printf("zx-virtio-blk: the driver is pid %d and its disk is %s\n", (int)driver, node);
+    printf("zx-virtio-blk: the driver (%s) is pid %d and its disk is %s\n", service_name(),
+           (int)driver, node);
     // The partitions' nodes come a moment after the disk's, once the
     // kernel has read the table through the driver.
     for (int i = 0; i < 100 && access(part, F_OK) != 0; i++)
@@ -1512,8 +1563,14 @@ static int restart_check(const char *self, long index, int kills) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     const char *self = strchr(argv[0], '/') ? argv[0] : "/bin/zx-virtio-blk";
-    if (argc > 1 && !strcmp(argv[1], "restart"))
+    if (argc > 1 && !strcmp(argv[1], "restart")) {
+        own_driver = argc > 4 && !strcmp(argv[4], "c");
         return restart_check(self, argc > 2 ? atol(argv[2]) : 0, argc > 3 ? atoi(argv[3]) : 2);
+    }
+    if (argc > 1 && !strcmp(argv[1], "bench")) {
+        own_driver = argc > 3 && !strcmp(argv[3], "c");
+        return bench(self, argc > 2 ? atol(argv[2]) : 0);
+    }
     if (argc == 3 && !strcmp(argv[1], "fs")) {
         if (fs_test(argv[2]) != 0) {
             char have[128];
