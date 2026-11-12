@@ -930,8 +930,14 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
-        unet.contains("exec /bin/zx-virtio-net service 0"),
+        unet.contains("exec /bin/udrv-virtio-net 0"),
         "the wrapper no longer runs the driver of card 0 as a service:\n{unet}"
+    );
+    // The Rust driver first; the C tool's only where that one is missing.
+    let unet_at = |what: &str| unet.find(what).unwrap_or(usize::MAX);
+    assert!(
+        unet_at("exec /bin/udrv-virtio-net") < unet_at("exec /bin/zx-virtio-net service 0"),
+        "the card's wrapper no longer prefers the Rust driver:\n{unet}"
     );
     // The disk: any, by kind, and the wrapper takes the number from where
     // the kernel took it.

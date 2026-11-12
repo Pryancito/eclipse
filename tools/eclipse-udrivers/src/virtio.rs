@@ -105,6 +105,13 @@ pub struct Device {
     notify: Vec<*mut u8>,
 }
 
+// SAFETY: with `&self` a `Device` only reads and writes registers
+// ([`Device::notify`], [`Device::ack`], the configuration), each access
+// whole in itself and the device's to order: two threads may share one, as
+// the network driver's do.
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
 impl Device {
     /// The device whose register window starts at `regs`.
     ///

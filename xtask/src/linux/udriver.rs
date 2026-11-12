@@ -9,11 +9,12 @@
 //! mounted on it.
 //!
 //! The drivers the system runs are Rust, the binaries of
-//! `tools/eclipse-udrivers`: `udrv-virtio-blk` for a virtio disk. The C
-//! programs in `tools/zx-virtio-blk` and `tools/zx-virtio-net` are the
-//! tools that check and time a driver; each also carries a driver of its
-//! own (`service`), which is what the network card still runs, and what the
-//! disk falls back to in an image whose Rust build failed.
+//! `tools/eclipse-udrivers`: `udrv-virtio-blk` for a virtio disk and
+//! `udrv-virtio-net` for a virtio network card. The C programs in
+//! `tools/zx-virtio-blk` and `tools/zx-virtio-net` are the tools that check
+//! and time a driver; each also carries a driver of its own (`service`),
+//! which is what a service falls back to in an image whose Rust build
+//! failed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ const TOOLS: [&str; 2] = ["zx-virtio-net", "zx-virtio-blk"];
 
 /// The Rust drivers' package, under `tools/`, and its binaries.
 const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
-const DRIVERS: [&str; 1] = ["udrv-virtio-blk"];
+const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
 
 /// The `unet` and `ublk` services and the wrappers they run.
 ///
@@ -59,8 +60,11 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # Eclipse OS: the userspace driver of the network card the kernel\n\
           # left alone (udriver=virtio-net@0), in the foreground for\n\
           # eclipse-init, which starts it again if it dies. The kernel keeps\n\
-          # the interface meanwhile. See tools/zx-virtio-net.\n\
-          [ -x /bin/zx-virtio-net ] || { echo 'eclipse-unet: /bin/zx-virtio-net is not in this image' >&2; sleep 5; exit 127; }\n\
+          # the interface meanwhile. See tools/eclipse-udrivers.\n\
+          [ -x /bin/udrv-virtio-net ] && exec /bin/udrv-virtio-net 0\n\
+          # An image whose Rust build failed: the C tool carries a driver too.\n\
+          echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image, trying zx-virtio-net' >&2\n\
+          [ -x /bin/zx-virtio-net ] || { echo 'eclipse-unet: /bin/zx-virtio-net is not in this image either' >&2; sleep 5; exit 127; }\n\
           exec /bin/zx-virtio-net service 0\n",
     )
     .unwrap();

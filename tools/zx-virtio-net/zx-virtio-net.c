@@ -35,7 +35,7 @@
 // its addresses and the connections through it; the next `service` gets
 // the same card and the same interface, and what was waiting goes out.
 //
-//   zx-virtio-net restart [N [ROUNDS [PORT [KILLS]]]]
+//   zx-virtio-net restart [N [ROUNDS [PORT [KILLS [c]]]]]
 //
 // The check of that: starts the driver as a child, gives the interface an
 // address and pings; then KILLS times (default 2) kills the driver with
@@ -44,6 +44,16 @@
 // under the same name, the download must finish, and the gateway must
 // answer pings with no address set again. At the end the driver is killed
 // and not started again, and the interface must go.
+//
+// The driver `restart` starts is the one the system runs: the Rust one,
+// /bin/udrv-virtio-net (tools/eclipse-udrivers), where the image has it,
+// and this program's own `service` where it does not, or with `c`.
+//
+//   zx-virtio-net bench [N [ROUNDS [PORT [c]]]]
+//
+// Starts the same driver as a child and uses the interface as `export`'s
+// check does: pings, and three downloads when PORT is given. It is how the
+// two drivers are compared, one boot each.
 //
 //   zx-virtio-net ping IFACE ADDRESS GATEWAY [ROUNDS]
 //
@@ -957,6 +967,16 @@ static int service(long index, int report) {
     return 0;
 }
 
+// The driver the system runs, when the image has it.
+#define SYSTEM_DRIVER "/bin/udrv-virtio-net"
+// Set by `c`: start this program's own `service` whatever the image has.
+static int own_driver;
+
+// Which driver start_driver() starts, for the log.
+static const char *driver_name(void) {
+    return !own_driver && access(SYSTEM_DRIVER, X_OK) == 0 ? SYSTEM_DRIVER : "this program's";
+}
+
 // Start the driver as a child, the way a supervisor would, and wait until
 // it says the card is up. Its pid, or -1.
 static pid_t start_driver(long index) {
@@ -968,6 +988,14 @@ static pid_t start_driver(long index) {
         die("fork", errno);
     if (pid == 0) {
         close(up[0]);
+        if (!own_driver && access(SYSTEM_DRIVER, X_OK) == 0) {
+            char a_index[24], a_report[24];
+            snprintf(a_index, sizeof a_index, "%ld", index);
+            snprintf(a_report, sizeof a_report, "%d", up[1]);
+            execl(SYSTEM_DRIVER, SYSTEM_DRIVER, a_index, a_report, (char *)NULL);
+            printf("zx-virtio-net: exec %s: %s\n", SYSTEM_DRIVER, strerror(errno));
+            _exit(127);
+        }
         _exit(service(index, up[1]));
     }
     close(up[1]);
@@ -1001,6 +1029,26 @@ static int ping_once(const char *what, const char *gw, int rounds, int size) {
 // download from, and started again. The interface must keep its name and
 // its address, the download must finish, and when the driver is killed and
 // not started again the interface must go.
+// The driver started as a child, and its interface used: pings, and
+// downloads when there is a `port` to fetch from.
+static int bench(long index, int rounds, int port) {
+    char name[16];
+    pid_t driver = start_driver(index);
+    if (driver < 0)
+        return 1;
+    if (find_ifname(name, sizeof name) != 0) {
+        printf("zx-virtio-net: FAIL: no interface has the card's address\n");
+        return 1;
+    }
+    printf("zx-virtio-net: the card is %s, its driver (%s) pid %d\n", name, driver_name(),
+           (int)driver);
+    int bad = ping_through(name, "driver in userspace", "10.0.3.15", "10.0.3.2", rounds, port);
+    kill_driver(driver);
+    if (!bad)
+        printf("zx-virtio-net: all checks passed\n");
+    return bad;
+}
+
 static int restart_check(long index, int rounds, int port, int kills) {
     const char *ip = "10.0.3.15", *gw = "10.0.3.2";
     char name[16], now[16], cmd[256];
@@ -1011,7 +1059,8 @@ static int restart_check(long index, int rounds, int port, int kills) {
         printf("zx-virtio-net: FAIL: no interface has the card's address\n");
         return 1;
     }
-    printf("zx-virtio-net: the card is %s\n", name);
+    printf("zx-virtio-net: the card is %s, its driver (%s) pid %d\n", name, driver_name(),
+           (int)driver);
     snprintf(cmd, sizeof cmd, "ifconfig %s %s netmask 255.255.255.0 up", name, ip);
     if (sh(cmd) != 0 || ping_once("first driver", gw, rounds, 56) != 0)
         return 1;
@@ -1081,9 +1130,16 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "service"))
         return service(argc > 2 ? atol(argv[2]) : 0, -1);
-    if (argc > 1 && !strcmp(argv[1], "restart"))
+    if (argc > 1 && !strcmp(argv[1], "restart")) {
+        own_driver = argc > 6 && !strcmp(argv[6], "c");
         return restart_check(argc > 2 ? atol(argv[2]) : 0, argc > 3 ? atoi(argv[3]) : 20,
                              argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 2);
+    }
+    if (argc > 1 && !strcmp(argv[1], "bench")) {
+        own_driver = argc > 5 && !strcmp(argv[5], "c");
+        return bench(argc > 2 ? atol(argv[2]) : 0, argc > 3 ? atoi(argv[3]) : 200,
+                     argc > 4 ? atoi(argv[4]) : 0);
+    }
     int exporting = argc > 1 && !strcmp(argv[1], "export");
     if (exporting) {
         argv++;
