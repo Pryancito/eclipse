@@ -62,6 +62,7 @@ pub(crate) use self::stat::StatMode;
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) use self::stat::Statx;
 mod xattr;
+mod xdiag;
 pub(crate) use xattr::{XattrOp, XattrTarget};
 
 impl Syscall<'_> {

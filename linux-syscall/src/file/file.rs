@@ -389,7 +389,7 @@ impl Syscall<'_> {
         // can never carry these markers.
         if <FileDesc as Into<i32>>::into(fd) <= 2 {
             if let Ok(peek) = base.as_slice(len.min(512)) {
-                tee_x_diag(peek);
+                super::xdiag::tee(peek);
             }
         }
         let proc = self.linux_process();
@@ -748,7 +748,7 @@ impl Syscall<'_> {
             }
             // stdout/stderr only — see sys_write.
             if <FileDesc as Into<i32>>::into(fd) <= 2 {
-                tee_x_diag(&buf[..n]);
+                super::xdiag::tee(&buf[..n]);
             }
             if !self.hunter_allows_write(&file_like, &buf[..n]) {
                 // hunter refused (ransomware, see `hunter_gate`): what was
@@ -3161,80 +3161,6 @@ numeric_enum_macro::numeric_enum! {
         SETLKW = 7,
         /// like F_DUPFD, but additionally set the close-on-exec flag
         DUPFD_CLOEXEC = F_LINUX_SPECIFIC_BASE + 6,
-    }
-}
-
-/// Tee X-server log/error lines into the dmesg ring (prefixed `XLOG:`) so the
-/// reason a graphics server (Xorg) aborts is visible via `dmesg`, even when its
-/// own logfile is unreachable. Scans a small prefix of each write for the
-/// markers Xorg uses for warnings, errors and fatals.
-fn tee_x_diag(buf: &[u8]) {
-    let scan = &buf[..buf.len().min(1024)];
-    let has = |needle: &[u8]| scan.windows(needle.len()).any(|w| w == needle);
-    // Xorg's own log markers …
-    let x_marker =
-        has(b"(EE)") || has(b"(WW)") || has(b"Fatal") || has(b"no screens") || has(b"(II) ");
-    // … plus the messages the *dynamic linker* prints to stderr when a program
-    // dies before it ever reaches main(). Xorg pulls in far more shared
-    // libraries than a typical CLI app, so a single missing `.so` or unresolved
-    // symbol makes musl's ld abort with one of these — and that path produces
-    // no Xorg log at all, which is exactly the "X won't start, no logs"
-    // symptom. Surface those into dmesg so the failing library/symbol is named.
-    let ld_error = has(b"Error loading shared library")
-        || has(b"Error relocating")
-        || has(b"symbol not found")
-        || has(b"No such file")
-        || has(b"cannot open shared object")
-        || has(b"version `")
-        || has(b"undefined symbol");
-    // … plus the failure text an X *CLIENT* prints. None of the markers above
-    // ever appear for a client that cannot reach the server: it dies with
-    // Xlib's own wording instead. A client launched from a menu, a script or
-    // a terminal the reporter has since closed writes that wording to a
-    // stderr nobody is capturing, so the single line naming the failure is
-    // lost and the bug reads as "it just doesn't work". Tee it into dmesg,
-    // which is the channel that survives.
-    //
-    // "open display" alone covers every phrasing in the wild ("couldn't open
-    // display", "cannot open display", "Can't open display", "unable to open
-    // display"); "XIO:"/"X connection to" catch a connection that dies
-    // mid-session; the RGB/GLX-visual refusals are what mesa-demos print when
-    // the server answers but offers no usable visual.
-    // …and the GL loader's own failures, which is where a client that reached
-    // the server and then could not get a usable context reports itself:
-    // "MESA: error: ZINK: vkQueueSubmit failed (VK_ERROR_DEVICE_LOST)",
-    // libGL/libEGL loader errors, a DRI3 handshake that fell back or failed.
-    // Without these the kernel's own lines and the client's explanation live
-    // in two different places, and only one of them survives the session.
-    let x_client_error = has(b"open display")
-        || has(b"XIO:")
-        || has(b"X connection to")
-        || has(b"Xlib:")
-        || has(b"xcb_connection")
-        || has(b"couldn't get an RGB")
-        || has(b"RGB GLX visual")
-        || has(b"MESA: error")
-        || has(b"libGL error")
-        || has(b"libEGL warning")
-        || has(b"failed to load driver")
-        || has(b"DRI3");
-    // Budget the client group only: a program looping on the same refusal
-    // (a respawning service, a shell loop) must not flood the console. The
-    // server/linker groups are unbudgeted as before — they fire once per
-    // start attempt.
-    if x_client_error && !x_marker && !ld_error {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static CLIENT_BUDGET: AtomicU32 = AtomicU32::new(0);
-        if CLIENT_BUDGET.fetch_add(1, Ordering::Relaxed) >= 24 {
-            return;
-        }
-    }
-    if x_marker || ld_error || x_client_error {
-        if let Ok(s) = core::str::from_utf8(scan) {
-            for line in s.split('\n').filter(|l| !l.is_empty()).take(6) {
-                kernel_hal::klog_info!("XLOG: {}", line);
-            }
-        }
     }
 }
 
