@@ -2040,13 +2040,43 @@ impl<'a> TcpSocket<'a> {
         }
     }
 
+    /// How far the window must have opened, past what the peer was last
+    /// told, for the news to be worth a segment of its own: half of the
+    /// largest window that can be advertised.
+    ///
+    /// Any growth at all used to be announced. With the receive buffer full
+    /// -- an application that reads slower than the peer sends -- every
+    /// `read` of 4 KiB then went out as a window update, the peer answered
+    /// each with the three segments that fit, and those were acknowledged
+    /// with the window nearly shut again: a 32 MiB download took 4300
+    /// segments of ours and 2700 bursts instead of 550 of each, and up to a
+    /// quarter longer. This is the receiver's half of silly window syndrome
+    /// avoidance (RFC 9293, 3.8.6.2.2), with a coarser step than the
+    /// segment size the RFC asks for at least: what a round trip costs here
+    /// is by the burst, not by the byte.
+    ///
+    /// A peer is never left waiting for news that does not come: either it
+    /// was last told of half the largest window or more, which it can use,
+    /// or a reader that empties the buffer opens the window by this much.
+    fn window_update_step(&self) -> u16 {
+        let largest = cmp::min(
+            self.rx_buffer.capacity() >> self.remote_win_shift as usize,
+            (1 << 16) - 1,
+        ) as u16;
+        cmp::max(largest / 2, 1)
+    }
+
     fn window_to_update(&self) -> bool {
         match self.state {
             State::SynSent
             | State::SynReceived
             | State::Established
             | State::FinWait1
-            | State::FinWait2 => self.scaled_window() > self.remote_last_win,
+            | State::FinWait2 => {
+                let window = self.scaled_window();
+                window > self.remote_last_win
+                    && window - self.remote_last_win >= self.window_update_step()
+            }
             _ => false,
         }
     }
@@ -5912,6 +5942,68 @@ mod test {
             window_len: 6,
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_window_update_waits_for_half_the_buffer() {
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 8]);
+        s.assembler = Assembler::new(s.rx_buffer.capacity());
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdefgh"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        // A small read opens the window, but not by enough to say so.
+        s.recv(|buffer| (2, buffer[0])).unwrap();
+        assert!(!s.window_to_update());
+        recv!(s, time 0, Err(Error::Exhausted));
+        // Half the buffer free: now the peer is told.
+        s.recv(|buffer| (2, buffer[0])).unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 8),
+            window_len: 4,
+            ..RECV_TEMPL
+        }));
+        // The step counts from what the peer was last told, not from zero.
+        s.recv(|buffer| (2, buffer[0])).unwrap();
+        recv!(s, time 0, Err(Error::Exhausted));
+        s.recv(|buffer| (2, buffer[0])).unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 8),
+            window_len: 8,
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_window_update_step_of_a_large_buffer() {
+        // Without window scaling the largest window is 65535 however big
+        // the buffer is, and the step is half of that, not half the buffer.
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 512 * 1024]);
+        s.assembler = Assembler::new(s.rx_buffer.capacity());
+        assert_eq!(s.remote_win_shift, 0);
+        assert_eq!(s.window_update_step(), 32767);
+        s.remote_last_win = 400;
+        assert!(s.window_to_update());
+        s.remote_last_win = 40000;
+        assert!(!s.window_to_update());
     }
 
     #[test]
