@@ -385,7 +385,9 @@ fn largest_entries(dir: &Path, n: usize) -> Vec<(u64, String)> {
     };
     for entry in top.flatten() {
         let p = entry.path();
-        let is_dir = fs::symlink_metadata(&p).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = fs::symlink_metadata(&p)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         let mut pushed = false;
         if is_dir {
             if let Ok(sub) = fs::read_dir(&p) {
@@ -403,7 +405,7 @@ fn largest_entries(dir: &Path, n: usize) -> Vec<(u64, String)> {
             all.push((sfs_payload_bytes_of(&p), rel));
         }
     }
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|e| std::cmp::Reverse(e.0));
     all.truncate(n);
     all
 }
@@ -412,7 +414,9 @@ fn largest_entries(dir: &Path, n: usize) -> Vec<(u64, String)> {
 fn sfs_payload_bytes_of(p: &Path) -> u64 {
     match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => sfs_payload_bytes(p),
-        Ok(m) => (1 + m.len().div_ceil(rcore_fs_sfs::BLKSIZE as u64)) * rcore_fs_sfs::BLKSIZE as u64,
+        Ok(m) => {
+            (1 + m.len().div_ceil(rcore_fs_sfs::BLKSIZE as u64)) * rcore_fs_sfs::BLKSIZE as u64
+        }
         Err(_) => 0,
     }
 }
@@ -1221,7 +1225,10 @@ mod image_size_tests {
         for payload in [3413 * MIB, 3414 * MIB, 3500 * MIB, 4031 * MIB] {
             let size = qemu_live_image_size_on_fat32(payload).unwrap() as u64;
             assert!(size <= FAT32_MAX_FILE, "{size} for {payload}");
-            assert!(size >= payload + 64 * MIB, "{size} leaves no room for {payload}");
+            assert!(
+                size >= payload + 64 * MIB,
+                "{size} leaves no room for {payload}"
+            );
             assert_eq!(size % MIB, 0);
         }
         // Too big even with the least headroom: an error that says so.
