@@ -18,10 +18,15 @@
 //!
 //! Three threads share the stack, under one lock. The card's takes what
 //! the driver says, a turn in one system call, and sends the kernel the
-//! datagrams that arrived. The sockets' takes what the kernel says, a
-//! message in one system call, and tells the driver of the frames that
-//! made. The third wakes once a second for what no message brings about:
-//! asking again for a neighbour that did not answer.
+//! datagrams that arrived, all in one message. The sockets' takes what
+//! the kernel says, every message that is waiting, and tells the driver of
+//! the frames that made, all in one write. The third wakes once a second
+//! for what no message brings about: asking again for a neighbour that did
+//! not answer.
+//!
+//! One message for many datagrams is what keeps this from costing a
+//! change of process for each: whoever is woken runs at once, so a wake
+//! for every datagram is a datagram at a time through four processes.
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the driver
 //! cannot be started or gives no card.
@@ -32,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use netstack::port::Port;
-use netstack::socks::{Stack, MESSAGE_MAX};
+use netstack::socks::{Arrived, Stack, MESSAGE_MAX};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
@@ -161,24 +166,47 @@ struct Shared {
 
 type Lock = Arc<Mutex<Shared>>;
 
-/// The lock, whatever became of the thread that had it last: the process
+/// A lock, whatever became of the thread that had it last: the process
 /// ends on a panic, so nobody is left to see a poisoned one.
-fn locked(shared: &Lock) -> MutexGuard<'_, Shared> {
-    shared.lock().unwrap_or_else(|e| e.into_inner())
+fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The link to the kernel: the channel the sockets' messages travel on.
-type Kernel = Option<Arc<Channel>>;
+struct Kernel {
+    channel: Channel,
+    /// Held to send what arrived, and taken before the stack's lock is
+    /// let go: the datagrams reach the kernel in the order they left the
+    /// stack, and no thread waits for the stack while another is in the
+    /// middle of telling the kernel.
+    sending: Mutex<()>,
+}
 
-/// Carry the frames through the stack, and what arrived for a socket to
-/// the kernel. Called with the lock held.
-fn poll(stack: &mut Stack<Port>, kernel: &Kernel) {
-    stack.poll(now(), |data| {
-        if let Some(kernel) = kernel {
-            // A kernel that is gone took the machine with it.
-            let _ = kernel.write(data, &[]);
+/// Carry the frames through the stack and tell the kernel what arrived
+/// for its sockets. Takes the lock, which it lets go before the kernel is
+/// told: that write wakes whoever reads the socket, who runs at once and
+/// has something to send before this thread is back.
+fn turn(mut shared: MutexGuard<'_, Shared>, kernel: Option<&Kernel>, data: &mut Vec<u8>) {
+    shared.stack.poll(now());
+    // Without the kernel there are no sockets for anything to arrive on.
+    let Some(kernel) = kernel else { return };
+    loop {
+        let arrived = shared.stack.arrived(data);
+        if arrived == Arrived::Nothing {
+            return;
         }
-    });
+        let sending = locked(&kernel.sending);
+        if arrived == Arrived::All {
+            drop(shared);
+            // A kernel that is gone took the machine with it.
+            let _ = kernel.channel.write(data, &[]);
+            return;
+        }
+        // More than a message holds, which a card's turn rarely brings:
+        // this one goes under the lock, and the next is asked for.
+        let _ = kernel.channel.write(data, &[]);
+        drop(sending);
+    }
 }
 
 /// Tell the driver, from a thread that is not the card's, what this turn
@@ -214,62 +242,74 @@ fn tell_driver(shared: &Lock, msgs: &mut [Msg; TURN]) {
 /// One system call a turn (`eclipse_fifo_reply_wait`): what the last turn
 /// left to say -- the receive slots that were read, the frames to send --
 /// goes out, and the call comes back with what the card did meanwhile.
-fn serve(shared: &Lock, kernel: &Kernel, fifo: &Fifo<Msg>) -> Status {
+/// One more when a datagram arrived for a socket, to tell the kernel.
+fn serve(shared: &Lock, kernel: Option<&Kernel>, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); TURN];
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
         let replies = locked(shared).stack.device().outgoing(&mut msgs);
         let got = match fifo.reply_wait(&mut msgs, replies) {
             Ok(got) => got,
             Err(e) => return e,
         };
-        let mut shared = locked(shared);
+        let shared = locked(shared);
         for m in &msgs[..got] {
             if !shared.stack.device().take(m) {
                 println!("{NAME}: a message from the driver that means nothing: {m:?}");
             }
         }
         // Every frame that has room for its answer, in one go.
-        poll(&mut shared.stack, kernel);
+        turn(shared, kernel, &mut data);
     }
 }
+
+/// The most messages of the kernel's done before the driver is told of
+/// the frames they made: fewer than a socket holds on their way to the
+/// card, so a program that sends in a burst loses none to that.
+const BURST: usize = 16;
 
 /// Do what the kernel asks for its sockets, until the kernel's end of the
 /// channel is gone (which it never is: it outlives this process).
 ///
-/// One system call a message (`eclipse_channel_reply_wait`, with nothing
-/// to reply), and one more when the message was a datagram to send, to
-/// tell the driver.
-fn serve_sockets(shared: Lock, kernel: Arc<Channel>) {
+/// One system call for the first message (`eclipse_channel_reply_wait`,
+/// with nothing to reply), one for each that is already waiting behind it
+/// and one that finds no more, and then one to tell the driver of all the
+/// frames they made.
+fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
     let mut message = vec![0u8; MESSAGE_MAX];
     let mut msgs = [Msg::default(); TURN];
-    let link = Some(kernel.clone());
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
+    let debug = std::env::var_os("NETSTACK_DEBUG").is_some();
     loop {
-        let len = match kernel.wait_read(&mut message) {
+        let mut len = match kernel.channel.wait_read(&mut message) {
             Ok(len) => len,
             Err(e) => {
                 println!("{NAME}: the kernel's channel is gone ({e}): no more sockets");
                 return;
             }
         };
-        let sends = {
-            let mut shared = locked(&shared);
-            match shared.stack.request(&message[..len]) {
-                Ok(true) => {
-                    poll(&mut shared.stack, &link);
-                    true
-                }
-                Ok(false) => false,
+        let mut sends = false;
+        for done in 1.. {
+            match locked(&shared).stack.request(&message[..len]) {
+                Ok(send) => sends |= send,
                 // A datagram that cannot go is dropped, as on any network;
                 // anything else the kernel does not send.
-                Err(why) => {
-                    if std::env::var_os("NETSTACK_DEBUG").is_some() {
-                        println!("{NAME}: refused ({why:?}) a message of {len} bytes");
-                    }
-                    false
+                Err(why) if debug => {
+                    println!("{NAME}: refused ({why:?}) a message of {len} bytes")
                 }
+                Err(_) => {}
             }
-        };
+            if done == BURST {
+                break;
+            }
+            match kernel.channel.try_read(&mut message) {
+                Ok(Some(next)) => len = next,
+                // Nothing more, or no kernel: the wait above says which.
+                _ => break,
+            }
+        }
         if sends {
+            turn(locked(&shared), Some(&kernel), &mut data);
             tell_driver(&shared, &mut msgs);
         }
     }
@@ -277,16 +317,17 @@ fn serve_sockets(shared: Lock, kernel: Arc<Channel>) {
 
 /// Once a second, do what the stack has pending that no frame and no
 /// message will make it do.
-fn keep_time(shared: Lock, kernel: Kernel) {
+fn keep_time(shared: Lock, kernel: Option<Arc<Kernel>>) {
     let mut msgs = [Msg::default(); TURN];
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
         std::thread::sleep(Duration::from_secs(1));
         {
-            let mut shared = locked(&shared);
-            if !shared.stack.restless(now()) {
+            let guard = locked(&shared);
+            if !guard.stack.restless(now()) {
                 continue;
             }
-            poll(&mut shared.stack, &kernel);
+            turn(guard, kernel.as_deref(), &mut data);
         }
         tell_driver(&shared, &mut msgs);
     }
@@ -294,7 +335,7 @@ fn keep_time(shared: Lock, kernel: Kernel) {
 
 /// Become the stack the kernel's served sockets use: the channel it will
 /// speak on, or why there is none.
-fn register(max_datagram: usize) -> Result<Arc<Channel>, String> {
+fn register(max_datagram: usize) -> Result<Arc<Kernel>, String> {
     let (ours, theirs) = Channel::create().map_err(|e| format!("channel_create: {e}"))?;
     let theirs = theirs.into_handle();
     // SAFETY: no pointers. The handle is the kernel's when the call works.
@@ -305,7 +346,10 @@ fn register(max_datagram: usize) -> Result<Arc<Channel>, String> {
         )
     };
     match served {
-        Ok(_) => Ok(Arc::new(ours)),
+        Ok(_) => Ok(Arc::new(Kernel {
+            channel: ours,
+            sending: Mutex::new(()),
+        })),
         Err(e) => {
             zx::close(theirs);
             Err(match e {
@@ -338,7 +382,7 @@ fn main() {
         .ip_addrs(vec![IpCidr::Ipv4(addr)])
         .finalize();
     let stack = Stack::new(iface);
-    let kernel: Kernel = match register(stack.max_datagram()) {
+    let kernel: Option<Arc<Kernel>> = match register(stack.max_datagram()) {
         Ok(kernel) => Some(kernel),
         Err(why) => {
             println!("{NAME}: no sockets, only the address: {why}");
@@ -370,7 +414,7 @@ fn main() {
     let mut pause = Duration::from_millis(100);
     loop {
         let since = std::time::Instant::now();
-        let why = serve(&shared, &kernel, &link.fifo);
+        let why = serve(&shared, kernel.as_deref(), &link.fifo);
         let status = link.driver.wait();
         println!(
             "{NAME}: the driver is gone ({why}{}); starting another",

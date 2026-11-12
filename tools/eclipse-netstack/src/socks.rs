@@ -11,7 +11,8 @@
 //! BIND    (kernel to stack)  16  u16 port
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u16 zero  24  the datagram
 //! CLOSE   (kernel to stack)
-//! DATA    (stack to kernel)  16  [u8; 4] from  20  u16 port  22  u16 zero  24  the datagram
+//! DATA    (stack to kernel)  16  one record after another, to the end:
+//!             0  u64 socket  8  [u8; 4] from  12  u16 port  14  u16 length  16  the datagram
 //! ```
 //!
 //! little-endian, the addresses as they are written
@@ -19,7 +20,9 @@
 //! the same). The kernel numbers the sockets and gives out the ports, so a
 //! `BIND` is told, not asked: the stack opens a smoltcp socket on that
 //! port and from then on every datagram that arrives for it goes to the
-//! kernel as a `DATA`, at once, and every `SEND` goes to the card.
+//! kernel, at once, and every `SEND` goes to the card. A `DATA` carries
+//! all the datagrams of a turn of the stack, for whichever sockets (its
+//! header's socket is zero): the kernel is woken once for them all.
 //!
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
@@ -40,8 +43,10 @@ pub const OP_DATA: u32 = 4;
 
 /// What every message starts with.
 pub const HEADER_LEN: usize = 16;
-/// Where the datagram starts in `SEND` and `DATA`.
+/// Where the datagram starts in `SEND`.
 pub const DATAGRAM_AT: usize = 24;
+/// What each record of a `DATA` starts with.
+pub const RECORD_LEN: usize = 16;
 /// The longest message: a channel's.
 pub const MESSAGE_MAX: usize = 65536;
 
@@ -81,17 +86,33 @@ pub fn parse_header(m: &[u8]) -> Option<(u32, u64)> {
     Some((op, sock))
 }
 
-/// Write the `DATA` message of a datagram into `m`: `data`, from
-/// `addr:port`, for socket `sock`.
-pub fn data_message(m: &mut Vec<u8>, sock: u64, addr: [u8; 4], port: u16, data: &[u8]) {
+/// Make `m` a `DATA` with no records yet.
+pub fn start_data(m: &mut Vec<u8>) {
     m.clear();
     m.extend_from_slice(&0u32.to_le_bytes());
     m.extend_from_slice(&OP_DATA.to_le_bytes());
+    m.extend_from_slice(&0u64.to_le_bytes());
+}
+
+/// Add a record to the `DATA` message `m`: `data`, from `addr:port`, for
+/// socket `sock`.
+pub fn push_record(m: &mut Vec<u8>, sock: u64, addr: [u8; 4], port: u16, data: &[u8]) {
     m.extend_from_slice(&sock.to_le_bytes());
     m.extend_from_slice(&addr);
     m.extend_from_slice(&port.to_le_bytes());
-    m.extend_from_slice(&[0, 0]);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(data);
+}
+
+/// What [`Stack::arrived`] put in its message.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Arrived {
+    /// No datagram had arrived: there is no message to send.
+    Nothing,
+    /// Every datagram that had arrived.
+    All,
+    /// As many as one message holds: there are more to ask for.
+    More,
 }
 
 /// An interface and the sockets the kernel has on it.
@@ -99,8 +120,6 @@ pub struct Stack<D: for<'d> Device<'d>> {
     iface: Interface<'static, D>,
     set: SocketSet<'static>,
     socks: BTreeMap<u64, SocketHandle>,
-    /// The `DATA` being written, kept for its allocation.
-    message: Vec<u8>,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -110,7 +129,6 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             iface,
             set: SocketSet::new(vec![]),
             socks: BTreeMap::new(),
-            message: Vec::with_capacity(DATAGRAM_AT + 2048),
         }
     }
 
@@ -205,22 +223,38 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         }
     }
 
-    /// Carry the card's frames through the stack, both ways, and give
-    /// `deliver` the `DATA` message of every datagram that arrived for a
-    /// socket.
-    pub fn poll(&mut self, now: Instant, mut deliver: impl FnMut(&[u8])) {
+    /// Carry the card's frames through the stack, both ways. What arrived
+    /// for a socket waits for [`arrived`](Self::arrived), which whoever
+    /// polls calls next.
+    pub fn poll(&mut self, now: Instant) {
         // What poll has to say about a frame it did not understand is not
         // news.
         let _ = self.iface.poll(&mut self.set, now);
+    }
+
+    /// Make `m` the `DATA` of the datagrams that arrived for the sockets,
+    /// taking them off the sockets: all of them, or as many as fit one
+    /// message.
+    pub fn arrived(&mut self, m: &mut Vec<u8>) -> Arrived {
+        start_data(m);
         for (&sock, &handle) in &self.socks {
             let mut socket = self.set.get::<UdpSocket>(handle);
-            while let Ok((data, from)) = socket.recv() {
-                let IpAddress::Ipv4(addr) = from.addr else {
-                    continue;
+            while let Ok((data, _)) = socket.peek() {
+                if m.len() + RECORD_LEN + data.len() > MESSAGE_MAX {
+                    return Arrived::More;
+                }
+                let Ok((data, from)) = socket.recv() else {
+                    break;
                 };
-                data_message(&mut self.message, sock, addr.0, from.port, data);
-                deliver(&self.message);
+                if let IpAddress::Ipv4(addr) = from.addr {
+                    push_record(m, sock, addr.0, from.port, data);
+                }
             }
+        }
+        if m.len() > HEADER_LEN {
+            Arrived::All
+        } else {
+            Arrived::Nothing
         }
     }
 
@@ -266,11 +300,46 @@ mod tests {
         (Stack::new(iface), window)
     }
 
-    /// Poll, and the `DATA` messages that came of it.
-    fn poll(stack: &mut Stack<crate::port::Port>) -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
-        stack.poll(Instant::from_millis(1), |m| out.push(m.to_vec()));
+    /// A datagram as the kernel is told of it: its socket, who sent it,
+    /// and what it carried.
+    type Told = (u64, [u8; 4], u16, Vec<u8>);
+
+    /// The records of a `DATA` message.
+    fn records(m: &[u8]) -> Vec<Told> {
+        assert_eq!(parse_header(m), Some((OP_DATA, 0)));
+        let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
+        while !rest.is_empty() {
+            let sock = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let addr: [u8; 4] = rest[8..12].try_into().unwrap();
+            let port = u16::from_le_bytes([rest[12], rest[13]]);
+            let len = u16::from_le_bytes([rest[14], rest[15]]) as usize;
+            out.push((
+                sock,
+                addr,
+                port,
+                rest[RECORD_LEN..RECORD_LEN + len].to_vec(),
+            ));
+            rest = &rest[RECORD_LEN + len..];
+        }
         out
+    }
+
+    /// Poll, and what the kernel is told arrived.
+    fn poll(stack: &mut Stack<crate::port::Port>) -> Vec<Told> {
+        stack.poll(Instant::from_millis(1));
+        let mut m = Vec::new();
+        match stack.arrived(&mut m) {
+            Arrived::Nothing => {
+                assert_eq!(m.len(), HEADER_LEN);
+                Vec::new()
+            }
+            Arrived::All => records(&m),
+            Arrived::More => panic!("more than one message"),
+        }
+    }
+
+    fn told(sock: u64, port: u16, data: &[u8]) -> Told {
+        (sock, THEIR_IP.0, port, data.to_vec())
     }
 
     /// The UDP datagram in `frame`: its ports and what it carries, when it
@@ -291,7 +360,8 @@ mod tests {
         // The same bytes `linux-object/src/net/user_stack.rs` builds and
         // reads, written out: neither side can move a field alone.
         let mut data = Vec::new();
-        data_message(
+        start_data(&mut data);
+        push_record(
             &mut data,
             0x0807_0605_0403_0201,
             [10, 0, 9, 1],
@@ -301,18 +371,25 @@ mod tests {
         assert_eq!(
             data,
             [
-                0, 0, 0, 0, 4, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 0, 9, 1, 0x34, 0x12, 0, 0,
+                0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 0, 9,
+                1, 0x34, 0x12, 2, 0, b'h', b'i'
+            ]
+        );
+        assert_eq!(
+            send(7, Ipv4Address([10, 0, 9, 1]), 0x1234, b"hi"),
+            [
+                0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 0x34, 0x12, 0, 0,
                 b'h', b'i'
             ]
         );
-        assert_eq!(parse_header(&data), Some((OP_DATA, 0x0807_0605_0403_0201)));
+        assert_eq!(parse_header(&data), Some((OP_DATA, 0)));
         assert_eq!(parse_header(&data[..HEADER_LEN - 1]), None);
         assert_eq!(
             bind(7, 5000),
             [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13]
         );
         assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
-        assert_eq!((HEADER_LEN, DATAGRAM_AT), (16, 24));
+        assert_eq!((HEADER_LEN, DATAGRAM_AT, RECORD_LEN), (16, 24, 16));
     }
 
     #[test]
@@ -324,12 +401,15 @@ mod tests {
         window.deliver(stack.device(), 0, &udp_frame(4000, 7000, b"hello"));
         window.deliver(stack.device(), 1, &udp_frame(4001, 7001, b""));
         window.deliver(stack.device(), 2, &udp_frame(4000, 7000, b"again"));
-        let got = poll(&mut stack);
-        let mut want = [Vec::new(), Vec::new(), Vec::new()];
-        data_message(&mut want[0], 5, THEIR_IP.0, 4000, b"hello");
-        data_message(&mut want[1], 5, THEIR_IP.0, 4000, b"again");
-        data_message(&mut want[2], 6, THEIR_IP.0, 4001, b"");
-        assert_eq!(got, want);
+        // All three in one message, socket by socket.
+        assert_eq!(
+            poll(&mut stack),
+            [
+                told(5, 4000, b"hello"),
+                told(5, 4000, b"again"),
+                told(6, 4001, b"")
+            ]
+        );
         // Each is told once.
         assert!(poll(&mut stack).is_empty());
     }
@@ -371,7 +451,7 @@ mod tests {
         window.deliver(stack.device(), 0, &udp_frame(4000, 7000, &long[..1472]));
         let got = poll(&mut stack);
         assert_eq!(got.len(), 1);
-        assert_eq!(&got[0][DATAGRAM_AT..], &long[..1472]);
+        assert_eq!(got[0].3, &long[..1472]);
     }
 
     #[test]
@@ -440,7 +520,7 @@ mod tests {
         window.deliver(stack.device(), 1, &udp_frame(4000, 7000, b"now"));
         let got = poll(&mut stack);
         assert_eq!(got.len(), 1);
-        assert_eq!(parse_header(&got[0]), Some((OP_DATA, 6)));
+        assert_eq!(got[0].0, 6);
     }
 
     #[test]
@@ -472,6 +552,32 @@ mod tests {
             poll(&mut stack);
         }
         assert_eq!(seen, (0..(TX + TX_DATAGRAMS) as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn more_datagrams_than_a_message_holds_take_another() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(5, 7000)), Ok(false));
+        // 48 of the longest: 44 fit one message.
+        let long = vec![0x77u8; 1472];
+        for i in 0..48u16 {
+            let slot = (i % RX as u16) as u32;
+            window.deliver(stack.device(), slot, &udp_frame(4000 + i, 7000, &long));
+            stack.poll(Instant::from_millis(1));
+            turn(stack.device());
+        }
+        let mut m = Vec::new();
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert!(m.len() <= MESSAGE_MAX);
+        let first = records(&m);
+        assert_eq!(first.len(), 44);
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        let second = records(&m);
+        assert_eq!(second.len(), 4);
+        // In the order they arrived, none twice.
+        let ports: Vec<u16> = first.iter().chain(&second).map(|r| r.2).collect();
+        assert_eq!(ports, (4000..4048).collect::<Vec<_>>());
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
     }
 
     #[test]

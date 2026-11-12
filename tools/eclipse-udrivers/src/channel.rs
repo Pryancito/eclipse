@@ -149,6 +149,35 @@ impl Channel {
         }
     }
 
+    /// Read the next message of bytes alone into `buf`, if there is one,
+    /// without waiting: how many bytes it had, or `None` when nothing is
+    /// queued. `PEER_CLOSED` when the other end went and left nothing.
+    pub fn try_read(&self, buf: &mut [u8]) -> Result<Option<usize>, Status> {
+        let (mut nbytes, mut nhandles): (u32, u32) = (0, 0);
+        // SAFETY: the kernel writes at most `buf.len()` bytes and the two
+        // counts; it is given room for no handles.
+        let read = unsafe {
+            zx::call8(
+                nr::CHANNEL_READ,
+                [
+                    self.0 as usize,
+                    0,
+                    buf.as_mut_ptr() as usize,
+                    0,
+                    buf.len(),
+                    0,
+                    &mut nbytes as *mut u32 as usize,
+                    &mut nhandles as *mut u32 as usize,
+                ],
+            )
+        };
+        match read {
+            Ok(_) => Ok(Some(nbytes as usize)),
+            Err(Status::SHOULD_WAIT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// This end as its handle, to give to a call that takes it: the
     /// caller's to close if the call does not.
     pub fn into_handle(self) -> Handle {

@@ -18,10 +18,14 @@
 //! BIND    (kernel to stack)  16  u16 port
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u16 zero  24  the datagram
 //! CLOSE   (kernel to stack)
-//! DATA    (stack to kernel)  16  [u8; 4] from  20  u16 port  22  u16 zero  24  the datagram
+//! DATA    (stack to kernel)  16  one record after another, to the end:
+//!             0  u64 socket  8  [u8; 4] from  12  u16 port  14  u16 length  16  the datagram
 //! ```
 //!
-//! little-endian, the addresses as they are written. The kernel numbers the
+//! little-endian, the addresses as they are written. A `DATA` carries
+//! every datagram a turn of the stack took off the card, for whichever
+//! sockets (its header's socket is zero): one message wakes the kernel
+//! once for all of them. The kernel numbers the
 //! sockets and gives out the ports: `bind` answers at once, as the `Socket`
 //! trait wants, and two sockets never get one port. A datagram that arrives
 //! is queued on its socket here, up to [`RX_QUEUE_BYTES`], so `recvfrom` and
@@ -62,8 +66,10 @@ pub const OP_DATA: u32 = 4;
 
 /// What every message starts with.
 pub const HEADER_LEN: usize = 16;
-/// Where the datagram starts in `SEND` and `DATA`.
+/// Where the datagram starts in `SEND`.
 pub const DATAGRAM_AT: usize = 24;
+/// What each record of a `DATA` starts with.
+pub const RECORD_LEN: usize = 16;
 /// The longest datagram UDP carries over IPv4.
 pub const MAX_DATAGRAM: usize = 65507;
 // A datagram and its header fit one channel message (65536 bytes).
@@ -94,9 +100,9 @@ pub fn bind_message(sock: u64, port: u16) -> Vec<u8> {
     m
 }
 
-/// `SEND` or `DATA` (`op`): `data` for, or from, `addr:port`.
-pub fn datagram_message(op: u32, sock: u64, addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8> {
-    let mut m = header(op, sock, 8 + data.len());
+/// `SEND`: `data` from socket `sock` for `addr:port`.
+pub fn send_message(sock: u64, addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_SEND, sock, 8 + data.len());
     m.extend_from_slice(&addr);
     m.extend_from_slice(&port.to_le_bytes());
     m.extend_from_slice(&[0, 0]);
@@ -119,14 +125,50 @@ pub fn parse_header(m: &[u8]) -> Option<(u32, u64)> {
     Some((op, sock))
 }
 
-/// The address, port and datagram of a `SEND` or `DATA` message.
-pub fn parse_datagram(m: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
+/// The address, port and datagram of a `SEND` message.
+pub fn parse_send(m: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
     if m.len() < DATAGRAM_AT || m.len() - DATAGRAM_AT > MAX_DATAGRAM {
         return None;
     }
     let addr: [u8; 4] = m[16..20].try_into().ok()?;
     let port = u16::from_le_bytes(m[20..22].try_into().ok()?);
     Some((addr, port, &m[DATAGRAM_AT..]))
+}
+
+/// A `DATA` with no records yet.
+pub fn data_message() -> Vec<u8> {
+    header(OP_DATA, 0, 0)
+}
+
+/// Add a record to the `DATA` message `m`: `data`, from `addr:port`, for
+/// socket `sock`.
+pub fn push_record(m: &mut Vec<u8>, sock: u64, addr: [u8; 4], port: u16, data: &[u8]) {
+    debug_assert!(data.len() <= MAX_DATAGRAM);
+    m.extend_from_slice(&sock.to_le_bytes());
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(data);
+}
+
+/// One record of a `DATA`: its socket, who sent the datagram, and it.
+pub type Record<'a> = (u64, [u8; 4], u16, &'a [u8]);
+
+/// The first record of `records`, the rest of a `DATA` message, and what
+/// follows it. `None` when what is there is not a whole record.
+pub fn parse_record(records: &[u8]) -> Option<(Record<'_>, &[u8])> {
+    if records.len() < RECORD_LEN {
+        return None;
+    }
+    let sock = u64::from_le_bytes(records[..8].try_into().ok()?);
+    let addr: [u8; 4] = records[8..12].try_into().ok()?;
+    let port = u16::from_le_bytes(records[12..14].try_into().ok()?);
+    let len = u16::from_le_bytes(records[14..16].try_into().ok()?) as usize;
+    let rest = &records[RECORD_LEN..];
+    if len > rest.len() {
+        return None;
+    }
+    Some(((sock, addr, port, &rest[..len]), &rest[len..]))
 }
 
 /// What a socket shares with the stack's link: where datagrams are queued
@@ -260,22 +302,29 @@ impl StackLink {
     }
 
     fn take(&self, m: &[u8]) {
-        let Some((OP_DATA, sock)) = parse_header(m) else {
+        let Some((OP_DATA, _)) = parse_header(m) else {
             warn!(
                 "user stack: a message that means nothing ({} bytes)",
                 m.len()
             );
             return;
         };
-        let Some((addr, port, data)) = parse_datagram(m) else {
-            warn!("user stack: a datagram that is not one ({} bytes)", m.len());
-            return;
-        };
-        // A datagram for a socket that closed meanwhile is nobody's.
-        let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
-        if let Some(shared) = shared {
-            let from = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port);
-            shared.deliver(from, data);
+        let mut records = &m[HEADER_LEN..];
+        while !records.is_empty() {
+            let Some(((sock, addr, port, data), rest)) = parse_record(records) else {
+                warn!(
+                    "user stack: {} bytes that are no record of a datagram",
+                    records.len()
+                );
+                return;
+            };
+            records = rest;
+            // A datagram for a socket that closed meanwhile is nobody's.
+            let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
+            if let Some(shared) = shared {
+                let from = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port);
+                shared.deliver(from, data);
+            }
         }
     }
 
@@ -501,10 +550,8 @@ impl Socket for ServedUdpSocket {
             return Err(LxError::EMSGSIZE);
         }
         self.autobind()?;
-        self.link.tell(
-            datagram_message(OP_SEND, self.sock, addr.0, to.port, data),
-            false,
-        )?;
+        self.link
+            .tell(send_message(self.sock, addr.0, to.port, data), false)?;
         Ok(data.len())
     }
 
@@ -722,7 +769,9 @@ mod tests {
 
         /// A datagram arrived for socket `sock`.
         fn arrives(&self, sock: u64, from: [u8; 4], port: u16, data: &[u8]) {
-            self.say(datagram_message(OP_DATA, sock, from, port, data));
+            let mut m = data_message();
+            push_record(&mut m, sock, from, port, data);
+            self.say(m);
         }
 
         fn say(&self, data: Vec<u8>) {
@@ -790,26 +839,53 @@ mod tests {
         assert_eq!(parse_header(&bind), Some((OP_BIND, 7)));
         assert_eq!(&bind[16..], &5000u16.to_le_bytes());
 
-        let send = datagram_message(OP_SEND, u64::MAX, [10, 0, 9, 1], 53, b"hola");
+        let send = send_message(u64::MAX, [10, 0, 9, 1], 53, b"hola");
         assert_eq!(parse_header(&send), Some((OP_SEND, u64::MAX)));
-        assert_eq!(
-            parse_datagram(&send),
-            Some(([10, 0, 9, 1], 53, &b"hola"[..]))
-        );
+        assert_eq!(parse_send(&send), Some(([10, 0, 9, 1], 53, &b"hola"[..])));
         // An empty datagram is one.
-        let empty = datagram_message(OP_DATA, 1, [1, 2, 3, 4], 9, b"");
+        let empty = send_message(1, [1, 2, 3, 4], 9, b"");
         assert_eq!(empty.len(), DATAGRAM_AT);
-        assert_eq!(parse_datagram(&empty), Some(([1, 2, 3, 4], 9, &b""[..])));
+        assert_eq!(parse_send(&empty), Some(([1, 2, 3, 4], 9, &b""[..])));
+
+        // A DATA is its records, one after another.
+        let mut data = data_message();
+        assert_eq!(parse_header(&data), Some((OP_DATA, 0)));
+        assert_eq!(parse_record(&data[HEADER_LEN..]), None);
+        push_record(&mut data, 7, [10, 0, 9, 1], 53, b"uno");
+        push_record(&mut data, 8, [10, 0, 9, 2], 54, b"");
+        let (first, rest) = parse_record(&data[HEADER_LEN..]).unwrap();
+        assert_eq!(first, (7, [10, 0, 9, 1], 53, &b"uno"[..]));
+        let (second, rest) = parse_record(rest).unwrap();
+        assert_eq!(second, (8, [10, 0, 9, 2], 54, &b""[..]));
+        assert!(rest.is_empty());
+        // A record cut short, in its head or in its datagram, is none.
+        assert_eq!(parse_record(&data[HEADER_LEN..HEADER_LEN + 15]), None);
+        assert_eq!(parse_record(&data[HEADER_LEN..HEADER_LEN + 18]), None);
 
         assert_eq!(parse_header(&close_message(3)), Some((OP_CLOSE, 3)));
         assert_eq!(close_message(3).len(), HEADER_LEN);
 
         // The same bytes `tools/eclipse-netstack/src/socks.rs` reads and
         // builds, written out: neither side can move a field alone.
+        let mut data = data_message();
+        push_record(
+            &mut data,
+            0x0807_0605_0403_0201,
+            [10, 0, 9, 1],
+            0x1234,
+            b"hi",
+        );
         assert_eq!(
-            datagram_message(OP_DATA, 0x0807_0605_0403_0201, [10, 0, 9, 1], 0x1234, b"hi"),
+            data,
             [
-                0, 0, 0, 0, 4, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 0, 9, 1, 0x34, 0x12, 0, 0,
+                0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 0, 9,
+                1, 0x34, 0x12, 2, 0, b'h', b'i'
+            ]
+        );
+        assert_eq!(
+            send_message(7, [10, 0, 9, 1], 0x1234, b"hi"),
+            [
+                0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 0x34, 0x12, 0, 0,
                 b'h', b'i'
             ]
         );
@@ -821,10 +897,10 @@ mod tests {
 
         // Too short to be a message, or to be a datagram.
         assert_eq!(parse_header(&send[..HEADER_LEN - 1]), None);
-        assert_eq!(parse_datagram(&send[..DATAGRAM_AT - 1]), None);
+        assert_eq!(parse_send(&send[..DATAGRAM_AT - 1]), None);
         // Longer than UDP carries.
         let long = alloc::vec![0u8; DATAGRAM_AT + MAX_DATAGRAM + 1];
-        assert_eq!(parse_datagram(&long), None);
+        assert_eq!(parse_send(&long), None);
     }
 
     #[test]
@@ -862,16 +938,10 @@ mod tests {
         let port_a = port(&a);
         assert!(EPHEMERAL.contains(&port_a));
         assert_eq!(stack.told(), Some(bind_message(a.sock, port_a)));
-        assert_eq!(
-            stack.told(),
-            Some(datagram_message(OP_SEND, a.sock, HOST, 9, b"uno"))
-        );
+        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 9, b"uno")));
         // The second send has the port already; another socket gets another.
         assert_eq!(Socket::write(&a, b"dos", to(HOST, 9)), Ok(3));
-        assert_eq!(
-            stack.told(),
-            Some(datagram_message(OP_SEND, a.sock, HOST, 9, b"dos"))
-        );
+        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 9, b"dos")));
         assert_eq!(Socket::write(&b, b"", to(HOST, 9)), Ok(0));
         let bind_b = stack.told().unwrap();
         assert_eq!(parse_header(&bind_b), Some((OP_BIND, b.sock)));
@@ -930,8 +1000,11 @@ mod tests {
         assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
         assert_eq!(FileLike::readable_bytes(&a), Some(0));
 
-        stack.arrives(a.sock, HOST, 4000, b"primero");
-        stack.arrives(a.sock, [10, 0, 9, 2], 4001, b"segundo, y largo");
+        // Two datagrams of one turn of the stack, in one message.
+        let mut turn = data_message();
+        push_record(&mut turn, a.sock, HOST, 4000, b"primero");
+        push_record(&mut turn, a.sock, [10, 0, 9, 2], 4001, b"segundo, y largo");
+        stack.say(turn);
         assert!(readable(&a));
         assert!(!readable(&b), "it was not for this one");
         assert_eq!(FileLike::readable_bytes(&a), Some(7));
@@ -970,8 +1043,18 @@ mod tests {
         stack.arrives(9999, HOST, 1, b"nobody's");
         stack.say(alloc::vec![1, 2, 3]);
         stack.say(bind_message(a.sock, 80));
-        stack.say(datagram_message(OP_SEND, a.sock, HOST, 1, b"not DATA"));
-        stack.say(header(OP_DATA, a.sock, 0));
+        stack.say(send_message(a.sock, HOST, 1, b"not DATA"));
+        // A DATA with nothing in it, and one whose second record is cut
+        // short: the first is delivered all the same.
+        stack.say(data_message());
+        assert!(!readable(&a));
+        let mut cut = data_message();
+        push_record(&mut cut, a.sock, HOST, 1, b"whole");
+        push_record(&mut cut, a.sock, HOST, 1, b"cut short");
+        cut.truncate(cut.len() - 1);
+        stack.say(cut);
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&a, &mut buf).0, Ok(5));
         assert!(!readable(&a));
         assert!(!stack.link.is_dead(), "nonsense does not end the stack");
         stack.arrives(a.sock, HOST, 1, b"real");
@@ -1018,10 +1101,7 @@ mod tests {
             Some((OP_BIND, a.sock))
         );
         assert_eq!(Socket::write(&a, b"ping", None), Ok(4));
-        assert_eq!(
-            stack.told(),
-            Some(datagram_message(OP_SEND, a.sock, HOST, 7, b"ping"))
-        );
+        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 7, b"ping")));
 
         stack.arrives(a.sock, [10, 0, 9, 9], 7, b"a stranger");
         stack.arrives(a.sock, HOST, 8, b"another port");
@@ -1072,7 +1152,7 @@ mod tests {
         while let Some(m) = stack.told() {
             last = Some(m);
         }
-        assert_eq!(last, Some(datagram_message(OP_SEND, a.sock, HOST, 9, b"x")));
+        assert_eq!(last, Some(send_message(a.sock, HOST, 9, b"x")));
     }
 
     #[test]
