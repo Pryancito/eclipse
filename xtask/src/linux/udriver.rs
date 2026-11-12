@@ -33,7 +33,8 @@ const TOOLS: [&str; 2] = ["zx-virtio-net", "zx-virtio-blk"];
 const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
 const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
 
-/// The `unet` and `ublk` services and the wrappers they run.
+/// The `unet` and `ublk` services and the wrappers they run, and
+/// `ublk-mounts`, which mounts what fstab puts on the served disk.
 ///
 /// `udriver =` keeps each out of every boot where the kernel drives the
 /// device itself, which is all of them unless the command line says
@@ -100,7 +101,75 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           exec /bin/zx-virtio-blk service \"$n\"\n",
     )
     .unwrap();
+
+    // What `/etc/fstab` puts on that disk. The kernel goes through fstab
+    // once, as init starts, and a disk whose driver is a service is not
+    // there yet: its lines fail there, and without this nothing mounts
+    // them. Ordered after the driver's start, which is only its fork, so
+    // the script itself waits for the device. A oneshot: init goes on to
+    // the next service once what fstab asked for is mounted.
+    fs::write(
+        svc_dir.join("ublk-mounts.service"),
+        b"# What /etc/fstab puts on the disk the userspace driver serves\n\
+          # (boot with udriver=virtio-blk@N). See\n\
+          # /usr/local/bin/eclipse-ublk-mounts.\n\
+          exec = /usr/local/bin/eclipse-ublk-mounts\n\
+          type = oneshot\n\
+          after = ublk\n\
+          udriver = virtio-blk\n",
+    )
+    .unwrap();
+    fs::write(localbin.join("eclipse-ublk-mounts"), UBLK_MOUNTS).unwrap();
 }
+
+/// `/usr/local/bin/eclipse-ublk-mounts`: every `/dev` line of fstab that
+/// nothing has mounted, once its device is there.
+///
+/// Which lines are the served disk's is not asked: a line the kernel's own
+/// pass mounted is skipped as mounted, and one it could not is this
+/// script's whoever serves the device. The wait is one budget for all the
+/// lines (`left`, in tenths of a second), so a fstab that names a disk
+/// which never comes costs the boot 5 s once, not 5 s a line.
+///
+/// A mount point is looked up in `/proc/mounts` first because mounting
+/// twice on one directory succeeds here, and stacks. (`mounted` reads into
+/// names of its own: a shell function shares the caller's variables, and
+/// reading the table into `at` left the mount point empty.)
+const UBLK_MOUNTS: &[u8] = b"#!/bin/sh\n\
+# Eclipse OS: mount what /etc/fstab puts on the disk a userspace driver\n\
+# serves (udriver=virtio-blk@N). The kernel goes through fstab once, as\n\
+# init starts, and that disk is not there yet: its driver is a service.\n\
+# This runs after the driver's start, waits for each device fstab names\n\
+# that nothing has mounted, and mounts it. A device that does not appear\n\
+# within the wait (5 s for all of them together) is reported and left.\n\
+fstab=/etc/fstab\n\
+[ -r \"$fstab\" ] || exit 0\n\
+left=50\n\
+rc=0\n\
+mounted() {\n\
+    while read -r _ place _; do\n\
+        [ \"$place\" = \"$1\" ] && return 0\n\
+    done < /proc/mounts\n\
+    return 1\n\
+}\n\
+while read -r dev at type opts _; do\n\
+    case \"$dev\" in /dev/*) ;; *) continue ;; esac\n\
+    case \"$at\" in /?*) ;; *) continue ;; esac\n\
+    case \",$opts,\" in *,noauto,*) continue ;; esac\n\
+    mounted \"$at\" && continue\n\
+    while [ ! -e \"$dev\" ] && [ \"$left\" -gt 0 ]; do\n\
+        sleep 0.1\n\
+        left=$((left - 1))\n\
+    done\n\
+    if [ ! -e \"$dev\" ]; then\n\
+        echo \"eclipse-ublk-mounts: $dev (for $at) is not there\" >&2\n\
+        rc=1\n\
+        continue\n\
+    fi\n\
+    mkdir -p \"$at\"\n\
+    busybox mount -t \"$type\" -o \"$opts\" \"$dev\" \"$at\" || rc=1\n\
+done < \"$fstab\"\n\
+exit $rc\n";
 
 impl LinuxRootfs {
     /// Put the drivers and their tools in the image's `/bin`, built for its
