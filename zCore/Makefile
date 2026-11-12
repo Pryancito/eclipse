@@ -723,9 +723,22 @@ endif
 # sidecar a killed build leaves nothing to trust and the retry rebuilds.
 # The `&&` chain covers the other way this goes wrong: a step that FAILS
 # without being killed must not publish a half-written image either.
+#
+# A file of 4 GiB or more cannot be on FAT32 at all, and mcopy does not fail
+# over it: it prints `File "initramfs.img" too big` and exits 0. The image was
+# published without its initramfs and the boot died in rboot with `failed to
+# read file at offset 0x0: VOLUME_CORRUPTED`. So such a file stops the build
+# here, by name and size. (`-size +Nc` is "more than N bytes", in GNU and BSD
+# find alike.)
 define build_esp_img
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
 	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
+	  big=$$(find "$(esp)/EFI" -type f -size +4294967295c -print 2>/dev/null); \
+	  if [ -n "$$big" ]; then \
+	    for f in $$big; do echo "error: $$f is $$(wc -c < "$$f") bytes; a FAT32 file stops at 4294967295 (4 GiB - 1)" >&2; done; \
+	    echo "error: the ESP is FAT32: rebuild the image (cargo image) so the initramfs is under 4 GiB" >&2; \
+	    exit 1; \
+	  fi; \
 	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128) || exit 1; \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
 	  rm -f "$(esp_img).tmp"; \

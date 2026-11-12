@@ -339,6 +339,84 @@ fn qemu_live_image_size(payload_bytes: u64) -> usize {
     padded_image_size(payload_bytes, 1, 8, 256) as usize
 }
 
+/// The largest file FAT32 can hold is 4 GiB minus one byte, and the QEMU live
+/// image travels to rboot as `\EFI\zCore\initramfs.img` on the FAT32 ESP
+/// (`zCore/Makefile`, `build_esp_img`). Whole MiB, like every other size here.
+const FAT32_MAX_IMAGE: u64 = 4095 * 1024 * 1024;
+
+/// The least headroom the QEMU live image is still worth booting with, when
+/// [`FAT32_MAX_IMAGE`] eats into the usual one: the boot itself writes logs,
+/// caches and `/root` rc files to it.
+const QEMU_LIVE_MIN_HEADROOM: u64 = 64 * 1024 * 1024;
+
+/// [`qemu_live_image_size`], held under [`FAT32_MAX_IMAGE`].
+///
+/// A desktop live root of about 3.4 GiB came out at exactly 4096 MiB. mcopy
+/// says `File "initramfs.img" too big` and still exits 0 (so the ESP build
+/// carried on), and the boot ended in rboot with `failed to read file at
+/// offset 0x0: VOLUME_CORRUPTED` -- a message that names neither the file
+/// nor its size. A payload that fits with less headroom gets less headroom;
+/// one that does not fit at all is an error here, at build time, with the
+/// sizes in it.
+fn qemu_live_image_size_on_fat32(payload_bytes: u64) -> Result<usize, String> {
+    let wanted = qemu_live_image_size(payload_bytes) as u64;
+    if wanted <= FAT32_MAX_IMAGE {
+        return Ok(wanted as usize);
+    }
+    if payload_bytes + QEMU_LIVE_MIN_HEADROOM <= FAT32_MAX_IMAGE {
+        return Ok(FAT32_MAX_IMAGE as usize);
+    }
+    Err(format!(
+        "the QEMU live image would be {} MiB ({} MiB of payload), and the ESP is \
+         FAT32, whose files stop at 4 GiB - 1 byte: rboot could not load it. \
+         It fits under {} MiB of payload",
+        wanted / (1024 * 1024),
+        payload_bytes.div_ceil(1024 * 1024),
+        (FAT32_MAX_IMAGE - QEMU_LIVE_MIN_HEADROOM) / (1024 * 1024),
+    ))
+}
+
+/// The largest entries under `dir`, two levels deep, biggest first: what to
+/// look at when an image does not fit.
+fn largest_entries(dir: &Path, n: usize) -> Vec<(u64, String)> {
+    let mut all = Vec::new();
+    let Ok(top) = fs::read_dir(dir) else {
+        return all;
+    };
+    for entry in top.flatten() {
+        let p = entry.path();
+        let is_dir = fs::symlink_metadata(&p).map(|m| m.is_dir()).unwrap_or(false);
+        let mut pushed = false;
+        if is_dir {
+            if let Ok(sub) = fs::read_dir(&p) {
+                for e in sub.flatten() {
+                    let q = e.path();
+                    let bytes = sfs_payload_bytes_of(&q);
+                    let rel = q.strip_prefix(dir).unwrap_or(&q).display().to_string();
+                    all.push((bytes, rel));
+                    pushed = true;
+                }
+            }
+        }
+        if !pushed {
+            let rel = p.strip_prefix(dir).unwrap_or(&p).display().to_string();
+            all.push((sfs_payload_bytes_of(&p), rel));
+        }
+    }
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.truncate(n);
+    all
+}
+
+/// [`sfs_payload_bytes`] of one entry, a file or a directory.
+fn sfs_payload_bytes_of(p: &Path) -> u64 {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => sfs_payload_bytes(p),
+        Ok(m) => (1 + m.len().div_ceil(rcore_fs_sfs::BLKSIZE as u64)) * rcore_fs_sfs::BLKSIZE as u64,
+        Err(_) => 0,
+    }
+}
+
 /// Largest regular file copied into the minimal live root. Acts as a safety net:
 /// a stray huge file (e.g. a `libLLVM.so` dropped into `/lib`) is left out so it
 /// can't bloat the RAM-resident initramfs. Every installer essential (busybox,
@@ -841,7 +919,26 @@ impl super::LinuxRootfs {
             // 6. QEMU live SFS: installer payloads + desktop. Not written to
             // the installed ESP or the ISO — those carry the lean images from
             // steps 3 and 5d.
-            let live_size = qemu_live_image_size(sfs_payload_bytes(&live_root));
+            let live_payload = sfs_payload_bytes(&live_root);
+            let live_size = match qemu_live_image_size_on_fat32(live_payload) {
+                Ok(size) => size,
+                Err(why) => {
+                    let mut msg = format!("{why}. Largest entries of the live root:");
+                    for (bytes, rel) in largest_entries(&live_root, 12) {
+                        msg.push_str(&format!("\n  {:>6} MiB  {rel}", bytes / (1024 * 1024)));
+                    }
+                    panic!("{msg}");
+                }
+            };
+            if (live_size as u64) < qemu_live_image_size(live_payload) as u64 {
+                println!(
+                    "warning: the QEMU live image is held at {} MiB, the most a FAT32 \
+                     file can be, instead of {} MiB: {} MiB free for the session",
+                    live_size / (1024 * 1024),
+                    qemu_live_image_size(live_payload) / (1024 * 1024),
+                    (live_size as u64 - live_payload) / (1024 * 1024),
+                );
+            }
             println!(
                 "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
@@ -1108,6 +1205,28 @@ mod image_size_tests {
             256 * MIB,
             "the QEMU live image is the root a browser session writes to"
         );
+    }
+
+    /// The QEMU live image rides on a FAT32 ESP: never 4 GiB or more, which is
+    /// what reached rboot as `VOLUME_CORRUPTED` at offset 0.
+    #[test]
+    fn the_qemu_live_image_always_fits_in_a_fat32_file() {
+        const FAT32_MAX_FILE: u64 = (1 << 32) - 1;
+        // Small payloads keep the usual headroom.
+        assert_eq!(
+            qemu_live_image_size_on_fat32(800 * MIB).unwrap(),
+            qemu_live_image_size(800 * MIB)
+        );
+        // The payload that came out at exactly 4096 MiB, and its neighbours.
+        for payload in [3413 * MIB, 3414 * MIB, 3500 * MIB, 4031 * MIB] {
+            let size = qemu_live_image_size_on_fat32(payload).unwrap() as u64;
+            assert!(size <= FAT32_MAX_FILE, "{size} for {payload}");
+            assert!(size >= payload + 64 * MIB, "{size} leaves no room for {payload}");
+            assert_eq!(size % MIB, 0);
+        }
+        // Too big even with the least headroom: an error that says so.
+        let err = qemu_live_image_size_on_fat32(4032 * MIB).unwrap_err();
+        assert!(err.contains("FAT32"), "{err}");
     }
 
     /// And so are the percentages: 40% for the bootstrap initramfs, 12.5% for
