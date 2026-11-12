@@ -28,8 +28,10 @@
 //
 // `service` is the driver as what it is for: the disk goes to the kernel
 // and the process serves it until it is killed, checking and writing
-// nothing of its own. This is what a supervisor runs (eclipse-init, `type =
-// respawn`). When it dies the kernel resets the device and keeps the disk:
+// nothing of its own. This is how a supervisor runs a driver; the system's
+// own service runs the Rust one (tools/eclipse-udrivers), and this one is
+// what `restart ... c` and `bench ... c` start, to compare against. When it
+// dies the kernel resets the device and keeps the disk:
 // the node stays, with whatever is mounted on it, and requests wait up to
 // ten seconds for the next `service`, which gets the same disk; what was
 // out with the dead driver is asked again.
