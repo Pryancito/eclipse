@@ -1288,8 +1288,8 @@ pub struct LinuxProcess {
     /// Where this process's redirected syscalls go, if anywhere: see
     /// [`syscall_redirect`]. Outside `inner` because every syscall reads it.
     syscall_redirect: syscall_redirect::RedirectSlot,
-    /// Whether this process's datagram sockets are those of the network
-    /// stack that runs as a process ([`crate::net::user_stack`]) and not the
+    /// Whether this process's IPv4 datagram and stream sockets are those of
+    /// the network stack that runs as a process ([`crate::net::user_stack`]) and not the
     /// kernel's: asked for with `eclipse_netstack_use`, inherited by `fork`
     /// and kept across `execve`, so a program is given that stack by
     /// whatever starts it. Outside `inner` because `socket` reads it.
@@ -1768,7 +1768,7 @@ const INIT_RLIMITS: [RLimit; RLIM_NLIMITS] = {
 pub type ExitCode = i32;
 
 impl LinuxProcess {
-    /// Whether this process's datagram sockets are the user stack's: see
+    /// Whether this process's IPv4 sockets are the user stack's: see
     /// the field.
     pub fn uses_user_netstack(&self) -> bool {
         self.user_netstack

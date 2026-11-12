@@ -82,6 +82,9 @@ const LINGER: Duration = Duration::from_millis(30_000);
 const BACKLOG_MAX: usize = 16;
 /// The most stream sockets of every kind.
 const STREAMS_MAX: usize = 1024;
+/// Handshakes one listener has in the middle at most: past this, who
+/// knocks is refused until one of them finishes or is given up on.
+const HALF_MADE_MAX: usize = 64;
 
 /// A connection.
 pub(super) struct Conn {
@@ -186,6 +189,15 @@ fn socket() -> TcpSocket<'static> {
     // window opens late.
     socket.set_ack_delay(None);
     socket
+}
+
+/// A socket that takes a connection to `port`. A handshake that starts
+/// on it and is not finished is given up on in the time a connect is.
+fn listening(port: u16) -> Option<TcpSocket<'static>> {
+    let mut socket = socket();
+    socket.listen(port).ok()?;
+    socket.set_timeout(Some(CONNECT_TIMEOUT));
+    Some(socket)
 }
 
 fn u16_at(m: &[u8], at: usize) -> u16 {
@@ -304,11 +316,25 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// `CLOSE` of a stream socket: `None` when `sock` is not one.
     pub(super) fn close_stream(&mut self, sock: u64) -> Option<bool> {
         if let Some(listener) = self.streams.listeners.remove(&sock) {
-            // The handshakes in the middle go with it, unanswered.
+            // Whoever was in the middle of connecting, or had just
+            // connected and was not told of yet, is reset.
+            let mut resets = false;
             for handle in listener.ready {
-                self.set.remove(handle);
+                let mut socket = self.set.get::<TcpSocket>(handle);
+                if socket.state() == TcpState::Listen {
+                    drop(socket);
+                    self.set.remove(handle);
+                } else {
+                    socket.abort();
+                    self.streams.closing.push(Closing {
+                        handle,
+                        until: None,
+                        reset: false,
+                    });
+                    resets = true;
+                }
             }
-            return Some(false);
+            return Some(resets);
         }
         let conn = self.streams.conns.remove(&sock)?;
         let mut socket = self.set.get::<TcpSocket>(conn.handle);
@@ -343,11 +369,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 .iter()
                 .filter(|&&handle| self.set.get::<TcpSocket>(handle).state() == TcpState::Listen)
                 .count();
-            while listening < listener.backlog && sockets < STREAMS_MAX {
-                let mut socket = socket();
-                if socket.listen(listener.port).is_err() {
+            let most = listener.backlog + HALF_MADE_MAX;
+            while listening < listener.backlog
+                && listener.ready.len() < most
+                && sockets < STREAMS_MAX
+            {
+                let Some(socket) = self::listening(listener.port) else {
                     break;
-                }
+                };
                 listener.ready.push(self.set.add(socket));
                 listening += 1;
                 sockets += 1;
@@ -403,10 +432,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 let state = socket.state();
                 match state {
                     TcpState::Listen | TcpState::SynReceived => {}
-                    // A socket that stopped listening without a
-                    // connection listens again.
+                    // A socket whose handshake was given up on listens
+                    // again.
                     TcpState::Closed | TcpState::TimeWait => {
-                        let _ = socket.listen(listener.port);
+                        if socket.listen(listener.port).is_ok() {
+                            socket.set_timeout(Some(CONNECT_TIMEOUT));
+                        }
                     }
                     // Made. Also one whose peer closed it at once: the
                     // program accepts it and reads the end.
@@ -420,6 +451,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                             i += 1;
                             continue;
                         };
+                        // From here it lasts as long as the peer answers.
+                        socket.set_timeout(None);
                         self.streams.accepted += 1;
                         let new = ACCEPTED_BIT | self.streams.accepted;
                         let mut bytes = [0u8; ACCEPTED_LEN];
@@ -1123,6 +1156,39 @@ mod tests {
         assert_eq!(events[0].3[..8], (ACCEPTED_BIT | 2).to_le_bytes());
         let (_three, events) = arrives(&mut wire, 40003, b"");
         assert_eq!(events[0].3[..8], (ACCEPTED_BIT | 3).to_le_bytes());
+
+        // A handshake nobody finishes is given up on, and its socket
+        // listens again: a listener is not used up by who only knocks.
+        // And only so many may knock at once.
+        let mut taken = 0;
+        for from in 41000..41000 + 2 * HALF_MADE_MAX as u16 {
+            let syn = Segment {
+                from,
+                to: 8080,
+                control: TcpControl::Syn,
+                seq: 1,
+                ack: None,
+                data: vec![],
+            };
+            let (sent, _) = wire.hears(&syn);
+            match sent[0].control {
+                TcpControl::Syn => taken += 1,
+                other => assert_eq!(other, TcpControl::Rst, "refused"),
+            }
+        }
+        assert!(taken > BACKLOG_MAX, "more than its backlog: {taken}");
+        assert!(taken <= HALF_MADE_MAX + BACKLOG_MAX, "{taken}");
+        let before = wire.stack.streams.sockets();
+        wire.ms += 31_000;
+        wire.turn();
+        wire.turn();
+        assert!(wire.stack.streams.sockets() <= before);
+        let listening = wire.stack.streams.listeners[&7]
+            .ready
+            .iter()
+            .filter(|&&h| wire.stack.set.get::<TcpSocket>(h).state() == TcpState::Listen)
+            .count();
+        assert!(listening >= 2, "its backlog, ready again");
 
         // Closed, it takes no more: the next is reset. The ones it made
         // go on.
