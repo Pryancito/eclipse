@@ -21,6 +21,7 @@ use std::process::exit;
 use udrivers::blk::{self, Disk, Msg};
 use udrivers::claim::{self, Dma};
 use udrivers::fifo::Fifo;
+use udrivers::status;
 use udrivers::virtio::{self, Device, Setup};
 use udrivers::zx::{self, nr, Status};
 
@@ -107,6 +108,16 @@ fn main() {
     } {
         die(format_args!("block_serve: {e}"));
     }
+    let place = format!("virtio-blk@{index}");
+    status::publish(
+        &format!("driver.{place}"),
+        &[
+            ("program", NAME),
+            ("device", &place),
+            ("serves", "kernel"),
+            ("sectors", &capacity.to_string()),
+        ],
+    );
     if let Some(fd) = report {
         // SAFETY: one byte of a static string to a descriptor the parent
         // passed for this.

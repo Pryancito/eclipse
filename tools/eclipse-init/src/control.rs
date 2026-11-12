@@ -6,15 +6,19 @@
 //! wakes: one line per service, tab-separated,
 //!
 //! ```text
-//! name  kind  state  pid  starts  started  log  exec
-//! ntpd  respawn  running  455  1  1793865120  /tmp/ntpd.log  /usr/local/bin/eclipse-ntpd
+//! name  kind  state  pid  starts  started  log  exec  udriver
+//! ntpd  respawn  running  455  1  1793865120  /tmp/ntpd.log  /usr/local/bin/eclipse-ntpd  -
+//! ublk  respawn  running  231  2  1793865101  /tmp/ublk.log  /usr/local/bin/eclipse-ublk  virtio-blk@1
 //! ```
 //!
 //! `state` is `running`, `waiting` (a restart is due after its backoff),
 //! `stopped` (stopped on request), `given-up` (written off for this boot) or
 //! `idle` (a oneshot, or a respawn not started yet). `pid` and `started` (the
 //! wall-clock second the current run began) are `-` when there is none;
-//! `starts` counts the starts of this boot.
+//! `starts` counts the starts of this boot. `udriver` is the device a
+//! driver service drives (its `udriver =` key, as the kernel command line
+//! names it), `-` for any other service. A reader that knows only the first
+//! eight columns reads the file as before.
 //!
 //! **Requests.** A file `/run/eclipse-init/ctl/<verb>.<name>`, then SIGHUP to
 //! PID 1. `verb` is `start`, `stop` or `restart`; only `respawn` services take
@@ -99,7 +103,7 @@ pub(crate) fn render_state(
     now: Instant,
     wall: u64,
 ) -> String {
-    let mut s = String::from("# name\tkind\tstate\tpid\tstarts\tstarted\tlog\texec\n");
+    let mut s = String::from("# name\tkind\tstate\tpid\tstarts\tstarted\tlog\texec\tudriver\n");
     for svc in services.values() {
         let kind = match svc.kind {
             Kind::Oneshot => "oneshot",
@@ -113,7 +117,7 @@ pub(crate) fn render_state(
             _ => "-".into(),
         };
         s += &format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             field(&svc.name),
             kind,
             state_of(svc, now),
@@ -122,6 +126,7 @@ pub(crate) fn render_state(
             started,
             field(svc.log.as_deref().unwrap_or("")),
             field(&svc.exec.join(" ")),
+            field(svc.udriver.as_deref().unwrap_or("")),
         );
     }
     s
@@ -323,6 +328,7 @@ mod tests {
         a.pid = Some(455);
         a.started_at = Some(now - Duration::from_secs(30));
         a.total_starts = 2;
+        a.udriver = Some("virtio-net@0".into());
         map.insert("ntpd".to_string(), a);
         let mut b = respawn("portal");
         b.restart_at = Some(now + Duration::from_secs(4));
@@ -343,10 +349,12 @@ mod tests {
                 "2",
                 "999970",
                 "/tmp/x.log",
-                "/bin/foo"
+                "/bin/foo",
+                "virtio-net@0"
             ]
         );
         assert_eq!(&lines[1][..4], &["portal", "respawn", "waiting", "-"]);
+        assert_eq!(lines[1][8], "-");
         assert!(text.starts_with('#'));
     }
 }

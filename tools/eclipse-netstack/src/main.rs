@@ -44,6 +44,7 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
 use udrivers::fifo::Fifo;
 use udrivers::net::{Msg, Offer, BUF_SIZE};
+use udrivers::status;
 use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
@@ -429,7 +430,9 @@ fn main() {
     }
 
     let mut pause = Duration::from_millis(100);
+    let mut driver_starts = 1;
     loop {
+        publish(index, addr, &link, driver_starts);
         let since = std::time::Instant::now();
         let why = serve(&shared, kernel.as_deref(), &link.fifo);
         let status = link.driver.wait();
@@ -467,5 +470,24 @@ fn main() {
             shared.fifo = next.fifo.clone();
         }
         link = next;
+        driver_starts += 1;
     }
+}
+
+/// Say what this stack is (see `udrivers::status`): the card, its
+/// address, the driver it runs now and how many it has started, which
+/// eclipse-init never sees. lunarmon's SERVIDORES list reads it.
+fn publish(index: usize, addr: Ipv4Cidr, link: &Link, driver_starts: u32) {
+    let device = format!("virtio-net@{index}");
+    status::publish(
+        &format!("stack.{device}"),
+        &[
+            ("program", NAME),
+            ("device", &device),
+            ("mac", &status::mac_text(link.mac)),
+            ("addr", &addr.to_string()),
+            ("driver_pid", &link.driver.id().to_string()),
+            ("driver_starts", &driver_starts.to_string()),
+        ],
+    );
 }

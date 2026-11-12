@@ -272,6 +272,10 @@ fn a_driver_starts_only_when_the_kernel_left_it_its_device() {
     assert!(cmdline_udriver_in(listed, "virtio-blk"));
     assert!(cmdline_udriver_in(listed, "virtio-net"));
     assert!(!cmdline_udriver_in(alone, "virtio-blk"));
+    // What the state file says the service drives.
+    assert_eq!(cmdline_udriver_device(listed, "virtio-blk"), Some("virtio-blk@1"));
+    assert_eq!(cmdline_udriver_device(listed, "virtio-net@0"), Some("virtio-net@0"));
+    assert_eq!(cmdline_udriver_device(alone, "virtio-blk"), None);
     assert!(!cmdline_udriver_in("udriver=virtio-blk@1", "virtio"));
     assert!(!cmdline_udriver_in("udriver=virtio-blk", "virtio-blk@0"));
     // The key is a field of its own in the service file.
