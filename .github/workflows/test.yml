@@ -428,7 +428,11 @@ jobs:
           # with the card's window made of memory: who has our address is
           # answered, a ping comes back with what it carried, a frame waits
           # in its slot while there is no room to answer it, and a message
-          # that names a place outside the window is refused.
+          # that names a place outside the window is refused. And the UDP
+          # sockets it serves the kernel: a datagram for a bound port is
+          # told to the kernel, a send leaves by the card, and the messages
+          # are laid out as `linux-object/src/net/user_stack.rs` lays them
+          # out (whose own tests, in the linux-object job, say the same).
           cargo test --manifest-path tools/eclipse-netstack/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
