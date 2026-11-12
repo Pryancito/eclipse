@@ -1,7 +1,11 @@
-//! A virtio network card, served to the kernel.
+//! A virtio network card, served to the kernel or to a process.
 //!
 //! The card becomes an interface of the kernel's
-//! (`loader/src/linux/net_serve.rs` is the other end). Frames pass through
+//! (`loader/src/linux/net_serve.rs` is the other end), or of a network
+//! stack that runs as a process (`tools/eclipse-netstack`), which gets what
+//! the kernel would have been given in an [`Offer`]. Either way the other
+//! end is called the kernel below: the driver cannot tell and does the
+//! same. Frames pass through
 //! the window -- a slice of the driver's DMA memory where the card's
 //! buffers already are, a slot each -- and a FIFO of 16-byte messages says
 //! which: `op, slot, len, off`.
@@ -116,6 +120,60 @@ pub const fn header_len(transport: Transport) -> usize {
     }
 }
 const _: () = assert!(TX_HEADROOM >= 12);
+
+/// What a driver started with a channel (`udrv-virtio-net N stack=FD`)
+/// sends down it once the card is up, in place of `eclipse_net_serve`: these
+/// sixteen bytes, and two handles -- the far end of the FIFO, then the
+/// window. Whoever reads it is to the driver what the kernel would have
+/// been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offer {
+    /// The card's address, as [`mac_word`] packs it.
+    pub mac: u64,
+    /// The window's slots: this many for frames coming in, then this many
+    /// for frames going out, [`BUF_SIZE`] bytes each.
+    pub rx_slots: u32,
+    pub tx_slots: u32,
+}
+
+impl Offer {
+    /// The bytes of an offer.
+    pub const LEN: usize = 16;
+    /// The handles that go with one.
+    pub const HANDLES: usize = 2;
+
+    /// What this driver offers of the card with address `mac`.
+    pub fn of(mac: [u8; 6]) -> Offer {
+        Offer {
+            mac: mac_word(mac),
+            rx_slots: RX_BUFS as u32,
+            tx_slots: TX_BUFS as u32,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Offer::LEN] {
+        let mut b = [0u8; Offer::LEN];
+        b[0..8].copy_from_slice(&self.mac.to_ne_bytes());
+        b[8..12].copy_from_slice(&self.rx_slots.to_ne_bytes());
+        b[12..16].copy_from_slice(&self.tx_slots.to_ne_bytes());
+        b
+    }
+
+    /// The offer in `bytes`, when they are exactly one.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Offer> {
+        let b: &[u8; Offer::LEN] = bytes.try_into().ok()?;
+        Some(Offer {
+            mac: u64::from_ne_bytes(b[0..8].try_into().ok()?),
+            rx_slots: u32::from_ne_bytes(b[8..12].try_into().ok()?),
+            tx_slots: u32::from_ne_bytes(b[12..16].try_into().ok()?),
+        })
+    }
+
+    /// The card's address, its six bytes.
+    pub fn mac_bytes(&self) -> [u8; 6] {
+        core::array::from_fn(|i| (self.mac >> (8 * i)) as u8)
+    }
+}
 
 /// The address as the kernel takes it: the first byte in the low bits.
 pub fn mac_word(mac: [u8; 6]) -> u64 {
@@ -290,7 +348,7 @@ impl Feeder {
                 Ok(got) => got,
                 Err(Status::SHOULD_WAIT) => match fifo.wait_readable() {
                     Ok(()) => continue,
-                    Err(e) => return format!("the kernel closed the FIFO: {e}"),
+                    Err(e) => return format!("the other end of the FIFO is gone: {e}"),
                 },
                 Err(e) => return format!("fifo_read: {e}"),
             };
@@ -433,6 +491,20 @@ mod tests {
         assert_eq!(dma_queue(TXQ) + 2 * PAGE, DMA_WIN);
         assert_eq!(WIN_SIZE, 96 * 2048);
         assert_eq!(DMA_SIZE, DMA_WIN + WIN_SIZE);
+    }
+
+    #[test]
+    fn an_offer_is_the_address_and_the_two_slot_counts() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let offer = Offer::of(mac);
+        assert_eq!((offer.rx_slots, offer.tx_slots), (64, 32));
+        let bytes = offer.to_bytes();
+        assert_eq!(&bytes[0..8], &0x5634_1200_5452u64.to_ne_bytes());
+        assert_eq!(Offer::from_bytes(&bytes), Some(offer));
+        assert_eq!(offer.mac_bytes(), mac);
+        // One byte short or one too many is not an offer.
+        assert_eq!(Offer::from_bytes(&bytes[..15]), None);
+        assert_eq!(Offer::from_bytes(&[0; 17]), None);
     }
 
     #[test]

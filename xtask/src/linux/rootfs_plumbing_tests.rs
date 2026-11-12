@@ -1025,6 +1025,64 @@ fn the_disk_wrapper_reads_its_number_off_the_command_line() {
     assert_eq!(number("LOG=warn:noudriver=virtio-blk@4"), "");
 }
 
+/// `unetstack=ADDR/PREFIX` on the kernel command line gives the first card
+/// to the network stack that runs as a process, and nothing else does: the
+/// wrapper of the `unet` service runs here over command lines of this
+/// test's, with the two programs it may end as swapped for `echo`.
+#[test]
+fn the_cards_wrapper_runs_the_stack_only_on_a_boot_that_names_its_address() {
+    let rootfs = init_rootfs("unet-stack");
+    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-unet")).unwrap();
+    for needle in [
+        "< /proc/cmdline",
+        "[ -x /bin/udrv-virtio-net ] ||",
+        "[ -x /bin/eclipse-netstack ] ||",
+        "exec /bin/eclipse-netstack 0 \"$stack\"",
+        "exec /bin/udrv-virtio-net 0",
+    ] {
+        assert_eq!(
+            script.matches(needle).count(),
+            1,
+            "{needle:?} is no longer in the wrapper exactly once:\n{script}"
+        );
+    }
+    let dir = scratch("unet-stack-run");
+    let run = |cmdline: &str| {
+        let file = dir.join("cmdline");
+        fs::write(&file, cmdline).unwrap();
+        let script = script
+            .replace("< /proc/cmdline", &format!("< '{}'", file.display()))
+            .replace("[ -x /bin/udrv-virtio-net ] ||", "true ||")
+            .replace("[ -x /bin/eclipse-netstack ] ||", "true ||")
+            .replace("exec /bin/eclipse-netstack", "exec echo stack")
+            .replace("exec /bin/udrv-virtio-net", "exec echo driver");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // The kernel joins its arguments with colons; a plain command line has
+    // spaces. Either way the word is found whole, with its value.
+    for cmdline in [
+        "LOG=warn:udriver=virtio-net@0:unetstack=10.0.9.15/24:ROOT=/dev/vda\n",
+        "LOG=warn udriver=virtio-net@0 unetstack=10.0.9.15/24\n",
+    ] {
+        assert_eq!(run(cmdline), "stack 0 10.0.9.15/24\n", "{cmdline}");
+    }
+    // No such word, a word with no value, and a word that only ends like
+    // it: the card is the kernel's, as on every boot before this.
+    for cmdline in [
+        "LOG=warn:udriver=virtio-net@0:ROOT=/dev/vda\n",
+        "LOG=warn:udriver=virtio-net@0:unetstack=:ROOT=/dev/vda\n",
+        "LOG=warn:udriver=virtio-net@0:notunetstack=10.0.9.15/24\n",
+        "",
+    ] {
+        assert_eq!(run(cmdline), "driver 0\n", "{cmdline:?}");
+    }
+}
+
 /// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run
 /// here with the three things it reaches for swapped for files of this
 /// test's -- fstab, the mount table, and `busybox mount`, which only says

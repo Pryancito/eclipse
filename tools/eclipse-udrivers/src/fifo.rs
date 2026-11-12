@@ -1,4 +1,5 @@
-//! A FIFO of fixed-size messages between a driver and the kernel.
+//! A FIFO of fixed-size messages between a driver and whoever it serves:
+//! the kernel, or another process.
 
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -46,6 +47,15 @@ impl<M: Message> Fifo<M> {
         ))
     }
 
+    /// The end `handle` names: one that came from somewhere else, such as
+    /// the end a driver gave away.
+    pub fn from_handle(handle: Handle) -> Fifo<M> {
+        Fifo {
+            handle,
+            _messages: PhantomData,
+        }
+    }
+
     /// Read what is waiting, up to `buf.len()` messages, without waiting:
     /// `SHOULD_WAIT` when there is nothing. How many were read.
     pub fn read(&self, buf: &mut [M]) -> Result<usize, Status> {
@@ -91,24 +101,8 @@ impl<M: Message> Fifo<M> {
     /// Sleep until there is something to read. `PEER_CLOSED` when the
     /// other end is gone and left nothing.
     pub fn wait_readable(&self) -> Result<(), Status> {
-        const READABLE: u32 = 1 << 0;
-        const PEER_CLOSED: u32 = 1 << 2;
-        let mut observed: u32 = 0;
-        // SAFETY: the kernel writes the signals it saw into `observed`.
-        unsafe {
-            zx::call(
-                nr::OBJECT_WAIT_ONE,
-                [
-                    self.handle as usize,
-                    (READABLE | PEER_CLOSED) as usize,
-                    i64::MAX as usize, // no deadline
-                    &mut observed as *mut u32 as usize,
-                    0,
-                    0,
-                ],
-            )?;
-        }
-        if observed & READABLE == 0 {
+        let observed = zx::wait_one(self.handle, zx::READABLE | zx::PEER_CLOSED)?;
+        if observed & zx::READABLE == 0 {
             return Err(Status::PEER_CLOSED);
         }
         Ok(())
@@ -145,5 +139,13 @@ impl<M: Message> Fifo<M> {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+impl<M: Message> Drop for Fifo<M> {
+    /// The other end sees this one gone, which is how each side learns
+    /// that the other has died.
+    fn drop(&mut self) {
+        zx::close(self.handle);
     }
 }

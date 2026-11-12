@@ -512,8 +512,17 @@ endif
 # `udriver=virtio-net@0` in KOPTS to have it recorded for a process to
 # claim (`tools/zx-virtio-net`). With UDISK as well, both go in one option:
 # `udriver=virtio-blk@N,virtio-net@0`.
+#
+# UNET_NET=<backend>: what that card is plugged into, in place of the
+# user-mode network. A user-mode network answers for its own addresses and
+# lets nothing in, so nobody can ping the guest through it; with
+# `UNET_NET=socket,udp=127.0.0.1:5700,localaddr=127.0.0.1:5701` every frame
+# the card sends is a datagram to port 5700 of this machine and every
+# datagram to port 5701 a frame it receives, which is what
+# `scripts/udp_ping.py` speaks.
+UNET_NET ?= user,net=10.0.3.0/24
 ifneq ($(UNET),)
-  qemu_opts += -netdev user,id=unet,net=10.0.3.0/24
+  qemu_opts += -netdev $(UNET_NET),id=unet
   ifeq ($(ARCH), aarch64)
     qemu_opts += -device virtio-net-device,netdev=unet,bus=virtio-mmio-bus.2
   else ifeq ($(ARCH), riscv64)

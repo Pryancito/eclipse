@@ -19,14 +19,19 @@ const GATEWAY_INDIRECT: libc::c_long = 0x8000;
 /// 0x4000: see `loader/src/linux.rs`).
 pub mod nr {
     pub const BTI_PIN: i64 = 1;
+    pub const CHANNEL_CREATE: i64 = 7;
+    pub const CHANNEL_READ: i64 = 8;
+    pub const CHANNEL_WRITE: i64 = 10;
     pub const FIFO_CREATE: i64 = 34;
     pub const FIFO_READ: i64 = 35;
     pub const FIFO_WRITE: i64 = 36;
+    pub const HANDLE_CLOSE: i64 = 45;
     pub const INTERRUPT_WAIT: i64 = 54;
     pub const OBJECT_WAIT_ONE: i64 = 81;
     pub const VMO_CREATE_CHILD: i64 = 192;
     pub const VMO_CREATE_CONTIGUOUS: i64 = 193;
     pub const ECLIPSE_HANDLE_TO_FD: i64 = 0x4000;
+    pub const ECLIPSE_FD_TO_HANDLE: i64 = 0x4001;
     pub const ECLIPSE_DEVICE_CLAIM: i64 = 0x4005;
     pub const ECLIPSE_BLOCK_SERVE: i64 = 0x4006;
     pub const ECLIPSE_NET_SERVE: i64 = 0x4007;
@@ -97,6 +102,38 @@ pub unsafe fn call8(n: i64, a: [usize; 8]) -> Result<usize, Status> {
         GATEWAY_BASE + (n as libc::c_long | GATEWAY_INDIRECT),
         a.as_ptr(),
     ))
+}
+
+/// The signals of a FIFO end or a channel end: something to read, and the
+/// other end gone.
+pub const READABLE: u32 = 1 << 0;
+pub const PEER_CLOSED: u32 = 1 << 2;
+
+/// Sleep until `handle` has one of `signals`. The ones it has.
+pub fn wait_one(handle: Handle, signals: u32) -> Result<u32, Status> {
+    let mut observed: u32 = 0;
+    // SAFETY: the kernel writes the signals it saw into `observed`.
+    unsafe {
+        call(
+            nr::OBJECT_WAIT_ONE,
+            [
+                handle as usize,
+                signals as usize,
+                i64::MAX as usize, // no deadline
+                &mut observed as *mut u32 as usize,
+                0,
+                0,
+            ],
+        )?;
+    }
+    Ok(observed)
+}
+
+/// Let go of `handle`.
+pub fn close(handle: Handle) {
+    // SAFETY: no pointers. A handle that is not one is the only way this
+    // fails, and there is nothing to do about it.
+    let _ = unsafe { call(nr::HANDLE_CLOSE, [handle as usize, 0, 0, 0, 0, 0]) };
 }
 
 /// Map all `len` bytes of the VMO `vmo`, readable and writable, shared
