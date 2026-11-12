@@ -12,6 +12,10 @@ use super::*;
 /// would have the kernel queue messages without end.
 const CREDIT_MAX: usize = 16 * 1024 * 1024;
 
+/// The most connections a listener holds for a program that does not
+/// accept them: past this, the stack is told to close what it makes.
+const WAITING_MAX: usize = 256;
+
 /// Where a stream socket is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
@@ -270,15 +274,20 @@ impl StackLink {
                         warn!("user stack: an ACCEPTED with a number that is taken");
                         return;
                     }
-                    let mut child = Inner::new(Phase::Open);
-                    child.credit = (number as usize).min(CREDIT_MAX);
-                    child.port = inner.port;
-                    child.remote = Some(from);
-                    let child = Stream::new(child);
-                    table.streams.insert(new, Arc::downgrade(&child));
-                    drop(table);
-                    inner.waiting.push_back((new, child));
-                    stream.sync(&inner, dead, Event::READABLE);
+                    if inner.waiting.len() >= WAITING_MAX {
+                        // Nobody accepts: the connection is not kept.
+                        refuse = Some(close_message(new));
+                    } else {
+                        let mut child = Inner::new(Phase::Open);
+                        child.credit = (number as usize).min(CREDIT_MAX);
+                        child.port = inner.port;
+                        child.remote = Some(from);
+                        let child = Stream::new(child);
+                        table.streams.insert(new, Arc::downgrade(&child));
+                        drop(table);
+                        inner.waiting.push_back((new, child));
+                        stream.sync(&inner, dead, Event::READABLE);
+                    }
                 }
                 (EV_BYTES, Phase::Open) if !bytes.is_empty() => {
                     if inner.queued + inner.unsaid + bytes.len() > STREAM_WINDOW {
@@ -1314,6 +1323,25 @@ mod tests {
                 (sock, EV_ACCEPTED, 500, &accepted_bytes(one, HOST, 40004)),
             ],
         );
+
+        // A listener nobody accepts from holds so many, and the rest are
+        // closed as they come.
+        {
+            let idle = stream(&stack);
+            assert_eq!(Socket::bind(&idle, any(8081)), Ok(0));
+            assert_eq!(Socket::listen(&idle), Ok(0));
+            while stack.told().is_some() {}
+            let number = |i: usize| ACCEPTED_BIT | (1000 + i as u64);
+            for i in 0..WAITING_MAX + 2 {
+                let bytes = accepted_bytes(number(i), HOST, 41000 + i as u16);
+                events(&stack, &[(idle.sock, EV_ACCEPTED, 500, &bytes)]);
+            }
+            assert_eq!(stack.told(), Some(close_message(number(WAITING_MAX))));
+            assert_eq!(stack.told(), Some(close_message(number(WAITING_MAX + 1))));
+            assert_eq!(stack.told(), None);
+            drop(idle);
+            while stack.told().is_some() {}
+        }
 
         // The connection goes on after the listener: its port is the
         // listener's to give back, and the one nobody accepted is closed.
