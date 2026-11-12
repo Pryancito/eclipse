@@ -20,3 +20,4 @@
 //! that can be tested without one.
 
 pub mod port;
+pub mod socks;

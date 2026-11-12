@@ -114,6 +114,15 @@ impl Port {
         n
     }
 
+    /// Messages [`outgoing`](Self::outgoing) gave that did not go: they
+    /// are the first of the next turn, in the order they were.
+    pub fn put_back(&self, msgs: &[Msg]) {
+        self.state
+            .borrow_mut()
+            .outgoing
+            .splice(0..0, msgs.iter().copied());
+    }
+
     /// How many frames wait for the stack.
     pub fn waiting(&self) -> usize {
         self.state.borrow().incoming.len()
@@ -124,6 +133,11 @@ impl Port {
         self.state.borrow().tx_free != 0
     }
 }
+
+// SAFETY: the window is this port's alone (`Port::new`), so the port can
+// go to whichever thread has it. It is not `Sync`: the stack's threads
+// take turns with it under a lock.
+unsafe impl Send for Port {}
 
 /// A frame that arrived, where the card left it.
 pub struct RxToken<'a> {
@@ -240,7 +254,11 @@ impl phy::TxToken for TxToken<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
+    //! A card that is memory on the heap, and THEIRS, the machine at the
+    //! other end of its wire: what the tests of the port and of the
+    //! sockets over it are written with.
+
     use super::*;
     use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache};
     use smoltcp::phy::ChecksumCapabilities;
@@ -248,26 +266,76 @@ mod tests {
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
         EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Packet, Ipv4Repr,
+        Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
     };
     use std::collections::BTreeMap;
 
-    const RX: usize = 4;
-    const TX: usize = 2;
-    const OURS: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x57]);
-    const THEIRS: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-    const OUR_IP: Ipv4Address = Ipv4Address([10, 0, 9, 15]);
-    const THEIR_IP: Ipv4Address = Ipv4Address([10, 0, 9, 1]);
+    pub const RX: usize = 4;
+    pub const TX: usize = 2;
+    pub const OURS: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x57]);
+    pub const THEIRS: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    pub const OUR_IP: Ipv4Address = Ipv4Address([10, 0, 9, 15]);
+    pub const THEIR_IP: Ipv4Address = Ipv4Address([10, 0, 9, 1]);
+
+    /// The window of a bench's card, as the card's side sees it.
+    #[derive(Clone, Copy)]
+    pub struct Window(*mut u8);
+
+    impl Window {
+        /// The card delivers `frame` in receive slot `slot`, ten bytes in,
+        /// as behind a legacy virtio header.
+        pub fn deliver(&self, port: &Port, slot: u32, frame: &[u8]) {
+            let at = slot as usize * BUF_SIZE + 10;
+            // SAFETY: inside receive slot `slot` of the window.
+            unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), self.0.add(at), frame.len()) };
+            assert!(port.take(&Msg {
+                op: OP_RX,
+                slot,
+                len: frame.len() as u32,
+                off: 10,
+            }));
+        }
+
+        /// The frame a transmit message names.
+        pub fn sent(&self, m: &Msg) -> Vec<u8> {
+            assert_eq!(m.op, OP_TX);
+            assert_eq!(m.off as usize, TX_HEADROOM);
+            assert!((m.slot as usize) < TX);
+            let at = (RX + m.slot as usize) * BUF_SIZE + TX_HEADROOM;
+            // SAFETY: inside transmit slot `m.slot` of the window.
+            unsafe { core::slice::from_raw_parts(self.0.add(at), m.len as usize) }.to_vec()
+        }
+
+        /// The card is done with what message `m` of a turn told it: a
+        /// frame to send is sent and its slot free again. A receive slot
+        /// given back needs no answer.
+        pub fn done(&self, port: &Port, m: &Msg) {
+            if m.op == OP_TX {
+                assert!(port.take(&Msg {
+                    len: 0,
+                    off: 0,
+                    ..*m
+                }));
+            }
+        }
+    }
+
+    /// This turn's messages of `port`.
+    pub fn turn(port: &Port) -> Vec<Msg> {
+        let mut buf = [Msg::default(); 96];
+        let n = port.outgoing(&mut buf);
+        buf[..n].to_vec()
+    }
 
     /// A window on the heap, and a stack with our address over it.
-    struct Bench {
-        window: *mut u8,
-        iface: Interface<'static, Port>,
-        sockets: SocketSet<'static>,
+    pub struct Bench {
+        pub window: Window,
+        pub iface: Interface<'static, Port>,
+        pub sockets: SocketSet<'static>,
     }
 
     impl Bench {
-        fn new() -> Bench {
+        pub fn new() -> Bench {
             // Not zeroes: what a slot held before must not reach the wire.
             let window = Box::leak(vec![0xa5u8; (RX + TX) * BUF_SIZE].into_boxed_slice());
             let window = window.as_mut_ptr();
@@ -279,29 +347,17 @@ mod tests {
                 .ip_addrs(vec![IpCidr::new(IpAddress::Ipv4(OUR_IP), 24)])
                 .finalize();
             Bench {
-                window,
+                window: Window(window),
                 iface,
                 sockets: SocketSet::new(vec![]),
             }
         }
 
-        /// The card delivers `frame` in receive slot `slot`, ten bytes in,
-        /// as behind a legacy virtio header.
-        fn deliver(&mut self, slot: u32, frame: &[u8]) {
-            let at = slot as usize * BUF_SIZE + 10;
-            // SAFETY: inside receive slot `slot` of the window.
-            unsafe {
-                core::ptr::copy_nonoverlapping(frame.as_ptr(), self.window.add(at), frame.len())
-            };
-            assert!(self.iface.device().take(&Msg {
-                op: OP_RX,
-                slot,
-                len: frame.len() as u32,
-                off: 10,
-            }));
+        pub fn deliver(&mut self, slot: u32, frame: &[u8]) {
+            self.window.deliver(self.iface.device(), slot, frame);
         }
 
-        fn poll(&mut self) {
+        pub fn poll(&mut self) {
             let _ = self.iface.poll(&mut self.sockets, Instant::from_millis(1));
         }
 
@@ -309,37 +365,26 @@ mod tests {
         /// smoltcp learns a neighbour from that and from nothing else, and
         /// a ping from a stranger gets a question, not its answer. The
         /// card then finishes with the reply, so the bench is as it began.
-        fn meet(&mut self) {
+        pub fn meet(&mut self) {
             self.deliver(RX as u32 - 1, &arp_request(OUR_IP));
             self.poll();
             let turn = self.turn();
             assert_eq!(turn.len(), 2);
-            assert!(self.iface.device().take(&Msg {
-                len: 0,
-                off: 0,
-                ..turn[1]
-            }));
+            self.window.done(self.iface.device(), &turn[1]);
         }
 
         /// This turn's messages.
-        fn turn(&mut self) -> Vec<Msg> {
-            let mut buf = [Msg::default(); 16];
-            let n = self.iface.device().outgoing(&mut buf);
-            buf[..n].to_vec()
+        pub fn turn(&mut self) -> Vec<Msg> {
+            turn(self.iface.device())
         }
 
         /// The frame a transmit message names.
-        fn sent(&self, m: &Msg) -> Vec<u8> {
-            assert_eq!(m.op, OP_TX);
-            assert_eq!(m.off as usize, TX_HEADROOM);
-            assert!((m.slot as usize) < TX);
-            let at = (RX + m.slot as usize) * BUF_SIZE + TX_HEADROOM;
-            // SAFETY: inside transmit slot `m.slot` of the window.
-            unsafe { core::slice::from_raw_parts(self.window.add(at), m.len as usize) }.to_vec()
+        pub fn sent(&self, m: &Msg) -> Vec<u8> {
+            self.window.sent(m)
         }
     }
 
-    fn rx_back(slot: u32) -> Msg {
+    pub fn rx_back(slot: u32) -> Msg {
         Msg {
             op: OP_RX,
             slot,
@@ -348,18 +393,21 @@ mod tests {
         }
     }
 
-    /// "Who has `target`?", from THEIRS to everybody.
-    fn arp_request(target: Ipv4Address) -> Vec<u8> {
+    fn arp(operation: ArpOperation, to: EthernetAddress, target: Ipv4Address) -> Vec<u8> {
         let arp = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
+            operation,
             source_hardware_addr: THEIRS,
             source_protocol_addr: THEIR_IP,
-            target_hardware_addr: EthernetAddress([0; 6]),
+            target_hardware_addr: if to == EthernetAddress::BROADCAST {
+                EthernetAddress([0; 6])
+            } else {
+                to
+            },
             target_protocol_addr: target,
         };
         let eth = EthernetRepr {
             src_addr: THEIRS,
-            dst_addr: EthernetAddress::BROADCAST,
+            dst_addr: to,
             ethertype: EthernetProtocol::Arp,
         };
         let mut bytes = vec![0u8; eth.buffer_len() + arp.buffer_len()];
@@ -369,19 +417,50 @@ mod tests {
         bytes
     }
 
-    /// An echo request from THEIRS to `to` with this payload.
-    fn echo_request(to: Ipv4Address, ident: u16, seq_no: u16, data: &[u8]) -> Vec<u8> {
-        let caps = ChecksumCapabilities::default();
-        let icmp = Icmpv4Repr::EchoRequest {
-            ident,
-            seq_no,
-            data,
+    /// "Who has `target`?", from THEIRS to everybody.
+    pub fn arp_request(target: Ipv4Address) -> Vec<u8> {
+        arp(ArpOperation::Request, EthernetAddress::BROADCAST, target)
+    }
+
+    /// "I have THEIR_IP", from THEIRS to us.
+    pub fn arp_reply() -> Vec<u8> {
+        arp(ArpOperation::Reply, OURS, OUR_IP)
+    }
+
+    /// Whether `frame` is us asking everybody who has `target`.
+    pub fn is_arp_request_for(frame: &[u8], target: Ipv4Address) -> bool {
+        let Ok(frame) = EthernetFrame::new_checked(frame) else {
+            return false;
         };
+        let asked = ArpPacket::new_checked(frame.payload())
+            .ok()
+            .and_then(|p| ArpRepr::parse(&p).ok());
+        frame.ethertype() == EthernetProtocol::Arp
+            && matches!(
+                asked,
+                Some(ArpRepr::EthernetIpv4 {
+                    operation: ArpOperation::Request,
+                    source_hardware_addr: OURS,
+                    source_protocol_addr: OUR_IP,
+                    target_protocol_addr,
+                    ..
+                }) if target_protocol_addr == target
+            )
+    }
+
+    /// An IPv4 packet from THEIRS to `to`, in its frame: `fill` writes
+    /// what it carries, `len` bytes of `protocol`.
+    fn ipv4_frame(
+        to: Ipv4Address,
+        protocol: IpProtocol,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Vec<u8> {
         let ip = Ipv4Repr {
             src_addr: THEIR_IP,
             dst_addr: to,
-            protocol: IpProtocol::Icmp,
-            payload_len: icmp.buffer_len(),
+            protocol,
+            payload_len: len,
             hop_limit: 64,
         };
         let eth = EthernetRepr {
@@ -389,17 +468,66 @@ mod tests {
             dst_addr: OURS,
             ethertype: EthernetProtocol::Ipv4,
         };
-        let mut bytes = vec![0u8; eth.buffer_len() + ip.buffer_len() + icmp.buffer_len()];
+        let mut bytes = vec![0u8; eth.buffer_len() + ip.buffer_len() + len];
         let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
         eth.emit(&mut frame);
         let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
-        ip.emit(&mut packet, &caps);
-        icmp.emit(
-            &mut Icmpv4Packet::new_unchecked(packet.payload_mut()),
-            &caps,
-        );
+        ip.emit(&mut packet, &ChecksumCapabilities::default());
+        fill(packet.payload_mut());
         bytes
     }
+
+    /// An echo request from THEIRS to `to` with this payload.
+    pub fn echo_request(to: Ipv4Address, ident: u16, seq_no: u16, data: &[u8]) -> Vec<u8> {
+        let icmp = Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        };
+        ipv4_frame(to, IpProtocol::Icmp, icmp.buffer_len(), |payload| {
+            icmp.emit(
+                &mut Icmpv4Packet::new_unchecked(payload),
+                &ChecksumCapabilities::default(),
+            )
+        })
+    }
+
+    /// A UDP datagram from THEIRS, port `from`, to our port `to`.
+    pub fn udp_frame(from: u16, to: u16, data: &[u8]) -> Vec<u8> {
+        let udp = UdpRepr {
+            src_port: from,
+            dst_port: to,
+        };
+        ipv4_frame(OUR_IP, IpProtocol::Udp, 8 + data.len(), |payload| {
+            udp.emit(
+                &mut UdpPacket::new_unchecked(payload),
+                &THEIR_IP.into(),
+                &OUR_IP.into(),
+                data.len(),
+                |room| room.copy_from_slice(data),
+                &ChecksumCapabilities::default(),
+            )
+        })
+    }
+
+    /// The IPv4 packet `frame` carries from us to THEIRS.
+    pub fn ipv4_of(frame: &[u8]) -> Vec<u8> {
+        let frame = EthernetFrame::new_checked(frame).unwrap();
+        assert_eq!(frame.ethertype(), EthernetProtocol::Ipv4);
+        assert_eq!((frame.src_addr(), frame.dst_addr()), (OURS, THEIRS));
+        frame.payload().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, ArpRepr, EthernetFrame, Icmpv4Packet, Icmpv4Repr, Ipv4Address,
+        Ipv4Packet, Ipv4Repr,
+    };
 
     #[test]
     fn a_card_has_some_slots_each_way_and_not_too_many() {
@@ -587,6 +715,24 @@ mod tests {
                 .consume(Instant::from_millis(1), 60, |_| Ok(()));
         }
         assert!(port.transmit().is_none());
+    }
+
+    #[test]
+    fn messages_that_did_not_go_are_the_first_of_the_next_turn() {
+        let mut bench = Bench::new();
+        bench.deliver(0, &arp_request(Ipv4Address([10, 0, 9, 99])));
+        bench.deliver(1, &arp_request(Ipv4Address([10, 0, 9, 98])));
+        bench.poll();
+        let first = bench.turn();
+        assert_eq!(first, [rx_back(0), rx_back(1)]);
+        // Meanwhile the stack made more to say; what was not said goes
+        // before it.
+        bench.deliver(2, &arp_request(Ipv4Address([10, 0, 9, 97])));
+        bench.poll();
+        bench.iface.device().put_back(&first[1..]);
+        assert_eq!(bench.turn(), [rx_back(1), rx_back(2)]);
+        bench.iface.device().put_back(&[]);
+        assert!(bench.turn().is_empty());
     }
 
     #[test]

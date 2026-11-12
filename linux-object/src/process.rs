@@ -657,6 +657,7 @@ impl NewChild for Process {
             syscall_redirect: syscall_redirect::RedirectSlot::forked(
                 &linux_parent.syscall_redirect,
             ),
+            user_netstack: core::sync::atomic::AtomicBool::new(linux_parent.uses_user_netstack()),
             inner: Mutex::new(linux_parent_inner.forked_child(
                 parent_pgid,
                 parent_sid,
@@ -1287,6 +1288,12 @@ pub struct LinuxProcess {
     /// Where this process's redirected syscalls go, if anywhere: see
     /// [`syscall_redirect`]. Outside `inner` because every syscall reads it.
     syscall_redirect: syscall_redirect::RedirectSlot,
+    /// Whether this process's datagram sockets are those of the network
+    /// stack that runs as a process ([`crate::net::user_stack`]) and not the
+    /// kernel's: asked for with `eclipse_netstack_use`, inherited by `fork`
+    /// and kept across `execve`, so a program is given that stack by
+    /// whatever starts it. Outside `inner` because `socket` reads it.
+    user_netstack: core::sync::atomic::AtomicBool,
 }
 
 /// Linux process mut inner data
@@ -1761,6 +1768,21 @@ const INIT_RLIMITS: [RLimit; RLIM_NLIMITS] = {
 pub type ExitCode = i32;
 
 impl LinuxProcess {
+    /// Whether this process's datagram sockets are the user stack's: see
+    /// the field.
+    pub fn uses_user_netstack(&self) -> bool {
+        self.user_netstack
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// From now on they are, for this process and what it forks.
+    pub fn use_user_netstack(&self) {
+        self.user_netstack
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl LinuxProcess {
     /// Whether `pid` is a child of this process that has exited and has not
     /// been collected by `wait*` yet -- a zombie. Its `Process` has already
     /// left the job (`ROOT_JOB.find_process` misses it), but `kill(2)` must
@@ -1907,6 +1929,7 @@ impl LinuxProcess {
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             syscall_redirect: Default::default(),
+            user_netstack: Default::default(),
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 start_ns: monotonic_now_ns(),

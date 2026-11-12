@@ -9,25 +9,37 @@
 //! stay through that: the interface carries nothing for a moment, as the
 //! kernel's does.
 //!
-//! The kernel has no interface for this card. Until this stack has
-//! sockets, all it does is answer for its address: ARP, and ICMP echo.
+//! The kernel has no interface for this card. The stack answers for its
+//! address by itself (ARP, ICMP echo), and serves the kernel the datagram
+//! sockets of the programs that asked for this stack
+//! (`eclipse_netstack_serve`; `netstack::socks` has what the two say to
+//! each other). On a kernel that has no such call it answers for its
+//! address and nothing else.
+//!
+//! Three threads share the stack, under one lock. The card's takes what
+//! the driver says, a turn in one system call, and sends the kernel the
+//! datagrams that arrived. The sockets' takes what the kernel says, a
+//! message in one system call, and tells the driver of the frames that
+//! made. The third wakes once a second for what no message brings about:
+//! asking again for a neighbour that did not answer.
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the driver
 //! cannot be started or gives no card.
 
 use std::collections::BTreeMap;
 use std::process::{exit, Child, Command};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use netstack::port::Port;
-use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache};
-use smoltcp::socket::SocketSet;
+use netstack::socks::{Stack, MESSAGE_MAX};
+use smoltcp::iface::{InterfaceBuilder, NeighborCache};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
 use udrivers::channel::Channel;
 use udrivers::fifo::Fifo;
 use udrivers::net::{Msg, Offer, BUF_SIZE};
-use udrivers::zx::{self, Handle, Status};
+use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
 const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX";
@@ -64,7 +76,7 @@ impl Drop for Window {
 /// A card and the driver that serves it.
 struct Link {
     driver: Child,
-    fifo: Fifo<Msg>,
+    fifo: Arc<Fifo<Msg>>,
     /// Held for the port over it, which the interface has: dropped, with
     /// the rest of the link, once the interface is on another.
     _window: Window,
@@ -121,7 +133,7 @@ fn start(index: usize) -> Result<(Link, Port), String> {
         Ok((fifo, window, port, mac)) => Ok((
             Link {
                 driver,
-                fifo,
+                fifo: Arc::new(fifo),
                 _window: window,
                 mac,
             },
@@ -139,32 +151,168 @@ fn now() -> Instant {
     Instant::from_micros((udrivers::now_ns() / 1000) as i64)
 }
 
+/// What the threads share.
+struct Shared {
+    stack: Stack<Port>,
+    /// The FIFO of the driver the card has now, for the threads that are
+    /// not the card's to tell it of a frame to send.
+    fifo: Arc<Fifo<Msg>>,
+}
+
+type Lock = Arc<Mutex<Shared>>;
+
+/// The lock, whatever became of the thread that had it last: the process
+/// ends on a panic, so nobody is left to see a poisoned one.
+fn locked(shared: &Lock) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The link to the kernel: the channel the sockets' messages travel on.
+type Kernel = Option<Arc<Channel>>;
+
+/// Carry the frames through the stack, and what arrived for a socket to
+/// the kernel. Called with the lock held.
+fn poll(stack: &mut Stack<Port>, kernel: &Kernel) {
+    stack.poll(now(), |data| {
+        if let Some(kernel) = kernel {
+            // A kernel that is gone took the machine with it.
+            let _ = kernel.write(data, &[]);
+        }
+    });
+}
+
+/// Tell the driver, from a thread that is not the card's, what this turn
+/// of the stack made: the frames to send, mostly. The card's thread sends
+/// its own with its next turn.
+fn tell_driver(shared: &Lock, msgs: &mut [Msg; TURN]) {
+    let (n, fifo) = {
+        let shared = locked(shared);
+        (shared.stack.device().outgoing(msgs), shared.fifo.clone())
+    };
+    if n == 0 {
+        return;
+    }
+    let went = match fifo.write(&msgs[..n]) {
+        Ok(went) => went,
+        // No room: the driver has a FIFO full of turns to read.
+        Err(Status::SHOULD_WAIT) => 0,
+        // The driver is gone, and the card's thread is finding out. The
+        // next driver starts with a port that owes nothing.
+        Err(_) => return,
+    };
+    if went < n {
+        // What did not fit goes with the next turn, the card's or this
+        // thread's: the driver answers what it has, and that wakes the
+        // card's thread.
+        locked(shared).stack.device().put_back(&msgs[went..n]);
+    }
+}
+
 /// Carry the card's frames through the stack until its driver is gone. Why
 /// it stopped.
 ///
 /// One system call a turn (`eclipse_fifo_reply_wait`): what the last turn
 /// left to say -- the receive slots that were read, the frames to send --
 /// goes out, and the call comes back with what the card did meanwhile.
-fn serve(
-    iface: &mut Interface<'static, Port>,
-    sockets: &mut SocketSet,
-    fifo: &Fifo<Msg>,
-) -> Status {
+fn serve(shared: &Lock, kernel: &Kernel, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); TURN];
     loop {
-        let replies = iface.device().outgoing(&mut msgs);
+        let replies = locked(shared).stack.device().outgoing(&mut msgs);
         let got = match fifo.reply_wait(&mut msgs, replies) {
             Ok(got) => got,
             Err(e) => return e,
         };
+        let mut shared = locked(shared);
         for m in &msgs[..got] {
-            if !iface.device().take(m) {
+            if !shared.stack.device().take(m) {
                 println!("{NAME}: a message from the driver that means nothing: {m:?}");
             }
         }
-        // Every frame that has room for its answer, in one go. What poll
-        // has to say about a frame it did not understand is not news.
-        let _ = iface.poll(sockets, now());
+        // Every frame that has room for its answer, in one go.
+        poll(&mut shared.stack, kernel);
+    }
+}
+
+/// Do what the kernel asks for its sockets, until the kernel's end of the
+/// channel is gone (which it never is: it outlives this process).
+///
+/// One system call a message (`eclipse_channel_reply_wait`, with nothing
+/// to reply), and one more when the message was a datagram to send, to
+/// tell the driver.
+fn serve_sockets(shared: Lock, kernel: Arc<Channel>) {
+    let mut message = vec![0u8; MESSAGE_MAX];
+    let mut msgs = [Msg::default(); TURN];
+    let link = Some(kernel.clone());
+    loop {
+        let len = match kernel.wait_read(&mut message) {
+            Ok(len) => len,
+            Err(e) => {
+                println!("{NAME}: the kernel's channel is gone ({e}): no more sockets");
+                return;
+            }
+        };
+        let sends = {
+            let mut shared = locked(&shared);
+            match shared.stack.request(&message[..len]) {
+                Ok(true) => {
+                    poll(&mut shared.stack, &link);
+                    true
+                }
+                Ok(false) => false,
+                // A datagram that cannot go is dropped, as on any network;
+                // anything else the kernel does not send.
+                Err(why) => {
+                    if std::env::var_os("NETSTACK_DEBUG").is_some() {
+                        println!("{NAME}: refused ({why:?}) a message of {len} bytes");
+                    }
+                    false
+                }
+            }
+        };
+        if sends {
+            tell_driver(&shared, &mut msgs);
+        }
+    }
+}
+
+/// Once a second, do what the stack has pending that no frame and no
+/// message will make it do.
+fn keep_time(shared: Lock, kernel: Kernel) {
+    let mut msgs = [Msg::default(); TURN];
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        {
+            let mut shared = locked(&shared);
+            if !shared.stack.restless(now()) {
+                continue;
+            }
+            poll(&mut shared.stack, &kernel);
+        }
+        tell_driver(&shared, &mut msgs);
+    }
+}
+
+/// Become the stack the kernel's served sockets use: the channel it will
+/// speak on, or why there is none.
+fn register(max_datagram: usize) -> Result<Arc<Channel>, String> {
+    let (ours, theirs) = Channel::create().map_err(|e| format!("channel_create: {e}"))?;
+    let theirs = theirs.into_handle();
+    // SAFETY: no pointers. The handle is the kernel's when the call works.
+    let served = unsafe {
+        zx::call(
+            nr::ECLIPSE_NETSTACK_SERVE,
+            [theirs as usize, max_datagram, 0, 0, 0, 0],
+        )
+    };
+    match served {
+        Ok(_) => Ok(Arc::new(ours)),
+        Err(e) => {
+            zx::close(theirs);
+            Err(match e {
+                Status::ALREADY_BOUND => "another process serves the kernel's sockets".into(),
+                e => format!("eclipse_netstack_serve: {e}"),
+            })
+        }
     }
 }
 
@@ -184,18 +332,45 @@ fn main() {
 
     let (mut link, port) = start(index).unwrap_or_else(|e| die(e));
     let mac = link.mac;
-    let mut iface = InterfaceBuilder::new(port)
+    let iface = InterfaceBuilder::new(port)
         .ethernet_addr(EthernetAddress(mac))
         .neighbor_cache(NeighborCache::new(BTreeMap::new()))
         .ip_addrs(vec![IpCidr::Ipv4(addr)])
         .finalize();
-    let mut sockets = SocketSet::new(vec![]);
-    println!("{NAME}: card {index} ({}) is {addr}", EthernetAddress(mac));
+    let stack = Stack::new(iface);
+    let kernel: Kernel = match register(stack.max_datagram()) {
+        Ok(kernel) => Some(kernel),
+        Err(why) => {
+            println!("{NAME}: no sockets, only the address: {why}");
+            None
+        }
+    };
+    let shared: Lock = Arc::new(Mutex::new(Shared {
+        stack,
+        fifo: link.fifo.clone(),
+    }));
+    println!(
+        "{NAME}: card {index} ({}) is {addr}{}",
+        EthernetAddress(mac),
+        if kernel.is_some() {
+            ", with sockets"
+        } else {
+            ""
+        }
+    );
+    if let Some(kernel) = &kernel {
+        let (shared, kernel) = (shared.clone(), kernel.clone());
+        std::thread::spawn(move || serve_sockets(shared, kernel));
+    }
+    {
+        let (shared, kernel) = (shared.clone(), kernel.clone());
+        std::thread::spawn(move || keep_time(shared, kernel));
+    }
 
     let mut pause = Duration::from_millis(100);
     loop {
         let since = std::time::Instant::now();
-        let why = serve(&mut iface, &mut sockets, &link.fifo);
+        let why = serve(&shared, &kernel, &link.fifo);
         let status = link.driver.wait();
         println!(
             "{NAME}: the driver is gone ({why}{}); starting another",
@@ -223,8 +398,13 @@ fn main() {
             }
         };
         // The new port first, then the old link goes, its window with it:
-        // nothing is left that points into that.
-        *iface.device_mut() = port;
+        // nothing is left that points into that. Under the lock, so no
+        // other thread is in the middle of a frame.
+        {
+            let mut shared = locked(&shared);
+            *shared.stack.device_mut() = port;
+            shared.fifo = next.fifo.clone();
+        }
         link = next;
     }
 }

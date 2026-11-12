@@ -187,6 +187,15 @@ impl Channel {
         self.check_and_read(|_| Ok(()))
     }
 
+    /// How many messages the peer holds unread: what a writer that must
+    /// not grow the peer's queue without end asks before it writes. None
+    /// when the peer is gone.
+    pub fn peer_pending(&self) -> usize {
+        self.peer
+            .upgrade()
+            .map_or(0, |peer| peer.recv_queue.lock().len())
+    }
+
     /// Write a packet to the channel
     pub fn write(&self, msg: T) -> ZxResult {
         self.write_counted(msg).map(|_| ())
