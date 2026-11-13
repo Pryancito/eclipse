@@ -601,21 +601,23 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// a time: `ALREADY_BOUND` while another process serves one; when the
 /// process dies its sockets answer `ENETDOWN` and the next can be served.
 ///
-/// Which sockets: the IPv4 datagram and stream sockets of the processes
-/// that asked for this stack with [`ECLIPSE_NETSTACK_USE`]. Every other
+/// Which sockets: the datagram and stream sockets of the processes that
+/// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
+/// on a boot with `unetuse=all`; the `AF_INET6` ones carry IPv4. Every other
 /// socket is the kernel's, as before. What one of those sockets sends to
 /// another at 127.0.0.0/8 or at `address` stays in the kernel, which has
 /// both: the stack is not told.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 
-/// `eclipse_netstack_use()`: from now on the IPv4 datagram and stream
-/// sockets this process opens are those of the network stack that runs as
-/// a process
-/// ([`ECLIPSE_NETSTACK_SERVE`]), not the kernel's. Inherited by `fork` and
-/// kept across `execve`: a program is given that stack by whatever starts
-/// it. A socket opened while no stack is served fails with `ENETDOWN`; the
-/// sockets the process already has stay what they are.
+/// `eclipse_netstack_use()`: from now on the datagram and stream sockets
+/// this process opens are those of the network stack that runs as a
+/// process ([`ECLIPSE_NETSTACK_SERVE`]), not the kernel's: the `AF_INET`
+/// ones, and the `AF_INET6` ones, which carry IPv4 there. Inherited by
+/// `fork` and kept across `execve`: a program is given that stack by
+/// whatever starts it, and on a boot with `unetuse=all` every program
+/// has it without asking. A socket opened while no stack is served fails
+/// with `ENETDOWN`; the sockets the process already has stay what they are.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 

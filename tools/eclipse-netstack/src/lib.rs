@@ -16,11 +16,13 @@
 //! sockets. A program's socket stays the kernel's object, and the kernel
 //! asks this process, over a channel, to send its datagrams and make its
 //! connections, and is told of what arrives (`eclipse_netstack_serve`).
-//! Which programs: the ones started by `eclipse-netstack-use`; every other
-//! socket is the kernel's stack's. The address is written on the command
+//! Which programs: the ones started by `eclipse-netstack-use`, and every
+//! other socket is the kernel's stack's; or all of them, on a boot with
+//! `unetuse=all`. The address is written on the command
 //! line or leased from a DHCP server, and one gateway carries what is not
 //! for the card's network ([`socks::lease`]). IPv4 only, and no
-//! fragments.
+//! fragments: a program's `AF_INET6` socket is served too, and carries
+//! IPv4 (`::` is every address, `::ffff:a.b.c.d` is `a.b.c.d`).
 //!
 //! What one program of the machine says to another, at 127.0.0.0/8 or at
 //! the stack's own address, never comes here: the kernel has both sockets

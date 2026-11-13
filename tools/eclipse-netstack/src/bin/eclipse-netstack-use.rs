@@ -2,10 +2,12 @@
 //! stack that runs as a process.
 //!
 //! Which stack a program's sockets are is not the program's business: it
-//! is decided by whatever starts it. This asks the kernel that the IPv4
+//! is decided by whatever starts it. This asks the kernel that the
 //! datagram and stream sockets of this process be those of `eclipse-netstack`
 //! (`eclipse_netstack_use`), which `fork` and `execve` carry on, and
 //! becomes the program. The program opens its sockets as it always did.
+//! A boot with `unetuse=all` on the kernel command line has asked for
+//! every program, and this is then not needed.
 //!
 //! Exit status: 2 without a program, 1 when the kernel has no such call,
 //! 127 when the program cannot be run.

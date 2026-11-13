@@ -84,7 +84,17 @@
 //! socket bound to an address of 127.0.0.0/8 is this machine's alone: the
 //! stack is never told of it, so nothing from the card reaches it.
 //!
-//! IPv4 only, so far.
+//! # IPv6 sockets
+//!
+//! The stack has IPv4 and no IPv6, and a program does not ask which
+//! before it opens its socket: plenty of them listen on an `AF_INET6`
+//! socket at `::` and expect IPv4 to arrive there too. So an `AF_INET6`
+//! socket is served like any other, and carries IPv4: `::` is every
+//! address, `::ffff:a.b.c.d` is `a.b.c.d`, and `::1` is this machine,
+//! which no version of IP has a part in. Any other IPv6 address is one
+//! the stack cannot reach (`ENETUNREACH`) or does not have
+//! (`EADDRNOTAVAIL`). Such a socket is told its addresses the same way,
+//! IPv4 ones as `::ffff:a.b.c.d`.
 
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
@@ -99,7 +109,7 @@ use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_hal::sync::Mutex;
 use log::warn;
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
 use zircon_object::impl_kobject;
 use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
@@ -526,6 +536,55 @@ pub fn current() -> Option<Arc<StackLink>> {
     STACK.lock().clone().filter(|link| !link.is_dead())
 }
 
+/// Whether every program's sockets are the served stack's, asked for or
+/// not: see [`use_for_all`].
+static FOR_ALL: AtomicBool = AtomicBool::new(false);
+
+/// From now on every program is one that asked (`unetuse=all` on the
+/// kernel command line): the machine's network is the stack that runs as
+/// a process, and the kernel's own stack is nobody's.
+pub fn use_for_all(on: bool) {
+    FOR_ALL.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`use_for_all`] is on.
+pub fn is_for_all() -> bool {
+    FOR_ALL.load(Ordering::Relaxed)
+}
+
+/// The IPv4 address a program names with `addr` on a socket of its
+/// family: see "IPv6 sockets" above. `elsewhere` is the answer for an
+/// IPv6 address that names nothing a stack without IPv6 has.
+fn plain(v6: bool, addr: IpAddress, elsewhere: LxError) -> LxResult<IpAddress> {
+    match (v6, addr) {
+        (_, IpAddress::Unspecified) | (false, IpAddress::Ipv4(_)) => Ok(addr),
+        (true, IpAddress::Ipv6(addr)) => {
+            if addr.is_unspecified() {
+                Ok(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED))
+            } else if addr.is_loopback() {
+                Ok(IpAddress::v4(127, 0, 0, 1))
+            } else {
+                addr.as_ipv4().map(IpAddress::Ipv4).ok_or(elsewhere)
+            }
+        }
+        _ => Err(LxError::EAFNOSUPPORT),
+    }
+}
+
+/// `endpoint` as a socket of that family says it: the other way of
+/// [`plain`].
+fn shown(v6: bool, endpoint: IpEndpoint) -> IpEndpoint {
+    if !v6 {
+        return endpoint;
+    }
+    let addr = match endpoint.addr {
+        IpAddress::Ipv4(addr) if !addr.is_unspecified() => Ipv6Address::from(addr),
+        IpAddress::Ipv6(addr) => addr,
+        _ => Ipv6Address::UNSPECIFIED,
+    };
+    IpEndpoint::new(IpAddress::Ipv6(addr), endpoint.port)
+}
+
 impl StackLink {
     /// Whether the process is gone.
     pub fn is_dead(&self) -> bool {
@@ -710,12 +769,15 @@ pub struct ServedUdpSocket {
     base: KObjectBase,
     link: Arc<StackLink>,
     sock: u64,
+    /// An `AF_INET6` socket: see "IPv6 sockets" at the top.
+    v6: bool,
     shared: Arc<Shared>,
 }
 
 impl ServedUdpSocket {
-    /// A socket of the stack behind `link`. `ENETDOWN` when it is gone.
-    pub fn new(link: Arc<StackLink>) -> LxResult<Self> {
+    /// A socket of the stack behind `link`, `AF_INET6` when `v6`.
+    /// `ENETDOWN` when the stack is gone.
+    pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
         if link.is_dead() {
             return Err(LxError::ENETDOWN);
         }
@@ -747,6 +809,7 @@ impl ServedUdpSocket {
             base: KObjectBase::new(),
             link,
             sock,
+            v6,
             shared,
         })
     }
@@ -790,7 +853,7 @@ impl ServedUdpSocket {
                     if inner.queue.is_empty() && !inner.read_closed && !self.link.is_dead() {
                         self.shared.bus.lock().clear(Event::READABLE);
                     }
-                    return (Ok(n), Endpoint::Ip(from));
+                    return (Ok(n), Endpoint::Ip(shown(self.v6, from)));
                 }
                 if inner.read_closed {
                     return (Ok(0), nobody());
@@ -835,7 +898,10 @@ impl Socket for ServedUdpSocket {
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         let to = match sendto_endpoint {
-            Some(Endpoint::Ip(to)) => to,
+            Some(Endpoint::Ip(mut to)) => {
+                to.addr = plain(self.v6, to.addr, LxError::ENETUNREACH)?;
+                to
+            }
             Some(_) => return Err(LxError::EAFNOSUPPORT),
             None => self.shared.inner.lock().remote.ok_or(LxError::ENOTCONN)?,
         };
@@ -882,9 +948,10 @@ impl Socket for ServedUdpSocket {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
-        let Endpoint::Ip(peer) = endpoint else {
+        let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
+        peer.addr = plain(self.v6, peer.addr, LxError::ENETUNREACH)?;
         if !matches!(peer.addr, IpAddress::Ipv4(_)) {
             return Err(LxError::EAFNOSUPPORT);
         }
@@ -894,12 +961,10 @@ impl Socket for ServedUdpSocket {
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
-        let Endpoint::Ip(local) = endpoint else {
+        let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
-        if !matches!(local.addr, IpAddress::Ipv4(_) | IpAddress::Unspecified) {
-            return Err(LxError::EAFNOSUPPORT);
-        }
+        local.addr = plain(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         // `inet_bind`: a socket that has a port is `EINVAL`.
         if self.shared.inner.lock().port.is_some() {
             return Err(LxError::EINVAL);
@@ -930,14 +995,16 @@ impl Socket for ServedUdpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.shared.inner.lock();
-        Some(Endpoint::Ip(IpEndpoint::new(
+        let local = IpEndpoint::new(
             IpAddress::Ipv4(inner.here.unwrap_or(Ipv4Address::UNSPECIFIED)),
             inner.port.unwrap_or(0),
-        )))
+        );
+        Some(Endpoint::Ip(shown(self.v6, local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
-        self.shared.inner.lock().remote.map(Endpoint::Ip)
+        let remote = self.shared.inner.lock().remote?;
+        Some(Endpoint::Ip(shown(self.v6, remote)))
     }
 
     fn is_inet(&self) -> bool {
@@ -945,7 +1012,11 @@ impl Socket for ServedUdpSocket {
     }
 
     fn so_domain(&self) -> Option<u32> {
-        Some(Domain::AF_INET as u32)
+        Some(if self.v6 {
+            Domain::AF_INET6 as u32
+        } else {
+            Domain::AF_INET as u32
+        })
     }
 
     fn so_protocol(&self) -> Option<u32> {
@@ -1047,6 +1118,12 @@ impl FileLike for ServedUdpSocket {
         ))
     }
 
+    /// What `ifconfig` and `ip` ask of any socket: the interfaces are
+    /// still the kernel's to list, whichever stack the socket is of.
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
+        super::handle_net_ioctl(request, arg1, arg2, arg3, false)
+    }
+
     /// `FIONREAD`: the size of the next datagram, 0 when there is none.
     fn readable_bytes(&self) -> Option<usize> {
         let inner = self.shared.inner.lock();
@@ -1081,7 +1158,7 @@ mod tests {
 
     impl Stack {
         fn socket(&self) -> ServedUdpSocket {
-            let s = ServedUdpSocket::new(self.link.clone()).unwrap();
+            let s = ServedUdpSocket::new(self.link.clone(), false).unwrap();
             FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
             s
         }
@@ -1273,6 +1350,107 @@ mod tests {
         // A port nobody has: lost, as a datagram is.
         assert_eq!(Socket::write(&client, b"nadie", to(here, 9)), Ok(5));
         assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn a_boot_that_asks_for_every_program_has_asked_for_each() {
+        let _g = LOCK.lock();
+        let proc = crate::process::LinuxProcess::new(rcore_fs_ramfs::RamFS::new(), 0);
+        assert!(!proc.uses_user_netstack());
+        // `unetuse=all`: every program is one that asked.
+        use_for_all(true);
+        assert!(is_for_all());
+        assert!(proc.uses_user_netstack());
+        use_for_all(false);
+        assert!(!proc.uses_user_netstack());
+        // And one that asks still has what it asked for.
+        proc.use_user_netstack();
+        assert!(proc.uses_user_netstack());
+    }
+
+    /// `addr` as an `AF_INET6` socket is given it and gives it.
+    pub(super) fn at6(addr: &str, port: u16) -> IpEndpoint {
+        let addr: core::net::Ipv6Addr = addr.parse().unwrap();
+        IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr.octets())), port)
+    }
+
+    #[test]
+    fn an_ipv6_datagram_socket_carries_ipv4() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let here = [127, 0, 0, 1];
+        // `::` is every address, and the port is the stack's to hear on.
+        let server = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        FileLike::set_flags(&server, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
+        assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
+        assert_eq!(ip(Socket::endpoint(&server).unwrap()), at6("::", 5353));
+
+        // What an IPv4 socket sends it comes from an IPv4 address, said
+        // the way such a socket says one; and it answers there.
+        let client = stack.socket();
+        assert_eq!(Socket::write(&client, b"hola", to(here, 5353)), Ok(4));
+        let sent_from = port(&client);
+        let mut buf = [0u8; 16];
+        let from = at6("::ffff:127.0.0.1", sent_from);
+        assert_eq!(recv(&server, &mut buf), (Ok(4), from));
+        assert_eq!(
+            Socket::write(&server, b"que tal", Some(Endpoint::Ip(from))),
+            Ok(7)
+        );
+        assert_eq!(recv(&client, &mut buf), (Ok(7), at(here, 5353)));
+        // `::1` is this machine as well.
+        assert_eq!(
+            Socket::write(&server, b"yo", Some(Endpoint::Ip(at6("::1", sent_from)))),
+            Ok(2)
+        );
+        assert_eq!(recv(&client, &mut buf), (Ok(2), at(here, 5353)));
+        while stack.told().is_some() {}
+
+        // An IPv4 address elsewhere goes to the stack as what it is, and
+        // what comes from there is said as it was written.
+        let there = Endpoint::Ip(at6("::ffff:10.0.9.1", 53));
+        assert_eq!(Socket::write(&server, b"q", Some(there.clone())), Ok(1));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(server.sock, HOST, 53, b"q"))
+        );
+        stack.arrives(server.sock, HOST, 53, b"r");
+        stack.link.pump();
+        assert_eq!(recv(&server, &mut buf), (Ok(1), at6("::ffff:10.0.9.1", 53)));
+        async_std::task::block_on(Socket::connect(&server, there)).unwrap();
+        assert_eq!(
+            ip(Socket::remote_endpoint(&server).unwrap()),
+            at6("::ffff:10.0.9.1", 53)
+        );
+
+        // The stack has no IPv6: an address that is only that is nowhere
+        // it reaches and none it has. And an IPv4 address is not one an
+        // `AF_INET6` socket is given.
+        let other = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        let v6 = Endpoint::Ip(at6("2001:db8::1", 53));
+        assert_eq!(
+            Socket::write(&other, b"q", Some(v6.clone())),
+            Err(LxError::ENETUNREACH)
+        );
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&other, v6.clone())),
+            Err(LxError::ENETUNREACH)
+        );
+        assert_eq!(Socket::bind(&other, v6), Err(LxError::EADDRNOTAVAIL));
+        assert_eq!(
+            Socket::bind(&other, Endpoint::Ip(at(here, 5354))),
+            Err(LxError::EAFNOSUPPORT)
+        );
+        // Bound to `::1` it is this machine's alone, like one bound to
+        // 127.0.0.1.
+        while stack.told().is_some() {}
+        assert_eq!(Socket::bind(&other, Endpoint::Ip(at6("::1", 5354))), Ok(0));
+        assert_eq!(stack.told(), None);
+        assert_eq!(
+            ip(Socket::endpoint(&other).unwrap()),
+            at6("::ffff:127.0.0.1", 5354)
+        );
     }
 
     #[test]
@@ -1603,7 +1781,7 @@ mod tests {
         assert!(link.is_dead());
         assert!(current().is_none());
         assert_eq!(
-            ServedUdpSocket::new(link.clone()).err(),
+            ServedUdpSocket::new(link.clone(), false).err(),
             Some(LxError::ENETDOWN)
         );
 
@@ -1633,7 +1811,7 @@ mod tests {
     fn a_stack_found_dead_by_a_write_is_dead() {
         let _g = LOCK.lock();
         let Stack { link, end } = stack();
-        let a = ServedUdpSocket::new(link.clone()).unwrap();
+        let a = ServedUdpSocket::new(link.clone(), false).unwrap();
         drop(end);
         assert_eq!(Socket::write(&a, b"x", to(HOST, 9)), Err(LxError::ENETDOWN));
         assert!(link.is_dead());

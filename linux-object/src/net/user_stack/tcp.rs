@@ -465,12 +465,16 @@ pub struct ServedTcpSocket {
     base: KObjectBase,
     link: Arc<StackLink>,
     sock: u64,
+    /// An `AF_INET6` socket, and so is what it accepts: see "IPv6
+    /// sockets" at the top of [`super`].
+    v6: bool,
     stream: Arc<Stream>,
 }
 
 impl ServedTcpSocket {
-    /// A socket of the stack behind `link`. `ENETDOWN` when it is gone.
-    pub fn new(link: Arc<StackLink>) -> LxResult<Self> {
+    /// A socket of the stack behind `link`, `AF_INET6` when `v6`.
+    /// `ENETDOWN` when the stack is gone.
+    pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
         if link.is_dead() {
             return Err(LxError::ENETDOWN);
         }
@@ -486,6 +490,7 @@ impl ServedTcpSocket {
             base: KObjectBase::new(),
             link,
             sock,
+            v6,
             stream,
         })
     }
@@ -666,9 +671,10 @@ impl Socket for ServedTcpSocket {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
-        let Endpoint::Ip(peer) = endpoint else {
+        let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
+        peer.addr = plain(self.v6, peer.addr, LxError::ENETUNREACH)?;
         let IpAddress::Ipv4(addr) = peer.addr else {
             return Err(LxError::EAFNOSUPPORT);
         };
@@ -760,9 +766,10 @@ impl Socket for ServedTcpSocket {
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
-        let Endpoint::Ip(local) = endpoint else {
+        let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
+        local.addr = plain(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         match local.addr {
             IpAddress::Unspecified => {}
             IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address => {}
@@ -891,9 +898,10 @@ impl Socket for ServedTcpSocket {
                         base: KObjectBase::new(),
                         link: self.link.clone(),
                         sock,
+                        v6: self.v6,
                         stream,
                     });
-                    let from = from.unwrap_or(IpEndpoint::UNSPECIFIED);
+                    let from = shown(self.v6, from.unwrap_or(IpEndpoint::UNSPECIFIED));
                     return Ok((socket as Arc<dyn FileLike>, Endpoint::Ip(from)));
                 }
                 if dead {
@@ -916,10 +924,8 @@ impl Socket for ServedTcpSocket {
             Phase::Connecting | Phase::Open | Phase::Over => self.link.address,
             Phase::Fresh | Phase::Listening => Ipv4Address::UNSPECIFIED,
         });
-        Some(Endpoint::Ip(IpEndpoint::new(
-            IpAddress::Ipv4(addr),
-            inner.port.unwrap_or(0),
-        )))
+        let local = IpEndpoint::new(IpAddress::Ipv4(addr), inner.port.unwrap_or(0));
+        Some(Endpoint::Ip(shown(self.v6, local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -927,7 +933,7 @@ impl Socket for ServedTcpSocket {
         inner
             .remote
             .filter(|_| inner.phase == Phase::Open)
-            .map(Endpoint::Ip)
+            .map(|remote| Endpoint::Ip(shown(self.v6, remote)))
     }
 
     fn take_so_error(&self) -> i32 {
@@ -947,7 +953,11 @@ impl Socket for ServedTcpSocket {
     }
 
     fn so_domain(&self) -> Option<u32> {
-        Some(Domain::AF_INET as u32)
+        Some(if self.v6 {
+            Domain::AF_INET6 as u32
+        } else {
+            Domain::AF_INET as u32
+        })
     }
 
     fn so_protocol(&self) -> Option<u32> {
@@ -1060,6 +1070,12 @@ impl FileLike for ServedTcpSocket {
         ))
     }
 
+    /// What `ifconfig` and `ip` ask of any socket: the interfaces are
+    /// still the kernel's to list, whichever stack the socket is of.
+    fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
+        crate::net::handle_net_ioctl(request, arg1, arg2, arg3, false)
+    }
+
     /// `FIONREAD`: the bytes that arrived and were not read.
     fn readable_bytes(&self) -> Option<usize> {
         Some(self.stream.inner.lock().queued)
@@ -1077,13 +1093,13 @@ mod tests {
 
     extern crate std;
 
-    use super::super::tests::{any, at, ip, stack, Stack, HOST, STACK_ADDR};
+    use super::super::tests::{any, at, at6, ip, stack, Stack, HOST, STACK_ADDR};
     use super::*;
     use crate::net::NET_TEST_LOCK as LOCK;
 
     /// A stream socket that does not wait.
     fn stream(stack: &Stack) -> ServedTcpSocket {
-        let s = ServedTcpSocket::new(stack.link.clone()).unwrap();
+        let s = ServedTcpSocket::new(stack.link.clone(), false).unwrap();
         FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
         s
     }
@@ -1751,6 +1767,100 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_socket_carries_ipv4() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let stream6 = || {
+            let s = ServedTcpSocket::new(stack.link.clone(), true).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        // What plenty of servers do: one `AF_INET6` socket at `::`, for
+        // whoever comes. The stack is told of the port, as of any.
+        let l = stream6();
+        assert_eq!(Socket::bind(&l, Endpoint::Ip(at6("::", 8080))), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        let (op, sock) = parse_header(&stack.told().unwrap()).unwrap();
+        assert_eq!((op, sock), (OP_LISTEN, l.sock));
+        assert_eq!(ip(Socket::endpoint(&l).unwrap()), at6("::", 8080));
+
+        // An IPv4 program of this machine reaches it, and is said to
+        // come from the IPv4 address it has, the way such a socket says
+        // one. What is accepted is a socket like its listener.
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let (s, from) = accepted(&l);
+        assert_eq!(from, at6("::ffff:127.0.0.1", from.port));
+        assert_eq!(
+            ip(Socket::endpoint(&*s).unwrap()),
+            at6("::ffff:127.0.0.1", 8080)
+        );
+        assert_eq!(ip(Socket::remote_endpoint(&*s).unwrap()), from);
+        assert_eq!(ip(Socket::remote_endpoint(&c).unwrap()), at(HERE, 8080));
+        let mut buf = [0u8; 8];
+        assert_eq!(Socket::write(&c, b"hola", None), Ok(4));
+        assert_eq!(read(&s, &mut buf), Ok(4));
+
+        // `::1` is this machine too.
+        let c6 = stream6();
+        assert_eq!(connect(&c6, at6("::1", 8080)), Ok(0));
+        assert_eq!(
+            ip(Socket::remote_endpoint(&c6).unwrap()),
+            at6("::ffff:127.0.0.1", 8080)
+        );
+        let (_s6, from) = accepted(&l);
+        assert_eq!(from, at6("::ffff:127.0.0.1", from.port));
+        assert_eq!(stack.told(), None);
+
+        // An IPv4 address elsewhere goes to the stack as what it is.
+        let out = stream6();
+        assert_eq!(
+            connect(&out, at6("::ffff:10.0.9.1", 80)),
+            Err(LxError::EINPROGRESS)
+        );
+        let local = ip(Socket::endpoint(&out).unwrap()).port;
+        assert_eq!(
+            stack.told(),
+            Some(connect_message(
+                out.sock,
+                HOST,
+                80,
+                local,
+                STREAM_WINDOW as u32
+            ))
+        );
+        events(&stack, &[(out.sock, EV_CONNECTED, 1000, &[])]);
+        assert_eq!(
+            ip(Socket::remote_endpoint(&out).unwrap()),
+            at6("::ffff:10.0.9.1", 80)
+        );
+        assert_eq!(
+            ip(Socket::endpoint(&out).unwrap()),
+            at6("::ffff:10.0.9.15", local)
+        );
+
+        // The stack has no IPv6: an address that is only that is nowhere
+        // it reaches and none it has. And an IPv4 address is not one an
+        // `AF_INET6` socket is given.
+        let no = stream6();
+        assert_eq!(
+            connect(&no, at6("2001:db8::1", 80)),
+            Err(LxError::ENETUNREACH)
+        );
+        assert_eq!(
+            Socket::bind(&no, Endpoint::Ip(at6("2001:db8::1", 80))),
+            Err(LxError::EADDRNOTAVAIL)
+        );
+        assert_eq!(connect(&no, at(HOST, 80)), Err(LxError::EAFNOSUPPORT));
+        // Bound to `::1` it is this machine's alone, like one bound to
+        // 127.0.0.1: the stack is not told that it listens.
+        while stack.told().is_some() {}
+        assert_eq!(Socket::bind(&no, Endpoint::Ip(at6("::1", 8081))), Ok(0));
+        assert_eq!(Socket::listen(&no), Ok(0));
+        assert_eq!(stack.told(), None);
+    }
+
+    #[test]
     fn a_listener_bound_to_this_machine_is_not_the_stacks() {
         let _lock = LOCK.lock();
         let stack = stack();
@@ -1879,7 +1989,7 @@ mod tests {
         assert_eq!(connect(&connecting, at(HOST, 80)), Err(LxError::ENETDOWN));
         assert_eq!(accept(&listening).err(), Some(LxError::ENETDOWN));
         assert_eq!(
-            ServedTcpSocket::new(link.clone()).err(),
+            ServedTcpSocket::new(link.clone(), false).err(),
             Some(LxError::ENETDOWN)
         );
     }
@@ -1889,7 +1999,7 @@ mod tests {
         let _lock = LOCK.lock();
         let stack = stack();
         for answer in [EV_CONNECTED, EV_FAILED] {
-            let s = Arc::new(ServedTcpSocket::new(stack.link.clone()).unwrap());
+            let s = Arc::new(ServedTcpSocket::new(stack.link.clone(), false).unwrap());
             let waiter = {
                 let s = s.clone();
                 std::thread::spawn(move || connect(&s, at(HOST, 80)))
