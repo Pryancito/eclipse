@@ -11,7 +11,9 @@
 //! `eclipse-network-up`, the `network` service of the image) at boot: it
 //! sets the static addresses and routes with `ip`, runs `udhcpc` / `udhcpc6`
 //! for the interfaces that want DHCP, writes `resolv.conf` when the servers are
-//! fixed, and on SIGHUP stops all of it and starts again from the file.
+//! fixed, and on SIGHUP stops all of it and starts again from the file. A
+//! card that a network stack running as a process has is that stack's to
+//! configure: the service tells it what the file says (`govern_stack`).
 //!
 //! Tab and Shift+Tab move between the fields, ←/→ change a mode, ↑/↓ the
 //! interface, Intro applies and Esc closes.
@@ -1088,8 +1090,9 @@ struct Client {
 /// Also the interfaces there were to bring up, as sysfs listed them without
 /// the cards of a stack that runs as a process, and whether there is such a
 /// card: the service compares that against what is there later (see
-/// [`service`]).
-fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, bool)) {
+/// [`service`]). And what the stacks that come later are settled by
+/// ([`settle_stacks`]).
+fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, bool), Applied) {
     for (dev, cidr) in added6.drain(..) {
         let _ = run(&["ip", "-6", "addr", "del", &cidr, "dev", &dev]);
     }
@@ -1120,12 +1123,33 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
         }
         dns.extend(p.dns);
     }
-    // The card of a stack that runs as a process is not configured here,
-    // but the name servers fixed for it are the machine's all the same:
-    // `resolv.conf` knows no interfaces.
-    let servers = Path::new(netconf::SERVERS);
-    for n in netconf::of_stacks(Path::new(SYS_NET), servers) {
-        dns.extend(netconf::plan(&netconf::settings_for(&conf, &n)).dns);
+    let applied = Applied { conf, dns };
+    settle_stacks(&applied, &netconf::stacks(Path::new(SYS_NET), Path::new(netconf::SERVERS)));
+    eprintln!("lunarnet: {} interfaz(es), {} cliente(s) DHCP", names.len(), clients.len());
+    (clients, seen, applied)
+}
+
+/// What a pass over the file left to do again whenever the stacks that
+/// run as processes change: the file as it was read, and the name servers
+/// it fixes for the interfaces configured here.
+struct Applied {
+    conf: Vec<Iface>,
+    dns: Vec<std::net::IpAddr>,
+}
+
+/// The part of a pass that is about the cards of the stacks that run as
+/// processes, `cards` being the ones the machine shows now. Such a card
+/// is not configured here: its stack is told what the file says for it,
+/// and has the address. The name servers fixed for it are the machine's
+/// all the same: `resolv.conf` knows no interfaces.
+///
+/// Done after each pass and again when a stack comes or goes, because a
+/// stack is only known by name while its card is shown: one that was
+/// starting when the file was applied has had none of this.
+fn settle_stacks(applied: &Applied, cards: &[netconf::StackCard]) {
+    let mut dns = applied.dns.clone();
+    for card in cards {
+        dns.extend(netconf::plan(&netconf::settings_for(&applied.conf, &card.name)).dns);
     }
     if dns.is_empty() {
         let _ = std::fs::remove_file(DNS_MARK);
@@ -1133,7 +1157,7 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
         // writes its own when it gets one; a stack that has its lease
         // already would not say them again, so they are written from what
         // it publishes.
-        let leased = netconf::stack_dns(Path::new(SYS_NET), servers);
+        let leased = netconf::stack_dns(Path::new(SYS_NET), Path::new(netconf::SERVERS));
         if !leased.is_empty() {
             write_resolv_conf(&netconf::lease_resolv_conf(&leased));
         }
@@ -1142,8 +1166,57 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
         let _ = std::fs::write(DNS_MARK, "");
         write_resolv_conf(&netconf::resolv_conf(&dns));
     }
-    eprintln!("lunarnet: {} interfaz(es), {} cliente(s) DHCP", names.len(), clients.len());
-    (clients, seen)
+    // Last: a stack that is to be another is ended here, and its card
+    // goes with it for a moment.
+    for card in cards {
+        govern_stack(card, &netconf::stack_wish(&applied.conf, &card.name));
+    }
+}
+
+/// Have the stack of `card` be as the file wants it, when it is not: leave
+/// the word where the stack looks when it starts (or take it away, for the
+/// command line's to stand again) and end the stack, which `eclipse-init`
+/// starts again. The programs' sockets outlive it; the connections it
+/// carried were the old address's.
+fn govern_stack(card: &netconf::StackCard, wish: &netconf::StackWish) {
+    if *wish == netconf::StackWish::Leave {
+        eprintln!("lunarnet: {}: lo que dice /etc/eclipse/network no se le puede pedir a la pila en proceso; se queda como está", card.name);
+    }
+    let Some(change) = netconf::stack_change(card, wish) else {
+        return;
+    };
+    let dir = Path::new(netconf::STACK_SETTINGS);
+    let file = dir.join(&card.mac);
+    let written = match &change {
+        Some(word) => {
+            let tmp = dir.join(format!(".{}.lunarnet", card.mac));
+            std::fs::create_dir_all(dir)
+                .and_then(|()| std::fs::write(&tmp, format!("# written by lunarnet from /etc/eclipse/network ({})\n{word}\n", card.name)))
+                .and_then(|()| std::fs::rename(&tmp, &file))
+        }
+        None => match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    };
+    if let Err(e) = written {
+        eprintln!("lunarnet: {}: {}: {e}", card.name, file.display());
+        return;
+    }
+    // Only a process that is a stack: the pid is what the stack published
+    // when it started, and it may be long gone.
+    let stack = card.pid.filter(|pid| {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        *pid > 1 && comm.trim().starts_with("eclipse-netstac")
+    });
+    let what = change.as_deref().unwrap_or("lo que diga el arranque");
+    match stack {
+        Some(pid) => {
+            eprintln!("lunarnet: {}: la pila en proceso pasa a {what}; se reinicia", card.name);
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        None => eprintln!("lunarnet: {}: la pila en proceso tendrá {what} cuando arranque", card.name),
+    }
 }
 
 /// `/etc/resolv.conf` says `text` from now on, whole or not at all.
@@ -1213,7 +1286,8 @@ fn service() -> ! {
     let mut added6 = Vec::new();
     loop {
         RELOAD.store(false, Ordering::SeqCst);
-        let (mut clients, seen) = bring_up(&mut added6);
+        let (mut clients, seen, applied) = bring_up(&mut added6);
+        let mut stacks = netconf::stacks(Path::new(SYS_NET), Path::new(netconf::SERVERS));
         while !RELOAD.load(Ordering::SeqCst) && !STOP.load(Ordering::SeqCst) {
             // An interface that was not there when the file was applied has
             // had none of it: a card whose driver is a process (`unet`) comes
@@ -1224,6 +1298,14 @@ fn service() -> ! {
             if netconf::to_configure(Path::new(SYS_NET), Path::new(netconf::SERVERS)) != seen {
                 eprintln!("lunarnet: las interfaces han cambiado, aplicando de nuevo");
                 break;
+            }
+            // A stack that runs as a process came, went or started again:
+            // what the file says for its card is settled with the one
+            // there is now.
+            let now = netconf::stacks(Path::new(SYS_NET), Path::new(netconf::SERVERS));
+            if now != stacks {
+                settle_stacks(&applied, &now);
+                stacks = now;
             }
             for c in &mut clients {
                 let dead = match &mut c.child {
