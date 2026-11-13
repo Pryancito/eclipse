@@ -2014,8 +2014,12 @@ impl<'a> InterfaceInner<'a> {
 
             _ => (),
         }
-        // The request got dispatched, limit the rate on the cache.
-        self.neighbor_cache.as_mut().unwrap().limit_rate(cx.now);
+        // The request got dispatched: no other for this neighbor for a
+        // while. A request for another neighbor is not held back.
+        self.neighbor_cache
+            .as_mut()
+            .unwrap()
+            .limit_rate(&dst_addr, cx.now);
         Err(Error::Unaddressable)
     }
 
