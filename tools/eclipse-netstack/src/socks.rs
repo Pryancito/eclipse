@@ -24,6 +24,20 @@
 //! all the datagrams of a turn of the stack, for whichever sockets (its
 //! header's socket is zero): the kernel is woken once for them all.
 //!
+//! A socket that speaks ICMP (what `ping` opens) has no port to open:
+//!
+//! ```text
+//! HEAR    (kernel to stack)
+//! ICMP    (kernel to stack)  16  [u8; 4] to  20  u8 hop limit  21  three zero  24  the ICMP message
+//! ```
+//!
+//! While any socket hears, from its `HEAR` to its `CLOSE`, every IPv4
+//! packet of ICMP the card brings goes to the kernel whole, as a record of
+//! a `DATA` for socket 0 and port 0: which socket it is for is the
+//! kernel's to say. An `ICMP` is a message to send for a socket that
+//! hears, behind an IPv4 header written here. The stack answers the
+//! echoes that arrive, heard or not.
+//!
 //! A stream socket is the same bargain with more to say, and [`tcp`] has
 //! it: the connection is a smoltcp socket here, and an `EVENTS` carries
 //! what a turn made of every connection.
@@ -31,13 +45,16 @@
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use smoltcp::iface::Interface;
+use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::phy::Device;
+use smoltcp::socket::{RawPacketMetadata, RawSocket, RawSocketBuffer};
 use smoltcp::socket::{SocketHandle, SocketSet, UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion};
+use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
 
 pub mod lease;
 pub mod tcp;
@@ -48,6 +65,12 @@ pub const OP_BIND: u32 = 1;
 pub const OP_SEND: u32 = 2;
 pub const OP_CLOSE: u32 = 3;
 pub const OP_DATA: u32 = 4;
+pub const OP_HEAR: u32 = 11;
+pub const OP_ICMP: u32 = 12;
+
+/// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
+/// whichever sockets hear.
+pub const HEARD: u64 = 0;
 
 /// What every message starts with.
 pub const HEADER_LEN: usize = 16;
@@ -60,6 +83,8 @@ pub const MESSAGE_MAX: usize = 65536;
 
 /// The IPv4 and UDP headers a datagram travels behind.
 const HEADERS: usize = 20 + 8;
+/// The IPv4 header an ICMP message travels behind.
+const IP_HEADER: usize = 20;
 /// The datagrams a socket holds between the card and the kernel: as many
 /// as a card delivers in one turn, since each turn empties it.
 const RX_DATAGRAMS: usize = 64;
@@ -72,8 +97,8 @@ const TX_DATAGRAMS: usize = 32;
 pub enum Refused {
     /// Too short, or an operation that is not one.
     Malformed,
-    /// A `BIND` for a socket that has a port, or to port 0; a `CONNECT`
-    /// or a `LISTEN` for a socket that is one already.
+    /// A `BIND` for a socket that has a port, or to port 0; a `CONNECT`,
+    /// a `LISTEN` or a `HEAR` for a socket that is one already.
     Bind,
     /// A message for a socket there is none of: never bound, or a
     /// connection that is over.
@@ -134,6 +159,11 @@ pub struct Stack<D: for<'d> Device<'d>> {
     set: SocketSet<'static>,
     /// The datagram sockets.
     socks: BTreeMap<u64, SocketHandle>,
+    /// The sockets that hear ICMP.
+    hearing: BTreeSet<u64>,
+    /// What hears for them, while there is one: a socket that every
+    /// IPv4 packet of ICMP reaches, and that sends theirs.
+    ear: Option<SocketHandle>,
     streams: tcp::Streams,
     /// When the last [`poll`](Self::poll) was.
     now: Instant,
@@ -152,6 +182,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             iface,
             set: SocketSet::new(vec![]),
             socks: BTreeMap::new(),
+            hearing: BTreeSet::new(),
+            ear: None,
             streams: tcp::Streams::default(),
             now: Instant::from_millis(0),
             brought: false,
@@ -181,9 +213,101 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         self.socks.len()
     }
 
-    /// Whether `sock` is a socket here, of either kind.
+    /// How many sockets hear ICMP.
+    pub fn hearing(&self) -> usize {
+        self.hearing.len()
+    }
+
+    /// Whether `sock` is a socket here, of any kind.
     fn knows(&self, sock: u64) -> bool {
-        self.socks.contains_key(&sock) || self.streams.knows(sock)
+        self.socks.contains_key(&sock) || self.hearing.contains(&sock) || self.streams.knows(sock)
+    }
+
+    /// The longest ICMP message this stack carries: what fits one frame.
+    fn max_icmp(&self) -> usize {
+        self.iface.device().capabilities().ip_mtu() - IP_HEADER
+    }
+
+    /// `HEAR`: `sock` hears ICMP from now on.
+    fn hear(&mut self, sock: u64) -> Result<bool, Refused> {
+        if sock == HEARD || self.knows(sock) {
+            return Err(Refused::Bind);
+        }
+        if self.ear.is_none() {
+            let room = self.iface.device().capabilities().ip_mtu();
+            let buffer = |packets: usize| {
+                RawSocketBuffer::new(
+                    vec![RawPacketMetadata::EMPTY; packets],
+                    vec![0u8; packets * room],
+                )
+            };
+            let ear = RawSocket::new(
+                IpVersion::Ipv4,
+                IpProtocol::Icmp,
+                buffer(RX_DATAGRAMS),
+                buffer(TX_DATAGRAMS),
+            );
+            self.ear = Some(self.set.add(ear));
+        }
+        self.hearing.insert(sock);
+        Ok(false)
+    }
+
+    /// `ICMP`: a message of `sock`'s to send.
+    fn icmp(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
+        if m.len() < DATAGRAM_AT {
+            return Err(Refused::Malformed);
+        }
+        if !self.hearing.contains(&sock) {
+            return Err(Refused::NoSocket);
+        }
+        let ear = self.ear.ok_or(Refused::NoSocket)?;
+        let to = Ipv4Address::from_bytes(&m[16..20]);
+        let hop_limit = m[20];
+        let message = &m[DATAGRAM_AT..];
+        if hop_limit == 0 {
+            return Err(Refused::Malformed);
+        }
+        if message.len() > self.max_icmp() {
+            return Err(Refused::TooLong);
+        }
+        // What is sent before the card has an address has nobody to come
+        // back to.
+        let from = self.address().ok_or(Refused::Unreachable)?.address();
+        if !self.reaches(to) {
+            return Err(Refused::Unreachable);
+        }
+        let header = Ipv4Repr {
+            src_addr: from,
+            dst_addr: to,
+            protocol: IpProtocol::Icmp,
+            payload_len: message.len(),
+            hop_limit,
+        };
+        let mut socket = self.set.get::<RawSocket>(ear);
+        let packet = socket
+            .send(IP_HEADER + message.len())
+            .map_err(|_| Refused::Full)?;
+        header.emit(
+            &mut Ipv4Packet::new_unchecked(&mut packet[..IP_HEADER]),
+            &ChecksumCapabilities::default(),
+        );
+        packet[IP_HEADER..].copy_from_slice(message);
+        Ok(true)
+    }
+
+    /// `CLOSE` of a socket that hears, if `sock` is one. With the last
+    /// of them goes the ear.
+    fn deaf(&mut self, sock: u64) -> bool {
+        if !self.hearing.remove(&sock) {
+            return false;
+        }
+        if self.hearing.is_empty() {
+            if let Some(ear) = self.ear.take() {
+                self.set.remove(ear);
+            }
+        }
+        true
     }
 
     /// Whether `addr` can be sent to: it is on the card's network, it is
@@ -212,6 +336,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_WRITE => self.write(sock, m),
             OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
             OP_WINDOW => self.window(sock, m),
+            OP_HEAR if m.len() == HEADER_LEN => self.hear(sock),
+            OP_ICMP => self.icmp(sock, m),
             OP_BIND => {
                 let port: [u8; 2] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
                 let port = u16::from_le_bytes(port);
@@ -257,6 +383,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 // A socket closed before it had a port was never told here.
                 if let Some(handle) = self.socks.remove(&sock) {
                     self.set.remove(handle);
+                    return Ok(false);
+                }
+                if self.deaf(sock) {
                     return Ok(false);
                 }
                 Ok(self.close_stream(sock).unwrap_or(false))
@@ -317,6 +446,22 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 }
             }
         }
+        if let Some(ear) = self.ear {
+            let room = self.iface.device().capabilities().ip_mtu();
+            let mut socket = self.set.get::<RawSocket>(ear);
+            while socket.can_recv() {
+                if m.len() + RECORD_LEN + room > MESSAGE_MAX {
+                    return Arrived::More;
+                }
+                let Ok(packet) = socket.recv() else {
+                    break;
+                };
+                if let Ok(header) = Ipv4Packet::new_checked(packet) {
+                    push_record(m, HEARD, header.src_addr().0, 0, packet);
+                    self.brought = true;
+                }
+            }
+        }
         if m.len() > HEADER_LEN {
             Arrived::All
         } else {
@@ -337,7 +482,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 mod tests {
     use super::*;
     use crate::port::testing::*;
-    use smoltcp::wire::{IpProtocol, Ipv4Packet, UdpPacket};
+    use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, UdpPacket};
 
     pub(super) fn message(op: u32, sock: u64, rest: &[u8]) -> Vec<u8> {
         let mut m = Vec::new();
@@ -456,6 +601,12 @@ mod tests {
             bind(7, 5000),
             [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13]
         );
+        assert_eq!(hear(7), [0, 0, 0, 0, 11, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            icmp(7, Ipv4Address([10, 0, 9, 1]), 64, &[8, 0]),
+            [0, 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 64, 0, 0, 0, 8, 0]
+        );
+        assert_eq!(HEARD, 0);
         assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
         assert_eq!((HEADER_LEN, DATAGRAM_AT, RECORD_LEN), (16, 24, 16));
     }
@@ -480,6 +631,170 @@ mod tests {
         );
         // Each is told once.
         assert!(poll(&mut stack).is_empty());
+    }
+
+    fn hear(sock: u64) -> Vec<u8> {
+        message(OP_HEAR, sock, &[])
+    }
+
+    fn icmp(sock: u64, to: Ipv4Address, hop_limit: u8, icmp: &[u8]) -> Vec<u8> {
+        let mut rest = to.0.to_vec();
+        rest.extend_from_slice(&[hop_limit, 0, 0, 0]);
+        rest.extend_from_slice(icmp);
+        message(OP_ICMP, sock, &rest)
+    }
+
+    /// An echo with this identifier, as a program writes it.
+    fn echo(ident: u16, data: &[u8]) -> Vec<u8> {
+        let repr = Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no: 1,
+            data,
+        };
+        let mut bytes = vec![0u8; repr.buffer_len()];
+        repr.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut bytes[..]),
+            &ChecksumCapabilities::default(),
+        );
+        bytes
+    }
+
+    /// The ICMP message of an IPv4 packet from THEIRS to us.
+    fn heard_of(packet: &[u8]) -> Vec<u8> {
+        let ip = Ipv4Packet::new_checked(packet).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.protocol(), IpProtocol::Icmp);
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (THEIR_IP, OUR_IP));
+        ip.payload().to_vec()
+    }
+
+    #[test]
+    fn while_a_socket_hears_every_packet_of_icmp_goes_to_the_kernel_whole() {
+        let (mut stack, window) = stack();
+        // Nobody hears: the answer to an echo nobody sent is dropped.
+        window.deliver(stack.device(), 0, &echo_reply(7, 1, b"early"));
+        assert!(poll(&mut stack).is_empty());
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        assert_eq!(stack.request(&hear(6)), Ok(false));
+        assert_eq!(stack.hearing(), 2);
+        window.deliver(stack.device(), 1, &echo_reply(7, 1, b"pong"));
+        // Once, for whichever sockets: socket 0, from THEIRS, no port.
+        let got = poll(&mut stack);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].0, got[0].1, got[0].2), (HEARD, THEIR_IP.0, 0));
+        let answer = heard_of(&got[0].3);
+        let answer = Icmpv4Packet::new_checked(&answer[..]).unwrap();
+        assert_eq!(
+            Icmpv4Repr::parse(&answer, &ChecksumCapabilities::default()),
+            Ok(Icmpv4Repr::EchoReply {
+                ident: 7,
+                seq_no: 1,
+                data: b"pong"
+            })
+        );
+        assert!(poll(&mut stack).is_empty());
+        // An echo for us is heard too, and answered here all the same.
+        window.deliver(stack.device(), 2, &echo_request(OUR_IP, 9, 3, b"you?"));
+        let got = poll(&mut stack);
+        assert_eq!(got.len(), 1);
+        assert_eq!(heard_of(&got[0].3)[0], 8);
+        let turn = turn(stack.device());
+        let answered = turn
+            .iter()
+            .filter(|m| m.op == udrivers::net::OP_TX)
+            .map(|m| window.sent(m))
+            .filter(|frame| frame.len() > 14 + 20 && frame[14 + 9] == 1 && frame[14 + 20] == 0)
+            .count();
+        assert_eq!(answered, 1);
+    }
+
+    #[test]
+    fn an_icmp_message_leaves_by_the_card_behind_a_header_of_ours() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        let ping = echo(0x1234, b"anybody there?");
+        assert_eq!(stack.request(&icmp(5, THEIR_IP, 9, &ping)), Ok(true));
+        assert!(poll(&mut stack).is_empty());
+        let turn = turn(stack.device());
+        assert_eq!(turn.len(), 1);
+        let ip = ipv4_of(&window.sent(&turn[0]));
+        let ip = Ipv4Packet::new_checked(&ip[..]).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.protocol(), IpProtocol::Icmp);
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (OUR_IP, THEIR_IP));
+        assert_eq!(ip.hop_limit(), 9);
+        // The message is the program's, to the byte.
+        assert_eq!(ip.payload(), &ping[..]);
+    }
+
+    #[test]
+    fn an_icmp_message_that_cannot_go_is_refused() {
+        let (mut stack, _window) = stack();
+        let ping = echo(1, b"x");
+        // A socket that does not hear has nothing to send.
+        assert_eq!(
+            stack.request(&icmp(5, THEIR_IP, 64, &ping)),
+            Err(Refused::NoSocket)
+        );
+        assert_eq!(stack.request(&bind(4, 7000)), Ok(false));
+        assert_eq!(
+            stack.request(&icmp(4, THEIR_IP, 64, &ping)),
+            Err(Refused::NoSocket)
+        );
+        // A socket is one thing, and socket 0 is not a socket.
+        assert_eq!(stack.request(&hear(4)), Err(Refused::Bind));
+        assert_eq!(stack.request(&hear(HEARD)), Err(Refused::Bind));
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        assert_eq!(stack.request(&hear(5)), Err(Refused::Bind));
+        assert_eq!(stack.request(&bind(5, 7001)), Err(Refused::Bind));
+        assert_eq!(
+            stack.request(&message(OP_HEAR, 6, &[0])),
+            Err(Refused::Malformed)
+        );
+        assert_eq!(
+            stack.request(&message(OP_ICMP, 5, &[0; 7])),
+            Err(Refused::Malformed)
+        );
+        // No hops is nowhere.
+        assert_eq!(
+            stack.request(&icmp(5, THEIR_IP, 0, &ping)),
+            Err(Refused::Malformed)
+        );
+        assert_eq!(
+            stack.request(&icmp(5, Ipv4Address([192, 168, 1, 1]), 64, &ping)),
+            Err(Refused::Unreachable)
+        );
+        // One frame carries a message of the datagram's length and its
+        // UDP header's, and no more.
+        let longest = echo(1, &vec![0x55; stack.max_datagram()]);
+        assert_eq!(stack.request(&icmp(5, THEIR_IP, 64, &longest)), Ok(true));
+        let longer = echo(1, &vec![0x55; stack.max_datagram() + 1]);
+        assert_eq!(
+            stack.request(&icmp(5, THEIR_IP, 64, &longer)),
+            Err(Refused::TooLong)
+        );
+    }
+
+    #[test]
+    fn with_the_last_socket_that_hears_goes_the_ear() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        assert_eq!(stack.request(&hear(6)), Ok(false));
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        window.deliver(stack.device(), 0, &echo_reply(7, 1, b"one"));
+        assert_eq!(poll(&mut stack).len(), 1);
+        assert_eq!(stack.request(&message(OP_CLOSE, 6, &[])), Ok(false));
+        assert_eq!(stack.hearing(), 0);
+        window.deliver(stack.device(), 1, &echo_reply(7, 2, b"two"));
+        assert!(poll(&mut stack).is_empty());
+        assert_eq!(
+            stack.request(&icmp(6, THEIR_IP, 64, &echo(1, b"x"))),
+            Err(Refused::NoSocket)
+        );
+        // And the next to hear, hears.
+        assert_eq!(stack.request(&hear(7)), Ok(false));
+        window.deliver(stack.device(), 2, &echo_reply(7, 3, b"three"));
+        assert_eq!(poll(&mut stack).len(), 1);
     }
 
     #[test]

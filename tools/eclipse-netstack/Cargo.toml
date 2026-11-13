@@ -50,6 +50,8 @@ smoltcp = { path = "../../smoltcp", default-features = false, features = [
     "proto-ipv4",
     "medium-ethernet",
     "socket-icmp",
+    # Every packet of ICMP the card brings, for the sockets `ping` opens.
+    "socket-raw",
     "socket-udp",
     "socket-tcp",
     # The client that asks for the card's address (`socks::lease`).
