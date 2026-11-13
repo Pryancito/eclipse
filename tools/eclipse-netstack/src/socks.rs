@@ -9,7 +9,7 @@
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
 //! BIND    (kernel to stack)  16  u16 port
-//! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u16 zero  24  the datagram
+//! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
 //!             0  u64 socket  8  [u8; 4] from  12  u16 port  14  u16 length  16  the datagram
@@ -20,7 +20,10 @@
 //! the same). The kernel numbers the sockets and gives out the ports, so a
 //! `BIND` is told, not asked: the stack opens a smoltcp socket on that
 //! port and from then on every datagram that arrives for it goes to the
-//! kernel, at once, and every `SEND` goes to the card. A `DATA` carries
+//! kernel, at once, and every `SEND` goes to the card, to travel as many
+//! hops as it says (0: as many as smoltcp gives a datagram by itself,
+//! which is what a kernel from before the byte had a meaning sends: the
+//! socket's options are the kernel's to keep). A `DATA` carries
 //! all the datagrams of a turn of the stack, for whichever sockets (its
 //! header's socket is zero): the kernel is woken once for them all.
 //!
@@ -85,6 +88,8 @@ pub const MESSAGE_MAX: usize = 65536;
 const HEADERS: usize = 20 + 8;
 /// The IPv4 header an ICMP message travels behind.
 const IP_HEADER: usize = 20;
+/// The hops smoltcp gives a datagram whose socket was told none.
+const HOPS: u8 = 64;
 /// The datagrams a socket holds between the card and the kernel: as many
 /// as a card delivers in one turn, since each turn empties it.
 const RX_DATAGRAMS: usize = 64;
@@ -373,6 +378,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                     return Err(Refused::Unreachable);
                 }
                 let to = IpEndpoint::new(IpAddress::Ipv4(addr), port);
+                self.hops(handle, m[22]);
                 self.set
                     .get::<UdpSocket>(handle)
                     .send_slice(data, to)
@@ -392,6 +398,27 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             }
             _ => Err(Refused::Malformed),
         }
+    }
+
+    /// Have the next datagram of the socket `handle` travel `hop_limit`
+    /// hops at most, or as many as smoltcp gives one when that is 0.
+    ///
+    /// smoltcp keeps one hop limit for a socket and writes it when a
+    /// datagram leaves, not when it is queued. So when the limit is to be
+    /// another, the datagrams that wait leave first, with theirs: a
+    /// `traceroute` sends one hop further each time from one socket, and
+    /// several of its messages can be here before a turn of the stack.
+    /// One that still cannot leave then (its neighbour has not answered,
+    /// or the card has no room for a frame) goes with the new limit.
+    fn hops(&mut self, handle: SocketHandle, hop_limit: u8) {
+        let wanted = (hop_limit != 0).then_some(hop_limit);
+        let has = self.set.get::<UdpSocket>(handle).hop_limit();
+        // Said or not, smoltcp's own is this.
+        if wanted.unwrap_or(HOPS) == has.unwrap_or(HOPS) {
+            return;
+        }
+        let _ = self.iface.poll(&mut self.set, self.now);
+        self.set.get::<UdpSocket>(handle).set_hop_limit(wanted);
     }
 
     /// Carry the card's frames through the stack, both ways. What arrived
@@ -497,10 +524,21 @@ mod tests {
         message(OP_BIND, sock, &port.to_le_bytes())
     }
 
+    /// A `SEND` as a kernel that says no hop limit writes it.
     pub(super) fn send(sock: u64, to: Ipv4Address, port: u16, data: &[u8]) -> Vec<u8> {
+        send_hops(sock, to, port, 0, data)
+    }
+
+    pub(super) fn send_hops(
+        sock: u64,
+        to: Ipv4Address,
+        port: u16,
+        hop_limit: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut rest = to.0.to_vec();
         rest.extend_from_slice(&port.to_le_bytes());
-        rest.extend_from_slice(&[0, 0]);
+        rest.extend_from_slice(&[hop_limit, 0]);
         rest.extend_from_slice(data);
         message(OP_SEND, sock, &rest)
     }
@@ -809,6 +847,51 @@ mod tests {
             udp_of(&window.sent(&turn[0])),
             (7000, 4000, b"reply".to_vec())
         );
+    }
+
+    #[test]
+    fn a_datagram_travels_as_many_hops_as_its_send_says() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(5, 7000)), Ok(false));
+        // The hop limit and the datagram of each frame a turn sent, which
+        // the card then finishes with.
+        let left = |stack: &mut Stack<crate::port::Port>| -> Vec<(u8, Vec<u8>)> {
+            assert!(poll(stack).is_empty());
+            let mut frames = Vec::new();
+            for m in turn(stack.device()) {
+                if m.op == udrivers::net::OP_TX {
+                    let frame = window.sent(&m);
+                    frames.push((ipv4_of(&frame)[8], udp_of(&frame).2));
+                }
+                window.done(stack.device(), &m);
+            }
+            frames
+        };
+        let hops = |sent: &[(u8, &[u8])]| -> Vec<(u8, Vec<u8>)> {
+            sent.iter().map(|(h, d)| (*h, d.to_vec())).collect()
+        };
+        // Not said: smoltcp's own.
+        let said = send(5, THEIR_IP, 4000, b"any");
+        assert_eq!(stack.request(&said), Ok(true));
+        assert_eq!(left(&mut stack), hops(&[(64, b"any")]));
+        // Said, and said again as another before the stack had a turn:
+        // each leaves with its own, in order. What `traceroute` sends.
+        // (Two at a time: the bench's card has two frames to send in.)
+        let probes: [(u8, &[u8]); 4] = [(1, b"one"), (2, b"two"), (2, b"too"), (3, b"six")];
+        for pair in probes.chunks(2) {
+            for (limit, data) in pair {
+                let said = send_hops(5, THEIR_IP, 4000, *limit, data);
+                assert_eq!(stack.request(&said), Ok(true));
+            }
+            assert_eq!(left(&mut stack), hops(pair));
+        }
+        // Not said again, after it was: smoltcp's own again; and the most
+        // there is.
+        assert_eq!(stack.request(&said), Ok(true));
+        assert_eq!(left(&mut stack), hops(&[(64, b"any")]));
+        let far = send_hops(5, THEIR_IP, 4000, 255, b"far");
+        assert_eq!(stack.request(&far), Ok(true));
+        assert_eq!(left(&mut stack), hops(&[(255, b"far")]));
     }
 
     #[test]
