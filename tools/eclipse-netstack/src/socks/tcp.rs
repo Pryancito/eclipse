@@ -391,6 +391,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         let now = self.now;
         let mut drained = false;
         let more = self.fill(m, now, &mut drained);
+        self.brought |= drained;
         if !more {
             self.reap(now);
             self.replenish();
@@ -905,9 +906,13 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].data, b"GET / HTTP/1.0\r\n\r\n");
         peer.heard(&sent[0]);
-        // What the peer says reaches the kernel, once.
+        // What the peer says reaches the kernel, once: bytes for the
+        // program, which the news of its socket were not.
+        assert!(!wire.stack.brought_bytes());
         let (sent, events) = wire.hears(&peer.segment(TcpControl::Psh, b"HTTP/1.0 200 OK\r\n"));
         assert_eq!(events, [told(5, EV_BYTES, 0, b"HTTP/1.0 200 OK\r\n")]);
+        assert!(wire.stack.brought_bytes());
+        assert!(!wire.stack.brought_bytes(), "asked once");
         assert_eq!(sent.len(), 1, "acknowledged at once");
         assert_eq!(sent[0].ack, Some(peer.seq));
         assert_eq!(wire.turn(), (vec![], vec![]));

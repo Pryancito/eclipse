@@ -114,6 +114,19 @@ impl Port {
         n
     }
 
+    /// Whether a frame waits to be sent.
+    pub fn has_frames(&self) -> bool {
+        self.state.borrow().outgoing.iter().any(|m| m.op == OP_TX)
+    }
+
+    /// Whether what waits for the driver is worth waking it for: a frame
+    /// to send, or a quarter of the receive slots to give back. A slot
+    /// that waits goes with the next frame, and until then the card has
+    /// the other three quarters to receive into.
+    pub fn due(&self) -> bool {
+        self.state.borrow().outgoing.len() >= (self.rx_slots / 4).max(1) || self.has_frames()
+    }
+
     /// Messages [`outgoing`](Self::outgoing) gave that did not go: they
     /// are the first of the next turn, in the order they were.
     pub fn put_back(&self, msgs: &[Msg]) {
@@ -820,5 +833,43 @@ mod tests {
         assert_eq!(bench.iface.device().outgoing(&mut one), 1);
         assert_eq!(one[0].op, OP_TX);
         assert_eq!(bench.iface.device().outgoing(&mut one), 0);
+    }
+
+    #[test]
+    fn the_driver_is_woken_for_a_frame_or_a_quarter_of_the_slots() {
+        use smoltcp::phy::{Device, RxToken as _, TxToken as _};
+        const SLOTS: usize = 16;
+        let mut mem = vec![0u8; (SLOTS + 2) * BUF_SIZE];
+        // SAFETY: the window is `mem`, which outlives the port and is
+        // nobody else's.
+        let mut port = unsafe { Port::new(mem.as_mut_ptr(), SLOTS, 2) }.unwrap();
+        let now = Instant::from_millis(0);
+        let read = |port: &mut Port, slot: u32| {
+            assert!(port.take(&Msg {
+                op: OP_RX,
+                slot,
+                len: 60,
+                off: 0,
+            }));
+            let (rx, _) = port.receive().unwrap();
+            rx.consume(now, |_| Ok(())).unwrap();
+        };
+        assert!(!port.due(), "nothing to say");
+        for slot in 0..3 {
+            read(&mut port, slot);
+            assert!(!port.due(), "{} slots to give back", slot + 1);
+        }
+        assert!(!port.has_frames());
+        // A frame to send takes them with it.
+        let tx = port.transmit().unwrap();
+        tx.consume(now, 60, |_| Ok(())).unwrap();
+        assert!(port.has_frames() && port.due());
+        assert_eq!(turn(&port).len(), 4);
+        assert!(!port.has_frames() && !port.due());
+        // And a quarter of the slots is worth the wake by itself.
+        for slot in 3..7 {
+            read(&mut port, slot);
+        }
+        assert!(port.due() && !port.has_frames());
     }
 }

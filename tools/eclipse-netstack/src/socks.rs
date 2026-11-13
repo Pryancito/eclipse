@@ -135,6 +135,9 @@ pub struct Stack<D: for<'d> Device<'d>> {
     streams: tcp::Streams,
     /// When the last [`poll`](Self::poll) was.
     now: Instant,
+    /// Whether [`arrived`](Self::arrived) has given the kernel bytes for a
+    /// program since [`brought_bytes`](Self::brought_bytes) last asked.
+    brought: bool,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -146,6 +149,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             socks: BTreeMap::new(),
             streams: tcp::Streams::default(),
             now: Instant::from_millis(0),
+            brought: false,
         }
     }
 
@@ -275,6 +279,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         }
     }
 
+    /// Whether the messages [`arrived`](Self::arrived) made since this was
+    /// last asked carried bytes for a program -- a datagram, or what came
+    /// on a connection -- and not only news of the sockets: what a program
+    /// may have an answer to.
+    pub fn brought_bytes(&mut self) -> bool {
+        core::mem::take(&mut self.brought)
+    }
+
     /// Make `m` the `DATA` of the datagrams that arrived for the sockets,
     /// taking them off the sockets: all of them, or as many as fit one
     /// message.
@@ -291,6 +303,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 };
                 if let IpAddress::Ipv4(addr) = from.addr {
                     push_record(m, sock, addr.0, from.port, data);
+                    self.brought = true;
                 }
             }
         }
@@ -612,7 +625,9 @@ mod tests {
             turn(stack.device());
         }
         let mut m = Vec::new();
+        assert!(!stack.brought_bytes(), "nothing given yet");
         assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert!(stack.brought_bytes(), "a program has something to answer");
         assert!(m.len() <= MESSAGE_MAX);
         let first = records(&m);
         assert_eq!(first.len(), 44);
@@ -622,7 +637,9 @@ mod tests {
         // In the order they arrived, none twice.
         let ports: Vec<u16> = first.iter().chain(&second).map(|r| r.2).collect();
         assert_eq!(ports, (4000..4048).collect::<Vec<_>>());
+        assert!(stack.brought_bytes());
         assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+        assert!(!stack.brought_bytes());
     }
 
     #[test]
