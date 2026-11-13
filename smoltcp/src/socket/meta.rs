@@ -43,8 +43,13 @@ impl Meta {
     /// Minimum delay between neighbor discovery requests for this particular socket,
     /// in milliseconds.
     ///
-    /// See also `iface::NeighborCache::SILENT_TIME`.
-    pub(crate) const DISCOVERY_SILENT_TIME: Duration = Duration::from_millis(3_000);
+    /// See also `iface::NeighborCache::SILENT_TIME`, which is the same: a socket that waits
+    /// for a neighbor asks for it again as soon as the cache lets it, once a second, as Linux
+    /// does, and after three requests with no answer the cache says the neighbor is absent.
+    /// This was three seconds, with nothing to end the wait: a datagram for a neighbor that
+    /// never answered stayed at the head of its socket's queue for good, and everything
+    /// behind it with it.
+    pub(crate) const DISCOVERY_SILENT_TIME: Duration = Duration::from_millis(1_000);
 
     pub(crate) fn poll_at<F>(&self, socket_poll_at: PollAt, has_neighbor: F) -> PollAt
     where
@@ -87,6 +92,12 @@ impl Meta {
                 }
             }
         }
+    }
+
+    /// What the socket had for the neighbor it waited for was dropped: it waits for nobody,
+    /// and what it has next can leave.
+    pub(crate) fn neighbor_given_up(&mut self) {
+        self.neighbor_state = NeighborState::Active;
     }
 
     pub(crate) fn neighbor_missing(&mut self, timestamp: Instant, neighbor: IpAddress) {

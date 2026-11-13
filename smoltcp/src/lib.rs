@@ -147,6 +147,10 @@ pub enum Error {
     /// E.g. there was no an Ethernet address corresponding to an IPv4 address in the ARP cache,
     /// or a TCP connection attempt was made to an unspecified endpoint.
     Unaddressable,
+    /// An outgoing packet is for a neighbor that has left several discovery requests, one
+    /// after another, unanswered: it has nowhere to go. A datagram is dropped; a TCP segment
+    /// stays with its socket, which sends it again.
+    Unreachable,
 
     /// The operation is finished.
     /// E.g. when reading from a TCP socket, there's no more data to read because the remote
@@ -184,6 +188,7 @@ impl fmt::Display for Error {
             Error::Exhausted => write!(f, "buffer space exhausted"),
             Error::Illegal => write!(f, "illegal operation"),
             Error::Unaddressable => write!(f, "unaddressable destination"),
+            Error::Unreachable => write!(f, "unreachable neighbor"),
             Error::Finished => write!(f, "operation finished"),
             Error::Truncated => write!(f, "truncated packet"),
             Error::Checksum => write!(f, "checksum error"),

@@ -1035,6 +1035,55 @@ mod tests {
     }
 
     #[test]
+    fn a_connect_to_a_neighbour_that_never_answers_ends_as_one_told_there_is_no_host() {
+        // A stack that has met nobody.
+        let Bench { window, iface, .. } = Bench::new();
+        let mut stack = Stack::new(iface);
+        let nobody = Ipv4Address([10, 0, 9, 77]);
+        // Poll at `ms`: how many times the neighbour was asked for, with
+        // nothing else sent, and the events that made.
+        let at = |stack: &mut Stack<Port>, ms: i64| {
+            stack.poll(Instant::from_millis(ms));
+            let mut asked = 0;
+            for msg in turn(stack.device()) {
+                if msg.op == OP_TX {
+                    assert!(is_arp_request_for(&window.sent(&msg), nobody));
+                    window.done(stack.device(), &msg);
+                    asked += 1;
+                }
+            }
+            let (mut m, mut events) = (Vec::new(), Vec::new());
+            if stack.arrived(&mut m) != Arrived::Nothing {
+                assert_eq!(super::super::parse_header(&m), Some((OP_EVENTS, 0)));
+                let mut rest = &m[HEADER_LEN..];
+                while !rest.is_empty() {
+                    let sock = u64::from_le_bytes(rest[..8].try_into().unwrap());
+                    let len = u16_at(rest, 10) as usize;
+                    let bytes = rest[16..16 + len].to_vec();
+                    events.push((sock, u16_at(rest, 8), u32_at(rest, 12), bytes));
+                    rest = &rest[16 + len..];
+                }
+            }
+            (asked, events)
+        };
+        stack.request(&connect(5, nobody, 80, 50000, 1000)).unwrap();
+        // Asked for three times, a second apart, as Linux asks.
+        for ms in [1000, 2000, 3000] {
+            assert_eq!(at(&mut stack, ms), (1, vec![]));
+            assert_eq!(at(&mut stack, ms + 999), (0, vec![]));
+        }
+        // Then the connect ends, three seconds after it began, as one
+        // that a router said had no host to go to.
+        assert_eq!(
+            at(&mut stack, 4000),
+            (1, vec![told(5, EV_FAILED, WHY_UNREACHABLE, &[3, 1])])
+        );
+        assert!(stack.streams.is_empty());
+        assert_eq!(at(&mut stack, 5000), (0, vec![]));
+        assert_eq!(stack.idle_for(Instant::from_millis(5000)), None);
+    }
+
+    #[test]
     fn a_connect_told_there_is_no_way_ends_there_and_says_what_it_heard() {
         use smoltcp::wire::IpProtocol;
         let mut wire = Wire::new();

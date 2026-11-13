@@ -28,6 +28,11 @@ pub(crate) enum Answer {
     /// The neighbor address is not in the cache, or has expired,
     /// and a discovery request for it has been sent recently.
     RateLimited,
+    /// The neighbor address is not in the cache, and the last
+    /// `ABSENT_AFTER` requests for it, one after another, were not
+    /// answered: what is for it has nowhere to go. `ask` says whether
+    /// another request may be sent now, which is how it is found again.
+    Absent { ask: bool },
 }
 
 impl Answer {
@@ -41,10 +46,25 @@ impl Answer {
 }
 
 /// How many neighbors a cache remembers as asked for at a time. With more
-/// than this many asked within `SILENT_TIME`, the one whose time ends
-/// first is forgotten early, and may be asked again sooner: still at most
-/// one request for each packet that had nowhere to go.
+/// than this many asked within `FORGET_TIME`, the one asked longest ago
+/// is forgotten early, and may be asked again sooner: still at most one
+/// request for each packet that had nowhere to go.
 const ASKED: usize = 8;
+
+/// How many requests in a row a neighbor leaves unanswered before it is
+/// taken as absent. Linux asks three times, a second apart.
+const ABSENT_AFTER: u8 = 3;
+
+/// A neighbor a discovery request was sent for and that has not answered.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct Asked {
+    protocol_addr: IpAddress,
+    /// When the last request for it was sent.
+    at: Instant,
+    /// How many were sent, one after another, with no answer.
+    times: u8,
+}
 
 /// A neighbor cache backed by a map.
 ///
@@ -68,8 +88,10 @@ const ASKED: usize = 8;
 #[derive(Debug)]
 pub struct Cache<'a> {
     storage: ManagedMap<'a, IpAddress, Neighbor>,
-    /// The neighbors a discovery request was sent for, and until when no
-    /// other request is sent for each.
+    /// The neighbors a discovery request was sent for and that have not
+    /// answered: no other request is sent for one until `SILENT_TIME`
+    /// after the last, and one that leaves `ABSENT_AFTER` unanswered is
+    /// absent until it answers or is left alone for `FORGET_TIME`.
     ///
     /// One time for the whole cache, which is what this was, made the
     /// request for one neighbor wait for the request for another: a
@@ -81,7 +103,7 @@ pub struct Cache<'a> {
     /// server. And a neighbor that never answers, asked again every time
     /// its socket's silence ends, could hold the others back round after
     /// round.
-    asked: [Option<(IpAddress, Instant)>; ASKED],
+    asked: [Option<Asked>; ASKED],
     #[cfg(any(feature = "std", feature = "alloc"))]
     gc_threshold: usize,
 }
@@ -90,6 +112,13 @@ impl<'a> Cache<'a> {
     /// Minimum delay between discovery requests for one neighbor, in
     /// milliseconds.
     pub(crate) const SILENT_TIME: Duration = Duration::from_millis(1_000);
+
+    /// How long after the last request for a neighbor that did not
+    /// answer it is forgotten that it was asked, in milliseconds. A
+    /// neighbor taken as absent is so for as long as something keeps
+    /// asking for it, and this long after: the next packet for it starts
+    /// again, and waits for an answer as the first did.
+    pub(crate) const FORGET_TIME: Duration = Duration::from_millis(3_000);
 
     /// Neighbor entry lifetime, in milliseconds.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
@@ -140,6 +169,13 @@ impl<'a> Cache<'a> {
     ) {
         debug_assert!(protocol_addr.is_unicast());
         debug_assert!(hardware_addr.is_unicast());
+
+        // It answered.
+        for asked in self.asked.iter_mut() {
+            if matches!(asked, Some(asked) if asked.protocol_addr == protocol_addr) {
+                *asked = None;
+            }
+        }
 
         #[cfg(any(feature = "std", feature = "alloc"))]
         let current_storage_size = self.storage.len();
@@ -230,9 +266,17 @@ impl<'a> Cache<'a> {
             }
         }
 
-        let asked = self.asked.iter().flatten();
-        let mut recently = asked.filter(|(_, silent_until)| timestamp < *silent_until);
-        if recently.any(|(addr, _)| addr == protocol_addr) {
+        let asked = self.asked.iter().flatten().find(|asked| {
+            asked.protocol_addr == *protocol_addr && timestamp < asked.at + Self::FORGET_TIME
+        });
+        let Some(asked) = asked else {
+            return Answer::NotFound;
+        };
+        // The last request may still be answered.
+        let waiting = timestamp < asked.at + Self::SILENT_TIME;
+        if asked.times > ABSENT_AFTER || (asked.times == ABSENT_AFTER && !waiting) {
+            Answer::Absent { ask: !waiting }
+        } else if waiting {
             Answer::RateLimited
         } else {
             Answer::NotFound
@@ -243,27 +287,32 @@ impl<'a> Cache<'a> {
     /// no other is sent for it until `SILENT_TIME` has passed. A request
     /// for any other neighbor is not held back by it.
     pub(crate) fn limit_rate(&mut self, protocol_addr: &IpAddress, timestamp: Instant) {
-        let ends =
-            |entry: &Option<(IpAddress, Instant)>| entry.map(|(_, silent_until)| silent_until);
-        // The place of this neighbor, or else one that is free or whose
-        // time has passed, or else the one whose time ends first.
-        let own = self
-            .asked
-            .iter()
-            .position(|entry| matches!(entry, Some((addr, _)) if addr == protocol_addr));
-        let free = || {
-            self.asked.iter().position(|entry| {
-                ends(entry).map_or(true, |silent_until| timestamp >= silent_until)
-            })
-        };
+        let forgotten = |asked: &Asked| timestamp >= asked.at + Self::FORGET_TIME;
+        // The place of this neighbor, or else one that is free, or else
+        // the one asked longest ago, which is forgotten if any is.
+        let own = self.asked.iter().position(
+            |asked| matches!(asked, Some(asked) if asked.protocol_addr == *protocol_addr),
+        );
+        let free = || self.asked.iter().position(Option::is_none);
         let first = || {
             let places = self.asked.iter().enumerate();
             places
-                .min_by_key(|(_, entry)| ends(entry))
+                .min_by_key(|(_, asked)| asked.map(|asked| asked.at))
                 .map(|(at, _)| at)
         };
         if let Some(at) = own.or_else(free).or_else(first) {
-            self.asked[at] = Some((*protocol_addr, timestamp + Self::SILENT_TIME));
+            // One more of a run, or the first of one.
+            let times = match self.asked[at] {
+                Some(asked) if asked.protocol_addr == *protocol_addr && !forgotten(&asked) => {
+                    asked.times.saturating_add(1)
+                }
+                _ => 1,
+            };
+            self.asked[at] = Some(Asked {
+                protocol_addr: *protocol_addr,
+                at: timestamp,
+                times,
+            });
         }
     }
 }
@@ -453,7 +502,6 @@ mod test {
             Answer::NotFound
         );
         // Asked again, its time starts again, in the place it had.
-        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(1000));
         cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(1500));
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(2400)),
@@ -500,15 +548,72 @@ mod test {
                 Answer::RateLimited
             );
         }
-        // A place whose time has passed is taken before one that has not.
-        cache.limit_rate(&neighbor(20), Instant::from_millis(1001));
+    }
+
+    /// A neighbor that leaves three requests in a row unanswered is
+    /// absent: for as long as it is asked for, and until it has been left
+    /// alone long enough to be forgotten.
+    #[test]
+    fn test_absent_after_three_unanswered() {
+        let mut cache_storage = [Default::default(); 3];
+        let mut cache = Cache::new(&mut cache_storage[..]);
+        let lookup = |cache: &Cache, addr, ms| cache.lookup(&addr, Instant::from_millis(ms));
+
+        for at in [0, 1000, 2000] {
+            assert_eq!(lookup(&cache, MOCK_IP_ADDR_1, at), Answer::NotFound);
+            cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(at));
+            // Each may still be answered, the third too.
+            assert_eq!(
+                lookup(&cache, MOCK_IP_ADDR_1, at + 999),
+                Answer::RateLimited
+            );
+        }
         assert_eq!(
-            cache.lookup(&neighbor(2), Instant::from_millis(1001)),
-            Answer::RateLimited
+            lookup(&cache, MOCK_IP_ADDR_1, 3000),
+            Answer::Absent { ask: true }
+        );
+        // Asked again, once a second, which is how it would be found.
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(3000));
+        assert_eq!(
+            lookup(&cache, MOCK_IP_ADDR_1, 3500),
+            Answer::Absent { ask: false }
         );
         assert_eq!(
-            cache.lookup(&neighbor(ASKED), Instant::from_millis(1001)),
-            Answer::RateLimited
+            lookup(&cache, MOCK_IP_ADDR_1, 4000),
+            Answer::Absent { ask: true }
         );
+        // Nobody else is absent for it.
+        assert_eq!(lookup(&cache, MOCK_IP_ADDR_2, 3500), Answer::NotFound);
+        // Left alone, it is forgotten that it was asked: it starts again.
+        assert_eq!(
+            lookup(&cache, MOCK_IP_ADDR_1, 5999),
+            Answer::Absent { ask: true }
+        );
+        assert_eq!(lookup(&cache, MOCK_IP_ADDR_1, 6000), Answer::NotFound);
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(6000));
+        assert_eq!(lookup(&cache, MOCK_IP_ADDR_1, 6500), Answer::RateLimited);
+        assert_eq!(lookup(&cache, MOCK_IP_ADDR_1, 7000), Answer::NotFound);
+    }
+
+    /// One that answers is no longer absent, nor once its entry expires.
+    #[test]
+    fn test_absent_until_it_answers() {
+        let mut cache_storage = [Default::default(); 3];
+        let mut cache = Cache::new(&mut cache_storage[..]);
+
+        for at in [0, 1000, 2000, 3000] {
+            cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(at));
+        }
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(3100)),
+            Answer::Absent { ask: false }
+        );
+        cache.fill(MOCK_IP_ADDR_1, HADDR_A, Instant::from_millis(3200));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(3300)),
+            Answer::Found(HADDR_A)
+        );
+        let expired = Instant::from_millis(3200) + Cache::ENTRY_LIFETIME;
+        assert_eq!(cache.lookup(&MOCK_IP_ADDR_1, expired), Answer::NotFound);
     }
 }

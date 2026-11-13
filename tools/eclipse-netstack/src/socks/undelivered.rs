@@ -23,12 +23,20 @@
 //! without another word to a peer there is no way to. A connection that
 //! is made is told nothing: what it sent is sent again, as Linux does.
 //!
+//! One such message the stack says to itself: of what it had for a
+//! neighbour on the card's network that is asked for and does not answer
+//! ([`nowhere`]), which is what Linux does. smoltcp asks three times, a
+//! second apart, and then drops the datagram, and every other for that
+//! neighbour while it keeps not answering: left in its socket it would
+//! wait for good, and everything the socket has behind it too.
+//!
 //! Two types are errors of this kind, destination unreachable (3) and
 //! time exceeded (11). A message that says a datagram was too long for
 //! the way (3, code 4) is passed on like the rest: this stack sends
 //! nothing longer than a frame and does not learn a shorter way from it.
 
-use smoltcp::wire::{Icmpv4Packet, IpProtocol, Ipv4Address, Ipv4Packet};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{Icmpv4Packet, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr};
 
 /// The record of an `EVENTS` that says a datagram was not delivered.
 pub const EV_UNDELIVERED: u16 = 7;
@@ -45,8 +53,43 @@ pub const TOO_LONG: u8 = 4;
 /// The last code of an unreachable that means something.
 pub const LAST_CODE: u8 = 15;
 
+/// The code of an unreachable that says the host is not there.
+pub const HOST: u8 = 1;
+
 /// The IPv4 header a message quotes, without options.
 const QUOTED_HEADER: usize = 20;
+/// What a message has to quote: that header and eight bytes more.
+const QUOTED: usize = QUOTED_HEADER + 8;
+/// The packet this host says to itself: an IPv4 header, the eight bytes
+/// an unreachable starts with, and what it quotes.
+pub const NOWHERE_LEN: usize = 20 + 8 + QUOTED;
+
+/// The IPv4 packet of ICMP that says the host `quoted` was for is not
+/// there, from the address it was sent from to that same address: what a
+/// router says of what it has no way on for, said here of what smoltcp
+/// dropped because its neighbour does not answer. `quoted` is the start
+/// of that packet, as [`smoltcp::iface::Interface::unreached`] gives it.
+pub fn nowhere(quoted: &[u8; QUOTED]) -> [u8; NOWHERE_LEN] {
+    let us = Ipv4Address::from_bytes(&quoted[12..16]);
+    let mut packet = [0u8; NOWHERE_LEN];
+    let (header, message) = packet.split_at_mut(20);
+    Ipv4Repr {
+        src_addr: us,
+        dst_addr: us,
+        protocol: IpProtocol::Icmp,
+        payload_len: message.len(),
+        hop_limit: 64,
+    }
+    .emit(
+        &mut Ipv4Packet::new_unchecked(header),
+        &ChecksumCapabilities::default(),
+    );
+    message[0] = UNREACHABLE;
+    message[1] = HOST;
+    message[8..].copy_from_slice(quoted);
+    Icmpv4Packet::new_unchecked(message).fill_checksum();
+    packet
+}
 
 /// What an ICMP message says was not delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

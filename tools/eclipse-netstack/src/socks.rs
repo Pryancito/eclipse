@@ -175,9 +175,9 @@ pub enum Arrived {
     More,
 }
 
-/// A socket that every IPv4 packet of ICMP reaches, whole, and that sends
-/// whole packets of it: `room` is the longest.
-fn ear(room: usize) -> RawSocket<'static> {
+/// A socket of whole IPv4 packets of ICMP, the longest of `room` bytes,
+/// that holds so many that arrived and so many to send.
+fn raw(room: usize, arrived: usize, to_send: usize) -> RawSocket<'static> {
     let buffer = |packets: usize| {
         RawSocketBuffer::new(
             vec![RawPacketMetadata::EMPTY; packets],
@@ -187,9 +187,23 @@ fn ear(room: usize) -> RawSocket<'static> {
     RawSocket::new(
         IpVersion::Ipv4,
         IpProtocol::Icmp,
-        buffer(RX_DATAGRAMS),
-        buffer(TX_DATAGRAMS),
+        buffer(arrived),
+        buffer(to_send),
     )
+}
+
+/// A socket that every IPv4 packet of ICMP reaches, whole. It sends
+/// nothing.
+fn ear(room: usize) -> RawSocket<'static> {
+    raw(room, RX_DATAGRAMS, 0)
+}
+
+/// A socket that sends whole IPv4 packets of ICMP, and that none reaches:
+/// it has no room for one. Each socket that hears has its own, as each
+/// datagram socket has its queue: what one program sends to a neighbour
+/// that does not answer waits, and is dropped, in nobody else's way.
+fn mouth(room: usize) -> RawSocket<'static> {
+    raw(room, 0, TX_DATAGRAMS)
 }
 
 /// An interface and the sockets the kernel has on it.
@@ -198,12 +212,11 @@ pub struct Stack<D: for<'d> Device<'d>> {
     set: SocketSet<'static>,
     /// The datagram sockets.
     socks: BTreeMap<u64, SocketHandle>,
-    /// The sockets that hear ICMP.
-    hearing: BTreeSet<u64>,
+    /// The sockets that hear ICMP, and what each sends by.
+    hearing: BTreeMap<u64, SocketHandle>,
     /// A socket that every IPv4 packet of ICMP reaches. What says that
-    /// something was not delivered is read off it; while a socket hears,
-    /// all of it goes to the kernel, and what such a socket sends leaves
-    /// by it.
+    /// something was not delivered is read off it, and while a socket
+    /// hears, all of it goes to the kernel.
     ear: SocketHandle,
     streams: tcp::Streams,
     /// When the last [`poll`](Self::poll) was.
@@ -227,7 +240,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             iface,
             set,
             socks: BTreeMap::new(),
-            hearing: BTreeSet::new(),
+            hearing: BTreeMap::new(),
             ear,
             streams: tcp::Streams::default(),
             now: Instant::from_millis(0),
@@ -266,7 +279,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 
     /// Whether `sock` is a socket here, of any kind.
     fn knows(&self, sock: u64) -> bool {
-        self.socks.contains_key(&sock) || self.hearing.contains(&sock) || self.streams.knows(sock)
+        self.socks.contains_key(&sock)
+            || self.hearing.contains_key(&sock)
+            || self.streams.knows(sock)
     }
 
     /// The longest ICMP message this stack carries: what fits one frame.
@@ -279,7 +294,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if sock == HEARD || self.knows(sock) {
             return Err(Refused::Bind);
         }
-        self.hearing.insert(sock);
+        let room = self.iface.device().capabilities().ip_mtu();
+        self.hearing.insert(sock, self.set.add(mouth(room)));
         Ok(false)
     }
 
@@ -288,9 +304,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if m.len() < DATAGRAM_AT {
             return Err(Refused::Malformed);
         }
-        if !self.hearing.contains(&sock) {
-            return Err(Refused::NoSocket);
-        }
+        let handle = *self.hearing.get(&sock).ok_or(Refused::NoSocket)?;
         let to = Ipv4Address::from_bytes(&m[16..20]);
         let hop_limit = m[20];
         let message = &m[DATAGRAM_AT..];
@@ -313,7 +327,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             payload_len: message.len(),
             hop_limit,
         };
-        let mut socket = self.set.get::<RawSocket>(self.ear);
+        let mut socket = self.set.get::<RawSocket>(handle);
         let packet = socket
             .send(IP_HEADER + message.len())
             .map_err(|_| Refused::Full)?;
@@ -325,37 +339,16 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         Ok(true)
     }
 
-    /// `CLOSE` of a socket that hears, if `sock` is one. With the last
-    /// of them goes what they sent and has not left: what can leave now
-    /// does, and the rest waits for a neighbour that has not answered,
-    /// at the head of a queue the next socket to hear would wait behind.
-    /// So the ear is another, with nothing to send.
+    /// `CLOSE` of a socket that hears, if `sock` is one. What it sent
+    /// and can leave now does, as with a datagram socket; what waits for
+    /// a neighbour that has not answered goes with it.
     fn deaf(&mut self, sock: u64) -> bool {
-        if !self.hearing.remove(&sock) {
+        let Some(handle) = self.hearing.remove(&sock) else {
             return false;
-        }
-        if self.hearing.is_empty() {
-            let _ = self.iface.poll(&mut self.set, self.now);
-            // What that brought is still read for what it says of ours.
-            while let Some(said) = self.overheard() {
-                if let Some(said) = said {
-                    self.undelivered(&said);
-                }
-            }
-            self.set.remove(self.ear);
-            let room = self.iface.device().capabilities().ip_mtu();
-            self.ear = self.set.add(ear(room));
-        }
+        };
+        let _ = self.iface.poll(&mut self.set, self.now);
+        self.set.remove(handle);
         true
-    }
-
-    /// Take the next packet off the ear when no socket hears: `None`
-    /// when it holds none, and otherwise what the packet says was not
-    /// delivered, if it says so.
-    fn overheard(&mut self) -> Option<Option<Undelivered>> {
-        let mut socket = self.set.get::<RawSocket>(self.ear);
-        let packet = socket.recv().ok()?;
-        Some(Undelivered::of(packet))
     }
 
     /// Have the kernel told, by the next `EVENTS`, that what `said` is
@@ -582,6 +575,26 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 Undelivered::of(packet)
             };
             if let Some(said) = said {
+                self.undelivered(&said);
+            }
+        }
+        // What had nowhere to go, because its neighbour is asked for and
+        // does not answer: this host says so to itself, and that is
+        // heard and read like what a router says.
+        loop {
+            if hearing && m.len() + RECORD_LEN + undelivered::NOWHERE_LEN > MESSAGE_MAX {
+                return Arrived::More;
+            }
+            let Some(quoted) = self.iface.unreached() else {
+                break;
+            };
+            let packet = undelivered::nowhere(&quoted);
+            if hearing {
+                let us = [quoted[12], quoted[13], quoted[14], quoted[15]];
+                push_record(m, HEARD, us, 0, &packet);
+                self.brought = true;
+            }
+            if let Some(said) = Undelivered::of(&packet) {
                 self.undelivered(&said);
             }
         }
@@ -1002,14 +1015,176 @@ mod tests {
         let sent = frames(&mut stack, 1205);
         assert_eq!(sent.len(), 1);
         assert_eq!(udp_of(&sent[0]), (5001, 7, b"hello".to_vec()));
-        // The one that has not answered is not asked again before its
-        // socket's three seconds are over, and is then.
-        assert_eq!(stack.request(&send(1, names, 53, b"who?")), Ok(true));
+        // The one that has not answered is asked again a second after
+        // the first time, and not before.
         assert!(frames(&mut stack, 1500).is_empty());
-        assert!(frames(&mut stack, 3999).is_empty());
-        let sent = frames(&mut stack, 4000);
+        assert!(frames(&mut stack, 1999).is_empty());
+        let sent = frames(&mut stack, 2000);
         assert_eq!(sent.len(), 1);
         assert!(is_arp_request_for(&sent[0], names));
+    }
+
+    /// A stack that has met nobody, and its card's window.
+    fn unmet() -> (Stack<crate::port::Port>, Window) {
+        let Bench { window, iface, .. } = Bench::new();
+        (Stack::new(iface), window)
+    }
+
+    /// Poll at `ms`: the frames that puts on the wire, the card done with
+    /// each, and the messages for the kernel that makes.
+    fn at(
+        stack: &mut Stack<crate::port::Port>,
+        window: &Window,
+        ms: i64,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        stack.poll(Instant::from_millis(ms));
+        let mut frames = Vec::new();
+        for m in &turn(stack.device()) {
+            if m.op == udrivers::net::OP_TX {
+                frames.push(window.sent(m));
+                window.done(stack.device(), m);
+            }
+        }
+        let mut messages = Vec::new();
+        loop {
+            let mut m = Vec::new();
+            match stack.arrived(&mut m) {
+                Arrived::Nothing => break,
+                Arrived::All => {
+                    messages.push(m);
+                    break;
+                }
+                Arrived::More => messages.push(m),
+            }
+        }
+        (frames, messages)
+    }
+
+    #[test]
+    fn a_datagram_for_a_neighbour_that_never_answers_is_dropped_and_the_next_leaves() {
+        let (mut stack, window) = unmet();
+        let nobody = Ipv4Address([10, 0, 9, 77]);
+        let asks_for = |frames: &[Vec<u8>], who: &[Ipv4Address]| {
+            assert_eq!(frames.len(), who.len(), "{frames:?}");
+            for (frame, &who) in frames.iter().zip(who) {
+                assert!(is_arp_request_for(frame, who));
+            }
+        };
+        let lost = |port: u8| vec![(1, EV_UNDELIVERED, 0, vec![10, 0, 9, 77, port, 0, 3, 1])];
+        stack.request(&bind(1, 5000)).unwrap();
+        // Two datagrams from one socket: for a neighbour that is not
+        // there and, behind it, for one that is.
+        assert_eq!(stack.request(&send(1, nobody, 9, b"lost")), Ok(true));
+        assert_eq!(stack.request(&send(1, THEIR_IP, 7, b"hello")), Ok(true));
+        // Asked for three times, a second apart, and nothing is said.
+        for ms in [1000, 2000, 3000] {
+            let (frames, messages) = at(&mut stack, &window, ms);
+            asks_for(&frames, &[nobody]);
+            assert!(messages.is_empty());
+            let (frames, messages) = at(&mut stack, &window, ms + 999);
+            assert!(frames.is_empty() && messages.is_empty());
+        }
+        // Then it is taken as absent: the datagram is dropped and the
+        // kernel is told whose it was, as if a router had said there is
+        // no such host. The neighbour is asked once more, and the
+        // datagram that waited behind has its own asked for.
+        let (frames, messages) = at(&mut stack, &window, 4000);
+        asks_for(&frames, &[nobody, THEIR_IP]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(events(&messages[0]), lost(9));
+        window.deliver(stack.device(), 0, &arp_reply());
+        let (frames, messages) = at(&mut stack, &window, 4005);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(udp_of(&frames[0]), (5000, 7, b"hello".to_vec()));
+        assert!(messages.is_empty());
+
+        // While it keeps not answering, what is for it is dropped at
+        // once, and it is asked for no more than once a second.
+        assert_eq!(stack.request(&send(1, nobody, 10, b"lost")), Ok(true));
+        let (frames, messages) = at(&mut stack, &window, 4500);
+        assert!(frames.is_empty());
+        assert_eq!(events(&messages[0]), lost(10));
+        assert_eq!(stack.request(&send(1, nobody, 11, b"lost")), Ok(true));
+        let (frames, messages) = at(&mut stack, &window, 5000);
+        asks_for(&frames, &[nobody]);
+        assert_eq!(events(&messages[0]), lost(11));
+        // Nothing is left to send, and nothing to wait for.
+        assert_eq!(stack.idle_for(Instant::from_millis(5001)), None);
+
+        // Left alone for three seconds it is asked for as at first: what
+        // is for it waits for the answer, and has it.
+        assert_eq!(stack.request(&send(1, nobody, 12, b"found")), Ok(true));
+        let (frames, messages) = at(&mut stack, &window, 8000);
+        asks_for(&frames, &[nobody]);
+        assert!(messages.is_empty());
+        window.deliver(stack.device(), 0, &arp_reply_from(nobody));
+        let (frames, messages) = at(&mut stack, &window, 8010);
+        assert_eq!(frames.len(), 1);
+        let found = Ipv4Packet::new_checked(&frames[0][14..]).unwrap();
+        assert_eq!(found.dst_addr(), nobody);
+        assert!(found.payload().ends_with(b"found"));
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn a_ping_for_a_neighbour_that_never_answers_is_in_no_other_programs_way() {
+        let (mut stack, window) = unmet();
+        let nobody = Ipv4Address([10, 0, 9, 77]);
+        let is_echo = |frame: &[u8]| frame.len() > 14 + 20 && frame[12..14] == [8, 0];
+        // Two programs ping, the first of them a neighbour that is not
+        // there. Each has its own queue: both neighbours are asked for
+        // at once, and the echo for the one that answers leaves.
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        assert_eq!(stack.request(&hear(6)), Ok(false));
+        let lost = echo(1, b"x");
+        assert_eq!(stack.request(&icmp(5, nobody, 64, &lost)), Ok(true));
+        assert_eq!(
+            stack.request(&icmp(6, THEIR_IP, 64, &echo(2, b"y"))),
+            Ok(true)
+        );
+        let (frames, messages) = at(&mut stack, &window, 1000);
+        assert_eq!(frames.len(), 2);
+        assert!(is_arp_request_for(&frames[0], nobody));
+        assert!(is_arp_request_for(&frames[1], THEIR_IP));
+        assert!(messages.is_empty());
+        window.deliver(stack.device(), 0, &arp_reply());
+        let (frames, _) = at(&mut stack, &window, 1005);
+        assert_eq!(frames.len(), 1);
+        assert!(is_echo(&frames[0]));
+        for ms in [2000, 3000] {
+            let (frames, messages) = at(&mut stack, &window, ms);
+            assert_eq!(frames.len(), 1);
+            assert!(is_arp_request_for(&frames[0], nobody));
+            assert!(messages.is_empty());
+        }
+        // After three seconds the echo nobody will answer is dropped,
+        // and the programs that hear are given what this host says of
+        // it: no such host, from our own address, with the start of the
+        // echo.
+        let (frames, messages) = at(&mut stack, &window, 4000);
+        assert_eq!(frames.len(), 1);
+        assert!(is_arp_request_for(&frames[0], nobody));
+        assert_eq!(messages.len(), 1);
+        let heard = records(&messages[0]);
+        assert_eq!(heard.len(), 1);
+        assert_eq!((heard[0].0, heard[0].1), (HEARD, OUR_IP.0));
+        let said = Ipv4Packet::new_checked(&heard[0].3[..]).unwrap();
+        assert!(said.verify_checksum());
+        assert_eq!((said.src_addr(), said.dst_addr()), (OUR_IP, OUR_IP));
+        let said = said.payload();
+        assert!(Icmpv4Packet::new_checked(said).unwrap().verify_checksum());
+        assert_eq!(said[..2], [3, 1]);
+        let quoted = Ipv4Packet::new_unchecked(&said[8..]);
+        assert_eq!((quoted.src_addr(), quoted.dst_addr()), (OUR_IP, nobody));
+        assert_eq!(quoted.protocol(), IpProtocol::Icmp);
+        assert_eq!(said[8 + 20..], lost[..8]);
+        // From then on, while it keeps not answering, an echo for it is
+        // dropped at once and said so.
+        assert_eq!(stack.request(&icmp(5, nobody, 64, &lost)), Ok(true));
+        let (frames, messages) = at(&mut stack, &window, 4500);
+        assert!(frames.is_empty());
+        assert_eq!(records(&messages[0]).len(), 1);
+        assert_eq!(stack.idle_for(Instant::from_millis(4501)), None);
     }
 
     /// A record of an `EVENTS`: its socket, what, number and bytes.

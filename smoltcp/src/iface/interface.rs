@@ -45,7 +45,18 @@ struct InterfaceInner<'a> {
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
+    /// The start of each packet that had nowhere to go, the oldest first: see
+    /// [`Interface::unreached`].
+    unreached: [Option<[u8; QUOTED]>; UNREACHED],
 }
+
+/// What is kept of a packet that had nowhere to go: its IPv4 header, without options, and
+/// the eight bytes behind it, which is what an ICMP message quotes of a packet that was not
+/// delivered.
+const QUOTED: usize = 28;
+
+/// How many such packets are kept for whoever asks. One more and the oldest is forgotten.
+const UNREACHED: usize = 8;
 
 /// A builder structure used for creating a network interface.
 pub struct InterfaceBuilder<'a, DeviceT: for<'d> Device<'d>> {
@@ -255,6 +266,7 @@ let iface = InterfaceBuilder::new(device)
                 ipv4_multicast_groups: self.ipv4_multicast_groups,
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
+                unreached: [None; UNREACHED],
             },
         }
     }
@@ -581,6 +593,22 @@ where
         }
     }
 
+    /// Take the oldest packet that had nowhere to go and has not been taken: one for a
+    /// neighbor that left several discovery requests, one after another, unanswered. What is
+    /// given is what an ICMP message that said "host unreachable" would quote of it: its
+    /// IPv4 header, without options, and the eight bytes behind it, which for UDP and for TCP
+    /// have the ports. A datagram was dropped and is not sent again; a TCP segment is still
+    /// with its socket.
+    ///
+    /// Only the last few are kept, and only of IPv4, of a raw socket, of UDP and of TCP.
+    /// Nobody has to take them.
+    pub fn unreached(&mut self) -> Option<[u8; QUOTED]> {
+        // Asked after every poll, and nearly always there is none.
+        let oldest = self.inner.unreached[0].take()?;
+        self.inner.unreached.rotate_left(1);
+        Some(oldest)
+    }
+
     /// Transmit packets queued in the given sockets, and receive packets queued
     /// in the device.
     ///
@@ -740,10 +768,22 @@ where
                 }};
             }
 
+            // A datagram for a neighbor that is absent is dropped: its socket is told that
+            // it left, and is done with it. Left where it was it would wait for good, and
+            // everything the socket has behind it with it.
+            macro_rules! respond_or_drop {
+                ($response:expr) => {{
+                    match respond!($response) {
+                        Err(Error::Unreachable) => Ok(()),
+                        result => result,
+                    }
+                }};
+            }
+
             let socket_result = match *socket {
                 #[cfg(feature = "socket-raw")]
                 Socket::Raw(ref mut socket) => {
-                    socket.dispatch(cx, |response| respond!(IpPacket::Raw(response)))
+                    socket.dispatch(cx, |response| respond_or_drop!(IpPacket::Raw(response)))
                 }
                 #[cfg(all(
                     feature = "socket-icmp",
@@ -752,17 +792,17 @@ where
                 Socket::Icmp(ref mut socket) => socket.dispatch(cx, |response| match response {
                     #[cfg(feature = "proto-ipv4")]
                     (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => {
-                        respond!(IpPacket::Icmpv4((ipv4_repr, icmpv4_repr)))
+                        respond_or_drop!(IpPacket::Icmpv4((ipv4_repr, icmpv4_repr)))
                     }
                     #[cfg(feature = "proto-ipv6")]
                     (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => {
-                        respond!(IpPacket::Icmpv6((ipv6_repr, icmpv6_repr)))
+                        respond_or_drop!(IpPacket::Icmpv6((ipv6_repr, icmpv6_repr)))
                     }
                     _ => Err(Error::Unaddressable),
                 }),
                 #[cfg(feature = "socket-udp")]
                 Socket::Udp(ref mut socket) => {
-                    socket.dispatch(cx, |response| respond!(IpPacket::Udp(response)))
+                    socket.dispatch(cx, |response| respond_or_drop!(IpPacket::Udp(response)))
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(ref mut socket) => {
@@ -779,7 +819,13 @@ where
             match (device_result, socket_result) {
                 (Err(Error::Exhausted), _) => break,   // nowhere to transmit
                 (Ok(()), Err(Error::Exhausted)) => (), // nothing to transmit
-                (Err(Error::Unaddressable), _) => {
+                (Err(Error::Unreachable), Ok(())) => {
+                    // Dropped, not sent: the socket waits for nobody, and has its next
+                    // one to send in this same poll.
+                    socket.meta_mut().neighbor_given_up();
+                    emitted_any = true;
+                }
+                (Err(Error::Unaddressable), _) | (Err(Error::Unreachable), _) => {
                     // This socket's next-hop neighbor is not yet resolved (an ARP /
                     // Neighbor Solicitation was just queued). Mark the socket as
                     // waiting — `neighbor_missing` + `egress_permitted` rate-limit
@@ -1951,7 +1997,7 @@ impl<'a> InterfaceInner<'a> {
 
         let dst_addr = self.route(dst_addr, cx.now)?;
 
-        match self
+        let absent = match self
             .neighbor_cache
             .as_mut()
             .unwrap()
@@ -1959,8 +2005,12 @@ impl<'a> InterfaceInner<'a> {
         {
             NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
             NeighborAnswer::RateLimited => return Err(Error::Unaddressable),
-            NeighborAnswer::NotFound => (),
-        }
+            NeighborAnswer::Absent { ask: false } => return Err(Error::Unreachable),
+            NeighborAnswer::NotFound => false,
+            // One that is absent is asked for all the same, which is how it is found
+            // when it is there again; what is for it does not wait for the answer.
+            NeighborAnswer::Absent { ask: true } => true,
+        };
 
         match (src_addr, dst_addr) {
             #[cfg(feature = "proto-ipv4")]
@@ -2020,7 +2070,52 @@ impl<'a> InterfaceInner<'a> {
             .as_mut()
             .unwrap()
             .limit_rate(&dst_addr, cx.now);
-        Err(Error::Unaddressable)
+        Err(if absent {
+            Error::Unreachable
+        } else {
+            Error::Unaddressable
+        })
+    }
+
+    /// Keep the start of `packet`, which had nowhere to go, for [`Interface::unreached`].
+    fn nowhere(&mut self, ip_repr: &IpRepr, packet: &IpPacket) {
+        let mut quoted = [0u8; QUOTED];
+        let (header, behind) = quoted.split_at_mut(QUOTED - 8);
+        match ip_repr {
+            #[cfg(feature = "proto-ipv4")]
+            IpRepr::Ipv4(ipv4_repr) => ipv4_repr.emit(
+                &mut Ipv4Packet::new_unchecked(header),
+                &crate::phy::ChecksumCapabilities::default(),
+            ),
+            _ => return,
+        }
+        match packet {
+            #[cfg(feature = "socket-raw")]
+            IpPacket::Raw((_, payload)) => {
+                let len = payload.len().min(behind.len());
+                behind[..len].copy_from_slice(&payload[..len]);
+            }
+            #[cfg(feature = "socket-udp")]
+            IpPacket::Udp((_, udp_repr, payload)) => {
+                behind[..2].copy_from_slice(&udp_repr.src_port.to_be_bytes());
+                behind[2..4].copy_from_slice(&udp_repr.dst_port.to_be_bytes());
+                let len = (payload.len() + 8).min(usize::from(u16::MAX)) as u16;
+                behind[4..6].copy_from_slice(&len.to_be_bytes());
+            }
+            #[cfg(feature = "socket-tcp")]
+            IpPacket::Tcp((_, tcp_repr)) => {
+                behind[..2].copy_from_slice(&tcp_repr.src_port.to_be_bytes());
+                behind[2..4].copy_from_slice(&tcp_repr.dst_port.to_be_bytes());
+                behind[4..].copy_from_slice(&tcp_repr.seq_number.0.to_be_bytes());
+            }
+            _ => return,
+        }
+        // The first free place, or the place of the oldest.
+        if self.unreached[UNREACHED - 1].is_some() {
+            self.unreached.rotate_left(1);
+        }
+        let free = self.unreached.iter().position(Option::is_none);
+        self.unreached[free.unwrap_or(UNREACHED - 1)] = Some(quoted);
     }
 
     fn dispatch_ip<Tx: TxToken>(
@@ -2034,12 +2129,16 @@ impl<'a> InterfaceInner<'a> {
         match cx.caps.medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
-                let (dst_hardware_addr, tx_token) = self.lookup_hardware_addr(
+                let looked_up = self.lookup_hardware_addr(
                     cx,
                     tx_token,
                     &ip_repr.src_addr(),
                     &ip_repr.dst_addr(),
-                )?;
+                );
+                if looked_up.as_ref().err() == Some(&Error::Unreachable) {
+                    self.nowhere(&ip_repr, &packet);
+                }
+                let (dst_hardware_addr, tx_token) = looked_up?;
 
                 self.dispatch_ethernet(cx, tx_token, ip_repr.total_len(), |mut frame| {
                     frame.set_dst_addr(dst_hardware_addr);
