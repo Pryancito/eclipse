@@ -510,6 +510,8 @@ struct Shared {
     bus: Arc<Mutex<EventBus>>,
     inner: Mutex<Inner>,
     hears: Hears,
+    /// An `AF_INET6` socket's: which table lists it.
+    v6: bool,
 }
 
 /// What is queued on a socket.
@@ -557,7 +559,7 @@ impl Shared {
 
     /// A socket with nothing queued, that can be written to: what cannot
     /// be sent is refused, not waited for.
-    fn new(hears: Hears) -> Arc<Shared> {
+    fn new(hears: Hears, v6: bool) -> Arc<Shared> {
         let mut bus = EventBus::default();
         bus.set(Event::WRITABLE);
         Arc::new(Shared {
@@ -574,6 +576,7 @@ impl Shared {
                 patience: Patience::default(),
             }),
             hears,
+            v6,
         })
     }
 
@@ -755,6 +758,10 @@ pub struct Listed {
     pub state: u8,
     /// The bytes that arrived for it and no program has read.
     pub unread: usize,
+    /// An `AF_INET6` socket: one of `/proc/net/tcp6` or `/proc/net/udp6`,
+    /// where its addresses, which are IPv4's, are written as that family
+    /// writes them (`::ffff:a.b.c.d`, and `::` for every address).
+    pub v6: bool,
 }
 
 /// The states of a [`Listed`].
@@ -922,8 +929,8 @@ impl StackLink {
         })
     }
 
-    /// The datagram sockets as `/proc/net/udp` lists them, in the order
-    /// of their numbers: the ones that have a port, as Linux lists the
+    /// The datagram sockets as `/proc/net/udp` and `/proc/net/udp6` list
+    /// them between the two, in the order of their numbers: the ones that have a port, as Linux lists the
     /// ones in its tables. One with a peer is established, as there, and
     /// the others are closed, which is how a datagram socket that is
     /// open and has no peer is listed. A socket that speaks ICMP is not
@@ -948,6 +955,7 @@ impl StackLink {
                         TCP_CLOSE
                     },
                     unread: inner.queued_bytes,
+                    v6: shared.v6,
                 })
             })
             .collect()
@@ -1344,7 +1352,7 @@ pub struct ServedUdpSocket {
 impl ServedUdpSocket {
     /// A socket of `link`, `AF_INET6` when `v6`.
     pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
-        let shared = Shared::new(Hears::Datagrams);
+        let shared = Shared::new(Hears::Datagrams, v6);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;
@@ -2045,6 +2053,11 @@ mod tests {
         assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
         assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
         assert_eq!(ip(Socket::endpoint(&server).unwrap()), at6("::", 5353));
+        // It is the IPv6 table's, with the address it has, which is none.
+        let listed = stack.link.listed_datagrams();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].v6);
+        assert_eq!(listed[0].local, at([0, 0, 0, 0], 5353));
 
         // What an IPv4 socket sends it comes from an IPv4 address, said
         // the way such a socket says one; and it answers there.
@@ -2680,6 +2693,7 @@ mod tests {
                 TCP_CLOSE
             },
             unread,
+            v6: false,
         };
         let here = row(at([127, 0, 0, 1], 7001), None, 0);
         assert_eq!(

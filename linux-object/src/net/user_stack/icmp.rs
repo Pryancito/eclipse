@@ -132,7 +132,7 @@ pub struct ServedIcmpSocket {
 impl ServedIcmpSocket {
     /// A socket of `link`: the raw one when `raw`, else the one that pings.
     pub fn new(link: Arc<StackLink>, raw: bool) -> LxResult<Self> {
-        let shared = Shared::new(if raw { Hears::Icmp } else { Hears::Echoes });
+        let shared = Shared::new(if raw { Hears::Icmp } else { Hears::Echoes }, false);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;

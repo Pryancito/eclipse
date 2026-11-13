@@ -2917,6 +2917,90 @@ fn tcp_state_code(state: smoltcp::socket::TcpState) -> u8 {
     }
 }
 
+/// Which of a protocol's two tables: `/proc/net/tcp` or `/proc/net/tcp6`,
+/// `/proc/net/udp` or `/proc/net/udp6`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcNetFamily {
+    V4,
+    V6,
+}
+
+impl ProcNetFamily {
+    /// The table a socket of the kernel's own set is in, by the addresses
+    /// it has: IPv6's when either is an IPv6 address. One that has no
+    /// address yet says nothing of its family and stays in IPv4's table,
+    /// where every one of them was listed before there were two.
+    fn of(local: smoltcp::wire::IpAddress, remote: smoltcp::wire::IpAddress) -> Self {
+        use smoltcp::wire::IpAddress;
+        if matches!(local, IpAddress::Ipv6(_)) || matches!(remote, IpAddress::Ipv6(_)) {
+            ProcNetFamily::V6
+        } else {
+            ProcNetFamily::V4
+        }
+    }
+
+    /// The table a socket of the stack that runs as a process is in: the
+    /// one of the family it was opened with.
+    fn of_served(sock: &user_stack::Listed) -> Self {
+        if sock.v6 {
+            ProcNetFamily::V6
+        } else {
+            ProcNetFamily::V4
+        }
+    }
+
+    /// An address cell as this table writes it.
+    fn cell(self, addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string::String {
+        match self {
+            ProcNetFamily::V4 => proc_net_hex_addr(addr, port),
+            ProcNetFamily::V6 => proc_net_hex_addr6(addr, port),
+        }
+    }
+
+    /// The names of the two address columns, as wide as the cells.
+    fn columns(self) -> &'static str {
+        match self {
+            ProcNetFamily::V4 => "local_address rem_address  ",
+            ProcNetFamily::V6 => {
+                "local_address                         remote_address                       "
+            }
+        }
+    }
+}
+
+/// One `/proc/net/{tcp6,udp6}` address cell: the sixteen bytes as four
+/// u32 read little-endian, each in hex, a colon, then the port in hex --
+/// what `netstat` parses (`::1` port 22 is
+/// "00000000000000000000000001000000:0016"). An IPv4 address is written
+/// the way an `AF_INET6` socket says one, `::ffff:a.b.c.d`, and no address
+/// is `::`.
+fn proc_net_hex_addr6(addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string::String {
+    use core::fmt::Write;
+    use smoltcp::wire::IpAddress;
+    let mut bytes = [0u8; 16];
+    match addr {
+        IpAddress::Ipv6(a) => bytes = a.0,
+        IpAddress::Ipv4(a) if !a.is_unspecified() => {
+            bytes[10] = 0xff;
+            bytes[11] = 0xff;
+            bytes[12..].copy_from_slice(&a.0);
+        }
+        _ => {}
+    }
+    let mut cell = alloc::string::String::with_capacity(37);
+    for word in [0, 4, 8, 12] {
+        let word = u32::from_le_bytes([
+            bytes[word],
+            bytes[word + 1],
+            bytes[word + 2],
+            bytes[word + 3],
+        ]);
+        let _ = write!(cell, "{:08X}", word);
+    }
+    let _ = write!(cell, ":{:04X}", port);
+    cell
+}
+
 /// `/proc/net/tcp` rendered from the live smoltcp socket set, in the layout
 /// of Documentation/networking/proc_net_tcp.rst. The queue/timer columns are
 /// zeros (not tracked at this granularity) and the socket's slot number
@@ -2927,17 +3011,29 @@ fn tcp_state_code(state: smoltcp::socket::TcpState) -> u8 {
 /// ([`user_stack`]), which are not in that set: the ones the kernel made
 /// for the programs that asked for that stack, or for every program on a
 /// boot with `unetuse=all`.
+///
+/// The sockets that have an IPv6 address, and the `AF_INET6` ones of the
+/// stack that runs as a process, are not here: they are
+/// [`proc_net_tcp6_content`]'s.
 pub fn proc_net_tcp_content() -> alloc::string::String {
-    proc_net_tcp_of(&user_stack::machine().listed_streams())
+    proc_net_tcp_of(ProcNetFamily::V4, &user_stack::machine().listed_streams())
 }
 
-/// [`proc_net_tcp_content`], with `served` the sockets of the stack that
-/// runs as a process.
-fn proc_net_tcp_of(served: &[user_stack::Listed]) -> alloc::string::String {
+/// `/proc/net/tcp6`: the same table for the sockets of the other family,
+/// with its wider addresses. `netstat` reads both, and said that this one
+/// was missing each time it ran.
+pub fn proc_net_tcp6_content() -> alloc::string::String {
+    proc_net_tcp_of(ProcNetFamily::V6, &user_stack::machine().listed_streams())
+}
+
+/// One of the two tables of TCP, with `served` the sockets of the stack
+/// that runs as a process: the ones of the table's family are listed.
+fn proc_net_tcp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
     use smoltcp::socket::Socket;
-    let mut s = alloc::string::String::from(
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+    let mut s = alloc::format!(
+        "  sl  {} st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        family.columns()
     );
     let sets = get_sockets();
     let sets = sets.lock();
@@ -2947,12 +3043,15 @@ fn proc_net_tcp_of(served: &[user_stack::Listed]) -> alloc::string::String {
         if let Socket::Tcp(tcp) = socket {
             let l = tcp.local_endpoint();
             let r = tcp.remote_endpoint();
+            if ProcNetFamily::of(l.addr, r.addr) != family {
+                continue;
+            }
             let _ = writeln!(
                 s,
                 "{:4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
                 i,
-                proc_net_hex_addr(l.addr, l.port),
-                proc_net_hex_addr(r.addr, r.port),
+                family.cell(l.addr, l.port),
+                family.cell(r.addr, r.port),
                 tcp_state_code(tcp.state()),
                 1000 + i,
             );
@@ -2960,14 +3059,17 @@ fn proc_net_tcp_of(served: &[user_stack::Listed]) -> alloc::string::String {
     }
     drop(sets);
     // Numbered past the kernel's own, so no two rows have one number.
-    for (i, sock) in served.iter().enumerate() {
+    let served = served
+        .iter()
+        .filter(|sock| ProcNetFamily::of_served(sock) == family);
+    for (i, sock) in served.enumerate() {
         let i = slots + i;
         let _ = writeln!(
             s,
             "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
             i,
-            proc_net_hex_addr(sock.local.addr, sock.local.port),
-            proc_net_hex_peer(sock.remote),
+            family.cell(sock.local.addr, sock.local.port),
+            proc_net_peer(family, sock.remote),
             sock.state,
             sock.unread,
             1000 + i,
@@ -2977,10 +3079,13 @@ fn proc_net_tcp_of(served: &[user_stack::Listed]) -> alloc::string::String {
 }
 
 /// The peer's cell of a served socket's row: nobody when it has none.
-fn proc_net_hex_peer(peer: Option<smoltcp::wire::IpEndpoint>) -> alloc::string::String {
+fn proc_net_peer(
+    family: ProcNetFamily,
+    peer: Option<smoltcp::wire::IpEndpoint>,
+) -> alloc::string::String {
     match peer {
-        Some(peer) => proc_net_hex_addr(peer.addr, peer.port),
-        None => proc_net_hex_addr(smoltcp::wire::IpAddress::Unspecified, 0),
+        Some(peer) => family.cell(peer.addr, peer.port),
+        None => family.cell(smoltcp::wire::IpAddress::Unspecified, 0),
     }
 }
 
@@ -2990,17 +3095,25 @@ fn proc_net_hex_peer(peer: Option<smoltcp::wire::IpEndpoint>) -> alloc::string::
 /// After them come the datagram sockets whose stack is a process, as in
 /// [`proc_net_tcp_content`]: the ones that have a port, with their peer
 /// and state 01 when they are connected, and the bytes they hold unread.
+/// The sockets of the other family are [`proc_net_udp6_content`]'s.
 pub fn proc_net_udp_content() -> alloc::string::String {
-    proc_net_udp_of(&user_stack::machine().listed_datagrams())
+    proc_net_udp_of(ProcNetFamily::V4, &user_stack::machine().listed_datagrams())
 }
 
-/// [`proc_net_udp_content`], with `served` the sockets of the stack that
-/// runs as a process.
-fn proc_net_udp_of(served: &[user_stack::Listed]) -> alloc::string::String {
+/// `/proc/net/udp6`: as [`proc_net_tcp6_content`].
+pub fn proc_net_udp6_content() -> alloc::string::String {
+    proc_net_udp_of(ProcNetFamily::V6, &user_stack::machine().listed_datagrams())
+}
+
+/// One of the two tables of UDP, with `served` the sockets of the stack
+/// that runs as a process: the ones of the table's family are listed.
+fn proc_net_udp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
     use smoltcp::socket::Socket;
-    let mut s = alloc::string::String::from(
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+    use smoltcp::wire::IpAddress;
+    let mut s = alloc::format!(
+        "  sl  {} st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        family.columns()
     );
     let sets = get_sockets();
     let sets = sets.lock();
@@ -3009,24 +3122,31 @@ fn proc_net_udp_of(served: &[user_stack::Listed]) -> alloc::string::String {
         slots = i + 1;
         if let Socket::Udp(udp) = socket {
             let l = udp.endpoint();
+            if ProcNetFamily::of(l.addr, IpAddress::Unspecified) != family {
+                continue;
+            }
             let _ = writeln!(
                 s,
-                "{:4}: {} 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
+                "{:4}: {} {} 07 00000000:00000000 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
                 i,
-                proc_net_hex_addr(l.addr, l.port),
+                family.cell(l.addr, l.port),
+                family.cell(IpAddress::Unspecified, 0),
                 1000 + i,
             );
         }
     }
     drop(sets);
-    for (i, sock) in served.iter().enumerate() {
+    let served = served
+        .iter()
+        .filter(|sock| ProcNetFamily::of_served(sock) == family);
+    for (i, sock) in served.enumerate() {
         let i = slots + i;
         let _ = writeln!(
             s,
             "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
             i,
-            proc_net_hex_addr(sock.local.addr, sock.local.port),
-            proc_net_hex_peer(sock.remote),
+            family.cell(sock.local.addr, sock.local.port),
+            proc_net_peer(family, sock.remote),
             sock.state,
             sock.unread,
             1000 + i,
@@ -3064,17 +3184,19 @@ mod proc_net_tests {
                 remote: None,
                 state: TCP_LISTEN,
                 unread: 0,
+                v6: false,
             },
             Listed {
                 local: at([10, 0, 9, 15], 49152),
                 remote: Some(at([10, 0, 9, 1], 80)),
                 state: TCP_ESTABLISHED,
                 unread: 0x1234,
+                v6: false,
             },
         ];
         // Whatever the kernel's own set holds while other tests run, the
         // served rows are the last two, numbered one after the other.
-        let tcp = proc_net_tcp_of(&served);
+        let tcp = proc_net_tcp_of(ProcNetFamily::V4, &served);
         let rows: Vec<&str> = tcp.lines().collect();
         assert!(rows[0].starts_with("  sl  local_address rem_address   st tx_queue rx_queue"));
         let (listening, open) = (rows[rows.len() - 2], rows[rows.len() - 1]);
@@ -3096,7 +3218,15 @@ mod proc_net_tests {
             )
         );
         // With none served, the table is as it was.
-        assert_eq!(proc_net_tcp_of(&[]).lines().count(), rows.len() - 2);
+        assert_eq!(
+            proc_net_tcp_of(ProcNetFamily::V4, &[]).lines().count(),
+            rows.len() - 2
+        );
+        // And they are not the other family's.
+        assert_eq!(
+            proc_net_tcp_of(ProcNetFamily::V6, &served).lines().count(),
+            proc_net_tcp_of(ProcNetFamily::V6, &[]).lines().count()
+        );
 
         let served = [
             Listed {
@@ -3104,15 +3234,17 @@ mod proc_net_tests {
                 remote: None,
                 state: TCP_CLOSE,
                 unread: 5,
+                v6: false,
             },
             Listed {
                 local: at([127, 0, 0, 1], 5353),
                 remote: Some(at([10, 0, 9, 1], 53)),
                 state: TCP_ESTABLISHED,
                 unread: 0,
+                v6: false,
             },
         ];
-        let udp = proc_net_udp_of(&served);
+        let udp = proc_net_udp_of(ProcNetFamily::V4, &served);
         let rows: Vec<&str> = udp.lines().collect();
         assert!(rows[0].ends_with("inode ref pointer drops"));
         let (plain, connected) = (rows[rows.len() - 2], rows[rows.len() - 1]);
@@ -3132,6 +3264,113 @@ mod proc_net_tests {
                 sl + 1,
                 1001 + sl
             )
+        );
+    }
+
+    /// An `AF_INET6` socket is a row of the IPv6 tables, whose addresses
+    /// are sixteen bytes: the IPv4 address it has is written the way such
+    /// a socket says one, and one that has none is `::`.
+    #[test]
+    fn an_ipv6_socket_is_a_row_of_the_ipv6_tables() {
+        use alloc::vec::Vec;
+        use smoltcp::wire::{IpAddress, IpEndpoint, Ipv6Address};
+        use user_stack::{Listed, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
+        // The cell, as Linux writes `::1` and `netstat` reads it back.
+        assert_eq!(
+            proc_net_hex_addr6(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 22),
+            "00000000000000000000000001000000:0016"
+        );
+        assert_eq!(
+            proc_net_hex_addr6(IpAddress::Unspecified, 0),
+            "00000000000000000000000000000000:0000"
+        );
+        // A socket of the kernel's own is IPv6's by either address, and
+        // IPv4's while it has none.
+        let v4 = IpAddress::Ipv4(Ipv4Address([10, 0, 9, 15]));
+        let v6 = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        let none = IpAddress::Unspecified;
+        assert!(ProcNetFamily::of(v6, none) == ProcNetFamily::V6);
+        assert!(ProcNetFamily::of(none, v6) == ProcNetFamily::V6);
+        assert!(ProcNetFamily::of(v4, v4) == ProcNetFamily::V4);
+        assert!(ProcNetFamily::of(v4, none) == ProcNetFamily::V4);
+        assert!(ProcNetFamily::of(none, none) == ProcNetFamily::V4);
+        let at = |a: [u8; 4], port| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(a)), port);
+        let served = [
+            Listed {
+                local: at([0, 0, 0, 0], 22),
+                remote: None,
+                state: TCP_LISTEN,
+                unread: 0,
+                v6: true,
+            },
+            Listed {
+                local: at([10, 0, 9, 15], 22),
+                remote: Some(at([10, 0, 9, 1], 40000)),
+                state: TCP_ESTABLISHED,
+                unread: 3,
+                v6: true,
+            },
+            Listed {
+                local: at([0, 0, 0, 0], 80),
+                remote: None,
+                state: TCP_LISTEN,
+                unread: 0,
+                v6: false,
+            },
+        ];
+        let tcp6 = proc_net_tcp_of(ProcNetFamily::V6, &served);
+        let rows: Vec<&str> = tcp6.lines().collect();
+        // The header Linux writes, to the space.
+        assert_eq!(
+            rows[0],
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        );
+        let (listening, open) = (rows[rows.len() - 2], rows[rows.len() - 1]);
+        let (sl, rest) = listening.split_once(": ").unwrap();
+        let sl: usize = sl.trim().parse().unwrap();
+        assert_eq!(
+            rest,
+            alloc::format!(
+                "00000000000000000000000000000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
+                1000 + sl
+            )
+        );
+        assert_eq!(
+            open,
+            alloc::format!(
+                "{:4}: 0000000000000000FFFF00000F09000A:0016 0000000000000000FFFF00000109000A:9C40 01 00000000:00000003 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
+                sl + 1,
+                1001 + sl
+            )
+        );
+        // The IPv4 socket is the other table's, and only it.
+        let tcp = proc_net_tcp_of(ProcNetFamily::V4, &served);
+        assert!(tcp.lines().last().unwrap().contains(": 00000000:0050 "));
+        assert_eq!(
+            tcp.lines().count(),
+            proc_net_tcp_of(ProcNetFamily::V4, &[]).lines().count() + 1
+        );
+
+        let served = [Listed {
+            local: at([0, 0, 0, 0], 5353),
+            remote: None,
+            state: TCP_CLOSE,
+            unread: 0,
+            v6: true,
+        }];
+        let udp6 = proc_net_udp_of(ProcNetFamily::V6, &served);
+        let rows: Vec<&str> = udp6.lines().collect();
+        assert_eq!(
+            rows[0],
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        );
+        let (_, rest) = rows[rows.len() - 1].split_once(": ").unwrap();
+        assert!(rest.starts_with(
+            "00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 "
+        ));
+        assert_eq!(
+            proc_net_udp_of(ProcNetFamily::V4, &served).lines().count(),
+            proc_net_udp_of(ProcNetFamily::V4, &[]).lines().count()
         );
     }
 
