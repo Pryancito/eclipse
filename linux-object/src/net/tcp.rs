@@ -606,11 +606,25 @@ impl Socket for TcpSocketState {
         if data.is_empty() {
             return Ok(0);
         }
-        // Retry until at least one byte is queued. A full TX buffer returns
-        // Ok(0); for a blocking socket we must keep draining ACKs (poll_ifaces)
-        // and try again instead of returning a 0-length write, which makes
-        // libc/busybox spin or treat the write as failed.
-        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        // A full TX buffer queues nothing (`Ok(0)`), and the answer to that
+        // is `EAGAIN` whether or not the fd is `O_NONBLOCK`: a blocking
+        // caller is made to wait by the system call, asleep on
+        // `async_poll(OUT)`, as for every other socket with a bounded queue
+        // (`queue_is_bounded` in linux-syscall). Never a 0-length write,
+        // which makes libc/busybox spin or treat the write as failed.
+        //
+        // This used to wait here instead, draining the interface in a loop
+        // for up to 30 s. That frees the buffer only when the card's driver
+        // is the kernel's: with a driver that is a process and one CPU, the
+        // loop was the only thing running, no frame left, and every write
+        // past the first buffer-full ended in `ENOBUFS` half a minute later.
+        //
+        // Room is made by the peer's acknowledgements, and those are taken
+        // in when the interface is polled, which is this call's to do: a
+        // blocking caller's write polls it once in full before it says the
+        // buffer is full, so that each time the system call comes back from
+        // its wait the stack has moved as far as what arrived lets it.
+        let mut polled = flags.contains(OpenFlags::NON_BLOCK);
         loop {
             let copied_len = {
                 let sets = get_sockets();
@@ -621,18 +635,18 @@ impl Socket for TcpSocketState {
             crate::net::drain_net_tick();
 
             match copied_len {
-                Ok(0) => {
-                    if flags.contains(OpenFlags::NON_BLOCK) {
-                        return Err(LxError::EAGAIN);
-                    }
-                    if kernel_hal::timer::timer_now() >= deadline {
-                        warn!("[tcp write] TX buffer full, deadline exceeded");
-                        return Err(LxError::ENOBUFS);
-                    }
-                    // Synchronous trait: drain ACKs so the peer's window frees
-                    // up TX buffer space before retrying.
+                Ok(0) if !polled => {
                     kernel_hal::deferred_job::drain_deferred_jobs();
                     crate::net::drain_net_urgent();
+                    polled = true;
+                }
+                Ok(0) => {
+                    if !flags.contains(OpenFlags::NON_BLOCK) {
+                        // The wait is the caller's, a few milliseconds at
+                        // a time: a signal ends it here.
+                        crate::process::check_signals()?;
+                    }
+                    return Err(LxError::EAGAIN);
                 }
                 Ok(size) => {
                     flush_socket_egress();
@@ -2281,6 +2295,47 @@ mod port_tests {
         deliver(&mut iface);
         assert_eq!(read(&client, &mut buf), Ok(0));
         assert_eq!(Socket::write(&client, b"x", None), Ok(1));
+    }
+
+    /// A blocking socket whose transmit buffer is full used to keep the
+    /// write inside the kernel, polling the interface for up to 30 s and
+    /// then answering `ENOBUFS`: with a card whose driver is a process and
+    /// one CPU nothing else ran meanwhile, so nothing was ever sent. The
+    /// write says `EAGAIN` at once and the system call waits, asleep.
+    #[test]
+    fn a_full_transmit_buffer_is_eagain_at_once_for_a_blocking_socket_too() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let (_server, client, child) = connected_pair(&mut iface, 41065);
+        FileLike::set_flags(&client, OpenFlags::empty()).unwrap();
+        let child = child.as_socket().unwrap();
+        let chunk = [7u8; 64 * 1024];
+        // Nothing is delivered and nobody reads: the buffer fills.
+        let mut queued = 0;
+        let full = loop {
+            match Socket::write(&client, &chunk, None) {
+                Ok(n) => {
+                    assert!(n > 0, "never a write of nothing");
+                    queued += n;
+                    assert!(queued < 64 << 20, "a buffer has an end");
+                }
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(full, LxError::EAGAIN);
+        assert!(
+            !Socket::poll(&client, PollEvents::OUT).1,
+            "no room: not writable"
+        );
+        // What the peer takes makes room, and the socket says so.
+        let mut buf = [0u8; 64 * 1024];
+        for _ in 0..4 {
+            deliver(&mut iface);
+            assert!(read(child, &mut buf).unwrap() > 0);
+        }
+        deliver(&mut iface);
+        assert!(Socket::poll(&client, PollEvents::OUT).1, "room again");
+        assert!(Socket::write(&client, &chunk, None).unwrap() > 0);
     }
 
     #[test]

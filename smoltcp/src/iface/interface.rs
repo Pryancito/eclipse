@@ -2055,6 +2055,34 @@ impl<'a> InterfaceInner<'a> {
             }
             #[cfg(feature = "medium-ip")]
             Medium::Ip => {
+                // A TCP segment leaves by an interface that routes its
+                // destination, or not at all. There is no neighbor to look
+                // up on this medium, so nothing above has asked.
+                //
+                // zCore drives one socket set from every interface in turn,
+                // the cards first and the loopback last, and the loopback
+                // is this medium: it sent whatever the cards had left. For
+                // a card that had no room for a frame at that moment (a
+                // full transmit ring, every slot of a served card with its
+                // driver) what was left was a connection's next segments,
+                // and they ended in the loopback's queue, addressed to a
+                // host that is not this one, counted as sent. The sender
+                // found out one retransmit timer later, each time: an
+                // upload of megabytes at 0.1 MB/s.
+                //
+                // Refused here the segment stays in the socket, which is
+                // marked as waiting for that neighbor, and the card that
+                // has it takes the socket back at its next poll.
+                //
+                // Only TCP. A datagram no interface routes has always ended
+                // here, which is how it is dropped; left in its socket it
+                // would hold back the ones behind it that can be sent.
+                #[cfg(feature = "socket-tcp")]
+                if matches!(packet, IpPacket::Tcp(_))
+                    && self.route(&ip_repr.dst_addr(), cx.now).is_err()
+                {
+                    return Err(Error::Unaddressable);
+                }
                 let tx_len = ip_repr.total_len();
                 tx_token.consume(cx.now, tx_len, |mut tx_buffer| {
                     debug_assert!(tx_buffer.as_ref().len() == tx_len);
@@ -2224,6 +2252,105 @@ mod test {
             iface.inner.route(&IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), now),
             Ok(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1))
         );
+    }
+
+    /// The loopback is polled after the cards, over the same sockets, and
+    /// has no neighbor to look up: a connection's segment that a card had
+    /// no room for at that moment must not leave by it instead. It did,
+    /// counted as sent, and the connection waited for its retransmit timer
+    /// every time the card's transmit slots ran out.
+    #[cfg(all(feature = "medium-ip", feature = "proto-ipv4", feature = "socket-tcp"))]
+    #[test]
+    fn the_loopback_does_not_take_a_tcp_segment_for_another_network() {
+        use core::cell::Cell;
+
+        /// Counts the packets the interface hands to its device.
+        struct Counted<'a>(&'a Cell<usize>);
+        impl TxToken for Counted<'_> {
+            fn consume<R, F>(self, _: Instant, len: usize, f: F) -> Result<R>
+            where
+                F: FnOnce(&mut [u8]) -> Result<R>,
+            {
+                self.0.set(self.0.get() + 1);
+                f(&mut vec![0; len])
+            }
+        }
+        let mut iface = InterfaceBuilder::new(Loopback::new(Medium::Ip))
+            .ip_addrs([IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)])
+            .routes(Routes::new(BTreeMap::new()))
+            .finalize();
+        let cx = iface.context(Instant::from_millis(0));
+        let sent = Cell::new(0);
+        let (card, far) = (Ipv4Address::new(10, 0, 9, 15), Ipv4Address::new(10, 0, 9, 1));
+        let home = Ipv4Address::new(127, 0, 0, 1);
+        let segment = TcpRepr {
+            src_port: 49152,
+            dst_port: 5000,
+            control: TcpControl::None,
+            seq_number: TcpSeqNumber(1),
+            ack_number: Some(TcpSeqNumber(1)),
+            window_len: 64,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            payload: b"a connection's next bytes",
+        };
+        let ip = |src_addr, dst_addr, protocol, payload_len| {
+            IpRepr::Ipv4(Ipv4Repr {
+                src_addr,
+                dst_addr,
+                protocol,
+                payload_len,
+                hop_limit: 64,
+            })
+        };
+        let tcp = |src, dst| {
+            IpPacket::Tcp((
+                ip(src, dst, IpProtocol::Tcp, segment.buffer_len()),
+                segment,
+            ))
+        };
+
+        // A connection that goes through a card: not the loopback's, and
+        // said in the way that leaves the segment in its socket.
+        assert_eq!(
+            iface
+                .inner
+                .dispatch_ip(&cx, Counted(&sent), tcp(card, far)),
+            Err(Error::Unaddressable)
+        );
+        assert_eq!(sent.get(), 0);
+        // One to this host is, as ever.
+        assert_eq!(
+            iface
+                .inner
+                .dispatch_ip(&cx, Counted(&sent), tcp(home, home)),
+            Ok(())
+        );
+        assert_eq!(sent.get(), 1);
+        // And a datagram nobody routes still ends here, so that it does not
+        // hold back the ones behind it in its socket.
+        #[cfg(feature = "socket-udp")]
+        {
+            let (udp, data) = (
+                UdpRepr {
+                    src_port: 4000,
+                    dst_port: 53,
+                },
+                &b"lost"[..],
+            );
+            let packet = IpPacket::Udp((
+                ip(card, far, IpProtocol::Udp, udp.header_len() + data.len()),
+                udp,
+                data,
+            ));
+            assert_eq!(
+                iface.inner.dispatch_ip(&cx, Counted(&sent), packet),
+                Ok(())
+            );
+            assert_eq!(sent.get(), 2);
+        }
     }
 
     #[allow(unused)]

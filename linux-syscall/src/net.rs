@@ -30,12 +30,13 @@ fn scm_rights_cloexec(flags: usize) -> bool {
 }
 
 /// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
-/// peer buffer), UDP (smoltcp's transmit ring) and a stream socket of the
-/// stack that runs as a process (what that stack still takes). The
-/// kernel's TCP waits on its own.
+/// peer buffer), UDP (smoltcp's transmit ring), TCP (smoltcp's transmit
+/// buffer) and a stream socket of the stack that runs as a process (what
+/// that stack still takes).
 pub(crate) fn queue_is_bounded(file_like: &Arc<dyn FileLike>) -> bool {
     file_like.downcast_ref::<UnixSocketState>().is_some()
         || file_like.downcast_ref::<UdpSocketState>().is_some()
+        || file_like.downcast_ref::<TcpSocketState>().is_some()
         || file_like
             .downcast_ref::<linux_object::net::user_stack::ServedTcpSocket>()
             .is_some()
@@ -51,9 +52,9 @@ struct SendMode {
 }
 
 /// `sock_sendmsg` flag handling. Waiting is for a socket whose `write`
-/// queues into a bounded buffer and says `EAGAIN` when it is full (unix and
-/// UDP) unless the fd is `O_NONBLOCK` or the call says `MSG_DONTWAIT`; a
-/// TCP socket's `write` waits for window on its own. `SIGPIPE` is the
+/// queues into a bounded buffer and says `EAGAIN` when it is full (unix,
+/// UDP, TCP) unless the fd is `O_NONBLOCK` or the call says
+/// `MSG_DONTWAIT`. `SIGPIPE` is the
 /// default for a dead peer, and `MSG_NOSIGNAL` is the one way to opt out.
 ///
 /// Both flags used to be ignored: a blocking `sendto`/`sendmsg` on a full
