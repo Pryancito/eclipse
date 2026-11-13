@@ -2922,7 +2922,18 @@ fn tcp_state_code(state: smoltcp::socket::TcpState) -> u8 {
 /// zeros (not tracked at this granularity) and the socket's slot number
 /// doubles as the inode column — unique per row, which is all `netstat -t`
 /// needs to list connections.
+///
+/// After them come the stream sockets whose stack is a process
+/// ([`user_stack`]), which are not in that set: the ones the kernel made
+/// for the programs that asked for that stack, or for every program on a
+/// boot with `unetuse=all`.
 pub fn proc_net_tcp_content() -> alloc::string::String {
+    proc_net_tcp_of(&user_stack::machine().listed_streams())
+}
+
+/// [`proc_net_tcp_content`], with `served` the sockets of the stack that
+/// runs as a process.
+fn proc_net_tcp_of(served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
     use smoltcp::socket::Socket;
     let mut s = alloc::string::String::from(
@@ -2930,7 +2941,9 @@ pub fn proc_net_tcp_content() -> alloc::string::String {
     );
     let sets = get_sockets();
     let sets = sets.lock();
+    let mut slots = 0;
     for (i, socket) in sets.iter().enumerate() {
+        slots = i + 1;
         if let Socket::Tcp(tcp) = socket {
             let l = tcp.local_endpoint();
             let r = tcp.remote_endpoint();
@@ -2945,12 +2958,45 @@ pub fn proc_net_tcp_content() -> alloc::string::String {
             );
         }
     }
+    drop(sets);
+    // Numbered past the kernel's own, so no two rows have one number.
+    for (i, sock) in served.iter().enumerate() {
+        let i = slots + i;
+        let _ = writeln!(
+            s,
+            "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
+            i,
+            proc_net_hex_addr(sock.local.addr, sock.local.port),
+            proc_net_hex_peer(sock.remote),
+            sock.state,
+            sock.unread,
+            1000 + i,
+        );
+    }
     s
+}
+
+/// The peer's cell of a served socket's row: nobody when it has none.
+fn proc_net_hex_peer(peer: Option<smoltcp::wire::IpEndpoint>) -> alloc::string::String {
+    match peer {
+        Some(peer) => proc_net_hex_addr(peer.addr, peer.port),
+        None => proc_net_hex_addr(smoltcp::wire::IpAddress::Unspecified, 0),
+    }
 }
 
 /// `/proc/net/udp` from the live smoltcp socket set. UDP rows carry state 07
 /// (TCP_CLOSE) like Linux does for unconnected datagram sockets.
+///
+/// After them come the datagram sockets whose stack is a process, as in
+/// [`proc_net_tcp_content`]: the ones that have a port, with their peer
+/// and state 01 when they are connected, and the bytes they hold unread.
 pub fn proc_net_udp_content() -> alloc::string::String {
+    proc_net_udp_of(&user_stack::machine().listed_datagrams())
+}
+
+/// [`proc_net_udp_content`], with `served` the sockets of the stack that
+/// runs as a process.
+fn proc_net_udp_of(served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
     use smoltcp::socket::Socket;
     let mut s = alloc::string::String::from(
@@ -2958,7 +3004,9 @@ pub fn proc_net_udp_content() -> alloc::string::String {
     );
     let sets = get_sockets();
     let sets = sets.lock();
+    let mut slots = 0;
     for (i, socket) in sets.iter().enumerate() {
+        slots = i + 1;
         if let Socket::Udp(udp) = socket {
             let l = udp.endpoint();
             let _ = writeln!(
@@ -2969,6 +3017,20 @@ pub fn proc_net_udp_content() -> alloc::string::String {
                 1000 + i,
             );
         }
+    }
+    drop(sets);
+    for (i, sock) in served.iter().enumerate() {
+        let i = slots + i;
+        let _ = writeln!(
+            s,
+            "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
+            i,
+            proc_net_hex_addr(sock.local.addr, sock.local.port),
+            proc_net_hex_peer(sock.remote),
+            sock.state,
+            sock.unread,
+            1000 + i,
+        );
     }
     s
 }
@@ -2985,6 +3047,92 @@ mod proc_net_tests {
         assert_eq!(proc_net_hex_addr(addr, 53), "0100007F:0035");
         let any = smoltcp::wire::IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
         assert_eq!(proc_net_hex_addr(any, 0), "00000000:0000");
+    }
+
+    /// The sockets of the stack that runs as a process come after the
+    /// kernel's own, in the same columns: `netstat` reads the addresses,
+    /// the state and the queues by their place in the line.
+    #[test]
+    fn the_served_sockets_are_rows_of_the_same_tables() {
+        use alloc::vec::Vec;
+        use smoltcp::wire::{IpAddress, IpEndpoint};
+        use user_stack::{Listed, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
+        let at = |a: [u8; 4], port| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(a)), port);
+        let served = [
+            Listed {
+                local: at([0, 0, 0, 0], 22),
+                remote: None,
+                state: TCP_LISTEN,
+                unread: 0,
+            },
+            Listed {
+                local: at([10, 0, 9, 15], 49152),
+                remote: Some(at([10, 0, 9, 1], 80)),
+                state: TCP_ESTABLISHED,
+                unread: 0x1234,
+            },
+        ];
+        // Whatever the kernel's own set holds while other tests run, the
+        // served rows are the last two, numbered one after the other.
+        let tcp = proc_net_tcp_of(&served);
+        let rows: Vec<&str> = tcp.lines().collect();
+        assert!(rows[0].starts_with("  sl  local_address rem_address   st tx_queue rx_queue"));
+        let (listening, open) = (rows[rows.len() - 2], rows[rows.len() - 1]);
+        let (sl, rest) = listening.split_once(": ").unwrap();
+        let sl: usize = sl.trim().parse().unwrap();
+        assert_eq!(
+            rest,
+            alloc::format!(
+                "00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
+                1000 + sl
+            )
+        );
+        assert_eq!(
+            open,
+            alloc::format!(
+                "{:4}: 0F09000A:C000 0109000A:0050 01 00000000:00001234 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
+                sl + 1,
+                1001 + sl
+            )
+        );
+        // With none served, the table is as it was.
+        assert_eq!(proc_net_tcp_of(&[]).lines().count(), rows.len() - 2);
+
+        let served = [
+            Listed {
+                local: at([0, 0, 0, 0], 68),
+                remote: None,
+                state: TCP_CLOSE,
+                unread: 5,
+            },
+            Listed {
+                local: at([127, 0, 0, 1], 5353),
+                remote: Some(at([10, 0, 9, 1], 53)),
+                state: TCP_ESTABLISHED,
+                unread: 0,
+            },
+        ];
+        let udp = proc_net_udp_of(&served);
+        let rows: Vec<&str> = udp.lines().collect();
+        assert!(rows[0].ends_with("inode ref pointer drops"));
+        let (plain, connected) = (rows[rows.len() - 2], rows[rows.len() - 1]);
+        let (sl, rest) = plain.split_once(": ").unwrap();
+        let sl: usize = sl.trim().parse().unwrap();
+        assert_eq!(
+            rest,
+            alloc::format!(
+                "00000000:0044 00000000:0000 07 00000000:00000005 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
+                1000 + sl
+            )
+        );
+        assert_eq!(
+            connected,
+            alloc::format!(
+                "{:4}: 0100007F:14E9 0109000A:0035 01 00000000:00000000 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
+                sl + 1,
+                1001 + sl
+            )
+        );
     }
 
     #[test]
