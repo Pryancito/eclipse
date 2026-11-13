@@ -312,9 +312,9 @@ pub(crate) mod testing {
     use smoltcp::socket::SocketSet;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress,
-        EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
-        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
-        TcpSeqNumber, UdpPacket, UdpRepr,
+        EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr, IgmpPacket,
+        IgmpRepr, IgmpVersion, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
     };
     use std::collections::BTreeMap;
 
@@ -394,6 +394,7 @@ pub(crate) mod testing {
                 .neighbor_cache(NeighborCache::new(BTreeMap::new()))
                 .ip_addrs(vec![IpCidr::new(IpAddress::Ipv4(OUR_IP), 24)])
                 .routes(Routes::new(BTreeMap::new()))
+                .ipv4_multicast_groups(BTreeMap::new())
                 .finalize();
             Bench {
                 window: Window(window),
@@ -598,6 +599,72 @@ pub(crate) mod testing {
                 &ChecksumCapabilities::default(),
             )
         })
+    }
+
+    /// The card every member of `group` hears at: the address Ethernet
+    /// has for the group.
+    pub fn group_card(group: Ipv4Address) -> EthernetAddress {
+        let [_, b, c, d] = group.0;
+        EthernetAddress([0x01, 0x00, 0x5e, b & 0x7f, c, d])
+    }
+
+    /// A UDP datagram from THEIRS, port `from`, to the members of
+    /// `group`, port `to`.
+    pub fn group_frame(group: Ipv4Address, from: u16, to: u16, data: &[u8]) -> Vec<u8> {
+        let udp = UdpRepr {
+            src_port: from,
+            dst_port: to,
+        };
+        let len = 8 + data.len();
+        ipv4_frame_for(group_card(group), group, IpProtocol::Udp, len, |payload| {
+            udp.emit(
+                &mut UdpPacket::new_unchecked(payload),
+                &THEIR_IP.into(),
+                &group.into(),
+                data.len(),
+                |room| room.copy_from_slice(data),
+                &ChecksumCapabilities::default(),
+            )
+        })
+    }
+
+    /// THEIRS, a router, asks every machine which groups it is a member
+    /// of, to be answered within a second.
+    pub fn groups_query() -> Vec<u8> {
+        let everybody = Ipv4Address::MULTICAST_ALL_SYSTEMS;
+        let query = IgmpRepr::MembershipQuery {
+            max_resp_time: smoltcp::time::Duration::from_millis(1000),
+            group_addr: Ipv4Address::UNSPECIFIED,
+            version: IgmpVersion::Version2,
+        };
+        let len = query.buffer_len();
+        ipv4_frame_for(
+            group_card(everybody),
+            everybody,
+            IpProtocol::Igmp,
+            len,
+            |payload| query.emit(&mut IgmpPacket::new_unchecked(payload)),
+        )
+    }
+
+    /// What `frame`, one of ours, says of a group in IGMP, and where it
+    /// was sent: `None` when it is not IGMP.
+    pub fn igmp_of(frame: &[u8]) -> Option<(IgmpRepr, Ipv4Address)> {
+        let frame = EthernetFrame::new_checked(frame).ok()?;
+        if frame.ethertype() != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ip = Ipv4Packet::new_checked(frame.payload()).ok()?;
+        if ip.protocol() != IpProtocol::Igmp {
+            return None;
+        }
+        assert!(ip.verify_checksum());
+        // Said to the neighbours, and no further.
+        assert_eq!(ip.hop_limit(), 1);
+        assert_eq!(frame.src_addr(), OURS);
+        assert_eq!(frame.dst_addr(), group_card(ip.dst_addr()));
+        let said = IgmpRepr::parse(&IgmpPacket::new_checked(ip.payload()).ok()?).ok()?;
+        Some((said, ip.dst_addr()))
     }
 
     /// An IPv4 packet of ICMP from THEIRS to us that carries `message`,

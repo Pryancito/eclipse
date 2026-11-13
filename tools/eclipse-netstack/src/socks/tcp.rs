@@ -239,8 +239,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             return Err(Refused::Malformed);
         }
         // Nowhere to send it (no gateway for what is off the card's
-        // network), and nobody to connect to at everybody's address.
-        if addr.is_broadcast() || !self.reaches(addr) {
+        // network), and nobody to connect to at everybody's address or
+        // at a group's.
+        if addr.is_broadcast() || addr.is_multicast() || !self.reaches(addr) {
             self.streams.owe(sock, EV_FAILED, WHY_UNREACHABLE, &[]);
             return Ok(true);
         }

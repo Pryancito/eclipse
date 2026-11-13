@@ -56,6 +56,9 @@ smoltcp = { path = "../../smoltcp", default-features = false, features = [
     "socket-tcp",
     # The client that asks for the card's address (`socks::lease`).
     "socket-dhcpv4",
+    # The groups the machine is a member of (`socks::groups`): what says
+    # so on the network, and what takes a datagram for one.
+    "proto-igmp",
 ] }
 
 [profile.release]

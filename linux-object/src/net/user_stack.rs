@@ -123,6 +123,21 @@
 //! A datagram for a port of this machine that no socket has is refused
 //! the same way, by the kernel itself.
 //!
+//! # Groups
+//!
+//! A program that asks to hear a group (`IP_ADD_MEMBERSHIP`) makes the
+//! machine a member of it, and the stack is told of the machine, not of
+//! the socket (`groups`):
+//!
+//! ```text
+//! JOIN    (kernel to stack)  16  [u8; 4] group
+//! LEAVE   (kernel to stack)  16  [u8; 4] group
+//! ```
+//!
+//! What arrives for the group arrives for the socket that has the port,
+//! and what a socket here sends to it reaches the member in this machine
+//! as well as the card.
+//!
 //! # What the card has carried
 //!
 //! The frames are the stack's and so is the count of them, which the
@@ -200,8 +215,10 @@ use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
+mod groups;
 mod icmp;
 mod tcp;
+pub use groups::{join_message, leave_message, Membership, MEMBERSHIPS_MAX, OP_JOIN, OP_LEAVE};
 pub use icmp::ServedIcmpSocket;
 pub use tcp::ServedTcpSocket;
 
@@ -601,6 +618,8 @@ struct Inner {
     /// delivered: what the next read or write answers, once, and
     /// `SO_ERROR`.
     error: Option<LxError>,
+    /// The groups it asked to be a member of (`IP_ADD_MEMBERSHIP`).
+    groups: Vec<Ipv4Address>,
 }
 
 impl Shared {
@@ -634,6 +653,7 @@ impl Shared {
                 read_closed: false,
                 patience: Patience::default(),
                 error: None,
+                groups: Vec::new(),
             }),
             hears,
             v6,
@@ -831,6 +851,9 @@ struct Table {
     /// Which datagram socket has each port: where a datagram from another
     /// program of this machine goes.
     bound: BTreeMap<u16, u64>,
+    /// The groups the machine is a member of, and how many sockets asked
+    /// for each.
+    groups: BTreeMap<Ipv4Address, usize>,
     /// The sockets that hear ICMP.
     hearing: BTreeSet<u64>,
     /// The identifiers of the sockets that ping: their ports.
@@ -1070,7 +1093,8 @@ impl StackLink {
     /// [`serve`], on these sockets. The stack is told of the sockets that
     /// are there already and are its business: the datagram sockets that
     /// have a port and the stream sockets that listen, less the ones
-    /// that are this machine's alone, and the ones that hear ICMP.
+    /// that are this machine's alone, and the ones that hear ICMP. And
+    /// of the groups the machine is a member of.
     pub fn attach(
         self: &Arc<Self>,
         channel: Arc<Channel>,
@@ -1134,6 +1158,9 @@ impl StackLink {
                 let listen = listen_message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
                 let _ = self.tell(listen, true);
             }
+        }
+        for group in self.groups() {
+            let _ = self.tell(join_message(group.0), true);
         }
         Ok(Serving {
             link: self.clone(),
@@ -1575,6 +1602,7 @@ impl Asked {
 
 impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
+        self.leave_every_group();
         let (port, here) = {
             let inner = self.shared.inner.lock();
             (inner.port, inner.here)
@@ -1641,9 +1669,12 @@ impl Socket for ServedUdpSocket {
         if data.len() > self.link.max_datagram.load(Ordering::Acquire) {
             return Err(LxError::EMSGSIZE);
         }
-        self.autobind()?;
+        let port = self.autobind()?;
         let said = send_message(self.sock, addr.0, to.port, self.hop_limit(addr), data);
         self.link.tell(said, false)?;
+        if addr.is_multicast() {
+            self.loop_back(port, to, data);
+        }
         Ok(data.len())
     }
 
@@ -1758,6 +1789,9 @@ impl Socket for ServedUdpSocket {
         // The two timeouts are kept where the waits look.
         if let Some(kept) = self.shared.inner.lock().patience.set(level, opt, data) {
             return kept;
+        }
+        if let Some(done) = self.membership(level, opt, data) {
+            return done;
         }
         if let Some(kept) = self.opts.lock().try_setsockopt(level, opt, data) {
             return kept;

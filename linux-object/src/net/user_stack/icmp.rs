@@ -272,7 +272,13 @@ impl Socket for ServedIcmpSocket {
         }
         let (broadcast, ttl) = {
             let opts = self.opts.lock();
-            (opts.broadcast, opts.ip_ttl)
+            // To a group, as far as a group's are to go (`ip_select_ttl`).
+            let ttl = if to.is_multicast() {
+                opts.mcast_ttl
+            } else {
+                opts.ip_ttl
+            };
+            (opts.broadcast, ttl)
         };
         // `ip_route_output`: everybody is not written to by accident.
         if to.is_broadcast() && !broadcast {
@@ -710,6 +716,16 @@ mod tests {
         assert_eq!(Socket::ip_ttl(&s), 3);
         assert_eq!(Socket::write(&s, &ping, to(HOST)), Ok(ping.len()));
         assert_eq!(stack.told(), Some(icmp_message(s.sock, HOST, 3, &ping)));
+        // And `IP_MULTICAST_TTL` to a group: the next machine, unless
+        // the program says further.
+        let everybody = [224, 0, 0, 1];
+        assert_eq!(Socket::write(&s, &ping, to(everybody)), Ok(ping.len()));
+        let said = icmp_message(s.sock, everybody, 1, &ping);
+        assert_eq!(stack.told(), Some(said));
+        assert_eq!(Socket::setsockopt(&s, 0, 33, &[9]), Ok(0));
+        assert_eq!(Socket::write(&s, &ping, to(everybody)), Ok(ping.len()));
+        let said = icmp_message(s.sock, everybody, 9, &ping);
+        assert_eq!(stack.told(), Some(said));
         // One frame's worth and no more, and nobody is everybody by
         // accident.
         let long = vec![0u8; MAX_FOR_TESTS + ECHO_HEADER + 1];

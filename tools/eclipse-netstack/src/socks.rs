@@ -45,6 +45,11 @@
 //! something it sent was not delivered, and tells the kernel whose it
 //! was ([`undelivered`]).
 //!
+//! A datagram for a group (224.0.0.0/4) leaves like any other, to the
+//! card every member hears at. One arrives for the socket that has its
+//! port while the machine is a member of the group, which the kernel
+//! says ([`groups`]).
+//!
 //! A stream socket is the same bargain with more to say, and [`tcp`] has
 //! it: the connection is a smoltcp socket here, and an `EVENTS` carries
 //! what a turn made of every connection.
@@ -66,9 +71,11 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion};
 use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
 
+pub mod groups;
 pub mod lease;
 pub mod tcp;
 pub mod undelivered;
+use groups::{OP_JOIN, OP_LEAVE};
 use tcp::{OP_CONNECT, OP_LISTEN, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, EV_UNDELIVERED};
 
@@ -109,7 +116,8 @@ const TX_DATAGRAMS: usize = 32;
 /// Why a message from the kernel was not done.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// Too short, or an operation that is not one.
+    /// Too short, an operation that is not one, or a group that is not
+    /// a group's address.
     Malformed,
     /// A `BIND` for a socket that has a port, or to port 0; a `CONNECT`,
     /// a `LISTEN` or a `HEAR` for a socket that is one already.
@@ -206,6 +214,8 @@ pub struct Stack<D: for<'d> Device<'d>> {
     /// Where what is not for the card's network goes, when anywhere.
     gateway: Option<Ipv4Address>,
     lease: lease::Leasing,
+    /// The groups the machine is a member of, as the kernel said.
+    groups: BTreeSet<Ipv4Address>,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -224,6 +234,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             brought: false,
             gateway: None,
             lease: lease::Leasing::default(),
+            groups: BTreeSet::new(),
         }
     }
 
@@ -379,11 +390,13 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     }
 
     /// Whether `addr` can be sent to: it is on the card's network, it is
-    /// everybody, or there is a gateway to send it through. A datagram
+    /// everybody, it is a group and the card has an address to send
+    /// from, or there is a gateway to send it through. A datagram
     /// smoltcp cannot place stays at the head of its socket's queue with
     /// every later one behind it, so one that cannot go is not queued.
     fn reaches(&self, addr: Ipv4Address) -> bool {
         addr.is_broadcast()
+            || (addr.is_multicast() && self.address().is_some())
             || self.iface.ip_addrs().iter().any(|cidr| match cidr {
                 // No address yet is not the network of everything.
                 IpCidr::Ipv4(cidr) => !cidr.address().is_unspecified() && cidr.contains_addr(&addr),
@@ -405,6 +418,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
             OP_WINDOW => self.window(sock, m),
             OP_HEAR if m.len() == HEADER_LEN => self.hear(sock),
+            OP_JOIN => self.member(m, true),
+            OP_LEAVE => self.member(m, false),
             OP_ICMP => self.icmp(sock, m),
             OP_BIND => {
                 let port: [u8; 2] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;

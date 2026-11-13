@@ -162,8 +162,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if held == self.lease.held {
             return;
         }
+        // The groups are said from an address: left from the one that
+        // goes, joined from the one that comes.
+        self.say_groups(false);
         self.put_address(held.as_ref().map_or(NO_ADDRESS, |lease| lease.address));
         self.set_gateway(held.as_ref().and_then(|lease| lease.gateway));
+        self.say_groups(true);
         self.lease.held = held;
         self.lease.news = true;
     }
@@ -258,8 +262,9 @@ mod tests {
         assert_eq!((ip.src_addr(), ip.dst_addr()), (OUR_IP, FAR));
         assert_eq!(ip.protocol(), IpProtocol::Udp);
 
-        // Never this machine, everybody's groups or nobody, gateway or not.
-        for nowhere in [[127, 0, 0, 1], [224, 0, 0, 251], [0, 0, 0, 0]] {
+        // Never this machine or nobody, gateway or not. (A group is not
+        // the gateway's business: it goes by the card, in `groups`.)
+        for nowhere in [[127, 0, 0, 1], [0, 0, 0, 0]] {
             assert_eq!(
                 stack.request(&send(1, Ipv4Address(nowhere), 53, b"x")),
                 Err(Refused::Unreachable),
