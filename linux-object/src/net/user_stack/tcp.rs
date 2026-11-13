@@ -59,6 +59,12 @@ struct Inner {
     /// Whether `port` is this socket's in the table: a connection that
     /// arrived on a listener has the listener's.
     holds_port: bool,
+    /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
+    /// of this machine alone, which the stack is not told of.
+    here: Option<Ipv4Address>,
+    /// Its own address in a connection to another program of this
+    /// machine, where it is not the stack's.
+    local: Option<Ipv4Address>,
     remote: Option<IpEndpoint>,
     flags: OpenFlags,
     read_closed: bool,
@@ -80,6 +86,8 @@ impl Inner {
             error: None,
             port: None,
             holds_port: false,
+            here: None,
+            local: None,
             remote: None,
             flags: OpenFlags::RDWR,
             read_closed: false,
@@ -327,10 +335,127 @@ impl StackLink {
             }
         }
         if let Some(bytes) = say {
-            let _ = self.tell(window_message(sock, bytes), true);
+            self.stream_window(sock, bytes);
         }
         if let Some(close) = refuse {
             let _ = self.tell(close, true);
+        }
+    }
+
+    /// The other end of `sock` when it is joined to a socket of this
+    /// machine: 0 once that end has closed. `None` for a connection of
+    /// the stack's.
+    fn joined(&self, sock: u64) -> Option<u64> {
+        self.table.lock().joined.get(&sock).copied()
+    }
+
+    /// `CONNECT`, to this machine: `sock`, which is `Connecting` from
+    /// `from`, is joined to a new socket on the queue of whoever listens
+    /// on `port` at `to`, or refused when nobody does. Either is said to
+    /// `sock` as the stack would say it, before this returns.
+    fn join(&self, sock: u64, to: Ipv4Address, port: u16, from: IpEndpoint) {
+        let listener = {
+            let table = self.table.lock();
+            let listener = table.listening.get(&port);
+            listener
+                .and_then(|listener| table.streams.get(listener))
+                .and_then(Weak::upgrade)
+        };
+        let made = listener.is_some_and(|listener| {
+            let mut inner = listener.inner.lock();
+            // One bound to an address takes what is for that address.
+            if inner.phase != Phase::Listening
+                || inner.here.is_some_and(|here| here != to)
+                || inner.waiting.len() >= WAITING_MAX
+            {
+                return false;
+            }
+            let mut child = Inner::new(Phase::Open);
+            child.credit = STREAM_WINDOW;
+            child.port = inner.port;
+            child.local = Some(to);
+            child.remote = Some(from);
+            let child = Stream::new(child);
+            let new = {
+                let mut table = self.table.lock();
+                table.next_sock += 1;
+                let new = table.next_sock;
+                table.streams.insert(new, Arc::downgrade(&child));
+                table.joined.insert(new, sock);
+                table.joined.insert(sock, new);
+                new
+            };
+            inner.waiting.push_back((new, child));
+            listener.sync(&inner, self.is_dead(), Event::READABLE);
+            true
+        });
+        if made {
+            // Each end takes what the other holds unread: a window.
+            self.event(sock, EV_CONNECTED, STREAM_WINDOW as u32, &[]);
+        } else {
+            self.event(sock, EV_FAILED, WHY_REFUSED, &[]);
+        }
+    }
+
+    /// `WRITE`: to the stack, or onto the other end's queue.
+    fn stream_write(&self, sock: u64, data: &[u8]) -> LxResult<()> {
+        match self.joined(sock) {
+            None => self.tell(write_message(sock, data), true),
+            // Written to an end that closed: taken, and answered with a
+            // reset, which the next read or write finds.
+            Some(0) => {
+                self.event(sock, EV_FAILED, WHY_RESET, &[]);
+                Ok(())
+            }
+            Some(peer) => {
+                self.event(peer, EV_BYTES, 0, data);
+                Ok(())
+            }
+        }
+    }
+
+    /// `WINDOW`: the program read `bytes`, which is room the other end
+    /// gets back.
+    fn stream_window(&self, sock: u64, bytes: u32) {
+        match self.joined(sock) {
+            None => {
+                let _ = self.tell(window_message(sock, bytes), true);
+            }
+            Some(0) => {}
+            Some(peer) => self.event(peer, EV_CREDIT, bytes, &[]),
+        }
+    }
+
+    /// `SHUTDOWN`: this end will write no more.
+    fn stream_shutdown(&self, sock: u64) -> LxResult<()> {
+        match self.joined(sock) {
+            None => self.tell(shutdown_message(sock), true),
+            Some(0) => Ok(()),
+            Some(peer) => {
+                self.event(peer, EV_EOF, 0, &[]);
+                Ok(())
+            }
+        }
+    }
+
+    /// `CLOSE`: the socket is gone. The other end of a connection within
+    /// this machine reads what it has and then the end, and what it
+    /// writes from then on is answered with a reset.
+    fn stream_close(&self, sock: u64) {
+        let peer = {
+            let mut table = self.table.lock();
+            let peer = table.joined.remove(&sock);
+            if let Some(peer) = peer.filter(|&peer| peer != 0) {
+                table.joined.insert(peer, 0);
+            }
+            peer
+        };
+        match peer {
+            None => {
+                let _ = self.tell(close_message(sock), true);
+            }
+            Some(0) => {}
+            Some(peer) => self.event(peer, EV_EOF, 0, &[]),
         }
     }
 }
@@ -392,7 +517,7 @@ impl ServedTcpSocket {
                     self.stream.sync(&inner, dead, Event::empty());
                     drop(inner);
                     if let Some(bytes) = say {
-                        let _ = self.link.tell(window_message(self.sock, bytes), true);
+                        self.link.stream_window(self.sock, bytes);
                     }
                     return Ok(n);
                 }
@@ -432,7 +557,15 @@ impl ServedTcpSocket {
             }
         }
         for (sock, _) in waiting {
-            let _ = self.link.tell(close_message(sock), true);
+            self.link.stream_close(sock);
+        }
+    }
+
+    /// Take this socket off the ports that are listened on.
+    fn stop_listening(&self, port: Option<u16>) {
+        let mut table = self.link.table.lock();
+        if let Some(port) = port.filter(|port| table.listening.get(port) == Some(&self.sock)) {
+            table.listening.remove(&port);
         }
     }
 
@@ -448,14 +581,18 @@ impl Drop for ServedTcpSocket {
             (
                 inner.port.filter(|_| inner.holds_port),
                 core::mem::take(&mut inner.waiting),
-                // What the stack has a socket for. One whose connection
-                // failed it has let go of already.
-                matches!(
-                    inner.phase,
-                    Phase::Connecting | Phase::Open | Phase::Listening
-                ),
+                // What the stack, or the other end, has a socket for. One
+                // whose connection failed it has let go of already, and
+                // of a listener that is this machine's alone the stack
+                // was never told.
+                match inner.phase {
+                    Phase::Connecting | Phase::Open => true,
+                    Phase::Listening => inner.here.is_none(),
+                    Phase::Fresh | Phase::Over => false,
+                },
             )
         };
+        self.stop_listening(port);
         {
             let mut table = self.link.table.lock();
             table.streams.remove(&self.sock);
@@ -464,8 +601,10 @@ impl Drop for ServedTcpSocket {
             }
         }
         self.unlisten(waiting);
-        if known {
-            let _ = self.link.tell(close_message(self.sock), true);
+        // A connection within this machine that was reset is known to
+        // nobody but the table.
+        if known || self.link.joined(self.sock).is_some() {
+            self.link.stream_close(self.sock);
         }
     }
 }
@@ -512,7 +651,7 @@ impl Socket for ServedTcpSocket {
         if n == 0 {
             return Err(LxError::EAGAIN);
         }
-        self.link.tell(write_message(self.sock, &data[..n]), true)?;
+        self.link.stream_write(self.sock, &data[..n])?;
         Ok(n)
     }
 
@@ -533,6 +672,8 @@ impl Socket for ServedTcpSocket {
         let IpAddress::Ipv4(addr) = peer.addr else {
             return Err(LxError::EAFNOSUPPORT);
         };
+        // Another program of this machine: the kernel joins the two.
+        let here = self.link.is_here(addr);
         let started = {
             let mut inner = self.stream.inner.lock();
             if self.link.is_dead() {
@@ -544,12 +685,21 @@ impl Socket for ServedTcpSocket {
                     if peer.port == 0 {
                         return Err(LxError::ECONNREFUSED);
                     }
+                    // `ip_route_connect`: nothing leaves the machine from
+                    // an address that is only the machine's.
+                    if inner.here.is_some() && !here {
+                        return Err(LxError::EINVAL);
+                    }
                     let local = self.autobind(&mut inner)?;
                     inner.phase = Phase::Connecting;
                     inner.error = None;
                     inner.remote = Some(peer);
+                    if here {
+                        let from = inner.here.unwrap_or_else(|| self.link.here_for(addr));
+                        inner.local = Some(from);
+                    }
                     self.stream.sync(&inner, false, Event::empty());
-                    Some(local)
+                    Some((local, inner.local))
                 }
                 // `__inet_stream_connect`: a second connect on a socket
                 // that does not wait is told the first is under way; one
@@ -561,7 +711,12 @@ impl Socket for ServedTcpSocket {
                 Phase::Open | Phase::Listening | Phase::Over => return Err(LxError::EISCONN),
             }
         };
-        if let Some(local) = started {
+        if let Some((local, Some(from))) = started.filter(|_| here) {
+            // Made or refused by the time this returns: there is nothing
+            // to be in progress, and the wait below does not wait.
+            let from = IpEndpoint::new(IpAddress::Ipv4(from), local);
+            self.link.join(self.sock, addr, peer.port, from);
+        } else if let Some((local, _)) = started {
             let connect =
                 connect_message(self.sock, addr.0, peer.port, local, STREAM_WINDOW as u32);
             if let Err(e) = self.link.tell(connect, true) {
@@ -591,6 +746,7 @@ impl Socket for ServedTcpSocket {
                     Phase::Connecting => {}
                     _ => {
                         let e = inner.error.take().unwrap_or(LxError::ECONNREFUSED);
+                        inner.local = None;
                         self.stream.sync(&inner, dead, Event::empty());
                         return Err(e);
                     }
@@ -610,10 +766,16 @@ impl Socket for ServedTcpSocket {
         match local.addr {
             IpAddress::Unspecified => {}
             IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address => {}
-            // The stack has one address, and no loopback.
+            // This machine's alone: see `listen`.
+            IpAddress::Ipv4(addr) if addr.is_loopback() => {}
+            // The stack has one address.
             IpAddress::Ipv4(_) => return Err(LxError::EADDRNOTAVAIL),
             _ => return Err(LxError::EAFNOSUPPORT),
         }
+        let here = match local.addr {
+            IpAddress::Ipv4(addr) if addr.is_loopback() => Some(addr),
+            _ => None,
+        };
         let mut inner = self.stream.inner.lock();
         // `inet_bind`: a socket that has a port, or is past needing one,
         // is `EINVAL`.
@@ -623,6 +785,7 @@ impl Socket for ServedTcpSocket {
         let port = self.link.table.lock().stream_ports.take(local.port)?;
         inner.port = Some(port);
         inner.holds_port = true;
+        inner.here = here;
         Ok(0)
     }
 
@@ -642,6 +805,14 @@ impl Socket for ServedTcpSocket {
             inner.phase = Phase::Listening;
             inner.error = None;
             self.stream.sync(&inner, false, Event::empty());
+            // Where the programs of this machine find it.
+            self.link.table.lock().listening.insert(port, self.sock);
+            // Bound to an address of 127.0.0.0/8, it is theirs alone: the
+            // stack, which would bring it what the card hears, is not
+            // told.
+            if inner.here.is_some() {
+                return Ok(0);
+            }
             port
         };
         let listen = listen_message(self.sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
@@ -649,6 +820,8 @@ impl Socket for ServedTcpSocket {
             let mut inner = self.stream.inner.lock();
             inner.phase = Phase::Fresh;
             self.stream.sync(&inner, true, Event::empty());
+            drop(inner);
+            self.stop_listening(Some(port));
             return Err(e);
         }
         Ok(0)
@@ -669,10 +842,14 @@ impl Socket for ServedTcpSocket {
                 if rd {
                     inner.phase = Phase::Fresh;
                     let waiting = core::mem::take(&mut inner.waiting);
+                    let (port, told) = (inner.port, inner.here.is_none());
                     self.stream.sync(&inner, dead, Event::READABLE);
                     drop(inner);
+                    self.stop_listening(port);
                     self.unlisten(waiting);
-                    let _ = self.link.tell(close_message(self.sock), true);
+                    if told {
+                        let _ = self.link.tell(close_message(self.sock), true);
+                    }
                 }
                 Ok(0)
             }
@@ -684,7 +861,7 @@ impl Socket for ServedTcpSocket {
                     .sync(&inner, dead, Event::READABLE | Event::WRITABLE);
                 drop(inner);
                 if fin {
-                    self.link.tell(shutdown_message(self.sock), true)?;
+                    self.link.stream_shutdown(self.sock)?;
                 }
                 Ok(0)
             }
@@ -732,12 +909,13 @@ impl Socket for ServedTcpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.stream.inner.lock();
-        // A connection has the stack's address; a socket that only has a
-        // port has every address, which is the one there is.
-        let addr = match inner.phase {
+        // A connection has the stack's address, or this machine's when it
+        // is to another of its programs; a socket that only has a port has
+        // every address, unless it was bound to one of this machine's.
+        let addr = inner.local.or(inner.here).unwrap_or(match inner.phase {
             Phase::Connecting | Phase::Open | Phase::Over => self.link.address,
             Phase::Fresh | Phase::Listening => Ipv4Address::UNSPECIFIED,
-        };
+        });
         Some(Endpoint::Ip(IpEndpoint::new(
             IpAddress::Ipv4(addr),
             inner.port.unwrap_or(0),
@@ -1363,6 +1541,251 @@ mod tests {
             &[(sock, EV_ACCEPTED, 500, &accepted_bytes(three, HOST, 40005))],
         );
         assert_eq!(stack.told(), Some(close_message(three)));
+    }
+
+    const HERE: [u8; 4] = [127, 0, 0, 1];
+
+    /// A listener on `at`, and what the stack was told of it read.
+    fn listener(stack: &Stack, at: Endpoint) -> ServedTcpSocket {
+        let l = stream(stack);
+        assert_eq!(Socket::bind(&l, at), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        while stack.told().is_some() {}
+        l
+    }
+
+    /// The next connection of `l`, as a socket that does not wait.
+    fn accepted(l: &ServedTcpSocket) -> (Arc<ServedTcpSocket>, IpEndpoint) {
+        let (socket, from) = accept(l).unwrap();
+        let socket = socket.downcast_arc::<ServedTcpSocket>().ok().unwrap();
+        FileLike::set_flags(&*socket, OpenFlags::NON_BLOCK).unwrap();
+        (socket, from)
+    }
+
+    #[test]
+    fn two_programs_of_this_machine_are_joined_and_the_stack_is_not_told() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = listener(&stack, any(8080));
+
+        // Made by the time connect returns, also for a socket that does
+        // not wait: there is nobody to wait for.
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        assert!(status(&c).write);
+        assert!(status(&l).read);
+        let (s, from) = accepted(&l);
+        let port = from.port;
+        assert!(port >= 49152);
+        assert_eq!(from, at(HERE, port));
+        // Each end's addresses are the other's, turned around.
+        assert_eq!(ip(Socket::endpoint(&c).unwrap()), at(HERE, port));
+        assert_eq!(ip(Socket::remote_endpoint(&c).unwrap()), at(HERE, 8080));
+        assert_eq!(ip(Socket::endpoint(&*s).unwrap()), at(HERE, 8080));
+        assert_eq!(ip(Socket::remote_endpoint(&*s).unwrap()), at(HERE, port));
+
+        // What one writes is what the other reads, each way.
+        let mut buf = [0u8; 16];
+        assert_eq!(read(&s, &mut buf), Err(LxError::EAGAIN));
+        assert_eq!(Socket::write(&c, b"hola", None), Ok(4));
+        assert!(status(&s).read);
+        assert_eq!(peek(&s, &mut buf), Ok(4));
+        assert_eq!(read(&s, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"hola");
+        assert_eq!(Socket::write(&*s, b"que tal", None), Ok(7));
+        assert_eq!(read(&c, &mut buf), Ok(7));
+        assert_eq!(&buf[..7], b"que tal");
+
+        // One side says it will write no more: the other reads the end,
+        // and can still write.
+        assert_eq!(Socket::shutdown(&c, 1), Ok(0));
+        assert_eq!(read(&s, &mut buf), Ok(0));
+        assert_eq!(Socket::write(&*s, b"adios", None), Ok(5));
+        assert_eq!(read(&c, &mut buf), Ok(5));
+
+        // The whole of 127.0.0.0/8 is this machine, and so is the stack's
+        // own address, which is then each end's.
+        let other = stream(&stack);
+        assert_eq!(connect(&other, at([127, 0, 0, 53], 8080)), Ok(0));
+        let (s2, from) = accepted(&l);
+        assert_eq!(from.addr, IpAddress::v4(127, 0, 0, 1));
+        assert_eq!(
+            ip(Socket::endpoint(&*s2).unwrap()),
+            at([127, 0, 0, 53], 8080)
+        );
+        let own = stream(&stack);
+        assert_eq!(connect(&own, at(STACK_ADDR, 8080)), Ok(0));
+        let (s3, from) = accepted(&l);
+        assert_eq!(from.addr, IpAddress::Ipv4(Ipv4Address(STACK_ADDR)));
+        assert_eq!(ip(Socket::endpoint(&*s3).unwrap()), at(STACK_ADDR, 8080));
+
+        // None of it was the stack's business, the closes included.
+        drop((c, s, other, s2, own, s3));
+        assert_eq!(stack.told(), None);
+        // The listener is the stack's too: what the card hears for the
+        // port is for it.
+        let closed = l.sock;
+        drop(l);
+        assert_eq!(stack.told(), Some(close_message(closed)));
+    }
+
+    #[test]
+    fn a_connection_within_this_machine_holds_a_window_and_no_more() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = listener(&stack, any(8080));
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let (s, _) = accepted(&l);
+
+        // The writer is taken from until the reader holds a window, and
+        // then waits.
+        let chunk = alloc::vec![7u8; 60000];
+        let mut written = 0;
+        loop {
+            match Socket::write(&c, &chunk, None) {
+                Ok(n) => written += n,
+                Err(e) => {
+                    assert_eq!(e, LxError::EAGAIN);
+                    break;
+                }
+            }
+        }
+        assert_eq!(written, STREAM_WINDOW);
+        assert!(!status(&c).write);
+
+        // Reading less than half a window gives no room back yet; past
+        // half, all that was read.
+        let mut buf = alloc::vec![0u8; STREAM_WINDOW / 2 - 1];
+        assert_eq!(read(&s, &mut buf), Ok(buf.len()));
+        assert!(buf.iter().all(|&b| b == 7));
+        assert!(!status(&c).write);
+        assert_eq!(read(&s, &mut buf[..1]), Ok(1));
+        assert!(status(&c).write);
+        assert_eq!(Socket::write(&c, &chunk, None), Ok(60000));
+        assert_eq!(Socket::write(&c, &chunk, None), Ok(60000));
+        assert_eq!(
+            Socket::write(&c, &chunk, None),
+            Ok(STREAM_WINDOW / 2 - 120000)
+        );
+        assert_eq!(Socket::write(&c, &chunk, None), Err(LxError::EAGAIN));
+        assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn nobody_listening_on_this_machine_is_a_connection_refused() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Err(LxError::ECONNREFUSED));
+        assert_eq!(Socket::take_so_error(&c), 0, "the error was given");
+        // A socket to try again with, anywhere.
+        assert_eq!(
+            ip(Socket::endpoint(&c).unwrap()).addr,
+            IpAddress::v4(0, 0, 0, 0)
+        );
+        let l = listener(&stack, any(8080));
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let (s, _) = accepted(&l);
+
+        // A listener that stops is nobody again, and the connection it
+        // made stays made.
+        assert_eq!(Socket::shutdown(&l, 0), Ok(0));
+        while stack.told().is_some() {}
+        let late = stream(&stack);
+        assert_eq!(connect(&late, at(HERE, 8080)), Err(LxError::ECONNREFUSED));
+        assert_eq!(Socket::write(&c, b"sigue", None), Ok(5));
+        let mut buf = [0u8; 8];
+        assert_eq!(read(&s, &mut buf), Ok(5));
+        assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn an_end_that_closes_is_the_end_and_then_a_reset() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = listener(&stack, any(8080));
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let (s, _) = accepted(&l);
+        assert_eq!(Socket::write(&*s, b"ultimo", None), Ok(6));
+        drop(s);
+
+        // What it wrote first, then the end.
+        let mut buf = [0u8; 8];
+        assert_eq!(read(&c, &mut buf), Ok(6));
+        assert_eq!(read(&c, &mut buf), Ok(0));
+        // Written to nobody: taken, answered with a reset, and a broken
+        // pipe from then on.
+        assert_eq!(Socket::write(&c, b"hay alguien", None), Ok(11));
+        assert_eq!(Socket::write(&c, b"x", None), Err(LxError::ECONNRESET));
+        assert_eq!(Socket::write(&c, b"x", None), Err(LxError::EPIPE));
+        drop(c);
+
+        // A connection nobody accepted, closed by who made it: there to
+        // accept, with what was written and the end.
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        assert_eq!(Socket::write(&c, b"prisa", None), Ok(5));
+        drop(c);
+        let (s, _) = accepted(&l);
+        assert_eq!(read(&s, &mut buf), Ok(5));
+        assert_eq!(read(&s, &mut buf), Ok(0));
+        drop(s);
+
+        // And one nobody accepted when the listener closes: the end, for
+        // who made it.
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let closed = l.sock;
+        drop(l);
+        assert_eq!(read(&c, &mut buf), Ok(0));
+        assert_eq!(stack.told(), Some(close_message(closed)));
+        assert_eq!(stack.told(), None);
+        // Nothing of any of them is left in the table.
+        drop(c);
+        let table = stack.link.table.lock();
+        assert!(table.joined.is_empty());
+        assert!(table.listening.is_empty());
+        assert!(table.streams.is_empty());
+    }
+
+    #[test]
+    fn a_listener_bound_to_this_machine_is_not_the_stacks() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = stream(&stack);
+        assert_eq!(Socket::bind(&l, Endpoint::Ip(at(HERE, 8080))), Ok(0));
+        assert_eq!(ip(Socket::endpoint(&l).unwrap()), at(HERE, 8080));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        // The stack would bring it what the card hears for the port.
+        assert_eq!(stack.told(), None);
+
+        // The address it is bound to, and no other of this machine's.
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        let (s, _) = accepted(&l);
+        assert_eq!(ip(Socket::endpoint(&*s).unwrap()), at(HERE, 8080));
+        for other in [[127, 0, 0, 2], STACK_ADDR] {
+            let c = stream(&stack);
+            assert_eq!(connect(&c, at(other, 8080)), Err(LxError::ECONNREFUSED));
+        }
+
+        // A socket bound there reaches this machine and nothing else.
+        let b = stream(&stack);
+        assert_eq!(Socket::bind(&b, Endpoint::Ip(at(HERE, 0))), Ok(0));
+        assert_eq!(connect(&b, at(HOST, 80)), Err(LxError::EINVAL));
+        assert_eq!(connect(&b, at(HERE, 8080)), Ok(0));
+        // An address that is neither the stack's nor this machine's is
+        // not one to bind to.
+        let no = stream(&stack);
+        assert_eq!(
+            Socket::bind(&no, Endpoint::Ip(at(HOST, 8081))),
+            Err(LxError::EADDRNOTAVAIL)
+        );
+
+        drop((c, s, b, l));
+        assert_eq!(stack.told(), None);
     }
 
     #[test]

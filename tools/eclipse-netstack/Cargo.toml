@@ -33,6 +33,12 @@ path = "src/bin/eclipse-udp-echo.rs"
 name = "eclipse-tcp-echo"
 path = "src/bin/eclipse-tcp-echo.rs"
 
+# A test program: what times TCP against that server from inside the
+# machine.
+[[bin]]
+name = "eclipse-tcp-bench"
+path = "src/bin/eclipse-tcp-bench.rs"
+
 [dependencies]
 libc = "0.2"
 # The system calls, the FIFO, the channel, and what a card's driver offers.
