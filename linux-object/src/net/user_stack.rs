@@ -369,6 +369,48 @@ pub fn parse_event(records: &[u8]) -> Option<(EventRecord<'_>, &[u8])> {
 
 /// What a socket shares with the stack's link: where datagrams are queued
 /// and what says so.
+/// `SO_RCVTIMEO` and `SO_SNDTIMEO` as they were set: how long a socket that
+/// blocks waits in a read or an accept (the first), in a write or a connect
+/// (the second), before the call gives up. All zero waits without limit.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Patience {
+    pub(super) receive: [u8; 16],
+    pub(super) send: [u8; 16],
+}
+
+impl Patience {
+    /// `setsockopt`, when the option is one of the two.
+    pub(super) fn set(&mut self, level: usize, opt: usize, data: &[u8]) -> Option<SysResult> {
+        const SOL_SOCKET: usize = 1;
+        const SO_RCVTIMEO: usize = 20;
+        const SO_SNDTIMEO: usize = 21;
+        if level != SOL_SOCKET || !matches!(opt, SO_RCVTIMEO | SO_SNDTIMEO) {
+            return None;
+        }
+        Some(sockopt_timeval(data).map(|tv| {
+            if opt == SO_RCVTIMEO {
+                self.receive = tv;
+            } else {
+                self.send = tv;
+            }
+            0
+        }))
+    }
+}
+
+/// Where the waits of one call end. Reckoned at the first of them, so a
+/// call that finds what it came for never reads the clock, and kept for
+/// the rest: the time is the call's, not each wait's.
+#[derive(Default)]
+pub(super) struct Until(Option<Option<core::time::Duration>>);
+
+impl Until {
+    /// The end for a call that waits `tv` (a `struct timeval`).
+    pub(super) fn of(&mut self, tv: &[u8; 16]) -> Option<core::time::Duration> {
+        *self.0.get_or_insert_with(|| sockopt_deadline(tv))
+    }
+}
+
 struct Shared {
     /// `READABLE` while the queue holds a datagram (or reading is over),
     /// `WRITABLE` always. Changed under `inner`.
@@ -391,6 +433,7 @@ struct Inner {
     last_msg_flags: i32,
     /// `shutdown(SHUT_RD)`: an empty queue is the end.
     read_closed: bool,
+    patience: Patience,
 }
 
 impl Shared {
@@ -940,6 +983,7 @@ impl ServedUdpSocket {
                 flags: OpenFlags::RDWR,
                 last_msg_flags: 0,
                 read_closed: false,
+                patience: Patience::default(),
             }),
         });
         let sock = {
@@ -972,8 +1016,9 @@ impl ServedUdpSocket {
     /// The next datagram, taken off the queue or only looked at.
     async fn receive(&self, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
         let nobody = || Endpoint::Ip(IpEndpoint::UNSPECIFIED);
+        let mut until = Until::default();
         loop {
-            {
+            let until = {
                 let mut guard = self.shared.inner.lock();
                 let inner = &mut *guard;
                 let remote = inner.remote;
@@ -1006,11 +1051,12 @@ impl ServedUdpSocket {
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
                     return (Err(LxError::EAGAIN), nobody());
                 }
-            }
-            // Woken by a datagram, or ended by a signal.
-            if let Err(e) =
-                crate::sync::wait_for_event(self.shared.bus.clone(), Event::READABLE).await
-            {
+                until.of(&inner.patience.receive)
+            };
+            // Woken by a datagram, or ended by a signal or by `SO_RCVTIMEO`
+            // (`EAGAIN`).
+            let bus = self.shared.bus.clone();
+            if let Err(e) = crate::sync::wait_for_event_until(bus, Event::READABLE, until).await {
                 return (Err(e), nobody());
             }
         }
@@ -1176,6 +1222,19 @@ impl Socket for ServedUdpSocket {
     fn take_msg_flags(&self) -> i32 {
         core::mem::take(&mut self.shared.inner.lock().last_msg_flags)
     }
+
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        let kept = self.shared.inner.lock().patience.set(level, opt, data);
+        kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
+    }
+
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.shared.inner.lock().patience.receive
+    }
+
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.shared.inner.lock().patience.send
+    }
 }
 
 impl_kobject!(ServedUdpSocket);
@@ -1220,14 +1279,19 @@ impl FileLike for ServedUdpSocket {
         })
     }
 
+    /// The wait of a read that blocks (a `splice` from the socket): it
+    /// ends with `SO_RCVTIMEO` as the read's own does.
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        let mut until = Until::default();
         loop {
             let status = FileLike::poll(self, events)?;
             let (want_read, want_write) = (events.wants_read(), events.wants_write());
             if (want_read && status.read) || want_write || !want_read {
                 return Ok(status);
             }
-            crate::sync::wait_for_event(self.shared.bus.clone(), Event::READABLE).await?;
+            let until = until.of(&self.shared.inner.lock().patience.receive);
+            let bus = self.shared.bus.clone();
+            crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
         }
     }
 
@@ -1976,6 +2040,44 @@ mod tests {
         let closed = a.sock;
         drop(a);
         assert_eq!(next.told(), Some(close_message(closed)));
+    }
+
+    #[test]
+    fn a_datagram_read_waits_as_long_as_so_rcvtimeo_says() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let s = stack.socket();
+        assert_eq!(Socket::bind(&s, any(5300)), Ok(0));
+        FileLike::set_flags(&s, OpenFlags::empty()).unwrap();
+
+        let mut tv = [0u8; 16];
+        tv[8..].copy_from_slice(&30_000i64.to_ne_bytes());
+        assert_eq!(Socket::so_rcvtimeo(&s), [0u8; 16]);
+        assert_eq!(Socket::setsockopt(&s, 1, 20, &tv), Ok(0));
+        assert_eq!(Socket::so_rcvtimeo(&s), tv);
+        // SO_SNDTIMEO is kept too, and waits for nothing: a datagram that
+        // cannot be sent is refused.
+        assert_eq!(Socket::setsockopt(&s, 1, 21, &tv), Ok(0));
+        assert_eq!(Socket::so_sndtimeo(&s), tv);
+        let mut wrong = tv;
+        wrong[8..].copy_from_slice(&(-1i64).to_ne_bytes());
+        assert_eq!(Socket::setsockopt(&s, 1, 20, &wrong), Err(LxError::EINVAL));
+        // What it keeps nowhere is answered as before.
+        assert_eq!(Socket::setsockopt(&s, 1, 6, &1u32.to_ne_bytes()), Ok(0));
+        assert_eq!(
+            Socket::setsockopt(&s, 6, 1, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+
+        // Nothing comes: the read gives up when the time is over and not
+        // before, and the socket is as it was.
+        let mut buf = [0u8; 16];
+        let before = kernel_hal::timer::timer_now();
+        assert_eq!(recv(&s, &mut buf).0, Err(LxError::EAGAIN));
+        let took = kernel_hal::timer::timer_now() - before;
+        assert!(took >= core::time::Duration::from_millis(30), "{:?}", took);
+        stack.arrives(s.sock, HOST, 53, b"tarde");
+        assert_eq!(recv(&s, &mut buf), (Ok(5), at(HOST, 53)));
     }
 
     /// A socket of `link` that does not wait.

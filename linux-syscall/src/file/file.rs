@@ -479,10 +479,14 @@ impl Syscall<'_> {
                     // A blocking pipe writer waits for room and carries on:
                     // `pipe_write` returns only once every byte is in (or a
                     // signal cuts it short), never `EAGAIN`.
-                    AfterWriteError::Wait => {
-                        file_like.async_poll(PollEvents::OUT).await?;
-                        continue;
-                    }
+                    // What ends the wait instead of room (a signal, the
+                    // socket's `SO_SNDTIMEO`) ends the write: what is
+                    // already in stands, or else that is the answer.
+                    AfterWriteError::Wait => match file_like.async_poll(PollEvents::OUT).await {
+                        Ok(_) => continue,
+                        Err(_) if written > 0 => break,
+                        Err(e) => return Err(e),
+                    },
                     // A later chunk failing (e.g. EAGAIN once the socket
                     // buffer filled) must report the bytes already consumed,
                     // not the error — POSIX partial write. Erroring would
@@ -770,9 +774,13 @@ impl Syscall<'_> {
                     }
                 }
                 Err(e) => match after_write_error(e, waits, written) {
-                    AfterWriteError::Wait => {
-                        file_like.async_poll(PollEvents::OUT).await?;
-                    }
+                    // As in `sys_write`: a wait that ends without room
+                    // leaves what is already in as the answer.
+                    AfterWriteError::Wait => match file_like.async_poll(PollEvents::OUT).await {
+                        Ok(_) => {}
+                        Err(_) if written > 0 => break,
+                        Err(e) => return Err(e),
+                    },
                     // Progress already made: report the partial count; the
                     // error will surface on the caller's next write. Erroring
                     // here instead would make the caller believe NOTHING was

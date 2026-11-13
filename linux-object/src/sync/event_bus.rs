@@ -545,11 +545,26 @@ pub fn wait_for_event(
     bus: Arc<Mutex<EventBus>>,
     mask: Event,
 ) -> impl Future<Output = crate::error::LxResult<Event>> {
+    wait_for_event_until(bus, mask, None)
+}
+
+/// [`wait_for_event`] that gives up at `deadline` (a `timer_now` instant)
+/// with `EAGAIN`, which is what a socket read or write answers when its
+/// `SO_RCVTIMEO` or `SO_SNDTIMEO` runs out. `None` waits without limit.
+///
+/// The wait is woken AT the deadline, not at the next backstop tick after
+/// it: a timeout of 20 ms is 20 ms.
+pub fn wait_for_event_until(
+    bus: Arc<Mutex<EventBus>>,
+    mask: Event,
+    deadline: Option<Duration>,
+) -> impl Future<Output = crate::error::LxResult<Event>> {
     EventBusFuture {
         bus,
         mask,
         sub_id: None,
         timer: None,
+        deadline,
     }
 }
 
@@ -563,6 +578,8 @@ struct EventBusFuture {
     /// place on re-polls, cancelled on Ready and on Drop so a late tick cannot
     /// wake a finished task. See [`INTERRUPT_CHECK_TICK_MS`].
     timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+    /// When the wait gives up with `EAGAIN`: see [`wait_for_event_until`].
+    deadline: Option<Duration>,
 }
 
 impl Drop for EventBusFuture {
@@ -642,8 +659,20 @@ impl Future for EventBusFuture {
             kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
             return Poll::Ready(Err(err));
         }
-        let deadline =
+        let mut deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS));
+        // A wait with an end of its own: `EAGAIN` once it is past, and
+        // until then the timer wakes it there and not a tick later.
+        if let Some(until) = this.deadline {
+            if kernel_hal::timer::timer_now() >= until {
+                if let Some(id) = this.sub_id.take() {
+                    this.bus.lock().unsubscribe(id);
+                }
+                kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                return Poll::Ready(Err(crate::error::LxError::EAGAIN));
+            }
+            deadline = deadline.min(until);
+        }
         if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
             cx.waker().wake_by_ref();
         }
@@ -903,6 +932,40 @@ mod interruptible_wait_tests {
     /// wait as `ESRCH`/`EINTR` just the same -- whatever the check answers is
     /// what the caller gets, unchanged. A wait that translated one error into
     /// another would hide which of the two it was.
+    /// A wait that was given an end comes back with `EAGAIN` once it is
+    /// past and leaves nothing parked; before it, it waits like another,
+    /// and what is on the bus is still the answer after it.
+    #[test]
+    fn a_wait_with_an_end_gives_up_there_and_not_before() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+
+        let far = kernel_hal::timer::deadline_after(Duration::from_secs(3600));
+        let mut fut = wait_for_event_until(bus.clone(), Event::READABLE, Some(far));
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        drop(fut);
+
+        let past = kernel_hal::timer::timer_now();
+        let mut fut = wait_for_event_until(bus.clone(), Event::READABLE, Some(past));
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Err(LxError::EAGAIN))
+        ));
+        assert_eq!(bus.lock().callbacks.len(), 0);
+
+        bus.lock().set(Event::READABLE);
+        let mut fut = wait_for_event_until(bus.clone(), Event::READABLE, Some(past));
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Ok(Event::READABLE))
+        ));
+    }
+
     #[test]
     fn the_reason_for_the_interruption_reaches_the_caller_unchanged() {
         let _restore = Restore;
