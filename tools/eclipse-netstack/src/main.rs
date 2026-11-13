@@ -2,6 +2,8 @@
 //! a network stack for virtio network card `N`, in this process, with the
 //! address `ADDR` or the one a DHCP server leases it. What is not for the
 //! card's network goes to the gateway, the one written or the lease's.
+//! When the machine's network settings name the card, what they say is
+//! used and not the command line (`netstack::governed`).
 //!
 //! The card must be one the kernel left to userspace
 //! (`udriver=virtio-net@N` on its command line) and that no driver has: this
@@ -50,6 +52,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use netstack::governed;
 use netstack::port::Port;
 use netstack::resolv::{self, Applied};
 use netstack::socks::lease::{Addressing, Lease};
@@ -191,6 +194,9 @@ struct Shared {
 struct Host {
     index: usize,
     mac: [u8; 6],
+    /// What the machine's network settings said for this card when the
+    /// stack started, as they said it ([`governed`]).
+    governed: Option<String>,
     shared: Mutex<Shared>,
     /// The kernel's sockets, from when it was told this stack's address.
     kernel: OnceLock<Arc<Kernel>>,
@@ -605,6 +611,21 @@ fn main() {
 
     let (mut link, port) = start(index).unwrap_or_else(|e| die(e));
     let mac = link.mac;
+    // The machine's settings for this card, when they say any, and not
+    // the command line.
+    let governed = governed::word(Path::new(governed::DIR), mac);
+    let how = match governed.as_deref().map(Addressing::parse) {
+        None => how,
+        Some(Some(theirs)) => theirs,
+        Some(None) => {
+            println!(
+                "{NAME}: {} says {:?}, which is no address: the command line's stands",
+                governed::path(Path::new(governed::DIR), mac).display(),
+                governed.as_deref().unwrap_or_default()
+            );
+            how
+        }
+    };
     // No address is what an interface that asks for one starts with.
     let address = match how {
         Addressing::Written(address, _) => address,
@@ -626,6 +647,7 @@ fn main() {
     let host = Arc::new(Host {
         index,
         mac,
+        governed,
         shared: Mutex::new(Shared {
             stack,
             fifo: link.fifo.clone(),
@@ -700,7 +722,8 @@ fn main() {
 }
 
 /// Say what this stack is (see `udrivers::status`): the card, its address
-/// and where that came from, the gateway and the lease's name servers, the
+/// and where that came from, what the machine's network settings said for
+/// it, the gateway and the lease's name servers, the
 /// driver it runs now and how many it has started, which eclipse-init
 /// never sees. lunarmon's SERVIDORES list reads it.
 fn publish(host: &Host) {
@@ -716,6 +739,11 @@ fn publish(host: &Host) {
         )
     };
     let device = format!("virtio-net@{}", host.index);
+    let from = match (leases, &host.governed) {
+        (true, _) => "dhcp",
+        (false, Some(_)) => "network settings",
+        (false, None) => "command line",
+    };
     let or_none = |text: Option<String>| text.unwrap_or_else(|| "none".into());
     let dns: Vec<String> = dns.iter().map(|server| server.to_string()).collect();
     status::publish(
@@ -725,7 +753,8 @@ fn publish(host: &Host) {
             ("device", &device),
             ("mac", &status::mac_text(host.mac)),
             ("addr", &or_none(address.map(|a| a.to_string()))),
-            ("addr_from", if leases { "dhcp" } else { "command line" }),
+            ("addr_from", from),
+            ("governed", host.governed.as_deref().unwrap_or("none")),
             ("gateway", &or_none(gateway.map(|g| g.to_string()))),
             ("dns", &or_none((!dns.is_empty()).then(|| dns.join(",")))),
             (

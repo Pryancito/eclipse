@@ -20,8 +20,9 @@
 //! other socket is the kernel's stack's; or all of them, on a boot with
 //! `unetuse=all`. The address is written on the command
 //! line or leased from a DHCP server, and one gateway carries what is not
-//! for the card's network ([`socks::lease`]); the name servers of a lease
-//! go to `/etc/resolv.conf` ([`resolv`]). IPv4 only, and no
+//! for the card's network ([`socks::lease`]); the machine's network
+//! settings say which instead when they name the card ([`governed`]); the
+//! name servers of a lease go to `/etc/resolv.conf` ([`resolv`]). IPv4 only, and no
 //! fragments: a program's `AF_INET6` socket is served too, and carries
 //! IPv4 (`::` is every address, `::ffff:a.b.c.d` is `a.b.c.d`).
 //!
@@ -38,6 +39,7 @@
 //! kernel's stack from the host, and `eclipse-tcp-bench` from a program of
 //! the guest, which is how what never reaches the card is timed.
 
+pub mod governed;
 pub mod port;
 pub mod resolv;
 pub mod socks;

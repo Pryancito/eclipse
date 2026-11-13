@@ -479,6 +479,106 @@ pub fn to_configure(sys: &Path, servers: &Path) -> (Vec<String>, bool) {
     (names, !cards.is_empty())
 }
 
+/// Where a stack that runs as a process looks for what this file says for
+/// its card: a file named after the card's address, holding a word as the
+/// stack's command line (`eclipse-netstack`'s `governed`). The stack has
+/// no interface name to look itself up by when it starts.
+pub const STACK_SETTINGS: &str = "/etc/eclipse/netstack";
+
+/// The card of a stack that runs as a process, among the machine's
+/// interfaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackCard {
+    /// The interface's name.
+    pub name: String,
+    /// Its address, as sysfs writes one.
+    pub mac: String,
+    /// The process that published it; it may be gone by now.
+    pub pid: Option<i32>,
+    /// What the settings said for the card when that stack started: the
+    /// `governed=` of its file (`None` for `none`, and for a stack from
+    /// before there was such a line).
+    pub governed: Option<String>,
+}
+
+/// The cards of the stacks that run as processes which the machine shows
+/// among its interfaces, each with what its stack published.
+pub fn stacks(sys: &Path, servers: &Path) -> Vec<StackCard> {
+    let files = std::fs::read_dir(servers).map(|rd| rd.flatten().collect()).unwrap_or_else(|_| Vec::new());
+    let mut texts: Vec<(std::path::PathBuf, String)> = files
+        .iter()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("stack.") && !n.ends_with(".tmp")))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok().map(|t| (e.path(), t)))
+        .collect();
+    texts.sort();
+    let mut cards = Vec::new();
+    for name in interfaces(sys) {
+        let mac = std::fs::read_to_string(sys.join(&name).join("address")).map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+        let value = |text: &str, key: &str| text.lines().find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()));
+        let Some((_, text)) = texts.iter().find(|(_, t)| value(t, "mac=").is_some_and(|m| m.to_ascii_lowercase() == mac)) else {
+            continue;
+        };
+        cards.push(StackCard {
+            name,
+            mac,
+            pid: value(text, "pid=").and_then(|p| p.parse().ok()),
+            governed: value(text, "governed=").filter(|g| g != "none" && !g.is_empty()),
+        });
+    }
+    cards
+}
+
+/// What the file means for the card of a stack that runs as a process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackWish {
+    /// The stack is to have this addressing: `dhcp`, `ADDR/PREFIX` or
+    /// `ADDR/PREFIX,GATEWAY`.
+    Word(String),
+    /// The file does not name the interface: the stack keeps what its
+    /// command line says, which is the boot's.
+    CommandLine,
+    /// The file names it and says what a stack cannot be told (IPv4 off,
+    /// an address that is none): it stays as it is.
+    Leave,
+}
+
+/// What `ifaces` wants of the stack whose card is the interface `name`.
+/// Only its IPv4: the stack has no IPv6.
+pub fn stack_wish(ifaces: &[Iface], name: &str) -> StackWish {
+    let Some(i) = ifaces.iter().find(|i| i.name == name) else {
+        return StackWish::CommandLine;
+    };
+    let problems = check(i);
+    let has = |f| problems.iter().any(|p| p.field == f);
+    match i.v4 {
+        V4::Dhcp => StackWish::Word("dhcp".into()),
+        V4::Off => StackWish::Leave,
+        V4::Static => match cidr4(&i.address4) {
+            Some((a, n)) if !has(Field::Address4) => {
+                let gateway = i.gateway4.trim();
+                if gateway.is_empty() || has(Field::Gateway4) {
+                    StackWish::Word(format!("{a}/{n}"))
+                } else {
+                    StackWish::Word(format!("{a}/{n},{gateway}"))
+                }
+            }
+            _ => StackWish::Leave,
+        },
+    }
+}
+
+/// What is to be written for `card` so that its stack is as `wish` says,
+/// when that is not what the stack started with: `Some(Some(word))` for
+/// a word to leave it, `Some(None)` to take the word away, `None` when
+/// there is nothing to change.
+pub fn stack_change(card: &StackCard, wish: &StackWish) -> Option<Option<String>> {
+    match wish {
+        StackWish::Leave => None,
+        StackWish::CommandLine => card.governed.is_some().then_some(None),
+        StackWish::Word(word) => (card.governed.as_deref() != Some(word)).then(|| Some(word.clone())),
+    }
+}
+
 /// The interfaces that are the card of a stack that runs as a process:
 /// the ones [`to_configure`] leaves out.
 pub fn of_stacks(sys: &Path, servers: &Path) -> Vec<String> {
@@ -729,6 +829,66 @@ mod tests {
         assert_eq!(to_configure(&sys, &servers), (Vec::new(), true));
         // What still shows it is the list for the panel.
         assert_eq!(interfaces(&sys), ["eth0"]);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn the_file_governs_the_stack_whose_card_it_names() {
+        let top = std::env::temp_dir().join(format!("lunarnet-stackwish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (sys, servers) = (top.join("sys"), top.join("servers"));
+        for (n, mac) in [("eth0", "52:54:00:12:34:56"), ("eth1", "52:54:00:AA:BB:CC")] {
+            std::fs::create_dir_all(sys.join(n)).unwrap();
+            std::fs::write(sys.join(n).join("address"), format!("{mac}\n")).unwrap();
+        }
+        std::fs::create_dir_all(&servers).unwrap();
+        // No stack, and one whose card the machine does not show.
+        assert!(stacks(&sys, &servers).is_empty());
+        std::fs::write(servers.join("stack.virtio-net@3"), "pid=9\nmac=52:54:00:00:00:03\ngoverned=dhcp\n").unwrap();
+        assert!(stacks(&sys, &servers).is_empty());
+        // One from before stacks said what governed them, and one that
+        // says it.
+        std::fs::write(servers.join("stack.virtio-net@0"), "pid=8\nmac=52:54:00:12:34:56\naddr=10.0.9.15/24\n").unwrap();
+        std::fs::write(servers.join("stack.virtio-net@1"), "pid=x\nmac=52:54:00:aa:bb:cc\ngoverned=10.0.9.20/24,10.0.9.1\n").unwrap();
+        let cards = stacks(&sys, &servers);
+        let card = |name: &str, mac: &str, pid, governed: Option<&str>| StackCard {
+            name: name.into(),
+            mac: mac.into(),
+            pid,
+            governed: governed.map(str::to_string),
+        };
+        assert_eq!(
+            cards,
+            [card("eth0", "52:54:00:12:34:56", Some(8), None), card("eth1", "52:54:00:aa:bb:cc", None, Some("10.0.9.20/24,10.0.9.1"))]
+        );
+        std::fs::write(servers.join("stack.virtio-net@0"), "pid=8\nmac=52:54:00:12:34:56\ngoverned=none\n").unwrap();
+        assert_eq!(stacks(&sys, &servers)[0].governed, None);
+
+        // An interface the file does not name is the command line's.
+        let word = |w: &str| StackWish::Word(w.into());
+        let file = |text: &str| parse(text);
+        assert_eq!(stack_wish(&file("iface=eth1\nipv4=dhcp\n"), "eth0"), StackWish::CommandLine);
+        // One it names is as it says.
+        assert_eq!(stack_wish(&file("iface=eth0\nipv4=dhcp\n"), "eth0"), word("dhcp"));
+        assert_eq!(stack_wish(&file("iface=eth0\nipv6=auto\n"), "eth0"), word("dhcp"));
+        let fixed = "iface=eth0\nipv4=static\naddress4=10.0.9.20/24\n";
+        assert_eq!(stack_wish(&file(fixed), "eth0"), word("10.0.9.20/24"));
+        let with = |gateway: &str| file(&format!("{fixed}gateway4={gateway}\n"));
+        assert_eq!(stack_wish(&with("10.0.9.1"), "eth0"), word("10.0.9.20/24,10.0.9.1"));
+        // A gateway that is none is left out, as it is for a card of the
+        // kernel's; an address that is none, or no IPv4, cannot be said.
+        assert_eq!(stack_wish(&with("192.168.1.1"), "eth0"), word("10.0.9.20/24"));
+        assert_eq!(stack_wish(&file("iface=eth0\nipv4=static\naddress4=10.0.9.300/24\n"), "eth0"), StackWish::Leave);
+        assert_eq!(stack_wish(&file("iface=eth0\nipv4=off\n"), "eth0"), StackWish::Leave);
+
+        // The stack is told only what it does not have already.
+        let (free, held) = (&cards[0], &cards[1]);
+        assert_eq!(stack_change(free, &StackWish::CommandLine), None);
+        assert_eq!(stack_change(free, &word("dhcp")), Some(Some("dhcp".into())));
+        assert_eq!(stack_change(held, &word("10.0.9.20/24,10.0.9.1")), None);
+        assert_eq!(stack_change(held, &word("dhcp")), Some(Some("dhcp".into())));
+        assert_eq!(stack_change(held, &StackWish::CommandLine), Some(None));
+        assert_eq!(stack_change(held, &StackWish::Leave), None);
         let _ = std::fs::remove_dir_all(&top);
     }
 
