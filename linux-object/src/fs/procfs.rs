@@ -1562,9 +1562,9 @@ impl ProcNetDirINode {
     /// path -- got a directory shaped like nothing else in the tree. `find`
     /// answered them from `find()`, which is why a lookup by name worked and
     /// only the listing was short.
-    fn entries() -> [&'static str; 9] {
+    fn entries() -> [&'static str; 11] {
         [
-            ".", "..", "dev", "route", "arp", "if_inet6", "tcp", "udp", "unix",
+            ".", "..", "dev", "route", "arp", "if_inet6", "tcp", "udp", "unix", "tcp6", "udp6",
         ]
     }
 }
@@ -1610,6 +1610,8 @@ impl INode for ProcNetDirINode {
             "tcp" => Ok(PROC_NET_TCP.clone()),
             "udp" => Ok(PROC_NET_UDP.clone()),
             "unix" => Ok(PROC_NET_UNIX.clone()),
+            "tcp6" => Ok(PROC_NET_TCP6.clone()),
+            "udp6" => Ok(PROC_NET_UDP6.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -2879,6 +2881,14 @@ fn proc_net_tcp_content() -> String {
 
 fn proc_net_udp_content() -> String {
     crate::net::proc_net_udp_content()
+}
+
+fn proc_net_tcp6_content() -> String {
+    crate::net::proc_net_tcp6_content()
+}
+
+fn proc_net_udp6_content() -> String {
+    crate::net::proc_net_udp6_content()
 }
 
 fn proc_net_unix_content() -> String {
@@ -4594,6 +4604,14 @@ lazy_static! {
         inode: 72,
         generate: proc_net_unix_content,
     });
+    static ref PROC_NET_TCP6: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 88,
+        generate: proc_net_tcp6_content,
+    });
+    static ref PROC_NET_UDP6: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 89,
+        generate: proc_net_udp6_content,
+    });
     static ref PROC_KBD: Arc<dyn INode> = Arc::new(ProcSysWritableINode {
         inode: 73,
         generate: proc_kbd_content,
@@ -5043,10 +5061,12 @@ mod dir_shape_tests {
         assert_eq!(names.first().map(|s| s.as_str()), Some("."));
         assert_eq!(names.get(1).map(|s| s.as_str()), Some(".."));
         // And the tables are still all there, after the two.
-        for table in ["dev", "route", "arp", "if_inet6", "tcp", "udp", "unix"] {
+        for table in [
+            "dev", "route", "arp", "if_inet6", "tcp", "udp", "unix", "tcp6", "udp6",
+        ] {
             assert!(names.iter().any(|n| n == table), "{} is listed", table);
         }
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 11);
     }
 
     /// Every listed name resolves, which is the property that makes a listing

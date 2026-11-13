@@ -37,6 +37,9 @@ pub(super) struct Stream {
     /// and [`failed`] say. Changed under `inner`.
     bus: Arc<Mutex<EventBus>>,
     inner: Mutex<Inner>,
+    /// An `AF_INET6` socket's, and so are the connections that arrive on
+    /// it: which table lists it.
+    v6: bool,
 }
 
 struct Inner {
@@ -172,10 +175,11 @@ fn failed(inner: &Inner) -> bool {
 }
 
 impl Stream {
-    fn new(inner: Inner) -> Arc<Stream> {
+    fn new(inner: Inner, v6: bool) -> Arc<Stream> {
         let stream = Arc::new(Stream {
             bus: Arc::new(Mutex::new(EventBus::default())),
             inner: Mutex::new(inner),
+            v6,
         });
         stream.sync(&stream.inner.lock(), Event::empty());
         stream
@@ -262,6 +266,7 @@ impl Stream {
             remote: inner.remote.filter(|_| inner.phase != Phase::Listening),
             state,
             unread: inner.queued,
+            v6: self.v6,
         })
     }
 }
@@ -281,8 +286,8 @@ fn parse_accepted(bytes: &[u8]) -> Option<(u64, IpEndpoint)> {
 }
 
 impl StackLink {
-    /// The stream sockets as `/proc/net/tcp` lists them, in the order of
-    /// their numbers: the ones that listen, connect or are connected,
+    /// The stream sockets as `/proc/net/tcp` and `/proc/net/tcp6` list
+    /// them between the two, in the order of their numbers: the ones that listen, connect or are connected,
     /// the connections nobody accepted yet among them, and both ends of
     /// one between two programs of this machine.
     pub fn listed_streams(&self) -> Vec<Listed> {
@@ -357,7 +362,7 @@ impl StackLink {
                         child.credit = (number as usize).min(CREDIT_MAX);
                         child.port = inner.port;
                         child.remote = Some(from);
-                        let child = Stream::new(child);
+                        let child = Stream::new(child, stream.v6);
                         table.streams.insert(new, Arc::downgrade(&child));
                         drop(table);
                         inner.waiting.push_back((new, child));
@@ -452,7 +457,7 @@ impl StackLink {
             child.port = inner.port;
             child.local = Some(to);
             child.remote = Some(from);
-            let child = Stream::new(child);
+            let child = Stream::new(child, listener.v6);
             let new = {
                 let mut table = self.table.lock();
                 table.next_sock += 1;
@@ -551,7 +556,7 @@ pub struct ServedTcpSocket {
 impl ServedTcpSocket {
     /// A socket of `link`, `AF_INET6` when `v6`.
     pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
-        let stream = Stream::new(Inner::new(Phase::Fresh));
+        let stream = Stream::new(Inner::new(Phase::Fresh), v6);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;
@@ -1560,6 +1565,7 @@ mod tests {
             remote,
             state,
             unread,
+            v6: false,
         };
         // A socket that is neither connected nor listening is in no
         // table, with a port or without.
@@ -1679,18 +1685,21 @@ mod tests {
                     remote: Some(at(here, port)),
                     state: TCP_ESTABLISHED,
                     unread: 0,
+                    v6: false,
                 },
                 Listed {
                     local: at(here, port),
                     remote: Some(at(here, 8090)),
                     state: TCP_ESTABLISHED,
                     unread: 0,
+                    v6: false,
                 },
                 Listed {
                     local: at(here, 8090),
                     remote: None,
                     state: TCP_LISTEN,
                     unread: 0,
+                    v6: false,
                 },
             ]
         );
@@ -2040,6 +2049,15 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(Socket::write(&c, b"hola", None), Ok(4));
         assert_eq!(read(&s, &mut buf), Ok(4));
+
+        // The listener and what it accepted are the IPv6 table's, with
+        // the IPv4 addresses they have, and the program that connected
+        // is the IPv4 table's.
+        let listed = stack.link.listed_streams();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.iter().all(|row| row.v6 == (row.local.port == 8080)));
+        assert_eq!(listed.iter().filter(|row| row.v6).count(), 2);
+        assert_eq!(listed[0].local, at([0, 0, 0, 0], 8080));
 
         // `::1` is this machine too.
         let c6 = stream6();
