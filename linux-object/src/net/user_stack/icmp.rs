@@ -40,6 +40,56 @@ pub(super) fn echo_reply_ident(message: &[u8]) -> Option<u16> {
         .then(|| u16::from_be_bytes([message[4], message[5]]))
 }
 
+/// ICMP's destination unreachable and time exceeded: the messages about
+/// something that was sent and not delivered.
+const UNREACHABLE: u8 = 3;
+const TIME_EXCEEDED: u8 = 11;
+
+/// What a program is told when an ICMP message of this type and code
+/// says that something its socket sent was not delivered, and whether
+/// that is an error that does not mend by itself: Linux's table
+/// (`icmp_err_convert`) and what `__udp4_lib_err` adds to it. `None` for
+/// a message that is not about that.
+///
+/// A connect under way ends with the error, mending or not
+/// (`tcp_v4_err`). A datagram socket's program hears only of the ones
+/// that do not mend, and only on a connected socket.
+///
+/// Two codes nobody sends any more have on Linux an error this kernel
+/// has no name for, and say the nearest: the destination host is unknown
+/// (7, `EHOSTDOWN`) and the source is isolated (8, `ENONET`).
+pub(super) fn undelivered_error(kind: u8, code: u8) -> Option<(LxError, bool)> {
+    use LxError::*;
+    match (kind, code) {
+        (TIME_EXCEEDED, _) => Some((EHOSTUNREACH, false)),
+        (UNREACHABLE, code) => Some(match code {
+            // The network, the host: a router's word, which may change.
+            0 | 11 => (ENETUNREACH, false),
+            1 | 12 => (EHOSTUNREACH, false),
+            // The protocol, the port: the host's own word.
+            2 => (ENOPROTOOPT, true),
+            3 => (ECONNREFUSED, true),
+            // Too long for the way, and not to be cut.
+            4 => (EMSGSIZE, true),
+            5 => (EOPNOTSUPP, false),
+            6 | 8 | 9 => (ENETUNREACH, true),
+            7 | 10 | 13 | 14 | 15 => (EHOSTUNREACH, true),
+            _ => (EHOSTUNREACH, false),
+        }),
+        _ => None,
+    }
+}
+
+/// The error of a connect that a `FAILED` says ended because of an ICMP
+/// message, whose type and code are its `bytes`: `None` when it carries
+/// none, or none that means anything.
+pub(super) fn connect_error(bytes: &[u8]) -> Option<LxError> {
+    let &[kind, code] = bytes else {
+        return None;
+    };
+    undelivered_error(kind, code).map(|(error, _)| error)
+}
+
 /// The Internet checksum of `bytes`: 0 for what carries its own and has
 /// it right.
 fn checksum(bytes: &[u8]) -> u16 {
@@ -567,6 +617,51 @@ mod tests {
         let from = Ipv4Address(HOST);
         let packet = packet(from, Ipv4Address(STACK_ADDR), 57, message);
         stack.arrives(HEARD, HOST, 0, &packet);
+    }
+
+    #[test]
+    fn what_was_not_delivered_is_the_error_linux_says() {
+        use LxError::*;
+        // `icmp_err_convert`, code by code, and whether it mends.
+        let table = [
+            (ENETUNREACH, false),
+            (EHOSTUNREACH, false),
+            (ENOPROTOOPT, true),
+            (ECONNREFUSED, true),
+            (EMSGSIZE, true),
+            (EOPNOTSUPP, false),
+            (ENETUNREACH, true),
+            (EHOSTUNREACH, true),
+            (ENETUNREACH, true),
+            (ENETUNREACH, true),
+            (EHOSTUNREACH, true),
+            (ENETUNREACH, false),
+            (EHOSTUNREACH, false),
+            (EHOSTUNREACH, true),
+            (EHOSTUNREACH, true),
+            (EHOSTUNREACH, true),
+        ];
+        for (code, said) in table.iter().enumerate() {
+            assert_eq!(
+                undelivered_error(3, code as u8),
+                Some(*said),
+                "code {}",
+                code
+            );
+        }
+        assert_eq!(undelivered_error(3, 16), Some((EHOSTUNREACH, false)));
+        // Out of hops, in transit or in pieces.
+        assert_eq!(undelivered_error(11, 0), Some((EHOSTUNREACH, false)));
+        assert_eq!(undelivered_error(11, 1), Some((EHOSTUNREACH, false)));
+        // An echo, its answer, a redirect: about nothing that was sent.
+        for kind in [0, 5, 8, 12] {
+            assert_eq!(undelivered_error(kind, 0), None, "type {}", kind);
+        }
+        assert_eq!(connect_error(&[3, 1]), Some(EHOSTUNREACH));
+        assert_eq!(connect_error(&[3, 3]), Some(ECONNREFUSED));
+        assert_eq!(connect_error(&[]), None);
+        assert_eq!(connect_error(&[3, 1, 0]), None);
+        assert_eq!(connect_error(&[8, 0]), None);
     }
 
     #[test]

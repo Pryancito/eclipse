@@ -41,6 +41,10 @@
 //! hears, behind an IPv4 header written here. The stack answers the
 //! echoes that arrive, heard or not.
 //!
+//! Heard or not, too, the stack reads the ICMP messages that say that
+//! something it sent was not delivered, and tells the kernel whose it
+//! was ([`undelivered`]).
+//!
 //! A stream socket is the same bargain with more to say, and [`tcp`] has
 //! it: the connection is a smoltcp socket here, and an `EVENTS` carries
 //! what a turn made of every connection.
@@ -64,7 +68,9 @@ use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
 
 pub mod lease;
 pub mod tcp;
+pub mod undelivered;
 use tcp::{OP_CONNECT, OP_LISTEN, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
+use undelivered::{Undelivered, EV_UNDELIVERED};
 
 /// The operations of a message.
 pub const OP_BIND: u32 = 1;
@@ -161,6 +167,23 @@ pub enum Arrived {
     More,
 }
 
+/// A socket that every IPv4 packet of ICMP reaches, whole, and that sends
+/// whole packets of it: `room` is the longest.
+fn ear(room: usize) -> RawSocket<'static> {
+    let buffer = |packets: usize| {
+        RawSocketBuffer::new(
+            vec![RawPacketMetadata::EMPTY; packets],
+            vec![0u8; packets * room],
+        )
+    };
+    RawSocket::new(
+        IpVersion::Ipv4,
+        IpProtocol::Icmp,
+        buffer(RX_DATAGRAMS),
+        buffer(TX_DATAGRAMS),
+    )
+}
+
 /// An interface and the sockets the kernel has on it.
 pub struct Stack<D: for<'d> Device<'d>> {
     iface: Interface<'static, D>,
@@ -169,9 +192,11 @@ pub struct Stack<D: for<'d> Device<'d>> {
     socks: BTreeMap<u64, SocketHandle>,
     /// The sockets that hear ICMP.
     hearing: BTreeSet<u64>,
-    /// What hears for them, while there is one: a socket that every
-    /// IPv4 packet of ICMP reaches, and that sends theirs.
-    ear: Option<SocketHandle>,
+    /// A socket that every IPv4 packet of ICMP reaches. What says that
+    /// something was not delivered is read off it; while a socket hears,
+    /// all of it goes to the kernel, and what such a socket sends leaves
+    /// by it.
+    ear: SocketHandle,
     streams: tcp::Streams,
     /// When the last [`poll`](Self::poll) was.
     now: Instant,
@@ -186,12 +211,14 @@ pub struct Stack<D: for<'d> Device<'d>> {
 impl<D: for<'d> Device<'d>> Stack<D> {
     /// The stack of `iface`, with no sockets.
     pub fn new(iface: Interface<'static, D>) -> Stack<D> {
+        let mut set = SocketSet::new(vec![]);
+        let ear = set.add(ear(iface.device().capabilities().ip_mtu()));
         Stack {
             iface,
-            set: SocketSet::new(vec![]),
+            set,
             socks: BTreeMap::new(),
             hearing: BTreeSet::new(),
-            ear: None,
+            ear,
             streams: tcp::Streams::default(),
             now: Instant::from_millis(0),
             brought: false,
@@ -241,22 +268,6 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if sock == HEARD || self.knows(sock) {
             return Err(Refused::Bind);
         }
-        if self.ear.is_none() {
-            let room = self.iface.device().capabilities().ip_mtu();
-            let buffer = |packets: usize| {
-                RawSocketBuffer::new(
-                    vec![RawPacketMetadata::EMPTY; packets],
-                    vec![0u8; packets * room],
-                )
-            };
-            let ear = RawSocket::new(
-                IpVersion::Ipv4,
-                IpProtocol::Icmp,
-                buffer(RX_DATAGRAMS),
-                buffer(TX_DATAGRAMS),
-            );
-            self.ear = Some(self.set.add(ear));
-        }
         self.hearing.insert(sock);
         Ok(false)
     }
@@ -269,7 +280,6 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if !self.hearing.contains(&sock) {
             return Err(Refused::NoSocket);
         }
-        let ear = self.ear.ok_or(Refused::NoSocket)?;
         let to = Ipv4Address::from_bytes(&m[16..20]);
         let hop_limit = m[20];
         let message = &m[DATAGRAM_AT..];
@@ -292,7 +302,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             payload_len: message.len(),
             hop_limit,
         };
-        let mut socket = self.set.get::<RawSocket>(ear);
+        let mut socket = self.set.get::<RawSocket>(self.ear);
         let packet = socket
             .send(IP_HEADER + message.len())
             .map_err(|_| Refused::Full)?;
@@ -305,17 +315,67 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     }
 
     /// `CLOSE` of a socket that hears, if `sock` is one. With the last
-    /// of them goes the ear.
+    /// of them goes what they sent and has not left: what can leave now
+    /// does, and the rest waits for a neighbour that has not answered,
+    /// at the head of a queue the next socket to hear would wait behind.
+    /// So the ear is another, with nothing to send.
     fn deaf(&mut self, sock: u64) -> bool {
         if !self.hearing.remove(&sock) {
             return false;
         }
         if self.hearing.is_empty() {
-            if let Some(ear) = self.ear.take() {
-                self.set.remove(ear);
+            let _ = self.iface.poll(&mut self.set, self.now);
+            // What that brought is still read for what it says of ours.
+            while let Some(said) = self.overheard() {
+                if let Some(said) = said {
+                    self.undelivered(&said);
+                }
             }
+            self.set.remove(self.ear);
+            let room = self.iface.device().capabilities().ip_mtu();
+            self.ear = self.set.add(ear(room));
         }
         true
+    }
+
+    /// Take the next packet off the ear when no socket hears: `None`
+    /// when it holds none, and otherwise what the packet says was not
+    /// delivered, if it says so.
+    fn overheard(&mut self) -> Option<Option<Undelivered>> {
+        let mut socket = self.set.get::<RawSocket>(self.ear);
+        let packet = socket.recv().ok()?;
+        Some(Undelivered::of(packet))
+    }
+
+    /// Have the kernel told, by the next `EVENTS`, that what `said` is
+    /// about was not delivered: the datagram socket that has the port it
+    /// left by, or the connect under way it was the knock of. Only of
+    /// what this stack sent: a message about somebody else's is no news
+    /// here.
+    fn undelivered(&mut self, said: &Undelivered) {
+        let from = IpAddress::Ipv4(said.from);
+        if !self
+            .iface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == from)
+        {
+            return;
+        }
+        match said.protocol {
+            IpProtocol::Udp => {
+                let set = &mut self.set;
+                let mut socks = self.socks.iter();
+                let sock = socks.find(|&(_, &handle)| {
+                    set.get::<UdpSocket>(handle).endpoint().port == said.local
+                });
+                if let Some((&sock, _)) = sock {
+                    self.streams.owe(sock, EV_UNDELIVERED, 0, &said.bytes());
+                }
+            }
+            IpProtocol::Tcp => self.connect_undelivered(said),
+            _ => {}
+        }
     }
 
     /// Whether `addr` can be sent to: it is on the card's network, it is
@@ -481,20 +541,33 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 }
             }
         }
-        if let Some(ear) = self.ear {
-            let room = self.iface.device().capabilities().ip_mtu();
-            let mut socket = self.set.get::<RawSocket>(ear);
-            while socket.can_recv() {
-                if m.len() + RECORD_LEN + room > MESSAGE_MAX {
+        // What the ear heard: all of it for the sockets that hear, when
+        // any does, and for the stack what says that something it sent
+        // was not delivered.
+        let hearing = !self.hearing.is_empty();
+        let room = self.iface.device().capabilities().ip_mtu();
+        loop {
+            let said = {
+                let mut socket = self.set.get::<RawSocket>(self.ear);
+                if !socket.can_recv() {
+                    break;
+                }
+                if hearing && m.len() + RECORD_LEN + room > MESSAGE_MAX {
                     return Arrived::More;
                 }
                 let Ok(packet) = socket.recv() else {
                     break;
                 };
-                if let Ok(header) = Ipv4Packet::new_checked(packet) {
-                    push_record(m, HEARD, header.src_addr().0, 0, packet);
-                    self.brought = true;
+                if hearing {
+                    if let Ok(header) = Ipv4Packet::new_checked(packet) {
+                        push_record(m, HEARD, header.src_addr().0, 0, packet);
+                        self.brought = true;
+                    }
                 }
+                Undelivered::of(packet)
+            };
+            if let Some(said) = said {
+                self.undelivered(&said);
             }
         }
         if m.len() > HEADER_LEN {
@@ -822,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn with_the_last_socket_that_hears_goes_the_ear() {
+    fn with_the_last_socket_that_hears_the_kernel_hears_no_more() {
         let (mut stack, window) = stack();
         assert_eq!(stack.request(&hear(5)), Ok(false));
         assert_eq!(stack.request(&hear(6)), Ok(false));
@@ -841,6 +914,131 @@ mod tests {
         assert_eq!(stack.request(&hear(7)), Ok(false));
         window.deliver(stack.device(), 2, &echo_reply(7, 3, b"three"));
         assert_eq!(poll(&mut stack).len(), 1);
+    }
+
+    #[test]
+    fn what_waits_for_a_neighbour_that_never_answers_is_not_in_the_next_sockets_way() {
+        let (mut stack, window) = stack();
+        let nobody = Ipv4Address([10, 0, 9, 77]);
+        let is_echo = |frame: &[u8]| frame.len() > 14 + 20 && frame[12..14] == [8, 0];
+        // An echo to a neighbour nobody has heard of: asked for, and the
+        // echo waits.
+        assert_eq!(stack.request(&hear(5)), Ok(false));
+        assert_eq!(
+            stack.request(&icmp(5, nobody, 64, &echo(1, b"x"))),
+            Ok(true)
+        );
+        assert!(poll(&mut stack).is_empty());
+        let sent = turn(stack.device());
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&window.sent(&sent[0]), nobody));
+        window.done(stack.device(), &sent[0]);
+        // Its program gives up. The echo to THEIRS of the next one leaves
+        // at once: it is not behind the one that still waits.
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        assert_eq!(stack.request(&hear(6)), Ok(false));
+        assert_eq!(
+            stack.request(&icmp(6, THEIR_IP, 64, &echo(2, b"y"))),
+            Ok(true)
+        );
+        assert!(poll(&mut stack).is_empty());
+        let sent = turn(stack.device());
+        assert_eq!(sent.len(), 1);
+        assert!(is_echo(&window.sent(&sent[0])));
+    }
+
+    /// A record of an `EVENTS`: its socket, what, number and bytes.
+    type Event = (u64, u16, u32, Vec<u8>);
+
+    /// The records of an `EVENTS` message.
+    fn events(m: &[u8]) -> Vec<Event> {
+        assert_eq!(parse_header(m), Some((tcp::OP_EVENTS, 0)));
+        let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
+        while !rest.is_empty() {
+            let sock = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let what = u16::from_le_bytes([rest[8], rest[9]]);
+            let len = u16::from_le_bytes([rest[10], rest[11]]) as usize;
+            let number = u32::from_le_bytes(rest[12..16].try_into().unwrap());
+            out.push((sock, what, number, rest[16..16 + len].to_vec()));
+            rest = &rest[16 + len..];
+        }
+        out
+    }
+
+    /// THEIRS says that the datagram we sent from port `local` to its
+    /// port `port` found nobody there; the turn that makes, in which no
+    /// socket hears, and the events the kernel is told.
+    fn nobody_at(
+        stack: &mut Stack<crate::port::Port>,
+        window: &Window,
+        local: u16,
+        port: u16,
+    ) -> Vec<Event> {
+        let said = undelivered_frame(3, 3, IpProtocol::Udp, local, THEIR_IP, port);
+        window.deliver(stack.device(), 0, &said);
+        stack.poll(Instant::from_millis(1));
+        // The card has the slot back for the next.
+        turn(stack.device());
+        let mut m = Vec::new();
+        match stack.arrived(&mut m) {
+            Arrived::Nothing => Vec::new(),
+            Arrived::All => events(&m),
+            Arrived::More => panic!("more than one message"),
+        }
+    }
+
+    #[test]
+    fn a_datagram_that_was_not_delivered_is_told_for_the_socket_of_its_port() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(5, 7000)), Ok(false));
+        assert_eq!(stack.request(&bind(6, 7001)), Ok(false));
+        // Nobody hears ICMP, and the stack does: where it went, and what
+        // was said of it.
+        assert_eq!(
+            nobody_at(&mut stack, &window, 7001, 53),
+            [(6, EV_UNDELIVERED, 0, vec![10, 0, 9, 1, 53, 0, 3, 3])]
+        );
+        // Once.
+        assert!(poll(&mut stack).is_empty());
+        // From a port no socket has: nobody's.
+        assert_eq!(nobody_at(&mut stack, &window, 7002, 53), []);
+        // A socket that closed: nobody's.
+        assert_eq!(stack.request(&message(OP_CLOSE, 6, &[])), Ok(false));
+        assert_eq!(nobody_at(&mut stack, &window, 7001, 53), []);
+        assert_eq!(nobody_at(&mut stack, &window, 7000, 53).len(), 1);
+
+        // What another machine sent is not ours to hear of, whatever port
+        // it left by.
+        let ours = undelivered_frame(3, 3, IpProtocol::Udp, 7000, THEIR_IP, 53);
+        let mut quoted = ours[14 + 20 + 8..].to_vec();
+        quoted[12..16].copy_from_slice(&[10, 0, 9, 77]);
+        let theirs = icmp_frame(&undelivered_message(3, 3, &quoted));
+        window.deliver(stack.device(), 0, &theirs);
+        assert!(poll(&mut stack).is_empty());
+    }
+
+    #[test]
+    fn while_a_socket_hears_what_was_not_delivered_is_heard_and_told() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(5, 7000)), Ok(false));
+        assert_eq!(stack.request(&hear(9)), Ok(false));
+        let said = undelivered_frame(11, 0, IpProtocol::Udp, 7000, THEIR_IP, 33434);
+        window.deliver(stack.device(), 0, &said);
+        stack.poll(Instant::from_millis(1));
+        // The packet whole for the sockets that hear, as before...
+        let mut m = Vec::new();
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        let heard = records(&m);
+        assert_eq!(heard.len(), 1);
+        assert_eq!((heard[0].0, heard[0].1), (HEARD, THEIR_IP.0));
+        assert_eq!(heard_of(&heard[0].3)[..2], [11, 0]);
+        // ...and then whose datagram it was.
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(
+            events(&m),
+            [(5, EV_UNDELIVERED, 0, vec![10, 0, 9, 1, 0x9a, 0x82, 11, 0])]
+        );
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
     }
 
     #[test]

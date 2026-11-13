@@ -151,6 +151,9 @@ pub enum LxError {
     ETIMEDOUT = 110,
     /// Connection refused
     ECONNREFUSED = 111,
+    /// No route to host -- a router on the way said that the host a
+    /// connect or a datagram was for cannot be reached (ICMP).
+    EHOSTUNREACH = 113,
     /// Operation now in progress (non-blocking connect)
     EINPROGRESS = 115,
     /// Address already in use
@@ -241,6 +244,7 @@ impl fmt::Display for LxError {
             ENOTCONN => "Transport endpoint is not connected",
             ETIMEDOUT => "Connection timed out",
             ECONNREFUSED => "Connection refused",
+            EHOSTUNREACH => "No route to host",
             EINPROGRESS => "Operation in progress",
             EADDRINUSE => "Address already in use",
             EADDRNOTAVAIL => "Cannot assign requested address",
@@ -391,7 +395,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 72] = [
+    const EVERY_ERRNO: [(LxError, isize); 73] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -459,6 +463,7 @@ mod errno_tests {
         (LxError::ENOTCONN, 107),
         (LxError::ETIMEDOUT, 110),
         (LxError::ECONNREFUSED, 111),
+        (LxError::EHOSTUNREACH, 113),
         (LxError::EALREADY, 114),
         (LxError::EINPROGRESS, 115),
         (LxError::ESTALE, 116),
@@ -549,6 +554,7 @@ mod errno_tests {
                 | LxError::ENOTCONN
                 | LxError::ETIMEDOUT
                 | LxError::ECONNREFUSED
+                | LxError::EHOSTUNREACH
                 | LxError::EALREADY
                 | LxError::EINPROGRESS
                 | LxError::ESTALE
@@ -559,7 +565,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            72,
+            73,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }
