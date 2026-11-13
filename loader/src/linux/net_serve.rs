@@ -268,13 +268,23 @@ impl FramePort for ServedNic {
             return true;
         }
         self.pump();
+        let free = self.state.lock().tx_free != 0;
         // The pump may have read frames too, and this is the sending half
         // of a poll: the receiving half is over. The FIFO is empty now, so
         // nothing else would bring the card's task to them.
-        if self.has_frames() {
+        //
+        // Only with a slot to answer them with. Without one the stack takes
+        // no frame (`ServedDriver::receive`), so the task would poll, come
+        // here, be called again and poll, with nothing between two rounds
+        // that lets anything else run: on one CPU the driver never got to
+        // give a slot back, and the machine stopped there. That is where an
+        // echo of megabytes ended, every slot out with the answers and the
+        // next frames already in. A slot's return is a message in the FIFO,
+        // and that brings the task.
+        if free && self.has_frames() {
             self.fifo.signal_set(Signal::USER_SIGNAL_0);
         }
-        self.state.lock().tx_free != 0
+        free
     }
 
     fn send(&self, frame: &[u8]) -> bool {
@@ -490,6 +500,34 @@ pub(super) fn net_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames in, and every transmit slot out with the driver: the stack
+    /// takes no frame it cannot answer, so calling the card's task for them
+    /// only has it poll and be called again, round and round, on the CPU
+    /// the driver needs to give a slot back.
+    #[test]
+    fn frames_that_wait_for_a_slot_do_not_call_the_cards_task() {
+        let (kernels, drivers) = Fifo::create(128, NET_MSG);
+        let slots = 2 + MAX_TX_SLOTS;
+        let window = VmObject::new_paged(slots * SLOT / 4096);
+        let nic = ServedNic::new(kernels.clone(), window, 2).unwrap();
+        let called = || kernels.signal().contains(Signal::USER_SIGNAL_0);
+        for _ in 0..MAX_TX_SLOTS {
+            assert!(nic.send(&[0u8; 60]));
+        }
+        drivers
+            .write(NET_MSG, &encode(OP_RX, 0, 60, 12), 1)
+            .unwrap();
+        assert!(!nic.can_send());
+        assert!(nic.has_frames(), "the frame was read on the way");
+        assert!(!called(), "nothing to call the task for yet");
+
+        // A slot comes back: now the frame can be taken, and the poll that
+        // found out was past its receiving half.
+        drivers.write(NET_MSG, &encode(OP_TX, 7, 0, 0), 1).unwrap();
+        assert!(nic.can_send());
+        assert!(called());
+    }
 
     #[test]
     fn a_seat_takes_one_driver_at_a_time() {
