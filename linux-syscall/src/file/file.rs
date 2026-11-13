@@ -510,7 +510,7 @@ impl Syscall<'_> {
     }
 
     /// True for a socket whose `write` queues into a bounded buffer, like a
-    /// pipe, and answers `EAGAIN` when that is full (unix, UDP).
+    /// pipe, and answers `EAGAIN` when that is full (unix, UDP, TCP).
     fn is_bounded_socket(&self, file_like: &Arc<dyn FileLike>) -> bool {
         crate::net::queue_is_bounded(file_like)
     }
@@ -526,8 +526,9 @@ impl Syscall<'_> {
     /// fds whose `write` this syscall waits on, as `pipe_write`,
     /// `unix_stream_sendmsg`, `sock_alloc_send_skb` and `eventfd_write` do,
     /// instead of handing the caller the `EAGAIN` that only a non-blocking fd
-    /// may see. (A TCP socket's `write` waits for window on its own,
-    /// synchronously.)
+    /// may see. A TCP socket is one of the bounded ones: its `write` used to
+    /// wait for window on its own, in a loop that kept the CPU from the
+    /// card's driver when that is a process.
     fn waits_for_room(&self, file_like: &Arc<dyn FileLike>) -> bool {
         (self.is_pipe(file_like)
             || self.is_bounded_socket(file_like)
