@@ -96,6 +96,22 @@
 //! has (`IP_TTL`). An echo to this machine is answered here, and never
 //! reaches the stack.
 //!
+//! # What the card has carried
+//!
+//! The frames are the stack's and so is the count of them, which the
+//! machine's interface has to show (`/proc/net/dev`, `ifconfig`):
+//!
+//! ```text
+//! COUNTS  (stack to kernel)  16  eight u64: received bytes, frames, errors, dropped,
+//!                                           then sent bytes, frames, errors, dropped
+//! ```
+//!
+//! Each is how many since the process started, said every now and then
+//! while they change and not for each frame. What is kept here
+//! ([`StackLink::carried`]) is the sum of how much each grew, so the
+//! interface's counts go on from where they were when a stack dies and
+//! another comes, and a number that goes back adds nothing.
+//!
 //! # This machine
 //!
 //! What a program sends to 127.0.0.0/8, or to the stack's own address, is
@@ -147,6 +163,8 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use kernel_hal::drivers::net::stack_card::Carried;
+use kernel_hal::drivers::scheme::NetStats;
 use kernel_hal::sync::Mutex;
 use log::warn;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
@@ -173,6 +191,7 @@ pub const OP_WINDOW: u32 = 9;
 pub const OP_EVENTS: u32 = 10;
 pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
+pub const OP_COUNTS: u32 = 13;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
 /// whichever sockets hear: no socket has the number.
@@ -213,6 +232,8 @@ pub const HEADER_LEN: usize = 16;
 pub const DATAGRAM_AT: usize = 24;
 /// What each record of a `DATA` starts with.
 pub const RECORD_LEN: usize = 16;
+/// The numbers of a `COUNTS`.
+pub const COUNTS: usize = 8;
 /// The longest datagram UDP carries over IPv4.
 pub const MAX_DATAGRAM: usize = 65507;
 // A datagram and its header fit one channel message (65536 bytes).
@@ -256,7 +277,6 @@ pub fn send_message(sock: u64, addr: [u8; 4], port: u16, hop_limit: u8, data: &[
     m
 }
 
-/// `CLOSE`: socket `sock` is gone.
 /// `HEAR`: socket `sock` hears ICMP from now on.
 pub fn hear_message(sock: u64) -> Vec<u8> {
     header(OP_HEAR, sock, 0)
@@ -272,8 +292,29 @@ pub fn icmp_message(sock: u64, addr: [u8; 4], hop_limit: u8, message: &[u8]) -> 
     m
 }
 
+/// `CLOSE`: socket `sock` is gone.
 pub fn close_message(sock: u64) -> Vec<u8> {
     header(OP_CLOSE, sock, 0)
+}
+
+/// `COUNTS`: what the card has carried since the stack started, in the
+/// order the message has them.
+pub fn counts_message(counts: &[u64; COUNTS]) -> Vec<u8> {
+    let mut m = header(OP_COUNTS, 0, COUNTS * 8);
+    for count in counts {
+        m.extend_from_slice(&count.to_le_bytes());
+    }
+    m
+}
+
+/// The numbers of a `COUNTS`, past its header: `None` when they are not
+/// all there. What a later stack adds after them is not read.
+pub fn parse_counts(numbers: &[u8]) -> Option<[u64; COUNTS]> {
+    let mut counts = [0u64; COUNTS];
+    for (i, count) in counts.iter_mut().enumerate() {
+        *count = u64::from_le_bytes(numbers.get(i * 8..i * 8 + 8)?.try_into().ok()?);
+    }
+    Some(counts)
 }
 
 /// A message's operation and socket, when it has both.
@@ -733,6 +774,12 @@ pub struct StackLink {
     /// is told, and while a new stack is told of all that have: so each
     /// is told once. Taken before any other lock here.
     telling: Mutex<()>,
+    /// What the stacks' card has carried, all of them: see
+    /// [`carried`](Self::carried).
+    carried: Arc<Carried>,
+    /// The last `COUNTS` of the stack that serves now: zero when it has
+    /// said none, and for the next.
+    counted: Mutex<[u64; COUNTS]>,
 }
 
 /// A stack process's turn at serving: what the task that reads its
@@ -846,7 +893,17 @@ impl StackLink {
             address: AtomicU32::new(0),
             table: Mutex::new(Table::default()),
             telling: Mutex::new(()),
+            carried: Arc::new(Carried::default()),
+            counted: Mutex::new([0; COUNTS]),
         })
+    }
+
+    /// What the card of the stacks that have served these sockets has
+    /// carried, as each said it (`COUNTS`): for the interface that shows
+    /// that card. It is the machine's, so it goes on through a stack
+    /// that dies and the one that comes after.
+    pub fn carried(&self) -> Arc<Carried> {
+        self.carried.clone()
     }
 
     /// [`serve`], on these sockets. The stack is told of the sockets that
@@ -973,11 +1030,48 @@ impl StackLink {
         match parse_header(m) {
             Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
+            Some((OP_COUNTS, _)) => self.take_counts(&m[HEADER_LEN..]),
             _ => warn!(
                 "user stack: a message that means nothing ({} bytes)",
                 m.len()
             ),
         }
+    }
+
+    /// The card has carried this much since its stack started: what is
+    /// more than that stack said last is added to what the machine's
+    /// interface has carried.
+    fn take_counts(&self, numbers: &[u8]) {
+        let Some(now) = parse_counts(numbers) else {
+            warn!(
+                "user stack: {} bytes that are no counts of a card",
+                numbers.len()
+            );
+            return;
+        };
+        let more = {
+            let mut counted = self.counted.lock();
+            let mut more = [0u64; COUNTS];
+            for ((more, now), was) in more.iter_mut().zip(now).zip(counted.iter()) {
+                // A count that goes back is a stack that lost count:
+                // nothing is taken away for it.
+                *more = now.saturating_sub(*was);
+            }
+            *counted = now;
+            more
+        };
+        let [rx_bytes, rx_packets, rx_errors, rx_dropped, tx_bytes, tx_packets, tx_errors, tx_dropped] =
+            more;
+        self.carried.add(&NetStats {
+            rx_bytes,
+            rx_packets,
+            tx_bytes,
+            tx_packets,
+            rx_errors,
+            rx_dropped,
+            tx_errors,
+            tx_dropped,
+        });
     }
 
     fn take_events(&self, mut records: &[u8]) {
@@ -1032,6 +1126,8 @@ impl StackLink {
             *served = None;
             self.up.store(false, Ordering::Release);
             self.address.store(0, Ordering::Release);
+            // The next one counts from nothing.
+            *self.counted.lock() = [0; COUNTS];
         }
         warn!("user stack: the process is gone");
         let streams: Vec<Arc<tcp::Stream>> = {
@@ -2503,6 +2599,62 @@ mod tests {
     }
 
     /// A socket of `link` that does not wait.
+    #[test]
+    fn what_the_card_has_carried_is_what_its_stacks_said_one_after_another() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let carried = stack.link.carried();
+        let shown = |carried: &Carried| {
+            let c = carried.so_far();
+            (c.rx_bytes, c.rx_packets, c.tx_bytes, c.tx_packets)
+        };
+        assert_eq!(shown(&carried), (0, 0, 0, 0));
+
+        // The message, as the stack writes it.
+        let said = counts_message(&[600, 4, 1, 2, 420, 3, 5, 6]);
+        assert_eq!(said.len(), HEADER_LEN + COUNTS * 8);
+        assert_eq!(parse_header(&said), Some((OP_COUNTS, 0)));
+        assert_eq!(&said[16..24], &600u64.to_le_bytes());
+        assert_eq!(&said[48..56], &420u64.to_le_bytes());
+        stack.say(said);
+        let c = carried.so_far();
+        assert_eq!((c.rx_bytes, c.rx_packets), (600, 4));
+        assert_eq!((c.rx_errors, c.rx_dropped), (1, 2));
+        assert_eq!((c.tx_bytes, c.tx_packets), (420, 3));
+        assert_eq!((c.tx_errors, c.tx_dropped), (5, 6));
+
+        // Said again, nothing more; said since the start, so what is new
+        // is the difference; and a number that goes back adds nothing.
+        stack.say(counts_message(&[600, 4, 1, 2, 420, 3, 5, 6]));
+        assert_eq!(shown(&carried), (600, 4, 420, 3));
+        stack.say(counts_message(&[700, 5, 1, 2, 420, 3, 5, 6]));
+        assert_eq!(shown(&carried), (700, 5, 420, 3));
+        stack.say(counts_message(&[100, 1, 0, 0, 500, 4, 5, 6]));
+        assert_eq!(shown(&carried), (700, 5, 500, 4));
+        // What a later stack adds after the eight is not read, and fewer
+        // than eight are no counts.
+        let mut longer = counts_message(&[160, 2, 0, 0, 500, 4, 5, 6]);
+        longer.extend_from_slice(&[0xff; 8]);
+        stack.say(longer);
+        assert_eq!(shown(&carried), (760, 6, 500, 4));
+        let mut short = counts_message(&[9000, 9000, 0, 0, 9000, 9000, 0, 0]);
+        short.truncate(HEADER_LEN + COUNTS * 8 - 1);
+        stack.say(short);
+        assert_eq!(shown(&carried), (760, 6, 500, 4));
+
+        // The stack dies. The interface has carried what it had, and the
+        // next stack counts from nothing: what it says is all new.
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        assert!(link.is_down());
+        assert_eq!(shown(&carried), (760, 6, 500, 4));
+        let next = stack_of(&link);
+        next.say(counts_message(&[40, 1, 0, 0, 50, 2, 0, 0]));
+        assert_eq!(shown(&link.carried()), (800, 7, 550, 6));
+        assert!(Arc::ptr_eq(&carried, &link.carried()));
+    }
+
     fn stack_socket(link: &Arc<StackLink>) -> ServedUdpSocket {
         let s = ServedUdpSocket::new(link.clone(), false).unwrap();
         FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();

@@ -12,16 +12,74 @@
 //! set from here, because they are the stack's too. It is made when the stack
 //! says what its card is and taken away when the stack is gone, and what it
 //! says never changes in between: a stack whose address changes starts over.
+//!
+//! What does change is how much the card has carried, which only the stack
+//! knows and says as it goes: the card is given the place those counts are
+//! kept ([`Carried`]), and answers with what is there when it is asked
+//! (`/proc/net/dev`, which is where `ifconfig` reads them).
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use super::ip_cfg;
-use crate::scheme::{NetScheme, RouteInfo, Scheme};
+use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
+
+/// What a card has carried so far, kept by whoever is told: the frames
+/// and the bytes each way, and the ones that came to nothing. It only
+/// grows, and it is not the card's: the stack that had the card may be
+/// gone and the next one's card goes on from the same counts.
+#[derive(Default)]
+pub struct Carried {
+    rx_bytes: AtomicU64,
+    rx_packets: AtomicU64,
+    rx_errors: AtomicU64,
+    rx_dropped: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_packets: AtomicU64,
+    tx_errors: AtomicU64,
+    tx_dropped: AtomicU64,
+}
+
+impl Carried {
+    /// `more` was carried since the last time.
+    pub fn add(&self, more: &NetStats) {
+        let pairs = [
+            (&self.rx_bytes, more.rx_bytes),
+            (&self.rx_packets, more.rx_packets),
+            (&self.rx_errors, more.rx_errors),
+            (&self.rx_dropped, more.rx_dropped),
+            (&self.tx_bytes, more.tx_bytes),
+            (&self.tx_packets, more.tx_packets),
+            (&self.tx_errors, more.tx_errors),
+            (&self.tx_dropped, more.tx_dropped),
+        ];
+        for (count, more) in pairs {
+            if more != 0 {
+                count.fetch_add(more, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// All of it, so far.
+    pub fn so_far(&self) -> NetStats {
+        NetStats {
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_errors: self.rx_errors.load(Ordering::Relaxed),
+            rx_dropped: self.rx_dropped.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+            tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            tx_dropped: self.tx_dropped.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// The interface that shows the card of a stack that runs somewhere else.
 pub struct StackCard {
@@ -30,6 +88,8 @@ pub struct StackCard {
     addrs: Vec<IpCidr>,
     /// The default route, when the stack has a gateway.
     routes: Vec<RouteInfo>,
+    /// What the stack says the card has carried.
+    carried: Arc<Carried>,
 }
 
 impl StackCard {
@@ -56,7 +116,16 @@ impl StackCard {
             mac: EthernetAddress(mac),
             addrs: vec![IpCidr::Ipv4(address)],
             routes,
+            carried: Arc::new(Carried::default()),
         }
+    }
+
+    /// The same card, with what it has carried read from `carried`: where
+    /// whoever hears the stack keeps what it says. Without it the card
+    /// has carried nothing, as far as anyone here can tell.
+    pub fn counting(mut self, carried: Arc<Carried>) -> Self {
+        self.carried = carried;
+        self
     }
 
     /// The card as a stack says it in three numbers, or `None` when they
@@ -132,6 +201,10 @@ impl NetScheme for StackCard {
 
     fn get_routes(&self) -> Vec<RouteInfo> {
         ip_cfg::reported_routes(&self.routes, &self.addrs)
+    }
+
+    fn get_stats(&self) -> NetStats {
+        self.carried.so_far()
     }
 
     fn poll(&self) -> DeviceResult {
@@ -229,6 +302,48 @@ mod tests {
         assert!(said([10, 0, 9, 15], 24, 0, 0).is_none());
         #[cfg(target_pointer_width = "64")]
         assert!(said([10, 0, 9, 15], 24, 0, 1 << 48).is_none());
+    }
+
+    #[test]
+    fn it_has_carried_what_was_counted_for_it_and_the_next_card_goes_on() {
+        // Nobody counts for it: nothing carried.
+        let alone = card(None).get_stats();
+        assert_eq!((alone.rx_packets, alone.tx_packets), (0, 0));
+
+        let carried = Arc::new(Carried::default());
+        let c = card(None).counting(carried.clone());
+        carried.add(&NetStats {
+            rx_bytes: 600,
+            rx_packets: 4,
+            tx_bytes: 420,
+            tx_packets: 3,
+            rx_errors: 1,
+            ..NetStats::default()
+        });
+        carried.add(&NetStats {
+            rx_bytes: 60,
+            rx_packets: 1,
+            tx_dropped: 2,
+            ..NetStats::default()
+        });
+        let stats = c.get_stats();
+        assert_eq!((stats.rx_bytes, stats.rx_packets), (660, 5));
+        assert_eq!((stats.tx_bytes, stats.tx_packets), (420, 3));
+        assert_eq!((stats.rx_errors, stats.rx_dropped), (1, 0));
+        assert_eq!((stats.tx_errors, stats.tx_dropped), (0, 2));
+
+        // The card of the stack that comes after starts where this one
+        // is: the counts are the machine's interface's, not a process's.
+        drop(c);
+        let next = card(Some([10, 0, 9, 1])).counting(carried.clone());
+        carried.add(&NetStats {
+            tx_bytes: 80,
+            tx_packets: 1,
+            ..NetStats::default()
+        });
+        let stats = next.get_stats();
+        assert_eq!((stats.rx_bytes, stats.rx_packets), (660, 5));
+        assert_eq!((stats.tx_bytes, stats.tx_packets), (500, 4));
     }
 
     #[test]

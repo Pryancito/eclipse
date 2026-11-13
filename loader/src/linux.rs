@@ -610,8 +610,9 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// of six. On a boot with `unetuse=all` the kernel shows that card among
 /// the machine's interfaces for as long as the stack serves, to be looked
 /// at (`ifconfig`, `ip`, `/proc/net`): nothing is sent through it or set
-/// on it there. A `prefix` of 0 says nothing of the card, and none is
-/// shown.
+/// on it there, and what it has carried is what the stack says on the
+/// channel as it goes. A `prefix` of 0 says nothing of the card, and none
+/// is shown.
 ///
 /// Which sockets: the datagram and stream sockets of the processes that
 /// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
@@ -645,7 +646,7 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let address = (args[2] as u32).to_be_bytes();
     let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
-    let card = show_stack_card(address, args);
+    let card = show_stack_card(address, args, serving.link().carried());
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them. Until this
     // process is gone: the next one's channel has its own task.
@@ -678,10 +679,16 @@ static STACK_CARD_NAME: lock::Mutex<Option<alloc::string::String>> = lock::Mutex
 /// and whoever waits for a default route see it. Where only the programs
 /// that ask have that stack, the kernel's interfaces are what the others
 /// use and the list stays theirs. The card, to take away with the stack.
+///
+/// `carried` is where what the stack says its card has carried is kept
+/// (`COUNTS`), and what the interface answers with: the same place for
+/// every stack, so the counts of `eth0` do not start over when its stack
+/// does.
 #[cfg(feature = "zircon-gateway")]
 fn show_stack_card(
     address: [u8; 4],
     args: &[usize; 6],
+    carried: Arc<kernel_hal::drivers::net::stack_card::Carried>,
 ) -> Option<Arc<kernel_hal::drivers::net::stack_card::StackCard>> {
     use kernel_hal::drivers::net::stack_card::StackCard;
     if !linux_object::net::user_stack::is_for_all() {
@@ -695,7 +702,7 @@ fn show_stack_card(
     *name = Some(called.clone());
     // `args[3..]`: the prefix, the gateway and the MAC, as the call says.
     let said = StackCard::said(called.clone(), address, args[3], args[4], args[5])?;
-    let card = Arc::new(said);
+    let card = Arc::new(said.counting(carried));
     if !kernel_hal::drivers::hotplug::add(kernel_hal::drivers::prelude::Device::Net(card.clone())) {
         return None;
     }

@@ -36,6 +36,12 @@
 //! what a program was just told waits a moment for the program's answer
 //! (`HOLD`).
 //!
+//! The kernel is also told how much the card has carried, since it is the
+//! kernel that shows the machine's interfaces and their counts: at once
+//! after a quiet while and a few times a second while frames go
+//! (`netstack::counts`), by whichever thread has just had a turn, and by
+//! the third when no turn comes to say the last of it.
+//!
 //! The kernel is told the address once, for `getsockname`, when it is
 //! given its sockets: at the start for an address that is written, with
 //! the first lease for one that is asked for. A lease that comes back with
@@ -50,8 +56,10 @@ use std::path::Path;
 use std::process::{exit, Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::Thread;
 use std::time::Duration;
 
+use netstack::counts::{Counts, Teller};
 use netstack::governed;
 use netstack::port::Port;
 use netstack::resolv::{self, Applied};
@@ -208,6 +216,12 @@ struct Host {
     /// [`publish`].
     driver_pid: AtomicU32,
     driver_starts: AtomicU32,
+    /// What the kernel was told the card has carried, and when. Taken
+    /// with the stack's lock held or with none, never the other way.
+    teller: Mutex<Teller>,
+    /// The thread that keeps time, once it runs: woken to tell the
+    /// kernel what a turn carried too soon after the last telling.
+    clock: OnceLock<Thread>,
 }
 
 /// A lock, whatever became of the thread that had it last: the process
@@ -232,7 +246,8 @@ struct Kernel {
 /// whoever reads the socket, who runs at once and has something to send
 /// before this thread is back.
 fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut Vec<u8>) -> bool {
-    shared.stack.poll(now());
+    let at = now();
+    shared.stack.poll(at);
     if let Some(lease) = shared.stack.lease_news() {
         // Not under the lock: the kernel may have to be told.
         drop(shared);
@@ -243,6 +258,7 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
     let Some(kernel) = host.kernel.get() else {
         return false;
     };
+    tell_counts(host, &shared.stack.device().counts(), at);
     let mut bytes = false;
     loop {
         let arrived = shared.stack.arrived(data);
@@ -262,6 +278,42 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
         let _ = kernel.channel.write(data, &[]);
         drop(sending);
     }
+}
+
+/// Tell the kernel that the card has carried `counts`, at `at`, when it
+/// has not been told and was last told long enough ago
+/// (`netstack::counts`). A message of its own, a few times a second at
+/// most: it wakes the kernel's task and no program.
+fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
+    let Some(kernel) = host.kernel.get() else {
+        return;
+    };
+    let told = {
+        let mut teller = locked(&host.teller);
+        teller.tell(counts, at).ok_or_else(|| teller.owes(counts))
+    };
+    match told {
+        // A kernel that is gone took the machine with it.
+        Ok(message) => {
+            let _ = kernel.channel.write(&message, &[]);
+        }
+        // Too soon: the thread that keeps time may be asleep for longer
+        // than this can wait, and does not know.
+        Err(true) => {
+            if let Some(clock) = host.clock.get() {
+                clock.unpark();
+            }
+        }
+        Err(false) => {}
+    }
+}
+
+/// How long until the kernel is to be told what the card has carried,
+/// when it has a kernel to tell and something to tell it.
+fn counts_due_in(host: &Host, counts: &Counts) -> Option<Duration> {
+    host.kernel.get()?;
+    let due = locked(&host.teller).due_in(counts, now())?;
+    Some(Duration::from_micros(due.total_micros()))
 }
 
 /// Tell the driver, from a thread that is not the card's, what this turn
@@ -429,16 +481,25 @@ const TICK_MAX: Duration = Duration::from_secs(1);
 const TICK_MIN: Duration = Duration::from_millis(1);
 
 /// When it is due, do what the stack has pending that no frame and no
-/// message will make it do.
+/// message will make it do, and tell the kernel what the card has carried
+/// since it was last told: the turn that carried it may have been the
+/// last for a while. It sleeps until then, or until a turn that carried
+/// something wakes it to count the time again ([`tell_counts`]).
 fn keep_time(host: Arc<Host>) {
+    let _ = host.clock.set(std::thread::current());
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
-        let idle = locked(&host.shared).stack.idle_for(now());
+        let (idle, counts) = {
+            let shared = locked(&host.shared);
+            (shared.stack.idle_for(now()), shared.stack.device().counts())
+        };
         let nap = idle.map_or(TICK_MAX, |d| Duration::from_micros(d.total_micros()));
-        std::thread::sleep(nap.clamp(TICK_MIN, TICK_MAX));
+        let nap = counts_due_in(&host, &counts).map_or(nap, |due| nap.min(due));
+        std::thread::park_timeout(nap.clamp(TICK_MIN, TICK_MAX));
         {
             let guard = locked(&host.shared);
+            tell_counts(&host, &guard.stack.device().counts(), now());
             // Another thread's turn may have done it meanwhile, or put it
             // off: an acknowledgement that arrived, say.
             if guard.stack.idle_for(now()) != Some(smoltcp::time::Duration::ZERO) {
@@ -657,6 +718,8 @@ fn main() {
         told: Mutex::new(None),
         driver_pid: AtomicU32::new(link.driver.id()),
         driver_starts: AtomicU32::new(1),
+        teller: Mutex::new(Teller::default()),
+        clock: OnceLock::new(),
     });
     let card = format!("card {index} ({})", EthernetAddress(mac));
     match how {
@@ -709,9 +772,11 @@ fn main() {
         };
         // The new port first, then the old link goes, its window with it:
         // nothing is left that points into that. Under the lock, so no
-        // other thread is in the middle of a frame.
+        // other thread is in the middle of a frame. What the card had
+        // carried it has carried still.
         {
             let mut shared = locked(&host.shared);
+            port.count_from(shared.stack.device().counts());
             *shared.stack.device_mut() = port;
             shared.fifo = next.fifo.clone();
         }
