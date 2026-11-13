@@ -958,9 +958,14 @@ impl Syscall<'_> {
                 }
                 // The same three answers `write(2)` gives a pipe.
                 Err(e) => match after_write_error(e, mode.wait, sent) {
-                    AfterWriteError::Wait => {
-                        file_like.async_poll(PollEvents::OUT).await?;
-                    }
+                    // `sk_stream_wait_memory` ended by a signal or by
+                    // `SO_SNDTIMEO`: what went in before is the answer
+                    // (`tcp_sendmsg`'s `do_error`), or else the error.
+                    AfterWriteError::Wait => match file_like.async_poll(PollEvents::OUT).await {
+                        Ok(_) => {}
+                        Err(_) if sent > 0 => return Ok(sent),
+                        Err(e) => return Err(e),
+                    },
                     AfterWriteError::Partial => return Ok(sent),
                     AfterWriteError::Fail => {
                         if sigpipe_due(e, mode.sigpipe) {

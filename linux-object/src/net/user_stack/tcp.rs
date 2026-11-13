@@ -71,6 +71,7 @@ struct Inner {
     write_closed: bool,
     /// The connections that arrived and nobody accepted yet.
     waiting: VecDeque<(u64, Arc<Stream>)>,
+    patience: Patience,
 }
 
 impl Inner {
@@ -93,6 +94,7 @@ impl Inner {
             read_closed: false,
             write_closed: false,
             waiting: VecDeque::new(),
+            patience: Patience::default(),
         }
     }
 
@@ -529,8 +531,9 @@ impl ServedTcpSocket {
 
     /// The next bytes, taken off the queue or only looked at.
     async fn receive(&self, data: &mut [u8], take: bool) -> SysResult {
+        let mut until = Until::default();
         loop {
-            {
+            let until = {
                 let mut inner = self.stream.inner.lock();
                 if inner.queued > 0 {
                     if data.is_empty() {
@@ -569,9 +572,12 @@ impl ServedTcpSocket {
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
                     return Err(LxError::EAGAIN);
                 }
-            }
-            // Woken by bytes, by the end, or ended by a signal.
-            crate::sync::wait_for_event(self.stream.bus.clone(), Event::READABLE).await?;
+                until.of(&inner.patience.receive)
+            };
+            // Woken by bytes, by the end, or ended by a signal or by
+            // `SO_RCVTIMEO` (`EAGAIN`).
+            let bus = self.stream.bus.clone();
+            crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
         }
     }
 
@@ -752,8 +758,9 @@ impl Socket for ServedTcpSocket {
                 return Err(LxError::EINPROGRESS);
             }
         }
+        let mut until = Until::default();
         loop {
-            {
+            let until = {
                 let mut inner = self.stream.inner.lock();
                 match inner.phase {
                     Phase::Open => return Ok(0),
@@ -765,11 +772,20 @@ impl Socket for ServedTcpSocket {
                         return Err(e);
                     }
                 }
-            }
+                until.of(&inner.patience.send)
+            };
             // A signal ends the wait and leaves the connection being made,
-            // as Linux does: the next connect waits for it again.
-            crate::sync::wait_for_event(self.stream.bus.clone(), Event::WRITABLE | Event::ERROR)
-                .await?;
+            // as Linux does: the next connect waits for it again. So does
+            // `SO_SNDTIMEO`, and what it answers is that the connection is
+            // under way, or was already (`__inet_stream_connect`).
+            let bus = self.stream.bus.clone();
+            match crate::sync::wait_for_event_until(bus, Event::WRITABLE | Event::ERROR, until)
+                .await
+            {
+                Err(LxError::EAGAIN) if started.is_some() => return Err(LxError::EINPROGRESS),
+                Err(LxError::EAGAIN) => return Err(LxError::EALREADY),
+                other => other?,
+            };
         }
     }
 
@@ -882,16 +898,24 @@ impl Socket for ServedTcpSocket {
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
+        let mut until = Until::default();
         loop {
-            {
+            let until = {
                 let mut inner = self.stream.inner.lock();
                 if inner.phase != Phase::Listening {
                     return Err(LxError::EINVAL);
                 }
                 if let Some((sock, stream)) = inner.waiting.pop_front() {
                     self.stream.sync(&inner, Event::empty());
+                    let patience = inner.patience;
                     drop(inner);
-                    let from = stream.inner.lock().remote;
+                    // `sk_clone_lock`: the connection has the listener's
+                    // timeouts.
+                    let from = {
+                        let mut child = stream.inner.lock();
+                        child.patience = patience;
+                        child.remote
+                    };
                     let socket = Arc::new(ServedTcpSocket {
                         base: KObjectBase::new(),
                         link: self.link.clone(),
@@ -905,8 +929,10 @@ impl Socket for ServedTcpSocket {
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
                     return Err(LxError::EAGAIN);
                 }
-            }
-            crate::sync::wait_for_event(self.stream.bus.clone(), Event::READABLE).await?;
+                until.of(&inner.patience.receive)
+            };
+            let bus = self.stream.bus.clone();
+            crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
         }
     }
 
@@ -961,6 +987,19 @@ impl Socket for ServedTcpSocket {
     fn socket_type(&self) -> Option<SocketType> {
         Some(SocketType::SOCK_STREAM)
     }
+
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        let kept = self.stream.inner.lock().patience.set(level, opt, data);
+        kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
+    }
+
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.stream.inner.lock().patience.receive
+    }
+
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.stream.inner.lock().patience.send
+    }
 }
 
 impl_kobject!(ServedTcpSocket);
@@ -1007,8 +1046,12 @@ impl FileLike for ServedTcpSocket {
         })
     }
 
+    /// The wait of a write that found no room, or of a read that blocks
+    /// (`splice`): nothing else asks for it, so it ends with `SO_SNDTIMEO`
+    /// or `SO_RCVTIMEO` (`EAGAIN`) as that call does in Linux.
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write) = (events.wants_read(), events.wants_write());
+        let mut until = Until::default();
         let mut mask = Event::ERROR;
         if read {
             mask |= Event::READABLE;
@@ -1026,7 +1069,15 @@ impl FileLike for ServedTcpSocket {
             {
                 return Ok(status);
             }
-            crate::sync::wait_for_event(self.stream.bus.clone(), mask).await?;
+            let until = {
+                let inner = self.stream.inner.lock();
+                until.of(if write {
+                    &inner.patience.send
+                } else {
+                    &inner.patience.receive
+                })
+            };
+            crate::sync::wait_for_event_until(self.stream.bus.clone(), mask, until).await?;
         }
     }
 
@@ -2138,5 +2189,138 @@ mod tests {
                 assert_eq!(Socket::take_so_error(&*s), 0, "the connect took it");
             }
         }
+    }
+
+    /// A `struct timeval`, as `setsockopt` is given it.
+    fn timeval(sec: i64, usec: i64) -> [u8; 16] {
+        let mut tv = [0u8; 16];
+        tv[..8].copy_from_slice(&sec.to_ne_bytes());
+        tv[8..].copy_from_slice(&usec.to_ne_bytes());
+        tv
+    }
+
+    /// `s` waits from now on, for as long as its timeouts say.
+    fn waits(s: &ServedTcpSocket) {
+        FileLike::set_flags(s, OpenFlags::empty()).unwrap();
+    }
+
+    /// What `call` answered and how long it took.
+    fn timed<T>(call: impl FnOnce() -> T) -> (T, core::time::Duration) {
+        let before = kernel_hal::timer::timer_now();
+        let answer = call();
+        (answer, kernel_hal::timer::timer_now() - before)
+    }
+
+    const SOL_SOCKET: usize = 1;
+    const SO_RCVTIMEO: usize = 20;
+    const SO_SNDTIMEO: usize = 21;
+    const SHORT: core::time::Duration = core::time::Duration::from_millis(30);
+
+    #[test]
+    fn a_read_and_an_accept_wait_as_long_as_so_rcvtimeo_says() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let (s, sock) = connected(&stack, 1000);
+        waits(&s);
+
+        // Kept as it was set, and one that is no time is refused.
+        assert_eq!(Socket::so_rcvtimeo(&s), [0u8; 16]);
+        let tv = timeval(0, 30_000);
+        assert_eq!(Socket::setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &tv), Ok(0));
+        assert_eq!(Socket::so_rcvtimeo(&s), tv);
+        assert_eq!(Socket::so_sndtimeo(&s), [0u8; 16]);
+        assert_eq!(
+            Socket::setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &timeval(0, 1_000_000)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            Socket::setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &tv[..8]),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(Socket::so_rcvtimeo(&s), tv);
+        // The options it keeps nowhere are answered as before.
+        assert_eq!(
+            Socket::setsockopt(&s, SOL_SOCKET, 9, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert_eq!(
+            Socket::setsockopt(&s, SOL_SOCKET, 3, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+
+        // Nothing comes: the read gives up when the time is over, and not
+        // before. The same for a look.
+        let mut buf = [0u8; 16];
+        let (answer, took) = timed(|| read(&s, &mut buf));
+        assert_eq!(answer, Err(LxError::EAGAIN));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        let (answer, took) = timed(|| peek(&s, &mut buf));
+        assert_eq!(answer, Err(LxError::EAGAIN));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        // The connection is as it was: what comes later is read.
+        events(&stack, &[(sock, EV_BYTES, 0, b"tarde")]);
+        assert_eq!(read(&s, &mut buf), Ok(5));
+        assert_eq!(&buf[..5], b"tarde");
+
+        // A listener waits that long for a connection, and the one that
+        // arrives has the listener's timeouts.
+        let l = listener(&stack, any(8080));
+        waits(&l);
+        assert_eq!(Socket::setsockopt(&l, SOL_SOCKET, SO_RCVTIMEO, &tv), Ok(0));
+        let (answer, took) = timed(|| accept(&l).err());
+        assert_eq!(answer, Some(LxError::EAGAIN));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        let one = ACCEPTED_BIT | 1;
+        events(
+            &stack,
+            &[(l.sock, EV_ACCEPTED, 500, &accepted_bytes(one, HOST, 40001))],
+        );
+        let (child, _) = accept(&l).unwrap();
+        let child = child.downcast_arc::<ServedTcpSocket>().ok().unwrap();
+        assert_eq!(Socket::so_rcvtimeo(&*child), tv);
+        let (answer, took) = timed(|| read(&child, &mut buf));
+        assert_eq!(answer, Err(LxError::EAGAIN));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+    }
+
+    #[test]
+    fn a_connect_and_a_write_wait_as_long_as_so_sndtimeo_says() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let s = stream(&stack);
+        waits(&s);
+        let tv = timeval(0, 30_000);
+        assert_eq!(Socket::setsockopt(&s, SOL_SOCKET, SO_SNDTIMEO, &tv), Ok(0));
+        assert_eq!(Socket::so_sndtimeo(&s), tv);
+        assert_eq!(Socket::so_rcvtimeo(&s), [0u8; 16]);
+
+        // Nobody answers: the connect says it is under way when the time
+        // is over, and one after it that it already was.
+        let (answer, took) = timed(|| connect(&s, at(HOST, 80)));
+        assert_eq!(answer, Err(LxError::EINPROGRESS));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        let (op, sock) = parse_header(&stack.told().unwrap()).unwrap();
+        assert_eq!(op, OP_CONNECT);
+        let (answer, took) = timed(|| connect(&s, at(HOST, 80)));
+        assert_eq!(answer, Err(LxError::EALREADY));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        // The stack was asked once, and the connection is made when it
+        // says so.
+        assert_eq!(stack.told(), None);
+        events(&stack, &[(sock, EV_CONNECTED, 4, &[])]);
+        assert_eq!(connect(&s, at(HOST, 80)), Err(LxError::EISCONN));
+
+        // The stack takes four bytes and no more: the wait for room, which
+        // is what a write that blocks does next, ends with the time.
+        assert_eq!(Socket::write(&s, b"abcdef", None), Ok(4));
+        assert_eq!(Socket::write(&s, b"ef", None), Err(LxError::EAGAIN));
+        let room = || async_std::task::block_on(FileLike::async_poll(&s, PollEvents::OUT));
+        let (answer, took) = timed(room);
+        assert_eq!(answer.err(), Some(LxError::EAGAIN));
+        assert!(took >= SHORT, "gave up after {:?}", took);
+        // And with room, it is there at once.
+        events(&stack, &[(sock, EV_CREDIT, 8, &[])]);
+        assert!(room().unwrap().write);
+        assert_eq!(Socket::write(&s, b"ef", None), Ok(2));
     }
 }

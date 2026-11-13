@@ -2475,46 +2475,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// on every ordinary `SO_*`/`TCP_*` call (which was a red herring while
     /// debugging download failures). The data path is unchanged.
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
-        const SOL_SOCKET: usize = 1;
-        const IPPROTO_IP: usize = 0;
-        const IPPROTO_TCP: usize = 6;
-        const IP_HDRINCL: usize = 3;
-        // Read-only SOL_SOCKET options — Linux rejects set with ENOPROTOOPT.
-        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
-            // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
-            return Err(LxError::ENOPROTOOPT);
-        }
-        // `do_tcp_setsockopt` is TCP-only; other families must not swallow TCP_*.
-        if level == IPPROTO_TCP && !self.is_tcp() {
-            return Err(LxError::ENOPROTOOPT);
-        }
-        // `do_ip_setsockopt` is inet-only; IP_HDRINCL further needs SOCK_RAW IPv4.
-        if level == IPPROTO_IP {
-            if !self.is_inet() {
-                return Err(LxError::ENOPROTOOPT);
-            }
-            if opt == IP_HDRINCL && !self.is_raw_ipv4() {
-                return Err(LxError::ENOPROTOOPT);
-            }
-        }
-        check_setsockopt_len(level, opt, data)?;
-        let known = match level {
-            // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
-            // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
-            SOL_SOCKET => matches!(opt, 2 | 6 | 7 | 8 | 9 | 13 | 15 | 20 | 21),
-            // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
-            IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
-            // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
-            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 34 | 35),
-            _ => false,
-        };
-        if !known {
-            debug!(
-                "setsockopt: accepting unhandled level={} opt={}",
-                level, opt
-            );
-        }
-        Ok(0)
+        setsockopt_unstored(self, level, opt, data)
     }
     /// missing documentation
     fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> SysResult {
@@ -2753,6 +2714,73 @@ impl StoredInetOpts {
         }
         None
     }
+}
+
+/// `setsockopt` for an option the socket keeps nowhere: the answers of
+/// [`Socket::setsockopt`] when a socket does not say otherwise, for one that
+/// keeps a few options itself and has this say the rest.
+pub(crate) fn setsockopt_unstored<S: Socket + ?Sized>(
+    socket: &S,
+    level: usize,
+    opt: usize,
+    data: &[u8],
+) -> SysResult {
+    const SOL_SOCKET: usize = 1;
+    const IPPROTO_IP: usize = 0;
+    const IPPROTO_TCP: usize = 6;
+    const IP_HDRINCL: usize = 3;
+    // Read-only SOL_SOCKET options — Linux rejects set with ENOPROTOOPT.
+    if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+        // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
+        return Err(LxError::ENOPROTOOPT);
+    }
+    // `do_tcp_setsockopt` is TCP-only; other families must not swallow TCP_*.
+    if level == IPPROTO_TCP && !socket.is_tcp() {
+        return Err(LxError::ENOPROTOOPT);
+    }
+    // `do_ip_setsockopt` is inet-only; IP_HDRINCL further needs SOCK_RAW IPv4.
+    if level == IPPROTO_IP {
+        if !socket.is_inet() {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if opt == IP_HDRINCL && !socket.is_raw_ipv4() {
+            return Err(LxError::ENOPROTOOPT);
+        }
+    }
+    check_setsockopt_len(level, opt, data)?;
+    let known = match level {
+        // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
+        // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
+        SOL_SOCKET => matches!(opt, 2 | 6 | 7 | 8 | 9 | 13 | 15 | 20 | 21),
+        // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
+        IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
+        // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
+        IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 34 | 35),
+        _ => false,
+    };
+    if !known {
+        debug!(
+            "setsockopt: accepting unhandled level={} opt={}",
+            level, opt
+        );
+    }
+    Ok(0)
+}
+
+/// The `struct timeval` a `SO_RCVTIMEO` or `SO_SNDTIMEO` is set to, as
+/// [`sockopt_deadline`] reads it. `tv_usec` must be in `0..1_000_000`
+/// (`sock_set_timeout`).
+pub(crate) fn sockopt_timeval(data: &[u8]) -> LxResult<[u8; 16]> {
+    if data.len() < 16 {
+        return Err(LxError::EINVAL);
+    }
+    let mut tv = [0u8; 16];
+    tv.copy_from_slice(&data[..16]);
+    let usec = i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    if !(0..1_000_000).contains(&usec) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(tv)
 }
 
 /// Minimum `optlen` for a known sockopt before we accept it as a no-op.
