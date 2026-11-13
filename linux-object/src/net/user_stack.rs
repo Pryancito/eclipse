@@ -70,6 +70,20 @@
 //! a listener is numbered by the stack, with [`ACCEPTED_BIT`] set, so its
 //! numbers never meet the kernel's.
 //!
+//! # This machine
+//!
+//! What a program sends to 127.0.0.0/8, or to the stack's own address, is
+//! for another program of this machine, and neither the card nor the
+//! stack has anything to add to it. It does not go to the stack: the
+//! kernel has both sockets, so a datagram goes from the one straight onto
+//! the queue of the one that has the port, and a connection is two stream
+//! sockets joined to each other -- what one writes is what the other has
+//! to read, and what the other reads is the room the one gets back. The
+//! same sockets, queues and counts as above, with the kernel saying to
+//! each end what the stack would have said; no TCP, and no message. A
+//! socket bound to an address of 127.0.0.0/8 is this machine's alone: the
+//! stack is never told of it, so nothing from the card reaches it.
+//!
 //! IPv4 only, so far.
 
 use crate::error::{LxError, LxResult};
@@ -343,6 +357,9 @@ struct Inner {
     queued_bytes: usize,
     /// The port, once bound.
     port: Option<u16>,
+    /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
+    /// of this machine alone, which the stack is not told of.
+    here: Option<Ipv4Address>,
     /// The peer of a connected socket.
     remote: Option<IpEndpoint>,
     flags: OpenFlags,
@@ -363,6 +380,15 @@ impl Shared {
         inner.queue.push_back((from, data.to_vec()));
         self.bus.lock().set(Event::READABLE);
         true
+    }
+
+    /// Queue a datagram another program of this machine sent to `to`. A
+    /// socket bound to one address hears what is for that address.
+    fn deliver_here(&self, to: Ipv4Address, from: IpEndpoint, data: &[u8]) {
+        let here = self.inner.lock().here;
+        if here.is_none_or(|here| here == to) {
+            self.deliver(from, data);
+        }
     }
 
     /// `shutdown(SHUT_RD)`: whoever waits to read is told.
@@ -435,6 +461,15 @@ struct Table {
     /// TCP's ports, which are not UDP's.
     stream_ports: Ports,
     next_sock: u64,
+    /// Which datagram socket has each port: where a datagram from another
+    /// program of this machine goes.
+    bound: BTreeMap<u16, u64>,
+    /// Which stream socket listens on each port: where a connection from
+    /// another program of this machine goes.
+    listening: BTreeMap<u16, u64>,
+    /// The connections between two programs of this machine: each end's
+    /// number to the other's, and to 0 once the other end has closed.
+    joined: BTreeMap<u64, u64>,
 }
 
 /// The kernel's end of a stack that runs as a process.
@@ -601,27 +636,72 @@ impl StackLink {
     }
 
     /// Give a socket the port `wanted`, or any when it is 0, and tell the
-    /// stack. `EADDRINUSE` when another has it or none is left.
-    fn bind(&self, sock: u64, wanted: u16) -> LxResult<u16> {
-        let port = self.table.lock().ports.take(wanted)?;
-        if let Err(e) = self.tell(bind_message(sock, port), true) {
-            self.table.lock().ports.taken.remove(&port);
-            return Err(e);
+    /// stack, unless the socket is this machine's alone (`told`).
+    /// `EADDRINUSE` when another has it or none is left.
+    fn bind(&self, sock: u64, wanted: u16, told: bool) -> LxResult<u16> {
+        let port = {
+            let mut table = self.table.lock();
+            let port = table.ports.take(wanted)?;
+            table.bound.insert(port, sock);
+            port
+        };
+        if told {
+            if let Err(e) = self.tell(bind_message(sock, port), true) {
+                let mut table = self.table.lock();
+                table.ports.taken.remove(&port);
+                table.bound.remove(&port);
+                return Err(e);
+            }
         }
         Ok(port)
     }
 
     /// A socket is gone: its number and its port are free, and the stack
-    /// is told.
-    fn close(&self, sock: u64, port: Option<u16>) {
+    /// is told, if it was ever told of the socket (`told`).
+    fn close(&self, sock: u64, port: Option<u16>, told: bool) {
         {
             let mut table = self.table.lock();
             table.socks.remove(&sock);
             if let Some(port) = port {
                 table.ports.taken.remove(&port);
+                table.bound.remove(&port);
             }
         }
-        let _ = self.tell(close_message(sock), true);
+        if told {
+            let _ = self.tell(close_message(sock), true);
+        }
+    }
+
+    /// Whether `addr` is this machine: what is sent there is for another
+    /// of its programs, and never leaves it.
+    fn is_here(&self, addr: Ipv4Address) -> bool {
+        addr.is_loopback() || (!self.address.is_unspecified() && addr == self.address)
+    }
+
+    /// The address this machine speaks from to who it reaches at `to`,
+    /// which is one of its own: 127.0.0.1 within 127.0.0.0/8, as Linux
+    /// picks it, and the stack's address to the stack's address.
+    fn here_for(&self, to: Ipv4Address) -> Ipv4Address {
+        if to.is_loopback() {
+            Ipv4Address::new(127, 0, 0, 1)
+        } else {
+            to
+        }
+    }
+
+    /// A datagram from one program of this machine to another: onto the
+    /// queue of the socket that has the port, if one has. One that nobody
+    /// has it for is lost, as a datagram is.
+    fn send_here(&self, from: IpEndpoint, to: Ipv4Address, port: u16, data: &[u8]) {
+        let shared = {
+            let table = self.table.lock();
+            let sock = table.bound.get(&port);
+            sock.and_then(|sock| table.socks.get(sock))
+                .and_then(Weak::upgrade)
+        };
+        if let Some(shared) = shared {
+            shared.deliver_here(to, from, data);
+        }
     }
 }
 
@@ -649,6 +729,7 @@ impl ServedUdpSocket {
                 queue: VecDeque::new(),
                 queued_bytes: 0,
                 port: None,
+                here: None,
                 remote: None,
                 flags: OpenFlags::RDWR,
                 last_msg_flags: 0,
@@ -676,7 +757,7 @@ impl ServedUdpSocket {
         if let Some(port) = self.shared.inner.lock().port {
             return Ok(port);
         }
-        let port = self.link.bind(self.sock, 0)?;
+        let port = self.link.bind(self.sock, 0, true)?;
         self.shared.inner.lock().port = Some(port);
         Ok(port)
     }
@@ -734,8 +815,11 @@ impl ServedUdpSocket {
 
 impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
-        let port = self.shared.inner.lock().port;
-        self.link.close(self.sock, port);
+        let (port, here) = {
+            let inner = self.shared.inner.lock();
+            (inner.port, inner.here)
+        };
+        self.link.close(self.sock, port, here.is_none());
     }
 }
 
@@ -758,6 +842,26 @@ impl Socket for ServedUdpSocket {
         let IpAddress::Ipv4(addr) = to.addr else {
             return Err(LxError::EAFNOSUPPORT);
         };
+        let here = self.shared.inner.lock().here;
+        if self.link.is_here(addr) {
+            // No card, so no frame to fit: the longest datagram there is.
+            if data.len() > MAX_DATAGRAM {
+                return Err(LxError::EMSGSIZE);
+            }
+            if self.link.is_dead() {
+                return Err(LxError::ENETDOWN);
+            }
+            let port = self.autobind()?;
+            let from = here.unwrap_or_else(|| self.link.here_for(addr));
+            let from = IpEndpoint::new(IpAddress::Ipv4(from), port);
+            self.link.send_here(from, addr, to.port, data);
+            return Ok(data.len());
+        }
+        // `ip_route_output`: nothing leaves the machine from an address
+        // that is only the machine's.
+        if here.is_some() {
+            return Err(LxError::EINVAL);
+        }
         if data.len() > self.link.max_datagram {
             return Err(LxError::EMSGSIZE);
         }
@@ -800,8 +904,16 @@ impl Socket for ServedUdpSocket {
         if self.shared.inner.lock().port.is_some() {
             return Err(LxError::EINVAL);
         }
-        let port = self.link.bind(self.sock, local.port)?;
-        self.shared.inner.lock().port = Some(port);
+        // At an address of 127.0.0.0/8 it is this machine's alone: the
+        // stack, which would bring it what the card hears, is not told.
+        let here = match local.addr {
+            IpAddress::Ipv4(addr) if addr.is_loopback() => Some(addr),
+            _ => None,
+        };
+        let port = self.link.bind(self.sock, local.port, here.is_none())?;
+        let mut inner = self.shared.inner.lock();
+        inner.port = Some(port);
+        inner.here = here;
         Ok(0)
     }
 
@@ -817,10 +929,10 @@ impl Socket for ServedUdpSocket {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let port = self.shared.inner.lock().port.unwrap_or(0);
+        let inner = self.shared.inner.lock();
         Some(Endpoint::Ip(IpEndpoint::new(
-            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
-            port,
+            IpAddress::Ipv4(inner.here.unwrap_or(Ipv4Address::UNSPECIFIED)),
+            inner.port.unwrap_or(0),
         )))
     }
 
@@ -1115,6 +1227,100 @@ mod tests {
         // Longer than UDP carries.
         let long = alloc::vec![0u8; DATAGRAM_AT + MAX_DATAGRAM + 1];
         assert_eq!(parse_send(&long), None);
+    }
+
+    #[test]
+    fn a_datagram_for_this_machine_goes_from_socket_to_socket() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let here = [127, 0, 0, 1];
+        let server = stack.socket();
+        assert_eq!(Socket::bind(&server, any(5353)), Ok(0));
+        let client = stack.socket();
+        while stack.told().is_some() {}
+
+        // The sender gets a port, which the stack is told as of any bound
+        // socket, and that is all the stack hears of it.
+        assert_eq!(Socket::write(&client, b"hola", to(here, 5353)), Ok(4));
+        let sent_from = port(&client);
+        assert_eq!(stack.told(), Some(bind_message(client.sock, sent_from)));
+        assert_eq!(stack.told(), None);
+        let mut buf = [0u8; 16];
+        assert!(readable(&server));
+        assert_eq!(recv(&server, &mut buf), (Ok(4), at(here, sent_from)));
+        assert_eq!(&buf[..4], b"hola");
+        // And the answer, to a socket connected to who it asked: it hears
+        // it, since it comes from there.
+        async_std::task::block_on(Socket::connect(&client, to(here, 5353).unwrap())).unwrap();
+        assert_eq!(
+            Socket::write(&server, b"que tal", to(here, sent_from)),
+            Ok(7)
+        );
+        assert_eq!(recv(&client, &mut buf), (Ok(7), at(here, 5353)));
+
+        // The stack's own address is this machine too, and is where the
+        // datagram then comes from.
+        assert_eq!(Socket::write(&client, b"yo", to(STACK_ADDR, 5353)), Ok(2));
+        assert_eq!(recv(&server, &mut buf), (Ok(2), at(STACK_ADDR, sent_from)));
+        // No frame of a card to fit: longer than the stack carries goes.
+        let long = alloc::vec![9u8; MAX_FOR_TESTS + 1000];
+        assert_eq!(
+            Socket::write(&client, &long, to(here, 5353)),
+            Ok(long.len())
+        );
+        let mut big = alloc::vec![0u8; 4096];
+        assert_eq!(recv(&server, &mut big).0, Ok(long.len()));
+        // A port nobody has: lost, as a datagram is.
+        assert_eq!(Socket::write(&client, b"nadie", to(here, 9)), Ok(5));
+        assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn a_datagram_socket_bound_to_this_machine_is_not_the_stacks() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let here = [127, 0, 0, 1];
+        let server = stack.socket();
+        assert_eq!(
+            Socket::bind(&server, Endpoint::Ip(at([127, 0, 0, 53], 53))),
+            Ok(0)
+        );
+        // The stack would bring it what the card hears for the port.
+        assert_eq!(stack.told(), None);
+        assert_eq!(
+            ip(Socket::endpoint(&server).unwrap()),
+            at([127, 0, 0, 53], 53)
+        );
+
+        let client = stack.socket();
+        assert_eq!(Socket::write(&client, b"a", to([127, 0, 0, 53], 53)), Ok(1));
+        // For another address of this machine's it is not there.
+        assert_eq!(Socket::write(&client, b"b", to(here, 53)), Ok(1));
+        assert_eq!(Socket::write(&client, b"c", to(STACK_ADDR, 53)), Ok(1));
+        let mut buf = [0u8; 16];
+        let (n, from) = recv(&server, &mut buf);
+        assert_eq!((n, &buf[..1]), (Ok(1), &b"a"[..]));
+        assert_eq!(recv(&server, &mut buf).0, Err(LxError::EAGAIN));
+        // It answers from the address it has, and to this machine only.
+        assert_eq!(
+            Socket::write(&server, b"r", Some(Endpoint::Ip(from))),
+            Ok(1)
+        );
+        assert_eq!(recv(&client, &mut buf), (Ok(1), at([127, 0, 0, 53], 53)));
+        assert_eq!(
+            Socket::write(&server, b"x", to(HOST, 53)),
+            Err(LxError::EINVAL)
+        );
+
+        // The stack heard of the client's port and nothing else, and does
+        // not hear of the server's close.
+        while let Some(m) = stack.told() {
+            assert_eq!(m, bind_message(client.sock, port(&client)));
+        }
+        drop(server);
+        assert_eq!(stack.told(), None);
+        let rebound = stack.socket();
+        assert_eq!(Socket::bind(&rebound, any(53)), Ok(0));
     }
 
     #[test]

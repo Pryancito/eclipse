@@ -19,13 +19,18 @@
 //! Which programs: the ones started by `eclipse-netstack-use`; every other
 //! socket is the kernel's stack's. The address is written on the command
 //! line or leased from a DHCP server, and one gateway carries what is not
-//! for the card's network ([`socks::lease`]). IPv4 only, no loopback, and
-//! no fragments.
+//! for the card's network ([`socks::lease`]). IPv4 only, and no
+//! fragments.
+//!
+//! What one program of the machine says to another, at 127.0.0.0/8 or at
+//! the stack's own address, never comes here: the kernel has both sockets
+//! and joins them, with no stack between (`linux-object/src/net/user_stack.rs`).
 //!
 //! [`port`] is the stack's side of a served card and [`socks`] the sockets
 //! over it: all of this that can be tested without a card or a kernel.
 //! `scripts/udp_ping.py` and `scripts/tcp_bench.py` measure it against the
-//! kernel's stack.
+//! kernel's stack from the host, and `eclipse-tcp-bench` from a program of
+//! the guest, which is how what never reaches the card is timed.
 
 pub mod port;
 pub mod socks;

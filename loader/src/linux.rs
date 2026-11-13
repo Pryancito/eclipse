@@ -603,7 +603,9 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 ///
 /// Which sockets: the IPv4 datagram and stream sockets of the processes
 /// that asked for this stack with [`ECLIPSE_NETSTACK_USE`]. Every other
-/// socket is the kernel's, as before.
+/// socket is the kernel's, as before. What one of those sockets sends to
+/// another at 127.0.0.0/8 or at `address` stays in the kernel, which has
+/// both: the stack is not told.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 
