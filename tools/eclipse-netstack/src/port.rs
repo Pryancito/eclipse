@@ -273,13 +273,14 @@ pub(crate) mod testing {
     //! sockets over it are written with.
 
     use super::*;
-    use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache};
+    use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache, Routes};
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::socket::SocketSet;
     use smoltcp::wire::{
-        ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-        EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-        Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+        ArpOperation, ArpPacket, ArpRepr, DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress,
+        EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
+        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
+        TcpSeqNumber, UdpPacket, UdpRepr,
     };
     use std::collections::BTreeMap;
 
@@ -358,6 +359,7 @@ pub(crate) mod testing {
                 .ethernet_addr(OURS)
                 .neighbor_cache(NeighborCache::new(BTreeMap::new()))
                 .ip_addrs(vec![IpCidr::new(IpAddress::Ipv4(OUR_IP), 24)])
+                .routes(Routes::new(BTreeMap::new()))
                 .finalize();
             Bench {
                 window: Window(window),
@@ -407,10 +409,19 @@ pub(crate) mod testing {
     }
 
     fn arp(operation: ArpOperation, to: EthernetAddress, target: Ipv4Address) -> Vec<u8> {
+        arp_from(THEIR_IP, operation, to, target)
+    }
+
+    fn arp_from(
+        from: Ipv4Address,
+        operation: ArpOperation,
+        to: EthernetAddress,
+        target: Ipv4Address,
+    ) -> Vec<u8> {
         let arp = ArpRepr::EthernetIpv4 {
             operation,
             source_hardware_addr: THEIRS,
-            source_protocol_addr: THEIR_IP,
+            source_protocol_addr: from,
             target_hardware_addr: if to == EthernetAddress::BROADCAST {
                 EthernetAddress([0; 6])
             } else {
@@ -438,6 +449,12 @@ pub(crate) mod testing {
     /// "I have THEIR_IP", from THEIRS to us.
     pub fn arp_reply() -> Vec<u8> {
         arp(ArpOperation::Reply, OURS, OUR_IP)
+    }
+
+    /// "I have `from`", from THEIRS to us: the card of THEIRS answering for
+    /// another address, as a gateway's does.
+    pub fn arp_reply_from(from: Ipv4Address) -> Vec<u8> {
+        arp_from(from, ArpOperation::Reply, OURS, OUR_IP)
     }
 
     /// Whether `frame` is us asking everybody who has `target`.
@@ -469,6 +486,17 @@ pub(crate) mod testing {
         len: usize,
         fill: impl FnOnce(&mut [u8]),
     ) -> Vec<u8> {
+        ipv4_frame_for(OURS, to, protocol, len, fill)
+    }
+
+    /// The same, to the card `card`: ours, or everybody's.
+    fn ipv4_frame_for(
+        card: EthernetAddress,
+        to: Ipv4Address,
+        protocol: IpProtocol,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Vec<u8> {
         let ip = Ipv4Repr {
             src_addr: THEIR_IP,
             dst_addr: to,
@@ -478,7 +506,7 @@ pub(crate) mod testing {
         };
         let eth = EthernetRepr {
             src_addr: THEIRS,
-            dst_addr: OURS,
+            dst_addr: card,
             ethertype: EthernetProtocol::Ipv4,
         };
         let mut bytes = vec![0u8; eth.buffer_len() + ip.buffer_len() + len];
@@ -521,6 +549,83 @@ pub(crate) mod testing {
                 &ChecksumCapabilities::default(),
             )
         })
+    }
+
+    /// What a DHCP server offers, and then agrees to.
+    pub struct Offered {
+        pub address: Ipv4Address,
+        pub mask: Ipv4Address,
+        pub router: Option<Ipv4Address>,
+        pub dns: [Option<Ipv4Address>; 3],
+        /// How long the lease lasts.
+        pub seconds: u32,
+    }
+
+    /// THEIRS, as the DHCP server, answers transaction `xid` with `kind`
+    /// (an offer, or the acknowledgement of a request): to everybody, as a
+    /// server does for a client that has no address yet.
+    pub fn dhcp_frame(kind: DhcpMessageType, xid: u32, offered: &Offered) -> Vec<u8> {
+        let dhcp = DhcpRepr {
+            message_type: kind,
+            transaction_id: xid,
+            client_hardware_address: OURS,
+            client_ip: Ipv4Address::UNSPECIFIED,
+            your_ip: offered.address,
+            server_ip: THEIR_IP,
+            router: offered.router,
+            subnet_mask: Some(offered.mask),
+            relay_agent_ip: Ipv4Address::UNSPECIFIED,
+            broadcast: false,
+            requested_ip: None,
+            client_identifier: None,
+            server_identifier: Some(THEIR_IP),
+            parameter_request_list: None,
+            dns_servers: Some(offered.dns),
+            max_size: None,
+            lease_duration: Some(offered.seconds),
+        };
+        let udp = UdpRepr {
+            src_port: 67,
+            dst_port: 68,
+        };
+        let (everybody, len) = (Ipv4Address::BROADCAST, dhcp.buffer_len());
+        ipv4_frame_for(
+            EthernetAddress::BROADCAST,
+            everybody,
+            IpProtocol::Udp,
+            8 + len,
+            |payload| {
+                udp.emit(
+                    &mut UdpPacket::new_unchecked(payload),
+                    &THEIR_IP.into(),
+                    &everybody.into(),
+                    len,
+                    |room| dhcp.emit(&mut DhcpPacket::new_unchecked(room)).unwrap(),
+                    &ChecksumCapabilities::default(),
+                )
+            },
+        )
+    }
+
+    /// The DHCP message `frame` carries from us to everybody's server: its
+    /// kind, its transaction, and the address it asks for.
+    pub fn dhcp_of(frame: &[u8]) -> (DhcpMessageType, u32, Option<Ipv4Address>) {
+        let frame = EthernetFrame::new_checked(frame).unwrap();
+        assert_eq!(frame.ethertype(), EthernetProtocol::Ipv4);
+        assert_eq!(
+            (frame.src_addr(), frame.dst_addr()),
+            (OURS, EthernetAddress::BROADCAST)
+        );
+        let ip = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.protocol(), IpProtocol::Udp);
+        assert_eq!(ip.dst_addr(), Ipv4Address::BROADCAST);
+        let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (68, 67));
+        let dhcp = DhcpPacket::new_checked(udp.payload()).unwrap();
+        let dhcp = DhcpRepr::parse(&dhcp).unwrap();
+        assert_eq!(dhcp.client_hardware_address, OURS);
+        (dhcp.message_type, dhcp.transaction_id, dhcp.requested_ip)
     }
 
     /// A TCP segment: its ports, what it does, its numbers and what it

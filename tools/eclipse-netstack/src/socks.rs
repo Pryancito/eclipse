@@ -39,6 +39,7 @@ use smoltcp::socket::{SocketHandle, SocketSet, UdpPacketMetadata, UdpSocket, Udp
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
+pub mod lease;
 pub mod tcp;
 use tcp::{OP_CONNECT, OP_LISTEN, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 
@@ -79,7 +80,8 @@ pub enum Refused {
     NoSocket,
     /// A datagram longer than one frame carries.
     TooLong,
-    /// A destination that is not on the card's network.
+    /// A destination that is not on the card's network, with no gateway
+    /// to send it through.
     Unreachable,
     /// The socket has [`TX_DATAGRAMS`] waiting already, or a `WRITE`
     /// carries more than the connection was said to take.
@@ -138,6 +140,9 @@ pub struct Stack<D: for<'d> Device<'d>> {
     /// Whether [`arrived`](Self::arrived) has given the kernel bytes for a
     /// program since [`brought_bytes`](Self::brought_bytes) last asked.
     brought: bool,
+    /// Where what is not for the card's network goes, when anywhere.
+    gateway: Option<Ipv4Address>,
+    lease: lease::Leasing,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -150,6 +155,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             streams: tcp::Streams::default(),
             now: Instant::from_millis(0),
             brought: false,
+            gateway: None,
+            lease: lease::Leasing::default(),
         }
     }
 
@@ -179,17 +186,19 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         self.socks.contains_key(&sock) || self.streams.knows(sock)
     }
 
-    /// Whether `addr` can be sent to: it is on the card's network, or
-    /// everybody. There are no routes yet, and a datagram smoltcp cannot
-    /// place stays at the head of its socket's queue with every later one
-    /// behind it.
+    /// Whether `addr` can be sent to: it is on the card's network, it is
+    /// everybody, or there is a gateway to send it through. A datagram
+    /// smoltcp cannot place stays at the head of its socket's queue with
+    /// every later one behind it, so one that cannot go is not queued.
     fn reaches(&self, addr: Ipv4Address) -> bool {
         addr.is_broadcast()
             || self.iface.ip_addrs().iter().any(|cidr| match cidr {
-                IpCidr::Ipv4(cidr) => cidr.contains_addr(&addr),
+                // No address yet is not the network of everything.
+                IpCidr::Ipv4(cidr) => !cidr.address().is_unspecified() && cidr.contains_addr(&addr),
                 #[allow(unreachable_patterns)]
                 _ => false,
             })
+            || (self.gateway.is_some() && addr.is_unicast() && !addr.is_loopback())
     }
 
     /// Do what a message from the kernel says. `Ok(true)` when that left
@@ -264,6 +273,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         // What poll has to say about a frame it did not understand is not
         // news.
         let _ = self.iface.poll(&mut self.set, now);
+        self.lease_turn();
     }
 
     /// Make `m` the next message for the kernel of what the last
@@ -329,7 +339,7 @@ mod tests {
     use crate::port::testing::*;
     use smoltcp::wire::{IpProtocol, Ipv4Packet, UdpPacket};
 
-    fn message(op: u32, sock: u64, rest: &[u8]) -> Vec<u8> {
+    pub(super) fn message(op: u32, sock: u64, rest: &[u8]) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(&0u32.to_le_bytes());
         m.extend_from_slice(&op.to_le_bytes());
@@ -338,11 +348,11 @@ mod tests {
         m
     }
 
-    fn bind(sock: u64, port: u16) -> Vec<u8> {
+    pub(super) fn bind(sock: u64, port: u16) -> Vec<u8> {
         message(OP_BIND, sock, &port.to_le_bytes())
     }
 
-    fn send(sock: u64, to: Ipv4Address, port: u16, data: &[u8]) -> Vec<u8> {
+    pub(super) fn send(sock: u64, to: Ipv4Address, port: u16, data: &[u8]) -> Vec<u8> {
         let mut rest = to.0.to_vec();
         rest.extend_from_slice(&port.to_le_bytes());
         rest.extend_from_slice(&[0, 0]);
