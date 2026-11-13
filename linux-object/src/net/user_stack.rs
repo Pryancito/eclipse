@@ -1212,6 +1212,62 @@ impl ServedUdpSocket {
     }
 }
 
+/// A question the kernel itself asks for a program whose sockets are
+/// served, and waits the answer of: its resolver's, to a name server.
+/// The program's own sockets go by the stack that runs as a process, so
+/// what the kernel asks on its behalf goes the same way, from a datagram
+/// socket of this machine like any other.
+pub struct Asked {
+    socket: ServedUdpSocket,
+    /// When the wait for the answer ends.
+    until: core::time::Duration,
+}
+
+/// Send `question` to `to` by the stack of `link`, to wait `patience` for
+/// what comes back. What a `sendto` would say when it cannot go:
+/// `ENETDOWN` with no stack, `EAFNOSUPPORT` for an IPv6 address.
+pub async fn ask(
+    link: &Arc<StackLink>,
+    to: IpEndpoint,
+    question: &[u8],
+    patience: core::time::Duration,
+) -> LxResult<Asked> {
+    let socket = ServedUdpSocket::new(link.clone(), false)?;
+    // Connected: what anybody else sends to its port is not an answer.
+    socket.connect(Endpoint::Ip(to)).await?;
+    Socket::write(&socket, question, None)?;
+    Ok(Asked {
+        socket,
+        until: kernel_hal::timer::timer_now() + patience,
+    })
+}
+
+impl Asked {
+    /// The next datagram from who was asked. `ETIMEDOUT` when the
+    /// patience ran out first, `EINTR` when a signal ended the wait.
+    pub async fn answer(&self) -> LxResult<Vec<u8>> {
+        let now = kernel_hal::timer::timer_now();
+        let left = self.until.checked_sub(now).filter(|left| !left.is_zero());
+        let left = left.ok_or(LxError::ETIMEDOUT)?;
+        // The read gives up as `SO_RCVTIMEO` has it: all zero would be
+        // never.
+        let micros = left.as_micros().max(1) as u64;
+        let mut tv = [0u8; 16];
+        tv[..8].copy_from_slice(&((micros / 1_000_000) as i64).to_ne_bytes());
+        tv[8..].copy_from_slice(&((micros % 1_000_000) as i64).to_ne_bytes());
+        self.socket.shared.inner.lock().patience.receive = tv;
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        match self.socket.shared.receive(false, &mut buf, true).await.0 {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Err(LxError::EAGAIN) => Err(LxError::ETIMEDOUT),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
         let (port, here) = {
@@ -1497,6 +1553,8 @@ mod tests {
     //! The socket against a stack that is the test: it holds the other end
     //! of the channel, reads what the kernel tells it and writes what
     //! arrived. Each test's stack serves sockets of its own.
+
+    extern crate std;
 
     use super::*;
     use crate::net::NET_TEST_LOCK as LOCK;
@@ -2236,6 +2294,70 @@ mod tests {
         assert!(took >= core::time::Duration::from_millis(30), "{:?}", took);
         stack.arrives(s.sock, HOST, 53, b"tarde");
         assert_eq!(recv(&s, &mut buf), (Ok(5), at(HOST, 53)));
+    }
+
+    #[test]
+    fn a_question_of_the_kernels_goes_by_the_stack_and_waits_for_its_answer() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let patience = core::time::Duration::from_secs(5);
+        let waiter = {
+            let link = stack.link.clone();
+            std::thread::spawn(move || {
+                async_std::task::block_on(async {
+                    let asked = ask(&link, at(HOST, 53), b"who?", patience).await?;
+                    let first = asked.answer().await?;
+                    let second = asked.answer().await?;
+                    Ok::<_, LxError>((first, second))
+                })
+            })
+        };
+        // It leaves as any program's datagram does: a socket with a port
+        // of its own, then the datagram.
+        let sock = loop {
+            match stack.told() {
+                Some(m) if parse_header(&m).map(|h| h.0) == Some(OP_SEND) => {
+                    assert_eq!(parse_send(&m), Some((HOST, 53, &b"who?"[..])));
+                    break parse_header(&m).unwrap().1;
+                }
+                _ => std::thread::yield_now(),
+            }
+        };
+        // What somebody else sends to that port is no answer.
+        stack.arrives(sock, [10, 0, 9, 77], 53, b"not who was asked");
+        stack.arrives(sock, HOST, 53, b"one");
+        stack.arrives(sock, HOST, 53, b"two");
+        assert_eq!(
+            waiter.join().unwrap(),
+            Ok((b"one".to_vec(), b"two".to_vec()))
+        );
+        // And the socket goes with the question.
+        assert_eq!(stack.told(), Some(close_message(sock)));
+
+        // No answer is `ETIMEDOUT` when the patience runs out, and from
+        // then on.
+        let short = core::time::Duration::from_millis(30);
+        let asked =
+            async_std::task::block_on(ask(&stack.link, at(HOST, 53), b"again", short)).unwrap();
+        let before = kernel_hal::timer::timer_now();
+        assert_eq!(
+            async_std::task::block_on(asked.answer()),
+            Err(LxError::ETIMEDOUT)
+        );
+        assert!(kernel_hal::timer::timer_now() - before >= short);
+        assert_eq!(
+            async_std::task::block_on(asked.answer()),
+            Err(LxError::ETIMEDOUT)
+        );
+
+        // What cannot be sent is said when it is asked: a server the
+        // stack has no way to (IPv6), and no stack at all.
+        let six = IpEndpoint::new(IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 53);
+        let refused = async_std::task::block_on(ask(&stack.link, six, b"x", short)).err();
+        assert_eq!(refused, Some(LxError::EAFNOSUPPORT));
+        let nobody = StackLink::new();
+        let refused = async_std::task::block_on(ask(&nobody, at(HOST, 53), b"x", short)).err();
+        assert_eq!(refused, Some(LxError::ENETDOWN));
     }
 
     /// A socket of `link` that does not wait.

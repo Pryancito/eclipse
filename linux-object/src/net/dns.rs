@@ -2,6 +2,7 @@
 //! and `/etc/resolv.conf`.
 
 use crate::error::{LxError, LxResult};
+use crate::net::user_stack::{self, StackLink};
 use crate::net::{drain_net_poll, local_udp_endpoint_for, UDP_METADATA_BUF};
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::time::Duration;
@@ -76,6 +77,20 @@ pub async fn resolve(
     hostname: &str,
     family: DnsFamily,
 ) -> LxResult<Vec<IpAddress>> {
+    resolve_by(root, hostname, family, None).await
+}
+
+/// [`resolve`], with the questions to the nameservers carried by the
+/// stack that runs as a process when `stack` is its sockets: how the name
+/// is resolved for a program whose own sockets are that stack's. The
+/// kernel's stack may have no card at all then, and a question sent by it
+/// would go nowhere.
+pub async fn resolve_by(
+    root: &Arc<dyn INode>,
+    hostname: &str,
+    family: DnsFamily,
+    stack: Option<&Arc<StackLink>>,
+) -> LxResult<Vec<IpAddress>> {
     if hostname.is_empty() || hostname.len() > 253 {
         return Err(LxError::EINVAL);
     }
@@ -96,12 +111,12 @@ pub async fn resolve(
 
     for server in servers {
         if want_v4 {
-            if let Ok(addrs) = query_at(server, hostname, QTYPE_A).await {
+            if let Ok(addrs) = query_at(server, hostname, QTYPE_A, stack).await {
                 out.extend(addrs);
             }
         }
         if want_v6 {
-            if let Ok(addrs) = query_at(server, hostname, QTYPE_AAAA).await {
+            if let Ok(addrs) = query_at(server, hostname, QTYPE_AAAA, stack).await {
                 out.extend(addrs);
             }
         }
@@ -349,9 +364,18 @@ fn parse_ipv6(s: &str) -> Option<Ipv6Address> {
     Some(Ipv6Address::from_bytes(&bytes))
 }
 
-async fn query_at(server: IpAddress, name: &str, qtype: u16) -> LxResult<Vec<IpAddress>> {
+async fn query_at(
+    server: IpAddress,
+    name: &str,
+    qtype: u16,
+    stack: Option<&Arc<StackLink>>,
+) -> LxResult<Vec<IpAddress>> {
     let id = (super::rand() & 0xffff) as u16;
     let query = build_query(name, id, qtype)?;
+    if let Some(link) = stack {
+        let reply = served_exchange(link, IpEndpoint::new(server, DNS_PORT), &query, id).await?;
+        return parse_addresses(&reply, qtype);
+    }
     let (local, remote) = match server {
         IpAddress::Ipv4(v4) => (
             local_udp_endpoint_for(IpAddress::Ipv4(v4)),
@@ -508,6 +532,24 @@ async fn udp_exchange(
     }
 }
 
+/// [`udp_exchange`] by the stack that runs as a process: the question
+/// leaves from a datagram socket of `link`, and the answer is the first
+/// datagram back from the server that carries the question's id.
+async fn served_exchange(
+    link: &Arc<StackLink>,
+    remote: IpEndpoint,
+    query: &[u8],
+    expect_id: u16,
+) -> LxResult<Vec<u8>> {
+    let asked = user_stack::ask(link, remote, query, REPLY_TIMEOUT).await?;
+    loop {
+        let reply = asked.answer().await?;
+        if reply.len() >= 2 && u16::from_be_bytes([reply[0], reply[1]]) == expect_id {
+            return Ok(reply);
+        }
+    }
+}
+
 fn skip_name(data: &[u8], mut off: usize) -> Option<usize> {
     let mut jumps = 0;
     loop {
@@ -601,6 +643,8 @@ mod dns_tests {
     //! merely broken answer reaches first. The failure modes are quiet:
     //! a length read past the end of the packet, a `::` expanded to the wrong
     //! number of zero groups, an address taken from the wrong record.
+
+    extern crate std;
 
     use super::*;
 
@@ -1029,6 +1073,69 @@ mod dns_tests {
         }
         assert!(wakes <= 37, "{} wakes", wakes);
         assert_eq!(REPLY_TIMEOUT, Duration::from_millis(1600));
+    }
+
+    /// A program whose sockets are the stack's that runs as a process has
+    /// its names asked by that stack: here of a name server that is a
+    /// program of the same machine, so the question goes from one served
+    /// socket to another and the kernel's own stack is never part of it.
+    #[test]
+    fn a_name_is_asked_by_the_stack_that_runs_as_a_process_for_its_programs() {
+        use crate::net::user_stack::ServedUdpSocket;
+        use crate::net::{Endpoint, Socket};
+        use rcore_fs::vfs::{FileSystem, FileType};
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let conf = etc.create("resolv.conf", FileType::File, 0o644).unwrap();
+        conf.write_at(0, b"nameserver 127.0.0.1\n").unwrap();
+
+        let link = StackLink::new();
+        let server = ServedUdpSocket::new(link.clone(), false).unwrap();
+        let here = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), DNS_PORT);
+        assert_eq!(Socket::bind(&server, Endpoint::Ip(here)), Ok(0));
+        // It answers the A question with one address and the AAAA one
+        // with none.
+        let answering = std::thread::spawn(move || {
+            async_std::task::block_on(async {
+                for _ in 0..2 {
+                    let mut buf = [0u8; 512];
+                    let (n, from) = Socket::read(&server, &mut buf).await;
+                    let n = n.unwrap();
+                    let qtype = u16::from_be_bytes([buf[n - 4], buf[n - 3]]);
+                    let mut reply = buf[..n].to_vec();
+                    reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                    if qtype == QTYPE_A {
+                        reply[7] = 1;
+                        reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                        reply.extend_from_slice(&[10, 0, 9, 1]);
+                    }
+                    assert_eq!(Socket::write(&server, &reply, Some(from)), Ok(reply.len()));
+                }
+            })
+        });
+        let got = async_std::task::block_on(resolve_by(
+            &root,
+            "probe.eclipse",
+            DnsFamily::Unspec,
+            Some(&link),
+        ));
+        assert_eq!(got, Ok(alloc::vec![IpAddress::v4(10, 0, 9, 1)]));
+        answering.join().unwrap();
+
+        // A name server beyond the machine cannot be asked while no stack
+        // serves, and that is known at once: nothing waits for an answer.
+        conf.resize(0).unwrap();
+        conf.write_at(0, b"nameserver 10.0.9.3\n").unwrap();
+        let before = kernel_hal::timer::timer_now();
+        let got = async_std::task::block_on(resolve_by(
+            &root,
+            "probe.eclipse",
+            DnsFamily::Unspec,
+            Some(&link),
+        ));
+        assert_eq!(got, Err(LxError::ENOENT));
+        assert!(kernel_hal::timer::timer_now() - before < REPLY_TIMEOUT);
     }
 
     #[test]

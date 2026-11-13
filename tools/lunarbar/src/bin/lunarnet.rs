@@ -1120,18 +1120,38 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
         }
         dns.extend(p.dns);
     }
+    // The card of a stack that runs as a process is not configured here,
+    // but the name servers fixed for it are the machine's all the same:
+    // `resolv.conf` knows no interfaces.
+    let servers = Path::new(netconf::SERVERS);
+    for n in netconf::of_stacks(Path::new(SYS_NET), servers) {
+        dns.extend(netconf::plan(&netconf::settings_for(&conf, &n)).dns);
+    }
     if dns.is_empty() {
         let _ = std::fs::remove_file(DNS_MARK);
+        // Not fixed (any more): the servers are a lease's. A `udhcpc`
+        // writes its own when it gets one; a stack that has its lease
+        // already would not say them again, so they are written from what
+        // it publishes.
+        let leased = netconf::stack_dns(Path::new(SYS_NET), servers);
+        if !leased.is_empty() {
+            write_resolv_conf(&netconf::lease_resolv_conf(&leased));
+        }
     } else {
         let _ = std::fs::create_dir_all(Path::new(DNS_MARK).parent().unwrap_or(Path::new("/run")));
         let _ = std::fs::write(DNS_MARK, "");
-        let tmp = "/etc/resolv.conf.lunarnet";
-        if std::fs::write(tmp, netconf::resolv_conf(&dns)).is_ok() {
-            let _ = std::fs::rename(tmp, "/etc/resolv.conf");
-        }
+        write_resolv_conf(&netconf::resolv_conf(&dns));
     }
     eprintln!("lunarnet: {} interfaz(es), {} cliente(s) DHCP", names.len(), clients.len());
     (clients, seen)
+}
+
+/// `/etc/resolv.conf` says `text` from now on, whole or not at all.
+fn write_resolv_conf(text: &str) {
+    let tmp = "/etc/resolv.conf.lunarnet";
+    if std::fs::write(tmp, text).is_ok() {
+        let _ = std::fs::rename(tmp, "/etc/resolv.conf");
+    }
 }
 
 /// Where the kernel lists its interfaces.

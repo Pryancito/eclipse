@@ -479,6 +479,53 @@ pub fn to_configure(sys: &Path, servers: &Path) -> (Vec<String>, bool) {
     (names, !cards.is_empty())
 }
 
+/// The interfaces that are the card of a stack that runs as a process:
+/// the ones [`to_configure`] leaves out.
+pub fn of_stacks(sys: &Path, servers: &Path) -> Vec<String> {
+    let ours = to_configure(sys, servers).0;
+    interfaces(sys).into_iter().filter(|n| !ours.contains(n)).collect()
+}
+
+/// The name servers the stacks that run as processes were leased: the
+/// `dns=` of each `stack.*` file of `servers` (`none` when its lease named
+/// none, or it has no lease), each once. Of the stacks whose card is one
+/// of the machine's interfaces in `sys`: one that serves only the
+/// programs that asked for it does not name the machine's servers.
+pub fn stack_dns(sys: &Path, servers: &Path) -> Vec<IpAddr> {
+    let shown: Vec<String> = interfaces(sys)
+        .iter()
+        .filter_map(|n| std::fs::read_to_string(sys.join(n).join("address")).ok())
+        .map(|a| a.trim().to_ascii_lowercase())
+        .collect();
+    let files = std::fs::read_dir(servers).map(|rd| rd.flatten().collect()).unwrap_or_else(|_| Vec::new());
+    let mut names: Vec<_> = files
+        .iter()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("stack.") && !n.ends_with(".tmp")))
+        .map(|e| e.path())
+        .collect();
+    names.sort();
+    let of_shown = |text: &String| {
+        let mac = text.lines().find_map(|l| l.strip_prefix("mac=")).unwrap_or("");
+        shown.contains(&mac.trim().to_ascii_lowercase())
+    };
+    let mut dns: Vec<IpAddr> = Vec::new();
+    for text in names.iter().filter_map(|p| std::fs::read_to_string(p).ok()).filter(of_shown) {
+        let said = text.lines().find_map(|l| l.strip_prefix("dns=")).unwrap_or("");
+        for d in said.split(',').filter_map(|d| d.trim().parse().ok()) {
+            if !dns.contains(&d) {
+                dns.push(d);
+            }
+        }
+    }
+    dns
+}
+
+/// `resolv.conf` for the servers of a lease, as whoever holds one writes
+/// it: the lease script of `udhcpc`, and a stack that runs as a process.
+pub fn lease_resolv_conf(dns: &[IpAddr]) -> String {
+    dns.iter().map(|d| format!("nameserver {d}\n")).collect()
+}
+
 /// Put it together: sysfs for the link, `ip` output for the addresses.
 pub fn live(sys: &Path, ip_addr: &str, route4: &str, route6: &str) -> Vec<Live> {
     let addrs = parse_ip_addr(ip_addr);
@@ -682,6 +729,46 @@ mod tests {
         assert_eq!(to_configure(&sys, &servers), (Vec::new(), true));
         // What still shows it is the list for the panel.
         assert_eq!(interfaces(&sys), ["eth0"]);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn the_name_servers_of_a_stacks_lease_are_read_from_what_it_publishes() {
+        let top = std::env::temp_dir().join(format!("lunarnet-stackdns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (sys, servers) = (top.join("sys"), top.join("servers"));
+        for (n, mac) in [("eth0", "52:54:00:12:34:56"), ("eth1", "52:54:00:aa:bb:cc")] {
+            std::fs::create_dir_all(sys.join(n)).unwrap();
+            std::fs::write(sys.join(n).join("address"), format!("{mac}\n")).unwrap();
+        }
+        // No stack: no card of one, and no servers.
+        assert!(of_stacks(&sys, &servers).is_empty());
+        assert!(stack_dns(&sys, &servers).is_empty());
+        std::fs::create_dir_all(&servers).unwrap();
+        let stack = |name: &str, mac: &str, dns: &str| {
+            std::fs::write(servers.join(name), format!("pid=8\nmac={mac}\naddr=10.0.9.15/24\ndns={dns}\n")).unwrap();
+        };
+        // A stack with no lease yet, or whose lease named none, says so.
+        stack("stack.virtio-net@0", "52:54:00:12:34:56", "none");
+        assert_eq!(of_stacks(&sys, &servers), ["eth0"]);
+        assert!(stack_dns(&sys, &servers).is_empty());
+        // What it was leased, in its order; a driver's file and one half
+        // written say nothing, and a second stack adds what is new.
+        stack("stack.virtio-net@0", "52:54:00:12:34:56", "10.0.9.3,9.9.9.9");
+        stack("driver.virtio-net@0", "52:54:00:12:34:56", "1.1.1.1");
+        stack("stack.virtio-net@1.tmp", "52:54:00:aa:bb:cc", "2.2.2.2");
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(stack_dns(&sys, &servers), [ip("10.0.9.3"), ip("9.9.9.9")]);
+        stack("stack.virtio-net@1", "52:54:00:aa:bb:cc", "9.9.9.9, 10.0.9.4,nonsense");
+        assert_eq!(stack_dns(&sys, &servers), [ip("10.0.9.3"), ip("9.9.9.9"), ip("10.0.9.4")]);
+        assert_eq!(of_stacks(&sys, &servers), ["eth0", "eth1"]);
+        // A stack whose card the machine does not show serves the
+        // programs that asked for it, and its servers are not the
+        // machine's.
+        stack("stack.virtio-net@2", "52:54:00:00:00:02", "10.0.9.5");
+        assert_eq!(stack_dns(&sys, &servers).len(), 3);
+        // Written as a lease script writes them: no line of ours on top.
+        assert_eq!(lease_resolv_conf(&stack_dns(&sys, &servers)[..2]), "nameserver 10.0.9.3\nnameserver 9.9.9.9\n");
         let _ = std::fs::remove_dir_all(&top);
     }
 }

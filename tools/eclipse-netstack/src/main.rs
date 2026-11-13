@@ -44,12 +44,14 @@
 //! cannot be started or gives no card, 3 when the lease's address changed.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::{exit, Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use netstack::port::Port;
+use netstack::resolv::{self, Applied};
 use netstack::socks::lease::{Addressing, Lease};
 use netstack::socks::tcp::OP_WRITE;
 use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_SEND};
@@ -559,10 +561,35 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
                 through(lease.gateway),
                 with_sockets(host)
             );
+            name_servers(host, &lease);
         }
         None => println!("{NAME}: card {index} lost its lease: no address until it has another"),
     }
     publish(host);
+}
+
+/// Write the name servers of a lease where every program's resolver
+/// looks, as the script of a `udhcpc` does for a card of the kernel's.
+/// While the card is the machine's: the kernel has been told it by now,
+/// and shows it at once if it is.
+fn name_servers(host: &Host, lease: &Lease) {
+    if !resolv::is_the_machines(Path::new(resolv::SYS_NET), host.mac) {
+        return;
+    }
+    let conf = resolv::RESOLV_CONF;
+    let named = || {
+        let dns: Vec<String> = lease.dns.iter().map(|d| d.to_string()).collect();
+        dns.join(", ")
+    };
+    match resolv::apply(&lease.dns, Path::new(conf), Path::new(resolv::FIXED)) {
+        Ok(Applied::Written) => println!("{NAME}: {conf} names {}, by the lease", named()),
+        Ok(Applied::Fixed) => println!(
+            "{NAME}: the lease names {}, and {conf} keeps the servers fixed by hand",
+            named()
+        ),
+        Ok(Applied::Unchanged | Applied::Nothing) => {}
+        Err(e) => eprintln!("{NAME}: {conf}: {e}"),
+    }
 }
 
 fn main() {
