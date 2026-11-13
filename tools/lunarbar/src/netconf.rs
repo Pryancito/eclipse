@@ -446,6 +446,39 @@ pub fn interfaces(sys: &Path) -> Vec<String> {
     v
 }
 
+/// Where the servers that run as processes say what they are, one file
+/// each (`eclipse-udrivers`' `status`).
+pub const SERVERS: &str = "/run/eclipse-servers";
+
+/// The MACs of the cards that have a network stack running as a process:
+/// the `mac=` of each `stack.*` file of `servers`, as sysfs writes one.
+pub fn stack_cards(servers: &Path) -> Vec<String> {
+    let files = std::fs::read_dir(servers).map(|rd| rd.flatten().collect()).unwrap_or_else(|_| Vec::new());
+    let mut macs: Vec<String> = files
+        .iter()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("stack.") && !n.ends_with(".tmp")))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| text.lines().find_map(|l| l.strip_prefix("mac=").map(|m| m.trim().to_ascii_lowercase())))
+        .collect();
+    macs.sort();
+    macs.dedup();
+    macs
+}
+
+/// The interfaces this service is to configure, and whether a stack that
+/// runs as a process has a card. The card of such a stack is that stack's
+/// to configure, with the address it was started with or its own DHCP
+/// client: the kernel shows it to be looked at, and an `ip addr add` or a
+/// `udhcpc` on it would do nothing. So it is left out here, and with one
+/// around, an empty list is no reason to try `eth0` on the off chance.
+pub fn to_configure(sys: &Path, servers: &Path) -> (Vec<String>, bool) {
+    let cards = stack_cards(servers);
+    let mac = |n: &str| std::fs::read_to_string(sys.join(n).join("address")).map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let mut names = interfaces(sys);
+    names.retain(|n| !cards.contains(&mac(n)));
+    (names, !cards.is_empty())
+}
+
 /// Put it together: sysfs for the link, `ip` output for the addresses.
 pub fn live(sys: &Path, ip_addr: &str, route4: &str, route6: &str) -> Vec<Live> {
     let addrs = parse_ip_addr(ip_addr);
@@ -613,5 +646,42 @@ mod tests {
         assert_eq!(l[0].v6.len(), 2);
         assert_eq!(l[0].gateway6.as_deref(), Some("fe80::2"));
         let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn the_card_of_a_stack_process_is_not_this_services_to_configure() {
+        let top = std::env::temp_dir().join(format!("lunarnet-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (sys, servers) = (top.join("sys"), top.join("servers"));
+        for (n, mac) in [("eth0", "52:54:00:12:34:56"), ("eth1", "52:54:00:aa:bb:cc"), ("lo", "00:00:00:00:00:00")] {
+            std::fs::create_dir_all(sys.join(n)).unwrap();
+            std::fs::write(sys.join(n).join("address"), format!("{mac}\n")).unwrap();
+        }
+        // No servers at all: every card is the kernel's.
+        assert_eq!(to_configure(&sys, &servers), (vec!["eth0".to_string(), "eth1".to_string()], false));
+
+        // A driver's file names a card too, and is not a stack's; a file
+        // half written is not read.
+        std::fs::create_dir_all(&servers).unwrap();
+        std::fs::write(servers.join("driver.virtio-net@0"), "pid=7\nmac=52:54:00:12:34:56\n").unwrap();
+        std::fs::write(servers.join("stack.virtio-net@1.tmp"), "pid=9\nmac=52:54:00:aa:bb:cc\n").unwrap();
+        assert!(stack_cards(&servers).is_empty());
+        assert_eq!(to_configure(&sys, &servers).0.len(), 2);
+
+        // The stack's card is left out, however its MAC is written, and
+        // the other one stays.
+        std::fs::write(servers.join("stack.virtio-net@0"), "pid=8\nprogram=eclipse-netstack\nmac=52:54:00:12:34:56\naddr=10.0.9.15/24\n").unwrap();
+        assert_eq!(stack_cards(&servers), ["52:54:00:12:34:56"]);
+        assert_eq!(to_configure(&sys, &servers), (vec!["eth1".to_string()], true));
+        std::fs::write(sys.join("eth0").join("address"), "52:54:00:12:34:56".to_uppercase()).unwrap();
+        assert_eq!(to_configure(&sys, &servers), (vec!["eth1".to_string()], true));
+
+        // With the only card a stack's, there is nothing to configure and
+        // it says why.
+        std::fs::remove_dir_all(sys.join("eth1")).unwrap();
+        assert_eq!(to_configure(&sys, &servers), (Vec::new(), true));
+        // What still shows it is the list for the panel.
+        assert_eq!(interfaces(&sys), ["eth0"]);
+        let _ = std::fs::remove_dir_all(&top);
     }
 }

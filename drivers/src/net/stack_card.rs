@@ -1,0 +1,241 @@
+//! The card of a network stack that is not the kernel's.
+//!
+//! When the stack runs as a process and every program's sockets are that
+//! stack's, the card that carries them is not in the kernel's list:
+//! `ifconfig`, `ip` and `/proc/net` showed `lo` and nothing else, and a
+//! program that waits for a default route before it starts waited until it
+//! gave up. A [`StackCard`] is that card in the list, to be looked at: a
+//! name, the MAC, and the address and the gateway the stack says it has.
+//!
+//! It carries nothing. No frame arrives on it and one sent on it is refused,
+//! because the frames are the stack's; its address and its routes cannot be
+//! set from here, because they are the stack's too. It is made when the stack
+//! says what its card is and taken away when the stack is gone, and what it
+//! says never changes in between: a stack whose address changes starts over.
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+
+use super::ip_cfg;
+use crate::scheme::{NetScheme, RouteInfo, Scheme};
+use crate::{DeviceError, DeviceResult};
+
+/// The interface that shows the card of a stack that runs somewhere else.
+pub struct StackCard {
+    name: String,
+    mac: EthernetAddress,
+    addrs: Vec<IpCidr>,
+    /// The default route, when the stack has a gateway.
+    routes: Vec<RouteInfo>,
+}
+
+impl StackCard {
+    /// The card `mac`, called `name`, with `address` on a network whose
+    /// prefix is `prefix` bits (32 at most), and what is not on that
+    /// network sent to `gateway`.
+    pub fn new(
+        name: String,
+        mac: [u8; 6],
+        address: [u8; 4],
+        prefix: u8,
+        gateway: Option<[u8; 4]>,
+    ) -> Self {
+        let routes = gateway
+            .map(|gateway| RouteInfo {
+                dst: IpCidr::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0),
+                gateway: Some(IpAddress::Ipv4(Ipv4Address(gateway))),
+            })
+            .into_iter()
+            .collect();
+        let address = Ipv4Cidr::new(Ipv4Address(address), prefix.min(32));
+        Self {
+            name,
+            mac: EthernetAddress(mac),
+            addrs: vec![IpCidr::Ipv4(address)],
+            routes,
+        }
+    }
+
+    /// The card as a stack says it in three numbers, or `None` when they
+    /// say none: `prefix` the bits of its network's prefix (1 to 32, and 0
+    /// from a stack that says nothing of its card), `gateway` an address
+    /// as a big-endian number (10.0.9.1 is 0x0a000901; 0 when there is no
+    /// gateway) and `mac` the six bytes of the MAC the same way. A card
+    /// with no address or no MAC is not one to show.
+    pub fn said(
+        name: String,
+        address: [u8; 4],
+        prefix: usize,
+        gateway: usize,
+        mac: usize,
+    ) -> Option<Self> {
+        if !(1..=32).contains(&prefix) || address == [0; 4] {
+            return None;
+        }
+        let mac = (mac as u64).to_be_bytes();
+        if mac[..2] != [0, 0] || mac[2..] == [0; 6] {
+            return None;
+        }
+        let mac = [mac[2], mac[3], mac[4], mac[5], mac[6], mac[7]];
+        // A gateway that is no IPv4 address is no gateway.
+        let gateway = (gateway as u64 <= u64::from(u32::MAX) && gateway != 0)
+            .then(|| (gateway as u32).to_be_bytes());
+        Some(Self::new(name, mac, address, prefix as u8, gateway))
+    }
+}
+
+impl Scheme for StackCard {
+    fn name(&self) -> &str {
+        "stack-card"
+    }
+}
+
+impl NetScheme for StackCard {
+    fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
+        Err(DeviceError::NotReady)
+    }
+
+    fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
+        Err(DeviceError::NotSupported)
+    }
+
+    fn can_recv(&self) -> bool {
+        false
+    }
+
+    fn can_send(&self) -> bool {
+        false
+    }
+
+    fn get_mac(&self) -> EthernetAddress {
+        self.mac
+    }
+
+    fn ifname(&self) -> &str {
+        &self.name
+    }
+
+    fn is_loopback(&self) -> bool {
+        false
+    }
+
+    fn get_ifname(&self) -> String {
+        self.name.clone()
+    }
+
+    fn get_ip_address(&self) -> Vec<IpCidr> {
+        self.addrs.clone()
+    }
+
+    fn get_routes(&self) -> Vec<RouteInfo> {
+        ip_cfg::reported_routes(&self.routes, &self.addrs)
+    }
+
+    fn poll(&self) -> DeviceResult {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(gateway: Option<[u8; 4]>) -> StackCard {
+        StackCard::new(
+            "eth0".into(),
+            [2, 0, 0, 0, 0, 7],
+            [10, 0, 9, 15],
+            24,
+            gateway,
+        )
+    }
+
+    #[test]
+    fn it_shows_what_the_stack_said_and_carries_nothing() {
+        let c = card(Some([10, 0, 9, 1]));
+        assert_eq!(c.ifname(), "eth0");
+        assert_eq!(c.get_ifname(), "eth0");
+        assert!(!c.is_loopback());
+        assert_eq!(c.get_mac(), EthernetAddress([2, 0, 0, 0, 0, 7]));
+        assert_eq!(
+            c.get_ip_address(),
+            [IpCidr::new(IpAddress::v4(10, 0, 9, 15), 24)]
+        );
+        assert!(c.link_carrier_up());
+
+        // The default route first and then its own network, as an
+        // interface the kernel carries reports them.
+        let routes = c.get_routes();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].dst, IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0));
+        assert_eq!(routes[0].gateway, Some(IpAddress::v4(10, 0, 9, 1)));
+        assert_eq!(routes[1].dst, IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24));
+        assert_eq!(routes[1].gateway, None);
+
+        // Nothing goes through it and nothing about it is set here.
+        assert!(!c.can_recv() && !c.can_send());
+        assert_eq!(c.recv(&mut [0u8; 64]), Err(DeviceError::NotReady));
+        assert_eq!(c.send(&[0u8; 64]), Err(DeviceError::NotSupported));
+        assert_eq!(c.poll(), Ok(()));
+        let other = Ipv4Cidr::new(Ipv4Address([10, 0, 9, 16]), 24);
+        assert_eq!(c.set_ipv4_address(other), Err(DeviceError::NotSupported));
+        assert_eq!(
+            c.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), None),
+            Err(DeviceError::NotSupported)
+        );
+        assert_eq!(c.get_ip_address().len(), 1);
+    }
+
+    #[test]
+    fn what_a_stack_says_in_numbers_is_its_card_or_none() {
+        let said = |address, prefix, gateway, mac| {
+            StackCard::said("eth0".into(), address, prefix, gateway, mac)
+        };
+        let c = said([10, 0, 9, 15], 24, 0x0a00_0901, 0x5254_0012_3456).unwrap();
+        assert_eq!(
+            c.get_mac(),
+            EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
+        );
+        assert_eq!(
+            c.get_ip_address(),
+            [IpCidr::new(IpAddress::v4(10, 0, 9, 15), 24)]
+        );
+        assert_eq!(c.get_routes()[0].gateway, Some(IpAddress::v4(10, 0, 9, 1)));
+        // No gateway, and one that is no address, is a card without one.
+        assert_eq!(
+            said([10, 0, 9, 15], 32, 0, 0x5254_0012_3456)
+                .unwrap()
+                .get_routes()
+                .len(),
+            1
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            said([10, 0, 9, 15], 24, 1 << 32, 0x5254_0012_3456)
+                .unwrap()
+                .get_routes()
+                .len(),
+            1
+        );
+        // A stack that says nothing of its card (all zero, as the ones
+        // before this said), a prefix that is none, no address, no MAC or
+        // more than a MAC: no card.
+        assert!(said([10, 0, 9, 15], 0, 0, 0).is_none());
+        assert!(said([10, 0, 9, 15], 33, 0, 0x5254_0012_3456).is_none());
+        assert!(said([0, 0, 0, 0], 24, 0, 0x5254_0012_3456).is_none());
+        assert!(said([10, 0, 9, 15], 24, 0, 0).is_none());
+        #[cfg(target_pointer_width = "64")]
+        assert!(said([10, 0, 9, 15], 24, 0, 1 << 48).is_none());
+    }
+
+    #[test]
+    fn without_a_gateway_there_is_only_its_own_network() {
+        let routes = card(None).get_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].dst, IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24));
+        assert_eq!(routes[0].gateway, None);
+    }
+}

@@ -21,6 +21,8 @@ pub mod mii;
 pub mod pcnet32;
 /// An interface whose card is driven outside the kernel.
 pub mod served;
+/// The card of a stack that runs outside the kernel, to be looked at.
+pub mod stack_card;
 /// AMD XGMAC 10GbE (`amd-xgbe`). MMIO, so it builds everywhere; see the
 /// module docs for what it does and does not do.
 pub mod xgbe;
