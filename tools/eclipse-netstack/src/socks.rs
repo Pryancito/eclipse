@@ -54,8 +54,9 @@
 //! it: the connection is a smoltcp socket here, and an `EVENTS` carries
 //! what a turn made of every connection.
 //!
-//! One more message goes to the kernel that is about no socket: how much
-//! the card has carried (`COUNTS`, in [`crate::counts`]).
+//! Two more messages go to the kernel that are about no socket: how much
+//! the card has carried (`COUNTS`, in [`crate::counts`]), and the IPv6
+//! addresses it has (`SIX`, in [`six`]).
 //!
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
@@ -73,6 +74,7 @@ use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
 
 pub mod groups;
 pub mod lease;
+pub mod six;
 pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
@@ -227,6 +229,7 @@ pub struct Stack<D: for<'d> Device<'d>> {
     /// Where what is not for the card's network goes, when anywhere.
     gateway: Option<Ipv4Address>,
     lease: lease::Leasing,
+    six: six::Six,
     /// The groups the machine is a member of, as the kernel said.
     groups: BTreeSet<Ipv4Address>,
 }
@@ -247,6 +250,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             brought: false,
             gateway: None,
             lease: lease::Leasing::default(),
+            six: six::Six::default(),
             groups: BTreeSet::new(),
         }
     }
@@ -502,10 +506,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// polls calls next.
     pub fn poll(&mut self, now: Instant) {
         self.now = now;
+        self.six_ask();
         // What poll has to say about a frame it did not understand is not
         // news.
         let _ = self.iface.poll(&mut self.set, now);
         self.lease_turn();
+        self.six_turn();
     }
 
     /// Make `m` the next message for the kernel of what the last
@@ -607,10 +613,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 
     /// How long until the stack has something to do that no frame and no
     /// message will remind it of: a neighbour to ask again, a segment to
-    /// send again, a connection to give up on. `None` when there is
-    /// nothing of the kind.
+    /// send again, a connection to give up on, a router to ask for. `None`
+    /// when there is nothing of the kind.
     pub fn idle_for(&self, now: Instant) -> Option<Duration> {
-        self.iface.poll_delay(&self.set, now)
+        let sockets = self.iface.poll_delay(&self.set, now);
+        match (sockets, self.six_idle(now)) {
+            (Some(sockets), Some(six)) => Some(sockets.min(six)),
+            (sockets, six) => sockets.or(six),
+        }
     }
 }
 
