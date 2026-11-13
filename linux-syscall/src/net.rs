@@ -1751,7 +1751,14 @@ impl Syscall<'_> {
         }
         let hostname = name.as_str(name_len).map_err(|_| LxError::EINVAL)?;
         let root_inode = dns_vfs_root().ok_or(LxError::ENOENT)?;
-        let addrs = dns::resolve(&root_inode, hostname, DnsFamily::from_usize(family)).await?;
+        // A program whose sockets are the stack's that runs as a process
+        // has its questions carried by that stack too.
+        let proc = self.linux_process();
+        let stack = proc
+            .uses_user_netstack()
+            .then(linux_object::net::user_stack::machine);
+        let family = DnsFamily::from_usize(family);
+        let addrs = dns::resolve_by(&root_inode, hostname, family, stack.as_ref()).await?;
         let n = addrs.len().min(out_max);
         for (i, ip) in addrs.iter().take(n).enumerate() {
             out.add(i)
