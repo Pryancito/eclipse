@@ -229,6 +229,41 @@ impl Stream {
         let inner = self.inner.lock();
         inner.phase == Phase::Listening && inner.here.is_none()
     }
+
+    /// How `/proc/net/tcp` lists it, when it does: a socket that listens,
+    /// connects or is connected, as Linux lists the ones that are in its
+    /// tables. `stack` is the address a connection the stack carries has.
+    ///
+    /// The state is what can be told from here, where the connection is
+    /// not: one that connects has sent its SYN, one that is open is
+    /// established until an end says it will send no more, and then it is
+    /// where such a connection spends its time -- waiting for the program
+    /// to close (the peer finished), for the peer to finish (the program
+    /// did), or for the last acknowledgement (both).
+    fn listed(&self, stack: Ipv4Address) -> Option<Listed> {
+        let inner = self.inner.lock();
+        let state = match inner.phase {
+            Phase::Fresh | Phase::Over => return None,
+            Phase::Listening => TCP_LISTEN,
+            Phase::Connecting => TCP_SYN_SENT,
+            Phase::Open => match (inner.eof, inner.write_closed) {
+                (false, false) => TCP_ESTABLISHED,
+                (true, false) => TCP_CLOSE_WAIT,
+                (false, true) => TCP_FIN_WAIT2,
+                (true, true) => TCP_LAST_ACK,
+            },
+        };
+        let addr = inner.local.or(inner.here).unwrap_or(match inner.phase {
+            Phase::Listening => Ipv4Address::UNSPECIFIED,
+            _ => stack,
+        });
+        Some(Listed {
+            local: IpEndpoint::new(IpAddress::Ipv4(addr), inner.port.unwrap_or(0)),
+            remote: inner.remote.filter(|_| inner.phase != Phase::Listening),
+            state,
+            unread: inner.queued,
+        })
+    }
 }
 
 /// The new socket, and where it connected from, of an `ACCEPTED`.
@@ -246,6 +281,22 @@ fn parse_accepted(bytes: &[u8]) -> Option<(u64, IpEndpoint)> {
 }
 
 impl StackLink {
+    /// The stream sockets as `/proc/net/tcp` lists them, in the order of
+    /// their numbers: the ones that listen, connect or are connected,
+    /// the connections nobody accepted yet among them, and both ends of
+    /// one between two programs of this machine.
+    pub fn listed_streams(&self) -> Vec<Listed> {
+        let streams: Vec<Arc<Stream>> = {
+            let table = self.table.lock();
+            table.streams.values().filter_map(Weak::upgrade).collect()
+        };
+        let stack = self.address();
+        streams
+            .iter()
+            .filter_map(|stream| stream.listed(stack))
+            .collect()
+    }
+
     /// One record of an `EVENTS`.
     pub(super) fn event(&self, sock: u64, what: u16, number: u32, bytes: &[u8]) {
         let stream = self.table.lock().streams.get(&sock).and_then(Weak::upgrade);
@@ -1498,6 +1549,151 @@ mod tests {
         assert_eq!(Socket::write(&s, b"x", None), Err(LxError::ECONNRESET));
         assert_eq!(Socket::write(&s, b"x", None), Err(LxError::EPIPE));
         assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn the_stream_sockets_are_listed_as_what_they_are() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let row = |local, remote, state, unread| Listed {
+            local,
+            remote,
+            state,
+            unread,
+        };
+        // A socket that is neither connected nor listening is in no
+        // table, with a port or without.
+        let fresh = stream(&stack);
+        let bound = stream(&stack);
+        assert_eq!(Socket::bind(&bound, any(8082)), Ok(0));
+        assert_eq!(stack.link.listed_streams(), []);
+
+        // One that listens has every address; one that connects has the
+        // stack's, and has sent its SYN.
+        let l = stream(&stack);
+        assert_eq!(Socket::bind(&l, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        let (_, listener) = parse_header(&stack.told().unwrap()).unwrap();
+        let listening = row(at([0, 0, 0, 0], 8080), None, TCP_LISTEN, 0);
+        assert_eq!(stack.link.listed_streams(), [listening]);
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HOST, 80)), Err(LxError::EINPROGRESS));
+        let (_, sock) = parse_header(&stack.told().unwrap()).unwrap();
+        let port = ip(Socket::endpoint(&c).unwrap()).port;
+        let ours = at(STACK_ADDR, port);
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, row(ours, Some(at(HOST, 80)), TCP_SYN_SENT, 0)]
+        );
+        // Connected, with what arrived and nobody read.
+        events(
+            &stack,
+            &[
+                (sock, EV_CONNECTED, 500, &[]),
+                (sock, EV_BYTES, 0, b"hello"),
+            ],
+        );
+        let open = |state, unread| row(ours, Some(at(HOST, 80)), state, unread);
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, open(TCP_ESTABLISHED, 5)]
+        );
+        let mut buf = [0u8; 3];
+        assert_eq!(read(&c, &mut buf), Ok(3));
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, open(TCP_ESTABLISHED, 2)]
+        );
+        // The peer finishes: it waits for the program to close. The
+        // program finishes too: for the last acknowledgement.
+        events(&stack, &[(sock, EV_EOF, 0, &[])]);
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, open(TCP_CLOSE_WAIT, 2)]
+        );
+        assert_eq!(Socket::shutdown(&c, 1), Ok(0));
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, open(TCP_LAST_ACK, 2)]
+        );
+        // Closed, it is in no table.
+        drop(c);
+        assert_eq!(stack.link.listed_streams(), [listening]);
+
+        // A connection that arrived is listed before anybody accepts it,
+        // at the listener's port, after the kernel's own in the order of
+        // the numbers. The program finishes first: it waits for the peer.
+        while stack.told().is_some() {}
+        let one = ACCEPTED_BIT | 1;
+        events(
+            &stack,
+            &[(
+                listener,
+                EV_ACCEPTED,
+                500,
+                &accepted_bytes(one, HOST, 40001),
+            )],
+        );
+        let arrived = |state| row(at(STACK_ADDR, 8080), Some(at(HOST, 40001)), state, 0);
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, arrived(TCP_ESTABLISHED)]
+        );
+        let (first, _) = accept(&l).unwrap();
+        let first = first.downcast_arc::<ServedTcpSocket>().ok().unwrap();
+        assert_eq!(Socket::shutdown(&*first, 1), Ok(0));
+        assert_eq!(
+            stack.link.listed_streams(),
+            [listening, arrived(TCP_FIN_WAIT2)]
+        );
+
+        // The stack dies: its connections are over and in no table, and
+        // the listener listens on.
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        assert_eq!(link.listed_streams(), [listening]);
+        drop((fresh, bound, first));
+        drop(l);
+        assert_eq!(link.listed_streams(), []);
+    }
+
+    #[test]
+    fn both_ends_of_a_connection_within_this_machine_are_listed() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let here = [127, 0, 0, 1];
+        let l = stream(&stack);
+        assert_eq!(Socket::bind(&l, Endpoint::Ip(at(here, 8090))), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(here, 8090)), Ok(0));
+        let port = ip(Socket::endpoint(&c).unwrap()).port;
+        let mut listed = stack.link.listed_streams();
+        listed.sort_by_key(|row| (row.state, row.local.port));
+        assert_eq!(
+            listed,
+            [
+                Listed {
+                    local: at(here, 8090),
+                    remote: Some(at(here, port)),
+                    state: TCP_ESTABLISHED,
+                    unread: 0,
+                },
+                Listed {
+                    local: at(here, port),
+                    remote: Some(at(here, 8090)),
+                    state: TCP_ESTABLISHED,
+                    unread: 0,
+                },
+                Listed {
+                    local: at(here, 8090),
+                    remote: None,
+                    state: TCP_LISTEN,
+                    unread: 0,
+                },
+            ]
+        );
     }
 
     #[test]

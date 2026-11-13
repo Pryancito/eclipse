@@ -742,6 +742,30 @@ struct Table {
     joined: BTreeMap<u64, u64>,
 }
 
+/// A served socket as the machine's tables of sockets list it
+/// (`/proc/net/tcp`, `/proc/net/udp`): what the kernel knows of it without
+/// asking the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Listed {
+    /// Its address and port: no address when it has every one.
+    pub local: IpEndpoint,
+    /// Its peer, when it has one.
+    pub remote: Option<IpEndpoint>,
+    /// Its state, as Linux numbers them (`include/net/tcp_states.h`).
+    pub state: u8,
+    /// The bytes that arrived for it and no program has read.
+    pub unread: usize,
+}
+
+/// The states of a [`Listed`].
+pub const TCP_ESTABLISHED: u8 = 1;
+pub const TCP_SYN_SENT: u8 = 2;
+pub const TCP_FIN_WAIT2: u8 = 5;
+pub const TCP_CLOSE: u8 = 7;
+pub const TCP_CLOSE_WAIT: u8 = 8;
+pub const TCP_LAST_ACK: u8 = 9;
+pub const TCP_LISTEN: u8 = 10;
+
 /// The stack process that serves now.
 struct Served {
     channel: Arc<Channel>,
@@ -896,6 +920,37 @@ impl StackLink {
             carried: Arc::new(Carried::default()),
             counted: Mutex::new([0; COUNTS]),
         })
+    }
+
+    /// The datagram sockets as `/proc/net/udp` lists them, in the order
+    /// of their numbers: the ones that have a port, as Linux lists the
+    /// ones in its tables. One with a peer is established, as there, and
+    /// the others are closed, which is how a datagram socket that is
+    /// open and has no peer is listed. A socket that speaks ICMP is not
+    /// UDP's and is not here.
+    pub fn listed_datagrams(&self) -> Vec<Listed> {
+        let socks: Vec<Arc<Shared>> = {
+            let table = self.table.lock();
+            table.socks.values().filter_map(Weak::upgrade).collect()
+        };
+        socks
+            .iter()
+            .filter(|shared| shared.hears == Hears::Datagrams)
+            .filter_map(|shared| {
+                let inner = shared.inner.lock();
+                let addr = inner.here.unwrap_or(Ipv4Address::UNSPECIFIED);
+                Some(Listed {
+                    local: IpEndpoint::new(IpAddress::Ipv4(addr), inner.port?),
+                    remote: inner.remote,
+                    state: if inner.remote.is_some() {
+                        TCP_ESTABLISHED
+                    } else {
+                        TCP_CLOSE
+                    },
+                    unread: inner.queued_bytes,
+                })
+            })
+            .collect()
     }
 
     /// What the card of the stacks that have served these sockets has
@@ -2599,6 +2654,65 @@ mod tests {
     }
 
     /// A socket of `link` that does not wait.
+    #[test]
+    fn the_datagram_sockets_that_have_a_port_are_listed() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        // No port, not in the table; nor a socket that pings, which has
+        // an identifier and no port of UDP's.
+        let fresh = stack.socket();
+        let pings = ServedIcmpSocket::new(stack.link.clone(), false).unwrap();
+        assert_eq!(stack.link.listed_datagrams(), []);
+
+        let a = stack.socket();
+        assert_eq!(Socket::bind(&a, any(7000)), Ok(0));
+        let local = stack.socket();
+        assert_eq!(
+            Socket::bind(&local, Endpoint::Ip(at([127, 0, 0, 1], 7001))),
+            Ok(0)
+        );
+        let row = |local, remote: Option<IpEndpoint>, unread| Listed {
+            local,
+            remote,
+            state: if remote.is_some() {
+                TCP_ESTABLISHED
+            } else {
+                TCP_CLOSE
+            },
+            unread,
+        };
+        let here = row(at([127, 0, 0, 1], 7001), None, 0);
+        assert_eq!(
+            stack.link.listed_datagrams(),
+            [row(at([0, 0, 0, 0], 7000), None, 0), here]
+        );
+        // What arrived and nobody read is counted, and a peer is shown.
+        stack.arrives(a.sock, HOST, 53, b"hello");
+        stack.arrives(a.sock, HOST, 53, b"you");
+        assert_eq!(
+            stack.link.listed_datagrams(),
+            [row(at([0, 0, 0, 0], 7000), None, 8), here]
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(recv(&a, &mut buf).0, Ok(5));
+        let connected = async_std::task::block_on(Socket::connect(&a, Endpoint::Ip(at(HOST, 53))));
+        assert_eq!(connected, Ok(0));
+        assert_eq!(
+            stack.link.listed_datagrams(),
+            [row(at([0, 0, 0, 0], 7000), Some(at(HOST, 53)), 3), here]
+        );
+        // Closed, it is gone from the table; and the table outlives the
+        // stack, as the sockets do.
+        drop(a);
+        assert_eq!(stack.link.listed_datagrams(), [here]);
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        assert_eq!(link.listed_datagrams(), [here]);
+        drop((fresh, pings, local));
+        assert_eq!(link.listed_datagrams(), []);
+    }
+
     #[test]
     fn what_the_card_has_carried_is_what_its_stacks_said_one_after_another() {
         let _g = LOCK.lock();
