@@ -154,6 +154,22 @@
 //! interface's counts go on from where they were when a stack dies and
 //! another comes, and a number that goes back adds nothing.
 //!
+//! # The card's IPv6 addresses
+//!
+//! The stack makes them, from its card and from what the link's router
+//! says, and they come and go while it runs. The machine's interface
+//! shows them (`ifconfig`, `ip -6`, `/proc/net/if_inet6`), so the stack
+//! says all of them each time one changes:
+//!
+//! ```text
+//! SIX     (stack to kernel)  16  [u8; 16] the router, or zeroes  32  one address after another, to the end:
+//!             0  [u8; 16] address  16  u8 the bits of its network's prefix  17  seven zero
+//! ```
+//!
+//! What is kept here ([`StackLink::sixes`]) is the last of them, and
+//! nothing once the stack is gone. No socket uses them yet (see "IPv6
+//! sockets").
+//!
 //! # This machine
 //!
 //! What a program sends to 127.0.0.0/8, or to the stack's own address, is
@@ -205,11 +221,11 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use kernel_hal::drivers::net::stack_card::Carried;
+use kernel_hal::drivers::net::stack_card::{Carried, Sixes};
 use kernel_hal::drivers::scheme::NetStats;
 use kernel_hal::sync::Mutex;
 use log::warn;
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address, Ipv6Cidr};
 use zircon_object::impl_kobject;
 use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
@@ -236,6 +252,7 @@ pub const OP_EVENTS: u32 = 10;
 pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
 pub const OP_COUNTS: u32 = 13;
+pub const OP_SIX: u32 = 16;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
 /// whichever sockets hear: no socket has the number.
@@ -362,6 +379,47 @@ pub fn parse_counts(numbers: &[u8]) -> Option<[u64; COUNTS]> {
         *count = u64::from_le_bytes(numbers.get(i * 8..i * 8 + 8)?.try_into().ok()?);
     }
     Some(counts)
+}
+
+/// What each address of a `SIX` takes, and the most of them that are
+/// taken: more than a card has.
+const SIX_ADDRESS_LEN: usize = 24;
+const SIX_ADDRESSES_MAX: usize = 16;
+
+/// `SIX`: the card has `addresses`, and `router` is its link's.
+pub fn six_message(router: Option<Ipv6Address>, addresses: &[Ipv6Cidr]) -> Vec<u8> {
+    let mut m = header(OP_SIX, 0, 16 + addresses.len() * SIX_ADDRESS_LEN);
+    m.extend_from_slice(&router.unwrap_or(Ipv6Address::UNSPECIFIED).0);
+    for address in addresses {
+        m.extend_from_slice(&address.address().0);
+        m.extend_from_slice(&[address.prefix_len(), 0, 0, 0, 0, 0, 0, 0]);
+    }
+    m
+}
+
+/// What a `SIX` says, past its header: `None` when it is not whole, or
+/// names what no card has -- an address that is a group's or none, a
+/// prefix of more bits than an address.
+pub fn parse_six(said: &[u8]) -> Option<(Option<Ipv6Address>, Vec<Ipv6Cidr>)> {
+    let router = Ipv6Address::from_bytes(said.get(..16)?);
+    let (records, rest) = said[16..].as_chunks::<SIX_ADDRESS_LEN>();
+    if !rest.is_empty() || records.len() > SIX_ADDRESSES_MAX {
+        return None;
+    }
+    let mut addresses = Vec::new();
+    for record in records {
+        let address = Ipv6Address::from_bytes(&record[..16]);
+        let prefix = record[16];
+        if !address.is_unicast() || prefix > 128 {
+            return None;
+        }
+        addresses.push(Ipv6Cidr::new(address, prefix));
+    }
+    let router = (!router.is_unspecified()).then_some(router);
+    if router.is_some_and(|router| !router.is_unicast()) {
+        return None;
+    }
+    Some((router, addresses))
 }
 
 /// A message's operation and socket, when it has both.
@@ -932,6 +990,9 @@ pub struct StackLink {
     /// The last `COUNTS` of the stack that serves now: zero when it has
     /// said none, and for the next.
     counted: Mutex<[u64; COUNTS]>,
+    /// The IPv6 addresses of the card of the stack that serves now: see
+    /// [`sixes`](Self::sixes).
+    sixes: Arc<Sixes>,
 }
 
 /// A stack process's turn at serving: what the task that reads its
@@ -1047,6 +1108,7 @@ impl StackLink {
             telling: Mutex::new(()),
             carried: Arc::new(Carried::default()),
             counted: Mutex::new([0; COUNTS]),
+            sixes: Arc::new(Sixes::default()),
         })
     }
 
@@ -1088,6 +1150,13 @@ impl StackLink {
     /// that dies and the one that comes after.
     pub fn carried(&self) -> Arc<Carried> {
         self.carried.clone()
+    }
+
+    /// What the card of the stack that serves now has of IPv6, as it
+    /// said last (`SIX`): for the interface that shows that card.
+    /// Nothing while no stack serves.
+    pub fn sixes(&self) -> Arc<Sixes> {
+        self.sixes.clone()
     }
 
     /// [`serve`], on these sockets. The stack is told of the sockets that
@@ -1219,6 +1288,13 @@ impl StackLink {
             Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
             Some((OP_COUNTS, _)) => self.take_counts(&m[HEADER_LEN..]),
+            Some((OP_SIX, _)) => match parse_six(&m[HEADER_LEN..]) {
+                Some((router, addresses)) => self.sixes.say(addresses, router),
+                None => warn!(
+                    "user stack: {} bytes that are no addresses of a card",
+                    m.len() - HEADER_LEN
+                ),
+            },
             _ => warn!(
                 "user stack: a message that means nothing ({} bytes)",
                 m.len()
@@ -1341,6 +1417,8 @@ impl StackLink {
             self.address.store(0, Ordering::Release);
             // The next one counts from nothing.
             *self.counted.lock() = [0; COUNTS];
+            // And says its own addresses.
+            self.sixes.forget();
         }
         warn!("user stack: the process is gone");
         let streams: Vec<Arc<tcp::Stream>> = {
@@ -3127,6 +3205,67 @@ mod tests {
         next.say(counts_message(&[40, 1, 0, 0, 50, 2, 0, 0]));
         assert_eq!(shown(&link.carried()), (800, 7, 550, 6));
         assert!(Arc::ptr_eq(&carried, &link.carried()));
+    }
+
+    #[test]
+    fn the_cards_ipv6_addresses_are_what_its_stack_said_last() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let sixes = stack.link.sixes();
+        assert_eq!((sixes.addresses(), sixes.router()), (vec![], None));
+
+        // The message, as the stack writes it.
+        let link = Ipv6Cidr::new(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 7), 64);
+        let given = Ipv6Cidr::new(Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 7), 64);
+        let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let said = six_message(Some(router), &[link, given]);
+        assert_eq!(said.len(), HEADER_LEN + 16 + 2 * 24);
+        assert_eq!(parse_header(&said), Some((OP_SIX, 0)));
+        assert_eq!(said[16..32], router.0);
+        assert_eq!(said[32..48], link.address().0);
+        assert_eq!(said[48..56], [64, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(said[56..72], given.address().0);
+        assert_eq!(six_message(None, &[link])[16..32], [0; 16]);
+
+        stack.say(six_message(None, &[link]));
+        assert_eq!((sixes.addresses(), sixes.router()), (vec![link], None));
+        stack.say(said.clone());
+        assert_eq!(sixes.addresses(), [link, given]);
+        assert_eq!(sixes.router(), Some(router));
+
+        // What is not whole, or names what no card has, changes nothing.
+        let group = Ipv6Cidr::new(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 64);
+        let mut wide = six_message(Some(router), &[link]);
+        wide[HEADER_LEN + 16 + 16] = 129;
+        let many = [link; SIX_ADDRESSES_MAX + 1];
+        for mut wrong in [
+            said[..said.len() - 1].to_vec(),
+            said[..HEADER_LEN + 15].to_vec(),
+            six_message(Some(router), &[group]),
+            wide,
+            six_message(Some(group.address()), &[link]),
+            six_message(Some(router), &many),
+        ] {
+            stack.say(core::mem::take(&mut wrong));
+            assert_eq!(sixes.addresses(), [link, given]);
+            assert_eq!(sixes.router(), Some(router));
+        }
+
+        // The router is gone and an address with it.
+        stack.say(six_message(None, &[link]));
+        assert_eq!((sixes.addresses(), sixes.router()), (vec![link], None));
+
+        // The stack dies: its card had them, and the next says its own.
+        stack.say(said);
+        let Stack { link: served, end } = stack;
+        drop(end);
+        served.pump();
+        assert!(served.is_down());
+        assert_eq!((sixes.addresses(), sixes.router()), (vec![], None));
+        let next = stack_of(&served);
+        next.say(six_message(None, &[given]));
+        assert_eq!(served.sixes().addresses(), [given]);
+        assert!(Arc::ptr_eq(&sixes, &served.sixes()));
     }
 
     fn stack_socket(link: &Arc<StackLink>) -> ServedUdpSocket {

@@ -1,0 +1,892 @@
+//! The card's IPv6 addresses, which nobody writes down and no server
+//! leases: the stack makes them.
+//!
+//! One is the card's own on its link, `fe80::` and the MAC
+//! ([`link_local`]), which it has from [`Stack::speak_six`] on. The
+//! others come from the link's router: the stack asks whether there is
+//! one (a router solicitation, three times at most, four seconds apart,
+//! while none has answered), and a router says so by itself every few
+//! minutes (a router advertisement). What an advertisement says is read here
+//! ([`advert`]), by hand: smoltcp's reading refuses the whole message for
+//! one option it does not know, and routers send plenty of those. Of what
+//! it says the stack takes two things:
+//!
+//! - the router itself, where what is for no network of the card's goes,
+//!   for as long as it says it is one. The first one heard is kept while
+//!   it lasts, and when it is one no more another is asked for.
+//! - each prefix of 64 bits that the router says an address may be made
+//!   from: the address is the prefix and the MAC, for as long as the
+//!   router says the prefix is good, and its network is the card's.
+//!   [`PREFIXES`] of them at most.
+//!
+//! smoltcp does the rest once the interface has the addresses: it answers
+//! the neighbours that ask where one is, and the echo requests.
+//!
+//! The kernel shows the card, so it is told what the card has, all of it
+//! each time it changes, in a message about no socket:
+//!
+//! ```text
+//! SIX     (stack to kernel)  16  [u8; 16] the router, or zeroes  32  one address after another, to the end:
+//!             0  [u8; 16] address  16  u8 the bits of its network's prefix  17  seven zero
+//! ```
+//!
+//! No socket carries IPv6 yet: what a program sends still travels as
+//! IPv4.
+
+use managed::ManagedSlice;
+use smoltcp::phy::{ChecksumCapabilities, Device};
+use smoltcp::socket::{RawPacketMetadata, RawSocket, RawSocketBuffer, SocketHandle};
+use smoltcp::time::{Duration, Instant};
+use smoltcp::wire::{
+    EthernetAddress, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpProtocol, IpVersion,
+    Ipv6Address, Ipv6Cidr, Ipv6Packet, Ipv6Repr, NdiscRepr,
+};
+
+use super::{Stack, HEADER_LEN};
+
+/// The message that says the card's IPv6 addresses.
+pub const OP_SIX: u32 = 16;
+/// Where the addresses start in a `SIX`.
+pub const SIX_ADDRESSES_AT: usize = HEADER_LEN + 16;
+/// What each address of a `SIX` takes.
+pub const SIX_ADDRESS_LEN: usize = 24;
+
+/// The addresses made from a router's prefixes, at most.
+pub const PREFIXES: usize = 4;
+/// How many times a router is asked for, while none has answered.
+const ASKS: u8 = 3;
+/// How long between two of those.
+const ASK_EVERY: Duration = Duration::from_secs(4);
+/// What a router's word cannot shorten an address's time below, unless
+/// it is shorter already (RFC 4862, 5.5.3): whoever can send a frame on
+/// the link could otherwise take every address away with one.
+const AT_LEAST: Duration = Duration::from_secs(2 * 60 * 60);
+/// A lifetime that does not end.
+const FOREVER: u32 = u32::MAX;
+/// The bits of a prefix an address is made from, and of its network.
+const PREFIX_BITS: u8 = 64;
+
+/// The messages that arrive for the stack to read and the ones it has to
+/// send: advertisements are rare and solicitations rarer.
+const HEARD: usize = 8;
+const TO_SAY: usize = 2;
+
+/// ICMPv6: a router advertisement, and where its options start.
+const ROUTER_ADVERT: u8 = 134;
+const ADVERT_OPTIONS_AT: usize = 16;
+/// The option that names a prefix, its length, and the flag that says an
+/// address may be made from it.
+const PREFIX_INFORMATION: u8 = 3;
+const PREFIX_INFORMATION_LEN: usize = 32;
+const AUTONOMOUS: u8 = 0x40;
+/// What a message of the neighbours' protocol travels with: nothing that
+/// crossed a router has it.
+const ON_LINK: u8 = 255;
+const IP_HEADER: usize = 40;
+
+/// The address a card with this MAC has on its link: `fe80::` and the MAC
+/// with `ff:fe` in its middle and its second bit turned.
+pub fn link_local(mac: EthernetAddress) -> Ipv6Address {
+    with_card(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), mac)
+}
+
+/// The address of `prefix`'s first 64 bits and the card `mac`.
+fn with_card(prefix: Ipv6Address, mac: EthernetAddress) -> Ipv6Address {
+    let m = mac.0;
+    let mut bytes = prefix.0;
+    bytes[8..].copy_from_slice(&[m[0] ^ 2, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]);
+    Ipv6Address(bytes)
+}
+
+/// What a router advertisement says, of what the stack takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advert {
+    /// Who sent it.
+    pub router: Ipv6Address,
+    /// For how many seconds it is a router to send through: 0 when it is
+    /// none.
+    pub lifetime: u16,
+    /// The prefixes an address may be made from, and for how many seconds
+    /// each is good.
+    pub prefixes: Vec<(Ipv6Address, u32)>,
+}
+
+/// What `packet`, a whole IPv6 packet of ICMP, says when it is a router
+/// advertisement to believe: from an address of the link, never through
+/// a router, and with its sum right.
+pub fn advert(packet: &[u8]) -> Option<Advert> {
+    let ip = Ipv6Packet::new_checked(packet).ok()?;
+    let (router, to) = (ip.src_addr(), ip.dst_addr());
+    if ip.next_header() != IpProtocol::Icmpv6 || ip.hop_limit() != ON_LINK {
+        return None;
+    }
+    if !router.is_link_local() {
+        return None;
+    }
+    let message = ip.payload();
+    if message.len() < ADVERT_OPTIONS_AT || message[0] != ROUTER_ADVERT || message[1] != 0 {
+        return None;
+    }
+    let icmp = Icmpv6Packet::new_checked(message).ok()?;
+    if !icmp.verify_checksum(&IpAddress::Ipv6(router), &IpAddress::Ipv6(to)) {
+        return None;
+    }
+    let lifetime = u16::from_be_bytes([message[6], message[7]]);
+    let mut prefixes = Vec::new();
+    let mut options = &message[ADVERT_OPTIONS_AT..];
+    // Each option says its kind and its length in eights of bytes; one
+    // that says none, or more than there is, ends the reading.
+    while options.len() >= 2 {
+        let len = usize::from(options[1]) * 8;
+        if len == 0 || len > options.len() {
+            break;
+        }
+        let (option, rest) = options.split_at(len);
+        options = rest;
+        if option[0] != PREFIX_INFORMATION || len < PREFIX_INFORMATION_LEN {
+            continue;
+        }
+        let prefix = Ipv6Address::from_bytes(&option[16..32]);
+        let valid = u32::from_be_bytes([option[4], option[5], option[6], option[7]]);
+        // An address is made from 64 bits of prefix, and not from the
+        // link's own or a group's.
+        let usable = option[2] == PREFIX_BITS
+            && option[3] & AUTONOMOUS != 0
+            && prefix.is_unicast()
+            && !prefix.is_link_local();
+        if usable && prefixes.len() < PREFIXES {
+            prefixes.push((prefix, valid));
+        }
+    }
+    Some(Advert {
+        router,
+        lifetime,
+        prefixes,
+    })
+}
+
+/// What a card has of IPv6: its addresses, the link's first, and the
+/// router when there is one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sixes {
+    pub addresses: Vec<Ipv6Cidr>,
+    pub router: Option<Ipv6Address>,
+}
+
+impl Sixes {
+    /// The `SIX` that says them.
+    pub fn message(&self) -> Vec<u8> {
+        let mut m = vec![0u8; SIX_ADDRESSES_AT];
+        m[4..8].copy_from_slice(&OP_SIX.to_le_bytes());
+        if let Some(router) = self.router {
+            m[HEADER_LEN..].copy_from_slice(router.as_bytes());
+        }
+        for address in &self.addresses {
+            m.extend_from_slice(address.address().as_bytes());
+            m.extend_from_slice(&[address.prefix_len(), 0, 0, 0, 0, 0, 0, 0]);
+        }
+        m
+    }
+}
+
+/// An address made from a router's prefix.
+struct Given {
+    address: Ipv6Address,
+    /// When it stops being good, if ever.
+    until: Option<Instant>,
+}
+
+/// The stack's side of having IPv6 addresses.
+#[derive(Default)]
+pub(super) struct Six {
+    /// The socket every IPv6 packet of ICMP reaches, where the
+    /// advertisements are read and the solicitations sent: on a stack
+    /// that speaks IPv6.
+    ear: Option<SocketHandle>,
+    /// The router, and until when it is one.
+    router: Option<(Ipv6Address, Instant)>,
+    given: Vec<Given>,
+    /// How many times a router has been asked for, and when the next is.
+    asked: u8,
+    ask_at: Option<Instant>,
+    /// Whether the addresses or the router changed since
+    /// [`Stack::six_news`] last asked.
+    news: bool,
+}
+
+impl Six {
+    /// When there is a router to ask for, if there is.
+    fn asks_at(&self) -> Option<Instant> {
+        if self.ear.is_some() && self.router.is_none() && self.asked < ASKS {
+            self.ask_at
+        } else {
+            None
+        }
+    }
+
+    /// The first time something of this ends or is due, when anything
+    /// is.
+    fn next(&self) -> Option<Instant> {
+        let router = self.router.map(|(_, until)| until);
+        let given = self.given.iter().filter_map(|given| given.until);
+        self.asks_at().into_iter().chain(router).chain(given).min()
+    }
+}
+
+impl<D: for<'d> Device<'d>> Stack<D> {
+    /// Have IPv6 addresses on the card: its own on the link from now on,
+    /// and what the link's router gives. Once.
+    pub fn speak_six(&mut self) {
+        if self.six.ear.is_some() {
+            return;
+        }
+        let ours = link_local(self.iface.ethernet_addr());
+        self.put_six(ours);
+        let room = self.iface.device().capabilities().ip_mtu();
+        let buffer = |packets: usize| {
+            RawSocketBuffer::new(
+                vec![RawPacketMetadata::EMPTY; packets],
+                vec![0u8; packets * room],
+            )
+        };
+        let ear = RawSocket::new(
+            IpVersion::Ipv6,
+            IpProtocol::Icmpv6,
+            buffer(HEARD),
+            buffer(TO_SAY),
+        );
+        self.six.ear = Some(self.set.add(ear));
+        self.six.ask_at = Some(self.now);
+        self.six.news = true;
+    }
+
+    /// What the card has of IPv6.
+    pub fn sixes(&self) -> Sixes {
+        let addresses = self.iface.ip_addrs().iter().filter_map(|cidr| match cidr {
+            IpCidr::Ipv6(cidr) => Some(*cidr),
+            _ => None,
+        });
+        Sixes {
+            addresses: addresses.collect(),
+            router: self.six.router.map(|(router, _)| router),
+        }
+    }
+
+    /// Whether that changed since this was last asked.
+    pub fn six_news(&mut self) -> bool {
+        core::mem::take(&mut self.six.news)
+    }
+
+    fn put_six(&mut self, address: Ipv6Address) {
+        let cidr = IpCidr::Ipv6(Ipv6Cidr::new(address, PREFIX_BITS));
+        self.iface.update_ip_addrs(|addrs| {
+            // The list is the `Vec` whoever built the interface gave it.
+            if let ManagedSlice::Owned(addrs) = addrs {
+                if !addrs.contains(&cidr) {
+                    addrs.push(cidr);
+                }
+            }
+        });
+    }
+
+    fn take_six(&mut self, address: Ipv6Address) {
+        let cidr = IpCidr::Ipv6(Ipv6Cidr::new(address, PREFIX_BITS));
+        self.iface.update_ip_addrs(|addrs| {
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.retain(|have| *have != cidr);
+            }
+        });
+    }
+
+    /// Before a poll: ask for a router when it is time to.
+    pub(super) fn six_ask(&mut self) {
+        let (Some(ear), Some(at)) = (self.six.ear, self.six.asks_at()) else {
+            return;
+        };
+        if self.now < at {
+            return;
+        }
+        // Sent or not (the card may have no room): the next is later.
+        self.six.asked += 1;
+        self.six.ask_at = Some(self.now + ASK_EVERY);
+        let mac = self.iface.ethernet_addr();
+        let (from, to) = (link_local(mac), Ipv6Address::LINK_LOCAL_ALL_ROUTERS);
+        let ask = Icmpv6Repr::Ndisc(NdiscRepr::RouterSolicit { lladdr: Some(mac) });
+        let ip = Ipv6Repr {
+            src_addr: from,
+            dst_addr: to,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: ask.buffer_len(),
+            hop_limit: ON_LINK,
+        };
+        let mut socket = self.set.get::<RawSocket>(ear);
+        if let Ok(packet) = socket.send(IP_HEADER + ask.buffer_len()) {
+            let (header, message) = packet.split_at_mut(IP_HEADER);
+            ip.emit(&mut Ipv6Packet::new_unchecked(header));
+            ask.emit(
+                &IpAddress::Ipv6(from),
+                &IpAddress::Ipv6(to),
+                &mut Icmpv6Packet::new_unchecked(message),
+                &ChecksumCapabilities::default(),
+            );
+        }
+    }
+
+    /// After a poll: read what the routers said, and let go of what has
+    /// lasted as long as it was said to.
+    pub(super) fn six_turn(&mut self) {
+        let Some(ear) = self.six.ear else {
+            return;
+        };
+        loop {
+            let said = match self.set.get::<RawSocket>(ear).recv() {
+                Ok(packet) => advert(packet),
+                Err(_) => break,
+            };
+            if let Some(said) = said {
+                self.six_heard(&said);
+            }
+        }
+        let now = self.now;
+        if self.six.router.is_some_and(|(_, until)| until <= now) {
+            self.set_router(None);
+        }
+        let over = |given: &Given| given.until.is_some_and(|until| until <= now);
+        while let Some(at) = self.six.given.iter().position(over) {
+            let gone = self.six.given.remove(at);
+            self.take_six(gone.address);
+            self.six.news = true;
+        }
+    }
+
+    /// Send what is for no network of the card's to `router` until
+    /// `until`, or nowhere.
+    fn set_router(&mut self, router: Option<(Ipv6Address, Instant)>) {
+        let was = self.six.router.map(|(router, _)| router);
+        let now = router.map(|(router, _)| router);
+        if was != now {
+            let routes = self.iface.routes_mut();
+            routes.remove_default_ipv6_route();
+            if let Some(router) = now {
+                // An interface built with no room for a route has none.
+                if routes.add_default_ipv6_route(router).is_err() {
+                    self.six.router = None;
+                    self.six.news |= was.is_some();
+                    return;
+                }
+            }
+            self.six.news = true;
+        }
+        self.six.router = router;
+        if was.is_some() && router.is_none() {
+            // There may be another: it is asked for as at first.
+            self.six.asked = 0;
+            self.six.ask_at = Some(self.now);
+        }
+    }
+
+    /// Take what a router's advertisement says.
+    fn six_heard(&mut self, said: &Advert) {
+        let now = self.now;
+        let ours = self.six.router.map(|(router, _)| router);
+        let lasts = now + Duration::from_secs(u64::from(said.lifetime));
+        match (ours, said.lifetime) {
+            // It is no router any more.
+            (Some(ours), 0) if ours == said.router => self.set_router(None),
+            (_, 0) => {}
+            // The one there is stays while it lasts.
+            (Some(ours), _) if ours != said.router => {}
+            _ => self.set_router(Some((said.router, lasts))),
+        }
+        let mac = self.iface.ethernet_addr();
+        for &(prefix, valid) in &said.prefixes {
+            let address = with_card(prefix, mac);
+            let until = (valid != FOREVER).then(|| now + Duration::from_secs(u64::from(valid)));
+            let room = self.six.given.len() < PREFIXES;
+            match self.six.given.iter_mut().find(|g| g.address == address) {
+                Some(given) => {
+                    // Longer is taken as said; shorter, only down to
+                    // AT_LEAST from now.
+                    let floor = now + AT_LEAST;
+                    let taken = match (until, given.until) {
+                        (None, _) => true,
+                        (Some(said), have) => said > floor || have.is_some_and(|have| said > have),
+                    };
+                    if taken {
+                        given.until = until;
+                    } else if given.until.is_none_or(|have| have > floor) {
+                        given.until = Some(floor);
+                    }
+                }
+                None if valid != 0 && room => {
+                    self.six.given.push(Given { address, until });
+                    self.put_six(address);
+                    self.six.news = true;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// How long until an address or the router ends, or a router is to
+    /// be asked for again.
+    pub(super) fn six_idle(&self, now: Instant) -> Option<Duration> {
+        let next = self.six.next()?;
+        Some(if next > now {
+            next - now
+        } else {
+            Duration::ZERO
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::port::testing::*;
+    use smoltcp::wire::{EthernetFrame, EthernetProtocol, EthernetRepr, NdiscNeighborFlags};
+
+    /// Our address on the link, and the one made from the router's prefix.
+    const OURS_LINK: Ipv6Address = Ipv6Address([
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x57,
+    ]);
+    const OURS_GIVEN: Ipv6Address = Ipv6Address([
+        0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x57,
+    ]);
+    const PREFIX: Ipv6Address = Ipv6Address([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    /// THEIRS on the link: the router.
+    const ROUTER: Ipv6Address = Ipv6Address([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    const ALL_NODES: Ipv6Address = Ipv6Address::LINK_LOCAL_ALL_NODES;
+    const ON_LINK_FLAG: u8 = 0x80;
+
+    /// A stack over a bench's card that speaks IPv6, with room for a
+    /// route.
+    fn stack() -> (Stack<crate::port::Port>, Window) {
+        let Bench { window, iface, .. } = Bench::new();
+        let mut stack = Stack::new(iface);
+        stack.speak_six();
+        (stack, window)
+    }
+
+    /// Poll at `ms`, and the frames that put on the wire, the card done
+    /// with each.
+    fn frames(stack: &mut Stack<crate::port::Port>, window: &Window, ms: i64) -> Vec<Vec<u8>> {
+        stack.poll(Instant::from_millis(ms));
+        let turn = turn(stack.device());
+        let mut out = Vec::new();
+        for m in &turn {
+            if m.op == udrivers::net::OP_TX {
+                out.push(window.sent(m));
+                window.done(stack.device(), m);
+            }
+        }
+        out
+    }
+
+    /// The card of the group `group`: `33:33` and its last four bytes.
+    fn group_card(group: Ipv6Address) -> EthernetAddress {
+        let g = group.0;
+        EthernetAddress([0x33, 0x33, g[12], g[13], g[14], g[15]])
+    }
+
+    /// THEIRS sends `message`, ICMPv6 with its sum to be written, from
+    /// `from` to `to`, to travel `hops`.
+    fn six_frame(from: Ipv6Address, to: Ipv6Address, hops: u8, message: &[u8]) -> Vec<u8> {
+        let eth = EthernetRepr {
+            src_addr: THEIRS,
+            dst_addr: if to.is_unicast() {
+                OURS
+            } else {
+                group_card(to)
+            },
+            ethertype: EthernetProtocol::Ipv6,
+        };
+        let ip = Ipv6Repr {
+            src_addr: from,
+            dst_addr: to,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: message.len(),
+            hop_limit: hops,
+        };
+        let mut bytes = vec![0u8; eth.buffer_len() + IP_HEADER + message.len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+        eth.emit(&mut frame);
+        let (header, payload) = frame.payload_mut().split_at_mut(IP_HEADER);
+        ip.emit(&mut Ipv6Packet::new_unchecked(header));
+        payload.copy_from_slice(message);
+        let mut icmp = Icmpv6Packet::new_unchecked(payload);
+        icmp.fill_checksum(&IpAddress::Ipv6(from), &IpAddress::Ipv6(to));
+        bytes
+    }
+
+    /// A message of ICMPv6 as smoltcp writes it, from `from` to `to`.
+    fn six_message(from: Ipv6Address, to: Ipv6Address, repr: &Icmpv6Repr) -> Vec<u8> {
+        let mut message = vec![0u8; repr.buffer_len()];
+        repr.emit(
+            &IpAddress::Ipv6(from),
+            &IpAddress::Ipv6(to),
+            &mut Icmpv6Packet::new_unchecked(&mut message[..]),
+            &ChecksumCapabilities::default(),
+        );
+        message
+    }
+
+    /// What a frame of ours carries: the cards, the addresses, the hops,
+    /// and the ICMPv6 message, its sum checked.
+    struct Sent {
+        to_card: EthernetAddress,
+        from: Ipv6Address,
+        to: Ipv6Address,
+        hops: u8,
+        message: Vec<u8>,
+    }
+
+    fn six_of(frame: &[u8]) -> Sent {
+        let eth = EthernetFrame::new_checked(frame).unwrap();
+        assert_eq!(eth.src_addr(), OURS);
+        assert_eq!(eth.ethertype(), EthernetProtocol::Ipv6);
+        let ip = Ipv6Packet::new_checked(eth.payload()).unwrap();
+        assert_eq!(ip.next_header(), IpProtocol::Icmpv6);
+        let (from, to) = (ip.src_addr(), ip.dst_addr());
+        let icmp = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+        assert!(icmp.verify_checksum(&IpAddress::Ipv6(from), &IpAddress::Ipv6(to)));
+        Sent {
+            to_card: eth.dst_addr(),
+            from,
+            to,
+            hops: ip.hop_limit(),
+            message: ip.payload().to_vec(),
+        }
+    }
+
+    /// One prefix of a router advertisement: its bits, its flags, and for
+    /// how many seconds it is good.
+    type Prefix = (Ipv6Address, u8, u8, u32);
+
+    /// A router advertisement's message: a router for `lifetime` seconds,
+    /// with its card, `prefixes`, and a name server, which is an option
+    /// smoltcp does not know.
+    fn advert_message(lifetime: u16, prefixes: &[Prefix]) -> Vec<u8> {
+        let mut m = vec![ROUTER_ADVERT, 0, 0, 0, 64, 0];
+        m.extend_from_slice(&lifetime.to_be_bytes());
+        m.extend_from_slice(&[0; 8]);
+        // Its card.
+        m.extend_from_slice(&[1, 1]);
+        m.extend_from_slice(&THEIRS.0);
+        for &(prefix, bits, flags, valid) in prefixes {
+            m.extend_from_slice(&[PREFIX_INFORMATION, 4, bits, flags]);
+            m.extend_from_slice(&valid.to_be_bytes());
+            m.extend_from_slice(&valid.to_be_bytes());
+            m.extend_from_slice(&[0; 4]);
+            m.extend_from_slice(prefix.as_bytes());
+        }
+        // A name server.
+        m.extend_from_slice(&[25, 3, 0, 0]);
+        m.extend_from_slice(&3600u32.to_be_bytes());
+        m.extend_from_slice(Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 3).as_bytes());
+        m
+    }
+
+    /// The router says it is one for `lifetime` seconds and that PREFIX
+    /// is good for `valid`.
+    fn advertise(stack: &mut Stack<crate::port::Port>, window: &Window, lifetime: u16, valid: u32) {
+        let message = advert_message(lifetime, &[(PREFIX, 64, AUTONOMOUS | ON_LINK_FLAG, valid)]);
+        let frame = six_frame(ROUTER, ALL_NODES, ON_LINK, &message);
+        window.deliver(stack.device(), 0, &frame);
+    }
+
+    fn cidr(address: Ipv6Address) -> Ipv6Cidr {
+        Ipv6Cidr::new(address, 64)
+    }
+
+    #[test]
+    fn the_links_address_is_the_mac_with_fffe_in_its_middle() {
+        assert_eq!(link_local(OURS), OURS_LINK);
+        // And the stack has it from the moment it speaks IPv6, which is
+        // news.
+        let (mut stack, _) = stack();
+        assert_eq!(
+            stack.sixes(),
+            Sixes {
+                addresses: vec![cidr(OURS_LINK)],
+                router: None
+            }
+        );
+        assert!(stack.six_news());
+        assert!(!stack.six_news());
+        // One that does not has none, and asks for no router.
+        let Bench { window, iface, .. } = Bench::new();
+        let mut quiet = Stack::new(iface);
+        assert_eq!(quiet.sixes(), Sixes::default());
+        assert!(frames(&mut quiet, &window, 0).is_empty());
+        assert_eq!(quiet.idle_for(Instant::from_millis(0)), None);
+    }
+
+    #[test]
+    fn a_router_is_asked_for_three_times_and_no_more() {
+        let (mut stack, window) = stack();
+        let mut asked = Vec::new();
+        for ms in [0, 1000, 3999, 4000, 8000, 12_000, 16_000, 60_000] {
+            let sent = frames(&mut stack, &window, ms);
+            assert!(sent.len() <= 1);
+            for frame in &sent {
+                let ask = six_of(frame);
+                assert_eq!(ask.to_card, EthernetAddress([0x33, 0x33, 0, 0, 0, 2]));
+                assert_eq!(
+                    (ask.from, ask.to),
+                    (OURS_LINK, Ipv6Address::LINK_LOCAL_ALL_ROUTERS)
+                );
+                assert_eq!(ask.hops, 255);
+                // "Is there a router?", from our card.
+                let mut said = vec![133, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+                said.extend_from_slice(&OURS.0);
+                assert_eq!(ask.message[..2], said[..2]);
+                assert_eq!(ask.message[4..], said[4..]);
+                asked.push(ms);
+            }
+            // Nothing else to wake for but the next of them.
+            let idle = stack.idle_for(Instant::from_millis(ms));
+            let next = [4000, 8000].iter().find(|&&at| at > ms);
+            assert_eq!(
+                idle,
+                next.map(|&at| Duration::from_millis((at - ms) as u64))
+            );
+        }
+        assert_eq!(asked, [0, 4000, 8000]);
+    }
+
+    #[test]
+    fn what_a_router_advertises_is_the_cards_address_and_its_way_out() {
+        let (mut stack, window) = stack();
+        assert_eq!(frames(&mut stack, &window, 0).len(), 1);
+        assert!(stack.six_news());
+
+        advertise(&mut stack, &window, 1800, 86_400);
+        assert!(frames(&mut stack, &window, 100).is_empty());
+        let sixes = stack.sixes();
+        assert_eq!(
+            sixes,
+            Sixes {
+                addresses: vec![cidr(OURS_LINK), cidr(OURS_GIVEN)],
+                router: Some(ROUTER)
+            }
+        );
+        assert!(stack.six_news());
+        assert!(!stack.six_news());
+
+        // What the kernel is told.
+        let m = sixes.message();
+        assert_eq!(m.len(), SIX_ADDRESSES_AT + 2 * SIX_ADDRESS_LEN);
+        assert_eq!(m[..4], [0; 4]);
+        assert_eq!(m[4..8], OP_SIX.to_le_bytes());
+        assert_eq!(m[8..16], [0; 8]);
+        assert_eq!(m[16..32], ROUTER.0);
+        assert_eq!(m[32..48], OURS_LINK.0);
+        assert_eq!(m[48..56], [64, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(m[56..72], OURS_GIVEN.0);
+        assert_eq!(m[72..80], [64, 0, 0, 0, 0, 0, 0, 0]);
+        // And with no router, zeroes.
+        let alone = Sixes {
+            router: None,
+            ..sixes
+        };
+        assert_eq!(alone.message()[16..32], [0; 16]);
+
+        // There is a router: it is not asked for again. The same word
+        // again is not news.
+        advertise(&mut stack, &window, 1800, 86_400);
+        for ms in [4000, 8000, 12_000] {
+            assert!(frames(&mut stack, &window, ms).is_empty());
+        }
+        assert!(!stack.six_news());
+        assert_eq!(stack.sixes().addresses.len(), 2);
+    }
+
+    #[test]
+    fn an_advertisement_not_to_believe_changes_nothing() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        assert!(stack.six_news());
+        let good = advert_message(1800, &[(PREFIX, 64, AUTONOMOUS, 86_400)]);
+        // One that crossed a router; one from no address of the link; one
+        // whose sum is wrong; and one that is another message.
+        let far = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 2);
+        let mut wrong = six_frame(ROUTER, ALL_NODES, ON_LINK, &good);
+        *wrong.last_mut().unwrap() ^= 1;
+        let mut other = good.clone();
+        other[0] = 133;
+        for frame in [
+            six_frame(ROUTER, ALL_NODES, 64, &good),
+            six_frame(far, ALL_NODES, ON_LINK, &good),
+            wrong,
+            six_frame(ROUTER, ALL_NODES, ON_LINK, &other),
+        ] {
+            window.deliver(stack.device(), 0, &frame);
+            frames(&mut stack, &window, 100);
+            assert!(!stack.six_news());
+            assert_eq!(stack.sixes().addresses, [cidr(OURS_LINK)]);
+            assert_eq!(stack.sixes().router, None);
+        }
+
+        // A prefix no address is made from -- of other than 64 bits, one
+        // that does not say an address may be, the link's own, a group's
+        // -- gives none, and its router is still one.
+        let group = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+        let none = advert_message(
+            1800,
+            &[
+                (PREFIX, 48, AUTONOMOUS, 86_400),
+                (PREFIX, 64, ON_LINK_FLAG, 86_400),
+                (link, 64, AUTONOMOUS, 86_400),
+                (group, 64, AUTONOMOUS, 86_400),
+                (PREFIX, 64, AUTONOMOUS, 0),
+            ],
+        );
+        window.deliver(
+            stack.device(),
+            0,
+            &six_frame(ROUTER, ALL_NODES, ON_LINK, &none),
+        );
+        frames(&mut stack, &window, 200);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().addresses, [cidr(OURS_LINK)]);
+        assert_eq!(stack.sixes().router, Some(ROUTER));
+
+        // More prefixes than the stack keeps: the first PREFIXES.
+        let many: Vec<Prefix> = (1..=6)
+            .map(|n| {
+                let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, n, 0, 0, 0, 0);
+                (prefix, 64, AUTONOMOUS, 86_400)
+            })
+            .collect();
+        let frame = six_frame(ROUTER, ALL_NODES, ON_LINK, &advert_message(1800, &many));
+        window.deliver(stack.device(), 0, &frame);
+        frames(&mut stack, &window, 300);
+        let addresses = stack.sixes().addresses;
+        assert_eq!(addresses.len(), 1 + PREFIXES);
+        let last = Ipv6Address::new(0x2001, 0xdb8, 0, 4, 0x5054, 0x00ff, 0xfe12, 0x3457);
+        assert_eq!(addresses[PREFIXES], cidr(last));
+    }
+
+    #[test]
+    fn a_router_and_its_addresses_last_as_long_as_it_says() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 30, 60);
+        frames(&mut stack, &window, 1000);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().router, Some(ROUTER));
+        // The router's end is the next thing to wake for.
+        let at = |ms: i64| Instant::from_millis(ms);
+        assert_eq!(stack.idle_for(at(1000)), Some(Duration::from_secs(30)));
+
+        frames(&mut stack, &window, 30_999);
+        assert!(!stack.six_news());
+        frames(&mut stack, &window, 31_000);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().router, None);
+        assert_eq!(stack.sixes().addresses.len(), 2);
+        // There may be another: one is asked for, as at first.
+        assert_eq!(stack.idle_for(at(31_000)), Some(Duration::ZERO));
+        assert_eq!(frames(&mut stack, &window, 31_000).len(), 1);
+        assert_eq!(stack.idle_for(at(31_000)), Some(Duration::from_secs(4)));
+
+        assert_eq!(frames(&mut stack, &window, 61_000).len(), 1);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().addresses, [cidr(OURS_LINK)]);
+        assert_eq!(stack.idle_for(at(61_000)), Some(Duration::from_secs(4)));
+
+        // It says again that it is one, and for a prefix good for three
+        // hours; then, that the prefix is good for ten seconds, which
+        // takes it down to two hours and no further; and then that it is
+        // no router, which is so at once.
+        advertise(&mut stack, &window, 1800, 3 * 3600);
+        frames(&mut stack, &window, 100_000);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().addresses.len(), 2);
+        advertise(&mut stack, &window, 1800, 10);
+        frames(&mut stack, &window, 101_000);
+        frames(&mut stack, &window, 101_000 + 3_600_000);
+        assert_eq!(stack.sixes().addresses.len(), 2);
+        advertise(&mut stack, &window, 0, 10);
+        frames(&mut stack, &window, 102_000 + 3_600_000);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().router, None);
+        frames(&mut stack, &window, 101_000 + 7_200_000);
+        assert!(stack.six_news());
+        assert_eq!(stack.sixes().addresses, [cidr(OURS_LINK)]);
+    }
+
+    #[test]
+    fn a_neighbour_that_asks_where_an_address_is_is_told() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let theirs = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let mut ms = 200;
+        // Asked of whoever may have it, and of the address itself.
+        for ours in [OURS_LINK, OURS_GIVEN] {
+            for to in [ours.solicited_node(), ours] {
+                let ask = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+                    target_addr: ours,
+                    lladdr: Some(THEIRS),
+                });
+                let frame = six_frame(theirs, to, ON_LINK, &six_message(theirs, to, &ask));
+                window.deliver(stack.device(), 0, &frame);
+                let sent = frames(&mut stack, &window, ms);
+                ms += 100;
+                assert_eq!(sent.len(), 1);
+                let answer = six_of(&sent[0]);
+                assert_eq!(answer.to_card, THEIRS);
+                assert_eq!((answer.from, answer.to, answer.hops), (ours, theirs, 255));
+                let said = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::SOLICITED,
+                    target_addr: ours,
+                    lladdr: Some(OURS),
+                });
+                assert_eq!(answer.message, six_message(ours, theirs, &said));
+            }
+        }
+        // For an address that is not the card's, nothing.
+        let other = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let ask = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: other,
+            lladdr: Some(THEIRS),
+        });
+        let to = other.solicited_node();
+        let frame = six_frame(theirs, to, ON_LINK, &six_message(theirs, to, &ask));
+        window.deliver(stack.device(), 0, &frame);
+        assert!(frames(&mut stack, &window, ms).is_empty());
+
+        // And an echo request for one of the card's is answered from it.
+        let echo = |reply: bool| {
+            let (ident, seq_no, data) = (7, 1, &b"is anybody there"[..]);
+            if reply {
+                Icmpv6Repr::EchoReply {
+                    ident,
+                    seq_no,
+                    data,
+                }
+            } else {
+                Icmpv6Repr::EchoRequest {
+                    ident,
+                    seq_no,
+                    data,
+                }
+            }
+        };
+        for ours in [OURS_LINK, OURS_GIVEN] {
+            let request = six_message(theirs, ours, &echo(false));
+            window.deliver(stack.device(), 0, &six_frame(theirs, ours, 64, &request));
+            ms += 100;
+            let sent = frames(&mut stack, &window, ms);
+            assert_eq!(sent.len(), 1);
+            let answer = six_of(&sent[0]);
+            assert_eq!(answer.to_card, THEIRS);
+            assert_eq!((answer.from, answer.to), (ours, theirs));
+            assert_eq!(answer.message, six_message(ours, theirs, &echo(true)));
+        }
+    }
+}

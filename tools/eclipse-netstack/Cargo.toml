@@ -41,6 +41,9 @@ path = "src/bin/eclipse-tcp-bench.rs"
 
 [dependencies]
 libc = "0.2"
+# The address list of a smoltcp interface is a `ManagedSlice`: an address
+# is added to it, and taken off it, as the `Vec` it is (`socks::six`).
+managed = { version = "0.8", default-features = false, features = ["std"] }
 # The system calls, the FIFO, the channel, and what a card's driver offers.
 udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
 # The kernel's own stack: the tree's copy, the same code the kernel links,
@@ -48,6 +51,9 @@ udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
 smoltcp = { path = "../../smoltcp", default-features = false, features = [
     "std",
     "proto-ipv4",
+    # The card's IPv6 addresses, and the neighbours that ask for them
+    # (`socks::six`).
+    "proto-ipv6",
     "medium-ethernet",
     "socket-icmp",
     # Every packet of ICMP the card brings, for the sockets `ping` opens.

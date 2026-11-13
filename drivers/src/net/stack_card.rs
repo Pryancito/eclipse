@@ -16,7 +16,10 @@
 //! What does change is how much the card has carried, which only the stack
 //! knows and says as it goes: the card is given the place those counts are
 //! kept ([`Carried`]), and answers with what is there when it is asked
-//! (`/proc/net/dev`, which is where `ifconfig` reads them).
+//! (`/proc/net/dev`, which is where `ifconfig` reads them). And its IPv6
+//! addresses, which its link's router gives and takes away: the card is
+//! given the place the stack's last word of them is kept ([`Sixes`]), and
+//! shows them and the router after what the stack said at first.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -24,10 +27,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{
+    EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr,
+};
 
 use super::ip_cfg;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
+use crate::sync::Mutex;
 use crate::{DeviceError, DeviceResult};
 
 /// What a card has carried so far, kept by whoever is told: the frames
@@ -81,6 +87,37 @@ impl Carried {
     }
 }
 
+/// What a card has of IPv6, kept by whoever is told: its addresses and
+/// the router of its link, as the stack said them last. Nothing, until
+/// it says, and once it is gone.
+#[derive(Default)]
+pub struct Sixes {
+    said: Mutex<(Vec<Ipv6Cidr>, Option<Ipv6Address>)>,
+}
+
+impl Sixes {
+    /// The card has `addresses` now, and what is for none of their
+    /// networks goes to `router`.
+    pub fn say(&self, addresses: Vec<Ipv6Cidr>, router: Option<Ipv6Address>) {
+        *self.said.lock() = (addresses, router);
+    }
+
+    /// The stack that said them is gone.
+    pub fn forget(&self) {
+        self.say(Vec::new(), None);
+    }
+
+    /// The addresses, in the order they were said.
+    pub fn addresses(&self) -> Vec<Ipv6Cidr> {
+        self.said.lock().0.clone()
+    }
+
+    /// The router, when there is one.
+    pub fn router(&self) -> Option<Ipv6Address> {
+        self.said.lock().1
+    }
+}
+
 /// The interface that shows the card of a stack that runs somewhere else.
 pub struct StackCard {
     name: String,
@@ -90,6 +127,8 @@ pub struct StackCard {
     routes: Vec<RouteInfo>,
     /// What the stack says the card has carried.
     carried: Arc<Carried>,
+    /// What the stack says the card has of IPv6.
+    sixes: Arc<Sixes>,
 }
 
 impl StackCard {
@@ -117,6 +156,7 @@ impl StackCard {
             addrs: vec![IpCidr::Ipv4(address)],
             routes,
             carried: Arc::new(Carried::default()),
+            sixes: Arc::new(Sixes::default()),
         }
     }
 
@@ -125,6 +165,14 @@ impl StackCard {
     /// has carried nothing, as far as anyone here can tell.
     pub fn counting(mut self, carried: Arc<Carried>) -> Self {
         self.carried = carried;
+        self
+    }
+
+    /// The same card, with its IPv6 addresses and router read from
+    /// `sixes`: where whoever hears the stack keeps what it says of
+    /// them. Without it the card has none.
+    pub fn with_sixes(mut self, sixes: Arc<Sixes>) -> Self {
+        self.sixes = sixes;
         self
     }
 
@@ -196,11 +244,18 @@ impl NetScheme for StackCard {
     }
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        self.addrs.clone()
+        let mut addrs = self.addrs.clone();
+        addrs.extend(self.sixes.addresses().into_iter().map(IpCidr::Ipv6));
+        addrs
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        ip_cfg::reported_routes(&self.routes, &self.addrs)
+        let mut routes = self.routes.clone();
+        routes.extend(self.sixes.router().map(|router| RouteInfo {
+            dst: IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0),
+            gateway: Some(IpAddress::Ipv6(router)),
+        }));
+        ip_cfg::reported_routes(&routes, &self.get_ip_address())
     }
 
     fn get_stats(&self) -> NetStats {
@@ -344,6 +399,47 @@ mod tests {
         let stats = next.get_stats();
         assert_eq!((stats.rx_bytes, stats.rx_packets), (660, 5));
         assert_eq!((stats.tx_bytes, stats.tx_packets), (500, 4));
+    }
+
+    #[test]
+    fn it_shows_the_ipv6_addresses_and_the_router_the_stack_said_last() {
+        let sixes = Arc::new(Sixes::default());
+        let c = card(Some([10, 0, 9, 1])).with_sixes(sixes.clone());
+        let v4 = IpCidr::new(IpAddress::v4(10, 0, 9, 15), 24);
+        assert_eq!(c.get_ip_address(), [v4]);
+        assert_eq!(c.get_routes().len(), 2);
+
+        // The link's own: an address, and its network.
+        let link = Ipv6Cidr::new(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 7), 64);
+        sixes.say(vec![link], None);
+        assert_eq!(c.get_ip_address(), [v4, IpCidr::Ipv6(link)]);
+        let routes = c.get_routes();
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[2].dst, IpCidr::Ipv6(link.network()));
+        assert_eq!(routes[2].gateway, None);
+
+        // What the router gave, and the router: the default routes first.
+        let given = Ipv6Cidr::new(Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 7), 64);
+        let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        sixes.say(vec![link, given], Some(router));
+        assert_eq!(
+            c.get_ip_address(),
+            [v4, IpCidr::Ipv6(link), IpCidr::Ipv6(given)]
+        );
+        let routes = c.get_routes();
+        assert_eq!(routes.len(), 5);
+        assert_eq!(routes[0].gateway, Some(IpAddress::v4(10, 0, 9, 1)));
+        assert_eq!(
+            routes[1].dst,
+            IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0)
+        );
+        assert_eq!(routes[1].gateway, Some(IpAddress::Ipv6(router)));
+        assert_eq!(routes[4].dst, IpCidr::Ipv6(given.network()));
+
+        // The stack is gone: what it said first is all there is.
+        sixes.forget();
+        assert_eq!(c.get_ip_address(), [v4]);
+        assert_eq!(c.get_routes().len(), 2);
     }
 
     #[test]

@@ -646,7 +646,8 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let address = (args[2] as u32).to_be_bytes();
     let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
-    let card = show_stack_card(address, args, serving.link().carried());
+    let link = serving.link();
+    let card = show_stack_card(address, args, link.carried(), link.sixes());
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them. Until this
     // process is gone: the next one's channel has its own task.
@@ -683,12 +684,14 @@ static STACK_CARD_NAME: lock::Mutex<Option<alloc::string::String>> = lock::Mutex
 /// `carried` is where what the stack says its card has carried is kept
 /// (`COUNTS`), and what the interface answers with: the same place for
 /// every stack, so the counts of `eth0` do not start over when its stack
-/// does.
+/// does. `sixes` is where what it says of its IPv6 addresses is kept
+/// (`SIX`), which the interface shows after the address above.
 #[cfg(feature = "zircon-gateway")]
 fn show_stack_card(
     address: [u8; 4],
     args: &[usize; 6],
     carried: Arc<kernel_hal::drivers::net::stack_card::Carried>,
+    sixes: Arc<kernel_hal::drivers::net::stack_card::Sixes>,
 ) -> Option<Arc<kernel_hal::drivers::net::stack_card::StackCard>> {
     use kernel_hal::drivers::net::stack_card::StackCard;
     if !linux_object::net::user_stack::is_for_all() {
@@ -702,7 +705,7 @@ fn show_stack_card(
     *name = Some(called.clone());
     // `args[3..]`: the prefix, the gateway and the MAC, as the call says.
     let said = StackCard::said(called.clone(), address, args[3], args[4], args[5])?;
-    let card = Arc::new(said.counting(carried));
+    let card = Arc::new(said.counting(carried).with_sixes(sixes));
     if !kernel_hal::drivers::hotplug::add(kernel_hal::drivers::prelude::Device::Net(card.clone())) {
         return None;
     }

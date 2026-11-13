@@ -64,6 +64,7 @@ use netstack::governed;
 use netstack::port::Port;
 use netstack::resolv::{self, Applied};
 use netstack::socks::lease::{Addressing, Lease};
+use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
 use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_SEND};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
@@ -195,6 +196,9 @@ struct Shared {
     /// something since the card's thread last waited for an answer to
     /// send its frames with (see [`HOLD`]).
     answering: bool,
+    /// Whether the card's IPv6 addresses changed and the kernel has not
+    /// been told: it is, with the first turn it has sockets here.
+    six_owed: bool,
 }
 
 /// What every thread has: the stack, and the kernel once it has sockets
@@ -254,10 +258,22 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
         settle(host, lease);
         shared = locked(&host.shared);
     }
+    if shared.stack.six_news() {
+        shared.six_owed = true;
+        let sixes = shared.stack.sixes();
+        drop(shared);
+        say_sixes(host, &sixes);
+        shared = locked(&host.shared);
+    }
     // Without the kernel there are no sockets for anything to arrive on.
     let Some(kernel) = host.kernel.get() else {
         return false;
     };
+    if core::mem::take(&mut shared.six_owed) {
+        // A message of its own, as rare as an address changes. A kernel
+        // that is gone took the machine with it.
+        let _ = kernel.channel.write(&shared.stack.sixes().message(), &[]);
+    }
     tell_counts(host, &shared.stack.device().counts(), at);
     let mut bytes = false;
     loop {
@@ -635,6 +651,25 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
     publish(host);
 }
 
+/// Say what the card has of IPv6 now, which is what its router made of
+/// it.
+fn say_sixes(host: &Host, sixes: &Sixes) {
+    let index = host.index;
+    let addresses: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
+    let router = sixes
+        .router
+        .map(|router| format!(", router {router}"))
+        .unwrap_or_default();
+    match addresses.as_slice() {
+        [] => println!("{NAME}: card {index} has no IPv6 address"),
+        addresses => println!(
+            "{NAME}: card {index} is {}{router}",
+            addresses.join(" and ")
+        ),
+    }
+    publish(host);
+}
+
 /// Write the name servers of a lease where every program's resolver
 /// looks, as the script of a `udhcpc` does for a card of the kernel's.
 /// While the card is the machine's: the kernel has been told it by now,
@@ -706,6 +741,7 @@ fn main() {
         }
         Addressing::Leased => stack.ask_for_lease(),
     }
+    stack.speak_six();
     let host = Arc::new(Host {
         index,
         mac,
@@ -714,6 +750,7 @@ fn main() {
             stack,
             fifo: link.fifo.clone(),
             answering: false,
+            six_owed: false,
         }),
         kernel: OnceLock::new(),
         told: Mutex::new(None),
@@ -793,7 +830,7 @@ fn main() {
 /// driver it runs now and how many it has started, which eclipse-init
 /// never sees. lunarmon's SERVIDORES list reads it.
 fn publish(host: &Host) {
-    let (address, gateway, dns, leases) = {
+    let (address, gateway, dns, leases, sixes) = {
         let shared = locked(&host.shared);
         let stack = &shared.stack;
         let dns = stack.lease().map(|lease| lease.dns.clone());
@@ -802,8 +839,10 @@ fn publish(host: &Host) {
             stack.gateway(),
             dns.unwrap_or_default(),
             stack.leases(),
+            stack.sixes(),
         )
     };
+    let addr6: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
     let device = format!("virtio-net@{}", host.index);
     let from = match (leases, &host.governed) {
         (true, _) => "dhcp",
@@ -823,6 +862,11 @@ fn publish(host: &Host) {
             ("governed", host.governed.as_deref().unwrap_or("none")),
             ("gateway", &or_none(gateway.map(|g| g.to_string()))),
             ("dns", &or_none((!dns.is_empty()).then(|| dns.join(",")))),
+            (
+                "addr6",
+                &or_none((!addr6.is_empty()).then(|| addr6.join(","))),
+            ),
+            ("gateway6", &or_none(sixes.router.map(|r| r.to_string()))),
             (
                 "driver_pid",
                 &host.driver_pid.load(Ordering::Relaxed).to_string(),

@@ -1571,7 +1571,12 @@ impl<'a> InterfaceInner<'a> {
                         .fill(ip_repr.src_addr.into(), lladdr, timestamp),
                     _ => (),
                 }
-                if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {
+                // Asked of whoever may have the address, or of the address
+                // itself: how a neighbor that knows where it is checks
+                // that it is still there.
+                let asked =
+                    self.has_solicited_node(ip_repr.dst_addr) || self.has_ip_addr(ip_repr.dst_addr);
+                if asked && self.has_ip_addr(target_addr) {
                     let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
                         flags: NdiscNeighborFlags::SOLICITED,
                         target_addr: target_addr,
