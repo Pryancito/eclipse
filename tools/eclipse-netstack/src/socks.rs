@@ -45,6 +45,9 @@
 //! it: the connection is a smoltcp socket here, and an `EVENTS` carries
 //! what a turn made of every connection.
 //!
+//! One more message goes to the kernel that is about no socket: how much
+//! the card has carried (`COUNTS`, in [`crate::counts`]).
+//!
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
 

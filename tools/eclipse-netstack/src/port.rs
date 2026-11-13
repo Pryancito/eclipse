@@ -21,6 +21,8 @@ use smoltcp::phy::{self, DeviceCapabilities};
 use smoltcp::time::Instant;
 use udrivers::net::{Msg, BUF_SIZE, FRAME_MAX, OP_RX, OP_TX, TX_HEADROOM};
 
+use crate::counts::Counts;
+
 // A frame of any length fits a transmit slot past its headroom.
 const _: () = assert!(TX_HEADROOM + FRAME_MAX <= BUF_SIZE);
 
@@ -48,6 +50,8 @@ struct State {
     outgoing: Vec<Msg>,
     /// One bit per free transmit slot.
     tx_free: u32,
+    /// What the card has carried: see [`Port::counts`].
+    counts: Counts,
 }
 
 /// A served card, from the stack's side.
@@ -78,8 +82,31 @@ impl Port {
                 incoming: VecDeque::new(),
                 outgoing: Vec::new(),
                 tx_free: ((1u64 << tx_slots) - 1) as u32,
+                counts: Counts::default(),
             }),
         })
+    }
+
+    /// What the card has carried through this port, and before it: the
+    /// frames it delivered, read yet or not, and the ones given to it to
+    /// send.
+    pub fn counts(&self) -> Counts {
+        self.state.borrow().counts
+    }
+
+    /// The card had carried `before` when this port was made for it: the
+    /// port of the driver that was there until now is where the card's
+    /// counts were, and they are the card's, not a driver's.
+    pub fn count_from(&self, before: Counts) {
+        let mut state = self.state.borrow_mut();
+        let here = state.counts;
+        state.counts = Counts {
+            rx_bytes: before.rx_bytes + here.rx_bytes,
+            rx_packets: before.rx_packets + here.rx_packets,
+            rx_errors: before.rx_errors + here.rx_errors,
+            tx_bytes: before.tx_bytes + here.tx_bytes,
+            tx_packets: before.tx_packets + here.tx_packets,
+        };
     }
 
     /// How many messages a turn can have to send: every slot once.
@@ -94,8 +121,14 @@ impl Port {
         let mut state = self.state.borrow_mut();
         match m.op {
             OP_RX => match rx_place(m, self.rx_slots) {
-                Some(at) => state.incoming.push_back((at, m.len as usize, m.slot)),
-                None => return false,
+                Some(at) => {
+                    state.incoming.push_back((at, m.len as usize, m.slot));
+                    state.counts.received(m.len as usize);
+                }
+                None => {
+                    state.counts.rx_errors += 1;
+                    return false;
+                }
             },
             OP_TX if (m.slot as usize) < self.tx_slots => state.tx_free |= 1 << m.slot,
             _ => return false,
@@ -256,6 +289,7 @@ impl phy::TxToken for TxToken<'_> {
                     len: len as u32,
                     off: TX_HEADROOM as u32,
                 });
+                state.counts.sent(len);
                 Ok(result)
             }
             Err(e) => {
@@ -831,6 +865,99 @@ mod tests {
                 ident: 0x1234,
                 seq_no: 7,
                 data: &data,
+            }
+        );
+    }
+
+    #[test]
+    fn the_card_has_carried_the_frames_each_way_and_goes_on_with_another_port() {
+        let mut bench = Bench::new();
+        assert_eq!(bench.iface.device().counts(), Counts::default());
+        // A question and its answer: one frame each way, of the length
+        // each has.
+        let question = arp_request(OUR_IP);
+        bench.deliver(RX as u32 - 1, &question);
+        // Counted when the card delivers it, read yet or not.
+        let counts = bench.iface.device().counts();
+        assert_eq!(
+            (counts.rx_packets, counts.rx_bytes),
+            (1, question.len() as u64)
+        );
+        assert_eq!((counts.tx_packets, counts.tx_bytes), (0, 0));
+        bench.poll();
+        let turn = bench.turn();
+        let answer = bench.sent(&turn[1]);
+        bench.window.done(bench.iface.device(), &turn[1]);
+        let counts = bench.iface.device().counts();
+        assert_eq!(
+            (counts.tx_packets, counts.tx_bytes),
+            (1, answer.len() as u64)
+        );
+        // A ping and its answer.
+        let ping = echo_request(OUR_IP, 1, 1, b"abc");
+        bench.deliver(0, &ping);
+        bench.poll();
+        let turn = bench.turn();
+        let pong = bench.sent(&turn[1]);
+        let counts = bench.iface.device().counts();
+        assert_eq!(
+            counts,
+            Counts {
+                rx_bytes: (question.len() + ping.len()) as u64,
+                rx_packets: 2,
+                rx_errors: 0,
+                tx_bytes: (answer.len() + pong.len()) as u64,
+                tx_packets: 2,
+            }
+        );
+
+        // A frame that could not be built was not sent, and a message
+        // that names no frame is an error and no frame.
+        {
+            use smoltcp::phy::{Device, TxToken};
+            let port = bench.iface.device_mut();
+            let failed: smoltcp::Result<()> =
+                port.transmit()
+                    .unwrap()
+                    .consume(Instant::from_millis(1), 60, |_| {
+                        Err(smoltcp::Error::Unaddressable)
+                    });
+            assert!(failed.is_err());
+            assert!(!port.take(&Msg {
+                op: OP_RX,
+                slot: RX as u32,
+                len: 60,
+                off: 0,
+            }));
+            // A transmit slot that is none is not the receiving side's.
+            assert!(!port.take(&Msg {
+                op: OP_TX,
+                slot: TX as u32,
+                len: 0,
+                off: 0,
+            }));
+        }
+        let before = bench.iface.device().counts();
+        assert_eq!(
+            before,
+            Counts {
+                rx_errors: 1,
+                ..counts
+            }
+        );
+
+        // The driver dies and the next one's port is another: the card
+        // has carried what it had, and what the new port carries is more.
+        let next = Bench::new();
+        let port = next.iface.device();
+        next.window.deliver(port, 0, &question);
+        port.count_from(before);
+        assert_eq!(
+            port.counts(),
+            Counts {
+                rx_bytes: before.rx_bytes + question.len() as u64,
+                rx_packets: 3,
+                ..before
             }
         );
     }
