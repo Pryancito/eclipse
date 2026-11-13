@@ -16,7 +16,7 @@
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
 //! BIND    (kernel to stack)  16  u16 port
-//! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u16 zero  24  the datagram
+//! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
 //!             0  u64 socket  8  [u8; 4] from  12  u16 port  14  u16 length  16  the datagram
@@ -30,7 +30,11 @@
 //! trait wants, and two sockets never get one port. A datagram that arrives
 //! is queued on its socket here, up to [`RX_QUEUE_BYTES`], so `recvfrom` and
 //! `poll` are answered from this side without a trip to the stack; past
-//! that it is dropped, as a full receive buffer drops.
+//! that it is dropped, as a full receive buffer drops. Each `SEND` says
+//! how many hops its datagram may travel, which is the socket's `IP_TTL`
+//! (`IP_MULTICAST_TTL` to a group): the socket's options are kept here
+//! and the stack has none of them. A hop limit of 0 is the stack's own
+//! choice, and what a kernel from before the byte had a meaning sends.
 //!
 //! What this trusts: the stack is a process the system started for the
 //! purpose. It sees every datagram of the sockets it serves and can forge
@@ -239,12 +243,15 @@ pub fn bind_message(sock: u64, port: u16) -> Vec<u8> {
     m
 }
 
-/// `SEND`: `data` from socket `sock` for `addr:port`.
-pub fn send_message(sock: u64, addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8> {
+/// `SEND`: `data` from socket `sock` for `addr:port`, to travel
+/// `hop_limit` hops at most (0: as many as the stack gives a datagram by
+/// itself, which is what a stack from before this byte had a meaning
+/// reads there).
+pub fn send_message(sock: u64, addr: [u8; 4], port: u16, hop_limit: u8, data: &[u8]) -> Vec<u8> {
     let mut m = header(OP_SEND, sock, 8 + data.len());
     m.extend_from_slice(&addr);
     m.extend_from_slice(&port.to_le_bytes());
-    m.extend_from_slice(&[0, 0]);
+    m.extend_from_slice(&[hop_limit, 0]);
     m.extend_from_slice(data);
     m
 }
@@ -1178,6 +1185,9 @@ pub struct ServedUdpSocket {
     /// An `AF_INET6` socket: see "IPv6 sockets" at the top.
     v6: bool,
     shared: Arc<Shared>,
+    /// What `setsockopt` was told, for `getsockopt` to say again; the
+    /// hop limits go with each datagram.
+    opts: Mutex<StoredInetOpts>,
 }
 
 impl ServedUdpSocket {
@@ -1197,7 +1207,21 @@ impl ServedUdpSocket {
             sock,
             v6,
             shared,
+            opts: Mutex::new(StoredInetOpts::default()),
         })
+    }
+
+    /// How many hops a datagram for `to` may travel: `IP_TTL`, or
+    /// `IP_MULTICAST_TTL` when `to` is a group's address. Never 0, which
+    /// on the wire to the stack means the stack's own.
+    fn hop_limit(&self, to: Ipv4Address) -> u8 {
+        let opts = self.opts.lock();
+        let limit = if to.is_multicast() {
+            opts.mcast_ttl
+        } else {
+            opts.ip_ttl
+        };
+        limit.clamp(1, 255) as u8
     }
 
     /// The socket's port, binding it to any when it has none: what a send
@@ -1325,8 +1349,8 @@ impl Socket for ServedUdpSocket {
             return Err(LxError::EMSGSIZE);
         }
         self.autobind()?;
-        self.link
-            .tell(send_message(self.sock, addr.0, to.port, data), false)?;
+        let said = send_message(self.sock, addr.0, to.port, self.hop_limit(addr), data);
+        self.link.tell(said, false)?;
         Ok(data.len())
     }
 
@@ -1429,8 +1453,35 @@ impl Socket for ServedUdpSocket {
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
-        let kept = self.shared.inner.lock().patience.set(level, opt, data);
-        kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
+        // The two timeouts are kept where the waits look.
+        if let Some(kept) = self.shared.inner.lock().patience.set(level, opt, data) {
+            return kept;
+        }
+        if let Some(kept) = self.opts.lock().try_setsockopt(level, opt, data) {
+            return kept;
+        }
+        setsockopt_unstored(self, level, opt, data)
+    }
+
+    fn so_reuseaddr(&self) -> bool {
+        self.opts.lock().reuse_addr
+    }
+
+    fn so_broadcast(&self) -> bool {
+        self.opts.lock().broadcast
+    }
+
+    fn so_keepalive(&self) -> bool {
+        self.opts.lock().keepalive
+    }
+
+    fn so_reuseport(&self) -> bool {
+        self.opts.lock().reuse_port
+    }
+
+    fn so_linger(&self) -> (bool, i32) {
+        let opts = self.opts.lock();
+        (opts.linger_on, opts.linger_sec)
     }
 
     fn so_rcvtimeo(&self) -> [u8; 16] {
@@ -1439,6 +1490,26 @@ impl Socket for ServedUdpSocket {
 
     fn so_sndtimeo(&self) -> [u8; 16] {
         self.shared.inner.lock().patience.send
+    }
+
+    fn ip_tos(&self) -> u32 {
+        self.opts.lock().ip_tos
+    }
+
+    fn ip_ttl(&self) -> u32 {
+        self.opts.lock().ip_ttl
+    }
+
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.opts.lock().mcast_ttl
+    }
+
+    fn ip_multicast_loop(&self) -> bool {
+        self.opts.lock().mcast_loop
+    }
+
+    fn ip_multicast_if(&self) -> u32 {
+        self.opts.lock().mcast_if
     }
 }
 
@@ -1667,11 +1738,13 @@ mod tests {
         assert_eq!(parse_header(&bind), Some((OP_BIND, 7)));
         assert_eq!(&bind[16..], &5000u16.to_le_bytes());
 
-        let send = send_message(u64::MAX, [10, 0, 9, 1], 53, b"hola");
+        let send = send_message(u64::MAX, [10, 0, 9, 1], 53, 64, b"hola");
         assert_eq!(parse_header(&send), Some((OP_SEND, u64::MAX)));
         assert_eq!(parse_send(&send), Some(([10, 0, 9, 1], 53, &b"hola"[..])));
+        // The hop limit and a zero between the port and the datagram.
+        assert_eq!(&send[20..24], &[53, 0, 64, 0]);
         // An empty datagram is one.
-        let empty = send_message(1, [1, 2, 3, 4], 9, b"");
+        let empty = send_message(1, [1, 2, 3, 4], 9, 64, b"");
         assert_eq!(empty.len(), DATAGRAM_AT);
         assert_eq!(parse_send(&empty), Some(([1, 2, 3, 4], 9, &b""[..])));
 
@@ -1722,9 +1795,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            send_message(7, [10, 0, 9, 1], 0x1234, b"hi"),
+            send_message(7, [10, 0, 9, 1], 0x1234, 64, b"hi"),
             [
-                0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 0x34, 0x12, 0, 0,
+                0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 0x34, 0x12, 64, 0,
                 b'h', b'i'
             ]
         );
@@ -1849,7 +1922,7 @@ mod tests {
         assert_eq!(Socket::write(&server, b"q", Some(there.clone())), Ok(1));
         assert_eq!(
             stack.told(),
-            Some(send_message(server.sock, HOST, 53, b"q"))
+            Some(send_message(server.sock, HOST, 53, 64, b"q"))
         );
         stack.arrives(server.sock, HOST, 53, b"r");
         stack.link.pump();
@@ -1972,10 +2045,16 @@ mod tests {
         let port_a = port(&a);
         assert!(EPHEMERAL.contains(&port_a));
         assert_eq!(stack.told(), Some(bind_message(a.sock, port_a)));
-        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 9, b"uno")));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(a.sock, HOST, 9, 64, b"uno"))
+        );
         // The second send has the port already; another socket gets another.
         assert_eq!(Socket::write(&a, b"dos", to(HOST, 9)), Ok(3));
-        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 9, b"dos")));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(a.sock, HOST, 9, 64, b"dos"))
+        );
         assert_eq!(Socket::write(&b, b"", to(HOST, 9)), Ok(0));
         let bind_b = stack.told().unwrap();
         assert_eq!(parse_header(&bind_b), Some((OP_BIND, b.sock)));
@@ -2077,7 +2156,7 @@ mod tests {
         stack.arrives(9999, HOST, 1, b"nobody's");
         stack.say(alloc::vec![1, 2, 3]);
         stack.say(bind_message(a.sock, 80));
-        stack.say(send_message(a.sock, HOST, 1, b"not DATA"));
+        stack.say(send_message(a.sock, HOST, 1, 64, b"not DATA"));
         // A DATA with nothing in it, and one whose second record is cut
         // short: the first is delivered all the same.
         stack.say(data_message());
@@ -2135,7 +2214,10 @@ mod tests {
             Some((OP_BIND, a.sock))
         );
         assert_eq!(Socket::write(&a, b"ping", None), Ok(4));
-        assert_eq!(stack.told(), Some(send_message(a.sock, HOST, 7, b"ping")));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(a.sock, HOST, 7, 64, b"ping"))
+        );
 
         stack.arrives(a.sock, [10, 0, 9, 9], 7, b"a stranger");
         stack.arrives(a.sock, HOST, 8, b"another port");
@@ -2187,7 +2269,7 @@ mod tests {
         while let Some(m) = stack.told() {
             last = Some(m);
         }
-        assert_eq!(last, Some(send_message(a.sock, HOST, 9, b"x")));
+        assert_eq!(last, Some(send_message(a.sock, HOST, 9, 64, b"x")));
     }
 
     #[test]
@@ -2252,7 +2334,7 @@ mod tests {
         link.pump();
         assert_eq!(recv(&a, &mut buf), (Ok(5), at(HOST, 1)));
         assert_eq!(Socket::write(&b, b"x", to(HOST, 9)), Ok(1));
-        assert_eq!(next.told(), Some(send_message(b.sock, HOST, 9, b"x")));
+        assert_eq!(next.told(), Some(send_message(b.sock, HOST, 9, 64, b"x")));
         let closed = a.sock;
         drop(a);
         assert_eq!(next.told(), Some(close_message(closed)));
@@ -2360,6 +2442,66 @@ mod tests {
         assert_eq!(refused, Some(LxError::ENETDOWN));
     }
 
+    #[test]
+    fn a_datagram_travels_as_many_hops_as_its_socket_was_told() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let s = stack_socket(&stack.link);
+        const IPPROTO_IP: usize = 0;
+        const IP_TTL: usize = 2;
+        const IP_MULTICAST_TTL: usize = 33;
+        let group = [224, 0, 0, 251];
+        let sent = |whom: [u8; 4], data: &[u8]| {
+            assert_eq!(Socket::write(&s, data, to(whom, 9)), Ok(data.len()));
+            loop {
+                let m = stack.told().unwrap();
+                if parse_header(&m).map(|h| h.0) == Some(OP_SEND) {
+                    break m;
+                }
+            }
+        };
+        // As Linux has them before anybody says: 64, and 1 to a group.
+        assert_eq!(Socket::ip_ttl(&s), 64);
+        assert_eq!(sent(HOST, b"a"), send_message(s.sock, HOST, 9, 64, b"a"));
+        assert_eq!(sent(group, b"b"), send_message(s.sock, group, 9, 1, b"b"));
+
+        // What `traceroute` does: one hop, then two.
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IP, IP_TTL, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert_eq!(Socket::ip_ttl(&s), 1);
+        assert_eq!(sent(HOST, b"c"), send_message(s.sock, HOST, 9, 1, b"c"));
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IP, IP_TTL, &2u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert_eq!(sent(HOST, b"d"), send_message(s.sock, HOST, 9, 2, b"d"));
+        // One byte is an option too, and 255 the most.
+        assert_eq!(Socket::setsockopt(&s, IPPROTO_IP, IP_TTL, &[255]), Ok(0));
+        assert_eq!(sent(HOST, b"e"), send_message(s.sock, HOST, 9, 255, b"e"));
+
+        // A group's datagrams have their own, and the others keep theirs.
+        let ttl = 5u32.to_ne_bytes();
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl),
+            Ok(0)
+        );
+        assert_eq!(Socket::ip_multicast_ttl(&s), 5);
+        assert_eq!(sent(group, b"f"), send_message(s.sock, group, 9, 5, b"f"));
+        assert_eq!(sent(HOST, b"g"), send_message(s.sock, HOST, 9, 255, b"g"));
+
+        // The other options a program sets are the ones it reads back.
+        const SOL_SOCKET: usize = 1;
+        const SO_BROADCAST: usize = 6;
+        assert!(!Socket::so_broadcast(&s));
+        assert_eq!(
+            Socket::setsockopt(&s, SOL_SOCKET, SO_BROADCAST, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert!(Socket::so_broadcast(&s));
+    }
+
     /// A socket of `link` that does not wait.
     fn stack_socket(link: &Arc<StackLink>) -> ServedUdpSocket {
         let s = ServedUdpSocket::new(link.clone(), false).unwrap();
@@ -2406,6 +2548,9 @@ mod tests {
         assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
         assert_eq!(stack.told(), Some(bind_message(client.sock, port(&client))));
         assert_eq!(Socket::write(&client, b"x", to(HOST, 9)), Ok(1));
-        assert_eq!(stack.told(), Some(send_message(client.sock, HOST, 9, b"x")));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(client.sock, HOST, 9, 64, b"x"))
+        );
     }
 }
