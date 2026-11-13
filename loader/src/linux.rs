@@ -588,7 +588,8 @@ pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 
-/// `eclipse_netstack_serve(channel, max_datagram, address)`: this process
+/// `eclipse_netstack_serve(channel, max_datagram, address, prefix, gateway,
+/// mac)`: this process
 /// is a network stack, and `channel` is the end of a channel on which the
 /// kernel tells it what the sockets it serves do and takes what arrives for
 /// them ([`linux_object::net::user_stack`] has the messages). The handle
@@ -602,6 +603,15 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// are the machine's and outlive the process: when it dies the
 /// connections it carried are over (`ENETDOWN`), and the next one served
 /// is told of the sockets that listen or have a port.
+///
+/// `prefix`, `gateway` and `mac` say what the stack's card is: the bits of
+/// its network's prefix (1 to 32), the gateway as `address` is written (0
+/// when there is none) and the MAC as a number, its first byte the highest
+/// of six. On a boot with `unetuse=all` the kernel shows that card among
+/// the machine's interfaces for as long as the stack serves, to be looked
+/// at (`ifconfig`, `ip`, `/proc/net`): nothing is sent through it or set
+/// on it there. A `prefix` of 0 says nothing of the card, and none is
+/// shown.
 ///
 /// Which sockets: the datagram and stream sockets of the processes that
 /// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
@@ -635,6 +645,7 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let address = (args[2] as u32).to_be_bytes();
     let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
+    let card = show_stack_card(address, args);
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them. Until this
     // process is gone: the next one's channel has its own task.
@@ -645,8 +656,54 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 .await;
             serving.pump();
         }
+        // No stack, no card: the next one says its own.
+        if let Some(card) = card {
+            let gone = kernel_hal::drivers::prelude::Device::Net(card);
+            if !kernel_hal::drivers::hotplug::remove(&gone) {
+                warn!("stack card: its interface was not registered any more");
+            }
+        }
     });
     Ok(())
+}
+
+/// The name the stack's card is shown under: the first stack's, kept for
+/// the ones after it, so a stack that starts again is the same `ethN`.
+#[cfg(feature = "zircon-gateway")]
+static STACK_CARD_NAME: lock::Mutex<Option<alloc::string::String>> = lock::Mutex::new(None);
+
+/// Put the card of the stack that serves now among the machine's
+/// interfaces, on a boot where every program's sockets are that stack's
+/// (`unetuse=all`): there its card is the machine's, and `ifconfig`, `ip`
+/// and whoever waits for a default route see it. Where only the programs
+/// that ask have that stack, the kernel's interfaces are what the others
+/// use and the list stays theirs. The card, to take away with the stack.
+#[cfg(feature = "zircon-gateway")]
+fn show_stack_card(
+    address: [u8; 4],
+    args: &[usize; 6],
+) -> Option<Arc<kernel_hal::drivers::net::stack_card::StackCard>> {
+    use kernel_hal::drivers::net::stack_card::StackCard;
+    if !linux_object::net::user_stack::is_for_all() {
+        return None;
+    }
+    let mut name = STACK_CARD_NAME.lock();
+    let called = name
+        .clone()
+        .unwrap_or_else(kernel_hal::drivers::net::next_eth_ifname);
+    // The name is this card's from now on, shown or not.
+    *name = Some(called.clone());
+    // `args[3..]`: the prefix, the gateway and the MAC, as the call says.
+    let said = StackCard::said(called.clone(), address, args[3], args[4], args[5])?;
+    let card = Arc::new(said);
+    if !kernel_hal::drivers::hotplug::add(kernel_hal::drivers::prelude::Device::Net(card.clone())) {
+        return None;
+    }
+    kernel_hal::klog_info!(
+        "stack card: {} is the card of the stack that runs as a process",
+        called
+    );
+    Some(card)
 }
 
 /// The largest message [`ECLIPSE_CHANNEL_REPLY_WAIT`] writes, Zircon's

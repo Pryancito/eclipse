@@ -192,10 +192,10 @@ struct Host {
     shared: Mutex<Shared>,
     /// The kernel's sockets, from when it was told this stack's address.
     kernel: OnceLock<Arc<Kernel>>,
-    /// The address the kernel was told, or would have been had it wanted
-    /// a stack: `getsockname` answers with it for as long as this process
-    /// lasts.
-    told: Mutex<Option<Ipv4Address>>,
+    /// The card the kernel was told, or would have been had it wanted a
+    /// stack: `getsockname` answers with its address, and the machine's
+    /// interfaces show it, for as long as this process lasts.
+    told: Mutex<Option<Card>>,
     /// The driver the card has now and how many it has had, for
     /// [`publish`].
     driver_pid: AtomicU32,
@@ -444,7 +444,7 @@ fn keep_time(host: Arc<Host>) {
 
 /// Become the stack the kernel's served sockets use: the channel it will
 /// speak on, or why there is none.
-fn register(max_datagram: usize, address: Ipv4Address) -> Result<Arc<Kernel>, String> {
+fn register(max_datagram: usize, card: Card) -> Result<Arc<Kernel>, String> {
     let (ours, theirs) = Channel::create().map_err(|e| format!("channel_create: {e}"))?;
     let theirs = theirs.into_handle();
     // SAFETY: no pointers. The handle is the kernel's when the call works.
@@ -454,10 +454,10 @@ fn register(max_datagram: usize, address: Ipv4Address) -> Result<Arc<Kernel>, St
             [
                 theirs as usize,
                 max_datagram,
-                u32::from_be_bytes(address.0) as usize,
-                0,
-                0,
-                0,
+                u32::from_be_bytes(card.address.address().0) as usize,
+                card.address.prefix_len() as usize,
+                card.gateway.map_or(0, |g| u32::from_be_bytes(g.0)) as usize,
+                card.mac_number() as usize,
             ],
         )
     };
@@ -476,24 +476,50 @@ fn register(max_datagram: usize, address: Ipv4Address) -> Result<Arc<Kernel>, St
     }
 }
 
-/// Give the kernel its sockets on this stack, whose address is `address`:
-/// once, since the kernel is told the address with them. A second address
-/// is the end of this process.
-fn serve_kernel(host: &Arc<Host>, address: Ipv4Address) {
+/// What the kernel is told of the card when it is given its sockets: the
+/// address the sockets have, and with the network, the gateway and the MAC
+/// what a kernel where every program uses this stack shows as the
+/// machine's interface (`ifconfig`, `ip`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Card {
+    mac: [u8; 6],
+    address: Ipv4Cidr,
+    gateway: Option<Ipv4Address>,
+}
+
+impl Card {
+    /// The MAC as a number, first byte highest: how it fits one argument.
+    fn mac_number(&self) -> u64 {
+        self.mac.iter().fold(0, |n, &byte| n << 8 | u64::from(byte))
+    }
+}
+
+/// Give the kernel its sockets on this stack, whose card is `card`: once,
+/// since the kernel is told the card with them. A second address or
+/// gateway is the end of this process.
+fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address>) {
+    let card = Card {
+        mac: host.mac,
+        address,
+        gateway,
+    };
     let mut told = locked(&host.told);
     match *told {
         None => {}
-        Some(was) if was == address => return,
+        Some(was) if was == card => return,
         Some(was) => {
             println!(
-                "{NAME}: the address is {address} now and the kernel's sockets were given {was}: starting over"
+                "{NAME}: the address is {address}{} now and the kernel was told {}{}: starting over",
+                through(gateway),
+                was.address,
+                through(was.gateway)
             );
             exit(3);
         }
     }
-    *told = Some(address);
+    *told = Some(card);
     let max_datagram = locked(&host.shared).stack.max_datagram();
-    match register(max_datagram, address) {
+    match register(max_datagram, card) {
         Ok(kernel) => {
             let _ = host.kernel.set(kernel.clone());
             let host = host.clone();
@@ -526,7 +552,7 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
     let index = host.index;
     match lease {
         Some(lease) => {
-            serve_kernel(host, lease.address.address());
+            serve_kernel(host, lease.address, lease.gateway);
             println!(
                 "{NAME}: card {index} is {} by its lease{}{}",
                 lease.address,
@@ -586,7 +612,7 @@ fn main() {
     let card = format!("card {index} ({})", EthernetAddress(mac));
     match how {
         Addressing::Written(address, gateway) => {
-            serve_kernel(&host, address.address());
+            serve_kernel(&host, address, gateway);
             println!(
                 "{NAME}: {card} is {address}{}{}",
                 through(gateway),

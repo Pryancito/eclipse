@@ -1085,16 +1085,18 @@ struct Client {
 /// and the static IPv6 addresses added (the next pass takes them away: the
 /// kernel's own SLAAC addresses are not this service's to flush).
 ///
-/// Also the interfaces there were to bring up, as sysfs listed them: the
-/// service compares that against what is there later (see [`service`]).
-fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, Vec<String>) {
+/// Also the interfaces there were to bring up, as sysfs listed them without
+/// the cards of a stack that runs as a process, and whether there is such a
+/// card: the service compares that against what is there later (see
+/// [`service`]).
+fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, bool)) {
     for (dev, cidr) in added6.drain(..) {
         let _ = run(&["ip", "-6", "addr", "del", &cidr, "dev", &dev]);
     }
     let conf = netconf::load(Path::new(netconf::CONF));
-    let seen = netconf::interfaces(Path::new(SYS_NET));
-    let mut names = seen.clone();
-    if names.is_empty() {
+    let seen = netconf::to_configure(Path::new(SYS_NET), Path::new(netconf::SERVERS));
+    let mut names = seen.0.clone();
+    if names.is_empty() && !seen.1 {
         // The NIC may not have probed yet; eth0 is the first one's name.
         names.push("eth0".into());
     }
@@ -1199,7 +1201,7 @@ fn service() -> ! {
             // in comes whenever it likes. One that went takes its DHCP
             // client's reason to run with it. Either way, start over from
             // what there is now.
-            if netconf::interfaces(Path::new(SYS_NET)) != seen {
+            if netconf::to_configure(Path::new(SYS_NET), Path::new(netconf::SERVERS)) != seen {
                 eprintln!("lunarnet: las interfaces han cambiado, aplicando de nuevo");
                 break;
             }
