@@ -140,9 +140,9 @@ impl Inner {
     }
 }
 
-/// Whether a read would not wait. `dead`: the stack is gone.
-fn readable(inner: &Inner, dead: bool) -> bool {
-    dead || match inner.phase {
+/// Whether a read would not wait.
+fn readable(inner: &Inner) -> bool {
+    match inner.phase {
         Phase::Listening => !inner.waiting.is_empty(),
         Phase::Connecting => false,
         _ => {
@@ -157,16 +157,16 @@ fn readable(inner: &Inner, dead: bool) -> bool {
 
 /// Whether a write would not wait: it has room, or it has an answer that
 /// is not "wait".
-fn writable(inner: &Inner, dead: bool) -> bool {
-    dead || match inner.phase {
+fn writable(inner: &Inner) -> bool {
+    match inner.phase {
         Phase::Open => inner.credit > 0 || inner.write_closed,
         Phase::Connecting | Phase::Listening => false,
         Phase::Fresh | Phase::Over => true,
     }
 }
 
-fn failed(inner: &Inner, dead: bool) -> bool {
-    dead || inner.error.is_some()
+fn failed(inner: &Inner) -> bool {
+    inner.error.is_some()
 }
 
 impl Stream {
@@ -175,20 +175,20 @@ impl Stream {
             bus: Arc::new(Mutex::new(EventBus::default())),
             inner: Mutex::new(inner),
         });
-        stream.sync(&stream.inner.lock(), false, Event::empty());
+        stream.sync(&stream.inner.lock(), Event::empty());
         stream
     }
 
     /// Make the bus say what `inner` says. `news` are the events that
     /// just happened again: said once more even if they were said, for
     /// who waits for an edge.
-    fn sync(&self, inner: &Inner, dead: bool, news: Event) {
+    fn sync(&self, inner: &Inner, news: Event) {
         let mut bus = self.bus.lock();
         let was = bus.events();
         for (event, now) in [
-            (Event::READABLE, readable(inner, dead)),
-            (Event::WRITABLE, writable(inner, dead)),
-            (Event::ERROR, failed(inner, dead)),
+            (Event::READABLE, readable(inner)),
+            (Event::WRITABLE, writable(inner)),
+            (Event::ERROR, failed(inner)),
         ] {
             if now && (!was.contains(event) || news.contains(event)) {
                 bus.set(event);
@@ -198,15 +198,34 @@ impl Stream {
         }
     }
 
-    /// The stack is gone: whoever waits on this socket is woken to find
-    /// out.
-    pub(super) fn wake(&self) {
+    /// The stack is gone. A connection it carried is over, and whoever
+    /// waits on it is woken to find out; a connection between two
+    /// programs of this machine, a listener and a socket that is neither
+    /// yet were never the stack's to lose.
+    pub(super) fn lose(&self) {
+        let mut inner = self.inner.lock();
+        if inner.local.is_some() {
+            return;
+        }
+        match inner.phase {
+            Phase::Connecting => {
+                inner.phase = Phase::Fresh;
+                inner.remote = None;
+            }
+            Phase::Open => inner.phase = Phase::Over,
+            Phase::Fresh | Phase::Listening | Phase::Over => return,
+        }
+        inner.credit = 0;
+        inner.error = Some(LxError::ENETDOWN);
+        self.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
+    }
+
+    /// Whether it listens for what the card hears, and not only for the
+    /// programs of this machine: what a stack that starts to serve is
+    /// told of.
+    pub(super) fn listens_for_the_stack(&self) -> bool {
         let inner = self.inner.lock();
-        self.sync(
-            &inner,
-            true,
-            Event::READABLE | Event::WRITABLE | Event::ERROR,
-        );
+        inner.phase == Phase::Listening && inner.here.is_none()
     }
 }
 
@@ -239,7 +258,6 @@ impl StackLink {
             }
             return;
         };
-        let dead = self.is_dead();
         let mut say = None;
         let mut refuse = None;
         {
@@ -249,7 +267,7 @@ impl StackLink {
                     inner.phase = Phase::Open;
                     inner.credit = (number as usize).min(CREDIT_MAX);
                     inner.error = None;
-                    stream.sync(&inner, dead, Event::WRITABLE);
+                    stream.sync(&inner, Event::WRITABLE);
                 }
                 (EV_FAILED, Phase::Connecting | Phase::Open) => {
                     if inner.phase == Phase::Connecting {
@@ -266,11 +284,7 @@ impl StackLink {
                         WHY_NO_ROOM => LxError::ENOBUFS,
                         _ => LxError::ECONNRESET,
                     });
-                    stream.sync(
-                        &inner,
-                        dead,
-                        Event::READABLE | Event::WRITABLE | Event::ERROR,
-                    );
+                    stream.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
                 }
                 (EV_ACCEPTED, Phase::Listening) => {
                     let Some((new, from)) = parse_accepted(bytes) else {
@@ -294,7 +308,7 @@ impl StackLink {
                         table.streams.insert(new, Arc::downgrade(&child));
                         drop(table);
                         inner.waiting.push_back((new, child));
-                        stream.sync(&inner, dead, Event::READABLE);
+                        stream.sync(&inner, Event::READABLE);
                     }
                 }
                 (EV_BYTES, Phase::Open) if !bytes.is_empty() => {
@@ -306,11 +320,7 @@ impl StackLink {
                         inner.credit = 0;
                         inner.error = Some(LxError::ECONNRESET);
                         refuse = Some(close_message(sock));
-                        stream.sync(
-                            &inner,
-                            dead,
-                            Event::READABLE | Event::WRITABLE | Event::ERROR,
-                        );
+                        stream.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
                     } else if inner.read_closed {
                         // `shutdown(SHUT_RD)`: taken and thrown away, so
                         // the peer is not left waiting for room.
@@ -318,16 +328,16 @@ impl StackLink {
                     } else {
                         inner.queued += bytes.len();
                         inner.chunks.push_back(bytes.to_vec());
-                        stream.sync(&inner, dead, Event::READABLE);
+                        stream.sync(&inner, Event::READABLE);
                     }
                 }
                 (EV_EOF, Phase::Open) => {
                     inner.eof = true;
-                    stream.sync(&inner, dead, Event::READABLE);
+                    stream.sync(&inner, Event::READABLE);
                 }
                 (EV_CREDIT, Phase::Open) => {
                     inner.credit = (inner.credit + number as usize).min(CREDIT_MAX);
-                    stream.sync(&inner, dead, Event::WRITABLE);
+                    stream.sync(&inner, Event::WRITABLE);
                 }
                 // An event for a socket that is no longer where the event
                 // finds it: a CREDIT after a reset, a second CONNECTED.
@@ -339,6 +349,20 @@ impl StackLink {
         }
         if let Some(close) = refuse {
             let _ = self.tell(close, true);
+        }
+    }
+
+    /// `sock` is no longer `stream`'s number, if it still was: a number
+    /// the stack gave out may be another socket's after the stack is
+    /// gone and the next has come.
+    fn forget(&self, sock: u64, stream: &Arc<Stream>) {
+        let mut table = self.table.lock();
+        let its = table
+            .streams
+            .get(&sock)
+            .is_some_and(|known| core::ptr::eq(known.as_ptr(), Arc::as_ptr(stream)));
+        if its {
+            table.streams.remove(&sock);
         }
     }
 
@@ -386,7 +410,7 @@ impl StackLink {
                 new
             };
             inner.waiting.push_back((new, child));
-            listener.sync(&inner, self.is_dead(), Event::READABLE);
+            listener.sync(&inner, Event::READABLE);
             true
         });
         if made {
@@ -472,12 +496,8 @@ pub struct ServedTcpSocket {
 }
 
 impl ServedTcpSocket {
-    /// A socket of the stack behind `link`, `AF_INET6` when `v6`.
-    /// `ENETDOWN` when the stack is gone.
+    /// A socket of `link`, `AF_INET6` when `v6`.
     pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
-        if link.is_dead() {
-            return Err(LxError::ENETDOWN);
-        }
         let stream = Stream::new(Inner::new(Phase::Fresh));
         let sock = {
             let mut table = link.table.lock();
@@ -512,14 +532,19 @@ impl ServedTcpSocket {
         loop {
             {
                 let mut inner = self.stream.inner.lock();
-                let dead = self.link.is_dead();
                 if inner.queued > 0 {
                     if data.is_empty() {
                         return Ok(0);
                     }
                     let n = inner.copy_out(data, take);
-                    let say = if take { inner.consumed(n) } else { None };
-                    self.stream.sync(&inner, dead, Event::empty());
+                    // Room is news for who still sends: the stack that
+                    // carries the connection, not the one after it.
+                    let say = if take && inner.phase == Phase::Open {
+                        inner.consumed(n)
+                    } else {
+                        None
+                    };
+                    self.stream.sync(&inner, Event::empty());
                     drop(inner);
                     if let Some(bytes) = say {
                         self.link.stream_window(self.sock, bytes);
@@ -529,7 +554,7 @@ impl ServedTcpSocket {
                 // `tcp_recvmsg`: what was queued first, then the error,
                 // once, then the end.
                 if let Some(e) = inner.error.take() {
-                    self.stream.sync(&inner, dead, Event::empty());
+                    self.stream.sync(&inner, Event::empty());
                     return Err(e);
                 }
                 if inner.eof || inner.read_closed || inner.phase == Phase::Over {
@@ -537,9 +562,6 @@ impl ServedTcpSocket {
                 }
                 if matches!(inner.phase, Phase::Fresh | Phase::Listening) {
                     return Err(LxError::ENOTCONN);
-                }
-                if dead {
-                    return Err(LxError::ENETDOWN);
                 }
                 if data.is_empty() {
                     return Ok(0);
@@ -553,16 +575,16 @@ impl ServedTcpSocket {
         }
     }
 
-    /// Stop taking connections: the ones nobody accepted are closed.
+    /// Stop taking connections: the ones nobody accepted are closed. One
+    /// that is over already, with the stack that carried it, is nobody's
+    /// to close: its number may be another's by now.
     fn unlisten(&self, waiting: VecDeque<(u64, Arc<Stream>)>) {
-        {
-            let mut table = self.link.table.lock();
-            for (sock, _) in &waiting {
-                table.streams.remove(sock);
+        for (sock, stream) in waiting {
+            let open = stream.inner.lock().phase == Phase::Open;
+            self.link.forget(sock, &stream);
+            if open {
+                self.link.stream_close(sock);
             }
-        }
-        for (sock, _) in waiting {
-            self.link.stream_close(sock);
         }
     }
 
@@ -598,12 +620,9 @@ impl Drop for ServedTcpSocket {
             )
         };
         self.stop_listening(port);
-        {
-            let mut table = self.link.table.lock();
-            table.streams.remove(&self.sock);
-            if let Some(port) = port {
-                table.stream_ports.taken.remove(&port);
-            }
+        self.link.forget(self.sock, &self.stream);
+        if let Some(port) = port {
+            self.link.table.lock().stream_ports.taken.remove(&port);
         }
         self.unlisten(waiting);
         // A connection within this machine that was reset is known to
@@ -630,10 +649,6 @@ impl Socket for ServedTcpSocket {
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
         let n = {
             let mut inner = self.stream.inner.lock();
-            let dead = self.link.is_dead();
-            if dead {
-                return Err(LxError::ENETDOWN);
-            }
             match inner.phase {
                 Phase::Open if !inner.write_closed => {}
                 Phase::Connecting => return Err(LxError::EAGAIN),
@@ -641,7 +656,7 @@ impl Socket for ServedTcpSocket {
                 // and a broken pipe from then on.
                 _ => {
                     let e = inner.error.take().unwrap_or(LxError::EPIPE);
-                    self.stream.sync(&inner, dead, Event::empty());
+                    self.stream.sync(&inner, Event::empty());
                     return Err(e);
                 }
             }
@@ -650,7 +665,7 @@ impl Socket for ServedTcpSocket {
             }
             let n = data.len().min(inner.credit).min(WRITE_MAX);
             inner.credit -= n;
-            self.stream.sync(&inner, dead, Event::empty());
+            self.stream.sync(&inner, Event::empty());
             n
         };
         if n == 0 {
@@ -662,12 +677,7 @@ impl Socket for ServedTcpSocket {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         let inner = self.stream.inner.lock();
-        let dead = self.link.is_dead();
-        (
-            readable(&inner, dead),
-            writable(&inner, dead),
-            failed(&inner, dead),
-        )
+        (readable(&inner), writable(&inner), failed(&inner))
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -682,9 +692,6 @@ impl Socket for ServedTcpSocket {
         let here = self.link.is_here(addr);
         let started = {
             let mut inner = self.stream.inner.lock();
-            if self.link.is_dead() {
-                return Err(LxError::ENETDOWN);
-            }
             match inner.phase {
                 Phase::Fresh => {
                     // Port 0 is nobody's.
@@ -704,7 +711,7 @@ impl Socket for ServedTcpSocket {
                         let from = inner.here.unwrap_or_else(|| self.link.here_for(addr));
                         inner.local = Some(from);
                     }
-                    self.stream.sync(&inner, false, Event::empty());
+                    self.stream.sync(&inner, Event::empty());
                     Some((local, inner.local))
                 }
                 // `__inet_stream_connect`: a second connect on a socket
@@ -725,11 +732,14 @@ impl Socket for ServedTcpSocket {
         } else if let Some((local, _)) = started {
             let connect =
                 connect_message(self.sock, addr.0, peer.port, local, STREAM_WINDOW as u32);
+            // No stack, no way out of the machine: `ENETDOWN`, here and
+            // not once more on what the socket does next.
             if let Err(e) = self.link.tell(connect, true) {
                 let mut inner = self.stream.inner.lock();
                 inner.phase = Phase::Fresh;
                 inner.remote = None;
-                self.stream.sync(&inner, true, Event::empty());
+                inner.error = None;
+                self.stream.sync(&inner, Event::empty());
                 return Err(e);
             }
             if self
@@ -745,15 +755,13 @@ impl Socket for ServedTcpSocket {
         loop {
             {
                 let mut inner = self.stream.inner.lock();
-                let dead = self.link.is_dead();
                 match inner.phase {
                     Phase::Open => return Ok(0),
-                    Phase::Connecting if dead => return Err(LxError::ENETDOWN),
                     Phase::Connecting => {}
                     _ => {
                         let e = inner.error.take().unwrap_or(LxError::ECONNREFUSED);
                         inner.local = None;
-                        self.stream.sync(&inner, dead, Event::empty());
+                        self.stream.sync(&inner, Event::empty());
                         return Err(e);
                     }
                 }
@@ -772,7 +780,7 @@ impl Socket for ServedTcpSocket {
         local.addr = plain(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         match local.addr {
             IpAddress::Unspecified => {}
-            IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address => {}
+            IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address() => {}
             // This machine's alone: see `listen`.
             IpAddress::Ipv4(addr) if addr.is_loopback() => {}
             // The stack has one address.
@@ -797,11 +805,9 @@ impl Socket for ServedTcpSocket {
     }
 
     fn listen(&self) -> SysResult {
+        let _telling = self.link.telling.lock();
         let port = {
             let mut inner = self.stream.inner.lock();
-            if self.link.is_dead() {
-                return Err(LxError::ENETDOWN);
-            }
             match inner.phase {
                 Phase::Listening => return Ok(0),
                 Phase::Fresh => {}
@@ -811,7 +817,7 @@ impl Socket for ServedTcpSocket {
             let port = self.autobind(&mut inner)?;
             inner.phase = Phase::Listening;
             inner.error = None;
-            self.stream.sync(&inner, false, Event::empty());
+            self.stream.sync(&inner, Event::empty());
             // Where the programs of this machine find it.
             self.link.table.lock().listening.insert(port, self.sock);
             // Bound to an address of 127.0.0.0/8, it is theirs alone: the
@@ -822,15 +828,10 @@ impl Socket for ServedTcpSocket {
             }
             port
         };
+        // With no stack to tell it listens all the same, for the programs
+        // of this machine: the next stack is told when it comes.
         let listen = listen_message(self.sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
-        if let Err(e) = self.link.tell(listen, true) {
-            let mut inner = self.stream.inner.lock();
-            inner.phase = Phase::Fresh;
-            self.stream.sync(&inner, true, Event::empty());
-            drop(inner);
-            self.stop_listening(Some(port));
-            return Err(e);
-        }
+        let _ = self.link.tell(listen, true);
         Ok(0)
     }
 
@@ -841,7 +842,6 @@ impl Socket for ServedTcpSocket {
     fn shutdown(&self, howto: usize) -> SysResult {
         let (rd, wr) = shutdown_sides(howto)?;
         let mut inner = self.stream.inner.lock();
-        let dead = self.link.is_dead();
         match inner.phase {
             // `inet_shutdown` on a listener: the read side stops it,
             // `SHUT_WR` alone leaves it listening.
@@ -850,7 +850,7 @@ impl Socket for ServedTcpSocket {
                     inner.phase = Phase::Fresh;
                     let waiting = core::mem::take(&mut inner.waiting);
                     let (port, told) = (inner.port, inner.here.is_none());
-                    self.stream.sync(&inner, dead, Event::READABLE);
+                    self.stream.sync(&inner, Event::READABLE);
                     drop(inner);
                     self.stop_listening(port);
                     self.unlisten(waiting);
@@ -864,8 +864,7 @@ impl Socket for ServedTcpSocket {
                 let fin = wr && !inner.write_closed;
                 inner.read_closed |= rd;
                 inner.write_closed |= wr;
-                self.stream
-                    .sync(&inner, dead, Event::READABLE | Event::WRITABLE);
+                self.stream.sync(&inner, Event::READABLE | Event::WRITABLE);
                 drop(inner);
                 if fin {
                     self.link.stream_shutdown(self.sock)?;
@@ -876,7 +875,7 @@ impl Socket for ServedTcpSocket {
             // sides are recorded, and the call fails.
             _ => {
                 inner.read_closed |= rd;
-                self.stream.sync(&inner, dead, Event::READABLE);
+                self.stream.sync(&inner, Event::READABLE);
                 Err(LxError::ENOTCONN)
             }
         }
@@ -886,12 +885,11 @@ impl Socket for ServedTcpSocket {
         loop {
             {
                 let mut inner = self.stream.inner.lock();
-                let dead = self.link.is_dead();
                 if inner.phase != Phase::Listening {
                     return Err(LxError::EINVAL);
                 }
                 if let Some((sock, stream)) = inner.waiting.pop_front() {
-                    self.stream.sync(&inner, dead, Event::empty());
+                    self.stream.sync(&inner, Event::empty());
                     drop(inner);
                     let from = stream.inner.lock().remote;
                     let socket = Arc::new(ServedTcpSocket {
@@ -903,9 +901,6 @@ impl Socket for ServedTcpSocket {
                     });
                     let from = shown(self.v6, from.unwrap_or(IpEndpoint::UNSPECIFIED));
                     return Ok((socket as Arc<dyn FileLike>, Endpoint::Ip(from)));
-                }
-                if dead {
-                    return Err(LxError::ENETDOWN);
                 }
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
                     return Err(LxError::EAGAIN);
@@ -921,7 +916,7 @@ impl Socket for ServedTcpSocket {
         // is to another of its programs; a socket that only has a port has
         // every address, unless it was bound to one of this machine's.
         let addr = inner.local.or(inner.here).unwrap_or(match inner.phase {
-            Phase::Connecting | Phase::Open | Phase::Over => self.link.address,
+            Phase::Connecting | Phase::Open | Phase::Over => self.link.address(),
             Phase::Fresh | Phase::Listening => Ipv4Address::UNSPECIFIED,
         });
         let local = IpEndpoint::new(IpAddress::Ipv4(addr), inner.port.unwrap_or(0));
@@ -939,8 +934,7 @@ impl Socket for ServedTcpSocket {
     fn take_so_error(&self) -> i32 {
         let mut inner = self.stream.inner.lock();
         let error = inner.error.take();
-        self.stream
-            .sync(&inner, self.link.is_dead(), Event::empty());
+        self.stream.sync(&inner, Event::empty());
         error.map_or(0, |e| e as isize as i32)
     }
 
@@ -1003,11 +997,10 @@ impl FileLike for ServedTcpSocket {
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inner = self.stream.inner.lock();
-        let dead = self.link.is_dead();
         Ok(PollStatus {
-            read: readable(&inner, dead),
-            write: writable(&inner, dead),
-            error: failed(&inner, dead),
+            read: readable(&inner),
+            write: writable(&inner),
+            error: failed(&inner),
             // `tcp_poll`: both directions are over.
             hangup: inner.phase == Phase::Over
                 || ((inner.eof || inner.read_closed) && inner.write_closed),
@@ -1093,7 +1086,7 @@ mod tests {
 
     extern crate std;
 
-    use super::super::tests::{any, at, at6, ip, stack, Stack, HOST, STACK_ADDR};
+    use super::super::tests::{any, at, at6, ip, stack, stack_of, Stack, HOST, STACK_ADDR};
     use super::*;
     use crate::net::NET_TEST_LOCK as LOCK;
 
@@ -1961,9 +1954,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_that_dies_takes_its_connections_with_it() {
+    fn a_stack_that_dies_takes_its_connections_and_leaves_the_rest() {
         let _lock = LOCK.lock();
         let stack = stack();
+        // What the stack carries: a connection out, one being made, and
+        // two that came in, one accepted and one not yet.
         let (open, sock) = connected(&stack, 100);
         events(&stack, &[(sock, EV_BYTES, 0, b"queda")]);
         let connecting = stream(&stack);
@@ -1971,27 +1966,147 @@ mod tests {
             connect(&connecting, at(HOST, 80)),
             Err(LxError::EINPROGRESS)
         );
-        let listening = stream(&stack);
-        assert_eq!(Socket::listen(&listening), Ok(0));
+        let listening = listener(&stack, any(8080));
+        let (one, two) = (ACCEPTED_BIT | 1, ACCEPTED_BIT | 2);
+        events(
+            &stack,
+            &[
+                (
+                    listening.sock,
+                    EV_ACCEPTED,
+                    500,
+                    &accepted_bytes(one, HOST, 40001),
+                ),
+                (
+                    listening.sock,
+                    EV_ACCEPTED,
+                    500,
+                    &accepted_bytes(two, HOST, 40002),
+                ),
+            ],
+        );
+        let (came, _) = accepted(&listening);
+        // What it does not: two programs of this machine, and a listener
+        // that is theirs alone.
+        let local = stream(&stack);
+        assert_eq!(Socket::bind(&local, Endpoint::Ip(at(HERE, 8081))), Ok(0));
+        assert_eq!(Socket::listen(&local), Ok(0));
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8081)), Ok(0));
+        let (s, _) = accepted(&local);
+        while stack.told().is_some() {}
+
         let Stack { link, end } = stack;
         drop(end);
         link.pump();
-        assert!(link.is_dead());
+        assert!(link.is_down());
 
-        for s in [&open, &connecting, &listening] {
-            let now = status(s);
-            assert!(now.read && now.write && now.error);
+        // A connection it carried is over: readable, writable and in
+        // error, for who waits on it. What had arrived is read, then the
+        // error, once, and then it is a connection that ended.
+        for lost in [&open, &*came] {
+            let now = status(lost);
+            assert!(now.read && now.write && now.error && now.hangup);
         }
         let mut buf = [0u8; 8];
         assert_eq!(read(&open, &mut buf), Ok(5), "what had arrived is read");
         assert_eq!(read(&open, &mut buf), Err(LxError::ENETDOWN));
-        assert_eq!(Socket::write(&open, b"x", None), Err(LxError::ENETDOWN));
-        assert_eq!(connect(&connecting, at(HOST, 80)), Err(LxError::ENETDOWN));
-        assert_eq!(accept(&listening).err(), Some(LxError::ENETDOWN));
+        assert_eq!(read(&open, &mut buf), Ok(0));
+        assert_eq!(Socket::write(&open, b"x", None), Err(LxError::EPIPE));
+        assert_eq!(Socket::write(&*came, b"x", None), Err(LxError::ENETDOWN));
+        // One being made is not made, and the socket can try again:
+        // which, with no stack, is refused there and then.
+        let now = status(&connecting);
+        assert!(now.write && now.error);
         assert_eq!(
-            ServedTcpSocket::new(link.clone(), false).err(),
-            Some(LxError::ENETDOWN)
+            Socket::take_so_error(&connecting),
+            LxError::ENETDOWN as isize as i32
         );
+        assert_eq!(connect(&connecting, at(HOST, 80)), Err(LxError::ENETDOWN));
+        assert_eq!(Socket::take_so_error(&connecting), 0);
+
+        // The listeners listen on, and the programs of this machine go
+        // on talking and find each other as before.
+        for l in [&listening, &local] {
+            assert!(Socket::is_listening(l));
+            assert!(!status(l).error);
+        }
+        assert_eq!(Socket::write(&c, b"sigo", None), Ok(4));
+        assert_eq!(read(&s, &mut buf), Ok(4));
+        let fresh = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&fresh, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(connect(&fresh, at(HERE, 8080)), Ok(0));
+        let (lost, _) = accepted(&listening);
+        assert!(status(&lost).error, "the one that came in and waited");
+        let (found, _) = accepted(&listening);
+        assert_eq!(Socket::write(&fresh, b"hola", None), Ok(4));
+        assert_eq!(read(&found, &mut buf), Ok(4));
+
+        // The next stack is told of the listener that is its business,
+        // and of nothing else there is.
+        let next = stack_of(&link);
+        assert_eq!(
+            next.told(),
+            Some(listen_message(
+                listening.sock,
+                8080,
+                LISTEN_BACKLOG,
+                STREAM_WINDOW as u32
+            ))
+        );
+        assert_eq!(next.told(), None);
+        // It gives out the numbers the one before gave out, and they are
+        // new sockets: the old ones, closed now, close nothing of it.
+        events(
+            &next,
+            &[(
+                listening.sock,
+                EV_ACCEPTED,
+                500,
+                &accepted_bytes(one, HOST, 40009),
+            )],
+        );
+        let (again, from) = accepted(&listening);
+        assert_eq!(from, at(HOST, 40009));
+        drop((came, lost, open, connecting));
+        assert_eq!(next.told(), None, "nothing of the stack before is told");
+        events(&next, &[(one, EV_BYTES, 0, b"nuevo")]);
+        assert_eq!(read(&again, &mut buf), Ok(5));
+        assert_eq!(Socket::write(&*again, b"si", None), Ok(2));
+        assert_eq!(next.told(), Some(write_message(one, b"si")));
+    }
+
+    #[test]
+    fn a_listener_from_before_the_stack_is_told_when_it_comes() {
+        let _lock = LOCK.lock();
+        let link = StackLink::new();
+        let l = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&l, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&l, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        // It listens for the programs of this machine meanwhile.
+        let c = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&c, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        // Nothing leaves the machine yet.
+        let out = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&out, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(connect(&out, at(HOST, 80)), Err(LxError::ENETDOWN));
+        assert_eq!(Socket::take_so_error(&out), 0);
+
+        let stack = stack_of(&link);
+        assert_eq!(
+            stack.told(),
+            Some(listen_message(
+                l.sock,
+                8080,
+                LISTEN_BACKLOG,
+                STREAM_WINDOW as u32
+            ))
+        );
+        assert_eq!(stack.told(), None);
+        // And the socket that had no way out has one.
+        assert_eq!(connect(&out, at(HOST, 80)), Err(LxError::EINPROGRESS));
     }
 
     #[test]

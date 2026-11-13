@@ -453,16 +453,16 @@ impl Syscall<'_> {
 
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             // A process that asked for the stack that runs as a process
-            // gets its stream and datagram sockets from it, or none while
-            // there is no such stack: never the kernel's behind its back.
-            // The `AF_INET6` ones too, which carry IPv4 there.
+            // gets its stream and datagram sockets from it, whether one
+            // runs yet or not: never the kernel's behind its back. The
+            // `AF_INET6` ones too, which carry IPv4 there.
             (
                 Domain::AF_INET | Domain::AF_INET6,
                 SocketType::SOCK_STREAM,
                 Some(Protocol::IPPROTO_IP | Protocol::IPPROTO_TCP),
             ) if self.linux_process().uses_user_netstack() => {
                 use linux_object::net::user_stack;
-                let link = user_stack::current().ok_or(LxError::ENETDOWN)?;
+                let link = user_stack::machine();
                 let v6 = matches!(domain, Domain::AF_INET6);
                 Arc::new(user_stack::ServedTcpSocket::new(link, v6)?)
             }
@@ -481,7 +481,7 @@ impl Syscall<'_> {
                 Some(Protocol::IPPROTO_IP | Protocol::IPPROTO_UDP),
             ) if self.linux_process().uses_user_netstack() => {
                 use linux_object::net::user_stack;
-                let link = user_stack::current().ok_or(LxError::ENETDOWN)?;
+                let link = user_stack::machine();
                 let v6 = matches!(domain, Domain::AF_INET6);
                 Arc::new(user_stack::ServedUdpSocket::new(link, v6)?)
             }

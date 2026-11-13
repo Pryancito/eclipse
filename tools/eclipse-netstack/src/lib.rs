@@ -27,6 +27,9 @@
 //! What one program of the machine says to another, at 127.0.0.0/8 or at
 //! the stack's own address, never comes here: the kernel has both sockets
 //! and joins them, with no stack between (`linux-object/src/net/user_stack.rs`).
+//! And the sockets outlive this process: started again, it is told of
+//! the ones that listen or have a port, and only the connections it was
+//! carrying are lost.
 //!
 //! [`port`] is the stack's side of a served card and [`socks`] the sockets
 //! over it: all of this that can be tested without a card or a kernel.

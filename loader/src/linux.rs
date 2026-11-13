@@ -598,8 +598,10 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// IPv4 address, its four bytes in the order they are written as the bytes
 /// of a big-endian number (10.0.9.15 is 0x0a00090f), or 0 for a stack that
 /// does not say: what `getsockname` answers for a connection. One stack at
-/// a time: `ALREADY_BOUND` while another process serves one; when the
-/// process dies its sockets answer `ENETDOWN` and the next can be served.
+/// a time: `ALREADY_BOUND` while another process serves one. The sockets
+/// are the machine's and outlive the process: when it dies the
+/// connections it carried are over (`ENETDOWN`), and the next one served
+/// is told of the sockets that listen or have a port.
 ///
 /// Which sockets: the datagram and stream sockets of the processes that
 /// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
@@ -616,8 +618,9 @@ pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 /// ones, and the `AF_INET6` ones, which carry IPv4 there. Inherited by
 /// `fork` and kept across `execve`: a program is given that stack by
 /// whatever starts it, and on a boot with `unetuse=all` every program
-/// has it without asking. A socket opened while no stack is served fails
-/// with `ENETDOWN`; the sockets the process already has stay what they are.
+/// has it without asking. A socket opened while no stack is served is one
+/// all the same, for the programs of this machine now and for the stack
+/// when it comes; the sockets the process already has stay what they are.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 
@@ -631,15 +634,16 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         proc.get_object_with_rights::<Channel>(args[0] as u32, Rights::READ | Rights::WRITE)?;
     let _ = proc.remove_handle(args[0] as u32);
     let address = (args[2] as u32).to_be_bytes();
-    let link = linux_object::net::user_stack::serve(channel, args[1], address)?;
+    let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
     // The stack's interrupt, in effect: sleep on the channel and put what
-    // arrives on its sockets, which wake whoever reads them.
+    // arrives on its sockets, which wake whoever reads them. Until this
+    // process is gone: the next one's channel has its own task.
     kernel_hal::thread::spawn(async move {
-        let wire: Arc<dyn KernelObject> = link.channel().clone();
-        while !link.is_dead() {
+        let wire: Arc<dyn KernelObject> = serving.channel().clone();
+        while !serving.is_over() {
             wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED)
                 .await;
-            link.pump();
+            serving.pump();
         }
     });
     Ok(())
