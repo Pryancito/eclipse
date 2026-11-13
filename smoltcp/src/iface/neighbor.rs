@@ -26,7 +26,7 @@ pub(crate) enum Answer {
     /// The neighbor address is not in the cache, or has expired.
     NotFound,
     /// The neighbor address is not in the cache, or has expired,
-    /// and a lookup has been made recently.
+    /// and a discovery request for it has been sent recently.
     RateLimited,
 }
 
@@ -39,6 +39,12 @@ impl Answer {
         }
     }
 }
+
+/// How many neighbors a cache remembers as asked for at a time. With more
+/// than this many asked within `SILENT_TIME`, the one whose time ends
+/// first is forgotten early, and may be asked again sooner: still at most
+/// one request for each packet that had nowhere to go.
+const ASKED: usize = 8;
 
 /// A neighbor cache backed by a map.
 ///
@@ -62,13 +68,27 @@ impl Answer {
 #[derive(Debug)]
 pub struct Cache<'a> {
     storage: ManagedMap<'a, IpAddress, Neighbor>,
-    silent_until: Instant,
+    /// The neighbors a discovery request was sent for, and until when no
+    /// other request is sent for each.
+    ///
+    /// One time for the whole cache, which is what this was, made the
+    /// request for one neighbor wait for the request for another: a
+    /// packet for a neighbor nobody had asked for, less than
+    /// `SILENT_TIME` after a request for any other, sent no request at
+    /// all, and its socket then kept quiet for its own
+    /// `DISCOVERY_SILENT_TIME` -- three seconds for the first packet to
+    /// a host, because a moment earlier something had asked for the name
+    /// server. And a neighbor that never answers, asked again every time
+    /// its socket's silence ends, could hold the others back round after
+    /// round.
+    asked: [Option<(IpAddress, Instant)>; ASKED],
     #[cfg(any(feature = "std", feature = "alloc"))]
     gc_threshold: usize,
 }
 
 impl<'a> Cache<'a> {
-    /// Minimum delay between discovery requests, in milliseconds.
+    /// Minimum delay between discovery requests for one neighbor, in
+    /// milliseconds.
     pub(crate) const SILENT_TIME: Duration = Duration::from_millis(1_000);
 
     /// Neighbor entry lifetime, in milliseconds.
@@ -93,7 +113,7 @@ impl<'a> Cache<'a> {
             storage,
             #[cfg(any(feature = "std", feature = "alloc"))]
             gc_threshold: Self::GC_THRESHOLD,
-            silent_until: Instant::from_millis(0),
+            asked: [None; ASKED],
         }
     }
 
@@ -108,7 +128,7 @@ impl<'a> Cache<'a> {
         Cache {
             storage,
             gc_threshold,
-            silent_until: Instant::from_millis(0),
+            asked: [None; ASKED],
         }
     }
 
@@ -210,15 +230,41 @@ impl<'a> Cache<'a> {
             }
         }
 
-        if timestamp < self.silent_until {
+        let asked = self.asked.iter().flatten();
+        let mut recently = asked.filter(|(_, silent_until)| timestamp < *silent_until);
+        if recently.any(|(addr, _)| addr == protocol_addr) {
             Answer::RateLimited
         } else {
             Answer::NotFound
         }
     }
 
-    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
-        self.silent_until = timestamp + Self::SILENT_TIME;
+    /// A discovery request for `protocol_addr` was sent at `timestamp`:
+    /// no other is sent for it until `SILENT_TIME` has passed. A request
+    /// for any other neighbor is not held back by it.
+    pub(crate) fn limit_rate(&mut self, protocol_addr: &IpAddress, timestamp: Instant) {
+        let ends =
+            |entry: &Option<(IpAddress, Instant)>| entry.map(|(_, silent_until)| silent_until);
+        // The place of this neighbor, or else one that is free or whose
+        // time has passed, or else the one whose time ends first.
+        let own = self
+            .asked
+            .iter()
+            .position(|entry| matches!(entry, Some((addr, _)) if addr == protocol_addr));
+        let free = || {
+            self.asked.iter().position(|entry| {
+                ends(entry).map_or(true, |silent_until| timestamp >= silent_until)
+            })
+        };
+        let first = || {
+            let places = self.asked.iter().enumerate();
+            places
+                .min_by_key(|(_, entry)| ends(entry))
+                .map(|(at, _)| at)
+        };
+        if let Some(at) = own.or_else(free).or_else(first) {
+            self.asked[at] = Some((*protocol_addr, timestamp + Self::SILENT_TIME));
+        }
     }
 }
 
@@ -360,7 +406,7 @@ mod test {
             Answer::NotFound
         );
 
-        cache.limit_rate(Instant::from_millis(0));
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(0));
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(100)),
             Answer::RateLimited
@@ -368,6 +414,101 @@ mod test {
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(2000)),
             Answer::NotFound
+        );
+    }
+
+    /// A request for one neighbor does not hold back the request for
+    /// another: each has its own time.
+    #[test]
+    fn test_hush_is_per_neighbor() {
+        let mut cache_storage = [Default::default(); 3];
+        let mut cache = Cache::new(&mut cache_storage[..]);
+
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(0));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(200)),
+            Answer::RateLimited
+        );
+        // Nobody asked for this one.
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2, Instant::from_millis(200)),
+            Answer::NotFound
+        );
+        cache.limit_rate(&MOCK_IP_ADDR_2, Instant::from_millis(200));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2, Instant::from_millis(999)),
+            Answer::RateLimited
+        );
+        // Each until its own second has passed.
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(1000)),
+            Answer::NotFound
+        );
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2, Instant::from_millis(1000)),
+            Answer::RateLimited
+        );
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2, Instant::from_millis(1200)),
+            Answer::NotFound
+        );
+        // Asked again, its time starts again, in the place it had.
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(1000));
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(1500));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(2400)),
+            Answer::RateLimited
+        );
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(2500)),
+            Answer::NotFound
+        );
+        // One that answered is found, asked for or not.
+        cache.fill(MOCK_IP_ADDR_1, HADDR_A, Instant::from_millis(2500));
+        cache.limit_rate(&MOCK_IP_ADDR_1, Instant::from_millis(2500));
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(2600)),
+            Answer::Found(HADDR_A)
+        );
+    }
+
+    /// More neighbors asked for at once than are remembered: the one
+    /// asked first is the one forgotten.
+    #[test]
+    fn test_hush_forgets_the_oldest() {
+        let mut cache_storage = [Default::default(); 3];
+        let mut cache = Cache::new(&mut cache_storage[..]);
+        let neighbor = |n: usize| IpAddress::v4(10, 0, 0, n as u8 + 1);
+
+        for n in 0..ASKED {
+            cache.limit_rate(&neighbor(n), Instant::from_millis(n as i64));
+        }
+        for n in 0..ASKED {
+            assert_eq!(
+                cache.lookup(&neighbor(n), Instant::from_millis(100)),
+                Answer::RateLimited
+            );
+        }
+        cache.limit_rate(&neighbor(ASKED), Instant::from_millis(100));
+        assert_eq!(
+            cache.lookup(&neighbor(0), Instant::from_millis(101)),
+            Answer::NotFound
+        );
+        for n in 1..=ASKED {
+            assert_eq!(
+                cache.lookup(&neighbor(n), Instant::from_millis(101)),
+                Answer::RateLimited
+            );
+        }
+        // A place whose time has passed is taken before one that has not.
+        cache.limit_rate(&neighbor(20), Instant::from_millis(1001));
+        assert_eq!(
+            cache.lookup(&neighbor(2), Instant::from_millis(1001)),
+            Answer::RateLimited
+        );
+        assert_eq!(
+            cache.lookup(&neighbor(ASKED), Instant::from_millis(1001)),
+            Answer::RateLimited
         );
     }
 }

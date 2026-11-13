@@ -962,6 +962,56 @@ mod tests {
         assert!(is_echo(&window.sent(&sent[0])));
     }
 
+    #[test]
+    fn a_neighbour_that_was_just_asked_for_does_not_make_the_next_one_wait() {
+        // A stack that has met nobody.
+        let Bench { window, iface, .. } = Bench::new();
+        let mut stack = Stack::new(iface);
+        // Poll at `ms`, and the frames that put on the wire.
+        let frames = |stack: &mut Stack<crate::port::Port>, ms: i64| -> Vec<Vec<u8>> {
+            stack.poll(Instant::from_millis(ms));
+            let mut out = Vec::new();
+            for m in &turn(stack.device()) {
+                if m.op == udrivers::net::OP_TX {
+                    out.push(window.sent(m));
+                    window.done(stack.device(), m);
+                }
+            }
+            out
+        };
+        let names = Ipv4Address([10, 0, 9, 3]);
+        stack.request(&bind(1, 5000)).unwrap();
+        stack.request(&bind(2, 5001)).unwrap();
+        // A question for a name server nobody has asked for yet: asked
+        // for, and the question waits.
+        assert_eq!(stack.request(&send(1, names, 53, b"who?")), Ok(true));
+        let sent = frames(&mut stack, 1000);
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&sent[0], names));
+        // A moment later, a datagram for another machine. It is asked
+        // for at once: smoltcp asked for one neighbour a second, whoever
+        // it was, and the socket that was not let ask kept quiet for
+        // three -- the first packet to a machine, three seconds late,
+        // because something had just asked for the name server.
+        assert_eq!(stack.request(&send(2, THEIR_IP, 7, b"hello")), Ok(true));
+        let sent = frames(&mut stack, 1200);
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&sent[0], THEIR_IP));
+        // It answers, and the datagram leaves.
+        window.deliver(stack.device(), 0, &arp_reply());
+        let sent = frames(&mut stack, 1205);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(udp_of(&sent[0]), (5001, 7, b"hello".to_vec()));
+        // The one that has not answered is not asked again before its
+        // socket's three seconds are over, and is then.
+        assert_eq!(stack.request(&send(1, names, 53, b"who?")), Ok(true));
+        assert!(frames(&mut stack, 1500).is_empty());
+        assert!(frames(&mut stack, 3999).is_empty());
+        let sent = frames(&mut stack, 4000);
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&sent[0], names));
+    }
+
     /// A record of an `EVENTS`: its socket, what, number and bytes.
     type Event = (u64, u16, u32, Vec<u8>);
 
