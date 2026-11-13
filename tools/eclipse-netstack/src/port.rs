@@ -533,6 +533,21 @@ pub(crate) mod testing {
         })
     }
 
+    /// The answer of THEIRS to an echo of ours with this payload.
+    pub fn echo_reply(ident: u16, seq_no: u16, data: &[u8]) -> Vec<u8> {
+        let icmp = Icmpv4Repr::EchoReply {
+            ident,
+            seq_no,
+            data,
+        };
+        ipv4_frame(OUR_IP, IpProtocol::Icmp, icmp.buffer_len(), |payload| {
+            icmp.emit(
+                &mut Icmpv4Packet::new_unchecked(payload),
+                &ChecksumCapabilities::default(),
+            )
+        })
+    }
+
     /// A UDP datagram from THEIRS, port `from`, to our port `to`.
     pub fn udp_frame(from: u16, to: u16, data: &[u8]) -> Vec<u8> {
         let udp = UdpRepr {

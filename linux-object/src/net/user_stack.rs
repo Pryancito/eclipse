@@ -70,6 +70,28 @@
 //! a listener is numbered by the stack, with [`ACCEPTED_BIT`] set, so its
 //! numbers never meet the kernel's.
 //!
+//! # ICMP
+//!
+//! `ping` asks for a socket that speaks ICMP, and it is served too
+//! ([`ServedIcmpSocket`], in `icmp`): the raw one (`SOCK_RAW`), which
+//! writes whole ICMP messages and reads whole IP packets, and the one that
+//! only pings (`SOCK_DGRAM`):
+//!
+//! ```text
+//! HEAR    (kernel to stack)
+//! ICMP    (kernel to stack)  16  [u8; 4] to  20  u8 hop limit  21  three zero  24  the ICMP message
+//! ```
+//!
+//! The stack keeps no ICMP socket apart from another: while one hears
+//! (from its `HEAR` to its `CLOSE`) every IPv4 packet of ICMP the card
+//! brings goes to the kernel, whole, as a record of a `DATA` for socket 0
+//! and port 0, and the kernel gives each socket what is its own -- a raw
+//! one all of them, as Linux does, and one that pings the answers to its
+//! own echoes. An `ICMP` is a message to send for a socket that hears,
+//! behind an IPv4 header the stack writes, with the hop limit the socket
+//! has (`IP_TTL`). An echo to this machine is answered here, and never
+//! reaches the stack.
+//!
 //! # This machine
 //!
 //! What a program sends to 127.0.0.0/8, or to the stack's own address, is
@@ -129,7 +151,9 @@ use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
+mod icmp;
 mod tcp;
+pub use icmp::ServedIcmpSocket;
 pub use tcp::ServedTcpSocket;
 
 /// The operations of a message.
@@ -143,6 +167,12 @@ pub const OP_WRITE: u32 = 7;
 pub const OP_SHUTDOWN: u32 = 8;
 pub const OP_WINDOW: u32 = 9;
 pub const OP_EVENTS: u32 = 10;
+pub const OP_HEAR: u32 = 11;
+pub const OP_ICMP: u32 = 12;
+
+/// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
+/// whichever sockets hear: no socket has the number.
+pub const HEARD: u64 = 0;
 
 /// What a record of an `EVENTS` says.
 pub const EV_CONNECTED: u16 = 1;
@@ -220,6 +250,21 @@ pub fn send_message(sock: u64, addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8>
 }
 
 /// `CLOSE`: socket `sock` is gone.
+/// `HEAR`: socket `sock` hears ICMP from now on.
+pub fn hear_message(sock: u64) -> Vec<u8> {
+    header(OP_HEAR, sock, 0)
+}
+
+/// `ICMP`: `message` from socket `sock` to `addr`, to travel `hop_limit`
+/// hops at most, which is not 0.
+pub fn icmp_message(sock: u64, addr: [u8; 4], hop_limit: u8, message: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_ICMP, sock, 8 + message.len());
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&[hop_limit, 0, 0, 0]);
+    m.extend_from_slice(message);
+    m
+}
+
 pub fn close_message(sock: u64) -> Vec<u8> {
     header(OP_CLOSE, sock, 0)
 }
@@ -416,6 +461,19 @@ struct Shared {
     /// `WRITABLE` always. Changed under `inner`.
     bus: Arc<Mutex<EventBus>>,
     inner: Mutex<Inner>,
+    hears: Hears,
+}
+
+/// What is queued on a socket.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hears {
+    /// The datagrams for its port.
+    Datagrams,
+    /// Every IPv4 packet of ICMP, whole: a raw socket.
+    Icmp,
+    /// The answers to the echoes it sent, which carry its `port` as
+    /// their identifier, without the IPv4 header: a socket that pings.
+    Echoes,
 }
 
 struct Inner {
@@ -447,6 +505,107 @@ impl Shared {
         inner.queue.push_back((from, data.to_vec()));
         self.bus.lock().set(Event::READABLE);
         true
+    }
+
+    /// A socket with nothing queued, that can be written to: what cannot
+    /// be sent is refused, not waited for.
+    fn new(hears: Hears) -> Arc<Shared> {
+        let mut bus = EventBus::default();
+        bus.set(Event::WRITABLE);
+        Arc::new(Shared {
+            bus: Arc::new(Mutex::new(bus)),
+            inner: Mutex::new(Inner {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                port: None,
+                here: None,
+                remote: None,
+                flags: OpenFlags::RDWR,
+                last_msg_flags: 0,
+                read_closed: false,
+                patience: Patience::default(),
+            }),
+            hears,
+        })
+    }
+
+    /// Queue what is this socket's of an IPv4 packet of ICMP from `from`.
+    fn deliver_heard(&self, from: Ipv4Address, packet: &[u8]) {
+        let from = IpEndpoint::new(IpAddress::Ipv4(from), 0);
+        match self.hears {
+            Hears::Datagrams => {}
+            Hears::Icmp => {
+                self.deliver(from, packet);
+            }
+            Hears::Echoes => {
+                let Some(message) = icmp::message_of(packet) else {
+                    return;
+                };
+                let ident = self.inner.lock().port;
+                if icmp::echo_reply_ident(message).is_some_and(|i| Some(i) == ident) {
+                    self.deliver(from, message);
+                }
+            }
+        }
+    }
+
+    /// The next datagram, taken off the queue or only looked at, as a
+    /// socket of that family says who sent it.
+    async fn receive(&self, v6: bool, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
+        let nobody = || Endpoint::Ip(IpEndpoint::UNSPECIFIED);
+        let mut until = Until::default();
+        loop {
+            let until = {
+                let mut guard = self.inner.lock();
+                let inner = &mut *guard;
+                let remote = inner.remote;
+                // A connected socket hears its peer and nobody else.
+                while matches!((inner.queue.front(), remote), (Some((from, _)), Some(peer)) if *from != peer)
+                {
+                    if let Some((_, dropped)) = inner.queue.pop_front() {
+                        inner.queued_bytes -= dropped.len();
+                    }
+                }
+                if let Some((from, datagram)) = inner.queue.front() {
+                    let (from, len) = (*from, datagram.len());
+                    let n = data.len().min(len);
+                    data[..n].copy_from_slice(&datagram[..n]);
+                    // MSG_TRUNC = 0x20: the datagram was longer than the buffer.
+                    inner.last_msg_flags = if len > n { 0x20 } else { 0 };
+                    if take {
+                        inner.queue.pop_front();
+                        inner.queued_bytes -= len;
+                    }
+                    if inner.queue.is_empty() && !inner.read_closed {
+                        self.bus.lock().clear(Event::READABLE);
+                    }
+                    return (Ok(n), Endpoint::Ip(shown(v6, from)));
+                }
+                if inner.read_closed {
+                    return (Ok(0), nobody());
+                }
+                self.bus.lock().clear(Event::READABLE);
+                if inner.flags.contains(OpenFlags::NON_BLOCK) {
+                    return (Err(LxError::EAGAIN), nobody());
+                }
+                until.of(&inner.patience.receive)
+            };
+            // Woken by a datagram, or ended by a signal or by `SO_RCVTIMEO`
+            // (`EAGAIN`).
+            let bus = self.bus.clone();
+            if let Err(e) = crate::sync::wait_for_event_until(bus, Event::READABLE, until).await {
+                return (Err(e), nobody());
+            }
+        }
+    }
+
+    /// The wait of a read that blocks, outside `read` (a `splice` from
+    /// the socket): it ends with `SO_RCVTIMEO` as the read's own does.
+    async fn wait_readable(&self, until: &mut Until) -> LxResult<()> {
+        let until = until.of(&self.inner.lock().patience.receive);
+        let bus = self.bus.clone();
+        crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
+        Ok(())
     }
 
     /// Queue a datagram another program of this machine sent to `to`. A
@@ -523,6 +682,10 @@ struct Table {
     /// Which datagram socket has each port: where a datagram from another
     /// program of this machine goes.
     bound: BTreeMap<u16, u64>,
+    /// The sockets that hear ICMP.
+    hearing: BTreeSet<u64>,
+    /// The identifiers of the sockets that ping: their ports.
+    idents: Ports,
     /// Which stream socket listens on each port: where a connection from
     /// another program of this machine goes.
     listening: BTreeMap<u16, u64>,
@@ -682,7 +845,7 @@ impl StackLink {
     /// [`serve`], on these sockets. The stack is told of the sockets that
     /// are there already and are its business: the datagram sockets that
     /// have a port and the stream sockets that listen, less the ones
-    /// that are this machine's alone.
+    /// that are this machine's alone, and the ones that hear ICMP.
     pub fn attach(
         self: &Arc<Self>,
         channel: Arc<Channel>,
@@ -712,7 +875,7 @@ impl StackLink {
             self.up.store(true, Ordering::Release);
             turn
         };
-        let (bound, listening) = {
+        let (bound, listening, hearing) = {
             let table = self.table.lock();
             let bound: Vec<(u64, u16, Arc<Shared>)> = table
                 .bound
@@ -730,8 +893,12 @@ impl StackLink {
                     Some((*sock, *port, stream))
                 })
                 .collect();
-            (bound, listening)
+            let hearing: Vec<u64> = table.hearing.iter().copied().collect();
+            (bound, listening, hearing)
         };
+        for sock in hearing {
+            let _ = self.tell(hear_message(sock), true);
+        }
         for (sock, port, shared) in bound {
             if shared.inner.lock().here.is_none() {
                 let _ = self.tell(bind_message(sock, port), true);
@@ -830,6 +997,10 @@ impl StackLink {
                 return;
             };
             records = rest;
+            if sock == HEARD {
+                self.heard(Ipv4Address(addr), data);
+                continue;
+            }
             // A datagram for a socket that closed meanwhile is nobody's.
             let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
             if let Some(shared) = shared {
@@ -922,6 +1093,50 @@ impl StackLink {
         }
     }
 
+    /// A socket that speaks ICMP is there: the stack is told to hear for
+    /// it, and the next stack when it comes.
+    fn hear(&self, sock: u64) {
+        let _telling = self.telling.lock();
+        self.table.lock().hearing.insert(sock);
+        let _ = self.tell(hear_message(sock), true);
+    }
+
+    /// A socket that speaks ICMP is gone: its number is free, and its
+    /// identifier if it had one, and the stack is told.
+    fn deaf(&self, sock: u64, ident: Option<u16>) {
+        let _telling = self.telling.lock();
+        {
+            let mut table = self.table.lock();
+            table.socks.remove(&sock);
+            table.hearing.remove(&sock);
+            if let Some(ident) = ident {
+                table.idents.taken.remove(&ident);
+            }
+        }
+        let _ = self.tell(close_message(sock), true);
+    }
+
+    /// Give a socket that pings the identifier `wanted`, or any when it
+    /// is 0. `EADDRINUSE` when another has it or none is left.
+    fn ident(&self, wanted: u16) -> LxResult<u16> {
+        self.table.lock().idents.take(wanted)
+    }
+
+    /// An IPv4 packet of ICMP from `from`, off the card or made here:
+    /// to every socket that hears, which takes what is its own.
+    fn heard(&self, from: Ipv4Address, packet: &[u8]) {
+        let hearing: Vec<Arc<Shared>> = {
+            let table = self.table.lock();
+            let socks = table.hearing.iter();
+            socks
+                .filter_map(|sock| table.socks.get(sock).and_then(Weak::upgrade))
+                .collect()
+        };
+        for shared in hearing {
+            shared.deliver_heard(from, packet);
+        }
+    }
+
     /// Whether `addr` is this machine: what is sent there is for another
     /// of its programs, and never leaves it.
     fn is_here(&self, addr: Ipv4Address) -> bool {
@@ -968,24 +1183,7 @@ pub struct ServedUdpSocket {
 impl ServedUdpSocket {
     /// A socket of `link`, `AF_INET6` when `v6`.
     pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
-        let mut bus = EventBus::default();
-        // A datagram socket can always be written to: what cannot be sent
-        // is refused, not waited for.
-        bus.set(Event::WRITABLE);
-        let shared = Arc::new(Shared {
-            bus: Arc::new(Mutex::new(bus)),
-            inner: Mutex::new(Inner {
-                queue: VecDeque::new(),
-                queued_bytes: 0,
-                port: None,
-                here: None,
-                remote: None,
-                flags: OpenFlags::RDWR,
-                last_msg_flags: 0,
-                read_closed: false,
-                patience: Patience::default(),
-            }),
-        });
+        let shared = Shared::new(Hears::Datagrams);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;
@@ -1012,55 +1210,6 @@ impl ServedUdpSocket {
         self.shared.inner.lock().port = Some(port);
         Ok(port)
     }
-
-    /// The next datagram, taken off the queue or only looked at.
-    async fn receive(&self, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
-        let nobody = || Endpoint::Ip(IpEndpoint::UNSPECIFIED);
-        let mut until = Until::default();
-        loop {
-            let until = {
-                let mut guard = self.shared.inner.lock();
-                let inner = &mut *guard;
-                let remote = inner.remote;
-                // A connected socket hears its peer and nobody else.
-                while matches!((inner.queue.front(), remote), (Some((from, _)), Some(peer)) if *from != peer)
-                {
-                    if let Some((_, dropped)) = inner.queue.pop_front() {
-                        inner.queued_bytes -= dropped.len();
-                    }
-                }
-                if let Some((from, datagram)) = inner.queue.front() {
-                    let (from, len) = (*from, datagram.len());
-                    let n = data.len().min(len);
-                    data[..n].copy_from_slice(&datagram[..n]);
-                    // MSG_TRUNC = 0x20: the datagram was longer than the buffer.
-                    inner.last_msg_flags = if len > n { 0x20 } else { 0 };
-                    if take {
-                        inner.queue.pop_front();
-                        inner.queued_bytes -= len;
-                    }
-                    if inner.queue.is_empty() && !inner.read_closed {
-                        self.shared.bus.lock().clear(Event::READABLE);
-                    }
-                    return (Ok(n), Endpoint::Ip(shown(self.v6, from)));
-                }
-                if inner.read_closed {
-                    return (Ok(0), nobody());
-                }
-                self.shared.bus.lock().clear(Event::READABLE);
-                if inner.flags.contains(OpenFlags::NON_BLOCK) {
-                    return (Err(LxError::EAGAIN), nobody());
-                }
-                until.of(&inner.patience.receive)
-            };
-            // Woken by a datagram, or ended by a signal or by `SO_RCVTIMEO`
-            // (`EAGAIN`).
-            let bus = self.shared.bus.clone();
-            if let Err(e) = crate::sync::wait_for_event_until(bus, Event::READABLE, until).await {
-                return (Err(e), nobody());
-            }
-        }
-    }
 }
 
 impl Drop for ServedUdpSocket {
@@ -1076,11 +1225,11 @@ impl Drop for ServedUdpSocket {
 #[async_trait]
 impl Socket for ServedUdpSocket {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.receive(data, true).await
+        self.shared.receive(self.v6, data, true).await
     }
 
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.receive(data, false).await
+        self.shared.receive(self.v6, data, false).await
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
@@ -1289,9 +1438,7 @@ impl FileLike for ServedUdpSocket {
             if (want_read && status.read) || want_write || !want_read {
                 return Ok(status);
             }
-            let until = until.of(&self.shared.inner.lock().patience.receive);
-            let bus = self.shared.bus.clone();
-            crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
+            self.shared.wait_readable(&mut until).await?;
         }
     }
 
@@ -1389,7 +1536,7 @@ mod tests {
         }
 
         /// A datagram arrived for socket `sock`.
-        fn arrives(&self, sock: u64, from: [u8; 4], port: u16, data: &[u8]) {
+        pub(super) fn arrives(&self, sock: u64, from: [u8; 4], port: u16, data: &[u8]) {
             let mut m = data_message();
             push_record(&mut m, sock, from, port, data);
             self.say(m);
@@ -1452,7 +1599,7 @@ mod tests {
     pub(super) const STACK_ADDR: [u8; 4] = [10, 0, 9, 15];
     /// What a stack over Ethernet carries: a frame's 1500 bytes less the
     /// IP and UDP headers.
-    const MAX_FOR_TESTS: usize = 1472;
+    pub(super) const MAX_FOR_TESTS: usize = 1472;
 
     #[test]
     fn a_message_is_its_header_and_what_the_operation_adds() {
@@ -1487,6 +1634,17 @@ mod tests {
 
         assert_eq!(parse_header(&close_message(3)), Some((OP_CLOSE, 3)));
         assert_eq!(close_message(3).len(), HEADER_LEN);
+
+        // What `ping`'s sockets say, written out as the stack reads it.
+        assert_eq!(
+            hear_message(7),
+            [0, 0, 0, 0, 11, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            icmp_message(7, [10, 0, 9, 1], 64, &[8, 0]),
+            [0, 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 64, 0, 0, 0, 8, 0]
+        );
+        assert_eq!(HEARD, 0);
 
         // The same bytes `tools/eclipse-netstack/src/socks.rs` reads and
         // builds, written out: neither side can move a field alone.

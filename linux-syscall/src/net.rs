@@ -493,6 +493,18 @@ impl Syscall<'_> {
             | (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
                 Arc::new(UdpSocketState::new(true)?)
             }
+            // And for the sockets `ping` opens, the raw one and the one
+            // that only pings: its echoes leave by the stack's card.
+            (
+                Domain::AF_INET,
+                SocketType::SOCK_DGRAM | SocketType::SOCK_RAW,
+                Some(Protocol::IPPROTO_ICMP),
+            ) if self.linux_process().uses_user_netstack() => {
+                use linux_object::net::user_stack;
+                let link = user_stack::machine();
+                let raw = matches!(socket_type, SocketType::SOCK_RAW);
+                Arc::new(user_stack::ServedIcmpSocket::new(link, raw)?)
+            }
             // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
                 Arc::new(IcmpSocketState::new(false)?)
