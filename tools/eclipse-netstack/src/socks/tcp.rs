@@ -15,6 +15,8 @@
 //!              0  u64 socket  8  u16 what  10  u16 length  12  u32 number  16  `length` bytes
 //!     CONNECTED  number: the bytes the stack takes
 //!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
+//!                bytes: none, or the type and the code of the ICMP message
+//!                that said the peer is unreachable ([`super::undelivered`])
 //!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
 //!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
 //!     BYTES      bytes: what arrived
@@ -32,6 +34,7 @@ use smoltcp::socket::{SocketHandle, TcpSocket, TcpSocketBuffer, TcpState};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
+use super::undelivered::{Undelivered, LAST_CODE, TOO_LONG, UNREACHABLE};
 use super::{Arrived, Refused, Stack, HEADER_LEN, MESSAGE_MAX, RECORD_LEN};
 
 pub const OP_CONNECT: u32 = 5;
@@ -85,6 +88,9 @@ const STREAMS_MAX: usize = 1024;
 /// Handshakes one listener has in the middle at most: past this, who
 /// knocks is refused until one of them finishes or is given up on.
 const HALF_MADE_MAX: usize = 64;
+/// The most records that wait for the next `EVENTS` with no socket to
+/// wait in: what is heard past this is lost, as what it says of was.
+const OWED_MAX: usize = 256;
 
 /// A connection.
 pub(super) struct Conn {
@@ -127,9 +133,10 @@ pub(super) struct Streams {
     conns: BTreeMap<u64, Conn>,
     listeners: BTreeMap<u64, Listener>,
     closing: Vec<Closing>,
-    /// What a message from the kernel left to say: a connect that could
-    /// not be started.
-    owed: Vec<(u64, u16, u32)>,
+    /// What is left to say that no socket here holds: a connect that
+    /// could not be started, a connect or a datagram that an ICMP message
+    /// said was not delivered. A record's socket, what, number and bytes.
+    owed: Vec<(u64, u16, u32, Vec<u8>)>,
     /// The number of the last connection that arrived.
     accepted: u64,
 }
@@ -144,6 +151,13 @@ impl Streams {
 
     pub(super) fn knows(&self, sock: u64) -> bool {
         self.conns.contains_key(&sock) || self.listeners.contains_key(&sock)
+    }
+
+    /// Have the next `EVENTS` carry this record.
+    pub(super) fn owe(&mut self, sock: u64, what: u16, number: u32, bytes: &[u8]) {
+        if self.owed.len() < OWED_MAX {
+            self.owed.push((sock, what, number, bytes.to_vec()));
+        }
     }
 
     /// Every smoltcp socket there is here.
@@ -227,11 +241,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         // Nowhere to send it (no gateway for what is off the card's
         // network), and nobody to connect to at everybody's address.
         if addr.is_broadcast() || !self.reaches(addr) {
-            self.streams.owed.push((sock, EV_FAILED, WHY_UNREACHABLE));
+            self.streams.owe(sock, EV_FAILED, WHY_UNREACHABLE, &[]);
             return Ok(true);
         }
         if self.streams.sockets() >= STREAMS_MAX {
-            self.streams.owed.push((sock, EV_FAILED, WHY_NO_ROOM));
+            self.streams.owe(sock, EV_FAILED, WHY_NO_ROOM, &[]);
             return Ok(true);
         }
         let mut socket = socket();
@@ -360,6 +374,36 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         Some(true)
     }
 
+    /// An ICMP message said that a segment was not delivered. When it was
+    /// the knock of a connect under way, the connect ends there, `FAILED`
+    /// with what the message said: there is no way to the peer, and
+    /// nothing more is sent it. A connection that is made goes on, and
+    /// sends again what was lost.
+    pub(super) fn connect_undelivered(&mut self, said: &Undelivered) {
+        // Too long for the way is not no way, and a code that means
+        // nothing ends nothing (`tcp_v4_err`).
+        if said.kind == UNREACHABLE && (said.code == TOO_LONG || said.code > LAST_CODE) {
+            return;
+        }
+        let to = IpEndpoint::new(IpAddress::Ipv4(said.to), said.port);
+        let set = &mut self.set;
+        let found = self.streams.conns.iter().find(|(_, conn)| {
+            let socket = set.get::<TcpSocket>(conn.handle);
+            conn.connecting.is_some()
+                && socket.state() == TcpState::SynSent
+                && socket.local_endpoint().port == said.local
+                && socket.remote_endpoint() == to
+        });
+        let Some((&sock, _)) = found else {
+            return;
+        };
+        if let Some(conn) = self.streams.conns.remove(&sock) {
+            self.set.remove(conn.handle);
+        }
+        let bytes = [said.kind, said.code];
+        self.streams.owe(sock, EV_FAILED, WHY_UNREACHABLE, &bytes);
+    }
+
     /// Give every listener the sockets it wants ready.
     fn replenish(&mut self) {
         let mut sockets = self.streams.sockets();
@@ -414,11 +458,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// The records of [`events`](Self::events). Whether there are more
     /// than fit.
     fn fill(&mut self, m: &mut Vec<u8>, now: Instant, drained: &mut bool) -> bool {
-        while let Some(&(sock, what, number)) = self.streams.owed.first() {
-            if !fits(m, 0) {
+        while let Some((sock, what, number, bytes)) = self.streams.owed.first() {
+            if !fits(m, bytes.len()) {
                 return true;
             }
-            push_event(m, sock, what, number, &[]);
+            push_event(m, *sock, *what, *number, bytes);
             self.streams.owed.remove(0);
         }
 
@@ -987,6 +1031,54 @@ mod tests {
             wire.stack.request(&message(OP_SHUTDOWN, 5, &[])),
             Err(Refused::NoSocket)
         );
+    }
+
+    #[test]
+    fn a_connect_told_there_is_no_way_ends_there_and_says_what_it_heard() {
+        use smoltcp::wire::IpProtocol;
+        let mut wire = Wire::new();
+        let (sent, _) = wire.asked(&connect(5, THEIR_IP, 81, 50000, 1000));
+        assert_eq!(sent.len(), 1);
+        let says = |wire: &mut Wire, kind: u8, code: u8, local: u16, port: u16| {
+            let said = undelivered_frame(kind, code, IpProtocol::Tcp, local, THEIR_IP, port);
+            wire.window.deliver(wire.stack.device(), 0, &said);
+            wire.turn()
+        };
+        // About what left by another port, or went to another, or was
+        // too long for the way, or with a code that means nothing: not
+        // this connect's end.
+        for (code, local, port) in [
+            (1, 50001, 81),
+            (1, 50000, 82),
+            (4, 50000, 81),
+            (16, 50000, 81),
+        ] {
+            assert_eq!(says(&mut wire, 3, code, local, port), (vec![], vec![]));
+        }
+        // No way to the host: it ends, with the type and the code heard,
+        // and nothing more is sent.
+        assert_eq!(
+            says(&mut wire, 3, 1, 50000, 81),
+            (vec![], vec![told(5, EV_FAILED, WHY_UNREACHABLE, &[3, 1])])
+        );
+        // Said once, and the socket is forgotten.
+        assert_eq!(wire.turn(), (vec![], vec![]));
+        assert_eq!(wire.stack.request(&write(5, b"x")), Err(Refused::NoSocket));
+        assert!(wire.stack.streams.is_empty());
+        assert_eq!(wire.stack.idle_for(Instant::from_millis(wire.ms)), None);
+
+        // The time a segment may travel ran out on the way: the same.
+        wire.asked(&connect(5, THEIR_IP, 81, 50000, 1000));
+        assert_eq!(
+            says(&mut wire, 11, 0, 50000, 81).1,
+            [told(5, EV_FAILED, WHY_UNREACHABLE, &[11, 0])]
+        );
+
+        // A connection that is made is told nothing, and goes on.
+        let mut peer = connected(&mut wire, 6, 1000);
+        assert_eq!(says(&mut wire, 3, 1, 50000, 80), (vec![], vec![]));
+        let (_, events) = wire.hears(&peer.segment(TcpControl::Psh, b"still here"));
+        assert_eq!(events, [told(6, EV_BYTES, 0, b"still here")]);
     }
 
     #[test]

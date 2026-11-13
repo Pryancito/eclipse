@@ -56,11 +56,15 @@
 //!              0  u64 socket  8  u16 what  10  u16 length  12  u32 number  16  `length` bytes
 //!     CONNECTED  number: the bytes the stack takes
 //!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
+//!                bytes: none, or u8 type, u8 code of the ICMP message that
+//!                said the peer is unreachable
 //!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
 //!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
 //!     BYTES      bytes: what arrived
 //!     EOF        the peer will send no more
 //!     CREDIT     number: more bytes the stack takes
+//!     UNDELIVERED  socket: a datagram socket's.
+//!                bytes: [u8; 4] to, u16 port, u8 type, u8 code
 //! ```
 //!
 //! Bytes are counted both ways, so neither side holds more than it said
@@ -95,6 +99,29 @@
 //! behind an IPv4 header the stack writes, with the hop limit the socket
 //! has (`IP_TTL`). An echo to this machine is answered here, and never
 //! reaches the stack.
+//!
+//! # What was not delivered
+//!
+//! A router that has no way on, or a host with nobody at the port, says
+//! so in an ICMP message about what it could not deliver. The stack
+//! reads those, heard or not, and says whose it was: `UNDELIVERED` for a
+//! datagram, by the port it left from, and `FAILED` with the message's
+//! type and code for a connect under way, which ends there. What the
+//! program is told is decided here, and it is what Linux tells it
+//! ([`icmp::undelivered_error`]):
+//!
+//! - a connect fails with the error the message means: `EHOSTUNREACH`
+//!   for a host, `ENETUNREACH` for a network, `ECONNREFUSED` for a port.
+//! - a datagram socket hears of it only when it is connected to where
+//!   the datagram went, and only of what does not mend by itself (nobody
+//!   at the port: `ECONNREFUSED`). Its next read or write fails with the
+//!   error, once; `SO_ERROR` takes it too, and `poll` says there is
+//!   one (`POLLERR`, with nothing to read). A socket
+//!   that is not connected is told nothing, as on Linux without
+//!   `IP_RECVERR`, which is not kept here.
+//!
+//! A datagram for a port of this machine that no socket has is refused
+//! the same way, by the kernel itself.
 //!
 //! # What the card has carried
 //!
@@ -204,6 +231,7 @@ pub const EV_ACCEPTED: u16 = 3;
 pub const EV_BYTES: u16 = 4;
 pub const EV_EOF: u16 = 5;
 pub const EV_CREDIT: u16 = 6;
+pub const EV_UNDELIVERED: u16 = 7;
 
 /// Why a connection `FAILED`.
 pub const WHY_REFUSED: u32 = 1;
@@ -234,6 +262,8 @@ pub const DATAGRAM_AT: usize = 24;
 pub const RECORD_LEN: usize = 16;
 /// The numbers of a `COUNTS`.
 pub const COUNTS: usize = 8;
+/// The bytes of an `UNDELIVERED` record.
+pub const UNDELIVERED_LEN: usize = 8;
 /// The longest datagram UDP carries over IPv4.
 pub const MAX_DATAGRAM: usize = 65507;
 // A datagram and its header fit one channel message (65536 bytes).
@@ -460,6 +490,30 @@ pub fn parse_event(records: &[u8]) -> Option<(EventRecord<'_>, &[u8])> {
     Some(((sock, what, number, &rest[..len]), &rest[len..]))
 }
 
+/// The bytes of an `UNDELIVERED`: the datagram that went to `addr:port`
+/// was the subject of an ICMP message of this type and code.
+pub fn undelivered_bytes(addr: [u8; 4], port: u16, kind: u8, code: u8) -> [u8; UNDELIVERED_LEN] {
+    let mut bytes = [0u8; UNDELIVERED_LEN];
+    bytes[..4].copy_from_slice(&addr);
+    bytes[4..6].copy_from_slice(&port.to_le_bytes());
+    bytes[6] = kind;
+    bytes[7] = code;
+    bytes
+}
+
+/// Where the datagram of an `UNDELIVERED` went, and the type and code of
+/// the message about it.
+pub fn parse_undelivered(bytes: &[u8]) -> Option<(IpEndpoint, u8, u8)> {
+    let bytes: &[u8; UNDELIVERED_LEN] = bytes.try_into().ok()?;
+    let addr = Ipv4Address([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let port = u16::from_le_bytes([bytes[4], bytes[5]]);
+    Some((
+        IpEndpoint::new(IpAddress::Ipv4(addr), port),
+        bytes[6],
+        bytes[7],
+    ))
+}
+
 /// What a socket shares with the stack's link: where datagrams are queued
 /// and what says so.
 /// `SO_RCVTIMEO` and `SO_SNDTIMEO` as they were set: how long a socket that
@@ -506,7 +560,8 @@ impl Until {
 
 struct Shared {
     /// `READABLE` while the queue holds a datagram (or reading is over),
-    /// `WRITABLE` always. Changed under `inner`.
+    /// `WRITABLE` always, `ERROR` while an error waits to be told.
+    /// Changed under `inner`.
     bus: Arc<Mutex<EventBus>>,
     inner: Mutex<Inner>,
     hears: Hears,
@@ -542,6 +597,10 @@ struct Inner {
     /// `shutdown(SHUT_RD)`: an empty queue is the end.
     read_closed: bool,
     patience: Patience,
+    /// What was said of a datagram this socket sent its peer and was not
+    /// delivered: what the next read or write answers, once, and
+    /// `SO_ERROR`.
+    error: Option<LxError>,
 }
 
 impl Shared {
@@ -574,10 +633,39 @@ impl Shared {
                 last_msg_flags: 0,
                 read_closed: false,
                 patience: Patience::default(),
+                error: None,
             }),
             hears,
             v6,
         })
+    }
+
+    /// A datagram this socket sent to `to` was not delivered, and will
+    /// not be the next time either: `error`. The program hears of it when
+    /// the socket is connected to `to` (`__udp4_lib_err`: the socket is
+    /// found by both ends of the datagram, and one that is not connected
+    /// is told nothing without `IP_RECVERR`). Whoever waits to read is
+    /// woken to be told.
+    fn undelivered(&self, to: IpEndpoint, error: LxError) {
+        let mut inner = self.inner.lock();
+        if self.hears != Hears::Datagrams || inner.remote != Some(to) {
+            return;
+        }
+        inner.error = Some(error);
+        self.bus.lock().set(Event::ERROR);
+    }
+
+    /// The error that waits to be told, which is told once
+    /// (`sock_error`).
+    fn take_error(&self) -> Option<LxError> {
+        Self::told(&self.bus, &mut self.inner.lock())
+    }
+
+    /// [`take_error`](Self::take_error), for who holds the socket's lock.
+    fn told(bus: &Mutex<EventBus>, inner: &mut Inner) -> Option<LxError> {
+        let error = inner.error.take()?;
+        bus.lock().clear(Event::ERROR);
+        Some(error)
     }
 
     /// Queue what is this socket's of an IPv4 packet of ICMP from `from`.
@@ -609,6 +697,10 @@ impl Shared {
             let until = {
                 let mut guard = self.inner.lock();
                 let inner = &mut *guard;
+                // Before what is queued, as Linux reads (`__skb_recv_udp`).
+                if let Some(error) = Self::told(&self.bus, inner) {
+                    return (Err(error), nobody());
+                }
                 let remote = inner.remote;
                 // A connected socket hears its peer and nobody else.
                 while matches!((inner.queue.front(), remote), (Some((from, _)), Some(peer)) if *from != peer)
@@ -641,10 +733,11 @@ impl Shared {
                 }
                 until.of(&inner.patience.receive)
             };
-            // Woken by a datagram, or ended by a signal or by `SO_RCVTIMEO`
-            // (`EAGAIN`).
+            // Woken by a datagram or by an error to be told, or ended by
+            // a signal or by `SO_RCVTIMEO` (`EAGAIN`).
             let bus = self.bus.clone();
-            if let Err(e) = crate::sync::wait_for_event_until(bus, Event::READABLE, until).await {
+            let news = Event::READABLE | Event::ERROR;
+            if let Err(e) = crate::sync::wait_for_event_until(bus, news, until).await {
                 return (Err(e), nobody());
             }
         }
@@ -655,17 +748,22 @@ impl Shared {
     async fn wait_readable(&self, until: &mut Until) -> LxResult<()> {
         let until = until.of(&self.inner.lock().patience.receive);
         let bus = self.bus.clone();
-        crate::sync::wait_for_event_until(bus, Event::READABLE, until).await?;
+        let news = Event::READABLE | Event::ERROR;
+        crate::sync::wait_for_event_until(bus, news, until).await?;
         Ok(())
     }
 
     /// Queue a datagram another program of this machine sent to `to`. A
-    /// socket bound to one address hears what is for that address.
-    fn deliver_here(&self, to: Ipv4Address, from: IpEndpoint, data: &[u8]) {
+    /// socket bound to one address hears what is for that address:
+    /// `false` when this one is bound to another. A datagram there was no
+    /// room for is lost, and was this socket's all the same.
+    fn deliver_here(&self, to: Ipv4Address, from: IpEndpoint, data: &[u8]) -> bool {
         let here = self.inner.lock().here;
-        if here.is_none_or(|here| here == to) {
-            self.deliver(from, data);
+        if !here.is_none_or(|here| here == to) {
+            return false;
         }
+        self.deliver(from, data);
+        true
     }
 
     /// `shutdown(SHUT_RD)`: whoever waits to read is told.
@@ -1147,7 +1245,32 @@ impl StackLink {
                 return;
             };
             records = rest;
-            self.event(sock, what, number, bytes);
+            if what == EV_UNDELIVERED {
+                self.undelivered(sock, bytes);
+            } else {
+                self.event(sock, what, number, bytes);
+            }
+        }
+    }
+
+    /// `UNDELIVERED`: an ICMP message said that a datagram of socket
+    /// `sock` was not delivered. Its program is told of an error that
+    /// does not mend by itself, if the socket is one that hears of them
+    /// ([`Shared::undelivered`]); the rest (a router that has no way just
+    /// now, a datagram that ran out of hops) is the news of whoever asked
+    /// for ICMP, and a datagram socket's program sends again or gives up
+    /// by itself.
+    fn undelivered(&self, sock: u64, bytes: &[u8]) {
+        let Some((to, kind, code)) = parse_undelivered(bytes) else {
+            warn!("user stack: an UNDELIVERED of {} bytes", bytes.len());
+            return;
+        };
+        let Some((error, true)) = icmp::undelivered_error(kind, code) else {
+            return;
+        };
+        let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
+        if let Some(shared) = shared {
+            shared.undelivered(to, error);
         }
     }
 
@@ -1321,18 +1444,17 @@ impl StackLink {
     }
 
     /// A datagram from one program of this machine to another: onto the
-    /// queue of the socket that has the port, if one has. One that nobody
-    /// has it for is lost, as a datagram is.
-    fn send_here(&self, from: IpEndpoint, to: Ipv4Address, port: u16, data: &[u8]) {
+    /// queue of the socket that has the port, if one has. `false` when
+    /// nobody has it at that address: the datagram is lost, and who sent
+    /// it is refused as a host with nobody at the port refuses.
+    fn send_here(&self, from: IpEndpoint, to: Ipv4Address, port: u16, data: &[u8]) -> bool {
         let shared = {
             let table = self.table.lock();
             let sock = table.bound.get(&port);
             sock.and_then(|sock| table.socks.get(sock))
                 .and_then(Weak::upgrade)
         };
-        if let Some(shared) = shared {
-            shared.deliver_here(to, from, data);
-        }
+        shared.is_some_and(|shared| shared.deliver_here(to, from, data))
     }
 }
 
@@ -1483,7 +1605,15 @@ impl Socket for ServedUdpSocket {
         let IpAddress::Ipv4(addr) = to.addr else {
             return Err(LxError::EAFNOSUPPORT);
         };
-        let here = self.shared.inner.lock().here;
+        let here = {
+            let mut inner = self.shared.inner.lock();
+            // What was said of a datagram before this one is told first,
+            // and this one is not sent (`sock_error`).
+            if let Some(error) = Shared::told(&self.shared.bus, &mut inner) {
+                return Err(error);
+            }
+            inner.here
+        };
         if self.link.is_here(addr) {
             // No card, so no frame to fit: the longest datagram there is.
             if data.len() > MAX_DATAGRAM {
@@ -1492,7 +1622,11 @@ impl Socket for ServedUdpSocket {
             let port = self.autobind()?;
             let from = here.unwrap_or_else(|| self.link.here_for(addr));
             let from = IpEndpoint::new(IpAddress::Ipv4(from), port);
-            self.link.send_here(from, addr, to.port, data);
+            if !self.link.send_here(from, addr, to.port, data) {
+                // Nobody at the port, said as the ICMP message that
+                // would have come back says it.
+                self.shared.undelivered(to, LxError::ECONNREFUSED);
+            }
             return Ok(data.len());
         }
         // `ip_route_output`: nothing leaves the machine from an address
@@ -1515,7 +1649,16 @@ impl Socket for ServedUdpSocket {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         let inner = self.shared.inner.lock();
-        (!inner.queue.is_empty() || inner.read_closed, true, false)
+        // An error is not something to read: `udp_poll` says it apart.
+        (
+            !inner.queue.is_empty() || inner.read_closed,
+            true,
+            inner.error.is_some(),
+        )
+    }
+
+    fn take_so_error(&self) -> i32 {
+        self.shared.take_error().map_or(0, |e| e as isize as i32)
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -1721,7 +1864,7 @@ impl FileLike for ServedUdpSocket {
         loop {
             let status = FileLike::poll(self, events)?;
             let (want_read, want_write) = (events.wants_read(), events.wants_write());
-            if (want_read && status.read) || want_write || !want_read {
+            if (want_read && status.read) || want_write || !want_read || status.error {
                 return Ok(status);
             }
             self.shared.wait_readable(&mut until).await?;
@@ -1830,6 +1973,15 @@ mod tests {
             self.say(m);
         }
 
+        /// An ICMP message of this type and code said that what `sock`
+        /// sent to `to:port` was not delivered.
+        fn undelivered(&self, sock: u64, to: [u8; 4], port: u16, kind: u8, code: u8) {
+            let mut m = events_message();
+            let bytes = undelivered_bytes(to, port, kind, code);
+            push_event(&mut m, sock, EV_UNDELIVERED, 0, &bytes);
+            self.say(m);
+        }
+
         pub(super) fn say(&self, data: Vec<u8>) {
             let msg = MessagePacket {
                 data,
@@ -1896,6 +2048,16 @@ mod tests {
         assert_eq!(&bind[..4], &[0; 4], "not a reply to any call");
         assert_eq!(parse_header(&bind), Some((OP_BIND, 7)));
         assert_eq!(&bind[16..], &5000u16.to_le_bytes());
+
+        // An `UNDELIVERED`: where it went, then what was said of it.
+        assert_eq!(EV_UNDELIVERED, 7);
+        let bytes = undelivered_bytes([10, 0, 9, 1], 0x1234, 3, 3);
+        assert_eq!(bytes, [10, 0, 9, 1, 0x34, 0x12, 3, 3]);
+        assert_eq!(
+            parse_undelivered(&bytes),
+            Some((at([10, 0, 9, 1], 0x1234), 3, 3))
+        );
+        assert_eq!(parse_undelivered(&bytes[..7]), None);
 
         let send = send_message(u64::MAX, [10, 0, 9, 1], 53, 64, b"hola");
         assert_eq!(parse_header(&send), Some((OP_SEND, u64::MAX)));
@@ -2390,6 +2552,156 @@ mod tests {
         assert_eq!(recv(&a, &mut buf), (Ok(4), at(HOST, 7)));
         assert_eq!(&buf[..4], b"pong");
         assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
+    }
+
+    /// The socket's `SO_ERROR`, which asking takes.
+    fn so_error(s: &ServedUdpSocket) -> Result<(), LxError> {
+        match Socket::take_so_error(s) {
+            0 => Ok(()),
+            e if e == LxError::ECONNREFUSED as isize as i32 => Err(LxError::ECONNREFUSED),
+            e if e == LxError::ENOPROTOOPT as isize as i32 => Err(LxError::ENOPROTOOPT),
+            e if e == LxError::EMSGSIZE as isize as i32 => Err(LxError::EMSGSIZE),
+            e => panic!("an error nobody expected: {}", e),
+        }
+    }
+
+    /// A socket of `stack` connected to the host's port 7, with what the
+    /// kernel said to the stack for that read.
+    fn connected(stack: &Stack) -> ServedUdpSocket {
+        let a = stack.socket();
+        let peer = Endpoint::Ip(at(HOST, 7));
+        assert_eq!(async_std::task::block_on(Socket::connect(&a, peer)), Ok(0));
+        assert!(stack.told().is_some());
+        a
+    }
+
+    #[test]
+    fn a_connected_socket_is_told_once_that_nobody_is_at_its_peers_port() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let a = connected(&stack);
+        assert_eq!(Socket::write(&a, b"ping", None), Ok(4));
+        assert!(stack.told().is_some());
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, false));
+
+        // Nobody there. Whoever polls sees an error, and nothing to
+        // read; whoever reads is told.
+        stack.undelivered(a.sock, HOST, 7, 3, 3);
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, true));
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::ECONNREFUSED));
+        // Once.
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, false));
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
+
+        // Or the next write hears it, and sends nothing; the one after
+        // it goes.
+        stack.undelivered(a.sock, HOST, 7, 3, 3);
+        assert_eq!(Socket::write(&a, b"ping", None), Err(LxError::ECONNREFUSED));
+        assert_eq!(stack.told(), None);
+        assert_eq!(Socket::write(&a, b"ping", None), Ok(4));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(a.sock, HOST, 7, 64, b"ping"))
+        );
+
+        // Or who asks for `SO_ERROR`.
+        stack.undelivered(a.sock, HOST, 7, 3, 3);
+        assert_eq!(so_error(&a), Err(LxError::ECONNREFUSED));
+        assert_eq!(so_error(&a), Ok(()));
+        assert_eq!(peek(&a, &mut buf).0, Err(LxError::EAGAIN));
+
+        // It is told before what waits to be read, which is still there.
+        stack.arrives(a.sock, HOST, 7, b"pong");
+        stack.undelivered(a.sock, HOST, 7, 3, 3);
+        assert_eq!(peek(&a, &mut buf).0, Err(LxError::ECONNREFUSED));
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (true, true, false));
+        assert_eq!(recv(&a, &mut buf), (Ok(4), at(HOST, 7)));
+
+        // The other errors that do not mend: no such protocol there, and
+        // a datagram too long for the way.
+        stack.undelivered(a.sock, HOST, 7, 3, 2);
+        assert_eq!(so_error(&a), Err(LxError::ENOPROTOOPT));
+        stack.undelivered(a.sock, HOST, 7, 3, 4);
+        assert_eq!(so_error(&a), Err(LxError::EMSGSIZE));
+    }
+
+    #[test]
+    fn what_may_mend_or_went_somewhere_else_is_not_told() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let a = connected(&stack);
+        // A router with no way just now, a datagram out of hops, and
+        // what is no error of something sent.
+        for (kind, code) in [(3, 0), (3, 1), (3, 5), (11, 0), (11, 1), (12, 0), (0, 0)] {
+            stack.undelivered(a.sock, HOST, 7, kind, code);
+            assert_eq!(so_error(&a), Ok(()), "type {} code {}", kind, code);
+            assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, false));
+        }
+        // What it sent to another port or another host before it was
+        // connected to this one.
+        stack.undelivered(a.sock, HOST, 8, 3, 3);
+        stack.undelivered(a.sock, [10, 0, 9, 9], 7, 3, 3);
+        assert_eq!(so_error(&a), Ok(()));
+
+        // A socket that is not connected is told nothing.
+        let b = stack.socket();
+        assert_eq!(Socket::write(&b, b"ping", to(HOST, 7)), Ok(4));
+        stack.undelivered(b.sock, HOST, 7, 3, 3);
+        assert_eq!(so_error(&b), Ok(()));
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&b, &mut buf).0, Err(LxError::EAGAIN));
+
+        // A socket that closed, a number that is nobody's, and a record
+        // that is not one.
+        let gone = a.sock;
+        drop(a);
+        stack.undelivered(gone, HOST, 7, 3, 3);
+        stack.undelivered(9999, HOST, 7, 3, 3);
+        let mut m = events_message();
+        push_event(&mut m, b.sock, EV_UNDELIVERED, 0, &[10, 0, 9, 1, 7, 0, 3]);
+        stack.say(m);
+        assert_eq!(so_error(&b), Ok(()));
+    }
+
+    #[test]
+    fn a_datagram_for_a_port_of_this_machine_that_nobody_has_is_refused() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let here = [127, 0, 0, 1];
+        let a = stack.socket();
+        let peer = Endpoint::Ip(at(here, 9));
+        assert_eq!(async_std::task::block_on(Socket::connect(&a, peer)), Ok(0));
+        // It is sent, as far as the program knows, and then refused.
+        assert_eq!(Socket::write(&a, b"anybody?", None), Ok(8));
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, true));
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::ECONNREFUSED));
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
+
+        // A socket bound there to another address does not have it.
+        let other = stack.socket();
+        assert_eq!(
+            Socket::bind(&other, Endpoint::Ip(at([127, 0, 0, 2], 9))),
+            Ok(0)
+        );
+        assert_eq!(Socket::write(&a, b"anybody?", None), Ok(8));
+        assert_eq!(so_error(&a), Err(LxError::ECONNREFUSED));
+        assert_eq!(recv(&other, &mut buf).0, Err(LxError::EAGAIN));
+        drop(other);
+
+        // With somebody at the port there is nothing to say.
+        let b = stack.socket();
+        assert_eq!(Socket::bind(&b, any(9)), Ok(0));
+        assert_eq!(Socket::write(&a, b"anybody?", None), Ok(8));
+        assert_eq!(so_error(&a), Ok(()));
+        assert_eq!(recv(&b, &mut buf).0, Ok(8));
+
+        // And a socket that is not connected is told nothing.
+        let c = stack.socket();
+        assert_eq!(Socket::write(&c, b"anybody?", to(here, 10)), Ok(8));
+        assert_eq!(so_error(&c), Ok(()));
+        assert_eq!(recv(&c, &mut buf).0, Err(LxError::EAGAIN));
     }
 
     #[test]

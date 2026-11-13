@@ -133,6 +133,7 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         LxError::ENOTCONN => bsd::ENOTCONN,
         LxError::ETIMEDOUT => bsd::ETIMEDOUT,
         LxError::ECONNREFUSED => bsd::ECONNREFUSED,
+        LxError::EHOSTUNREACH => bsd::EHOSTUNREACH,
         LxError::EALREADY => bsd::EALREADY,
         LxError::EINPROGRESS => bsd::EINPROGRESS,
     }
@@ -211,6 +212,7 @@ mod tests {
         LxError::ENOTCONN,
         LxError::ETIMEDOUT,
         LxError::ECONNREFUSED,
+        LxError::EHOSTUNREACH,
         LxError::EINPROGRESS,
         LxError::EADDRINUSE,
         LxError::EADDRNOTAVAIL,

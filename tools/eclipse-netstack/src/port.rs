@@ -600,6 +600,54 @@ pub(crate) mod testing {
         })
     }
 
+    /// An IPv4 packet of ICMP from THEIRS to us that carries `message`,
+    /// as it is.
+    pub fn icmp_frame(message: &[u8]) -> Vec<u8> {
+        ipv4_frame(OUR_IP, IpProtocol::Icmp, message.len(), |payload| {
+            payload.copy_from_slice(message)
+        })
+    }
+
+    /// The ICMP message of this type and code about `quoted`, the start
+    /// of what was not delivered, with the checksum it is to have.
+    pub fn undelivered_message(kind: u8, code: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut message = vec![kind, code, 0, 0, 0, 0, 0, 0];
+        message.extend_from_slice(quoted);
+        Icmpv4Packet::new_unchecked(&mut message[..]).fill_checksum();
+        message
+    }
+
+    /// THEIRS says, with this type and code, that what we sent from our
+    /// port `local` to `to`, port `port`, was not delivered: the frame of
+    /// an ICMP message that quotes the IPv4 header of ours and the eight
+    /// bytes behind it.
+    pub fn undelivered_frame(
+        kind: u8,
+        code: u8,
+        protocol: IpProtocol,
+        local: u16,
+        to: Ipv4Address,
+        port: u16,
+    ) -> Vec<u8> {
+        let ip = Ipv4Repr {
+            src_addr: OUR_IP,
+            dst_addr: to,
+            protocol,
+            payload_len: 8,
+            hop_limit: 1,
+        };
+        let mut quoted = vec![0u8; ip.buffer_len() + 8];
+        ip.emit(
+            &mut Ipv4Packet::new_unchecked(&mut quoted[..]),
+            &ChecksumCapabilities::default(),
+        );
+        quoted[20..22].copy_from_slice(&local.to_be_bytes());
+        quoted[22..24].copy_from_slice(&port.to_be_bytes());
+        // A datagram's length, or a segment's first number: 8, or 8.
+        quoted[24..28].copy_from_slice(&[0, 8, 0, 0]);
+        icmp_frame(&undelivered_message(kind, code, &quoted))
+    }
+
     /// What a DHCP server offers, and then agrees to.
     pub struct Offered {
         pub address: Ipv4Address,

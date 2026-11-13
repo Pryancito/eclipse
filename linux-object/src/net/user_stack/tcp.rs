@@ -338,7 +338,12 @@ impl StackLink {
                     inner.error = Some(match number {
                         WHY_REFUSED => LxError::ECONNREFUSED,
                         WHY_TIMED_OUT => LxError::ETIMEDOUT,
-                        WHY_UNREACHABLE => LxError::ENETUNREACH,
+                        // What the ICMP message that ended it means,
+                        // when one did; no way to send it at all is no
+                        // way to the network.
+                        WHY_UNREACHABLE => {
+                            icmp::connect_error(bytes).unwrap_or(LxError::ENETUNREACH)
+                        }
                         WHY_NO_ROOM => LxError::ENOBUFS,
                         _ => LxError::ECONNRESET,
                     });
@@ -1363,16 +1368,27 @@ mod tests {
     fn a_connect_that_fails_leaves_its_error_once_and_a_socket_to_try_again() {
         let _lock = LOCK.lock();
         let stack = stack();
-        for (why, error) in [
-            (WHY_REFUSED, LxError::ECONNREFUSED),
-            (WHY_TIMED_OUT, LxError::ETIMEDOUT),
-            (WHY_UNREACHABLE, LxError::ENETUNREACH),
-            (WHY_NO_ROOM, LxError::ENOBUFS),
+        // The last four: what an ICMP message said, by its type and code.
+        // The host, the network, nobody at the port, out of hops; and a
+        // code that means nothing is still no way to the host.
+        let none: &[u8] = &[];
+        for (why, said, error) in [
+            (WHY_REFUSED, none, LxError::ECONNREFUSED),
+            (WHY_TIMED_OUT, none, LxError::ETIMEDOUT),
+            (WHY_UNREACHABLE, none, LxError::ENETUNREACH),
+            (WHY_NO_ROOM, none, LxError::ENOBUFS),
+            (WHY_UNREACHABLE, &[3, 1], LxError::EHOSTUNREACH),
+            (WHY_UNREACHABLE, &[3, 0], LxError::ENETUNREACH),
+            (WHY_UNREACHABLE, &[3, 3], LxError::ECONNREFUSED),
+            (WHY_UNREACHABLE, &[11, 0], LxError::EHOSTUNREACH),
+            (WHY_UNREACHABLE, &[3, 99], LxError::EHOSTUNREACH),
+            (WHY_UNREACHABLE, &[8, 0], LxError::ENETUNREACH),
+            (WHY_UNREACHABLE, &[3], LxError::ENETUNREACH),
         ] {
             let s = stream(&stack);
             assert_eq!(connect(&s, at(HOST, 80)), Err(LxError::EINPROGRESS));
             let (_, sock) = parse_header(&stack.told().unwrap()).unwrap();
-            events(&stack, &[(sock, EV_FAILED, why, &[])]);
+            events(&stack, &[(sock, EV_FAILED, why, said)]);
             // What a program that waited in `poll` for the connect sees.
             let now = status(&s);
             assert!(now.read && now.write && now.error);
