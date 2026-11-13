@@ -44,11 +44,11 @@ pub(super) fn echo_reply_ident(message: &[u8]) -> Option<u16> {
 /// it right.
 fn checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut pairs = bytes.chunks_exact(2);
-    for pair in &mut pairs {
-        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    let (pairs, odd) = bytes.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let [last] = pairs.remainder() {
+    if let [last] = odd {
         sum += u32::from(*last) << 8;
     }
     while sum >> 16 != 0 {
