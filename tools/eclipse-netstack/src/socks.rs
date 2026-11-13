@@ -388,6 +388,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_CLOSE if m.len() == HEADER_LEN => {
                 // A socket closed before it had a port was never told here.
                 if let Some(handle) = self.socks.remove(&sock) {
+                    // What it sent and has not left goes first: a program
+                    // that sends and ends has sent, and its `CLOSE` can
+                    // be here before the stack had a turn. The `SEND`
+                    // said there would be frames; this adds none.
+                    let _ = self.iface.poll(&mut self.set, self.now);
                     self.set.remove(handle);
                     return Ok(false);
                 }
@@ -892,6 +897,29 @@ mod tests {
         let far = send_hops(5, THEIR_IP, 4000, 255, b"far");
         assert_eq!(stack.request(&far), Ok(true));
         assert_eq!(left(&mut stack), hops(&[(255, b"far")]));
+    }
+
+    #[test]
+    fn what_a_socket_sent_leaves_though_it_closes_at_once() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(5, 7000)), Ok(false));
+        assert_eq!(stack.request(&send(5, THEIR_IP, 4000, b"last")), Ok(true));
+        assert_eq!(stack.request(&send(5, THEIR_IP, 4001, b"words")), Ok(true));
+        // The close comes before the stack had a turn.
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        assert_eq!(stack.sockets(), 0);
+        assert!(poll(&mut stack).is_empty());
+        let sent: Vec<_> = turn(stack.device())
+            .iter()
+            .map(|m| udp_of(&window.sent(m)))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (7000, 4000, b"last".to_vec()),
+                (7000, 4001, b"words".to_vec())
+            ]
+        );
     }
 
     #[test]
