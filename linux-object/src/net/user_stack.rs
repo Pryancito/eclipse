@@ -84,6 +84,20 @@
 //! socket bound to an address of 127.0.0.0/8 is this machine's alone: the
 //! stack is never told of it, so nothing from the card reaches it.
 //!
+//! # A stack that comes and goes
+//!
+//! The sockets are the machine's, not the stack process's
+//! ([`StackLink`]). A program opens one before any stack is served, and
+//! it works for what stays in the machine; what would leave it is
+//! `ENETDOWN` until a stack comes. When the process dies -- it is a
+//! process, it can be restarted -- a socket that listens goes on
+//! listening and a datagram socket keeps its port, and the next process
+//! to serve is told of them (`LISTEN`, `BIND`) as if they had just been
+//! made. What ends with the process is what only it had, the TCP of the
+//! connections it carried: those are over (`ENETDOWN`, once, then the
+//! end), as when a machine in between forgets a connection. The numbers
+//! it gave out are forgotten with it, so the next can give them again.
+//!
 //! # IPv6 sockets
 //!
 //! The stack has IPv4 and no IPv6, and a program does not ask which
@@ -106,7 +120,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::convert::TryInto;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_hal::sync::Mutex;
 use log::warn;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
@@ -407,14 +421,6 @@ impl Shared {
         inner.read_closed = true;
         self.bus.lock().set(Event::READABLE);
     }
-
-    /// The stack is gone: whoever waits to read is woken to find out. Under
-    /// `inner`, as every change of the bus, so a reader that looked a
-    /// moment before and is about to sleep does not miss it.
-    fn wake(&self) {
-        let _inner = self.inner.lock();
-        self.bus.lock().set(Event::READABLE);
-    }
 }
 
 /// The ports of one protocol: which are taken, and where the search for
@@ -482,58 +488,89 @@ struct Table {
     joined: BTreeMap<u64, u64>,
 }
 
-/// The kernel's end of a stack that runs as a process.
-pub struct StackLink {
+/// The stack process that serves now.
+struct Served {
     channel: Arc<Channel>,
-    /// The longest datagram the stack carries: what fits one frame of its
-    /// card, for a stack that does not fragment.
-    max_datagram: usize,
-    /// The stack's address, which is the local address of every
-    /// connection: unspecified when the stack did not say.
-    address: Ipv4Address,
-    table: Mutex<Table>,
-    dead: AtomicBool,
+    /// Which it is of the stacks there have been: 1 the first.
+    turn: u64,
 }
 
-/// The stack that serves the sockets of the programs that ask for one.
-static STACK: Mutex<Option<Arc<StackLink>>> = Mutex::new(None);
+/// The served sockets of this machine, and the stack process that carries
+/// what they say beyond it, while there is one.
+///
+/// The sockets are the machine's and not the process's: they are here
+/// before the first stack is served, and when a stack dies they wait for
+/// the next, which is told of the ones that are bound or listen. What
+/// dies with a stack is what only it had: the connections it carried.
+pub struct StackLink {
+    served: Mutex<Option<Served>>,
+    /// Whether a stack serves now: `served`, without its lock.
+    up: AtomicBool,
+    /// How many stacks there have been.
+    turns: AtomicU64,
+    /// The longest datagram the stack carries: what fits one frame of its
+    /// card, for a stack that does not fragment.
+    max_datagram: AtomicUsize,
+    /// The stack's address, which is the local address of every
+    /// connection it carries, as the bytes of a big-endian number: 0
+    /// while there is no stack, or it did not say.
+    address: AtomicU32,
+    table: Mutex<Table>,
+    /// Held while a socket takes a port or starts to listen and the stack
+    /// is told, and while a new stack is told of all that have: so each
+    /// is told once. Taken before any other lock here.
+    telling: Mutex<()>,
+}
+
+/// A stack process's turn at serving: what the task that reads its
+/// channel holds.
+pub struct Serving {
+    link: Arc<StackLink>,
+    channel: Arc<Channel>,
+    turn: u64,
+}
+
+impl Serving {
+    /// The sockets it serves.
+    pub fn link(&self) -> &Arc<StackLink> {
+        &self.link
+    }
+
+    /// The channel, for whoever sleeps on it until there is something to
+    /// [`pump`](Self::pump).
+    pub fn channel(&self) -> &Arc<Channel> {
+        &self.channel
+    }
+
+    /// Whether the process is gone.
+    pub fn is_over(&self) -> bool {
+        !self.link.serves(self.turn)
+    }
+
+    /// Read what the stack has sent: each datagram and event to its
+    /// socket.
+    pub fn pump(&self) {
+        self.link.pump_on(&self.channel, self.turn);
+    }
+}
+
+/// The served sockets of this machine.
+static MACHINE: Mutex<Option<Arc<StackLink>>> = Mutex::new(None);
+
+/// The served sockets of this machine: where the socket of a program
+/// that asked for the stack that runs as a process is made, whether one
+/// runs yet or not.
+pub fn machine() -> Arc<StackLink> {
+    MACHINE.lock().get_or_insert_with(StackLink::new).clone()
+}
 
 /// A process serves a stack on `channel`, the kernel's end, that carries
 /// datagrams of up to `max_datagram` bytes: a longer one is `EMSGSIZE` to
 /// who sends it. `address` is the stack's own, which a connected socket
 /// answers `getsockname` with. `ALREADY_BOUND` while another process
 /// serves one.
-pub fn serve(
-    channel: Arc<Channel>,
-    max_datagram: usize,
-    address: [u8; 4],
-) -> ZxResult<Arc<StackLink>> {
-    if !(1..=MAX_DATAGRAM).contains(&max_datagram) {
-        return Err(ZxError::INVALID_ARGS);
-    }
-    let mut stack = STACK.lock();
-    if let Some(old) = stack.as_ref() {
-        // The one before may have died a moment ago, with nobody there
-        // yet to say so: ask its channel.
-        old.pump();
-        if !old.is_dead() {
-            return Err(ZxError::ALREADY_BOUND);
-        }
-    }
-    let link = Arc::new(StackLink {
-        channel,
-        max_datagram,
-        address: Ipv4Address(address),
-        table: Mutex::new(Table::default()),
-        dead: AtomicBool::new(false),
-    });
-    *stack = Some(link.clone());
-    Ok(link)
-}
-
-/// The stack being served, if there is one.
-pub fn current() -> Option<Arc<StackLink>> {
-    STACK.lock().clone().filter(|link| !link.is_dead())
+pub fn serve(channel: Arc<Channel>, max_datagram: usize, address: [u8; 4]) -> ZxResult<Serving> {
+    machine().attach(channel, max_datagram, address)
 }
 
 /// Whether every program's sockets are the served stack's, asked for or
@@ -586,24 +623,131 @@ fn shown(v6: bool, endpoint: IpEndpoint) -> IpEndpoint {
 }
 
 impl StackLink {
-    /// Whether the process is gone.
-    pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Acquire)
+    /// Sockets that no stack serves yet.
+    pub fn new() -> Arc<StackLink> {
+        Arc::new(StackLink {
+            served: Mutex::new(None),
+            up: AtomicBool::new(false),
+            turns: AtomicU64::new(0),
+            max_datagram: AtomicUsize::new(0),
+            address: AtomicU32::new(0),
+            table: Mutex::new(Table::default()),
+            telling: Mutex::new(()),
+        })
     }
 
-    /// The channel, for whoever sleeps on it until there is something to
-    /// [`pump`](Self::pump).
-    pub fn channel(&self) -> &Arc<Channel> {
-        &self.channel
+    /// [`serve`], on these sockets. The stack is told of the sockets that
+    /// are there already and are its business: the datagram sockets that
+    /// have a port and the stream sockets that listen, less the ones
+    /// that are this machine's alone.
+    pub fn attach(
+        self: &Arc<Self>,
+        channel: Arc<Channel>,
+        max_datagram: usize,
+        address: [u8; 4],
+    ) -> ZxResult<Serving> {
+        if !(1..=MAX_DATAGRAM).contains(&max_datagram) {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        // The one before may have died a moment ago, with nobody there
+        // yet to say so: ask its channel.
+        self.pump();
+        let _telling = self.telling.lock();
+        let turn = {
+            let mut served = self.served.lock();
+            if served.is_some() {
+                return Err(ZxError::ALREADY_BOUND);
+            }
+            let turn = self.turns.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_datagram.store(max_datagram, Ordering::Release);
+            self.address
+                .store(u32::from_be_bytes(address), Ordering::Release);
+            *served = Some(Served {
+                channel: channel.clone(),
+                turn,
+            });
+            self.up.store(true, Ordering::Release);
+            turn
+        };
+        let (bound, listening) = {
+            let table = self.table.lock();
+            let bound: Vec<(u64, u16, Arc<Shared>)> = table
+                .bound
+                .iter()
+                .filter_map(|(port, sock)| {
+                    let shared = table.socks.get(sock).and_then(Weak::upgrade)?;
+                    Some((*sock, *port, shared))
+                })
+                .collect();
+            let listening: Vec<(u64, u16, Arc<tcp::Stream>)> = table
+                .listening
+                .iter()
+                .filter_map(|(port, sock)| {
+                    let stream = table.streams.get(sock).and_then(Weak::upgrade)?;
+                    Some((*sock, *port, stream))
+                })
+                .collect();
+            (bound, listening)
+        };
+        for (sock, port, shared) in bound {
+            if shared.inner.lock().here.is_none() {
+                let _ = self.tell(bind_message(sock, port), true);
+            }
+        }
+        for (sock, port, stream) in listening {
+            if stream.listens_for_the_stack() {
+                let listen = listen_message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
+                let _ = self.tell(listen, true);
+            }
+        }
+        Ok(Serving {
+            link: self.clone(),
+            channel,
+            turn,
+        })
     }
 
-    /// Read what the stack has sent: each datagram onto its socket's queue.
+    /// Whether no stack serves now: what leaves the machine has nowhere
+    /// to go (`ENETDOWN`). What stays in it does not notice.
+    pub fn is_down(&self) -> bool {
+        !self.up.load(Ordering::Acquire)
+    }
+
+    /// Whether the stack of that turn still serves.
+    fn serves(&self, turn: u64) -> bool {
+        !self.is_down() && self.turns.load(Ordering::Acquire) == turn
+    }
+
+    /// The stack that serves now: its channel and its turn.
+    fn current(&self) -> Option<(Arc<Channel>, u64)> {
+        if self.is_down() {
+            return None;
+        }
+        let served = self.served.lock();
+        served.as_ref().map(|s| (s.channel.clone(), s.turn))
+    }
+
+    /// The stack's address: unspecified while there is none, or it did
+    /// not say.
+    fn address(&self) -> Ipv4Address {
+        Ipv4Address(self.address.load(Ordering::Acquire).to_be_bytes())
+    }
+
+    /// Read what the stack that serves now has sent.
     pub fn pump(&self) {
-        while !self.is_dead() {
-            match self.channel.read() {
+        if let Some((channel, turn)) = self.current() {
+            self.pump_on(&channel, turn);
+        }
+    }
+
+    /// Read what the stack of that turn has sent: each datagram onto its
+    /// socket's queue, each event to its socket.
+    fn pump_on(&self, channel: &Arc<Channel>, turn: u64) {
+        while self.serves(turn) {
+            match channel.read() {
                 Ok(msg) => self.take(&msg.data),
                 Err(ZxError::SHOULD_WAIT) => return,
-                Err(_) => self.died(),
+                Err(_) => self.gone(turn),
             }
         }
     }
@@ -652,52 +796,61 @@ impl StackLink {
         }
     }
 
-    /// The process is gone: its sockets answer `ENETDOWN` from now on,
-    /// also to who was asleep on one, and the next stack can be served. A
-    /// socket does not move to the next stack: the program opens another.
-    fn died(&self) {
-        if self.dead.swap(true, Ordering::AcqRel) {
-            return;
+    /// The process of that turn is gone, and the next stack can be
+    /// served. The sockets stay: a listener goes on listening and a
+    /// datagram socket keeps its port, for the programs of this machine
+    /// now and for the next stack when it comes. What goes is what only
+    /// the process had: a connection it carried is over (`ENETDOWN`),
+    /// for who was asleep on it too.
+    fn gone(&self, turn: u64) {
+        {
+            let mut served = self.served.lock();
+            if served.as_ref().map(|s| s.turn) != Some(turn) {
+                return;
+            }
+            *served = None;
+            self.up.store(false, Ordering::Release);
+            self.address.store(0, Ordering::Release);
         }
         warn!("user stack: the process is gone");
-        let (socks, streams): (Vec<Weak<Shared>>, Vec<Weak<tcp::Stream>>) = {
-            let table = self.table.lock();
-            (
-                table.socks.values().cloned().collect(),
-                table.streams.values().cloned().collect(),
-            )
+        let streams: Vec<Arc<tcp::Stream>> = {
+            let mut table = self.table.lock();
+            let streams = table.streams.values().filter_map(Weak::upgrade).collect();
+            // The numbers the process gave out are the next one's to give.
+            table.streams.retain(|sock, _| sock & ACCEPTED_BIT == 0);
+            streams
         };
-        for shared in socks.iter().filter_map(Weak::upgrade) {
-            shared.wake();
-        }
-        for stream in streams.iter().filter_map(Weak::upgrade) {
-            stream.wake();
+        for stream in streams {
+            stream.lose();
         }
     }
 
-    /// A message to the stack. `ENETDOWN` when it is gone, `ENOBUFS` when
-    /// it has [`SEND_BACKLOG`] unread and `urgent` is not set.
+    /// A message to the stack. `ENETDOWN` when there is none, `ENOBUFS`
+    /// when it has [`SEND_BACKLOG`] unread and `urgent` is not set.
     fn tell(&self, data: Vec<u8>, urgent: bool) -> LxResult<()> {
-        if self.is_dead() {
+        let Some((channel, turn)) = self.current() else {
             return Err(LxError::ENETDOWN);
-        }
-        if !urgent && self.channel.peer_pending() >= SEND_BACKLOG {
+        };
+        if !urgent && channel.peer_pending() >= SEND_BACKLOG {
             return Err(LxError::ENOBUFS);
         }
         let msg = MessagePacket {
             data,
             handles: Vec::new(),
         };
-        self.channel.write(msg).map_err(|_| {
-            self.died();
+        channel.write(msg).map_err(|_| {
+            self.gone(turn);
             LxError::ENETDOWN
         })
     }
 
     /// Give a socket the port `wanted`, or any when it is 0, and tell the
     /// stack, unless the socket is this machine's alone (`told`).
-    /// `EADDRINUSE` when another has it or none is left.
+    /// `EADDRINUSE` when another has it or none is left. With no stack
+    /// to tell, the port is the socket's all the same: the next stack is
+    /// told when it comes.
     fn bind(&self, sock: u64, wanted: u16, told: bool) -> LxResult<u16> {
+        let _telling = self.telling.lock();
         let port = {
             let mut table = self.table.lock();
             let port = table.ports.take(wanted)?;
@@ -705,12 +858,7 @@ impl StackLink {
             port
         };
         if told {
-            if let Err(e) = self.tell(bind_message(sock, port), true) {
-                let mut table = self.table.lock();
-                table.ports.taken.remove(&port);
-                table.bound.remove(&port);
-                return Err(e);
-            }
+            let _ = self.tell(bind_message(sock, port), true);
         }
         Ok(port)
     }
@@ -734,7 +882,7 @@ impl StackLink {
     /// Whether `addr` is this machine: what is sent there is for another
     /// of its programs, and never leaves it.
     fn is_here(&self, addr: Ipv4Address) -> bool {
-        addr.is_loopback() || (!self.address.is_unspecified() && addr == self.address)
+        addr.is_loopback() || (!self.address().is_unspecified() && addr == self.address())
     }
 
     /// The address this machine speaks from to who it reaches at `to`,
@@ -775,12 +923,8 @@ pub struct ServedUdpSocket {
 }
 
 impl ServedUdpSocket {
-    /// A socket of the stack behind `link`, `AF_INET6` when `v6`.
-    /// `ENETDOWN` when the stack is gone.
+    /// A socket of `link`, `AF_INET6` when `v6`.
     pub fn new(link: Arc<StackLink>, v6: bool) -> LxResult<Self> {
-        if link.is_dead() {
-            return Err(LxError::ENETDOWN);
-        }
         let mut bus = EventBus::default();
         // A datagram socket can always be written to: what cannot be sent
         // is refused, not waited for.
@@ -850,16 +994,13 @@ impl ServedUdpSocket {
                         inner.queue.pop_front();
                         inner.queued_bytes -= len;
                     }
-                    if inner.queue.is_empty() && !inner.read_closed && !self.link.is_dead() {
+                    if inner.queue.is_empty() && !inner.read_closed {
                         self.shared.bus.lock().clear(Event::READABLE);
                     }
                     return (Ok(n), Endpoint::Ip(shown(self.v6, from)));
                 }
                 if inner.read_closed {
                     return (Ok(0), nobody());
-                }
-                if self.link.is_dead() {
-                    return (Err(LxError::ENETDOWN), nobody());
                 }
                 self.shared.bus.lock().clear(Event::READABLE);
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
@@ -914,9 +1055,6 @@ impl Socket for ServedUdpSocket {
             if data.len() > MAX_DATAGRAM {
                 return Err(LxError::EMSGSIZE);
             }
-            if self.link.is_dead() {
-                return Err(LxError::ENETDOWN);
-            }
             let port = self.autobind()?;
             let from = here.unwrap_or_else(|| self.link.here_for(addr));
             let from = IpEndpoint::new(IpAddress::Ipv4(from), port);
@@ -928,7 +1066,11 @@ impl Socket for ServedUdpSocket {
         if here.is_some() {
             return Err(LxError::EINVAL);
         }
-        if data.len() > self.link.max_datagram {
+        // Nothing leaves the machine while no stack serves.
+        if self.link.is_down() {
+            return Err(LxError::ENETDOWN);
+        }
+        if data.len() > self.link.max_datagram.load(Ordering::Acquire) {
             return Err(LxError::EMSGSIZE);
         }
         self.autobind()?;
@@ -939,12 +1081,7 @@ impl Socket for ServedUdpSocket {
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         let inner = self.shared.inner.lock();
-        let dead = self.link.is_dead();
-        (
-            !inner.queue.is_empty() || inner.read_closed || dead,
-            true,
-            dead,
-        )
+        (!inner.queue.is_empty() || inner.read_closed, true, false)
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
@@ -975,10 +1112,19 @@ impl Socket for ServedUdpSocket {
             IpAddress::Ipv4(addr) if addr.is_loopback() => Some(addr),
             _ => None,
         };
-        let port = self.link.bind(self.sock, local.port, here.is_none())?;
+        // Said before the port is taken: a stack that starts to serve
+        // just then is told of the sockets that are not this machine's
+        // alone.
+        self.shared.inner.lock().here = here;
+        let bound = self.link.bind(self.sock, local.port, here.is_none());
         let mut inner = self.shared.inner.lock();
-        inner.port = Some(port);
-        inner.here = here;
+        match bound {
+            Ok(port) => inner.port = Some(port),
+            Err(e) => {
+                inner.here = None;
+                return Err(e);
+            }
+        }
         Ok(0)
     }
 
@@ -1139,7 +1285,7 @@ impl FileLike for ServedUdpSocket {
 mod tests {
     //! The socket against a stack that is the test: it holds the other end
     //! of the channel, reads what the kernel tells it and writes what
-    //! arrived. Every test takes `LOCK`: one stack is served at a time.
+    //! arrived. Each test's stack serves sockets of its own.
 
     use super::*;
     use crate::net::NET_TEST_LOCK as LOCK;
@@ -1150,10 +1296,20 @@ mod tests {
         pub(super) end: Arc<Channel>,
     }
 
+    /// A stack that serves sockets of its own: no test sees another's.
     pub(super) fn stack() -> Stack {
+        stack_of(&StackLink::new())
+    }
+
+    /// A stack that serves the sockets of `link`, which has none now.
+    pub(super) fn stack_of(link: &Arc<StackLink>) -> Stack {
         let (kernel, end) = Channel::create();
-        let link = serve(kernel, MAX_FOR_TESTS, STACK_ADDR).expect("the stack before is gone");
-        Stack { link, end }
+        link.attach(kernel, MAX_FOR_TESTS, STACK_ADDR)
+            .expect("the stack before is gone");
+        Stack {
+            link: link.clone(),
+            end,
+        }
     }
 
     impl Stack {
@@ -1654,7 +1810,7 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_eq!(recv(&a, &mut buf).0, Ok(5));
         assert!(!readable(&a));
-        assert!(!stack.link.is_dead(), "nonsense does not end the stack");
+        assert!(!stack.link.is_down(), "nonsense does not end the stack");
         stack.arrives(a.sock, HOST, 1, b"real");
         assert!(readable(&a));
     }
@@ -1740,7 +1896,8 @@ mod tests {
         // A close is told all the same: the stack must not keep the socket.
         let b = stack.socket();
         drop(b);
-        assert_eq!(stack.link.channel.peer_pending(), SEND_BACKLOG + 1);
+        let (channel, _) = stack.link.current().unwrap();
+        assert_eq!(channel.peer_pending(), SEND_BACKLOG + 1);
         // Once the stack has read enough, a send goes through again.
         assert!(stack.told().is_some());
         assert_eq!(Socket::write(&a, b"x", to(HOST, 9)), Err(LxError::ENOBUFS));
@@ -1754,72 +1911,119 @@ mod tests {
     }
 
     #[test]
-    fn when_the_stack_dies_its_sockets_say_the_network_is_down() {
+    fn when_the_stack_dies_its_sockets_wait_for_the_next() {
         let _g = LOCK.lock();
         let stack = stack();
+        let here = [127, 0, 0, 1];
         let a = stack.socket();
+        assert_eq!(Socket::bind(&a, any(7000)), Ok(0));
+        let local = stack.socket();
+        assert_eq!(Socket::bind(&local, Endpoint::Ip(at(here, 7001))), Ok(0));
         stack.arrives(a.sock, HOST, 1, b"last");
         // One stack at a time.
         let (other, _other_end) = Channel::create();
         assert_eq!(
-            serve(other, MAX_FOR_TESTS, STACK_ADDR).err(),
+            stack.link.attach(other, MAX_FOR_TESTS, STACK_ADDR).err(),
             Some(ZxError::ALREADY_BOUND)
         );
         // And one that carries nothing, or more than UDP does, is none.
         for bad in [0, MAX_DATAGRAM + 1] {
             let (other, _other_end) = Channel::create();
             assert_eq!(
-                serve(other, bad, STACK_ADDR).err(),
+                stack.link.attach(other, bad, STACK_ADDR).err(),
                 Some(ZxError::INVALID_ARGS)
             );
         }
-        assert!(current().is_some());
+        assert!(!stack.link.is_down());
 
         let Stack { link, end } = stack;
         drop(end);
         link.pump();
-        assert!(link.is_dead());
-        assert!(current().is_none());
-        assert_eq!(
-            ServedUdpSocket::new(link.clone(), false).err(),
-            Some(LxError::ENETDOWN)
-        );
+        assert!(link.is_down());
 
-        // What had arrived is read; then every operation says so, and
-        // `poll` reports the socket readable and in error, so who waits on
-        // it comes to read that.
+        // What had arrived is read, and then there is nothing to read:
+        // the socket is not in error, it waits. Nothing leaves the
+        // machine, and that is said to who tries.
         let mut buf = [0u8; 8];
         assert_eq!(recv(&a, &mut buf).0, Ok(4));
-        assert_eq!(recv(&a, &mut buf).0, Err(LxError::ENETDOWN));
-        assert_eq!(Socket::poll(&a, PollEvents::IN), (true, true, true));
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, false));
         assert_eq!(Socket::write(&a, b"x", to(HOST, 9)), Err(LxError::ENETDOWN));
-        assert_eq!(Socket::bind(&a, any(7000)), Err(LxError::ENETDOWN));
-        // The port a refused bind took is not kept.
-        assert!(link.table.lock().ports.taken.is_empty());
+        // What stays in the machine does not notice.
+        assert_eq!(Socket::write(&a, b"aqui", to(here, 7001)), Ok(4));
+        assert_eq!(recv(&local, &mut buf), (Ok(4), at(here, 7000)));
+        // And a socket is made, and takes a port, with no stack at all.
+        let b = ServedUdpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&b, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&b, any(7002)), Ok(0));
+        assert_eq!(
+            Socket::bind(&stack_socket(&link), any(7002)),
+            Err(LxError::EADDRINUSE)
+        );
 
-        // The next stack is served, and the old socket is not its.
-        let next = self::stack();
-        let b = next.socket();
-        assert_eq!(Socket::bind(&b, any(7000)), Ok(0));
-        assert_eq!(recv(&a, &mut buf).0, Err(LxError::ENETDOWN));
+        // The next stack is told of the sockets that have a port, less
+        // the one that is this machine's alone, and they are its: what
+        // it hears for them arrives, and it is told when one closes.
+        let next = stack_of(&link);
+        assert_eq!(next.told(), Some(bind_message(a.sock, 7000)));
+        assert_eq!(next.told(), Some(bind_message(b.sock, 7002)));
+        assert_eq!(next.told(), None);
+        next.arrives(a.sock, HOST, 1, b"again");
+        link.pump();
+        assert_eq!(recv(&a, &mut buf), (Ok(5), at(HOST, 1)));
+        assert_eq!(Socket::write(&b, b"x", to(HOST, 9)), Ok(1));
+        assert_eq!(next.told(), Some(send_message(b.sock, HOST, 9, b"x")));
+        let closed = a.sock;
         drop(a);
-        assert_eq!(next.told(), Some(bind_message(b.sock, 7000)));
-        assert_eq!(next.told(), None, "the old socket's close is not told");
+        assert_eq!(next.told(), Some(close_message(closed)));
+    }
+
+    /// A socket of `link` that does not wait.
+    fn stack_socket(link: &Arc<StackLink>) -> ServedUdpSocket {
+        let s = ServedUdpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+        s
     }
 
     #[test]
-    fn a_stack_found_dead_by_a_write_is_dead() {
+    fn a_stack_found_dead_by_a_write_is_gone() {
         let _g = LOCK.lock();
         let Stack { link, end } = stack();
-        let a = ServedUdpSocket::new(link.clone(), false).unwrap();
+        let a = stack_socket(&link);
         drop(end);
         assert_eq!(Socket::write(&a, b"x", to(HOST, 9)), Err(LxError::ENETDOWN));
-        assert!(link.is_dead());
-        // And `serve` finds it out by itself when nobody pumped.
+        assert!(link.is_down());
+        // And the next one finds it out by itself when nobody pumped.
         let Stack { link, end } = stack();
         drop(end);
-        assert!(!link.is_dead());
-        let _next = stack();
-        assert!(link.is_dead());
+        assert!(!link.is_down());
+        let _next = stack_of(&link);
+        assert!(!link.is_down());
+    }
+
+    #[test]
+    fn the_machine_has_sockets_before_it_has_a_stack() {
+        let _g = LOCK.lock();
+        let link = StackLink::new();
+        assert!(link.is_down());
+        let here = [127, 0, 0, 1];
+        // Two programs talk with nobody serving anything.
+        let server = stack_socket(&link);
+        assert_eq!(Socket::bind(&server, any(5353)), Ok(0));
+        let client = stack_socket(&link);
+        assert_eq!(Socket::write(&client, b"hola", to(here, 5353)), Ok(4));
+        let mut buf = [0u8; 8];
+        assert_eq!(recv(&server, &mut buf).0, Ok(4));
+        // Outside there is no way yet.
+        assert_eq!(
+            Socket::write(&client, b"x", to(HOST, 9)),
+            Err(LxError::ENETDOWN)
+        );
+        // The stack comes and is told of both, each with its port.
+        let stack = stack_of(&link);
+        assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
+        assert_eq!(stack.told(), Some(bind_message(client.sock, port(&client))));
+        assert_eq!(Socket::write(&client, b"x", to(HOST, 9)), Ok(1));
+        assert_eq!(stack.told(), Some(send_message(client.sock, HOST, 9, b"x")));
     }
 }
