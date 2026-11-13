@@ -376,6 +376,26 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
         }
+        // `unetuse=all`: every program's IPv4 sockets are those of the stack
+        // that runs as a process (`unetstack=`), and not only the ones
+        // started by `eclipse-netstack-use`. The kernel's own stack keeps
+        // what is not a datagram or a stream: ping, raw and packet sockets.
+        #[cfg(feature = "linux")]
+        match kernel_hal::cmdline::value(&options.cmdline, "unetuse") {
+            Some("all") => {
+                linux_object::net::user_stack::use_for_all(true);
+                klog_info!(
+                    "Eclipse: every program's sockets go to the stack process (unetuse=all)"
+                );
+            }
+            Some(other) => {
+                klog_warn!(
+                    "Eclipse: unetuse={} is not understood (only \"all\"); ignored",
+                    other
+                );
+            }
+            None => {}
+        }
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
         // measurable difference to `eclipse.ipcbench`.

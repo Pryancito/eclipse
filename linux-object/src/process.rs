@@ -1292,7 +1292,9 @@ pub struct LinuxProcess {
     /// the network stack that runs as a process ([`crate::net::user_stack`]) and not the
     /// kernel's: asked for with `eclipse_netstack_use`, inherited by `fork`
     /// and kept across `execve`, so a program is given that stack by
-    /// whatever starts it. Outside `inner` because `socket` reads it.
+    /// whatever starts it. A boot with `unetuse=all` has asked for every
+    /// process ([`crate::net::user_stack::use_for_all`]). Outside `inner`
+    /// because `socket` reads it.
     user_netstack: core::sync::atomic::AtomicBool,
 }
 
@@ -1773,6 +1775,7 @@ impl LinuxProcess {
     pub fn uses_user_netstack(&self) -> bool {
         self.user_netstack
             .load(core::sync::atomic::Ordering::Relaxed)
+            || crate::net::user_stack::is_for_all()
     }
 
     /// From now on they are, for this process and what it forks.
