@@ -1,5 +1,7 @@
-//! `eclipse-netstack N ADDR/PREFIX`: a network stack for virtio network
-//! card `N`, in this process, with the address `ADDR`.
+//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY]` or `eclipse-netstack N dhcp`:
+//! a network stack for virtio network card `N`, in this process, with the
+//! address `ADDR` or the one a DHCP server leases it. What is not for the
+//! card's network goes to the gateway, the one written or the lease's.
 //!
 //! The card must be one the kernel left to userspace
 //! (`udriver=virtio-net@N` on its command line) and that no driver has: this
@@ -32,18 +34,26 @@
 //! what a program was just told waits a moment for the program's answer
 //! (`HOLD`).
 //!
+//! The kernel is told the address once, for `getsockname`, when it is
+//! given its sockets: at the start for an address that is written, with
+//! the first lease for one that is asked for. A lease that comes back with
+//! another address ends this process, for whoever started it to start it
+//! again: the connections were the old address's.
+//!
 //! Exit status: 2 for a command line that is not one, 1 when the driver
-//! cannot be started or gives no card.
+//! cannot be started or gives no card, 3 when the lease's address changed.
 
 use std::collections::BTreeMap;
 use std::process::{exit, Child, Command};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use netstack::port::Port;
+use netstack::socks::lease::{Addressing, Lease};
 use netstack::socks::tcp::OP_WRITE;
 use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_SEND};
-use smoltcp::iface::{InterfaceBuilder, NeighborCache};
+use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
@@ -53,7 +63,7 @@ use udrivers::status;
 use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
-const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX";
+const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY] | eclipse-netstack N dhcp";
 /// The card's driver, which this process starts.
 const DRIVER: &str = "/bin/udrv-virtio-net";
 /// The messages of one turn: as many as the driver's FIFO holds.
@@ -174,7 +184,23 @@ struct Shared {
     answering: bool,
 }
 
-type Lock = Arc<Mutex<Shared>>;
+/// What every thread has: the stack, and the kernel once it has sockets
+/// here.
+struct Host {
+    index: usize,
+    mac: [u8; 6],
+    shared: Mutex<Shared>,
+    /// The kernel's sockets, from when it was told this stack's address.
+    kernel: OnceLock<Arc<Kernel>>,
+    /// The address the kernel was told, or would have been had it wanted
+    /// a stack: `getsockname` answers with it for as long as this process
+    /// lasts.
+    told: Mutex<Option<Ipv4Address>>,
+    /// The driver the card has now and how many it has had, for
+    /// [`publish`].
+    driver_pid: AtomicU32,
+    driver_starts: AtomicU32,
+}
 
 /// A lock, whatever became of the thread that had it last: the process
 /// ends on a panic, so nobody is left to see a poisoned one.
@@ -197,10 +223,18 @@ struct Kernel {
 /// the lock, which it lets go before the kernel is told: that write wakes
 /// whoever reads the socket, who runs at once and has something to send
 /// before this thread is back.
-fn turn(mut shared: MutexGuard<'_, Shared>, kernel: Option<&Kernel>, data: &mut Vec<u8>) -> bool {
+fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut Vec<u8>) -> bool {
     shared.stack.poll(now());
+    if let Some(lease) = shared.stack.lease_news() {
+        // Not under the lock: the kernel may have to be told.
+        drop(shared);
+        settle(host, lease);
+        shared = locked(&host.shared);
+    }
     // Without the kernel there are no sockets for anything to arrive on.
-    let Some(kernel) = kernel else { return false };
+    let Some(kernel) = host.kernel.get() else {
+        return false;
+    };
     let mut bytes = false;
     loop {
         let arrived = shared.stack.arrived(data);
@@ -225,9 +259,9 @@ fn turn(mut shared: MutexGuard<'_, Shared>, kernel: Option<&Kernel>, data: &mut 
 /// Tell the driver, from a thread that is not the card's, what this turn
 /// of the stack made: the frames to send, mostly. The card's thread sends
 /// its own with its next turn.
-fn tell_driver(shared: &Lock, msgs: &mut [Msg; TURN]) {
+fn tell_driver(host: &Host, msgs: &mut [Msg; TURN]) {
     let (n, fifo) = {
-        let shared = locked(shared);
+        let shared = locked(&host.shared);
         (shared.stack.device().outgoing(msgs), shared.fifo.clone())
     };
     if n == 0 {
@@ -245,7 +279,7 @@ fn tell_driver(shared: &Lock, msgs: &mut [Msg; TURN]) {
         // What did not fit goes with the next turn, the card's or this
         // thread's: the driver answers what it has, and that wakes the
         // card's thread.
-        locked(shared).stack.device().put_back(&msgs[went..n]);
+        locked(&host.shared).stack.device().put_back(&msgs[went..n]);
     }
 }
 
@@ -276,12 +310,12 @@ const HOLD: u64 = 2_000_000;
 /// The driver is told only of what is worth waking it for
 /// ([`Port::due`]): a receive slot to give back waits for a frame to go
 /// with.
-fn serve(shared: &Lock, kernel: Option<&Kernel>, fifo: &Fifo<Msg>) -> Status {
+fn serve(host: &Arc<Host>, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
         let replies = {
-            let shared = locked(shared);
+            let shared = locked(&host.shared);
             let port = shared.stack.device();
             if port.due() {
                 port.outgoing(&mut msgs)
@@ -293,18 +327,18 @@ fn serve(shared: &Lock, kernel: Option<&Kernel>, fifo: &Fifo<Msg>) -> Status {
             Ok(got) => got,
             Err(e) => return e,
         };
-        let guard = locked(shared);
+        let guard = locked(&host.shared);
         for m in &msgs[..got] {
             if !guard.stack.device().take(m) {
                 println!("{NAME}: a message from the driver that means nothing: {m:?}");
             }
         }
         // Every frame that has room for its answer, in one go.
-        if !turn(guard, kernel, &mut data) {
+        if !turn(host, guard, &mut data) {
             continue;
         }
         let hold = {
-            let mut shared = locked(shared);
+            let mut shared = locked(&host.shared);
             let hold = shared.answering && shared.stack.device().has_frames();
             // Until a program sends again.
             shared.answering &= !hold;
@@ -332,7 +366,7 @@ const BURST: usize = 16;
 /// with nothing to reply), one for each that is already waiting behind it
 /// and one that finds no more, and then one to tell the driver of all the
 /// frames they made.
-fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
+fn serve_sockets(host: Arc<Host>, kernel: Arc<Kernel>) {
     let mut message = vec![0u8; MESSAGE_MAX];
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
@@ -347,7 +381,7 @@ fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
         };
         let (mut sends, mut answers) = (false, false);
         for done in 1.. {
-            match locked(&shared).stack.request(&message[..len]) {
+            match locked(&host.shared).stack.request(&message[..len]) {
                 Ok(send) => {
                     sends |= send;
                     // A program with something to say, which is what the
@@ -372,10 +406,10 @@ fn serve_sockets(shared: Lock, kernel: Arc<Kernel>) {
             }
         }
         if sends {
-            let mut guard = locked(&shared);
+            let mut guard = locked(&host.shared);
             guard.answering |= answers;
-            turn(guard, Some(&kernel), &mut data);
-            tell_driver(&shared, &mut msgs);
+            turn(&host, guard, &mut data);
+            tell_driver(&host, &mut msgs);
         }
     }
 }
@@ -388,23 +422,23 @@ const TICK_MIN: Duration = Duration::from_millis(1);
 
 /// When it is due, do what the stack has pending that no frame and no
 /// message will make it do.
-fn keep_time(shared: Lock, kernel: Option<Arc<Kernel>>) {
+fn keep_time(host: Arc<Host>) {
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
-        let idle = locked(&shared).stack.idle_for(now());
+        let idle = locked(&host.shared).stack.idle_for(now());
         let nap = idle.map_or(TICK_MAX, |d| Duration::from_micros(d.total_micros()));
         std::thread::sleep(nap.clamp(TICK_MIN, TICK_MAX));
         {
-            let guard = locked(&shared);
+            let guard = locked(&host.shared);
             // Another thread's turn may have done it meanwhile, or put it
             // off: an acknowledgement that arrived, say.
             if guard.stack.idle_for(now()) != Some(smoltcp::time::Duration::ZERO) {
                 continue;
             }
-            turn(guard, kernel.as_deref(), &mut data);
+            turn(&host, guard, &mut data);
         }
-        tell_driver(&shared, &mut msgs);
+        tell_driver(&host, &mut msgs);
     }
 }
 
@@ -442,64 +476,136 @@ fn register(max_datagram: usize, address: Ipv4Address) -> Result<Arc<Kernel>, St
     }
 }
 
+/// Give the kernel its sockets on this stack, whose address is `address`:
+/// once, since the kernel is told the address with them. A second address
+/// is the end of this process.
+fn serve_kernel(host: &Arc<Host>, address: Ipv4Address) {
+    let mut told = locked(&host.told);
+    match *told {
+        None => {}
+        Some(was) if was == address => return,
+        Some(was) => {
+            println!(
+                "{NAME}: the address is {address} now and the kernel's sockets were given {was}: starting over"
+            );
+            exit(3);
+        }
+    }
+    *told = Some(address);
+    let max_datagram = locked(&host.shared).stack.max_datagram();
+    match register(max_datagram, address) {
+        Ok(kernel) => {
+            let _ = host.kernel.set(kernel.clone());
+            let host = host.clone();
+            std::thread::spawn(move || serve_sockets(host, kernel));
+        }
+        Err(why) => println!("{NAME}: no sockets, only the address: {why}"),
+    }
+}
+
+/// `, with sockets` once the kernel has them here.
+fn with_sockets(host: &Host) -> &'static str {
+    if host.kernel.get().is_some() {
+        ", with sockets"
+    } else {
+        ""
+    }
+}
+
+/// `, gateway ADDR` when there is one.
+fn through(gateway: Option<Ipv4Address>) -> String {
+    gateway
+        .map(|gateway| format!(", gateway {gateway}"))
+        .unwrap_or_default()
+}
+
+/// The lease changed: the stack has made the interface what it says, and
+/// the rest is told here. A first lease is when the kernel gets its
+/// sockets.
+fn settle(host: &Arc<Host>, lease: Option<Lease>) {
+    let index = host.index;
+    match lease {
+        Some(lease) => {
+            serve_kernel(host, lease.address.address());
+            println!(
+                "{NAME}: card {index} is {} by its lease{}{}",
+                lease.address,
+                through(lease.gateway),
+                with_sockets(host)
+            );
+        }
+        None => println!("{NAME}: card {index} lost its lease: no address until it has another"),
+    }
+    publish(host);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let parsed = match &args[1..] {
-        [index, addr] => index
-            .parse::<usize>()
-            .ok()
-            .zip(addr.parse::<Ipv4Cidr>().ok()),
+        [index, how] => index.parse::<usize>().ok().zip(Addressing::parse(how)),
         _ => None,
     };
-    let Some((index, addr)) = parsed else {
+    let Some((index, how)) = parsed else {
         println!("{USAGE}");
         exit(2);
     };
 
     let (mut link, port) = start(index).unwrap_or_else(|e| die(e));
     let mac = link.mac;
+    // No address is what an interface that asks for one starts with.
+    let address = match how {
+        Addressing::Written(address, _) => address,
+        Addressing::Leased => Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+    };
     let iface = InterfaceBuilder::new(port)
         .ethernet_addr(EthernetAddress(mac))
         .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-        .ip_addrs(vec![IpCidr::Ipv4(addr)])
+        .ip_addrs(vec![IpCidr::Ipv4(address)])
+        .routes(Routes::new(BTreeMap::new()))
         .finalize();
-    let stack = Stack::new(iface);
-    let kernel: Option<Arc<Kernel>> = match register(stack.max_datagram(), addr.address()) {
-        Ok(kernel) => Some(kernel),
-        Err(why) => {
-            println!("{NAME}: no sockets, only the address: {why}");
-            None
+    let mut stack = Stack::new(iface);
+    match how {
+        Addressing::Written(_, gateway) => {
+            stack.set_gateway(gateway);
         }
-    };
-    let shared: Lock = Arc::new(Mutex::new(Shared {
-        stack,
-        fifo: link.fifo.clone(),
-        answering: false,
-    }));
-    println!(
-        "{NAME}: card {index} ({}) is {addr}{}",
-        EthernetAddress(mac),
-        if kernel.is_some() {
-            ", with sockets"
-        } else {
-            ""
+        Addressing::Leased => stack.ask_for_lease(),
+    }
+    let host = Arc::new(Host {
+        index,
+        mac,
+        shared: Mutex::new(Shared {
+            stack,
+            fifo: link.fifo.clone(),
+            answering: false,
+        }),
+        kernel: OnceLock::new(),
+        told: Mutex::new(None),
+        driver_pid: AtomicU32::new(link.driver.id()),
+        driver_starts: AtomicU32::new(1),
+    });
+    let card = format!("card {index} ({})", EthernetAddress(mac));
+    match how {
+        Addressing::Written(address, gateway) => {
+            serve_kernel(&host, address.address());
+            println!(
+                "{NAME}: {card} is {address}{}{}",
+                through(gateway),
+                with_sockets(&host)
+            );
         }
-    );
-    if let Some(kernel) = &kernel {
-        let (shared, kernel) = (shared.clone(), kernel.clone());
-        std::thread::spawn(move || serve_sockets(shared, kernel));
+        // The clock's thread finds the first question due at once.
+        Addressing::Leased => println!("{NAME}: {card} asks for its address"),
     }
     {
-        let (shared, kernel) = (shared.clone(), kernel.clone());
-        std::thread::spawn(move || keep_time(shared, kernel));
+        let host = host.clone();
+        std::thread::spawn(move || keep_time(host));
     }
 
     let mut pause = Duration::from_millis(100);
-    let mut driver_starts = 1;
     loop {
-        publish(index, addr, &link, driver_starts);
+        publish(&host);
         let since = std::time::Instant::now();
-        let why = serve(&shared, kernel.as_deref(), &link.fifo);
+        let why = serve(&host, &link.fifo);
         let status = link.driver.wait();
         println!(
             "{NAME}: the driver is gone ({why}{}); starting another",
@@ -530,29 +636,53 @@ fn main() {
         // nothing is left that points into that. Under the lock, so no
         // other thread is in the middle of a frame.
         {
-            let mut shared = locked(&shared);
+            let mut shared = locked(&host.shared);
             *shared.stack.device_mut() = port;
             shared.fifo = next.fifo.clone();
         }
         link = next;
-        driver_starts += 1;
+        host.driver_pid.store(link.driver.id(), Ordering::Relaxed);
+        host.driver_starts.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Say what this stack is (see `udrivers::status`): the card, its
-/// address, the driver it runs now and how many it has started, which
-/// eclipse-init never sees. lunarmon's SERVIDORES list reads it.
-fn publish(index: usize, addr: Ipv4Cidr, link: &Link, driver_starts: u32) {
-    let device = format!("virtio-net@{index}");
+/// Say what this stack is (see `udrivers::status`): the card, its address
+/// and where that came from, the gateway and the lease's name servers, the
+/// driver it runs now and how many it has started, which eclipse-init
+/// never sees. lunarmon's SERVIDORES list reads it.
+fn publish(host: &Host) {
+    let (address, gateway, dns, leases) = {
+        let shared = locked(&host.shared);
+        let stack = &shared.stack;
+        let dns = stack.lease().map(|lease| lease.dns.clone());
+        (
+            stack.address(),
+            stack.gateway(),
+            dns.unwrap_or_default(),
+            stack.leases(),
+        )
+    };
+    let device = format!("virtio-net@{}", host.index);
+    let or_none = |text: Option<String>| text.unwrap_or_else(|| "none".into());
+    let dns: Vec<String> = dns.iter().map(|server| server.to_string()).collect();
     status::publish(
         &format!("stack.{device}"),
         &[
             ("program", NAME),
             ("device", &device),
-            ("mac", &status::mac_text(link.mac)),
-            ("addr", &addr.to_string()),
-            ("driver_pid", &link.driver.id().to_string()),
-            ("driver_starts", &driver_starts.to_string()),
+            ("mac", &status::mac_text(host.mac)),
+            ("addr", &or_none(address.map(|a| a.to_string()))),
+            ("addr_from", if leases { "dhcp" } else { "command line" }),
+            ("gateway", &or_none(gateway.map(|g| g.to_string()))),
+            ("dns", &or_none((!dns.is_empty()).then(|| dns.join(",")))),
+            (
+                "driver_pid",
+                &host.driver_pid.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "driver_starts",
+                &host.driver_starts.load(Ordering::Relaxed).to_string(),
+            ),
         ],
     );
 }

@@ -46,6 +46,8 @@ smoltcp = { path = "../../smoltcp", default-features = false, features = [
     "socket-icmp",
     "socket-udp",
     "socket-tcp",
+    # The client that asks for the card's address (`socks::lease`).
+    "socket-dhcpv4",
 ] }
 
 [profile.release]

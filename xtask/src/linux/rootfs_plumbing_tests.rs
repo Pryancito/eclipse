@@ -1071,6 +1071,17 @@ fn the_cards_wrapper_runs_the_stack_only_on_a_boot_that_names_its_address() {
     ] {
         assert_eq!(run(cmdline), "stack 0 10.0.9.15/24\n", "{cmdline}");
     }
+    // The word goes to the stack as it is written, which is where a gateway
+    // after a comma or `dhcp` is understood.
+    for (cmdline, word) in [
+        (
+            "LOG=warn:udriver=virtio-net@0:unetstack=10.0.9.15/24,10.0.9.2:ROOT=/dev/vda\n",
+            "10.0.9.15/24,10.0.9.2",
+        ),
+        ("LOG=warn udriver=virtio-net@0 unetstack=dhcp\n", "dhcp"),
+    ] {
+        assert_eq!(run(cmdline), format!("stack 0 {word}\n"), "{cmdline}");
+    }
     // No such word, a word with no value, and a word that only ends like
     // it: the card is the kernel's, as on every boot before this.
     for cmdline in [

@@ -224,8 +224,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if port == 0 || local == 0 {
             return Err(Refused::Malformed);
         }
-        // There are no routes yet, and nobody to connect to at everybody's
-        // address.
+        // Nowhere to send it (no gateway for what is off the card's
+        // network), and nobody to connect to at everybody's address.
         if addr.is_broadcast() || !self.reaches(addr) {
             self.streams.owed.push((sock, EV_FAILED, WHY_UNREACHABLE));
             return Ok(true);

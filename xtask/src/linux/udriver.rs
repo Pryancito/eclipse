@@ -89,7 +89,8 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # unetstack=ADDR/PREFIX on the kernel command line: the card does\n\
           # not go to the kernel. The network stack that runs as a process\n\
           # takes it, with that address, and runs the driver itself. See\n\
-          # tools/eclipse-netstack.\n\
+          # tools/eclipse-netstack. unetstack=ADDR/PREFIX,GATEWAY gives it a\n\
+          # gateway too, and unetstack=dhcp has it ask a server for both.\n\
           stack=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^unetstack=//p' | head -n 1)\n\
           if [ -n \"$stack\" ]; then\n\
           \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\

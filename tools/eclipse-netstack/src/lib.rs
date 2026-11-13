@@ -17,8 +17,10 @@
 //! asks this process, over a channel, to send its datagrams and make its
 //! connections, and is told of what arrives (`eclipse_netstack_serve`).
 //! Which programs: the ones started by `eclipse-netstack-use`; every other
-//! socket is the kernel's stack's. IPv4 only, no routes beyond the card's
-//! network, no loopback, and no fragments.
+//! socket is the kernel's stack's. The address is written on the command
+//! line or leased from a DHCP server, and one gateway carries what is not
+//! for the card's network ([`socks::lease`]). IPv4 only, no loopback, and
+//! no fragments.
 //!
 //! [`port`] is the stack's side of a served card and [`socks`] the sockets
 //! over it: all of this that can be tested without a card or a kernel.
