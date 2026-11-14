@@ -7,6 +7,9 @@
 //! writes echoes only, which leave with the socket's identifier in place
 //! of the program's, and reads the answers to them, without the header.
 //!
+//! The same two of `AF_INET6` speak ICMPv6, and what is different about
+//! them is in [`super::icmp6`].
+//!
 //! Not here: `IP_HDRINCL` (the header is the stack's to write), a raw
 //! socket bound to one address hearing only what is for it, and what
 //! Linux queues for a socket that pings when an echo comes back as an
@@ -92,7 +95,7 @@ pub(super) fn connect_error(bytes: &[u8]) -> Option<LxError> {
 
 /// The Internet checksum of `bytes`: 0 for what carries its own and has
 /// it right.
-fn checksum(bytes: &[u8]) -> u16 {
+pub(super) fn checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     let (pairs, odd) = bytes.as_chunks::<2>();
     for pair in pairs {
@@ -168,21 +171,34 @@ impl StackLink {
     }
 }
 
-/// A socket that speaks ICMP, whose stack is a process.
+/// A socket that speaks ICMP, or ICMPv6, whose stack is a process.
 pub struct ServedIcmpSocket {
     base: KObjectBase,
-    link: Arc<StackLink>,
-    sock: u64,
-    shared: Arc<Shared>,
+    pub(super) link: Arc<StackLink>,
+    pub(super) sock: u64,
+    /// `shared.v6` for a socket of ICMPv6.
+    pub(super) shared: Arc<Shared>,
     /// The options a program sets and asks for again. `IP_TTL` is the
     /// one that changes what leaves.
     opts: Mutex<StoredInetOpts>,
+    /// And the ones of a socket of ICMPv6.
+    pub(super) six: Mutex<icmp6::Opts>,
 }
 
 impl ServedIcmpSocket {
-    /// A socket of `link`: the raw one when `raw`, else the one that pings.
+    /// A socket of `link` that speaks ICMP: the raw one when `raw`, else
+    /// the one that pings.
     pub fn new(link: Arc<StackLink>, raw: bool) -> LxResult<Self> {
-        let shared = Shared::new(if raw { Hears::Icmp } else { Hears::Echoes }, false);
+        Self::open(link, raw, false)
+    }
+
+    /// The same, that speaks ICMPv6.
+    pub fn new6(link: Arc<StackLink>, raw: bool) -> LxResult<Self> {
+        Self::open(link, raw, true)
+    }
+
+    fn open(link: Arc<StackLink>, raw: bool, six: bool) -> LxResult<Self> {
+        let shared = Shared::new(if raw { Hears::Icmp } else { Hears::Echoes }, six);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;
@@ -190,23 +206,28 @@ impl ServedIcmpSocket {
             table.socks.insert(sock, Arc::downgrade(&shared));
             sock
         };
-        link.hear(sock);
+        link.hear(sock, six);
         Ok(ServedIcmpSocket {
             base: KObjectBase::new(),
             link,
             sock,
             shared,
             opts: Mutex::new(StoredInetOpts::default()),
+            six: Mutex::new(icmp6::Opts::default()),
         })
     }
 
-    fn is_raw(&self) -> bool {
+    pub(super) fn is_raw(&self) -> bool {
         self.shared.hears == Hears::Icmp
+    }
+
+    fn is_six(&self) -> bool {
+        self.shared.v6
     }
 
     /// The identifier of a socket that pings, giving it any when it has
     /// none: what a send or a connect on an unbound socket does.
-    fn autobind(&self) -> LxResult<u16> {
+    pub(super) fn autobind(&self) -> LxResult<u16> {
         if let Some(ident) = self.shared.inner.lock().port {
             return Ok(ident);
         }
@@ -243,14 +264,17 @@ impl Drop for ServedIcmpSocket {
 #[async_trait]
 impl Socket for ServedIcmpSocket {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(false, data, true).await
+        self.shared.receive(self.is_six(), data, true).await
     }
 
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(false, data, false).await
+        self.shared.receive(self.is_six(), data, false).await
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
+        if self.is_six() {
+            return self.write6(data, sendto_endpoint);
+        }
         let to = match sendto_endpoint {
             Some(Endpoint::Ip(to)) => to,
             Some(_) => return Err(LxError::EAFNOSUPPORT),
@@ -305,6 +329,9 @@ impl Socket for ServedIcmpSocket {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
+        if self.is_six() {
+            return self.connect6(endpoint);
+        }
         let Endpoint::Ip(peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
@@ -318,6 +345,9 @@ impl Socket for ServedIcmpSocket {
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
+        if self.is_six() {
+            return self.bind6(endpoint);
+        }
         let Endpoint::Ip(local) = endpoint else {
             return Err(LxError::EINVAL);
         };
@@ -352,7 +382,7 @@ impl Socket for ServedIcmpSocket {
     fn endpoint(&self) -> Option<Endpoint> {
         let ident = self.shared.inner.lock().port.unwrap_or(0);
         let local = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), ident);
-        Some(Endpoint::Ip(local))
+        Some(Endpoint::Ip(shown(self.is_six(), local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -364,15 +394,20 @@ impl Socket for ServedIcmpSocket {
     }
 
     fn is_raw_ipv4(&self) -> bool {
-        self.is_raw()
+        self.is_raw() && !self.is_six()
     }
 
     fn so_domain(&self) -> Option<u32> {
-        Some(Domain::AF_INET as u32)
+        Some(if self.is_six() {
+            Domain::AF_INET6
+        } else {
+            Domain::AF_INET
+        } as u32)
     }
 
     fn so_protocol(&self) -> Option<u32> {
-        Some(1) // IPPROTO_ICMP
+        // IPPROTO_ICMPV6, IPPROTO_ICMP
+        Some(if self.is_six() { 58 } else { 1 })
     }
 
     fn socket_type(&self) -> Option<SocketType> {
@@ -387,9 +422,22 @@ impl Socket for ServedIcmpSocket {
         core::mem::take(&mut self.shared.inner.lock().last_msg_flags)
     }
 
+    fn recv_cmsgs(&self) -> Vec<(i32, i32, i32)> {
+        if self.is_six() {
+            self.recv_cmsgs6()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const IPPROTO_IP: usize = 0;
         const IP_HDRINCL: usize = 3;
+        if self.is_six() {
+            if let Some(done) = self.setsockopt6(level, opt, data) {
+                return done;
+            }
+        }
         if level == IPPROTO_IP && opt == IP_HDRINCL {
             // Not an option of a socket that pings. A raw one may say it
             // leaves the header to who sends for it, which is how it is;
@@ -563,7 +611,7 @@ impl FileLike for ServedIcmpSocket {
     /// `FIONREAD`: the size of what is read next, 0 when there is nothing.
     fn readable_bytes(&self) -> Option<usize> {
         let inner = self.shared.inner.lock();
-        Some(inner.queue.front().map_or(0, |(_, d)| d.len()))
+        Some(inner.queue.front().map_or(0, |(_, d, _)| d.len()))
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

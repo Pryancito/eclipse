@@ -32,7 +32,9 @@
 //!
 //! A datagram socket's datagrams travel as IPv6 when the kernel says so
 //! (`SEND6`, `DATA6`, in [`super`]), and so does a connection
-//! (`CONNECT6`, `LISTEN6`, `ACCEPTED6`, in [`super::tcp`]).
+//! (`CONNECT6`, `LISTEN6`, `ACCEPTED6`, in [`super::tcp`]). What a
+//! socket of ICMPv6 hears is read off the same socket as the
+//! advertisements ([`super::icmp6`]).
 
 use managed::ManagedSlice;
 use smoltcp::phy::{ChecksumCapabilities, Device};
@@ -67,9 +69,10 @@ const FOREVER: u32 = u32::MAX;
 /// The bits of a prefix an address is made from, and of its network.
 const PREFIX_BITS: u8 = 64;
 
-/// The messages that arrive for the stack to read and the ones it has to
-/// send: advertisements are rare and solicitations rarer.
-const HEARD: usize = 8;
+/// The messages that arrive in one turn, for the stack to read and for
+/// the sockets that hear ICMPv6, and the ones the stack has to send:
+/// solicitations are rare.
+const HEARD: usize = 64;
 const TO_SAY: usize = 2;
 
 /// ICMPv6: a router advertisement, and where its options start.
@@ -356,7 +359,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         };
         loop {
             let said = match self.set.get::<RawSocket>(ear).recv() {
-                Ok(packet) => advert(packet),
+                Ok(packet) => {
+                    // All of it is the kernel's to hear, while a socket
+                    // of ICMPv6 does.
+                    self.hearing6.keep(packet);
+                    advert(packet)
+                }
                 Err(_) => break,
             };
             if let Some(said) = said {
@@ -460,11 +468,13 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 mod tests {
     use super::*;
     use crate::port::testing::*;
+    use crate::socks::icmp6::{OP_HEAR6, OP_ICMP6};
     use crate::socks::tcp::WHY_UNREACHABLE;
     use crate::socks::tcp::{ACCEPTED_BIT, EV_ACCEPTED6, EV_BYTES, EV_CONNECTED, EV_FAILED};
     use crate::socks::tcp::{OP_CONNECT6, OP_EVENTS, OP_LISTEN, OP_LISTEN6, OP_WRITE};
     use crate::socks::tests::{bind, message, records};
     use crate::socks::{parse_header, Arrived, Refused};
+    use crate::socks::{HEARD as HEARD_SOCK, OP_CLOSE, OP_HEAR};
     use crate::socks::{OP_DATA6, OP_SEND6, RECORD6_LEN, RECORD_LEN};
     use smoltcp::wire::{EthernetFrame, EthernetProtocol, EthernetRepr, NdiscNeighborFlags};
     use smoltcp::wire::{TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
@@ -1474,5 +1484,260 @@ mod tests {
             ((OURS_GIVEN, 8081), (near, 40001), TcpControl::Rst)
         );
         assert_eq!(events(&mut stack), []);
+    }
+
+    /// An `ICMP6` as the kernel writes it.
+    fn icmp6(sock: u64, to: Ipv6Address, hops: u8, icmp: &[u8]) -> Vec<u8> {
+        let mut rest = to.0.to_vec();
+        rest.extend_from_slice(&[hops, 0, 0, 0]);
+        rest.extend_from_slice(icmp);
+        message(OP_ICMP6, sock, &rest)
+    }
+
+    /// An echo, or its answer, with this identifier and sequence 1, as a
+    /// program writes it: the sum is not its to write.
+    fn echo6(kind: u8, ident: u16, data: &[u8]) -> Vec<u8> {
+        let mut m = vec![kind, 0, 0xde, 0xad];
+        m.extend_from_slice(&ident.to_be_bytes());
+        m.extend_from_slice(&[0, 1]);
+        m.extend_from_slice(data);
+        m
+    }
+
+    const ECHO: u8 = 128;
+    const ECHO_REPLY: u8 = 129;
+
+    #[test]
+    fn the_messages_of_icmpv6_are_laid_out_as_the_kernel_lays_them_out() {
+        assert_eq!((OP_ICMP6, OP_HEAR6), (21, 22));
+        let to = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let m = icmp6(0x0102, to, 9, &[128, 0, 0, 0]);
+        let mut said = vec![0, 0, 0, 0, 21, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0];
+        said.extend_from_slice(&[0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99]);
+        said.extend_from_slice(&[9, 0, 0, 0, 128, 0, 0, 0]);
+        assert_eq!(m, said);
+    }
+
+    #[test]
+    fn an_icmpv6_message_leaves_behind_a_header_of_ours_with_its_sum_written() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        assert_eq!(stack.request(&message(OP_HEAR6, 9, &[])), Ok(false));
+        assert_eq!(stack.hearing6(), 1);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let ping = echo6(ECHO, 0x4242, b"anybody?");
+        let mut ms = 1000;
+        // As a datagram: from the address that goes there, the neighbour
+        // asked for first. The message is the program's but for the sum,
+        // which is the stack's to write (`six_of` checks it).
+        for (to, through, from, hops) in [
+            (near, near, OURS_GIVEN, 64),
+            (link, link, OURS_LINK, 3),
+            (far, ROUTER, OURS_GIVEN, 200),
+        ] {
+            assert_eq!(stack.request(&icmp6(9, to, hops, &ping)), Ok(true));
+            let sent = frames(&mut stack, &window, ms);
+            assert_eq!(sent.len(), 1);
+            let ask = six_of(&sent[0]);
+            assert_eq!((ask.from, ask.to), (from, through.solicited_node()));
+            window.deliver(stack.device(), 0, &here_is(through, from));
+            let sent = frames(&mut stack, &window, ms + 10);
+            assert_eq!(sent.len(), 1);
+            let sent = six_of(&sent[0]);
+            assert_eq!((sent.to_card, sent.from, sent.to), (THEIRS, from, to));
+            assert_eq!(sent.hops, hops);
+            assert_eq!(sent.message[..2], ping[..2]);
+            assert_ne!(sent.message[2..4], ping[2..4]);
+            assert_eq!(sent.message[4..], ping[4..]);
+            ms += 1000;
+        }
+        // To everybody on the link, from the link's address, with nobody
+        // to ask for; and whatever its type.
+        let all = Ipv6Address::LINK_LOCAL_ALL_NODES;
+        let odd = [200u8, 7, 0, 0, 1, 2, 3, 4];
+        assert_eq!(stack.request(&icmp6(9, all, 1, &odd)), Ok(true));
+        let sent = frames(&mut stack, &window, ms);
+        assert_eq!(sent.len(), 1);
+        let sent = six_of(&sent[0]);
+        assert_eq!(
+            (sent.to_card, sent.from, sent.to, sent.hops),
+            (group_card(all), OURS_LINK, all, 1)
+        );
+        assert_eq!(sent.message[..2], odd[..2]);
+        assert_eq!(sent.message[4..], odd[4..]);
+
+        // What cannot be done is refused, and nothing leaves.
+        let longest = stack.max_datagram6() + 8;
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+        assert_eq!(stack.request(&message(OP_HEAR, 5, &[])), Ok(false));
+        let short = &icmp6(9, near, 64, &ping)[..39];
+        for (m, why) in [
+            (icmp6(8, near, 64, &ping), Refused::NoSocket),
+            // A datagram socket has no ICMPv6 to send, nor one that hears
+            // as IPv4.
+            (icmp6(7, near, 64, &ping), Refused::NoSocket),
+            (icmp6(5, near, 64, &ping), Refused::NoSocket),
+            (icmp6(9, near, 0, &ping), Refused::Malformed),
+            (short.to_vec(), Refused::Malformed),
+            (
+                icmp6(9, Ipv6Address::UNSPECIFIED, 64, &ping),
+                Refused::Unreachable,
+            ),
+            (
+                icmp6(9, Ipv6Address::LOOPBACK, 64, &ping),
+                Refused::Unreachable,
+            ),
+            (icmp6(9, near, 64, &vec![0; longest + 1]), Refused::TooLong),
+            // A socket's number is one socket's.
+            (message(OP_HEAR6, 9, &[]), Refused::Bind),
+            (message(OP_HEAR6, 7, &[]), Refused::Bind),
+            (message(OP_HEAR6, 5, &[]), Refused::Bind),
+            (message(OP_HEAR6, 0, &[]), Refused::Bind),
+            (message(OP_HEAR, 9, &[]), Refused::Bind),
+        ] {
+            assert_eq!(stack.request(&m), Err(why));
+        }
+        assert!(frames(&mut stack, &window, ms + 100).is_empty());
+        // The longest fills a frame.
+        assert_eq!(
+            stack.request(&icmp6(9, near, 64, &vec![0; longest])),
+            Ok(true)
+        );
+        let sent = frames(&mut stack, &window, ms + 200);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), 14 + 1500);
+
+        // Without a router only the link is reached, and without IPv6
+        // nothing.
+        let Bench { window, iface, .. } = Bench::new();
+        let mut alone = Stack::new(iface);
+        alone.speak_six();
+        frames(&mut alone, &window, 0);
+        assert_eq!(alone.request(&message(OP_HEAR6, 9, &[])), Ok(false));
+        assert_eq!(
+            alone.request(&icmp6(9, far, 64, &ping)),
+            Err(Refused::Unreachable)
+        );
+        assert_eq!(alone.request(&icmp6(9, link, 64, &ping)), Ok(true));
+        assert_eq!(frames(&mut alone, &window, 100).len(), 1);
+        let Bench { iface, .. } = Bench::new();
+        let mut quiet = Stack::new(iface);
+        assert_eq!(quiet.request(&message(OP_HEAR6, 9, &[])), Ok(false));
+        assert_eq!(
+            quiet.request(&icmp6(9, link, 64, &ping)),
+            Err(Refused::Unreachable)
+        );
+    }
+
+    /// The IPv6 packet a frame carries.
+    fn packet_of(frame: &[u8]) -> Vec<u8> {
+        frame[14..].to_vec()
+    }
+
+    #[test]
+    fn while_a_socket_hears_every_packet_of_icmpv6_goes_to_the_kernel_whole() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let pong = |data: &[u8]| six_frame(near, OURS_GIVEN, 57, &echo6(ECHO_REPLY, 7, data));
+        let mut m = Vec::new();
+        // Nobody hears: the answer to an echo nobody sent is dropped.
+        window.deliver(stack.device(), 0, &pong(b"early"));
+        stack.poll(Instant::from_millis(200));
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        assert_eq!(stack.request(&message(OP_HEAR6, 5, &[])), Ok(false));
+        assert_eq!(stack.request(&message(OP_HEAR6, 6, &[])), Ok(false));
+        assert_eq!(stack.hearing6(), 2);
+        // Once, for whichever sockets: socket 0, from who sent it, no
+        // port, and the packet as it came, with the hops it had left.
+        let frame = pong(b"pong");
+        window.deliver(stack.device(), 0, &frame);
+        stack.poll(Instant::from_millis(300));
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(records6(&m), [(HEARD_SOCK, near, 0, packet_of(&frame))]);
+        assert_eq!(packet_of(&frame)[7], 57);
+        assert!(stack.brought_bytes());
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        // One with its sum wrong is nobody's.
+        let mut wrong = pong(b"wrong");
+        let last = wrong.len() - 1;
+        wrong[last] ^= 1;
+        window.deliver(stack.device(), 0, &wrong);
+        stack.poll(Instant::from_millis(400));
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        // What a router says is heard too, and read here all the same;
+        // and an echo for us is heard and answered here.
+        let advert = advert_message(0, &[]);
+        let advert = six_frame(ROUTER, ALL_NODES, ON_LINK, &advert);
+        let ping = six_frame(near, OURS_GIVEN, 64, &echo6(ECHO, 9, b"you?"));
+        window.deliver(stack.device(), 0, &advert);
+        window.deliver(stack.device(), 1, &ping);
+        let sent = frames(&mut stack, &window, 500);
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(
+            records6(&m),
+            [
+                (HEARD_SOCK, ROUTER, 0, packet_of(&advert)),
+                (HEARD_SOCK, near, 0, packet_of(&ping)),
+            ]
+        );
+        assert_eq!(stack.sixes().router, None);
+        // The neighbour is asked for, and what it says is heard like
+        // the rest; its next echo is answered.
+        // (The router said it is none, so another is asked for: 133.)
+        let kinds = |sent: &[Vec<u8>]| -> Vec<u8> {
+            let kinds = sent.iter().map(|frame| six_of(frame).message[0]);
+            kinds.filter(|kind| *kind != 133).collect()
+        };
+        assert_eq!(kinds(&sent), [135]);
+        let found = here_is(near, OURS_GIVEN);
+        window.deliver(stack.device(), 0, &found);
+        window.deliver(stack.device(), 1, &ping);
+        let sent = frames(&mut stack, &window, 510);
+        assert_eq!(kinds(&sent), [ECHO_REPLY]);
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(
+            records6(&m),
+            [
+                (HEARD_SOCK, near, 0, packet_of(&found)),
+                (HEARD_SOCK, near, 0, packet_of(&ping)),
+            ]
+        );
+
+        // With what is heard of IPv4 in the same turn, each in a message
+        // of its kind.
+        assert_eq!(stack.request(&message(OP_HEAR, 4, &[])), Ok(false));
+        let frame = pong(b"six");
+        window.deliver(stack.device(), 0, &echo_reply(7, 1, b"four"));
+        window.deliver(stack.device(), 1, &frame);
+        stack.poll(Instant::from_millis(600));
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records(&m).len(), 1);
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(records6(&m), [(HEARD_SOCK, near, 0, packet_of(&frame))]);
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        // With the last socket that hears, the kernel hears no more, and
+        // what it was not told yet is nobody's.
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        window.deliver(stack.device(), 0, &pong(b"for the other"));
+        stack.poll(Instant::from_millis(700));
+        assert_eq!(stack.request(&message(OP_CLOSE, 6, &[])), Ok(false));
+        assert_eq!(stack.hearing6(), 0);
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+        window.deliver(stack.device(), 0, &pong(b"late"));
+        stack.poll(Instant::from_millis(800));
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+        // The number is free.
+        assert_eq!(stack.request(&message(OP_HEAR6, 5, &[])), Ok(false));
     }
 }

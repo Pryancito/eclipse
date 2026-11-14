@@ -383,13 +383,40 @@ fn build_scm_rights_cmsg(cmsg: CmsgLayout, fds: &[i32]) -> Vec<u8> {
 /// instead would make a lone message look longer than it is and a reader
 /// walking two of them land past the second.
 fn build_cmsg(cmsg: CmsgLayout, typ: i32, payload: &[u8]) -> Vec<u8> {
+    build_cmsg_at(cmsg, SOL_SOCKET_LEVEL, typ, payload)
+}
+
+/// Build one control message of `level` around `payload`, as
+/// [`build_cmsg`] builds one of the socket's own.
+fn build_cmsg_at(cmsg: CmsgLayout, level: i32, typ: i32, payload: &[u8]) -> Vec<u8> {
     let cmsg_len = cmsg.hdr_len + payload.len();
     let mut buf = Vec::with_capacity(cmsg.align_up(cmsg_len));
     cmsg.push_len(&mut buf, cmsg_len);
-    buf.extend_from_slice(&SOL_SOCKET_LEVEL.to_ne_bytes());
+    buf.extend_from_slice(&level.to_ne_bytes());
     buf.extend_from_slice(&typ.to_ne_bytes());
     buf.extend_from_slice(payload);
     buf
+}
+
+/// `said` after what `buf` holds of control messages, each an `int` of
+/// its level and type: as many of them as `room` bytes hold whole, in
+/// their order. `false` when one was left out.
+fn push_int_cmsgs(
+    cmsg: CmsgLayout,
+    buf: &mut Vec<u8>,
+    said: &[(i32, i32, i32)],
+    room: usize,
+) -> bool {
+    for &(level, typ, value) in said {
+        let at = cmsg.align_up(buf.len());
+        let one = build_cmsg_at(cmsg, level, typ, &value.to_ne_bytes());
+        if at + one.len() > room {
+            return false;
+        }
+        buf.resize(at, 0);
+        buf.extend(one);
+    }
+    true
 }
 
 /// The control buffer `recvmsg` hands back: the descriptors the peer attached,
@@ -504,6 +531,17 @@ impl Syscall<'_> {
                 let link = user_stack::machine();
                 let raw = matches!(socket_type, SocketType::SOCK_RAW);
                 Arc::new(user_stack::ServedIcmpSocket::new(link, raw)?)
+            }
+            // And the same two of ICMPv6, what `ping -6` opens.
+            (
+                Domain::AF_INET6,
+                SocketType::SOCK_DGRAM | SocketType::SOCK_RAW,
+                Some(Protocol::IPPROTO_ICMPV6),
+            ) if self.linux_process().uses_user_netstack() => {
+                use linux_object::net::user_stack;
+                let link = user_stack::machine();
+                let raw = matches!(socket_type, SocketType::SOCK_RAW);
+                Arc::new(user_stack::ServedIcmpSocket::new6(link, raw)?)
             }
             // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
             (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
@@ -1331,8 +1369,15 @@ impl Syscall<'_> {
                         installed.push(proc.add_file_cloexec(fl, cloexec)?.into());
                     }
                 }
-                let cbuf = build_recv_cmsgs(cmsg, &installed, creds.as_ref());
+                let mut cbuf = build_recv_cmsgs(cmsg, &installed, creds.as_ref());
                 if cbuf.len() <= hdr.msg_controllen {
+                    // What the socket itself says of what was read (how
+                    // many hops an ICMPv6 message had left), after those:
+                    // what does not fit whole is left out and said so.
+                    let said = socket.recv_cmsgs();
+                    if !push_int_cmsgs(cmsg, &mut cbuf, &said, hdr.msg_controllen) {
+                        ctrunc = true;
+                    }
                     ctrl_written = cbuf.len();
                     if ctrl_written > 0 {
                         hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
@@ -1948,6 +1993,45 @@ mod scm_rights_tests {
         // The padding the alignment introduced is zero, not whatever the
         // kernel stack held.
         assert_eq!(&buf[20..24], &[0, 0, 0, 0]);
+    }
+
+    /// What a socket says of what was read (the hops an ICMPv6 message had
+    /// left) goes after the socket level's messages, each on the alignment
+    /// a reader steps by, and one that does not fit whole is left out.
+    #[test]
+    fn what_the_socket_says_follows_on_the_alignment_or_is_left_out() {
+        const HOPS: [(i32, i32, i32); 2] = [(41, 52, 57), (41, 8, 57)];
+        let one = CMSG_HDR_LEN + 4;
+        // Alone: two messages of 20 bytes, the second at 24.
+        let mut buf = Vec::new();
+        assert!(push_int_cmsgs(NATIVE, &mut buf, &HOPS, 256));
+        let mut said = cmsg(41, 52, &57i32.to_ne_bytes());
+        said.extend_from_slice(&cmsg(41, 8, &57i32.to_ne_bytes())[..one]);
+        assert_eq!(buf, said);
+        assert_eq!(
+            u64::from_ne_bytes(buf[0..8].try_into().unwrap()) as usize,
+            one
+        );
+        // Room for one and not quite two: the first whole, and no more.
+        let mut buf = Vec::new();
+        assert!(!push_int_cmsgs(NATIVE, &mut buf, &HOPS, 24 + one - 1));
+        assert_eq!(buf, said[..one]);
+        let mut buf = Vec::new();
+        assert!(push_int_cmsgs(NATIVE, &mut buf, &HOPS, 24 + one));
+        assert_eq!(buf, said);
+        // After the credentials, past their padding.
+        let creds = ucred_of(7);
+        let mut buf = build_recv_cmsgs(NATIVE, &[], Some(&creds));
+        let before = buf.clone();
+        assert_eq!(before.len(), CMSG_HDR_LEN + 12);
+        assert!(push_int_cmsgs(NATIVE, &mut buf, &HOPS[..1], 256));
+        assert_eq!(buf[..before.len()], before[..]);
+        assert_eq!(buf[before.len()..32], [0, 0, 0, 0]);
+        assert_eq!(buf[32..], said[..one]);
+        // Nothing to say changes nothing.
+        let mut buf = before.clone();
+        assert!(push_int_cmsgs(NATIVE, &mut buf, &[], 0));
+        assert_eq!(buf, before);
     }
 
     #[test]

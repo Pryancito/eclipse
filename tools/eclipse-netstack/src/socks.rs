@@ -52,6 +52,9 @@
 //! hears, behind an IPv4 header written here. The stack answers the
 //! echoes that arrive, heard or not.
 //!
+//! A socket that speaks ICMPv6 is told of the same way (`HEAR6`,
+//! `ICMP6`, in [`icmp6`]), and what it hears is a record of a `DATA6`.
+//!
 //! Heard or not, too, the stack reads the ICMP messages that say that
 //! something it sent was not delivered, and tells the kernel whose it
 //! was ([`undelivered`]).
@@ -84,11 +87,13 @@ use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion};
 use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address};
 
 pub mod groups;
+pub mod icmp6;
 pub mod lease;
 pub mod six;
 pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
+use icmp6::{OP_HEAR6, OP_ICMP6};
 use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, EV_UNDELIVERED};
 
@@ -102,8 +107,9 @@ pub const OP_ICMP: u32 = 12;
 pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
 
-/// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
-/// whichever sockets hear.
+/// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
+/// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
+/// hear.
 pub const HEARD: u64 = 0;
 
 /// What every message starts with.
@@ -265,6 +271,8 @@ pub struct Stack<D: for<'d> Device<'d>> {
     gateway: Option<Ipv4Address>,
     lease: lease::Leasing,
     six: six::Six,
+    /// The sockets that hear ICMPv6.
+    hearing6: icmp6::Hearing6,
     /// The groups the machine is a member of, as the kernel said.
     groups: BTreeSet<Ipv4Address>,
 }
@@ -286,6 +294,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             gateway: None,
             lease: lease::Leasing::default(),
             six: six::Six::default(),
+            hearing6: icmp6::Hearing6::default(),
             groups: BTreeSet::new(),
         }
     }
@@ -325,6 +334,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     fn knows(&self, sock: u64) -> bool {
         self.socks.contains_key(&sock)
             || self.hearing.contains_key(&sock)
+            || self.hearing6.knows(sock)
             || self.streams.knows(sock)
     }
 
@@ -457,9 +467,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
             OP_WINDOW => self.window(sock, m),
             OP_HEAR if m.len() == HEADER_LEN => self.hear(sock),
+            OP_HEAR6 if m.len() == HEADER_LEN => self.hear6(sock),
             OP_JOIN => self.member(m, true),
             OP_LEAVE => self.member(m, false),
             OP_ICMP => self.icmp(sock, m),
+            OP_ICMP6 => self.icmp6(sock, m),
             OP_BIND => {
                 let port: [u8; 2] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
                 let port = u16::from_le_bytes(port);
@@ -535,7 +547,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                     self.set.remove(handle);
                     return Ok(false);
                 }
-                if self.deaf(sock) {
+                if self.deaf(sock) || self.deaf6(sock) {
                     return Ok(false);
                 }
                 Ok(self.close_stream(sock).unwrap_or(false))
@@ -635,7 +647,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             }
         }
         if six {
-            // What is heard of ICMP is told in a `DATA`: the next.
+            // What is heard of ICMP is told in a message of its own: the
+            // next.
             return Arrived::More;
         }
         // What the ear heard: all of it for the sockets that hear, when
@@ -687,10 +700,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 self.undelivered(&said);
             }
         }
-        if m.len() > HEADER_LEN {
-            Arrived::All
+        if m.len() == HEADER_LEN {
+            // And what was heard of ICMPv6, in a `DATA6`.
+            return self.heard6(m);
+        }
+        if self.hearing6.waits() {
+            Arrived::More
         } else {
-            Arrived::Nothing
+            Arrived::All
         }
     }
 

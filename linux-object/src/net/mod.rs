@@ -2590,6 +2590,13 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn take_msg_flags(&self) -> i32 {
         0
     }
+    /// What the last read has to say beside its bytes, to a `recvmsg`
+    /// with room for control messages: the level, the type and the `int`
+    /// of each (the hops an ICMPv6 message had left, for a socket that
+    /// was asked to say).
+    fn recv_cmsgs(&self) -> alloc::vec::Vec<(i32, i32, i32)> {
+        alloc::vec::Vec::new()
+    }
 }
 
 /// Stored `SOL_SOCKET` / `IPPROTO_IP` knobs for inet sockets that used to
