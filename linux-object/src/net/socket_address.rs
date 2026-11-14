@@ -191,7 +191,13 @@ impl From<Endpoint> for SockAddr {
                         sin6_port: u16::to_be(ip.port),
                         sin6_flowinfo: 0,
                         sin6_addr: ipv6.0,
-                        sin6_scope_id: 0,
+                        // Which link an address of a link is of, as
+                        // Linux says it; of the others, nothing.
+                        sin6_scope_id: if ipv6.is_link_local() {
+                            crate::net::link_scope_index()
+                        } else {
+                            0
+                        },
                     },
                 },
                 IpAddress::Unspecified | _ => SockAddr {
@@ -629,6 +635,31 @@ mod sockaddr_tests {
             Endpoint::Unix(p) => p,
             _ => panic!("AF_UNIX did not parse as a unix endpoint"),
         }
+    }
+
+    /// An address of a link says which link it is of, as Linux has it
+    /// (`ipv6_iface_scope_id`): a resolver that asked `fe80::1%eth0`
+    /// compares the whole `sockaddr_in6` of the answer with the one it
+    /// sent to. The others say nothing.
+    #[test]
+    fn an_address_of_a_link_says_which_link_it_is_of() {
+        let scope = |addr: IpAddress| {
+            let addr = SockAddr::from(Endpoint::Ip(IpEndpoint::new(addr, 53)));
+            #[allow(unsafe_code)]
+            unsafe {
+                addr.addr_in6.sin6_scope_id
+            }
+        };
+        let card = crate::net::link_scope_index();
+        assert_eq!(scope(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 0x99)), card);
+        assert_eq!(scope(IpAddress::v6(0xfec0, 0, 0, 0, 0, 0, 0, 0x99)), 0);
+        assert_eq!(scope(IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 0);
+        assert_eq!(scope(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1)), 0);
+        // The index is the one `SIOCGIFINDEX` gives the first interface
+        // that is not the loopback.
+        let cards = crate::net::get_net_device();
+        let first = cards.iter().position(|iface| !iface.is_loopback());
+        assert_eq!(card, first.map_or(0, |at| at as u32 + 1));
     }
 
     fn ip_of(addr: SockAddr, len: usize) -> IpEndpoint {
