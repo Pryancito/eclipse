@@ -376,26 +376,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
         }
-        // `unetuse=all`: every program's IPv4 sockets are those of the stack
-        // that runs as a process (`unetstack=`), and not only the ones
-        // started by `eclipse-netstack-use`. The kernel's own stack keeps
-        // what is not a datagram or a stream: ping, raw and packet sockets.
-        #[cfg(feature = "linux")]
-        match kernel_hal::cmdline::value(&options.cmdline, "unetuse") {
-            Some("all") => {
-                linux_object::net::user_stack::use_for_all(true);
-                klog_info!(
-                    "Eclipse: every program's sockets go to the stack process (unetuse=all)"
-                );
-            }
-            Some(other) => {
-                klog_warn!(
-                    "Eclipse: unetuse={} is not understood (only \"all\"); ignored",
-                    other
-                );
-            }
-            None => {}
-        }
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
         // measurable difference to `eclipse.ipcbench`.
@@ -749,6 +729,48 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // Whose the machine's network is, now that the cards the kernel drives
+    // itself are known: see `linux_object::net::user_stack::boot`. A boot
+    // that leaves the first virtio network card to userspace
+    // (`udriver=virtio-net@0`) gives it to the stack that runs as a process,
+    // and on a machine with no other card every program's sockets are that
+    // stack's; `unetstack=kernel`, `unetuse=asked` and `unetuse=all` say
+    // otherwise.
+    #[cfg(feature = "linux")]
+    {
+        use linux_object::net::user_stack::{self, boot};
+        let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
+        let unetuse = word("unetuse");
+        if let Some(other) = unetuse.filter(|said| !boot::understood(said)) {
+            klog_warn!(
+                "Eclipse: unetuse={} is not understood (\"all\" or \"asked\"); ignored",
+                other
+            );
+        }
+        let kernel_cards = kernel_hal::drivers::all_net()
+            .as_vec()
+            .iter()
+            .filter(|card| !card.is_loopback())
+            .count();
+        let whose = boot::whose(word("udriver"), word("unetstack"), unetuse, kernel_cards);
+        user_stack::use_for_all(whose.all());
+        match whose {
+            boot::Whose::AllSaid => klog_info!(
+                "Eclipse: every program's sockets go to the stack process (unetuse=all)"
+            ),
+            boot::Whose::AllOnlyCard => klog_info!(
+                "Eclipse: every program's sockets go to the stack process, which has the machine's only card (unetstack=kernel for the kernel's stack, unetuse=asked for the programs that ask only)"
+            ),
+            boot::Whose::AskedSaid => klog_info!(
+                "Eclipse: the stack process is for the programs that ask (unetuse=asked)"
+            ),
+            boot::Whose::KernelCards(cards) => klog_info!(
+                "Eclipse: the stack process is for the programs that ask: the kernel drives {} card(s) of its own (unetuse=all for every program)",
+                cards
+            ),
+            boot::Whose::NoStack => {}
+        }
+    }
     // ... and start the worker that walks the caches direct reclaim may not:
     // evicting a page-cache entry writes its dirty pages back through the
     // filesystem, which an allocation that has already failed cannot do. Also

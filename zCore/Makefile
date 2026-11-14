@@ -510,8 +510,19 @@ endif
 # (10.0.3.0/24, so that it is not the kernel card's 10.0.2.0/24), for a
 # driver in userspace. The kernel has no virtio-net driver: boot with
 # `udriver=virtio-net@0` in KOPTS to have it recorded for a process to
-# claim (`tools/zx-virtio-net`). With UDISK as well, both go in one option:
+# claim. With UDISK as well, both go in one option:
 # `udriver=virtio-blk@N,virtio-net@0`.
+#
+# Who claims it is the network stack that runs as a process
+# (`tools/eclipse-netstack`), which is the card's driver too and asks a
+# DHCP server for its address; `unetstack=ADDR/PREFIX[,GATEWAY]` in KOPTS
+# gives it one. With `NIC=none` that card is the machine's only one and
+# every program's sockets are that stack's; with a card of the kernel's
+# as well, the programs started by `eclipse-netstack-use` have it, or
+# every program with `unetuse=all`. `unetuse=asked` keeps it to those
+# programs on any machine, and `unetstack=kernel` gives the card to the
+# kernel's own stack instead, with a driver process to carry its frames
+# (`tools/eclipse-udrivers`).
 #
 # UNET_NET=<backend>: what that card is plugged into, in place of the
 # user-mode network. A user-mode network answers for its own addresses and

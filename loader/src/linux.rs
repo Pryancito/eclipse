@@ -607,7 +607,8 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// `prefix`, `gateway` and `mac` say what the stack's card is: the bits of
 /// its network's prefix (1 to 32), the gateway as `address` is written (0
 /// when there is none) and the MAC as a number, its first byte the highest
-/// of six. On a boot with `unetuse=all` the kernel shows that card among
+/// of six. On a boot where every program's sockets are this stack's
+/// (`linux_object::net::user_stack::boot`) the kernel shows that card among
 /// the machine's interfaces for as long as the stack serves, to be looked
 /// at (`ifconfig`, `ip`, `/proc/net`): nothing is sent through it or set
 /// on it there, and what it has carried is what the stack says on the
@@ -616,7 +617,7 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 ///
 /// Which sockets: the datagram and stream sockets of the processes that
 /// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
-/// on a boot with `unetuse=all`; the `AF_INET6` ones carry IPv4. Every other
+/// on such a boot; the `AF_INET6` ones carry IPv4. Every other
 /// socket is the kernel's, as before. What one of those sockets sends to
 /// another at 127.0.0.0/8 or at `address` stays in the kernel, which has
 /// both: the stack is not told.
@@ -628,8 +629,10 @@ pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 /// process ([`ECLIPSE_NETSTACK_SERVE`]), not the kernel's: the `AF_INET`
 /// ones, and the `AF_INET6` ones, which carry IPv4 there. Inherited by
 /// `fork` and kept across `execve`: a program is given that stack by
-/// whatever starts it, and on a boot with `unetuse=all` every program
-/// has it without asking. A socket opened while no stack is served is one
+/// whatever starts it, and on a boot where that stack is the machine's
+/// network every program has it without asking
+/// (`linux_object::net::user_stack::boot`). A socket opened while no stack
+/// is served is one
 /// all the same, for the programs of this machine now and for the stack
 /// when it comes; the sockets the process already has stay what they are.
 #[cfg(feature = "zircon-gateway")]
@@ -676,7 +679,8 @@ static STACK_CARD_NAME: lock::Mutex<Option<alloc::string::String>> = lock::Mutex
 
 /// Put the card of the stack that serves now among the machine's
 /// interfaces, on a boot where every program's sockets are that stack's
-/// (`unetuse=all`): there its card is the machine's, and `ifconfig`, `ip`
+/// (`linux_object::net::user_stack::boot`): there its card is the
+/// machine's, and `ifconfig`, `ip`
 /// and whoever waits for a default route see it. Where only the programs
 /// that ask have that stack, the kernel's interfaces are what the others
 /// use and the list stays theirs. The card, to take away with the stack.

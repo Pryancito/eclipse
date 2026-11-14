@@ -18,11 +18,15 @@
 //! a device left to userspace, and the service's wrapper says so.
 //!
 //! `eclipse-netstack` (`tools/eclipse-netstack`) is the network stack as a
-//! process: on a boot that asks for it (`unetstack=ADDR/PREFIX` next to
-//! `udriver=virtio-net@0`) the `unet` service runs it in place of the
-//! driver. It is the card's driver itself and takes the card's frames
-//! instead of the kernel; with `unetdriver=process` as well it runs
-//! `udrv-virtio-net` for that, a process of its own.
+//! process, and what the `unet` service runs on a boot that leaves it the
+//! card (`udriver=virtio-net@0`): it is the card's driver itself, takes
+//! the card's frames instead of the kernel and asks a DHCP server for its
+//! address, or has the one the boot gives it (`unetstack=ADDR/PREFIX`).
+//! With `unetdriver=process` as well it runs `udrv-virtio-net` for the
+//! card, a process of its own. `unetstack=kernel` is the boot that keeps
+//! the kernel's stack: there the service runs the driver alone, which
+//! hands the card to the kernel. Whose sockets that stack's are is the
+//! kernel's to say (`linux_object::net::user_stack::boot`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,8 +75,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     // The card: the first one, which is what `network` is ordered after.
     fs::write(
         svc_dir.join("unet.service"),
-        b"# Driver of the network card left to userspace (boot with\n\
-          # udriver=virtio-net@0). See /usr/local/bin/eclipse-unet.\n\
+        b"# The network card left to userspace (boot with\n\
+          # udriver=virtio-net@0): the network stack that runs as a process,\n\
+          # or the card's driver alone. See /usr/local/bin/eclipse-unet.\n\
           exec = /usr/local/bin/eclipse-unet\n\
           type = respawn\n\
           udriver = virtio-net@0\n",
@@ -81,21 +86,24 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     fs::write(
         localbin.join("eclipse-unet"),
         b"#!/bin/sh\n\
-          # Eclipse OS: the userspace driver of the network card the kernel\n\
-          # left alone (udriver=virtio-net@0), in the foreground for\n\
-          # eclipse-init, which starts it again if it dies. The kernel keeps\n\
-          # the interface meanwhile. See tools/eclipse-udrivers.\n\
+          # Eclipse OS: what drives the network card the kernel left alone\n\
+          # (udriver=virtio-net@0), in the foreground for eclipse-init,\n\
+          # which starts it again if it dies. See tools/eclipse-udrivers.\n\
           # The driver is the Rust one and only that one: the C tool's own\n\
           # driver is for checking and timing, never the system's.\n\
           [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
-          # unetstack=ADDR/PREFIX on the kernel command line: the card does\n\
-          # not go to the kernel. The network stack that runs as a process\n\
-          # takes it, with that address, and is its driver too. See\n\
-          # tools/eclipse-netstack. unetstack=ADDR/PREFIX,GATEWAY gives it a\n\
-          # gateway too, and unetstack=dhcp has it ask a server for both.\n\
+          # The card does not go to the kernel: the network stack that runs\n\
+          # as a process takes it and is its driver too. See\n\
+          # tools/eclipse-netstack. It asks a DHCP server for its address\n\
+          # and gateway (unetstack=dhcp on the kernel command line, or no\n\
+          # such word); unetstack=ADDR/PREFIX gives it that address, and\n\
+          # unetstack=ADDR/PREFIX,GATEWAY a gateway too.\n\
+          # unetstack=kernel: the card is for the kernel's own stack, and\n\
+          # what runs here is its driver alone.\n\
           words=$(tr ': ' '\\n\\n' < /proc/cmdline)\n\
           stack=$(echo \"$words\" | sed -n 's/^unetstack=//p' | head -n 1)\n\
-          if [ -n \"$stack\" ]; then\n\
+          [ -n \"$stack\" ] || stack=dhcp\n\
+          if [ \"$stack\" != kernel ]; then\n\
           \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           \x20   # unetdriver=process: the driver in a process of its own, which\n\
           \x20   # the stack starts and starts again, as it was before the stack\n\

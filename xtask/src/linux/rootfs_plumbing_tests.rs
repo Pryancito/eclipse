@@ -1025,12 +1025,14 @@ fn the_disk_wrapper_reads_its_number_off_the_command_line() {
     assert_eq!(number("LOG=warn:noudriver=virtio-blk@4"), "");
 }
 
-/// `unetstack=ADDR/PREFIX` on the kernel command line gives the first card
-/// to the network stack that runs as a process, and nothing else does: the
-/// wrapper of the `unet` service runs here over command lines of this
-/// test's, with the two programs it may end as swapped for `echo`.
+/// The first card left to userspace goes to the network stack that runs as
+/// a process, with the address the kernel command line gives it
+/// (`unetstack=ADDR/PREFIX`) or a DHCP server's, and to the kernel's own
+/// stack only on a boot that says so (`unetstack=kernel`): the wrapper of
+/// the `unet` service runs here over command lines of this test's, with
+/// the two programs it may end as swapped for `echo`.
 #[test]
-fn the_cards_wrapper_runs_the_stack_only_on_a_boot_that_names_its_address() {
+fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
     let rootfs = init_rootfs("unet-stack");
     let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-unet")).unwrap();
     for needle in [
@@ -1101,15 +1103,37 @@ fn the_cards_wrapper_runs_the_stack_only_on_a_boot_that_names_its_address() {
         assert_eq!(run(cmdline), format!("stack 0 {word}\n"), "{cmdline}");
     }
     // No such word, a word with no value, and a word that only ends like
-    // it: the card is the kernel's, as on every boot before this.
+    // it: the stack has the card all the same, and asks a server for its
+    // address.
     for cmdline in [
         "LOG=warn:udriver=virtio-net@0:ROOT=/dev/vda\n",
         "LOG=warn:udriver=virtio-net@0:unetstack=:ROOT=/dev/vda\n",
         "LOG=warn:udriver=virtio-net@0:notunetstack=10.0.9.15/24\n",
+        "LOG=warn:udriver=virtio-net@0:notunetstack=kernel\n",
         "",
+    ] {
+        assert_eq!(run(cmdline), "stack 0 dhcp\n", "{cmdline:?}");
+    }
+    assert_eq!(
+        run("LOG=warn udriver=virtio-net@0 unetdriver=process\n"),
+        "stack 0 dhcp driver=process\n"
+    );
+    // `unetstack=kernel`: the card is the kernel's, which is what every
+    // boot had before the stack was its driver, and what drives it is a
+    // process whatever else the boot says of the stack's driver.
+    for cmdline in [
+        "LOG=warn:udriver=virtio-net@0:unetstack=kernel:ROOT=/dev/vda\n",
+        "LOG=warn udriver=virtio-net@0 unetstack=kernel\n",
+        "LOG=warn:udriver=virtio-net@0:unetdriver=process:unetstack=kernel\n",
     ] {
         assert_eq!(run(cmdline), "driver 0\n", "{cmdline:?}");
     }
+    // A word that only starts like it is an address, a bad one, which the
+    // stack is the one to refuse.
+    assert_eq!(
+        run("LOG=warn:udriver=virtio-net@0:unetstack=kernels\n"),
+        "stack 0 kernels\n"
+    );
 }
 
 /// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run

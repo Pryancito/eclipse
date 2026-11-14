@@ -3036,7 +3036,7 @@ fn proc_net_hex_addr6(addr: smoltcp::wire::IpAddress, port: u16) -> alloc::strin
 /// After them come the stream sockets whose stack is a process
 /// ([`user_stack`]), which are not in that set: the ones the kernel made
 /// for the programs that asked for that stack, or for every program on a
-/// boot with `unetuse=all`.
+/// boot where that stack is the machine's network ([`user_stack::boot`]).
 ///
 /// The sockets that have an IPv6 address, and the `AF_INET6` ones of the
 /// stack that runs as a process, are not here: they are
