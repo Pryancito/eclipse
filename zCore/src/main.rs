@@ -736,17 +736,43 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // machine that has such a card has it on, as a boot that names a device
     // with `udriver=` has had it since before. `zircon.gateway=0` still
     // wins, and then the card is not left at all.
+    //
+    // A boot that lends the stack process the kernel's own first card
+    // (`unetcard=kernel`) has asked for the gateway as well: the loan is
+    // made through it.
     #[cfg(feature = "linux")]
     let left_to_userspace = kernel_hal::drivers::user::reserved();
     #[cfg(feature = "linux")]
-    if !left_to_userspace.is_empty()
+    let (kernel_cards, lendable) = {
+        let cards = kernel_hal::drivers::all_net().as_vec();
+        let mut cards = cards.iter().filter(|card| !card.is_loopback()).peekable();
+        let lendable = cards.peek().is_some_and(|first| first.can_lend());
+        (cards.count(), lendable)
+    };
+    #[cfg(feature = "linux")]
+    let lent = {
+        use linux_object::net::user_stack::boot;
+        let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
+        let lent = boot::lends(
+            word("unetcard"),
+            word("unetstack"),
+            left_to_userspace.iter().any(|left| left == boot::CARD),
+            lendable,
+        );
+        boot::set_lent(lent);
+        lent
+    };
+    #[cfg(feature = "linux")]
+    if (lent || !left_to_userspace.is_empty())
         && !kernel_hal::cmdline::is_off(&options.cmdline, "zircon.gateway")
     {
         let already = kernel_hal::cmdline::flag(&options.cmdline, "zircon.gateway")
             || kernel_hal::cmdline::value(&options.cmdline, "udriver")
                 .is_some_and(|devices| !devices.is_empty());
         zcore_loader::linux::set_zircon_gateway(true);
-        if !already {
+        if !already && lent {
+            klog_info!("Eclipse: Zircon syscall gateway ENABLED (unetcard=kernel)");
+        } else if !already {
             klog_info!(
                 "Eclipse: Zircon syscall gateway ENABLED ({} left to userspace)",
                 left_to_userspace.join(",")
@@ -759,6 +785,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // runs as a process, and on a machine with no other card every
     // program's sockets are that stack's; `unetstack=kernel`,
     // `unetstack=none`, `unetuse=asked` and `unetuse=all` say otherwise.
+    // With `unetcard=kernel` the card that stack has is the kernel's
+    // first, lent, and it is no card of the kernel's stack any more.
     #[cfg(feature = "linux")]
     {
         use linux_object::net::user_stack::{self, boot};
@@ -771,12 +799,30 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 other
             );
         }
-        let kernel_cards = kernel_hal::drivers::all_net()
-            .as_vec()
-            .iter()
-            .filter(|card| !card.is_loopback())
-            .count();
-        let whose = boot::whose(card, word("unetstack"), unetuse, kernel_cards);
+        if let Some(other) = word("unetcard").filter(|said| *said != "kernel") {
+            klog_warn!(
+                "Eclipse: unetcard={} is not understood (\"kernel\"); ignored",
+                other
+            );
+        } else if word("unetcard").is_some() && !lent {
+            klog_warn!(
+                "Eclipse: unetcard=kernel lends nothing on this boot: {}",
+                if card {
+                    "the stack process has the virtio card"
+                } else if !boot::has_stack(true, word("unetstack")) {
+                    "it runs no stack process (unetstack=)"
+                } else if kernel_cards == 0 {
+                    "the kernel drives no card"
+                } else {
+                    "the driver of the kernel's first card cannot lend it"
+                }
+            );
+        } else if lent {
+            klog_info!(
+                "Eclipse: the kernel lends its first card to the stack process (unetcard=kernel)"
+            );
+        }
+        let whose = boot::whose(card, lent, word("unetstack"), unetuse, kernel_cards);
         user_stack::use_for_all(whose.all());
         match whose {
             boot::Whose::AllSaid => klog_info!(

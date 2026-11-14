@@ -1,7 +1,7 @@
-//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY] [driver=process]` or
-//! `eclipse-netstack N dhcp [driver=process]`: a network stack for virtio
-//! network card `N`, in this process, with the address `ADDR` or the one a
-//! DHCP server leases it. What is not for the card's network goes to the
+//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY] [driver=process|card=kernel]`
+//! or `eclipse-netstack N dhcp [driver=process|card=kernel]`: a network
+//! stack for virtio network card `N`, in this process, with the address
+//! `ADDR` or the one a DHCP server leases it. What is not for the card's network goes to the
 //! gateway, the one written or the lease's. When the machine's network
 //! settings name the card, what they say is used and not the command line
 //! (`netstack::governed`).
@@ -21,6 +21,14 @@
 //! smoltcp knows of the neighbours stay through that, which is what the
 //! second process buys; every frame pays for it with a change of process
 //! each way.
+//!
+//! With `card=kernel` the card is not a virtio one of this process's but
+//! card `N` of the ones the kernel drives, the loopback not counted, which
+//! the kernel lends (`udrivers::lent`): its driver stays in the kernel and
+//! gives this process the frames. Until this stack has drivers of its own
+//! for such cards, that is how it is the network of a machine that has
+//! one. The loan ends with this process, and the card is the kernel's
+//! stack's again.
 //!
 //! The kernel has no interface for this card. The stack answers for its
 //! address by itself (ARP, ICMP echo), and serves the kernel the datagram
@@ -84,15 +92,20 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
 use udrivers::claim;
 use udrivers::fifo::Fifo;
+use udrivers::lent::Lent;
 use udrivers::net::{self, Feeder, Msg, NoCard, Offer, BUF_SIZE};
 use udrivers::status;
 use udrivers::virtio::Device;
 use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
-const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY]|dhcp [driver=process]";
+const USAGE: &str =
+    "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY]|dhcp [driver=process|card=kernel]";
 /// The word that asks for the card's driver in a process of its own.
 const APART: &str = "driver=process";
+/// The word for a card the kernel drives and lends, in place of a virtio
+/// card of this process's own.
+const KERNELS: &str = "card=kernel";
 /// The card's driver, when it is a process of its own, which this one
 /// starts.
 const DRIVER: &str = "/bin/udrv-virtio-net";
@@ -175,6 +188,63 @@ impl Own {
     }
 }
 
+/// The card, when it is one the kernel drives and has lent to this
+/// process: what any thread needs to give it frames to send and its
+/// receive slots back.
+struct Borrowed {
+    lent: Lent,
+    /// Taken before the stack's lock and never with it held, as
+    /// [`Own::feeder`] is and for the same reason: two threads' frames
+    /// reach the card in the order the stack made them.
+    giving: Mutex<()>,
+}
+
+impl Borrowed {
+    /// Give the kernel what the stack has for the card: the receive slots
+    /// it has read and the frames it wants sent, which the card has
+    /// before this returns unless it has no room. With `when_due`, only if
+    /// that is worth the call ([`Port::due`]). The transmit slots the card
+    /// is through with come back with the same call.
+    ///
+    /// Whether the stack is owed another turn: it had run out of transmit
+    /// slots, so what it had to send may not all be made yet, and some
+    /// came back. Nothing else would bring that turn: the kernel wakes the
+    /// card's thread for a slot only when a frame had to wait for the
+    /// card.
+    fn give(&self, host: &Host, msgs: &mut [Msg; TURN], when_due: bool) -> bool {
+        let _giving = locked(&self.giving);
+        let (n, short) = {
+            let shared = locked(&host.shared);
+            let port = shared.stack.device();
+            let short = !port.can_send();
+            if when_due && !port.due() {
+                (0, short)
+            } else {
+                (port.outgoing(msgs), short)
+            }
+        };
+        if n == 0 {
+            return false;
+        }
+        let back = match self.lent.turn(msgs, n, false, false) {
+            Ok(back) => back,
+            Err(e) => die(format_args!(
+                "the kernel's card is gone (net_lent_turn: {e})"
+            )),
+        };
+        if back == 0 {
+            return false;
+        }
+        let shared = locked(&host.shared);
+        for m in &msgs[..back] {
+            if !shared.stack.device().take(m) {
+                println!("{NAME}: a message from the kernel's card that means nothing: {m:?}");
+            }
+        }
+        short
+    }
+}
+
 /// How the stack's threads reach the card.
 #[derive(Clone)]
 enum Wire {
@@ -182,6 +252,8 @@ enum Wire {
     Driver(Arc<Fifo<Msg>>),
     /// It is this process's.
     Own(Arc<Own>),
+    /// It is the kernel's, lent.
+    Kernel(Arc<Borrowed>),
 }
 
 /// What the card's thread has of the card besides the [`Wire`].
@@ -192,6 +264,8 @@ enum Taker {
     Driver { driver: Child, _window: Window },
     /// The taking halves of the card's rings.
     Own(net::Card),
+    /// Nothing: the kernel has the card, and the wire is the loan.
+    Kernel,
 }
 
 /// A card as the stack has it: its own, or a driver's that serves it.
@@ -225,6 +299,35 @@ fn take(index: usize) -> Result<(Link, Port), String> {
             })),
             taker: Taker::Own(driven.card),
             mac: driven.mac,
+        },
+        port,
+    ))
+}
+
+/// Borrow the kernel's card `index`: the link to it, and the port for the
+/// stack, over a window of this process's that the kernel copies the
+/// frames into and out of.
+fn borrow(index: usize) -> Result<(Link, Port), String> {
+    let lent = Lent::borrow(index, net::RX_BUFS, net::TX_BUFS).map_err(|e| match e {
+        NoCard::NoGateway => "the gateway is off (zircon.gateway=0 on the command line?)".into(),
+        NoCard::Other(e) => e,
+    })?;
+    // SAFETY: the loan's window, which lasts as long as the loan does;
+    // the kernel, during this process's own calls, and this port are all
+    // that read or write it, a slot at a time as the messages say whose it
+    // is. The loan is in the link, which outlives the interface the port
+    // goes into: the process ends before either is dropped.
+    let port = unsafe { Port::new(lent.window(), lent.rx_slots, lent.tx_slots) }
+        .ok_or("a window with more slots than a port takes")?;
+    let mac = lent.mac;
+    Ok((
+        Link {
+            wire: Wire::Kernel(Arc::new(Borrowed {
+                lent,
+                giving: Mutex::new(()),
+            })),
+            taker: Taker::Kernel,
+            mac,
         },
         port,
     ))
@@ -319,6 +422,8 @@ struct Shared {
 /// here.
 struct Host {
     index: usize,
+    /// Whether the card is one the kernel drives and lends (`card=kernel`).
+    kernels: bool,
     mac: [u8; 6],
     /// What the machine's network settings said for this card when the
     /// stack started, as they said it ([`governed`]).
@@ -461,11 +566,17 @@ fn counts_due_in(host: &Host, counts: &Counts) -> Option<Duration> {
 /// Tell the card, from a thread that is not the card's, what this turn
 /// of the stack made: the frames to send, mostly. The card's thread sends
 /// its own with its next turn.
-fn tell_driver(host: &Host, msgs: &mut [Msg; TURN]) {
+fn tell_driver(host: &Arc<Host>, msgs: &mut [Msg; TURN], data: &mut Vec<u8>) {
     let wire = locked(&host.shared).wire.clone();
     let fifo = match wire {
         Wire::Driver(fifo) => fifo,
         Wire::Own(own) => return own.give(host, msgs, false),
+        Wire::Kernel(card) => {
+            while card.give(host, msgs, false) {
+                turn(host, locked(&host.shared), data);
+            }
+            return;
+        }
     };
     let n = locked(&host.shared).stack.device().outgoing(msgs);
     if n == 0 {
@@ -611,6 +722,34 @@ fn serve_card(host: &Arc<Host>, own: &Own, card: &mut net::Card) -> String {
     }
 }
 
+/// Carry the frames of a card the kernel lends through the stack, for as
+/// long as the loan lasts. Why it stopped.
+///
+/// Asleep in the kernel between bursts (`eclipse_net_lent_turn`), which
+/// comes back with the frames that arrived, each in a receive slot of this
+/// process's window, and with the transmit slots of frames that had to
+/// wait for room on the card. After a turn the kernel gets back the
+/// receive slots that were read and the frames to send, when they are
+/// worth the call ([`Port::due`]). Nothing is kept for a program's answer
+/// ([`HOLD`]), as with a card of this process's own ([`serve_card`]): a
+/// frame given to the kernel is on the card when the call returns, and
+/// wakes nobody.
+fn serve_lent(host: &Arc<Host>, card: &Borrowed) -> String {
+    let mut got = [Msg::default(); TURN];
+    let mut msgs = [Msg::default(); TURN];
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
+    loop {
+        let n = match card.lent.turn(&mut got, 0, true, true) {
+            Ok(n) => n,
+            Err(e) => return format!("net_lent_turn: {e}"),
+        };
+        carried(host, &got[..n], &mut data);
+        while card.give(host, &mut msgs, true) {
+            turn(host, locked(&host.shared), &mut data);
+        }
+    }
+}
+
 /// The most messages of the kernel's done before the driver is told of
 /// the frames they made: fewer than a socket holds on their way to the
 /// card, so a program that sends in a burst loses none to that.
@@ -666,7 +805,7 @@ fn serve_sockets(host: Arc<Host>, kernel: Arc<Kernel>) {
             let mut guard = locked(&host.shared);
             guard.answering |= answers;
             turn(&host, guard, &mut data);
-            tell_driver(&host, &mut msgs);
+            tell_driver(&host, &mut msgs, &mut data);
         }
     }
 }
@@ -704,7 +843,7 @@ fn keep_time(host: Arc<Host>) {
             }
             turn(&host, guard, &mut data);
         }
-        tell_driver(&host, &mut msgs);
+        tell_driver(&host, &mut msgs, &mut data);
     }
 }
 
@@ -884,9 +1023,13 @@ fn name_servers(host: &Host, heard: impl FnOnce(&mut Named)) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (words, apart) = match &args[1..] {
-        [words @ .., last] if last == APART => (words, true),
-        words => (words, false),
+    // The card and its address, then at most one word on whose the card
+    // is: a driver of its own is a virtio card's, and the kernel's card
+    // has the kernel for its driver.
+    let (words, apart, kernels) = match &args[1..] {
+        [words @ .., last] if last == APART => (words, true, false),
+        [words @ .., last] if last == KERNELS => (words, false, true),
+        words => (words, false, false),
     };
     let parsed = match words {
         [index, how] => index.parse::<usize>().ok().zip(Addressing::parse(how)),
@@ -897,7 +1040,13 @@ fn main() {
         exit(2);
     };
 
-    let taken = if apart { start(index) } else { take(index) };
+    let taken = if kernels {
+        borrow(index)
+    } else if apart {
+        start(index)
+    } else {
+        take(index)
+    };
     let (mut link, port) = taken.unwrap_or_else(|e| die(e));
     let mac = link.mac;
     // The machine's settings for this card, when they say any, and not
@@ -938,6 +1087,7 @@ fn main() {
     stack.speak_six();
     let host = Arc::new(Host {
         index,
+        kernels,
         mac,
         governed,
         shared: Mutex::new(Shared {
@@ -951,13 +1101,17 @@ fn main() {
         named: Mutex::new(Named::default()),
         driver_pid: AtomicU32::new(match &link.taker {
             Taker::Driver { driver, .. } => driver.id(),
-            Taker::Own(_) => 0,
+            Taker::Own(_) | Taker::Kernel => 0,
         }),
         driver_starts: AtomicU32::new(apart as u32),
         teller: Mutex::new(Teller::default()),
         clock: OnceLock::new(),
     });
-    let card = format!("card {index} ({})", EthernetAddress(mac));
+    let card = format!(
+        "{}card {index} ({})",
+        if kernels { "the kernel's " } else { "" },
+        EthernetAddress(mac)
+    );
     match how {
         Addressing::Written(address, gateway) => {
             serve_kernel(&host, address, gateway);
@@ -986,6 +1140,12 @@ fn main() {
             (Wire::Own(own), Taker::Own(card)) => {
                 let why = serve_card(&host, own, card);
                 die(format_args!("card {index} is gone ({why})"));
+            }
+            // The kernel's, and the same goes: the loan ends with this
+            // process and the next one borrows the card again.
+            (Wire::Kernel(card), Taker::Kernel) => {
+                let why = serve_lent(&host, card);
+                die(format_args!("the kernel's card {index} is gone ({why})"));
             }
             _ => unreachable!("a link is made whole, of one kind"),
         };
@@ -1057,7 +1217,11 @@ fn publish(host: &Host) {
         )
     };
     let addr6: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
-    let device = format!("virtio-net@{}", host.index);
+    let device = if host.kernels {
+        format!("kernel-net@{}", host.index)
+    } else {
+        format!("virtio-net@{}", host.index)
+    };
     let from = match (leases, &host.governed) {
         (true, _) => "dhcp",
         (false, Some(_)) => "network settings",
@@ -1084,8 +1248,11 @@ fn publish(host: &Host) {
         ),
         ("gateway6", or_none(sixes.router.map(|r| r.to_string()))),
     ];
-    // A driver that is this process is no other process to show.
-    if starts == 0 {
+    // A driver that is this process, or the kernel, is no other process
+    // to show.
+    if host.kernels {
+        fields.push(("driver", "kernel".into()));
+    } else if starts == 0 {
         fields.push(("driver", "own".into()));
     } else {
         fields.push(("driver", "process".into()));

@@ -3309,6 +3309,10 @@ pub struct E1000eInterface {
     watchdog_job_scheduled: Arc<AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
+    /// them.
+    lent: super::lent::Lent,
 }
 
 /// Unmask the NIC interrupt sources the driver services.
@@ -3446,6 +3450,30 @@ impl E1000eInterface {
             self.schedule_watchdog(false);
         }
 
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled, neither to read them nor to send on a card it has not
+        // got. The lock is taken a frame at a time: the borrower sends
+        // through `NetScheme::send`, which takes it too.
+        if let Some(taker) = self.lent.taker() {
+            for _ in 0..super::lent::BURST {
+                let frame = self.driver.hw.lock().receive();
+                match frame {
+                    Some(frame) => taker.take(frame),
+                    None => break,
+                }
+            }
+            {
+                let mut hw = self.driver.hw.lock();
+                hw.flush_rx_doorbell();
+                hw.flush_tx_doorbell();
+                let rx_burst = hw.stats.rx_packets.saturating_sub(rx_baseline);
+                hw.tune_itr(now, rx_burst);
+            }
+            taker.done();
+            return Ok(());
+        }
+
         // Do NOT manually toggle interrupts around the SOCKETS + iface locks.
         // `super::intr_off/on` are raw hardware toggles (drivers_intr_*) that
         // bypass the kernel-sync Mutex's push_off/pop_off noff accounting. The
@@ -3566,6 +3594,12 @@ impl Scheme for E1000eInterface {
 }
 
 impl NetScheme for E1000eInterface {
+    fn lend(&self, taker: Option<Arc<dyn super::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+    fn can_lend(&self) -> bool {
+        true
+    }
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -4232,6 +4266,7 @@ pub fn init(
         watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
+        lent: super::lent::Lent::default(),
     };
 
     Ok(e1000e_iface)
@@ -6344,6 +6379,7 @@ mod scheme_tests {
             watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
             routes: Arc::new(Mutex::new(vec![])),
             ip_addrs: Arc::new(Mutex::new(ip_addrs)),
+            lent: crate::net::lent::Lent::default(),
         }
     }
 
@@ -6817,6 +6853,49 @@ mod scheme_tests {
         let iface = interface();
         let mut buf = [0u8; 64];
         assert_eq!(iface.recv(&mut buf), Err(DeviceError::NotReady));
+    }
+
+    /// A lent card's frames go to its borrower, whole and in order, and the
+    /// kernel's own stack reads none of them; taken back, the card is the
+    /// kernel's again and the borrower hears no more.
+    #[test]
+    fn a_lent_cards_frames_go_to_its_borrower_and_not_to_the_kernels_stack() {
+        use crate::net::lent::tests::Kept;
+        let iface = interface();
+        let kept = Arc::new(Kept::default());
+        assert_eq!(iface.lend(Some(kept.clone())), Ok(()));
+        let (first, second) = ([0xa5u8; 300], [0x5au8; 60]);
+        {
+            let hw = iface.driver.hw.lock();
+            super::rx_ring_tests::hw_deliver(&hw, 0, &first);
+            super::rx_ring_tests::hw_deliver(&hw, 1, &second);
+        }
+        iface.poll_with_irq_hint(0).unwrap();
+        assert_eq!(*kept.frames.lock(), [first.to_vec(), second.to_vec()]);
+        assert_eq!(*kept.dones.lock(), 1, "told once that the burst is over");
+        let mut buf = [0u8; 64];
+        assert_eq!(iface.recv(&mut buf), Err(DeviceError::NotReady));
+        // A poll that finds nothing still says it is through: a frame that
+        // waited for room on the card is sent on that word.
+        iface.poll_with_irq_hint(0).unwrap();
+        assert_eq!(kept.frames.lock().len(), 2);
+        assert_eq!(*kept.dones.lock(), 2);
+        // One borrower at a time.
+        let other = Arc::new(Kept::default());
+        assert_eq!(
+            iface.lend(Some(other.clone())),
+            Err(DeviceError::AlreadyExists)
+        );
+        // Taken back: the next frame is read by the kernel's side.
+        assert_eq!(iface.lend(None), Ok(()));
+        {
+            let hw = iface.driver.hw.lock();
+            super::rx_ring_tests::hw_deliver(&hw, 2, &first);
+        }
+        assert_eq!(iface.recv(&mut buf), Ok(64));
+        assert_eq!(kept.frames.lock().len(), 2);
+        assert_eq!(*kept.dones.lock(), 2);
+        assert!(other.frames.lock().is_empty());
     }
 
     /// The carrier is up if the driver saw it up OR the status register says so

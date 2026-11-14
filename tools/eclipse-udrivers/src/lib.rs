@@ -19,6 +19,7 @@ pub mod channel;
 pub mod claim;
 pub mod fifo;
 pub mod hybrid;
+pub mod lent;
 pub mod net;
 pub mod queue;
 pub mod status;

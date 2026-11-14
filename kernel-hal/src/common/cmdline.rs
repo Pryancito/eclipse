@@ -112,12 +112,14 @@ pub fn is_off(cmdline: &str, key: &str) -> bool {
 /// What a boot leaves to drivers in userspace, as
 /// `zcore_drivers::user::set_reservation` takes it: the value of `udriver=`,
 /// and whether the first virtio network card goes with it unasked. It does
-/// unless the boot wants no network stack for that card (`unetstack=none`)
-/// or has shut the gateway a driver in userspace claims its device through
+/// unless the boot wants no network stack for that card (`unetstack=none`),
+/// gives that stack the kernel's own card instead (`unetcard=kernel`), or
+/// has shut the gateway a driver in userspace claims its device through
 /// (`zircon.gateway=0`): a card nobody could claim is better left unseen.
 pub fn user_devices(cmdline: &str) -> (Option<&str>, bool) {
-    let net_by_default =
-        value(cmdline, "unetstack") != Some("none") && !is_off(cmdline, "zircon.gateway");
+    let net_by_default = value(cmdline, "unetstack") != Some("none")
+        && value(cmdline, "unetcard") != Some("kernel")
+        && !is_off(cmdline, "zircon.gateway");
     (value(cmdline, "udriver"), net_by_default)
 }
 
@@ -852,6 +854,14 @@ mod tests {
         );
         // A word that only ends like it says nothing.
         assert!(user_devices("notunetstack=none").1);
+        // The stack process has the kernel's card: the virtio one is not
+        // left for it unasked, and is if the boot names it.
+        assert_eq!(user_devices("LOG=warn:unetcard=kernel"), (None, false));
+        assert_eq!(
+            user_devices("udriver=virtio-net@0:unetcard=kernel"),
+            (Some("virtio-net@0"), false)
+        );
+        assert!(user_devices("unetcard=virtio").1);
     }
 
     #[test]

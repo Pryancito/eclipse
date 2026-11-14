@@ -2229,10 +2229,14 @@ fn proc_bootprofile_content() -> String {
 /// `/proc/udrivers`: the devices the kernel left to drivers in userspace,
 /// one to a line as `udriver=` names each (`virtio-net@0`). Only the ones
 /// that are there: a device the command line names and the machine does
-/// not have is not listed, and one the kernel left unasked is. It is what
-/// init reads to know which driver services have a device to claim.
+/// not have is not listed, and one the kernel left unasked is. A card the
+/// kernel drives and lends to the stack process (`unetcard=kernel`) is
+/// listed too, as `kernel-net@0`. It is what init reads to know which
+/// driver services have a device to claim.
 fn proc_udrivers_content() -> String {
-    udrivers_lines(&kernel_hal::drivers::user::reserved())
+    let mut left = kernel_hal::drivers::user::reserved();
+    left.extend(crate::net::user_stack::boot::lent().map(String::from));
+    udrivers_lines(&left)
 }
 
 fn udrivers_lines(left: &[String]) -> String {

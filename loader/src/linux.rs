@@ -638,6 +638,53 @@ pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 
+/// `eclipse_net_borrow(index, window, rx_slots, tx_slots, *out) -> status`:
+/// borrow a network card the kernel drives, for this process's network
+/// stack. `index` counts the kernel's cards from 0, the loopback left out.
+/// `window` is `(rx_slots + tx_slots) * 2048` bytes of this process's
+/// memory, a slot each, receive slots first (at most 1024 and 32, or
+/// `OUT_OF_RANGE`): the frames pass through it, copied by the kernel
+/// during [`ECLIPSE_NET_LENT_TURN`]. `out` takes two `u64`s: the handle
+/// of the loan, and the card's address, its first byte in the low byte.
+///
+/// While the handle lives the card's driver gives the frames it receives
+/// to this process and not to the kernel's stack, and the card is not
+/// among the kernel's interfaces; closing it, or dying, gives the card
+/// back. `ACCESS_DENIED` unless it is the card the boot lends (the first,
+/// with `unetcard=kernel`: `linux_object::net::user_stack::boot::lends`),
+/// `NOT_FOUND` when the kernel has no such card, `NOT_SUPPORTED` when its
+/// driver cannot lend it, `ALREADY_BOUND` when it is lent.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_NET_BORROW: u32 = ECLIPSE_GATEWAY_EXT + 11;
+
+/// `eclipse_net_lent_turn(card, msgs, give, room, flags, *actual) ->
+/// status`: a turn on a borrowed card ([`ECLIPSE_NET_BORROW`]). `msgs` is
+/// an array of 16-byte messages, `op, slot, len, off` as with
+/// [`ECLIPSE_NET_SERVE`]. The first `give` are for the kernel: `OP_RX`
+/// (1), receive slot `slot` has been read and can take a frame again;
+/// `OP_TX` (2), send the `len` bytes that are `off` bytes into transmit
+/// slot `slot`, which the card is given before the call returns unless it
+/// has no room. Then up to `room` messages are written to the same array,
+/// with their count in `*actual` (a `usize`): `OP_TX`, the card has taken
+/// the frame of that slot, which is free again; and with
+/// [`ECLIPSE_LENT_FRAMES`] in `flags`, `OP_RX`: a frame of `len` bytes is
+/// at the start of receive slot `slot`.
+///
+/// With [`ECLIPSE_LENT_WAIT`] the call sleeps until it has a message to
+/// answer with; a signal ends the sleep with `ZX_ERR_INTERNAL_INTR_RETRY`,
+/// the messages already given: retry with `give` 0. `give` and `room` are
+/// at most the window's slots, or `OUT_OF_RANGE`.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_NET_LENT_TURN: u32 = ECLIPSE_GATEWAY_EXT + 12;
+
+/// [`ECLIPSE_NET_LENT_TURN`] flag: sleep until there is an answer.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_LENT_WAIT: usize = 1;
+
+/// [`ECLIPSE_NET_LENT_TURN`] flag: answer with received frames too.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_LENT_FRAMES: usize = 2;
+
 /// [`ECLIPSE_NETSTACK_SERVE`]: the channel becomes the kernel's link to the
 /// stack, and a task carries what arrives on it to the sockets.
 #[cfg(feature = "zircon-gateway")]
@@ -992,6 +1039,22 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             proc.linux().use_user_netstack();
             0
         }
+        // Only the card the boot lends (`unetcard=kernel`): a machine that
+        // did not say so keeps its cards for the kernel's stack whoever asks.
+        ECLIPSE_NET_BORROW
+            if args[0] != 0 || linux_object::net::user_stack::boot::lent().is_none() =>
+        {
+            status(ZxError::ACCESS_DENIED)
+        }
+        ECLIPSE_NET_BORROW => match net_lend::net_borrow(proc, args) {
+            Ok(name) => {
+                // The card the stack shows as its own is this one, under
+                // the name it had: what the machine's settings call it.
+                STACK_CARD_NAME.lock().get_or_insert(name);
+                0
+            }
+            Err(e) => status(e),
+        },
         _ => status(ZxError::NOT_SUPPORTED),
     }
 }
@@ -2460,6 +2523,18 @@ async fn handle_user_trap(
                         },
                     }
                 }
+                _ if zx_num == ECLIPSE_NET_LENT_TURN => {
+                    match net_lend::give_then(thread.proc(), &args) {
+                        Err(e) => e as isize as usize,
+                        Ok(turn) => run_with_irq_enable! {
+                            match linux_object::process::interruptible(turn.wait_then_answer()).await {
+                                Ok(Ok(())) => 0,
+                                Ok(Err(e)) => e as isize as usize,
+                                Err(_) => zircon_object::ZxError::INTERNAL_INTR_RETRY as isize as usize,
+                            }
+                        },
+                    }
+                }
                 _ if zx_num >= ECLIPSE_GATEWAY_EXT => {
                     eclipse_gateway_call(thread.proc(), zx_num, &args) as usize
                 }
@@ -2995,6 +3070,8 @@ use device_claim::claim_device;
 mod block_serve;
 #[cfg(feature = "zircon-gateway")]
 mod fifo_turn;
+#[cfg(feature = "zircon-gateway")]
+mod net_lend;
 #[cfg(feature = "zircon-gateway")]
 mod net_serve;
 

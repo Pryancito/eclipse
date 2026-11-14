@@ -1,6 +1,7 @@
 use super::Scheme;
 use crate::{DeviceError, DeviceResult};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
 
@@ -31,6 +32,20 @@ pub trait NetScheme: Scheme {
     }
     fn can_send(&self) -> bool {
         true
+    }
+    /// Lend the card to a network stack that is not the kernel's (`Some`),
+    /// or take it back (`None`): see [`crate::net::lent`]. While it is
+    /// lent the frames it receives go to the taker and the kernel's own
+    /// stack leaves it alone; [`send`](Self::send) is how the borrower's
+    /// frames leave. A driver that cannot be lent says so, which is what
+    /// every driver does that does not answer here.
+    fn lend(&self, _taker: Option<Arc<dyn crate::net::lent::FrameTaker>>) -> DeviceResult {
+        Err(DeviceError::NotSupported)
+    }
+    /// Whether [`lend`](Self::lend) is something this driver does at all,
+    /// which a boot has to know before it promises the card to anybody.
+    fn can_lend(&self) -> bool {
+        false
     }
     fn get_mac(&self) -> EthernetAddress;
     /// Returns the interface name as a string slice without allocating heap memory.

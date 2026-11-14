@@ -525,6 +525,11 @@ endif
 # kernel's own stack instead, with a driver process to carry its frames
 # (`tools/eclipse-udrivers`).
 #
+# Without UNET, `unetcard=kernel` in KOPTS gives that stack the first card
+# the kernel drives itself (the e1000e of an x86_64 run): the kernel goes
+# on driving it and lends it, its frames go to the stack process and that
+# stack is the network of every program, as with a card of its own.
+#
 # UNET_NET=<backend>: what that card is plugged into, in place of the
 # user-mode network. A user-mode network answers for its own addresses and
 # lets nothing in, so nobody can ping the guest through it; with
