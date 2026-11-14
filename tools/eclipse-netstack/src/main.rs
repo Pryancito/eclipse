@@ -62,7 +62,7 @@ use std::time::Duration;
 use netstack::counts::{Counts, Teller};
 use netstack::governed;
 use netstack::port::Port;
-use netstack::resolv::{self, Applied};
+use netstack::resolv::{self, Applied, Named};
 use netstack::socks::lease::{Addressing, Lease};
 use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
@@ -216,6 +216,10 @@ struct Host {
     /// stack: `getsockname` answers with its address, and the machine's
     /// interfaces show it, for as long as this process lasts.
     told: Mutex<Option<Card>>,
+    /// The name servers of the lease and of the routers, as last heard:
+    /// held while they are written down, and never with the stack's
+    /// lock.
+    named: Mutex<Named>,
     /// The driver the card has now and how many it has had, for
     /// [`publish`].
     driver_pid: AtomicU32,
@@ -263,6 +267,13 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
         let sixes = shared.stack.sixes();
         drop(shared);
         say_sixes(host, &sixes);
+        shared = locked(&host.shared);
+    }
+    if shared.stack.names6_news() {
+        let routers = shared.stack.names6();
+        // Not under the lock: a file is written.
+        drop(shared);
+        name_servers(host, |named| named.routers = routers);
         shared = locked(&host.shared);
     }
     // Without the kernel there are no sockets for anything to arrive on.
@@ -644,7 +655,7 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
                 through(lease.gateway),
                 with_sockets(host)
             );
-            name_servers(host, &lease);
+            name_servers(host, |named| named.lease = lease.dns);
         }
         None => println!("{NAME}: card {index} lost its lease: no address until it has another"),
     }
@@ -670,24 +681,31 @@ fn say_sixes(host: &Host, sixes: &Sixes) {
     publish(host);
 }
 
-/// Write the name servers of a lease where every program's resolver
-/// looks, as the script of a `udhcpc` does for a card of the kernel's.
-/// While the card is the machine's: the kernel has been told it by now,
-/// and shows it at once if it is.
-fn name_servers(host: &Host, lease: &Lease) {
-    if !resolv::is_the_machines(Path::new(resolv::SYS_NET), host.mac) {
+/// Write the name servers there are where every program's resolver
+/// looks, once `heard` has said what changed of them: the lease's, as
+/// the script of a `udhcpc` does for a card of the kernel's, and after
+/// them the ones the link's routers name. While the card is the
+/// machine's: the kernel has been told it by the time there is a lease,
+/// and shows it at once if it is. What a router named before that is
+/// kept, and written with the lease's.
+fn name_servers(host: &Host, heard: impl FnOnce(&mut Named)) {
+    let mut named = locked(&host.named);
+    heard(&mut named);
+    let Some(card) = resolv::card_name(Path::new(resolv::SYS_NET), host.mac) else {
         return;
-    }
-    let conf = resolv::RESOLV_CONF;
-    let named = || {
-        let dns: Vec<String> = lease.dns.iter().map(|d| d.to_string()).collect();
-        dns.join(", ")
     };
-    match resolv::apply(&lease.dns, Path::new(conf), Path::new(resolv::FIXED)) {
-        Ok(Applied::Written) => println!("{NAME}: {conf} names {}, by the lease", named()),
+    let conf = resolv::RESOLV_CONF;
+    let whose = match (named.lease.is_empty(), named.routers.is_empty()) {
+        (false, true) => "the lease",
+        (true, _) => "the router",
+        (false, false) => "the lease and the router",
+    };
+    let servers = || named.written(&card).join(", ");
+    match resolv::apply(&named, &card, Path::new(conf), Path::new(resolv::FIXED)) {
+        Ok(Applied::Written) => println!("{NAME}: {conf} names {}, by {whose}", servers()),
         Ok(Applied::Fixed) => println!(
-            "{NAME}: the lease names {}, and {conf} keeps the servers fixed by hand",
-            named()
+            "{NAME}: {whose} names {}, and {conf} keeps the servers fixed by hand",
+            servers()
         ),
         Ok(Applied::Unchanged | Applied::Nothing) => {}
         Err(e) => eprintln!("{NAME}: {conf}: {e}"),
@@ -755,6 +773,7 @@ fn main() {
         }),
         kernel: OnceLock::new(),
         told: Mutex::new(None),
+        named: Mutex::new(Named::default()),
         driver_pid: AtomicU32::new(link.driver.id()),
         driver_starts: AtomicU32::new(1),
         teller: Mutex::new(Teller::default()),
