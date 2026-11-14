@@ -771,17 +771,20 @@ impl TaskCollection {
         }
 
         let handoff = self.handoff_candidate(cursor, inner);
+        // A woken task the quota turn below passes over, if it does.
+        let mut passed_urgent = false;
         let (slot, serve_yielded) = if let Some(slot) = handoff {
             (slot, false)
         } else if inner.affine == 0 {
             crate::runtime::note_not_stranded(self.cpu_id as usize);
             if cursor.urgent_turns >= URGENT_QUOTA {
-                Self::bitmap_candidate(inner, cursor.yielded_next, true)
-                    .map(|slot| (slot, true))
-                    .or_else(|| {
-                        Self::bitmap_candidate(inner, cursor.urgent_next, false)
-                            .map(|slot| (slot, false))
-                    })
+                let yielded = Self::bitmap_candidate(inner, cursor.yielded_next, true);
+                passed_urgent = yielded.is_some()
+                    && Self::bitmap_candidate(inner, cursor.urgent_next, false).is_some();
+                yielded.map(|slot| (slot, true)).or_else(|| {
+                    Self::bitmap_candidate(inner, cursor.urgent_next, false)
+                        .map(|slot| (slot, false))
+                })
             } else {
                 Self::bitmap_candidate(inner, cursor.urgent_next, false)
                     .map(|slot| (slot, false))
@@ -884,6 +887,7 @@ impl TaskCollection {
             }
             let serve_yielded =
                 yielded.is_some() && (urgent.is_none() || cursor.urgent_turns >= URGENT_QUOTA);
+            passed_urgent = serve_yielded && urgent.is_some();
             (
                 (if serve_yielded { yielded } else { urgent })?,
                 serve_yielded,
@@ -902,6 +906,11 @@ impl TaskCollection {
             return None;
         }
         page.mark_borrowed(subpage_idx, true);
+        // A quota turn taken past a woken task is a turn, not the CPU. The
+        // kernel ends it soon for a thread it put in this lane
+        // (`kernel_hal::thread::preempt_behind`); without that a thread
+        // waking every 200 us was left 2 ms late beside a busy loop.
+        crate::runtime::note_quota_pick(self.cpu_id as usize, passed_urgent);
         // The claim end of the wake-to-run latency probe. Only the urgent lane
         // is measured: a voluntary yield is a task giving up a CPU it had, so
         // the interval between its self-wake and its next poll is not a wait
@@ -1881,6 +1890,53 @@ mod collection_tests {
             }
         }
         assert_eq!(seen, [true, true]);
+    }
+
+    /// A volunteer served by the quota while a woken task waits is told so
+    /// (`quota_passed_urgent`), and the kernel ends its turn soon; one served
+    /// because nothing woken is waiting is not, and keeps the CPU.
+    #[test]
+    fn a_quota_pick_past_a_waiting_woken_task_is_told_so() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let hog = tc.add_task(pending(), None);
+        let yielder = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(hog).2);
+        page.mark_yielded(unpack_key(yielder).2);
+        let mut served = false;
+        for _ in 0..2 * (URGENT_QUOTA + 1) {
+            let (key, _, waker) = tc.take_task().expect("the queue stopped handing work out");
+            if key == yielder {
+                assert!(
+                    crate::runtime::quota_passed_urgent(),
+                    "the volunteer was served past a woken task and not told"
+                );
+                served = true;
+                waker.mark_borrowed(false);
+                break;
+            }
+            assert!(
+                !crate::runtime::quota_passed_urgent(),
+                "a woken task was told it passed one"
+            );
+            waker.wake_by_ref();
+            waker.mark_borrowed(false);
+        }
+        assert!(served, "the volunteer was never served");
+        // The woken task is left asleep: the volunteer is now served alone.
+        let (key, _, waker) = tc.take_task().expect("the woken task was lost");
+        assert_eq!(key, hog);
+        waker.mark_borrowed(false);
+        page.mark_yielded(unpack_key(yielder).2);
+        let (key, _, waker) = tc.take_task().expect("the volunteer was lost");
+        assert_eq!(key, yielder);
+        assert!(
+            !crate::runtime::quota_passed_urgent(),
+            "a volunteer served with no one waiting was told it passed someone"
+        );
+        waker.mark_borrowed(false);
     }
 
     /// Point this CPU's hand-off hint at `key` the way a same-CPU wake does.
