@@ -127,11 +127,15 @@ pub(super) const MAX_FOR_TESTS: usize = 1472;
 
 #[test]
 fn a_message_is_its_header_and_what_the_operation_adds() {
-    let bind = bind_message(7, 5000);
-    assert_eq!(bind.len(), HEADER_LEN + 2);
+    let bind = bind_message(7, 5000, Takes::Four);
+    assert_eq!(bind.len(), HEADER_LEN + 4);
     assert_eq!(&bind[..4], &[0; 4], "not a reply to any call");
     assert_eq!(parse_header(&bind), Some((OP_BIND, 7)));
-    assert_eq!(&bind[16..], &5000u16.to_le_bytes());
+    assert_eq!(&bind[16..18], &5000u16.to_le_bytes());
+    // And which versions of IP the port is the socket's for.
+    assert_eq!(&bind[18..], &[4, 0]);
+    assert_eq!(&bind_message(7, 5000, Takes::Both)[18..], &[0, 0]);
+    assert_eq!(&bind_message(7, 5000, Takes::Six)[18..], &[6, 0]);
 
     // An `UNDELIVERED`: where it went, then what was said of it.
     assert_eq!(EV_UNDELIVERED, 7);
@@ -222,8 +226,8 @@ fn a_message_is_its_header_and_what_the_operation_adds() {
         ]
     );
     assert_eq!(
-        bind_message(7, 5000),
-        [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13]
+        bind_message(7, 5000, Takes::Four),
+        [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13, 4, 0]
     );
     assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
 
@@ -249,7 +253,10 @@ fn a_datagram_for_this_machine_goes_from_socket_to_socket() {
     // socket, and that is all the stack hears of it.
     assert_eq!(Socket::write(&client, b"hola", to(here, 5353)), Ok(4));
     let sent_from = port(&client);
-    assert_eq!(stack.told(), Some(bind_message(client.sock, sent_from)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(client.sock, sent_from, Takes::Four))
+    );
     assert_eq!(stack.told(), None);
     let mut buf = [0u8; 16];
     assert!(readable(&server));
@@ -332,7 +339,10 @@ fn an_ipv6_datagram_socket_carries_ipv6() {
     let server = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
     FileLike::set_flags(&server, OpenFlags::NON_BLOCK).unwrap();
     assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(server.sock, 5353, Takes::Both))
+    );
 
     // The messages, as the stack reads and writes them.
     let near = six("fec0::99");
@@ -427,7 +437,10 @@ fn an_ipv6_datagram_socket_carries_ipv6() {
         Socket::bind(&other, Endpoint::Ip(at6("fec0::7", 5355))),
         Ok(0)
     );
-    assert_eq!(stack.told(), Some(bind_message(other.sock, 5355)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(other.sock, 5355, Takes::Both))
+    );
     let own = Endpoint::Ip(at6("fec0::7", 5353));
     assert_eq!(Socket::write(&other, b"here", Some(own)), Ok(4));
     assert_eq!(stack.told(), None);
@@ -460,7 +473,10 @@ fn an_ipv6_datagram_socket_carries_ipv4() {
     let server = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
     FileLike::set_flags(&server, OpenFlags::NON_BLOCK).unwrap();
     assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(server.sock, 5353, Takes::Both))
+    );
     assert_eq!(ip(Socket::endpoint(&server).unwrap()), at6("::", 5353));
     // It is the IPv6 table's, with the address it has, which is none.
     let listed = stack.link.listed_datagrams();
@@ -575,7 +591,7 @@ fn a_datagram_socket_bound_to_this_machine_is_not_the_stacks() {
     // The stack heard of the client's port and nothing else, and does
     // not hear of the server's close.
     while let Some(m) = stack.told() {
-        assert_eq!(m, bind_message(client.sock, port(&client)));
+        assert_eq!(m, bind_message(client.sock, port(&client), Takes::Four));
     }
     drop(server);
     assert_eq!(stack.told(), None);
@@ -593,7 +609,7 @@ fn bind_gives_the_port_asked_for_once_and_tells_the_stack() {
     assert_eq!(port(&a), 0);
 
     assert_eq!(Socket::bind(&a, any(7000)), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(a.sock, 7000)));
+    assert_eq!(stack.told(), Some(bind_message(a.sock, 7000, Takes::Four)));
     assert_eq!(port(&a), 7000);
     // A socket has one port, and a port one socket.
     assert_eq!(Socket::bind(&a, any(7001)), Err(LxError::EINVAL));
@@ -605,7 +621,7 @@ fn bind_gives_the_port_asked_for_once_and_tells_the_stack() {
     drop(a);
     assert_eq!(stack.told(), Some(close_message(closed)));
     assert_eq!(Socket::bind(&b, any(7000)), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(b.sock, 7000)));
+    assert_eq!(stack.told(), Some(bind_message(b.sock, 7000, Takes::Four)));
 }
 
 #[test]
@@ -617,7 +633,10 @@ fn a_send_from_a_socket_without_a_port_gets_it_one_first() {
     assert_eq!(Socket::write(&a, b"uno", to(HOST, 9)), Ok(3));
     let port_a = port(&a);
     assert!(EPHEMERAL.contains(&port_a));
-    assert_eq!(stack.told(), Some(bind_message(a.sock, port_a)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(a.sock, port_a, Takes::Four))
+    );
     assert_eq!(
         stack.told(),
         Some(send_message(a.sock, HOST, 9, 64, b"uno"))
@@ -728,7 +747,7 @@ fn what_the_stack_says_that_is_no_datagram_for_a_socket_is_dropped() {
     stack.arrives(gone_sock, HOST, 1, b"late");
     stack.arrives(9999, HOST, 1, b"nobody's");
     stack.say(alloc::vec![1, 2, 3]);
-    stack.say(bind_message(a.sock, 80));
+    stack.say(bind_message(a.sock, 80, Takes::Four));
     stack.say(send_message(a.sock, HOST, 1, 64, b"not DATA"));
     // A DATA with nothing in it, and one whose second record is cut
     // short: the first is delivered all the same.
@@ -1126,8 +1145,8 @@ fn when_the_stack_dies_its_sockets_wait_for_the_next() {
     // the one that is this machine's alone, and they are its: what
     // it hears for them arrives, and it is told when one closes.
     let next = stack_of(&link);
-    assert_eq!(next.told(), Some(bind_message(a.sock, 7000)));
-    assert_eq!(next.told(), Some(bind_message(b.sock, 7002)));
+    assert_eq!(next.told(), Some(bind_message(a.sock, 7000, Takes::Four)));
+    assert_eq!(next.told(), Some(bind_message(b.sock, 7002, Takes::Four)));
     assert_eq!(next.told(), None);
     next.arrives(a.sock, HOST, 1, b"again");
     link.pump();
@@ -1619,11 +1638,162 @@ fn the_machine_has_sockets_before_it_has_a_stack() {
     );
     // The stack comes and is told of both, each with its port.
     let stack = stack_of(&link);
-    assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
-    assert_eq!(stack.told(), Some(bind_message(client.sock, port(&client))));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(server.sock, 5353, Takes::Four))
+    );
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(client.sock, port(&client), Takes::Four))
+    );
     assert_eq!(Socket::write(&client, b"x", to(HOST, 9)), Ok(1));
     assert_eq!(
         stack.told(),
         Some(send_message(client.sock, HOST, 9, 64, b"x"))
     );
+}
+
+/// `IPV6_V6ONLY`, said `on` or not.
+fn only6(s: &dyn Socket, on: i32) -> SysResult {
+    s.setsockopt(41, 26, &on.to_ne_bytes())
+}
+
+#[test]
+fn a_socket_for_ipv6_only_leaves_its_port_to_one_of_ipv4() {
+    let _g = LOCK.lock();
+    let stack = stack();
+    let six = |addr: &str| match at6(addr, 0).addr {
+        IpAddress::Ipv6(addr) => addr,
+        _ => unreachable!(),
+    };
+    stack.say(six_message(None, &[Ipv6Cidr::new(six("fec0::7"), 64)]));
+    let socket6 = || {
+        let s = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+        s
+    };
+    let said = |s: &ServedUdpSocket| Socket::getsockopt_own(s, 41, 26);
+    let yes = Some(1i32.to_ne_bytes().to_vec());
+    let no = Some(0i32.to_ne_bytes().to_vec());
+
+    // Said before the socket has a port, by a socket of that family, as
+    // an `int` (`do_ipv6_setsockopt`).
+    let v6only = socket6();
+    assert_eq!(said(&v6only), no);
+    assert_eq!(v6only.setsockopt(41, 26, &[1, 0]), Err(LxError::EINVAL));
+    assert_eq!(only6(&v6only, 1), Ok(0));
+    assert_eq!(said(&v6only), yes);
+    assert_eq!(only6(&v6only, 0), Ok(0));
+    assert_eq!(said(&v6only), no);
+    assert_eq!(only6(&v6only, 1), Ok(0));
+    let v4 = stack.socket();
+    assert_eq!(only6(&v4, 1), Err(LxError::ENOPROTOOPT));
+
+    // An address of IPv4 is none of its own, nor anywhere it has a way
+    // to, however it is written.
+    let mapped = Endpoint::Ip(at6("::ffff:10.0.9.1", 53));
+    assert_eq!(Socket::bind(&v6only, mapped.clone()), Err(LxError::EINVAL));
+    assert_eq!(
+        Socket::write(&v6only, b"q", Some(mapped.clone())),
+        Err(LxError::ENETUNREACH)
+    );
+    assert_eq!(
+        async_std::task::block_on(Socket::connect(&v6only, mapped)),
+        Err(LxError::ENETUNREACH)
+    );
+    assert_eq!(port(&v6only), 0, "none of that gave it a port");
+
+    // Its port is its own for IPv6, and the stack is told so: a socket
+    // of IPv4 has the same one, and no third has it for either.
+    assert_eq!(Socket::bind(&v6only, Endpoint::Ip(at6("::", 7000))), Ok(0));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(v6only.sock, 7000, Takes::Six))
+    );
+    assert_eq!(Socket::bind(&v4, any(7000)), Ok(0));
+    assert_eq!(stack.told(), Some(bind_message(v4.sock, 7000, Takes::Four)));
+    let both = socket6();
+    let another = socket6();
+    assert_eq!(only6(&another, 1), Ok(0));
+    for third in [&both, &another, &stack.socket()] {
+        assert_eq!(
+            Socket::bind(
+                third,
+                Endpoint::Ip(shown(third.shared.takes(), at([0; 4], 7000)))
+            ),
+            Err(LxError::EADDRINUSE)
+        );
+    }
+    // With a port, what it carries is said.
+    assert_eq!(only6(&v6only, 0), Err(LxError::EINVAL));
+    assert_eq!(only6(&v6only, 1), Err(LxError::EINVAL));
+    assert_eq!(said(&v6only), yes);
+
+    // What arrives is the one's whose version of IP it arrived as,
+    // whatever a stack says.
+    let mut buf = [0u8; 16];
+    stack.arrives(v6only.sock, HOST, 53, b"four");
+    assert_eq!(recv(&v6only, &mut buf).0, Err(LxError::EAGAIN));
+    stack.say(data6(v4.sock, "fec0::99", 53, b"six"));
+    assert_eq!(recv(&v4, &mut buf).0, Err(LxError::EAGAIN));
+    stack.say(data6(v6only.sock, "fec0::99", 53, b"six"));
+    assert_eq!(recv(&v6only, &mut buf), (Ok(3), at6("fec0::99", 53)));
+    stack.arrives(v4.sock, HOST, 53, b"four");
+    assert_eq!(recv(&v4, &mut buf), (Ok(4), at(HOST, 53)));
+
+    // In this machine too: what is sent to `::1` is for the one, which
+    // is told it came from there and answers there, and what is sent to
+    // 127.0.0.1 is for the other.
+    assert_eq!(Socket::bind(&both, Endpoint::Ip(at6("::", 7001))), Ok(0));
+    let there = Endpoint::Ip(at6("::1", 7000));
+    assert_eq!(Socket::write(&both, b"six", Some(there.clone())), Ok(3));
+    assert_eq!(recv(&v6only, &mut buf), (Ok(3), at6("::1", 7001)));
+    assert_eq!(recv(&v4, &mut buf).0, Err(LxError::EAGAIN));
+    let back = Endpoint::Ip(at6("::1", 7001));
+    assert_eq!(Socket::write(&v6only, b"si", Some(back)), Ok(2));
+    assert_eq!(recv(&both, &mut buf).0, Ok(2));
+    // Connected, the same.
+    async_std::task::block_on(Socket::connect(&both, there)).unwrap();
+    assert_eq!(Socket::write(&both, b"more", None), Ok(4));
+    assert_eq!(recv(&v6only, &mut buf), (Ok(4), at6("::1", 7001)));
+    let client = stack.socket();
+    assert_eq!(
+        Socket::write(&client, b"four", to([127, 0, 0, 1], 7000)),
+        Ok(4)
+    );
+    assert_eq!(recv(&v4, &mut buf).0, Ok(4));
+    assert_eq!(recv(&v6only, &mut buf).0, Err(LxError::EAGAIN));
+
+    // A stack that comes later is told of each with what it is for.
+    while stack.told().is_some() {}
+    let Stack { link, end } = stack;
+    drop(end);
+    link.pump();
+    let next = stack_of(&link);
+    let mut told = Vec::new();
+    while let Some(m) = next.told() {
+        told.push(m);
+    }
+    assert!(told.contains(&bind_message(v4.sock, 7000, Takes::Four)));
+    assert!(told.contains(&bind_message(v6only.sock, 7000, Takes::Six)));
+    assert!(told.contains(&bind_message(both.sock, 7001, Takes::Both)));
+    let binds = |told: &[Vec<u8>]| {
+        let is_bind = |m: &&Vec<u8>| parse_header(m).is_some_and(|(op, _)| op == OP_BIND);
+        told.iter().filter(is_bind).count()
+    };
+    assert_eq!(binds(&told), 4, "each once: those and the client");
+
+    // The one of IPv4 gone, the port is free for IPv4 and no more: with
+    // nobody there, 127.0.0.1 is refused, and a socket for both cannot
+    // have it while the one for IPv6 does.
+    drop(v4);
+    assert_eq!(
+        Socket::bind(&another, Endpoint::Ip(at6("::", 7000))),
+        Err(LxError::EADDRINUSE)
+    );
+    let fresh = ServedUdpSocket::new(link.clone(), false).unwrap();
+    assert_eq!(Socket::bind(&fresh, any(7000)), Ok(0));
+    drop(fresh);
+    drop(v6only);
+    assert_eq!(Socket::bind(&another, Endpoint::Ip(at6("::", 7000))), Ok(0));
 }

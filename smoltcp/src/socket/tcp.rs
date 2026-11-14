@@ -12,7 +12,8 @@ use crate::socket::{Context, PollAt, Socket, SocketHandle, SocketMeta};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber, TCP_HEADER_LEN,
+    IpAddress, IpEndpoint, IpProtocol, IpRepr, IpVersion, TcpControl, TcpRepr, TcpSeqNumber,
+    TCP_HEADER_LEN,
 };
 use crate::{Error, Result};
 
@@ -330,9 +331,9 @@ pub struct TcpSocket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_address: IpAddress,
-    /// A listener that takes only what arrives as IPv4: see
-    /// [`set_listen_ipv4_only`](Self::set_listen_ipv4_only).
-    listen_ipv4_only: bool,
+    /// A listener that takes only what arrives as one version of IP: see
+    /// [`set_listen_only`](Self::set_listen_only).
+    listen_only: Option<IpVersion>,
     /// Current local endpoint. This is used for both filtering the incoming packets and
     /// setting the source address. When listening or initiating connection on/from
     /// an unspecified address, this field is updated with the chosen source address before
@@ -431,7 +432,7 @@ impl<'a> TcpSocket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_address: IpAddress::default(),
-            listen_ipv4_only: false,
+            listen_only: None,
             local_endpoint: IpEndpoint::default(),
             remote_endpoint: IpEndpoint::default(),
             local_seq_no: INITIAL_SEQ_NO,
@@ -660,7 +661,7 @@ impl<'a> TcpSocket<'a> {
         self.timeout = None;
         self.hop_limit = None;
         self.listen_address = IpAddress::default();
-        self.listen_ipv4_only = false;
+        self.listen_only = None;
         self.local_endpoint = IpEndpoint::default();
         self.remote_endpoint = IpEndpoint::default();
         self.local_seq_no = INITIAL_SEQ_NO;
@@ -716,11 +717,14 @@ impl<'a> TcpSocket<'a> {
     }
 
     /// Have a socket that listens at every address take only the
-    /// connections that arrive as IPv4, as an `AF_INET` socket does: one
-    /// that arrives as IPv6 is not this socket's, and is refused when it is
-    /// nobody's. Said after [`listen`](Self::listen), which forgets it.
-    pub fn set_listen_ipv4_only(&mut self, on: bool) {
-        self.listen_ipv4_only = on;
+    /// connections that arrive as `version`, as an `AF_INET` socket takes
+    /// those of IPv4 and one that is for IPv6 only (`IPV6_V6ONLY`) those
+    /// of IPv6: one that arrives as the other is not this socket's, so
+    /// another can listen on the same port for those, and it is refused
+    /// when it is nobody's. `None` takes both. Said after
+    /// [`listen`](Self::listen), which forgets it.
+    pub fn set_listen_only(&mut self, version: Option<IpVersion>) {
+        self.listen_only = version;
     }
 
     /// Connect to a given endpoint.
@@ -1272,10 +1276,12 @@ impl<'a> TcpSocket<'a> {
         if self.state == State::Listen && repr.ack_number.is_some() {
             return false;
         }
-        // Nor is what arrives as IPv6 for a listener of IPv4.
+        // Nor is what arrives as one version of IP for a listener of the
+        // other.
         if self.state == State::Listen
-            && self.listen_ipv4_only
-            && !matches!(ip_repr.dst_addr(), IpAddress::Ipv4(_))
+            && self
+                .listen_only
+                .is_some_and(|version| version != ip_repr.dst_addr().version())
         {
             return false;
         }
@@ -3031,6 +3037,33 @@ mod test {
         assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
 
         assert_eq!(s.state, State::Listen);
+    }
+
+    #[test]
+    fn test_listen_only_one_version() {
+        let mut s = socket_listen();
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+        let (arrives, other) = match SEND_IP_TEMPL.dst_addr().version() {
+            IpVersion::Ipv4 => (IpVersion::Ipv4, IpVersion::Ipv6),
+            _ => (IpVersion::Ipv6, IpVersion::Ipv4),
+        };
+        s.set_listen_only(Some(arrives));
+        assert!(s.accepts(&SEND_IP_TEMPL, &syn));
+        s.set_listen_only(Some(other));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &syn));
+        s.set_listen_only(None);
+        assert!(s.accepts(&SEND_IP_TEMPL, &syn));
+
+        // Listening again forgets it.
+        s.set_listen_only(Some(other));
+        s.close();
+        assert_eq!(s.listen(LOCAL_PORT), Ok(()));
+        assert!(s.accepts(&SEND_IP_TEMPL, &syn));
     }
 
     #[test]

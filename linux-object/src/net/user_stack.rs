@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
-//! BIND    (kernel to stack)  16  u16 port
+//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
@@ -27,7 +27,8 @@
 //! sockets (its header's socket is zero): one message wakes the kernel
 //! once for all of them. The kernel numbers the
 //! sockets and gives out the ports: `bind` answers at once, as the `Socket`
-//! trait wants, and two sockets never get one port. A datagram that arrives
+//! trait wants, and two sockets never get one port for the same version
+//! of IP (`only`: see "IPv6 sockets"). A datagram that arrives
 //! is queued on its socket here, up to [`RX_QUEUE_BYTES`], so `recvfrom` and
 //! `poll` are answered from this side without a trip to the stack; past
 //! that it is dropped, as a full receive buffer drops. Each `SEND` says
@@ -229,8 +230,7 @@
 //!             0  u64 socket  8  [u8; 16] from  24  u16 port  26  u16 length  28  the datagram
 //! ```
 //!
-//! The port is one for both: an `AF_INET` socket that has it is not
-//! given what arrives as IPv6. Where the card has no way to
+//! Where the card has no way to
 //! ([`Sixes::reaches`]) is `ENETUNREACH`, and an address of the card's
 //! own is this machine, like `::1`. How many hops such a datagram may
 //! travel is the socket's `IPV6_UNICAST_HOPS` (`IPV6_MULTICAST_HOPS` to
@@ -239,18 +239,35 @@
 //!
 //! What a socket of that family is asked about its options of IPv6's
 //! level it answers itself ([`Socket::getsockopt_own`]): the hops, and
-//! that it is not for IPv6 only.
+//! whether it is for IPv6 only.
+//!
+//! Which it is once it is told so (`IPV6_V6ONLY`), before it has a port.
+//! A program that listens on one socket of each family tells its
+//! `AF_INET6` one that, and gives both the same port: so a port is a
+//! socket's for the versions of IP it takes ([`Takes`]), and one that
+//! takes IPv4 and one that takes IPv6 have the same one. The stack is
+//! told with each `BIND` (`only`: 0 for both, 4, or 6), and gives each
+//! socket what arrived as its own; an `AF_INET` socket's says 4, so what
+//! arrives as IPv6 for a port only it has is refused, as Linux refuses
+//! it. A socket that is for IPv6 only has no way to an address of IPv4
+//! however it is written (`ENETUNREACH`), and cannot be bound to one
+//! (`EINVAL`). In this machine, what is sent to `::1` is for it and what
+//! is sent to 127.0.0.1 is not; and it is told this machine is `::1`,
+//! where a socket for both is told `::ffff:127.0.0.1`.
 //!
 //! So does a stream socket of that family. It connects to any other
 //! IPv6 address with `CONNECT6`, and is told with `CONNECTED` which of
 //! the card's addresses it connected from, which the stack chooses. It
-//! listens with `LISTEN6`, for what arrives as either; an `AF_INET`
-//! socket listens with `LISTEN`, and who knocks at its port as IPv6 is
-//! refused. A connection that arrives as IPv6 is an `ACCEPTED6`:
+//! listens with `LISTEN6`, for what arrives as either, or with
+//! `LISTEN6ONLY` once it was told `IPV6_V6ONLY`; an `AF_INET` socket
+//! listens with `LISTEN`, and who knocks at its port as IPv6 is refused
+//! unless another listens there for that. A connection that arrives as
+//! IPv6 is an `ACCEPTED6`:
 //!
 //! ```text
 //! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
 //! LISTEN6  (kernel to stack)  as LISTEN
+//! LISTEN6ONLY (kernel to stack)  as LISTEN
 //!     CONNECTED  bytes: none, or [u8; 16] the address it connected from
 //!     ACCEPTED6  as ACCEPTED.  bytes: u64 the new socket, [u8; 16] from,
 //!                u16 port, u16 zero, [u8; 16] the address it arrived at
@@ -320,6 +337,7 @@ pub const OP_CONNECT6: u32 = 19;
 pub const OP_LISTEN6: u32 = 20;
 pub const OP_ICMP6: u32 = 21;
 pub const OP_HEAR6: u32 = 22;
+pub const OP_LISTEN6ONLY: u32 = 23;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
 /// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
@@ -396,10 +414,11 @@ fn header(op: u32, sock: u64, room: usize) -> Vec<u8> {
     m
 }
 
-/// `BIND`: socket `sock` has port `port`.
-pub fn bind_message(sock: u64, port: u16) -> Vec<u8> {
-    let mut m = header(OP_BIND, sock, 2);
+/// `BIND`: socket `sock` has port `port`, for what arrives as `takes`.
+pub fn bind_message(sock: u64, port: u16, takes: Takes) -> Vec<u8> {
+    let mut m = header(OP_BIND, sock, 4);
     m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&[takes.byte(), 0]);
     m
 }
 
@@ -635,6 +654,12 @@ pub fn listen6_message(sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u
     listen_of(OP_LISTEN6, sock, port, backlog, window)
 }
 
+/// `LISTEN6ONLY`: as [`listen_message`], for the connections that arrive
+/// as IPv6 and no others.
+pub fn listen6only_message(sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
+    listen_of(OP_LISTEN6ONLY, sock, port, backlog, window)
+}
+
 fn listen_of(op: u32, sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
     let mut m = header(op, sock, 8);
     m.extend_from_slice(&port.to_le_bytes());
@@ -822,6 +847,9 @@ struct Shared {
     hears: Hears,
     /// An `AF_INET6` socket's: which table lists it.
     v6: bool,
+    /// One that was told to carry IPv6 alone (`IPV6_V6ONLY`), which it
+    /// can be told until it has a port.
+    only6: AtomicBool,
 }
 
 /// What is queued on a socket.
@@ -850,6 +878,9 @@ struct Inner {
     here: Option<Ipv4Address>,
     /// The peer of a connected socket.
     remote: Option<IpEndpoint>,
+    /// Whether the peer was said as an address of IPv6: `::1`, which is
+    /// kept as 127.0.0.1.
+    remote_six: bool,
     flags: OpenFlags,
     /// `MSG_TRUNC` of the last read, for `recvmsg`.
     last_msg_flags: i32,
@@ -902,6 +933,7 @@ impl Shared {
                 port: None,
                 here: None,
                 remote: None,
+                remote_six: false,
                 flags: OpenFlags::RDWR,
                 last_msg_flags: 0,
                 last_hops: 0,
@@ -913,7 +945,13 @@ impl Shared {
             }),
             hears,
             v6,
+            only6: AtomicBool::new(false),
         })
+    }
+
+    /// Which versions of IP the socket is for.
+    fn takes(&self) -> Takes {
+        Takes::of(self.v6, self.only6.load(Ordering::Relaxed))
     }
 
     /// A datagram this socket sent to `to` was not delivered, and will
@@ -996,7 +1034,7 @@ impl Shared {
 
     /// The next datagram, taken off the queue or only looked at, as a
     /// socket of that family says who sent it.
-    async fn receive(&self, v6: bool, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
+    async fn receive(&self, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
         let nobody = || Endpoint::Ip(IpEndpoint::UNSPECIFIED);
         let mut until = Until::default();
         loop {
@@ -1029,7 +1067,7 @@ impl Shared {
                     if inner.queue.is_empty() && !inner.read_closed {
                         self.bus.lock().clear(Event::READABLE);
                     }
-                    return (Ok(n), Endpoint::Ip(shown(v6, from)));
+                    return (Ok(n), Endpoint::Ip(shown(self.takes(), from)));
                 }
                 if inner.read_closed {
                     return (Ok(0), nobody());
@@ -1081,48 +1119,171 @@ impl Shared {
     }
 }
 
+/// Which versions of IP a socket is for: what arrives as each is its
+/// own, and so is its port for each. A socket that is for one leaves the
+/// port to another for the other, as `sshd` and others expect when they
+/// listen on one socket of each family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// An `AF_INET6` socket, which carries IPv4 too.
+    Both,
+    /// An `AF_INET` socket.
+    Four,
+    /// An `AF_INET6` socket that was told to carry IPv6 alone
+    /// (`IPV6_V6ONLY`).
+    Six,
+}
+
+impl Takes {
+    /// What a socket takes that is `AF_INET6` when `v6`, and was told to
+    /// carry IPv6 alone when `only6`.
+    fn of(v6: bool, only6: bool) -> Takes {
+        match (v6, only6) {
+            (false, _) => Takes::Four,
+            (true, false) => Takes::Both,
+            (true, true) => Takes::Six,
+        }
+    }
+
+    fn four(self) -> bool {
+        self != Takes::Six
+    }
+
+    fn six(self) -> bool {
+        self != Takes::Four
+    }
+
+    /// As a `BIND` says it: 0 for both, or the version.
+    pub fn byte(self) -> u8 {
+        match self {
+            Takes::Both => 0,
+            Takes::Four => 4,
+            Takes::Six => 6,
+        }
+    }
+
+    /// A bit for each version.
+    fn bits(self) -> u8 {
+        u8::from(self.four()) | u8::from(self.six()) << 1
+    }
+}
+
 /// The ports of one protocol: which are taken, and where the search for
 /// a free one starts.
 struct Ports {
-    taken: BTreeSet<u16>,
+    /// Each port that is taken, and for which versions of IP
+    /// ([`Takes::bits`]).
+    taken: BTreeMap<u16, u8>,
     next: u16,
 }
 
 impl Default for Ports {
     fn default() -> Self {
         Ports {
-            taken: BTreeSet::new(),
+            taken: BTreeMap::new(),
             next: *EPHEMERAL.start(),
         }
     }
 }
 
 impl Ports {
-    /// Take the port `wanted`, or any when it is 0. `EADDRINUSE` when
-    /// another socket has it or none is left.
-    fn take(&mut self, wanted: u16) -> LxResult<u16> {
-        if wanted != 0 {
-            if !self.taken.insert(wanted) {
+    /// For which versions of IP `port` is taken.
+    fn held(&self, port: u16) -> u8 {
+        self.taken.get(&port).copied().unwrap_or(0)
+    }
+
+    /// Take the port `wanted`, or any when it is 0, for what a socket
+    /// `takes`. `EADDRINUSE` when another socket has it for any of that,
+    /// or none is left.
+    fn take(&mut self, wanted: u16, takes: Takes) -> LxResult<u16> {
+        let bits = takes.bits();
+        let port = if wanted != 0 {
+            if self.held(wanted) & bits != 0 {
                 return Err(LxError::EADDRINUSE);
             }
-            return Ok(wanted);
-        }
-        let span = EPHEMERAL.len() as u32;
-        let first = self.next;
-        let port = (0..span)
-            .map(|i| {
-                let at = (first - EPHEMERAL.start()) as u32 + i;
-                EPHEMERAL.start() + (at % span) as u16
-            })
-            .find(|p| !self.taken.contains(p))
-            .ok_or(LxError::EADDRINUSE)?;
-        self.taken.insert(port);
-        self.next = if port == *EPHEMERAL.end() {
-            *EPHEMERAL.start()
+            wanted
         } else {
-            port + 1
+            let span = EPHEMERAL.len() as u32;
+            let first = self.next;
+            let port = (0..span)
+                .map(|i| {
+                    let at = (first - EPHEMERAL.start()) as u32 + i;
+                    EPHEMERAL.start() + (at % span) as u16
+                })
+                .find(|p| self.held(*p) & bits == 0)
+                .ok_or(LxError::EADDRINUSE)?;
+            self.next = if port == *EPHEMERAL.end() {
+                *EPHEMERAL.start()
+            } else {
+                port + 1
+            };
+            port
         };
+        *self.taken.entry(port).or_default() |= bits;
         Ok(port)
+    }
+
+    /// The socket that took `port` for what it `takes` is gone.
+    fn free(&mut self, port: u16, takes: Takes) {
+        if let Some(held) = self.taken.get_mut(&port) {
+            *held &= !takes.bits();
+            if *held == 0 {
+                self.taken.remove(&port);
+            }
+        }
+    }
+}
+
+/// Which socket has each port, for what is IPv4 and for what is IPv6:
+/// one socket for both, or one for each.
+#[derive(Default)]
+struct Holders {
+    four: BTreeMap<u16, u64>,
+    six: BTreeMap<u16, u64>,
+}
+
+impl Holders {
+    /// `sock` has `port`, for what it `takes`.
+    fn insert(&mut self, port: u16, sock: u64, takes: Takes) {
+        if takes.four() {
+            self.four.insert(port, sock);
+        }
+        if takes.six() {
+            self.six.insert(port, sock);
+        }
+    }
+
+    /// `sock` has `port` no more.
+    fn remove(&mut self, port: u16, sock: u64) {
+        for holders in [&mut self.four, &mut self.six] {
+            if holders.get(&port) == Some(&sock) {
+                holders.remove(&port);
+            }
+        }
+    }
+
+    /// Who has `port` for what a program of this machine sends there: to
+    /// an address of IPv6 when `six`. `::1` is this machine with no
+    /// version of IP in between, so what is sent there finds a socket of
+    /// `AF_INET` when no other has the port; what is sent to 127.0.0.1
+    /// never finds one that is for IPv6 only.
+    fn get(&self, port: u16, six: bool) -> Option<u64> {
+        let four = || self.four.get(&port);
+        if six {
+            self.six.get(&port).or_else(four).copied()
+        } else {
+            four().copied()
+        }
+    }
+
+    /// Every socket that has a port, once, and the port.
+    fn each(&self) -> Vec<(u64, u16)> {
+        let both = self.four.iter().chain(
+            self.six
+                .iter()
+                .filter(|(port, sock)| self.four.get(port) != Some(sock)),
+        );
+        both.map(|(port, sock)| (*sock, *port)).collect()
     }
 }
 
@@ -1137,7 +1298,7 @@ struct Table {
     next_sock: u64,
     /// Which datagram socket has each port: where a datagram from another
     /// program of this machine goes.
-    bound: BTreeMap<u16, u64>,
+    bound: Holders,
     /// The groups the machine is a member of, and how many sockets asked
     /// for each.
     groups: BTreeMap<Ipv4Address, usize>,
@@ -1147,7 +1308,7 @@ struct Table {
     idents: Ports,
     /// Which stream socket listens on each port: where a connection from
     /// another program of this machine goes.
-    listening: BTreeMap<u16, u64>,
+    listening: Holders,
     /// The connections between two programs of this machine: each end's
     /// number to the other's, and to 0 once the other end has closed.
     joined: BTreeMap<u64, u64>,
@@ -1327,13 +1488,28 @@ fn either(v6: bool, addr: IpAddress, elsewhere: LxError) -> LxResult<IpAddress> 
 /// frame loses when it travels as IPv6.
 const IPV6_MORE: usize = 20;
 
-/// `endpoint` as a socket of that family says it: the other way of
-/// [`plain`].
-fn shown(v6: bool, endpoint: IpEndpoint) -> IpEndpoint {
-    if !v6 {
+/// Whether `addr` is an IPv4 address written as one of IPv6
+/// (`::ffff:a.b.c.d`): what a socket that is for IPv6 only has no way to
+/// (`ENETUNREACH`) and cannot be bound to (`EINVAL`).
+fn disguised(addr: IpAddress) -> bool {
+    matches!(addr, IpAddress::Ipv6(addr) if addr.as_ipv4().is_some())
+}
+
+/// Whether `addr` is an address of IPv6 that is no IPv4 one in disguise:
+/// `::1` among them, which [`plain`] makes 127.0.0.1.
+fn said_as_six(addr: IpAddress) -> bool {
+    matches!(addr, IpAddress::Ipv6(_)) && !disguised(addr)
+}
+
+/// `endpoint` as a socket that takes that says it: the other way of
+/// [`plain`]. To one that is for IPv6 only this machine is `::1`, the
+/// only address of IPv4 it is ever told.
+fn shown(takes: Takes, endpoint: IpEndpoint) -> IpEndpoint {
+    if takes == Takes::Four {
         return endpoint;
     }
     let addr = match endpoint.addr {
+        IpAddress::Ipv4(addr) if takes == Takes::Six && addr.is_loopback() => Ipv6Address::LOOPBACK,
         IpAddress::Ipv4(addr) if !addr.is_unspecified() => Ipv6Address::from(addr),
         IpAddress::Ipv6(addr) => addr,
         _ => Ipv6Address::UNSPECIFIED,
@@ -1443,18 +1619,20 @@ impl StackLink {
             let table = self.table.lock();
             let bound: Vec<(u64, u16, Arc<Shared>)> = table
                 .bound
-                .iter()
-                .filter_map(|(port, sock)| {
-                    let shared = table.socks.get(sock).and_then(Weak::upgrade)?;
-                    Some((*sock, *port, shared))
+                .each()
+                .into_iter()
+                .filter_map(|(sock, port)| {
+                    let shared = table.socks.get(&sock).and_then(Weak::upgrade)?;
+                    Some((sock, port, shared))
                 })
                 .collect();
             let listening: Vec<(u64, u16, Arc<tcp::Stream>)> = table
                 .listening
-                .iter()
-                .filter_map(|(port, sock)| {
-                    let stream = table.streams.get(sock).and_then(Weak::upgrade)?;
-                    Some((*sock, *port, stream))
+                .each()
+                .into_iter()
+                .filter_map(|(sock, port)| {
+                    let stream = table.streams.get(&sock).and_then(Weak::upgrade)?;
+                    Some((sock, port, stream))
                 })
                 .collect();
             let hearing: Vec<(u64, bool)> = table
@@ -1477,7 +1655,7 @@ impl StackLink {
         }
         for (sock, port, shared) in bound {
             if shared.inner.lock().here.is_none() {
-                let _ = self.tell(bind_message(sock, port), true);
+                let _ = self.tell(bind_message(sock, port, shared.takes()), true);
             }
         }
         for (sock, port, stream) in listening {
@@ -1658,7 +1836,9 @@ impl StackLink {
             }
             // A datagram for a socket that closed meanwhile is nobody's.
             let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
-            if let Some(shared) = shared {
+            // Nor is one that travelled as IPv4 a socket's that is for
+            // IPv6 only, whatever the stack says.
+            if let Some(shared) = shared.filter(|shared| shared.takes().four()) {
                 let from = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port);
                 shared.deliver(from, data);
             }
@@ -1685,7 +1865,7 @@ impl StackLink {
                 continue;
             }
             let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
-            if let Some(shared) = shared.filter(|shared| shared.v6) {
+            if let Some(shared) = shared.filter(|shared| shared.takes().six()) {
                 let from = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr)), port);
                 shared.deliver(from, data);
             }
@@ -1744,34 +1924,34 @@ impl StackLink {
         })
     }
 
-    /// Give a socket the port `wanted`, or any when it is 0, and tell the
-    /// stack, unless the socket is this machine's alone (`told`).
-    /// `EADDRINUSE` when another has it or none is left. With no stack
-    /// to tell, the port is the socket's all the same: the next stack is
-    /// told when it comes.
-    fn bind(&self, sock: u64, wanted: u16, told: bool) -> LxResult<u16> {
+    /// Give a socket the port `wanted`, or any when it is 0, for what it
+    /// `takes`, and tell the stack, unless the socket is this machine's
+    /// alone (`told`). `EADDRINUSE` when another has it for any of that
+    /// or none is left. With no stack to tell, the port is the socket's
+    /// all the same: the next stack is told when it comes.
+    fn bind(&self, sock: u64, wanted: u16, takes: Takes, told: bool) -> LxResult<u16> {
         let _telling = self.telling.lock();
         let port = {
             let mut table = self.table.lock();
-            let port = table.ports.take(wanted)?;
-            table.bound.insert(port, sock);
+            let port = table.ports.take(wanted, takes)?;
+            table.bound.insert(port, sock, takes);
             port
         };
         if told {
-            let _ = self.tell(bind_message(sock, port), true);
+            let _ = self.tell(bind_message(sock, port, takes), true);
         }
         Ok(port)
     }
 
     /// A socket is gone: its number and its port are free, and the stack
     /// is told, if it was ever told of the socket (`told`).
-    fn close(&self, sock: u64, port: Option<u16>, told: bool) {
+    fn close(&self, sock: u64, port: Option<u16>, takes: Takes, told: bool) {
         {
             let mut table = self.table.lock();
             table.socks.remove(&sock);
             if let Some(port) = port {
-                table.ports.taken.remove(&port);
-                table.bound.remove(&port);
+                table.ports.free(port, takes);
+                table.bound.remove(port, sock);
             }
         }
         if told {
@@ -1801,7 +1981,7 @@ impl StackLink {
             table.socks.remove(&sock);
             table.hearing.remove(&sock);
             if let Some(ident) = ident {
-                table.idents.taken.remove(&ident);
+                table.idents.free(ident, Takes::Both);
             }
         }
         let _ = self.tell(close_message(sock), true);
@@ -1810,7 +1990,7 @@ impl StackLink {
     /// Give a socket that pings the identifier `wanted`, or any when it
     /// is 0. `EADDRINUSE` when another has it or none is left.
     fn ident(&self, wanted: u16) -> LxResult<u16> {
-        self.table.lock().idents.take(wanted)
+        self.table.lock().idents.take(wanted, Takes::Both)
     }
 
     /// The sockets that hear ICMP, of either kind.
@@ -1863,8 +2043,8 @@ impl StackLink {
     fn send_here6(&self, from: IpEndpoint, port: u16, data: &[u8]) -> bool {
         let shared = {
             let table = self.table.lock();
-            let sock = table.bound.get(&port);
-            sock.and_then(|sock| table.socks.get(sock))
+            let sock = table.bound.get(port, true);
+            sock.and_then(|sock| table.socks.get(&sock))
                 .and_then(Weak::upgrade)
         };
         shared.is_some_and(|shared| {
@@ -1877,14 +2057,22 @@ impl StackLink {
     }
 
     /// A datagram from one program of this machine to another: onto the
-    /// queue of the socket that has the port, if one has. `false` when
+    /// queue of the socket that has the port, if one has, for what was
+    /// sent to an address of IPv6 (`::1`) when `six`. `false` when
     /// nobody has it at that address: the datagram is lost, and who sent
     /// it is refused as a host with nobody at the port refuses.
-    fn send_here(&self, from: IpEndpoint, to: Ipv4Address, port: u16, data: &[u8]) -> bool {
+    fn send_here(
+        &self,
+        from: IpEndpoint,
+        to: Ipv4Address,
+        port: u16,
+        data: &[u8],
+        six: bool,
+    ) -> bool {
         let shared = {
             let table = self.table.lock();
-            let sock = table.bound.get(&port);
-            sock.and_then(|sock| table.socks.get(sock))
+            let sock = table.bound.get(port, six);
+            sock.and_then(|sock| table.socks.get(&sock))
                 .and_then(Weak::upgrade)
         };
         shared.is_some_and(|shared| shared.deliver_here(to, from, data))
@@ -1998,9 +2186,32 @@ impl ServedUdpSocket {
         if let Some(port) = self.shared.inner.lock().port {
             return Ok(port);
         }
-        let port = self.link.bind(self.sock, 0, true)?;
+        let port = self.link.bind(self.sock, 0, self.shared.takes(), true)?;
         self.shared.inner.lock().port = Some(port);
         Ok(port)
+    }
+
+    /// `IPV6_V6ONLY`: the socket carries IPv6 alone, or both again.
+    /// Something to say before the socket has a port, which is its own
+    /// for what it carries (`do_ipv6_setsockopt`).
+    fn set_only6(&self, data: &[u8]) -> SysResult {
+        let only6 = icmp6::flag(data)?;
+        let inner = self.shared.inner.lock();
+        if inner.port.is_some() {
+            return Err(LxError::EINVAL);
+        }
+        self.shared.only6.store(only6, Ordering::Relaxed);
+        Ok(0)
+    }
+
+    /// `addr` as [`either`] reads it, when this socket has a way there:
+    /// one that is for IPv6 only has none to an address of IPv4,
+    /// however it is written (`elsewhere`).
+    fn way(&self, addr: IpAddress, elsewhere: LxError) -> LxResult<IpAddress> {
+        if self.shared.takes() == Takes::Six && disguised(addr) {
+            return Err(elsewhere);
+        }
+        either(self.v6, addr, elsewhere)
     }
 }
 
@@ -2049,7 +2260,7 @@ impl Asked {
         tv[8..].copy_from_slice(&((micros % 1_000_000) as i64).to_ne_bytes());
         self.socket.shared.inner.lock().patience.receive = tv;
         let mut buf = vec![0u8; MAX_DATAGRAM];
-        match self.socket.shared.receive(false, &mut buf, true).await.0 {
+        match self.socket.shared.receive(&mut buf, true).await.0 {
             Ok(n) => {
                 buf.truncate(n);
                 Ok(buf)
@@ -2067,28 +2278,34 @@ impl Drop for ServedUdpSocket {
             let inner = self.shared.inner.lock();
             (inner.port, inner.here)
         };
-        self.link.close(self.sock, port, here.is_none());
+        self.link
+            .close(self.sock, port, self.shared.takes(), here.is_none());
     }
 }
 
 #[async_trait]
 impl Socket for ServedUdpSocket {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(self.v6, data, true).await
+        self.shared.receive(data, true).await
     }
 
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(self.v6, data, false).await
+        self.shared.receive(data, false).await
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
-        let to = match sendto_endpoint {
+        // Where to, and whether that was said as an address of IPv6.
+        let (to, six) = match sendto_endpoint {
             Some(Endpoint::Ip(mut to)) => {
-                to.addr = either(self.v6, to.addr, LxError::ENETUNREACH)?;
-                to
+                let six = said_as_six(to.addr);
+                to.addr = self.way(to.addr, LxError::ENETUNREACH)?;
+                (to, six)
             }
             Some(_) => return Err(LxError::EAFNOSUPPORT),
-            None => self.shared.inner.lock().remote.ok_or(LxError::ENOTCONN)?,
+            None => {
+                let inner = self.shared.inner.lock();
+                (inner.remote.ok_or(LxError::ENOTCONN)?, inner.remote_six)
+            }
         };
         let addr = match to.addr {
             IpAddress::Ipv4(addr) => addr,
@@ -2112,7 +2329,7 @@ impl Socket for ServedUdpSocket {
             let port = self.autobind()?;
             let from = here.unwrap_or_else(|| self.link.here_for(addr));
             let from = IpEndpoint::new(IpAddress::Ipv4(from), port);
-            if !self.link.send_here(from, addr, to.port, data) {
+            if !self.link.send_here(from, addr, to.port, data, six) {
                 // Nobody at the port, said as the ICMP message that
                 // would have come back says it.
                 self.shared.undelivered(to, LxError::ECONNREFUSED);
@@ -2158,7 +2375,10 @@ impl Socket for ServedUdpSocket {
         let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
-        peer.addr = either(self.v6, peer.addr, LxError::ENETUNREACH)?;
+        let six = said_as_six(peer.addr);
+        // `ip6_datagram_connect`: a socket that is for IPv6 only has no
+        // way to an address of IPv4.
+        peer.addr = self.way(peer.addr, LxError::ENETUNREACH)?;
         match peer.addr {
             IpAddress::Ipv4(_) => {}
             // `ip6_datagram_connect`: no way there is said now.
@@ -2171,7 +2391,9 @@ impl Socket for ServedUdpSocket {
             _ => return Err(LxError::EAFNOSUPPORT),
         }
         self.autobind()?;
-        self.shared.inner.lock().remote = Some(peer);
+        let mut inner = self.shared.inner.lock();
+        inner.remote = Some(peer);
+        inner.remote_six = six;
         Ok(0)
     }
 
@@ -2179,7 +2401,9 @@ impl Socket for ServedUdpSocket {
         let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
-        local.addr = either(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
+        // `inet6_bind`: an address of IPv4 is none for a socket that is
+        // for IPv6 only.
+        local.addr = self.way(local.addr, LxError::EINVAL)?;
         // An IPv6 address has to be one the card has; the socket then
         // hears at its port, like one bound to `::`.
         if let IpAddress::Ipv6(addr) = local.addr {
@@ -2201,7 +2425,8 @@ impl Socket for ServedUdpSocket {
         // just then is told of the sockets that are not this machine's
         // alone.
         self.shared.inner.lock().here = here;
-        let bound = self.link.bind(self.sock, local.port, here.is_none());
+        let takes = self.shared.takes();
+        let bound = self.link.bind(self.sock, local.port, takes, here.is_none());
         let mut inner = self.shared.inner.lock();
         match bound {
             Ok(port) => inner.port = Some(port),
@@ -2230,12 +2455,12 @@ impl Socket for ServedUdpSocket {
             IpAddress::Ipv4(inner.here.unwrap_or(Ipv4Address::UNSPECIFIED)),
             inner.port.unwrap_or(0),
         );
-        Some(Endpoint::Ip(shown(self.v6, local)))
+        Some(Endpoint::Ip(shown(self.shared.takes(), local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
         let remote = self.shared.inner.lock().remote?;
-        Some(Endpoint::Ip(shown(self.v6, remote)))
+        Some(Endpoint::Ip(shown(self.shared.takes(), remote)))
     }
 
     fn is_inet(&self) -> bool {
@@ -2276,6 +2501,9 @@ impl Socket for ServedUdpSocket {
             if !self.v6 {
                 return Err(LxError::ENOPROTOOPT);
             }
+            if opt == icmp6::IPV6_V6ONLY {
+                return self.set_only6(data);
+            }
             if let Some(kept) = self.six.lock().set_hops(opt, data) {
                 return kept.map(|()| 0);
             }
@@ -2289,6 +2517,10 @@ impl Socket for ServedUdpSocket {
     fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
         if !self.v6 || level != icmp6::IPPROTO_IPV6 {
             return None;
+        }
+        if opt == icmp6::IPV6_V6ONLY {
+            let only6 = self.shared.takes() == Takes::Six;
+            return Some(i32::from(only6).to_ne_bytes().to_vec());
         }
         // Whether what arrives says its hops is not kept here: nothing
         // says it of a datagram.

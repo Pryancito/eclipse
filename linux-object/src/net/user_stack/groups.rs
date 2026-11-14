@@ -231,7 +231,7 @@ impl ServedUdpSocket {
             return;
         }
         let from = IpEndpoint::new(IpAddress::Ipv4(self.link.address()), port);
-        self.link.send_here(from, group, to.port, data);
+        self.link.send_here(from, group, to.port, data, false);
     }
 }
 
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(add(&s, GROUP), Ok(0));
         assert_eq!(Socket::bind(&s, any(5000)), Ok(0));
         let stack = stack_of(&link);
-        assert_eq!(stack.told(), Some(bind_message(s.sock, 5000)));
+        assert_eq!(stack.told(), Some(bind_message(s.sock, 5000, Takes::Four)));
         assert_eq!(stack.told(), Some(join_message(GROUP)));
         assert_eq!(stack.told(), None);
         // And the one after it.
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(drop_group(&s, GROUP), Ok(0));
         assert_eq!(add(&s, OTHER), Ok(0));
         let next = stack_of(&link);
-        assert_eq!(next.told(), Some(bind_message(s.sock, 5000)));
+        assert_eq!(next.told(), Some(bind_message(s.sock, 5000, Takes::Four)));
         assert_eq!(next.told(), Some(join_message(OTHER)));
         assert_eq!(next.told(), None);
         // What arrives for the group arrives for the port.
@@ -433,10 +433,16 @@ mod tests {
         let stack = stack();
         let member = socket(&stack.link);
         assert_eq!(Socket::bind(&member, any(5000)), Ok(0));
-        assert_eq!(stack.told(), Some(bind_message(member.sock, 5000)));
+        assert_eq!(
+            stack.told(),
+            Some(bind_message(member.sock, 5000, Takes::Four))
+        );
         let sender = socket(&stack.link);
         assert_eq!(Socket::bind(&sender, any(6000)), Ok(0));
-        assert_eq!(stack.told(), Some(bind_message(sender.sock, 6000)));
+        assert_eq!(
+            stack.told(),
+            Some(bind_message(sender.sock, 6000, Takes::Four))
+        );
 
         // Nobody here is a member: out, one hop, and that is all.
         assert_eq!(Socket::write(&sender, b"one", to(GROUP, 5000)), Ok(3));

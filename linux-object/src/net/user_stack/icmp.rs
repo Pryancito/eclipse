@@ -264,11 +264,11 @@ impl Drop for ServedIcmpSocket {
 #[async_trait]
 impl Socket for ServedIcmpSocket {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(self.is_six(), data, true).await
+        self.shared.receive(data, true).await
     }
 
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        self.shared.receive(self.is_six(), data, false).await
+        self.shared.receive(data, false).await
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
@@ -382,7 +382,7 @@ impl Socket for ServedIcmpSocket {
     fn endpoint(&self) -> Option<Endpoint> {
         let ident = self.shared.inner.lock().port.unwrap_or(0);
         let local = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), ident);
-        Some(Endpoint::Ip(shown(self.is_six(), local)))
+        Some(Endpoint::Ip(shown(Takes::of(self.is_six(), false), local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
