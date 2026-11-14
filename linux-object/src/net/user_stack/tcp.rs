@@ -67,7 +67,10 @@ struct Inner {
     here: Option<Ipv4Address>,
     /// Its own address in a connection to another program of this
     /// machine, where it is not the stack's.
-    local: Option<Ipv4Address>,
+    local: Option<IpAddress>,
+    /// Its own address in a connection of IPv6 that the stack carries:
+    /// which of the card's, as the stack said.
+    at: Option<Ipv6Address>,
     remote: Option<IpEndpoint>,
     flags: OpenFlags,
     read_closed: bool,
@@ -92,6 +95,7 @@ impl Inner {
             holds_port: false,
             here: None,
             local: None,
+            at: None,
             remote: None,
             flags: OpenFlags::RDWR,
             read_closed: false,
@@ -174,6 +178,28 @@ fn failed(inner: &Inner) -> bool {
     inner.error.is_some()
 }
 
+/// The address a socket has. A connection has the stack's (`stack` when
+/// it is one of IPv4, and of IPv6 the one the stack said, once it has),
+/// or this machine's when it is to another of its programs; a socket that
+/// only has a port has every address, unless it was bound to one of this
+/// machine's.
+fn address(inner: &Inner, stack: Ipv4Address) -> IpAddress {
+    let six = matches!(inner.remote, Some(remote) if matches!(remote.addr, IpAddress::Ipv6(_)));
+    if let Some(local) = inner.local {
+        local
+    } else if let Some(here) = inner.here {
+        IpAddress::Ipv4(here)
+    } else if let Some(at) = inner.at {
+        IpAddress::Ipv6(at)
+    } else {
+        match inner.phase {
+            Phase::Fresh | Phase::Listening => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            _ if six => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+            _ => IpAddress::Ipv4(stack),
+        }
+    }
+}
+
 impl Stream {
     fn new(inner: Inner, v6: bool) -> Arc<Stream> {
         let stream = Arc::new(Stream {
@@ -234,6 +260,17 @@ impl Stream {
         inner.phase == Phase::Listening && inner.here.is_none()
     }
 
+    /// What tells a stack that it listens on `port`: for what arrives as
+    /// IPv6 as well, when it is an `AF_INET6` socket.
+    pub(super) fn listen_message(&self, sock: u64, port: u16) -> Vec<u8> {
+        let message = if self.v6 {
+            listen6_message
+        } else {
+            listen_message
+        };
+        message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32)
+    }
+
     /// How `/proc/net/tcp` lists it, when it does: a socket that listens,
     /// connects or is connected, as Linux lists the ones that are in its
     /// tables. `stack` is the address a connection the stack carries has.
@@ -257,12 +294,8 @@ impl Stream {
                 (true, true) => TCP_LAST_ACK,
             },
         };
-        let addr = inner.local.or(inner.here).unwrap_or(match inner.phase {
-            Phase::Listening => Ipv4Address::UNSPECIFIED,
-            _ => stack,
-        });
         Some(Listed {
-            local: IpEndpoint::new(IpAddress::Ipv4(addr), inner.port.unwrap_or(0)),
+            local: IpEndpoint::new(address(&inner, stack), inner.port.unwrap_or(0)),
             remote: inner.remote.filter(|_| inner.phase != Phase::Listening),
             state,
             unread: inner.queued,
@@ -271,18 +304,26 @@ impl Stream {
     }
 }
 
-/// The new socket, and where it connected from, of an `ACCEPTED`.
-fn parse_accepted(bytes: &[u8]) -> Option<(u64, IpEndpoint)> {
-    if bytes.len() != ACCEPTED_LEN {
-        return None;
+/// The new socket and where it connected from, of an `ACCEPTED`; of an
+/// `ACCEPTED6`, also the address of the card it connected to.
+fn parse_accepted(what: u16, bytes: &[u8]) -> Option<(u64, IpEndpoint, Option<Ipv6Address>)> {
+    let sock = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+    match (what, bytes.len()) {
+        (EV_ACCEPTED, ACCEPTED_LEN) => {
+            let addr: [u8; 4] = bytes[8..12].try_into().ok()?;
+            let port = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
+            let from = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port);
+            Some((sock, from, None))
+        }
+        (EV_ACCEPTED6, ACCEPTED6_LEN) => {
+            let addr: [u8; 16] = bytes[8..24].try_into().ok()?;
+            let port = u16::from_le_bytes(bytes[24..26].try_into().ok()?);
+            let at: [u8; 16] = bytes[28..44].try_into().ok()?;
+            let from = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr)), port);
+            Some((sock, from, Some(Ipv6Address(at))))
+        }
+        _ => None,
     }
-    let sock = u64::from_le_bytes(bytes[..8].try_into().ok()?);
-    let addr: [u8; 4] = bytes[8..12].try_into().ok()?;
-    let port = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
-    Some((
-        sock,
-        IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port),
-    ))
 }
 
 impl StackLink {
@@ -309,10 +350,8 @@ impl StackLink {
             // A connection for a listener that closed meanwhile is
             // nobody's, and the stack is told so. Anything else for a
             // socket that closed is late.
-            if what == EV_ACCEPTED {
-                if let Some((new, _)) = parse_accepted(bytes) {
-                    let _ = self.tell(close_message(new), true);
-                }
+            if let Some((new, ..)) = parse_accepted(what, bytes) {
+                let _ = self.tell(close_message(new), true);
             }
             return;
         };
@@ -325,6 +364,9 @@ impl StackLink {
                     inner.phase = Phase::Open;
                     inner.credit = (number as usize).min(CREDIT_MAX);
                     inner.error = None;
+                    // Of IPv6, from which of the card's addresses.
+                    let at: Option<[u8; 16]> = bytes.try_into().ok();
+                    inner.at = at.map(Ipv6Address);
                     stream.sync(&inner, Event::WRITABLE);
                 }
                 (EV_FAILED, Phase::Connecting | Phase::Open) => {
@@ -349,8 +391,8 @@ impl StackLink {
                     });
                     stream.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
                 }
-                (EV_ACCEPTED, Phase::Listening) => {
-                    let Some((new, from)) = parse_accepted(bytes) else {
+                (EV_ACCEPTED | EV_ACCEPTED6, Phase::Listening) => {
+                    let Some((new, from, at)) = parse_accepted(what, bytes) else {
                         warn!("user stack: an ACCEPTED of {} bytes", bytes.len());
                         return;
                     };
@@ -359,14 +401,16 @@ impl StackLink {
                         warn!("user stack: an ACCEPTED with a number that is taken");
                         return;
                     }
-                    if inner.waiting.len() >= WAITING_MAX {
-                        // Nobody accepts: the connection is not kept.
+                    if inner.waiting.len() >= WAITING_MAX || (at.is_some() && !stream.v6) {
+                        // Nobody accepts: the connection is not kept. Nor
+                        // is one of IPv6 on a socket that is not.
                         refuse = Some(close_message(new));
                     } else {
                         let mut child = Inner::new(Phase::Open);
                         child.credit = (number as usize).min(CREDIT_MAX);
                         child.port = inner.port;
                         child.remote = Some(from);
+                        child.at = at;
                         let child = Stream::new(child, stream.v6);
                         table.streams.insert(new, Arc::downgrade(&child));
                         drop(table);
@@ -440,7 +484,7 @@ impl StackLink {
     /// `from`, is joined to a new socket on the queue of whoever listens
     /// on `port` at `to`, or refused when nobody does. Either is said to
     /// `sock` as the stack would say it, before this returns.
-    fn join(&self, sock: u64, to: Ipv4Address, port: u16, from: IpEndpoint) {
+    fn join(&self, sock: u64, to: IpAddress, port: u16, from: IpEndpoint) {
         let listener = {
             let table = self.table.lock();
             let listener = table.listening.get(&port);
@@ -450,9 +494,11 @@ impl StackLink {
         };
         let made = listener.is_some_and(|listener| {
             let mut inner = listener.inner.lock();
-            // One bound to an address takes what is for that address.
+            // One bound to an address takes what is for that address, and
+            // one of IPv4 what is for an address of IPv4.
             if inner.phase != Phase::Listening
-                || inner.here.is_some_and(|here| here != to)
+                || inner.here.is_some_and(|here| IpAddress::Ipv4(here) != to)
+                || (matches!(to, IpAddress::Ipv6(_)) && !listener.v6)
                 || inner.waiting.len() >= WAITING_MAX
             {
                 return false;
@@ -751,12 +797,21 @@ impl Socket for ServedTcpSocket {
         let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
-        peer.addr = plain(self.v6, peer.addr, LxError::ENETUNREACH)?;
-        let IpAddress::Ipv4(addr) = peer.addr else {
-            return Err(LxError::EAFNOSUPPORT);
+        peer.addr = either(self.v6, peer.addr, LxError::ENETUNREACH)?;
+        // Another program of this machine: the kernel joins the two. An
+        // address of the card's own is this machine in IPv6 too.
+        let here = match peer.addr {
+            IpAddress::Ipv4(addr) => self.link.is_here(addr),
+            IpAddress::Ipv6(addr) => self.link.sixes().has(&addr),
+            _ => return Err(LxError::EAFNOSUPPORT),
         };
-        // Another program of this machine: the kernel joins the two.
-        let here = self.link.is_here(addr);
+        // `tcp_v6_connect`: nobody to connect to at a group's address, and
+        // nowhere to send it where the card has no way to.
+        if let IpAddress::Ipv6(addr) = peer.addr {
+            if !here && (addr.is_multicast() || !self.link.sixes().reaches(&addr)) {
+                return Err(LxError::ENETUNREACH);
+            }
+        }
         let started = {
             let mut inner = self.stream.inner.lock();
             match inner.phase {
@@ -775,8 +830,12 @@ impl Socket for ServedTcpSocket {
                     inner.error = None;
                     inner.remote = Some(peer);
                     if here {
-                        let from = inner.here.unwrap_or_else(|| self.link.here_for(addr));
-                        inner.local = Some(from);
+                        inner.local = Some(match peer.addr {
+                            IpAddress::Ipv4(addr) => IpAddress::Ipv4(
+                                inner.here.unwrap_or_else(|| self.link.here_for(addr)),
+                            ),
+                            own => own,
+                        });
                     }
                     self.stream.sync(&inner, Event::empty());
                     Some((local, inner.local))
@@ -794,11 +853,19 @@ impl Socket for ServedTcpSocket {
         if let Some((local, Some(from))) = started.filter(|_| here) {
             // Made or refused by the time this returns: there is nothing
             // to be in progress, and the wait below does not wait.
-            let from = IpEndpoint::new(IpAddress::Ipv4(from), local);
-            self.link.join(self.sock, addr, peer.port, from);
+            let from = IpEndpoint::new(from, local);
+            self.link.join(self.sock, peer.addr, peer.port, from);
         } else if let Some((local, _)) = started {
-            let connect =
-                connect_message(self.sock, addr.0, peer.port, local, STREAM_WINDOW as u32);
+            let window = STREAM_WINDOW as u32;
+            let connect = match peer.addr {
+                IpAddress::Ipv6(addr) => {
+                    connect6_message(self.sock, addr.0, peer.port, local, window)
+                }
+                IpAddress::Ipv4(addr) => {
+                    connect_message(self.sock, addr.0, peer.port, local, window)
+                }
+                _ => return Err(LxError::EAFNOSUPPORT),
+            };
             // No stack, no way out of the machine: `ENETDOWN`, here and
             // not once more on what the socket does next.
             if let Err(e) = self.link.tell(connect, true) {
@@ -854,14 +921,17 @@ impl Socket for ServedTcpSocket {
         let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
-        local.addr = plain(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
+        local.addr = either(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         match local.addr {
             IpAddress::Unspecified => {}
             IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address() => {}
             // This machine's alone: see `listen`.
             IpAddress::Ipv4(addr) if addr.is_loopback() => {}
-            // The stack has one address.
-            IpAddress::Ipv4(_) => return Err(LxError::EADDRNOTAVAIL),
+            // An address of the card's is heard at like every address.
+            IpAddress::Ipv6(addr) if self.link.sixes().has(&addr) => {}
+            // The stack has one address of IPv4, and the ones it said of
+            // IPv6.
+            IpAddress::Ipv4(_) | IpAddress::Ipv6(_) => return Err(LxError::EADDRNOTAVAIL),
             _ => return Err(LxError::EAFNOSUPPORT),
         }
         let here = match local.addr {
@@ -907,7 +977,7 @@ impl Socket for ServedTcpSocket {
         };
         // With no stack to tell it listens all the same, for the programs
         // of this machine: the next stack is told when it comes.
-        let listen = listen_message(self.sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
+        let listen = self.stream.listen_message(self.sock, port);
         let _ = self.link.tell(listen, true);
         Ok(0)
     }
@@ -999,14 +1069,8 @@ impl Socket for ServedTcpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.stream.inner.lock();
-        // A connection has the stack's address, or this machine's when it
-        // is to another of its programs; a socket that only has a port has
-        // every address, unless it was bound to one of this machine's.
-        let addr = inner.local.or(inner.here).unwrap_or(match inner.phase {
-            Phase::Connecting | Phase::Open | Phase::Over => self.link.address(),
-            Phase::Fresh | Phase::Listening => Ipv4Address::UNSPECIFIED,
-        });
-        let local = IpEndpoint::new(IpAddress::Ipv4(addr), inner.port.unwrap_or(0));
+        let addr = address(&inner, self.link.address());
+        let local = IpEndpoint::new(addr, inner.port.unwrap_or(0));
         Some(Endpoint::Ip(shown(self.v6, local)))
     }
 
@@ -1301,7 +1365,10 @@ mod tests {
         assert_eq!(first, (7, EV_BYTES, 0, &b"hola"[..]));
         let ((sock, what, number, bytes), rest) = parse_event(rest).unwrap();
         assert_eq!((sock, what, number), (9, EV_ACCEPTED, 0x0004_0000));
-        assert_eq!(parse_accepted(bytes), Some((new, at([10, 0, 9, 1], 40000))));
+        assert_eq!(
+            parse_accepted(what, bytes),
+            Some((new, at([10, 0, 9, 1], 40000), None))
+        );
         assert!(rest.is_empty());
         // A record cut short, in its head or in its bytes, is none.
         assert_eq!(parse_event(&m[HEADER_LEN..HEADER_LEN + 15]), None);
@@ -2046,7 +2113,7 @@ mod tests {
         assert_eq!(Socket::bind(&l, Endpoint::Ip(at6("::", 8080))), Ok(0));
         assert_eq!(Socket::listen(&l), Ok(0));
         let (op, sock) = parse_header(&stack.told().unwrap()).unwrap();
-        assert_eq!((op, sock), (OP_LISTEN, l.sock));
+        assert_eq!((op, sock), (OP_LISTEN6, l.sock));
         assert_eq!(ip(Socket::endpoint(&l).unwrap()), at6("::", 8080));
 
         // An IPv4 program of this machine reaches it, and is said to
@@ -2132,6 +2199,205 @@ mod tests {
         assert_eq!(Socket::bind(&no, Endpoint::Ip(at6("::1", 8081))), Ok(0));
         assert_eq!(Socket::listen(&no), Ok(0));
         assert_eq!(stack.told(), None);
+    }
+
+    #[test]
+    fn an_ipv6_socket_carries_ipv6() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let six = |addr: &str| match at6(addr, 0).addr {
+            IpAddress::Ipv6(addr) => addr,
+            _ => unreachable!(),
+        };
+        let cards = [
+            Ipv6Cidr::new(six("fe80::7"), 64),
+            Ipv6Cidr::new(six("fec0::7"), 64),
+        ];
+        stack.say(six_message(None, &cards));
+        let stream6 = || {
+            let s = ServedTcpSocket::new(stack.link.clone(), true).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        let (near, card) = (six("fec0::99"), six("fec0::7"));
+        let window = STREAM_WINDOW as u32;
+
+        // The messages, as the stack reads and writes them.
+        let said = connect6_message(7, near.0, 80, 49152, 0x0004_0000);
+        assert_eq!(
+            said[..16],
+            [0, 0, 0, 0, 19, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(said[16..32], near.0);
+        assert_eq!(said[32..], [80, 0, 0, 0xc0, 0, 0, 4, 0]);
+        assert_eq!(
+            listen6_message(7, 8080, 8, 0x0004_0000),
+            [0, 0, 0, 0, 20, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x1f, 8, 0, 0, 0, 4, 0]
+        );
+        let new = ACCEPTED_BIT | 1;
+        let bytes = accepted6_bytes(new, near.0, 40000, card.0);
+        assert_eq!(bytes[..8], [1, 0, 0, 0, 0, 0, 0, 0x80]);
+        assert_eq!(bytes[8..24], near.0);
+        assert_eq!(bytes[24..28], [0x40, 0x9c, 0, 0]);
+        assert_eq!(bytes[28..], card.0);
+        assert_eq!(
+            parse_accepted(EV_ACCEPTED6, &bytes),
+            Some((new, at6("fec0::99", 40000), Some(card)))
+        );
+        assert_eq!(parse_accepted(EV_ACCEPTED, &bytes), None);
+        assert_eq!(parse_accepted(EV_ACCEPTED6, &bytes[..ACCEPTED_LEN]), None);
+
+        // A connect to a neighbour of the card's network is the stack's
+        // to make, as IPv6. Which of the card's addresses it is from is
+        // the stack's to say, and until it does the socket has none.
+        let out = stream6();
+        assert_eq!(
+            connect(&out, at6("fec0::99", 80)),
+            Err(LxError::EINPROGRESS)
+        );
+        let local = ip(Socket::endpoint(&out).unwrap()).port;
+        assert_eq!(
+            stack.told(),
+            Some(connect6_message(out.sock, near.0, 80, local, window))
+        );
+        assert_eq!(ip(Socket::endpoint(&out).unwrap()), at6("::", local));
+        events(&stack, &[(out.sock, EV_CONNECTED, 1000, &card.0)]);
+        assert_eq!(ip(Socket::endpoint(&out).unwrap()), at6("fec0::7", local));
+        assert_eq!(
+            ip(Socket::remote_endpoint(&out).unwrap()),
+            at6("fec0::99", 80)
+        );
+        assert_eq!(Socket::write(&out, b"hola", None), Ok(4));
+        assert_eq!(stack.told(), Some(write_message(out.sock, b"hola")));
+        // It is the IPv6 table's, with those addresses.
+        let listed = stack.link.listed_streams();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].v6);
+        assert_eq!(listed[0].local, at6("fec0::7", local));
+        assert_eq!(listed[0].remote, Some(at6("fec0::99", 80)));
+
+        // Nobody to connect to at a group's address, and no way further
+        // than the card's networks while there is no router; with one,
+        // it is the stack's to try.
+        let far = stream6();
+        for nowhere in ["ff02::1", "2001:db8::1"] {
+            assert_eq!(
+                connect(&far, at6(nowhere, 80)),
+                Err(LxError::ENETUNREACH),
+                "{nowhere}"
+            );
+        }
+        stack.say(six_message(Some(six("fe80::2")), &cards));
+        assert_eq!(
+            connect(&far, at6("2001:db8::1", 80)),
+            Err(LxError::EINPROGRESS)
+        );
+        let local = ip(Socket::endpoint(&far).unwrap()).port;
+        assert_eq!(
+            stack.told(),
+            Some(connect6_message(
+                far.sock,
+                six("2001:db8::1").0,
+                80,
+                local,
+                window
+            ))
+        );
+        // An `AF_INET` socket is not given an IPv6 address.
+        let four = stream(&stack);
+        assert_eq!(
+            connect(&four, at6("fec0::99", 80)),
+            Err(LxError::EAFNOSUPPORT)
+        );
+
+        // A socket of IPv6 listens for what arrives as either, and one
+        // of IPv4 for IPv4.
+        let l = stream6();
+        assert_eq!(Socket::bind(&l, Endpoint::Ip(at6("::", 8080))), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        assert_eq!(
+            stack.told(),
+            Some(listen6_message(l.sock, 8080, LISTEN_BACKLOG, window))
+        );
+        let l4 = stream(&stack);
+        assert_eq!(Socket::bind(&l4, any(8081)), Ok(0));
+        assert_eq!(Socket::listen(&l4), Ok(0));
+        assert_eq!(
+            stack.told(),
+            Some(listen_message(l4.sock, 8081, LISTEN_BACKLOG, window))
+        );
+
+        // A connection that arrived as IPv6 is said with the address it
+        // came from and the address of the card it came to.
+        events(&stack, &[(l.sock, EV_ACCEPTED6, 1000, &bytes)]);
+        let (s, from) = accepted(&l);
+        assert_eq!(from, at6("fec0::99", 40000));
+        assert_eq!(ip(Socket::endpoint(&*s).unwrap()), at6("fec0::7", 8080));
+        assert_eq!(ip(Socket::remote_endpoint(&*s).unwrap()), from);
+        events(&stack, &[(new, EV_BYTES, 0, b"hola")]);
+        let mut buf = [0u8; 8];
+        assert_eq!(read(&s, &mut buf), Ok(4));
+        // One that arrived as IPv4 is the same listener's.
+        let new4 = ACCEPTED_BIT | 2;
+        let bytes4 = accepted_bytes(new4, HOST, 40001);
+        events(&stack, &[(l.sock, EV_ACCEPTED, 1000, &bytes4)]);
+        let (s4, from) = accepted(&l);
+        assert_eq!(from, at6("::ffff:10.0.9.1", 40001));
+        assert_eq!(
+            ip(Socket::endpoint(&*s4).unwrap()),
+            at6("::ffff:10.0.9.15", 8080)
+        );
+        // A stack that says one of IPv6 arrived for a socket of IPv4 is
+        // told to close it.
+        let new3 = ACCEPTED_BIT | 3;
+        let bytes3 = accepted6_bytes(new3, near.0, 40002, card.0);
+        events(&stack, &[(l4.sock, EV_ACCEPTED6, 1000, &bytes3)]);
+        assert_eq!(stack.told(), Some(close_message(new3)));
+        assert_eq!(accept(&l4).err(), Some(LxError::EAGAIN));
+
+        // An address of the card's own is this machine: the two are
+        // joined, each with that address, and the stack is not told.
+        let c = stream6();
+        assert_eq!(connect(&c, at6("fec0::7", 8080)), Ok(0));
+        let (sc, from) = accepted(&l);
+        assert_eq!(from, at6("fec0::7", from.port));
+        assert_eq!(ip(Socket::endpoint(&c).unwrap()), from);
+        assert_eq!(ip(Socket::endpoint(&*sc).unwrap()), at6("fec0::7", 8080));
+        assert_eq!(
+            ip(Socket::remote_endpoint(&c).unwrap()),
+            at6("fec0::7", 8080)
+        );
+        assert_eq!(Socket::write(&c, b"aqui", None), Ok(4));
+        assert_eq!(read(&sc, &mut buf), Ok(4));
+        assert_eq!(buf[..4], *b"aqui");
+        // The listener of IPv4 is not reached at an IPv6 address.
+        let c4 = stream6();
+        assert_eq!(
+            connect(&c4, at6("fec0::7", 8081)),
+            Err(LxError::ECONNREFUSED)
+        );
+        assert_eq!(stack.told(), None);
+
+        // A socket is bound to an address the card has, and to no other.
+        let b = stream6();
+        assert_eq!(
+            Socket::bind(&b, Endpoint::Ip(at6("fec0::8", 8082))),
+            Err(LxError::EADDRNOTAVAIL)
+        );
+        assert_eq!(Socket::bind(&b, Endpoint::Ip(at6("fec0::7", 8082))), Ok(0));
+
+        // The next stack is told of each listener as it listens.
+        while stack.told().is_some() {}
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        let next = stack_of(&link);
+        let mut told = Vec::new();
+        while let Some(m) = next.told() {
+            told.push(m);
+        }
+        assert!(told.contains(&listen6_message(l.sock, 8080, LISTEN_BACKLOG, window)));
+        assert!(told.contains(&listen_message(l4.sock, 8081, LISTEN_BACKLOG, window)));
     }
 
     #[test]

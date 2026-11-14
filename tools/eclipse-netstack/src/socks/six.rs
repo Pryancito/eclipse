@@ -31,7 +31,8 @@
 //! ```
 //!
 //! A datagram socket's datagrams travel as IPv6 when the kernel says so
-//! (`SEND6`, `DATA6`, in [`super`]). A connection's do not yet.
+//! (`SEND6`, `DATA6`, in [`super`]), and so does a connection
+//! (`CONNECT6`, `LISTEN6`, `ACCEPTED6`, in [`super::tcp`]).
 
 use managed::ManagedSlice;
 use smoltcp::phy::{ChecksumCapabilities, Device};
@@ -459,10 +460,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 mod tests {
     use super::*;
     use crate::port::testing::*;
+    use crate::socks::tcp::WHY_UNREACHABLE;
+    use crate::socks::tcp::{ACCEPTED_BIT, EV_ACCEPTED6, EV_BYTES, EV_CONNECTED, EV_FAILED};
+    use crate::socks::tcp::{OP_CONNECT6, OP_EVENTS, OP_LISTEN, OP_LISTEN6, OP_WRITE};
     use crate::socks::tests::{bind, message, records};
     use crate::socks::{parse_header, Arrived, Refused};
-    use crate::socks::{OP_DATA6, OP_SEND6, RECORD6_LEN};
+    use crate::socks::{OP_DATA6, OP_SEND6, RECORD6_LEN, RECORD_LEN};
     use smoltcp::wire::{EthernetFrame, EthernetProtocol, EthernetRepr, NdiscNeighborFlags};
+    use smoltcp::wire::{TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
     use smoltcp::wire::{UdpPacket, UdpRepr};
 
     /// Our address on the link, and the one made from the router's prefix.
@@ -634,6 +639,111 @@ mod tests {
                 rest[RECORD6_LEN..RECORD6_LEN + len].to_vec(),
             ));
             rest = &rest[RECORD6_LEN + len..];
+        }
+        out
+    }
+
+    /// A segment as IPv6: who it is from and for, what it says, where its
+    /// numbers are and what it carries.
+    #[derive(Debug, PartialEq)]
+    struct Segment6 {
+        from: (Ipv6Address, u16),
+        to: (Ipv6Address, u16),
+        control: TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        data: Vec<u8>,
+    }
+
+    /// THEIRS sends `segment`.
+    fn tcp6_frame(segment: &Segment6) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port: segment.from.1,
+            dst_port: segment.to.1,
+            control: segment.control,
+            seq_number: TcpSeqNumber(segment.seq as i32),
+            ack_number: segment.ack.map(|ack| TcpSeqNumber(ack as i32)),
+            window_len: u16::MAX,
+            window_scale: None,
+            max_seg_size: (segment.control == TcpControl::Syn).then_some(1440),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            payload: &segment.data,
+        };
+        let mut bytes = vec![0u8; tcp.buffer_len()];
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut bytes[..]),
+            &IpAddress::Ipv6(segment.from.0),
+            &IpAddress::Ipv6(segment.to.0),
+            &ChecksumCapabilities::default(),
+        );
+        ip6_frame(segment.from.0, segment.to.0, 64, IpProtocol::Tcp, &bytes)
+    }
+
+    /// A segment of ours on the wire as IPv6, for THEIRS's card, its sum
+    /// checked.
+    fn tcp6_of(frame: &[u8]) -> Segment6 {
+        let eth = EthernetFrame::new_checked(frame).unwrap();
+        assert_eq!((eth.src_addr(), eth.dst_addr()), (OURS, THEIRS));
+        assert_eq!(eth.ethertype(), EthernetProtocol::Ipv6);
+        let ip = Ipv6Packet::new_checked(eth.payload()).unwrap();
+        assert_eq!(ip.next_header(), IpProtocol::Tcp);
+        let (from, to) = (ip.src_addr(), ip.dst_addr());
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let tcp = TcpRepr::parse(
+            &tcp,
+            &IpAddress::Ipv6(from),
+            &IpAddress::Ipv6(to),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        Segment6 {
+            from: (from, tcp.src_port),
+            to: (to, tcp.dst_port),
+            control: tcp.control,
+            seq: tcp.seq_number.0 as u32,
+            ack: tcp.ack_number.map(|ack| ack.0 as u32),
+            data: tcp.payload.to_vec(),
+        }
+    }
+
+    /// A `CONNECT6` as the kernel writes it.
+    fn connect6(sock: u64, to: Ipv6Address, port: u16, local: u16, window: u32) -> Vec<u8> {
+        let mut rest = to.0.to_vec();
+        rest.extend_from_slice(&port.to_le_bytes());
+        rest.extend_from_slice(&local.to_le_bytes());
+        rest.extend_from_slice(&window.to_le_bytes());
+        message(OP_CONNECT6, sock, &rest)
+    }
+
+    /// A `LISTEN` or a `LISTEN6`, as the kernel writes them.
+    fn listen(op: u32, sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
+        let mut rest = port.to_le_bytes().to_vec();
+        rest.extend_from_slice(&backlog.to_le_bytes());
+        rest.extend_from_slice(&window.to_le_bytes());
+        message(op, sock, &rest)
+    }
+
+    /// What the stack tells the kernel of its stream sockets now: the
+    /// records of its `EVENTS`.
+    fn events(stack: &mut Stack<crate::port::Port>) -> Vec<(u64, u16, u32, Vec<u8>)> {
+        let (mut m, mut out) = (Vec::new(), Vec::new());
+        while stack.arrived(&mut m) != Arrived::Nothing {
+            assert_eq!(parse_header(&m), Some((OP_EVENTS, 0)));
+            let mut rest = &m[HEADER_LEN..];
+            while !rest.is_empty() {
+                let sock = u64::from_le_bytes(rest[..8].try_into().unwrap());
+                let what = u16::from_le_bytes([rest[8], rest[9]]);
+                let len = u16::from_le_bytes([rest[10], rest[11]]) as usize;
+                let number = u32::from_le_bytes(rest[12..16].try_into().unwrap());
+                out.push((
+                    sock,
+                    what,
+                    number,
+                    rest[RECORD_LEN..RECORD_LEN + len].to_vec(),
+                ));
+                rest = &rest[RECORD_LEN + len..];
+            }
         }
         out
     }
@@ -1161,5 +1271,208 @@ mod tests {
         window.deliver(stack.device(), 0, &v6(5002, b"nobody"));
         stack.poll(Instant::from_millis(400));
         assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+    }
+
+    #[test]
+    fn a_connect_travels_as_ipv6_from_the_address_that_goes_there() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+        // The message, as the kernel writes it.
+        let said = connect6(7, near, 80, 49152, 0x0004_0000);
+        assert_eq!(
+            said[..16],
+            [0, 0, 0, 0, 19, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(said[16..32], near.0);
+        assert_eq!(said[32..], [80, 0, 0, 0xc0, 0, 0, 4, 0]);
+
+        // To a neighbour on the network the router gave, from the address
+        // it gave, and to one of the link, from the link's: the neighbour
+        // is asked for, and then the connection is knocked for. The
+        // kernel is told which address it was made from.
+        let mut ms = 1000;
+        for (sock, to, from, local) in [(7, near, OURS_GIVEN, 50000), (8, link, OURS_LINK, 50001)] {
+            assert_eq!(
+                stack.request(&connect6(sock, to, 80, local, 4096)),
+                Ok(true)
+            );
+            let sent = frames(&mut stack, &window, ms);
+            assert_eq!(sent.len(), 1);
+            let ask = six_of(&sent[0]);
+            assert_eq!((ask.from, ask.to), (from, to.solicited_node()));
+            window.deliver(stack.device(), 0, &here_is(to, from));
+            let sent = frames(&mut stack, &window, ms + 10);
+            assert_eq!(sent.len(), 1);
+            let syn = tcp6_of(&sent[0]);
+            assert_eq!((syn.from, syn.to), ((from, local), (to, 80)));
+            assert_eq!((syn.control, syn.ack), (TcpControl::Syn, None));
+            assert_eq!(events(&mut stack), []);
+            let answer = Segment6 {
+                from: (to, 80),
+                to: (from, local),
+                control: TcpControl::Syn,
+                seq: 7000,
+                ack: Some(syn.seq.wrapping_add(1)),
+                data: Vec::new(),
+            };
+            window.deliver(stack.device(), 0, &tcp6_frame(&answer));
+            let sent = frames(&mut stack, &window, ms + 20);
+            assert_eq!(sent.len(), 1);
+            let ack = tcp6_of(&sent[0]);
+            assert_eq!((ack.control, ack.ack), (TcpControl::None, Some(7001)));
+            let told = events(&mut stack);
+            assert_eq!(told.len(), 1);
+            assert_eq!((told[0].0, told[0].1), (sock, EV_CONNECTED));
+            assert_eq!(told[0].3, from.0);
+            // And it is a connection like any other.
+            assert_eq!(stack.request(&message(OP_WRITE, sock, b"hola")), Ok(true));
+            let sent = frames(&mut stack, &window, ms + 30);
+            assert_eq!(sent.len(), 1);
+            let bytes = tcp6_of(&sent[0]);
+            assert_eq!((bytes.from, bytes.to), ((from, local), (to, 80)));
+            assert_eq!(bytes.data, b"hola");
+            let heard = Segment6 {
+                control: TcpControl::None,
+                seq: 7001,
+                ack: Some(bytes.seq.wrapping_add(4)),
+                ..answer
+            };
+            window.deliver(stack.device(), 0, &tcp6_frame(&heard));
+            assert!(frames(&mut stack, &window, ms + 40).is_empty());
+            ms += 1000;
+        }
+
+        // Nobody to connect to at a group's address, and a message cut
+        // short is none.
+        let group = Ipv6Address::LINK_LOCAL_ALL_NODES;
+        assert_eq!(
+            stack.request(&connect6(9, group, 80, 50002, 4096)),
+            Ok(true)
+        );
+        assert!(frames(&mut stack, &window, ms).is_empty());
+        assert_eq!(
+            events(&mut stack),
+            [(9, EV_FAILED, WHY_UNREACHABLE, Vec::new())]
+        );
+        let short = &connect6(9, near, 80, 50002, 4096)[..39];
+        assert_eq!(stack.request(short), Err(Refused::Malformed));
+        assert_eq!(
+            stack.request(&connect6(7, near, 81, 50003, 4096)),
+            Err(Refused::Bind),
+            "a socket that is connected"
+        );
+    }
+
+    #[test]
+    fn a_connect_with_no_way_as_ipv6_fails_at_once() {
+        // With no router, further than the link there is no way; and
+        // with no IPv6 at all there is none anywhere.
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        assert_eq!(stack.request(&connect6(7, far, 80, 50000, 4096)), Ok(true));
+        assert!(frames(&mut stack, &window, 10).is_empty());
+        assert_eq!(
+            events(&mut stack),
+            [(7, EV_FAILED, WHY_UNREACHABLE, Vec::new())]
+        );
+        assert_eq!(stack.request(&connect6(7, link, 80, 50000, 4096)), Ok(true));
+        assert_eq!(frames(&mut stack, &window, 20).len(), 1, "asks for it");
+
+        let Bench { window, iface, .. } = Bench::new();
+        let mut stack = Stack::new(iface);
+        assert_eq!(stack.request(&connect6(7, link, 80, 50000, 4096)), Ok(true));
+        assert!(frames(&mut stack, &window, 10).is_empty());
+        assert_eq!(
+            events(&mut stack),
+            [(7, EV_FAILED, WHY_UNREACHABLE, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn a_listener_takes_what_arrives_as_ipv6_when_the_kernel_says_so() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        assert_eq!(
+            listen(OP_LISTEN6, 7, 8080, 8, 0x0004_0000),
+            [0, 0, 0, 0, 20, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x1f, 8, 0, 0, 0, 4, 0]
+        );
+        // One socket listens for both, as a socket of IPv6 does, and one
+        // for IPv4 alone.
+        let both = listen(OP_LISTEN6, 7, 8080, 2, 4096);
+        assert_eq!(stack.request(&both), Ok(false));
+        let four = listen(OP_LISTEN, 8, 8081, 2, 4096);
+        assert_eq!(stack.request(&four), Ok(false));
+
+        // Who knocks as IPv6 at the first is answered, once it is known
+        // where it is, from the address it knocked at.
+        let knock = |port: u16, to: u16| Segment6 {
+            from: (near, port),
+            to: (OURS_GIVEN, to),
+            control: TcpControl::Syn,
+            seq: 9000,
+            ack: None,
+            data: Vec::new(),
+        };
+        window.deliver(stack.device(), 0, &tcp6_frame(&knock(40000, 8080)));
+        let sent = frames(&mut stack, &window, 1000);
+        assert_eq!(sent.len(), 1);
+        let ask = six_of(&sent[0]);
+        assert_eq!((ask.from, ask.to), (OURS_GIVEN, near.solicited_node()));
+        window.deliver(stack.device(), 0, &here_is(near, OURS_GIVEN));
+        let sent = frames(&mut stack, &window, 1010);
+        assert_eq!(sent.len(), 1);
+        let answer = tcp6_of(&sent[0]);
+        assert_eq!(
+            (answer.from, answer.to),
+            ((OURS_GIVEN, 8080), (near, 40000))
+        );
+        assert_eq!((answer.control, answer.ack), (TcpControl::Syn, Some(9001)));
+        assert_eq!(events(&mut stack), [], "not made yet");
+        // Made, it is told with where it came from and where it came to,
+        // and what it brought follows.
+        let first = Segment6 {
+            control: TcpControl::None,
+            seq: 9001,
+            ack: Some(answer.seq.wrapping_add(1)),
+            data: b"hola".to_vec(),
+            ..knock(40000, 8080)
+        };
+        window.deliver(stack.device(), 0, &tcp6_frame(&first));
+        frames(&mut stack, &window, 1020);
+        let new = ACCEPTED_BIT | 1;
+        let mut accepted = new.to_le_bytes().to_vec();
+        accepted.extend_from_slice(&near.0);
+        accepted.extend_from_slice(&[0x40, 0x9c, 0, 0]);
+        accepted.extend_from_slice(&OURS_GIVEN.0);
+        assert_eq!(accepted.len(), 44);
+        let told = events(&mut stack);
+        assert_eq!(told.len(), 2);
+        assert_eq!(
+            (told[0].0, told[0].1, &told[0].3),
+            (7, EV_ACCEPTED6, &accepted)
+        );
+        assert_eq!(told[1], (new, EV_BYTES, 0, b"hola".to_vec()));
+
+        // Who knocks as IPv6 at the listener of IPv4 is refused, and the
+        // kernel hears nothing of it.
+        window.deliver(stack.device(), 0, &tcp6_frame(&knock(40001, 8081)));
+        let sent = frames(&mut stack, &window, 1030);
+        assert_eq!(sent.len(), 1);
+        let refused = tcp6_of(&sent[0]);
+        assert_eq!(
+            (refused.from, refused.to, refused.control),
+            ((OURS_GIVEN, 8081), (near, 40001), TcpControl::Rst)
+        );
+        assert_eq!(events(&mut stack), []);
     }
 }

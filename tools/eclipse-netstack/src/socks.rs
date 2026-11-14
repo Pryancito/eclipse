@@ -89,7 +89,7 @@ pub mod six;
 pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
-use tcp::{OP_CONNECT, OP_LISTEN, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
+use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, EV_UNDELIVERED};
 
 /// The operations of a message.
@@ -450,7 +450,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         let (op, sock) = parse_header(m).ok_or(Refused::Malformed)?;
         match op {
             OP_CONNECT => self.connect(sock, m),
-            OP_LISTEN => self.listen(sock, m),
+            OP_CONNECT6 => self.connect6(sock, m),
+            OP_LISTEN => self.listen(sock, m, false),
+            OP_LISTEN6 => self.listen(sock, m, true),
             OP_WRITE => self.write(sock, m),
             OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
             OP_WINDOW => self.window(sock, m),

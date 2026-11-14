@@ -330,6 +330,9 @@ pub struct TcpSocket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_address: IpAddress,
+    /// A listener that takes only what arrives as IPv4: see
+    /// [`set_listen_ipv4_only`](Self::set_listen_ipv4_only).
+    listen_ipv4_only: bool,
     /// Current local endpoint. This is used for both filtering the incoming packets and
     /// setting the source address. When listening or initiating connection on/from
     /// an unspecified address, this field is updated with the chosen source address before
@@ -428,6 +431,7 @@ impl<'a> TcpSocket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_address: IpAddress::default(),
+            listen_ipv4_only: false,
             local_endpoint: IpEndpoint::default(),
             remote_endpoint: IpEndpoint::default(),
             local_seq_no: INITIAL_SEQ_NO,
@@ -656,6 +660,7 @@ impl<'a> TcpSocket<'a> {
         self.timeout = None;
         self.hop_limit = None;
         self.listen_address = IpAddress::default();
+        self.listen_ipv4_only = false;
         self.local_endpoint = IpEndpoint::default();
         self.remote_endpoint = IpEndpoint::default();
         self.local_seq_no = INITIAL_SEQ_NO;
@@ -708,6 +713,14 @@ impl<'a> TcpSocket<'a> {
         self.remote_endpoint = IpEndpoint::default();
         self.set_state(State::Listen);
         Ok(())
+    }
+
+    /// Have a socket that listens at every address take only the
+    /// connections that arrive as IPv4, as an `AF_INET` socket does: one
+    /// that arrives as IPv6 is not this socket's, and is refused when it is
+    /// nobody's. Said after [`listen`](Self::listen), which forgets it.
+    pub fn set_listen_ipv4_only(&mut self, on: bool) {
+        self.listen_ipv4_only = on;
     }
 
     /// Connect to a given endpoint.
@@ -1257,6 +1270,13 @@ impl<'a> TcpSocket<'a> {
         // be destined to this socket, but another one may well listen on the same
         // local endpoint.
         if self.state == State::Listen && repr.ack_number.is_some() {
+            return false;
+        }
+        // Nor is what arrives as IPv6 for a listener of IPv4.
+        if self.state == State::Listen
+            && self.listen_ipv4_only
+            && !matches!(ip_repr.dst_addr(), IpAddress::Ipv4(_))
+        {
             return false;
         }
 

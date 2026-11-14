@@ -7,22 +7,35 @@
 //!
 //! ```text
 //! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window
+//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
 //! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
+//! LISTEN6  (kernel to stack)  as LISTEN
 //! WRITE    (kernel to stack)  16  the bytes
 //! SHUTDOWN (kernel to stack)
 //! WINDOW   (kernel to stack)  16  u32 bytes
 //! EVENTS   (stack to kernel)  16  one record after another, to the end:
 //!              0  u64 socket  8  u16 what  10  u16 length  12  u32 number  16  `length` bytes
 //!     CONNECTED  number: the bytes the stack takes
+//!                bytes: none, or [u8; 16] the address it connected from,
+//!                when the connection is one of IPv6
 //!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
 //!                bytes: none, or the type and the code of the ICMP message
 //!                that said the peer is unreachable ([`super::undelivered`])
 //!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
 //!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
+//!     ACCEPTED6  as ACCEPTED, of a connection that arrived as IPv6.
+//!                bytes: u64 the new socket, [u8; 16] from, u16 port, u16 zero,
+//!                [u8; 16] the address of the card it arrived at
 //!     BYTES      bytes: what arrived
 //!     EOF        the peer will send no more
 //!     CREDIT     number: more bytes the stack takes
 //! ```
+//!
+//! A `LISTEN` takes the connections that arrive as IPv4, as an `AF_INET`
+//! socket does, and whoever knocks as IPv6 is refused; a `LISTEN6` takes
+//! both, as an `AF_INET6` socket does. A `CONNECT6` is a connect to an
+//! IPv6 address, from the address of the card that
+//! [`six`](super::six) says goes there.
 //!
 //! An `EVENTS` carries what a turn of the stack made of every connection,
 //! as a `DATA` carries its datagrams: the kernel is woken once.
@@ -32,7 +45,7 @@ use std::collections::BTreeMap;
 use smoltcp::phy::Device;
 use smoltcp::socket::{SocketHandle, TcpSocket, TcpSocketBuffer, TcpState};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
 
 use super::undelivered::{Undelivered, LAST_CODE, TOO_LONG, UNREACHABLE};
 use super::{Arrived, Refused, Stack, HEADER_LEN, MESSAGE_MAX, RECORD_LEN};
@@ -43,6 +56,8 @@ pub const OP_WRITE: u32 = 7;
 pub const OP_SHUTDOWN: u32 = 8;
 pub const OP_WINDOW: u32 = 9;
 pub const OP_EVENTS: u32 = 10;
+pub const OP_CONNECT6: u32 = 19;
+pub const OP_LISTEN6: u32 = 20;
 
 /// What a record of an `EVENTS` says.
 pub const EV_CONNECTED: u16 = 1;
@@ -51,6 +66,7 @@ pub const EV_ACCEPTED: u16 = 3;
 pub const EV_BYTES: u16 = 4;
 pub const EV_EOF: u16 = 5;
 pub const EV_CREDIT: u16 = 6;
+pub const EV_ACCEPTED6: u16 = 8;
 
 /// Why a connection `FAILED`.
 pub const WHY_REFUSED: u32 = 1;
@@ -64,6 +80,8 @@ pub const WHY_NO_ROOM: u32 = 5;
 pub const ACCEPTED_BIT: u64 = 1 << 63;
 /// The bytes of an `ACCEPTED` record.
 pub const ACCEPTED_LEN: usize = 16;
+/// The bytes of an `ACCEPTED6` record.
+pub const ACCEPTED6_LEN: usize = 44;
 
 /// What a connection holds that the peer sent and the kernel has no room
 /// for yet. With the kernel's own window, what the peer can send to a
@@ -111,6 +129,8 @@ pub(super) struct Conn {
 /// A socket that takes connections.
 pub(super) struct Listener {
     port: u16,
+    /// A `LISTEN6`: it takes what arrives as IPv6 too.
+    six: bool,
     backlog: usize,
     /// The window of each connection it makes.
     window: usize,
@@ -205,13 +225,23 @@ fn socket() -> TcpSocket<'static> {
     socket
 }
 
-/// A socket that takes a connection to `port`. A handshake that starts
-/// on it and is not finished is given up on in the time a connect is.
-fn listening(port: u16) -> Option<TcpSocket<'static>> {
+/// A socket that takes a connection to `port`, one that arrives as IPv6
+/// as well when `six`. A handshake that starts on it and is not finished
+/// is given up on in the time a connect is.
+fn listening(port: u16, six: bool) -> Option<TcpSocket<'static>> {
     let mut socket = socket();
-    socket.listen(port).ok()?;
+    listen_again(&mut socket, port, six).then_some(socket)
+}
+
+/// Have `socket`, which is closed, take a connection to `port`.
+fn listen_again(socket: &mut TcpSocket<'_>, port: u16, six: bool) -> bool {
+    if socket.listen(port).is_err() {
+        return false;
+    }
+    // After the listen, which forgets the ones before.
+    socket.set_listen_ipv4_only(!six);
     socket.set_timeout(Some(CONNECT_TIMEOUT));
-    Some(socket)
+    true
 }
 
 fn u16_at(m: &[u8], at: usize) -> u16 {
@@ -235,13 +265,43 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         let addr = Ipv4Address::from_bytes(&m[16..20]);
         let (port, local) = (u16_at(m, 20), u16_at(m, 22));
         let window = u32_at(m, 24) as usize;
-        if port == 0 || local == 0 {
-            return Err(Refused::Malformed);
-        }
         // Nowhere to send it (no gateway for what is off the card's
         // network), and nobody to connect to at everybody's address or
         // at a group's.
-        if addr.is_broadcast() || addr.is_multicast() || !self.reaches(addr) {
+        let way = !addr.is_broadcast() && !addr.is_multicast() && self.reaches(addr);
+        self.connect_to(sock, IpAddress::Ipv4(addr), port, local, window, way)
+    }
+
+    /// `CONNECT6`, which is answered as a `CONNECT` is.
+    pub(super) fn connect6(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
+        if m.len() != HEADER_LEN + 24 {
+            return Err(Refused::Malformed);
+        }
+        if self.knows(sock) {
+            return Err(Refused::Bind);
+        }
+        let addr = Ipv6Address::from_bytes(&m[16..32]);
+        let (port, local) = (u16_at(m, 32), u16_at(m, 34));
+        let window = u32_at(m, 36) as usize;
+        let way = !addr.is_multicast() && self.reaches6(addr);
+        self.connect_to(sock, IpAddress::Ipv6(addr), port, local, window, way)
+    }
+
+    /// Start the connect of `sock` from the port `local` to `port` at
+    /// `addr`, when there is a `way` there.
+    fn connect_to(
+        &mut self,
+        sock: u64,
+        addr: IpAddress,
+        port: u16,
+        local: u16,
+        window: usize,
+        way: bool,
+    ) -> Result<bool, Refused> {
+        if port == 0 || local == 0 {
+            return Err(Refused::Malformed);
+        }
+        if !way {
             self.streams.owe(sock, EV_FAILED, WHY_UNREACHABLE, &[]);
             return Ok(true);
         }
@@ -250,7 +310,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             return Ok(true);
         }
         let mut socket = socket();
-        let to = IpEndpoint::new(IpAddress::Ipv4(addr), port);
+        let to = IpEndpoint::new(addr, port);
         if socket.connect(to, local).is_err() {
             return Err(Refused::Malformed);
         }
@@ -272,8 +332,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         Ok(true)
     }
 
-    /// `LISTEN`.
-    pub(super) fn listen(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
+    /// `LISTEN`, or `LISTEN6` when `six`.
+    pub(super) fn listen(&mut self, sock: u64, m: &[u8], six: bool) -> Result<bool, Refused> {
         if m.len() != HEADER_LEN + 8 {
             return Err(Refused::Malformed);
         }
@@ -283,6 +343,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         }
         let listener = Listener {
             port,
+            six,
             backlog: (u16_at(m, 18) as usize).clamp(1, BACKLOG_MAX),
             window: u32_at(m, 20) as usize,
             ready: Vec::new(),
@@ -419,7 +480,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 && listener.ready.len() < most
                 && sockets < STREAMS_MAX
             {
-                let Some(socket) = self::listening(listener.port) else {
+                let Some(socket) = self::listening(listener.port, listener.six) else {
                     break;
                 };
                 listener.ready.push(self.set.add(socket));
@@ -481,31 +542,41 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                     // A socket whose handshake was given up on listens
                     // again.
                     TcpState::Closed | TcpState::TimeWait => {
-                        if socket.listen(listener.port).is_ok() {
-                            socket.set_timeout(Some(CONNECT_TIMEOUT));
-                        }
+                        listen_again(&mut socket, listener.port, listener.six);
                     }
                     // Made. Also one whose peer closed it at once: the
                     // program accepts it and reads the end.
                     _ => {
-                        if !fits(m, ACCEPTED_LEN) {
+                        if !fits(m, ACCEPTED6_LEN) {
                             return true;
                         }
                         let from = socket.remote_endpoint();
-                        let IpAddress::Ipv4(addr) = from.addr else {
-                            socket.abort();
-                            i += 1;
-                            continue;
+                        let at = socket.local_endpoint().addr;
+                        let new = ACCEPTED_BIT | (self.streams.accepted + 1);
+                        let mut bytes = [0u8; ACCEPTED6_LEN];
+                        bytes[..8].copy_from_slice(&new.to_le_bytes());
+                        let (what, len) = match (from.addr, at) {
+                            (IpAddress::Ipv4(addr), _) => {
+                                bytes[8..12].copy_from_slice(&addr.0);
+                                bytes[12..14].copy_from_slice(&from.port.to_le_bytes());
+                                (EV_ACCEPTED, ACCEPTED_LEN)
+                            }
+                            (IpAddress::Ipv6(addr), IpAddress::Ipv6(at)) => {
+                                bytes[8..24].copy_from_slice(&addr.0);
+                                bytes[24..26].copy_from_slice(&from.port.to_le_bytes());
+                                bytes[28..44].copy_from_slice(&at.0);
+                                (EV_ACCEPTED6, ACCEPTED6_LEN)
+                            }
+                            _ => {
+                                socket.abort();
+                                i += 1;
+                                continue;
+                            }
                         };
                         // From here it lasts as long as the peer answers.
                         socket.set_timeout(None);
                         self.streams.accepted += 1;
-                        let new = ACCEPTED_BIT | self.streams.accepted;
-                        let mut bytes = [0u8; ACCEPTED_LEN];
-                        bytes[..8].copy_from_slice(&new.to_le_bytes());
-                        bytes[8..12].copy_from_slice(&addr.0);
-                        bytes[12..14].copy_from_slice(&from.port.to_le_bytes());
-                        push_event(m, sock, EV_ACCEPTED, TX_BYTES as u32, &bytes);
+                        push_event(m, sock, what, TX_BYTES as u32, &bytes[..len]);
                         listener.ready.swap_remove(i);
                         self.streams.conns.insert(
                             new,
@@ -549,7 +620,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                         continue;
                     }
                     _ => {
-                        if !fits(m, 0) {
+                        if !fits(m, 16) {
                             more = true;
                             break;
                         }
@@ -558,7 +629,17 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                         socket.set_timeout(None);
                         conn.connecting = None;
                         conn.credit = TX_BYTES;
-                        push_event(m, sock, EV_CONNECTED, TX_BYTES as u32, &[]);
+                        // The kernel knows the one IPv4 address the card
+                        // has, and is told which of the IPv6 ones it was.
+                        let from = match socket.local_endpoint().addr {
+                            IpAddress::Ipv6(from) => from.0,
+                            _ => [0; 16],
+                        };
+                        let from = match socket.remote_endpoint().addr {
+                            IpAddress::Ipv6(_) => &from[..],
+                            _ => &[],
+                        };
+                        push_event(m, sock, EV_CONNECTED, TX_BYTES as u32, from);
                     }
                 }
             }
@@ -1272,6 +1353,19 @@ mod tests {
         assert!(sent.iter().any(|s| s.control == TcpControl::Rst));
         wire.turn();
         assert!(wire.stack.streams.is_empty());
+    }
+
+    #[test]
+    fn a_listener_for_both_takes_what_arrives_as_ipv4() {
+        // What arrives as IPv6 for one is in `six`.
+        let mut wire = Wire::new();
+        let mut both = listen(7, 8080, 2, 1000);
+        both[4..8].copy_from_slice(&OP_LISTEN6.to_le_bytes());
+        assert_eq!(wire.stack.request(&both), Ok(false));
+        let (_, events) = arrives(&mut wire, 40001, b"GET /");
+        let first = ACCEPTED_BIT | 1;
+        assert_eq!((events[0].0, events[0].1), (7, EV_ACCEPTED));
+        assert_eq!(events[1], told(first, EV_BYTES, 0, b"GET /"));
     }
 
     #[test]

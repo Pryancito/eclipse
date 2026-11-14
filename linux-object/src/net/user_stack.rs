@@ -220,9 +220,22 @@
 //! The port is one for both: an `AF_INET` socket that has it is not
 //! given what arrives as IPv6. Where the card has no way to
 //! ([`Sixes::reaches`]) is `ENETUNREACH`, and an address of the card's
-//! own is this machine, like `::1`. A stream socket carries IPv4 only
-//! yet: for it any other IPv6 address is one the stack cannot reach
-//! (`ENETUNREACH`) or does not have (`EADDRNOTAVAIL`).
+//! own is this machine, like `::1`.
+//!
+//! So does a stream socket of that family. It connects to any other
+//! IPv6 address with `CONNECT6`, and is told with `CONNECTED` which of
+//! the card's addresses it connected from, which the stack chooses. It
+//! listens with `LISTEN6`, for what arrives as either; an `AF_INET`
+//! socket listens with `LISTEN`, and who knocks at its port as IPv6 is
+//! refused. A connection that arrives as IPv6 is an `ACCEPTED6`:
+//!
+//! ```text
+//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
+//! LISTEN6  (kernel to stack)  as LISTEN
+//!     CONNECTED  bytes: none, or [u8; 16] the address it connected from
+//!     ACCEPTED6  as ACCEPTED.  bytes: u64 the new socket, [u8; 16] from,
+//!                u16 port, u16 zero, [u8; 16] the address it arrived at
+//! ```
 
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
@@ -269,6 +282,8 @@ pub const OP_COUNTS: u32 = 13;
 pub const OP_SIX: u32 = 16;
 pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
+pub const OP_CONNECT6: u32 = 19;
+pub const OP_LISTEN6: u32 = 20;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
 /// whichever sockets hear: no socket has the number.
@@ -282,6 +297,7 @@ pub const EV_BYTES: u16 = 4;
 pub const EV_EOF: u16 = 5;
 pub const EV_CREDIT: u16 = 6;
 pub const EV_UNDELIVERED: u16 = 7;
+pub const EV_ACCEPTED6: u16 = 8;
 
 /// Why a connection `FAILED`.
 pub const WHY_REFUSED: u32 = 1;
@@ -295,6 +311,8 @@ pub const WHY_NO_ROOM: u32 = 5;
 pub const ACCEPTED_BIT: u64 = 1 << 63;
 /// The bytes of an `ACCEPTED` record.
 pub const ACCEPTED_LEN: usize = 16;
+/// The bytes of an `ACCEPTED6` record.
+pub const ACCEPTED6_LEN: usize = 44;
 /// The bytes of a stream the kernel holds unread: what `CONNECT` and
 /// `LISTEN` say as their window.
 pub const STREAM_WINDOW: usize = 256 * 1024;
@@ -539,10 +557,30 @@ pub fn connect_message(sock: u64, addr: [u8; 4], port: u16, local: u16, window: 
     m
 }
 
+/// `CONNECT6`: as [`connect_message`], to an IPv6 address.
+pub fn connect6_message(sock: u64, addr: [u8; 16], port: u16, local: u16, window: u32) -> Vec<u8> {
+    let mut m = header(OP_CONNECT6, sock, 24);
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&local.to_le_bytes());
+    m.extend_from_slice(&window.to_le_bytes());
+    m
+}
+
 /// `LISTEN`: socket `sock` takes connections to `port`, `backlog` of them
 /// ready at a time, and `window` bytes of what arrives on each.
 pub fn listen_message(sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
-    let mut m = header(OP_LISTEN, sock, 8);
+    listen_of(OP_LISTEN, sock, port, backlog, window)
+}
+
+/// `LISTEN6`: as [`listen_message`], for the connections that arrive as
+/// IPv6 as well.
+pub fn listen6_message(sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
+    listen_of(OP_LISTEN6, sock, port, backlog, window)
+}
+
+fn listen_of(op: u32, sock: u64, port: u16, backlog: u16, window: u32) -> Vec<u8> {
+    let mut m = header(op, sock, 8);
     m.extend_from_slice(&port.to_le_bytes());
     m.extend_from_slice(&backlog.to_le_bytes());
     m.extend_from_slice(&window.to_le_bytes());
@@ -591,6 +629,17 @@ pub fn accepted_bytes(sock: u64, addr: [u8; 4], port: u16) -> [u8; ACCEPTED_LEN]
     b[..8].copy_from_slice(&sock.to_le_bytes());
     b[8..12].copy_from_slice(&addr);
     b[12..14].copy_from_slice(&port.to_le_bytes());
+    b
+}
+
+/// The bytes of an `ACCEPTED6`: the new socket `sock`, connected from
+/// `addr:port` to the card's address `at`.
+pub fn accepted6_bytes(sock: u64, addr: [u8; 16], port: u16, at: [u8; 16]) -> [u8; ACCEPTED6_LEN] {
+    let mut b = [0u8; ACCEPTED6_LEN];
+    b[..8].copy_from_slice(&sock.to_le_bytes());
+    b[8..24].copy_from_slice(&addr);
+    b[24..26].copy_from_slice(&port.to_le_bytes());
+    b[28..44].copy_from_slice(&at);
     b
 }
 
@@ -1291,8 +1340,7 @@ impl StackLink {
         }
         for (sock, port, stream) in listening {
             if stream.listens_for_the_stack() {
-                let listen = listen_message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
-                let _ = self.tell(listen, true);
+                let _ = self.tell(stream.listen_message(sock, port), true);
             }
         }
         for group in self.groups() {
