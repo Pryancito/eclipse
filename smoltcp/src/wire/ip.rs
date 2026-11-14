@@ -531,6 +531,27 @@ impl From<Ipv6Repr> for Repr {
     }
 }
 
+/// The address of `ours` that what goes to `dst_addr` is sent from: the
+/// one on the destination's network; failing that, one of the
+/// destination's kind (the link's own for what stays on the link, another
+/// for what goes further); failing that, the first there is.
+#[cfg(feature = "proto-ipv6")]
+fn ipv6_source(dst_addr: &Ipv6Address, ours: &[Cidr]) -> Option<Ipv6Address> {
+    let ours = || {
+        ours.iter().filter_map(|cidr| match cidr {
+            Cidr::Ipv6(cidr) => Some(cidr),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })
+    };
+    let near = dst_addr.is_link_local() || (dst_addr.is_multicast() && dst_addr.0[1] & 0x0f <= 2);
+    ours()
+        .find(|cidr| cidr.contains_addr(dst_addr))
+        .or_else(|| ours().find(|cidr| cidr.address().is_link_local() == near))
+        .or_else(|| ours().next())
+        .map(|cidr| cidr.address())
+}
+
 impl Repr {
     /// Return the protocol version.
     pub fn version(&self) -> Version {
@@ -700,25 +721,8 @@ impl Repr {
                 } else {
                     None
                 };
-                // The address on the destination's network; failing
-                // that, one of the destination's kind (the link's own
-                // for what stays on the link, another for what goes
-                // further); failing that, the first there is.
-                let ours = || {
-                    fallback_src_addrs.iter().filter_map(|cidr| match cidr {
-                        Cidr::Ipv6(cidr) => Some(cidr),
-                        #[allow(unreachable_patterns)]
-                        _ => None,
-                    })
-                };
-                let near = dst_addr.is_link_local()
-                    || (dst_addr.is_multicast() && dst_addr.0[1] & 0x0f <= 2);
-                let chosen = ours()
-                    .find(|cidr| cidr.contains_addr(&dst_addr))
-                    .or_else(|| ours().find(|cidr| cidr.address().is_link_local() == near))
-                    .or_else(|| ours().next());
-                if let Some(cidr) = chosen {
-                    src_addr = Some(cidr.address());
+                if let Some(chosen) = ipv6_source(&dst_addr, fallback_src_addrs) {
+                    src_addr = Some(chosen);
                 }
                 Ok(Repr::Ipv6(Ipv6Repr {
                     src_addr: src_addr.ok_or(Error::Unaddressable)?,
@@ -764,9 +768,15 @@ impl Repr {
                 resolve_unspecified!(Repr::Ipv4, Address::Ipv4, repr, fallback_src_addrs)
             }
 
+            // A TCP socket that connects from no address in particular
+            // lowers its packets before they get here.
             #[cfg(feature = "proto-ipv6")]
             &Repr::Ipv6(mut repr) => {
-                resolve_unspecified!(Repr::Ipv6, Address::Ipv6, repr, fallback_src_addrs)
+                if repr.src_addr.is_unspecified() {
+                    repr.src_addr = ipv6_source(&repr.dst_addr, fallback_src_addrs)
+                        .ok_or(Error::Unaddressable)?;
+                }
+                Ok(Repr::Ipv6(repr))
             }
 
             &Repr::Unspecified { .. } => {
