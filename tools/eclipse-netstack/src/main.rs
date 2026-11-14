@@ -1,17 +1,26 @@
-//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY]` or `eclipse-netstack N dhcp`:
-//! a network stack for virtio network card `N`, in this process, with the
-//! address `ADDR` or the one a DHCP server leases it. What is not for the
-//! card's network goes to the gateway, the one written or the lease's.
-//! When the machine's network settings name the card, what they say is
-//! used and not the command line (`netstack::governed`).
+//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY] [driver=process]` or
+//! `eclipse-netstack N dhcp [driver=process]`: a network stack for virtio
+//! network card `N`, in this process, with the address `ADDR` or the one a
+//! DHCP server leases it. What is not for the card's network goes to the
+//! gateway, the one written or the lease's. When the machine's network
+//! settings name the card, what they say is used and not the command line
+//! (`netstack::governed`).
 //!
 //! The card must be one the kernel left to userspace
-//! (`udriver=virtio-net@N` on its command line) and that no driver has: this
-//! starts the driver itself (`/bin/udrv-virtio-net N stack=FD`), with a
-//! channel on which the driver hands the card over, and starts it again
-//! when it dies. The address, and what smoltcp knows of the neighbours,
-//! stay through that: the interface carries nothing for a moment, as the
-//! kernel's does.
+//! (`udriver=virtio-net@N` on its command line) and that no driver has.
+//! This process is its driver: it claims the card, and its threads read
+//! the card's rings and fill them themselves (`udrivers::net`), so a frame
+//! goes from the card to the stack and back without a change of process.
+//! When the card or this process fails, the process ends and whoever
+//! started it starts it again; the kernel keeps the sockets meanwhile.
+//!
+//! With `driver=process` the driver is a process of its own, as it was
+//! before the two were one: this starts it (`/bin/udrv-virtio-net N
+//! stack=FD`), with a channel on which the driver hands the card over, and
+//! starts it again when it dies. The address, the connections and what
+//! smoltcp knows of the neighbours stay through that, which is what the
+//! second process buys; every frame pays for it with a change of process
+//! each way.
 //!
 //! The kernel has no interface for this card. The stack answers for its
 //! address by itself (ARP, ICMP echo), and serves the kernel the datagram
@@ -20,21 +29,22 @@
 //! each other). On a kernel that has no such call it answers for its
 //! address and nothing else.
 //!
-//! Three threads share the stack, under one lock. The card's takes what
-//! the driver says, a turn in one system call, and sends the kernel what
-//! arrived, all in one message. The sockets' takes what the kernel says,
-//! every message that is waiting, and tells the driver of the frames that
-//! made, all in one write. The third sleeps until the stack has something
+//! Three threads share the stack, under one lock. The card's sleeps on
+//! the card's interrupt (or on the driver's FIFO), takes what the card
+//! did, a turn at a time, and sends the kernel what arrived, all in one
+//! message. The sockets' takes what the kernel says, every message that is
+//! waiting, and gives the card the frames that made, all at once. The third sleeps until the stack has something
 //! to do that no message brings about: asking again for a neighbour that
 //! did not answer, sending again a segment nobody acknowledged.
 //!
 //! One message for all that arrived is what keeps this from costing a
 //! change of process for each datagram or segment: whoever is woken runs
 //! at once, so a wake for each is one at a time through four processes.
-//! The driver is woken as seldom, for the same reason: a receive slot to
-//! give back waits for a frame to go with, and the acknowledgement of
-//! what a program was just told waits a moment for the program's answer
-//! (`HOLD`).
+//! The card is given what there is for it as seldom: a receive slot to
+//! give back waits for a frame to go with. And a driver that is a process
+//! of its own is woken as seldom, for the same reason: there the
+//! acknowledgement of what a program was just told waits a moment for the
+//! program's answer (`HOLD`).
 //!
 //! The kernel is also told how much the card has carried, since it is the
 //! kernel that shows the machine's interfaces and their counts: at once
@@ -48,8 +58,9 @@
 //! another address ends this process, for whoever started it to start it
 //! again: the connections were the old address's.
 //!
-//! Exit status: 2 for a command line that is not one, 1 when the driver
-//! cannot be started or gives no card, 3 when the lease's address changed.
+//! Exit status: 2 for a command line that is not one, 1 when there is no
+//! card to take, when the card fails, and when a driver of its own cannot
+//! be started or gives no card, 3 when the lease's address changed.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -71,17 +82,24 @@ use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
+use udrivers::claim;
 use udrivers::fifo::Fifo;
-use udrivers::net::{Msg, Offer, BUF_SIZE};
+use udrivers::net::{self, Feeder, Msg, NoCard, Offer, BUF_SIZE};
 use udrivers::status;
+use udrivers::virtio::Device;
 use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
-const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY] | eclipse-netstack N dhcp";
-/// The card's driver, which this process starts.
+const USAGE: &str = "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY]|dhcp [driver=process]";
+/// The word that asks for the card's driver in a process of its own.
+const APART: &str = "driver=process";
+/// The card's driver, when it is a process of its own, which this one
+/// starts.
 const DRIVER: &str = "/bin/udrv-virtio-net";
-/// The messages of one turn: as many as the driver's FIFO holds.
-const TURN: usize = udrivers::net::FIFO_DEPTH;
+/// The messages of one turn: as many as the driver's FIFO holds, which is
+/// more than a card has slots.
+const TURN: usize = net::FIFO_DEPTH;
+const _: () = assert!(net::SLOTS <= TURN);
 /// The longest pause before the driver is started again, which is where
 /// the pauses stop doubling for one that keeps dying.
 const PAUSE_MAX: Duration = Duration::from_secs(8);
@@ -108,18 +126,112 @@ impl Drop for Window {
     }
 }
 
-/// A card and the driver that serves it.
+/// The card, when this process is its driver: what any thread needs to
+/// give it frames to send and its receive slots back.
+struct Own {
+    device: Device,
+    /// The offering halves of the card's rings. Taken before the stack's
+    /// lock and never with it held: whoever has it gives the card what
+    /// the stack has for it now, so two threads' frames reach the card in
+    /// the order the stack made them.
+    feeder: Mutex<Feeder>,
+    /// The card's interrupt, or `None` where the card has to be looked at.
+    interrupt: Option<Handle>,
+}
+
+impl Own {
+    /// Give the card what the stack has for it: the receive slots it has
+    /// read and the frames it wants sent. With `when_due`, only if that is
+    /// worth a trip to the card ([`Port::due`]).
+    fn give(&self, host: &Host, msgs: &mut [Msg; TURN], when_due: bool) {
+        let mut feeder = locked(&self.feeder);
+        let n = {
+            let shared = locked(&host.shared);
+            let port = shared.stack.device();
+            if when_due && !port.due() {
+                0
+            } else {
+                port.outgoing(msgs)
+            }
+        };
+        if n == 0 {
+            return;
+        }
+        match feeder.give(&msgs[..n]) {
+            Ok((rx, tx)) => {
+                if rx {
+                    self.device.notify(net::RXQ);
+                }
+                if tx {
+                    self.device.notify(net::TXQ);
+                }
+            }
+            // The port makes them and checks them: a bug here, and nothing
+            // to carry on with.
+            Err(m) => die(format_args!(
+                "a message for the card that means nothing: {m:?}"
+            )),
+        }
+    }
+}
+
+/// How the stack's threads reach the card.
+#[derive(Clone)]
+enum Wire {
+    /// Through its driver, a process of its own, down the driver's FIFO.
+    Driver(Arc<Fifo<Msg>>),
+    /// It is this process's.
+    Own(Arc<Own>),
+}
+
+/// What the card's thread has of the card besides the [`Wire`].
+enum Taker {
+    /// The driver's process, and its window, held for the port over it,
+    /// which the interface has: dropped, with the rest of the link, once
+    /// the interface is on another.
+    Driver { driver: Child, _window: Window },
+    /// The taking halves of the card's rings.
+    Own(net::Card),
+}
+
+/// A card as the stack has it: its own, or a driver's that serves it.
 struct Link {
-    driver: Child,
-    fifo: Arc<Fifo<Msg>>,
-    /// Held for the port over it, which the interface has: dropped, with
-    /// the rest of the link, once the interface is on another.
-    _window: Window,
+    wire: Wire,
+    taker: Taker,
     mac: [u8; 6],
 }
 
-/// Start the driver of card `index` and take the card it offers: the link
-/// to it, and the port for the stack.
+/// Take card `index` for this process to drive: the link to it, and the
+/// port for the stack, which is over the card's own slots.
+fn take(index: usize) -> Result<(Link, Port), String> {
+    let driven = net::drive(index, false).map_err(|e| match e {
+        NoCard::NoGateway => "the gateway is off (zircon.gateway=0 on the command line?)".into(),
+        NoCard::Other(e) => e,
+    })?;
+    if driven.irq_refused {
+        println!("{NAME}: the device refused MSI-X vector 0; polling");
+    }
+    // SAFETY: the slots of the DMA memory, which is mapped for as long as
+    // the process lasts; the card and this port are all that read or write
+    // them, a slot at a time as the rings say whose it is.
+    let port = unsafe { Port::new(driven.dma.ptr.add(net::DMA_WIN), net::RX_BUFS, net::TX_BUFS) }
+        .ok_or("a card with more slots than a port takes")?;
+    Ok((
+        Link {
+            wire: Wire::Own(Arc::new(Own {
+                device: driven.device,
+                feeder: Mutex::new(driven.feeder),
+                interrupt: driven.interrupt,
+            })),
+            taker: Taker::Own(driven.card),
+            mac: driven.mac,
+        },
+        port,
+    ))
+}
+
+/// Start the driver of card `index`, a process of its own, and take the
+/// card it offers: the link to it, and the port for the stack.
 fn start(index: usize) -> Result<(Link, Port), String> {
     let (ours, theirs) = Channel::create().map_err(|e| match e {
         Status::NO_GATEWAY => "the gateway is off (zircon.gateway=0 on the command line?)".into(),
@@ -167,9 +279,11 @@ fn start(index: usize) -> Result<(Link, Port), String> {
     match taken {
         Ok((fifo, window, port, mac)) => Ok((
             Link {
-                driver,
-                fifo: Arc::new(fifo),
-                _window: window,
+                wire: Wire::Driver(Arc::new(fifo)),
+                taker: Taker::Driver {
+                    driver,
+                    _window: window,
+                },
                 mac,
             },
             port,
@@ -189,9 +303,9 @@ fn now() -> Instant {
 /// What the threads share.
 struct Shared {
     stack: Stack<Port>,
-    /// The FIFO of the driver the card has now, for the threads that are
-    /// not the card's to tell it of a frame to send.
-    fifo: Arc<Fifo<Msg>>,
+    /// The way to the card now, for the threads that are not the card's
+    /// to give it a frame to send.
+    wire: Wire,
     /// Whether the programs answer what arrives for them: one has sent
     /// something since the card's thread last waited for an answer to
     /// send its frames with (see [`HOLD`]).
@@ -220,7 +334,8 @@ struct Host {
     /// held while they are written down, and never with the stack's
     /// lock.
     named: Mutex<Named>,
-    /// The driver the card has now and how many it has had, for
+    /// The driver the card has now and how many it has had, when the
+    /// driver is a process of its own (zero when it is this one), for
     /// [`publish`].
     driver_pid: AtomicU32,
     driver_starts: AtomicU32,
@@ -343,14 +458,16 @@ fn counts_due_in(host: &Host, counts: &Counts) -> Option<Duration> {
     Some(Duration::from_micros(due.total_micros()))
 }
 
-/// Tell the driver, from a thread that is not the card's, what this turn
+/// Tell the card, from a thread that is not the card's, what this turn
 /// of the stack made: the frames to send, mostly. The card's thread sends
 /// its own with its next turn.
 fn tell_driver(host: &Host, msgs: &mut [Msg; TURN]) {
-    let (n, fifo) = {
-        let shared = locked(&host.shared);
-        (shared.stack.device().outgoing(msgs), shared.fifo.clone())
+    let wire = locked(&host.shared).wire.clone();
+    let fifo = match wire {
+        Wire::Driver(fifo) => fifo,
+        Wire::Own(own) => return own.give(host, msgs, false),
     };
+    let n = locked(&host.shared).stack.device().outgoing(msgs);
     if n == 0 {
         return;
     }
@@ -371,8 +488,8 @@ fn tell_driver(host: &Host, msgs: &mut [Msg; TURN]) {
 }
 
 /// How long the card's thread keeps the frames of a turn that brought a
-/// program bytes, for the program's answer to go to the driver with them:
-/// in nanoseconds.
+/// program bytes, for the program's answer to go to the driver with them,
+/// when the driver is a process of its own: in nanoseconds.
 ///
 /// What such a turn has to send is an acknowledgement, and the program is
 /// awake with the bytes before this thread is back. Sent now, the
@@ -385,8 +502,29 @@ fn tell_driver(host: &Host, msgs: &mut [Msg; TURN]) {
 /// arrives.
 const HOLD: u64 = 2_000_000;
 
-/// Carry the card's frames through the stack until its driver is gone. Why
-/// it stopped.
+/// Take what the card did (`msgs`) and carry the frames through the
+/// stack, telling the kernel what arrived for its sockets: whether what
+/// that left to send is to be kept a moment ([`HOLD`]).
+fn carried(host: &Arc<Host>, msgs: &[Msg], data: &mut Vec<u8>) -> bool {
+    let guard = locked(&host.shared);
+    for m in msgs {
+        if !guard.stack.device().take(m) {
+            println!("{NAME}: a message from the card that means nothing: {m:?}");
+        }
+    }
+    // Every frame that has room for its answer, in one go.
+    if !turn(host, guard, data) {
+        return false;
+    }
+    let mut shared = locked(&host.shared);
+    let hold = shared.answering && shared.stack.device().has_frames();
+    // Until a program sends again.
+    shared.answering &= !hold;
+    hold
+}
+
+/// Carry the frames of a card a driver serves through the stack until the
+/// driver is gone. Why it stopped.
 ///
 /// One system call a turn (`eclipse_fifo_reply_wait`): what the last turn
 /// left to say -- the receive slots that were read, the frames to send --
@@ -414,29 +552,61 @@ fn serve(host: &Arc<Host>, fifo: &Fifo<Msg>) -> Status {
             Ok(got) => got,
             Err(e) => return e,
         };
-        let guard = locked(&host.shared);
-        for m in &msgs[..got] {
-            if !guard.stack.device().take(m) {
-                println!("{NAME}: a message from the driver that means nothing: {m:?}");
-            }
-        }
-        // Every frame that has room for its answer, in one go.
-        if !turn(host, guard, &mut data) {
-            continue;
-        }
-        let hold = {
-            let mut shared = locked(&host.shared);
-            let hold = shared.answering && shared.stack.device().has_frames();
-            // Until a program sends again.
-            shared.answering &= !hold;
-            hold
-        };
-        if hold {
+        if carried(host, &msgs[..got], &mut data) {
             // Time up, or the driver has more to say: either way what is
             // left to send goes with the next turn's call.
             if let Err(e) = fifo.wait_readable_for(HOLD) {
                 return e;
             }
+        }
+    }
+}
+
+/// How long between two looks at a card that has no interrupt.
+const LOOK: Duration = Duration::from_micros(200);
+
+/// Carry the frames of this process's own card through the stack, for as
+/// long as the card works. Why it stopped.
+///
+/// Asleep on the card's interrupt between bursts. A burst is taken out of
+/// the rings a turn at a time until they are empty; after each turn the
+/// card gets back the receive slots that were read and the frames to
+/// send, when they are worth the trip ([`Port::due`]), so it is never
+/// left without slots in the middle of a burst. One system call to wait,
+/// and one more when something arrived for a socket, to tell the kernel.
+///
+/// Nothing is kept for a program's answer, as it is for a driver that is
+/// another process ([`HOLD`]): what a turn leaves to send wakes nobody
+/// here, and waiting for the answer would be waiting blind, since the
+/// card's interrupt stays masked from one wait for it to the next. Timed
+/// on riscv64 (QEMU counting instructions, one CPU), a thousand echoes of
+/// 56 bytes with a host: 4.0 ms each when the frames were kept, 0.55 to
+/// 0.7 ms sent at once, and 1.0 ms with the driver in its own process.
+fn serve_card(host: &Arc<Host>, own: &Own, card: &mut net::Card) -> String {
+    let mut got = [Msg::default(); net::SLOTS];
+    let mut msgs = [Msg::default(); TURN];
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
+    loop {
+        if let Some(interrupt) = own.interrupt {
+            if let Err(e) = claim::interrupt_wait(interrupt) {
+                return format!("interrupt_wait: {e}");
+            }
+            own.device.ack();
+        }
+        let mut any = false;
+        loop {
+            let n = match card.collect(&mut got) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(why) => return why,
+            };
+            any = true;
+            carried(host, &got[..n], &mut data);
+            own.give(host, &mut msgs, true);
+        }
+        if own.interrupt.is_none() && !any {
+            own.device.ack();
+            std::thread::sleep(LOOK);
         }
     }
 }
@@ -714,7 +884,11 @@ fn name_servers(host: &Host, heard: impl FnOnce(&mut Named)) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let parsed = match &args[1..] {
+    let (words, apart) = match &args[1..] {
+        [words @ .., last] if last == APART => (words, true),
+        words => (words, false),
+    };
+    let parsed = match words {
         [index, how] => index.parse::<usize>().ok().zip(Addressing::parse(how)),
         _ => None,
     };
@@ -723,7 +897,8 @@ fn main() {
         exit(2);
     };
 
-    let (mut link, port) = start(index).unwrap_or_else(|e| die(e));
+    let taken = if apart { start(index) } else { take(index) };
+    let (mut link, port) = taken.unwrap_or_else(|e| die(e));
     let mac = link.mac;
     // The machine's settings for this card, when they say any, and not
     // the command line.
@@ -767,15 +942,18 @@ fn main() {
         governed,
         shared: Mutex::new(Shared {
             stack,
-            fifo: link.fifo.clone(),
+            wire: link.wire.clone(),
             answering: false,
             six_owed: false,
         }),
         kernel: OnceLock::new(),
         told: Mutex::new(None),
         named: Mutex::new(Named::default()),
-        driver_pid: AtomicU32::new(link.driver.id()),
-        driver_starts: AtomicU32::new(1),
+        driver_pid: AtomicU32::new(match &link.taker {
+            Taker::Driver { driver, .. } => driver.id(),
+            Taker::Own(_) => 0,
+        }),
+        driver_starts: AtomicU32::new(apart as u32),
         teller: Mutex::new(Teller::default()),
         clock: OnceLock::new(),
     });
@@ -801,8 +979,18 @@ fn main() {
     loop {
         publish(&host);
         let since = std::time::Instant::now();
-        let why = serve(&host, &link.fifo);
-        let status = link.driver.wait();
+        let (fifo, driver) = match (&link.wire, &mut link.taker) {
+            (Wire::Driver(fifo), Taker::Driver { driver, .. }) => (fifo, driver),
+            // The card is this process's, and so is its failing: whoever
+            // started the stack starts it again, with the card reset.
+            (Wire::Own(own), Taker::Own(card)) => {
+                let why = serve_card(&host, own, card);
+                die(format_args!("card {index} is gone ({why})"));
+            }
+            _ => unreachable!("a link is made whole, of one kind"),
+        };
+        let why = serve(&host, fifo);
+        let status = driver.wait();
         println!(
             "{NAME}: the driver is gone ({why}{}); starting another",
             status.map(|s| format!(", {s}")).unwrap_or_default()
@@ -818,8 +1006,10 @@ fn main() {
             match start(index) {
                 Ok(next) if next.0.mac == mac => break next,
                 Ok((mut other, _)) => {
-                    let _ = other.driver.kill();
-                    let _ = other.driver.wait();
+                    if let Taker::Driver { driver, .. } = &mut other.taker {
+                        let _ = driver.kill();
+                        let _ = driver.wait();
+                    }
                     die(format_args!(
                         "card {index} came back as {}: not the card this stack had",
                         EthernetAddress(other.mac)
@@ -836,19 +1026,23 @@ fn main() {
             let mut shared = locked(&host.shared);
             port.count_from(shared.stack.device().counts());
             *shared.stack.device_mut() = port;
-            shared.fifo = next.fifo.clone();
+            shared.wire = next.wire.clone();
         }
         link = next;
-        host.driver_pid.store(link.driver.id(), Ordering::Relaxed);
+        if let Taker::Driver { driver, .. } = &link.taker {
+            host.driver_pid.store(driver.id(), Ordering::Relaxed);
+        }
         host.driver_starts.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Say what this stack is (see `udrivers::status`): the card, its address
 /// and where that came from, what the machine's network settings said for
-/// it, the gateway and the lease's name servers, the
-/// driver it runs now and how many it has started, which eclipse-init
-/// never sees. lunarmon's SERVIDORES list reads it.
+/// it, the gateway and the lease's name servers, and whose the card's
+/// driver is: this process (`driver=own`), or a process of its own
+/// (`driver=process`), with the one it runs now and how many it has
+/// started, which eclipse-init never sees. lunarmon's SERVIDORES list
+/// reads it.
 fn publish(host: &Host) {
     let (address, gateway, dns, leases, sixes) = {
         let shared = locked(&host.shared);
@@ -871,30 +1065,36 @@ fn publish(host: &Host) {
     };
     let or_none = |text: Option<String>| text.unwrap_or_else(|| "none".into());
     let dns: Vec<String> = dns.iter().map(|server| server.to_string()).collect();
-    status::publish(
-        &format!("stack.{device}"),
-        &[
-            ("program", NAME),
-            ("device", &device),
-            ("mac", &status::mac_text(host.mac)),
-            ("addr", &or_none(address.map(|a| a.to_string()))),
-            ("addr_from", from),
-            ("governed", host.governed.as_deref().unwrap_or("none")),
-            ("gateway", &or_none(gateway.map(|g| g.to_string()))),
-            ("dns", &or_none((!dns.is_empty()).then(|| dns.join(",")))),
-            (
-                "addr6",
-                &or_none((!addr6.is_empty()).then(|| addr6.join(","))),
-            ),
-            ("gateway6", &or_none(sixes.router.map(|r| r.to_string()))),
-            (
-                "driver_pid",
-                &host.driver_pid.load(Ordering::Relaxed).to_string(),
-            ),
-            (
-                "driver_starts",
-                &host.driver_starts.load(Ordering::Relaxed).to_string(),
-            ),
-        ],
-    );
+    let starts = host.driver_starts.load(Ordering::Relaxed);
+    let mut fields: Vec<(&str, String)> = vec![
+        ("program", NAME.into()),
+        ("device", device.clone()),
+        ("mac", status::mac_text(host.mac)),
+        ("addr", or_none(address.map(|a| a.to_string()))),
+        ("addr_from", from.into()),
+        (
+            "governed",
+            host.governed.clone().unwrap_or_else(|| "none".into()),
+        ),
+        ("gateway", or_none(gateway.map(|g| g.to_string()))),
+        ("dns", or_none((!dns.is_empty()).then(|| dns.join(",")))),
+        (
+            "addr6",
+            or_none((!addr6.is_empty()).then(|| addr6.join(","))),
+        ),
+        ("gateway6", or_none(sixes.router.map(|r| r.to_string()))),
+    ];
+    // A driver that is this process is no other process to show.
+    if starts == 0 {
+        fields.push(("driver", "own".into()));
+    } else {
+        fields.push(("driver", "process".into()));
+        fields.push((
+            "driver_pid",
+            host.driver_pid.load(Ordering::Relaxed).to_string(),
+        ));
+        fields.push(("driver_starts", starts.to_string()));
+    }
+    let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    status::publish(&format!("stack.{device}"), &fields);
 }

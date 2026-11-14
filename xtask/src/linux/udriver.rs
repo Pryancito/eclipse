@@ -20,8 +20,9 @@
 //! `eclipse-netstack` (`tools/eclipse-netstack`) is the network stack as a
 //! process: on a boot that asks for it (`unetstack=ADDR/PREFIX` next to
 //! `udriver=virtio-net@0`) the `unet` service runs it in place of the
-//! driver, and it runs the driver itself and takes the card's frames
-//! instead of the kernel.
+//! driver. It is the card's driver itself and takes the card's frames
+//! instead of the kernel; with `unetdriver=process` as well it runs
+//! `udrv-virtio-net` for that, a process of its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,13 +90,22 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           # unetstack=ADDR/PREFIX on the kernel command line: the card does\n\
           # not go to the kernel. The network stack that runs as a process\n\
-          # takes it, with that address, and runs the driver itself. See\n\
+          # takes it, with that address, and is its driver too. See\n\
           # tools/eclipse-netstack. unetstack=ADDR/PREFIX,GATEWAY gives it a\n\
           # gateway too, and unetstack=dhcp has it ask a server for both.\n\
-          stack=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^unetstack=//p' | head -n 1)\n\
+          words=$(tr ': ' '\\n\\n' < /proc/cmdline)\n\
+          stack=$(echo \"$words\" | sed -n 's/^unetstack=//p' | head -n 1)\n\
           if [ -n \"$stack\" ]; then\n\
           \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
-          \x20   exec /bin/eclipse-netstack 0 \"$stack\"\n\
+          \x20   # unetdriver=process: the driver in a process of its own, which\n\
+          \x20   # the stack starts and starts again, as it was before the stack\n\
+          \x20   # drove the card itself. A driver that dies then costs no\n\
+          \x20   # connection, and every frame a change of process each way.\n\
+          \x20   case $(echo \"$words\" | sed -n 's/^unetdriver=//p' | head -n 1) in\n\
+          \x20       process) set -- driver=process ;;\n\
+          \x20       *) set -- ;;\n\
+          \x20   esac\n\
+          \x20   exec /bin/eclipse-netstack 0 \"$stack\" \"$@\"\n\
           fi\n\
           exec /bin/udrv-virtio-net 0\n",
     )
