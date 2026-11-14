@@ -2244,15 +2244,17 @@ pub struct Asked {
 }
 
 /// Send `question` to `to` by the stack of `link`, to wait `patience` for
-/// what comes back. What a `sendto` would say when it cannot go:
-/// `ENETDOWN` with no stack, `EAFNOSUPPORT` for an IPv6 address.
+/// what comes back: from a socket of the address's family, so who has an
+/// address of IPv6 is asked as IPv6. What a `sendto` would say when it
+/// cannot go: `ENETDOWN` with no stack, `ENETUNREACH` with no way there.
 pub async fn ask(
     link: &Arc<StackLink>,
     to: IpEndpoint,
     question: &[u8],
     patience: core::time::Duration,
 ) -> LxResult<Asked> {
-    let socket = ServedUdpSocket::new(link.clone(), false)?;
+    let v6 = matches!(to.addr, IpAddress::Ipv6(_));
+    let socket = ServedUdpSocket::new(link.clone(), v6)?;
     // Connected: what anybody else sends to its port is not an answer.
     socket.connect(Endpoint::Ip(to)).await?;
     Socket::write(&socket, question, None)?;

@@ -1249,14 +1249,38 @@ fn a_question_of_the_kernels_goes_by_the_stack_and_waits_for_its_answer() {
         Err(LxError::ETIMEDOUT)
     );
 
-    // What cannot be sent is said when it is asked: a server the
-    // stack has no way to (IPv6), and no stack at all.
-    let six = IpEndpoint::new(IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 53);
+    // What cannot be sent is said when it is asked: a server of IPv6
+    // while the stack has no way to it, and no stack at all.
+    let six = at6("2001:db8::1", 53);
     let refused = async_std::task::block_on(ask(&stack.link, six, b"x", short)).err();
-    assert_eq!(refused, Some(LxError::EAFNOSUPPORT));
+    assert_eq!(refused, Some(LxError::ENETUNREACH));
     let nobody = StackLink::new();
     let refused = async_std::task::block_on(ask(&nobody, at(HOST, 53), b"x", short)).err();
     assert_eq!(refused, Some(LxError::ENETDOWN));
+
+    // With a way there, who has an address of IPv6 is asked as IPv6,
+    // from a socket of IPv6, and its answer is read the same.
+    let (IpAddress::Ipv6(card), IpAddress::Ipv6(router), IpAddress::Ipv6(server)) =
+        (at6("fec0::7", 0).addr, at6("fe80::2", 0).addr, six.addr)
+    else {
+        unreachable!()
+    };
+    stack.say(six_message(Some(router), &[Ipv6Cidr::new(card, 64)]));
+    while stack.told().is_some() {}
+    let asked = async_std::task::block_on(ask(&stack.link, six, b"who6?", patience)).unwrap();
+    let sock = loop {
+        let m = stack.told().expect("the question leaves");
+        if let Some((OP_SEND6, sock)) = parse_header(&m) {
+            assert_eq!(m, send6_message(sock, server.0, 53, 0, b"who6?"));
+            break sock;
+        }
+    };
+    stack.say(data6(sock, "2001:db8::9", 53, b"not who was asked"));
+    stack.say(data6(sock, "2001:db8::1", 53, b"six"));
+    assert_eq!(
+        async_std::task::block_on(asked.answer()),
+        Ok(b"six".to_vec())
+    );
 }
 
 #[test]

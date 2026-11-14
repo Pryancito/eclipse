@@ -133,6 +133,18 @@ pub fn iface_by_linux_ifindex(idx: u32) -> LxResult<Arc<dyn zcore_drivers::schem
         .ok_or(LxError::ENODEV)
 }
 
+/// The index, as Linux numbers them, of the interface that an address of
+/// a link (`fe80::/10`) is taken to be of: the machine's first that is
+/// not the loopback, and 0 while it has none. Linux says with such an
+/// address which link it is of (`sin6_scope_id`), and a resolver that
+/// asked a name server at `fe80::1%eth0` takes for its answer only what
+/// comes from that address of that link.
+pub fn link_scope_index() -> u32 {
+    let cards = get_net_device();
+    let card = cards.iter().position(|iface| !iface.is_loopback());
+    card.map_or(0, |at| at as u32 + 1)
+}
+
 /// Pick the Ethernet netdev for an IPv4 destination (never loopback).
 pub fn netdev_for_ipv4(
     dst: smoltcp::wire::Ipv4Address,

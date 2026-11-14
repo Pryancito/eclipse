@@ -1136,6 +1136,45 @@ mod dns_tests {
         ));
         assert_eq!(got, Err(LxError::ENOENT));
         assert!(kernel_hal::timer::timer_now() - before < REPLY_TIMEOUT);
+
+        // A name server with an address of IPv6 is asked as IPv6: here
+        // one of this machine, that answers the AAAA question.
+        conf.resize(0).unwrap();
+        conf.write_at(0, b"nameserver ::1\n").unwrap();
+        let server = ServedUdpSocket::new(link.clone(), true).unwrap();
+        let v6 = |segments: [u16; 8]| {
+            let [a, b, c, d, e, f, g, h] = segments;
+            IpAddress::v6(a, b, c, d, e, f, g, h)
+        };
+        let here = IpEndpoint::new(v6([0, 0, 0, 0, 0, 0, 0, 1]), DNS_PORT);
+        assert_eq!(Socket::bind(&server, Endpoint::Ip(here)), Ok(0));
+        let answering = std::thread::spawn(move || {
+            async_std::task::block_on(async {
+                for _ in 0..2 {
+                    let mut buf = [0u8; 512];
+                    let (n, from) = Socket::read(&server, &mut buf).await;
+                    let n = n.unwrap();
+                    let qtype = u16::from_be_bytes([buf[n - 4], buf[n - 3]]);
+                    let mut reply = buf[..n].to_vec();
+                    reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                    if qtype == QTYPE_AAAA {
+                        reply[7] = 1;
+                        reply.extend_from_slice(&[0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+                        reply.extend_from_slice(&[0xfe, 0xc0, 0, 0, 0, 0, 0, 0]);
+                        reply.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x99]);
+                    }
+                    assert_eq!(Socket::write(&server, &reply, Some(from)), Ok(reply.len()));
+                }
+            })
+        });
+        let got = async_std::task::block_on(resolve_by(
+            &root,
+            "probe.eclipse",
+            DnsFamily::Unspec,
+            Some(&link),
+        ));
+        assert_eq!(got, Ok(alloc::vec![v6([0xfec0, 0, 0, 0, 0, 0, 0, 0x99])]));
+        answering.join().unwrap();
     }
 
     #[test]

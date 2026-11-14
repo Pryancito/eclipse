@@ -9,7 +9,7 @@
 //! minutes (a router advertisement). What an advertisement says is read here
 //! ([`advert`]), by hand: smoltcp's reading refuses the whole message for
 //! one option it does not know, and routers send plenty of those. Of what
-//! it says the stack takes two things:
+//! it says the stack takes three things:
 //!
 //! - the router itself, where what is for no network of the card's goes,
 //!   for as long as it says it is one. The first one heard is kept while
@@ -18,6 +18,10 @@
 //!   from: the address is the prefix and the MAC, for as long as the
 //!   router says the prefix is good, and its network is the card's.
 //!   [`PREFIXES`] of them at most.
+//! - the name servers it names (RFC 8106), each for as long as it says:
+//!   [`SERVERS`] of them at most, the first heard. The stack only keeps
+//!   them ([`Stack::names6`]); who runs it writes them where the
+//!   resolvers look.
 //!
 //! smoltcp does the rest once the interface has the addresses: it answers
 //! the neighbours that ask where one is, and the echo requests.
@@ -84,6 +88,12 @@ const ADVERT_OPTIONS_AT: usize = 16;
 const PREFIX_INFORMATION: u8 = 3;
 const PREFIX_INFORMATION_LEN: usize = 32;
 const AUTONOMOUS: u8 = 0x40;
+/// The option that names name servers (RFC 8106, 5.1): where its
+/// lifetime is and where its addresses start.
+const RECURSIVE_DNS_SERVER: u8 = 25;
+const SERVERS_AT: usize = 8;
+/// The name servers kept, at most: as many as a resolver asks.
+pub const SERVERS: usize = 3;
 /// What a message of the neighbours' protocol travels with: nothing that
 /// crossed a router has it.
 const ON_LINK: u8 = 255;
@@ -114,6 +124,9 @@ pub struct Advert {
     /// The prefixes an address may be made from, and for how many seconds
     /// each is good.
     pub prefixes: Vec<(Ipv6Address, u32)>,
+    /// The name servers it names, and for how many seconds each is one:
+    /// 0 when it is one no more.
+    pub servers: Vec<(Ipv6Address, u32)>,
 }
 
 /// What `packet`, a whole IPv6 packet of ICMP, says when it is a router
@@ -138,6 +151,7 @@ pub fn advert(packet: &[u8]) -> Option<Advert> {
     }
     let lifetime = u16::from_be_bytes([message[6], message[7]]);
     let mut prefixes = Vec::new();
+    let mut servers = Vec::new();
     let mut options = &message[ADVERT_OPTIONS_AT..];
     // Each option says its kind and its length in eights of bytes; one
     // that says none, or more than there is, ends the reading.
@@ -148,25 +162,40 @@ pub fn advert(packet: &[u8]) -> Option<Advert> {
         }
         let (option, rest) = options.split_at(len);
         options = rest;
-        if option[0] != PREFIX_INFORMATION || len < PREFIX_INFORMATION_LEN {
-            continue;
-        }
-        let prefix = Ipv6Address::from_bytes(&option[16..32]);
-        let valid = u32::from_be_bytes([option[4], option[5], option[6], option[7]]);
-        // An address is made from 64 bits of prefix, and not from the
-        // link's own or a group's.
-        let usable = option[2] == PREFIX_BITS
-            && option[3] & AUTONOMOUS != 0
-            && prefix.is_unicast()
-            && !prefix.is_link_local();
-        if usable && prefixes.len() < PREFIXES {
-            prefixes.push((prefix, valid));
+        let seconds = u32::from_be_bytes([option[4], option[5], option[6], option[7]]);
+        match option[0] {
+            PREFIX_INFORMATION if len >= PREFIX_INFORMATION_LEN => {
+                let prefix = Ipv6Address::from_bytes(&option[16..32]);
+                // An address is made from 64 bits of prefix, and not from
+                // the link's own or a group's.
+                let usable = option[2] == PREFIX_BITS
+                    && option[3] & AUTONOMOUS != 0
+                    && prefix.is_unicast()
+                    && !prefix.is_link_local();
+                if usable && prefixes.len() < PREFIXES {
+                    prefixes.push((prefix, seconds));
+                }
+            }
+            RECURSIVE_DNS_SERVER => {
+                // One address after another; a piece of one at the end is
+                // not one.
+                let (addresses, _) = option[SERVERS_AT..].as_chunks::<16>();
+                for address in addresses {
+                    let server = Ipv6Address(*address);
+                    // Somebody to ask: no group, and not this machine.
+                    if server.is_unicast() && !server.is_loopback() {
+                        servers.push((server, seconds));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Some(Advert {
         router,
         lifetime,
         prefixes,
+        servers,
     })
 }
 
@@ -194,7 +223,8 @@ impl Sixes {
     }
 }
 
-/// An address made from a router's prefix.
+/// An address made from a router's prefix, or a name server's that a
+/// router named.
 struct Given {
     address: Ipv6Address,
     /// When it stops being good, if ever.
@@ -217,6 +247,10 @@ pub(super) struct Six {
     /// Whether the addresses or the router changed since
     /// [`Stack::six_news`] last asked.
     news: bool,
+    /// The name servers the routers named, the first heard first.
+    named: Vec<Given>,
+    /// Whether those changed since [`Stack::names6_news`] last asked.
+    names_news: bool,
 }
 
 impl Six {
@@ -233,7 +267,8 @@ impl Six {
     /// is.
     fn next(&self) -> Option<Instant> {
         let router = self.router.map(|(_, until)| until);
-        let given = self.given.iter().filter_map(|given| given.until);
+        let given = self.given.iter().chain(&self.named);
+        let given = given.filter_map(|given| given.until);
         self.asks_at().into_iter().chain(router).chain(given).min()
     }
 }
@@ -296,6 +331,17 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// Whether that changed since this was last asked.
     pub fn six_news(&mut self) -> bool {
         core::mem::take(&mut self.six.news)
+    }
+
+    /// The name servers the link's routers name now, the first heard
+    /// first.
+    pub fn names6(&self) -> Vec<Ipv6Address> {
+        self.six.named.iter().map(|named| named.address).collect()
+    }
+
+    /// Whether those changed since this was last asked.
+    pub fn names6_news(&mut self) -> bool {
+        core::mem::take(&mut self.six.names_news)
     }
 
     fn put_six(&mut self, address: Ipv6Address) {
@@ -400,6 +446,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             self.take_six(gone.address);
             self.six.news = true;
         }
+        let named = self.six.named.len();
+        self.six.named.retain(|named| !over(named));
+        self.six.names_news |= self.six.named.len() != named;
     }
 
     /// Send what is for no network of the card's to `router` until
@@ -469,10 +518,29 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 None => {}
             }
         }
+        for &(server, seconds) in &said.servers {
+            let until = (seconds != FOREVER).then(|| now + Duration::from_secs(u64::from(seconds)));
+            let named = &mut self.six.named;
+            match named.iter().position(|named| named.address == server) {
+                // It is a name server no more, at once: nothing is lost
+                // by asking another, as there is by losing an address.
+                Some(at) if seconds == 0 => {
+                    named.remove(at);
+                    self.six.names_news = true;
+                }
+                Some(at) => named[at].until = until,
+                None if seconds != 0 && named.len() < SERVERS => {
+                    let address = server;
+                    named.push(Given { address, until });
+                    self.six.names_news = true;
+                }
+                None => {}
+            }
+        }
     }
 
-    /// How long until an address or the router ends, or a router is to
-    /// be asked for again.
+    /// How long until an address, the router or a name server ends, or a
+    /// router is to be asked for again.
     pub(super) fn six_idle(&self, now: Instant) -> Option<Duration> {
         let next = self.six.next()?;
         Some(if next > now {
@@ -859,6 +927,21 @@ pub(in crate::socks) mod tests {
     /// how many seconds it is good.
     type Prefix = (Ipv6Address, u8, u8, u32);
 
+    /// The name server every advertisement of [`advert_message`] names,
+    /// for an hour.
+    const NAMED: Ipv6Address = Ipv6Address([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+
+    /// The option of an advertisement that names `servers` for
+    /// `seconds`.
+    fn names_option(servers: &[Ipv6Address], seconds: u32) -> Vec<u8> {
+        let mut option = vec![RECURSIVE_DNS_SERVER, 1 + 2 * servers.len() as u8, 0, 0];
+        option.extend_from_slice(&seconds.to_be_bytes());
+        for server in servers {
+            option.extend_from_slice(server.as_bytes());
+        }
+        option
+    }
+
     /// A router advertisement's message: a router for `lifetime` seconds,
     /// with its card, `prefixes`, and a name server, which is an option
     /// smoltcp does not know.
@@ -876,10 +959,7 @@ pub(in crate::socks) mod tests {
             m.extend_from_slice(&[0; 4]);
             m.extend_from_slice(prefix.as_bytes());
         }
-        // A name server.
-        m.extend_from_slice(&[25, 3, 0, 0]);
-        m.extend_from_slice(&3600u32.to_be_bytes());
-        m.extend_from_slice(Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 3).as_bytes());
+        m.extend_from_slice(&names_option(&[NAMED], 3600));
         m
     }
 
@@ -1113,6 +1193,87 @@ pub(in crate::socks) mod tests {
         frames(&mut stack, &window, 101_000 + 7_200_000);
         assert!(stack.six_news());
         assert_eq!(stack.sixes().addresses, [cidr(OURS_LINK)]);
+    }
+
+    #[test]
+    fn the_name_servers_a_router_names_are_kept_for_as_long_as_it_says() {
+        let six = |last: u16| Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, last);
+        let near = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 5);
+        // What an advertisement says of them: every address of every
+        // such option, with the option's time; not a piece of one, a
+        // group, this machine or nobody.
+        let mut message = advert_message(1800, &[]);
+        let group = Ipv6Address::LINK_LOCAL_ALL_NODES;
+        let nobody = Ipv6Address::UNSPECIFIED;
+        let some = [six(4), group, Ipv6Address::LOOPBACK, nobody, near];
+        message.extend_from_slice(&names_option(&some, 600));
+        let mut piece = names_option(&[six(6), six(7)], 0);
+        piece.truncate(32);
+        piece[1] = 4;
+        message.extend_from_slice(&piece);
+        let frame = six_frame(ROUTER, ALL_NODES, ON_LINK, &message);
+        let said = advert(&frame[14..]).unwrap();
+        assert_eq!(
+            said.servers,
+            [(NAMED, 3600), (six(4), 600), (near, 600), (six(6), 0)]
+        );
+
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        assert_eq!(stack.names6(), []);
+        assert!(!stack.names6_news());
+        // The first heard first, three at most; and the same again is
+        // not news.
+        let says = |stack: &mut Stack<crate::port::Port>, options: &[Vec<u8>], ms: i64| {
+            let mut message = advert_message(1800, &[]);
+            for option in options {
+                message.extend_from_slice(option);
+            }
+            let frame = six_frame(ROUTER, ALL_NODES, ON_LINK, &message);
+            window.deliver(stack.device(), 0, &frame);
+            frames(stack, &window, ms);
+        };
+        says(&mut stack, &[], 1000);
+        assert_eq!(stack.names6(), [NAMED]);
+        assert!(stack.names6_news());
+        assert!(!stack.names6_news());
+        let more = [
+            names_option(&[six(4), near], 600),
+            names_option(&[six(6)], 600),
+        ];
+        says(&mut stack, &more, 2000);
+        assert_eq!(stack.names6(), [NAMED, six(4), near]);
+        assert!(stack.names6_news());
+        says(&mut stack, &more, 3000);
+        assert!(!stack.names6_news());
+
+        // One it says is none any more goes at once, and leaves room.
+        let fewer = [names_option(&[six(4)], 0), names_option(&[six(6)], FOREVER)];
+        says(&mut stack, &fewer, 4000);
+        assert_eq!(stack.names6(), [NAMED, near, six(6)]);
+        assert!(stack.names6_news());
+        // One that was never one is not news for being none.
+        says(&mut stack, &[names_option(&[six(8)], 0)], 5000);
+        assert!(!stack.names6_news());
+
+        // Each ends when its time does, counted from when it was last
+        // said, and that is what the stack wakes for: the one of the
+        // link first, ten minutes after 3 s.
+        let at = |ms: i64| Instant::from_millis(ms);
+        assert_eq!(stack.idle_for(at(5000)), Some(Duration::from_secs(598)));
+        frames(&mut stack, &window, 602_999);
+        assert!(!stack.names6_news());
+        frames(&mut stack, &window, 603_000);
+        assert_eq!(stack.names6(), [NAMED, six(6)]);
+        assert!(stack.names6_news());
+        // The one of every advertisement, an hour after the last; the
+        // one named for ever stays.
+        frames(&mut stack, &window, 3_605_000);
+        assert_eq!(stack.names6(), [six(6)]);
+        assert!(stack.names6_news());
+        frames(&mut stack, &window, 1_000_000_000);
+        assert_eq!(stack.names6(), [six(6)]);
+        assert!(!stack.names6_news());
     }
 
     #[test]
