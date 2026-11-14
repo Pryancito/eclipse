@@ -1300,6 +1300,105 @@ fn a_datagram_travels_as_many_hops_as_its_socket_was_told() {
     assert!(Socket::so_broadcast(&s));
 }
 
+#[test]
+fn a_datagram_travels_as_ipv6_as_many_hops_as_its_socket_was_told() {
+    let _g = LOCK.lock();
+    let stack = stack();
+    let six = |addr: &str| match at6(addr, 0).addr {
+        IpAddress::Ipv6(addr) => addr,
+        _ => unreachable!(),
+    };
+    stack.say(six_message(None, &[Ipv6Cidr::new(six("fec0::7"), 64)]));
+    let s = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+    const IPPROTO_IPV6: usize = 41;
+    const IPV6_UNICAST_HOPS: usize = 16;
+    const IPV6_MULTICAST_HOPS: usize = 18;
+    const IPV6_V6ONLY: usize = 26;
+    let (far, group) = (six("2001:db8::5").0, six("ff02::fb").0);
+    stack.say(six_message(
+        Some(six("fe80::99")),
+        &[Ipv6Cidr::new(six("fec0::7"), 64)],
+    ));
+    let sent = |whom: [u8; 16], data: &[u8]| {
+        let there = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(whom)), 33434);
+        assert_eq!(
+            Socket::write(&s, data, Some(Endpoint::Ip(there))),
+            Ok(data.len())
+        );
+        loop {
+            let m = stack.told().unwrap();
+            if parse_header(&m).map(|h| h.0) == Some(OP_SEND6) {
+                break m;
+            }
+        }
+    };
+    let said =
+        |whom: [u8; 16], hops: u8, data: &[u8]| send6_message(s.sock, whom, 33434, hops, data);
+    let set =
+        |opt: usize, hops: i32| Socket::setsockopt(&s, IPPROTO_IPV6, opt, &hops.to_ne_bytes());
+    let get = |opt: usize| {
+        let said = Socket::getsockopt_own(&s, IPPROTO_IPV6, opt)?;
+        Some(i32::from_ne_bytes(said.try_into().unwrap()))
+    };
+    // Before anybody says: the stack's own, and 1 to a group; asked,
+    // the socket says what that is.
+    assert_eq!(sent(far, b"a"), said(far, 0, b"a"));
+    assert_eq!(sent(group, b"b"), said(group, 1, b"b"));
+    assert_eq!(get(IPV6_UNICAST_HOPS), Some(64));
+    assert_eq!(get(IPV6_MULTICAST_HOPS), Some(1));
+
+    // What `traceroute -6` does: one hop, then two.
+    assert_eq!(set(IPV6_UNICAST_HOPS, 1), Ok(0));
+    assert_eq!(sent(far, b"c"), said(far, 1, b"c"));
+    assert_eq!(get(IPV6_UNICAST_HOPS), Some(1));
+    assert_eq!(set(IPV6_UNICAST_HOPS, 2), Ok(0));
+    assert_eq!(sent(far, b"d"), said(far, 2, b"d"));
+    // A group's datagrams have their own, and the others keep theirs.
+    assert_eq!(sent(group, b"e"), said(group, 1, b"e"));
+    assert_eq!(set(IPV6_MULTICAST_HOPS, 5), Ok(0));
+    assert_eq!(sent(group, b"f"), said(group, 5, b"f"));
+    assert_eq!(sent(far, b"g"), said(far, 2, b"g"));
+    assert_eq!(get(IPV6_MULTICAST_HOPS), Some(5));
+    // 255 is the most, and -1 is as when nothing was said.
+    assert_eq!(set(IPV6_UNICAST_HOPS, 255), Ok(0));
+    assert_eq!(sent(far, b"h"), said(far, 255, b"h"));
+    assert_eq!(set(IPV6_UNICAST_HOPS, -1), Ok(0));
+    assert_eq!(set(IPV6_MULTICAST_HOPS, -1), Ok(0));
+    assert_eq!(sent(far, b"i"), said(far, 0, b"i"));
+    assert_eq!(sent(group, b"j"), said(group, 1, b"j"));
+    assert_eq!(get(IPV6_UNICAST_HOPS), Some(64));
+    // What is no number of hops, or not an `int`.
+    for opt in [IPV6_UNICAST_HOPS, IPV6_MULTICAST_HOPS] {
+        assert_eq!(set(opt, 256), Err(LxError::EINVAL));
+        assert_eq!(set(opt, -2), Err(LxError::EINVAL));
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IPV6, opt, &[1, 0]),
+            Err(LxError::EINVAL)
+        );
+    }
+    assert_eq!(sent(far, b"k"), said(far, 0, b"k"));
+
+    // The socket takes both families, and says so; what it does not
+    // keep it does not answer for.
+    assert_eq!(get(IPV6_V6ONLY), Some(0));
+    assert_eq!(get(51), None, "IPV6_RECVHOPLIMIT");
+    assert_eq!(get(8), None, "IPV6_2292HOPLIMIT");
+    assert_eq!(get(1000), None);
+    assert_eq!(Socket::getsockopt_own(&s, 58, 1), None);
+
+    // IPv6's are no options of an `AF_INET` socket.
+    let four = stack_socket(&stack.link);
+    let hops = 3i32.to_ne_bytes();
+    assert_eq!(
+        Socket::setsockopt(&four, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops),
+        Err(LxError::ENOPROTOOPT)
+    );
+    assert_eq!(
+        Socket::getsockopt_own(&four, IPPROTO_IPV6, IPV6_UNICAST_HOPS),
+        None
+    );
+}
+
 /// A socket of `link` that does not wait.
 #[test]
 fn the_datagram_sockets_that_have_a_port_are_listed() {

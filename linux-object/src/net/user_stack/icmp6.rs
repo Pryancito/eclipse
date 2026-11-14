@@ -26,9 +26,8 @@
 //! Not here: a socket bound to one address sending from it or hearing
 //! only what is for it, the socket that pings being told of the errors
 //! that come back for its echoes (in Linux one that asked with
-//! `IPV6_RECVERR` is), and asking what the options are (`getsockopt`).
-//! A raw socket also hears what the card brings for a group the machine
-//! is no member of.
+//! `IPV6_RECVERR` is). A raw socket also hears what the card brings for
+//! a group the machine is no member of.
 
 use super::icmp::{checksum, ServedIcmpSocket};
 use super::*;
@@ -53,13 +52,14 @@ const GROUP_HOPS: u8 = 1;
 
 /// The levels and options of `setsockopt` that are these sockets'.
 const IPPROTO_IP: usize = 0;
-const IPPROTO_IPV6: usize = 41;
+pub(super) const IPPROTO_IPV6: usize = 41;
 const IPPROTO_ICMPV6: usize = 58;
 const SOL_RAW: usize = 255;
 const IPV6_CHECKSUM: usize = 7;
 const IPV6_2292HOPLIMIT: usize = 8;
 const IPV6_UNICAST_HOPS: usize = 16;
 const IPV6_MULTICAST_HOPS: usize = 18;
+const IPV6_V6ONLY: usize = 26;
 const IPV6_RECVHOPLIMIT: usize = 51;
 const IPV6_HOPLIMIT: usize = 52;
 const ICMP6_FILTER: usize = 1;
@@ -176,7 +176,14 @@ fn hops(data: &[u8]) -> LxResult<Option<u8>> {
     }
 }
 
-/// The options of a socket of ICMPv6 that are not IPv4's.
+/// Whether `opt` is one of the two that ask `recvmsg` to say how many
+/// hops what it read had left.
+pub(super) fn tells_hops(opt: usize) -> bool {
+    matches!(opt, IPV6_RECVHOPLIMIT | IPV6_2292HOPLIMIT)
+}
+
+/// The options of a socket that are IPv6's and not IPv4's: all of them
+/// for a socket of ICMPv6, the hops for one of datagrams.
 #[derive(Default)]
 pub(super) struct Opts {
     /// `IPV6_UNICAST_HOPS` and `IPV6_MULTICAST_HOPS`, when said.
@@ -186,6 +193,54 @@ pub(super) struct Opts {
     /// many hops what it read had left.
     tell_hops: bool,
     tell_hops_2292: bool,
+}
+
+impl Opts {
+    /// `setsockopt` of how many hops what the socket sends may travel
+    /// (`IPV6_UNICAST_HOPS`, `IPV6_MULTICAST_HOPS`): `None` for any
+    /// other option.
+    pub(super) fn set_hops(&mut self, opt: usize, data: &[u8]) -> Option<LxResult<()>> {
+        let kept = match opt {
+            IPV6_UNICAST_HOPS => &mut self.hops,
+            IPV6_MULTICAST_HOPS => &mut self.group_hops,
+            _ => return None,
+        };
+        Some(hops(data).map(|hops| *kept = hops))
+    }
+
+    /// How many hops what goes to `to` may travel, when the socket was
+    /// told: `None` when it was not, which is 64, and 1 to a group
+    /// ([`hops_to`](Self::hops_to)). Never 0: the stack sends nothing
+    /// that is to go nowhere.
+    pub(super) fn hops_said(&self, to: &Ipv6Address) -> Option<u8> {
+        let said = if to.is_multicast() {
+            self.group_hops
+        } else {
+            self.hops
+        };
+        said.map(|hops| hops.max(1))
+    }
+
+    /// How many hops what goes to `to` may travel.
+    fn hops_to(&self, to: &Ipv6Address) -> u8 {
+        let unsaid = if to.is_multicast() { GROUP_HOPS } else { HOPS };
+        self.hops_said(to).unwrap_or(unsaid)
+    }
+
+    /// What `getsockopt` says an option of IPv6's level is, for the ones
+    /// kept here (`do_ipv6_getsockopt`: hops that were not said are the
+    /// ones a packet gets). `IPV6_V6ONLY` is no: a socket served by the
+    /// stack takes both families, or is of ICMPv6 and has one.
+    pub(super) fn get(&self, opt: usize) -> Option<i32> {
+        match opt {
+            IPV6_UNICAST_HOPS => Some(i32::from(self.hops.unwrap_or(HOPS))),
+            IPV6_MULTICAST_HOPS => Some(i32::from(self.group_hops.unwrap_or(GROUP_HOPS))),
+            IPV6_RECVHOPLIMIT => Some(i32::from(self.tell_hops)),
+            IPV6_2292HOPLIMIT => Some(i32::from(self.tell_hops_2292)),
+            IPV6_V6ONLY => Some(0),
+            _ => None,
+        }
+    }
 }
 
 impl StackLink {
@@ -265,15 +320,8 @@ impl ServedIcmpSocket {
         if message.len() + IPV6_MORE > longest {
             return Err(LxError::EMSGSIZE);
         }
-        let hop_limit = {
-            let six = self.six.lock();
-            if to.is_multicast() {
-                six.group_hops.unwrap_or(GROUP_HOPS)
-            } else {
-                six.hops.unwrap_or(HOPS)
-            }
-        };
-        let said = icmp6_message(self.sock, to.0, hop_limit.max(1), &message);
+        let hop_limit = self.six.lock().hops_to(&to);
+        let said = icmp6_message(self.sock, to.0, hop_limit, &message);
         self.link.tell(said, false)?;
         Ok(data.len())
     }
@@ -323,12 +371,9 @@ impl ServedIcmpSocket {
         match (level, opt) {
             // IPv4's are no options of a socket of this family.
             (IPPROTO_IP, _) => Some(Err(LxError::ENOPROTOOPT)),
-            (IPPROTO_IPV6, IPV6_UNICAST_HOPS) => done(hops(data).map(|hops| {
-                self.six.lock().hops = hops;
-            })),
-            (IPPROTO_IPV6, IPV6_MULTICAST_HOPS) => done(hops(data).map(|hops| {
-                self.six.lock().group_hops = hops;
-            })),
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS | IPV6_MULTICAST_HOPS) => {
+                done(self.six.lock().set_hops(opt, data)?)
+            }
             (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) => done(int(data).map(|on| {
                 self.six.lock().tell_hops = on != 0;
             })),
@@ -356,6 +401,21 @@ impl ServedIcmpSocket {
                 Some(Ok(0))
             }
             (IPPROTO_ICMPV6, _) => Some(Err(LxError::ENOPROTOOPT)),
+            _ => None,
+        }
+    }
+
+    /// `getsockopt`, on a socket of ICMPv6, of the options that are
+    /// these sockets': IPv6's, and the raw one's filter.
+    pub(super) fn getsockopt6(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
+        match (level, opt) {
+            (IPPROTO_IPV6, _) => {
+                let said = self.six.lock().get(opt)?;
+                Some(said.to_ne_bytes().to_vec())
+            }
+            (IPPROTO_ICMPV6, ICMP6_FILTER) if self.is_raw() => {
+                Some(self.shared.inner.lock().blocked.to_vec())
+            }
             _ => None,
         }
     }
@@ -544,6 +604,57 @@ mod tests {
         );
         assert_eq!(echo_reply_ident(&icmp(ECHO_REQUEST, 0x4242, b"")), None);
         assert_eq!(echo_reply_ident(&[ECHO_REPLY, 0, 0, 0, 0x42]), None);
+    }
+
+    #[test]
+    fn a_socket_says_what_its_options_are() {
+        let _g = LOCK.lock();
+        let stack = stack6();
+        let raw = socket(&stack.link, true);
+        let pings = socket(&stack.link, false);
+        let get = |s: &ServedIcmpSocket, opt: usize| {
+            let said = Socket::getsockopt_own(s, 41, opt)?;
+            Some(i32::from_ne_bytes(said.try_into().unwrap()))
+        };
+        let set = |s: &ServedIcmpSocket, opt: usize, value: i32| {
+            Socket::setsockopt(s, 41, opt, &value.to_ne_bytes())
+        };
+        for s in [&raw, &pings] {
+            // As they are before anybody says: 64 hops, 1 to a group,
+            // nothing said of what arrives, and not IPv6 only.
+            let before = [(16, 64), (18, 1), (51, 0), (8, 0), (26, 0)];
+            for (opt, value) in before {
+                assert_eq!(get(s, opt), Some(value), "option {}", opt);
+            }
+            // And as they were set.
+            for (opt, value) in [(16, 7), (18, 3), (51, 1), (8, 5)] {
+                assert_eq!(set(s, opt, value), Ok(0));
+            }
+            let after = [(16, 7), (18, 3), (51, 1), (8, 1), (26, 0)];
+            for (opt, value) in after {
+                assert_eq!(get(s, opt), Some(value), "option {}", opt);
+            }
+            // -1 hops is as many as before.
+            assert_eq!(set(s, 16, -1), Ok(0));
+            assert_eq!(get(s, 16), Some(64));
+            // Not one of these.
+            assert_eq!(get(s, 7), None, "IPV6_CHECKSUM");
+            assert_eq!(get(s, 1000), None);
+            assert_eq!(Socket::getsockopt_own(s, 0, 2), None, "IP_TTL");
+            assert_eq!(Socket::getsockopt_own(s, 58, 2), None);
+        }
+        // The filter is the raw socket's: all let by, then as it was set.
+        assert_eq!(Socket::getsockopt_own(&raw, 58, 1), Some(vec![0; 32]));
+        let mut filter = [0xffu8; 32];
+        filter[16] = !0b10;
+        assert_eq!(Socket::setsockopt(&raw, 58, 1, &filter), Ok(0));
+        assert_eq!(Socket::getsockopt_own(&raw, 58, 1), Some(filter.to_vec()));
+        assert_eq!(Socket::getsockopt_own(&pings, 58, 1), None);
+
+        // A socket of IPv4's ICMP has none of them.
+        let four = ServedIcmpSocket::new(stack.link.clone(), true).unwrap();
+        assert_eq!(Socket::getsockopt_own(&four, 41, 16), None);
+        assert_eq!(Socket::getsockopt_own(&four, 58, 1), None);
     }
 
     #[test]

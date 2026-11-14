@@ -212,6 +212,11 @@ fn mmsg_batch(vlen: usize) -> usize {
     vlen.min(MMSG_MAX)
 }
 
+/// The levels of the options only sockets of IPv6 and of ICMPv6 have,
+/// which `getsockopt` leaves to the socket ([`Socket::getsockopt_own`]).
+const SOL_IPV6: usize = 41;
+const SOL_ICMPV6: usize = 58;
+
 /// What to do with the `msg_control` of a `sendmsg`: read `SCM_RIGHTS` out of
 /// it, ignore it, or refuse the call.
 ///
@@ -716,7 +721,17 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                // Unknown levels (SOL_PACKET, SOL_IPV6, …) are
+                // A level only sockets of some family have (IPv6's,
+                // ICMPv6's): the socket says what its option is, when it
+                // has it.
+                if matches!(level, SOL_IPV6 | SOL_ICMPV6) && !optval.is_null() {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let said = file_like.as_socket()?.getsockopt_own(level, optname);
+                    if let Some(value) = said {
+                        return write_sockopt_out(out, optval, optlen, &value);
+                    }
+                }
+                // Unknown levels (SOL_PACKET, …) are
                 // `ENOPROTOOPT`, same as an unknown optname under a known
                 // level. Returning a zeroed int used to tell probes they
                 // got a real option value of 0.

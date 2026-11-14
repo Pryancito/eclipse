@@ -232,7 +232,14 @@
 //! The port is one for both: an `AF_INET` socket that has it is not
 //! given what arrives as IPv6. Where the card has no way to
 //! ([`Sixes::reaches`]) is `ENETUNREACH`, and an address of the card's
-//! own is this machine, like `::1`.
+//! own is this machine, like `::1`. How many hops such a datagram may
+//! travel is the socket's `IPV6_UNICAST_HOPS` (`IPV6_MULTICAST_HOPS` to
+//! a group), as `IP_TTL` is for what travels as IPv4: `traceroute -6`
+//! sends one that may travel one, then two.
+//!
+//! What a socket of that family is asked about its options of IPv6's
+//! level it answers itself ([`Socket::getsockopt_own`]): the hops, and
+//! that it is not for IPv6 only.
 //!
 //! So does a stream socket of that family. It connects to any other
 //! IPv6 address with `CONNECT6`, and is told with `CONNECTED` which of
@@ -1895,6 +1902,9 @@ pub struct ServedUdpSocket {
     /// What `setsockopt` was told, for `getsockopt` to say again; the
     /// hop limits go with each datagram.
     opts: Mutex<StoredInetOpts>,
+    /// The same, of the options that are IPv6's: how many hops what
+    /// travels as IPv6 may (`IPV6_UNICAST_HOPS`, `IPV6_MULTICAST_HOPS`).
+    six: Mutex<icmp6::Opts>,
 }
 
 impl ServedUdpSocket {
@@ -1915,6 +1925,7 @@ impl ServedUdpSocket {
             v6,
             shared,
             opts: Mutex::new(StoredInetOpts::default()),
+            six: Mutex::new(icmp6::Opts::default()),
         })
     }
 
@@ -1970,9 +1981,12 @@ impl ServedUdpSocket {
             return Err(LxError::EMSGSIZE);
         }
         self.autobind()?;
-        // A group's is not to leave the link unless it is said to; the
-        // rest travel as far as the stack lets a datagram.
-        let hop_limit = u8::from(addr.is_multicast());
+        // As many hops as the socket was told (`IPV6_UNICAST_HOPS`,
+        // `IPV6_MULTICAST_HOPS`). When it was not, a group's is not to
+        // leave the link, and the rest travel as far as the stack lets a
+        // datagram.
+        let said = self.six.lock().hops_said(&addr);
+        let hop_limit = said.unwrap_or(u8::from(addr.is_multicast()));
         let said = send6_message(self.sock, addr.0, port, hop_limit, data);
         self.link.tell(said, false)?;
         Ok(data.len())
@@ -2256,10 +2270,34 @@ impl Socket for ServedUdpSocket {
         if let Some(done) = self.membership(level, opt, data) {
             return done;
         }
+        if level == icmp6::IPPROTO_IPV6 {
+            // IPv6's are no options of an `AF_INET` socket
+            // (`ip_setsockopt`).
+            if !self.v6 {
+                return Err(LxError::ENOPROTOOPT);
+            }
+            if let Some(kept) = self.six.lock().set_hops(opt, data) {
+                return kept.map(|()| 0);
+            }
+        }
         if let Some(kept) = self.opts.lock().try_setsockopt(level, opt, data) {
             return kept;
         }
         setsockopt_unstored(self, level, opt, data)
+    }
+
+    fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
+        if !self.v6 || level != icmp6::IPPROTO_IPV6 {
+            return None;
+        }
+        // Whether what arrives says its hops is not kept here: nothing
+        // says it of a datagram.
+        let said = self
+            .six
+            .lock()
+            .get(opt)
+            .filter(|_| !icmp6::tells_hops(opt))?;
+        Some(said.to_ne_bytes().to_vec())
     }
 
     fn so_reuseaddr(&self) -> bool {

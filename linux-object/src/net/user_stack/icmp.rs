@@ -422,6 +422,14 @@ impl Socket for ServedIcmpSocket {
         core::mem::take(&mut self.shared.inner.lock().last_msg_flags)
     }
 
+    fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
+        if self.is_six() {
+            self.getsockopt6(level, opt)
+        } else {
+            None
+        }
+    }
+
     fn recv_cmsgs(&self) -> Vec<(i32, i32, i32)> {
         if self.is_six() {
             self.recv_cmsgs6()

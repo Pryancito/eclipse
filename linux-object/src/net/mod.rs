@@ -2597,6 +2597,13 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn recv_cmsgs(&self) -> alloc::vec::Vec<(i32, i32, i32)> {
         alloc::vec::Vec::new()
     }
+    /// What the socket says an option is, of a level that only sockets
+    /// of some family have and `getsockopt` keeps no table for (IPv6's,
+    /// ICMPv6's): its bytes, or `None` when the socket has no such
+    /// option (`ENOPROTOOPT`).
+    fn getsockopt_own(&self, _level: usize, _opt: usize) -> Option<alloc::vec::Vec<u8>> {
+        None
+    }
 }
 
 /// Stored `SOL_SOCKET` / `IPPROTO_IP` knobs for inet sockets that used to
