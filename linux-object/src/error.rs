@@ -112,6 +112,10 @@ pub enum LxError {
     /// Mesa checks for explicitly (`errno == ETIME` -> `VK_TIMEOUT`); any other
     /// errno there is treated as a lost device.
     ETIME = 62,
+    /// Protocol error -- what a socket is told when ICMPv6 says that what
+    /// it sent has a field no host on the way understood (a parameter
+    /// problem, `icmpv6_err_convert`).
+    EPROTO = 71,
     /// File descriptor in bad state -- the fd is valid, the object behind it
     /// is not in a state that allows the operation. ALSA returns it from
     /// `writei`/`readi` on a stream that is neither prepared nor running.
@@ -228,6 +232,7 @@ impl fmt::Display for LxError {
             EIDRM => "Identifier removed",
             ENODATA => "No data available",
             ETIME => "Timer expired",
+            EPROTO => "Protocol error",
             EBADFD => "File descriptor in bad state",
             ELIBBAD => "Accessing a corrupted shared library",
             ENOTSOCK => "Socket operation on non-socket",
@@ -395,7 +400,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 73] = [
+    const EVERY_ERRNO: [(LxError, isize); 74] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -444,6 +449,7 @@ mod errno_tests {
         (LxError::EREMOTE, 66),
         (LxError::ETIME, 62),
         (LxError::EOVERFLOW, 75),
+        (LxError::EPROTO, 71),
         (LxError::EBADFD, 77),
         (LxError::ELIBBAD, 80),
         (LxError::ENOTSOCK, 88),
@@ -535,6 +541,7 @@ mod errno_tests {
                 | LxError::EREMOTE
                 | LxError::ETIME
                 | LxError::EOVERFLOW
+                | LxError::EPROTO
                 | LxError::EBADFD
                 | LxError::ELIBBAD
                 | LxError::ENOTSOCK
@@ -565,7 +572,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            73,
+            74,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }

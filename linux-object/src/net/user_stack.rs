@@ -55,9 +55,11 @@
 //! EVENTS   (stack to kernel)  16  one record after another, to the end:
 //!              0  u64 socket  8  u16 what  10  u16 length  12  u32 number  16  `length` bytes
 //!     CONNECTED  number: the bytes the stack takes
-//!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
+//!     FAILED     number: why (refused, timed out, reset, unreachable, no room,
+//!                unreachable as IPv6)
 //!                bytes: none, or u8 type, u8 code of the ICMP message that
-//!                said the peer is unreachable
+//!                said the peer is unreachable (of the ICMPv6 message, for
+//!                the last)
 //!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
 //!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
 //!     BYTES      bytes: what arrived
@@ -65,6 +67,8 @@
 //!     CREDIT     number: more bytes the stack takes
 //!     UNDELIVERED  socket: a datagram socket's.
 //!                bytes: [u8; 4] to, u16 port, u8 type, u8 code
+//!     UNDELIVERED6 socket: a datagram socket's.
+//!                bytes: [u8; 16] to, u16 port, u8 type, u8 code (ICMPv6's)
 //! ```
 //!
 //! Bytes are counted both ways, so neither side holds more than it said
@@ -122,6 +126,14 @@
 //!
 //! A datagram for a port of this machine that no socket has is refused
 //! the same way, by the kernel itself.
+//!
+//! What travelled as IPv6 has ICMPv6 say it, with its own types and
+//! codes, and the stack passes those on as they are: `UNDELIVERED6` for
+//! a datagram and `FAILED` with "unreachable as IPv6" for a connect. The
+//! errors are Linux's for them ([`icmp6::undelivered_error`]): nobody
+//! answers at the address is `EHOSTUNREACH`, which is also what the
+//! stack says to itself of a neighbour that does not answer; nobody at
+//! the port, `ECONNREFUSED`; forbidden on the way, `EACCES`.
 //!
 //! # Groups
 //!
@@ -316,6 +328,7 @@ pub const EV_EOF: u16 = 5;
 pub const EV_CREDIT: u16 = 6;
 pub const EV_UNDELIVERED: u16 = 7;
 pub const EV_ACCEPTED6: u16 = 8;
+pub const EV_UNDELIVERED6: u16 = 9;
 
 /// Why a connection `FAILED`.
 pub const WHY_REFUSED: u32 = 1;
@@ -323,6 +336,7 @@ pub const WHY_TIMED_OUT: u32 = 2;
 pub const WHY_RESET: u32 = 3;
 pub const WHY_UNREACHABLE: u32 = 4;
 pub const WHY_NO_ROOM: u32 = 5;
+pub const WHY_UNREACHABLE6: u32 = 6;
 
 /// Set in the number of a socket the stack numbered: a connection that
 /// arrived on a listener.
@@ -350,6 +364,8 @@ pub const RECORD_LEN: usize = 16;
 pub const COUNTS: usize = 8;
 /// The bytes of an `UNDELIVERED` record.
 pub const UNDELIVERED_LEN: usize = 8;
+/// The bytes of an `UNDELIVERED6` record.
+pub const UNDELIVERED6_LEN: usize = 20;
 /// The longest datagram UDP carries over IPv4.
 pub const MAX_DATAGRAM: usize = 65507;
 // A datagram and its header fit one channel message (65536 bytes).
@@ -718,6 +734,31 @@ pub fn parse_undelivered(bytes: &[u8]) -> Option<(IpEndpoint, u8, u8)> {
         IpEndpoint::new(IpAddress::Ipv4(addr), port),
         bytes[6],
         bytes[7],
+    ))
+}
+
+/// The bytes of an `UNDELIVERED6`: the datagram that went to `addr:port`
+/// as IPv6 was the subject of an ICMPv6 message of this type and code.
+pub fn undelivered6_bytes(addr: [u8; 16], port: u16, kind: u8, code: u8) -> [u8; UNDELIVERED6_LEN] {
+    let mut bytes = [0u8; UNDELIVERED6_LEN];
+    bytes[..16].copy_from_slice(&addr);
+    bytes[16..18].copy_from_slice(&port.to_le_bytes());
+    bytes[18] = kind;
+    bytes[19] = code;
+    bytes
+}
+
+/// Where the datagram of an `UNDELIVERED6` went, and the type and code
+/// of the message about it.
+pub fn parse_undelivered6(bytes: &[u8]) -> Option<(IpEndpoint, u8, u8)> {
+    let bytes: &[u8; UNDELIVERED6_LEN] = bytes.try_into().ok()?;
+    let mut addr = [0u8; 16];
+    addr.copy_from_slice(&bytes[..16]);
+    let port = u16::from_le_bytes([bytes[16], bytes[17]]);
+    Some((
+        IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr)), port),
+        bytes[18],
+        bytes[19],
     ))
 }
 
@@ -1558,27 +1599,34 @@ impl StackLink {
                 return;
             };
             records = rest;
-            if what == EV_UNDELIVERED {
-                self.undelivered(sock, bytes);
-            } else {
-                self.event(sock, what, number, bytes);
+            match what {
+                EV_UNDELIVERED | EV_UNDELIVERED6 => self.undelivered(sock, what, bytes),
+                _ => self.event(sock, what, number, bytes),
             }
         }
     }
 
-    /// `UNDELIVERED`: an ICMP message said that a datagram of socket
-    /// `sock` was not delivered. Its program is told of an error that
+    /// `UNDELIVERED`, or `UNDELIVERED6` as `what` says: an ICMP message,
+    /// or one of ICMPv6, said that a datagram of socket `sock` was not
+    /// delivered. Its program is told of an error that
     /// does not mend by itself, if the socket is one that hears of them
     /// ([`Shared::undelivered`]); the rest (a router that has no way just
     /// now, a datagram that ran out of hops) is the news of whoever asked
     /// for ICMP, and a datagram socket's program sends again or gives up
     /// by itself.
-    fn undelivered(&self, sock: u64, bytes: &[u8]) {
-        let Some((to, kind, code)) = parse_undelivered(bytes) else {
+    fn undelivered(&self, sock: u64, what: u16, bytes: &[u8]) {
+        let said = if what == EV_UNDELIVERED6 {
+            parse_undelivered6(bytes)
+                .map(|(to, kind, code)| (to, icmp6::undelivered_error(kind, code)))
+        } else {
+            parse_undelivered(bytes)
+                .map(|(to, kind, code)| (to, icmp::undelivered_error(kind, code)))
+        };
+        let Some((to, error)) = said else {
             warn!("user stack: an UNDELIVERED of {} bytes", bytes.len());
             return;
         };
-        let Some((error, true)) = icmp::undelivered_error(kind, code) else {
+        let Some((error, true)) = error else {
             return;
         };
         let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
@@ -2431,6 +2479,15 @@ mod tests {
             self.say(m);
         }
 
+        /// The same, of what went as IPv6 and what ICMPv6 said.
+        fn undelivered6(&self, sock: u64, to: &str, port: u16, kind: u8, code: u8) {
+            let to: core::net::Ipv6Addr = to.parse().unwrap();
+            let mut m = events_message();
+            let bytes = undelivered6_bytes(to.octets(), port, kind, code);
+            push_event(&mut m, sock, EV_UNDELIVERED6, 0, &bytes);
+            self.say(m);
+        }
+
         pub(super) fn say(&self, data: Vec<u8>) {
             let msg = MessagePacket {
                 data,
@@ -2507,6 +2564,21 @@ mod tests {
             Some((at([10, 0, 9, 1], 0x1234), 3, 3))
         );
         assert_eq!(parse_undelivered(&bytes[..7]), None);
+
+        // An `UNDELIVERED6`: the same, with the longer address.
+        assert_eq!(EV_UNDELIVERED6, 9);
+        assert_eq!(WHY_UNREACHABLE6, 6);
+        let there = at6("fec0::99", 0x1234);
+        let IpAddress::Ipv6(addr) = there.addr else {
+            unreachable!()
+        };
+        let bytes = undelivered6_bytes(addr.0, 0x1234, 1, 4);
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes[..16], addr.0);
+        assert_eq!(bytes[16..], [0x34, 0x12, 1, 4]);
+        assert_eq!(parse_undelivered6(&bytes), Some((there, 1, 4)));
+        assert_eq!(parse_undelivered6(&bytes[..19]), None);
+        assert_eq!(parse_undelivered6(&bytes[..8]), None);
 
         let send = send_message(u64::MAX, [10, 0, 9, 1], 53, 64, b"hola");
         assert_eq!(parse_header(&send), Some((OP_SEND, u64::MAX)));
@@ -3158,6 +3230,8 @@ mod tests {
             e if e == LxError::ECONNREFUSED as isize as i32 => Err(LxError::ECONNREFUSED),
             e if e == LxError::ENOPROTOOPT as isize as i32 => Err(LxError::ENOPROTOOPT),
             e if e == LxError::EMSGSIZE as isize as i32 => Err(LxError::EMSGSIZE),
+            e if e == LxError::EACCES as isize as i32 => Err(LxError::EACCES),
+            e if e == LxError::EPROTO as isize as i32 => Err(LxError::EPROTO),
             e => panic!("an error nobody expected: {}", e),
         }
     }
@@ -3259,6 +3333,80 @@ mod tests {
         push_event(&mut m, b.sock, EV_UNDELIVERED, 0, &[10, 0, 9, 1, 7, 0, 3]);
         stack.say(m);
         assert_eq!(so_error(&b), Ok(()));
+    }
+
+    #[test]
+    fn what_icmpv6_says_of_a_datagram_is_told_as_linux_tells_it() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let six = |addr: &str| match at6(addr, 0).addr {
+            IpAddress::Ipv6(addr) => addr,
+            _ => unreachable!(),
+        };
+        stack.say(six_message(None, &[Ipv6Cidr::new(six("fec0::7"), 64)]));
+        let socket = || {
+            let s = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        let a = socket();
+        let peer = Endpoint::Ip(at6("fec0::99", 7));
+        assert_eq!(async_std::task::block_on(Socket::connect(&a, peer)), Ok(0));
+        assert!(stack.told().is_some());
+
+        // Nobody at the port: told once, to who polls and reads.
+        stack.undelivered6(a.sock, "fec0::99", 7, 1, 4);
+        assert_eq!(Socket::poll(&a, PollEvents::IN), (false, true, true));
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::ECONNREFUSED));
+        assert_eq!(recv(&a, &mut buf).0, Err(LxError::EAGAIN));
+        // Or to the next write, which sends nothing.
+        stack.undelivered6(a.sock, "fec0::99", 7, 1, 4);
+        assert_eq!(Socket::write(&a, b"ping", None), Err(LxError::ECONNREFUSED));
+        assert_eq!(stack.told(), None);
+        assert_eq!(Socket::write(&a, b"ping", None), Ok(4));
+        assert!(stack.told().is_some());
+
+        // The others that do not mend: forbidden on the way, too big for
+        // it, a header nobody understood, a code that means nothing.
+        for (kind, code, error) in [
+            (1, 1, LxError::EACCES),
+            (1, 5, LxError::EACCES),
+            (1, 6, LxError::EACCES),
+            (1, 7, LxError::EPROTO),
+            (2, 0, LxError::EMSGSIZE),
+            (4, 0, LxError::EPROTO),
+            (4, 1, LxError::EPROTO),
+        ] {
+            stack.undelivered6(a.sock, "fec0::99", 7, kind, code);
+            assert_eq!(so_error(&a), Err(error), "type {} code {}", kind, code);
+            assert_eq!(so_error(&a), Ok(()));
+        }
+
+        // What may mend is not told: no way just now, nobody answering
+        // at the address (which the stack says of a neighbour that does
+        // not answer), out of hops; nor what is no error; nor IPv4's
+        // numbers for nobody at the port.
+        for (kind, code) in [(1, 0), (1, 2), (1, 3), (3, 0), (3, 1), (129, 0), (3, 3)] {
+            stack.undelivered6(a.sock, "fec0::99", 7, kind, code);
+            assert_eq!(so_error(&a), Ok(()), "type {} code {}", kind, code);
+        }
+        // Nor what went to another port or to another host.
+        stack.undelivered6(a.sock, "fec0::99", 8, 1, 4);
+        stack.undelivered6(a.sock, "fec0::98", 7, 1, 4);
+        assert_eq!(so_error(&a), Ok(()));
+
+        // A socket that is not connected is told nothing, and a record
+        // that is not one is nobody's.
+        let b = socket();
+        let there = Endpoint::Ip(at6("fec0::99", 7));
+        assert_eq!(Socket::write(&b, b"ping", Some(there)), Ok(4));
+        stack.undelivered6(b.sock, "fec0::99", 7, 1, 4);
+        assert_eq!(so_error(&b), Ok(()));
+        let mut m = events_message();
+        push_event(&mut m, a.sock, EV_UNDELIVERED6, 0, &[0; 19]);
+        stack.say(m);
+        assert_eq!(so_error(&a), Ok(()));
     }
 
     #[test]

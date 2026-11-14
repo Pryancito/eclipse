@@ -34,9 +34,24 @@
 //! time exceeded (11). A message that says a datagram was too long for
 //! the way (3, code 4) is passed on like the rest: this stack sends
 //! nothing longer than a frame and does not learn a shorter way from it.
+//!
+//! What travelled as IPv6 has ICMPv6 say the same of it, with other
+//! numbers ([`Undelivered6`]): the four types that are errors, 1 to 4,
+//! quote the packet from its IPv6 header on. The kernel hears of it the
+//! same way, with the longer address and ICMPv6's type and code:
+//!
+//! ```text
+//!     UNDELIVERED6  socket: a datagram socket's.
+//!                   bytes: [u8; 16] to, u16 port, u8 type, u8 code
+//!     FAILED        number: unreachable, as IPv6.  bytes: u8 type, u8 code
+//! ```
+//!
+//! and of a neighbour that does not answer the stack says to itself that
+//! the address is unreachable ([`nowhere6`]).
 
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{Icmpv4Packet, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr};
+use smoltcp::wire::{Icmpv6Packet, IpAddress, Ipv6Address, Ipv6Packet, Ipv6Repr};
 
 /// The record of an `EVENTS` that says a datagram was not delivered.
 pub const EV_UNDELIVERED: u16 = 7;
@@ -165,6 +180,119 @@ impl Undelivered {
     }
 }
 
+/// The record of an `EVENTS` that says a datagram that travelled as IPv6
+/// was not delivered, and its bytes.
+pub const EV_UNDELIVERED6: u16 = 9;
+pub const UNDELIVERED6_LEN: usize = 20;
+
+/// ICMPv6's errors: destination unreachable, packet too big, time
+/// exceeded, parameter problem. Every type from the first to the last is
+/// one.
+pub const UNREACHABLE6: u8 = 1;
+pub const TOO_BIG6: u8 = 2;
+pub const PARAMETER6: u8 = 4;
+/// The code of an unreachable that says nobody answers at the address.
+pub const ADDRESS6: u8 = 3;
+
+/// The IPv6 header a message quotes, and what it has to quote: that
+/// header and eight bytes more.
+const QUOTED6_HEADER: usize = 40;
+const QUOTED6: usize = QUOTED6_HEADER + 8;
+/// The packet this host says to itself: an IPv6 header, the eight bytes
+/// an unreachable starts with, and what it quotes.
+pub const NOWHERE6_LEN: usize = 40 + 8 + QUOTED6;
+
+/// [`nowhere`], of IPv6: the packet of ICMPv6 that says nobody answers at
+/// the address `quoted` was for, from the address it was sent from to
+/// that same address. `quoted` is the start of that packet, as
+/// [`smoltcp::iface::Interface::unreached6`] gives it.
+pub fn nowhere6(quoted: &[u8; QUOTED6]) -> [u8; NOWHERE6_LEN] {
+    let us = Ipv6Address::from_bytes(&quoted[8..24]);
+    let mut packet = [0u8; NOWHERE6_LEN];
+    let (header, message) = packet.split_at_mut(40);
+    Ipv6Repr {
+        src_addr: us,
+        dst_addr: us,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: message.len(),
+        hop_limit: 64,
+    }
+    .emit(&mut Ipv6Packet::new_unchecked(header));
+    message[0] = UNREACHABLE6;
+    message[1] = ADDRESS6;
+    message[8..].copy_from_slice(quoted);
+    let us = IpAddress::Ipv6(us);
+    Icmpv6Packet::new_unchecked(message).fill_checksum(&us, &us);
+    packet
+}
+
+/// What an ICMPv6 message says was not delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Undelivered6 {
+    /// The message's type and code.
+    pub kind: u8,
+    pub code: u8,
+    /// UDP or TCP.
+    pub protocol: IpProtocol,
+    /// Who sent it, and from which port.
+    pub from: Ipv6Address,
+    pub local: u16,
+    /// Where it was going.
+    pub to: Ipv6Address,
+    pub port: u16,
+}
+
+impl Undelivered6 {
+    /// What `packet`, an IPv6 packet of ICMPv6, says was not delivered:
+    /// `None` when it is no such message, when its sum does not hold or
+    /// when what it quotes is not the start of a UDP datagram or of a
+    /// TCP segment right behind an IPv6 header.
+    pub fn of(packet: &[u8]) -> Option<Undelivered6> {
+        let packet = Ipv6Packet::new_checked(packet).ok()?;
+        if packet.next_header() != IpProtocol::Icmpv6 {
+            return None;
+        }
+        let message = packet.payload();
+        // Behind the type, the code, the sum and four bytes more.
+        let quoted = message.get(8..)?;
+        let (kind, code) = (message[0], message[1]);
+        if !(UNREACHABLE6..=PARAMETER6).contains(&kind) {
+            return None;
+        }
+        let (from, to) = (packet.src_addr().into(), packet.dst_addr().into());
+        if !Icmpv6Packet::new_unchecked(message).verify_checksum(&from, &to) {
+            return None;
+        }
+        if quoted.len() < QUOTED6_HEADER || quoted[0] >> 4 != 6 {
+            return None;
+        }
+        let protocol = IpProtocol::from(quoted[6]);
+        if !matches!(protocol, IpProtocol::Udp | IpProtocol::Tcp) {
+            return None;
+        }
+        let ports = quoted.get(QUOTED6_HEADER..QUOTED6_HEADER + 4)?;
+        Some(Undelivered6 {
+            kind,
+            code,
+            protocol,
+            from: Ipv6Address::from_bytes(&quoted[8..24]),
+            local: u16::from_be_bytes([ports[0], ports[1]]),
+            to: Ipv6Address::from_bytes(&quoted[24..40]),
+            port: u16::from_be_bytes([ports[2], ports[3]]),
+        })
+    }
+
+    /// The bytes of the `UNDELIVERED6` that says it.
+    pub fn bytes(&self) -> [u8; UNDELIVERED6_LEN] {
+        let mut bytes = [0u8; UNDELIVERED6_LEN];
+        bytes[..16].copy_from_slice(&self.to.0);
+        bytes[16..18].copy_from_slice(&self.port.to_le_bytes());
+        bytes[18] = self.kind;
+        bytes[19] = self.code;
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +386,67 @@ mod tests {
         let with_options = icmp_frame(&undelivered_message(3, 3, &quoted));
         let said = Undelivered::of(&packet(&with_options)).unwrap();
         assert_eq!((said.local, said.port), (7000, 53));
+    }
+
+    #[test]
+    fn what_this_host_says_to_itself_as_ipv6_is_read_like_what_a_router_says() {
+        // The start of a datagram from fec0::7 port 5000 to fec0::77
+        // port 9, as smoltcp keeps it.
+        let (us, nobody) = (
+            Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 7),
+            Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x77),
+        );
+        let mut quoted = [0u8; 48];
+        Ipv6Repr {
+            src_addr: us,
+            dst_addr: nobody,
+            next_header: IpProtocol::Udp,
+            payload_len: 12,
+            hop_limit: 64,
+        }
+        .emit(&mut Ipv6Packet::new_unchecked(&mut quoted[..40]));
+        quoted[40..46].copy_from_slice(&[0x13, 0x88, 0, 9, 0, 12]);
+        let packet = nowhere6(&quoted);
+        assert_eq!(packet.len(), 96);
+        // From us to us, ICMPv6, 64 hops; unreachable, the address; and
+        // what was kept, behind four bytes that say nothing.
+        let ip = Ipv6Packet::new_checked(&packet[..]).unwrap();
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (us, us));
+        assert_eq!((ip.next_header(), ip.hop_limit()), (IpProtocol::Icmpv6, 64));
+        assert_eq!(packet[40..42], [1, 3]);
+        assert_eq!(packet[44..48], [0; 4]);
+        assert_eq!(packet[48..], quoted);
+        let said = Undelivered6 {
+            kind: 1,
+            code: 3,
+            protocol: IpProtocol::Udp,
+            from: us,
+            local: 5000,
+            to: nobody,
+            port: 9,
+        };
+        assert_eq!(Undelivered6::of(&packet), Some(said));
+        // The record: where it went, then what was said.
+        let mut bytes = nobody.0.to_vec();
+        bytes.extend_from_slice(&[9, 0, 1, 3]);
+        assert_eq!(said.bytes()[..], bytes[..]);
+        assert_eq!((EV_UNDELIVERED6, UNDELIVERED6_LEN), (9, 20));
+        let there = Undelivered6 {
+            to: Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99),
+            port: 0x1234,
+            code: 4,
+            ..said
+        };
+        assert_eq!(there.bytes()[16..], [0x34, 0x12, 1, 4]);
+
+        // A sum that does not hold, a packet cut short, and what is not
+        // IPv6 at all say nothing.
+        let mut wrong = packet;
+        wrong[95] ^= 1;
+        assert_eq!(Undelivered6::of(&wrong), None);
+        assert_eq!(Undelivered6::of(&packet[..95]), None);
+        assert_eq!(Undelivered6::of(&packet[..47]), None);
+        assert_eq!(Undelivered6::of(&[]), None);
+        assert_eq!(Undelivered6::of(&quoted), None);
     }
 }

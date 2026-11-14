@@ -386,6 +386,10 @@ impl StackLink {
                         WHY_UNREACHABLE => {
                             icmp::connect_error(bytes).unwrap_or(LxError::ENETUNREACH)
                         }
+                        // The same, said by ICMPv6.
+                        WHY_UNREACHABLE6 => {
+                            icmp6::connect_error(bytes).unwrap_or(LxError::ENETUNREACH)
+                        }
                         WHY_NO_ROOM => LxError::ENOBUFS,
                         _ => LxError::ECONNRESET,
                     });
@@ -1451,6 +1455,17 @@ mod tests {
             (WHY_UNREACHABLE, &[3, 99], LxError::EHOSTUNREACH),
             (WHY_UNREACHABLE, &[8, 0], LxError::ENETUNREACH),
             (WHY_UNREACHABLE, &[3], LxError::ENETUNREACH),
+            // And what ICMPv6 said, whose numbers are others: no way,
+            // nobody answering at the address, nobody at the port,
+            // forbidden, out of hops, a header nobody understood.
+            (WHY_UNREACHABLE6, &[1, 0], LxError::ENETUNREACH),
+            (WHY_UNREACHABLE6, &[1, 3], LxError::EHOSTUNREACH),
+            (WHY_UNREACHABLE6, &[1, 4], LxError::ECONNREFUSED),
+            (WHY_UNREACHABLE6, &[1, 1], LxError::EACCES),
+            (WHY_UNREACHABLE6, &[3, 0], LxError::EHOSTUNREACH),
+            (WHY_UNREACHABLE6, &[4, 0], LxError::EPROTO),
+            (WHY_UNREACHABLE6, &[128, 0], LxError::ENETUNREACH),
+            (WHY_UNREACHABLE6, none, LxError::ENETUNREACH),
         ] {
             let s = stream(&stack);
             assert_eq!(connect(&s, at(HOST, 80)), Err(LxError::EINPROGRESS));

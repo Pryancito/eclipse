@@ -18,9 +18,11 @@
 //!     CONNECTED  number: the bytes the stack takes
 //!                bytes: none, or [u8; 16] the address it connected from,
 //!                when the connection is one of IPv6
-//!     FAILED     number: why (refused, timed out, reset, unreachable, no room)
+//!     FAILED     number: why (refused, timed out, reset, unreachable, no room,
+//!                unreachable as IPv6)
 //!                bytes: none, or the type and the code of the ICMP message
-//!                that said the peer is unreachable ([`super::undelivered`])
+//!                that said the peer is unreachable, or of the ICMPv6 message
+//!                for the last ([`super::undelivered`])
 //!     ACCEPTED   socket: the listener.  number: the bytes the stack takes.
 //!                bytes: u64 the new socket, [u8; 4] from, u16 port, u16 zero
 //!     ACCEPTED6  as ACCEPTED, of a connection that arrived as IPv6.
@@ -47,7 +49,7 @@ use smoltcp::socket::{SocketHandle, TcpSocket, TcpSocketBuffer, TcpState};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
 
-use super::undelivered::{Undelivered, LAST_CODE, TOO_LONG, UNREACHABLE};
+use super::undelivered::{Undelivered, Undelivered6, LAST_CODE, TOO_BIG6, TOO_LONG, UNREACHABLE};
 use super::{Arrived, Refused, Stack, HEADER_LEN, MESSAGE_MAX, RECORD_LEN};
 
 pub const OP_CONNECT: u32 = 5;
@@ -74,6 +76,7 @@ pub const WHY_TIMED_OUT: u32 = 2;
 pub const WHY_RESET: u32 = 3;
 pub const WHY_UNREACHABLE: u32 = 4;
 pub const WHY_NO_ROOM: u32 = 5;
+pub const WHY_UNREACHABLE6: u32 = 6;
 
 /// Set in the number of a connection that arrived on a listener: the
 /// stack numbers those, and the kernel every other socket.
@@ -448,12 +451,32 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             return;
         }
         let to = IpEndpoint::new(IpAddress::Ipv4(said.to), said.port);
+        let bytes = [said.kind, said.code];
+        self.connect_unreachable(said.local, to, WHY_UNREACHABLE, bytes);
+    }
+
+    /// The same, of a knock that travelled as IPv6: what ICMPv6 said of
+    /// it ends the connect, unless it was that it is too big for the
+    /// way (`tcp_v6_err`).
+    pub(super) fn connect_undelivered6(&mut self, said: &Undelivered6) {
+        if said.kind == TOO_BIG6 {
+            return;
+        }
+        let to = IpEndpoint::new(IpAddress::Ipv6(said.to), said.port);
+        let bytes = [said.kind, said.code];
+        self.connect_unreachable(said.local, to, WHY_UNREACHABLE6, bytes);
+    }
+
+    /// End the connect under way from the port `local` to `to`, if there
+    /// is one, with a `FAILED` that says `why` and the type and code of
+    /// the message that said so.
+    fn connect_unreachable(&mut self, local: u16, to: IpEndpoint, why: u32, bytes: [u8; 2]) {
         let set = &mut self.set;
         let found = self.streams.conns.iter().find(|(_, conn)| {
             let socket = set.get::<TcpSocket>(conn.handle);
             conn.connecting.is_some()
                 && socket.state() == TcpState::SynSent
-                && socket.local_endpoint().port == said.local
+                && socket.local_endpoint().port == local
                 && socket.remote_endpoint() == to
         });
         let Some((&sock, _)) = found else {
@@ -462,8 +485,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         if let Some(conn) = self.streams.conns.remove(&sock) {
             self.set.remove(conn.handle);
         }
-        let bytes = [said.kind, said.code];
-        self.streams.owe(sock, EV_FAILED, WHY_UNREACHABLE, &bytes);
+        self.streams.owe(sock, EV_FAILED, why, &bytes);
     }
 
     /// Give every listener the sockets it wants ready.

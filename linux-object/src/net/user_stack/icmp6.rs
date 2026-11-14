@@ -18,10 +18,17 @@
 //! leaves. The stack writes it for what goes by the card, and the kernel
 //! for what stays in the machine.
 //!
+//! What ICMPv6 says of something that was not delivered is a message
+//! like any other to the raw socket, which reads it when its filter lets
+//! it by. What it means for the socket that sent what was not delivered
+//! is said here too ([`undelivered_error`]).
+//!
 //! Not here: a socket bound to one address sending from it or hearing
-//! only what is for it, the errors that come back for an echo, and
-//! asking what the options are (`getsockopt`). A raw socket also hears
-//! what the card brings for a group the machine is no member of.
+//! only what is for it, the socket that pings being told of the errors
+//! that come back for its echoes (in Linux one that asked with
+//! `IPV6_RECVERR` is), and asking what the options are (`getsockopt`).
+//! A raw socket also hears what the card brings for a group the machine
+//! is no member of.
 
 use super::icmp::{checksum, ServedIcmpSocket};
 use super::*;
@@ -56,6 +63,55 @@ const IPV6_MULTICAST_HOPS: usize = 18;
 const IPV6_RECVHOPLIMIT: usize = 51;
 const IPV6_HOPLIMIT: usize = 52;
 const ICMP6_FILTER: usize = 1;
+
+/// ICMPv6's errors: destination unreachable, packet too big, time
+/// exceeded and parameter problem.
+const UNREACHABLE: u8 = 1;
+const TOO_BIG: u8 = 2;
+const TIME_EXCEEDED: u8 = 3;
+const PARAMETER: u8 = 4;
+
+/// What a program is told when an ICMPv6 message of this type and code
+/// says that something its socket sent was not delivered, and whether
+/// that is an error that does not mend by itself: Linux's table
+/// (`icmpv6_err_convert`) and what `__udp6_lib_err` adds to it, which is
+/// that a datagram too big for the way does not mend. `None` for a
+/// message that is not about that.
+///
+/// As for IPv4 ([`super::icmp::undelivered_error`]), a connect under way
+/// ends with the error, mending or not (`tcp_v6_err`), and a datagram
+/// socket's program hears only of the ones that do not mend, and only on
+/// a connected socket.
+pub(super) fn undelivered_error(kind: u8, code: u8) -> Option<(LxError, bool)> {
+    use LxError::*;
+    match (kind, code) {
+        (UNREACHABLE, code) => Some(match code {
+            // No way there: a router's word, which may change.
+            0 => (ENETUNREACH, false),
+            // Forbidden on the way, by whoever runs it.
+            1 | 5 | 6 => (EACCES, true),
+            // Nobody answers at the address: a neighbour may be back.
+            2 | 3 => (EHOSTUNREACH, false),
+            // Nobody at the port: the host's own word.
+            4 => (ECONNREFUSED, true),
+            _ => (EPROTO, true),
+        }),
+        (TOO_BIG, _) => Some((EMSGSIZE, true)),
+        (TIME_EXCEEDED, _) => Some((EHOSTUNREACH, false)),
+        (PARAMETER, _) => Some((EPROTO, true)),
+        _ => None,
+    }
+}
+
+/// The error of a connect that a `FAILED` says ended because of an
+/// ICMPv6 message, whose type and code are its `bytes`: `None` when it
+/// carries none, or none that means anything.
+pub(super) fn connect_error(bytes: &[u8]) -> Option<LxError> {
+    let &[kind, code] = bytes else {
+        return None;
+    };
+    undelivered_error(kind, code).map(|(error, _)| error)
+}
 
 /// The ICMPv6 message of an IPv6 packet that carries one right behind
 /// its header, and the hops the packet had left.
@@ -412,6 +468,41 @@ mod tests {
     /// left.
     fn hears(stack: &Stack, from: &str, message: &[u8]) {
         stack.say(data6(HEARD, from, 0, &packet(from, GIVEN, 57, message)));
+    }
+
+    #[test]
+    fn what_icmpv6_says_means_what_it_means_on_linux() {
+        use LxError::*;
+        // Destination unreachable, code by code (`tab_unreach`), and a
+        // code past the table.
+        let unreachable = [
+            (ENETUNREACH, false),
+            (EACCES, true),
+            (EHOSTUNREACH, false),
+            (EHOSTUNREACH, false),
+            (ECONNREFUSED, true),
+            (EACCES, true),
+            (EACCES, true),
+            (EPROTO, true),
+        ];
+        for (code, means) in unreachable.iter().enumerate() {
+            assert_eq!(undelivered_error(1, code as u8), Some(*means), "{}", code);
+        }
+        assert_eq!(undelivered_error(1, 200), Some((EPROTO, true)));
+        // Too big for the way, out of hops, a header nobody understood.
+        assert_eq!(undelivered_error(2, 0), Some((EMSGSIZE, true)));
+        assert_eq!(undelivered_error(3, 0), Some((EHOSTUNREACH, false)));
+        assert_eq!(undelivered_error(3, 1), Some((EHOSTUNREACH, false)));
+        assert_eq!(undelivered_error(4, 2), Some((EPROTO, true)));
+        // What is no error of something sent.
+        for kind in [0, 5, 100, 127, 128, 129, 133, 136, 255] {
+            assert_eq!(undelivered_error(kind, 0), None, "type {}", kind);
+        }
+        assert_eq!(connect_error(&[1, 3]), Some(EHOSTUNREACH));
+        assert_eq!(connect_error(&[1, 4]), Some(ECONNREFUSED));
+        assert_eq!(connect_error(&[]), None);
+        assert_eq!(connect_error(&[1, 3, 0]), None);
+        assert_eq!(connect_error(&[128, 0]), None);
     }
 
     #[test]

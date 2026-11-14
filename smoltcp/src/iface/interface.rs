@@ -48,12 +48,18 @@ struct InterfaceInner<'a> {
     /// The start of each packet that had nowhere to go, the oldest first: see
     /// [`Interface::unreached`].
     unreached: [Option<[u8; QUOTED]>; UNREACHED],
+    /// The same of IPv6: see [`Interface::unreached6`].
+    #[cfg(feature = "proto-ipv6")]
+    unreached6: [Option<[u8; QUOTED6]>; UNREACHED],
 }
 
 /// What is kept of a packet that had nowhere to go: its IPv4 header, without options, and
 /// the eight bytes behind it, which is what an ICMP message quotes of a packet that was not
 /// delivered.
 const QUOTED: usize = 28;
+/// The same of a packet of IPv6, whose header is longer.
+#[cfg(feature = "proto-ipv6")]
+const QUOTED6: usize = 48;
 
 /// How many such packets are kept for whoever asks. One more and the oldest is forgotten.
 const UNREACHED: usize = 8;
@@ -267,6 +273,8 @@ let iface = InterfaceBuilder::new(device)
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
                 unreached: [None; UNREACHED],
+                #[cfg(feature = "proto-ipv6")]
+                unreached6: [None; UNREACHED],
             },
         }
     }
@@ -606,6 +614,17 @@ where
         // Asked after every poll, and nearly always there is none.
         let oldest = self.inner.unreached[0].take()?;
         self.inner.unreached.rotate_left(1);
+        Some(oldest)
+    }
+
+    /// [`unreached`](Self::unreached), of IPv6: the oldest packet that had nowhere to go
+    /// because its neighbor left several solicitations unanswered. What is given is its
+    /// IPv6 header and the eight bytes behind it, which is the start of what an ICMPv6
+    /// message that said "address unreachable" would quote.
+    #[cfg(feature = "proto-ipv6")]
+    pub fn unreached6(&mut self) -> Option<[u8; QUOTED6]> {
+        let oldest = self.inner.unreached6[0].take()?;
+        self.inner.unreached6.rotate_left(1);
         Some(oldest)
     }
 
@@ -2082,18 +2101,50 @@ impl<'a> InterfaceInner<'a> {
         })
     }
 
-    /// Keep the start of `packet`, which had nowhere to go, for [`Interface::unreached`].
+    /// Keep the start of `packet`, which had nowhere to go, for [`Interface::unreached`],
+    /// or for [`Interface::unreached6`] when it is of IPv6.
     fn nowhere(&mut self, ip_repr: &IpRepr, packet: &IpPacket) {
-        let mut quoted = [0u8; QUOTED];
-        let (header, behind) = quoted.split_at_mut(QUOTED - 8);
+        /// Put `quoted` in the first free place of `kept`, or in the place of the oldest.
+        fn keep<const N: usize>(kept: &mut [Option<[u8; N]>; UNREACHED], quoted: [u8; N]) {
+            if kept[UNREACHED - 1].is_some() {
+                kept.rotate_left(1);
+            }
+            let free = kept.iter().position(Option::is_none);
+            kept[free.unwrap_or(UNREACHED - 1)] = Some(quoted);
+        }
+
+        // What is behind the header, when it is something a socket sent.
+        let mut behind = [0u8; 8];
+        if !Self::quote_behind(packet, &mut behind) {
+            return;
+        }
         match ip_repr {
             #[cfg(feature = "proto-ipv4")]
-            IpRepr::Ipv4(ipv4_repr) => ipv4_repr.emit(
-                &mut Ipv4Packet::new_unchecked(header),
-                &crate::phy::ChecksumCapabilities::default(),
-            ),
-            _ => return,
+            IpRepr::Ipv4(ipv4_repr) => {
+                let mut quoted = [0u8; QUOTED];
+                let (header, rest) = quoted.split_at_mut(QUOTED - 8);
+                ipv4_repr.emit(
+                    &mut Ipv4Packet::new_unchecked(header),
+                    &crate::phy::ChecksumCapabilities::default(),
+                );
+                rest.copy_from_slice(&behind);
+                keep(&mut self.unreached, quoted);
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpRepr::Ipv6(ipv6_repr) => {
+                let mut quoted = [0u8; QUOTED6];
+                let (header, rest) = quoted.split_at_mut(QUOTED6 - 8);
+                ipv6_repr.emit(&mut Ipv6Packet::new_unchecked(header));
+                rest.copy_from_slice(&behind);
+                keep(&mut self.unreached6, quoted);
+            }
+            _ => (),
         }
+    }
+
+    /// Write into `behind` the first eight bytes `packet` has behind its IP header, when it
+    /// is one of a raw socket, of UDP or of TCP: `false` for any other.
+    fn quote_behind(packet: &IpPacket, behind: &mut [u8; 8]) -> bool {
         match packet {
             #[cfg(feature = "socket-raw")]
             IpPacket::Raw((_, payload)) => {
@@ -2113,14 +2164,9 @@ impl<'a> InterfaceInner<'a> {
                 behind[2..4].copy_from_slice(&tcp_repr.dst_port.to_be_bytes());
                 behind[4..].copy_from_slice(&tcp_repr.seq_number.0.to_be_bytes());
             }
-            _ => return,
+            _ => return false,
         }
-        // The first free place, or the place of the oldest.
-        if self.unreached[UNREACHED - 1].is_some() {
-            self.unreached.rotate_left(1);
-        }
-        let free = self.unreached.iter().position(Option::is_none);
-        self.unreached[free.unwrap_or(UNREACHED - 1)] = Some(quoted);
+        true
     }
 
     fn dispatch_ip<Tx: TxToken>(
