@@ -321,13 +321,9 @@ impl Cidr {
     /// Query whether the subnetwork described by this IPv6 CIDR block contains
     /// the given address.
     pub fn contains_addr(&self, addr: &Address) -> bool {
-        // right shift by 128 is not legal
-        if self.prefix_len == 0 {
-            return true;
-        }
-
-        let shift = 128 - self.prefix_len;
-        self.address.mask(shift) == addr.mask(shift)
+        // The first `prefix_len` bits are the network's: `mask` keeps
+        // that many from the front.
+        self.address.mask(self.prefix_len) == addr.mask(self.prefix_len)
     }
 
     /// Query whether the subnetwork described by this IPV6 CIDR block contains
@@ -338,15 +334,8 @@ impl Cidr {
 
     /// Return the network block of this IPv6 CIDR.
     pub fn network(&self) -> Cidr {
-        if self.prefix_len == 0 {
-            return Cidr {
-                address: Address::UNSPECIFIED,
-                prefix_len: 0,
-            };
-        }
-        let shift = 128 - self.prefix_len;
         Cidr {
-            address: Address(self.address.mask(shift)),
+            address: Address(self.address.mask(self.prefix_len)),
             prefix_len: self.prefix_len,
         }
     }
@@ -1005,6 +994,42 @@ mod test {
 
         let cidr_without_prefix = Cidr::new(LINK_LOCAL_ADDR, 0);
         assert!(cidr_without_prefix.contains_addr(&Address::LOOPBACK));
+    }
+
+    #[test]
+    fn test_cidr_of_other_lengths() {
+        // A network is the first `prefix_len` bits of its address,
+        // whatever the length: with 64 the first and the last are as
+        // many, which hid that the last ones were looked at.
+        let a = Address::new;
+        let link = Cidr::new(a(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10);
+        assert!(link.contains_addr(&a(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(link.contains_addr(&a(0xfebf, 0xffff, 0, 0, 0, 0, 0, 1)));
+        assert!(!link.contains_addr(&a(0xfec0, 0, 0, 0, 0, 0, 0, 1)));
+        let unique = Cidr::new(a(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7);
+        assert!(unique.contains_addr(&a(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)));
+        assert!(!unique.contains_addr(&a(0xfe00, 0, 0, 0, 0, 0, 0, 1)));
+        let route = Cidr::new(a(0x2001, 0xdb8, 5, 0, 0, 0, 0, 0), 48);
+        assert!(route.contains_addr(&a(0x2001, 0xdb8, 5, 0, 0, 0, 0, 1)));
+        assert!(route.contains_addr(&a(0x2001, 0xdb8, 5, 6, 0, 0, 0, 1)));
+        assert!(!route.contains_addr(&a(0x2001, 0xdb8, 6, 0, 0, 0, 0, 1)));
+        // One address is a network of itself and of nothing else.
+        let one = Cidr::new(Address::LOOPBACK, 128);
+        assert!(one.contains_addr(&Address::LOOPBACK));
+        assert!(!one.contains_addr(&a(0, 0, 0, 0, 0, 0, 0, 2)));
+        assert!(!one.contains_addr(&a(0xfec0, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(!one.contains_subnet(&link));
+        assert!(link.contains_subnet(&Cidr::new(a(0xfe80, 0, 0, 0, 0, 0, 0, 1), 128)));
+
+        // And the network of an address is those bits and zeroes.
+        let of = |addr: Address, bits: u8| Cidr::new(addr, bits).network();
+        assert_eq!(of(a(0x2001, 0xdb8, 5, 6, 0, 0, 0, 1), 48), route);
+        assert_eq!(of(a(0xfebf, 0xffff, 0, 0, 0, 0, 0, 1), 10), link);
+        assert_eq!(of(Address::LOOPBACK, 128), one);
+        assert_eq!(
+            of(a(0x2001, 0xdb8, 5, 6, 0, 0, 0, 1), 0),
+            Cidr::new(Address::UNSPECIFIED, 0)
+        );
     }
 
     #[test]
