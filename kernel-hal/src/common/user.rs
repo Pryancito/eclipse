@@ -572,6 +572,19 @@ impl<T, P: Write> UserPtr<T, P> {
         self.check_len_for(1, MMUFlags::WRITE)
     }
 
+    /// The `len` elements from here, to write into, checked once as a
+    /// run: the counterpart of [`as_slice`](UserPtr::as_slice), for a
+    /// caller that writes many small pieces into one region and would
+    /// otherwise pay [`write_array`](Self::write_array)'s check for each.
+    pub fn as_mut_slice(&mut self, len: usize) -> Result<&'static mut [T]> {
+        if len == 0 {
+            Ok(&mut [])
+        } else {
+            self.check_len_for(len, MMUFlags::WRITE)?;
+            Ok(unsafe { core::slice::from_raw_parts_mut(self.0, len) })
+        }
+    }
+
     // 类似于写，
     // 但指针为空时返回 `Ok(())`。
     /// Same as [`write`](Self::write),
@@ -1290,6 +1303,23 @@ mod tests {
     }
 
     // ---- copies ---------------------------------------------------------
+
+    #[test]
+    fn as_mut_slice_writes_where_the_pointer_says() {
+        init_handler();
+        let mut dst = alloc::vec![0u8; 16];
+        let mut p = UserOutPtr::<u8>::from(dst.as_mut_ptr() as usize);
+        let run = p.as_mut_slice(16).unwrap();
+        run[3..6].copy_from_slice(b"abc");
+        assert_eq!(&dst[2..7], b"\0abc\0");
+        // Nothing to write is legal, and asks nothing of the pointer.
+        assert!(UserOutPtr::<u8>::from(0)
+            .as_mut_slice(0)
+            .unwrap()
+            .is_empty());
+        // A null pointer is refused as any write through it is.
+        assert!(UserOutPtr::<u8>::from(0).as_mut_slice(1).is_err());
+    }
 
     #[test]
     fn read_array_and_as_slice_copy_the_requested_elements() {
