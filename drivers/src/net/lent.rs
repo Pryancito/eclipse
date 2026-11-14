@@ -38,6 +38,14 @@ pub trait FrameTaker: Send + Sync {
     /// the frames given since the last call are all there are for now, and
     /// a card that had no room for a frame to send may have it again.
     fn done(&self);
+    /// The card interrupted while lent. A driver that says so has not
+    /// looked: it masked the card and left the frames on it for the
+    /// borrower, who looks at the card itself ([`NetScheme::poll`]) when it
+    /// next can, in its own time, and so unmasks it. Said from the
+    /// interrupt: wake whoever looks, and nothing more.
+    ///
+    /// [`NetScheme::poll`]: crate::scheme::NetScheme::poll
+    fn interrupted(&self) {}
 }
 
 /// Where a driver keeps the taker of its card: empty while the card is the
@@ -72,6 +80,11 @@ impl Lent {
         Ok(())
     }
 
+    /// Whether the card is lent, without the lock.
+    pub fn is_on(&self) -> bool {
+        self.on.load(Ordering::Acquire)
+    }
+
     /// Who the card's frames go to, if it is lent.
     pub fn taker(&self) -> Option<Arc<dyn FrameTaker>> {
         if !self.on.load(Ordering::Acquire) {
@@ -90,6 +103,7 @@ pub(crate) mod tests {
     pub(crate) struct Kept {
         pub frames: Mutex<Vec<Vec<u8>>>,
         pub dones: Mutex<usize>,
+        pub interrupts: Mutex<usize>,
     }
 
     impl FrameTaker for Kept {
@@ -98,6 +112,9 @@ pub(crate) mod tests {
         }
         fn done(&self) {
             *self.dones.lock() += 1;
+        }
+        fn interrupted(&self) {
+            *self.interrupts.lock() += 1;
         }
     }
 

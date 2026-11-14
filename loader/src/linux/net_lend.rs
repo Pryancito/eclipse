@@ -123,6 +123,9 @@ impl Card for KernelCard {
         // The driver feeds the kernel's stack again and the card is back
         // among the kernel's interfaces.
         let _ = self.0.lend(None);
+        // A card that interrupted for the borrower is masked until looked
+        // at: this look is the kernel's, and unmasks it.
+        let _ = self.0.poll();
         let name = self.0.get_ifname();
         if kernel_hal::drivers::hotplug::add(Device::Net(self.0.clone())) {
             info!("lent card: {name} is the kernel's again");
@@ -151,6 +154,9 @@ pub(super) struct LentCard {
     state: lock::Mutex<State>,
     /// One sender to the card at a time, without a lock held across it.
     sending: AtomicBool,
+    /// The card interrupted and nobody has looked at it since: it is
+    /// masked until someone does ([`FrameTaker::interrupted`]).
+    owed: AtomicBool,
 }
 
 impl_kobject!(LentCard);
@@ -184,6 +190,7 @@ impl LentCard {
                 dropped: 0,
             }),
             sending: AtomicBool::new(false),
+            owed: AtomicBool::new(false),
         }))
     }
 
@@ -346,12 +353,32 @@ impl LentCard {
         // With the lock held: two tellers must not cross, the one that saw
         // nothing speaking after the one that saw a frame.
         let state = self.state.lock();
-        let ready =
-            !state.tx_done.is_empty() || (!state.incoming.is_empty() && !state.rx_free.is_empty());
+        // A look owed is something too: the interrupt that owes it may have
+        // come between that turn's look and this.
+        let ready = !state.tx_done.is_empty()
+            || (!state.incoming.is_empty() && !state.rx_free.is_empty())
+            || self.owed.load(Ordering::Acquire);
         if ready {
             self.base.signal_set(Signal::READABLE);
         } else {
             self.base.signal_clear(Signal::READABLE);
+        }
+    }
+
+    /// The card interrupted: wake whoever sleeps on it, to look. From the
+    /// interrupt, so it only says so.
+    fn interrupted(&self) {
+        self.owed.store(true, Ordering::Release);
+        self.base.signal_set(Signal::READABLE);
+    }
+
+    /// Look at the card if it interrupted since it was last looked at: the
+    /// borrower's turn does what the driver's bottom half would have done,
+    /// in the borrower's time, so frames do not wait for the kernel to be
+    /// idle.
+    fn look_if_owed(&self) {
+        if self.owed.swap(false, Ordering::AcqRel) {
+            self.card.look();
         }
     }
 
@@ -390,6 +417,12 @@ impl FrameTaker for Taker {
         if let Some(lent) = self.lent() {
             lent.flush();
             lent.tell();
+        }
+    }
+
+    fn interrupted(&self) {
+        if let Some(lent) = self.lent() {
+            lent.interrupted();
         }
     }
 }
@@ -524,6 +557,12 @@ impl Turn {
         let frames = self.flags & LENT_FRAMES != 0;
         let mut out: Vec<u8> = Vec::new();
         loop {
+            // Only a turn that takes frames looks: one that does not would
+            // leave them for the one that does, which then waits for this
+            // one's thread to be done with the CPU.
+            if frames {
+                self.card.look_if_owed();
+            }
             // The receive slots, looked at once for what this pass puts in
             // them, and only when it may put a frame there.
             let mut slots = None;
@@ -584,6 +623,8 @@ mod tests {
         room: lock::Mutex<usize>,
         /// How many times it was given back.
         back: lock::Mutex<usize>,
+        /// How many times it was looked at.
+        looks: lock::Mutex<usize>,
     }
 
     impl Wire {
@@ -604,7 +645,9 @@ mod tests {
             self.sent.lock().push(frame.to_vec());
             Ok(())
         }
-        fn look(&self) {}
+        fn look(&self) {
+            *self.looks.lock() += 1;
+        }
         fn give_back(&self) {
             *self.back.lock() += 1;
         }
@@ -638,6 +681,24 @@ mod tests {
     fn put(card: &LentCard, window: &mut [u8], slot: u32, mark: u8, len: usize) {
         let at = (card.rx_slots + slot as usize) * SLOT + 16;
         window[at..at + len].copy_from_slice(&frame(mark, len));
+    }
+
+    #[test]
+    fn an_interrupt_wakes_the_borrower_to_look_once() {
+        let wire = Wire::with_room(0);
+        let card = lent(&wire, 2, 1);
+        assert!(!ready(&card));
+        // Nothing owed: no look.
+        card.look_if_owed();
+        assert_eq!(*wire.looks.lock(), 0);
+        card.interrupted();
+        assert!(card.base.signal().contains(Signal::READABLE));
+        // A turn that finds nothing else to say does not put it to sleep.
+        assert!(ready(&card));
+        card.look_if_owed();
+        card.look_if_owed();
+        assert_eq!(*wire.looks.lock(), 1);
+        assert!(!ready(&card));
     }
 
     #[test]
