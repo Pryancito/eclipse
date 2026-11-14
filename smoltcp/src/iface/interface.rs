@@ -972,7 +972,9 @@ impl<'a> InterfaceInner<'a> {
                 IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOOPBACK => {
                     // Take the lower order 24 bits of the IPv6 address and
                     // append those bits to FF02:0:0:0:0:1:FF00::/104.
-                    addr.as_bytes()[14..] == cidr.address().as_bytes()[14..]
+                    let group = Ipv6Cidr::SOLICITED_NODE_PREFIX.address();
+                    addr.as_bytes()[..13] == group.as_bytes()[..13]
+                        && addr.as_bytes()[13..] == cidr.address().as_bytes()[13..]
                 }
                 _ => false,
             }
@@ -3431,6 +3433,25 @@ mod test {
         assert!(!iface
             .inner
             .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0x0003)));
+        // The last 24 bits, and of that group and no other.
+        assert!(!iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff12, 0x0002)));
+        assert!(!iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0002)));
+        assert!(!iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff05, 0, 0, 0, 0, 1, 0xff00, 0x0002)));
+        iface.update_ip_addrs(|addrs| {
+            let third = IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 5, 6, 0x12, 2), 64);
+            let mut all = addrs.to_vec();
+            all.push(third);
+            *addrs = From::from(all);
+        });
+        assert!(iface
+            .inner
+            .has_solicited_node(Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff12, 0x0002)));
     }
 
     #[test]
