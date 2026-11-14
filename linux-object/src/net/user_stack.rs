@@ -236,6 +236,20 @@
 //!     ACCEPTED6  as ACCEPTED.  bytes: u64 the new socket, [u8; 16] from,
 //!                u16 port, u16 zero, [u8; 16] the address it arrived at
 //! ```
+//!
+//! And so do the sockets that speak ICMPv6, what `ping -6` opens
+//! ([`icmp6`]):
+//!
+//! ```text
+//! ICMP6   (kernel to stack)  16  [u8; 16] to  32  u8 hop limit  33  three zero  36  the ICMPv6 message
+//! HEAR6   (kernel to stack)
+//! ```
+//!
+//! As `ICMP` and `HEAR`, with two differences. The stack chooses the
+//! address the message is from, and ICMPv6's sum covers it: so the sum
+//! is the stack's to write, and the kernel leaves its place alone. And
+//! what such a socket hears comes as records of a `DATA6` for socket 0,
+//! each a whole IPv6 packet of ICMPv6 whose sum the stack saw is right.
 
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
@@ -260,6 +274,7 @@ use zircon_object::{ZxError, ZxResult};
 
 mod groups;
 mod icmp;
+mod icmp6;
 mod tcp;
 pub use groups::{join_message, leave_message, Membership, MEMBERSHIPS_MAX, OP_JOIN, OP_LEAVE};
 pub use icmp::ServedIcmpSocket;
@@ -284,9 +299,12 @@ pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
 pub const OP_CONNECT6: u32 = 19;
 pub const OP_LISTEN6: u32 = 20;
+pub const OP_ICMP6: u32 = 21;
+pub const OP_HEAR6: u32 = 22;
 
-/// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
-/// whichever sockets hear: no socket has the number.
+/// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
+/// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
+/// hear: no socket has the number.
 pub const HEARD: u64 = 0;
 
 /// What a record of an `EVENTS` says.
@@ -395,6 +413,21 @@ pub fn hear_message(sock: u64) -> Vec<u8> {
 /// hops at most, which is not 0.
 pub fn icmp_message(sock: u64, addr: [u8; 4], hop_limit: u8, message: &[u8]) -> Vec<u8> {
     let mut m = header(OP_ICMP, sock, 8 + message.len());
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&[hop_limit, 0, 0, 0]);
+    m.extend_from_slice(message);
+    m
+}
+
+/// `HEAR6`: socket `sock` hears ICMPv6 from now on.
+pub fn hear6_message(sock: u64) -> Vec<u8> {
+    header(OP_HEAR6, sock, 0)
+}
+
+/// `ICMP6`: `message` from socket `sock` to `addr`, to travel `hop_limit`
+/// hops at most, which is not 0. Its sum is the stack's to write.
+pub fn icmp6_message(sock: u64, addr: [u8; 16], hop_limit: u8, message: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_ICMP6, sock, 20 + message.len());
     m.extend_from_slice(&addr);
     m.extend_from_slice(&[hop_limit, 0, 0, 0]);
     m.extend_from_slice(message);
@@ -748,15 +781,19 @@ struct Shared {
 enum Hears {
     /// The datagrams for its port.
     Datagrams,
-    /// Every IPv4 packet of ICMP, whole: a raw socket.
+    /// Every IPv4 packet of ICMP, whole: a raw socket. One of
+    /// `AF_INET6` (`v6`): every ICMPv6 message its filter lets by,
+    /// without the IPv6 header.
     Icmp,
     /// The answers to the echoes it sent, which carry its `port` as
-    /// their identifier, without the IPv4 header: a socket that pings.
+    /// their identifier, without the IP header: a socket that pings.
     Echoes,
 }
 
 struct Inner {
-    queue: VecDeque<(IpEndpoint, Vec<u8>)>,
+    /// What arrived: who sent it, the bytes, and the hops it had left
+    /// when that is known (ICMPv6), else 0.
+    queue: VecDeque<(IpEndpoint, Vec<u8>, u8)>,
     queued_bytes: usize,
     /// The port, once bound.
     port: Option<u16>,
@@ -768,6 +805,13 @@ struct Inner {
     flags: OpenFlags,
     /// `MSG_TRUNC` of the last read, for `recvmsg`.
     last_msg_flags: i32,
+    /// The hops of the last read, for `recvmsg`.
+    last_hops: u8,
+    /// The types of ICMPv6 a raw socket does not want (`ICMP6_FILTER`):
+    /// a bit each, set for one that is not, as the program wrote them
+    /// (words of 32 bits, the lowest byte first on every machine this
+    /// kernel runs on).
+    blocked: [u8; 32],
     /// `shutdown(SHUT_RD)`: an empty queue is the end.
     read_closed: bool,
     patience: Patience,
@@ -782,12 +826,17 @@ struct Inner {
 impl Shared {
     /// Queue a datagram that arrived. `false` when there was no room.
     fn deliver(&self, from: IpEndpoint, data: &[u8]) -> bool {
+        self.deliver_with(from, data, 0)
+    }
+
+    /// [`deliver`](Self::deliver), of what had `hops` left.
+    fn deliver_with(&self, from: IpEndpoint, data: &[u8], hops: u8) -> bool {
         let mut inner = self.inner.lock();
         if inner.read_closed || inner.queued_bytes + data.len() > RX_QUEUE_BYTES {
             return false;
         }
         inner.queued_bytes += data.len();
-        inner.queue.push_back((from, data.to_vec()));
+        inner.queue.push_back((from, data.to_vec(), hops));
         self.bus.lock().set(Event::READABLE);
         true
     }
@@ -807,6 +856,8 @@ impl Shared {
                 remote: None,
                 flags: OpenFlags::RDWR,
                 last_msg_flags: 0,
+                last_hops: 0,
+                blocked: [0; 32],
                 read_closed: false,
                 patience: Patience::default(),
                 error: None,
@@ -847,6 +898,9 @@ impl Shared {
 
     /// Queue what is this socket's of an IPv4 packet of ICMP from `from`.
     fn deliver_heard(&self, from: Ipv4Address, packet: &[u8]) {
+        if self.v6 {
+            return;
+        }
         let from = IpEndpoint::new(IpAddress::Ipv4(from), 0);
         match self.hears {
             Hears::Datagrams => {}
@@ -865,6 +919,33 @@ impl Shared {
         }
     }
 
+    /// Queue `message`, ICMPv6 from `from` that had `hops` left, when it
+    /// is this socket's: any that a raw socket's filter lets by
+    /// (`icmpv6_filter`), and for a socket that pings the answer to an
+    /// echo of its own.
+    fn deliver_heard6(&self, from: Ipv6Address, hops: u8, message: &[u8]) {
+        let Some(&kind) = message.first() else {
+            return;
+        };
+        if !self.v6 {
+            return;
+        }
+        let from = IpEndpoint::new(IpAddress::Ipv6(from), 0);
+        let wanted = {
+            let inner = self.inner.lock();
+            match self.hears {
+                Hears::Datagrams => false,
+                Hears::Icmp => inner.blocked[usize::from(kind >> 3)] & (1 << (kind & 7)) == 0,
+                Hears::Echoes => {
+                    icmp6::echo_reply_ident(message).is_some_and(|i| Some(i) == inner.port)
+                }
+            }
+        };
+        if wanted {
+            self.deliver_with(from, message, hops);
+        }
+    }
+
     /// The next datagram, taken off the queue or only looked at, as a
     /// socket of that family says who sent it.
     async fn receive(&self, v6: bool, data: &mut [u8], take: bool) -> (SysResult, Endpoint) {
@@ -880,16 +961,17 @@ impl Shared {
                 }
                 let remote = inner.remote;
                 // A connected socket hears its peer and nobody else.
-                while matches!((inner.queue.front(), remote), (Some((from, _)), Some(peer)) if *from != peer)
+                while matches!((inner.queue.front(), remote), (Some((from, _, _)), Some(peer)) if *from != peer)
                 {
-                    if let Some((_, dropped)) = inner.queue.pop_front() {
+                    if let Some((_, dropped, _)) = inner.queue.pop_front() {
                         inner.queued_bytes -= dropped.len();
                     }
                 }
-                if let Some((from, datagram)) = inner.queue.front() {
-                    let (from, len) = (*from, datagram.len());
+                if let Some((from, datagram, hops)) = inner.queue.front() {
+                    let (from, len, hops) = (*from, datagram.len(), *hops);
                     let n = data.len().min(len);
                     data[..n].copy_from_slice(&datagram[..n]);
+                    inner.last_hops = hops;
                     // MSG_TRUNC = 0x20: the datagram was longer than the buffer.
                     inner.last_msg_flags = if len > n { 0x20 } else { 0 };
                     if take {
@@ -1327,11 +1409,23 @@ impl StackLink {
                     Some((*sock, *port, stream))
                 })
                 .collect();
-            let hearing: Vec<u64> = table.hearing.iter().copied().collect();
+            let hearing: Vec<(u64, bool)> = table
+                .hearing
+                .iter()
+                .filter_map(|sock| {
+                    let shared = table.socks.get(sock).and_then(Weak::upgrade)?;
+                    Some((*sock, shared.v6))
+                })
+                .collect();
             (bound, listening, hearing)
         };
-        for sock in hearing {
-            let _ = self.tell(hear_message(sock), true);
+        for (sock, six) in hearing {
+            let said = if six {
+                hear6_message(sock)
+            } else {
+                hear_message(sock)
+            };
+            let _ = self.tell(said, true);
         }
         for (sock, port, shared) in bound {
             if shared.inner.lock().here.is_none() {
@@ -1529,6 +1623,12 @@ impl StackLink {
                 return;
             };
             records = rest;
+            if sock == HEARD {
+                if let Some((hops, message)) = icmp6::message_of(data) {
+                    self.heard6(Ipv6Address(addr), hops, message);
+                }
+                continue;
+            }
             let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
             if let Some(shared) = shared.filter(|shared| shared.v6) {
                 let from = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr)), port);
@@ -1624,12 +1724,17 @@ impl StackLink {
         }
     }
 
-    /// A socket that speaks ICMP is there: the stack is told to hear for
-    /// it, and the next stack when it comes.
-    fn hear(&self, sock: u64) {
+    /// A socket that speaks ICMP is there, or ICMPv6 when `six`: the
+    /// stack is told to hear for it, and the next stack when it comes.
+    fn hear(&self, sock: u64, six: bool) {
         let _telling = self.telling.lock();
         self.table.lock().hearing.insert(sock);
-        let _ = self.tell(hear_message(sock), true);
+        let said = if six {
+            hear6_message(sock)
+        } else {
+            hear_message(sock)
+        };
+        let _ = self.tell(said, true);
     }
 
     /// A socket that speaks ICMP is gone: its number is free, and its
@@ -1653,18 +1758,29 @@ impl StackLink {
         self.table.lock().idents.take(wanted)
     }
 
+    /// The sockets that hear ICMP, of either kind.
+    fn hearing(&self) -> Vec<Arc<Shared>> {
+        let table = self.table.lock();
+        let socks = table.hearing.iter();
+        socks
+            .filter_map(|sock| table.socks.get(sock).and_then(Weak::upgrade))
+            .collect()
+    }
+
     /// An IPv4 packet of ICMP from `from`, off the card or made here:
     /// to every socket that hears, which takes what is its own.
     fn heard(&self, from: Ipv4Address, packet: &[u8]) {
-        let hearing: Vec<Arc<Shared>> = {
-            let table = self.table.lock();
-            let socks = table.hearing.iter();
-            socks
-                .filter_map(|sock| table.socks.get(sock).and_then(Weak::upgrade))
-                .collect()
-        };
-        for shared in hearing {
+        for shared in self.hearing() {
             shared.deliver_heard(from, packet);
+        }
+    }
+
+    /// An ICMPv6 message from `from` that had `hops` left, off the card
+    /// or made here: to every socket that hears, which takes what is its
+    /// own.
+    fn heard6(&self, from: Ipv6Address, hops: u8, message: &[u8]) {
+        for shared in self.hearing() {
+            shared.deliver_heard6(from, hops, message);
         }
     }
 
@@ -2246,7 +2362,7 @@ impl FileLike for ServedUdpSocket {
     /// `FIONREAD`: the size of the next datagram, 0 when there is none.
     fn readable_bytes(&self) -> Option<usize> {
         let inner = self.shared.inner.lock();
-        Some(inner.queue.front().map_or(0, |(_, d)| d.len()))
+        Some(inner.queue.front().map_or(0, |(_, d, _)| d.len()))
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -2538,7 +2654,7 @@ mod tests {
     }
 
     /// A `DATA6` of one datagram, as the stack writes it.
-    fn data6(sock: u64, from: &str, port: u16, data: &[u8]) -> Vec<u8> {
+    pub(super) fn data6(sock: u64, from: &str, port: u16, data: &[u8]) -> Vec<u8> {
         let from: core::net::Ipv6Addr = from.parse().unwrap();
         let mut m = header(OP_DATA6, 0, RECORD6_LEN + data.len());
         m.extend_from_slice(&sock.to_le_bytes());
