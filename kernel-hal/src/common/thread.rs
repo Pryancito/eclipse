@@ -28,6 +28,117 @@ pub async fn preempt_now() {
     YieldFuture::involuntary().await
 }
 
+/// Whether [`preempt_behind`] files the thread behind the woken ones. On by
+/// default; `PREEMPTBEHIND=0` on the kernel command line turns it off, for
+/// A/B runs on one build.
+static PREEMPT_BEHIND: AtomicBool = AtomicBool::new(true);
+
+/// Turn [`preempt_behind`] on or off. Called once at boot from the command
+/// line.
+pub fn set_preempt_behind(enabled: bool) {
+    PREEMPT_BEHIND.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether [`preempt_behind`] is on.
+pub fn preempt_behind_enabled() -> bool {
+    PREEMPT_BEHIND.load(Ordering::Relaxed)
+}
+
+/// Takes the CPU from a thread that was running in user mode, at the end of
+/// its slice or for a task woken past its floor, and files it behind every
+/// task that is waiting because it was woken.
+///
+/// A thread that is taken off the CPU this way has had the CPU for a while,
+/// and every task waiting because it was woken has had none of it. With
+/// [`preempt_now`] both were in one lane, served in slot order. So a busy
+/// loop woken out of its turn by a frame for the network stack got the CPU
+/// back for a whole slice as soon as the stack's thread blocked for a moment,
+/// even while the stack's other thread and the program it served were
+/// runnable. An upload beside such a loop ran at 8 MB/s against 22 alone.
+///
+/// The lane it goes to is the voluntary-yield lane, which the run queue still
+/// serves once in every `URGENT_QUOTA` turns however busy the woken lane is
+/// (`vendor/PreemptiveScheduler/src/task_collection.rs`). So it cannot starve:
+/// it waits for at most that many short turns of woken threads. When
+/// [`preempt_now`] was written that quota did not exist, and a thread put in
+/// that lane got nothing for as long as anyone kept waking.
+///
+/// Off ([`set_preempt_behind`]), this is [`preempt_now`].
+pub async fn preempt_behind() {
+    BEHIND_STATS[0].fetch_add(1, Ordering::Relaxed);
+    if !preempt_behind_enabled() {
+        return YieldFuture::involuntary().await;
+    }
+    YieldFuture::voluntary().await;
+    // Back by the run queue's quota, past a woken task that is still
+    // waiting: this is a short turn, and a timer says when it is over
+    // ([`quota_turn_over`]). Only a thread that came back this way gets
+    // one; a quota pick of anything else is left as it was.
+    #[cfg(target_os = "none")]
+    if executor::quota_passed_urgent() {
+        let end = crate::timer::timer_now() + Duration::from_nanos(QUOTA_TURN_NS);
+        let cpu = crate::cpu::cpu_id() as usize;
+        if let Some(turn) = QUOTA_TURN_END_NS.get(cpu) {
+            turn.store(end.as_nanos() as u64, Ordering::Relaxed);
+        }
+        crate::timer::timer_set(end, alloc::boxed::Box::new(|_| {}));
+        BEHIND_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `[put behind, quota turns given, quota turns ended by the trap path]`.
+static BEHIND_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `(put behind, quota turns given, quota turns ended)` since boot, for
+/// `/proc/perf/kernel`.
+pub fn preempt_behind_stats() -> (u64, u64, u64) {
+    (
+        BEHIND_STATS[0].load(Ordering::Relaxed),
+        BEHIND_STATS[1].load(Ordering::Relaxed),
+        BEHIND_STATS[2].load(Ordering::Relaxed),
+    )
+}
+
+/// How long a turn the run queue's quota gives a preempted thread past a
+/// woken one. About what a woken thread waited for the CPU beside a busy
+/// loop before [`preempt_behind`] (0.3 ms at worst, under QEMU).
+const QUOTA_TURN_NS: u64 = 250_000;
+
+/// When the quota turn running on each CPU ends; 0 for none.
+static QUOTA_TURN_END_NS: [AtomicU64; crate::config::MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; crate::config::MAX_CORE_NUM];
+
+/// Forget the quota turn on this CPU, if any: the poll of the thread that
+/// had it is over, so the next thread to trap here is not cut short for it.
+pub fn quota_turn_forget() {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if let Some(turn) = QUOTA_TURN_END_NS.get(cpu) {
+        if turn.load(Ordering::Relaxed) != 0 {
+            turn.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether the thread running on this CPU is on a quota turn
+/// ([`preempt_behind`]) that is over; the turn is forgotten once it is.
+/// The trap path takes the CPU back on that, floor or no floor.
+pub fn quota_turn_over() -> bool {
+    let cpu = crate::cpu::cpu_id() as usize;
+    let Some(turn) = QUOTA_TURN_END_NS.get(cpu) else {
+        return false;
+    };
+    let end = turn.load(Ordering::Relaxed);
+    if end == 0 {
+        return false;
+    }
+    if (crate::timer::timer_now().as_nanos() as u64) < end {
+        return false;
+    }
+    turn.store(0, Ordering::Relaxed);
+    BEHIND_STATS[2].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Gives the CPU back from a **synchronous** caller, which cannot `.await`.
 ///
 /// Every other yield in this module is a future, and a future is no use to a

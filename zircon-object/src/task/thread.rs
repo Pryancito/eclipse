@@ -570,6 +570,13 @@ struct SchedAttr {
     /// 0 wherever the deadline is settled up by other means, so a credit is
     /// never paid twice for the same absence.
     last_tick_ns: AtomicU64,
+    /// What this thread has taken of the CPU in user mode lately: the start
+    /// of the window being counted, its user time ([`Thread::get_time`]) at
+    /// that start, and the share (per mille) of the last window that closed.
+    /// See [`Thread::sched_took_more_than_half`].
+    share_window_ns: AtomicU64,
+    share_user_at_ns: AtomicU64,
+    share_last_pm: AtomicU64,
 }
 
 impl Default for SchedAttr {
@@ -584,8 +591,25 @@ impl Default for SchedAttr {
             slice_left_ns: AtomicU64::new(NO_SLICE_REMAINDER),
             parked_at_ns: AtomicU64::new(0),
             last_tick_ns: AtomicU64::new(0),
+            share_window_ns: AtomicU64::new(0),
+            share_user_at_ns: AtomicU64::new(0),
+            share_last_pm: AtomicU64::new(0),
         }
     }
+}
+
+/// How long a window [`Thread::sched_took_more_than_half`] measures a share
+/// over: one default slice.
+const SHARE_WINDOW_NS: u64 = BASE_TIMESLICE_NS;
+
+/// The share, per mille, of `ran` CPU nanoseconds in a window that began at
+/// `start`, by `now`; `None` for a window too young to say (under a tick).
+fn share_pm(start: u64, ran: u64, now: u64) -> Option<u64> {
+    let span = now.saturating_sub(start);
+    if start == 0 || span < SCHED_TICK_NS {
+        return None;
+    }
+    Some((ran.min(span) * 1000) / span)
 }
 
 pub struct Thread {
@@ -1129,6 +1153,51 @@ impl Thread {
             // paying for it a second time at the next tick.
             self.sched.last_tick_ns.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Note the end of a poll of this thread at `now` (ns): where the window
+    /// [`Thread::sched_took_more_than_half`] counts over is closed and the
+    /// next one begun.
+    pub fn sched_note_poll_end(&self, now: u64) {
+        let start = self.sched.share_window_ns.load(Ordering::Relaxed);
+        if start != 0 && now.saturating_sub(start) < SHARE_WINDOW_NS {
+            return;
+        }
+        let user = self.get_time();
+        if start != 0 {
+            let ran = user.saturating_sub(self.sched.share_user_at_ns.load(Ordering::Relaxed));
+            let share = share_pm(start, ran, now).unwrap_or(0);
+            self.sched.share_last_pm.store(share, Ordering::Relaxed);
+        }
+        self.sched.share_window_ns.store(now, Ordering::Relaxed);
+        self.sched.share_user_at_ns.store(user, Ordering::Relaxed);
+    }
+
+    /// Whether this thread has spent more than half the CPU in user mode
+    /// lately: in the last window that closed, or in the one being counted.
+    ///
+    /// What the trap path asks before putting a thread it takes off the CPU
+    /// behind the woken ones (`kernel_hal::thread::preempt_behind`). A busy
+    /// loop beside a network stack's threads has had most of the CPU, in
+    /// user mode, and goes behind them. Two threads that both want the whole
+    /// CPU, one of them parking now and then, settle at half each: the one
+    /// that had less keeps its place in the woken lane. Put behind on every
+    /// preemption, the plain loop got 0.5 of an even share against one that
+    /// parked for 50 us every 600 us.
+    ///
+    /// User mode only, because time in the kernel is time a thread asked
+    /// for something: the writer of a pipe spends half the CPU copying into
+    /// it, and put behind for that it lost 5 % of its bandwidth.
+    pub fn sched_took_more_than_half(&self) -> bool {
+        if self.sched.share_last_pm.load(Ordering::Relaxed) > 500 {
+            return true;
+        }
+        let start = self.sched.share_window_ns.load(Ordering::Relaxed);
+        let ran = self
+            .get_time()
+            .saturating_sub(self.sched.share_user_at_ns.load(Ordering::Relaxed));
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        share_pm(start, ran, now).is_some_and(|share| share > 500)
     }
 
     /// Whether a pending *wake-up* preemption request may take the CPU from
@@ -2252,10 +2321,14 @@ impl Future for ThreadSwitchFuture {
             let _running = RunningGuard::new();
             self.future.lock().as_mut().poll(cx)
         };
-        let poll_ns = kernel_hal::timer::timer_now()
+        let poll_end = kernel_hal::timer::timer_now();
+        let poll_ns = poll_end
             .checked_sub(poll_start)
             .unwrap_or_default()
             .as_nanos() as u64;
+        self.thread.sched_note_poll_end(poll_end.as_nanos() as u64);
+        // A quota turn ends with the poll that had it, whoever traps next.
+        kernel_hal::thread::quota_turn_forget();
         if ret.is_pending() {
             self.thread
                 .note_context_switch(kernel_hal::thread::take_yielded());
@@ -3486,6 +3559,28 @@ mod sched_tests {
             resume_slice_end(0, 0, 0, LAG_SLICE),
             0,
             "un slice agotado en el instante 0 se confunde con no tener slice"
+        );
+    }
+
+    /// The share `sched_took_more_than_half` reads: none for a window under
+    /// a tick, and never more than all of the window.
+    #[test]
+    fn a_share_is_read_only_from_a_window_a_tick_old() {
+        let start = 1_000_000_000;
+        assert_eq!(
+            share_pm(start, 1_000, start + SCHED_TICK_NS - 1),
+            None,
+            "una ventana de menos de un tick ya da una cuota"
+        );
+        assert_eq!(share_pm(0, 1_000, start), None, "sin ventana hay cuota");
+        assert_eq!(
+            share_pm(start, SCHED_TICK_NS / 2, start + SCHED_TICK_NS),
+            Some(500)
+        );
+        assert_eq!(
+            share_pm(start, 3 * SCHED_TICK_NS, start + SCHED_TICK_NS),
+            Some(1000),
+            "una cuota de más de toda la ventana"
         );
     }
 

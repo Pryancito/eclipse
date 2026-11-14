@@ -146,6 +146,22 @@ Es decir: el temporizador por plazo vale ~3-4x en latencia de `sleep`, y la
 preempción por despertar vale **~9x** en el pipe bajo carga. Ninguno de los dos
 degrada las cifras en reposo.
 
+Un tercer interruptor, `PREEMPTBEHIND=0`, devuelve al carril de los despertados
+al hilo que se desaloja en modo usuario. Por defecto, si ha pasado más de la
+mitad de la CPU en modo usuario en la última ventana de 20 ms, ese hilo va detrás
+de los despertados (`kernel_hal::thread::preempt_behind`), y la cuota del carril
+de cesión le da turnos de 250 µs mientras haya despertados esperando.
+`sched mode:` dice si está activo y cuántas veces ha actuado. Bajo
+`-icount shift=2`, con 1 CPU y `VDSOFORCE=1`, tres arranques de cada:
+
+| | por defecto | `PREEMPTBEHIND=0` |
+| --- | ---: | ---: |
+| pipe ida/vuelta **carga** | **323-380 us** | 2 195-2 557 us |
+| reparto justo, bucle frente a hilo que se aparca | 1,13-1,15x | 1,31-1,41x |
+| ancho de banda de pipe | 188-189 MB/s | 188-190 MB/s |
+| subida TCP de 8 MB con un bucle, tarjeta prestada a la pila de usuario | **12,4-13,8 MB/s** | 8,4-9,4 MB/s |
+| despertador de 200 us junto a un bucle, retraso peor | 373-470 us (una vez 1 158) | 289-434 us |
+
 ### Un fallo encontrado por este A/B
 
 La primera corrida con **ambos** interruptores apagados no llegó a imprimir ni

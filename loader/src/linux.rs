@@ -2682,15 +2682,23 @@ async fn handle_user_trap(
                 let wake_resched = (slice_expired || wake_may_preempt)
                     && kernel_hal::thread::need_resched_pending()
                     && kernel_hal::thread::take_need_resched();
-                // `preempt_now`, not `yield_now`: neither of these is the
-                // task volunteering. `yield_now` files the self-wake in the
-                // voluntary-yield lane, which the run queue drains only once no
-                // urgent notify is left -- so a CPU-bound thread preempted at
-                // the end of its slice did not run again for as long as any
-                // peer on the CPU kept waking, and the slice length stopped
-                // mattering at all. See `kernel_hal::thread::preempt_now`.
-                if slice_expired || wake_resched {
-                    kernel_hal::thread::preempt_now().await;
+                // A short turn the run queue gave this thread past a woken
+                // one (`preempt_behind`), now over.
+                let quota_over = kernel_hal::thread::quota_turn_over();
+                // Behind the woken tasks (`preempt_behind`): this thread has
+                // had the CPU for a slice, or for the floor at least, and the
+                // tasks waiting because they were woken have had none of it.
+                // The run queue's urgent quota still serves it within a few
+                // short turns. A wake honoured at a system call's exit stays
+                // `preempt_now` (`honour_wake_preempt_on_syscall_exit`): a
+                // thread that calls the kernel that often is more likely one
+                // of a pipeline than a loop.
+                if slice_expired || wake_resched || quota_over {
+                    if thread.sched_took_more_than_half() {
+                        kernel_hal::thread::preempt_behind().await;
+                    } else {
+                        kernel_hal::thread::preempt_now().await;
+                    }
                 } else if kernel_hal::thread::need_resched_pending() {
                     // Denied inside the floor. Left to the next interrupt, that
                     // is the 4 ms tick for a thread in a userspace loop, which

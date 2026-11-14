@@ -957,11 +957,20 @@ pub fn kernel_report() -> String {
     // is self-describing when compared against another.
     {
         let (deadline, wakeup) = kernel_hal::kstats::sched_switches();
+        let behind = kernel_hal::thread::preempt_behind_stats();
         let _ = writeln!(
             out,
-            "sched mode:   deadline-timer={} wakeup-preempt={} cow-fork={} fork-gather={}",
+            "sched mode:   deadline-timer={} wakeup-preempt={} preempt-behind={} ({} behind, {} quota turns, {} ended) cow-fork={} fork-gather={}",
             if deadline { "on" } else { "OFF" },
             if wakeup { "on" } else { "OFF" },
+            if kernel_hal::thread::preempt_behind_enabled() {
+                "on"
+            } else {
+                "OFF"
+            },
+            behind.0,
+            behind.1,
+            behind.2,
             if zircon_object::vm::cow_fork_enabled() {
                 "on"
             } else {

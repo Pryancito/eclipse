@@ -232,6 +232,29 @@ static HANDOFF: AtomicBool = AtomicBool::new(false);
 /// Hand-offs taken, for [`handoff_stats`].
 static HANDOFFS_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Per CPU: whether the task its run queue handed out last was served from
+/// the voluntary-yield lane by the quota, past a woken task that is still
+/// waiting (see `TaskCollection::schedule`). Set at every hand-out, so it
+/// always speaks of the task now being polled; read by that task with
+/// [`quota_passed_urgent`].
+static QUOTA_PASSED: [AtomicBool; MAX_CORE_NUM] = [const { AtomicBool::new(false) }; MAX_CORE_NUM];
+
+pub(crate) fn note_quota_pick(cpu: usize, passed_urgent: bool) {
+    if let Some(flag) = QUOTA_PASSED.get(cpu) {
+        flag.store(passed_urgent, Ordering::Relaxed);
+    }
+}
+
+/// Whether the task being polled on this CPU was handed out by the yield
+/// lane's quota past a woken task that is waiting for the CPU. The kernel
+/// gives such a task a short turn (`kernel_hal::thread::preempt_behind`).
+pub fn quota_passed_urgent() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    QUOTA_PASSED
+        .get(cpu)
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
 /// Enable/disable direct hand-off. Called once at boot from the command line.
 pub fn set_handoff(enabled: bool) {
     HANDOFF.store(enabled, Ordering::Relaxed);
