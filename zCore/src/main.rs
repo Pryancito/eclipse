@@ -729,17 +729,41 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // What the buses left to userspace, now that they have been probed
+    // (`zcore_drivers::user`). The first virtio network card is left there
+    // without a word, since the kernel has no driver for one, and a device
+    // left to userspace needs the Zircon gateway to be claimed through: a
+    // machine that has such a card has it on, as a boot that names a device
+    // with `udriver=` has had it since before. `zircon.gateway=0` still
+    // wins, and then the card is not left at all.
+    #[cfg(feature = "linux")]
+    let left_to_userspace = kernel_hal::drivers::user::reserved();
+    #[cfg(feature = "linux")]
+    if !left_to_userspace.is_empty()
+        && !kernel_hal::cmdline::is_off(&options.cmdline, "zircon.gateway")
+    {
+        let already = kernel_hal::cmdline::flag(&options.cmdline, "zircon.gateway")
+            || kernel_hal::cmdline::value(&options.cmdline, "udriver")
+                .is_some_and(|devices| !devices.is_empty());
+        zcore_loader::linux::set_zircon_gateway(true);
+        if !already {
+            klog_info!(
+                "Eclipse: Zircon syscall gateway ENABLED ({} left to userspace)",
+                left_to_userspace.join(",")
+            );
+        }
+    }
     // Whose the machine's network is, now that the cards the kernel drives
-    // itself are known: see `linux_object::net::user_stack::boot`. A boot
-    // that leaves the first virtio network card to userspace
-    // (`udriver=virtio-net@0`) gives it to the stack that runs as a process,
-    // and on a machine with no other card every program's sockets are that
-    // stack's; `unetstack=kernel`, `unetuse=asked` and `unetuse=all` say
-    // otherwise.
+    // itself are known: see `linux_object::net::user_stack::boot`. The
+    // first virtio network card, left to userspace, goes to the stack that
+    // runs as a process, and on a machine with no other card every
+    // program's sockets are that stack's; `unetstack=kernel`,
+    // `unetstack=none`, `unetuse=asked` and `unetuse=all` say otherwise.
     #[cfg(feature = "linux")]
     {
         use linux_object::net::user_stack::{self, boot};
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
+        let card = left_to_userspace.iter().any(|left| left == boot::CARD);
         let unetuse = word("unetuse");
         if let Some(other) = unetuse.filter(|said| !boot::understood(said)) {
             klog_warn!(
@@ -752,7 +776,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             .iter()
             .filter(|card| !card.is_loopback())
             .count();
-        let whose = boot::whose(word("udriver"), word("unetstack"), unetuse, kernel_cards);
+        let whose = boot::whose(card, word("unetstack"), unetuse, kernel_cards);
         user_stack::use_for_all(whose.all());
         match whose {
             boot::Whose::AllSaid => klog_info!(

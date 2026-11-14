@@ -1,10 +1,12 @@
 //! The drivers that run as processes, and the boot services that run them.
 //!
-//! A device the kernel was told to leave alone (`udriver=<kind>@<N>` on its
-//! command line) is driven by a program in the image. Each is a boot
-//! service -- `unet`, `ublk` -- that `eclipse-init` starts only on a boot
-//! that left it a device (the `udriver =` key), watches, and starts again
-//! when it dies. The kernel keeps what the driver gave it meanwhile: the
+//! A device the kernel leaves alone -- one its command line names
+//! (`udriver=<kind>@<N>`), and the first virtio network card without a
+//! word, the kernel having no driver for it -- is driven by a program in
+//! the image. Each is a boot service -- `unet`, `ublk` -- that
+//! `eclipse-init` starts only on a boot that left it a device (the
+//! `udriver =` key, against the kernel's `/proc/udrivers`), watches, and
+//! starts again when it dies. The kernel keeps what the driver gave it meanwhile: the
 //! interface with its addresses and connections, the disk with what is
 //! mounted on it.
 //!
@@ -18,15 +20,18 @@
 //! a device left to userspace, and the service's wrapper says so.
 //!
 //! `eclipse-netstack` (`tools/eclipse-netstack`) is the network stack as a
-//! process, and what the `unet` service runs on a boot that leaves it the
-//! card (`udriver=virtio-net@0`): it is the card's driver itself, takes
+//! process, and what the `unet` service runs on a machine with a virtio
+//! network card: it is the card's driver itself, takes
 //! the card's frames instead of the kernel and asks a DHCP server for its
 //! address, or has the one the boot gives it (`unetstack=ADDR/PREFIX`).
 //! With `unetdriver=process` as well it runs `udrv-virtio-net` for the
 //! card, a process of its own. `unetstack=kernel` is the boot that keeps
 //! the kernel's stack: there the service runs the driver alone, which
-//! hands the card to the kernel. Whose sockets that stack's are is the
-//! kernel's to say (`linux_object::net::user_stack::boot`).
+//! hands the card to the kernel. `unetstack=none` is the boot where
+//! nothing of the system's takes the card: the kernel does not leave it
+//! unasked, and if the boot names it the service only waits, for a driver
+//! run by hand. Whose sockets that stack's are is the kernel's to say
+//! (`linux_object::net::user_stack::boot`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,7 +69,8 @@ const NETSTACK_USES: [&str; 2] = ["tools/eclipse-udrivers/src", "smoltcp/src"];
 /// `ublk-mounts`, which mounts what fstab puts on the served disk.
 ///
 /// `udriver =` keeps each out of every boot where the kernel drives the
-/// device itself, which is all of them unless the command line says
+/// device itself or the machine has none: a disk is left when the command
+/// line says so, and the first virtio network card unless it says
 /// otherwise. Supervised: when a driver dies the kernel resets its device
 /// and init starts the next one at once.
 ///
@@ -75,9 +81,10 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     // The card: the first one, which is what `network` is ordered after.
     fs::write(
         svc_dir.join("unet.service"),
-        b"# The network card left to userspace (boot with\n\
-          # udriver=virtio-net@0): the network stack that runs as a process,\n\
-          # or the card's driver alone. See /usr/local/bin/eclipse-unet.\n\
+        b"# The virtio network card, which the kernel leaves to userspace\n\
+          # (it has no driver for it): the network stack that runs as a\n\
+          # process, or the card's driver alone. See\n\
+          # /usr/local/bin/eclipse-unet.\n\
           exec = /usr/local/bin/eclipse-unet\n\
           type = respawn\n\
           udriver = virtio-net@0\n",
@@ -86,9 +93,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     fs::write(
         localbin.join("eclipse-unet"),
         b"#!/bin/sh\n\
-          # Eclipse OS: what drives the network card the kernel left alone\n\
-          # (udriver=virtio-net@0), in the foreground for eclipse-init,\n\
-          # which starts it again if it dies. See tools/eclipse-udrivers.\n\
+          # Eclipse OS: what drives the virtio network card, which the\n\
+          # kernel leaves alone, in the foreground for eclipse-init, which\n\
+          # starts it again if it dies. See tools/eclipse-udrivers.\n\
           # The driver is the Rust one and only that one: the C tool's own\n\
           # driver is for checking and timing, never the system's.\n\
           [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
@@ -100,9 +107,16 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # unetstack=ADDR/PREFIX,GATEWAY a gateway too.\n\
           # unetstack=kernel: the card is for the kernel's own stack, and\n\
           # what runs here is its driver alone.\n\
+          # unetstack=none: nothing of the system's takes the card. The\n\
+          # kernel leaves it only if udriver=virtio-net@0 says so, and then\n\
+          # it is for a driver run by hand: this only waits.\n\
           words=$(tr ': ' '\\n\\n' < /proc/cmdline)\n\
           stack=$(echo \"$words\" | sed -n 's/^unetstack=//p' | head -n 1)\n\
           [ -n \"$stack\" ] || stack=dhcp\n\
+          if [ \"$stack\" = none ]; then\n\
+          \x20   while sleep 86400; do :; done\n\
+          \x20   exit 0\n\
+          fi\n\
           if [ \"$stack\" != kernel ]; then\n\
           \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           \x20   # unetdriver=process: the driver in a process of its own, which\n\

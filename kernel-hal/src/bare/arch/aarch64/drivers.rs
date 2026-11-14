@@ -39,7 +39,9 @@ pub fn init() {
     // firmware boot disk is not guaranteed to occupy the first one.  A block
     // device is optional (the Zircon ZBI is linked into the kernel), so do not
     // abort boot when this slot is empty.
-    zcore_drivers::user::set_reservation(crate::cmdline::value(&super::cmdline(), "udriver"));
+    let cmdline = super::cmdline();
+    let (udriver, net_by_default) = crate::cmdline::user_devices(&cmdline);
+    zcore_drivers::user::set_reservation(udriver, net_by_default);
     let slot0 = unsafe { &mut *(phys_to_virt(VIRTIO_BASE) as *mut VirtIOHeader) };
     if !reserved_for_userspace(slot0, 0) {
         if let Ok(virtio_blk) = VirtIoBlk::new(slot0) {

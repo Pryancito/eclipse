@@ -405,8 +405,9 @@ struct Service {
     /// session-bus probe only on a boot that asked for it.
     cmdline: Option<String>,
     /// If set (`virtio-net@0`), the service starts only when the kernel
-    /// command line leaves that device to a userspace driver: `udriver=`
-    /// names it, alone or among others. Without a number (`virtio-blk`), any
+    /// left that device to a userspace driver: its `/proc/udrivers` lists
+    /// it, because `udriver=` on the command line names it or because the
+    /// kernel leaves it unasked. Without a number (`virtio-blk`), any
     /// device of that kind. It is how a driver ships in every
     /// image and runs only on the boots where the kernel stood back from its
     /// device -- on any other the device is the kernel's, or not there, and
@@ -924,18 +925,19 @@ fn main() {
     // `udriver = <device>`: a driver for a device the kernel left to
     // userspace runs only on a boot where it did.
     let boot_cmdline = read_cmdline();
+    let left = fs::read_to_string("/proc/udrivers").ok();
     // What stays drives the device the list names: that is what the state
     // file says of it.
     services.retain(|name, s| match s.udriver.as_deref() {
         None => true,
-        Some(device) => match cmdline_udriver_device(&boot_cmdline, device) {
+        Some(device) => match udriver_device(left.as_deref(), &boot_cmdline, device) {
             Some(listed) => {
                 s.udriver = Some(listed.to_string());
                 true
             }
             None => {
                 log(&format!(
-                    "{name}: skipped (needs 'udriver={device}' on the kernel cmdline)"
+                    "{name}: skipped (the kernel left no '{device}' to userspace; 'udriver={device}' on its cmdline asks for it)"
                 ));
                 false
             }
@@ -2695,9 +2697,28 @@ fn cmdline_udriver_in(cmdline: &str, device: &str) -> bool {
 /// (`virtio-blk@1`), which is the one the service's driver takes. What the
 /// state file says the service drives.
 fn cmdline_udriver_device<'a>(cmdline: &'a str, device: &str) -> Option<&'a str> {
-    cmdline_value(cmdline, "udriver=")?.split(',').find(|d| {
+    device_among(cmdline_value(cmdline, "udriver=")?.split(','), device)
+}
+
+/// The one of `devices` (`virtio-blk@1`, `virtio-net@0`) that `device`
+/// names: itself, or for a bare kind the first of that kind.
+fn device_among<'a>(mut devices: impl Iterator<Item = &'a str>, device: &str) -> Option<&'a str> {
+    devices.find(|d| {
         *d == device || (!device.contains('@') && d.split_once('@').map(|(kind, _)| kind) == Some(device))
     })
+}
+
+/// The device the kernel left to userspace that `device` names, which is
+/// what a service with `udriver = <device>` waits for. `left` is the
+/// kernel's own list, `/proc/udrivers`, one device to a line: the devices it
+/// stood back from and that are there, named on the command line or not (the
+/// first virtio network card is left without a word, the kernel having no
+/// driver for it). A kernel with no such file says it with `udriver=` alone.
+fn udriver_device<'a>(left: Option<&'a str>, cmdline: &'a str, device: &str) -> Option<&'a str> {
+    match left {
+        Some(left) => device_among(left.lines().map(str::trim), device),
+        None => cmdline_udriver_device(cmdline, device),
+    }
 }
 
 /// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the

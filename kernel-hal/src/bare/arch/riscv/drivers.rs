@@ -81,7 +81,9 @@ pub(super) fn init() -> DeviceResult {
         }
     }
     // Before the probe: a disk it finds may be one to leave alone.
-    zcore_drivers::user::set_reservation(crate::cmdline::value(&super::cmdline(), "udriver"));
+    let cmdline = super::cmdline();
+    let (udriver, net_by_default) = crate::cmdline::user_devices(&cmdline);
+    zcore_drivers::user::set_reservation(udriver, net_by_default);
     // prase DTB and probe devices
     let dev_list =
         DevicetreeDriverBuilder::new(phys_to_virt(crate::KCONFIG.dtb_paddr), IoMapperImpl)?

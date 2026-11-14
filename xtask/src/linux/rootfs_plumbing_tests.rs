@@ -1041,6 +1041,7 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         "[ -x /bin/eclipse-netstack ] ||",
         "exec /bin/eclipse-netstack 0 \"$stack\"",
         "exec /bin/udrv-virtio-net 0",
+        "while sleep 86400; do :; done",
     ] {
         assert_eq!(
             script.matches(needle).count(),
@@ -1057,7 +1058,8 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
             .replace("[ -x /bin/udrv-virtio-net ] ||", "true ||")
             .replace("[ -x /bin/eclipse-netstack ] ||", "true ||")
             .replace("exec /bin/eclipse-netstack", "exec echo stack")
-            .replace("exec /bin/udrv-virtio-net", "exec echo driver");
+            .replace("exec /bin/udrv-virtio-net", "exec echo driver")
+            .replace("while sleep 86400; do :; done", "echo waits");
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
@@ -1134,6 +1136,15 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         run("LOG=warn:udriver=virtio-net@0:unetstack=kernels\n"),
         "stack 0 kernels\n"
     );
+    // `unetstack=none`: the card the boot named is for a driver run by
+    // hand, and the service runs none; it waits, so that init does not
+    // start it again and again.
+    for cmdline in [
+        "LOG=warn:udriver=virtio-net@0:unetstack=none:ROOT=/dev/vda\n",
+        "LOG=warn udriver=virtio-net@0 unetdriver=process unetstack=none\n",
+    ] {
+        assert_eq!(run(cmdline), "waits\n", "{cmdline:?}");
+    }
 }
 
 /// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run
