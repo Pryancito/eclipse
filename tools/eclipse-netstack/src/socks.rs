@@ -92,6 +92,7 @@ use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address};
 
 pub mod groups;
 pub mod icmp6;
+pub mod isn;
 pub mod lease;
 pub mod six;
 pub mod tcp;
