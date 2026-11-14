@@ -1079,6 +1079,24 @@ fn the_cards_wrapper_runs_the_stack_only_on_a_boot_that_names_its_address() {
             "10.0.9.15/24,10.0.9.2",
         ),
         ("LOG=warn udriver=virtio-net@0 unetstack=dhcp\n", "dhcp"),
+        // The stack is the card's driver unless the boot wants the driver
+        // in a process of its own, and says so with this very word.
+        (
+            "LOG=warn:udriver=virtio-net@0:unetstack=dhcp:unetdriver=process\n",
+            "dhcp driver=process",
+        ),
+        (
+            "LOG=warn udriver=virtio-net@0 unetdriver=process unetstack=10.0.9.15/24\n",
+            "10.0.9.15/24 driver=process",
+        ),
+        (
+            "LOG=warn:udriver=virtio-net@0:unetstack=dhcp:unetdriver=own\n",
+            "dhcp",
+        ),
+        (
+            "LOG=warn:udriver=virtio-net@0:unetstack=dhcp:notunetdriver=process\n",
+            "dhcp",
+        ),
     ] {
         assert_eq!(run(cmdline), format!("stack 0 {word}\n"), "{cmdline}");
     }

@@ -26,13 +26,10 @@
 use std::process::exit;
 
 use udrivers::channel::Channel;
-use udrivers::claim::{self, Dma};
 use udrivers::fifo::Fifo;
-use udrivers::net::{self, Card, Feeder, Msg, Offer};
-use udrivers::queue::Queue;
+use udrivers::net::{self, Msg, NoCard, Offer};
 use udrivers::status;
-use udrivers::virtio::{self, Device, Setup};
-use udrivers::zx::{self, nr, Status};
+use udrivers::zx::{self, nr};
 
 const NAME: &str = "udrv-virtio-net";
 const USAGE: &str = "usage: udrv-virtio-net [N [REPORT_FD | stack=FD]]";
@@ -71,74 +68,29 @@ fn main() {
         },
     };
 
-    // The driver before this one may have died a moment ago: three seconds
-    // of patience.
-    let claim = match claim::claim(claim::KIND_VIRTIO_NET, index, 300) {
-        Ok(claim) => claim,
-        Err(Status::NO_GATEWAY) => {
-            println!("{NAME}: the gateway is off (zircon.gateway=0 on the command line?)");
-            exit(2);
-        }
-        Err(e) => die(format_args!(
-            "claim (boot with udriver=virtio-net@N and a card there): {e}"
-        )),
-    };
-    let Some(transport) = claim.transport else {
-        die("unknown transport");
-    };
-    let regs = claim.map_regs().unwrap_or_else(|e| die(e));
     // The slots are also the kernel's window: it copies a frame out of a
     // receive slot and into a transmit slot, and the card reads and writes
     // them where they are.
-    let dma = Dma::new(
-        claim.bti,
-        net::DMA_SIZE,
-        Some((net::DMA_WIN, net::WIN_SIZE)),
-    )
-    .unwrap_or_else(|e| die(e));
-    let window = dma.window.expect("asked for above");
-
-    // SAFETY: `regs` is the claimed device's window, mapped for good.
-    let mut device = unsafe { Device::new(regs, transport) };
-    // Both queues raise the interrupt: a frame the card has sent gives its
-    // slot back to the kernel.
-    let irq = claim.interrupt.is_some();
-    let up = device
-        .bring_up(&Setup {
-            device_id: virtio::ID_NET,
-            want: 0,
-            need: net::F_MAC,
-            queue_size: net::QUEUE_SIZE,
-            queues: &[
-                (dma.daddr + net::dma_queue(net::RXQ) as u64, irq),
-                (dma.daddr + net::dma_queue(net::TXQ) as u64, irq),
-            ],
-        })
-        .unwrap_or_else(|e| die(e));
-    let mut mac = [0u8; 6];
-    for (i, byte) in mac.iter_mut().enumerate() {
-        *byte = device.config8(i as u32);
-    }
-    device.driver_ok();
-    let interrupt = if up.irq_refused {
-        println!("{NAME}: the device refused MSI-X vector 0; polling");
-        None
-    } else {
-        claim.interrupt
+    let net::Driven {
+        device,
+        mut feeder,
+        mut card,
+        interrupt,
+        irq_refused,
+        mac,
+        dma,
+    } = match net::drive(index, true) {
+        Ok(driven) => driven,
+        Err(NoCard::NoGateway) => {
+            println!("{NAME}: the gateway is off (zircon.gateway=0 on the command line?)");
+            exit(2);
+        }
+        Err(NoCard::Other(e)) => die(e),
     };
-
-    // SAFETY: each queue's two pages of the DMA memory, zeroed, mapped for
-    // good and nobody else's.
-    let (rx_offers, rx_answers) =
-        unsafe { Queue::new(dma.ptr.add(net::dma_queue(net::RXQ)), net::QUEUE_SIZE) }.split();
-    let (tx_offers, tx_answers) =
-        unsafe { Queue::new(dma.ptr.add(net::dma_queue(net::TXQ)), net::QUEUE_SIZE) }.split();
-    let header = net::header_len(transport);
-    // SAFETY: `dma` is DMA_SIZE bytes the device sees at `daddr`, mapped for
-    // good; the halves are of the queues in it.
-    let mut feeder = unsafe { Feeder::new(rx_offers, tx_offers, dma.ptr, dma.daddr, header) };
-    let mut card = Card::new(rx_answers, tx_answers, header);
-    feeder.fill(&device);
+    let window = dma.window.expect("asked for above");
+    if irq_refused {
+        println!("{NAME}: the device refused MSI-X vector 0; polling");
+    }
 
     let (fifo, kernels) = Fifo::<Msg>::create(net::FIFO_DEPTH)
         .unwrap_or_else(|e| die(format_args!("fifo_create: {e}")));

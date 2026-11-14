@@ -23,6 +23,13 @@
 //! rings ([`Feeder`]). Neither can find the FIFO full: it holds as many
 //! messages as there are slots.
 //!
+//! A stack that is the card's driver itself has no FIFO and no second
+//! process: it brings the card up as this driver does ([`drive`]) and
+//! its own threads call the two sides, with the same messages
+//! ([`Card::collect`] for what the card did, [`Feeder::give`] for what it
+//! is to do). The slots are then the stack's and the card's and nobody
+//! else's.
+//!
 //! How the two threads are created matters, because the kernel's scheduler
 //! comes to them in that order. Measured on 32 MiB downloads over TCP at
 //! one CPU, against the C driver this one replaced (1.83 s):
@@ -41,10 +48,10 @@
 
 use core::ptr;
 
-use crate::claim;
+use crate::claim::{self, Dma};
 use crate::fifo::{Fifo, Message};
-use crate::queue::{Answers, Desc, Offers, DESC_F_WRITE};
-use crate::virtio::{Device, Transport};
+use crate::queue::{Answers, Desc, Offers, Queue, DESC_F_WRITE};
+use crate::virtio::{self, Device, Setup, Transport};
 use crate::zx::{Handle, Status};
 use crate::PAGE;
 
@@ -92,7 +99,9 @@ pub const OP_RX: u32 = 1;
 pub const OP_TX: u32 = 2;
 /// Messages the FIFO holds each way: one per slot, and room.
 pub const FIFO_DEPTH: usize = 128;
-const SLOTS: usize = RX_BUFS + TX_BUFS;
+/// The slots of the window, which is the most messages there can be at
+/// once: no slot is in two.
+pub const SLOTS: usize = RX_BUFS + TX_BUFS;
 const _: () = assert!(SLOTS <= FIFO_DEPTH);
 
 /// One FIFO element.
@@ -250,6 +259,112 @@ pub fn received(id: u32, len: u32, header: usize) -> Option<Msg> {
     })
 }
 
+/// A card this process drives: claimed, brought up, and holding every
+/// receive slot. What `udrv-virtio-net` then serves to the kernel or to a
+/// stack over a FIFO, and what a stack that is its own driver
+/// (`tools/eclipse-netstack`) reads and fills itself.
+pub struct Driven {
+    pub device: Device,
+    pub feeder: Feeder,
+    pub card: Card,
+    /// The card's interrupt to sleep on, or `None` where there is none and
+    /// the card has to be looked at.
+    pub interrupt: Option<Handle>,
+    /// Whether the card had an interrupt and refused it (MSI-X vector 0),
+    /// which is why there is none above.
+    pub irq_refused: bool,
+    pub mac: [u8; 6],
+    /// The DMA memory: each queue's pages, then the window ([`DMA_WIN`]).
+    /// Its `window` is the handle asked for in [`drive`].
+    pub dma: Dma,
+}
+
+/// Why [`drive`] has no card.
+#[derive(Debug)]
+pub enum NoCard {
+    /// The Zircon gateway is off.
+    NoGateway,
+    Other(String),
+}
+
+/// Claim virtio network card `index` and bring it up, with all its receive
+/// slots given to it. `window` is whether the slots are also cut out as a
+/// VMO of their own, to hand to whoever takes the frames from another
+/// process.
+///
+/// The driver before this one may have died a moment ago, and the kernel
+/// is resetting the card: three seconds of patience.
+pub fn drive(index: usize, window: bool) -> Result<Driven, NoCard> {
+    let other = |e: String| NoCard::Other(e);
+    let claim = match claim::claim(claim::KIND_VIRTIO_NET, index, 300) {
+        Ok(claim) => claim,
+        Err(Status::NO_GATEWAY) => return Err(NoCard::NoGateway),
+        Err(e) => {
+            return Err(other(format!(
+                "claim (boot with udriver=virtio-net@N and a card there): {e}"
+            )))
+        }
+    };
+    let Some(transport) = claim.transport else {
+        return Err(other("unknown transport".into()));
+    };
+    let regs = claim.map_regs().map_err(other)?;
+    // The slots are where the card reads and writes the frames, and where
+    // whoever takes them reads and writes them too: nothing is copied.
+    let dma =
+        Dma::new(claim.bti, DMA_SIZE, window.then_some((DMA_WIN, WIN_SIZE))).map_err(other)?;
+
+    // SAFETY: `regs` is the claimed device's window, mapped for good.
+    let mut device = unsafe { Device::new(regs, transport) };
+    // Both queues raise the interrupt: a frame the card has sent gives its
+    // slot back.
+    let irq = claim.interrupt.is_some();
+    let up = device
+        .bring_up(&Setup {
+            device_id: virtio::ID_NET,
+            want: 0,
+            need: F_MAC,
+            queue_size: QUEUE_SIZE,
+            queues: &[
+                (dma.daddr + dma_queue(RXQ) as u64, irq),
+                (dma.daddr + dma_queue(TXQ) as u64, irq),
+            ],
+        })
+        .map_err(other)?;
+    let mut mac = [0u8; 6];
+    for (i, byte) in mac.iter_mut().enumerate() {
+        *byte = device.config8(i as u32);
+    }
+    device.driver_ok();
+    let interrupt = if up.irq_refused {
+        None
+    } else {
+        claim.interrupt
+    };
+
+    // SAFETY: each queue's two pages of the DMA memory, zeroed, mapped for
+    // good and nobody else's.
+    let (rx_offers, rx_answers) =
+        unsafe { Queue::new(dma.ptr.add(dma_queue(RXQ)), QUEUE_SIZE) }.split();
+    let (tx_offers, tx_answers) =
+        unsafe { Queue::new(dma.ptr.add(dma_queue(TXQ)), QUEUE_SIZE) }.split();
+    let header = header_len(transport);
+    // SAFETY: `dma` is DMA_SIZE bytes the device sees at `daddr`, mapped for
+    // good; the halves are of the queues in it.
+    let mut feeder = unsafe { Feeder::new(rx_offers, tx_offers, dma.ptr, dma.daddr, header) };
+    let card = Card::new(rx_answers, tx_answers, header);
+    feeder.fill(&device);
+    Ok(Driven {
+        device,
+        feeder,
+        card,
+        interrupt,
+        irq_refused: up.irq_refused,
+        mac,
+        dma,
+    })
+}
+
 /// The side that gives the card its buffers: the receive slots the kernel
 /// has emptied and the frames it wants sent.
 pub struct Feeder {
@@ -297,7 +412,7 @@ impl Feeder {
     ///
     /// Each buffer is the card's at once, as in the C driver. Publishing
     /// them all at the end was measured and is no faster.
-    fn give(&mut self, msgs: &[Msg]) -> Result<(bool, bool), Msg> {
+    pub fn give(&mut self, msgs: &[Msg]) -> Result<(bool, bool), Msg> {
         let (mut rx, mut tx) = (false, false);
         for m in msgs {
             match ask(m).ok_or(*m)? {
@@ -383,7 +498,7 @@ impl Card {
 
     /// What the card has finished, as the messages that tell the kernel:
     /// how many. At most a ring's worth of each, which is all there can be.
-    fn collect(&mut self, out: &mut [Msg; SLOTS]) -> Result<usize, String> {
+    pub fn collect(&mut self, out: &mut [Msg; SLOTS]) -> Result<usize, String> {
         let mut n = 0;
         while n < RX_BUFS {
             let Some((id, len)) = self.rx.take_used() else {
