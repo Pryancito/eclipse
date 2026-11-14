@@ -18,7 +18,9 @@
 //!
 //! - The window is the borrower's own memory. The kernel copies a frame
 //!   into a receive slot, or out of a transmit slot, during the borrower's
-//!   call, where that memory is at hand.
+//!   call, where that memory is at hand. The window is checked once a
+//!   call, not once a frame, and a frame to send goes from its slot to the
+//!   card with no copy of its own when nothing waits before it.
 //! - There is no FIFO and nobody to wake for a frame to send. One call is a
 //!   turn: it gives the kernel its messages -- `OP_RX`, a receive slot the
 //!   borrower has read; `OP_TX`, a frame to send, which goes to the card
@@ -200,14 +202,13 @@ impl LentCard {
         }
     }
 
-    /// A message from the borrower. `frame` reads the frame of an `OP_TX`
-    /// out of the window: `len` bytes, `at` bytes in. A message that means
-    /// nothing is dropped.
-    pub(super) fn given(
-        &self,
-        (op, slot, len, off): (u32, u32, u32, u32),
-        frame: impl FnOnce(usize, usize) -> Option<Vec<u8>>,
-    ) {
+    /// A message from the borrower. The frame of an `OP_TX` is in
+    /// `window`, the borrower's, when it could be had: `len` bytes from
+    /// `off` into the transmit slot, which is past the receive slots. It
+    /// goes to the card now when nothing waits before it
+    /// ([`send_now`](Self::send_now)), and waits, copied, when it cannot. A
+    /// message that means nothing is dropped.
+    pub(super) fn given(&self, (op, slot, len, off): (u32, u32, u32, u32), window: Option<&[u8]>) {
         let at = slot as usize;
         match op {
             OP_RX => {
@@ -233,17 +234,47 @@ impl LentCard {
                     }
                     state.tx_busy |= 1 << at;
                 }
-                let frame = frame((self.rx_slots + at) * SLOT + off, len);
-                let mut state = self.state.lock();
-                match frame {
-                    Some(frame) => state.tx_waiting.push_back((slot, frame)),
+                let start = (self.rx_slots + at) * SLOT + off;
+                let Some(frame) = window.and_then(|window| window.get(start..start + len)) else {
                     // Nothing could be read there, so nothing is sent: the
                     // slot goes back all the same.
-                    None => state.tx_done.push_back(slot),
+                    self.state.lock().tx_done.push_back(slot);
+                    return;
+                };
+                if !self.send_now(slot, frame) {
+                    self.state
+                        .lock()
+                        .tx_waiting
+                        .push_back((slot, frame.to_vec()));
                 }
             }
             _ => warn!("lent card: a message that means nothing ({op}, {slot})"),
         }
+    }
+
+    /// Give the card `frame`, of `slot`, straight from where it is: whether
+    /// it is done with, sent or refused for good. Not when another is
+    /// sending or a frame waits, which would go after it, nor when the card
+    /// has no room: then it is the caller's to keep.
+    fn send_now(&self, slot: u32, frame: &[u8]) -> bool {
+        if self.sending.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let done = self.state.lock().tx_waiting.is_empty()
+            && match self.card.send(frame) {
+                Ok(_) => true,
+                Err(DeviceError::NotReady) => false,
+                // As in `flush`: a frame the card will never take is lost.
+                Err(e) => {
+                    warn!("lent card: a frame the card refused ({e:?})");
+                    true
+                }
+            };
+        if done {
+            self.state.lock().tx_done.push_back(slot);
+        }
+        self.sending.store(false, Ordering::Release);
+        done
     }
 
     /// Send what waits, in order, as far as the card takes it.
@@ -466,12 +497,13 @@ pub(super) fn give_then(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Turn
         let bytes: Vec<u8> = UserInPtr::<u8>::from(msgs)
             .read_array(give * NET_MSG)
             .map_err(|_| ZxError::INVALID_ARGS)?;
+        // The whole window, looked at once for the call. A window that is
+        // not all there sends nothing, and every slot comes back.
+        let window = UserInPtr::<u8>::from(card.window)
+            .as_slice(card.slots() * SLOT)
+            .ok();
         for m in bytes.as_chunks::<NET_MSG>().0 {
-            card.given(decode(m), |at, len| {
-                UserInPtr::<u8>::from(card.window.checked_add(at)?)
-                    .read_array(len)
-                    .ok()
-            });
+            card.given(decode(m), window);
         }
         card.flush();
         card.tell();
@@ -492,14 +524,26 @@ impl Turn {
         let frames = self.flags & LENT_FRAMES != 0;
         let mut out: Vec<u8> = Vec::new();
         loop {
+            // The receive slots, looked at once for what this pass puts in
+            // them, and only when it may put a frame there.
+            let mut slots = None;
+            if frames {
+                slots = UserOutPtr::<u8>::from(self.card.window)
+                    .as_mut_slice(self.card.rx_slots * SLOT)
+                    .ok();
+            }
             while out.len() < self.room * NET_MSG {
                 match self.card.next(frames) {
                     Some(Answer::Sent(slot)) => out.extend_from_slice(&encode(OP_TX, slot, 0, 0)),
                     Some(Answer::Frame(slot, frame)) => {
                         let at = slot as usize * SLOT;
-                        let put = self.card.window.checked_add(at).is_some_and(|place| {
-                            UserOutPtr::<u8>::from(place).write_array(&frame).is_ok()
-                        });
+                        let place = slots
+                            .as_deref_mut()
+                            .and_then(|slots| slots.get_mut(at..at + frame.len()));
+                        let put = place.is_some();
+                        if let Some(place) = place {
+                            place.copy_from_slice(&frame);
+                        }
                         if !put {
                             self.card.unheld(slot);
                             self.card.tell();
@@ -580,6 +624,22 @@ mod tests {
         alloc::vec![mark; len]
     }
 
+    /// A borrower's window for `card`, zero but for these frames to send:
+    /// each `(slot, mark, len)` at the place a message `(OP_TX, slot, len,
+    /// 16)` names.
+    fn window(card: &LentCard, frames: &[(u32, u8, usize)]) -> Vec<u8> {
+        let mut window = alloc::vec![0; card.slots() * SLOT];
+        for &(slot, mark, len) in frames {
+            put(card, &mut window, slot, mark, len);
+        }
+        window
+    }
+
+    fn put(card: &LentCard, window: &mut [u8], slot: u32, mark: u8, len: usize) {
+        let at = (card.rx_slots + slot as usize) * SLOT + 16;
+        window[at..at + len].copy_from_slice(&frame(mark, len));
+    }
+
     #[test]
     fn a_window_has_some_slots_on_each_side_and_not_too_many() {
         let wire = Wire::with_room(0);
@@ -610,7 +670,7 @@ mod tests {
         assert_eq!(card.next(true), None);
         assert!(!ready(&card));
         // A slot given back is where it goes.
-        card.given((OP_RX, 1, 0, 0), |_, _| None);
+        card.given((OP_RX, 1, 0, 0), None);
         assert!(ready(&card));
         assert_eq!(card.next(true), Some(Answer::Frame(1, frame(3, 60))));
         assert!(!ready(&card));
@@ -621,16 +681,16 @@ mod tests {
         let wire = Wire::with_room(0);
         let card = lent(&wire, 2, 1);
         // Never held, and no such slot.
-        card.given((OP_RX, 0, 0, 0), |_, _| None);
-        card.given((OP_RX, 9, 0, 0), |_, _| None);
+        card.given((OP_RX, 0, 0, 0), None);
+        card.given((OP_RX, 9, 0, 0), None);
         card.arrived(frame(1, 60));
         card.arrived(frame(2, 60));
         card.arrived(frame(3, 60));
         assert_eq!(card.next(true), Some(Answer::Frame(0, frame(1, 60))));
         assert_eq!(card.next(true), Some(Answer::Frame(1, frame(2, 60))));
         // Given back twice: one frame goes there, not two.
-        card.given((OP_RX, 0, 0, 0), |_, _| None);
-        card.given((OP_RX, 0, 0, 0), |_, _| None);
+        card.given((OP_RX, 0, 0, 0), None);
+        card.given((OP_RX, 0, 0, 0), None);
         assert_eq!(card.next(true), Some(Answer::Frame(0, frame(3, 60))));
         card.arrived(frame(4, 60));
         assert_eq!(card.next(true), None);
@@ -640,15 +700,11 @@ mod tests {
     fn a_frame_to_send_goes_to_the_card_at_once_and_its_slot_comes_back() {
         let wire = Wire::with_room(8);
         let card = lent(&wire, 2, 4);
-        let mut asked = None;
-        card.given((OP_TX, 3, 100, 16), |at, len| {
-            asked = Some((at, len));
-            Some(frame(7, len))
-        });
         // The frame is read where the message says: past the receive
-        // slots, in its own, after the headroom.
-        assert_eq!(asked, Some(((2 + 3) * SLOT + 16, 100)));
-        card.flush();
+        // slots, in its own, after the headroom. It is on the card before
+        // anything is flushed.
+        let mut window = window(&card, &[(3, 7, 100)]);
+        card.given((OP_TX, 3, 100, 16), Some(&window));
         assert_eq!(*wire.sent.lock(), [frame(7, 100)]);
         assert!(ready(&card));
         // A turn that takes no frames is still told of its slots.
@@ -656,29 +712,33 @@ mod tests {
         assert_eq!(card.next(false), None);
         assert!(!ready(&card));
         // And the slot can be used again.
-        card.given((OP_TX, 3, 60, 16), |_, len| Some(frame(8, len)));
-        card.flush();
-        assert_eq!(wire.sent.lock().len(), 2);
+        put(&card, &mut window, 3, 8, 60);
+        card.given((OP_TX, 3, 60, 16), Some(&window));
+        assert_eq!(*wire.sent.lock(), [frame(7, 100), frame(8, 60)]);
     }
 
     #[test]
     fn frames_the_card_has_no_room_for_wait_and_go_in_order() {
         let wire = Wire::with_room(1);
         let card = lent(&wire, 1, 4);
-        for slot in 0..3 {
-            card.given((OP_TX, slot, 60, 16), |_, len| Some(frame(slot as u8, len)));
-        }
+        let mut window = window(&card, &[(0, 0, 60), (1, 1, 60), (2, 2, 60)]);
+        card.given((OP_TX, 0, 60, 16), Some(&window));
+        card.given((OP_TX, 1, 60, 16), Some(&window));
         card.flush();
-        // One went; the others wait, and their slots are not free.
+        // One went; the other waits, and its slot is not free.
         assert_eq!(*wire.sent.lock(), [frame(0, 60)]);
         assert_eq!(card.next(false), Some(Answer::Sent(0)));
         assert_eq!(card.next(false), None);
+        // What waits was copied: the borrower may write over its slot.
+        put(&card, &mut window, 1, 0xee, 60);
         // A slot whose frame waits cannot be given again.
-        card.given((OP_TX, 1, 60, 16), |_, _| {
-            panic!("read for a slot that is busy")
-        });
-        // The card is through with something: the rest go, in order.
+        card.given((OP_TX, 1, 60, 16), Some(&window));
+        // The card has room again, and a frame that comes now does not go
+        // before the one that waits.
         *wire.room.lock() = 8;
+        card.given((OP_TX, 2, 60, 16), Some(&window));
+        assert_eq!(*wire.sent.lock(), [frame(0, 60)]);
+        // The card is through with something: the rest go, in order.
         card.flush();
         assert_eq!(
             *wire.sent.lock(),
@@ -693,21 +753,25 @@ mod tests {
     fn a_frame_to_send_outside_its_slot_is_dropped() {
         let wire = Wire::with_room(8);
         let card = lent(&wire, 1, 2);
-        let never = |_: usize, _: usize| -> Option<Vec<u8>> { panic!("read outside a slot") };
-        card.given((OP_TX, 2, 60, 16), never);
-        card.given((OP_TX, 0, 0, 16), never);
-        card.given((OP_TX, 0, 1515, 16), never);
-        card.given((OP_TX, 0, 1514, 600), never);
-        card.given((OP_TX, 0, 60, u32::MAX), never);
-        card.given((7, 0, 60, 16), never);
+        let window = window(&card, &[(0, 1, 60), (1, 1, 60)]);
+        let at = Some(&window[..]);
+        card.given((OP_TX, 2, 60, 16), at);
+        card.given((OP_TX, 0, 0, 16), at);
+        card.given((OP_TX, 0, 1515, 16), at);
+        card.given((OP_TX, 0, 1514, 600), at);
+        card.given((OP_TX, 0, 60, u32::MAX), at);
+        card.given((7, 0, 60, 16), at);
         card.flush();
         assert!(wire.sent.lock().is_empty());
         assert_eq!(card.next(false), None);
-        // A frame that cannot be read is not sent, and its slot comes back.
-        card.given((OP_TX, 1, 60, 16), |_, _| None);
+        // A frame that cannot be read is not sent, and its slot comes back:
+        // no window, or one too short for the slot.
+        card.given((OP_TX, 1, 60, 16), None);
+        card.given((OP_TX, 0, 60, 16), Some(&window[..SLOT + 40]));
         card.flush();
         assert!(wire.sent.lock().is_empty());
         assert_eq!(card.next(false), Some(Answer::Sent(1)));
+        assert_eq!(card.next(false), Some(Answer::Sent(0)));
     }
 
     #[test]
@@ -731,8 +795,9 @@ mod tests {
         let card = lent(&wire, 2, 2);
         let taker = Taker(Arc::new(lock::Mutex::new(Arc::downgrade(&card))));
         // A frame waits for room on the card.
-        card.given((OP_TX, 0, 60, 16), |_, len| Some(frame(1, len)));
-        card.given((OP_TX, 1, 60, 16), |_, len| Some(frame(2, len)));
+        let window = window(&card, &[(0, 1, 60), (1, 2, 60)]);
+        card.given((OP_TX, 0, 60, 16), Some(&window));
+        card.given((OP_TX, 1, 60, 16), Some(&window));
         card.flush();
         assert_eq!(wire.sent.lock().len(), 1);
         // The driver's word that it is through sends it, and calls the
