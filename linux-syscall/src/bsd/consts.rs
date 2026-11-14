@@ -236,6 +236,7 @@ pub mod errno {
     pub const EILSEQ: i32 = 86;
     pub const ENOATTR: i32 = 87;
     pub const EBADMSG: i32 = 89;
+    pub const EPROTO: i32 = 92;
     pub const ENOTRECOVERABLE: i32 = 95;
     pub const EOWNERDEAD: i32 = 96;
     /// Largest `errno` FreeBSD defines. Anything above it is not an error

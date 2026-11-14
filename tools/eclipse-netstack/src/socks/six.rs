@@ -45,6 +45,7 @@ use smoltcp::wire::{
     Ipv6Address, Ipv6Cidr, Ipv6Packet, Ipv6Repr, NdiscRepr,
 };
 
+use super::undelivered::{nowhere6, Undelivered6};
 use super::{Stack, HEADER_LEN};
 
 /// The message that says the card's IPv6 addresses.
@@ -358,17 +359,32 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             return;
         };
         loop {
-            let said = match self.set.get::<RawSocket>(ear).recv() {
+            let (said, lost) = match self.set.get::<RawSocket>(ear).recv() {
                 Ok(packet) => {
                     // All of it is the kernel's to hear, while a socket
                     // of ICMPv6 does.
                     self.hearing6.keep(packet);
-                    advert(packet)
+                    (advert(packet), Undelivered6::of(packet))
                 }
                 Err(_) => break,
             };
             if let Some(said) = said {
                 self.six_heard(&said);
+            }
+            // Heard or not, what says that something this stack sent was
+            // not delivered is told to the kernel.
+            if let Some(lost) = lost {
+                self.undelivered6(&lost);
+            }
+        }
+        // What had nowhere to go, because its neighbour is asked for and
+        // does not answer: this host says so to itself, and that is heard
+        // and read like what a router says.
+        while let Some(quoted) = self.iface.unreached6() {
+            let packet = nowhere6(&quoted);
+            self.hearing6.keep(&packet);
+            if let Some(lost) = Undelivered6::of(&packet) {
+                self.undelivered6(&lost);
             }
         }
         let now = self.now;
@@ -469,10 +485,11 @@ mod tests {
     use super::*;
     use crate::port::testing::*;
     use crate::socks::icmp6::{OP_HEAR6, OP_ICMP6};
-    use crate::socks::tcp::WHY_UNREACHABLE;
     use crate::socks::tcp::{ACCEPTED_BIT, EV_ACCEPTED6, EV_BYTES, EV_CONNECTED, EV_FAILED};
     use crate::socks::tcp::{OP_CONNECT6, OP_EVENTS, OP_LISTEN, OP_LISTEN6, OP_WRITE};
+    use crate::socks::tcp::{WHY_UNREACHABLE, WHY_UNREACHABLE6};
     use crate::socks::tests::{bind, message, records};
+    use crate::socks::undelivered::EV_UNDELIVERED6;
     use crate::socks::{parse_header, Arrived, Refused};
     use crate::socks::{HEARD as HEARD_SOCK, OP_CLOSE, OP_HEAR};
     use crate::socks::{OP_DATA6, OP_SEND6, RECORD6_LEN, RECORD_LEN};
@@ -1739,5 +1756,249 @@ mod tests {
         assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
         // The number is free.
         assert_eq!(stack.request(&message(OP_HEAR6, 5, &[])), Ok(false));
+    }
+
+    /// What ICMPv6 says of `quoted`, the IPv6 packet that was not
+    /// delivered: a message of this type and code, its sum to be
+    /// written.
+    fn lost6(kind: u8, code: u8, quoted: &[u8]) -> Vec<u8> {
+        let mut m = vec![kind, code, 0, 0, 0, 0, 0, 0];
+        m.extend_from_slice(quoted);
+        m
+    }
+
+    /// The types of the ICMPv6 messages among `sent`, but for the asking
+    /// for a router, which has its own times.
+    fn kinds(sent: &[Vec<u8>]) -> Vec<u8> {
+        let kinds = sent.iter().map(|frame| six_of(frame).message[0]);
+        kinds.filter(|kind| *kind != 133).collect()
+    }
+
+    /// The bytes of an `UNDELIVERED6`.
+    fn undelivered6(to: Ipv6Address, port: u16, kind: u8, code: u8) -> Vec<u8> {
+        let mut bytes = to.0.to_vec();
+        bytes.extend_from_slice(&port.to_le_bytes());
+        bytes.extend_from_slice(&[kind, code]);
+        bytes
+    }
+
+    #[test]
+    fn what_is_for_a_neighbour_that_never_answers_as_ipv6_is_dropped_and_told() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let nobody = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x77);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        // A datagram, a connect and an echo for a neighbour that is not
+        // there, and behind the datagram another for one that is.
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+        assert_eq!(stack.request(&message(OP_HEAR6, 5, &[])), Ok(false));
+        assert_eq!(stack.request(&send6(7, nobody, 9, 0, b"lost")), Ok(true));
+        assert_eq!(stack.request(&send6(7, near, 7, 0, b"hello")), Ok(true));
+        assert_eq!(
+            stack.request(&connect6(8, nobody, 80, 50000, 4096)),
+            Ok(true)
+        );
+        let ping = echo6(ECHO, 1, b"anyone?");
+        assert_eq!(stack.request(&icmp6(5, nobody, 64, &ping)), Ok(true));
+        let mut m = Vec::new();
+        // Asked for three times, a second apart, and nothing is said.
+        for ms in [1000, 2000, 3000] {
+            let sent = frames(&mut stack, &window, ms);
+            assert_eq!(kinds(&sent), [135], "at {ms}");
+            assert_eq!(six_of(&sent[0]).message[8..24], nobody.0);
+            assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+            assert!(kinds(&frames(&mut stack, &window, ms + 999)).is_empty());
+            assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+        }
+        // Then it is taken as absent: what was for it is dropped. The
+        // stack says so to itself as a router would, that nobody answers
+        // at the address, once for each thing dropped, and a socket that
+        // hears ICMPv6 hears it.
+        let sent = frames(&mut stack, &window, 4000);
+        assert_eq!(kinds(&sent), [135, 135]);
+        assert_eq!(six_of(&sent[0]).message[8..24], nobody.0);
+        assert_eq!(six_of(&sent[1]).message[8..24], near.0);
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        let heard = records6(&m);
+        assert_eq!(heard.len(), 3);
+        let mut whose = Vec::new();
+        for (sock, from, port, packet) in &heard {
+            assert_eq!((*sock, *from, *port), (HEARD_SOCK, OURS_GIVEN, 0));
+            let ip = Ipv6Packet::new_checked(&packet[..]).unwrap();
+            assert_eq!((ip.src_addr(), ip.dst_addr()), (OURS_GIVEN, OURS_GIVEN));
+            assert_eq!(ip.hop_limit(), 64);
+            let said = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+            let us = IpAddress::Ipv6(OURS_GIVEN);
+            assert!(said.verify_checksum(&us, &us));
+            // Unreachable, the address; and the start of what was sent.
+            let said = ip.payload();
+            assert_eq!(said[..2], [1, 3]);
+            assert_eq!(said.len(), 8 + 40 + 8);
+            let quoted = Ipv6Packet::new_unchecked(&said[8..]);
+            assert_eq!((quoted.src_addr(), quoted.dst_addr()), (OURS_GIVEN, nobody));
+            whose.push((quoted.next_header(), said[48..].to_vec()));
+        }
+        // The datagram from its port to the other, the echo as it left,
+        // and the knock.
+        assert_eq!(whose[0].0, IpProtocol::Udp);
+        assert_eq!(whose[0].1[..6], [0x13, 0x88, 0, 9, 0, 12]);
+        assert_eq!(whose[1].0, IpProtocol::Icmpv6);
+        assert_eq!(whose[1].1[..2], [ECHO, 0]);
+        assert_eq!(whose[1].1[4..], [0, 1, 0, 1]);
+        assert_eq!(whose[2].0, IpProtocol::Tcp);
+        assert_eq!(whose[2].1[..4], [0xc3, 0x50, 0, 80]);
+        // And the kernel is told whose they were: the datagram's socket,
+        // and the connect, which ends there.
+        assert_eq!(
+            events(&mut stack),
+            [
+                (7, EV_UNDELIVERED6, 0, undelivered6(nobody, 9, 1, 3)),
+                (8, EV_FAILED, WHY_UNREACHABLE6, vec![1, 3]),
+            ]
+        );
+        // The datagram that waited behind leaves when its own neighbour
+        // answers.
+        window.deliver(stack.device(), 0, &here_is(near, OURS_GIVEN));
+        let sent = frames(&mut stack, &window, 4005);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            udp6_of(&sent[0]),
+            (THEIRS, (OURS_GIVEN, 5000), (near, 7), 64, b"hello".to_vec())
+        );
+        // (What the neighbour said is heard, like all of ICMPv6.)
+        assert_eq!(stack.arrived(&mut m), Arrived::All);
+        assert_eq!(records6(&m).len(), 1);
+
+        // While it keeps not answering, what is for it is dropped at
+        // once: a connect does not wait for nobody.
+        assert_eq!(
+            stack.request(&connect6(8, nobody, 80, 50001, 4096)),
+            Ok(true)
+        );
+        assert!(kinds(&frames(&mut stack, &window, 4500)).is_empty());
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records6(&m).len(), 1);
+        assert_eq!(
+            events(&mut stack),
+            [(8, EV_FAILED, WHY_UNREACHABLE6, vec![1, 3])]
+        );
+        // With nobody hearing, the kernel is told all the same.
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        assert_eq!(stack.request(&send6(7, nobody, 10, 0, b"lost")), Ok(true));
+        frames(&mut stack, &window, 4600);
+        assert_eq!(
+            events(&mut stack),
+            [(7, EV_UNDELIVERED6, 0, undelivered6(nobody, 10, 1, 3))]
+        );
+    }
+
+    #[test]
+    fn what_icmpv6_says_was_not_delivered_is_told_to_the_kernel() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        window.deliver(stack.device(), 0, &here_is(near, OURS_GIVEN));
+        window.deliver(stack.device(), 1, &here_is(ROUTER, OURS_GIVEN));
+        frames(&mut stack, &window, 200);
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+
+        // A datagram for a port nobody has: the host says so, quoting
+        // it, and the kernel is told whose it was and what was said.
+        assert_eq!(stack.request(&send6(7, near, 9, 0, b"anyone?")), Ok(true));
+        let sent = frames(&mut stack, &window, 1000);
+        assert_eq!(sent.len(), 1);
+        let datagram = packet_of(&sent[0]);
+        let refused = six_frame(near, OURS_GIVEN, 64, &lost6(1, 4, &datagram));
+        window.deliver(stack.device(), 0, &refused);
+        frames(&mut stack, &window, 1010);
+        assert_eq!(
+            events(&mut stack),
+            [(7, EV_UNDELIVERED6, 0, undelivered6(near, 9, 1, 4))]
+        );
+        // The record, byte by byte, as the kernel reads it.
+        let said = Undelivered6::of(&packet_of(&refused)).unwrap();
+        assert_eq!(said.bytes().len(), 20);
+        assert_eq!(said.bytes()[..16], near.0);
+        assert_eq!(said.bytes()[16..], [9, 0, 1, 4]);
+
+        // One that ran out of hops on the way: the router says so, and
+        // that is told too. What it means is the kernel's to say.
+        assert_eq!(
+            stack.request(&send6(7, far, 33434, 1, b"how far?")),
+            Ok(true)
+        );
+        let sent = frames(&mut stack, &window, 2000);
+        assert_eq!(sent.len(), 1);
+        let far_datagram = packet_of(&sent[0]);
+        let out_of_hops = six_frame(ROUTER, OURS_GIVEN, 64, &lost6(3, 0, &far_datagram));
+        window.deliver(stack.device(), 0, &out_of_hops);
+        frames(&mut stack, &window, 2010);
+        assert_eq!(
+            events(&mut stack),
+            [(7, EV_UNDELIVERED6, 0, undelivered6(far, 33434, 3, 0))]
+        );
+
+        // A connect under way ends with what was said of its knock,
+        // unless it is that the knock was too big for the way.
+        assert_eq!(stack.request(&connect6(8, far, 80, 50000, 4096)), Ok(true));
+        let sent = frames(&mut stack, &window, 3000);
+        assert_eq!(sent.len(), 1);
+        let knock = packet_of(&sent[0]);
+        let too_big = six_frame(ROUTER, OURS_GIVEN, 64, &lost6(2, 0, &knock));
+        window.deliver(stack.device(), 0, &too_big);
+        frames(&mut stack, &window, 3010);
+        assert_eq!(events(&mut stack), []);
+        let forbidden = six_frame(ROUTER, OURS_GIVEN, 64, &lost6(1, 1, &knock));
+        window.deliver(stack.device(), 0, &forbidden);
+        frames(&mut stack, &window, 3020);
+        assert_eq!(
+            events(&mut stack),
+            [(8, EV_FAILED, WHY_UNREACHABLE6, vec![1, 1])]
+        );
+        // It is over: the same said again is about nothing.
+        window.deliver(stack.device(), 0, &forbidden);
+        frames(&mut stack, &window, 3030);
+        assert_eq!(events(&mut stack), []);
+
+        // What says nothing to anybody: a sum that does not hold; what
+        // is no error; what quotes a packet that is not ours, or from a
+        // port no socket has, or cut before its ports, or that is no
+        // datagram and no knock.
+        let mut wrong = refused.clone();
+        let last = wrong.len() - 1;
+        wrong[last] ^= 1;
+        let mut theirs = datagram.clone();
+        theirs[8..24].copy_from_slice(&far.0);
+        let mut strangers = datagram.clone();
+        strangers[40..42].copy_from_slice(&6000u16.to_be_bytes());
+        let ping = six_frame(OURS_GIVEN, near, 64, &echo6(ECHO, 1, b"x"));
+        for (n, frame) in [
+            wrong,
+            six_frame(near, OURS_GIVEN, 64, &lost6(129, 0, &datagram)),
+            six_frame(near, OURS_GIVEN, 64, &lost6(0, 0, &datagram)),
+            six_frame(near, OURS_GIVEN, 64, &lost6(5, 0, &datagram)),
+            six_frame(near, OURS_GIVEN, 64, &lost6(1, 4, &theirs)),
+            six_frame(near, OURS_GIVEN, 64, &lost6(1, 4, &strangers)),
+            six_frame(near, OURS_GIVEN, 64, &lost6(1, 4, &datagram[..43])),
+            six_frame(near, OURS_GIVEN, 64, &lost6(1, 4, &packet_of(&ping))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            window.deliver(stack.device(), 0, &frame);
+            frames(&mut stack, &window, 4000 + n as i64);
+            assert_eq!(events(&mut stack), [], "the {n}th");
+        }
+        // And the socket is as it was.
+        assert_eq!(
+            stack.request(&send6(7, near, 7, 0, b"still here")),
+            Ok(true)
+        );
+        assert_eq!(frames(&mut stack, &window, 5000).len(), 1);
     }
 }

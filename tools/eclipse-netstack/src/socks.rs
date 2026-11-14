@@ -95,7 +95,7 @@ pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
 use icmp6::{OP_HEAR6, OP_ICMP6};
 use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
-use undelivered::{Undelivered, EV_UNDELIVERED};
+use undelivered::{Undelivered, Undelivered6, EV_UNDELIVERED, EV_UNDELIVERED6};
 
 /// The operations of a message.
 pub const OP_BIND: u32 = 1;
@@ -432,6 +432,33 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 }
             }
             IpProtocol::Tcp => self.connect_undelivered(said),
+            _ => {}
+        }
+    }
+
+    /// [`undelivered`](Self::undelivered), of what travelled as IPv6.
+    fn undelivered6(&mut self, said: &Undelivered6) {
+        let from = IpAddress::Ipv6(said.from);
+        if !self
+            .iface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == from)
+        {
+            return;
+        }
+        match said.protocol {
+            IpProtocol::Udp => {
+                let set = &mut self.set;
+                let mut socks = self.socks.iter();
+                let sock = socks.find(|&(_, &handle)| {
+                    set.get::<UdpSocket>(handle).endpoint().port == said.local
+                });
+                if let Some((&sock, _)) = sock {
+                    self.streams.owe(sock, EV_UNDELIVERED6, 0, &said.bytes());
+                }
+            }
+            IpProtocol::Tcp => self.connect_undelivered6(said),
             _ => {}
         }
     }

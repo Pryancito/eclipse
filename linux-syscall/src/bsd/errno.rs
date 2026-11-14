@@ -107,6 +107,8 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         LxError::ESTALE => bsd::ESTALE,
         LxError::EREMOTE => bsd::EREMOTE,
         LxError::EOVERFLOW => bsd::EOVERFLOW,
+        // Linux's number for this one (71) is `EREMOTE` over there.
+        LxError::EPROTO => bsd::EPROTO,
         // FreeBSD has no `EBADFD` ("the descriptor is fine, the object behind
         // it is not"). Its number over there is `ENOLCK`. `EBADF` would be
         // worse than `EINVAL`: it would claim the descriptor itself is wrong,
@@ -200,6 +202,7 @@ mod tests {
         LxError::EBADFD,
         LxError::ELIBBAD,
         LxError::EOVERFLOW,
+        LxError::EPROTO,
         LxError::ENOTSOCK,
         LxError::ENOPROTOOPT,
         LxError::EPROTONOSUPPORT,
@@ -262,6 +265,9 @@ mod tests {
         assert_eq!(lx_to_freebsd(LxError::ENAMETOOLONG), 63);
         assert_eq!(lx_to_freebsd(LxError::ETIMEDOUT), 60);
         assert_eq!(lx_to_freebsd(LxError::EINPROGRESS), 36);
+        // Linux's 71, which over there says the object is remote.
+        assert_eq!(lx_to_freebsd(LxError::EPROTO), 92);
+        assert_ne!(lx_to_freebsd(LxError::EPROTO), LxError::EPROTO as i32);
     }
 
     /// The six that used to fall through `_ => EINVAL`.
