@@ -395,6 +395,7 @@ pub(crate) mod testing {
                 .ip_addrs(vec![IpCidr::new(IpAddress::Ipv4(OUR_IP), 24)])
                 .routes(Routes::new(BTreeMap::new()))
                 .ipv4_multicast_groups(BTreeMap::new())
+                .ipv6_multicast_groups(BTreeMap::new())
                 .finalize();
             Bench {
                 window: Window(window),

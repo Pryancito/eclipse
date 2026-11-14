@@ -183,11 +183,10 @@ impl Address {
     /// unicast.
     pub fn solicited_node(&self) -> Address {
         assert!(self.is_unicast());
-        let mut bytes = [
-            0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-        ];
-        bytes[14..].copy_from_slice(&self.0[14..]);
+        // FF02:0:0:0:0:1:FF00::/104 and the address's last 24 bits
+        // (RFC 4291, 2.7.1).
+        let mut bytes = Cidr::SOLICITED_NODE_PREFIX.address.0;
+        bytes[13..].copy_from_slice(&self.0[13..]);
         Address(bytes)
     }
 }
@@ -834,6 +833,16 @@ mod test {
             LINK_LOCAL_ADDR.write_parts(&mut bytes);
             assert_eq!(LINK_LOCAL_ADDR, Address::from_parts(&bytes));
         }
+    }
+
+    #[test]
+    fn test_solicited_node() {
+        // RFC 4291, 2.7.1: 4037::01:800:200e:8c6c is asked for at
+        // ff02::1:ff0e:8c6c.
+        let addr = Address::new(0x4037, 0, 0, 0, 0x0001, 0x0800, 0x200e, 0x8c6c);
+        let group = Address::new(0xff02, 0, 0, 0, 0, 0x0001, 0xff0e, 0x8c6c);
+        assert_eq!(addr.solicited_node(), group);
+        assert!(group.is_multicast());
     }
 
     #[test]

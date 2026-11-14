@@ -258,6 +258,7 @@ impl Drop for ServedIcmpSocket {
             _ => None,
         };
         self.link.deaf(self.sock, ident);
+        self.link.leave_every_group6(&self.shared);
     }
 }
 

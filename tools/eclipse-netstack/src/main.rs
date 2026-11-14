@@ -733,6 +733,7 @@ fn main() {
         .ip_addrs(vec![IpCidr::Ipv4(address)])
         .routes(Routes::new(BTreeMap::new()))
         .ipv4_multicast_groups(BTreeMap::new())
+        .ipv6_multicast_groups(BTreeMap::new())
         .finalize();
     let mut stack = Stack::new(iface);
     match how {

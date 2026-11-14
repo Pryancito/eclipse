@@ -147,6 +147,9 @@
 //! LEAVE   (kernel to stack)  16  [u8; 4] group
 //! ```
 //!
+//! The groups of IPv6 are kept the same way (`IPV6_JOIN_GROUP`, `JOIN6`
+//! and `LEAVE6`, in `groups6`).
+//!
 //! What arrives for the group arrives for the socket that has the port,
 //! and what a socket here sends to it reaches the member in this machine
 //! as well as the card.
@@ -309,10 +312,13 @@ use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
 mod groups;
+mod groups6;
 mod icmp;
 mod icmp6;
 mod tcp;
 pub use groups::{join_message, leave_message, Membership, MEMBERSHIPS_MAX, OP_JOIN, OP_LEAVE};
+pub use groups6::{join6_message, leave6_message, Membership6, MEMBERSHIPS6_MAX};
+pub use groups6::{OP_JOIN6, OP_LEAVE6};
 pub use icmp::ServedIcmpSocket;
 pub use tcp::ServedTcpSocket;
 
@@ -900,6 +906,8 @@ struct Inner {
     error: Option<LxError>,
     /// The groups it asked to be a member of (`IP_ADD_MEMBERSHIP`).
     groups: Vec<Ipv4Address>,
+    /// And the ones of IPv6 (`IPV6_JOIN_GROUP`).
+    groups6: Vec<Ipv6Address>,
 }
 
 impl Shared {
@@ -942,6 +950,7 @@ impl Shared {
                 patience: Patience::default(),
                 error: None,
                 groups: Vec::new(),
+                groups6: Vec::new(),
             }),
             hears,
             v6,
@@ -1302,6 +1311,8 @@ struct Table {
     /// The groups the machine is a member of, and how many sockets asked
     /// for each.
     groups: BTreeMap<Ipv4Address, usize>,
+    /// The same of IPv6.
+    groups6: BTreeMap<Ipv6Address, usize>,
     /// The sockets that hear ICMP.
     hearing: BTreeSet<u64>,
     /// The identifiers of the sockets that ping: their ports.
@@ -1665,6 +1676,9 @@ impl StackLink {
         }
         for group in self.groups() {
             let _ = self.tell(join_message(group.0), true);
+        }
+        for group in self.groups6() {
+            let _ = self.tell(join6_message(group.0), true);
         }
         Ok(Serving {
             link: self.clone(),
@@ -2168,7 +2182,7 @@ impl ServedUdpSocket {
         if data.len() + IPV6_MORE > self.link.max_datagram.load(Ordering::Acquire) {
             return Err(LxError::EMSGSIZE);
         }
-        self.autobind()?;
+        let from = self.autobind()?;
         // As many hops as the socket was told (`IPV6_UNICAST_HOPS`,
         // `IPV6_MULTICAST_HOPS`). When it was not, a group's is not to
         // leave the link, and the rest travel as far as the stack lets a
@@ -2177,6 +2191,9 @@ impl ServedUdpSocket {
         let hop_limit = said.unwrap_or(u8::from(addr.is_multicast()));
         let said = send6_message(self.sock, addr.0, port, hop_limit, data);
         self.link.tell(said, false)?;
+        if addr.is_multicast() {
+            self.loop_back6(from, addr, port, data);
+        }
         Ok(data.len())
     }
 
@@ -2274,6 +2291,7 @@ impl Asked {
 impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
         self.leave_every_group();
+        self.link.leave_every_group6(&self.shared);
         let (port, here) = {
             let inner = self.shared.inner.lock();
             (inner.port, inner.here)
@@ -2504,7 +2522,11 @@ impl Socket for ServedUdpSocket {
             if opt == icmp6::IPV6_V6ONLY {
                 return self.set_only6(data);
             }
-            if let Some(kept) = self.six.lock().set_hops(opt, data) {
+            if let Some(done) = self.link.membership6(&self.shared, opt, data) {
+                return done;
+            }
+            let mut six = self.six.lock();
+            if let Some(kept) = six.set_hops(opt, data).or_else(|| six.set_loop(opt, data)) {
                 return kept.map(|()| 0);
             }
         }
