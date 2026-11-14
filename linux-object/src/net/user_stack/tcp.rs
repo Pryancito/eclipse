@@ -65,6 +65,10 @@ struct Inner {
     /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
     /// of this machine alone, which the stack is not told of.
     here: Option<Ipv4Address>,
+    /// An `AF_INET6` socket that was told to carry IPv6 alone
+    /// (`IPV6_V6ONLY`), which it can be told until it has a port; and so
+    /// are the connections that arrive on it.
+    only6: bool,
     /// Its own address in a connection to another program of this
     /// machine, where it is not the stack's.
     local: Option<IpAddress>,
@@ -94,6 +98,7 @@ impl Inner {
             port: None,
             holds_port: false,
             here: None,
+            only6: false,
             local: None,
             at: None,
             remote: None,
@@ -260,13 +265,20 @@ impl Stream {
         inner.phase == Phase::Listening && inner.here.is_none()
     }
 
+    /// Which versions of IP the socket is for.
+    fn takes(&self, inner: &Inner) -> Takes {
+        Takes::of(self.v6, inner.only6)
+    }
+
     /// What tells a stack that it listens on `port`: for what arrives as
-    /// IPv6 as well, when it is an `AF_INET6` socket.
+    /// IPv6 as well when it is an `AF_INET6` socket, or for that alone
+    /// when it was told so.
     pub(super) fn listen_message(&self, sock: u64, port: u16) -> Vec<u8> {
-        let message = if self.v6 {
-            listen6_message
-        } else {
-            listen_message
+        let takes = self.takes(&self.inner.lock());
+        let message = match takes {
+            Takes::Four => listen_message,
+            Takes::Both => listen6_message,
+            Takes::Six => listen6only_message,
         };
         message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32)
     }
@@ -405,14 +417,22 @@ impl StackLink {
                         warn!("user stack: an ACCEPTED with a number that is taken");
                         return;
                     }
-                    if inner.waiting.len() >= WAITING_MAX || (at.is_some() && !stream.v6) {
+                    let takes = stream.takes(&inner);
+                    let theirs = if at.is_some() {
+                        takes.six()
+                    } else {
+                        takes.four()
+                    };
+                    if inner.waiting.len() >= WAITING_MAX || !theirs {
                         // Nobody accepts: the connection is not kept. Nor
-                        // is one of IPv6 on a socket that is not.
+                        // is one of IPv6 on a socket that is not, or one
+                        // of IPv4 on a socket that is for IPv6 only.
                         refuse = Some(close_message(new));
                     } else {
                         let mut child = Inner::new(Phase::Open);
                         child.credit = (number as usize).min(CREDIT_MAX);
                         child.port = inner.port;
+                        child.only6 = inner.only6;
                         child.remote = Some(from);
                         child.at = at;
                         let child = Stream::new(child, stream.v6);
@@ -487,13 +507,16 @@ impl StackLink {
     /// `CONNECT`, to this machine: `sock`, which is `Connecting` from
     /// `from`, is joined to a new socket on the queue of whoever listens
     /// on `port` at `to`, or refused when nobody does. Either is said to
-    /// `sock` as the stack would say it, before this returns.
-    fn join(&self, sock: u64, to: IpAddress, port: u16, from: IpEndpoint) {
+    /// `sock` as the stack would say it, before this returns. `six` when
+    /// `to` was said as an address of IPv6, as `::1` was, which is
+    /// 127.0.0.1 here: who listens for IPv6 only is found by that and by
+    /// nothing else.
+    fn join(&self, sock: u64, to: IpAddress, port: u16, from: IpEndpoint, six: bool) {
         let listener = {
             let table = self.table.lock();
-            let listener = table.listening.get(&port);
+            let listener = table.listening.get(port, six);
             listener
-                .and_then(|listener| table.streams.get(listener))
+                .and_then(|listener| table.streams.get(&listener))
                 .and_then(Weak::upgrade)
         };
         let made = listener.is_some_and(|listener| {
@@ -510,6 +533,7 @@ impl StackLink {
             let mut child = Inner::new(Phase::Open);
             child.credit = STREAM_WINDOW;
             child.port = inner.port;
+            child.only6 = inner.only6;
             child.local = Some(to);
             child.remote = Some(from);
             let child = Stream::new(child, listener.v6);
@@ -634,7 +658,8 @@ impl ServedTcpSocket {
         if let Some(port) = inner.port {
             return Ok(port);
         }
-        let port = self.link.table.lock().stream_ports.take(0)?;
+        let takes = self.stream.takes(inner);
+        let port = self.link.table.lock().stream_ports.take(0, takes)?;
         inner.port = Some(port);
         inner.holds_port = true;
         Ok(port)
@@ -707,9 +732,8 @@ impl ServedTcpSocket {
 
     /// Take this socket off the ports that are listened on.
     fn stop_listening(&self, port: Option<u16>) {
-        let mut table = self.link.table.lock();
-        if let Some(port) = port.filter(|port| table.listening.get(port) == Some(&self.sock)) {
-            table.listening.remove(&port);
+        if let Some(port) = port {
+            self.link.table.lock().listening.remove(port, self.sock);
         }
     }
 
@@ -720,10 +744,11 @@ impl ServedTcpSocket {
 
 impl Drop for ServedTcpSocket {
     fn drop(&mut self) {
-        let (port, waiting, known) = {
+        let (port, takes, waiting, known) = {
             let mut inner = self.stream.inner.lock();
             (
                 inner.port.filter(|_| inner.holds_port),
+                self.stream.takes(&inner),
                 core::mem::take(&mut inner.waiting),
                 // What the stack, or the other end, has a socket for. One
                 // whose connection failed it has let go of already, and
@@ -739,7 +764,7 @@ impl Drop for ServedTcpSocket {
         self.stop_listening(port);
         self.link.forget(self.sock, &self.stream);
         if let Some(port) = port {
-            self.link.table.lock().stream_ports.taken.remove(&port);
+            self.link.table.lock().stream_ports.free(port, takes);
         }
         self.unlisten(waiting);
         // A connection within this machine that was reset is known to
@@ -801,6 +826,12 @@ impl Socket for ServedTcpSocket {
         let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
+        let six = said_as_six(peer.addr);
+        // `tcp_v6_connect`: a socket that is for IPv6 only has no way to
+        // an address of IPv4.
+        if self.stream.inner.lock().only6 && disguised(peer.addr) {
+            return Err(LxError::ENETUNREACH);
+        }
         peer.addr = either(self.v6, peer.addr, LxError::ENETUNREACH)?;
         // Another program of this machine: the kernel joins the two. An
         // address of the card's own is this machine in IPv6 too.
@@ -858,7 +889,7 @@ impl Socket for ServedTcpSocket {
             // Made or refused by the time this returns: there is nothing
             // to be in progress, and the wait below does not wait.
             let from = IpEndpoint::new(from, local);
-            self.link.join(self.sock, peer.addr, peer.port, from);
+            self.link.join(self.sock, peer.addr, peer.port, from, six);
         } else if let Some((local, _)) = started {
             let window = STREAM_WINDOW as u32;
             let connect = match peer.addr {
@@ -925,6 +956,11 @@ impl Socket for ServedTcpSocket {
         let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
+        // `inet6_bind`: an address of IPv4 is none for a socket that is
+        // for IPv6 only.
+        if self.stream.inner.lock().only6 && disguised(local.addr) {
+            return Err(LxError::EINVAL);
+        }
         local.addr = either(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         match local.addr {
             IpAddress::Unspecified => {}
@@ -948,7 +984,13 @@ impl Socket for ServedTcpSocket {
         if inner.port.is_some() || inner.phase != Phase::Fresh {
             return Err(LxError::EINVAL);
         }
-        let port = self.link.table.lock().stream_ports.take(local.port)?;
+        let takes = self.stream.takes(&inner);
+        let port = self
+            .link
+            .table
+            .lock()
+            .stream_ports
+            .take(local.port, takes)?;
         inner.port = Some(port);
         inner.holds_port = true;
         inner.here = here;
@@ -970,7 +1012,12 @@ impl Socket for ServedTcpSocket {
             inner.error = None;
             self.stream.sync(&inner, Event::empty());
             // Where the programs of this machine find it.
-            self.link.table.lock().listening.insert(port, self.sock);
+            let takes = self.stream.takes(&inner);
+            self.link
+                .table
+                .lock()
+                .listening
+                .insert(port, self.sock, takes);
             // Bound to an address of 127.0.0.0/8, it is theirs alone: the
             // stack, which would bring it what the card hears, is not
             // told.
@@ -1043,6 +1090,7 @@ impl Socket for ServedTcpSocket {
                 if let Some((sock, stream)) = inner.waiting.pop_front() {
                     self.stream.sync(&inner, Event::empty());
                     let patience = inner.patience;
+                    let takes = self.stream.takes(&inner);
                     drop(inner);
                     // `sk_clone_lock`: the connection has the listener's
                     // timeouts.
@@ -1058,7 +1106,7 @@ impl Socket for ServedTcpSocket {
                         v6: self.v6,
                         stream,
                     });
-                    let from = shown(self.v6, from.unwrap_or(IpEndpoint::UNSPECIFIED));
+                    let from = shown(takes, from.unwrap_or(IpEndpoint::UNSPECIFIED));
                     return Ok((socket as Arc<dyn FileLike>, Endpoint::Ip(from)));
                 }
                 if inner.flags.contains(OpenFlags::NON_BLOCK) {
@@ -1075,7 +1123,7 @@ impl Socket for ServedTcpSocket {
         let inner = self.stream.inner.lock();
         let addr = address(&inner, self.link.address());
         let local = IpEndpoint::new(addr, inner.port.unwrap_or(0));
-        Some(Endpoint::Ip(shown(self.v6, local)))
+        Some(Endpoint::Ip(shown(self.stream.takes(&inner), local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -1083,7 +1131,7 @@ impl Socket for ServedTcpSocket {
         inner
             .remote
             .filter(|_| inner.phase == Phase::Open)
-            .map(|remote| Endpoint::Ip(shown(self.v6, remote)))
+            .map(|remote| Endpoint::Ip(shown(self.stream.takes(&inner), remote)))
     }
 
     fn take_so_error(&self) -> i32 {
@@ -1110,11 +1158,11 @@ impl Socket for ServedTcpSocket {
     }
 
     fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
-        // `IPV6_V6ONLY`: no, an `AF_INET6` socket here takes both
-        // families.
-        const IPV6_V6ONLY: usize = 26;
-        (self.v6 && level == icmp6::IPPROTO_IPV6 && opt == IPV6_V6ONLY)
-            .then(|| 0i32.to_ne_bytes().to_vec())
+        // `IPV6_V6ONLY`: whether it was told to carry IPv6 alone.
+        (self.v6 && level == icmp6::IPPROTO_IPV6 && opt == icmp6::IPV6_V6ONLY).then(|| {
+            let only6 = self.stream.inner.lock().only6;
+            i32::from(only6).to_ne_bytes().to_vec()
+        })
     }
 
     fn so_protocol(&self) -> Option<u32> {
@@ -1126,6 +1174,17 @@ impl Socket for ServedTcpSocket {
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        // `IPV6_V6ONLY`: something to say before the socket has a port,
+        // which is its own for what it carries (`do_ipv6_setsockopt`).
+        if self.v6 && level == icmp6::IPPROTO_IPV6 && opt == icmp6::IPV6_V6ONLY {
+            let only6 = icmp6::flag(data)?;
+            let mut inner = self.stream.inner.lock();
+            if inner.port.is_some() {
+                return Err(LxError::EINVAL);
+            }
+            inner.only6 = only6;
+            return Ok(0);
+        }
         let kept = self.stream.inner.lock().patience.set(level, opt, data);
         kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
     }
@@ -2130,7 +2189,7 @@ mod tests {
         drop(c);
         let table = stack.link.table.lock();
         assert!(table.joined.is_empty());
-        assert!(table.listening.is_empty());
+        assert!(table.listening.each().is_empty());
         assert!(table.streams.is_empty());
     }
 
@@ -2434,6 +2493,137 @@ mod tests {
         }
         assert!(told.contains(&listen6_message(l.sock, 8080, LISTEN_BACKLOG, window)));
         assert!(told.contains(&listen_message(l4.sock, 8081, LISTEN_BACKLOG, window)));
+    }
+
+    #[test]
+    fn a_socket_for_ipv6_only_listens_beside_one_of_ipv4() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let six = |addr: &str| match at6(addr, 0).addr {
+            IpAddress::Ipv6(addr) => addr,
+            _ => unreachable!(),
+        };
+        stack.say(six_message(None, &[Ipv6Cidr::new(six("fec0::7"), 64)]));
+        let stream6 = || {
+            let s = ServedTcpSocket::new(stack.link.clone(), true).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        let only6 = |s: &ServedTcpSocket, on: i32| s.setsockopt(41, 26, &on.to_ne_bytes());
+        let said = |s: &ServedTcpSocket| Socket::getsockopt_own(s, 41, 26);
+        let yes = Some(1i32.to_ne_bytes().to_vec());
+        let window = STREAM_WINDOW as u32;
+        assert_eq!(
+            listen6only_message(7, 8080, 8, 0x0004_0000),
+            [0, 0, 0, 0, 23, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x1f, 8, 0, 0, 0, 4, 0]
+        );
+
+        // Said before the socket has a port, as an `int`.
+        let l6 = stream6();
+        assert_eq!(l6.setsockopt(41, 26, &[1]), Err(LxError::EINVAL));
+        assert_eq!(only6(&l6, 1), Ok(0));
+        assert_eq!(said(&l6), yes);
+        // An address of IPv4 is none of its own, nor anywhere it has a
+        // way to, however it is written.
+        let mapped = at6("::ffff:10.0.9.1", 80);
+        assert_eq!(
+            Socket::bind(&l6, Endpoint::Ip(at6("::ffff:10.0.9.15", 8080))),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(connect(&l6, mapped), Err(LxError::ENETUNREACH));
+        assert_eq!(stack.told(), None);
+
+        // It listens for IPv6 alone, and a socket of IPv4 on the same
+        // port for the rest; no third has the port for either.
+        assert_eq!(Socket::bind(&l6, Endpoint::Ip(at6("::", 8080))), Ok(0));
+        assert_eq!(only6(&l6, 0), Err(LxError::EINVAL));
+        assert_eq!(Socket::listen(&l6), Ok(0));
+        assert_eq!(
+            stack.told(),
+            Some(listen6only_message(l6.sock, 8080, LISTEN_BACKLOG, window))
+        );
+        let l4 = stream(&stack);
+        assert_eq!(Socket::bind(&l4, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&l4), Ok(0));
+        assert_eq!(
+            stack.told(),
+            Some(listen_message(l4.sock, 8080, LISTEN_BACKLOG, window))
+        );
+        assert_eq!(
+            Socket::bind(&stream6(), Endpoint::Ip(at6("::", 8080))),
+            Err(LxError::EADDRINUSE)
+        );
+        assert_eq!(
+            Socket::bind(&stream(&stack), any(8080)),
+            Err(LxError::EADDRINUSE)
+        );
+
+        // What arrives as IPv6 is its own, and what it accepts is for
+        // IPv6 only too.
+        let (near, card) = (six("fec0::99"), six("fec0::7"));
+        let new = ACCEPTED_BIT | 1;
+        let bytes = accepted6_bytes(new, near.0, 40000, card.0);
+        events(&stack, &[(l6.sock, EV_ACCEPTED6, 1000, &bytes)]);
+        let (s, from) = accepted(&l6);
+        assert_eq!(from, at6("fec0::99", 40000));
+        assert_eq!(said(&s), yes);
+        assert_eq!(only6(&s, 0), Err(LxError::EINVAL));
+        // A stack that says one of IPv4 arrived for it is told to close
+        // it.
+        let new4 = ACCEPTED_BIT | 2;
+        let bytes4 = accepted_bytes(new4, HOST, 40001);
+        events(&stack, &[(l6.sock, EV_ACCEPTED, 1000, &bytes4)]);
+        assert_eq!(stack.told(), Some(close_message(new4)));
+        assert_eq!(accept(&l6).err(), Some(LxError::EAGAIN));
+        events(&stack, &[(l4.sock, EV_ACCEPTED, 1000, &bytes4)]);
+        let (_s4, from) = accepted(&l4);
+        assert_eq!(from, at(HOST, 40001));
+
+        // In this machine too: who connects to `::1` reaches the one,
+        // which is told it came from there, and who connects to
+        // 127.0.0.1 the other.
+        let c6 = stream6();
+        assert_eq!(connect(&c6, at6("::1", 8080)), Ok(0));
+        let (s6, from) = accepted(&l6);
+        assert_eq!(from, at6("::1", from.port));
+        assert_eq!(ip(Socket::endpoint(&*s6).unwrap()), at6("::1", 8080));
+        assert_eq!(accept(&l4).err(), Some(LxError::EAGAIN));
+        let c4 = stream(&stack);
+        assert_eq!(connect(&c4, at(HERE, 8080)), Ok(0));
+        assert_eq!(accepted(&l4).1.addr, at(HERE, 0).addr);
+        assert_eq!(accept(&l6).err(), Some(LxError::EAGAIN));
+        // And at an address of the card's own.
+        let c = stream6();
+        assert_eq!(connect(&c, at6("fec0::7", 8080)), Ok(0));
+        assert_eq!(accepted(&l6).1.addr, at6("fec0::7", 0).addr);
+        assert_eq!(stack.told(), None);
+
+        // With the one of IPv4 gone, who connects to 127.0.0.1 is
+        // refused: the other is not for that.
+        drop(l4);
+        while stack.told().is_some() {}
+        assert_eq!(
+            connect(&stream(&stack), at(HERE, 8080)),
+            Err(LxError::ECONNREFUSED)
+        );
+        // And the port is free for IPv4, and for no more than that.
+        assert_eq!(
+            Socket::bind(&stream6(), Endpoint::Ip(at6("::", 8080))),
+            Err(LxError::EADDRINUSE)
+        );
+        assert_eq!(Socket::bind(&stream(&stack), any(8080)), Ok(0));
+
+        // The next stack is told what it listens for.
+        while stack.told().is_some() {}
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        let next = stack_of(&link);
+        let mut told = Vec::new();
+        while let Some(m) = next.told() {
+            told.push(m);
+        }
+        assert!(told.contains(&listen6only_message(l6.sock, 8080, LISTEN_BACKLOG, window)));
     }
 
     #[test]

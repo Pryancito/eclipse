@@ -59,7 +59,7 @@ const IPV6_CHECKSUM: usize = 7;
 const IPV6_2292HOPLIMIT: usize = 8;
 const IPV6_UNICAST_HOPS: usize = 16;
 const IPV6_MULTICAST_HOPS: usize = 18;
-const IPV6_V6ONLY: usize = 26;
+pub(super) const IPV6_V6ONLY: usize = 26;
 const IPV6_RECVHOPLIMIT: usize = 51;
 const IPV6_HOPLIMIT: usize = 52;
 const ICMP6_FILTER: usize = 1;
@@ -167,6 +167,11 @@ fn int(data: &[u8]) -> LxResult<i32> {
     Ok(i32::from_ne_bytes(bytes))
 }
 
+/// Whether an option a program set is on.
+pub(super) fn flag(data: &[u8]) -> LxResult<bool> {
+    int(data).map(|on| on != 0)
+}
+
 /// As many hops as an option says: -1 is as many as when it was not
 /// said, and more than a byte holds is `EINVAL`.
 fn hops(data: &[u8]) -> LxResult<Option<u8>> {
@@ -229,8 +234,8 @@ impl Opts {
 
     /// What `getsockopt` says an option of IPv6's level is, for the ones
     /// kept here (`do_ipv6_getsockopt`: hops that were not said are the
-    /// ones a packet gets). `IPV6_V6ONLY` is no: a socket served by the
-    /// stack takes both families, or is of ICMPv6 and has one.
+    /// ones a packet gets). `IPV6_V6ONLY` is no: a socket of ICMPv6 has
+    /// one family, and one of datagrams says its own.
     pub(super) fn get(&self, opt: usize) -> Option<i32> {
         match opt {
             IPV6_UNICAST_HOPS => Some(i32::from(self.hops.unwrap_or(HOPS))),

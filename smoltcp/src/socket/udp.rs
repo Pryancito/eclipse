@@ -6,7 +6,7 @@ use core::task::Waker;
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt, Socket, SocketHandle, SocketMeta};
 use crate::storage::{PacketBuffer, PacketMetadata};
-use crate::wire::{IpEndpoint, IpProtocol, IpRepr, UdpRepr};
+use crate::wire::{IpEndpoint, IpProtocol, IpRepr, IpVersion, UdpRepr};
 use crate::{Error, Result};
 
 /// A UDP packet metadata.
@@ -27,6 +27,9 @@ pub struct UdpSocket<'a> {
     tx_buffer: UdpSocketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// The one version of IP whose datagrams are this socket's: see
+    /// [`set_only`](Self::set_only).
+    only: Option<IpVersion>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -42,6 +45,7 @@ impl<'a> UdpSocket<'a> {
             rx_buffer: rx_buffer,
             tx_buffer: tx_buffer,
             hop_limit: None,
+            only: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -121,6 +125,23 @@ impl<'a> UdpSocket<'a> {
         }
 
         self.hop_limit = hop_limit
+    }
+
+    /// Have a socket that is bound to every address take only the
+    /// datagrams that arrive as `version`, as an `AF_INET` socket takes
+    /// those of IPv4 and one that is for IPv6 only (`IPV6_V6ONLY`) those
+    /// of IPv6: one that arrives as the other is not this socket's, so
+    /// another socket can have the same port for those, and it is refused
+    /// when it is nobody's. `None`, which is how a socket starts, takes
+    /// both.
+    pub fn set_only(&mut self, version: Option<IpVersion>) {
+        self.only = version;
+    }
+
+    /// The one version of IP whose datagrams are this socket's, when it
+    /// was told one ([`set_only`](Self::set_only)).
+    pub fn only(&self) -> Option<IpVersion> {
+        self.only
     }
 
     /// Bind the socket to the given endpoint.
@@ -305,6 +326,9 @@ impl<'a> UdpSocket<'a> {
 
     pub(crate) fn accepts(&self, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
         if self.endpoint.port != repr.dst_port {
+            return false;
+        }
+        if self.only.is_some_and(|version| version != ip_repr.dst_addr().version()) {
             return false;
         }
         if !self.endpoint.addr.is_unspecified()
@@ -707,6 +731,24 @@ mod test {
         assert!(socket.accepts(&remote_ip_repr(), &udp_repr));
         udp_repr.dst_port += 1;
         assert!(!socket.accepts(&remote_ip_repr(), &udp_repr));
+    }
+
+    #[test]
+    fn test_accepts_only_the_version_it_is_for() {
+        let mut socket = socket(buffer(1), buffer(0));
+        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+
+        let ip_repr = remote_ip_repr();
+        let (arrives, other) = match ip_repr.dst_addr().version() {
+            IpVersion::Ipv4 => (IpVersion::Ipv4, IpVersion::Ipv6),
+            _ => (IpVersion::Ipv6, IpVersion::Ipv4),
+        };
+        socket.set_only(Some(arrives));
+        assert!(socket.accepts(&ip_repr, &REMOTE_UDP_REPR));
+        socket.set_only(Some(other));
+        assert!(!socket.accepts(&ip_repr, &REMOTE_UDP_REPR));
+        socket.set_only(None);
+        assert!(socket.accepts(&ip_repr, &REMOTE_UDP_REPR));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
 //! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
 //! LISTEN6  (kernel to stack)  as LISTEN
+//! LISTEN6ONLY (kernel to stack)  as LISTEN
 //! WRITE    (kernel to stack)  16  the bytes
 //! SHUTDOWN (kernel to stack)
 //! WINDOW   (kernel to stack)  16  u32 bytes
@@ -35,7 +36,10 @@
 //!
 //! A `LISTEN` takes the connections that arrive as IPv4, as an `AF_INET`
 //! socket does, and whoever knocks as IPv6 is refused; a `LISTEN6` takes
-//! both, as an `AF_INET6` socket does. A `CONNECT6` is a connect to an
+//! both, as an `AF_INET6` socket does; a `LISTEN6ONLY` takes the ones
+//! that arrive as IPv6, as such a socket does once it was told
+//! `IPV6_V6ONLY`, and leaves the port to a `LISTEN` for the others. A
+//! `CONNECT6` is a connect to an
 //! IPv6 address, from the address of the card that
 //! [`six`](super::six) says goes there.
 //!
@@ -47,7 +51,7 @@ use std::collections::BTreeMap;
 use smoltcp::phy::Device;
 use smoltcp::socket::{SocketHandle, TcpSocket, TcpSocketBuffer, TcpState};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpVersion, Ipv4Address, Ipv6Address};
 
 use super::undelivered::{Undelivered, Undelivered6, LAST_CODE, TOO_BIG6, TOO_LONG, UNREACHABLE};
 use super::{Arrived, Refused, Stack, HEADER_LEN, MESSAGE_MAX, RECORD_LEN};
@@ -60,6 +64,7 @@ pub const OP_WINDOW: u32 = 9;
 pub const OP_EVENTS: u32 = 10;
 pub const OP_CONNECT6: u32 = 19;
 pub const OP_LISTEN6: u32 = 20;
+pub const OP_LISTEN6ONLY: u32 = 23;
 
 /// What a record of an `EVENTS` says.
 pub const EV_CONNECTED: u16 = 1;
@@ -132,8 +137,10 @@ pub(super) struct Conn {
 /// A socket that takes connections.
 pub(super) struct Listener {
     port: u16,
-    /// A `LISTEN6`: it takes what arrives as IPv6 too.
-    six: bool,
+    /// The one version of IP it takes what arrives as: IPv4 for a
+    /// `LISTEN`, IPv6 for a `LISTEN6ONLY`, and none for a `LISTEN6`,
+    /// which takes both.
+    only: Option<IpVersion>,
     backlog: usize,
     /// The window of each connection it makes.
     window: usize,
@@ -228,21 +235,21 @@ fn socket() -> TcpSocket<'static> {
     socket
 }
 
-/// A socket that takes a connection to `port`, one that arrives as IPv6
-/// as well when `six`. A handshake that starts on it and is not finished
-/// is given up on in the time a connect is.
-fn listening(port: u16, six: bool) -> Option<TcpSocket<'static>> {
+/// A socket that takes a connection to `port`: one that arrives as the
+/// version `only`, or as either. A handshake that starts on it and is not
+/// finished is given up on in the time a connect is.
+fn listening(port: u16, only: Option<IpVersion>) -> Option<TcpSocket<'static>> {
     let mut socket = socket();
-    listen_again(&mut socket, port, six).then_some(socket)
+    listen_again(&mut socket, port, only).then_some(socket)
 }
 
 /// Have `socket`, which is closed, take a connection to `port`.
-fn listen_again(socket: &mut TcpSocket<'_>, port: u16, six: bool) -> bool {
+fn listen_again(socket: &mut TcpSocket<'_>, port: u16, only: Option<IpVersion>) -> bool {
     if socket.listen(port).is_err() {
         return false;
     }
     // After the listen, which forgets the ones before.
-    socket.set_listen_ipv4_only(!six);
+    socket.set_listen_only(only);
     socket.set_timeout(Some(CONNECT_TIMEOUT));
     true
 }
@@ -335,8 +342,13 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         Ok(true)
     }
 
-    /// `LISTEN`, or `LISTEN6` when `six`.
-    pub(super) fn listen(&mut self, sock: u64, m: &[u8], six: bool) -> Result<bool, Refused> {
+    /// `LISTEN` (`only` IPv4), `LISTEN6` (both) or `LISTEN6ONLY`.
+    pub(super) fn listen(
+        &mut self,
+        sock: u64,
+        m: &[u8],
+        only: Option<IpVersion>,
+    ) -> Result<bool, Refused> {
         if m.len() != HEADER_LEN + 8 {
             return Err(Refused::Malformed);
         }
@@ -346,7 +358,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         }
         let listener = Listener {
             port,
-            six,
+            only,
             backlog: (u16_at(m, 18) as usize).clamp(1, BACKLOG_MAX),
             window: u32_at(m, 20) as usize,
             ready: Vec::new(),
@@ -502,7 +514,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 && listener.ready.len() < most
                 && sockets < STREAMS_MAX
             {
-                let Some(socket) = self::listening(listener.port, listener.six) else {
+                let Some(socket) = self::listening(listener.port, listener.only) else {
                     break;
                 };
                 listener.ready.push(self.set.add(socket));
@@ -564,7 +576,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                     // A socket whose handshake was given up on listens
                     // again.
                     TcpState::Closed | TcpState::TimeWait => {
-                        listen_again(&mut socket, listener.port, listener.six);
+                        listen_again(&mut socket, listener.port, listener.only);
                     }
                     // Made. Also one whose peer closed it at once: the
                     // program accepts it and reads the end.

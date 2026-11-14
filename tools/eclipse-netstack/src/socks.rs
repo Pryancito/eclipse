@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
-//! BIND    (kernel to stack)  16  u16 port
+//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
@@ -28,7 +28,11 @@
 //!
 //! A socket's port is one, whichever way a datagram for it travels: what
 //! arrives is told in the order it arrived, in a `DATA` or a `DATA6` as
-//! each travelled. The kernel numbers the sockets and gives out the ports, so a
+//! each travelled. Unless its `BIND` says the socket is for one version
+//! of IP `only` (4 or 6, where 0 is both), as an `AF_INET` socket is and
+//! one told `IPV6_V6ONLY`: then what arrives as the other is not its
+//! own, and another socket can have the same port for that.
+//! The kernel numbers the sockets and gives out the ports, so a
 //! `BIND` is told, not asked: the stack opens a smoltcp socket on that
 //! port and from then on every datagram that arrives for it goes to the
 //! kernel, at once, and every `SEND` goes to the card, to travel as many
@@ -94,7 +98,8 @@ pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
 use icmp6::{OP_HEAR6, OP_ICMP6};
-use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
+use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_LISTEN6ONLY};
+use tcp::{OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, Undelivered6, EV_UNDELIVERED, EV_UNDELIVERED6};
 
 /// The operations of a message.
@@ -424,8 +429,10 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             IpProtocol::Udp => {
                 let set = &mut self.set;
                 let mut socks = self.socks.iter();
+                // The one that has the port for what travels as IPv4.
                 let sock = socks.find(|&(_, &handle)| {
-                    set.get::<UdpSocket>(handle).endpoint().port == said.local
+                    let socket = set.get::<UdpSocket>(handle);
+                    socket.endpoint().port == said.local && socket.only() != Some(IpVersion::Ipv6)
                 });
                 if let Some((&sock, _)) = sock {
                     self.streams.owe(sock, EV_UNDELIVERED, 0, &said.bytes());
@@ -452,7 +459,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 let set = &mut self.set;
                 let mut socks = self.socks.iter();
                 let sock = socks.find(|&(_, &handle)| {
-                    set.get::<UdpSocket>(handle).endpoint().port == said.local
+                    let socket = set.get::<UdpSocket>(handle);
+                    socket.endpoint().port == said.local && socket.only() != Some(IpVersion::Ipv4)
                 });
                 if let Some((&sock, _)) = sock {
                     self.streams.owe(sock, EV_UNDELIVERED6, 0, &said.bytes());
@@ -488,8 +496,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         match op {
             OP_CONNECT => self.connect(sock, m),
             OP_CONNECT6 => self.connect6(sock, m),
-            OP_LISTEN => self.listen(sock, m, false),
-            OP_LISTEN6 => self.listen(sock, m, true),
+            OP_LISTEN => self.listen(sock, m, Some(IpVersion::Ipv4)),
+            OP_LISTEN6 => self.listen(sock, m, None),
+            OP_LISTEN6ONLY => self.listen(sock, m, Some(IpVersion::Ipv6)),
             OP_WRITE => self.write(sock, m),
             OP_SHUTDOWN if m.len() == HEADER_LEN => self.shutdown(sock),
             OP_WINDOW => self.window(sock, m),
@@ -500,8 +509,14 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_ICMP => self.icmp(sock, m),
             OP_ICMP6 => self.icmp6(sock, m),
             OP_BIND => {
-                let port: [u8; 2] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
-                let port = u16::from_le_bytes(port);
+                let said: [u8; 4] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
+                let port = u16::from_le_bytes([said[0], said[1]]);
+                let only = match said[2] {
+                    0 => None,
+                    4 => Some(IpVersion::Ipv4),
+                    6 => Some(IpVersion::Ipv6),
+                    _ => return Err(Refused::Malformed),
+                };
                 if port == 0 || self.knows(sock) {
                     return Err(Refused::Bind);
                 }
@@ -514,6 +529,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 };
                 let mut socket = UdpSocket::new(buffer(RX_DATAGRAMS), buffer(TX_DATAGRAMS));
                 socket.bind(port).map_err(|_| Refused::Bind)?;
+                socket.set_only(only);
                 self.socks.insert(sock, self.set.add(socket));
                 Ok(false)
             }
@@ -766,8 +782,15 @@ mod tests {
         m
     }
 
+    /// A `BIND` of a socket that is for both versions of IP.
     pub(super) fn bind(sock: u64, port: u16) -> Vec<u8> {
-        message(OP_BIND, sock, &port.to_le_bytes())
+        bind_only(sock, port, 0)
+    }
+
+    /// A `BIND` of a socket that is for one version `only`: 4 or 6.
+    pub(super) fn bind_only(sock: u64, port: u16, only: u8) -> Vec<u8> {
+        let [low, high] = port.to_le_bytes();
+        message(OP_BIND, sock, &[low, high, only, 0])
     }
 
     /// A `SEND` as a kernel that says no hop limit writes it.
@@ -882,8 +905,8 @@ mod tests {
         assert_eq!(parse_header(&data), Some((OP_DATA, 0)));
         assert_eq!(parse_header(&data[..HEADER_LEN - 1]), None);
         assert_eq!(
-            bind(7, 5000),
-            [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13]
+            bind_only(7, 5000, 4),
+            [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13, 4, 0]
         );
         assert_eq!(hear(7), [0, 0, 0, 0, 11, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
