@@ -662,6 +662,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "",
         ),
         ("hunterd", "respawn", "/usr/local/bin/eclipse-hunterd", ""),
+        ("knet", "respawn", "/usr/local/bin/eclipse-unet kernel", ""),
         (
             "labwc",
             "respawn",
@@ -690,7 +691,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "network",
             "respawn",
             "/usr/local/bin/eclipse-network-up",
-            "unet",
+            "unet knet",
         ),
         ("notify", "respawn", "/usr/local/bin/eclipse-notify", ""),
         ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "network"),
@@ -913,8 +914,9 @@ fn only_the_bus_probe_is_gated_on_the_kernel_cmdline() {
 }
 
 /// `udriver =` keeps a driver out of every boot where the kernel drives the
-/// device itself. Only the two drivers that run as processes have it, and
-/// what mounts the served disk; each driver names what its wrapper drives,
+/// device itself. Only the two drivers that run as processes have it,
+/// what mounts the served disk, and the stack that borrows a card of the
+/// kernel's (`knet`); each driver names what its wrapper drives,
 /// and each is supervised: a driver that is not started again leaves the
 /// machine without the device until it reboots.
 #[test]
@@ -926,7 +928,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .collect();
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["ublk", "ublk-mounts", "unet"],
+        ["knet", "ublk", "ublk-mounts", "unet"],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
     for (name, body) in &gated {
@@ -937,6 +939,14 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         };
         assert_eq!(field(body, "type"), Some(kind), "{name}");
     }
+    // The card the kernel lends: what it lists it as, and the wrapper of
+    // the other card told which this one is.
+    assert_eq!(field(&gated[0].1, "udriver"), Some("kernel-net@0"));
+    assert_eq!(
+        field(&gated[0].1, "exec"),
+        Some("/usr/local/bin/eclipse-unet kernel")
+    );
+    let gated = &gated[1..];
     // The mounts: on the boots the disk's driver runs on, after its start.
     assert_eq!(field(&gated[1].1, "udriver"), field(&gated[0].1, "udriver"));
     assert_eq!(field(&gated[1].1, "after"), Some("ublk"));
@@ -989,7 +999,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .find(|(n, _)| n == "network")
         .unwrap()
         .1;
-    assert_eq!(field(&network, "after"), Some("unet"));
+    assert_eq!(field(&network, "after"), Some("unet knet"));
 }
 
 /// What the disk's wrapper makes of a kernel command line: the number of
@@ -1050,7 +1060,7 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         );
     }
     let dir = scratch("unet-stack-run");
-    let run = |cmdline: &str| {
+    let run_as = |card: &str, cmdline: &str| {
         let file = dir.join("cmdline");
         fs::write(&file, cmdline).unwrap();
         let script = script
@@ -1063,10 +1073,13 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
+            .arg("eclipse-unet")
+            .args((!card.is_empty()).then_some(card))
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
     };
+    let run = |cmdline: &str| run_as("", cmdline);
     // The kernel joins its arguments with colons; a plain command line has
     // spaces. Either way the word is found whole, with its value.
     for cmdline in [
@@ -1144,6 +1157,32 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         "LOG=warn udriver=virtio-net@0 unetdriver=process unetstack=none\n",
     ] {
         assert_eq!(run(cmdline), "waits\n", "{cmdline:?}");
+    }
+    // `eclipse-unet kernel`, the `knet` service: the stack borrows the
+    // kernel's card, with a server's address or the boot's, and no driver
+    // process whatever `unetdriver=` says.
+    for (cmdline, stack) in [
+        ("LOG=warn:unetcard=kernel:ROOT=/dev/vda\n", "dhcp"),
+        ("LOG=warn unetcard=kernel unetstack=dhcp\n", "dhcp"),
+        (
+            "LOG=warn:unetcard=kernel:unetstack=10.0.2.15/24,10.0.2.2\n",
+            "10.0.2.15/24,10.0.2.2",
+        ),
+        ("LOG=warn:unetcard=kernel:unetdriver=process\n", "dhcp"),
+    ] {
+        assert_eq!(
+            run_as("kernel", cmdline),
+            format!("stack 0 {stack} card=kernel\n"),
+            "{cmdline:?}"
+        );
+    }
+    // The kernel lends nothing on a boot with no stack process, so the
+    // service does not start; started all the same, it only waits.
+    for cmdline in [
+        "LOG=warn:unetcard=kernel:unetstack=kernel\n",
+        "LOG=warn:unetcard=kernel:unetstack=none\n",
+    ] {
+        assert_eq!(run_as("kernel", cmdline), "waits\n", "{cmdline:?}");
     }
 }
 
@@ -1409,6 +1448,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         // A card's driver and a disk's, and the disk's mounts; no session
         // needed.
         "unet",
+        "knet",
         "ublk",
         "ublk-mounts",
     ];

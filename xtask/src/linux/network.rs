@@ -71,7 +71,7 @@ pub(super) fn write_network_service(svc_dir: &Path) {
         b"# The network at boot. See /usr/local/bin/eclipse-network-up.\n\
           exec = /usr/local/bin/eclipse-network-up\n\
           type = respawn\n\
-          after = unet\n",
+          after = unet knet\n",
     )
     .unwrap();
 }

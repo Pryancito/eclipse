@@ -3180,6 +3180,7 @@ dependencies = [
  "cfg-if 1.0.0",
  "env_logger",
  "executor",
+ "futures",
  "hunter",
  "kernel-hal",
  "linux-object",

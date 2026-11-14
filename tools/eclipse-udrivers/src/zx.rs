@@ -39,6 +39,8 @@ pub mod nr {
     pub const ECLIPSE_FIFO_REPLY_WAIT: i64 = 0x4008;
     pub const ECLIPSE_NETSTACK_SERVE: i64 = 0x4009;
     pub const ECLIPSE_NETSTACK_USE: i64 = 0x400a;
+    pub const ECLIPSE_NET_BORROW: i64 = 0x400b;
+    pub const ECLIPSE_NET_LENT_TURN: i64 = 0x400c;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.
@@ -47,11 +49,13 @@ pub struct Status(pub i32);
 
 impl Status {
     pub const INTERNAL_INTR_RETRY: Status = Status(-6);
+    pub const NOT_SUPPORTED: Status = Status(-2);
     pub const INVALID_ARGS: Status = Status(-10);
     pub const OUT_OF_RANGE: Status = Status(-14);
     pub const TIMED_OUT: Status = Status(-21);
     pub const SHOULD_WAIT: Status = Status(-22);
     pub const PEER_CLOSED: Status = Status(-24);
+    pub const NOT_FOUND: Status = Status(-25);
     pub const ALREADY_BOUND: Status = Status(-27);
     pub const IO: Status = Status(-40);
     /// Not Zircon's: what Linux answers to a system call it does not have,

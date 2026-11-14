@@ -22,6 +22,12 @@ linux-syscall = { path = "../linux-syscall", optional = true }
 hunter = { path = "../hunter" }
 executor = { path = "../vendor/PreemptiveScheduler" }
 lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
+# `zircon_object::impl_kobject!` names it: a kernel object of this crate's
+# own (`linux::net_lend::LentCard`) needs it in scope.
+futures = { version = "0.3", default-features = false, features = [
+  "alloc",
+  "async-await",
+] }
 
 [features]
 default = ["libos", "linux", "zircon"]
