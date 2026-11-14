@@ -1109,6 +1109,14 @@ impl Socket for ServedTcpSocket {
         })
     }
 
+    fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
+        // `IPV6_V6ONLY`: no, an `AF_INET6` socket here takes both
+        // families.
+        const IPV6_V6ONLY: usize = 26;
+        (self.v6 && level == icmp6::IPPROTO_IPV6 && opt == IPV6_V6ONLY)
+            .then(|| 0i32.to_ne_bytes().to_vec())
+    }
+
     fn so_protocol(&self) -> Option<u32> {
         Some(6) // IPPROTO_TCP
     }
@@ -1433,6 +1441,19 @@ mod tests {
         assert_eq!(stack.told(), Some(close_message(sock)));
         let other = stream(&stack);
         assert_eq!(Socket::bind(&other, any(port)), Ok(0));
+    }
+
+    #[test]
+    fn an_ipv6_stream_socket_says_it_is_not_ipv6_only() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let six = ServedTcpSocket::new(stack.link.clone(), true).unwrap();
+        let zero = Some(0i32.to_ne_bytes().to_vec());
+        assert_eq!(Socket::getsockopt_own(&six, 41, 26), zero);
+        // The hops are not kept: nobody is told how many.
+        assert_eq!(Socket::getsockopt_own(&six, 41, 16), None);
+        assert_eq!(Socket::getsockopt_own(&six, 58, 1), None);
+        assert_eq!(Socket::getsockopt_own(&stream(&stack), 41, 26), None);
     }
 
     #[test]
