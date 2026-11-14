@@ -293,7 +293,8 @@ fn a_boot_that_asks_for_every_program_has_asked_for_each() {
     let _g = LOCK.lock();
     let proc = crate::process::LinuxProcess::new(rcore_fs_ramfs::RamFS::new(), 0);
     assert!(!proc.uses_user_netstack());
-    // `unetuse=all`: every program is one that asked.
+    // A boot where the stack process is the machine's network: every
+    // program is one that asked.
     use_for_all(true);
     assert!(is_for_all());
     assert!(proc.uses_user_netstack());

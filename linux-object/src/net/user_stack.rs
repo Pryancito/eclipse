@@ -311,6 +311,7 @@ use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
+pub mod boot;
 mod groups;
 mod groups6;
 mod icmp;
@@ -1451,9 +1452,9 @@ pub fn serve(channel: Arc<Channel>, max_datagram: usize, address: [u8; 4]) -> Zx
 /// not: see [`use_for_all`].
 static FOR_ALL: AtomicBool = AtomicBool::new(false);
 
-/// From now on every program is one that asked (`unetuse=all` on the
-/// kernel command line): the machine's network is the stack that runs as
-/// a process, and the kernel's own stack is nobody's.
+/// From now on every program is one that asked: the machine's network is
+/// the stack that runs as a process, and the kernel's own stack is
+/// nobody's. Which boots are like that is [`boot::whose`]'s to say.
 pub fn use_for_all(on: bool) {
     FOR_ALL.store(on, Ordering::Relaxed);
 }
