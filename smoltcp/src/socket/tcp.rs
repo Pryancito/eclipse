@@ -58,7 +58,8 @@ impl fmt::Display for State {
 }
 
 /// Initial sequence number. This used to be 0, but some servers don't behave correctly
-/// with that, so we use a non-zero starting sequence number. TODO: randomize instead.
+/// with that, so we use a non-zero starting sequence number. A socket that was given
+/// somebody to choose it ([`TcpSocket::set_initial_seq`]) starts where they say instead.
 /// https://github.com/smoltcp-rs/smoltcp/issues/489
 const INITIAL_SEQ_NO: TcpSeqNumber = TcpSeqNumber(42);
 
@@ -382,6 +383,9 @@ pub struct TcpSocket<'a> {
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
+    /// Who chooses the sequence number a connection starts at; see
+    /// [`set_initial_seq`](Self::set_initial_seq).
+    initial_seq: Option<fn(IpEndpoint, IpEndpoint) -> u32>,
     /// Delayed ack timer. If set, packets containing exclusively
     /// ACK or window updates (ie, no data) won't be sent until expiry.
     ack_delay_timer: AckDelayTimer,
@@ -450,6 +454,7 @@ impl<'a> TcpSocket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             ack_delay: Some(ACK_DELAY_DEFAULT),
+            initial_seq: None,
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
@@ -555,6 +560,28 @@ impl<'a> TcpSocket<'a> {
     /// By default, the ACK delay is set to 10ms.
     pub fn set_ack_delay(&mut self, duration: Option<Duration>) {
         self.ack_delay = duration
+    }
+
+    /// Have `choose` say the sequence number each connection of this
+    /// socket starts at, from the local and the remote endpoint of the
+    /// connection, in that order: the one it makes ([`connect`](Self::connect),
+    /// where the local address may not be chosen yet) and each one it takes
+    /// while it listens, asked again for every SYN.
+    ///
+    /// Without one, a connection made starts at a number everybody knows
+    /// and one taken at a number worked out from the peer's, so whoever
+    /// knows the addresses and ports of a connection can write into it
+    /// without seeing it (RFC 6528). A socket keeps who chooses for as
+    /// long as it lives, also when it listens or connects again.
+    pub fn set_initial_seq(&mut self, choose: Option<fn(IpEndpoint, IpEndpoint) -> u32>) {
+        self.initial_seq = choose
+    }
+
+    /// The sequence number a connection between `local` and `remote` starts
+    /// at when somebody chooses it.
+    fn chosen_seq(&self, local: IpEndpoint, remote: IpEndpoint) -> Option<TcpSeqNumber> {
+        self.initial_seq
+            .map(|choose| TcpSeqNumber(choose(local, remote) as i32))
     }
 
     /// Enable or disable Nagle's Algorithm.
@@ -771,8 +798,10 @@ impl<'a> TcpSocket<'a> {
             ..local_endpoint
         };
 
-        // Carry over the local sequence number.
-        let local_seq_no = self.local_seq_no;
+        // Carry over the local sequence number, when nobody chooses it.
+        let local_seq_no = self
+            .chosen_seq(local_endpoint, remote_endpoint)
+            .unwrap_or(self.local_seq_no);
 
         self.reset();
         self.local_endpoint = local_endpoint;
@@ -1604,8 +1633,11 @@ impl<'a> TcpSocket<'a> {
 
                 self.local_endpoint = IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port);
                 self.remote_endpoint = IpEndpoint::new(ip_repr.src_addr(), repr.src_port);
-                // FIXME: use something more secure here
-                self.local_seq_no = TcpSeqNumber(!repr.seq_number.0);
+                // What the peer could work out by itself, unless somebody
+                // chooses.
+                self.local_seq_no = self
+                    .chosen_seq(self.local_endpoint, self.remote_endpoint)
+                    .unwrap_or(TcpSeqNumber(!repr.seq_number.0));
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.remote_has_sack = repr.sack_permitted;
@@ -3067,6 +3099,48 @@ mod test {
     }
 
     #[test]
+    fn test_listen_syn_starts_where_chosen() {
+        fn choose(local: IpEndpoint, remote: IpEndpoint) -> u32 {
+            assert_eq!(local, LOCAL_END);
+            assert_eq!(remote, REMOTE_END);
+            0x8000_0000 | (u32::from(local.port) << 8) | u32::from(remote.port)
+        }
+        let chosen = TcpSeqNumber(choose(LOCAL_END, REMOTE_END) as i32);
+        let syn = TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        };
+
+        let mut s = socket_listen();
+        s.set_initial_seq(Some(choose));
+        send!(s, syn);
+        assert_eq!(s.state, State::SynReceived);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: chosen,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Listening again does not forget who chooses.
+        s.abort();
+        assert_eq!(s.listen(LOCAL_PORT), Ok(()));
+        send!(s, syn);
+        assert_eq!(s.local_seq_no, chosen);
+
+        // And nobody chooses for a socket that was not told.
+        let mut s = socket_listen();
+        send!(s, syn);
+        assert_eq!(s.local_seq_no, TcpSeqNumber(!REMOTE_SEQ.0));
+    }
+
+    #[test]
     fn test_listen_rst() {
         let mut s = socket_listen();
         send!(
@@ -3366,6 +3440,54 @@ mod test {
             .expect("Connect failed with valid parameters");
         assert_eq!(s.local_endpoint(), LOCAL_END);
         assert_eq!(s.remote_endpoint(), REMOTE_END);
+    }
+
+    #[test]
+    fn test_connect_starts_where_chosen() {
+        fn choose(local: IpEndpoint, remote: IpEndpoint) -> u32 {
+            // The address it leaves from is not chosen yet.
+            assert_eq!(local, IpEndpoint::new(MOCK_UNSPECIFIED, LOCAL_END.port));
+            assert_eq!(remote, REMOTE_END);
+            0xfff0_0000 | u32::from(remote.port)
+        }
+        let chosen = TcpSeqNumber(choose(
+            IpEndpoint::new(MOCK_UNSPECIFIED, LOCAL_END.port),
+            REMOTE_END,
+        ) as i32);
+
+        let mut s = socket();
+        s.set_initial_seq(Some(choose));
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: chosen,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(chosen + 1),
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+
+        // Connecting again asks again.
+        s.abort();
+        s.local_seq_no = LOCAL_SEQ;
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
+        assert_eq!(s.local_seq_no, chosen);
     }
 
     #[test]

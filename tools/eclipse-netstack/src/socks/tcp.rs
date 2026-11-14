@@ -232,6 +232,8 @@ fn socket() -> TcpSocket<'static> {
     // As the kernel's stack: an acknowledgement held back is a peer whose
     // window opens late.
     socket.set_ack_delay(None);
+    // Where each connection starts counting is not for anybody to guess.
+    socket.set_initial_seq(Some(super::isn::initial_seq));
     socket
 }
 
@@ -1085,6 +1087,40 @@ mod tests {
             wire.stack.request(&listen(5, 8080, 1, 1000)),
             Err(Refused::Bind)
         );
+    }
+
+    #[test]
+    fn nobody_can_tell_beforehand_where_a_connection_starts() {
+        let mut wire = Wire::new();
+        // The ones we make: not at smoltcp's 42, and two of them not at
+        // the same place.
+        let mut starts = Vec::new();
+        for (sock, local) in [(1, 50000), (2, 50001), (3, 50002)] {
+            let (sent, _) = wire.asked(&connect(sock, THEIR_IP, 80, local, 1000));
+            assert_eq!((sent.len(), sent[0].control), (1, TcpControl::Syn));
+            assert_ne!(sent[0].seq, 42);
+            assert!(!starts.contains(&sent[0].seq), "{starts:?}");
+            starts.push(sent[0].seq);
+        }
+        // The ones we take: not at what the peer's number says, and not
+        // the same for two peers that start at the same number.
+        assert_eq!(wire.stack.request(&listen(7, 8080, 4, 1000)), Ok(false));
+        for from in [40001, 40002, 40003] {
+            let syn = Segment {
+                from,
+                to: 8080,
+                control: TcpControl::Syn,
+                seq: 9000,
+                ack: None,
+                data: vec![],
+            };
+            let (sent, _) = wire.hears(&syn);
+            assert_eq!((sent.len(), sent[0].control), (1, TcpControl::Syn));
+            assert_eq!(sent[0].ack, Some(9001));
+            assert_ne!(sent[0].seq, !9000);
+            assert!(!starts.contains(&sent[0].seq), "{starts:?}");
+            starts.push(sent[0].seq);
+        }
     }
 
     #[test]
