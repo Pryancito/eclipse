@@ -263,6 +263,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         self.six.ear = Some(self.set.add(ear));
         self.six.ask_at = Some(self.now);
         self.six.news = true;
+        self.mld_speak();
     }
 
     /// Whether a datagram for `addr` can be sent as IPv6: to a group, to
@@ -307,6 +308,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 }
             }
         });
+        self.mld_addresses();
     }
 
     fn take_six(&mut self, address: Ipv6Address) {
@@ -316,6 +318,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                 addrs.retain(|have| *have != cidr);
             }
         });
+        self.mld_addresses();
     }
 
     /// Before a poll: ask for a router when it is time to.
@@ -481,7 +484,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::socks) mod tests {
     use super::*;
     use crate::port::testing::*;
     use crate::socks::icmp6::{OP_HEAR6, OP_ICMP6};
@@ -499,7 +502,7 @@ mod tests {
     use smoltcp::wire::{UdpPacket, UdpRepr};
 
     /// Our address on the link, and the one made from the router's prefix.
-    const OURS_LINK: Ipv6Address = Ipv6Address([
+    pub(in crate::socks) const OURS_LINK: Ipv6Address = Ipv6Address([
         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x57,
     ]);
     const OURS_GIVEN: Ipv6Address = Ipv6Address([
@@ -507,13 +510,14 @@ mod tests {
     ]);
     const PREFIX: Ipv6Address = Ipv6Address([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     /// THEIRS on the link: the router.
-    const ROUTER: Ipv6Address = Ipv6Address([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    pub(in crate::socks) const ROUTER: Ipv6Address =
+        Ipv6Address([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     const ALL_NODES: Ipv6Address = Ipv6Address::LINK_LOCAL_ALL_NODES;
     const ON_LINK_FLAG: u8 = 0x80;
 
     /// A stack over a bench's card that speaks IPv6, with room for a
     /// route.
-    fn stack() -> (Stack<crate::port::Port>, Window) {
+    pub(in crate::socks) fn stack() -> (Stack<crate::port::Port>, Window) {
         let Bench { window, iface, .. } = Bench::new();
         let mut stack = Stack::new(iface);
         stack.speak_six();
@@ -521,8 +525,25 @@ mod tests {
     }
 
     /// Poll at `ms`, and the frames that put on the wire, the card done
-    /// with each.
-    fn frames(stack: &mut Stack<crate::port::Port>, window: &Window, ms: i64) -> Vec<Vec<u8>> {
+    /// with each. What the stack says of its groups (MLD, behind a
+    /// hop-by-hop header) is not among them: [`super::super::mld`] looks
+    /// at that.
+    pub(in crate::socks) fn frames(
+        stack: &mut Stack<crate::port::Port>,
+        window: &Window,
+        ms: i64,
+    ) -> Vec<Vec<u8>> {
+        let mut out = every_frame(stack, window, ms);
+        out.retain(|frame| !is_mld(frame));
+        out
+    }
+
+    /// The same, with what the stack says of its groups.
+    pub(in crate::socks) fn every_frame(
+        stack: &mut Stack<crate::port::Port>,
+        window: &Window,
+        ms: i64,
+    ) -> Vec<Vec<u8>> {
         stack.poll(Instant::from_millis(ms));
         let turn = turn(stack.device());
         let mut out = Vec::new();
@@ -535,8 +556,16 @@ mod tests {
         out
     }
 
+    /// Whether `frame` carries IPv6 behind a hop-by-hop header.
+    pub(in crate::socks) fn is_mld(frame: &[u8]) -> bool {
+        let eth = EthernetFrame::new_checked(frame).unwrap();
+        eth.ethertype() == EthernetProtocol::Ipv6
+            && Ipv6Packet::new_checked(eth.payload())
+                .is_ok_and(|ip| ip.next_header() == IpProtocol::HopByHop)
+    }
+
     /// The card of the group `group`: `33:33` and its last four bytes.
-    fn group_card(group: Ipv6Address) -> EthernetAddress {
+    pub(in crate::socks) fn group_card(group: Ipv6Address) -> EthernetAddress {
         let g = group.0;
         EthernetAddress([0x33, 0x33, g[12], g[13], g[14], g[15]])
     }
@@ -553,7 +582,7 @@ mod tests {
 
     /// THEIRS sends `payload`, of `protocol`, from `from` to `to`, to
     /// travel `hops`.
-    fn ip6_frame(
+    pub(in crate::socks) fn ip6_frame(
         from: Ipv6Address,
         to: Ipv6Address,
         hops: u8,
@@ -586,7 +615,11 @@ mod tests {
     }
 
     /// THEIRS sends the datagram `data` from `from` to `to`, as IPv6.
-    fn udp6_frame(from: (Ipv6Address, u16), to: (Ipv6Address, u16), data: &[u8]) -> Vec<u8> {
+    pub(in crate::socks) fn udp6_frame(
+        from: (Ipv6Address, u16),
+        to: (Ipv6Address, u16),
+        data: &[u8],
+    ) -> Vec<u8> {
         let udp = UdpRepr {
             src_port: from.1,
             dst_port: to.1,
@@ -606,7 +639,7 @@ mod tests {
     /// A datagram of ours on the wire as IPv6: the card it is for, who
     /// it is from and for, the hops, and what it carries, its sum
     /// checked.
-    type Datagram6 = (
+    pub(in crate::socks) type Datagram6 = (
         EthernetAddress,
         (Ipv6Address, u16),
         (Ipv6Address, u16),
@@ -614,7 +647,7 @@ mod tests {
         Vec<u8>,
     );
 
-    fn udp6_of(frame: &[u8]) -> Datagram6 {
+    pub(in crate::socks) fn udp6_of(frame: &[u8]) -> Datagram6 {
         let eth = EthernetFrame::new_checked(frame).unwrap();
         assert_eq!(eth.src_addr(), OURS);
         assert_eq!(eth.ethertype(), EthernetProtocol::Ipv6);
@@ -643,7 +676,13 @@ mod tests {
     }
 
     /// A `SEND6` as the kernel writes it.
-    fn send6(sock: u64, to: Ipv6Address, port: u16, hops: u8, data: &[u8]) -> Vec<u8> {
+    pub(in crate::socks) fn send6(
+        sock: u64,
+        to: Ipv6Address,
+        port: u16,
+        hops: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut rest = to.0.to_vec();
         rest.extend_from_slice(&port.to_le_bytes());
         rest.extend_from_slice(&[hops, 0]);
@@ -652,7 +691,7 @@ mod tests {
     }
 
     /// The records of a `DATA6`.
-    fn records6(m: &[u8]) -> Vec<(u64, Ipv6Address, u16, Vec<u8>)> {
+    pub(in crate::socks) fn records6(m: &[u8]) -> Vec<(u64, Ipv6Address, u16, Vec<u8>)> {
         assert_eq!(parse_header(m), Some((OP_DATA6, 0)));
         let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
         while !rest.is_empty() {
@@ -901,9 +940,10 @@ mod tests {
                 assert_eq!(ask.message[4..], said[4..]);
                 asked.push(ms);
             }
-            // Nothing else to wake for but the next of them.
+            // Nothing else to wake for but the next of them, and in the
+            // first second what MLD says again.
             let idle = stack.idle_for(Instant::from_millis(ms));
-            let next = [4000, 8000].iter().find(|&&at| at > ms);
+            let next = [1000, 4000, 8000].iter().find(|&&at| at > ms);
             assert_eq!(
                 idle,
                 next.map(|&at| Duration::from_millis((at - ms) as u64))
@@ -1970,7 +2010,10 @@ mod tests {
         let mut m = Vec::new();
         // Asked for three times, a second apart, and nothing is said.
         for ms in [1000, 2000, 3000] {
-            let sent = frames(&mut stack, &window, ms);
+            // Twice: the bench's card has two slots, and in the first
+            // second one of them goes to what MLD says again.
+            let mut sent = frames(&mut stack, &window, ms);
+            sent.extend(frames(&mut stack, &window, ms));
             assert_eq!(kinds(&sent), [135], "at {ms}");
             assert_eq!(six_of(&sent[0]).message[8..24], nobody.0);
             assert_eq!(stack.arrived(&mut m), Arrived::Nothing);

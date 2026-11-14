@@ -59,6 +59,9 @@ const IPV6_CHECKSUM: usize = 7;
 const IPV6_2292HOPLIMIT: usize = 8;
 const IPV6_UNICAST_HOPS: usize = 16;
 const IPV6_MULTICAST_HOPS: usize = 18;
+const IPV6_MULTICAST_LOOP: usize = 19;
+pub(super) const IPV6_JOIN_GROUP: usize = 20;
+pub(super) const IPV6_LEAVE_GROUP: usize = 21;
 pub(super) const IPV6_V6ONLY: usize = 26;
 const IPV6_RECVHOPLIMIT: usize = 51;
 const IPV6_HOPLIMIT: usize = 52;
@@ -194,6 +197,9 @@ pub(super) struct Opts {
     /// `IPV6_UNICAST_HOPS` and `IPV6_MULTICAST_HOPS`, when said.
     hops: Option<u8>,
     group_hops: Option<u8>,
+    /// `IPV6_MULTICAST_LOOP` turned off: what the socket sends to a group
+    /// is not for the members in this machine.
+    no_loop: bool,
     /// `IPV6_RECVHOPLIMIT` and `IPV6_2292HOPLIMIT`: `recvmsg` says how
     /// many hops what it read had left.
     tell_hops: bool,
@@ -211,6 +217,18 @@ impl Opts {
             _ => return None,
         };
         Some(hops(data).map(|hops| *kept = hops))
+    }
+
+    /// `setsockopt` of whether what the socket sends to a group is also
+    /// for the members in this machine (`IPV6_MULTICAST_LOOP`): `None`
+    /// for any other option.
+    pub(super) fn set_loop(&mut self, opt: usize, data: &[u8]) -> Option<LxResult<()>> {
+        (opt == IPV6_MULTICAST_LOOP).then(|| flag(data).map(|on| self.no_loop = !on))
+    }
+
+    /// Whether it is.
+    pub(super) fn loops(&self) -> bool {
+        !self.no_loop
     }
 
     /// How many hops what goes to `to` may travel, when the socket was
@@ -240,6 +258,7 @@ impl Opts {
         match opt {
             IPV6_UNICAST_HOPS => Some(i32::from(self.hops.unwrap_or(HOPS))),
             IPV6_MULTICAST_HOPS => Some(i32::from(self.group_hops.unwrap_or(GROUP_HOPS))),
+            IPV6_MULTICAST_LOOP => Some(i32::from(self.loops())),
             IPV6_RECVHOPLIMIT => Some(i32::from(self.tell_hops)),
             IPV6_2292HOPLIMIT => Some(i32::from(self.tell_hops_2292)),
             IPV6_V6ONLY => Some(0),
@@ -378,6 +397,10 @@ impl ServedIcmpSocket {
             (IPPROTO_IP, _) => Some(Err(LxError::ENOPROTOOPT)),
             (IPPROTO_IPV6, IPV6_UNICAST_HOPS | IPV6_MULTICAST_HOPS) => {
                 done(self.six.lock().set_hops(opt, data)?)
+            }
+            (IPPROTO_IPV6, IPV6_MULTICAST_LOOP) => done(self.six.lock().set_loop(opt, data)?),
+            (IPPROTO_IPV6, IPV6_JOIN_GROUP | IPV6_LEAVE_GROUP) => {
+                self.link.membership6(&self.shared, opt, data)
             }
             (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) => done(int(data).map(|on| {
                 self.six.lock().tell_hops = on != 0;

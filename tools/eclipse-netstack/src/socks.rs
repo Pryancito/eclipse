@@ -94,11 +94,13 @@ pub mod groups;
 pub mod icmp6;
 pub mod isn;
 pub mod lease;
+pub mod mld;
 pub mod six;
 pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
 use icmp6::{OP_HEAR6, OP_ICMP6};
+use mld::{OP_JOIN6, OP_LEAVE6};
 use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_LISTEN6ONLY};
 use tcp::{OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, Undelivered6, EV_UNDELIVERED, EV_UNDELIVERED6};
@@ -281,6 +283,8 @@ pub struct Stack<D: for<'d> Device<'d>> {
     hearing6: icmp6::Hearing6,
     /// The groups the machine is a member of, as the kernel said.
     groups: BTreeSet<Ipv4Address>,
+    /// The same of IPv6, and what there is to say of them.
+    mld: mld::Mld,
 }
 
 impl<D: for<'d> Device<'d>> Stack<D> {
@@ -302,6 +306,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             six: six::Six::default(),
             hearing6: icmp6::Hearing6::default(),
             groups: BTreeSet::new(),
+            mld: mld::Mld::default(),
         }
     }
 
@@ -507,6 +512,8 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_HEAR6 if m.len() == HEADER_LEN => self.hear6(sock),
             OP_JOIN => self.member(m, true),
             OP_LEAVE => self.member(m, false),
+            OP_JOIN6 => self.member6(m, true),
+            OP_LEAVE6 => self.member6(m, false),
             OP_ICMP => self.icmp(sock, m),
             OP_ICMP6 => self.icmp6(sock, m),
             OP_BIND => {
@@ -627,11 +634,13 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     pub fn poll(&mut self, now: Instant) {
         self.now = now;
         self.six_ask();
+        self.mld_say();
         // What poll has to say about a frame it did not understand is not
         // news.
         let _ = self.iface.poll(&mut self.set, now);
         self.lease_turn();
         self.six_turn();
+        self.mld_turn();
     }
 
     /// Make `m` the next message for the kernel of what the last
@@ -761,10 +770,9 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// when there is nothing of the kind.
     pub fn idle_for(&self, now: Instant) -> Option<Duration> {
         let sockets = self.iface.poll_delay(&self.set, now);
-        match (sockets, self.six_idle(now)) {
-            (Some(sockets), Some(six)) => Some(sockets.min(six)),
-            (sockets, six) => sockets.or(six),
-        }
+        let six = self.six_idle(now);
+        let mld = self.mld_idle(now);
+        [sockets, six, mld].into_iter().flatten().min()
     }
 }
 

@@ -45,6 +45,10 @@ struct InterfaceInner<'a> {
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
+    /// The groups of IPv6 the interface is a member of, when it was given
+    /// room to keep them: see [`InterfaceBuilder::ipv6_multicast_groups`].
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_multicast_groups: Option<ManagedMap<'a, Ipv6Address, ()>>,
     /// The start of each packet that had nowhere to go, the oldest first: see
     /// [`Interface::unreached`].
     unreached: [Option<[u8; QUOTED]>; UNREACHED],
@@ -78,6 +82,8 @@ pub struct InterfaceBuilder<'a, DeviceT: for<'d> Device<'d>> {
     /// Does not share storage with `ipv6_multicast_groups` to avoid IPv6 size overhead.
     #[cfg(feature = "proto-igmp")]
     ipv4_multicast_groups: ManagedMap<'a, Ipv4Address, ()>,
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_multicast_groups: Option<ManagedMap<'a, Ipv6Address, ()>>,
 }
 
 impl<'a, DeviceT> InterfaceBuilder<'a, DeviceT>
@@ -126,6 +132,8 @@ let iface = InterfaceBuilder::new(device)
             routes: Routes::new(ManagedMap::Borrowed(&mut [])),
             #[cfg(feature = "proto-igmp")]
             ipv4_multicast_groups: ManagedMap::Borrowed(&mut []),
+            #[cfg(feature = "proto-ipv6")]
+            ipv6_multicast_groups: None,
         }
     }
 
@@ -210,6 +218,26 @@ let iface = InterfaceBuilder::new(device)
         self
     }
 
+    /// Provide storage for the groups of IPv6 the interface is a member of,
+    /// and with it have the interface hear only what arrives for those: the
+    /// ones joined with [`join_multicast_group()`], the group of every node
+    /// and the solicited-node groups of its addresses. An interface that is
+    /// given none hears what arrives for any group, as it did before there
+    /// was something to join with.
+    ///
+    /// Joining and leaving a group of IPv6 sends nothing: saying so on the
+    /// network (MLD) is left to whoever joins.
+    ///
+    /// [`join_multicast_group()`]: struct.Interface.html#method.join_multicast_group
+    #[cfg(feature = "proto-ipv6")]
+    pub fn ipv6_multicast_groups<T>(mut self, ipv6_multicast_groups: T) -> Self
+    where
+        T: Into<ManagedMap<'a, Ipv6Address, ()>>,
+    {
+        self.ipv6_multicast_groups = Some(ipv6_multicast_groups.into());
+        self
+    }
+
     /// Set the Neighbor Cache the interface will use.
     #[cfg(feature = "medium-ethernet")]
     pub fn neighbor_cache(mut self, neighbor_cache: NeighborCache<'a>) -> Self {
@@ -272,6 +300,8 @@ let iface = InterfaceBuilder::new(device)
                 ipv4_multicast_groups: self.ipv4_multicast_groups,
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_multicast_groups: self.ipv6_multicast_groups,
                 unreached: [None; UNREACHED],
                 #[cfg(feature = "proto-ipv6")]
                 unreached6: [None; UNREACHED],
@@ -503,7 +533,15 @@ where
                     Ok(false)
                 }
             }
-            // Multicast is not yet implemented for other address families
+            // A group of IPv6 is kept, where there is room for them, and
+            // nothing is said of it: that is whoever joins's to say.
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(addr) if addr.is_multicast() => {
+                let groups = self.inner.ipv6_multicast_groups.as_mut();
+                let groups = groups.ok_or(Error::Unaddressable)?;
+                groups.insert(addr, ()).map_err(|_| Error::Exhausted)?;
+                Ok(false)
+            }
             _ => Err(Error::Unaddressable),
         }
     }
@@ -533,7 +571,12 @@ where
                     Ok(false)
                 }
             }
-            // Multicast is not yet implemented for other address families
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(addr) => {
+                let groups = self.inner.ipv6_multicast_groups.as_mut();
+                groups.ok_or(Error::Unaddressable)?.remove(&addr);
+                Ok(false)
+            }
             _ => Err(Error::Unaddressable),
         }
     }
@@ -1003,13 +1046,28 @@ impl<'a> InterfaceInner<'a> {
     /// Check whether the interface listens to given destination multicast IP address.
     ///
     /// If built without feature `proto-igmp` this function will
-    /// always return `false`.
+    /// always return `false` for an address of IPv4. A group of IPv6 is
+    /// one that was joined, the group of every node (on the link or on the
+    /// interface) or the solicited-node group of an address of the
+    /// interface.
     pub fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
         match addr.into() {
             #[cfg(feature = "proto-igmp")]
             IpAddress::Ipv4(key) => {
                 key == Ipv4Address::MULTICAST_ALL_SYSTEMS
                     || self.ipv4_multicast_groups.get(&key).is_some()
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(key) => {
+                const INTERFACE_ALL_NODES: Ipv6Address =
+                    Ipv6Address([0xff, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+                key == Ipv6Address::LINK_LOCAL_ALL_NODES
+                    || key == INTERFACE_ALL_NODES
+                    || self.has_solicited_node(key)
+                    || self
+                        .ipv6_multicast_groups
+                        .as_ref()
+                        .is_some_and(|groups| groups.get(&key).is_some())
             }
             _ => false,
         }
@@ -1183,6 +1241,14 @@ impl<'a> InterfaceInner<'a> {
             // Discard packets with non-unicast source addresses.
             net_debug!("non-unicast source address");
             return Err(Error::Malformed);
+        }
+
+        // An interface that keeps its groups hears those and no other.
+        if ipv6_repr.dst_addr.is_multicast()
+            && self.ipv6_multicast_groups.is_some()
+            && !self.has_multicast_group(ipv6_repr.dst_addr)
+        {
+            return Ok(None);
         }
 
         let ip_payload = ipv6_packet.payload();
@@ -3410,6 +3476,115 @@ mod test {
                 ))
             );
         }
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "proto-ipv6",
+        feature = "socket-udp",
+        feature = "medium-ethernet"
+    ))]
+    fn test_ipv6_hears_the_groups_it_keeps() {
+        use crate::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
+
+        const REMOTE: Ipv6Address = Ipv6Address([0xfd, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+
+        /// Whether a datagram for port 68 at `to` reaches the socket that
+        /// has the port.
+        fn arrives(iface: &mut Interface<'_, Loopback>, to: Ipv6Address) -> bool {
+            let buffer = || UdpSocketBuffer::new(vec![UdpPacketMetadata::EMPTY], vec![0; 16]);
+            let mut socket = UdpSocket::new(buffer(), buffer());
+            socket.bind(68).unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let handle = sockets.add(socket);
+
+            let udp = UdpRepr {
+                src_port: 67,
+                dst_port: 68,
+            };
+            let ip = Ipv6Repr {
+                src_addr: REMOTE,
+                dst_addr: to,
+                next_header: IpProtocol::Udp,
+                payload_len: udp.header_len() + 3,
+                hop_limit: 1,
+            };
+            let mut bytes = vec![0u8; ip.buffer_len() + ip.payload_len];
+            ip.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..]));
+            udp.emit(
+                &mut UdpPacket::new_unchecked(&mut bytes[ip.buffer_len()..]),
+                &REMOTE.into(),
+                &to.into(),
+                3,
+                |buf| buf.copy_from_slice(b"hey"),
+                &ChecksumCapabilities::default(),
+            );
+            let cx = iface.context(Instant::from_secs(0));
+            let packet = Ipv6Packet::new_unchecked(&bytes[..]);
+            let _ = iface.inner.process_ipv6(&cx, &mut sockets, &packet);
+            let arrived = sockets.get::<UdpSocket>(handle).can_recv();
+            arrived
+        }
+
+        let group = Ipv6Address::new(0xff15, 0, 0, 0, 0, 0, 0, 0x1234);
+        let other = Ipv6Address::new(0xff15, 0, 0, 0, 0, 0, 0, 0x4321);
+        let ours = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+        let solicited = Ipv6Address::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 1);
+        let not_solicited = Ipv6Address::new(0xff05, 0, 0, 0, 0, 1, 0xff00, 1);
+        let all_nodes = Ipv6Address::LINK_LOCAL_ALL_NODES;
+        let now = Instant::from_secs(0);
+
+        // An interface that was given no room for groups hears any, and
+        // has nothing to join with.
+        let (mut iface, _) = create_loopback_ethernet();
+        assert!(arrives(&mut iface, group));
+        assert!(arrives(&mut iface, not_solicited));
+        assert!(!iface.has_multicast_group(group));
+        assert_eq!(
+            iface.join_multicast_group(group, now),
+            Err(Error::Unaddressable)
+        );
+        assert_eq!(
+            iface.leave_multicast_group(group, now),
+            Err(Error::Unaddressable)
+        );
+
+        // One that keeps them hears its own, everybody's and the ones of
+        // its addresses.
+        let device = Loopback::new(Medium::Ethernet);
+        let mut iface = InterfaceBuilder::new(device)
+            .ethernet_addr(EthernetAddress::default())
+            .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+            .ip_addrs([IpCidr::new(ours.into(), 64)])
+            .ipv6_multicast_groups(BTreeMap::new())
+            .finalize();
+        for (to, heard) in [
+            (ours, true),
+            (all_nodes, true),
+            (solicited, true),
+            (not_solicited, false),
+            (group, false),
+            (other, false),
+        ] {
+            assert_eq!(arrives(&mut iface, to), heard, "{}", to);
+            assert_eq!(iface.has_multicast_group(to), heard && to != ours, "{}", to);
+        }
+
+        // Joining says nothing, twice is once, and an address that is no
+        // group's is not joined.
+        assert_eq!(iface.join_multicast_group(group, now), Ok(false));
+        assert_eq!(iface.join_multicast_group(group, now), Ok(false));
+        assert_eq!(
+            iface.join_multicast_group(ours, now),
+            Err(Error::Unaddressable)
+        );
+        assert!(iface.has_multicast_group(group));
+        assert!(arrives(&mut iface, group));
+        assert!(!arrives(&mut iface, other));
+        assert!(iface.device_mut().transmit().is_some());
+        assert_eq!(iface.leave_multicast_group(group, now), Ok(false));
+        assert_eq!(iface.leave_multicast_group(group, now), Ok(false));
+        assert!(!arrives(&mut iface, group));
     }
 
     #[test]
