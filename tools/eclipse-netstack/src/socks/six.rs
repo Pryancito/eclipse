@@ -30,8 +30,8 @@
 //!             0  [u8; 16] address  16  u8 the bits of its network's prefix  17  seven zero
 //! ```
 //!
-//! No socket carries IPv6 yet: what a program sends still travels as
-//! IPv4.
+//! A datagram socket's datagrams travel as IPv6 when the kernel says so
+//! (`SEND6`, `DATA6`, in [`super`]). A connection's do not yet.
 
 use managed::ManagedSlice;
 use smoltcp::phy::{ChecksumCapabilities, Device};
@@ -260,6 +260,21 @@ impl<D: for<'d> Device<'d>> Stack<D> {
         self.six.news = true;
     }
 
+    /// Whether a datagram for `addr` can be sent as IPv6: to a group, to
+    /// a network of the card's, or to anywhere else while there is a
+    /// router. As for IPv4, one that cannot go is not queued.
+    pub(super) fn reaches6(&self, addr: Ipv6Address) -> bool {
+        if self.six.ear.is_none() || addr.is_unspecified() || addr.is_loopback() {
+            return false;
+        }
+        addr.is_multicast()
+            || self.six.router.is_some()
+            || self.iface.ip_addrs().iter().any(|cidr| match cidr {
+                IpCidr::Ipv6(cidr) => cidr.contains_addr(&addr),
+                _ => false,
+            })
+    }
+
     /// What the card has of IPv6.
     pub fn sixes(&self) -> Sixes {
         let addresses = self.iface.ip_addrs().iter().filter_map(|cidr| match cidr {
@@ -444,7 +459,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
 mod tests {
     use super::*;
     use crate::port::testing::*;
+    use crate::socks::tests::{bind, message, records};
+    use crate::socks::{parse_header, Arrived, Refused};
+    use crate::socks::{OP_DATA6, OP_SEND6, RECORD6_LEN};
     use smoltcp::wire::{EthernetFrame, EthernetProtocol, EthernetRepr, NdiscNeighborFlags};
+    use smoltcp::wire::{UdpPacket, UdpRepr};
 
     /// Our address on the link, and the one made from the router's prefix.
     const OURS_LINK: Ipv6Address = Ipv6Address([
@@ -492,6 +511,22 @@ mod tests {
     /// THEIRS sends `message`, ICMPv6 with its sum to be written, from
     /// `from` to `to`, to travel `hops`.
     fn six_frame(from: Ipv6Address, to: Ipv6Address, hops: u8, message: &[u8]) -> Vec<u8> {
+        let mut bytes = ip6_frame(from, to, hops, IpProtocol::Icmpv6, message);
+        let at = bytes.len() - message.len();
+        let mut icmp = Icmpv6Packet::new_unchecked(&mut bytes[at..]);
+        icmp.fill_checksum(&IpAddress::Ipv6(from), &IpAddress::Ipv6(to));
+        bytes
+    }
+
+    /// THEIRS sends `payload`, of `protocol`, from `from` to `to`, to
+    /// travel `hops`.
+    fn ip6_frame(
+        from: Ipv6Address,
+        to: Ipv6Address,
+        hops: u8,
+        protocol: IpProtocol,
+        message: &[u8],
+    ) -> Vec<u8> {
         let eth = EthernetRepr {
             src_addr: THEIRS,
             dst_addr: if to.is_unicast() {
@@ -504,7 +539,7 @@ mod tests {
         let ip = Ipv6Repr {
             src_addr: from,
             dst_addr: to,
-            next_header: IpProtocol::Icmpv6,
+            next_header: protocol,
             payload_len: message.len(),
             hop_limit: hops,
         };
@@ -514,9 +549,93 @@ mod tests {
         let (header, payload) = frame.payload_mut().split_at_mut(IP_HEADER);
         ip.emit(&mut Ipv6Packet::new_unchecked(header));
         payload.copy_from_slice(message);
-        let mut icmp = Icmpv6Packet::new_unchecked(payload);
-        icmp.fill_checksum(&IpAddress::Ipv6(from), &IpAddress::Ipv6(to));
         bytes
+    }
+
+    /// THEIRS sends the datagram `data` from `from` to `to`, as IPv6.
+    fn udp6_frame(from: (Ipv6Address, u16), to: (Ipv6Address, u16), data: &[u8]) -> Vec<u8> {
+        let udp = UdpRepr {
+            src_port: from.1,
+            dst_port: to.1,
+        };
+        let mut datagram = vec![0u8; 8 + data.len()];
+        udp.emit(
+            &mut UdpPacket::new_unchecked(&mut datagram[..]),
+            &IpAddress::Ipv6(from.0),
+            &IpAddress::Ipv6(to.0),
+            data.len(),
+            |room| room.copy_from_slice(data),
+            &ChecksumCapabilities::default(),
+        );
+        ip6_frame(from.0, to.0, 64, IpProtocol::Udp, &datagram)
+    }
+
+    /// A datagram of ours on the wire as IPv6: the card it is for, who
+    /// it is from and for, the hops, and what it carries, its sum
+    /// checked.
+    type Datagram6 = (
+        EthernetAddress,
+        (Ipv6Address, u16),
+        (Ipv6Address, u16),
+        u8,
+        Vec<u8>,
+    );
+
+    fn udp6_of(frame: &[u8]) -> Datagram6 {
+        let eth = EthernetFrame::new_checked(frame).unwrap();
+        assert_eq!(eth.src_addr(), OURS);
+        assert_eq!(eth.ethertype(), EthernetProtocol::Ipv6);
+        let ip = Ipv6Packet::new_checked(eth.payload()).unwrap();
+        assert_eq!(ip.next_header(), IpProtocol::Udp);
+        let (from, to) = (ip.src_addr(), ip.dst_addr());
+        let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+        assert!(udp.verify_checksum(&IpAddress::Ipv6(from), &IpAddress::Ipv6(to)));
+        (
+            eth.dst_addr(),
+            (from, udp.src_port()),
+            (to, udp.dst_port()),
+            ip.hop_limit(),
+            udp.payload().to_vec(),
+        )
+    }
+
+    /// THEIRS says that `address` is at its card, to `to`.
+    fn here_is(address: Ipv6Address, to: Ipv6Address) -> Vec<u8> {
+        let said = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+            flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+            target_addr: address,
+            lladdr: Some(THEIRS),
+        });
+        six_frame(address, to, ON_LINK, &six_message(address, to, &said))
+    }
+
+    /// A `SEND6` as the kernel writes it.
+    fn send6(sock: u64, to: Ipv6Address, port: u16, hops: u8, data: &[u8]) -> Vec<u8> {
+        let mut rest = to.0.to_vec();
+        rest.extend_from_slice(&port.to_le_bytes());
+        rest.extend_from_slice(&[hops, 0]);
+        rest.extend_from_slice(data);
+        message(OP_SEND6, sock, &rest)
+    }
+
+    /// The records of a `DATA6`.
+    fn records6(m: &[u8]) -> Vec<(u64, Ipv6Address, u16, Vec<u8>)> {
+        assert_eq!(parse_header(m), Some((OP_DATA6, 0)));
+        let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
+        while !rest.is_empty() {
+            let sock = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let addr = Ipv6Address::from_bytes(&rest[8..24]);
+            let port = u16::from_le_bytes([rest[24], rest[25]]);
+            let len = u16::from_le_bytes([rest[26], rest[27]]) as usize;
+            out.push((
+                sock,
+                addr,
+                port,
+                rest[RECORD6_LEN..RECORD6_LEN + len].to_vec(),
+            ));
+            rest = &rest[RECORD6_LEN + len..];
+        }
+        out
     }
 
     /// A message of ICMPv6 as smoltcp writes it, from `from` to `to`.
@@ -888,5 +1007,159 @@ mod tests {
             assert_eq!((answer.from, answer.to), (ours, theirs));
             assert_eq!(answer.message, six_message(ours, theirs, &echo(true)));
         }
+    }
+
+    #[test]
+    fn a_datagram_travels_as_ipv6_when_the_kernel_says_so() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+        let near = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let mut ms = 1000;
+        // To a neighbour on the network the router gave, from the
+        // address it gave; to one of the link, from the link's; and to
+        // anywhere else by the router, from the one it gave. Each
+        // neighbour is asked for first, from the address that sends.
+        for (to, through, from, hops) in [
+            (near, near, OURS_GIVEN, 0),
+            (link, link, OURS_LINK, 3),
+            (far, ROUTER, OURS_GIVEN, 200),
+        ] {
+            assert_eq!(stack.request(&send6(7, to, 7, hops, b"over six")), Ok(true));
+            let sent = frames(&mut stack, &window, ms);
+            assert_eq!(sent.len(), 1);
+            let ask = six_of(&sent[0]);
+            assert_eq!((ask.from, ask.to), (from, through.solicited_node()));
+            assert_eq!(ask.message[0], 135);
+            assert_eq!(ask.message[8..24], through.0);
+            window.deliver(stack.device(), 0, &here_is(through, from));
+            let sent = frames(&mut stack, &window, ms + 10);
+            assert_eq!(sent.len(), 1);
+            let hops = if hops == 0 { 64 } else { hops };
+            assert_eq!(
+                udp6_of(&sent[0]),
+                (THEIRS, (from, 5000), (to, 7), hops, b"over six".to_vec())
+            );
+            ms += 1000;
+        }
+        // To everybody on the link, at the card every one of them hears
+        // at, with nobody to ask for.
+        let all = Ipv6Address::LINK_LOCAL_ALL_NODES;
+        assert_eq!(stack.request(&send6(7, all, 7, 1, b"anyone")), Ok(true));
+        let sent = frames(&mut stack, &window, ms);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            udp6_of(&sent[0]),
+            (
+                group_card(all),
+                (OURS_LINK, 5000),
+                (all, 7),
+                1,
+                b"anyone".to_vec()
+            )
+        );
+
+        // What cannot be done is refused, and nothing leaves.
+        let longest = stack.max_datagram6();
+        assert_eq!(longest, stack.max_datagram() - 20);
+        let short = &send6(7, near, 7, 0, b"")[..35];
+        for (m, why) in [
+            (send6(8, near, 7, 0, b"x"), Refused::NoSocket),
+            (send6(7, near, 0, 0, b"x"), Refused::Unreachable),
+            (
+                send6(7, Ipv6Address::UNSPECIFIED, 7, 0, b"x"),
+                Refused::Unreachable,
+            ),
+            (
+                send6(7, Ipv6Address::LOOPBACK, 7, 0, b"x"),
+                Refused::Unreachable,
+            ),
+            (
+                send6(7, near, 7, 0, &vec![0; longest + 1]),
+                Refused::TooLong,
+            ),
+            (short.to_vec(), Refused::Malformed),
+        ] {
+            assert_eq!(stack.request(&m), Err(why));
+        }
+        assert_eq!(
+            stack.request(&send6(7, near, 7, 0, &vec![0; longest])),
+            Ok(true)
+        );
+        assert_eq!(frames(&mut stack, &window, ms + 100).len(), 1);
+        assert!(frames(&mut stack, &window, ms + 200).is_empty());
+    }
+
+    #[test]
+    fn without_a_router_only_the_link_is_reached_and_without_ipv6_nothing() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert_eq!(
+            stack.request(&send6(7, far, 7, 0, b"x")),
+            Err(Refused::Unreachable)
+        );
+        assert_eq!(stack.request(&send6(7, link, 7, 0, b"x")), Ok(true));
+        assert_eq!(frames(&mut stack, &window, 100).len(), 1);
+
+        let Bench { iface, .. } = Bench::new();
+        let mut quiet = Stack::new(iface);
+        assert_eq!(quiet.request(&bind(7, 5000)), Ok(false));
+        assert_eq!(
+            quiet.request(&send6(7, link, 7, 0, b"x")),
+            Err(Refused::Unreachable)
+        );
+    }
+
+    #[test]
+    fn what_arrives_as_ipv6_is_told_with_who_sent_it_in_the_order_it_arrived() {
+        let (mut stack, window) = stack();
+        frames(&mut stack, &window, 0);
+        advertise(&mut stack, &window, 1800, 86_400);
+        frames(&mut stack, &window, 100);
+        assert_eq!(stack.request(&bind(7, 5000)), Ok(false));
+        assert_eq!(stack.request(&bind(8, 5001)), Ok(false));
+        let theirs = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let v6 = |port: u16, data: &[u8]| udp6_frame((theirs, 4000), (OURS_GIVEN, port), data);
+
+        // One datagram: one `DATA6`, and nothing after it.
+        let mut m = Vec::new();
+        window.deliver(stack.device(), 0, &v6(5000, b"first"));
+        stack.poll(Instant::from_millis(200));
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records6(&m), [(7, theirs, 4000, b"first".to_vec())]);
+        assert!(stack.brought_bytes());
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        // Both kinds for one socket, and another socket's after: each
+        // message is of one kind, and a socket's are in their order.
+        window.deliver(stack.device(), 0, &udp_frame(4000, 5000, b"four"));
+        window.deliver(stack.device(), 1, &v6(5000, b"six"));
+        window.deliver(stack.device(), 2, &udp_frame(4000, 5000, b"four again"));
+        window.deliver(stack.device(), 3, &v6(5001, b"six for the other"));
+        stack.poll(Instant::from_millis(300));
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records(&m), [(7, THEIR_IP.0, 4000, b"four".to_vec())]);
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records6(&m), [(7, theirs, 4000, b"six".to_vec())]);
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(records(&m), [(7, THEIR_IP.0, 4000, b"four again".to_vec())]);
+        assert_eq!(stack.arrived(&mut m), Arrived::More);
+        assert_eq!(
+            records6(&m),
+            [(8, theirs, 4000, b"six for the other".to_vec())]
+        );
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
+
+        // For a port nobody has, nothing is told.
+        window.deliver(stack.device(), 0, &v6(5002, b"nobody"));
+        stack.poll(Instant::from_millis(400));
+        assert_eq!(stack.arrived(&mut m), Arrived::Nothing);
     }
 }

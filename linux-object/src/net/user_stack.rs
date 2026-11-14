@@ -167,8 +167,7 @@
 //! ```
 //!
 //! What is kept here ([`StackLink::sixes`]) is the last of them, and
-//! nothing once the stack is gone. No socket uses them yet (see "IPv6
-//! sockets").
+//! nothing once the stack is gone.
 //!
 //! # This machine
 //!
@@ -200,15 +199,30 @@
 //!
 //! # IPv6 sockets
 //!
-//! The stack has IPv4 and no IPv6, and a program does not ask which
-//! before it opens its socket: plenty of them listen on an `AF_INET6`
-//! socket at `::` and expect IPv4 to arrive there too. So an `AF_INET6`
-//! socket is served like any other, and carries IPv4: `::` is every
-//! address, `::ffff:a.b.c.d` is `a.b.c.d`, and `::1` is this machine,
-//! which no version of IP has a part in. Any other IPv6 address is one
-//! the stack cannot reach (`ENETUNREACH`) or does not have
-//! (`EADDRNOTAVAIL`). Such a socket is told its addresses the same way,
-//! IPv4 ones as `::ffff:a.b.c.d`.
+//! A program does not ask what the stack speaks before it opens its
+//! socket: plenty of them listen on an `AF_INET6` socket at `::` and
+//! expect IPv4 to arrive there too. So an `AF_INET6` socket is served
+//! like any other, and carries IPv4: `::` is every address,
+//! `::ffff:a.b.c.d` is `a.b.c.d`, and `::1` is this machine, which no
+//! version of IP has a part in. Such a socket is told its IPv4 addresses
+//! the same way, as `::ffff:a.b.c.d`.
+//!
+//! A datagram socket of that family carries IPv6 as well. What it sends
+//! to any other IPv6 address travels as IPv6, and what arrives as IPv6
+//! for its port is its own, with the longer address:
+//!
+//! ```text
+//! SEND6   (kernel to stack)  16  [u8; 16] to   32  u16 port  34  u8 hop limit  35  u8 zero  36  the datagram
+//! DATA6   (stack to kernel)  16  one record after another, to the end:
+//!             0  u64 socket  8  [u8; 16] from  24  u16 port  26  u16 length  28  the datagram
+//! ```
+//!
+//! The port is one for both: an `AF_INET` socket that has it is not
+//! given what arrives as IPv6. Where the card has no way to
+//! ([`Sixes::reaches`]) is `ENETUNREACH`, and an address of the card's
+//! own is this machine, like `::1`. A stream socket carries IPv4 only
+//! yet: for it any other IPv6 address is one the stack cannot reach
+//! (`ENETUNREACH`) or does not have (`EADDRNOTAVAIL`).
 
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
@@ -253,6 +267,8 @@ pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
 pub const OP_COUNTS: u32 = 13;
 pub const OP_SIX: u32 = 16;
+pub const OP_SEND6: u32 = 17;
+pub const OP_DATA6: u32 = 18;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
 /// whichever sockets hear: no socket has the number.
@@ -334,6 +350,17 @@ pub fn bind_message(sock: u64, port: u16) -> Vec<u8> {
 /// reads there).
 pub fn send_message(sock: u64, addr: [u8; 4], port: u16, hop_limit: u8, data: &[u8]) -> Vec<u8> {
     let mut m = header(OP_SEND, sock, 8 + data.len());
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&[hop_limit, 0]);
+    m.extend_from_slice(data);
+    m
+}
+
+/// `SEND6`: `data` from socket `sock` to `addr:port` as IPv6, to travel
+/// `hop_limit` hops at most (0: as many as the stack gives one).
+pub fn send6_message(sock: u64, addr: [u8; 16], port: u16, hop_limit: u8, data: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_SEND6, sock, 20 + data.len());
     m.extend_from_slice(&addr);
     m.extend_from_slice(&port.to_le_bytes());
     m.extend_from_slice(&[hop_limit, 0]);
@@ -472,6 +499,29 @@ pub fn parse_record(records: &[u8]) -> Option<(Record<'_>, &[u8])> {
     let port = u16::from_le_bytes(records[12..14].try_into().ok()?);
     let len = u16::from_le_bytes(records[14..16].try_into().ok()?) as usize;
     let rest = &records[RECORD_LEN..];
+    if len > rest.len() {
+        return None;
+    }
+    Some(((sock, addr, port, &rest[..len]), &rest[len..]))
+}
+
+/// What each record of a `DATA6` starts with.
+pub const RECORD6_LEN: usize = 28;
+
+/// One record of a `DATA6`: the socket, who sent the datagram, and it.
+pub type Record6<'a> = (u64, [u8; 16], u16, &'a [u8]);
+
+/// The first record of `records`, the rest of a `DATA6` message, and
+/// what follows it. `None` when what is there is not a whole record.
+pub fn parse_record6(records: &[u8]) -> Option<(Record6<'_>, &[u8])> {
+    if records.len() < RECORD6_LEN {
+        return None;
+    }
+    let sock = u64::from_le_bytes(records[..8].try_into().ok()?);
+    let addr: [u8; 16] = records[8..24].try_into().ok()?;
+    let port = u16::from_le_bytes(records[24..26].try_into().ok()?);
+    let len = u16::from_le_bytes(records[26..28].try_into().ok()?) as usize;
+    let rest = &records[RECORD6_LEN..];
     if len > rest.len() {
         return None;
     }
@@ -1081,6 +1131,23 @@ fn plain(v6: bool, addr: IpAddress, elsewhere: LxError) -> LxResult<IpAddress> {
     }
 }
 
+/// As [`plain`], for a socket whose datagrams also travel as IPv6: an
+/// IPv6 address that is none of those stays what it is.
+fn either(v6: bool, addr: IpAddress, elsewhere: LxError) -> LxResult<IpAddress> {
+    match addr {
+        IpAddress::Ipv6(six)
+            if v6 && !six.is_unspecified() && !six.is_loopback() && six.as_ipv4().is_none() =>
+        {
+            Ok(addr)
+        }
+        _ => plain(v6, addr, elsewhere),
+    }
+}
+
+/// The header IPv6 has more than IPv4's: what the longest datagram of a
+/// frame loses when it travels as IPv6.
+const IPV6_MORE: usize = 20;
+
 /// `endpoint` as a socket of that family says it: the other way of
 /// [`plain`].
 fn shown(v6: bool, endpoint: IpEndpoint) -> IpEndpoint {
@@ -1286,6 +1353,7 @@ impl StackLink {
     fn take(&self, m: &[u8]) {
         match parse_header(m) {
             Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
+            Some((OP_DATA6, _)) => self.take_datagrams6(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
             Some((OP_COUNTS, _)) => self.take_counts(&m[HEADER_LEN..]),
             Some((OP_SIX, _)) => match parse_six(&m[HEADER_LEN..]) {
@@ -1395,6 +1463,27 @@ impl StackLink {
             let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
             if let Some(shared) = shared {
                 let from = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(addr)), port);
+                shared.deliver(from, data);
+            }
+        }
+    }
+
+    /// The datagrams of a `DATA6`, each onto the queue of its socket:
+    /// one of `AF_INET6`, since no other is given what travelled as
+    /// IPv6.
+    fn take_datagrams6(&self, mut records: &[u8]) {
+        while !records.is_empty() {
+            let Some(((sock, addr, port, data), rest)) = parse_record6(records) else {
+                warn!(
+                    "user stack: {} bytes that are no record of a datagram",
+                    records.len()
+                );
+                return;
+            };
+            records = rest;
+            let shared = self.table.lock().socks.get(&sock).and_then(Weak::upgrade);
+            if let Some(shared) = shared.filter(|shared| shared.v6) {
+                let from = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr)), port);
                 shared.deliver(from, data);
             }
         }
@@ -1548,6 +1637,26 @@ impl StackLink {
         }
     }
 
+    /// A datagram a program of this machine sent to an IPv6 address of
+    /// the card's: onto the queue of the `AF_INET6` socket that has the
+    /// port, unless it is bound to another address of this machine.
+    /// `false` when there is none.
+    fn send_here6(&self, from: IpEndpoint, port: u16, data: &[u8]) -> bool {
+        let shared = {
+            let table = self.table.lock();
+            let sock = table.bound.get(&port);
+            sock.and_then(|sock| table.socks.get(sock))
+                .and_then(Weak::upgrade)
+        };
+        shared.is_some_and(|shared| {
+            let anywhere = shared.inner.lock().here.is_none();
+            shared.v6 && anywhere && {
+                shared.deliver(from, data);
+                true
+            }
+        })
+    }
+
     /// A datagram from one program of this machine to another: onto the
     /// queue of the socket that has the port, if one has. `false` when
     /// nobody has it at that address: the datagram is lost, and who sent
@@ -1608,6 +1717,53 @@ impl ServedUdpSocket {
             opts.ip_ttl
         };
         limit.clamp(1, 255) as u8
+    }
+
+    /// Send `data` to `addr:port`, an IPv6 address that is no IPv4 one
+    /// in disguise: by the stack as IPv6, or to the socket of this
+    /// machine that has the port when the address is the card's own.
+    fn write6(&self, addr: Ipv6Address, port: u16, data: &[u8]) -> SysResult {
+        let here = {
+            let mut inner = self.shared.inner.lock();
+            if let Some(error) = Shared::told(&self.shared.bus, &mut inner) {
+                return Err(error);
+            }
+            inner.here
+        };
+        let sixes = &self.link.sixes;
+        if sixes.has(&addr) {
+            if data.len() > MAX_DATAGRAM {
+                return Err(LxError::EMSGSIZE);
+            }
+            let from = IpEndpoint::new(IpAddress::Ipv6(addr), self.autobind()?);
+            if !self.link.send_here6(from, port, data) {
+                let to = IpEndpoint::new(IpAddress::Ipv6(addr), port);
+                self.shared.undelivered(to, LxError::ECONNREFUSED);
+            }
+            return Ok(data.len());
+        }
+        // Nothing leaves the machine from an address that is only the
+        // machine's, nor while no stack serves, nor for where the card
+        // has no way to.
+        if here.is_some() {
+            return Err(LxError::EINVAL);
+        }
+        if self.link.is_down() {
+            return Err(LxError::ENETDOWN);
+        }
+        if !sixes.reaches(&addr) {
+            return Err(LxError::ENETUNREACH);
+        }
+        if data.len() + IPV6_MORE > self.link.max_datagram.load(Ordering::Acquire) {
+            return Err(LxError::EMSGSIZE);
+        }
+        self.autobind()?;
+        // A group's is not to leave the link unless it is said to; the
+        // rest travel as far as the stack lets a datagram.
+        let hop_limit = u8::from(addr.is_multicast());
+        let said = send6_message(self.sock, addr.0, port, hop_limit, data);
+        self.link.tell(said, false)?;
+        Ok(data.len())
     }
 
     /// The socket's port, binding it to any when it has none: what a send
@@ -1702,14 +1858,16 @@ impl Socket for ServedUdpSocket {
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         let to = match sendto_endpoint {
             Some(Endpoint::Ip(mut to)) => {
-                to.addr = plain(self.v6, to.addr, LxError::ENETUNREACH)?;
+                to.addr = either(self.v6, to.addr, LxError::ENETUNREACH)?;
                 to
             }
             Some(_) => return Err(LxError::EAFNOSUPPORT),
             None => self.shared.inner.lock().remote.ok_or(LxError::ENOTCONN)?,
         };
-        let IpAddress::Ipv4(addr) = to.addr else {
-            return Err(LxError::EAFNOSUPPORT);
+        let addr = match to.addr {
+            IpAddress::Ipv4(addr) => addr,
+            IpAddress::Ipv6(addr) => return self.write6(addr, to.port, data),
+            _ => return Err(LxError::EAFNOSUPPORT),
         };
         let here = {
             let mut inner = self.shared.inner.lock();
@@ -1774,9 +1932,17 @@ impl Socket for ServedUdpSocket {
         let Endpoint::Ip(mut peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
-        peer.addr = plain(self.v6, peer.addr, LxError::ENETUNREACH)?;
-        if !matches!(peer.addr, IpAddress::Ipv4(_)) {
-            return Err(LxError::EAFNOSUPPORT);
+        peer.addr = either(self.v6, peer.addr, LxError::ENETUNREACH)?;
+        match peer.addr {
+            IpAddress::Ipv4(_) => {}
+            // `ip6_datagram_connect`: no way there is said now.
+            IpAddress::Ipv6(addr) => {
+                let sixes = &self.link.sixes;
+                if !sixes.has(&addr) && !sixes.reaches(&addr) {
+                    return Err(LxError::ENETUNREACH);
+                }
+            }
+            _ => return Err(LxError::EAFNOSUPPORT),
         }
         self.autobind()?;
         self.shared.inner.lock().remote = Some(peer);
@@ -1787,7 +1953,14 @@ impl Socket for ServedUdpSocket {
         let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);
         };
-        local.addr = plain(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
+        local.addr = either(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
+        // An IPv6 address has to be one the card has; the socket then
+        // hears at its port, like one bound to `::`.
+        if let IpAddress::Ipv6(addr) = local.addr {
+            if !self.link.sixes.has(&addr) {
+                return Err(LxError::EADDRNOTAVAIL);
+            }
+        }
         // `inet_bind`: a socket that has a port is `EINVAL`.
         if self.shared.inner.lock().port.is_some() {
             return Err(LxError::EINVAL);
@@ -2316,6 +2489,154 @@ mod tests {
         IpEndpoint::new(IpAddress::Ipv6(Ipv6Address(addr.octets())), port)
     }
 
+    /// A `DATA6` of one datagram, as the stack writes it.
+    fn data6(sock: u64, from: &str, port: u16, data: &[u8]) -> Vec<u8> {
+        let from: core::net::Ipv6Addr = from.parse().unwrap();
+        let mut m = header(OP_DATA6, 0, RECORD6_LEN + data.len());
+        m.extend_from_slice(&sock.to_le_bytes());
+        m.extend_from_slice(&from.octets());
+        m.extend_from_slice(&port.to_le_bytes());
+        m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        m.extend_from_slice(data);
+        m
+    }
+
+    #[test]
+    fn an_ipv6_datagram_socket_carries_ipv6() {
+        let _g = LOCK.lock();
+        let stack = stack();
+        let six = |addr: &str| match at6(addr, 0).addr {
+            IpAddress::Ipv6(addr) => addr,
+            _ => unreachable!(),
+        };
+        let cards = [
+            Ipv6Cidr::new(six("fe80::7"), 64),
+            Ipv6Cidr::new(six("fec0::7"), 64),
+        ];
+        stack.say(six_message(None, &cards));
+
+        let server = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        FileLike::set_flags(&server, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
+        assert_eq!(stack.told(), Some(bind_message(server.sock, 5353)));
+
+        // The messages, as the stack reads and writes them.
+        let near = six("fec0::99");
+        let said = send6_message(server.sock, near.0, 53, 0, b"q");
+        assert_eq!(said.len(), HEADER_LEN + 20 + 1);
+        assert_eq!(parse_header(&said), Some((OP_SEND6, server.sock)));
+        assert_eq!(said[16..32], near.0);
+        assert_eq!(said[32..36], [53, 0, 0, 0]);
+        assert_eq!(said[36..], *b"q");
+        let arrived = data6(server.sock, "fec0::99", 53, b"r");
+        assert_eq!(parse_header(&arrived), Some((OP_DATA6, 0)));
+        assert_eq!(
+            parse_record6(&arrived[HEADER_LEN..]),
+            Some(((server.sock, near.0, 53, &b"r"[..]), &[][..]))
+        );
+        assert_eq!(parse_record6(&arrived[HEADER_LEN..arrived.len() - 1]), None);
+
+        // To a neighbour of the card's network it goes as IPv6, and what
+        // comes back is said with the address it came from.
+        let there = Endpoint::Ip(at6("fec0::99", 53));
+        assert_eq!(Socket::write(&server, b"q", Some(there.clone())), Ok(1));
+        assert_eq!(stack.told(), Some(said));
+        stack.say(arrived);
+        let mut buf = [0u8; 16];
+        assert_eq!(recv(&server, &mut buf), (Ok(1), at6("fec0::99", 53)));
+        // To a group, to stay on the link.
+        let group = Endpoint::Ip(at6("ff02::fb", 5353));
+        assert_eq!(Socket::write(&server, b"g", Some(group)), Ok(1));
+        let group = six("ff02::fb");
+        assert_eq!(
+            stack.told(),
+            Some(send6_message(server.sock, group.0, 5353, 1, b"g"))
+        );
+        // Further than the card's networks there is no way while there
+        // is no router, for a send or a connect; with one there is.
+        let far = Endpoint::Ip(at6("2001:db8::1", 53));
+        assert_eq!(
+            Socket::write(&server, b"q", Some(far.clone())),
+            Err(LxError::ENETUNREACH)
+        );
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&server, far.clone())),
+            Err(LxError::ENETUNREACH)
+        );
+        stack.say(six_message(Some(six("fe80::2")), &cards));
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&server, far.clone())),
+            Ok(0)
+        );
+        assert_eq!(
+            ip(Socket::remote_endpoint(&server).unwrap()),
+            at6("2001:db8::1", 53)
+        );
+        assert_eq!(Socket::write(&server, b"qq", None), Ok(2));
+        let far = six("2001:db8::1");
+        assert_eq!(
+            stack.told(),
+            Some(send6_message(server.sock, far.0, 53, 0, b"qq"))
+        );
+        // The longest is twenty bytes shorter than IPv4's.
+        let long = vec![0u8; MAX_FOR_TESTS - 20];
+        assert_eq!(Socket::write(&server, &long, None), Ok(long.len()));
+        assert!(stack.told().is_some());
+        let longer = vec![0u8; MAX_FOR_TESTS - 19];
+        assert_eq!(
+            Socket::write(&server, &longer, None),
+            Err(LxError::EMSGSIZE)
+        );
+        assert_eq!(stack.told(), None);
+
+        // An `AF_INET` socket is not given what arrives as IPv6 for its
+        // port.
+        let four = stack.socket();
+        assert_eq!(
+            Socket::bind(&four, Endpoint::Ip(at([0, 0, 0, 0], 5354))),
+            Ok(0)
+        );
+        stack.say(data6(four.sock, "fec0::99", 53, b"not yours"));
+        assert_eq!(recv(&four, &mut buf).0, Err(LxError::EAGAIN));
+        while stack.told().is_some() {}
+
+        // An address of the card's is this machine: nothing goes to the
+        // stack, and who has the port hears it from that address. A
+        // socket can be bound to one, and to no other.
+        let other = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        FileLike::set_flags(&other, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(
+            Socket::bind(&other, Endpoint::Ip(at6("fec0::8", 5355))),
+            Err(LxError::EADDRNOTAVAIL)
+        );
+        assert_eq!(
+            Socket::bind(&other, Endpoint::Ip(at6("fec0::7", 5355))),
+            Ok(0)
+        );
+        assert_eq!(stack.told(), Some(bind_message(other.sock, 5355)));
+        let own = Endpoint::Ip(at6("fec0::7", 5353));
+        assert_eq!(Socket::write(&other, b"here", Some(own)), Ok(4));
+        assert_eq!(stack.told(), None);
+        assert_eq!(recv(&server, &mut buf).0, Err(LxError::EAGAIN));
+        // (The server is connected: it hears who it is connected to.)
+        let third = ServedUdpSocket::new(stack.link.clone(), true).unwrap();
+        FileLike::set_flags(&third, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&third, Endpoint::Ip(at6("::", 5356))), Ok(0));
+        let own = Endpoint::Ip(at6("fec0::7", 5356));
+        assert_eq!(Socket::write(&other, b"here", Some(own)), Ok(4));
+        assert_eq!(recv(&third, &mut buf), (Ok(4), at6("fec0::7", 5355)));
+        while stack.told().is_some() {}
+
+        // The stack dies, and its addresses with it.
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        assert_eq!(
+            Socket::write(&third, b"q", Some(there)),
+            Err(LxError::ENETDOWN)
+        );
+    }
+
     #[test]
     fn an_ipv6_datagram_socket_carries_ipv4() {
         let _g = LOCK.lock();
@@ -2371,7 +2692,7 @@ mod tests {
             at6("::ffff:10.0.9.1", 53)
         );
 
-        // The stack has no IPv6: an address that is only that is nowhere
+        // The card has no IPv6 address: one that is only that is nowhere
         // it reaches and none it has. And an IPv4 address is not one an
         // `AF_INET6` socket is given.
         let other = ServedUdpSocket::new(stack.link.clone(), true).unwrap();

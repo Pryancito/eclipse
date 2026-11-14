@@ -116,6 +116,23 @@ impl Sixes {
     pub fn router(&self) -> Option<Ipv6Address> {
         self.said.lock().1
     }
+
+    /// Whether `address` is one of the card's.
+    pub fn has(&self, address: &Ipv6Address) -> bool {
+        let said = self.said.lock();
+        said.0.iter().any(|ours| ours.address() == *address)
+    }
+
+    /// Whether the card has a way to `address`: to a group, to a network
+    /// of one of its addresses, or to anywhere while there is a router.
+    /// Never while it has no address.
+    pub fn reaches(&self, address: &Ipv6Address) -> bool {
+        let said = self.said.lock();
+        !said.0.is_empty()
+            && (address.is_multicast()
+                || said.1.is_some()
+                || said.0.iter().any(|ours| ours.contains_addr(address)))
+    }
 }
 
 /// The interface that shows the card of a stack that runs somewhere else.
@@ -436,8 +453,20 @@ mod tests {
         assert_eq!(routes[1].gateway, Some(IpAddress::Ipv6(router)));
         assert_eq!(routes[4].dst, IpCidr::Ipv6(given.network()));
 
+        // What is the card's, and where it has a way to.
+        let on_link = Ipv6Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 0x99);
+        let far = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let group = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+        assert!(sixes.has(&given.address()) && sixes.has(&link.address()));
+        assert!(!sixes.has(&on_link));
+        assert!(sixes.reaches(&on_link) && sixes.reaches(&far) && sixes.reaches(&group));
+        sixes.say(vec![link, given], None);
+        assert!(sixes.reaches(&on_link) && sixes.reaches(&group));
+        assert!(!sixes.reaches(&far));
+
         // The stack is gone: what it said first is all there is.
         sixes.forget();
+        assert!(!sixes.has(&link.address()) && !sixes.reaches(&group));
         assert_eq!(c.get_ip_address(), [v4]);
         assert_eq!(c.get_routes().len(), 2);
     }

@@ -17,7 +17,18 @@
 //!
 //! little-endian, the addresses as they are written
 //! (`linux-object/src/net/user_stack.rs` is the kernel's side, and says
-//! the same). The kernel numbers the sockets and gives out the ports, so a
+//! the same). A datagram that travels as IPv6 is said the same way with
+//! the longer address:
+//!
+//! ```text
+//! SEND6   (kernel to stack)  16  [u8; 16] to   32  u16 port  34  u8 hop limit  35  u8 zero  36  the datagram
+//! DATA6   (stack to kernel)  16  one record after another, to the end:
+//!             0  u64 socket  8  [u8; 16] from  24  u16 port  26  u16 length  28  the datagram
+//! ```
+//!
+//! A socket's port is one, whichever way a datagram for it travels: what
+//! arrives is told in the order it arrived, in a `DATA` or a `DATA6` as
+//! each travelled. The kernel numbers the sockets and gives out the ports, so a
 //! `BIND` is told, not asked: the stack opens a smoltcp socket on that
 //! port and from then on every datagram that arrives for it goes to the
 //! kernel, at once, and every `SEND` goes to the card, to travel as many
@@ -70,7 +81,7 @@ use smoltcp::socket::{RawPacketMetadata, RawSocket, RawSocketBuffer};
 use smoltcp::socket::{SocketHandle, SocketSet, UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion};
-use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr};
+use smoltcp::wire::{Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address};
 
 pub mod groups;
 pub mod lease;
@@ -88,6 +99,8 @@ pub const OP_CLOSE: u32 = 3;
 pub const OP_DATA: u32 = 4;
 pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
+pub const OP_SEND6: u32 = 17;
+pub const OP_DATA6: u32 = 18;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, for
 /// whichever sockets hear.
@@ -99,11 +112,17 @@ pub const HEADER_LEN: usize = 16;
 pub const DATAGRAM_AT: usize = 24;
 /// What each record of a `DATA` starts with.
 pub const RECORD_LEN: usize = 16;
+/// Where the datagram starts in `SEND6`.
+pub const DATAGRAM6_AT: usize = 36;
+/// What each record of a `DATA6` starts with.
+pub const RECORD6_LEN: usize = 28;
 /// The longest message: a channel's.
 pub const MESSAGE_MAX: usize = 65536;
 
 /// The IPv4 and UDP headers a datagram travels behind.
 const HEADERS: usize = 20 + 8;
+/// The IPv6 and UDP headers one travels behind.
+const HEADERS6: usize = 40 + 8;
 /// The IPv4 header an ICMP message travels behind.
 const IP_HEADER: usize = 20;
 /// The hops smoltcp gives a datagram whose socket was told none.
@@ -153,6 +172,22 @@ pub fn start_data(m: &mut Vec<u8>) {
     m.extend_from_slice(&0u32.to_le_bytes());
     m.extend_from_slice(&OP_DATA.to_le_bytes());
     m.extend_from_slice(&0u64.to_le_bytes());
+}
+
+/// Make `m` a `DATA6` with no records yet.
+pub fn start_data6(m: &mut Vec<u8>) {
+    start_data(m);
+    m[4..8].copy_from_slice(&OP_DATA6.to_le_bytes());
+}
+
+/// Add a record to the `DATA6` message `m`: `data`, from `addr:port`,
+/// for socket `sock`.
+pub fn push_record6(m: &mut Vec<u8>, sock: u64, addr: [u8; 16], port: u16, data: &[u8]) {
+    m.extend_from_slice(&sock.to_le_bytes());
+    m.extend_from_slice(&addr);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(data);
 }
 
 /// Add a record to the `DATA` message `m`: `data`, from `addr:port`, for
@@ -269,6 +304,11 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// it does not fragment.
     pub fn max_datagram(&self) -> usize {
         self.iface.device().capabilities().ip_mtu() - HEADERS
+    }
+
+    /// The longest one that travels as IPv6, whose header is longer.
+    pub fn max_datagram6(&self) -> usize {
+        self.iface.device().capabilities().ip_mtu() - HEADERS6
     }
 
     /// How many datagram sockets the kernel has here.
@@ -460,6 +500,28 @@ impl<D: for<'d> Device<'d>> Stack<D> {
                     .map_err(|_| Refused::Full)?;
                 Ok(true)
             }
+            OP_SEND6 => {
+                if m.len() < DATAGRAM6_AT {
+                    return Err(Refused::Malformed);
+                }
+                let handle = *self.socks.get(&sock).ok_or(Refused::NoSocket)?;
+                let addr = Ipv6Address::from_bytes(&m[16..32]);
+                let port = u16::from_le_bytes([m[32], m[33]]);
+                let data = &m[DATAGRAM6_AT..];
+                if data.len() > self.max_datagram6() {
+                    return Err(Refused::TooLong);
+                }
+                if port == 0 || !self.reaches6(addr) {
+                    return Err(Refused::Unreachable);
+                }
+                let to = IpEndpoint::new(IpAddress::Ipv6(addr), port);
+                self.hops(handle, m[34]);
+                self.set
+                    .get::<UdpSocket>(handle)
+                    .send_slice(data, to)
+                    .map_err(|_| Refused::Full)?;
+                Ok(true)
+            }
             OP_CLOSE if m.len() == HEADER_LEN => {
                 // A socket closed before it had a port was never told here.
                 if let Some(handle) = self.socks.remove(&sock) {
@@ -540,20 +602,39 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// message.
     fn datagrams(&mut self, m: &mut Vec<u8>) -> Arrived {
         start_data(m);
+        // Whether `m` is a `DATA6`: it is what its first datagram is.
+        let mut six = false;
         for (&sock, &handle) in &self.socks {
             let mut socket = self.set.get::<UdpSocket>(handle);
-            while let Ok((data, _)) = socket.peek() {
-                if m.len() + RECORD_LEN + data.len() > MESSAGE_MAX {
+            while let Ok((data, from)) = socket.peek() {
+                let is_six = matches!(from.addr, IpAddress::Ipv6(_));
+                if m.len() == HEADER_LEN {
+                    six = is_six;
+                    if six {
+                        start_data6(m);
+                    }
+                } else if is_six != six {
+                    // The other kind: the next message.
+                    return Arrived::More;
+                }
+                let record = if six { RECORD6_LEN } else { RECORD_LEN };
+                if m.len() + record + data.len() > MESSAGE_MAX {
                     return Arrived::More;
                 }
                 let Ok((data, from)) = socket.recv() else {
                     break;
                 };
-                if let IpAddress::Ipv4(addr) = from.addr {
-                    push_record(m, sock, addr.0, from.port, data);
-                    self.brought = true;
+                match from.addr {
+                    IpAddress::Ipv4(addr) => push_record(m, sock, addr.0, from.port, data),
+                    IpAddress::Ipv6(addr) => push_record6(m, sock, addr.0, from.port, data),
+                    _ => continue,
                 }
+                self.brought = true;
             }
+        }
+        if six {
+            // What is heard of ICMP is told in a `DATA`: the next.
+            return Arrived::More;
         }
         // What the ear heard: all of it for the sockets that hear, when
         // any does, and for the stack what says that something it sent
@@ -672,10 +753,10 @@ mod tests {
 
     /// A datagram as the kernel is told of it: its socket, who sent it,
     /// and what it carried.
-    type Told = (u64, [u8; 4], u16, Vec<u8>);
+    pub(super) type Told = (u64, [u8; 4], u16, Vec<u8>);
 
     /// The records of a `DATA` message.
-    fn records(m: &[u8]) -> Vec<Told> {
+    pub(super) fn records(m: &[u8]) -> Vec<Told> {
         assert_eq!(parse_header(m), Some((OP_DATA, 0)));
         let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
         while !rest.is_empty() {
