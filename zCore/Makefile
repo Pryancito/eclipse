@@ -508,10 +508,11 @@ endif
 
 # UNET=1: a virtio network card on a user-mode network of its own
 # (10.0.3.0/24, so that it is not the kernel card's 10.0.2.0/24), for a
-# driver in userspace. The kernel has no virtio-net driver: boot with
-# `udriver=virtio-net@0` in KOPTS to have it recorded for a process to
-# claim. With UDISK as well, both go in one option:
-# `udriver=virtio-blk@N,virtio-net@0`.
+# driver in userspace. The kernel has no virtio-net driver, so it leaves
+# the first such card for a process to claim without a word in KOPTS
+# (`udriver=virtio-net@0` says the same; with UDISK the disk is named:
+# `udriver=virtio-blk@N`). `unetstack=none` in KOPTS is the boot where the
+# kernel does not leave it and nothing takes it.
 #
 # Who claims it is the network stack that runs as a process
 # (`tools/eclipse-netstack`), which is the card's driver too and asks a

@@ -13,8 +13,11 @@
 //!
 //! The count is per kind and runs across every bus the kernel probes, so
 //! `virtio-blk@1` is "the second virtio disk" whatever the transport. The
-//! default is no reservation at all: the kernel takes every device, as it
-//! always has.
+//! kernel takes every device it has a driver for unless the command line
+//! says otherwise, as it always has. A virtio network card is one it has
+//! none for, so the first of them is left to userspace without a word
+//! ([`wanted`]): there it is the card of the network stack that runs as a
+//! process, where otherwise it would be nobody's.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -169,21 +172,41 @@ pub fn parse_specs(spec: &str) -> Vec<(&'static str, usize)> {
     spec.split(',').filter_map(parse_spec).collect()
 }
 
+/// What a boot leaves to userspace: the devices its `udriver=` value
+/// names and, with `net_by_default`, the first virtio network card when
+/// that value names no network card at all. Each with whether the command
+/// line named it.
+pub fn wanted(spec: Option<&str>, net_by_default: bool) -> Vec<((&'static str, usize), bool)> {
+    let mut wanted: Vec<_> = parse_specs(spec.unwrap_or(""))
+        .into_iter()
+        .map(|device| (device, true))
+        .collect();
+    if net_by_default && !wanted.iter().any(|((kind, _), _)| *kind == VIRTIO_NET) {
+        wanted.push(((VIRTIO_NET, 0), false));
+    }
+    wanted
+}
+
 /// Set the reservation from the command line's `udriver=` value, before
-/// the buses are probed. Only the first call counts.
-pub fn set_reservation(spec: Option<&str>) {
+/// the buses are probed: see [`wanted`]. Only the first call counts.
+pub fn set_reservation(spec: Option<&str>, net_by_default: bool) {
     WANTED.call_once(|| {
-        let mut wanted = Vec::new();
         for item in spec.unwrap_or("").split(',').filter(|s| !s.is_empty()) {
-            match parse_spec(item) {
-                Some((kind, index)) => {
-                    info!("udriver: reserving {kind} #{index} for userspace");
-                    wanted.push((kind, index));
-                }
-                None => warn!("udriver={item}: not a device this kernel can reserve"),
+            if parse_spec(item).is_none() {
+                warn!("udriver={item}: not a device this kernel can reserve");
             }
         }
-        wanted
+        wanted(spec, net_by_default)
+            .into_iter()
+            .map(|((kind, index), named)| {
+                if named {
+                    info!("udriver: reserving {kind} #{index} for userspace");
+                } else {
+                    info!("udriver: {kind} #{index}, if there is one, is for userspace: the kernel has no driver for it");
+                }
+                (kind, index)
+            })
+            .collect()
     });
 }
 
@@ -253,6 +276,16 @@ pub fn reserve_if(
         claimed: AtomicBool::new(false),
     }));
     true
+}
+
+/// The devices left to userspace, as `udriver=` would name each
+/// (`virtio-net@0`), in the order the buses found them.
+pub fn reserved() -> Vec<alloc::string::String> {
+    RESERVED
+        .lock()
+        .iter()
+        .map(|d| alloc::format!("{}@{}", d.kind, d.index))
+        .collect()
 }
 
 /// The reserved device of `kind` with this index, if there is one.
@@ -371,10 +404,43 @@ mod tests {
         assert!(!device(transport, &mut window).reset());
     }
 
+    #[test]
+    fn the_first_network_card_is_left_to_userspace_without_a_word() {
+        // Nothing said: the card, and it was not named.
+        assert_eq!(wanted(None, true), [((VIRTIO_NET, 0), false)]);
+        assert_eq!(wanted(Some(""), true), [((VIRTIO_NET, 0), false)]);
+        // A disk named: the disk, and the card as well.
+        assert_eq!(
+            wanted(Some("virtio-blk@1"), true),
+            [((VIRTIO_BLK, 1), true), ((VIRTIO_NET, 0), false)]
+        );
+        // A card named, the first or another: that one and no other.
+        assert_eq!(
+            wanted(Some("virtio-net@0"), true),
+            [((VIRTIO_NET, 0), true)]
+        );
+        assert_eq!(
+            wanted(Some("virtio-net@1,virtio-blk@0"), true),
+            [((VIRTIO_NET, 1), true), ((VIRTIO_BLK, 0), true)]
+        );
+        // A boot that wants no card left by itself has what it names.
+        assert_eq!(wanted(None, false), []);
+        assert_eq!(
+            wanted(Some("virtio-blk@1"), false),
+            [((VIRTIO_BLK, 1), true)]
+        );
+        assert_eq!(
+            wanted(Some("virtio-net@0"), false),
+            [((VIRTIO_NET, 0), true)]
+        );
+        // An item that names no device changes nothing.
+        assert_eq!(wanted(Some("floppy@0"), true), [((VIRTIO_NET, 0), false)]);
+    }
+
     // The global state is set once per process, so one test walks it.
     #[test]
     fn only_the_wanted_device_is_reserved() {
-        set_reservation(Some("virtio-blk@1,virtio-net@0"));
+        set_reservation(Some("virtio-blk@1,virtio-net@0"), true);
         let base = SEEN[0].load(Ordering::Acquire) + SEEN[1].load(Ordering::Acquire);
         // Other tests may not count devices, so the index is absolute only
         // when this test starts from zero.

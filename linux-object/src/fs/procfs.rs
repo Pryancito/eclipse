@@ -68,7 +68,7 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 59] = [
+const PROC_ROOT_STATIC: [&str; 60] = [
     "net",
     "gpuready",
     "present",
@@ -128,6 +128,7 @@ const PROC_ROOT_STATIC: [&str; 59] = [
     "usbhid",
     "bootprofile",
     "kbd",
+    "udrivers",
 ];
 
 /// The machine's live processes. The census itself is
@@ -833,6 +834,7 @@ impl INode for ProcRootINode {
             "gpudump" => Ok(PROC_GPUDUMP.clone()),
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
             "kbd" => Ok(PROC_KBD.clone()),
+            "udrivers" => Ok(PROC_UDRIVERS.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             "thread-self" => Ok(Arc::new(ProcSelfSymINode { thread: true })),
             name => {
@@ -2224,6 +2226,19 @@ fn proc_bootprofile_content() -> String {
     crate::boot_trace::render()
 }
 
+/// `/proc/udrivers`: the devices the kernel left to drivers in userspace,
+/// one to a line as `udriver=` names each (`virtio-net@0`). Only the ones
+/// that are there: a device the command line names and the machine does
+/// not have is not listed, and one the kernel left unasked is. It is what
+/// init reads to know which driver services have a device to claim.
+fn proc_udrivers_content() -> String {
+    udrivers_lines(&kernel_hal::drivers::user::reserved())
+}
+
+fn udrivers_lines(left: &[String]) -> String {
+    left.iter().map(|device| format!("{device}\n")).collect()
+}
+
 fn proc_kptr_restrict_content() -> String {
     String::from("0\n")
 }
@@ -3365,6 +3380,13 @@ fn proc_oops_content() -> String {
 // A block of its own, not a line in the one above: `lazy_static!` expands
 // recursively, one level per entry, and that block is already at the macro
 // recursion limit -- one more entry in it fails to compile.
+lazy_static! {
+    static ref PROC_UDRIVERS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 165,
+        generate: proc_udrivers_content,
+    });
+}
+
 lazy_static! {
     /// `/proc/stalls` — the blocking waits outstanding RIGHT NOW, longest
     /// first. Every other wait counter in the kernel is recorded when the wait
@@ -5592,6 +5614,15 @@ mod comm_field_tests {
         let listed = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), listed, "un nombre repetido en el listado");
+    }
+
+    #[test]
+    fn the_devices_left_to_userspace_are_listed_one_to_a_line() {
+        assert_eq!(udrivers_lines(&[]), "");
+        assert_eq!(
+            udrivers_lines(&["virtio-blk@1".into(), "virtio-net@0".into()]),
+            "virtio-blk@1\nvirtio-net@0\n"
+        );
     }
 
     #[test]

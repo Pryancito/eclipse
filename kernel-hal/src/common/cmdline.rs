@@ -109,6 +109,18 @@ pub fn is_off(cmdline: &str, key: &str) -> bool {
     value(cmdline, key).and_then(parse_bool) == Some(false)
 }
 
+/// What a boot leaves to drivers in userspace, as
+/// `zcore_drivers::user::set_reservation` takes it: the value of `udriver=`,
+/// and whether the first virtio network card goes with it unasked. It does
+/// unless the boot wants no network stack for that card (`unetstack=none`)
+/// or has shut the gateway a driver in userspace claims its device through
+/// (`zircon.gateway=0`): a card nobody could claim is better left unseen.
+pub fn user_devices(cmdline: &str) -> (Option<&str>, bool) {
+    let net_by_default =
+        value(cmdline, "unetstack") != Some("none") && !is_off(cmdline, "zircon.gateway");
+    (value(cmdline, "udriver"), net_by_default)
+}
+
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
 /// on in one go — `nvidia.cuda` for every switch CUDA needs.
 ///
@@ -815,6 +827,32 @@ mod tests {
     }
 
     // ── the CPU-count ceiling ───────────────────────────────────────────────
+
+    #[test]
+    fn the_network_card_goes_to_userspace_unless_the_boot_wants_none_there() {
+        // Nothing said: the card, unasked.
+        assert_eq!(user_devices("LOG=warn:ROOT=/dev/vda"), (None, true));
+        assert_eq!(user_devices(""), (None, true));
+        // What `udriver=` says is passed on as it is written.
+        assert_eq!(
+            user_devices("LOG=warn:udriver=virtio-blk@1,virtio-net@0"),
+            (Some("virtio-blk@1,virtio-net@0"), true)
+        );
+        // An address for the stack, or the kernel's stack for the card: it
+        // is left to userspace all the same.
+        assert!(user_devices("unetstack=10.0.9.15/24").1);
+        assert!(user_devices("unetstack=dhcp:zircon.gateway=1").1);
+        assert!(user_devices("unetstack=kernel").1);
+        // No stack for it, or no gateway to claim it through: not unasked.
+        assert_eq!(user_devices("LOG=warn:unetstack=none"), (None, false));
+        assert_eq!(user_devices("zircon.gateway=0"), (None, false));
+        assert_eq!(
+            user_devices("udriver=virtio-net@0:unetstack=none"),
+            (Some("virtio-net@0"), false)
+        );
+        // A word that only ends like it says nothing.
+        assert!(user_devices("notunetstack=none").1);
+    }
 
     #[test]
     fn a_command_line_that_says_nothing_about_smp_sets_no_ceiling() {

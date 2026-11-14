@@ -19,8 +19,9 @@
 //! asks this process, over a channel, to send its datagrams and make its
 //! connections, and is told of what arrives (`eclipse_netstack_serve`).
 //! Which programs: all of them, on a machine whose only card is this
-//! stack's, which is what a boot that leaves it the card gets
-//! (`udriver=virtio-net@0`); with `unetuse=asked` on the kernel command
+//! stack's, which is what a machine with a virtio network card gets
+//! without a word (the kernel leaves that card to userspace, having no
+//! driver for it); with `unetuse=asked` on the kernel command
 //! line, or where the kernel drives a card of its own, the ones started by
 //! `eclipse-netstack-use`, and every other socket is the kernel's
 //! stack's. The address is written on the command
