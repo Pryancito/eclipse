@@ -3306,6 +3306,10 @@ pub struct E1000eInterface {
     /// the next [`poll_with_irq_hint`](E1000eInterface::poll_with_irq_hint),
     /// IRQ-driven or periodic.
     pending_icr: Arc<AtomicU32>,
+    /// A lent card refused a frame for want of room on the ring: the
+    /// borrower wants to hear when frames have gone out, and only then.
+    /// See [`ims_rearm`](E1000eInterface::ims_rearm).
+    tx_room_wanted: Arc<AtomicBool>,
     watchdog_job_scheduled: Arc<AtomicBool>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -3424,7 +3428,28 @@ impl E1000eInterface {
     }
 
     fn ims_rearm(&self) {
-        ims_rearm_at(self.base);
+        if !self.lent.is_on() {
+            ims_rearm_at(self.base);
+            return;
+        }
+        // A lent card does not interrupt for frames sent, unless the
+        // borrower waits for room. Each interrupt starts the throttle's
+        // interval again (ITR, 512 us when busy), so the one for a reply
+        // just sent held back the next frame received: an echo went from
+        // 460 to 720-830 us. The borrower learns the card took a frame when
+        // it sends it ([`NetScheme::send`]), and needs no interrupt for that.
+        let tx = if self.tx_room_wanted.load(Ordering::Acquire) {
+            ICR_TXDW
+        } else {
+            0
+        };
+        unsafe {
+            mmio_write(self.base, E1000E_IMC, ICR_TXDW & !tx);
+            compiler_fence(Ordering::SeqCst);
+            mmio_write(self.base, E1000E_IMS, (IMS_REARM & !ICR_TXDW) | tx);
+            let _ = mmio_read(self.base, E1000E_IMS);
+            fence(Ordering::SeqCst);
+        }
     }
 
     /// NIC poll; `irq_icr` carries ICR bits when invoked from the deferred IRQ bottom-half.
@@ -3456,6 +3481,10 @@ impl E1000eInterface {
         // got. The lock is taken a frame at a time: the borrower sends
         // through `NetScheme::send`, which takes it too.
         if let Some(taker) = self.lent.taker() {
+            // The interrupt that would have said so has no bottom half.
+            if irq_icr & ICR_LSC != 0 {
+                self.schedule_watchdog(true);
+            }
             for _ in 0..super::lent::BURST {
                 let frame = self.driver.hw.lock().receive();
                 match frame {
@@ -3470,6 +3499,9 @@ impl E1000eInterface {
                 let rx_burst = hw.stats.rx_packets.saturating_sub(rx_baseline);
                 hw.tune_itr(now, rx_burst);
             }
+            // The borrower tries again what the card had no room for, and
+            // says so again if there is still none.
+            self.tx_room_wanted.store(false, Ordering::Release);
             taker.done();
             return Ok(());
         }
@@ -3541,6 +3573,30 @@ impl Scheme for E1000eInterface {
         if icr == 0 {
             if !self.poll_pending.load(Ordering::SeqCst) {
                 self.ims_rearm();
+            }
+            return;
+        }
+
+        // A card lent to a stack that is not the kernel's has no bottom
+        // half: a deferred job runs when the CPU idles or a kernel socket
+        // waits, and with the card lent nobody waits on one, so with the
+        // CPU busy its frames sat on the card for tens of milliseconds.
+        // The card stays masked with its causes kept, and the borrower is
+        // woken to look at it itself (`NetScheme::poll`, which re-arms it),
+        // as soon as it runs.
+        if self.lent.is_on() {
+            self.pending_icr.fetch_or(icr, Ordering::AcqRel);
+            match self.lent.taker() {
+                Some(taker) => {
+                    unsafe {
+                        mmio_write(self.base, E1000E_IMC, 0xFFFF_FFFF);
+                        let _ = mmio_read(self.base, E1000E_IMC);
+                        fence(Ordering::SeqCst);
+                    }
+                    taker.interrupted();
+                }
+                // Given back meanwhile: whoever has it now looks.
+                None => self.ims_rearm(),
             }
             return;
         }
@@ -3764,7 +3820,19 @@ impl NetScheme for E1000eInterface {
     }
     fn send(&self, data: &[u8]) -> DeviceResult<usize> {
         let mut hw = self.driver.hw.lock();
-        hw.send(data)?;
+        let sent = hw.send(data);
+        drop(hw);
+        if sent == Err(DeviceError::NotReady)
+            && self.lent.is_on()
+            && !self.tx_room_wanted.swap(true, Ordering::AcqRel)
+        {
+            // Hear when frames have gone out (see `ims_rearm`).
+            unsafe {
+                mmio_write(self.base, E1000E_IMS, ICR_TXDW);
+                let _ = mmio_read(self.base, E1000E_IMS);
+            }
+        }
+        sent?;
         Ok(data.len())
     }
     fn can_recv(&self) -> bool {
@@ -4263,6 +4331,7 @@ pub fn init(
         poll_pending_set_us: Arc::new(AtomicU64::new(0)),
         link_up_seen,
         pending_icr: Arc::new(AtomicU32::new(0)),
+        tx_room_wanted: Arc::new(AtomicBool::new(false)),
         watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
@@ -6376,6 +6445,7 @@ mod scheme_tests {
             poll_pending_set_us: Arc::new(AtomicU64::new(0)),
             link_up_seen: Arc::new(AtomicBool::new(true)),
             pending_icr: Arc::new(AtomicU32::new(0)),
+            tx_room_wanted: Arc::new(AtomicBool::new(false)),
             watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
             routes: Arc::new(Mutex::new(vec![])),
             ip_addrs: Arc::new(Mutex::new(ip_addrs)),
@@ -6896,6 +6966,50 @@ mod scheme_tests {
         assert_eq!(kept.frames.lock().len(), 2);
         assert_eq!(*kept.dones.lock(), 2);
         assert!(other.frames.lock().is_empty());
+    }
+
+    /// A lent card's interrupt wakes the borrower and leaves the card masked
+    /// for it, with no bottom half; the borrower's look unmasks it, without
+    /// the interrupt for frames sent unless it waits for room on the ring.
+    #[test]
+    fn a_lent_cards_interrupt_is_the_borrowers_to_answer() {
+        use crate::net::lent::tests::Kept;
+        let reg = |iface: &E1000eInterface, r: usize| unsafe {
+            core::ptr::read_volatile((iface.base + r * 4) as *const u32)
+        };
+        let iface = interface();
+        let kept = Arc::new(Kept::default());
+        assert_eq!(iface.lend(Some(kept.clone())), Ok(()));
+        unsafe {
+            core::ptr::write_volatile((iface.base + E1000E_ICR * 4) as *mut u32, ICR_RXT0);
+        }
+        iface.handle_irq(iface.irq);
+        assert_eq!(*kept.interrupts.lock(), 1);
+        assert_eq!(*kept.dones.lock(), 0, "nobody looked for it");
+        assert!(!iface.poll_pending.load(Ordering::SeqCst), "no bottom half");
+        assert_eq!(
+            reg(&iface, E1000E_IMC),
+            0xFFFF_FFFF,
+            "masked until looked at"
+        );
+        // The borrower looks.
+        NetScheme::poll(&iface).unwrap();
+        assert_eq!(*kept.dones.lock(), 1);
+        assert_eq!(reg(&iface, E1000E_IMS), IMS_REARM & !ICR_TXDW);
+        // No room for a frame: the card says when there is.
+        iface.driver.hw.lock().link_up = false;
+        unsafe {
+            core::ptr::write_volatile((iface.base + E1000E_STATUS * 4) as *mut u32, 0);
+        }
+        assert_eq!(iface.send(&[0u8; 60]), Err(DeviceError::NotReady));
+        assert_eq!(reg(&iface, E1000E_IMS), ICR_TXDW);
+        // Looked at again, the borrower has tried again and did not ask.
+        NetScheme::poll(&iface).unwrap();
+        assert_eq!(reg(&iface, E1000E_IMS), IMS_REARM & !ICR_TXDW);
+        // Given back: the kernel's card interrupts for everything again.
+        assert_eq!(iface.lend(None), Ok(()));
+        NetScheme::poll(&iface).unwrap();
+        assert_eq!(reg(&iface, E1000E_IMS), IMS_REARM);
     }
 
     /// The carrier is up if the driver saw it up OR the status register says so
