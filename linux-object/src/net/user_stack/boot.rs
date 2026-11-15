@@ -17,17 +17,20 @@
 //! * `unetuse=all`: every program's sockets are a stack process's whatever
 //!   else the boot says, even while none runs.
 //!
-//! A machine where the kernel drives a card of its own keeps the kernel's
-//! stack for the programs that do not ask, since that stack is the only one
-//! that reaches that card: there the stack process is for the ones that do,
-//! unless the boot says `unetuse=all`.
+//! A machine with no such card, whose first card the kernel drives itself
+//! (the e1000e of an x86_64 machine), lends that card to the stack process
+//! ([`lends`]): the kernel goes on driving it, its frames go to the stack
+//! process and not to the kernel's stack, and it counts as the stack
+//! process's card in all of the above. That is the machine's network too
+//! when the kernel has no other card. `unetstack=kernel` keeps the card,
+//! and the network, for the kernel's own stack, as `unetstack=none` does;
+//! `unetcard=kernel` lends the card even when a virtio card is there, which
+//! is then not left to userspace unasked.
 //!
-//! `unetcard=kernel` is the boot that gives the stack process the kernel's
-//! own first card instead: the kernel goes on driving it and lends it
-//! ([`lends`]), its frames go to the stack process and not to the kernel's
-//! stack, and it counts as the stack process's card in all of the above.
-//! It is for a machine with no virtio network card left to userspace, which
-//! would be that stack's card first.
+//! The kernel's other cards are its own stack's, which is the only one that
+//! reaches them: on a machine with any, the programs that do not ask keep
+//! the kernel's stack, and the stack process is for the ones that do,
+//! unless the boot says `unetuse=all`.
 
 /// The card the stack process takes, as `udriver=` names it and as
 /// `zcore_drivers::user::reserved` lists it: the one the `unet` boot
@@ -42,16 +45,14 @@ pub const LENT_CARD: &str = "kernel-net@0";
 static LENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether this boot lends the kernel's first card to a stack that runs as
-/// a process (`unetcard=kernel`): `unetcard` and `unetstack` are the values
-/// of those words, `card` is whether [`CARD`] is there and left to
-/// userspace, and `lendable` whether the kernel drives a first card and its
-/// driver can lend it. A machine with [`CARD`] has that one for the stack
-/// process, and a boot that wants no stack process lends nothing.
-pub fn lends(unetcard: Option<&str>, unetstack: Option<&str>, card: bool, lendable: bool) -> bool {
-    unetcard == Some("kernel")
-        && lendable
-        && !card
-        && !matches!(unetstack, Some("kernel") | Some("none"))
+/// a process: `unetstack` is the value of that word, `card` is whether
+/// [`CARD`] is there and left to userspace, and `lendable` whether the
+/// kernel drives a first card and its driver can lend it. It does unless
+/// one of those says no: a machine with [`CARD`] has that one for the stack
+/// process, and a boot that wants no stack process (`unetstack=kernel`,
+/// `unetstack=none`) lends nothing.
+pub fn lends(unetstack: Option<&str>, card: bool, lendable: bool) -> bool {
+    lendable && !card && !matches!(unetstack, Some("kernel") | Some("none"))
 }
 
 /// Says what [`lends`] answered on this boot, once it is known.
@@ -205,20 +206,18 @@ mod tests {
 
     #[test]
     fn a_card_the_kernel_lends_is_the_stack_processs_and_not_the_kernels() {
-        // The boot asks, the kernel's first card can be lent and no virtio
-        // card is left to userspace: lent.
-        assert!(lends(Some("kernel"), None, false, true));
-        assert!(lends(Some("kernel"), Some("dhcp"), false, true));
-        // Not asked, or asked with a word that is not the one.
-        assert!(!lends(None, None, false, true));
-        assert!(!lends(Some("yes"), None, false, true));
+        // The kernel's first card can be lent and no virtio card is left
+        // to userspace: lent, with nothing said or with an address.
+        assert!(lends(None, false, true));
+        assert!(lends(Some("dhcp"), false, true));
+        assert!(lends(Some("10.0.2.15/24,10.0.2.2"), false, true));
         // No card of the kernel's, or one whose driver cannot lend it.
-        assert!(!lends(Some("kernel"), None, false, false));
+        assert!(!lends(None, false, false));
         // The virtio card is the stack process's first.
-        assert!(!lends(Some("kernel"), None, true, true));
+        assert!(!lends(None, true, true));
         // A boot with no stack process has nobody to lend to.
-        assert!(!lends(Some("kernel"), Some("kernel"), false, true));
-        assert!(!lends(Some("kernel"), Some("none"), false, true));
+        assert!(!lends(Some("kernel"), false, true));
+        assert!(!lends(Some("none"), false, true));
 
         // The only card of the machine, lent: the stack process is the
         // network of every program, as with a card of its own.

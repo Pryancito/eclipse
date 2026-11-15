@@ -2230,8 +2230,8 @@ fn proc_bootprofile_content() -> String {
 /// one to a line as `udriver=` names each (`virtio-net@0`). Only the ones
 /// that are there: a device the command line names and the machine does
 /// not have is not listed, and one the kernel left unasked is. A card the
-/// kernel drives and lends to the stack process (`unetcard=kernel`) is
-/// listed too, as `kernel-net@0`. It is what init reads to know which
+/// kernel drives and lends to the stack process (`user_stack::boot::lends`)
+/// is listed too, as `kernel-net@0`. It is what init reads to know which
 /// driver services have a device to claim.
 fn proc_udrivers_content() -> String {
     let mut left = kernel_hal::drivers::user::reserved();

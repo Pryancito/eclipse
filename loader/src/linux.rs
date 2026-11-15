@@ -651,7 +651,7 @@ pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 /// to this process and not to the kernel's stack, and the card is not
 /// among the kernel's interfaces; closing it, or dying, gives the card
 /// back. `ACCESS_DENIED` unless it is the card the boot lends (the first,
-/// with `unetcard=kernel`: `linux_object::net::user_stack::boot::lends`),
+/// on a machine with no virtio card: `linux_object::net::user_stack::boot::lends`),
 /// `NOT_FOUND` when the kernel has no such card, `NOT_SUPPORTED` when its
 /// driver cannot lend it, `ALREADY_BOUND` when it is lent.
 #[cfg(feature = "zircon-gateway")]
@@ -1039,8 +1039,9 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             proc.linux().use_user_netstack();
             0
         }
-        // Only the card the boot lends (`unetcard=kernel`): a machine that
-        // did not say so keeps its cards for the kernel's stack whoever asks.
+        // Only the card the boot lends (`user_stack::boot::lends`): a boot
+        // that lends none keeps its cards for the kernel's stack whoever
+        // asks.
         ECLIPSE_NET_BORROW
             if args[0] != 0 || linux_object::net::user_stack::boot::lent().is_none() =>
         {
