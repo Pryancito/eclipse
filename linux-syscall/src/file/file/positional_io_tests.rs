@@ -151,7 +151,9 @@ fn pread_and_pwrite_leave_the_offset_alone_and_read_and_write_move_it() {
 
             // A pwrite goes where it was told and still does not move it.
             let abcd = *b"ABCD";
-            let pwrite = sys.sys_pwrite(fd, UserInPtr::from(abcd.as_ptr() as usize), 4, 0);
+            let pwrite = sys
+                .sys_pwrite(fd, UserInPtr::from(abcd.as_ptr() as usize), 4, 0)
+                .await;
             assert_eq!(pwrite, Ok(4), "a pwrite did not put four bytes");
             assert_eq!(
                 sys.sys_lseek(fd, 0, SEEK_CUR),
@@ -378,7 +380,8 @@ fn a_negative_offset_is_einval_in_every_one_of_the_four_positional_calls() {
                 "pread took a negative offset"
             );
             assert_eq!(
-                sys.sys_pwrite(fd, UserInPtr::from(four.as_ptr() as usize), 4, minus_one),
+                sys.sys_pwrite(fd, UserInPtr::from(four.as_ptr() as usize), 4, minus_one)
+                    .await,
                 Err(LxError::EINVAL),
                 "pwrite took a negative offset"
             );

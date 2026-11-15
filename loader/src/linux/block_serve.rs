@@ -456,8 +456,9 @@ impl Link {
         Ok((parts, k))
     }
 
-    /// Ask the driver to flush the device, and wait until it has.
-    fn flush_device(&self) -> DeviceResult {
+    /// Ask the driver to flush the device: the slot the answer comes to,
+    /// and until when to wait for it.
+    fn send_flush(&self) -> Result<([Part; 1], u64), DeviceError> {
         let deadline = now_ms() + REPLY_TIMEOUT_MS;
         let taken = self.claim(1, deadline).ok_or(DeviceError::IoError)?;
         let slot = taken.trailing_zeros() as usize;
@@ -472,6 +473,12 @@ impl Link {
         self.expect[slot].store(id, Ordering::Release);
         // On failure it may be on its way: the slot does not come back.
         self.send(&encode(OP_FLUSH, id, 0, 0, 0), 1, deadline)?;
+        Ok((part, deadline))
+    }
+
+    /// Ask the driver to flush the device, and wait until it has.
+    fn flush_device(&self) -> DeviceResult {
+        let (part, deadline) = self.send_flush()?;
         let answered = self.wait_yielding(&part, deadline);
         self.release(&part);
         answered
@@ -558,6 +565,45 @@ impl Link {
         Ok(())
     }
 
+    /// A write, the task asleep while the driver works: [`read_async`]'s
+    /// other half.
+    ///
+    /// [`read_async`]: Self::read_async
+    async fn write_async(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        let len = buf.len();
+        if !in_range(block_id as u64, len, self.sectors) {
+            debug!("served disk: {len} bytes at sector {block_id} refused");
+            return Err(DeviceError::InvalidParam);
+        }
+        let window = &self.window;
+        let mut before = |off: usize, at: usize, n: usize| {
+            window.write(off, &buf[at..at + n]).map_err(|e| {
+                warn!("served disk: writing the window: {e:?}");
+                DeviceError::IoError
+            })
+        };
+        let deadline = now_ms() + REPLY_TIMEOUT_MS;
+        let mut done = 0;
+        while done < len {
+            let (parts, k) =
+                self.submit(OP_WRITE, block_id, len, &mut done, deadline, &mut before)?;
+            let parts = &parts[..k];
+            let answered = self.wait_async(parts, deadline).await;
+            self.finish(parts, answered, &mut |_, _, _| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// [`flush_device`](Self::flush_device), the task asleep until the
+    /// device has: a flush takes as long as the disk under it, which is no
+    /// time to keep a CPU looking.
+    async fn flush_async(&self) -> DeviceResult {
+        let (part, deadline) = self.send_flush()?;
+        let answered = self.sleep_on(&part, deadline).await;
+        self.release(&part);
+        answered
+    }
+
     /// What `parts` came back as: `None` while any is still out.
     fn verdict(&self, parts: &[Part]) -> Option<DeviceResult> {
         let mut failed = false;
@@ -618,6 +664,12 @@ impl Link {
         if let Some(r) = self.look(parts) {
             return r;
         }
+        self.sleep_on(parts, deadline).await
+    }
+
+    /// [`wait_async`](Self::wait_async) without the look, for what is
+    /// known to take long.
+    async fn sleep_on(&self, parts: &[Part], deadline: u64) -> DeviceResult {
         let fifo: Arc<dyn KernelObject> = self.fifo.clone();
         loop {
             if let Some(r) = self.verdict(parts) {
@@ -847,6 +899,20 @@ impl ServedDisk {
     }
 }
 
+impl ServedDisk {
+    /// The driver died under a request that sleeps: asleep until the next
+    /// one, or until it is known that none comes.
+    async fn next_driver(&self, old: &Arc<Link>) -> Result<Arc<Link>, DeviceError> {
+        loop {
+            if let Some(next) = self.after(old)? {
+                return Ok(next);
+            }
+            let soon = kernel_hal::timer::timer_now() + NEXT_DRIVER_STEP;
+            kernel_hal::thread::sleep_until(soon).await;
+        }
+    }
+}
+
 impl Scheme for ServedDisk {
     fn name(&self) -> &str {
         // The `virtio` family, so the node is a `vdX`: what is behind it is
@@ -882,23 +948,48 @@ impl BlockScheme for ServedDisk {
                 if r.is_ok() || !link.is_dead() {
                     break r;
                 }
-                // The driver died under the read: asleep until the next.
-                link = loop {
-                    match self.after(&link) {
-                        Ok(Some(next)) => break next,
-                        Ok(None) => {
-                            let soon = kernel_hal::timer::timer_now() + NEXT_DRIVER_STEP;
-                            kernel_hal::thread::sleep_until(soon).await;
-                        }
-                        Err(e) => {
-                            self.stats.note_read(&Err(e), len);
-                            return Err(e);
-                        }
-                    }
+                link = match self.next_driver(&link).await {
+                    Ok(next) => next,
+                    Err(e) => break Err(e),
                 };
             };
             self.stats.note_read(&r, len);
             r
+        }))
+    }
+
+    fn write_block_async<'a>(
+        &'a self,
+        block_id: usize,
+        buf: &'a [u8],
+    ) -> Option<BlockReadFuture<'a>> {
+        Some(Box::pin(async move {
+            let mut link = self.link();
+            let r = loop {
+                let r = link.write_async(block_id, buf).await;
+                if r.is_ok() || !link.is_dead() {
+                    break r;
+                }
+                link = match self.next_driver(&link).await {
+                    Ok(next) => next,
+                    Err(e) => break Err(e),
+                };
+            };
+            self.stats.note_write(&r, buf.len());
+            r
+        }))
+    }
+
+    fn flush_async(&self) -> Option<BlockReadFuture<'_>> {
+        Some(Box::pin(async move {
+            let mut link = self.link();
+            loop {
+                let r = link.flush_async().await;
+                if r.is_ok() || !link.is_dead() {
+                    return r;
+                }
+                link = self.next_driver(&link).await?;
+            }
         }))
     }
 
@@ -988,6 +1079,8 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     /// A link with its driver's end of the FIFO, for a disk of `sectors`.
@@ -1091,6 +1184,93 @@ mod tests {
         });
         assert_eq!(r, Err(DeviceError::InvalidParam));
         assert_eq!(asked, 2);
+    }
+
+    /// A driver on a thread of its own: it keeps a disk in memory, takes
+    /// each message off its end of the FIFO, and answers it. Returns what
+    /// it was asked (the ops) and the disk, once its FIFO is closed.
+    fn driver(
+        window: Arc<VmObject>,
+        end: Arc<Fifo>,
+        sectors: usize,
+    ) -> std::thread::JoinHandle<(Vec<u32>, Vec<u8>)> {
+        std::thread::spawn(move || {
+            let mut disk = alloc::vec![0u8; sectors * SECTOR];
+            let mut asked = Vec::new();
+            loop {
+                let mut m = [0u8; BLOCK_MSG];
+                match end.read(BLOCK_MSG, &mut m, 1) {
+                    Ok(_) => {}
+                    Err(ZxError::SHOULD_WAIT) => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(_) => return (asked, disk),
+                }
+                let op = u32::from_ne_bytes(m[0..4].try_into().unwrap());
+                let n = u32::from_ne_bytes(m[8..12].try_into().unwrap()) as usize * SECTOR;
+                let off = u32::from_ne_bytes(m[12..16].try_into().unwrap()) as usize;
+                let at = u64::from_ne_bytes(m[16..24].try_into().unwrap()) as usize * SECTOR;
+                asked.push(op);
+                if op == OP_WRITE {
+                    window.read(off, &mut disk[at..at + n]).unwrap();
+                } else if op == OP_READ {
+                    window.write(off, &disk[at..at + n]).unwrap();
+                }
+                m[24..32].copy_from_slice(&0i64.to_ne_bytes());
+                if end.write(BLOCK_MSG, &m, 1).is_err() {
+                    return (asked, disk);
+                }
+            }
+        })
+    }
+
+    #[async_std::test]
+    async fn a_write_asleep_goes_through_the_window_in_slots() {
+        let (first, end) = link(64);
+        let (disk, _) = ServedDisk::new(first.clone());
+        let served = driver(first.window.clone(), end, 64);
+        // Two slots and a sector more, from sector 5.
+        let data: Vec<u8> = (0..2 * 4096 + SECTOR).map(|i| (i % 251) as u8).collect();
+        let write = disk.write_block_async(5, &data).expect("a served disk");
+        assert_eq!(write.await, Ok(()));
+        // It is read back as written, and a flush comes after as one message.
+        let mut back = alloc::vec![0u8; data.len()];
+        let read = disk.read_block_async(5, &mut back).expect("a served disk");
+        assert_eq!(read.await, Ok(()));
+        assert_eq!(back, data);
+        assert_eq!(disk.flush_async().expect("a served disk").await, Ok(()));
+        // Every slot is free again.
+        let all = ((1u64 << first.slots) - 1) as u32;
+        assert_eq!(first.free.load(Ordering::Acquire) & all, all);
+        drop(disk);
+        drop(first);
+        let (asked, on_disk) = served.join().unwrap();
+        assert_eq!(&on_disk[5 * SECTOR..5 * SECTOR + data.len()], &data[..]);
+        assert_eq!(asked.iter().filter(|&&op| op == OP_WRITE).count(), 3);
+        assert_eq!(asked.last(), Some(&OP_FLUSH));
+    }
+
+    #[async_std::test]
+    async fn a_write_asleep_past_the_end_is_refused_and_asks_nothing() {
+        let (first, end) = link(64);
+        let (disk, _) = ServedDisk::new(first.clone());
+        let write = disk.write_block_async(64, &[0u8; SECTOR]).unwrap();
+        assert_eq!(write.await, Err(DeviceError::InvalidParam));
+        let mut m = [0u8; BLOCK_MSG];
+        assert_eq!(end.read(BLOCK_MSG, &mut m, 1), Err(ZxError::SHOULD_WAIT));
+    }
+
+    #[async_std::test]
+    async fn a_write_and_a_flush_asleep_fail_when_no_driver_is_left() {
+        let (first, end) = link(64);
+        let (disk, turn) = ServedDisk::new(first.clone());
+        drop(end);
+        disk.undrive(&first);
+        disk.give_up(turn);
+        let write = disk.write_block_async(0, &[0u8; SECTOR]).unwrap();
+        assert_eq!(write.await, Err(DeviceError::IoError));
+        assert_eq!(disk.flush_async().unwrap().await, Err(DeviceError::IoError));
     }
 
     #[test]

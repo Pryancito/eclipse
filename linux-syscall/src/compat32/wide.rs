@@ -111,7 +111,7 @@ impl Syscall<'_> {
     }
 
     /// `pwrite64(2)`, i386 181: the offset in two registers, **low first**.
-    pub fn sys_pwrite64(
+    pub async fn sys_pwrite64(
         &self,
         fd: usize,
         base: usize,
@@ -125,6 +125,7 @@ impl Syscall<'_> {
             len,
             join(offset_low, offset_high),
         )
+        .await
     }
 
     /// `truncate64(2)`, i386 193: the length in two registers, **low first**.

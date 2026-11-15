@@ -65,7 +65,7 @@ impl IoStats {
     }
 }
 
-/// A read to wait for without holding the CPU: see
+/// A request to wait for without holding the CPU: see
 /// [`BlockScheme::read_block_async`].
 pub type BlockReadFuture<'a> =
     core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = DeviceResult> + Send + 'a>>;
@@ -120,6 +120,22 @@ pub trait BlockScheme: Scheme {
         _block_id: usize,
         _buf: &'a mut [u8],
     ) -> Option<BlockReadFuture<'a>> {
+        None
+    }
+    /// The write [`write_block`](Self::write_block) does, as a future: see
+    /// [`read_block_async`](Self::read_block_async). A process that writes
+    /// to such a disk while another waits on that process -- a filesystem
+    /// server, with its client's request open -- would otherwise hold the
+    /// CPU in a wait inside a wait.
+    fn write_block_async<'a>(
+        &'a self,
+        _block_id: usize,
+        _buf: &'a [u8],
+    ) -> Option<BlockReadFuture<'a>> {
+        None
+    }
+    /// [`flush`](Self::flush), as a future, for the same disks.
+    fn flush_async(&self) -> Option<BlockReadFuture<'_>> {
         None
     }
     /// What this disk has transferred, when its driver counts it ([`IoStats`]).

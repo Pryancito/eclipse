@@ -49,7 +49,12 @@ const S_OK: u8 = 0;
 pub const DMA_QUEUE: usize = 0;
 pub const DMA_REQ: usize = 2 * PAGE;
 pub const DMA_DATA: usize = 3 * PAGE;
-pub const DATA_MAX: usize = 64 * 1024;
+/// The window is what one turn of the FIFO can move: the kernel cuts it
+/// into as many slots as the FIFO holds messages, so a megabyte is sixteen
+/// requests of 64 KiB on the device at once. With the 64 KiB there was
+/// before, a megabyte was sixteen turns, each with its notify, its
+/// interrupt and two wakes.
+pub const DATA_MAX: usize = 1024 * 1024;
 pub const DMA_SIZE: usize = DMA_DATA + DATA_MAX;
 const REQ_SLOT: usize = 32;
 /// A request's header: type, a reserved word and the sector. Its status
@@ -489,7 +494,8 @@ mod tests {
         let io = check(&msg(OP_WRITE, 0, 1, 0), CAPACITY).unwrap();
         assert_eq!((io.kind, io.len), (T_OUT, 512));
         // The whole window, and the last sectors of the disk.
-        assert!(check(&msg(OP_READ, 0, 128, 0), CAPACITY).is_ok());
+        let window = (DATA_MAX / SECTOR) as u32;
+        assert!(check(&msg(OP_READ, 0, window, 0), CAPACITY).is_ok());
         assert!(check(&msg(OP_READ, CAPACITY - 8, 8, 0), CAPACITY).is_ok());
     }
 
@@ -498,12 +504,15 @@ mod tests {
         let out = Err(Status::OUT_OF_RANGE);
         assert_eq!(check(&msg(OP_READ, 0, 0, 0), CAPACITY), out);
         assert_eq!(
-            check(&msg(OP_READ, 0, 129, 0), CAPACITY),
+            check(
+                &msg(OP_READ, 0, (DATA_MAX / SECTOR) as u32 + 1, 0),
+                CAPACITY
+            ),
             out,
             "more than the window"
         );
         assert_eq!(
-            check(&msg(OP_READ, 0, 8, 61 * 1024), CAPACITY),
+            check(&msg(OP_READ, 0, 8, (DATA_MAX - 3 * 1024) as u32), CAPACITY),
             out,
             "off its end"
         );

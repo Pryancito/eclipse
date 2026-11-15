@@ -216,14 +216,14 @@ fn fsync_syncs_the_whole_file_and_fdatasync_only_its_data() {
             let lp = sys.linux_process();
             let (fd, tally) = a_counting_file(&lp, OpenFlags::RDWR);
 
-            assert_eq!(sys.sys_fsync(FileDesc::from(fd)), Ok(0));
+            assert_eq!(sys.sys_fsync(FileDesc::from(fd)).await, Ok(0));
             assert_eq!(
                 tally.counts(),
                 (1, 0, 0),
                 "fsync did not ask for the file's metadata as well as its data"
             );
 
-            assert_eq!(sys.sys_fdatasync(FileDesc::from(fd)), Ok(0));
+            assert_eq!(sys.sys_fdatasync(FileDesc::from(fd)).await, Ok(0));
             assert_eq!(
                 tally.counts(),
                 (1, 1, 0),
@@ -304,12 +304,12 @@ fn a_device_that_cannot_sync_says_so_through_every_one_of_the_three() {
             let fd = FileDesc::from(fd);
 
             assert_eq!(
-                sys.sys_fsync(fd),
+                sys.sys_fsync(fd).await,
                 Err(LxError::ENOSPC),
                 "fsync reported success on a device that could not sync"
             );
             assert_eq!(
-                sys.sys_fdatasync(fd),
+                sys.sys_fdatasync(fd).await,
                 Err(LxError::ENOSPC),
                 "fdatasync reported success on a device that could not sync"
             );

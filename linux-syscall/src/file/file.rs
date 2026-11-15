@@ -624,7 +624,7 @@ impl Syscall<'_> {
 
     /// writes up to count bytes from the buffer
     /// starting at buf to the file descriptor fd at offset offset. The file offset is not changed.
-    pub fn sys_pwrite(
+    pub async fn sys_pwrite(
         &self,
         fd: FileDesc,
         base: UserInPtr<u8>,
@@ -662,7 +662,14 @@ impl Syscall<'_> {
                 }
                 return Err(LxError::EPERM);
             }
-            match file_like.write_at(offset + written as u64, chunk) {
+            // A disk served by a process is written asleep: see
+            // `File::write_at_asleep`.
+            let at = offset + written as u64;
+            let asleep = match file_like.downcast_ref::<File>() {
+                Some(file) => file.write_at_asleep(at, chunk).await,
+                None => None,
+            };
+            match asleep.unwrap_or_else(|| file_like.write_at(at, chunk)) {
                 // A write of nothing would spin the loop for ever.
                 Ok(0) => break,
                 Ok(w) => {
@@ -1533,18 +1540,28 @@ impl Syscall<'_> {
 
     /// transfers ("flushes") all modified in-core data of (i.e., modified buffer cache pages for) the file
     /// referred to by the file descriptor fd to the disk device
-    pub fn sys_fsync(&self, fd: FileDesc) -> SysResult {
+    pub async fn sys_fsync(&self, fd: FileDesc) -> SysResult {
         info!("fsync: fd={:?}", fd);
         let proc = self.linux_process();
-        proc.get_file(fd)?.sync_all()?;
+        let file = proc.get_file(fd)?;
+        // The node of a disk served by a process: asleep until it has
+        // flushed, which takes as long as the disk under it does.
+        match file.sync_asleep().await {
+            Some(synced) => synced?,
+            None => file.sync_all()?,
+        }
         Ok(0)
     }
 
     /// is similar to fsync(), but does not flush modified metadata unless that metadata is needed
-    pub fn sys_fdatasync(&self, fd: FileDesc) -> SysResult {
+    pub async fn sys_fdatasync(&self, fd: FileDesc) -> SysResult {
         info!("fdatasync: fd={:?}", fd);
         let proc = self.linux_process();
-        proc.get_file(fd)?.sync_data()?;
+        let file = proc.get_file(fd)?;
+        match file.sync_asleep().await {
+            Some(synced) => synced?,
+            None => file.sync_data()?,
+        }
         Ok(0)
     }
 
