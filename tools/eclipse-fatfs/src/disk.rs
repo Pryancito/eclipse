@@ -13,6 +13,14 @@
 //! sectors. A chunk knows which of its sectors it holds: whole sectors
 //! written into a chunk that was never read (a new file's clusters) do not
 //! read the device first.
+//!
+//! The chunks are in one stretch of memory, [`Kept`], with nothing in it
+//! that points anywhere: the server gives it to the kernel with the mount,
+//! and when the server dies the next one is given it back and goes on from
+//! what was written and had not reached the device. So each change to it
+//! is made in an order that leaves it true whenever the process stops: a
+//! sector is marked as not on the device before its bytes change, and as
+//! held only once its bytes are there.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -112,23 +120,119 @@ impl Hasher for ByIndex {
     }
 }
 
-struct Chunk {
-    bytes: Box<[u8]>,
+/// What [`Kept`] starts with.
+#[repr(C)]
+struct Head {
+    /// [`MAGIC`] once the memory is laid out.
+    magic: u64,
+    /// The bytes of the device the chunks are of.
+    device_len: u64,
+    /// What whoever uses the disk keeps here ([`Disk::word`]).
+    word: u64,
+}
+
+/// "eclfatk1": the layout below.
+const MAGIC: u64 = 0x316b_7461_666c_6365;
+
+/// What is known of the chunk in each place of [`Kept`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Meta {
+    /// Which chunk of the device, or [`NO_CHUNK`].
+    index: u64,
+    /// When it was last used: the least recent goes first.
+    used: u64,
     /// The sectors whose bytes are here: the others are still only on the
     /// device.
     held: Sectors,
     /// The sectors written here that the device does not have yet.
     dirty: Sectors,
-    /// When it was last used: the least recent goes first.
-    used: u64,
+}
+
+const NO_CHUNK: u64 = u64::MAX;
+/// Where the [`Meta`]s start, and the chunks' bytes.
+const METAS_AT: usize = 4096;
+const BYTES_AT: usize = 8192;
+const _: () = assert!(METAS_AT + CHUNKS_KEPT * core::mem::size_of::<Meta>() <= BYTES_AT);
+
+/// The memory the chunks are kept in: a [`Head`], a [`Meta`] for each
+/// place and the places' bytes.
+pub struct Kept {
+    base: *mut u8,
+    /// The memory, when it is this process's own.
+    _own: Option<Vec<u128>>,
+}
+
+impl Kept {
+    /// The bytes of it.
+    pub const LEN: usize = BYTES_AT + CHUNKS_KEPT * CHUNK;
+
+    /// Memory of this process's own, which goes when it does.
+    pub fn private() -> Self {
+        let mut own = vec![0u128; Self::LEN / 16];
+        Kept {
+            base: own.as_mut_ptr().cast(),
+            _own: Some(own),
+        }
+    }
+
+    /// The memory at `base`: zeros, or what a [`Disk`] left there.
+    ///
+    /// # Safety
+    /// `base` is the start of [`Kept::LEN`] bytes, at a page's start, that
+    /// are readable and writable for as long as this is used, and nothing
+    /// else reads or writes them meanwhile.
+    pub unsafe fn at(base: *mut u8) -> Self {
+        Kept { base, _own: None }
+    }
+
+    fn head(&mut self) -> &mut Head {
+        // SAFETY: inside the memory, aligned (the base is), and borrowed
+        // as `self` is.
+        unsafe { &mut *self.base.cast::<Head>() }
+    }
+
+    fn meta(&self, place: usize) -> &Meta {
+        assert!(place < CHUNKS_KEPT);
+        // SAFETY: as `head`; the place is one of them.
+        unsafe { &*self.base.add(METAS_AT).cast::<Meta>().add(place) }
+    }
+
+    fn meta_mut(&mut self, place: usize) -> &mut Meta {
+        assert!(place < CHUNKS_KEPT);
+        // SAFETY: as `meta`.
+        unsafe { &mut *self.base.add(METAS_AT).cast::<Meta>().add(place) }
+    }
+
+    fn bytes(&self, place: usize) -> &[u8] {
+        assert!(place < CHUNKS_KEPT);
+        // SAFETY: the place's own stretch of the memory.
+        unsafe { core::slice::from_raw_parts(self.base.add(BYTES_AT + place * CHUNK), CHUNK) }
+    }
+
+    /// The place's metadata and its bytes, to change both.
+    fn place_mut(&mut self, place: usize) -> (&mut Meta, &mut [u8]) {
+        assert!(place < CHUNKS_KEPT);
+        // SAFETY: as `meta` and `bytes`, which do not overlap.
+        unsafe {
+            (
+                &mut *self.base.add(METAS_AT).cast::<Meta>().add(place),
+                core::slice::from_raw_parts_mut(self.base.add(BYTES_AT + place * CHUNK), CHUNK),
+            )
+        }
+    }
 }
 
 pub struct Disk<B> {
     blocks: B,
     len: u64,
     pos: u64,
-    chunks: HashMap<u64, Chunk, BuildHasherDefault<ByIndex>>,
+    kept: Kept,
+    /// The place each kept chunk is in: what `kept` says, to look up.
+    place_of: HashMap<u64, usize, BuildHasherDefault<ByIndex>>,
     clock: u64,
+    /// The memory was another `Disk`'s before.
+    adopted: bool,
     /// How many times the device was read, and written.
     pub device_reads: u64,
     pub device_writes: u64,
@@ -165,17 +269,78 @@ fn write_fully<B: Blocks>(blocks: &mut B, mut at: u64, mut buf: &[u8]) -> io::Re
 }
 
 impl<B: Blocks> Disk<B> {
-    /// `blocks`, which holds `len` bytes.
+    /// `blocks`, which holds `len` bytes, with chunks that go when this
+    /// does.
     pub fn new(blocks: B, len: u64) -> Self {
-        Disk {
+        Self::over(blocks, len, Kept::private()).expect("new memory is no other disk's")
+    }
+
+    /// `blocks`, which holds `len` bytes, with its chunks in `kept`: empty
+    /// when `kept` is new, and what the last `Disk` over it left when it is
+    /// not. `None` when what is there is not this device's.
+    pub fn over(blocks: B, len: u64, mut kept: Kept) -> Option<Self> {
+        let mut place_of = HashMap::default();
+        let mut clock = 0;
+        let adopted = kept.head().magic == MAGIC;
+        if adopted {
+            if kept.head().device_len != len {
+                return None;
+            }
+            for place in 0..CHUNKS_KEPT {
+                let meta = *kept.meta(place);
+                if meta.index == NO_CHUNK {
+                    continue;
+                }
+                // A chunk past the device, or one in two places, is not
+                // what a `Disk` leaves.
+                if meta.index >= len.div_ceil(CHUNK as u64)
+                    || place_of.insert(meta.index, place).is_some()
+                {
+                    return None;
+                }
+                clock = clock.max(meta.used);
+            }
+        } else {
+            for place in 0..CHUNKS_KEPT {
+                *kept.meta_mut(place) = Meta {
+                    index: NO_CHUNK,
+                    used: 0,
+                    held: 0,
+                    dirty: 0,
+                };
+            }
+            kept.head().device_len = len;
+            kept.head().word = 0;
+            // Last: until it is there the memory is new.
+            kept.head().magic = MAGIC;
+        }
+        Some(Disk {
             blocks,
             len,
             pos: 0,
-            chunks: HashMap::default(),
-            clock: 0,
+            kept,
+            place_of,
+            clock,
+            adopted,
             device_reads: 0,
             device_writes: 0,
-        }
+        })
+    }
+
+    /// Whether the chunks were in the memory already: another `Disk`'s,
+    /// that is gone.
+    pub fn adopted(&self) -> bool {
+        self.adopted
+    }
+
+    /// A word kept with the chunks, for whoever uses the disk: 0 in new
+    /// memory.
+    pub fn word(&mut self) -> u64 {
+        self.kept.head().word
+    }
+
+    pub fn set_word(&mut self, word: u64) {
+        self.kept.head().word = word;
     }
 
     /// The device, as it is: without what [`flush`](Self::flush) has not
@@ -186,7 +351,7 @@ impl<B: Blocks> Disk<B> {
 
     /// Whether something written has not reached the device.
     pub fn is_dirty(&self) -> bool {
-        self.chunks.values().any(|c| c.dirty != 0)
+        (0..CHUNKS_KEPT).any(|place| self.kept.meta(place).dirty != 0)
     }
 
     /// The bytes of the chunk `index`: the last one may be short.
@@ -194,75 +359,72 @@ impl<B: Blocks> Disk<B> {
         (self.len - index * CHUNK as u64).min(CHUNK as u64) as usize
     }
 
-    /// Write the sectors of the chunk `index` the device does not have, a
-    /// run of them at a time.
-    fn write_out(&mut self, index: u64) -> io::Result<()> {
-        let Some(chunk) = self.chunks.get_mut(&index) else {
+    /// Write the sectors of the chunk in `place` the device does not have,
+    /// a run of them at a time.
+    fn write_out(&mut self, place: usize) -> io::Result<()> {
+        let index = self.kept.meta(place).index;
+        if index == NO_CHUNK {
             return Ok(());
-        };
-        let mut left = chunk.dirty;
+        }
+        let len = self.chunk_len(index);
+        let mut left = self.kept.meta(place).dirty;
         while left != 0 {
             let from = left.trailing_zeros() as usize;
             let run = (left >> from).trailing_ones() as usize;
-            let (start, end) = (
-                from * SECTOR,
-                ((from + run) * SECTOR).min(chunk.bytes.len()),
-            );
+            let (start, end) = (from * SECTOR, ((from + run) * SECTOR).min(len));
             self.device_writes += 1;
             write_fully(
                 &mut self.blocks,
                 index * CHUNK as u64 + start as u64,
-                &chunk.bytes[start..end],
+                &self.kept.bytes(place)[start..end],
             )?;
             left &= !sectors(from, from + run);
-            chunk.dirty = left;
+            self.kept.meta_mut(place).dirty = left;
         }
         Ok(())
     }
 
     /// Everything written reaches the device, and the device its medium.
     pub fn flush(&mut self) -> io::Result<()> {
-        let mut dirty: Vec<u64> = self
-            .chunks
-            .iter()
-            .filter(|(_, c)| c.dirty != 0)
-            .map(|(i, _)| *i)
+        let mut dirty: Vec<(u64, usize)> = (0..CHUNKS_KEPT)
+            .map(|place| (self.kept.meta(place), place))
+            .filter(|(meta, _)| meta.index != NO_CHUNK && meta.dirty != 0)
+            .map(|(meta, place)| (meta.index, place))
             .collect();
         dirty.sort_unstable();
-        for index in dirty {
-            self.write_out(index)?;
+        for (_, place) in dirty {
+            self.write_out(place)?;
         }
         self.blocks.sync()
     }
 
-    /// The chunk `index` with the sectors `needed` of it held, from the
-    /// device those that are not.
-    fn chunk(&mut self, index: u64, needed: Sectors) -> io::Result<&mut Chunk> {
+    /// The place of the chunk `index` with the sectors `needed` of it held,
+    /// from the device those that are not.
+    fn chunk(&mut self, index: u64, needed: Sectors) -> io::Result<usize> {
         self.clock += 1;
-        if !self.chunks.contains_key(&index) {
-            if self.chunks.len() >= CHUNKS_KEPT {
-                let oldest = self
-                    .chunks
-                    .iter()
-                    .min_by_key(|(_, c)| c.used)
-                    .map(|(i, _)| *i);
-                if let Some(oldest) = oldest {
-                    self.write_out(oldest)?;
-                    self.chunks.remove(&oldest);
-                }
+        let place = match self.place_of.get(&index) {
+            Some(place) => *place,
+            None => {
+                // A place nothing is in, or the one used least lately.
+                let place = (0..CHUNKS_KEPT)
+                    .min_by_key(|place| match self.kept.meta(*place) {
+                        meta if meta.index == NO_CHUNK => 0,
+                        meta => meta.used + 1,
+                    })
+                    .expect("there are places");
+                self.write_out(place)?;
+                let meta = self.kept.meta_mut(place);
+                let was = meta.index;
+                // Nothing held first: the bytes there are the old chunk's.
+                meta.held = 0;
+                meta.dirty = 0;
+                meta.index = index;
+                self.place_of.remove(&was);
+                self.place_of.insert(index, place);
+                place
             }
-            let bytes = vec![0u8; self.chunk_len(index)].into_boxed_slice();
-            self.chunks.insert(
-                index,
-                Chunk {
-                    bytes,
-                    held: 0,
-                    dirty: 0,
-                    used: 0,
-                },
-            );
-        }
-        let missing = needed & !self.chunks[&index].held;
+        };
+        let missing = needed & !self.kept.meta(place).held;
         if missing != 0 {
             // One read of the chunk, of which the sectors not held are
             // taken: those held may be newer than the device.
@@ -270,18 +432,17 @@ impl<B: Blocks> Disk<B> {
             let mut read = vec![0u8; len];
             self.device_reads += 1;
             read_fully(&self.blocks, index * CHUNK as u64, &mut read)?;
-            let chunk = self.chunks.get_mut(&index).expect("just put there");
+            let (meta, bytes) = self.kept.place_mut(place);
             for sector in 0..len.div_ceil(SECTOR) {
-                if chunk.held & (1 << sector) == 0 {
+                if meta.held & (1 << sector) == 0 {
                     let (from, to) = (sector * SECTOR, ((sector + 1) * SECTOR).min(len));
-                    chunk.bytes[from..to].copy_from_slice(&read[from..to]);
+                    bytes[from..to].copy_from_slice(&read[from..to]);
                 }
             }
-            chunk.held = Sectors::MAX;
+            meta.held = Sectors::MAX;
         }
-        let chunk = self.chunks.get_mut(&index).expect("just put there");
-        chunk.used = self.clock;
-        Ok(chunk)
+        self.kept.meta_mut(place).used = self.clock;
+        Ok(place)
     }
 
     /// Read from the chunk the offset `at` is in, up to its end.
@@ -290,15 +451,15 @@ impl<B: Blocks> Disk<B> {
         let n = buf.len().min(self.chunk_len(index) - within);
         let needed = sectors(within / SECTOR, (within + n).div_ceil(SECTOR));
         // The usual read, of a chunk that is kept and holds it: one lookup.
-        self.clock += 1;
-        let chunk = match self.chunks.get_mut(&index) {
-            Some(chunk) if needed & !chunk.held == 0 => {
-                chunk.used = self.clock;
-                chunk
+        let place = match self.place_of.get(&index) {
+            Some(place) if needed & !self.kept.meta(*place).held == 0 => {
+                self.clock += 1;
+                self.kept.meta_mut(*place).used = self.clock;
+                *place
             }
             _ => self.chunk(index, needed)?,
         };
-        buf[..n].copy_from_slice(&chunk.bytes[within..within + n]);
+        buf[..n].copy_from_slice(&self.kept.bytes(place)[within..within + n]);
         Ok(n)
     }
 
@@ -317,10 +478,15 @@ impl<B: Blocks> Disk<B> {
             end / SECTOR
         };
         let whole = sectors(within.div_ceil(SECTOR), whole_to);
-        let chunk = self.chunk(index, touched & !whole)?;
-        chunk.bytes[within..end].copy_from_slice(&buf[..n]);
-        chunk.held |= touched;
-        chunk.dirty |= touched;
+        let place = self.chunk(index, touched & !whole)?;
+        let (meta, bytes) = self.kept.place_mut(place);
+        // In this order, for a process that stops in the middle: a sector
+        // that was held is not the device's from before its bytes change,
+        // and one that was not is held only once its bytes are whole.
+        meta.dirty |= touched & meta.held;
+        bytes[within..end].copy_from_slice(&buf[..n]);
+        meta.dirty |= touched;
+        meta.held |= touched;
         Ok(n)
     }
 }
@@ -340,17 +506,17 @@ fn direct(offset: u64, len: usize, min: usize) -> bool {
 
 impl<B: Blocks> Disk<B> {
     /// The parts of `[offset, offset + len)` that kept chunks hold, as
-    /// `(chunk, first sector, sectors, where in the range)`: the range is
+    /// `(place, first sector, sectors, where in the range)`: the range is
     /// whole sectors.
-    fn held_in(&self, offset: u64, len: usize) -> Vec<(u64, usize, usize, usize)> {
+    fn held_in(&self, offset: u64, len: usize) -> Vec<(usize, usize, usize, usize)> {
         let mut parts = Vec::new();
         let mut at = offset;
         let end = offset + len as u64;
         while at < end {
             let (index, within) = (at / CHUNK as u64, (at % CHUNK as u64) as usize);
             let n = ((end - at) as usize).min(CHUNK - within);
-            if self.chunks.contains_key(&index) {
-                parts.push((index, within / SECTOR, n / SECTOR, (at - offset) as usize));
+            if let Some(place) = self.place_of.get(&index) {
+                parts.push((*place, within / SECTOR, n / SECTOR, (at - offset) as usize));
             }
             at += n as u64;
         }
@@ -368,12 +534,12 @@ impl<B: Blocks> Disk<B> {
             read_fully(&self.blocks, offset, buf)?;
             // What a kept chunk holds of it is as new as the device or
             // newer.
-            for (index, first, count, at) in self.held_in(offset, buf.len()) {
-                let chunk = &self.chunks[&index];
-                for sector in (first..first + count).filter(|s| chunk.held & (1 << s) != 0) {
+            for (place, first, count, at) in self.held_in(offset, buf.len()) {
+                let (held, bytes) = (self.kept.meta(place).held, self.kept.bytes(place));
+                for sector in (first..first + count).filter(|s| held & (1 << s) != 0) {
                     let to = at + (sector - first) * SECTOR;
                     buf[to..to + SECTOR]
-                        .copy_from_slice(&chunk.bytes[sector * SECTOR..(sector + 1) * SECTOR]);
+                        .copy_from_slice(&bytes[sector * SECTOR..(sector + 1) * SECTOR]);
                 }
             }
             return Ok(());
@@ -396,12 +562,12 @@ impl<B: Blocks> Disk<B> {
             write_fully(&mut self.blocks, offset, buf)?;
             // The kept chunks have it too, and no older bytes to write
             // over it later.
-            for (index, first, count, at) in self.held_in(offset, buf.len()) {
-                let chunk = self.chunks.get_mut(&index).expect("it was there");
+            for (place, first, count, at) in self.held_in(offset, buf.len()) {
+                let (meta, bytes) = self.kept.place_mut(place);
                 let (from, n) = (first * SECTOR, count * SECTOR);
-                chunk.bytes[from..from + n].copy_from_slice(&buf[at..at + n]);
-                chunk.held |= sectors(first, first + count);
-                chunk.dirty &= !sectors(first, first + count);
+                bytes[from..from + n].copy_from_slice(&buf[at..at + n]);
+                meta.held |= sectors(first, first + count);
+                meta.dirty &= !sectors(first, first + count);
             }
             return Ok(());
         }
@@ -645,5 +811,59 @@ mod tests {
         let mut expect = dev.clone();
         expect[CHUNK + 600..].fill(4);
         assert_eq!(disk.blocks()[..], expect[..]);
+    }
+
+    /// Memory for [`Kept::at`], as a mapping the kernel holds would be.
+    fn memory() -> Vec<u128> {
+        vec![0u128; Kept::LEN / 16]
+    }
+
+    #[test]
+    fn what_was_written_and_not_flushed_is_the_next_disks_over_the_same_memory() {
+        let dev = device(4 * CHUNK);
+        let mut memory = memory();
+        let base = memory.as_mut_ptr().cast::<u8>();
+        // SAFETY: the test's own memory, one `Disk` over it at a time.
+        let mut disk = Disk::over(dev.clone(), dev.len() as u64, unsafe { Kept::at(base) })
+            .expect("new memory");
+        disk.write_all_at(1000, &[7; 3000]).unwrap();
+        disk.write_all_at(2 * CHUNK as u64 + 512, &[8; 512])
+            .unwrap();
+        // The process dies: the device has nothing of it.
+        let left = disk.blocks().clone();
+        core::mem::forget(disk);
+        assert_eq!(left, dev);
+
+        // SAFETY: as above; the first is gone.
+        let mut next =
+            Disk::over(left, dev.len() as u64, unsafe { Kept::at(base) }).expect("the same device");
+        assert!(next.is_dirty());
+        let mut expect = dev.clone();
+        expect[1000..4000].fill(7);
+        expect[2 * CHUNK + 512..2 * CHUNK + 1024].fill(8);
+        assert_eq!(read_all(&mut next, 0, 4 * CHUNK), expect);
+        next.flush().unwrap();
+        assert!(!next.is_dirty());
+        assert_eq!(next.blocks()[..], expect[..]);
+    }
+
+    #[test]
+    fn memory_kept_for_another_device_is_not_taken() {
+        let dev = device(4 * CHUNK);
+        let mut memory = memory();
+        let base = memory.as_mut_ptr().cast::<u8>();
+        // SAFETY: the test's own memory, one `Disk` over it at a time.
+        drop(Disk::over(dev.clone(), dev.len() as u64, unsafe { Kept::at(base) }).unwrap());
+        // SAFETY: as above.
+        assert!(Disk::over(dev[..CHUNK].to_vec(), CHUNK as u64, unsafe {
+            Kept::at(base)
+        })
+        .is_none());
+        // What is not a `Disk`'s: a chunk in two places.
+        // SAFETY: as above.
+        let mut kept = unsafe { Kept::at(base) };
+        kept.meta_mut(0).index = 1;
+        kept.meta_mut(1).index = 1;
+        assert!(Disk::over(dev.clone(), dev.len() as u64, kept).is_none());
     }
 }

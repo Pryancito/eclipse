@@ -22,6 +22,11 @@
 //! [`Node`], which a rename moves and gives its new path: a file that is
 //! open stays the same file.
 //!
+//! When the server dies the mount stays, and waits for the next one
+//! ([`ServedFs`]): the requests carry paths, what was written is in memory
+//! the mount keeps for its servers, and a request that was out with the
+//! dead server is made again with the next.
+//!
 //! What this trusts: the server is a process root started for the purpose.
 //! It can answer wrongly -- the names, sizes and bytes are whatever it says
 //! -- or not at all (a request gives up, as an I/O error). It cannot name
@@ -39,6 +44,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use kernel_hal::thread::SyncWait;
 
 use lock::Mutex;
 use rcore_fs::vfs::{
@@ -47,7 +53,11 @@ use rcore_fs::vfs::{
 use zircon_object::ipc::Fifo;
 use zircon_object::vm::VmObject;
 
-use self::link::Link;
+use self::link::{Answer, Fail, Link};
+
+/// What the kernel's end of a server's FIFO raises when the mount lets go
+/// of the server: whoever holds that end to watch the server lets go too.
+pub use self::link::LEFT as SERVER_LEFT;
 use self::wire::{
     Entry, DATA_AREA, LIST_END, MODE_DIR, OP_CREATE, OP_LIST, OP_READ, OP_REMOVE, OP_RENAME,
     OP_SETTIME, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE, STATFS_LEN,
@@ -61,6 +71,16 @@ pub const SERVE_FOLD_CASE: usize = 1;
 /// `eclipse_fs_serve` flag: the mount is read-only.
 pub const SERVE_READ_ONLY: usize = 2;
 
+/// `eclipse_fs_serve` flag: only take over a mount whose server is gone,
+/// and make none.
+pub const SERVE_TAKE_OVER: usize = 4;
+
+/// How long a mount whose server died waits for the next one before its
+/// requests fail. The same as a served disk's wait for its next driver,
+/// for the same reason: longer than the longest pause `eclipse-init` puts
+/// between two starts of a service that keeps dying (8 s).
+const SERVER_GRACE_MS: u64 = 10_000;
+
 /// The most entries of one directory the kernel takes: a server that never
 /// says its listing is over does not fill the heap.
 const MAX_ENTRIES: usize = 1 << 20;
@@ -68,8 +88,9 @@ const MAX_ENTRIES: usize = 1 << 20;
 /// `st_dev` of each served mount, apart from the other filesystems'.
 static DEV_COUNTER: AtomicU64 = AtomicU64::new(0x5E70_0000);
 
-/// The served mounts, by where they are mounted: what an unmount closes.
-static MOUNTS: Mutex<Vec<(String, Arc<Link>)>> = Mutex::new(Vec::new());
+/// The served mounts, by where they are mounted: what an unmount closes,
+/// and what the next server of one finds.
+static MOUNTS: Mutex<Vec<(String, Arc<ServedFs>)>> = Mutex::new(Vec::new());
 
 /// A path's directory and its name in it.
 fn split_path(path: &str) -> (&str, &str) {
@@ -198,8 +219,33 @@ struct Dirs {
     changes: u64,
 }
 
-pub struct ServedFs {
+/// Who serves a mount: a link at a time, one per server.
+struct Server {
     link: Arc<Link>,
+    /// How many servers the mount has had.
+    turns: usize,
+}
+
+/// A filesystem behind a FIFO.
+///
+/// When its server dies the mount stays, with what is open on it. A
+/// request that was out with the dead server, and any that comes while
+/// there is none, waits for the next server and is made again with it;
+/// what the kernel keeps of the filesystem (listings, sizes, pages) is
+/// still true, because the server keeps what it was told in memory the
+/// mount holds for it ([`ServedFs::kept`]) and the next server starts from
+/// there. Only when no server comes within [`SERVER_GRACE_MS`] do requests
+/// fail -- and a server that comes later still finds the mount.
+pub struct ServedFs {
+    server: Mutex<Server>,
+    /// How long a request waits for the next server, from the death of
+    /// the last.
+    grace_ms: AtomicU64,
+    /// Memory the server gave with the mount: the next server is given it.
+    kept: Mutex<Option<Arc<VmObject>>>,
+    /// The source and the type of the mount's line in the mount table, and
+    /// the flags it was made with: what the next server must say again.
+    shown: Mutex<(String, String, usize)>,
     this: Weak<Self>,
     dev_id: u64,
     fold_case: bool,
@@ -233,7 +279,10 @@ impl Drop for ChangingDirs<'_> {
 impl ServedFs {
     fn new(link: Arc<Link>, fold_case: bool, read_only: bool) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
-            link,
+            server: Mutex::new(Server { link, turns: 1 }),
+            grace_ms: AtomicU64::new(SERVER_GRACE_MS),
+            kept: Mutex::new(None),
+            shown: Mutex::new((String::new(), String::new(), 0)),
             this: this.clone(),
             dev_id: DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
             fold_case,
@@ -285,6 +334,73 @@ impl ServedFs {
             gone: AtomicBool::new(false),
             changes: Mutex::new((0, 0)),
         })
+    }
+
+    /// The link of the server of the moment.
+    fn link(&self) -> Arc<Link> {
+        self.server.lock().link.clone()
+    }
+
+    /// The next server's link takes over: its turn. `None` while the mount
+    /// has a server.
+    fn take_over(&self, link: Arc<Link>) -> Option<usize> {
+        let mut server = self.server.lock();
+        // Its end of the FIFO may have closed a moment ago, with nothing
+        // on this side having looked yet.
+        if !server.link.looked_dead() {
+            return None;
+        }
+        server.link = link;
+        server.turns += 1;
+        Some(server.turns)
+    }
+
+    /// The server of turn `turn` is gone: its requests fail from now, and
+    /// the wait for the next server starts.
+    pub fn server_left(&self, turn: usize) {
+        let server = self.server.lock();
+        if server.turns == turn {
+            server.link.close();
+        }
+    }
+
+    /// Whether the mount has no server and waits for none: the last one
+    /// died longer ago than a request waits for the next.
+    fn deserted(&self, link: &Link) -> bool {
+        link.is_dead() && link::now_ms() > link.died_at() + self.grace_ms.load(Ordering::Relaxed)
+    }
+
+    /// Ask the server `op` with `names` in the slot (a path, or two with a
+    /// NUL between), `a`, `b` and `data`. When the server dies under the
+    /// request it is made again with the next one, and the answer says so:
+    /// the dead server may have done what was asked before it died.
+    fn ask(&self, op: u32, names: &[u8], a: u64, b: u32, data: &[u8]) -> (Result<Answer>, bool) {
+        let mut link = self.link();
+        let mut again = false;
+        loop {
+            match link.call_with(op, names, a, b, data) {
+                Ok(answer) => return (Ok(answer), again),
+                Err(Fail::Said(e)) => return (Err(e), again),
+                Err(Fail::Gone) => {}
+            }
+            let mut away = SyncWait::new();
+            link = loop {
+                let now = self.link();
+                if !Arc::ptr_eq(&now, &link) {
+                    break now;
+                }
+                if !self.mounted.load(Ordering::Acquire) || self.deserted(&link) {
+                    return (Err(FsError::DeviceError), again);
+                }
+                link::between_looks(&mut away);
+            };
+            again = true;
+        }
+    }
+
+    /// [`ask`](Self::ask) about one path, for what may be asked twice.
+    fn call(&self, op: u32, path: &str, a: u64, b: u32) -> Result<Answer> {
+        self.ask(op, path.as_bytes(), a, b, &[]).0
     }
 
     fn writable(&self) -> Result<()> {
@@ -346,7 +462,7 @@ impl ServedFs {
         let mut data = Vec::new();
         let mut next = 0u64;
         while next != LIST_END {
-            let answer = self.link.call(OP_LIST, path, next, 0)?;
+            let answer = self.call(OP_LIST, path, next, 0)?;
             data.resize(answer.len, 0);
             answer.data(0, &mut data)?;
             // An answer that goes nowhere would be asked for again for ever.
@@ -360,8 +476,17 @@ impl ServedFs {
         Ok(entries)
     }
 
+    /// The entry called `name` in the directory `dir`, as the server has
+    /// it now.
+    fn entry_named(&self, dir: &str, name: &str) -> Result<Entry> {
+        self.ask_listing(dir)?
+            .into_iter()
+            .find(|entry| self.same_name(&entry.name, name))
+            .ok_or(FsError::EntryNotFound)
+    }
+
     /// The one entry a reply describes: what was made, or renamed.
-    fn entry_of(answer: link::Answer<'_>) -> Result<Entry> {
+    fn entry_of(answer: Answer) -> Result<Entry> {
         let mut data = alloc::vec![0u8; answer.len];
         answer.data(0, &mut data)?;
         drop(answer);
@@ -396,7 +521,7 @@ impl ServedFs {
             return None;
         }
         self.info_stale.store(false, Ordering::Release);
-        let Ok(answer) = self.link.call(OP_STATFS, "", 0, 0) else {
+        let Ok(answer) = self.call(OP_STATFS, "", 0, 0) else {
             return known;
         };
         let mut raw = [0u8; STATFS_LEN];
@@ -450,12 +575,13 @@ fn put_slot(listing: &mut Listing, slot: Slot) {
 
 impl FileSystem for ServedFs {
     /// What was written is the server's already: this has it reach the
-    /// device. A server that is gone has nothing of the kernel's to write.
+    /// device. A mount with no server, and none on its way, has nothing of
+    /// the kernel's to write.
     fn sync(&self) -> Result<()> {
-        if self.read_only || self.link.is_dead() || !self.mounted.load(Ordering::Acquire) {
+        if self.read_only || !self.mounted.load(Ordering::Acquire) || self.deserted(&self.link()) {
             return Ok(());
         }
-        self.link.call(OP_SYNC, "", 0, 0).map(|_| ())
+        self.call(OP_SYNC, "", 0, 0).map(|_| ())
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
@@ -577,7 +703,6 @@ impl INode for ServedINode {
             let ask = (want - done).min(DATA_AREA);
             let answer = self
                 .fs
-                .link
                 .call(OP_READ, &path, (offset + done) as u64, ask as u32)?;
             let n = answer.count.min(answer.len).min(ask);
             if n == 0 {
@@ -605,16 +730,18 @@ impl INode for ServedINode {
         let mut failed = None;
         while done < buf.len() {
             let piece = &buf[done..(done + DATA_AREA).min(buf.len())];
+            // Written twice, when the server died under it, it is the same
+            // bytes in the same place.
             let wrote = self
                 .fs
-                .link
-                .call_with(
+                .ask(
                     OP_WRITE,
                     path.as_bytes(),
                     (offset + done) as u64,
                     piece.len() as u32,
                     piece,
                 )
+                .0
                 .map(|answer| answer.count.min(piece.len()));
             match wrote {
                 Ok(n) => {
@@ -668,7 +795,6 @@ impl INode for ServedINode {
         if before != metadata.mtime.sec && !node.is_dir && !node.is_gone() {
             let path = node.path();
             self.fs
-                .link
                 .call(OP_SETTIME, &path, metadata.mtime.sec as u64, 0)?;
         }
         Ok(())
@@ -685,7 +811,7 @@ impl INode for ServedINode {
             return Ok(());
         }
         let _changing = Changing::new(&self.node);
-        self.fs.link.call(OP_TRUNCATE, &path, len as u64, 0)?;
+        self.fs.call(OP_TRUNCATE, &path, len as u64, 0)?;
         self.node.size.store(len as u64, Ordering::Relaxed);
         self.node.mtime.store(now(), Ordering::Relaxed);
         self.fs.info_stale.store(true, Ordering::Release);
@@ -705,11 +831,13 @@ impl INode for ServedINode {
             return Err(FsError::EntryExist);
         }
         let _changing = self.fs.changing_dirs();
-        let answer = self
-            .fs
-            .link
-            .call(OP_CREATE, &join_path(&dir, name), mode as u64, 0)?;
-        let entry = ServedFs::entry_of(answer)?;
+        let path = join_path(&dir, name);
+        let entry = match self.fs.ask(OP_CREATE, path.as_bytes(), mode as u64, 0, &[]) {
+            // It was not there before this asked, and the server that was
+            // asked first died: that one made it.
+            (Err(FsError::EntryExist), true) => self.fs.entry_named(&dir, name)?,
+            (answer, _) => ServedFs::entry_of(answer?)?,
+        };
         if entry.is_dir != (type_ == FileType::Dir) {
             return Err(FsError::DeviceError);
         }
@@ -744,7 +872,11 @@ impl INode for ServedINode {
         drop(listing);
         let path = node.path();
         let _changing = self.fs.changing_dirs();
-        self.fs.link.call(OP_REMOVE, &path, 0, 0)?;
+        match self.fs.ask(OP_REMOVE, path.as_bytes(), 0, 0, &[]) {
+            // The server that was asked first removed it, and died.
+            (Err(FsError::EntryNotFound), true) => {}
+            (answer, _) => drop(answer?),
+        }
         node.gone.store(true, Ordering::Release);
         {
             let mut dirs = self.fs.dirs.lock();
@@ -805,11 +937,11 @@ impl INode for ServedINode {
         }
         let names = alloc::format!("{old_path}\0{new_path}");
         let _changing = self.fs.changing_dirs();
-        let answer = self
-            .fs
-            .link
-            .call_with(OP_RENAME, names.as_bytes(), 0, 0, &[])?;
-        let entry = ServedFs::entry_of(answer)?;
+        let entry = match self.fs.ask(OP_RENAME, names.as_bytes(), 0, 0, &[]) {
+            // The server that was asked first renamed it, and died.
+            (Err(FsError::EntryNotFound), true) => self.fs.entry_named(&to_dir, new_name)?,
+            (answer, _) => ServedFs::entry_of(answer?)?,
+        };
         let new_path = join_path(&to_dir, &entry.name);
 
         let mut replaced = None;
@@ -1010,23 +1142,43 @@ pub(super) fn if_unchanged(inode: &dyn INode, token: u64, keep: impl FnOnce()) -
     unchanged
 }
 
+/// What [`serve`] made of a server: the mount it serves and its turn at
+/// it, for [`ServedFs::server_left`] when its end of the FIFO closes.
+pub struct Served {
+    pub fs: Arc<ServedFs>,
+    pub turn: usize,
+    /// A mount taken over: the memory its first server gave for the
+    /// servers after it, when it gave any.
+    pub kept: Option<Arc<VmObject>>,
+    pub taken_over: bool,
+}
+
 /// `eclipse_fs_serve`: mount at `target` the filesystem a process serves on
 /// `fifo`, through `window`. `source` and `fstype` are what the mount table
 /// shows for it. The caller needs what `mount(2)` needs.
+///
+/// When `target` already is a served mount with that source and type whose
+/// server is gone, the process takes that mount over instead, as it is:
+/// the flags must be the ones it was made with. `kept` is memory the mount
+/// holds for its servers; the one taking over is given the first one's
+/// back. `EBUSY` while the mount has a server; with [`SERVE_TAKE_OVER`],
+/// `ENOENT` when there is no such mount to take.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     proc: &LinuxProcess,
     fifo: Arc<Fifo>,
     window: Arc<VmObject>,
+    kept: Option<Arc<VmObject>>,
     target: &str,
     source: &str,
     fstype: &str,
     flags: usize,
-) -> LxResult<()> {
+) -> LxResult<Served> {
     if !proc.capable(crate::process::CAP_SYS_ADMIN) {
         return Err(LxError::EPERM);
     }
     let shown = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
-    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY) != 0
+    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY | SERVE_TAKE_OVER) != 0
         || !target.starts_with('/')
         || !shown(source)
         || !shown(fstype)
@@ -1034,18 +1186,52 @@ pub fn serve(
         return Err(LxError::EINVAL);
     }
     let link = Arc::new(Link::new(fifo, window).map_err(|_| LxError::EINVAL)?);
+    let made_with = flags & !SERVE_TAKE_OVER;
+    let at = super::mount_ops::normalize_target(target);
+    let known = MOUNTS
+        .lock()
+        .iter()
+        .find(|(place, fs)| {
+            let shown = fs.shown.lock();
+            *place == at && shown.0 == source && shown.1 == fstype
+        })
+        .map(|(_, fs)| fs.clone());
+    if let Some(fs) = known {
+        if fs.shown.lock().2 != made_with {
+            return Err(LxError::EINVAL);
+        }
+        let turn = fs.take_over(link).ok_or(LxError::EBUSY)?;
+        info!("served fs: {at} has a server again");
+        let kept = fs.kept.lock().clone();
+        return Ok(Served {
+            fs,
+            turn,
+            kept,
+            taken_over: true,
+        });
+    }
+    if flags & SERVE_TAKE_OVER != 0 {
+        return Err(LxError::ENOENT);
+    }
     let read_only = flags & SERVE_READ_ONLY != 0;
-    let fs = ServedFs::new(link.clone(), flags & SERVE_FOLD_CASE != 0, read_only);
+    let fs = ServedFs::new(link, flags & SERVE_FOLD_CASE != 0, read_only);
+    *fs.kept.lock() = kept;
+    *fs.shown.lock() = (String::from(source), String::from(fstype), made_with);
     let target = super::mount_ops::mount_served(target, source, fstype, fs.clone(), read_only)?;
     fs.mounted.store(true, Ordering::Release);
-    MOUNTS.lock().push((target, link));
-    Ok(())
+    MOUNTS.lock().push((target, fs.clone()));
+    Ok(Served {
+        fs,
+        turn: 1,
+        kept: None,
+        taken_over: false,
+    })
 }
 
 /// `target` was unmounted, with whatever was mounted under it: the servers
 /// of the served mounts among them are told, by their FIFO closing.
 pub(super) fn unmounted(target: &str) {
-    let gone: Vec<Arc<Link>> = {
+    let gone: Vec<Arc<ServedFs>> = {
         let mut mounts = MOUNTS.lock();
         let under = |at: &str| {
             at == target
@@ -1058,9 +1244,19 @@ pub(super) fn unmounted(target: &str) {
             .into_iter()
             .partition(|(at, _)| under(at));
         *mounts = kept;
-        gone.into_iter().map(|(_, link)| link).collect()
+        gone.into_iter().map(|(_, fs)| fs).collect()
     };
-    for link in gone {
-        link.close();
+    for fs in gone {
+        if !fs.read_only && fs.link().looked_dead() && fs.kept.lock().is_some() {
+            warn!(
+                "served fs: {} is unmounted with no server: what its last one had not \
+                 written to the device is lost",
+                fs.shown.lock().0
+            );
+        }
+        // Nothing waits for a next server from here on.
+        fs.mounted.store(false, Ordering::Release);
+        fs.link().close();
+        fs.kept.lock().take();
     }
 }
