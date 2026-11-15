@@ -27,10 +27,9 @@ path = "src/bin/eclipse-fs-bench.rs"
 libc = "0.2"
 # The system calls and the FIFO.
 udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
-# The same FAT code the kernel links for its own FAT, at the commit the
-# tree's Cargo.lock has it at: what runs here and what runs there differ in
-# where, not in what.
-fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "2aefc2a027ce94ed0671752814dac203f0450e11", default-features = false, features = ["std", "alloc", "lfn", "log_level_warn"] }
+# The same FAT code the kernel links for its own FAT (`vendor/fatfs`): what
+# runs here and what runs there differ in where, not in what.
+fatfs = { path = "../../vendor/fatfs", default-features = false, features = ["std", "alloc", "lfn", "log_level_warn"] }
 
 [profile.release]
 opt-level = 2

@@ -73,6 +73,10 @@ exclude = [
     # AES for EclipseFS encryption: crates.io aes 0.8.4 with AES-NI limited
     # to targets with SSE (see its Cargo.toml).
     "vendor/aes",
+    # The FAT code of the kernel's FAT and of the FAT server
+    # (tools/eclipse-fatfs): rust-fatfs with a directory entry read and
+    # written in one piece (see its Cargo.toml).
+    "vendor/fatfs",
 ]
 
 [patch."https://github.com/DeathWish5/PreemptiveScheduler"]
@@ -107,6 +111,13 @@ trapframe = { path = "vendor/trapframe" }
 # grows by taking chunks of RAM, and without a way to take a free block back
 # out of the buddy that memory never went back to the frame allocator.
 buddy_system_allocator = { path = "vendor/buddy_system_allocator" }
+
+# rust-fatfs at 2aefc2a (the commit Cargo.lock had it at) with one change: a
+# directory entry is read, and written, in one piece and not a field at a
+# time. Looking a name up in a directory went through every entry before it
+# at a dozen reads of the device each.
+[patch."https://github.com/rafalh/rust-fatfs"]
+fatfs = { path = "vendor/fatfs" }
 
 [patch."https://github.com/smoltcp-rs/smoltcp"]
 smoltcp = { path = "./smoltcp" }
