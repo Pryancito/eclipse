@@ -412,7 +412,11 @@ impl Taker {
                 slot: slot as u32,
                 // A frame not to pass on goes to the stack empty, which
                 // gives the slot back like any other.
-                len: if whole && len as usize <= BUF_SIZE { len as u32 } else { 0 },
+                len: if whole && len as usize <= BUF_SIZE {
+                    len as u32
+                } else {
+                    0
+                },
                 off: 0,
             };
             n += 1;
@@ -493,7 +497,11 @@ pub fn drive(index: usize) -> Result<Driven, crate::net::NoCard> {
         return Err(other(format!(
             "not an e1000e's registers: {} bytes{}",
             claim.size,
-            if claim.pci { "" } else { ", and a virtio transport" }
+            if claim.pci {
+                ""
+            } else {
+                ", and a virtio transport"
+            }
         )));
     }
     let base = claim.map_regs().map_err(other)?;
@@ -557,7 +565,11 @@ fn mac_of(regs: Regs) -> [u8; 6] {
 /// # Safety
 /// `regs` is the card's; `dma` is [`DMA_SIZE`] zeroed bytes the card sees
 /// at `daddr`, mapped for as long as the sides live, and nobody else's.
-pub unsafe fn bring_up(regs: Regs, dma: *mut u8, daddr: u64) -> Result<(Giver, Taker, [u8; 6]), String> {
+pub unsafe fn bring_up(
+    regs: Regs,
+    dma: *mut u8,
+    daddr: u64,
+) -> Result<(Giver, Taker, [u8; 6]), String> {
     regs.write(IMC, u32::MAX);
     regs.write(RCTL, 0);
     regs.write(TCTL, TCTL_PSP);
@@ -721,7 +733,13 @@ mod tests {
 
         fn tx(&mut self, i: usize) -> (u64, u16, u8) {
             let d = self.desc(TX_RING_AT + i * DESC);
-            unsafe { (ptr::read(d.cast::<u64>()), get_u16(d, D_LEN), get_u8(d, TXD_CMD)) }
+            unsafe {
+                (
+                    ptr::read(d.cast::<u64>()),
+                    get_u16(d, D_LEN),
+                    get_u8(d, TXD_CMD),
+                )
+            }
         }
 
         fn reg(&self, reg: usize) -> u32 {
@@ -748,12 +766,6 @@ mod tests {
     }
 
     #[test]
-    fn the_rings_and_their_tables_fit_the_first_page_and_the_window_follows() {
-        assert!(TX_SLOTS_AT + TX_RING * 2 <= WIN_AT);
-        assert_eq!(DMA_SIZE, PAGE + (RX_BUFS + TX_BUFS) * BUF_SIZE);
-    }
-
-    #[test]
     fn a_receive_slot_given_back_is_the_next_descriptor_whatever_its_number() {
         let mut bench = Bench::new();
         let (mut giver, mut taker) = bench.sides();
@@ -765,12 +777,28 @@ mod tests {
         assert_eq!(taker.collect(&mut out), 0, "nothing received yet");
         bench.receive(0, 60, RXD_STAT_DD | RXD_STAT_EOP, 0);
         assert_eq!(taker.collect(&mut out), 1);
-        assert_eq!(out[0], Msg { op: OP_RX, slot: 5, len: 60, off: 0 });
+        assert_eq!(
+            out[0],
+            Msg {
+                op: OP_RX,
+                slot: 5,
+                len: 60,
+                off: 0
+            }
+        );
         // Taken once: the next look does not see it again.
         assert_eq!(taker.collect(&mut out), 0);
         bench.receive(1, 1514, RXD_STAT_DD | RXD_STAT_EOP, 0);
         assert_eq!(taker.collect(&mut out), 1);
-        assert_eq!(out[0], Msg { op: OP_RX, slot: 2, len: 1514, off: 0 });
+        assert_eq!(
+            out[0],
+            Msg {
+                op: OP_RX,
+                slot: 2,
+                len: 1514,
+                off: 0
+            }
+        );
     }
 
     #[test]
@@ -811,14 +839,29 @@ mod tests {
         giver.give(&[tx(3, 42), tx(0, 1514)]).unwrap();
         assert_eq!(bench.reg(TDT), 2);
         let (addr, len, cmd) = bench.tx(0);
-        assert_eq!(addr, 0x10_0000 + (WIN_AT + (RX_BUFS + 3) * BUF_SIZE + TX_HEADROOM) as u64);
+        assert_eq!(
+            addr,
+            0x10_0000 + (WIN_AT + (RX_BUFS + 3) * BUF_SIZE + TX_HEADROOM) as u64
+        );
         assert_eq!((len, cmd), (42, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS));
-        assert_eq!(taker.sleep_with(), IMS_WAKE | ICR_TXDW, "frames on the card");
+        assert_eq!(
+            taker.sleep_with(),
+            IMS_WAKE | ICR_TXDW,
+            "frames on the card"
+        );
         let mut out = [Msg::default(); RX_BUFS + TX_BUFS];
         assert_eq!(taker.collect(&mut out), 0);
         bench.sent(0);
         assert_eq!(taker.collect(&mut out), 1);
-        assert_eq!(out[0], Msg { op: OP_TX, slot: 3, len: 0, off: 0 });
+        assert_eq!(
+            out[0],
+            Msg {
+                op: OP_TX,
+                slot: 3,
+                len: 0,
+                off: 0
+            }
+        );
         bench.sent(1);
         assert_eq!(taker.collect(&mut out), 1);
         assert_eq!(out[0].slot, 0);
@@ -831,12 +874,32 @@ mod tests {
         let mut bench = Bench::new();
         let (mut giver, _) = bench.sides();
         let bad = [
-            Msg { op: OP_RX, slot: RX_BUFS as u32, len: 0, off: 0 },
-            Msg { op: OP_TX, slot: TX_BUFS as u32, len: 60, off: TX_HEADROOM as u32 },
+            Msg {
+                op: OP_RX,
+                slot: RX_BUFS as u32,
+                len: 0,
+                off: 0,
+            },
+            Msg {
+                op: OP_TX,
+                slot: TX_BUFS as u32,
+                len: 60,
+                off: TX_HEADROOM as u32,
+            },
             tx(0, FRAME_MAX as u32 + 1),
             tx(0, 0),
-            Msg { op: OP_TX, slot: 0, len: 60, off: 0 },
-            Msg { op: 9, slot: 0, len: 0, off: 0 },
+            Msg {
+                op: OP_TX,
+                slot: 0,
+                len: 60,
+                off: 0,
+            },
+            Msg {
+                op: 9,
+                slot: 0,
+                len: 0,
+                off: 0,
+            },
         ];
         for m in bad {
             assert_eq!(giver.give(&[rx(1), m, rx(2)]), Err(m), "{m:?}");

@@ -10,8 +10,8 @@
 //! started the driver simply start it again.
 
 use super::{
-    CLAIM_WORDS, ECLIPSE_DEVICE_E1000E, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
-    ECLIPSE_TRANSPORT_PCI, ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
+    CLAIM_WORDS, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
+    ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::time::Duration;
@@ -23,6 +23,17 @@ use zircon_object::object::{Handle, HandleValue, KernelObject, KoID, Rights, Sig
 use zircon_object::task::Process;
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
+
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an Intel
+/// 82574 network card (QEMU's `e1000e`), left to userspace by
+/// `udriver=e1000e@N`.
+pub const ECLIPSE_DEVICE_E1000E: usize = 3;
+
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
+/// function that is not virtio. The window is its first memory BAR, with
+/// the registers as its datasheet lays them out; words 4 to 6 of the claim
+/// are zero, and its line is an MSI on x86_64 and a level elsewhere.
+pub const ECLIPSE_TRANSPORT_PCI: u64 = 3;
 
 /// The controllers a reserved device's interrupt can be on, by the name
 /// each one gives itself: the PLIC before anything else on riscv64, where

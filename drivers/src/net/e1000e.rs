@@ -4347,16 +4347,7 @@ pub fn init(
 
 pub struct E1000eDriverPci;
 
-/// The register BAR of an 82574 (datasheet §9.1.1.4: 128 KiB of memory).
-const E1000E_BAR0_LEN: usize = 128 * 1024;
-
-/// Whether `tools/eclipse-udrivers`' e1000e driver can drive this part:
-/// the 82574L and 82574LA, which is what QEMU's `e1000e` is. The PCH parts
-/// (I217 to I219) need the PHY and flash work only this driver does.
-fn user_driver_takes(device_id: u16) -> bool {
-    matches!(device_id, 0x10d3 | 0x10f6)
-}
-
+mod user_card;
 impl PciDriver for E1000eDriverPci {
     fn name(&self) -> &str {
         "e1000e"
@@ -4384,38 +4375,11 @@ impl PciDriver for E1000eDriverPci {
             return Err(DeviceError::IoError);
         };
 
-        // `udriver=e1000e@N`: the card is a userspace driver's, and the
-        // kernel does not so much as reset it. Counted whether it can be
-        // handed over or not, so `@N` names the same card either way.
-        let usable = user_driver_takes(dev.id.device_id);
-        if crate::user::reserve_if(
-            crate::user::E1000E,
-            usable,
-            crate::user::Transport::Pci,
-            bar0_addr,
-            E1000E_BAR0_LEN,
-            || crate::user::Wiring {
-                // The MSI that `bus::pci` armed; x86 MSI numbers sit 32
-                // below their vectors, which is what the APIC takes.
-                irq: irq.map(|irq| {
-                    if cfg!(target_arch = "x86_64") {
-                        irq + 32
-                    } else {
-                        irq
-                    }
-                }),
-                // The kernel's own view of the registers, for the one thing
-                // it does to the card: reset it when its driver dies.
-                vaddr: mapper
-                    .as_ref()
-                    .and_then(|m| m.query_or_map(bar0_addr, E1000E_BAR0_LEN)),
-            },
-        ) {
+        if user_card::left(dev, mapper, irq, bar0_addr) {
             return Err(DeviceError::NotSupported);
         }
-
         // Through the base the mapper returns: see `bus::resolve_window`.
-        let vaddr = crate::bus::resolve_window(mapper, bar0_addr, E1000E_BAR0_LEN, 0);
+        let vaddr = crate::bus::resolve_window(mapper, bar0_addr, 128 * 1024, 0);
         let name = crate::net::next_eth_ifname();
 
         unsafe {

@@ -197,7 +197,11 @@ impl UserDevice {
 /// What the command line asked for: each a `(kind, index)`.
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
-static SEEN: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static SEEN: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N` or

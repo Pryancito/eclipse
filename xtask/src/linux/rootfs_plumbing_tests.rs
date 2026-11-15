@@ -655,13 +655,13 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-dbus-system",
             "",
         ),
+        ("enet", "respawn", "/usr/local/bin/eclipse-unet e1000e", ""),
         (
             "gtk-caches",
             "oneshot",
             "/usr/local/bin/eclipse-gtk-caches",
             "",
         ),
-        ("enet", "respawn", "/usr/local/bin/eclipse-unet e1000e", ""),
         ("hunterd", "respawn", "/usr/local/bin/eclipse-hunterd", ""),
         ("knet", "respawn", "/usr/local/bin/eclipse-unet kernel", ""),
         (
@@ -940,6 +940,14 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         };
         assert_eq!(field(body, "type"), Some(kind), "{name}");
     }
+    // The e1000e the boot leaves: the stack drives it, through the wrapper
+    // of the other card told which this one is.
+    assert_eq!(field(&gated[0].1, "udriver"), Some("e1000e@0"));
+    assert_eq!(
+        field(&gated[0].1, "exec"),
+        Some("/usr/local/bin/eclipse-unet e1000e")
+    );
+    let gated = &gated[1..];
     // The card the kernel lends: what it lists it as, and the wrapper of
     // the other card told which this one is.
     assert_eq!(field(&gated[0].1, "udriver"), Some("kernel-net@0"));

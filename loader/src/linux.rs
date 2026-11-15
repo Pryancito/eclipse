@@ -496,8 +496,7 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   The BTI is what `zx_vmo_create_contiguous` and `zx_bti_pin` want for
 ///   DMA memory and its device addresses.
 /// - word 1: the transport (low half: 1 = legacy virtio-mmio, 2 = modern
-///   virtio-pci, 3 = a PCI function that is not virtio, its first memory
-///   BAR) and the
+///   virtio-pci, 3 = plain PCI: `device_claim::ECLIPSE_TRANSPORT_PCI`) and the
 ///   interrupt line (high half, `u32::MAX` when unknown).
 /// - word 2: where the window starts inside the VMO.
 /// - word 3: the window's size.
@@ -512,9 +511,6 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   `zx_interrupt_bind`. A level-triggered line (virtio-mmio) is masked
 ///   when it fires and unmasked by the next wait or ack, so the driver
 ///   quiets the device in between; an MSI (virtio-pci) is not masked.
-///
-/// A PCI function that is not virtio (3) has nothing in words 4 to 6; its
-/// line is an MSI on x86_64 and a level elsewhere.
 ///
 /// `kind` 1 is a virtio block device, 2 a virtio network card, 3 an Intel
 /// 82574 network card (`e1000e`). `NOT_FOUND` when no such device was
@@ -544,11 +540,6 @@ pub const ECLIPSE_DEVICE_VIRTIO_BLK: usize = 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_DEVICE_VIRTIO_NET: usize = 2;
 
-/// [`ECLIPSE_DEVICE_CLAIM`] kind: an Intel 82574 network card (QEMU's
-/// `e1000e`), left to userspace by `udriver=e1000e@N`.
-#[cfg(feature = "zircon-gateway")]
-pub const ECLIPSE_DEVICE_E1000E: usize = 3;
-
 /// [`ECLIPSE_DEVICE_CLAIM`] transport: legacy virtio over MMIO.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_TRANSPORT_VIRTIO_MMIO: u64 = 1;
@@ -556,11 +547,6 @@ pub const ECLIPSE_TRANSPORT_VIRTIO_MMIO: u64 = 1;
 /// [`ECLIPSE_DEVICE_CLAIM`] transport: modern virtio over PCI.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_TRANSPORT_VIRTIO_PCI: u64 = 2;
-
-/// [`ECLIPSE_DEVICE_CLAIM`] transport: a PCI function that is not virtio;
-/// the window is its first memory BAR.
-#[cfg(feature = "zircon-gateway")]
-pub const ECLIPSE_TRANSPORT_PCI: u64 = 3;
 
 /// `eclipse_block_serve(fifo, window, sectors)`: give the kernel a disk that
 /// this process drives. `fifo` is the end of a FIFO of 32-byte block
