@@ -258,6 +258,11 @@ pub(super) fn init() -> DeviceResult {
     // Before any bus is probed: a disk it finds may be one to leave alone.
     let (udriver, net_by_default) = crate::cmdline::user_devices(crate::KCONFIG.cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
+    // The e1000e too, on this architecture, where its driver in userspace
+    // has been run and measured: `unetcard=kernel` keeps it in the kernel.
+    if crate::cmdline::user_e1000e(crate::KCONFIG.cmdline) {
+        zcore_drivers::user::leave_first_e1000e(udriver);
+    }
     // First thing, before the APs and the tick derive anything from it: the
     // firmware tables are reachable now, so the provisional TSC frequency can
     // be measured against the ACPI PM timer.

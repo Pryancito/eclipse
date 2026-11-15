@@ -17,8 +17,15 @@
 //! * `unetuse=all`: every program's sockets are a stack process's whatever
 //!   else the boot says, even while none runs.
 //!
-//! A machine with no such card, whose first card the kernel drives itself
-//! (the e1000e of an x86_64 machine), lends that card to the stack process
+//! On x86_64 a machine with no such card whose first card is an Intel
+//! 82574 (QEMU's `e1000e`) leaves that one to userspace the same way
+//! ([`E1000E_CARD`]), and the stack process is its driver;
+//! `unetcard=kernel` keeps its driver in the kernel, which then lends it
+//! as below, and `unetstack=kernel` keeps card and network for the
+//! kernel's own stack.
+//!
+//! A machine with neither, whose first card the kernel drives itself
+//! (an I219, or any card on a boot that says `unetcard=kernel`), lends that card to the stack process
 //! ([`lends`]): the kernel goes on driving it, its frames go to the stack
 //! process and not to the kernel's stack, and it counts as the stack
 //! process's card in all of the above. That is the machine's network too
@@ -38,7 +45,7 @@
 pub const CARD: &str = "virtio-net@0";
 
 /// The first Intel 82574 card, when the boot leaves it to userspace
-/// (`udriver=e1000e@0`): the stack process claims it and is its driver,
+/// (unasked on x86_64, or `udriver=e1000e@0`): the stack process claims it and is its driver,
 /// as with [`CARD`], and it counts as that card in all of the above. The
 /// `enet` boot service is started for it. Only the stack process drives
 /// it from userspace: with `unetstack=kernel` nothing takes it.

@@ -40,7 +40,8 @@
 //! device.
 //!
 //! An Intel 82574 card (QEMU's `e1000e`) the boot leaves to userspace
-//! (`udriver=e1000e@0`) is the stack's too, and the stack is its driver:
+//! (an x86_64 machine with no virtio card does, unless it says
+//! `unetcard=kernel`; `udriver=e1000e@0` elsewhere) is the stack's too, and the stack is its driver:
 //! the `enet` service starts, and the wrapper runs the stack with
 //! `card=e1000e`. Nothing else drives it from userspace, so on a boot that
 //! keeps the kernel's stack (`unetstack=kernel`) the service only waits.
