@@ -92,6 +92,14 @@ jobs:
           # soft-float kernel target uses because AES-NI needs the SSE
           # registers -- with no tests of any kind.
           cargo test --manifest-path vendor/aes/Cargo.toml
+          # `vendor/fatfs` is the FAT code of the kernel's FAT and of the
+          # FAT server, in `exclude` like the two above: rust-fatfs with a
+          # directory entry read and written in one piece. Its own unit
+          # tests, and the one that an entry comes back from the disk's
+          # bytes field for field. `--lib`: the doc test and the
+          # integration tests want upstream's disk images, which are not
+          # vendored.
+          cargo test --manifest-path vendor/fatfs/Cargo.toml --lib
           # The same `default-members = ["xtask"]` hole as the block below,
           # and these two fell straight through it with their tests already
           # written: `z-config` holds the machine table that decides what an

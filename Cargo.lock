@@ -950,7 +950,6 @@ dependencies = [
 [[package]]
 name = "fatfs"
 version = "0.4.0"
-source = "git+https://github.com/rafalh/rust-fatfs#2aefc2a027ce94ed0671752814dac203f0450e11"
 dependencies = [
  "bitflags 2.13.1",
  "log",
