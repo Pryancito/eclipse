@@ -38,6 +38,7 @@ mod link;
 mod tests;
 pub mod wire;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -235,7 +236,9 @@ struct Server {
 /// still true, because the server keeps what it was told in memory the
 /// mount holds for it ([`ServedFs::kept`]) and the next server starts from
 /// there. Only when no server comes within [`SERVER_GRACE_MS`] do requests
-/// fail -- and a server that comes later still finds the mount.
+/// fail -- and a server that comes later still finds the mount. A server
+/// that hangs is made one that died: the request that waited on its
+/// silence has it killed (`link::Link::hung`).
 pub struct ServedFs {
     server: Mutex<Server>,
     /// How long a request waits for the next server, from the death of
@@ -361,6 +364,15 @@ impl ServedFs {
         let server = self.server.lock();
         if server.turns == turn {
             server.link.close();
+        }
+    }
+
+    /// How the server of turn `turn` is ended if it hangs: `kill`, which
+    /// kills its process.
+    pub fn server_killed_with(&self, turn: usize, kill: Box<dyn Fn() + Send + Sync>) {
+        let server = self.server.lock();
+        if server.turns == turn {
+            server.link.killed_with(kill);
         }
     }
 
