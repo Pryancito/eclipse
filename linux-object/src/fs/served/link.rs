@@ -36,9 +36,15 @@ pub const LEFT: Signal = Signal::USER_SIGNAL_0;
 const PENDING: u8 = 0;
 const ANSWERED: u8 = 1;
 
-/// How long a request waits for its answer. A server that reads a slow
-/// disk takes a while; one that takes this long is not going to answer.
-const REPLY_TIMEOUT_MS: u64 = 30_000;
+/// How long a request waits while the server answers nothing, this
+/// request or any other. A server that reads a slow disk takes a while;
+/// one that says nothing for this long is not going to, and is taken for
+/// hung: it is killed, and the mount waits for the next one as it does
+/// when a server dies.
+const HUNG_AFTER_MS: u64 = 30_000;
+
+/// What ends a server that hangs: its process, killed.
+pub(super) type Kill = alloc::boxed::Box<dyn Fn() + Send + Sync>;
 
 pub(super) struct Link {
     /// The kernel's end, until the mount is gone: dropping it is what tells
@@ -59,6 +65,13 @@ pub(super) struct Link {
     dead: AtomicBool,
     /// When that was seen, in milliseconds; 0 while it has not been.
     died_at: AtomicU64,
+    /// When the server last answered a request, in milliseconds.
+    answered_at: AtomicU64,
+    /// [`HUNG_AFTER_MS`], or what a test has for it.
+    pub hung_after_ms: AtomicU64,
+    /// What kills the server when it hangs, once there is something that
+    /// can.
+    kill: lock::Mutex<Option<Kill>>,
     next_id: AtomicU32,
 }
 
@@ -153,6 +166,9 @@ impl Link {
             ret_b: [const { AtomicU32::new(0) }; SLOTS],
             dead: AtomicBool::new(false),
             died_at: AtomicU64::new(0),
+            answered_at: AtomicU64::new(0),
+            hung_after_ms: AtomicU64::new(HUNG_AFTER_MS),
+            kill: lock::Mutex::new(None),
             next_id: AtomicU32::new(0),
         })
     }
@@ -179,6 +195,35 @@ impl Link {
     pub fn looked_dead(&self) -> bool {
         self.pump();
         self.is_dead()
+    }
+
+    /// How the server is ended when it hangs.
+    pub fn killed_with(&self, kill: Kill) {
+        *self.kill.lock() = Some(kill);
+    }
+
+    /// The server has said nothing for as long as a request waits: it is
+    /// killed and the link closed, so that the next server can have the
+    /// mount. Killed first, because the next one starts from the memory
+    /// this one writes; closed whether or not the kill does anything,
+    /// because nothing more is to be had from it either way.
+    fn hung(&self) {
+        if self.is_dead() {
+            return;
+        }
+        warn!("served fs: the server answers nothing: it is killed");
+        let kill = self.kill.lock().take();
+        if let Some(kill) = kill {
+            kill();
+        }
+        self.close();
+    }
+
+    /// Whether the server has said nothing since `since` for as long as a
+    /// request waits.
+    fn silent_since(&self, since: u64) -> bool {
+        let heard = since.max(self.answered_at.load(Ordering::Acquire));
+        now_ms() > heard + self.hung_after_ms.load(Ordering::Relaxed)
     }
 
     /// The mount is gone, or the server: nothing is asked on this link
@@ -211,6 +256,9 @@ impl Link {
                 return 0;
             }
         };
+        if n > 0 {
+            self.answered_at.store(now_ms(), Ordering::Release);
+        }
         for m in back.as_chunks::<MSG>().0.iter().take(n) {
             let reply = wire::decode(m);
             let slot = (reply.reqid as usize) & (SLOTS - 1);
@@ -231,8 +279,9 @@ impl Link {
         n
     }
 
-    /// A free slot, waiting for one while there are none.
-    fn claim(&self, deadline: u64) -> Option<usize> {
+    /// A free slot, waiting for one while there are none and the server
+    /// answers those that are held.
+    fn claim(&self, since: u64) -> Option<usize> {
         let mut away = SyncWait::new();
         loop {
             let free = self.free.load(Ordering::Acquire);
@@ -252,7 +301,11 @@ impl Link {
                 }
                 continue;
             }
-            if self.is_dead() || now_ms() > deadline {
+            if self.is_dead() {
+                return None;
+            }
+            if self.silent_since(since) {
+                self.hung();
                 return None;
             }
             // The holders may be parked: their replies are read by whoever
@@ -265,8 +318,9 @@ impl Link {
 
     /// Ask the server `op`, with the names as they go in the slot (one
     /// path, or two with a NUL between), `a`, `b` and `data` in its data
-    /// area, and wait for what it says. Its `errno` is the error, and so is
-    /// a server that does not answer; one that is gone is [`Fail::Gone`].
+    /// area, and wait for what it says. Its `errno` is the error; a server
+    /// that is gone is [`Fail::Gone`], and so is one that hangs, which is
+    /// gone by the time this says so.
     pub fn call_with(
         self: &Arc<Self>,
         op: u32,
@@ -285,9 +339,9 @@ impl Link {
         if self.is_dead() {
             return Err(Fail::Gone);
         }
-        let deadline = now_ms() + REPLY_TIMEOUT_MS;
-        let Some(slot) = self.claim(deadline) else {
-            return Err(if self.is_dead() { Fail::Gone } else { failed });
+        let since = now_ms();
+        let Some(slot) = self.claim(since) else {
+            return Err(Fail::Gone);
         };
         let id = (self.next_id.fetch_add(1, Ordering::Relaxed) << SLOT_BITS) | slot as u32;
         self.expect[slot].store(id, Ordering::Release);
@@ -313,12 +367,16 @@ impl Link {
         loop {
             match fifo.write(MSG, &msg, 1) {
                 Ok(_) => break,
-                Err(ZxError::SHOULD_WAIT) if now_ms() <= deadline => between_looks(&mut away),
-                Err(e) => {
+                Err(ZxError::SHOULD_WAIT) if !self.silent_since(since) => between_looks(&mut away),
+                // A server that reads nothing is as one that answers
+                // nothing.
+                Err(ZxError::SHOULD_WAIT) => {
                     give_back(self);
-                    if e == ZxError::SHOULD_WAIT {
-                        return Err(failed);
-                    }
+                    self.hung();
+                    return Err(Fail::Gone);
+                }
+                Err(_) => {
+                    give_back(self);
                     self.die();
                     return Err(Fail::Gone);
                 }
@@ -337,9 +395,9 @@ impl Link {
             if self.is_dead() {
                 return Err(Fail::Gone);
             }
-            if now_ms() > deadline {
-                warn!("served fs: a request was not answered in time");
-                return Err(failed);
+            if self.silent_since(since) {
+                self.hung();
+                return Err(Fail::Gone);
             }
             between_looks(&mut away);
         }

@@ -153,11 +153,13 @@ fn serve(
 }
 
 /// How a fake server ends: on the first request `op` it gets, after doing
-/// it or before, it goes without answering.
+/// it or before, it goes without answering -- or, when it `hangs`, stays
+/// and answers nothing more.
 #[derive(Clone, Copy)]
 struct DiesOn {
     op: u32,
     done_first: bool,
+    hangs: bool,
 }
 
 /// A fake server of `tree` as a thread, and the kernel's link to it.
@@ -198,6 +200,15 @@ fn server(
         ];
         window.read(slot + NAME_AREA, &mut sent).unwrap();
         let dies = dies_on.filter(|d| d.op == op);
+        if dies.is_some_and(|d| d.hangs) {
+            // Its end of the FIFO stays open, as a process's does that is
+            // stopped or spins, until the kernel lets go of the other.
+            let mut closed = [0u8; MSG];
+            while servers.read(MSG, &mut closed, 1) != Err(ZxError::PEER_CLOSED) {
+                thread::yield_now();
+            }
+            return ZxError::TIMED_OUT;
+        }
         if dies.is_some_and(|d| !d.done_first) {
             return ZxError::CANCELED;
         }
@@ -252,7 +263,14 @@ impl Mount {
 
     /// A mount whose first server goes on its first request `op`.
     fn dying_on(op: u32, done_first: bool) -> Self {
-        Self::with(false, Some(DiesOn { op, done_first }))
+        Self::with(
+            false,
+            Some(DiesOn {
+                op,
+                done_first,
+                hangs: false,
+            }),
+        )
     }
 
     /// Another server of the same tree takes the mount over: whether it
@@ -460,6 +478,43 @@ fn a_server_that_dies_with_none_after_it_is_an_error_once_the_wait_is_over() {
     let before = std::time::Instant::now();
     assert_eq!(fs.root_inode().get_entry(2), Err(FsError::DeviceError));
     assert!(before.elapsed() < std::time::Duration::from_millis(30));
+}
+
+/// A server that holds its end of the FIFO and answers nothing: the
+/// request that waited as long as a request waits has it killed, and is
+/// answered by the server that takes the mount over.
+#[test]
+fn a_server_that_hangs_is_killed_and_the_next_one_answers() {
+    let hangs = DiesOn {
+        op: OP_READ,
+        done_first: false,
+        hangs: true,
+    };
+    let mount = Mount::with(false, Some(hangs));
+    let readme = mount.root().find("Readme.TXT").unwrap();
+    let killed = Arc::new(AtomicUsize::new(0));
+    let kills = killed.clone();
+    mount.fs.server_killed_with(
+        1,
+        Box::new(move || {
+            kills.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    mount.fs.link().hung_after_ms.store(60, Ordering::Relaxed);
+    // No server may have the mount while that one has it.
+    let first = mount.fs.link();
+    let coming = mount.next_server_in(0);
+    let before = std::time::Instant::now();
+    let mut buf = [0u8; 100];
+    assert_eq!(readme.read_at(5000, &mut buf), Ok(100));
+    assert_eq!(buf[..], content(5000, 100)[..]);
+    assert!(before.elapsed() >= std::time::Duration::from_millis(60));
+    assert_eq!(killed.load(Ordering::Relaxed), 1);
+    assert!(first.is_dead());
+    let mount = coming.join().unwrap();
+    // The one that hung saw its FIFO closed, as a killed one's is.
+    assert!(!Arc::ptr_eq(&first, &mount.fs.link()));
+    assert_eq!(mount.asked(OP_READ), 1);
 }
 
 #[test]

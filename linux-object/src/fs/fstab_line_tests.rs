@@ -289,3 +289,48 @@ fn the_runs_deadline_is_built_once_and_handed_out_again() {
         BURN_MS
     );
 }
+
+/// A FAT line on a device is the server's, and the kernel's own FAT keeps
+/// it on each boot where nothing would start that server: the boot that
+/// says so, and the root filesystem that has no service for it.
+#[test]
+fn a_fat_line_is_left_to_its_server_unless_the_boot_or_the_root_keeps_it() {
+    for fstype in ["vfat", "msdos", "FAT32", "fat16", "fat"] {
+        let parsed = mount_ops::parse_fstype(fstype).unwrap();
+        assert!(
+            left_to_fat_server("/dev/sda1", parsed, None, true),
+            "{}",
+            fstype
+        );
+        assert!(
+            !left_to_fat_server("/dev/sda1", parsed, Some("kernel"), true),
+            "{}: `ufat=kernel` is the way back",
+            fstype
+        );
+        assert!(
+            !left_to_fat_server("/dev/sda1", parsed, None, false),
+            "{}: nothing in this root would mount it",
+            fstype
+        );
+    }
+    assert!(
+        left_to_fat_server("/dev/sda1", "vfat", Some("server"), true),
+        "only `kernel` is the word"
+    );
+    // The placeholder of an image nobody installed: the kernel derives the
+    // device from `ROOT=`, which the service does not.
+    assert!(!left_to_fat_server(
+        "__ECLIPSE_EFI_DEV___",
+        "vfat",
+        None,
+        true
+    ));
+    for fstype in ["btrfs", "eclipsefs"] {
+        let parsed = mount_ops::parse_fstype(fstype).unwrap();
+        assert!(
+            !left_to_fat_server("/dev/sda2", parsed, None, true),
+            "{}",
+            fstype
+        );
+    }
+}

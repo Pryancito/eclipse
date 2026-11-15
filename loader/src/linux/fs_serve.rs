@@ -25,7 +25,9 @@ use zircon_object::ZxError;
 /// The process answers each message on the other end of the FIFO, and sees
 /// that end closed when the filesystem is unmounted. When the process is
 /// gone the mount stays: its requests wait ten seconds for the next
-/// server, and fail after that until one comes.
+/// server, and fail after that until one comes. A process that holds its
+/// end and answers nothing for thirty seconds while a request waits is
+/// killed, and is then a server that is gone.
 ///
 /// The next server is a process that makes this call with the same place,
 /// source, type and flags: it is given the mount as it is, and the answer
@@ -105,6 +107,19 @@ fn serve(proc: &Arc<Process>, args: &[usize; 6]) -> Result<u32, ZxError> {
     // notice the server going: this does, and the mount's wait for the
     // next one starts when it went.
     let (fs, turn) = (served.fs, served.turn);
+    // A server that stops answering is killed, for the next to take the
+    // mount: by its pid, which is its own for as long as it holds the
+    // other end of the FIFO.
+    let pid = proc.id() as usize;
+    fs.server_killed_with(
+        turn,
+        alloc::boxed::Box::new(move || {
+            let kill = linux_object::signal::Signal::SIGKILL;
+            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                warn!("served fs: the hung server {pid} was not killed: {e:?}");
+            }
+        }),
+    );
     kernel_hal::thread::spawn(async move {
         let wire: Arc<dyn KernelObject> = fifo;
         // The server went, or the mount did, and then this end must go

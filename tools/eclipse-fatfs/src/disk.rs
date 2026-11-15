@@ -21,6 +21,17 @@
 //! is made in an order that leaves it true whenever the process stops: a
 //! sector is marked as not on the device before its bytes change, and as
 //! held only once its bytes are there.
+//!
+//! A change of several writes that is only true whole -- a rename, which
+//! writes the new name and then takes the old one off -- is made as a
+//! *group*: between [`Disk::begin`] and [`Disk::commit`] each sector is
+//! put in a journal in the kept memory, as it was, before it is first
+//! written, and `commit` empties the journal. A server that dies inside
+//! the group leaves the journal, and the next `Disk` over the memory
+//! writes the sectors back as they were: the change was not begun.
+//! Reading costs a group nothing, which is why it is the old sectors that
+//! are kept and not the new: the FAT code reads a directory entry in a
+//! dozen pieces, and looked each of them up among the group's.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -129,10 +140,19 @@ struct Head {
     device_len: u64,
     /// What whoever uses the disk keeps here ([`Disk::word`]).
     word: u64,
+    /// The sectors in the journal: those the group being made has
+    /// written, as they were before it. 0 when no group is being made.
+    journal: u64,
 }
 
-/// "eclfatk1": the layout below.
-const MAGIC: u64 = 0x316b_7461_666c_6365;
+/// "eclfatk2": the layout below.
+const MAGIC: u64 = 0x326b_7461_666c_6365;
+
+/// The sectors of a group the journal has room for: 128 KiB, which is a
+/// directory's new cluster of the largest size and the entries and table
+/// sectors around it. A group that writes more is, from there on, written
+/// as it would be without one.
+pub const GROUP_MAX: usize = 256;
 
 /// What is known of the chunk in each place of [`Kept`].
 #[repr(C)]
@@ -154,9 +174,14 @@ const NO_CHUNK: u64 = u64::MAX;
 const METAS_AT: usize = 4096;
 const BYTES_AT: usize = 8192;
 const _: () = assert!(METAS_AT + CHUNKS_KEPT * core::mem::size_of::<Meta>() <= BYTES_AT);
+/// The journal, after the chunks: which sector each of its places is of,
+/// then the places' bytes.
+const JOURNAL_AT: usize = BYTES_AT + CHUNKS_KEPT * CHUNK;
+const JOURNAL_BYTES_AT: usize = JOURNAL_AT + 4096;
+const _: () = assert!(GROUP_MAX * 8 <= JOURNAL_BYTES_AT - JOURNAL_AT);
 
 /// The memory the chunks are kept in: a [`Head`], a [`Meta`] for each
-/// place and the places' bytes.
+/// place, the places' bytes, and the journal.
 pub struct Kept {
     base: *mut u8,
     /// The memory, when it is this process's own.
@@ -165,7 +190,7 @@ pub struct Kept {
 
 impl Kept {
     /// The bytes of it.
-    pub const LEN: usize = BYTES_AT + CHUNKS_KEPT * CHUNK;
+    pub const LEN: usize = JOURNAL_BYTES_AT + GROUP_MAX * SECTOR;
 
     /// Memory of this process's own, which goes when it does.
     pub fn private() -> Self {
@@ -210,6 +235,42 @@ impl Kept {
         unsafe { core::slice::from_raw_parts(self.base.add(BYTES_AT + place * CHUNK), CHUNK) }
     }
 
+    /// The sector the journal's place `i` is of, and its bytes.
+    fn journal(&self, i: usize) -> (u64, &[u8]) {
+        assert!(i < GROUP_MAX);
+        // SAFETY: the journal's own stretch of the memory, aligned as the
+        // base is.
+        unsafe {
+            (
+                *self.base.add(JOURNAL_AT).cast::<u64>().add(i),
+                core::slice::from_raw_parts(self.base.add(JOURNAL_BYTES_AT + i * SECTOR), SECTOR),
+            )
+        }
+    }
+
+    fn set_journal(&mut self, i: usize, sector: u64, bytes: &[u8; SECTOR]) {
+        assert!(i < GROUP_MAX);
+        // SAFETY: as `journal`.
+        unsafe {
+            *self.base.add(JOURNAL_AT).cast::<u64>().add(i) = sector;
+            core::slice::from_raw_parts_mut(self.base.add(JOURNAL_BYTES_AT + i * SECTOR), SECTOR)
+                .copy_from_slice(bytes);
+        }
+    }
+
+    /// Say how many sectors of the journal stand: the one store a sector
+    /// is in it by, or the group is done with, so it is made where it is
+    /// written and not moved before what it follows.
+    fn set_journaled(&mut self, sectors: usize) {
+        use core::sync::atomic::{compiler_fence, Ordering};
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: the head's own field.
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*self.base.cast::<Head>()).journal, sectors as u64)
+        };
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// The place's metadata and its bytes, to change both.
     fn place_mut(&mut self, place: usize) -> (&mut Meta, &mut [u8]) {
         assert!(place < CHUNKS_KEPT);
@@ -233,6 +294,15 @@ pub struct Disk<B> {
     clock: u64,
     /// The memory was another `Disk`'s before.
     adopted: bool,
+    /// The group being made: the sectors in the journal, which are those
+    /// written since [`Disk::begin`]. `None` when there is no group, and
+    /// once a group has written more than the journal holds.
+    group: Option<Vec<u64>>,
+    /// In a test, the changes this may still make to the memory and the
+    /// device before it is as a process that stopped: every one after is
+    /// not made.
+    #[cfg(test)]
+    pub changes_left: Option<u64>,
     /// How many times the device was read, and written.
     pub device_reads: u64,
     pub device_writes: u64,
@@ -311,10 +381,11 @@ impl<B: Blocks> Disk<B> {
             }
             kept.head().device_len = len;
             kept.head().word = 0;
+            kept.head().journal = 0;
             // Last: until it is there the memory is new.
             kept.head().magic = MAGIC;
         }
-        Some(Disk {
+        let mut disk = Disk {
             blocks,
             len,
             pos: 0,
@@ -322,9 +393,92 @@ impl<B: Blocks> Disk<B> {
             place_of,
             clock,
             adopted,
+            group: None,
+            #[cfg(test)]
+            changes_left: None,
             device_reads: 0,
             device_writes: 0,
-        })
+        };
+        // A group the last `Disk` was making: its sectors go back to what
+        // they were, which changes nothing where it was done before.
+        let journaled = disk.kept.head().journal as usize;
+        if journaled > GROUP_MAX {
+            return None;
+        }
+        for i in 0..journaled {
+            let (sector, bytes) = disk.kept.journal(i);
+            let at = sector.checked_mul(SECTOR as u64).filter(|at| *at < len)?;
+            let bytes: [u8; SECTOR] = bytes.try_into().expect("a sector");
+            let n = SECTOR.min((len - at) as usize);
+            disk.write_base(at, &bytes[..n]).ok()?;
+        }
+        disk.kept.set_journaled(0);
+        Some(disk)
+    }
+
+    /// Whether this may still change the memory and the device: always,
+    /// but in a test that stops it at a change.
+    #[inline]
+    fn alive(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some(left) = &mut self.changes_left {
+            if *left == 0 {
+                return false;
+            }
+            *left -= 1;
+        }
+        true
+    }
+
+    /// What is written from here to [`commit`](Self::commit) is one
+    /// change: none of it is there after a server's death in between.
+    pub fn begin(&mut self) {
+        self.group.get_or_insert_with(Vec::new);
+    }
+
+    /// The group is made: nothing is left to take it back with.
+    pub fn commit(&mut self) {
+        if self.group.take().is_some_and(|group| !group.is_empty()) && self.alive() {
+            self.kept.set_journaled(0);
+        }
+    }
+
+    /// Before `[offset, offset + len)` is written in a group: each of its
+    /// sectors that the journal does not have goes in it, as it is.
+    fn journal(&mut self, offset: u64, len: usize) -> io::Result<()> {
+        let end = offset + len as u64;
+        for sector in offset / SECTOR as u64..end.div_ceil(SECTOR as u64) {
+            let Some(group) = &self.group else {
+                return Ok(());
+            };
+            if group.contains(&sector) {
+                continue;
+            }
+            let i = group.len();
+            if i == GROUP_MAX {
+                // More than the journal holds: the group is written, from
+                // here, as without one, and what it wrote stays.
+                self.group = None;
+                if self.alive() {
+                    self.kept.set_journaled(0);
+                }
+                return Ok(());
+            }
+            let at = sector * SECTOR as u64;
+            let mut was = [0u8; SECTOR];
+            let n = SECTOR.min((self.len - at) as usize);
+            self.read_exact_at(at, &mut was[..n])?;
+            // The sector, and then that it is there: a sector the word
+            // does not count is not written back.
+            if self.alive() {
+                self.kept.set_journal(i, sector, &was);
+            }
+            if self.alive() {
+                self.kept.set_journaled(i + 1);
+            }
+            self.group.as_mut().expect("a group").push(sector);
+        }
+        Ok(())
     }
 
     /// Whether the chunks were in the memory already: another `Disk`'s,
@@ -372,6 +526,9 @@ impl<B: Blocks> Disk<B> {
             let from = left.trailing_zeros() as usize;
             let run = (left >> from).trailing_ones() as usize;
             let (start, end) = (from * SECTOR, ((from + run) * SECTOR).min(len));
+            if !self.alive() {
+                return Ok(());
+            }
             self.device_writes += 1;
             write_fully(
                 &mut self.blocks,
@@ -413,6 +570,9 @@ impl<B: Blocks> Disk<B> {
                     })
                     .expect("there are places");
                 self.write_out(place)?;
+                if !self.alive() {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
                 let meta = self.kept.meta_mut(place);
                 let was = meta.index;
                 // Nothing held first: the bytes there are the old chunk's.
@@ -479,6 +639,9 @@ impl<B: Blocks> Disk<B> {
         };
         let whole = sectors(within.div_ceil(SECTOR), whole_to);
         let place = self.chunk(index, touched & !whole)?;
+        if !self.alive() {
+            return Ok(n);
+        }
         let (meta, bytes) = self.kept.place_mut(place);
         // In this order, for a process that stops in the middle: a sector
         // that was held is not the device's from before its bytes change,
@@ -529,6 +692,12 @@ impl<B: Blocks> Disk<B> {
         if offset + buf.len() as u64 > self.len {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
+        self.read_base(offset, buf)
+    }
+
+    /// [`read_exact_at`](Self::read_exact_at), the range being inside the
+    /// device.
+    fn read_base(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         if direct(offset, buf.len(), DIRECT_MIN) {
             self.device_reads += 1;
             read_fully(&self.blocks, offset, buf)?;
@@ -557,7 +726,19 @@ impl<B: Blocks> Disk<B> {
         if offset + buf.len() as u64 > self.len {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
+        if self.group.is_some() {
+            self.journal(offset, buf.len())?;
+        }
+        self.write_base(offset, buf)
+    }
+
+    /// [`write_all_at`](Self::write_all_at), the range being inside the
+    /// device and in the journal if it has to be.
+    fn write_base(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
         if direct(offset, buf.len(), DIRECT_WRITE_MIN) {
+            if !self.alive() {
+                return Ok(());
+            }
             self.device_writes += 1;
             write_fully(&mut self.blocks, offset, buf)?;
             // The kept chunks have it too, and no older bytes to write
@@ -609,6 +790,14 @@ impl<B: Blocks> Write for Disk<B> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
+        }
+        if self.group.is_some() {
+            // What `write_chunk` will write: up to the chunk's end.
+            let within = (self.pos % CHUNK as u64) as usize;
+            let n = buf
+                .len()
+                .min(self.chunk_len(self.pos / CHUNK as u64) - within);
+            self.journal(self.pos, n)?;
         }
         let n = self.write_chunk(self.pos, buf)?;
         self.pos += n as u64;
@@ -865,5 +1054,65 @@ mod tests {
         kept.meta_mut(0).index = 1;
         kept.meta_mut(1).index = 1;
         assert!(Disk::over(dev.clone(), dev.len() as u64, kept).is_none());
+    }
+    #[test]
+    fn a_group_a_dead_disk_was_making_is_taken_back_and_one_it_made_is_not() {
+        let dev = device(4 * CHUNK);
+        let len = dev.len() as u64;
+        let mut mem = memory();
+        let base = mem.as_mut_ptr().cast::<u8>();
+        let (a, b) = (CHUNK as u64 + 700, 3 * CHUNK as u64 - 3);
+        let mut want = dev.clone();
+        want[a as usize..a as usize + 5].copy_from_slice(b"first");
+        want[b as usize..b as usize + 6].copy_from_slice(b"second");
+        // The disk stops after each of the changes the group is, and
+        // then is let finish: the one after it has all of the group or,
+        // while there was a change left to make, none.
+        let mut dev_now = dev.clone();
+        for cut in 0.. {
+            // SAFETY: the test's own memory, one disk over it at a time.
+            let mut disk = Disk::over(dev_now, len, unsafe { Kept::at(base) }).unwrap();
+            let has = read_all(&mut disk, 0, dev.len());
+            if has == want {
+                assert!(cut > 8, "{cut} changes");
+                break;
+            }
+            assert!(has == dev, "cut at {cut}");
+            disk.changes_left = Some(cut);
+            disk.begin();
+            disk.write_all_at(a, b"first").unwrap();
+            disk.seek(SeekFrom::Start(b)).unwrap();
+            // Across two sectors, and two chunks.
+            disk.write_all(b"second").unwrap();
+            // Some of it reaches the device inside the group.
+            disk.flush().unwrap();
+            disk.commit();
+            dev_now = disk.blocks().clone();
+            core::mem::forget(disk);
+        }
+    }
+
+    #[test]
+    fn a_group_longer_than_the_journal_is_written_and_stays() {
+        let dev = device(8 * CHUNK);
+        let len = dev.len() as u64;
+        let mut mem = memory();
+        let base = mem.as_mut_ptr().cast::<u8>();
+        // SAFETY: the test's own memory, one disk over it at a time.
+        let mut disk = Disk::over(dev.clone(), len, unsafe { Kept::at(base) }).unwrap();
+        disk.begin();
+        let wrote = vec![0xa5u8; (GROUP_MAX + 9) * SECTOR - 20];
+        disk.write_all_at(CHUNK as u64 + 10, &wrote).unwrap();
+        // Not taken back by the disk after this one, the group made or
+        // not: there is no knowing all of what it was.
+        let left = disk.blocks().clone();
+        core::mem::forget(disk);
+        // SAFETY: as above; the first is gone.
+        let mut disk = Disk::over(left, len, unsafe { Kept::at(base) }).unwrap();
+        let mut want = dev;
+        want[CHUNK + 10..CHUNK + 10 + wrote.len()].copy_from_slice(&wrote);
+        assert_eq!(read_all(&mut disk, 0, want.len()), want);
+        disk.flush().unwrap();
+        assert_eq!(*disk.blocks(), want);
     }
 }

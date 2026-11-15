@@ -87,7 +87,8 @@ const FATFS: [&str; 2] = ["eclipse-fatfs", "eclipse-fs-bench"];
 const FATFS_USES: [&str; 1] = ["tools/eclipse-udrivers/src"];
 
 /// The `unet` and `ublk` services and the wrappers they run, and
-/// `ublk-mounts`, which mounts what fstab puts on the served disk.
+/// `ublk-mounts`, which mounts what fstab puts on the served disk; and
+/// `fat-mounts`, which mounts fstab's FAT volumes with a server each.
 ///
 /// `udriver =` keeps each out of every boot where the kernel drives the
 /// device itself or the machine has none: a disk is left when the command
@@ -238,7 +239,108 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     )
     .unwrap();
     fs::write(localbin.join("eclipse-ublk-mounts"), UBLK_MOUNTS).unwrap();
+
+    // The FAT volumes of `/etc/fstab`: each is mounted by a process that
+    // serves it (`eclipse-fatfs`), not by the kernel's FAT, which leaves
+    // those lines when the root filesystem has this service. On every
+    // boot, whoever drives the disk; after the userspace disk driver's
+    // start for the boots that have one.
+    fs::write(
+        svc_dir.join("fat-mounts.service"),
+        b"# The FAT volumes of /etc/fstab, each served by a process
+          # (eclipse-fatfs); ufat=kernel on the kernel command line keeps
+          # them for the kernel's own FAT. See
+          # /usr/local/bin/eclipse-fat-mounts.
+          exec = /usr/local/bin/eclipse-fat-mounts
+          type = oneshot
+          after = ublk
+",
+    )
+    .unwrap();
+    fs::write(localbin.join("eclipse-fat-mounts"), FAT_MOUNTS).unwrap();
 }
+
+/// `/usr/local/bin/eclipse-fat-mounts`: every FAT line of fstab on a
+/// device, mounted with a server process.
+///
+/// The kernel's pass over fstab leaves these lines when the root
+/// filesystem has `fat-mounts.service` and the boot does not say
+/// `ufat=kernel` (`left_to_fat_server`, in the kernel); with the word the
+/// kernel mounts them and this does nothing. The types are the kernel's
+/// spellings of FAT, in any case, so no line is left by one and not taken
+/// by the other.
+///
+/// A volume whose server does not make the mount (no binary, a volume it
+/// cannot read) is mounted with the kernel's FAT, and said: `/boot/efi`
+/// is there either way. The wait for a device is for the disk a userspace
+/// driver serves, which comes after init starts; every other disk is
+/// there by now or is not coming.
+///
+/// The mounting is left running and the script ends: init goes on to the
+/// next service at once. On one processor a server's start among all the
+/// others' took the boot 0.3 s that the kernel's pass, a task beside init,
+/// never did; nothing is ordered after these mounts, as nothing could be
+/// after the kernel's.
+const FAT_MOUNTS: &[u8] = b"#!/bin/sh\n\
+# Eclipse OS: mount the FAT volumes of /etc/fstab, each with a process\n\
+# that serves it (eclipse-fatfs) and not with the kernel's FAT. The\n\
+# kernel leaves those lines to this service; ufat=kernel on its command\n\
+# line keeps them for the kernel, and then there is nothing to do here.\n\
+# A volume the server does not mount is mounted with the kernel's FAT.\n\
+fstab=/etc/fstab\n\
+[ -r \"$fstab\" ] || exit 0\n\
+# (No program is run to read the boot's words or a line's type: on the\n\
+# boot with no FAT line this costs one shell and nothing else.)\n\
+read -r words < /proc/cmdline\n\
+set -f\n\
+IFS=': \t'\n\
+for word in $words; do\n\
+    case \"$word\" in ufat=*) [ \"$word\" = ufat=kernel ] && exit 0; break ;; esac\n\
+done\n\
+unset IFS\n\
+set +f\n\
+# Only the disk of a userspace driver is waited for (5 s for all the\n\
+# lines together): the kernel's disks are there before init.\n\
+left=0\n\
+while read -r device; do\n\
+    case \"$device\" in virtio-blk@*) left=50 ;; esac\n\
+done < /proc/udrivers\n\
+mounted() {\n\
+    while read -r _ place _; do\n\
+        [ \"$place\" = \"$1\" ] && return 0\n\
+    done < /proc/mounts\n\
+    return 1\n\
+}\n\
+mounts() {\n\
+    while read -r dev at type opts _; do\n\
+        case \"$dev\" in /dev/*) ;; *) continue ;; esac\n\
+        case \"$at\" in /?*) ;; *) continue ;; esac\n\
+        case \"$type\" in\n\
+            [Vv][Ff][Aa][Tt]|[Ff][Aa][Tt]|[Ff][Aa][Tt]32|[Ff][Aa][Tt]16|[Mm][Ss][Dd][Oo][Ss]) ;;\n\
+            *) continue ;;\n\
+        esac\n\
+        case \",$opts,\" in *,noauto,*) continue ;; esac\n\
+        mounted \"$at\" && continue\n\
+        while [ ! -e \"$dev\" ] && [ \"$left\" -gt 0 ]; do\n\
+            sleep 0.1\n\
+            left=$((left - 1))\n\
+        done\n\
+        if [ ! -e \"$dev\" ]; then\n\
+            echo \"eclipse-fat-mounts: $dev (for $at) is not there\" >&2\n\
+            continue\n\
+        fi\n\
+        [ -d \"$at\" ] || mkdir -p \"$at\"\n\
+        ro=\n\
+        case \",$opts,\" in *,ro,*) ro=-r ;; esac\n\
+        /bin/eclipse-fatfs $ro \"$dev\" \"$at\" && continue\n\
+        echo \"eclipse-fat-mounts: no server for $dev at $at: the kernel's FAT mounts it\" >&2\n\
+        busybox mount -t \"$type\" -o \"$opts\" \"$dev\" \"$at\"\n\
+    done < \"$fstab\"\n\
+}\n\
+# Not waited for: the kernel's pass over fstab, which these lines were\n\
+# mounted by, runs beside init too and never held the boot back.\n\
+mounts &\n\
+exit 0\n";
 
 /// `/usr/local/bin/eclipse-ublk-mounts`: every `/dev` line of fstab that
 /// nothing has mounted, once its device is there.
@@ -253,6 +355,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
 /// twice on one directory succeeds here, and stacks. (`mounted` reads into
 /// names of its own: a shell function shares the caller's variables, and
 /// reading the table into `at` left the mount point empty.)
+///
+/// The FAT lines are not this script's but [`FAT_MOUNTS`]'s, except on
+/// the boot that keeps FAT in the kernel (`ufat=kernel`).
 const UBLK_MOUNTS: &[u8] = b"#!/bin/sh\n\
 # Eclipse OS: mount what /etc/fstab puts on the disk a userspace driver\n\
 # serves (udriver=virtio-blk@N). The kernel goes through fstab once, as\n\
@@ -264,6 +369,17 @@ fstab=/etc/fstab\n\
 [ -r \"$fstab\" ] || exit 0\n\
 left=50\n\
 rc=0\n\
+# The FAT volumes are eclipse-fat-mounts's, which mounts each with a\n\
+# server process, unless the boot keeps them for the kernel's FAT.\n\
+fat=\n\
+read -r words < /proc/cmdline\n\
+set -f\n\
+IFS=': \t'\n\
+for word in $words; do\n\
+    case \"$word\" in ufat=*) fat=${word#ufat=}; break ;; esac\n\
+done\n\
+unset IFS\n\
+set +f\n\
 mounted() {\n\
     while read -r _ place _; do\n\
         [ \"$place\" = \"$1\" ] && return 0\n\
@@ -274,6 +390,11 @@ while read -r dev at type opts _; do\n\
     case \"$dev\" in /dev/*) ;; *) continue ;; esac\n\
     case \"$at\" in /?*) ;; *) continue ;; esac\n\
     case \",$opts,\" in *,noauto,*) continue ;; esac\n\
+    if [ \"$fat\" != kernel ]; then\n\
+        case \"$type\" in\n\
+            [Vv][Ff][Aa][Tt]|[Ff][Aa][Tt]|[Ff][Aa][Tt]32|[Ff][Aa][Tt]16|[Mm][Ss][Dd][Oo][Ss]) continue ;;\n\
+        esac\n\
+    fi\n\
     mounted \"$at\" && continue\n\
     while [ ! -e \"$dev\" ] && [ \"$left\" -gt 0 ]; do\n\
         sleep 0.1\n\

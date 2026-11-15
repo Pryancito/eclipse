@@ -657,6 +657,12 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ),
         ("enet", "respawn", "/usr/local/bin/eclipse-unet e1000e", ""),
         (
+            "fat-mounts",
+            "oneshot",
+            "/usr/local/bin/eclipse-fat-mounts",
+            "ublk",
+        ),
+        (
             "gtk-caches",
             "oneshot",
             "/usr/local/bin/eclipse-gtk-caches",
@@ -1229,6 +1235,7 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
     for needle in [
         "fstab=/etc/fstab",
         "< /proc/mounts",
+        "< /proc/cmdline",
         "busybox mount -t",
         "left=50",
     ] {
@@ -1239,13 +1246,15 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
         );
     }
     let dir = scratch("ublk-mounts-run");
-    let run = |fstab: &str, mounts: &str| {
-        let (f, m) = (dir.join("fstab"), dir.join("mounts"));
+    let run_on = |cmdline: &str, fstab: &str, mounts: &str| {
+        let (f, m, c) = (dir.join("fstab"), dir.join("mounts"), dir.join("cmdline"));
         fs::write(&f, fstab).unwrap();
         fs::write(&m, mounts).unwrap();
+        fs::write(&c, cmdline).unwrap();
         let script = script
             .replace("fstab=/etc/fstab", &format!("fstab='{}'", f.display()))
             .replace("< /proc/mounts", &format!("< '{}'", m.display()))
+            .replace("< /proc/cmdline", &format!("< '{}'", c.display()))
             .replace("busybox mount -t", "echo mount -t")
             // Two tenths of a second, not fifty: the wait is what is tested,
             // not its length.
@@ -1262,29 +1271,30 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
             out.status.code(),
         )
     };
+    let run = |fstab: &str, mounts: &str| run_on("LOG=warn:udriver=virtio-blk@0\n", fstab, mounts);
     let at = |name: &str| dir.join(name).display().to_string();
-    let (data, taken, absent) = (at("data"), at("taken"), at("absent"));
+    let (data, taken, absent, fat) = (at("data"), at("taken"), at("absent"), at("fat"));
     let fstab = format!(
         "# /etc/fstab\n\
          __ECLIPSE_ROOT_DEV__  /          eclipsefs defaults 0 1\n\
          __ECLIPSE_EFI_DEV___  /boot/efi  vfat defaults,noatime 0 0\n\
-         /dev/null  /  vfat defaults 0 0\n\
+         /dev/null  /  btrfs defaults 0 0\n\
          /dev/null  none  swap sw 0 0\n\
-         /dev/null  {}  vfat defaults,noauto 0 0\n\
-         /dev/null  {taken}  vfat defaults 0 0\n\
-         /dev/null  {data}  vfat defaults,noatime 0 0\n\
+         /dev/null  {}  btrfs defaults,noauto 0 0\n\
+         /dev/null  {taken}  btrfs defaults 0 0\n\
+         /dev/null  {data}  btrfs defaults,noatime 0 0\n\
          server:/export  {}  nfs defaults 0 0\n",
         at("noauto"),
         at("nfs"),
     );
-    let mounts = format!("rootfs / rootfs rw 0 0\n/dev/vdb2 {taken} vfat rw 0 0\n");
+    let mounts = format!("rootfs / rootfs rw 0 0\n/dev/vdb2 {taken} btrfs rw 0 0\n");
 
     // Only the line with a device, a place of its own, no `noauto`, and
     // nothing mounted there yet.
     let (out, err, code) = run(&fstab, &mounts);
     assert_eq!(
         out,
-        format!("mount -t vfat -o defaults,noatime /dev/null {data}\n"),
+        format!("mount -t btrfs -o defaults,noatime /dev/null {data}\n"),
         "stderr: {err}"
     );
     assert_eq!(code, Some(0), "stderr: {err}");
@@ -1293,17 +1303,39 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
         assert!(!dir.join(name).exists(), "{name} was not this script's");
     }
 
+    // A FAT volume is `eclipse-fat-mounts`'s, in every spelling the kernel
+    // reads as FAT, and this script's again on the boot that keeps FAT
+    // for the kernel.
+    for fstype in ["vfat", "msdos", "FAT32"] {
+        let with_fat = format!("/dev/null  {fat}  {fstype} defaults 0 0\n");
+        let (out, err, code) = run(&with_fat, &mounts);
+        assert_eq!((out.as_str(), code), ("", Some(0)), "{fstype}: {err}");
+        assert!(!dir.join("fat").exists(), "{fstype}");
+        let (out, err, code) = run_on(
+            "LOG=warn:udriver=virtio-blk@0:ufat=kernel\n",
+            &with_fat,
+            &mounts,
+        );
+        assert_eq!(
+            out,
+            format!("mount -t {fstype} -o defaults /dev/null {fat}\n"),
+            "stderr: {err}"
+        );
+        assert_eq!(code, Some(0));
+        fs::remove_dir(dir.join("fat")).unwrap();
+    }
+
     // A device that never comes: said, left, and the others still mounted.
     let late = format!(
-        "/dev/eclipse-no-such-disk1  {absent}  vfat defaults 0 0\n\
-         /dev/eclipse-no-such-disk2  {absent}2  vfat defaults 0 0\n{fstab}"
+        "/dev/eclipse-no-such-disk1  {absent}  btrfs defaults 0 0\n\
+         /dev/eclipse-no-such-disk2  {absent}2  btrfs defaults 0 0\n{fstab}"
     );
     let started = std::time::Instant::now();
     let (out, err, code) = run(&late, &mounts);
     let took = started.elapsed();
     assert_eq!(
         out,
-        format!("mount -t vfat -o defaults,noatime /dev/null {data}\n")
+        format!("mount -t btrfs -o defaults,noatime /dev/null {data}\n")
     );
     assert_eq!(code, Some(1));
     assert!(
@@ -1322,6 +1354,185 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
     let none = script
         .replace("fstab=/etc/fstab", &format!("fstab='{}'", at("no-fstab")))
         .replace("busybox mount -t", "echo mount -t");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(none)
+        .output()
+        .unwrap();
+    assert_eq!(
+        (out.stdout.len(), out.stderr.len(), out.status.code()),
+        (0, 0, Some(0))
+    );
+}
+
+/// What `eclipse-fat-mounts` makes of a fstab: the script itself, with
+/// the things it reaches for swapped for files of this test's and for
+/// commands that only say what they were asked. `/dev/null` stands for a
+/// disk that is there; `SERVER` is how the stand-in for `eclipse-fatfs`
+/// ends.
+#[test]
+fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
+    let rootfs = init_rootfs("fat-mounts");
+    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-fat-mounts")).unwrap();
+    for needle in [
+        "fstab=/etc/fstab",
+        "< /proc/mounts",
+        "< /proc/cmdline",
+        "< /proc/udrivers",
+        "/bin/eclipse-fatfs $ro",
+        "busybox mount -t",
+        "left=50",
+    ] {
+        assert_eq!(
+            script.matches(needle).count(),
+            1,
+            "{needle:?} is no longer in the script exactly once:\n{script}"
+        );
+    }
+    // Every boot: no `udriver =` to keep it out of the ordinary one.
+    let service =
+        fs::read_to_string(rootfs.join("etc/eclipse/services/fat-mounts.service")).unwrap();
+    assert_eq!(field(&service, "udriver"), None);
+    assert_eq!(field(&service, "type"), Some("oneshot"));
+
+    let dir = scratch("fat-mounts-run");
+    let run = |cmdline: &str, udrivers: &str, server: &str, fstab: &str, mounts: &str| {
+        let file = |name: &str, body: &str| {
+            let path = dir.join(name);
+            fs::write(&path, body).unwrap();
+            path.display().to_string()
+        };
+        let script = script
+            .replace(
+                "fstab=/etc/fstab",
+                &format!("fstab='{}'", file("fstab", fstab)),
+            )
+            .replace("< /proc/mounts", &format!("< '{}'", file("mounts", mounts)))
+            .replace(
+                "< /proc/cmdline",
+                &format!("< '{}'", file("cmdline", cmdline)),
+            )
+            .replace(
+                "< /proc/udrivers",
+                &format!("< '{}'", file("udrivers", udrivers)),
+            )
+            .replace("/bin/eclipse-fatfs $ro", "serve $ro")
+            .replace("busybox mount -t", "echo mount -t")
+            // A second, so that "did not wait" has room on a busy machine.
+            .replace("left=50", "left=10");
+        let script = format!("serve() {{ echo serve \"$@\"; {server}; }}\n{script}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+            out.status.code(),
+        )
+    };
+    let at = |name: &str| dir.join(name).display().to_string();
+    let (efi, old, read, taken) = (at("efi"), at("old"), at("read"), at("taken"));
+    let fstab = format!(
+        "# /etc/fstab\n\
+         __ECLIPSE_ROOT_DEV__  /          eclipsefs defaults 0 1\n\
+         __ECLIPSE_EFI_DEV___  /boot/efi  vfat defaults,noatime 0 0\n\
+         /dev/null  {efi}  vfat defaults,noatime 0 0\n\
+         /dev/null  {old}  MSDOS defaults 0 0\n\
+         /dev/null  {read}  vfat noatime,ro 0 0\n\
+         /dev/null  {taken}  vfat defaults 0 0\n\
+         /dev/null  {}  vfat defaults,noauto 0 0\n\
+         /dev/null  {}  btrfs defaults 0 0\n\
+         /dev/null  none  swap sw 0 0\n\
+         server:/export  {}  nfs defaults 0 0\n",
+        at("noauto"),
+        at("home"),
+        at("nfs"),
+    );
+    let mounts = format!("rootfs / rootfs rw 0 0\n/dev/vdb2 {taken} vfat rw 0 0\n");
+    let boot = "LOG=warn:ROOT=/dev/sda2\n";
+
+    // The FAT lines on a device, each with its server; `ro` is the
+    // server's `-r`. Nothing else is this script's.
+    let (out, err, code) = run(boot, "", "true", &fstab, &mounts);
+    assert_eq!(
+        out,
+        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n"),
+        "stderr: {err}"
+    );
+    assert_eq!((err.as_str(), code), ("", Some(0)));
+    for name in ["efi", "old", "read"] {
+        assert!(dir.join(name).is_dir(), "{name}: the mount point is made");
+    }
+    for name in ["taken", "noauto", "home", "nfs"] {
+        assert!(!dir.join(name).exists(), "{name} was not this script's");
+    }
+
+    // A server that does not make the mount: the kernel's FAT mounts the
+    // volume, with the line's own type and options, and it is said.
+    let (out, err, code) = run(boot, "", "false", &fstab, &mounts);
+    assert_eq!(
+        out,
+        format!(
+            "serve /dev/null {efi}\nmount -t vfat -o defaults,noatime /dev/null {efi}\n\
+             serve /dev/null {old}\nmount -t MSDOS -o defaults /dev/null {old}\n\
+             serve -r /dev/null {read}\nmount -t vfat -o noatime,ro /dev/null {read}\n"
+        ),
+        "stderr: {err}"
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        err.matches("the kernel's FAT mounts it").count(),
+        3,
+        "{err}"
+    );
+
+    // `ufat=kernel`: the kernel mounted them itself, and nothing is done.
+    for cmdline in ["LOG=warn:ufat=kernel:ROOT=/dev/sda2\n", "ufat=kernel\n"] {
+        let (out, err, code) = run(cmdline, "", "true", &fstab, &mounts);
+        assert_eq!((out.as_str(), err.as_str(), code), ("", "", Some(0)));
+    }
+    // Not that word: served.
+    for cmdline in ["LOG=warn:ufat=kernels\n", "LOG=warn:notufat=kernel\n"] {
+        let (out, _, _) = run(cmdline, "", "true", &fstab, &mounts);
+        assert_eq!(out.lines().count(), 3, "{cmdline:?}");
+    }
+
+    // A device that is not there is waited for only when a userspace
+    // driver has a disk to serve: the kernel's disks are there by now.
+    let late = format!(
+        "/dev/eclipse-no-such-disk1  {}  vfat defaults 0 0\n",
+        at("absent")
+    );
+    for (udrivers, waits) in [
+        ("virtio-net@0\n", false),
+        ("virtio-net@0\nvirtio-blk@0\n", true),
+    ] {
+        let started = std::time::Instant::now();
+        let (out, err, code) = run(boot, udrivers, "true", &late, &mounts);
+        let took = started.elapsed();
+        // Said, and no more than said: the script is not waited for, so
+        // it has no way to fail.
+        assert_eq!((out.as_str(), code), ("", Some(0)));
+        assert!(err.contains("/dev/eclipse-no-such-disk1"), "{err}");
+        assert!(!dir.join("absent").exists());
+        if waits {
+            assert!(
+                took >= std::time::Duration::from_millis(1000),
+                "the script did not wait for the served disk: {took:?}"
+            );
+        } else {
+            assert!(
+                took < std::time::Duration::from_millis(700),
+                "the script waited for a disk nothing will bring: {took:?}"
+            );
+        }
+    }
+
+    // An image with no fstab at all (riscv64's has none): nothing to do.
+    let none = script.replace("fstab=/etc/fstab", &format!("fstab='{}'", at("no-fstab")));
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(none)
@@ -1484,6 +1695,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "enet",
         "ublk",
         "ublk-mounts",
+        "fat-mounts",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
