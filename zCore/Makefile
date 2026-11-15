@@ -532,9 +532,12 @@ endif
 # that card for the kernel's own stack, as before; `unetcard=kernel` lends
 # it even with UNET's card there, which then is not left to userspace.
 #
-# `udriver=e1000e@0` in KOPTS leaves that e1000e to userspace instead: the
+# On x86_64 that e1000e is left to userspace instead, without a word: the
 # kernel does not bring it up, and the stack process claims it and is its
 # driver (`tools/eclipse-udrivers/src/e1000e.rs`), as with UNET's card.
+# `unetcard=kernel` in KOPTS is the boot where the kernel drives it and
+# lends it, as above; `udriver=e1000e@0` asks for the userspace driver on
+# the other architectures.
 #
 # UNET_NET=<backend>: what that card is plugged into, in place of the
 # user-mode network. A user-mode network answers for its own addresses and

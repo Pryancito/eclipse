@@ -203,6 +203,45 @@ static SEEN: [AtomicUsize; 3] = [
     AtomicUsize::new(0),
 ];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
+/// Whether the first e1000e is left to userspace without the boot naming
+/// it: see [`leave_first_e1000e`].
+static E1000E_UNASKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a boot whose `udriver=` value is `spec` leaves the first e1000e
+/// to userspace unasked, on a machine where that is done: it does unless
+/// the boot names a network card itself, which is then the one it means.
+pub fn e1000e_unasked(spec: Option<&str>) -> bool {
+    !parse_specs(spec.unwrap_or(""))
+        .iter()
+        .any(|(kind, _)| [VIRTIO_NET, E1000E].contains(kind))
+}
+
+/// Leave the first e1000e to userspace without a word, for the network
+/// stack that runs as a process to drive, as the first virtio network
+/// card is left: `spec` is the boot's `udriver=` value
+/// ([`e1000e_unasked`]). The kernel has a driver for this card, so whoever
+/// finds it can still keep it ([`keep_first_e1000e`]). Before the buses
+/// are probed.
+pub fn leave_first_e1000e(spec: Option<&str>) {
+    if e1000e_unasked(spec) {
+        info!(
+            "udriver: e1000e #0, if it is an 82574 and there is no virtio card, is for userspace"
+        );
+        E1000E_UNASKED.store(true, Ordering::Release);
+    }
+}
+
+/// Whether the first e1000e would be left to userspace unasked.
+pub fn first_e1000e_unasked() -> bool {
+    E1000E_UNASKED.load(Ordering::Acquire)
+}
+
+/// The kernel keeps the first e1000e after all, unless the boot named it:
+/// it is a part the userspace driver does not take, or the machine has a
+/// virtio card for the stack process.
+pub fn keep_first_e1000e() {
+    E1000E_UNASKED.store(false, Ordering::Release);
+}
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N` or
 /// `e1000e@N`.
@@ -301,7 +340,8 @@ pub fn reserve_if(
         return false;
     };
     let index = SEEN[slot].fetch_add(1, Ordering::AcqRel);
-    let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)));
+    let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
+        || (kind == E1000E && index == 0 && first_e1000e_unasked());
     if !wanted {
         return false;
     }
@@ -360,6 +400,16 @@ mod tests {
         assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
+    }
+
+    #[test]
+    fn the_first_e1000e_goes_unasked_unless_the_boot_names_a_card() {
+        assert!(e1000e_unasked(None));
+        assert!(e1000e_unasked(Some("")));
+        assert!(e1000e_unasked(Some("virtio-blk@1")));
+        assert!(!e1000e_unasked(Some("virtio-net@0")));
+        assert!(!e1000e_unasked(Some("virtio-blk@1,e1000e@1")));
+        assert!(!e1000e_unasked(Some("e1000e@0")));
     }
 
     #[test]

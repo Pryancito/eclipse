@@ -18,6 +18,15 @@ fn user_driver_takes(device_id: u16) -> bool {
     matches!(device_id, 0x10d3 | 0x10f6)
 }
 
+/// Whether the machine has a virtio network card on PCI: the card the
+/// stack process takes before any other.
+fn virtio_net_on_the_bus() -> bool {
+    use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+    // SAFETY: the configuration space the bus's own scan reads.
+    unsafe { pci::scan_bus(&PortOpsImpl, PCI_ACCESS) }
+        .any(|dev| dev.id.vendor_id == 0x1af4 && matches!(dev.id.device_id, 0x1000 | 0x1041))
+}
+
 /// Count this card among the e1000e's and answer whether the boot leaves
 /// it to userspace, in which case it is recorded and the caller must not
 /// touch it. Counted whether it can be handed over or not, so `@N` names
@@ -28,6 +37,14 @@ pub(super) fn left(
     irq: Option<usize>,
     bar0: usize,
 ) -> bool {
+    // Unasked, the card goes to userspace only if its driver there takes
+    // it and no virtio card is the stack process's already: otherwise the
+    // kernel drives it, as it always has, and says nothing of it.
+    if crate::user::first_e1000e_unasked()
+        && (!user_driver_takes(dev.id.device_id) || virtio_net_on_the_bus())
+    {
+        crate::user::keep_first_e1000e();
+    }
     crate::user::reserve_if(
         crate::user::E1000E,
         user_driver_takes(dev.id.device_id),

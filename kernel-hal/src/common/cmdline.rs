@@ -123,6 +123,16 @@ pub fn user_devices(cmdline: &str) -> (Option<&str>, bool) {
     (value(cmdline, "udriver"), net_by_default)
 }
 
+/// Whether a boot leaves the first e1000e to userspace without naming it,
+/// for the network stack that runs as a process to drive
+/// (`zcore_drivers::user::leave_first_e1000e`): when it would leave a
+/// virtio card ([`user_devices`]), and the card is not for the kernel's own
+/// stack (`unetstack=kernel`). `unetcard=kernel` is the boot where the
+/// kernel drives the card and lends it.
+pub fn user_e1000e(cmdline: &str) -> bool {
+    user_devices(cmdline).1 && value(cmdline, "unetstack") != Some("kernel")
+}
+
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
 /// on in one go — `nvidia.cuda` for every switch CUDA needs.
 ///
@@ -862,6 +872,17 @@ mod tests {
             (Some("virtio-net@0"), false)
         );
         assert!(user_devices("unetcard=virtio").1);
+    }
+
+    #[test]
+    fn the_first_e1000e_is_the_stack_process_s_unless_the_boot_keeps_it() {
+        assert!(user_e1000e("LOG=warn:ROOT=/dev/vda"));
+        assert!(user_e1000e("unetstack=10.0.2.15/24"));
+        // The kernel's own stack, no stack, the loan, or no gateway.
+        assert!(!user_e1000e("unetstack=kernel"));
+        assert!(!user_e1000e("unetstack=none"));
+        assert!(!user_e1000e("unetcard=kernel"));
+        assert!(!user_e1000e("zircon.gateway=0"));
     }
 
     #[test]
