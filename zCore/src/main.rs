@@ -763,7 +763,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
         let lent = boot::lends(
             word("unetstack"),
-            left_to_userspace.iter().any(|left| left == boot::CARD),
+            boot::has_card(&left_to_userspace),
             lendable,
         );
         boot::set_lent(lent);
@@ -798,7 +798,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     {
         use linux_object::net::user_stack::{self, boot};
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
-        let card = left_to_userspace.iter().any(|left| left == boot::CARD);
+        let card = boot::has_card(&left_to_userspace);
         let unetuse = word("unetuse");
         if let Some(other) = unetuse.filter(|said| !boot::understood(said)) {
             klog_warn!(
@@ -815,7 +815,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             klog_warn!(
                 "Eclipse: unetcard=kernel lends nothing on this boot: {}",
                 if card {
-                    "the stack process has the virtio card"
+                    "the stack process has a card of its own"
                 } else if !boot::has_stack(true, word("unetstack")) {
                     "it runs no stack process (unetstack=)"
                 } else if kernel_cards == 0 {

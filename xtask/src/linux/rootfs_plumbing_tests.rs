@@ -661,6 +661,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-gtk-caches",
             "",
         ),
+        ("enet", "respawn", "/usr/local/bin/eclipse-unet e1000e", ""),
         ("hunterd", "respawn", "/usr/local/bin/eclipse-hunterd", ""),
         ("knet", "respawn", "/usr/local/bin/eclipse-unet kernel", ""),
         (
@@ -691,7 +692,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "network",
             "respawn",
             "/usr/local/bin/eclipse-network-up",
-            "unet knet",
+            "unet knet enet",
         ),
         ("notify", "respawn", "/usr/local/bin/eclipse-notify", ""),
         ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "network"),
@@ -928,7 +929,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .collect();
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["knet", "ublk", "ublk-mounts", "unet"],
+        ["enet", "knet", "ublk", "ublk-mounts", "unet"],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
     for (name, body) in &gated {
@@ -999,7 +1000,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .find(|(n, _)| n == "network")
         .unwrap()
         .1;
-    assert_eq!(field(&network, "after"), Some("unet knet"));
+    assert_eq!(field(&network, "after"), Some("unet knet enet"));
 }
 
 /// What the disk's wrapper makes of a kernel command line: the number of
@@ -1183,6 +1184,29 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         "LOG=warn:unetcard=kernel:unetstack=none\n",
     ] {
         assert_eq!(run_as("kernel", cmdline), "waits\n", "{cmdline:?}");
+    }
+    // `eclipse-unet e1000e`, the `enet` service: the stack claims the
+    // e1000e the boot left to userspace and drives it; nothing drives it
+    // for the kernel's stack, so there the service only waits.
+    for (cmdline, stack) in [
+        ("LOG=warn:udriver=e1000e@0:ROOT=/dev/vda\n", "dhcp"),
+        (
+            "LOG=warn udriver=e1000e@0 unetstack=10.0.2.15/24,10.0.2.2\n",
+            "10.0.2.15/24,10.0.2.2",
+        ),
+        ("LOG=warn:udriver=e1000e@0:unetdriver=process\n", "dhcp"),
+    ] {
+        assert_eq!(
+            run_as("e1000e", cmdline),
+            format!("stack 0 {stack} card=e1000e\n"),
+            "{cmdline:?}"
+        );
+    }
+    for cmdline in [
+        "LOG=warn:udriver=e1000e@0:unetstack=kernel\n",
+        "LOG=warn:udriver=e1000e@0:unetstack=none\n",
+    ] {
+        assert_eq!(run_as("e1000e", cmdline), "waits\n", "{cmdline:?}");
     }
 }
 
@@ -1449,6 +1473,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         // needed.
         "unet",
         "knet",
+        "enet",
         "ublk",
         "ublk-mounts",
     ];

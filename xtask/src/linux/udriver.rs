@@ -38,6 +38,12 @@
 //! `knet` service is the one that starts, and the same wrapper runs the
 //! stack with `card=kernel`, which borrows the card instead of claiming a
 //! device.
+//!
+//! An Intel 82574 card (QEMU's `e1000e`) the boot leaves to userspace
+//! (`udriver=e1000e@0`) is the stack's too, and the stack is its driver:
+//! the `enet` service starts, and the wrapper runs the stack with
+//! `card=e1000e`. Nothing else drives it from userspace, so on a boot that
+//! keeps the kernel's stack (`unetstack=kernel`) the service only waits.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,6 +114,18 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           udriver = kernel-net@0\n",
     )
     .unwrap();
+    // The first e1000e, when the boot leaves it to userspace: the stack
+    // claims it and drives it itself.
+    fs::write(
+        svc_dir.join("enet.service"),
+        b"# The first e1000e network card, left to userspace by the boot\n\
+          # (udriver=e1000e@0): the network stack that runs as a process, which\n\
+          # is its driver too. See /usr/local/bin/eclipse-unet.\n\
+          exec = /usr/local/bin/eclipse-unet e1000e\n\
+          type = respawn\n\
+          udriver = e1000e@0\n",
+    )
+    .unwrap();
     fs::write(
         localbin.join("eclipse-unet"),
         b"#!/bin/sh\n\
@@ -120,7 +138,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # eclipse-unet kernel: the stack's card is the first one the kernel\n\
           # drives itself, which it lends when there is no virtio card.\n\
           # No driver runs here then: the kernel's is the card's.\n\
-          [ \"$1\" = kernel ] || [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          # eclipse-unet e1000e: the stack's card is the first e1000e, which\n\
+          # the boot left to userspace (udriver=e1000e@0); the stack drives it.\n\
+          [ \"$1\" = kernel ] || [ \"$1\" = e1000e ] || [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           # The card does not go to the kernel: the network stack that runs\n\
           # as a process takes it and is its driver too. See\n\
           # tools/eclipse-netstack. It asks a DHCP server for its address\n\
@@ -137,7 +157,8 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           [ -n \"$stack\" ] || stack=dhcp\n\
           # A card the kernel lends has no driver to run alone either, and a\n\
           # boot that keeps the kernel's stack does not lend it.\n\
-          if [ \"$stack\" = none ] || [ \"$1:$stack\" = kernel:kernel ]; then\n\
+          # Nor has an e1000e: only the stack drives one from userspace.\n\
+          if [ \"$stack\" = none ] || [ \"$1:$stack\" = kernel:kernel ] || [ \"$1:$stack\" = e1000e:kernel ]; then\n\
           \x20   while sleep 86400; do :; done\n\
           \x20   exit 0\n\
           fi\n\
@@ -149,6 +170,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           \x20   # connection, and every frame a change of process each way.\n\
           \x20   case $1:$(echo \"$words\" | sed -n 's/^unetdriver=//p' | head -n 1) in\n\
           \x20       kernel:*) set -- card=kernel ;;\n\
+          \x20       e1000e:*) set -- card=e1000e ;;\n\
           \x20       :process) set -- driver=process ;;\n\
           \x20       *) set -- ;;\n\
           \x20   esac\n\

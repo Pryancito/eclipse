@@ -10,8 +10,8 @@
 //! started the driver simply start it again.
 
 use super::{
-    CLAIM_WORDS, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
-    ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
+    CLAIM_WORDS, ECLIPSE_DEVICE_E1000E, ECLIPSE_DEVICE_VIRTIO_BLK, ECLIPSE_DEVICE_VIRTIO_NET,
+    ECLIPSE_TRANSPORT_PCI, ECLIPSE_TRANSPORT_VIRTIO_MMIO, ECLIPSE_TRANSPORT_VIRTIO_PCI,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::time::Duration;
@@ -74,7 +74,13 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
     }
     // virtio-mmio raises a level that stays up until the driver acks it in
     // the device; an MSI is a message, and there is nothing to hold down.
-    let level = device.transport == Transport::VirtioMmio;
+    // A PCI function's line is an MSI on x86_64 and its INTx elsewhere,
+    // which is a level too.
+    let level = match device.transport {
+        Transport::VirtioMmio => true,
+        Transport::VirtioPci { .. } => false,
+        Transport::Pci => !cfg!(target_arch = "x86_64"),
+    };
     let line = Box::new(ControllerLine { controller, irq });
     match Interrupt::new_line(line, level) {
         Ok(interrupt) => Some(interrupt),
@@ -179,6 +185,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let kind = match args[0] {
         ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
         ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
+        ECLIPSE_DEVICE_E1000E => user::E1000E,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
@@ -227,6 +234,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 notify_multiplier as u64,
             ],
         ),
+        Transport::Pci => (ECLIPSE_TRANSPORT_PCI, [0; 3]),
     };
     let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
     let words: [u64; CLAIM_WORDS] = [
