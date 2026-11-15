@@ -210,8 +210,24 @@ impl Link {
     /// says. Its `errno` is the error; a server that is gone, or does not
     /// answer, is the device failing.
     pub fn call(&self, op: u32, path: &str, a: u64, b: u32) -> Result<Answer<'_>, FsError> {
+        self.call_with(op, path.as_bytes(), a, b, &[])
+    }
+
+    /// [`call`](Self::call) with the names as they go in the slot (one
+    /// path, or two with a NUL between) and `data` in its data area.
+    pub fn call_with(
+        &self,
+        op: u32,
+        path: &[u8],
+        a: u64,
+        b: u32,
+        data: &[u8],
+    ) -> Result<Answer<'_>, FsError> {
         if path.len() > NAME_AREA {
             return Err(FsError::NameTooLong);
+        }
+        if data.len() > DATA_AREA {
+            return Err(FsError::InvalidParam);
         }
         if self.is_dead() {
             return Err(FsError::DeviceError);
@@ -224,7 +240,10 @@ impl Link {
         let give_back = |link: &Link| {
             link.free.fetch_or(1 << slot, Ordering::AcqRel);
         };
-        if !path.is_empty() && self.window.write(slot * SLOT_LEN, path.as_bytes()).is_err() {
+        let at = slot * SLOT_LEN;
+        let put =
+            |at: usize, bytes: &[u8]| bytes.is_empty() || self.window.write(at, bytes).is_ok();
+        if !put(at, path) || !put(at + NAME_AREA, data) {
             give_back(self);
             return Err(FsError::DeviceError);
         }

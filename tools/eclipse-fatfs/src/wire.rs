@@ -42,6 +42,25 @@ pub const OP_READ: u32 = 2;
 /// The filesystem's numbers.
 pub const OP_STATFS: u32 = 3;
 
+/// The `b` bytes of the data area into the file at the path, from byte `a`.
+pub const OP_WRITE: u32 = 4;
+/// Make the file at the path, or with [`CREATE_DIR`] in `a` the directory.
+pub const OP_CREATE: u32 = 5;
+/// Remove the file at the path, or the empty directory.
+pub const OP_REMOVE: u32 = 6;
+/// Two paths, a NUL between them: the first becomes the second.
+pub const OP_RENAME: u32 = 7;
+/// Make the file at the path `a` bytes long.
+pub const OP_TRUNCATE: u32 = 8;
+/// What was written reaches the device, the volume left as an unmount
+/// leaves it.
+pub const OP_SYNC: u32 = 9;
+/// The file at the path was last written at `a`, seconds as an `i64`.
+pub const OP_SETTIME: u32 = 10;
+
+/// [`OP_CREATE`]'s `a` for a directory: `S_IFDIR`.
+pub const CREATE_DIR: u64 = 0o040000;
+
 /// [`OP_LIST`]'s `a` in the reply that holds the directory's last entries.
 pub const LIST_END: u64 = u64::MAX;
 /// The bytes of an [`OP_STATFS`] reply: five u64.
@@ -57,6 +76,8 @@ pub const MODE_FILE: u32 = 0o100644;
 /// `eclipse_fs_serve` flag: names match whatever the case of their ASCII
 /// letters.
 pub const SERVE_FOLD_CASE: usize = 1;
+/// `eclipse_fs_serve` flag: the mount is read-only.
+pub const SERVE_READ_ONLY: usize = 2;
 
 /// One entry of a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]

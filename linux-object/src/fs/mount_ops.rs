@@ -288,7 +288,7 @@ pub fn mount_fs(
 }
 
 /// Mount at `target` a filesystem that a process serves
-/// ([`served`](super::served)), read-only, and return where it was mounted.
+/// ([`served`](super::served)) and return where it was mounted.
 /// `source` and `fstype` are what its line of the mount table says.
 ///
 /// The process is inside the call that brings it here, so nothing on the
@@ -298,10 +298,11 @@ pub(crate) fn mount_served(
     source: &str,
     fstype: &str,
     fs: Arc<dyn FileSystem>,
+    read_only: bool,
 ) -> LxResult<String> {
     let target_norm = normalize_target(target);
     let mount_node = resolve_mnode(&target_norm)?;
-    let flags = mount_state::MS_RDONLY;
+    let flags = if read_only { mount_state::MS_RDONLY } else { 0 };
     let (fs, state) = prepare_fs(fs, flags, "");
     mount_node.mount(fs).map_err(LxError::from)?;
     // `served` is the word that tells this mount's line from one of the

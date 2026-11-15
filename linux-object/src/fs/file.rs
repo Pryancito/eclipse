@@ -687,6 +687,7 @@ fn served_read(
             // The whole window, or what the file has of it: whole pages,
             // zeros past the end of the file.
             let pages = window / PAGE_SIZE..(window + DATA_AREA).min(size).div_ceil(PAGE_SIZE);
+            let token = super::served::read_token(&**inode);
             fetched.clear();
             fetched.resize(pages.len() * PAGE_SIZE, 0);
             let want = fetched.len().min(size - window);
@@ -700,7 +701,12 @@ fn served_read(
                     Err(e) => return Some(Err(e.into())),
                 }
             }
-            vmo.supply(pages.start, &fetched);
+            // Not kept when a write went by meanwhile: what was fetched
+            // may be from before it. The read below then takes those pages
+            // through the cache's own fill.
+            if let Some(token) = token {
+                super::served::if_unchanged(&**inode, token, || vmo.supply(pages.start, &fetched));
+            }
         }
         window += DATA_AREA;
     }
@@ -879,6 +885,19 @@ pub fn cache_truncate(inode: &Arc<dyn INode>, new_len: usize) {
         let zeros = [0u8; PAGE_SIZE];
         let _ = vmo.write(new_len, &zeros[..tail]);
     }
+}
+
+/// The file is removed, on a filesystem where its number is no other
+/// file's afterwards: its page cache goes, and its place in the registry
+/// with it. A cache that stayed would be memory nothing reads, and one more
+/// entry for every `mmap` to walk past (`take_prunable`), for each file
+/// ever removed. Whoever still maps the cache keeps it, on their own.
+pub(crate) fn cache_forget(inode: &Arc<dyn INode>) {
+    let key = cache_key(inode);
+    let forgotten = SHARED_FILE_VMOS.lock().remove(&key);
+    // Dropped here, with the lock down: its frames go back through the
+    // heap.
+    drop(forgotten);
 }
 
 /// Entries the registry no longer needs, REMOVED from it but still alive.
@@ -1387,6 +1406,13 @@ impl File {
             return Err(LxError::EBADF);
         }
         let offset = inner.offset as usize;
+        // A served directory is read by places, which stay where they are
+        // while its entries are removed.
+        if let Some(entry) = super::served::entry_at(&*inner.inode, offset) {
+            let (meta, name, next) = entry?;
+            inner.offset = next as u64;
+            return Ok((meta, name));
+        }
         match inner.inode.get_entry_with_metadata(offset) {
             Ok(entry) => {
                 inner.offset += 1;
