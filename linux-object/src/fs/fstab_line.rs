@@ -86,6 +86,30 @@ pub(super) fn fstab_line_action<'a>(
     }
 }
 
+/// The service of the root filesystem that mounts the FAT lines this pass
+/// leaves, from the root: `eclipse-fat-mounts`, which starts a server
+/// process (`eclipse-fatfs`) for each.
+pub(super) const FAT_MOUNTS_SERVICE: &str = "etc/eclipse/services/fat-mounts.service";
+
+/// Whether a block line is left to the FAT server: a FAT volume on a
+/// device, on a boot that does not say `ufat=kernel`, in a root filesystem
+/// that has the service which mounts it.
+///
+/// `parsed` is the type as [`mount_ops::parse_fstype`] spells it, so every
+/// spelling of FAT is left or none is. The service is asked for because a
+/// root filesystem older than this kernel has nothing that would mount the
+/// line: there the kernel's own FAT keeps it, as it does with the word.
+/// A source that is not a device is a placeholder the kernel resolves
+/// itself (`__ECLIPSE_EFI_DEV___`), and stays with it too.
+pub(super) fn left_to_fat_server(
+    source: &str,
+    parsed: &str,
+    ufat: Option<&str>,
+    has_service: bool,
+) -> bool {
+    parsed == "vfat" && source.starts_with("/dev/") && has_service && ufat != Some("kernel")
+}
+
 /// The deadline every network line of this fstab run shares, built on the
 /// first line that needs one.
 ///

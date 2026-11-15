@@ -2374,7 +2374,10 @@ pub async fn mount_fstab_deferred() {
     }
 }
 
-use fstab_line::{fstab_flags, fstab_line_action, mount_fstab_network, run_budget, FstabAction};
+use fstab_line::{
+    fstab_flags, fstab_line_action, left_to_fat_server, mount_fstab_network, run_budget,
+    FstabAction, FAT_MOUNTS_SERVICE,
+};
 
 async fn mount_fstab(root: &Arc<MNode>) {
     info!("mount_fstab: parsing /etc/fstab");
@@ -2382,6 +2385,12 @@ async fn mount_fstab(root: &Arc<MNode>) {
     // network line spends none of it and the clock starts when the first
     // server is actually dialled.
     let mut net_budget: Option<Budget> = None;
+    // The FAT lines are a server process's, started by a service of this
+    // root filesystem, unless the boot keeps them for the kernel's FAT.
+    let cmdline = kernel_hal::boot::cmdline();
+    let ufat = kernel_hal::cmdline::value(&cmdline, "ufat");
+    let root_dyn: Arc<dyn INode> = root.clone();
+    let has_fat_service = root_dyn.lookup_follow(FAT_MOUNTS_SERVICE, 4).is_ok();
     if let Ok(etc) = root.find(true, "etc") {
         if let Ok(fstab_inode) = etc.find(true, "fstab") {
             let fstab_dyn: Arc<dyn INode> = fstab_inode;
@@ -2427,6 +2436,10 @@ async fn mount_fstab(root: &Arc<MNode>) {
                             }
                             FstabAction::Block(fstype_parsed) => fstype_parsed,
                         };
+                        if left_to_fat_server(source, fstype_parsed, ufat, has_fat_service) {
+                            info!("mount_fstab: {:?} is left to the FAT server", target);
+                            continue;
+                        }
 
                         // Resolve the source inode using coerced root_dyn
                         let source_rel = source.trim_start_matches('/');
