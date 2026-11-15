@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fatfs::{FsOptions, LossyOemCpConverter, StdIoWrapper};
 
-use crate::disk::{Blocks, Disk};
+use crate::disk::{Blocks, Disk, Kept};
 use crate::wire::{self, Entry, STATFS_LEN};
 
 /// The files remembered.
@@ -195,6 +195,10 @@ fn runs_of(clusters: impl Iterator<Item = (u64, u64)>) -> (Vec<Run>, u64) {
     (runs, size)
 }
 
+/// [`Disk::word`]: it was set, and the volume was clean when it was.
+const NOTED: u64 = 1;
+const WAS_CLEAN: u64 = 2;
+
 /// The file being made longer, open at `pos`.
 struct Appending<B: Blocks + 'static> {
     path: String,
@@ -218,6 +222,12 @@ pub struct Volume<B: Blocks + 'static> {
     listed: Option<(String, Vec<Entry>)>,
     /// Something was written since the volume was last left clean.
     changed: bool,
+    /// This server took the volume over from one that died, and the
+    /// volume was clean before the first of them mounted it: the mark that
+    /// it is not, which the dead server made, is this one's to take off.
+    /// The FAT code leaves a mark it finds, as it must when it cannot know
+    /// whose it is.
+    marks_clean: bool,
     /// How many times a file was opened by path.
     pub opens: u64,
 }
@@ -234,8 +244,28 @@ impl<B: Blocks + 'static> Volume<B> {
     /// The FAT volume on `blocks`, which holds `len` bytes: an error when
     /// it is not one.
     pub fn open(blocks: B, len: u64) -> Result<Self, String> {
-        let disk = Rc::new(RefCell::new(Disk::new(blocks, len)));
+        Self::open_over(blocks, len, Kept::private())
+    }
+
+    /// [`open`](Self::open) with what is written and has not reached the
+    /// device kept in `kept`: new memory, or what the server before this
+    /// one left, which is then part of the volume as much as the device is.
+    pub fn open_over(blocks: B, len: u64, kept: Kept) -> Result<Self, String> {
+        let disk = Disk::over(blocks, len, kept).ok_or("what was kept is another device's")?;
+        let disk = Rc::new(RefCell::new(disk));
         let fs = Self::mount(&disk).map_err(|e| format!("{e:?}"))?;
+        // Whether the volume was clean when the first server mounted it
+        // is kept with the chunks, for the servers after it.
+        let adopted = disk.borrow().adopted();
+        if !adopted {
+            let clean = !fs
+                .read_status_flags()
+                .map_err(|e| format!("{e:?}"))?
+                .dirty();
+            let word = NOTED | if clean { WAS_CLEAN } else { 0 };
+            disk.borrow_mut().set_word(word);
+        }
+        let marks_clean = adopted && disk.borrow_mut().word() & WAS_CLEAN != 0;
         Ok(Volume {
             appending: None,
             fs: Some(Box::new(fs)),
@@ -243,6 +273,7 @@ impl<B: Blocks + 'static> Volume<B> {
             open: Vec::new(),
             listed: None,
             changed: false,
+            marks_clean,
             opens: 0,
         })
     }
@@ -658,12 +689,31 @@ impl<B: Blocks + 'static> Volume<B> {
         let mut left_clean = Ok(());
         if std::mem::take(&mut self.changed) {
             if let Some(fs) = self.fs.take() {
+                let fat32 = fs.fat_type() == fatfs::FatType::Fat32;
                 left_clean = fs.unmount().map_err(errno);
+                if self.marks_clean && left_clean.is_ok() {
+                    left_clean = self.mark_clean(fat32);
+                }
             }
             self.fs = Some(Box::new(Self::mount(&self.disk).map_err(errno)?));
         }
         self.flush()?;
         left_clean
+    }
+
+    /// Take the mark that the volume was not unmounted off its boot
+    /// sector: the low bit of a byte whose place depends on the kind of
+    /// FAT.
+    fn mark_clean(&mut self, fat32: bool) -> Result<(), Errno> {
+        let at = if fat32 { 0x41 } else { 0x25 };
+        let mut disk = self.disk.borrow_mut();
+        let mut flags = [0u8; 1];
+        disk.read_exact_at(at, &mut flags).map_err(|_| libc::EIO)?;
+        if flags[0] & 1 != 0 {
+            flags[0] &= !1;
+            disk.write_all_at(at, &flags).map_err(|_| libc::EIO)?;
+        }
+        Ok(())
     }
 
     /// The mount is over: [`sync`](Self::sync), with the count of free
@@ -1223,5 +1273,63 @@ mod tests {
     fn what_is_not_a_fat_volume_is_not_opened() {
         let image = vec![0x55u8; 1 << 20];
         assert!(Volume::open(image, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn the_next_server_goes_on_from_what_the_dead_one_was_told() {
+        let mut memory = vec![0u128; Kept::LEN / 16];
+        let base = memory.as_mut_ptr().cast::<u8>();
+        let (image, len) = {
+            let vol = volume();
+            let image = vol.disk.borrow().blocks().clone();
+            (image.clone(), image.len() as u64)
+        };
+        // SAFETY: the test's own memory, one volume over it at a time.
+        let mut vol = Volume::open_over(image, len, unsafe { Kept::at(base) }).unwrap();
+        let big = big();
+        vol.create("docs/new.bin", false).unwrap();
+        assert_eq!(vol.write("docs/new.bin", 0, &big[..40_000]), Ok(40_000));
+        assert_eq!(vol.write("hello.txt", 7, b"there\n"), Ok(6));
+        vol.rename("docs/deep/big.bin", "moved.bin").unwrap();
+        vol.remove("many/file-number-0007.dat").unwrap();
+        // The server dies as it is, with none of that on the device.
+        let device = vol.disk.borrow().blocks().clone();
+        core::mem::forget(vol);
+        assert!(Volume::open(device.clone(), len)
+            .unwrap()
+            .entries("docs")
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "new.bin"));
+
+        // SAFETY: as above; the first is gone.
+        let mut next = Volume::open_over(device, len, unsafe { Kept::at(base) }).unwrap();
+        let mut out = vec![0u8; 65_536];
+        assert_eq!(next.read("docs/new.bin", 0, &mut out), Ok(40_000));
+        assert_eq!(out[..40_000], big[..40_000]);
+        assert_eq!(next.read("hello.txt", 0, &mut out), Ok(13));
+        assert_eq!(&out[..13], b"hello, there\n");
+        assert_eq!(next.read("moved.bin", 0, &mut out[..100]), Ok(100));
+        assert!(next.entries("docs/deep").unwrap().is_empty());
+        assert_eq!(next.entries("many").unwrap().len(), 299);
+        // And goes on: what the kernel asks twice is done once.
+        assert_eq!(
+            next.write("docs/new.bin", 40_000, &big[40_000..50_000]),
+            Ok(10_000)
+        );
+        assert_eq!(
+            next.write("docs/new.bin", 40_000, &big[40_000..50_000]),
+            Ok(10_000)
+        );
+        let disk = next.disk.clone();
+        next.close().unwrap();
+        // The device alone has all of it now, and the volume is whole.
+        let device = disk.borrow().blocks().clone();
+        let mut alone = Volume::open(device, len).unwrap();
+        assert!(!alone.fs().unwrap().read_status_flags().unwrap().dirty());
+        assert_eq!(alone.read("docs/new.bin", 0, &mut out), Ok(50_000));
+        assert_eq!(out[..50_000], big[..50_000]);
+        let mut numbers = [0u8; 40];
+        alone.statfs(&mut numbers).unwrap();
     }
 }

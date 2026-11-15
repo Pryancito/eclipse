@@ -78,6 +78,9 @@ pub const MODE_FILE: u32 = 0o100644;
 pub const SERVE_FOLD_CASE: usize = 1;
 /// `eclipse_fs_serve` flag: the mount is read-only.
 pub const SERVE_READ_ONLY: usize = 2;
+/// `eclipse_fs_serve` flag: take over a mount whose server is gone, and
+/// make none.
+pub const SERVE_TAKE_OVER: usize = 4;
 
 /// One entry of a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]

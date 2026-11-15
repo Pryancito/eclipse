@@ -10,18 +10,28 @@
 //! One request is in flight on each slot of the window. Whoever waits reads
 //! the replies, all of them, and marks each slot answered; a reply's slot is
 //! in its `reqid`.
+//!
+//! A link is one server's. When the server dies the link is dead, and says
+//! since when: the mount waits that long for the next server's link
+//! (`ServedFs::ask`).
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use kernel_hal::thread::SyncWait;
 use rcore_fs::vfs::FsError;
 use zircon_object::ipc::Fifo;
+use zircon_object::object::{KernelObject, Signal};
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
 
 use super::wire::{self, DATA_AREA, MSG, NAME_AREA, SLOTS, SLOT_LEN};
 
 const SLOT_BITS: u32 = SLOTS.trailing_zeros();
+
+/// Raised on the kernel's end of the FIFO when the link is closed: the
+/// link's own end is dropped then, and the server sees its end closed once
+/// every other holder has dropped theirs.
+pub const LEFT: Signal = Signal::USER_SIGNAL_0;
 
 const PENDING: u8 = 0;
 const ANSWERED: u8 = 1;
@@ -47,13 +57,15 @@ pub(super) struct Link {
     /// The server closed its end, or the mount is gone: nothing will be
     /// answered again.
     dead: AtomicBool,
+    /// When that was seen, in milliseconds; 0 while it has not been.
+    died_at: AtomicU64,
     next_id: AtomicU32,
 }
 
 /// A request that was answered, and its slot of the window until this is
 /// dropped: what the server put there is read through it.
-pub(super) struct Answer<'a> {
-    link: &'a Link,
+pub(super) struct Answer {
+    link: Arc<Link>,
     slot: usize,
     /// The reply's count: never negative.
     pub count: usize,
@@ -62,7 +74,7 @@ pub(super) struct Answer<'a> {
     pub len: usize,
 }
 
-impl Answer<'_> {
+impl Answer {
     /// `buf.len()` bytes of the data area, from `offset`: only what the
     /// server said it filled.
     pub fn data(&self, offset: usize, buf: &mut [u8]) -> Result<(), FsError> {
@@ -79,20 +91,39 @@ impl Answer<'_> {
     }
 }
 
-impl Drop for Answer<'_> {
+impl Drop for Answer {
     fn drop(&mut self) {
         self.link.free.fetch_or(1 << self.slot, Ordering::AcqRel);
     }
 }
 
-fn now_ms() -> u64 {
+/// Why a request has no answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Fail {
+    /// The server's answer: its `errno`, or a request that could not be
+    /// made at all.
+    Said(FsError),
+    /// The server is gone, and nothing says whether it did what was asked.
+    Gone,
+}
+
+impl From<Fail> for FsError {
+    fn from(fail: Fail) -> Self {
+        match fail {
+            Fail::Said(e) => e,
+            Fail::Gone => FsError::DeviceError,
+        }
+    }
+}
+
+pub(super) fn now_ms() -> u64 {
     kernel_hal::timer::timer_now().as_millis() as u64
 }
 
 /// What a request does while it waits: let the CPU go, and let it take
 /// interrupts. Kernel tasks run with interrupts masked, and the interrupt
 /// that wakes the server -- its disk's -- needs somewhere to land.
-fn between_looks(wait: &mut SyncWait) {
+pub(super) fn between_looks(wait: &mut SyncWait) {
     use kernel_hal::interrupt::{intr_get, intr_off, intr_on};
     if !intr_get() {
         intr_on();
@@ -121,6 +152,7 @@ impl Link {
             ret_a: [const { AtomicU64::new(0) }; SLOTS],
             ret_b: [const { AtomicU32::new(0) }; SLOTS],
             dead: AtomicBool::new(false),
+            died_at: AtomicU64::new(0),
             next_id: AtomicU32::new(0),
         })
     }
@@ -129,12 +161,37 @@ impl Link {
         self.dead.load(Ordering::Acquire)
     }
 
-    /// The mount is gone: nothing is asked on this link again, and the
-    /// server sees its FIFO closed.
+    /// When the server was seen to be gone.
+    pub fn died_at(&self) -> u64 {
+        self.died_at.load(Ordering::Acquire)
+    }
+
+    /// The server is gone. Whether this is the first to say so.
+    fn die(&self) -> bool {
+        let first = !self.dead.swap(true, Ordering::AcqRel);
+        if first {
+            self.died_at.store(now_ms().max(1), Ordering::Release);
+        }
+        first
+    }
+
+    /// Whether the server is gone, after a look at its end of the FIFO.
+    pub fn looked_dead(&self) -> bool {
+        self.pump();
+        self.is_dead()
+    }
+
+    /// The mount is gone, or the server: nothing is asked on this link
+    /// again, and a server sees its FIFO closed.
     pub fn close(&self) {
-        self.dead.store(true, Ordering::Release);
+        self.die();
         let fifo = self.fifo.lock().take();
-        drop(fifo);
+        if let Some(fifo) = fifo {
+            // Whoever waits on it to learn of the server's going
+            // (`loader::linux::fs_serve`) lets go of it too.
+            let object: Arc<dyn KernelObject> = fifo;
+            object.signal_set(LEFT);
+        }
     }
 
     /// Read whatever replies have come back and mark their slots. Returns
@@ -148,7 +205,7 @@ impl Link {
             Ok(n) => n,
             Err(ZxError::SHOULD_WAIT) => return 0,
             Err(e) => {
-                if !self.dead.swap(true, Ordering::AcqRel) {
+                if self.die() {
                     warn!("served fs: the server is gone ({e:?})");
                 }
                 return 0;
@@ -206,34 +263,32 @@ impl Link {
         }
     }
 
-    /// Ask the server `op` of `path` with `a` and `b`, and wait for what it
-    /// says. Its `errno` is the error; a server that is gone, or does not
-    /// answer, is the device failing.
-    pub fn call(&self, op: u32, path: &str, a: u64, b: u32) -> Result<Answer<'_>, FsError> {
-        self.call_with(op, path.as_bytes(), a, b, &[])
-    }
-
-    /// [`call`](Self::call) with the names as they go in the slot (one
-    /// path, or two with a NUL between) and `data` in its data area.
+    /// Ask the server `op`, with the names as they go in the slot (one
+    /// path, or two with a NUL between), `a`, `b` and `data` in its data
+    /// area, and wait for what it says. Its `errno` is the error, and so is
+    /// a server that does not answer; one that is gone is [`Fail::Gone`].
     pub fn call_with(
-        &self,
+        self: &Arc<Self>,
         op: u32,
         path: &[u8],
         a: u64,
         b: u32,
         data: &[u8],
-    ) -> Result<Answer<'_>, FsError> {
+    ) -> Result<Answer, Fail> {
+        let failed = Fail::Said(FsError::DeviceError);
         if path.len() > NAME_AREA {
-            return Err(FsError::NameTooLong);
+            return Err(Fail::Said(FsError::NameTooLong));
         }
         if data.len() > DATA_AREA {
-            return Err(FsError::InvalidParam);
+            return Err(Fail::Said(FsError::InvalidParam));
         }
         if self.is_dead() {
-            return Err(FsError::DeviceError);
+            return Err(Fail::Gone);
         }
         let deadline = now_ms() + REPLY_TIMEOUT_MS;
-        let slot = self.claim(deadline).ok_or(FsError::DeviceError)?;
+        let Some(slot) = self.claim(deadline) else {
+            return Err(if self.is_dead() { Fail::Gone } else { failed });
+        };
         let id = (self.next_id.fetch_add(1, Ordering::Relaxed) << SLOT_BITS) | slot as u32;
         self.expect[slot].store(id, Ordering::Release);
         self.state[slot].store(PENDING, Ordering::Release);
@@ -245,12 +300,12 @@ impl Link {
             |at: usize, bytes: &[u8]| bytes.is_empty() || self.window.write(at, bytes).is_ok();
         if !put(at, path) || !put(at + NAME_AREA, data) {
             give_back(self);
-            return Err(FsError::DeviceError);
+            return Err(failed);
         }
         let msg = wire::encode(op, id, a, b, path.len() as u32);
         let Some(fifo) = self.fifo.lock().clone() else {
             give_back(self);
-            return Err(FsError::DeviceError);
+            return Err(Fail::Gone);
         };
         let mut away = SyncWait::new();
         // The FIFO holds a message for every slot, so there is room unless
@@ -260,11 +315,12 @@ impl Link {
                 Ok(_) => break,
                 Err(ZxError::SHOULD_WAIT) if now_ms() <= deadline => between_looks(&mut away),
                 Err(e) => {
-                    if e != ZxError::SHOULD_WAIT {
-                        self.dead.store(true, Ordering::Release);
-                    }
                     give_back(self);
-                    return Err(FsError::DeviceError);
+                    if e == ZxError::SHOULD_WAIT {
+                        return Err(failed);
+                    }
+                    self.die();
+                    return Err(Fail::Gone);
                 }
             }
         }
@@ -279,21 +335,21 @@ impl Link {
             // A slot still waiting stays taken for good: the server may yet
             // write into it.
             if self.is_dead() {
-                return Err(FsError::DeviceError);
+                return Err(Fail::Gone);
             }
             if now_ms() > deadline {
                 warn!("served fs: a request was not answered in time");
-                return Err(FsError::DeviceError);
+                return Err(failed);
             }
             between_looks(&mut away);
         }
         let status = self.status[slot].load(Ordering::Relaxed);
         if status < 0 {
             give_back(self);
-            return Err(wire::error_of(status));
+            return Err(Fail::Said(wire::error_of(status)));
         }
         Ok(Answer {
-            link: self,
+            link: self.clone(),
             slot,
             count: status as usize,
             a: self.ret_a[slot].load(Ordering::Relaxed),

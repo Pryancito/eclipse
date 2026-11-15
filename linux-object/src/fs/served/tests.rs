@@ -152,79 +152,140 @@ fn serve(
     }
 }
 
+/// How a fake server ends: on the first request `op` it gets, after doing
+/// it or before, it goes without answering.
+#[derive(Clone, Copy)]
+struct DiesOn {
+    op: u32,
+    done_first: bool,
+}
+
+/// A fake server of `tree` as a thread, and the kernel's link to it.
+fn server(
+    tree: &Arc<std::sync::Mutex<Tree>>,
+    asked: &Arc<[AtomicUsize; 16]>,
+    dies_on: Option<DiesOn>,
+) -> (Arc<Link>, thread::JoinHandle<ZxError>) {
+    let (ours, servers) = Fifo::create(SLOTS, MSG);
+    let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+    let link = Arc::new(Link::new(ours, window.clone()).unwrap());
+    let (t, n) = (tree.clone(), asked.clone());
+    let server = thread::spawn(move || loop {
+        let mut m = [0u8; MSG];
+        match servers.read(MSG, &mut m, 1) {
+            Ok(_) => {}
+            Err(ZxError::SHOULD_WAIT) => {
+                thread::yield_now();
+                continue;
+            }
+            // The kernel's end is gone: the mount is.
+            Err(e) => return e,
+        }
+        let op = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
+        let request = wire::decode(&m);
+        let names = u32::from_ne_bytes([m[20], m[21], m[22], m[23]]) as usize;
+        let slot = (request.reqid as usize & (SLOTS - 1)) * SLOT_LEN;
+        let mut path = vec![0u8; names];
+        window.read(slot, &mut path).unwrap();
+        let path = core::str::from_utf8(&path).unwrap();
+        let mut sent = vec![
+            0u8;
+            if op == OP_WRITE {
+                request.b as usize
+            } else {
+                0
+            }
+        ];
+        window.read(slot + NAME_AREA, &mut sent).unwrap();
+        let dies = dies_on.filter(|d| d.op == op);
+        if dies.is_some_and(|d| !d.done_first) {
+            return ZxError::CANCELED;
+        }
+        n[op as usize].fetch_add(1, Ordering::Relaxed);
+        let (status, a, data) = serve(
+            &mut t.lock().unwrap(),
+            op,
+            path,
+            request.a,
+            request.b as usize,
+            &sent,
+        );
+        if dies.is_some() {
+            return ZxError::CANCELED;
+        }
+        window.write(slot + NAME_AREA, &data).unwrap();
+        m[8..16].copy_from_slice(&a.to_ne_bytes());
+        m[16..20].copy_from_slice(&(data.len() as u32).to_ne_bytes());
+        m[24..32].copy_from_slice(&status.to_ne_bytes());
+        servers.write(MSG, &m, 1).unwrap();
+    });
+    (link, server)
+}
+
 /// A mount of the fake server's tree, and how many requests of each kind it
 /// has answered.
 struct Mount {
     fs: Arc<ServedFs>,
-    link: Arc<Link>,
     tree: Arc<std::sync::Mutex<Tree>>,
     asked: Arc<[AtomicUsize; 16]>,
-    server: Option<thread::JoinHandle<ZxError>>,
+    servers: Vec<thread::JoinHandle<ZxError>>,
 }
 
 impl Mount {
     fn new() -> Self {
-        Self::with(false)
+        Self::with(false, None)
     }
 
-    fn with(read_only: bool) -> Self {
-        let (ours, servers) = Fifo::create(SLOTS, MSG);
-        let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
-        let link = Arc::new(Link::new(ours, window.clone()).unwrap());
-        let fs = ServedFs::new(link.clone(), true, read_only);
-        fs.mounted.store(true, Ordering::Release);
+    fn with(read_only: bool, dies_on: Option<DiesOn>) -> Self {
         let tree = Arc::new(std::sync::Mutex::new(tree()));
         let asked = Arc::new([const { AtomicUsize::new(0) }; 16]);
-        let (t, n) = (tree.clone(), asked.clone());
-        let server = thread::spawn(move || loop {
-            let mut m = [0u8; MSG];
-            match servers.read(MSG, &mut m, 1) {
-                Ok(_) => {}
-                Err(ZxError::SHOULD_WAIT) => {
-                    thread::yield_now();
-                    continue;
-                }
-                // The kernel's end is gone: the mount is.
-                Err(e) => return e,
-            }
-            let op = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
-            let request = wire::decode(&m);
-            let names = u32::from_ne_bytes([m[20], m[21], m[22], m[23]]) as usize;
-            let slot = (request.reqid as usize & (SLOTS - 1)) * SLOT_LEN;
-            let mut path = vec![0u8; names];
-            window.read(slot, &mut path).unwrap();
-            let path = core::str::from_utf8(&path).unwrap();
-            let mut sent = vec![
-                0u8;
-                if op == OP_WRITE {
-                    request.b as usize
-                } else {
-                    0
-                }
-            ];
-            window.read(slot + NAME_AREA, &mut sent).unwrap();
-            n[op as usize].fetch_add(1, Ordering::Relaxed);
-            let (status, a, data) = serve(
-                &mut t.lock().unwrap(),
-                op,
-                path,
-                request.a,
-                request.b as usize,
-                &sent,
-            );
-            window.write(slot + NAME_AREA, &data).unwrap();
-            m[8..16].copy_from_slice(&a.to_ne_bytes());
-            m[16..20].copy_from_slice(&(data.len() as u32).to_ne_bytes());
-            m[24..32].copy_from_slice(&status.to_ne_bytes());
-            servers.write(MSG, &m, 1).unwrap();
-        });
+        let (link, server) = server(&tree, &asked, dies_on);
+        let fs = ServedFs::new(link, true, read_only);
+        fs.mounted.store(true, Ordering::Release);
         Mount {
             fs,
-            link,
             tree,
             asked,
-            server: Some(server),
+            servers: vec![server],
         }
+    }
+
+    /// A mount whose first server goes on its first request `op`.
+    fn dying_on(op: u32, done_first: bool) -> Self {
+        Self::with(false, Some(DiesOn { op, done_first }))
+    }
+
+    /// Another server of the same tree takes the mount over: whether it
+    /// was let.
+    fn next_server(&mut self) -> bool {
+        let (link, server) = server(&self.tree, &self.asked, None);
+        let taken = self.fs.take_over(link.clone()).is_some();
+        if !taken {
+            link.close();
+        }
+        self.servers.push(server);
+        taken
+    }
+
+    /// The server of the moment goes, as a process that is killed does.
+    fn kill_server(&mut self) {
+        self.fs.link().close();
+        for server in self.servers.drain(..) {
+            let _ = server.join();
+        }
+    }
+
+    /// The same mount, taken over by another server `after_ms` from now.
+    fn next_server_in(mut self, after_ms: u64) -> thread::JoinHandle<Self> {
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(after_ms));
+            // The one before is seen to be gone first: a request may be
+            // what finds out.
+            while !self.next_server() {
+                thread::yield_now();
+            }
+            self
+        })
     }
 
     /// How many requests `op` the server has answered.
@@ -256,15 +317,17 @@ impl Mount {
 
     /// Unmount, and what the server's end of the FIFO then said.
     fn unmount(mut self) -> ZxError {
-        self.link.close();
-        self.server.take().unwrap().join().unwrap()
+        self.fs.mounted.store(false, Ordering::Release);
+        self.fs.link().close();
+        self.servers.pop().unwrap().join().unwrap()
     }
 }
 
 impl Drop for Mount {
     fn drop(&mut self) {
-        self.link.close();
-        if let Some(server) = self.server.take() {
+        self.fs.mounted.store(false, Ordering::Release);
+        self.fs.link().close();
+        for server in self.servers.drain(..) {
             let _ = server.join();
         }
     }
@@ -383,14 +446,135 @@ fn what_was_listed_outlives_the_server_and_the_rest_is_an_error() {
 }
 
 #[test]
-fn a_server_that_dies_is_an_error_and_not_a_wait() {
+fn a_server_that_dies_with_none_after_it_is_an_error_once_the_wait_is_over() {
     let (ours, servers) = Fifo::create(SLOTS, MSG);
     let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
     let fs = ServedFs::new(Arc::new(Link::new(ours, window).unwrap()), false, false);
     fs.mounted.store(true, Ordering::Release);
+    fs.grace_ms.store(30, Ordering::Relaxed);
     drop(servers);
+    let before = std::time::Instant::now();
     assert_eq!(fs.root_inode().get_entry(2), Err(FsError::DeviceError));
+    assert!(before.elapsed() >= std::time::Duration::from_millis(30));
+    // And at once from then on.
+    let before = std::time::Instant::now();
     assert_eq!(fs.root_inode().get_entry(2), Err(FsError::DeviceError));
+    assert!(before.elapsed() < std::time::Duration::from_millis(30));
+}
+
+#[test]
+fn a_request_with_no_server_waits_for_the_next_one() {
+    let mut mount = Mount::new();
+    let readme = mount.root().find("Readme.TXT").unwrap();
+    mount.kill_server();
+    let coming = mount.next_server_in(50);
+    // Asked while there is no server: answered by the one that comes.
+    let mut buf = [0u8; 100];
+    assert_eq!(readme.read_at(5000, &mut buf), Ok(100));
+    assert_eq!(buf[..], content(5000, 100)[..]);
+    let mount = coming.join().unwrap();
+    // What was listed before is still what the mount has.
+    assert_eq!(mount.asked(OP_LIST), 1);
+    assert_eq!(
+        mount.root().find("docs").unwrap().get_entry(2).unwrap(),
+        "file-000"
+    );
+}
+
+#[test]
+fn a_mount_with_a_server_is_not_taken_over() {
+    let mut mount = Mount::new();
+    assert!(!mount.next_server());
+    assert_eq!(mount.root().get_entry(2).unwrap(), "Readme.TXT");
+    mount.kill_server();
+    assert!(mount.next_server());
+    assert_eq!(
+        mount.root().find("docs").unwrap().get_entry(2).unwrap(),
+        "file-000"
+    );
+}
+
+#[test]
+fn a_server_that_comes_after_the_wait_still_finds_the_mount() {
+    let mut mount = Mount::new();
+    mount.fs.grace_ms.store(0, Ordering::Relaxed);
+    let root = mount.root();
+    mount.kill_server();
+    thread::sleep(std::time::Duration::from_millis(5));
+    assert!(root.find("docs").is_err());
+    assert_eq!(mount.fs.sync(), Ok(()));
+    assert!(mount.next_server());
+    assert_eq!(root.find("docs").unwrap().get_entry(2).unwrap(), "file-000");
+}
+
+#[test]
+fn a_write_the_server_died_under_is_written_by_the_next() {
+    for done_first in [false, true] {
+        let mount = Mount::dying_on(OP_WRITE, done_first);
+        let file = mount.root().find("Readme.TXT").unwrap();
+        let coming = mount.next_server_in(20);
+        assert_eq!(file.write_at(3, b"written"), Ok(7));
+        let mount = coming.join().unwrap();
+        assert_eq!(
+            mount.on_server("Readme.TXT").unwrap()[..10],
+            *b"\x00\x01\x02written"
+        );
+        assert_eq!(file.metadata().unwrap().size, 10_000);
+    }
+}
+
+#[test]
+fn a_file_the_dead_server_made_is_the_file_that_was_asked_for() {
+    for done_first in [false, true] {
+        let mount = Mount::dying_on(OP_CREATE, done_first);
+        let root = mount.root();
+        root.get_entry(2).unwrap();
+        let coming = mount.next_server_in(20);
+        // The second server says it exists, when the first made it: that
+        // is the answer to the first request, not a refusal.
+        let made = root.create("new.txt", FileType::File, 0o644).unwrap();
+        let mount = coming.join().unwrap();
+        assert_eq!(mount.on_server("new.txt").unwrap(), b"");
+        assert_eq!(made.write_at(0, b"abc"), Ok(3));
+        assert_eq!(mount.on_server("new.txt").unwrap(), b"abc");
+        // And one that is there is still refused.
+        assert_eq!(
+            root.create("new.txt", FileType::File, 0o644).err(),
+            Some(FsError::EntryExist)
+        );
+    }
+}
+
+#[test]
+fn a_file_the_dead_server_removed_is_removed() {
+    for done_first in [false, true] {
+        let mount = Mount::dying_on(OP_REMOVE, done_first);
+        let root = mount.root();
+        let coming = mount.next_server_in(20);
+        assert_eq!(root.unlink("Readme.TXT"), Ok(()));
+        let mount = coming.join().unwrap();
+        assert!(mount.on_server("Readme.TXT").is_none());
+        assert!(root.find("Readme.TXT").is_err());
+        assert_eq!(root.unlink("Readme.TXT"), Err(FsError::EntryNotFound));
+    }
+}
+
+#[test]
+fn a_file_the_dead_server_renamed_is_under_its_new_name() {
+    for done_first in [false, true] {
+        let mount = Mount::dying_on(OP_RENAME, done_first);
+        let root = mount.root();
+        let file = root.find("Readme.TXT").unwrap();
+        let coming = mount.next_server_in(20);
+        assert_eq!(root.move_("Readme.TXT", &root, "here.txt"), Ok(()));
+        let mount = coming.join().unwrap();
+        assert!(mount.on_server("Readme.TXT").is_none());
+        assert_eq!(mount.on_server("here.txt").unwrap(), content(0, 10_000));
+        assert!(root.find("Readme.TXT").is_err());
+        // The open file is the renamed one.
+        assert_eq!(file.write_at(10_000, b"!"), Ok(1));
+        assert_eq!(mount.on_server("here.txt").unwrap().len(), 10_001);
+    }
 }
 
 #[test]
@@ -404,16 +588,18 @@ fn a_window_too_short_for_a_slot_is_not_a_link() {
 
 #[test]
 fn an_unmount_closes_the_mounts_at_and_under_the_place() {
-    let link_at = |at: &str| {
+    let mount_at = |at: &str| {
         let (ours, servers) = Fifo::create(SLOTS, MSG);
         let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
         let link = Arc::new(Link::new(ours, window).unwrap());
-        MOUNTS.lock().push((String::from(at), link.clone()));
+        let fs = ServedFs::new(link.clone(), false, false);
+        fs.mounted.store(true, Ordering::Release);
+        MOUNTS.lock().push((String::from(at), fs));
         (link, servers)
     };
-    let (a, _a_end) = link_at("/served-test/a");
-    let (under, _under_end) = link_at("/served-test/a/deep/er");
-    let (beside, _beside_end) = link_at("/served-test/ab");
+    let (a, _a_end) = mount_at("/served-test/a");
+    let (under, _under_end) = mount_at("/served-test/a/deep/er");
+    let (beside, _beside_end) = mount_at("/served-test/ab");
     unmounted("/served-test/a");
     assert!(a.is_dead() && under.is_dead());
     assert!(!beside.is_dead());
@@ -657,7 +843,7 @@ fn a_renamed_directory_takes_what_was_listed_below_it() {
 
 #[test]
 fn a_read_only_mount_is_asked_for_no_change() {
-    let mount = Mount::with(true);
+    let mount = Mount::with(true, None);
     let root = mount.root();
     let readme = root.find("Readme.TXT").unwrap();
     assert_eq!(readme.write_at(0, b"x"), Err(FsError::ReadOnly));
