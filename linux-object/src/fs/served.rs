@@ -1,25 +1,32 @@
 //! A filesystem that a process serves: the kernel's side of it.
 //!
-//! The process (`tools/eclipse-fatfs` is the first) reads the disk and knows
-//! its format; the kernel knows neither. What it keeps is what it has been
-//! told: the entries of each directory it listed, with their sizes and
-//! times, and the pages of each file it read, in the file's page cache
-//! (`served_read` in `File`). The kernel is the server's only client, so
-//! what it was told stays true, and a name looked up twice, a `stat`, or
-//! bytes read twice ask the server nothing.
+//! The process (`tools/eclipse-fatfs` is the first) reads and writes the
+//! disk and knows its format; the kernel knows neither. What it keeps is
+//! what it has been told: the entries of each directory it listed, with
+//! their sizes and times, and the pages of each file it read, in the
+//! file's page cache (`served_read` in `File`). The kernel is the server's
+//! only client, so what it was told stays true, and a name looked up twice,
+//! a `stat`, or bytes read twice ask the server nothing.
+//!
+//! A change goes to the server when it is made -- a `write` returns once
+//! the server has the bytes -- and the kernel then changes what it keeps to
+//! match: the file's size, its directory's entries, the pages of its cache
+//! the write covers. So nothing the kernel holds is ever ahead of the
+//! server; what the server holds reaches the device when it is asked to
+//! (`fsync`, `sync`, an unmount) or when the server sees fit.
 //!
 //! A file is its path from the top of the mount, as on the kernel's own
 //! FAT, and each request carries the path: the server keeps nothing per
 //! open file that the kernel would have to tell it to forget, or to tell
-//! the next server after it died.
+//! the next server after it died. The kernel's own name for a file is a
+//! [`Node`], which a rename moves and gives its new path: a file that is
+//! open stays the same file.
 //!
 //! What this trusts: the server is a process root started for the purpose.
 //! It can answer wrongly -- the names, sizes and bytes are whatever it says
 //! -- or not at all (a request gives up, as an I/O error). It cannot name
 //! anything outside its mount ([`wire::records`]), and it sees no kernel
 //! memory: only the window it gave.
-//!
-//! This first step mounts read-only.
 
 mod link;
 #[cfg(test)]
@@ -31,7 +38,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use lock::Mutex;
 use rcore_fs::vfs::{
@@ -41,13 +48,18 @@ use zircon_object::ipc::Fifo;
 use zircon_object::vm::VmObject;
 
 use self::link::Link;
-use self::wire::{Entry, DATA_AREA, LIST_END, OP_LIST, OP_READ, OP_STATFS, STATFS_LEN};
+use self::wire::{
+    Entry, DATA_AREA, LIST_END, MODE_DIR, OP_CREATE, OP_LIST, OP_READ, OP_REMOVE, OP_RENAME,
+    OP_SETTIME, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE, STATFS_LEN,
+};
 use crate::error::{LxError, LxResult};
 use crate::process::LinuxProcess;
 
 /// `eclipse_fs_serve` flag: a name matches an entry whatever the case of
 /// its ASCII letters, as on FAT.
 pub const SERVE_FOLD_CASE: usize = 1;
+/// `eclipse_fs_serve` flag: the mount is read-only.
+pub const SERVE_READ_ONLY: usize = 2;
 
 /// The most entries of one directory the kernel takes: a server that never
 /// says its listing is over does not fill the heap.
@@ -59,22 +71,31 @@ static DEV_COUNTER: AtomicU64 = AtomicU64::new(0x5E70_0000);
 /// The served mounts, by where they are mounted: what an unmount closes.
 static MOUNTS: Mutex<Vec<(String, Arc<Link>)>> = Mutex::new(Vec::new());
 
-/// The inode number of a path: FNV-1a, as the kernel's FAT numbers its own.
-fn ino_of(path: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in path.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// A path's directory and its name in it.
 fn split_path(path: &str) -> (&str, &str) {
     match path.rfind('/') {
         Some(i) => (&path[..i], &path[i + 1..]),
         None => ("", path),
     }
+}
+
+/// The path of `name` in the directory `dir`.
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        alloc::format!("{dir}/{name}")
+    }
+}
+
+/// `path` when it is `dir` or under it: what follows `dir` in it.
+fn under<'a>(path: &'a str, dir: &str) -> Option<&'a str> {
+    path.strip_prefix(dir)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn now() -> i64 {
+    kernel_hal::timer::wall_clock_now().as_secs() as i64
 }
 
 /// What the server says of the filesystem as a whole.
@@ -96,29 +117,146 @@ const UNASKED: Numbers = Numbers {
     ftype: 0,
 };
 
+/// A file or a directory, as the kernel knows it: every inode of it is
+/// this one node, so what a write made of its size is what the next `stat`
+/// says, and its number is its own for as long as it is known.
+struct Node {
+    ino: u64,
+    is_dir: bool,
+    /// From the top of the mount. A rename changes it.
+    path: Mutex<String>,
+    size: AtomicU64,
+    mtime: AtomicI64,
+    atime: AtomicI64,
+    ctime: AtomicI64,
+    /// Removed: its path is nobody's, or another file's by now.
+    gone: AtomicBool,
+    /// The changes to its bytes: how many are with the server now, and how
+    /// many there have been. See [`read_token`].
+    changes: Mutex<(u32, u64)>,
+}
+
+impl Node {
+    fn path(&self) -> String {
+        self.path.lock().clone()
+    }
+
+    fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    /// The path to ask the server about: none once the node is removed.
+    fn live_path(&self) -> Result<String> {
+        if self.is_gone() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(self.path())
+    }
+}
+
+/// A change to a file's bytes, from before the server is asked for it
+/// until it has answered.
+struct Changing<'a>(&'a Node);
+
+impl<'a> Changing<'a> {
+    fn new(node: &'a Node) -> Self {
+        let mut changes = node.changes.lock();
+        changes.0 += 1;
+        changes.1 += 1;
+        Changing(node)
+    }
+}
+
+impl Drop for Changing<'_> {
+    fn drop(&mut self) {
+        let mut changes = self.0.changes.lock();
+        changes.0 -= 1;
+        changes.1 += 1;
+    }
+}
+
+/// An entry of a listing: the name the directory has it under, and it.
+#[derive(Clone)]
+struct Slot {
+    name: String,
+    node: Arc<Node>,
+}
+
+/// A directory's entries, in the order the server listed them. A removed
+/// entry leaves its place empty, so that a directory being read while it
+/// is emptied (`rm -r`) goes on from where it was and misses nothing:
+/// `getdents` counts places. An entry that is made takes the first empty
+/// place, so a directory is never longer than the most entries it had.
+type Listing = Vec<Option<Slot>>;
+
+/// The directories listed so far, by path, and the changes to them.
+struct Dirs {
+    listed: BTreeMap<String, Arc<Listing>>,
+    /// The changes to directories with the server now, and how many there
+    /// have been: a listing read while one was on its way is not kept.
+    changing: u32,
+    changes: u64,
+}
+
 pub struct ServedFs {
     link: Arc<Link>,
     this: Weak<Self>,
     dev_id: u64,
     fold_case: bool,
-    /// The directories listed so far, by path.
-    dirs: Mutex<BTreeMap<String, Arc<Vec<Entry>>>>,
+    read_only: bool,
+    root: Arc<Node>,
+    next_ino: AtomicU64,
+    dirs: Mutex<Dirs>,
     /// The filesystem's numbers, once asked.
     info: Mutex<Option<Numbers>>,
+    /// Something was written since: the free space is another number.
+    info_stale: AtomicBool,
     /// The mount is made: until then the server is inside the call that
     /// makes it, and asking it anything would wait for the answer in vain.
     mounted: AtomicBool,
 }
 
+/// A change to the directories, from before the server is asked for it
+/// until what the kernel keeps has been changed to match.
+struct ChangingDirs<'a>(&'a ServedFs);
+
+impl Drop for ChangingDirs<'_> {
+    fn drop(&mut self) {
+        let mut dirs = self.0.dirs.lock();
+        dirs.changing -= 1;
+        dirs.changes += 1;
+        drop(dirs);
+        self.0.info_stale.store(true, Ordering::Release);
+    }
+}
+
 impl ServedFs {
-    fn new(link: Arc<Link>, fold_case: bool) -> Arc<Self> {
+    fn new(link: Arc<Link>, fold_case: bool, read_only: bool) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             link,
             this: this.clone(),
             dev_id: DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
             fold_case,
-            dirs: Mutex::new(BTreeMap::new()),
+            read_only,
+            root: Arc::new(Node {
+                ino: 1,
+                is_dir: true,
+                path: Mutex::new(String::new()),
+                size: AtomicU64::new(0),
+                mtime: AtomicI64::new(0),
+                atime: AtomicI64::new(0),
+                ctime: AtomicI64::new(0),
+                gone: AtomicBool::new(false),
+                changes: Mutex::new((0, 0)),
+            }),
+            next_ino: AtomicU64::new(2),
+            dirs: Mutex::new(Dirs {
+                listed: BTreeMap::new(),
+                changing: 0,
+                changes: 0,
+            }),
             info: Mutex::new(None),
+            info_stale: AtomicBool::new(false),
             mounted: AtomicBool::new(false),
         })
     }
@@ -127,12 +265,83 @@ impl ServedFs {
         self.this.upgrade().expect("ServedFs dropped")
     }
 
+    fn inode(&self, node: Arc<Node>) -> ServedINode {
+        ServedINode {
+            fs: self.arc(),
+            node,
+        }
+    }
+
+    /// The node of the entry the server described, in the directory `dir`.
+    fn node_of(&self, dir: &str, entry: &Entry) -> Arc<Node> {
+        Arc::new(Node {
+            ino: self.next_ino.fetch_add(1, Ordering::Relaxed),
+            is_dir: entry.is_dir,
+            path: Mutex::new(join_path(dir, &entry.name)),
+            size: AtomicU64::new(if entry.is_dir { 0 } else { entry.size }),
+            mtime: AtomicI64::new(entry.mtime),
+            atime: AtomicI64::new(entry.atime),
+            ctime: AtomicI64::new(entry.ctime),
+            gone: AtomicBool::new(false),
+            changes: Mutex::new((0, 0)),
+        })
+    }
+
+    fn writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    fn changing_dirs(&self) -> ChangingDirs<'_> {
+        let mut dirs = self.dirs.lock();
+        dirs.changing += 1;
+        dirs.changes += 1;
+        ChangingDirs(self)
+    }
+
     /// The entries of the directory `path`: as listed before, or from the
     /// server. No lock is held while it answers.
-    fn listing(&self, path: &str) -> Result<Arc<Vec<Entry>>> {
-        if let Some(listed) = self.dirs.lock().get(path) {
-            return Ok(listed.clone());
+    fn listing(&self, path: &str) -> Result<Arc<Listing>> {
+        // A listing the server made while a directory was being changed
+        // may or may not have the change, so it is asked for again; one
+        // that keeps being overtaken is used this once and not kept.
+        for last in [false, false, true] {
+            let before = {
+                let dirs = self.dirs.lock();
+                if let Some(listed) = dirs.listed.get(path) {
+                    return Ok(listed.clone());
+                }
+                (dirs.changing == 0).then_some(dirs.changes)
+            };
+            let entries = self.ask_listing(path)?;
+            let listing: Listing = entries
+                .iter()
+                .map(|entry| {
+                    Some(Slot {
+                        name: entry.name.clone(),
+                        node: self.node_of(path, entry),
+                    })
+                })
+                .collect();
+            let listing = Arc::new(listing);
+            let mut dirs = self.dirs.lock();
+            if let Some(listed) = dirs.listed.get(path) {
+                return Ok(listed.clone());
+            }
+            if dirs.changing == 0 && before == Some(dirs.changes) {
+                dirs.listed.insert(path.to_string(), listing.clone());
+                return Ok(listing);
+            }
+            if last {
+                return Ok(listing);
+            }
         }
+        unreachable!("the last round returns")
+    }
+
+    fn ask_listing(&self, path: &str) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
         let mut data = Vec::new();
         let mut next = 0u64;
@@ -148,9 +357,17 @@ impl ServedFs {
             wire::records(&data, answer.count, &mut entries).ok_or(FsError::DeviceError)?;
             next = answer.a;
         }
-        let entries = Arc::new(entries);
-        self.dirs.lock().insert(path.to_string(), entries.clone());
         Ok(entries)
+    }
+
+    /// The one entry a reply describes: what was made, or renamed.
+    fn entry_of(answer: link::Answer<'_>) -> Result<Entry> {
+        let mut data = alloc::vec![0u8; answer.len];
+        answer.data(0, &mut data)?;
+        drop(answer);
+        let mut entries = Vec::new();
+        wire::records(&data, 1, &mut entries).ok_or(FsError::DeviceError)?;
+        entries.pop().ok_or(FsError::DeviceError)
     }
 
     fn same_name(&self, a: &str, b: &str) -> bool {
@@ -161,14 +378,27 @@ impl ServedFs {
         }
     }
 
-    fn numbers(&self) -> Option<Numbers> {
-        if let Some(numbers) = *self.info.lock() {
-            return Some(numbers);
+    /// Where in `listing` the entry called `name` is.
+    fn position(&self, listing: &Listing, name: &str) -> Option<usize> {
+        listing
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|s| self.same_name(&s.name, name)))
+    }
+
+    /// The filesystem's numbers: as last asked, or with `fresh` asked
+    /// again when something was written since.
+    fn numbers(&self, fresh: bool) -> Option<Numbers> {
+        let known = *self.info.lock();
+        if known.is_some() && !(fresh && self.info_stale.load(Ordering::Acquire)) {
+            return known;
         }
         if !self.mounted.load(Ordering::Acquire) {
             return None;
         }
-        let answer = self.link.call(OP_STATFS, "", 0, 0).ok()?;
+        self.info_stale.store(false, Ordering::Release);
+        let Ok(answer) = self.link.call(OP_STATFS, "", 0, 0) else {
+            return known;
+        };
         let mut raw = [0u8; STATFS_LEN];
         answer.data(0, &mut raw).ok()?;
         drop(answer);
@@ -189,24 +419,51 @@ impl ServedFs {
         *self.info.lock() = Some(numbers);
         Some(numbers)
     }
+
+    /// Drop the removed file's pages: its number is no other file's, but
+    /// they are memory nothing will read.
+    fn forget_pages(&self, node: &Arc<Node>) {
+        if !node.is_dir {
+            let inode: Arc<dyn INode> = Arc::new(self.inode(node.clone()));
+            super::file::cache_forget(&inode);
+        }
+    }
+}
+
+/// Take the entry at `at` out of `listing`: its place stays, empty, unless
+/// it was the last.
+fn take_slot(listing: &mut Listing, at: usize) -> Option<Slot> {
+    let slot = listing.get_mut(at)?.take();
+    while listing.last().is_some_and(|last| last.is_none()) {
+        listing.pop();
+    }
+    slot
+}
+
+/// Put an entry in `listing`: in the first empty place, or at the end.
+fn put_slot(listing: &mut Listing, slot: Slot) {
+    match listing.iter_mut().find(|place| place.is_none()) {
+        Some(place) => *place = Some(slot),
+        None => listing.push(Some(slot)),
+    }
 }
 
 impl FileSystem for ServedFs {
-    /// Nothing to write: the mount is read-only.
+    /// What was written is the server's already: this has it reach the
+    /// device. A server that is gone has nothing of the kernel's to write.
     fn sync(&self) -> Result<()> {
-        Ok(())
+        if self.read_only || self.link.is_dead() || !self.mounted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.link.call(OP_SYNC, "", 0, 0).map(|_| ())
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
-        Arc::new(ServedINode {
-            fs: self.arc(),
-            path: String::new(),
-            entry: None,
-        })
+        Arc::new(self.inode(self.root.clone()))
     }
 
     fn info(&self) -> FsInfo {
-        let n = self.numbers().unwrap_or(UNASKED);
+        let n = self.numbers(true).unwrap_or(UNASKED);
         FsInfo {
             bsize: n.bsize,
             frsize: n.bsize,
@@ -221,62 +478,84 @@ impl FileSystem for ServedFs {
     }
 }
 
-/// A file or a directory of a served filesystem: its path from the top of
-/// the mount, and what its directory's listing said of it (`None` for the
-/// top, which is in no listing).
+/// A file or a directory of a served filesystem, as the VFS holds it.
 struct ServedINode {
     fs: Arc<ServedFs>,
-    path: String,
-    entry: Option<Entry>,
+    node: Arc<Node>,
 }
 
 impl ServedINode {
     fn is_dir(&self) -> bool {
-        self.entry.as_ref().is_none_or(|e| e.is_dir)
+        self.node.is_dir
     }
 
-    fn child(&self, entry: &Entry) -> ServedINode {
-        ServedINode {
-            fs: self.fs.clone(),
-            // The name as the directory has it, which is the one the
-            // server finds.
-            path: if self.path.is_empty() {
-                entry.name.clone()
-            } else {
-                alloc::format!("{}/{}", self.path, entry.name)
-            },
-            entry: Some(entry.clone()),
+    fn dir_path(&self) -> Result<String> {
+        if !self.is_dir() {
+            return Err(FsError::NotDir);
         }
+        self.node.live_path()
     }
 
     fn parent(&self) -> Result<ServedINode> {
-        let (dir, name) = split_path(&self.path);
-        if name.is_empty() {
-            // The top is its own parent: the mount above it takes `..` from
-            // there.
-            return Ok(ServedINode {
-                fs: self.fs.clone(),
-                path: String::new(),
-                entry: None,
-            });
+        let path = self.node.path();
+        let (dir, name) = split_path(&path);
+        // The top is its own parent: the mount above it takes `..` from
+        // there.
+        if name.is_empty() || dir.is_empty() {
+            return Ok(self.fs.inode(self.fs.root.clone()));
         }
         let (above, dir_name) = split_path(dir);
-        let entry = match dir_name {
-            "" => None,
-            _ => Some(
-                self.fs
-                    .listing(above)?
-                    .iter()
-                    .find(|e| e.name == dir_name)
-                    .cloned()
-                    .ok_or(FsError::EntryNotFound)?,
-            ),
+        let node = self
+            .fs
+            .listing(above)?
+            .iter()
+            .flatten()
+            .find(|s| s.name == dir_name)
+            .map(|s| s.node.clone())
+            .ok_or(FsError::EntryNotFound)?;
+        Ok(self.fs.inode(node))
+    }
+
+    fn metadata_of(&self, node: &Node) -> Metadata {
+        let size = node.size.load(Ordering::Relaxed) as usize;
+        let at = |sec: &AtomicI64| Timespec {
+            sec: sec.load(Ordering::Relaxed),
+            nsec: 0,
         };
-        Ok(ServedINode {
-            fs: self.fs.clone(),
-            path: dir.to_string(),
-            entry,
-        })
+        Metadata {
+            dev: self.fs.dev_id as usize,
+            inode: node.ino as usize,
+            size,
+            blk_size: self.fs.numbers(false).unwrap_or(UNASKED).bsize,
+            // `st_blocks` counts 512-byte units whatever the block size.
+            blocks: size.div_ceil(512),
+            atime: at(&node.atime),
+            mtime: at(&node.mtime),
+            ctime: at(&node.ctime),
+            type_: if node.is_dir {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
+            mode: if node.is_dir { 0o755 } else { 0o644 },
+            nlinks: match (node.is_gone(), node.is_dir) {
+                (true, _) => 0,
+                (false, true) => 2,
+                (false, false) => 1,
+            },
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        }
+    }
+
+    /// A name a directory entry can have, as far as the kernel is
+    /// concerned; the server has its own say.
+    fn check_name(name: &str) -> Result<()> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(FsError::InvalidParam);
+        }
+        Ok(())
     }
 }
 
@@ -284,22 +563,22 @@ impl INode for ServedINode {
     /// The bytes as the server reads them, each call a request: what fills
     /// the page cache. `read(2)` comes through `File`'s `served_read` instead.
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let entry = match &self.entry {
-            Some(e) if !e.is_dir => e,
-            _ => return Err(FsError::IsDir),
-        };
-        let size = entry.size as usize;
+        if self.is_dir() {
+            return Err(FsError::IsDir);
+        }
+        let size = self.node.size.load(Ordering::Relaxed) as usize;
         if offset >= size {
             return Ok(0);
         }
+        let path = self.node.live_path()?;
         let want = buf.len().min(size - offset);
         let mut done = 0;
         while done < want {
             let ask = (want - done).min(DATA_AREA);
-            let answer =
-                self.fs
-                    .link
-                    .call(OP_READ, &self.path, (offset + done) as u64, ask as u32)?;
+            let answer = self
+                .fs
+                .link
+                .call(OP_READ, &path, (offset + done) as u64, ask as u32)?;
             let n = answer.count.min(answer.len).min(ask);
             if n == 0 {
                 break;
@@ -310,48 +589,293 @@ impl INode for ServedINode {
         Ok(done)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::ReadOnly)
+    /// The bytes go to the server, a window of them at a time, and are
+    /// written when this returns. Fewer than asked when the volume filled.
+    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        if self.is_dir() {
+            return Err(FsError::IsDir);
+        }
+        self.fs.writable()?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let path = self.node.live_path()?;
+        let _changing = Changing::new(&self.node);
+        let mut done = 0;
+        let mut failed = None;
+        while done < buf.len() {
+            let piece = &buf[done..(done + DATA_AREA).min(buf.len())];
+            let wrote = self
+                .fs
+                .link
+                .call_with(
+                    OP_WRITE,
+                    path.as_bytes(),
+                    (offset + done) as u64,
+                    piece.len() as u32,
+                    piece,
+                )
+                .map(|answer| answer.count.min(piece.len()));
+            match wrote {
+                Ok(n) => {
+                    done += n;
+                    if n < piece.len() {
+                        failed = Some(FsError::NoDeviceSpace);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if done > 0 {
+            self.node
+                .size
+                .fetch_max((offset + done) as u64, Ordering::Relaxed);
+            self.node.mtime.store(now(), Ordering::Relaxed);
+            self.fs.info_stale.store(true, Ordering::Release);
+        }
+        match failed {
+            Some(e) if done == 0 => Err(e),
+            _ => Ok(done),
+        }
     }
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: true,
-            write: false,
+            write: !self.fs.read_only,
             error: false,
             hangup: false,
         })
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let (size, atime, mtime, ctime) = match &self.entry {
-            Some(e) if !e.is_dir => (e.size as usize, e.atime, e.mtime, e.ctime),
-            Some(e) => (0, e.atime, e.mtime, e.ctime),
-            None => (0, 0, 0, 0),
+        Ok(self.metadata_of(&self.node))
+    }
+
+    /// The times are the node's from here on, and a file's time of last
+    /// writing goes to the server; the owner and the mode are not the
+    /// filesystem's to keep.
+    fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
+        self.fs.writable()?;
+        let node = &self.node;
+        node.atime.store(metadata.atime.sec, Ordering::Relaxed);
+        node.ctime.store(metadata.ctime.sec, Ordering::Relaxed);
+        let before = node.mtime.swap(metadata.mtime.sec, Ordering::Relaxed);
+        if before != metadata.mtime.sec && !node.is_dir && !node.is_gone() {
+            let path = node.path();
+            self.fs
+                .link
+                .call(OP_SETTIME, &path, metadata.mtime.sec as u64, 0)?;
+        }
+        Ok(())
+    }
+
+    fn resize(&self, len: usize) -> Result<()> {
+        if self.is_dir() {
+            return Err(FsError::IsDir);
+        }
+        self.fs.writable()?;
+        let path = self.node.live_path()?;
+        // The length it has: what `O_TRUNC` asks of a file just made.
+        if self.node.size.load(Ordering::Relaxed) == len as u64 {
+            return Ok(());
+        }
+        let _changing = Changing::new(&self.node);
+        self.fs.link.call(OP_TRUNCATE, &path, len as u64, 0)?;
+        self.node.size.store(len as u64, Ordering::Relaxed);
+        self.node.mtime.store(now(), Ordering::Relaxed);
+        self.fs.info_stale.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn create(&self, name: &str, type_: FileType, _mode: u32) -> Result<Arc<dyn INode>> {
+        let dir = self.dir_path()?;
+        self.fs.writable()?;
+        Self::check_name(name)?;
+        let mode = match type_ {
+            FileType::File => 0,
+            FileType::Dir => MODE_DIR,
+            _ => return Err(FsError::NotSupported),
         };
-        let at = |sec: i64| Timespec { sec, nsec: 0 };
-        let is_dir = self.is_dir();
-        Ok(Metadata {
-            dev: self.fs.dev_id as usize,
-            inode: ino_of(&self.path) as usize,
-            size,
-            blk_size: self.fs.numbers().unwrap_or(UNASKED).bsize,
-            // `st_blocks` counts 512-byte units whatever the block size.
-            blocks: size.div_ceil(512),
-            atime: at(atime),
-            mtime: at(mtime),
-            ctime: at(ctime),
-            type_: if is_dir {
-                FileType::Dir
-            } else {
-                FileType::File
-            },
-            mode: if is_dir { 0o755 } else { 0o644 },
-            nlinks: if is_dir { 2 } else { 1 },
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        if self.fs.position(&*self.fs.listing(&dir)?, name).is_some() {
+            return Err(FsError::EntryExist);
+        }
+        let _changing = self.fs.changing_dirs();
+        let answer = self
+            .fs
+            .link
+            .call(OP_CREATE, &join_path(&dir, name), mode as u64, 0)?;
+        let entry = ServedFs::entry_of(answer)?;
+        if entry.is_dir != (type_ == FileType::Dir) {
+            return Err(FsError::DeviceError);
+        }
+        let node = self.fs.node_of(&dir, &entry);
+        if let Some(listing) = self.fs.dirs.lock().listed.get_mut(&dir) {
+            put_slot(
+                Arc::make_mut(listing),
+                Slot {
+                    name: entry.name,
+                    node: node.clone(),
+                },
+            );
+        }
+        self.node.mtime.store(now(), Ordering::Relaxed);
+        Ok(Arc::new(self.fs.inode(node)))
+    }
+
+    fn unlink(&self, name: &str) -> Result<()> {
+        let dir = self.dir_path()?;
+        self.fs.writable()?;
+        if name == "." || name == ".." {
+            return Err(FsError::DirNotEmpty);
+        }
+        let listing = self.fs.listing(&dir)?;
+        let at = self
+            .fs
+            .position(&listing, name)
+            .ok_or(FsError::EntryNotFound)?;
+        let Some(Slot { node, .. }) = listing[at].clone() else {
+            return Err(FsError::EntryNotFound);
+        };
+        drop(listing);
+        let path = node.path();
+        let _changing = self.fs.changing_dirs();
+        self.fs.link.call(OP_REMOVE, &path, 0, 0)?;
+        node.gone.store(true, Ordering::Release);
+        {
+            let mut dirs = self.fs.dirs.lock();
+            if let Some(listing) = dirs.listed.get_mut(&dir) {
+                let listing = Arc::make_mut(listing);
+                // By the node, not the place it was found at: that was
+                // before the server was asked.
+                let at = listing
+                    .iter()
+                    .position(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(&s.node, &node)));
+                if let Some(at) = at {
+                    take_slot(listing, at);
+                }
+            }
+            if node.is_dir {
+                dirs.listed.remove(&path);
+            }
+        }
+        self.node.mtime.store(now(), Ordering::Relaxed);
+        self.fs.forget_pages(&node);
+        Ok(())
+    }
+
+    /// `old_name` here becomes `new_name` in `target`, in place of what is
+    /// there. The node stays the one it was, under its new path, and so do
+    /// the nodes below a directory.
+    fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> Result<()> {
+        let from_dir = self.dir_path()?;
+        self.fs.writable()?;
+        let dest = target
+            .as_any_ref()
+            .downcast_ref::<ServedINode>()
+            .filter(|dest| Arc::ptr_eq(&self.fs, &dest.fs))
+            .ok_or(FsError::NotSameFs)?;
+        let to_dir = dest.dir_path()?;
+        if old_name == "." || old_name == ".." {
+            return Err(FsError::InvalidParam);
+        }
+        Self::check_name(new_name)?;
+        let listing = self.fs.listing(&from_dir)?;
+        let node = self
+            .fs
+            .position(&listing, old_name)
+            .and_then(|at| listing[at].clone())
+            .map(|slot| slot.node)
+            .ok_or(FsError::EntryNotFound)?;
+        drop(listing);
+        // The other directory's entries too, so that what is replaced there
+        // is known to be.
+        self.fs.listing(&to_dir)?;
+        let old_path = node.path();
+        let new_path = join_path(&to_dir, new_name);
+        if old_path == new_path {
+            return Ok(());
+        }
+        if node.is_dir && under(&to_dir, &old_path).is_some() {
+            return Err(FsError::InvalidParam);
+        }
+        let names = alloc::format!("{old_path}\0{new_path}");
+        let _changing = self.fs.changing_dirs();
+        let answer = self
+            .fs
+            .link
+            .call_with(OP_RENAME, names.as_bytes(), 0, 0, &[])?;
+        let entry = ServedFs::entry_of(answer)?;
+        let new_path = join_path(&to_dir, &entry.name);
+
+        let mut replaced = None;
+        {
+            let mut dirs = self.fs.dirs.lock();
+            if let Some(listing) = dirs.listed.get_mut(&from_dir) {
+                let listing = Arc::make_mut(listing);
+                let at = listing
+                    .iter()
+                    .position(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(&s.node, &node)));
+                if let Some(at) = at {
+                    take_slot(listing, at);
+                }
+            }
+            match dirs.listed.get_mut(&to_dir) {
+                Some(listing) => {
+                    let listing = Arc::make_mut(listing);
+                    if let Some(at) = self.fs.position(listing, &entry.name) {
+                        replaced = take_slot(listing, at).map(|slot| slot.node);
+                    }
+                    put_slot(
+                        listing,
+                        Slot {
+                            name: entry.name,
+                            node: node.clone(),
+                        },
+                    );
+                }
+                // Nowhere to keep it: the next listing makes a new node of
+                // it, and this one must not go on as a second.
+                None => node.gone.store(true, Ordering::Release),
+            }
+            if let Some(replaced) = &replaced {
+                replaced.gone.store(true, Ordering::Release);
+                if replaced.is_dir {
+                    dirs.listed.remove(&new_path);
+                }
+            }
+            *node.path.lock() = new_path.clone();
+            if node.is_dir {
+                // What was listed below it is below its new path.
+                let below: Vec<String> = dirs
+                    .listed
+                    .keys()
+                    .filter(|path| under(path, &old_path).is_some())
+                    .cloned()
+                    .collect();
+                for was in below {
+                    let Some(listing) = dirs.listed.remove(&was) else {
+                        continue;
+                    };
+                    let is = alloc::format!("{new_path}{}", &was[old_path.len()..]);
+                    for slot in listing.iter().flatten() {
+                        *slot.node.path.lock() = join_path(&is, &slot.name);
+                    }
+                    dirs.listed.insert(is, listing);
+                }
+            }
+        }
+        let at = now();
+        self.node.mtime.store(at, Ordering::Relaxed);
+        dest.node.mtime.store(at, Ordering::Relaxed);
+        if let Some(replaced) = replaced {
+            self.fs.forget_pages(&replaced);
+        }
+        Ok(())
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
@@ -359,19 +883,16 @@ impl INode for ServedINode {
             return Err(FsError::NotDir);
         }
         match name {
-            "." => Ok(Arc::new(ServedINode {
-                fs: self.fs.clone(),
-                path: self.path.clone(),
-                entry: self.entry.clone(),
-            })),
+            "." => Ok(Arc::new(self.fs.inode(self.node.clone()))),
             ".." => Ok(Arc::new(self.parent()?)),
             name => {
-                let entries = self.fs.listing(&self.path)?;
-                let entry = entries
-                    .iter()
-                    .find(|e| self.fs.same_name(&e.name, name))
+                let listing = self.fs.listing(&self.node.live_path()?)?;
+                let at = self
+                    .fs
+                    .position(&listing, name)
                     .ok_or(FsError::EntryNotFound)?;
-                Ok(Arc::new(self.child(entry)))
+                let slot = listing[at].as_ref().ok_or(FsError::EntryNotFound)?;
+                Ok(Arc::new(self.fs.inode(slot.node.clone())))
             }
         }
     }
@@ -385,9 +906,11 @@ impl INode for ServedINode {
             1 => Ok(String::from("..")),
             i => self
                 .fs
-                .listing(&self.path)?
-                .get(i - 2)
-                .map(|e| e.name.clone())
+                .listing(&self.node.live_path()?)?
+                .iter()
+                .flatten()
+                .nth(i - 2)
+                .map(|s| s.name.clone())
                 .ok_or(FsError::EntryNotFound),
         }
     }
@@ -400,19 +923,23 @@ impl INode for ServedINode {
             0 => Ok((self.metadata()?, String::from("."))),
             1 => Ok((self.parent()?.metadata()?, String::from(".."))),
             i => {
-                let entries = self.fs.listing(&self.path)?;
-                let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
-                Ok((self.child(entry).metadata()?, entry.name.clone()))
+                let listing = self.fs.listing(&self.node.live_path()?)?;
+                let slot = listing
+                    .iter()
+                    .flatten()
+                    .nth(i - 2)
+                    .ok_or(FsError::EntryNotFound)?;
+                Ok((self.metadata_of(&slot.node), slot.name.clone()))
             }
         }
     }
 
     fn sync_all(&self) -> Result<()> {
-        Ok(())
+        self.fs.sync()
     }
 
     fn sync_data(&self) -> Result<()> {
-        Ok(())
+        self.fs.sync()
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -426,11 +953,61 @@ impl INode for ServedINode {
 
 /// Whether `inode` is a file of a served filesystem: one whose `read(2)`
 /// goes through its page cache (`File::read`), each `read_at` of the inode
-/// itself being a request to a process.
+/// itself being a request to a process. Not a file that was removed, which
+/// has no page cache any more and nothing to read.
 pub(super) fn is_file(inode: &dyn INode) -> bool {
     inode
         .downcast_ref::<ServedINode>()
-        .is_some_and(|i| !i.is_dir())
+        .is_some_and(|i| !i.is_dir() && !i.node.is_gone())
+}
+
+/// The entry of the served directory `inode` at the place `at` or the
+/// first after it, and the place after that one: how an open directory is
+/// read, by places that stay where they are while entries are removed
+/// ([`Listing`]). `None` for anything but a served directory.
+pub(super) fn entry_at(inode: &dyn INode, at: usize) -> Option<Result<(Metadata, String, usize)>> {
+    let inode = inode.downcast_ref::<ServedINode>().filter(|i| i.is_dir())?;
+    Some(match at {
+        0 | 1 => inode
+            .get_entry_with_metadata(at)
+            .map(|(m, n)| (m, n, at + 1)),
+        at => (|| {
+            let listing = inode.fs.listing(&inode.node.live_path()?)?;
+            let (place, slot) = listing
+                .iter()
+                .enumerate()
+                .skip(at - 2)
+                .find_map(|(place, slot)| Some((place, slot.as_ref()?)))
+                .ok_or(FsError::EntryNotFound)?;
+            Ok((inode.metadata_of(&slot.node), slot.name.clone(), place + 3))
+        })(),
+    })
+}
+
+/// Before the bytes of the served file `inode` are fetched to be kept in
+/// its page cache: what [`if_unchanged`] takes afterwards. `None` while a
+/// write to the file is with the server, when what is fetched may be from
+/// before it or after it.
+pub(super) fn read_token(inode: &dyn INode) -> Option<u64> {
+    let inode = inode.downcast_ref::<ServedINode>()?;
+    let changes = inode.node.changes.lock();
+    (changes.0 == 0).then_some(changes.1)
+}
+
+/// Run `keep`, which puts fetched bytes in the page cache, unless the file
+/// was written to since `token` was taken. No write starts while it runs,
+/// so the pages it keeps are the file's, and a write that starts after
+/// finds them there and changes them (`cache_overlay_write`).
+pub(super) fn if_unchanged(inode: &dyn INode, token: u64, keep: impl FnOnce()) -> bool {
+    let Some(inode) = inode.downcast_ref::<ServedINode>() else {
+        return false;
+    };
+    let changes = inode.node.changes.lock();
+    let unchanged = *changes == (0, token);
+    if unchanged {
+        keep();
+    }
+    unchanged
 }
 
 /// `eclipse_fs_serve`: mount at `target` the filesystem a process serves on
@@ -449,13 +1026,17 @@ pub fn serve(
         return Err(LxError::EPERM);
     }
     let shown = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
-    if flags & !SERVE_FOLD_CASE != 0 || !target.starts_with('/') || !shown(source) || !shown(fstype)
+    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY) != 0
+        || !target.starts_with('/')
+        || !shown(source)
+        || !shown(fstype)
     {
         return Err(LxError::EINVAL);
     }
     let link = Arc::new(Link::new(fifo, window).map_err(|_| LxError::EINVAL)?);
-    let fs = ServedFs::new(link.clone(), flags & SERVE_FOLD_CASE != 0);
-    let target = super::mount_ops::mount_served(target, source, fstype, fs.clone())?;
+    let read_only = flags & SERVE_READ_ONLY != 0;
+    let fs = ServedFs::new(link.clone(), flags & SERVE_FOLD_CASE != 0, read_only);
+    let target = super::mount_ops::mount_served(target, source, fstype, fs.clone(), read_only)?;
     fs.mounted.store(true, Ordering::Release);
     MOUNTS.lock().push((target, link));
     Ok(())

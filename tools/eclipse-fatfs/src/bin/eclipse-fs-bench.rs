@@ -8,9 +8,15 @@
 //! `big.bin` when not given) is read in order through 64 KiB and 4 KiB
 //! buffers, at 500 scattered offsets, and through a mapping. Each line is
 //! one of those: how many, the bytes, the time, and the time for each.
+//!
+//! `eclipse-fs-bench -w DIR` times writing instead, in a directory it
+//! makes under `DIR` and removes: 200 files of 4 KiB made, a 2 MiB file
+//! written in order through 64 KiB and 4 KiB buffers, written over, written
+//! at 500 scattered offsets, synced and read back, then the files renamed
+//! and removed.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -73,10 +79,116 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, u128) {
     (out, start.elapsed().as_micros())
 }
 
+/// The byte at `i` of what is written: so that what is read back says
+/// whether it is what was written.
+fn pattern(from: u64, len: usize) -> Vec<u8> {
+    (from..from + len as u64)
+        .map(|i| (i ^ (i >> 9) ^ (i >> 17)) as u8)
+        .collect()
+}
+
+/// `-w`: time writing under `dir`.
+fn writing(dir: &Path) {
+    const SMALL: u64 = 200;
+    const BIG: usize = 2 << 20;
+    let top = dir.join("fs-bench.tmp");
+    let _ = fs::remove_dir_all(&top);
+    let ok =
+        |what: &str, r: std::io::Result<()>| r.unwrap_or_else(|e| die(format_args!("{what}: {e}")));
+    ok("mkdir", fs::create_dir(&top));
+    let small = |i: u64, to: &str| top.join(format!("{to}-{i:03}.dat"));
+
+    let piece = pattern(0, 4096);
+    let ((), us) = timed(|| {
+        for i in 0..SMALL {
+            let mut file = File::create(small(i, "small")).unwrap_or_else(|e| die(e));
+            ok("write", file.write_all(&piece));
+        }
+    });
+    line("make small files", SMALL, SMALL * 4096, us);
+
+    let whole = pattern(0, BIG);
+    for (pass, name, buf) in [
+        ("write 64k new", "big-64k.bin", 64 * 1024),
+        ("write 4k new", "big-4k.bin", 4096),
+        ("write 64k over", "big-64k.bin", 64 * 1024),
+    ] {
+        let path = top.join(name);
+        let ((), us) = timed(|| {
+            // Over what is there, without cutting it first: `over` is a
+            // write that needs no new room.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap_or_else(|e| die(e));
+            for chunk in whole.chunks(buf) {
+                ok("write", file.write_all(chunk));
+            }
+        });
+        line(pass, (BIG / buf) as u64, BIG as u64, us);
+    }
+
+    let big = top.join("big-64k.bin");
+    let mut expect = whole.clone();
+    {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .unwrap_or_else(|e| die(e));
+        let mut at = 12345u64;
+        let ((), us) = timed(|| {
+            for i in 0..500u64 {
+                at = at
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let offset = (at >> 20) % (BIG as u64 - 4096);
+                let bytes = pattern(i * 7919, 4096);
+                ok("pwrite", file.write_all_at(&bytes, offset));
+                expect[offset as usize..offset as usize + 4096].copy_from_slice(&bytes);
+            }
+        });
+        line("pwrite 4k", 500, 500 * 4096, us);
+        let ((), us) = timed(|| ok("fsync", file.sync_all()));
+        line("fsync", 1, 0, us);
+    }
+
+    let (back, us) = timed(|| fs::read(&big).unwrap_or_else(|e| die(e)));
+    line("read back", 1, back.len() as u64, us);
+    let small_ok = (0..SMALL).all(|i| fs::read(small(i, "small")).is_ok_and(|b| b == piece));
+    let four_k = fs::read(top.join("big-4k.bin")).is_ok_and(|b| b == whole);
+    println!(
+        "read back: big {} 4k {} small {}",
+        if back == expect { "same" } else { "DIFFERENT" },
+        if four_k { "same" } else { "DIFFERENT" },
+        if small_ok { "same" } else { "DIFFERENT" },
+    );
+
+    let ((), us) = timed(|| {
+        for i in 0..SMALL {
+            ok("rename", fs::rename(small(i, "small"), small(i, "moved")));
+        }
+    });
+    line("rename", SMALL, 0, us);
+    let ((), us) = timed(|| {
+        for i in 0..SMALL {
+            ok("unlink", fs::remove_file(small(i, "moved")));
+        }
+    });
+    line("unlink", SMALL, 0, us);
+    ok("remove", fs::remove_dir_all(&top));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, dir] = args.as_slice() {
+        if flag == "-w" {
+            return writing(Path::new(dir));
+        }
+    }
     let Some(dir) = args.first() else {
-        eprintln!("usage: eclipse-fs-bench DIR [BIG]");
+        eprintln!("usage: eclipse-fs-bench DIR [BIG]\n       eclipse-fs-bench -w DIR");
         std::process::exit(2)
     };
     let dir = Path::new(dir);

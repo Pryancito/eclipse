@@ -128,31 +128,37 @@ impl<M: Message> Fifo<M> {
     /// `buf`. How many were read. With the Zircon calls alone that is a
     /// write, a read that finds nothing, a wait and a read.
     pub fn reply_wait(&self, buf: &mut [M], mut replies: usize) -> Result<usize, Status> {
-        assert!(replies <= buf.len());
         loop {
-            let mut got: usize = 0;
-            // SAFETY: the kernel reads `replies` messages of `buf`, then
-            // writes at most `buf.len()` into it and the count into `got`.
-            let r = unsafe {
-                zx::call(
-                    nr::ECLIPSE_FIFO_REPLY_WAIT,
-                    [
-                        self.handle as usize,
-                        size_of::<M>(),
-                        buf.as_mut_ptr() as usize,
-                        replies,
-                        buf.len(),
-                        &mut got as *mut usize as usize,
-                    ],
-                )
-            };
-            match r {
-                Ok(_) => return Ok(got),
+            match self.reply_wait_once(buf, replies) {
                 // A signal cut the wait short. The replies went before it.
                 Err(Status::INTERNAL_INTR_RETRY) => replies = 0,
-                Err(e) => return Err(e),
+                done => return done,
             }
         }
+    }
+
+    /// [`reply_wait`](Self::reply_wait) that a signal ends, as
+    /// `INTERNAL_INTR_RETRY`: for whoever has something to do when one
+    /// comes (a timer's). The replies went before it.
+    pub fn reply_wait_once(&self, buf: &mut [M], replies: usize) -> Result<usize, Status> {
+        assert!(replies <= buf.len());
+        let mut got: usize = 0;
+        // SAFETY: the kernel reads `replies` messages of `buf`, then
+        // writes at most `buf.len()` into it and the count into `got`.
+        unsafe {
+            zx::call(
+                nr::ECLIPSE_FIFO_REPLY_WAIT,
+                [
+                    self.handle as usize,
+                    size_of::<M>(),
+                    buf.as_mut_ptr() as usize,
+                    replies,
+                    buf.len(),
+                    &mut got as *mut usize as usize,
+                ],
+            )
+        }
+        .map(|_| got)
     }
 }
 

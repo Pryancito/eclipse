@@ -4,9 +4,10 @@
 //! other side.
 //!
 //! A request is one message; its names are at the start of the request's
-//! slot of the window, and what the server answers with is in the slot's
-//! data area. The reply is the same message with `status` filled in: a
-//! count, or a Linux `errno`, negated.
+//! slot of the window, and what goes with it -- the bytes to write, or what
+//! the server answers with -- is in the slot's data area. The reply is the
+//! same message with `status` filled in: a count, or a Linux `errno`,
+//! negated.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -36,6 +37,27 @@ pub const OP_READ: u32 = 2;
 /// The filesystem's numbers, as [`STATFS_LEN`] bytes in the data area: block
 /// size, blocks, free blocks, longest name and `statfs`'s magic (u64 each).
 pub const OP_STATFS: u32 = 3;
+
+/// Write the `b` bytes of the data area into the file at the path, from
+/// byte `a`; a file that ends before `a` is zeros up to it. The reply:
+/// `status` bytes written, fewer than `b` when the volume filled up.
+pub const OP_WRITE: u32 = 4;
+/// Make the file at the path, or with [`MODE_DIR`] in `a` the directory.
+/// The reply: its record in the data area, `b` bytes.
+pub const OP_CREATE: u32 = 5;
+/// Remove the file at the path, or the directory, which must be empty.
+pub const OP_REMOVE: u32 = 6;
+/// Two paths, a NUL between them: the first becomes the second, in place
+/// of what was there (a file, or an empty directory). The reply: the
+/// record of the entry under its new name.
+pub const OP_RENAME: u32 = 7;
+/// Make the file at the path `a` bytes long: cut, or grown with zeros.
+pub const OP_TRUNCATE: u32 = 8;
+/// What was written reaches the device, and the volume is left as an
+/// unmount would leave it.
+pub const OP_SYNC: u32 = 9;
+/// The file at the path was last written at `a`, seconds as an `i64`.
+pub const OP_SETTIME: u32 = 10;
 
 /// [`OP_LIST`]'s `a` in a reply that holds the directory's last entries.
 pub const LIST_END: u64 = u64::MAX;
@@ -99,6 +121,7 @@ pub fn error_of(status: i64) -> FsError {
     match -status {
         2 => FsError::EntryNotFound,
         17 => FsError::EntryExist,
+        18 => FsError::NotSameFs,
         20 => FsError::NotDir,
         21 => FsError::IsDir,
         22 => FsError::InvalidParam,

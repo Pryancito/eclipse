@@ -18,12 +18,12 @@ use zircon_object::ZxError;
 /// `names` is `names_len` bytes: where to mount (an absolute path), then
 /// what the mount table shows as the mount's source and as its type, a NUL
 /// between each two. `flags`: 1 when a name matches an entry whatever the
-/// case of its ASCII letters.
+/// case of its ASCII letters, 2 for a read-only mount.
 ///
-/// The mount is read-only. The process answers each message on the other
-/// end of the FIFO, and sees that end closed when the filesystem is
-/// unmounted; when the process is gone, what the kernel had not read yet is
-/// an I/O error. Both handles go to the kernel, whatever the answer.
+/// The process answers each message on the other end of the FIFO, and sees
+/// that end closed when the filesystem is unmounted; when the process is
+/// gone, what the kernel had not read yet is an I/O error, and so is every
+/// change. Both handles go to the kernel, whatever the answer.
 ///
 /// `ACCESS_DENIED` to a process that may not `mount(2)`, `NOT_FOUND` when
 /// there is no such directory, `INVALID_ARGS` for names that are not three,
