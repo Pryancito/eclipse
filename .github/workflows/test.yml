@@ -437,6 +437,16 @@ jobs:
           # hand: a connect and a listener's connections, the bytes each
           # side said it takes and no more, a reset, both ways of closing.
           cargo test --manifest-path tools/eclipse-netstack/Cargo.toml
+          # eclipse-fatfs, the FAT filesystem that runs as a process: one
+          # more standalone package built best-effort for the image, which
+          # takes the drivers' library by path. The tests make a FAT volume
+          # in memory with the same FAT code and read it back the way the
+          # kernel asks: a directory's entries over as many replies as they
+          # take, a file's bytes at any offset without walking its chain of
+          # clusters, the volume's numbers -- and that the layout of a
+          # message and of a listing's records is the one the kernel reads
+          # (`linux-object/src/fs/served/wire.rs`).
+          cargo test --manifest-path tools/eclipse-fatfs/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the

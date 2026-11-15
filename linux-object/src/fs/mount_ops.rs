@@ -287,6 +287,34 @@ pub fn mount_fs(
     Ok(())
 }
 
+/// Mount at `target` a filesystem that a process serves
+/// ([`served`](super::served)), read-only, and return where it was mounted.
+/// `source` and `fstype` are what its line of the mount table says.
+///
+/// The process is inside the call that brings it here, so nothing on the
+/// way may ask the filesystem a question: its root is known without one.
+pub(crate) fn mount_served(
+    target: &str,
+    source: &str,
+    fstype: &str,
+    fs: Arc<dyn FileSystem>,
+) -> LxResult<String> {
+    let target_norm = normalize_target(target);
+    let mount_node = resolve_mnode(&target_norm)?;
+    let flags = mount_state::MS_RDONLY;
+    let (fs, state) = prepare_fs(fs, flags, "");
+    mount_node.mount(fs).map_err(LxError::from)?;
+    // `served` is the word that tells this mount's line from one of the
+    // kernel's own filesystem of the same type.
+    let opts = build_options_string(flags, "served");
+    super::register_mount(source, &target_norm, fstype, &opts, Some(state));
+    super::dcache::invalidate();
+    // A filesystem on a device, as much as one the kernel reads itself:
+    // hunter queues it for the same scan.
+    hunter::media::note_mount(source, &target_norm, fstype);
+    Ok(target_norm)
+}
+
 /// `mount -t nfs host:/export target`.
 ///
 /// Everything network-specific is here and nothing of it leaks into the
@@ -587,6 +615,7 @@ pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
     mount_state::check_umount_flags(flags)?;
     let root = vfs_root().ok_or(LxError::EINVAL)?;
     umount_from(&root, &MOUNT_TABLE, target, flags)?;
+    super::served::unmounted(&normalize_target(target));
     hunter::media::note_umount(&normalize_target(target));
     Ok(())
 }

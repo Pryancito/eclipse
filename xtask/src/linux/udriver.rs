@@ -78,6 +78,14 @@ const NETSTACK: [&str; 5] = [
 ];
 const NETSTACK_USES: [&str; 2] = ["tools/eclipse-udrivers/src", "smoltcp/src"];
 
+/// A filesystem that runs as a process: its package, under `tools/`, its
+/// binaries -- `eclipse-fatfs DEVICE DIR` mounts a FAT volume it serves,
+/// and `eclipse-fs-bench` is what a mount is timed with -- and what it is
+/// built from besides its own sources.
+const FATFS_PACKAGE: &str = "eclipse-fatfs";
+const FATFS: [&str; 2] = ["eclipse-fatfs", "eclipse-fs-bench"];
+const FATFS_USES: [&str; 1] = ["tools/eclipse-udrivers/src"];
+
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk.
 ///
@@ -301,6 +309,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(NETSTACK_PACKAGE, &NETSTACK, &NETSTACK_USES);
         for name in NETSTACK {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(FATFS_PACKAGE, &FATFS, &FATFS_USES);
+        for name in FATFS {
             put(&built.join(name), name);
         }
     }

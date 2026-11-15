@@ -1337,6 +1337,10 @@ impl VMObjectTrait for VMObjectPaged {
         self.get_inner_mut().prefill(page_idx, pages);
     }
 
+    fn supply(&self, page_idx: usize, data: &[u8]) {
+        self.get_inner_mut().supply(page_idx, data);
+    }
+
     fn is_shared(&self) -> bool {
         self.shared.load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -1655,6 +1659,33 @@ impl VMObjectPagedInner {
             f(paddr + block.begin, buf_range);
         }
         Ok(())
+    }
+
+    /// The missing pages of the run that starts at `page_idx` become `data`'s,
+    /// a page each: what [`prefill`](Self::prefill) inserts, read by the
+    /// caller. On a root node with a source only, as there, and within the
+    /// object.
+    fn supply(&mut self, page_idx: usize, data: &[u8]) {
+        if self.parent.is_some() || self.type_.is_hidden() || self.source.is_none() {
+            return;
+        }
+        for (i, src) in data.as_chunks::<PAGE_SIZE>().0.iter().enumerate() {
+            let page = page_idx + i;
+            if page >= self.size / PAGE_SIZE {
+                break;
+            }
+            if self.frames.contains_key(&page) {
+                continue;
+            }
+            let Some(frame) = PhysFrame::new() else {
+                break;
+            };
+            let dst = phys_to_virt(frame.paddr()) as *mut u8;
+            // SAFETY: a fresh frame is one page of memory this object now
+            // owns, and `src` is exactly one page.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, PAGE_SIZE) };
+            self.frames.insert(page, PageState::new(frame));
+        }
     }
 
     /// Make the missing pages of `[page_idx, page_idx + pages)` resident from
@@ -2995,6 +3026,25 @@ mod tests {
         vmo.commit_page(20, MMUFlags::READ).unwrap();
         assert_eq!(page_byte(&vmo, 20), 20);
         assert_eq!(src.page_reads(), 1);
+    }
+
+    /// Supplied pages are resident without the source being read, and a
+    /// page that was already there keeps what it held.
+    #[test]
+    fn supplied_pages_are_resident_and_the_source_is_not_read() {
+        let src = CountingSource::new(32, false);
+        let vmo = VmObject::new_paged_cache(32, src.clone());
+        vmo.commit_page(1, MMUFlags::READ).unwrap();
+        let reads = (src.range_reads(), src.page_reads());
+        vmo.supply(0, &vec![0xAAu8; 3 * PAGE_SIZE]);
+        assert_eq!(vmo.committed_pages_in_range(0, 32), 3);
+        assert_eq!(page_byte(&vmo, 0), 0xAA);
+        assert_eq!(page_byte(&vmo, 1), 1, "the resident page is kept");
+        assert_eq!(page_byte(&vmo, 2), 0xAA);
+        assert_eq!((src.range_reads(), src.page_reads()), reads);
+        // Past the end of the object nothing is taken.
+        vmo.supply(31, &vec![0xBBu8; 2 * PAGE_SIZE]);
+        assert_eq!(vmo.committed_pages_in_range(0, 32), 4);
     }
 
     /// Pages already resident are neither re-read nor replaced: the read
