@@ -443,6 +443,10 @@ else ifeq ($(ARCH), aarch64)
   # throwaway overlay instead, so every restart finds the image as built.
   comma := ,
   aarch64_rootfs_opts := $(if $(filter 1,$(TEST)),$(comma)snapshot=on)
+  # The image of the variant asked for: `VARIANT=minimal` builds
+  # `aarch64-minimal.img`, and with `aarch64.img` spelled out here it booted
+  # the desktop image, or nothing on a tree that only has the minimal one.
+  aarch64_rootfs := $(if $(filter 1,$(LINUX)),$(user_img),aarch64.img)
 	qemu_opts += \
 		-machine virt \
 		-cpu cortex-a72 \
@@ -451,7 +455,7 @@ else ifeq ($(ARCH), aarch64)
 		-serial file:/tmp/serial.out \
 		-bios ../ignored/target/aarch64/firmware/QEMU_EFI.fd \
 		-hda fat:rw:disk \
-		-drive file=aarch64.img,if=none,format=raw,id=x0$(aarch64_rootfs_opts) \
+		-drive file=$(aarch64_rootfs),if=none,format=raw,id=x0$(aarch64_rootfs_opts) \
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 endif
 
