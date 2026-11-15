@@ -137,7 +137,9 @@ impl Syscall<'_> {
             sys::PREAD => {
                 BsdRet::from_result(self.sys_pread(a0.into(), a1.into(), a2, a3 as _).await)
             }
-            sys::PWRITE => BsdRet::from_result(self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _)),
+            sys::PWRITE => {
+                BsdRet::from_result(self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _).await)
+            }
             sys::OPEN => match translate::open_flags_to_linux(a1 as i32) {
                 Err(e) => BsdRet::from_lx(e),
                 Ok(f) => BsdRet::from_result(
@@ -155,8 +157,8 @@ impl Syscall<'_> {
             sys::CLOSE => BsdRet::from_result(self.sys_close(a0.into())),
             sys::CLOSE_RANGE => BsdRet::from_result(self.sys_close_range(a0, a1, a2)),
             sys::LSEEK => BsdRet::from_result(self.sys_lseek(a0.into(), a1 as i64, a2)),
-            sys::FSYNC => BsdRet::from_result(self.sys_fsync(a0.into())),
-            sys::FDATASYNC => BsdRet::from_result(self.sys_fdatasync(a0.into())),
+            sys::FSYNC => BsdRet::from_result(self.sys_fsync(a0.into()).await),
+            sys::FDATASYNC => BsdRet::from_result(self.sys_fdatasync(a0.into()).await),
             sys::TRUNCATE => BsdRet::from_result(self.sys_truncate(a0.into(), a1)),
             sys::FTRUNCATE => BsdRet::from_result(self.sys_ftruncate(a0.into(), a1)),
             sys::DUP => BsdRet::from_result(self.sys_dup(a0.into())),

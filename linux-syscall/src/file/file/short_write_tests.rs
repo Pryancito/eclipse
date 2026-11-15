@@ -238,8 +238,12 @@ fn a_positional_write_of_nothing_still_reaches_the_file_so_it_can_be_refused() {
         Box::pin(async move {
             let nothing: [u8; 0] = [];
             let at = nothing.as_ptr() as usize;
-            let refused = sys.sys_pwrite(FileDesc::from(readable), UserInPtr::from(at), 0, 0);
-            let allowed = sys.sys_pwrite(FileDesc::from(writable), UserInPtr::from(at), 0, 0);
+            let refused = sys
+                .sys_pwrite(FileDesc::from(readable), UserInPtr::from(at), 0, 0)
+                .await;
+            let allowed = sys
+                .sys_pwrite(FileDesc::from(writable), UserInPtr::from(at), 0, 0)
+                .await;
             (refused, allowed)
         })
     });
@@ -270,6 +274,7 @@ fn a_positional_write_the_file_only_partly_takes_reports_what_went_in() {
                 IT_IS_OFFERED,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
@@ -295,6 +300,7 @@ fn a_positional_write_the_file_refuses_outright_is_the_error_and_not_a_count() {
                 IT_IS_OFFERED,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
@@ -320,6 +326,7 @@ fn a_positional_write_that_fails_after_a_whole_chunk_reports_the_chunk() {
                 TWO_WHOLE_CHUNKS,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
@@ -444,12 +451,14 @@ fn a_positional_read_past_the_stack_buffer_stops_at_the_end_of_the_file() {
     let (put, got, what) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let fd = FileDesc::from(fd);
-            let put = sys.sys_pwrite(
-                fd,
-                UserInPtr::from(TEN_DIGITS.as_ptr() as usize),
-                TEN_DIGITS.len(),
-                0,
-            );
+            let put = sys
+                .sys_pwrite(
+                    fd,
+                    UserInPtr::from(TEN_DIGITS.as_ptr() as usize),
+                    TEN_DIGITS.len(),
+                    0,
+                )
+                .await;
             let mut out = vec![0u8; PAST_THE_STACK_BUFFER];
             let got = sys
                 .sys_pread(
@@ -495,6 +504,7 @@ fn a_positional_write_the_file_takes_none_of_is_a_count_of_nothing_and_not_a_spi
                 IT_IS_OFFERED,
                 0,
             )
+            .await
         })
     });
     assert_eq!(

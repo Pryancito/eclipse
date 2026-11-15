@@ -504,7 +504,10 @@ mod tests {
         let out = Err(Status::OUT_OF_RANGE);
         assert_eq!(check(&msg(OP_READ, 0, 0, 0), CAPACITY), out);
         assert_eq!(
-            check(&msg(OP_READ, 0, (DATA_MAX / SECTOR) as u32 + 1, 0), CAPACITY),
+            check(
+                &msg(OP_READ, 0, (DATA_MAX / SECTOR) as u32 + 1, 0),
+                CAPACITY
+            ),
             out,
             "more than the window"
         );

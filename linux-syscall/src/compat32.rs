@@ -293,7 +293,7 @@ impl Syscall<'_> {
             I386_GET_THREAD_AREA => return syscall_ret(self.sys_get_thread_area(a0)),
             I386_LLSEEK => return syscall_ret(self.sys_llseek(a0, a1, a2, a3, a4)),
             I386_PREAD64 => return syscall_ret(self.sys_pread64(a0, a1, a2, a3, a4).await),
-            I386_PWRITE64 => return syscall_ret(self.sys_pwrite64(a0, a1, a2, a3, a4)),
+            I386_PWRITE64 => return syscall_ret(self.sys_pwrite64(a0, a1, a2, a3, a4).await),
             I386_MMAP2 => {
                 return syscall_ret(self.sys_mmap2(a0, a1, a2, a3, a4, a5).await);
             }

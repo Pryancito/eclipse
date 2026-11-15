@@ -1474,6 +1474,44 @@ impl File {
     }
 }
 
+impl File {
+    /// `pwrite` on the node of a disk that answers asynchronously (one
+    /// served by a process), the task asleep until the answer: `None` for
+    /// everything else, which is written with
+    /// [`write_at`](FileLike::write_at).
+    ///
+    /// What makes the difference is who is waiting. The process that
+    /// writes to such a disk is often a filesystem server with a client's
+    /// request open, and the client waits for it giving its CPU away turn
+    /// by turn: a server that waited for its disk the same way was a wait
+    /// inside a wait, and each of those sets a fresh executor up.
+    pub async fn write_at_asleep(&self, offset: u64, buf: &[u8]) -> Option<LxResult<usize>> {
+        let (flags, inode) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone())
+        };
+        let dev = inode.downcast_ref::<super::devfs::BlockDev>()?;
+        let write = dev.write_at_async(offset as usize, buf)?;
+        if !flags.writable() {
+            return Some(Err(LxError::EBADF));
+        }
+        let written = write.await.map_err(LxError::from);
+        if let Ok(n) = written {
+            // As after `write_at`: the mappings of the node see the write.
+            cache_overlay_write(&inode, offset as usize, &buf[..n]);
+        }
+        Some(written)
+    }
+
+    /// `fsync` on such a node, on the same terms.
+    pub async fn sync_asleep(&self) -> Option<LxResult<()>> {
+        let inode = self.inner.read().inode.clone();
+        let dev = inode.downcast_ref::<super::devfs::BlockDev>()?;
+        let sync = dev.sync_async()?;
+        Some(sync.await.map_err(LxError::from))
+    }
+}
+
 #[async_trait]
 impl FileLike for File {
     fn flags(&self) -> OpenFlags {

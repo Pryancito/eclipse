@@ -50,6 +50,28 @@ impl BlockDev {
         let read = self.block.read_block_async(offset / BS, buf)?;
         Some(async move { read.await.map(|()| len).map_err(convert_error) })
     }
+
+    /// `write_at`, as a future, on the same terms as
+    /// [`read_at_async`](Self::read_at_async).
+    pub fn write_at_async<'a>(
+        &'a self,
+        offset: usize,
+        buf: &'a [u8],
+    ) -> Option<impl core::future::Future<Output = Result<usize>> + 'a> {
+        const BS: usize = 512;
+        if buf.is_empty() || !offset.is_multiple_of(BS) || !buf.len().is_multiple_of(BS) {
+            return None;
+        }
+        let len = buf.len();
+        let write = self.block.write_block_async(offset / BS, buf)?;
+        Some(async move { write.await.map(|()| len).map_err(convert_error) })
+    }
+
+    /// `fsync` on the node, as a future, when the disk has one.
+    pub fn sync_async(&self) -> Option<impl core::future::Future<Output = Result<()>> + '_> {
+        let flush = self.block.flush_async()?;
+        Some(async move { flush.await.map_err(convert_error) })
+    }
 }
 
 impl INode for BlockDev {
@@ -303,8 +325,25 @@ impl BlockScheme for PartitionBlock {
             .read_block_async(self.start_block + block_id, buf)
     }
 
+    fn write_block_async<'a>(
+        &'a self,
+        block_id: usize,
+        buf: &'a [u8],
+    ) -> Option<zcore_drivers::scheme::BlockReadFuture<'a>> {
+        let nsectors = buf.len() / 512;
+        if block_id + nsectors > self.block_count {
+            return None;
+        }
+        self.parent
+            .write_block_async(self.start_block + block_id, buf)
+    }
+
     fn flush(&self) -> zcore_drivers::DeviceResult {
         self.parent.flush()
+    }
+
+    fn flush_async(&self) -> Option<zcore_drivers::scheme::BlockReadFuture<'_>> {
+        self.parent.flush_async()
     }
 
     fn block_count(&self) -> usize {
