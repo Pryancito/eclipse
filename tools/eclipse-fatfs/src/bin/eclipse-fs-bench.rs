@@ -14,6 +14,11 @@
 //! written in order through 64 KiB and 4 KiB buffers, written over, written
 //! at 500 scattered offsets, synced and read back, then the files renamed
 //! and removed.
+//!
+//! `eclipse-fs-bench -d DEVICE` times the disk under a filesystem: 8 MiB
+//! of the device, 1 MiB in, read through 1 MiB, 64 KiB and 4 KiB buffers
+//! and written back as read -- the device is left as it was -- in order and
+//! at 500 scattered places, with an `fsync` after each pass of writes.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -180,15 +185,84 @@ fn writing(dir: &Path) {
     ok("remove", fs::remove_dir_all(&top));
 }
 
+/// `-d`: time the device at `path`, writing back only what was read.
+fn device(path: &Path) {
+    const AT: u64 = 1 << 20;
+    const SPAN: usize = 8 << 20;
+    let ok =
+        |what: &str, r: std::io::Result<()>| r.unwrap_or_else(|e| die(format_args!("{what}: {e}")));
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| die(format_args!("{}: {e}", path.display())));
+    let mut held = vec![0u8; SPAN];
+    let sizes = [("1M", 1 << 20), ("64k", 64 << 10), ("4k", 4096)];
+    for (name, buf) in sizes {
+        let ((), us) = timed(|| {
+            for (i, chunk) in held.chunks_mut(buf).enumerate() {
+                ok("pread", file.read_exact_at(chunk, AT + (i * buf) as u64));
+            }
+        });
+        line(
+            &format!("dev read {name}"),
+            (SPAN / buf) as u64,
+            SPAN as u64,
+            us,
+        );
+    }
+    let sum = held.iter().fold(0u64, |s, &b| s.wrapping_add(b as u64));
+    for (name, buf) in sizes {
+        let ((), us) = timed(|| {
+            for (i, chunk) in held.chunks(buf).enumerate() {
+                ok("pwrite", file.write_all_at(chunk, AT + (i * buf) as u64));
+            }
+        });
+        line(
+            &format!("dev write {name}"),
+            (SPAN / buf) as u64,
+            SPAN as u64,
+            us,
+        );
+        let ((), us) = timed(|| ok("fsync", file.sync_all()));
+        line(&format!("dev fsync after {name}"), 1, 0, us);
+    }
+    let mut at = 12345u64;
+    let ((), us) = timed(|| {
+        for _ in 0..500 {
+            at = at
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let off = ((at >> 20) % (SPAN as u64 - 4096)) / 512 * 512;
+            let piece = &held[off as usize..off as usize + 4096];
+            ok("pwrite", file.write_all_at(piece, AT + off));
+        }
+    });
+    line("dev pwrite 4k", 500, 500 * 4096, us);
+    let ((), us) = timed(|| ok("fsync", file.sync_all()));
+    line("dev fsync", 1, 0, us);
+    let mut back = vec![0u8; SPAN];
+    ok("pread", file.read_exact_at(&mut back, AT));
+    println!(
+        "device: sum {sum:x}, read back {}",
+        if back == held { "same" } else { "DIFFERENT" }
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag, dir] = args.as_slice() {
         if flag == "-w" {
             return writing(Path::new(dir));
         }
+        if flag == "-d" {
+            return device(Path::new(dir));
+        }
     }
     let Some(dir) = args.first() else {
-        eprintln!("usage: eclipse-fs-bench DIR [BIG]\n       eclipse-fs-bench -w DIR");
+        eprintln!(
+            "usage: eclipse-fs-bench DIR [BIG]\n       eclipse-fs-bench -w DIR\n       eclipse-fs-bench -d DEVICE"
+        );
         std::process::exit(2)
     };
     let dir = Path::new(dir);
