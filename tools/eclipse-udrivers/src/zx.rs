@@ -26,8 +26,10 @@ pub mod nr {
     pub const FIFO_READ: i64 = 35;
     pub const FIFO_WRITE: i64 = 36;
     pub const HANDLE_CLOSE: i64 = 45;
+    pub const HANDLE_DUPLICATE: i64 = 47;
     pub const INTERRUPT_WAIT: i64 = 54;
     pub const OBJECT_WAIT_ONE: i64 = 81;
+    pub const VMO_CREATE: i64 = 191;
     pub const VMO_CREATE_CHILD: i64 = 192;
     pub const VMO_CREATE_CONTIGUOUS: i64 = 193;
     pub const ECLIPSE_HANDLE_TO_FD: i64 = 0x4000;
@@ -41,6 +43,7 @@ pub mod nr {
     pub const ECLIPSE_NETSTACK_USE: i64 = 0x400a;
     pub const ECLIPSE_NET_BORROW: i64 = 0x400b;
     pub const ECLIPSE_NET_LENT_TURN: i64 = 0x400c;
+    pub const ECLIPSE_FS_SERVE: i64 = 0x400d;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.
@@ -149,6 +152,38 @@ pub fn close(handle: Handle) {
     // SAFETY: no pointers. A handle that is not one is the only way this
     // fails, and there is nothing to do about it.
     let _ = unsafe { call(nr::HANDLE_CLOSE, [handle as usize, 0, 0, 0, 0, 0]) };
+}
+
+/// `len` bytes (whole pages) of zeroed memory to share with the kernel: a
+/// VMO made for it, mapped here, and a second handle to it to give away.
+pub fn shared_memory(len: usize) -> Result<(*mut u8, Handle), String> {
+    /// `ZX_RIGHT_SAME_RIGHTS`.
+    const SAME_RIGHTS: usize = 1 << 31;
+    let (mut vmo, mut other): (Handle, Handle) = (0, 0);
+    // SAFETY: the kernel writes a handle into `vmo`.
+    unsafe {
+        call(
+            nr::VMO_CREATE,
+            [len, 0, &mut vmo as *mut Handle as usize, 0, 0, 0],
+        )
+    }
+    .map_err(|e| format!("vmo_create: {e}"))?;
+    // SAFETY: the kernel writes a handle into `other`.
+    unsafe {
+        call(
+            nr::HANDLE_DUPLICATE,
+            [
+                vmo as usize,
+                SAME_RIGHTS,
+                &mut other as *mut Handle as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+    .map_err(|e| format!("handle_duplicate: {e}"))?;
+    Ok((map(vmo, len)?, other))
 }
 
 /// Map all `len` bytes of the VMO `vmo`, readable and writable, shared

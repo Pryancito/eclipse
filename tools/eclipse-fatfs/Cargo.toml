@@ -1,0 +1,42 @@
+[package]
+name = "eclipse-fatfs"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS FAT filesystem that runs as a process"
+
+# Standalone: NOT a workspace member. It targets userspace
+# (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
+# builds it on its own (see `xtask/src/linux/udriver.rs`), like the drivers.
+[workspace]
+
+[lib]
+name = "fatserve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eclipse-fatfs"
+path = "src/main.rs"
+
+# A test program: what a filesystem is timed with from inside the machine,
+# mounted one way and then another.
+[[bin]]
+name = "eclipse-fs-bench"
+path = "src/bin/eclipse-fs-bench.rs"
+
+[dependencies]
+libc = "0.2"
+# The system calls and the FIFO.
+udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
+# The same FAT code the kernel links for its own FAT, at the commit the
+# tree's Cargo.lock has it at: what runs here and what runs there differ in
+# where, not in what.
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "2aefc2a027ce94ed0671752814dac203f0450e11", default-features = false, features = ["std", "alloc", "lfn", "log_level_warn"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+# Nothing to unwind into: the kernel answers what this had not with an I/O
+# error, and whoever started it starts it again.
+panic = "abort"
+strip = true

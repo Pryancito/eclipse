@@ -106,6 +106,15 @@ pub trait VMObjectTrait: Sync + Send {
     /// on its own as before. A no-op on objects with no backing source.
     fn prefill(&self, _page_idx: usize, _pages: usize) {}
 
+    /// [`prefill`](Self::prefill) with the bytes already in hand: `data`,
+    /// whole pages of the backing source from page `page_idx` on, becomes the
+    /// pages of that run that are not resident yet. For a caller that reads
+    /// the source itself -- where it can wait, and can tell a read that
+    /// failed from zeros -- and leaves the object's lock out of the read.
+    /// Pages already resident keep what they hold. A no-op on objects with
+    /// no backing source.
+    fn supply(&self, _page_idx: usize, _data: &[u8]) {}
+
     /// Decommit allocated physical memory.
     fn decommit(&self, offset: usize, len: usize) -> ZxResult;
 

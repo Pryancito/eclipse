@@ -41,6 +41,7 @@ pub mod pty;
 pub mod rcore_fs_wrapper;
 pub mod record_lock;
 mod search;
+pub mod served;
 mod signalfd;
 pub mod stdio;
 mod syncobj_eventfd;

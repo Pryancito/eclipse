@@ -1028,6 +1028,7 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Ok(()) => 0,
             Err(e) => status(e),
         },
+        fs_serve::ECLIPSE_FS_SERVE => fs_serve::fs_serve(proc, args),
         ECLIPSE_NET_SERVE => match net_serve::net_serve(proc, args) {
             Ok(()) => 0,
             Err(e) => status(e),
@@ -3080,6 +3081,8 @@ use device_claim::claim_device;
 mod block_serve;
 #[cfg(feature = "zircon-gateway")]
 mod fifo_turn;
+#[cfg(feature = "zircon-gateway")]
+mod fs_serve;
 #[cfg(feature = "zircon-gateway")]
 mod net_lend;
 #[cfg(feature = "zircon-gateway")]

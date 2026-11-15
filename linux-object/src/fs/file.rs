@@ -647,6 +647,70 @@ pub(crate) fn cache_overlay_read(inode: &Arc<dyn INode>, offset: usize, buf: &mu
     }
 }
 
+/// `read(2)`/`pread(2)` of a file that a process serves
+/// ([`served`](super::served)): from the file's page cache, the same one
+/// its mappings use, so that bytes read once are not asked for again. `None`
+/// for any other file, and for one whose cache does not cover the read.
+///
+/// The pages the cache lacks are read here, a server's window at a time,
+/// and handed to it ([`supply`](zircon_object::vm::VMObjectTrait::supply)):
+/// the cache's own fill runs with its lock held and turns a read that
+/// failed into zeros, which a mapping has to live with and `read` does not.
+fn served_read(
+    inode: &Arc<dyn INode>,
+    path: &str,
+    offset: usize,
+    buf: &mut [u8],
+) -> Option<LxResult<usize>> {
+    use super::served::wire::DATA_AREA;
+    if !super::served::is_file(&**inode) {
+        return None;
+    }
+    let size = match inode.metadata() {
+        Ok(meta) => meta.size,
+        Err(e) => return Some(Err(e.into())),
+    };
+    if buf.is_empty() || offset >= size {
+        return Some(Ok(0));
+    }
+    let len = buf.len().min(size - offset);
+    let vmo = inode_cache_vmo(inode, path, size, offset, len, false)?;
+    let end = offset + len;
+    let mut window = offset / DATA_AREA * DATA_AREA;
+    let mut fetched = Vec::new();
+    while window < end {
+        // The pages of this window the read touches: if the cache has
+        // them, the rest of the window is not this read's to fetch.
+        let asked =
+            window.max(offset) / PAGE_SIZE..(window + DATA_AREA).min(end).div_ceil(PAGE_SIZE);
+        if asked.clone().any(|p| vmo.committed_paddr(p).is_none()) {
+            // The whole window, or what the file has of it: whole pages,
+            // zeros past the end of the file.
+            let pages = window / PAGE_SIZE..(window + DATA_AREA).min(size).div_ceil(PAGE_SIZE);
+            fetched.clear();
+            fetched.resize(pages.len() * PAGE_SIZE, 0);
+            let want = fetched.len().min(size - window);
+            let mut done = 0;
+            while done < want {
+                match inode.read_at(window + done, &mut fetched[done..want]) {
+                    // The file is shorter than its directory says: not
+                    // zeros to keep as its bytes.
+                    Ok(0) => return Some(Err(LxError::EIO)),
+                    Ok(n) => done += n,
+                    Err(e) => return Some(Err(e.into())),
+                }
+            }
+            vmo.supply(pages.start, &fetched);
+        }
+        window += DATA_AREA;
+    }
+    Some(
+        vmo.read(offset, &mut buf[..len])
+            .map(|()| len)
+            .map_err(|_| LxError::EIO),
+    )
+}
+
 /// The queues reads of a disk filesystem wait in, one per filesystem (by its
 /// address; two that land on the same slot only share a queue).
 static DISK_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
@@ -1451,6 +1515,11 @@ impl FileLike for File {
                 return len;
             }
         }
+        if let Some(read) = served_read(&inode, &self.path, offset as usize, buf) {
+            let len = read?;
+            self.inner.write().offset += len as u64;
+            return Ok(len);
+        }
 
         let len = if !flags.non_block() {
             // block
@@ -1537,6 +1606,9 @@ impl FileLike for File {
             if let Some(len) = self.seq_read(&inode, kept, offset, buf, false) {
                 return len;
             }
+        }
+        if let Some(read) = served_read(&inode, &self.path, offset as usize, buf) {
+            return read;
         }
 
         // A disk that answers asynchronously (one served by a process): the
