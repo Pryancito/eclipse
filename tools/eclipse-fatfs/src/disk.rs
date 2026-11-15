@@ -10,7 +10,8 @@
 //!
 //! What is written stays in its chunk until the chunk is let go or
 //! [`Disk::flush`] is called, and then goes to the device as runs of
-//! sectors. A chunk knows which of its sectors it holds: whole sectors
+//! sectors: what follows on the device, in one chunk or over several, is
+//! one write of it. A chunk knows which of its sectors it holds: whole sectors
 //! written into a chunk that was never read (a new file's clusters) do not
 //! read the device first.
 //!
@@ -45,6 +46,9 @@ pub const CHUNK: usize = 64 * 1024;
 pub const CHUNKS_KEPT: usize = 64;
 
 const SECTOR: usize = 512;
+/// The most one write of the device carries when [`Disk::flush`] joins
+/// what follows on it: 1 MiB.
+const WRITE_MOST: usize = 16 * CHUNK;
 /// One bit for each sector of a chunk.
 type Sectors = u128;
 const _: () = assert!(CHUNK / SECTOR == Sectors::BITS as usize);
@@ -303,6 +307,9 @@ pub struct Disk<B> {
     /// not made.
     #[cfg(test)]
     pub changes_left: Option<u64>,
+    /// In a test, how many times the stream was read.
+    #[cfg(test)]
+    pub reads: u64,
     /// How many times the device was read, and written.
     pub device_reads: u64,
     pub device_writes: u64,
@@ -396,6 +403,8 @@ impl<B: Blocks> Disk<B> {
             group: None,
             #[cfg(test)]
             changes_left: None,
+            #[cfg(test)]
+            reads: 0,
             device_reads: 0,
             device_writes: 0,
         };
@@ -513,19 +522,44 @@ impl<B: Blocks> Disk<B> {
         (self.len - index * CHUNK as u64).min(CHUNK as u64) as usize
     }
 
-    /// Write the sectors of the chunk in `place` the device does not have,
-    /// a run of them at a time.
+    /// The stretches of the chunk in `place` to write so that the device
+    /// has all of it: `[from, to)` in sectors each.
+    ///
+    /// Sectors the device has, between two it does not, are written with
+    /// them when the chunk holds them: they are what the device has, and
+    /// one write of the device costs more than the sectors in it. Writes
+    /// here and there over a file leave a chunk with a dozen stretches
+    /// to write, a write of the device each.
+    fn stretches(&self, place: usize) -> Vec<(usize, usize)> {
+        let meta = self.kept.meta(place);
+        let (held, mut left) = (meta.held, meta.dirty);
+        let mut stretches: Vec<(usize, usize)> = Vec::new();
+        while left != 0 {
+            let from = left.trailing_zeros() as usize;
+            let to = from + (left >> from).trailing_ones() as usize;
+            left &= !sectors(from, to);
+            match stretches.last_mut() {
+                Some(last) if sectors(last.1, from) & !held == 0 => last.1 = to,
+                _ => stretches.push((from, to)),
+            }
+        }
+        stretches
+    }
+
+    /// Where on the device the sectors `[from, to)` of the chunk `index`
+    /// are, in bytes: the last chunk may end inside its last sector.
+    fn bytes_of(&self, index: u64, from: usize, to: usize) -> (usize, usize) {
+        (from * SECTOR, (to * SECTOR).min(self.chunk_len(index)))
+    }
+
+    /// Write the sectors of the chunk in `place` the device does not have.
     fn write_out(&mut self, place: usize) -> io::Result<()> {
         let index = self.kept.meta(place).index;
         if index == NO_CHUNK {
             return Ok(());
         }
-        let len = self.chunk_len(index);
-        let mut left = self.kept.meta(place).dirty;
-        while left != 0 {
-            let from = left.trailing_zeros() as usize;
-            let run = (left >> from).trailing_ones() as usize;
-            let (start, end) = (from * SECTOR, ((from + run) * SECTOR).min(len));
+        for (from, to) in self.stretches(place) {
+            let (start, end) = self.bytes_of(index, from, to);
             if !self.alive() {
                 return Ok(());
             }
@@ -535,22 +569,69 @@ impl<B: Blocks> Disk<B> {
                 index * CHUNK as u64 + start as u64,
                 &self.kept.bytes(place)[start..end],
             )?;
-            left &= !sectors(from, from + run);
-            self.kept.meta_mut(place).dirty = left;
+            self.kept.meta_mut(place).dirty &= !sectors(from, to);
         }
         Ok(())
     }
 
     /// Everything written reaches the device, and the device its medium.
+    ///
+    /// Stretches that follow one another on the device -- the chunks of a
+    /// file written in order, or over and over -- are one write of it, up
+    /// to [`WRITE_MOST`].
     pub fn flush(&mut self) -> io::Result<()> {
-        let mut dirty: Vec<(u64, usize)> = (0..CHUNKS_KEPT)
-            .map(|place| (self.kept.meta(place), place))
-            .filter(|(meta, _)| meta.index != NO_CHUNK && meta.dirty != 0)
-            .map(|(meta, place)| (meta.index, place))
-            .collect();
+        // Each stretch: where on the device it starts and ends, and whose
+        // it is.
+        let mut dirty: Vec<(u64, u64, usize, usize, usize)> = Vec::new();
+        for place in 0..CHUNKS_KEPT {
+            let meta = self.kept.meta(place);
+            if meta.index == NO_CHUNK || meta.dirty == 0 {
+                continue;
+            }
+            let index = meta.index;
+            for (from, to) in self.stretches(place) {
+                let (start, end) = self.bytes_of(index, from, to);
+                let base = index * CHUNK as u64;
+                dirty.push((base + start as u64, base + end as u64, place, from, to));
+            }
+        }
         dirty.sort_unstable();
-        for (_, place) in dirty {
-            self.write_out(place)?;
+        let mut joined = Vec::new();
+        let mut at = 0;
+        while at < dirty.len() {
+            // Those from `at` on that follow one another.
+            let mut next = at + 1;
+            while next < dirty.len()
+                && dirty[next].0 == dirty[next - 1].1
+                && dirty[next].1 - dirty[at].0 <= WRITE_MOST as u64
+            {
+                next += 1;
+            }
+            if !self.alive() {
+                return Ok(());
+            }
+            self.device_writes += 1;
+            let (start, _, place, from, _) = dirty[at];
+            if next == at + 1 {
+                let within = (start % CHUNK as u64) as usize;
+                let len = (dirty[at].1 - start) as usize;
+                let bytes = &self.kept.bytes(place)[within..within + len];
+                debug_assert_eq!(within, from * SECTOR);
+                write_fully(&mut self.blocks, start, bytes)?;
+            } else {
+                joined.clear();
+                for (start, end, place, ..) in &dirty[at..next] {
+                    let within = (start % CHUNK as u64) as usize;
+                    let len = (end - start) as usize;
+                    joined.extend_from_slice(&self.kept.bytes(*place)[within..within + len]);
+                }
+                write_fully(&mut self.blocks, start, &joined)?;
+            }
+            // On the device, all of them: only now.
+            for (_, _, place, from, to) in &dirty[at..next] {
+                self.kept.meta_mut(*place).dirty &= !sectors(*from, *to);
+            }
+            at = next;
         }
         self.blocks.sync()
     }
@@ -766,6 +847,10 @@ impl<B: Blocks> Read for Disk<B> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
         }
         let n = self.read_chunk(self.pos, buf)?;
         self.pos += n as u64;
@@ -1003,8 +1088,114 @@ mod tests {
     }
 
     /// Memory for [`Kept::at`], as a mapping the kernel holds would be.
+    #[test]
+    fn what_a_chunk_holds_between_two_writes_goes_to_the_device_with_them() {
+        let dev = device(4 * CHUNK);
+        let mut disk = Disk::new(dev.clone(), dev.len() as u64);
+        // A chunk read whole, then written here and there.
+        read_all(&mut disk, 0, CHUNK);
+        for sector in [3u64, 40, 41, 100] {
+            disk.write_all_at(sector * 512 + 7, &[sector as u8; 100])
+                .unwrap();
+        }
+        disk.flush().unwrap();
+        assert_eq!(disk.device_writes, 1);
+        // Whole sectors written into a chunk that was not read: what is
+        // between them is not held, and is not written.
+        disk.write_all_at(CHUNK as u64 + 512, &[1; 512]).unwrap();
+        disk.write_all_at(CHUNK as u64 + 9 * 512, &[2; 1024])
+            .unwrap();
+        let mut expect = disk.blocks().clone();
+        expect[CHUNK + 512..CHUNK + 1024].fill(1);
+        expect[CHUNK + 9 * 512..CHUNK + 11 * 512].fill(2);
+        disk.flush().unwrap();
+        assert_eq!(disk.device_writes, 3);
+        assert_eq!(*disk.blocks(), expect);
+        assert!(!disk.is_dirty());
+        for sector in [3usize, 40, 41, 100] {
+            let at = sector * 512 + 7;
+            assert_eq!(disk.blocks()[at..at + 100], [sector as u8; 100]);
+            assert_eq!(disk.blocks()[at + 100], dev[at + 100]);
+        }
+    }
+
+    #[test]
+    fn chunks_that_follow_one_another_are_one_write_of_the_device() {
+        let dev = device(40 * CHUNK);
+        let mut disk = Disk::new(dev.clone(), dev.len() as u64);
+        // Whole sectors, a few at a time: they wait in their chunks. From
+        // the middle of one chunk to the middle of the fourth after it.
+        let (from, to) = (CHUNK + 4096, 5 * CHUNK - 8192);
+        let bytes: Vec<u8> = (from..to).map(|i| (i / 4096) as u8).collect();
+        for (i, piece) in bytes.chunks(4096).enumerate() {
+            disk.write_all_at((from + i * 4096) as u64, piece).unwrap();
+        }
+        // And one somewhere else.
+        disk.write_all_at(9 * CHUNK as u64, &[5; 512]).unwrap();
+        assert_eq!(disk.device_writes, 0);
+        disk.flush().unwrap();
+        assert_eq!(disk.device_writes, 2);
+        assert_eq!(disk.blocks()[from..to], bytes[..]);
+        assert_eq!(disk.blocks()[..from], dev[..from]);
+        assert_eq!(disk.blocks()[to..9 * CHUNK], dev[to..9 * CHUNK]);
+        assert_eq!(disk.blocks()[9 * CHUNK..9 * CHUNK + 512], [5; 512]);
+
+        // More than one write carries is more than one write.
+        let long = vec![3u8; 4096];
+        for i in 0..(WRITE_MOST + 2 * CHUNK) / 4096 {
+            disk.write_all_at((12 * CHUNK + i * 4096) as u64, &long)
+                .unwrap();
+        }
+        let before = disk.device_writes;
+        disk.flush().unwrap();
+        assert_eq!(disk.device_writes - before, 2);
+        assert!(
+            disk.blocks()[12 * CHUNK..12 * CHUNK + WRITE_MOST + 2 * CHUNK]
+                .iter()
+                .all(|b| *b == 3)
+        );
+    }
+
     fn memory() -> Vec<u128> {
         vec![0u128; Kept::LEN / 16]
+    }
+
+    #[test]
+    fn a_flush_a_dead_disk_was_making_is_finished_by_the_next() {
+        let dev = device(8 * CHUNK);
+        let len = dev.len() as u64;
+        let mut whole = None;
+        for cut in 0.. {
+            let mut memory = memory();
+            let base = memory.as_mut_ptr().cast::<u8>();
+            // SAFETY: the test's own memory, one `Disk` over it at a time.
+            let mut disk = Disk::over(dev.clone(), len, unsafe { Kept::at(base) }).unwrap();
+            read_all(&mut disk, 0, CHUNK);
+            for (at, byte) in [(700u64, 1u8), (30_000, 2), (CHUNK as u64 - 512, 3)] {
+                disk.write_all_at(at, &[byte; 600]).unwrap();
+            }
+            disk.write_all_at(3 * CHUNK as u64, &[4; 2048]).unwrap();
+            // It dies `cut` writes of the device into the flush.
+            disk.changes_left = Some(cut);
+            disk.flush().unwrap();
+            let died = disk.changes_left == Some(0);
+            let left = disk.blocks().clone();
+            core::mem::forget(disk);
+            // SAFETY: as above; the first is gone.
+            let mut next = Disk::over(left, len, unsafe { Kept::at(base) }).unwrap();
+            next.flush().unwrap();
+            assert!(!next.is_dirty());
+            let now = next.blocks().clone();
+            assert_eq!(now[700..1300], [1; 600], "cut {cut}");
+            assert_eq!(now[30_000..30_600], [2; 600], "cut {cut}");
+            assert_eq!(now[CHUNK - 512..CHUNK + 88], [3; 600], "cut {cut}");
+            assert_eq!(now[3 * CHUNK..3 * CHUNK + 2048], [4; 2048], "cut {cut}");
+            assert_eq!(*whole.get_or_insert(now.clone()), now, "cut {cut}");
+            if !died {
+                assert!(cut >= 2, "{cut} writes");
+                break;
+            }
+        }
     }
 
     #[test]

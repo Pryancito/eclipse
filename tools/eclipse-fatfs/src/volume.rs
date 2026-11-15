@@ -17,6 +17,7 @@
 //! end for each piece.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,10 @@ use crate::wire::{self, Entry, STATFS_LEN};
 
 /// The files remembered.
 const FILES_KEPT: usize = 32;
+
+/// The directories whose names are remembered. The kernel keeps the
+/// listing of every directory it has read; this is the same for a few.
+const NAMES_KEPT: usize = 4;
 
 /// `statfs`'s magic for FAT: `MSDOS_SUPER_MAGIC`.
 const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
@@ -176,6 +181,24 @@ struct Open {
     stamped: i64,
 }
 
+/// The names of a directory asked about lately.
+///
+/// Whether a name is in a directory is asked before every change -- is
+/// what is to be made there already, is what is to be renamed there, is
+/// there something to take the place of -- and the FAT code answers by
+/// reading the directory an entry at a time up to the name, or to the end
+/// when it is not there. Only this server changes the volume, so what it
+/// read once it knows until it changes it itself.
+struct Names {
+    /// The directory's path, in lower case: FAT's names are the same
+    /// whatever their case.
+    dir: String,
+    /// By name in lower case: the entry as the directory had it, or `None`
+    /// for one that is there and was changed since -- written, cut, made
+    /// -- which is read again when it is asked for.
+    by_name: HashMap<String, Option<Entry>>,
+}
+
 /// The clusters of a file, each `(place on the disk, bytes)`, as runs:
 /// clusters that follow one another on the disk are one run.
 fn runs_of(clusters: impl Iterator<Item = (u64, u64)>) -> (Vec<Run>, u64) {
@@ -220,6 +243,12 @@ pub struct Volume<B: Blocks + 'static> {
     /// The directory listed last: one that does not fit a reply is asked
     /// for again from where the reply stopped.
     listed: Option<(String, Vec<Entry>)>,
+    /// The names of the directories asked about last, the most recent at
+    /// the end.
+    names: Vec<Names>,
+    /// The path last marked as changed in `names`: a file is written many
+    /// times over, and marked once.
+    marked: String,
     /// Something was written since the volume was last left clean.
     changed: bool,
     /// This server took the volume over from one that died, and the
@@ -272,7 +301,12 @@ impl<B: Blocks + 'static> Volume<B> {
             disk,
             open: Vec::new(),
             listed: None,
-            changed: false,
+            names: Vec::new(),
+            marked: String::new(),
+            // The mark is this one's to take off at the first sync, having
+            // written anything itself or not: an unmount asks for a sync
+            // and does not wait for what this does after it.
+            changed: marks_clean,
             marks_clean,
             opens: 0,
         })
@@ -365,15 +399,82 @@ impl<B: Blocks + 'static> Volume<B> {
         self.scan(path, |_| (true, false))
     }
 
-    /// The entry at `path`, as its directory lists it.
-    fn entry_at(&self, path: &str) -> Result<Entry, Errno> {
-        let (dir, name) = split_path(path);
-        let folded = name.to_lowercase();
+    /// The entry of `name` in the directory `dir`, by reading the
+    /// directory up to it.
+    fn entry_read(&self, dir: &str, folded: &str) -> Result<Entry, Errno> {
         let is_it = |name: &str| {
             let found = name.to_lowercase() == folded;
             (found, found)
         };
         self.scan(dir, is_it)?.pop().ok_or(libc::ENOENT)
+    }
+
+    /// The entry at `path`, as its directory lists it.
+    fn entry_at(&mut self, path: &str) -> Result<Entry, Errno> {
+        let (dir, name) = split_path(path);
+        let (key, folded) = (dir.to_lowercase(), name.to_lowercase());
+        let names = match self.names.iter().position(|names| names.dir == key) {
+            Some(i) => self.names.remove(i),
+            None => {
+                let entries = self.entries(dir)?;
+                let mut by_name = HashMap::with_capacity(entries.len());
+                for entry in entries {
+                    // The first of two names that differ in case only is
+                    // the one a reading of the directory finds.
+                    by_name
+                        .entry(entry.name.to_lowercase())
+                        .or_insert(Some(entry));
+                }
+                if self.names.len() >= NAMES_KEPT {
+                    self.names.remove(0);
+                }
+                // Read now, with what was marked: marked again when it
+                // changes again.
+                self.marked.clear();
+                Names { dir: key, by_name }
+            }
+        };
+        self.names.push(names);
+        let known = self.names.last().expect("just pushed").by_name.get(&folded);
+        match known {
+            None => Err(libc::ENOENT),
+            Some(Some(entry)) => Ok(entry.clone()),
+            Some(None) => {
+                let entry = self.entry_read(dir, &folded)?;
+                let names = self.names.last_mut().expect("just pushed");
+                names.by_name.insert(folded, Some(entry.clone()));
+                self.marked.clear();
+                Ok(entry)
+            }
+        }
+    }
+
+    /// The entry at `path` is there and is not what `names` has of it:
+    /// it was made, or what it says of its file changed.
+    fn mark(&mut self, path: &str) {
+        if self.marked == path {
+            return;
+        }
+        let (dir, name) = split_path(path);
+        let key = dir.to_lowercase();
+        if let Some(names) = self.names.iter_mut().find(|names| names.dir == key) {
+            names.by_name.insert(name.to_lowercase(), None);
+        }
+        self.marked.clear();
+        self.marked.push_str(path);
+    }
+
+    /// The entry at `path` is gone, and what was under it.
+    fn forget(&mut self, path: &str) {
+        let (dir, name) = split_path(path);
+        let (key, folded) = (dir.to_lowercase(), name.to_lowercase());
+        if let Some(names) = self.names.iter_mut().find(|names| names.dir == key) {
+            names.by_name.remove(&folded);
+        }
+        let (gone, under) = (path.to_lowercase(), path.to_lowercase() + "/");
+        self.names
+            .retain(|names| names.dir != gone && !names.dir.starts_with(&under));
+        self.marked.clear();
     }
 
     /// `OP_LIST`: the entries of the directory `path` from entry `start`
@@ -476,6 +577,7 @@ impl<B: Blocks + 'static> Volume<B> {
         }
         self.listed = None;
         self.changed = true;
+        self.mark(path);
         let now = unix_now();
         let mut appending = match self.appending.take() {
             Some(appending) if appending.path == path => appending,
@@ -592,6 +694,7 @@ impl<B: Blocks + 'static> Volume<B> {
         self.appending = None;
         self.listed = None;
         self.changed = true;
+        self.mark(path);
         self.stamp(path, secs)
     }
 
@@ -602,6 +705,7 @@ impl<B: Blocks + 'static> Volume<B> {
             return Err(libc::EFBIG);
         }
         self.changing(path);
+        self.mark(path);
         let mut file = self.fs()?.root_dir().open_file(path).map_err(errno)?;
         let size = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)).map_err(errno)?;
         if len < size {
@@ -627,13 +731,26 @@ impl<B: Blocks + 'static> Volume<B> {
             return Err(libc::EEXIST);
         }
         self.changing(path);
-        let root = self.fs()?.root_dir();
         if dir {
-            root.create_dir(path).map(drop)
+            self.fs()?.root_dir().create_dir(path).map(drop)
         } else {
-            root.create_file(path).map(drop)
+            // A file made is a file about to be written: it stays open
+            // for that, and the first write does not look it up again.
+            let fs = self.fs_for_appending()?;
+            fs.root_dir().create_file(path).map(|file| {
+                self.appending = Some(Appending {
+                    path: path.to_string(),
+                    file,
+                    pos: 0,
+                    size: 0,
+                });
+            })
         }
-        .map_err(errno)?;
+        .map_err(|e| {
+            self.names.clear();
+            errno(e)
+        })?;
+        self.mark(path);
         // What a listing would say of it, without one: the name as given,
         // which is how it is kept, and the clock it was stamped with.
         let now = unix_now();
@@ -669,8 +786,15 @@ impl<B: Blocks + 'static> Volume<B> {
     /// `OP_REMOVE`: the file `path`, or the directory, which is empty.
     pub fn remove(&mut self, path: &str) -> Result<(), Errno> {
         self.changing(path);
-        let root = self.fs()?.root_dir();
-        self.grouped(|| root.remove(path))
+        let removed = {
+            let root = self.fs()?.root_dir();
+            self.grouped(|| root.remove(path))
+        };
+        match removed {
+            Ok(()) => self.forget(path),
+            Err(_) => self.names.clear(),
+        }
+        removed
     }
 
     /// `OP_RENAME`: `from` becomes `to`, in place of the file or the empty
@@ -680,7 +804,6 @@ impl<B: Blocks + 'static> Volume<B> {
         self.changing(from);
         // A directory's files have other paths now.
         self.open.clear();
-        let root = self.fs()?.root_dir();
         // The same entry under a name that differs in case only is not
         // something to take the place of, and the FAT code leaves it as it
         // is.
@@ -695,10 +818,29 @@ impl<B: Blocks + 'static> Volume<B> {
                 // the journal holds, and the move below must fit. Between
                 // the two `to` is gone and `from` is whole, and the
                 // rename asked again finishes.
-                _ => self.grouped(|| root.remove(to))?,
+                _ => {
+                    let removed = {
+                        let root = self.fs()?.root_dir();
+                        self.grouped(|| root.remove(to))
+                    };
+                    match removed {
+                        Ok(()) => self.forget(to),
+                        Err(_) => self.names.clear(),
+                    }
+                    removed?
+                }
             }
         }
-        self.grouped(|| root.rename(from, &root, to))?;
+        let renamed = {
+            let root = self.fs()?.root_dir();
+            self.grouped(|| root.rename(from, &root, to))
+        };
+        if renamed.is_err() {
+            self.names.clear();
+        }
+        renamed?;
+        self.forget(from);
+        self.mark(to);
         moved.name = split_path(to).1.to_string();
         Ok(moved)
     }
@@ -714,7 +856,17 @@ impl<B: Blocks + 'static> Volume<B> {
         if std::mem::take(&mut self.changed) {
             if let Some(fs) = self.fs.take() {
                 let fat32 = fs.fat_type() == fatfs::FatType::Fat32;
-                left_clean = fs.unmount().map_err(errno);
+                // A volume taken over was mounted with the dead server's
+                // mark on it, and the FAT code keeps no count of free
+                // clusters for one so marked: it leaves the count the
+                // volume had before, or none. This is about to take the
+                // mark off, and the count would be believed: counted
+                // first, once.
+                let counted = match self.marks_clean {
+                    true => fs.stats().map(drop),
+                    false => Ok(()),
+                };
+                left_clean = counted.and_then(|()| fs.unmount()).map_err(errno);
                 if self.marks_clean && left_clean.is_ok() {
                     left_clean = self.mark_clean(fat32);
                 }
@@ -1034,14 +1186,15 @@ mod tests {
     }
 
     #[test]
-    fn a_file_written_in_order_is_opened_once() {
+    fn a_file_made_and_written_in_order_is_not_opened_again() {
         let mut vol = volume();
         vol.create("log", false).unwrap();
         let opens = vol.opens;
         for i in 0..50u64 {
             assert_eq!(vol.write("log", i * 1000, &[i as u8; 1000]), Ok(1000));
         }
-        assert_eq!(vol.opens - opens, 1);
+        // Made and written: it was open from its making.
+        assert_eq!(vol.opens - opens, 0);
         let back = read_whole(&mut vol, "log");
         assert_eq!(back.len(), 50_000);
         assert!(back
@@ -1201,6 +1354,92 @@ mod tests {
     }
 
     #[test]
+    fn a_name_is_looked_up_in_what_was_read_of_its_directory_once() {
+        let mut vol = volume();
+        let reads = |vol: &Volume<Vec<u8>>| vol.disk.borrow().reads;
+        // The first question about a directory reads it; the ones after
+        // do not, whatever their answer.
+        assert_eq!(vol.entry_at("many/file-number-0299.dat").unwrap().size, 0);
+        let before = reads(&vol);
+        assert!(vol.entry_at("many/FILE-number-0007.DAT").is_ok());
+        assert_eq!(vol.entry_at("many/nothing").unwrap_err(), libc::ENOENT);
+        assert_eq!(
+            vol.create("many/file-number-0100.dat", false),
+            Err(libc::EEXIST)
+        );
+        assert_eq!(reads(&vol), before);
+
+        // What this changes it knows: made, written, cut, renamed, gone.
+        vol.create("many/new.txt", false).unwrap();
+        assert_eq!(vol.create("many/NEW.txt", false), Err(libc::EEXIST));
+        assert_eq!(vol.entry_at("many/new.txt").unwrap().size, 0);
+        vol.write("many/new.txt", 0, b"twelve bytes").unwrap();
+        assert_eq!(vol.entry_at("many/new.txt").unwrap().size, 12);
+        vol.truncate("many/new.txt", 5).unwrap();
+        assert_eq!(vol.entry_at("many/new.txt").unwrap().size, 5);
+        let at = 1_600_000_000;
+        vol.set_time("many/new.txt", at).unwrap();
+        assert_eq!(vol.entry_at("many/new.txt").unwrap().mtime, at);
+        let moved = vol.rename("many/new.txt", "many/Old.txt").unwrap();
+        assert_eq!(
+            (moved.name.as_str(), moved.size, moved.mtime),
+            ("Old.txt", 5, at)
+        );
+        assert_eq!(vol.entry_at("many/new.txt").unwrap_err(), libc::ENOENT);
+        assert_eq!(vol.entry_at("many/old.TXT").unwrap().name, "Old.txt");
+        vol.remove("many/Old.txt").unwrap();
+        assert_eq!(vol.entry_at("many/old.txt").unwrap_err(), libc::ENOENT);
+        assert_eq!(vol.remove("many/old.txt"), Err(libc::ENOENT));
+        vol.create("many/old.txt", true).unwrap();
+        assert!(vol.entry_at("many/old.txt").unwrap().is_dir);
+
+        // A file written, its directory's names let go and read again,
+        // and the file written again.
+        vol.write("docs/a long name with spaces.md", 0, b"0123456789")
+            .unwrap();
+        for dir in ["a", "b", "c", "d"] {
+            vol.create(dir, true).unwrap();
+            assert!(vol.entry_at(&format!("{dir}/x")).is_err());
+        }
+        let name = "docs/a long name with spaces.md";
+        assert_eq!(vol.entry_at(name).unwrap().size, 10);
+        vol.write(name, 10, b"and more").unwrap();
+        assert_eq!(vol.entry_at(name).unwrap().size, 18);
+
+        // To another directory, and over what is there.
+        vol.rename("hello.txt", "many/file-number-0001.dat")
+            .unwrap();
+        assert_eq!(vol.entry_at("many/file-number-0001.dat").unwrap().size, 13);
+        assert_eq!(vol.entry_at("hello.txt").unwrap_err(), libc::ENOENT);
+
+        // A directory that goes, or moves, takes its names with it.
+        vol.create("docs/deep/more", true).unwrap();
+        vol.create("docs/deep/more/x", false).unwrap();
+        assert!(vol.entry_at("docs/deep/more/x").is_ok());
+        vol.rename("docs/deep", "depth").unwrap();
+        assert_eq!(vol.entry_at("docs/deep/more/x").unwrap_err(), libc::ENOENT);
+        assert!(vol.entry_at("depth/more/x").is_ok());
+        vol.remove("depth/more/x").unwrap();
+        vol.remove("depth/more").unwrap();
+        assert_eq!(vol.entry_at("depth/more/x").unwrap_err(), libc::ENOENT);
+        vol.create("depth/more", false).unwrap();
+        assert!(vol.entry_at("depth/more/x").is_err());
+
+        // And it is all what the directories say, read again.
+        for dir in ["", "many", "docs", "depth", "a"] {
+            for (name, is_dir, size) in names(&mut vol, dir) {
+                let path = if dir.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                let entry = vol.entry_at(&path).unwrap();
+                assert_eq!((entry.name, entry.is_dir, entry.size), (name, is_dir, size));
+            }
+        }
+    }
+
+    #[test]
     fn a_volume_that_fills_up_says_so_and_stays_whole() {
         let mut vol = volume();
         vol.create("filler", false).unwrap();
@@ -1356,6 +1595,53 @@ mod tests {
         let mut numbers = [0u8; 40];
         alone.statfs(&mut numbers).unwrap();
     }
+
+    #[test]
+    fn a_volume_taken_over_is_left_with_its_free_clusters_counted_at_a_sync() {
+        // FAT32, which is what keeps a count: 40 MiB of 512-byte clusters.
+        let mut image = Cursor::new(vec![0u8; 40 << 20]);
+        let options = fatfs::FormatVolumeOptions::new()
+            .fat_type(fatfs::FatType::Fat32)
+            .bytes_per_cluster(512);
+        fatfs::format_volume(&mut StdIoWrapper::new(&mut image), options).unwrap();
+        let image = image.into_inner();
+        let len = image.len() as u64;
+        let count = |image: &[u8]| u32::from_le_bytes(image[1000..1004].try_into().unwrap());
+        let free = count(&image);
+        for writes_after in [false, true] {
+            let mut memory = vec![0u128; Kept::LEN / 16];
+            let base = memory.as_mut_ptr().cast::<u8>();
+            // SAFETY: the test's own memory, one volume over it at a time.
+            let mut vol = Volume::open_over(image.clone(), len, unsafe { Kept::at(base) }).unwrap();
+            vol.create("file", false).unwrap();
+            assert_eq!(vol.write("file", 0, &[1; 60_000]), Ok(60_000));
+            // The server dies; the next is asked for a sync, as an unmount
+            // asks, having made something more itself or not.
+            let device = vol.disk.borrow().blocks().clone();
+            core::mem::forget(vol);
+            // SAFETY: as above; the first is gone.
+            let mut next = Volume::open_over(device, len, unsafe { Kept::at(base) }).unwrap();
+            let mut used = 60_000u32.div_ceil(512);
+            if writes_after {
+                next.create("more", false).unwrap();
+                assert_eq!(next.write("more", 0, &[2; 5000]), Ok(5000));
+                used += 5000u32.div_ceil(512);
+            }
+            next.sync().unwrap();
+            let device = next.disk.borrow().blocks().clone();
+            // Unmarked, and with the count: what a volume not marked
+            // says of its free clusters is believed.
+            assert_eq!(device[0x41] & 1, 0);
+            assert_eq!(count(&device), free - used, "after: {writes_after}");
+            // And the unmount leaves it unmarked, with the count.
+            let disk = next.disk.clone();
+            next.close().unwrap();
+            let device = disk.borrow().blocks().clone();
+            assert_eq!(device[0x41] & 1, 0);
+            assert_eq!(count(&device), free - used, "after: {writes_after}");
+        }
+    }
+
     /// `fsck.vfat -n` on the image, where there is one: nothing lost,
     /// nothing in two files, no entry without its clusters.
     fn checked(device: &[u8], what: &str) {
