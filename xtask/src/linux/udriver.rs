@@ -33,8 +33,8 @@
 //! run by hand. Whose sockets that stack's are is the kernel's to say
 //! (`linux_object::net::user_stack::boot`).
 //!
-//! On a boot with `unetcard=kernel` the stack's card is the first one the
-//! kernel drives itself, lent: the kernel lists it as `kernel-net@0`, the
+//! On a machine with no virtio card the stack's card is the first one the
+//! kernel drives itself, lent (unless the boot says `unetstack=kernel`): the kernel lists it as `kernel-net@0`, the
 //! `knet` service is the one that starts, and the same wrapper runs the
 //! stack with `card=kernel`, which borrows the card instead of claiming a
 //! device.
@@ -96,12 +96,12 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           udriver = virtio-net@0\n",
     )
     .unwrap();
-    // The kernel's own first card, on a boot that lends it
-    // (`unetcard=kernel`): the kernel lists it beside what it left.
+    // The kernel's own first card, on a boot that lends it (one with no
+    // virtio card): the kernel lists it beside what it left.
     fs::write(
         svc_dir.join("knet.service"),
         b"# The first network card the kernel drives, lent to the network\n\
-          # stack that runs as a process (boot with unetcard=kernel). See\n\
+          # stack that runs as a process (a machine with no virtio card). See\n\
           # /usr/local/bin/eclipse-unet.\n\
           exec = /usr/local/bin/eclipse-unet kernel\n\
           type = respawn\n\
@@ -118,7 +118,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # driver is for checking and timing, never the system's.\n\
           #\n\
           # eclipse-unet kernel: the stack's card is the first one the kernel\n\
-          # drives itself, which it lends on a boot with unetcard=kernel.\n\
+          # drives itself, which it lends when there is no virtio card.\n\
           # No driver runs here then: the kernel's is the card's.\n\
           [ \"$1\" = kernel ] || [ -x /bin/udrv-virtio-net ] || { echo 'eclipse-unet: /bin/udrv-virtio-net is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           # The card does not go to the kernel: the network stack that runs\n\

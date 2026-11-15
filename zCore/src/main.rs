@@ -744,9 +744,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // with `udriver=` has had it since before. `zircon.gateway=0` still
     // wins, and then the card is not left at all.
     //
-    // A boot that lends the stack process the kernel's own first card
-    // (`unetcard=kernel`) has asked for the gateway as well: the loan is
-    // made through it.
+    // A boot that lends the stack process the kernel's own first card,
+    // which a machine with no virtio card does unless it says
+    // `unetstack=kernel`, has the gateway on as well: the loan is made
+    // through it.
     #[cfg(feature = "linux")]
     let left_to_userspace = kernel_hal::drivers::user::reserved();
     #[cfg(feature = "linux")]
@@ -761,7 +762,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         use linux_object::net::user_stack::boot;
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
         let lent = boot::lends(
-            word("unetcard"),
             word("unetstack"),
             left_to_userspace.iter().any(|left| left == boot::CARD),
             lendable,
@@ -778,7 +778,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 .is_some_and(|devices| !devices.is_empty());
         zcore_loader::linux::set_zircon_gateway(true);
         if !already && lent {
-            klog_info!("Eclipse: Zircon syscall gateway ENABLED (unetcard=kernel)");
+            klog_info!("Eclipse: Zircon syscall gateway ENABLED (the kernel's first card is lent)");
         } else if !already {
             klog_info!(
                 "Eclipse: Zircon syscall gateway ENABLED ({} left to userspace)",
@@ -792,8 +792,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // runs as a process, and on a machine with no other card every
     // program's sockets are that stack's; `unetstack=kernel`,
     // `unetstack=none`, `unetuse=asked` and `unetuse=all` say otherwise.
-    // With `unetcard=kernel` the card that stack has is the kernel's
-    // first, lent, and it is no card of the kernel's stack any more.
+    // With no virtio card, the card that stack has is the kernel's first,
+    // lent, and it is no card of the kernel's stack any more.
     #[cfg(feature = "linux")]
     {
         use linux_object::net::user_stack::{self, boot};
@@ -826,7 +826,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             );
         } else if lent {
             klog_info!(
-                "Eclipse: the kernel lends its first card to the stack process (unetcard=kernel)"
+                "Eclipse: the kernel lends its first card to the stack process (unetstack=kernel keeps it for the kernel's stack)"
             );
         }
         let whose = boot::whose(card, lent, word("unetstack"), unetuse, kernel_cards);
