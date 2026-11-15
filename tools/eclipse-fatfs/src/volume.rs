@@ -647,10 +647,30 @@ impl<B: Blocks + 'static> Volume<B> {
         })
     }
 
+    /// `change`, as one change to the disk: none of what it writes is
+    /// there after this server's death inside it (while it is no more
+    /// than the disk's journal holds).
+    ///
+    /// What the FAT code does in several writes is true only whole. A
+    /// rename writes the entry under its new name and then takes the old
+    /// one off; between the two the file has two names and one chain of
+    /// clusters, and the kernel, asking the next server for the rename
+    /// again, would have it remove the new name -- and the chain with it --
+    /// to put the old one in its place.
+    fn grouped<T>(&self, change: impl FnOnce() -> Result<T, FatError>) -> Result<T, Errno> {
+        self.disk.borrow_mut().begin();
+        let changed = change();
+        // Also when it failed: what it wrote before it did is what the
+        // FAT code believes is there.
+        self.disk.borrow_mut().commit();
+        changed.map_err(errno)
+    }
+
     /// `OP_REMOVE`: the file `path`, or the directory, which is empty.
     pub fn remove(&mut self, path: &str) -> Result<(), Errno> {
         self.changing(path);
-        self.fs()?.root_dir().remove(path).map_err(errno)
+        let root = self.fs()?.root_dir();
+        self.grouped(|| root.remove(path))
     }
 
     /// `OP_RENAME`: `from` becomes `to`, in place of the file or the empty
@@ -671,10 +691,14 @@ impl<B: Blocks + 'static> Volume<B> {
             match (moved.is_dir, there.is_dir) {
                 (true, false) => return Err(libc::ENOTDIR),
                 (false, true) => return Err(libc::EISDIR),
-                _ => root.remove(to).map_err(errno)?,
+                // A change of its own: a long file's chain is more than
+                // the journal holds, and the move below must fit. Between
+                // the two `to` is gone and `from` is whole, and the
+                // rename asked again finishes.
+                _ => self.grouped(|| root.remove(to))?,
             }
         }
-        root.rename(from, &root, to).map_err(errno)?;
+        self.grouped(|| root.rename(from, &root, to))?;
         moved.name = split_path(to).1.to_string();
         Ok(moved)
     }
@@ -1331,5 +1355,110 @@ mod tests {
         assert_eq!(out[..50_000], big[..50_000]);
         let mut numbers = [0u8; 40];
         alone.statfs(&mut numbers).unwrap();
+    }
+    /// `fsck.vfat -n` on the image, where there is one: nothing lost,
+    /// nothing in two files, no entry without its clusters.
+    fn checked(device: &[u8], what: &str) {
+        let path = std::env::temp_dir().join(format!(
+            "eclipse-fatfs-{}-{:?}.img",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, device).unwrap();
+        let out = std::process::Command::new("fsck.vfat")
+            .arg("-n")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_file(&path);
+        if let Ok(out) = out {
+            assert!(
+                out.status.success(),
+                "{what}: fsck.vfat:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    /// The whole of a file.
+    fn contents(vol: &mut Volume<Vec<u8>>, path: &str) -> Vec<u8> {
+        let mut out = vec![0u8; BIG + 65_536];
+        let n = vol.read(path, 0, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    /// A server that dies inside a rename, at each change it makes to the
+    /// kept memory and the device in turn. The next server finds the
+    /// rename done or not begun, never the file under two names; asked
+    /// for it again, as the kernel asks, it leaves the volume as a rename
+    /// nothing cut short does.
+    #[test]
+    fn a_rename_the_servers_death_cuts_short_is_done_or_not_begun() {
+        let image = volume().disk.borrow().blocks().clone();
+        let len = image.len() as u64;
+        for (from, to) in [
+            // In its directory, to another, to a name of several entries,
+            // over a file that is there, and a directory.
+            ("hello.txt", "HELLO2.TXT"),
+            ("docs/deep/big.bin", "moved.bin"),
+            (
+                "hello.txt",
+                "docs/a name long enough to take several entries.txt",
+            ),
+            ("docs/deep/big.bin", "docs/A long name with spaces.md"),
+            // (In its parent: the FAT code leaves a moved directory's
+            // `..` naming the old one, cut short or not, which the check
+            // of the volume below would take for this test's doing.)
+            ("docs/deep", "docs/abyss"),
+        ] {
+            let is_dir = from == "docs/deep";
+            let mut cut = 0;
+            loop {
+                let mut memory = vec![0u128; Kept::LEN / 16];
+                let base = memory.as_mut_ptr().cast::<u8>();
+                // SAFETY: the test's own memory, one volume over it at a
+                // time.
+                let mut vol =
+                    Volume::open_over(image.clone(), len, unsafe { Kept::at(base) }).unwrap();
+                let was = match is_dir {
+                    true => contents(&mut vol, "docs/deep/big.bin"),
+                    false => contents(&mut vol, from),
+                };
+                vol.disk.borrow_mut().changes_left = Some(cut);
+                let _ = vol.rename(from, to);
+                let whole = vol.disk.borrow().changes_left != Some(0);
+                let device = vol.disk.borrow().blocks().clone();
+                core::mem::forget(vol);
+
+                // SAFETY: as above; the first is gone.
+                let mut next = Volume::open_over(device, len, unsafe { Kept::at(base) }).unwrap();
+                let what = format!("{from} -> {to}, cut at {cut}");
+                if next.entry_at(from).is_ok() {
+                    // Not begun, or only what was at `to` is gone: asked
+                    // again.
+                    assert!(!whole, "{what}");
+                    next.rename(from, to).unwrap();
+                }
+                assert_eq!(next.entry_at(from).unwrap_err(), libc::ENOENT, "{what}");
+                let file = match is_dir {
+                    true => format!("{to}/big.bin"),
+                    false => to.to_string(),
+                };
+                assert!(contents(&mut next, &file) == was, "{what}");
+                let disk = next.disk.clone();
+                next.close().unwrap();
+                let device = disk.borrow().blocks().clone();
+                checked(&device, &what);
+                let mut alone = Volume::open(device, len).unwrap();
+                assert!(contents(&mut alone, &file) == was, "{what}");
+                assert_eq!(alone.entries("many").unwrap().len(), 300, "{what}");
+
+                cut += 1;
+                if whole {
+                    break;
+                }
+            }
+            assert!(cut > 4, "{from} -> {to}: {cut} changes");
+        }
     }
 }
