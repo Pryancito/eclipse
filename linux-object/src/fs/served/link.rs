@@ -268,7 +268,6 @@ impl Link {
             }
             between_looks(&mut away);
         }
-        drop(away);
         let status = self.status[slot].load(Ordering::Relaxed);
         if status < 0 {
             give_back(self);
