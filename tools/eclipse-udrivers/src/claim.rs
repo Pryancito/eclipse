@@ -15,9 +15,12 @@ use crate::PAGE;
 /// Claim kinds.
 pub const KIND_VIRTIO_BLK: usize = 1;
 pub const KIND_VIRTIO_NET: usize = 2;
+/// An Intel 82574 network card (QEMU's `e1000e`): see [`crate::e1000e`].
+pub const KIND_E1000E: usize = 3;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;
+const TRANSPORT_PCI: u32 = 3;
 
 const BTI_PERM_READ: usize = 1 << 0;
 const BTI_PERM_WRITE: usize = 1 << 1;
@@ -32,8 +35,11 @@ pub struct Claim {
     /// For DMA memory and its device addresses.
     pub bti: Handle,
     /// How the device is reached, `None` for a transport this crate does
-    /// not know.
+    /// not know, and for a PCI function that is not virtio.
     pub transport: Option<Transport>,
+    /// Whether it is a PCI function that is not virtio, whose window is its
+    /// first memory BAR: registers as its datasheet lays them out.
+    pub pci: bool,
     /// The interrupt line, for the record (`u32::MAX` when unknown).
     pub irq: u32,
     /// Where the register window starts inside the VMO, and its size.
@@ -64,6 +70,7 @@ impl Claim {
             regs: low(w[0]),
             bti: high(w[0]),
             transport,
+            pci: low(w[1]) == TRANSPORT_PCI,
             irq: high(w[1]),
             offset: w[2],
             size: w[3],
@@ -281,8 +288,29 @@ mod tests {
 
     #[test]
     fn a_transport_nobody_here_knows_is_not_guessed_at() {
-        let c = Claim::from_words(&[0, 3, 0, 0x1000, 0, 0, 0, 0]);
+        let c = Claim::from_words(&[0, 4, 0, 0x1000, 0, 0, 0, 0]);
         assert_eq!(c.transport, None);
+        assert!(!c.pci);
+    }
+
+    #[test]
+    fn a_pci_function_that_is_not_virtio_has_its_bar_and_no_virtio_transport() {
+        let c = Claim::from_words(&[
+            0x0000_0004_0000_0003,
+            0x0000_0029_0000_0003, // plain PCI, vector 0x29
+            0,
+            0x2_0000,
+            0,
+            0,
+            0,
+            6,
+        ]);
+        assert!(c.pci);
+        assert_eq!(c.transport, None);
+        assert_eq!((c.irq, c.interrupt), (0x29, Some(6)));
+        assert_eq!(c.span(), 0x2_0000);
+        let virtio = Claim::from_words(&[0, 1, 0, 0x200, 0, 0, 0, 0]);
+        assert!(!virtio.pci);
     }
 
     #[test]

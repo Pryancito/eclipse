@@ -37,6 +37,22 @@
 /// service is started for.
 pub const CARD: &str = "virtio-net@0";
 
+/// The first Intel 82574 card, when the boot leaves it to userspace
+/// (`udriver=e1000e@0`): the stack process claims it and is its driver,
+/// as with [`CARD`], and it counts as that card in all of the above. The
+/// `enet` boot service is started for it. Only the stack process drives
+/// it from userspace: with `unetstack=kernel` nothing takes it.
+pub const E1000E_CARD: &str = "e1000e@0";
+
+/// Whether what the buses left to userspace (`zcore_drivers::user::reserved`)
+/// has a card for the stack process to take and drive: [`CARD`] or
+/// [`E1000E_CARD`].
+pub fn has_card<S: AsRef<str>>(left_to_userspace: &[S]) -> bool {
+    left_to_userspace
+        .iter()
+        .any(|left| [CARD, E1000E_CARD].contains(&left.as_ref()))
+}
+
 /// The kernel's first card when it is lent to the stack process, as
 /// `/proc/udrivers` lists it: the one the `knet` boot service is started
 /// for.
@@ -129,6 +145,15 @@ pub fn whose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_virtio_card_or_the_first_e1000e_left_to_userspace_is_the_stacks() {
+        assert!(has_card(&["virtio-net@0"]));
+        assert!(has_card(&["virtio-blk@1", "e1000e@0"]));
+        assert!(!has_card(&["virtio-blk@1"]));
+        assert!(!has_card(&["virtio-net@1", "e1000e@1"]));
+        assert!(!has_card::<&str>(&[]));
+    }
 
     #[test]
     fn the_stack_process_is_the_network_of_a_machine_whose_only_card_it_has() {

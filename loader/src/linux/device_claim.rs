@@ -24,6 +24,17 @@ use zircon_object::task::Process;
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an Intel
+/// 82574 network card (QEMU's `e1000e`), left to userspace by
+/// `udriver=e1000e@N`.
+pub const ECLIPSE_DEVICE_E1000E: usize = 3;
+
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
+/// function that is not virtio. The window is its first memory BAR, with
+/// the registers as its datasheet lays them out; words 4 to 6 of the claim
+/// are zero, and its line is an MSI on x86_64 and a level elsewhere.
+pub const ECLIPSE_TRANSPORT_PCI: u64 = 3;
+
 /// The controllers a reserved device's interrupt can be on, by the name
 /// each one gives itself: the PLIC before anything else on riscv64, where
 /// the per-hart local controllers are in the same list and do not take
@@ -74,7 +85,13 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
     }
     // virtio-mmio raises a level that stays up until the driver acks it in
     // the device; an MSI is a message, and there is nothing to hold down.
-    let level = device.transport == Transport::VirtioMmio;
+    // A PCI function's line is an MSI on x86_64 and its INTx elsewhere,
+    // which is a level too.
+    let level = match device.transport {
+        Transport::VirtioMmio => true,
+        Transport::VirtioPci { .. } => false,
+        Transport::Pci => !cfg!(target_arch = "x86_64"),
+    };
     let line = Box::new(ControllerLine { controller, irq });
     match Interrupt::new_line(line, level) {
         Ok(interrupt) => Some(interrupt),
@@ -179,6 +196,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let kind = match args[0] {
         ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
         ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
+        ECLIPSE_DEVICE_E1000E => user::E1000E,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
@@ -227,6 +245,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 notify_multiplier as u64,
             ],
         ),
+        Transport::Pci => (ECLIPSE_TRANSPORT_PCI, [0; 3]),
     };
     let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
     let words: [u64; CLAIM_WORDS] = [

@@ -17,6 +17,7 @@
 pub mod blk;
 pub mod channel;
 pub mod claim;
+pub mod e1000e;
 pub mod fifo;
 pub mod hybrid;
 pub mod lent;

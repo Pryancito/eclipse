@@ -1,5 +1,5 @@
-//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY] [driver=process|card=kernel]`
-//! or `eclipse-netstack N dhcp [driver=process|card=kernel]`: a network
+//! `eclipse-netstack N ADDR/PREFIX[,GATEWAY] [driver=process|card=kernel|card=e1000e]`
+//! or `eclipse-netstack N dhcp [driver=process|card=kernel|card=e1000e]`: a network
 //! stack for virtio network card `N`, in this process, with the address
 //! `ADDR` or the one a DHCP server leases it. What is not for the card's network goes to the
 //! gateway, the one written or the lease's. When the machine's network
@@ -29,6 +29,12 @@
 //! for such cards, that is how it is the network of a machine that has
 //! one. The loan ends with this process, and the card is the kernel's
 //! stack's again.
+//!
+//! With `card=e1000e` the card is Intel 82574 `N` (QEMU's `e1000e`), which
+//! the boot left to userspace (`udriver=e1000e@N`), and this process is
+//! its driver as it is a virtio card's (`udrivers::e1000e`): the kernel
+//! has nothing of it but its interrupt and, when this process dies, its
+//! reset.
 //!
 //! The kernel has no interface for this card. The stack answers for its
 //! address by itself (ARP, ICMP echo), and serves the kernel the datagram
@@ -91,6 +97,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use udrivers::channel::Channel;
 use udrivers::claim;
+use udrivers::e1000e;
 use udrivers::fifo::Fifo;
 use udrivers::lent::Lent;
 use udrivers::net::{self, Feeder, Msg, NoCard, Offer, BUF_SIZE};
@@ -100,12 +107,15 @@ use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "eclipse-netstack";
 const USAGE: &str =
-    "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY]|dhcp [driver=process|card=kernel]";
+    "usage: eclipse-netstack N ADDR/PREFIX[,GATEWAY]|dhcp [driver=process|card=kernel|card=e1000e]";
 /// The word that asks for the card's driver in a process of its own.
 const APART: &str = "driver=process";
 /// The word for a card the kernel drives and lends, in place of a virtio
 /// card of this process's own.
 const KERNELS: &str = "card=kernel";
+/// The word for an e1000e the boot left to userspace, which this process
+/// drives, in place of a virtio card.
+const E1000E: &str = "card=e1000e";
 /// The card's driver, when it is a process of its own, which this one
 /// starts.
 const DRIVER: &str = "/bin/udrv-virtio-net";
@@ -142,14 +152,23 @@ impl Drop for Window {
 /// The card, when this process is its driver: what any thread needs to
 /// give it frames to send and its receive slots back.
 struct Own {
-    device: Device,
-    /// The offering halves of the card's rings. Taken before the stack's
-    /// lock and never with it held: whoever has it gives the card what
-    /// the stack has for it now, so two threads' frames reach the card in
-    /// the order the stack made them.
-    feeder: Mutex<Feeder>,
+    rings: Rings,
     /// The card's interrupt, or `None` where the card has to be looked at.
     interrupt: Option<Handle>,
+}
+
+/// The card's giving side, by the kind of card. Taken before the stack's
+/// lock and never with it held: whoever has it gives the card what the
+/// stack has for it now, so two threads' frames reach the card in the
+/// order the stack made them.
+enum Rings {
+    /// A virtio card: the offering halves of its queues.
+    Virtio {
+        device: Device,
+        feeder: Mutex<Feeder>,
+    },
+    /// An e1000e: the tails of its rings.
+    E1000e { giver: Mutex<e1000e::Giver> },
 }
 
 impl Own {
@@ -157,8 +176,48 @@ impl Own {
     /// read and the frames it wants sent. With `when_due`, only if that is
     /// worth a trip to the card ([`Port::due`]).
     fn give(&self, host: &Host, msgs: &mut [Msg; TURN], when_due: bool) {
-        let mut feeder = locked(&self.feeder);
-        let n = {
+        match &self.rings {
+            Rings::Virtio { device, feeder } => {
+                let mut feeder = locked(feeder);
+                let n = Self::outgoing(host, msgs, when_due);
+                if n == 0 {
+                    return;
+                }
+                match feeder.give(&msgs[..n]) {
+                    Ok((rx, tx)) => {
+                        if rx {
+                            device.notify(net::RXQ);
+                        }
+                        if tx {
+                            device.notify(net::TXQ);
+                        }
+                    }
+                    // The port makes them and checks them: a bug here, and
+                    // nothing to carry on with.
+                    Err(m) => die(format_args!(
+                        "a message for the card that means nothing: {m:?}"
+                    )),
+                }
+            }
+            Rings::E1000e { giver, .. } => {
+                let mut giver = locked(giver);
+                let n = Self::outgoing(host, msgs, when_due);
+                if n == 0 {
+                    return;
+                }
+                if let Err(m) = giver.give(&msgs[..n]) {
+                    die(format_args!(
+                        "a message for the card that means nothing: {m:?}"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// What the stack has for the card, into `msgs`: how many. With
+    /// `when_due`, only if that is worth a trip to the card.
+    fn outgoing(host: &Host, msgs: &mut [Msg; TURN], when_due: bool) -> usize {
+        {
             let shared = locked(&host.shared);
             let port = shared.stack.device();
             if when_due && !port.due() {
@@ -166,24 +225,6 @@ impl Own {
             } else {
                 port.outgoing(msgs)
             }
-        };
-        if n == 0 {
-            return;
-        }
-        match feeder.give(&msgs[..n]) {
-            Ok((rx, tx)) => {
-                if rx {
-                    self.device.notify(net::RXQ);
-                }
-                if tx {
-                    self.device.notify(net::TXQ);
-                }
-            }
-            // The port makes them and checks them: a bug here, and nothing
-            // to carry on with.
-            Err(m) => die(format_args!(
-                "a message for the card that means nothing: {m:?}"
-            )),
         }
     }
 }
@@ -262,8 +303,10 @@ enum Taker {
     /// which the interface has: dropped, with the rest of the link, once
     /// the interface is on another.
     Driver { driver: Child, _window: Window },
-    /// The taking halves of the card's rings.
+    /// The taking halves of a virtio card's rings.
     Own(net::Card),
+    /// The taking ends of an e1000e's rings.
+    E1000e(e1000e::Taker),
     /// Nothing: the kernel has the card, and the wire is the loan.
     Kernel,
 }
@@ -293,11 +336,49 @@ fn take(index: usize) -> Result<(Link, Port), String> {
     Ok((
         Link {
             wire: Wire::Own(Arc::new(Own {
-                device: driven.device,
-                feeder: Mutex::new(driven.feeder),
+                rings: Rings::Virtio {
+                    device: driven.device,
+                    feeder: Mutex::new(driven.feeder),
+                },
                 interrupt: driven.interrupt,
             })),
             taker: Taker::Own(driven.card),
+            mac: driven.mac,
+        },
+        port,
+    ))
+}
+
+/// Take e1000e `index` for this process to drive: the link to it, and the
+/// port for the stack, which is over the card's own slots.
+fn take_e1000e(index: usize) -> Result<(Link, Port), String> {
+    let driven = e1000e::drive(index).map_err(|e| match e {
+        NoCard::NoGateway => "the gateway is off (zircon.gateway=0 on the command line?)".into(),
+        NoCard::Other(e) => e,
+    })?;
+    if driven.interrupt.is_none() {
+        println!("{NAME}: the card has no interrupt; polling");
+    }
+    // SAFETY: the slots of the DMA memory, which is mapped for as long as
+    // the process lasts; the card and this port are all that read or write
+    // them, a slot at a time as the rings say whose it is.
+    let port = unsafe {
+        Port::new(
+            driven.dma.ptr.add(e1000e::WIN_AT),
+            net::RX_BUFS,
+            net::TX_BUFS,
+        )
+    }
+    .ok_or("a card with more slots than a port takes")?;
+    Ok((
+        Link {
+            wire: Wire::Own(Arc::new(Own {
+                rings: Rings::E1000e {
+                    giver: Mutex::new(driven.giver),
+                },
+                interrupt: driven.interrupt,
+            })),
+            taker: Taker::E1000e(driven.taker),
             mac: driven.mac,
         },
         port,
@@ -424,6 +505,8 @@ struct Host {
     index: usize,
     /// Whether the card is one the kernel drives and lends (`card=kernel`).
     kernels: bool,
+    /// Whether it is an e1000e this process drives (`card=e1000e`).
+    intel: bool,
     mac: [u8; 6],
     /// What the machine's network settings said for this card when the
     /// stack started, as they said it ([`governed`]).
@@ -698,11 +781,14 @@ fn serve_card(host: &Arc<Host>, own: &Own, card: &mut net::Card) -> String {
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
     loop {
+        let Rings::Virtio { device, .. } = &own.rings else {
+            unreachable!("a virtio card's taker with its own rings");
+        };
         if let Some(interrupt) = own.interrupt {
             if let Err(e) = claim::interrupt_wait(interrupt) {
                 return format!("interrupt_wait: {e}");
             }
-            own.device.ack();
+            device.ack();
         }
         let mut any = false;
         loop {
@@ -716,7 +802,46 @@ fn serve_card(host: &Arc<Host>, own: &Own, card: &mut net::Card) -> String {
             own.give(host, &mut msgs, true);
         }
         if own.interrupt.is_none() && !any {
-            own.device.ack();
+            device.ack();
+            std::thread::sleep(LOOK);
+        }
+    }
+}
+
+/// [`serve_card`] for an e1000e: the same turns, asleep on the card's
+/// interrupt between bursts. Before it sleeps the card is told what to wake
+/// it for ([`e1000e::Taker::sleep_with`]): a frame in, and the end of a
+/// send while frames are still on the card. What the card raised is read
+/// (and so cleared) when it wakes, before anything is taken: whatever the
+/// card does after that raises the interrupt again.
+fn serve_e1000e(host: &Arc<Host>, own: &Own, card: &mut e1000e::Taker) -> String {
+    let regs = card.regs();
+    let mut got = [Msg::default(); net::SLOTS];
+    let mut msgs = [Msg::default(); TURN];
+    let mut data = Vec::with_capacity(MESSAGE_MAX);
+    let mut asked = e1000e::IMS_WAKE;
+    loop {
+        if let Some(interrupt) = own.interrupt {
+            let want = card.sleep_with();
+            if want != asked {
+                regs.ask(want);
+                asked = want;
+            }
+            if let Err(e) = e1000e::wait(interrupt, regs) {
+                return format!("interrupt_wait: {e}");
+            }
+        }
+        let mut any = false;
+        loop {
+            let n = card.collect(&mut got);
+            if n == 0 {
+                break;
+            }
+            any = true;
+            carried(host, &got[..n], &mut data);
+            own.give(host, &mut msgs, true);
+        }
+        if own.interrupt.is_none() && !any {
             std::thread::sleep(LOOK);
         }
     }
@@ -1026,10 +1151,11 @@ fn main() {
     // The card and its address, then at most one word on whose the card
     // is: a driver of its own is a virtio card's, and the kernel's card
     // has the kernel for its driver.
-    let (words, apart, kernels) = match &args[1..] {
-        [words @ .., last] if last == APART => (words, true, false),
-        [words @ .., last] if last == KERNELS => (words, false, true),
-        words => (words, false, false),
+    let (words, apart, kernels, intel) = match &args[1..] {
+        [words @ .., last] if last == APART => (words, true, false, false),
+        [words @ .., last] if last == KERNELS => (words, false, true, false),
+        [words @ .., last] if last == E1000E => (words, false, false, true),
+        words => (words, false, false, false),
     };
     let parsed = match words {
         [index, how] => index.parse::<usize>().ok().zip(Addressing::parse(how)),
@@ -1042,6 +1168,8 @@ fn main() {
 
     let taken = if kernels {
         borrow(index)
+    } else if intel {
+        take_e1000e(index)
     } else if apart {
         start(index)
     } else {
@@ -1088,6 +1216,7 @@ fn main() {
     let host = Arc::new(Host {
         index,
         kernels,
+        intel,
         mac,
         governed,
         shared: Mutex::new(Shared {
@@ -1101,7 +1230,7 @@ fn main() {
         named: Mutex::new(Named::default()),
         driver_pid: AtomicU32::new(match &link.taker {
             Taker::Driver { driver, .. } => driver.id(),
-            Taker::Own(_) | Taker::Kernel => 0,
+            Taker::Own(_) | Taker::E1000e(_) | Taker::Kernel => 0,
         }),
         driver_starts: AtomicU32::new(apart as u32),
         teller: Mutex::new(Teller::default()),
@@ -1140,6 +1269,10 @@ fn main() {
             (Wire::Own(own), Taker::Own(card)) => {
                 let why = serve_card(&host, own, card);
                 die(format_args!("card {index} is gone ({why})"));
+            }
+            (Wire::Own(own), Taker::E1000e(card)) => {
+                let why = serve_e1000e(&host, own, card);
+                die(format_args!("e1000e {index} is gone ({why})"));
             }
             // The kernel's, and the same goes: the loan ends with this
             // process and the next one borrows the card again.
@@ -1219,6 +1352,8 @@ fn publish(host: &Host) {
     let addr6: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
     let device = if host.kernels {
         format!("kernel-net@{}", host.index)
+    } else if host.intel {
+        format!("e1000e@{}", host.index)
     } else {
         format!("virtio-net@{}", host.index)
     };

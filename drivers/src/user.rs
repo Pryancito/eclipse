@@ -27,8 +27,11 @@ use spin::{Mutex, Once};
 pub const VIRTIO_BLK: &str = "virtio-blk";
 /// A virtio network card.
 pub const VIRTIO_NET: &str = "virtio-net";
+/// An Intel 82574 network card (QEMU's `e1000e`), which the kernel drives
+/// itself unless `udriver=e1000e@N` asks for it.
+pub const E1000E: &str = "e1000e";
 /// The kinds that can be reserved.
-const KINDS: [&str; 2] = [VIRTIO_BLK, VIRTIO_NET];
+const KINDS: [&str; 3] = [VIRTIO_BLK, VIRTIO_NET, E1000E];
 
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +52,9 @@ pub enum Transport {
         /// `notify_off_multiplier`.
         notify_multiplier: u32,
     },
+    /// A PCI function that is not virtio: the window is its first memory
+    /// BAR, the registers as its datasheet lays them out.
+    Pci,
 }
 
 /// A device reserved for userspace.
@@ -91,6 +97,15 @@ const PCI_DEVICE_STATUS: usize = 0x14;
 /// is given up on. The spec asks the driver to wait for the zero (§4.1.4.3.2);
 /// QEMU answers it on the first read.
 const RESET_READS: usize = 1000;
+/// An e1000e's registers (82574 datasheet §10.2): `CTRL`, `RCTL`, `TCTL`
+/// and `IMC`, by byte offset, and the bit of `CTRL` that resets the MAC.
+const E1000E_CTRL: usize = 0x0000;
+const E1000E_IMC: usize = 0x00d8;
+const E1000E_RCTL: usize = 0x0100;
+const E1000E_TCTL: usize = 0x0400;
+const E1000E_CTRL_RST: u32 = 1 << 26;
+/// How far into its window the registers above go.
+const E1000E_RESET_SPAN: usize = E1000E_TCTL + 4;
 
 impl UserDevice {
     /// Take the device. Only one caller gets `true` until it is
@@ -108,6 +123,11 @@ impl UserDevice {
     /// virtio device is reset (spec 1.1 §2.1.1), and wait for it to read
     /// back zero. From then on it touches none of the memory its queues
     /// named and raises no interrupt, until a driver sets it up again.
+    ///
+    /// An e1000e is stopped as its own driver stops it: every interrupt
+    /// masked, receive and transmit off, then a MAC reset (`CTRL.RST`),
+    /// which the card clears when it is done. Its rings are forgotten with
+    /// it: the next driver programs them again.
     ///
     /// `false` when it cannot be done -- the kernel has no mapping of the
     /// window, the window is too short to hold the register, or the device
@@ -139,6 +159,30 @@ impl UserDevice {
                 unsafe { status.write_volatile(0) };
                 (0..RESET_READS).any(|_| unsafe { status.read_volatile() } == 0)
             }
+            Transport::Pci if self.kind == E1000E => {
+                if self.size < E1000E_RESET_SPAN {
+                    return false;
+                }
+                let reg = |off: usize| (vaddr + off) as *mut u32;
+                // SAFETY: as above; every register is inside the window.
+                unsafe {
+                    reg(E1000E_IMC).write_volatile(u32::MAX);
+                    reg(E1000E_RCTL).write_volatile(0);
+                    reg(E1000E_TCTL).write_volatile(0);
+                    let ctrl = reg(E1000E_CTRL).read_volatile();
+                    reg(E1000E_CTRL).write_volatile(ctrl | E1000E_CTRL_RST);
+                }
+                let done = (0..RESET_READS)
+                    .any(|_| unsafe { reg(E1000E_CTRL).read_volatile() } & E1000E_CTRL_RST == 0);
+                // The reset unmasks nothing, but leaves whatever the card
+                // had raised: masked again, for the next driver to start
+                // from silence.
+                // SAFETY: as above.
+                unsafe { reg(E1000E_IMC).write_volatile(u32::MAX) };
+                done
+            }
+            // A PCI function of a kind this does not know how to stop.
+            Transport::Pci => false,
         }
     }
 
@@ -153,10 +197,15 @@ impl UserDevice {
 /// What the command line asked for: each a `(kind, index)`.
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
-static SEEN: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static SEEN: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
 
-/// Parse one item of a `udriver=` value: `virtio-blk@N` or `virtio-net@N`.
+/// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N` or
+/// `e1000e@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -308,6 +357,7 @@ mod tests {
         assert_eq!(parse_spec("virtio-blk"), None);
         assert_eq!(parse_spec("virtio-blk@x"), None);
         assert_eq!(parse_spec("virtio-net@0"), Some((VIRTIO_NET, 0)));
+        assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
     }
@@ -380,6 +430,41 @@ mod tests {
         let at = 0x100 + PCI_DEVICE_STATUS;
         assert_eq!(window[at], 0);
         assert_eq!((window[at - 1], window[at + 1]), (0xff, 0xff), "one byte");
+    }
+
+    #[test]
+    fn an_e1000e_is_reset_with_its_interrupts_masked_and_its_queues_off() {
+        let mut window = [0u32; E1000E_RESET_SPAN / 4];
+        window[E1000E_RCTL / 4] = 0x0400_8002; // EN | BAM | SECRC
+        window[E1000E_TCTL / 4] = 0x0103_f0fa;
+        window[E1000E_CTRL / 4] = 0x0000_0040; // SLU
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(window.as_mut_ptr() as *mut u8, E1000E_RESET_SPAN)
+        };
+        let card = UserDevice {
+            kind: E1000E,
+            ..device(Transport::Pci, bytes)
+        };
+        // A window of plain memory keeps the bit set: the card is the one
+        // that clears it, so the reset is not taken to have happened.
+        assert!(!card.reset());
+        assert_eq!(window[E1000E_IMC / 4], u32::MAX);
+        assert_eq!((window[E1000E_RCTL / 4], window[E1000E_TCTL / 4]), (0, 0));
+        assert_eq!(window[E1000E_CTRL / 4], 0x40 | E1000E_CTRL_RST);
+    }
+
+    #[test]
+    fn a_pci_function_of_another_kind_is_not_reset() {
+        let mut window = [0xffu8; E1000E_RESET_SPAN];
+        assert!(!device(Transport::Pci, &mut window).reset());
+        assert!(window.iter().all(|b| *b == 0xff));
+        let mut short = [0xffu8; E1000E_TCTL];
+        let card = UserDevice {
+            kind: E1000E,
+            ..device(Transport::Pci, &mut short)
+        };
+        assert!(!card.reset());
+        assert!(short.iter().all(|b| *b == 0xff));
     }
 
     #[test]

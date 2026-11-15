@@ -4347,6 +4347,7 @@ pub fn init(
 
 pub struct E1000eDriverPci;
 
+mod user_card;
 impl PciDriver for E1000eDriverPci {
     fn name(&self) -> &str {
         "e1000e"
@@ -4374,6 +4375,9 @@ impl PciDriver for E1000eDriverPci {
             return Err(DeviceError::IoError);
         };
 
+        if user_card::left(dev, mapper, irq, bar0_addr) {
+            return Err(DeviceError::NotSupported);
+        }
         // Through the base the mapper returns: see `bus::resolve_window`.
         let vaddr = crate::bus::resolve_window(mapper, bar0_addr, 128 * 1024, 0);
         let name = crate::net::next_eth_ifname();
