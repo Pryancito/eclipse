@@ -73,8 +73,14 @@ impl Syscall<'_> {
     }
 
     pub async fn syscall(&mut self, num: u32, args: [usize; 8]) -> isize {
-        let thread_name = self.thread.name();
-        let proc_name = self.thread.proc().name();
+        // Only the log lines below want the names, and each is a lock and a
+        // copy of a string: two allocations on every call for a kernel that
+        // logs none of this.
+        let (thread_name, proc_name) = if log::log_enabled!(log::Level::Info) {
+            (self.thread.name(), self.thread.proc().name())
+        } else {
+            Default::default()
+        };
         let sys_type = match Sys::try_from(num) {
             Ok(t) => t,
             Err(_) => {

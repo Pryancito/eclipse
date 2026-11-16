@@ -19,6 +19,9 @@ use crate::zx::{self, nr, Handle, Status};
 const WAIT: usize = 1;
 /// [`Lent::turn`]: take the frames that arrived too.
 const FRAMES: usize = 2;
+/// [`Lent::turn_for`]: where in the flags the longest sleep starts, in
+/// microseconds.
+const LIMIT_SHIFT: usize = 8;
 
 /// A borrowed card. The loan ends when this is dropped, or with the
 /// process.
@@ -119,13 +122,28 @@ impl Lent {
     pub fn turn(
         &self,
         msgs: &mut [Msg],
-        mut give: usize,
+        give: usize,
         wait: bool,
         frames: bool,
     ) -> Result<usize, Status> {
+        self.turn_for(msgs, give, wait, frames, 0)
+    }
+
+    /// [`turn`](Self::turn), whose sleep lasts `limit_us` microseconds at
+    /// most when that is not 0: then nothing may come back.
+    pub fn turn_for(
+        &self,
+        msgs: &mut [Msg],
+        mut give: usize,
+        wait: bool,
+        frames: bool,
+        limit_us: u32,
+    ) -> Result<usize, Status> {
         assert!(give <= msgs.len());
         let room = msgs.len().min(self.rx_slots + self.tx_slots);
-        let flags = if wait { WAIT } else { 0 } | if frames { FRAMES } else { 0 };
+        let flags = if wait { WAIT } else { 0 }
+            | if frames { FRAMES } else { 0 }
+            | (limit_us as usize) << LIMIT_SHIFT;
         loop {
             let mut got: usize = 0;
             // SAFETY: the kernel reads `give` messages of `msgs`, writes at

@@ -74,11 +74,11 @@ impl<T: ?Sized> TicketMutex<T> {
     /// File ptr is stored LAST so a concurrent snapshotter that keys on
     /// `holder_file != 0` never reads a torn (ptr, len, line) triple.
     #[inline(always)]
-    fn record_holder(&self, caller: &'static core::panic::Location<'static>) {
+    fn record_holder(&self, caller: &'static core::panic::Location<'static>, cpu: u8) {
         let file = caller.file();
         self.holder_file_len.store(file.len(), Ordering::Relaxed);
         self.holder_line_cpu.store(
-            ((crate::interrupt::current_cpu_id() as usize) << 32) | caller.line() as usize,
+            ((cpu as usize) << 32) | caller.line() as usize,
             Ordering::Relaxed,
         );
         self.holder_file
@@ -87,7 +87,7 @@ impl<T: ?Sized> TicketMutex<T> {
 
     #[track_caller]
     pub fn lock(&self) -> TicketMutexGuard<'_, T> {
-        push_off();
+        let cpu = push_off();
         let caller = core::panic::Location::caller();
         let mut spins: u64 = 0;
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
@@ -160,7 +160,7 @@ impl<T: ?Sized> TicketMutex<T> {
                 }
             }
         }
-        self.record_holder(caller);
+        self.record_holder(caller, cpu);
         TicketMutexGuard {
             next_serving: &self.next_serving,
             holder_file: &self.holder_file,
@@ -178,7 +178,7 @@ impl<T: ?Sized> TicketMutex<T> {
     #[inline]
     #[track_caller]
     pub fn try_lock(&self) -> Option<TicketMutexGuard<'_, T>> {
-        push_off();
+        let cpu = push_off();
         let ticket = self
             .next_ticket
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |ticket| {
@@ -189,7 +189,7 @@ impl<T: ?Sized> TicketMutex<T> {
                 }
             });
         if let Ok(ticket) = ticket {
-            self.record_holder(core::panic::Location::caller());
+            self.record_holder(core::panic::Location::caller(), cpu);
             Some(TicketMutexGuard {
                 next_serving: &self.next_serving,
                 holder_file: &self.holder_file,

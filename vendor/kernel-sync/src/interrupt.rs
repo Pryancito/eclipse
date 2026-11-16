@@ -33,6 +33,7 @@ cfg_if::cfg_if! {
 
             /// riscv publishes no logical id: `tp` holds the *hart* id, which
             /// is a hardware id and goes through the map like any other.
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 None
             }
@@ -128,6 +129,7 @@ cfg_if::cfg_if! {
             /// keeps `cpu_id()` cheap enough to sit on every lock acquire —
             /// and a *corruptible* one, which is why the caller cross-checks it.
             #[cfg(target_arch = "x86_64")]
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 if trapframe::logical_cpu_id_valid() {
                     Some(trapframe::read_logical_cpu_id())
@@ -137,6 +139,7 @@ cfg_if::cfg_if! {
             }
 
             #[cfg(not(target_arch = "x86_64"))]
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 None
             }
@@ -177,6 +180,7 @@ cfg_if::cfg_if! {
             /// left in it on a core the kernel has not set up yet, and 0 —
             /// which is what an unset one usually reads — is the boot CPU.
             /// So it goes through the same cross-check.
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 let id: u64;
                 unsafe { core::arch::asm!("mrs {0}, tpidr_el1", out(reg) id) };
@@ -231,6 +235,7 @@ cfg_if::cfg_if! {
                 HW_ID.with(|c| c.get())
             }
 
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 PUBLISHED.with(|c| c.get())
             }
@@ -277,6 +282,7 @@ cfg_if::cfg_if! {
             pub(super) fn raw_hw_id() -> u32 {
                 unimplemented!();
             }
+            #[inline(always)]
             pub(super) fn published_cpu_id() -> Option<u8> {
                 unimplemented!();
             }
@@ -317,7 +323,32 @@ static LOGICAL_IDS: LogicalIdMap = LogicalIdMap::new();
 /// Answering [`NO_CPU`] rather than 0 is the point: 0 is the boot CPU
 /// everywhere, so a wrong 0 does not lose the answer, it silently nests this
 /// CPU's interrupt-disable depth in the BSP's slot.
+///
+/// The steady state -- no AP-boot window open, a publisher that names a
+/// registered CPU -- is answered in the caller, with no call: two loads, the
+/// publisher's two bytes and a bit test. It was a call of nineteen
+/// instructions, made three times for every lock taken and released, and
+/// counted at a fifth of everything the kernel executed for a small TCP echo
+/// (580 calls for an echo between two programs of the machine, 1 800 through
+/// the network stack that runs as a process). Anything else goes the long
+/// way round, [`current_cpu_id_slow`], which asks all three again.
+#[inline]
 pub fn current_cpu_id() -> u8 {
+    if !LOGICAL_IDS.ap_boot_any() {
+        if let Some(published) = published_cpu_id() {
+            if LOGICAL_IDS.accepts_published(published) {
+                return published;
+            }
+        }
+    }
+    current_cpu_id_slow()
+}
+
+/// [`current_cpu_id`] when the short way did not answer: all three sources,
+/// in order.
+#[cold]
+#[inline(never)]
+fn current_cpu_id_slow() -> u8 {
     // The relaxed mask load short-circuits this in the steady state. It
     // matters: this runs on every `push_off`/`pop_off`, i.e. on every kernel
     // lock acquire and release, and reading a hardware id costs an RDMSR plus
@@ -466,7 +497,13 @@ static CPUS: [CpuStorage; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 
 #[inline]
 pub fn mycpu() -> &'static mut Cpu {
-    let id = cpu_id() as usize;
+    cpu_slot(cpu_id())
+}
+
+/// The slot of the CPU [`current_cpu_id`] just named.
+#[inline]
+fn cpu_slot(id: u8) -> &'static mut Cpu {
+    let id = id as usize;
     // Not a bounds check for its own sake: this is the one place that turns
     // "we do not know which CPU this is" into a stop, instead of letting it
     // become "slot 0", which is the boot CPU's.
@@ -502,10 +539,15 @@ pub fn lock_depth() -> i32 {
 // push_off/pop_off are like intr_off()/intr_on() except that they are matched:
 // it takes two pop_off()s to undo two push_off()s.  Also, if interrupts
 // are initially off, then push_off, pop_off leaves them off.
-pub(crate) fn push_off() {
+///
+/// Answers which CPU this is, for the caller that wants to write it down
+/// (the lock's holder record) and would otherwise ask again.
+pub(crate) fn push_off() -> u8 {
     let old = intr_get();
     intr_off();
-    mycpu().push(old);
+    let id = cpu_id();
+    cpu_slot(id).push(old);
+    id
 }
 
 pub(crate) fn pop_off() {

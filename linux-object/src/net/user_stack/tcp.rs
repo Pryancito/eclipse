@@ -668,9 +668,18 @@ impl ServedTcpSocket {
     /// The next bytes, taken off the queue or only looked at.
     async fn receive(&self, data: &mut [u8], take: bool) -> SysResult {
         let mut until = Until::default();
+        // What the stack has sent and the link's task has not read yet may
+        // be these bytes: looked for once, before sleeping for them.
+        let mut looked = false;
         loop {
             let until = {
                 let mut inner = self.stream.inner.lock();
+                if inner.queued == 0 && !looked {
+                    drop(inner);
+                    looked = true;
+                    self.link.pump();
+                    continue;
+                }
                 if inner.queued > 0 {
                     if data.is_empty() {
                         return Ok(0);
