@@ -2540,6 +2540,7 @@ fn write_labwc_environment(rootfs: &Path) {
           # the connect is refused at once and apps carry on bus-less; a\n\
           # dbus-daemon bound to this path later is picked up automatically.\n\
           DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+          DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket\n\
           # Qt, for the KDE look: native Wayland first, Xwayland as fallback.\n\
           # The renderer-dependent half (QT_QUICK_BACKEND=software on pixman)\n\
           # is exported by the labwc wrapper, like SDL's. NOT set here:\n\

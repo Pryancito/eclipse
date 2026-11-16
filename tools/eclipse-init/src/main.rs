@@ -583,6 +583,12 @@ const CHILD_ENV: &[&str] = &[
     // were: see docs/README-desktop.md), but pinned, the connect is refused
     // at once and the app skips the fork/exec/pipe detour entirely.
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
+    // The system bus, pinned to where eclipse-dbusd binds it. zbus (and
+    // libdbus) default to `/var/run/dbus/system_bus_socket`, and this kernel
+    // looks AF_UNIX paths up by their literal string, so the `var/run -> ../run`
+    // symlink does not reach the socket: ENOENT (ec-hyperion-bar's radio
+    // actions, on the RTX).
+    "DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket",
 ];
 
 // ── The boot timeline ──────────────────────────────────────────────────────
