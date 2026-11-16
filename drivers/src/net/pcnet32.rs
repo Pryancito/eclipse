@@ -68,8 +68,8 @@ pub const PCI_DEVICE_PCNET_HOME: u16 = 0x2001;
 
 /// Descriptors per ring. Must be a power of two: the chip is told the size as
 /// a log2 exponent (see [`tlen_rlen`]), so nothing else is expressible.
-const RING_LEN: usize = 32;
-const RING_LOG2: u8 = 5;
+const RING_LEN: usize = 256;
+const RING_LOG2: u8 = 8;
 const _: () = assert!(1 << RING_LOG2 == RING_LEN);
 
 /// Bytes per RX/TX buffer. Linux uses 1544 for the same chip: a 1518-byte
@@ -1163,6 +1163,11 @@ impl NetScheme for Pcnet32Interface {
 
     fn can_lend(&self) -> bool {
         true
+    }
+
+    // As the e1000: a small echo takes over twice as long lent.
+    fn lends_unasked(&self) -> bool {
+        false
     }
 
     fn get_mac(&self) -> EthernetAddress {

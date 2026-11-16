@@ -174,6 +174,11 @@ impl NetScheme for RTLxInterface {
         true
     }
 
+    // Never run lent on its board.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }

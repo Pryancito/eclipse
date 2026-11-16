@@ -734,13 +734,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         kernel_hal::drivers::set_pci_msix_enabled(true);
         klog_info!("Eclipse: pci.msix -- PCI devices are armed with MSI-X");
     }
-    // `pci.intx=0`: a network card with no MSI is not given the legacy
-    // interrupt line of its slot. Read here for the same reason as
-    // `pci.msix` above: `primary_init` is what probes the cards.
+    // `pci.intx=1`: a network card with no MSI is given the legacy
+    // interrupt line of its slot, which a boot that lends such a card
+    // (`unetlend=any`) needs and so asks for as well; `pci.intx=0` wins.
+    // Read here for the same reason as `pci.msix` above: `primary_init` is
+    // what probes the cards.
     #[cfg(not(feature = "libos"))]
-    if kernel_hal::cmdline::is_off(&options.cmdline, "pci.intx") {
-        kernel_hal::drivers::set_pci_intx_enabled(false);
-        klog_info!("Eclipse: pci.intx=0 -- network cards with no MSI get no interrupt");
+    if !kernel_hal::cmdline::is_off(&options.cmdline, "pci.intx")
+        && (kernel_hal::cmdline::flag(&options.cmdline, "pci.intx")
+            || kernel_hal::cmdline::value(&options.cmdline, "unetlend") == Some("any"))
+    {
+        kernel_hal::drivers::set_pci_intx_enabled(true);
+        klog_info!(
+            "Eclipse: network cards with no MSI get the legacy interrupt line of their slot"
+        );
     }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
@@ -762,7 +769,12 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     let (kernel_cards, lendable) = {
         let cards = kernel_hal::drivers::all_net().as_vec();
         let mut cards = cards.iter().filter(|card| !card.is_loopback()).peekable();
-        let lendable = cards.peek().is_some_and(|first| first.can_lend());
+        // A card whose driver lends it only when asked is for the boot
+        // that says `unetlend=any`.
+        let any = kernel_hal::cmdline::value(&options.cmdline, "unetlend") == Some("any");
+        let lendable = cards
+            .peek()
+            .is_some_and(|first| first.can_lend() && (any || first.lends_unasked()));
         (cards.count(), lendable)
     };
     #[cfg(feature = "linux")]

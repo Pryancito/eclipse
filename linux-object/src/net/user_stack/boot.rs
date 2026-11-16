@@ -34,8 +34,12 @@
 //! `unetcard=kernel` lends the card even when a virtio card is there, which
 //! is then not left to userspace unasked.
 //!
-//! Every driver of the kernel's lends its card (`NetScheme::can_lend`), so
-//! the first card of a machine is the stack process's whichever it is.
+//! Every driver of the kernel's can lend its card (`NetScheme::can_lend`).
+//! The Intel ones with MSI do it unasked; the others (QEMU's `e1000` and
+//! `pcnet`, and the cards of the boards) only on a boot that says
+//! `unetlend=any` (`NetScheme::lends_unasked`), and keep the kernel's own
+//! stack otherwise: the first two were measured slower lent at a small
+//! echo, and the rest have never run lent on their machines.
 //!
 //! The kernel's other cards are its own stack's, which is the only one that
 //! reaches them: on a machine with any, the programs that do not ask keep

@@ -146,17 +146,21 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
 /// Cards that have no MSI and raise the legacy line of their slot (INTx),
 /// by the line: see [`pci_intx_line`].
 static INTX_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
-/// `pci.intx=0`: see [`set_pci_intx_enabled`].
-static INTX_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `pci.intx=1`, `unetlend=any`: see [`set_pci_intx_enabled`].
+static INTX_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether a card with no MSI is given the legacy interrupt line of its
-/// slot ([`pci_intx_line`]). It is unless the boot says `pci.intx=0`, which
-/// leaves such a card with no interrupt at all, as it was before: the
-/// kernel's own stack looks at it whenever a program waits on a socket,
-/// and it is not lent. The way out for a machine where another device
-/// holds the same line and nobody answers for it.
+/// slot ([`pci_intx_line`]). It is on a boot that says `pci.intx=1`, or
+/// that lends such a card (`unetlend=any`): a card with no interrupt can
+/// only be looked at now and then, which is enough for the kernel's own
+/// stack, that looks whenever a program waits on a socket, and not for a
+/// borrower. A boot that says neither leaves such a card with no interrupt,
+/// as it always was: the line is the one the firmware wrote, which is
+/// right where the lines of the PCI slots are steered to ISA interrupts
+/// (QEMU does) and has not been seen on a real machine, where another
+/// device may hold the same line with nobody to answer for it.
 pub fn set_pci_intx_enabled(on: bool) {
-    INTX_OFF.store(!on, Ordering::Release);
+    INTX_ON.store(on, Ordering::Release);
 }
 
 /// The interrupt line a PCI card with no MSI raises, as the number its
@@ -169,9 +173,10 @@ pub fn set_pci_intx_enabled(on: bool) {
 /// a frame, and only the kernel's own stack, which looks at its cards
 /// whenever a program waits on a socket, could use them. `None` for a card
 /// with no interrupt pin, for a line the firmware did not give (0, 255) or
-/// that is no ISA line, off x86_64, and on a boot that says `pci.intx=0`.
+/// that is no ISA line, off x86_64, and on a boot that has not asked for
+/// it ([`set_pci_intx_enabled`]).
 pub fn pci_intx_line<Pin>(line: u8, pin: Option<Pin>) -> Option<usize> {
-    if !cfg!(target_arch = "x86_64") || INTX_OFF.load(Ordering::Acquire) {
+    if !cfg!(target_arch = "x86_64") || !INTX_ON.load(Ordering::Acquire) {
         return None;
     }
     pin?;
@@ -218,13 +223,22 @@ fn finish_intx_registrations(host: &Arc<dyn IrqScheme>) {
                 dev.handle_irq(line);
             }
         });
+        let first = handler.clone();
         let done = host
             .configure(line, IrqTriggerMode::Level, IrqPolarity::ActiveLow)
             .and_then(|_| host.register_handler(line, handler))
             .and_then(|_| host.unmask(line));
+        if done.is_ok() {
+            // A card that raised its line before this (a PCnet does, the
+            // moment it is started) raised it at an entry that was still
+            // masked and edge, where a controller may drop it: the line is
+            // then held with nothing left to announce it, and the card is
+            // never heard again. Asking the cards once here answers it.
+            first();
+        }
         match done {
             Ok(_) => crate::klog_info!(
-                "[net] legacy interrupt line {} registered for {} (pci.intx=0 leaves it out)",
+                "[net] legacy interrupt line {} registered for {}",
                 line,
                 names
             ),
@@ -530,7 +544,7 @@ mod tests {
         DEFERRED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
         MSI_PENDING.lock().clear();
         INTX_PENDING.lock().clear();
-        INTX_OFF.store(false, Ordering::SeqCst);
+        INTX_ON.store(false, Ordering::SeqCst);
         *MSI_IRQ_HOST.lock() = None;
         SEEN.lock().clear();
     }
@@ -843,9 +857,13 @@ mod tests {
     fn the_line_of_a_card_with_no_msi_is_the_one_the_firmware_wrote() {
         alone_with_the_statics(|| {
             if !cfg!(target_arch = "x86_64") {
+                set_pci_intx_enabled(true);
                 assert_eq!(pci_intx_line(11, Some(1u8)), None);
                 return;
             }
+            // A boot that has not asked gives no card a line.
+            assert_eq!(pci_intx_line(11, Some(1u8)), None);
+            set_pci_intx_enabled(true);
             assert_eq!(pci_intx_line(11, Some(1u8)), Some(11));
             assert_eq!(pci_intx_line(5, Some(4u8)), Some(5));
             // No pin, no line: the card raises nothing.
@@ -855,7 +873,7 @@ mod tests {
             for line in [0u8, 2, 16, 33, 255] {
                 assert_eq!(pci_intx_line(line, Some(1u8)), None, "line {}", line);
             }
-            // And the boot that wants none of it.
+            // And back.
             set_pci_intx_enabled(false);
             assert_eq!(pci_intx_line(11, Some(1u8)), None);
             set_pci_intx_enabled(true);
@@ -888,14 +906,19 @@ mod tests {
                 ]
             );
             assert_eq!(intc.unmasked.lock().clone(), std::vec![11, 10]);
+            // Each card was asked once as its line was registered: one
+            // that raised it before then is answered, and heard again.
+            assert_eq!(a.1.lock().clone(), std::vec![11]);
+            assert_eq!(b.1.lock().clone(), std::vec![11]);
+            assert_eq!(c.1.lock().clone(), std::vec![10]);
             let handlers = intc.handlers.lock();
             assert_eq!(handlers.len(), 2);
             (handlers[0].1)();
-            assert_eq!(a.1.lock().clone(), std::vec![11]);
-            assert_eq!(b.1.lock().clone(), std::vec![11]);
-            assert!(c.1.lock().is_empty());
-            (handlers[1].1)();
+            assert_eq!(a.1.lock().clone(), std::vec![11, 11]);
+            assert_eq!(b.1.lock().clone(), std::vec![11, 11]);
             assert_eq!(c.1.lock().clone(), std::vec![10]);
+            (handlers[1].1)();
+            assert_eq!(c.1.lock().clone(), std::vec![10, 10]);
             // The walk took them: a second one registers nothing more.
             drop(handlers);
             pci_finish_msi_registrations().expect("the walk failed");

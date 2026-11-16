@@ -398,7 +398,7 @@ pub fn set_pci_msix_enabled(v: bool) {
 }
 
 /// Whether a PCI network card with no MSI is given the legacy interrupt
-/// line of its slot (`pci.intx=0` says no). See
+/// line of its slot (`pci.intx=1` and `unetlend=any` say so). See
 /// `zcore_drivers::net::set_pci_intx_enabled`.
 pub fn set_pci_intx_enabled(v: bool) {
     zcore_drivers::net::set_pci_intx_enabled(v);

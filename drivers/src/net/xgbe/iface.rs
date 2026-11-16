@@ -347,6 +347,12 @@ impl NetScheme for XgbeInterface {
         true
     }
 
+    // Never run lent on its machine, and it has no interrupt registered:
+    // the borrower looks at it now and then.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }

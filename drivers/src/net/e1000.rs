@@ -649,6 +649,13 @@ impl NetScheme for E1000Interface {
         true
     }
 
+    // An echo of 56 bytes takes 2.4 times as long through the stack
+    // process as through the kernel's stack on this card, which has no
+    // interrupt throttle to hide it.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }

@@ -47,6 +47,14 @@ pub trait NetScheme: Scheme {
     fn can_lend(&self) -> bool {
         false
     }
+    /// Whether a boot that says nothing lends this card
+    /// ([`can_lend`](Self::can_lend)), or only one that asks
+    /// (`unetlend=any`). A driver says no while its card, lent, is not
+    /// known to do as well as with the kernel's own stack: measured and
+    /// found slower, or never run on the machine it is for.
+    fn lends_unasked(&self) -> bool {
+        self.can_lend()
+    }
     fn get_mac(&self) -> EthernetAddress;
     /// Returns the interface name as a string slice without allocating heap memory.
     fn ifname(&self) -> &str {
