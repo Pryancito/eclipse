@@ -159,12 +159,21 @@ fn cargo_build(workspace: &Path, packages: &[&str], features: Option<&str>) -> b
 /// foot as the terminal (Apotheosis is not built), and the labwc session's
 /// own shortcuts for the lunar apps (see `rc.xml` in `desktop.rs`). Abyss's
 /// launcher keeps Super+R; Super+E is the file manager, as in labwc.
+///
+/// `render-device` pins the console GPU, as `WLR_DRM_DEVICES` does for labwc.
+/// Abyss's automatic pick counts each GPU's connectors from the
+/// `/sys/class/drm/cardN-<connector>` directories, and Eclipse's sysfs lists
+/// only the `cardN`/`renderDN` nodes, so on the RTX machine it found two GPUs
+/// with no connector and refused to start. `card0` is the GPU the screen hangs
+/// off (`devfs::drm::build_gpu_nodes`); its connectors are read through KMS
+/// once it is open, which works.
 const DEFAULT_CONFIG: &str = "\
 // Eclipse OS: system defaults for the Abyss session (desktop=abyss).
 // Your own changes go in ~/.config/eclipse/abyss.kdl (or Settings).
 // Every key: https://github.com/Pryancito/desktop/blob/main/docs/CONFIG.md
 mode \"de\"
 misc {
+    render-device \"/dev/dri/card0\"
     terminal-command \"foot\"
 }
 launcher {
@@ -222,6 +231,8 @@ pub(super) fn write_wrapper(localbin: &Path) {
           : \"${LIBSEAT_BACKEND:=seatd}\"; export LIBSEAT_BACKEND\n\
           : \"${LANG:=es_ES.UTF-8}\"; export LANG\n\
           : \"${TZ:=Europe/Madrid}\"; export TZ\n\
+          # Xwayland's sockets go in /tmp/.X11-unix, which Smithay does not create.\n\
+          [ -d /tmp/.X11-unix ] || { mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix; }\n\
           if [ ! -x /usr/bin/ec-abyss ]; then\n\
           \x20 echo 'eclipse-abyss: /usr/bin/ec-abyss is not in this image (desktop/ submodule not built); boot with desktop=labwc' >/dev/console 2>/dev/null\n\
           \x20 sleep 60\n\
@@ -360,6 +371,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Same pin as labwc's `WLR_DRM_DEVICES`: without it Abyss looks for
+    /// connectors in sysfs, finds none on Eclipse, and does not start.
+    #[test]
+    fn config_pins_the_console_gpu() {
+        assert!(DEFAULT_CONFIG.contains("render-device \"/dev/dri/card0\"\n"));
+    }
+
     #[test]
     fn abyss_is_the_default_only_when_installed() {
         let dir = std::env::temp_dir().join(format!("abyss-sess-{}", std::process::id()));
@@ -379,6 +397,7 @@ mod tests {
         let s = fs::read_to_string(dir.join("eclipse-abyss")).unwrap();
         assert!(s.contains("exec /usr/bin/ec-abyss --backend drm --session\n"));
         assert!(s.contains("LIBSEAT_BACKEND:=seatd"));
+        assert!(s.contains("mkdir -p /tmp/.X11-unix"));
         let c = fs::read_to_string(dir.join("eclipse-abyss-client")).unwrap();
         assert!(c.contains("WAYLAND_DISPLAY=wayland-1;"));
         let _ = fs::remove_dir_all(&dir);
