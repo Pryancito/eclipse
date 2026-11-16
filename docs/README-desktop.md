@@ -476,12 +476,14 @@ una, según este orden (gana el primero que aparezca):
    defecto (`desktop=none` con `VARIANT=minimal`). Para la sesión Xorg
    (framebuffer/`fbdev` sobre `/dev/fb0`): `make qemu DESKTOP=xorg`.
 2. **Fichero** `/etc/eclipse/desktop` (primer token): override persistente por
-   instalación que puedes editar. Se instala con el valor `labwc`.
-3. Por defecto: **labwc**.
+   instalación que puedes editar. Se instala con el valor `abyss` si la imagen
+   lleva Abyss, y `labwc` si no (ver [La sesión Abyss](#la-sesión-abyss)).
+3. Sin fichero: **labwc**.
 
 Como el hardware real arranca con la cmdline instalada (sin `desktop=`), cae al
-fichero `/etc/eclipse/desktop` y usa **labwc**; `make qemu` también, salvo que
-se le pase `DESKTOP=`. Los
+fichero `/etc/eclipse/desktop` y usa **Abyss**. `make qemu` sigue arrancando
+labwc, salvo que se le pase `DESKTOP=`: la GPU virtio de QEMU es solo 2D y
+Abyss dibuja únicamente con GL. Los
 servicios de cada sesión llevan una etiqueta `desktop =` en su
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` son `desktop = labwc`,
 `xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `network`)
@@ -493,19 +495,19 @@ es el instalador: cmdline `desktop=none` y SFS sin escritorio, así que
 `eclipse-init` deja la consola y no lanza el compositor. Tras `install-eclipse`,
 `./scripts/vbox-eclipse.sh --disk-only` arranca labwc desde el VDI instalado.
 
-## La sesión Abyss (opcional)
+## La sesión Abyss
 
 Hay una tercera sesión, **Abyss**: el compositor Wayland en Rust de
 [chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), con su
 barra (`ec-hyperion-bar`), su lanzador (`ec-launcher`) y Ajustes
 (`ec-settings`), con el fondo lunarbg y las apps lunar de siempre. Viene del
 submódulo `desktop/`, que apunta al fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
-**labwc sigue siendo la sesión por defecto**: Abyss solo arranca si lo eliges.
+**Abyss es la sesión por defecto** y labwc queda como opcional.
 
 ```sh
 git submodule update --init desktop   # una vez, para traer el código
-# arranque: desktop=abyss en la cmdline, o de forma persistente:
-echo abyss > /etc/eclipse/desktop
+# volver a labwc: desktop=labwc en la cmdline, o de forma persistente:
+echo labwc > /etc/eclipse/desktop
 ```
 
 - **Compilación**: `cargo xtask image` lo compila en el anfitrión, como
@@ -513,7 +515,8 @@ echo abyss > /etc/eclipse/desktop
   xkbcommon del sistema (`apt-get install libseat-dev libinput-dev libudev-dev
   libgbm-dev libegl-dev libgles-dev libxkbcommon-dev libwayland-dev
   libdrm-dev`). Si falta el submódulo, falta un paquete o la compilación falla,
-  la imagen sale igual, solo con labwc. Con anfitrión de otra arquitectura no
+  la imagen sale igual, solo con labwc, y entonces labwc es la sesión por
+  defecto. Con anfitrión de otra arquitectura no
   se compila.
 - **Servicios** (`desktop = abyss`): `abyss-seatd`, `abyss`
   (`/usr/local/bin/eclipse-abyss`, log en `/tmp/abyss.log`), la barra de Abyss
