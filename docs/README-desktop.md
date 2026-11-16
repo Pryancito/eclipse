@@ -18,7 +18,8 @@ igual que hace con el idioma y la zona horaria.
 
 ```sh
 eclipse-look            # imprime la actual
-eclipse-look tecno      # panel de instrumentos «Orbital HUD» (por defecto)
+eclipse-look tecno      # panel de instrumentos «Orbital HUD» (por defecto en labwc)
+eclipse-look abyss      # cristal negro cálido de Abyss (por defecto en la sesión Abyss)
 eclipse-look eclipse    # la violeta original
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
@@ -38,6 +39,21 @@ eclipse-look win11      # Windows 11
 [img/tecno-orbital-hud.png](img/tecno-orbital-hud.png)): negro espacial,
 cian de instrumentación `#38e1ff`, filete `#1d3550` y el oro `#f2c14e` de la
 media luna de lunarbg para marcar lo que tiene el foco.
+
+`abyss` es el aspecto de la sesión Abyss (el escritorio por defecto cuando la
+imagen trae `ec-abyss`, que entonces se instala con `look=abyss`). Los valores
+salen de la guía de estilo de Abyss (`desktop/docs/STYLE.md`), sin copiar su
+código: fondo `#0b0906`, tinta blanca (secundaria al 64 %), filetes blancos al
+12 %, esquinas redondeadas (ventana 16, tarjeta 13, celda 10) y el oro
+`#f2c33c` solo en la etiqueta de lo seleccionado, nunca como relleno. Cada app
+lunar dibuja su panel opaco sobre ese negro y `lunarbar::glass::frost` lo
+vuelve translúcido al 70 % al terminar: Abyss desenfoca, satura y perfila lo
+que hay detrás de una superficie translúcida, así que el cristal lo pone el
+compositor y el texto sigue opaco. La pantalla de bloqueo se queda opaca a
+propósito. Los datos van en JetBrains Mono (`fonts-jetbrains-mono`, OFL;
+lunartext vuelve a DejaVu Sans Mono si no está). lunarbg dibuja la misma
+esfera que `tecno` en blanco cálido y oro (ver
+[img/lunar-abyss.png](img/lunar-abyss.png)).
 
 Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml` (y la
 fuente de los títulos: `DejaVu Sans Mono` en `tecno`, `DejaVu Sans` en el

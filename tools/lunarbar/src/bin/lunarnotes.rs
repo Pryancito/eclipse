@@ -15,6 +15,7 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::glass::{self, ink};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{KEY_DOWN_WL, KEY_ESC_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_UP_WL};
 use lunarbar::notes::{self, Entry};
@@ -33,15 +34,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 // ── look ─────────────────────────────────────────────────────────────────────
 
-const GROUND: Rgb = (0x04, 0x07, 0x0d);
-const SURFACE: Rgb = (0x0a, 0x14, 0x23);
-const HAIRLINE: Rgb = (0x1d, 0x35, 0x50);
-const TEXT: Rgb = (0xe6, 0xf1, 0xff);
-const MUTED: Rgb = (0x8a, 0xa4, 0xc2);
-const CYAN: Rgb = (0x38, 0xe1, 0xff);
-const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
-const WARN: Rgb = (0xff, 0x8a, 0x5c);
-const AMBER: Rgb = (0xf6, 0x74, 0x00);
 
 const MARGIN: i32 = 48;
 const PANEL_MAX_W: i32 = 720;
@@ -94,25 +86,25 @@ fn fit(s: &str, cols: usize) -> String {
 
 fn sev_color(sev: &str) -> Rgb {
     match sev {
-        "crit" => WARN,
-        "warn" => AMBER,
-        _ => CYAN,
+        "crit" => ink().warn,
+        "warn" => ink().amber,
+        _ => ink().cyan,
     }
 }
 
 fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
-    cv.fill_rect_a(0, 0, w, h, GROUND, 0.9);
+    cv.fill_rect_a(0, 0, w, h, ink().ground, ink().veil);
     let (px, py, pw, ph) = panel(w, h, s.entries.len());
-    cv.fill_rect_a(px, py, pw, ph, SURFACE, 1.0);
+    glass::panel(cv, px, py, pw, ph, ink().surface);
     for (x, y, rw, rh) in [
         (px, py, pw, 1),
         (px, py + ph - 1, pw, 1),
         (px, py, 1, ph),
         (px + pw - 1, py, 1, ph),
     ] {
-        cv.fill_rect_a(x, y, rw, rh, HAIRLINE, 1.0);
+        cv.fill_rect_a(x, y, rw, rh, ink().hairline, 1.0);
     }
-    cv.brackets(px, py, pw, ph, 16, 2, GOLD);
+    glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
 
     let new = notes::unseen(s.entries, s.seen);
     let (title, empty, keys, fresh) = (
@@ -122,7 +114,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
         s.lang.s(Key::notes_new),
     );
     let hy = py + (HEAD_H - GLYPH_H) / 2;
-    cv.text_bold(title, px + PAD + 4, hy, CYAN);
+    cv.text_bold(title, px + PAD + 4, hy, ink().cyan);
     let count = if new > 0 {
         format!("{} · {new} {fresh}", s.entries.len())
     } else {
@@ -133,9 +125,9 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
         &count,
         px + pw - PAD - 4 - cw,
         hy,
-        if new > 0 { GOLD } else { MUTED },
+        if new > 0 { ink().gold } else { ink().muted },
     );
-    cv.hline(px + PAD, py + HEAD_H - 1, pw - 2 * PAD, HAIRLINE, 1.0);
+    cv.hline(px + PAD, py + HEAD_H - 1, pw - 2 * PAD, ink().hairline, 1.0);
 
     let cols = ((pw - 2 * PAD - 16) / GLYPH_W).max(8) as usize;
     if s.entries.is_empty() {
@@ -143,21 +135,21 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
             empty,
             px + PAD + 4,
             py + HEAD_H + (ENTRY_H - GLYPH_H) / 2,
-            MUTED,
+            ink().muted,
         );
     }
     let shown = visible(w, h, s.entries.len());
     for (n, e) in s.entries.iter().skip(s.top).take(shown).enumerate() {
         let ey = py + HEAD_H + n as i32 * ENTRY_H;
         if n > 0 {
-            cv.hline(px + PAD, ey, pw - 2 * PAD, HAIRLINE, 0.6);
+            cv.hline(px + PAD, ey, pw - 2 * PAD, ink().hairline, 0.6);
         }
         let x = px + PAD + 4;
         let l1 = ey + 10;
         // New since the last look: a bar down the left edge, as the active
         // window wears in the overview.
         if e.when > s.seen {
-            cv.fill_rect_a(px + 1, ey + 8, 2, ENTRY_H - 16, CYAN, 1.0);
+            cv.fill_rect_a(px + 1, ey + 8, 2, ENTRY_H - 16, ink().cyan, 1.0);
         }
         let col = sev_color(&e.severity);
         cv.fill_rect_a(x, l1 + (GLYPH_H - 8) / 2, 8, 8, col, 1.0);
@@ -170,17 +162,17 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
             ),
             x + 16,
             l1,
-            MUTED,
+            ink().muted,
         );
-        cv.text(&when, px + pw - PAD - 4 - ww, l1, MUTED);
-        cv.text_bold(&fit(&e.title, cols), x, l1 + LINE, TEXT);
+        cv.text(&when, px + pw - PAD - 4 - ww, l1, ink().muted);
+        cv.text_bold(&fit(&e.title, cols), x, l1 + LINE, ink().text);
         if !e.body.is_empty() {
-            cv.text(&fit(&e.body, cols), x, l1 + 2 * LINE, MUTED);
+            cv.text(&fit(&e.body, cols), x, l1 + 2 * LINE, ink().muted);
         }
     }
     let foot_y = py + ph - FOOT_H + (FOOT_H - GLYPH_H) / 2;
-    cv.hline(px + PAD, py + ph - FOOT_H, pw - 2 * PAD, HAIRLINE, 1.0);
-    cv.text(keys, px + PAD + 4, foot_y, MUTED);
+    cv.hline(px + PAD, py + ph - FOOT_H, pw - 2 * PAD, ink().hairline, 1.0);
+    cv.text(keys, px + PAD + 4, foot_y, ink().muted);
     let hidden = s.entries.len().saturating_sub(s.top + shown);
     if hidden > 0 || s.top > 0 {
         let pos = format!(
@@ -190,7 +182,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
             s.entries.len()
         );
         let w = Canvas::text_width(&pos);
-        cv.text(&pos, px + pw - PAD - 4 - w, foot_y, MUTED);
+        cv.text(&pos, px + pw - PAD - 4 - w, foot_y, ink().muted);
     }
 }
 
@@ -232,7 +224,7 @@ impl State {
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else {
             return;
         };
-        cv.set_square(true);
+        cv.set_square(!glass::on());
         let scene = Scene {
             entries: &self.entries,
             seen: self.seen,
@@ -243,6 +235,7 @@ impl State {
         draw(&mut cv, self.w as i32, self.h as i32, &scene);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
+        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -541,9 +534,10 @@ fn dump(spec: &str) -> ! {
         lang: Lang::current(),
     };
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(true);
+    cv.set_square(!glass::on());
     draw(&mut cv, w as i32, h as i32, &scene);
     let mut buf = vec![0u8; w * h * 4];
+    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarnotes: could not write {path}");
         std::process::exit(1);

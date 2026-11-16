@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::glass::{self, ink};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL,
@@ -48,16 +49,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 // ── look ─────────────────────────────────────────────────────────────────────
 
-const GROUND: Rgb = (0x04, 0x07, 0x0d);
-const SURFACE: Rgb = (0x0a, 0x14, 0x23);
-const WELL: Rgb = (0x06, 0x0d, 0x18);
-const HAIRLINE: Rgb = (0x1d, 0x35, 0x50);
-const TEXT: Rgb = (0xe6, 0xf1, 0xff);
-const MUTED: Rgb = (0x8a, 0xa4, 0xc2);
-const DIM: Rgb = (0x4a, 0x60, 0x7a);
-const CYAN: Rgb = (0x38, 0xe1, 0xff);
-const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
-const WARN: Rgb = (0xff, 0x8a, 0x5c);
 
 const MARGIN: i32 = 48;
 const PANEL_MAX_W: i32 = 960;
@@ -322,68 +313,65 @@ fn fit(s: &str, px: i32) -> String {
 }
 
 fn frame(cv: &mut Canvas, r: Rect, c: Rgb) {
-    let (x, y, w, h) = r;
-    for (a, b, rw, rh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
-        cv.fill_rect_a(a, b, rw, rh, c, 1.0);
-    }
+    glass::outline(cv, r.0, r.1, r.2, r.3, c);
 }
 
 fn state_word(state: &str, lang: Lang) -> (&'static str, Rgb) {
     match state {
-        "up" => (lang.s(Key::net_state_up), CYAN),
-        "dormant" => (lang.s(Key::net_state_dormant), GOLD),
-        "down" | "lowerlayerdown" => (lang.s(Key::net_state_down), WARN),
-        _ => (lang.s(Key::net_state_unknown), MUTED),
+        "up" => (lang.s(Key::net_state_up), ink().cyan),
+        "dormant" => (lang.s(Key::net_state_dormant), ink().gold),
+        "down" | "lowerlayerdown" => (lang.s(Key::net_state_down), ink().warn),
+        _ => (lang.s(Key::net_state_unknown), ink().muted),
     }
 }
 
 fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
     let l = layout(w, h, s.live.len());
     let (px, py, pw, ph) = l.panel;
-    cv.fill_rect_a(0, 0, w, h, GROUND, 0.9);
-    cv.fill_rect_a(px, py, pw, ph, SURFACE, 1.0);
-    frame(cv, l.panel, HAIRLINE);
-    cv.brackets(px, py, pw, ph, 16, 2, GOLD);
+    cv.fill_rect_a(0, 0, w, h, ink().ground, ink().veil);
+    glass::panel(cv, px, py, pw, ph, ink().surface);
+    frame(cv, l.panel, ink().hairline);
+    glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
 
     // Head.
     let hy = py + (HEAD_H - GLYPH_H) / 2;
-    let tw = cv.text_bold(s.lang.s(Key::net_title), px + PAD, hy, CYAN);
-    cv.text(s.lang.s(Key::net_subtitle), px + PAD + tw + 12, hy, MUTED);
+    let tw = cv.text_bold(s.lang.s(Key::net_title), px + PAD, hy, ink().cyan);
+    cv.text(s.lang.s(Key::net_subtitle), px + PAD + tw + 12, hy, ink().muted);
     let keys = s.lang.s(Key::net_keys);
     let kw = Canvas::text_width(keys);
     if kw < pw - 2 * PAD - 220 {
-        cv.text(keys, px + pw - PAD - kw, hy, MUTED);
+        cv.text(keys, px + pw - PAD - kw, hy, ink().muted);
     }
-    cv.hline(px + PAD, py + HEAD_H - 1, pw - 2 * PAD, HAIRLINE, 1.0);
+    cv.hline(px + PAD, py + HEAD_H - 1, pw - 2 * PAD, ink().hairline, 1.0);
 
     // The interfaces.
     let body_h = ph - HEAD_H - FOOT_H;
-    cv.fill_rect_a(px + LIST_W, py + HEAD_H + PAD, 1, body_h - 2 * PAD, HAIRLINE, 1.0);
+    cv.fill_rect_a(px + LIST_W, py + HEAD_H + PAD, 1, body_h - 2 * PAD, ink().hairline, 1.0);
     if s.live.is_empty() {
-        cv.text(s.lang.s(Key::net_no_ifaces), px + PAD, py + HEAD_H + PAD + 8, MUTED);
+        cv.text(s.lang.s(Key::net_no_ifaces), px + PAD, py + HEAD_H + PAD + 8, ink().muted);
     }
     for (k, lv) in s.live.iter().enumerate() {
         let r = iface_row(&l, k);
         let on = k == s.sel;
         if on {
-            cv.fill_rect_a(r.0, r.1, r.2, r.3, CYAN, 0.08);
-            cv.fill_rect_a(r.0, r.1 + 8, 2, r.3 - 16, CYAN, 1.0);
+            glass::cell(cv, r.0, r.1, r.2, r.3, ink().cyan, 0.08);
+            cv.fill_rect_a(r.0, r.1 + 8, 2, r.3 - 16, ink().cyan, 1.0);
         }
         if on && s.focus == Focus::List {
-            cv.brackets(r.0 + 4, r.1 + 2, r.2 - 8, r.3 - 4, 8, 1, GOLD);
+            glass::brackets(cv, r.0 + 4, r.1 + 2, r.2 - 8, r.3 - 4, 8, 1, ink().gold);
         }
         let x = px + PAD;
         let y1 = r.1 + 10;
-        cv.text_bold(&fit(&lv.name, 112), x, y1, if on { TEXT } else { MUTED });
+        cv.text_bold(&fit(&lv.name, 112), x, y1, if on { ink().text } else { ink().muted });
         let (word, col) = state_word(&lv.state, s.lang);
         let ww = Canvas::text_width(word);
         cv.fill_rect_a(px + LIST_W - PAD - ww - 12, y1 + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
         cv.text(word, px + LIST_W - PAD - ww, y1, col);
         let mac = if lv.mac.is_empty() { "—" } else { &lv.mac };
-        cv.text(mac, x, y1 + GLYPH_H + 6, DIM);
+        cv.text(mac, x, y1 + GLYPH_H + 6, ink().dim);
         if s.dirty.get(k).copied().unwrap_or(false) {
             let t = s.lang.s(Key::net_unapplied);
-            cv.text(t, x, y1 + 2 * (GLYPH_H + 6), GOLD);
+            cv.text(t, x, y1 + 2 * (GLYPH_H + 6), ink().gold);
         }
     }
 
@@ -479,23 +467,23 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
         why(Field::Dns),
     );
     let hint = s.lang.s(Key::net_dns_hint);
-    cv.text(&fit(hint, l.rw - LABEL_W), l.dns.0, l.dns.1 + FIELD_H + 6, DIM);
+    cv.text(&fit(hint, l.rw - LABEL_W), l.dns.0, l.dns.1 + FIELD_H + 6, ink().dim);
 
     draw_foot(cv, &l, s, s.dirty.get(s.sel).copied().unwrap_or(false));
 }
 
 fn section(cv: &mut Canvas, l: &Layout, top: i32, title: &str, now: &str, lang: Lang) {
     let y = top + (SEC_HEAD_H - GLYPH_H) / 2;
-    let tw = cv.text_bold(title, l.rx, y, CYAN);
-    cv.hline(l.rx, top + SEC_HEAD_H - 4, l.rw, HAIRLINE, 0.6);
+    let tw = cv.text_bold(title, l.rx, y, ink().cyan);
+    cv.hline(l.rx, top + SEC_HEAD_H - 4, l.rw, ink().hairline, 0.6);
     let label = lang.s(Key::net_now);
     let room = l.rw - tw - 24;
     let lw = Canvas::text_width(label);
     let val = fit(now, room - lw);
     let vw = Canvas::text_width(&val);
     let x = l.rx + l.rw - vw;
-    cv.text(label, x - lw, y, DIM);
-    cv.text(&val, x, y, TEXT);
+    cv.text(label, x - lw, y, ink().dim);
+    cv.text(&val, x, y, ink().text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,28 +498,28 @@ fn segments(
     lang: Lang,
 ) {
     let y = top + SEC_HEAD_H + (ROW_H - GLYPH_H) / 2;
-    cv.text(lang.s(Key::net_mode), l.rx, y, MUTED);
+    cv.text(lang.s(Key::net_mode), l.rx, y, ink().muted);
     for (k, r) in segs.iter().enumerate() {
         let on = k == at;
         if on {
-            cv.fill_rect_a(r.0, r.1, r.2, r.3, CYAN, 0.16);
+            glass::cell(cv, r.0, r.1, r.2, r.3, ink().cyan, 0.16);
         } else {
-            cv.fill_rect_a(r.0, r.1, r.2, r.3, WELL, 1.0);
+            glass::cell(cv, r.0, r.1, r.2, r.3, ink().well, 1.0);
         }
-        frame(cv, *r, if on { CYAN } else { HAIRLINE });
+        frame(cv, *r, if on { ink().cyan } else { ink().hairline });
         let t = fit(names[k], r.2 - 8);
         let tx = r.0 + (r.2 - Canvas::text_width(&t)) / 2;
         let ty = r.1 + (r.3 - GLYPH_H) / 2;
         if on {
-            cv.text_bold(&t, tx, ty, CYAN);
+            cv.text_bold(&t, tx, ty, ink().cyan);
         } else {
-            cv.text(&t, tx, ty, MUTED);
+            cv.text(&t, tx, ty, ink().muted);
         }
     }
     if focused {
         let (x0, y0) = (segs[0].0, segs[0].1);
         let x1 = segs[2].0 + segs[2].2;
-        cv.brackets(x0 - 4, y0 - 4, x1 - x0 + 8, FIELD_H + 8, 8, 2, GOLD);
+        glass::brackets(cv, x0 - 4, y0 - 4, x1 - x0 + 8, FIELD_H + 8, 8, 2, ink().gold);
     }
 }
 
@@ -551,35 +539,35 @@ fn field(
     let r = field_rect(l, which);
     let enabled = f.enabled(i);
     let focused = s.focus == f;
-    cv.text(label, l.rx, r.1 + (FIELD_H - GLYPH_H) / 2, if enabled { MUTED } else { DIM });
+    cv.text(label, l.rx, r.1 + (FIELD_H - GLYPH_H) / 2, if enabled { ink().muted } else { ink().dim });
     let text = text_of(i, which);
     let ty = r.1 + (FIELD_H - GLYPH_H) / 2;
     if !enabled {
-        cv.fill_rect_a(r.0, r.1, r.2, r.3, SURFACE, 1.0);
+        glass::cell(cv, r.0, r.1, r.2, r.3, ink().surface, 1.0);
         frame(cv, r, (0x13, 0x24, 0x38));
-        cv.text(&fit(hint, r.2 - 16), r.0 + 8, ty, DIM);
+        cv.text(&fit(hint, r.2 - 16), r.0 + 8, ty, ink().dim);
         return;
     }
-    cv.fill_rect_a(r.0, r.1, r.2, r.3, WELL, 1.0);
+    glass::cell(cv, r.0, r.1, r.2, r.3, ink().well, 1.0);
     let edge = match (why.is_some(), focused) {
-        (true, _) => WARN,
-        (false, true) => CYAN,
-        _ => HAIRLINE,
+        (true, _) => ink().warn,
+        (false, true) => ink().cyan,
+        _ => ink().hairline,
     };
     frame(cv, r, edge);
     if focused {
         cv.fill_rect_a(r.0, r.1 + r.3 - 2, r.2, 2, edge, 1.0);
     }
     if text.is_empty() && !focused {
-        cv.text(&fit(hint, r.2 - 16), r.0 + 8, ty, DIM);
+        cv.text(&fit(hint, r.2 - 16), r.0 + 8, ty, ink().dim);
     } else {
         // The end of a long value is what is being typed: show that end.
         let cols = ((r.2 - 24) / GLYPH_W).max(1) as usize;
         let n = text.chars().count();
         let shown: String = text.chars().skip(n.saturating_sub(cols)).collect();
-        let adv = cv.text(&shown, r.0 + 8, ty, TEXT);
+        let adv = cv.text(&shown, r.0 + 8, ty, ink().text);
         if focused {
-            cv.fill_rect_a(r.0 + 8 + adv + 1, r.1 + 6, 2, FIELD_H - 12, CYAN, 1.0);
+            cv.fill_rect_a(r.0 + 8 + adv + 1, r.1 + 6, 2, FIELD_H - 12, ink().cyan, 1.0);
         }
     }
     if let Some(w) = why {
@@ -587,36 +575,36 @@ fn field(
         let room = l.rx + l.rw - x;
         // With no room beside it, "Aplicar" still says it on the status line.
         if room >= 8 * GLYPH_W {
-            cv.text(&fit(s.lang.s(w), room), x, ty, WARN);
+            cv.text(&fit(s.lang.s(w), room), x, ty, ink().warn);
         }
     }
 }
 
 fn button(cv: &mut Canvas, r: Rect, label: &str, lit: bool, focused: bool) {
-    cv.fill_rect_a(r.0, r.1, r.2, r.3, if lit { GOLD } else { WELL }, if lit { 0.14 } else { 1.0 });
-    frame(cv, r, if lit { GOLD } else { HAIRLINE });
+    glass::cell(cv, r.0, r.1, r.2, r.3, if lit { ink().gold } else { ink().well }, if lit { 0.14 } else { 1.0 });
+    frame(cv, r, if lit { ink().gold } else { ink().hairline });
     let tx = r.0 + (r.2 - Canvas::text_width(label)) / 2;
     let ty = r.1 + (r.3 - GLYPH_H) / 2;
     if lit {
-        cv.text_bold(label, tx, ty, GOLD);
+        cv.text_bold(label, tx, ty, ink().gold);
     } else {
-        cv.text(label, tx, ty, MUTED);
+        cv.text(label, tx, ty, ink().muted);
     }
     if focused {
-        cv.brackets(r.0 - 4, r.1 - 4, r.2 + 8, r.3 + 8, 8, 2, CYAN);
+        glass::brackets(cv, r.0 - 4, r.1 - 4, r.2 + 8, r.3 + 8, 8, 2, ink().cyan);
     }
 }
 
 fn draw_foot(cv: &mut Canvas, l: &Layout, s: &Scene, dirty: bool) {
     let (px, py, pw, ph) = l.panel;
     let top = py + ph - FOOT_H;
-    cv.hline(px + PAD, top, pw - 2 * PAD, HAIRLINE, 1.0);
+    cv.hline(px + PAD, top, pw - 2 * PAD, ink().hairline, 1.0);
     button(cv, l.revert, s.lang.s(Key::net_undo_caps), false, s.focus == Focus::Revert);
     button(cv, l.apply, s.lang.s(Key::net_apply_caps), dirty, s.focus == Focus::Apply);
     let col = match s.tone {
-        Tone::Plain => MUTED,
-        Tone::Good => CYAN,
-        Tone::Bad => WARN,
+        Tone::Plain => ink().muted,
+        Tone::Good => ink().cyan,
+        Tone::Bad => ink().warn,
     };
     let room = l.revert.0 - px - 2 * PAD;
     cv.text(&fit(s.status, room), px + PAD, top + (FOOT_H - GLYPH_H) / 2, col);
@@ -1375,10 +1363,11 @@ impl State {
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else {
             return;
         };
-        cv.set_square(true);
+        cv.set_square(!glass::on());
         self.ed.draw(&mut cv, self.w as i32, self.h as i32);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
+        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -1585,9 +1574,10 @@ fn dump(spec: &str) -> ! {
     }
     let ed = sample();
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(true);
+    cv.set_square(!glass::on());
     ed.draw(&mut cv, w as i32, h as i32);
     let mut buf = vec![0u8; w * h * 4];
+    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarnet: could not write {path}");
         std::process::exit(1);

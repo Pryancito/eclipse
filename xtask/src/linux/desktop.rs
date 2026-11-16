@@ -32,6 +32,7 @@
 
 use std::{fs, path::Path};
 
+mod abyss_look;
 mod firefox;
 mod locale;
 mod look;
@@ -2644,7 +2645,7 @@ bright4=3b78ff\nbright5=b4009e\nbright6=61d6d6\nbright7=f2f2f2\n";
 fn foot_ini(colors: &str) -> String {
     format!(
         "# Eclipse OS - foot terminal theme (written by xtask; pick the look\n\
-         # with `eclipse-look win11|kde|eclipse|gnome|tecno`, which copies the\n\
+         # with `eclipse-look win11|kde|eclipse|gnome|tecno|abyss`, which copies the\n\
          # matching\n\
          # foot.<look>.ini over this file).\n\
          # Name a real monospace family first: the bare 'monospace' alias\n\

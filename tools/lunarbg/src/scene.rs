@@ -60,6 +60,8 @@ pub enum Style {
     #[default]
     Cosmic,
     Tecno,
+    /// The `tecno` face in the Abyss session's warm palette.
+    Abyss,
 }
 
 // ---------------------------------------------------------------- layout
@@ -155,7 +157,7 @@ pub fn layout_styled(
     // wordmark below at 170 + text height. Take a comfortable margin.
     let reach = match style {
         Style::Cosmic => (300.0 * s).max(215.0 * s + 40.0 * sc) + 8.0 * sc,
-        Style::Tecno => tecno::REACH * s + 8.0 * sc,
+        Style::Tecno | Style::Abyss => tecno::REACH * s + 8.0 * sc,
     };
     let x0 = ((cx - reach * sx).floor().max(0.0)) as usize;
     let y0 = ((cy - reach).floor().max(0.0)) as usize;
@@ -196,6 +198,8 @@ pub fn render_base_styled(
     let cosmic = style == Style::Cosmic;
     let (ground_top, ground_bottom, glow) = if cosmic {
         (COSMIC_DEEP, COSMIC_MID, NEBULA_CYAN)
+    } else if style == Style::Abyss {
+        (tecno::ABYSS_GROUND_TOP, tecno::ABYSS_GROUND_BOTTOM, tecno::ABYSS_GLOW)
     } else {
         (tecno::GROUND_TOP, tecno::GROUND_BOTTOM, tecno::GLOW)
     };
@@ -364,7 +368,7 @@ pub fn render_frame(frame: &mut [u8], w: usize, base: &[u8], lay: &Layout, t_ms:
         sx: lay.sx,
         px: lay.px,
     };
-    if lay.style == Style::Tecno {
+    if matches!(lay.style, Style::Tecno | Style::Abyss) {
         tecno::frame(&mut pb, lay, t_ms);
         return;
     }

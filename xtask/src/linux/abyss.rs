@@ -53,6 +53,24 @@ pub(super) fn session<'a>(rootfs: &Path, default: &'a str) -> &'a str {
     }
 }
 
+/// The look the image ships for `session`: the Abyss session wears the
+/// `abyss` look (warm-black glass, see `tools/lunarbar/src/glass.rs`), so the
+/// lunar apps match the compositor around them. Only the image's own default
+/// (`look=tecno`, written by `eclipse-look`'s installer) is replaced; a
+/// labwc image keeps tecno.
+pub(super) fn default_look(rootfs: &Path, session: &str) {
+    let path = rootfs.join("etc/eclipse/look");
+    if session != "abyss" {
+        return;
+    }
+    let shipped = fs::read_to_string(&path).unwrap_or_default();
+    if shipped.trim().is_empty() || shipped.trim() == "look=tecno" {
+        if let Err(e) = fs::write(&path, "look=abyss\n") {
+            eprintln!("warning: could not write {path:?}: {e}");
+        }
+    }
+}
+
 impl LinuxRootfs {
     /// Build Abyss and its shell from `desktop/` and copy the binaries into
     /// `usr/bin`, plus the default `/etc/eclipse/abyss.kdl`. Best-effort.
@@ -316,6 +334,23 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_abyss_session_ships_the_abyss_look() {
+        let dir = std::env::temp_dir().join(format!("abyss-look-{}", std::process::id()));
+        let etc = dir.join("etc/eclipse");
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(etc.join("look"), "look=tecno\n").unwrap();
+        default_look(&dir, "labwc");
+        assert_eq!(fs::read_to_string(etc.join("look")).unwrap(), "look=tecno\n");
+        default_look(&dir, "abyss");
+        assert_eq!(fs::read_to_string(etc.join("look")).unwrap(), "look=abyss\n");
+        // A look somebody chose is left alone.
+        fs::write(etc.join("look"), "look=kde\n").unwrap();
+        default_look(&dir, "abyss");
+        assert_eq!(fs::read_to_string(etc.join("look")).unwrap(), "look=kde\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

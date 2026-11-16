@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::glass::{self, ink};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ESC_WL, KEY_HOME_WL, KEY_PGDN_WL, KEY_PGUP_WL,
@@ -59,16 +60,6 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 // ── look ─────────────────────────────────────────────────────────────────────
 
-const SURFACE: Rgb = (0x0a, 0x14, 0x23);
-const WELL: Rgb = (0x06, 0x0d, 0x18);
-const HAIRLINE: Rgb = (0x1d, 0x35, 0x50);
-const TEXT: Rgb = (0xe6, 0xf1, 0xff);
-const MUTED: Rgb = (0x8a, 0xa4, 0xc2);
-const DIM: Rgb = (0x4a, 0x60, 0x7a);
-const CYAN: Rgb = (0x38, 0xe1, 0xff);
-const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
-const WARN: Rgb = (0xff, 0x8a, 0x5c);
-const OK: Rgb = (0x6e, 0xe7, 0xa8);
 
 const DEFAULT_W: u32 = 1180;
 const DEFAULT_H: u32 = 760;
@@ -640,10 +631,7 @@ fn fit(s: &str, px: i32) -> String {
 }
 
 fn frame(cv: &mut Canvas, r: Rect, c: Rgb) {
-    let (x, y, w, h) = r;
-    for (a, b, rw, rh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
-        cv.fill_rect_a(a, b, rw, rh, c, 1.0);
-    }
+    glass::outline(cv, r.0, r.1, r.2, r.3, c);
 }
 
 fn text_right(cv: &mut Canvas, s: &str, right: i32, y: i32, c: Rgb) {
@@ -651,8 +639,8 @@ fn text_right(cv: &mut Canvas, s: &str, right: i32, y: i32, c: Rgb) {
 }
 
 fn button(cv: &mut Canvas, r: Rect, label: &str, col: Rgb, lit: bool) {
-    cv.fill_rect_a(r.0, r.1, r.2, r.3, if lit { col } else { WELL }, if lit { 0.14 } else { 1.0 });
-    frame(cv, r, if lit || col != MUTED { col } else { HAIRLINE });
+    glass::cell(cv, r.0, r.1, r.2, r.3, if lit { col } else { ink().well }, if lit { 0.14 } else { 1.0 });
+    frame(cv, r, if lit || col != ink().muted { col } else { ink().hairline });
     let tx = r.0 + (r.2 - Canvas::text_width(label)) / 2;
     let ty = r.1 + (r.3 - GLYPH_H) / 2;
     if lit {
@@ -663,8 +651,18 @@ fn button(cv: &mut Canvas, r: Rect, label: &str, col: Rgb, lit: bool) {
 }
 
 fn bar(cv: &mut Canvas, x: i32, y: i32, w: i32, frac: f32, c: Rgb) {
-    cv.fill_rect_a(x, y, w, BAR_H, WELL, 1.0);
-    frame(cv, (x, y, w, BAR_H), HAIRLINE);
+    if glass::on() {
+        // The guide's meter: a thin rounded track, the run in white.
+        cv.round_rect(x, y + 1, w, BAR_H - 2, (BAR_H - 2) / 2, ink().hairline);
+        let f = ((w as f32) * frac.clamp(0.0, 1.0)).round() as i32;
+        if f > 0 {
+            cv.round_rect(x, y + 1, f.max(BAR_H - 2), BAR_H - 2, (BAR_H - 2) / 2, glass::METER);
+        }
+        let _ = c;
+        return;
+    }
+    cv.fill_rect_a(x, y, w, BAR_H, ink().well, 1.0);
+    frame(cv, (x, y, w, BAR_H), ink().hairline);
     let f = ((w - 2) as f32 * frac.clamp(0.0, 1.0)) as i32;
     if f > 0 {
         cv.fill_rect_a(x + 1, y + 1, f, BAR_H - 2, c, 1.0);
@@ -672,21 +670,21 @@ fn bar(cv: &mut Canvas, x: i32, y: i32, w: i32, frac: f32, c: Rgb) {
 }
 
 fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
-    cv.fill_rect_a(0, 0, w, h, SURFACE, 1.0);
+    cv.fill_rect_a(0, 0, w, h, ink().surface, 1.0);
     // Head.
     let hy = (HEAD_H - GLYPH_H) / 2;
-    cv.text_bold("MONITOR", PAD, hy, CYAN);
+    cv.text_bold("MONITOR", PAD, hy, ink().cyan);
     let labels = [m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services), m.lang.s(Key::mon_servers)];
     for ((r, label), tab) in tabs(w).iter().zip(labels).zip(Tab::ALL) {
         let on = tab == m.tab;
-        cv.fill_rect_a(r.0, r.1, r.2, r.3, if on { CYAN } else { WELL }, if on { 0.16 } else { 1.0 });
-        frame(cv, *r, if on { CYAN } else { HAIRLINE });
+        glass::cell(cv, r.0, r.1, r.2, r.3, if on { ink().cyan } else { ink().well }, if on { 0.16 } else { 1.0 });
+        frame(cv, *r, if on { ink().cyan } else { ink().hairline });
         let tx = r.0 + (r.2 - Canvas::text_width(label)) / 2;
         let ty = r.1 + (r.3 - GLYPH_H) / 2;
         if on {
-            cv.text_bold(label, tx, ty, CYAN);
+            cv.text_bold(label, tx, ty, if glass::on() { ink().gold } else { ink().cyan });
         } else {
-            cv.text(label, tx, ty, MUTED);
+            cv.text(label, tx, ty, ink().muted);
         }
     }
     let summary = match m.tab {
@@ -720,8 +718,8 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     };
     let room = w - (tabs(w)[2].0 + TAB_W) - 2 * PAD;
     let summary = fit(&summary, room);
-    text_right(cv, &summary, w - PAD, hy, MUTED);
-    cv.hline(0, HEAD_H - 1, w, HAIRLINE, 1.0);
+    text_right(cv, &summary, w - PAD, hy, ink().muted);
+    cv.hline(0, HEAD_H - 1, w, ink().hairline, 1.0);
 
     match m.tab {
         Tab::Procs => draw_procs(cv, w, h, m),
@@ -731,8 +729,8 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
 }
 
 fn plate_head(cv: &mut Canvas, x: i32, y: i32, w: i32, title: &str, value: &str) {
-    cv.text_bold(title, x, y, CYAN);
-    text_right(cv, value, x + w, y, TEXT);
+    cv.text_bold(title, x, y, ink().cyan);
+    text_right(cv, value, x + w, y, ink().text);
 }
 
 fn draw_strip(cv: &mut Canvas, w: i32, m: &Mon) {
@@ -755,46 +753,46 @@ fn draw_strip(cv: &mut Canvas, w: i32, m: &Mon) {
         }
         let avg = cores.iter().sum::<f32>() / cores.len() as f32;
         let label = if per == 1 { format!("c{}", r) } else { format!("c{}-{}", r * per, r * per + cores.len() - 1) };
-        cv.text(&label, xs[0], y, MUTED);
+        cv.text(&label, xs[0], y, ink().muted);
         let lw = 6 * GLYPH_W;
-        bar(cv, xs[0] + lw, y + (GLYPH_H - BAR_H) / 2, pw - lw - 6 * GLYPH_W, avg / 100.0, CYAN);
-        text_right(cv, &format!("{} %", avg.round() as u32), xs[0] + pw, y, MUTED);
+        bar(cv, xs[0] + lw, y + (GLYPH_H - BAR_H) / 2, pw - lw - 6 * GLYPH_W, avg / 100.0, ink().cyan);
+        text_right(cv, &format!("{} %", avg.round() as u32), xs[0] + pw, y, ink().muted);
     }
 
     // Memory.
     let mem = &m.m.mem;
     plate_head(cv, xs[1], top, pw, m.lang.s(Key::mon_memory), &format!("{} / {}", sysmon::fmt_kib(mem.used(), m.lang), sysmon::fmt_kib(mem.total, m.lang)));
     let frac = if mem.total > 0 { mem.used() as f32 / mem.total as f32 } else { 0.0 };
-    bar(cv, xs[1], top + line + (GLYPH_H - BAR_H) / 2, pw, frac, CYAN);
-    cv.text(&fit(&format!("{} {} · {} {}", m.lang.s(Key::mon_cached), sysmon::fmt_kib(mem.cached, m.lang), m.lang.s(Key::mon_free), sysmon::fmt_kib(mem.free, m.lang)), pw), xs[1], top + 2 * line, MUTED);
+    bar(cv, xs[1], top + line + (GLYPH_H - BAR_H) / 2, pw, frac, ink().cyan);
+    cv.text(&fit(&format!("{} {} · {} {}", m.lang.s(Key::mon_cached), sysmon::fmt_kib(mem.cached, m.lang), m.lang.s(Key::mon_free), sysmon::fmt_kib(mem.free, m.lang)), pw), xs[1], top + 2 * line, ink().muted);
     let swap = if mem.swap_total > 0 {
         format!("{} {} / {}", m.lang.s(Key::mon_swap), sysmon::fmt_kib(mem.swap_total - mem.swap_free, m.lang), sysmon::fmt_kib(mem.swap_total, m.lang))
     } else {
         m.lang.s(Key::mon_no_swap).into()
     };
-    cv.text(&fit(&swap, pw), xs[1], top + 3 * line, MUTED);
+    cv.text(&fit(&swap, pw), xs[1], top + 3 * line, ink().muted);
 
     // Network.
     plate_head(cv, xs[2], top, pw, m.lang.s(Key::net_title), if m.m.iface.is_empty() { "—" } else { &m.m.iface });
-    cv.text(m.lang.s(Key::mon_in), xs[2], top + line, MUTED);
-    text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_down)), xs[2] + pw, top + line, TEXT);
-    cv.text(m.lang.s(Key::mon_out), xs[2], top + 2 * line, MUTED);
-    text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_up)), xs[2] + pw, top + 2 * line, TEXT);
-    cv.text(&fit(if m.m.addr.is_empty() { m.lang.s(Key::mon_no_ipv4_address) } else { &m.m.addr }, pw), xs[2], top + 3 * line, MUTED);
+    cv.text(m.lang.s(Key::mon_in), xs[2], top + line, ink().muted);
+    text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_down)), xs[2] + pw, top + line, ink().text);
+    cv.text(m.lang.s(Key::mon_out), xs[2], top + 2 * line, ink().muted);
+    text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.net_up)), xs[2] + pw, top + 2 * line, ink().text);
+    cv.text(&fit(if m.m.addr.is_empty() { m.lang.s(Key::mon_no_ipv4_address) } else { &m.m.addr }, pw), xs[2], top + 3 * line, ink().muted);
 
     // Disk.
     let root = m.m.root_pct.map(|p| format!("/ {p} %")).unwrap_or_default();
     plate_head(cv, xs[3], top, pw, m.lang.s(Key::mon_disk), &root);
     if m.m.disk_name.is_empty() {
-        cv.text(&fit(m.lang.s(Key::mon_no_proc_diskstats), pw), xs[3], top + line, DIM);
+        cv.text(&fit(m.lang.s(Key::mon_no_proc_diskstats), pw), xs[3], top + line, ink().dim);
     } else {
-        cv.text(m.lang.s(Key::mon_read), xs[3], top + line, MUTED);
-        text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_read)), xs[3] + pw, top + line, TEXT);
-        cv.text(m.lang.s(Key::mon_write), xs[3], top + 2 * line, MUTED);
-        text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_write)), xs[3] + pw, top + 2 * line, TEXT);
-        cv.text(&fit(&m.m.disk_name, pw), xs[3], top + 3 * line, MUTED);
+        cv.text(m.lang.s(Key::mon_read), xs[3], top + line, ink().muted);
+        text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_read)), xs[3] + pw, top + line, ink().text);
+        cv.text(m.lang.s(Key::mon_write), xs[3], top + 2 * line, ink().muted);
+        text_right(cv, &format!("{}/s", sysinfo::fmt_rate(m.m.disk_write)), xs[3] + pw, top + 2 * line, ink().text);
+        cv.text(&fit(&m.m.disk_name, pw), xs[3], top + 3 * line, ink().muted);
     }
-    cv.hline(0, HEAD_H + STRIP_H - 1, w, HAIRLINE, 1.0);
+    cv.hline(0, HEAD_H + STRIP_H - 1, w, ink().hairline, 1.0);
 }
 
 fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
@@ -802,15 +800,15 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     // Search.
     let sy = HEAD_H + STRIP_H;
     let ty = sy + (SEARCH_H - GLYPH_H) / 2;
-    let lw = cv.text(m.lang.s(Key::mon_search), PAD, ty, MUTED);
+    let lw = cv.text(m.lang.s(Key::mon_search), PAD, ty, ink().muted);
     let field = (PAD + lw + 12, sy + (SEARCH_H - 28) / 2, 264, 28);
-    cv.fill_rect_a(field.0, field.1, field.2, field.3, WELL, 1.0);
-    frame(cv, field, if m.filter.is_empty() { HAIRLINE } else { CYAN });
+    glass::cell(cv, field.0, field.1, field.2, field.3, ink().well, 1.0);
+    frame(cv, field, if m.filter.is_empty() { ink().hairline } else { ink().cyan });
     if m.filter.is_empty() {
-        cv.text(m.lang.s(Key::mon_type_a_name_or_a_pid), field.0 + 8, ty, DIM);
+        cv.text(m.lang.s(Key::mon_type_a_name_or_a_pid), field.0 + 8, ty, ink().dim);
     } else {
-        let adv = cv.text(&m.filter, field.0 + 8, ty, TEXT);
-        cv.fill_rect_a(field.0 + 8 + adv + 1, field.1 + 6, 2, 16, CYAN, 1.0);
+        let adv = cv.text(&m.filter, field.0 + 8, ty, ink().text);
+        cv.fill_rect_a(field.0 + 8 + adv + 1, field.1 + 6, 2, 16, ink().cyan, 1.0);
     }
     let sort = match m.sort {
         Sort::Pid => "PID",
@@ -818,23 +816,23 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         Sort::Cpu => "CPU",
         Sort::Mem => m.lang.s(Key::mon_memory_2),
     };
-    cv.text(&format!("{}: {sort}", m.lang.s(Key::mon_sort)), field.0 + field.2 + 16, ty, MUTED);
+    cv.text(&format!("{}: {sort}", m.lang.s(Key::mon_sort)), field.0 + field.2 + 16, ty, ink().muted);
     let apps = m.rows.iter().filter(|r| r.window.is_some()).count();
-    text_right(cv, &format!("{} {} · {apps} {}", m.rows.len(), m.lang.s(Key::mon_processes_2), m.lang.s(Key::mon_with_a_window)), w - PAD, ty, MUTED);
+    text_right(cv, &format!("{} {} · {apps} {}", m.rows.len(), m.lang.s(Key::mon_processes_2), m.lang.s(Key::mon_with_a_window)), w - PAD, ty, ink().muted);
 
     // Column heads.
     let cy = sy + SEARCH_H;
     let c = columns(w);
     let hy = cy + (COLS_H - GLYPH_H) / 2;
-    let head = |s: Sort| if m.sort == s { CYAN } else { MUTED };
+    let head = |s: Sort| if m.sort == s { ink().cyan } else { ink().muted };
     cv.text("PID", PAD, hy, head(Sort::Pid));
     cv.text(m.lang.s(Key::mon_name_2), PAD + PID_W, hy, head(Sort::Name));
     text_right(cv, "CPU", c[4], hy, head(Sort::Cpu));
     text_right(cv, m.lang.s(Key::mon_memory), c[3], hy, head(Sort::Mem));
-    text_right(cv, m.lang.s(Key::mon_threads), c[2], hy, MUTED);
-    text_right(cv, m.lang.s(Key::mon_state), c[1], hy, MUTED);
-    text_right(cv, m.lang.s(Key::mon_time), c[0], hy, MUTED);
-    cv.hline(PAD, cy + COLS_H - 1, w - 2 * PAD, HAIRLINE, 1.0);
+    text_right(cv, m.lang.s(Key::mon_threads), c[2], hy, ink().muted);
+    text_right(cv, m.lang.s(Key::mon_state), c[1], hy, ink().muted);
+    text_right(cv, m.lang.s(Key::mon_time), c[0], hy, ink().muted);
+    cv.hline(PAD, cy + COLS_H - 1, w - 2 * PAD, ink().hairline, 1.0);
 
     // Rows.
     let (top, n) = proc_rows(h);
@@ -845,90 +843,100 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let ty = y + (ROW_H - GLYPH_H) / 2;
         match it {
             Item::Section(s) => {
-                cv.text(s, PAD, ty + 2, GOLD);
+                cv.text(s, PAD, ty + 2, if glass::on() { ink().muted } else { ink().gold });
             }
             Item::Proc(i) => {
                 let r = &m.rows[*i];
-                if m.sel_pid == Some(r.pid) {
-                    cv.fill_rect_a(0, y, w, ROW_H, CYAN, 0.08);
-                    cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, CYAN, 1.0);
+                let sel = m.sel_pid == Some(r.pid);
+                if sel && glass::on() {
+                    glass::cell(cv, PAD / 2, y + 1, w - PAD, ROW_H - 2, ink().sel, 1.0);
+                    glass::outline(cv, PAD / 2, y + 1, w - PAD, ROW_H - 2, glass::RIM);
+                } else if sel {
+                    cv.fill_rect_a(0, y, w, ROW_H, ink().cyan, 0.08);
+                    cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
                 }
-                cv.text(&r.pid.to_string(), PAD, ty, MUTED);
-                let adv = cv.text(&fit(&r.name, name_w), PAD + PID_W, ty, TEXT);
+                cv.text(&r.pid.to_string(), PAD, ty, ink().muted);
+                let name_c = if sel && glass::on() { ink().gold } else { ink().text };
+                let adv = cv.text(&fit(&r.name, name_w), PAD + PID_W, ty, name_c);
                 if let Some(t) = &r.window {
                     let room = name_w - adv - 16;
                     if room > 4 * GLYPH_W && !t.is_empty() {
-                        cv.text(&fit(&format!("· {t}"), room), PAD + PID_W + adv + 8, ty, DIM);
+                        cv.text(&fit(&format!("· {t}"), room), PAD + PID_W + adv + 8, ty, ink().dim);
                     }
                 }
                 let cpu = pct(r.cpu, m.lang);
-                text_right(cv, &cpu, c[4], ty, if r.cpu >= 50.0 { GOLD } else { TEXT });
-                text_right(cv, &sysmon::fmt_kib(r.mem_kib, m.lang), c[3], ty, TEXT);
-                text_right(cv, &r.threads.to_string(), c[2], ty, MUTED);
-                text_right(cv, &r.state.to_string(), c[1], ty, if r.state == 'Z' || r.state == 'D' { WARN } else { MUTED });
-                text_right(cv, &sysmon::fmt_ticks(r.ticks), c[0], ty, MUTED);
+                text_right(cv, &cpu, c[4], ty, if r.cpu >= 50.0 { ink().gold } else { ink().text });
+                text_right(cv, &sysmon::fmt_kib(r.mem_kib, m.lang), c[3], ty, ink().text);
+                text_right(cv, &r.threads.to_string(), c[2], ty, ink().muted);
+                text_right(cv, &r.state.to_string(), c[1], ty, if r.state == 'Z' || r.state == 'D' { ink().warn } else { ink().muted });
+                text_right(cv, &sysmon::fmt_ticks(r.ticks), c[0], ty, ink().muted);
             }
         }
     }
     if items.is_empty() {
-        cv.text(m.lang.s(Key::mon_no_process_matches), PAD, top + 8, MUTED);
+        cv.text(m.lang.s(Key::mon_no_process_matches), PAD, top + 8, ink().muted);
     }
 
     // Foot.
     let fy = h - FOOT_H;
-    cv.hline(0, fy, w, HAIRLINE, 1.0);
+    cv.hline(0, fy, w, ink().hairline, 1.0);
     let b = foot_buttons(w, h);
     let info = match m.selected_row() {
         Some(r) => format!("{} · PID {} · {}", r.name, r.pid, if r.cmd.is_empty() { "—" } else { &r.cmd }),
         None => m.lang.s(Key::mon_footer_processes_keys).into(),
     };
     let text = if m.status.is_empty() { info } else { m.status.clone() };
-    let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
+    let col = if m.status.is_empty() { ink().muted } else if m.bad { ink().warn } else { ink().cyan };
     cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
     let sel = m.selected_row().is_some();
-    button(cv, b[1], m.lang.s(Key::mon_end), if sel { GOLD } else { MUTED }, sel);
-    button(cv, b[2], m.lang.s(Key::mon_kill), if sel { WARN } else { MUTED }, false);
+    button(cv, b[1], m.lang.s(Key::mon_end), if sel { ink().gold } else { ink().muted }, sel);
+    button(cv, b[2], m.lang.s(Key::mon_kill), if sel { ink().warn } else { ink().muted }, false);
 }
 
 fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let lw = svc_list_w(w);
     let top = HEAD_H;
     let body_h = h - HEAD_H - FOOT_H;
-    cv.fill_rect_a(PAD + lw, top, 1, body_h, HAIRLINE, 1.0);
+    cv.fill_rect_a(PAD + lw, top, 1, body_h, ink().hairline, 1.0);
     // Columns: SERVICIO, TIPO, ESTADO, PID, ARRANQUES, DESDE.
     let x0 = PAD;
     let cols = [x0, x0 + 168, x0 + 168 + 104, x0 + lw - 216, x0 + lw - 120, x0 + lw - 8];
     let hy = top + (COLS_H - GLYPH_H) / 2 + 4;
-    cv.text(m.lang.s(Key::mon_service), cols[0], hy, MUTED);
-    cv.text(m.lang.s(Key::mon_kind), cols[1], hy, MUTED);
-    cv.text(m.lang.s(Key::mon_state), cols[2], hy, MUTED);
-    text_right(cv, "PID", cols[3], hy, MUTED);
-    text_right(cv, m.lang.s(Key::mon_starts), cols[4], hy, MUTED);
-    text_right(cv, m.lang.s(Key::mon_for), cols[5], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_service), cols[0], hy, ink().muted);
+    cv.text(m.lang.s(Key::mon_kind), cols[1], hy, ink().muted);
+    cv.text(m.lang.s(Key::mon_state), cols[2], hy, ink().muted);
+    text_right(cv, "PID", cols[3], hy, ink().muted);
+    text_right(cv, m.lang.s(Key::mon_starts), cols[4], hy, ink().muted);
+    text_right(cv, m.lang.s(Key::mon_for), cols[5], hy, ink().muted);
     let ry = top + COLS_H + 8;
-    cv.hline(PAD, ry - 1, lw - 8, HAIRLINE, 1.0);
+    cv.hline(PAD, ry - 1, lw - 8, ink().hairline, 1.0);
     let n = ((body_h - COLS_H - 8) / ROW_H).max(1) as usize;
     let first = m.sel_svc.saturating_sub(n.saturating_sub(1));
     if m.svcs.is_empty() {
-        cv.text(&fit(m.lang.s(Key::mon_no_services_file_yet), lw - 16), PAD, ry + 8, MUTED);
+        cv.text(&fit(m.lang.s(Key::mon_no_services_file_yet), lw - 16), PAD, ry + 8, ink().muted);
     }
     for (k, s) in m.svcs.iter().enumerate().skip(first).take(n) {
         let y = ry + (k - first) as i32 * ROW_H;
         let ty = y + (ROW_H - GLYPH_H) / 2;
         if k == m.sel_svc {
-            cv.fill_rect_a(0, y, PAD + lw, ROW_H, CYAN, 0.08);
-            cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, CYAN, 1.0);
+            if glass::on() {
+                glass::cell(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, ink().sel, 1.0);
+                glass::outline(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, glass::RIM);
+            } else {
+                cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
+                cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
+            }
         }
-        cv.text(&fit(&s.name, 160), cols[0], ty, TEXT);
-        cv.text(if s.kind == "respawn" { m.lang.s(Key::mon_respawn) } else { m.lang.s(Key::mon_once) }, cols[1], ty, MUTED);
+        cv.text(&fit(&s.name, 160), cols[0], ty, ink().text);
+        cv.text(if s.kind == "respawn" { m.lang.s(Key::mon_respawn) } else { m.lang.s(Key::mon_once) }, cols[1], ty, ink().muted);
         let (word, bad) = sysmon::state_word(&s.state, m.lang);
         let col = state_col(&s.state, bad);
         cv.fill_rect_a(cols[2], ty + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
         cv.text(word, cols[2] + 12, ty, col);
-        text_right(cv, &s.pid.map(|p| p.to_string()).unwrap_or("—".into()), cols[3], ty, MUTED);
-        text_right(cv, &s.starts.to_string(), cols[4], ty, MUTED);
+        text_right(cv, &s.pid.map(|p| p.to_string()).unwrap_or("—".into()), cols[3], ty, ink().muted);
+        text_right(cv, &s.starts.to_string(), cols[4], ty, ink().muted);
         let since = s.started.map(|t| sysmon::fmt_secs(m.now_wall.saturating_sub(t))).unwrap_or("—".into());
-        text_right(cv, &since, cols[5], ty, MUTED);
+        text_right(cv, &since, cols[5], ty, ink().muted);
     }
 
     // Detail.
@@ -936,7 +944,7 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let dw = w - dx - PAD;
     if let Some(s) = m.svcs.get(m.sel_svc) {
         let y = top + PAD;
-        cv.text_bold(&s.name.to_uppercase(), dx, y, CYAN);
+        cv.text_bold(&s.name.to_uppercase(), dx, y, ink().cyan);
         let (word, bad) = sysmon::state_word(&s.state, m.lang);
         let st = match s.pid {
             Some(p) => format!("{word} · PID {p}"),
@@ -961,35 +969,35 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         .enumerate()
         {
             let ly = y + (k as i32 + 1) * line + 4;
-            cv.text(a, dx, ly, MUTED);
-            cv.text(&fit(b, dw - lab), dx + lab, ly, TEXT);
+            cv.text(a, dx, ly, ink().muted);
+            cv.text(&fit(b, dw - lab), dx + lab, ly, ink().text);
         }
         let ly = y + 5 * line + 12;
-        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, MUTED);
-        cv.hline(dx, ly + GLYPH_H + 4, dw, HAIRLINE, 1.0);
+        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, ink().muted);
+        cv.hline(dx, ly + GLYPH_H + 4, dw, ink().hairline, 1.0);
         let lb = (dx, ly + GLYPH_H + 12, dw, h - FOOT_H - PAD - (ly + GLYPH_H + 12));
-        cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, WELL, 1.0);
-        frame(cv, lb, HAIRLINE);
+        cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, ink().well, 1.0);
+        frame(cv, lb, ink().hairline);
         let fits = ((lb.3 - 16) / (GLYPH_H + 4)).max(0) as usize;
         if m.log.is_empty() {
             let why = if s.log.is_none() { m.lang.s(Key::mon_this_service_keeps_no_log) } else { m.lang.s(Key::mon_the_log_is_empty) };
-            cv.text(why, lb.0 + 8, lb.1 + 8, DIM);
+            cv.text(why, lb.0 + 8, lb.1 + 8, ink().dim);
         }
         for (k, l) in m.log.iter().skip(m.log.len().saturating_sub(fits)).enumerate() {
-            cv.text(&fit(l, lb.2 - 16), lb.0 + 8, lb.1 + 8 + k as i32 * (GLYPH_H + 4), MUTED);
+            cv.text(&fit(l, lb.2 - 16), lb.0 + 8, lb.1 + 8 + k as i32 * (GLYPH_H + 4), ink().muted);
         }
     }
 
     // Foot.
     let fy = h - FOOT_H;
-    cv.hline(0, fy, w, HAIRLINE, 1.0);
+    cv.hline(0, fy, w, ink().hairline, 1.0);
     let b = foot_buttons(w, h);
     let text = if m.status.is_empty() {
         m.lang.s(Key::mon_footer_services_keys).to_string()
     } else {
         m.status.clone()
     };
-    let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
+    let col = if m.status.is_empty() { ink().muted } else if m.bad { ink().warn } else { ink().cyan };
     cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
     service_buttons(cv, b, m);
 }
@@ -999,9 +1007,9 @@ fn service_buttons(cv: &mut Canvas, b: [Rect; 3], m: &Mon) {
     let s = m.chosen_svc();
     let ctl = s.is_some_and(|s| s.kind == "respawn");
     let running = s.is_some_and(|s| s.pid.is_some());
-    button(cv, b[0], m.lang.s(Key::mon_start), if ctl && !running { CYAN } else { MUTED }, false);
-    button(cv, b[1], m.lang.s(Key::mon_restart), if ctl { GOLD } else { MUTED }, ctl);
-    button(cv, b[2], m.lang.s(Key::mon_stop), if ctl && running { WARN } else { MUTED }, false);
+    button(cv, b[0], m.lang.s(Key::mon_start), if ctl && !running { ink().cyan } else { ink().muted }, false);
+    button(cv, b[1], m.lang.s(Key::mon_restart), if ctl { ink().gold } else { ink().muted }, ctl);
+    button(cv, b[2], m.lang.s(Key::mon_stop), if ctl && running { ink().warn } else { ink().muted }, false);
 }
 
 /// What the system got from a server, in a few words.
@@ -1035,43 +1043,48 @@ fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     let lw = svc_list_w(w);
     let top = HEAD_H;
     let body_h = h - HEAD_H - FOOT_H;
-    cv.fill_rect_a(PAD + lw, top, 1, body_h, HAIRLINE, 1.0);
+    cv.fill_rect_a(PAD + lw, top, 1, body_h, ink().hairline, 1.0);
     // Columns: SERVIDOR, DISPOSITIVO, DA, ESTADO, REINICIOS.
     let x0 = PAD;
     let cols = [x0, x0 + 96, x0 + 96 + 128, x0 + lw - 224, x0 + lw - 8];
     let hy = top + (COLS_H - GLYPH_H) / 2 + 4;
-    cv.text(m.lang.s(Key::mon_server), cols[0], hy, MUTED);
-    cv.text(m.lang.s(Key::mon_device), cols[1], hy, MUTED);
-    cv.text(m.lang.s(Key::mon_gives), cols[2], hy, MUTED);
-    cv.text(m.lang.s(Key::mon_state), cols[3], hy, MUTED);
-    text_right(cv, m.lang.s(Key::mon_restarts), cols[4], hy, MUTED);
+    cv.text(m.lang.s(Key::mon_server), cols[0], hy, ink().muted);
+    cv.text(m.lang.s(Key::mon_device), cols[1], hy, ink().muted);
+    cv.text(m.lang.s(Key::mon_gives), cols[2], hy, ink().muted);
+    cv.text(m.lang.s(Key::mon_state), cols[3], hy, ink().muted);
+    text_right(cv, m.lang.s(Key::mon_restarts), cols[4], hy, ink().muted);
     let ry = top + COLS_H + 8;
-    cv.hline(PAD, ry - 1, lw - 8, HAIRLINE, 1.0);
+    cv.hline(PAD, ry - 1, lw - 8, ink().hairline, 1.0);
     let n = ((body_h - COLS_H - 8) / ROW_H).max(1) as usize;
     let first = m.sel_srv.saturating_sub(n.saturating_sub(1));
     if m.servers.is_empty() {
         // Two lines: the reason is long.
         let why = m.lang.s(Key::mon_no_servers);
         let (a, b) = why.split_once(" (").map(|(a, b)| (a.to_string(), format!("({b}"))).unwrap_or((why.into(), String::new()));
-        cv.text(&fit(&a, lw - 16), PAD, ry + 8, MUTED);
-        cv.text(&fit(&b, lw - 16), PAD, ry + 8 + GLYPH_H + 6, DIM);
+        cv.text(&fit(&a, lw - 16), PAD, ry + 8, ink().muted);
+        cv.text(&fit(&b, lw - 16), PAD, ry + 8 + GLYPH_H + 6, ink().dim);
     }
     for (k, s) in m.servers.iter().enumerate().skip(first).take(n) {
         let y = ry + (k - first) as i32 * ROW_H;
         let ty = y + (ROW_H - GLYPH_H) / 2;
         if k == m.sel_srv {
-            cv.fill_rect_a(0, y, PAD + lw, ROW_H, CYAN, 0.08);
-            cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, CYAN, 1.0);
+            if glass::on() {
+                glass::cell(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, ink().sel, 1.0);
+                glass::outline(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, glass::RIM);
+            } else {
+                cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
+                cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
+            }
         }
-        cv.text(&fit(&s.service, cols[1] - cols[0] - 8), cols[0], ty, TEXT);
-        cv.text(&fit(&s.device, cols[2] - cols[1] - 8), cols[1], ty, MUTED);
-        cv.text(&fit(&gives_text(&s.gives, m.lang), cols[3] - cols[2] - 8), cols[2], ty, TEXT);
+        cv.text(&fit(&s.service, cols[1] - cols[0] - 8), cols[0], ty, ink().text);
+        cv.text(&fit(&s.device, cols[2] - cols[1] - 8), cols[1], ty, ink().muted);
+        cv.text(&fit(&gives_text(&s.gives, m.lang), cols[3] - cols[2] - 8), cols[2], ty, ink().text);
         let (word, bad) = sysmon::state_word(&s.state, m.lang);
         let col = state_col(&s.state, bad);
         cv.fill_rect_a(cols[3], ty + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
         cv.text(word, cols[3] + 12, ty, col);
         let r = s.restarts();
-        text_right(cv, &r.to_string(), cols[4], ty, if r > 0 { GOLD } else { MUTED });
+        text_right(cv, &r.to_string(), cols[4], ty, if r > 0 { ink().gold } else { ink().muted });
     }
 
     // Detail.
@@ -1086,7 +1099,7 @@ fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         };
         text_right(cv, &st, dx + dw, y, state_col(&s.state, bad));
         let room = dw - Canvas::text_width(&st) - 16;
-        cv.text_bold(&fit(&s.program.to_uppercase(), room), dx, y, CYAN);
+        cv.text_bold(&fit(&s.program.to_uppercase(), room), dx, y, ink().cyan);
         let line = GLYPH_H + 8;
         let lab = 18 * GLYPH_W;
         let cost = |pid: Option<i32>| {
@@ -1112,47 +1125,47 @@ fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         }
         for (k, (a, b)) in lines.iter().enumerate() {
             let ly = y + (k as i32 + 1) * line + 4;
-            cv.text(a, dx, ly, MUTED);
-            cv.text(&fit(b, dw - lab), dx + lab, ly, TEXT);
+            cv.text(a, dx, ly, ink().muted);
+            cv.text(&fit(b, dw - lab), dx + lab, ly, ink().text);
         }
         let ly = y + (lines.len() as i32 + 1) * line + 12;
-        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, MUTED);
-        cv.hline(dx, ly + GLYPH_H + 4, dw, HAIRLINE, 1.0);
+        cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, ink().muted);
+        cv.hline(dx, ly + GLYPH_H + 4, dw, ink().hairline, 1.0);
         let lb = (dx, ly + GLYPH_H + 12, dw, (h - FOOT_H - PAD - (ly + GLYPH_H + 12)).max(0));
-        cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, WELL, 1.0);
-        frame(cv, lb, HAIRLINE);
+        cv.fill_rect_a(lb.0, lb.1, lb.2, lb.3, ink().well, 1.0);
+        frame(cv, lb, ink().hairline);
         let fits = ((lb.3 - 16) / (GLYPH_H + 4)).max(0) as usize;
         if m.log.is_empty() {
             let keeps = m.chosen_svc().is_some_and(|s| s.log.is_some());
             let why = if keeps { m.lang.s(Key::mon_the_log_is_empty) } else { m.lang.s(Key::mon_this_service_keeps_no_log) };
-            cv.text(why, lb.0 + 8, lb.1 + 8, DIM);
+            cv.text(why, lb.0 + 8, lb.1 + 8, ink().dim);
         }
         for (k, l) in m.log.iter().skip(m.log.len().saturating_sub(fits)).enumerate() {
-            cv.text(&fit(l, lb.2 - 16), lb.0 + 8, lb.1 + 8 + k as i32 * (GLYPH_H + 4), MUTED);
+            cv.text(&fit(l, lb.2 - 16), lb.0 + 8, lb.1 + 8 + k as i32 * (GLYPH_H + 4), ink().muted);
         }
     }
 
     // Foot.
     let fy = h - FOOT_H;
-    cv.hline(0, fy, w, HAIRLINE, 1.0);
+    cv.hline(0, fy, w, ink().hairline, 1.0);
     let b = foot_buttons(w, h);
     let text = if m.status.is_empty() {
         m.lang.s(Key::mon_footer_servers_keys).to_string()
     } else {
         m.status.clone()
     };
-    let col = if m.status.is_empty() { MUTED } else if m.bad { WARN } else { CYAN };
+    let col = if m.status.is_empty() { ink().muted } else if m.bad { ink().warn } else { ink().cyan };
     cv.text(&fit(&text, b[0].0 - 2 * PAD), PAD, fy + (FOOT_H - GLYPH_H) / 2, col);
     service_buttons(cv, b, m);
 }
 
 fn state_col(state: &str, bad: bool) -> Rgb {
     match state {
-        "running" => CYAN,
-        "waiting" => GOLD,
-        _ if bad => WARN,
-        "idle" => OK,
-        _ => MUTED,
+        "running" => ink().cyan,
+        "waiting" => ink().gold,
+        _ if bad => ink().warn,
+        "idle" => ink().ok,
+        _ => ink().muted,
     }
 }
 
@@ -1331,10 +1344,11 @@ impl State {
             return;
         }
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else { return };
-        cv.set_square(true);
+        cv.set_square(!glass::on());
         draw(&mut cv, self.w as i32, self.h as i32, &self.mon);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
+        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -1588,9 +1602,10 @@ fn dump(spec: &str) -> ! {
         _ => {}
     }
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(true);
+    cv.set_square(!glass::on());
     draw(&mut cv, w as i32, h as i32, &m);
     let mut buf = vec![0u8; w * h * 4];
+    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarmon: could not write {path}");
         std::process::exit(1);

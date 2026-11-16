@@ -13,7 +13,9 @@ use std::{fs, path::Path};
 /// (the violet original, what the image ships), `kde` (KDE Breeze Dark),
 /// `win11` (Windows 11 dark), `gnome` (`labAdwaita-dark-xbm`, straight from
 /// labwc's own theme repository, see [`super::upstream`]) and `tecno` (the
-/// instrument panel, see [`super::tecno`]) -- persisted
+/// instrument panel, see [`super::tecno`]) and `abyss` (the Abyss session's
+/// warm-black glass; the image ships it when Abyss is the session, see
+/// `default_look` in `linux/abyss.rs`) -- persisted
 /// in
 /// `/etc/eclipse/look` like `eclipse-kbd`/`eclipse-locale`/`eclipse-tz` do
 /// with their own settings. `--boot` is what eclipse-init runs before the
@@ -37,7 +39,8 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
         b"#!/bin/sh\n\
           # Eclipse OS: desktop look (win11 = Windows 11 dark, kde = KDE\n\
           # Breeze Dark, gnome = labAdwaita-dark-xbm, from labwc's own theme\n\
-          # repository, tecno = the instrument panel, eclipse = the violet\n\
+          # repository, tecno = the instrument panel, abyss = the Abyss\n\
+          # session's glass, eclipse = the violet\n\
           # original).\n\
           CONF=/etc/eclipse/look\n\
           CFG=\"${HOME:-/root}/.config\"\n\
@@ -45,7 +48,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
           \n\
           look_ok() {\n\
-          \x20 case \"$1\" in win11|kde|eclipse|gnome|tecno) return 0 ;; *) return 1 ;; esac\n\
+          \x20 case \"$1\" in win11|kde|eclipse|gnome|tecno|abyss) return 0 ;; *) return 1 ;; esac\n\
           }\n\
           \n\
           theme_for() {\n\
@@ -54,6 +57,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20 kde) echo Breeze-Dark ;;\n\
           \x20 gnome) echo labAdwaita-dark-xbm ;;\n\
           \x20 tecno) echo Tecno-Dark ;;\n\
+          \x20 abyss) echo Abyss-Dark ;;\n\
           \x20 *) echo Eclipse-Dark ;;\n\
           \x20 esac\n\
           }\n\
@@ -106,6 +110,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20       -e \"s|<name>labAdwaita-dark-xbm</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>labAdwaita-dark</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>Tecno-Dark</name>|<name>$theme</name>|\" \\\n\
+          \x20       -e \"s|<name>Abyss-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
           # Titlebar, menu and OSD face: tecno is a monospace readout, every\n\
           # other look the proportional DejaVu. Mono first, so Sans -> Mono\n\
@@ -144,7 +149,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|gnome|tecno|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|gnome|tecno|abyss|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -156,7 +161,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20 current\n\
           \x20 exit 0\n\
           \x20 ;;\n\
-          win11|kde|eclipse|gnome|tecno)\n\
+          win11|kde|eclipse|gnome|tecno|abyss)\n\
           \x20 apply \"$1\"\n\
           \x20 echo \"$1\"\n\
           \x20 ;;\n\

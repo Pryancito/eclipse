@@ -25,8 +25,9 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
-use lunarbar::draw::{Canvas, Rgb, GLYPH_H};
+use lunarbar::draw::{Canvas, GLYPH_H};
 use lunarbar::fill_guard;
+use lunarbar::glass::{self, ink};
 use lunarbar::hunter_notify::{self, Action as NotifyAction, Alert, Severity};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL};
@@ -56,13 +57,6 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 
 // ── look ─────────────────────────────────────────────────────────────────────
 
-const GROUND: Rgb = (0x04, 0x07, 0x0d);
-const SURFACE: Rgb = (0x0a, 0x14, 0x23);
-const HAIRLINE: Rgb = (0x1d, 0x35, 0x50);
-const TEXT: Rgb = (0xe6, 0xf1, 0xff);
-const MUTED: Rgb = (0x8a, 0xa4, 0xc2);
-const CYAN: Rgb = (0x38, 0xe1, 0xff);
-const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
 
 /// How dark the frozen screen is outside the selection.
 const DIM: f32 = 0.55;
@@ -259,14 +253,14 @@ fn draw_overlay(cv: &mut Canvas, w: i32, h: i32, v: &View) {
     match v.sel {
         Some(s) if s.w > 0 && s.h > 0 => {
             // Dim the four bands around the selection, not the selection.
-            cv.fill_rect_a(0, 0, w, s.y, GROUND, DIM);
-            cv.fill_rect_a(0, s.y + s.h, w, h - s.y - s.h, GROUND, DIM);
-            cv.fill_rect_a(0, s.y, s.x, s.h, GROUND, DIM);
-            cv.fill_rect_a(s.x + s.w, s.y, w - s.x - s.w, s.h, GROUND, DIM);
+            cv.fill_rect_a(0, 0, w, s.y, ink().ground, DIM);
+            cv.fill_rect_a(0, s.y + s.h, w, h - s.y - s.h, ink().ground, DIM);
+            cv.fill_rect_a(0, s.y, s.x, s.h, ink().ground, DIM);
+            cv.fill_rect_a(s.x + s.w, s.y, w - s.x - s.w, s.h, ink().ground, DIM);
             for (x, y, rw, rh) in [(s.x, s.y, s.w, 1), (s.x, s.y + s.h - 1, s.w, 1), (s.x, s.y, 1, s.h), (s.x + s.w - 1, s.y, 1, s.h)] {
-                cv.fill_rect_a(x, y, rw, rh, CYAN, 1.0);
+                cv.fill_rect_a(x, y, rw, rh, ink().cyan, 1.0);
             }
-            cv.brackets(s.x, s.y, s.w, s.h, BRACKET_LEN, 2, GOLD);
+            glass::brackets(cv, s.x, s.y, s.w, s.h, BRACKET_LEN, 2, ink().gold);
             // The readout, under the selection or above it near the bottom.
             let label = format!("{} × {}", v.real.0, v.real.1);
             let pw = Canvas::text_width(&label) + 2 * PLATE_PAD;
@@ -275,9 +269,9 @@ fn draw_overlay(cv: &mut Canvas, w: i32, h: i32, v: &View) {
             let py = if below + ph <= h { below } else { (s.y - PLATE_GAP - ph).max(0) };
             let px = s.x.clamp(0, (w - pw).max(0));
             plate(cv, px, py, pw, ph);
-            cv.text(&label, px + PLATE_PAD, py + PLATE_PAD, TEXT);
+            cv.text(&label, px + PLATE_PAD, py + PLATE_PAD, ink().text);
         }
-        _ => cv.fill_rect_a(0, 0, w, h, GROUND, DIM),
+        _ => cv.fill_rect_a(0, 0, w, h, ink().ground, DIM),
     }
     if v.hint {
         let (a, b) = match v.lang {
@@ -288,16 +282,16 @@ fn draw_overlay(cv: &mut Canvas, w: i32, h: i32, v: &View) {
         let ph = 2 * GLYPH_H + 4 + 2 * PLATE_PAD;
         let (px, py) = ((w - pw) / 2, 48);
         plate(cv, px, py, pw, ph);
-        cv.brackets(px, py, pw, ph, 8, 1, GOLD);
-        cv.text_bold(a, px + (pw - Canvas::text_width(a)) / 2, py + PLATE_PAD, TEXT);
-        cv.text(b, px + (pw - Canvas::text_width(b)) / 2, py + PLATE_PAD + GLYPH_H + 4, MUTED);
+        glass::brackets(cv, px, py, pw, ph, 8, 1, ink().gold);
+        cv.text_bold(a, px + (pw - Canvas::text_width(a)) / 2, py + PLATE_PAD, ink().text);
+        cv.text(b, px + (pw - Canvas::text_width(b)) / 2, py + PLATE_PAD + GLYPH_H + 4, ink().muted);
     }
 }
 
 fn plate(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32) {
-    cv.fill_rect_a(x, y, w, h, SURFACE, 0.94);
+    cv.fill_rect_a(x, y, w, h, ink().surface, 0.94);
     for (rx, ry, rw, rh) in [(x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)] {
-        cv.fill_rect_a(rx, ry, rw, rh, HAIRLINE, 1.0);
+        cv.fill_rect_a(rx, ry, rw, rh, ink().hairline, 1.0);
     }
 }
 
@@ -544,6 +538,7 @@ impl State {
         draw_overlay(&mut cv, c.w as i32, c.h as i32, &View { shot: scaled, sel, real, hint, lang });
         // SAFETY: `map` is the frame this cover mapped, `len` bytes.
         let data = unsafe { std::slice::from_raw_parts_mut(c.map, c.len) };
+        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             c.surface.attach(Some(buf), 0, 0);
             c.surface.damage_buffer(0, 0, c.w as i32, c.h as i32);
@@ -807,7 +802,7 @@ fn dump(spec: &str) -> ! {
         .and_then(|p| resized(&p, w, h))
         .unwrap_or_else(|| {
             let mut p = Pixmap::new(w, h).unwrap();
-            p.fill(tiny_skia::Color::from_rgba8(GROUND.0, GROUND.1, GROUND.2, 255));
+            p.fill(tiny_skia::Color::from_rgba8(ink().ground.0, ink().ground.1, ink().ground.2, 255));
             p
         });
     let sel = std::env::var("LUNARSHOT_SEL").ok().and_then(|s| {
@@ -815,10 +810,11 @@ fn dump(spec: &str) -> ! {
         (v.len() == 4).then(|| Rect { x: v[0], y: v[1], w: v[2], h: v[3] })
     });
     let mut cv = Canvas::try_new(w as usize, h as usize).unwrap_or_else(|| fail("no canvas"));
-    cv.set_square(true);
+    cv.set_square(!glass::on());
     let real = sel.map(|r| (r.w, r.h)).unwrap_or((0, 0));
     draw_overlay(&mut cv, w as i32, h as i32, &View { shot: &shot, sel, real, hint: sel.is_none(), lang: Lang::current() });
     let mut buf = vec![0u8; w as usize * h as usize * 4];
+    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         fail("could not write the dump");
     }

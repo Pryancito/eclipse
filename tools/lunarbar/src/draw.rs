@@ -751,6 +751,41 @@ impl Canvas {
         }
     }
 
+    /// A 1px outline of a rounded rectangle, inside `x, y, w, h`.
+    pub fn round_frame(&mut self, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb) {
+        let Some(p) = rounded_rect_path(x as f32 + 0.5, y as f32 + 0.5, (w - 1).max(1) as f32, (h - 1).max(1) as f32, rad as f32) else {
+            return;
+        };
+        let stroke = Stroke { width: 1.0, ..Stroke::default() };
+        self.pix.stroke_path(&p, &Self::paint(c, 1.0), &stroke, Transform::identity(), None);
+    }
+
+    /// Give every OPAQUE pixel the alpha `alpha(r, g, b)` returns, keeping it
+    /// premultiplied. Pixels already translucent are left alone. The `abyss`
+    /// look's glass (see [`crate::glass::frost`]).
+    pub fn map_opaque(&mut self, alpha: impl Fn(u8, u8, u8) -> f32) {
+        for p in self.pix.pixels_mut() {
+            if p.alpha() != 0xff {
+                continue;
+            }
+            let a = alpha(p.red(), p.green(), p.blue()).clamp(0.0, 1.0);
+            if a >= 1.0 {
+                continue;
+            }
+            let m = |c: u8| (c as f32 * a).round() as u8;
+            let a8 = (a * 255.0).round() as u8;
+            // The colour channels can never exceed the alpha once scaled.
+            if let Some(q) = tiny_skia::PremultipliedColorU8::from_rgba(
+                m(p.red()).min(a8),
+                m(p.green()).min(a8),
+                m(p.blue()).min(a8),
+                a8,
+            ) {
+                *p = q;
+            }
+        }
+    }
+
     /// Swizzle the finished RGBA frame into an XRGB8888 (B,G,R,X) buffer.
     /// `dst` must be at least w*h*4 bytes. Returns false if sizes disagree
     /// (never panics — the panel must stay up under a bad configure).

@@ -1704,6 +1704,9 @@ const DESKTOP_UBUNTU: &[&str] = &[
     "xfonts-base",
     "xfonts-encodings",
     "fonts-dejavu",
+    // JetBrains Mono: the `abyss` look's data face (lunartext reads it from
+    // /usr/share/fonts/truetype/jetbrains-mono). OFL-1.1.
+    "fonts-jetbrains-mono",
     "xterm",
     "openbox",
     "x11-xserver-utils",
