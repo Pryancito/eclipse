@@ -631,6 +631,25 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
     // name, type, exec, after
     const BOOT: &[(&str, &str, &str, &str)] = &[
         (
+            "abyss",
+            "respawn",
+            "/usr/local/bin/eclipse-abyss",
+            "abyss-seatd dbus",
+        ),
+        (
+            "abyss-hyperion-bar",
+            "respawn",
+            "/usr/local/bin/eclipse-abyss-client ec-hyperion-bar",
+            "abyss",
+        ),
+        ("abyss-seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+        (
+            "abyss-wallpaper",
+            "respawn",
+            "/usr/local/bin/eclipse-abyss-client ec-wallpaper",
+            "abyss",
+        ),
+        (
             "boot-sound",
             "oneshot",
             "/usr/local/bin/eclipse-boot-sound",
@@ -816,8 +835,10 @@ fn every_order_names_a_service_that_exists() {
 #[test]
 fn a_service_that_waits_for_a_socket_is_ordered_after_whatever_binds_it() {
     const BOUND_BY: &[(&str, &str)] = &[
-        ("/run/seatd.sock", "seatd"),
+        // One seatd per session: a service has a single `desktop`.
+        ("/run/seatd.sock", "seatd abyss-seatd"),
         ("/run/user/0/wayland-0", "labwc"),
+        ("/run/user/0/eclipse/abyss.sock", "abyss"),
         ("/run/user/0/bus", "dbus"),
     ];
     /// Everything a service is ordered after, directly or through another:
@@ -852,15 +873,18 @@ fn a_service_that_waits_for_a_socket_is_ordered_after_whatever_binds_it() {
         let Some(socket) = field(body, "wait_socket") else {
             continue;
         };
-        let (_, binder) = BOUND_BY
+        let (_, binders) = BOUND_BY
             .iter()
             .find(|(s, _)| *s == socket)
             .unwrap_or_else(|| {
                 panic!("{name} waits for {socket}, which nothing in the image binds")
             });
+        let after = ordered_after(&all, name);
         assert!(
-            ordered_after(&all, name).iter().any(|d| d == *binder),
-            "{name} waits for {socket} but nothing orders it after {binder}, so it can start first"
+            binders
+                .split_whitespace()
+                .any(|binder| after.iter().any(|d| d == binder)),
+            "{name} waits for {socket} but nothing orders it after {binders}, so it can start first"
         );
     }
 }
@@ -1558,7 +1582,10 @@ fn nothing_on_the_boot_path_waits_for_a_sound_card() {
         .collect();
     assert_eq!(
         waits,
-        [("labwc".to_string(), "/dev/input".to_string())],
+        [
+            ("abyss".to_string(), "/dev/input".to_string()),
+            ("labwc".to_string(), "/dev/input".to_string()),
+        ],
         "a service waits for a path that is not the compositor's input directory"
     );
 }
@@ -1674,6 +1701,12 @@ fn the_two_sessions_never_start_each_others_clients() {
         "xkbmap",
     ];
     const XORG: &[&str] = &["boot-sound-xorg", "xorg"];
+    const ABYSS: &[&str] = &[
+        "abyss",
+        "abyss-hyperion-bar",
+        "abyss-seatd",
+        "abyss-wallpaper",
+    ];
     const EITHER: &[&str] = &[
         "dbus",
         "dbus-selftest",
@@ -1703,6 +1736,8 @@ fn the_two_sessions_never_start_each_others_clients() {
             Some("labwc")
         } else if XORG.contains(&name.as_str()) {
             Some("xorg")
+        } else if ABYSS.contains(&name.as_str()) {
+            Some("abyss")
         } else {
             assert!(
                 EITHER.contains(&name.as_str()),
