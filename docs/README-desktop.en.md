@@ -554,6 +554,8 @@ echo labwc > /etc/eclipse/desktop
   automatic pick looks for connectors in `/sys/class/drm/cardN-*`, which
   Eclipse does not expose, and without that line Abyss does not start
   ("no GPU on seat 'seat0' has any connector").
+  If Abyss dies several times in one boot on the GPU, `eclipse-init` respawns
+  it with software GL, as it does for labwc.
 - **Config**: `/etc/eclipse/abyss.kdl` (`de` desktop mode, `foot` terminal);
   yours goes in `~/.config/eclipse/abyss.kdl` or in Settings. Every key:
   `desktop/docs/CONFIG.md`.

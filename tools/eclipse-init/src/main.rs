@@ -3429,15 +3429,17 @@ fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at
                 // off zink, which with no GPU path lands on lavapipe.
                 let _ = std::fs::write(RENDERER_FALLBACK_MARKER, "init-degraded\n");
                 log(&format!(
-                    "respawn: labwc died {n}x this boot on the GPU renderer ({how}); \
+                    "respawn: {} died {n}x this boot on the GPU renderer ({how}); \
                      degrading the compositor to pixman for the rest of this boot -- \
                      the GPU channel is likely wedged (a client's EXEC hung it and \
-                     ctx 0 is never rebuilt); see `dmesg | grep nouveau-uapi` and /tmp/labwc.log"
+                     ctx 0 is never rebuilt); see `dmesg | grep nouveau-uapi` and /tmp/{}.log",
+                    svc.name, svc.name
                 ));
             } else {
                 log(&format!(
-                    "respawn: labwc died ({how}) on the GPU renderer; retrying it \
-                     ({n}/{COMPOSITOR_DEGRADE_AFTER} exits before degrading to pixman)"
+                    "respawn: {} died ({how}) on the GPU renderer; retrying it \
+                     ({n}/{COMPOSITOR_DEGRADE_AFTER} exits before degrading to pixman)",
+                    svc.name
                 ));
             }
         }
@@ -3683,7 +3685,9 @@ fn compositor_exit(
     gpu: bool,
     bump: impl FnOnce() -> u32,
 ) -> Option<(u32, bool)> {
-    if name != "labwc" || degraded || !gpu {
+    // Both sessions' compositors: Abyss renders on the same zink+NVK stack
+    // (it gets the same env from `build_child_env`) and can wedge the same way.
+    if !matches!(name, "labwc" | "abyss") || degraded || !gpu {
         return None;
     }
     let n = bump() + 1;

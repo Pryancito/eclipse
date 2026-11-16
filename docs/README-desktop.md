@@ -559,6 +559,8 @@ echo labwc > /etc/eclipse/desktop
   en `abyss.kdl`, como `WLR_DRM_DEVICES` en labwc): su elección automática
   busca los conectores en `/sys/class/drm/cardN-*`, que Eclipse no expone, y
   sin esa línea Abyss no arranca («no GPU on seat 'seat0' has any connector»).
+  Si Abyss muere varias veces en un arranque con la GPU, `eclipse-init` lo
+  relanza con GL por software, igual que hace con labwc.
 - **Configuración**: `/etc/eclipse/abyss.kdl` (modo escritorio `de`, terminal
   `foot`); lo tuyo va en `~/.config/eclipse/abyss.kdl` o en Ajustes. Todas las
   claves: `desktop/docs/CONFIG.md`.
