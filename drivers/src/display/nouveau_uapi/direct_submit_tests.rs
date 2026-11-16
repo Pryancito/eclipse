@@ -308,6 +308,11 @@ fn the_semaphore_streams_write_the_address_the_payload_and_the_operation() {
     // syncobj layer's own compare tolerates.
     assert_ne!(acq[5] & 0x7, 2);
     assert_eq!(acq[5] & (1 << 20), 0, "an acquire must not wait for idle");
+    assert_ne!(
+        acq[5] & (1 << 12),
+        0,
+        "an acquire not yet met must let another TSG run (ACQUIRE_SWITCH_TSG_EN, as nouveau)"
+    );
 }
 
 /// Every ioctl this driver dispatches gets its own profile slot, and the
