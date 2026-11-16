@@ -4,7 +4,7 @@ use super::*;
 
 /// Every look, so a row added to `Look` without a row here fails to compile
 /// rather than quietly inheriting whatever the `_` arm says.
-const LOOKS: [Look; 4] = [Look::Eclipse, Look::Kde, Look::Win11, Look::Tecno];
+const LOOKS: [Look; 5] = [Look::Eclipse, Look::Kde, Look::Win11, Look::Tecno, Look::Abyss];
 
 #[test]
 fn each_look_wears_its_own_palette() {
@@ -332,7 +332,7 @@ fn the_dim_tier_is_readable_because_it_paints_enabled_text_too() {
             Look::Eclipse => 4.91,
             Look::Kde => 3.93,
             Look::Win11 => 3.80,
-            Look::Tecno => 4.5,
+            Look::Tecno | Look::Abyss => 4.5,
         };
         let on_bar = contrast(p.dim, p.bar_bg);
         assert!(

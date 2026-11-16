@@ -1793,6 +1793,7 @@ const LOOKS: &[(&str, &str, &str)] = &[
     ("eclipse", "Eclipse-Dark", "background=120f1c"),
     ("gnome", "labAdwaita-dark-xbm", "background=1d1d1d"),
     ("tecno", "Tecno-Dark", "background=060b14"),
+    ("abyss", "Abyss-Dark", "background=0b0906"),
 ];
 
 /// `xml` with its comments taken out. rc.xml's comments name the very

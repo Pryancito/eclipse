@@ -18,7 +18,8 @@ does with the language and the time zone.
 
 ```sh
 eclipse-look            # prints the current one
-eclipse-look tecno      # "Orbital HUD" instrument panel (default)
+eclipse-look tecno      # "Orbital HUD" instrument panel (default under labwc)
+eclipse-look abyss      # Abyss's warm-black glass (default in the Abyss session)
 eclipse-look eclipse    # the original violet one
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
@@ -38,6 +39,19 @@ eclipse-look win11      # Windows 11
 [img/tecno-orbital-hud.png](img/tecno-orbital-hud.png)): space black,
 instrumentation cyan `#38e1ff`, fillet `#1d3550` and the gold `#f2c14e` of
 lunarbg's crescent to mark what has focus.
+
+`abyss` is the Abyss session's look (the image ships `look=abyss` when it
+carries `ec-abyss`). Its values come from Abyss's style guide
+(`desktop/docs/STYLE.md`), none of its code: `#0b0906` ground, white ink
+(secondary at 64 %), white hairlines at 12 %, rounded corners (window 16, card
+13, cell 10), and the `#f2c33c` gold only on the selected label, never as a
+fill. Each lunar app draws its panel opaque on that black and
+`lunarbar::glass::frost` turns it 70 % translucent at the end: Abyss blurs,
+saturates and rims what is behind a translucent surface, so the compositor
+supplies the glass and text stays opaque. The lock screen stays opaque on
+purpose. Data is set in JetBrains Mono (`fonts-jetbrains-mono`, OFL; lunartext
+falls back to DejaVu Sans Mono). lunarbg draws the `tecno` face in warm white
+and gold (see [img/lunar-abyss.png](img/lunar-abyss.png)).
 
 Changing the look rewrites the theme's `<name>` in `rc.xml` (and the title font:
 `DejaVu Sans Mono` in `tecno`, `DejaVu Sans` in the rest), copies the matching

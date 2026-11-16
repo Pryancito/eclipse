@@ -35,6 +35,8 @@ pub(super) fn install(rootfs: &Path) {
     write_theme(rootfs);
     write_foot(rootfs);
     write_gtk(rootfs);
+    // The Abyss session's look rides along: it borrows these buttons.
+    super::abyss_look::install(rootfs);
 }
 
 /// The widgets both GTK versions share: square, hairline-framed, cyan focus.
@@ -144,7 +146,7 @@ fn write_theme(rootfs: &Path) {
 
 /// The window buttons of the "Orbital HUD" mockup: a 1px square with the
 /// glyph inside it. Generated once and vendored under `xtask/assets`.
-const BUTTONS: &[(&str, &[u8])] = &[
+pub(super) const BUTTONS: &[(&str, &[u8])] = &[
     (
         "close.xbm",
         include_bytes!("../../../assets/tecno-buttons/close.xbm"),

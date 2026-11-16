@@ -1,5 +1,5 @@
 //! Which look the desktop is wearing: KDE's Breeze Dark, Windows 11 dark,
-//! Eclipse's own, or `tecno`. Persisted by `eclipse-look` in
+//! Eclipse's own, `tecno` or `abyss`. Persisted by `eclipse-look` in
 //! `/etc/eclipse/look` (and applied at boot by eclipse-init), so every client
 //! agrees without an IPC bus.
 
@@ -18,6 +18,11 @@ pub enum Look {
     /// segments and history plots rather than as a number on its own.
     /// `#060b14` ground, `#38e1ff` accent, `#f2c14e` gold.
     Tecno,
+    /// The look of the Abyss session: warm-black glass (the compositor blurs
+    /// what is behind a translucent surface), rounded plates, white ink and
+    /// one gold label for what is selected. `#0b0906` ground at .70,
+    /// `#f2c33c` gold. The default when Abyss is the session.
+    Abyss,
 }
 
 impl Look {
@@ -36,6 +41,7 @@ impl Look {
             // `tech` as well: the setting is written by people at a prompt,
             // and the two spellings are one keystroke apart.
             "tecno" | "tech" => Some(Look::Tecno),
+            "abyss" => Some(Look::Abyss),
             _ => None,
         }
     }
@@ -128,6 +134,9 @@ mod tests {
             ("TECNO", Look::Tecno),
             ("tech", Look::Tecno),
             ("TECH", Look::Tecno),
+            ("abyss", Look::Abyss),
+            ("Abyss", Look::Abyss),
+            ("ABYSS", Look::Abyss),
         ] {
             assert_eq!(Look::from_name(name), Some(want), "{name}");
         }
@@ -151,6 +160,7 @@ mod tests {
         assert_eq!(look_from_text("  look=kde\n"), Some(Look::Kde));
         assert_eq!(look_from_text("\tlook=win11"), Some(Look::Win11));
         assert_eq!(look_from_text("look=tecno\n"), Some(Look::Tecno));
+        assert_eq!(look_from_text("look=abyss\n"), Some(Look::Abyss));
         assert_eq!(look_from_text("look=kde  \n"), Some(Look::Kde));
         // Comments and blank lines skipped, as the format allows.
         assert_eq!(

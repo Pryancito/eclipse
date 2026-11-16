@@ -31,6 +31,7 @@ use lunarbar::apps::{norm_key, scan_apps};
 use lunarbar::calc;
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::now_secs;
+use lunarbar::glass;
 use lunarbar::runhist::History;
 use lunarbar::fill_guard;
 use lunarbar::i18n::{Key, Lang};
@@ -137,12 +138,27 @@ const PAL_WIN11: Palette = Palette {
     border: (0x3d, 0x3d, 0x3d),
 };
 
+/// `abyss`: the Abyss session's warm-black glass (see `lunarbar::glass`).
+/// The panel is drawn opaque on the ground and frosted after the draw.
+const PAL_ABYSS: Palette = Palette {
+    scrim: (0x00, 0x00, 0x00),
+    scrim_a: 0.30,
+    panel: glass::GROUND,
+    field: glass::WELL,
+    text: glass::TEXT,
+    dim: glass::MUTED,
+    accent: glass::GOLD_TEXT,
+    sel: glass::SELECT,
+    border: glass::RIM,
+};
+
 fn palette(look: Look) -> &'static Palette {
     match look {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Tecno => &PAL_TECNO,
+        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -829,15 +845,18 @@ fn draw_overlay(
     // `tecno` is the "Orbital HUD" mockup: square corners, a hairline round
     // the field, a cyan bar on the selected row and gold corner brackets.
     let hud = st.look == Look::Tecno;
-    let r = |n: i32| if hud { 0 } else { n };
+    let abyss = st.look == Look::Abyss;
+    let r = |n: i32| if hud { 0 } else if abyss { n + n / 2 } else { n };
 
     // 1px accent-tinted border under the panel, drawn as a slightly larger
     // rounded rect: with no compositor shadows a borderless panel floats
     // shapelessly over the scrim.
-    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, r(9), if hud { p.accent } else { p.border }, if hud { 0.55 } else { 0.9 });
+    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, r(9), if hud { p.accent } else { p.border }, if hud { 0.55 } else if abyss { 1.0 } else { 0.9 });
     // Windows 11's flyouts are acrylic; with no blur available in labwc, flat
     // translucency is the honest approximation (see lunarbar's bar_alpha).
-    let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
+    // `abyss` draws it opaque: `glass::frost` makes the ground translucent
+    // after the draw, and only touches opaque pixels.
+    let panel_a = if st.look == Look::Win11 { 0.92 } else if abyss { 1.0 } else { 0.97 };
     cv.round_rect_a(px, py, pw, ph, r(8), p.panel, panel_a);
     if hud {
         cv.brackets(px - 1, py - 1, pw + 2, ph + 2, 14, 2, TECNO_GOLD);
@@ -850,6 +869,9 @@ fn draw_overlay(
     if hud {
         cv.fill_rect_a(fx, fy, fw, FIELD_H, p.border, 1.0);
         cv.fill_rect_a(fx + 1, fy + 1, fw - 2, FIELD_H - 2, p.field, 1.0);
+    } else if abyss {
+        cv.round_rect(fx, fy, fw, FIELD_H, glass::R_CELL + 1, glass::HAIRLINE);
+        cv.round_rect(fx + 1, fy + 1, fw - 2, FIELD_H - 2, glass::R_CELL, p.field);
     } else {
         cv.round_rect(fx, fy, fw, FIELD_H, 6, p.field);
     }
@@ -857,7 +879,7 @@ fn draw_overlay(
     // A ">" prompt instead of a magnifier: the font is a bitmap ISO-8859-1
     // face with no icon glyphs, and a hand-drawn lens at 15px reads as dirt.
     // tecno: the mockup's shell prompt `>_` and the shortcut flush right.
-    cv.text_bold(if hud { ">_" } else { ">" }, fx + 10, ty, p.accent);
+    cv.text_bold(if hud { ">_" } else if abyss { "/" } else { ">" }, fx + 10, ty, if abyss { p.dim } else { p.accent });
     let tx = fx + 10 + if hud { 3 } else { 2 } * GLYPH_W;
     let key_w = if hud { Canvas::text_width(st.lang.run_key()) + 12 } else { 0 };
     if hud {
@@ -899,11 +921,18 @@ fn draw_overlay(
         let y = row0 + k as i32 * ROW_H;
         let selected = row == st.sel;
         let hovered = st.hover == Some(row);
-        if selected {
+        if selected && abyss {
+            // The guide's selected cell: glass a step clearer under a crisp
+            // rim, and gold on the label only (below).
+            cv.round_rect(fx, y, fw, ROW_H - 2, glass::R_CELL, p.border);
+            cv.round_rect(fx + 1, y + 1, fw - 2, ROW_H - 4, glass::R_CELL - 1, p.sel);
+        } else if selected {
             cv.round_rect(fx, y, fw, ROW_H - 2, r(6), p.sel);
             if hud {
                 cv.fill_rect_a(fx, y, 2, ROW_H - 2, p.accent, 1.0);
             }
+        } else if hovered && abyss {
+            cv.round_rect(fx, y, fw, ROW_H - 2, glass::R_CELL, glass::HOVER);
         } else if hovered {
             cv.round_rect_a(fx, y, fw, ROW_H - 2, r(6), p.sel, 0.35);
         }
@@ -916,7 +945,8 @@ fn draw_overlay(
             Some(pm) => cv.pixmap(ix, iy, &pm),
             None => {
                 let ch = it.name.chars().next().unwrap_or('?');
-                cv.badge(ix, iy, ICON, ch, p.field, p.accent);
+                // `abyss` keeps gold for the selected label alone.
+                cv.badge(ix, iy, ICON, ch, if abyss { glass::HOVER } else { p.field }, if abyss { p.dim } else { p.accent });
                 if hud {
                     // The mockup's framed glyph box: a square well, hairline edge.
                     cv.fill_rect_a(ix, iy, ICON, ICON, p.field, 1.0);
@@ -940,7 +970,7 @@ fn draw_overlay(
         let ty = y + (ROW_H - 2 - GLYPH_H) / 2;
         // Launched before: a gold mark at the row's edge, which is why it
         // ranks where it does.
-        if st.scores.get(st.item_index(row)).is_some_and(|&s| s > 0.0) && !selected {
+        if st.scores.get(st.item_index(row)).is_some_and(|&s| s > 0.0) && !selected && !abyss {
             cv.fill_rect_a(fx + 2, y + (ROW_H - 2) / 2 - 2, 3, 4, TECNO_GOLD, 1.0);
         }
         if it.kind == Kind::Calc {
@@ -992,7 +1022,7 @@ fn draw_overlay(
         } else {
             it.name.clone()
         };
-        cv.text(&name, text_x, ty, p.text);
+        cv.text(&name, text_x, ty, if selected && abyss { glass::GOLD_TEXT } else { p.text });
         if show_cmd {
             let cx = fx + fw - cmd_w - 10;
             cv.text(cmd, cx, ty, if selected { p.text } else { p.dim });
@@ -1012,7 +1042,7 @@ fn draw_overlay(
         let tx = fx + fw - 4;
         cv.round_rect_a(tx, row0, 3, track_h, 1, p.dim, 0.25);
         let ty = row0 + (frac * (track_h - thumb_h) as f32) as i32;
-        cv.round_rect_a(tx, ty, 3, thumb_h, 1, p.accent, 0.8);
+        cv.round_rect_a(tx, ty, 3, thumb_h, 1, if abyss { p.dim } else { p.accent }, 0.8);
     }
 
     // ── footer ──
@@ -1027,6 +1057,9 @@ fn draw_overlay(
         p.dim,
     );
 
+    if abyss {
+        glass::frost(cv);
+    }
     ((px, py, pw, ph), row0)
 }
 
@@ -1448,6 +1481,7 @@ fn new_state(toggle_desktop: bool) -> State {
     // could return two different looks and leave the palette from one beside the
     // geometry of the other.
     let look = Look::current();
+    glass::enter(look);
     let mut st = State {
         compositor: None,
         shm: None,
@@ -2357,11 +2391,11 @@ mod tests {
     /// variant stops this compiling, which is the point, because the palette
     /// tests walk this list and a look missing from it would go unchecked in
     /// exactly the silent way a palette bug already is. It caught `tecno`.
-    fn every_look() -> [Look; 4] {
-        let all = [Look::Win11, Look::Kde, Look::Eclipse, Look::Tecno];
+    fn every_look() -> [Look; 5] {
+        let all = [Look::Win11, Look::Kde, Look::Eclipse, Look::Tecno, Look::Abyss];
         for look in all {
             match look {
-                Look::Win11 | Look::Kde | Look::Eclipse | Look::Tecno => {}
+                Look::Win11 | Look::Kde | Look::Eclipse | Look::Tecno | Look::Abyss => {}
             }
         }
         all

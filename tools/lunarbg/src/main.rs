@@ -70,7 +70,13 @@ fn look_style() -> scene::Style {
     static STYLE: std::sync::OnceLock<scene::Style> = std::sync::OnceLock::new();
     *STYLE.get_or_init(|| {
         let file = std::fs::read_to_string("/etc/eclipse/look").ok();
-        scene::style_from(std::env::var("ECLIPSE_LOOK").ok().as_deref(), file.as_deref())
+        let style =
+            scene::style_from(std::env::var("ECLIPSE_LOOK").ok().as_deref(), file.as_deref());
+        // The Abyss look's data face, before the first glyph is drawn.
+        if style == scene::Style::Abyss {
+            lunartext::use_family(lunartext::Family::JetBrains);
+        }
+        style
     })
 }
 

@@ -48,6 +48,26 @@ pub(super) const GLOW: Rgb = rgb(0x07, 0x22, 0x2b);
 pub(super) const GLOW_R: f32 = 620.0;
 
 const CYAN: Rgb = rgb(0x38, 0xe1, 0xff);
+
+/// The `abyss` look's face: the same instrument, recoloured to the Abyss
+/// session's warm black. Rings and ticks in warm white instead of cyan, the
+/// crescent in Abyss gold, a dim amber wash behind it instead of the teal.
+pub(super) const ABYSS_GROUND_TOP: Rgb = rgb(0x0b, 0x09, 0x06);
+pub(super) const ABYSS_GROUND_BOTTOM: Rgb = rgb(0x10, 0x0d, 0x09);
+pub(super) const ABYSS_GLOW: Rgb = rgb(0x24, 0x1b, 0x0c);
+const ABYSS_LINE: Rgb = rgb(0xf4, 0xf1, 0xea);
+const ABYSS_GOLD: Rgb = rgb(0xf2, 0xc3, 0x3c);
+const ABYSS_MUTED: Rgb = rgb(0xa7, 0xa6, 0xa5);
+const ABYSS_VOID: Rgb = rgb(0x0b, 0x09, 0x06);
+
+/// The four inks of the face, for the style being drawn.
+fn inks(style: Style) -> (Rgb, Rgb, Rgb, Rgb) {
+    if style == Style::Abyss {
+        (ABYSS_LINE, ABYSS_GOLD, ABYSS_MUTED, ABYSS_VOID)
+    } else {
+        (CYAN, GOLD, MUTED, VOID)
+    }
+}
 const GOLD: Rgb = rgb(0xf2, 0xc1, 0x4e);
 const MUTED: Rgb = rgb(0x8a, 0xa4, 0xc2);
 /// The moon: darker than the ground, so the eclipse reads as a body.
@@ -177,7 +197,7 @@ pub(super) const REACH: f32 = 340.0;
 pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
     let known = |n: &str| {
         let n = n.trim().to_ascii_lowercase();
-        matches!(n.as_str(), "eclipse" | "kde" | "win11" | "gnome" | "tecno").then_some(n)
+        matches!(n.as_str(), "eclipse" | "kde" | "win11" | "gnome" | "tecno" | "abyss").then_some(n)
     };
     let from_file = || {
         file?.lines().find_map(|l| {
@@ -191,6 +211,7 @@ pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
     };
     match env.and_then(known).or_else(from_file).as_deref() {
         Some("tecno") | None => Style::Tecno,
+        Some("abyss") => Style::Abyss,
         Some(_) => Style::Cosmic,
     }
 }
@@ -198,10 +219,11 @@ pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
 pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
     let (cx, cy, s, px) = (lay.cx, lay.cy, lay.s, lay.px);
     let hair = 1.0 * px;
+    let (cyan, gold, muted, void) = inks(lay.style);
 
-    pb.ring(cx, cy, R_OUTER * s, hair, CYAN, 0.07);
-    pb.ring(cx, cy, R_SOLID * s, hair, CYAN, 0.20);
-    pb.ring(cx, cy, R_INNER * s, hair, CYAN, 0.06);
+    pb.ring(cx, cy, R_OUTER * s, hair, cyan, 0.07);
+    pb.ring(cx, cy, R_SOLID * s, hair, cyan, 0.20);
+    pb.ring(cx, cy, R_INNER * s, hair, cyan, 0.06);
 
     // The clock. 12 o'clock is straight up, and angles grow clockwise.
     let t = wall(t_ms);
@@ -220,14 +242,14 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
     for k in 0..60 {
         let (x, y) = at(R_DOTS, up + k as f32 * 6.0);
         let (r, a) = if k == ss { (1.4, 0.95) } else if k % 5 == 0 { (1.0, 0.45) } else { (0.7, 0.25) };
-        pb.dot(x, y, r * px, CYAN, a);
+        pb.dot(x, y, r * px, cyan, a);
     }
 
     // The hands, as arcs from the top: gold the hour on the inner ring, cyan
     // the minute on the solid one, each with a dot where it stands.
     let hour = (hh as f32 + mm as f32 / 60.0) * 30.0;
     let minute = (mm as f32 + ss as f32 / 60.0) * 6.0;
-    for (r, span, c) in [(R_INNER, hour, GOLD), (R_SOLID, minute, CYAN)] {
+    for (r, span, c) in [(R_INNER, hour, gold), (R_SOLID, minute, cyan)] {
         if span >= 0.5 {
             pb.sweep(cx, cy, r * s, up, span, 1.2 * px, c, 0.4);
         }
@@ -238,10 +260,10 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
     // The eclipse: the gold sun, then the dark moon over it, with a faint
     // corona on the moon's limb where it stands out against the ground.
     let sun_r = SUN_R * s;
-    pb.disc(cx, cy + SUN_DY * s, sun_r, GOLD, 1.0);
+    pb.disc(cx, cy + SUN_DY * s, sun_r, gold, 1.0);
     let (mx, my) = (cx + MOON_DX * s * pb.sx, cy);
-    pb.disc(mx, my, sun_r, VOID, 1.0);
-    pb.ring(mx, my, sun_r + 1.5 * px, hair, CYAN, 0.10);
+    pb.disc(mx, my, sun_r, void, 1.0);
+    pb.ring(mx, my, sun_r + 1.5 * px, hair, cyan, 0.10);
 
     // Spaced caption: ' ' is an empty cell, '·' a dot.
     let adv = CAPTION_ADV * s;
@@ -253,8 +275,8 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
         let gx = left + i as f32 * adv;
         match ch {
             ' ' => {}
-            '·' => pb.dot(gx, ty, 1.0 * px, MUTED, 0.6),
-            _ => pb.glyph(ch, gx, ty, scale, MUTED, 0.75),
+            '·' => pb.dot(gx, ty, 1.0 * px, muted, 0.6),
+            _ => pb.glyph(ch, gx, ty, scale, muted, 0.75),
         }
     }
 
@@ -268,8 +290,8 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
         let gx = left + i as f32 * adv;
         match ch {
             ' ' => {}
-            '·' => pb.dot(gx, ty, 1.0 * px, GOLD, 0.5),
-            _ => pb.glyph(ch, gx, ty, scale, MUTED, 0.5),
+            '·' => pb.dot(gx, ty, 1.0 * px, gold, 0.5),
+            _ => pb.glyph(ch, gx, ty, scale, muted, 0.5),
         }
     }
 }
@@ -384,6 +406,8 @@ mod tests {
     #[test]
     fn the_look_picks_the_face_and_tecno_is_the_default() {
         assert_eq!(style_from(None, None), Style::Tecno);
+        assert_eq!(style_from(None, Some("look=abyss\n")), Style::Abyss);
+        assert_eq!(style_from(Some("ABYSS"), Some("look=tecno")), Style::Abyss);
         assert_eq!(style_from(None, Some("look=eclipse\n")), Style::Cosmic);
         assert_eq!(style_from(None, Some("# x\nlook = tecno\n")), Style::Tecno);
         assert_eq!(style_from(Some("KDE"), Some("look=tecno")), Style::Cosmic);

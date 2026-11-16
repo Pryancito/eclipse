@@ -54,6 +54,7 @@ use std::os::fd::AsRawFd;
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::files::{self, Entry};
 use lunarbar::fill_guard;
+use lunarbar::glass;
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_INSERT_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
@@ -165,12 +166,30 @@ const PAL_WIN11: Palette = Palette {
     border: (0x3d, 0x3d, 0x3d),
 };
 
+/// `abyss`: the Abyss session's warm-black glass (see `lunarbar::glass`).
+/// Folders and the browse title in near-white; gold is the selected row's
+/// label alone.
+const PAL_ABYSS: Palette = Palette {
+    scrim: (0x00, 0x00, 0x00),
+    scrim_a: 0.30,
+    panel: glass::GROUND,
+    field: glass::WELL,
+    text: glass::TEXT,
+    dim: glass::MUTED,
+    accent: (0xe8, 0xe6, 0xe3),
+    sel: glass::SELECT,
+    sel_text: glass::GOLD_TEXT,
+    on_accent: glass::GROUND,
+    border: glass::HAIRLINE,
+};
+
 fn palette(look: Look) -> &'static Palette {
     match look {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Tecno => &PAL_TECNO,
+        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -1311,12 +1330,16 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let p = st.pal;
     // Tecno is mockup A: square plates, caps labels, gold folders.
     let hud = st.look == Look::Tecno;
-    let rad = |r: i32| if hud { 0 } else { r };
+    let abyss = st.look == Look::Abyss;
+    let rad = |r: i32| if hud { 0 } else if abyss { r + r / 2 + 2 } else { r };
     cv.fill_rect_a(0, 0, w as i32, h as i32, p.scrim, p.scrim_a);
 
     let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows.len());
-    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, rad(9), p.border, 0.9);
-    let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
+    // `abyss` draws the panel opaque; `glass::frost` makes its ground the
+    // window tint after the draw.
+    let (rim, rim_a) = if abyss { (glass::RIM, 1.0) } else { (p.border, 0.9) };
+    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, rad(9), rim, rim_a);
+    let panel_a = if st.look == Look::Win11 { 0.92 } else if abyss { 1.0 } else { 0.97 };
     cv.round_rect_a(px, py, pw, ph, rad(8), p.panel, panel_a);
 
     let inner = pw - PAD * 2;
@@ -1385,7 +1408,10 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
                 break;
             }
             let here = pl.path == st.dir;
-            if here {
+            if here && abyss {
+                cv.round_rect(rx, y, rw, PLACE_H - 2, glass::R_CELL, glass::RIM);
+                cv.round_rect(rx + 1, y + 1, rw - 2, PLACE_H - 4, glass::R_CELL - 1, p.sel);
+            } else if here {
                 cv.round_rect_a(rx, y, rw, PLACE_H - 2, rad(5), p.sel, 0.95);
                 if hud {
                     cv.fill_rect_a(rx, y, 2, PLACE_H - 2, p.accent, 1.0);
@@ -1492,6 +1518,11 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
             // A's selected row: the plate, framed in a cyan hairline.
             cv.fill_rect_a(lx, y, lw, ROW_H - 2, p.accent, 0.9);
             cv.fill_rect_a(lx + 1, y + 1, lw - 2, ROW_H - 4, p.sel, 1.0);
+        } else if selected && abyss {
+            // The guide's selected cell: a step clearer under a crisp rim,
+            // gold on the label only.
+            cv.round_rect(lx, y, lw, ROW_H - 2, glass::R_CELL, glass::RIM);
+            cv.round_rect(lx + 1, y + 1, lw - 2, ROW_H - 4, glass::R_CELL - 1, p.sel);
         } else if selected {
             cv.round_rect_a(lx, y, lw, ROW_H - 2, 5, p.sel, 0.95);
         } else if hovered {
@@ -1643,6 +1674,9 @@ fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     // The action menu, over everything, under the selected row.
     let sel_y = row0_y + (st.sel.saturating_sub(st.top)) as i32 * ROW_H + ROW_H - 2;
     let menu = actions::draw_menu(cv, st, lx, lw, sel_y, foot_y);
+    if abyss {
+        glass::frost(cv);
+    }
 
     Frame {
         panel: (px, py, pw, ph),
@@ -2184,6 +2218,7 @@ fn new_state(cli: &Cli) -> State {
     // when the user switches, and two calls could leave the palette from one
     // look beside the geometry of the other.
     let look = Look::current();
+    glass::enter(look);
     let mode = cli.mode();
     let mut st = State {
         compositor: None,

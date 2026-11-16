@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use lunarbar::clip::{self, History, Req, ReqParse};
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::glass;
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     key_char, BTN_LEFT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL,
@@ -1438,12 +1439,26 @@ const PAL_WIN11: Palette = Palette {
     border: (0x18, 0x18, 0x18),
 };
 
+/// `abyss`: the Abyss session's warm-black glass (see `lunarbar::glass`).
+const PAL_ABYSS: Palette = Palette {
+    scrim: (0x00, 0x00, 0x00),
+    scrim_a: 0.30,
+    panel: glass::GROUND,
+    field: glass::WELL,
+    text: glass::TEXT,
+    dim: glass::MUTED,
+    accent: glass::GOLD,
+    sel: glass::SELECT,
+    border: glass::RIM,
+};
+
 fn palette(look: Look) -> &'static Palette {
     match look {
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Win11 => &PAL_WIN11,
         Look::Tecno => &PAL_TECNO,
+        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -1544,6 +1559,7 @@ struct Picker {
 impl Picker {
     fn new(items: Vec<String>, live: bool) -> Self {
         let look = Look::current();
+        glass::enter(look);
         let lang = Lang::current();
         let mut p = Self {
             compositor: None,
@@ -1735,6 +1751,9 @@ impl Picker {
             return;
         };
         let (panel, row0, fits) = draw_picker(&mut cv, w, h, self);
+        if self.look == Look::Abyss {
+            glass::frost(&mut cv);
+        }
         self.panel = panel;
         self.row0_y = row0;
         self.rows_shown = fits;
@@ -1934,9 +1953,12 @@ fn draw_picker(
 
     let pane = pane_height(st, h as i32);
     let (px, py, pw, ph) = panel_rect(w as i32, h as i32, st.rows.len(), pane);
-    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, 9, p.border, 0.9);
-    let panel_a = if st.look == Look::Win11 { 0.92 } else { 0.97 };
-    cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
+    // `abyss` draws it opaque and frosts the ground after the draw.
+    let abyss = st.look == Look::Abyss;
+    let (r, rim_a) = if abyss { (glass::R_WINDOW, 1.0) } else { (8, 0.9) };
+    cv.round_rect_a(px - 1, py - 1, pw + 2, ph + 2, r + 1, p.border, rim_a);
+    let panel_a = if st.look == Look::Win11 { 0.92 } else if abyss { 1.0 } else { 0.97 };
+    cv.round_rect_a(px, py, pw, ph, r, p.panel, panel_a);
 
     // Header: what this is, and how many entries there are.
     let hx = px + PAD + 4;
@@ -1985,7 +2007,10 @@ fn draw_picker(
     for (n, (_, preview)) in st.rows.iter().skip(st.top).take(fits).enumerate() {
         let ry = row0 + (n as i32) * ROW_H;
         let absolute = st.top + n;
-        if absolute == st.sel {
+        if absolute == st.sel && abyss {
+            cv.round_rect(px + PAD, ry, pw - 2 * PAD, ROW_H - 2, glass::R_CELL, p.border);
+            cv.round_rect(px + PAD + 1, ry + 1, pw - 2 * PAD - 2, ROW_H - 4, glass::R_CELL - 1, p.sel);
+        } else if absolute == st.sel {
             cv.round_rect(px + PAD, ry, pw - 2 * PAD, ROW_H - 2, 5, p.sel);
             cv.active_line(px + PAD + 2, ry + 4, ROW_H - 10, p.accent);
         } else if st.hover == Some(absolute) {
@@ -2468,6 +2493,9 @@ fn dump(spec: &str) -> ! {
         std::process::exit(1);
     };
     let (_, _, rows) = draw_picker(&mut cv, w, h, &st);
+    if st.look == Look::Abyss {
+        glass::frost(&mut cv);
+    }
     let mut buf = vec![0u8; w * h * 4];
     if !cv.blit_argb(&mut buf) {
         eprintln!("lunarclip: fallo el blit");

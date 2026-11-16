@@ -9,6 +9,9 @@ pub enum Look {
     Eclipse,
     /// Mockup A, "Orbital HUD": the image's default look.
     Tecno,
+    /// The Abyss session's look: warm black, white ink, gold for what is
+    /// selected (see lunarbar's `glass` module for where the values come from).
+    Abyss,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +38,7 @@ impl Look {
             "kde" | "breeze" => Some(Look::Kde),
             "eclipse" => Some(Look::Eclipse),
             "tecno" | "gnome" => Some(Look::Tecno),
+            "abyss" => Some(Look::Abyss),
             _ => None,
         }
     }
@@ -52,7 +56,13 @@ impl Look {
     pub fn current() -> Self {
         let env = std::env::var("ECLIPSE_LOOK").ok();
         let file = std::fs::read_to_string("/etc/eclipse/look").ok();
-        Self::resolve(env.as_deref(), file.as_deref())
+        let look = Self::resolve(env.as_deref(), file.as_deref());
+        // The Abyss look's data face; read once per process, so only the
+        // first call before any text decides it.
+        if look == Look::Abyss {
+            lunartext::use_family(lunartext::Family::JetBrains);
+        }
+        look
     }
 
     /// Path `eclipse-look` writes; used to detect mid-session changes.
@@ -85,6 +95,17 @@ impl Look {
                 dim: rgb(0x8a, 0xa4, 0xc2),
                 accent: rgb(0x38, 0xe1, 0xff),
                 border: rgb(0x1d, 0x35, 0x50),
+            },
+            // Abyss: the window base `#0b0906`, a well a shade under it,
+            // white ink at .64 for secondary text, the gold accent, a white
+            // hairline at .12.
+            Look::Abyss => Palette {
+                panel: rgb(0x0b, 0x09, 0x06),
+                field: rgb(0x14, 0x12, 0x0f),
+                text: rgb(0xff, 0xff, 0xff),
+                dim: rgb(0xa7, 0xa6, 0xa5),
+                accent: rgb(0xf2, 0xc3, 0x3c),
+                border: rgb(0x28, 0x27, 0x24),
             },
             Look::Win11 => Palette {
                 panel: rgb(0x2b, 0x2b, 0x2b),
@@ -127,6 +148,7 @@ mod tests {
         assert_eq!(Look::from_name(" win11 "), Some(Look::Win11));
         assert_eq!(Look::from_name("breeze"), Some(Look::Kde));
         assert_eq!(Look::from_name("nope"), None);
+        assert_eq!(Look::from_name("Abyss"), Some(Look::Abyss));
     }
 
     #[test]

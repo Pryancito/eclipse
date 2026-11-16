@@ -1972,6 +1972,7 @@ impl LinuxRootfs {
             Ok(()) => println!("desktop session: {session} ({})", path.display()),
             Err(e) => eprintln!("warning: could not write {path:?}: {e}"),
         }
+        abyss::default_look(rootfs, session);
     }
 
     /// 编译 busybox。

@@ -66,6 +66,37 @@ struct Faces {
     bold: Face<'static>,
 }
 
+/// Which monospace family the outlines come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    /// DejaVu Sans Mono: every look but `abyss`.
+    DejaVu,
+    /// JetBrains Mono, the data face of the `abyss` look (Ubuntu's
+    /// `fonts-jetbrains-mono`, OFL-1.1). Falls back to DejaVu when it is not
+    /// on disk, so a missing package costs the face, not the text.
+    JetBrains,
+}
+
+/// Where Ubuntu's `fonts-jetbrains-mono` puts its static cuts.
+const JETBRAINS_DIRS: &[&str] = &[
+    "/usr/share/fonts/truetype/jetbrains-mono",
+    "/usr/share/fonts/jetbrains-mono",
+    "/usr/share/fonts/TTF",
+];
+
+static FAMILY: OnceLock<Family> = OnceLock::new();
+
+/// Pick the family before the first glyph is drawn. The faces are read once
+/// per process, so a call after the first [`glyph`] (or a second call) changes
+/// nothing and returns false.
+pub fn use_family(family: Family) -> bool {
+    FAMILY.set(family).is_ok() && FACES.get().is_none()
+}
+
+fn family() -> Family {
+    *FAMILY.get().unwrap_or(&Family::DejaVu)
+}
+
 fn load_face(dir: &str, file: &str) -> Option<Face<'static>> {
     let bytes = std::fs::read(format!("{dir}/{file}")).ok()?;
     // Read once per process and kept for its whole life: the face borrows the
@@ -82,6 +113,19 @@ fn load() -> Option<Faces> {
         Ok(d) if !d.is_empty() => vec![d],
         _ => FONT_DIRS.iter().map(|d| d.to_string()).collect(),
     };
+    if family() == Family::JetBrains {
+        let jb: Vec<String> = match std::env::var("LUNAR_FONT_DIR") {
+            Ok(d) if !d.is_empty() => vec![d],
+            _ => JETBRAINS_DIRS.iter().map(|d| d.to_string()).collect(),
+        };
+        for dir in &jb {
+            if let Some(regular) = load_face(dir, "JetBrainsMono-Regular.ttf") {
+                let bold =
+                    load_face(dir, "JetBrainsMono-Bold.ttf").unwrap_or_else(|| regular.clone());
+                return Some(Faces { regular, bold });
+            }
+        }
+    }
     for dir in &dirs {
         if let Some(regular) = load_face(dir, "DejaVuSansMono.ttf") {
             // No bold cut on disk is a regular-only face, not no face.
@@ -93,8 +137,9 @@ fn load() -> Option<Faces> {
     None
 }
 
+static FACES: OnceLock<Option<Faces>> = OnceLock::new();
+
 fn faces() -> Option<&'static Faces> {
-    static FACES: OnceLock<Option<Faces>> = OnceLock::new();
     FACES.get_or_init(load).as_ref()
 }
 

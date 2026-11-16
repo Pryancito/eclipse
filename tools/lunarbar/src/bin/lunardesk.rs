@@ -16,8 +16,9 @@
 
 use std::os::fd::{AsFd, AsRawFd};
 
-use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
+use lunarbar::draw::{Canvas, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::glass::{self, ink};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::icons::IconCache;
 use lunarbar::keys::{KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL, KEY_TAB_WL};
@@ -45,14 +46,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 // ── look ─────────────────────────────────────────────────────────────────────
 
-const GROUND: Rgb = (0x04, 0x07, 0x0d);
-const SURFACE: Rgb = (0x0a, 0x14, 0x23);
-const HAIRLINE: Rgb = (0x1d, 0x35, 0x50);
-const TEXT: Rgb = (0xe6, 0xf1, 0xff);
-const MUTED: Rgb = (0x8a, 0xa4, 0xc2);
-const CYAN: Rgb = (0x38, 0xe1, 0xff);
-const GOLD: Rgb = (0xf2, 0xc1, 0x4e);
-const SEL: Rgb = (0x0c, 0x2a, 0x3a);
 
 const MARGIN: i32 = 48;
 const PLATE_GAP: i32 = 24;
@@ -189,68 +182,68 @@ fn hit_test(s: &Scene, w: i32, h: i32, x: i32, y: i32) -> Option<Hit> {
 
 fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene, icons: &mut IconCache) {
     // Translucent: the desktop shows through, dimmed, behind the plates.
-    cv.fill_rect_a(0, 0, w, h, GROUND, 0.9);
+    cv.fill_rect_a(0, 0, w, h, ink().ground, ink().veil);
     let (title, keys, empty, more) = (
         s.lang.s(Key::desk_desktops),
         s.lang.s(Key::desk_keys),
         s.lang.s(Key::desk_empty),
         s.lang.s(Key::file_more),
     );
-    let adv = cv.text_bold(title, MARGIN, MARGIN, CYAN);
-    cv.text(keys, MARGIN + adv + 16, MARGIN, MUTED);
-    cv.hline(MARGIN, MARGIN + GLYPH_H + 12, w - 2 * MARGIN, HAIRLINE, 1.0);
+    let adv = cv.text_bold(title, MARGIN, MARGIN, ink().cyan);
+    cv.text(keys, MARGIN + adv + 16, MARGIN, ink().muted);
+    cv.hline(MARGIN, MARGIN + GLYPH_H + 12, w - 2 * MARGIN, ink().hairline, 1.0);
 
     let ps = plates(w, h, s.n, max_rows(s));
     let rows = layout_rows(s, &ps);
     let cols = |pw: i32| ((pw - 2 * PAD - ICON - 8) / GLYPH_W).max(4) as usize;
     for (d, &(px, py, pw, ph)) in ps.iter().enumerate() {
-        cv.fill_rect_a(px, py, pw, ph, SURFACE, 1.0);
+        glass::panel(cv, px, py, pw, ph, ink().surface);
         let edge = if d == s.sel || s.hover.is_some_and(|hv| matches!(hv, Hit::Desk(x) | Hit::Win(x, _) if x == d)) {
-            CYAN
+            ink().cyan
         } else {
-            HAIRLINE
+            ink().hairline
         };
         for (x, y, rw, rh) in [(px, py, pw, 1), (px, py + ph - 1, pw, 1), (px, py, 1, ph), (px + pw - 1, py, 1, ph)] {
             cv.fill_rect_a(x, y, rw, rh, edge, 1.0);
         }
         if d == s.current {
-            cv.brackets(px, py, pw, ph, 16, 2, GOLD);
+            glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
         }
         // Head: the number, how many windows, and "actual".
         let num = format!("{:02}", d + 1);
-        cv.text_big(&num, px + PAD, py + 12, if d == s.current { TEXT } else { MUTED });
+        cv.text_big(&num, px + PAD, py + 12, if d == s.current { ink().text } else { ink().muted });
         let count = s.desk_of.iter().filter(|&&x| x == d).count();
         let tag = match (d == s.current, s.lang) {
             (true, Lang::Es) => format!("actual · {count}"),
             (true, Lang::En) => format!("current · {count}"),
             (false, _) => format!("{count}"),
         };
-        cv.text(&tag, px + pw - PAD - Canvas::text_width(&tag), py + 16, if d == s.current { GOLD } else { MUTED });
-        cv.hline(px + PAD, py + HEAD_H - 8, pw - 2 * PAD, HAIRLINE, 1.0);
+        cv.text(&tag, px + pw - PAD - Canvas::text_width(&tag), py + 16, if d == s.current { ink().gold } else { ink().muted });
+        cv.hline(px + PAD, py + HEAD_H - 8, pw - 2 * PAD, ink().hairline, 1.0);
 
         if rows[d].is_empty() {
-            cv.text(empty, px + PAD, py + HEAD_H + (ROW_H - GLYPH_H) / 2, MUTED);
+            cv.text(empty, px + PAD, py + HEAD_H + (ROW_H - GLYPH_H) / 2, ink().muted);
         }
         for &(i, ry) in &rows[d] {
             let win = &s.wins[i];
             if s.hover == Some(Hit::Win(d, i)) {
-                cv.fill_rect_a(px + 4, ry, pw - 8, ROW_H, SEL, 1.0);
+                cv.fill_rect_a(px + 4, ry, pw - 8, ROW_H, ink().sel, 1.0);
             }
             let iy = ry + (ROW_H - ICON) / 2;
             match icons.get(&win.app_id, ICON as u32) {
                 Some(pm) => cv.pixmap(px + PAD, iy, &pm),
-                None => cv.fill_rect_a(px + PAD + 4, iy + 4, ICON - 8, ICON - 8, MUTED, 1.0),
+                None => cv.fill_rect_a(px + PAD + 4, iy + 4, ICON - 8, ICON - 8, ink().muted, 1.0),
             }
             let label = if win.title.trim().is_empty() { &win.app_id } else { &win.title };
-            let c = if win.minimized { MUTED } else { TEXT };
+            let c = if win.minimized { ink().muted } else { ink().text };
             cv.text(&fit(label, cols(pw)), px + PAD + ICON + 8, ry + (ROW_H - GLYPH_H) / 2, c);
             if win.activated {
-                cv.fill_rect_a(px + 1, ry + 6, 2, ROW_H - 12, CYAN, 1.0);
+                cv.fill_rect_a(px + 1, ry + 6, 2, ROW_H - 12, ink().cyan, 1.0);
             }
         }
         if count > MAX_ROWS {
             let t = format!("+{} {more}", count - MAX_ROWS);
-            cv.text(&t, px + PAD, py + HEAD_H + MAX_ROWS as i32 * ROW_H + 4, MUTED);
+            cv.text(&t, px + PAD, py + HEAD_H + MAX_ROWS as i32 * ROW_H + 4, ink().muted);
         }
     }
 }
@@ -333,6 +326,7 @@ impl State {
         self.icons = icons;
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
+        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -616,10 +610,11 @@ fn dump(spec: &str) -> ! {
     let hover = std::env::var("LUNARDESK_HOVER").ok().and_then(|v| v.parse().ok()).map(|i: usize| Hit::Win(desk_of[i], i));
     let scene = Scene { wins: &wins, desk_of: &desk_of, n: 4, current: 0, sel: 0, hover, lang: Lang::current() };
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(true);
+    cv.set_square(!glass::on());
     let mut icons = IconCache::default();
     draw(&mut cv, w as i32, h as i32, &scene, &mut icons);
     let mut buf = vec![0u8; w * h * 4];
+    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunardesk: could not write {path}");
         std::process::exit(1);
