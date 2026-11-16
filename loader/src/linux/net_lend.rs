@@ -71,6 +71,10 @@ pub(super) const LENT_FRAMES: usize = super::ECLIPSE_LENT_FRAMES;
 /// flags the longest sleep starts, in microseconds.
 pub(super) const LENT_LIMIT_SHIFT: usize = super::ECLIPSE_LENT_LIMIT_SHIFT;
 
+/// The messages a turn's answer has room for before it grows: more than
+/// a turn brings unless the card is in the middle of a burst.
+const BURST_ROOM: usize = 32;
+
 /// The most receive slots a window is taken with, as the stack's port has
 /// it.
 const MAX_RX_SLOTS: usize = 1024;
@@ -590,6 +594,8 @@ impl Turn {
             0 => None,
             limit => Some(kernel_hal::timer::timer_now() + Duration::from_micros(limit)),
         };
+        // Room for a burst at once: grown a message at a time it was two
+        // allocations more for a turn that brought two frames.
         let mut out: Vec<u8> = Vec::new();
         loop {
             // Only a turn that takes frames looks: one that does not would
@@ -607,7 +613,11 @@ impl Turn {
                     .ok();
             }
             while out.len() < self.room * NET_MSG {
-                match self.card.next(frames) {
+                let next = self.card.next(frames);
+                if next.is_some() && out.capacity() == 0 {
+                    out.reserve_exact(self.room.min(BURST_ROOM) * NET_MSG);
+                }
+                match next {
                     Some(Answer::Sent(slot)) => out.extend_from_slice(&encode(OP_TX, slot, 0, 0)),
                     Some(Answer::Frame(slot, frame)) => {
                         let at = slot as usize * SLOT;

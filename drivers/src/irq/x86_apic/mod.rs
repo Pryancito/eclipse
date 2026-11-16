@@ -11,6 +11,7 @@ use crate::sync::Mutex;
 use crate::utils::{run_irq_handler, IrqManager};
 use crate::{DeviceError, DeviceResult, PhysAddr, VirtAddr};
 use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const IOAPIC_IRQ_RANGE: Range<usize> = X86_INT_BASE..X86_INT_LOCAL_APIC_BASE;
 const LAPIC_IRQ_RANGE: Range<usize> = 0..16;
@@ -22,6 +23,44 @@ pub struct Apic {
     ioapic_list: IoApicList,
     manager_ioapic: Mutex<IrqManager<256>>,
     manager_lapic: Mutex<IrqManager<16>>,
+    /// The lines `configure` was told are level triggered, by number.
+    level_lines: Bits,
+    /// The vectors whose end of interrupt is written after the handler; see
+    /// [`Bits`].
+    late_eoi: Bits,
+}
+
+/// One bit for each of 256 lines or vectors, read on every interrupt with no
+/// lock.
+///
+/// It exists for the level triggered lines of an I/O APIC (a classic PCI
+/// line). Such a line is announced again the moment the end of interrupt is
+/// written while the card still holds it down, and the card holds it until
+/// its handler has answered. Written before the handler, as an edge or an MSI
+/// wants, every interrupt of such a card arrived twice, the second with
+/// nothing to say: about two wasted interrupts for each echo of a small
+/// packet. For these vectors the end of interrupt goes after the handler.
+#[derive(Default)]
+struct Bits([AtomicU64; 4]);
+
+impl Bits {
+    fn set(&self, n: usize, on: bool) {
+        let Some(word) = self.0.get(n / 64) else {
+            return;
+        };
+        let bit = 1u64 << (n % 64);
+        if on {
+            word.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            word.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    fn get(&self, n: usize) -> bool {
+        self.0
+            .get(n / 64)
+            .is_some_and(|w| w.load(Ordering::Relaxed) & (1u64 << (n % 64)) != 0)
+    }
 }
 
 impl Apic {
@@ -37,6 +76,8 @@ impl Apic {
             ioapic_list: IoApicList::new(acpi_rsdp, phys_to_virt),
             manager_ioapic: Mutex::new(IrqManager::new(IOAPIC_IRQ_RANGE)),
             manager_lapic: Mutex::new(IrqManager::new(LAPIC_IRQ_RANGE)),
+            level_lines: Bits::default(),
+            late_eoi: Bits::default(),
         }
     }
 
@@ -138,7 +179,10 @@ impl Scheme for Apic {
 
     fn handle_irq(&self, vector: usize) {
         // Intel: the spurious-interrupt vector must NOT write EOI.
-        if vector != self::consts::X86_INT_APIC_SPURIOUS && LocalApic::is_initialized() {
+        // A level triggered line gets its end of interrupt after the handler
+        // (see `Bits`); everything else gets it here.
+        let late = self.late_eoi.get(vector);
+        if !late && vector != self::consts::X86_INT_APIC_SPURIOUS && LocalApic::is_initialized() {
             Self::local_apic().eoi();
         }
         // CRITICAL: look the handler up under the manager lock, then RELEASE the
@@ -170,6 +214,9 @@ impl Scheme for Apic {
         // The PLIC had only the second and the GIC-400 had neither.
         if let Err(DeviceError::InvalidParam) = run_irq_handler(vector, handler) {
             warn!("no registered handler for interrupt vector {}!", vector);
+        }
+        if late && LocalApic::is_initialized() {
+            Self::local_apic().eoi();
         }
     }
 }
@@ -216,7 +263,14 @@ impl IrqScheme for Apic {
     fn configure(&self, gsi: usize, tm: IrqTriggerMode, pol: IrqPolarity) -> DeviceResult {
         let gsi = gsi as u32;
         self.with_ioapic(gsi, |apic| {
+            let level = matches!(tm, IrqTriggerMode::Level);
             apic.configure(gsi, tm, pol, LocalApic::bsp_id());
+            self.level_lines.set(gsi as usize, level);
+            // A line configured after its handler was registered.
+            let vector = apic.get_vector(gsi) as usize;
+            if self.manager_ioapic.lock().get(vector).is_some() {
+                self.late_eoi.set(vector, level);
+            }
             Ok(())
         })
     }
@@ -231,6 +285,8 @@ impl IrqScheme for Apic {
                     .manager_ioapic
                     .lock()
                     .register_handler(vector, handler)? as u8;
+                self.late_eoi
+                    .set(vector as usize, self.level_lines.get(gsi));
                 apic.map_vector(gsi32, vector);
                 Ok(())
             })
@@ -272,6 +328,7 @@ impl IrqScheme for Apic {
         self.with_ioapic(gsi, |apic| {
             let vector = apic.get_vector(gsi) as _;
             self.manager_ioapic.lock().unregister_handler(vector)?;
+            self.late_eoi.set(vector, false);
             apic.map_vector(gsi, 0);
             Ok(())
         })
@@ -775,5 +832,20 @@ mod tests {
         Apic::send_sipi(0x8, 1);
         Apic::send_nmi_all_others();
         a.handle_irq(FIRST);
+    }
+
+    #[test]
+    fn a_bit_is_kept_for_each_of_256_numbers_and_none_beyond() {
+        let bits = Bits::default();
+        for n in [0, 63, 64, 255] {
+            assert!(!bits.get(n));
+            bits.set(n, true);
+            assert!(bits.get(n));
+        }
+        assert!(!bits.get(1) && !bits.get(65) && !bits.get(254));
+        bits.set(64, false);
+        assert!(!bits.get(64) && bits.get(63) && bits.get(255));
+        bits.set(256, true);
+        assert!(!bits.get(256));
     }
 }
