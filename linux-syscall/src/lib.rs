@@ -203,13 +203,25 @@ pub(crate) struct RecvBuf {
 impl RecvBuf {
     /// A zeroed buffer of `len` bytes. `ENOMEM` when the heap cannot hold it.
     pub(crate) fn new(len: usize) -> linux_object::error::LxResult<Self> {
+        // A spare is exactly `SYSCALL_IO_MAX` long, so it answers only a
+        // receive that fits in one. Taking it for a LARGER receive is what
+        // panicked the kernel from a program's own `recvmsg`: an AF_UNIX
+        // datagram socket's ceiling is `message_io_cap`, well above
+        // `SYSCALL_IO_MAX`, and `bytes()` then sliced `heap[..len]` with
+        // `len` past the end of a 64 KiB block --- "range end index 212464
+        // out of range for slice of length 65536", with the machine down.
         let heap = if len <= RECV_STACK {
             alloc::vec::Vec::new()
-        } else if let Some(spare) = RECV_SPARE.lock().iter_mut().find_map(Option::take) {
-            spare
         } else {
-            try_zeroed_buf(len)?
+            match (len <= SYSCALL_IO_MAX)
+                .then(|| RECV_SPARE.lock().iter_mut().find_map(Option::take))
+                .flatten()
+            {
+                Some(spare) => spare,
+                None => try_zeroed_buf(len)?,
+            }
         };
+        debug_assert!(heap.len() >= len || len <= RECV_STACK);
         Ok(RecvBuf {
             stack: [0u8; RECV_STACK],
             heap,
@@ -308,6 +320,28 @@ mod recv_buf_tests {
         assert_eq!(last.heap.as_ptr(), at);
         assert!(last.heap.iter().all(|&x| x == 0));
         drop(last);
+        empty_the_pool();
+    }
+
+    /// A receive LARGER than a spare does not take one: a spare is a 64 KiB
+    /// block, and `recvmsg` on an AF_UNIX datagram socket may ask for more
+    /// (`message_io_cap`). Taking one then sliced it past its end and
+    /// panicked the kernel with user-supplied iovec lengths.
+    #[test]
+    fn a_receive_larger_than_a_spare_gets_a_buffer_of_its_own() {
+        let _one = ONE.lock();
+        empty_the_pool();
+        // Leave a spare in the pool, as a 64 KiB receive does.
+        drop(RecvBuf::new(SYSCALL_IO_MAX).unwrap());
+        assert!(RECV_SPARE.lock().iter().any(|s| s.is_some()));
+        let want = 212_464;
+        let mut big = RecvBuf::new(want).unwrap();
+        assert_eq!(big.heap.len(), want);
+        assert_eq!(big.buf().len(), want, "the whole buffer, with no panic");
+        assert!(big.buf().iter().all(|&x| x == 0));
+        // And the spare is still there for a receive that does fit.
+        assert!(RECV_SPARE.lock().iter().any(|s| s.is_some()));
+        drop(big);
         empty_the_pool();
     }
 

@@ -192,6 +192,78 @@ pub fn push_packet(packet: &[u8]) {
     purge_dead_sockets(&mut sockets);
 }
 
+/// How many times a frame is offered to the card before `sendto` gives up.
+///
+/// Only a card that says "no room right now" is worth asking again: the ring
+/// drains on its own and the frame goes out on the next try. Every other
+/// refusal is the same refusal however many times it is made.
+const TX_TRIES: usize = 16;
+
+/// What a card's refusal of a frame means to `sendto(2)`.
+///
+/// Every refusal used to come back as `EAGAIN`. A frame the card will NEVER
+/// take then looked to the program exactly like a momentarily full ring, so
+/// `udhcpc6` --- which sends its SOLICIT through `AF_PACKET`/`SOCK_DGRAM`,
+/// building the IPv6 and UDP headers itself --- printed "sendto: Resource
+/// temporarily unavailable" and tried again for ever, with nothing anywhere
+/// saying what the card had actually answered. `packet_sendmsg` tells the
+/// cases apart (`EMSGSIZE` for a frame over the device's ceiling, `ENETDOWN`
+/// for an interface that is not carrying, `EOPNOTSUPP` for a device with no
+/// transmit path), and so does this.
+fn tx_error(dev: &(dyn NetScheme + Send + Sync), e: zcore_drivers::DeviceError) -> LxError {
+    use zcore_drivers::DeviceError::*;
+    match e {
+        // A frame the card cannot hold: asking again changes nothing.
+        InvalidParam | BufferTooSmall => LxError::EMSGSIZE,
+        // A device that does not transmit at all (a card the stack process
+        // shows for an interface it drives itself).
+        NotSupported => LxError::EOPNOTSUPP,
+        // No room on the ring, with the link up: the one answer that means
+        // "try again", and the one `EAGAIN` is for.
+        NotReady if dev.link_carrier_up() => LxError::EAGAIN,
+        // The card is not carrying: `packet_sendmsg` answers `ENETDOWN` for
+        // an interface a frame cannot leave by, instead of telling the
+        // program to try again on a link that is not there.
+        NotReady => LxError::ENETDOWN,
+        _ => LxError::EIO,
+    }
+}
+
+/// Hand one whole Ethernet frame to the card, as `dev_queue_xmit` does.
+///
+/// Says in the log what was refused and why when the frame does not go out:
+/// a driver's `klog_warn!` never reaches the serial line, so a card refusing
+/// every frame was until now visible only as an errno in the program.
+fn put_on_the_wire(dev: &(dyn NetScheme + Send + Sync), frame: &[u8]) -> LxResult<()> {
+    let mut refused = zcore_drivers::DeviceError::NotReady;
+    for _ in 0..TX_TRIES {
+        match dev.send(frame) {
+            Ok(_) => {
+                kernel_hal::deferred_job::drain_deferred_jobs();
+                return Ok(());
+            }
+            Err(e) => {
+                refused = e;
+                kernel_hal::deferred_job::drain_deferred_jobs();
+                // Only a full ring is worth offering the same frame again.
+                if !matches!(e, zcore_drivers::DeviceError::NotReady) {
+                    break;
+                }
+            }
+        }
+    }
+    let err = tx_error(dev, refused);
+    warn!(
+        "AF_PACKET: {} refused a {}-byte frame ({:?}); carrier={} -> {:?}",
+        dev.get_ifname(),
+        frame.len(),
+        refused,
+        dev.link_carrier_up(),
+        err
+    );
+    Err(err)
+}
+
 pub struct PacketSocketState {
     base: KObjectBase,
     inner: Arc<PacketSocketInner>,
@@ -291,8 +363,15 @@ impl Socket for PacketSocketState {
                 }
                 let payload = if self.inner.socket_type == SocketType::SOCK_DGRAM {
                     ipv4_datagram_from_eth_frame(&internal_buf[..n]).unwrap_or_else(|| {
-                        if n > 14 {
-                            &internal_buf[14..n]
+                        // Everything that is not IPv4 (IPv6, ARP...) is handed
+                        // over from the end of its own L2 header, which on a
+                        // VLAN-tagged link is 18 bytes and not 14: the fixed
+                        // 14 left four bytes of the tag at the head of every
+                        // datagram. `eth_l2_header_len` is the one answer the
+                        // whole file uses for this.
+                        let l2 = eth_l2_header_len(&internal_buf[..n]).map_or(14, |(at, _)| at);
+                        if n > l2 {
+                            &internal_buf[l2..n]
                         } else {
                             &internal_buf[..0]
                         }
@@ -373,14 +452,7 @@ impl Socket for PacketSocketState {
                 };
                 frame.set_ethertype(protocol.into());
                 frame.payload_mut()[..data.len()].copy_from_slice(data);
-                for _ in 0..16 {
-                    if dev.send(&buf[..frame_len]).is_ok() {
-                        kernel_hal::deferred_job::drain_deferred_jobs();
-                        return Ok(data.len());
-                    }
-                    kernel_hal::deferred_job::drain_deferred_jobs();
-                }
-                return Err(LxError::EAGAIN);
+                return put_on_the_wire(dev.as_ref(), &buf[..frame_len]).map(|()| data.len());
             }
             // If no endpoint, we can't send SOCK_DGRAM (no destination MAC).
             return Err(LxError::EINVAL);
@@ -395,18 +467,7 @@ impl Socket for PacketSocketState {
         } else {
             data
         };
-        for _ in 0..16 {
-            match dev.send(send_buf) {
-                Ok(_) => {
-                    kernel_hal::deferred_job::drain_deferred_jobs();
-                    return Ok(data.len());
-                }
-                Err(_) => {
-                    kernel_hal::deferred_job::drain_deferred_jobs();
-                }
-            }
-        }
-        Err(LxError::EAGAIN)
+        put_on_the_wire(dev.as_ref(), send_buf).map(|()| data.len())
     }
 
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
@@ -640,6 +701,129 @@ mod tests {
         frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
         assert_eq!(eth_l2_header_len(&frame), Some((18, 0x0800)));
         assert_eq!(eth_l2_header_len(&frame[..14]), None);
+    }
+
+    /// A `SOCK_DGRAM` read hands over the datagram, not the tail of the L2
+    /// header: on a VLAN-tagged link the datagram starts at 18, not at 14.
+    #[async_std::test]
+    async fn a_vlan_tagged_datagram_starts_after_the_whole_l2_header() {
+        let s = PacketSocketState::new(SocketType::SOCK_DGRAM, 0x86DD).unwrap();
+        FileLike::set_flags(&*s, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        let mut f = alloc::vec![0u8; 18 + 8];
+        f[12..14].copy_from_slice(&0x8100u16.to_be_bytes()); // 802.1Q
+        f[16..18].copy_from_slice(&0x86DDu16.to_be_bytes()); // IPv6 inside
+        f[18..].copy_from_slice(&[0x60, 1, 2, 3, 4, 5, 6, 7]);
+        s.inner
+            .packet_queue
+            .lock()
+            .push_back(Arc::from(f.into_boxed_slice()));
+        let mut buf = [0u8; 16];
+        let (n, _) = Socket::read(&*s, &mut buf).await;
+        assert_eq!(n, Ok(8));
+        assert_eq!(&buf[..8], &[0x60, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A card that refuses frames: it answers `refusal` to every send and
+    /// says whether it is carrying.
+    struct RefusingCard {
+        refusal: zcore_drivers::DeviceError,
+        carrier: bool,
+        tries: core::sync::atomic::AtomicUsize,
+    }
+
+    impl RefusingCard {
+        fn new(refusal: zcore_drivers::DeviceError, carrier: bool) -> Self {
+            Self {
+                refusal,
+                carrier,
+                tries: core::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn tries(&self) -> usize {
+            self.tries.load(core::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl zcore_drivers::scheme::Scheme for RefusingCard {
+        fn name(&self) -> &str {
+            "refusing-card"
+        }
+    }
+
+    impl NetScheme for RefusingCard {
+        fn recv(&self, _buf: &mut [u8]) -> zcore_drivers::DeviceResult<usize> {
+            Err(zcore_drivers::DeviceError::NotReady)
+        }
+        fn send(&self, _buf: &[u8]) -> zcore_drivers::DeviceResult<usize> {
+            self.tries
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            Err(self.refusal)
+        }
+        fn link_carrier_up(&self) -> bool {
+            self.carrier
+        }
+        fn get_mac(&self) -> EthernetAddress {
+            EthernetAddress([0x02, 0, 0, 0, 0, 1])
+        }
+        fn ifname(&self) -> &str {
+            "eth0"
+        }
+        fn is_loopback(&self) -> bool {
+            false
+        }
+        fn get_ifname(&self) -> alloc::string::String {
+            alloc::string::String::from("eth0")
+        }
+        fn get_ip_address(&self) -> Vec<smoltcp::wire::IpCidr> {
+            Vec::new()
+        }
+        fn poll(&self) -> zcore_drivers::DeviceResult {
+            Ok(())
+        }
+    }
+
+    /// A full ring on a live link is the one refusal worth trying again, and
+    /// the only one that is `EAGAIN`.
+    #[test]
+    fn a_full_ring_is_tried_again_and_is_eagain() {
+        let card = RefusingCard::new(zcore_drivers::DeviceError::NotReady, true);
+        assert_eq!(put_on_the_wire(&card, &[0u8; 60]), Err(LxError::EAGAIN));
+        assert_eq!(card.tries(), TX_TRIES);
+    }
+
+    /// With no carrier the frame cannot leave by that interface at all:
+    /// `ENETDOWN`, not "try again" --- which is what `udhcpc6` was told, and
+    /// why it kept printing "Resource temporarily unavailable" for ever.
+    #[test]
+    fn a_card_with_no_carrier_is_enetdown() {
+        let card = RefusingCard::new(zcore_drivers::DeviceError::NotReady, false);
+        assert_eq!(put_on_the_wire(&card, &[0u8; 60]), Err(LxError::ENETDOWN));
+    }
+
+    /// A refusal that will never change is made once, not sixteen times.
+    #[test]
+    fn a_refusal_that_cannot_change_is_not_repeated() {
+        for (refusal, want) in [
+            (zcore_drivers::DeviceError::InvalidParam, LxError::EMSGSIZE),
+            (
+                zcore_drivers::DeviceError::BufferTooSmall,
+                LxError::EMSGSIZE,
+            ),
+            (
+                zcore_drivers::DeviceError::NotSupported,
+                LxError::EOPNOTSUPP,
+            ),
+            (zcore_drivers::DeviceError::IoError, LxError::EIO),
+        ] {
+            let card = RefusingCard::new(refusal, true);
+            assert_eq!(
+                put_on_the_wire(&card, &[0u8; 60]),
+                Err(want),
+                "{:?}",
+                refusal
+            );
+            assert_eq!(card.tries(), 1, "{:?}", refusal);
+        }
     }
 
     /// Idle AF_PACKET must answer `FIONREAD` with 0, not fall through to ENOTTY.
