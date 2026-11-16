@@ -332,6 +332,16 @@ pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
     })
 }
 
+/// Who holds `handle` (pids, `DMABUF_HOLDER`, a KMS framebuffer's holder),
+/// or `None` if it is not tracked here. For the GEM quota's report.
+pub fn holders(handle: u32) -> Option<Vec<u64>> {
+    MAPPINGS
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.holders.clone())
+}
+
 /// How many references `handle` has, or `None` if it is not tracked here.
 pub fn ref_count(handle: u32) -> Option<u32> {
     MAPPINGS

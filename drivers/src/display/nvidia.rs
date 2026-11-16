@@ -228,6 +228,8 @@ pub use boot_edid::{boot_edid, set_boot_edid};
 /// `/proc/gpuready`'s answer for this GPU; own file for the size ceiling, no
 /// logic change.
 mod gem_free_queue;
+/// `GEM_NEW`'s per-card quota and its `ENOMEM` report.
+mod gem_quota;
 mod gpu_ready;
 
 /// The CRTC and plane ids a card advertises, which used to be the SAME two
@@ -680,16 +682,9 @@ static HDMI_AUDIO_STATUS: lock::Mutex<Option<alloc::string::String>> = lock::Mut
 static NVIDIA_GPUS: lock::Mutex<Vec<Arc<NvidiaGpu>>> = lock::Mutex::new(Vec::new());
 
 /// Live bytes across every entry in every GPU's `nouveau_gem` table.
-/// Updated on `GEM_NEW` / `GEM_CLOSE` / process-exit free. Quotas in the
-/// `GEM_NEW` arm consult this before calling `gem_alloc`.
+/// Updated on `GEM_NEW` / `GEM_CLOSE` / process-exit free. Reported by
+/// `gem_quota`; the quota itself is per card.
 static NOUVEAU_GEM_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Hard cap on a single `GEM_NEW` allocation.
-const GEM_NEW_MAX_SINGLE: u64 = 256 * 1024 * 1024; // 256 MiB
-/// Cap on live `nouveau_gem` bytes owned by one pid.
-const GEM_NEW_MAX_PER_PID: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-/// Soft global ceiling; actual cap is `min(this, vram_bytes * 2)`.
-const GEM_NEW_MAX_GLOBAL: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 fn record_hdmi_audio_status(s: alloc::string::String) {
     *HDMI_AUDIO_STATUS.lock() = Some(s);
@@ -12537,51 +12532,8 @@ impl NvidiaGpu {
                     req.info.tile_flags,
                     nv::gem_reported_kind(kind, page_shift, comp),
                 );
-                // Quotas before gem_alloc: one BO, per-pid live, and global live.
-                if size > GEM_NEW_MAX_SINGLE {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] GEM_NEW: size={} exceeds single-alloc cap {} MiB (pid={})",
-                        size,
-                        GEM_NEW_MAX_SINGLE / (1024 * 1024),
-                        owner_pid
-                    );
-                    return Err(nv::ENOMEM);
-                }
-                let vram_bytes = (self.effective_vram_mb() as u64).saturating_mul(1024 * 1024);
-                let global_cap = if vram_bytes == 0 {
-                    GEM_NEW_MAX_GLOBAL
-                } else {
-                    GEM_NEW_MAX_GLOBAL.min(vram_bytes.saturating_mul(2))
-                };
-                {
-                    let gem = self.nouveau_gem.lock();
-                    let pid_live: u64 = gem
-                        .iter()
-                        .filter(|o| o.owner_pid == owner_pid)
-                        .map(|o| o.size)
-                        .sum();
-                    if pid_live.saturating_add(size) > GEM_NEW_MAX_PER_PID {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: per-pid quota hit (pid={} live={} + {} > {} GiB)",
-                            owner_pid,
-                            pid_live,
-                            size,
-                            GEM_NEW_MAX_PER_PID / (1024 * 1024 * 1024)
-                        );
-                        return Err(nv::ENOMEM);
-                    }
-                    let global_live = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
-                    if global_live.saturating_add(size) > global_cap {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: global quota hit (live={} + {} > cap={} MiB, vram={} MiB)",
-                            global_live,
-                            size,
-                            global_cap / (1024 * 1024),
-                            self.effective_vram_mb()
-                        );
-                        return Err(nv::ENOMEM);
-                    }
-                }
+                // This card's quota, before gem_alloc: see `gem_quota`.
+                gem_quota::check(self, owner_pid, size, req.info.domain)?;
                 let Some(device_instance) = *self.rm_device_instance.lock() else {
                     crate::klog_warn!("[nouveau-uapi] GEM_NEW: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
@@ -12613,7 +12565,16 @@ impl NvidiaGpu {
                     bar1_len: self.info.fb_size as u64,
                 };
                 let placed =
-                    gem_vram::place(&target, placement, super::nvidia_hooks::map_device_window)?;
+                    gem_vram::place(&target, placement, super::nvidia_hooks::map_device_window)
+                        .inspect_err(|_| {
+                            gem_quota::report_enomem(
+                                self,
+                                "the RM refused",
+                                owner_pid,
+                                size,
+                                req.info.domain,
+                            )
+                        })?;
                 let (alloc, sysmem) = (placed.alloc, placed.sysmem);
                 let (phys_addr, vram_offset) = (placed.phys_addr, placed.vram_offset);
                 let map_handle = if let Some(pa) = phys_addr {
@@ -12658,6 +12619,7 @@ impl NvidiaGpu {
                     tile_flags,
                 });
                 NOUVEAU_GEM_BYTES.fetch_add(size, Ordering::Relaxed);
+                gem_quota::note_growth(self);
                 // Feed the /proc/gpudbg memory summary. `req.info.domain` is
                 // still the client's REQUEST here (overwritten to the domain
                 // actually used a few lines below); phys_addr.is_some() means a

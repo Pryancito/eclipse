@@ -489,30 +489,30 @@ fn gem_new_is_refused_for_its_own_reason_before_it_needs_the_rm() {
     assert_eq!(gem_new(&gpu, 4096, 0, A), Err(nv::EOPNOTSUPP));
     assert_eq!(gem_new(&gpu, 0, gart, A), Err(nv::EINVAL));
     assert_eq!(gem_new(&gpu, u32::MAX as u64 + 1, gart, A), Err(nv::EINVAL));
+    let single = gem_quota::MAX_SINGLE;
     assert_eq!(
-        gem_new(&gpu, GEM_NEW_MAX_SINGLE + 1, gart, A),
+        gem_new(&gpu, single + 1, gart, A),
         Err(nv::ENOMEM),
         "single-allocation cap"
     );
-    assert_eq!(gem_new(&gpu, GEM_NEW_MAX_SINGLE, gart, A), Err(nv::ENODEV));
-    // Per-pid quota: what A already holds plus this request.
-    object(&gpu, A, GEM_NEW_MAX_PER_PID - 4096, None);
-    assert_eq!(gem_new(&gpu, 8192, gart, A), Err(nv::ENOMEM));
+    assert_eq!(gem_new(&gpu, single, gart, A), Err(nv::ENODEV));
+    // The card's quota: twice its VRAM (16 GiB on an 8 GiB board), for all
+    // its owners together. No process has a ceiling of its own any more:
+    // A may hold more than the old 2 GiB.
+    let cap = gem_quota::card_cap(8192);
+    object(&gpu, A, 3 << 30, None);
     assert_eq!(gem_new(&gpu, 4096, gart, A), Err(nv::ENODEV));
-    assert_eq!(
-        gem_new(&gpu, 8192, gart, B),
-        Err(nv::ENODEV),
-        "B's quota is B's"
-    );
-    // Global quota: min(4 GiB, twice the VRAM), across every pid.
-    object(&gpu, B, GEM_NEW_MAX_PER_PID, None);
+    object(&gpu, B, cap - (3 << 30) - 4096, None);
+    assert_eq!(gem_new(&gpu, 8192, gart, A), Err(nv::ENOMEM));
     assert_eq!(gem_new(&gpu, 8192, gart, STRANGER), Err(nv::ENOMEM));
     assert_eq!(gem_new(&gpu, 4096, gart, STRANGER), Err(nv::ENODEV));
-    // Twice a 1 GiB board is the tighter cap.
-    let small = NvidiaGpu::for_test(0x1f06, 1024);
-    NOUVEAU_GEM_BYTES.store(2048 * MIB - 4096, Ordering::Relaxed);
-    assert_eq!(gem_new(&small, 8192, gart, STRANGER), Err(nv::ENOMEM));
-    assert_eq!(gem_new(&small, 4096, gart, STRANGER), Err(nv::ENODEV));
+    // Another card's memory is not this one's, and the all-cards counter
+    // no longer decides anything (it held both RTX cards under one 4 GiB).
+    let other = NvidiaGpu::for_test(0x1f06, 8192);
+    NOUVEAU_GEM_BYTES.store(8 << 30, Ordering::Relaxed);
+    assert_eq!(gem_new(&other, 8192, gart, STRANGER), Err(nv::ENODEV));
+    // A card of unknown VRAM gets 4 GiB.
+    assert_eq!(gem_quota::card_cap(0), 4 << 30);
     // A request the RM never saw burns no handle.
     let next = gpu.nouveau_gem_next_handle.load(Ordering::Relaxed);
     assert_eq!(gem_new(&gpu, 4096, gart, STRANGER), Err(nv::ENODEV));
