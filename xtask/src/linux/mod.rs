@@ -1394,6 +1394,9 @@ impl LinuxRootfs {
               # SDL_Init: with no daemon the connect is refused at once and\n\
               # apps carry on.\n\
               export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              # System bus where eclipse-dbusd binds it: the default\n\
+              # /var/run/... path does not reach an AF_UNIX socket here.\n\
+              export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket\n\
               # GTK's file dialog is a portal call when GTK_USE_PORTAL=1. The\n\
               # stamp appears when eclipse-portald owns the name, so the var\n\
               # follows a portal that really serves. No wait here (the labwc\n\
