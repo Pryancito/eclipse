@@ -484,6 +484,10 @@ pub struct E1000Interface {
     irq: usize,
     base: usize,
     poll_pending: Arc<core::sync::atomic::AtomicBool>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
+    /// them.
+    lent: super::lent::Lent,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -504,6 +508,13 @@ impl E1000Interface {
     /// branch — which read-clears ICR without queuing a poll, dropping the RX
     /// frame until the next interrupt. The periodic `poll()` path re-arms itself.
     fn poll_inner(&self) -> DeviceResult {
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled, neither to read them nor to send on a card it has not
+        // got.
+        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         // Mutex::lock() uses push_off/pop_off which already disables interrupts
         // for the duration of the critical section. Manual intr_off/on bypasses
@@ -553,6 +564,24 @@ impl Scheme for E1000Interface {
         let icr = unsafe { mmio_read(self.base, E1000_ICR) };
         if icr == 0 {
             if !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+                self.ims_rearm();
+            }
+            return;
+        }
+
+        // A lent card has no bottom half: a deferred job runs when the CPU
+        // idles or a kernel socket waits, and with the card lent nobody
+        // waits on one. The card stays masked and the borrower is woken to
+        // look at it itself (`NetScheme::poll`, which re-arms it). The
+        // cause read above is gone, and the look does not need it: it
+        // reads the ring.
+        if self.lent.is_on() && !self.poll_pending.load(core::sync::atomic::Ordering::SeqCst) {
+            unsafe {
+                mmio_write(self.base, E1000_IMC, 0xffffffff);
+                let _ = mmio_read(self.base, E1000_IMC);
+            }
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
                 self.ims_rearm();
             }
             return;
@@ -612,6 +641,21 @@ impl Scheme for E1000Interface {
 }
 
 impl NetScheme for E1000Interface {
+    fn lend(&self, taker: Option<Arc<dyn super::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
+    // An echo of 56 bytes takes 2.4 times as long through the stack
+    // process as through the kernel's stack on this card, which has no
+    // interrupt throttle to hide it.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -1041,6 +1085,7 @@ pub fn init(
         irq,
         base: header,
         poll_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        lent: super::lent::Lent::default(),
         stats,
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
@@ -1070,9 +1115,20 @@ impl PciDriver for E1000DriverPci {
             // Through the base the mapper returns: see `bus::resolve_window`.
             let vaddr = crate::bus::resolve_window(mapper, addr as usize, 4096 * 8, 0);
             let name = crate::net::next_eth_ifname();
-            let vector = irq.map(|idx| idx + 32).unwrap_or(0);
-            let iface = init(name, vector, vaddr, len as usize, 0)?;
-            Ok(Device::Net(Arc::new(iface)))
+            // An 82540 has no MSI (QEMU's has none): it raises the legacy
+            // line of its slot, or nothing tells this driver of a frame.
+            let line = match irq {
+                Some(_) => None,
+                None => crate::net::pci_intx_line(dev.pic_interrupt_line, dev.interrupt_pin),
+            };
+            let vector = irq.map(|idx| idx + 32).or(line).unwrap_or(0);
+            let iface = Arc::new(init(name, vector, vaddr, len as usize, 0)?);
+            if line.is_some() {
+                crate::net::pci_note_pending_intx(vector, iface.clone());
+            } else if vector != 0 {
+                crate::net::pci_note_pending_msi(vector, iface.clone());
+            }
+            Ok(Device::Net(iface))
         } else {
             Err(crate::DeviceError::NotSupported)
         }

@@ -222,6 +222,10 @@ pub struct XgbeInterface {
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`crate::net::lent`]); empty, the kernel's own stack
+    /// reads them.
+    lent: crate::net::lent::Lent,
     /// Counters, shared with the tokens.
     pub stats: Arc<Mutex<NetStats>>,
     /// Routes this interface owns.
@@ -234,6 +238,12 @@ impl XgbeInterface {
     /// Drain smoltcp without touching the interrupt mask; the IRQ path owns
     /// the mask through its guard.
     fn poll_inner(&self) -> DeviceResult {
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled.
+        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         // `try_lock`, not a blocking acquire: this runs from a deferred job
@@ -285,6 +295,19 @@ impl Scheme for XgbeInterface {
         if self.poll_pending.load(Ordering::SeqCst) {
             return;
         }
+        // A lent card has no bottom half: a deferred job runs when the CPU
+        // idles or a kernel socket waits, and with the card lent nobody
+        // waits on one. The card stays masked and the borrower is woken to
+        // look at it itself (`NetScheme::poll`, which unmasks it).
+        if self.lent.is_on() {
+            self.driver.hw.lock().mask_irqs();
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
+                self.driver.hw.lock().unmask_irqs();
+            }
+            return;
+        }
+
         self.poll_pending.store(true, Ordering::SeqCst);
         self.driver.hw.lock().mask_irqs();
 
@@ -316,6 +339,20 @@ impl Scheme for XgbeInterface {
 }
 
 impl NetScheme for XgbeInterface {
+    fn lend(&self, taker: Option<Arc<dyn crate::net::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
+    // Never run lent on its machine, and it has no interrupt registered:
+    // the borrower looks at it now and then.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -420,6 +457,7 @@ pub fn new_interface(
         name,
         irq,
         poll_pending: Arc::new(AtomicBool::new(false)),
+        lent: crate::net::lent::Lent::default(),
         stats,
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),

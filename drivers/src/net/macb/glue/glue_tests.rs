@@ -402,6 +402,47 @@ fn the_mask_comes_back_even_if_the_job_is_dropped_without_running() {
 // El camino de una trama
 // ---------------------------------------------------------------------------
 
+/// A lent card gives its frames to the borrower: its interrupt disarms it
+/// and wakes the borrower, with no bottom half, and the borrower's look
+/// hands the frames over and arms it again.
+#[test]
+fn a_lent_card_gives_its_frames_to_the_borrower_and_not_to_the_kernels_stack() {
+    use crate::net::lent::tests::Kept;
+    sin_tocar_los_sockets!();
+    let hw = Hw::new();
+    let iface = interfaz(&hw);
+    assert!(iface.can_lend());
+    let kept = Arc::new(Kept::default());
+    assert_eq!(iface.lend(Some(kept.clone())), Ok(()));
+
+    {
+        let rings = iface.driver.rings.lock();
+        deliver_frame(&rings, 0, TRAMA);
+    }
+    hw.raise_irq(ISR_RCOMP);
+    let antes = pending_deferred_jobs();
+    iface.handle_irq(IRQ);
+
+    assert_eq!(hw.peek(ISR) & ISR_RCOMP, 0, "no se reconocio");
+    assert_eq!(hw.peek(IMR) & MACB_IRQ_WANTED, MACB_IRQ_WANTED);
+    assert_eq!(pending_deferred_jobs(), antes);
+    assert_eq!(*kept.interrupts.lock(), 1);
+    assert!(kept.frames.lock().is_empty());
+
+    iface.poll().unwrap();
+    assert_eq!(*kept.frames.lock(), vec![TRAMA.to_vec()]);
+    assert_eq!(*kept.dones.lock(), 1);
+    assert_eq!(hw.peek(IMR) & MACB_IRQ_WANTED, 0, "la tarjeta no se armo");
+
+    // Given back, the next interrupt has its bottom half again.
+    assert_eq!(iface.lend(None), Ok(()));
+    hw.raise_irq(ISR_RCOMP);
+    iface.handle_irq(IRQ);
+    assert_eq!(pending_deferred_jobs(), antes + 1);
+    assert_eq!(*kept.interrupts.lock(), 1);
+    drain_deferred_jobs();
+}
+
 /// Una trama que el MAC deja en el anillo sale por el `RxToken` **entera**, y
 /// se cuenta.
 #[test]

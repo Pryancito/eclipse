@@ -397,6 +397,13 @@ pub fn set_pci_msix_enabled(v: bool) {
     zcore_drivers::bus::pci::msix::bringup::set_enabled(v);
 }
 
+/// Whether a PCI network card with no MSI is given the legacy interrupt
+/// line of its slot (`pci.intx=1` and `unetlend=any` say so). See
+/// `zcore_drivers::net::set_pci_intx_enabled`.
+pub fn set_pci_intx_enabled(v: bool) {
+    zcore_drivers::net::set_pci_intx_enabled(v);
+}
+
 /// Lets the AMD 10GbE (`xgbe`) probe run its bring-up sequence instead of
 /// leaving the device unclaimed (`xgbe.enable`). Default off: not one
 /// register write of that sequence has ever reached the part, because QEMU

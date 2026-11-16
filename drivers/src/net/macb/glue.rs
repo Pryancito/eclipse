@@ -270,6 +270,10 @@ impl phy::TxToken for MacbTxToken {
 // La interfaz
 // ---------------------------------------------------------------------------
 
+/// How often the link of a lent card is looked at, in microseconds: what
+/// the kernel's periodic poll of its interfaces did for it.
+const LENT_LINK_EVERY_US: u64 = 100_000;
+
 #[derive(Clone)]
 pub struct MacbInterface {
     iface: Arc<Mutex<Interface<'static, MacbDriver>>>,
@@ -277,6 +281,13 @@ pub struct MacbInterface {
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`crate::net::lent`]); empty, the kernel's own stack
+    /// reads them.
+    lent: crate::net::lent::Lent,
+    /// When a lent card's link was last looked at, in microseconds: see
+    /// [`NetScheme::poll`].
+    link_seen: Arc<core::sync::atomic::AtomicU64>,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -291,6 +302,12 @@ impl MacbInterface {
     /// puesto, reconoce la causa y no encola nada: la trama se queda en el
     /// anillo hasta que llegue la siguiente.
     fn poll_inner(&self) -> DeviceResult {
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled.
+        if self.lent.hand_over(|| self.driver.take_frame()) {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         // `try_lock`, no una toma que bloquea. Esto corre desde un trabajo
@@ -358,6 +375,20 @@ impl Scheme for MacbInterface {
             // reconozcan causas que ese trabajo no va a ver.
             return;
         }
+        // A lent card has no bottom half: a deferred job runs when the CPU
+        // idles or a kernel socket waits, and with the card lent nobody
+        // waits on one. The card stays disarmed and the borrower is woken
+        // to look at it itself (`NetScheme::poll`, which reclaims what was
+        // sent and arms it again).
+        if self.lent.is_on() {
+            self.driver.mac.irq_disable(MACB_IRQ_WANTED);
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
+                self.driver.mac.irq_enable(MACB_IRQ_WANTED);
+            }
+            return;
+        }
+
         self.poll_pending.store(true, Ordering::SeqCst);
         self.driver.mac.irq_disable(MACB_IRQ_WANTED);
 
@@ -408,6 +439,19 @@ impl Scheme for MacbInterface {
 }
 
 impl NetScheme for MacbInterface {
+    fn lend(&self, taker: Option<Arc<dyn crate::net::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
+    // Never run lent on its board.
+    fn lends_unasked(&self) -> bool {
+        false
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -439,7 +483,21 @@ impl NetScheme for MacbInterface {
         // lo lleva el PHY. Primero el enlace y luego el poll, para que el MAC
         // este a la velocidad nueva antes de que le lleguen tramas que poner
         // en el aire.
-        self.driver.refresh_link();
+        //
+        // A lent card is looked at for every interrupt and not ten times
+        // a second, and the link is a walk of the PHY's registers: there
+        // it is looked at as often as the periodic poll would
+        // ([`LENT_LINK_EVERY_US`]).
+        if self.lent.is_on() {
+            let now = timer_now_as_micros();
+            let seen = self.link_seen.load(Ordering::Relaxed);
+            if now.wrapping_sub(seen) >= LENT_LINK_EVERY_US || seen == 0 {
+                self.link_seen.store(now.max(1), Ordering::Relaxed);
+                self.driver.refresh_link();
+            }
+        } else {
+            self.driver.refresh_link();
+        }
         self.driver.reclaim();
         // El camino periodico lleva la mascara el mismo; el de la interrupcion
         // va por `poll_inner` y su guardia.
@@ -677,6 +735,8 @@ pub unsafe fn macb_init(
         name,
         irq,
         poll_pending: Arc::new(AtomicBool::new(false)),
+        lent: crate::net::lent::Lent::default(),
+        link_seen: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         stats,
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),
