@@ -255,6 +255,14 @@ pub struct GenetInterface {
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`crate::net::lent`]); empty, the kernel's own stack
+    /// reads them.
+    lent: crate::net::lent::Lent,
+    /// A lent card's link changed and nobody has looked yet: its
+    /// interrupt has no bottom half to look in, so the borrower's next
+    /// look does ([`NetScheme::poll`]).
+    link_owed: Arc<AtomicBool>,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -269,6 +277,12 @@ impl GenetInterface {
     /// todavia puesto, reconoce la causa y no encola nada: la trama se queda
     /// en el anillo hasta que llegue la siguiente.
     fn poll_inner(&self) -> DeviceResult {
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled.
+        if self.lent.hand_over(|| self.driver.take_frame()) {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         // `try_lock`, no una toma que bloquea. Esto corre desde un trabajo
@@ -324,6 +338,23 @@ impl Scheme for GenetInterface {
             // reconozcan causas que ese trabajo no va a ver.
             return;
         }
+        // A lent card has no bottom half: a deferred job runs when the CPU
+        // idles or a kernel socket waits, and with the card lent nobody
+        // waits on one. The card stays masked and the borrower is woken to
+        // look at it itself (`NetScheme::poll`, which unmasks it), the
+        // link first if this said it changed.
+        if self.lent.is_on() {
+            if status & UMAC_IRQ_LINK_EVENT != 0 {
+                self.link_owed.store(true, Ordering::SeqCst);
+            }
+            self.driver.mac.irq_mask(GENET_IRQ_WANTED);
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
+                self.driver.mac.irq_unmask(GENET_IRQ_WANTED);
+            }
+            return;
+        }
+
         self.poll_pending.store(true, Ordering::SeqCst);
         self.driver.mac.irq_mask(GENET_IRQ_WANTED);
 
@@ -366,6 +397,14 @@ impl Scheme for GenetInterface {
 }
 
 impl NetScheme for GenetInterface {
+    fn lend(&self, taker: Option<Arc<dyn crate::net::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -392,6 +431,11 @@ impl NetScheme for GenetInterface {
     }
 
     fn poll(&self) -> DeviceResult {
+        // What a lent card's interrupt left for this look: the link
+        // first, as the bottom half has it.
+        if self.link_owed.swap(false, Ordering::SeqCst) {
+            self.driver.refresh_link();
+        }
         // El camino periodico lleva la mascara el mismo; el de la interrupcion
         // va por `poll_inner` y su guardia.
         let res = self.poll_inner();
@@ -631,6 +675,8 @@ pub unsafe fn genet_init(
         name,
         irq,
         poll_pending: Arc::new(AtomicBool::new(false)),
+        lent: crate::net::lent::Lent::default(),
+        link_owed: Arc::new(AtomicBool::new(false)),
         stats,
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),

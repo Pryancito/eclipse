@@ -34,6 +34,9 @@
 //! `unetcard=kernel` lends the card even when a virtio card is there, which
 //! is then not left to userspace unasked.
 //!
+//! Every driver of the kernel's lends its card (`NetScheme::can_lend`), so
+//! the first card of a machine is the stack process's whichever it is.
+//!
 //! The kernel's other cards are its own stack's, which is the only one that
 //! reaches them: on a machine with any, the programs that do not ask keep
 //! the kernel's stack, and the stack process is for the ones that do,

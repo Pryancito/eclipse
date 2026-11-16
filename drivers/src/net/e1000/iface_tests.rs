@@ -510,6 +510,55 @@ fn the_periodic_poll_puts_the_mask_back_itself() {
     assert_eq!(reg(base, E1000_IMS), IMS_REARMED);
 }
 
+// --- the card lent to a stack that is not the kernel's
+
+#[test]
+fn a_lent_cards_interrupt_wakes_the_borrower_and_queues_nothing() {
+    use crate::net::lent::tests::Kept;
+    let (base, iface) = interface(0);
+    assert!(iface.can_lend());
+    let kept = alloc::sync::Arc::new(Kept::default());
+    assert_eq!(iface.lend(Some(kept.clone())), Ok(()));
+    // One borrower at a time.
+    assert_eq!(
+        iface.lend(Some(kept.clone())),
+        Err(DeviceError::AlreadyExists)
+    );
+
+    poke(base, E1000_ICR, 1 << 7);
+    poke(base, E1000_IMS, 0);
+    poke(base, E1000_IMC, 0);
+    let pending = crate::utils::deferred_job::pending_deferred_jobs();
+    iface.handle_irq(IRQ);
+    assert_eq!(*kept.interrupts.lock(), 1, "the borrower was not woken");
+    assert_eq!(
+        crate::utils::deferred_job::pending_deferred_jobs(),
+        pending,
+        "a bottom half was queued for a card that has none"
+    );
+    assert_eq!(reg(base, E1000_IMC), 0xffff_ffff, "the card was not masked");
+    assert_eq!(reg(base, E1000_IMS), 0, "the mask was put back too early");
+    assert_eq!(*kept.dones.lock(), 0, "the interrupt looked at the ring");
+
+    // The borrower's look: what is on the ring is its own, it is told the
+    // look is over, and the card speaks again.
+    iface.poll().expect("the look failed");
+    assert_eq!(*kept.dones.lock(), 1);
+    assert!(kept.frames.lock().is_empty());
+    assert_eq!(reg(base, E1000_IMS), IMS_REARMED);
+
+    // Given back: the next interrupt is the kernel's own again.
+    assert_eq!(iface.lend(None), Ok(()));
+    poke(base, E1000_ICR, 1 << 7);
+    iface.handle_irq(IRQ);
+    assert_eq!(*kept.interrupts.lock(), 1);
+    assert_eq!(
+        crate::utils::deferred_job::pending_deferred_jobs(),
+        pending + 1
+    );
+    crate::utils::deferred_job::drain_deferred_jobs();
+}
+
 // --- what goes out and what comes in
 
 #[test]

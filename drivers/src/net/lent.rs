@@ -92,11 +92,49 @@ impl Lent {
         }
         self.taker.lock().clone()
     }
+
+    /// The card interrupted. `true` when it is lent and its borrower was
+    /// told ([`FrameTaker::interrupted`]): the driver has masked the card,
+    /// leaves it so, and queues nothing of its own, since the borrower
+    /// looks at the card itself ([`hand_over`](Self::hand_over), from the
+    /// driver's `poll`) and that is where it is unmasked. `false` when
+    /// the card is the kernel's own, or was given back meanwhile: the
+    /// driver does what it always did.
+    pub fn interrupted(&self) -> bool {
+        match self.taker() {
+            Some(taker) => {
+                taker.interrupted();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The look at a lent card, in the place of the poll of the kernel's
+    /// stack: the frames `receive` finds go to the borrower, whole and in
+    /// order, at most [`BURST`] of them, and the borrower is told that is
+    /// all for now. `false`, and nothing is read, when the card is not
+    /// lent. `receive` takes the driver's own lock a frame at a time: the
+    /// borrower sends through `NetScheme::send`, which takes it too.
+    pub fn hand_over(&self, mut receive: impl FnMut() -> Option<Vec<u8>>) -> bool {
+        let Some(taker) = self.taker() else {
+            return false;
+        };
+        for _ in 0..BURST {
+            match receive() {
+                Some(frame) => taker.take(frame),
+                None => break,
+            }
+        }
+        taker.done();
+        true
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use alloc::vec;
 
     /// A taker that keeps what it is given.
     #[derive(Default)]
@@ -116,6 +154,45 @@ pub(crate) mod tests {
         fn interrupted(&self) {
             *self.interrupts.lock() += 1;
         }
+    }
+
+    #[test]
+    fn a_look_at_a_lent_card_hands_its_frames_to_the_borrower() {
+        let lent = Lent::default();
+        let mut ring: Vec<Vec<u8>> = vec![vec![3], vec![2], vec![1]];
+        // The kernel's own card: nothing is read, nobody is told.
+        assert!(!lent.hand_over(|| ring.pop()));
+        assert!(!lent.interrupted());
+        assert_eq!(ring.len(), 3);
+
+        let kept = Arc::new(Kept::default());
+        assert_eq!(lent.set(Some(kept.clone())), Ok(()));
+        // An interrupt wakes the borrower and reads nothing.
+        assert!(lent.interrupted());
+        assert_eq!(*kept.interrupts.lock(), 1);
+        assert!(kept.frames.lock().is_empty());
+        // The look hands over what is there, in order, and says so once.
+        assert!(lent.hand_over(|| ring.pop()));
+        assert_eq!(*kept.frames.lock(), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(*kept.dones.lock(), 1);
+        // An empty card is still a look that ended.
+        assert!(lent.hand_over(|| None));
+        assert_eq!(*kept.dones.lock(), 2);
+
+        // No more than a burst at a time: the rest brings the driver back.
+        let mut left = BURST + 5;
+        assert!(lent.hand_over(|| {
+            left = left.checked_sub(1)?;
+            Some(vec![0])
+        }));
+        assert_eq!(left, 5);
+        assert_eq!(kept.frames.lock().len(), 3 + BURST);
+
+        // Given back: the kernel's own again.
+        assert_eq!(lent.set(None), Ok(()));
+        assert!(!lent.interrupted());
+        assert!(!lent.hand_over(|| Some(vec![9])));
+        assert_eq!(*kept.interrupts.lock(), 1);
     }
 
     #[test]

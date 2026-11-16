@@ -1027,6 +1027,10 @@ pub struct Pcnet32Interface {
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
+    /// them.
+    lent: super::lent::Lent,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
@@ -1039,6 +1043,12 @@ impl Pcnet32Interface {
     /// still true, acknowledges the cause and queues nothing, losing the
     /// frame until the next one arrives.
     fn poll_inner(&self) -> DeviceResult {
+        // A card lent to a stack that is not the kernel's: its frames go
+        // to the borrower as they are, and the kernel's stack is not
+        // polled.
+        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         let sockets = get_sockets();
         // `try_lock`, not a blocking acquire. This runs from a deferred job,
@@ -1095,6 +1105,19 @@ impl Scheme for Pcnet32Interface {
             return;
         }
 
+        // A lent card has no bottom half: a deferred job runs when the CPU
+        // idles or a kernel socket waits, and with the card lent nobody
+        // waits on one. The chip stays masked and the borrower is woken to
+        // look at it itself (`NetScheme::poll`, which unmasks it).
+        if self.lent.is_on() {
+            self.driver.hw.lock().mask_irqs();
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
+                self.driver.hw.lock().unmask_irqs();
+            }
+            return;
+        }
+
         self.poll_pending.store(true, Ordering::SeqCst);
         self.driver.hw.lock().mask_irqs();
 
@@ -1134,6 +1157,14 @@ impl Scheme for Pcnet32Interface {
 }
 
 impl NetScheme for Pcnet32Interface {
+    fn lend(&self, taker: Option<Arc<dyn super::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -1166,6 +1197,14 @@ impl NetScheme for Pcnet32Interface {
     fn poll(&self) -> DeviceResult {
         // The periodic path owns the mask itself; the IRQ path goes through
         // `poll_inner` and its guard.
+        if self.lent.is_on() {
+            // What the bottom half does before its poll, for a card that
+            // has none.
+            let errors = self.driver.hw.lock().reap_tx_errors();
+            if errors > 0 {
+                self.stats.lock().tx_errors += errors as u64;
+            }
+        }
         let res = self.poll_inner();
         self.driver.hw.lock().unmask_irqs();
         res
@@ -1306,6 +1345,7 @@ pub fn init(
         name,
         irq,
         poll_pending: Arc::new(AtomicBool::new(false)),
+        lent: super::lent::Lent::default(),
         stats,
         routes: Arc::new(Mutex::new(vec![])),
         ip_addrs: Arc::new(Mutex::new(ip_addrs)),

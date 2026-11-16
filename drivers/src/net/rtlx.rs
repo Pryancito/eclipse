@@ -35,6 +35,38 @@ pub struct RTLxInterface {
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub name: String,
     pub irq: usize,
+    /// Who the card's frames go to while it is lent to a stack that is not
+    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
+    /// them.
+    pub lent: super::lent::Lent,
+}
+
+impl RTLxInterface {
+    /// The look at a lent card: what its interrupt would have done, with
+    /// the frames going to the borrower and not to the kernel's stack.
+    /// `false` when the card is not lent.
+    fn look_lent(&self) -> bool {
+        if !self.lent.is_on() {
+            return false;
+        }
+        // The slots of what was sent, before the borrower sends more.
+        self.driver.0.lock().tx_complete();
+        let handed = self.lent.hand_over(|| {
+            let mut driver = self.driver.0.lock();
+            // A frame the GMAC marked bad comes back empty and is no
+            // frame: the next one is looked for, so that it does not sit
+            // on the ring until another arrives.
+            while driver.can_recv() {
+                let (frame, _count) = driver.geth_recv(1);
+                if !frame.is_empty() {
+                    return Some(frame);
+                }
+            }
+            None
+        });
+        self.driver.0.lock().int_enable();
+        handed
+    }
 }
 
 impl Scheme for RTLxInterface {
@@ -52,6 +84,19 @@ impl Scheme for RTLxInterface {
         // bits back), so whatever comes out of here is the only record left of
         // why the NIC raised the line.
         let status = self.driver.0.lock().interrupt_status();
+
+        // A card lent to a stack that is not the kernel's: the card is
+        // silenced and the borrower is woken to look at it itself
+        // (`NetScheme::poll`, which arms it again), in its own time and
+        // not in this interrupt.
+        if status == rtl8211f::TxDmaIrqStatus::HandleTxRx as i32 && self.lent.is_on() {
+            self.driver.0.lock().int_disable();
+            if !self.lent.interrupted() {
+                // Given back meanwhile: whoever has it now looks.
+                self.driver.0.lock().int_enable();
+            }
+            return;
+        }
 
         if status == rtl8211f::TxDmaIrqStatus::HandleTxRx as i32 {
             let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
@@ -121,6 +166,14 @@ impl Scheme for RTLxInterface {
 }
 
 impl NetScheme for RTLxInterface {
+    fn lend(&self, taker: Option<Arc<dyn super::lent::FrameTaker>>) -> DeviceResult {
+        self.lent.set(taker)
+    }
+
+    fn can_lend(&self) -> bool {
+        true
+    }
+
     fn get_mac(&self) -> EthernetAddress {
         self.iface.lock().ethernet_addr()
     }
@@ -302,6 +355,9 @@ impl NetScheme for RTLxInterface {
     }
 
     fn poll(&self) -> DeviceResult {
+        if self.look_lent() {
+            return Ok(());
+        }
         let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
         // Disable interrupts while holding the SOCKETS and iface locks.
         // On real hardware the NIC fires a hardware interrupt as soon as a
@@ -575,6 +631,7 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
         }])),
         name: String::from("rtl8211f"),
         irq,
+        lent: super::lent::Lent::default(),
     };
 
     Ok(rtl8211f_iface)
@@ -1736,6 +1793,7 @@ mod tests {
             routes: Arc::new(Mutex::new(Vec::new())),
             name: String::from("rtl8211f"),
             irq: 7,
+            lent: crate::net::lent::Lent::default(),
         }
     }
 

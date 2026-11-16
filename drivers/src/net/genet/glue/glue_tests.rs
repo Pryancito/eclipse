@@ -371,6 +371,53 @@ fn a_link_that_went_down_does_not_take_the_card_down_with_it() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_lent_card_gives_its_frames_to_the_borrower_and_not_to_the_kernels_stack() {
+    use crate::net::lent::tests::Kept;
+    sin_tocar_los_sockets!();
+    let hw = Hw::new();
+    let iface = interfaz(&hw);
+    assert!(iface.can_lend());
+    let kept = Arc::new(Kept::default());
+    assert_eq!(iface.lend(Some(kept.clone())), Ok(()));
+
+    hw.deliver_frame(0, TRAMA);
+    hw.set_link_100(DEFAULT_PHY_ADDR, true);
+    hw.raise_irq(UMAC_IRQ_RXDMA_DONE | UMAC_IRQ_LINK_UP);
+    let antes = pending_deferred_jobs();
+    iface.handle_irq(IRQ);
+
+    // Acknowledged, masked, the borrower woken, and no bottom half.
+    assert_eq!(hw.peek(GENET_INTRL2_0_OFF + INTRL2_CPU_STAT), 0);
+    assert_eq!(
+        hw.peek(GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_STATUS),
+        UMAC_IRQ_ALL
+    );
+    assert_eq!(pending_deferred_jobs(), antes);
+    assert_eq!(*kept.interrupts.lock(), 1);
+    assert!(kept.frames.lock().is_empty());
+
+    // The borrower's look: the link the interrupt spoke of, then the
+    // frame, whole, and the card unmasked.
+    iface.poll().unwrap();
+    let cmd = hw.peek(UMAC_CMD);
+    assert_eq!((cmd >> CMD_SPEED_SHIFT) & CMD_SPEED_MASK, UMAC_SPEED_100);
+    assert_eq!(*kept.frames.lock(), vec![TRAMA.to_vec()]);
+    assert_eq!(*kept.dones.lock(), 1);
+    assert_eq!(
+        hw.peek(GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_STATUS),
+        !GENET_IRQ_WANTED
+    );
+
+    // Given back, the next interrupt has its bottom half again.
+    assert_eq!(iface.lend(None), Ok(()));
+    hw.raise_irq(UMAC_IRQ_RXDMA_DONE);
+    iface.handle_irq(IRQ);
+    assert_eq!(pending_deferred_jobs(), antes + 1);
+    assert_eq!(*kept.interrupts.lock(), 1);
+    drain_deferred_jobs();
+}
+
+#[test]
 fn a_received_frame_comes_up_whole_and_counted() {
     let hw = Hw::new();
     let iface = interfaz(&hw);
