@@ -831,6 +831,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         }
         let whose = boot::whose(card, lent, word("unetstack"), unetuse, kernel_cards);
         user_stack::use_for_all(whose.all());
+        user_stack::machine().alone(whose.alone());
         match whose {
             boot::Whose::AllSaid => klog_info!(
                 "Eclipse: every program's sockets go to the stack process (unetuse=all)"
@@ -844,6 +845,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             boot::Whose::KernelCards(cards) => klog_info!(
                 "Eclipse: the stack process is for the programs that ask: the kernel drives {} card(s) of its own (unetuse=all for every program)",
                 cards
+            ),
+            boot::Whose::AllNoCard => klog_info!(
+                "Eclipse: the machine has no network card: its programs' sockets join each other with no stack (unetstack=kernel for the kernel's stack)"
             ),
             boot::Whose::NoStack => {}
         }

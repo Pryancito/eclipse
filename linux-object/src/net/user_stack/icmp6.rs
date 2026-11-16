@@ -332,7 +332,7 @@ impl ServedIcmpSocket {
         // Nothing leaves the machine while no stack serves, nor for
         // where the card has no way to.
         if self.link.is_down() {
-            return Err(LxError::ENETDOWN);
+            return Err(self.link.down());
         }
         if !self.link.sixes.reaches(&to) {
             return Err(LxError::ENETUNREACH);

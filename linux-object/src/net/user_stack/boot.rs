@@ -38,6 +38,13 @@
 //! reaches them: on a machine with any, the programs that do not ask keep
 //! the kernel's stack, and the stack process is for the ones that do,
 //! unless the boot says `unetuse=all`.
+//!
+//! A machine with no card at all, the kernel's or anybody's, has no stack
+//! process and needs none: what its programs say to each other never
+//! reaches a stack ([`Whose::AllNoCard`]). Their sockets are the served
+//! ones all the same, which join two programs of the machine by
+//! themselves, and the kernel's own stack carries nothing there;
+//! `unetstack=kernel` gives them the kernel's stack and its loopback back.
 
 /// The card the stack process takes, as `udriver=` names it and as
 /// `zcore_drivers::user::reserved` lists it: the one the `unet` boot
@@ -98,6 +105,9 @@ pub enum Whose {
     AllSaid,
     /// The stack process's: it has the only card of the machine.
     AllOnlyCard,
+    /// The served ones, with no stack process behind them: the machine
+    /// has no card, and what its programs say to each other needs none.
+    AllNoCard,
     /// The kernel's: the boot says so (`unetuse=asked`).
     AskedSaid,
     /// The kernel's: this boot gives no card to a stack process.
@@ -107,9 +117,16 @@ pub enum Whose {
 }
 
 impl Whose {
-    /// Whether every program's sockets are the stack process's.
+    /// Whether every program's sockets are the served ones, the stack
+    /// process's where there is one.
     pub fn all(self) -> bool {
-        matches!(self, Whose::AllSaid | Whose::AllOnlyCard)
+        matches!(self, Whose::AllSaid | Whose::AllOnlyCard | Whose::AllNoCard)
+    }
+
+    /// Whether no stack process is expected behind those sockets: what
+    /// would leave the machine has no way out, and never will have.
+    pub fn alone(self) -> bool {
+        self == Whose::AllNoCard
     }
 }
 
@@ -130,7 +147,9 @@ pub fn understood(unetuse: &str) -> bool {
 /// [`lends`]), whose command line has these values of `unetstack=` and
 /// `unetuse=` (`None` for a word that is not there), on a machine where
 /// the kernel drives `kernel_cards` network cards itself, the loopback not
-/// counted and the lent one counted.
+/// counted and the lent one counted. A card left to userspace for the
+/// kernel's own stack (`unetstack=kernel`) is brought to it by a driver
+/// process and is not one of those.
 pub fn whose(
     card: bool,
     lent: bool,
@@ -141,6 +160,13 @@ pub fn whose(
     match unetuse {
         Some("all") => Whose::AllSaid,
         Some("asked") => Whose::AskedSaid,
+        // No card anywhere, and no word that keeps the kernel's stack: a
+        // card left to userspace that no stack takes (`unetstack=none`)
+        // is nobody's network either.
+        _ if !lent && !has_stack(card, unetstack) && kernel_cards == 0 => match unetstack {
+            Some("kernel") => Whose::NoStack,
+            _ => Whose::AllNoCard,
+        },
         _ if !lent && !has_stack(card, unetstack) => Whose::NoStack,
         _ => match kernel_cards.saturating_sub(lent as usize) {
             0 => Whose::AllOnlyCard,
@@ -181,16 +207,39 @@ mod tests {
 
     #[test]
     fn a_boot_that_leaves_no_card_to_a_stack_process_keeps_the_kernels() {
-        // A machine without such a card, or a boot that did not leave it.
+        // A machine whose card the kernel drives and does not lend.
         assert_eq!(whose(false, false, None, None, 1), Whose::NoStack);
-        assert_eq!(whose(false, false, None, None, 0), Whose::NoStack);
-        // The card left to userspace for the kernel's own stack, or for
-        // nobody's.
+        assert_eq!(whose(false, false, Some("dhcp"), None, 2), Whose::NoStack);
+        // The card left to userspace for the kernel's own stack.
         assert_eq!(whose(true, false, Some("kernel"), None, 0), Whose::NoStack);
-        assert_eq!(whose(true, false, Some("none"), None, 0), Whose::NoStack);
-        // An address there does not make a stack of it.
-        assert_eq!(whose(false, false, Some("dhcp"), None, 0), Whose::NoStack);
+        assert_eq!(whose(true, false, Some("none"), None, 1), Whose::NoStack);
         assert!(!Whose::NoStack.all());
+        assert!(!Whose::NoStack.alone());
+    }
+
+    #[test]
+    fn a_machine_with_no_card_has_the_served_sockets_and_no_stack() {
+        // No card of the kernel's, none left to userspace.
+        assert_eq!(whose(false, false, None, None, 0), Whose::AllNoCard);
+        // An address there does not make a stack of it.
+        assert_eq!(whose(false, false, Some("dhcp"), None, 0), Whose::AllNoCard);
+        // A card left to userspace that no stack takes is nobody's
+        // network.
+        assert_eq!(whose(true, false, Some("none"), None, 0), Whose::AllNoCard);
+        assert_eq!(whose(false, false, Some("none"), None, 0), Whose::AllNoCard);
+        assert!(Whose::AllNoCard.all());
+        assert!(Whose::AllNoCard.alone());
+        // No other answer is a machine alone.
+        assert!(!Whose::AllSaid.alone());
+        assert!(!Whose::AllOnlyCard.alone());
+        // The kernel's stack and its loopback, for the boot that says so.
+        assert_eq!(whose(false, false, Some("kernel"), None, 0), Whose::NoStack);
+        // And what the boot says of every program still counts first.
+        assert_eq!(
+            whose(false, false, None, Some("asked"), 0),
+            Whose::AskedSaid
+        );
+        assert_eq!(whose(false, false, None, Some("all"), 0), Whose::AllSaid);
     }
 
     #[test]
@@ -233,7 +282,7 @@ mod tests {
             whose(true, false, None, Some("every"), 1),
             Whose::KernelCards(1)
         );
-        assert_eq!(whose(false, false, None, Some(""), 0), Whose::NoStack);
+        assert_eq!(whose(false, false, None, Some(""), 1), Whose::NoStack);
     }
 
     #[test]
