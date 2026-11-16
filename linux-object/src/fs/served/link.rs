@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, 
 use kernel_hal::thread::SyncWait;
 use rcore_fs::vfs::FsError;
 use zircon_object::ipc::Fifo;
-use zircon_object::object::{KernelObject, Signal};
+use zircon_object::object::{KernelObject, KickOn, Signal};
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
 
@@ -382,7 +382,11 @@ impl Link {
                 }
             }
         }
-        drop(fifo);
+        // From the first turn given away, the reply's arrival has this CPU
+        // take the wait up again: see `KickOn`. The FIFO is not held past
+        // that: a link that is closed drops its own.
+        let mut fifo = Some(fifo);
+        let mut _kick = None;
         loop {
             if self.state[slot].load(Ordering::Acquire) == ANSWERED {
                 break;
@@ -398,6 +402,11 @@ impl Link {
             if self.silent_since(since) {
                 self.hung();
                 return Err(Fail::Gone);
+            }
+            if let Some(fifo) = fifo.take() {
+                _kick = Some(KickOn::new(&*fifo, Signal::READABLE | Signal::PEER_CLOSED));
+                // What came before the callback was there raised nothing.
+                continue;
             }
             between_looks(&mut away);
         }

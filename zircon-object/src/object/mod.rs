@@ -109,11 +109,12 @@ use {
     kernel_hal::sync::{HeldByCurrentCpu, Mutex},
 };
 
-pub use {super::*, clock::*, counter::*, handle::*, rights::*, signal::*};
+pub use {super::*, clock::*, counter::*, handle::*, kick::*, rights::*, signal::*};
 
 mod clock;
 mod counter;
 mod handle;
+mod kick;
 mod rights;
 #[allow(hidden_glob_reexports)]
 mod signal;

@@ -645,6 +645,33 @@ impl TaskCollection {
         }
     }
 
+    /// Whether a task that was **woken** is waiting on this queue: the urgent
+    /// lane alone, without the tasks that gave the CPU up or had it taken at
+    /// the end of a slice.
+    ///
+    /// What a kicked weak turn asks before it goes ahead of the queue
+    /// (`runtime::kick_weak_turn`). A parked thread whose answer has come is
+    /// owed the CPU before a task that has just had a slice of it, but not
+    /// before one that was woken and has had none: run ahead of those, it is
+    /// itself preempted for them a moment later, in user mode, and its next
+    /// wait then parks out of an ordinary poll -- which costs a new executor.
+    ///
+    /// Affinity is not looked at, and a collection that is locked answers
+    /// `true`: both err towards waiting, which is bounded
+    /// (`runtime::kick_goes_now`).
+    pub fn has_woken_ready(&self) -> bool {
+        let Some(fc) = self.queue(DEFAULT_PRIORITY) else {
+            return true;
+        };
+        match fc.try_lock() {
+            Some(inner) => inner.pages.iter().any(|page| {
+                let (notified, _yielded, dropped, borrowed) = page.peek_lanes();
+                notified & !dropped & !borrowed != 0
+            }),
+            None => true,
+        }
+    }
+
     /// Number of tasks on this queue that are *runnable right now* (a wake is
     /// published and no executor holds them).
     ///
@@ -1864,6 +1891,29 @@ mod collection_tests {
             served_on,
             URGENT_QUOTA
         );
+    }
+
+    #[test]
+    fn only_a_woken_task_counts_as_woken_and_ready() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let woken = tc.add_task(pending(), None);
+        let yielder = tc.add_task(pending(), None);
+        drain(&tc);
+        assert!(!tc.has_woken_ready(), "nothing is runnable");
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        // A task that gave the CPU up is ready, and is not one that waits
+        // because it was woken.
+        page.mark_yielded(unpack_key(yielder).2);
+        assert!(tc.has_ready());
+        assert!(!tc.has_woken_ready());
+        // One that was woken is, until an executor has it.
+        page.notify(unpack_key(woken).2);
+        assert!(tc.has_woken_ready());
+        page.mark_borrowed(unpack_key(woken).2, true);
+        assert!(!tc.has_woken_ready());
+        page.mark_borrowed(unpack_key(woken).2, false);
+        assert!(tc.has_woken_ready());
     }
 
     #[test]
