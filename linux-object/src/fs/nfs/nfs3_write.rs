@@ -203,22 +203,28 @@ impl SetAttr {
         enc.optional(self.uid, |e, v| e.u32(v));
         enc.optional(self.gid, |e, v| e.u32(v));
         enc.optional(self.size, |e, v| e.u64(v));
-        enc.optional(self.atime, |e, v| encode_set_time(e, v));
-        enc.optional(self.mtime, |e, v| encode_set_time(e, v));
+        encode_set_time(enc, self.atime);
+        encode_set_time(enc, self.mtime);
     }
 }
 
-/// Append a `set_atime`/`set_mtime` body: the `time_how`, then the time only
+/// Append a `set_atime`/`set_mtime`: the `time_how`, then the time only
 /// for `SET_TO_CLIENT_TIME`.
 ///
-/// Careful with the discriminants: `DONT_CHANGE` is 0, `SET_TO_SERVER_TIME`
-/// is 1 and `SET_TO_CLIENT_TIME` is 2. The outer `Option` has already said
-/// "change it", so only 1 and 2 are ever written here — writing 0 would be a
-/// call that silently changed nothing.
-fn encode_set_time(enc: &mut XdrEncoder, when: SetTime) -> &mut XdrEncoder {
+/// These two are **not** optionals like the four fields before them: the
+/// union's own discriminant says "leave it" (`DONT_CHANGE`, 0), "the
+/// server's clock" (`SET_TO_SERVER_TIME`, 1) or "this time"
+/// (`SET_TO_CLIENT_TIME`, 2). Writing a "present" word in front of it, as
+/// for `set_mode3`, shifts everything after by a word: the server then read
+/// an access time as "server's clock", the modification time out of the
+/// words meant for the access time, and a `SETATTR` that set the
+/// modification time came back `NFS3ERR_INVAL`, which is what every
+/// `open(O_CREAT)` on a mount ended in.
+fn encode_set_time(enc: &mut XdrEncoder, when: Option<SetTime>) -> &mut XdrEncoder {
     match when {
-        SetTime::Server => enc.u32(1),
-        SetTime::Client(t) => {
+        None => enc.u32(0),
+        Some(SetTime::Server) => enc.u32(1),
+        Some(SetTime::Client(t)) => {
             enc.u32(2);
             enc.u32(t.sec as u32);
             enc.u32(t.nsec as u32)

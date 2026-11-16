@@ -180,11 +180,10 @@ fn every_sattr3_field_is_encoded_in_the_order_the_protocol_lists_them() {
     assert_eq!(dec.optional(|d| d.u32()).unwrap(), Some(1000));
     assert_eq!(dec.optional(|d| d.u32()).unwrap(), Some(1001));
     assert_eq!(dec.optional(|d| d.u64()).unwrap(), Some(0x1_0000_0000));
-    // set_atime: present, SET_TO_SERVER_TIME, and no time behind it.
-    assert!(dec.bool().unwrap());
+    // set_atime: SET_TO_SERVER_TIME, and no time behind it. The union's
+    // discriminant is the `time_how` itself: there is no "present" word.
     assert_eq!(dec.u32().unwrap(), 1);
-    // set_mtime: present, SET_TO_CLIENT_TIME, and the time.
-    assert!(dec.bool().unwrap());
+    // set_mtime: SET_TO_CLIENT_TIME, and the time.
     assert_eq!(dec.u32().unwrap(), 2);
     assert_eq!(dec.u32().unwrap(), 99);
     assert_eq!(dec.u32().unwrap(), 88);
@@ -221,31 +220,42 @@ fn server_time_carries_no_time_and_client_time_carries_one() {
 }
 
 #[test]
-fn the_client_never_writes_dont_change_inside_a_present_field() {
-    // `time_how` has DONT_CHANGE = 0, and the outer optional has already said
-    // "change it". A 0 there is a call that quietly does nothing.
+fn a_time_is_its_time_how_and_has_no_present_word_before_it() {
+    // RFC 1813: `set_atime` and `set_mtime` are unions switched on
+    // `time_how` (DONT_CHANGE 0, SET_TO_SERVER_TIME 1, SET_TO_CLIENT_TIME
+    // 2), unlike the four `set_*3` before them, which are switched on a
+    // bool. A real server (ganesha) answered `NFS3ERR_INVAL` to the extra
+    // word, so these are the bytes, word by word.
     let fh = handle(8);
-    for when in [
-        SetTime::Server,
-        SetTime::Client(Timespec { sec: 0, nsec: 0 }),
-    ] {
-        let args = encode_setattr(
-            &fh,
-            &SetAttr {
-                mtime: Some(when),
-                ..SetAttr::default()
-            },
-            None,
-        );
+    let words = |attr: &SetAttr| {
+        let args = encode_setattr(&fh, attr, None);
         let mut dec = XdrDecoder::new(&args);
         dec.opaque().unwrap();
-        for _ in 0..4 {
-            assert!(!dec.bool().unwrap());
+        let mut all = alloc::vec::Vec::new();
+        while dec.remaining() > 0 {
+            all.push(dec.u32().unwrap());
         }
-        assert!(!dec.bool().unwrap(), "set_atime absent");
-        assert!(dec.bool().unwrap(), "set_mtime present");
-        assert_ne!(dec.u32().unwrap(), 0, "DONT_CHANGE must not be written");
-    }
+        all
+    };
+    let at = Timespec { sec: 7, nsec: 9 };
+    // mode, uid, gid, size absent; atime; mtime; no guard.
+    assert_eq!(words(&SetAttr::default()), [0, 0, 0, 0, 0, 0, 0]);
+    let mtime = SetAttr {
+        mtime: Some(SetTime::Client(at)),
+        ..SetAttr::default()
+    };
+    assert_eq!(words(&mtime), [0, 0, 0, 0, 0, 2, 7, 9, 0]);
+    let atime = SetAttr {
+        atime: Some(SetTime::Client(at)),
+        ..SetAttr::default()
+    };
+    assert_eq!(words(&atime), [0, 0, 0, 0, 2, 7, 9, 0, 0]);
+    let server = SetAttr {
+        atime: Some(SetTime::Server),
+        mtime: Some(SetTime::Server),
+        ..SetAttr::default()
+    };
+    assert_eq!(words(&server), [0, 0, 0, 0, 1, 1, 0]);
 }
 
 #[test]
