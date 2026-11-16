@@ -80,7 +80,7 @@ pub use runtime::{
     current_executor_abandonable, current_stack_top_looks_null, current_task_abandonable,
     end_voluntary_yield, fault_sp_abandonable, halt_poll_stats, handle_timeout, handoff_enabled,
     handoff_stats, heap_smash_suspected, idle_backlog_kick_stats, irq_on_idle_executor,
-    irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work, need_resched_pending,
+    irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work, kick_weak_turn, need_resched_pending,
     note_heap_smash_suspected, quota_passed_urgent, resched_ipis_sent, run_until_idle,
     runnable_task_count, sched_rescue_kick_stats, sched_steal_stats, sched_weak_stats, sched_yield,
     set_halt_poll_ns, set_handoff, set_idle_callback, set_idle_work_hook, set_now_ns_hook,

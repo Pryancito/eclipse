@@ -52,7 +52,7 @@ use kernel_hal::drivers::prelude::{Device, DeviceError, DeviceResult};
 use kernel_hal::drivers::scheme::{BlockReadFuture, BlockScheme, IoSnapshot, IoStats, Scheme};
 use kernel_hal::thread::SyncWait;
 use zircon_object::ipc::Fifo;
-use zircon_object::object::{KernelObject, Rights, Signal};
+use zircon_object::object::{KernelObject, KickOn, Rights, Signal};
 use zircon_object::task::Process;
 use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
@@ -360,6 +360,9 @@ impl Link {
     /// long: a look that finds nothing makes the next waits sleep at once.
     fn wait_yielding(&self, parts: &[Part], deadline: u64) -> DeviceResult {
         let mut away = SyncWait::new();
+        // From the first turn given away, a reply's arrival has this CPU
+        // take the wait up again: see `KickOn`.
+        let mut kick = None;
         loop {
             let mut pending = false;
             let mut failed = false;
@@ -385,6 +388,15 @@ impl Link {
                 return Err(DeviceError::IoError);
             }
             if self.pump() == 0 {
+                if kick.is_none() {
+                    kick = Some(KickOn::new(
+                        &*self.fifo,
+                        Signal::READABLE | Signal::PEER_CLOSED,
+                    ));
+                    // What came before the callback was there raised
+                    // nothing.
+                    continue;
+                }
                 between_looks(&mut away);
             }
         }

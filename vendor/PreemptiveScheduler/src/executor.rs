@@ -2071,6 +2071,9 @@ impl Executor {
         let mut _cr3_pin: Option<(Arc<Task>, usize)> = None;
         let mut polls_since_weak = 0u64;
         let mut barren_weak_turns = 0u32;
+        // Passes of this loop a kicked weak turn has let woken tasks go
+        // first.
+        let mut kick_waits = 0u32;
         // The last task this loop released still runnable (preempted or
         // yielded), until the next pick says whether it was set aside for a
         // different one. See `runtime::kick_idle_for_set_aside`.
@@ -2109,17 +2112,41 @@ impl Executor {
             // back with no fewer frames parked and double the interval, to a
             // cap: bounded cost when the frames are stuck, unchanged response
             // when they are not.
+            //
+            // And a turn that was asked for is given ahead of the cadence:
+            // whoever delivered what a parked thread waits for said so (see
+            // `runtime::kick_weak_turn`), and the frame can finish now. It
+            // goes ahead of tasks that have just had the CPU, and lets
+            // tasks that were woken and wait for it go first, but only a
+            // couple of them (`runtime::WEAK_KICK_PATIENCE`).
             let waiting = crate::runtime::weak_waiting_here();
             let state = self.state.load(Ordering::Acquire);
             if state != ExecutorState::WEAK as u8
                 && state != ExecutorState::KILLED as u8
-                && crate::runtime::weak_turn_due(
+                && waiting != 0
+                && crate::runtime::weak_turn_wanted(
                     waiting,
                     polls_since_weak,
                     crate::runtime::weak_turn_interval(
                         barren_weak_turns,
                         crate::runtime::WEAK_TURN_EVERY,
                     ),
+                    {
+                        let now = crate::runtime::weak_kick_pending()
+                            && crate::runtime::kick_goes_now(
+                                self.task_collection.has_woken_ready(),
+                                kick_waits,
+                            );
+                        if now {
+                            kick_waits = 0;
+                            crate::runtime::take_weak_kick()
+                        } else {
+                            if crate::runtime::weak_kick_pending() {
+                                kick_waits = kick_waits.saturating_add(1);
+                            }
+                            false
+                        }
+                    },
                 )
             {
                 polls_since_weak = 0;
@@ -2347,6 +2374,10 @@ impl Executor {
                 } else if weak_executor != 0 {
                     debug!("return to runtime and run weak executor");
                     SCHED_WEAK_YIELD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // This is the turn a kick asks for: one left standing
+                    // would buy the next frame to park a turn before
+                    // anything it waits for could have run.
+                    let _ = crate::runtime::take_weak_kick();
                     critical.set(false);
                     crate::runtime::sched_yield();
                     critical.set(true);

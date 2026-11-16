@@ -247,6 +247,44 @@ impl SyncWait {
     }
 }
 
+/// Tells a CPU that what a [`SyncWait`] on it waits for has come: taken
+/// by the waiter before it gives the CPU away, used by whoever delivers
+/// (a signal callback on the object the answer arrives through).
+///
+/// Between its turns a waiter is not a task anyone can wake: it is a poll
+/// frozen half way, which its CPU takes up again when it has nothing else
+/// to do or, with other work queued, once every so many polls. With a
+/// process computing on that CPU each of those polls is a time slice, and
+/// a request answered in half a millisecond was seen 200 ms later. A kick
+/// has the CPU take the frozen polls up before its next task.
+///
+/// A kick that finds nobody waiting does nothing, so one too many is
+/// harmless; the waiter still looks for itself on every turn, so one too
+/// few costs time and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncKick {
+    cpu: usize,
+}
+
+impl SyncKick {
+    /// For a wait of the thread that calls, on the CPU it runs on. Take it
+    /// before the first turn, with nothing that may give the CPU away in
+    /// between: a parked thread is taken up again on the CPU it parked on.
+    pub fn here() -> Self {
+        Self {
+            cpu: crate::cpu::cpu_id() as usize,
+        }
+    }
+
+    /// Have that CPU look at its waiters before it takes another task.
+    pub fn kick(&self) {
+        #[cfg(target_os = "none")]
+        executor::kick_weak_turn(self.cpu);
+        #[cfg(not(target_os = "none"))]
+        let _ = self.cpu;
+    }
+}
+
 #[cfg(target_os = "none")]
 impl Drop for SyncWait {
     fn drop(&mut self) {

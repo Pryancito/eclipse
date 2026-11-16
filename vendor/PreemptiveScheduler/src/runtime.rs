@@ -830,6 +830,63 @@ pub(crate) fn weak_waiting_here() -> u64 {
     WEAK_WAITING[cpu].0.load(Ordering::Relaxed)
 }
 
+/// A parked weak executor on each CPU has been told that what it waits for
+/// is there.
+///
+/// The cadence below is for a frame nobody knows anything about. A thread
+/// that parked itself waiting for an answer (a `SyncWait`: a request to a
+/// filesystem or disk server) is a different case: the moment the answer
+/// arrives, the frame can finish, and making it wait out 8 polls -- each a
+/// whole time slice when the other task on the CPU is computing -- turned a
+/// half-millisecond request into 200 ms. Whoever delivers the answer sets
+/// this, and the strong executor gives the frames a turn before the next
+/// task that is not itself waiting because it was woken, and after a couple
+/// of those at most (see [`kick_goes_now`]).
+static WEAK_KICK: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
+
+/// Ask `cpu` to give its parked weak executors a turn before its next task.
+/// From any CPU, any context: one store.
+pub fn kick_weak_turn(cpu: usize) {
+    if cpu < MAX_CORE_NUM {
+        WEAK_KICK[cpu].0.store(1, Ordering::Release);
+    }
+}
+
+/// How many woken tasks a kicked weak turn lets go first.
+///
+/// Going ahead of a task that was woken has a price: the parked thread is
+/// preempted for it a moment later, in user mode, and its next wait parks
+/// out of an ordinary poll, which costs a new executor (a filesystem
+/// benchmark on a quiet machine took 7 % longer that way). Waiting for all
+/// of them has another: beside a loop that starts processes there is always
+/// one more, and the turn came only by the cadence, 130 ms a request. Two
+/// is the server that answered finishing its turn and the driver under it.
+pub(crate) const WEAK_KICK_PATIENCE: u32 = 2;
+
+/// Whether a kicked weak turn is given on this pass: when no woken task is
+/// waiting, or when `waited` passes have already been given to them.
+pub(crate) fn kick_goes_now(woken_ready: bool, waited: u32) -> bool {
+    !woken_ready || waited >= WEAK_KICK_PATIENCE
+}
+
+/// Whether a turn has been asked for on this CPU and not yet taken.
+#[inline]
+pub(crate) fn weak_kick_pending() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    cpu < MAX_CORE_NUM && WEAK_KICK[cpu].0.load(Ordering::Relaxed) != 0
+}
+
+/// Whether a turn was asked for on this CPU; asking is forgotten by the
+/// answer. A relaxed load of this CPU's own line when nothing was asked.
+#[inline]
+pub(crate) fn take_weak_kick() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM || WEAK_KICK[cpu].0.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    WEAK_KICK[cpu].0.swap(0, Ordering::AcqRel) != 0
+}
+
 /// Polls the strong executor may take before a parked weak executor gets a turn.
 ///
 /// Small, because what is waiting is a task that cannot run at all until the
@@ -862,6 +919,12 @@ pub(crate) fn weak_turn_interval(barren_turns: u32, every: u64) -> u64 {
 /// yielding, and yielding every pass -- are a starved task and a starved queue.
 pub(crate) fn weak_turn_due(waiting: u64, polls_since: u64, every: u64) -> bool {
     waiting != 0 && polls_since >= every
+}
+
+/// [`weak_turn_due`], or a turn that was asked for (see [`kick_weak_turn`]):
+/// with frames parked, a kick is a turn now, whatever the cadence says.
+pub(crate) fn weak_turn_wanted(waiting: u64, polls_since: u64, every: u64, kicked: bool) -> bool {
+    waiting != 0 && (kicked || polls_since >= every)
 }
 
 fn note_weak_live(live: usize) {
@@ -2786,6 +2849,14 @@ pub fn run_until_idle() -> bool {
                 report_switch_bounce_if_any();
             }
         }
+        // Count again what is still parked, now that they have run: the
+        // strong executor reads the count on its side of the switch to tell
+        // a turn that freed a frame from one that did not. Published only
+        // before the pass, a frame that finished in it was still counted,
+        // every turn looked barren, and the cadence doubled turn after turn
+        // -- 16, 32, 64, 128 polls -- for a thread that was finishing a
+        // request each time.
+        runtime.reclaim_finished_weaks();
     }
 }
 
@@ -4286,7 +4357,51 @@ mod weak_turn_tests {
     //! [`weak_turn_due`], the condition that decides whether a parked weak
     //! executor gets the CPU while the run queue still has work.
 
-    use super::{weak_turn_due, weak_turn_interval, WEAK_TURN_EVERY, WEAK_TURN_MAX_BACKOFF};
+    use super::{
+        kick_weak_turn, take_weak_kick, weak_turn_due, weak_turn_interval, weak_turn_wanted,
+        WEAK_TURN_EVERY, WEAK_TURN_MAX_BACKOFF,
+    };
+
+    #[test]
+    fn a_kick_is_a_turn_now_but_only_with_a_frame_parked() {
+        assert!(weak_turn_wanted(1, 0, WEAK_TURN_EVERY, true));
+        assert!(weak_turn_wanted(3, 0, WEAK_TURN_EVERY << 6, true));
+        assert!(!weak_turn_wanted(0, 0, WEAK_TURN_EVERY, true));
+        assert!(!weak_turn_wanted(0, u64::MAX, WEAK_TURN_EVERY, true));
+        // Without one it is the cadence, unchanged.
+        for polls in 0..2 * WEAK_TURN_EVERY {
+            assert_eq!(
+                weak_turn_wanted(1, polls, WEAK_TURN_EVERY, false),
+                weak_turn_due(1, polls, WEAK_TURN_EVERY)
+            );
+        }
+    }
+
+    #[test]
+    fn a_kicked_turn_lets_a_couple_of_woken_tasks_go_first_and_no_more() {
+        use super::{kick_goes_now, WEAK_KICK_PATIENCE};
+        assert!(kick_goes_now(false, 0), "nobody woken: now");
+        for waited in 0..WEAK_KICK_PATIENCE {
+            assert!(!kick_goes_now(true, waited));
+        }
+        assert!(kick_goes_now(true, WEAK_KICK_PATIENCE));
+        assert!(kick_goes_now(true, u32::MAX));
+    }
+
+    #[test]
+    fn a_kick_is_taken_once() {
+        let cpu = crate::arch::cpu_id() as usize;
+        // Whatever an earlier test left.
+        let _ = take_weak_kick();
+        assert!(!take_weak_kick());
+        kick_weak_turn(cpu);
+        kick_weak_turn(cpu);
+        assert!(take_weak_kick());
+        assert!(!take_weak_kick());
+        // A CPU that does not exist is nobody's turn.
+        kick_weak_turn(usize::MAX);
+        assert!(!take_weak_kick());
+    }
 
     /// A turn that frees a frame keeps the fast cadence; one that frees nothing
     /// doubles it, and the doubling stops rather than running away.
