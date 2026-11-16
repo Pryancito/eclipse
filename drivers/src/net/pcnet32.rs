@@ -1403,10 +1403,21 @@ impl PciDriver for Pcnet32DriverPci {
         };
 
         let name = crate::net::next_eth_ifname();
-        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+        // A PCnet has no MSI: it raises the legacy line of its slot, or
+        // nothing tells this driver of a frame.
+        let line = match irq {
+            Some(_) => None,
+            None => crate::net::pci_intx_line(dev.pic_interrupt_line, dev.interrupt_pin),
+        };
+        let vector = irq.map(|idx| idx + 32).or(line).unwrap_or(0);
         let io = Box::new(unsafe { IoSpace::new(base) });
-        let iface = init(name, vector, io, 0)?;
-        Ok(Device::Net(Arc::new(iface)))
+        let iface = Arc::new(init(name, vector, io, 0)?);
+        if line.is_some() {
+            crate::net::pci_note_pending_intx(vector, iface.clone());
+        } else if vector != 0 {
+            crate::net::pci_note_pending_msi(vector, iface.clone());
+        }
+        Ok(Device::Net(iface))
     }
 }
 

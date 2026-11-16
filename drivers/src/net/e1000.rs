@@ -1108,9 +1108,20 @@ impl PciDriver for E1000DriverPci {
             // Through the base the mapper returns: see `bus::resolve_window`.
             let vaddr = crate::bus::resolve_window(mapper, addr as usize, 4096 * 8, 0);
             let name = crate::net::next_eth_ifname();
-            let vector = irq.map(|idx| idx + 32).unwrap_or(0);
-            let iface = init(name, vector, vaddr, len as usize, 0)?;
-            Ok(Device::Net(Arc::new(iface)))
+            // An 82540 has no MSI (QEMU's has none): it raises the legacy
+            // line of its slot, or nothing tells this driver of a frame.
+            let line = match irq {
+                Some(_) => None,
+                None => crate::net::pci_intx_line(dev.pic_interrupt_line, dev.interrupt_pin),
+            };
+            let vector = irq.map(|idx| idx + 32).or(line).unwrap_or(0);
+            let iface = Arc::new(init(name, vector, vaddr, len as usize, 0)?);
+            if line.is_some() {
+                crate::net::pci_note_pending_intx(vector, iface.clone());
+            } else if vector != 0 {
+                crate::net::pci_note_pending_msi(vector, iface.clone());
+            }
+            Ok(Device::Net(iface))
         } else {
             Err(crate::DeviceError::NotSupported)
         }

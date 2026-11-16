@@ -137,8 +137,105 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
                 Err(e) => crate::klog_warn!("[net] failed to register IRQ vector {}: {:?}", v, e),
             }
         }
+        drop(q);
+        finish_intx_registrations(&host);
     }
     Ok(())
+}
+
+/// Cards that have no MSI and raise the legacy line of their slot (INTx),
+/// by the line: see [`pci_intx_line`].
+static INTX_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
+/// `pci.intx=0`: see [`set_pci_intx_enabled`].
+static INTX_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a card with no MSI is given the legacy interrupt line of its
+/// slot ([`pci_intx_line`]). It is unless the boot says `pci.intx=0`, which
+/// leaves such a card with no interrupt at all, as it was before: the
+/// kernel's own stack looks at it whenever a program waits on a socket,
+/// and it is not lent. The way out for a machine where another device
+/// holds the same line and nobody answers for it.
+pub fn set_pci_intx_enabled(on: bool) {
+    INTX_OFF.store(!on, Ordering::Release);
+}
+
+/// The interrupt line a PCI card with no MSI raises, as the number its
+/// handler is registered with ([`pci_note_pending_intx`]) and called with.
+///
+/// It is the line the firmware wrote in the card's configuration space:
+/// the ISA interrupt its slot's pin is steered to, which the I/O APIC has
+/// on the pin of the same number. That is how QEMU's `e1000` and `pcnet`
+/// interrupt, which have no MSI; without it nothing told their drivers of
+/// a frame, and only the kernel's own stack, which looks at its cards
+/// whenever a program waits on a socket, could use them. `None` for a card
+/// with no interrupt pin, for a line the firmware did not give (0, 255) or
+/// that is no ISA line, off x86_64, and on a boot that says `pci.intx=0`.
+pub fn pci_intx_line<Pin>(line: u8, pin: Option<Pin>) -> Option<usize> {
+    if !cfg!(target_arch = "x86_64") || INTX_OFF.load(Ordering::Acquire) {
+        return None;
+    }
+    pin?;
+    // 2 is the cascade of the two 8259s and no line of a device's.
+    matches!(line, 1 | 3..=15).then_some(line as usize)
+}
+
+/// `dev` raises the legacy line `line` ([`pci_intx_line`]): its handler is
+/// registered, with any other card's on the same line, when the interrupt
+/// controller is up ([`pci_finish_msi_registrations`]).
+pub fn pci_note_pending_intx(line: usize, dev: Arc<dyn Scheme>) {
+    let mut pending = INTX_PENDING.lock();
+    if !pending
+        .iter()
+        .any(|(l, d)| *l == line && core::ptr::eq(Arc::as_ptr(d), Arc::as_ptr(&dev)))
+    {
+        pending.push((line, dev));
+    }
+}
+
+/// The lines of [`INTX_PENDING`], each with the cards that share it.
+fn intx_lines(pending: Vec<(usize, Arc<dyn Scheme>)>) -> Vec<(usize, Vec<Arc<dyn Scheme>>)> {
+    let mut lines: Vec<(usize, Vec<Arc<dyn Scheme>>)> = Vec::new();
+    for (line, dev) in pending {
+        match lines.iter_mut().find(|(l, _)| *l == line) {
+            Some((_, devs)) => devs.push(dev),
+            None => lines.push((line, alloc::vec![dev])),
+        }
+    }
+    lines
+}
+
+fn finish_intx_registrations(host: &Arc<dyn IrqScheme>) {
+    use crate::prelude::{IrqPolarity, IrqTriggerMode};
+    let pending = core::mem::take(&mut *INTX_PENDING.lock());
+    for (line, devs) in intx_lines(pending) {
+        // A PCI line is held down until its card is answered, and shared:
+        // every card on it is asked, and each knows by its own registers
+        // whether it was the one.
+        let names: Vec<&str> = devs.iter().map(|d| d.name()).collect();
+        let names = names.join(",");
+        let handler: crate::scheme::IrqHandler = Arc::new(move || {
+            for dev in &devs {
+                dev.handle_irq(line);
+            }
+        });
+        let done = host
+            .configure(line, IrqTriggerMode::Level, IrqPolarity::ActiveLow)
+            .and_then(|_| host.register_handler(line, handler))
+            .and_then(|_| host.unmask(line));
+        match done {
+            Ok(_) => crate::klog_info!(
+                "[net] legacy interrupt line {} registered for {} (pci.intx=0 leaves it out)",
+                line,
+                names
+            ),
+            Err(e) => crate::klog_warn!(
+                "[net] failed to register legacy interrupt line {} for {}: {:?}",
+                line,
+                names,
+                e
+            ),
+        }
+    }
 }
 
 // The RTL8211F PHY/GMAC pair only exists on the D1, so neither the driver nor
@@ -432,6 +529,8 @@ mod tests {
         DEFERRED_PACKETS.lock().clear();
         DEFERRED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
         MSI_PENDING.lock().clear();
+        INTX_PENDING.lock().clear();
+        INTX_OFF.store(false, Ordering::SeqCst);
         *MSI_IRQ_HOST.lock() = None;
         SEEN.lock().clear();
     }
@@ -681,6 +780,127 @@ mod tests {
             self.unregistered.lock().push(irq);
             Ok(())
         }
+    }
+
+    /// An interrupt controller with lines: it keeps how each was set up and
+    /// the handler it was given, to raise the line with.
+    #[derive(Default)]
+    struct LineIntc {
+        configured: Mutex<Vec<(usize, alloc::string::String)>>,
+        handlers: Mutex<Vec<(usize, crate::scheme::IrqHandler)>>,
+        unmasked: Mutex<Vec<usize>>,
+    }
+
+    impl Scheme for LineIntc {
+        fn name(&self) -> &str {
+            "line-intc"
+        }
+    }
+
+    impl IrqScheme for LineIntc {
+        fn is_valid_irq(&self, _irq: usize) -> bool {
+            true
+        }
+        fn mask(&self, _irq: usize) -> DeviceResult {
+            Ok(())
+        }
+        fn unmask(&self, irq: usize) -> DeviceResult {
+            self.unmasked.lock().push(irq);
+            Ok(())
+        }
+        fn configure(
+            &self,
+            irq: usize,
+            tm: crate::prelude::IrqTriggerMode,
+            pol: crate::prelude::IrqPolarity,
+        ) -> DeviceResult {
+            self.configured
+                .lock()
+                .push((irq, alloc::format!("{:?}/{:?}", tm, pol)));
+            Ok(())
+        }
+        fn register_handler(&self, irq: usize, h: crate::scheme::IrqHandler) -> DeviceResult {
+            self.handlers.lock().push((irq, h));
+            Ok(())
+        }
+        fn unregister(&self, _irq: usize) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    /// A card that counts the interrupts it is asked about, by line.
+    struct Asked(&'static str, Mutex<Vec<usize>>);
+    impl Scheme for Asked {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn handle_irq(&self, irq: usize) {
+            self.1.lock().push(irq);
+        }
+    }
+
+    #[test]
+    fn the_line_of_a_card_with_no_msi_is_the_one_the_firmware_wrote() {
+        alone_with_the_statics(|| {
+            if !cfg!(target_arch = "x86_64") {
+                assert_eq!(pci_intx_line(11, Some(1u8)), None);
+                return;
+            }
+            assert_eq!(pci_intx_line(11, Some(1u8)), Some(11));
+            assert_eq!(pci_intx_line(5, Some(4u8)), Some(5));
+            // No pin, no line: the card raises nothing.
+            assert_eq!(pci_intx_line::<u8>(11, None), None);
+            // A line the firmware did not give, the cascade, and what is
+            // no ISA line.
+            for line in [0u8, 2, 16, 33, 255] {
+                assert_eq!(pci_intx_line(line, Some(1u8)), None, "line {}", line);
+            }
+            // And the boot that wants none of it.
+            set_pci_intx_enabled(false);
+            assert_eq!(pci_intx_line(11, Some(1u8)), None);
+            set_pci_intx_enabled(true);
+            assert_eq!(pci_intx_line(11, Some(1u8)), Some(11));
+        })
+    }
+
+    #[test]
+    fn the_cards_of_a_shared_line_are_all_asked_when_it_is_raised() {
+        alone_with_the_statics(|| {
+            let intc = Arc::new(LineIntc::default());
+            pci_set_irq_host(intc.clone());
+            let a = Arc::new(Asked("eth0", Mutex::new(Vec::new())));
+            let b = Arc::new(Asked("eth1", Mutex::new(Vec::new())));
+            let c = Arc::new(Asked("eth2", Mutex::new(Vec::new())));
+            pci_note_pending_intx(11, a.clone());
+            pci_note_pending_intx(11, b.clone());
+            // Noted twice, asked once.
+            pci_note_pending_intx(11, a.clone());
+            pci_note_pending_intx(10, c.clone());
+            pci_finish_msi_registrations().expect("the walk failed");
+
+            // One handler a line, level and active low as a PCI line is,
+            // set up before the handler is there, and then unmasked.
+            assert_eq!(
+                intc.configured.lock().clone(),
+                std::vec![
+                    (11, alloc::string::String::from("Level/ActiveLow")),
+                    (10, alloc::string::String::from("Level/ActiveLow")),
+                ]
+            );
+            assert_eq!(intc.unmasked.lock().clone(), std::vec![11, 10]);
+            let handlers = intc.handlers.lock();
+            assert_eq!(handlers.len(), 2);
+            (handlers[0].1)();
+            assert_eq!(a.1.lock().clone(), std::vec![11]);
+            assert_eq!(b.1.lock().clone(), std::vec![11]);
+            assert!(c.1.lock().is_empty());
+            (handlers[1].1)();
+            assert_eq!(c.1.lock().clone(), std::vec![10]);
+            // The walk took them: a second one registers nothing more.
+            drop(handlers);
+            pci_finish_msi_registrations().expect("the walk failed");
+            assert_eq!(intc.handlers.lock().len(), 2);
+        })
     }
 
     /// A NIC, as far as this queue is concerned.
