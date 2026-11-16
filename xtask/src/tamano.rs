@@ -152,6 +152,9 @@ const PASADOS: &[(&str, usize)] = &[
     // `main_tests/` (730 líneas, ni una de producción) para que cupiera el
     // menú de hunter, y quedó en 4576.
     ("tools/lunarbar/src/main.rs", 4750),
+    // 4250: master llegó a 4005 con el techo general en 4000 (rojo antes de
+    // #2631, que no toca este fichero). Lo que toca es partirlo.
+    ("loader/src/linux.rs", 4250),
     (
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
         4750,
