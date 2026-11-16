@@ -311,7 +311,7 @@ impl Socket for ServedIcmpSocket {
         }
         // Nothing leaves the machine while no stack serves.
         if self.link.is_down() {
-            return Err(LxError::ENETDOWN);
+            return Err(self.link.down());
         }
         // A UDP datagram's header is as long as an echo's, and the stack
         // does not fragment either.

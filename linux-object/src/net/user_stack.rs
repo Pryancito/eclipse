@@ -1395,6 +1395,9 @@ pub struct StackLink {
     /// The IPv6 addresses of the card of the stack that serves now: see
     /// [`sixes`](Self::sixes).
     sixes: Arc<Sixes>,
+    /// Whether no stack is expected, ever: see
+    /// [`alone`](Self::alone).
+    alone: AtomicBool,
 }
 
 /// A stack process's turn at serving: what the task that reads its
@@ -1543,6 +1546,7 @@ impl StackLink {
             carried: Arc::new(Carried::default()),
             counted: Mutex::new([0; COUNTS]),
             sixes: Arc::new(Sixes::default()),
+            alone: AtomicBool::new(false),
         })
     }
 
@@ -1692,6 +1696,25 @@ impl StackLink {
     /// to go (`ENETDOWN`). What stays in it does not notice.
     pub fn is_down(&self) -> bool {
         !self.up.load(Ordering::Acquire)
+    }
+
+    /// The machine has no network card, so no stack is expected: its
+    /// sockets are these all the same, for what its programs say to each
+    /// other, and what would leave it has no way out and never will
+    /// (`ENETUNREACH`), which is not a network that is down for now.
+    pub fn alone(&self, on: bool) {
+        self.alone.store(on, Ordering::Release);
+    }
+
+    /// What a socket is told when no stack serves and it wants out of the
+    /// machine: `ENETDOWN` where one is expected, `ENETUNREACH` on a
+    /// machine with no card ([`alone`](Self::alone)).
+    pub fn down(&self) -> LxError {
+        if self.alone.load(Ordering::Acquire) {
+            LxError::ENETUNREACH
+        } else {
+            LxError::ENETDOWN
+        }
     }
 
     /// Whether the stack of that turn still serves.
@@ -1924,7 +1947,7 @@ impl StackLink {
     /// when it has [`SEND_BACKLOG`] unread and `urgent` is not set.
     fn tell(&self, data: Vec<u8>, urgent: bool) -> LxResult<()> {
         let Some((channel, turn)) = self.current() else {
-            return Err(LxError::ENETDOWN);
+            return Err(self.down());
         };
         if !urgent && channel.peer_pending() >= SEND_BACKLOG {
             return Err(LxError::ENOBUFS);
@@ -2175,7 +2198,7 @@ impl ServedUdpSocket {
             return Err(LxError::EINVAL);
         }
         if self.link.is_down() {
-            return Err(LxError::ENETDOWN);
+            return Err(self.link.down());
         }
         if !sixes.reaches(&addr) {
             return Err(LxError::ENETUNREACH);
@@ -2364,7 +2387,7 @@ impl Socket for ServedUdpSocket {
         }
         // Nothing leaves the machine while no stack serves.
         if self.link.is_down() {
-            return Err(LxError::ENETDOWN);
+            return Err(self.link.down());
         }
         if data.len() > self.link.max_datagram.load(Ordering::Acquire) {
             return Err(LxError::EMSGSIZE);

@@ -2850,6 +2850,30 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_alone_joins_its_programs_and_has_no_way_out() {
+        let _lock = LOCK.lock();
+        let link = StackLink::new();
+        link.alone(true);
+        let l = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&l, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&l, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        // Its programs find each other with no stack, now and for good.
+        let c = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&c, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(connect(&c, at(HERE, 8080)), Ok(0));
+        // What would leave has no way to: not a network that is down
+        // for now, and nothing is left on the socket for later.
+        let out = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&out, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(connect(&out, at(HOST, 80)), Err(LxError::ENETUNREACH));
+        assert_eq!(Socket::take_so_error(&out), 0);
+        // A machine that is given a card after all is as any other.
+        link.alone(false);
+        assert_eq!(connect(&out, at(HOST, 80)), Err(LxError::ENETDOWN));
+    }
+
+    #[test]
     fn a_listener_from_before_the_stack_is_told_when_it_comes() {
         let _lock = LOCK.lock();
         let link = StackLink::new();
