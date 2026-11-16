@@ -847,28 +847,42 @@ fn serve_e1000e(host: &Arc<Host>, own: &Own, card: &mut e1000e::Taker) -> String
     }
 }
 
-/// Carry the frames of a card the kernel lends through the stack, for as
-/// long as the loan lasts. Why it stopped.
+/// Carry the frames of a card the kernel has lent through the stack, for
+/// as long as the loan lasts. Why it ended.
 ///
-/// Asleep in the kernel between bursts (`eclipse_net_lent_turn`), which
+/// Asleep in the kernel between turns (`eclipse_net_lent_turn`), which
 /// comes back with the frames that arrived, each in a receive slot of this
 /// process's window, and with the transmit slots of frames that had to
 /// wait for room on the card. After a turn the kernel gets back the
 /// receive slots that were read and the frames to send, when they are
-/// worth the call ([`Port::due`]). Nothing is kept for a program's answer
-/// ([`HOLD`]), as with a card of this process's own ([`serve_card`]): a
-/// frame given to the kernel is on the card when the call returns, and
-/// wakes nobody.
+/// worth the call ([`Port::due`]).
+///
+/// A turn that brought bytes to a program that is answering keeps what it
+/// has to send ([`HOLD`]), as with a driver that is another process: the
+/// acknowledgement goes with the answer, in the one call the thread that
+/// carries the answer makes, and this thread goes back to sleep without a
+/// call of its own. It sleeps no longer than [`HOLD`] then, and sends what
+/// it kept when no answer came. Sent at once, the acknowledgement was a
+/// call and a frame more for each echo whenever this thread got to it
+/// before the answer did, which a boot either did every time or never: a
+/// thousand echoes of 56 bytes with a host took 620 us each or 450 (QEMU
+/// counting instructions, one CPU, e1000).
 fn serve_lent(host: &Arc<Host>, card: &Borrowed) -> String {
     let mut got = [Msg::default(); TURN];
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
+    let mut hold = false;
     loop {
-        let n = match card.lent.turn(&mut got, 0, true, true) {
+        let limit = if hold { (HOLD / 1000) as u32 } else { 0 };
+        let n = match card.lent.turn_for(&mut got, 0, true, true, limit) {
             Ok(n) => n,
             Err(e) => return format!("net_lent_turn: {e}"),
         };
-        carried(host, &got[..n], &mut data);
+        // Time up with nothing arrived: what was kept goes now.
+        hold = carried(host, &got[..n], &mut data) && n != 0;
+        if hold {
+            continue;
+        }
         while card.give(host, &mut msgs, true) {
             turn(host, locked(&host.shared), &mut data);
         }

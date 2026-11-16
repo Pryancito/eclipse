@@ -44,7 +44,10 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::drivers::net::lent::FrameTaker;
 use kernel_hal::drivers::net::served::frame_len_ok;
@@ -64,6 +67,9 @@ pub(super) const LENT_WAIT: usize = super::ECLIPSE_LENT_WAIT;
 /// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN) flag: answer
 /// with the frames that arrived too, not only with transmit slots.
 pub(super) const LENT_FRAMES: usize = super::ECLIPSE_LENT_FRAMES;
+/// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN): where in the
+/// flags the longest sleep starts, in microseconds.
+pub(super) const LENT_LIMIT_SHIFT: usize = super::ECLIPSE_LENT_LIMIT_SHIFT;
 
 /// The most receive slots a window is taken with, as the stack's port has
 /// it.
@@ -550,11 +556,40 @@ pub(super) fn give_then(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Turn
     })
 }
 
+/// Over when either of two is: a wait and its limit.
+struct Either<A, B> {
+    one: Pin<A>,
+    other: Pin<B>,
+}
+
+impl<A, B> Future for Either<A, B>
+where
+    A: core::ops::DerefMut<Target: Future> + Unpin,
+    B: core::ops::DerefMut<Target: Future> + Unpin,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        if this.one.as_mut().poll(cx).is_ready() || this.other.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 impl Turn {
     /// The answer: what there is to say now, or with [`LENT_WAIT`] what
     /// there is once there is something.
     pub(super) async fn wait_then_answer(self) -> ZxResult {
         let frames = self.flags & LENT_FRAMES != 0;
+        // The borrower keeps what it has to send a moment, for a program's
+        // answer to go with it: it sleeps no longer than that.
+        let until = match (self.flags >> LENT_LIMIT_SHIFT) as u64 {
+            0 => None,
+            limit => Some(kernel_hal::timer::timer_now() + Duration::from_micros(limit)),
+        };
         let mut out: Vec<u8> = Vec::new();
         loop {
             // Only a turn that takes frames looks: one that does not would
@@ -598,7 +633,19 @@ impl Turn {
                 break;
             }
             let object: Arc<dyn KernelObject> = self.card.clone();
-            object.wait_signal(Signal::READABLE).await;
+            match until {
+                None => {
+                    object.wait_signal(Signal::READABLE).await;
+                }
+                Some(until) if kernel_hal::timer::timer_now() >= until => break,
+                Some(until) => {
+                    Either {
+                        one: core::pin::pin!(object.wait_signal(Signal::READABLE)),
+                        other: core::pin::pin!(kernel_hal::thread::sleep_until(until)),
+                    }
+                    .await
+                }
+            }
         }
         if !out.is_empty() {
             UserOutPtr::<u8>::from(self.msgs)

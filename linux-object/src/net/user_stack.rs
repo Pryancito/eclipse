@@ -1386,6 +1386,11 @@ pub struct StackLink {
     /// is told, and while a new stack is told of all that have: so each
     /// is told once. Taken before any other lock here.
     telling: Mutex<()>,
+    /// Held while the stack's messages are read and given to their
+    /// sockets ([`pump`](Self::pump)), so that two that read at once, the
+    /// link's own task and a program that is about to wait, give them in
+    /// the order the stack sent them.
+    pumping: Mutex<()>,
     /// What the stacks' card has carried, all of them: see
     /// [`carried`](Self::carried).
     carried: Arc<Carried>,
@@ -1543,6 +1548,7 @@ impl StackLink {
             address: AtomicU32::new(0),
             table: Mutex::new(Table::default()),
             telling: Mutex::new(()),
+            pumping: Mutex::new(()),
             carried: Arc::new(Carried::default()),
             counted: Mutex::new([0; COUNTS]),
             sixes: Arc::new(Sixes::default()),
@@ -1738,6 +1744,12 @@ impl StackLink {
     }
 
     /// Read what the stack that serves now has sent.
+    ///
+    /// The link's task does it when the stack's channel has something, and
+    /// so does a program before it sleeps for what a socket has not got:
+    /// the stack may have sent it already, with the task not yet run, and
+    /// then the program has it without sleeping, without that task's turn
+    /// and without being woken.
     pub fn pump(&self) {
         if let Some((channel, turn)) = self.current() {
             self.pump_on(&channel, turn);
@@ -1747,6 +1759,7 @@ impl StackLink {
     /// Read what the stack of that turn has sent: each datagram onto its
     /// socket's queue, each event to its socket.
     fn pump_on(&self, channel: &Arc<Channel>, turn: u64) {
+        let _pumping = self.pumping.lock();
         while self.serves(turn) {
             match channel.read() {
                 Ok(msg) => self.take(&msg.data),

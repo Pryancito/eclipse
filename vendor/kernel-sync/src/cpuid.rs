@@ -217,6 +217,7 @@ impl LogicalIdMap {
     ///
     /// The registered set is authoritative and costs one relaxed load of a
     /// line that is read-only in the steady state.
+    #[inline]
     pub fn accepts_published(&self, logical: u8) -> bool {
         let registered = self.registered.load(Ordering::Relaxed);
         // `registered == 0` is the pre-SMP window, where the publisher is all
@@ -271,6 +272,7 @@ impl LogicalIdMap {
 
     /// Whether any window is open. One relaxed load, which is what keeps the
     /// steady-state `cpu_id()` free of a hardware id read.
+    #[inline]
     pub fn ap_boot_any(&self) -> bool {
         self.ap_boot_active.load(Ordering::Relaxed) != 0
     }

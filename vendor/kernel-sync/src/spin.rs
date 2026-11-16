@@ -66,11 +66,11 @@ impl<T: ?Sized> SpinMutex<T> {
     /// ptr stored LAST so a snapshotter keying on `holder_file != 0` never
     /// reads a torn triple.
     #[inline(always)]
-    fn record_holder(&self, caller: &'static core::panic::Location<'static>) {
+    fn record_holder(&self, caller: &'static core::panic::Location<'static>, cpu: u8) {
         let file = caller.file();
         self.holder_file_len.store(file.len(), Ordering::Relaxed);
         self.holder_line_cpu.store(
-            ((crate::interrupt::current_cpu_id() as usize) << 32) | caller.line() as usize,
+            ((cpu as usize) << 32) | caller.line() as usize,
             Ordering::Relaxed,
         );
         self.holder_file
@@ -115,7 +115,7 @@ impl<T: ?Sized> SpinMutex<T> {
     #[inline(always)]
     #[track_caller]
     pub fn lock(&self) -> SpinMutexGuard<'_, T> {
-        push_off();
+        let cpu = push_off();
         let caller = core::panic::Location::caller();
         let mut spins: u64 = 0;
         #[cfg(test)]
@@ -149,7 +149,7 @@ impl<T: ?Sized> SpinMutex<T> {
         }
         #[cfg(test)]
         turn_ledger::record(lost, spins);
-        self.record_holder(caller);
+        self.record_holder(caller, cpu);
         SpinMutexGuard {
             lock: &self.locked,
             holder_file: &self.holder_file,
@@ -160,13 +160,13 @@ impl<T: ?Sized> SpinMutex<T> {
     #[inline]
     #[track_caller]
     pub fn try_lock(&self) -> Option<SpinMutexGuard<'_, T>> {
-        push_off();
+        let cpu = push_off();
         if self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            self.record_holder(core::panic::Location::caller());
+            self.record_holder(core::panic::Location::caller(), cpu);
             Some(SpinMutexGuard {
                 lock: &self.locked,
                 holder_file: &self.holder_file,
