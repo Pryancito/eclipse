@@ -29,6 +29,7 @@
 //! can answer for. The real one dials TCP; the one in the tests hands back a
 //! scripted server and writes down which port was asked for.
 
+use alloc::boxed::Box;
 use alloc::vec;
 
 use smoltcp::socket::{TcpSocket, TcpSocketBuffer, TcpState};
@@ -39,7 +40,8 @@ use zcore_drivers::net::get_sockets;
 use crate::error::{LxError, LxResult};
 use crate::net::GlobalSocketHandle;
 
-use super::client::RpcTransport;
+use super::client::{RpcTransport, TransportError};
+use super::served::ServedTransport;
 use super::transport::{KernelDriver, KernelTransport, StackDriver};
 
 /// How long to wait for a TCP handshake before giving up.
@@ -108,18 +110,73 @@ impl TcpConnector {
     }
 }
 
+/// A connection of [`TcpConnector`]: through the stack process where the
+/// machine's network is one, and through the kernel's own stack where it
+/// is not.
+pub enum Wire {
+    /// The kernel's smoltcp, driven by hand.
+    Kernel(KernelTransport<KernelDriver>),
+    /// A served socket: see [`served`](super::served).
+    Served(Box<ServedTransport>),
+}
+
+impl RpcTransport for Wire {
+    fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
+        match self {
+            Wire::Kernel(t) => t.send(data),
+            Wire::Served(t) => t.send(data),
+        }
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        match self {
+            Wire::Kernel(t) => t.recv(buf),
+            Wire::Served(t) => t.recv(buf),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        match self {
+            Wire::Kernel(t) => t.now_ms(),
+            Wire::Served(t) => t.now_ms(),
+        }
+    }
+
+    fn poll(&mut self) {
+        match self {
+            Wire::Kernel(t) => t.poll(),
+            Wire::Served(t) => t.poll(),
+        }
+    }
+
+    fn give_up(&mut self) {
+        match self {
+            Wire::Kernel(t) => t.give_up(),
+            Wire::Served(t) => t.give_up(),
+        }
+    }
+}
+
 impl Connector for TcpConnector {
-    type Transport = KernelTransport<KernelDriver>;
+    type Transport = Wire;
 
     fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport> {
-        let mut driver = KernelDriver;
         // The caller's budget and this connector's ceiling, whichever is
         // shorter: the ceiling is what a connector built with
         // `with_timeout` promised, and the budget is what is left of the
         // caller's deadline.
         let ms = timeout_ms.min(self.timeout_ms);
+        // The network every program of this machine uses is the one a
+        // mount uses: where that is the stack process, the kernel's own
+        // stack has no card and reaches nobody.
+        if crate::net::user_stack::is_for_all() {
+            let link = crate::net::user_stack::machine();
+            return ServedTransport::connect(link, self.addr, port, ms)
+                .map(|t| Wire::Served(Box::new(t)));
+        }
+        let mut driver = KernelDriver;
         let handle = connect_sync(self.addr, port, ms, &mut driver)?;
-        Ok(KernelTransport::new(handle))
+        Ok(Wire::Kernel(KernelTransport::new(handle)))
     }
 }
 

@@ -71,6 +71,7 @@ pub mod portmap;
 #[cfg(test)]
 mod real_server_tests;
 pub mod rpc;
+pub mod served;
 pub mod session;
 pub mod source;
 pub mod transport;

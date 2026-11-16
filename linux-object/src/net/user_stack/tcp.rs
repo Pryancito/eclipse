@@ -726,6 +726,24 @@ impl ServedTcpSocket {
         }
     }
 
+    /// How a connect that did not wait has gone: `None` while it is under
+    /// way. What the wait of a connect that waits looks at, for a kernel
+    /// client that waits without a task (the NFS client). A failure is
+    /// told once, as there.
+    pub(crate) fn connect_outcome(&self) -> Option<LxResult<()>> {
+        let mut inner = self.stream.inner.lock();
+        match inner.phase {
+            Phase::Open => Some(Ok(())),
+            Phase::Connecting => None,
+            _ => {
+                let e = inner.error.take().unwrap_or(LxError::ECONNREFUSED);
+                inner.local = None;
+                self.stream.sync(&inner, Event::empty());
+                Some(Err(e))
+            }
+        }
+    }
+
     /// Stop taking connections: the ones nobody accepted are closed. One
     /// that is over already, with the stack that carried it, is nobody's
     /// to close: its number may be another's by now.

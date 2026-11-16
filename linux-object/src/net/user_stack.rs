@@ -1737,6 +1737,14 @@ impl StackLink {
         served.as_ref().map(|s| (s.channel.clone(), s.turn))
     }
 
+    /// The channel of the stack that serves now, for a kernel client
+    /// that waits without a task (the NFS client) to be told when the
+    /// stack has sent something: readable is when [`pump`](Self::pump) has
+    /// something to read.
+    pub(crate) fn channel(&self) -> Option<Arc<Channel>> {
+        self.current().map(|(channel, _)| channel)
+    }
+
     /// The stack's address: unspecified while there is none, or it did
     /// not say.
     fn address(&self) -> Ipv4Address {
