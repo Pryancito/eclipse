@@ -217,6 +217,12 @@ impl LocalApic {
             let shadow = &*(&raw const SLOT_SHADOWS)
                 .cast::<[u64; SLOT_WORDS]>()
                 .add(idx);
+            // Nearly always nothing differs, and this runs every time the
+            // timer is armed, which a sleep with a deadline does: the two are
+            // compared whole first, and word by word only to say where.
+            if core::slice::from_raw_parts(words.cast_const(), SLOT_WORDS) == &shadow[..] {
+                return;
+            }
             let mut first = None;
             let mut last = 0;
             for (i, &want) in shadow.iter().enumerate() {

@@ -299,18 +299,9 @@ impl Syscall<'_> {
         // Hybrid stack/heap buffer: line-oriented apps (busybox shell, getline,
         // fgetc) drive a stream of small reads — keep those alloc-free. The
         // ~64 KiB ceiling case still goes via the buddy allocator.
-        const STACK_BUF: usize = 512;
-        let mut stack_buf = [0u8; STACK_BUF];
-        let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
-            crate::try_zeroed_buf(chunk_size)?
-        } else {
-            alloc::vec::Vec::new()
-        };
-        let buf: &mut [u8] = if chunk_size > STACK_BUF {
-            &mut heap_buf[..]
-        } else {
-            &mut stack_buf[..chunk_size]
-        };
+        // A large one is a kept buffer when there is one, and is not zeroed
+        // whole for a read that fills a little of it (`RecvBuf`).
+        let mut buf = crate::RecvBuf::new(chunk_size)?;
         let mut read_len = 0;
 
         while read_len < len {
@@ -319,7 +310,7 @@ impl Syscall<'_> {
             // >=4 KiB read produced by the file's read (inode/driver) or by
             // the copy-out below?
             let n = file_like
-                .read(&mut buf[..current_len])
+                .read(&mut buf.buf()[..current_len])
                 .await
                 .inspect_err(|e| {
                     // ONLY the EFAULT this diag hunts. It used to fire on ANY error,
@@ -353,18 +344,20 @@ impl Syscall<'_> {
             // already convert VINTR into SIGINT for the foreground pgrp
             // themselves — so the syscall-level check was pure downside and was
             // removed.
-            base.add(read_len).write_array(&buf[..n]).inspect_err(|e| {
-                // Unguarded is fine here: write_array only fails on a bad user
-                // address (the EFAULT this diag hunts), never on a benign/hot
-                // EAGAIN, so it cannot flood the way the read path above did.
-                kernel_hal::klog_info!(
-                    "[read-efault] fd={:?} base={:#x} n={:#x}: write_array -> {:?}",
-                    fd,
-                    base.as_addr() + read_len,
-                    n,
-                    e
-                );
-            })?;
+            base.add(read_len)
+                .write_array(buf.wrote(n))
+                .inspect_err(|e| {
+                    // Unguarded is fine here: write_array only fails on a bad user
+                    // address (the EFAULT this diag hunts), never on a benign/hot
+                    // EAGAIN, so it cannot flood the way the read path above did.
+                    kernel_hal::klog_info!(
+                        "[read-efault] fd={:?} base={:#x} n={:#x}: write_array -> {:?}",
+                        fd,
+                        base.as_addr() + read_len,
+                        n,
+                        e
+                    );
+                })?;
             read_len += n;
             if n < current_len || !is_seekable {
                 break;
@@ -591,29 +584,20 @@ impl Syscall<'_> {
         // Same hybrid buffer as sys_read — short positional reads (e.g. ELF
         // header probes during dlopen, libc pread of small struct slots) hit
         // the stack path.
-        const STACK_BUF: usize = 512;
-        let mut stack_buf = [0u8; STACK_BUF];
-        let mut heap_buf: alloc::vec::Vec<u8> = if chunk_size > STACK_BUF {
-            crate::try_zeroed_buf(chunk_size)?
-        } else {
-            alloc::vec::Vec::new()
-        };
-        let buf: &mut [u8] = if chunk_size > STACK_BUF {
-            &mut heap_buf[..]
-        } else {
-            &mut stack_buf[..chunk_size]
-        };
+        // A large one is a kept buffer when there is one, and is not zeroed
+        // whole for a read that fills a little of it (`RecvBuf`).
+        let mut buf = crate::RecvBuf::new(chunk_size)?;
         let mut read_len = 0;
 
         while read_len < len {
             let current_len = (len - read_len).min(chunk_size);
             let n = file_like
-                .read_at(offset + read_len as u64, &mut buf[..current_len])
+                .read_at(offset + read_len as u64, &mut buf.buf()[..current_len])
                 .await?;
             if n == 0 {
                 break;
             }
-            base.add(read_len).write_array(&buf[..n])?;
+            base.add(read_len).write_array(buf.wrote(n))?;
             read_len += n;
             if n < current_len {
                 break;

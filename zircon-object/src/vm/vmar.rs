@@ -1753,6 +1753,9 @@ impl VmAddressRegion {
         let Some(end) = addr.checked_add(len - 1) else {
             return false;
         };
+        if let Some(answer) = self.range_allows_in_one(addr, end, access) {
+            return answer;
+        }
         let mut at = addr;
         loop {
             let Some(mapping) = self.find_mapping(at) else {
@@ -1764,19 +1767,9 @@ impl VmAddressRegion {
                 // Not the mapping it was found for: refuse, as above.
                 return false;
             }
-            // The pages of this mapping the range covers, and every run of
-            // flags that meets them. The runs come in order, so none after
-            // the last page is looked at.
             let first = (at - inner.addr) / PAGE_SIZE;
             let last = (end.min(mapping_end - 1) - inner.addr) / PAGE_SIZE;
-            let refused = inner
-                .flags
-                .runs()
-                .take_while(|&(start, _, _)| start <= last)
-                .any(|(start, count, flags)| {
-                    first < start + count && !fault_grants(flags).contains(access)
-                });
-            if refused {
+            if Self::runs_refuse(&inner, first, last, access) {
                 return false;
             }
             if mapping_end > end {
@@ -1784,6 +1777,45 @@ impl VmAddressRegion {
             }
             at = mapping_end;
         }
+    }
+
+    /// Does any page from `first` to `last` of this mapping refuse `access`?
+    ///
+    /// Every run of flags that meets those pages is looked at. The runs come
+    /// in order, so none after the last page is.
+    fn runs_refuse(inner: &VmMappingInner, first: usize, last: usize, access: MMUFlags) -> bool {
+        inner
+            .flags
+            .runs()
+            .take_while(|&(start, _, _)| start <= last)
+            .any(|(start, count, flags)| {
+                first < start + count && !fault_grants(flags).contains(access)
+            })
+    }
+
+    /// [`Self::range_allows`] for the range a copy to or from a program
+    /// nearly always names: `addr..=end` inside one mapping of this very
+    /// region. `None` when it is anything else (a child region, a hole, two
+    /// mappings), which the walk in `range_allows` answers.
+    ///
+    /// The walk takes this region's lock to find the mapping, the mapping's
+    /// to ask whether it holds the address, and the mapping's again to read
+    /// its end and flags, and it clones the mapping's `Arc` to carry it from
+    /// one to the next. Every system call that reads or writes user memory
+    /// pays that, several times over for a call with several pointers. Here
+    /// each lock is taken once and nothing is cloned. The order (region,
+    /// then mapping) is the one `mapping_containing` already takes them in.
+    fn range_allows_in_one(&self, addr: usize, end: usize, access: MMUFlags) -> Option<bool> {
+        let guard = self.inner.lock();
+        let inner = guard.as_ref()?;
+        let (_, mapping) = inner.mappings.range(..=addr).next_back()?;
+        let mapping = mapping.inner.lock();
+        if mapping.addr > addr || end >= mapping.end_addr() {
+            return None;
+        }
+        let first = (addr - mapping.addr) / PAGE_SIZE;
+        let last = (end - mapping.addr) / PAGE_SIZE;
+        Some(!Self::runs_refuse(&mapping, first, last, access))
     }
 
     /// Validate that a complete user address range is mapped with `access` permissions.
