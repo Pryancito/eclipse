@@ -78,7 +78,7 @@ pub(super) struct Leasing {
 /// it.
 const NO_ADDRESS: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0);
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// The card's address and network, when it has one.
     pub fn address(&self) -> Option<Ipv4Cidr> {
         self.iface.ip_addrs().iter().find_map(|cidr| match cidr {

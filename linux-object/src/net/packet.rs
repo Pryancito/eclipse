@@ -43,11 +43,20 @@ fn purge_dead_sockets(sockets: &mut Vec<Weak<PacketSocketInner>>) {
 
 fn unregister_inner(inner: &Arc<PacketSocketInner>) {
     let inner_ptr = Arc::as_ptr(inner);
-    PACKET_SOCKETS.lock().retain(|weak| {
-        weak.upgrade()
-            .map(|arc| !core::ptr::eq(Arc::as_ptr(&arc), inner_ptr))
-            .unwrap_or(false)
-    });
+    let left = {
+        let mut sockets = PACKET_SOCKETS.lock();
+        sockets.retain(|weak| {
+            weak.upgrade()
+                .map(|arc| !core::ptr::eq(Arc::as_ptr(&arc), inner_ptr))
+                .unwrap_or(false)
+        });
+        sockets.iter().any(|w| w.strong_count() > 0)
+    };
+    if !left {
+        // Nobody listens any more: the stack that has the card stops
+        // saying its frames, and goes back to paying nothing for them.
+        crate::net::user_stack::tap(false);
+    }
 }
 
 fn register_fd(inner: &Arc<PacketSocketInner>, state: &Arc<PacketSocketState>) {
@@ -150,7 +159,19 @@ pub fn push_packet(packet: &[u8]) {
     crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
     crate::net::ra::process_from_frame(packet);
+    deliver_tapped_frame(packet);
+}
 
+/// One frame the card of a stack that runs as a process received, for
+/// the `AF_PACKET` sockets of this machine and for nothing else.
+///
+/// The frames of such a card come as a message of the protocol between
+/// the kernel and the stack (`TAP`, `FRAMES`), and the network they are
+/// of is the stack's: the kernel keeps no neighbour of that card, routes
+/// nothing on it and answers nothing on it, so unlike [`push_packet`]
+/// this teaches the caches nothing and takes no router's word. It is
+/// only what a program that listens on the interface hears.
+pub fn deliver_tapped_frame(packet: &[u8]) {
     let mut sockets = PACKET_SOCKETS.lock();
     if !sockets.iter().any(|w| w.strong_count() > 0) {
         purge_dead_sockets(&mut sockets);
@@ -305,7 +326,15 @@ impl PacketSocketState {
             last_msg_flags: Mutex::new(0),
         });
         register_fd(&inner, &state);
+        let first = !registry.iter().any(|w| w.strong_count() > 0);
         registry.push(Arc::downgrade(&inner));
+        drop(registry);
+        if first {
+            // On a boot where the card is a stack process's, its frames
+            // reach this machine only while somebody listens, and this
+            // is the first who does.
+            crate::net::user_stack::tap(true);
+        }
         Ok(state)
     }
 }

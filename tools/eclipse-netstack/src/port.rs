@@ -52,6 +52,10 @@ struct State {
     tx_free: u32,
     /// What the card has carried: see [`Port::counts`].
     counts: Counts,
+    /// Whether the frames the card receives are copied for whoever
+    /// listens, and the ones copied and not taken yet.
+    listening: bool,
+    heard: VecDeque<Vec<u8>>,
 }
 
 /// A served card, from the stack's side.
@@ -83,6 +87,8 @@ impl Port {
                 outgoing: Vec::new(),
                 tx_free: ((1u64 << tx_slots) - 1) as u32,
                 counts: Counts::default(),
+                listening: false,
+                heard: VecDeque::new(),
             }),
         })
     }
@@ -195,6 +201,42 @@ pub struct TxToken<'a> {
     port: &'a Port,
 }
 
+/// A card whose frames can be listened to.
+///
+/// What a card carries is the stack's, and an `AF_PACKET` socket of a
+/// program is the kernel's: on a boot where the card is this process's,
+/// the kernel has nothing to give such a socket unless this process says
+/// what arrives. It asks for it while a program listens (`TAP`) and not
+/// a byte is copied while none does.
+pub trait Listened {
+    /// Copy the frames the card receives from now on, or stop.
+    fn listen(&self, on: bool);
+    /// The frames copied since this was last asked, in the order they
+    /// arrived.
+    fn heard(&self) -> Vec<Vec<u8>>;
+}
+
+/// The most frames kept for whoever listens: a program that does not
+/// read them (or a kernel that stopped asking) must not grow this
+/// process without end, and what is dropped is the oldest, as a full
+/// receive queue drops.
+pub const HEARD_MAX: usize = 256;
+
+impl Listened for Port {
+    fn listen(&self, on: bool) {
+        let mut state = self.state.borrow_mut();
+        state.listening = on;
+        if !on {
+            state.heard = VecDeque::new();
+        }
+    }
+
+    fn heard(&self) -> Vec<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        core::mem::take(&mut state.heard).into()
+    }
+}
+
 impl<'a> phy::Device<'a> for Port {
     type RxToken = RxToken<'a>;
     type TxToken = TxToken<'a>;
@@ -222,6 +264,15 @@ impl<'a> phy::Device<'a> for Port {
         // the window, and a slot is in `incoming` once, so no other
         // reference to these bytes exists.
         let frame = unsafe { core::slice::from_raw_parts_mut(port.window.add(at), len) };
+        // Whoever listens hears every frame the card brought, understood
+        // here or not: smoltcp sees them all through this one door.
+        if state.listening {
+            if state.heard.len() >= HEARD_MAX {
+                state.heard.pop_front();
+            }
+            state.heard.push_back(frame.to_vec());
+        }
+        drop(state);
         Some((RxToken { frame }, TxToken { port }))
     }
 

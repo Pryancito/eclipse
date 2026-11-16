@@ -193,7 +193,7 @@ pub fn query(packet: &[u8]) -> Option<Ipv6Address> {
     (group.is_unspecified() || group.is_multicast()).then_some(group)
 }
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// How many groups of IPv6 the kernel said the machine is a member
     /// of.
     pub fn groups6(&self) -> usize {

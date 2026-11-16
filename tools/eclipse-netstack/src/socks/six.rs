@@ -273,7 +273,7 @@ impl Six {
     }
 }
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// Have IPv6 addresses on the card: its own on the link from now on,
     /// and what the link's router gives. Once.
     pub fn speak_six(&mut self) {

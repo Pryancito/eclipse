@@ -7,11 +7,19 @@
 //! gave up. A [`StackCard`] is that card in the list, to be looked at: a
 //! name, the MAC, and the address and the gateway the stack says it has.
 //!
-//! It carries nothing. No frame arrives on it and one sent on it is refused,
-//! because the frames are the stack's; its address and its routes cannot be
-//! set from here, because they are the stack's too. It is made when the stack
-//! says what its card is and taken away when the stack is gone, and what it
-//! says never changes in between: a stack whose address changes starts over.
+//! Its address and its routes cannot be set from here, because they are the
+//! stack's. It is made when the stack says what its card is and taken away
+//! when the stack is gone, and what it says never changes in between: a stack
+//! whose address changes starts over.
+//!
+//! A frame sent on it goes to the stack, which has the card and puts it on
+//! the wire ([`Wire`]). It used to be refused, always and with
+//! `NotSupported`, and that is what an `AF_PACKET` socket met on a boot where
+//! the stack runs as a process: `udhcpc6`, which builds its own IPv6 and UDP
+//! headers and sends the DHCPv6 SOLICIT through one, could not put a single
+//! frame on the wire, and neither could `udhcpc` or a tcpdump. A card with no
+//! wire -- one nobody has told where its stack is -- still refuses, as it
+//! did.
 //!
 //! What does change is how much the card has carried, which only the stack
 //! knows and says as it goes: the card is given the place those counts are
@@ -135,6 +143,19 @@ impl Sixes {
     }
 }
 
+/// Where a frame sent on a stack's card goes: to the stack, which has the
+/// card and puts it on the wire.
+///
+/// The card is in the kernel and the stack is a process, so the frame
+/// travels as a message of the protocol between them; what that is, is
+/// whoever makes the card's to know (`linux-object`'s `user_stack`), and
+/// the card only asks.
+pub trait Wire: Send + Sync {
+    /// `frame`, whole, for the card to carry. False when it did not go:
+    /// there is no stack just now, or it has more unread than it should.
+    fn put(&self, frame: &[u8]) -> bool;
+}
+
 /// The interface that shows the card of a stack that runs somewhere else.
 pub struct StackCard {
     name: String,
@@ -146,6 +167,8 @@ pub struct StackCard {
     carried: Arc<Carried>,
     /// What the stack says the card has of IPv6.
     sixes: Arc<Sixes>,
+    /// Where a frame sent on the card goes, when anyone has said.
+    wire: Option<Arc<dyn Wire>>,
 }
 
 impl StackCard {
@@ -174,6 +197,7 @@ impl StackCard {
             routes,
             carried: Arc::new(Carried::default()),
             sixes: Arc::new(Sixes::default()),
+            wire: None,
         }
     }
 
@@ -182,6 +206,14 @@ impl StackCard {
     /// has carried nothing, as far as anyone here can tell.
     pub fn counting(mut self, carried: Arc<Carried>) -> Self {
         self.carried = carried;
+        self
+    }
+
+    /// The same card, with `wire` to put on the wire what is sent on it:
+    /// the way to the stack that has the card. Without it nothing can be
+    /// sent on the card at all, which is how it was before there was one.
+    pub fn through(mut self, wire: Arc<dyn Wire>) -> Self {
+        self.wire = Some(wire);
         self
     }
 
@@ -232,8 +264,16 @@ impl NetScheme for StackCard {
         Err(DeviceError::NotReady)
     }
 
-    fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
-        Err(DeviceError::NotSupported)
+    /// To the stack, which has the card: `NotSupported` where nobody said
+    /// how to reach it, `NotReady` when it would not take the frame just
+    /// now (no stack serving, or more unread than it should have).
+    fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
+        let wire = self.wire.as_ref().ok_or(DeviceError::NotSupported)?;
+        if wire.put(buf) {
+            Ok(buf.len())
+        } else {
+            Err(DeviceError::NotReady)
+        }
     }
 
     fn can_recv(&self) -> bool {
@@ -241,7 +281,7 @@ impl NetScheme for StackCard {
     }
 
     fn can_send(&self) -> bool {
-        false
+        self.wire.is_some()
     }
 
     fn get_mac(&self) -> EthernetAddress {
@@ -298,6 +338,49 @@ mod tests {
         )
     }
 
+    /// A wire that keeps what was sent on it, and answers `takes`.
+    struct Kept {
+        takes: bool,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Wire for Kept {
+        fn put(&self, frame: &[u8]) -> bool {
+            if !self.takes {
+                return false;
+            }
+            self.sent.lock().push(frame.to_vec());
+            true
+        }
+    }
+
+    /// With a wire, a frame sent on the card goes to the stack whole.
+    #[test]
+    fn a_frame_sent_on_the_card_goes_to_the_stack() {
+        let wire = Arc::new(Kept {
+            takes: true,
+            sent: Mutex::new(Vec::new()),
+        });
+        let c = card(None).through(wire.clone());
+        assert!(c.can_send());
+        let frame = [0x33u8, 0x33, 0, 1, 0, 2, 2, 0, 0, 0, 0, 7, 0x86, 0xdd, 1, 2];
+        assert_eq!(c.send(&frame), Ok(frame.len()));
+        assert_eq!(wire.sent.lock().as_slice(), &[frame.to_vec()]);
+    }
+
+    /// A stack that will not take it now is `NotReady` -- try again --
+    /// and not `NotSupported`, which is a card with no stack at all.
+    #[test]
+    fn a_stack_that_does_not_take_the_frame_is_not_ready() {
+        let wire = Arc::new(Kept {
+            takes: false,
+            sent: Mutex::new(Vec::new()),
+        });
+        let c = card(None).through(wire);
+        assert!(c.can_send());
+        assert_eq!(c.send(&[0u8; 64]), Err(DeviceError::NotReady));
+    }
+
     #[test]
     fn it_shows_what_the_stack_said_and_carries_nothing() {
         let c = card(Some([10, 0, 9, 1]));
@@ -320,7 +403,8 @@ mod tests {
         assert_eq!(routes[1].dst, IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24));
         assert_eq!(routes[1].gateway, None);
 
-        // Nothing goes through it and nothing about it is set here.
+        // Nothing goes through a card nobody said how to reach, and
+        // nothing about it is set here.
         assert!(!c.can_recv() && !c.can_send());
         assert_eq!(c.recv(&mut [0u8; 64]), Err(DeviceError::NotReady));
         assert_eq!(c.send(&[0u8; 64]), Err(DeviceError::NotSupported));

@@ -264,7 +264,7 @@ fn u32_at(m: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]])
 }
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// `CONNECT`. A connect that cannot be started is answered `FAILED`
     /// by the next turn, which is why this asks for one.
     pub(super) fn connect(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
