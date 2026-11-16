@@ -123,7 +123,9 @@ mod tests {
         let rc = fs::read_to_string(dir.join("usr/share/themes/Abyss-Dark/openbox-3/themerc"))
             .expect("themerc");
         assert!(rc.contains("window.active.title.bg.color: #1d1b18"));
-        assert!(dir.join("usr/share/themes/Abyss-Dark/openbox-3/close.xbm").is_file());
+        assert!(dir
+            .join("usr/share/themes/Abyss-Dark/openbox-3/close.xbm")
+            .is_file());
         let ini = fs::read_to_string(dir.join("root/.config/foot/foot.abyss.ini")).expect("ini");
         assert!(ini.contains("background=0b0906"));
         let _ = fs::remove_dir_all(&dir);

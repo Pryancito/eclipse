@@ -77,7 +77,13 @@ pub async fn resolve(
     hostname: &str,
     family: DnsFamily,
 ) -> LxResult<Vec<IpAddress>> {
-    resolve_by(root, hostname, family, None).await
+    // Who asks here is the kernel itself (a mount that names its server),
+    // and the kernel's questions go by the machine's network. Where that
+    // is the stack that runs as a process, the kernel's own stack has no
+    // card: a question sent by it reached nobody and the mount failed
+    // with `ENOENT`.
+    let stack = user_stack::is_for_all().then(user_stack::machine);
+    resolve_by(root, hostname, family, stack.as_ref()).await
 }
 
 /// [`resolve`], with the questions to the nameservers carried by the
@@ -1073,6 +1079,44 @@ mod dns_tests {
         }
         assert!(wakes <= 37, "{} wakes", wakes);
         assert_eq!(REPLY_TIMEOUT, Duration::from_millis(1600));
+    }
+
+    /// The kernel's own questions ([`resolve`], a mount that names its
+    /// server) go by the stack that runs as a process on a machine whose
+    /// network is that one.
+    #[test]
+    fn the_kernels_own_question_goes_by_the_machines_network() {
+        use crate::net::user_stack::{machine, use_for_all, ServedUdpSocket};
+        use crate::net::{Endpoint, Socket};
+        use rcore_fs::vfs::{FileSystem, FileType};
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let conf = etc.create("resolv.conf", FileType::File, 0o644).unwrap();
+        conf.write_at(0, b"nameserver 127.0.0.1\n").unwrap();
+
+        let server = ServedUdpSocket::new(machine(), false).unwrap();
+        let here = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), DNS_PORT);
+        assert_eq!(Socket::bind(&server, Endpoint::Ip(here)), Ok(0));
+        let answering = std::thread::spawn(move || {
+            async_std::task::block_on(async {
+                let mut buf = [0u8; 512];
+                let (n, from) = Socket::read(&server, &mut buf).await;
+                let n = n.unwrap();
+                let mut reply = buf[..n].to_vec();
+                reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                reply[7] = 1;
+                reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                reply.extend_from_slice(&[10, 0, 9, 7]);
+                assert_eq!(Socket::write(&server, &reply, Some(from)), Ok(reply.len()));
+            })
+        });
+        use_for_all(true);
+        let got = async_std::task::block_on(resolve(&root, "nfs.eclipse", DnsFamily::V4));
+        use_for_all(false);
+        assert_eq!(got, Ok(alloc::vec![IpAddress::v4(10, 0, 9, 7)]));
+        answering.join().unwrap();
     }
 
     /// A program whose sockets are the stack's that runs as a process has

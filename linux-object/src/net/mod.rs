@@ -910,7 +910,7 @@ pub fn sync_neighbor_cache_into_smoltcp() {
     }
 }
 
-/// Local UDP bind address for a query toward `dst` (port 0 → ephemeral on send).
+/// Local UDP bind address for a query toward `dst`, with a port of its own.
 pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
     use smoltcp::wire::IpAddress;
     let addr = match dst {
@@ -918,7 +918,10 @@ pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
         IpAddress::Ipv6(d) => IpAddress::Ipv6(select_ipv6_for_dst(d)),
         other => other,
     };
-    IpEndpoint::new(addr, 0)
+    // A port of its own: smoltcp refuses to bind port 0 (it has no "any
+    // port"), and with 0 here every question the kernel's stack was to
+    // carry failed before it was sent.
+    IpEndpoint::new(addr, get_ephemeral_port())
 }
 
 mod adaptive;

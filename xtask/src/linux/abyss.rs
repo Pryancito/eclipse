@@ -344,9 +344,15 @@ mod tests {
         fs::create_dir_all(&etc).unwrap();
         fs::write(etc.join("look"), "look=tecno\n").unwrap();
         default_look(&dir, "labwc");
-        assert_eq!(fs::read_to_string(etc.join("look")).unwrap(), "look=tecno\n");
+        assert_eq!(
+            fs::read_to_string(etc.join("look")).unwrap(),
+            "look=tecno\n"
+        );
         default_look(&dir, "abyss");
-        assert_eq!(fs::read_to_string(etc.join("look")).unwrap(), "look=abyss\n");
+        assert_eq!(
+            fs::read_to_string(etc.join("look")).unwrap(),
+            "look=abyss\n"
+        );
         // A look somebody chose is left alone.
         fs::write(etc.join("look"), "look=kde\n").unwrap();
         default_look(&dir, "abyss");
