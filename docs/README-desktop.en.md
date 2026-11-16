@@ -496,8 +496,8 @@ installed VDI.
 
 There is a third session, **Abyss**: the Rust Wayland compositor from
 [chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), with its
-bar (`ec-hyperion-bar`), launcher (`ec-launcher`), wallpaper (`ec-wallpaper`)
-and Settings (`ec-settings`). It comes from the `desktop/` submodule, which
+bar (`ec-hyperion-bar`), launcher (`ec-launcher`) and Settings
+(`ec-settings`), with the lunarbg wallpaper and the usual lunar apps. It comes from the `desktop/` submodule, which
 points at the fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
 **labwc stays the default session**: Abyss starts only when you pick it.
 
@@ -514,19 +514,31 @@ echo abyss > /etc/eclipse/desktop
   submodule, a missing package or a failed build the image still comes out,
   with labwc only. It is not built on a host of another architecture.
 - **Services** (`desktop = abyss`): `abyss-seatd`, `abyss`
-  (`/usr/local/bin/eclipse-abyss`, log in `/tmp/abyss.log`), `abyss-wallpaper`
-  and `abyss-hyperion-bar` (through `eclipse-abyss-client`, which waits for the
-  control socket `/run/user/0/eclipse/abyss.sock`). Abyss opens the launcher
-  itself on Super+E / Super+R.
+  (`/usr/local/bin/eclipse-abyss`, log in `/tmp/abyss.log`), Abyss's bar
+  `abyss-hyperion-bar` (through `eclipse-abyss-client`), and Eclipse's own
+  **lunarbg** (`abyss-lunarbg`) as the wallpaper and **lunarclip**
+  (`abyss-lunarclip`), through the same wrappers as under labwc. They all wait
+  for the control socket `/run/user/0/eclipse/abyss.sock`.
+- **Lunar apps**: they work as under labwc, with the same shortcuts, set in
+  `/etc/eclipse/abyss.kdl`: Super+Return (terminal), Alt+Space and Alt+F2
+  (lunarrun), Super+E (lunarfile), Super+V (clipboard), Super+D (show
+  desktop), Super+L (lunarlock), Super+Tab (lunardesk), Super+N (lunarnotes),
+  Super+K (keyboard), Print and Shift+Print (lunarshot) and Ctrl+Shift+Esc
+  (lunarmon). Abyss's launcher stays on Super+R.
+- **Permissions**: Abyss hides its privileged protocols from any program not
+  named in `/etc/eclipse/policy.kdl`. It lists lunarclip
+  (`clipboard.data-control-allow`), lunarshot (`capture.allow`) and lunarbar,
+  lunarrun and lunardesk (`toplevel-management.allow`, which the fork adds
+  together with `zwlr_foreign_toplevel_management` and `ext-workspace`).
 - **Display**: Abyss listens on `wayland-1`, never `wayland-0`.
 - **GPU**: it renders with GLES on GBM/EGL, down the same zink+NVK path as
   labwc, since `eclipse-init` sets the GPU variables for every service.
 - **Config**: `/etc/eclipse/abyss.kdl` (`de` desktop mode, `foot` terminal);
   yours goes in `~/.config/eclipse/abyss.kdl` or in Settings. Every key:
   `desktop/docs/CONFIG.md`.
-- **Not yet**: Abyss's notifications (`ec-toasts`/`ec-services` would fight
-  `eclipse-notifyd` for `org.freedesktop.Notifications`), and lunarbar, which
-  needs `zwlr_foreign_toplevel_management` and `ext-workspace`.
+- **Not yet**: notifications. `ec-toasts`/`ec-services` would fight
+  `eclipse-notifyd` for `org.freedesktop.Notifications`, and `eclipse-notifyd`'s
+  cards are drawn by lunarbar, which does not run in this session.
 - **Licence**: all of `desktop/` is AGPL-3.0-only (its protocols and SDKs are
   Apache-2.0). It is built and shipped as separate programs; nothing from it is
   linked with this repository's MIT code. The source of what ships is the

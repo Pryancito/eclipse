@@ -28,15 +28,11 @@ use std::path::{Path, PathBuf};
 /// What the `abyss/` workspace builds: the compositor and its control CLI.
 const ABYSS_BINS: &[&str] = &["ec-abyss", "ec-ctl"];
 
-/// What the `shell/` workspace builds: bar, launcher, wallpaper and Settings.
-/// Not yet `ec-toasts`/`ec-services`: they own `org.freedesktop.Notifications`
-/// and would fight `eclipse-notifyd` for it on the shared session bus.
-const SHELL_BINS: &[&str] = &[
-    "ec-hyperion-bar",
-    "ec-launcher",
-    "ec-wallpaper",
-    "ec-settings",
-];
+/// What the `shell/` workspace builds: bar, launcher and Settings. The
+/// wallpaper is lunarbg, as in labwc, so `ec-wallpaper` is not built. Not yet
+/// `ec-toasts`/`ec-services`: they own `org.freedesktop.Notifications` and
+/// would fight `eclipse-notifyd` for it on the shared session bus.
+const SHELL_BINS: &[&str] = &["ec-hyperion-bar", "ec-launcher", "ec-settings"];
 
 /// The submodule's checkout.
 fn desktop_dir() -> PathBuf {
@@ -98,6 +94,7 @@ impl LinuxRootfs {
         let etc = rootfs.join("etc/eclipse");
         let _ = fs::create_dir_all(&etc);
         let _ = fs::write(etc.join("abyss.kdl"), DEFAULT_CONFIG);
+        let _ = fs::write(etc.join("policy.kdl"), DEFAULT_POLICY);
         println!("abyss: {installed} binaries in /usr/bin (session: desktop=abyss)");
     }
 }
@@ -127,7 +124,9 @@ fn cargo_build(workspace: &Path, packages: &[&str], features: Option<&str>) -> b
 
 /// `/etc/eclipse/abyss.kdl`. Upstream defaults, except what Eclipse OS needs:
 /// a desktop in the KDE manner (titlebars, maximize) like the labwc session,
-/// and foot as the terminal, since Apotheosis is not built.
+/// foot as the terminal (Apotheosis is not built), and the labwc session's
+/// own shortcuts for the lunar apps (see `rc.xml` in `desktop.rs`). Abyss's
+/// launcher keeps Super+R; Super+E is the file manager, as in labwc.
 const DEFAULT_CONFIG: &str = "\
 // Eclipse OS: system defaults for the Abyss session (desktop=abyss).
 // Your own changes go in ~/.config/eclipse/abyss.kdl (or Settings).
@@ -136,6 +135,42 @@ mode \"de\"
 misc {
     terminal-command \"foot\"
 }
+launcher {
+    bind {
+        open \"none\"
+        run \"Super+R\"
+    }
+}
+bind \"SUPER\" \"Return\" { spawn \"/usr/local/bin/eclipse-terminal\"; }
+bind \"ALT\" \"Return\" { spawn \"/usr/local/bin/eclipse-terminal\"; }
+bind \"ALT\" \"space\" { spawn \"/usr/local/bin/eclipse-run\"; }
+bind \"ALT\" \"F2\" { spawn \"/usr/local/bin/eclipse-run\"; }
+bind \"SUPER\" \"e\" { spawn \"/usr/local/bin/eclipse-files\"; }
+bind \"SUPER\" \"v\" { spawn \"/usr/local/bin/eclipse-clipboard\"; }
+bind \"SUPER\" \"d\" { spawn \"/usr/local/bin/eclipse-showdesktop\"; }
+bind \"SUPER\" \"l\" { spawn \"lunarlock\"; }
+bind \"SUPER\" \"Tab\" { spawn \"lunardesk\"; }
+bind \"SUPER\" \"n\" { spawn \"lunarnotes\"; }
+bind \"SUPER\" \"k\" { spawn \"/usr/local/bin/eclipse-kbd toggle\"; }
+bind \"Print\" { spawn \"lunarshot\"; }
+bind \"SHIFT\" \"Print\" { spawn \"lunarshot --region\"; }
+bind \"CTRL SHIFT\" \"Escape\" { spawn \"/usr/local/bin/eclipse-monitor\"; }
+";
+
+/// `/etc/eclipse/policy.kdl`: upstream's `secret` windows and input methods,
+/// plus the lunar apps' admissions. Abyss hides every privileged global from
+/// a program not named here (ADR 0094), so each lunar app that needs one is
+/// listed: the clipboard manager, the screenshot tool, and the clients that
+/// list and control windows and desktops (Super+Tab, Super+D, lunarbar).
+const DEFAULT_POLICY: &str = "\
+// Eclipse OS: who may use Abyss's privileged protocols (desktop=abyss).
+windowrule \"sensitivity secret\" { app-id \"^ec-secret-prompt$\"; }
+windowrule \"sensitivity secret\" { app-id \"^(?i:org\\\\.keepassxc\\\\.KeePassXC|keepassxc)$\"; }
+windowrule \"sensitivity secret\" { app-id \"^(?i:bitwarden|com\\\\.bitwarden\\\\.desktop)$\"; }
+input-method { allow \"fcitx5\" \"kime\" \"squeekboard\"; }
+clipboard { data-control-allow \"/bin/lunarclip\"; }
+capture { allow \"/bin/lunarshot\"; }
+toplevel-management { allow \"/bin/lunarbar\" \"/bin/lunarrun\" \"/bin/lunardesk\"; }
 ";
 
 /// `/usr/local/bin/eclipse-abyss`: the session's environment, then Abyss.
@@ -217,18 +252,26 @@ pub(super) fn write_services(svc_dir: &Path) {
                 .into(),
         ),
     ];
-    for bin in ["ec-wallpaper", "ec-hyperion-bar"] {
+    // Abyss's bar; lunarbg and lunarclip through the same wrappers as under
+    // labwc (they take whichever wayland-N socket exists).
+    for (name, exec) in [
+        (
+            "hyperion-bar",
+            "/usr/local/bin/eclipse-abyss-client ec-hyperion-bar",
+        ),
+        ("lunarbg", "/usr/local/bin/eclipse-lunarbg"),
+        ("lunarclip", "/usr/local/bin/eclipse-lunarclip"),
+    ] {
         files.push((
-            format!("abyss-{}.service", bin.trim_start_matches("ec-")),
+            format!("abyss-{name}.service"),
             format!(
-                "# {bin} for the Abyss session.\n\
-                 exec = /usr/local/bin/eclipse-abyss-client {bin}\n\
+                "# {name} for the Abyss session.\n\
+                 exec = {exec}\n\
                  type = respawn\n\
                  after = abyss\n\
                  requires = abyss\n\
                  wait_socket = /run/user/0/eclipse/abyss.sock\n\
-                 desktop = abyss\n\
-                 log = /tmp/{bin}.log\n"
+                 desktop = abyss\n"
             ),
         ));
     }
@@ -258,7 +301,7 @@ mod tests {
             assert!(!body.contains("desktop = labwc"), "{body}");
             n += 1;
         }
-        assert_eq!(n, 4);
+        assert_eq!(n, 5);
         let _ = fs::remove_dir_all(&dir);
     }
 

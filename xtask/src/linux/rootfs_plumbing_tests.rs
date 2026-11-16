@@ -642,13 +642,19 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-abyss-client ec-hyperion-bar",
             "abyss",
         ),
-        ("abyss-seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
         (
-            "abyss-wallpaper",
+            "abyss-lunarbg",
             "respawn",
-            "/usr/local/bin/eclipse-abyss-client ec-wallpaper",
+            "/usr/local/bin/eclipse-lunarbg",
             "abyss",
         ),
+        (
+            "abyss-lunarclip",
+            "respawn",
+            "/usr/local/bin/eclipse-lunarclip",
+            "abyss",
+        ),
+        ("abyss-seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
         (
             "boot-sound",
             "oneshot",
@@ -1705,7 +1711,8 @@ fn the_two_sessions_never_start_each_others_clients() {
         "abyss",
         "abyss-hyperion-bar",
         "abyss-seatd",
-        "abyss-wallpaper",
+        "abyss-lunarbg",
+        "abyss-lunarclip",
     ];
     const EITHER: &[&str] = &[
         "dbus",
