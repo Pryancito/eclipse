@@ -1,8 +1,9 @@
-//! Abyss, the second (optional) desktop session: the Wayland compositor and
-//! its shell from the `desktop` submodule (Pryancito/desktop, a fork of
-//! chasebrowndev/EclipseOS). labwc stays the default; Abyss runs only when
-//! the boot picks it, with `desktop=abyss` on the command line or `abyss` in
-//! `/etc/eclipse/desktop` (eclipse-init's `selected_desktop`).
+//! Abyss, the default desktop session: the Wayland compositor and its shell
+//! from the `desktop` submodule (Pryancito/desktop, a fork of
+//! chasebrowndev/EclipseOS). It is what `/etc/eclipse/desktop` names when the
+//! image carries it (see [`session`]); labwc is the optional session, picked
+//! with `desktop=labwc` on the command line or `labwc` in that file
+//! (eclipse-init's `selected_desktop`).
 //!
 //! Licence: everything under `desktop/` is AGPL-3.0-only (its protocol crates
 //! and SDKs are Apache-2.0). It is built and shipped as separate programs; no
@@ -13,7 +14,7 @@
 //! libinput, libudev, GBM/EGL and xkbcommon, so it is only built when the host
 //! architecture is the image's, and every step is best-effort. A missing
 //! submodule, a missing `-dev` package or a failed build just leaves the image
-//! without the second session; labwc is untouched either way.
+//! without Abyss, and then the image boots labwc as before.
 //!
 //! It lives apart from `linux/mod.rs` because that file sits at its size
 //! ceiling (see `xtask/src/tamano.rs`).
@@ -37,6 +38,19 @@ const SHELL_BINS: &[&str] = &["ec-hyperion-bar", "ec-launcher", "ec-settings"];
 /// The submodule's checkout.
 fn desktop_dir() -> PathBuf {
     PROJECT_DIR.join("desktop")
+}
+
+/// The session `/etc/eclipse/desktop` gets. Abyss replaces labwc as the
+/// default, but only when its compositor actually landed in `usr/bin`: an
+/// image built without the submodule, on another architecture or with a failed
+/// build must not boot hunting for a binary it does not carry. Any other
+/// default (`none` on the minimal image) is kept as it is.
+pub(super) fn session<'a>(rootfs: &Path, default: &'a str) -> &'a str {
+    if default == "labwc" && rootfs.join("usr/bin/ec-abyss").is_file() {
+        "abyss"
+    } else {
+        default
+    }
 }
 
 impl LinuxRootfs {
@@ -302,6 +316,17 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abyss_is_the_default_only_when_installed() {
+        let dir = std::env::temp_dir().join(format!("abyss-sess-{}", std::process::id()));
+        fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        assert_eq!(session(&dir, "labwc"), "labwc");
+        fs::write(dir.join("usr/bin/ec-abyss"), "").unwrap();
+        assert_eq!(session(&dir, "labwc"), "abyss");
+        assert_eq!(session(&dir, "none"), "none");
         let _ = fs::remove_dir_all(&dir);
     }
 
