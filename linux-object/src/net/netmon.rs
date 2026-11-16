@@ -1,9 +1,9 @@
 //! What hunter's network monitor (`hunter::netmon`) is told about: every inet
 //! socket a process holds, with the process.
 //!
-//! `/proc/net/tcp` walks the smoltcp socket set, which knows ports and states
-//! and nothing about owners. Ownership lives in the descriptor tables, so this
-//! walks those instead: one [`hunter::netmon::Sock`] per (process, socket),
+//! Ownership lives in the descriptor tables, so this walks those and asks
+//! each socket what it is, whichever stack carries it (the kernel's own or
+//! the one that runs as a process): one [`hunter::netmon::Sock`] per (process, socket),
 //! the way `netstat -p` pairs them on Linux. A socket inherited across `fork`
 //! shows under each holder.
 
