@@ -187,13 +187,12 @@ fn gpuobj_free_frees_the_rm_class_and_reports_one_the_rm_no_longer_has() {
 }
 
 /// A GPU the id table cannot size (no VRAM figure and an architecture
-/// without a floor) is capped at the global GEM ceiling alone, so a
-/// GEM_NEW that fits it goes on to the RM (ENODEV here, none attached)
-/// where a board sized at 1 MiB refuses the same request at its own
-/// ceiling (ENOMEM). And `GET_ZCULL_INFO` is ENOSYS by design: mesa
+/// without a floor) gets the 4 GiB card quota (`gem_quota::card_cap`), so a
+/// GEM_NEW that fits it goes on to the RM (ENODEV here, none attached), and
+/// so does a board sized at 1 MiB: twice its VRAM is under the floor. And `GET_ZCULL_INFO` is ENOSYS by design: mesa
 /// probes it and tolerates the refusal.
 #[test]
-fn a_gpu_without_a_vram_figure_is_capped_at_the_global_ceiling_and_zcull_info_is_enosys() {
+fn a_gpu_without_a_vram_figure_gets_the_4_gib_floor_and_zcull_info_is_enosys() {
     let _g = LOCK.lock();
     let _live = LiveBytes::hold();
     nv::set_enabled(true);
@@ -202,14 +201,19 @@ fn a_gpu_without_a_vram_figure_is_capped_at_the_global_ceiling_and_zcull_info_is
     assert_eq!(
         gem_new(&gpu, 3 * MIB, nv::NOUVEAU_GEM_DOMAIN_GART, A),
         Err(nv::ENODEV),
-        "within the global ceiling: on to the RM, which is not there"
+        "within the 4 GiB floor: on to the RM, which is not there"
     );
     gpu.architecture = NvidiaArchitecture::Turing;
     gpu.vram_size_mb = 1;
     assert_eq!(
         gem_new(&gpu, 3 * MIB, nv::NOUVEAU_GEM_DOMAIN_GART, A),
+        Err(nv::ENODEV),
+        "twice a 1 MiB board is under the floor, which holds"
+    );
+    assert_eq!(
+        gem_new(&gpu, 257 * MIB, nv::NOUVEAU_GEM_DOMAIN_GART, A),
         Err(nv::ENOMEM),
-        "twice the board's VRAM is the ceiling: 2 MiB"
+        "the single-allocation cap still holds"
     );
     let mut probe = 0u64;
     assert_eq!(
