@@ -43,6 +43,98 @@ pub struct TicketMutexGuard<'a, T: ?Sized + 'a> {
 unsafe impl<T: ?Sized + Send> Sync for TicketMutex<T> {}
 unsafe impl<T: ?Sized + Send> Send for TicketMutex<T> {}
 
+/// The holder's record of one lock, for the waiter that reports it.
+struct Holder<'a> {
+    file: &'a AtomicUsize,
+    file_len: &'a AtomicUsize,
+    line_cpu: &'a AtomicUsize,
+}
+
+/// Spin until `ticket` is the one served.
+///
+/// What [`TicketMutex::lock`] does when the lock is not free. Not generic and
+/// never inlined: one copy for every kind of lock in the kernel, kept away
+/// from the path of the lock that is free.
+#[cold]
+#[inline(never)]
+fn wait_turn(
+    next_serving: &AtomicUsize,
+    ticket: usize,
+    holder: Holder<'_>,
+    caller: &'static core::panic::Location<'static>,
+) {
+    let mut spins: u64 = 0;
+    while next_serving.load(Ordering::Acquire) != ticket {
+        core::hint::spin_loop();
+        spins += 1;
+        // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
+        // IPIs, and someone else is spin-waiting for our ack — see
+        // `set_spin_pump`. Drain our queue at a cadence that keeps ack
+        // latency in microseconds while costing one relaxed load per 512
+        // spins when there is nothing pending.
+        if spins & 511 == 0 {
+            crate::deadlock::spin_pump();
+        }
+        // Same-cpu re-entrancy is never contention: a ticket lock is not
+        // re-entrant, so if the recorded holder is THIS cpu, this acquire
+        // can only be nested inside the holder's critical section and will
+        // spin forever. Detect it after a token number of spins (a real
+        // release needs none of this cpu's cycles, so a handful of spins
+        // with ourselves as holder is already conclusive) and report both
+        // sites immediately instead of after the multi-second threshold —
+        // turning a probabilistic wedge into an instant, named report.
+        if spins == 1024 || spins == 131_072 {
+            // Two sightings, well apart, both naming THIS cpu as holder.
+            // One read is not proof: the holder record is stamped after the
+            // acquire and cleared on release, so a single read can catch
+            // the previous owner's stale record — and this cpu may BE that
+            // previous owner. A same-cpu record still standing after 130k
+            // further spins cannot be stale (a release needs none of our
+            // cycles and clears it; a new owner restamps it), so only then
+            // is it reported. Observed before the re-check: a banner with
+            // holder==waiter and the run completing anyway.
+            let hf = holder.file.load(Ordering::Acquire);
+            if hf != 0 {
+                let lc = holder.line_cpu.load(Ordering::Relaxed);
+                if (lc >> 32) as u32 == crate::interrupt::current_cpu_id() as u32
+                    && spins == 131_072
+                {
+                    report_deadlock(caller.file(), caller.line());
+                    let hl = holder.file_len.load(Ordering::Relaxed);
+                    crate::deadlock::report_deadlock_holder(
+                        hf,
+                        hl,
+                        (lc & 0xffff_ffff) as u32,
+                        (lc >> 32) as u32,
+                    );
+                }
+            }
+        }
+        if spins == crate::deadlock::deadlock_spins() {
+            // Many seconds of continuous spinning with IRQs off: this CPU
+            // is almost certainly part of a deadlock. Self-report the stuck
+            // call site (once), then keep spinning — if the holder ever
+            // releases, behavior is unchanged.
+            report_deadlock(caller.file(), caller.line());
+            // Also report WHO holds the lock we are stuck on: after ~8s of
+            // continuous spinning the recorded holder is the wedged owner,
+            // not some transient contender. Best effort — a release racing
+            // this snapshot just reads as "no holder" and is skipped.
+            let hf = holder.file.load(Ordering::Acquire);
+            if hf != 0 {
+                let hl = holder.file_len.load(Ordering::Relaxed);
+                let lc = holder.line_cpu.load(Ordering::Relaxed);
+                crate::deadlock::report_deadlock_holder(
+                    hf,
+                    hl,
+                    (lc & 0xffff_ffff) as u32,
+                    (lc >> 32) as u32,
+                );
+            }
+        }
+    }
+}
+
 impl<T> TicketMutex<T> {
     #[inline(always)]
     pub const fn new(data: T) -> Self {
@@ -85,81 +177,58 @@ impl<T: ?Sized> TicketMutex<T> {
             .store(file.as_ptr() as usize, Ordering::Release);
     }
 
+    /// Take the lock, waiting for it in line.
+    ///
+    /// The lock that is free is the whole of this function: a ticket, one
+    /// look at who is served, the holder's record and the guard. A lock that
+    /// is held is [`lock_held`](Self::lock_held)'s from there to the end, out
+    /// of line, so that the spins it counts and the reports it writes cost
+    /// the free lock nothing: with them in here this function saved and
+    /// restored five registers around a loop it almost never entered, and was
+    /// a seventh of everything the kernel ran for a small TCP echo.
     #[track_caller]
     pub fn lock(&self) -> TicketMutexGuard<'_, T> {
         let cpu = push_off();
         let caller = core::panic::Location::caller();
-        let mut spins: u64 = 0;
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        while self.next_serving.load(Ordering::Acquire) != ticket {
-            core::hint::spin_loop();
-            spins += 1;
-            // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
-            // IPIs, and someone else is spin-waiting for our ack — see
-            // `set_spin_pump`. Drain our queue at a cadence that keeps ack
-            // latency in microseconds while costing one relaxed load per 512
-            // spins when there is nothing pending.
-            if spins & 511 == 0 {
-                crate::deadlock::spin_pump();
-            }
-            // Same-cpu re-entrancy is never contention: a ticket lock is not
-            // re-entrant, so if the recorded holder is THIS cpu, this acquire
-            // can only be nested inside the holder's critical section and will
-            // spin forever. Detect it after a token number of spins (a real
-            // release needs none of this cpu's cycles, so a handful of spins
-            // with ourselves as holder is already conclusive) and report both
-            // sites immediately instead of after the multi-second threshold —
-            // turning a probabilistic wedge into an instant, named report.
-            if spins == 1024 || spins == 131_072 {
-                // Two sightings, well apart, both naming THIS cpu as holder.
-                // One read is not proof: the holder record is stamped after the
-                // acquire and cleared on release, so a single read can catch
-                // the previous owner's stale record — and this cpu may BE that
-                // previous owner. A same-cpu record still standing after 130k
-                // further spins cannot be stale (a release needs none of our
-                // cycles and clears it; a new owner restamps it), so only then
-                // is it reported. Observed before the re-check: a banner with
-                // holder==waiter and the run completing anyway.
-                let hf = self.holder_file.load(Ordering::Acquire);
-                if hf != 0 {
-                    let lc = self.holder_line_cpu.load(Ordering::Relaxed);
-                    if (lc >> 32) as u32 == crate::interrupt::current_cpu_id() as u32
-                        && spins == 131_072
-                    {
-                        report_deadlock(caller.file(), caller.line());
-                        let hl = self.holder_file_len.load(Ordering::Relaxed);
-                        crate::deadlock::report_deadlock_holder(
-                            hf,
-                            hl,
-                            (lc & 0xffff_ffff) as u32,
-                            (lc >> 32) as u32,
-                        );
-                    }
-                }
-            }
-            if spins == crate::deadlock::deadlock_spins() {
-                // Many seconds of continuous spinning with IRQs off: this CPU
-                // is almost certainly part of a deadlock. Self-report the stuck
-                // call site (once), then keep spinning — if the holder ever
-                // releases, behavior is unchanged.
-                report_deadlock(caller.file(), caller.line());
-                // Also report WHO holds the lock we are stuck on: after ~8s of
-                // continuous spinning the recorded holder is the wedged owner,
-                // not some transient contender. Best effort — a release racing
-                // this snapshot just reads as "no holder" and is skipped.
-                let hf = self.holder_file.load(Ordering::Acquire);
-                if hf != 0 {
-                    let hl = self.holder_file_len.load(Ordering::Relaxed);
-                    let lc = self.holder_line_cpu.load(Ordering::Relaxed);
-                    crate::deadlock::report_deadlock_holder(
-                        hf,
-                        hl,
-                        (lc & 0xffff_ffff) as u32,
-                        (lc >> 32) as u32,
-                    );
-                }
-            }
+        if self.next_serving.load(Ordering::Acquire) != ticket {
+            return self.lock_held(ticket, caller, cpu);
         }
+        self.served(ticket, caller, cpu)
+    }
+
+    /// The rest of [`lock`](Self::lock) for a lock somebody holds: wait for
+    /// `ticket`'s turn, then what the free lock does.
+    #[cold]
+    #[inline(never)]
+    fn lock_held(
+        &self,
+        ticket: usize,
+        caller: &'static core::panic::Location<'static>,
+        cpu: u8,
+    ) -> TicketMutexGuard<'_, T> {
+        wait_turn(
+            &self.next_serving,
+            ticket,
+            Holder {
+                file: &self.holder_file,
+                file_len: &self.holder_file_len,
+                line_cpu: &self.holder_line_cpu,
+            },
+            caller,
+        );
+        self.served(ticket, caller, cpu)
+    }
+
+    /// `ticket` is the one served: write down who holds the lock and hand
+    /// out its guard.
+    #[inline(always)]
+    fn served(
+        &self,
+        ticket: usize,
+        caller: &'static core::panic::Location<'static>,
+        cpu: u8,
+    ) -> TicketMutexGuard<'_, T> {
         self.record_holder(caller, cpu);
         TicketMutexGuard {
             next_serving: &self.next_serving,
@@ -170,7 +239,7 @@ impl<T: ?Sized> TicketMutex<T> {
             // so there's no other thread accessing the data.
             //
             // Every other thread has another ticket number so it's
-            // definitely stuck in the spin loop above.
+            // definitely stuck in the spin loop of `wait_turn`.
             data: unsafe { &mut *self.data.get() },
         }
     }

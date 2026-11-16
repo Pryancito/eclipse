@@ -542,6 +542,7 @@ pub fn lock_depth() -> i32 {
 ///
 /// Answers which CPU this is, for the caller that wants to write it down
 /// (the lock's holder record) and would otherwise ask again.
+#[inline]
 pub(crate) fn push_off() -> u8 {
     let old = intr_get();
     intr_off();

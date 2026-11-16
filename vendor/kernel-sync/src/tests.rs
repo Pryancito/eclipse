@@ -1075,6 +1075,34 @@ fn a_ticket_lock_serves_in_the_order_it_handed_the_tickets_out() {
     });
 }
 
+/// The lock that was held when it was asked for is taken out of line
+/// (`lock_held`), and what comes out of there is the same as what the free
+/// lock hands out: the waiter is the holder on record, with the data.
+#[test]
+fn a_cpu_that_waited_for_the_lock_is_the_holder_on_record_once_it_is_in() {
+    static LOCK: Ticket<u32> = Ticket::new(0);
+    on_a_cpu(|| {
+        *LOCK.lock() = 0;
+        let held = LOCK.lock();
+        let before = LOCK.next_ticket_for_test();
+        let waiter = std::thread::spawn(|| {
+            on_a_cpu(|| {
+                let mut g = LOCK.lock();
+                assert!(LOCK.holder_is_current_cpu(), "the one that waited holds it");
+                *g += 1;
+            })
+        });
+        while LOCK.next_ticket_for_test() == before {
+            std::thread::yield_now();
+        }
+        assert!(LOCK.holder_is_current_cpu(), "still ours while it waits");
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(*LOCK.lock(), 1);
+        assert!(!LOCK.is_locked());
+    });
+}
+
 #[test]
 fn a_try_lock_takes_a_ticket_and_gives_the_queue_back_when_it_fails() {
     on_a_cpu(|| {

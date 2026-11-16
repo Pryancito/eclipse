@@ -48,6 +48,10 @@ struct Inner {
     chunks: VecDeque<Vec<u8>>,
     /// How much of the first piece was read already.
     read_at: usize,
+    /// The last small piece that was read whole, empty, for the next
+    /// bytes that fit in it: a request and its answer, one after the
+    /// other, do not reserve and free a piece each.
+    spare: Option<Vec<u8>>,
     /// The bytes in `chunks` not read yet.
     queued: usize,
     /// The bytes read since the stack was last told (`WINDOW`).
@@ -90,6 +94,7 @@ impl Inner {
             phase,
             chunks: VecDeque::new(),
             read_at: 0,
+            spare: None,
             queued: 0,
             unsaid: 0,
             credit: 0,
@@ -146,13 +151,33 @@ impl Inner {
                 }
                 left -= first;
                 self.read_at = 0;
-                self.chunks.pop_front();
+                if let Some(mut read) = self.chunks.pop_front() {
+                    if self.spare.is_none() && read.capacity() <= SPARE_MAX {
+                        read.clear();
+                        self.spare = Some(read);
+                    }
+                }
             }
             self.queued -= done;
         }
         done
     }
+
+    /// Queue `bytes` as one more piece, in the spare one when they fit.
+    fn queue(&mut self, bytes: &[u8]) {
+        let mut piece = match self.spare.take() {
+            Some(spare) if spare.capacity() >= bytes.len() => spare,
+            _ => Vec::with_capacity(bytes.len()),
+        };
+        piece.extend_from_slice(bytes);
+        self.queued += bytes.len();
+        self.chunks.push_back(piece);
+    }
 }
+
+/// The largest piece a socket keeps empty for the bytes that come next
+/// (`Inner::spare`): what an idle socket holds on to at most.
+const SPARE_MAX: usize = 2048;
 
 /// Whether a read would not wait.
 fn readable(inner: &Inner) -> bool {
@@ -457,8 +482,7 @@ impl StackLink {
                         // the peer is not left waiting for room.
                         say = inner.consumed(bytes.len());
                     } else {
-                        inner.queued += bytes.len();
-                        inner.chunks.push_back(bytes.to_vec());
+                        inner.queue(bytes);
                         stream.sync(&inner, Event::READABLE);
                     }
                 }
@@ -3095,5 +3119,59 @@ mod tests {
         events(&stack, &[(sock, EV_CREDIT, 8, &[])]);
         assert!(room().unwrap().write);
         assert_eq!(Socket::write(&s, b"ef", None), Ok(2));
+    }
+
+    /// A small piece that was read whole is the one the next bytes are
+    /// queued in: a request and an answer, in turns, reserve nothing.
+    #[test]
+    fn a_small_piece_read_whole_is_kept_for_the_bytes_that_come_next() {
+        let mut inner = Inner::new(Phase::Open);
+        inner.queue(b"first words");
+        let piece = inner.chunks[0].as_ptr();
+        let mut buf = [0u8; 32];
+        assert_eq!(inner.copy_out(&mut buf, true), 11);
+        assert_eq!(&buf[..11], b"first words");
+        assert_eq!(inner.queued, 0);
+
+        inner.queue(b"the next");
+        assert_eq!(inner.chunks[0].as_ptr(), piece);
+        assert!(inner.spare.is_none());
+        assert_eq!(inner.copy_out(&mut buf, true), 8);
+        assert_eq!(&buf[..8], b"the next");
+    }
+
+    /// What does not fit in the spare piece gets one of its own, and the
+    /// bytes come out as they went in whatever piece they were in.
+    #[test]
+    fn bytes_that_do_not_fit_in_the_spare_piece_get_their_own() {
+        let mut inner = Inner::new(Phase::Open);
+        inner.queue(b"ab");
+        let mut buf = [0u8; 64];
+        assert_eq!(inner.copy_out(&mut buf, true), 2);
+        assert!(inner.spare.is_some());
+
+        inner.queue(b"longer than two");
+        inner.queue(b"cd");
+        // Looked at, not taken: nothing is kept of a piece still queued.
+        assert_eq!(inner.copy_out(&mut buf[..6], false), 6);
+        assert_eq!(inner.copy_out(&mut buf[..6], true), 6);
+        assert_eq!(&buf[..6], b"longer");
+        assert_eq!(inner.copy_out(&mut buf, true), 11);
+        assert_eq!(&buf[..11], b" than twocd");
+        assert_eq!(inner.queued, 0);
+        assert!(inner.chunks.is_empty());
+    }
+
+    /// A large piece is freed when it is read: an idle socket holds on to
+    /// `SPARE_MAX` bytes at most.
+    #[test]
+    fn a_large_piece_is_not_kept_once_read() {
+        let mut inner = Inner::new(Phase::Open);
+        let big = vec![3u8; SPARE_MAX + 1];
+        inner.queue(&big);
+        let mut buf = vec![0u8; big.len()];
+        assert_eq!(inner.copy_out(&mut buf, true), big.len());
+        assert_eq!(buf, big);
+        assert!(inner.spare.is_none());
     }
 }
