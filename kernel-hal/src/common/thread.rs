@@ -28,10 +28,17 @@ pub async fn preempt_now() {
     YieldFuture::involuntary().await
 }
 
-/// Whether [`preempt_behind`] files the thread behind the woken ones. On by
-/// default; `PREEMPTBEHIND=0` on the kernel command line turns it off, for
-/// A/B runs on one build.
-static PREEMPT_BEHIND: AtomicBool = AtomicBool::new(true);
+/// Whether [`preempt_behind`] files the thread behind the woken ones. Off by
+/// default; `PREEMPTBEHIND=1` on the kernel command line turns it on.
+///
+/// It was on by default, and a GPU desktop froze for about 20 s every minute
+/// on real hardware (2x RTX 2060 SUPER, labwc and Abyss alike), gone with
+/// `PREEMPTBEHIND=0`. A desktop on the GPU always has woken tasks waiting
+/// (vblank timers, fence polls of a few hundred microseconds), so a thread
+/// that renders in user mode, put behind them, got only the quota's 250 us
+/// turns. The clients waiting for its buffers kept polling until their own
+/// 10 s fence timeouts gave up. Linux's CFS has no such lane.
+static PREEMPT_BEHIND: AtomicBool = AtomicBool::new(false);
 
 /// Turn [`preempt_behind`] on or off. Called once at boot from the command
 /// line.
@@ -69,7 +76,11 @@ pub async fn preempt_behind() {
     if !preempt_behind_enabled() {
         return YieldFuture::involuntary().await;
     }
+    #[cfg(target_os = "none")]
+    let behind_at = crate::timer::timer_now();
     YieldFuture::voluntary().await;
+    #[cfg(target_os = "none")]
+    note_behind_wait(crate::timer::timer_now().saturating_sub(behind_at));
     // Back by the run queue's quota, past a woken task that is still
     // waiting: this is a short turn, and a timer says when it is over
     // ([`quota_turn_over`]). Only a thread that came back this way gets
@@ -84,6 +95,41 @@ pub async fn preempt_behind() {
         crate::timer::timer_set(end, alloc::boxed::Box::new(|_| {}));
         BEHIND_STATS[1].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A wait behind the woken ones past this is worth a `klog` line: it is
+/// the starvation that froze a GPU desktop with this on by default.
+#[cfg(target_os = "none")]
+const BEHIND_WAIT_WARN_NS: u64 = 100_000_000;
+
+/// When the last such line went out, so there is at most one a second.
+#[cfg(target_os = "none")]
+static BEHIND_WARNED_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Say so when a thread put behind the woken ones waited long for the CPU.
+#[cfg(target_os = "none")]
+fn note_behind_wait(waited: Duration) {
+    let waited_ns = waited.as_nanos() as u64;
+    if waited_ns < BEHIND_WAIT_WARN_NS {
+        return;
+    }
+    let now = crate::timer::timer_now().as_nanos() as u64;
+    let last = BEHIND_WARNED_AT_NS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1_000_000_000 {
+        return;
+    }
+    if BEHIND_WARNED_AT_NS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::klog_warn!(
+        "[sched] PREEMPTBEHIND: un hilo puesto detras de los despertados espero {} ms la CPU \
+         (cpu {}); si el escritorio se congela, arranca sin PREEMPTBEHIND=1",
+        waited_ns / 1_000_000,
+        crate::cpu::cpu_id()
+    );
 }
 
 /// `[put behind, quota turns given, quota turns ended by the trap path]`.

@@ -146,15 +146,22 @@ Es decir: el temporizador por plazo vale ~3-4x en latencia de `sleep`, y la
 preempción por despertar vale **~9x** en el pipe bajo carga. Ninguno de los dos
 degrada las cifras en reposo.
 
-Un tercer interruptor, `PREEMPTBEHIND=0`, devuelve al carril de los despertados
-al hilo que se desaloja en modo usuario. Por defecto, si ha pasado más de la
-mitad de la CPU en modo usuario en la última ventana de 20 ms, ese hilo va detrás
-de los despertados (`kernel_hal::thread::preempt_behind`), y la cuota del carril
-de cesión le da turnos de 250 µs mientras haya despertados esperando.
+Un tercer interruptor, `PREEMPTBEHIND=1`, está **apagado por defecto**. Encendido,
+si un hilo desalojado en modo usuario ha pasado más de la mitad de la CPU en modo
+usuario en la última ventana de 20 ms, va detrás de los despertados
+(`kernel_hal::thread::preempt_behind`), y la cuota del carril de cesión le da
+turnos de 250 µs mientras haya despertados esperando. Estuvo encendido por
+defecto y congelaba el escritorio en GPU (2x RTX 2060 SUPER, labwc y Abyss) unos
+20 s cada minuto: en un escritorio en GPU siempre hay despertados esperando
+(timers de vblank, sondeos de fences), así que el hilo que pinta se quedaba con
+turnos de 250 µs hasta que vencían los timeouts de 10 s de las fences. Con él
+encendido, una espera detrás de los despertados de más de 100 ms deja una línea
+`[sched] PREEMPTBEHIND:` en `dmesg`. Las cifras de abajo son de cuando estaba
+encendido por defecto.
 `sched mode:` dice si está activo y cuántas veces ha actuado. Bajo
 `-icount shift=2`, con 1 CPU y `VDSOFORCE=1`, tres arranques de cada:
 
-| | por defecto | `PREEMPTBEHIND=0` |
+| | `PREEMPTBEHIND=1` | apagado (por defecto) |
 | --- | ---: | ---: |
 | pipe ida/vuelta **carga** | **323-380 us** | 2 195-2 557 us |
 | reparto justo, bucle frente a hilo que se aparca | 1,13-1,15x | 1,31-1,41x |

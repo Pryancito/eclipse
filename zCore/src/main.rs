@@ -377,11 +377,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
         }
         // A thread taken off the CPU in user mode waits behind the woken
-        // ones (see `kernel_hal::thread::preempt_behind`): on by default.
-        let behind = !kernel_hal::cmdline::is_off(&options.cmdline, "PREEMPTBEHIND");
+        // ones (see `kernel_hal::thread::preempt_behind`): off by default,
+        // because on a GPU desktop it froze the screen ~20 s every minute;
+        // `PREEMPTBEHIND=1` turns it on.
+        let behind = kernel_hal::cmdline::flag(&options.cmdline, "PREEMPTBEHIND");
         kernel_hal::thread::set_preempt_behind(behind);
-        if !behind {
-            klog_info!("Eclipse: preempted threads in the woken lane (PREEMPTBEHIND=0)");
+        if behind {
+            klog_info!("Eclipse: preempted threads behind the woken ones (PREEMPTBEHIND=1)");
         }
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
