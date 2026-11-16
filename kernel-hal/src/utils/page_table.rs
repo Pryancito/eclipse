@@ -58,6 +58,19 @@ pub trait GenericPTE: Debug + Clone + Copy + Sync + Send {
     /// [`GenericPTE::dirty`] is `None` is never believed in the first place.
     fn set_dirty(&mut self) {}
 
+    /// Forget the write recorded through this entry, when the format keeps
+    /// one and this entry can be made to record the next: `false`, and the
+    /// entry untouched, otherwise.
+    ///
+    /// This is half of an operation. An entry cleared here still sits, with
+    /// the bit set, in the TLB of every CPU that wrote through it, and such a
+    /// CPU writes again without touching the entry: the page would read clean
+    /// after being written. The caller invalidates those TLBs before anyone
+    /// may write the page ([`PageTableImpl::clear_dirty_range`]'s contract).
+    fn clear_dirty(&mut self) -> bool {
+        false
+    }
+
     /// Whether this leaf carries [`MMUFlags::SPECIAL`]: Linux's `pte_special`.
     ///
     /// `false` by default, which is sound because the page table asks the
@@ -168,6 +181,23 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         let p2 = next_table_mut(p3e)?;
         let p2e = &p2[p2_index(vaddr)];
         Ok(next_table_mut(p2e)?)
+    }
+
+    /// [`Self::p1_table_of`], to write an entry of it.
+    fn p1_table_of_mut(&mut self, vaddr: VirtAddr) -> PagingResult<&mut [PTE]> {
+        let p3 = if L::LEVEL == 3 {
+            table_of_mut::<PTE>(self.table_phys())
+        } else if L::LEVEL == 4 {
+            let p4 = table_of_mut::<PTE>(self.table_phys());
+            let p4e = &p4[p4_index(vaddr)];
+            next_table_mut(p4e)?
+        } else {
+            unreachable!()
+        };
+        let p3e = &p3[p3_index(vaddr)];
+        let p2 = next_table_mut(p3e)?;
+        let p2e = &p2[p2_index(vaddr)];
+        next_table_mut(p2e)
     }
 
     /// Replace the huge leaf that describes `vaddr` with a table of
@@ -405,9 +435,11 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
     /// of pages at the top, and poisoning only those is the difference between
     /// 2 MiB and a few pages of stores on every preemption-mid-poll. What
     /// makes it safe rather than hopeful is that the answer comes from the
-    /// hardware's own dirty bit, which nothing here ever clears: it is
-    /// monotone per frame, so it can only ever over-report, and over-reporting
-    /// costs stores.
+    /// hardware's own dirty bit, which is cleared in one place only
+    /// ([`Self::clear_dirty_range`], on a region that has just been poisoned
+    /// whole and with every TLB flushed behind it): between two of those it
+    /// is monotone per frame, so it can only ever over-report, and
+    /// over-reporting costs stores.
     ///
     /// The scan runs bottom-up and stops at the **first** dirty page, which is
     /// the deepest one: every page above it is inside the answer anyway, so
@@ -453,6 +485,41 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
             }
         }
         Some(0)
+    }
+
+    /// Forget the writes recorded on the 4 KiB pages of `[base, base +
+    /// size)`, and return how many pages now read clean that did not.
+    ///
+    /// The other half of [`Self::dirty_depth_from_top`]: that one can only
+    /// bound the scheduler's stack poison on a region that started clean,
+    /// and a region that has just been poisoned whole is one whose pages may
+    /// start again -- what they hold is poison, and from here on a recorded
+    /// write means somebody put something else there.
+    ///
+    /// A page that is not an ordinary present 4 KiB entry, or whose format
+    /// cannot forget ([`GenericPTE::clear_dirty`]), is left as it was and
+    /// keeps reading written: the answer stays an over-estimate.
+    ///
+    /// **The caller must flush these pages from every CPU's TLB before
+    /// anything may write them**, whenever the count is not zero. A TLB entry
+    /// that already carries the bit absorbs a write without recording it.
+    pub fn clear_dirty_range(&mut self, base: VirtAddr, size: usize) -> usize {
+        const PAGE: usize = PageSize::Size4K as usize;
+        if !base.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) {
+            return 0;
+        }
+        let mut cleared = 0;
+        for off in (0..size).step_by(PAGE) {
+            let vaddr = base + off;
+            let Ok(table) = self.p1_table_of_mut(vaddr) else {
+                continue;
+            };
+            let entry = &mut table[p1_index(vaddr)];
+            if entry.is_present() && entry.dirty() == Some(true) && entry.clear_dirty() {
+                cleared += 1;
+            }
+        }
+        cleared
     }
 
     pub fn clone_kernel(&self) -> Self {
@@ -908,6 +975,13 @@ mod walker_tests {
         }
         fn set_dirty(&mut self) {
             self.0 |= D;
+        }
+        fn clear_dirty(&mut self) -> bool {
+            if self.0 & MUTE != 0 {
+                return false;
+            }
+            self.0 &= !D;
+            true
         }
         fn is_special(&self) -> bool {
             self.0 & SPECIAL != 0
@@ -2138,6 +2212,55 @@ mod walker_tests {
         let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
         set_bits(&pt, REGION, D);
         assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(8 * K));
+    }
+
+    /// Forgetting the writes of a region makes it read clean, and only the
+    /// pages that were written count.
+    #[test]
+    fn a_region_whose_writes_are_forgotten_reads_clean() {
+        let mut pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        for off in [0usize, 3, 7] {
+            set_bits(&pt, REGION + off * K, D);
+        }
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(8 * K));
+        assert_eq!(pt.clear_dirty_range(REGION, 8 * K), 3);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(0));
+        assert_eq!(pt.clear_dirty_range(REGION, 8 * K), 0, "nothing left");
+        // A write after it is seen again.
+        set_bits(&pt, REGION + 6 * K, D);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(2 * K));
+    }
+
+    /// Only the pages asked about are touched.
+    #[test]
+    fn forgetting_stops_at_the_ends_of_the_region() {
+        let mut pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        for off in 0..8 {
+            set_bits(&pt, REGION + off * K, D);
+        }
+        assert_eq!(pt.clear_dirty_range(REGION + 2 * K, 4 * K), 4);
+        assert_eq!(pt.dirty_depth_from_top(REGION + 2 * K, 4 * K), Some(0));
+        assert_eq!(pt.dirty_depth_from_top(REGION, 2 * K), Some(2 * K));
+        assert_eq!(pt.dirty_depth_from_top(REGION + 6 * K, 2 * K), Some(2 * K));
+    }
+
+    /// What cannot be forgotten is left alone and keeps the answer an
+    /// over-estimate: an entry that cannot say, a page that is not mapped, a
+    /// region that is not whole pages, a huge leaf.
+    #[test]
+    fn what_cannot_be_forgotten_is_left_as_it_was() {
+        let mut pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION + 1 * K, D | MUTE);
+        set_bits(&pt, REGION + 5 * K, D);
+        assert_eq!(pt.clear_dirty_range(REGION, 9 * K), 1, "the one that can");
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), None, "the mute one");
+        assert_eq!(pt.clear_dirty_range(REGION + 1, 8 * K), 0);
+        assert_eq!(pt.clear_dirty_range(REGION, 8 * K - 1), 0);
+
+        let mut pt = a_table::<PageTableLevel4>();
+        pt.map(Page::new_aligned(REGION, PageSize::Size2M), 16 * M, rw())
+            .unwrap();
+        assert_eq!(pt.clear_dirty_range(REGION, 8 * K), 0);
     }
 
     /// Several written pages: the answer covers the deepest, not the first

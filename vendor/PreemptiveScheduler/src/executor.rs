@@ -581,12 +581,49 @@ static STACK_DIRTY_DEPTH: spin::Mutex<Option<StackDirtyDepthHook>> = spin::Mutex
 ///
 /// El gancho tiene que **sobreestimar o acertar, nunca quedarse corto**: si
 /// devuelve `Some(n)`, ninguna palabra por debajo de `base + size - n` puede
-/// haber sido escrita desde que se creo el mapeo. Tiene que contestar sin
+/// haber sido escrita desde que se creo el mapeo, o desde la ultima vez que
+/// la zona se enveneno entera y se marco limpia
+/// ([`set_stack_mark_clean_hook`]). Tiene que contestar sin
 /// tomar cerrojos que el planificador pueda estar sosteniendo y sin derribar
 /// el TLB, porque corre dentro de `Executor::new`, con interrupciones
 /// apagadas. Un gancho que no pueda prometer eso devuelve `None`.
 pub unsafe fn set_stack_dirty_depth_hook(hook: StackDirtyDepthHook) {
     *STACK_DIRTY_DEPTH.lock() = Some(hook);
+}
+
+/// Tell the page table that `[base, base + size)` now holds poison and
+/// nothing else, so that it can forget the writes it has recorded there.
+///
+/// The dirty bit only bounds the poison if it starts clean, and on the one
+/// architecture that has it the kernel heap never does: every page of it
+/// reads written from boot, so the answer was always "the whole region" and
+/// the bound never acted (`0 bounded, 158 whole` after a file benchmark).
+/// A block that has just been poisoned whole is the one moment at which
+/// "not written since" and "holds poison" are the same statement.
+type StackMarkCleanHook = fn(base: usize, size: usize);
+
+static STACK_MARK_CLEAN: spin::Mutex<Option<StackMarkCleanHook>> = spin::Mutex::new(None);
+
+/// Register the hook that forgets recorded writes: see
+/// [`StackMarkCleanHook`].
+///
+/// # Safety
+///
+/// After the hook returns, a page of the region must read clean to the
+/// dirty-depth hook only if **no CPU can write it without that write being
+/// recorded**: clearing the bit in the entry is not enough, every TLB that
+/// may hold the entry with the bit set has to drop it first. A hook that
+/// cannot promise that for a page leaves the page as it was. It is called
+/// from `Executor::new`, interrupts off, on a block nobody else may touch.
+pub unsafe fn set_stack_mark_clean_hook(hook: StackMarkCleanHook) {
+    *STACK_MARK_CLEAN.lock() = Some(hook);
+}
+
+/// The test twin of [`set_stack_mark_clean_hook`]; take
+/// [`with_dirty_depth_hook`]'s guard first, which serialises both.
+#[cfg(test)]
+pub(crate) fn set_mark_clean_hook_for_test(hook: Option<StackMarkCleanHook>) {
+    *STACK_MARK_CLEAN.lock() = hook;
 }
 
 /// Poner o quitar el gancho, y devolver el cerrojo que serializa a los tests
@@ -660,6 +697,15 @@ pub(crate) unsafe fn poison_usable_region_bounded(base: usize, size: usize) {
     // SAFETY: `bound <= size`, asi que `[base + size - bound, base + size)`
     // cae dentro de lo que el llamante promete.
     unsafe { poison_usable_region(base + size - bound, bound) };
+    // The whole region is poison now and nothing has run on it: the one
+    // moment at which its recorded writes can be forgotten, so that the
+    // next occupant's are the only ones the bound sees.
+    if bound == size {
+        let hook = *STACK_MARK_CLEAN.lock();
+        if let Some(hook) = hook {
+            hook(base, size);
+        }
+    }
 }
 
 /// La palabra que le toca al hueco `i` de la banda de guarda.

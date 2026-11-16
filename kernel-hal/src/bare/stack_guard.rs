@@ -389,6 +389,34 @@ fn dirty_depth(base: usize, size: usize) -> Option<usize> {
     PageTable::from_current().dirty_depth_from_top(base, size)
 }
 
+/// Forget the writes recorded on a stack's usable region that has just
+/// been poisoned whole, so that [`dirty_depth`] bounds its next poison.
+///
+/// The kernel heap is `.bss`, and every page of it reads written from the
+/// start, so without this the bound never once acted: each new executor
+/// stored 2 MiB, on a path taken whenever a thread gives the CPU away in
+/// the middle of a poll.
+///
+/// The order is the whole of it: the bits first, then this CPU's TLB, then
+/// every other CPU's, and only then does the block go back to its caller.
+/// A CPU that still held one of these entries with the bit set would write
+/// the page without the write being recorded. The block is nobody's but the
+/// caller's while this runs, so nothing writes it in between.
+///
+/// What this leaves out: a CPU that cannot take the shootdown is dropped
+/// from it (`remote_flush_tlb_aspace`), as for every other change of a
+/// kernel mapping. If such a CPU later ran on this stack with a stale
+/// entry, a page it wrote would read clean and keep its frames past the
+/// next recycle -- the state every stack was in before the poison existed.
+fn mark_clean(base: usize, size: usize) {
+    let mut pt = PageTable::from_current();
+    if pt.clear_dirty_range(base, size) == 0 {
+        return;
+    }
+    crate::vm::flush_tlb(None);
+    crate::common::ipi::remote_flush_tlb_aspace(None, None);
+}
+
 /// Register this module's hooks with the scheduler.
 ///
 /// Must run after the kernel page tables are pinned and *before* the first
@@ -414,6 +442,10 @@ pub fn init() {
     // `GenericPTE::dirty`. Registered last: until it is, the scheduler
     // poisons whole regions, which is always correct.
     unsafe { executor::set_stack_dirty_depth_hook(dirty_depth) };
+    // SAFETY: [`mark_clean`] flushes every CPU's TLB after clearing the
+    // bits and before it returns, and leaves alone any page it cannot do
+    // that for.
+    unsafe { executor::set_stack_mark_clean_hook(mark_clean) };
 }
 
 /// `(bands installed, install requests refused)` since boot.

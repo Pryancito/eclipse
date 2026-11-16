@@ -147,9 +147,9 @@ impl GenericPTE for X86PTE {
     }
     /// The one format of the three whose hardware maintains this bit: the CPU
     /// sets D on the first write through the entry and never clears it by
-    /// itself. Nothing in the kernel clears it either, which is what makes it
-    /// usable without a shootdown — clearing D without invalidating every
-    /// CPU's TLB would let an entry that already has D absorb a write, and the
+    /// itself. The kernel clears it in one place, [`Self::clear_dirty`], and
+    /// only with a flush of every CPU's TLB behind it — clearing D without
+    /// one would let an entry that already has D absorb a write, and the
     /// page would read clean after being written.
     ///
     /// Only meaningful on a leaf; an intermediate table entry's bit 6 is
@@ -160,6 +160,23 @@ impl GenericPTE for X86PTE {
 
     fn set_dirty(&mut self) {
         self.0 |= PTF::DIRTY.bits();
+    }
+
+    /// Atomic, because the entry is live: a plain read-modify-write would
+    /// lose an accessed bit the CPU set in between.
+    ///
+    /// Refused on a global entry. The flush the caller owes after this is a
+    /// reload of CR3 on every CPU, which leaves global translations where
+    /// they are, and one of those with the bit set would absorb the next
+    /// write unrecorded.
+    fn clear_dirty(&mut self) -> bool {
+        if self.0 & PTF::GLOBAL.bits() != 0 || self.is_leaf() {
+            return false;
+        }
+        // SAFETY: as in `set_flags`.
+        let cell = unsafe { &*(self as *mut Self as *const AtomicU64) };
+        cell.fetch_and(!PTF::DIRTY.bits(), Ordering::AcqRel);
+        true
     }
 
     fn is_special(&self) -> bool {
