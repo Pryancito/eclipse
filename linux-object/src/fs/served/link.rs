@@ -136,7 +136,7 @@ pub(super) fn now_ms() -> u64 {
 /// What a request does while it waits: let the CPU go, and let it take
 /// interrupts. Kernel tasks run with interrupts masked, and the interrupt
 /// that wakes the server -- its disk's -- needs somewhere to land.
-pub(super) fn between_looks(wait: &mut SyncWait) {
+pub(crate) fn between_looks(wait: &mut SyncWait) {
     use kernel_hal::interrupt::{intr_get, intr_off, intr_on};
     if !intr_get() {
         intr_on();

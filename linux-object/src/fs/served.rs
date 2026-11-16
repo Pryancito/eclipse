@@ -34,6 +34,7 @@
 //! memory: only the window it gave.
 
 mod link;
+pub(crate) use link::between_looks;
 #[cfg(test)]
 mod tests;
 pub mod wire;
