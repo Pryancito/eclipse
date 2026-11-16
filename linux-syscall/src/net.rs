@@ -645,6 +645,11 @@ impl Syscall<'_> {
                 let server_side = UnixSocketState::new();
                 server_side.set_path(server.bound_path());
                 server_side.set_socket_type(server.sock_type());
+                // The client's SO_PEERCRED reads this end's owner. Left at 0
+                // it named no process, so the client saw uid -1: Abyss's
+                // ec-ipc refuses a socket "owned by uid 4294967295, not 0",
+                // and the bar and Settings never reached the compositor.
+                server_side.set_owner_pid(server.owner_pid());
                 UnixSocketState::connect_pair(&client, &server_side);
                 server.push_accept(server_side);
                 return Ok(0);

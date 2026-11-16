@@ -435,6 +435,14 @@ impl UnixSocketState {
     pub fn bound_path(&self) -> String {
         self.inner.lock().path.clone()
     }
+
+    /// The pid recorded by [`Self::set_owner_pid`]. `connect` copies a
+    /// listener's into the server end it builds, so the client's
+    /// `SO_PEERCRED` names the server process (Linux: `unix_stream_connect`
+    /// copies the listener's `sk_peer_cred` into the new socket).
+    pub fn owner_pid(&self) -> i32 {
+        self.inner.lock().owner_pid
+    }
 }
 
 impl Drop for UnixSocketState {
@@ -1476,6 +1484,20 @@ mod tests {
 
     /// A second `bind` on an already-bound socket is `EINVAL` (`unix_bind`).
     /// It used to overwrite the path and leave the first registry entry.
+    /// What `sys_connect` relies on to give the client the server's pid for
+    /// `SO_PEERCRED`: the listener's owner can be read back and copied.
+    #[test]
+    fn owner_pid_reads_back_for_the_server_end() {
+        let listener = UnixSocketState::new();
+        listener.set_owner_pid(42);
+        let server_side = UnixSocketState::new();
+        assert_eq!(server_side.owner_pid(), 0);
+        server_side.set_owner_pid(listener.owner_pid());
+        let client = UnixSocketState::new();
+        UnixSocketState::connect_pair(&client, &server_side);
+        assert_eq!(client.peer_pid(), Some(42));
+    }
+
     #[test]
     fn binding_twice_is_einval() {
         let s = UnixSocketState::new();
