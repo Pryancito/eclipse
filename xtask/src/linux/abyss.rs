@@ -238,6 +238,28 @@ pub(super) fn write_wrapper(localbin: &Path) {
           \x20 sleep 60\n\
           \x20 exit 127\n\
           fi\n\
+          # The first GPU start of a boot comes up broken on the RTX: EGL on\n\
+          # zink+NVK initialises, but the panel shows noise until Abyss is\n\
+          # killed and started again; the second start draws (labwc hits the\n\
+          # same first-start failure, see its wrapper's retry ladder). So the\n\
+          # first start of a boot is a warm-up: run Abyss until it has created\n\
+          # its scanout, stop it, and start the real one. The marker lives in\n\
+          # /run, which init wipes at boot. ECLIPSE_ABYSS_NO_WARMUP=1 skips it.\n\
+          if [ \"${MESA_LOADER_DRIVER_OVERRIDE:-}\" = zink ] && [ -z \"${ECLIPSE_ABYSS_NO_WARMUP:-}\" ] && [ ! -e /run/eclipse-abyss-warm ]; then\n\
+          \x20 : > /run/eclipse-abyss-warm\n\
+          \x20 W=/tmp/abyss-warmup.log\n\
+          \x20 /usr/bin/ec-abyss --backend drm --session >\"$W\" 2>&1 &\n\
+          \x20 pid=$!\n\
+          \x20 i=0\n\
+          \x20 while [ \"$i\" -lt 30 ] && kill -0 \"$pid\" 2>/dev/null && ! grep -q 'scanout compositor created' \"$W\" 2>/dev/null; do sleep 1; i=$((i+1)); done\n\
+          \x20 sleep 2\n\
+          \x20 kill \"$pid\" 2>/dev/null\n\
+          \x20 i=0\n\
+          \x20 while [ \"$i\" -lt 5 ] && kill -0 \"$pid\" 2>/dev/null; do sleep 1; i=$((i+1)); done\n\
+          \x20 kill -9 \"$pid\" 2>/dev/null\n\
+          \x20 wait \"$pid\" 2>/dev/null\n\
+          \x20 sleep 1\n\
+          fi\n\
           # `--session` exports WAYLAND_DISPLAY to systemd --user when there is\n\
           # one; here there is none and it skips that. eclipse-init starts the\n\
           # shell (abyss-*.service) instead.\n\
@@ -398,6 +420,11 @@ mod tests {
         assert!(s.contains("exec /usr/bin/ec-abyss --backend drm --session\n"));
         assert!(s.contains("LIBSEAT_BACKEND:=seatd"));
         assert!(s.contains("mkdir -p /tmp/.X11-unix"));
+        // The warm-up start is GPU-only, once per boot, and kills by pid.
+        let warm = s.find("/run/eclipse-abyss-warm").unwrap();
+        assert!(warm < s.find("exec /usr/bin/ec-abyss").unwrap());
+        assert!(s.contains("MESA_LOADER_DRIVER_OVERRIDE:-}\" = zink"));
+        assert!(s.contains("kill \"$pid\""));
         let c = fs::read_to_string(dir.join("eclipse-abyss-client")).unwrap();
         assert!(c.contains("WAYLAND_DISPLAY=wayland-1;"));
         let _ = fs::remove_dir_all(&dir);
