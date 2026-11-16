@@ -555,6 +555,10 @@ echo labwc > /etc/eclipse/desktop
 - **GPU**: dibuja con GLES sobre GBM/EGL. Va por la misma ruta zink+NVK que
   labwc, porque las variables de GPU las pone `eclipse-init` para todos los
   servicios.
+  Usa siempre `/dev/dri/card0`, la GPU de la pantalla (`misc.render-device`
+  en `abyss.kdl`, como `WLR_DRM_DEVICES` en labwc): su elección automática
+  busca los conectores en `/sys/class/drm/cardN-*`, que Eclipse no expone, y
+  sin esa línea Abyss no arranca («no GPU on seat 'seat0' has any connector»).
 - **Configuración**: `/etc/eclipse/abyss.kdl` (modo escritorio `de`, terminal
   `foot`); lo tuyo va en `~/.config/eclipse/abyss.kdl` o en Ajustes. Todas las
   claves: `desktop/docs/CONFIG.md`.
