@@ -1118,12 +1118,12 @@ impl Syscall<'_> {
         let cap_len = len.min(super::SYSCALL_IO_MAX);
         // Fallible: same ceiling as `sys_read`. `vec![0; n]` here took the
         // machine down under heap pressure from a multi-GB download.
-        let mut data = crate::try_zeroed_buf(cap_len)?;
+        let mut data = crate::RecvBuf::new(cap_len)?;
         let socket = file_like.as_socket()?;
         let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
-            socket.peek(&mut data).await
+            socket.peek(data.buf()).await
         } else {
-            socket.read(&mut data).await
+            socket.read(data.buf()).await
         };
         if force_nonblock {
             let _ = file_like.set_flags(old_flags);
@@ -1133,7 +1133,9 @@ impl Syscall<'_> {
                 let sockaddr_in = SockAddr::from(endpoint);
                 sockaddr_in.write_to(src_addr, addrlen)?;
             }
-            buf.write_array(&data[..received])?;
+            // `received` can be the size of a datagram that did not fit
+            // (`MSG_TRUNC`): what was written is at most the buffer.
+            buf.write_array(data.wrote(received))?;
             Ok(received)
         } else {
             result
@@ -1312,7 +1314,7 @@ impl Syscall<'_> {
         let mut iovs = self.read_iovecs(iov_ptr, iovlen)?;
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let total_len = iovs.total_len().min(message_io_cap(&file_like));
-        let mut data = crate::try_zeroed_buf(total_len)?;
+        let mut data = crate::RecvBuf::new(total_len)?;
 
         let old_flags = file_like.flags();
         let force_nonblock =
@@ -1322,9 +1324,9 @@ impl Syscall<'_> {
         }
         let socket = file_like.as_socket()?;
         let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
-            socket.peek(&mut data).await
+            socket.peek(data.buf()).await
         } else {
-            socket.read(&mut data).await
+            socket.read(data.buf()).await
         };
         if force_nonblock {
             let _ = file_like.set_flags(old_flags);
@@ -1332,7 +1334,7 @@ impl Syscall<'_> {
 
         let addr = hdr.msg_name;
         if let Ok(len) = result {
-            iovs.write_from_buf(&data[..len])?;
+            iovs.write_from_buf(data.wrote(len))?;
             if !addr.is_null() {
                 let sockaddr_in = SockAddr::from(endpoint);
                 // The address bytes, and then the length at the offset the

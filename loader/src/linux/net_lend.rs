@@ -67,9 +67,11 @@ pub(super) const LENT_WAIT: usize = super::ECLIPSE_LENT_WAIT;
 /// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN) flag: answer
 /// with the frames that arrived too, not only with transmit slots.
 pub(super) const LENT_FRAMES: usize = super::ECLIPSE_LENT_FRAMES;
-/// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN): where in the
-/// flags the longest sleep starts, in microseconds.
-pub(super) const LENT_LIMIT_SHIFT: usize = super::ECLIPSE_LENT_LIMIT_SHIFT;
+/// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN): the bits of
+/// the flags from this one up are the longest a sleep ([`LENT_WAIT`])
+/// lasts, in microseconds, and 0 is no limit. A sleep that ends there
+/// answers with no message.
+pub(super) const LENT_LIMIT_SHIFT: usize = 8;
 
 /// The messages a turn's answer has room for before it grows: more than
 /// a turn brings unless the card is in the middle of a burst.

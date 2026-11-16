@@ -686,12 +686,6 @@ pub const ECLIPSE_LENT_WAIT: usize = 1;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_LENT_FRAMES: usize = 2;
 
-/// [`ECLIPSE_NET_LENT_TURN`]: the bits of `flags` from this one up are the
-/// longest a sleep ([`ECLIPSE_LENT_WAIT`]) lasts, in microseconds, and 0
-/// is no limit. A sleep that ends there answers with no message.
-#[cfg(feature = "zircon-gateway")]
-pub const ECLIPSE_LENT_LIMIT_SHIFT: usize = 8;
-
 /// [`ECLIPSE_NETSTACK_SERVE`]: the channel becomes the kernel's link to the
 /// stack, and a task carries what arrives on it to the sockets.
 #[cfg(feature = "zircon-gateway")]

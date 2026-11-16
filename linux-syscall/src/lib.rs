@@ -163,6 +163,184 @@ pub(crate) fn try_zeroed_buf(n: usize) -> linux_object::error::LxResult<alloc::v
     Ok(buf)
 }
 
+/// Bytes of a receive that fit in the call's own frame.
+const RECV_STACK: usize = 512;
+
+/// How many full-size receive buffers are kept for the next call.
+const RECV_KEPT: usize = 8;
+
+/// Full-size ([`SYSCALL_IO_MAX`]) buffers that are all zeros, kept between
+/// receives; see [`RecvBuf`].
+static RECV_SPARE: lock::Mutex<[Option<alloc::vec::Vec<u8>>; RECV_KEPT]> =
+    lock::Mutex::new([const { None }; RECV_KEPT]);
+
+/// The kernel's buffer for one receive from a socket or one `read` of a file.
+///
+/// The socket or file fills a kernel buffer and the bytes it reports are
+/// copied to the program. The buffer starts as zeros so that a socket reporting more than
+/// it wrote hands the program zeros, never old kernel memory. Zeroing it on
+/// every call was most of what a small receive cost: a program that asks for
+/// up to 64 KiB and gets 56 bytes paid for 64 KiB of stores and for a 64 KiB
+/// heap block, about a sixth of a whole local echo.
+///
+/// So a small receive uses its own frame, and a large one takes a spare
+/// full-size buffer when there is one. A spare is all zeros by construction:
+/// a buffer goes back only after the part that may have been written is
+/// zeroed again. That part is the most the caller ever said with
+/// [`wrote`](Self::wrote); a buffer handed out with [`buf`](Self::buf) and
+/// never answered for (an error, an early return) counts as written whole,
+/// which costs what zeroing up front did.
+pub(crate) struct RecvBuf {
+    stack: [u8; RECV_STACK],
+    heap: alloc::vec::Vec<u8>,
+    len: usize,
+    /// The most any answered fill wrote.
+    dirty: usize,
+    /// Handed out to be filled, and not answered for yet.
+    out: bool,
+}
+
+impl RecvBuf {
+    /// A zeroed buffer of `len` bytes. `ENOMEM` when the heap cannot hold it.
+    pub(crate) fn new(len: usize) -> linux_object::error::LxResult<Self> {
+        let heap = if len <= RECV_STACK {
+            alloc::vec::Vec::new()
+        } else if let Some(spare) = RECV_SPARE.lock().iter_mut().find_map(Option::take) {
+            spare
+        } else {
+            try_zeroed_buf(len)?
+        };
+        Ok(RecvBuf {
+            stack: [0u8; RECV_STACK],
+            heap,
+            len,
+            dirty: 0,
+            out: false,
+        })
+    }
+
+    /// The whole buffer, to be filled.
+    pub(crate) fn buf(&mut self) -> &mut [u8] {
+        self.out = true;
+        self.bytes()
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        if self.len <= RECV_STACK {
+            &mut self.stack[..self.len]
+        } else {
+            &mut self.heap[..self.len]
+        }
+    }
+
+    /// The fill answered `n` bytes: the first `n` are what it wrote, and
+    /// what is cleared before the buffer is kept.
+    pub(crate) fn wrote(&mut self, n: usize) -> &[u8] {
+        let n = n.min(self.len);
+        self.dirty = self.dirty.max(n);
+        self.out = false;
+        &self.bytes()[..n]
+    }
+}
+
+impl Drop for RecvBuf {
+    fn drop(&mut self) {
+        if self.heap.len() != SYSCALL_IO_MAX {
+            return;
+        }
+        let dirty = if self.out { self.len } else { self.dirty };
+        self.heap[..dirty.min(SYSCALL_IO_MAX)].fill(0);
+        let mut spare = RECV_SPARE.lock();
+        if let Some(slot) = spare.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(core::mem::take(&mut self.heap));
+        }
+    }
+}
+
+#[cfg(test)]
+mod recv_buf_tests {
+    use super::*;
+
+    /// The pool is one for the whole test binary.
+    static ONE: lock::Mutex<()> = lock::Mutex::new(());
+
+    fn empty_the_pool() {
+        for slot in RECV_SPARE.lock().iter_mut() {
+            *slot = None;
+        }
+    }
+
+    #[test]
+    fn a_small_receive_takes_no_heap_block() {
+        let mut b = RecvBuf::new(RECV_STACK).unwrap();
+        assert_eq!(b.buf().len(), RECV_STACK);
+        assert!(b.buf().iter().all(|&x| x == 0));
+        assert_eq!(b.heap.capacity(), 0);
+    }
+
+    #[test]
+    fn a_kept_buffer_comes_back_as_zeros() {
+        let _one = ONE.lock();
+        empty_the_pool();
+        let mut b = RecvBuf::new(SYSCALL_IO_MAX).unwrap();
+        b.buf()[..100].fill(0xaa);
+        assert_eq!(b.wrote(100).len(), 100);
+        let at = b.heap.as_ptr();
+        drop(b);
+        // A smaller receive takes the kept one, and sees only zeros.
+        let mut again = RecvBuf::new(4096).unwrap();
+        assert_eq!(again.heap.as_ptr(), at);
+        assert_eq!(again.buf().len(), 4096);
+        assert!(again.heap.iter().all(|&x| x == 0));
+        // Nothing said about what was written: all of what was handed out.
+        again.buf().fill(0x55);
+        drop(again);
+        let mut loops = RecvBuf::new(SYSCALL_IO_MAX).unwrap();
+        assert_eq!(loops.heap.as_ptr(), at);
+        assert!(loops.heap.iter().all(|&x| x == 0));
+        // Filled twice, as a read in pieces is: the larger answer counts.
+        loops.buf()[..300].fill(1);
+        loops.wrote(300);
+        loops.buf()[..20].fill(2);
+        loops.wrote(20);
+        drop(loops);
+        let last = RecvBuf::new(SYSCALL_IO_MAX).unwrap();
+        assert_eq!(last.heap.as_ptr(), at);
+        assert!(last.heap.iter().all(|&x| x == 0));
+        drop(last);
+        empty_the_pool();
+    }
+
+    #[test]
+    fn a_count_past_the_buffer_is_cut_to_it() {
+        let mut b = RecvBuf::new(16).unwrap();
+        assert_eq!(b.wrote(usize::MAX).len(), 16);
+    }
+
+    #[test]
+    fn a_buffer_that_is_not_full_size_is_not_kept() {
+        let _one = ONE.lock();
+        empty_the_pool();
+        drop(RecvBuf::new(4096).unwrap());
+        assert!(RECV_SPARE.lock().iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn no_more_than_the_pool_holds_are_kept() {
+        let _one = ONE.lock();
+        empty_the_pool();
+        let many: alloc::vec::Vec<_> = (0..RECV_KEPT + 2)
+            .map(|_| RecvBuf::new(SYSCALL_IO_MAX).unwrap())
+            .collect();
+        drop(many);
+        assert_eq!(
+            RECV_SPARE.lock().iter().filter(|s| s.is_some()).count(),
+            RECV_KEPT
+        );
+        empty_the_pool();
+    }
+}
+
 #[cfg(test)]
 mod zeroed_buf_tests {
     use super::*;
