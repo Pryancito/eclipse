@@ -2549,11 +2549,20 @@ pub(super) const NVC46F_SEM_ADDR_LO: u32 = 0x5c;
 /// disables the direct-submit path.
 pub(super) const NVC46F_SEM_EXECUTE_RELEASE: u32 = 0x1 | (1 << 20);
 
-/// `NVC46F_SEM_EXECUTE`: OPERATION_ACQ_CIRC_GEQ (2:0 = 3). Circular GEQ
-/// matches [`crate::scheme::syncobj`]'s wrapping `fence_landed` compare, so a
-/// payload that wrapped past `u32::MAX` still unblocks the acquire. Strict
-/// GEQ (`0x2`) would hang across wrap. PAYLOAD_SIZE_32BIT, no WFI/timestamp.
-pub(super) const NVC46F_SEM_EXECUTE_ACQUIRE: u32 = 0x3;
+/// `NVC46F_SEM_EXECUTE`: OPERATION_ACQ_CIRC_GEQ (2:0 = 3) with
+/// **ACQUIRE_SWITCH_TSG_EN** (bit 12 = 1). Circular GEQ matches
+/// [`crate::scheme::syncobj`]'s wrapping `fence_landed` compare, so a payload
+/// that wrapped past `u32::MAX` still unblocks the acquire. Strict GEQ (`0x2`)
+/// would hang across wrap. PAYLOAD_SIZE_32BIT, no WFI/timestamp.
+///
+/// SWITCH_TSG_EN lets the scheduler run another TSG while this acquire is
+/// not yet satisfied, as Linux nouveau does (`gv100_fence_sync32`). Without
+/// it the PBDMA kept retrying the acquire on the channel's own timeslice.
+/// The semaphore it waits for is usually released by another context (the
+/// compositor letting go of a client's buffer). With a client that outruns
+/// it (`vblank_mode=0 es2gears_wayland`), hardware fences took up to 7.8 s
+/// from submit to land, and the client froze for tens of seconds.
+pub(super) const NVC46F_SEM_EXECUTE_ACQUIRE: u32 = 0x3 | (1 << 12);
 
 /// Build the 6-dword host semaphore RELEASE stream (`sem_va` <- `payload`).
 #[inline]
