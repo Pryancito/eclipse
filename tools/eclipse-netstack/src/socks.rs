@@ -79,7 +79,7 @@
 //! A [`Stack`] is the interface and those sockets. It makes no system
 //! call: whoever has it carries the messages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use smoltcp::iface::Interface;
 use smoltcp::phy::ChecksumCapabilities;
@@ -114,6 +114,9 @@ pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
 pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
+pub const OP_TAP: u32 = 26;
+pub const OP_FRAME: u32 = 27;
+pub const OP_FRAMES: u32 = 28;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
 /// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
@@ -194,6 +197,22 @@ pub fn start_data6(m: &mut Vec<u8>) {
     m[4..8].copy_from_slice(&OP_DATA6.to_le_bytes());
 }
 
+/// What each frame of a `FRAMES` starts with: its length.
+pub const FRAME_RECORD_LEN: usize = 4;
+
+/// Make `m` a `FRAMES` with no frames yet.
+pub fn start_frames(m: &mut Vec<u8>) {
+    start_data(m);
+    m[4..8].copy_from_slice(&OP_FRAMES.to_le_bytes());
+}
+
+/// Add `frame`, whole, to the `FRAMES` message `m`.
+pub fn push_frame(m: &mut Vec<u8>, frame: &[u8]) {
+    m.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+    m.extend_from_slice(&[0, 0]);
+    m.extend_from_slice(frame);
+}
+
 /// Add a record to the `DATA6` message `m`: `data`, from `addr:port`,
 /// for socket `sock`.
 pub fn push_record6(m: &mut Vec<u8>, sock: u64, addr: [u8; 16], port: u16, data: &[u8]) {
@@ -258,7 +277,7 @@ fn mouth(room: usize) -> RawSocket<'static> {
 }
 
 /// An interface and the sockets the kernel has on it.
-pub struct Stack<D: for<'d> Device<'d>> {
+pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     iface: Interface<'static, D>,
     set: SocketSet<'static>,
     /// The datagram sockets.
@@ -285,9 +304,12 @@ pub struct Stack<D: for<'d> Device<'d>> {
     groups: BTreeSet<Ipv4Address>,
     /// The same of IPv6, and what there is to say of them.
     mld: mld::Mld,
+    /// Frames the card received while the kernel listens (`TAP`), taken
+    /// off the card and waiting for a `FRAMES` to carry them.
+    heard: VecDeque<Vec<u8>>,
 }
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// The stack of `iface`, with no sockets.
     pub fn new(iface: Interface<'static, D>) -> Stack<D> {
         let mut set = SocketSet::new(vec![]);
@@ -307,6 +329,7 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             hearing6: icmp6::Hearing6::default(),
             groups: BTreeSet::new(),
             mld: mld::Mld::default(),
+            heard: VecDeque::new(),
         }
     }
 
@@ -514,6 +537,12 @@ impl<D: for<'d> Device<'d>> Stack<D> {
             OP_LEAVE => self.member(m, false),
             OP_JOIN6 => self.member6(m, true),
             OP_LEAVE6 => self.member6(m, false),
+            OP_TAP => {
+                let on = *m.get(HEADER_LEN).ok_or(Refused::Malformed)? != 0;
+                self.iface.device().listen(on);
+                Ok(false)
+            }
+            OP_FRAME => self.put_frame(&m[HEADER_LEN..]),
             OP_ICMP => self.icmp(sock, m),
             OP_ICMP6 => self.icmp6(sock, m),
             OP_BIND => {
@@ -648,12 +677,58 @@ impl<D: for<'d> Device<'d>> Stack<D> {
     /// arrived, taken off their sockets, and once there are no more of
     /// those an `EVENTS` of what became of the connections.
     pub fn arrived(&mut self, m: &mut Vec<u8>) -> Arrived {
-        match self.datagrams(m) {
-            Arrived::Nothing => self.events(m),
-            // The connections have not been asked yet.
-            Arrived::All if !self.streams.is_empty() => Arrived::More,
-            arrived => arrived,
+        // The frames first, and in a message of their own: what a
+        // program that listens on the interface hears is every frame as
+        // it arrived, before anything made of it.
+        match self.frames(m) {
+            // There are the datagrams and the connections to ask for yet.
+            Arrived::All | Arrived::More => Arrived::More,
+            Arrived::Nothing => match self.datagrams(m) {
+                Arrived::Nothing => self.events(m),
+                // The connections have not been asked yet.
+                Arrived::All if !self.streams.is_empty() => Arrived::More,
+                arrived => arrived,
+            },
         }
+    }
+
+    /// Make `m` the `FRAMES` of what the card received while the kernel
+    /// listens: all of them, or as many as fit one message. Nothing at
+    /// all while nobody listens, which is how it costs nothing then.
+    fn frames(&mut self, m: &mut Vec<u8>) -> Arrived {
+        self.heard.extend(self.iface.device().heard());
+        if self.heard.is_empty() {
+            return Arrived::Nothing;
+        }
+        start_frames(m);
+        while let Some(frame) = self.heard.front() {
+            if m.len() + FRAME_RECORD_LEN + frame.len() > MESSAGE_MAX {
+                return Arrived::More;
+            }
+            let frame = self.heard.pop_front().expect("there is one");
+            push_frame(m, &frame);
+        }
+        Arrived::All
+    }
+
+    /// `FRAME`: this whole frame on the wire, as it is. It is the
+    /// kernel's, from a program's `AF_PACKET` socket, and nothing here
+    /// looks inside it: a card carries what it is given.
+    fn put_frame(&mut self, frame: &[u8]) -> Result<bool, Refused> {
+        let room = self.iface.device().capabilities().max_transmission_unit;
+        if frame.is_empty() || frame.len() > room {
+            return Err(Refused::TooLong);
+        }
+        let now = self.now;
+        let token = self.iface.device_mut().transmit().ok_or(Refused::Full)?;
+        use smoltcp::phy::TxToken;
+        token
+            .consume(now, frame.len(), |slot| {
+                slot.copy_from_slice(frame);
+                Ok(())
+            })
+            .map_err(|_| Refused::Full)?;
+        Ok(true)
     }
 
     /// Whether the messages [`arrived`](Self::arrived) made since this was
@@ -884,6 +959,115 @@ mod tests {
         (udp.src_port(), udp.dst_port(), udp.payload().to_vec())
     }
 
+    /// A `TAP` as the kernel writes it.
+    pub(super) fn tap(on: bool) -> Vec<u8> {
+        message(OP_TAP, 0, &[u8::from(on), 0, 0, 0])
+    }
+
+    /// A `FRAME` as the kernel writes it.
+    pub(super) fn frame_message(frame: &[u8]) -> Vec<u8> {
+        message(OP_FRAME, 0, frame)
+    }
+
+    /// The frames of a `FRAMES` message.
+    fn frames_of(m: &[u8]) -> Vec<Vec<u8>> {
+        assert_eq!(parse_header(m), Some((OP_FRAMES, 0)));
+        let (mut rest, mut out) = (&m[HEADER_LEN..], Vec::new());
+        while !rest.is_empty() {
+            let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            out.push(rest[FRAME_RECORD_LEN..FRAME_RECORD_LEN + len].to_vec());
+            rest = &rest[FRAME_RECORD_LEN + len..];
+        }
+        out
+    }
+
+    /// Nothing is copied for the kernel until it asks (`TAP`), every
+    /// frame the card brings is said while it does -- the ones the stack
+    /// makes nothing of as well, which is what `AF_PACKET` is for -- and
+    /// nothing again once it stops.
+    #[test]
+    fn the_frames_the_card_brings_go_to_the_kernel_while_it_listens() {
+        let (mut stack, window) = stack();
+        let heard = |stack: &mut Stack<crate::port::Port>| -> Vec<Vec<u8>> {
+            stack.poll(Instant::from_millis(1));
+            let mut m = Vec::new();
+            let said = match stack.arrived(&mut m) {
+                Arrived::Nothing => Vec::new(),
+                _ => frames_of(&m),
+            };
+            // The card finishes with the turn, so the next one has slots
+            // again: a frame waits for one to answer it with.
+            for msg in crate::port::testing::turn(stack.iface.device()) {
+                window.done(stack.iface.device(), &msg);
+            }
+            said
+        };
+
+        // Nobody listening: the frame goes through the stack and no copy
+        // of it is kept.
+        window.deliver(stack.iface.device(), 0, &arp_request(OUR_IP));
+        assert!(heard(&mut stack).is_empty());
+
+        assert_eq!(stack.request(&tap(true)), Ok(false));
+        // A frame of a protocol this stack answers, and one it makes
+        // nothing of at all: both are the listener's.
+        window.deliver(stack.iface.device(), 1, &arp_request(OUR_IP));
+        let mut strange = arp_request(OUR_IP);
+        strange[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+        window.deliver(stack.iface.device(), 2, &strange);
+        // A frame is the listener's as the stack takes it off the card,
+        // and a turn takes as many as it has room to answer.
+        let mut said = heard(&mut stack);
+        for _ in 0..4 {
+            said.extend(heard(&mut stack));
+        }
+        assert_eq!(said.len(), 2, "both frames, whole and in order");
+        assert_eq!(said[0], arp_request(OUR_IP));
+        assert_eq!(said[1], strange);
+        // Said once: the next turn has nothing to say.
+        assert!(heard(&mut stack).is_empty());
+
+        assert_eq!(stack.request(&tap(false)), Ok(false));
+        window.deliver(stack.iface.device(), 3, &arp_request(OUR_IP));
+        assert!(heard(&mut stack).is_empty(), "nothing once it stops");
+    }
+
+    /// A `FRAME` goes on the wire as it is, byte for byte: the kernel
+    /// wrote the whole thing (an `AF_PACKET` socket's frame) and nothing
+    /// here looks inside it.
+    #[test]
+    fn a_frame_the_kernel_sends_goes_out_as_it_is() {
+        let (mut stack, window) = stack();
+        let mut frame = vec![0x33, 0x33, 0, 1, 0, 2];
+        frame.extend_from_slice(&[0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+        frame.extend_from_slice(&0x86DDu16.to_be_bytes());
+        frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 8, 17, 1]);
+        assert_eq!(stack.request(&frame_message(&frame)), Ok(true));
+        let turn = crate::port::testing::turn(stack.iface.device());
+        let sent: Vec<Vec<u8>> = turn
+            .iter()
+            .filter(|m| m.op == udrivers::net::OP_TX)
+            .map(|m| window.sent(m))
+            .collect();
+        assert_eq!(sent, vec![frame]);
+    }
+
+    /// A frame no card carries is refused, and nothing is put in a slot.
+    #[test]
+    fn a_frame_that_is_no_frame_is_refused() {
+        let (mut stack, _window) = stack();
+        assert_eq!(stack.request(&frame_message(&[])), Err(Refused::TooLong));
+        let too_long = vec![0u8; 16 * 1024];
+        assert_eq!(
+            stack.request(&frame_message(&too_long)),
+            Err(Refused::TooLong)
+        );
+        assert_eq!(
+            stack.request(&message(OP_TAP, 0, &[])),
+            Err(Refused::Malformed)
+        );
+    }
+
     #[test]
     fn the_messages_are_laid_out_as_the_kernel_lays_them_out() {
         // The same bytes `linux-object/src/net/user_stack.rs` builds and
@@ -922,8 +1106,26 @@ mod tests {
             icmp(7, Ipv4Address([10, 0, 9, 1]), 64, &[8, 0]),
             [0, 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 10, 0, 9, 1, 64, 0, 0, 0, 8, 0]
         );
+        // The frames of an `AF_PACKET` socket, both ways.
+        let mut frames = Vec::new();
+        start_frames(&mut frames);
+        push_frame(&mut frames, &[1, 2, 3]);
+        assert_eq!(
+            frames,
+            [0, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3]
+        );
+        assert_eq!(
+            frame_message(&[1, 2, 3]),
+            [0, 0, 0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]
+        );
+        assert_eq!(
+            tap(true),
+            [0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
         assert_eq!(HEARD, 0);
         assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
+        assert_eq!((OP_TAP, OP_FRAME, OP_FRAMES), (26, 27, 28));
+        assert_eq!(FRAME_RECORD_LEN, 4);
         assert_eq!((HEADER_LEN, DATAGRAM_AT, RECORD_LEN), (16, 24, 16));
     }
 

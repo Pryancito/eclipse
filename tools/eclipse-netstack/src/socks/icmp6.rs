@@ -95,7 +95,7 @@ impl Hearing6 {
     }
 }
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// The longest ICMPv6 message this stack carries: what fits one
     /// frame.
     fn max_icmp6(&self) -> usize {

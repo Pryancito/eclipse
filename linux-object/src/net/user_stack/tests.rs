@@ -1822,3 +1822,111 @@ fn a_socket_for_ipv6_only_leaves_its_port_to_one_of_ipv4() {
     drop(v6only);
     assert_eq!(Socket::bind(&another, Endpoint::Ip(at6("::", 7000))), Ok(0));
 }
+
+/// The frames of an `AF_PACKET` socket, both ways: the same bytes
+/// `tools/eclipse-netstack/src/socks.rs` builds and reads, written out.
+/// Neither side can move a field alone.
+#[test]
+fn the_frames_are_laid_out_as_the_stack_lays_them_out() {
+    let mut frames = frames_message();
+    push_frame(&mut frames, &[1, 2, 3]);
+    assert_eq!(
+        frames,
+        [0, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3]
+    );
+    assert_eq!(
+        frame_message(&[1, 2, 3]),
+        [0, 0, 0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]
+    );
+    assert_eq!(
+        tap_message(true),
+        [0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+    );
+    assert_eq!(parse_tap(&tap_message(true)), Some(true));
+    assert_eq!(parse_tap(&tap_message(false)), Some(false));
+    assert_eq!(parse_tap(&frames_message()), None);
+    assert_eq!((OP_TAP, OP_FRAME, OP_FRAMES), (26, 27, 28));
+    assert_eq!(FRAME_RECORD_LEN, 4);
+
+    // The frames come out whole and in order, and what is not a whole
+    // frame ends the walk instead of slicing out of range.
+    let mut two = frames_message();
+    push_frame(&mut two, &[1, 2, 3]);
+    push_frame(&mut two, &[4]);
+    let rest = &two[HEADER_LEN..];
+    let (first, rest) = parse_frame(rest).unwrap();
+    assert_eq!(first, [1, 2, 3]);
+    let (second, rest) = parse_frame(rest).unwrap();
+    assert_eq!(second, [4]);
+    assert!(rest.is_empty());
+    assert_eq!(
+        parse_frame(&[3, 0, 0, 0, 1, 2]),
+        None,
+        "shorter than it says"
+    );
+    assert_eq!(parse_frame(&[0, 0, 0, 0]), None, "no frame is no frame");
+    assert_eq!(parse_frame(&[1, 0, 0]), None, "not even a record");
+}
+
+/// A frame sent on the machine's card goes to the stack whole, and a
+/// card with no stack behind it takes none: that is what the interface
+/// answers `EOPNOTSUPP`/`ENETDOWN` with.
+#[test]
+fn a_frame_sent_on_the_card_goes_to_the_stack() {
+    let _lock = LOCK.lock();
+    let link = StackLink::new();
+    let frame = [0x33u8, 0x33, 0, 1, 0, 2, 2, 0, 0, 0, 0, 7, 0x86, 0xdd, 1, 2];
+    assert!(!link.put_frame(&frame), "no stack, nowhere to put it");
+    let stack = stack_of(&link);
+    assert!(link.put_frame(&frame));
+    assert_eq!(stack.told(), Some(frame_message(&frame)));
+    // Nothing without end is copied.
+    assert!(!link.put_frame(&[0u8; MAX_FRAME + 1]));
+    assert_eq!(stack.told(), None);
+
+    // And the stack is told when to say the frames it receives.
+    link.tap(true);
+    assert_eq!(stack.told(), Some(tap_message(true)));
+    link.tap(false);
+    assert_eq!(stack.told(), Some(tap_message(false)));
+}
+
+/// The frames the stack says reach a program that listens on the
+/// interface, whole and in order, and nothing else of this machine
+/// changes for them: they are of the stack's network, not the kernel's.
+#[test]
+fn the_frames_the_stack_says_reach_a_packet_socket() {
+    let _lock = LOCK.lock();
+    let link = StackLink::new();
+    let stack = stack_of(&link);
+    let socket = crate::net::packet::PacketSocketState::new(
+        crate::net::SocketType::SOCK_RAW,
+        0x86DD, // IPv6, which is what udhcpc6 listens for
+    )
+    .unwrap();
+    FileLike::set_flags(&*socket, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+
+    let frame = |last: u8| {
+        let mut f = alloc::vec![0u8; 60];
+        f[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+        f[59] = last;
+        f
+    };
+    let mut m = frames_message();
+    push_frame(&mut m, &frame(1));
+    push_frame(&mut m, &frame(2));
+    // A frame of another protocol is not this socket's.
+    let mut other = alloc::vec![0u8; 60];
+    other[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    push_frame(&mut m, &other);
+    stack.say(m);
+
+    let mut buf = [0u8; 64];
+    for last in [1u8, 2] {
+        let (n, _) = async_std::task::block_on(Socket::read(&*socket, &mut buf));
+        assert_eq!(n, Ok(60));
+        assert_eq!(buf[59], last);
+    }
+    let (n, _) = async_std::task::block_on(Socket::read(&*socket, &mut buf));
+    assert_eq!(n, Err(LxError::EAGAIN), "and nothing that is not its own");
+}

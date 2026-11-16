@@ -43,7 +43,7 @@ pub const OP_LEAVE: u32 = 15;
 /// The group of every machine on the network.
 pub const EVERYBODY: Ipv4Address = Ipv4Address::MULTICAST_ALL_SYSTEMS;
 
-impl<D: for<'d> Device<'d>> Stack<D> {
+impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// How many groups the kernel said the machine is a member of.
     pub fn groups(&self) -> usize {
         self.groups.len()

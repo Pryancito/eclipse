@@ -338,6 +338,9 @@ pub const OP_HEAR: u32 = 11;
 pub const OP_ICMP: u32 = 12;
 pub const OP_COUNTS: u32 = 13;
 pub const OP_SIX: u32 = 16;
+pub const OP_TAP: u32 = 26;
+pub const OP_FRAME: u32 = 27;
+pub const OP_FRAMES: u32 = 28;
 pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
 pub const OP_CONNECT6: u32 = 19;
@@ -567,6 +570,61 @@ pub fn parse_send(m: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
     let addr: [u8; 4] = m[16..20].try_into().ok()?;
     let port = u16::from_le_bytes(m[20..22].try_into().ok()?);
     Some((addr, port, &m[DATAGRAM_AT..]))
+}
+
+/// What each record of a `FRAMES` starts with: the length of the frame.
+pub const FRAME_RECORD_LEN: usize = 4;
+
+/// The longest frame that travels either way, which is a jumbo one and
+/// then some: a card's MTU is the stack's business, and this is only so
+/// that nothing without end is copied.
+pub const MAX_FRAME: usize = 16 * 1024;
+
+/// `TAP`: from now on the stack says the frames its card receives (`on`),
+/// or says them no more.
+pub fn tap_message(on: bool) -> Vec<u8> {
+    let mut m = header(OP_TAP, 0, 4);
+    m.extend_from_slice(&[u8::from(on), 0, 0, 0]);
+    m
+}
+
+/// Whether a `TAP` asks for the frames. `None` when it is no `TAP`.
+pub fn parse_tap(m: &[u8]) -> Option<bool> {
+    Some(m.get(HEADER_LEN)? != &0)
+}
+
+/// `FRAME`: this whole Ethernet frame on the wire, as it is.
+pub fn frame_message(frame: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_FRAME, 0, frame.len());
+    m.extend_from_slice(frame);
+    m
+}
+
+/// A `FRAMES` with no frames yet.
+pub fn frames_message() -> Vec<u8> {
+    header(OP_FRAMES, 0, 0)
+}
+
+/// Add `frame` to the `FRAMES` message `m`.
+pub fn push_frame(m: &mut Vec<u8>, frame: &[u8]) {
+    debug_assert!(frame.len() <= MAX_FRAME);
+    m.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+    m.extend_from_slice(&[0, 0]);
+    m.extend_from_slice(frame);
+}
+
+/// The first frame of `frames`, the rest of a `FRAMES` message, and what
+/// follows it. `None` when what is there is not a whole frame.
+pub fn parse_frame(frames: &[u8]) -> Option<(&[u8], &[u8])> {
+    if frames.len() < FRAME_RECORD_LEN {
+        return None;
+    }
+    let len = u16::from_le_bytes(frames[..2].try_into().ok()?) as usize;
+    let end = FRAME_RECORD_LEN.checked_add(len)?;
+    if len == 0 || end > frames.len() {
+        return None;
+    }
+    Some((&frames[FRAME_RECORD_LEN..end], &frames[end..]))
 }
 
 /// A `DATA` with no records yet.
@@ -1467,6 +1525,24 @@ pub fn use_for_all(on: bool) {
     FOR_ALL.store(on, Ordering::Relaxed);
 }
 
+/// Where a frame sent on the machine's stack card goes: to the stack
+/// that has the card, as a `FRAME`. This is what makes an `AF_PACKET`
+/// socket work on a boot where the card is the stack's.
+impl zcore_drivers::net::stack_card::Wire for StackLink {
+    fn put(&self, frame: &[u8]) -> bool {
+        self.put_frame(frame)
+    }
+}
+
+/// Tell the stack that serves this machine whether to say the frames its
+/// card receives. Nothing happens where no stack runs: the card is the
+/// kernel's and its frames are already everyone's.
+pub fn tap(on: bool) {
+    if is_for_all() {
+        machine().tap(on);
+    }
+}
+
 /// Whether [`use_for_all`] is on.
 pub fn is_for_all() -> bool {
     FOR_ALL.load(Ordering::Relaxed)
@@ -1691,6 +1767,12 @@ impl StackLink {
         for group in self.groups6() {
             let _ = self.tell(join6_message(group.0), true);
         }
+        // A socket that was listening for frames before this stack came
+        // is listening still: the new one is told, as the bound sockets
+        // and the groups are.
+        if crate::net::packet::has_packet_sockets() {
+            self.tap(true);
+        }
         Ok(Serving {
             link: self.clone(),
             channel,
@@ -1783,6 +1865,7 @@ impl StackLink {
             Some((OP_DATA6, _)) => self.take_datagrams6(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
             Some((OP_COUNTS, _)) => self.take_counts(&m[HEADER_LEN..]),
+            Some((OP_FRAMES, _)) => self.take_frames(&m[HEADER_LEN..]),
             Some((OP_SIX, _)) => match parse_six(&m[HEADER_LEN..]) {
                 Some((router, addresses)) => self.sixes.say(addresses, router),
                 None => warn!(
@@ -1795,6 +1878,40 @@ impl StackLink {
                 m.len()
             ),
         }
+    }
+
+    /// The frames the card received while the stack was told to say
+    /// them (`TAP`), each to whoever listens on this machine's
+    /// interface: an `AF_PACKET` socket, and nothing else. The kernel
+    /// does no network of its own on that card -- it is the stack's --
+    /// so nothing here learns an address from these frames.
+    fn take_frames(&self, mut frames: &[u8]) {
+        while !frames.is_empty() {
+            let Some((frame, rest)) = parse_frame(frames) else {
+                warn!(
+                    "user stack: {} bytes that are no frame of a card",
+                    frames.len()
+                );
+                return;
+            };
+            frames = rest;
+            crate::net::packet::deliver_tapped_frame(frame);
+        }
+    }
+
+    /// `frame`, whole, for the stack to put on the wire. False when it
+    /// did not go: no stack serves, or it has more unread than it
+    /// should. This is how an `AF_PACKET` socket reaches the wire on a
+    /// boot where the card is the stack's ([`crate::net::packet`]).
+    pub fn put_frame(&self, frame: &[u8]) -> bool {
+        frame.len() <= MAX_FRAME && self.tell(frame_message(frame), false).is_ok()
+    }
+
+    /// Ask the stack for the frames its card receives, or ask it to stop.
+    /// What a stack that is not serving is not told, the next one is
+    /// when it comes ([`StackLink::attach`]).
+    pub fn tap(&self, on: bool) {
+        let _ = self.tell(tap_message(on), true);
     }
 
     /// The card has carried this much since its stack started: what is
