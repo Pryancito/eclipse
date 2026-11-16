@@ -284,3 +284,62 @@ fn the_counters_tell_a_bounded_block_from_a_whole_one() {
     assert_eq!(after.0, before.0);
     assert_eq!(after.2, before.2, "y cero paginas ahorradas");
 }
+
+// ── forgetting the recorded writes ─────────────────────────────────────────
+
+/// A block poisoned whole is handed to the mark-clean hook, with the region
+/// that was poisoned; one whose poison was bounded is not, because what lies
+/// below the bound was not written by this call and may be anything.
+#[test]
+fn only_a_block_poisoned_whole_is_marked_clean() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_BASE: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_SIZE: AtomicUsize = AtomicUsize::new(0);
+    fn clean(base: usize, size: usize) {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        SEEN_BASE.store(base, Ordering::SeqCst);
+        SEEN_SIZE.store(size, Ordering::SeqCst);
+    }
+    fn everything(_base: usize, size: usize) -> Option<usize> {
+        Some(size)
+    }
+    fn one_page(_base: usize, _size: usize) -> Option<usize> {
+        Some(PAGE_SIZE)
+    }
+    let mut buf = block(4);
+    let base = buf.as_mut_ptr() as usize;
+    let size = buf.len() * 8;
+
+    let g = with_dirty_depth_hook(Some(everything));
+    super::set_mark_clean_hook_for_test(Some(clean));
+    // SAFETY: `[base, base + size)` is this test's live buffer.
+    unsafe { poison_usable_region_bounded(base, size) };
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(SEEN_BASE.load(Ordering::SeqCst), base);
+    assert_eq!(SEEN_SIZE.load(Ordering::SeqCst), size);
+    // And it was called after the poison, not before it.
+    assert_eq!(poisoned_suffix(&buf), Some(size));
+    drop(g);
+
+    let g = with_dirty_depth_hook(Some(one_page));
+    // SAFETY: as above.
+    unsafe { poison_usable_region_bounded(base, size) };
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        1,
+        "a bounded poison marks nothing"
+    );
+    drop(g);
+
+    // No dirty-depth hook at all is a whole poison too.
+    let g = with_dirty_depth_hook(None);
+    // SAFETY: as above.
+    unsafe { poison_usable_region_bounded(base, size) };
+    assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    super::set_mark_clean_hook_for_test(None);
+    // SAFETY: as above.
+    unsafe { poison_usable_region_bounded(base, size) };
+    assert_eq!(CALLS.load(Ordering::SeqCst), 2, "no hook, no call");
+    drop(g);
+}

@@ -831,6 +831,47 @@ fn the_x86_entry_reports_the_hardware_dirty_bit() {
 }
 
 #[test]
+fn the_x86_entry_forgets_a_write_and_nothing_else() {
+    let fresh = a_leaf(X86PTE::zeroed(), FRAME, rw(), false);
+    let mut written = X86PTE::from_raw(fresh.raw() | X86_DIRTY | X86_ACCESSED);
+    assert!(written.clear_dirty());
+    assert_eq!(written.dirty(), Some(false));
+    assert_eq!(
+        written.raw(),
+        fresh.raw() | X86_ACCESSED,
+        "only bit 6 goes: the frame, the permissions and A stay"
+    );
+    // And the next write is seen again.
+    written.set_dirty();
+    assert_eq!(written.dirty(), Some(true));
+
+    // A global entry survives the reload of CR3 that follows a forgetting,
+    // so it is not forgotten: it would absorb the next write unrecorded.
+    const X86_GLOBAL: u64 = 1 << 8;
+    let mut global = X86PTE::from_raw(fresh.raw() | X86_DIRTY | X86_GLOBAL);
+    assert!(!global.clear_dirty());
+    assert_eq!(global.dirty(), Some(true));
+    // Nor a huge leaf, whose one bit speaks for 512 pages.
+    let mut huge = X86PTE::from_raw(fresh.raw() | X86_DIRTY | X86_PS);
+    assert!(!huge.clear_dirty());
+    assert_eq!(huge.dirty(), Some(true));
+}
+
+/// The two formats that cannot say whether a page was written cannot
+/// forget it either.
+#[test]
+fn the_formats_with_no_dirty_bit_forget_nothing() {
+    let mut e = a_leaf(Rv64PTE::zeroed(), FRAME, rw(), false);
+    let before = e.raw();
+    assert!(!e.clear_dirty());
+    assert_eq!(e.raw(), before);
+    let mut e = a_leaf(AARCH64PTE::zeroed(), FRAME, rw(), false);
+    let before = e.raw();
+    assert!(!e.clear_dirty());
+    assert_eq!(e.raw(), before);
+}
+
+#[test]
 fn the_x86_dirty_bit_survives_a_flag_rewrite() {
     // The stack quarantine write-protects the usable region of a coroutine
     // stack when it is freed and restores it when the block is reused, and
