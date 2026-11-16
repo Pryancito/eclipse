@@ -219,8 +219,15 @@ impl LocalApic {
                 .add(idx);
             // Nearly always nothing differs, and this runs every time the
             // timer is armed, which a sleep with a deadline does: the two are
-            // compared whole first, and word by word only to say where.
-            if core::slice::from_raw_parts(words.cast_const(), SLOT_WORDS) == &shadow[..] {
+            // compared first, and looked at again only to say where. Word
+            // by word here too: as two slices they went to the kernel's
+            // `memcmp`, which goes byte by byte -- 630 instructions for
+            // these few words, on every wait that has an end.
+            let same = shadow
+                .iter()
+                .enumerate()
+                .all(|(i, &want)| core::ptr::read(words.add(i)) == want);
+            if same {
                 return;
             }
             let mut first = None;

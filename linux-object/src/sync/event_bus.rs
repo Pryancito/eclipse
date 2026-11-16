@@ -47,6 +47,10 @@ bitflags! {
     }
 }
 
+/// How many places [`EventBus::change`] leaves in a table of callbacks that
+/// has emptied: below this it is kept as it is, for the next waiter.
+const CALLBACKS_KEPT_ROOM: usize = 16;
+
 /// handler of event in the event bus
 pub type EventHandler = Box<dyn Fn(Event) -> bool + Send>;
 
@@ -136,12 +140,17 @@ impl EventBus {
         new.insert(set);
         self.event = new;
         if new != orig {
-            let pending = core::mem::take(&mut self.callbacks);
-            let mut kept = Vec::with_capacity(pending.len());
-            for (id, f) in pending {
-                if !f(new) {
-                    kept.push((id, f));
-                }
+            // The table that is fired is the table that is kept: the ones
+            // that are done leave it in place. It used to be poured into a
+            // new one, which was a table reserved and a table freed for
+            // every wait that a change ended -- each blocking read of a
+            // socket or a pipe.
+            let mut kept = core::mem::take(&mut self.callbacks);
+            kept.retain(|(_, f)| !f(new));
+            // One that a crowd of waiters grew does not stay that size for
+            // the one or two that wait on it afterwards.
+            if kept.capacity() > CALLBACKS_KEPT_ROOM && kept.len() <= kept.capacity() / 4 {
+                kept.shrink_to(CALLBACKS_KEPT_ROOM.max(kept.len() * 2));
             }
             // Subscriptions that arrived while we were firing.
             let mut late = core::mem::take(&mut self.callbacks);
@@ -1174,5 +1183,51 @@ mod seq_for_tests {
         bus.set(Event::PROCESS_QUIT);
         assert_eq!(bus.seq_for(Event::PROCESS_QUIT), bus.seq());
         assert_eq!(bus.seq_for(Event::empty()), bus.seq());
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    //! The table of callbacks across a change.
+
+    use super::{Event, EventBus, CALLBACKS_KEPT_ROOM};
+    use alloc::boxed::Box;
+
+    /// A change fires the table where it is: the callbacks that are done
+    /// leave it, the others stay in their order, and no other table is
+    /// reserved for them.
+    #[test]
+    fn a_change_fires_the_table_in_place_and_keeps_the_rest_in_order() {
+        let mut bus = EventBus::default();
+        let ids: alloc::vec::Vec<u64> = [false, true, false, true]
+            .iter()
+            .map(|&done| bus.subscribe(Box::new(move |_| done)).unwrap())
+            .collect();
+        let table = bus.callbacks.as_ptr();
+        let room = bus.callbacks.capacity();
+
+        bus.set(Event::READABLE);
+
+        let left: alloc::vec::Vec<u64> = bus.callbacks.iter().map(|(id, _)| *id).collect();
+        assert_eq!(left, [ids[0], ids[2]]);
+        assert_eq!(bus.callbacks.as_ptr(), table);
+        assert_eq!(bus.callbacks.capacity(), room);
+    }
+
+    /// A table that a crowd grew is not kept that size once the crowd has
+    /// been woken.
+    #[test]
+    fn a_table_that_a_crowd_grew_is_given_back_when_it_empties() {
+        let mut bus = EventBus::default();
+        for _ in 0..1000 {
+            bus.subscribe(Box::new(|_| true)).unwrap();
+        }
+        bus.subscribe(Box::new(|_| false)).unwrap();
+        assert!(bus.callbacks.capacity() > 1000);
+
+        bus.set(Event::READABLE);
+
+        assert_eq!(bus.callbacks.len(), 1);
+        assert!(bus.callbacks.capacity() <= CALLBACKS_KEPT_ROOM);
     }
 }
