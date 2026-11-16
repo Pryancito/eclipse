@@ -613,9 +613,16 @@ fn grow_cache_vmo(vmo: &Arc<VmObject>, end: usize) -> bool {
 
 /// The page cache of `inode`, if one exists. Never creates one.
 fn cache_vmo_of(inode: &Arc<dyn INode>) -> Option<Arc<VmObject>> {
+    // The key first, with no lock held: it asks the inode for its
+    // metadata, which on a network filesystem (or a served one) is a
+    // question to somebody else that gives the CPU away while it waits.
+    // Asked inside the lock, the next task to look a cache up spun on a
+    // lock whose holder was waiting for a reply: the kernel stopped at the
+    // second write of a `cp` onto an NFS mount.
+    let key = cache_key(inode);
     SHARED_FILE_VMOS
         .lock()
-        .get(&cache_key(inode))
+        .get(&key)
         .map(|(vmo, _, _)| vmo.clone())
 }
 

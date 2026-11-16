@@ -292,6 +292,34 @@ fn what_this_client_writes_is_what_the_server_reads_back() {
 
 #[test]
 #[ignore = "needs an NFSv3 server on 127.0.0.1; see the module docs"]
+fn a_file_made_through_the_inode_is_owned_cut_and_written_as_open_does() {
+    use rcore_fs::vfs::{FileSystem, FileType};
+    let (mounted, _) = mounted!();
+    let root = mounted.fs.root_inode();
+    let name = "abierto-por-eclipse.txt";
+    let _ = root.unlink(name);
+    // What `open(O_CREAT | O_TRUNC)` does, call by call.
+    let file = root.create(name, FileType::File, 0o644).expect("create");
+    let mut metadata = file.metadata().expect("metadata");
+    metadata.uid = 0;
+    metadata.gid = 0;
+    metadata.mode = 0o644;
+    // A time of the client's own: the server has to take it and give it
+    // back, which it refused while the call was a word out of step.
+    metadata.mtime.sec = 1_000_000_000;
+    metadata.mtime.nsec = 0;
+    file.set_metadata(&metadata).expect("set_metadata");
+    assert_eq!(file.metadata().expect("metadata").mtime.sec, 1_000_000_000);
+    file.resize(0).expect("resize");
+    assert_eq!(file.write_at(0, b"hola"), Ok(4));
+    let mut back = [0u8; 8];
+    assert_eq!(file.read_at(0, &mut back), Ok(4));
+    assert_eq!(&back[..4], b"hola");
+    root.unlink(name).expect("unlink");
+}
+
+#[test]
+#[ignore = "needs an NFSv3 server on 127.0.0.1; see the module docs"]
 fn a_directory_this_client_makes_is_a_directory_on_the_server() {
     let (mounted, _) = mounted!();
     let mut session = mounted.fs.session().lock();
