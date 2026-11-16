@@ -471,7 +471,7 @@ hacerse en `xtask/src/linux/desktop.rs`.
 Eclipse trae dos sesiones de escritorio y `eclipse-init` (PID 1) arranca solo
 una, según este orden (gana el primero que aparezca):
 
-1. **Argumento de arranque** `desktop=<labwc|xorg>` en la cmdline del kernel
+1. **Argumento de arranque** `desktop=<labwc|xorg|abyss>` en la cmdline del kernel
    (`/proc/cmdline`). Es lo que usa `make qemu`, que fija `desktop=labwc` por
    defecto (`desktop=none` con `VARIANT=minimal`). Para la sesión Xorg
    (framebuffer/`fbdev` sobre `/dev/fb0`): `make qemu DESKTOP=xorg`.
@@ -492,3 +492,57 @@ initramfs con Mesa/labwc). El ISO (`make iso` / `./scripts/vbox-eclipse.sh --iso
 es el instalador: cmdline `desktop=none` y SFS sin escritorio, así que
 `eclipse-init` deja la consola y no lanza el compositor. Tras `install-eclipse`,
 `./scripts/vbox-eclipse.sh --disk-only` arranca labwc desde el VDI instalado.
+
+## La sesión Abyss (opcional)
+
+Hay una tercera sesión, **Abyss**: el compositor Wayland en Rust de
+[chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), con su
+barra (`ec-hyperion-bar`), su lanzador (`ec-launcher`) y Ajustes
+(`ec-settings`), con el fondo lunarbg y las apps lunar de siempre. Viene del
+submódulo `desktop/`, que apunta al fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
+**labwc sigue siendo la sesión por defecto**: Abyss solo arranca si lo eliges.
+
+```sh
+git submodule update --init desktop   # una vez, para traer el código
+# arranque: desktop=abyss en la cmdline, o de forma persistente:
+echo abyss > /etc/eclipse/desktop
+```
+
+- **Compilación**: `cargo xtask image` lo compila en el anfitrión, como
+  SilverSurfer, porque enlaza la libseat, libinput, libudev, GBM/EGL y
+  xkbcommon del sistema (`apt-get install libseat-dev libinput-dev libudev-dev
+  libgbm-dev libegl-dev libgles-dev libxkbcommon-dev libwayland-dev
+  libdrm-dev`). Si falta el submódulo, falta un paquete o la compilación falla,
+  la imagen sale igual, solo con labwc. Con anfitrión de otra arquitectura no
+  se compila.
+- **Servicios** (`desktop = abyss`): `abyss-seatd`, `abyss`
+  (`/usr/local/bin/eclipse-abyss`, log en `/tmp/abyss.log`), la barra de Abyss
+  `abyss-hyperion-bar` (por `eclipse-abyss-client`), y de Eclipse **lunarbg**
+  (`abyss-lunarbg`) como fondo y **lunarclip** (`abyss-lunarclip`), con los
+  mismos wrappers que en labwc. Todos esperan al socket de control
+  `/run/user/0/eclipse/abyss.sock`.
+- **Apps lunar**: funcionan igual que en labwc, con los mismos atajos, que
+  van en `/etc/eclipse/abyss.kdl`: Super+Intro (terminal), Alt+Espacio y
+  Alt+F2 (lunarrun), Super+E (lunarfile), Super+V (portapapeles), Super+D
+  (mostrar escritorio), Super+L (lunarlock), Super+Tab (lunardesk), Super+N
+  (lunarnotes), Super+K (teclado), Impr y Mayús+Impr (lunarshot) y
+  Ctrl+Mayús+Esc (lunarmon). El lanzador de Abyss se queda en Super+R.
+- **Permisos**: Abyss esconde sus protocolos privilegiados a cualquier programa
+  que no esté nombrado en `/etc/eclipse/policy.kdl`. Ahí se listan lunarclip
+  (`clipboard.data-control-allow`), lunarshot (`capture.allow`) y lunarbar,
+  lunarrun y lunardesk (`toplevel-management.allow`, que el fork añade junto
+  con `zwlr_foreign_toplevel_management` y `ext-workspace`).
+- **Pantalla**: Abyss escucha en `wayland-1`, nunca en `wayland-0`.
+- **GPU**: dibuja con GLES sobre GBM/EGL. Va por la misma ruta zink+NVK que
+  labwc, porque las variables de GPU las pone `eclipse-init` para todos los
+  servicios.
+- **Configuración**: `/etc/eclipse/abyss.kdl` (modo escritorio `de`, terminal
+  `foot`); lo tuyo va en `~/.config/eclipse/abyss.kdl` o en Ajustes. Todas las
+  claves: `desktop/docs/CONFIG.md`.
+- **Todavía no**: las notificaciones. `ec-toasts`/`ec-services` pelearían con
+  `eclipse-notifyd` por `org.freedesktop.Notifications`, y las tarjetas de
+  `eclipse-notifyd` las dibuja lunarbar, que en esta sesión no corre.
+- **Licencia**: todo `desktop/` es AGPL-3.0-only (sus protocolos y SDK son
+  Apache-2.0). Se compila y se distribuye como programas aparte; nada de ahí se
+  enlaza con el código MIT de este repositorio. El código fuente de lo que se
+  distribuye es el commit fijado del submódulo.

@@ -471,7 +471,7 @@ by `xtask` when building the rootfs: persistent changes must be made in
 Eclipse ships two desktop sessions and `eclipse-init` (PID 1) starts only one,
 in this order (the first one found wins):
 
-1. **Boot argument** `desktop=<labwc|xorg>` on the kernel cmdline
+1. **Boot argument** `desktop=<labwc|xorg|abyss>` on the kernel cmdline
    (`/proc/cmdline`). It is what `make qemu` uses, setting `desktop=labwc` by
    default (`desktop=none` with `VARIANT=minimal`). For the Xorg session
    (framebuffer/`fbdev` on `/dev/fb0`): `make qemu DESKTOP=xorg`.
@@ -491,3 +491,55 @@ is the installer: cmdline `desktop=none` and an SFS without a desktop, so
 `eclipse-init` leaves the console and does not launch the compositor. After
 `install-eclipse`, `./scripts/vbox-eclipse.sh --disk-only` boots labwc from the
 installed VDI.
+
+## The Abyss session (optional)
+
+There is a third session, **Abyss**: the Rust Wayland compositor from
+[chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), with its
+bar (`ec-hyperion-bar`), launcher (`ec-launcher`) and Settings
+(`ec-settings`), with the lunarbg wallpaper and the usual lunar apps. It comes from the `desktop/` submodule, which
+points at the fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
+**labwc stays the default session**: Abyss starts only when you pick it.
+
+```sh
+git submodule update --init desktop   # once, to fetch the code
+# boot: desktop=abyss on the cmdline, or persistently:
+echo abyss > /etc/eclipse/desktop
+```
+
+- **Build**: `cargo xtask image` builds it on the host, like SilverSurfer,
+  because it links the system libseat, libinput, libudev, GBM/EGL and
+  xkbcommon (`apt-get install libseat-dev libinput-dev libudev-dev libgbm-dev
+  libegl-dev libgles-dev libxkbcommon-dev libwayland-dev libdrm-dev`). With no
+  submodule, a missing package or a failed build the image still comes out,
+  with labwc only. It is not built on a host of another architecture.
+- **Services** (`desktop = abyss`): `abyss-seatd`, `abyss`
+  (`/usr/local/bin/eclipse-abyss`, log in `/tmp/abyss.log`), Abyss's bar
+  `abyss-hyperion-bar` (through `eclipse-abyss-client`), and Eclipse's own
+  **lunarbg** (`abyss-lunarbg`) as the wallpaper and **lunarclip**
+  (`abyss-lunarclip`), through the same wrappers as under labwc. They all wait
+  for the control socket `/run/user/0/eclipse/abyss.sock`.
+- **Lunar apps**: they work as under labwc, with the same shortcuts, set in
+  `/etc/eclipse/abyss.kdl`: Super+Return (terminal), Alt+Space and Alt+F2
+  (lunarrun), Super+E (lunarfile), Super+V (clipboard), Super+D (show
+  desktop), Super+L (lunarlock), Super+Tab (lunardesk), Super+N (lunarnotes),
+  Super+K (keyboard), Print and Shift+Print (lunarshot) and Ctrl+Shift+Esc
+  (lunarmon). Abyss's launcher stays on Super+R.
+- **Permissions**: Abyss hides its privileged protocols from any program not
+  named in `/etc/eclipse/policy.kdl`. It lists lunarclip
+  (`clipboard.data-control-allow`), lunarshot (`capture.allow`) and lunarbar,
+  lunarrun and lunardesk (`toplevel-management.allow`, which the fork adds
+  together with `zwlr_foreign_toplevel_management` and `ext-workspace`).
+- **Display**: Abyss listens on `wayland-1`, never `wayland-0`.
+- **GPU**: it renders with GLES on GBM/EGL, down the same zink+NVK path as
+  labwc, since `eclipse-init` sets the GPU variables for every service.
+- **Config**: `/etc/eclipse/abyss.kdl` (`de` desktop mode, `foot` terminal);
+  yours goes in `~/.config/eclipse/abyss.kdl` or in Settings. Every key:
+  `desktop/docs/CONFIG.md`.
+- **Not yet**: notifications. `ec-toasts`/`ec-services` would fight
+  `eclipse-notifyd` for `org.freedesktop.Notifications`, and `eclipse-notifyd`'s
+  cards are drawn by lunarbar, which does not run in this session.
+- **Licence**: all of `desktop/` is AGPL-3.0-only (its protocols and SDKs are
+  Apache-2.0). It is built and shipped as separate programs; nothing from it is
+  linked with this repository's MIT code. The source of what ships is the
+  pinned submodule commit.
