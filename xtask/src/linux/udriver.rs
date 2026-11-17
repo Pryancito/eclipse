@@ -25,16 +25,14 @@
 //! the card's frames instead of the kernel and asks a DHCP server for its
 //! address, or has the one the boot gives it (`unetstack=ADDR/PREFIX`).
 //! With `unetdriver=process` as well it runs `udrv-virtio-net` for the
-//! card, a process of its own. `unetstack=kernel` is the boot that keeps
-//! the kernel's stack: there the service runs the driver alone, which
-//! hands the card to the kernel. `unetstack=none` is the boot where
+//! card, a process of its own. `unetstack=none` is the boot where
 //! nothing of the system's takes the card: the kernel does not leave it
 //! unasked, and if the boot names it the service only waits, for a driver
 //! run by hand. Whose sockets that stack's are is the kernel's to say
 //! (`linux_object::net::user_stack::boot`).
 //!
 //! On a machine with no virtio card the stack's card is the first one the
-//! kernel drives itself, lent (unless the boot says `unetstack=kernel`): the kernel lists it as `kernel-net@0`, the
+//! kernel drives itself, lent: the kernel lists it as `kernel-net@0`, the
 //! `knet` service is the one that starts, and the same wrapper runs the
 //! stack with `card=kernel`, which borrows the card instead of claiming a
 //! device.
@@ -43,8 +41,7 @@
 //! (an x86_64 machine with no virtio card does, unless it says
 //! `unetcard=kernel`; `udriver=e1000e@0` elsewhere) is the stack's too, and the stack is its driver:
 //! the `enet` service starts, and the wrapper runs the stack with
-//! `card=e1000e`. Nothing else drives it from userspace, so on a boot that
-//! keeps the kernel's stack (`unetstack=kernel`) the service only waits.
+//! `card=e1000e`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -157,36 +154,30 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # and gateway (unetstack=dhcp on the kernel command line, or no\n\
           # such word); unetstack=ADDR/PREFIX gives it that address, and\n\
           # unetstack=ADDR/PREFIX,GATEWAY a gateway too.\n\
-          # unetstack=kernel: the card is for the kernel's own stack, and\n\
-          # what runs here is its driver alone.\n\
+          # unetstack=kernel kept the kernel's own stack once, and says\n\
+          # nothing now: the stack has the card as with no such word.\n\
           # unetstack=none: nothing of the system's takes the card. The\n\
           # kernel leaves it only if udriver=virtio-net@0 says so, and then\n\
           # it is for a driver run by hand: this only waits.\n\
           words=$(tr ': ' '\\n\\n' < /proc/cmdline)\n\
           stack=$(echo \"$words\" | sed -n 's/^unetstack=//p' | head -n 1)\n\
-          [ -n \"$stack\" ] || stack=dhcp\n\
-          # A card the kernel lends has no driver to run alone either, and a\n\
-          # boot that keeps the kernel's stack does not lend it.\n\
-          # Nor has an e1000e: only the stack drives one from userspace.\n\
-          if [ \"$stack\" = none ] || [ \"$1:$stack\" = kernel:kernel ] || [ \"$1:$stack\" = e1000e:kernel ]; then\n\
+          [ -n \"$stack\" ] && [ \"$stack\" != kernel ] || stack=dhcp\n\
+          if [ \"$stack\" = none ]; then\n\
           \x20   while sleep 86400; do :; done\n\
           \x20   exit 0\n\
           fi\n\
-          if [ \"$stack\" != kernel ]; then\n\
-          \x20   [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
-          \x20   # unetdriver=process: the driver in a process of its own, which\n\
-          \x20   # the stack starts and starts again, as it was before the stack\n\
-          \x20   # drove the card itself. A driver that dies then costs no\n\
-          \x20   # connection, and every frame a change of process each way.\n\
-          \x20   case $1:$(echo \"$words\" | sed -n 's/^unetdriver=//p' | head -n 1) in\n\
-          \x20       kernel:*) set -- card=kernel ;;\n\
-          \x20       e1000e:*) set -- card=e1000e ;;\n\
-          \x20       :process) set -- driver=process ;;\n\
-          \x20       *) set -- ;;\n\
-          \x20   esac\n\
-          \x20   exec /bin/eclipse-netstack 0 \"$stack\" \"$@\"\n\
-          fi\n\
-          exec /bin/udrv-virtio-net 0\n",
+          [ -x /bin/eclipse-netstack ] || { echo 'eclipse-unet: /bin/eclipse-netstack is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          # unetdriver=process: the driver in a process of its own, which\n\
+          # the stack starts and starts again, as it was before the stack\n\
+          # drove the card itself. A driver that dies then costs no\n\
+          # connection, and every frame a change of process each way.\n\
+          case $1:$(echo \"$words\" | sed -n 's/^unetdriver=//p' | head -n 1) in\n\
+          \x20   kernel:*) set -- card=kernel ;;\n\
+          \x20   e1000e:*) set -- card=e1000e ;;\n\
+          \x20   :process) set -- driver=process ;;\n\
+          \x20   *) set -- ;;\n\
+          esac\n\
+          exec /bin/eclipse-netstack 0 \"$stack\" \"$@\"\n",
     )
     .unwrap();
 

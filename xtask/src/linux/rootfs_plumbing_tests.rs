@@ -1004,8 +1004,8 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert_eq!(field(&gated[2].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
-        unet.contains("exec /bin/udrv-virtio-net 0"),
-        "the wrapper no longer runs the driver of card 0 as a service:\n{unet}"
+        unet.contains("exec /bin/eclipse-netstack 0"),
+        "the wrapper no longer runs the stack on card 0 as a service:\n{unet}"
     );
     // The Rust driver and no other: the C tool's own driver is for its
     // tests, and a service that ran it would be a system on a driver nobody
@@ -1086,12 +1086,12 @@ fn the_disk_wrapper_reads_its_number_off_the_command_line() {
 
 /// The first card left to userspace goes to the network stack that runs as
 /// a process, with the address the kernel command line gives it
-/// (`unetstack=ADDR/PREFIX`) or a DHCP server's, and to the kernel's own
-/// stack only on a boot that says so (`unetstack=kernel`): the wrapper of
-/// the `unet` service runs here over command lines of this test's, with
-/// the two programs it may end as swapped for `echo`.
+/// (`unetstack=ADDR/PREFIX`) or a DHCP server's, and never to the kernel's
+/// own stack, whatever the boot says (`unetstack=kernel` did once): the
+/// wrapper of the `unet` service runs here over command lines of this
+/// test's, with the program it ends as swapped for `echo`.
 #[test]
-fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
+fn the_cards_wrapper_runs_the_stack_whatever_the_boot_says_of_the_kernels() {
     let rootfs = init_rootfs("unet-stack");
     let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-unet")).unwrap();
     for needle in [
@@ -1099,7 +1099,6 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         "[ -x /bin/udrv-virtio-net ] ||",
         "[ -x /bin/eclipse-netstack ] ||",
         "exec /bin/eclipse-netstack 0 \"$stack\"",
-        "exec /bin/udrv-virtio-net 0",
         "while sleep 86400; do :; done",
     ] {
         assert_eq!(
@@ -1117,7 +1116,6 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
             .replace("[ -x /bin/udrv-virtio-net ] ||", "true ||")
             .replace("[ -x /bin/eclipse-netstack ] ||", "true ||")
             .replace("exec /bin/eclipse-netstack", "exec echo stack")
-            .replace("exec /bin/udrv-virtio-net", "exec echo driver")
             .replace("while sleep 86400; do :; done", "echo waits");
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -1182,16 +1180,20 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
         run("LOG=warn udriver=virtio-net@0 unetdriver=process\n"),
         "stack 0 dhcp driver=process\n"
     );
-    // `unetstack=kernel`: the card is the kernel's, which is what every
-    // boot had before the stack was its driver, and what drives it is a
-    // process whatever else the boot says of the stack's driver.
+    // `unetstack=kernel` gave the card to the kernel's own stack once.
+    // It says nothing now: the stack has the card, and asks a server for
+    // its address.
     for cmdline in [
         "LOG=warn:udriver=virtio-net@0:unetstack=kernel:ROOT=/dev/vda\n",
         "LOG=warn udriver=virtio-net@0 unetstack=kernel\n",
-        "LOG=warn:udriver=virtio-net@0:unetdriver=process:unetstack=kernel\n",
     ] {
-        assert_eq!(run(cmdline), "driver 0\n", "{cmdline:?}");
+        assert_eq!(run(cmdline), "stack 0 dhcp\n", "{cmdline:?}");
     }
+    assert_eq!(
+        run("LOG=warn:udriver=virtio-net@0:unetdriver=process:unetstack=kernel\n"),
+        "stack 0 dhcp driver=process\n"
+    );
+    assert!(!script.contains("exec /bin/udrv-virtio-net"));
     // A word that only starts like it is an address, a bad one, which the
     // stack is the one to refuse.
     assert_eq!(
@@ -1227,15 +1229,14 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
     }
     // The kernel lends nothing on a boot with no stack process, so the
     // service does not start; started all the same, it only waits.
-    for cmdline in [
-        "LOG=warn:unetcard=kernel:unetstack=kernel\n",
-        "LOG=warn:unetcard=kernel:unetstack=none\n",
-    ] {
-        assert_eq!(run_as("kernel", cmdline), "waits\n", "{cmdline:?}");
-    }
+    let none = "LOG=warn:unetcard=kernel:unetstack=none\n";
+    assert_eq!(run_as("kernel", none), "waits\n");
+    assert_eq!(
+        run_as("kernel", "LOG=warn:unetcard=kernel:unetstack=kernel\n"),
+        "stack 0 dhcp card=kernel\n"
+    );
     // `eclipse-unet e1000e`, the `enet` service: the stack claims the
-    // e1000e the boot left to userspace and drives it; nothing drives it
-    // for the kernel's stack, so there the service only waits.
+    // e1000e the boot left to userspace and drives it.
     for (cmdline, stack) in [
         ("LOG=warn:udriver=e1000e@0:ROOT=/dev/vda\n", "dhcp"),
         (
@@ -1250,12 +1251,12 @@ fn the_cards_wrapper_runs_the_stack_unless_the_boot_keeps_the_kernels() {
             "{cmdline:?}"
         );
     }
-    for cmdline in [
-        "LOG=warn:udriver=e1000e@0:unetstack=kernel\n",
-        "LOG=warn:udriver=e1000e@0:unetstack=none\n",
-    ] {
-        assert_eq!(run_as("e1000e", cmdline), "waits\n", "{cmdline:?}");
-    }
+    let none = "LOG=warn:udriver=e1000e@0:unetstack=none\n";
+    assert_eq!(run_as("e1000e", none), "waits\n");
+    assert_eq!(
+        run_as("e1000e", "LOG=warn:udriver=e1000e@0:unetstack=kernel\n"),
+        "stack 0 dhcp card=e1000e\n"
+    );
 }
 
 /// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run

@@ -8,29 +8,29 @@
 //! machine with such a card gets by saying nothing, and these are the
 //! words that change it:
 //!
-//! * `unetstack=kernel`: the card goes to the kernel's own stack, with a
-//!   driver process to carry its frames, and no stack runs as a process.
 //! * `unetstack=none`: the card is not left to userspace unless the boot
-//!   names it, and no stack takes it either way.
-//! * `unetuse=asked`: the stack process has the card, and only the
-//!   programs started by `eclipse-netstack-use` have its sockets.
+//!   names it, no stack takes it either way, and the kernel lends none of
+//!   its own: the machine has no network, and its programs the sockets
+//!   of a machine with no card.
 //! * `unetuse=all`: every program's sockets are a stack process's whatever
 //!   else the boot says, even while none runs.
+//!
+//! No word gives a boot the kernel's own stack any more: `unetstack=kernel`,
+//! `unetuse=asked` and `unetlend=asked` did, and say nothing now
+//! ([`gone`]).
 //!
 //! On x86_64 a machine with no such card whose first card is an Intel
 //! 82574 (QEMU's `e1000e`) leaves that one to userspace the same way
 //! ([`E1000E_CARD`]), and the stack process is its driver;
 //! `unetcard=kernel` keeps its driver in the kernel, which then lends it
-//! as below, and `unetstack=kernel` keeps card and network for the
-//! kernel's own stack.
+//! as below.
 //!
 //! A machine with neither, whose first card the kernel drives itself
 //! (an I219, or any card on a boot that says `unetcard=kernel`), lends that card to the stack process
 //! ([`lends`]): the kernel goes on driving it, its frames go to the stack
 //! process and not to the kernel's stack, and it counts as the stack
 //! process's card in all of the above. That is the machine's network too
-//! when the kernel has no other card. `unetstack=kernel` keeps the card,
-//! and the network, for the kernel's own stack, as `unetstack=none` does;
+//! when the kernel has no other card. `unetstack=none` lends nothing;
 //! `unetcard=kernel` lends the card even when a virtio card is there, which
 //! is then not left to userspace unasked.
 //!
@@ -39,9 +39,7 @@
 //! echo costs about 1.6 times as much lent as with the kernel's own stack
 //! (against a host that takes its time to answer; connecting, sending and
 //! receiving are faster lent), which is the price that was accepted for
-//! one stack instead of two. `unetlend=asked` goes back to lending only
-//! the cards whose drivers lend unasked (`NetScheme::lends_unasked`: the
-//! Intel ones with MSI), and the others keep the kernel's own stack. On
+//! one stack instead of two. On
 //! x86_64 a card with no MSI needs the legacy interrupt line of its slot
 //! to be lent, which a boot has under a hypervisor or with `pci.intx=1`
 //! (`kernel_hal::drivers::pci_intx_wanted`); without the line such a card
@@ -51,21 +49,17 @@
 //! stack process, whichever its first card is: it has a stack for each
 //! (`tools/eclipse-netstack`, `cards`), and is the machine's network by
 //! whichever has a cable. That is when every one of them can be lent. A
-//! card that cannot (its driver lends only when asked and the boot says
-//! `unetlend=asked`, or it has no interrupt) is the kernel's own stack's,
+//! card that cannot (it has no interrupt) is the kernel's own stack's,
 //! which is the only one that reaches it: on a machine with any, the
 //! stack process has its first card and no other, the programs that do
 //! not ask keep the kernel's stack, and the stack process is for the ones
-//! that do, unless the boot says `unetuse=all`. A boot that says
-//! `unetuse=asked` is the same: the first only, and the kernel's stack
-//! keeps the rest.
+//! that do, unless the boot says `unetuse=all`.
 //!
 //! A machine with no card at all, the kernel's or anybody's, has no stack
 //! process and needs none: what its programs say to each other never
 //! reaches a stack ([`Whose::AllNoCard`]). Their sockets are the served
 //! ones all the same, which join two programs of the machine by
-//! themselves, and the kernel's own stack carries nothing there;
-//! `unetstack=kernel` gives them the kernel's stack and its loopback back.
+//! themselves, and the kernel's own stack carries nothing there.
 
 /// The card the stack process takes, as `udriver=` names it and as
 /// `zcore_drivers::user::reserved` lists it: the one the `unet` boot
@@ -75,8 +69,7 @@ pub const CARD: &str = "virtio-net@0";
 /// The first Intel 82574 card, when the boot leaves it to userspace
 /// (unasked on x86_64, or `udriver=e1000e@0`): the stack process claims it and is its driver,
 /// as with [`CARD`], and it counts as that card in all of the above. The
-/// `enet` boot service is started for it. Only the stack process drives
-/// it from userspace: with `unetstack=kernel` nothing takes it.
+/// `enet` boot service is started for it.
 pub const E1000E_CARD: &str = "e1000e@0";
 
 /// Whether what the buses left to userspace (`zcore_drivers::user::reserved`)
@@ -104,30 +97,31 @@ static ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new
 /// [`CARD`] is there and left to userspace, and `lendable` whether the
 /// kernel drives a first card and its driver can lend it. It does unless
 /// one of those says no: a machine with [`CARD`] has that one for the stack
-/// process, and a boot that wants no stack process (`unetstack=kernel`,
-/// `unetstack=none`) lends nothing.
+/// process, and a boot that wants no stack process (`unetstack=none`)
+/// lends nothing.
 pub fn lends(unetstack: Option<&str>, card: bool, lendable: bool) -> bool {
-    lendable && !card && !matches!(unetstack, Some("kernel") | Some("none"))
+    lendable && !card && unetstack != Some("none")
+}
+
+/// What a word of the command line that kept the kernel's own stack for
+/// a boot said, when `value` is one of those: the words are still read,
+/// to tell whoever wrote them that they say nothing now.
+pub fn gone(word: &str, value: &str) -> bool {
+    matches!(
+        (word, value),
+        ("unetstack", "kernel") | ("unetuse", "asked") | ("unetlend", "asked")
+    )
 }
 
 /// How many of the kernel's cards this boot lends to the stack that runs
 /// as a process: `lendable` is how many it drives whose drivers can lend
-/// them on this boot ([`lends_any`]), `card` whether [`CARD`] is there and
-/// left to userspace, and the words are the command line's. All of them,
-/// whether the stack process starts with one of them or with a card of
-/// its own, unless the boot wants no stack process (`unetstack=kernel`,
-/// `unetstack=none`) or keeps the kernel's stack for the programs that do
-/// not ask (`unetuse=asked`): then the stack process has one card, its
-/// own or the kernel's first.
-pub fn lends_cards(
-    unetstack: Option<&str>,
-    unetuse: Option<&str>,
-    card: bool,
-    lendable: usize,
-) -> usize {
-    match (unetstack, unetuse) {
-        (Some("kernel") | Some("none"), _) => 0,
-        (_, Some("asked")) => lendable.min(!card as usize),
+/// them on this boot ([`lends_any`]), and `unetstack` the command line's
+/// word. All of them, whether the stack process starts with one of them
+/// or with a card of its own, unless the boot wants no stack process
+/// (`unetstack=none`).
+pub fn lends_cards(unetstack: Option<&str>, lendable: usize) -> usize {
+    match unetstack {
+        Some("none") => 0,
         _ => lendable,
     }
 }
@@ -154,14 +148,13 @@ pub fn may_borrow(loans: usize, unasked: bool) -> bool {
 
 /// Whether this boot lends a card whose driver lends only when asked
 /// (`NetScheme::lends_unasked`). `unetlend` is that word's value: `any`
-/// says yes and `asked` says no. A boot that says neither lends it where
+/// says yes. A boot that does not say so lends it where
 /// the card can be told of its frames: `interrupts` is whether a card with
 /// no MSI has an interrupt on this boot (always, off x86_64; on x86_64,
 /// whether it is given the legacy line of its slot).
 pub fn lends_any(unetlend: Option<&str>, interrupts: bool) -> bool {
     match unetlend {
         Some("any") => true,
-        Some("asked") => false,
         _ => interrupts,
     }
 }
@@ -189,9 +182,8 @@ pub enum Whose {
     /// The served ones, with no stack process behind them: the machine
     /// has no card, and what its programs say to each other needs none.
     AllNoCard,
-    /// The kernel's: the boot says so (`unetuse=asked`).
-    AskedSaid,
-    /// The kernel's: this boot gives no card to a stack process.
+    /// The kernel's: it drives cards and can lend none of them to a
+    /// stack process.
     NoStack,
     /// The kernel's: it drives this many cards of its own.
     KernelCards(usize),
@@ -215,12 +207,12 @@ impl Whose {
 /// is whether [`CARD`] is there and left to userspace, and `unetstack` the
 /// value of that word on the command line.
 pub fn has_stack(card: bool, unetstack: Option<&str>) -> bool {
-    card && !matches!(unetstack, Some("kernel") | Some("none"))
+    card && unetstack != Some("none")
 }
 
 /// What `unetuse=` can say. Any other word is as good as none.
 pub fn understood(unetuse: &str) -> bool {
-    matches!(unetuse, "all" | "asked")
+    unetuse == "all"
 }
 
 /// Whose the sockets are on a boot where [`CARD`] is left to userspace or
@@ -228,9 +220,7 @@ pub fn understood(unetuse: &str) -> bool {
 /// ([`lends_cards`]), whose command line has these values of `unetstack=`
 /// and `unetuse=` (`None` for a word that is not there), on a machine where
 /// the kernel drives `kernel_cards` network cards itself, the loopback not
-/// counted and the lent ones counted. A card left to userspace for the
-/// kernel's own stack (`unetstack=kernel`) is brought to it by a driver
-/// process and is not one of those.
+/// counted and the lent ones counted.
 pub fn whose(
     card: bool,
     lent: usize,
@@ -241,14 +231,9 @@ pub fn whose(
     let stack = lent != 0 || has_stack(card, unetstack);
     match unetuse {
         Some("all") => Whose::AllSaid,
-        Some("asked") => Whose::AskedSaid,
-        // No card anywhere, and no word that keeps the kernel's stack: a
-        // card left to userspace that no stack takes (`unetstack=none`)
-        // is nobody's network either.
-        _ if !stack && kernel_cards == 0 => match unetstack {
-            Some("kernel") => Whose::NoStack,
-            _ => Whose::AllNoCard,
-        },
+        // No card anywhere, or a boot that wants no stack
+        // (`unetstack=none`), whatever cards it has: nobody's network.
+        _ if !stack && (kernel_cards == 0 || unetstack == Some("none")) => Whose::AllNoCard,
         _ if !stack => Whose::NoStack,
         _ => match kernel_cards.saturating_sub(lent) {
             0 => Whose::AllOnlyCard,
@@ -262,21 +247,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_card_the_kernel_can_lend_is_lent_unless_the_boot_keeps_its_stack() {
+    fn every_card_the_kernel_can_lend_is_lent_unless_the_boot_wants_no_stack() {
         // With nothing said: all of them, to a stack process that starts
         // with one of them or with a card of its own.
-        assert_eq!(lends_cards(None, None, false, 2), 2);
-        assert_eq!(lends_cards(None, None, true, 2), 2);
-        assert_eq!(lends_cards(Some("dhcp"), Some("all"), true, 1), 1);
-        assert_eq!(lends_cards(None, None, false, 0), 0);
+        assert_eq!(lends_cards(None, 2), 2);
+        assert_eq!(lends_cards(Some("dhcp"), 1), 1);
+        assert_eq!(lends_cards(None, 0), 0);
         // No stack process: nobody to lend to.
-        assert_eq!(lends_cards(Some("kernel"), None, false, 2), 0);
-        assert_eq!(lends_cards(Some("none"), None, true, 2), 0);
-        // The kernel's stack for who does not ask: the stack process has
-        // one card, and the kernel's stack the rest.
-        assert_eq!(lends_cards(None, Some("asked"), false, 2), 1);
-        assert_eq!(lends_cards(None, Some("asked"), true, 2), 0);
-        assert_eq!(lends_cards(None, Some("asked"), false, 0), 0);
+        assert_eq!(lends_cards(Some("none"), 2), 0);
+        // The word that kept the kernel's stack says nothing.
+        assert_eq!(lends_cards(Some("kernel"), 2), 2);
 
         // What a borrower is answered by, once the boot has decided.
         assert!(!lends_some());
@@ -306,7 +286,8 @@ mod tests {
     fn the_boot_can_say_which_cards_are_lent() {
         for interrupts in [false, true] {
             assert!(lends_any(Some("any"), interrupts));
-            assert!(!lends_any(Some("asked"), interrupts));
+            // The word that lent fewer says nothing now.
+            assert_eq!(lends_any(Some("asked"), interrupts), interrupts);
         }
     }
 
@@ -334,13 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn a_boot_that_leaves_no_card_to_a_stack_process_keeps_the_kernels() {
-        // A machine whose card the kernel drives and does not lend.
+    fn a_machine_whose_cards_cannot_be_lent_keeps_the_kernels_stack() {
+        // A machine whose card the kernel drives and cannot lend.
         assert_eq!(whose(false, 0, None, None, 1), Whose::NoStack);
         assert_eq!(whose(false, 0, Some("dhcp"), None, 2), Whose::NoStack);
-        // The card left to userspace for the kernel's own stack.
-        assert_eq!(whose(true, 0, Some("kernel"), None, 0), Whose::NoStack);
-        assert_eq!(whose(true, 0, Some("none"), None, 1), Whose::NoStack);
         assert!(!Whose::NoStack.all());
         assert!(!Whose::NoStack.alone());
     }
@@ -351,20 +329,38 @@ mod tests {
         assert_eq!(whose(false, 0, None, None, 0), Whose::AllNoCard);
         // An address there does not make a stack of it.
         assert_eq!(whose(false, 0, Some("dhcp"), None, 0), Whose::AllNoCard);
-        // A card left to userspace that no stack takes is nobody's
-        // network.
+        // A boot that wants no stack is nobody's network, whatever
+        // cards it has.
         assert_eq!(whose(true, 0, Some("none"), None, 0), Whose::AllNoCard);
         assert_eq!(whose(false, 0, Some("none"), None, 0), Whose::AllNoCard);
+        assert_eq!(whose(true, 0, Some("none"), None, 1), Whose::AllNoCard);
+        assert_eq!(whose(false, 0, Some("none"), None, 2), Whose::AllNoCard);
         assert!(Whose::AllNoCard.all());
         assert!(Whose::AllNoCard.alone());
         // No other answer is a machine alone.
         assert!(!Whose::AllSaid.alone());
         assert!(!Whose::AllOnlyCard.alone());
-        // The kernel's stack and its loopback, for the boot that says so.
-        assert_eq!(whose(false, 0, Some("kernel"), None, 0), Whose::NoStack);
         // And what the boot says of every program still counts first.
-        assert_eq!(whose(false, 0, None, Some("asked"), 0), Whose::AskedSaid);
         assert_eq!(whose(false, 0, None, Some("all"), 0), Whose::AllSaid);
+    }
+
+    #[test]
+    fn no_word_gives_a_boot_the_kernels_stack() {
+        assert!(gone("unetstack", "kernel"));
+        assert!(gone("unetuse", "asked"));
+        assert!(gone("unetlend", "asked"));
+        assert!(!gone("unetstack", "none") && !gone("unetstack", "dhcp"));
+        assert!(!gone("unetuse", "all") && !gone("unetlend", "any"));
+        assert!(!gone("unetcard", "kernel"));
+        // With them said, the boot is the one that says nothing: the
+        // stack process has the card and every program its sockets.
+        assert_eq!(whose(true, 0, Some("kernel"), None, 0), Whose::AllOnlyCard);
+        assert_eq!(whose(false, 0, Some("kernel"), None, 0), Whose::AllNoCard);
+        assert_eq!(whose(true, 0, None, Some("asked"), 0), Whose::AllOnlyCard);
+        assert_eq!(whose(false, 1, None, Some("asked"), 1), Whose::AllOnlyCard);
+        assert!(lends(Some("kernel"), false, true));
+        assert!(has_stack(true, Some("kernel")));
+        assert!(!understood("asked"));
     }
 
     #[test]
@@ -380,21 +376,10 @@ mod tests {
         // stack process of the boot's (one can be run by hand).
         assert_eq!(whose(true, 0, None, Some("all"), 1), Whose::AllSaid);
         assert_eq!(whose(false, 0, None, Some("all"), 1), Whose::AllSaid);
-        assert_eq!(
-            whose(true, 0, Some("kernel"), Some("all"), 0),
-            Whose::AllSaid
-        );
+        assert_eq!(whose(true, 0, Some("none"), Some("all"), 0), Whose::AllSaid);
         assert!(Whose::AllSaid.all());
-        // `unetuse=asked`: the stack has the only card and still only the
-        // programs that ask have it.
-        assert_eq!(whose(true, 0, None, Some("asked"), 0), Whose::AskedSaid);
-        assert_eq!(
-            whose(true, 0, Some("dhcp"), Some("asked"), 0),
-            Whose::AskedSaid
-        );
-        assert!(!Whose::AskedSaid.all());
-        // A word that is neither is as good as none.
-        assert!(understood("all") && understood("asked"));
+        // Any other word is as good as none.
+        assert!(understood("all"));
         assert!(!understood("") && !understood("ALL") && !understood("every"));
         assert_eq!(whose(true, 0, None, Some("every"), 0), Whose::AllOnlyCard);
         assert_eq!(
@@ -416,7 +401,6 @@ mod tests {
         // The virtio card is the stack process's first.
         assert!(!lends(None, true, true));
         // A boot with no stack process has nobody to lend to.
-        assert!(!lends(Some("kernel"), false, true));
         assert!(!lends(Some("none"), false, true));
 
         // The only card of the machine, lent: the stack process is the
@@ -425,7 +409,6 @@ mod tests {
         // Another card the kernel keeps: its stack for who does not ask.
         assert_eq!(whose(false, 1, None, None, 2), Whose::KernelCards(1));
         // What the boot says of every program still counts.
-        assert_eq!(whose(false, 1, None, Some("asked"), 1), Whose::AskedSaid);
         assert_eq!(whose(false, 1, None, Some("all"), 2), Whose::AllSaid);
 
         // Every card of the kernel's lent: the stack process has them

@@ -540,16 +540,12 @@ endif
 # gives it one. With `NIC=none` that card is the machine's only one and
 # every program's sockets are that stack's; with a card of the kernel's
 # as well, the programs started by `eclipse-netstack-use` have it, or
-# every program with `unetuse=all`. `unetuse=asked` keeps it to those
-# programs on any machine, and `unetstack=kernel` gives the card to the
-# kernel's own stack instead, with a driver process to carry its frames
-# (`tools/eclipse-udrivers`).
+# every program with `unetuse=all`.
 #
 # Without UNET that stack has the first card the kernel drives itself (the
 # e1000e of an x86_64 run): the kernel goes on driving it and lends it, its
 # frames go to the stack process and that stack is the network of every
-# program, as with a card of its own. `unetstack=kernel` in KOPTS keeps
-# that card for the kernel's own stack, as before; `unetcard=kernel` lends
+# program, as with a card of its own. `unetcard=kernel` lends
 # it even with UNET's card there, which then is not left to userspace.
 #
 # On x86_64 that e1000e is left to userspace instead, without a word: the

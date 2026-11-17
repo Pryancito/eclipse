@@ -21,8 +21,7 @@
 //! Which programs: all of them, on a machine whose only card is this
 //! stack's, which is what a machine with a virtio network card gets
 //! without a word (the kernel leaves that card to userspace, having no
-//! driver for it); with `unetuse=asked` on the kernel command
-//! line, or where the kernel drives a card of its own, the ones started by
+//! driver for it); where the kernel drives a card it cannot lend, the ones started by
 //! `eclipse-netstack-use`, and every other socket is the kernel's
 //! stack's. The address is written on the command
 //! line or leased from a DHCP server, and one gateway carries what is not

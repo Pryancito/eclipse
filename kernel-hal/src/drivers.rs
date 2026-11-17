@@ -433,7 +433,7 @@ pub fn set_pci_intx_enabled(v: bool) {
 /// `pci_intx` is what the boot says of `pci.intx` (`Some(true)` for
 /// `pci.intx=1`, `Some(false)` for `pci.intx=0`), and it wins. `unetlend` is
 /// that word's value: `any` asks for the line, since it asks for such cards
-/// to be lent, and `asked` does not. A boot that says none of it has the
+/// to be lent. A boot that says none of it has the
 /// line under a hypervisor and not on a real machine: the line is the one
 /// the firmware wrote, level triggered, which is right where the lines of
 /// the PCI slots are steered to ISA interrupts (QEMU does), and on a real
@@ -443,7 +443,6 @@ pub fn pci_intx_wanted(pci_intx: Option<bool>, unetlend: Option<&str>, hyperviso
     match (pci_intx, unetlend) {
         (Some(said), _) => said,
         (None, Some("any")) => true,
-        (None, Some("asked")) => false,
         (None, _) => hypervisor,
     }
 }
@@ -1947,9 +1946,11 @@ mod pci_intx_tests {
     }
 
     #[test]
-    fn asking_for_every_card_to_be_lent_asks_for_the_line_and_asked_does_not() {
+    fn asking_for_every_card_to_be_lent_asks_for_the_line() {
         assert!(pci_intx_wanted(None, Some("any"), false));
-        assert!(!pci_intx_wanted(None, Some("asked"), true));
+        // The word that asked for fewer says nothing now.
+        assert!(pci_intx_wanted(None, Some("asked"), true));
+        assert!(!pci_intx_wanted(None, Some("asked"), false));
     }
 }
 
