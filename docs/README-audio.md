@@ -160,7 +160,16 @@ DAI -- the HDA stream and its ring -- never sees a client.
   `GET_PIN_SENSE`) because GOP never enables audio packets.
 
 On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
-once the compositor is up (`mpg123` via ALSA card 0).
+(`mpg123` via Pulse, or ALSA card 0 without it). It is **one** service row, with
+no `desktop =` and `after = *`: it plays at the end of the boot under any
+session (labwc, Xorg, Abyss) and on a console with no desktop at all. It is
+best-effort: with no player or no PCM it exits 0 and is not retried.
+
+The install medium (the ISO) installs no `pulseaudio.service`: its root is
+assembled from `LIVE_KEEP`, which carries no `usr/bin`, so the binary never
+ships and the row was only ever `exit 127`, twenty times per boot. That is
+`LIVE_DROP_SERVICES` in `xtask/src/linux/image.rs`; the QEMU live image, which
+does get `usr/bin`, gets the row back.
 
 ## The display side (NVIDIA GPUs)
 
