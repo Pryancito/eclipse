@@ -1598,6 +1598,10 @@ impl zcore_drivers::net::stack_card::Wire for StackLink {
     fn put(&self, frame: &[u8]) -> bool {
         self.put_frame(frame)
     }
+
+    fn configure(&self, card: u64, change: zcore_drivers::net::stack_card::Change) -> bool {
+        StackLink::configure(self, card, change)
+    }
 }
 
 /// Tell the stack that serves this machine whether to say the frames its

@@ -135,6 +135,44 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         core::mem::take(&mut self.lease.news).then(|| self.lease.held.clone())
     }
 
+    /// The card's address is `address` from now on, or it has none,
+    /// because somebody on this machine says so (`ip addr`, `ifconfig`):
+    /// no server is asked for one any more, and what a lease gave is
+    /// gone with it. The gateway stays while it is on the new network.
+    pub fn write_address(&mut self, address: Option<Ipv4Cidr>) {
+        if let Some(client) = self.lease.client.take() {
+            self.set.remove(client);
+        }
+        self.lease.held = None;
+        self.lease.news = false;
+        // The groups are said from an address: left from the one that
+        // goes, joined from the one that comes.
+        self.say_groups(false);
+        self.put_address(address.unwrap_or(NO_ADDRESS));
+        let gateway = self.gateway;
+        self.set_gateway(gateway.filter(|g| address.is_some_and(|a| a.contains_addr(g))));
+        self.say_groups(true);
+    }
+
+    /// Give up what a server gave and ask again, from no address: what
+    /// taking the address away comes to on a card that asks for its own
+    /// (`ip addr flush`, the script of a DHCP client that is going).
+    pub fn ask_again(&mut self) {
+        self.write_address(None);
+        self.ask_for_lease();
+    }
+
+    /// [`set_gateway`](Self::set_gateway) for one somebody on this
+    /// machine names: `false`, and nothing changed, when it is not a
+    /// machine of the card's network.
+    pub fn write_gateway(&mut self, gateway: Option<Ipv4Address>) -> bool {
+        let near = |gateway: Ipv4Address| {
+            self.address()
+                .is_some_and(|a| a.contains_addr(&gateway) && a.address() != gateway)
+        };
+        gateway.is_none_or(near) && self.set_gateway(gateway)
+    }
+
     fn put_address(&mut self, address: Ipv4Cidr) {
         self.iface.update_ip_addrs(|addrs| {
             if let Some(first) = addrs.iter_mut().next() {
@@ -361,6 +399,42 @@ mod tests {
 
     /// The stack built by hand has a gateway only when given one, and it
     /// stays through an interface that never asks for a lease.
+    #[test]
+    fn an_address_written_by_hand_ends_the_asking_and_keeps_a_gateway_that_is_near() {
+        let (mut stack, window) = stack();
+        stack.ask_for_lease();
+        assert!(stack.leases() && stack.address().is_none());
+        let address = Ipv4Cidr::new(Ipv4Address([192, 168, 7, 9]), 24);
+        stack.write_address(Some(address));
+        assert!(!stack.leases());
+        assert_eq!(stack.address(), Some(address));
+        assert_eq!(stack.lease_news(), None);
+        // Nobody is asked for an address any more.
+        assert!(frames(&mut stack, &window, 5_000).is_empty());
+        // A gateway of its network, and no other.
+        assert!(!stack.write_gateway(Some(Ipv4Address([10, 0, 9, 2]))));
+        assert!(!stack.write_gateway(Some(address.address())));
+        assert_eq!(stack.gateway(), None);
+        assert!(stack.write_gateway(Some(Ipv4Address([192, 168, 7, 1]))));
+        assert_eq!(stack.gateway(), Some(Ipv4Address([192, 168, 7, 1])));
+        // It stays through another address of the network, and goes
+        // with one of another, or with none.
+        stack.write_address(Some(Ipv4Cidr::new(Ipv4Address([192, 168, 7, 10]), 24)));
+        assert_eq!(stack.gateway(), Some(Ipv4Address([192, 168, 7, 1])));
+        stack.write_address(Some(Ipv4Cidr::new(Ipv4Address([10, 0, 9, 15]), 24)));
+        assert_eq!(stack.gateway(), None);
+        assert!(stack.write_gateway(Some(GATEWAY)));
+        stack.write_address(None);
+        assert_eq!((stack.address(), stack.gateway()), (None, None));
+        assert!(stack.write_gateway(None));
+        // Asking again is asking from nothing: a server is spoken to.
+        stack.write_address(Some(address));
+        stack.ask_again();
+        assert!(stack.leases());
+        assert_eq!((stack.address(), stack.gateway()), (None, None));
+        assert!(!frames(&mut stack, &window, 5_000).is_empty());
+    }
+
     #[test]
     fn a_stack_with_a_written_address_never_asks_for_one() {
         let (mut stack, window) = stack();

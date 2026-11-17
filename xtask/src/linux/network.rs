@@ -41,9 +41,23 @@ pub(super) fn write_network_wrapper(localbin: &Path) {
           # and route are all set by this script on the 'bound' event.\n\
           SCRIPTv4=/usr/share/udhcpc/default.script\n\
           [ -x \"$SCRIPTv4\" ] || SCRIPTv4=/etc/udhcpc/default.script\n\
+          # A card the kernel lends to the network stack that runs as a\n\
+          # process is the kernel's for a moment yet: wait for that stack\n\
+          # to say its cards, which are its own to give an address.\n\
+          if grep -q '^kernel-net@' /proc/udrivers 2>/dev/null; then\n\
+          \x20 n=0\n\
+          \x20 while [ $n -lt 75 ] && ! ls /run/eclipse-servers/stack.* >/dev/null 2>&1; do\n\
+          \x20   sleep 0.2; n=$((n + 1))\n\
+          \x20 done\n\
+          fi\n\
+          macs=$(sed -n 's/^mac=//p' /run/eclipse-servers/stack.* 2>/dev/null)\n\
           for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
+          \x20 m=$(cat \"/sys/class/net/$i/address\" 2>/dev/null)\n\
+          \x20 [ -z \"$m\" ] || case \"$macs\" in *\"$m\"*) continue ;; esac\n\
           \x20 exec udhcpc -i \"$i\" -f -R -s \"$SCRIPTv4\"\n\
           done\n\
+          # Every card is such a stack's: nothing to do here but stay.\n\
+          [ -z \"$macs\" ] || { while sleep 86400; do :; done; exit 0; }\n\
           # `ip` may not have listed anything yet (netlink dump raced the\n\
           # NIC probe). eth0 is the sequential name the kernel assigns to\n\
           # the first Ethernet NIC.\n\

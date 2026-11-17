@@ -1271,6 +1271,17 @@ fn service() -> ! {
         libc::signal(libc::SIGTERM, h);
         libc::signal(libc::SIGINT, h);
     }
+    // A card the kernel lends is among its interfaces until the stack
+    // that runs as a process borrows it, a moment after this starts: wait
+    // for that stack, for as long as one may take to come.
+    let since = Instant::now();
+    let udrivers = std::fs::read_to_string(netconf::UDRIVERS).unwrap_or_default();
+    while netconf::awaits_stack(&udrivers, Path::new(netconf::SERVERS))
+        && since.elapsed() < Duration::from_secs(15)
+        && !STOP.load(Ordering::SeqCst)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let mut added6 = Vec::new();
     loop {
         RELOAD.store(false, Ordering::SeqCst);

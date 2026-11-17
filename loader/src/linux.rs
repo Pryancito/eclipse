@@ -611,10 +611,10 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// of six. On a boot where every program's sockets are this stack's
 /// (`linux_object::net::user_stack::boot`) the kernel shows that card among
 /// the machine's interfaces for as long as the stack serves, to be looked
-/// at (`ifconfig`, `ip`, `/proc/net`): nothing is sent through it or set
-/// on it there, and what it has carried is what the stack says on the
-/// channel as it goes. A `prefix` of 0 says nothing of the card, and none
-/// is shown.
+/// at (`ifconfig`, `ip`, `/proc/net`) and set (`ip addr`, `ip route`,
+/// `ifconfig`), which the kernel asks of the stack on the channel; what it
+/// has carried is what the stack says there as it goes. An `address` and a
+/// `prefix` of 0 are a card with no address yet, shown without one.
 ///
 /// Which sockets: the datagram and stream sockets of the processes that
 /// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
@@ -699,6 +699,15 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
     let link = serving.link();
     let card = show_stack_card(address, args, link.carried(), link.sixes());
+    // What the stack says of its first card from here on is that one's.
+    let mac = (args[5] as u64).to_be_bytes();
+    let said = linux_object::net::user_stack::cards::Said::first(
+        [mac[2], mac[3], mac[4], mac[5], mac[6], mac[7]],
+        address,
+        args[3],
+        args[4],
+    );
+    link.first_card(said, card.clone());
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them. Until this
     // process is gone: the next one's channel has its own task.

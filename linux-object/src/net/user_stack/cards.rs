@@ -1,49 +1,80 @@
-//! The other cards of the stack that runs as a process.
+//! The cards of the stack that runs as a process, and their addresses.
 //!
-//! The stack is told to the kernel with one card, the one it gives the
-//! kernel its sockets with (`eclipse_netstack_serve`), and that card is
-//! the stack's address here. A machine with more cards has a stack for
-//! each in the one process (`tools/eclipse-netstack`, `cards`), and each
-//! of the others is said with a message of its own once it has an
-//! address, and again when that changes:
+//! The stack gives the kernel its sockets with one card, its first
+//! (`eclipse_netstack_serve`), which it says there with the address it
+//! has then, if it has one. A machine with more cards has a stack for
+//! each in the one process (`tools/eclipse-netstack`, `cards`). Each
+//! card is said with a message of its own, the others at the start and
+//! every one whenever its address or its gateway changes:
 //!
 //! ```text
 //! CARD  (stack to kernel)  8  u64 card  16  [u8; 6] MAC  22  u8 prefix  23  u8 zero
 //!                          24  [u8; 4] address  28  [u8; 4] gateway
 //! ```
 //!
-//! `card` is a number of the stack's for that card, never 0, which is
-//! the card it serves with. No address (all zero) is a card that lost
-//! its own; no gateway is all zero. What a card has carried (`COUNTS`)
-//! and what it has of IPv6 (`SIX`) are said with the same number where
-//! a socket's would be, and 0 there is the first card, as it was.
+//! `card` is a number of the stack's for that card, and 0 is the card it
+//! serves with. No address (all zero) is a card that has none yet, or
+//! lost its own; no gateway is all zero. What a card has carried
+//! (`COUNTS`) and what it has of IPv6 (`SIX`) are said with the same
+//! number where a socket's would be.
 //!
 //! What the kernel does with it: on a boot where every program's sockets
-//! are the stack's, the card is one more interface of the machine, with
-//! its address, its gateway, its counts and its IPv6 addresses, under
-//! the name it had while the kernel drove it. Its address is this
-//! machine's, like the first card's: what is sent there is for another
-//! program here, and a socket can be bound to it. And a connection, or a
-//! connected datagram socket, to a machine on that card's network says
-//! that card's address as its own, which is the one it leaves by. The
-//! cards go with the stack; the next one says its own.
+//! are the stack's, each card is an interface of the machine, with its
+//! address, its gateway, its counts and its IPv6 addresses, under the
+//! name it had while the kernel drove it. The first card's address is
+//! the stack's here. Another's is this machine's too: what is sent there
+//! is for another program here, and a socket can be bound to it. And a
+//! connection, or a connected datagram socket, to a machine on that
+//! card's network says that card's address as its own, which is the one
+//! it leaves by. The cards go with the stack; the next one says its own.
+//!
+//! The address and the gateway are the stack's to have and anybody's to
+//! ask for: what `ip addr`, `ip route` and `ifconfig` set on such an
+//! interface is asked of the stack ([`StackLink::configure`]),
+//!
+//! ```text
+//! ADDRESS  (kernel to stack)  8  u64 card  16  [u8; 4] address  20  u8 prefix  21  three zero
+//! GATEWAY  (kernel to stack)  8  u64 card  16  [u8; 4] gateway
+//! ```
+//!
+//! all zero for none. The stack then has that address and asks no server
+//! for one any more, and says the card again (`CARD`) as it is. The
+//! kernel shows what it asked for at once, and what the stack says when
+//! it does.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
-use kernel_hal::drivers::net::stack_card::{Carried, Sixes, StackCard};
+use kernel_hal::drivers::net::stack_card::{Carried, Change, Sixes, StackCard};
 use kernel_hal::drivers::prelude::Device;
 use kernel_hal::drivers::scheme::NetStats;
 use kernel_hal::sync::Mutex;
-use log::warn;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 
 use super::{header, StackLink, COUNTS};
 
-/// The operation of the message.
+/// The operations of the messages.
 pub const OP_CARD: u32 = 31;
+pub const OP_ADDRESS: u32 = 32;
+pub const OP_GATEWAY: u32 = 33;
+
+/// `ADDRESS`: card `card` is to have `address`, or none.
+pub fn address_message(card: u64, address: Option<Ipv4Cidr>) -> Vec<u8> {
+    let mut m = header(OP_ADDRESS, card, 8);
+    m.extend_from_slice(&address.map_or([0; 4], |a| a.address().0));
+    m.extend_from_slice(&[address.map_or(0, |a| a.prefix_len()), 0, 0, 0]);
+    m
+}
+
+/// `GATEWAY`: card `card` is to send what is not for its network to
+/// `gateway`, or nowhere.
+pub fn gateway_message(card: u64, gateway: Option<Ipv4Address>) -> Vec<u8> {
+    let mut m = header(OP_GATEWAY, card, 4);
+    m.extend_from_slice(&gateway.map_or([0; 4], |g| g.0));
+    m
+}
 /// What a `CARD` says past its header.
 const CARD_LEN: usize = 16;
 
@@ -55,6 +86,23 @@ pub struct Said {
     /// them.
     pub address: Option<Ipv4Cidr>,
     pub gateway: Option<Ipv4Address>,
+}
+
+impl Said {
+    /// The card a stack gives the kernel its sockets with, as that call
+    /// says it: `prefix` the bits of its network's prefix and `gateway`
+    /// an address as a big-endian number, each 0 for none.
+    pub fn first(mac: [u8; 6], address: [u8; 4], prefix: usize, gateway: usize) -> Said {
+        let address = (address != [0; 4] && (1..=32).contains(&prefix))
+            .then(|| Ipv4Cidr::new(Ipv4Address(address), prefix as u8));
+        let gateway = (gateway != 0 && gateway as u64 <= u64::from(u32::MAX))
+            .then(|| Ipv4Address((gateway as u32).to_be_bytes()));
+        Said {
+            mac,
+            address,
+            gateway: gateway.filter(|_| address.is_some()),
+        }
+    }
 }
 
 /// `CARD`: the stack's card `card` is this.
@@ -92,7 +140,7 @@ pub fn parse_card(said: &[u8]) -> Option<Said> {
     })
 }
 
-/// A card of the stack's that is not its first, as it said it last.
+/// A card of the stack's, as it said it last.
 struct Other {
     said: Said,
     /// The last `COUNTS` of it.
@@ -189,34 +237,103 @@ fn hide(shown: Option<Arc<StackCard>>) {
 impl StackLink {
     /// `CARD`: the stack's card `card` is `said` from now on.
     pub(super) fn take_card(&self, card: u64, said: Said) {
-        if card == 0 {
-            warn!("user stack: a CARD for the card it serves with");
-            return;
-        }
         let mut now = self.others.now.lock();
-        let was = now.remove(&card);
-        let counted = was.as_ref().map_or([0; COUNTS], |was| was.counted);
-        if was.as_ref().is_some_and(|was| was.said == said) {
-            now.extend(was.map(|was| (card, was)));
+        if card == 0 {
+            let address = said
+                .address
+                .map_or(0, |a| u32::from_be_bytes(a.address().0));
+            self.address
+                .store(address, core::sync::atomic::Ordering::Release);
+        }
+        if let Some(other) = now.get_mut(&card) {
+            if other.said != said {
+                other.said = said;
+                if let Some(shown) = &other.shown {
+                    shown.set(said.address, said.gateway);
+                }
+            }
             return;
         }
-        hide(was.and_then(|was| was.shown));
-        let shown = said
-            .address
-            .filter(|_| super::is_for_all())
-            .and_then(|address| self.show(card, &said, address));
+        // The first card is put among the machine's interfaces by who
+        // gave the kernel its sockets ([`StackLink::first_card`]).
+        let shown = (card != 0 && super::is_for_all())
+            .then(|| self.show(card, &said))
+            .flatten();
         now.insert(
             card,
             Other {
                 said,
-                counted,
+                counted: [0; COUNTS],
                 shown,
             },
         );
     }
 
+    /// The stack that serves now gave the kernel its sockets with a card
+    /// that is `said`, which `shown` shows among the machine's
+    /// interfaces, when anything does.
+    pub fn first_card(&self, said: Said, shown: Option<Arc<StackCard>>) {
+        let mut now = self.others.now.lock();
+        match now.get_mut(&0) {
+            // The stack has said it again already: that is the later word.
+            Some(first) => {
+                if let Some(shown) = &shown {
+                    shown.set(first.said.address, first.said.gateway);
+                }
+                first.shown = shown;
+            }
+            None => {
+                now.insert(
+                    0,
+                    Other {
+                        said,
+                        counted: [0; COUNTS],
+                        shown,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Ask the stack for `change` on its card `card`, and show it as
+    /// asked until the stack says how it is. `false` when it was not
+    /// asked: no stack serves, it has no such card, or the gateway is
+    /// not on the card's network.
+    pub fn configure(&self, card: u64, change: Change) -> bool {
+        let said = self.others.now.lock().get(&card).map(|other| other.said);
+        let Some(mut said) = said else {
+            return false;
+        };
+        let message = match change {
+            Change::Address(address) => {
+                said.address = address;
+                // A gateway is on the card's network, or is none.
+                said.gateway = said
+                    .gateway
+                    .filter(|gateway| address.is_some_and(|a| a.contains_addr(gateway)));
+                address_message(card, address)
+            }
+            Change::Gateway(gateway) => {
+                let near = |gateway: &Ipv4Address| {
+                    said.address
+                        .is_some_and(|a| a.contains_addr(gateway) && a.address() != *gateway)
+                };
+                if gateway.as_ref().is_some_and(|gateway| !near(gateway)) {
+                    return false;
+                }
+                said.gateway = gateway;
+                gateway_message(card, gateway)
+            }
+        };
+        if self.tell(message, true).is_err() {
+            return false;
+        }
+        self.take_card(card, said);
+        true
+    }
+
     /// Put `card` among the machine's interfaces.
-    fn show(&self, card: u64, said: &Said, address: Ipv4Cidr) -> Option<Arc<StackCard>> {
+    fn show(&self, card: u64, said: &Said) -> Option<Arc<StackCard>> {
         let (name, carried, sixes) = self.others.keep(card, |kept| {
             // The name it had while the kernel drove it; one of its own
             // otherwise, and the same from then on.
@@ -231,10 +348,11 @@ impl StackLink {
             StackCard::new(
                 name.clone(),
                 said.mac,
-                address.address().0,
-                address.prefix_len(),
+                said.address.map_or([0; 4], |a| a.address().0),
+                said.address.map_or(0, |a| a.prefix_len()),
                 said.gateway.map(|gateway| gateway.0),
             )
+            .numbered(card)
             .counting(carried)
             .with_sixes(sixes)
             .through(wire),
@@ -270,8 +388,11 @@ impl StackLink {
     /// The stack is gone, and its cards with it.
     pub(super) fn forget_cards(&self) {
         let gone = core::mem::take(&mut *self.others.now.lock());
-        for (_, other) in gone {
-            hide(other.shown);
+        for (card, other) in gone {
+            // The first card's interface is taken away by who put it.
+            if card != 0 {
+                hide(other.shown);
+            }
         }
         for kept in self.others.kept.lock().values() {
             kept.sixes.forget();
@@ -281,17 +402,17 @@ impl StackLink {
     /// Whether `addr` is the address of a card that is not the first.
     pub(super) fn is_another(&self, addr: Ipv4Address) -> bool {
         let now = self.others.now.lock();
-        now.values()
-            .any(|other| other.said.address.is_some_and(|a| a.address() == addr))
+        let mut others = now.iter().filter(|(card, _)| **card != 0);
+        others.any(|(_, other)| other.said.address.is_some_and(|a| a.address() == addr))
     }
 
     /// The address this machine speaks from to `to`: the one of the card
     /// whose network `to` is on, and the first card's to anywhere else.
     pub(super) fn address_toward(&self, to: Ipv4Address) -> Ipv4Address {
         let now = self.others.now.lock();
-        let near = now.values().filter_map(|other| other.said.address);
-        near.clone()
-            .find(|address| address.contains_addr(&to))
+        let others = now.iter().filter(|(card, _)| **card != 0);
+        let mut near = others.filter_map(|(_, other)| other.said.address);
+        near.find(|address| address.contains_addr(&to))
             .map_or_else(|| self.address(), |address| address.address())
     }
 
@@ -299,9 +420,8 @@ impl StackLink {
     /// lists them.
     pub fn other_cards(&self) -> Vec<(u64, Said)> {
         let now = self.others.now.lock();
-        now.iter()
-            .map(|(card, other)| (*card, other.said))
-            .collect()
+        let others = now.iter().filter(|(card, _)| **card != 0);
+        others.map(|(card, other)| (*card, other.said)).collect()
     }
 }
 
@@ -389,9 +509,117 @@ mod tests {
         stack.say(card_message(2, &lost));
         assert!(!link.is_here(moved));
         assert_eq!(link.address_toward(Ipv4Address([192, 168, 200, 1])), first);
-        // The card the stack serves with is not said this way.
-        stack.say(card_message(0, &said(other.0, 24, None)));
+        // The card the stack serves with is the first: what is said of
+        // it is the address the machine speaks from, and no other card.
+        stack.say(card_message(0, &said([10, 0, 9, 77], 24, None)));
         assert_eq!(link.other_cards(), [(2, lost)]);
+        assert_eq!(link.address(), Ipv4Address([10, 0, 9, 77]));
+        assert!(link.is_here(Ipv4Address([10, 0, 9, 77])) && !link.is_here(first));
+        stack.say(card_message(0, &lost));
+        assert!(link.address().is_unspecified());
+        assert!(!link.is_here(Ipv4Address::UNSPECIFIED));
+    }
+
+    #[test]
+    fn what_is_set_on_a_card_is_asked_of_the_stack_that_has_it() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let link = &stack.link;
+        let to = Ipv4Cidr::new(Ipv4Address([10, 0, 4, 77]), 24);
+        // A card the stack has not said is nobody's to set.
+        assert!(!link.configure(2, Change::Address(Some(to))));
+        assert_eq!(stack.told(), None);
+
+        stack.say(card_message(
+            2,
+            &said([10, 0, 4, 15], 24, Some([10, 0, 4, 2])),
+        ));
+        assert!(link.configure(2, Change::Address(Some(to))));
+        assert_eq!(stack.told(), Some(address_message(2, Some(to))));
+        // Shown as asked, with the gateway that is still near.
+        assert_eq!(
+            link.other_cards(),
+            [(2, said([10, 0, 4, 77], 24, Some([10, 0, 4, 2])))]
+        );
+        assert!(link.is_here(to.address()));
+
+        // A gateway on the card's network, and not the card itself.
+        let far = Ipv4Address([10, 0, 5, 1]);
+        assert!(!link.configure(2, Change::Gateway(Some(far))));
+        assert!(!link.configure(2, Change::Gateway(Some(to.address()))));
+        assert_eq!(stack.told(), None);
+        let near = Ipv4Address([10, 0, 4, 1]);
+        assert!(link.configure(2, Change::Gateway(Some(near))));
+        assert_eq!(stack.told(), Some(gateway_message(2, Some(near))));
+        assert_eq!(
+            link.other_cards(),
+            [(2, said([10, 0, 4, 77], 24, Some([10, 0, 4, 1])))]
+        );
+        assert!(link.configure(2, Change::Gateway(None)));
+        assert_eq!(stack.told(), Some(gateway_message(2, None)));
+
+        // Another network takes the gateway with it; no address, too.
+        let moved = Ipv4Cidr::new(Ipv4Address([192, 168, 7, 9]), 16);
+        assert!(link.configure(2, Change::Gateway(Some(near))));
+        assert!(link.configure(2, Change::Address(Some(moved))));
+        assert_eq!(link.other_cards(), [(2, said(moved.address().0, 16, None))]);
+        assert!(link.configure(2, Change::Address(None)));
+        assert!(!link.is_here(moved.address()));
+        assert!(
+            !link.configure(2, Change::Gateway(Some(near))),
+            "no network"
+        );
+
+        // What the stack says after is how it is, whatever was asked.
+        stack.say(card_message(2, &said([10, 0, 4, 15], 24, None)));
+        assert_eq!(link.other_cards(), [(2, said([10, 0, 4, 15], 24, None))]);
+    }
+
+    #[test]
+    fn the_first_card_is_set_as_the_others_and_is_the_machines_address() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let link = stack.link.clone();
+        // As who gives the kernel its sockets says it: no address yet.
+        assert_eq!(
+            Said::first(MAC, [0; 4], 0, 0x0a00_0902),
+            Said {
+                mac: MAC,
+                address: None,
+                gateway: None
+            }
+        );
+        let first = Said::first(MAC, STACK_ADDR, 24, 0x0a00_0902);
+        assert_eq!(first, said(STACK_ADDR, 24, Some([10, 0, 9, 2])));
+        link.first_card(first, None);
+        assert!(link.other_cards().is_empty());
+
+        let to = Ipv4Cidr::new(Ipv4Address([10, 0, 9, 77]), 24);
+        assert!(link.configure(0, Change::Address(Some(to))));
+        assert_eq!(stack.told(), Some(address_message(0, Some(to))));
+        assert_eq!(link.address(), to.address());
+        assert!(link.configure(0, Change::Address(None)));
+        assert!(link.address().is_unspecified());
+
+        // The stack is gone: there is no card to set until the next.
+        drop(stack);
+        link.pump();
+        assert!(!link.configure(0, Change::Address(Some(to))));
+    }
+
+    #[test]
+    fn what_is_asked_of_a_card_is_laid_out_for_the_stack() {
+        let to = Ipv4Cidr::new(Ipv4Address([10, 0, 4, 77]), 24);
+        let m = address_message(3, Some(to));
+        assert_eq!(m[4..8], OP_ADDRESS.to_le_bytes());
+        assert_eq!(m[8..16], 3u64.to_le_bytes());
+        assert_eq!(m[16..], [10, 0, 4, 77, 24, 0, 0, 0]);
+        assert_eq!(address_message(3, None)[16..], [0; 8]);
+        let m = gateway_message(1, Some(Ipv4Address([10, 0, 4, 2])));
+        assert_eq!(m[4..8], OP_GATEWAY.to_le_bytes());
+        assert_eq!(m[8..16], 1u64.to_le_bytes());
+        assert_eq!(m[16..], [10, 0, 4, 2]);
+        assert_eq!(gateway_message(1, None)[16..], [0; 4]);
     }
 
     #[test]

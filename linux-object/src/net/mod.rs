@@ -1507,6 +1507,12 @@ fn ipv4_gateway_from_routes(
 /// Install `0.0.0.0/0` via DHCP gateway or inferred gateway on the host subnet.
 pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+    // A card of the stack that runs as a process has the routes that
+    // stack was given: a guess made here would be asked of it, and put
+    // back the default route somebody took away.
+    if iface.name() == zcore_drivers::net::stack_card::NAME {
+        return;
+    }
     let Some(gw) = ipv4_default_gateway(iface) else {
         return;
     };

@@ -7,10 +7,13 @@
 //! gave up. A [`StackCard`] is that card in the list, to be looked at: a
 //! name, the MAC, and the address and the gateway the stack says it has.
 //!
-//! Its address and its routes cannot be set from here, because they are the
-//! stack's. It is made when the stack says what its card is and taken away
-//! when the stack is gone, and what it says never changes in between: a stack
-//! whose address changes starts over.
+//! Its address and its gateway are the stack's. The card shows what the
+//! stack said of them last ([`StackCard::set`]): none before its lease, the
+//! lease's after, another when it changes. To set them from here (`ip addr`,
+//! `ip route`, `ifconfig`) is to ask the stack, through the same [`Wire`] a
+//! frame goes by ([`Wire::configure`]): one IPv4 address, and the gateway
+//! for what is not on its network. It is made when the stack says what its
+//! card is and taken away when the stack is gone.
 //!
 //! A frame sent on it goes to the stack, which has the card and puts it on
 //! the wire ([`Wire`]). It used to be refused, always and with
@@ -154,15 +157,32 @@ pub trait Wire: Send + Sync {
     /// `frame`, whole, for the card to carry. False when it did not go:
     /// there is no stack just now, or it has more unread than it should.
     fn put(&self, frame: &[u8]) -> bool;
+
+    /// Ask the stack for `change` on its card `card`. False when it was
+    /// not asked: there is no stack just now, or the change is one no
+    /// card of its has (a gateway that is not on the card's network).
+    fn configure(&self, _card: u64, _change: Change) -> bool {
+        false
+    }
+}
+
+/// What can be asked of a stack about a card of its.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// This address and network, or none.
+    Address(Option<Ipv4Cidr>),
+    /// This gateway for what is not on the card's network, or none.
+    Gateway(Option<Ipv4Address>),
 }
 
 /// The interface that shows the card of a stack that runs somewhere else.
 pub struct StackCard {
     name: String,
     mac: EthernetAddress,
-    addrs: Vec<IpCidr>,
-    /// The default route, when the stack has a gateway.
-    routes: Vec<RouteInfo>,
+    /// The stack's number for the card: 0 for the one it serves with.
+    card: u64,
+    /// The address and the gateway the stack said last.
+    said: Mutex<(Option<Ipv4Cidr>, Option<Ipv4Address>)>,
     /// What the stack says the card has carried.
     carried: Arc<Carried>,
     /// What the stack says the card has of IPv6.
@@ -182,22 +202,39 @@ impl StackCard {
         prefix: u8,
         gateway: Option<[u8; 4]>,
     ) -> Self {
-        let routes = gateway
-            .map(|gateway| RouteInfo {
-                dst: IpCidr::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0),
-                gateway: Some(IpAddress::Ipv4(Ipv4Address(gateway))),
-            })
-            .into_iter()
-            .collect();
-        let address = Ipv4Cidr::new(Ipv4Address(address), prefix.min(32));
+        let address = (address != [0; 4] && prefix != 0)
+            .then(|| Ipv4Cidr::new(Ipv4Address(address), prefix.min(32)));
         Self {
             name,
             mac: EthernetAddress(mac),
-            addrs: vec![IpCidr::Ipv4(address)],
-            routes,
+            card: 0,
+            said: Mutex::new((address, gateway.map(Ipv4Address))),
             carried: Arc::new(Carried::default()),
             sixes: Arc::new(Sixes::default()),
             wire: None,
+        }
+    }
+
+    /// The same card, as the stack's card `card`: what is asked of the
+    /// stack about it says that number.
+    pub fn numbered(mut self, card: u64) -> Self {
+        self.card = card;
+        self
+    }
+
+    /// The stack says the card has this address and this gateway now, or
+    /// none.
+    pub fn set(&self, address: Option<Ipv4Cidr>, gateway: Option<Ipv4Address>) {
+        *self.said.lock() = (address, gateway);
+    }
+
+    /// Ask the stack for `change` on this card.
+    fn ask(&self, change: Change) -> DeviceResult {
+        let wire = self.wire.as_ref().ok_or(DeviceError::NotSupported)?;
+        if wire.configure(self.card, change) {
+            Ok(())
+        } else {
+            Err(DeviceError::NotReady)
         }
     }
 
@@ -227,10 +264,11 @@ impl StackCard {
 
     /// The card as a stack says it in three numbers, or `None` when they
     /// say none: `prefix` the bits of its network's prefix (1 to 32, and 0
-    /// from a stack that says nothing of its card), `gateway` an address
-    /// as a big-endian number (10.0.9.1 is 0x0a000901; 0 when there is no
-    /// gateway) and `mac` the six bytes of the MAC the same way. A card
-    /// with no address or no MAC is not one to show.
+    /// with no address, from a stack whose card has none yet), `gateway`
+    /// an address as a big-endian number (10.0.9.1 is 0x0a000901; 0 when
+    /// there is no gateway) and `mac` the six bytes of the MAC the same
+    /// way. A card with no MAC is not one to show, nor one with an
+    /// address and no network or a network and no address.
     pub fn said(
         name: String,
         address: [u8; 4],
@@ -238,7 +276,7 @@ impl StackCard {
         gateway: usize,
         mac: usize,
     ) -> Option<Self> {
-        if !(1..=32).contains(&prefix) || address == [0; 4] {
+        if prefix > 32 || (prefix == 0) != (address == [0; 4]) {
             return None;
         }
         let mac = (mac as u64).to_be_bytes();
@@ -249,13 +287,18 @@ impl StackCard {
         // A gateway that is no IPv4 address is no gateway.
         let gateway = (gateway as u64 <= u64::from(u32::MAX) && gateway != 0)
             .then(|| (gateway as u32).to_be_bytes());
+        let gateway = gateway.filter(|_| prefix != 0);
         Some(Self::new(name, mac, address, prefix as u8, gateway))
     }
 }
 
+/// What a [`StackCard`] answers as its driver's name: by it the kernel's
+/// own stack knows a card that is not its to drive.
+pub const NAME: &str = "stack-card";
+
 impl Scheme for StackCard {
     fn name(&self) -> &str {
-        "stack-card"
+        NAME
     }
 }
 
@@ -301,13 +344,92 @@ impl NetScheme for StackCard {
     }
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        let mut addrs = self.addrs.clone();
+        let mut addrs: Vec<IpCidr> = self.said.lock().0.map(IpCidr::Ipv4).into_iter().collect();
         addrs.extend(self.sixes.addresses().into_iter().map(IpCidr::Ipv6));
         addrs
     }
 
+    /// The card's one address of IPv4 is `cidr` from now on: asked of
+    /// the stack, which says it back when it is.
+    fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
+        // 0.0.0.0 is no address: how `ifconfig` and a DHCP client's
+        // script take the one there is away.
+        if cidr.address().is_unspecified() {
+            return match self.said.lock().0 {
+                Some(_) => self.ask(Change::Address(None)),
+                None => Ok(()),
+            };
+        }
+        if cidr.prefix_len() == 0 || !cidr.address().is_unicast() {
+            return Err(DeviceError::InvalidParam);
+        }
+        self.ask(Change::Address(Some(cidr)))
+    }
+
+    /// A card of the stack's has one address of IPv4: adding one is
+    /// setting it. Its IPv6 addresses are its router's to give.
+    fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        match cidr {
+            IpCidr::Ipv4(cidr) => self.set_ipv4_address(cidr),
+            _ => Err(DeviceError::NotSupported),
+        }
+    }
+
+    /// Take the card's address away, when `cidr` is it.
+    fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let has = self.said.lock().0;
+        match cidr {
+            IpCidr::Ipv4(cidr) if has.is_some_and(|has| has.address() == cidr.address()) => {
+                self.ask(Change::Address(None))
+            }
+            IpCidr::Ipv4(_) => Err(DeviceError::InvalidParam),
+            _ => Err(DeviceError::NotSupported),
+        }
+    }
+
+    /// The default route of IPv4 is the stack's gateway; it has no
+    /// other route to add.
+    fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+        match (cidr, gateway) {
+            (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gateway))) if cidr.prefix_len() == 0 => {
+                // A gateway is a machine of the card's network.
+                let near = self.said.lock().0.is_some_and(|address| {
+                    address.contains_addr(&gateway) && address.address() != gateway
+                });
+                if !near {
+                    return Err(DeviceError::InvalidParam);
+                }
+                self.ask(Change::Gateway(Some(gateway)))
+            }
+            _ => Err(DeviceError::NotSupported),
+        }
+    }
+
+    fn del_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+        let has = self.said.lock().1;
+        match (cidr, gateway) {
+            (IpCidr::Ipv4(cidr), gateway) if cidr.prefix_len() == 0 => match gateway {
+                Some(IpAddress::Ipv4(gateway)) if has != Some(gateway) => {
+                    Err(DeviceError::InvalidParam)
+                }
+                Some(IpAddress::Ipv4(_)) | None if has.is_some() => self.ask(Change::Gateway(None)),
+                _ => Err(DeviceError::InvalidParam),
+            },
+            _ => Err(DeviceError::NotSupported),
+        }
+    }
+
     fn get_routes(&self) -> Vec<RouteInfo> {
-        let mut routes = self.routes.clone();
+        // The default route, when the stack has a gateway.
+        let (address, gateway) = *self.said.lock();
+        let mut routes: Vec<RouteInfo> = gateway
+            .filter(|_| address.is_some())
+            .map(|gateway| RouteInfo {
+                dst: IpCidr::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0),
+                gateway: Some(IpAddress::Ipv4(gateway)),
+            })
+            .into_iter()
+            .collect();
         routes.extend(self.sixes.router().map(|router| RouteInfo {
             dst: IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0),
             gateway: Some(IpAddress::Ipv6(router)),
@@ -342,6 +464,85 @@ mod tests {
     struct Kept {
         takes: bool,
         sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    /// A wire that keeps what was asked of the stack.
+    #[derive(Default)]
+    struct Asked(Mutex<Vec<(u64, Change)>>);
+
+    impl Wire for Asked {
+        fn put(&self, _frame: &[u8]) -> bool {
+            false
+        }
+
+        fn configure(&self, card: u64, change: Change) -> bool {
+            self.0.lock().push((card, change));
+            true
+        }
+    }
+
+    #[test]
+    fn what_is_set_on_the_card_is_asked_of_the_stack_and_shown_when_it_says_so() {
+        let wire = Arc::new(Asked::default());
+        let c = card(Some([10, 0, 9, 1])).numbered(2).through(wire.clone());
+        let other = Ipv4Cidr::new(Ipv4Address([192, 168, 7, 9]), 24);
+        let router = Ipv4Address([192, 168, 7, 1]);
+        let default = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        assert_eq!(c.set_ipv4_address(other), Ok(()));
+        assert_eq!(c.add_ip_address(IpCidr::Ipv4(other)), Ok(()));
+        // A gateway is on the network the card is shown on.
+        assert_eq!(
+            c.add_route(default, Some(IpAddress::Ipv4(router))),
+            Err(DeviceError::InvalidParam)
+        );
+        let near = Ipv4Address([10, 0, 9, 7]);
+        assert_eq!(c.add_route(default, Some(IpAddress::Ipv4(near))), Ok(()));
+        assert_eq!(c.del_route(default, None), Ok(()));
+        // Its own address can be taken away, and no other.
+        assert_eq!(
+            c.remove_ip_address(IpCidr::Ipv4(other)),
+            Err(DeviceError::InvalidParam)
+        );
+        let own = IpCidr::new(IpAddress::v4(10, 0, 9, 15), 24);
+        assert_eq!(c.remove_ip_address(own), Ok(()));
+        assert_eq!(
+            wire.0.lock().as_slice(),
+            &[
+                (2, Change::Address(Some(other))),
+                (2, Change::Address(Some(other))),
+                (2, Change::Gateway(Some(near))),
+                (2, Change::Gateway(None)),
+                (2, Change::Address(None)),
+            ]
+        );
+        // 0.0.0.0 takes the address away, too, and is nothing to ask of
+        // a card that has none.
+        let none = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 24);
+        assert_eq!(c.set_ipv4_address(none), Ok(()));
+        assert_eq!(wire.0.lock().len(), 6);
+        c.set(None, None);
+        assert_eq!(c.set_ipv4_address(none), Ok(()));
+        assert_eq!(wire.0.lock().len(), 6);
+        c.set(Some(Ipv4Cidr::new(Ipv4Address([10, 0, 9, 15]), 24)), None);
+        // Asking changes nothing: the stack's word does.
+        assert_eq!(c.get_ip_address(), [own]);
+        c.set(Some(other), Some(router));
+        assert_eq!(c.get_ip_address(), [IpCidr::Ipv4(other)]);
+        assert_eq!(c.get_routes()[0].gateway, Some(IpAddress::Ipv4(router)));
+        c.set(None, None);
+        assert!(c.get_ip_address().is_empty() && c.get_routes().is_empty());
+
+        // What a card of a stack does not have.
+        let group = Ipv4Cidr::new(Ipv4Address([224, 0, 0, 1]), 24);
+        assert_eq!(c.set_ipv4_address(group), Err(DeviceError::InvalidParam));
+        let six = IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 128);
+        assert_eq!(c.add_ip_address(six), Err(DeviceError::NotSupported));
+        let net = IpCidr::new(IpAddress::v4(10, 9, 0, 0), 16);
+        assert_eq!(
+            c.add_route(net, Some(IpAddress::Ipv4(router))),
+            Err(DeviceError::NotSupported)
+        );
+        assert_eq!(c.del_route(default, None), Err(DeviceError::InvalidParam));
     }
 
     impl Wire for Kept {
@@ -415,6 +616,11 @@ mod tests {
             c.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), None),
             Err(DeviceError::NotSupported)
         );
+        let router = Some(IpAddress::v4(10, 0, 9, 1));
+        assert_eq!(
+            c.add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), router),
+            Err(DeviceError::NotSupported)
+        );
         assert_eq!(c.get_ip_address().len(), 1);
     }
 
@@ -449,10 +655,14 @@ mod tests {
                 .len(),
             1
         );
-        // A stack that says nothing of its card (all zero, as the ones
-        // before this said), a prefix that is none, no address, no MAC or
-        // more than a MAC: no card.
-        assert!(said([10, 0, 9, 15], 0, 0, 0).is_none());
+        // A card with no address yet is one, with nothing to show of it.
+        let bare = said([0, 0, 0, 0], 0, 0x0a00_0901, 0x5254_0012_3456).unwrap();
+        assert!(bare.get_ip_address().is_empty() && bare.get_routes().is_empty());
+        // A stack that says nothing of its card (all zero), a prefix
+        // that is none, an address with no network or a network with no
+        // address, no MAC or more than a MAC: no card.
+        assert!(said([0, 0, 0, 0], 0, 0, 0).is_none());
+        assert!(said([10, 0, 9, 15], 0, 0, 0x5254_0012_3456).is_none());
         assert!(said([10, 0, 9, 15], 33, 0, 0x5254_0012_3456).is_none());
         assert!(said([0, 0, 0, 0], 24, 0, 0x5254_0012_3456).is_none());
         assert!(said([10, 0, 9, 15], 24, 0, 0).is_none());
