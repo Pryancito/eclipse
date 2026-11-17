@@ -119,9 +119,6 @@ buddy_system_allocator = { path = "vendor/buddy_system_allocator" }
 [patch."https://github.com/rafalh/rust-fatfs"]
 fatfs = { path = "vendor/fatfs" }
 
-[patch."https://github.com/smoltcp-rs/smoltcp"]
-smoltcp = { path = "./smoltcp" }
-
 # kernel-sync (`lock`) vendorizado en vendor/kernel-sync: añade el mapeo
 # APIC ID -> id lógico denso para que los arrays per-CPU no se desborden bajo SMP.
 [patch."https://github.com/DeathWish5/kernel-sync"]

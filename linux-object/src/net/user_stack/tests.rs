@@ -639,7 +639,7 @@ fn a_send_from_a_socket_without_a_port_gets_it_one_first() {
     // No destination and no peer; a peer that is not IPv4; too long.
     assert_eq!(Socket::write(&a, b"x", None), Err(LxError::ENOTCONN));
     let v6 = Endpoint::Ip(IpEndpoint::new(
-        IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOOPBACK),
+        IpAddress::Ipv6(zcore_drivers::wire::Ipv6Address::LOOPBACK),
         9,
     ));
     assert_eq!(

@@ -326,7 +326,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use kernel_hal::drivers::net::stack_card::{Carried, Sixes};
 use kernel_hal::sync::Mutex;
 use log::warn;
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address, Ipv6Cidr};
+use zcore_drivers::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address, Ipv6Cidr};
 use zircon_object::impl_kobject;
 use zircon_object::ipc::{Channel, MessagePacket};
 use zircon_object::object::*;

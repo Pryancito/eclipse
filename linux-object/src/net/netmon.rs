@@ -33,7 +33,7 @@ fn ip_of(ep: Option<Endpoint>) -> Option<(String, u16, bool)> {
         Endpoint::Ip(ip) => Some((
             ip.addr.to_string(),
             ip.port,
-            matches!(ip.addr, smoltcp::wire::IpAddress::Ipv6(_)),
+            matches!(ip.addr, zcore_drivers::wire::IpAddress::Ipv6(_)),
         )),
         _ => None,
     }
@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::net::user_stack::{ServedTcpSocket, ServedUdpSocket, StackLink};
     use crate::net::{IpAddress, NET_TEST_LOCK};
-    use smoltcp::wire::IpEndpoint;
+    use zcore_drivers::wire::IpEndpoint;
 
     fn any(port: u16) -> Endpoint {
         Endpoint::Ip(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port))

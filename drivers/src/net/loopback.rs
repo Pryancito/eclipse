@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+use crate::wire::{EthernetAddress, IpAddress, IpCidr};
 
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::sync::Mutex;
@@ -203,12 +203,12 @@ impl NetScheme for ShownLoopback {
         Ok(())
     }
 
-    fn add_route(&self, cidr: IpCidr, gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+    fn add_route(&self, cidr: IpCidr, gateway: Option<crate::wire::IpAddress>) -> DeviceResult {
         self.routes.lock().push(RouteInfo { dst: cidr, gateway });
         Ok(())
     }
 
-    fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+    fn del_route(&self, cidr: IpCidr, _gateway: Option<crate::wire::IpAddress>) -> DeviceResult {
         self.routes.lock().retain(|r| r.dst != cidr);
         Ok(())
     }

@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::wire::*;
+use crate::wire::*;
 
 use super::{ip_cfg, timer_now_as_micros, ProviderImpl};
 use crate::builder::IoMapper;

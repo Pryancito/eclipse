@@ -25,7 +25,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use kernel_hal::thread::SyncWait;
-use smoltcp::wire::{IpAddress, IpEndpoint};
+use zcore_drivers::wire::{IpAddress, IpEndpoint};
 use zircon_object::object::{KickOn, Signal};
 
 use crate::error::{LxError, LxResult};

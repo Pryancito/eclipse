@@ -1432,8 +1432,8 @@ mod registry_tests {
         fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
             Ok(0)
         }
-        fn get_mac(&self) -> smoltcp::wire::EthernetAddress {
-            smoltcp::wire::EthernetAddress::default()
+        fn get_mac(&self) -> zcore_drivers::wire::EthernetAddress {
+            zcore_drivers::wire::EthernetAddress::default()
         }
         fn ifname(&self) -> &str {
             &self.name
@@ -1441,7 +1441,7 @@ mod registry_tests {
         fn is_loopback(&self) -> bool {
             self.is_loopback
         }
-        fn get_ip_address(&self) -> Vec<smoltcp::wire::IpCidr> {
+        fn get_ip_address(&self) -> Vec<zcore_drivers::wire::IpCidr> {
             Vec::new()
         }
         fn poll(&self) -> DeviceResult {

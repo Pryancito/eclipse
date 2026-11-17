@@ -54,7 +54,7 @@ use kernel_hal::drivers::net::stack_card::{Carried, Change, Sixes, StackCard};
 use kernel_hal::drivers::prelude::Device;
 use kernel_hal::drivers::scheme::{NetScheme, NetStats};
 use kernel_hal::sync::Mutex;
-use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
+use zcore_drivers::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 
 use super::{header, StackLink, COUNTS};
 

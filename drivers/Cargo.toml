@@ -41,28 +41,8 @@ lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
 isomorphic_drivers = { git = "https://github.com/rcore-os/isomorphic_drivers", rev = "f7cd97a8", features = [
     "log",
 ] }
-smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "35e833e3", default-features = false, features = [
-    "log",
-    "alloc",
-    "verbose",
-    "proto-ipv4",
-    "proto-ipv6",
-    "proto-igmp",
-    "medium-ip",
-    "medium-ethernet",
-    "socket-raw",
-    "socket-udp",
-    "socket-tcp",
-    "socket-icmp",
-    "async",
-] }
-# The address list of a smoltcp interface is a `ManagedSlice`, and telling
-# the owned case from the borrowed one is what lets `add_ip_address` grow
-# the list instead of overwriting an address already there.
-managed = { version = "0.8", default-features = false, features = ["alloc"] }
 d1-pac = { version = "0.0.27", optional = true }
 volatile = "0.3"
-ixgbe-driver = "0.1"
 
 # LibOS mode
 [target.'cfg(not(target_os = "none"))'.dependencies]

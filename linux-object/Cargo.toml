@@ -41,21 +41,6 @@ cfg-if = "1.0"
 zcore-drivers = { path = "../drivers", features = ["virtio"] }
 pci = { git = "https://github.com/elliott10/pci-rs", rev = "8f33774b" }
 lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }
-smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "35e833e3", default-features = false, features = [
-    "log",
-    "alloc",
-    "verbose",
-    "proto-ipv4",
-    "proto-ipv6",
-    "proto-igmp",
-    "medium-ip",
-    "medium-ethernet",
-    "socket-raw",
-    "socket-udp",
-    "socket-tcp",
-    "socket-icmp",
-    "async",
-] }
 
 [dev-dependencies]
 async-std = { version = "1.10", features = ["attributes"] }

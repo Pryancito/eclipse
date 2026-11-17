@@ -65,8 +65,8 @@ use hunter_feed_proc::ProcHunterFeedINode;
 use hunter_net::ProcHunterNetINode;
 use hunter_proc::{ProcHunterBootINode, ProcHunterINode, ProcHunterScanINode};
 use present::proc_present_content;
-use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
+use zcore_drivers::wire::{IpAddress, IpCidr};
 
 const PROC_ROOT_STATIC: [&str; 60] = [
     "net",

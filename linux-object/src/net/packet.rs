@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use kernel_hal::{net::get_net_device, thread};
 use lazy_static::lazy_static;
 use lock::Mutex;
-use smoltcp::wire::{EthernetAddress, EthernetFrame};
 use zcore_drivers::scheme::NetScheme;
+#[cfg(test)]
+use zcore_drivers::wire::EthernetAddress;
 use zircon_object::object::*;
 
 /// Per-socket RX queue depth. udhcpc stays bound for the lease lifetime and
@@ -81,10 +82,9 @@ const MAX_FRAME_COPY: usize = 1518;
 
 /// Bytes of L2 header (14, or 18 with 802.1Q) and EtherType.
 ///
-/// Every parser `push_packet` feeds a frame to needs this same answer, so it
-/// lives here once: `arp_cache`, `ndp_cache` and `ra` all call it.
-/// It used to be open-coded in each of them, and `arp_cache` was the one that
-/// never got the 802.1Q clause, so on a VLAN-tagged link it learned nothing.
+/// What `arp_cache`, which `push_packet` feeds, reads a frame by. It used
+/// to be open-coded there without the 802.1Q clause, so on a VLAN-tagged
+/// link it learned nothing.
 pub(crate) fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
     if frame.len() < 14 {
         return None;
@@ -156,8 +156,6 @@ fn drive_packet_rx(net: &(dyn NetScheme + Send + Sync)) {
 /// mutex guard is held breaks that nesting and panics with "RefCell already borrowed".
 pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
-    crate::net::ndp_cache::learn_from_frame(packet);
-    crate::net::ra::process_from_frame(packet);
     deliver_tapped_frame(packet, 0);
 }
 
@@ -459,12 +457,14 @@ impl Socket for PacketSocketState {
         let dev = if ifindex > 0 {
             crate::net::iface_by_linux_ifindex(ifindex)?
         } else {
-            crate::net::netdev_for_ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED).or_else(|_| {
-                get_net_device()
-                    .into_iter()
-                    .find(|n| !n.is_loopback())
-                    .ok_or(LxError::ENODEV)
-            })?
+            crate::net::netdev_for_ipv4(zcore_drivers::wire::Ipv4Address::UNSPECIFIED).or_else(
+                |_| {
+                    get_net_device()
+                        .into_iter()
+                        .find(|n| !n.is_loopback())
+                        .ok_or(LxError::ENODEV)
+                },
+            )?
         };
 
         if self.inner.socket_type == SocketType::SOCK_DGRAM {
@@ -477,9 +477,8 @@ impl Socket for PacketSocketState {
                 // drop shorter frames (DHCP DISCOVER is well above this, ARP
                 // and tiny UDP are not).
                 let frame_len = (data.len() + 14).max(60);
-                let mut frame = EthernetFrame::new_unchecked(&mut buf[..frame_len]);
-                frame.set_dst_addr(EthernetAddress::from_bytes(&ll.addr[..6]));
-                frame.set_src_addr(dev.get_mac());
+                buf[..6].copy_from_slice(&ll.addr[..6]);
+                buf[6..12].copy_from_slice(dev.get_mac().as_bytes());
                 let protocol_raw = if ll.protocol != 0 {
                     ll.protocol
                 } else {
@@ -492,8 +491,8 @@ impl Socket for PacketSocketState {
                 } else {
                     protocol_raw
                 };
-                frame.set_ethertype(protocol.into());
-                frame.payload_mut()[..data.len()].copy_from_slice(data);
+                buf[12..14].copy_from_slice(&protocol.to_be_bytes());
+                buf[14..14 + data.len()].copy_from_slice(data);
                 return put_on_the_wire(dev.as_ref(), &buf[..frame_len]).map(|()| data.len());
             }
             // If no endpoint, we can't send SOCK_DGRAM (no destination MAC).
@@ -856,7 +855,7 @@ mod tests {
         fn get_ifname(&self) -> alloc::string::String {
             alloc::string::String::from("eth0")
         }
-        fn get_ip_address(&self) -> Vec<smoltcp::wire::IpCidr> {
+        fn get_ip_address(&self) -> Vec<zcore_drivers::wire::IpCidr> {
             Vec::new()
         }
         fn poll(&self) -> zcore_drivers::DeviceResult {

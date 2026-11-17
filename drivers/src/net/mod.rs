@@ -10,7 +10,6 @@ pub mod ether_hash;
 pub mod ip_cfg;
 /// A card of the kernel's lent to a stack that runs outside the kernel.
 pub mod lent;
-// pub mod ixgbe;
 pub mod loopback;
 // Los registros MII/MDIO genericos (el papel de `include/uapi/linux/mii.h`):
 // ni el GMAC del D1 ni el GENET de la Raspberry Pi son sus dueños, los dos los

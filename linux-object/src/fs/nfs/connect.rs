@@ -15,7 +15,7 @@
 //! can answer for. The real one dials TCP; the one in the tests hands back a
 //! scripted server and writes down which port was asked for.
 
-use smoltcp::wire::IpAddress;
+use zcore_drivers::wire::IpAddress;
 
 use crate::error::LxResult;
 

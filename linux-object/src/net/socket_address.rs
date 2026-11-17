@@ -7,7 +7,7 @@ use crate::error::{LxError, LxResult};
 // use crate::net::Endpoint;
 
 // smoltcp
-pub use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+pub use zcore_drivers::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 use crate::net::*;
 use kernel_hal::user::{UserInOutPtr, UserOutPtr};
@@ -111,7 +111,7 @@ pub struct SockAddrPlaceholder {
 
 // ============= Endpoint =============
 
-use smoltcp::wire::IpEndpoint;
+use zcore_drivers::wire::IpEndpoint;
 
 /// missing documentation
 #[derive(Clone, Debug)]

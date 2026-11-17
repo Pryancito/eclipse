@@ -146,7 +146,7 @@ use core::mem::{size_of, MaybeUninit};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use smoltcp::wire::*;
+use crate::wire::*;
 
 use crate::builder::IoMapper;
 use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
