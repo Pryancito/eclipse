@@ -82,7 +82,7 @@ const MAX_FRAME_COPY: usize = 1518;
 /// Bytes of L2 header (14, or 18 with 802.1Q) and EtherType.
 ///
 /// Every parser `push_packet` feeds a frame to needs this same answer, so it
-/// lives here once: `arp_cache`, `ndp_cache`, `icmp_rx` and `ra` all call it.
+/// lives here once: `arp_cache`, `ndp_cache` and `ra` all call it.
 /// It used to be open-coded in each of them, and `arp_cache` was the one that
 /// never got the 802.1Q clause, so on a VLAN-tagged link it learned nothing.
 pub(crate) fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
@@ -157,7 +157,6 @@ fn drive_packet_rx(net: &(dyn NetScheme + Send + Sync)) {
 pub fn push_packet(packet: &[u8]) {
     crate::net::arp_cache::learn_from_frame(packet);
     crate::net::ndp_cache::learn_from_frame(packet);
-    crate::net::icmp_rx::deliver_from_frame(packet);
     crate::net::ra::process_from_frame(packet);
     deliver_tapped_frame(packet, 0);
 }

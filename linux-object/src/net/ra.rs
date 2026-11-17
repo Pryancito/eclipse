@@ -7,7 +7,7 @@
 //! both directions even though the address is configured.
 //!
 //! This module is fed every RX frame from `push_packet` (the same path as
-//! `ndp_cache` / `icmp_rx`). For a valid RA it:
+//! `ndp_cache`). For a valid RA it:
 //!   * installs a default IPv6 route (`::/0`) via the router's link-local source,
 //!     which gives every IPv6 destination a reachable, NDP-resolvable next-hop;
 //!   * performs SLAAC (RFC 4862) for an autonomous on-link /64 prefix, forming
@@ -231,7 +231,7 @@ fn slaac_address(pfx: &[u8; 16], link_local: Ipv6Address) -> Ipv6Address {
 fn apply(router_ll: Ipv6Address, router_lifetime: u16, prefix: Option<PrefixInfo>) {
     // Apply to the primary Ethernet interface. The RX dispatch path carries no
     // ingress-interface information (frames are processed globally, as with
-    // `ndp_cache`/`icmp_rx`), so on a multi-NIC host the RA is attributed to the
+    // `ndp_cache`), so on a multi-NIC host the RA is attributed to the
     // first Ethernet device — correct for the common single-NIC case.
     let iface = match get_net_device().into_iter().find(|d| !d.is_loopback()) {
         Some(d) => d,

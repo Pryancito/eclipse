@@ -30,13 +30,10 @@ fn scm_rights_cloexec(flags: usize) -> bool {
 }
 
 /// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
-/// peer buffer), UDP (smoltcp's transmit ring), TCP (smoltcp's transmit
-/// buffer) and a stream socket of the stack that runs as a process (what
-/// that stack still takes).
+/// peer buffer) and a stream socket of the stack that runs as a process
+/// (what that stack still takes).
 pub(crate) fn queue_is_bounded(file_like: &Arc<dyn FileLike>) -> bool {
     file_like.downcast_ref::<UnixSocketState>().is_some()
-        || file_like.downcast_ref::<UdpSocketState>().is_some()
-        || file_like.downcast_ref::<TcpSocketState>().is_some()
         || file_like
             .downcast_ref::<linux_object::net::user_stack::ServedTcpSocket>()
             .is_some()
@@ -486,46 +483,29 @@ impl Syscall<'_> {
         );
 
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
-            // A process that asked for the stack that runs as a process
-            // gets its stream and datagram sockets from it, whether one
-            // runs yet or not: never the kernel's behind its back. The
-            // `AF_INET6` ones too, which carry IPv4 there.
+            // Stream and datagram sockets are the stack's that runs as a
+            // process, whether one runs yet or not: the kernel has none
+            // of its own. The `AF_INET6` ones too, which carry IPv4 there.
             (
                 Domain::AF_INET | Domain::AF_INET6,
                 SocketType::SOCK_STREAM,
                 Some(Protocol::IPPROTO_IP | Protocol::IPPROTO_TCP),
-            ) if self.linux_process().uses_user_netstack() => {
+            ) => {
                 use linux_object::net::user_stack;
                 let link = user_stack::machine();
                 let v6 = matches!(domain, Domain::AF_INET6);
                 Arc::new(user_stack::ServedTcpSocket::new(link, v6)?)
-            }
-            (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
-            | (Domain::AF_INET, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
-                Arc::new(TcpSocketState::new(false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_IP))
-            | (Domain::AF_INET6, SocketType::SOCK_STREAM, Some(Protocol::IPPROTO_TCP)) => {
-                Arc::new(TcpSocketState::new(true)?)
             }
             // The same for its datagram sockets.
             (
                 Domain::AF_INET | Domain::AF_INET6,
                 SocketType::SOCK_DGRAM,
                 Some(Protocol::IPPROTO_IP | Protocol::IPPROTO_UDP),
-            ) if self.linux_process().uses_user_netstack() => {
+            ) => {
                 use linux_object::net::user_stack;
                 let link = user_stack::machine();
                 let v6 = matches!(domain, Domain::AF_INET6);
                 Arc::new(user_stack::ServedUdpSocket::new(link, v6)?)
-            }
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
-            | (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
-                Arc::new(UdpSocketState::new(false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_IP))
-            | (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_UDP)) => {
-                Arc::new(UdpSocketState::new(true)?)
             }
             // And for the sockets `ping` opens, the raw one and the one
             // that only pings: its echoes leave by the stack's card.
@@ -533,7 +513,7 @@ impl Syscall<'_> {
                 Domain::AF_INET,
                 SocketType::SOCK_DGRAM | SocketType::SOCK_RAW,
                 Some(Protocol::IPPROTO_ICMP),
-            ) if self.linux_process().uses_user_netstack() => {
+            ) => {
                 use linux_object::net::user_stack;
                 let link = user_stack::machine();
                 let raw = matches!(socket_type, SocketType::SOCK_RAW);
@@ -544,25 +524,16 @@ impl Syscall<'_> {
                 Domain::AF_INET6,
                 SocketType::SOCK_DGRAM | SocketType::SOCK_RAW,
                 Some(Protocol::IPPROTO_ICMPV6),
-            ) if self.linux_process().uses_user_netstack() => {
+            ) => {
                 use linux_object::net::user_stack;
                 let link = user_stack::machine();
                 let raw = matches!(socket_type, SocketType::SOCK_RAW);
                 Arc::new(user_stack::ServedIcmpSocket::new6(link, raw)?)
             }
-            // Linux ping(8) uses SOCK_DGRAM + IPPROTO_ICMP (ping_socket).
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMP)) => {
-                Arc::new(IcmpSocketState::new(false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
-                Arc::new(IcmpSocketState::new(true)?)
-            }
             // And for its raw sockets of any other protocol of IPv4:
             // whole packets, which leave by the stack's card and are
             // heard off it.
-            (Domain::AF_INET, SocketType::SOCK_RAW, _)
-                if self.linux_process().uses_user_netstack() =>
-            {
+            (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 use linux_object::net::user_stack;
                 // `inet_create`: a raw socket is of a protocol.
                 let protocol = match (protocol_num & 0xff) as u8 {
@@ -577,9 +548,7 @@ impl Syscall<'_> {
             // And the same of IPv6, where the protocol is not ICMPv6: what
             // the packets of its protocol carry, behind a header the
             // stack writes.
-            (Domain::AF_INET6, SocketType::SOCK_RAW, _)
-                if self.linux_process().uses_user_netstack() =>
-            {
+            (Domain::AF_INET6, SocketType::SOCK_RAW, _) => {
                 use linux_object::net::user_stack;
                 // `inet6_create`: a raw socket is of a protocol.
                 let protocol = match (protocol_num & 0xff) as u8 {
@@ -590,13 +559,6 @@ impl Syscall<'_> {
                     user_stack::machine(),
                     protocol,
                 )?)
-            }
-            // AF_INET/AF_INET6 raw sockets (some userlands probe these)
-            (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_RAW, _) => {
-                Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, true)?)
             }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
