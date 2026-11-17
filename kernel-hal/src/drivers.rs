@@ -421,10 +421,44 @@ pub fn set_pci_msix_enabled(v: bool) {
 }
 
 /// Whether a PCI network card with no MSI is given the legacy interrupt
-/// line of its slot (`pci.intx=1` and `unetlend=any` say so). See
+/// line of its slot ([`pci_intx_wanted`] says when). See
 /// `zcore_drivers::net::set_pci_intx_enabled`.
 pub fn set_pci_intx_enabled(v: bool) {
     zcore_drivers::net::set_pci_intx_enabled(v);
+}
+
+/// Whether this boot gives a network card with no MSI the legacy interrupt
+/// line of its slot, which a card that is lent to the stack process needs.
+///
+/// `pci_intx` is what the boot says of `pci.intx` (`Some(true)` for
+/// `pci.intx=1`, `Some(false)` for `pci.intx=0`), and it wins. `unetlend` is
+/// that word's value: `any` asks for the line, since it asks for such cards
+/// to be lent, and `asked` does not. A boot that says none of it has the
+/// line under a hypervisor and not on a real machine: the line is the one
+/// the firmware wrote, level triggered, which is right where the lines of
+/// the PCI slots are steered to ISA interrupts (QEMU does), and on a real
+/// machine another device may hold the same line with nobody to answer for
+/// it. No real machine has run with it yet.
+pub fn pci_intx_wanted(pci_intx: Option<bool>, unetlend: Option<&str>, hypervisor: bool) -> bool {
+    match (pci_intx, unetlend) {
+        (Some(said), _) => said,
+        (None, Some("any")) => true,
+        (None, Some("asked")) => false,
+        (None, _) => hypervisor,
+    }
+}
+
+/// Whether the machine runs under a hypervisor, where one can tell
+/// (x86_64: CPUID.01H:ECX[31], which QEMU sets with or without KVM).
+pub fn under_hypervisor() -> bool {
+    #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+    {
+        core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "libos"))))]
+    {
+        false
+    }
 }
 
 /// Lets the AMD 10GbE (`xgbe`) probe run its bring-up sequence instead of
@@ -1890,6 +1924,33 @@ pub fn disk_inflight() -> (Option<(u8, &'static str, u64)>, u64, u64) {
 pub fn disk_busy_over_last(secs: u64) -> (u64, u64) {
     use zcore_drivers::ata::ahci::inflight;
     inflight::busy_over_last(secs, inflight::now_us())
+}
+
+#[cfg(test)]
+mod pci_intx_tests {
+    use super::pci_intx_wanted;
+
+    #[test]
+    fn a_boot_that_says_nothing_has_the_line_only_under_a_hypervisor() {
+        assert!(pci_intx_wanted(None, None, true));
+        assert!(!pci_intx_wanted(None, None, false));
+    }
+
+    #[test]
+    fn what_the_boot_says_of_the_line_wins() {
+        for hypervisor in [false, true] {
+            for lend in [None, Some("any"), Some("asked")] {
+                assert!(pci_intx_wanted(Some(true), lend, hypervisor));
+                assert!(!pci_intx_wanted(Some(false), lend, hypervisor));
+            }
+        }
+    }
+
+    #[test]
+    fn asking_for_every_card_to_be_lent_asks_for_the_line_and_asked_does_not() {
+        assert!(pci_intx_wanted(None, Some("any"), false));
+        assert!(!pci_intx_wanted(None, Some("asked"), true));
+    }
 }
 
 #[cfg(test)]

@@ -146,16 +146,16 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
 /// Cards that have no MSI and raise the legacy line of their slot (INTx),
 /// by the line: see [`pci_intx_line`].
 static INTX_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
-/// `pci.intx=1`, `unetlend=any`: see [`set_pci_intx_enabled`].
+/// Set by the boot: see [`set_pci_intx_enabled`].
 static INTX_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether a card with no MSI is given the legacy interrupt line of its
-/// slot ([`pci_intx_line`]). It is on a boot that says `pci.intx=1`, or
-/// that lends such a card (`unetlend=any`): a card with no interrupt can
-/// only be looked at now and then, which is enough for the kernel's own
-/// stack, that looks whenever a program waits on a socket, and not for a
-/// borrower. A boot that says neither leaves such a card with no interrupt,
-/// as it always was: the line is the one the firmware wrote, which is
+/// slot ([`pci_intx_line`]). It is under a hypervisor, and on a boot that
+/// says `pci.intx=1` or `unetlend=any` (`kernel_hal::drivers::pci_intx_wanted`):
+/// a card with no interrupt can only be looked at now and then, which is
+/// enough for the kernel's own stack, that looks whenever a program waits
+/// on a socket, and not for a borrower. Another boot leaves such a card
+/// with no interrupt, as it always was: the line is the one the firmware wrote, which is
 /// right where the lines of the PCI slots are steered to ISA interrupts
 /// (QEMU does) and has not been seen on a real machine, where another
 /// device may hold the same line with nobody to answer for it.

@@ -34,12 +34,18 @@
 //! `unetcard=kernel` lends the card even when a virtio card is there, which
 //! is then not left to userspace unasked.
 //!
-//! Every driver of the kernel's can lend its card (`NetScheme::can_lend`).
-//! The Intel ones with MSI do it unasked; the others (QEMU's `e1000` and
-//! `pcnet`, and the cards of the boards) only on a boot that says
-//! `unetlend=any` (`NetScheme::lends_unasked`), and keep the kernel's own
-//! stack otherwise: the first two were measured slower lent at a small
-//! echo, and the rest have never run lent on their machines.
+//! Every driver of the kernel's can lend its card (`NetScheme::can_lend`),
+//! and an ordinary boot lends whichever is first ([`lends_any`]). A small
+//! echo costs about 1.6 times as much lent as with the kernel's own stack
+//! (against a host that takes its time to answer; connecting, sending and
+//! receiving are faster lent), which is the price that was accepted for
+//! one stack instead of two. `unetlend=asked` goes back to lending only
+//! the cards whose drivers lend unasked (`NetScheme::lends_unasked`: the
+//! Intel ones with MSI), and the others keep the kernel's own stack. On
+//! x86_64 a card with no MSI needs the legacy interrupt line of its slot
+//! to be lent, which a boot has under a hypervisor or with `pci.intx=1`
+//! (`kernel_hal::drivers::pci_intx_wanted`); without the line such a card
+//! is lent only to a boot that says `unetlend=any`.
 //!
 //! The kernel's other cards are its own stack's, which is the only one that
 //! reaches them: on a machine with any, the programs that do not ask keep
@@ -90,6 +96,20 @@ static LENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::ne
 /// `unetstack=none`) lends nothing.
 pub fn lends(unetstack: Option<&str>, card: bool, lendable: bool) -> bool {
     lendable && !card && !matches!(unetstack, Some("kernel") | Some("none"))
+}
+
+/// Whether this boot lends a card whose driver lends only when asked
+/// (`NetScheme::lends_unasked`). `unetlend` is that word's value: `any`
+/// says yes and `asked` says no. A boot that says neither lends it where
+/// the card can be told of its frames: `interrupts` is whether a card with
+/// no MSI has an interrupt on this boot (always, off x86_64; on x86_64,
+/// whether it is given the legacy line of its slot).
+pub fn lends_any(unetlend: Option<&str>, interrupts: bool) -> bool {
+    match unetlend {
+        Some("any") => true,
+        Some("asked") => false,
+        _ => interrupts,
+    }
 }
 
 /// Says what [`lends`] answered on this boot, once it is known.
@@ -185,6 +205,24 @@ pub fn whose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ordinary_boot_lends_any_card_that_has_an_interrupt() {
+        assert!(lends_any(None, true));
+        assert!(!lends_any(None, false), "nothing to tell the borrower with");
+        assert!(
+            lends_any(Some("yes"), true),
+            "a word it does not know is none"
+        );
+    }
+
+    #[test]
+    fn the_boot_can_say_which_cards_are_lent() {
+        for interrupts in [false, true] {
+            assert!(lends_any(Some("any"), interrupts));
+            assert!(!lends_any(Some("asked"), interrupts));
+        }
+    }
 
     #[test]
     fn a_virtio_card_or_the_first_e1000e_left_to_userspace_is_the_stacks() {
