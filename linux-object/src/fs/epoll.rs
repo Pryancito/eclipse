@@ -906,6 +906,9 @@ impl Epoll {
         // Counted on entry, not per re-scan: one syscall is one wait, however
         // many times the loop below goes round. See [`stats`].
         stats::entered(timeout_msecs);
+        // The place this wait has on its thread to be woken by a signal,
+        // kept for the whole call and given back when it returns.
+        let mut signal = crate::sync::SignalWake::new();
         loop {
             // Snapshot the interest list, keeping each watched file's OWN
             // `Arc<dyn FileLike>`. Two reasons this is the handle to poll,
@@ -1055,7 +1058,14 @@ impl Epoll {
             // A blocking wait may be interrupted by a deliverable signal, but a
             // signal must not hide events that are already ready, nor turn a
             // non-blocking/expired wait into `EINTR`.
-            if let Err(err) = crate::process::check_signals() {
+            //
+            // The waker is left with the thread before the look
+            // (`SignalWake::check`), so a signal queued after it wakes this
+            // wait when it arrives and not on the next tick.
+            let waker =
+                core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await;
+            let (interrupted, parked) = signal.check(&waker);
+            if let Err(err) = interrupted {
                 stats::returned_error();
                 return Err(err);
             }
@@ -1075,8 +1085,6 @@ impl Epoll {
             // wakeups of a parked desktop process. Any fd without an event
             // source (evdev nodes, signalfd, nested epolls) keeps the short
             // tick for its whole set, preserving the old behavior exactly.
-            let waker =
-                core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await;
             //
             // An edge-triggered entry parks on its file's next publication
             // instead: a level subscription fires at once on a flag that is
@@ -1118,7 +1126,7 @@ impl Epoll {
             }
             let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
             let tick_ms = if covered {
-                crate::net::wait::IO_WAIT_COVERED_TICK_MS
+                crate::net::wait::covered_tick_ms(parked)
             } else {
                 crate::net::wait::IO_WAIT_TICK_MS
             };

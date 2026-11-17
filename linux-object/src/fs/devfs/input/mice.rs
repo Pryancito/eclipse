@@ -312,6 +312,8 @@ impl INode for MiceDev {
             subs: Vec<(usize, u64)>,
             /// Backstop slot; see [`MICE_INTERRUPT_CHECK_TICK_MS`].
             timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+            /// The place this wait has on its thread to be woken by a signal.
+            signal: crate::sync::SignalWake,
         }
 
         impl MiceFuture<'_> {
@@ -371,9 +373,14 @@ impl INode for MiceDev {
                 // mice do, so this and the tick below are the only things in the
                 // whole wait that can answer a signal or a kill. After the
                 // readiness check, deliberately -- see `EventDev`.
-                if super::event::wait_interrupted() {
+                let (interrupted, parked) = this.signal.check(cx.waker());
+                if interrupted.is_err() {
                     this.unpark();
                     return Poll::Ready(Err(FsError::Interrupted));
+                }
+                if parked {
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Pending;
                 }
                 let deadline = kernel_hal::timer::deadline_after(
                     core::time::Duration::from_millis(MICE_INTERRUPT_CHECK_TICK_MS),
@@ -389,6 +396,7 @@ impl INode for MiceDev {
             dev: self,
             subs: Vec::new(),
             timer: None,
+            signal: crate::sync::SignalWake::new(),
         })
     }
 

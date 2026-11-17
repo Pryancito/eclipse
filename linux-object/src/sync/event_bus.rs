@@ -535,6 +535,45 @@ fn wait_unparked(wait: u64) {
     self::test_interrupt::unpark(wait)
 }
 
+/// The place a wait has on its thread to be woken by a signal, for the
+/// waits that are not an [`EventBusFuture`]: a field of the wait's future,
+/// asked once per poll in place of the signal check.
+///
+/// [`check`](Self::check) leaves the waker with the thread and then looks
+/// at the signals, in that order, so one queued after the look wakes the
+/// wait. Where it answers `true` the wait needs no timer to look again;
+/// where it answers `false` -- no Linux thread here, or another wait of the
+/// thread has the place -- it does, as before. The place is given back
+/// when this is dropped, with the future that holds it.
+#[derive(Default)]
+pub struct SignalWake(Option<u64>);
+
+impl SignalWake {
+    /// A wait that has not parked yet.
+    pub const fn new() -> Self {
+        SignalWake(None)
+    }
+
+    /// The signal check of a wait about to sleep, and whether the thread
+    /// took `waker` to wake it for a signal.
+    pub fn check(&mut self, waker: &core::task::Waker) -> (crate::error::LxResult<()>, bool) {
+        wait_interrupted_parking(&mut self.0, waker)
+    }
+
+    /// The wait is over: give the place back now and not at the drop.
+    pub fn done(&mut self) {
+        if let Some(wait) = self.0.take() {
+            wait_unparked(wait);
+        }
+    }
+}
+
+impl Drop for SignalWake {
+    fn drop(&mut self) {
+        self.done();
+    }
+}
+
 /// The test-only stand-in for [`crate::process::check_signals`].
 #[cfg(test)]
 pub(crate) mod test_interrupt {

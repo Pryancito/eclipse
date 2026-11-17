@@ -111,6 +111,8 @@ impl Semaphore {
             /// and `semop(-1)` on a semaphore nobody ever releases was a wait
             /// that `kill -9` could not end either.
             timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+            /// The place this wait has on its thread to be woken by a signal.
+            signal: crate::sync::SignalWake,
         }
 
         impl Drop for SemaphoreFuture {
@@ -172,12 +174,21 @@ impl Semaphore {
                 // only what the SEMAPHORE does, so this is the only thing here
                 // that can answer a signal or a kill. semop(2) lists EINTR
                 // among its errors for exactly this.
-                if let Err(err) = crate::process::check_signals() {
+                //
+                // The waker is left with the thread before the look: a
+                // signal queued after it wakes this wait, which then needs
+                // no timer.
+                let (interrupted, parked) = this.signal.check(cx.waker());
+                if let Err(err) = interrupted {
                     if let Some(id) = this.sub_id.take() {
                         this.inner.lock().eventbus.unsubscribe(id);
                     }
                     kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
                     return Poll::Ready(Err(err));
+                }
+                if parked {
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Pending;
                 }
                 let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
                     SEMOP_INTERRUPT_CHECK_TICK_MS,
@@ -193,6 +204,7 @@ impl Semaphore {
             inner: self.lock.clone(),
             sub_id: None,
             timer: None,
+            signal: crate::sync::SignalWake::new(),
         };
         future.await
     }

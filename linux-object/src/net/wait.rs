@@ -25,6 +25,29 @@ pub const IO_WAIT_TICK_MS: u64 = 4;
 /// 100 ms of added latency instead of a hang.
 pub const IO_WAIT_COVERED_TICK_MS: u64 = 100;
 
+/// The covered tick of a wait whose thread also wakes it for a signal
+/// ([`crate::sync::SignalWake`]).
+///
+/// Of the two things the covered tick was for, the signal is no longer one:
+/// it wakes the wait when it is queued and not up to 100 ms later. What is
+/// left is the insurance against a wake lost in the subscription wiring,
+/// and insurance that is never expected to pay does not have to wake every
+/// parked process ten times a second: once a second bounds such a bug to a
+/// second of latency, still not a hang.
+pub const IO_WAIT_PARKED_TICK_MS: u64 = 1000;
+
+/// The fallback interval of a wait with a parked readiness waker on every
+/// watched fd: [`IO_WAIT_PARKED_TICK_MS`] when its thread wakes it for a
+/// signal too, [`IO_WAIT_COVERED_TICK_MS`] when the tick is all there is to
+/// look for one.
+pub const fn covered_tick_ms(parked: bool) -> u64 {
+    if parked {
+        IO_WAIT_PARKED_TICK_MS
+    } else {
+        IO_WAIT_COVERED_TICK_MS
+    }
+}
+
 /// One sleep cycle in epoll/poll: wake on NET/TTY IRQ or fallback timer.
 pub struct IoMultiplexWait {
     deadline: Option<Duration>,
@@ -276,5 +299,20 @@ mod hid_handshake_tests {
             "no evdev node in this set: an input frame is not this wait's \
              business and must not cut its sleep short"
         );
+    }
+}
+
+#[cfg(test)]
+mod covered_tick_tests {
+    use super::*;
+
+    /// A wait its thread wakes for a signal keeps only the insurance, ten
+    /// times rarer; one that the tick alone watches keeps the old interval.
+    #[test]
+    fn the_covered_tick_is_a_second_only_when_the_thread_wakes_the_wait() {
+        assert_eq!(covered_tick_ms(false), IO_WAIT_COVERED_TICK_MS);
+        assert_eq!(covered_tick_ms(true), IO_WAIT_PARKED_TICK_MS);
+        assert_eq!(IO_WAIT_COVERED_TICK_MS, 100);
+        assert_eq!(IO_WAIT_PARKED_TICK_MS, 1000);
     }
 }

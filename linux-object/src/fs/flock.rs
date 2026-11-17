@@ -177,6 +177,7 @@ pub fn wait_for_change(since: u64) -> impl Future<Output = Result<(), LxError>> 
         since,
         sub_id: None,
         timer: None,
+        signal: crate::sync::SignalWake::new(),
     }
 }
 
@@ -193,6 +194,8 @@ struct ChangeFuture {
     /// happens to the waiter, so a tick is what lets a signal kill a
     /// `flock` parked behind a lock nobody drops.
     timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+    /// The place this wait has on its thread to be woken by a signal.
+    signal: crate::sync::SignalWake,
 }
 
 impl ChangeFuture {
@@ -240,9 +243,16 @@ impl Future for ChangeFuture {
                 }
             }
         }
-        if let Err(err) = crate::process::check_signals() {
+        // The waker is left with the thread before the look: a signal
+        // queued after it wakes this wait, which then needs no timer.
+        let (interrupted, parked) = this.signal.check(cx.waker());
+        if let Err(err) = interrupted {
             this.unsubscribe();
             return Poll::Ready(Err(err));
+        }
+        if parked {
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Pending;
         }
         let deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(FLOCK_INTERRUPT_CHECK_TICK_MS));
