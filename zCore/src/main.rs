@@ -736,16 +736,29 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         kernel_hal::drivers::set_pci_msix_enabled(true);
         klog_info!("Eclipse: pci.msix -- PCI devices are armed with MSI-X");
     }
-    // `pci.intx=1`: a network card with no MSI is given the legacy
-    // interrupt line of its slot, which a boot that lends such a card
-    // (`unetlend=any`) needs and so asks for as well; `pci.intx=0` wins.
+    // A network card with no MSI is given the legacy interrupt line of its
+    // slot, which it needs to be lent to the stack process: under a
+    // hypervisor unless the boot says no (`pci.intx=0`, `unetlend=asked`),
+    // on a real machine only if it says so (`pci.intx=1`, `unetlend=any`).
     // Read here for the same reason as `pci.msix` above: `primary_init` is
     // what probes the cards.
     #[cfg(not(feature = "libos"))]
-    if !kernel_hal::cmdline::is_off(&options.cmdline, "pci.intx")
-        && (kernel_hal::cmdline::flag(&options.cmdline, "pci.intx")
-            || kernel_hal::cmdline::value(&options.cmdline, "unetlend") == Some("any"))
-    {
+    let pci_intx = {
+        let said = if kernel_hal::cmdline::is_off(&options.cmdline, "pci.intx") {
+            Some(false)
+        } else if kernel_hal::cmdline::flag(&options.cmdline, "pci.intx") {
+            Some(true)
+        } else {
+            None
+        };
+        kernel_hal::drivers::pci_intx_wanted(
+            said,
+            kernel_hal::cmdline::value(&options.cmdline, "unetlend"),
+            kernel_hal::drivers::under_hypervisor(),
+        )
+    };
+    #[cfg(not(feature = "libos"))]
+    if pci_intx {
         kernel_hal::drivers::set_pci_intx_enabled(true);
         klog_info!(
             "Eclipse: network cards with no MSI get the legacy interrupt line of their slot"
@@ -771,9 +784,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     let (kernel_cards, lendable) = {
         let cards = kernel_hal::drivers::all_net().as_vec();
         let mut cards = cards.iter().filter(|card| !card.is_loopback()).peekable();
-        // A card whose driver lends it only when asked is for the boot
-        // that says `unetlend=any`.
-        let any = kernel_hal::cmdline::value(&options.cmdline, "unetlend") == Some("any");
+        // A card whose driver lends it only when asked is lent all the
+        // same, unless the boot says `unetlend=asked` or the card would
+        // have no interrupt to tell the borrower of its frames with.
+        #[cfg(not(feature = "libos"))]
+        let interrupts = !cfg!(target_arch = "x86_64") || pci_intx;
+        #[cfg(feature = "libos")]
+        let interrupts = false;
+        let any = linux_object::net::user_stack::boot::lends_any(
+            kernel_hal::cmdline::value(&options.cmdline, "unetlend"),
+            interrupts,
+        );
         let lendable = cards
             .peek()
             .is_some_and(|first| first.can_lend() && (any || first.lends_unasked()));

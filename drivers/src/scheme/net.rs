@@ -47,11 +47,12 @@ pub trait NetScheme: Scheme {
     fn can_lend(&self) -> bool {
         false
     }
-    /// Whether a boot that says nothing lends this card
-    /// ([`can_lend`](Self::can_lend)), or only one that asks
-    /// (`unetlend=any`). A driver says no while its card, lent, is not
-    /// known to do as well as with the kernel's own stack: measured and
-    /// found slower, or never run on the machine it is for.
+    /// Whether this card is lent ([`can_lend`](Self::can_lend)) even on a
+    /// boot that says `unetlend=asked`, which keeps for the kernel's own
+    /// stack the cards whose drivers say no here: the ones that, lent, are
+    /// not known to do as well as with that stack (measured and found
+    /// slower at a small echo, or never run on the machine they are for).
+    /// An ordinary boot lends those too.
     fn lends_unasked(&self) -> bool {
         self.can_lend()
     }
