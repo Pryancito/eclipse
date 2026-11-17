@@ -102,13 +102,23 @@ impl Named {
 /// Make `conf` name the servers `named`, on the machine whose interface
 /// is called `card`, unless `fixed` is there.
 pub fn apply(named: &Named, card: &str, conf: &Path, fixed: &Path) -> io::Result<Applied> {
-    if named.is_empty() {
+    apply_lines(&named.written(card), conf, fixed)
+}
+
+/// Make `conf` name `servers`, each as it is written ([`Named::written`]),
+/// unless `fixed` is there: the servers of every card of a machine that
+/// has several, the first card's first.
+pub fn apply_lines(servers: &[String], conf: &Path, fixed: &Path) -> io::Result<Applied> {
+    if servers.is_empty() {
         return Ok(Applied::Nothing);
     }
     if fixed.exists() {
         return Ok(Applied::Fixed);
     }
-    let text = named.text(card);
+    let text: String = servers
+        .iter()
+        .map(|d| format!("nameserver {d}\n"))
+        .collect();
     if std::fs::read_to_string(conf).is_ok_and(|now| now == text) {
         return Ok(Applied::Unchanged);
     }

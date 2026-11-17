@@ -322,7 +322,6 @@ use async_trait::async_trait;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_hal::drivers::net::stack_card::{Carried, Sixes};
-use kernel_hal::drivers::scheme::NetStats;
 use kernel_hal::sync::Mutex;
 use log::warn;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address, Ipv6Cidr};
@@ -332,6 +331,7 @@ use zircon_object::object::*;
 use zircon_object::{ZxError, ZxResult};
 
 pub mod boot;
+pub mod cards;
 mod groups;
 mod groups6;
 mod icmp;
@@ -1525,6 +1525,8 @@ pub struct StackLink {
     /// Whether no stack is expected, ever: see
     /// [`alone`](Self::alone).
     alone: AtomicBool,
+    /// The cards of the stack that are not its first: see [`cards`].
+    others: cards::Others,
 }
 
 /// A stack process's turn at serving: what the task that reads its
@@ -1693,6 +1695,7 @@ impl StackLink {
             counted: Mutex::new([0; COUNTS]),
             sixes: Arc::new(Sixes::default()),
             alone: AtomicBool::new(false),
+            others: cards::Others::default(),
         })
     }
 
@@ -1923,9 +1926,21 @@ impl StackLink {
             Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
             Some((OP_DATA6, _)) => self.take_datagrams6(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),
-            Some((OP_COUNTS, _)) => self.take_counts(&m[HEADER_LEN..]),
+            Some((OP_COUNTS, 0)) => self.take_counts(&m[HEADER_LEN..]),
+            Some((OP_COUNTS, card)) => match parse_counts(&m[HEADER_LEN..]) {
+                Some(counts) => self.take_counts_of(card, counts),
+                None => warn!("user stack: a COUNTS that is no counts of a card"),
+            },
+            Some((cards::OP_CARD, card)) => match cards::parse_card(&m[HEADER_LEN..]) {
+                Some(said) => self.take_card(card, said),
+                None => warn!(
+                    "user stack: {} bytes that are no card",
+                    m.len() - HEADER_LEN
+                ),
+            },
             Some((OP_FRAMES, _)) => self.take_frames(&m[HEADER_LEN..]),
-            Some((OP_SIX, _)) => match parse_six(&m[HEADER_LEN..]) {
+            Some((OP_SIX, card)) => match parse_six(&m[HEADER_LEN..]) {
+                Some((router, addresses)) if card != 0 => self.take_six_of(card, router, addresses),
                 Some((router, addresses)) => self.sixes.say(addresses, router),
                 None => warn!(
                     "user stack: {} bytes that are no addresses of a card",
@@ -1984,29 +1999,8 @@ impl StackLink {
             );
             return;
         };
-        let more = {
-            let mut counted = self.counted.lock();
-            let mut more = [0u64; COUNTS];
-            for ((more, now), was) in more.iter_mut().zip(now).zip(counted.iter()) {
-                // A count that goes back is a stack that lost count:
-                // nothing is taken away for it.
-                *more = now.saturating_sub(*was);
-            }
-            *counted = now;
-            more
-        };
-        let [rx_bytes, rx_packets, rx_errors, rx_dropped, tx_bytes, tx_packets, tx_errors, tx_dropped] =
-            more;
-        self.carried.add(&NetStats {
-            rx_bytes,
-            rx_packets,
-            tx_bytes,
-            tx_packets,
-            rx_errors,
-            rx_dropped,
-            tx_errors,
-            tx_dropped,
-        });
+        let more = cards::grown(&mut self.counted.lock(), now);
+        self.carried.add(&more);
     }
 
     fn take_events(&self, mut records: &[u8]) {
@@ -2127,6 +2121,7 @@ impl StackLink {
             // And says its own addresses.
             self.sixes.forget();
         }
+        self.forget_cards();
         warn!("user stack: the process is gone");
         let streams: Vec<Arc<tcp::Stream>> = {
             let mut table = self.table.lock();
@@ -2253,7 +2248,9 @@ impl StackLink {
     /// Whether `addr` is this machine: what is sent there is for another
     /// of its programs, and never leaves it.
     fn is_here(&self, addr: Ipv4Address) -> bool {
-        addr.is_loopback() || (!self.address().is_unspecified() && addr == self.address())
+        addr.is_loopback()
+            || (!self.address().is_unspecified() && addr == self.address())
+            || self.is_another(addr)
     }
 
     /// The address this machine speaks from to who it reaches at `to`,
@@ -2700,7 +2697,7 @@ impl Socket for ServedUdpSocket {
         // on behalf of nobody.
         let from = inner.here.or_else(|| match inner.remote?.addr {
             IpAddress::Ipv4(to) if self.link.is_here(to) => Some(self.link.here_for(to)),
-            IpAddress::Ipv4(_) => Some(self.link.address()),
+            IpAddress::Ipv4(to) => Some(self.link.address_toward(to)),
             _ => None,
         });
         let local = IpEndpoint::new(

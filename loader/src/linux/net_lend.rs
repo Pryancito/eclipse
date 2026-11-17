@@ -497,6 +497,8 @@ pub(super) fn net_borrow(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Str
     *behind.lock() = Arc::downgrade(&lent);
     let name = card.get_ifname();
     let mac = card.get_mac().0;
+    // What the stack's card is shown as, when it says this one.
+    linux_object::net::user_stack::cards::note_lent(mac, &name);
     // Out of the kernel's list: the machine's interfaces are the stack's
     // to show now.
     if !kernel_hal::drivers::hotplug::remove(&Device::Net(card.clone())) {

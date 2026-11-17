@@ -213,7 +213,7 @@ fn failed(inner: &Inner) -> bool {
 /// or this machine's when it is to another of its programs; a socket that
 /// only has a port has every address, unless it was bound to one of this
 /// machine's.
-fn address(inner: &Inner, stack: Ipv4Address) -> IpAddress {
+fn address(inner: &Inner, link: &StackLink) -> IpAddress {
     let six = matches!(inner.remote, Some(remote) if matches!(remote.addr, IpAddress::Ipv6(_)));
     if let Some(local) = inner.local {
         local
@@ -225,7 +225,11 @@ fn address(inner: &Inner, stack: Ipv4Address) -> IpAddress {
         match inner.phase {
             Phase::Fresh | Phase::Listening => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
             _ if six => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
-            _ => IpAddress::Ipv4(stack),
+            // The card it leaves by.
+            _ => IpAddress::Ipv4(match inner.remote.map(|remote| remote.addr) {
+                Some(IpAddress::Ipv4(to)) => link.address_toward(to),
+                _ => link.address(),
+            }),
         }
     }
 }
@@ -318,7 +322,7 @@ impl Stream {
     /// where such a connection spends its time -- waiting for the program
     /// to close (the peer finished), for the peer to finish (the program
     /// did), or for the last acknowledgement (both).
-    fn listed(&self, stack: Ipv4Address) -> Option<Listed> {
+    fn listed(&self, link: &StackLink) -> Option<Listed> {
         let inner = self.inner.lock();
         let state = match inner.phase {
             Phase::Fresh | Phase::Over => return None,
@@ -332,7 +336,7 @@ impl Stream {
             },
         };
         Some(Listed {
-            local: IpEndpoint::new(address(&inner, stack), inner.port.unwrap_or(0)),
+            local: IpEndpoint::new(address(&inner, link), inner.port.unwrap_or(0)),
             remote: inner.remote.filter(|_| inner.phase != Phase::Listening),
             state,
             unread: inner.queued,
@@ -373,10 +377,9 @@ impl StackLink {
             let table = self.table.lock();
             table.streams.values().filter_map(Weak::upgrade).collect()
         };
-        let stack = self.address();
         streams
             .iter()
-            .filter_map(|stream| stream.listed(stack))
+            .filter_map(|stream| stream.listed(self))
             .collect()
     }
 
@@ -1019,6 +1022,7 @@ impl Socket for ServedTcpSocket {
         match local.addr {
             IpAddress::Unspecified => {}
             IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address() => {}
+            IpAddress::Ipv4(addr) if self.link.is_another(addr) => {}
             // This machine's alone: see `listen`.
             IpAddress::Ipv4(addr) if addr.is_loopback() => {}
             // An address of the card's is heard at like every address.
@@ -1175,7 +1179,7 @@ impl Socket for ServedTcpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.stream.inner.lock();
-        let addr = address(&inner, self.link.address());
+        let addr = address(&inner, &self.link);
         let local = IpEndpoint::new(addr, inner.port.unwrap_or(0));
         Some(Endpoint::Ip(shown(self.stream.takes(&inner), local)))
     }
