@@ -18,12 +18,8 @@
 //! sockets. A program's socket stays the kernel's object, and the kernel
 //! asks this process, over a channel, to send its datagrams and make its
 //! connections, and is told of what arrives (`eclipse_netstack_serve`).
-//! Which programs: all of them, on a machine whose only card is this
-//! stack's, which is what a machine with a virtio network card gets
-//! without a word (the kernel leaves that card to userspace, having no
-//! driver for it); where the kernel drives a card it cannot lend, the ones started by
-//! `eclipse-netstack-use`, and every other socket is the kernel's
-//! stack's. The address is written on the command
+//! Which programs: all of them, on every boot. The kernel has no stack
+//! of its own for a program's sockets. The address is written on the command
 //! line or leased from a DHCP server, and one gateway carries what is not
 //! for the card's network ([`socks::lease`]); the machine's network
 //! settings say which instead when they name the card ([`governed`]); the
