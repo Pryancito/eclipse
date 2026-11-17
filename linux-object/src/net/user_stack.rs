@@ -1,10 +1,9 @@
 //! Sockets served by a network stack that runs as a process.
 //!
-//! The kernel's own stack is smoltcp, in the kernel. `tools/eclipse-netstack`
-//! is the same stack in a process, with a card of its own, and this is how a
-//! program reaches it: the process registers one end of a channel
-//! (`eclipse_netstack_serve`), and a datagram socket of a program that asked
-//! for that stack (`eclipse_netstack_use`, see [`crate::process`]) is a
+//! The kernel has no stack of its own. `tools/eclipse-netstack` is smoltcp
+//! in a process, with the machine's cards, and this is how a program
+//! reaches it: the process registers one end of a channel
+//! (`eclipse_netstack_serve`), and a datagram socket of any program is a
 //! [`ServedUdpSocket`]. The descriptor, its flags, `poll` and `close` stay
 //! here, as for any socket; what the socket sends and receives goes over the
 //! channel.
@@ -1589,17 +1588,6 @@ pub fn serve(channel: Arc<Channel>, max_datagram: usize, address: [u8; 4]) -> Zx
     machine().attach(channel, max_datagram, address)
 }
 
-/// Whether every program's sockets are the served stack's, asked for or
-/// not: see [`use_for_all`].
-static FOR_ALL: AtomicBool = AtomicBool::new(false);
-
-/// From now on every program is one that asked: the machine's network is
-/// the stack that runs as a process, and the kernel's own stack is
-/// nobody's. Which boots are like that is [`boot::whose`]'s to say.
-pub fn use_for_all(on: bool) {
-    FOR_ALL.store(on, Ordering::Relaxed);
-}
-
 /// Where a frame sent on the machine's stack card goes: to the stack
 /// that has the card, as a `FRAME`. This is what makes an `AF_PACKET`
 /// socket work on a boot where the card is the stack's.
@@ -1617,14 +1605,7 @@ impl zcore_drivers::net::stack_card::Wire for StackLink {
 /// card receives. Nothing happens where no stack runs: the card is the
 /// kernel's and its frames are already everyone's.
 pub fn tap(on: bool) {
-    if is_for_all() {
-        machine().tap(on);
-    }
-}
-
-/// Whether [`use_for_all`] is on.
-pub fn is_for_all() -> bool {
-    FOR_ALL.load(Ordering::Relaxed)
+    machine().tap(on);
 }
 
 /// The IPv4 address a program names with `addr` on a socket of its

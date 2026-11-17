@@ -40,7 +40,6 @@ pub mod nr {
     pub const ECLIPSE_NET_SERVE: i64 = 0x4007;
     pub const ECLIPSE_FIFO_REPLY_WAIT: i64 = 0x4008;
     pub const ECLIPSE_NETSTACK_SERVE: i64 = 0x4009;
-    pub const ECLIPSE_NETSTACK_USE: i64 = 0x400a;
     pub const ECLIPSE_NET_BORROW: i64 = 0x400b;
     pub const ECLIPSE_NET_LENT_TURN: i64 = 0x400c;
     pub const ECLIPSE_FS_SERVE: i64 = 0x400d;

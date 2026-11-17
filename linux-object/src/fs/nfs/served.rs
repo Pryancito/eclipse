@@ -1,20 +1,15 @@
 //! The connection through the stack process: a served TCP socket, driven
 //! **synchronously**.
 //!
-//! [`KernelTransport`](super::transport::KernelTransport) drives the kernel's
-//! own smoltcp by hand. On a machine whose network is a stack process
-//! ([`is_for_all`](crate::net::user_stack::is_for_all)) the kernel's stack has
-//! no card under it, so a mount through it reached nobody: the NFS client
-//! was the one thing left that could not use the network every program
-//! uses. This is the same four methods over a
-//! [`ServedTcpSocket`], the socket a program's `socket(2)` gets there.
+//! The machine's network is a stack process, and the kernel has no stack
+//! of its own: this is the transport's four methods over a
+//! [`ServedTcpSocket`], the socket a program's `socket(2)` gets.
 //!
 //! # What waiting is here
 //!
 //! The caller is a `mount(2)`, or a `read(2)` of a file on the mount, and
-//! cannot `await`. With the kernel's stack the wait drives the card itself.
-//! Here the bytes come from another process, so the wait has to let that
-//! process run and then read what it sent: [`StackLink::pump`] reads the
+//! cannot `await`. The bytes come from another process, so the wait has to
+//! let that process run and then read what it sent: [`StackLink::pump`] reads the
 //! stack's messages without the link's task, and between two looks the CPU
 //! is given away ([`between_looks`]) as a request to a served filesystem
 //! gives it away. From the first turn given away, the stack's channel

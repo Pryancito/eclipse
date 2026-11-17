@@ -3,9 +3,7 @@
 //!
 //! A test program, and an ordinary one: `socket`, `bind`, `recvfrom`,
 //! `sendto`, with nothing of Eclipse's in it. It is what the stack that
-//! runs as a process is measured with against the kernel's
-//! (`scripts/udp_ping.py --udp PORT`): started as it is, its socket is the
-//! kernel's; started by `eclipse-netstack-use`, the process's.
+//! runs as a process is measured with (`scripts/udp_ping.py --udp PORT`).
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the port
 //! cannot be had or the socket fails.

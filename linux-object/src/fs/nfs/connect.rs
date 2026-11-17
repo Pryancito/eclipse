@@ -1,23 +1,9 @@
 //! Opening the connection, **synchronously**, and the seam that lets the
 //! handshake above it be tested without one.
 //!
-//! The transport of the previous batch takes a socket that is already
-//! connected, because connecting is a wait of its own: its own timeout, its
-//! own states and its own error mapping, and none of it belongs in `send`.
-//! This is that wait, and it is the same shape as everything else in this
-//! client — a loop that drives the stack by hand and comes back whatever the
-//! clock says — because the caller is a `mount(2)` that cannot `await`.
-//!
-//! # Why not `TcpSocketState::connect`
-//!
-//! Because it is `async`, and its blocking half
-//! (`wait_for_handshake`) parks on `NetRxOrTimeoutFuture`. That `.await` is
-//! the only asynchronous thing in it: the loop around it already drains the
-//! stack by hand. So this is that loop with the park replaced by
-//! [`kernel_hal::thread::yield_now_sync`], exactly as the transport's own
-//! park was arrived at — and it answers with the same three errnos, for the
-//! same three reasons, because a mount that fails differently from a `connect`
-//! against the same server would be its own bug report.
+//! The connection is a stream socket of the network stack that runs as a
+//! process ([`served`](super::served)): the network every program of this
+//! machine uses is the one a mount uses.
 //!
 //! # Why a trait
 //!
@@ -29,37 +15,18 @@
 //! can answer for. The real one dials TCP; the one in the tests hands back a
 //! scripted server and writes down which port was asked for.
 
-use alloc::boxed::Box;
-use alloc::vec;
+use smoltcp::wire::IpAddress;
 
-use smoltcp::socket::{TcpSocket, TcpSocketBuffer, TcpState};
-use smoltcp::wire::{IpAddress, IpEndpoint};
+use crate::error::LxResult;
 
-use zcore_drivers::net::get_sockets;
-
-use crate::error::{LxError, LxResult};
-use crate::net::GlobalSocketHandle;
-
-use super::client::{RpcTransport, TransportError};
+use super::client::RpcTransport;
 use super::served::ServedTransport;
-use super::transport::{KernelDriver, KernelTransport, StackDriver};
 
 /// How long to wait for a TCP handshake before giving up.
 ///
-/// The same thirty seconds `TcpSocketState::connect` waits, so a mount against
-/// an unreachable server fails when a `connect(2)` against it would.
+/// The thirty seconds a `connect(2)` waits, so a mount against an
+/// unreachable server fails when a `connect(2)` against it would.
 pub const CONNECT_TIMEOUT_MS: u64 = 30_000;
-
-/// The most consecutive passes the handshake wait will make **without the
-/// clock advancing at all**.
-///
-/// The third copy of the same exit, for the third loop whose only other way
-/// out is the clock. See
-/// [`MAX_RECV_PASSES`](super::transport::MAX_RECV_PASSES): a stalled timer
-/// here would hold the thread that drives the network stack, so this loop
-/// returns whatever the clock says and the mount fails rather than the
-/// machine's networking stopping.
-pub const MAX_CONNECT_PASSES: u32 = 5_000;
 
 /// Makes a connection to one port on the server.
 ///
@@ -82,7 +49,7 @@ pub trait Connector {
     fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport>;
 }
 
-/// The real one: a kernel TCP socket to a fixed address.
+/// The real one: a served TCP socket to a fixed address.
 ///
 /// The address, not the hostname: resolving is `async` and happens on the
 /// mount path above, which is also where a hostname that does not resolve is
@@ -110,55 +77,8 @@ impl TcpConnector {
     }
 }
 
-/// A connection of [`TcpConnector`]: through the stack process where the
-/// machine's network is one, and through the kernel's own stack where it
-/// is not.
-pub enum Wire {
-    /// The kernel's smoltcp, driven by hand.
-    Kernel(KernelTransport<KernelDriver>),
-    /// A served socket: see [`served`](super::served).
-    Served(Box<ServedTransport>),
-}
-
-impl RpcTransport for Wire {
-    fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        match self {
-            Wire::Kernel(t) => t.send(data),
-            Wire::Served(t) => t.send(data),
-        }
-    }
-
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        match self {
-            Wire::Kernel(t) => t.recv(buf),
-            Wire::Served(t) => t.recv(buf),
-        }
-    }
-
-    fn now_ms(&self) -> u64 {
-        match self {
-            Wire::Kernel(t) => t.now_ms(),
-            Wire::Served(t) => t.now_ms(),
-        }
-    }
-
-    fn poll(&mut self) {
-        match self {
-            Wire::Kernel(t) => t.poll(),
-            Wire::Served(t) => t.poll(),
-        }
-    }
-
-    fn give_up(&mut self) {
-        match self {
-            Wire::Kernel(t) => t.give_up(),
-            Wire::Served(t) => t.give_up(),
-        }
-    }
-}
-
 impl Connector for TcpConnector {
-    type Transport = Wire;
+    type Transport = ServedTransport;
 
     fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport> {
         // The caller's budget and this connector's ceiling, whichever is
@@ -166,135 +86,7 @@ impl Connector for TcpConnector {
         // `with_timeout` promised, and the budget is what is left of the
         // caller's deadline.
         let ms = timeout_ms.min(self.timeout_ms);
-        // The network every program of this machine uses is the one a
-        // mount uses: where that is the stack process, the kernel's own
-        // stack has no card and reaches nobody.
-        if crate::net::user_stack::is_for_all() {
-            let link = crate::net::user_stack::machine();
-            return ServedTransport::connect(link, self.addr, port, ms)
-                .map(|t| Wire::Served(Box::new(t)));
-        }
-        let mut driver = KernelDriver;
-        let handle = connect_sync(self.addr, port, ms, &mut driver)?;
-        Ok(Wire::Kernel(KernelTransport::new(handle)))
+        let link = crate::net::user_stack::machine();
+        ServedTransport::connect(link, self.addr, port, ms)
     }
 }
-
-/// Open a TCP connection and wait for the handshake to finish.
-///
-/// Answers like `connect(2)` does, and for the same reasons:
-///
-/// - `ECONNREFUSED` when the peer answered with a reset, which moves the
-///   socket from `SynSent` straight to `Closed`. Reported the moment it is
-///   seen rather than by spinning to the deadline, because "nothing is
-///   listening there" and "the server is unreachable" are different problems
-///   and the person reading the mount's error has to tell them apart.
-/// - `ETIMEDOUT` when the handshake simply never completes. The socket is
-///   **aborted** before returning, as `tcp.rs` aborts it, so the next attempt
-///   starts a new handshake instead of inheriting this one's.
-/// - `EADDRNOTAVAIL` when there is no free local port, and `ENOMEM` when the
-///   socket set is full, which is what registering a socket answers.
-pub(crate) fn connect_sync<D: StackDriver>(
-    addr: IpAddress,
-    port: u16,
-    timeout_ms: u64,
-    driver: &mut D,
-) -> LxResult<GlobalSocketHandle> {
-    let socket = TcpSocket::new(
-        TcpSocketBuffer::new(vec![0u8; crate::net::TCP_RECVBUF]),
-        TcpSocketBuffer::new(vec![0u8; crate::net::TCP_SENDBUF]),
-    );
-    let handle = crate::net::register_smoltcp_socket(socket)?;
-
-    // The kernel's own TCP sockets are gone, so the only sockets of the set
-    // are the ones made here: the port counter alone does not collide.
-    {
-        let sockets = get_sockets();
-        let mut sets = sockets.lock();
-        let local = crate::net::get_ephemeral_port();
-        sets.get::<TcpSocket>(handle.inner())
-            .connect((addr, port), IpEndpoint::new(IpAddress::Unspecified, local))
-            .map_err(|e| match e {
-                smoltcp::Error::Unaddressable => LxError::ECONNREFUSED,
-                smoltcp::Error::Illegal => LxError::EISCONN,
-                _ => LxError::ENOBUFS,
-            })?;
-    }
-
-    wait_for_handshake(&handle, timeout_ms, driver)?;
-    Ok(handle)
-}
-
-/// The waiting half: drive the stack until the socket is connected, refused,
-/// or out of time.
-fn wait_for_handshake<D: StackDriver>(
-    handle: &GlobalSocketHandle,
-    timeout_ms: u64,
-    driver: &mut D,
-) -> LxResult<()> {
-    let deadline = now_ms().saturating_add(timeout_ms);
-    let mut stalls = 0u32;
-    let mut seen = now_ms();
-    loop {
-        driver.drive();
-
-        let sockets = get_sockets();
-        let state = {
-            let mut sets = sockets.lock();
-            let socket = sets.get::<TcpSocket>(handle.inner());
-            socket.state()
-        };
-        match state {
-            TcpState::Established => return Ok(()),
-            // A reset in answer to the SYN: nothing is listening on that
-            // port. `SynSent -> Closed` is how smoltcp reports it, and
-            // waiting out the deadline would turn "refused" into "timed out".
-            TcpState::Closed | TcpState::TimeWait => {
-                abort(handle, driver);
-                return Err(LxError::ECONNREFUSED);
-            }
-            // Still handshaking, or in a state this wait does not interpret.
-            _ => {}
-        }
-
-        let before = now_ms();
-        if before >= deadline {
-            // Given up on rather than left behind: a socket still in
-            // `SynSent` would keep retransmitting its SYN, and the next
-            // attempt would be a second handshake to the same place.
-            abort(handle, driver);
-            return Err(LxError::ETIMEDOUT);
-        }
-        kernel_hal::thread::yield_now_sync();
-        let after = now_ms();
-        let newest = if before > after { before } else { after };
-        if newest > seen {
-            seen = newest;
-            stalls = 0;
-        } else {
-            stalls += 1;
-            if stalls >= MAX_CONNECT_PASSES {
-                abort(handle, driver);
-                return Err(LxError::ETIMEDOUT);
-            }
-        }
-    }
-}
-
-/// Reset the socket and push the reset out.
-fn abort<D: StackDriver>(handle: &GlobalSocketHandle, driver: &mut D) {
-    {
-        let sockets = get_sockets();
-        let mut sets = sockets.lock();
-        sets.get::<TcpSocket>(handle.inner()).abort();
-    }
-    driver.drive();
-}
-
-fn now_ms() -> u64 {
-    kernel_hal::timer::timer_now().as_millis() as u64
-}
-
-#[cfg(test)]
-#[path = "connect_tests.rs"]
-mod connect_tests;

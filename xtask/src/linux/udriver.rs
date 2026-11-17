@@ -61,14 +61,13 @@ const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
 const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
 
 /// The network stack that runs as a process: its package, under `tools/`,
-/// its binaries -- the stack, what runs a program on it, and the UDP and
-/// TCP echo servers and the TCP client it is measured with -- and what it
+/// its binaries -- the stack, and the UDP and TCP echo servers and the TCP
+/// client it is measured with -- and what it
 /// is built from besides its own sources (the drivers' library and the
 /// tree's smoltcp, both by path).
 const NETSTACK_PACKAGE: &str = "eclipse-netstack";
-const NETSTACK: [&str; 5] = [
+const NETSTACK: [&str; 4] = [
     "eclipse-netstack",
-    "eclipse-netstack-use",
     "eclipse-udp-echo",
     "eclipse-tcp-echo",
     "eclipse-tcp-bench",

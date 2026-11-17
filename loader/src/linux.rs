@@ -616,28 +616,11 @@ pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 /// has carried is what the stack says there as it goes. An `address` and a
 /// `prefix` of 0 are a card with no address yet, shown without one.
 ///
-/// Which sockets: the datagram and stream sockets of the processes that
-/// asked for this stack with [`ECLIPSE_NETSTACK_USE`], or of every process
-/// on such a boot; the `AF_INET6` ones carry IPv4. Every other
-/// socket is the kernel's, as before. What one of those sockets sends to
-/// another at 127.0.0.0/8 or at `address` stays in the kernel, which has
-/// both: the stack is not told.
+/// Which sockets: those of every process; the `AF_INET6` ones carry IPv4
+/// too. What one of those sockets sends to another at 127.0.0.0/8 or at
+/// `address` stays in the kernel, which has both: the stack is not told.
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_NETSTACK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 9;
-
-/// `eclipse_netstack_use()`: from now on the datagram and stream sockets
-/// this process opens are those of the network stack that runs as a
-/// process ([`ECLIPSE_NETSTACK_SERVE`]), not the kernel's: the `AF_INET`
-/// ones, and the `AF_INET6` ones, which carry IPv4 there. Inherited by
-/// `fork` and kept across `execve`: a program is given that stack by
-/// whatever starts it, and on a boot where that stack is the machine's
-/// network every program has it without asking
-/// (`linux_object::net::user_stack::boot`). A socket opened while no stack
-/// is served is one
-/// all the same, for the programs of this machine now and for the stack
-/// when it comes; the sockets the process already has stay what they are.
-#[cfg(feature = "zircon-gateway")]
-pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 
 /// `eclipse_net_borrow(index, window, rx_slots, tx_slots, *out) -> status`:
 /// borrow a network card the kernel drives, for this process's network
@@ -755,9 +738,6 @@ fn show_stack_card(
     sixes: Arc<kernel_hal::drivers::net::stack_card::Sixes>,
 ) -> Option<Arc<kernel_hal::drivers::net::stack_card::StackCard>> {
     use kernel_hal::drivers::net::stack_card::StackCard;
-    if !linux_object::net::user_stack::is_for_all() {
-        return None;
-    }
     let mut name = STACK_CARD_NAME.lock();
     // The name the card had while the kernel drove it, when it is one
     // the kernel lent: a stack with several shows each as it was.
@@ -1057,10 +1037,6 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Ok(()) => 0,
             Err(e) => status(e),
         },
-        ECLIPSE_NETSTACK_USE => {
-            proc.linux().use_user_netstack();
-            0
-        }
         // Only the cards the boot lends (`user_stack::boot::lends_cards`,
         // which `net_borrow` counts): a boot that lends none keeps its
         // cards for the kernel's stack whoever asks.
