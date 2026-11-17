@@ -134,7 +134,7 @@ fn packet(from: Ipv4Address, to: Ipv4Address, hop_limit: u8, message: &[u8]) -> 
 }
 
 /// The IPv4 address `addr` names.
-fn v4(addr: IpAddress) -> LxResult<Ipv4Address> {
+pub(super) fn v4(addr: IpAddress) -> LxResult<Ipv4Address> {
     match addr {
         IpAddress::Ipv4(addr) => Ok(addr),
         IpAddress::Unspecified => Ok(Ipv4Address::UNSPECIFIED),
@@ -144,7 +144,7 @@ fn v4(addr: IpAddress) -> LxResult<Ipv4Address> {
 
 /// Where a program means when it says `addr`: nowhere is this machine
 /// (`ip_route_output`).
-fn destination(addr: IpAddress) -> LxResult<Ipv4Address> {
+pub(super) fn destination(addr: IpAddress) -> LxResult<Ipv4Address> {
     let addr = v4(addr)?;
     Ok(if addr.is_unspecified() {
         Ipv4Address::new(127, 0, 0, 1)
@@ -209,7 +209,7 @@ impl ServedIcmpSocket {
             table.socks.insert(sock, Arc::downgrade(&shared));
             sock
         };
-        link.hear(sock, six);
+        link.hear(sock, shared.hears, six);
         Ok(ServedIcmpSocket {
             base: KObjectBase::new(),
             link,

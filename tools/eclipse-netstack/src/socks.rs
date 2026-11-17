@@ -56,6 +56,10 @@
 //! hears, behind an IPv4 header written here. The stack answers the
 //! echoes that arrive, heard or not.
 //!
+//! A raw socket of any other protocol says which (`RAW`) and sends whole
+//! packets (`PACKET`), in [`raw`]; what arrives of its protocol is a
+//! record like what is heard of ICMP.
+//!
 //! A socket that speaks ICMPv6 is told of the same way (`HEAR6`,
 //! `ICMP6`, in [`icmp6`]), and what it hears is a record of a `DATA6`.
 //!
@@ -95,12 +99,14 @@ pub mod icmp6;
 pub mod isn;
 pub mod lease;
 pub mod mld;
+pub mod raw;
 pub mod six;
 pub mod tcp;
 pub mod undelivered;
 use groups::{OP_JOIN, OP_LEAVE};
 use icmp6::{OP_HEAR6, OP_ICMP6};
 use mld::{OP_JOIN6, OP_LEAVE6};
+use raw::{OP_PACKET, OP_RAW};
 use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_LISTEN6ONLY};
 use tcp::{OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, Undelivered6, EV_UNDELIVERED, EV_UNDELIVERED6};
@@ -300,6 +306,8 @@ pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     six: six::Six,
     /// The sockets that hear ICMPv6.
     hearing6: icmp6::Hearing6,
+    /// The raw sockets of other protocols.
+    raws: raw::Raws,
     /// The groups the machine is a member of, as the kernel said.
     groups: BTreeSet<Ipv4Address>,
     /// The same of IPv6, and what there is to say of them.
@@ -327,6 +335,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             lease: lease::Leasing::default(),
             six: six::Six::default(),
             hearing6: icmp6::Hearing6::default(),
+            raws: raw::Raws::default(),
             groups: BTreeSet::new(),
             mld: mld::Mld::default(),
             heard: VecDeque::new(),
@@ -369,6 +378,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         self.socks.contains_key(&sock)
             || self.hearing.contains_key(&sock)
             || self.hearing6.knows(sock)
+            || self.raws.knows(sock)
             || self.streams.knows(sock)
     }
 
@@ -545,6 +555,8 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             OP_FRAME => self.put_frame(&m[HEADER_LEN..]),
             OP_ICMP => self.icmp(sock, m),
             OP_ICMP6 => self.icmp6(sock, m),
+            OP_RAW => self.raw_open(sock, m),
+            OP_PACKET => self.raw_packet(sock, m),
             OP_BIND => {
                 let said: [u8; 4] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
                 let port = u16::from_le_bytes([said[0], said[1]]);
@@ -627,7 +639,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                     self.set.remove(handle);
                     return Ok(false);
                 }
-                if self.deaf(sock) || self.deaf6(sock) {
+                if self.deaf(sock) || self.deaf6(sock) || self.raw_close(sock) {
                     return Ok(false);
                 }
                 Ok(self.close_stream(sock).unwrap_or(false))
@@ -807,6 +819,10 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             if let Some(said) = said {
                 self.undelivered(&said);
             }
+        }
+        // What arrived of the protocols the raw sockets speak.
+        if !self.raw_arrived(m) {
+            return Arrived::More;
         }
         // What had nowhere to go, because its neighbour is asked for and
         // does not answer: this host says so to itself, and that is
@@ -1121,6 +1137,15 @@ mod tests {
         assert_eq!(
             tap(true),
             [0, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
+        // A raw socket's two.
+        assert_eq!(
+            raw_open(7, 17),
+            [0, 0, 0, 0, 29, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 0]
+        );
+        assert_eq!(
+            message(OP_PACKET, 7, &[0x45, 0]),
+            [0, 0, 0, 0, 30, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x45, 0]
         );
         assert_eq!(HEARD, 0);
         assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
@@ -1922,5 +1947,144 @@ mod tests {
             (7000, 4000, b"wait".to_vec())
         );
         assert_eq!(stack.idle_for(Instant::from_millis(2)), None);
+    }
+
+    /// A `RAW` as the kernel writes it.
+    fn raw_open(sock: u64, protocol: u8) -> Vec<u8> {
+        message(OP_RAW, sock, &[protocol, 0, 0, 0])
+    }
+
+    /// An IPv4 packet as a program that writes its own header makes it:
+    /// no sum, and an identification that will not travel.
+    fn made(from: Ipv4Address, to: Ipv4Address, protocol: u8, hops: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x45, 0];
+        packet.extend_from_slice(&((IP_HEADER + body.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x12, 0x34, 0, 0, hops, protocol, 0, 0]);
+        packet.extend_from_slice(&from.0);
+        packet.extend_from_slice(&to.0);
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    #[test]
+    fn a_raw_sockets_packet_leaves_as_it_was_made_from_the_cards_address() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&raw_open(5, 17)), Ok(false));
+        assert_eq!(stack.raws(), 1);
+        let nowhere = Ipv4Address::UNSPECIFIED;
+        let packet = made(nowhere, THEIR_IP, 17, 7, b"\x9c\x40\x1b\x58\x00\x0c\x00\x00data");
+        assert_eq!(stack.request(&message(OP_PACKET, 5, &packet)), Ok(true));
+        // And one of another protocol, which Linux lets the same socket
+        // send when it writes the header.
+        let other = made(OUR_IP, THEIR_IP, 89, 1, b"hello, routers");
+        assert_eq!(stack.request(&message(OP_PACKET, 5, &other)), Ok(true));
+        assert!(poll(&mut stack).is_empty());
+        let turn = turn(stack.device());
+        assert_eq!(turn.len(), 2);
+        let sent: Vec<Vec<u8>> = turn.iter().map(|m| ipv4_of(&window.sent(m))).collect();
+        for (sent, (protocol, hops, body)) in sent.iter().zip([
+            (IpProtocol::Udp, 7, &packet[IP_HEADER..]),
+            (IpProtocol::from(89), 1, &other[IP_HEADER..]),
+        ]) {
+            let ip = Ipv4Packet::new_checked(&sent[..]).unwrap();
+            assert!(ip.verify_checksum());
+            assert_eq!(ip.protocol(), protocol);
+            assert_eq!((ip.src_addr(), ip.dst_addr()), (OUR_IP, THEIR_IP));
+            assert_eq!(ip.hop_limit(), hops);
+            assert_eq!(ip.payload(), body);
+        }
+    }
+
+    #[test]
+    fn what_arrives_of_a_raw_sockets_protocol_is_told_whole_and_still_delivered() {
+        let (mut stack, window) = stack();
+        assert_eq!(stack.request(&bind(4, 7000)), Ok(false));
+        assert_eq!(stack.request(&raw_open(5, 17)), Ok(false));
+        assert_eq!(stack.request(&raw_open(6, 17)), Ok(false));
+        // A socket of the protocol no packet is of hears nothing.
+        assert_eq!(stack.request(&raw_open(7, 255)), Ok(false));
+        window.deliver(stack.device(), 0, &udp_frame(4000, 7000, b"hello"));
+        let got = poll(&mut stack);
+        // The datagram for its socket, and the packet once for whichever
+        // raw sockets: socket 0, from THEIRS, no port.
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], told(4, 4000, b"hello"));
+        assert_eq!((got[1].0, got[1].1, got[1].2), (HEARD, THEIR_IP.0, 0));
+        let ip = Ipv4Packet::new_checked(&got[1].3[..]).unwrap();
+        assert_eq!(ip.protocol(), IpProtocol::Udp);
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (THEIR_IP, OUR_IP));
+        let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (4000, 7000));
+        assert_eq!(udp.payload(), b"hello");
+        // What is heard of ICMP is not theirs: nobody said `HEAR`.
+        window.deliver(stack.device(), 1, &echo_reply(7, 1, b"pong"));
+        assert!(poll(&mut stack).is_empty());
+        // While one speaks the protocol it is heard; after the last, not.
+        assert_eq!(stack.request(&message(OP_CLOSE, 5, &[])), Ok(false));
+        window.deliver(stack.device(), 2, &udp_frame(4000, 7000, b"again"));
+        assert_eq!(poll(&mut stack).len(), 2);
+        assert_eq!(stack.request(&message(OP_CLOSE, 6, &[])), Ok(false));
+        assert_eq!(stack.request(&message(OP_CLOSE, 7, &[])), Ok(false));
+        assert_eq!(stack.raws(), 0);
+        window.deliver(stack.device(), 3, &udp_frame(4000, 7000, b"last"));
+        assert_eq!(poll(&mut stack), [told(4, 4000, b"last")]);
+    }
+
+    #[test]
+    fn a_raw_packet_that_cannot_go_is_refused() {
+        let (mut stack, _window) = stack();
+        let packet = made(OUR_IP, THEIR_IP, 17, 64, b"12345678");
+        // Not a raw socket: none, and one of another kind.
+        assert_eq!(
+            stack.request(&message(OP_PACKET, 5, &packet)),
+            Err(Refused::NoSocket)
+        );
+        assert_eq!(stack.request(&bind(4, 7000)), Ok(false));
+        assert_eq!(
+            stack.request(&message(OP_PACKET, 4, &packet)),
+            Err(Refused::NoSocket)
+        );
+        // ICMP has its own bargain, a socket is one thing, and socket 0
+        // is not a socket.
+        assert_eq!(stack.request(&raw_open(5, 1)), Err(Refused::Malformed));
+        assert_eq!(stack.request(&raw_open(4, 17)), Err(Refused::Bind));
+        assert_eq!(stack.request(&raw_open(HEARD, 17)), Err(Refused::Bind));
+        assert_eq!(stack.request(&raw_open(5, 17)), Ok(false));
+        assert_eq!(stack.request(&raw_open(5, 6)), Err(Refused::Bind));
+        assert_eq!(
+            stack.request(&message(OP_RAW, 6, &[17])),
+            Err(Refused::Malformed)
+        );
+        let refused = |stack: &mut Stack<crate::port::Port>, packet: &[u8]| {
+            stack.request(&message(OP_PACKET, 5, packet)).unwrap_err()
+        };
+        // Not a packet: cut short, of IPv6, longer or shorter than it says,
+        // with no hops to travel.
+        assert_eq!(refused(&mut stack, &packet[..19]), Refused::Malformed);
+        let mut six = packet.clone();
+        six[0] = 0x65;
+        assert_eq!(refused(&mut stack, &six), Refused::Malformed);
+        let mut long = packet.clone();
+        long.push(0);
+        assert_eq!(refused(&mut stack, &long), Refused::Malformed);
+        assert_eq!(refused(&mut stack, &packet[..27]), Refused::Malformed);
+        let spent = made(OUR_IP, THEIR_IP, 17, 0, b"12345678");
+        assert_eq!(refused(&mut stack, &spent), Refused::Malformed);
+        // More than a frame carries.
+        let room = stack.max_datagram() + 8;
+        let fits = made(OUR_IP, THEIR_IP, 17, 64, &vec![0; room]);
+        assert_eq!(stack.request(&message(OP_PACKET, 5, &fits)), Ok(true));
+        let over = made(OUR_IP, THEIR_IP, 17, 64, &vec![0; room + 1]);
+        assert_eq!(refused(&mut stack, &over), Refused::TooLong);
+        // Somewhere no way leads.
+        let far = made(OUR_IP, Ipv4Address([192, 0, 2, 1]), 17, 64, b"12345678");
+        assert_eq!(refused(&mut stack, &far), Refused::Unreachable);
+        // More protocols than one socket sends.
+        for protocol in 100..103 {
+            let packet = made(OUR_IP, THEIR_IP, protocol, 64, b"x");
+            assert_eq!(stack.request(&message(OP_PACKET, 5, &packet)), Ok(true));
+        }
+        let fifth = made(OUR_IP, THEIR_IP, 103, 64, b"x");
+        assert_eq!(refused(&mut stack, &fifth), Refused::Full);
     }
 }

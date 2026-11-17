@@ -555,6 +555,23 @@ impl Syscall<'_> {
             (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
                 Arc::new(IcmpSocketState::new(true)?)
             }
+            // And for its raw sockets of any other protocol of IPv4:
+            // whole packets, which leave by the stack's card and are
+            // heard off it.
+            (Domain::AF_INET, SocketType::SOCK_RAW, _)
+                if self.linux_process().uses_user_netstack() =>
+            {
+                use linux_object::net::user_stack;
+                // `inet_create`: a raw socket is of a protocol.
+                let protocol = match (protocol_num & 0xff) as u8 {
+                    0 => return Err(LxError::EPROTONOSUPPORT),
+                    protocol => protocol,
+                };
+                Arc::new(user_stack::ServedRawSocket::new(
+                    user_stack::machine(),
+                    protocol,
+                )?)
+            }
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)

@@ -212,7 +212,11 @@ impl From<Endpoint> for SockAddr {
         } else if let Endpoint::LinkLevel(link_level) = endpoint {
             let mut sll_addr = [0u8; 8];
             sll_addr.copy_from_slice(&link_level.addr);
-            let hatype = if link_level.interface_index == 1 {
+            // What carries a hardware address is not the loopback,
+            // whatever its index: on a machine whose card is listed
+            // first, every frame `arping` read off `eth0` said it came by
+            // a loopback, and it counted no answer.
+            let hatype = if link_level.halen == 0 && link_level.interface_index == 1 {
                 ARPHRD_LOOPBACK
             } else {
                 ARPHRD_ETHER
@@ -910,5 +914,12 @@ mod sockaddr_tests {
         assert_eq!(unsafe { lo.addr_ll.sll_hatype }, ARPHRD_LOOPBACK);
         let eth = SockAddr::from(Endpoint::LinkLevel(LinkLevelEndpoint::new(2)));
         assert_eq!(unsafe { eth.addr_ll.sll_hatype }, ARPHRD_ETHER);
+        // A frame that says which card sent it came by a card, also on
+        // a machine that lists its card first.
+        let mut first = LinkLevelEndpoint::new(1);
+        first.addr[..6].copy_from_slice(&[0x52, 0x55, 0x0a, 0, 2, 2]);
+        first.halen = 6;
+        let first = SockAddr::from(Endpoint::LinkLevel(first));
+        assert_eq!(unsafe { first.addr_ll.sll_hatype }, ARPHRD_ETHER);
     }
 }

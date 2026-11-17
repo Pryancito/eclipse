@@ -119,6 +119,7 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         // FreeBSD shell turns into "Exec format error".
         LxError::ELIBBAD => bsd::ENOEXEC,
         LxError::ENOTSOCK => bsd::ENOTSOCK,
+        LxError::EDESTADDRREQ => bsd::EDESTADDRREQ,
         LxError::EMSGSIZE => bsd::EMSGSIZE,
         LxError::ENOPROTOOPT => bsd::ENOPROTOOPT,
         LxError::EPROTONOSUPPORT => bsd::EPROTONOSUPPORT,
@@ -221,6 +222,7 @@ mod tests {
         LxError::EADDRNOTAVAIL,
         LxError::ENETDOWN,
         LxError::ENETUNREACH,
+        LxError::EDESTADDRREQ,
         LxError::EMSGSIZE,
         LxError::EALREADY,
         LxError::ENOKEY,
