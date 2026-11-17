@@ -53,6 +53,7 @@ pub struct Status(pub i32);
 impl Status {
     pub const INTERNAL_INTR_RETRY: Status = Status(-6);
     pub const NOT_SUPPORTED: Status = Status(-2);
+    pub const NO_MEMORY: Status = Status(-4);
     pub const INVALID_ARGS: Status = Status(-10);
     pub const OUT_OF_RANGE: Status = Status(-14);
     pub const TIMED_OUT: Status = Status(-21);
@@ -60,6 +61,7 @@ impl Status {
     pub const PEER_CLOSED: Status = Status(-24);
     pub const NOT_FOUND: Status = Status(-25);
     pub const ALREADY_BOUND: Status = Status(-27);
+    pub const ACCESS_DENIED: Status = Status(-30);
     pub const IO: Status = Status(-40);
     /// Not Zircon's: what Linux answers to a system call it does not have,
     /// which is what the gateway's numbers are when the gateway is off.

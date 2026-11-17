@@ -304,7 +304,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// Whether a datagram for `addr` can be sent as IPv6: to a group, to
     /// a network of the card's, or to anywhere else while there is a
     /// router. As for IPv4, one that cannot go is not queued.
-    pub(super) fn reaches6(&self, addr: Ipv6Address) -> bool {
+    pub fn reaches6(&self, addr: Ipv6Address) -> bool {
         if self.six.ear.is_none() || addr.is_unspecified() || addr.is_loopback() {
             return false;
         }
@@ -312,6 +312,16 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             || self.six.router.is_some()
             || self.iface.ip_addrs().iter().any(|cidr| match cidr {
                 IpCidr::Ipv6(cidr) => cidr.contains_addr(&addr),
+                _ => false,
+            })
+    }
+
+    /// Whether `addr` is on a network of the card's that is not the
+    /// link's own, which every card has: reached with no router between.
+    pub fn on_link6(&self, addr: Ipv6Address) -> bool {
+        self.six.ear.is_some()
+            && self.iface.ip_addrs().iter().any(|cidr| match cidr {
+                IpCidr::Ipv6(cidr) => !cidr.address().is_link_local() && cidr.contains_addr(&addr),
                 _ => false,
             })
     }

@@ -46,7 +46,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::drivers::net::lent::FrameTaker;
@@ -117,6 +117,10 @@ pub(super) trait Card: Send + Sync {
     fn give_back(&self);
 }
 
+/// How many of the kernel's cards are lent now: no more than the boot
+/// lends (`user_stack::boot::may_borrow`).
+static LOANS: AtomicUsize = AtomicUsize::new(0);
+
 /// A card the kernel drives.
 struct KernelCard(Arc<dyn NetScheme>);
 
@@ -143,6 +147,7 @@ impl Card for KernelCard {
             info!("lent card: {name} is the kernel's again");
         }
         kernel_hal::net::wake_net_rx_waiters_now();
+        LOANS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -461,13 +466,25 @@ pub(super) fn net_borrow(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Str
     if !(1..=MAX_RX_SLOTS).contains(&rx_slots) || !(1..=MAX_TX_SLOTS).contains(&tx_slots) {
         return Err(ZxError::OUT_OF_RANGE);
     }
+    // One of the cards the boot lends, and no more of them than it lends:
+    // counted before it is taken, so that two borrowers cannot both have
+    // the last.
+    let loans = LOANS.fetch_add(1, Ordering::AcqRel);
+    let unasked = card.lends_unasked();
+    if !linux_object::net::user_stack::boot::may_borrow(loans, unasked) {
+        LOANS.fetch_sub(1, Ordering::AcqRel);
+        return Err(ZxError::ACCESS_DENIED);
+    }
     // Lent first, to a taker with nobody behind it yet: a card that cannot
     // be lent, or is lent, is left as it is.
     let behind: Arc<lock::Mutex<Weak<LentCard>>> = Arc::new(lock::Mutex::new(Weak::new()));
     card.lend(Some(Arc::new(Taker(behind.clone()))))
-        .map_err(|e| match e {
-            DeviceError::AlreadyExists => ZxError::ALREADY_BOUND,
-            _ => ZxError::NOT_SUPPORTED,
+        .map_err(|e| {
+            LOANS.fetch_sub(1, Ordering::AcqRel);
+            match e {
+                DeviceError::AlreadyExists => ZxError::ALREADY_BOUND,
+                _ => ZxError::NOT_SUPPORTED,
+            }
         })?;
     // From here on dropping `lent` undoes all of it.
     let lent = LentCard::new(

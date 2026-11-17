@@ -651,8 +651,8 @@ pub const ECLIPSE_NETSTACK_USE: u32 = ECLIPSE_GATEWAY_EXT + 10;
 /// While the handle lives the card's driver gives the frames it receives
 /// to this process and not to the kernel's stack, and the card is not
 /// among the kernel's interfaces; closing it, or dying, gives the card
-/// back. `ACCESS_DENIED` unless it is the card the boot lends (the first,
-/// on a machine with no virtio card: `linux_object::net::user_stack::boot::lends`),
+/// back. `ACCESS_DENIED` unless it is a card the boot lends, and while as
+/// many are lent as it lends (`linux_object::net::user_stack::boot::lends_cards`),
 /// `NOT_FOUND` when the kernel has no such card, `NOT_SUPPORTED` when its
 /// driver cannot lend it, `ALREADY_BOUND` when it is lent.
 #[cfg(feature = "zircon-gateway")]
@@ -1046,19 +1046,21 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             proc.linux().use_user_netstack();
             0
         }
-        // Only the card the boot lends (`user_stack::boot::lends`): a boot
-        // that lends none keeps its cards for the kernel's stack whoever
-        // asks.
-        ECLIPSE_NET_BORROW
-            if args[0] != 0 || linux_object::net::user_stack::boot::lent().is_none() =>
-        {
+        // Only the cards the boot lends (`user_stack::boot::lends_cards`,
+        // which `net_borrow` counts): a boot that lends none keeps its
+        // cards for the kernel's stack whoever asks.
+        ECLIPSE_NET_BORROW if !linux_object::net::user_stack::boot::lends_some() => {
             status(ZxError::ACCESS_DENIED)
         }
         ECLIPSE_NET_BORROW => match net_lend::net_borrow(proc, args) {
             Ok(name) => {
-                // The card the stack shows as its own is this one, under
-                // the name it had: what the machine's settings call it.
-                STACK_CARD_NAME.lock().get_or_insert(name);
+                // The card the stack shows as its own is the first it
+                // borrows, under the name it had: what the machine's
+                // settings call it. A stack with a card of its own shows
+                // that one, and borrows the kernel's besides.
+                if linux_object::net::user_stack::boot::lent().is_some() {
+                    STACK_CARD_NAME.lock().get_or_insert(name);
+                }
                 0
             }
             Err(e) => status(e),

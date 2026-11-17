@@ -23,8 +23,8 @@
 //! each way.
 //!
 //! With `card=kernel` the card is not a virtio one of this process's but
-//! card `N` of the ones the kernel drives, the loopback not counted, which
-//! the kernel lends (`udrivers::lent`): its driver stays in the kernel and
+//! card `N` of the ones the kernel drives, the loopback not counted, or
+//! the first after it that the kernel lends (`udrivers::lent`): its driver stays in the kernel and
 //! gives this process the frames. Until this stack has drivers of its own
 //! for such cards, that is how it is the network of a machine that has
 //! one. The loan ends with this process, and the card is the kernel's
@@ -42,6 +42,14 @@
 //! (`eclipse_netstack_serve`; `netstack::socks` has what the two say to
 //! each other). On a kernel that has no such call it answers for its
 //! address and nothing else.
+//!
+//! The kernel's other cards are this stack's too, whichever card it
+//! started with: every one the boot lends is borrowed at the start, and
+//! each has a stack of its own here, with its settings' address or a
+//! lease's, a thread for its frames and one for its time. The kernel
+//! still speaks to one stack and is told one card, the first that has an
+//! address, and what it says goes to the stack of the card it is for
+//! (`netstack::cards`).
 //!
 //! Three threads share the stack, under one lock. The card's sleeps on
 //! the card's interrupt (or on the driver's FIFO), takes what the card
@@ -84,6 +92,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use netstack::cards;
 use netstack::counts::{Counts, Teller};
 use netstack::governed;
 use netstack::port::Port;
@@ -393,6 +402,41 @@ fn borrow(index: usize) -> Result<(Link, Port), String> {
         NoCard::NoGateway => "the gateway is off (zircon.gateway=0 on the command line?)".into(),
         NoCard::Other(e) => e,
     })?;
+    lent_link(lent)
+}
+
+/// How far the kernel's cards are looked through for one to borrow: more
+/// than a machine has.
+const KERNEL_CARDS: usize = 32;
+
+/// Borrow every card the kernel lends from its card `from` on, `most` at
+/// most: the links and the ports, in the kernel's order. A card that is
+/// borrowed leaves the kernel's count, so the next is looked for in the
+/// same place; one that is not to be had is passed over.
+fn borrow_all(from: usize, most: usize) -> Vec<(Link, Port)> {
+    let mut all = Vec::new();
+    let mut index = from;
+    while all.len() < most && index < KERNEL_CARDS {
+        match Lent::try_borrow(index, net::RX_BUFS, net::TX_BUFS) {
+            Ok(lent) => match lent_link(lent) {
+                Ok(link) => all.push(link),
+                Err(why) => {
+                    println!("{NAME}: {why}");
+                    break;
+                }
+            },
+            Err(Status::ACCESS_DENIED | Status::NOT_SUPPORTED | Status::ALREADY_BOUND) => {
+                index += 1
+            }
+            // No such card, or no kernel that lends.
+            Err(_) => break,
+        }
+    }
+    all
+}
+
+/// The link to a card that was borrowed, and the port for the stack.
+fn lent_link(lent: Lent) -> Result<(Link, Port), String> {
     // SAFETY: the loan's window, which lasts as long as the loan does;
     // the kernel, during this process's own calls, and this port are all
     // that read or write it, a slot at a time as the messages say whose it
@@ -502,6 +546,8 @@ struct Shared {
 /// What every thread has: the stack, and the kernel once it has sockets
 /// here.
 struct Host {
+    /// Its place among the hosts ([`hosts`]).
+    slot: usize,
     index: usize,
     /// Whether the card is one the kernel drives and lends (`card=kernel`).
     kernels: bool,
@@ -533,6 +579,33 @@ struct Host {
     /// The thread that keeps time, once it runs: woken to tell the
     /// kernel what a turn carried too soon after the last telling.
     clock: OnceLock<Thread>,
+}
+
+/// Every card's host, in the order the stacks were made: the first is
+/// the card the command line names. Set once, before any thread but the
+/// first runs.
+static HOSTS: OnceLock<Vec<Arc<Host>>> = OnceLock::new();
+/// The place of the host whose card the kernel was told, once it was:
+/// the first that had an address.
+static SHOWN: OnceLock<usize> = OnceLock::new();
+/// When the hosts were made, and how long from then the first card has
+/// to get an address before another is the one the kernel is told: about
+/// what a DHCP server takes to answer.
+static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+const HEAD_START: Duration = Duration::from_secs(3);
+/// Held to decide which host that is.
+static TELLING: Mutex<()> = Mutex::new(());
+
+fn hosts() -> &'static [Arc<Host>] {
+    HOSTS.get().map_or(&[], |hosts| hosts.as_slice())
+}
+
+impl Host {
+    /// Whether this host's card is the one the kernel shows: what it is
+    /// told of a card (its counts, its IPv6 addresses) is that card's.
+    fn shown(&self) -> bool {
+        SHOWN.get() == Some(&self.slot)
+    }
 }
 
 /// A lock, whatever became of the thread that had it last: the process
@@ -583,7 +656,7 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
     let Some(kernel) = host.kernel.get() else {
         return false;
     };
-    if core::mem::take(&mut shared.six_owed) {
+    if host.shown() && core::mem::take(&mut shared.six_owed) {
         // A message of its own, as rare as an address changes. A kernel
         // that is gone took the machine with it.
         let _ = kernel.channel.write(&shared.stack.sixes().message(), &[]);
@@ -615,7 +688,7 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
 /// (`netstack::counts`). A message of its own, a few times a second at
 /// most: it wakes the kernel's task and no program.
 fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
-    let Some(kernel) = host.kernel.get() else {
+    let Some(kernel) = host.kernel.get().filter(|_| host.shown()) else {
         return;
     };
     let told = {
@@ -641,7 +714,7 @@ fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
 /// How long until the kernel is to be told what the card has carried,
 /// when it has a kernel to tell and something to tell it.
 fn counts_due_in(host: &Host, counts: &Counts) -> Option<Duration> {
-    host.kernel.get()?;
+    host.kernel.get().filter(|_| host.shown())?;
     let due = locked(&host.teller).due_in(counts, now())?;
     Some(Duration::from_micros(due.total_micros()))
 }
@@ -901,7 +974,9 @@ const BURST: usize = 16;
 /// with nothing to reply), one for each that is already waiting behind it
 /// and one that finds no more, and then one to tell the driver of all the
 /// frames they made.
-fn serve_sockets(host: Arc<Host>, kernel: Arc<Kernel>) {
+fn serve_sockets(kernel: Arc<Kernel>) {
+    let hosts = hosts();
+    let shown = SHOWN.get().copied().unwrap_or(0);
     let mut message = vec![0u8; MESSAGE_MAX];
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
@@ -914,15 +989,29 @@ fn serve_sockets(host: Arc<Host>, kernel: Arc<Kernel>) {
                 return;
             }
         };
-        let (mut sends, mut answers) = (false, false);
+        // A bit for each host: its stack has something to send, and a
+        // program had something to say there.
+        let (mut sends, mut answers) = (0u32, 0u32);
         for done in 1.. {
-            match locked(&host.shared).stack.request(&message[..len]) {
+            let said = &message[..len];
+            let asked = match hosts {
+                [host] => locked(&host.shared).stack.request(said).map(u32::from),
+                // Each card's stack, all held while the message finds
+                // the ones it is for.
+                hosts => {
+                    let mut held: Vec<_> = hosts.iter().map(|host| locked(&host.shared)).collect();
+                    let mut stacks: Vec<_> = held.iter_mut().map(|held| &mut held.stack).collect();
+                    cards::request(&mut stacks, shown, said)
+                }
+            };
+            match asked {
                 Ok(send) => {
                     sends |= send;
                     // A program with something to say, which is what the
                     // card's thread waits for ([`HOLD`]).
-                    answers |=
-                        matches!(parse_header(&message[..len]), Some((OP_WRITE | OP_SEND, _)));
+                    if matches!(parse_header(said), Some((OP_WRITE | OP_SEND, _))) {
+                        answers |= send;
+                    }
                 }
                 // A datagram that cannot go is dropped, as on any network;
                 // anything else the kernel does not send.
@@ -940,11 +1029,14 @@ fn serve_sockets(host: Arc<Host>, kernel: Arc<Kernel>) {
                 _ => break,
             }
         }
-        if sends {
+        for (slot, host) in hosts.iter().enumerate() {
+            if sends & 1 << slot == 0 {
+                continue;
+            }
             let mut guard = locked(&host.shared);
-            guard.answering |= answers;
-            turn(&host, guard, &mut data);
-            tell_driver(&host, &mut msgs, &mut data);
+            guard.answering |= answers & 1 << slot != 0;
+            turn(host, guard, &mut data);
+            tell_driver(host, &mut msgs, &mut data);
         }
     }
 }
@@ -1038,9 +1130,11 @@ impl Card {
     }
 }
 
-/// Give the kernel its sockets on this stack, whose card is `card`: once,
-/// since the kernel is told the card with them. A second address or
-/// gateway is the end of this process.
+/// Give the kernel its sockets on the stacks of this process, now that
+/// this host's card has an address: once, by the first card that has one,
+/// since the kernel is told that card with them. A second address or
+/// gateway for that card is the end of this process; another card's is
+/// that card's own business.
 fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address>) {
     let card = Card {
         mac: host.mac,
@@ -1051,7 +1145,7 @@ fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address
     match *told {
         None => {}
         Some(was) if was == card => return,
-        Some(was) => {
+        Some(was) if host.shown() => {
             println!(
                 "{NAME}: the address is {address}{} now and the kernel was told {}{}: starting over",
                 through(gateway),
@@ -1060,14 +1154,31 @@ fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address
             );
             exit(3);
         }
+        Some(_) => {}
     }
     *told = Some(card);
+    drop(told);
+    // The first card is the one to show when it has a cable: another
+    // that has its address sooner gives it a moment.
+    while host.slot != 0
+        && SHOWN.get().is_none()
+        && STARTED.get().is_some_and(|at| at.elapsed() < HEAD_START)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let telling = locked(&TELLING);
+    if SHOWN.set(host.slot).is_err() {
+        // Another card is the one the kernel shows.
+        return;
+    }
     let max_datagram = locked(&host.shared).stack.max_datagram();
     match register(max_datagram, card) {
         Ok(kernel) => {
-            let _ = host.kernel.set(kernel.clone());
-            let host = host.clone();
-            std::thread::spawn(move || serve_sockets(host, kernel));
+            for host in hosts() {
+                let _ = host.kernel.set(kernel.clone());
+            }
+            drop(telling);
+            std::thread::spawn(move || serve_sockets(kernel));
         }
         Err(why) => println!("{NAME}: no sockets, only the address: {why}"),
     }
@@ -1180,7 +1291,13 @@ fn main() {
         exit(2);
     };
 
-    let taken = if kernels {
+    // The kernel's cards: the one asked for is the first it lends from
+    // there on, and the rest are this stack's too, whatever its own is.
+    let mut lent = borrow_all(if kernels { index } else { 0 }, cards::MAX);
+    let taken = if kernels && !lent.is_empty() {
+        Ok(lent.remove(0))
+    } else if kernels {
+        // For what the kernel says of it.
         borrow(index)
     } else if intel {
         take_e1000e(index)
@@ -1190,86 +1307,67 @@ fn main() {
         take(index)
     };
     let (mut link, port) = taken.unwrap_or_else(|e| die(e));
+    lent.truncate(cards::MAX - 1);
     let mac = link.mac;
-    // The machine's settings for this card, when they say any, and not
-    // the command line.
-    let governed = governed::word(Path::new(governed::DIR), mac);
-    let how = match governed.as_deref().map(Addressing::parse) {
-        None => how,
-        Some(Some(theirs)) => theirs,
-        Some(None) => {
-            println!(
-                "{NAME}: {} says {:?}, which is no address: the command line's stands",
-                governed::path(Path::new(governed::DIR), mac).display(),
-                governed.as_deref().unwrap_or_default()
-            );
-            how
-        }
-    };
-    // No address is what an interface that asks for one starts with.
-    let address = match how {
-        Addressing::Written(address, _) => address,
-        Addressing::Leased => Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
-    };
-    let iface = InterfaceBuilder::new(port)
-        .ethernet_addr(EthernetAddress(mac))
-        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-        .ip_addrs(vec![IpCidr::Ipv4(address)])
-        .routes(Routes::new(BTreeMap::new()))
-        .ipv4_multicast_groups(BTreeMap::new())
-        .ipv6_multicast_groups(BTreeMap::new())
-        .finalize();
-    let mut stack = Stack::new(iface);
-    match how {
-        Addressing::Written(_, gateway) => {
-            stack.set_gateway(gateway);
-        }
-        Addressing::Leased => stack.ask_for_lease(),
+    let (host, how) = raise(0, index, (kernels, intel, apart), &link, port, how);
+    let mut all = vec![(host.clone(), how)];
+    // The borrowed ones ask for an address unless the machine's settings
+    // have one for them. They are kept in their hosts for as long as the
+    // process lasts.
+    for (place, (link, port)) in lent.into_iter().enumerate() {
+        let index = index * kernels as usize + kernels as usize + place;
+        let (other, how) = raise(
+            place + 1,
+            index,
+            (true, false, false),
+            &link,
+            port,
+            Addressing::Leased,
+        );
+        all.push((other, how));
     }
-    stack.speak_six();
-    let host = Arc::new(Host {
-        index,
-        kernels,
-        intel,
-        mac,
-        governed,
-        shared: Mutex::new(Shared {
-            stack,
-            wire: link.wire.clone(),
-            answering: false,
-            six_owed: false,
-        }),
-        kernel: OnceLock::new(),
-        told: Mutex::new(None),
-        named: Mutex::new(Named::default()),
-        driver_pid: AtomicU32::new(match &link.taker {
-            Taker::Driver { driver, .. } => driver.id(),
-            Taker::Own(_) | Taker::E1000e(_) | Taker::Kernel => 0,
-        }),
-        driver_starts: AtomicU32::new(apart as u32),
-        teller: Mutex::new(Teller::default()),
-        clock: OnceLock::new(),
-    });
-    let card = format!(
-        "{}card {index} ({})",
-        if kernels { "the kernel's " } else { "" },
-        EthernetAddress(mac)
-    );
-    match how {
-        Addressing::Written(address, gateway) => {
-            serve_kernel(&host, address, gateway);
-            println!(
-                "{NAME}: {card} is {address}{}{}",
-                through(gateway),
-                with_sockets(&host)
-            );
+    let _ = STARTED.set(std::time::Instant::now());
+    let _ = HOSTS.set(all.iter().map(|(host, _)| host.clone()).collect());
+    for (host, how) in &all {
+        let card = format!(
+            "{}card {} ({})",
+            if host.kernels { "the kernel's " } else { "" },
+            host.index,
+            EthernetAddress(host.mac)
+        );
+        match *how {
+            Addressing::Written(address, gateway) => {
+                serve_kernel(host, address, gateway);
+                println!(
+                    "{NAME}: {card} is {address}{}{}",
+                    through(gateway),
+                    with_sockets(host)
+                );
+            }
+            // The clock's thread finds the first question due at once.
+            Addressing::Leased => println!("{NAME}: {card} asks for its address"),
         }
-        // The clock's thread finds the first question due at once.
-        Addressing::Leased => println!("{NAME}: {card} asks for its address"),
     }
-    {
+    for (host, _) in &all {
         let host = host.clone();
         std::thread::spawn(move || keep_time(host));
+    }
+    // A thread for the frames of each card that is not the first, which
+    // has this one.
+    for (other, _) in &all[1..] {
+        let other = other.clone();
+        std::thread::spawn(move || {
+            publish(&other);
+            let wire = locked(&other.shared).wire.clone();
+            let Wire::Kernel(card) = wire else {
+                unreachable!("a borrowed card's wire is the loan");
+            };
+            let why = serve_lent(&other, &card);
+            die(format_args!(
+                "the kernel's card {} is gone ({why})",
+                other.index
+            ));
+        });
     }
 
     let mut pause = Duration::from_millis(100);
@@ -1341,6 +1439,85 @@ fn main() {
         }
         host.driver_starts.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The host of a card: a stack over `port` for the card of `link`, in
+/// place `slot`, with the address the machine's settings give the card
+/// or else `how`. `whose` is whether the card is the kernel's and lent,
+/// an e1000e of this process's, and a driver process's. The host, and
+/// where its address comes from.
+fn raise(
+    slot: usize,
+    index: usize,
+    whose: (bool, bool, bool),
+    link: &Link,
+    port: Port,
+    how: Addressing,
+) -> (Arc<Host>, Addressing) {
+    let (kernels, intel, apart) = whose;
+    let mac = link.mac;
+    // The machine's settings for this card, when they say any, and not
+    // the command line.
+    let governed = governed::word(Path::new(governed::DIR), mac);
+    let how = match governed.as_deref().map(Addressing::parse) {
+        None => how,
+        Some(Some(theirs)) => theirs,
+        Some(None) => {
+            println!(
+                "{NAME}: {} says {:?}, which is no address: the command line's stands",
+                governed::path(Path::new(governed::DIR), mac).display(),
+                governed.as_deref().unwrap_or_default()
+            );
+            how
+        }
+    };
+    // No address is what an interface that asks for one starts with.
+    let address = match how {
+        Addressing::Written(address, _) => address,
+        Addressing::Leased => Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+    };
+    let iface = InterfaceBuilder::new(port)
+        .ethernet_addr(EthernetAddress(mac))
+        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+        .ip_addrs(vec![IpCidr::Ipv4(address)])
+        .routes(Routes::new(BTreeMap::new()))
+        .ipv4_multicast_groups(BTreeMap::new())
+        .ipv6_multicast_groups(BTreeMap::new())
+        .finalize();
+    let mut stack = Stack::new(iface);
+    stack.number_from(cards::numbers_of(slot));
+    match how {
+        Addressing::Written(_, gateway) => {
+            stack.set_gateway(gateway);
+        }
+        Addressing::Leased => stack.ask_for_lease(),
+    }
+    stack.speak_six();
+    let host = Arc::new(Host {
+        slot,
+        index,
+        kernels,
+        intel,
+        mac,
+        governed,
+        shared: Mutex::new(Shared {
+            stack,
+            wire: link.wire.clone(),
+            answering: false,
+            six_owed: false,
+        }),
+        kernel: OnceLock::new(),
+        told: Mutex::new(None),
+        named: Mutex::new(Named::default()),
+        driver_pid: AtomicU32::new(match &link.taker {
+            Taker::Driver { driver, .. } => driver.id(),
+            Taker::Own(_) | Taker::E1000e(_) | Taker::Kernel => 0,
+        }),
+        driver_starts: AtomicU32::new(apart as u32),
+        teller: Mutex::new(Teller::default()),
+        clock: OnceLock::new(),
+    });
+    (host, how)
 }
 
 /// Say what this stack is (see `udrivers::status`): the card, its address

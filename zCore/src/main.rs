@@ -795,23 +795,43 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             kernel_hal::cmdline::value(&options.cmdline, "unetlend"),
             interrupts,
         );
-        let lendable = cards
-            .peek()
-            .is_some_and(|first| first.can_lend() && (any || first.lends_unasked()));
-        (cards.count(), lendable)
+        // The first, which the stack process starts with when it has no
+        // card of its own, and how many in all, which it takes too.
+        let lends = |card: &&alloc::sync::Arc<dyn kernel_hal::drivers::scheme::NetScheme>| {
+            card.can_lend() && (any || card.lends_unasked())
+        };
+        let first = cards.peek().is_some_and(lends);
+        let (mut count, mut lendable) = (0, 0);
+        for card in cards {
+            count += 1;
+            lendable += lends(&card) as usize;
+        }
+        (count, (first, lendable, any))
     };
     #[cfg(feature = "linux")]
     let lent = {
         use linux_object::net::user_stack::boot;
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
-        let lent = boot::lends(
-            word("unetstack"),
-            boot::has_card(&left_to_userspace),
-            lendable,
-        );
+        let (first, lendable, any) = lendable;
+        let card = boot::has_card(&left_to_userspace);
+        // A stack process whose first card is the kernel's first has the
+        // `knet` service for it; with any other first card the kernel's
+        // are taken by the stack process that card's service starts.
+        let lent = boot::lends(word("unetstack"), card, first);
+        // All of them or the first alone: a card the kernel cannot lend
+        // keeps its stack for the programs that do not ask, and that
+        // stack keeps every card but the stack process's first.
+        let lendable = match (card || lent, lendable == kernel_cards) {
+            (true, true) => lendable,
+            _ => lent as usize,
+        };
+        let cards = boot::lends_cards(word("unetstack"), word("unetuse"), card, lendable);
         boot::set_lent(lent);
-        lent
+        boot::set_lends(cards, any);
+        (lent, cards)
     };
+    #[cfg(feature = "linux")]
+    let (lent, lent_cards) = lent;
     #[cfg(feature = "linux")]
     if (lent || !left_to_userspace.is_empty())
         && !kernel_hal::cmdline::is_off(&options.cmdline, "zircon.gateway")
@@ -867,12 +887,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "the driver of the kernel's first card cannot lend it"
                 }
             );
-        } else if lent {
+        } else if lent && lent_cards == 1 {
             klog_info!(
                 "Eclipse: the kernel lends its first card to the stack process (unetstack=kernel keeps it for the kernel's stack)"
             );
+        } else if lent_cards != 0 {
+            klog_info!(
+                "Eclipse: the kernel lends {} of its {} card(s) to the stack process (unetstack=kernel keeps them for the kernel's stack)",
+                lent_cards,
+                kernel_cards
+            );
         }
-        let whose = boot::whose(card, lent, word("unetstack"), unetuse, kernel_cards);
+        let whose = boot::whose(card, lent_cards, word("unetstack"), unetuse, kernel_cards);
         user_stack::use_for_all(whose.all());
         // No socket of this boot is the kernel's stack's: `lo` has nothing
         // to carry, and is only shown.
