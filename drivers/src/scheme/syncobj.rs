@@ -923,12 +923,16 @@ fn resolve_hw_locked(
             .find(|o| o.handle == f.handle)
             .is_some_and(|o| f.point > o.point && node_below_waiting(table, o, f.point));
         if held {
+            if landed {
+                late_fence_report(table, &f, now, true);
+            }
             i += 1;
             continue;
         }
         any = true;
         table.pending.swap_remove(i);
         if landed {
+            late_fence_report(table, &f, now, false);
             let lat = now.wrapping_sub(f.submitted_us);
             FENCES_LANDED.fetch_add(1, Ordering::Relaxed);
             FENCE_LATENCY_US.fetch_add(lat, Ordering::Relaxed);
@@ -2437,6 +2441,72 @@ fn wait_inner(
             core::hint::spin_loop();
         }
     }
+}
+
+/// A hardware fence older than this when it lands (or when it is found
+/// landed but held behind a lower node of its chain) is worth a line: a
+/// frame's fence lands in well under a millisecond.
+const LATE_FENCE_US: u64 = 1_000_000;
+
+/// One console line for a hardware fence that took more than
+/// [`LATE_FENCE_US`] from submit to land, or that has landed and is still
+/// held behind a lower node of its chain (a link or an older fence of the
+/// same handle). `/proc/gpudbg` only shows the maximum latency; this says
+/// which handle, which ring and, when held, what it is held behind. Budgeted
+/// per boot like [`stall_report`]; a held fence is reported once.
+fn late_fence_report(table: &SyncobjTable, f: &PendingFence, now: u64, held: bool) {
+    let age = now.wrapping_sub(f.submitted_us);
+    if age < LATE_FENCE_US {
+        return;
+    }
+    // A held fence is looked at on every resolve until it is released:
+    // report it once, by the last (handle, point) reported.
+    static LAST_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let key = (u64::from(f.handle) << 32) | (f.point & 0xffff_ffff);
+    if held && LAST_HELD.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    static BUDGET: AtomicU32 = AtomicU32::new(0);
+    let Some(n) = stall_report_number(&BUDGET) else {
+        return;
+    };
+    let (cur, links) = match table.objects.iter().find(|o| o.handle == f.handle) {
+        Some(o) => {
+            let mut links = alloc::string::String::new();
+            for l in o.links.iter().take(4) {
+                use core::fmt::Write;
+                let _ = write!(links, " link->{} deps=[", l.dst_point);
+                for &(src, target) in l.deps.iter().take(4) {
+                    let src_cur = effective_point(table, src, 0)
+                        .map(|p| p as i64)
+                        .unwrap_or(-1);
+                    let _ = write!(links, "{}:{}/{} ", src, target, src_cur);
+                }
+                links.push(']');
+            }
+            (o.point as i64, links)
+        }
+        None => (-1, alloc::string::String::new()),
+    };
+    let older = table
+        .pending
+        .iter()
+        .filter(|g| g.handle == f.handle && g.point < f.point)
+        .count();
+    crate::klog_warn!(
+        "[syncobj] hw fence {} after {} ms: handle {} point {} (now at {}) ctx {} payload {}; older fences of the handle in flight={}{} (report {}/{} this boot)",
+        if held { "landed but HELD" } else { "landed" },
+        age / 1_000,
+        f.handle,
+        f.point,
+        cur,
+        f.ctx_idx,
+        f.payload,
+        older,
+        links,
+        n + 1,
+        MAX_STALL_REPORTS
+    );
 }
 
 /// One console line for a wait parked past 2 s: every handle with its target
