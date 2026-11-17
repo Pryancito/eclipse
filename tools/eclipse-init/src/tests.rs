@@ -970,9 +970,9 @@ fn a_log_is_rotated_once_it_outgrows_the_cap_and_the_writers_fd_survives() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Two services can name the same `log =` -- `boot-sound` and
-/// `boot-sound-xorg` both write `/tmp/boot-sound.log` -- and rotating it
-/// twice in one sweep would throw away the generation just kept.
+/// Two services can name the same `log =` -- the chime shipped as two rows
+/// that both wrote `/tmp/boot-sound.log` -- and rotating it twice in one
+/// sweep would throw away the generation just kept.
 #[test]
 fn a_log_two_services_share_is_rotated_once_per_sweep() {
     let dir = scratch("log-shared");
@@ -980,7 +980,7 @@ fn a_log_two_services_share_is_rotated_once_per_sweep() {
     fs::write(&path, vec![b'y'; MAX_LOG_BYTES as usize]).unwrap();
 
     let mut map = BTreeMap::new();
-    for name in ["boot-sound", "boot-sound-xorg"] {
+    for name in ["one", "two"] {
         map.insert(
             name.to_string(),
             parse_service(
@@ -1409,6 +1409,55 @@ fn a_dependency_cycle_still_boots_everything() {
     assert!(order.contains(&"b".to_string()));
     // The one service outside the cycle still gets its turn.
     assert!(order.contains(&"c".to_string()));
+}
+
+/// `after = *`: the end of the boot, whatever else the table holds.
+///
+/// The chime is the service that needs it. Spelled as a list of names it
+/// was `boot-sound`, which sorts near the front, so forgetting one name
+/// moved the one service that marks the end of the boot into the middle
+/// of it with nothing to see.
+#[test]
+fn after_everything_comes_out_last_however_the_table_is_named() {
+    // "zzz" sorts after the chime and has no dependency of its own: name
+    // order alone would put the chime first.
+    let order = order_of(&[
+        ("boot-sound", &["*"]),
+        ("abyss", &["abyss-seatd"]),
+        ("abyss-seatd", &[]),
+        ("zzz", &[]),
+    ]);
+    assert_eq!(
+        order.last().map(String::as_str),
+        Some("boot-sound"),
+        "{order:?}"
+    );
+    assert_eq!(order.len(), 4);
+}
+
+/// Two of them come out together at the end, in name order, instead of
+/// each waiting for the other and both falling out of the sort as a cycle
+/// -- which would have put them in name order ANYWHERE, including before
+/// the services they are supposed to follow.
+#[test]
+fn two_services_ordered_last_do_not_deadlock_each_other() {
+    let order = order_of(&[("b-last", &["*"]), ("a-last", &["*"]), ("work", &[])]);
+    assert_eq!(order, vec!["work", "a-last", "b-last"], "{order:?}");
+}
+
+/// And it is still an ordering, not a cancellation: a service ordered last
+/// starts, and starts after a dependency chain of any depth.
+#[test]
+fn after_everything_follows_a_whole_chain() {
+    let order = order_of(&[("c", &["b"]), ("b", &["a"]), ("a", &[]), ("zz", &["*"])]);
+    assert_eq!(order, vec!["a", "b", "c", "zz"], "{order:?}");
+}
+
+/// A table whose only service is ordered last still starts it: `*` names
+/// no service, so there is nothing for it to wait for.
+#[test]
+fn a_lone_service_ordered_last_still_starts() {
+    assert_eq!(order_of(&[("boot-sound", &["*"])]), vec!["boot-sound"]);
 }
 
 #[test]

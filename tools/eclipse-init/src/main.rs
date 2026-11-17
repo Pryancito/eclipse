@@ -1624,7 +1624,9 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 /// comments and blank lines ignored:
 ///   exec    = /usr/sbin/foo --flag    (required; whitespace-split into argv)
 ///   type    = respawn | oneshot       (default: oneshot)
-///   after   = bar baz                 (optional; space-separated dep names)
+///   after   = bar baz                 (optional; space-separated dep names.
+///                                      `after = *` is every other service:
+///                                      see `AFTER_EVERYTHING`)
 ///   desktop = labwc | xorg            (optional; only start under that session)
 ///   cmdline = dbus.selftest           (optional; only start when the kernel
 ///                                      command line carries this token)
@@ -1757,13 +1759,40 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     })
 }
 
+/// The `after =` entry that names no service: "after everything else".
+///
+/// A service ordered last cannot be written as a list of names -- the list is
+/// the whole table, so every service added later has to be remembered in it,
+/// and the one that is forgotten moves the service that was supposed to be
+/// last to the middle of the boot with nothing to see. `boot-sound` is exactly
+/// that service: the chime says the boot is over, and it said so from
+/// somewhere in the middle (`b` sorts early) unless it listed every session
+/// service by hand.
+///
+/// Only `after =` honours it. A `requires = *` would mean "cannot work without
+/// anything at all", which is not a thing to express, and it reaches `after`
+/// through the `requires` implies `after` rule, where [`ordered_names`] treats
+/// it the same way as if it had been written here.
+const AFTER_EVERYTHING: &str = "*";
+
 /// Produce a start order honouring `after =` dependencies: a service is only
 /// emitted once every dependency it lists has been emitted. Remaining services
 /// (missing deps or dependency cycles) are appended in name order so a bad
 /// `after =` never wedges boot.
+///
+/// `after = *` ([`AFTER_EVERYTHING`]) waits for every service that is not
+/// itself ordered last, so two of them come out together, in name order,
+/// instead of each waiting for the other and both falling out of the sort as a
+/// cycle.
 fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     let mut pending: Vec<String> = services.keys().cloned().collect();
+    let last_of_all = |name: &String| {
+        services[name]
+            .after
+            .iter()
+            .any(|d| d == AFTER_EVERYTHING)
+    };
 
     loop {
         let mut progressed = false;
@@ -1774,7 +1803,14 @@ fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
                 .iter()
                 // A dep that doesn't exist can never be satisfied: ignore it
                 // (treat as already-met) rather than deadlock.
-                .all(|d| !services.contains_key(d) || order.contains(d));
+                .all(|d| {
+                    if d == AFTER_EVERYTHING {
+                        return services
+                            .keys()
+                            .all(|other| *other == name || last_of_all(other) || order.contains(other));
+                    }
+                    !services.contains_key(d) || order.contains(d)
+                });
             if ready {
                 order.push(name);
                 progressed = true;
@@ -3186,9 +3222,9 @@ fn report_log_tail(svc: &mut Service) {
 
 /// Rotate every log the service table names that has outgrown the cap.
 ///
-/// By distinct path, because two services can share one `log =`
-/// (`boot-sound` and `boot-sound-xorg` both write `/tmp/boot-sound.log`) and
-/// rotating it twice would throw away the generation just kept.
+/// By distinct path, because two services can share one `log =` (the chime
+/// shipped as two rows that both wrote `/tmp/boot-sound.log`) and rotating it
+/// twice would throw away the generation just kept.
 fn sweep_logs(services: &BTreeMap<String, Service>) {
     let paths: BTreeSet<&str> = services.values().filter_map(|s| s.log.as_deref()).collect();
     for path in paths {

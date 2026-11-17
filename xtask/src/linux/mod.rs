@@ -1,5 +1,6 @@
 mod abyss;
 mod apt_rootfs;
+mod boot_sound;
 mod btrfs_image;
 mod cuda_probe;
 mod desktop;
@@ -4722,9 +4723,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // installs only for `desktop`. Written into a minimal image it is a row
         // that can never start -- `eclipse-pulseaudio: pulseaudio not
         // installed`, 20 times, 8 seconds apart, 162 seconds of console before
-        // `CRASH_START_LIMIT` gives up on it. The two services that name it
-        // (`boot-sound`, `boot-sound-xorg`) are both `desktop =`-guarded, so
-        // leaving it out here strands no `requires =`.
+        // `CRASH_START_LIMIT` gives up on it. Nothing `requires =` it any
+        // more (the chime is best-effort: see `boot-sound.service` below), so
+        // leaving the row out strands nothing. It also has to stay out of the
+        // RAM-resident live/installer images, which carry `etc` whole from a
+        // desktop rootfs and `usr/bin` from nothing: `LIVE_DROP_SERVICES` in
+        // `image.rs`.
         if has_desktop {
             fs::write(
                 svc_dir.join("pulseaudio.service"),
@@ -4743,34 +4747,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
             let _ = fs::remove_file(svc_dir.join("pulseaudio.service"));
         }
 
-        // Boot chime: play once after the session is up so NVIDIA HDMI audio
-        // (ELD/SET_HDMI_ENABLE) has had a DRM query. Oneshot wrapper forks
-        // mpg123 and exits so init is not blocked for the length of the track.
-        fs::write(
-            svc_dir.join("boot-sound.service"),
-            b"# Startup MP3 (Eclipse_Awakening). See /usr/local/bin/eclipse-boot-sound.\n\
-              exec = /usr/local/bin/eclipse-boot-sound\n\
-              type = oneshot\n\
-              after = pulseaudio lunarbar\n\
-              requires = pulseaudio lunarbar\n\
-              wait_socket = /run/user/0/wayland-0\n\
-              desktop = labwc\n\
-              log = /tmp/boot-sound.log\n\
-              timeout = 15\n",
-        )
-        .unwrap();
-        fs::write(
-            svc_dir.join("boot-sound-xorg.service"),
-            b"# Startup MP3 under the Xorg session.\n\
-              exec = /usr/local/bin/eclipse-boot-sound\n\
-              type = oneshot\n\
-              after = pulseaudio xorg\n\
-              requires = pulseaudio xorg\n\
-              desktop = xorg\n\
-              log = /tmp/boot-sound.log\n\
-              timeout = 15\n",
-        )
-        .unwrap();
+        boot_sound::service(svc_dir);
     }
 
     /// The wrapper scripts `install_eclipse_init` lays down in
@@ -4784,105 +4761,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
     /// `execve` answered EACCES, and init respawned it for the whole boot.
     /// Takes `svc_dir` because `write_oopslog` adds a service of its own.
     pub(super) fn write_init_wrappers(localbin: &Path, svc_dir: &Path) {
-        fs::write(
-            localbin.join("eclipse-boot-sound"),
-            b"#!/bin/sh\n\
-              # Detach so the oneshot does not hold up lunarbar/xkbmap.\n\
-              setsid /usr/local/bin/eclipse-boot-sound-play </dev/null >>/tmp/boot-sound.log 2>&1 &\n\
-              exit 0\n",
-        )
-        .unwrap();
-        fs::write(
-            localbin.join("eclipse-boot-sound-play"),
-            b"#!/bin/sh\n\
-              # Wait for PulseAudio (or a raw PCM), unmute, play the startup MP3 once.\n\
-              MP3=/usr/share/eclipse/Eclipse_Awakening.mp3\n\
-              [ -f \"$MP3\" ] || { echo \"eclipse-boot-sound: missing $MP3\" >&2; exit 0; }\n\
-              # Every mpg123 here runs under a watchdog. A player wedged in the\n\
-              # audio path never comes back on its own, and it holds the PCM for\n\
-              # the whole session (the device is exclusive: every later open\n\
-              # answers EBUSY), so the chime would cost all later sound. The\n\
-              # track is a few seconds long; anything past MAXPLAY is stuck.\n\
-              MAXPLAY=20\n\
-              # Prefer the real binary. Wrappers like mpg123-pulse already pass\n\
-              # `-o pulse`; if we then add `-o alsa` the later flag wins, mpg123\n\
-              # grabs the exclusive PCM, hangs, and the chime (and session audio)\n\
-              # loops until the watchdog -- the \"final loop\" seen on Ubuntu.\n\
-              MPG123=\n\
-              for c in mpg123.bin mpg123; do\n\
-              \x20 command -v \"$c\" >/dev/null 2>&1 && { MPG123=$c; break; }\n\
-              done\n\
-              play() {\n\
-              \x20 \"$MPG123\" \"$@\" &\n\
-              \x20 p=$!\n\
-              \x20 ( i=0\n\
-              \x20\x20 while [ \"$i\" -lt \"$MAXPLAY\" ]; do\n\
-              \x20\x20\x20 kill -0 \"$p\" 2>/dev/null || exit 0\n\
-              \x20\x20\x20 i=$((i + 1))\n\
-              \x20\x20\x20 sleep 1\n\
-              \x20\x20 done\n\
-              \x20\x20 echo \"eclipse-boot-sound: $MPG123 stuck after ${MAXPLAY}s; killing it\" >&2\n\
-              \x20\x20 kill -TERM \"$p\" 2>/dev/null\n\
-              \x20\x20 sleep 1\n\
-              \x20\x20 kill -KILL \"$p\" 2>/dev/null ) &\n\
-              \x20 w=$!\n\
-              \x20 wait \"$p\"\n\
-              \x20 r=$?\n\
-              \x20 kill \"$w\" 2>/dev/null\n\
-              \x20 wait \"$w\" 2>/dev/null\n\
-              \x20 return \"$r\"\n\
-              }\n\
-              i=0\n\
-              while [ \"$i\" -lt 20 ]; do\n\
-              \x20 if [ -S /run/pulse/native ] || [ -e /dev/snd/pcmC0D0p ] || [ -e /dev/dsp ]; then\n\
-              \x20\x20 break\n\
-              \x20 fi\n\
-              \x20 i=$((i + 1))\n\
-              \x20 sleep 1\n\
-              done\n\
-              if [ ! -S /run/pulse/native ] && [ ! -e /dev/snd/pcmC0D0p ] && [ ! -e /dev/dsp ]; then\n\
-              \x20 echo 'eclipse-boot-sound: no PCM device' >&2\n\
-              \x20 exit 0\n\
-              fi\n\
-              # Compositor DRM query enables NVIDIA HDMI packets; give it a beat.\n\
-              sleep 2\n\
-              if command -v pactl >/dev/null 2>&1 && [ -S /run/pulse/native ]; then\n\
-              \x20 pactl set-sink-volume @DEFAULT_SINK@ 70% 2>/dev/null\n\
-              \x20 pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null\n\
-              \x20 # Force every sink OUT of SUSPENDED via the EXPLICIT resume path.\n\
-              \x20 # The kernel PCM's implicit cold resume (run from the sink IO thread\n\
-              \x20 # when a stream attaches) is unreliable under SMP+KVM: it plays silent\n\
-              \x20 # or hangs. The explicit `suspend-sink 0` resume always works, so do it\n\
-              \x20 # once now; with no module-suspend-on-idle loaded the sink then stays\n\
-              \x20 # active for the whole session and every later play (mpg123/paplay/\n\
-              \x20 # Firefox) hits an already-running PCM instead of the broken resume.\n\
-              \x20 for s in $(pactl list short sinks 2>/dev/null | awk '{print $1}'); do\n\
-              \x20\x20 pactl suspend-sink \"$s\" 0 2>/dev/null || true\n\
-              \x20 done\n\
-              elif command -v amixer >/dev/null 2>&1; then\n\
-              \x20 amixer -q set Master 70% unmute 2>/dev/null\n\
-              fi\n\
-              if [ -n \"$MPG123\" ]; then\n\
-              \x20 if [ -S /run/pulse/native ]; then\n\
-              \x20\x20 # Pulse is up: ONLY use the pulse output. Opening ALSA here\n\
-              \x20\x20 # races Pulse for the exclusive PCM and wedges the player.\n\
-              \x20\x20 play -q -o pulse --encoding s16 --no-gapless \"$MP3\"\n\
-              \x20\x20 # drain can block forever if the sink is wedged; bound it.\n\
-              \x20\x20 if command -v pactl >/dev/null 2>&1; then\n\
-              \x20\x20\x20 pactl drain 2>/dev/null &\n\
-              \x20\x20\x20 d=$!\n\
-              \x20\x20\x20 ( sleep 5; kill \"$d\" 2>/dev/null ) &\n\
-              \x20\x20\x20 wait \"$d\" 2>/dev/null || true\n\
-              \x20\x20 fi\n\
-              \x20 else\n\
-              \x20\x20 play -q -o alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
-              \x20 fi\n\
-              \x20 exit 0\n\
-              fi\n\
-              echo 'eclipse-boot-sound: mpg123 not installed' >&2\n\
-              exit 0\n",
-        )
-        .unwrap();
+        boot_sound::wrappers(localbin);
         fs::write(
             localbin.join("eclipse-pulseaudio"),
             b"#!/bin/sh\n\

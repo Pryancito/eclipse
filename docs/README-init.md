@@ -86,12 +86,30 @@ Dos cosas por las que no es el `Requires=` de systemd tal cual:
   lo ignora el orden topológico. Una sesión que no trae esa dependencia no
   pierde por eso todo lo que va detrás.
 
-Lo llevan los ocho pares en los que no es una opinión: el servicio espera en
+Lo llevan los pares en los que no es una opinión: el servicio espera en
 `wait_socket` justamente el socket que crea el otro (labwc → seatd, lunarbar /
-lunarbg / xkbmap → labwc, dbus-selftest → dbus) o no tiene sentido sin él
-(boot-sound → pulseaudio). Un test de `xtask` fija esa lista y otro comprueba
-que ningún `requires =` nombra un servicio que la imagen no escriba, porque un
-nombre mal escrito ahí sería silencioso.
+lunarbg / xkbmap → labwc, dbus-selftest → dbus). Un test de `xtask` fija esa
+lista y otro comprueba que ningún `requires =` nombra un servicio que la imagen
+no escriba, porque un nombre mal escrito ahí sería silencioso.
+
+`boot-sound` **estuvo** en esa lista (`requires = pulseaudio`) y ya no: es un
+chime de mejor esfuerzo. Su reproductor espera el socket de Pulse **o** un PCM
+pelado y sale con 0 cuando no hay ninguno, así que un servidor de sonido al que
+init renunció cancelaba un chime que habría sonado igual.
+
+### `after = *`: el final del arranque
+
+Una fila puede pedir ser **lo último**: `after = *` la ordena detrás de todos
+los demás servicios, sin nombrar a ninguno. La lleva solo `boot-sound`, porque
+el chime dice que el arranque terminó y escrito como lista de nombres decía eso
+desde la mitad (`boot-sound` ordena temprano) en cuanto se olvidaba un nombre.
+Dos filas con `*` salen juntas al final, en orden de nombre, en vez de esperarse
+la una a la otra y caerse del orden como un ciclo.
+
+El chime tampoco lleva `desktop =`. Lo llevaba dos veces, `labwc` y `xorg`, y la
+sesión por defecto de la imagen de escritorio es `abyss` en cuanto `ec-abyss`
+entra en ella: init descarta todo servicio etiquetado para otra sesión, así que
+**las dos filas se caían antes de empezar el arranque y no sonaba nada**.
 
 ## Lo que se cerró en la tercera tanda
 
@@ -118,7 +136,7 @@ Tres detalles del cómo:
   alarma de un disparo, no un temporizador de intervalo, para que no siga
   saltando durante el apagado.
 - **Por ruta distinta**: dos servicios pueden compartir un `log =`
-  (`boot-sound` y `boot-sound-xorg` escriben los dos en `/tmp/boot-sound.log`) y
+  (dos filas pueden compartir `/tmp/boot-sound.log`) y
   rotarlo dos veces en la misma pasada se llevaría la generación recién
   guardada.
 

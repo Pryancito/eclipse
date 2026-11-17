@@ -593,13 +593,16 @@ fn every_requirement_names_a_service_this_image_writes() {
 fn a_service_gated_on_another_services_socket_requires_it() {
     let rootfs = init_rootfs("init-requires-sockets");
     for (name, dep) in [
-        ("labwc", "seatd"),           // /run/seatd.sock
-        ("lunarbar", "labwc"),        // /run/user/0/wayland-0
-        ("lunarbg", "labwc"),         //      ""
-        ("xkbmap", "labwc"),          //      ""
-        ("dbus-selftest", "dbus"),    // /run/user/0/bus
-        ("boot-sound", "pulseaudio"), // no sound server, no chime
-        ("boot-sound-xorg", "pulseaudio"),
+        ("labwc", "seatd"),    // /run/seatd.sock
+        ("lunarbar", "labwc"), // /run/user/0/wayland-0
+        ("lunarbg", "labwc"),  //      ""
+        ("xkbmap", "labwc"),   //      ""
+        ("dbus-selftest", "dbus"), // /run/user/0/bus
+                               // The chime is NOT in this list, on purpose: it waits for no
+                               // socket and requires nothing. Its player polls for Pulse's
+                               // socket or a raw PCM and exits 0 when neither turns up, so a
+                               // sound server given up on used to cancel a chime that would
+                               // have played anyway.
     ] {
         let body = fs::read_to_string(
             rootfs
@@ -655,17 +658,13 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "abyss",
         ),
         ("abyss-seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+        // `*`: after every other service, in every session. See
+        // `AFTER_EVERYTHING` in tools/eclipse-init.
         (
             "boot-sound",
             "oneshot",
             "/usr/local/bin/eclipse-boot-sound",
-            "pulseaudio lunarbar",
-        ),
-        (
-            "boot-sound-xorg",
-            "oneshot",
-            "/usr/local/bin/eclipse-boot-sound",
-            "pulseaudio xorg",
+            "*",
         ),
         ("dbus", "respawn", "/usr/local/bin/eclipse-dbus", ""),
         (
@@ -824,6 +823,11 @@ fn every_order_names_a_service_that_exists() {
     let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
     for (name, body) in &all {
         for dep in field(body, "after").unwrap_or_default().split_whitespace() {
+            // `*` names no service on purpose: "after everything else".
+            // See `AFTER_EVERYTHING` in tools/eclipse-init.
+            if dep == "*" {
+                continue;
+            }
             assert!(
                 names.contains(&dep),
                 "{name} is ordered after `{dep}`, which is not a service"
@@ -1697,7 +1701,6 @@ fn the_ollama_service_install_ollama_cuda_writes_follows_the_table_rules() {
 #[test]
 fn the_two_sessions_never_start_each_others_clients() {
     const LABWC: &[&str] = &[
-        "boot-sound",
         "gtk-caches",
         "labwc",
         "lunarbar",
@@ -1706,7 +1709,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "seatd",
         "xkbmap",
     ];
-    const XORG: &[&str] = &["boot-sound-xorg", "xorg"];
+    const XORG: &[&str] = &["xorg"];
     const ABYSS: &[&str] = &[
         "abyss",
         "abyss-hyperion-bar",
@@ -1715,6 +1718,10 @@ fn the_two_sessions_never_start_each_others_clients() {
         "abyss-lunarclip",
     ];
     const EITHER: &[&str] = &[
+        // The chime belongs to the boot, not to a session: tagged
+        // `labwc`/`xorg` it was dropped on an image whose default session
+        // is `abyss`, and nobody heard it at all.
+        "boot-sound",
         "dbus",
         "dbus-selftest",
         "dbus-system",
@@ -1789,24 +1796,72 @@ fn the_minimal_table_has_no_service_the_apk_closure_would_have_to_supply() {
 
     // And nothing left in the minimal table may still need it: a
     // `requires =` naming a service that does not exist is a dependency
-    // that can never be met. The two that name it (`boot-sound`,
-    // `boot-sound-xorg`) are `desktop =`-guarded, so `eclipse-init`
-    // discards them before the dependency is ever read -- which is the
-    // reason this removal is safe, and the reason it has to be checked
-    // rather than assumed.
+    // that can never be met, and `eclipse-init` reads the requirement of
+    // every service it keeps. The chime named it once and no longer does
+    // -- which is the reason this removal is safe, and the reason it has
+    // to be checked rather than assumed.
     for entry in fs::read_dir(&minimal).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".service") {
             continue;
         }
         let body = fs::read_to_string(entry.path()).unwrap();
-        let needs_pulse = ["requires", "after"].iter().any(|key| {
-            field(&body, key).is_some_and(|v| v.split_whitespace().any(|dep| dep == "pulseaudio"))
-        });
         assert!(
-            !needs_pulse || field(&body, "desktop").is_some(),
-            "{name} depends on pulseaudio and is not session-guarded, so in a \
-                 minimal image it waits for a service that is not written"
+            !field(&body, "requires")
+                .is_some_and(|v| v.split_whitespace().any(|dep| dep == "pulseaudio")),
+            "{name} requires pulseaudio, which a minimal image does not write: \
+                 eclipse-init gives up on it for the whole boot"
+        );
+    }
+}
+
+/// One chime, and it is the end of the boot in every session.
+///
+/// The row shipped twice, `desktop = labwc` and `desktop = xorg`, and the
+/// desktop image's own default session is `abyss` whenever `ec-abyss`
+/// landed in it (`abyss::session`): init drops every service tagged for
+/// another session, so BOTH rows were dropped before the boot began and
+/// the image played nothing. A `desktop =` back on this row, or a second
+/// chime for a third session, is that bug again.
+#[test]
+fn the_chime_belongs_to_the_boot_and_not_to_a_session() {
+    for (label, desktop) in [("desktop", true), ("minimal", false)] {
+        let svc = scratch(&format!("chime-{label}")).join("etc/eclipse/services");
+        fs::create_dir_all(&svc).unwrap();
+        LinuxRootfs::write_init_services(&svc, desktop);
+
+        let chimes: Vec<String> = fs::read_dir(&svc)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("boot-sound"))
+            .collect();
+        assert_eq!(
+            chimes,
+            vec!["boot-sound.service".to_string()],
+            "{label}: the chime is one row and only one: {chimes:?}"
+        );
+
+        let body = fs::read_to_string(svc.join("boot-sound.service")).unwrap();
+        assert_eq!(
+            field(&body, "desktop"),
+            None,
+            "{label}: a session-tagged chime is silent on every other session"
+        );
+        assert_eq!(
+            field(&body, "after"),
+            Some("*"),
+            "{label}: `after = *` is what puts the chime at the END of the boot"
+        );
+        assert_eq!(
+            field(&body, "requires"),
+            None,
+            "{label}: the chime is best-effort; a requirement given up on cancels it"
+        );
+        assert_eq!(
+            field(&body, "wait_socket"),
+            None,
+            "{label}: there is no compositor socket under a console session"
         );
     }
 }
@@ -2140,21 +2195,23 @@ fn every_player_the_chime_starts_is_killed_if_it_wedges() {
 #[test]
 fn the_chime_oneshots_carry_a_short_timeout_of_their_own() {
     let rootfs = init_rootfs("chime-timeout");
-    for name in ["boot-sound", "boot-sound-xorg"] {
-        let body = fs::read_to_string(rootfs.join(format!("etc/eclipse/services/{name}.service")))
-            .unwrap();
-        let secs: u64 = fields(&body)
-            .into_iter()
-            .find(|(k, _)| *k == "timeout")
-            .unwrap_or_else(|| panic!("{name} sin timeout propio:\n{body}"))
-            .1
-            .parse()
-            .unwrap_or_else(|e| panic!("{name}: timeout no numerico: {e}"));
-        assert!(
-            secs > 0 && secs <= 30,
-            "{name}: timeout = {secs} no acota el chime"
-        );
-    }
+    // One chime: it was two, one per session, and both were dropped on an
+    // image whose session is `abyss` (see
+    // `the_chime_belongs_to_the_boot_and_not_to_a_session`).
+    let name = "boot-sound";
+    let body =
+        fs::read_to_string(rootfs.join(format!("etc/eclipse/services/{name}.service"))).unwrap();
+    let secs: u64 = fields(&body)
+        .into_iter()
+        .find(|(k, _)| *k == "timeout")
+        .unwrap_or_else(|| panic!("{name} sin timeout propio:\n{body}"))
+        .1
+        .parse()
+        .unwrap_or_else(|e| panic!("{name}: timeout no numerico: {e}"));
+    assert!(
+        secs > 0 && secs <= 30,
+        "{name}: timeout = {secs} no acota el chime"
+    );
 }
 
 /// The watchdog, RUN rather than read: the structural test above cannot

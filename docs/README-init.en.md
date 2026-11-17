@@ -84,12 +84,30 @@ Two ways in which it is not systemd's `Requires=` as is:
   topological order ignores it. A session that does not bring that dependency
   does not lose everything behind it because of that.
 
-It is carried by the eight pairs where it is not a matter of opinion: the
-service waits in `wait_socket` for exactly the socket the other one creates
-(labwc → seatd, lunarbar / lunarbg / xkbmap → labwc, dbus-selftest → dbus) or
-makes no sense without it (boot-sound → pulseaudio). An `xtask` test pins that
-list and another checks that no `requires =` names a service the image does not
-write, because a misspelt name there would be silent.
+It is carried by the pairs where it is not a matter of opinion: the service
+waits in `wait_socket` for exactly the socket the other one creates (labwc →
+seatd, lunarbar / lunarbg / xkbmap → labwc, dbus-selftest → dbus). An `xtask`
+test pins that list and another checks that no `requires =` names a service the
+image does not write, because a misspelt name there would be silent.
+
+`boot-sound` **was** on that list (`requires = pulseaudio`) and is not any
+more: the chime is best-effort. Its player waits for Pulse's socket **or** a
+raw PCM and exits 0 when there is neither, so a sound server init had given up
+on used to cancel a chime that would have played anyway.
+
+### `after = *`: the end of the boot
+
+A row can ask to be **last**: `after = *` orders it behind every other service
+without naming one. Only `boot-sound` carries it, because the chime says the
+boot is over and, written as a list of names, it said so from the middle of it
+(`boot-sound` sorts early) the moment a name was forgotten. Two rows with `*`
+come out together at the end, in name order, instead of each waiting for the
+other and both falling out of the sort as a cycle.
+
+The chime carries no `desktop =` either. It carried two, `labwc` and `xorg`,
+and the desktop image's default session is `abyss` as soon as `ec-abyss` lands
+in it: init drops every service tagged for another session, so **both rows were
+dropped before the boot began and nothing played at all**.
 
 ## What the third round closed
 
@@ -114,8 +132,8 @@ Three details of the how:
   `waitpid` while nothing is pending, so without an alarm it would never look;
   the handler only raises the flag and the loop re-arms. It is a one-shot alarm,
   not an interval timer, so that it does not keep firing during shutdown.
-- **By distinct path**: two services can share a `log =` (`boot-sound` and
-  `boot-sound-xorg` both write to `/tmp/boot-sound.log`) and rotating it twice
+- **By distinct path**: two services can share a `log =` (two rows may both
+  write `/tmp/boot-sound.log`) and rotating it twice
   in the same pass would take away the generation just saved.
 
 What it does **not** cover: a file a wrapper writes on its own that is not any

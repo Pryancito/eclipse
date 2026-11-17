@@ -475,6 +475,62 @@ const LIVE_KEEP: [&str; 9] = [
     "usr/local/bin",
 ];
 
+/// The services whose row ships in `etc` and whose program does not: taken out
+/// of the live/installer root after [`build_live_rootfs`] has copied it.
+///
+/// `etc` is in [`LIVE_KEEP`] and is copied WHOLE from the full rootfs, so the
+/// RAM-resident roots inherit `/etc/eclipse/services` as a desktop image wrote
+/// it. `usr/bin` is in no list at all: the apk closure that carries
+/// `pulseaudio` stays in `rootfs.btrfs.gz`. So the ISO installer booted a row
+/// whose `exec` wrapper answers `eclipse-pulseaudio: pulseaudio not
+/// installed`, `sleep 8`, `exit 127` -- twenty times, 162 seconds of an
+/// installer's console, on every single boot of the medium, with nothing an
+/// installer could do about it.
+///
+/// Dropped from the live root and not from the full one: the installed system
+/// gets the desktop and its sound server from the btrfs payload, and the QEMU
+/// live image gets the row back with the desktop stack it is given
+/// ([`restore_dropped_services`]), so this takes the chime's sound server from
+/// no image that has one.
+const LIVE_DROP_SERVICES: [&str; 1] = ["pulseaudio"];
+
+/// Where a service row lives inside a rootfs.
+fn service_file(root: &Path, name: &str) -> std::path::PathBuf {
+    root.join("etc/eclipse/services")
+        .join(format!("{name}.service"))
+}
+
+/// Remove [`LIVE_DROP_SERVICES`] from `live`, the root that is frozen into the
+/// ESP bootstrap initramfs and the ISO installer SFS.
+fn drop_services_from_live_root(live: &Path) {
+    for name in LIVE_DROP_SERVICES {
+        let path = service_file(live, name);
+        if path.is_file() && fs::remove_file(&path).is_ok() {
+            println!("  live-rootfs: dropped {name}.service (its program is not in LIVE_KEEP)");
+        }
+    }
+}
+
+/// Put [`LIVE_DROP_SERVICES`] back into `live` from `full`, for the QEMU live
+/// image only -- the one image built from this root that also gets `usr/bin`,
+/// and therefore the only one where the row can start.
+fn restore_dropped_services(full: &Path, live: &Path) {
+    for name in LIVE_DROP_SERVICES {
+        let src = service_file(full, name);
+        if !src.is_file() {
+            continue;
+        }
+        let dst = service_file(live, name);
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::copy(&src, &dst) {
+            Ok(_) => println!("  live-rootfs: {name}.service back for the QEMU live image"),
+            Err(e) => eprintln!("warning: could not restore {name}.service: {e}"),
+        }
+    }
+}
+
 /// Recursively copy `src` into `dst`, preserving symlinks (busybox applets are
 /// symlinks to `busybox`) and permissions. Regular files larger than
 /// [`LIVE_FILE_CAP`] are skipped. A missing `src` is a no-op.
@@ -625,6 +681,10 @@ impl super::LinuxRootfs {
             let live_root = self.artifact_dir("live-rootfs");
             println!("Building minimal live/installer root...");
             build_live_rootfs(&rootfs_path, &live_root);
+            // `etc` came over whole, including rows for programs that did not:
+            // see `LIVE_DROP_SERVICES`. Here, before the two lean images are
+            // frozen below.
+            drop_services_from_live_root(&live_root);
 
             // The vendored NVIDIA driver reads gsp.bin at boot from the
             // initramfs (zCore/src/main.rs load_nvidia_gsp_firmware, right
@@ -905,6 +965,9 @@ impl super::LinuxRootfs {
             // Mesa even if an earlier desktop build left something behind.
             if self.variant().has_desktop() {
                 super::xorg::copy_into_live(&rootfs_path, &live_root);
+                // usr/bin is here now, so the rows dropped above have their
+                // programs again -- in this image and in no other.
+                restore_dropped_services(&rootfs_path, &live_root);
                 // That copies usr/lib and usr/bin whole, NVIDIA's userspace
                 // with them, and QEMU has no NVIDIA GPU for it: libcuda and
                 // its PTX JIT alone are 130 MiB of RAM initramfs. Official
@@ -1363,6 +1426,73 @@ mod image_size_tests {
         ] {
             assert!(out.join(d).is_dir(), "missing mount point {d}");
         }
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The ISO installer and the ESP bootstrap do not carry a service whose
+    /// program they do not carry, and the QEMU live image -- built from the
+    /// same root, after `usr/bin` is copied into it -- does.
+    ///
+    /// `etc` is copied whole, so the lean roots inherited
+    /// `pulseaudio.service` from a desktop rootfs while `usr/bin/pulseaudio`
+    /// stayed in `rootfs.btrfs.gz`: `eclipse-pulseaudio: pulseaudio not
+    /// installed`, `exit 127`, twenty times, on every boot of an install
+    /// medium. See [`LIVE_DROP_SERVICES`].
+    #[test]
+    fn a_service_whose_program_is_not_in_live_keep_is_dropped_from_the_lean_roots() {
+        let full = scratch("drop-full");
+        let out = scratch("drop-out");
+        fs::create_dir_all(full.join("etc/eclipse/services")).unwrap();
+        for name in ["pulseaudio", "boot-sound"] {
+            fs::write(
+                service_file(&full, name),
+                b"exec = /usr/local/bin/x
+",
+            )
+            .unwrap();
+        }
+
+        build_live_rootfs(&full, &out);
+        assert!(
+            service_file(&out, "pulseaudio").is_file(),
+            "`etc` is in LIVE_KEEP, so the row arrives with it: that is the whole problem"
+        );
+
+        drop_services_from_live_root(&out);
+        assert!(
+            !service_file(&out, "pulseaudio").exists(),
+            "the ISO installer would respawn a binary it does not carry"
+        );
+        assert!(
+            service_file(&out, "boot-sound").is_file(),
+            "only LIVE_DROP_SERVICES goes: /usr/local/bin IS in LIVE_KEEP"
+        );
+
+        // And the QEMU live image, which does get usr/bin, gets it back.
+        restore_dropped_services(&full, &out);
+        assert!(
+            service_file(&out, "pulseaudio").is_file(),
+            "the QEMU live image has pulseaudio and lost its service"
+        );
+
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// Nothing to drop is not an error: the minimal variant writes no such
+    /// row in the first place, and a rootfs with no service table at all
+    /// (an architecture whose init did not land) must not stop an image
+    /// build in either function.
+    #[test]
+    fn dropping_and_restoring_a_row_that_is_not_there_is_a_no_op() {
+        let full = scratch("drop-none-full");
+        let out = scratch("drop-none-out");
+        fs::create_dir_all(&full).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        drop_services_from_live_root(&out);
+        restore_dropped_services(&full, &out);
+        assert!(!service_file(&out, "pulseaudio").exists());
         let _ = fs::remove_dir_all(&full);
         let _ = fs::remove_dir_all(&out);
     }
