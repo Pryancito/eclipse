@@ -5958,6 +5958,16 @@ pub struct SignalPark {
     thread: Arc<Thread>,
     object: Arc<dyn KernelObject>,
     armed: bool,
+    /// The deadline's timer, taken out when the park ends before it.
+    timer: Option<kernel_hal::deadline::TimerId>,
+}
+
+impl Drop for SignalPark {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            kernel_hal::timer::timer_cancel(timer);
+        }
+    }
 }
 
 impl SignalPark {
@@ -5967,6 +5977,7 @@ impl SignalPark {
             thread: thread.clone(),
             object: thread.clone(),
             armed: false,
+            timer: None,
         }
     }
 
@@ -5986,7 +5997,7 @@ impl SignalPark {
                 // Weak: the timer must not keep a dead thread's object alive
                 // for the length of a long sleep.
                 let weak = Arc::downgrade(&self.thread);
-                kernel_hal::timer::timer_set(
+                self.timer = kernel_hal::timer::timer_set_cancellable(
                     deadline,
                     Box::new(move |_now| {
                         if let Some(thread) = weak.upgrade() {
