@@ -125,6 +125,9 @@
 //! is from nowhere and with its sum done again; the header is the
 //! kernel's, or the program's when it writes its own.
 //!
+//! The raw sockets of `AF_INET6` that are not of ICMPv6 are served too
+//! (`raw6`): `RAW6` and `PACKET6`, whose IPv6 header the stack writes.
+//!
 //! # What was not delivered
 //!
 //! A router that has no way on, or a host with nobody at the port, says
@@ -337,12 +340,14 @@ mod groups6;
 mod icmp;
 mod icmp6;
 mod raw;
+mod raw6;
 mod tcp;
 pub use groups::{join_message, leave_message, Membership, MEMBERSHIPS_MAX, OP_JOIN, OP_LEAVE};
 pub use groups6::{join6_message, leave6_message, Membership6, MEMBERSHIPS6_MAX};
 pub use groups6::{OP_JOIN6, OP_LEAVE6};
 pub use icmp::ServedIcmpSocket;
 pub use raw::ServedRawSocket;
+pub use raw6::{packet6_message, raw6_message, OP_PACKET6, OP_RAW6};
 pub use tcp::ServedTcpSocket;
 
 /// The operations of a message.
@@ -971,7 +976,9 @@ enum Hears {
     /// their identifier, without the IP header: a socket that pings.
     Echoes,
     /// Every IPv4 packet of this protocol, which is not ICMP, whole: a
-    /// raw socket of it ([`raw`]).
+    /// raw socket of it ([`raw`]). One of `AF_INET6` (`v6`): what every
+    /// IPv6 packet of this protocol, which is not ICMPv6, carries
+    /// ([`raw6`]).
     Packets(u8),
 }
 
@@ -980,6 +987,7 @@ impl Hears {
     /// hears this. A socket of datagrams is told of by its port.
     fn said(self, sock: u64, six: bool) -> Vec<u8> {
         match self {
+            Hears::Packets(protocol) if six => raw6_message(sock, protocol),
             Hears::Packets(protocol) => raw_message(sock, protocol),
             _ if six => hear6_message(sock),
             _ => hear_message(sock),
@@ -2096,8 +2104,12 @@ impl StackLink {
             };
             records = rest;
             if sock == HEARD {
+                // A whole packet: of ICMPv6, or of a protocol a raw
+                // socket speaks.
                 if let Some((hops, message)) = icmp6::message_of(data) {
                     self.heard6(Ipv6Address(addr), hops, message);
+                } else if let Some((protocol, hops, carried)) = raw6::carried_of(data) {
+                    self.heard_raw6(Ipv6Address(addr), hops, protocol, carried);
                 }
                 continue;
             }

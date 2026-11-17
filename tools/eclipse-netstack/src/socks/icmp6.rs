@@ -185,24 +185,26 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         true
     }
 
-    /// Make `m` the `DATA6` of what was heard of ICMPv6: all of it, or
-    /// as much as fits one message. `m` is left as it was when there is
-    /// nothing.
+    /// Make `m` the `DATA6` of what was heard of ICMPv6 and of the raw
+    /// sockets' protocols ([`super::raw6`]): all of it, or as much as
+    /// fits one message. `m` is left as it was when there is nothing.
     pub(super) fn heard6(&mut self, m: &mut Vec<u8>) -> Arrived {
-        if self.hearing6.heard.is_empty() {
+        if self.hearing6.heard.is_empty() && self.raws6.heard.is_empty() {
             return Arrived::Nothing;
         }
         start_data6(m);
-        while let Some(packet) = self.hearing6.heard.front() {
-            if m.len() + RECORD6_LEN + packet.len() > MESSAGE_MAX {
-                return Arrived::More;
+        for heard in [&mut self.hearing6.heard, &mut self.raws6.heard] {
+            while let Some(packet) = heard.front() {
+                if m.len() + RECORD6_LEN + packet.len() > MESSAGE_MAX {
+                    return Arrived::More;
+                }
+                // The header's source, which is whole in what is kept.
+                let mut from = [0u8; 16];
+                from.copy_from_slice(&packet[8..24]);
+                push_record6(m, HEARD, from, 0, packet);
+                heard.pop_front();
+                self.brought = true;
             }
-            // The header's source, which `keep` saw is whole.
-            let mut from = [0u8; 16];
-            from.copy_from_slice(&packet[8..24]);
-            push_record6(m, HEARD, from, 0, packet);
-            self.hearing6.heard.pop_front();
-            self.brought = true;
         }
         debug_assert!(m.len() > HEADER_LEN);
         Arrived::All

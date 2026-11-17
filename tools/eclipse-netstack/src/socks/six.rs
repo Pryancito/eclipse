@@ -583,7 +583,7 @@ pub(in crate::socks) mod tests {
     pub(in crate::socks) const OURS_LINK: Ipv6Address = Ipv6Address([
         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x57,
     ]);
-    const OURS_GIVEN: Ipv6Address = Ipv6Address([
+    pub(in crate::socks) const OURS_GIVEN: Ipv6Address = Ipv6Address([
         0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x57,
     ]);
     const PREFIX: Ipv6Address = Ipv6Address([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -744,7 +744,7 @@ pub(in crate::socks) mod tests {
     }
 
     /// THEIRS says that `address` is at its card, to `to`.
-    fn here_is(address: Ipv6Address, to: Ipv6Address) -> Vec<u8> {
+    pub(in crate::socks) fn here_is(address: Ipv6Address, to: Ipv6Address) -> Vec<u8> {
         let said = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
             flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
             target_addr: address,
