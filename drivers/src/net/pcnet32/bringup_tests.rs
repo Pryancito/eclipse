@@ -233,24 +233,6 @@ fn the_ring_index_wraps_at_the_end_and_nowhere_else() {
     );
 }
 
-#[test]
-fn a_frame_longer_than_the_scratch_goes_to_the_heap_instead_of_panicking() {
-    // `len` is whatever the IP layer computed, not a clamped MTU: one
-    // `sendto` of a 1495-byte UDP payload is 1537 bytes on the wire, past the
-    // scratch, and indexing a fixed array with it panics the kernel.
-    let mut scratch = [0u8; TX_SCRATCH_LEN];
-    let mut heap = Vec::new();
-    for len in [0usize, 1, 60, TX_SCRATCH_LEN] {
-        let buf = tx_stage(len, &mut scratch, &mut heap);
-        assert_eq!(buf.len(), len);
-        assert!(heap.is_empty(), "len {} should not have hit the heap", len);
-    }
-    let buf = tx_stage(TX_SCRATCH_LEN + 1, &mut scratch, &mut heap);
-    assert_eq!(buf.len(), TX_SCRATCH_LEN + 1);
-    let buf = tx_stage(65535, &mut scratch, &mut heap);
-    assert_eq!(buf.len(), 65535, "a 64 KiB datagram must not panic either");
-}
-
 // ——— The register layout ———
 
 #[test]

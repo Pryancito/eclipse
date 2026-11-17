@@ -608,31 +608,6 @@ fn the_statistics_handed_out_are_a_copy_and_not_the_counters_themselves() {
     );
 }
 
-// --- what smoltcp is told about the card
-
-#[test]
-fn smoltcp_is_told_the_whole_frame_and_the_kernel_the_payload() {
-    let (_base, iface) = interface(0);
-    let caps = phy::Device::capabilities(&iface.driver);
-    // The two MTUs of this driver are not the same number and must not be made
-    // to agree: smoltcp's `max_transmission_unit` is the whole ethernet frame,
-    // header included, while the `get_mtu` userspace reads is the payload.
-    assert_eq!(caps.max_transmission_unit, 1514, "frame, not payload");
-    assert_eq!(iface.get_mtu(), 1500, "payload, not frame");
-    assert_eq!(
-        caps.max_transmission_unit - iface.get_mtu(),
-        14,
-        "the gap between them is the ethernet header"
-    );
-    // A burst limit must stay unset: smoltcp clamps the TCP window to
-    // `burst * MSS` in a u16, so burst=64 wraps 94336 to 28800 and the link
-    // tops out at a few Mbps.
-    assert_eq!(
-        caps.max_burst_size, None,
-        "a burst limit wraps the TCP window and caps the link at a few Mbps"
-    );
-}
-
 #[test]
 fn the_pci_driver_claims_the_two_device_ids_qemu_offers_and_no_other() {
     let driver = E1000DriverPci;

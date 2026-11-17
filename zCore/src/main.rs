@@ -897,9 +897,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             );
         }
         let whose = boot::whose(card, lent_cards, word("unetstack"), kernel_cards);
-        // No socket of any boot is the kernel's stack's: `lo` has nothing
-        // to carry, and is only shown.
-        kernel_hal::drivers::show_loopback_only();
+        kernel_hal::drivers::ensure_loopback();
         user_stack::machine().alone(whose.alone());
         match whose {
             boot::Whose::AllOnlyCard => klog_info!(

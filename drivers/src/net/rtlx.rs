@@ -6,42 +6,46 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::iface::*;
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-// use smoltcp::socket::SocketSet;
-use smoltcp::time::Instant;
 use smoltcp::wire::*;
-use smoltcp::Result;
 
 use super::realtek::rtl8211f::{self, RTL8211F};
-use super::{timer_now_as_micros, ProviderImpl, PAGE_SIZE};
+use super::{ip_cfg, timer_now_as_micros, ProviderImpl, PAGE_SIZE};
 
-/// Stack scratch for [`RTLxTxToken::consume`]; covers the advertised MTU
-/// (1514) with headroom. Oversized requests are refused, never clipped.
-const TX_SCRATCH_LEN: usize = 1536;
-
-use crate::net::get_sockets;
-use crate::scheme::{NetScheme, RouteInfo, Scheme};
+use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
-use managed::ManagedSlice;
 
 #[derive(Clone)]
 pub struct RTLxDriver(Arc<Mutex<RTL8211F<ProviderImpl>>>);
 
 #[derive(Clone)]
 pub struct RTLxInterface {
-    pub iface: Arc<Mutex<Interface<'static, RTLxDriver>>>,
+    mac: EthernetAddress,
+    pub ip_addrs: Arc<Mutex<Vec<IpCidr>>>,
+    pub stats: Arc<Mutex<NetStats>>,
     pub driver: RTLxDriver,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
     pub name: String,
     pub irq: usize,
-    /// Who the card's frames go to while it is lent to a stack that is not
-    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
-    /// them.
+    /// Who the card's frames go to while it is lent to the stack that
+    /// runs as a process ([`super::lent`]); empty, nobody has them.
     pub lent: super::lent::Lent,
 }
 
 impl RTLxInterface {
+    /// The next good frame on the ring. A frame the GMAC marked bad comes
+    /// back empty and is no frame: the next one is looked for, so that it
+    /// does not sit on the ring until another arrives.
+    fn take_frame(&self) -> Option<Vec<u8>> {
+        let mut driver = self.driver.0.lock();
+        while driver.can_recv() {
+            let (frame, _count) = driver.geth_recv(1);
+            if !frame.is_empty() {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
     /// The look at a lent card: what its interrupt would have done, with
     /// the frames going to the borrower and not to the kernel's stack.
     /// `false` when the card is not lent.
@@ -51,19 +55,7 @@ impl RTLxInterface {
         }
         // The slots of what was sent, before the borrower sends more.
         self.driver.0.lock().tx_complete();
-        let handed = self.lent.hand_over(|| {
-            let mut driver = self.driver.0.lock();
-            // A frame the GMAC marked bad comes back empty and is no
-            // frame: the next one is looked for, so that it does not sit
-            // on the ring until another arrives.
-            while driver.can_recv() {
-                let (frame, _count) = driver.geth_recv(1);
-                if !frame.is_empty() {
-                    return Some(frame);
-                }
-            }
-            None
-        });
+        let handed = self.lent.hand_over(|| self.take_frame());
         self.driver.0.lock().int_enable();
         handed
     }
@@ -99,10 +91,6 @@ impl Scheme for RTLxInterface {
         }
 
         if status == rtl8211f::TxDmaIrqStatus::HandleTxRx as i32 {
-            let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-            let sockets = get_sockets();
-            let mut sockets = sockets.lock();
-
             {
                 let mut driver = self.driver.0.lock();
                 driver.int_disable();
@@ -119,23 +107,10 @@ impl Scheme for RTLxInterface {
                 // actually installs is this one, and it did not.
                 driver.tx_complete();
             }
-            match self.iface.lock().poll(&mut sockets, timestamp) {
-                Ok(b) => {
-                    debug!("nic poll, is changed ?: {}", b);
-                }
-                Err(err) => {
-                    error!("poll got err {}", err);
-                }
-            }
+            // No stack above a card that is not lent: the ring is
+            // emptied and the frames are shown to who listens for them.
+            super::lent::tap_only(&self.stats, || self.take_frame());
             self.driver.0.lock().int_enable();
-            drop(sockets);
-            // Drain the AF_PACKET tap queue and wake blocked socket readers.
-            // `RTLxRxToken::consume` calls `net_defer_packet` for every frame,
-            // but nothing on this driver ever flushed that queue, so an
-            // AF_PACKET consumer (the DHCP client) received nothing at all on
-            // riscv64 and blocked readers only woke on the fallback park
-            // timer. Both e1000 drivers do this after every poll.
-            super::net_flush_deferred_packets();
             super::wake_net_rx_waiters();
         } else if status == rtl8211f::TxDmaIrqStatus::TxHardError as i32
             || status == rtl8211f::TxDmaIrqStatus::TxHardErrorBumpTc as i32
@@ -180,7 +155,7 @@ impl NetScheme for RTLxInterface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        self.mac
     }
 
     fn ifname(&self) -> &str {
@@ -196,206 +171,43 @@ impl NetScheme for RTLxInterface {
     }
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
-        Vec::from(self.iface.lock().ip_addrs())
+        self.ip_addrs.lock().clone()
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            let mut set_primary = false;
-            for slot in addrs.iter_mut() {
-                if let IpCidr::Ipv4(_) = slot {
-                    if !set_primary {
-                        *slot = IpCidr::Ipv4(cidr);
-                        set_primary = true;
-                    } else {
-                        *slot = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
-                    }
-                }
-            }
-            if !set_primary {
-                if let Some(slot) = addrs.iter_mut().next() {
-                    *slot = IpCidr::Ipv4(cidr);
-                }
-            }
-        });
-        Ok(())
+        ip_cfg::set_ipv4_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            if addrs.contains(&cidr) {
-                return;
-            }
-            for slot in addrs.iter_mut() {
-                if (slot.address().is_unspecified() && slot.prefix_len() == 0)
-                    || (slot.address() == IpAddress::v4(240, 0, 0, 0) && slot.prefix_len() == 32)
-                {
-                    *slot = cidr;
-                    return;
-                }
-            }
-            // Every slot is taken. Growing the list is the only way to keep
-            // the addresses that are already there; overwriting the newest one
-            // silently takes an address the interface still answers on.
-            if let ManagedSlice::Owned(addrs) = addrs {
-                addrs.push(cidr);
-            } else if let Some(slot) = addrs.iter_mut().last() {
-                // Borrowed storage cannot grow, so the newest slot is the best
-                // there is.
-                *slot = cidr;
-            }
-        });
-        Ok(())
+        ip_cfg::add_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            for slot in addrs.iter_mut() {
-                if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
-                    return;
-                }
-            }
-        });
-        Ok(())
+        ip_cfg::remove_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        match gateway {
-            Some(IpAddress::Ipv4(gw)) => {
-                let mut routes = self.routes.lock();
-                if cidr.prefix_len() == 0 {
-                    iface
-                        .routes_mut()
-                        .add_default_ipv4_route(gw)
-                        .map_err(|_| DeviceError::IoError)?;
-                    // Only one default route can be in force, so a new one
-                    // replaces the one already there. A route to a named
-                    // network replaces nothing -- and this purge used to run
-                    // for every gatewayed route, so the static route in a DHCP
-                    // lease took 0.0.0.0/0 out of the table the kernel reports
-                    // while smoltcp went on routing through it.
-                    routes
-                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
-                }
-                routes.push(RouteInfo {
-                    dst: cidr,
-                    gateway: Some(IpAddress::Ipv4(gw)),
-                });
-            }
-            Some(IpAddress::Ipv6(gw)) => {
-                let mut routes = self.routes.lock();
-                if cidr.prefix_len() == 0 {
-                    iface
-                        .routes_mut()
-                        .add_default_ipv6_route(gw)
-                        .map_err(|_| DeviceError::IoError)?;
-                    // Only one default route can be in force, so a new one
-                    // replaces the one already there. A route to a named
-                    // network replaces nothing -- and this purge used to run
-                    // for every gatewayed route, so the static route in a DHCP
-                    // lease took ::/0 out of the table the kernel reports
-                    // while smoltcp went on routing through it.
-                    routes
-                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
-                }
-                routes.push(RouteInfo {
-                    dst: cidr,
-                    gateway: Some(IpAddress::Ipv6(gw)),
-                });
-            }
-            None => {
-                self.routes.lock().push(RouteInfo { dst: cidr, gateway });
-            }
-            _ => {}
-        }
-        Ok(())
+        ip_cfg::add_route(&mut self.routes.lock(), cidr, gateway)
     }
 
     fn del_route(&self, cidr: IpCidr, _gateway: Option<IpAddress>) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        if cidr.prefix_len() == 0 {
-            match cidr {
-                IpCidr::Ipv4(_) => {
-                    let _ = iface.routes_mut().remove_default_ipv4_route();
-                }
-                IpCidr::Ipv6(_) => {
-                    let _ = iface.routes_mut().remove_default_ipv6_route();
-                }
-                _ => {}
-            }
-        }
-        self.routes.lock().retain(|r| r.dst != cidr);
-        Ok(())
+        ip_cfg::del_route(&mut self.routes.lock(), cidr)
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        let iface = self.iface.lock();
-        let mut res = Vec::new();
-
-        res.extend(self.routes.lock().clone());
-
-        for cidr in iface.ip_addrs() {
-            match cidr {
-                IpCidr::Ipv4(v4) if v4.prefix_len() > 0 => {
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv4(v4.network()),
-                        gateway: None,
-                    });
-                }
-                IpCidr::Ipv6(v6) if v6.prefix_len() > 0 => {
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv6(v6.network()),
-                        gateway: None,
-                    });
-                }
-                _ => {}
-            }
-        }
-        res
+        ip_cfg::reported_routes(&self.routes.lock(), &self.ip_addrs.lock())
     }
 
     fn poll(&self) -> DeviceResult {
-        if self.look_lent() {
-            return Ok(());
+        if !self.look_lent() {
+            // Not lent: no stack above it.
+            super::lent::tap_only(&self.stats, || self.take_frame());
         }
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        // Disable interrupts while holding the SOCKETS and iface locks.
-        // On real hardware the NIC fires a hardware interrupt as soon as a
-        // frame lands in the DMA ring.  If that interrupt is delivered while
-        // this thread already holds SOCKETS, handle_irq() will try to acquire
-        // the same lock and spin forever, dead-locking the system.
-        // The kernel-sync Mutex already keeps interrupts off for the duration
-        // of the locked critical section (push_off/pop_off), so the NIC IRQ
-        // cannot reenter while SOCKETS is held. Manual intr_off/on here would
-        // desync the noff accounting and panic ("pop_off" / "RefCell already
-        // borrowed") under SMP, so we rely on the Mutex alone.
-        let sockets = get_sockets();
-        let mut sockets = sockets.lock();
-        let result = self.iface.lock().poll(&mut sockets, timestamp);
-        // Release the SOCKETS guard promptly so interrupts (disabled by the
-        // lock) are re-enabled as soon as the critical section ends.
-        drop(sockets);
-        // Same as `handle_irq`: flush the AF_PACKET tap queue and wake RX
-        // waiters now that the smoltcp locks are released.
-        super::net_flush_deferred_packets();
-        match result {
-            Ok(b) => {
-                debug!("nic poll, is changed ?: {}", b);
-                if b {
-                    super::wake_net_rx_waiters();
-                }
-                Ok(())
-            }
-            Err(err) => {
-                error!("poll got err {}", err);
-                Err(DeviceError::IoError)
-            }
-        }
+        Ok(())
+    }
+
+    fn get_stats(&self) -> NetStats {
+        self.stats.lock().clone()
     }
 
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize> {
@@ -437,105 +249,6 @@ impl NetScheme for RTLxInterface {
     }
     fn get_mtu(&self) -> usize {
         1500
-    }
-}
-
-pub struct RTLxRxToken(Vec<u8>);
-pub struct RTLxTxToken(RTLxDriver);
-
-impl<'a> Device<'a> for RTLxDriver {
-    type RxToken = RTLxRxToken;
-    type TxToken = RTLxTxToken;
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(64);
-        caps.medium = Medium::Ethernet;
-        caps
-    }
-
-    fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        // One acquisition, as in `NetScheme::recv` and for the same two reasons.
-        // The second one bites on a single CPU as well: an empty answer used to
-        // become an `RxToken` all the same, so a frame the GMAC marked bad turned
-        // into a zero-length "frame" tapped to every AF_PACKET listener and
-        // handed to smoltcp as an Ethernet header.
-        let mut driver = self.0.lock();
-        if !driver.can_recv() {
-            return None;
-        }
-        //这里每次只接收一个网络包
-        let (vec_recv, _rxcount) = driver.geth_recv(1);
-        if vec_recv.is_empty() {
-            return None;
-        }
-        drop(driver);
-        Some((RTLxRxToken(vec_recv), RTLxTxToken(self.clone())))
-    }
-
-    fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.0.lock().can_send() {
-            Some(RTLxTxToken(self.clone()))
-        } else {
-            None
-        }
-    }
-}
-
-impl phy::RxToken for RTLxRxToken {
-    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        // Dispatch to global packet tapping (AF_PACKET sockets)
-        super::net_defer_packet(&self.0);
-        f(&mut self.0)
-    }
-}
-
-impl phy::TxToken for RTLxTxToken {
-    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        // `len` comes from the IP layer, which this smoltcp never clamps to
-        // the device MTU (and it has no fragmentation), so indexing a fixed
-        // stack array with it panics the kernel on any oversized datagram —
-        // a single UDP `sendto` is enough. Refuse instead.
-        let mut buffer = [0u8; TX_SCRATCH_LEN];
-        if len > TX_SCRATCH_LEN {
-            return Err(smoltcp::Error::Exhausted);
-        }
-        let result = f(&mut buffer[..len]);
-        if result.is_ok() {
-            // Re-check ownership under the SAME lock as the send: transmit()
-            // gated on can_send() under a different lock acquisition, so on SMP
-            // another CPU can consume the slot in between.
-            let mut driver = (self.0).0.lock();
-            // Reclaim before asking. `can_send` reads the free-slot count off
-            // `tx_clean`, which only `tx_complete` advances -- see `handle_irq`
-            // for how a ring that fills up stays full.
-            driver.tx_complete();
-            // And when the slot really is gone, say so. This used to drop the
-            // frame and hand smoltcp back the closure's `Ok`, which tells the
-            // stack the frame went out. The e1000e paid for exactly that on real
-            // hardware and its own comment records the bill: the ingress path
-            // emits the ACK or window update for a received segment through the
-            // TxToken paired with that RxToken, having ALREADY advanced
-            // `remote_last_ack`/`remote_last_win`, so a dropped ACK is never
-            // re-emitted and the peer waits on a window it believes is closed.
-            // `Exhausted` is the answer smoltcp is built for: `socket_egress`
-            // breaks out of the burst and keeps the segment for the next poll.
-            if !driver.can_send() {
-                return Err(smoltcp::Error::Exhausted);
-            }
-            if driver.geth_send(&buffer[..len]).is_err() {
-                error!("rtl8211f: the GMAC refused a {}-byte frame", len);
-                return Err(smoltcp::Error::Exhausted);
-            }
-        }
-        result
     }
 }
 
@@ -612,23 +325,13 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
     let default_gateway = Ipv4Address::new(192, 168, 0, 1);
-    // Per-NIC storage — avoid the shared `static mut` aliasing bug fixed in e1000e.
-    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-        Box::leak(vec![None; 4].into_boxed_slice());
-    let mut routes = Routes::new(routes_storage);
-    routes.add_default_ipv4_route(default_gateway).unwrap();
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
-    let iface = InterfaceBuilder::new(net_driver.clone())
-        .ethernet_addr(ethernet_addr)
-        .neighbor_cache(neighbor_cache)
-        .ip_addrs(ip_addrs)
-        .routes(routes)
-        .finalize();
 
     info!("rtl8211f interface up with addr 192.168.0.123/24");
     info!("rtl8211f interface up with route 192.168.0.1/24");
     let rtl8211f_iface = RTLxInterface {
-        iface: Arc::new(Mutex::new(iface)),
+        mac: ethernet_addr,
+        ip_addrs: Arc::new(Mutex::new(ip_addrs)),
+        stats: Arc::new(Mutex::new(NetStats::default())),
         driver: net_driver,
         routes: Arc::new(Mutex::new(vec![RouteInfo {
             dst: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
@@ -641,12 +344,6 @@ pub fn rtlx_init<F: Fn(usize, usize) -> Option<usize>>(
 
     Ok(rtl8211f_iface)
 }
-
-//TODO: Global SocketSet
-// lazy_static::lazy_static! {
-//     pub static ref SOCKETS: Mutex<SocketSet<'static>> =
-//         Mutex::new(SocketSet::new(vec![]));
-// }
 
 /// The glue between the D1's GMAC and smoltcp, 465 lines with no tests.
 ///
@@ -662,7 +359,6 @@ mod tests {
     use super::*;
     use core::cell::RefCell;
     use rtl8211f::fake::{self, Phy};
-    use smoltcp::phy::{RxToken, TxToken};
 
     /// The interface the D1 boots with, over the faked GMAC.
     ///
@@ -671,10 +367,6 @@ mod tests {
     /// dereferences the literal address `0x0450_0048`.
     fn interface(irq: usize) -> RTLxInterface {
         rtlx_init(irq, |_paddr, _size| Some(0)).expect("a healthy GMAC must come up")
-    }
-
-    fn at(micros: i64) -> Instant {
-        Instant::from_micros(micros)
     }
 
     /// Leave `payload` in the next receive slot, the way the GMAC leaves a good
@@ -970,167 +662,7 @@ mod tests {
 
     // ----------------------------------------------------- what smoltcp sees
 
-    /// `geth_recv` spends its budget dropping a frame the GMAC marked bad and
-    /// hands back an empty `Vec`. That used to become an `RxToken` all the same:
-    /// a zero-length "frame" offered to every AF_PACKET listener and handed to
-    /// smoltcp as an Ethernet header. A bad frame is routine on a marginal
-    /// cable, which is the state this board boots in.
-    #[test]
-    fn a_frame_the_gmac_marked_bad_is_no_frame_at_all() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        stage_bad(&iface, &[0xa5u8; 64]);
-
-        let mut driver = iface.driver.clone();
-        assert!(
-            driver.receive().is_none(),
-            "an empty answer from `geth_recv` is no frame, not a zero-length one"
-        );
-    }
-
-    #[test]
-    fn the_frame_in_the_ring_is_the_frame_the_token_hands_over() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let payload = [0x5au8; 100];
-        stage(&iface, &payload);
-
-        let mut driver = iface.driver.clone();
-        let (rx, _tx) = driver.receive().expect("a good frame must come back");
-        rx.consume(at(0), |buf| {
-            assert_eq!(buf, &payload[..], "the payload came back changed");
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn an_empty_ring_offers_nothing_to_receive() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let mut driver = iface.driver.clone();
-        assert!(driver.receive().is_none());
-    }
-
-    /// Two numbers that have to move together: smoltcp's MTU counts the Ethernet
-    /// header, the scheme's does not.
-    #[test]
-    fn the_advertised_mtu_is_the_ethernet_header_plus_what_the_scheme_reports() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let caps = iface.driver.capabilities();
-        assert_eq!(caps.max_transmission_unit, iface.get_mtu() + 14);
-        assert_eq!(caps.medium, Medium::Ethernet);
-    }
-
     // ------------------------------------------------------------ transmitting
-
-    /// The length comes from the IP layer, which this smoltcp never clamps to the
-    /// device MTU and cannot fragment, so indexing the fixed scratch with it
-    /// panicked the kernel from a single oversized `sendto`.
-    #[test]
-    fn a_frame_too_big_for_the_scratch_is_refused_before_the_closure_writes_it() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let token = RTLxTxToken(iface.driver.clone());
-
-        let mut closure_ran = false;
-        let result: Result<()> = token.consume(at(0), TX_SCRATCH_LEN + 1, |_buf| {
-            closure_ran = true;
-            Ok(())
-        });
-
-        assert_eq!(result, Err(smoltcp::Error::Exhausted));
-        assert!(
-            !closure_ran,
-            "the closure must never see a buffer shorter than the length it asked for"
-        );
-    }
-
-    /// The lie. Dropping the frame and handing smoltcp back the closure's `Ok`
-    /// tells the stack it went out. The e1000e paid for that on real hardware:
-    /// the ACK for a received segment is emitted through the TxToken paired with
-    /// that RxToken, after smoltcp has already advanced its window state, so a
-    /// dropped ACK is never re-emitted and the transfer stalls.
-    #[test]
-    fn a_frame_the_ring_could_not_take_is_reported_as_exhausted_not_as_sent() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        stall_tx_ring(&iface);
-        let token = RTLxTxToken(iface.driver.clone());
-
-        let result: Result<()> = token.consume(at(0), 64, |buf| {
-            buf.fill(0xa5);
-            Ok(())
-        });
-
-        assert_eq!(
-            result,
-            Err(smoltcp::Error::Exhausted),
-            "`Exhausted` is what smoltcp is built for: it keeps the segment and \
-             retries on the next poll"
-        );
-    }
-
-    /// And the ring is only full once the descriptors the DMA finished with have
-    /// been reclaimed, which is the same `tx_complete` the interrupt handler owes.
-    #[test]
-    fn the_token_reclaims_what_the_dma_finished_before_it_calls_the_ring_full() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        full_but_finished_tx_ring(&iface);
-        let token = RTLxTxToken(iface.driver.clone());
-
-        let result: Result<()> = token.consume(at(0), 64, |buf| {
-            buf.fill(0xa5);
-            Ok(())
-        });
-
-        assert!(
-            result.is_ok(),
-            "every slot had been finished with; reclaiming them is what makes one free"
-        );
-    }
-
-    #[test]
-    fn the_bytes_the_closure_wrote_are_the_bytes_that_reach_the_ring() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let frame: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
-        let token = RTLxTxToken(iface.driver.clone());
-
-        let written = frame.clone();
-        token
-            .consume(at(0), written.len(), |buf| {
-                buf.copy_from_slice(&written);
-                Ok(())
-            })
-            .unwrap();
-
-        assert_eq!(
-            fake::tx_buffer(&iface.driver.0.lock(), 0, frame.len()),
-            frame,
-            "the frame the closure filled in is the frame handed to the GMAC"
-        );
-    }
-
-    /// A closure that fails posts nothing: the scratch it half-filled is not a
-    /// frame.
-    #[test]
-    fn a_closure_that_fails_posts_nothing() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let token = RTLxTxToken(iface.driver.clone());
-
-        let result: Result<()> = token.consume(at(0), 64, |_buf| Err(smoltcp::Error::Illegal));
-
-        assert_eq!(result, Err(smoltcp::Error::Illegal));
-        assert_eq!(
-            fake::tx_cursors(&iface.driver.0.lock()),
-            (0, 0),
-            "the ring cursors must not have moved"
-        );
-    }
 
     // ----------------------------------------------------- what userspace sees
 
@@ -1217,19 +749,6 @@ mod tests {
     }
 
     // --------------------------------------------------------- the addresses
-
-    /// What smoltcp's own routing table has for `dst`, which is a different
-    /// thing from the list `get_routes` reports: the scheme keeps its own copy
-    /// for `/proc/net/route`, and the stack routes by this one.
-    fn gateway_in_the_stack(iface: &RTLxInterface, dst: IpCidr) -> Option<IpAddress> {
-        let mut found = None;
-        iface
-            .iface
-            .lock()
-            .routes_mut()
-            .update(|routes| found = routes.get(&dst).map(|route| route.via_router));
-        found
-    }
 
     /// The address lands in the first IPv4 slot and nowhere else. The walk has
     /// to tell the slot it is setting from the ones it is blanking, and if it
@@ -1453,28 +972,6 @@ mod tests {
         );
     }
 
-    /// Deleting the default route takes it out of smoltcp's own table too, not
-    /// only out of the list the scheme reports. Leave it in and the kernel says
-    /// there is no gateway while the stack keeps sending through the old one.
-    #[test]
-    fn deleting_the_default_route_takes_it_out_of_the_stacks_own_table() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let default = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
-        assert_eq!(
-            gateway_in_the_stack(&iface, default),
-            Some(IpAddress::Ipv4(Ipv4Address::new(192, 168, 0, 1))),
-            "the board boots with a default route in the stack"
-        );
-
-        iface.del_route(default, None).unwrap();
-        assert_eq!(
-            gateway_in_the_stack(&iface, default),
-            None,
-            "the stack still routes through the gateway the kernel deleted"
-        );
-    }
-
     // ------------------------------------------------------- the poll and tap
 
     /// The frames the AF_PACKET tap was handed, in the order it got them.
@@ -1518,41 +1015,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------ transmitting
-
-    /// A ring with no free slot offers no transmit token. Hand one out anyway
-    /// and smoltcp writes a frame into a closure whose `geth_send` then refuses
-    /// it, which is a frame the stack believes it sent.
-    #[test]
-    fn a_stalled_ring_offers_no_transmit_token() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        stall_tx_ring(&iface);
-        let mut driver = iface.driver.clone();
-        assert!(
-            driver.transmit().is_none(),
-            "a full ring handed out a token"
-        );
-    }
-
-    /// A new default route reaches smoltcp's own table, not only the list the
-    /// kernel reports. Nothing tied the two together, so they could disagree:
-    /// `/proc/net/route` naming one gateway and every packet going to another.
-    #[test]
-    fn a_new_default_route_is_the_one_the_stack_routes_through() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let default = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
-        let gateway = Ipv4Address::new(10, 0, 0, 1);
-        iface
-            .add_route(default, Some(IpAddress::Ipv4(gateway)))
-            .unwrap();
-
-        assert_eq!(
-            gateway_in_the_stack(&iface, default),
-            Some(IpAddress::Ipv4(gateway)),
-            "the stack still routes through the gateway the board booted with"
-        );
-    }
 
     /// The same for IPv6: a route to a named prefix is not a default route and
     /// must leave the default route alone.
@@ -1636,56 +1098,6 @@ mod tests {
             networks.contains(&IpCidr::new(IpAddress::v4(128, 0, 0, 0), 1)),
             "a /1 address has a network like any other: {:?}",
             networks
-        );
-    }
-
-    /// A frame of exactly `TX_SCRATCH_LEN` bytes fits in the scratch, so the
-    /// closure gets to write it. Refuse at the limit rather than above it and
-    /// the largest frame the token has room for never reaches the closure at
-    /// all -- and the caller is told `Exhausted`, which means "try again
-    /// later" for a frame that will never fit.
-    #[test]
-    fn a_frame_that_exactly_fills_the_scratch_reaches_the_closure() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let mut driver = iface.driver.clone();
-        let token = driver.transmit().expect("an empty ring has room");
-
-        let mut asked = 0usize;
-        let out = token.consume(at(0), TX_SCRATCH_LEN, |buf| {
-            asked = buf.len();
-            buf.fill(0x5a);
-            Ok(())
-        });
-
-        assert_eq!(asked, TX_SCRATCH_LEN, "the closure was never called");
-        // And the GMAC takes it: its own per-buffer limit is wider than the
-        // scratch, so the scratch is the only thing deciding here.
-        assert!(out.is_ok(), "{:?}", out.err());
-    }
-
-    /// The frame posted is as long as the frame the closure wrote. The
-    /// descriptor carries the length in its low eleven bits and the scratch is
-    /// `TX_SCRATCH_LEN` bytes whatever the frame is, so posting the whole
-    /// scratch puts a 60-byte ARP on the wire as a 1536-byte frame -- which
-    /// every peer on it drops, while the ring and the counters say it was sent.
-    #[test]
-    fn the_frame_posted_is_as_long_as_the_frame_the_closure_wrote() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let mut driver = iface.driver.clone();
-        let token = driver.transmit().expect("an empty ring has room");
-        token
-            .consume(at(0), 60, |buf| {
-                buf.fill(0xa5);
-                Ok(())
-            })
-            .unwrap();
-
-        assert_eq!(
-            fake::tx_frame_len(&iface.driver.0.lock(), 0),
-            60,
-            "the descriptor announces a length the closure never wrote"
         );
     }
 
@@ -1781,169 +1193,6 @@ mod tests {
     // nothing in `add_ip_address` or `add_route` knows which caller built the
     // interface.
 
-    /// An interface over the faked GMAC with storage of this test's choosing.
-    fn interface_with(addrs: ManagedSlice<'static, IpCidr>, route_slots: usize) -> RTLxInterface {
-        let driver = RTLxDriver(Arc::new(Mutex::new(fake::driver())));
-        let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-            Box::leak(vec![None; route_slots].into_boxed_slice());
-        let iface = InterfaceBuilder::new(driver.clone())
-            .ethernet_addr(EthernetAddress::from_bytes(&[2, 0, 0, 0, 0, 1]))
-            .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-            .ip_addrs(addrs)
-            .routes(Routes::new(routes_storage))
-            .finalize();
-        RTLxInterface {
-            iface: Arc::new(Mutex::new(iface)),
-            driver,
-            routes: Arc::new(Mutex::new(Vec::new())),
-            name: String::from("rtl8211f"),
-            irq: 7,
-            lent: crate::net::lent::Lent::default(),
-        }
-    }
-
-    /// A fixed-size list, the way storage that was not allocated for the
-    /// occasion arrives.
-    fn borrowed(addrs: Vec<IpCidr>) -> ManagedSlice<'static, IpCidr> {
-        ManagedSlice::Borrowed(Box::leak(addrs.into_boxed_slice()))
-    }
-
-    /// `set_ipv4_address` writes the primary address into the first IPv4 slot
-    /// it finds. An interface with no IPv4 slot at all -- an IPv6-only one, or
-    /// one whose storage the board filled with link-locals -- has to get the
-    /// address anyway, or `ip addr add` on it does nothing and says it worked.
-    #[test]
-    fn an_address_list_with_no_ipv4_slot_still_takes_the_primary_address() {
-        let link_local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-        let iface = interface_with(
-            borrowed(vec![IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64))]),
-            4,
-        );
-        let wanted = Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 7), 24);
-
-        iface.set_ipv4_address(wanted).unwrap();
-
-        assert_eq!(
-            iface.get_ip_address(),
-            alloc::vec![IpCidr::Ipv4(wanted)],
-            "the only slot there was did not take the address"
-        );
-    }
-
-    /// And with nowhere at all to put it, it is dropped rather than panicking.
-    /// `addrs.iter_mut().next()` on an empty list is `None`, and indexing it
-    /// instead would turn a misconfigured interface into a kernel panic.
-    #[test]
-    fn an_empty_address_list_has_nowhere_to_put_the_primary_address() {
-        let iface = interface_with(borrowed(Vec::new()), 4);
-
-        iface
-            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 7), 24))
-            .expect("nowhere to put it is not an error");
-
-        assert!(iface.get_ip_address().is_empty());
-    }
-
-    /// `240.0.0.0/32` is the second sentinel the free-slot test knows, and the
-    /// four lines that know it are copied into three drivers. The loopback and
-    /// the e1000 each have a test for them; this one did not, so a sentinel
-    /// slot here was never reused and the address went to the fallback instead.
-    #[test]
-    fn the_other_free_slot_sentinel_is_reused_here_too() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        // The sentinel FIRST and two real addresses after it. With it last, the
-        // fallback for storage that cannot grow takes the newest slot and
-        // overwrites it anyway, so the test could not tell "the sentinel was
-        // recognised" from "the last slot was taken".
-        let sentinel = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
-        let kept = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
-        let newest = IpCidr::new(IpAddress::v4(192, 168, 1, 123), 24);
-        let iface = interface_with(borrowed(vec![sentinel, kept, newest]), 4);
-        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
-
-        iface.add_ip_address(added).unwrap();
-
-        let after = iface.get_ip_address();
-        assert!(
-            after.contains(&added),
-            "the sentinel slot was not reused: {:?}",
-            after
-        );
-        assert!(!after.contains(&sentinel), "{:?}", after);
-        assert!(
-            after.contains(&kept) && after.contains(&newest),
-            "a configured address was taken instead of the sentinel: {:?}",
-            after
-        );
-    }
-
-    /// `240.0.0.0` is only a free slot at `/32`. With any other prefix it is an
-    /// address somebody configured in `240.0.0.0/4`, and the next
-    /// `add_ip_address` must not write over it -- the same thing
-    /// `an_address_with_a_zero_prefix_is_still_an_address` holds for the other
-    /// sentinel. None of the three drivers that carry these four lines tested
-    /// it, which is what let the lot keep a mutant that dropped the prefix
-    /// check alive.
-    #[test]
-    fn the_sentinel_with_any_other_prefix_is_still_an_address() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        // First, not last: with no slot free the fallback takes the NEWEST one,
-        // so a sentinel sitting last would be overwritten either way and the
-        // two readings could not be told apart.
-        let configured = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 8);
-        let iface = interface_with(
-            borrowed(vec![
-                configured,
-                IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24),
-            ]),
-            4,
-        );
-        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
-
-        iface.add_ip_address(added).unwrap();
-
-        let after = iface.get_ip_address();
-        assert!(
-            after.contains(&configured),
-            "240.0.0.0/8 was taken for a free slot: {:?}",
-            after
-        );
-        assert!(after.contains(&added), "{:?}", after);
-    }
-
-    /// With every slot taken and no way to grow, the new address takes the
-    /// newest slot -- the best there is. The owned list grows instead, which
-    /// is the path `rtlx_init`'s own storage takes and the one already tested.
-    #[test]
-    fn an_address_list_that_cannot_grow_gives_up_its_newest_slot() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let oldest = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
-        let newest = IpCidr::new(IpAddress::v4(192, 168, 1, 123), 24);
-        let iface = interface_with(borrowed(vec![oldest, newest]), 4);
-        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
-
-        iface.add_ip_address(added).unwrap();
-
-        let after = iface.get_ip_address();
-        assert_eq!(after.len(), 2, "borrowed storage grew: {:?}", after);
-        assert!(after.contains(&oldest), "the oldest slot went: {:?}", after);
-        assert!(after.contains(&added), "{:?}", after);
-    }
-
-    /// Nowhere to put it and nothing to overwrite: the address is dropped and
-    /// the interface is left alone.
-    #[test]
-    fn an_empty_list_that_cannot_grow_takes_no_address_at_all() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface_with(borrowed(Vec::new()), 4);
-
-        iface
-            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
-            .expect("nowhere to put it is not an error");
-
-        assert!(iface.get_ip_address().is_empty());
-    }
-
     /// Removing an address the interface does not have takes nothing away.
     /// `ip addr del` on a stale address is routine, and a run off the end of
     /// the list that blanked a slot anyway would take the address the board
@@ -1962,58 +1211,6 @@ mod tests {
     }
 
     // --------------------------------------------------------------- routing
-
-    /// A routing table with no room says so instead of reporting a default
-    /// route it never installed. The kernel would then show a gateway smoltcp
-    /// does not route through, which is the hardest kind of networking bug to
-    /// read: every table agrees and no packet arrives.
-    #[test]
-    fn a_default_route_that_does_not_fit_is_reported_rather_than_swallowed() {
-        let iface = interface_with(
-            borrowed(vec![IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24)]),
-            0,
-        );
-
-        assert_eq!(
-            iface
-                .add_route(
-                    IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-                    Some(IpAddress::v4(192, 168, 0, 1)),
-                )
-                .err(),
-            Some(DeviceError::IoError),
-            "a default route that was not installed was reported as added"
-        );
-        assert!(
-            iface.get_routes().iter().all(|r| r.gateway.is_none()),
-            "the route was recorded although the stack refused it: {:?}",
-            iface.get_routes()
-        );
-    }
-
-    /// The same for IPv6, which has its own call and its own `?`.
-    #[test]
-    fn an_ipv6_default_route_that_does_not_fit_is_reported_too() {
-        let iface = interface_with(
-            borrowed(vec![IpCidr::Ipv6(Ipv6Cidr::new(
-                Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
-                64,
-            ))]),
-            0,
-        );
-
-        assert_eq!(
-            iface
-                .add_route(
-                    IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
-                    Some(IpAddress::Ipv6(Ipv6Address::new(
-                        0xfe80, 0, 0, 0, 0, 0, 0, 2
-                    ))),
-                )
-                .err(),
-            Some(DeviceError::IoError)
-        );
-    }
 
     /// Only one default route of a family can be in force, so a new one
     /// replaces the one before it -- and only that one. The purge used to run
@@ -2128,125 +1325,7 @@ mod tests {
         );
     }
 
-    /// `del_route` has to take an IPv6 default route out of the stack's own
-    /// table as well as out of the list the kernel reports. Only the IPv4 side
-    /// of that was tested, and the two are separate calls.
-    #[test]
-    fn deleting_the_ipv6_default_route_takes_it_out_of_the_stacks_table_too() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let v6_default = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
-        let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
-        iface
-            .add_route(v6_default, Some(IpAddress::Ipv6(gateway)))
-            .unwrap();
-        assert_eq!(
-            gateway_in_the_stack(&iface, v6_default),
-            Some(IpAddress::Ipv6(gateway)),
-            "the IPv6 default route never reached the stack"
-        );
-
-        iface.del_route(v6_default, None).unwrap();
-
-        assert_eq!(
-            gateway_in_the_stack(&iface, v6_default),
-            None,
-            "the stack still routes through a gateway the kernel has forgotten"
-        );
-        assert!(
-            !iface
-                .get_routes()
-                .iter()
-                .any(|r| r.gateway == Some(IpAddress::Ipv6(gateway))),
-            "the route is still in the list the kernel reports"
-        );
-    }
-
     // ------------------------------------------- the poll and what it wakes
-
-    /// An ARP request for this interface's own address, as a whole Ethernet
-    /// frame. smoltcp answers one of these out of the interface itself, with
-    /// no socket in the set, which is what makes it the one frame that can
-    /// prove the poll moved something.
-    fn arp_request_for_us() -> Vec<u8> {
-        let asker = EthernetAddress([0x02, 0, 0, 0, 0, 0x11]);
-        let arp = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
-            source_hardware_addr: asker,
-            source_protocol_addr: Ipv4Address::new(192, 168, 0, 1),
-            target_hardware_addr: EthernetAddress::BROADCAST,
-            target_protocol_addr: Ipv4Address::new(192, 168, 0, 123),
-        };
-        let eth = EthernetRepr {
-            src_addr: asker,
-            dst_addr: EthernetAddress::BROADCAST,
-            ethertype: EthernetProtocol::Arp,
-        };
-        let mut bytes = alloc::vec![0u8; eth.buffer_len() + arp.buffer_len()];
-        let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
-        eth.emit(&mut frame);
-        arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
-        bytes
-    }
-
-    /// The counterpart of `a_received_frame_reaches_an_af_packet_tap`, which
-    /// holds that a frame smoltcp could make nothing of wakes nobody. A frame
-    /// it DID act on has to wake the readers, once: on this driver nothing else
-    /// tells a reader parked on its net-RX wait that its bytes arrived, so
-    /// before that call it waited out its fallback park timer on every hop.
-    #[test]
-    fn a_poll_that_moved_a_packet_wakes_the_readers_once() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        crate::net::tests::alone_with_the_statics(|| {
-            crate::utils::host_hooks::reset();
-            let iface = interface(7);
-            stage(&iface, &arp_request_for_us());
-
-            iface.poll().expect("an ARP request is not a poll error");
-
-            assert_eq!(
-                crate::utils::host_hooks::WAKE_CALLS.load(core::sync::atomic::Ordering::SeqCst),
-                1,
-                "the stack acted on the frame and no reader was woken for it"
-            );
-        })
-    }
-
-    /// A frame the GMAC refuses after the closure has already written it comes
-    /// back as `Exhausted`, not as sent. `geth_send` refuses anything shorter
-    /// than an Ethernet header: its descriptor fill loop is `while len != 0`,
-    /// so a zero-length frame leaves the previous frame's length bits in place
-    /// with OWN set and never advances `tx_dirty`, and the ring desynchronises
-    /// for good.
-    ///
-    /// The stack has to be told, because the ingress path emits the ACK for a
-    /// received segment through the TxToken paired with its RxToken, having
-    /// already advanced `remote_last_ack` -- so an ACK reported as sent is
-    /// never re-emitted and the peer waits on a window it believes is closed.
-    #[test]
-    fn a_frame_the_gmac_refuses_comes_back_as_exhausted_not_as_sent() {
-        let _dev = fake::with_phy(Phy::gigabit_partner());
-        let iface = interface(7);
-        let (clean_before, dirty_before) = fake::tx_cursors(&iface.driver.0.lock());
-        let mut driver = iface.driver.clone();
-        let token = driver.transmit().expect("an empty ring has room");
-
-        let outcome = token.consume(at(0), 4, |buf| {
-            buf.fill(0xa5);
-            Ok(())
-        });
-
-        assert_eq!(
-            outcome.err(),
-            Some(smoltcp::Error::Exhausted),
-            "a frame the GMAC threw away was reported as sent"
-        );
-        assert_eq!(
-            fake::tx_cursors(&iface.driver.0.lock()),
-            (clean_before, dirty_before),
-            "the ring moved for a frame that never went out"
-        );
-    }
 
     // The error arm of `iface.poll()` is left alone, in all three places it
     // appears here (`poll`, `handle_irq` and the loopback's `poll`). smoltcp

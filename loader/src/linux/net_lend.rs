@@ -3,16 +3,14 @@
 //! the kernel drives, lent to a process that is the machine's network
 //! stack.
 //!
-//! The mirror of [`net_serve`](super::net_serve). There a process drives a
-//! card and the kernel has the stack; here the kernel keeps the driver --
-//! the registers, the rings, the interrupt -- and the stack is the
-//! process's (`tools/eclipse-netstack`), which has no driver of its own for
-//! such a card. The driver stops feeding the kernel's stack
-//! (`kernel_hal::drivers::net::lent`) and the card leaves the kernel's list
+//! The kernel keeps the driver -- the registers, the rings, the interrupt
+//! -- and the stack is the process's (`tools/eclipse-netstack`), which has
+//! no driver of its own for such a card. The driver gives its frames to
+//! the loan (`kernel_hal::drivers::net::lent`) and the card leaves the kernel's list
 //! of interfaces: the frames it receives are kept here, a [`LentCard`],
 //! until the process takes them.
 //!
-//! The messages are the ones of a served card, `op, slot, len, off`, over a
+//! The messages are `op, slot, len, off` ([`net_wire`](super::net_wire)), over a
 //! window cut into slots of [`SLOT`] bytes, receive slots first. Two things
 //! differ, and both because the other end is the kernel and not a process:
 //!
@@ -49,8 +47,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
+use kernel_hal::drivers::net::lent::frame_len_ok;
 use kernel_hal::drivers::net::lent::FrameTaker;
-use kernel_hal::drivers::net::served::frame_len_ok;
 use kernel_hal::drivers::prelude::{Device, DeviceError};
 use kernel_hal::drivers::scheme::NetScheme;
 use kernel_hal::user::{UserInPtr, UserOutPtr};
@@ -59,7 +57,7 @@ use zircon_object::object::*;
 use zircon_object::task::Process;
 use zircon_object::{ZxError, ZxResult};
 
-use super::net_serve::{decode, encode, MAX_TX_SLOTS, NET_MSG, OP_RX, OP_TX, SLOT};
+use super::net_wire::{decode, encode, MAX_TX_SLOTS, NET_MSG, OP_RX, OP_TX, SLOT};
 
 /// [`ECLIPSE_NET_LENT_TURN`](super::ECLIPSE_NET_LENT_TURN) flag: sleep
 /// until there is a message to answer with.

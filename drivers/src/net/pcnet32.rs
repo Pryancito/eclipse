@@ -37,16 +37,11 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities};
-use smoltcp::time::Instant;
 use smoltcp::wire::*;
-use smoltcp::Result;
 
 use super::{ip_cfg, timer_now_as_micros};
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
-use crate::net::get_sockets;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::utils::dma::DmaRegion;
 use crate::{Device, DeviceError, DeviceResult};
@@ -78,10 +73,6 @@ const PKT_BUF_SIZE: usize = 1544;
 
 /// The MTU advertised upwards, and the longest frame accepted for transmit.
 const MAX_FRAME: usize = 1514;
-
-/// Scratch for staging a frame smoltcp is about to write.
-const TX_SCRATCH_LEN: usize = 1536;
-const _: () = assert!(TX_SCRATCH_LEN >= MAX_FRAME);
 
 // ——— CSR / BCR numbers and bits ———
 
@@ -404,24 +395,6 @@ pub const fn next_desc(idx: usize) -> usize {
         0
     } else {
         idx + 1
-    }
-}
-
-/// Stage a buffer of exactly `len` bytes for smoltcp to write into, on the
-/// stack when it fits and on the heap when it does not.
-///
-/// `len` is whatever the IP layer computed, not a clamped MTU, so indexing a
-/// fixed array with it panics the kernel from one `sendto`.
-fn tx_stage<'a>(
-    len: usize,
-    scratch: &'a mut [u8; TX_SCRATCH_LEN],
-    heap: &'a mut Vec<u8>,
-) -> &'a mut [u8] {
-    if len <= TX_SCRATCH_LEN {
-        &mut scratch[..len]
-    } else {
-        heap.resize(len, 0);
-        &mut heap[..]
     }
 }
 
@@ -911,7 +884,7 @@ impl Pcnet32 {
     }
 }
 
-// ——— smoltcp glue ———
+// ——— The interface ———
 
 #[derive(Clone)]
 pub struct Pcnet32Driver {
@@ -919,117 +892,15 @@ pub struct Pcnet32Driver {
     pub stats: Arc<Mutex<NetStats>>,
 }
 
-pub struct Pcnet32RxToken {
-    data: Vec<u8>,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-pub struct Pcnet32TxToken {
-    driver: Pcnet32Driver,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-impl phy::Device<'_> for Pcnet32Driver {
-    type RxToken = Pcnet32RxToken;
-    type TxToken = Pcnet32TxToken;
-
-    fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.hw.lock().receive().map(|pkt| {
-            (
-                Pcnet32RxToken {
-                    data: pkt,
-                    stats: self.stats.clone(),
-                },
-                Pcnet32TxToken {
-                    driver: self.clone(),
-                    stats: self.stats.clone(),
-                },
-            )
-        })
-    }
-
-    fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.hw.lock().can_send() {
-            Some(Pcnet32TxToken {
-                driver: self.clone(),
-                stats: self.stats.clone(),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = MAX_FRAME;
-        // Leave `max_burst_size` unset: smoltcp clamps the TCP window to
-        // `burst * MSS` through a u16, so a burst of 64 wraps and caps the
-        // connection at a few Mbps. The same trap is documented in `e1000.rs`.
-        caps.max_burst_size = None;
-        caps
-    }
-}
-
-impl phy::RxToken for Pcnet32RxToken {
-    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        {
-            let mut stats = self.stats.lock();
-            stats.rx_packets += 1;
-            stats.rx_bytes += self.data.len() as u64;
-        }
-        // AF_PACKET taps, after smoltcp has let go of SOCKETS.
-        super::net_defer_packet(&self.data);
-        f(&mut self.data)
-    }
-}
-
-impl phy::TxToken for Pcnet32TxToken {
-    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        let buf: &mut [u8] = tx_stage(len, &mut scratch, &mut heap);
-        let result = f(buf)?;
-
-        let sent = {
-            let mut hw = self.driver.hw.lock();
-            hw.send(buf)
-        };
-
-        if !sent {
-            // NEVER report a dropped frame as sent. smoltcp emits the ACK for
-            // a received segment through the TxToken paired with its RxToken
-            // and has already advanced `remote_last_ack`, so an `Ok` here
-            // loses that ACK for good and the peer stalls on a window it
-            // believes is closed. `Err(Exhausted)` keeps smoltcp consistent so
-            // the segment is re-emitted.
-            let mut stats = self.stats.lock();
-            stats.tx_errors += 1;
-            return Err(smoltcp::Error::Exhausted);
-        }
-
-        let mut stats = self.stats.lock();
-        stats.tx_packets += 1;
-        stats.tx_bytes += len as u64;
-        Ok(result)
-    }
-}
-
 #[derive(Clone)]
 pub struct Pcnet32Interface {
-    iface: Arc<Mutex<Interface<'static, Pcnet32Driver>>>,
+    mac: EthernetAddress,
     driver: Pcnet32Driver,
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
-    /// Who the card's frames go to while it is lent to a stack that is not
-    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
-    /// them.
+    /// Who the card's frames go to while it is lent to the stack that
+    /// runs as a process ([`super::lent`]); empty, nobody has them.
     lent: super::lent::Lent,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
@@ -1037,41 +908,19 @@ pub struct Pcnet32Interface {
 }
 
 impl Pcnet32Interface {
-    /// Drain smoltcp WITHOUT touching the interrupt mask. The IRQ path unmasks
-    /// only after clearing `poll_pending`; unmasking in here would let a frame
-    /// arriving in the window fire an interrupt that finds `poll_pending`
-    /// still true, acknowledges the cause and queues nothing, losing the
-    /// frame until the next one arrives.
+    /// Empty the receive ring WITHOUT touching the interrupt mask. The IRQ
+    /// path unmasks only after clearing `poll_pending`; unmasking in here
+    /// would let a frame arriving in the window fire an interrupt that finds
+    /// `poll_pending` still true, acknowledges the cause and queues nothing,
+    /// losing the frame until the next one arrives.
     fn poll_inner(&self) -> DeviceResult {
-        // A card lent to a stack that is not the kernel's: its frames go
-        // to the borrower as they are, and the kernel's stack is not
-        // polled.
-        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
-            return Ok(());
+        // A card lent to the stack that runs as a process: its frames go
+        // to the borrower as they are. One that is not lent has no stack
+        // above it.
+        if !self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            super::lent::tap_only(&self.stats, || self.driver.hw.lock().receive());
         }
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        let sockets = get_sockets();
-        // `try_lock`, not a blocking acquire. This runs from a deferred job,
-        // and a socket syscall drains that queue WHILE holding the socket set.
-        // On this IRQ-off kernel a blocking acquire then spins forever on a
-        // lock the same CPU already owns -- the deadlock `e1000.rs` records
-        // hitting during a 64 MB download. Whoever holds the set drives the
-        // poll on release, so skipping loses nothing.
-        let res = match (sockets.try_lock(), self.iface.try_lock()) {
-            (Some(mut sockets), Some(mut iface)) => match iface.poll(&mut sockets, timestamp) {
-                Ok(p) => {
-                    trace!("[pcnet32] poll: {:?}", p);
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!("[pcnet32] poll got err {}", err);
-                    Err(DeviceError::IoError)
-                }
-            },
-            _ => Ok(()),
-        };
-        super::net_flush_deferred_packets();
-        res
+        Ok(())
     }
 }
 
@@ -1171,7 +1020,7 @@ impl NetScheme for Pcnet32Interface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        self.mac
     }
 
     fn ifname(&self) -> &str {
@@ -1188,15 +1037,6 @@ impl NetScheme for Pcnet32Interface {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         self.ip_addrs.lock().clone()
-    }
-
-    fn seed_neighbor(
-        &self,
-        protocol: smoltcp::wire::IpAddress,
-        hardware: EthernetAddress,
-    ) -> DeviceResult {
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        ip_cfg::seed_neighbor(&mut self.iface.lock(), protocol, hardware, timestamp)
     }
 
     fn poll(&self) -> DeviceResult {
@@ -1246,33 +1086,27 @@ impl NetScheme for Pcnet32Interface {
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        ip_cfg::set_ipv4_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::set_ipv4_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        ip_cfg::add_ip_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::add_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        ip_cfg::remove_ip_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::remove_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
-        ip_cfg::add_route(
-            &mut self.iface.lock(),
-            &mut self.routes.lock(),
-            cidr,
-            gateway,
-        )
+        ip_cfg::add_route(&mut self.routes.lock(), cidr, gateway)
     }
 
     fn del_route(&self, cidr: IpCidr, _gateway: Option<IpAddress>) -> DeviceResult {
-        ip_cfg::del_route(&mut self.iface.lock(), &mut self.routes.lock(), cidr)
+        ip_cfg::del_route(&mut self.routes.lock(), cidr)
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        let iface = self.iface.lock();
-        ip_cfg::reported_routes(&self.routes.lock(), iface.ip_addrs())
+        ip_cfg::reported_routes(&self.routes.lock(), &self.ip_addrs.lock())
     }
 
     fn get_stats(&self) -> NetStats {
@@ -1332,20 +1166,9 @@ pub fn init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    // Per-NIC route storage. A shared `static mut` would alias if two of these
-    // probed, corrupting both route tables.
-    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-        Box::leak(vec![None; 4].into_boxed_slice());
-    let iface = InterfaceBuilder::new(driver.clone())
-        .ethernet_addr(ethernet_addr)
-        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-        .ip_addrs(ip_addrs.clone())
-        .routes(Routes::new(routes_storage))
-        .finalize();
-
     crate::klog_info!("pcnet32 interface {} discovered", name);
     Ok(Pcnet32Interface {
-        iface: Arc::new(Mutex::new(iface)),
+        mac: ethernet_addr,
         driver,
         name,
         irq,

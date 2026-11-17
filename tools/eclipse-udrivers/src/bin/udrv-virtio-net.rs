@@ -1,24 +1,13 @@
-//! `udrv-virtio-net [N [REPORT_FD | stack=FD]]`: the driver of virtio
-//! network card `N` (default 0) that the kernel left to userspace
-//! (`udriver=virtio-net@N` on its command line).
+//! `udrv-virtio-net N stack=FD`: the driver of virtio network card `N`
+//! that the kernel left to userspace (`udriver=virtio-net@N` on its command
+//! line), for the network stack that runs as a process.
 //!
-//! The card goes to the kernel -- an interface, `ethN` -- and this process
-//! carries its frames until it is killed. It is what a supervisor runs
-//! (`eclipse-init`, the `unet` service). When it dies the kernel resets the
-//! card and keeps the interface for ten seconds, with its addresses, routes
-//! and connections: the next driver of the card with the same address gets
-//! the same interface.
-//!
-//! With `REPORT_FD`, the card's address (six bytes) is written to that
-//! descriptor once the card is the kernel's, for a parent that waits for
-//! it.
-//!
-//! With `stack=FD`, the card does not go to the kernel at all. `FD` holds
-//! one end of a channel, which the process that started this one made
-//! (`tools/eclipse-netstack`), and what the kernel would have been given
-//! goes down it instead: an [`Offer`] with the far end of the FIFO and the
-//! window. That process is then the only one that sees the card's frames,
-//! and they pass between the two without the kernel touching them.
+//! `FD` holds one end of a channel, which the process that started this
+//! one made (`tools/eclipse-netstack`, with `unetdriver=process`), and the
+//! card is offered down it: an [`Offer`] with the far end of the FIFO and
+//! the window. That process is then the only one that sees the card's
+//! frames, and they pass between the two without the kernel touching
+//! them. The kernel has no stack to give a card to.
 //!
 //! Exit status: 2 when the Zircon gateway is off, 1 on any other error and
 //! when the other end of the FIFO goes away.
@@ -29,18 +18,9 @@ use udrivers::channel::Channel;
 use udrivers::fifo::Fifo;
 use udrivers::net::{self, Msg, NoCard, Offer};
 use udrivers::status;
-use udrivers::zx::{self, nr};
 
 const NAME: &str = "udrv-virtio-net";
-const USAGE: &str = "usage: udrv-virtio-net [N [REPORT_FD | stack=FD]]";
-
-/// Who the card is served to.
-enum Taker {
-    /// The kernel, and the descriptor to report the address on, if any.
-    Kernel(Option<i32>),
-    /// The process at the other end of this channel.
-    Stack(Channel),
-}
+const USAGE: &str = "usage: udrv-virtio-net N stack=FD";
 
 fn die(what: impl std::fmt::Display) -> ! {
     println!("{NAME}: {what}");
@@ -54,13 +34,11 @@ fn main() {
         Some(Ok(index)) => index,
         Some(Err(_)) => die(USAGE),
     };
-    // The channel is taken out of its descriptor before anything else: a
-    // driver started for a stack must never fall back to the kernel.
-    let taker = match args.get(2).map(|a| a.strip_prefix("stack=").ok_or(a)) {
-        None => Taker::Kernel(None),
-        Some(Err(report)) => Taker::Kernel(report.parse().ok()),
-        Some(Ok(fd)) => match fd.parse().map(Channel::from_fd) {
-            Ok(Ok(channel)) => Taker::Stack(channel),
+    // The channel is taken out of its descriptor before anything else.
+    let channel = match args.get(2).and_then(|a| a.strip_prefix("stack=")) {
+        None => die(USAGE),
+        Some(fd) => match fd.parse().map(Channel::from_fd) {
+            Ok(Ok(channel)) => channel,
             Ok(Err(e)) => die(format_args!(
                 "stack={fd}: no channel in that descriptor: {e}"
             )),
@@ -68,7 +46,7 @@ fn main() {
         },
     };
 
-    // The slots are also the kernel's window: it copies a frame out of a
+    // The slots are also the stack's window: it copies a frame out of a
     // receive slot and into a transmit slot, and the card reads and writes
     // them where they are.
     let net::Driven {
@@ -94,44 +72,10 @@ fn main() {
 
     let (fifo, kernels) = Fifo::<Msg>::create(net::FIFO_DEPTH)
         .unwrap_or_else(|e| die(format_args!("fifo_create: {e}")));
-    let stack = matches!(taker, Taker::Stack(_));
-    match taker {
-        Taker::Kernel(report) => {
-            // SAFETY: no pointers: two handles, which go to the kernel, the
-            // address and a count.
-            if let Err(e) = unsafe {
-                zx::call(
-                    nr::ECLIPSE_NET_SERVE,
-                    [
-                        kernels as usize,
-                        window as usize,
-                        net::mac_word(mac) as usize,
-                        net::RX_BUFS,
-                        0,
-                        0,
-                    ],
-                )
-            } {
-                die(format_args!("net_serve: {e}"));
-            }
-            if let Some(fd) = report {
-                // SAFETY: the six bytes of `mac` to a descriptor the parent
-                // passed for this.
-                unsafe {
-                    if libc::write(fd, mac.as_ptr().cast(), mac.len()) != mac.len() as isize {
-                        die("write (report)");
-                    }
-                    libc::close(fd);
-                }
-            }
-        }
-        Taker::Stack(channel) => {
-            // The channel is closed once the offer is in it: the FIFO is
-            // what tells each side that the other has gone.
-            if let Err(e) = channel.write(&Offer::of(mac).to_bytes(), &[kernels, window]) {
-                die(format_args!("the stack did not take the card: {e}"));
-            }
-        }
+    // The channel is closed once the offer is in it: the FIFO is what
+    // tells each side that the other has gone.
+    if let Err(e) = channel.write(&Offer::of(mac).to_bytes(), &[kernels, window]) {
+        die(format_args!("the stack did not take the card: {e}"));
     }
 
     let place = format!("virtio-net@{index}");
@@ -140,7 +84,7 @@ fn main() {
         &[
             ("program", NAME),
             ("device", &place),
-            ("serves", if stack { "stack" } else { "kernel" }),
+            ("serves", "stack"),
             ("mac", &status::mac_text(mac)),
         ],
     );

@@ -1,8 +1,8 @@
 //! [`ECLIPSE_FIFO_REPLY_WAIT`](super::ECLIPSE_FIFO_REPLY_WAIT): a driver's
 //! whole turn on its FIFO in one syscall.
 //!
-//! A process that serves a device to the kernel (`block_serve`,
-//! `net_serve`) lives in a loop on one FIFO: answer what it was asked, find
+//! A process that serves a device to the kernel (`block_serve`)
+//! lives in a loop on one FIFO: answer what it was asked, find
 //! out what is asked next. With the Zircon calls alone that is a write, a
 //! read that finds nothing, a wait and a read -- four trips into the kernel
 //! for each request, and on the path of every block and every frame. This is

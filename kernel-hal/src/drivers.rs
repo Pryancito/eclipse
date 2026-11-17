@@ -330,27 +330,15 @@ pub fn primary_irq() -> &'static (dyn IrqScheme + Send + Sync + 'static) {
 }
 
 /// Returns all devices which implement the [`NetScheme`].
-/// From here on `lo` is only shown: the interface of smoltcp that was
-/// there, if one was, is taken off the list and
-/// [`zcore_drivers::net::ShownLoopback`] put in its place with its
-/// addresses and counters, and a machine that had no `lo` gets one. For
-/// the boot where every socket is a served one, which has nothing for the
-/// kernel's stack to carry to 127.0.0.1. `true` when there was one to
-/// retire.
-pub fn show_loopback_only() -> bool {
-    use zcore_drivers::net::ShownLoopback;
+/// A machine whose platform made no `lo` gets one, behind its cards.
+/// `true` when there was one already.
+pub fn ensure_loopback() -> bool {
     let mut list = DEVICES.net.0.write();
-    match list.iter().position(|d| d.is_loopback()) {
-        Some(at) => {
-            let shown = ShownLoopback::after(list[at].as_ref());
-            list[at] = Arc::new(shown);
-            true
-        }
-        None => {
-            list.push(Arc::new(ShownLoopback::new()));
-            false
-        }
+    let had = list.iter().any(|d| d.is_loopback());
+    if !had {
+        list.push(Arc::new(zcore_drivers::net::ShownLoopback::new()));
     }
+    had
 }
 
 pub fn all_net() -> &'static DeviceList<dyn NetScheme> {
@@ -1969,12 +1957,12 @@ mod shown_loopback_tests {
     /// A machine with no `lo` gets one, one that has it keeps one only,
     /// and it stays behind every card.
     #[test]
-    fn a_machine_is_left_with_one_lo_that_is_only_shown() {
+    fn a_machine_is_left_with_one_lo() {
         let had = loopbacks();
-        assert_eq!(show_loopback_only(), had > 0);
+        assert_eq!(ensure_loopback(), had > 0);
         assert_eq!(loopbacks(), had.max(1));
-        // Again: the one that is there is replaced, not added to.
-        assert!(show_loopback_only());
+        // Again: the one that is there stays, and none is added.
+        assert!(ensure_loopback());
         assert_eq!(loopbacks(), had.max(1));
         let lo = {
             let list = all_net().as_vec();

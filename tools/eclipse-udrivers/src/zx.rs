@@ -37,7 +37,6 @@ pub mod nr {
     pub const ECLIPSE_CHANNEL_REPLY_WAIT: i64 = 0x4004;
     pub const ECLIPSE_DEVICE_CLAIM: i64 = 0x4005;
     pub const ECLIPSE_BLOCK_SERVE: i64 = 0x4006;
-    pub const ECLIPSE_NET_SERVE: i64 = 0x4007;
     pub const ECLIPSE_FIFO_REPLY_WAIT: i64 = 0x4008;
     pub const ECLIPSE_NETSTACK_SERVE: i64 = 0x4009;
     pub const ECLIPSE_NET_BORROW: i64 = 0x400b;

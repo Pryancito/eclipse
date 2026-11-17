@@ -95,14 +95,6 @@ pub trait NetScheme: Scheme {
     fn get_arp_content(&self) -> String {
         String::new()
     }
-    /// Import a resolved IPv4/IPv6 neighbor into smoltcp's cache (for TCP/UDP egress).
-    fn seed_neighbor(
-        &self,
-        _protocol: smoltcp::wire::IpAddress,
-        _hardware: EthernetAddress,
-    ) -> DeviceResult {
-        Ok(())
-    }
     fn poll(&self) -> DeviceResult;
     /// SIOCSIFFLAGS / admin up — drivers may re-probe link (default no-op).
     fn refresh_link(&self) -> DeviceResult {
@@ -264,13 +256,6 @@ mod tests {
         assert_eq!(nic.set_promiscuous(true), Ok(()));
         assert_eq!(nic.set_allmulti(true), Ok(()));
         assert_eq!(nic.set_multicast_list(&[[1, 0, 0x5e, 0, 0, 1]]), Ok(()));
-        assert_eq!(
-            nic.seed_neighbor(
-                IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
-                EthernetAddress([0x02, 0, 0, 0, 0, 2])
-            ),
-            Ok(())
-        );
     }
 
     /// `NetStats` is handed around as `Default` in the default `get_stats`;
