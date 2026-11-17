@@ -217,50 +217,6 @@ pub fn netdev_for_ipv4(
     Err(LxError::ENODEV)
 }
 
-/// Pick the Ethernet netdev for an IPv6 destination (never loopback).
-pub fn netdev_for_ipv6(
-    dst: smoltcp::wire::Ipv6Address,
-) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
-    use smoltcp::wire::IpCidr;
-    let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
-    for iface in get_net_device().iter() {
-        if iface.is_loopback() {
-            continue;
-        }
-        for ip in iface.get_ip_address() {
-            if let IpCidr::Ipv6(cidr) = ip {
-                if cidr.prefix_len() == 0 || cidr.address().is_unspecified() {
-                    continue;
-                }
-                if cidr.contains_addr(&dst)
-                    && best.as_ref().is_none_or(|(p, _)| cidr.prefix_len() > *p)
-                {
-                    best = Some((cidr.prefix_len(), iface.clone()));
-                }
-            }
-        }
-    }
-    if let Some((_, dev)) = best {
-        return Ok(dev);
-    }
-    for iface in get_net_device().iter() {
-        if iface.is_loopback() {
-            continue;
-        }
-        let has_v6 = iface.get_ip_address().iter().any(|ip| {
-            matches!(
-                ip,
-                IpCidr::Ipv6(cidr)
-                    if cidr.prefix_len() > 0 && !cidr.address().is_unspecified()
-            )
-        });
-        if has_v6 {
-            return Ok(iface.clone());
-        }
-    }
-    Err(LxError::ENODEV)
-}
-
 pub fn iface_ipv4_cidr(iface: &dyn zcore_drivers::scheme::NetScheme) -> Option<Ipv4Cidr> {
     iface
         .get_ip_address()
@@ -321,20 +277,8 @@ pub fn prefix_len_from_netmask(addr: Ipv4Address) -> LxResult<u8> {
     Ok(prefix_len)
 }
 
-/// missing documentation
-pub mod tcp;
-pub use tcp::*;
-
-/// missing documentation
-pub mod udp;
-pub use udp::*;
-
 /// Sockets served by a network stack that runs as a process.
 pub mod user_stack;
-
-/// missing documentation
-pub mod raw;
-pub use raw::*;
 
 /// missing documentation
 pub mod packet;
@@ -345,12 +289,6 @@ pub mod netlink;
 pub use netlink::*;
 pub mod unix;
 pub use unix::*;
-pub mod listen_table;
-pub use listen_table::*;
-
-/// missing documentation
-pub mod icmp;
-pub use icmp::*;
 
 /// IPv4 → MAC cache (fed from RX frames).
 pub mod arp_cache;
@@ -358,9 +296,6 @@ pub use arp_cache::*;
 
 /// IPv6 → MAC cache (fed from RX frames).
 pub mod ndp_cache;
-
-/// ICMP echo replies from `push_packet` (ping RX).
-pub mod icmp_rx;
 
 /// IPv6 Router Advertisement handling (default route + SLAAC), fed from RX.
 pub mod ra;
@@ -371,7 +306,6 @@ pub mod wait;
 
 /// Who holds which inet socket, for hunter's network monitor.
 pub mod netmon;
-pub use icmp_rx::*;
 
 // pub mod stack;
 
@@ -413,10 +347,6 @@ pub const TCP_RECVBUF: usize = 512 * 1024;
 
 /// missing documentation
 pub const UDP_METADATA_BUF: usize = 256;
-/// missing documentation
-pub const UDP_SENDBUF: usize = 64 * 1024;
-/// missing documentation
-pub const UDP_RECVBUF: usize = 64 * 1024;
 
 /// Largest single kernel-heap `Vec` allocation (avoids multi‑MiB smoltcp/socket buffers).
 pub const MAX_KERNEL_VEC: usize = 4 * 1024 * 1024;
@@ -433,36 +363,9 @@ pub fn kernel_vec_zeroed(len: usize) -> crate::error::LxResult<alloc::vec::Vec<u
     Ok(v)
 }
 
-/// Fallible `vec![fill; n]` for socket metadata rings (UDP/RAW). Same contract
-/// as [`kernel_vec_zeroed`]: `ENOMEM` instead of `alloc_error`.
-pub fn kernel_vec_filled<T: Clone>(
-    n: usize,
-    fill: T,
-) -> crate::error::LxResult<alloc::vec::Vec<T>> {
-    let mut v = alloc::vec::Vec::new();
-    v.try_reserve_exact(n)
-        .map_err(|_| crate::error::LxError::ENOMEM)?;
-    v.resize(n, fill);
-    Ok(v)
-}
-
 // ========RAW
 
-/// missing documentation
-pub const RAW_METADATA_BUF: usize = 64;
-/// missing documentation
-pub const RAW_SENDBUF: usize = 64 * 1024; // 64K
-/// missing documentation
-pub const RAW_RECVBUF: usize = 64 * 1024; // 64K
-
 // ========RAW
-
-/// missing documentation
-pub const ICMP_METADATA_BUF: usize = 1024;
-/// missing documentation
-pub const ICMP_SENDBUF: usize = 64 * 1024; // 64K
-/// missing documentation
-pub const ICMP_RECVBUF: usize = 64 * 1024; // 64K
 
 // ========Other
 
@@ -911,15 +814,6 @@ pub fn prepare_ipv4_stack() {
     }
 }
 
-/// Poll smoltcp then pull any remaining RX into `push_packet` / `icmp_rx`.
-pub fn drain_ipv4_nic(dev: &dyn zcore_drivers::scheme::NetScheme, rounds: usize) {
-    for _ in 0..rounds {
-        kernel_hal::deferred_job::drain_deferred_jobs();
-        poll_netdev(dev);
-        netdev_drain_rx(dev);
-    }
-}
-
 /// Import software ARP/NDP learnings into smoltcp's neighbor cache (TCP/UDP egress).
 pub fn sync_neighbor_cache_into_smoltcp() {
     use smoltcp::wire::IpAddress;
@@ -1249,23 +1143,6 @@ pub fn poll_ifaces() {
     maybe_run_net_housekeeping(mono_us(), false);
 }
 
-/// Poll a single NIC once (smoltcp path — can hold the global socket set lock).
-pub fn poll_netdev(dev: &dyn zcore_drivers::scheme::NetScheme) {
-    kernel_hal::deferred_job::drain_deferred_jobs();
-    let _ = dev.poll();
-    kernel_hal::deferred_job::drain_deferred_jobs();
-}
-
-/// Pull RX from every non-loopback NIC into `push_packet` / `icmp_rx` (no throttle).
-pub fn drain_all_nic_rx() {
-    kernel_hal::deferred_job::drain_deferred_jobs();
-    kernel_hal::net::for_each_net_device(|dev| {
-        if !dev.is_loopback() {
-            netdev_drain_rx(dev);
-        }
-    });
-}
-
 /// Copy RX frames from the NIC ring into AF_PACKET (`push_packet`).
 ///
 /// This is the v0.5.0 path that made `udhcpc` see DHCPOFFER/DHCPACK. Driving
@@ -1305,26 +1182,6 @@ pub fn is_ipv4_placeholder(addr: smoltcp::wire::Ipv4Address) -> bool {
     addr == smoltcp::wire::Ipv4Address::new(240, 0, 0, 0)
 }
 
-/// True when `dst` is configured on a local interface (excluding placeholders / Class E).
-pub fn is_local_host_ipv4(dst: smoltcp::wire::Ipv4Address) -> bool {
-    use smoltcp::wire::IpCidr;
-    if dst.is_loopback() || !dst.is_unicast() || dst.0[0] >= 240 {
-        return false;
-    }
-    get_net_device().iter().any(|dev| {
-        dev.get_ip_address().iter().any(|ip| match ip {
-            IpCidr::Ipv4(cidr) => {
-                let addr = cidr.address();
-                !addr.is_unspecified()
-                    && !is_ipv4_placeholder(addr)
-                    && cidr.prefix_len() > 0
-                    && addr == dst
-            }
-            _ => false,
-        })
-    })
-}
-
 /// Pick a concrete IPv4 source for `dst` (skip 0.0.0.0/0 catch-all; prefer longest prefix).
 pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ipv4Address {
     use smoltcp::wire::{IpCidr, Ipv4Address};
@@ -1358,15 +1215,6 @@ pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ip
     Ipv4Address::UNSPECIFIED
 }
 
-/// Drive iface poll until pending smoltcp egress (ARP + TX) has had time to complete.
-///
-/// Rounds after the first are throttled (`drain_net_tick`), so 128 iterations
-/// were almost always no-ops that still paid several mutex lock/unlock pairs
-/// per `write()`. Four full polls is enough for ARP + the TX doorbell.
-pub fn flush_socket_egress() {
-    drain_net_poll(4);
-}
-
 /// A `SO_RCVTIMEO` / `SO_SNDTIMEO` value (`struct timeval`, 16 bytes) as the
 /// deadline of a call that starts now: `None` when it is zero, which is the
 /// default and means "wait for as long as it takes".
@@ -1389,73 +1237,6 @@ pub(crate) fn sockopt_deadline(tv: &[u8; 16]) -> Option<core::time::Duration> {
     }
     let ms = sec.max(0) as u64 * 1000 + (usec.max(0) as u64).div_ceil(1000);
     Some(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(ms.max(1)))
-}
-
-/// Whether a deadline from [`sockopt_deadline`] has passed. `None` never has.
-pub(crate) fn sockopt_deadline_passed(deadline: Option<core::time::Duration>) -> bool {
-    deadline.is_some_and(|d| kernel_hal::timer::timer_now() >= d)
-}
-
-fn is_ipv4_on_link(
-    dev: &dyn zcore_drivers::scheme::NetScheme,
-    dst: smoltcp::wire::Ipv4Address,
-) -> bool {
-    use smoltcp::wire::IpCidr;
-    dev.get_ip_address().iter().any(|cidr| match cidr {
-        IpCidr::Ipv4(v4) => {
-            let addr = v4.address();
-            v4.prefix_len() > 0
-                && !addr.is_unspecified()
-                && !is_ipv4_placeholder(addr)
-                && v4.contains_addr(&dst)
-        }
-        _ => false,
-    })
-}
-
-fn resolve_ipv4_next_hop(
-    dev: &dyn zcore_drivers::scheme::NetScheme,
-    dst: smoltcp::wire::Ipv4Address,
-) -> smoltcp::wire::Ipv4Address {
-    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
-
-    // Same subnet (e.g. 192.168.1.1): ARP the host directly — this is why router ping works.
-    if is_ipv4_on_link(dev, dst) {
-        return dst;
-    }
-
-    // Off-subnet (8.8.8.8, 172.x): never ARP the remote IP; always use the default gateway.
-    if let Some(gw) = ipv4_default_gateway(dev) {
-        return gw;
-    }
-
-    // Fallback: longest-prefix match with sane gateway on default routes.
-    let mut best: Option<(u8, Ipv4Address)> = None;
-    for route in dev.get_routes() {
-        let (prefix, matched) = match route.dst {
-            IpCidr::Ipv4(cidr) => (cidr.prefix_len(), cidr.contains_addr(&dst)),
-            _ => (0, false),
-        };
-        if !matched {
-            continue;
-        }
-        let next_hop = match (prefix, route.gateway) {
-            (_, Some(IpAddress::Ipv4(gw))) if !gw.is_unspecified() => gw,
-            (0, _) => infer_ipv4_gateway(dev).unwrap_or(dst),
-            _ => dst,
-        };
-        if best.is_none_or(|(p, _)| prefix > p) {
-            best = Some((prefix, next_hop));
-        }
-    }
-
-    let hop = best.map_or(dst, |(_, hop)| hop);
-    if hop == dst {
-        if let Some(gw) = infer_ipv4_gateway(dev) {
-            return gw;
-        }
-    }
-    hop
 }
 
 /// Guess the default gateway when DHCP/`ip route` did not install one.
@@ -1535,89 +1316,6 @@ pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
     }
 }
 
-/// Send a complete IPv4 datagram on the wire (same path as DHCP `PacketSocket`).
-pub fn send_ip_ethernet(ip: &[u8]) -> LxResult {
-    use smoltcp::wire::{
-        ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, Ipv4Packet,
-    };
-
-    if ip.len() < 20 {
-        return Err(LxError::EINVAL);
-    }
-    let pkt = Ipv4Packet::new_checked(ip).map_err(|_| LxError::EINVAL)?;
-    let dst = pkt.dst_addr();
-    if !dst.is_unicast() {
-        return Err(LxError::EINVAL);
-    }
-    let src = pkt.src_addr();
-    if src.is_unspecified() {
-        return Err(LxError::EINVAL);
-    }
-
-    let dev = netdev_for_ipv4(dst)?;
-    if has_usable_ipv4() {
-        prepare_ipv4_stack();
-    } else {
-        ensure_ipv4_default_route(dev.as_ref());
-    }
-    let arp_target = resolve_ipv4_next_hop(dev.as_ref(), dst);
-    if arp_target.is_unspecified() || !arp_target.is_unicast() {
-        return Err(LxError::EINVAL);
-    }
-    let our_mac_eth = dev.get_mac();
-
-    const ARP_TRIES: usize = 4;
-    for attempt in 0..ARP_TRIES {
-        if let Some(dst_mac) = arp_cache::lookup(arp_target) {
-            let mut frame = vec![0u8; 14 + ip.len()];
-            let mut eth = EthernetFrame::new_unchecked(&mut frame);
-            eth.set_dst_addr(dst_mac);
-            eth.set_src_addr(our_mac_eth);
-            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv4);
-            eth.payload_mut().copy_from_slice(ip);
-            dev.send(&frame).map_err(|_| LxError::EIO)?;
-            drain_ipv4_nic(dev.as_ref(), 4);
-            return Ok(());
-        }
-
-        // Broadcast ARP who-has (QEMU gateway answers quickly after DHCP).
-        let mut arp_buf = vec![0u8; 60];
-        {
-            let mut eth = EthernetFrame::new_unchecked(&mut arp_buf);
-            eth.set_dst_addr(EthernetAddress::BROADCAST);
-            eth.set_src_addr(our_mac_eth);
-            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Arp);
-            let repr = ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Request,
-                source_hardware_addr: our_mac_eth,
-                source_protocol_addr: src,
-                target_hardware_addr: EthernetAddress([0; 6]),
-                target_protocol_addr: arp_target,
-            };
-            repr.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
-        }
-        dev.send(&arp_buf).map_err(|_| LxError::EIO)?;
-        drain_ipv4_nic(dev.as_ref(), 4);
-        if attempt + 1 < ARP_TRIES {
-            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(25);
-            while kernel_hal::timer::timer_now() < deadline {
-                drain_ipv4_nic(dev.as_ref(), 2);
-                if arp_cache::lookup(arp_target).is_some() {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-        }
-        if arp_cache::lookup(arp_target).is_some() {
-            continue;
-        }
-        if attempt + 1 == ARP_TRIES {
-            break;
-        }
-    }
-    Err(LxError::EINVAL)
-}
-
 /// Pick a concrete IPv6 source for `dst` (skip ::/0 catch-all; prefer longest prefix).
 pub fn select_ipv6_for_dst(dst: smoltcp::wire::Ipv6Address) -> smoltcp::wire::Ipv6Address {
     use smoltcp::wire::{IpCidr, Ipv6Address};
@@ -1649,170 +1347,6 @@ pub fn select_ipv6_for_dst(dst: smoltcp::wire::Ipv6Address) -> smoltcp::wire::Ip
         }
     }
     Ipv6Address::UNSPECIFIED
-}
-
-fn resolve_ipv6_next_hop(
-    dev: &dyn zcore_drivers::scheme::NetScheme,
-    dst: smoltcp::wire::Ipv6Address,
-) -> smoltcp::wire::Ipv6Address {
-    use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address};
-
-    let on_link = dev.get_ip_address().iter().any(|cidr| match cidr {
-        IpCidr::Ipv6(v6) => {
-            v6.prefix_len() > 0 && !v6.address().is_unspecified() && v6.contains_addr(&dst)
-        }
-        _ => false,
-    });
-    if on_link {
-        return dst;
-    }
-
-    let mut best: Option<(u8, Ipv6Address)> = None;
-    for route in dev.get_routes() {
-        let (prefix, matched) = match route.dst {
-            IpCidr::Ipv6(cidr) => (cidr.prefix_len(), cidr.contains_addr(&dst)),
-            _ => (0, false),
-        };
-        if !matched {
-            continue;
-        }
-        let next_hop = match route.gateway {
-            Some(IpAddress::Ipv6(gw)) => gw,
-            _ => dst,
-        };
-        if best.is_none_or(|(p, _)| prefix > p) {
-            best = Some((prefix, next_hop));
-        }
-    }
-
-    best.map_or(dst, |(_, hop)| hop)
-}
-
-/// Send a complete IPv6 datagram on the wire.
-pub fn send_ip6_ethernet(ip: &[u8]) -> LxResult {
-    use smoltcp::wire::{
-        EthernetAddress, EthernetFrame, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol,
-        Ipv6Packet, Ipv6Repr, NdiscRepr,
-    };
-
-    if ip.len() < 40 {
-        return Err(LxError::EINVAL);
-    }
-    let pkt = Ipv6Packet::new_checked(ip).map_err(|_| LxError::EINVAL)?;
-    let dst = pkt.dst_addr();
-    if dst.is_multicast() {
-        // Send directly to the mapped multicast MAC address
-        let dev = netdev_for_ipv6(dst)?;
-        let our_mac_eth = dev.get_mac();
-        let dst_mac = EthernetAddress([
-            0x33,
-            0x33,
-            dst.as_bytes()[12],
-            dst.as_bytes()[13],
-            dst.as_bytes()[14],
-            dst.as_bytes()[15],
-        ]);
-        let mut frame = vec![0u8; 14 + ip.len()];
-        let mut eth = EthernetFrame::new_unchecked(&mut frame);
-        eth.set_dst_addr(dst_mac);
-        eth.set_src_addr(our_mac_eth);
-        eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
-        eth.payload_mut().copy_from_slice(ip);
-        dev.send(&frame).map_err(|_| LxError::EIO)?;
-        return Ok(());
-    }
-
-    if !dst.is_unicast() {
-        return Err(LxError::EINVAL);
-    }
-    let src = pkt.src_addr();
-    if src.is_unspecified() {
-        return Err(LxError::EINVAL);
-    }
-
-    let dev = netdev_for_ipv6(dst)?;
-    let ndp_target = resolve_ipv6_next_hop(dev.as_ref(), dst);
-    let our_mac_eth = dev.get_mac();
-
-    const NDP_TRIES: usize = 4;
-    for attempt in 0..NDP_TRIES {
-        if let Some(dst_mac) = ndp_cache::lookup(ndp_target) {
-            let mut frame = vec![0u8; 14 + ip.len()];
-            let mut eth = EthernetFrame::new_unchecked(&mut frame);
-            eth.set_dst_addr(dst_mac);
-            eth.set_src_addr(our_mac_eth);
-            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
-            eth.payload_mut().copy_from_slice(ip);
-            dev.send(&frame).map_err(|_| LxError::EIO)?;
-            poll_netdev(dev.as_ref());
-            return Ok(());
-        }
-
-        // Send Neighbor Solicitation (NDP who-has) to the target's solicited node multicast address
-        let solicited_node_ip = ndp_target.solicited_node();
-        let dst_mac = EthernetAddress([
-            0x33,
-            0x33,
-            solicited_node_ip.as_bytes()[12],
-            solicited_node_ip.as_bytes()[13],
-            solicited_node_ip.as_bytes()[14],
-            solicited_node_ip.as_bytes()[15],
-        ]);
-
-        // Construct NS packet
-        let ns_repr = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
-            target_addr: ndp_target,
-            lladdr: Some(our_mac_eth),
-        });
-
-        let ip_repr = Ipv6Repr {
-            src_addr: src,
-            dst_addr: solicited_node_ip,
-            next_header: IpProtocol::Icmpv6,
-            payload_len: ns_repr.buffer_len(),
-            hop_limit: 255,
-        };
-
-        let total_len = 14 + ip_repr.buffer_len() + ns_repr.buffer_len();
-        let mut ns_buf = vec![0u8; total_len];
-        {
-            let mut eth = EthernetFrame::new_unchecked(&mut ns_buf);
-            eth.set_dst_addr(dst_mac);
-            eth.set_src_addr(our_mac_eth);
-            eth.set_ethertype(smoltcp::wire::EthernetProtocol::Ipv6);
-
-            let mut ip_packet = Ipv6Packet::new_unchecked(eth.payload_mut());
-            ip_repr.emit(&mut ip_packet);
-
-            let mut icmp_packet = Icmpv6Packet::new_unchecked(ip_packet.payload_mut());
-            ns_repr.emit(
-                &IpAddress::Ipv6(src),
-                &IpAddress::Ipv6(solicited_node_ip),
-                &mut icmp_packet,
-                &smoltcp::phy::ChecksumCapabilities::default(),
-            );
-        }
-
-        dev.send(&ns_buf).map_err(|_| LxError::EIO)?;
-        drain_ipv4_nic(dev.as_ref(), 4);
-        if attempt + 1 < NDP_TRIES {
-            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(25);
-            while kernel_hal::timer::timer_now() < deadline {
-                drain_ipv4_nic(dev.as_ref(), 2);
-                if ndp_cache::lookup(ndp_target).is_some() {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-        }
-        if ndp_cache::lookup(ndp_target).is_some() {
-            continue;
-        }
-        if attempt + 1 == NDP_TRIES {
-            break;
-        }
-    }
-    Err(LxError::EINVAL)
 }
 
 // ============= SocketHandle =============
@@ -1881,20 +1415,7 @@ pub(crate) fn shutdown_sides(howto: usize) -> LxResult<(bool, bool)> {
 #[cfg(test)]
 pub(crate) static NET_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
 
-/// Spin the ephemeral port counter until its next answer is `port`, so a
-/// test can tell "skipped what is bound" from "the next number anyway".
-#[cfg(test)]
-pub(crate) fn rewind_ephemeral_port_to(port: u16) {
-    let before = if port == 49152 { 65534 } else { port - 1 };
-    for _ in 0..(2 * 16384) {
-        if get_ephemeral_port() == before {
-            return;
-        }
-    }
-    panic!("allocator never came round to {}", before);
-}
-
-fn get_ephemeral_port() -> u16 {
+pub(crate) fn get_ephemeral_port() -> u16 {
     use core::sync::atomic::{AtomicU16, Ordering};
     const LOW: u16 = 49152;
     static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
@@ -2608,7 +2129,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn tcp_nodelay(&self) -> bool {
         false
     }
-    /// True only for real `IPPROTO_TCP` sockets (`TcpSocketState`).
+    /// True only for real `IPPROTO_TCP` sockets (`ServedTcpSocket`).
     /// `SOCK_STREAM` alone is not enough (AF_UNIX streams are not TCP).
     fn is_tcp(&self) -> bool {
         false

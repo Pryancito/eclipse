@@ -2,9 +2,8 @@
 //! socket a process holds, with the process.
 //!
 //! Ownership lives in the descriptor tables, so this walks those and asks
-//! each socket what it is, whichever stack carries it (the kernel's own or
-//! the one that runs as a process): one [`hunter::netmon::Sock`] per (process, socket),
-//! the way `netstat -p` pairs them on Linux. A socket inherited across `fork`
+//! each socket what it is, as the stack that runs as a process carries it:
+//! one [`hunter::netmon::Sock`] per (process, socket), the way `netstat -p` pairs them on Linux. A socket inherited across `fork`
 //! shows under each holder.
 
 use alloc::string::{String, ToString};
@@ -128,7 +127,8 @@ pub fn on_listen(proc: &Arc<Process>, socket: &dyn Socket) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::{IpAddress, IpEndpoint, TcpSocketState, UdpSocketState, NET_TEST_LOCK};
+    use crate::net::user_stack::{ServedTcpSocket, ServedUdpSocket, StackLink};
+    use crate::net::{IpAddress, IpEndpoint, NET_TEST_LOCK};
 
     fn any(port: u16) -> Endpoint {
         Endpoint::Ip(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port))
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn a_bound_udp_socket_is_an_unconnected_listener() {
         let _g = NET_TEST_LOCK.lock();
-        let s = UdpSocketState::new(false).unwrap();
+        let s = ServedUdpSocket::new(StackLink::new(), false).unwrap();
         assert_eq!(Socket::bind(&s, any(40053)), Ok(0));
         let d = describe(9, String::from("/sbin/x"), &s).unwrap();
         assert_eq!(d.proto, Proto::Udp);
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn a_listening_tcp_socket_is_a_listener_without_a_peer() {
         let _g = NET_TEST_LOCK.lock();
-        let s = TcpSocketState::new(false).unwrap();
+        let s = ServedTcpSocket::new(StackLink::new(), false).unwrap();
         assert_eq!(Socket::bind(&s, any(40080)), Ok(0));
         assert_eq!(Socket::listen(&s), Ok(0));
         let d = describe(7, String::from("/usr/bin/nc"), &s).unwrap();
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn a_fresh_tcp_socket_is_closed_and_not_a_listener() {
         let _g = NET_TEST_LOCK.lock();
-        let s = TcpSocketState::new(false).unwrap();
+        let s = ServedTcpSocket::new(StackLink::new(), false).unwrap();
         let d = describe(7, String::from("/x"), &s).unwrap();
         assert_eq!(d.state, State::Closed);
         assert!(!d.is_listener());

@@ -77,7 +77,7 @@ fn insert_bounded(
 /// Learn mappings from a complete Ethernet frame (called from `push_packet`).
 pub fn learn_from_frame(frame: &[u8]) {
     // Same L2 parse as the other three parsers `push_packet` feeds
-    // (`ndp_cache`, `icmp_rx`, `ra`): 14 bytes, or 18 with an 802.1Q tag.
+    // (`ndp_cache`, `ra`): 14 bytes, or 18 with an 802.1Q tag.
     let Some((l2, ethertype)) = crate::net::packet::eth_l2_header_len(frame) else {
         return;
     };
@@ -170,7 +170,7 @@ pub fn get_entries() -> alloc::vec::Vec<(Ipv4Address, EthernetAddress)> {
 mod tests {
     //! The software ARP cache, which is what `mod.rs` asks for the next-hop
     //! MAC before it hand-builds an IPv4 frame. It is fed from `push_packet`
-    //! alongside `ndp_cache`, `icmp_rx` and `ra`; those three parsed the L2
+    //! alongside `ndp_cache` and `ra` (and `icmp_rx`, since removed); those three parsed the L2
     //! header the same way and this one did not.
 
     use super::*;

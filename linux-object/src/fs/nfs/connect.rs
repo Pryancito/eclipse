@@ -206,17 +206,19 @@ pub(crate) fn connect_sync<D: StackDriver>(
     );
     let handle = crate::net::register_smoltcp_socket(socket)?;
 
-    // The local port is picked and used under one hold of the socket set, so
-    // no other socket can take it in between -- the same reason `tcp.rs`
-    // gives for doing it that way, and the same race if it is not.
+    // The kernel's own TCP sockets are gone, so the only sockets of the set
+    // are the ones made here: the port counter alone does not collide.
     {
         let sockets = get_sockets();
         let mut sets = sockets.lock();
-        let local = crate::net::tcp::free_ephemeral_port(&sets, IpAddress::Unspecified)
-            .ok_or(LxError::EADDRNOTAVAIL)?;
+        let local = crate::net::get_ephemeral_port();
         sets.get::<TcpSocket>(handle.inner())
             .connect((addr, port), IpEndpoint::new(IpAddress::Unspecified, local))
-            .map_err(crate::net::tcp::connect_error)?;
+            .map_err(|e| match e {
+                smoltcp::Error::Unaddressable => LxError::ECONNREFUSED,
+                smoltcp::Error::Illegal => LxError::EISCONN,
+                _ => LxError::ENOBUFS,
+            })?;
     }
 
     wait_for_handshake(&handle, timeout_ms, driver)?;
