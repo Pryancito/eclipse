@@ -35,11 +35,22 @@
 //!                          24  [u8; 4] address  28  [u8; 4] gateway
 //! ```
 //!
-//! `card` is that card's number here ([`number_of`]), never 0, which is
-//! the card the kernel was given its sockets with; no address is a card
-//! that lost its own. What a card has carried (`COUNTS`) and what it has
+//! `card` is that card's number here ([`number_of`]): 0 is the first,
+//! which the kernel was given its sockets with; no address is a card
+//! that has none yet, or lost its own. What a card has carried (`COUNTS`) and what it has
 //! of IPv6 (`SIX`) say the same number where a socket's would be
 //! ([`of_card`]).
+//!
+//! What the kernel asks of a card, because somebody on the machine did
+//! (`ip addr`, `ip route`, `ifconfig`), names it by the same number:
+//!
+//! ```text
+//! ADDRESS  (kernel to stack)  8  u64 card  16  [u8; 4] address  20  u8 prefix  21  three zero
+//! GATEWAY  (kernel to stack)  8  u64 card  16  [u8; 4] gateway
+//! ```
+//!
+//! all zero for none ([`asked`]). The card has that address from then
+//! on and asks no server for one, and is said again as it is.
 //!
 //! What this does not do: the frames of every card are the first
 //! interface's to a packet socket, a frame such a socket sends leaves by
@@ -69,10 +80,55 @@ pub fn numbers_of(slot: usize) -> u64 {
 /// The operation of the message that says a card.
 pub const OP_CARD: u32 = 31;
 
-/// The number the kernel knows the card in place `slot` by, when it is
-/// not the one it was given its sockets with (which is 0).
+/// The operations of the messages that ask for a card's address and
+/// gateway.
+pub const OP_ADDRESS: u32 = 32;
+pub const OP_GATEWAY: u32 = 33;
+
+/// The number the kernel knows the card in place `slot` by: 0 is the
+/// first, which it was given its sockets with.
 pub fn number_of(slot: usize) -> u64 {
-    slot as u64 + 1
+    slot as u64
+}
+
+/// What the kernel asks of a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// To have this address and network, or none.
+    Address(Option<Ipv4Cidr>),
+    /// To send what is not for its network to this gateway, or nowhere.
+    Gateway(Option<Ipv4Address>),
+}
+
+/// What `m` asks, and of which card, when it is an `ADDRESS` or a
+/// `GATEWAY`: `Err` for one that says no address a card has.
+pub fn asked(m: &[u8]) -> Option<Result<(u64, Ask), Refused>> {
+    let (op, card) = parse_header(m)?;
+    let said = &m[HEADER_LEN..];
+    let four = |at: usize| said.get(at..at + 4).map(Ipv4Address::from_bytes);
+    Some(match op {
+        OP_ADDRESS => match (four(0), said.get(4..8)) {
+            (Some(address), Some(&[0, 0, 0, 0])) if address.is_unspecified() => {
+                Ok((card, Ask::Address(None)))
+            }
+            (Some(address), Some(&[prefix @ 1..=32, 0, 0, 0]))
+                if said.len() == 8 && address.is_unicast() && !address.is_loopback() =>
+            {
+                Ok((card, Ask::Address(Some(Ipv4Cidr::new(address, prefix)))))
+            }
+            _ => Err(Refused::Malformed),
+        },
+        OP_GATEWAY => match four(0) {
+            Some(gateway) if said.len() == 4 && gateway.is_unspecified() => {
+                Ok((card, Ask::Gateway(None)))
+            }
+            Some(gateway) if said.len() == 4 && gateway.is_unicast() => {
+                Ok((card, Ask::Gateway(Some(gateway))))
+            }
+            _ => Err(Refused::Malformed),
+        },
+        _ => return None,
+    })
 }
 
 /// `m`, a message about a card (`COUNTS`, `SIX`), as one about card
@@ -267,10 +323,42 @@ mod tests {
         let m = card_message(2, mac, None, Some(Ipv4Address([10, 0, 4, 2])));
         assert_eq!(m[HEADER_LEN + 6..], [0; 10]);
         // The first card is 0, and no other is.
-        assert_eq!(number_of(0), 1);
+        assert_eq!((number_of(0), number_of(1)), (0, 1));
         let mut counts = crate::counts::Counts::default().message();
-        of_card(&mut counts, number_of(1));
+        of_card(&mut counts, number_of(2));
         assert_eq!(parse_header(&counts), Some((crate::counts::OP_COUNTS, 2)));
+    }
+
+    #[test]
+    fn what_the_kernel_asks_of_a_card_is_read_as_it_lays_it_out() {
+        // The same bytes `linux-object/src/net/user_stack/cards.rs` writes.
+        let address = message(OP_ADDRESS, 1, &[192, 168, 7, 9, 24, 0, 0, 0]);
+        let cidr = Ipv4Cidr::new(Ipv4Address([192, 168, 7, 9]), 24);
+        assert_eq!(asked(&address), Some(Ok((1, Ask::Address(Some(cidr))))));
+        let none = message(OP_ADDRESS, 0, &[0; 8]);
+        assert_eq!(asked(&none), Some(Ok((0, Ask::Address(None)))));
+        let gateway = message(OP_GATEWAY, 1, &[192, 168, 7, 1]);
+        let router = Ipv4Address([192, 168, 7, 1]);
+        assert_eq!(asked(&gateway), Some(Ok((1, Ask::Gateway(Some(router))))));
+        assert_eq!(
+            asked(&message(OP_GATEWAY, 1, &[0; 4])),
+            Some(Ok((1, Ask::Gateway(None))))
+        );
+        // What is no address of a card's, and what is cut short.
+        for bad in [
+            message(OP_ADDRESS, 1, &[192, 168, 7, 9, 0, 0, 0, 0]),
+            message(OP_ADDRESS, 1, &[192, 168, 7, 9, 33, 0, 0, 0]),
+            message(OP_ADDRESS, 1, &[224, 0, 0, 1, 24, 0, 0, 0]),
+            message(OP_ADDRESS, 1, &[127, 0, 0, 1, 8, 0, 0, 0]),
+            message(OP_ADDRESS, 1, &[192, 168, 7, 9, 24]),
+            message(OP_GATEWAY, 1, &[255, 255, 255, 255]),
+            message(OP_GATEWAY, 1, &[192, 168, 7]),
+        ] {
+            assert_eq!(asked(&bad), Some(Err(Refused::Malformed)), "{bad:?}");
+        }
+        // Anything else is no such asking.
+        assert_eq!(asked(&bind(7, 4000)), None);
+        assert_eq!(asked(&[1, 2, 3]), None);
     }
 
     #[test]

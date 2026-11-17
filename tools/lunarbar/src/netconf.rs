@@ -465,6 +465,19 @@ pub fn stack_cards(servers: &Path) -> Vec<String> {
     macs
 }
 
+/// Where the kernel lists the cards it leaves or lends to a process.
+pub const UDRIVERS: &str = "/proc/udrivers";
+
+/// Whether to wait before configuring anything: the boot lends a card of
+/// the kernel's to a stack that runs as a process (a `kernel-net@` line of
+/// `udrivers`, the text of [`UDRIVERS`]), and no such stack has said its
+/// cards yet. Until it borrows them they are still among the kernel's
+/// interfaces, and a DHCP client started on one would go on speaking for
+/// the stack's card that takes its name.
+pub fn awaits_stack(udrivers: &str, servers: &Path) -> bool {
+    udrivers.lines().any(|l| l.trim().starts_with("kernel-net@")) && stack_cards(servers).is_empty()
+}
+
 /// The interfaces this service is to configure, and whether a stack that
 /// runs as a process has a card. The card of such a stack is that stack's
 /// to configure, with the address it was started with or its own DHCP
@@ -752,6 +765,22 @@ mod tests {
         let d = plan(&Iface::new("eth0"));
         assert!(d.dhcp4 && !d.dhcp6);
         assert_eq!(d.commands.len(), 1);
+    }
+
+    #[test]
+    fn a_card_the_kernel_lends_is_waited_for_until_its_stack_says_it() {
+        let servers = std::env::temp_dir().join(format!("lunarnet-awaits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&servers);
+        // No card lent: nothing to wait for, with or without a directory.
+        assert!(!awaits_stack("", &servers));
+        assert!(!awaits_stack("virtio-net@0\n", &servers));
+        assert!(awaits_stack("kernel-net@0\n", &servers));
+        std::fs::create_dir_all(&servers).unwrap();
+        std::fs::write(servers.join("driver.virtio-blk@0"), "pid=3\n").unwrap();
+        assert!(awaits_stack("virtio-blk@0\n kernel-net@0\n", &servers));
+        std::fs::write(servers.join("stack.kernel-net@0"), "pid=9\nmac=52:54:00:00:00:03\n").unwrap();
+        assert!(!awaits_stack("kernel-net@0\n", &servers));
+        let _ = std::fs::remove_dir_all(&servers);
     }
 
     #[test]

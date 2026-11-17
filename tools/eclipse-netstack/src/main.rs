@@ -47,10 +47,9 @@
 //! started with: every one the boot lends is borrowed at the start, and
 //! each has a stack of its own here, with its settings' address or a
 //! lease's, a thread for its frames and one for its time. The kernel
-//! still speaks on one channel, which it is given with the first card
-//! that has an address; the others are said to it apart, each when it
-//! has one, and what the kernel says goes to the stack of the card it is
-//! for (`netstack::cards`).
+//! still speaks on one channel, which it is given with the first card;
+//! the others are said to it apart, and what the kernel says goes to the
+//! stack of the card it is for (`netstack::cards`).
 //!
 //! Three threads share the stack, under one lock. The card's sleeps on
 //! the card's interrupt (or on the driver's FIFO), takes what the card
@@ -75,20 +74,22 @@
 //! (`netstack::counts`), by whichever thread has just had a turn, and by
 //! the third when no turn comes to say the last of it.
 //!
-//! The kernel is told the address once, for `getsockname`, when it is
-//! given its sockets: at the start for an address that is written, with
-//! the first lease for one that is asked for. A lease that comes back with
-//! another address ends this process, for whoever started it to start it
-//! again: the connections were the old address's.
+//! The kernel is given its sockets at the start, with the first card and
+//! the address it has then, if it has one, and is told each card again
+//! whenever its address or its gateway changes (`CARD`): with a lease,
+//! when one is lost, and when somebody on the machine sets them (`ip
+//! addr`, `ip route`, `ifconfig`), which the kernel asks of this stack
+//! (`ADDRESS`, `GATEWAY`: `netstack::cards`). An address set that way
+//! stays: no server is asked for one after it.
 //!
 //! Exit status: 2 for a command line that is not one, 1 when there is no
 //! card to take, when the card fails, and when a driver of its own cannot
-//! be started or gives no card, 3 when the lease's address changed.
+//! be started or gives no card.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{exit, Child, Command};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
@@ -559,12 +560,12 @@ struct Host {
     /// stack started, as they said it ([`governed`]).
     governed: Option<String>,
     shared: Mutex<Shared>,
-    /// The kernel's sockets, from when it was told this stack's address.
+    /// The kernel's sockets, once it has them here.
     kernel: OnceLock<Arc<Kernel>>,
-    /// The card the kernel was told, or would have been had it wanted a
-    /// stack: `getsockname` answers with its address, and the machine's
-    /// interfaces show it, for as long as this process lasts.
-    told: Mutex<Option<Card>>,
+    /// Whether the card's address was set by somebody on the machine
+    /// (`ip addr`, `ifconfig`), and not by the command line, the
+    /// settings or a lease.
+    by_hand: AtomicBool,
     /// The name servers of the lease and of the routers, as last heard:
     /// held while they are written down, and never with the stack's
     /// lock.
@@ -586,17 +587,6 @@ struct Host {
 /// the card the command line names. Set once, before any thread but the
 /// first runs.
 static HOSTS: OnceLock<Vec<Arc<Host>>> = OnceLock::new();
-/// The place of the host whose card the kernel was told, once it was:
-/// the first that had an address.
-static SHOWN: OnceLock<usize> = OnceLock::new();
-/// When the hosts were made, and how long from then the first card has
-/// to get an address before another is the one the kernel is told: about
-/// what a DHCP server takes to answer.
-static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
-const HEAD_START: Duration = Duration::from_secs(3);
-/// Held to decide which host that is.
-static TELLING: Mutex<()> = Mutex::new(());
-
 fn hosts() -> &'static [Arc<Host>] {
     HOSTS.get().map_or(&[], |hosts| hosts.as_slice())
 }
@@ -605,28 +595,24 @@ impl Host {
     /// Whether this host's card is the one the kernel was given its
     /// sockets with: the stack's address, as far as it knows.
     fn shown(&self) -> bool {
-        SHOWN.get() == Some(&self.slot)
+        self.slot == 0
     }
 
-    /// The number the kernel knows this host's card by: 0 for the one it
-    /// was given its sockets with.
+    /// The number the kernel knows this host's card by.
     fn card(&self) -> u64 {
-        if self.shown() {
-            0
-        } else {
-            cards::number_of(self.slot)
-        }
+        cards::number_of(self.slot)
     }
 
-    /// Tell the kernel this host's card, which is not the one it was
-    /// given its sockets with: its address now, or that it has none.
+    /// Tell the kernel this host's card as it is now: its address and
+    /// its gateway, or that it has none.
     fn say_card(&self) {
-        let Some(kernel) = self.kernel.get().filter(|_| !self.shown()) else {
+        let Some(kernel) = self.kernel.get() else {
             return;
         };
-        let told = *locked(&self.told);
-        let (address, gateway) =
-            told.map_or((None, None), |card| (Some(card.address), card.gateway));
+        let (address, gateway) = {
+            let shared = locked(&self.shared);
+            (shared.stack.address(), shared.stack.gateway())
+        };
         let said = cards::card_message(self.card(), self.mac, address, gateway);
         // A kernel that is gone took the machine with it.
         let _ = kernel.channel.write(&said, &[]);
@@ -1004,7 +990,7 @@ const BURST: usize = 16;
 /// frames they made.
 fn serve_sockets(kernel: Arc<Kernel>) {
     let hosts = hosts();
-    let shown = SHOWN.get().copied().unwrap_or(0);
+    let shown = 0;
     let mut message = vec![0u8; MESSAGE_MAX];
     let mut msgs = [Msg::default(); TURN];
     let mut data = Vec::with_capacity(MESSAGE_MAX);
@@ -1022,11 +1008,13 @@ fn serve_sockets(kernel: Arc<Kernel>) {
         let (mut sends, mut answers) = (0u32, 0u32);
         for done in 1.. {
             let said = &message[..len];
-            let asked = match hosts {
-                [host] => locked(&host.shared).stack.request(said).map(u32::from),
+            let asked = match (cards::asked(said), hosts) {
+                // For a card's address, not for a socket.
+                (Some(ask), _) => ask.and_then(configure).map(|()| 0),
+                (None, [host]) => locked(&host.shared).stack.request(said).map(u32::from),
                 // Each card's stack, all held while the message finds
                 // the ones it is for.
-                hosts => {
+                (None, hosts) => {
                     let mut held: Vec<_> = hosts.iter().map(|host| locked(&host.shared)).collect();
                     let mut stacks: Vec<_> = held.iter_mut().map(|held| &mut held.stack).collect();
                     cards::request(&mut stacks, shown, said)
@@ -1108,7 +1096,17 @@ fn keep_time(host: Arc<Host>) {
 
 /// Become the stack the kernel's served sockets use: the channel it will
 /// speak on, or why there is none.
-fn register(max_datagram: usize, card: Card) -> Result<Arc<Kernel>, String> {
+fn register(host: &Host) -> Result<Arc<Kernel>, String> {
+    let (max_datagram, address, gateway) = {
+        let shared = locked(&host.shared);
+        let stack = &shared.stack;
+        (stack.max_datagram(), stack.address(), stack.gateway())
+    };
+    // The MAC as a number, first byte highest: how it fits one argument.
+    let mac = host
+        .mac
+        .iter()
+        .fold(0u64, |n, &byte| n << 8 | u64::from(byte));
     let (ours, theirs) = Channel::create().map_err(|e| format!("channel_create: {e}"))?;
     let theirs = theirs.into_handle();
     // SAFETY: no pointers. The handle is the kernel's when the call works.
@@ -1118,10 +1116,10 @@ fn register(max_datagram: usize, card: Card) -> Result<Arc<Kernel>, String> {
             [
                 theirs as usize,
                 max_datagram,
-                u32::from_be_bytes(card.address.address().0) as usize,
-                card.address.prefix_len() as usize,
-                card.gateway.map_or(0, |g| u32::from_be_bytes(g.0)) as usize,
-                card.mac_number() as usize,
+                address.map_or(0, |a| u32::from_be_bytes(a.address().0)) as usize,
+                address.map_or(0, |a| a.prefix_len()) as usize,
+                gateway.map_or(0, |g| u32::from_be_bytes(g.0)) as usize,
+                mac as usize,
             ],
         )
     };
@@ -1140,80 +1138,78 @@ fn register(max_datagram: usize, card: Card) -> Result<Arc<Kernel>, String> {
     }
 }
 
-/// What the kernel is told of the card when it is given its sockets: the
-/// address the sockets have, and with the network, the gateway and the MAC
-/// what a kernel where every program uses this stack shows as the
-/// machine's interface (`ifconfig`, `ip`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Card {
-    mac: [u8; 6],
-    address: Ipv4Cidr,
-    gateway: Option<Ipv4Address>,
-}
-
-impl Card {
-    /// The MAC as a number, first byte highest: how it fits one argument.
-    fn mac_number(&self) -> u64 {
-        self.mac.iter().fold(0, |n, &byte| n << 8 | u64::from(byte))
-    }
-}
-
-/// Give the kernel its sockets on the stacks of this process, now that
-/// this host's card has an address: once, by the first card that has one,
-/// since the kernel is told that card with them. A second address or
-/// gateway for that card is the end of this process; another card's is
-/// that card's own business.
-fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address>) {
-    let card = Card {
-        mac: host.mac,
-        address,
-        gateway,
-    };
-    let mut told = locked(&host.told);
-    match *told {
-        None => {}
-        Some(was) if was == card => return,
-        Some(was) if host.shown() => {
-            println!(
-                "{NAME}: the address is {address}{} now and the kernel was told {}{}: starting over",
-                through(gateway),
-                was.address,
-                through(was.gateway)
-            );
-            exit(3);
-        }
-        Some(_) => {}
-    }
-    *told = Some(card);
-    drop(told);
-    // The first card is the one to show when it has a cable: another
-    // that has its address sooner gives it a moment.
-    while host.slot != 0
-        && SHOWN.get().is_none()
-        && STARTED.get().is_some_and(|at| at.elapsed() < HEAD_START)
-    {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let telling = locked(&TELLING);
-    if SHOWN.set(host.slot).is_err() {
-        // Another card is the one the kernel has its sockets with: this
-        // one is said apart.
-        host.say_card();
-        return;
-    }
-    let max_datagram = locked(&host.shared).stack.max_datagram();
-    match register(max_datagram, card) {
+/// Give the kernel its sockets on the stacks of this process, with the
+/// first card and whatever address it has now, and tell it the others:
+/// once, at the start. What changes of any card after that is said as it
+/// does ([`Host::say_card`]).
+fn serve_kernel() {
+    let hosts = hosts();
+    match register(&hosts[0]) {
         Ok(kernel) => {
-            for other in hosts() {
-                let _ = other.kernel.set(kernel.clone());
-                // One that had its address first, and waited.
+            for host in hosts {
+                let _ = host.kernel.set(kernel.clone());
+            }
+            for other in &hosts[1..] {
                 other.say_card();
             }
-            drop(telling);
             std::thread::spawn(move || serve_sockets(kernel));
         }
         Err(why) => println!("{NAME}: no sockets, only the address: {why}"),
     }
+}
+
+/// Do what the kernel asks of a card (`ADDRESS`, `GATEWAY`), and say the
+/// card back as that left it.
+fn configure((card, ask): (u64, cards::Ask)) -> Result<(), netstack::socks::Refused> {
+    use netstack::socks::Refused;
+    let host = hosts()
+        .iter()
+        .find(|host| host.card() == card)
+        .ok_or(Refused::NoSocket)?;
+    let index = host.index;
+    match ask {
+        cards::Ask::Address(address) => {
+            // The address of a card that asks a server for its own is
+            // taken away by asking again: only one set by hand ends the
+            // asking, and only that one leaves the card with none.
+            let again = {
+                let mut shared = locked(&host.shared);
+                let again = address.is_none() && shared.stack.leases();
+                if again {
+                    shared.stack.ask_again();
+                } else {
+                    shared.stack.write_address(address);
+                }
+                again
+            };
+            host.by_hand.store(!again, Ordering::Relaxed);
+            match address {
+                Some(address) => {
+                    println!("{NAME}: card {index} is {address}, as it was asked to be")
+                }
+                None if again => {
+                    println!("{NAME}: card {index} gave its address up, and asks for one again")
+                }
+                None => println!("{NAME}: card {index} has no address, as it was asked"),
+            }
+            // What a lease named goes with the lease.
+            name_servers(host, |named| named.lease.clear());
+        }
+        cards::Ask::Gateway(gateway) => {
+            if !locked(&host.shared).stack.write_gateway(gateway) {
+                // Said back as it is, so that the kernel shows that.
+                host.say_card();
+                return Err(Refused::Unreachable);
+            }
+            println!(
+                "{NAME}: card {index} has {} now, as it was asked",
+                gateway.map_or("no gateway".into(), |g| format!("gateway {g}"))
+            );
+        }
+    }
+    host.say_card();
+    publish(host);
+    Ok(())
 }
 
 /// `, with sockets` once the kernel has them here.
@@ -1233,13 +1229,12 @@ fn through(gateway: Option<Ipv4Address>) -> String {
 }
 
 /// The lease changed: the stack has made the interface what it says, and
-/// the rest is told here. A first lease is when the kernel gets its
-/// sockets.
+/// the rest is told here.
 fn settle(host: &Arc<Host>, lease: Option<Lease>) {
     let index = host.index;
+    host.say_card();
     match lease {
         Some(lease) => {
-            serve_kernel(host, lease.address, lease.gateway);
             println!(
                 "{NAME}: card {index} is {} by its lease{}{}",
                 lease.address,
@@ -1248,15 +1243,7 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
             );
             name_servers(host, |named| named.lease = lease.dns);
         }
-        None => {
-            println!("{NAME}: card {index} lost its lease: no address until it has another");
-            // The kernel goes on showing the card it has its sockets
-            // with; another is taken off the machine's interfaces.
-            if !host.shown() {
-                *locked(&host.told) = None;
-                host.say_card();
-            }
-        }
+        None => println!("{NAME}: card {index} lost its lease: no address until it has another"),
     }
     publish(host);
 }
@@ -1392,8 +1379,14 @@ fn main() {
         );
         all.push((other, how));
     }
-    let _ = STARTED.set(std::time::Instant::now());
     let _ = HOSTS.set(all.iter().map(|(host, _)| host.clone()).collect());
+    // Each card's file before the kernel shows the card: whoever sets the
+    // machine's network up (`lunarnet`) leaves alone a card it finds
+    // there, and would start a DHCP client of its own on one it does not.
+    for (host, _) in &all {
+        publish(host);
+    }
+    serve_kernel();
     for (host, how) in &all {
         let card = format!(
             "{}card {} ({})",
@@ -1403,7 +1396,6 @@ fn main() {
         );
         match *how {
             Addressing::Written(address, gateway) => {
-                serve_kernel(host, address, gateway);
                 println!(
                     "{NAME}: {card} is {address}{}{}",
                     through(gateway),
@@ -1573,7 +1565,7 @@ fn raise(
             six_owed: false,
         }),
         kernel: OnceLock::new(),
-        told: Mutex::new(None),
+        by_hand: AtomicBool::new(false),
         named: Mutex::new(Named::default()),
         driver_pid: AtomicU32::new(match &link.taker {
             Taker::Driver { driver, .. } => driver.id(),
@@ -1614,8 +1606,10 @@ fn publish(host: &Host) {
     } else {
         format!("virtio-net@{}", host.index)
     };
+    let by_hand = host.by_hand.load(Ordering::Relaxed);
     let from = match (leases, &host.governed) {
         (true, _) => "dhcp",
+        (false, _) if by_hand => "set by hand",
         (false, Some(_)) => "network settings",
         (false, None) => "command line",
     };
