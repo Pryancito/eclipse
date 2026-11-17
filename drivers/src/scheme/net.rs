@@ -47,12 +47,11 @@ pub trait NetScheme: Scheme {
     fn can_lend(&self) -> bool {
         false
     }
-    /// Whether this card is lent ([`can_lend`](Self::can_lend)) even on a
-    /// boot that says `unetlend=asked`, which keeps for the kernel's own
-    /// stack the cards whose drivers say no here: the ones that, lent, are
-    /// not known to do as well as with that stack (measured and found
-    /// slower at a small echo, or never run on the machine they are for).
-    /// An ordinary boot lends those too.
+    /// Whether this card is lent ([`can_lend`](Self::can_lend)) even
+    /// where it has no interrupt line of its own to be told of its frames
+    /// by: the ones whose drivers say no here need the legacy line of
+    /// their slot, or a boot that says `unetlend=any`. An ordinary boot
+    /// that has the line lends those too.
     fn lends_unasked(&self) -> bool {
         self.can_lend()
     }

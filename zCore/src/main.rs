@@ -738,7 +738,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
     // A network card with no MSI is given the legacy interrupt line of its
     // slot, which it needs to be lent to the stack process: under a
-    // hypervisor unless the boot says no (`pci.intx=0`, `unetlend=asked`),
+    // hypervisor unless the boot says no (`pci.intx=0`),
     // on a real machine only if it says so (`pci.intx=1`, `unetlend=any`).
     // Read here for the same reason as `pci.msix` above: `primary_init` is
     // what probes the cards.
@@ -775,8 +775,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // wins, and then the card is not left at all.
     //
     // A boot that lends the stack process the kernel's own first card,
-    // which a machine with no virtio card does unless it says
-    // `unetstack=kernel`, has the gateway on as well: the loan is made
+    // which a machine with no virtio card does unless it wants no stack
+    // (`unetstack=none`), has the gateway on as well: the loan is made
     // through it.
     #[cfg(feature = "linux")]
     let left_to_userspace = kernel_hal::drivers::user::reserved();
@@ -785,7 +785,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         let cards = kernel_hal::drivers::all_net().as_vec();
         let mut cards = cards.iter().filter(|card| !card.is_loopback()).peekable();
         // A card whose driver lends it only when asked is lent all the
-        // same, unless the boot says `unetlend=asked` or the card would
+        // same, unless the card would
         // have no interrupt to tell the borrower of its frames with.
         #[cfg(not(feature = "libos"))]
         let interrupts = !cfg!(target_arch = "x86_64") || pci_intx;
@@ -825,7 +825,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             (true, true) => lendable,
             _ => lent as usize,
         };
-        let cards = boot::lends_cards(word("unetstack"), word("unetuse"), card, lendable);
+        let cards = boot::lends_cards(word("unetstack"), lendable);
         boot::set_lent(lent);
         boot::set_lends(cards, any);
         (lent, cards)
@@ -853,8 +853,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // itself are known: see `linux_object::net::user_stack::boot`. The
     // first virtio network card, left to userspace, goes to the stack that
     // runs as a process, and on a machine with no other card every
-    // program's sockets are that stack's; `unetstack=kernel`,
-    // `unetstack=none`, `unetuse=asked` and `unetuse=all` say otherwise.
+    // program's sockets are that stack's; `unetstack=none` and
+    // `unetuse=all` say otherwise.
     // With no virtio card, the card that stack has is the kernel's first,
     // lent, and it is no card of the kernel's stack any more.
     #[cfg(feature = "linux")]
@@ -863,9 +863,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         let word = |name: &str| kernel_hal::cmdline::value(&options.cmdline, name);
         let card = boot::has_card(&left_to_userspace);
         let unetuse = word("unetuse");
-        if let Some(other) = unetuse.filter(|said| !boot::understood(said)) {
+        // The words that kept the kernel's own stack say nothing now.
+        for name in ["unetstack", "unetuse", "unetlend"] {
+            if let Some(said) = word(name).filter(|said| boot::gone(name, said)) {
+                klog_warn!(
+                    "Eclipse: {}={} no longer keeps the kernel's own network stack; ignored",
+                    name,
+                    said
+                );
+            }
+        }
+        if let Some(other) =
+            unetuse.filter(|said| !boot::understood(said) && !boot::gone("unetuse", said))
+        {
             klog_warn!(
-                "Eclipse: unetuse={} is not understood (\"all\" or \"asked\"); ignored",
+                "Eclipse: unetuse={} is not understood (\"all\"); ignored",
                 other
             );
         }
@@ -880,7 +892,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 if card {
                     "the stack process has a card of its own"
                 } else if !boot::has_stack(true, word("unetstack")) {
-                    "it runs no stack process (unetstack=)"
+                    "it runs no stack process (unetstack=none)"
                 } else if kernel_cards == 0 {
                     "the kernel drives no card"
                 } else {
@@ -888,12 +900,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 }
             );
         } else if lent && lent_cards == 1 {
-            klog_info!(
-                "Eclipse: the kernel lends its first card to the stack process (unetstack=kernel keeps it for the kernel's stack)"
-            );
+            klog_info!("Eclipse: the kernel lends its first card to the stack process");
         } else if lent_cards != 0 {
             klog_info!(
-                "Eclipse: the kernel lends {} of its {} card(s) to the stack process (unetstack=kernel keeps them for the kernel's stack)",
+                "Eclipse: the kernel lends {} of its {} card(s) to the stack process",
                 lent_cards,
                 kernel_cards
             );
@@ -911,19 +921,22 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "Eclipse: every program's sockets go to the stack process (unetuse=all)"
             ),
             boot::Whose::AllOnlyCard => klog_info!(
-                "Eclipse: every program's sockets go to the stack process, which has the machine's only card (unetstack=kernel for the kernel's stack, unetuse=asked for the programs that ask only)"
-            ),
-            boot::Whose::AskedSaid => klog_info!(
-                "Eclipse: the stack process is for the programs that ask (unetuse=asked)"
+                "Eclipse: every program's sockets go to the stack process, which has the machine's only card"
             ),
             boot::Whose::KernelCards(cards) => klog_info!(
                 "Eclipse: the stack process is for the programs that ask: the kernel drives {} card(s) of its own (unetuse=all for every program)",
                 cards
             ),
-            boot::Whose::AllNoCard => klog_info!(
-                "Eclipse: the machine has no network card: its programs' sockets join each other with no stack (unetstack=kernel for the kernel's stack)"
+            boot::Whose::AllNoCard if word("unetstack") == Some("none") => klog_info!(
+                "Eclipse: this boot runs no network stack (unetstack=none): its programs' sockets join each other and reach nothing else"
             ),
-            boot::Whose::NoStack => {}
+            boot::Whose::AllNoCard => klog_info!(
+                "Eclipse: the machine has no network card: its programs' sockets join each other with no stack"
+            ),
+            boot::Whose::NoStack => klog_warn!(
+                "Eclipse: none of the kernel's {} network card(s) can be lent to the stack process: they keep the kernel's own stack (pci.intx=1 or unetlend=any lends a card with no MSI)",
+                kernel_cards
+            ),
         }
     }
     // ... and start the worker that walks the caches direct reclaim may not:

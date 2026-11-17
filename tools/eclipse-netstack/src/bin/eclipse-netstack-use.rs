@@ -7,9 +7,8 @@
 //! (`eclipse_netstack_use`), which `fork` and `execve` carry on, and
 //! becomes the program. The program opens its sockets as it always did.
 //! On a machine whose only card is that stack's the kernel has asked for
-//! every program, and this is then not needed: it is for a boot with
-//! `unetuse=asked` on the kernel command line, and for a machine where
-//! the kernel drives a card of its own.
+//! every program, and this is then not needed: it is for a machine where
+//! the kernel drives a card it cannot lend.
 //!
 //! Exit status: 2 without a program, 1 when the kernel has no such call,
 //! 127 when the program cannot be run.
