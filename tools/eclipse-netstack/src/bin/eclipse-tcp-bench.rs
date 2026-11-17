@@ -45,8 +45,13 @@ fn connect(to: (Ipv4Addr, u16)) -> TcpStream {
     // One segment for each write, when it is written. Not every stack has
     // the option, and the ones that do not have nothing to turn off.
     let _ = conn.set_nodelay(true);
-    let _ = conn.set_read_timeout(Some(PATIENCE));
-    let _ = conn.set_write_timeout(Some(PATIENCE));
+    // `PATIENCE=0` in the environment: wait for ever, as a program that
+    // sets no timeout does. A wait with an end arms a timer for it in the
+    // kernel and one without does not, so the two are not the same path.
+    if std::env::var("PATIENCE").as_deref() != Ok("0") {
+        let _ = conn.set_read_timeout(Some(PATIENCE));
+        let _ = conn.set_write_timeout(Some(PATIENCE));
+    }
     conn
 }
 

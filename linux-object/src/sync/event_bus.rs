@@ -473,6 +473,12 @@ pub fn subscribe_edge_on(
 /// nothing re-polls the future, so nothing ever calls [`wait_interrupted`],
 /// and the wait outlives every attempt to end it.
 ///
+/// A wait on a Linux thread no longer needs it for that: it leaves its waker
+/// with the thread, and what queues a signal or starts the thread dying
+/// wakes it there (`LinuxThreadExt::park_waiter`). The tick is what is left
+/// for the waits the thread did not take: one in a kernel context, a second
+/// wait of a thread, and a wait with an end of its own.
+///
 /// 100 ms is the same backstop the io-multiplex path already uses
 /// (`net::wait::IO_WAIT_COVERED_TICK_MS`), and it is a ceiling on how late a
 /// `kill` can be, not on how fast data arrives.
@@ -498,6 +504,37 @@ pub(crate) fn wait_interrupted() -> crate::error::LxResult<()> {
     self::test_interrupt::check()
 }
 
+/// [`wait_interrupted`] for a wait that leaves its waker with the thread
+/// first, to be woken by the signal itself: the answer, and whether the
+/// waker was taken. See [`crate::process::check_signals_parking`].
+#[cfg(not(test))]
+fn wait_interrupted_parking(
+    wait: &mut Option<u64>,
+    waker: &core::task::Waker,
+) -> (crate::error::LxResult<()>, bool) {
+    crate::process::check_signals_parking(wait, waker)
+}
+
+#[cfg(test)]
+fn wait_interrupted_parking(
+    wait: &mut Option<u64>,
+    waker: &core::task::Waker,
+) -> (crate::error::LxResult<()>, bool) {
+    let parked = self::test_interrupt::park(wait, waker);
+    (self::test_interrupt::check(), parked)
+}
+
+/// The wait numbered `wait` no longer wants to be told of a signal.
+#[cfg(not(test))]
+fn wait_unparked(wait: u64) {
+    crate::process::unpark_wait(wait)
+}
+
+#[cfg(test)]
+fn wait_unparked(wait: u64) {
+    self::test_interrupt::unpark(wait)
+}
+
 /// The test-only stand-in for [`crate::process::check_signals`].
 #[cfg(test)]
 pub(crate) mod test_interrupt {
@@ -513,6 +550,66 @@ pub(crate) mod test_interrupt {
         /// test lock is needed and a test that panics cannot poison the next.
         static PENDING: Cell<Option<LxError>> = const { Cell::new(None) };
         static DELAY: Cell<usize> = const { Cell::new(0) };
+        /// Whether this thread takes the waker of a wait, as a Linux
+        /// thread does, and the one it has: off unless a test turns it on,
+        /// so every other test waits by the timer as a kernel context does.
+        static TAKES: Cell<bool> = const { Cell::new(false) };
+        static PARKED: core::cell::RefCell<Option<(u64, core::task::Waker)>> =
+            const { core::cell::RefCell::new(None) };
+        static NEXT: Cell<u64> = const { Cell::new(1) };
+    }
+
+    /// From here on this thread takes the waker of a wait (`true`) or
+    /// refuses it (`false`); what it had is let go either way.
+    pub(crate) fn takes_wakers(takes: bool) {
+        TAKES.with(|t| t.set(takes));
+        PARKED.with(|p| p.borrow_mut().take());
+    }
+
+    /// The number of the wait parked on this thread, if one is.
+    pub(crate) fn parked_wait() -> Option<u64> {
+        PARKED.with(|p| p.borrow().as_ref().map(|(n, _)| *n))
+    }
+
+    /// What a signal queued to this thread does to the wait parked on it.
+    pub(crate) fn wake_parked() {
+        let waker = PARKED.with(|p| p.borrow().as_ref().map(|(_, w)| w.clone()));
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// `LinuxThreadExt::park_waiter`, for the thread of the test.
+    pub(super) fn park(wait: &mut Option<u64>, waker: &core::task::Waker) -> bool {
+        if !TAKES.with(|t| t.get()) {
+            return false;
+        }
+        PARKED.with(|p| {
+            let mut slot = p.borrow_mut();
+            match slot.as_mut() {
+                Some((held, parked)) if Some(*held) == *wait => {
+                    *parked = waker.clone();
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    let number = NEXT.with(|n| n.replace(n.get() + 1));
+                    *slot = Some((number, waker.clone()));
+                    *wait = Some(number);
+                    true
+                }
+            }
+        })
+    }
+
+    /// `LinuxThreadExt::unpark_waiter`, for the thread of the test.
+    pub(super) fn unpark(wait: u64) {
+        PARKED.with(|p| {
+            let mut slot = p.borrow_mut();
+            if matches!(slot.as_ref(), Some((held, _)) if *held == wait) {
+                slot.take();
+            }
+        });
     }
 
     /// Answer `Ok` for the next `after_polls` checks, then `Err(err)` for
@@ -526,6 +623,7 @@ pub(crate) mod test_interrupt {
     pub(crate) fn clear() {
         PENDING.with(|p| p.set(None));
         DELAY.with(|d| d.set(0));
+        takes_wakers(false);
     }
 
     pub(super) fn check() -> LxResult<()> {
@@ -568,13 +666,7 @@ pub fn wait_for_event_until(
     mask: Event,
     deadline: Option<Duration>,
 ) -> impl Future<Output = crate::error::LxResult<Event>> {
-    EventBusFuture {
-        bus,
-        mask,
-        sub_id: None,
-        timer: None,
-        deadline,
-    }
+    EventBusFuture::new(bus, mask, deadline)
 }
 
 /// EventBus future for async
@@ -589,6 +681,30 @@ struct EventBusFuture {
     timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
     /// When the wait gives up with `EAGAIN`: see [`wait_for_event_until`].
     deadline: Option<Duration>,
+    /// The number of this wait on the thread that holds its waker to wake
+    /// it for a signal: while it has one, no backstop timer is armed.
+    parked: Option<u64>,
+}
+
+impl EventBusFuture {
+    fn new(bus: Arc<Mutex<EventBus>>, mask: Event, deadline: Option<Duration>) -> Self {
+        EventBusFuture {
+            bus,
+            mask,
+            sub_id: None,
+            timer: None,
+            deadline,
+            parked: None,
+        }
+    }
+
+    /// The wait is over, or is abandoned: nothing is to wake it any more.
+    fn settle(&mut self) {
+        if let Some(wait) = self.parked.take() {
+            wait_unparked(wait);
+        }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+    }
 }
 
 impl Drop for EventBusFuture {
@@ -596,7 +712,7 @@ impl Drop for EventBusFuture {
         if let Some(id) = self.sub_id.take() {
             self.bus.lock().unsubscribe(id);
         }
-        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+        self.settle();
     }
 }
 
@@ -613,7 +729,7 @@ impl Future for EventBusFuture {
                 }
                 let event = lock.event;
                 drop(lock);
-                kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                this.settle();
                 return Poll::Ready(Ok(event));
             }
             // Not `sub_id.is_none()`: the callback registered below is
@@ -644,11 +760,11 @@ impl Future for EventBusFuture {
                     if !(lock.event & this.mask).is_empty() {
                         let event = lock.event;
                         drop(lock);
-                        kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                        this.settle();
                         return Poll::Ready(Ok(event));
                     }
                     drop(lock);
-                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    this.settle();
                     return Poll::Ready(Err(crate::error::LxError::ENOMEM));
                 }
             }
@@ -661,15 +777,32 @@ impl Future for EventBusFuture {
         // Checked AFTER the readiness test, deliberately, and in that order:
         // Linux gives a read that can be served right now its data, and
         // synthesises EINTR only when it would otherwise block.
-        if let Err(err) = wait_interrupted() {
+        //
+        // The waker is left with the thread before the look, so that a
+        // signal queued after it wakes this wait by itself. Where the
+        // thread took it, that is the whole of the answer to a signal; where
+        // it did not -- no Linux thread here, or another wait of this
+        // thread has the place -- a timer looks again, as it always did.
+        //
+        // A wait with an end of its own arms a timer for that end whatever
+        // happens, so it keeps looking by it and takes no place on the
+        // thread: parking as well was one to three microseconds more on
+        // each read of a socket with `SO_RCVTIMEO`.
+        let (interrupted, parked) = if this.deadline.is_none() {
+            wait_interrupted_parking(&mut this.parked, cx.waker())
+        } else {
+            (wait_interrupted(), false)
+        };
+        if let Err(err) = interrupted {
             if let Some(id) = this.sub_id.take() {
                 this.bus.lock().unsubscribe(id);
             }
-            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            this.settle();
             return Poll::Ready(Err(err));
         }
-        let mut deadline =
-            kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS));
+        let mut deadline = (!parked).then(|| {
+            kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS))
+        });
         // A wait with an end of its own: `EAGAIN` once it is past, and
         // until then the timer wakes it there and not a tick later.
         if let Some(until) = this.deadline {
@@ -677,13 +810,20 @@ impl Future for EventBusFuture {
                 if let Some(id) = this.sub_id.take() {
                     this.bus.lock().unsubscribe(id);
                 }
-                kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                this.settle();
                 return Poll::Ready(Err(crate::error::LxError::EAGAIN));
             }
-            deadline = deadline.min(until);
+            deadline = Some(deadline.map_or(until, |tick| tick.min(until)));
         }
-        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
-            cx.waker().wake_by_ref();
+        match deadline {
+            Some(deadline) => {
+                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+                    cx.waker().wake_by_ref();
+                }
+            }
+            // Parked on the thread and without an end of its own: only the
+            // bus or a signal ends this wait, and each wakes it by itself.
+            None => kernel_hal::timer_waker::kill_timer_waker(&mut this.timer),
         }
         Poll::Pending
     }
@@ -973,6 +1113,127 @@ mod interruptible_wait_tests {
             Pin::new(&mut fut).poll(&mut cx),
             Poll::Ready(Ok(Event::READABLE))
         ));
+    }
+
+    /// A wait whose waker the thread takes arms no timer: the bus wakes it
+    /// for data and the thread wakes it for a signal, and when it is woken
+    /// for one it comes back with the interruption and leaves nothing
+    /// parked, on the bus or on the thread.
+    #[test]
+    fn a_wait_parked_on_its_thread_arms_no_timer_and_ends_for_a_signal() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        WOKE.store(false, Ordering::SeqCst);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+
+        let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, None);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(
+            fut.timer.is_none(),
+            "a timer was armed for a wait the thread wakes"
+        );
+        assert_eq!(test_interrupt::parked_wait(), fut.parked);
+        assert!(fut.parked.is_some());
+
+        // The signal: queued, then the thread wakes what is parked on it.
+        test_interrupt::interrupt_after(0, LxError::EINTR);
+        assert!(!WOKE.load(Ordering::SeqCst));
+        test_interrupt::wake_parked();
+        assert!(WOKE.load(Ordering::SeqCst));
+
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Err(LxError::EINTR))
+        ));
+        assert_eq!(test_interrupt::parked_wait(), None);
+        assert_eq!(bus.lock().callbacks.len(), 0);
+    }
+
+    /// The thread lets go of the waker when the wait ends with what it
+    /// waited for, and when it is abandoned.
+    #[test]
+    fn a_wait_that_ends_or_is_dropped_leaves_nothing_parked_on_its_thread() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+
+        let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, None);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(test_interrupt::parked_wait().is_some());
+        bus.lock().set(Event::READABLE);
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Ok(Event::READABLE))
+        ));
+        assert_eq!(test_interrupt::parked_wait(), None);
+        drop(fut);
+        bus.lock().clear(Event::READABLE);
+
+        let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, None);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(test_interrupt::parked_wait().is_some());
+        drop(fut);
+        assert_eq!(test_interrupt::parked_wait(), None);
+    }
+
+    /// One wait per thread has the place. A second one keeps the timer that
+    /// looks for a signal, and does not take the first one's place when it
+    /// ends.
+    #[test]
+    fn a_second_wait_of_the_thread_keeps_its_timer() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+
+        let mut first = EventBusFuture::new(bus.clone(), Event::READABLE, None);
+        assert!(matches!(Pin::new(&mut first).poll(&mut cx), Poll::Pending));
+        let mut second = EventBusFuture::new(bus.clone(), Event::WRITABLE, None);
+        assert!(matches!(Pin::new(&mut second).poll(&mut cx), Poll::Pending));
+        assert!(first.timer.is_none());
+        assert!(second.timer.is_some());
+        assert_eq!(second.parked, None);
+
+        drop(second);
+        assert_eq!(test_interrupt::parked_wait(), first.parked);
+    }
+
+    /// A wait with an end of its own keeps the timer it needs for that end
+    /// and takes no place on the thread, which is left for a wait that has
+    /// nothing else to wake it.
+    #[test]
+    fn a_wait_with_an_end_keeps_its_timer_and_takes_no_place_on_the_thread() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+
+        let far = kernel_hal::timer::deadline_after(Duration::from_secs(3600));
+        let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, Some(far));
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(fut.timer.is_some());
+        assert_eq!(fut.parked, None);
+        assert_eq!(test_interrupt::parked_wait(), None);
+
+        // The place is there for a wait without one.
+        let mut other = EventBusFuture::new(bus.clone(), Event::WRITABLE, None);
+        assert!(matches!(Pin::new(&mut other).poll(&mut cx), Poll::Pending));
+        assert!(other.timer.is_none());
+        assert_eq!(test_interrupt::parked_wait(), other.parked);
     }
 
     #[test]
