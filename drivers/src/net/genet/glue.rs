@@ -25,17 +25,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities};
-use smoltcp::time::Instant;
 use smoltcp::wire::*;
-use smoltcp::Result;
 
 use super::dt;
 use super::rings::RX_BUF_LENGTH;
 use super::*;
-use crate::net::get_sockets;
-use crate::net::{ip_cfg, timer_now_as_micros};
+use crate::net::ip_cfg;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::utils::devicetree::Node;
 use crate::{DeviceError, DeviceResult};
@@ -44,10 +39,6 @@ use lock::Mutex;
 
 /// Lo que el GENET pone en el aire: 1514 bytes de trama Ethernet.
 pub const GENET_MTU: usize = 1500;
-/// El hueco de pila donde se arma una trama de salida. Cubre la MTU anunciada
-/// con sitio de sobra; lo que no quepa se rechaza, nunca se recorta.
-const TX_SCRATCH_LEN: usize = 1536;
-
 /// La MAC que se usa si el cargador de arranque no dejo ninguna.
 ///
 /// En la Raspberry Pi el firmware pone la MAC de la placa en los registros del
@@ -87,16 +78,6 @@ pub struct GenetDriver {
     /// Si el RGMII de esta placa lleva el retardo puesto por el PHY
     /// (`rgmii-rxid`, que es lo que declara la Pi 4) y no por el MAC.
     pub id_mode_dis: bool,
-}
-
-pub struct GenetRxToken {
-    data: Vec<u8>,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-pub struct GenetTxToken {
-    driver: GenetDriver,
-    stats: Arc<Mutex<NetStats>>,
 }
 
 impl GenetDriver {
@@ -150,114 +131,19 @@ impl GenetDriver {
     }
 }
 
-impl phy::Device<'_> for GenetDriver {
-    type RxToken = GenetRxToken;
-    type TxToken = GenetTxToken;
-
-    fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.take_frame().map(|data| {
-            (
-                GenetRxToken {
-                    data,
-                    stats: self.stats.clone(),
-                },
-                GenetTxToken {
-                    driver: self.clone(),
-                    stats: self.stats.clone(),
-                },
-            )
-        })
-    }
-
-    fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.rings.lock().can_send() {
-            Some(GenetTxToken {
-                driver: self.clone(),
-                stats: self.stats.clone(),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = GENET_MTU + 14;
-        // `max_burst_size` se queda sin poner: smoltcp recorta la ventana TCP
-        // a `burst * MSS` por un u16, asi que un lote de 64 da la vuelta y
-        // deja la conexion en unos pocos Mbps. La misma trampa esta
-        // documentada en `e1000.rs` y en `pcnet32.rs`.
-        caps.max_burst_size = None;
-        caps.medium = phy::Medium::Ethernet;
-        caps
-    }
-}
-
-impl phy::RxToken for GenetRxToken {
-    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        {
-            let mut stats = self.stats.lock();
-            stats.rx_packets += 1;
-            stats.rx_bytes += self.data.len() as u64;
-        }
-        // Los oyentes de AF_PACKET, que es como el cliente de DHCP ve las
-        // tramas.
-        crate::net::net_defer_packet(&self.data);
-        f(&mut self.data)
-    }
-}
-
-impl phy::TxToken for GenetTxToken {
-    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        // `len` viene de la capa IP, que esta smoltcp no recorta a la MTU del
-        // dispositivo y no fragmenta: indexar un array de pila con ella tumba
-        // el kernel con un solo `sendto` grande. Se rechaza.
-        if len > TX_SCRATCH_LEN {
-            self.stats.lock().tx_errors += 1;
-            return Err(smoltcp::Error::Exhausted);
-        }
-        let mut buffer = [0u8; TX_SCRATCH_LEN];
-        let result = f(&mut buffer[..len])?;
-
-        let enviada = self.driver.rings.lock().send(&buffer[..len]).is_ok();
-        if !enviada {
-            // **Nunca** dar por enviada una trama que se tiro. smoltcp emite
-            // el ACK de un segmento recibido por el TxToken emparejado con su
-            // RxToken, y ya ha avanzado `remote_last_ack`: un `Ok` aqui pierde
-            // ese ACK para siempre y el otro extremo se queda esperando una
-            // ventana que cree cerrada. `Exhausted` es la respuesta para la
-            // que smoltcp esta hecho: corta el lote y se queda el segmento.
-            self.stats.lock().tx_errors += 1;
-            return Err(smoltcp::Error::Exhausted);
-        }
-
-        let mut stats = self.stats.lock();
-        stats.tx_packets += 1;
-        stats.tx_bytes += len as u64;
-        Ok(result)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // La interfaz
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct GenetInterface {
-    iface: Arc<Mutex<Interface<'static, GenetDriver>>>,
+    mac: EthernetAddress,
     driver: GenetDriver,
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
-    /// Who the card's frames go to while it is lent to a stack that is not
-    /// the kernel's ([`crate::net::lent`]); empty, the kernel's own stack
-    /// reads them.
+    /// Who the card's frames go to while it is lent to the stack that
+    /// runs as a process ([`crate::net::lent`]); empty, nobody has them.
     lent: crate::net::lent::Lent,
     /// A lent card's link changed and nobody has looked yet: its
     /// interrupt has no bottom half to look in, so the borrower's next
@@ -277,37 +163,13 @@ impl GenetInterface {
     /// todavia puesto, reconoce la causa y no encola nada: la trama se queda
     /// en el anillo hasta que llegue la siguiente.
     fn poll_inner(&self) -> DeviceResult {
-        // A card lent to a stack that is not the kernel's: its frames go
-        // to the borrower as they are, and the kernel's stack is not
-        // polled.
-        if self.lent.hand_over(|| self.driver.take_frame()) {
-            return Ok(());
+        // A card lent to the stack that runs as a process: its frames go
+        // to the borrower as they are. One that is not lent has no stack
+        // above it.
+        if !self.lent.hand_over(|| self.driver.take_frame()) {
+            crate::net::lent::tap_only(&self.stats, || self.driver.take_frame());
         }
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        let sockets = get_sockets();
-        // `try_lock`, no una toma que bloquea. Esto corre desde un trabajo
-        // diferido, y una llamada de socket vacia esa cola MIENTRAS tiene el
-        // conjunto de sockets cogido: en este kernel con las interrupciones
-        // apagadas, una toma que bloquea se queda girando sobre un cerrojo que
-        // ya tiene esta misma CPU. Es el bloqueo que `e1000.rs` cuenta haberse
-        // comido en una descarga de 64 MB. Quien lo tenga cogido hace el poll
-        // al soltarlo, asi que saltarselo no pierde nada.
-        let res = match (sockets.try_lock(), self.iface.try_lock()) {
-            (Some(mut sockets), Some(mut iface)) => match iface.poll(&mut sockets, timestamp) {
-                Ok(p) => {
-                    trace!("[genet] poll: {:?}", p);
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!("[genet] poll got err {}", err);
-                    Err(DeviceError::IoError)
-                }
-            },
-            _ => Ok(()),
-        };
-        crate::net::net_flush_deferred_packets();
-        crate::net::wake_net_rx_waiters();
-        res
+        Ok(())
     }
 }
 
@@ -411,7 +273,7 @@ impl NetScheme for GenetInterface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        self.mac
     }
 
     fn ifname(&self) -> &str {
@@ -428,11 +290,6 @@ impl NetScheme for GenetInterface {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         self.ip_addrs.lock().clone()
-    }
-
-    fn seed_neighbor(&self, protocol: IpAddress, hardware: EthernetAddress) -> DeviceResult {
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        ip_cfg::seed_neighbor(&mut self.iface.lock(), protocol, hardware, timestamp)
     }
 
     fn poll(&self) -> DeviceResult {
@@ -476,33 +333,27 @@ impl NetScheme for GenetInterface {
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        ip_cfg::set_ipv4_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::set_ipv4_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        ip_cfg::add_ip_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::add_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        ip_cfg::remove_ip_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::remove_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
-        ip_cfg::add_route(
-            &mut self.iface.lock(),
-            &mut self.routes.lock(),
-            cidr,
-            gateway,
-        )
+        ip_cfg::add_route(&mut self.routes.lock(), cidr, gateway)
     }
 
     fn del_route(&self, cidr: IpCidr, _gateway: Option<IpAddress>) -> DeviceResult {
-        ip_cfg::del_route(&mut self.iface.lock(), &mut self.routes.lock(), cidr)
+        ip_cfg::del_route(&mut self.routes.lock(), cidr)
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        let iface = self.iface.lock();
-        ip_cfg::reported_routes(&self.routes.lock(), iface.ip_addrs())
+        ip_cfg::reported_routes(&self.routes.lock(), &self.ip_addrs.lock())
     }
 
     fn get_stats(&self) -> NetStats {
@@ -662,20 +513,9 @@ pub unsafe fn genet_init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    // Almacenamiento de rutas **por tarjeta**: un `static mut` compartido se
-    // solaparia si se sondan dos, y corromperia las dos tablas.
-    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-        Box::leak(vec![None; 4].into_boxed_slice());
-    let iface = InterfaceBuilder::new(driver.clone())
-        .ethernet_addr(ethernet_addr)
-        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-        .ip_addrs(ip_addrs.clone())
-        .routes(Routes::new(routes_storage))
-        .finalize();
-
     crate::klog_info!("genet interface {} discovered", name);
     Ok(GenetInterface {
-        iface: Arc::new(Mutex::new(iface)),
+        mac: ethernet_addr,
         driver,
         name,
         irq,

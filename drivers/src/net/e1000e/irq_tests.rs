@@ -24,7 +24,6 @@ use crate::utils::deferred_job::{
     drain_deferred_jobs, drain_deferred_jobs_max, evicted_deferred_jobs, pending_deferred_jobs,
     push_deferred_job, push_deferred_job_front,
 };
-use smoltcp::phy::{Device as _, RxToken as _, TxToken as _};
 extern crate std;
 
 /// The causes the driver unmasks: TXDW, LSC and the three RX bits, plus the
@@ -514,42 +513,60 @@ fn the_statistics_handed_out_are_a_copy_and_not_the_counters_themselves() {
 
 // --- the smoltcp token layer
 
+/// `send`/`recv` are the raw path, the one a socket syscall takes without
+/// going through smoltcp at all.
 #[test]
-fn a_pair_of_tokens_comes_out_only_when_a_frame_is_waiting() {
+fn the_raw_send_and_receive_path_carries_a_frame_end_to_end() {
     let iface = at(1_000);
-    let mut driver = iface.driver.clone();
-    assert!(
-        driver.receive().is_none(),
-        "it handed the stack a frame out of an empty ring"
+    assert!(iface.can_send(), "a free ring says it cannot send");
+    let frame = alloc::vec![0xA5u8; 128];
+    assert_eq!(
+        iface.send(&frame).expect("the frame was refused"),
+        frame.len(),
+        "the count reported is not the whole frame"
     );
-    let frame = ipv4_udp_frame(b"hola");
-    hw_deliver(&iface.driver.hw.lock(), 0, &frame);
-    assert!(
-        driver.receive().is_some(),
-        "the frame the card delivered did not reach the stack"
+
+    let delivered = ipv4_udp_frame(b"vuelta");
+    hw_deliver(&iface.driver.hw.lock(), 0, &delivered);
+    let mut buf = alloc::vec![0u8; 2048];
+    let n = iface.recv(&mut buf).expect("nothing came back");
+    assert_eq!(
+        &buf[..n],
+        &delivered[..],
+        "the frame read back is not the one delivered"
+    );
+    assert_eq!(
+        iface.recv(&mut buf).err(),
+        Some(DeviceError::NotReady),
+        "an empty ring answered with a frame"
     );
 }
 
-/// Deliver one frame into `slot` and let the stack consume its token,
-/// returning what the stack was shown. The slot matters: the card fills them
+/// Deliver one frame into `slot`, take it off the ring and give its buffer
+/// back, returning what was taken. The slot matters: the card fills them
 /// in order, so a second frame goes into the one after the first.
 fn round_trip_one_frame(iface: &E1000eInterface, slot: usize, frame: &[u8]) -> Vec<u8> {
     hw_deliver(&iface.driver.hw.lock(), slot, frame);
-    let mut driver = iface.driver.clone();
-    let (rx, _tx) = driver.receive().expect("no frame came out of the ring");
-    rx.consume(Instant::from_micros(0), |buf| Ok(buf.to_vec()))
-        .expect("the stack refused the frame")
+    let taken = iface
+        .driver
+        .hw
+        .lock()
+        .receive()
+        .expect("no frame came out of the ring");
+    let seen = taken.clone();
+    iface.driver.hw.lock().recycle_rx_frame(taken);
+    seen
 }
 
 #[test]
-fn consuming_an_rx_token_hands_the_frame_over_and_gives_its_buffer_back() {
+fn a_frame_taken_off_the_ring_is_whole_and_gives_its_buffer_back() {
     let iface = at(1_000);
     iface.driver.hw.lock().rx_frame_pool.clear();
     let frame = ipv4_udp_frame(&[0x5a; 64]);
     assert_eq!(
         round_trip_one_frame(&iface, 0, &frame),
         frame,
-        "the frame the stack saw is not the one the card delivered"
+        "the frame taken is not the one the card delivered"
     );
     assert_eq!(
         iface.driver.hw.lock().rx_frame_pool.len(),
@@ -592,13 +609,22 @@ fn a_full_pool_takes_no_more_buffers() {
         let hw = iface.driver.hw.lock();
         hw_deliver(&hw, 0, &first);
     }
-    let mut driver = iface.driver.clone();
-    let (rx_a, _tx_a) = driver.receive().expect("the first frame did not come out");
+    let rx_a = iface
+        .driver
+        .hw
+        .lock()
+        .receive()
+        .expect("the first frame did not come out");
     {
         let hw = iface.driver.hw.lock();
         hw_deliver(&hw, 1, &second);
     }
-    let (rx_b, _tx_b) = driver.receive().expect("the second frame did not come out");
+    let rx_b = iface
+        .driver
+        .hw
+        .lock()
+        .receive()
+        .expect("the second frame did not come out");
 
     {
         let mut hw = iface.driver.hw.lock();
@@ -608,8 +634,7 @@ fn a_full_pool_takes_no_more_buffers() {
         }
     }
     for rx in [rx_a, rx_b] {
-        rx.consume(Instant::from_micros(0), |_buf| Ok(()))
-            .expect("the stack refused the frame");
+        iface.driver.hw.lock().recycle_rx_frame(rx);
     }
     assert_eq!(
         iface.driver.hw.lock().rx_frame_pool.len(),
@@ -647,166 +672,5 @@ fn a_pooled_buffer_is_reused_and_a_longer_frame_still_comes_out_whole() {
     assert!(
         hw.rx_frame_pool[0].capacity() >= long.len(),
         "the buffer was handed back without the room the longer frame needed"
-    );
-}
-
-#[test]
-fn a_tx_token_comes_out_only_while_the_ring_has_room() {
-    let iface = at(1_000);
-    let mut driver = iface.driver.clone();
-    assert!(
-        driver.transmit().is_some(),
-        "a ring that starts entirely free refused a token"
-    );
-    // Fill every slot but the guard the hardware needs.
-    {
-        let mut hw = iface.driver.hw.lock();
-        for i in 0..NUM_TX - 1 {
-            hw.send(&alloc::vec![i as u8; 64])
-                .expect("a free slot refused a frame");
-        }
-    }
-    assert!(
-        driver.transmit().is_none(),
-        "a full ring handed out a token the token cannot honour"
-    );
-}
-
-/// The closure is promised a slice of exactly `len`. Clamping an oversized
-/// request to the stack scratch would either panic inside the closure's
-/// `copy_from_slice` or put a truncated frame on the wire.
-#[test]
-fn a_tx_token_hands_the_closure_a_slice_of_exactly_the_length_asked_for() {
-    let iface = at(1_000);
-    let mut driver = iface.driver.clone();
-    for len in [60, TX_SCRATCH_LEN, TX_SCRATCH_LEN + 1] {
-        let token = driver.transmit().expect("the ring had room");
-        let got = token
-            .consume(Instant::from_micros(0), len, |buf| Ok(buf.len()))
-            .expect("the frame was refused");
-        assert_eq!(
-            got, len,
-            "a frame of {} bytes was handed a buffer of {}",
-            len, got
-        );
-    }
-}
-
-#[test]
-fn what_a_tx_token_writes_is_what_lands_in_the_ring() {
-    let iface = at(1_000);
-    let slot = iface.driver.hw.lock().tx_tail;
-    let mut driver = iface.driver.clone();
-    let token = driver.transmit().expect("the ring had room");
-    token
-        .consume(Instant::from_micros(0), 64, |buf| {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = i as u8;
-            }
-            Ok(())
-        })
-        .expect("the frame was refused");
-    let hw = iface.driver.hw.lock();
-    let posted = unsafe {
-        let d = &*hw.tx_ring.as_ptr::<TxDesc>().add(slot);
-        core::slice::from_raw_parts(hw.tx_buf_vaddr(slot) as *const u8, d.len as usize)
-    };
-    assert_eq!(
-        posted.len(),
-        64,
-        "the descriptor does not carry the length the stack asked for"
-    );
-    assert!(
-        posted.iter().enumerate().all(|(i, b)| *b == i as u8),
-        "the bytes in the buffer are not the ones the stack wrote"
-    );
-}
-
-/// Nothing completes with the carrier down, so waiting is pointless. It is not
-/// counted as a drop either: `tx_dropped` means "lost with the link up", which
-/// is the deadlock signature the watchdog reports.
-#[test]
-fn a_frame_offered_with_the_link_down_is_refused_instead_of_spun_on() {
-    let iface = at(1_000);
-    {
-        let mut hw = iface.driver.hw.lock();
-        hw.link_up = false;
-        poke(hw.base, E1000E_STATUS, 0);
-        hw.tx_dropped = 0;
-    }
-    let mut driver = iface.driver.clone();
-    let token = driver.transmit().expect("the ring had room");
-    let result = token.consume(Instant::from_micros(0), 64, |_buf| Ok(()));
-    assert_eq!(
-        result.err(),
-        Some(smoltcp::Error::Exhausted),
-        "a frame was accepted with no carrier to send it on"
-    );
-    assert_eq!(
-        iface.driver.hw.lock().tx_dropped,
-        0,
-        "a frame refused with the link down was counted as a link-up loss"
-    );
-}
-
-/// A full ring with the carrier up is spun on, because the NIC drains it by
-/// DMA on its own, and only counted as a drop once the spin limit is spent.
-/// Dropping it silently is the one thing this path must never do: the ACK
-/// smoltcp generates in response to a received segment goes out through this
-/// token, and smoltcp has already advanced its window state by the time it
-/// learns the send failed.
-#[test]
-fn a_full_ring_with_the_link_up_is_counted_as_a_drop_rather_than_lost_silently() {
-    let iface = at(1_000);
-    let mut driver = iface.driver.clone();
-    let token = driver.transmit().expect("the ring had room");
-    {
-        let mut hw = iface.driver.hw.lock();
-        for i in 0..NUM_TX - 1 {
-            hw.send(&alloc::vec![i as u8; 64])
-                .expect("a free slot refused a frame");
-        }
-        assert!(!hw.can_send(), "the ring did not fill");
-        hw.tx_dropped = 0;
-    }
-    let result = token.consume(Instant::from_micros(0), 64, |_buf| Ok(()));
-    assert_eq!(
-        result.err(),
-        Some(smoltcp::Error::Exhausted),
-        "a frame was accepted onto a ring with no room for it"
-    );
-    assert_eq!(
-        iface.driver.hw.lock().tx_dropped,
-        1,
-        "a frame lost with the link up was not counted, so the watchdog has nothing to report"
-    );
-}
-
-/// `send`/`recv` are the raw path, the one a socket syscall takes without
-/// going through smoltcp at all.
-#[test]
-fn the_raw_send_and_receive_path_carries_a_frame_end_to_end() {
-    let iface = at(1_000);
-    assert!(iface.can_send(), "a free ring says it cannot send");
-    let frame = alloc::vec![0xA5u8; 128];
-    assert_eq!(
-        iface.send(&frame).expect("the frame was refused"),
-        frame.len(),
-        "the count reported is not the whole frame"
-    );
-
-    let delivered = ipv4_udp_frame(b"vuelta");
-    hw_deliver(&iface.driver.hw.lock(), 0, &delivered);
-    let mut buf = alloc::vec![0u8; 2048];
-    let n = iface.recv(&mut buf).expect("nothing came back");
-    assert_eq!(
-        &buf[..n],
-        &delivered[..],
-        "the frame read back is not the one delivered"
-    );
-    assert_eq!(
-        iface.recv(&mut buf).err(),
-        Some(DeviceError::NotReady),
-        "an empty ring answered with a frame"
     );
 }

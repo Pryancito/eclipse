@@ -25,6 +25,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::{DeviceError, DeviceResult};
 
+/// The longest frame a card takes or gives: an Ethernet header and a
+/// 1500-byte payload, without the checksum the card adds.
+pub const MAX_FRAME: usize = 1514;
+
+/// Whether `len` is the length of a frame that can be sent: not empty, and
+/// no longer than [`MAX_FRAME`]. A longer one is refused, never clipped.
+pub fn frame_len_ok(len: usize) -> bool {
+    (1..=MAX_FRAME).contains(&len)
+}
+
 /// The most frames a driver hands over for one interrupt or poll: what it
 /// leaves on the card brings it back.
 pub const BURST: usize = 256;
@@ -128,6 +138,28 @@ impl Lent {
         }
         taker.done();
         true
+    }
+}
+
+/// What a card that is not lent does with what it receives. No stack is
+/// above it in the kernel, so a frame is counted, shown to who listens on
+/// the card (`AF_PACKET`), and gone: the ring is emptied, at most
+/// [`BURST`] frames a call, and the card's interrupt has nothing left to
+/// say.
+pub fn tap_only(
+    stats: &Mutex<crate::scheme::NetStats>,
+    mut receive: impl FnMut() -> Option<Vec<u8>>,
+) {
+    for _ in 0..BURST {
+        let Some(frame) = receive() else {
+            break;
+        };
+        {
+            let mut stats = stats.lock();
+            stats.rx_packets += 1;
+            stats.rx_bytes += frame.len() as u64;
+        }
+        super::net_dispatch_packet(&frame);
     }
 }
 

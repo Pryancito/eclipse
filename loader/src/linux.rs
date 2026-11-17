@@ -557,24 +557,10 @@ pub const ECLIPSE_TRANSPORT_VIRTIO_PCI: u64 = 2;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
 
-/// `eclipse_net_serve(fifo, window, mac, rx_slots)`: give the kernel a
-/// network card that this process drives. `fifo` is the end of a FIFO of
-/// 16-byte frame messages the kernel keeps, `window` a VMO of 2048-byte
-/// slots the frames pass through (the first `rx_slots` for frames coming
-/// in), and `mac` the card's address, its first byte in the low byte. The
-/// card appears as an `ethN` interface; the process passes frames on the
-/// other end of the FIFO. Both handles go to the kernel. The interface
-/// outlasts the process by ten seconds, carrying nothing: a process that
-/// serves a card with the same `mac` within them gets that interface, with
-/// its addresses and the connections through it. `ALREADY_BOUND` when the
-/// card with that `mac` has a driver.
-#[cfg(feature = "zircon-gateway")]
-pub const ECLIPSE_NET_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 7;
-
 /// `eclipse_fifo_reply_wait(fifo, elem_size, buf, replies, room, *actual)
 /// -> status`: [`ECLIPSE_CHANNEL_REPLY_WAIT`] for a FIFO, the turn of a
-/// process that serves a device to the kernel ([`ECLIPSE_BLOCK_SERVE`],
-/// [`ECLIPSE_NET_SERVE`]). Writes the first `replies` elements of `buf` to
+/// process that serves a device to the kernel ([`ECLIPSE_BLOCK_SERVE`]).
+/// Writes the first `replies` elements of `buf` to
 /// `fifo` (none when `replies` is 0), then waits until there is something
 /// to read and reads up to `room` elements into the same `buf`, with their
 /// count in `*actual` (a `usize`).
@@ -643,8 +629,7 @@ pub const ECLIPSE_NET_BORROW: u32 = ECLIPSE_GATEWAY_EXT + 11;
 
 /// `eclipse_net_lent_turn(card, msgs, give, room, flags, *actual) ->
 /// status`: a turn on a borrowed card ([`ECLIPSE_NET_BORROW`]). `msgs` is
-/// an array of 16-byte messages, `op, slot, len, off` as with
-/// [`ECLIPSE_NET_SERVE`]. The first `give` are for the kernel: `OP_RX`
+/// an array of 16-byte messages, `op, slot, len, off`. The first `give` are for the kernel: `OP_RX`
 /// (1), receive slot `slot` has been read and can take a frame again;
 /// `OP_TX` (2), send the `len` bytes that are `off` bytes into transmit
 /// slot `slot`, which the card is given before the call returns unless it
@@ -1029,10 +1014,6 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Err(e) => status(e),
         },
         fs_serve::ECLIPSE_FS_SERVE => fs_serve::fs_serve(proc, args),
-        ECLIPSE_NET_SERVE => match net_serve::net_serve(proc, args) {
-            Ok(()) => 0,
-            Err(e) => status(e),
-        },
         ECLIPSE_NETSTACK_SERVE => match netstack_serve(proc, args) {
             Ok(()) => 0,
             Err(e) => status(e),
@@ -3084,7 +3065,7 @@ mod fs_serve;
 #[cfg(feature = "zircon-gateway")]
 mod net_lend;
 #[cfg(feature = "zircon-gateway")]
-mod net_serve;
+mod net_wire;
 
 #[cfg(test)]
 mod user_trap_tests;

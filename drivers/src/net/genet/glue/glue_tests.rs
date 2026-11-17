@@ -9,12 +9,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::phy::{Device, RxToken, TxToken};
-
 use super::super::genet_fake::{Hw, DEFAULT_PHY_ADDR};
 use super::super::rings::*;
 use super::*;
-use crate::net::get_sockets;
 use crate::utils::deferred_job::{drain_deferred_jobs, pending_deferred_jobs};
 use crate::utils::devicetree::Node;
 
@@ -33,23 +30,6 @@ fn interfaz(hw: &Hw) -> GenetInterface {
         )
     }
     .expect("un GENET sano tiene que arrancar")
-}
-
-/// Coge el conjunto de sockets y no lo suelta mientras el guardia viva.
-///
-/// `SOCKETS` es un estatico de **todo el proceso** y la suite corre en
-/// paralelo: un poll de esta interfaz sobre el conjunto compartido se mete en
-/// medio de los tests de la interfaz de loopback, que estan contando si su
-/// propio poll movio algo. Y no hace falta para nada de lo que se mide aqui:
-/// con el conjunto cogido, `poll_inner` se va por su `try_lock` --que es el
-/// camino que de verdad corre en el kernel cuando una llamada de socket vacia
-/// la cola de trabajos-- y lo que queda por comprobar es la mascara, que es lo
-/// que estos tests miran.
-macro_rules! sin_tocar_los_sockets {
-    () => {
-        let sockets = get_sockets();
-        let _sockets = sockets.lock();
-    };
 }
 
 const TRAMA: &[u8] = &[
@@ -261,7 +241,6 @@ fn a_spurious_interrupt_acknowledges_nothing() {
 
 #[test]
 fn an_interrupt_acks_masks_and_queues_the_work() {
-    sin_tocar_los_sockets!();
     let hw = Hw::new();
     let iface = interfaz(&hw);
     hw.raise_irq(UMAC_IRQ_RXDMA_DONE);
@@ -293,7 +272,6 @@ fn a_second_interrupt_does_not_queue_a_second_job() {
     // La tarjeta sigue enmascarada hasta que corra el trabajo encolado:
     // desenmascarar o encolar otro dejaria que los flancos siguientes
     // reconozcan causas que ese trabajo no va a ver.
-    sin_tocar_los_sockets!();
     let hw = Hw::new();
     let iface = interfaz(&hw);
     hw.raise_irq(UMAC_IRQ_RXDMA_DONE);
@@ -329,7 +307,6 @@ fn a_link_event_readjusts_the_mac_before_anything_is_transmitted() {
     // El enlace del GENET avisa por interrupcion. Si la velocidad cambio y el
     // MAC no se entera, lo que sale al cable sale a la velocidad vieja: el
     // enlace esta arriba, el contador de errores a cero y no pasa un paquete.
-    sin_tocar_los_sockets!();
     let hw = Hw::new();
     let iface = interfaz(&hw);
     hw.set_link_100(DEFAULT_PHY_ADDR, true);
@@ -347,7 +324,6 @@ fn a_link_event_readjusts_the_mac_before_anything_is_transmitted() {
 
 #[test]
 fn a_link_that_went_down_does_not_take_the_card_down_with_it() {
-    sin_tocar_los_sockets!();
     let hw = Hw::new();
     let iface = interfaz(&hw);
     hw.set_link_down(DEFAULT_PHY_ADDR);
@@ -373,7 +349,6 @@ fn a_link_that_went_down_does_not_take_the_card_down_with_it() {
 #[test]
 fn a_lent_card_gives_its_frames_to_the_borrower_and_not_to_the_kernels_stack() {
     use crate::net::lent::tests::Kept;
-    sin_tocar_los_sockets!();
     let hw = Hw::new();
     let iface = interfaz(&hw);
     assert!(iface.can_lend());
@@ -418,57 +393,6 @@ fn a_lent_card_gives_its_frames_to_the_borrower_and_not_to_the_kernels_stack() {
 }
 
 #[test]
-fn a_received_frame_comes_up_whole_and_counted() {
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    hw.deliver_frame(0, TRAMA);
-
-    let mut driver = iface.driver.clone();
-    let (rx, _tx) = driver.receive().expect("hay una trama");
-    rx.consume(smoltcp::time::Instant::from_micros(0), |buf| {
-        assert_eq!(buf, TRAMA);
-        Ok(())
-    })
-    .unwrap();
-
-    let stats = iface.get_stats();
-    assert_eq!(stats.rx_packets, 1);
-    assert_eq!(stats.rx_bytes, TRAMA.len() as u64);
-}
-
-#[test]
-fn a_frame_the_mac_marked_bad_is_no_frame_at_all() {
-    // El error de los anillos (`IoError`) no es una trama de longitud cero:
-    // devolverla como tal la da por buena hasta el primer intento de leerle la
-    // cabecera Ethernet, y en `NetScheme::recv` un `Ok(0)` es fin de fichero
-    // para quien llamo a `read`.
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    hw.deliver_frame_with_status(0, TRAMA, DMA_RX_CRC_ERROR);
-
-    let mut driver = iface.driver.clone();
-    assert!(driver.receive().is_none());
-    assert_eq!(iface.recv(&mut [0u8; 2048]), Err(DeviceError::NotReady));
-}
-
-#[test]
-fn the_frames_the_mac_threw_away_are_in_the_counters() {
-    // Nadie de este fichero las vio, asi que no estan en ningun contador de
-    // aqui: la cuenta esta en los anillos y en el registro del MAC.
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    hw.deliver_frame_with_status(0, TRAMA, DMA_RX_CRC_ERROR);
-    let mut driver = iface.driver.clone();
-    assert!(driver.receive().is_none());
-    // Siete descartes contados por el MAC en la mitad de arriba del productor.
-    hw.poke(RDMA_PROD_INDEX, hw.peek(RDMA_PROD_INDEX) | (7 << 16));
-
-    let stats = iface.get_stats();
-    assert_eq!(stats.rx_errors, 1);
-    assert_eq!(stats.rx_dropped, 7);
-}
-
-#[test]
 fn a_transmitted_frame_reaches_the_descriptor_and_is_counted() {
     let hw = Hw::new();
     let iface = interfaz(&hw);
@@ -477,68 +401,6 @@ fn a_transmitted_frame_reaches_the_descriptor_and_is_counted() {
     // `NetScheme::send` es el camino de AF_PACKET, que no pasa por el TxToken:
     // los contadores de smoltcp no se mueven desde aqui.
     assert_eq!(iface.get_stats().tx_packets, 0);
-}
-
-#[test]
-fn an_oversized_frame_is_refused_instead_of_panicking() {
-    // `len` viene de la capa IP, que esta smoltcp no recorta a la MTU y no
-    // fragmenta: indexar el hueco de pila con ella tumba el kernel con un solo
-    // `sendto` grande.
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    let mut driver = iface.driver.clone();
-    let tx = driver.transmit().expect("el anillo esta vacio");
-    let r: Result<()> = tx.consume(
-        smoltcp::time::Instant::from_micros(0),
-        TX_SCRATCH_LEN + 1,
-        |_| Ok(()),
-    );
-    assert_eq!(r.err(), Some(smoltcp::Error::Exhausted));
-    assert_eq!(iface.get_stats().tx_errors, 1);
-}
-
-#[test]
-fn a_full_ring_is_never_reported_as_a_frame_sent() {
-    // smoltcp emite el ACK de un segmento recibido por el TxToken emparejado
-    // con su RxToken, y ya ha avanzado `remote_last_ack`: dar por enviada una
-    // trama que se tiro pierde ese ACK para siempre y el otro extremo se queda
-    // esperando una ventana que cree cerrada.
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    // El anillo entero en vuelo y nada completado.
-    while iface.can_send() {
-        iface
-            .send(TRAMA)
-            .expect("cabe mientras can_send diga que si");
-    }
-    let mut driver = iface.driver.clone();
-    assert!(driver.transmit().is_none(), "un anillo lleno no da TxToken");
-
-    // Y si el anillo se llena entre el `transmit` y el `consume` --que es lo
-    // que pasa en SMP-- la respuesta sigue siendo `Exhausted`, no `Ok`.
-    let token = GenetTxToken {
-        driver: iface.driver.clone(),
-        stats: iface.stats.clone(),
-    };
-    let r: Result<()> = token.consume(smoltcp::time::Instant::from_micros(0), TRAMA.len(), |buf| {
-        buf.copy_from_slice(TRAMA);
-        Ok(())
-    });
-    assert_eq!(r.err(), Some(smoltcp::Error::Exhausted));
-    assert_eq!(iface.get_stats().tx_errors, 1);
-}
-
-#[test]
-fn the_advertised_capabilities_do_not_cap_the_window() {
-    // smoltcp recorta la ventana TCP a `burst * MSS` por un u16: un lote de 64
-    // da la vuelta y deja la conexion en unos pocos Mbps. Es la trampa que
-    // `e1000.rs` y `pcnet32.rs` ya documentan.
-    let hw = Hw::new();
-    let iface = interfaz(&hw);
-    let caps = iface.driver.clone().capabilities();
-    assert_eq!(caps.max_transmission_unit, GENET_MTU + 14);
-    assert_eq!(caps.max_burst_size, None);
-    assert_eq!(iface.get_mtu(), 1500);
 }
 
 #[test]

@@ -9,17 +9,11 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use managed::ManagedSlice;
-use smoltcp::iface::*;
-use smoltcp::phy::{self, Checksum, DeviceCapabilities};
-use smoltcp::time::Instant;
 use smoltcp::wire::*;
-use smoltcp::Result;
 
-use super::{timer_now_as_micros, ProviderImpl};
+use super::{ip_cfg, timer_now_as_micros, ProviderImpl};
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
-use crate::net::get_sockets;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme, SchemeUpcast};
 use crate::utils::dma::DmaRegion;
 use crate::{Device, DeviceError, DeviceResult};
@@ -30,18 +24,6 @@ use pci::{PCIDevice, BAR};
 const NUM_DESC: usize = 256;
 /// Size in bytes of each RX/TX DMA buffer (one page).
 const RX_BUF_SIZE: usize = 4096;
-/// Stack scratch for [`E1000TxToken::consume`]; covers the advertised MTU
-/// (1514) with headroom. Longer frames fall back to a heap buffer — they must
-/// never be clipped, see the comment there.
-const TX_SCRATCH_LEN: usize = 1536;
-
-/// The reason the scratch exists is that the common case must not allocate,
-/// so it has to cover the MTU this driver advertises to smoltcp
-/// (`DeviceCapabilities::max_transmission_unit`, 1514). Checked here rather
-/// than in a test: neither value can change at run time, so the build is the
-/// right place to catch someone lowering one of them.
-const _: () = assert!(TX_SCRATCH_LEN >= 1514);
-
 /// The next descriptor index, wrapping at the end of the ring.
 #[inline]
 fn next_desc(idx: usize) -> usize {
@@ -86,28 +68,6 @@ fn tx_frame_postable(len: usize) -> bool {
 #[inline]
 fn tx_ring_has_room(next_to_use: usize, dd_at: impl Fn(usize) -> bool) -> bool {
     dd_at(next_to_use) && dd_at(next_desc(next_to_use))
-}
-
-/// Somewhere to build a `len`-byte frame: the stack scratch when it fits, a
-/// heap buffer when it does not.
-///
-/// Do NOT index a fixed-size stack array with `len`: it is whatever the IP
-/// layer computed for this datagram, and this smoltcp has neither IP
-/// fragmentation nor an egress MTU clamp (`max_transmission_unit` only feeds
-/// the TCP MSS). A single `sendto()` of a 1495-byte UDP payload -- never mind
-/// a 64 KiB one, or a raw socket -- makes `len` exceed the buffer, and
-/// `&mut scratch[..len]` panics inside the kernel.
-fn tx_stage<'a>(
-    len: usize,
-    scratch: &'a mut [u8; TX_SCRATCH_LEN],
-    heap: &'a mut Vec<u8>,
-) -> &'a mut [u8] {
-    if len <= TX_SCRATCH_LEN {
-        &mut scratch[..len]
-    } else {
-        heap.resize(len, 0);
-        heap.as_mut_slice()
-    }
 }
 
 #[repr(C)]
@@ -478,15 +438,14 @@ pub struct E1000Driver {
 
 #[derive(Clone)]
 pub struct E1000Interface {
-    iface: Arc<Mutex<Interface<'static, E1000Driver>>>,
+    mac: EthernetAddress,
     driver: E1000Driver,
     name: String,
     irq: usize,
     base: usize,
     poll_pending: Arc<core::sync::atomic::AtomicBool>,
-    /// Who the card's frames go to while it is lent to a stack that is not
-    /// the kernel's ([`super::lent`]); empty, the kernel's own stack reads
-    /// them.
+    /// Who the card's frames go to while it is lent to the stack that
+    /// runs as a process ([`super::lent`]); empty, nobody has them.
     lent: super::lent::Lent,
     pub stats: Arc<Mutex<NetStats>>,
     pub routes: Arc<Mutex<Vec<RouteInfo>>>,
@@ -508,46 +467,13 @@ impl E1000Interface {
     /// branch — which read-clears ICR without queuing a poll, dropping the RX
     /// frame until the next interrupt. The periodic `poll()` path re-arms itself.
     fn poll_inner(&self) -> DeviceResult {
-        // A card lent to a stack that is not the kernel's: its frames go
-        // to the borrower as they are, and the kernel's stack is not
-        // polled, neither to read them nor to send on a card it has not
-        // got.
-        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
-            return Ok(());
+        // A card lent to the stack that runs as a process: its frames go
+        // to the borrower as they are. One that is not lent has no stack
+        // above it.
+        if !self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            super::lent::tap_only(&self.stats, || self.driver.hw.lock().receive());
         }
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        // Mutex::lock() uses push_off/pop_off which already disables interrupts
-        // for the duration of the critical section. Manual intr_off/on bypasses
-        // the noff accounting and panics ("RefCell already borrowed") under SMP.
-        let sockets = get_sockets();
-        // `try_lock`, NOT a blocking `lock()`. This poll runs from a deferred
-        // job, and a socket syscall drains that queue WHILE it holds the
-        // socket set (a read/write pumping the NIC to make progress). On this
-        // IRQ-off kernel the blocking acquire then spins forever on a lock the
-        // same CPU already owns: reproduced in QEMU as
-        //   [DEADLOCK: spinlock(s) stuck >8s] cpu=0 at drivers/src/net/e1000.rs
-        //   HOLDER cpu=0 at linux-object/src/net/tcp.rs
-        // during a 64 MB HTTP download. If either lock is held, skip the
-        // smoltcp poll: the frame that owns the socket set drives it on
-        // release, so nothing is lost. `e1000e::poll_with_irq_hint` documents
-        // and fixes exactly this; e1000 never got the same treatment.
-        let res = {
-            match (sockets.try_lock(), self.iface.try_lock()) {
-                (Some(mut sockets), Some(mut iface)) => match iface.poll(&mut sockets, timestamp) {
-                    Ok(p) => {
-                        trace!("e1000 NetScheme poll: {:?}", p);
-                        Ok(())
-                    }
-                    Err(err) => {
-                        warn!("poll got err {}", err);
-                        Err(DeviceError::IoError)
-                    }
-                },
-                _ => Ok(()),
-            }
-        };
-        super::net_flush_deferred_packets();
-        res
+        Ok(())
     }
 }
 
@@ -657,7 +583,7 @@ impl NetScheme for E1000Interface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        self.mac
     }
 
     fn ifname(&self) -> &str {
@@ -675,18 +601,6 @@ impl NetScheme for E1000Interface {
     // get ip addresses
     fn get_ip_address(&self) -> Vec<IpCidr> {
         self.ip_addrs.lock().clone()
-    }
-
-    fn seed_neighbor(
-        &self,
-        protocol: smoltcp::wire::IpAddress,
-        hardware: smoltcp::wire::EthernetAddress,
-    ) -> DeviceResult {
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        self.iface
-            .lock()
-            .seed_neighbor(protocol, hardware, timestamp);
-        Ok(())
     }
 
     fn poll(&self) -> DeviceResult {
@@ -736,170 +650,27 @@ impl NetScheme for E1000Interface {
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            let mut set_primary = false;
-            for slot in addrs.iter_mut() {
-                if let IpCidr::Ipv4(_) = slot {
-                    if !set_primary {
-                        *slot = IpCidr::Ipv4(cidr);
-                        set_primary = true;
-                    } else {
-                        *slot = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
-                    }
-                }
-            }
-            if !set_primary {
-                if let Some(slot) = addrs.iter_mut().next() {
-                    *slot = IpCidr::Ipv4(cidr);
-                }
-            }
-        });
-        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
-        Ok(())
+        ip_cfg::set_ipv4_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            if addrs.contains(&cidr) {
-                return;
-            }
-            for slot in addrs.iter_mut() {
-                if (slot.address().is_unspecified() && slot.prefix_len() == 0)
-                    || (slot.address() == IpAddress::v4(240, 0, 0, 0) && slot.prefix_len() == 32)
-                {
-                    *slot = cidr;
-                    return;
-                }
-            }
-            // Every slot is taken. Growing the list is the only way to keep
-            // the addresses that are already there; overwriting the newest one
-            // silently takes an address the interface still answers on.
-            if let ManagedSlice::Owned(addrs) = addrs {
-                addrs.push(cidr);
-            } else if let Some(slot) = addrs.iter_mut().last() {
-                // Borrowed storage cannot grow, so the newest slot is the best
-                // there is.
-                *slot = cidr;
-            }
-        });
-        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
-        Ok(())
+        ip_cfg::add_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        iface.update_ip_addrs(|addrs| {
-            for slot in addrs.iter_mut() {
-                if *slot == cidr {
-                    *slot = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
-                    return;
-                }
-            }
-        });
-        *self.ip_addrs.lock() = iface.ip_addrs().to_vec();
-        Ok(())
+        ip_cfg::remove_ip_address(&mut self.ip_addrs.lock(), cidr)
     }
 
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        match gateway {
-            Some(IpAddress::Ipv4(gw)) => {
-                let mut routes = self.routes.lock();
-                if cidr.prefix_len() == 0 {
-                    let _ = iface.routes_mut().remove_default_ipv4_route();
-                    iface
-                        .routes_mut()
-                        .add_default_ipv4_route(gw)
-                        .map_err(|_| DeviceError::IoError)?;
-                    // Only one default route can be in force, so a new one
-                    // replaces the one already there. A route to a named
-                    // network replaces nothing -- and this purge used to run
-                    // for every gatewayed route, so the static route in a DHCP
-                    // lease took 0.0.0.0/0 out of the table the kernel reports
-                    // while smoltcp went on routing through it.
-                    routes
-                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
-                }
-                routes.push(RouteInfo {
-                    dst: cidr,
-                    gateway: Some(IpAddress::Ipv4(gw)),
-                });
-            }
-            Some(IpAddress::Ipv6(gw)) => {
-                let mut routes = self.routes.lock();
-                if cidr.prefix_len() == 0 {
-                    let _ = iface.routes_mut().remove_default_ipv6_route();
-                    iface
-                        .routes_mut()
-                        .add_default_ipv6_route(gw)
-                        .map_err(|_| DeviceError::IoError)?;
-                    // Only one default route can be in force, so a new one
-                    // replaces the one already there. A route to a named
-                    // network replaces nothing -- and this purge used to run
-                    // for every gatewayed route, so the static route in a DHCP
-                    // lease took ::/0 out of the table the kernel reports
-                    // while smoltcp went on routing through it.
-                    routes
-                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
-                }
-                routes.push(RouteInfo {
-                    dst: cidr,
-                    gateway: Some(IpAddress::Ipv6(gw)),
-                });
-            }
-            None => {
-                self.routes.lock().push(RouteInfo { dst: cidr, gateway });
-            }
-            _ => {}
-        }
-        Ok(())
+        ip_cfg::add_route(&mut self.routes.lock(), cidr, gateway)
     }
 
-    fn del_route(&self, cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
-        let mut iface = self.iface.lock();
-        if cidr.prefix_len() == 0 {
-            match cidr {
-                IpCidr::Ipv4(_) => {
-                    let _ = iface.routes_mut().remove_default_ipv4_route();
-                }
-                IpCidr::Ipv6(_) => {
-                    let _ = iface.routes_mut().remove_default_ipv6_route();
-                }
-                _ => {}
-            }
-        }
-        self.routes.lock().retain(|r| r.dst != cidr);
-        Ok(())
+    fn del_route(&self, cidr: IpCidr, _gateway: Option<IpAddress>) -> DeviceResult {
+        ip_cfg::del_route(&mut self.routes.lock(), cidr)
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        let iface = self.iface.lock();
-        let mut res = Vec::new();
-
-        // 1. Add tracked routes
-        res.extend(self.routes.lock().clone());
-
-        // 2. Add direct routes
-        for cidr in iface.ip_addrs() {
-            match cidr {
-                IpCidr::Ipv4(v4) if v4.prefix_len() > 0 => {
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv4(v4.network()),
-                        gateway: None,
-                    });
-                }
-                IpCidr::Ipv6(v6) if v6.prefix_len() > 0 => {
-                    res.push(RouteInfo {
-                        dst: IpCidr::Ipv6(v6.network()),
-                        gateway: None,
-                    });
-                }
-                _ => {}
-            }
-        }
-        res
+        ip_cfg::reported_routes(&self.routes.lock(), &self.ip_addrs.lock())
     }
 
     fn get_stats(&self) -> NetStats {
@@ -907,114 +678,6 @@ impl NetScheme for E1000Interface {
     }
     fn get_mtu(&self) -> usize {
         1500
-    }
-}
-
-pub struct E1000RxToken {
-    data: Vec<u8>,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-pub struct E1000TxToken {
-    driver: E1000Driver,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-impl phy::Device<'_> for E1000Driver {
-    type RxToken = E1000RxToken;
-    type TxToken = E1000TxToken;
-
-    fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.hw.lock().receive().map(|pkt| {
-            (
-                E1000RxToken {
-                    data: pkt,
-                    stats: self.stats.clone(),
-                },
-                E1000TxToken {
-                    driver: self.clone(),
-                    stats: self.stats.clone(),
-                },
-            )
-        })
-    }
-
-    fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.hw.lock().can_send() {
-            Some(E1000TxToken {
-                driver: self.clone(),
-                stats: self.stats.clone(),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1514;
-        // Do NOT set max_burst_size. smoltcp clamps the TCP window to
-        // `burst * MSS` and stores it in a u16: burst=64 → 64*1474=94336,
-        // which wraps to 28800 and caps throughput at a few Mbps.
-        caps.max_burst_size = None;
-        caps
-    }
-}
-
-impl phy::RxToken for E1000RxToken {
-    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        let mut stats = self.stats.lock();
-        stats.rx_packets += 1;
-        stats.rx_bytes += self.data.len() as u64;
-        drop(stats);
-
-        // Dispatch to global packet tapping (AF_PACKET sockets) after smoltcp unlocks SOCKETS.
-        super::net_defer_packet(&self.data);
-        f(&mut self.data)
-    }
-}
-
-impl phy::TxToken for E1000TxToken {
-    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        // Do NOT index a fixed-size stack array with `len`: it is whatever the
-        // IP layer computed for this datagram, and this smoltcp has neither IP
-        // fragmentation nor an egress MTU clamp (`max_transmission_unit` only
-        // feeds the TCP MSS). A single `sendto()` of a 1495-byte UDP payload
-        // — never mind a 64 KiB one, or a raw socket — makes `len` exceed the
-        // buffer and `&mut buffer[..len]` panics inside the kernel.
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap_buf = Vec::new();
-        let buf: &mut [u8] = tx_stage(len, &mut scratch, &mut heap_buf);
-        let result = f(buf)?;
-
-        let mut driver = self.driver.hw.lock();
-        let sent = driver.send(buf);
-        drop(driver);
-
-        if sent {
-            let mut stats = self.stats.lock();
-            stats.tx_packets += 1;
-            stats.tx_bytes += len as u64;
-        } else {
-            // NEVER report a dropped frame as sent. smoltcp's `socket_ingress`
-            // emits the ACK / window-update for a received segment through the
-            // TxToken paired with that RxToken, and it has ALREADY advanced
-            // `remote_last_ack` / `remote_last_win` by the time we are called.
-            // Returning `Ok` there loses the ACK for good: the peer waits on a
-            // window it believes is closed and the transfer stalls mid-stream.
-            // `Err(Exhausted)` keeps smoltcp's state consistent so the segment
-            // is re-emitted. (`e1000e::E1000eTxToken::consume` documents the
-            // same failure; it additionally spins briefly for a free slot.)
-            return Err(smoltcp::Error::Exhausted);
-        }
-
-        Ok(result)
     }
 }
 
@@ -1063,23 +726,9 @@ pub fn init(
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
         IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
     ];
-    // Per-NIC storage (same pattern as e1000e): a shared `static mut` would
-    // alias if two e1000 probes ran, corrupting both route tables.
-    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-        Box::leak(vec![None; 4].into_boxed_slice());
-    let routes = Routes::new(routes_storage);
-    let neighbor_cache = NeighborCache::new(BTreeMap::new());
-
-    let iface = InterfaceBuilder::new(net_driver.clone())
-        .ethernet_addr(ethernet_addr)
-        .neighbor_cache(neighbor_cache)
-        .ip_addrs(ip_addrs.clone())
-        .routes(routes)
-        .finalize();
-
     crate::klog_info!("e1000 interface {} discovered", name);
     let e1000_iface = E1000Interface {
-        iface: Arc::new(Mutex::new(iface)),
+        mac: ethernet_addr,
         driver: net_driver,
         name,
         irq,
@@ -1235,94 +884,6 @@ mod ring_tests {
         assert!(!tx_ring_has_room(0, |_| false));
         assert!(!tx_ring_has_room(NUM_DESC - 1, |_| false));
     }
-
-    #[test]
-    fn a_frame_that_fits_the_scratch_uses_it_and_is_exactly_its_length() {
-        let mut scratch = [0xAAu8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        for len in [0usize, 1, 60, 1514, TX_SCRATCH_LEN] {
-            let buf = tx_stage(len, &mut scratch, &mut heap);
-            assert_eq!(buf.len(), len, "staged buffer must be exactly `len`");
-            assert!(heap.is_empty(), "len {} should not have hit the heap", len);
-        }
-    }
-
-    #[test]
-    fn a_frame_longer_than_the_scratch_goes_to_the_heap_instead_of_panicking() {
-        // This is the one that panicked the kernel. `len` is whatever the IP
-        // layer computed, and a single `sendto()` of a 1495-byte UDP payload
-        // takes it past the 1536-byte scratch: 1495 + 20 (IP) + 8 (UDP) + 14
-        // (Ethernet) = 1537.
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        let buf = tx_stage(1537, &mut scratch, &mut heap);
-        assert_eq!(buf.len(), 1537);
-
-        // And the extreme a raw socket can ask for.
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        let buf = tx_stage(65535, &mut scratch, &mut heap);
-        assert_eq!(buf.len(), 65535);
-    }
-
-    #[test]
-    fn the_staged_buffer_is_zeroed_whichever_side_of_the_boundary_it_is_on() {
-        // smoltcp fills only the headers it knows about; whatever is left is
-        // what goes on the wire. A dirty scratch leaks the previous frame.
-        let mut scratch = [0xFFu8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        let buf = tx_stage(64, &mut scratch, &mut heap);
-        buf.fill(0);
-        assert!(buf.iter().all(|&b| b == 0));
-
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = alloc::vec![0xFFu8; 8];
-        let buf = tx_stage(4000, &mut scratch, &mut heap);
-        assert_eq!(buf.len(), 4000);
-        assert!(
-            buf[8..].iter().all(|&b| b == 0),
-            "the grown tail of the heap buffer must be zero, not stale bytes"
-        );
-    }
-
-    #[test]
-    fn the_scratch_boundary_is_exact() {
-        // One byte either side of `TX_SCRATCH_LEN`: `<=` uses the scratch, and
-        // `>` must not, because `&mut scratch[..len]` past its length is the
-        // panic.
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        assert_eq!(
-            tx_stage(TX_SCRATCH_LEN, &mut scratch, &mut heap).len(),
-            TX_SCRATCH_LEN
-        );
-        assert!(heap.is_empty());
-
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        assert_eq!(
-            tx_stage(TX_SCRATCH_LEN + 1, &mut scratch, &mut heap).len(),
-            TX_SCRATCH_LEN + 1
-        );
-        assert_eq!(
-            heap.len(),
-            TX_SCRATCH_LEN + 1,
-            "it must have gone to the heap"
-        );
-    }
-
-    #[test]
-    fn the_scratch_covers_the_advertised_mtu() {
-        // The reason the scratch exists at all: the common case must not
-        // allocate. 1514 is the MTU this driver advertises to smoltcp.
-        // (That the scratch covers the advertised MTU is asserted at compile
-        // time next to the constant itself -- a build error beats a test
-        // failure for something neither value can change at run time.)
-        //
-        // A postable frame is allowed to be longer than the scratch, so the
-        // two limits are not the same number and must not be conflated.
-        assert!(tx_frame_postable(TX_SCRATCH_LEN + 1));
-    }
 }
 
 #[cfg(test)]
@@ -1394,8 +955,8 @@ mod e1000_desc_layout_tests {
 /// The driver over a register window in ordinary memory.
 ///
 /// `ring_tests` and `e1000_desc_layout_tests` above cover the pure helpers --
-/// `next_desc`, `rx_len_clamped`, `tx_frame_postable`, `tx_ring_has_room`,
-/// `tx_stage` -- and the descriptor layout, and they are good tests. What
+/// `next_desc`, `rx_len_clamped`, `tx_frame_postable`, `tx_ring_has_room`
+/// -- and the descriptor layout, and they are good tests. What
 /// nothing covered is **the bodies that use them**: `E1000::new`, `receive`,
 /// `send`, `can_send` and `handle_interrupt` were at zero lines, 568 of the
 /// file's 590 lines of production. So the ring guard that keeps TX from going

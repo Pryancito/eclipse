@@ -3,7 +3,6 @@
 
 use crate::sync::Mutex;
 use alloc::{sync::Arc, vec};
-use smoltcp::socket::SocketSet;
 
 pub mod e1000;
 pub mod e1000e;
@@ -21,15 +20,13 @@ pub mod mii;
 /// x86 has, so the module is not built elsewhere.
 #[cfg(target_arch = "x86_64")]
 pub mod pcnet32;
-/// An interface whose card is driven outside the kernel.
-pub mod served;
 /// The card of a stack that runs outside the kernel, to be looked at.
 pub mod stack_card;
 /// AMD XGMAC 10GbE (`amd-xgbe`). MMIO, so it builds everywhere; see the
 /// module docs for what it does and does not do.
 pub mod xgbe;
 pub use isomorphic_drivers::provider::Provider;
-pub use loopback::{LoopbackDevice, LoopbackInterface, ShownLoopback};
+pub use loopback::ShownLoopback;
 
 use crate::scheme::{IrqScheme, Scheme};
 use crate::DeviceResult;
@@ -376,8 +373,7 @@ unsafe extern "C" {
     fn drivers_wake_net_rx_waiters();
 }
 
-/// Wake all tasks waiting for TCP/UDP RX data.
-/// Call this after `iface.poll()` processes incoming packets.
+/// Wake the tasks that wait for frames of a card.
 pub fn wake_net_rx_waiters() {
     unsafe { drivers_wake_net_rx_waiters() }
 }
@@ -387,41 +383,7 @@ pub const PAGE_SIZE: usize = 4096;
 type VirtAddr = usize;
 type PhysAddr = usize;
 
-lazy_static::lazy_static! {
-    pub static ref SOCKETS: Arc<Mutex<SocketSet<'static>>> =
-    Arc::new(Mutex::new(SocketSet::new(vec![])));
-
-    static ref PACKET_CALLBACK: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
-
-    /// AF_PACKET taps queued during smoltcp `poll` (SOCKETS held) and flushed after.
-    pub static ref DEFERRED_PACKETS: Mutex<alloc::collections::VecDeque<Vec<u8>>> = Mutex::new(alloc::collections::VecDeque::new());
-}
-
-/// How many frames one `poll` may hand to an AF_PACKET tap.
-///
-/// It was 64. The e1000e has **256 RX descriptors** (its own comment says so),
-/// every frame of a poll goes through [`net_defer_packet`] while smoltcp holds
-/// `SOCKETS`, and the queue is only drained afterwards by
-/// [`net_flush_deferred_packets`] -- so one poll of a full ring offered 256
-/// frames to a queue that held 64 and dropped the oldest 192 without a word.
-/// With a tap running, that is not an edge case: it is every burst that fills
-/// the ring, which is what a download does.
-///
-/// A poll's worth of the largest ring in the tree, then. The frames are only
-/// copied at all when a tap is registered, and the queue is emptied on every
-/// flush, so the cost is borne by whoever is capturing.
-const DEFERRED_PACKET_MAX: usize = 256;
-
-/// Frames dropped because the tap queue was full, since boot.
-static DEFERRED_PACKETS_DROPPED: AtomicUsize = AtomicUsize::new(0);
-
-/// How many frames an AF_PACKET tap has lost to a full queue.
-///
-/// A cap that drops is invisible without this: the tap simply shows fewer
-/// frames than went past, and nothing anywhere says so.
-pub fn dropped_deferred_packets() -> usize {
-    DEFERRED_PACKETS_DROPPED.load(Ordering::Relaxed)
-}
+static PACKET_CALLBACK: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {
@@ -443,91 +405,14 @@ pub fn net_dispatch_packet(data: &[u8]) {
     }
 }
 
-/// Queue a frame for AF_PACKET while smoltcp holds `SOCKETS` (see [`net_flush_deferred_packets`]).
-///
-/// No-op (and no allocation) when no packet callback is registered — the common
-/// case for normal TCP/UDP traffic without an AF_PACKET tap.
-pub fn net_defer_packet(data: &[u8]) {
-    if PACKET_CALLBACK.lock().is_none() {
-        return;
-    }
-    queue_for_the_tap(data.to_vec());
-}
-
-/// The one place the cap is applied, so there is one cap.
-///
-/// It used to be written out twice, once here and once in
-/// [`net_defer_packet_owned`], which is two places to fix and one to forget.
-fn queue_for_the_tap(frame: Vec<u8>) {
-    let mut q = DEFERRED_PACKETS.lock();
-    if q.len() >= DEFERRED_PACKET_MAX {
-        q.pop_front();
-        DEFERRED_PACKETS_DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
-    q.push_back(frame);
-}
-
-/// Like [`net_defer_packet`], but takes ownership so the caller can avoid a
-/// second heap copy when it already holds a `Vec<u8>`.
-pub fn net_defer_packet_owned(data: Vec<u8>) {
-    if PACKET_CALLBACK.lock().is_none() {
-        return;
-    }
-    queue_for_the_tap(data);
-}
-
-/// Flush frames queued by [`net_defer_packet`]; call only after releasing smoltcp locks.
-pub fn net_flush_deferred_packets() {
-    let batch: alloc::collections::VecDeque<Vec<u8>> = {
-        let mut q = DEFERRED_PACKETS.lock();
-        core::mem::take(&mut *q)
-    };
-    for pkt in batch {
-        net_dispatch_packet(&pkt);
-    }
-}
-
-// 注意！这个容易出现死锁
-#[cfg(not(test))]
-pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
-    SOCKETS.clone()
-}
-
-/// Under test, the socket set is **per thread**.
-///
-/// `SOCKETS` is one set for the whole binary, and the harness runs the suite
-/// in parallel: a `poll` driven by one test takes that shared set and carries
-/// out the egress of sockets another test had just staged, so the other test's
-/// own `poll` reports it moved nothing. That is not a hypothetical -- two
-/// `net::loopback` tests failed one run in three (`the staged frame was lost`)
-/// and passed on their own, and the comment next to one of them claimed the
-/// suite ran `--test-threads=1`, which it does not.
-///
-/// A thread-local set is the same shape the rest of this crate already uses to
-/// stay honest under a parallel harness (`utils::dma_sync::test_flag`, every
-/// fake register window): nothing is shared, so nothing can be stolen. It
-/// changes no production path -- `cfg(not(test))` above is what the kernel
-/// links -- and it does not weaken what the tests check: a test that wants to
-/// see `poll` give up while the set is locked still locks its own set, and
-/// one that wants two interfaces over one set gets it as long as they live in
-/// the same test.
-#[cfg(test)]
-pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
-    std::thread_local! {
-        static TEST_SOCKETS: Arc<Mutex<SocketSet<'static>>> =
-            Arc::new(Mutex::new(SocketSet::new(vec![])));
-    }
-    TEST_SOCKETS.with(|s| s.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scheme::IrqScheme;
     extern crate std;
 
-    /// Everything here lives in process-wide statics -- the tap callback, the
-    /// deferred queue, the drop counter, the MSI queue -- so the tests take
+    /// Everything here lives in process-wide statics -- the tap callback,
+    /// the MSI queue -- so the tests take
     /// turns, and each leaves them as it found them.
     pub(crate) fn alone_with_the_statics<R>(body: impl FnOnce() -> R) -> R {
         static TURNSTILE: Mutex<()> = Mutex::new(());
@@ -540,42 +425,11 @@ mod tests {
 
     fn clear_the_statics() {
         *PACKET_CALLBACK.lock() = None;
-        DEFERRED_PACKETS.lock().clear();
-        DEFERRED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
         MSI_PENDING.lock().clear();
         INTX_PENDING.lock().clear();
         INTX_ON.store(false, Ordering::SeqCst);
         *MSI_IRQ_HOST.lock() = None;
         SEEN.lock().clear();
-    }
-
-    /// The socket set a test sees is **its own**, and the same one all the way
-    /// through the test.
-    ///
-    /// This is the fix for two `net::loopback` tests that failed one run in
-    /// three: with one set for the whole binary, a `poll` driven by another
-    /// thread carried out the egress of the socket this test had just staged,
-    /// and this test's own `poll` then reported it moved nothing. Nothing in
-    /// the suite shares the set, so nothing can take a packet out of it.
-    #[test]
-    fn under_test_each_thread_gets_its_own_socket_set() {
-        let mine = get_sockets();
-        assert!(
-            Arc::ptr_eq(&mine, &get_sockets()),
-            "the same thread has to get the same set, or a poll and the socket \
-             it staged would not even be in the same place"
-        );
-        let otro = std::thread::spawn(|| Arc::as_ptr(&get_sockets()) as usize)
-            .join()
-            .expect("the thread must not panic");
-        assert_ne!(
-            Arc::as_ptr(&mine) as usize,
-            otro,
-            "two threads share the socket set: one test's poll can empty another's"
-        );
-        // And the process-wide set the kernel links is still there, untouched:
-        // what changed is only which one `get_sockets` hands out under test.
-        assert!(SOCKETS.lock().iter().next().is_none());
     }
 
     /// The frames the tap was handed, in the order it got them.
@@ -585,8 +439,12 @@ mod tests {
         SEEN.lock().push(data.to_vec());
     }
 
+    /// The frames of this module's tests: the cards of other tests show
+    /// theirs to the same tap meanwhile, and none of those is four bytes.
     fn seen() -> Vec<Vec<u8>> {
-        SEEN.lock().clone()
+        let mut seen = SEEN.lock().clone();
+        seen.retain(|frame| frame.len() == 4);
+        seen
     }
 
     fn frame(n: u32) -> Vec<u8> {
@@ -597,125 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_copied_when_nobody_is_listening() {
-        // The common case: no AF_PACKET tap, and the receive path must not pay
-        // an allocation and a copy per frame for a queue nobody drains.
+    fn a_frame_reaches_the_tap_that_listens_and_nobody_when_none_does() {
         alone_with_the_statics(|| {
-            for i in 0..10 {
-                net_defer_packet(&frame(i));
-                net_defer_packet_owned(frame(i));
-            }
-            assert!(DEFERRED_PACKETS.lock().is_empty());
-            assert_eq!(dropped_deferred_packets(), 0);
-        })
-    }
-
-    #[test]
-    fn a_frame_reaches_the_tap_only_once_the_queue_is_flushed() {
-        // The whole point of deferring: `net_defer_packet` is called with
-        // smoltcp's `SOCKETS` held, and the callback takes more locks.
-        alone_with_the_statics(|| {
-            set_packet_callback(tap);
-            net_defer_packet(&frame(7));
-            assert!(seen().is_empty(), "the tap was called with SOCKETS held");
-            net_flush_deferred_packets();
-            assert_eq!(seen(), std::vec![frame(7)]);
-        })
-    }
-
-    #[test]
-    fn the_frames_reach_the_tap_in_the_order_they_arrived() {
-        alone_with_the_statics(|| {
-            set_packet_callback(tap);
-            for i in 0..8 {
-                net_defer_packet(&frame(i));
-            }
-            net_flush_deferred_packets();
-            assert_eq!(seen(), (0..8).map(frame).collect::<Vec<_>>());
-        })
-    }
-
-    #[test]
-    fn a_whole_ring_of_frames_reaches_the_tap() {
-        // The e1000e has 256 RX descriptors, and one poll can drain all of
-        // them before anything is flushed. The cap was 64, so 192 of those 256
-        // frames were dropped -- silently, and the oldest first, which for a
-        // capture means losing the beginning of the burst.
-        alone_with_the_statics(|| {
-            set_packet_callback(tap);
-            for i in 0..256 {
-                net_defer_packet(&frame(i));
-            }
-            net_flush_deferred_packets();
-            assert_eq!(seen().len(), 256, "a poll of a full ring lost frames");
-            assert_eq!(seen(), (0..256).map(frame).collect::<Vec<_>>());
-            assert_eq!(dropped_deferred_packets(), 0);
-        })
-    }
-
-    #[test]
-    fn the_frames_that_do_not_fit_are_counted_instead_of_vanishing() {
-        // Past the cap frames still have to go, but a cap that drops without
-        // counting is a cap nobody can see: the tap just shows fewer frames
-        // than went past and nothing anywhere says so.
-        alone_with_the_statics(|| {
-            set_packet_callback(tap);
-            for i in 0..(DEFERRED_PACKET_MAX + 10) as u32 {
-                net_defer_packet(&frame(i));
-            }
-            assert_eq!(dropped_deferred_packets(), 10);
-            net_flush_deferred_packets();
-            assert_eq!(seen().len(), DEFERRED_PACKET_MAX);
-            // The oldest went, so the newest are the ones still here.
-            assert_eq!(seen()[0], frame(10));
-        })
-    }
-
-    #[test]
-    fn the_cap_is_the_same_whether_the_frame_is_borrowed_or_owned() {
-        // It was written out twice, which is two places to fix and one to
-        // forget. This is the test that would have noticed.
-        for owned in [false, true] {
-            alone_with_the_statics(|| {
-                set_packet_callback(tap);
-                for i in 0..(DEFERRED_PACKET_MAX + 3) as u32 {
-                    if owned {
-                        net_defer_packet_owned(frame(i));
-                    } else {
-                        net_defer_packet(&frame(i));
-                    }
-                }
-                assert_eq!(
-                    (DEFERRED_PACKETS.lock().len(), dropped_deferred_packets()),
-                    (DEFERRED_PACKET_MAX, 3),
-                    "owned = {}",
-                    owned
-                );
-            })
-        }
-    }
-
-    #[test]
-    fn a_flush_leaves_the_queue_empty_even_if_the_tap_goes_away() {
-        alone_with_the_statics(|| {
-            set_packet_callback(tap);
-            net_defer_packet(&frame(1));
-            *PACKET_CALLBACK.lock() = None;
-            net_flush_deferred_packets();
-            assert!(
-                DEFERRED_PACKETS.lock().is_empty(),
-                "the frames of a tap that unregistered stay queued for ever"
-            );
+            net_dispatch_packet(&frame(1));
             assert!(seen().is_empty());
-        })
-    }
-
-    #[test]
-    fn a_flush_with_nothing_queued_does_nothing() {
-        alone_with_the_statics(|| {
             set_packet_callback(tap);
-            net_flush_deferred_packets();
-            assert!(seen().is_empty());
+            for i in 2..5 {
+                net_dispatch_packet(&frame(i));
+            }
+            assert_eq!(seen(), (2..5).map(frame).collect::<Vec<_>>());
         })
     }
 

@@ -309,19 +309,6 @@ pub mod netmon;
 
 // pub mod stack;
 
-// ============= Socket Set =============
-use zcore_drivers::net::get_sockets;
-// lazy_static! {
-//     /// Global SocketSet in smoltcp.
-//     ///
-//     /// Because smoltcp is a single thread network stack,
-//     /// every socket operation needs to lock this.
-//     pub static ref SOCKETS: Mutex<SocketSet<'static>> =
-//         Mutex::new(SocketSet::new(vec![]));
-// }
-
-// ============= Socket Set =============
-
 // ============= Define =============
 
 // ========TCP
@@ -732,19 +719,6 @@ pub fn prepare_ipv4_stack() {
     }
 }
 
-/// Import software ARP/NDP learnings into smoltcp's neighbor cache (TCP/UDP egress).
-pub fn sync_neighbor_cache_into_smoltcp() {
-    use smoltcp::wire::IpAddress;
-    for dev in get_net_device().iter() {
-        for (ip, mac) in arp_cache::get_entries() {
-            let _ = dev.seed_neighbor(IpAddress::Ipv4(ip), mac);
-        }
-        for (ip, mac) in ndp_cache::get_entries() {
-            let _ = dev.seed_neighbor(IpAddress::Ipv6(ip), mac);
-        }
-    }
-}
-
 mod adaptive;
 
 /// Minimum interval for heavy net housekeeping (route/neighbor/prune).
@@ -871,12 +845,8 @@ fn maybe_run_net_housekeeping(now_us: u64, force: bool) {
         }
     }
     let _running = Running;
-    sync_neighbor_cache_into_smoltcp();
     if has_usable_ipv4() {
         prepare_ipv4_stack();
-    }
-    if let Some(mut sockets) = zcore_drivers::net::get_sockets().try_lock() {
-        sockets.prune();
     }
 }
 
@@ -1041,9 +1011,6 @@ pub fn poll_ifaces() {
             warn!("error : {:?}", e)
         }
     });
-    if zcore_drivers::net::loopback::take_loopback_moved() {
-        kernel_hal::net::wake_net_rx_waiters_now();
-    }
     maybe_run_net_housekeeping(mono_us(), false);
 }
 
@@ -2285,25 +2252,6 @@ fn proc_net_hex_addr(addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string
     alloc::format!("{:08X}:{:04X}", v4, port)
 }
 
-/// Linux numeric TCP state codes from `include/net/tcp_states.h`, keyed by
-/// the smoltcp state machine.
-fn tcp_state_code(state: smoltcp::socket::TcpState) -> u8 {
-    use smoltcp::socket::TcpState;
-    match state {
-        TcpState::Established => 0x01,
-        TcpState::SynSent => 0x02,
-        TcpState::SynReceived => 0x03,
-        TcpState::FinWait1 => 0x04,
-        TcpState::FinWait2 => 0x05,
-        TcpState::TimeWait => 0x06,
-        TcpState::Closed => 0x07,
-        TcpState::CloseWait => 0x08,
-        TcpState::LastAck => 0x09,
-        TcpState::Listen => 0x0A,
-        TcpState::Closing => 0x0B,
-    }
-}
-
 /// Which of a protocol's two tables: `/proc/net/tcp` or `/proc/net/tcp6`,
 /// `/proc/net/udp` or `/proc/net/udp6`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2313,19 +2261,6 @@ enum ProcNetFamily {
 }
 
 impl ProcNetFamily {
-    /// The table a socket of the kernel's own set is in, by the addresses
-    /// it has: IPv6's when either is an IPv6 address. One that has no
-    /// address yet says nothing of its family and stays in IPv4's table,
-    /// where every one of them was listed before there were two.
-    fn of(local: smoltcp::wire::IpAddress, remote: smoltcp::wire::IpAddress) -> Self {
-        use smoltcp::wire::IpAddress;
-        if matches!(local, IpAddress::Ipv6(_)) || matches!(remote, IpAddress::Ipv6(_)) {
-            ProcNetFamily::V6
-        } else {
-            ProcNetFamily::V4
-        }
-    }
-
     /// The table a socket of the stack that runs as a process is in: the
     /// one of the family it was opened with.
     fn of_served(sock: &user_stack::Listed) -> Self {
@@ -2417,40 +2352,14 @@ pub fn proc_net_tcp6_content() -> alloc::string::String {
 /// that runs as a process: the ones of the table's family are listed.
 fn proc_net_tcp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
-    use smoltcp::socket::Socket;
     let mut s = alloc::format!(
         "  sl  {} st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
         family.columns()
     );
-    let sets = get_sockets();
-    let sets = sets.lock();
-    let mut slots = 0;
-    for (i, socket) in sets.iter().enumerate() {
-        slots = i + 1;
-        if let Socket::Tcp(tcp) = socket {
-            let l = tcp.local_endpoint();
-            let r = tcp.remote_endpoint();
-            if ProcNetFamily::of(l.addr, r.addr) != family {
-                continue;
-            }
-            let _ = writeln!(
-                s,
-                "{:4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
-                i,
-                family.cell(l.addr, l.port),
-                family.cell(r.addr, r.port),
-                tcp_state_code(tcp.state()),
-                1000 + i,
-            );
-        }
-    }
-    drop(sets);
-    // Numbered past the kernel's own, so no two rows have one number.
     let served = served
         .iter()
         .filter(|sock| ProcNetFamily::of_served(sock) == family);
     for (i, sock) in served.enumerate() {
-        let i = slots + i;
         let _ = writeln!(
             s,
             "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 1 0000000000000000 100 0 0 10 0",
@@ -2496,38 +2405,14 @@ pub fn proc_net_udp6_content() -> alloc::string::String {
 /// that runs as a process: the ones of the table's family are listed.
 fn proc_net_udp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> alloc::string::String {
     use core::fmt::Write;
-    use smoltcp::socket::Socket;
-    use smoltcp::wire::IpAddress;
     let mut s = alloc::format!(
         "  sl  {} st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
         family.columns()
     );
-    let sets = get_sockets();
-    let sets = sets.lock();
-    let mut slots = 0;
-    for (i, socket) in sets.iter().enumerate() {
-        slots = i + 1;
-        if let Socket::Udp(udp) = socket {
-            let l = udp.endpoint();
-            if ProcNetFamily::of(l.addr, IpAddress::Unspecified) != family {
-                continue;
-            }
-            let _ = writeln!(
-                s,
-                "{:4}: {} {} 07 00000000:00000000 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
-                i,
-                family.cell(l.addr, l.port),
-                family.cell(IpAddress::Unspecified, 0),
-                1000 + i,
-            );
-        }
-    }
-    drop(sets);
     let served = served
         .iter()
         .filter(|sock| ProcNetFamily::of_served(sock) == family);
     for (i, sock) in served.enumerate() {
-        let i = slots + i;
         let _ = writeln!(
             s,
             "{:4}: {} {} {:02X} 00000000:{:08X} 00:00000000 00000000     0        0 {} 2 0000000000000000 0",
@@ -2671,16 +2556,6 @@ mod proc_net_tests {
             proc_net_hex_addr6(IpAddress::Unspecified, 0),
             "00000000000000000000000000000000:0000"
         );
-        // A socket of the kernel's own is IPv6's by either address, and
-        // IPv4's while it has none.
-        let v4 = IpAddress::Ipv4(Ipv4Address([10, 0, 9, 15]));
-        let v6 = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
-        let none = IpAddress::Unspecified;
-        assert!(ProcNetFamily::of(v6, none) == ProcNetFamily::V6);
-        assert!(ProcNetFamily::of(none, v6) == ProcNetFamily::V6);
-        assert!(ProcNetFamily::of(v4, v4) == ProcNetFamily::V4);
-        assert!(ProcNetFamily::of(v4, none) == ProcNetFamily::V4);
-        assert!(ProcNetFamily::of(none, none) == ProcNetFamily::V4);
         let at = |a: [u8; 4], port| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(a)), port);
         let served = [
             Listed {
@@ -2759,15 +2634,6 @@ mod proc_net_tests {
             proc_net_udp_of(ProcNetFamily::V4, &served).lines().count(),
             proc_net_udp_of(ProcNetFamily::V4, &[]).lines().count()
         );
-    }
-
-    #[test]
-    fn tcp_state_codes_match_tcp_states_h() {
-        use smoltcp::socket::TcpState;
-        assert_eq!(tcp_state_code(TcpState::Established), 0x01);
-        assert_eq!(tcp_state_code(TcpState::Listen), 0x0A);
-        assert_eq!(tcp_state_code(TcpState::TimeWait), 0x06);
-        assert_eq!(tcp_state_code(TcpState::Closed), 0x07);
     }
 }
 

@@ -2,9 +2,10 @@
 //!
 //! Every NIC driver in this crate answers the same half of `NetScheme`: the
 //! `SIOCSIFADDR` / `SIOCADDRT` family, which is pure bookkeeping over the
-//! smoltcp `Interface` and the two shadow tables (`ip_addrs`, `routes`) the
-//! kernel reports through `/proc` and `ifconfig`. None of it touches a
-//! register, so none of it belongs in a driver.
+//! two tables (`ip_addrs`, `routes`) the kernel reports through `/proc` and
+//! `ifconfig`. None of it touches a register, so none of it belongs in a
+//! driver. The tables are all there is: the kernel has no stack that
+//! routes by them, and a card's network is the stack's that borrows it.
 //!
 //! Linux keeps this in the netdev core and leaves the driver with the
 //! datapath; here it was copied per driver instead, and the copies drifted:
@@ -12,24 +13,18 @@
 //! losing its newest entry, a non-default gatewayed route purging the default
 //! route from the reported table) that were found and fixed in one copy at a
 //! time. These are those fixes, once.
-//!
-//! `pcnet32` is the first user. `e1000`/`e1000e` still carry their own copies;
-//! converting them is a change to a working datapath and gets its own batch.
 
 use alloc::vec::Vec;
 
-use managed::ManagedSlice;
-use smoltcp::iface::Interface;
-use smoltcp::phy::Device;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use crate::scheme::RouteInfo;
-use crate::{DeviceError, DeviceResult};
+use crate::DeviceResult;
 
 /// The placeholder a free address slot holds.
 ///
-/// `InterfaceBuilder::ip_addrs` is given a fixed-length list, so "no address"
-/// has to be a value rather than an absent entry. Both spellings below have
+/// The list started as a fixed-length one, so "no address" is a value
+/// rather than an absent entry. Both spellings below have
 /// been used as that placeholder, and `add_ip_address` must recognise either
 /// or it overwrites a live address instead of filling a hole.
 #[inline]
@@ -44,8 +39,7 @@ fn vacant_slot() -> IpCidr {
     IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)
 }
 
-/// Decide what `set_ipv4_address` does to an address list, without an
-/// `Interface` to hold.
+/// What `set_ipv4_address` does to an address list.
 ///
 /// `cidr` becomes the first IPv4 slot and every other IPv4 slot is vacated:
 /// one interface, one IPv4 address, which is what `SIOCSIFADDR` means. If the
@@ -70,16 +64,8 @@ pub fn apply_set_ipv4(addrs: &mut [IpCidr], cidr: Ipv4Cidr) {
 }
 
 /// `SIOCSIFADDR`: make `cidr` the interface's IPv4 address.
-pub fn set_ipv4_address<D>(
-    iface: &mut Interface<'static, D>,
-    shadow: &mut Vec<IpCidr>,
-    cidr: Ipv4Cidr,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
-    iface.update_ip_addrs(|addrs| apply_set_ipv4(addrs, cidr));
-    *shadow = iface.ip_addrs().to_vec();
+pub fn set_ipv4_address(addrs: &mut [IpCidr], cidr: Ipv4Cidr) -> DeviceResult {
+    apply_set_ipv4(addrs, cidr);
     Ok(())
 }
 
@@ -87,9 +73,8 @@ where
 ///
 /// A free slot is reused; with every slot taken the list GROWS rather than
 /// overwriting the newest entry, which silently took an address the interface
-/// still answered on. Borrowed storage cannot grow, and there the newest slot
-/// is still the least bad place to put it.
-pub fn apply_add_ip(addrs: &mut ManagedSlice<'static, IpCidr>, cidr: IpCidr) {
+/// still had.
+pub fn apply_add_ip(addrs: &mut Vec<IpCidr>, cidr: IpCidr) {
     if addrs.contains(&cidr) {
         return;
     }
@@ -99,24 +84,12 @@ pub fn apply_add_ip(addrs: &mut ManagedSlice<'static, IpCidr>, cidr: IpCidr) {
             return;
         }
     }
-    if let ManagedSlice::Owned(addrs) = addrs {
-        addrs.push(cidr);
-    } else if let Some(slot) = addrs.iter_mut().last() {
-        *slot = cidr;
-    }
+    addrs.push(cidr);
 }
 
-/// `SIOCAIFADDR` over an `Interface`.
-pub fn add_ip_address<D>(
-    iface: &mut Interface<'static, D>,
-    shadow: &mut Vec<IpCidr>,
-    cidr: IpCidr,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
-    iface.update_ip_addrs(|addrs| apply_add_ip(addrs, cidr));
-    *shadow = iface.ip_addrs().to_vec();
+/// `SIOCAIFADDR`.
+pub fn add_ip_address(addrs: &mut Vec<IpCidr>, cidr: IpCidr) -> DeviceResult {
+    apply_add_ip(addrs, cidr);
     Ok(())
 }
 
@@ -132,25 +105,16 @@ pub fn apply_remove_ip(addrs: &mut [IpCidr], cidr: IpCidr) {
     }
 }
 
-/// `SIOCDIFADDR` over an `Interface`.
-pub fn remove_ip_address<D>(
-    iface: &mut Interface<'static, D>,
-    shadow: &mut Vec<IpCidr>,
-    cidr: IpCidr,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
-    iface.update_ip_addrs(|addrs| apply_remove_ip(addrs, cidr));
-    *shadow = iface.ip_addrs().to_vec();
+/// `SIOCDIFADDR`.
+pub fn remove_ip_address(addrs: &mut [IpCidr], cidr: IpCidr) -> DeviceResult {
+    apply_remove_ip(addrs, cidr);
     Ok(())
 }
 
 /// Does adding a route to `cidr` replace the default route of its family?
 ///
 /// Only a `/0` does. This ran for every gatewayed route once, so the static
-/// route in a DHCP lease took `0.0.0.0/0` out of the table the kernel reports
-/// while smoltcp went on routing through it.
+/// route in a DHCP lease took `0.0.0.0/0` out of the table the kernel reports.
 #[inline]
 pub fn replaces_default(cidr: &IpCidr) -> bool {
     cidr.prefix_len() == 0
@@ -170,42 +134,19 @@ pub fn purge_reported_default(routes: &mut Vec<RouteInfo>, cidr: &IpCidr) {
 }
 
 /// `SIOCADDRT`.
-pub fn add_route<D>(
-    iface: &mut Interface<'static, D>,
+pub fn add_route(
     routes: &mut Vec<RouteInfo>,
     cidr: IpCidr,
     gateway: Option<IpAddress>,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
+) -> DeviceResult {
     match gateway {
-        Some(IpAddress::Ipv4(gw)) => {
+        Some(gw @ (IpAddress::Ipv4(_) | IpAddress::Ipv6(_))) => {
             if replaces_default(&cidr) {
-                let _ = iface.routes_mut().remove_default_ipv4_route();
-                iface
-                    .routes_mut()
-                    .add_default_ipv4_route(gw)
-                    .map_err(|_| DeviceError::IoError)?;
                 purge_reported_default(routes, &cidr);
             }
             routes.push(RouteInfo {
                 dst: cidr,
-                gateway: Some(IpAddress::Ipv4(gw)),
-            });
-        }
-        Some(IpAddress::Ipv6(gw)) => {
-            if replaces_default(&cidr) {
-                let _ = iface.routes_mut().remove_default_ipv6_route();
-                iface
-                    .routes_mut()
-                    .add_default_ipv6_route(gw)
-                    .map_err(|_| DeviceError::IoError)?;
-                purge_reported_default(routes, &cidr);
-            }
-            routes.push(RouteInfo {
-                dst: cidr,
-                gateway: Some(IpAddress::Ipv6(gw)),
+                gateway: Some(gw),
             });
         }
         None => routes.push(RouteInfo { dst: cidr, gateway }),
@@ -215,25 +156,7 @@ where
 }
 
 /// `SIOCDELRT`.
-pub fn del_route<D>(
-    iface: &mut Interface<'static, D>,
-    routes: &mut Vec<RouteInfo>,
-    cidr: IpCidr,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
-    if replaces_default(&cidr) {
-        match cidr {
-            IpCidr::Ipv4(_) => {
-                let _ = iface.routes_mut().remove_default_ipv4_route();
-            }
-            IpCidr::Ipv6(_) => {
-                let _ = iface.routes_mut().remove_default_ipv6_route();
-            }
-            _ => {}
-        }
-    }
+pub fn del_route(routes: &mut Vec<RouteInfo>, cidr: IpCidr) -> DeviceResult {
     routes.retain(|r| r.dst != cidr);
     Ok(())
 }
@@ -264,24 +187,9 @@ pub fn reported_routes(tracked: &[RouteInfo], addrs: &[IpCidr]) -> Vec<RouteInfo
     res
 }
 
-/// Seed smoltcp's neighbour cache, the `SchemeUpcast`-free part of it.
-pub fn seed_neighbor<D>(
-    iface: &mut Interface<'static, D>,
-    protocol: IpAddress,
-    hardware: smoltcp::wire::EthernetAddress,
-    timestamp: smoltcp::time::Instant,
-) -> DeviceResult
-where
-    D: for<'d> Device<'d>,
-{
-    iface.seed_neighbor(protocol, hardware, timestamp);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    //! These exercise the pure halves of the helpers: the decisions, with no
-    //! `Interface` in the way. Each one is a rule a per-driver copy of this
+    //! The decisions of the helpers. Each one is a rule a per-driver copy of this
     //! code got wrong at least once.
 
     use super::*;
@@ -290,10 +198,6 @@ mod tests {
 
     fn v4(a: u8, b: u8, c: u8, d: u8, prefix: u8) -> IpCidr {
         IpCidr::new(IpAddress::v4(a, b, c, d), prefix)
-    }
-
-    fn owned(addrs: Vec<IpCidr>) -> ManagedSlice<'static, IpCidr> {
-        ManagedSlice::Owned(addrs)
     }
 
     #[test]
@@ -331,7 +235,7 @@ mod tests {
 
     #[test]
     fn adding_an_address_fills_a_free_slot_and_keeps_the_live_ones() {
-        let mut addrs = owned(vec![v4(10, 0, 0, 1, 24), v4(0, 0, 0, 0, 0)]);
+        let mut addrs = (vec![v4(10, 0, 0, 1, 24), v4(0, 0, 0, 0, 0)]);
         apply_add_ip(&mut addrs, v4(192, 168, 0, 2, 24));
         assert_eq!(addrs[0], v4(10, 0, 0, 1, 24), "the live address stays");
         assert_eq!(addrs[1], v4(192, 168, 0, 2, 24));
@@ -342,7 +246,7 @@ mod tests {
         // 240.0.0.0/32 is the placeholder some builders use. Not recognising
         // it meant `add_ip_address` walked past a hole and overwrote a live
         // address at the end of the list.
-        let mut addrs = owned(vec![v4(240, 0, 0, 0, 32), v4(10, 0, 0, 1, 24)]);
+        let mut addrs = (vec![v4(240, 0, 0, 0, 32), v4(10, 0, 0, 1, 24)]);
         apply_add_ip(&mut addrs, v4(192, 168, 0, 2, 24));
         assert_eq!(addrs[0], v4(192, 168, 0, 2, 24));
         assert_eq!(addrs[1], v4(10, 0, 0, 1, 24), "untouched");
@@ -350,33 +254,22 @@ mod tests {
 
     #[test]
     fn an_address_already_present_is_not_added_twice() {
-        let mut addrs = owned(vec![v4(10, 0, 0, 1, 24), v4(0, 0, 0, 0, 0)]);
+        let mut addrs = (vec![v4(10, 0, 0, 1, 24), v4(0, 0, 0, 0, 0)]);
         apply_add_ip(&mut addrs, v4(10, 0, 0, 1, 24));
         assert_eq!(addrs[1], v4(0, 0, 0, 0, 0), "the free slot stays free");
     }
 
     #[test]
-    fn a_full_owned_list_grows_rather_than_losing_an_address() {
+    fn a_full_list_grows_rather_than_losing_an_address() {
         // This is the bug the comment in `e1000.rs` records: with every slot
         // taken, the newest entry was overwritten and the interface quietly
         // stopped answering on it.
-        let mut addrs = owned(vec![v4(10, 0, 0, 1, 24), v4(10, 0, 0, 2, 24)]);
+        let mut addrs = (vec![v4(10, 0, 0, 1, 24), v4(10, 0, 0, 2, 24)]);
         apply_add_ip(&mut addrs, v4(10, 0, 0, 3, 24));
         assert_eq!(addrs.len(), 3, "the list must grow");
         assert_eq!(addrs[0], v4(10, 0, 0, 1, 24));
         assert_eq!(addrs[1], v4(10, 0, 0, 2, 24));
         assert_eq!(addrs[2], v4(10, 0, 0, 3, 24));
-    }
-
-    #[test]
-    fn a_full_borrowed_list_cannot_grow_and_takes_the_last_slot() {
-        // Borrowed storage has nowhere to grow into, so the last slot is the
-        // best there is -- but the FIRST addresses must still survive.
-        let storage: &'static mut [IpCidr] = vec![v4(10, 0, 0, 1, 24), v4(10, 0, 0, 2, 24)].leak();
-        let mut addrs = ManagedSlice::Borrowed(storage);
-        apply_add_ip(&mut addrs, v4(10, 0, 0, 3, 24));
-        assert_eq!(addrs[0], v4(10, 0, 0, 1, 24));
-        assert_eq!(addrs[1], v4(10, 0, 0, 3, 24));
     }
 
     #[test]
@@ -402,8 +295,7 @@ mod tests {
     #[test]
     fn purging_the_reported_default_leaves_the_static_routes_alone() {
         // The DHCP lease case: a static route plus a default route. Purging on
-        // every gatewayed route took 0.0.0.0/0 out of the reported table while
-        // smoltcp went on routing through it.
+        // every gatewayed route took 0.0.0.0/0 out of the reported table.
         let mut routes = vec![
             RouteInfo {
                 dst: v4(0, 0, 0, 0, 0),

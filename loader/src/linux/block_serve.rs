@@ -38,7 +38,7 @@
 //! or slowly (a request gives up after [`REPLY_TIMEOUT_MS`]); it cannot make
 //! the kernel read or write anything but the window.
 
-use super::net_serve::Seat;
+use super::net_wire::Seat;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

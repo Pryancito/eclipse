@@ -5,7 +5,7 @@
 //! `xgbe.enable` esta abierta.
 
 use super::*;
-use crate::net::{get_sockets, ip_cfg, timer_now_as_micros};
+use crate::net::ip_cfg;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::boxed::Box;
@@ -16,18 +16,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use lock::Mutex;
-use smoltcp::iface::*;
-use smoltcp::phy::{self, DeviceCapabilities};
-use smoltcp::time::Instant;
 use smoltcp::wire::*;
-use smoltcp::Result;
 
 /// The largest frame this interface puts on the wire. The standard one: the
 /// bring-up configures an MTU of 1500 and nothing here asks for jumbo.
 const MAX_FRAME: usize = 1514;
-/// Where a transmit frame is staged when it fits on the stack.
-const TX_SCRATCH_LEN: usize = 1536;
-
 /// Can a frame of `len` bytes go out?
 ///
 /// Refused rather than clipped, for the reason `pcnet32` spells out: a
@@ -35,19 +28,6 @@ const TX_SCRATCH_LEN: usize = 1536;
 #[inline]
 pub const fn tx_frame_postable(len: usize) -> bool {
     len > 0 && len <= MAX_FRAME
-}
-
-fn tx_stage<'a>(
-    len: usize,
-    scratch: &'a mut [u8; TX_SCRATCH_LEN],
-    heap: &'a mut Vec<u8>,
-) -> &'a mut [u8] {
-    if len <= TX_SCRATCH_LEN {
-        &mut scratch[..len]
-    } else {
-        heap.resize(len, 0);
-        &mut heap[..]
-    }
 }
 
 /// The registers and the rings, together, behind one lock.
@@ -120,111 +100,16 @@ pub struct XgbeDriver {
     pub stats: Arc<Mutex<NetStats>>,
 }
 
-/// A frame that has arrived.
-pub struct XgbeRxToken {
-    data: Vec<u8>,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-/// Permission to put one frame out.
-pub struct XgbeTxToken {
-    driver: XgbeDriver,
-    stats: Arc<Mutex<NetStats>>,
-}
-
-impl phy::Device<'_> for XgbeDriver {
-    type RxToken = XgbeRxToken;
-    type TxToken = XgbeTxToken;
-
-    fn receive(&mut self) -> Option<(Self::RxToken, Self::TxToken)> {
-        self.hw.lock().receive().map(|pkt| {
-            (
-                XgbeRxToken {
-                    data: pkt,
-                    stats: self.stats.clone(),
-                },
-                XgbeTxToken {
-                    driver: self.clone(),
-                    stats: self.stats.clone(),
-                },
-            )
-        })
-    }
-
-    fn transmit(&mut self) -> Option<Self::TxToken> {
-        if self.hw.lock().can_send() {
-            Some(XgbeTxToken {
-                driver: self.clone(),
-                stats: self.stats.clone(),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = MAX_FRAME;
-        // Left unset deliberately: smoltcp clamps the TCP window to
-        // `burst * MSS` through a u16, so a burst of 64 wraps and caps the
-        // connection at a few Mbps. Same trap as `e1000.rs` and `pcnet32.rs`.
-        caps.max_burst_size = None;
-        caps
-    }
-}
-
-impl phy::RxToken for XgbeRxToken {
-    fn consume<R, F>(mut self, _timestamp: Instant, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        {
-            let mut stats = self.stats.lock();
-            stats.rx_packets += 1;
-            stats.rx_bytes += self.data.len() as u64;
-        }
-        crate::net::net_defer_packet(&self.data);
-        f(&mut self.data)
-    }
-}
-
-impl phy::TxToken for XgbeTxToken {
-    fn consume<R, F>(self, _timestamp: Instant, len: usize, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut [u8]) -> Result<R>,
-    {
-        let mut scratch = [0u8; TX_SCRATCH_LEN];
-        let mut heap = Vec::new();
-        let buf: &mut [u8] = tx_stage(len, &mut scratch, &mut heap);
-        let result = f(buf)?;
-
-        let sent = self.driver.hw.lock().send(buf);
-        if !sent {
-            // Never report a dropped frame as sent: smoltcp emits the ACK for
-            // a received segment through the TxToken paired with its RxToken
-            // and has already advanced `remote_last_ack`, so an `Ok` here
-            // loses that ACK for good.
-            self.stats.lock().tx_errors += 1;
-            return Err(smoltcp::Error::Exhausted);
-        }
-        let mut stats = self.stats.lock();
-        stats.tx_packets += 1;
-        stats.tx_bytes += len as u64;
-        Ok(result)
-    }
-}
-
 /// The interface the rest of the kernel sees.
 #[derive(Clone)]
 pub struct XgbeInterface {
-    iface: Arc<Mutex<Interface<'static, XgbeDriver>>>,
+    mac: EthernetAddress,
     driver: XgbeDriver,
     name: String,
     irq: usize,
     poll_pending: Arc<AtomicBool>,
-    /// Who the card's frames go to while it is lent to a stack that is not
-    /// the kernel's ([`crate::net::lent`]); empty, the kernel's own stack
-    /// reads them.
+    /// Who the card's frames go to while it is lent to the stack that
+    /// runs as a process ([`crate::net::lent`]); empty, nobody has them.
     lent: crate::net::lent::Lent,
     /// Counters, shared with the tokens.
     pub stats: Arc<Mutex<NetStats>>,
@@ -238,30 +123,13 @@ impl XgbeInterface {
     /// Drain smoltcp without touching the interrupt mask; the IRQ path owns
     /// the mask through its guard.
     fn poll_inner(&self) -> DeviceResult {
-        // A card lent to a stack that is not the kernel's: its frames go
-        // to the borrower as they are, and the kernel's stack is not
-        // polled.
-        if self.lent.hand_over(|| self.driver.hw.lock().receive()) {
-            return Ok(());
+        // A card lent to the stack that runs as a process: its frames go
+        // to the borrower as they are. One that is not lent has no stack
+        // above it.
+        if !self.lent.hand_over(|| self.driver.hw.lock().receive()) {
+            crate::net::lent::tap_only(&self.stats, || self.driver.hw.lock().receive());
         }
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        let sockets = get_sockets();
-        // `try_lock`, not a blocking acquire: this runs from a deferred job
-        // and a socket syscall drains that queue while holding the socket
-        // set, so a blocking acquire deadlocks on this IRQ-off kernel. The
-        // same shape `e1000.rs` and `pcnet32.rs` both settled on.
-        let res = match (sockets.try_lock(), self.iface.try_lock()) {
-            (Some(mut sockets), Some(mut iface)) => match iface.poll(&mut sockets, timestamp) {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    warn!("[xgbe] poll got err {}", err);
-                    Err(DeviceError::IoError)
-                }
-            },
-            _ => Ok(()),
-        };
-        crate::net::net_flush_deferred_packets();
-        res
+        Ok(())
     }
 }
 
@@ -354,7 +222,7 @@ impl NetScheme for XgbeInterface {
     }
 
     fn get_mac(&self) -> EthernetAddress {
-        self.iface.lock().ethernet_addr()
+        self.mac
     }
 
     fn ifname(&self) -> &str {
@@ -371,15 +239,6 @@ impl NetScheme for XgbeInterface {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         self.ip_addrs.lock().clone()
-    }
-
-    fn seed_neighbor(
-        &self,
-        protocol: smoltcp::wire::IpAddress,
-        hardware: EthernetAddress,
-    ) -> DeviceResult {
-        let timestamp = Instant::from_micros(timer_now_as_micros() as i64);
-        ip_cfg::seed_neighbor(&mut self.iface.lock(), protocol, hardware, timestamp)
     }
 
     fn poll(&self) -> DeviceResult {
@@ -419,7 +278,7 @@ impl NetScheme for XgbeInterface {
     }
 
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
-        ip_cfg::set_ipv4_address(&mut self.iface.lock(), &mut self.ip_addrs.lock(), cidr)
+        ip_cfg::set_ipv4_address(&mut self.ip_addrs.lock(), cidr)
     }
 }
 
@@ -439,20 +298,9 @@ pub fn new_interface(
     };
     let ethernet_addr = EthernetAddress::from_bytes(&mac);
     let ip_addrs = vec![IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)];
-    // Per-NIC route storage: a shared `static mut` would alias if two of
-    // these probed and corrupt both route tables.
-    let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
-        Box::leak(vec![None; 4].into_boxed_slice());
-    let iface = InterfaceBuilder::new(driver.clone())
-        .ethernet_addr(ethernet_addr)
-        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
-        .ip_addrs(ip_addrs.clone())
-        .routes(Routes::new(routes_storage))
-        .finalize();
-
     crate::klog_info!("xgbe interface {} discovered", name);
     Ok(XgbeInterface {
-        iface: Arc::new(Mutex::new(iface)),
+        mac: ethernet_addr,
         driver,
         name,
         irq,
