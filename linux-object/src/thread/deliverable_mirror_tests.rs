@@ -182,3 +182,93 @@ fn a_thread_without_a_linux_ext_reads_as_nothing() {
         "a non-Linux thread must answer `nothing`, not panic"
     );
 }
+
+// ── the waker a wait leaves on the thread ───────────────────────────────────
+
+/// A waker that counts how many times it was woken.
+fn counting_waker(count: &'static core::sync::atomic::AtomicUsize) -> Waker {
+    use core::sync::atomic::AtomicUsize;
+    use core::task::{RawWaker, RawWakerVTable};
+    fn raw(ptr: *const ()) -> RawWaker {
+        unsafe fn clone(ptr: *const ()) -> RawWaker {
+            raw(ptr)
+        }
+        unsafe fn wake(ptr: *const ()) {
+            (*(ptr as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe fn drop(_: *const ()) {}
+        RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake, drop))
+    }
+    unsafe { Waker::from_raw(raw(count as *const AtomicUsize as *const ())) }
+}
+
+/// A signal that becomes deliverable wakes the wait parked on the thread,
+/// from the guard's own `Drop`: whoever queued it did not have to remember.
+#[test]
+fn a_signal_that_becomes_deliverable_wakes_the_wait_parked_on_the_thread() {
+    static WOKEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let thread = a_thread(79_101);
+    let ext = thread.linux_ext().unwrap();
+    let mut wait = None;
+    assert!(ext.park_waiter(&mut wait, &counting_waker(&WOKEN)));
+    assert!(wait.is_some());
+
+    thread.lock_linux().queue_signal(Signal::SIGUSR1, None);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 1);
+
+    // The same bit again is no news; another one is.
+    thread.lock_linux().queue_signal(Signal::SIGUSR1, None);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 1);
+    thread.lock_linux().queue_signal(Signal::SIGTERM, None);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 2);
+
+    // Once the wait is over nothing is woken.
+    ext.unpark_waiter(wait.unwrap());
+    thread.lock_linux().queue_signal(Signal::SIGINT, None);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 2);
+}
+
+/// A signal the thread blocks is not deliverable and wakes nothing by the
+/// guard; who queues it says so (`wake_signal_sleeper`), for the waits that
+/// want a blocked signal too.
+#[test]
+fn a_blocked_signal_wakes_the_parked_wait_only_when_its_sender_says_so() {
+    static WOKEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let thread = a_thread(79_102);
+    let ext = thread.linux_ext().unwrap();
+    thread.lock_linux().set_signal_mask(set_of(Signal::SIGUSR1));
+    let mut wait = None;
+    assert!(ext.park_waiter(&mut wait, &counting_waker(&WOKEN)));
+
+    thread.lock_linux().queue_signal(Signal::SIGUSR1, None);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 0);
+    crate::process::wake_signal_sleeper(&thread);
+    assert_eq!(WOKEN.load(Ordering::SeqCst), 1);
+}
+
+/// One wait has the place on a thread: a second is refused, and cannot
+/// take the first one's waker away by ending.
+#[test]
+fn one_wait_has_the_place_on_a_thread_and_a_second_is_refused() {
+    static FIRST: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static SECOND: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let thread = a_thread(79_103);
+    let ext = thread.linux_ext().unwrap();
+    let (mut first, mut second) = (None, None);
+    assert!(ext.park_waiter(&mut first, &counting_waker(&FIRST)));
+    assert!(!ext.park_waiter(&mut second, &counting_waker(&SECOND)));
+    assert_eq!(second, None);
+    // The first parks again, as each poll of it does.
+    assert!(ext.park_waiter(&mut first, &counting_waker(&FIRST)));
+
+    // A number that is not the one parked lets nothing go.
+    ext.unpark_waiter(first.unwrap() + 1_000_000);
+    ext.wake_waiter();
+    assert_eq!(FIRST.load(Ordering::SeqCst), 1);
+    assert_eq!(SECOND.load(Ordering::SeqCst), 0);
+
+    ext.unpark_waiter(first.unwrap());
+    assert!(ext.park_waiter(&mut second, &counting_waker(&SECOND)));
+    ext.wake_waiter();
+    assert_eq!(SECOND.load(Ordering::SeqCst), 1);
+}

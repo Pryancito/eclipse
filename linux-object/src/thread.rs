@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::Waker;
 use kernel_hal::context::{UserContext, UserContextField};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::user::{Out, UserInPtr, UserOutPtr, UserPtr};
@@ -43,6 +44,9 @@ pub trait ThreadExt {
     /// A thread whose ext is not a Linux one (or is being torn down) reads
     /// as "nothing", which is what the old code did with `try_lock_linux`.
     fn has_deliverable_signal(&self) -> bool;
+    /// The Linux side of this thread outside its lock, when it has one:
+    /// where a wait parks its waker ([`LinuxThreadExt::park_waiter`]).
+    fn linux_ext(&self) -> Option<&LinuxThreadExt>;
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserOutPtr<i32>);
     /// The word `set_tid_address` (or `CLONE_CHILD_CLEARTID`) registered:
@@ -185,7 +189,15 @@ pub struct LinuxThreadExt {
     deliverable: AtomicU64,
     /// The state itself.
     inner: Mutex<LinuxThread>,
+    /// The waker of the wait this thread is parked in, when the wait asked
+    /// to be told of a signal: see [`Self::park_waiter`].
+    waiter: Mutex<Option<(u64, Waker)>>,
 }
+
+/// The numbers [`LinuxThreadExt::park_waiter`] hands out. One counter for
+/// every thread: a wait that is dropped on another thread than the one it
+/// parked on must not name a wait of that one.
+static NEXT_WAIT: AtomicU64 = AtomicU64::new(1);
 
 impl LinuxThreadExt {
     /// Wraps `linux`, publishing what it starts out with.
@@ -203,6 +215,60 @@ impl LinuxThreadExt {
         Self {
             deliverable,
             inner: Mutex::new(linux),
+            waiter: Mutex::new(None),
+        }
+    }
+
+    /// Leave `waker` to be woken when a signal is queued to this thread or
+    /// the thread starts dying ([`Self::wake_waiter`]): what lets a wait on
+    /// something else -- bytes on a socket, room in a pipe -- end for a
+    /// signal without a timer that looks every 100 ms.
+    ///
+    /// `wait` is the wait's own word: `None` before its first park, and the
+    /// number it was given from then on. One wait per thread has the place;
+    /// `false` to a second one, which keeps its timer. Park BEFORE looking
+    /// at the pending signals, so that one queued after the look finds the
+    /// waker here.
+    pub fn park_waiter(&self, wait: &mut Option<u64>, waker: &Waker) -> bool {
+        let mut slot = self.waiter.lock();
+        match slot.as_mut() {
+            Some((held, parked)) if Some(*held) == *wait => {
+                if !parked.will_wake(waker) {
+                    *parked = waker.clone();
+                }
+                true
+            }
+            Some(_) => false,
+            None => {
+                let number = NEXT_WAIT.fetch_add(1, Ordering::Relaxed);
+                *slot = Some((number, waker.clone()));
+                *wait = Some(number);
+                true
+            }
+        }
+    }
+
+    /// The wait numbered `wait` is over: its waker is let go, if it is
+    /// still the one parked here.
+    pub fn unpark_waiter(&self, wait: u64) {
+        let gone = {
+            let mut slot = self.waiter.lock();
+            match slot.as_ref() {
+                Some((held, _)) if *held == wait => slot.take(),
+                _ => None,
+            }
+        };
+        // Off the lock: dropping a waker runs the task's own code.
+        drop(gone);
+    }
+
+    /// Wake the wait parked here, if there is one. It stays parked: the
+    /// wait looks at the signals again and decides by itself whether it is
+    /// over.
+    pub fn wake_waiter(&self) {
+        let parked = self.waiter.lock().as_ref().map(|(_, w)| w.clone());
+        if let Some(waker) = parked {
+            waker.wake();
         }
     }
 
@@ -240,9 +306,14 @@ impl Drop for LinuxThreadGuard<'_> {
         // Still holding the lock: `self.guard` is a field, and fields are
         // dropped after this body runs. A reader that sees this store has
         // seen a value that was true at the moment the lock was released.
-        self.ext
-            .deliverable
-            .store(self.guard.deliverable_signals(), Ordering::Release);
+        let now = self.guard.deliverable_signals();
+        let before = self.ext.deliverable.swap(now, Ordering::AcqRel);
+        // Something became deliverable that was not: a wait parked on this
+        // thread is told here, whoever queued it and whether or not they
+        // remembered to (`wake_signal_sleeper`).
+        if now & !before != 0 {
+            self.ext.wake_waiter();
+        }
     }
 }
 
@@ -371,6 +442,10 @@ impl ThreadExt for Thread {
             guard: m.inner.lock(),
             ext: m,
         }
+    }
+
+    fn linux_ext(&self) -> Option<&LinuxThreadExt> {
+        self.ext().downcast_ref::<LinuxThreadExt>()
     }
 
     fn has_deliverable_signal(&self) -> bool {
