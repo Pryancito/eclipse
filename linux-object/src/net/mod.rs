@@ -9,7 +9,7 @@ use crate::fs::{FileLike, PollEvents};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
-use smoltcp::wire::{EthernetAddress, IpCidr, IpEndpoint, Ipv4Cidr, Ipv6Cidr};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 pub use socket_address::*;
 
 pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
@@ -326,27 +326,7 @@ use zcore_drivers::net::get_sockets;
 
 // ========TCP
 
-/// TCP send buffer: 512 KiB — large enough that a single window fits a typical
-/// APK download chunk even at 100 ms RTT (theoretical limit ~5 MB/s vs ~640 KB/s
-/// with the old 64 KiB window).
-///
-/// MUST stay modest: the kernel heap is a FIXED 256 MiB and every TCP socket
-/// pins SENDBUF+RECVBUF up front. apk fetch opens ~30 parallel connections, so
-/// at the previous 2 MiB (×2 = 4 MiB/socket) ~30 sockets alone reserved ~120 MiB
-/// and a large download exhausted the heap mid-transfer -> kernel OOM panic.
-/// That OOM is what surfaced on real hardware as the deterministic ~16-27 MB
-/// download "stall" (apk could no longer allocate, stopped reading, the TCP
-/// window closed, and the peer went into zero-window persist). 512 KiB ×2 keeps
-/// ~30 sockets near ~30 MiB with ample headroom.
-pub const TCP_SENDBUF: usize = 512 * 1024;
-/// TCP receive buffer: 512 KiB — advertised window size to remote peers.
-/// Keeping this equal to SENDBUF avoids asymmetric flow stalls.
-pub const TCP_RECVBUF: usize = 512 * 1024;
-
 // ========UDP
-
-/// missing documentation
-pub const UDP_METADATA_BUF: usize = 256;
 
 /// Largest single kernel-heap `Vec` allocation (avoids multi‑MiB smoltcp/socket buffers).
 pub const MAX_KERNEL_VEC: usize = 4 * 1024 * 1024;
@@ -712,68 +692,6 @@ numeric_enum! {
 
 // ============= Define =============
 
-// ============= SocketHandle =============
-
-use smoltcp::socket::SocketHandle;
-
-/// Maximum smoltcp sockets (each owns RX/TX buffers on the kernel heap).
-pub(super) const MAX_SMOLTCIP_SOCKETS: usize = 96;
-
-pub(super) fn smoltcp_socket_count(set: &smoltcp::socket::SocketSet<'_>) -> usize {
-    set.iter().count()
-}
-
-/// Register a socket in the global smoltcp set, or return `ENOMEM` if at cap.
-pub(super) fn register_smoltcp_socket<T>(socket: T) -> LxResult<GlobalSocketHandle>
-where
-    T: Into<smoltcp::socket::Socket<'static>>,
-{
-    let sockets_arc = get_sockets();
-    let mut sockets = sockets_arc.lock();
-    if smoltcp_socket_count(&sockets) >= MAX_SMOLTCIP_SOCKETS {
-        return Err(LxError::ENOMEM);
-    }
-    Ok(GlobalSocketHandle(sockets.add(socket)))
-}
-
-/// A wrapper for `SocketHandle`.
-/// Auto increase and decrease reference count on Clone and Drop.
-#[derive(Debug)]
-pub(super) struct GlobalSocketHandle(SocketHandle);
-
-impl GlobalSocketHandle {
-    /// The smoltcp handle inside, for a holder outside this module.
-    ///
-    /// The wrapper is what owns the socket — it is reference counted and its
-    /// `Drop` releases the set's slot — so a caller that wants the raw handle
-    /// must keep the wrapper alive for as long as it uses the handle. Which is
-    /// why this is a borrow of `self` and not a `into`: the handle alone is
-    /// not ownership of anything.
-    pub(crate) fn inner(&self) -> SocketHandle {
-        self.0
-    }
-}
-
-impl Clone for GlobalSocketHandle {
-    fn clone(&self) -> Self {
-        get_sockets().lock().retain(self.0);
-        Self(self.0)
-    }
-}
-
-impl Drop for GlobalSocketHandle {
-    fn drop(&mut self) {
-        let net_sockets = get_sockets();
-        let mut sockets = net_sockets.lock();
-        sockets.release(self.0);
-        sockets.prune();
-
-        // send FIN immediately when applicable
-        drop(sockets);
-        poll_ifaces();
-    }
-}
-
 use kernel_hal::net::get_net_device;
 
 /// True once DHCP (or static config) assigned a real host IPv4 — not placeholder/0.0.0.0.
@@ -825,20 +743,6 @@ pub fn sync_neighbor_cache_into_smoltcp() {
             let _ = dev.seed_neighbor(IpAddress::Ipv6(ip), mac);
         }
     }
-}
-
-/// Local UDP bind address for a query toward `dst`, with a port of its own.
-pub fn local_udp_endpoint_for(dst: smoltcp::wire::IpAddress) -> IpEndpoint {
-    use smoltcp::wire::IpAddress;
-    let addr = match dst {
-        IpAddress::Ipv4(d) => IpAddress::Ipv4(select_ipv4_for_dst(d)),
-        IpAddress::Ipv6(d) => IpAddress::Ipv6(select_ipv6_for_dst(d)),
-        other => other,
-    };
-    // A port of its own: smoltcp refuses to bind port 0 (it has no "any
-    // port"), and with 0 here every question the kernel's stack was to
-    // carry failed before it was sent.
-    IpEndpoint::new(addr, get_ephemeral_port())
 }
 
 mod adaptive;
@@ -1182,39 +1086,6 @@ pub fn is_ipv4_placeholder(addr: smoltcp::wire::Ipv4Address) -> bool {
     addr == smoltcp::wire::Ipv4Address::new(240, 0, 0, 0)
 }
 
-/// Pick a concrete IPv4 source for `dst` (skip 0.0.0.0/0 catch-all; prefer longest prefix).
-pub fn select_ipv4_for_dst(dst: smoltcp::wire::Ipv4Address) -> smoltcp::wire::Ipv4Address {
-    use smoltcp::wire::{IpCidr, Ipv4Address};
-    let mut best: Option<(u8, Ipv4Address)> = None;
-    for iface in get_net_device().iter() {
-        for ip in iface.get_ip_address() {
-            if let IpCidr::Ipv4(cidr) = ip {
-                let addr = cidr.address();
-                if addr.is_unspecified() || cidr.prefix_len() == 0 || is_ipv4_placeholder(addr) {
-                    continue;
-                }
-                if cidr.contains_addr(&dst) && best.is_none_or(|(p, _)| cidr.prefix_len() > p) {
-                    best = Some((cidr.prefix_len(), addr));
-                }
-            }
-        }
-    }
-    if let Some((_, a)) = best {
-        return a;
-    }
-    for iface in get_net_device().iter() {
-        for ip in iface.get_ip_address() {
-            if let IpCidr::Ipv4(cidr) = ip {
-                let addr = cidr.address();
-                if !addr.is_unspecified() && cidr.prefix_len() > 0 && !is_ipv4_placeholder(addr) {
-                    return addr;
-                }
-            }
-        }
-    }
-    Ipv4Address::UNSPECIFIED
-}
-
 /// A `SO_RCVTIMEO` / `SO_SNDTIMEO` value (`struct timeval`, 16 bytes) as the
 /// deadline of a call that starts now: `None` when it is zero, which is the
 /// default and means "wait for as long as it takes".
@@ -1316,39 +1187,6 @@ pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
     }
 }
 
-/// Pick a concrete IPv6 source for `dst` (skip ::/0 catch-all; prefer longest prefix).
-pub fn select_ipv6_for_dst(dst: smoltcp::wire::Ipv6Address) -> smoltcp::wire::Ipv6Address {
-    use smoltcp::wire::{IpCidr, Ipv6Address};
-    let mut best: Option<(u8, Ipv6Address)> = None;
-    for iface in get_net_device().iter() {
-        for ip in iface.get_ip_address() {
-            if let IpCidr::Ipv6(cidr) = ip {
-                let addr = cidr.address();
-                if addr.is_unspecified() || cidr.prefix_len() == 0 {
-                    continue;
-                }
-                if cidr.contains_addr(&dst) && best.is_none_or(|(p, _)| cidr.prefix_len() > p) {
-                    best = Some((cidr.prefix_len(), addr));
-                }
-            }
-        }
-    }
-    if let Some((_, a)) = best {
-        return a;
-    }
-    for iface in get_net_device().iter() {
-        for ip in iface.get_ip_address() {
-            if let IpCidr::Ipv6(cidr) = ip {
-                let addr = cidr.address();
-                if !addr.is_unspecified() && cidr.prefix_len() > 0 {
-                    return addr;
-                }
-            }
-        }
-    }
-    Ipv6Address::UNSPECIFIED
-}
-
 // ============= SocketHandle =============
 
 // ============= Rand Port =============
@@ -1409,41 +1247,11 @@ pub(crate) fn shutdown_sides(howto: usize) -> LxResult<(bool, bool)> {
     }
 }
 
-/// Serializes the socket tests of this module tree: they share the global
-/// smoltcp set, the loopback interfaces they build move every socket's
-/// packets, and the ephemeral port counter is one for all of them.
+/// Serializes the socket tests of this module tree: they share the
+/// machine's served sockets and its ports.
 #[cfg(test)]
 pub(crate) static NET_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
 
-pub(crate) fn get_ephemeral_port() -> u16 {
-    use core::sync::atomic::{AtomicU16, Ordering};
-    const LOW: u16 = 49152;
-    static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
-    // Seed once on first use (the seed is always in [LOW, 65535], never 0).
-    let _ = EPHEMERAL_PORT.compare_exchange(
-        0,
-        LOW + (rand() % (65536 - LOW as u64)) as u16,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    // Atomically advance, wrapping within the dynamic range.
-    loop {
-        let cur = EPHEMERAL_PORT.load(Ordering::Relaxed);
-        let next = if !(LOW..65535).contains(&cur) {
-            LOW
-        } else {
-            cur + 1
-        };
-        if EPHEMERAL_PORT
-            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return next;
-        }
-    }
-}
-
-// ============= Rand Port =============
 // ============= IOCTL =============
 
 pub fn handle_net_ioctl(

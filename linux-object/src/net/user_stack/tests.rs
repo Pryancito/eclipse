@@ -288,23 +288,6 @@ fn a_datagram_for_this_machine_goes_from_socket_to_socket() {
     assert_eq!(stack.told(), None);
 }
 
-#[test]
-fn a_boot_that_asks_for_every_program_has_asked_for_each() {
-    let _g = LOCK.lock();
-    let proc = crate::process::LinuxProcess::new(rcore_fs_ramfs::RamFS::new(), 0);
-    assert!(!proc.uses_user_netstack());
-    // A boot where the stack process is the machine's network: every
-    // program is one that asked.
-    use_for_all(true);
-    assert!(is_for_all());
-    assert!(proc.uses_user_netstack());
-    use_for_all(false);
-    assert!(!proc.uses_user_netstack());
-    // And one that asks still has what it asked for.
-    proc.use_user_netstack();
-    assert!(proc.uses_user_netstack());
-}
-
 /// `addr` as an `AF_INET6` socket is given it and gives it.
 pub(super) fn at6(addr: &str, port: u16) -> IpEndpoint {
     let addr: core::net::Ipv6Addr = addr.parse().unwrap();

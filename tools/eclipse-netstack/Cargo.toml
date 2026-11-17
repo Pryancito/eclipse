@@ -18,11 +18,6 @@ path = "src/lib.rs"
 name = "eclipse-netstack"
 path = "src/main.rs"
 
-# Runs a program with its sockets on this stack.
-[[bin]]
-name = "eclipse-netstack-use"
-path = "src/bin/eclipse-netstack-use.rs"
-
 # A test program: a UDP echo server, which the stack is measured with.
 [[bin]]
 name = "eclipse-udp-echo"

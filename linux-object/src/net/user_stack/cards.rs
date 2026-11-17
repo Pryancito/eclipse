@@ -259,9 +259,7 @@ impl StackLink {
         }
         // The first card is put among the machine's interfaces by who
         // gave the kernel its sockets ([`StackLink::first_card`]).
-        let shown = (card != 0 && super::is_for_all())
-            .then(|| self.show(card, &said))
-            .flatten();
+        let shown = (card != 0).then(|| self.show(card, &said)).flatten();
         now.insert(
             card,
             Other {

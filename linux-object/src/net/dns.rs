@@ -1,15 +1,12 @@
-//! Hostname resolver: `/etc/hosts` first, then DNS (A / AAAA) via smoltcp UDP
-//! and `/etc/resolv.conf`.
+//! Hostname resolver: `/etc/hosts` first, then DNS (A / AAAA) by a datagram
+//! socket of the stack that runs as a process, and `/etc/resolv.conf`.
 
 use crate::error::{LxError, LxResult};
 use crate::net::user_stack::{self, StackLink};
-use crate::net::{drain_net_poll, local_udp_endpoint_for, UDP_METADATA_BUF};
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::time::Duration;
 use rcore_fs::vfs::INode;
-use smoltcp::socket::{UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
-use zcore_drivers::net::get_sockets;
 
 const DNS_PORT: u16 = 53;
 const QTYPE_A: u16 = 1;
@@ -78,24 +75,17 @@ pub async fn resolve(
     family: DnsFamily,
 ) -> LxResult<Vec<IpAddress>> {
     // Who asks here is the kernel itself (a mount that names its server),
-    // and the kernel's questions go by the machine's network. Where that
-    // is the stack that runs as a process, the kernel's own stack has no
-    // card: a question sent by it reached nobody and the mount failed
-    // with `ENOENT`.
-    let stack = user_stack::is_for_all().then(user_stack::machine);
-    resolve_by(root, hostname, family, stack.as_ref()).await
+    // and the kernel's questions go by the machine's network.
+    resolve_by(root, hostname, family, &user_stack::machine()).await
 }
 
 /// [`resolve`], with the questions to the nameservers carried by the
-/// stack that runs as a process when `stack` is its sockets: how the name
-/// is resolved for a program whose own sockets are that stack's. The
-/// kernel's stack may have no card at all then, and a question sent by it
-/// would go nowhere.
+/// sockets of `stack`, the stack that runs as a process.
 pub async fn resolve_by(
     root: &Arc<dyn INode>,
     hostname: &str,
     family: DnsFamily,
-    stack: Option<&Arc<StackLink>>,
+    stack: &Arc<StackLink>,
 ) -> LxResult<Vec<IpAddress>> {
     if hostname.is_empty() || hostname.len() > 253 {
         return Err(LxError::EINVAL);
@@ -374,26 +364,11 @@ async fn query_at(
     server: IpAddress,
     name: &str,
     qtype: u16,
-    stack: Option<&Arc<StackLink>>,
+    stack: &Arc<StackLink>,
 ) -> LxResult<Vec<IpAddress>> {
     let id = (super::rand() & 0xffff) as u16;
     let query = build_query(name, id, qtype)?;
-    if let Some(link) = stack {
-        let reply = served_exchange(link, IpEndpoint::new(server, DNS_PORT), &query, id).await?;
-        return parse_addresses(&reply, qtype);
-    }
-    let (local, remote) = match server {
-        IpAddress::Ipv4(v4) => (
-            local_udp_endpoint_for(IpAddress::Ipv4(v4)),
-            IpEndpoint::new(IpAddress::Ipv4(v4), DNS_PORT),
-        ),
-        IpAddress::Ipv6(v6) => (
-            local_udp_endpoint_for(IpAddress::Ipv6(v6)),
-            IpEndpoint::new(IpAddress::Ipv6(v6), DNS_PORT),
-        ),
-        IpAddress::Unspecified | _ => return Err(LxError::EINVAL),
-    };
-    let reply = udp_exchange(local, remote, &query, id).await?;
+    let reply = served_exchange(stack, IpEndpoint::new(server, DNS_PORT), &query, id).await?;
     parse_addresses(&reply, qtype)
 }
 
@@ -438,108 +413,10 @@ fn encode_qname(name: &str, out: &mut Vec<u8>) -> LxResult {
     Ok(())
 }
 
-/// How long one query waits for its answer: what the 32 rounds of 50 ms
-/// it waited in before added up to.
+/// How long one query waits for its answer.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(32 * 50);
-/// The first sleep while waiting for an answer. A resolver on the LAN (or
-/// QEMU's) answers in a millisecond or two, and the old 50 ms step added
-/// that much latency to every lookup.
-const REPLY_WAIT_MIN: Duration = Duration::from_millis(2);
-/// The longest sleep: the step doubles up to here, so an answer that is slow
-/// in coming costs a wake every 50 ms, as the spinning wait looked.
-const REPLY_WAIT_MAX: Duration = Duration::from_millis(50);
 
-/// The sleep after `step` (the one before it), doubling within the bounds.
-fn next_reply_wait(step: Duration) -> Duration {
-    (step * 2).clamp(REPLY_WAIT_MIN, REPLY_WAIT_MAX)
-}
-
-/// Removes the query's socket from the set however the exchange ends --
-/// answer, timeout, error, or the future dropped because the caller was
-/// killed while it slept. A stranded socket keeps its buffers for the rest
-/// of the uptime, and enough of them fill the set (see below).
-struct QuerySocket(smoltcp::socket::SocketHandle);
-
-impl Drop for QuerySocket {
-    fn drop(&mut self) {
-        get_sockets().lock().remove(self.0);
-    }
-}
-
-async fn udp_exchange(
-    local: IpEndpoint,
-    remote: IpEndpoint,
-    query: &[u8],
-    expect_id: u16,
-) -> LxResult<Vec<u8>> {
-    let rx_buffer = UdpSocketBuffer::new(
-        vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
-        vec![0u8; 512],
-    );
-    let tx_buffer = UdpSocketBuffer::new(
-        vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
-        vec![0u8; 512],
-    );
-    let socket = UdpSocket::new(rx_buffer, tx_buffer);
-    let sockets = get_sockets();
-    let mut set = sockets.lock();
-    if super::smoltcp_socket_count(&set) >= super::MAX_SMOLTCIP_SOCKETS {
-        return Err(LxError::ENOMEM);
-    }
-    let handle = set.add(socket);
-    drop(set);
-    let _socket = QuerySocket(handle);
-    // The socket is already IN the set, so an early return here does not drop
-    // it -- it strands it, with its two 512-byte buffers and its metadata
-    // vectors, for the rest of the uptime. Both of these fail for ordinary
-    // reasons (a local port already taken, no route yet), and after
-    // `MAX_SMOLTCIP_SOCKETS` of them the set is full of sockets nobody owns
-    // and every later resolution answers ENOMEM: DNS stops, permanently, and
-    // nothing says why. So the handle is removed on the way out, as it
-    // already is on both of the paths below.
-    {
-        let mut set = sockets.lock();
-        let mut sock = set.get::<UdpSocket>(handle);
-        let started = sock
-            .bind(local)
-            .map_err(|_| LxError::EINVAL)
-            .and_then(|_| sock.send_slice(query, remote).map_err(|_| LxError::EIO));
-        started?;
-    }
-
-    let mut buf = [0u8; 512];
-    let deadline = kernel_hal::timer::timer_now() + REPLY_TIMEOUT;
-    let mut step = Duration::ZERO;
-    let mut first = true;
-    loop {
-        drain_net_poll(8);
-        if first {
-            kernel_hal::deferred_job::drain_deferred_jobs();
-            first = false;
-        }
-        {
-            let mut set = sockets.lock();
-            let mut sock = set.get::<UdpSocket>(handle);
-            if sock.can_recv() {
-                if let Ok((n, _)) = sock.recv_slice(&mut buf) {
-                    if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == expect_id {
-                        return Ok(buf[..n].to_vec());
-                    }
-                }
-            }
-        }
-        let now = kernel_hal::timer::timer_now();
-        if now >= deadline {
-            return Err(LxError::ETIMEDOUT);
-        }
-        step = next_reply_wait(step);
-        crate::process::interruptible(kernel_hal::thread::sleep_until((now + step).min(deadline)))
-            .await?;
-    }
-}
-
-/// [`udp_exchange`] by the stack that runs as a process: the question
-/// leaves from a datagram socket of `link`, and the answer is the first
+/// One question and its answer: the question leaves from a datagram socket of `link`, and the answer is the first
 /// datagram back from the server that carries the question's id.
 async fn served_exchange(
     link: &Arc<StackLink>,
@@ -1051,42 +928,12 @@ mod dns_tests {
         ));
     }
 
-    // ── the wait for a nameserver's answer ──────────────────────────────────
-
-    #[test]
-    fn the_wait_for_an_answer_starts_short_and_doubles_to_the_old_step() {
-        let mut step = Duration::ZERO;
-        let mut seen = Vec::new();
-        for _ in 0..7 {
-            step = next_reply_wait(step);
-            seen.push(step.as_millis() as u64);
-        }
-        assert_eq!(seen, alloc::vec![2, 4, 8, 16, 32, 50, 50]);
-    }
-
-    #[test]
-    fn a_query_nobody_answers_wakes_about_as_often_as_the_spinning_one_looked() {
-        // The spinning wait looked 32 times in its 1.6 s and burned the CPU
-        // in between; the sleeping one may look a few more times early on,
-        // and sleeps through all of it.
-        let mut step = Duration::ZERO;
-        let mut waited = Duration::ZERO;
-        let mut wakes = 0;
-        while waited < REPLY_TIMEOUT {
-            step = next_reply_wait(step);
-            waited += step;
-            wakes += 1;
-        }
-        assert!(wakes <= 37, "{} wakes", wakes);
-        assert_eq!(REPLY_TIMEOUT, Duration::from_millis(1600));
-    }
-
     /// The kernel's own questions ([`resolve`], a mount that names its
     /// server) go by the stack that runs as a process on a machine whose
     /// network is that one.
     #[test]
     fn the_kernels_own_question_goes_by_the_machines_network() {
-        use crate::net::user_stack::{machine, use_for_all, ServedUdpSocket};
+        use crate::net::user_stack::{machine, ServedUdpSocket};
         use crate::net::{Endpoint, Socket};
         use rcore_fs::vfs::{FileSystem, FileType};
         let _g = crate::net::NET_TEST_LOCK.lock();
@@ -1112,9 +959,7 @@ mod dns_tests {
                 assert_eq!(Socket::write(&server, &reply, Some(from)), Ok(reply.len()));
             })
         });
-        use_for_all(true);
         let got = async_std::task::block_on(resolve(&root, "nfs.eclipse", DnsFamily::V4));
-        use_for_all(false);
         assert_eq!(got, Ok(alloc::vec![IpAddress::v4(10, 0, 9, 7)]));
         answering.join().unwrap();
     }
@@ -1158,12 +1003,8 @@ mod dns_tests {
                 }
             })
         });
-        let got = async_std::task::block_on(resolve_by(
-            &root,
-            "probe.eclipse",
-            DnsFamily::Unspec,
-            Some(&link),
-        ));
+        let got =
+            async_std::task::block_on(resolve_by(&root, "probe.eclipse", DnsFamily::Unspec, &link));
         assert_eq!(got, Ok(alloc::vec![IpAddress::v4(10, 0, 9, 1)]));
         answering.join().unwrap();
 
@@ -1172,12 +1013,8 @@ mod dns_tests {
         conf.resize(0).unwrap();
         conf.write_at(0, b"nameserver 10.0.9.3\n").unwrap();
         let before = kernel_hal::timer::timer_now();
-        let got = async_std::task::block_on(resolve_by(
-            &root,
-            "probe.eclipse",
-            DnsFamily::Unspec,
-            Some(&link),
-        ));
+        let got =
+            async_std::task::block_on(resolve_by(&root, "probe.eclipse", DnsFamily::Unspec, &link));
         assert_eq!(got, Err(LxError::ENOENT));
         assert!(kernel_hal::timer::timer_now() - before < REPLY_TIMEOUT);
 
@@ -1211,12 +1048,8 @@ mod dns_tests {
                 }
             })
         });
-        let got = async_std::task::block_on(resolve_by(
-            &root,
-            "probe.eclipse",
-            DnsFamily::Unspec,
-            Some(&link),
-        ));
+        let got =
+            async_std::task::block_on(resolve_by(&root, "probe.eclipse", DnsFamily::Unspec, &link));
         assert_eq!(got, Ok(alloc::vec![v6([0xfec0, 0, 0, 0, 0, 0, 0, 0x99])]));
         answering.join().unwrap();
     }

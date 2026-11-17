@@ -8,9 +8,7 @@
 //! A test program, and an ordinary one: `socket`, `bind`, `listen`,
 //! `accept`, `read`, `write`, a thread for each connection, with nothing
 //! of Eclipse's in it. It is what the stack that runs as a process is
-//! measured with against the kernel's (`scripts/tcp_bench.py`): started as
-//! it is, its sockets are the kernel's; started by `eclipse-netstack-use`,
-//! the process's.
+//! measured with (`scripts/tcp_bench.py`).
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the port
 //! cannot be had or no more connections can be taken.

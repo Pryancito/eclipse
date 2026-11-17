@@ -128,7 +128,8 @@ pub fn on_listen(proc: &Arc<Process>, socket: &dyn Socket) {
 mod tests {
     use super::*;
     use crate::net::user_stack::{ServedTcpSocket, ServedUdpSocket, StackLink};
-    use crate::net::{IpAddress, IpEndpoint, NET_TEST_LOCK};
+    use crate::net::{IpAddress, NET_TEST_LOCK};
+    use smoltcp::wire::IpEndpoint;
 
     fn any(port: u16) -> Endpoint {
         Endpoint::Ip(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port))

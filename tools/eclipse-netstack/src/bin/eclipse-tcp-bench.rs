@@ -16,9 +16,7 @@
 //!   checked against what a source sends.
 //!
 //! One line of result, `RESULT what number unit`, after a line that says
-//! it in words. A test program, and an ordinary one, like the server:
-//! started as it is, its sockets are the kernel's; started by
-//! `eclipse-netstack-use`, the process's.
+//! it in words. A test program, and an ordinary one, like the server.
 //!
 //! Exit status: 2 for a command line that is not one, 1 when the server
 //! is not there or did not answer as it should.
