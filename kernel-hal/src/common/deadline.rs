@@ -18,9 +18,7 @@
 //! reprograms its timer four thousand times a second.
 
 use alloc::boxed::Box;
-use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
-use core::cmp::Ordering as CmpOrdering;
 use core::convert::TryFrom;
 use core::time::Duration;
 
@@ -347,31 +345,38 @@ pub fn stray_deadline_cpu_armed(
     worst.map(|(cpu, _)| cpu)
 }
 
-/// A pending timer: its absolute deadline and the callback to run.
+/// What names one timer in a [`TimerHeap`], so it can be taken back out.
 ///
-/// Ordered so the [`BinaryHeap`] (a max-heap) yields the *earliest* deadline
-/// first — `cmp` is reversed on `deadline`.
-struct TimerEvent {
-    deadline: Duration,
-    callback: Box<dyn FnOnce(Duration) + Send + Sync + 'static>,
+/// `index` is the timer's place in the heap's table and `turn` says which of
+/// the timers that have had that place it is: a key outlives its timer, and
+/// must not take out the next one to be given the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerKey {
+    index: u32,
+    turn: u32,
 }
 
-impl PartialEq for TimerEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline.eq(&other.deadline)
-    }
+/// A timer's place in line: its deadline, and where its callback is kept.
+struct TimerEvent {
+    deadline: Duration,
+    index: u32,
 }
-impl Eq for TimerEvent {}
-impl PartialOrd for TimerEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
+
+/// The callback of the timer that has a place in the table, and where in
+/// the heap its event is.
+#[derive(Default)]
+struct TimerPlace {
+    turn: u32,
+    at: u32,
+    callback: Option<TimerCallbackBox>,
 }
-impl Ord for TimerEvent {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        // Reverse so the min-deadline is at the top of the max-heap.
-        other.deadline.cmp(&self.deadline)
-    }
+
+/// A timer set with `timer_set_cancellable`: the CPU whose heap holds it and
+/// its key there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerId {
+    pub(crate) cpu: usize,
+    pub(crate) key: TimerKey,
 }
 
 /// A minimal timer heap.
@@ -383,23 +388,132 @@ impl Ord for TimerEvent {
 /// is essential — timer callbacks re-arm periodic timers by calling
 /// `timer_set`, which re-locks the heap; running them under the lock is a
 /// same-CPU re-entrant self-deadlock.
+///
+/// A timer its owner no longer wants comes out with [`Self::cancel`]. It used
+/// to stay until its deadline: the owner only told the callback to do
+/// nothing, and the CPU was still armed for it and interrupted to find out.
+/// A wait with a timeout that ends early, which is nearly every one, left
+/// one such interrupt behind; a small TCP echo through the stack process
+/// took more timer interrupts for the dead than it took for anything else.
+///
+/// The heap is kept by hand, each timer knowing where in it its event is,
+/// so that cancelling takes that one event out: no search, nothing left
+/// behind for the deadline to clear (a program that reads with a timeout of
+/// a minute, thousands of times a second, would leave a minute's worth), and
+/// no memory asked for or given back per timer, which a tree of timers did
+/// every time the only timer of a CPU came or went.
 #[derive(Default)]
 pub struct TimerHeap {
-    events: BinaryHeap<TimerEvent>,
+    /// A binary min-heap on the deadline.
+    events: Vec<TimerEvent>,
+    places: Vec<TimerPlace>,
+    /// Places of the table that hold no timer.
+    free: Vec<u32>,
 }
 
+/// The callback a timer owns.
+type TimerCallbackBox = Box<dyn FnOnce(Duration) + Send + Sync + 'static>;
+
 impl TimerHeap {
-    pub fn add(
-        &mut self,
-        deadline: Duration,
-        callback: Box<dyn FnOnce(Duration) + Send + Sync + 'static>,
-    ) {
-        self.events.push(TimerEvent { deadline, callback });
+    /// Add a timer, and say what to [`Self::cancel`] it by.
+    pub fn add(&mut self, deadline: Duration, callback: TimerCallbackBox) -> TimerKey {
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.places.push(TimerPlace::default());
+                (self.places.len() - 1) as u32
+            }
+        };
+        let at = self.events.len();
+        self.events.push(TimerEvent { deadline, index });
+        let place = &mut self.places[index as usize];
+        place.callback = Some(callback);
+        place.at = at as u32;
+        let turn = place.turn;
+        self.rise(at);
+        TimerKey { index, turn }
+    }
+
+    /// Take a timer back out before it is due. `None` when it already ran,
+    /// or was already cancelled. The callback comes back so that the caller
+    /// drops it outside the heap's lock.
+    pub fn cancel(&mut self, key: TimerKey) -> Option<TimerCallbackBox> {
+        let place = self.places.get(key.index as usize)?;
+        if place.turn != key.turn || place.callback.is_none() {
+            return None;
+        }
+        let at = place.at as usize;
+        Some(self.take_out(at))
+    }
+
+    /// Take the event at `at` out of the heap, and its timer out of the
+    /// table: the place can be given to another timer, which no key of this
+    /// one may take out.
+    fn take_out(&mut self, at: usize) -> TimerCallbackBox {
+        let event = self.events.swap_remove(at);
+        if at < self.events.len() {
+            // The last event took the hole: put it where it belongs.
+            self.places[self.events[at].index as usize].at = at as u32;
+            let at = self.rise(at);
+            self.sink(at);
+        }
+        let place = &mut self.places[event.index as usize];
+        place.turn = place.turn.wrapping_add(1);
+        self.free.push(event.index);
+        place
+            .callback
+            .take()
+            .expect("an event in the heap has its callback in the table")
+    }
+
+    /// Swap two events and tell their timers where they are now.
+    fn swap(&mut self, a: usize, b: usize) {
+        self.events.swap(a, b);
+        self.places[self.events[a].index as usize].at = a as u32;
+        self.places[self.events[b].index as usize].at = b as u32;
+    }
+
+    /// Move the event at `at` towards the front while it is due before its
+    /// parent. Says where it ended.
+    fn rise(&mut self, mut at: usize) -> usize {
+        while at > 0 {
+            let parent = (at - 1) / 2;
+            if self.events[parent].deadline <= self.events[at].deadline {
+                break;
+            }
+            self.swap(at, parent);
+            at = parent;
+        }
+        at
+    }
+
+    /// Move the event at `at` away from the front while a child is due
+    /// before it.
+    fn sink(&mut self, mut at: usize) {
+        loop {
+            let left = 2 * at + 1;
+            if left >= self.events.len() {
+                break;
+            }
+            let right = left + 1;
+            let first = if right < self.events.len()
+                && self.events[right].deadline < self.events[left].deadline
+            {
+                right
+            } else {
+                left
+            };
+            if self.events[at].deadline <= self.events[first].deadline {
+                break;
+            }
+            self.swap(at, first);
+            at = first;
+        }
     }
 
     /// Deadline of the earliest pending timer, if any.
     pub fn next(&self) -> Option<Duration> {
-        self.events.peek().map(|e| e.deadline)
+        self.events.first().map(|e| e.deadline)
     }
 
     /// The earliest pending deadline in nanoseconds, or [`NO_DEADLINE`].
@@ -420,16 +534,15 @@ impl TimerHeap {
     }
 
     /// Pop every event whose deadline is `<= now`, returning their callbacks.
-    pub fn drain_expired(
-        &mut self,
-        now: Duration,
-    ) -> Vec<Box<dyn FnOnce(Duration) + Send + Sync + 'static>> {
+    ///
+    /// Nothing due is the usual answer of a tick, and it allocates nothing.
+    pub fn drain_expired(&mut self, now: Duration) -> Vec<TimerCallbackBox> {
         let mut ready = Vec::new();
-        while let Some(t) = self.events.peek() {
-            if t.deadline > now {
+        while let Some(front) = self.events.first() {
+            if front.deadline > now {
                 break;
             }
-            ready.push(self.events.pop().unwrap().callback);
+            ready.push(self.take_out(0));
         }
         ready
     }
@@ -976,6 +1089,131 @@ mod tests {
             cb(Duration::ZERO);
         }
         assert_eq!(bits.load(Ordering::Relaxed), 0b011);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_timer_is_gone_and_is_not_what_the_cpu_is_armed_for() {
+        let bits = Arc::new(AtomicU64::new(0));
+        let mut h = TimerHeap::default();
+        let near = h.add(Duration::from_millis(10), marker(&bits, 0));
+        h.add(Duration::from_millis(40), marker(&bits, 1));
+        assert_eq!(h.next_ns(), 10 * MS);
+        assert!(h.cancel(near).is_some(), "it was there to take out");
+        assert_eq!(h.next_ns(), 40 * MS, "the dead timer no longer leads");
+        assert_eq!(h.len(), 1);
+        for cb in h.drain_expired(Duration::from_secs(1)) {
+            cb(Duration::ZERO);
+        }
+        assert_eq!(bits.load(Ordering::Relaxed), 0b10, "only the live one ran");
+    }
+
+    #[test]
+    fn cancelling_takes_out_that_timer_and_not_its_twin() {
+        // Two timers for the same instant: the number tells them apart.
+        let bits = Arc::new(AtomicU64::new(0));
+        let mut h = TimerHeap::default();
+        let first = h.add(Duration::from_millis(10), marker(&bits, 0));
+        let second = h.add(Duration::from_millis(10), marker(&bits, 1));
+        assert_ne!(first, second);
+        drop(h.cancel(first));
+        for cb in h.drain_expired(Duration::from_millis(10)) {
+            cb(Duration::ZERO);
+        }
+        assert_eq!(bits.load(Ordering::Relaxed), 0b10);
+    }
+
+    #[test]
+    fn cancelling_a_timer_that_ran_or_was_cancelled_does_nothing() {
+        let bits = Arc::new(AtomicU64::new(0));
+        let mut h = TimerHeap::default();
+        let ran = h.add(Duration::from_millis(10), marker(&bits, 0));
+        let stays = h.add(Duration::from_millis(40), marker(&bits, 1));
+        drop(h.drain_expired(Duration::from_millis(10)));
+        assert!(h.cancel(ran).is_none(), "it already came out to run");
+        assert!(h.cancel(stays).is_some());
+        assert!(h.cancel(stays).is_none(), "and only once");
+        // A later timer for the same instant is another timer.
+        let again = h.add(Duration::from_millis(40), marker(&bits, 2));
+        assert!(h.cancel(stays).is_none());
+        assert_eq!(h.len(), 1);
+        assert!(h.cancel(again).is_some());
+    }
+
+    #[test]
+    fn a_timer_cancelled_behind_a_live_one_never_reaches_the_front() {
+        let bits = Arc::new(AtomicU64::new(0));
+        let mut h = TimerHeap::default();
+        h.add(Duration::from_millis(10), marker(&bits, 0));
+        let dead = h.add(Duration::from_millis(20), marker(&bits, 1));
+        h.add(Duration::from_millis(30), marker(&bits, 2));
+        drop(h.cancel(dead));
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.next_ns(), 10 * MS);
+        for cb in h.drain_expired(Duration::from_millis(10)) {
+            cb(Duration::ZERO);
+        }
+        assert_eq!(h.next_ns(), 30 * MS, "not the cancelled one's 20 ms");
+        for cb in h.drain_expired(Duration::from_millis(30)) {
+            cb(Duration::ZERO);
+        }
+        assert_eq!(bits.load(Ordering::Relaxed), 0b101);
+        assert!(h.is_empty());
+        assert_eq!(h.next_ns(), NO_DEADLINE);
+    }
+
+    #[test]
+    fn timers_set_and_cancelled_over_and_over_keep_to_one_place() {
+        // What a wait with a timeout does on every pass.
+        let bits = Arc::new(AtomicU64::new(0));
+        let mut h = TimerHeap::default();
+        for pass in 0..1000u64 {
+            let key = h.add(Duration::from_millis(10 + pass), marker(&bits, 0));
+            assert!(h.cancel(key).is_some());
+        }
+        assert!(h.is_empty());
+        assert_eq!(h.next_ns(), NO_DEADLINE);
+        assert_eq!(h.places.len(), 1);
+        assert!(h.events.is_empty());
+    }
+
+    #[test]
+    fn timers_cancelled_from_anywhere_leave_the_rest_in_order() {
+        // Every third timer of a shuffled lot is cancelled; what is left
+        // comes out earliest first, each one once.
+        let mut h = TimerHeap::default();
+        let order = Arc::new(lock::Mutex::new(Vec::new()));
+        let mut keys = Vec::new();
+        for n in 0..200u64 {
+            let ms = (n * 7919) % 211;
+            let order = order.clone();
+            keys.push((
+                ms,
+                h.add(
+                    Duration::from_millis(ms),
+                    Box::new(move |_| order.lock().push(ms)),
+                ),
+            ));
+        }
+        let mut kept = Vec::new();
+        for (n, (ms, key)) in keys.into_iter().enumerate() {
+            if n % 3 == 0 {
+                assert!(h.cancel(key).is_some());
+                assert!(h.cancel(key).is_none());
+            } else {
+                kept.push(ms);
+            }
+        }
+        assert_eq!(h.len(), kept.len());
+        kept.sort_unstable();
+        assert_eq!(h.next_ns(), kept[0] * MS);
+        // In two bites, so that a drain that stops half way is covered.
+        for now in [100, 1000] {
+            for cb in h.drain_expired(Duration::from_millis(now)) {
+                cb(Duration::ZERO);
+            }
+        }
+        assert_eq!(*order.lock(), kept);
         assert!(h.is_empty());
     }
 

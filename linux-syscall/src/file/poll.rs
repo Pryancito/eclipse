@@ -493,6 +493,9 @@ impl Syscall<'_> {
             /// (pipes, unix sockets, ptys, eventfd/timerfd, DRM). Refreshed
             /// each pass; RAII-unsubscribed on drop.
             subs: Vec<linux_object::sync::ReadinessSub>,
+            /// The place this wait has on its thread to be woken by a
+            /// signal.
+            signal: linux_object::sync::SignalWake,
         }
         impl Drop for PollFuture<'_> {
             fn drop(&mut self) {
@@ -625,7 +628,11 @@ impl Syscall<'_> {
                 // block again. If the caller already has ready fds (or a
                 // timeout of 0 / an expired timeout), Linux returns that result
                 // instead of synthesizing `EINTR`.
-                if let Err(e) = linux_object::process::check_signals() {
+                //
+                // The waker is left with the thread before the look, so a
+                // signal queued after it wakes this wait when it arrives.
+                let (interrupted, parked) = this.signal.check(cx.waker());
+                if let Err(e) = interrupted {
                     clear_poll_io(
                         &mut this.timer,
                         &mut this.io_waker,
@@ -673,7 +680,7 @@ impl Syscall<'_> {
                     covered &= any_watched;
                 }
                 let covered_tick =
-                    Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);
+                    Duration::from_millis(linux_object::net::wait::covered_tick_ms(parked));
 
                 match poll_wait_decision(this.timeout_msecs, this.begin_time, mono_now()) {
                     PollWait::ReturnEmpty => {
@@ -756,6 +763,7 @@ impl Syscall<'_> {
 
             io_waker: None,
             subs: Vec::new(),
+            signal: linux_object::sync::SignalWake::new(),
         };
         let result = future.await;
         if let Err(e) = &result {
@@ -1037,6 +1045,9 @@ impl Syscall<'_> {
             io_waker: Option<core::task::Waker>,
             /// Readiness wakers parked on the watched fds (see PollFuture).
             subs: Vec<linux_object::sync::ReadinessSub>,
+            /// The place this wait has on its thread to be woken by a
+            /// signal.
+            signal: linux_object::sync::SignalWake,
             /// The fds the three sets name, ascending.
             members: Vec<FileDesc>,
             /// `members` resolved by `select_core`, for the first pass.
@@ -1140,7 +1151,11 @@ impl Syscall<'_> {
                     return Poll::Ready(Ok(events));
                 }
 
-                if let Err(e) = linux_object::process::check_signals() {
+                //
+                // The waker is left with the thread before the look, so a
+                // signal queued after it wakes this wait when it arrives.
+                let (interrupted, parked) = this.signal.check(cx.waker());
+                if let Err(e) = interrupted {
                     clear_poll_io(
                         &mut this.timer,
                         &mut this.io_waker,
@@ -1180,7 +1195,7 @@ impl Syscall<'_> {
                     covered &= any_watched;
                 }
                 let covered_tick =
-                    Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);
+                    Duration::from_millis(linux_object::net::wait::covered_tick_ms(parked));
 
                 match poll_wait_decision(this.timeout_msecs, this.begin_time, mono_now()) {
                     PollWait::ReturnEmpty => {
@@ -1265,6 +1280,7 @@ impl Syscall<'_> {
             timer: None,
             io_waker: None,
             subs: Vec::new(),
+            signal: linux_object::sync::SignalWake::new(),
             members,
             first_files,
         };

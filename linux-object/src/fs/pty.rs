@@ -1313,6 +1313,8 @@ struct PtyReadFuture<'a> {
     /// wakeups on this end is the master writing, which is exactly what the
     /// timer is there to stop depending on.
     timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+    /// The place this wait has on its thread to be woken by a signal.
+    signal: crate::sync::SignalWake,
     /// Whether this is the slave's read side, the only one with a line
     /// discipline and therefore the only one with a timer.
     slave: bool,
@@ -1373,7 +1375,12 @@ impl Future for PtyReadFuture<'_> {
         // above, deliberately: data that is already there is delivered, and
         // `EINTR` is only synthesised for a read that would really block.
         // `FsError::Interrupted` is what the file layer turns into `EINTR`.
-        if crate::sync::wait_interrupted().is_err() {
+        //
+        // The waker is left with the thread before the look
+        // (`SignalWake::check`), so a signal queued after it wakes this
+        // read by itself.
+        let (interrupted, parked) = this.signal.check(cx.waker());
+        if interrupted.is_err() {
             if let Some(id) = this.sub_id.take() {
                 this.bus.lock().unsubscribe(id);
             }
@@ -1385,20 +1392,31 @@ impl Future for PtyReadFuture<'_> {
         // above run again. The backstop is why a wait with no VTIME is still
         // interruptible; it is a ceiling on how late a `kill` can be, not on
         // how fast a byte arrives.
-        let backstop =
-            kernel_hal::timer::deadline_after(Duration::from_millis(PTY_INTERRUPT_CHECK_TICK_MS));
-        let deadline = if this.slave {
-            let dl = this.pty.vtime_deadline_ns.load(Ordering::Acquire);
-            if dl != 0 {
-                backstop.min(Duration::from_nanos(dl))
-            } else {
-                backstop
+        //
+        // A read the thread wakes for a signal has no backstop: only the
+        // VTIME deadline is left for a timer, when there is one.
+        let backstop = (!parked).then(|| {
+            kernel_hal::timer::deadline_after(Duration::from_millis(PTY_INTERRUPT_CHECK_TICK_MS))
+        });
+        let vtime = if this.slave {
+            match this.pty.vtime_deadline_ns.load(Ordering::Acquire) {
+                0 => None,
+                dl => Some(Duration::from_nanos(dl)),
             }
         } else {
-            backstop
+            None
         };
-        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
-            cx.waker().wake_by_ref();
+        let deadline = match (backstop, vtime) {
+            (Some(tick), Some(dl)) => Some(tick.min(dl)),
+            (tick, dl) => tick.or(dl),
+        };
+        match deadline {
+            Some(deadline) => {
+                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+                    cx.waker().wake_by_ref();
+                }
+            }
+            None => kernel_hal::timer_waker::kill_timer_waker(&mut this.timer),
         }
         // Re-check after subscribing: data may have arrived in the window
         // between the first check and the subscription, which would otherwise
@@ -1427,6 +1445,7 @@ fn readable_future<'a>(
         check,
         sub_id: None,
         timer: None,
+        signal: crate::sync::SignalWake::new(),
         slave,
     })
 }
@@ -1649,6 +1668,67 @@ mod tests {
             "a read nothing will ever answer must give up when the thread is \
              killed: FsError::Interrupted is what becomes EINTR"
         );
+    }
+
+    fn read_wait(p: &Pty, slave: bool) -> PtyReadFuture<'_> {
+        PtyReadFuture {
+            pty: p,
+            bus: if slave {
+                p.slave_bus.clone()
+            } else {
+                p.master_bus.clone()
+            },
+            check: if slave {
+                Pty::slave_readable
+            } else {
+                Pty::master_readable
+            },
+            sub_id: None,
+            timer: None,
+            signal: crate::sync::SignalWake::new(),
+            slave,
+        }
+    }
+
+    /// A read whose thread takes its waker arms no timer: the bus wakes it
+    /// for a byte and the thread for a signal. This was a timer armed and
+    /// cancelled by every terminal read that waited.
+    #[test]
+    fn a_parked_read_on_a_silent_pty_arms_no_timer_and_can_be_killed() {
+        use crate::sync::test_interrupt;
+        let p = pty();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for slave in [false, true] {
+            interrupts::clear();
+            test_interrupt::takes_wakers(true);
+            let mut fut = read_wait(&p, slave);
+            assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+            assert!(fut.timer.is_none(), "slave={}: a timer was armed", slave);
+            assert!(test_interrupt::parked_wait().is_some());
+
+            interrupts::interrupt_now();
+            let ended = matches!(
+                Pin::new(&mut fut).poll(&mut cx),
+                Poll::Ready(Err(FsError::Interrupted))
+            );
+            assert!(ended, "slave={}", slave);
+            drop(fut);
+            assert_eq!(test_interrupt::parked_wait(), None);
+        }
+        interrupts::clear();
+    }
+
+    /// A thread that takes no waker keeps the tick that looks for a signal.
+    #[test]
+    fn a_read_the_thread_does_not_take_keeps_its_tick() {
+        interrupts::clear();
+        let p = pty();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = read_wait(&p, false);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(fut.timer.is_some());
     }
 
     /// A fresh pair with one slave open, as `alloc_ptmx` + `open_pts` would

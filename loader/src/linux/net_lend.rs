@@ -539,9 +539,22 @@ pub(super) fn give_then(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Turn
         .write(0)
         .map_err(|_| ZxError::INVALID_ARGS)?;
     if give != 0 {
-        let bytes: Vec<u8> = UserInPtr::<u8>::from(msgs)
-            .read_array(give * NET_MSG)
-            .map_err(|_| ZxError::INVALID_ARGS)?;
+        // Copied before they are believed, as ever; the few of an ordinary
+        // turn onto the stack, where a `Vec` was an allocation a turn.
+        let mut here = [0u8; OUT_HERE * NET_MSG];
+        let more;
+        let bytes: &[u8] = if give <= OUT_HERE {
+            let said = UserInPtr::<u8>::from(msgs)
+                .as_slice(give * NET_MSG)
+                .map_err(|_| ZxError::INVALID_ARGS)?;
+            here[..said.len()].copy_from_slice(said);
+            &here[..said.len()]
+        } else {
+            more = UserInPtr::<u8>::from(msgs)
+                .read_array(give * NET_MSG)
+                .map_err(|_| ZxError::INVALID_ARGS)?;
+            &more
+        };
         // The whole window, looked at once for the call. A window that is
         // not all there sends nothing, and every slot comes back.
         let window = UserInPtr::<u8>::from(card.window)
@@ -585,6 +598,64 @@ where
     }
 }
 
+/// How many messages a turn's answer holds in place.
+const OUT_HERE: usize = 8;
+
+/// What a turn answers, a message after another. The few messages of an
+/// ordinary turn (a frame, a slot that is free again) are kept in place:
+/// in a `Vec` they were an allocation and a free for every turn that had
+/// anything to say. A burst goes to the heap, with room for all of it at
+/// once.
+struct Out {
+    here: [u8; OUT_HERE * NET_MSG],
+    len: usize,
+    more: Vec<u8>,
+    /// How many messages a burst is given room for.
+    burst: usize,
+}
+
+impl Out {
+    fn new(burst: usize) -> Self {
+        Out {
+            here: [0; OUT_HERE * NET_MSG],
+            len: 0,
+            more: Vec::new(),
+            burst,
+        }
+    }
+
+    fn push(&mut self, message: [u8; NET_MSG]) {
+        if self.more.is_empty() && self.len + NET_MSG <= self.here.len() {
+            self.here[self.len..self.len + NET_MSG].copy_from_slice(&message);
+        } else {
+            if self.more.is_empty() {
+                self.more
+                    .reserve_exact(self.burst.max(OUT_HERE + 1) * NET_MSG);
+                self.more.extend_from_slice(&self.here[..self.len]);
+            }
+            self.more.extend_from_slice(&message);
+        }
+        self.len += NET_MSG;
+    }
+
+    /// The bytes of the messages so far.
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn said(&self) -> &[u8] {
+        if self.more.is_empty() {
+            &self.here[..self.len]
+        } else {
+            &self.more
+        }
+    }
+}
+
 impl Turn {
     /// The answer: what there is to say now, or with [`LENT_WAIT`] what
     /// there is once there is something.
@@ -596,9 +667,7 @@ impl Turn {
             0 => None,
             limit => Some(kernel_hal::timer::timer_now() + Duration::from_micros(limit)),
         };
-        // Room for a burst at once: grown a message at a time it was two
-        // allocations more for a turn that brought two frames.
-        let mut out: Vec<u8> = Vec::new();
+        let mut out = Out::new(self.room.min(BURST_ROOM));
         loop {
             // Only a turn that takes frames looks: one that does not would
             // leave them for the one that does, which then waits for this
@@ -615,12 +684,8 @@ impl Turn {
                     .ok();
             }
             while out.len() < self.room * NET_MSG {
-                let next = self.card.next(frames);
-                if next.is_some() && out.capacity() == 0 {
-                    out.reserve_exact(self.room.min(BURST_ROOM) * NET_MSG);
-                }
-                match next {
-                    Some(Answer::Sent(slot)) => out.extend_from_slice(&encode(OP_TX, slot, 0, 0)),
+                match self.card.next(frames) {
+                    Some(Answer::Sent(slot)) => out.push(encode(OP_TX, slot, 0, 0)),
                     Some(Answer::Frame(slot, frame)) => {
                         let at = slot as usize * SLOT;
                         let place = slots
@@ -635,7 +700,7 @@ impl Turn {
                             self.card.tell();
                             return Err(ZxError::INVALID_ARGS);
                         }
-                        out.extend_from_slice(&encode(OP_RX, slot, frame.len() as u32, 0));
+                        out.push(encode(OP_RX, slot, frame.len() as u32, 0));
                     }
                     None => break,
                 }
@@ -661,7 +726,7 @@ impl Turn {
         }
         if !out.is_empty() {
             UserOutPtr::<u8>::from(self.msgs)
-                .write_array(&out)
+                .write_array(out.said())
                 .map_err(|_| ZxError::INVALID_ARGS)?;
         }
         UserOutPtr::<usize>::from(self.actual)
@@ -673,6 +738,25 @@ impl Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn's answer is the same bytes whether it stayed in place or
+    /// went to the heap.
+    #[test]
+    fn an_answer_is_the_same_in_place_and_on_the_heap() {
+        for count in [0usize, 1, OUT_HERE, OUT_HERE + 1, 40] {
+            let mut out = Out::new(BURST_ROOM);
+            let mut want = Vec::new();
+            for slot in 0..count as u32 {
+                let message = encode(OP_RX, slot, 60 + slot, 0);
+                out.push(message);
+                want.extend_from_slice(&message);
+            }
+            assert_eq!(out.len(), count * NET_MSG);
+            assert_eq!(out.is_empty(), count == 0);
+            assert_eq!(out.said(), &want[..], "{count} messages");
+            assert_eq!(out.more.is_empty(), count <= OUT_HERE);
+        }
+    }
 
     /// A card that keeps what it is sent and can be full.
     #[derive(Default)]

@@ -29,18 +29,6 @@ const EVENT_DEV_MINOR_BASE: usize = 0x40;
 /// how late a `kill` can be, not on how fast an event arrives.
 const EVDEV_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
-/// Whether the thread parked in a blocking evdev read must stop waiting -- a
-/// signal is deliverable, the thread is dying, or its process has exited.
-///
-/// Goes through `crate::sync`'s switch rather than calling
-/// `crate::process::check_signals` directly: there is no current thread in a
-/// host test, so the real check always answers `Ok` there and no test could
-/// otherwise reach the interrupted branch at all. One switch for every
-/// interruptible wait in the crate, so they all flip together.
-pub(super) fn wait_interrupted() -> bool {
-    crate::sync::wait_interrupted().is_err()
-}
-
 /// The clock that stamps events, as `EVIOCSCLOCKID` selects it.
 ///
 /// Linux keeps this per open file description; here it belongs to the node,
@@ -396,6 +384,8 @@ impl INode for EventDev {
             sub_id: Option<u64>,
             /// Backstop slot; see [`EVDEV_INTERRUPT_CHECK_TICK_MS`].
             timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+            /// The place this wait has on its thread to be woken by a signal.
+            signal: crate::sync::SignalWake,
         }
 
         impl EventFuture<'_> {
@@ -463,9 +453,18 @@ impl INode for EventDev {
                 // Checked AFTER readiness, deliberately: data that is already
                 // there is delivered, and `EINTR` is synthesised only for a
                 // read that would otherwise block.
-                if wait_interrupted() {
+                //
+                // The waker is left with the thread before the look: a
+                // signal queued after it wakes this read, which then needs
+                // no tick.
+                let (interrupted, parked) = this.signal.check(cx.waker());
+                if interrupted.is_err() {
                     this.unpark();
                     return Poll::Ready(Err(FsError::Interrupted));
+                }
+                if parked {
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Pending;
                 }
                 let deadline = kernel_hal::timer::deadline_after(
                     core::time::Duration::from_millis(EVDEV_INTERRUPT_CHECK_TICK_MS),
@@ -481,6 +480,7 @@ impl INode for EventDev {
             dev: self,
             sub_id: None,
             timer: None,
+            signal: crate::sync::SignalWake::new(),
         })
     }
 

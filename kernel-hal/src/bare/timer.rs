@@ -6,7 +6,7 @@ use core::time::Duration;
 
 use lock::Mutex;
 
-use crate::deadline::{duration_to_ns, is_due, TimerHeap, NO_DEADLINE};
+use crate::deadline::{duration_to_ns, is_due, TimerHeap, TimerId, NO_DEADLINE};
 
 /// Timer interrupt frequency in Hz.
 /// 250 Hz gives a 4 ms tick granularity — a good balance between
@@ -677,6 +677,42 @@ hal_fn_impl! {
         }
 
         fn timer_set(deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send + Sync>) {
+            let _ = Self::timer_set_cancellable(deadline, callback);
+        }
+
+        fn timer_cancel(timer: TimerId) {
+            // The callback is dropped after the heap's lock: it may own the
+            // last reference to anything.
+            let _callback = {
+                // Its own heap, or another CPU's if that one is free right
+                // now. Never a wait for another CPU's heap: see
+                // `try_drain_cpu_heap`. A timer left behind is what every
+                // timer was before this function existed.
+                let heap = if timer.cpu == timer_cpu() {
+                    Some(TIMER_HEAPS[timer.cpu].lock())
+                } else {
+                    TIMER_HEAPS[timer.cpu].try_lock()
+                };
+                let Some(mut heap) = heap else {
+                    return;
+                };
+                let led = heap.next_ns();
+                let callback = heap.cancel(timer.key);
+                // The count stays programmed for whatever it was: at worst
+                // one interrupt that finds nothing due, and the next timer
+                // set within that span costs no write to the count at all.
+                let leads = heap.next_ns();
+                if leads != led {
+                    publish_deadline(timer.cpu, leads);
+                }
+                callback
+            };
+        }
+
+        fn timer_set_cancellable(
+            deadline: Duration,
+            callback: Box<dyn FnOnce(Duration) + Send + Sync>,
+        ) -> Option<TimerId> {
             debug!("Set timer at: {:?}", deadline);
             // Mutex::lock() uses push_off/pop_off which already handles interrupt
             // disabling. Manual intr_off/on here would bypass the noff accounting
@@ -686,7 +722,7 @@ hal_fn_impl! {
             // is woken for it.
             let cpu = timer_cpu();
             let mut t = TIMER_HEAPS[cpu].lock();
-            t.add(deadline, callback);
+            let key = t.add(deadline, callback);
             // Republish this CPU's earliest deadline so its own fast-path tick
             // (and the stray sweep) observe it. Done under the lock so
             // concurrent updates can't race with `timer_tick`'s post-expire
@@ -704,6 +740,7 @@ hal_fn_impl! {
                 arm_deadline(duration_to_ns(timer_now()), next);
             }
             drop(t);
+            Some(TimerId { cpu, key })
         }
 
         fn timer_tick() {

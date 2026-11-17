@@ -485,6 +485,9 @@ struct UnixEventWait {
     /// a finished task — the lunarbar null fn-ptr `#PF` (`rip=0x3` in
     /// `timer_tick`) after Wayland sessions.
     timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+    /// The place this wait has on its thread to be woken by a signal:
+    /// while it has one, no backstop timer is armed.
+    signal: crate::sync::SignalWake,
 }
 
 impl Drop for UnixEventWait {
@@ -532,19 +535,34 @@ impl Future for UnixEventWait {
         // a signal or a kill. Checked AFTER the readiness test, deliberately:
         // Linux serves a read it can serve now and synthesises EINTR only when
         // it would otherwise block.
-        if let Err(err) = crate::process::check_signals() {
+        //
+        // The waker is left with the thread before the look
+        // (`SignalWake::check`), so a signal queued after it wakes this
+        // wait by itself.
+        let (interrupted, parked) = this.signal.check(cx.waker());
+        if let Err(err) = interrupted {
             if let Some(id) = this.sub_id.take() {
                 this.inner.lock().eventbus.unsubscribe(id);
             }
             kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
             return Poll::Ready(Err(err));
         }
-        // Backstop: eventbus is the fast path, but a parked callback can be
-        // evicted from a full table -- and nothing on the bus ever fires for a
-        // signal, so this tick is also what bounds how late a `kill` can be.
-        // Arm once; refresh waker on re-poll — never push a fresh `timer_set`
-        // every Pending (that was the churn behind the desktop null fn-ptr
-        // #PF).
+        if parked {
+            // The socket wakes this wait through the bus and a signal
+            // through the thread: nothing is left for a timer to look at. A
+            // callback evicted from a full table is woken as it is evicted
+            // (`EventBus::subscribe`), and subscribes again above. This was
+            // a timer armed and cancelled for every read that waited, and
+            // fifty wakeups a second of every client parked on an idle
+            // Wayland or D-Bus connection.
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Pending;
+        }
+        // Backstop, for a wait the thread did not take: nothing on the bus
+        // ever fires for a signal, so this tick is what bounds how late a
+        // `kill` can be. Arm once; refresh waker on re-poll — never push a
+        // fresh `timer_set` every Pending (that was the churn behind the
+        // desktop null fn-ptr #PF).
         let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(20));
         if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
             cx.waker().wake_by_ref();
@@ -758,6 +776,7 @@ impl Socket for UnixSocketState {
                 mask: Event::READABLE | Event::CLOSED,
                 sub_id: None,
                 timer: None,
+                signal: crate::sync::SignalWake::new(),
             })
             .await
             {
@@ -1000,6 +1019,7 @@ impl Socket for UnixSocketState {
                 mask: Event::READABLE | Event::CLOSED,
                 sub_id: None,
                 timer: None,
+                signal: crate::sync::SignalWake::new(),
             }
             .await?;
         }
@@ -2678,5 +2698,135 @@ mod record_tests {
             Socket::write(&*c, &vec![0u8; UNIX_STREAM_BUF_MAX + 1], None),
             Err(LxError::EMSGSIZE)
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_wake_tests {
+    //! The blocking read and `accept` of a unix socket, woken for a signal
+    //! by the thread instead of by a 20 ms tick.
+
+    use super::*;
+    use crate::sync::test_interrupt;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Waker;
+
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<Counter>, Waker) {
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        (counter.clone(), Waker::from(counter))
+    }
+
+    /// Puts the thread of the test back as every other test expects it.
+    struct Restore;
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            test_interrupt::clear();
+        }
+    }
+
+    fn read_wait(sock: &UnixSocketState) -> UnixEventWait {
+        UnixEventWait {
+            inner: sock.inner.clone(),
+            mask: Event::READABLE | Event::CLOSED,
+            sub_id: None,
+            timer: None,
+            signal: crate::sync::SignalWake::new(),
+        }
+    }
+
+    /// A reader whose thread takes its waker arms no timer; the signal wakes
+    /// it, and it ends with the interruption and leaves nothing behind on
+    /// the thread or on the socket.
+    #[test]
+    fn a_parked_reader_arms_no_timer_and_ends_for_a_signal() {
+        let _restore = Restore;
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+        let sock = UnixSocketState::new();
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut wait = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(wait.timer.is_none(), "a timer for a wait the thread wakes");
+        assert!(test_interrupt::parked_wait().is_some());
+        // Polled again with nothing new: still no timer.
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(wait.timer.is_none());
+
+        test_interrupt::interrupt_after(0, LxError::EINTR);
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+        test_interrupt::wake_parked();
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            Pin::new(&mut wait).poll(&mut cx),
+            Poll::Ready(Err(LxError::EINTR))
+        ));
+        assert!(wait.sub_id.is_none());
+        drop(wait);
+        assert_eq!(test_interrupt::parked_wait(), None);
+    }
+
+    /// A wait that ends with what it waited for, or is abandoned, gives the
+    /// place on the thread back.
+    #[test]
+    fn a_reader_that_ends_or_is_dropped_leaves_the_thread_free() {
+        let _restore = Restore;
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+        let sock = UnixSocketState::new();
+        let (_count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut wait = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(test_interrupt::parked_wait().is_some());
+        sock.inner.lock().eventbus.set(Event::READABLE);
+        assert!(matches!(
+            Pin::new(&mut wait).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        drop(wait);
+        assert_eq!(test_interrupt::parked_wait(), None);
+        sock.inner.lock().eventbus.clear(Event::READABLE);
+
+        let mut wait = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(test_interrupt::parked_wait().is_some());
+        drop(wait);
+        assert_eq!(test_interrupt::parked_wait(), None);
+    }
+
+    /// A context that takes no waker (a kernel task, a second wait of the
+    /// thread) keeps the tick: it is all that looks for its signal.
+    #[test]
+    fn a_reader_the_thread_does_not_take_keeps_its_tick() {
+        let _restore = Restore;
+        test_interrupt::clear();
+        let sock = UnixSocketState::new();
+        let (_count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut wait = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert!(wait.timer.is_some());
+
+        test_interrupt::takes_wakers(true);
+        let mut first = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut first).poll(&mut cx), Poll::Pending));
+        let mut second = read_wait(&sock);
+        assert!(matches!(Pin::new(&mut second).poll(&mut cx), Poll::Pending));
+        assert!(first.timer.is_none());
+        assert!(second.timer.is_some());
     }
 }

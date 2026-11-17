@@ -61,6 +61,29 @@ fn loopback_tx_handler(packet: &[u8]) {
     packet::push_packet(&eth_frame);
 }
 
+/// The headers a TCP segment between two programs of this machine would
+/// have had, IPv4's and TCP's: what [`count_on_lo`] adds to what was
+/// written. `::1` is 127.0.0.1 here, so a joined connection is counted as
+/// one of IPv4 whatever family its sockets are.
+pub const LO_TCP_HEADERS: usize = 20 + 20;
+/// The same for a datagram: IPv4's and UDP's.
+pub const LO_UDP_HEADERS: usize = 20 + 8;
+/// And for a datagram to an IPv6 address of the machine.
+pub const LO_UDP6_HEADERS: usize = 40 + 8;
+/// And for an ICMP message, whose own header is part of what is sent.
+pub const LO_ICMP_HEADERS: usize = 20;
+/// The same over IPv6.
+pub const LO_ICMP6_HEADERS: usize = 40;
+
+/// One packet of `payload` bytes, and `headers` more, went from a program
+/// of this machine to another without being a frame anywhere: `lo` counts
+/// it, as Linux's does for all that is delivered locally. Only what
+/// carries data is counted: no handshake, no acknowledgement, no window.
+#[inline]
+pub fn count_on_lo(payload: usize, headers: usize) {
+    zcore_drivers::net::loopback::count_local(1, (payload + headers) as u64);
+}
+
 /// Global initialization for the network stack.
 pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);

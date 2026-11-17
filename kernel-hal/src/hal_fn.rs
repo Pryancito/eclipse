@@ -340,6 +340,25 @@ hal_fn_def! {
         /// TODO: use `Instant` as the type of `deadline`.
         pub fn timer_set(deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send + Sync>);
 
+        /// [`timer_set`], for a timer its owner may not want any more: what
+        /// comes back takes it out again with [`timer_cancel`]. `None` where
+        /// timers cannot be taken out (the timer is set all the same, and
+        /// runs at its deadline).
+        pub fn timer_set_cancellable(
+            deadline: Duration,
+            callback: Box<dyn FnOnce(Duration) + Send + Sync>
+        ) -> Option<crate::deadline::TimerId> {
+            timer_set(deadline, callback);
+            None
+        }
+
+        /// Take out a timer that [`timer_set_cancellable`] set, so that no
+        /// CPU is interrupted for it. Its callback is dropped without
+        /// running. Does nothing for a timer that already ran. It may also
+        /// leave the timer where it is (another CPU's heap that is busy just
+        /// now): whoever cancels still has to make the callback harmless.
+        pub fn timer_cancel(_timer: crate::deadline::TimerId) {}
+
         /// Check timers, call when timer interrupt happened.
         pub(crate) fn timer_tick();
 

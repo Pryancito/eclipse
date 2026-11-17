@@ -280,10 +280,13 @@ impl StackLink {
     fn icmp_here6(&self, to: Ipv6Address, message: &[u8]) {
         let mut said = message.to_vec();
         seal(to, to, &mut said);
+        // Neither the message nor its answer is a frame: `lo` counts them.
+        crate::net::count_on_lo(said.len(), crate::net::LO_ICMP6_HEADERS);
         self.heard6(to, HOPS_HERE, &said);
         if said.len() >= ECHO_HEADER && said[0] == ECHO_REQUEST && said[1] == 0 {
             said[0] = ECHO_REPLY;
             seal(to, to, &mut said);
+            crate::net::count_on_lo(said.len(), crate::net::LO_ICMP6_HEADERS);
             self.heard6(to, HOPS_HERE, &said);
         }
     }

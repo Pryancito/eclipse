@@ -11,9 +11,12 @@
 //!
 //! A [`TimerWakerSlot`] is that missing handle. The armed callback and the slot
 //! share one refcounted cell; cancelling flips a flag and **drops the waker**,
-//! so when the timer eventually fires it finds nothing to do. The callback is
-//! never unregistered from the timer heap — it simply becomes a no-op — which
-//! keeps cancellation lock-free-ish and safe to call from `Drop`.
+//! so a timer that still fires finds nothing to do. That is what makes a
+//! cancel safe from `Drop` and against a fire on another CPU. The cancel then
+//! also takes the timer out of the heap ([`crate::timer::timer_cancel`]),
+//! which is only about cost: a dead timer left there still interrupts its CPU
+//! at a deadline nobody waits for, and every timed wait that ends early left
+//! one.
 //!
 //! Callers keep an `Option<TimerWakerSlot>` in their future and drive it with
 //! [`ensure_timer_waker`] (arm, or refresh the waker if the same deadline is
@@ -87,10 +90,13 @@ impl TimerWakerInner {
 /// A live timer wake-up that its owner can cancel.
 ///
 /// Dropping the slot cancels it. The armed callback keeps its own reference to
-/// the shared cell, so the timer itself stays in the heap either way — it just
-/// finds nothing left to wake.
+/// the shared cell, so a timer that cannot be taken out of the heap finds
+/// nothing left to wake.
 pub struct TimerWakerSlot {
     inner: Arc<TimerWakerInner>,
+    /// The timer itself, where it can be taken out of the heap: cancelling
+    /// then also spares the CPU the interrupt at a deadline nobody waits for.
+    timer: Option<crate::deadline::TimerId>,
 }
 
 impl TimerWakerSlot {
@@ -115,7 +121,14 @@ impl Drop for TimerWakerSlot {
     /// futures across four crates park a slot in a field; this makes the
     /// eleventh safe by construction.
     fn drop(&mut self) {
+        // A timer that already ran is out of the heap: nothing to look for.
+        let pending = !self.is_done();
         self.inner.cancel();
+        if pending {
+            if let Some(timer) = self.timer {
+                crate::timer::timer_cancel(timer);
+            }
+        }
     }
 }
 
@@ -137,7 +150,7 @@ pub fn ensure_timer_waker(
     cx: &Context<'_>,
 ) -> bool {
     ensure_timer_waker_with(slot, deadline, cx.waker(), |deadline, callback| {
-        crate::timer::timer_set(deadline, callback)
+        crate::timer::timer_set_cancellable(deadline, callback)
     })
 }
 
@@ -151,7 +164,7 @@ fn ensure_timer_waker_with(
     slot: &mut Option<TimerWakerSlot>,
     deadline: Duration,
     waker: &Waker,
-    arm: impl FnOnce(Duration, TimerCallback),
+    arm: impl FnOnce(Duration, TimerCallback) -> Option<crate::deadline::TimerId>,
 ) -> bool {
     if let Some(existing) = slot.as_ref() {
         if !existing.is_done() && existing.inner.deadline == deadline {
@@ -202,8 +215,8 @@ fn ensure_timer_waker_with(
     }) else {
         return false;
     };
-    arm(deadline, callback);
-    *slot = Some(TimerWakerSlot { inner });
+    let timer = arm(deadline, callback);
+    *slot = Some(TimerWakerSlot { inner, timer });
     true
 }
 
@@ -345,6 +358,7 @@ mod tests {
             ensure_timer_waker_with(slot, deadline, &waker_of(probe), |asked, callback| {
                 assert_eq!(asked, deadline, "armed for an instant nobody asked for");
                 armed = Some(callback);
+                None
             }),
             "arming the timer must not OOM in these tests"
         );
@@ -677,8 +691,9 @@ mod benches {
 
     /// A timer that keeps the callback instead of arming anything, so no
     /// wall clock can fire in the middle of a row.
-    fn hold(_deadline: Duration, callback: TimerCallback) {
+    fn hold(_deadline: Duration, callback: TimerCallback) -> Option<crate::deadline::TimerId> {
         core::mem::forget(callback);
+        None
     }
 
     /// The common case, and the one that matters: the slot is already armed

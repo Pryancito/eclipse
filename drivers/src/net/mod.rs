@@ -29,7 +29,7 @@ pub mod stack_card;
 /// module docs for what it does and does not do.
 pub mod xgbe;
 pub use isomorphic_drivers::provider::Provider;
-pub use loopback::{LoopbackDevice, LoopbackInterface};
+pub use loopback::{LoopbackDevice, LoopbackInterface, ShownLoopback};
 
 use crate::scheme::{IrqScheme, Scheme};
 use crate::DeviceResult;
