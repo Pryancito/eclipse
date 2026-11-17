@@ -47,9 +47,10 @@
 //! started with: every one the boot lends is borrowed at the start, and
 //! each has a stack of its own here, with its settings' address or a
 //! lease's, a thread for its frames and one for its time. The kernel
-//! still speaks to one stack and is told one card, the first that has an
-//! address, and what it says goes to the stack of the card it is for
-//! (`netstack::cards`).
+//! still speaks on one channel, which it is given with the first card
+//! that has an address; the others are said to it apart, each when it
+//! has one, and what the kernel says goes to the stack of the card it is
+//! for (`netstack::cards`).
 //!
 //! Three threads share the stack, under one lock. The card's sleeps on
 //! the card's interrupt (or on the driver's FIFO), takes what the card
@@ -601,10 +602,34 @@ fn hosts() -> &'static [Arc<Host>] {
 }
 
 impl Host {
-    /// Whether this host's card is the one the kernel shows: what it is
-    /// told of a card (its counts, its IPv6 addresses) is that card's.
+    /// Whether this host's card is the one the kernel was given its
+    /// sockets with: the stack's address, as far as it knows.
     fn shown(&self) -> bool {
         SHOWN.get() == Some(&self.slot)
+    }
+
+    /// The number the kernel knows this host's card by: 0 for the one it
+    /// was given its sockets with.
+    fn card(&self) -> u64 {
+        if self.shown() {
+            0
+        } else {
+            cards::number_of(self.slot)
+        }
+    }
+
+    /// Tell the kernel this host's card, which is not the one it was
+    /// given its sockets with: its address now, or that it has none.
+    fn say_card(&self) {
+        let Some(kernel) = self.kernel.get().filter(|_| !self.shown()) else {
+            return;
+        };
+        let told = *locked(&self.told);
+        let (address, gateway) =
+            told.map_or((None, None), |card| (Some(card.address), card.gateway));
+        let said = cards::card_message(self.card(), self.mac, address, gateway);
+        // A kernel that is gone took the machine with it.
+        let _ = kernel.channel.write(&said, &[]);
     }
 }
 
@@ -656,10 +681,12 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
     let Some(kernel) = host.kernel.get() else {
         return false;
     };
-    if host.shown() && core::mem::take(&mut shared.six_owed) {
+    if core::mem::take(&mut shared.six_owed) {
         // A message of its own, as rare as an address changes. A kernel
         // that is gone took the machine with it.
-        let _ = kernel.channel.write(&shared.stack.sixes().message(), &[]);
+        let mut said = shared.stack.sixes().message();
+        cards::of_card(&mut said, host.card());
+        let _ = kernel.channel.write(&said, &[]);
     }
     tell_counts(host, &shared.stack.device().counts(), at);
     let mut bytes = false;
@@ -688,7 +715,7 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
 /// (`netstack::counts`). A message of its own, a few times a second at
 /// most: it wakes the kernel's task and no program.
 fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
-    let Some(kernel) = host.kernel.get().filter(|_| host.shown()) else {
+    let Some(kernel) = host.kernel.get() else {
         return;
     };
     let told = {
@@ -697,7 +724,8 @@ fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
     };
     match told {
         // A kernel that is gone took the machine with it.
-        Ok(message) => {
+        Ok(mut message) => {
+            cards::of_card(&mut message, host.card());
             let _ = kernel.channel.write(&message, &[]);
         }
         // Too soon: the thread that keeps time may be asleep for longer
@@ -714,7 +742,7 @@ fn tell_counts(host: &Host, counts: &Counts, at: Instant) {
 /// How long until the kernel is to be told what the card has carried,
 /// when it has a kernel to tell and something to tell it.
 fn counts_due_in(host: &Host, counts: &Counts) -> Option<Duration> {
-    host.kernel.get().filter(|_| host.shown())?;
+    host.kernel.get()?;
     let due = locked(&host.teller).due_in(counts, now())?;
     Some(Duration::from_micros(due.total_micros()))
 }
@@ -1168,14 +1196,18 @@ fn serve_kernel(host: &Arc<Host>, address: Ipv4Cidr, gateway: Option<Ipv4Address
     }
     let telling = locked(&TELLING);
     if SHOWN.set(host.slot).is_err() {
-        // Another card is the one the kernel shows.
+        // Another card is the one the kernel has its sockets with: this
+        // one is said apart.
+        host.say_card();
         return;
     }
     let max_datagram = locked(&host.shared).stack.max_datagram();
     match register(max_datagram, card) {
         Ok(kernel) => {
-            for host in hosts() {
-                let _ = host.kernel.set(kernel.clone());
+            for other in hosts() {
+                let _ = other.kernel.set(kernel.clone());
+                // One that had its address first, and waited.
+                other.say_card();
             }
             drop(telling);
             std::thread::spawn(move || serve_sockets(kernel));
@@ -1216,7 +1248,15 @@ fn settle(host: &Arc<Host>, lease: Option<Lease>) {
             );
             name_servers(host, |named| named.lease = lease.dns);
         }
-        None => println!("{NAME}: card {index} lost its lease: no address until it has another"),
+        None => {
+            println!("{NAME}: card {index} lost its lease: no address until it has another");
+            // The kernel goes on showing the card it has its sockets
+            // with; another is taken off the machine's interfaces.
+            if !host.shown() {
+                *locked(&host.told) = None;
+                host.say_card();
+            }
+        }
     }
     publish(host);
 }
@@ -1248,23 +1288,49 @@ fn say_sixes(host: &Host, sixes: &Sixes) {
 /// and shows it at once if it is. What a router named before that is
 /// kept, and written with the lease's.
 fn name_servers(host: &Host, heard: impl FnOnce(&mut Named)) {
-    let mut named = locked(&host.named);
-    heard(&mut named);
-    let Some(card) = resolv::card_name(Path::new(resolv::SYS_NET), host.mac) else {
+    heard(&mut locked(&host.named));
+    // One writer at a time: the file is every card's.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = locked(&WRITING);
+    let name = |host: &Host| resolv::card_name(Path::new(resolv::SYS_NET), host.mac);
+    // The card the kernel has its sockets with says whether the
+    // machine's interfaces are this stack's.
+    let first = hosts().iter().find(|host| host.shown());
+    let Some(card) = first.map_or_else(|| name(host), |first| name(first)) else {
         return;
     };
+    // That card's servers first, then each other card's. One the kernel
+    // does not list yet has no name to write an address of its link by.
+    let mut servers: Vec<String> = Vec::new();
+    let others = hosts().iter().filter(|host| !host.shown());
+    for (host, card) in first
+        .map(|first| (first, Some(card)))
+        .into_iter()
+        .chain(others.map(|other| (other, name(other))))
+    {
+        let mut named = locked(&host.named).clone();
+        if card.is_none() {
+            named.routers.clear();
+        }
+        for server in named.written(card.as_deref().unwrap_or_default()) {
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    }
     let conf = resolv::RESOLV_CONF;
+    let named = locked(&host.named);
     let whose = match (named.lease.is_empty(), named.routers.is_empty()) {
         (false, true) => "the lease",
         (true, _) => "the router",
         (false, false) => "the lease and the router",
     };
-    let servers = || named.written(&card).join(", ");
-    match resolv::apply(&named, &card, Path::new(conf), Path::new(resolv::FIXED)) {
-        Ok(Applied::Written) => println!("{NAME}: {conf} names {}, by {whose}", servers()),
+    let said = || servers.join(", ");
+    match resolv::apply_lines(&servers, Path::new(conf), Path::new(resolv::FIXED)) {
+        Ok(Applied::Written) => println!("{NAME}: {conf} names {}, by {whose}", said()),
         Ok(Applied::Fixed) => println!(
             "{NAME}: {whose} names {}, and {conf} keeps the servers fixed by hand",
-            servers()
+            said()
         ),
         Ok(Applied::Unchanged | Applied::Nothing) => {}
         Err(e) => eprintln!("{NAME}: {conf}: {e}"),

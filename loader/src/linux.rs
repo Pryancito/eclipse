@@ -750,8 +750,14 @@ fn show_stack_card(
         return None;
     }
     let mut name = STACK_CARD_NAME.lock();
-    let called = name
-        .clone()
+    // The name the card had while the kernel drove it, when it is one
+    // the kernel lent: a stack with several shows each as it was.
+    let mac = (args[5] as u64).to_be_bytes();
+    let lent = linux_object::net::user_stack::cards::name_for([
+        mac[2], mac[3], mac[4], mac[5], mac[6], mac[7],
+    ]);
+    let called = lent
+        .or_else(|| name.clone())
         .unwrap_or_else(kernel_hal::drivers::net::next_eth_ifname);
     // The name is this card's from now on, shown or not.
     *name = Some(called.clone());

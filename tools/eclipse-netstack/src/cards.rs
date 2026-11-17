@@ -26,20 +26,34 @@
 //!   one stack's.
 //! * to the shown card's stack, a frame to put on the wire (`FRAME`).
 //!
-//! What this does not do: the kernel shows one interface, so a program
-//! sees one address (`getsockname`, `ifconfig`) though it is reached at
-//! each card's, the frames of every card are that interface's to a packet
-//! socket, and an IPv6 address of the link (`fe80::`) is taken to be on
-//! the shown card's link.
+//! The kernel is told the other cards too, each with a message of its
+//! own once it has an address and again when that changes, and shows
+//! each as an interface of the machine:
+//!
+//! ```text
+//! CARD  (stack to kernel)  8  u64 card  16  [u8; 6] MAC  22  u8 prefix  23  u8 zero
+//!                          24  [u8; 4] address  28  [u8; 4] gateway
+//! ```
+//!
+//! `card` is that card's number here ([`number_of`]), never 0, which is
+//! the card the kernel was given its sockets with; no address is a card
+//! that lost its own. What a card has carried (`COUNTS`) and what it has
+//! of IPv6 (`SIX`) say the same number where a socket's would be
+//! ([`of_card`]).
+//!
+//! What this does not do: the frames of every card are the first
+//! interface's to a packet socket, a frame such a socket sends leaves by
+//! the shown card, and an IPv6 address of the link (`fe80::`) is taken
+//! to be on the shown card's link.
 
 use smoltcp::phy::Device;
-use smoltcp::wire::{Ipv4Address, Ipv6Address};
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address};
 
 use crate::port::Listened;
 use crate::socks::icmp6::OP_ICMP6;
 use crate::socks::raw::OP_PACKET;
 use crate::socks::tcp::{OP_CONNECT, OP_CONNECT6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
-use crate::socks::{parse_header, Refused, Stack};
+use crate::socks::{parse_header, Refused, Stack, HEADER_LEN};
 use crate::socks::{OP_FRAME, OP_ICMP, OP_SEND, OP_SEND6};
 
 /// The most cards one process has stacks for: a bit each in what
@@ -50,6 +64,43 @@ pub const MAX: usize = 8;
 /// in place `slot` ([`Stack::number_from`]).
 pub fn numbers_of(slot: usize) -> u64 {
     (slot as u64) << 48
+}
+
+/// The operation of the message that says a card.
+pub const OP_CARD: u32 = 31;
+
+/// The number the kernel knows the card in place `slot` by, when it is
+/// not the one it was given its sockets with (which is 0).
+pub fn number_of(slot: usize) -> u64 {
+    slot as u64 + 1
+}
+
+/// `m`, a message about a card (`COUNTS`, `SIX`), as one about card
+/// `card`.
+pub fn of_card(m: &mut [u8], card: u64) {
+    m[8..HEADER_LEN].copy_from_slice(&card.to_le_bytes());
+}
+
+/// `CARD`: card `card` is `mac`, with this address and gateway, or with
+/// none.
+pub fn card_message(
+    card: u64,
+    mac: [u8; 6],
+    address: Option<Ipv4Cidr>,
+    gateway: Option<Ipv4Address>,
+) -> Vec<u8> {
+    let mut m = vec![0u8; HEADER_LEN];
+    m[4..8].copy_from_slice(&OP_CARD.to_le_bytes());
+    of_card(&mut m, card);
+    m.extend_from_slice(&mac);
+    m.extend_from_slice(&[address.map_or(0, |a| a.prefix_len()), 0]);
+    m.extend_from_slice(&address.map_or([0; 4], |a| a.address().0));
+    m.extend_from_slice(
+        &gateway
+            .filter(|_| address.is_some())
+            .map_or([0; 4], |g| g.0),
+    );
+    m
 }
 
 /// Whom a message is for.
@@ -199,6 +250,27 @@ mod tests {
 
     fn to(addr: [u8; 4]) -> Vec<u8> {
         send(7, Ipv4Address(addr), 9, b"x")
+    }
+
+    #[test]
+    fn a_card_is_said_as_the_kernel_reads_it() {
+        // The same bytes `linux-object/src/net/user_stack/cards.rs` reads.
+        let address = Ipv4Cidr::new(Ipv4Address([10, 0, 4, 15]), 24);
+        let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x57];
+        let m = card_message(2, mac, Some(address), Some(Ipv4Address([10, 0, 4, 2])));
+        assert_eq!(parse_header(&m), Some((OP_CARD, 2)));
+        assert_eq!(
+            m[HEADER_LEN..],
+            [0x52, 0x54, 0, 0x12, 0x34, 0x57, 24, 0, 10, 0, 4, 15, 10, 0, 4, 2]
+        );
+        // One that lost its address has no gateway either.
+        let m = card_message(2, mac, None, Some(Ipv4Address([10, 0, 4, 2])));
+        assert_eq!(m[HEADER_LEN + 6..], [0; 10]);
+        // The first card is 0, and no other is.
+        assert_eq!(number_of(0), 1);
+        let mut counts = crate::counts::Counts::default().message();
+        of_card(&mut counts, number_of(1));
+        assert_eq!(parse_header(&counts), Some((crate::counts::OP_COUNTS, 2)));
     }
 
     #[test]
