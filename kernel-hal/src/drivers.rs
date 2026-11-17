@@ -330,6 +330,29 @@ pub fn primary_irq() -> &'static (dyn IrqScheme + Send + Sync + 'static) {
 }
 
 /// Returns all devices which implement the [`NetScheme`].
+/// From here on `lo` is only shown: the interface of smoltcp that was
+/// there, if one was, is taken off the list and
+/// [`zcore_drivers::net::ShownLoopback`] put in its place with its
+/// addresses and counters, and a machine that had no `lo` gets one. For
+/// the boot where every socket is a served one, which has nothing for the
+/// kernel's stack to carry to 127.0.0.1. `true` when there was one to
+/// retire.
+pub fn show_loopback_only() -> bool {
+    use zcore_drivers::net::ShownLoopback;
+    let mut list = DEVICES.net.0.write();
+    match list.iter().position(|d| d.is_loopback()) {
+        Some(at) => {
+            let shown = ShownLoopback::after(list[at].as_ref());
+            list[at] = Arc::new(shown);
+            true
+        }
+        None => {
+            list.push(Arc::new(ShownLoopback::new()));
+            false
+        }
+    }
+}
+
 pub fn all_net() -> &'static DeviceList<dyn NetScheme> {
     &DEVICES.net
 }
@@ -1867,4 +1890,41 @@ pub fn disk_inflight() -> (Option<(u8, &'static str, u64)>, u64, u64) {
 pub fn disk_busy_over_last(secs: u64) -> (u64, u64) {
     use zcore_drivers::ata::ahci::inflight;
     inflight::busy_over_last(secs, inflight::now_us())
+}
+
+#[cfg(test)]
+mod shown_loopback_tests {
+    use super::*;
+
+    fn loopbacks() -> usize {
+        all_net()
+            .as_vec()
+            .iter()
+            .filter(|d| d.is_loopback())
+            .count()
+    }
+
+    /// A machine with no `lo` gets one, one that has it keeps one only,
+    /// and it stays behind every card.
+    #[test]
+    fn a_machine_is_left_with_one_lo_that_is_only_shown() {
+        let had = loopbacks();
+        assert_eq!(show_loopback_only(), had > 0);
+        assert_eq!(loopbacks(), had.max(1));
+        // Again: the one that is there is replaced, not added to.
+        assert!(show_loopback_only());
+        assert_eq!(loopbacks(), had.max(1));
+        let lo = {
+            let list = all_net().as_vec();
+            let last = list.last().expect("a lo").clone();
+            assert!(last.is_loopback(), "lo goes behind the cards");
+            last
+        };
+        assert_eq!(lo.ifname(), "lo");
+        assert!(lo.poll().is_ok());
+        // As it was for the tests next door.
+        if had == 0 {
+            assert!(DEVICES.remove_device(&Device::Net(lo)));
+        }
+    }
 }

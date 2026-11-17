@@ -264,6 +264,8 @@ impl Socket for RawSocketState {
                 return Err(LxError::EINVAL);
             };
             if dst.is_loopback() || is_local_host_ipv4(dst) {
+                super::count_on_lo(data.len(), super::LO_ICMP_HEADERS);
+                super::count_on_lo(data.len(), super::LO_ICMP_HEADERS);
                 super::icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), data.to_vec());
                 return Ok(data.len());
             }

@@ -159,6 +159,8 @@ impl StackLink {
     /// stack of a machine answers one: neither leaves it.
     fn icmp_here(&self, to: Ipv4Address, message: &[u8]) {
         let from = self.here_for(to);
+        // Neither the message nor its answer is a frame: `lo` counts them.
+        crate::net::count_on_lo(message.len(), crate::net::LO_ICMP_HEADERS);
         self.heard(from, &packet(from, to, HOPS_HERE, message));
         let echo = message.len() >= ECHO_HEADER && message[0] == ECHO_REQUEST && message[1] == 0;
         // One with a wrong checksum is dropped, as one off a card is.
@@ -166,6 +168,7 @@ impl StackLink {
             let mut answer = message.to_vec();
             answer[0] = ECHO_REPLY;
             seal(&mut answer);
+            crate::net::count_on_lo(answer.len(), crate::net::LO_ICMP_HEADERS);
             self.heard(to, &packet(to, from, HOPS_HERE, &answer));
         }
     }

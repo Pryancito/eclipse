@@ -593,6 +593,9 @@ impl StackLink {
                 Ok(())
             }
             Some(peer) => {
+                // What `lo` shows of it: one segment, with the headers it
+                // would have had.
+                crate::net::count_on_lo(data.len(), crate::net::LO_TCP_HEADERS);
                 self.event(peer, EV_BYTES, 0, data);
                 Ok(())
             }
@@ -2121,6 +2124,29 @@ mod tests {
         let closed = l.sock;
         drop(l);
         assert_eq!(stack.told(), Some(close_message(closed)));
+    }
+
+    /// What two joined sockets write is what `lo` shows: a packet for
+    /// each write, of what was written and the headers a segment has.
+    #[test]
+    fn what_joined_sockets_write_is_counted_on_lo() {
+        use zcore_drivers::net::loopback::local_counted;
+        let stack = stack();
+        let l = listener(&stack, any(8081));
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8081)), Ok(0));
+        let (s, _) = accepted(&l);
+
+        // The connection itself is no packet of data.
+        let (packets, bytes) = local_counted();
+        assert_eq!(Socket::write(&c, b"hola", None), Ok(4));
+        assert_eq!(Socket::write(&*s, b"que tal", None), Ok(7));
+        let (packets_now, bytes_now) = local_counted();
+        // At least: the counters are the machine's, and another test may
+        // be writing.
+        assert!(packets_now - packets >= 2);
+        assert!(bytes_now - bytes >= (4 + 7 + 2 * crate::net::LO_TCP_HEADERS) as u64);
+        drop((c, s, l));
     }
 
     #[test]

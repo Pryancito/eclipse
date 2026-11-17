@@ -265,6 +265,9 @@ impl Socket for IcmpSocketState {
             }
             if is_local_host_ipv6(dst) {
                 let icmp = Self::echo_request_bytes(&mut inner, data);
+                // The request and its answer, neither of which is a frame.
+                super::count_on_lo(icmp.len(), super::LO_ICMP6_HEADERS);
+                super::count_on_lo(icmp.len(), super::LO_ICMP6_HEADERS);
                 icmp_rx::queue_echo_reply(IpAddress::Ipv6(dst), icmp);
                 return Ok(data.len());
             }
@@ -280,6 +283,9 @@ impl Socket for IcmpSocketState {
             }
             if dst.is_loopback() || is_local_host_ipv4(dst) {
                 let icmp = Self::echo_request_bytes(&mut inner, data);
+                // The request and its answer, neither of which is a frame.
+                super::count_on_lo(icmp.len(), super::LO_ICMP_HEADERS);
+                super::count_on_lo(icmp.len(), super::LO_ICMP_HEADERS);
                 icmp_rx::queue_echo_reply(IpAddress::Ipv4(dst), icmp);
                 return Ok(data.len());
             }

@@ -2226,6 +2226,7 @@ impl StackLink {
         shared.is_some_and(|shared| {
             let anywhere = shared.inner.lock().here.is_none();
             shared.v6 && anywhere && {
+                crate::net::count_on_lo(data.len(), crate::net::LO_UDP6_HEADERS);
                 shared.deliver(from, data);
                 true
             }
@@ -2251,7 +2252,11 @@ impl StackLink {
             sock.and_then(|sock| table.socks.get(&sock))
                 .and_then(Weak::upgrade)
         };
-        shared.is_some_and(|shared| shared.deliver_here(to, from, data))
+        let taken = shared.is_some_and(|shared| shared.deliver_here(to, from, data));
+        if taken {
+            crate::net::count_on_lo(data.len(), crate::net::LO_UDP_HEADERS);
+        }
+        taken
     }
 }
 
