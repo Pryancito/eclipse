@@ -41,23 +41,23 @@ const ECHO_HEADER: usize = 8;
 const SUM_END: usize = 4;
 const SUM_AT: i32 = 2;
 /// The IPv6 header a message travels behind, and what it calls ICMPv6.
-const IP_HEADER: usize = 40;
+pub(super) const IP_HEADER: usize = 40;
 const ICMPV6: u8 = 58;
 /// The hop limit of what this machine says to itself.
-const HOPS_HERE: u8 = 64;
+pub(super) const HOPS_HERE: u8 = 64;
 /// As far as a message goes when the program has not said: a group's
 /// stays on the link.
 const HOPS: u8 = 64;
 const GROUP_HOPS: u8 = 1;
 
 /// The levels and options of `setsockopt` that are these sockets'.
-const IPPROTO_IP: usize = 0;
+pub(super) const IPPROTO_IP: usize = 0;
 pub(super) const IPPROTO_IPV6: usize = 41;
 const IPPROTO_ICMPV6: usize = 58;
-const SOL_RAW: usize = 255;
-const IPV6_CHECKSUM: usize = 7;
+pub(super) const SOL_RAW: usize = 255;
+pub(super) const IPV6_CHECKSUM: usize = 7;
 const IPV6_2292HOPLIMIT: usize = 8;
-const IPV6_UNICAST_HOPS: usize = 16;
+pub(super) const IPV6_UNICAST_HOPS: usize = 16;
 const IPV6_MULTICAST_HOPS: usize = 18;
 const IPV6_MULTICAST_LOOP: usize = 19;
 pub(super) const IPV6_JOIN_GROUP: usize = 20;
@@ -150,7 +150,7 @@ fn seal(from: Ipv6Address, to: Ipv6Address, message: &mut [u8]) {
 /// Where a program means when it says `addr`: nowhere is this machine
 /// (`ip6_datagram_connect`, `rawv6_sendmsg`). An IPv4 address written as
 /// IPv6 is nowhere ICMPv6 goes.
-fn destination(addr: IpAddress) -> LxResult<Ipv6Address> {
+pub(super) fn destination(addr: IpAddress) -> LxResult<Ipv6Address> {
     match addr {
         IpAddress::Unspecified => Ok(Ipv6Address::LOOPBACK),
         IpAddress::Ipv6(addr) if addr.is_unspecified() => Ok(Ipv6Address::LOOPBACK),
@@ -162,7 +162,7 @@ fn destination(addr: IpAddress) -> LxResult<Ipv6Address> {
 
 /// An `int` a program set an option to (`do_ipv6_setsockopt`: nothing
 /// shorter is one).
-fn int(data: &[u8]) -> LxResult<i32> {
+pub(super) fn int(data: &[u8]) -> LxResult<i32> {
     let bytes: [u8; 4] = data
         .get(..4)
         .and_then(|bytes| bytes.try_into().ok())
@@ -226,6 +226,33 @@ impl Opts {
         (opt == IPV6_MULTICAST_LOOP).then(|| flag(data).map(|on| self.no_loop = !on))
     }
 
+    /// `setsockopt` of whether `recvmsg` says how many hops what it
+    /// read had left (`IPV6_RECVHOPLIMIT`, `IPV6_2292HOPLIMIT`): `None`
+    /// for any other option.
+    pub(super) fn set_tell_hops(&mut self, opt: usize, data: &[u8]) -> Option<LxResult<()>> {
+        let kept = match opt {
+            IPV6_RECVHOPLIMIT => &mut self.tell_hops,
+            IPV6_2292HOPLIMIT => &mut self.tell_hops_2292,
+            _ => return None,
+        };
+        Some(flag(data).map(|on| *kept = on))
+    }
+
+    /// What `recvmsg` says beside what it last read, which had `hops`
+    /// left, to a program that asked, as each way of asking is answered
+    /// (`ip6_datagram_recv_specific_ctl`).
+    pub(super) fn cmsgs(&self, hops: u8) -> Vec<(i32, i32, i32)> {
+        let hops = i32::from(hops);
+        let mut said = Vec::new();
+        if self.tell_hops {
+            said.push((IPPROTO_IPV6 as i32, IPV6_HOPLIMIT as i32, hops));
+        }
+        if self.tell_hops_2292 {
+            said.push((IPPROTO_IPV6 as i32, IPV6_2292HOPLIMIT as i32, hops));
+        }
+        said
+    }
+
     /// Whether it is.
     pub(super) fn loops(&self) -> bool {
         !self.no_loop
@@ -245,7 +272,7 @@ impl Opts {
     }
 
     /// How many hops what goes to `to` may travel.
-    fn hops_to(&self, to: &Ipv6Address) -> u8 {
+    pub(super) fn hops_to(&self, to: &Ipv6Address) -> u8 {
         let unsaid = if to.is_multicast() { GROUP_HOPS } else { HOPS };
         self.hops_said(to).unwrap_or(unsaid)
     }
@@ -270,7 +297,7 @@ impl Opts {
 impl StackLink {
     /// Whether `addr` is this machine: `::1`, or an address of the
     /// card's.
-    fn is_here6(&self, addr: &Ipv6Address) -> bool {
+    pub(super) fn is_here6(&self, addr: &Ipv6Address) -> bool {
         addr.is_loopback() || self.sixes.has(addr)
     }
 
@@ -405,12 +432,9 @@ impl ServedIcmpSocket {
             (IPPROTO_IPV6, IPV6_JOIN_GROUP | IPV6_LEAVE_GROUP) => {
                 self.link.membership6(&self.shared, opt, data)
             }
-            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) => done(int(data).map(|on| {
-                self.six.lock().tell_hops = on != 0;
-            })),
-            (IPPROTO_IPV6, IPV6_2292HOPLIMIT) => done(int(data).map(|on| {
-                self.six.lock().tell_hops_2292 = on != 0;
-            })),
+            (IPPROTO_IPV6, IPV6_RECVHOPLIMIT | IPV6_2292HOPLIMIT) => {
+                done(self.six.lock().set_tell_hops(opt, data)?)
+            }
             // Where the sum is written, which a program may say when it
             // says where it is anyway. At this level only
             // (`do_rawv6_setsockopt`: at IPv6's it is `EINVAL` for a
@@ -455,19 +479,8 @@ impl ServedIcmpSocket {
     /// had left, to a program that asked, as each way of asking is
     /// answered (`ip6_datagram_recv_specific_ctl`).
     pub(super) fn recv_cmsgs6(&self) -> Vec<(i32, i32, i32)> {
-        let six = self.six.lock();
-        if !six.tell_hops && !six.tell_hops_2292 {
-            return Vec::new();
-        }
-        let hops = i32::from(self.shared.inner.lock().last_hops);
-        let mut said = Vec::new();
-        if six.tell_hops {
-            said.push((IPPROTO_IPV6 as i32, IPV6_HOPLIMIT as i32, hops));
-        }
-        if six.tell_hops_2292 {
-            said.push((IPPROTO_IPV6 as i32, IPV6_2292HOPLIMIT as i32, hops));
-        }
-        said
+        let hops = self.shared.inner.lock().last_hops;
+        self.six.lock().cmsgs(hops)
     }
 }
 

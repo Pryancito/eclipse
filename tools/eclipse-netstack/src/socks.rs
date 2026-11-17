@@ -61,7 +61,9 @@
 //! record like what is heard of ICMP.
 //!
 //! A socket that speaks ICMPv6 is told of the same way (`HEAR6`,
-//! `ICMP6`, in [`icmp6`]), and what it hears is a record of a `DATA6`.
+//! `ICMP6`, in [`icmp6`]), and what it hears is a record of a `DATA6`;
+//! so is what arrives for a raw socket of another protocol of IPv6
+//! (`RAW6`, `PACKET6`, in [`raw6`]).
 //!
 //! Heard or not, too, the stack reads the ICMP messages that say that
 //! something it sent was not delivered, and tells the kernel whose it
@@ -100,6 +102,7 @@ pub mod isn;
 pub mod lease;
 pub mod mld;
 pub mod raw;
+pub mod raw6;
 pub mod six;
 pub mod tcp;
 pub mod undelivered;
@@ -107,6 +110,7 @@ use groups::{OP_JOIN, OP_LEAVE};
 use icmp6::{OP_HEAR6, OP_ICMP6};
 use mld::{OP_JOIN6, OP_LEAVE6};
 use raw::{OP_PACKET, OP_RAW};
+use raw6::{OP_PACKET6, OP_RAW6};
 use tcp::{OP_CONNECT, OP_CONNECT6, OP_LISTEN, OP_LISTEN6, OP_LISTEN6ONLY};
 use tcp::{OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use undelivered::{Undelivered, Undelivered6, EV_UNDELIVERED, EV_UNDELIVERED6};
@@ -308,6 +312,8 @@ pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     hearing6: icmp6::Hearing6,
     /// The raw sockets of other protocols.
     raws: raw::Raws,
+    /// The raw sockets of IPv6 of other protocols than ICMPv6.
+    raws6: raw6::Raws6,
     /// The groups the machine is a member of, as the kernel said.
     groups: BTreeSet<Ipv4Address>,
     /// The same of IPv6, and what there is to say of them.
@@ -336,6 +342,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             six: six::Six::default(),
             hearing6: icmp6::Hearing6::default(),
             raws: raw::Raws::default(),
+            raws6: raw6::Raws6::default(),
             groups: BTreeSet::new(),
             mld: mld::Mld::default(),
             heard: VecDeque::new(),
@@ -379,6 +386,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             || self.hearing.contains_key(&sock)
             || self.hearing6.knows(sock)
             || self.raws.knows(sock)
+            || self.raws6.knows(sock)
             || self.streams.knows(sock)
     }
 
@@ -573,6 +581,8 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             OP_ICMP6 => self.icmp6(sock, m),
             OP_RAW => self.raw_open(sock, m),
             OP_PACKET => self.raw_packet(sock, m),
+            OP_RAW6 => self.raw6_open(sock, m),
+            OP_PACKET6 => self.raw6_packet(sock, m),
             OP_BIND => {
                 let said: [u8; 4] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
                 let port = u16::from_le_bytes([said[0], said[1]]);
@@ -655,7 +665,11 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                     self.set.remove(handle);
                     return Ok(false);
                 }
-                if self.deaf(sock) || self.deaf6(sock) || self.raw_close(sock) {
+                if self.deaf(sock)
+                    || self.deaf6(sock)
+                    || self.raw_close(sock)
+                    || self.raw6_close(sock)
+                {
                     return Ok(false);
                 }
                 Ok(self.close_stream(sock).unwrap_or(false))
@@ -697,6 +711,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         let _ = self.iface.poll(&mut self.set, now);
         self.lease_turn();
         self.six_turn();
+        self.raw6_turn();
         self.mld_turn();
     }
 
@@ -864,7 +879,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             // And what was heard of ICMPv6, in a `DATA6`.
             return self.heard6(m);
         }
-        if self.hearing6.waits() {
+        if self.hearing6.waits() || !self.raws6.heard.is_empty() {
             Arrived::More
         } else {
             Arrived::All

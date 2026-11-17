@@ -16,8 +16,8 @@
 //! and its sum is done again. The stack's header is twenty bytes and
 //! never a fragment, so options and the identification do not travel.
 //!
-//! Not here: the raw sockets of `AF_INET6`, a socket bound to one
-//! address hearing only what is for it, and a packet for this machine
+//! The same socket of `AF_INET6` is in [`super::raw6`]. Not here: a
+//! socket bound to one address hearing only what is for it, and a packet for this machine
 //! reaching anything but the raw sockets of its protocol.
 
 use super::*;
@@ -83,22 +83,35 @@ fn included(data: &[u8]) -> LxResult<Vec<u8>> {
 /// a process.
 pub struct ServedRawSocket {
     base: KObjectBase,
-    link: Arc<StackLink>,
-    sock: u64,
-    shared: Arc<Shared>,
-    protocol: u8,
+    pub(super) link: Arc<StackLink>,
+    pub(super) sock: u64,
+    /// `shared.v6` for a socket of `AF_INET6`.
+    pub(super) shared: Arc<Shared>,
+    pub(super) protocol: u8,
     /// `IP_HDRINCL`: the program writes the header.
     header_included: AtomicBool,
     /// The options a program sets and asks for again. `IP_TTL` is the
     /// one that changes what leaves.
     opts: Mutex<StoredInetOpts>,
+    /// And the ones of a socket of `AF_INET6`.
+    pub(super) six: Mutex<raw6::Opts>,
 }
 
 impl ServedRawSocket {
     /// A raw socket of `link` that speaks `protocol`.
     pub fn new(link: Arc<StackLink>, protocol: u8) -> LxResult<Self> {
         debug_assert_ne!(protocol, ICMP);
-        let shared = Shared::new(Hears::Packets(protocol), false);
+        Self::open(link, protocol, false)
+    }
+
+    /// The same of `AF_INET6`, where the protocol is not ICMPv6.
+    pub fn new6(link: Arc<StackLink>, protocol: u8) -> LxResult<Self> {
+        debug_assert_ne!(protocol, raw6::ICMPV6);
+        Self::open(link, protocol, true)
+    }
+
+    fn open(link: Arc<StackLink>, protocol: u8, six: bool) -> LxResult<Self> {
+        let shared = Shared::new(Hears::Packets(protocol), six);
         let sock = {
             let mut table = link.table.lock();
             table.next_sock += 1;
@@ -106,7 +119,7 @@ impl ServedRawSocket {
             table.socks.insert(sock, Arc::downgrade(&shared));
             sock
         };
-        link.hear(sock, shared.hears, false);
+        link.hear(sock, shared.hears, six);
         Ok(ServedRawSocket {
             base: KObjectBase::new(),
             link,
@@ -115,7 +128,12 @@ impl ServedRawSocket {
             protocol,
             header_included: AtomicBool::new(protocol == IPPROTO_RAW),
             opts: Mutex::new(StoredInetOpts::default()),
+            six: Mutex::new(raw6::Opts::default()),
         })
+    }
+
+    pub(super) fn is_six(&self) -> bool {
+        self.shared.v6
     }
 }
 
@@ -136,6 +154,9 @@ impl Socket for ServedRawSocket {
     }
 
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
+        if self.is_six() {
+            return self.write6(data, sendto_endpoint);
+        }
         // The length of an IPv4 packet is 16 bits, header and all.
         if data.len() > usize::from(u16::MAX) - IP_HEADER {
             return Err(LxError::EMSGSIZE);
@@ -204,6 +225,9 @@ impl Socket for ServedRawSocket {
     }
 
     async fn connect(&self, endpoint: Endpoint) -> SysResult {
+        if self.is_six() {
+            return self.connect6(endpoint);
+        }
         let Endpoint::Ip(peer) = endpoint else {
             return Err(LxError::EAFNOSUPPORT);
         };
@@ -214,6 +238,9 @@ impl Socket for ServedRawSocket {
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
+        if self.is_six() {
+            return self.bind6(endpoint);
+        }
         let Endpoint::Ip(local) = endpoint else {
             return Err(LxError::EINVAL);
         };
@@ -238,7 +265,7 @@ impl Socket for ServedRawSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let local = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0);
-        Some(Endpoint::Ip(local))
+        Some(Endpoint::Ip(shown(Takes::of(self.is_six(), false), local)))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -250,7 +277,7 @@ impl Socket for ServedRawSocket {
     }
 
     fn is_raw_ipv4(&self) -> bool {
-        true
+        !self.is_six()
     }
 
     fn ip_hdrincl(&self) -> bool {
@@ -258,7 +285,28 @@ impl Socket for ServedRawSocket {
     }
 
     fn so_domain(&self) -> Option<u32> {
-        Some(Domain::AF_INET as u32)
+        Some(if self.is_six() {
+            Domain::AF_INET6
+        } else {
+            Domain::AF_INET
+        } as u32)
+    }
+
+    fn getsockopt_own(&self, level: usize, opt: usize) -> Option<Vec<u8>> {
+        if self.is_six() {
+            self.getsockopt6(level, opt)
+        } else {
+            None
+        }
+    }
+
+    fn recv_cmsgs(&self) -> Vec<(i32, i32, i32)> {
+        if self.is_six() {
+            let hops = self.shared.inner.lock().last_hops;
+            self.six.lock().hops.cmsgs(hops)
+        } else {
+            Vec::new()
+        }
     }
 
     fn so_protocol(&self) -> Option<u32> {
@@ -276,6 +324,11 @@ impl Socket for ServedRawSocket {
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const IPPROTO_IP: usize = 0;
         const IP_HDRINCL: usize = 3;
+        if self.is_six() {
+            if let Some(done) = self.setsockopt6(level, opt, data) {
+                return done;
+            }
+        }
         if level == IPPROTO_IP && opt == IP_HDRINCL {
             check_setsockopt_len(level, opt, data)?;
             let on = data.iter().take(4).any(|b| *b != 0);

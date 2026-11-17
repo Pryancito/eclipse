@@ -9,8 +9,8 @@
 //! says goes:
 //!
 //! * to every stack, when it makes or ends a socket that waits for what
-//!   arrives: `BIND`, the `LISTEN`s, `HEAR`, `HEAR6`, `RAW`, the groups,
-//!   `TAP`, `CLOSE`. A datagram for a port is taken whichever card
+//!   arrives: `BIND`, the `LISTEN`s, `HEAR`, `HEAR6`, `RAW`, `RAW6`, the
+//!   groups, `TAP`, `CLOSE`. A datagram for a port is taken whichever card
 //!   brought it, and a connection is accepted on any.
 //! * to one stack, when it has somewhere to go (`SEND`, `CONNECT`,
 //!   `ICMP`, `PACKET` and the same of IPv6): the stack whose card is on
@@ -63,6 +63,7 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address};
 use crate::port::Listened;
 use crate::socks::icmp6::OP_ICMP6;
 use crate::socks::raw::OP_PACKET;
+use crate::socks::raw6::OP_PACKET6;
 use crate::socks::tcp::{OP_CONNECT, OP_CONNECT6, OP_SHUTDOWN, OP_WINDOW, OP_WRITE};
 use crate::socks::{parse_header, Refused, Stack, HEADER_LEN};
 use crate::socks::{OP_FRAME, OP_ICMP, OP_SEND, OP_SEND6};
@@ -194,7 +195,7 @@ pub fn whom(m: &[u8]) -> Whom {
         OP_CONNECT => to(four(16), true),
         // The destination of the header the packet starts with.
         OP_PACKET => to(four(32), false),
-        OP_SEND6 | OP_ICMP6 => to6(sixteen(16), false),
+        OP_SEND6 | OP_ICMP6 | OP_PACKET6 => to6(sixteen(16), false),
         OP_CONNECT6 => to6(sixteen(16), true),
         OP_WRITE | OP_SHUTDOWN | OP_WINDOW => Whom::Owner(sock),
         OP_FRAME => Whom::Card(sock),
@@ -393,6 +394,19 @@ mod tests {
                 once: false
             }
         );
+        // What a raw socket of IPv6 sends says where first, and the
+        // protocol it speaks is every stack's to hear.
+        let mut said = vec![0u8; 20];
+        said[..16].copy_from_slice(&Ipv6Address::LOOPBACK.0);
+        assert_eq!(
+            whom(&message(OP_PACKET6, 7, &said)),
+            Whom::To6 {
+                addr: Ipv6Address::LOOPBACK,
+                once: false
+            }
+        );
+        let raw6 = message(crate::socks::raw6::OP_RAW6, 7, &[89, 0, 0, 0]);
+        assert_eq!(whom(&raw6), Whom::All);
         // Too short to say where.
         assert_eq!(whom(&message(OP_SEND, 7, &[10, 0])), Whom::Shown);
         assert_eq!(whom(&[1, 2, 3]), Whom::Shown);

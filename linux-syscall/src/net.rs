@@ -216,6 +216,8 @@ fn mmsg_batch(vlen: usize) -> usize {
 /// which `getsockopt` leaves to the socket ([`Socket::getsockopt_own`]).
 const SOL_IPV6: usize = 41;
 const SOL_ICMPV6: usize = 58;
+/// And the one of a raw socket's own (`IPV6_CHECKSUM`).
+const SOL_RAW: usize = 255;
 
 /// What to do with the `msg_control` of a `sendmsg`: read `SCM_RIGHTS` out of
 /// it, ignore it, or refuse the call.
@@ -572,6 +574,23 @@ impl Syscall<'_> {
                     protocol,
                 )?)
             }
+            // And the same of IPv6, where the protocol is not ICMPv6: what
+            // the packets of its protocol carry, behind a header the
+            // stack writes.
+            (Domain::AF_INET6, SocketType::SOCK_RAW, _)
+                if self.linux_process().uses_user_netstack() =>
+            {
+                use linux_object::net::user_stack;
+                // `inet6_create`: a raw socket is of a protocol.
+                let protocol = match (protocol_num & 0xff) as u8 {
+                    0 => return Err(LxError::EPROTONOSUPPORT),
+                    protocol => protocol,
+                };
+                Arc::new(user_stack::ServedRawSocket::new6(
+                    user_stack::machine(),
+                    protocol,
+                )?)
+            }
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
@@ -744,9 +763,9 @@ impl Syscall<'_> {
             Ok(level) => level,
             Err(_) => {
                 // A level only sockets of some family have (IPv6's,
-                // ICMPv6's): the socket says what its option is, when it
+                // ICMPv6's, a raw socket's): the socket says what its option is, when it
                 // has it.
-                if matches!(level, SOL_IPV6 | SOL_ICMPV6) && !optval.is_null() {
+                if matches!(level, SOL_IPV6 | SOL_ICMPV6 | SOL_RAW) && !optval.is_null() {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let said = file_like.as_socket()?.getsockopt_own(level, optname);
                     if let Some(value) = said {
