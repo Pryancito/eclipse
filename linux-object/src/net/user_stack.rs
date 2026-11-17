@@ -633,9 +633,10 @@ pub fn parse_tap(m: &[u8]) -> Option<bool> {
     Some(m.get(HEADER_LEN)? != &0)
 }
 
-/// `FRAME`: this whole Ethernet frame on the wire, as it is.
-pub fn frame_message(frame: &[u8]) -> Vec<u8> {
-    let mut m = header(OP_FRAME, 0, frame.len());
+/// `FRAME`: this whole Ethernet frame on the wire of the stack's card
+/// `card` ([`cards`]), as it is.
+pub fn frame_message(card: u64, frame: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_FRAME, card, frame.len());
     m.extend_from_slice(frame);
     m
 }
@@ -1595,8 +1596,8 @@ pub fn use_for_all(on: bool) {
 /// that has the card, as a `FRAME`. This is what makes an `AF_PACKET`
 /// socket work on a boot where the card is the stack's.
 impl zcore_drivers::net::stack_card::Wire for StackLink {
-    fn put(&self, frame: &[u8]) -> bool {
-        self.put_frame(frame)
+    fn put(&self, card: u64, frame: &[u8]) -> bool {
+        self.put_frame(card, frame)
     }
 
     fn configure(&self, card: u64, change: zcore_drivers::net::stack_card::Change) -> bool {
@@ -1942,7 +1943,7 @@ impl StackLink {
                     m.len() - HEADER_LEN
                 ),
             },
-            Some((OP_FRAMES, _)) => self.take_frames(&m[HEADER_LEN..]),
+            Some((OP_FRAMES, card)) => self.take_frames(card, &m[HEADER_LEN..]),
             Some((OP_SIX, card)) => match parse_six(&m[HEADER_LEN..]) {
                 Some((router, addresses)) if card != 0 => self.take_six_of(card, router, addresses),
                 Some((router, addresses)) => self.sixes.say(addresses, router),
@@ -1958,12 +1959,14 @@ impl StackLink {
         }
     }
 
-    /// The frames the card received while the stack was told to say
-    /// them (`TAP`), each to whoever listens on this machine's
-    /// interface: an `AF_PACKET` socket, and nothing else. The kernel
+    /// The frames the stack's card `card` received while the stack was
+    /// told to say them (`TAP`), each to whoever listens on the interface
+    /// that shows that card, or on every one: an `AF_PACKET` socket, and
+    /// nothing else. The kernel
     /// does no network of its own on that card -- it is the stack's --
     /// so nothing here learns an address from these frames.
-    fn take_frames(&self, mut frames: &[u8]) {
+    fn take_frames(&self, card: u64, mut frames: &[u8]) {
+        let on = self.ifindex_of(card);
         while !frames.is_empty() {
             let Some((frame, rest)) = parse_frame(frames) else {
                 warn!(
@@ -1973,16 +1976,17 @@ impl StackLink {
                 return;
             };
             frames = rest;
-            crate::net::packet::deliver_tapped_frame(frame);
+            crate::net::packet::deliver_tapped_frame(frame, on);
         }
     }
 
-    /// `frame`, whole, for the stack to put on the wire. False when it
+    /// `frame`, whole, for the stack to put on the wire of its card
+    /// `card`. False when it
     /// did not go: no stack serves, or it has more unread than it
     /// should. This is how an `AF_PACKET` socket reaches the wire on a
     /// boot where the card is the stack's ([`crate::net::packet`]).
-    pub fn put_frame(&self, frame: &[u8]) -> bool {
-        frame.len() <= MAX_FRAME && self.tell(frame_message(frame), false).is_ok()
+    pub fn put_frame(&self, card: u64, frame: &[u8]) -> bool {
+        frame.len() <= MAX_FRAME && self.tell(frame_message(card, frame), false).is_ok()
     }
 
     /// Ask the stack for the frames its card receives, or ask it to stop.

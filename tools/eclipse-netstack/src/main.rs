@@ -102,7 +102,7 @@ use netstack::resolv::{self, Applied, Named};
 use netstack::socks::lease::{Addressing, Lease};
 use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
-use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_SEND};
+use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_FRAMES, OP_SEND};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
@@ -681,6 +681,11 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
         bytes |= shared.stack.brought_bytes();
         if arrived == Arrived::Nothing {
             return bytes;
+        }
+        // The frames a card heard are said as that card's: whoever
+        // listens on one interface hears only what arrived on it.
+        if parse_header(data).is_some_and(|(op, _)| op == OP_FRAMES) {
+            cards::of_card(data, host.card());
         }
         let sending = locked(&kernel.sending);
         if arrived == Arrived::All {

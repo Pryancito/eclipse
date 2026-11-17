@@ -1835,8 +1835,8 @@ fn the_frames_are_laid_out_as_the_stack_lays_them_out() {
         [0, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3]
     );
     assert_eq!(
-        frame_message(&[1, 2, 3]),
-        [0, 0, 0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]
+        frame_message(2, &[1, 2, 3]),
+        [0, 0, 0, 0, 27, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]
     );
     assert_eq!(
         tap_message(true),
@@ -1876,12 +1876,15 @@ fn a_frame_sent_on_the_card_goes_to_the_stack() {
     let _lock = LOCK.lock();
     let link = StackLink::new();
     let frame = [0x33u8, 0x33, 0, 1, 0, 2, 2, 0, 0, 0, 0, 7, 0x86, 0xdd, 1, 2];
-    assert!(!link.put_frame(&frame), "no stack, nowhere to put it");
+    assert!(!link.put_frame(0, &frame), "no stack, nowhere to put it");
     let stack = stack_of(&link);
-    assert!(link.put_frame(&frame));
-    assert_eq!(stack.told(), Some(frame_message(&frame)));
+    assert!(link.put_frame(0, &frame));
+    assert_eq!(stack.told(), Some(frame_message(0, &frame)));
+    // By the card it was sent on.
+    assert!(link.put_frame(1, &frame));
+    assert_eq!(stack.told(), Some(frame_message(1, &frame)));
     // Nothing without end is copied.
-    assert!(!link.put_frame(&[0u8; MAX_FRAME + 1]));
+    assert!(!link.put_frame(0, &[0u8; MAX_FRAME + 1]));
     assert_eq!(stack.told(), None);
 
     // And the stack is told when to say the frames it receives.

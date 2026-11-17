@@ -154,9 +154,10 @@ impl Sixes {
 /// whoever makes the card's to know (`linux-object`'s `user_stack`), and
 /// the card only asks.
 pub trait Wire: Send + Sync {
-    /// `frame`, whole, for the card to carry. False when it did not go:
-    /// there is no stack just now, or it has more unread than it should.
-    fn put(&self, frame: &[u8]) -> bool;
+    /// `frame`, whole, for the stack's card `card` to carry. False when
+    /// it did not go: there is no stack just now, or it has more unread
+    /// than it should.
+    fn put(&self, card: u64, frame: &[u8]) -> bool;
 
     /// Ask the stack for `change` on its card `card`. False when it was
     /// not asked: there is no stack just now, or the change is one no
@@ -312,7 +313,7 @@ impl NetScheme for StackCard {
     /// now (no stack serving, or more unread than it should have).
     fn send(&self, buf: &[u8]) -> DeviceResult<usize> {
         let wire = self.wire.as_ref().ok_or(DeviceError::NotSupported)?;
-        if wire.put(buf) {
+        if wire.put(self.card, buf) {
             Ok(buf.len())
         } else {
             Err(DeviceError::NotReady)
@@ -463,7 +464,7 @@ mod tests {
     /// A wire that keeps what was sent on it, and answers `takes`.
     struct Kept {
         takes: bool,
-        sent: Mutex<Vec<Vec<u8>>>,
+        sent: Mutex<Vec<(u64, Vec<u8>)>>,
     }
 
     /// A wire that keeps what was asked of the stack.
@@ -471,7 +472,7 @@ mod tests {
     struct Asked(Mutex<Vec<(u64, Change)>>);
 
     impl Wire for Asked {
-        fn put(&self, _frame: &[u8]) -> bool {
+        fn put(&self, _card: u64, _frame: &[u8]) -> bool {
             false
         }
 
@@ -546,11 +547,11 @@ mod tests {
     }
 
     impl Wire for Kept {
-        fn put(&self, frame: &[u8]) -> bool {
+        fn put(&self, card: u64, frame: &[u8]) -> bool {
             if !self.takes {
                 return false;
             }
-            self.sent.lock().push(frame.to_vec());
+            self.sent.lock().push((card, frame.to_vec()));
             true
         }
     }
@@ -566,7 +567,13 @@ mod tests {
         assert!(c.can_send());
         let frame = [0x33u8, 0x33, 0, 1, 0, 2, 2, 0, 0, 0, 0, 7, 0x86, 0xdd, 1, 2];
         assert_eq!(c.send(&frame), Ok(frame.len()));
-        assert_eq!(wire.sent.lock().as_slice(), &[frame.to_vec()]);
+        // By the card it was sent on, which the stack knows by its number.
+        let other = card(None).numbered(3).through(wire.clone());
+        assert_eq!(other.send(&frame[..14]), Ok(14));
+        assert_eq!(
+            wire.sent.lock().as_slice(),
+            &[(0, frame.to_vec()), (3, frame[..14].to_vec())]
+        );
     }
 
     /// A stack that will not take it now is `NotReady` -- try again --

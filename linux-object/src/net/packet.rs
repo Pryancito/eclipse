@@ -159,7 +159,7 @@ pub fn push_packet(packet: &[u8]) {
     crate::net::ndp_cache::learn_from_frame(packet);
     crate::net::icmp_rx::deliver_from_frame(packet);
     crate::net::ra::process_from_frame(packet);
-    deliver_tapped_frame(packet);
+    deliver_tapped_frame(packet, 0);
 }
 
 /// One frame the card of a stack that runs as a process received, for
@@ -171,7 +171,11 @@ pub fn push_packet(packet: &[u8]) {
 /// nothing on it and answers nothing on it, so unlike [`push_packet`]
 /// this teaches the caches nothing and takes no router's word. It is
 /// only what a program that listens on the interface hears.
-pub fn deliver_tapped_frame(packet: &[u8]) {
+///
+/// `on` is the interface the frame arrived on, as Linux numbers them, or
+/// 0 where nobody can say: a socket bound to another interface does not
+/// hear it, and one bound to none hears every card's.
+pub fn deliver_tapped_frame(packet: &[u8], on: u32) {
     let mut sockets = PACKET_SOCKETS.lock();
     if !sockets.iter().any(|w| w.strong_count() > 0) {
         purge_dead_sockets(&mut sockets);
@@ -183,6 +187,10 @@ pub fn deliver_tapped_frame(packet: &[u8]) {
 
     for (i, weak) in sockets.iter().enumerate() {
         if let Some(inner) = weak.upgrade() {
+            let bound = *inner.ifindex.lock();
+            if on != 0 && bound != 0 && bound != on {
+                continue;
+            }
             let protocol = *inner.protocol.lock();
             if let Some(et) = ethertype {
                 if protocol != 0 && protocol != 0x0003 && protocol != et {
@@ -768,6 +776,34 @@ mod tests {
         let (n, _) = Socket::read(&*s, &mut buf).await;
         assert_eq!(n, Ok(8));
         assert_eq!(&buf[..8], &[0x60, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A frame said to have arrived on one interface is heard by the
+    /// sockets bound to it and by the ones bound to none, and not by one
+    /// bound to another: a DHCP client on `eth1` does not take the offer
+    /// made on `eth0`.
+    #[test]
+    fn a_frame_is_heard_on_the_interface_it_arrived_on() {
+        let _lock = crate::net::NET_TEST_LOCK.lock();
+        // A protocol nothing else in these tests listens for.
+        const PROTOCOL: u16 = 0x88b5;
+        let socket = |bound: u32| {
+            let s = PacketSocketState::new(SocketType::SOCK_RAW, PROTOCOL).unwrap();
+            *s.inner.ifindex.lock() = bound;
+            s
+        };
+        let (any, second, third) = (socket(0), socket(2), socket(3));
+        let heard = |s: &Arc<PacketSocketState>| s.inner.packet_queue.lock().len();
+        let mut frame = alloc::vec![0u8; 60];
+        frame[12..14].copy_from_slice(&PROTOCOL.to_be_bytes());
+
+        deliver_tapped_frame(&frame, 2);
+        assert_eq!((heard(&any), heard(&second), heard(&third)), (1, 1, 0));
+        deliver_tapped_frame(&frame, 3);
+        assert_eq!((heard(&any), heard(&second), heard(&third)), (2, 1, 1));
+        // Where nobody can say which, it is everyone's, as before.
+        deliver_tapped_frame(&frame, 0);
+        assert_eq!((heard(&any), heard(&second), heard(&third)), (3, 2, 2));
     }
 
     /// A card that refuses frames: it answers `refusal` to every send and

@@ -16,7 +16,10 @@
 //! serves with. No address (all zero) is a card that has none yet, or
 //! lost its own; no gateway is all zero. What a card has carried
 //! (`COUNTS`) and what it has of IPv6 (`SIX`) are said with the same
-//! number where a socket's would be.
+//! number where a socket's would be. So are the frames it heard
+//! (`FRAMES`), which only who listens on its interface or on every one
+//! hears, and a frame for it to carry (`FRAME`, kernel to stack) says
+//! the card it was sent on the same way.
 //!
 //! What the kernel does with it: on a boot where every program's sockets
 //! are the stack's, each card is an interface of the machine, with its
@@ -49,7 +52,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use kernel_hal::drivers::net::stack_card::{Carried, Change, Sixes, StackCard};
 use kernel_hal::drivers::prelude::Device;
-use kernel_hal::drivers::scheme::NetStats;
+use kernel_hal::drivers::scheme::{NetScheme, NetStats};
 use kernel_hal::sync::Mutex;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 
@@ -397,6 +400,25 @@ impl StackLink {
         for kept in self.others.kept.lock().values() {
             kept.sixes.forget();
         }
+    }
+
+    /// The interface that shows `card`, as Linux numbers them: 0 when
+    /// none does, which is a frame for whoever listens on every one.
+    pub(super) fn ifindex_of(&self, card: u64) -> u32 {
+        let shown = self
+            .others
+            .now
+            .lock()
+            .get(&card)
+            .and_then(|other| other.shown.clone());
+        let Some(shown) = shown else {
+            return 0;
+        };
+        let name = shown.get_ifname();
+        let at = crate::net::get_net_device()
+            .iter()
+            .position(|interface| interface.get_ifname() == name);
+        at.map_or(0, |at| at as u32 + 1)
     }
 
     /// Whether `addr` is the address of a card that is not the first.
