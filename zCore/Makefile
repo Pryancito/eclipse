@@ -538,9 +538,8 @@ endif
 # (`tools/eclipse-netstack`), which is the card's driver too and asks a
 # DHCP server for its address; `unetstack=ADDR/PREFIX[,GATEWAY]` in KOPTS
 # gives it one. With `NIC=none` that card is the machine's only one and
-# every program's sockets are that stack's; with a card of the kernel's
-# as well, the programs started by `eclipse-netstack-use` have it, or
-# every program with `unetuse=all`.
+# every program's sockets are that stack's; a card of the kernel's as
+# well is lent to it too.
 #
 # Without UNET that stack has the first card the kernel drives itself (the
 # e1000e of an x86_64 run): the kernel goes on driving it and lends it, its
