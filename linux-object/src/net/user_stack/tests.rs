@@ -1930,3 +1930,29 @@ fn the_frames_the_stack_says_reach_a_packet_socket() {
     let (n, _) = async_std::task::block_on(Socket::read(&*socket, &mut buf));
     assert_eq!(n, Err(LxError::EAGAIN), "and nothing that is not its own");
 }
+
+/// `getsockname` after `connect`: the address the datagrams leave by,
+/// which is how a program asks what the machine is called on the way to
+/// somewhere.
+#[test]
+fn a_connected_socket_says_the_address_it_speaks_from() {
+    let _g = LOCK.lock();
+    let stack = stack();
+    let s = stack.socket();
+    let local = |s: &ServedUdpSocket| ip(s.endpoint().unwrap()).addr;
+    assert_eq!(local(&s), IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
+    let peer = Endpoint::Ip(at(HOST, 1025));
+    assert_eq!(async_std::task::block_on(Socket::connect(&s, peer)), Ok(0));
+    assert_eq!(local(&s), IpAddress::Ipv4(Ipv4Address(STACK_ADDR)));
+    // To this machine, from the address it was called by.
+    let here = stack.socket();
+    let peer = Endpoint::Ip(at([127, 0, 0, 1], 1025));
+    assert_eq!(
+        async_std::task::block_on(Socket::connect(&here, peer)),
+        Ok(0)
+    );
+    assert_eq!(
+        local(&here),
+        IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
+    );
+}

@@ -164,6 +164,8 @@ pub enum LxError {
     EADDRINUSE = 98,
     /// Cannot assign requested address
     EADDRNOTAVAIL = 99,
+    /// Destination address required
+    EDESTADDRREQ = 89,
     /// Message too long
     EMSGSIZE = 90,
     /// Required key not available -- an encrypted file or directory whose
@@ -253,6 +255,7 @@ impl fmt::Display for LxError {
             EINPROGRESS => "Operation in progress",
             EADDRINUSE => "Address already in use",
             EADDRNOTAVAIL => "Cannot assign requested address",
+            EDESTADDRREQ => "Destination address required",
             EMSGSIZE => "Message too long",
             EALREADY => "Operation already in progress",
             ENOKEY => "Required key not available",
@@ -400,7 +403,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 74] = [
+    const EVERY_ERRNO: [(LxError, isize); 75] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -453,6 +456,7 @@ mod errno_tests {
         (LxError::EBADFD, 77),
         (LxError::ELIBBAD, 80),
         (LxError::ENOTSOCK, 88),
+        (LxError::EDESTADDRREQ, 89),
         (LxError::EMSGSIZE, 90),
         (LxError::ENOPROTOOPT, 92),
         (LxError::EPROTONOSUPPORT, 93),
@@ -545,6 +549,7 @@ mod errno_tests {
                 | LxError::EBADFD
                 | LxError::ELIBBAD
                 | LxError::ENOTSOCK
+                | LxError::EDESTADDRREQ
                 | LxError::EMSGSIZE
                 | LxError::ENOPROTOOPT
                 | LxError::EPROTONOSUPPORT
@@ -572,7 +577,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            74,
+            75,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }

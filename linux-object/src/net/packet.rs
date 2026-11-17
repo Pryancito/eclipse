@@ -430,6 +430,12 @@ impl Socket for PacketSocketState {
             if non_block {
                 return (Err(LxError::EAGAIN), endpoint);
             }
+            // A signal ends the wait (`EINTR`), as it does on every other
+            // socket: `arping` counts its seconds with `SIGALRM` while it
+            // waits here, and never left when nobody answered.
+            if let Err(e) = crate::process::check_signals() {
+                return (Err(e), endpoint);
+            }
 
             // Drain deferred jobs (IRQ -> iface.poll -> push_packet) and then sleep a short
             // interval. On real hardware the NIC IRQ enqueues a deferred_job; draining here
@@ -535,10 +541,22 @@ impl Socket for PacketSocketState {
         }
     }
 
+    /// `packet_getname`: the interface the socket is bound to, with its
+    /// protocol and its hardware address. It used to say the index and
+    /// nothing else, and `arping`, which asks the socket what its
+    /// interface's address is, answered "interface eth0 is not ARPable
+    /// (no ll address)" and sent nothing.
     fn endpoint(&self) -> Option<Endpoint> {
-        Some(Endpoint::LinkLevel(LinkLevelEndpoint::new(
-            *self.inner.ifindex.lock() as usize,
-        )))
+        let ifindex = *self.inner.ifindex.lock();
+        let mut ll = LinkLevelEndpoint::new(ifindex as usize);
+        ll.protocol = *self.inner.protocol.lock();
+        if let Ok(dev) = crate::net::iface_by_linux_ifindex(ifindex) {
+            if !dev.is_loopback() {
+                ll.addr[..6].copy_from_slice(dev.get_mac().as_bytes());
+                ll.halen = 6;
+            }
+        }
+        Some(Endpoint::LinkLevel(ll))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {

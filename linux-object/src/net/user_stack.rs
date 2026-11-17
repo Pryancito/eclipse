@@ -105,6 +105,26 @@
 //! has (`IP_TTL`). An echo to this machine is answered here, and never
 //! reaches the stack.
 //!
+//! # Raw sockets
+//!
+//! A raw socket of IPv4 of any other protocol is served as well
+//! ([`ServedRawSocket`], in `raw`): what a program opens to speak a
+//! protocol of its own, or to write whole packets (`IP_HDRINCL`,
+//! `IPPROTO_RAW`):
+//!
+//! ```text
+//! RAW     (kernel to stack)  16  u8 protocol  17  three zero
+//! PACKET  (kernel to stack)  16  the IPv4 packet, whole
+//! ```
+//!
+//! From its `RAW` to its `CLOSE` every IPv4 packet of the socket's
+//! protocol the card brings goes to the kernel as what is heard of ICMP
+//! does -- a record for socket 0 -- and the kernel gives each raw socket
+//! the packets of its protocol. The stack still does with them what it
+//! did. A `PACKET` leaves as it is, but from the card's address when it
+//! is from nowhere and with its sum done again; the header is the
+//! kernel's, or the program's when it writes its own.
+//!
 //! # What was not delivered
 //!
 //! A router that has no way on, or a host with nobody at the port, says
@@ -316,11 +336,13 @@ mod groups;
 mod groups6;
 mod icmp;
 mod icmp6;
+mod raw;
 mod tcp;
 pub use groups::{join_message, leave_message, Membership, MEMBERSHIPS_MAX, OP_JOIN, OP_LEAVE};
 pub use groups6::{join6_message, leave6_message, Membership6, MEMBERSHIPS6_MAX};
 pub use groups6::{OP_JOIN6, OP_LEAVE6};
 pub use icmp::ServedIcmpSocket;
+pub use raw::ServedRawSocket;
 pub use tcp::ServedTcpSocket;
 
 /// The operations of a message.
@@ -341,6 +363,8 @@ pub const OP_SIX: u32 = 16;
 pub const OP_TAP: u32 = 26;
 pub const OP_FRAME: u32 = 27;
 pub const OP_FRAMES: u32 = 28;
+pub const OP_RAW: u32 = 29;
+pub const OP_PACKET: u32 = 30;
 pub const OP_SEND6: u32 = 17;
 pub const OP_DATA6: u32 = 18;
 pub const OP_CONNECT6: u32 = 19;
@@ -468,6 +492,22 @@ pub fn icmp_message(sock: u64, addr: [u8; 4], hop_limit: u8, message: &[u8]) -> 
     m.extend_from_slice(&addr);
     m.extend_from_slice(&[hop_limit, 0, 0, 0]);
     m.extend_from_slice(message);
+    m
+}
+
+/// `RAW`: socket `sock` speaks `protocol` of IPv4 from now on, whole
+/// packets: a raw socket that is not one of ICMP.
+pub fn raw_message(sock: u64, protocol: u8) -> Vec<u8> {
+    let mut m = header(OP_RAW, sock, 4);
+    m.extend_from_slice(&[protocol, 0, 0, 0]);
+    m
+}
+
+/// `PACKET`: the IPv4 packet `packet`, header and all, from socket
+/// `sock`.
+pub fn packet_message(sock: u64, packet: &[u8]) -> Vec<u8> {
+    let mut m = header(OP_PACKET, sock, packet.len());
+    m.extend_from_slice(packet);
     m
 }
 
@@ -929,6 +969,21 @@ enum Hears {
     /// The answers to the echoes it sent, which carry its `port` as
     /// their identifier, without the IP header: a socket that pings.
     Echoes,
+    /// Every IPv4 packet of this protocol, which is not ICMP, whole: a
+    /// raw socket of it ([`raw`]).
+    Packets(u8),
+}
+
+impl Hears {
+    /// What tells the stack that socket `sock`, of IPv6 when `six`,
+    /// hears this. A socket of datagrams is told of by its port.
+    fn said(self, sock: u64, six: bool) -> Vec<u8> {
+        match self {
+            Hears::Packets(protocol) => raw_message(sock, protocol),
+            _ if six => hear6_message(sock),
+            _ => hear_message(sock),
+        }
+    }
 }
 
 struct Inner {
@@ -1058,8 +1113,17 @@ impl Shared {
         let from = IpEndpoint::new(IpAddress::Ipv4(from), 0);
         match self.hears {
             Hears::Datagrams => {}
+            // What is heard for the raw sockets of other protocols comes
+            // the same way: each takes the packets of its own.
             Hears::Icmp => {
-                self.deliver(from, packet);
+                if raw::protocol_of(packet) == Some(raw::ICMP) {
+                    self.deliver(from, packet);
+                }
+            }
+            Hears::Packets(protocol) => {
+                if raw::protocol_of(packet) == Some(protocol) {
+                    self.deliver(from, packet);
+                }
             }
             Hears::Echoes => {
                 let Some(message) = icmp::message_of(packet) else {
@@ -1088,7 +1152,7 @@ impl Shared {
         let wanted = {
             let inner = self.inner.lock();
             match self.hears {
-                Hears::Datagrams => false,
+                Hears::Datagrams | Hears::Packets(_) => false,
                 Hears::Icmp => inner.blocked[usize::from(kind >> 3)] & (1 << (kind & 7)) == 0,
                 Hears::Echoes => {
                     icmp6::echo_reply_ident(message).is_some_and(|i| Some(i) == inner.port)
@@ -1733,22 +1797,17 @@ impl StackLink {
                     Some((sock, port, stream))
                 })
                 .collect();
-            let hearing: Vec<(u64, bool)> = table
+            let hearing: Vec<Vec<u8>> = table
                 .hearing
                 .iter()
                 .filter_map(|sock| {
                     let shared = table.socks.get(sock).and_then(Weak::upgrade)?;
-                    Some((*sock, shared.v6))
+                    Some(shared.hears.said(*sock, shared.v6))
                 })
                 .collect();
             (bound, listening, hearing)
         };
-        for (sock, six) in hearing {
-            let said = if six {
-                hear6_message(sock)
-            } else {
-                hear_message(sock)
-            };
+        for said in hearing {
             let _ = self.tell(said, true);
         }
         for (sock, port, shared) in bound {
@@ -2135,17 +2194,13 @@ impl StackLink {
         }
     }
 
-    /// A socket that speaks ICMP is there, or ICMPv6 when `six`: the
-    /// stack is told to hear for it, and the next stack when it comes.
-    fn hear(&self, sock: u64, six: bool) {
+    /// A socket that speaks ICMP is there, or ICMPv6 when `six`, or a
+    /// raw one of another protocol: the stack is told to hear for it,
+    /// and the next stack when it comes.
+    fn hear(&self, sock: u64, hears: Hears, six: bool) {
         let _telling = self.telling.lock();
         self.table.lock().hearing.insert(sock);
-        let said = if six {
-            hear6_message(sock)
-        } else {
-            hear_message(sock)
-        };
-        let _ = self.tell(said, true);
+        let _ = self.tell(hears.said(sock, six), true);
     }
 
     /// A socket that speaks ICMP is gone: its number is free, and its
@@ -2638,8 +2693,18 @@ impl Socket for ServedUdpSocket {
 
     fn endpoint(&self) -> Option<Endpoint> {
         let inner = self.shared.inner.lock();
+        // A connected socket speaks from the address its datagrams leave
+        // by (`ip4_datagram_connect`), and says so: it is how a program
+        // asks which address of the machine reaches somewhere. `arping`
+        // asked, was told 0.0.0.0, and asked the wire who has an address
+        // on behalf of nobody.
+        let from = inner.here.or_else(|| match inner.remote?.addr {
+            IpAddress::Ipv4(to) if self.link.is_here(to) => Some(self.link.here_for(to)),
+            IpAddress::Ipv4(_) => Some(self.link.address()),
+            _ => None,
+        });
         let local = IpEndpoint::new(
-            IpAddress::Ipv4(inner.here.unwrap_or(Ipv4Address::UNSPECIFIED)),
+            IpAddress::Ipv4(from.unwrap_or(Ipv4Address::UNSPECIFIED)),
             inner.port.unwrap_or(0),
         );
         Some(Endpoint::Ip(shown(self.shared.takes(), local)))
