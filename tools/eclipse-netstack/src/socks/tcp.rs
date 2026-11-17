@@ -265,6 +265,13 @@ fn u32_at(m: &[u8], at: usize) -> u32 {
 }
 
 impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
+    /// Number the connections that arrive from `base` on, and not from
+    /// 0: of several stacks that listen for the same kernel
+    /// ([`crate::cards`]), each has numbers of its own.
+    pub fn number_from(&mut self, base: u64) {
+        self.streams.accepted = base & !ACCEPTED_BIT;
+    }
+
     /// `CONNECT`. A connect that cannot be started is answered `FAILED`
     /// by the next turn, which is why this asks for one.
     pub(super) fn connect(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {

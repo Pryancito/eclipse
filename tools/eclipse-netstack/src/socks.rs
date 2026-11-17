@@ -515,7 +515,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// from, or there is a gateway to send it through. A datagram
     /// smoltcp cannot place stays at the head of its socket's queue with
     /// every later one behind it, so one that cannot go is not queued.
-    fn reaches(&self, addr: Ipv4Address) -> bool {
+    pub fn reaches(&self, addr: Ipv4Address) -> bool {
         addr.is_broadcast()
             || (addr.is_multicast() && self.address().is_some())
             || self.iface.ip_addrs().iter().any(|cidr| match cidr {
@@ -525,6 +525,22 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 _ => false,
             })
             || (self.gateway.is_some() && addr.is_unicast() && !addr.is_loopback())
+    }
+
+    /// Whether `addr` is on the card's own network: reached with no
+    /// gateway between. Of several cards ([`crate::cards`]), the one a
+    /// packet for it leaves by.
+    pub fn on_link(&self, addr: Ipv4Address) -> bool {
+        self.iface.ip_addrs().iter().any(|cidr| match cidr {
+            IpCidr::Ipv4(cidr) => !cidr.address().is_unspecified() && cidr.contains_addr(&addr),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        })
+    }
+
+    /// Whether `sock` is a connection or a listener here.
+    pub fn has_stream(&self, sock: u64) -> bool {
+        self.streams.knows(sock)
     }
 
     /// Do what a message from the kernel says. `Ok(true)` when that left
@@ -868,12 +884,12 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::port::testing::*;
     use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, UdpPacket};
 
-    pub(super) fn message(op: u32, sock: u64, rest: &[u8]) -> Vec<u8> {
+    pub(crate) fn message(op: u32, sock: u64, rest: &[u8]) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(&0u32.to_le_bytes());
         m.extend_from_slice(&op.to_le_bytes());
@@ -883,7 +899,7 @@ mod tests {
     }
 
     /// A `BIND` of a socket that is for both versions of IP.
-    pub(super) fn bind(sock: u64, port: u16) -> Vec<u8> {
+    pub(crate) fn bind(sock: u64, port: u16) -> Vec<u8> {
         bind_only(sock, port, 0)
     }
 
@@ -894,7 +910,7 @@ mod tests {
     }
 
     /// A `SEND` as a kernel that says no hop limit writes it.
-    pub(super) fn send(sock: u64, to: Ipv4Address, port: u16, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn send(sock: u64, to: Ipv4Address, port: u16, data: &[u8]) -> Vec<u8> {
         send_hops(sock, to, port, 0, data)
     }
 
@@ -1972,7 +1988,13 @@ mod tests {
         assert_eq!(stack.request(&raw_open(5, 17)), Ok(false));
         assert_eq!(stack.raws(), 1);
         let nowhere = Ipv4Address::UNSPECIFIED;
-        let packet = made(nowhere, THEIR_IP, 17, 7, b"\x9c\x40\x1b\x58\x00\x0c\x00\x00data");
+        let packet = made(
+            nowhere,
+            THEIR_IP,
+            17,
+            7,
+            b"\x9c\x40\x1b\x58\x00\x0c\x00\x00data",
+        );
         assert_eq!(stack.request(&message(OP_PACKET, 5, &packet)), Ok(true));
         // And one of another protocol, which Linux lets the same socket
         // send when it writes the header.

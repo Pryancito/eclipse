@@ -468,11 +468,25 @@ NIC ?= e1000e
 
 # `NIC=none`: no such card at all, for a machine whose only network card is
 # the one a userspace driver takes (`UNET=1`).
-ifneq ($(NIC), none)
+#
+# `NIC_NET=none`: the card is there with nothing plugged into it, as a port
+# with no cable.
+ifeq ($(NIC_NET), none)
+  qemu_opts += -device $(NIC)
+else ifneq ($(NIC), none)
   qemu_opts += \
 	-netdev user,id=net1 \
 	-device $(NIC),netdev=net1 \
 	-object filter-dump,id=f0,netdev=net1,file=/tmp/eclipse.pcap
+endif
+
+# `NIC2=<model>`: a second card, of that model, on a user-mode network of
+# its own (10.0.4.0/24): a machine with two ports. The kernel lends the
+# stack process every card it drives, and that stack is the machine's
+# network by whichever has an address (`tools/eclipse-netstack`, `cards`).
+NIC2_NET ?= user,net=10.0.4.0/24
+ifneq ($(NIC2),)
+  qemu_opts += -netdev $(NIC2_NET),id=net2 -device $(NIC2),netdev=net2
 endif
 qemu_opts += -no-reboot
 
@@ -481,7 +495,9 @@ qemu_opts += -no-reboot
 # reduce bulk-download throughput by an order of magnitude.
 ifeq ($(PCAP), on)
   ifneq ($(NIC), none)
-    qemu_opts += -object filter-dump,id=f1,netdev=net1,file=dump.pcap
+    ifneq ($(NIC_NET), none)
+      qemu_opts += -object filter-dump,id=f1,netdev=net1,file=dump.pcap
+    endif
   endif
 endif
 

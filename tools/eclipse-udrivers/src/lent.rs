@@ -44,6 +44,33 @@ impl Lent {
     /// Borrow the kernel's card `index` (the loopback is not counted),
     /// over a window of this many slots.
     pub fn borrow(index: usize, rx_slots: usize, tx_slots: usize) -> Result<Lent, NoCard> {
+        Self::try_borrow(index, rx_slots, tx_slots).map_err(|e| match e {
+            Status::NO_GATEWAY => NoCard::NoGateway,
+            Status::NOT_FOUND => NoCard::Other(format!("the kernel drives no card {index}")),
+            Status::NOT_SUPPORTED => NoCard::Other(format!(
+                "the driver of the kernel's card {index} cannot lend it"
+            )),
+            Status::ALREADY_BOUND => {
+                NoCard::Other(format!("the kernel's card {index} is lent already"))
+            }
+            Status::ACCESS_DENIED => {
+                NoCard::Other(format!("this boot does not lend the kernel's card {index}"))
+            }
+            Status::NO_MEMORY => NoCard::Other(format!(
+                "mmap: {}",
+                std::io::Error::from_raw_os_error(libc::ENOMEM)
+            )),
+            e => NoCard::Other(format!("net_borrow: {e}")),
+        })
+    }
+
+    /// [`borrow`](Self::borrow), answering with what the kernel said when
+    /// it lends no such card: `NOT_FOUND` when it drives no card `index`
+    /// (and none after it), `ACCESS_DENIED`, `NOT_SUPPORTED` or
+    /// `ALREADY_BOUND` when that one is not to be had and the next may
+    /// be. A card that is borrowed leaves the kernel's count: the one
+    /// after it is card `index` from then on.
+    pub fn try_borrow(index: usize, rx_slots: usize, tx_slots: usize) -> Result<Lent, Status> {
         let len = (rx_slots + tx_slots) * BUF_SIZE;
         // SAFETY: a fresh anonymous mapping.
         let window = unsafe {
@@ -57,10 +84,7 @@ impl Lent {
             )
         };
         if window == libc::MAP_FAILED {
-            return Err(NoCard::Other(format!(
-                "mmap: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(Status::NO_MEMORY);
         }
         // Every page there before the kernel writes a frame to it.
         // SAFETY: `len` bytes just mapped.
@@ -85,17 +109,7 @@ impl Lent {
         if let Err(e) = r {
             // SAFETY: the mapping made above, which nothing else has seen.
             unsafe { libc::munmap(window, len) };
-            return Err(match e {
-                Status::NO_GATEWAY => NoCard::NoGateway,
-                Status::NOT_FOUND => NoCard::Other(format!("the kernel drives no card {index}")),
-                Status::NOT_SUPPORTED => NoCard::Other(format!(
-                    "the driver of the kernel's card {index} cannot lend it"
-                )),
-                Status::ALREADY_BOUND => {
-                    NoCard::Other(format!("the kernel's card {index} is lent already"))
-                }
-                e => NoCard::Other(format!("net_borrow: {e}")),
-            });
+            return Err(e);
         }
         Ok(Lent {
             handle: out[0] as Handle,

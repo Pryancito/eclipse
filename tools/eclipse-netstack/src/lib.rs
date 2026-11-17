@@ -41,12 +41,16 @@
 //! the ones that listen or have a port, and only the connections it was
 //! carrying are lost.
 //!
+//! A machine with several cards has a stack for each in the one process,
+//! and [`cards`] says which of them a message of the kernel's is for.
+//!
 //! [`port`] is the stack's side of a served card and [`socks`] the sockets
 //! over it: all of this that can be tested without a card or a kernel.
 //! `scripts/udp_ping.py` and `scripts/tcp_bench.py` measure it against the
 //! kernel's stack from the host, and `eclipse-tcp-bench` from a program of
 //! the guest, which is how what never reaches the card is timed.
 
+pub mod cards;
 pub mod counts;
 pub mod governed;
 pub mod port;

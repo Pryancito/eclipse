@@ -165,15 +165,12 @@ impl Socket for ServedRawSocket {
         // Where the header says, which is where it goes.
         let to = Ipv4Address::from_bytes(&packet[16..20]);
         let here = self.link.is_here(to);
-        if packet[12..16] == [0; 4] {
+        if here && packet[12..16] == [0; 4] {
             // From nowhere is from this machine: to itself from the
-            // address it was called by, to anybody else from the card's,
-            // which the stack writes if it has changed since.
-            let from = if here {
-                self.link.here_for(to)
-            } else {
-                self.link.address()
-            };
+            // address it was called by. To anybody else it is from the
+            // card it leaves by, which is the stack's to say: it may have
+            // several, and writes the address there.
+            let from = self.link.here_for(to);
             packet[12..16].copy_from_slice(&from.0);
         }
         seal(&mut packet);
@@ -519,10 +516,11 @@ mod tests {
         assert_eq!(sent.len(), IP_HEADER + 8);
         assert_eq!(sent[..2], [0x45, 0]);
         assert_eq!(sent[2..4], 28u16.to_be_bytes());
-        // Nine hops, of UDP, from the stack's address to the host.
+        // Nine hops, of UDP, to the host, from nowhere: the stack
+        // writes the address of the card it leaves by.
         assert_eq!(sent[8..10], [9, UDP]);
         assert_eq!(icmp::checksum(&sent[..IP_HEADER]), 0);
-        assert_eq!((&sent[12..16], &sent[16..20]), (&STACK_ADDR[..], &HOST[..]));
+        assert_eq!((&sent[12..16], &sent[16..20]), (&[0u8; 4][..], &HOST[..]));
         assert_eq!(&sent[IP_HEADER..], b"12345678");
         // Connected, a write needs no address; the longest is what one
         // frame carries, and the stack does not cut a packet.
@@ -567,7 +565,7 @@ mod tests {
         assert_eq!(sent[4..6], [0x12, 0x34]);
         assert_eq!(sent[8..10], [7, UDP]);
         assert_eq!(icmp::checksum(&sent[..IP_HEADER]), 0);
-        assert_eq!((&sent[12..16], &sent[16..20]), (&STACK_ADDR[..], &HOST[..]));
+        assert_eq!((&sent[12..16], &sent[16..20]), (&[0u8; 4][..], &HOST[..]));
         assert_eq!(&sent[IP_HEADER..], b"12345678");
         // What is no header is refused, and nothing is said.
         assert_eq!(Socket::write(&s, &[], to(HOST)), Err(LxError::EINVAL));
