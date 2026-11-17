@@ -171,6 +171,9 @@ pub enum Whom {
     To { addr: Ipv4Address, once: bool },
     /// The same, of IPv6.
     To6 { addr: Ipv6Address, once: bool },
+    /// The stack of the card with this number ([`number_of`]): a frame
+    /// goes out by the card it was sent on.
+    Card(u64),
     /// The stack of the card the kernel shows.
     Shown,
 }
@@ -194,7 +197,7 @@ pub fn whom(m: &[u8]) -> Whom {
         OP_SEND6 | OP_ICMP6 => to6(sixteen(16), false),
         OP_CONNECT6 => to6(sixteen(16), true),
         OP_WRITE | OP_SHUTDOWN | OP_WINDOW => Whom::Owner(sock),
-        OP_FRAME => Whom::Shown,
+        OP_FRAME => Whom::Card(sock),
         _ => Whom::All,
     }
 }
@@ -237,6 +240,10 @@ where
     match whom(m) {
         Whom::All => all(),
         Whom::Shown => only,
+        // A card this process does not have is the shown one's to refuse.
+        Whom::Card(card) => (0..stacks.len())
+            .find(|&slot| number_of(slot) == card)
+            .map_or(only, |slot| 1u32 << slot),
         Whom::Owner(sock) => each(&|stack| stack.has_stream(sock)),
         Whom::To { addr, once } if !once && (addr.is_broadcast() || addr.is_multicast()) => {
             each(&|stack| stack.reaches(addr))
@@ -367,7 +374,8 @@ mod tests {
             assert_eq!(whom(&message(op, 7, &[])), Whom::All);
         }
         assert_eq!(whom(&message(OP_WRITE, 7, b"abc")), Whom::Owner(7));
-        assert_eq!(whom(&message(OP_FRAME, 0, &[0; 60])), Whom::Shown);
+        assert_eq!(whom(&message(OP_FRAME, 0, &[0; 60])), Whom::Card(0));
+        assert_eq!(whom(&message(OP_FRAME, 1, &[0; 60])), Whom::Card(1));
         assert_eq!(
             whom(&to([10, 0, 9, 1])),
             Whom::To {
@@ -410,6 +418,11 @@ mod tests {
         assert_eq!(places(&stacks, 1, &connect), 0b10);
         // What makes a socket, both.
         assert_eq!(places(&stacks, 0, &bind(7, 4000)), 0b11);
+        // A frame, by the card it was sent on, wherever it is for; one
+        // sent on a card there is not is the shown one's to refuse.
+        assert_eq!(places(&stacks, 0, &message(OP_FRAME, 0, &[0xff; 60])), 0b01);
+        assert_eq!(places(&stacks, 0, &message(OP_FRAME, 1, &[0xff; 60])), 0b10);
+        assert_eq!(places(&stacks, 0, &message(OP_FRAME, 5, &[0xff; 60])), 0b01);
     }
 
     #[test]
