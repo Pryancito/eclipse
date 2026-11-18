@@ -510,10 +510,12 @@ ifeq ($(DISK), on)
   qemu_opts += -drive format=qcow2,id=userdisk,if=none,file=$(qemu_disk)
 endif
 
-# UDISK=<raw image>: one more virtio disk, for a driver in userspace. Boot
-# with `udriver=virtio-blk@N` in KOPTS to have the kernel leave it alone, N
-# being its place among the virtio disks (on aarch64 the root disk is the
-# first, so this one is 1; riscv64 boots from the initrd, so it is 0).
+# UDISK=<raw image>: one more virtio disk, for a driver in userspace. The
+# kernel leaves every virtio disk to that driver unasked (`ublk=kernel` in
+# KOPTS keeps them), but the one it boots from on a machine with no initrd:
+# on aarch64 the root disk is the first, so this one is 1; riscv64 and
+# x86_64 boot from an initrd, so it is 0 there. `udriver=virtio-blk@N`
+# names one disk, and then the kernel keeps the others.
 # `tools/zx-device-claim` checks that a process can take it.
 ifneq ($(UDISK),)
   qemu_opts += -drive file=$(UDISK),if=none,format=raw,id=udisk

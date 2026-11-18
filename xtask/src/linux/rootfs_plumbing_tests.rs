@@ -684,7 +684,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "fat-mounts",
             "oneshot",
             "/usr/local/bin/eclipse-fat-mounts",
-            "ublk",
+            "ublk ublk2 ublk3 ublk4",
         ),
         (
             "gtk-caches",
@@ -741,8 +741,11 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "ublk-mounts",
             "oneshot",
             "/usr/local/bin/eclipse-ublk-mounts",
-            "ublk",
+            "ublk ublk2 ublk3 ublk4",
         ),
+        ("ublk2", "respawn", "/usr/local/bin/eclipse-ublk 2", ""),
+        ("ublk3", "respawn", "/usr/local/bin/eclipse-ublk 3", ""),
+        ("ublk4", "respawn", "/usr/local/bin/eclipse-ublk 4", ""),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         (
             "xkbmap",
@@ -969,7 +972,16 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         .collect();
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["enet", "knet", "ublk", "ublk-mounts", "unet"],
+        [
+            "enet",
+            "knet",
+            "ublk",
+            "ublk-mounts",
+            "ublk2",
+            "ublk3",
+            "ublk4",
+            "unet"
+        ],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
     for (name, body) in &gated {
@@ -998,10 +1010,23 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     let gated = &gated[1..];
     // The mounts: on the boots the disk's driver runs on, after its start.
     assert_eq!(field(&gated[1].1, "udriver"), field(&gated[0].1, "udriver"));
-    assert_eq!(field(&gated[1].1, "after"), Some("ublk"));
+    assert_eq!(field(&gated[1].1, "after"), Some("ublk ublk2 ublk3 ublk4"));
+    // A service for each further disk, the Nth of the kernel's list.
+    for (n, (name, body)) in gated[2..5].iter().enumerate() {
+        let nth = n + 2;
+        assert_eq!(name, &format!("ublk{nth}"));
+        assert_eq!(
+            field(body, "udriver"),
+            Some(format!("virtio-blk/{nth}").as_str())
+        );
+        assert_eq!(
+            field(body, "exec"),
+            Some(format!("/usr/local/bin/eclipse-ublk {nth}").as_str())
+        );
+    }
     let wrapper = |name: &str| fs::read_to_string(rootfs.join("usr/local/bin").join(name)).unwrap();
     // The card: the first one, by number.
-    assert_eq!(field(&gated[2].1, "udriver"), Some("virtio-net@0"));
+    assert_eq!(field(&gated[5].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
         unet.contains("exec /bin/eclipse-netstack 0"),
@@ -1019,7 +1044,8 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert_eq!(field(&gated[0].1, "udriver"), Some("virtio-blk"));
     let ublk = wrapper("eclipse-ublk");
     assert!(
-        ublk.contains("/proc/cmdline")
+        ublk.contains("/proc/udrivers")
+            && ublk.contains("/proc/cmdline")
             && ublk.contains("s/^virtio-blk@//p")
             && ublk.contains("exec /bin/udrv-virtio-blk \"$n\""),
         "the wrapper no longer runs the driver of the disk the kernel left:\n{ublk}"
@@ -1051,37 +1077,76 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert_eq!(field(&network, "after"), Some("unet knet enet"));
 }
 
-/// What the disk's wrapper makes of a kernel command line: the number of
-/// the first virtio disk in `udriver=`, wherever in the line and the list
-/// it is. The pipeline is the wrapper's own, run here on a line from a file.
+/// Which disk the disk's wrapper drives: the Nth virtio disk of the
+/// kernel's list, `/proc/udrivers` (N its argument, 1 without one), or of
+/// `udriver=` on the command line when the kernel has no list. The lines
+/// are the wrapper's own, run here on files of this test's.
 #[test]
-fn the_disk_wrapper_reads_its_number_off_the_command_line() {
+fn the_disk_wrapper_reads_its_number_off_the_kernels_list() {
     let rootfs = init_rootfs("ublk-number");
     let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-ublk")).unwrap();
-    let line = wrapper
+    let from = wrapper
         .lines()
-        .find(|l| l.starts_with("n=$("))
+        .position(|l| l.starts_with("nth="))
+        .expect("no `nth=` line in the wrapper");
+    let to = wrapper
+        .lines()
+        .position(|l| l.starts_with("n=$("))
         .expect("no `n=$(...)` line in the wrapper");
+    let lines: Vec<&str> = wrapper.lines().collect();
+    let pick = lines[from..=to].join("\n");
     let dir = scratch("ublk-number-run");
-    let number = |cmdline: &str| {
-        let file = dir.join("cmdline");
-        fs::write(&file, format!("{cmdline}\n")).unwrap();
+    let number = |list: Option<&str>, cmdline: &str, nth: &str| {
+        let cmdfile = dir.join("cmdline");
+        fs::write(&cmdfile, format!("{cmdline}\n")).unwrap();
+        let listfile = dir.join("udrivers");
+        let _ = fs::remove_file(&listfile);
+        if let Some(list) = list {
+            fs::write(&listfile, list).unwrap();
+        }
         let script = format!(
             "{}\nprintf %s \"$n\"",
-            line.replace("/proc/cmdline", &format!("'{}'", file.display()))
+            pick.replace("/proc/cmdline", &format!("'{}'", cmdfile.display()))
+                .replace("/proc/udrivers", &format!("'{}'", listfile.display()))
         );
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
+            .arg("sh")
+            .args((!nth.is_empty()).then_some(nth))
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(number("LOG=warn:udriver=virtio-blk@1:desktop=labwc"), "1");
-    assert_eq!(number("LOG=warn:udriver=virtio-net@0,virtio-blk@2"), "2");
-    assert_eq!(number("LOG=warn udriver=virtio-blk@0,virtio-blk@3"), "0");
-    assert_eq!(number("LOG=warn:udriver=virtio-net@0"), "");
-    assert_eq!(number("LOG=warn:noudriver=virtio-blk@4"), "");
+    // The kernel's list: what it left, named or not.
+    let left = "virtio-blk@1\nvirtio-net@0\nvirtio-blk@2\n";
+    assert_eq!(number(Some(left), "LOG=warn", ""), "1");
+    assert_eq!(number(Some(left), "LOG=warn", "1"), "1");
+    assert_eq!(number(Some(left), "LOG=warn", "2"), "2");
+    assert_eq!(number(Some(left), "LOG=warn", "3"), "");
+    assert_eq!(
+        number(Some("virtio-net@0\n"), "udriver=virtio-blk@1", ""),
+        ""
+    );
+    // No list: the command line.
+    assert_eq!(
+        number(None, "LOG=warn:udriver=virtio-blk@1:desktop=labwc", ""),
+        "1"
+    );
+    assert_eq!(
+        number(None, "LOG=warn:udriver=virtio-net@0,virtio-blk@2", ""),
+        "2"
+    );
+    assert_eq!(
+        number(None, "LOG=warn udriver=virtio-blk@0,virtio-blk@3", ""),
+        "0"
+    );
+    assert_eq!(
+        number(None, "LOG=warn udriver=virtio-blk@0,virtio-blk@3", "2"),
+        "3"
+    );
+    assert_eq!(number(None, "LOG=warn:udriver=virtio-net@0", ""), "");
+    assert_eq!(number(None, "LOG=warn:noudriver=virtio-blk@4", ""), "");
 }
 
 /// The first card left to userspace goes to the network stack that runs as
@@ -1742,6 +1807,9 @@ fn the_two_sessions_never_start_each_others_clients() {
         "knet",
         "enet",
         "ublk",
+        "ublk2",
+        "ublk3",
+        "ublk4",
         "ublk-mounts",
         "fat-mounts",
     ];

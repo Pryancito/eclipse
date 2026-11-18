@@ -18,6 +18,11 @@
 //! none for, so the first of them is left to userspace without a word
 //! ([`wanted`]): there it is the card of the network stack that runs as a
 //! process, where otherwise it would be nobody's.
+//!
+//! The virtio disks go to userspace unasked as well, when the boot names
+//! none ([`leave_virtio_disks`]): every one but the disk the kernel boots
+//! from, on a machine with no initrd, which is the first. `ublk=kernel`
+//! keeps them all for the kernel's own driver.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -243,6 +248,48 @@ pub fn keep_first_e1000e() {
     E1000E_UNASKED.store(false, Ordering::Release);
 }
 
+/// Whether the virtio disks are left to userspace without the boot naming
+/// them: see [`leave_virtio_disks`].
+static DISKS_UNASKED: AtomicBool = AtomicBool::new(false);
+/// Whether the first virtio disk is the kernel's all the same: the disk it
+/// boots from.
+static KEEP_FIRST_DISK: AtomicBool = AtomicBool::new(false);
+
+/// Whether a boot whose `udriver=` value is `spec` leaves its virtio disks
+/// to userspace unasked: it does unless it names a disk itself, and then
+/// that one is what it means and the kernel drives the others, as it did
+/// before disks were left by default.
+pub fn disks_unasked(spec: Option<&str>) -> bool {
+    !parse_specs(spec.unwrap_or(""))
+        .iter()
+        .any(|(kind, _)| *kind == VIRTIO_BLK)
+}
+
+/// Leave every virtio disk to the driver in userspace, as the first
+/// virtio network card is left, unless the boot names a disk
+/// ([`disks_unasked`]). With `boot_disk` the first of them stays the
+/// kernel's: a machine that has no initrd boots from its first disk, and
+/// the root is mounted before any driver in userspace can run. Before the
+/// buses are probed.
+pub fn leave_virtio_disks(spec: Option<&str>, boot_disk: bool) {
+    if !disks_unasked(spec) {
+        return;
+    }
+    if boot_disk {
+        info!("udriver: every virtio disk but the first, the boot's, is for userspace");
+    } else {
+        info!("udriver: every virtio disk is for userspace");
+    }
+    KEEP_FIRST_DISK.store(boot_disk, Ordering::Release);
+    DISKS_UNASKED.store(true, Ordering::Release);
+}
+
+/// Whether virtio disk `index` is left to userspace unasked.
+fn disk_unasked(index: usize) -> bool {
+    DISKS_UNASKED.load(Ordering::Acquire)
+        && !(index == 0 && KEEP_FIRST_DISK.load(Ordering::Acquire))
+}
+
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N` or
 /// `e1000e@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
@@ -341,7 +388,8 @@ pub fn reserve_if(
     };
     let index = SEEN[slot].fetch_add(1, Ordering::AcqRel);
     let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
-        || (kind == E1000E && index == 0 && first_e1000e_unasked());
+        || (kind == E1000E && index == 0 && first_e1000e_unasked())
+        || (kind == VIRTIO_BLK && disk_unasked(index));
     if !wanted {
         return false;
     }
@@ -410,6 +458,15 @@ mod tests {
         assert!(!e1000e_unasked(Some("virtio-net@0")));
         assert!(!e1000e_unasked(Some("virtio-blk@1,e1000e@1")));
         assert!(!e1000e_unasked(Some("e1000e@0")));
+    }
+
+    #[test]
+    fn the_virtio_disks_go_unasked_unless_the_boot_names_one() {
+        assert!(disks_unasked(None));
+        assert!(disks_unasked(Some("")));
+        assert!(disks_unasked(Some("virtio-net@0,e1000e@0")));
+        assert!(!disks_unasked(Some("virtio-blk@1")));
+        assert!(!disks_unasked(Some("virtio-net@0,virtio-blk@0")));
     }
 
     #[test]
