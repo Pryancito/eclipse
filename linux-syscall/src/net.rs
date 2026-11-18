@@ -1090,8 +1090,6 @@ impl Syscall<'_> {
         let written = self
             .send_all(&file_like, buf.as_slice(len)?, endpoint, mode)
             .await?;
-        // Do not drain_net_poll here — busybox ping uses sendto; 32× poll_ifaces
-        // blocks for a long time (smoltcp + SOCKETS lock). Sockets drive RX in read/poll.
         Ok(written)
     }
 

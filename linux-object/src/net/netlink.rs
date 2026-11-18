@@ -543,7 +543,6 @@ impl Socket for NetlinkSocketState {
                                                     e
                                                 );
                                             }
-                                            crate::net::prepare_ipv4_stack();
                                         }
                                         log::debug!(
                                             "[netlink] NewAddr {} on {} ifindex={}",
@@ -627,9 +626,6 @@ impl Socket for NetlinkSocketState {
                                 log::warn!("[netlink] NewRoute: neither RTA_OIF nor RTA_GATEWAY");
                                 errno::EINVAL
                             };
-                            if errno == 0 && matches!(dst_cidr, IpCidr::Ipv4(_)) {
-                                crate::net::prepare_ipv4_stack();
-                            }
                             errno
                         }
                     };

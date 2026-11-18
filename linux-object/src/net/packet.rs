@@ -82,9 +82,6 @@ const MAX_FRAME_COPY: usize = 1518;
 
 /// Bytes of L2 header (14, or 18 with 802.1Q) and EtherType.
 ///
-/// What `arp_cache`, which `push_packet` feeds, reads a frame by. It used
-/// to be open-coded there without the 802.1Q clause, so on a VLAN-tagged
-/// link it learned nothing.
 pub(crate) fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
     if frame.len() < 14 {
         return None;
@@ -140,22 +137,12 @@ fn frame_arc(packet: &[u8]) -> Option<PacketFrame> {
     Some(Arc::from(buf.into_boxed_slice()))
 }
 
-fn drive_packet_rx(net: &(dyn NetScheme + Send + Sync)) {
-    // Same order as v0.5.0: copy the ring into AF_PACKET, then poll smoltcp
-    // for whatever is left (TCP/UDP). `io_wait_tick` already polled smoltcp
-    // once this wakeup, so TCP still wins the race for in-flight segments;
-    // this leftover drain is what lets udhcpc see DHCP that smoltcp skipped.
-    crate::net::netdev_drain_rx(net);
-    let _ = net.poll();
-}
-
 /// Dispatches a received packet to all registered AF_PACKET sockets.
 ///
 /// Do not call `intr_on()`/`intr_off()` here: `lock::Mutex` already uses
 /// `push_off`/`pop_off` on a per-CPU `RefCell`. Re-enabling IRQs while a
 /// mutex guard is held breaks that nesting and panics with "RefCell already borrowed".
 pub fn push_packet(packet: &[u8]) {
-    crate::net::arp_cache::learn_from_frame(packet);
     deliver_tapped_frame(packet, 0);
 }
 
@@ -360,30 +347,9 @@ impl Socket for PacketSocketState {
         let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
 
         loop {
-            // Always drain deferred jobs and poll the NIC on every iteration.
-            // On real hardware the packet queue may contain network noise (ARP probes,
-            // mDNS, etc.) that keeps it non-empty, which would prevent net.poll()
-            // from ever running and leave DHCPACK stuck in the hardware RX ring.
+            // What an interrupt left to be done puts frames on the queue:
+            // it is done before the queue is looked at.
             kernel_hal::deferred_job::drain_deferred_jobs();
-
-            let ifindex = *self.inner.ifindex.lock();
-            {
-                let poll_net = |net: &(dyn NetScheme + Send + Sync)| {
-                    drive_packet_rx(net);
-                    drive_packet_rx(net);
-                };
-                if ifindex > 0 {
-                    if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
-                        poll_net(net.as_ref());
-                    }
-                } else {
-                    for net in get_net_device().iter() {
-                        if !net.is_loopback() {
-                            poll_net(net.as_ref());
-                        }
-                    }
-                }
-            }
 
             let pkt = self.inner.packet_queue.lock().pop_front();
             if let Some(internal_buf) = pkt {
@@ -499,8 +465,6 @@ impl Socket for PacketSocketState {
             return Err(LxError::EINVAL);
         }
 
-        // Do not call full poll_ifaces() here — edhcpc blocks inside send() while
-        // waiting for DHCPOFFER; a heavy poll (link bringup + full RX drain) looks hung.
         let mut raw = [0u8; ETH_FRAME_MAX];
         let send_buf: &[u8] = if data.len() < 60 && data.len() <= ETH_FRAME_MAX {
             raw[..data.len()].copy_from_slice(data);
@@ -572,18 +536,6 @@ impl Socket for PacketSocketState {
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let ifindex = *self.inner.ifindex.lock();
-        // Same drain as v0.5.0 (raw ring → AF_PACKET, then smoltcp poll).
-        if ifindex > 0 {
-            if let Ok(net) = crate::net::iface_by_linux_ifindex(ifindex) {
-                drive_packet_rx(net.as_ref());
-            }
-        } else {
-            for net in get_net_device().iter() {
-                if !net.is_loopback() {
-                    drive_packet_rx(net.as_ref());
-                }
-            }
-        }
         let readable = !self.inner.packet_queue.lock().is_empty();
         let dev = if ifindex > 0 {
             crate::net::iface_by_linux_ifindex(ifindex).ok()

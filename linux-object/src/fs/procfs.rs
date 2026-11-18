@@ -4110,37 +4110,9 @@ fn proc_filesystems_content() -> String {
 }
 
 fn proc_net_arp_content() -> String {
-    let mut s = String::new();
-    let _ = writeln!(
-        s,
-        "IP address       HW type     Flags       HW address            Mask     Device"
-    );
-    let entries = crate::net::arp_cache::get_entries();
-    for (ip, mac) in entries {
-        let dev_name = if let Ok(dev) = crate::net::netdev_for_ipv4(ip) {
-            dev.get_ifname()
-        } else {
-            kernel_hal::net::get_net_device()
-                .iter()
-                .find(|d| !d.is_loopback())
-                .map(|d| d.get_ifname())
-                .unwrap_or_else(|| "eth0".into())
-        };
-        let mac_bytes = mac.as_bytes();
-        let _ = writeln!(
-            s,
-            "{:<15}  0x1         0x2         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        {}",
-            ip,
-            mac_bytes[0],
-            mac_bytes[1],
-            mac_bytes[2],
-            mac_bytes[3],
-            mac_bytes[4],
-            mac_bytes[5],
-            dev_name
-        );
-    }
-    s
+    // The neighbours are the stack's, which is a process and does not
+    // say them: the table has its heading and no rows.
+    String::from("IP address       HW type     Flags       HW address            Mask     Device\n")
 }
 
 fn proc_net_if_inet6_content() -> String {
