@@ -1887,16 +1887,44 @@ impl<'a> InterfaceInner<'a> {
         let udp_repr = UdpRepr::parse(&udp_packet, &src_addr, &dst_addr, &cx.caps.checksum)?;
         let udp_payload = udp_packet.payload();
 
-        for mut udp_socket in sockets.iter_mut().filter_map(UdpSocket::downcast) {
-            if !udp_socket.accepts(&ip_repr, &udp_repr) {
-                continue;
+        // Several sockets can have the port. A datagram for a group or for everybody is for
+        // every one of them; one for this machine alone is for the one whose claim is best.
+        if dst_addr.is_broadcast() || dst_addr.is_multicast() {
+            let mut handled = None;
+            for mut udp_socket in sockets.iter_mut().filter_map(UdpSocket::downcast) {
+                if !udp_socket.accepts(&ip_repr, &udp_repr) {
+                    continue;
+                }
+                // The packet is valid and handled by a socket, unless every socket that
+                // would take it has its buffer full.
+                let done = udp_socket.process(cx, &ip_repr, &udp_repr, udp_payload);
+                if handled.is_none() || done.is_ok() {
+                    handled = Some(done);
+                }
             }
-
-            match udp_socket.process(cx, &ip_repr, &udp_repr, udp_payload) {
-                // The packet is valid and handled by socket.
-                Ok(()) => return Ok(None),
-                // The packet is malformed, or the socket buffer is full.
-                Err(e) => return Err(e),
+            if let Some(done) = handled {
+                return done.map(|()| None);
+            }
+        } else {
+            let best = sockets
+                .iter_mut()
+                .filter_map(UdpSocket::downcast)
+                .enumerate()
+                .filter(|(_, udp_socket)| udp_socket.accepts(&ip_repr, &udp_repr))
+                .max_by_key(|(_, udp_socket)| udp_socket.claim())
+                .map(|(nth, _)| nth);
+            let best = best.and_then(|nth| {
+                sockets
+                    .iter_mut()
+                    .filter_map(UdpSocket::downcast)
+                    .nth(nth)
+            });
+            if let Some(mut udp_socket) = best {
+                // The packet is valid and handled by socket, or it is malformed, or the
+                // socket buffer is full.
+                return udp_socket
+                    .process(cx, &ip_repr, &udp_repr, udp_payload)
+                    .map(|()| None);
             }
         }
 

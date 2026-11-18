@@ -316,6 +316,9 @@ pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     six: six::Six,
     /// The other addresses and the routes.
     more: more::More,
+    /// How many datagram sockets were given a port so far: of two that
+    /// share one, the later takes what is for this machine alone.
+    binds: u32,
     /// What smoltcp's count of the changes of its neighbours was when the
     /// kernel was last said them ([`neigh_news`](Self::neigh_news)).
     neigh_said: u32,
@@ -353,6 +356,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             six: six::Six::default(),
             more: more::More::default(),
             neigh_said: 0,
+            binds: 0,
             hearing6: icmp6::Hearing6::default(),
             raws: raw::Raws::default(),
             raws6: raw6::Raws6::default(),
@@ -636,6 +640,11 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                     .bind(IpEndpoint::new(at, port))
                     .map_err(|_| Refused::Bind)?;
                 socket.set_only(only);
+                // Two sockets can have a port, when the kernel let them
+                // (`SO_REUSEADDR`, `SO_REUSEPORT`): the later is the one
+                // that hears what is for this machine alone.
+                self.binds = self.binds.wrapping_add(1);
+                socket.set_order(self.binds);
                 self.socks.insert(sock, self.set.add(socket));
                 Ok(false)
             }

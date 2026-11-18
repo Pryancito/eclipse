@@ -8,6 +8,11 @@
 
 use super::*;
 
+/// `setsockopt`'s level of the options of every socket, and the one
+/// that lets a port be taken again.
+const SOL_SOCKET: usize = 1;
+const SO_REUSEADDR: usize = 2;
+
 /// The most credit a stack is believed to give: a stack that says more
 /// would have the kernel queue messages without end.
 const CREDIT_MAX: usize = 16 * 1024 * 1024;
@@ -63,9 +68,13 @@ struct Inner {
     /// What `SO_ERROR` answers, and the next read or write.
     error: Option<LxError>,
     port: Option<u16>,
-    /// Whether `port` is this socket's in the table: a connection that
-    /// arrived on a listener has the listener's.
+    /// Whether `port` is this socket's in the table: its own, or for a
+    /// connection that arrived on a listener the listener's, which it
+    /// has as the listener had it.
     holds_port: bool,
+    /// `SO_REUSEADDR`, as it was said last: what the socket takes its
+    /// port with.
+    reuse: bool,
     /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
     /// of this machine alone, which the stack is not told of.
     here: Option<Ipv4Address>,
@@ -105,6 +114,7 @@ impl Inner {
             error: None,
             port: None,
             holds_port: false,
+            reuse: false,
             here: None,
             bound: None,
             only6: false,
@@ -489,6 +499,13 @@ impl StackLink {
                         child.bound = inner.bound;
                         child.remote = Some(from);
                         child.at = at;
+                        // The port is its own too from now on, as the
+                        // listener has it.
+                        child.reuse = inner.reuse;
+                        if let Some(port) = inner.port {
+                            table.stream_ports.adopt(port, sock, new);
+                            child.holds_port = true;
+                        }
                         let child = Stream::new(child, stream.v6);
                         table.streams.insert(new, Arc::downgrade(&child));
                         drop(table);
@@ -568,11 +585,12 @@ impl StackLink {
         let listener = {
             let table = self.table.lock();
             let listener = table.listening.get(port, six, to);
-            listener
-                .and_then(|listener| table.streams.get(&listener))
-                .and_then(Weak::upgrade)
+            listener.and_then(|listener| {
+                let stream = table.streams.get(&listener).and_then(Weak::upgrade)?;
+                Some((listener, stream))
+            })
         };
-        let made = listener.is_some_and(|listener| {
+        let made = listener.is_some_and(|(listening, listener)| {
             let mut inner = listener.inner.lock();
             // One bound to an address takes what is for that address, and
             // one of IPv4 what is for an address of IPv4.
@@ -589,11 +607,18 @@ impl StackLink {
             child.only6 = inner.only6;
             child.local = Some(to);
             child.remote = Some(from);
+            child.reuse = inner.reuse;
+            child.holds_port = inner.port.is_some();
             let child = Stream::new(child, listener.v6);
             let new = {
                 let mut table = self.table.lock();
                 table.next_sock += 1;
                 let new = table.next_sock;
+                // The port is its own too from now on, as the listener
+                // has it.
+                if let Some(port) = inner.port {
+                    table.stream_ports.adopt(port, listening, new);
+                }
                 table.streams.insert(new, Arc::downgrade(&child));
                 table.joined.insert(new, sock);
                 table.joined.insert(sock, new);
@@ -715,7 +740,11 @@ impl ServedTcpSocket {
             return Ok(port);
         }
         let takes = self.stream.takes(inner);
-        let port = self.link.table.lock().stream_ports.take(0, takes, None)?;
+        let mut table = self.link.table.lock();
+        let port = table
+            .stream_ports
+            .take(0, takes, None, self.sock, Sharing::default())?;
+        drop(table);
         inner.port = Some(port);
         inner.holds_port = true;
         Ok(port)
@@ -805,7 +834,17 @@ impl ServedTcpSocket {
     /// to close: its number may be another's by now.
     fn unlisten(&self, waiting: VecDeque<(u64, Arc<Stream>)>) {
         for (sock, stream) in waiting {
-            let open = stream.inner.lock().phase == Phase::Open;
+            let (open, port) = {
+                let inner = stream.inner.lock();
+                (
+                    inner.phase == Phase::Open,
+                    inner.port.filter(|_| inner.holds_port),
+                )
+            };
+            // Nobody took it: the port it had of its listener is free.
+            if let Some(port) = port {
+                self.link.table.lock().stream_ports.free(port, sock);
+            }
             self.link.forget(sock, &stream);
             if open {
                 self.link.stream_close(sock);
@@ -816,7 +855,9 @@ impl ServedTcpSocket {
     /// Take this socket off the ports that are listened on.
     fn stop_listening(&self, port: Option<u16>) {
         if let Some(port) = port {
-            self.link.table.lock().listening.remove(port, self.sock);
+            let mut table = self.link.table.lock();
+            table.listening.remove(port, self.sock);
+            table.stream_ports.quiet(port, self.sock);
         }
     }
 
@@ -827,12 +868,10 @@ impl ServedTcpSocket {
 
 impl Drop for ServedTcpSocket {
     fn drop(&mut self) {
-        let (port, whose, takes, waiting, known) = {
+        let (port, waiting, known) = {
             let mut inner = self.stream.inner.lock();
             (
                 inner.port.filter(|_| inner.holds_port),
-                whose(&inner),
-                self.stream.takes(&inner),
                 core::mem::take(&mut inner.waiting),
                 // What the stack, or the other end, has a socket for. One
                 // whose connection failed it has let go of already, and
@@ -848,7 +887,7 @@ impl Drop for ServedTcpSocket {
         self.stop_listening(port);
         self.link.forget(self.sock, &self.stream);
         if let Some(port) = port {
-            self.link.table.lock().stream_ports.free(port, takes, whose);
+            self.link.table.lock().stream_ports.free(port, self.sock);
         }
         self.unlisten(waiting);
         // A connection within this machine that was reset is known to
@@ -1092,10 +1131,16 @@ impl Socket for ServedTcpSocket {
             return Err(LxError::EINVAL);
         }
         let takes = self.stream.takes(&inner);
+        let sharing = Sharing {
+            reuse: inner.reuse,
+            shares: false,
+        };
         let port = self.link.table.lock().stream_ports.take(
             local.port,
             takes,
             here.map(IpAddress::Ipv4).or(bound),
+            self.sock,
+            sharing,
         )?;
         inner.port = Some(port);
         inner.holds_port = true;
@@ -1115,6 +1160,13 @@ impl Socket for ServedTcpSocket {
                 _ => return Err(LxError::EINVAL),
             }
             let port = self.autobind(&mut inner)?;
+            // `inet_csk_get_port`, again: of the sockets that share a
+            // port by `SO_REUSEADDR`, one listens.
+            self.link
+                .table
+                .lock()
+                .stream_ports
+                .listen(port, self.sock)?;
             inner.phase = Phase::Listening;
             inner.error = None;
             self.stream.sync(&inner, Event::empty());
@@ -1292,8 +1344,17 @@ impl Socket for ServedTcpSocket {
             inner.only6 = only6;
             return Ok(0);
         }
+        // `SO_REUSEADDR`: what the socket takes its port with.
+        if level == SOL_SOCKET && opt == SO_REUSEADDR {
+            self.stream.inner.lock().reuse = icmp6::flag(data)?;
+            return Ok(0);
+        }
         let kept = self.stream.inner.lock().patience.set(level, opt, data);
         kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
+    }
+
+    fn so_reuseaddr(&self) -> bool {
+        self.stream.inner.lock().reuse
     }
 
     fn so_rcvtimeo(&self) -> [u8; 16] {
@@ -2071,17 +2132,18 @@ mod tests {
             while stack.told().is_some() {}
         }
 
-        // The connection goes on after the listener: its port is the
-        // listener's to give back, and the one nobody accepted is closed.
+        // The connection goes on after the listener, and has its port
+        // for as long: the one nobody accepted is closed.
         drop(l);
         assert_eq!(stack.told(), Some(close_message(two)));
         assert_eq!(stack.told(), Some(close_message(sock)));
         assert_eq!(stack.told(), None);
-        assert_eq!(Socket::bind(&other, any(8080)), Ok(0));
+        assert_eq!(Socket::bind(&other, any(8080)), Err(LxError::EADDRINUSE));
         events(&stack, &[(one, EV_BYTES, 0, b"mas")]);
         assert_eq!(read(&first, &mut buf), Ok(3));
         drop(first);
         assert_eq!(stack.told(), Some(close_message(one)));
+        assert_eq!(Socket::bind(&other, any(8080)), Ok(0));
 
         // A connection that arrives for a listener that is gone is closed
         // at once.
@@ -2091,6 +2153,104 @@ mod tests {
             &[(sock, EV_ACCEPTED, 500, &accepted_bytes(three, HOST, 40005))],
         );
         assert_eq!(stack.told(), Some(close_message(three)));
+    }
+
+    #[test]
+    fn a_port_is_taken_again_as_so_reuseaddr_says() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let reuse = |s: &ServedTcpSocket| {
+            assert_eq!(
+                s.setsockopt(SOL_SOCKET, SO_REUSEADDR, &1i32.to_ne_bytes()),
+                Ok(0)
+            );
+        };
+        // What was said is what is answered.
+        let plain = stream(&stack);
+        assert!(!Socket::so_reuseaddr(&plain));
+        let first = stream(&stack);
+        reuse(&first);
+        assert!(Socket::so_reuseaddr(&first));
+
+        // Two that both said so have the port, at the same address or one
+        // of them at every address; one that did not say so does not.
+        assert_eq!(Socket::bind(&first, any(8080)), Ok(0));
+        assert_eq!(Socket::bind(&plain, any(8080)), Err(LxError::EADDRINUSE));
+        let second = stream(&stack);
+        reuse(&second);
+        assert_eq!(
+            Socket::bind(&second, Endpoint::Ip(at(STACK_ADDR, 8080))),
+            Ok(0)
+        );
+        // One of them listens, and only one.
+        assert_eq!(Socket::listen(&first), Ok(0));
+        assert_eq!(Socket::listen(&second), Err(LxError::EADDRINUSE));
+        assert!(!Socket::is_listening(&second));
+        // And nobody else has the port while it does, whatever they say.
+        let third = stream(&stack);
+        reuse(&third);
+        assert_eq!(Socket::bind(&third, any(8080)), Err(LxError::EADDRINUSE));
+        drop(second);
+        while stack.told().is_some() {}
+
+        // A connection that arrived has the port after its listener is
+        // gone: the server that starts again takes it back by having
+        // said so, as the one before it had.
+        let one = ACCEPTED_BIT | 1;
+        events(
+            &stack,
+            &[(
+                first.sock,
+                EV_ACCEPTED,
+                500,
+                &accepted_bytes(one, HOST, 40001),
+            )],
+        );
+        let (left, _) = accepted(&first);
+        assert!(Socket::so_reuseaddr(&*left));
+        drop(first);
+        while stack.told().is_some() {}
+        assert_eq!(Socket::bind(&plain, any(8080)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::bind(&third, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&third), Ok(0));
+        // One that stops listening lets another listen.
+        let fourth = stream(&stack);
+        reuse(&fourth);
+        assert_eq!(Socket::bind(&fourth, any(8080)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::shutdown(&third, 0), Ok(0));
+        assert_eq!(Socket::bind(&fourth, any(8080)), Ok(0));
+        assert_eq!(Socket::listen(&fourth), Ok(0));
+        // With every one of them gone the port is anybody's.
+        drop((third, fourth, left));
+        assert_eq!(Socket::bind(&plain, any(8080)), Ok(0));
+
+        // What a listener that had not said so left behind keeps the
+        // port from everybody until it is gone.
+        let l = listener(&stack, any(8090));
+        let two = ACCEPTED_BIT | 2;
+        events(
+            &stack,
+            &[(l.sock, EV_ACCEPTED, 500, &accepted_bytes(two, HOST, 40002))],
+        );
+        let (left, _) = accepted(&l);
+        // And one nobody accepted, only until its listener is.
+        let three = ACCEPTED_BIT | 3;
+        events(
+            &stack,
+            &[(
+                l.sock,
+                EV_ACCEPTED,
+                500,
+                &accepted_bytes(three, HOST, 40003),
+            )],
+        );
+        drop(l);
+        let again = stream(&stack);
+        reuse(&again);
+        assert_eq!(Socket::bind(&again, any(8090)), Err(LxError::EADDRINUSE));
+        drop(left);
+        assert_eq!(Socket::bind(&again, any(8090)), Ok(0));
+        while stack.told().is_some() {}
     }
 
     const HERE: [u8; 4] = [127, 0, 0, 1];
@@ -2706,7 +2866,7 @@ mod tests {
         assert_eq!(stack.told(), Some(close_message(new4)));
         assert_eq!(accept(&l6).err(), Some(LxError::EAGAIN));
         events(&stack, &[(l4.sock, EV_ACCEPTED, 1000, &bytes4)]);
-        let (_s4, from) = accepted(&l4);
+        let (s4, from) = accepted(&l4);
         assert_eq!(from, at(HOST, 40001));
 
         // In this machine too: who connects to `::1` reaches the one,
@@ -2731,6 +2891,8 @@ mod tests {
         // With the one of IPv4 gone, who connects to 127.0.0.1 is
         // refused: the other is not for that.
         drop(l4);
+        // And with it what arrived on it, which had its port.
+        drop(s4);
         while stack.told().is_some() {}
         assert_eq!(
             connect(&stream(&stack), at(HERE, 8080)),

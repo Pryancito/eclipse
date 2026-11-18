@@ -284,6 +284,41 @@ mod tests {
     }
 
     #[test]
+    fn sockets_that_share_a_port_each_hear_a_group_and_the_last_hears_the_rest() {
+        use crate::socks::tests::bind_at;
+        use crate::socks::OP_CLOSE;
+        use smoltcp::wire::IpAddress;
+        let (mut stack, window) = stack();
+        // The kernel let three have the port (`SO_REUSEADDR`): two at
+        // every address and, between them, one at the card's.
+        stack.request(&bind(1, 5000)).unwrap();
+        stack
+            .request(&bind_at(2, 5000, IpAddress::Ipv4(OUR_IP)))
+            .unwrap();
+        stack.request(&bind(3, 5000)).unwrap();
+        assert_eq!(stack.request(&join(GROUP)), Ok(true));
+        sent(&mut stack, &window);
+
+        // What is for the group is for every one of them.
+        window.deliver(stack.device(), 0, &group_frame(GROUP, 4000, 5000, b"all"));
+        let mut heard = arrived(&mut stack, 1);
+        heard.sort();
+        let all = b"all".to_vec();
+        assert_eq!(heard, [(1, all.clone()), (2, all.clone()), (3, all)]);
+
+        // What is for this machine alone is for one: the one bound to
+        // the address, and without it the one that took the port last.
+        window.deliver(stack.device(), 0, &udp_frame(4000, 5000, b"one"));
+        assert_eq!(arrived(&mut stack, 2), [(2, b"one".to_vec())]);
+        assert_eq!(stack.request(&message(OP_CLOSE, 2, &[])), Ok(false));
+        window.deliver(stack.device(), 0, &udp_frame(4000, 5000, b"two"));
+        assert_eq!(arrived(&mut stack, 3), [(3, b"two".to_vec())]);
+        assert_eq!(stack.request(&message(OP_CLOSE, 3, &[])), Ok(false));
+        window.deliver(stack.device(), 0, &udp_frame(4000, 5000, b"three"));
+        assert_eq!(arrived(&mut stack, 4), [(1, b"three".to_vec())]);
+    }
+
+    #[test]
     fn what_is_no_group_is_not_joined_and_everybodys_is_not_said() {
         let (mut stack, window) = stack();
         // The same bytes `linux-object/src/net/user_stack/groups.rs`

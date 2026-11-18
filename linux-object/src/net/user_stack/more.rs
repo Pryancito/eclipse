@@ -556,6 +556,77 @@ mod tests {
     }
 
     #[test]
+    fn datagram_sockets_share_a_port_when_both_said_so() {
+        use super::super::tests::{any, at, ip};
+        use super::super::ServedUdpSocket;
+        use crate::error::LxError;
+        use crate::fs::{FileLike, OpenFlags};
+        use crate::net::{Endpoint, Socket};
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let link = stack.link.clone();
+        link.first_card(Card::first(MAC, STACK_ADDR, 24, 0), None);
+        let udp = |opt: Option<usize>| {
+            let s = ServedUdpSocket::new(link.clone(), false).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            if let Some(opt) = opt {
+                assert_eq!(Socket::setsockopt(&s, 1, opt, &1i32.to_ne_bytes()), Ok(0));
+            }
+            s
+        };
+        let recv = |s: &ServedUdpSocket| {
+            let mut buf = [0u8; 8];
+            let (n, from) = async_std::task::block_on(Socket::read(s, &mut buf));
+            n.map(|n| (buf[..n].to_vec(), ip(from)))
+        };
+        const SO_REUSEADDR: usize = 2;
+        const SO_REUSEPORT: usize = 15;
+
+        // Two that said `SO_REUSEADDR` have the port; one that did not
+        // say it has not, nor one that said the other thing.
+        let (first, second) = (udp(Some(SO_REUSEADDR)), udp(Some(SO_REUSEADDR)));
+        assert_eq!(Socket::bind(&first, any(5300)), Ok(0));
+        assert_eq!(Socket::bind(&second, any(5300)), Ok(0));
+        assert_eq!(
+            Socket::bind(&udp(None), any(5300)),
+            Err(LxError::EADDRINUSE)
+        );
+        assert_eq!(
+            Socket::bind(&udp(Some(SO_REUSEPORT)), any(5300)),
+            Err(LxError::EADDRINUSE)
+        );
+        while stack.told().is_some() {}
+        // What a program of this machine sends there goes to the one
+        // that took the port last.
+        let sender = udp(None);
+        let to = Some(Endpoint::Ip(at(STACK_ADDR, 5300)));
+        assert_eq!(Socket::write(&sender, b"hi", to.clone()), Ok(2));
+        assert_eq!(recv(&second).map(|got| got.0), Ok(b"hi".to_vec()));
+        assert_eq!(recv(&first), Err(LxError::EAGAIN));
+        // And to the other once that one is gone.
+        drop(second);
+        assert_eq!(Socket::write(&sender, b"yo", to), Ok(2));
+        assert_eq!(recv(&first).map(|got| got.0), Ok(b"yo".to_vec()));
+        // With one left that said so, one that did not is still kept out.
+        assert_eq!(
+            Socket::bind(&udp(None), any(5300)),
+            Err(LxError::EADDRINUSE)
+        );
+        drop(first);
+        assert_eq!(Socket::bind(&udp(None), any(5300)), Ok(0));
+
+        // `SO_REUSEPORT` the same, between two that both said it.
+        let (third, fourth) = (udp(Some(SO_REUSEPORT)), udp(Some(SO_REUSEPORT)));
+        assert_eq!(Socket::bind(&third, any(5301)), Ok(0));
+        assert_eq!(Socket::bind(&fourth, any(5301)), Ok(0));
+        assert_eq!(
+            Socket::bind(&udp(Some(SO_REUSEADDR)), any(5301)),
+            Err(LxError::EADDRINUSE)
+        );
+        while stack.told().is_some() {}
+    }
+
+    #[test]
     fn a_port_is_a_sockets_at_the_address_it_was_bound_to() {
         use super::super::tests::{any, at, ip};
         use super::super::{listen_message, ServedTcpSocket, ServedUdpSocket};

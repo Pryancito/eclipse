@@ -30,6 +30,9 @@ pub struct UdpSocket<'a> {
     /// The one version of IP whose datagrams are this socket's: see
     /// [`set_only`](Self::set_only).
     only: Option<IpVersion>,
+    /// Its place among the sockets that have its port: see
+    /// [`set_order`](Self::set_order).
+    order: u32,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -46,6 +49,7 @@ impl<'a> UdpSocket<'a> {
             tx_buffer: tx_buffer,
             hop_limit: None,
             only: None,
+            order: 0,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -136,6 +140,22 @@ impl<'a> UdpSocket<'a> {
     /// both.
     pub fn set_only(&mut self, version: Option<IpVersion>) {
         self.only = version;
+    }
+
+    /// Say when this socket took its port, as a number that grows: of
+    /// the sockets that have the same port at the same address, the one
+    /// with the highest takes a datagram that is for this machine alone.
+    /// One for a group or for everybody goes to every one of them.
+    pub fn set_order(&mut self, order: u32) {
+        self.order = order;
+    }
+
+    /// How well this socket's claim on a datagram it
+    /// [accepts](Self::accepts) compares with another's: one bound to
+    /// the address before one bound to none, and then the later
+    /// ([`set_order`](Self::set_order)).
+    pub(crate) fn claim(&self) -> (bool, u32) {
+        (!self.endpoint.addr.is_unspecified(), self.order)
     }
 
     /// The one version of IP whose datagrams are this socket's, when it
