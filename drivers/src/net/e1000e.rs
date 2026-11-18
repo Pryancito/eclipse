@@ -3383,11 +3383,10 @@ impl E1000eInterface {
     /// `deferred_job.rs` caps it at 256 entries and silently drops the oldest
     /// without running it. Without this, every future interrupt would take
     /// `handle_irq`'s "already pending" fast path forever (re-arm and return)
-    /// and `poll_with_irq_hint` would never run again except via periodic
-    /// external polling (`poll_ifaces_throttled`). Called from `poll()`,
-    /// which is reached by that periodic polling regardless of IRQ state, so
-    /// this reliably self-heals even on an interface that stopped receiving
-    /// interrupts entirely.
+    /// and `poll_with_irq_hint` would never run again. Called from `poll()`,
+    /// which whoever has the card calls when it looks at it (the stack that
+    /// borrowed it, each turn) regardless of IRQ state, so this self-heals
+    /// even on an interface that stopped receiving interrupts entirely.
     fn heal_stuck_poll_pending(&self) {
         if !self.poll_pending.load(Ordering::SeqCst) {
             return;

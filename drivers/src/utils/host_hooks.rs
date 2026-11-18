@@ -286,9 +286,6 @@ extern "C" fn drivers_wake_net_rx_waiters() {
     WAKE_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
-#[no_mangle]
-extern "C" fn drivers_net_drain() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

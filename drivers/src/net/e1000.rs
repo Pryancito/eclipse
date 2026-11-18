@@ -527,8 +527,8 @@ impl Scheme for E1000Interface {
             // BODY meant an evicted bottom-half left the NIC masked and
             // `poll_pending` stuck true forever — every later IRQ then took
             // the `else` branch below, read-clearing ICR without ever queuing
-            // a poll, and the interface was demoted to the periodic
-            // `poll_ifaces` path for the life of the kernel. This is the same
+            // a poll, and the interface was deaf to its interrupts for the
+            // life of the kernel. This is the same
             // `PollPendingGuard` shape `e1000e.rs` uses.
             struct PollPendingGuard {
                 pending: Arc<AtomicBool>,

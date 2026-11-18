@@ -6,7 +6,7 @@
 pub mod socket_address;
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, PollEvents};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
 pub use socket_address::*;
@@ -88,15 +88,9 @@ pub fn count_on_lo(payload: usize, headers: usize) {
 pub fn init() {
     zcore_drivers::net::set_packet_callback(packet::push_packet);
     zcore_drivers::net::loopback::register_loopback_tx_callback(loopback_tx_handler);
-    refresh_arp_local_macs();
     for iface in get_net_device() {
         ensure_ipv6_link_local(iface.as_ref());
     }
-}
-
-pub fn refresh_arp_local_macs() {
-    let macs: alloc::vec::Vec<_> = get_net_device().iter().map(|d| d.get_mac()).collect();
-    arp_cache::refresh_local_macs(macs);
 }
 
 /// Derive the RFC 4862 link-local address (fe80::/64, EUI-64 IID) from a MAC.
@@ -288,10 +282,6 @@ pub mod netlink;
 pub use netlink::*;
 pub mod unix;
 pub use unix::*;
-
-/// IPv4 → MAC cache (fed from RX frames).
-pub mod arp_cache;
-pub use arp_cache::*;
 
 pub mod dns;
 
@@ -674,54 +664,9 @@ numeric_enum! {
 
 use kernel_hal::net::get_net_device;
 
-/// True once DHCP (or static config) assigned a real host IPv4 — not placeholder/0.0.0.0.
-pub fn has_usable_ipv4() -> bool {
-    use zcore_drivers::wire::IpCidr;
-    get_net_device().iter().any(|dev| {
-        dev.get_ip_address().iter().any(|ip| match ip {
-            IpCidr::Ipv4(cidr) => {
-                let addr = cidr.address();
-                cidr.prefix_len() > 0
-                    && !addr.is_unspecified()
-                    && !is_ipv4_placeholder(addr)
-                    && addr.0[0] < 240
-            }
-            _ => false,
-        })
-    })
-}
-
-/// Resolve the IPv4 default gateway from routes or `.1` on the host subnet.
-pub fn ipv4_default_gateway(
-    dev: &dyn zcore_drivers::scheme::NetScheme,
-) -> Option<zcore_drivers::wire::Ipv4Address> {
-    ipv4_gateway_from_routes(&dev.get_routes())
-        .filter(|gw| !gw.is_unspecified())
-        .or_else(|| infer_ipv4_gateway(dev))
-}
-
-/// Ensure smoltcp has a default route (ICMP/TCP/UDP share this stack).
-pub fn prepare_ipv4_stack() {
-    if !has_usable_ipv4() {
-        return;
-    }
-    for dev in get_net_device().iter() {
-        if !dev.is_loopback() {
-            ensure_ipv4_default_route(dev.as_ref());
-        }
-    }
-}
-
-mod adaptive;
-
-/// Minimum interval for heavy net housekeeping (route/neighbor/prune).
-const NET_HOUSEKEEPING_INTERVAL_US: u64 = 250_000;
-
 /// Deferred IRQ drain when epoll/poll is not waiting on sockets.
 const DEFERRED_IDLE_INTERVAL_US: u64 = 20_000;
 
-static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
-static LAST_NET_HOUSEKEEPING_US: AtomicU64 = AtomicU64::new(0);
 static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
 
 // `fd_is_socket` / `fd_is_interactive` lived here: "is this fd a socket?"
@@ -747,12 +692,10 @@ fn mono_us() -> u64 {
 /// gun: every CPU that reaches the check inside the same interval reads the
 /// same `last`, every one of them passes, and every one of them stores `now`
 /// and runs the body. That is not theoretical -- it is the six-CPU pile-up on
-/// the e1000e `iface` lock captured on real hardware, where the HOLDER sat in
-/// `add_route` (reached from [`maybe_run_net_housekeeping`] via
-/// [`prepare_ipv4_stack`]) and the other five spun in `seed_neighbor` (reached
-/// from the *same* housekeeping pass, via
-/// [`sync_neighbor_cache_into_smoltcp`]). Both ends of that banner are inside
-/// the body this throttle is supposed to let one CPU run.
+/// the e1000e `iface` lock captured on real hardware, when the kernel had a
+/// network stack of its own and its housekeeping was the body: the holder
+/// and the five that spun behind it were all inside what this throttle is
+/// supposed to let one CPU run.
 ///
 /// The `compare_exchange` makes the stamp the claim: the winner moves it and
 /// runs, the losers see the moved stamp on the retry and go home. Returns
@@ -782,85 +725,6 @@ fn claim_interval_seen(slot: &AtomicU64, mut last: u64, now: u64, interval_us: u
             Err(current) => last = current,
         }
     }
-}
-
-fn net_poll_interval_elapsed(interval_us: u64) -> bool {
-    claim_interval(&LAST_NET_POLL_US, mono_us(), interval_us)
-}
-
-#[inline]
-fn adaptive_deferred_jobs_per_tick() -> usize {
-    adaptive::deferred_jobs_budget(kernel_hal::deferred_job::pending_deferred_jobs())
-}
-
-#[inline]
-fn adaptive_net_poll_interval_us() -> u64 {
-    adaptive::net_poll_interval_us(kernel_hal::deferred_job::pending_deferred_jobs())
-}
-
-/// Held while a housekeeping pass is in flight, so only one CPU is ever inside
-/// the body.
-///
-/// [`claim_interval`] already hands the turn to one caller, but it hands it out
-/// by the clock, and `force` skips the clock entirely. This is the structural
-/// half: whatever the stamp says, a second CPU that arrives while the body is
-/// running turns around. The body's work is idempotent housekeeping, so the one
-/// that turns around loses nothing -- the pass already in flight does it.
-static NET_HOUSEKEEPING_RUNNING: AtomicBool = AtomicBool::new(false);
-
-#[inline]
-fn maybe_run_net_housekeeping(now_us: u64, force: bool) {
-    // One CPU per interval, or all of them at once -- see [`claim_interval`].
-    let won = claim_interval(
-        &LAST_NET_HOUSEKEEPING_US,
-        now_us,
-        NET_HOUSEKEEPING_INTERVAL_US,
-    );
-    if force {
-        // A forced pass runs whether or not it won the turn, and publishes the
-        // stamp as the old code did, so the periodic pass whose work it just
-        // did does not follow it a microsecond later.
-        LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
-    } else if !won {
-        return;
-    }
-    if NET_HOUSEKEEPING_RUNNING.swap(true, Ordering::Acquire) {
-        return;
-    }
-    // Cleared by `Drop`, not by a store at the end: an early `return` added to
-    // the body later would otherwise latch the flag and kill housekeeping for
-    // the life of the kernel, which is exactly how `poll_pending` got stuck
-    // once already.
-    struct Running;
-    impl Drop for Running {
-        fn drop(&mut self) {
-            NET_HOUSEKEEPING_RUNNING.store(false, Ordering::Release);
-        }
-    }
-    let _running = Running;
-    if has_usable_ipv4() {
-        prepare_ipv4_stack();
-    }
-}
-
-/// Throttled NIC poll for multiplex wait loops (epoll/poll/select).
-pub fn poll_ifaces_throttled() {
-    if !net_poll_interval_elapsed(adaptive_net_poll_interval_us()) {
-        return;
-    }
-    poll_ifaces();
-}
-
-/// Socket path: deferred IRQ work + throttled NIC poll.
-pub fn drain_net_tick() {
-    kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
-    poll_ifaces_throttled();
-}
-
-/// After recv/send or connect: always run a full NIC poll once.
-pub fn drain_net_urgent() {
-    kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
-    poll_ifaces();
 }
 
 /// Register wakers for poll/epoll/select so MSI/TTY IRQs resume the task before timers.
@@ -945,99 +809,28 @@ pub fn clear_io_wait_wakers_hid(
     }
 }
 
-/// One tick of an I/O wait loop: HID/USB first, then throttled NIC / deferred work.
+/// The interrupt work a wait on sockets runs each tick, at least, and at
+/// most: more of it the more of it waits.
+const DEFERRED_JOBS_PER_TICK: usize = 4;
+const DEFERRED_JOBS_PER_TICK_MAX: usize = 12;
+
+/// One tick of an I/O wait loop: HID/USB first, then the work interrupts
+/// left to be done.
 ///
-/// When `watch_interactive` and not `watch_net`, skips [`poll_ifaces`] so shell/TTY
-/// loops are not blocked by smoltcp/NIC work.
+/// No card is looked at here: a card is its stack's, which is a process
+/// and is told of what arrives by the card's interrupt. A wait that
+/// watches no socket runs that work more rarely, so that shell and TTY
+/// loops are not held by it.
 pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
     kernel_hal::input_poll::poll_input_devices();
     if watch_net {
-        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
-        poll_ifaces_throttled();
-    } else {
-        if claim_interval(&LAST_DEFERRED_IDLE_US, mono_us(), DEFERRED_IDLE_INTERVAL_US) {
-            kernel_hal::deferred_job::drain_deferred_jobs_max(1);
-        }
-    }
-}
-
-/// Set once networking is up enough to be polled safely (after the first
-/// normal `poll_ifaces`, which happens during DHCP — long before any large
-/// disk transfer). The AHCI driver's wait loop consults this via
-/// `drivers_net_drain` so it never pokes the net stack during early-boot root
-/// mounting, before the interfaces/socket set exist.
-static NET_DRAIN_READY: AtomicBool = AtomicBool::new(false);
-/// Re-entrancy guard: `drivers_net_drain` must never recurse into itself (it
-/// won't in practice — the net path issues no disk I/O — but make it
-/// structurally impossible).
-static NET_DRAINING: AtomicBool = AtomicBool::new(false);
-
-/// Hook called by polled block drivers (AHCI) from inside their command-wait
-/// busy loop on real hardware, where a single command/flush can hold the CPU
-/// (interrupts disabled, under the fs lock) for long enough to starve the
-/// *polled* network stack — overflowing the NIC RX ring and stalling an
-/// in-flight TLS download (the "failed to extract libLLVM.so: I/O error" seen
-/// only on real hardware, only for the largest package). Servicing the network
-/// here keeps the connection alive across long disk waits.
-///
-/// Safe to call with the fs/AHCI locks held: it only touches the network locks
-/// (disjoint), the network never issues disk I/O (no deadlock cycle), and it is
-/// a no-op until networking is ready and whenever already draining.
-#[no_mangle]
-pub extern "C" fn drivers_net_drain() {
-    if !NET_DRAIN_READY.load(Ordering::Relaxed) {
-        return;
-    }
-    if NET_DRAINING.swap(true, Ordering::Acquire) {
-        return; // already draining on this stack
-    }
-    poll_ifaces();
-    NET_DRAINING.store(false, Ordering::Release);
-}
-
-/// miss doc
-pub fn poll_ifaces() {
-    NET_DRAIN_READY.store(true, Ordering::Relaxed);
-    kernel_hal::net::for_each_net_device(|iface| match iface.poll() {
-        Ok(_) => {}
-        Err(e) => {
-            warn!("error : {:?}", e)
-        }
-    });
-    maybe_run_net_housekeeping(mono_us(), false);
-}
-
-/// Copy RX frames from the NIC ring into AF_PACKET (`push_packet`).
-///
-/// This is the v0.5.0 path that made `udhcpc` see DHCPOFFER/DHCPACK. Driving
-/// only `poll()` is not enough: e1000e skips the smoltcp drain when the
-/// socket-set lock is busy, and even a successful poll can drop a DHCP
-/// datagram that has no UDP socket (udhcpc speaks AF_PACKET, not UDP/68).
-/// `io_wait_tick` still runs `poll_ifaces` first so TCP/UDP see frames
-/// before this leftover drain.
-pub fn netdev_drain_rx(dev: &dyn zcore_drivers::scheme::NetScheme) {
-    let mut buf = alloc::vec![0u8; 2048];
-    for _ in 0..32 {
-        match dev.recv(&mut buf) {
-            Ok(n) if n > 0 => packet::push_packet(&buf[..n]),
-            _ => break,
-        }
-    }
-    kernel_hal::deferred_job::drain_deferred_jobs();
-}
-
-/// Drive smoltcp until ARP/TX/RX make progress (needed after raw/icmp sends).
-pub fn drain_net_poll(rounds: usize) {
-    if has_usable_ipv4() {
-        prepare_ipv4_stack();
-    }
-    for i in 0..rounds {
-        if i == 0 {
-            drain_net_urgent();
-        } else {
-            drain_net_tick();
-        }
-        kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
+        let pending = kernel_hal::deferred_job::pending_deferred_jobs();
+        let most = DEFERRED_JOBS_PER_TICK_MAX - DEFERRED_JOBS_PER_TICK;
+        kernel_hal::deferred_job::drain_deferred_jobs_max(
+            DEFERRED_JOBS_PER_TICK + pending.min(most),
+        );
+    } else if claim_interval(&LAST_DEFERRED_IDLE_US, mono_us(), DEFERRED_IDLE_INTERVAL_US) {
+        kernel_hal::deferred_job::drain_deferred_jobs_max(1);
     }
 }
 
@@ -1068,83 +861,6 @@ pub(crate) fn sockopt_deadline(tv: &[u8; 16]) -> Option<core::time::Duration> {
     }
     let ms = sec.max(0) as u64 * 1000 + (usec.max(0) as u64).div_ceil(1000);
     Some(kernel_hal::timer::timer_now() + core::time::Duration::from_millis(ms.max(1)))
-}
-
-/// Guess the default gateway when DHCP/`ip route` did not install one.
-fn infer_ipv4_gateway(
-    dev: &dyn zcore_drivers::scheme::NetScheme,
-) -> Option<zcore_drivers::wire::Ipv4Address> {
-    use zcore_drivers::wire::{IpCidr, Ipv4Address};
-    for ip in dev.get_ip_address() {
-        if let IpCidr::Ipv4(cidr) = ip {
-            let addr = cidr.address();
-            if addr.is_unspecified() || cidr.prefix_len() < 8 || is_ipv4_placeholder(addr) {
-                continue;
-            }
-            let o = addr.0;
-            // QEMU user networking (slirp): gateway is 10.0.2.2, not .1.
-            if o[0] == 10 && o[1] == 0 && o[2] == 2 {
-                return Some(Ipv4Address::new(10, 0, 2, 2));
-            }
-            let gw1 = Ipv4Address::new(o[0], o[1], o[2], 1);
-            let gw2 = Ipv4Address::new(o[0], o[1], o[2], 2);
-            if arp_cache::lookup(gw2).is_some() {
-                return Some(gw2);
-            }
-            if arp_cache::lookup(gw1).is_some() {
-                return Some(gw1);
-            }
-            return Some(gw1);
-        }
-    }
-    None
-}
-
-fn ipv4_gateway_from_routes(
-    routes: &[zcore_drivers::scheme::RouteInfo],
-) -> Option<zcore_drivers::wire::Ipv4Address> {
-    use zcore_drivers::wire::{IpAddress, IpCidr};
-    routes
-        .iter()
-        .find_map(|route| match (route.dst, route.gateway) {
-            (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gw)))
-                if cidr.prefix_len() == 0 && !gw.is_unspecified() =>
-            {
-                Some(gw)
-            }
-            _ => None,
-        })
-}
-
-/// Install `0.0.0.0/0` via DHCP gateway or inferred gateway on the host subnet.
-pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
-    use zcore_drivers::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
-    // A card of the stack that runs as a process has the routes that
-    // stack was given: a guess made here would be asked of it, and put
-    // back the default route somebody took away.
-    if iface.name() == zcore_drivers::net::stack_card::NAME {
-        return;
-    }
-    let Some(gw) = ipv4_default_gateway(iface) else {
-        return;
-    };
-    if ipv4_gateway_from_routes(&iface.get_routes()) == Some(gw) {
-        return;
-    }
-    let default = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
-    if iface.add_route(default, Some(IpAddress::Ipv4(gw))).is_ok() {
-        info!(
-            "[net] inferred default IPv4 route via {} on {}",
-            gw,
-            iface.get_ifname()
-        );
-    } else {
-        warn!(
-            "[net] failed to add default IPv4 route via {} on {}",
-            gw,
-            iface.get_ifname()
-        );
-    }
 }
 
 // ============= SocketHandle =============
@@ -1366,7 +1082,6 @@ pub fn handle_net_ioctl(
             iface
                 .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                 .map_err(|_| LxError::EINVAL)?;
-            prepare_ipv4_stack();
             Ok(0)
         }
 
@@ -1430,7 +1145,6 @@ pub fn handle_net_ioctl(
             iface
                 .set_ipv4_address(Ipv4Cidr::new(addr, prefix_len))
                 .map_err(|_| LxError::EINVAL)?;
-            prepare_ipv4_stack();
             Ok(0)
         }
 
