@@ -373,15 +373,15 @@ impl INode for MiceDev {
                 // mice do, so this and the tick below are the only things in the
                 // whole wait that can answer a signal or a kill. After the
                 // readiness check, deliberately -- see `EventDev`.
-                let (interrupted, parked) = this.signal.check(cx.waker());
+                let (interrupted, _parked) = this.signal.check(cx.waker());
                 if interrupted.is_err() {
                     this.unpark();
                     return Poll::Ready(Err(FsError::Interrupted));
                 }
-                if parked {
-                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
-                    return Poll::Pending;
-                }
+                // Parked on the thread or not, the tick below stays: a signal
+                // wakes this wait by itself now, but the tick is also the
+                // insurance against a wake lost in the readiness wiring
+                // (`crate::sync::LOST_WAKE_TICK_MS`).
                 let deadline = kernel_hal::timer::deadline_after(
                     core::time::Duration::from_millis(MICE_INTERRUPT_CHECK_TICK_MS),
                 );

@@ -30,11 +30,12 @@ pub const IO_WAIT_COVERED_TICK_MS: u64 = 100;
 ///
 /// Of the two things the covered tick was for, the signal is no longer one:
 /// it wakes the wait when it is queued and not up to 100 ms later. What is
-/// left is the insurance against a wake lost in the subscription wiring,
-/// and insurance that is never expected to pay does not have to wake every
-/// parked process ten times a second: once a second bounds such a bug to a
-/// second of latency, still not a hang.
-pub const IO_WAIT_PARKED_TICK_MS: u64 = 1000;
+/// left is the insurance against a wake lost in the subscription wiring.
+/// It was a second from 2026-11-17, and with it the GPU desktop froze for
+/// tens of seconds again: a compositor or a client whose wake is lost runs
+/// one frame a second at best. Back to 100 ms
+/// ([`crate::sync::LOST_WAKE_TICK_MS`]).
+pub const IO_WAIT_PARKED_TICK_MS: u64 = crate::sync::LOST_WAKE_TICK_MS;
 
 /// The fallback interval of a wait with a parked readiness waker on every
 /// watched fd: [`IO_WAIT_PARKED_TICK_MS`] when its thread wakes it for a
@@ -306,13 +307,13 @@ mod hid_handshake_tests {
 mod covered_tick_tests {
     use super::*;
 
-    /// A wait its thread wakes for a signal keeps only the insurance, ten
-    /// times rarer; one that the tick alone watches keeps the old interval.
+    /// A wait its thread wakes for a signal keeps the insurance tick at the
+    /// same 100 ms: at a second, a lost wake froze the GPU desktop.
     #[test]
-    fn the_covered_tick_is_a_second_only_when_the_thread_wakes_the_wait() {
+    fn the_covered_tick_stays_short_when_the_thread_wakes_the_wait() {
         assert_eq!(covered_tick_ms(false), IO_WAIT_COVERED_TICK_MS);
         assert_eq!(covered_tick_ms(true), IO_WAIT_PARKED_TICK_MS);
         assert_eq!(IO_WAIT_COVERED_TICK_MS, 100);
-        assert_eq!(IO_WAIT_PARKED_TICK_MS, 1000);
+        assert!(IO_WAIT_PARKED_TICK_MS <= 100);
     }
 }

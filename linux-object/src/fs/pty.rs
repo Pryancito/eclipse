@@ -1393,11 +1393,13 @@ impl Future for PtyReadFuture<'_> {
         // interruptible; it is a ceiling on how late a `kill` can be, not on
         // how fast a byte arrives.
         //
-        // A read the thread wakes for a signal has no backstop: only the
-        // VTIME deadline is left for a timer, when there is one.
-        let backstop = (!parked).then(|| {
-            kernel_hal::timer::deadline_after(Duration::from_millis(PTY_INTERRUPT_CHECK_TICK_MS))
-        });
+        // A read the thread wakes for a signal keeps the backstop too, as
+        // the insurance against a wake lost in the readiness wiring
+        // (`crate::sync::LOST_WAKE_TICK_MS`).
+        let _ = parked;
+        let backstop = Some(kernel_hal::timer::deadline_after(Duration::from_millis(
+            PTY_INTERRUPT_CHECK_TICK_MS,
+        )));
         let vtime = if this.slave {
             match this.pty.vtime_deadline_ns.load(Ordering::Acquire) {
                 0 => None,
@@ -1690,11 +1692,11 @@ mod tests {
         }
     }
 
-    /// A read whose thread takes its waker arms no timer: the bus wakes it
-    /// for a byte and the thread for a signal. This was a timer armed and
-    /// cancelled by every terminal read that waited.
+    /// A read whose thread takes its waker keeps the insurance tick against
+    /// a lost wake: the bus wakes it for a byte and the thread for a signal,
+    /// and the tick is what is left if the bus ever misses one.
     #[test]
-    fn a_parked_read_on_a_silent_pty_arms_no_timer_and_can_be_killed() {
+    fn a_parked_read_on_a_silent_pty_keeps_its_tick_and_can_be_killed() {
         use crate::sync::test_interrupt;
         let p = pty();
         let waker = noop_waker();
@@ -1704,7 +1706,7 @@ mod tests {
             test_interrupt::takes_wakers(true);
             let mut fut = read_wait(&p, slave);
             assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
-            assert!(fut.timer.is_none(), "slave={}: a timer was armed", slave);
+            assert!(fut.timer.is_some(), "slave={}: no insurance tick", slave);
             assert!(test_interrupt::parked_wait().is_some());
 
             interrupts::interrupt_now();

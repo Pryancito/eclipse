@@ -408,14 +408,14 @@ impl Future for ChangeFuture<'_> {
         // thing here that can answer a signal or a kill.
         // The waker is left with the thread before the look: a signal queued
         // after it wakes this wait, which then needs no timer.
-        let (interrupted, parked) = this.signal.check(cx.waker());
+        let (interrupted, _parked) = this.signal.check(cx.waker());
         if let Err(err) = interrupted {
             return this.done(Err(err));
         }
-        if parked {
-            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
-            return Poll::Pending;
-        }
+        // Parked on the thread or not, the tick below stays: a signal
+        // wakes this wait by itself now, but the tick is also the
+        // insurance against a wake lost in the readiness wiring
+        // (`crate::sync::LOST_WAKE_TICK_MS`).
         let deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(MSG_INTERRUPT_CHECK_TICK_MS));
         if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
