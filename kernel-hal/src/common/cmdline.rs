@@ -132,6 +132,15 @@ pub fn user_e1000e(cmdline: &str) -> bool {
     user_devices(cmdline).1
 }
 
+/// Whether a boot leaves its virtio disks to the driver in userspace
+/// without naming them (`zcore_drivers::user::leave_virtio_disks`): it
+/// does unless it keeps them for the kernel's own driver (`ublk=kernel`)
+/// or has shut the gateway that driver claims a disk through
+/// (`zircon.gateway=0`). A disk `udriver=` names is left either way.
+pub fn user_disks(cmdline: &str) -> bool {
+    value(cmdline, "ublk") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+}
+
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
 /// on in one go — `nvidia.cuda` for every switch CUDA needs.
 ///
@@ -883,6 +892,18 @@ mod tests {
         assert!(!user_e1000e("unetstack=none"));
         assert!(!user_e1000e("unetcard=kernel"));
         assert!(!user_e1000e("zircon.gateway=0"));
+    }
+
+    #[test]
+    fn the_virtio_disks_are_userspace_s_unless_the_boot_keeps_them() {
+        assert!(user_disks("LOG=warn:ROOT=/dev/vda"));
+        assert!(user_disks(""));
+        assert!(user_disks("ublk=user:zircon.gateway=1"));
+        // The kernel's own driver, or no gateway to claim a disk through.
+        assert!(!user_disks("LOG=warn:ublk=kernel"));
+        assert!(!user_disks("zircon.gateway=0"));
+        // A word that only ends like it says nothing.
+        assert!(user_disks("notublk=kernel"));
     }
 
     #[test]

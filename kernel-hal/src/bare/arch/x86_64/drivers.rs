@@ -258,6 +258,12 @@ pub(super) fn init() -> DeviceResult {
     // Before any bus is probed: a disk it finds may be one to leave alone.
     let (udriver, net_by_default) = crate::cmdline::user_devices(crate::KCONFIG.cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
+    // The virtio disks too, for the driver in userspace: all of them, or
+    // all but the first when there is no initrd and that one is the disk
+    // the root comes from. `ublk=kernel` keeps them in the kernel.
+    if crate::cmdline::user_disks(crate::KCONFIG.cmdline) {
+        zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
+    }
     // The e1000e too, on this architecture, where its driver in userspace
     // has been run and measured: `unetcard=kernel` keeps it in the kernel.
     if crate::cmdline::user_e1000e(crate::KCONFIG.cmdline) {

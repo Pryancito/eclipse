@@ -81,15 +81,18 @@ const NETSTACK_USES: [&str; 2] = ["tools/eclipse-udrivers/src", "smoltcp/src"];
 const FATFS_PACKAGE: &str = "eclipse-fatfs";
 const FATFS: [&str; 2] = ["eclipse-fatfs", "eclipse-fs-bench"];
 const FATFS_USES: [&str; 1] = ["tools/eclipse-udrivers/src"];
+/// How many virtio disks get a driver service of their own (`ublk`,
+/// `ublk2`, ...): the ones the kernel leaves beyond these have none.
+const UBLK_DISKS: usize = 4;
 
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk; and
 /// `fat-mounts`, which mounts fstab's FAT volumes with a server each.
 ///
 /// `udriver =` keeps each out of every boot where the kernel drives the
-/// device itself or the machine has none: a disk is left when the command
-/// line says so, and the first virtio network card unless it says
-/// otherwise. Supervised: when a driver dies the kernel resets its device
+/// device itself or the machine has none: the virtio disks and the first
+/// virtio network card are left unless the command line says otherwise
+/// (`ublk=kernel` keeps the disks in the kernel). Supervised: when a driver dies the kernel resets its device
 /// and init starts the next one at once.
 ///
 /// `service` is a driver doing its job and nothing else: it hands the
@@ -180,30 +183,54 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     )
     .unwrap();
 
-    // The disk: whichever the command line names. Which virtio disk is
-    // spare depends on the machine (the root may be the first), so the
-    // service is gated on the kind and the wrapper reads the number.
-    fs::write(
-        svc_dir.join("ublk.service"),
-        b"# Driver of the virtio disk left to userspace (boot with\n\
-          # udriver=virtio-blk@N). See /usr/local/bin/eclipse-ublk.\n\
-          exec = /usr/local/bin/eclipse-ublk\n\
-          type = respawn\n\
-          udriver = virtio-blk\n",
-    )
-    .unwrap();
+    // The disks: every virtio disk the kernel left, named on the command
+    // line or not (it leaves them all unasked, but the one it boots from
+    // on a machine with no initrd). Which they are depends on the machine,
+    // so each service is gated on the Nth disk of the kernel's list and
+    // the wrapper reads its number there: `ublk` drives the first, `ublk2`
+    // the second, up to four.
+    for nth in 1..=UBLK_DISKS {
+        let (name, which, arg) = match nth {
+            1 => ("ublk".to_string(), "virtio-blk".to_string(), String::new()),
+            n => (
+                format!("ublk{n}"),
+                format!("virtio-blk/{n}"),
+                format!(" {n}"),
+            ),
+        };
+        fs::write(
+            svc_dir.join(format!("{name}.service")),
+            format!(
+                "# Driver of virtio disk number {nth} of those the kernel left to\n\
+                 # userspace (all of them, unless the boot says ublk=kernel or\n\
+                 # names one with udriver=virtio-blk@N). See\n\
+                 # /usr/local/bin/eclipse-ublk.\n\
+                 exec = /usr/local/bin/eclipse-ublk{arg}\n\
+                 type = respawn\n\
+                 udriver = {which}\n"
+            ),
+        )
+        .unwrap();
+    }
     fs::write(
         localbin.join("eclipse-ublk"),
         b"#!/bin/sh\n\
-          # Eclipse OS: the userspace driver of the virtio disk the kernel\n\
-          # left alone (udriver=virtio-blk@N), in the foreground for\n\
-          # eclipse-init, which starts it again if it dies. The kernel keeps\n\
-          # the disk meanwhile, with what is mounted on it, and what was being\n\
-          # read or written goes on with the next driver. See\n\
-          # tools/eclipse-udrivers.\n\
-          # Which disk: the first virtio-blk@N in the kernel's udriver= list.\n\
-          n=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^udriver=//p' | tr ',' '\\n' | sed -n 's/^virtio-blk@//p' | head -n 1)\n\
-          [ -n \"$n\" ] || { echo 'eclipse-ublk: no virtio-blk@N in udriver= on the kernel command line' >&2; sleep 5; exit 1; }\n\
+          # Eclipse OS: the userspace driver of a virtio disk the kernel\n\
+          # left alone, in the foreground for eclipse-init, which starts it\n\
+          # again if it dies. The kernel keeps the disk meanwhile, with what\n\
+          # is mounted on it, and what was being read or written goes on with\n\
+          # the next driver. See tools/eclipse-udrivers.\n\
+          # Which disk: the Nth virtio-blk@K the kernel lists in /proc/udrivers\n\
+          # (N is the argument, 1 without one); on a kernel with no such list,\n\
+          # the Nth of the udriver= words on its command line.\n\
+          nth=${1:-1}\n\
+          if [ -r /proc/udrivers ]; then\n\
+          \x20   disks=$(sed -n 's/^virtio-blk@//p' /proc/udrivers)\n\
+          else\n\
+          \x20   disks=$(tr ': ' '\\n\\n' < /proc/cmdline | sed -n 's/^udriver=//p' | tr ',' '\\n' | sed -n 's/^virtio-blk@//p')\n\
+          fi\n\
+          n=$(echo \"$disks\" | sed -n \"${nth}p\")\n\
+          [ -n \"$n\" ] || { echo \"eclipse-ublk: the kernel left no virtio disk number $nth to userspace\" >&2; sleep 5; exit 1; }\n\
           # The driver is the Rust one and only that one: the C tool's own\n\
           # driver is for checking and timing, never the system's.\n\
           [ -x /bin/udrv-virtio-blk ] || { echo 'eclipse-ublk: /bin/udrv-virtio-blk is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
@@ -219,12 +246,12 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     // the next service once what fstab asked for is mounted.
     fs::write(
         svc_dir.join("ublk-mounts.service"),
-        b"# What /etc/fstab puts on the disk the userspace driver serves\n\
-          # (boot with udriver=virtio-blk@N). See\n\
+        b"# What /etc/fstab puts on the disks the userspace driver serves\n\
+          # (every virtio disk, unless the boot says ublk=kernel). See\n\
           # /usr/local/bin/eclipse-ublk-mounts.\n\
           exec = /usr/local/bin/eclipse-ublk-mounts\n\
           type = oneshot\n\
-          after = ublk\n\
+          after = ublk ublk2 ublk3 ublk4\n\
           udriver = virtio-blk\n",
     )
     .unwrap();
@@ -243,7 +270,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # /usr/local/bin/eclipse-fat-mounts.
           exec = /usr/local/bin/eclipse-fat-mounts
           type = oneshot
-          after = ublk
+          after = ublk ublk2 ublk3 ublk4
 ",
     )
     .unwrap();
@@ -350,7 +377,7 @@ exit 0\n";
 /// the boot that keeps FAT in the kernel (`ufat=kernel`).
 const UBLK_MOUNTS: &[u8] = b"#!/bin/sh\n\
 # Eclipse OS: mount what /etc/fstab puts on the disk a userspace driver\n\
-# serves (udriver=virtio-blk@N). The kernel goes through fstab once, as\n\
+# serves (the virtio disks). The kernel goes through fstab once, as\n\
 # init starts, and that disk is not there yet: its driver is a service.\n\
 # This runs after the driver's start, waits for each device fstab names\n\
 # that nothing has mounted, and mounts it. A device that does not appear\n\

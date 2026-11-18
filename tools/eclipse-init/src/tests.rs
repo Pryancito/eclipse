@@ -310,6 +310,13 @@ fn the_kernels_list_of_what_it_left_is_what_a_driver_waits_for() {
     assert_eq!(udriver_device(Some(left), nothing, "virtio-net@0"), Some("virtio-net@0"));
     assert_eq!(udriver_device(Some("virtio-net@10\n"), nothing, "virtio-net@1"), None);
     assert_eq!(udriver_device(Some(left), nothing, "virtio"), None);
+    // The Nth of a kind: a service for each disk the kernel left.
+    let disks = "virtio-blk@1\nvirtio-net@0\nvirtio-blk@2\n";
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/1"), Some("virtio-blk@1"));
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/2"), Some("virtio-blk@2"));
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/3"), None);
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/0"), None);
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/x"), None);
     // A kernel with no list: what its command line names.
     assert_eq!(udriver_device(None, said, "virtio-net@0"), Some("virtio-net@0"));
     assert_eq!(udriver_device(None, nothing, "virtio-net@0"), None);
