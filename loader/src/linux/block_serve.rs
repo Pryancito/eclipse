@@ -819,6 +819,9 @@ pub(super) struct ServedDisk {
     /// No driver, and none came in time: requests fail instead of waiting.
     gone: AtomicBool,
     stats: IoStats,
+    /// A request has already been reported for waiting with kernel locks
+    /// held (see [`ServedDisk::note_held_locks`]): once is enough.
+    held_told: AtomicBool,
 }
 
 impl ServedDisk {
@@ -831,6 +834,7 @@ impl ServedDisk {
             driven: lock::Mutex::new(Driven { link, seat }),
             gone: AtomicBool::new(false),
             stats: IoStats::new(),
+            held_told: AtomicBool::new(false),
         };
         (disk, turn)
     }
@@ -896,6 +900,7 @@ impl ServedDisk {
         &self,
         mut request: impl FnMut(&Link) -> Result<T, DeviceError>,
     ) -> Result<T, DeviceError> {
+        self.note_held_locks();
         let mut link = self.link();
         loop {
             let r = request(&link);
@@ -915,7 +920,87 @@ impl ServedDisk {
     }
 }
 
+/// The lock depth every task runs at, with no lock of its own: measured on
+/// x86_64, 1 in a plain `getpid` as in a `read` of a disk node and in a
+/// kernel task, so a request at 1 holds nothing it took itself.
+const TASK_LOCK_DEPTH: i32 = 1;
+
+/// How many callers [`ServedDisk::note_held_locks`] names: enough to get
+/// past the block layer to whoever holds the lock.
+const HELD_CALLERS: usize = 12;
+
+/// The return addresses of this call's callers, nearest first, by the frame
+/// pointers (x86_64 keeps them: `frame-pointer` in its target). How many.
+///
+/// The chain is this thread's own, live below this frame, so each step only
+/// has to be a kernel stack word a little above the last: a frame further
+/// than 64 KiB on is not one, and the walk stops rather than read it.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn callers_here(out: &mut [u64]) -> usize {
+    use kernel_hal::kaddr::{is_kernel_stack_qword, is_kernel_text};
+    let mut rbp: u64;
+    // SAFETY: reads the frame pointer register.
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)) };
+    let mut n = 0;
+    while n < out.len() && is_kernel_stack_qword(rbp) {
+        // SAFETY: a frame record of this thread's live stack, checked above
+        // and by the bound below.
+        let (next, ret) = unsafe {
+            (
+                core::ptr::read_volatile(rbp as *const u64),
+                core::ptr::read_volatile((rbp + 8) as *const u64),
+            )
+        };
+        if !is_kernel_text(ret) {
+            break;
+        }
+        out[n] = ret;
+        n += 1;
+        if next <= rbp || next - rbp > 64 * 1024 {
+            break;
+        }
+        rbp = next;
+    }
+    n
+}
+
+/// Elsewhere there is no frame chain to walk: the warning names no callers.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn callers_here(_out: &mut [u64]) -> usize {
+    0
+}
+
 impl ServedDisk {
+    /// Say, once for the disk, that a request came with kernel locks held.
+    ///
+    /// The request gives the CPU away until its driver answers, since only
+    /// then does the driver's process run; a task that then spins on one of
+    /// the caller's locks -- a kernel filesystem's periodic commit, a second
+    /// writer -- never gives it back, and the CPU hangs with nothing on the
+    /// console but "spinlock stuck" much later. This names the disk and the
+    /// depth at the moment the hazard starts. Nothing changes for the
+    /// request.
+    fn note_held_locks(&self) {
+        let depth = lock::lock_depth() - TASK_LOCK_DEPTH;
+        if depth > 0 && !self.held_told.swap(true, Ordering::AcqRel) {
+            let mut callers = [0u64; HELD_CALLERS];
+            let n = callers_here(&mut callers);
+            let mut chain = alloc::string::String::new();
+            for &ret in &callers[..n] {
+                use core::fmt::Write;
+                let _ = write!(chain, "\n  from {}", kernel_hal::ksyms::Addr(ret));
+            }
+            // Error, not warn: the boot's log level is `error`, and this is
+            // what to read when the machine hangs later.
+            error!(
+                "served disk ({}): a request waits for its driver with {depth} kernel lock(s) \
+                 held; a task that spins on one of them meanwhile hangs this CPU, as the \
+                 driver's process never runs{chain}",
+                self.name
+            );
+        }
+    }
+
     /// The driver died under a request that sleeps: asleep until the next
     /// one, or until it is known that none comes.
     async fn next_driver(&self, old: &Arc<Link>) -> Result<Arc<Link>, DeviceError> {
