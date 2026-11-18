@@ -14,6 +14,7 @@
 //! -- is kept apart from the system calls, and tested on the host with
 //! `cargo test`.
 
+pub mod ahci;
 pub mod blk;
 pub mod channel;
 pub mod claim;

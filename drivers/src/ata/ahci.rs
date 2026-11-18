@@ -1802,6 +1802,34 @@ impl PciDriver for AhciDriverPci {
             );
         }
 
+        // `udriver=ahci@N`: the controller, with every disk on it, is a
+        // userspace driver's (`tools/eclipse-udrivers`), and the kernel
+        // does not so much as reset it until that driver dies. Counted
+        // either way, so `@N` names the same controller whatever the
+        // command line says. After the command register above: the driver
+        // needs the controller's memory decoding and its bus mastering.
+        if crate::user::reserve_if(
+            crate::user::AHCI,
+            true,
+            crate::user::Transport::Pci,
+            addr,
+            map_len,
+            || crate::user::Wiring {
+                // The MSI that `bus::pci` armed; x86 MSI numbers sit 32
+                // below their vectors, which is what the APIC takes.
+                irq: irq.map(|irq| {
+                    if cfg!(target_arch = "x86_64") {
+                        irq + 32
+                    } else {
+                        irq
+                    }
+                }),
+                vaddr: Some(mapped_vaddr),
+            },
+        ) {
+            return Err(DeviceError::NotSupported);
+        }
+
         let vaddr = mapped_vaddr;
         let vector = irq.map(|idx| idx + 32).unwrap_or(33);
         let mut disks = AhciInterface::new_all(vaddr, vector)?;

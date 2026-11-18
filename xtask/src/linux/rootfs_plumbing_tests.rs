@@ -684,7 +684,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "fat-mounts",
             "oneshot",
             "/usr/local/bin/eclipse-fat-mounts",
-            "ublk ublk2 ublk3 ublk4 unvme unvme2",
+            "ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2",
         ),
         (
             "gtk-caches",
@@ -736,12 +736,14 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "dbus-system",
         ),
         ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+        ("uahci", "respawn", "/usr/local/bin/eclipse-uahci 1", ""),
+        ("uahci2", "respawn", "/usr/local/bin/eclipse-uahci 2", ""),
         ("ublk", "respawn", "/usr/local/bin/eclipse-ublk", ""),
         (
             "ublk-mounts",
             "oneshot",
             "/usr/local/bin/eclipse-ublk-mounts",
-            "ublk ublk2 ublk3 ublk4 unvme unvme2",
+            "ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2",
         ),
         ("ublk2", "respawn", "/usr/local/bin/eclipse-ublk 2", ""),
         ("ublk3", "respawn", "/usr/local/bin/eclipse-ublk 3", ""),
@@ -977,6 +979,8 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         [
             "enet",
             "knet",
+            "uahci",
+            "uahci2",
             "ublk",
             "ublk-mounts",
             "ublk2",
@@ -1012,28 +1016,34 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         Some("/usr/local/bin/eclipse-unet kernel")
     );
     let gated = &gated[1..];
+    // The NVMe and AHCI controllers named on the command line: one
+    // service each, the Nth of the kind.
+    let controller = |at: &[(String, String)], service: &str, kind: &str| {
+        for (n, (name, body)) in at.iter().enumerate() {
+            let nth = n + 1;
+            let (want, which) = if nth == 1 {
+                (service.to_string(), kind.to_string())
+            } else {
+                (format!("{service}{nth}"), format!("{kind}/{nth}"))
+            };
+            assert_eq!(name, &want);
+            assert_eq!(field(body, "udriver"), Some(which.as_str()));
+            assert_eq!(
+                field(body, "exec"),
+                Some(format!("/usr/local/bin/eclipse-{service} {nth}").as_str())
+            );
+            assert_eq!(field(body, "type"), Some("respawn"));
+        }
+    };
+    controller(&gated[0..2], "uahci", "ahci");
+    let gated = &gated[2..];
     // The mounts: on the boots the disk's driver runs on, after its start.
-    assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-blk|nvme"));
+    assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-blk|nvme|ahci"));
     assert_eq!(
         field(&gated[1].1, "after"),
-        Some("ublk ublk2 ublk3 ublk4 unvme unvme2")
+        Some("ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2")
     );
-    // The NVMe controllers named on the command line: one service each.
-    for (n, (name, body)) in gated[6..8].iter().enumerate() {
-        let nth = n + 1;
-        assert_eq!(name, if nth == 1 { "unvme" } else { "unvme2" });
-        let which = if nth == 1 {
-            "nvme".to_string()
-        } else {
-            format!("nvme/{nth}")
-        };
-        assert_eq!(field(body, "udriver"), Some(which.as_str()));
-        assert_eq!(
-            field(body, "exec"),
-            Some(format!("/usr/local/bin/eclipse-unvme {nth}").as_str())
-        );
-        assert_eq!(field(body, "type"), Some("respawn"));
-    }
+    controller(&gated[6..8], "unvme", "nvme");
     // A service for each further disk, the Nth of the kernel's list.
     for (n, (name, body)) in gated[2..5].iter().enumerate() {
         let nth = n + 2;
@@ -1835,6 +1845,8 @@ fn the_two_sessions_never_start_each_others_clients() {
         "ublk4",
         "unvme",
         "unvme2",
+        "uahci",
+        "uahci2",
         "ublk-mounts",
         "fat-mounts",
     ];

@@ -1032,23 +1032,30 @@ impl BlockScheme for ServedDisk {
 const NEXT_DRIVER_STEP: Duration = Duration::from_millis(5);
 
 /// The disks that have been served from a device the kernel left to
-/// userspace, by that device's place among the reserved disks: what a
-/// second driver of the same device is given instead of a new disk.
+/// userspace, by that device's kind, its place among the reserved devices
+/// of that kind, and which of its disks it is (the port of an AHCI
+/// controller; 0 for a device with one): what a second driver of the same
+/// device is given instead of a new disk.
 static DISKS: lock::Mutex<Vec<(ReservedPlace, Arc<ServedDisk>)>> = lock::Mutex::new(Vec::new());
 
-/// A reserved device's kind and its place among the reserved disks.
-type ReservedPlace = (&'static str, usize);
+/// A reserved device's kind, its place among the reserved devices of that
+/// kind, and which of its disks.
+type ReservedPlace = (&'static str, usize, usize);
 
 /// The kinds of reserved device a process can serve as a disk, with the
 /// name each one's node is made after.
-const DISK_KINDS: [(&str, &str); 2] = [
+const DISK_KINDS: [(&str, &str); 3] = [
     (kernel_hal::drivers::user::VIRTIO_BLK, "virtio-blk-served"),
     (kernel_hal::drivers::user::NVME, "nvme-served"),
+    // Not `nvme` nor `virtio`: an `sdX`, as the kernel's AHCI disks are.
+    (kernel_hal::drivers::user::AHCI, "ahci-served"),
 ];
 
 /// [`ECLIPSE_BLOCK_SERVE`](super::ECLIPSE_BLOCK_SERVE): `args[0]` the FIFO end
 /// the kernel keeps, `args[1]` the data window, `args[2]` the disk's size in
-/// sectors. Both handles are the kernel's from here on, whatever the answer.
+/// sectors, `args[3]` which of the device's disks it is (an AHCI port; 0
+/// for a device with one disk). Both handles are the kernel's from here on,
+/// whatever the answer.
 ///
 /// A process that holds a reserved disk (`udriver=virtio-blk@N`, claimed)
 /// serves that disk: the first time it becomes a device node, and every
@@ -1062,11 +1069,12 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let _ = proc.remove_handle(args[1] as u32);
     let link = Arc::new(Link::new(fifo.clone(), window, args[2] as u64)?);
-    let device = DISK_KINDS
-        .iter()
-        .find_map(|(kind, _)| super::device_claim::held_by(proc, kind).map(|index| (*kind, index)));
+    let unit = args[3];
+    let device = DISK_KINDS.iter().find_map(|(kind, _)| {
+        super::device_claim::held_by(proc, kind).map(|index| (*kind, index, unit))
+    });
     let name = device
-        .and_then(|(kind, _)| DISK_KINDS.iter().find(|(k, _)| *k == kind))
+        .and_then(|(kind, _, _)| DISK_KINDS.iter().find(|(k, _)| *k == kind))
         .map_or(DISK_KINDS[0].1, |(_, name)| *name);
     let known = device.and_then(|key| {
         let disks = DISKS.lock();

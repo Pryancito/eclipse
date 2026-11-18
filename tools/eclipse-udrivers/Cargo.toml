@@ -2,7 +2,7 @@
 name = "eclipse-udrivers"
 version = "0.1.0"
 edition = "2021"
-description = "Eclipse OS drivers that run as processes: virtio and NVMe disks, network cards"
+description = "Eclipse OS drivers that run as processes: virtio, NVMe and SATA disks, network cards"
 
 # Standalone: NOT a workspace member. It targets userspace
 # (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
@@ -16,6 +16,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "udrv-virtio-blk"
 path = "src/bin/udrv-virtio-blk.rs"
+
+[[bin]]
+name = "udrv-ahci"
+path = "src/bin/udrv-ahci.rs"
 
 [[bin]]
 name = "udrv-nvme"
