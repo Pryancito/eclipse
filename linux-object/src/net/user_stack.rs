@@ -339,6 +339,7 @@ mod groups6;
 mod icmp;
 mod icmp6;
 pub mod more;
+pub mod neigh;
 mod raw;
 mod raw6;
 mod tcp;
@@ -2025,6 +2026,16 @@ impl StackLink {
                     m.len() - HEADER_LEN
                 ),
             },
+            Some((neigh::OP_NEIGH, card)) => {
+                let now = kernel_hal::timer::timer_now().as_millis() as u64;
+                match neigh::parse_neigh(&m[HEADER_LEN..], now) {
+                    Some(met) => self.more_of(card).meet(met),
+                    None => warn!(
+                        "user stack: {} bytes that are no neighbours of a card",
+                        m.len() - HEADER_LEN
+                    ),
+                }
+            }
             _ => warn!(
                 "user stack: a message that means nothing ({} bytes)",
                 m.len()
