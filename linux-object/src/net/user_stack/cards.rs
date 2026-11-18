@@ -474,8 +474,9 @@ impl StackLink {
     /// whose network `to` is on, and the first card's to anywhere else.
     pub(super) fn address_toward(&self, to: Ipv4Address) -> Ipv4Address {
         let now = self.others.now.lock();
-        let others = now.iter().filter(|(card, _)| **card != 0);
-        let mut near = others.filter_map(|(_, other)| other.said.address);
+        // A card's first address before the ones it has after it, the
+        // first card's before the others': as the stack picks.
+        let mut near = now.values().filter_map(|other| other.said.address);
         near.find(|address| address.contains_addr(&to))
             .map(|address| address.address())
             // Then an address a card has after its first.

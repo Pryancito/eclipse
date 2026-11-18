@@ -780,4 +780,55 @@ mod tests {
             Err(Refused::Unreachable)
         );
     }
+
+    /// The addresses an IPv4 frame of ours leaves from and goes to.
+    fn ends(frame: &[u8]) -> (Ipv4Address, Ipv4Address) {
+        let frame = EthernetFrame::new_checked(frame).unwrap();
+        let ip = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        assert!(ip.verify_checksum());
+        (ip.src_addr(), ip.dst_addr())
+    }
+
+    #[test]
+    fn a_socket_bound_to_another_address_sends_from_it() {
+        use crate::socks::tests::bind_at;
+        let mut bench = Bench::new();
+        bench.meet();
+        let Bench { window, iface, .. } = bench;
+        let mut stack = Stack::new(iface);
+        let other = Ipv4Address([192, 168, 7, 9]);
+        assert_eq!(stack.grant(Wish::Also(v4(other.0, 24), true)), Ok(()));
+        // Bound to no address, a datagram leaves from the card's first;
+        // bound to the other, from the other, to the same place.
+        stack.request(&bind(1, 5000)).unwrap();
+        stack
+            .request(&bind_at(2, 5001, IpAddress::Ipv4(other)))
+            .unwrap();
+        assert_eq!(stack.request(&send(1, THEIR_IP, 53, b"any")), Ok(true));
+        assert_eq!(stack.request(&send(2, THEIR_IP, 53, b"bound")), Ok(true));
+        let sent = frames(&mut stack, &window, 1);
+        let from: Vec<_> = sent.iter().map(|frame| ends(frame)).collect();
+        assert_eq!(from, [(OUR_IP, THEIR_IP), (other, THEIR_IP)]);
+        // A connection from a bound socket is from its address too.
+        let mut connect = crate::socks::tests::message(crate::socks::tcp::OP_CONNECT, 3, &[]);
+        connect.extend_from_slice(&THEIR_IP.0);
+        connect.extend_from_slice(&80u16.to_le_bytes());
+        connect.extend_from_slice(&50000u16.to_le_bytes());
+        connect.extend_from_slice(&4096u32.to_le_bytes());
+        connect.extend_from_slice(&other.0);
+        assert_eq!(stack.request(&connect), Ok(true));
+        let sent = frames(&mut stack, &window, 2);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(ends(&sent[0]), (other, THEIR_IP));
+        // What it was bound to is of one version of IP: nothing of the
+        // other leaves it.
+        let mut six = crate::socks::tests::message(crate::socks::OP_SEND6, 2, &[0xfe, 0x80]);
+        six.extend_from_slice(&[0; 13]);
+        six.extend_from_slice(&[1, 53, 0, 0, 0, b'x']);
+        assert_eq!(stack.request(&six), Err(Refused::Unreachable));
+        // A `BIND` that says an address says which kind, in sixteen bytes.
+        let mut short = bind_at(4, 5002, IpAddress::Ipv4(other));
+        short.pop();
+        assert_eq!(stack.request(&short), Err(Refused::Malformed));
+    }
 }

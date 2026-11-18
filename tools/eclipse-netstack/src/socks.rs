@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
-//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero
+//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero, or 4 or 6 and then  20  [u8; 16] address
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
@@ -31,7 +31,11 @@
 //! each travelled. Unless its `BIND` says the socket is for one version
 //! of IP `only` (4 or 6, where 0 is both), as an `AF_INET` socket is and
 //! one told `IPV6_V6ONLY`: then what arrives as the other is not its
-//! own, and another socket can have the same port for that.
+//! own, and another socket can have the same port for that. A `BIND`
+//! that says an address of the machine's is of a socket that was bound
+//! to it: it hears what arrives at that address (and at everybody's or a
+//! group's), and what it sends leaves from it, whichever address the card
+//! would have picked.
 //! The kernel numbers the sockets and gives out the ports, so a
 //! `BIND` is told, not asked: the stack opens a smoltcp socket on that
 //! port and from then on every datagram that arrives for it goes to the
@@ -590,7 +594,21 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             OP_RAW6 => self.raw6_open(sock, m),
             OP_PACKET6 => self.raw6_packet(sock, m),
             OP_BIND => {
-                let said: [u8; 4] = m[HEADER_LEN..].try_into().map_err(|_| Refused::Malformed)?;
+                // The port, for what, and when the socket was bound to an
+                // address of the machine's, its version and the address:
+                // what the socket then sends leaves from it, and it hears
+                // what arrives at it and nowhere else.
+                let rest = &m[HEADER_LEN..];
+                let said: [u8; 4] = rest
+                    .get(..4)
+                    .and_then(|said| said.try_into().ok())
+                    .ok_or(Refused::Malformed)?;
+                let at = match (said[3], rest.len()) {
+                    (0, 4) => IpAddress::Unspecified,
+                    (4, 20) => IpAddress::Ipv4(Ipv4Address::from_bytes(&rest[4..8])),
+                    (6, 20) => IpAddress::Ipv6(Ipv6Address::from_bytes(&rest[4..20])),
+                    _ => return Err(Refused::Malformed),
+                };
                 let port = u16::from_le_bytes([said[0], said[1]]);
                 let only = match said[2] {
                     0 => None,
@@ -609,7 +627,9 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                     )
                 };
                 let mut socket = UdpSocket::new(buffer(RX_DATAGRAMS), buffer(TX_DATAGRAMS));
-                socket.bind(port).map_err(|_| Refused::Bind)?;
+                socket
+                    .bind(IpEndpoint::new(at, port))
+                    .map_err(|_| Refused::Bind)?;
                 socket.set_only(only);
                 self.socks.insert(sock, self.set.add(socket));
                 Ok(false)
@@ -627,7 +647,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 }
                 // Port 0 is nobody's, and smoltcp says so with a panic in
                 // a debug build.
-                if port == 0 || !self.reaches(addr) {
+                if port == 0 || !self.reaches(addr) || self.bound_as(handle, IpVersion::Ipv6) {
                     return Err(Refused::Unreachable);
                 }
                 let to = IpEndpoint::new(IpAddress::Ipv4(addr), port);
@@ -649,7 +669,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 if data.len() > self.max_datagram6() {
                     return Err(Refused::TooLong);
                 }
-                if port == 0 || !self.reaches6(addr) {
+                if port == 0 || !self.reaches6(addr) || self.bound_as(handle, IpVersion::Ipv4) {
                     return Err(Refused::Unreachable);
                 }
                 let to = IpEndpoint::new(IpAddress::Ipv6(addr), port);
@@ -682,6 +702,14 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             }
             _ => Err(Refused::Malformed),
         }
+    }
+
+    /// Whether the socket `handle` was bound to an address of `version`:
+    /// what it sends leaves from that address, and so cannot go to one of
+    /// the other version.
+    fn bound_as(&mut self, handle: SocketHandle, version: IpVersion) -> bool {
+        let at = self.set.get::<UdpSocket>(handle).endpoint().addr;
+        !at.is_unspecified() && at.version() == version
     }
 
     /// Have the next datagram of the socket `handle` travel `hop_limit`
@@ -922,6 +950,25 @@ pub(crate) mod tests {
     /// A `BIND` of a socket that is for both versions of IP.
     pub(crate) fn bind(sock: u64, port: u16) -> Vec<u8> {
         bind_only(sock, port, 0)
+    }
+
+    /// A `BIND` of a socket at the address `at` of the machine's.
+    pub(crate) fn bind_at(sock: u64, port: u16, at: IpAddress) -> Vec<u8> {
+        let [low, high] = port.to_le_bytes();
+        let mut rest = vec![low, high, 0, 0];
+        match at {
+            IpAddress::Ipv4(at) => {
+                rest[3] = 4;
+                rest.extend_from_slice(&at.0);
+                rest.extend_from_slice(&[0; 12]);
+            }
+            IpAddress::Ipv6(at) => {
+                rest[3] = 6;
+                rest.extend_from_slice(&at.0);
+            }
+            _ => {}
+        }
+        message(OP_BIND, sock, &rest)
     }
 
     /// A `BIND` of a socket that is for one version `only`: 4 or 6.

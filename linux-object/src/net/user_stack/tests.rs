@@ -127,15 +127,15 @@ pub(super) const MAX_FOR_TESTS: usize = 1472;
 
 #[test]
 fn a_message_is_its_header_and_what_the_operation_adds() {
-    let bind = bind_message(7, 5000, Takes::Four);
+    let bind = bind_message(7, 5000, Takes::Four, None);
     assert_eq!(bind.len(), HEADER_LEN + 4);
     assert_eq!(&bind[..4], &[0; 4], "not a reply to any call");
     assert_eq!(parse_header(&bind), Some((OP_BIND, 7)));
     assert_eq!(&bind[16..18], &5000u16.to_le_bytes());
     // And which versions of IP the port is the socket's for.
     assert_eq!(&bind[18..], &[4, 0]);
-    assert_eq!(&bind_message(7, 5000, Takes::Both)[18..], &[0, 0]);
-    assert_eq!(&bind_message(7, 5000, Takes::Six)[18..], &[6, 0]);
+    assert_eq!(&bind_message(7, 5000, Takes::Both, None)[18..], &[0, 0]);
+    assert_eq!(&bind_message(7, 5000, Takes::Six, None)[18..], &[6, 0]);
 
     // An `UNDELIVERED`: where it went, then what was said of it.
     assert_eq!(EV_UNDELIVERED, 7);
@@ -226,7 +226,7 @@ fn a_message_is_its_header_and_what_the_operation_adds() {
         ]
     );
     assert_eq!(
-        bind_message(7, 5000, Takes::Four),
+        bind_message(7, 5000, Takes::Four, None),
         [0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x13, 4, 0]
     );
     assert_eq!((OP_SEND, OP_CLOSE), (2, 3));
@@ -255,7 +255,7 @@ fn a_datagram_for_this_machine_goes_from_socket_to_socket() {
     let sent_from = port(&client);
     assert_eq!(
         stack.told(),
-        Some(bind_message(client.sock, sent_from, Takes::Four))
+        Some(bind_message(client.sock, sent_from, Takes::Four, None))
     );
     assert_eq!(stack.told(), None);
     let mut buf = [0u8; 16];
@@ -325,7 +325,7 @@ fn an_ipv6_datagram_socket_carries_ipv6() {
     assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
     assert_eq!(
         stack.told(),
-        Some(bind_message(server.sock, 5353, Takes::Both))
+        Some(bind_message(server.sock, 5353, Takes::Both, None))
     );
 
     // The messages, as the stack reads and writes them.
@@ -423,7 +423,22 @@ fn an_ipv6_datagram_socket_carries_ipv6() {
     );
     assert_eq!(
         stack.told(),
-        Some(bind_message(other.sock, 5355, Takes::Both))
+        Some(bind_message(
+            other.sock,
+            5355,
+            Takes::Both,
+            Some(at6("fec0::7", 0).addr)
+        ))
+    );
+    assert_eq!(ip(Socket::endpoint(&other).unwrap()), at6("fec0::7", 5355));
+    // From an address of IPv6 there is no way to one of IPv4.
+    assert_eq!(
+        Socket::write(
+            &other,
+            b"four",
+            Some(Endpoint::Ip(at6("::ffff:10.0.9.1", 53)))
+        ),
+        Err(LxError::ENETUNREACH)
     );
     let own = Endpoint::Ip(at6("fec0::7", 5353));
     assert_eq!(Socket::write(&other, b"here", Some(own)), Ok(4));
@@ -459,7 +474,7 @@ fn an_ipv6_datagram_socket_carries_ipv4() {
     assert_eq!(Socket::bind(&server, Endpoint::Ip(at6("::", 5353))), Ok(0));
     assert_eq!(
         stack.told(),
-        Some(bind_message(server.sock, 5353, Takes::Both))
+        Some(bind_message(server.sock, 5353, Takes::Both, None))
     );
     assert_eq!(ip(Socket::endpoint(&server).unwrap()), at6("::", 5353));
     // It is the IPv6 table's, with the address it has, which is none.
@@ -575,7 +590,10 @@ fn a_datagram_socket_bound_to_this_machine_is_not_the_stacks() {
     // The stack heard of the client's port and nothing else, and does
     // not hear of the server's close.
     while let Some(m) = stack.told() {
-        assert_eq!(m, bind_message(client.sock, port(&client), Takes::Four));
+        assert_eq!(
+            m,
+            bind_message(client.sock, port(&client), Takes::Four, None)
+        );
     }
     drop(server);
     assert_eq!(stack.told(), None);
@@ -593,7 +611,10 @@ fn bind_gives_the_port_asked_for_once_and_tells_the_stack() {
     assert_eq!(port(&a), 0);
 
     assert_eq!(Socket::bind(&a, any(7000)), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(a.sock, 7000, Takes::Four)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(a.sock, 7000, Takes::Four, None))
+    );
     assert_eq!(port(&a), 7000);
     // A socket has one port, and a port one socket.
     assert_eq!(Socket::bind(&a, any(7001)), Err(LxError::EINVAL));
@@ -605,7 +626,10 @@ fn bind_gives_the_port_asked_for_once_and_tells_the_stack() {
     drop(a);
     assert_eq!(stack.told(), Some(close_message(closed)));
     assert_eq!(Socket::bind(&b, any(7000)), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(b.sock, 7000, Takes::Four)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(b.sock, 7000, Takes::Four, None))
+    );
 }
 
 #[test]
@@ -619,7 +643,7 @@ fn a_send_from_a_socket_without_a_port_gets_it_one_first() {
     assert!(EPHEMERAL.contains(&port_a));
     assert_eq!(
         stack.told(),
-        Some(bind_message(a.sock, port_a, Takes::Four))
+        Some(bind_message(a.sock, port_a, Takes::Four, None))
     );
     assert_eq!(
         stack.told(),
@@ -731,7 +755,7 @@ fn what_the_stack_says_that_is_no_datagram_for_a_socket_is_dropped() {
     stack.arrives(gone_sock, HOST, 1, b"late");
     stack.arrives(9999, HOST, 1, b"nobody's");
     stack.say(alloc::vec![1, 2, 3]);
-    stack.say(bind_message(a.sock, 80, Takes::Four));
+    stack.say(bind_message(a.sock, 80, Takes::Four, None));
     stack.say(send_message(a.sock, HOST, 1, 64, b"not DATA"));
     // A DATA with nothing in it, and one whose second record is cut
     // short: the first is delivered all the same.
@@ -1129,8 +1153,14 @@ fn when_the_stack_dies_its_sockets_wait_for_the_next() {
     // the one that is this machine's alone, and they are its: what
     // it hears for them arrives, and it is told when one closes.
     let next = stack_of(&link);
-    assert_eq!(next.told(), Some(bind_message(a.sock, 7000, Takes::Four)));
-    assert_eq!(next.told(), Some(bind_message(b.sock, 7002, Takes::Four)));
+    assert_eq!(
+        next.told(),
+        Some(bind_message(a.sock, 7000, Takes::Four, None))
+    );
+    assert_eq!(
+        next.told(),
+        Some(bind_message(b.sock, 7002, Takes::Four, None))
+    );
     assert_eq!(next.told(), None);
     next.arrives(a.sock, HOST, 1, b"again");
     link.pump();
@@ -1648,11 +1678,11 @@ fn the_machine_has_sockets_before_it_has_a_stack() {
     let stack = stack_of(&link);
     assert_eq!(
         stack.told(),
-        Some(bind_message(server.sock, 5353, Takes::Four))
+        Some(bind_message(server.sock, 5353, Takes::Four, None))
     );
     assert_eq!(
         stack.told(),
-        Some(bind_message(client.sock, port(&client), Takes::Four))
+        Some(bind_message(client.sock, port(&client), Takes::Four, None))
     );
     assert_eq!(Socket::write(&client, b"x", to(HOST, 9)), Ok(1));
     assert_eq!(
@@ -1716,10 +1746,13 @@ fn a_socket_for_ipv6_only_leaves_its_port_to_one_of_ipv4() {
     assert_eq!(Socket::bind(&v6only, Endpoint::Ip(at6("::", 7000))), Ok(0));
     assert_eq!(
         stack.told(),
-        Some(bind_message(v6only.sock, 7000, Takes::Six))
+        Some(bind_message(v6only.sock, 7000, Takes::Six, None))
     );
     assert_eq!(Socket::bind(&v4, any(7000)), Ok(0));
-    assert_eq!(stack.told(), Some(bind_message(v4.sock, 7000, Takes::Four)));
+    assert_eq!(
+        stack.told(),
+        Some(bind_message(v4.sock, 7000, Takes::Four, None))
+    );
     let both = socket6();
     let another = socket6();
     assert_eq!(only6(&another, 1), Ok(0));
@@ -1782,9 +1815,9 @@ fn a_socket_for_ipv6_only_leaves_its_port_to_one_of_ipv4() {
     while let Some(m) = next.told() {
         told.push(m);
     }
-    assert!(told.contains(&bind_message(v4.sock, 7000, Takes::Four)));
-    assert!(told.contains(&bind_message(v6only.sock, 7000, Takes::Six)));
-    assert!(told.contains(&bind_message(both.sock, 7001, Takes::Both)));
+    assert!(told.contains(&bind_message(v4.sock, 7000, Takes::Four, None)));
+    assert!(told.contains(&bind_message(v6only.sock, 7000, Takes::Six, None)));
+    assert!(told.contains(&bind_message(both.sock, 7001, Takes::Both, None)));
     let binds = |told: &[Vec<u8>]| {
         let is_bind = |m: &&Vec<u8>| parse_header(m).is_some_and(|(op, _)| op == OP_BIND);
         told.iter().filter(is_bind).count()

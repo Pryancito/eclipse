@@ -6,8 +6,8 @@
 //! would (`linux-object/src/net/user_stack.rs` says it at length):
 //!
 //! ```text
-//! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window
-//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
+//! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window  (28  [u8; 4] from)
+//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window  (40  [u8; 16] from)
 //! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
 //! LISTEN6  (kernel to stack)  as LISTEN
 //! LISTEN6ONLY (kernel to stack)  as LISTEN
@@ -41,7 +41,9 @@
 //! `IPV6_V6ONLY`, and leaves the port to a `LISTEN` for the others. A
 //! `CONNECT6` is a connect to an
 //! IPv6 address, from the address of the card that
-//! [`six`](super::six) says goes there.
+//! [`six`](super::six) says goes there. A connect that ends with a
+//! `from` is of a socket that was bound to that address of the
+//! machine's, and the connection is from it.
 //!
 //! An `EVENTS` carries what a turn of the stack made of every connection,
 //! as a `DATA` carries its datagrams: the kernel is woken once.
@@ -275,9 +277,13 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// `CONNECT`. A connect that cannot be started is answered `FAILED`
     /// by the next turn, which is why this asks for one.
     pub(super) fn connect(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
-        if m.len() != HEADER_LEN + 12 {
-            return Err(Refused::Malformed);
-        }
+        // With four bytes more, the socket was bound to that address of
+        // the machine's, and the connection is from it.
+        let from = match m.len() - HEADER_LEN.min(m.len()) {
+            12 => IpAddress::Unspecified,
+            16 => IpAddress::Ipv4(Ipv4Address::from_bytes(&m[28..32])),
+            _ => return Err(Refused::Malformed),
+        };
         if self.knows(sock) {
             return Err(Refused::Bind);
         }
@@ -288,14 +294,24 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         // network), and nobody to connect to at everybody's address or
         // at a group's.
         let way = !addr.is_broadcast() && !addr.is_multicast() && self.reaches(addr);
-        self.connect_to(sock, IpAddress::Ipv4(addr), port, local, window, way)
+        self.connect_to(
+            sock,
+            IpAddress::Ipv4(addr),
+            port,
+            (from, local),
+            window,
+            way,
+        )
     }
 
     /// `CONNECT6`, which is answered as a `CONNECT` is.
     pub(super) fn connect6(&mut self, sock: u64, m: &[u8]) -> Result<bool, Refused> {
-        if m.len() != HEADER_LEN + 24 {
-            return Err(Refused::Malformed);
-        }
+        // With sixteen bytes more, the address the socket was bound to.
+        let from = match m.len() - HEADER_LEN.min(m.len()) {
+            24 => IpAddress::Unspecified,
+            40 => IpAddress::Ipv6(Ipv6Address::from_bytes(&m[40..56])),
+            _ => return Err(Refused::Malformed),
+        };
         if self.knows(sock) {
             return Err(Refused::Bind);
         }
@@ -303,17 +319,25 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         let (port, local) = (u16_at(m, 32), u16_at(m, 34));
         let window = u32_at(m, 36) as usize;
         let way = !addr.is_multicast() && self.reaches6(addr);
-        self.connect_to(sock, IpAddress::Ipv6(addr), port, local, window, way)
+        self.connect_to(
+            sock,
+            IpAddress::Ipv6(addr),
+            port,
+            (from, local),
+            window,
+            way,
+        )
     }
 
-    /// Start the connect of `sock` from the port `local` to `port` at
-    /// `addr`, when there is a `way` there.
+    /// Start the connect of `sock` from the port `local` (and the address
+    /// `from` of the machine's, when the socket was bound to one) to
+    /// `port` at `addr`, when there is a `way` there.
     fn connect_to(
         &mut self,
         sock: u64,
         addr: IpAddress,
         port: u16,
-        local: u16,
+        (from, local): (IpAddress, u16),
         window: usize,
         way: bool,
     ) -> Result<bool, Refused> {
@@ -330,7 +354,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         }
         let mut socket = socket();
         let to = IpEndpoint::new(addr, port);
-        if socket.connect(to, local).is_err() {
+        if socket.connect(to, IpEndpoint::new(from, local)).is_err() {
             return Err(Refused::Malformed);
         }
         // After the connect, which forgets the one before.
