@@ -806,6 +806,11 @@ impl Syscall<'_> {
             // cloning and single-client devices are not claimed by one.
             let inode = if flags.is_path() {
                 inode
+            } else if let Some(served) = inode.downcast_ref::<linux_object::fs::devfs::ServedNode>()
+            {
+                // A node a process serves: every open is the server's to
+                // take, told how it is opened (`O_ACCMODE`).
+                served.open_client(flags.bits() & 3)?
             } else {
                 prepare_open_inode(inode, proc.fsuid())?
             };

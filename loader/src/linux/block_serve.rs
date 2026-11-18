@@ -1037,7 +1037,10 @@ type Served = ((&'static str, usize), Arc<ServedDisk>);
 /// The disks that have been served from a device the kernel left to
 /// userspace, by that device's place among the reserved disks: what a
 /// second driver of the same device is given instead of a new disk.
-static DISKS: lock::Mutex<Vec<Served>> = lock::Mutex::new(Vec::new());
+static DISKS: lock::Mutex<Vec<(ReservedPlace, Arc<ServedDisk>)>> = lock::Mutex::new(Vec::new());
+
+/// A reserved device's kind and its place among the reserved disks.
+type ReservedPlace = (&'static str, usize);
 
 /// The kinds of reserved device a process can serve as a disk, with the
 /// name each one's node is made after.

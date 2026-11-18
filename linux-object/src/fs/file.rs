@@ -1801,6 +1801,13 @@ impl FileLike for File {
         if let Some(pipe) = inode.downcast_ref::<super::pipe::Pipe>() {
             return Ok(pipe.async_poll_for(_events).await?);
         }
+        // A served node's open has its readiness on a bus of its own, both
+        // directions: a writer waits for room, not for something to read.
+        if let Some(served) = inode.downcast_ref::<super::devfs::ServedOpen>() {
+            let mask = super::poll_events_to_bus_mask(_events);
+            crate::sync::wait_for_event(served.bus(), mask).await?;
+            return Ok(inode.poll()?);
+        }
         Ok(inode.async_poll().await?)
     }
 
@@ -1820,6 +1827,16 @@ impl FileLike for File {
         }
         if let Some(pipe) = inode.downcast_ref::<super::pipe::Pipe>() {
             return Some(pipe.subscribe_readiness(events, waker));
+        }
+        // An open of a node a process serves: its readiness is what the
+        // server last said, on the open's own bus.
+        if let Some(served) = inode.downcast_ref::<super::devfs::ServedOpen>() {
+            let mask = super::poll_events_to_bus_mask(events);
+            return Some(crate::sync::subscribe_readiness_on(
+                &served.bus(),
+                mask,
+                waker,
+            ));
         }
         // An NVIDIA open waiting for an OS event the RM posts to it.
         #[cfg(target_arch = "x86_64")]
@@ -1876,6 +1893,12 @@ impl FileLike for File {
 
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         // ioctl syscall
+        // A served node's `ioctl` returns what its server answers, which
+        // is waited for without this file's lock.
+        let inode = self.inner.read().inode.clone();
+        if let Some(served) = inode.downcast_ref::<super::devfs::ServedOpen>() {
+            return served.ioctl(request as u32, arg1);
+        }
         let inner = self.inner.read();
         use super::devfs::PcmDev;
         if let Some(pcm) = inner.inode.downcast_ref::<PcmDev>() {
