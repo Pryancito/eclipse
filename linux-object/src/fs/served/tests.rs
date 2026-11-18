@@ -168,6 +168,19 @@ fn server(
     asked: &Arc<[AtomicUsize; 16]>,
     dies_on: Option<DiesOn>,
 ) -> (Arc<Link>, thread::JoinHandle<ZxError>) {
+    server_with(tree, asked, dies_on, serve)
+}
+
+/// How a fake server answers one request: [`serve`]'s shape.
+type Answers = fn(&mut Tree, u32, &str, u64, usize, &[u8]) -> (i64, u64, Vec<u8>);
+
+/// [`server`], answering with `answers`.
+fn server_with(
+    tree: &Arc<std::sync::Mutex<Tree>>,
+    asked: &Arc<[AtomicUsize; 16]>,
+    dies_on: Option<DiesOn>,
+    answers: Answers,
+) -> (Arc<Link>, thread::JoinHandle<ZxError>) {
     let (ours, servers) = Fifo::create(SLOTS, MSG);
     let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
     let link = Arc::new(Link::new(ours, window.clone()).unwrap());
@@ -213,7 +226,7 @@ fn server(
             return ZxError::CANCELED;
         }
         n[op as usize].fetch_add(1, Ordering::Relaxed);
-        let (status, a, data) = serve(
+        let (status, a, data) = answers(
             &mut t.lock().unwrap(),
             op,
             path,
@@ -1041,4 +1054,190 @@ fn a_removed_files_pages_are_forgotten() {
     // The open file has nothing to read, and keeps no pages for it.
     assert!(block_on(FileLike::read_at(&*file, 0, &mut buf)).is_err());
     assert_eq!(crate::fs::file::shared_file_vmo_stats().0, kept - 1);
+}
+
+/// A POSIX record: [`wire::RECORD_HEAD_POSIX`] bytes, then the name.
+fn posix_record(name: &str, mode: u32, uid: u32, size: u64) -> Vec<u8> {
+    let head = wire::RECORD_HEAD_POSIX;
+    let rec_len = (head + name.len()).next_multiple_of(8);
+    let mut r = vec![0u8; rec_len];
+    r[0..2].copy_from_slice(&(rec_len as u16).to_ne_bytes());
+    r[2..4].copy_from_slice(&(name.len() as u16).to_ne_bytes());
+    r[4..8].copy_from_slice(&mode.to_ne_bytes());
+    r[8..16].copy_from_slice(&size.to_ne_bytes());
+    r[40..44].copy_from_slice(&uid.to_ne_bytes());
+    r[44..48].copy_from_slice(&(uid + 1).to_ne_bytes());
+    r[48..52].copy_from_slice(&1u32.to_ne_bytes());
+    r[head..head + name.len()].copy_from_slice(name.as_bytes());
+    r
+}
+
+/// A fake POSIX server: the top (mode 0o750, of user 7) holds the symbolic
+/// link `lnk` of user 1000, to `target`. What it is asked to change is
+/// written down in the tree, as a path `!` and what was asked.
+fn serve_posix(
+    tree: &mut Tree,
+    op: u32,
+    names: &str,
+    a: u64,
+    b: usize,
+    data: &[u8],
+) -> (i64, u64, Vec<u8>) {
+    let note = |tree: &mut Tree, what: String| tree.push((what, false, Vec::new()));
+    match op {
+        OP_STAT if names.is_empty() => (1, 0, posix_record("top", MODE_DIR | 0o750, 7, 0)),
+        OP_LIST if names.is_empty() => {
+            (1, LIST_END, posix_record("lnk", MODE_LINK | 0o777, 1000, 6))
+        }
+        OP_READ if names == "lnk" => {
+            let bytes = &b"target"[a as usize..];
+            let n = b.min(bytes.len());
+            (n as i64, 0, bytes[..n].to_vec())
+        }
+        OP_CREATE => {
+            note(tree, alloc::format!("!create {names} {a:o}"));
+            let name = split_path(names).1;
+            (1, 0, posix_record(name, a as u32, 0, 0))
+        }
+        OP_WRITE => {
+            note(
+                tree,
+                alloc::format!(
+                    "!write {names} {}",
+                    core::str::from_utf8(&data[..b]).unwrap()
+                ),
+            );
+            (b as i64, 0, Vec::new())
+        }
+        OP_SETATTR => {
+            note(
+                tree,
+                alloc::format!("!setattr {names} {}:{} {b:o}", a >> 32, a & 0xffff_ffff),
+            );
+            (0, 0, Vec::new())
+        }
+        OP_SETTIME => {
+            note(tree, alloc::format!("!settime {names} {a}"));
+            (0, 0, Vec::new())
+        }
+        _ => (-38, 0, Vec::new()),
+    }
+}
+
+/// A POSIX mount of [`serve_posix`].
+fn posix_mount() -> Mount {
+    let tree = Arc::new(std::sync::Mutex::new(Tree::new()));
+    let asked = Arc::new([const { AtomicUsize::new(0) }; 16]);
+    let (link, server) = server_with(&tree, &asked, None, serve_posix);
+    let fs = ServedFs::with_flags(link, SERVE_POSIX);
+    fs.mounted.store(true, Ordering::Release);
+    Mount {
+        fs,
+        tree,
+        asked,
+        servers: vec![server],
+    }
+}
+
+impl Mount {
+    /// What the fake POSIX server was asked to change.
+    fn notes(&self) -> Vec<String> {
+        let tree = self.tree.lock().unwrap();
+        tree.iter()
+            .map(|(p, _, _)| p.clone())
+            .filter(|p| p.starts_with('!'))
+            .collect()
+    }
+}
+
+#[test]
+fn a_posix_mount_has_owners_permissions_and_symbolic_links() {
+    let m = posix_mount();
+    let root = m.root().metadata().unwrap();
+    assert_eq!(
+        (root.type_, root.mode, root.uid, root.gid),
+        (FileType::Dir, 0o750, 7, 8)
+    );
+    // Asked once.
+    m.root().metadata().unwrap();
+    assert_eq!(m.asked(OP_STAT), 1);
+    let link = m.root().find("lnk").unwrap();
+    let meta = link.metadata().unwrap();
+    assert_eq!(
+        (meta.type_, meta.mode, meta.uid, meta.gid),
+        (FileType::SymLink, 0o777, 1000, 1001)
+    );
+    let mut target = [0u8; 16];
+    assert_eq!(link.read_at(0, &mut target).unwrap(), 6);
+    assert_eq!(&target[..6], b"target");
+}
+
+#[test]
+fn a_posix_mount_makes_the_kind_asked_for_with_its_permissions() {
+    let m = posix_mount();
+    // A link is all permissions, whatever the mask left.
+    let made = m.root().create("new", FileType::SymLink, 0o755).unwrap();
+    made.write_at(0, b"elsewhere").unwrap();
+    assert_eq!(made.metadata().unwrap().type_, FileType::SymLink);
+    assert_eq!(made.metadata().unwrap().size, 9);
+    m.root().create("fifo", FileType::NamedPipe, 0o640).unwrap();
+    assert_eq!(
+        m.root().create("dev", FileType::CharDevice, 0o600).err(),
+        Some(FsError::NotSupported)
+    );
+    assert_eq!(
+        m.notes(),
+        [
+            "!create new 120777",
+            "!write new elsewhere",
+            "!create fifo 10640"
+        ]
+    );
+}
+
+#[test]
+fn a_posix_mount_keeps_the_owner_and_the_mode_it_is_given_and_asks_once() {
+    let m = posix_mount();
+    let link = m.root().find("lnk").unwrap();
+    let mut meta = link.metadata().unwrap();
+    // Nothing changed: nothing asked.
+    link.set_metadata(&meta).unwrap();
+    assert!(m.notes().is_empty());
+    // A link's owner changes; its permissions stay all of them.
+    meta.uid = 0;
+    meta.mode = 0o700;
+    link.set_metadata(&meta).unwrap();
+    assert_eq!(m.notes(), ["!setattr lnk 0:1001 777"]);
+    let now = link.metadata().unwrap();
+    assert_eq!(
+        (now.uid, now.mode, now.type_),
+        (0, 0o777, FileType::SymLink)
+    );
+    // A file's permissions change.
+    let file = m.root().create("plain", FileType::File, 0o644).unwrap();
+    let mut meta = file.metadata().unwrap();
+    meta.mode = 0o600;
+    file.set_metadata(&meta).unwrap();
+    assert_eq!(m.notes().last().unwrap(), "!setattr plain 0:1 600");
+    assert_eq!(file.metadata().unwrap().mode, 0o600);
+    // A directory's time is the server's too.
+    let mut top = m.root().metadata().unwrap();
+    top.mtime.sec = 1234;
+    m.root().set_metadata(&top).unwrap();
+    assert_eq!(m.notes().last().unwrap(), "!settime  1234");
+}
+
+#[test]
+fn a_mount_that_is_not_posix_is_files_and_directories_of_roots() {
+    let m = Mount::new();
+    let file = m.root().find("readme.txt").unwrap().metadata().unwrap();
+    assert_eq!(
+        (file.type_, file.mode, file.uid, file.nlinks),
+        (FileType::File, 0o644, 0, 1)
+    );
+    let dir = m.root().find("docs").unwrap().metadata().unwrap();
+    assert_eq!((dir.type_, dir.mode, dir.nlinks), (FileType::Dir, 0o755, 2));
+    // Nothing is asked of the top.
+    m.root().metadata().unwrap();
+    assert_eq!(m.asked(OP_STAT), 0);
 }

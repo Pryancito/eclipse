@@ -45,7 +45,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use kernel_hal::thread::SyncWait;
 
 use lock::Mutex;
@@ -61,8 +61,9 @@ use self::link::{Answer, Fail, Link};
 /// of the server: whoever holds that end to watch the server lets go too.
 pub use self::link::LEFT as SERVER_LEFT;
 use self::wire::{
-    Entry, DATA_AREA, LIST_END, MODE_DIR, OP_CREATE, OP_LIST, OP_READ, OP_REMOVE, OP_RENAME,
-    OP_SETTIME, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE, STATFS_LEN,
+    Entry, DATA_AREA, LIST_END, MODE_BLOCK, MODE_CHAR, MODE_DIR, MODE_FIFO, MODE_FILE, MODE_KIND,
+    MODE_LINK, MODE_SOCKET, OP_CREATE, OP_LIST, OP_READ, OP_REMOVE, OP_RENAME, OP_SETATTR,
+    OP_SETTIME, OP_STAT, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE, STATFS_LEN,
 };
 use crate::error::{LxError, LxResult};
 use crate::process::LinuxProcess;
@@ -76,6 +77,12 @@ pub const SERVE_READ_ONLY: usize = 2;
 /// `eclipse_fs_serve` flag: only take over a mount whose server is gone,
 /// and make none.
 pub const SERVE_TAKE_OVER: usize = 4;
+/// `eclipse_fs_serve` flag: the filesystem has what POSIX asks of one --
+/// each file's owner, permissions and number of names, symbolic links,
+/// pipes and sockets -- and its listings say so ([`wire::RECORD_HEAD_POSIX`]).
+/// Without it every file is a plain file or a directory of root's, as on
+/// FAT, and that is all the server is asked to keep.
+pub const SERVE_POSIX: usize = 8;
 
 /// How long a mount whose server died waits for the next one before its
 /// requests fail. The same as a served disk's wait for its next driver,
@@ -146,6 +153,12 @@ const UNASKED: Numbers = Numbers {
 struct Node {
     ino: u64,
     is_dir: bool,
+    /// Its kind and permissions, as `st_mode` has them.
+    mode: AtomicU32,
+    uid: AtomicU32,
+    gid: AtomicU32,
+    nlink: AtomicU32,
+    rdev: u64,
     /// From the top of the mount. A rename changes it.
     path: Mutex<String>,
     size: AtomicU64,
@@ -264,6 +277,11 @@ pub struct ServedFs {
     /// The mount is made: until then the server is inside the call that
     /// makes it, and asking it anything would wait for the answer in vain.
     mounted: AtomicBool,
+    /// [`SERVE_POSIX`].
+    posix: bool,
+    /// The top's own owner and mode were asked for ([`OP_STAT`]): a listing
+    /// only has what is below it.
+    root_asked: AtomicBool,
 }
 
 /// A change to the directories, from before the server is asked for it
@@ -281,7 +299,18 @@ impl Drop for ChangingDirs<'_> {
 }
 
 impl ServedFs {
+    #[cfg(test)]
     fn new(link: Arc<Link>, fold_case: bool, read_only: bool) -> Arc<Self> {
+        Self::with_flags(
+            link,
+            if fold_case { SERVE_FOLD_CASE } else { 0 }
+                | if read_only { SERVE_READ_ONLY } else { 0 },
+        )
+    }
+
+    fn with_flags(link: Arc<Link>, flags: usize) -> Arc<Self> {
+        let fold_case = flags & SERVE_FOLD_CASE != 0;
+        let read_only = flags & SERVE_READ_ONLY != 0;
         Arc::new_cyclic(|this| Self {
             server: Mutex::new(Server { link, turns: 1 }),
             grace_ms: AtomicU64::new(SERVER_GRACE_MS),
@@ -294,6 +323,11 @@ impl ServedFs {
             root: Arc::new(Node {
                 ino: 1,
                 is_dir: true,
+                mode: AtomicU32::new(MODE_DIR | 0o755),
+                uid: AtomicU32::new(0),
+                gid: AtomicU32::new(0),
+                nlink: AtomicU32::new(2),
+                rdev: 0,
                 path: Mutex::new(String::new()),
                 size: AtomicU64::new(0),
                 mtime: AtomicI64::new(0),
@@ -311,6 +345,8 @@ impl ServedFs {
             info: Mutex::new(None),
             info_stale: AtomicBool::new(false),
             mounted: AtomicBool::new(false),
+            posix: flags & SERVE_POSIX != 0,
+            root_asked: AtomicBool::new(false),
         })
     }
 
@@ -330,6 +366,11 @@ impl ServedFs {
         Arc::new(Node {
             ino: self.next_ino.fetch_add(1, Ordering::Relaxed),
             is_dir: entry.is_dir,
+            mode: AtomicU32::new(entry.mode),
+            uid: AtomicU32::new(entry.uid),
+            gid: AtomicU32::new(entry.gid),
+            nlink: AtomicU32::new(entry.nlink),
+            rdev: entry.rdev,
             path: Mutex::new(join_path(dir, &entry.name)),
             size: AtomicU64::new(if entry.is_dir { 0 } else { entry.size }),
             mtime: AtomicI64::new(entry.mtime),
@@ -483,7 +524,8 @@ impl ServedFs {
             if !goes_on || entries.len() + answer.count > MAX_ENTRIES {
                 return Err(FsError::DeviceError);
             }
-            wire::records(&data, answer.count, &mut entries).ok_or(FsError::DeviceError)?;
+            wire::records(&data, answer.count, &mut entries, self.posix)
+                .ok_or(FsError::DeviceError)?;
             next = answer.a;
         }
         Ok(entries)
@@ -499,13 +541,39 @@ impl ServedFs {
     }
 
     /// The one entry a reply describes: what was made, or renamed.
-    fn entry_of(answer: Answer) -> Result<Entry> {
+    fn entry_of(&self, answer: Answer) -> Result<Entry> {
         let mut data = alloc::vec![0u8; answer.len];
         answer.data(0, &mut data)?;
         drop(answer);
         let mut entries = Vec::new();
-        wire::records(&data, 1, &mut entries).ok_or(FsError::DeviceError)?;
+        wire::records(&data, 1, &mut entries, self.posix).ok_or(FsError::DeviceError)?;
         entries.pop().ok_or(FsError::DeviceError)
+    }
+
+    /// On a POSIX mount, the top's owner, mode and times, asked for once:
+    /// what `stat` of the mount point says.
+    fn ask_root(&self) {
+        if !self.posix
+            || !self.mounted.load(Ordering::Acquire)
+            || self.root_asked.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let entry = self.call(OP_STAT, "", 0, 0).and_then(|a| self.entry_of(a));
+        match entry {
+            Ok(entry) if entry.is_dir => {
+                let root = &self.root;
+                root.mode.store(entry.mode, Ordering::Relaxed);
+                root.uid.store(entry.uid, Ordering::Relaxed);
+                root.gid.store(entry.gid, Ordering::Relaxed);
+                root.nlink.store(entry.nlink, Ordering::Relaxed);
+                root.mtime.store(entry.mtime, Ordering::Relaxed);
+                root.atime.store(entry.atime, Ordering::Relaxed);
+                root.ctime.store(entry.ctime, Ordering::Relaxed);
+            }
+            // Asked again next time: the server may be on its way.
+            _ => self.root_asked.store(false, Ordering::Release),
+        }
     }
 
     fn same_name(&self, a: &str, b: &str) -> bool {
@@ -617,6 +685,19 @@ impl FileSystem for ServedFs {
     }
 }
 
+/// The VFS's kind of file for a mode.
+fn file_type(mode: u32) -> FileType {
+    match mode & MODE_KIND {
+        MODE_DIR => FileType::Dir,
+        MODE_LINK => FileType::SymLink,
+        MODE_FIFO => FileType::NamedPipe,
+        MODE_SOCKET => FileType::Socket,
+        MODE_CHAR => FileType::CharDevice,
+        MODE_BLOCK => FileType::BlockDevice,
+        _ => FileType::File,
+    }
+}
+
 /// A file or a directory of a served filesystem, as the VFS holds it.
 struct ServedINode {
     fs: Arc<ServedFs>,
@@ -671,20 +752,16 @@ impl ServedINode {
             atime: at(&node.atime),
             mtime: at(&node.mtime),
             ctime: at(&node.ctime),
-            type_: if node.is_dir {
-                FileType::Dir
+            type_: file_type(node.mode.load(Ordering::Relaxed)),
+            mode: (node.mode.load(Ordering::Relaxed) & 0o7777) as u16,
+            nlinks: if node.is_gone() {
+                0
             } else {
-                FileType::File
+                node.nlink.load(Ordering::Relaxed) as usize
             },
-            mode: if node.is_dir { 0o755 } else { 0o644 },
-            nlinks: match (node.is_gone(), node.is_dir) {
-                (true, _) => 0,
-                (false, true) => 2,
-                (false, false) => 1,
-            },
-            uid: 0,
-            gid: 0,
-            rdev: 0,
+            uid: node.uid.load(Ordering::Relaxed) as usize,
+            gid: node.gid.load(Ordering::Relaxed) as usize,
+            rdev: node.rdev as usize,
         }
     }
 
@@ -793,19 +870,44 @@ impl INode for ServedINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
+        if Arc::ptr_eq(&self.node, &self.fs.root) {
+            self.fs.ask_root();
+        }
         Ok(self.metadata_of(&self.node))
     }
 
     /// The times are the node's from here on, and a file's time of last
-    /// writing goes to the server; the owner and the mode are not the
-    /// filesystem's to keep.
+    /// writing goes to the server. On a POSIX mount the owner and the
+    /// permissions go to it too, and a directory's time; elsewhere they are
+    /// not the filesystem's to keep.
     fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
         self.fs.writable()?;
         let node = &self.node;
+        if self.fs.posix && !node.is_gone() {
+            let mode = node.mode.load(Ordering::Relaxed);
+            // A symbolic link's permissions are not its to change; its owner
+            // is (`lchown`).
+            let perms = match mode & MODE_KIND {
+                MODE_LINK => mode & 0o7777,
+                _ => metadata.mode as u32 & 0o7777,
+            };
+            let (uid, gid) = (metadata.uid as u32, metadata.gid as u32);
+            if perms != mode & 0o7777
+                || uid != node.uid.load(Ordering::Relaxed)
+                || gid != node.gid.load(Ordering::Relaxed)
+            {
+                let path = node.live_path()?;
+                let owner = (uid as u64) << 32 | gid as u64;
+                self.fs.call(OP_SETATTR, &path, owner, perms)?;
+                node.mode.store(mode & MODE_KIND | perms, Ordering::Relaxed);
+                node.uid.store(uid, Ordering::Relaxed);
+                node.gid.store(gid, Ordering::Relaxed);
+            }
+        }
         node.atime.store(metadata.atime.sec, Ordering::Relaxed);
         node.ctime.store(metadata.ctime.sec, Ordering::Relaxed);
         let before = node.mtime.swap(metadata.mtime.sec, Ordering::Relaxed);
-        if before != metadata.mtime.sec && !node.is_dir && !node.is_gone() {
+        if before != metadata.mtime.sec && (self.fs.posix || !node.is_dir) && !node.is_gone() {
             let path = node.path();
             self.fs
                 .call(OP_SETTIME, &path, metadata.mtime.sec as u64, 0)?;
@@ -831,14 +933,28 @@ impl INode for ServedINode {
         Ok(())
     }
 
-    fn create(&self, name: &str, type_: FileType, _mode: u32) -> Result<Arc<dyn INode>> {
+    fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
         let dir = self.dir_path()?;
         self.fs.writable()?;
         Self::check_name(name)?;
-        let mode = match type_ {
-            FileType::File => 0,
-            FileType::Dir => MODE_DIR,
+        // What a server that is not POSIX's is told: file, or directory. A
+        // POSIX one is told the kind and the permissions.
+        let kind = match (type_, self.fs.posix) {
+            (FileType::File, false) => 0,
+            (FileType::Dir, false) => MODE_DIR,
+            (FileType::File, true) => MODE_FILE,
+            (FileType::Dir, true) => MODE_DIR,
+            (FileType::SymLink, true) => MODE_LINK,
+            (FileType::NamedPipe, true) => MODE_FIFO,
+            (FileType::Socket, true) => MODE_SOCKET,
             _ => return Err(FsError::NotSupported),
+        };
+        let mode = match self.fs.posix {
+            // A symbolic link's permissions are all of them, as on Linux,
+            // whatever the mask said.
+            true if kind == MODE_LINK => kind | 0o777,
+            true => kind | mode & 0o7777,
+            false => kind,
         };
         if self.fs.position(&*self.fs.listing(&dir)?, name).is_some() {
             return Err(FsError::EntryExist);
@@ -849,9 +965,11 @@ impl INode for ServedINode {
             // It was not there before this asked, and the server that was
             // asked first died: that one made it.
             (Err(FsError::EntryExist), true) => self.fs.entry_named(&dir, name)?,
-            (answer, _) => ServedFs::entry_of(answer?)?,
+            (answer, _) => self.fs.entry_of(answer?)?,
         };
-        if entry.is_dir != (type_ == FileType::Dir) {
+        if entry.is_dir != (type_ == FileType::Dir)
+            || (self.fs.posix && entry.mode & MODE_KIND != kind)
+        {
             return Err(FsError::DeviceError);
         }
         let node = self.fs.node_of(&dir, &entry);
@@ -953,7 +1071,7 @@ impl INode for ServedINode {
         let entry = match self.fs.ask(OP_RENAME, names.as_bytes(), 0, 0, &[]) {
             // The server that was asked first renamed it, and died.
             (Err(FsError::EntryNotFound), true) => self.fs.entry_named(&to_dir, new_name)?,
-            (answer, _) => ServedFs::entry_of(answer?)?,
+            (answer, _) => self.fs.entry_of(answer?)?,
         };
         let new_path = join_path(&to_dir, &entry.name);
 
@@ -1191,7 +1309,7 @@ pub fn serve(
         return Err(LxError::EPERM);
     }
     let shown = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
-    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY | SERVE_TAKE_OVER) != 0
+    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY | SERVE_TAKE_OVER | SERVE_POSIX) != 0
         || !target.starts_with('/')
         || !shown(source)
         || !shown(fstype)
@@ -1227,7 +1345,7 @@ pub fn serve(
         return Err(LxError::ENOENT);
     }
     let read_only = flags & SERVE_READ_ONLY != 0;
-    let fs = ServedFs::new(link, flags & SERVE_FOLD_CASE != 0, read_only);
+    let fs = ServedFs::with_flags(link, made_with);
     *fs.kept.lock() = kept;
     *fs.shown.lock() = (String::from(source), String::from(fstype), made_with);
     let target = super::mount_ops::mount_served(target, source, fstype, fs.clone(), read_only)?;

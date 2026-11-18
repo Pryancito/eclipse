@@ -19,7 +19,9 @@ use zircon_object::ZxError;
 /// what the mount table shows as the mount's source and as its type, a NUL
 /// between each two. `flags`: 1 when a name matches an entry whatever the
 /// case of its ASCII letters, 2 for a read-only mount, 4 to take a mount
-/// over and make none. `kept` is a VMO the mount holds for its servers, or
+/// over and make none, 8 for a filesystem with owners, permissions and
+/// symbolic links (its listings then have the longer records of
+/// `wire::RECORD_HEAD_POSIX`). `kept` is a VMO the mount holds for its servers, or
 /// 0: what a server must not lose when it dies.
 ///
 /// The process answers each message on the other end of the FIFO, and sees
