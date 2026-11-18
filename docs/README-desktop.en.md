@@ -19,7 +19,7 @@ does with the language and the time zone.
 ```sh
 eclipse-look            # prints the current one
 eclipse-look tecno      # "Orbital HUD" instrument panel (default under labwc)
-eclipse-look abyss      # Abyss's warm-black glass (default in the Abyss session)
+eclipse-look abyss      # Abyss's warm-black glass (meant for the Abyss session)
 eclipse-look eclipse    # the original violet one
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
@@ -40,8 +40,8 @@ eclipse-look win11      # Windows 11
 instrumentation cyan `#38e1ff`, fillet `#1d3550` and the gold `#f2c14e` of
 lunarbg's crescent to mark what has focus.
 
-`abyss` is the Abyss session's look (the image ships `look=abyss` when it
-carries `ec-abyss`). Its values come from Abyss's style guide
+`abyss` is the look meant for the Abyss session (optional; the image ships
+`look=tecno`, so switch with `eclipse-look abyss`). Its values come from Abyss's style guide
 (`desktop/docs/STYLE.md`), none of its code: `#0b0906` ground, white ink
 (secondary at 64 %), white hairlines at 12 %, rounded corners (window 16, card
 13, cell 10), and the `#f2c33c` gold only on the selected label, never as a
@@ -490,14 +490,12 @@ in this order (the first one found wins):
    default (`desktop=none` with `VARIANT=minimal`). For the Xorg session
    (framebuffer/`fbdev` on `/dev/fb0`): `make qemu DESKTOP=xorg`.
 2. **File** `/etc/eclipse/desktop` (first token): a persistent per-installation
-   override you can edit. It is installed with the value `abyss` when the image
-   carries Abyss, and `labwc` otherwise (see [The Abyss session](#the-abyss-session)).
-3. No file: **labwc**.
+   override you can edit. It is installed with the value `labwc`.
+3. Default: **labwc**.
 
 Since real hardware boots with the installed cmdline (no `desktop=`), it falls
-back to the `/etc/eclipse/desktop` file and uses **Abyss**. `make qemu` still
-boots labwc unless given `DESKTOP=`: QEMU's virtio GPU is 2D only and Abyss
-draws with GL only. Each session's services carry a `desktop =` tag in their
+back to the `/etc/eclipse/desktop` file and uses **labwc**; `make qemu` does too,
+unless given `DESKTOP=`. Each session's services carry a `desktop =` tag in their
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` are `desktop = labwc`,
 `xorg` is `desktop = xorg`, and untagged services (e.g. `network`) always start.
 
@@ -508,19 +506,19 @@ is the installer: cmdline `desktop=none` and an SFS without a desktop, so
 `install-eclipse`, `./scripts/vbox-eclipse.sh --disk-only` boots labwc from the
 installed VDI.
 
-## The Abyss session
+## The Abyss session (optional)
 
 There is a third session, **Abyss**: the Rust Wayland compositor from
 [chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), with its
 bar (`ec-hyperion-bar`), launcher (`ec-launcher`) and Settings
 (`ec-settings`), with the lunarbg wallpaper and the usual lunar apps. It comes from the `desktop/` submodule, which
 points at the fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
-**Abyss is the default session** and labwc is the optional one.
+**labwc stays the default session**: Abyss starts only when you pick it.
 
 ```sh
 git submodule update --init desktop   # once, to fetch the code
-# back to labwc: desktop=labwc on the cmdline, or persistently:
-echo labwc > /etc/eclipse/desktop
+# boot: desktop=abyss on the cmdline, or persistently:
+echo abyss > /etc/eclipse/desktop
 ```
 
 - **Build**: `cargo xtask image` builds it on the host, like SilverSurfer,
@@ -528,7 +526,7 @@ echo labwc > /etc/eclipse/desktop
   xkbcommon (`apt-get install libseat-dev libinput-dev libudev-dev libgbm-dev
   libegl-dev libgles-dev libxkbcommon-dev libwayland-dev libdrm-dev`). With no
   submodule, a missing package or a failed build the image still comes out,
-  with labwc only, and labwc is then the default. It is not built on a host of another architecture.
+  with labwc only. It is not built on a host of another architecture.
 - **Services** (`desktop = abyss`): `abyss-seatd`, `abyss`
   (`/usr/local/bin/eclipse-abyss`, log in `/tmp/abyss.log`), Abyss's bar
   `abyss-hyperion-bar` (through `eclipse-abyss-client`), and Eclipse's own

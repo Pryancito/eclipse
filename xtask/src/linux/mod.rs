@@ -4401,8 +4401,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         let _ = fs::create_dir_all(&localbin);
         Self::write_init_wrappers(&localbin, &svc_dir);
 
-        // Default desktop selector: `abyss` on the desktop variant when it
-        // landed in the image, else `labwc`; `none` on the minimal one. A boot with
+        // Default desktop selector: `labwc` on the desktop variant (the
+        // hardware default; Abyss is opt-in), `none` on the minimal one. A boot with
         // `desktop=xorg` on the kernel cmdline (see `make qemu`) overrides this;
         // editing this file changes the default persistently. See
         // eclipse-init's `selected_desktop`.
@@ -4420,7 +4420,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         Self::write_desktop_session(
             rootfs,
             if desktop {
-                abyss::session(rootfs, self.1.default_session())
+                self.1.default_session()
             } else {
                 Variant::Minimal.default_session()
             },
