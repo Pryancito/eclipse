@@ -1328,13 +1328,44 @@ impl Takes {
     }
 }
 
-/// The ports of one protocol: which are taken, and where the search for
-/// a free one starts.
+/// What a socket said of sharing its port before it took it:
+/// `SO_REUSEADDR` and `SO_REUSEPORT`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(super) struct Sharing {
+    /// `SO_REUSEADDR`: another socket that said so too may have the port
+    /// at the same address, unless one of the two listens.
+    pub reuse: bool,
+    /// `SO_REUSEPORT`, of a datagram socket: another that said so too
+    /// may have the port.
+    pub shares: bool,
+}
+
+/// A socket's hold on a port.
+struct Hold {
+    sock: u64,
+    /// At which address of the machine's: none when at every one.
+    at: Option<IpAddress>,
+    /// For which versions of IP ([`Takes::bits`]).
+    bits: u8,
+    sharing: Sharing,
+    /// A stream socket that listens: nobody shares a port with it.
+    listening: bool,
+}
+
+/// The ports that are taken, and the next to give to a socket that asks
+/// for any.
+///
+/// As Linux has it (`inet_csk_bind_conflict`, `udp_lib_lport_inuse`): two
+/// sockets are in each other's way on a port when they are for a same
+/// version of IP at the same address, or either at every address;
+/// unless both said `SO_REUSEADDR` and the one that has the port does
+/// not listen, or both are datagram sockets that said `SO_REUSEPORT`. A
+/// connection that arrived on a listener has the listener's port, with
+/// what the listener said, for as long as it lives: a server that ends
+/// and starts again while one is left takes its port back only with
+/// `SO_REUSEADDR`.
 struct Ports {
-    /// Each port that is taken: at which address of the machine's (none
-    /// when at every one), and for which versions of IP
-    /// ([`Takes::bits`]).
-    taken: BTreeMap<u16, Vec<(Option<IpAddress>, u8)>>,
+    taken: BTreeMap<u16, Vec<Hold>>,
     next: u16,
 }
 
@@ -1354,23 +1385,38 @@ fn clash(one: Option<IpAddress>, other: Option<IpAddress>) -> bool {
 }
 
 impl Ports {
-    /// For which versions of IP `port` is taken from a socket that would
-    /// be `at` that address (at every one when none).
-    fn held(&self, port: u16, at: Option<IpAddress>) -> u8 {
-        let holders = self.taken.get(&port).into_iter().flatten();
-        holders
-            .filter(|(theirs, _)| clash(*theirs, at))
-            .fold(0, |held, (_, bits)| held | bits)
+    /// The holds on `port` that a socket for `bits` at `at` meets.
+    fn met(&self, port: u16, at: Option<IpAddress>, bits: u8) -> impl Iterator<Item = &Hold> {
+        let holds = self.taken.get(&port).into_iter().flatten();
+        holds.filter(move |hold| hold.bits & bits != 0 && clash(hold.at, at))
     }
 
-    /// Take the port `wanted`, or any when it is 0, for what a socket
-    /// `takes`, `at` an address of the machine's or at every one.
-    /// `EADDRINUSE` when another socket has it for any of that at that
-    /// address or at every one, or none is left.
-    fn take(&mut self, wanted: u16, takes: Takes, at: Option<IpAddress>) -> LxResult<u16> {
+    /// Whether a socket for `bits` that would be `at` that address (at
+    /// every one when none) finds `port` taken, having said `sharing`.
+    fn in_way(&self, port: u16, at: Option<IpAddress>, bits: u8, sharing: Sharing) -> bool {
+        self.met(port, at, bits).any(|hold| {
+            let reused = sharing.reuse && hold.sharing.reuse && !hold.listening;
+            let shared = sharing.shares && hold.sharing.shares;
+            !(reused || shared)
+        })
+    }
+
+    /// Take the port `wanted`, or any when it is 0, for what the socket
+    /// `sock` `takes`, `at` an address of the machine's or at every one.
+    /// `EADDRINUSE` when another socket is in its way there, whatever
+    /// the two said of `sharing` not helping, or none is left. A port
+    /// given to one that asks for any is one nobody has there.
+    fn take(
+        &mut self,
+        wanted: u16,
+        takes: Takes,
+        at: Option<IpAddress>,
+        sock: u64,
+        sharing: Sharing,
+    ) -> LxResult<u16> {
         let bits = takes.bits();
         let port = if wanted != 0 {
-            if self.held(wanted, at) & bits != 0 {
+            if self.in_way(wanted, at, bits, sharing) {
                 return Err(LxError::EADDRINUSE);
             }
             wanted
@@ -1382,7 +1428,7 @@ impl Ports {
                     let at = (first - EPHEMERAL.start()) as u32 + i;
                     EPHEMERAL.start() + (at % span) as u16
                 })
-                .find(|p| self.held(*p, at) & bits == 0)
+                .find(|p| self.met(*p, at, bits).next().is_none())
                 .ok_or(LxError::EADDRINUSE)?;
             self.next = if port == *EPHEMERAL.end() {
                 *EPHEMERAL.start()
@@ -1391,23 +1437,70 @@ impl Ports {
             };
             port
         };
-        let holders = self.taken.entry(port).or_default();
-        match holders.iter_mut().find(|(theirs, _)| *theirs == at) {
-            Some((_, held)) => *held |= bits,
-            None => holders.push((at, bits)),
-        }
+        self.taken.entry(port).or_default().push(Hold {
+            sock,
+            at,
+            bits,
+            sharing,
+            listening: false,
+        });
         Ok(port)
     }
 
-    /// The socket that took `port` for what it `takes`, `at` that
-    /// address, is gone.
-    fn free(&mut self, port: u16, takes: Takes, at: Option<IpAddress>) {
-        if let Some(holders) = self.taken.get_mut(&port) {
-            if let Some((_, held)) = holders.iter_mut().find(|(theirs, _)| *theirs == at) {
-                *held &= !takes.bits();
-            }
-            holders.retain(|(_, held)| *held != 0);
-            if holders.is_empty() {
+    /// The socket `sock`, which has `port`, starts to listen.
+    /// `EADDRINUSE` when another that it shares the port with listens
+    /// already: `SO_REUSEADDR` lets two have a port, not two listen on
+    /// it.
+    fn listen(&mut self, port: u16, sock: u64) -> LxResult {
+        let Some(holds) = self.taken.get_mut(&port) else {
+            return Ok(());
+        };
+        let Some(own) = holds.iter().position(|hold| hold.sock == sock) else {
+            return Ok(());
+        };
+        let (at, bits) = (holds[own].at, holds[own].bits);
+        let taken = holds.iter().enumerate().any(|(i, hold)| {
+            i != own && hold.listening && hold.bits & bits != 0 && clash(hold.at, at)
+        });
+        if taken {
+            return Err(LxError::EADDRINUSE);
+        }
+        holds[own].listening = true;
+        Ok(())
+    }
+
+    /// The socket `sock`, which has `port`, listens no more.
+    fn quiet(&mut self, port: u16, sock: u64) {
+        let holds = self.taken.get_mut(&port).into_iter().flatten();
+        for hold in holds.filter(|hold| hold.sock == sock) {
+            hold.listening = false;
+        }
+    }
+
+    /// A connection `new` arrived on the listener `sock` of `port`: it
+    /// has the port as the listener has it, and after the listener is
+    /// gone.
+    fn adopt(&mut self, port: u16, sock: u64, new: u64) {
+        let Some(holds) = self.taken.get_mut(&port) else {
+            return;
+        };
+        if let Some(theirs) = holds.iter().find(|hold| hold.sock == sock) {
+            let hold = Hold {
+                sock: new,
+                at: theirs.at,
+                bits: theirs.bits,
+                sharing: theirs.sharing,
+                listening: false,
+            };
+            holds.push(hold);
+        }
+    }
+
+    /// The socket `sock` that had `port` is gone.
+    fn free(&mut self, port: u16, sock: u64) {
+        if let Some(holds) = self.taken.get_mut(&port) {
+            holds.retain(|hold| hold.sock != sock);
+            if holds.is_empty() {
                 self.taken.remove(&port);
             }
         }
@@ -1457,8 +1550,10 @@ impl Holders {
     fn get(&self, port: u16, six: bool, to: IpAddress) -> Option<u64> {
         let pick = |holders: &BTreeMap<u16, Vec<(Option<IpAddress>, u64)>>| {
             let at = holders.get(&port)?;
-            let exact = at.iter().find(|(theirs, _)| *theirs == Some(to));
-            let any = || at.iter().find(|(theirs, _)| theirs.is_none());
+            // Of two that share the port at one address, the one that
+            // took it last.
+            let exact = at.iter().rev().find(|(theirs, _)| *theirs == Some(to));
+            let any = || at.iter().rev().find(|(theirs, _)| theirs.is_none());
             exact.or_else(any).map(|(_, sock)| *sock)
         };
         if six {
@@ -2266,6 +2361,7 @@ impl StackLink {
         takes: Takes,
         here: Option<Ipv4Address>,
         at: Option<IpAddress>,
+        sharing: Sharing,
     ) -> LxResult<u16> {
         let _telling = self.telling.lock();
         // The port is the socket's at the address it was bound to: another
@@ -2273,7 +2369,7 @@ impl StackLink {
         let whose = here.map(IpAddress::Ipv4).or(at);
         let port = {
             let mut table = self.table.lock();
-            let port = table.ports.take(wanted, takes, whose)?;
+            let port = table.ports.take(wanted, takes, whose, sock, sharing)?;
             table.bound.insert(port, sock, takes, whose);
             port
         };
@@ -2285,12 +2381,12 @@ impl StackLink {
 
     /// A socket is gone: its number and its port are free, and the stack
     /// is told, if it was ever told of the socket (`told`).
-    fn close(&self, sock: u64, port: Option<u16>, takes: Takes, told: bool, at: Option<IpAddress>) {
+    fn close(&self, sock: u64, port: Option<u16>, told: bool) {
         {
             let mut table = self.table.lock();
             table.socks.remove(&sock);
             if let Some(port) = port {
-                table.ports.free(port, takes, at);
+                table.ports.free(port, sock);
                 table.bound.remove(port, sock);
             }
         }
@@ -2317,7 +2413,7 @@ impl StackLink {
             table.socks.remove(&sock);
             table.hearing.remove(&sock);
             if let Some(ident) = ident {
-                table.idents.free(ident, Takes::Both, None);
+                table.idents.free(ident, 0);
             }
         }
         let _ = self.tell(close_message(sock), true);
@@ -2326,7 +2422,11 @@ impl StackLink {
     /// Give a socket that pings the identifier `wanted`, or any when it
     /// is 0. `EADDRINUSE` when another has it or none is left.
     fn ident(&self, wanted: u16) -> LxResult<u16> {
-        self.table.lock().idents.take(wanted, Takes::Both, None)
+        let mut table = self.table.lock();
+        // One socket for each: none shares.
+        table
+            .idents
+            .take(wanted, Takes::Both, None, 0, Sharing::default())
     }
 
     /// The sockets that hear ICMP, of either kind.
@@ -2533,9 +2633,14 @@ impl ServedUdpSocket {
         if let Some(port) = self.shared.inner.lock().port {
             return Ok(port);
         }
-        let port = self
-            .link
-            .bind(self.sock, 0, self.shared.takes(), None, None)?;
+        let port = self.link.bind(
+            self.sock,
+            0,
+            self.shared.takes(),
+            None,
+            None,
+            Sharing::default(),
+        )?;
         self.shared.inner.lock().port = Some(port);
         Ok(port)
     }
@@ -2626,13 +2731,11 @@ impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
         self.leave_every_group();
         self.link.leave_every_group6(&self.shared);
-        let (port, here, bound) = {
+        let (port, here) = {
             let inner = self.shared.inner.lock();
-            (inner.port, inner.here, inner.bound)
+            (inner.port, inner.here)
         };
-        let whose = here.map(IpAddress::Ipv4).or(bound);
-        self.link
-            .close(self.sock, port, self.shared.takes(), here.is_none(), whose);
+        self.link.close(self.sock, port, here.is_none());
     }
 }
 
@@ -2802,7 +2905,16 @@ impl Socket for ServedUdpSocket {
             inner.bound = bound;
         }
         let takes = self.shared.takes();
-        let port = self.link.bind(self.sock, local.port, takes, here, bound);
+        let sharing = {
+            let opts = self.opts.lock();
+            Sharing {
+                reuse: opts.reuse_addr,
+                shares: opts.reuse_port,
+            }
+        };
+        let port = self
+            .link
+            .bind(self.sock, local.port, takes, here, bound, sharing);
         let mut inner = self.shared.inner.lock();
         match port {
             Ok(port) => inner.port = Some(port),
