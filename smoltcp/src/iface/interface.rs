@@ -1167,7 +1167,11 @@ impl<'a> InterfaceInner<'a> {
                     return Err(Error::Malformed);
                 }
 
-                if !self.in_same_network(&IpAddress::Ipv4(source_protocol_addr)) {
+                // A neighbour is on a network of ours, or on one a route
+                // says is reached with no router between.
+                if !self.in_same_network(&IpAddress::Ipv4(source_protocol_addr))
+                    && !self.routed_on_link(&IpAddress::Ipv4(source_protocol_addr), timestamp)
+                {
                     net_debug!("arp: source IP address not in same network as us");
                     return Err(Error::Malformed);
                 }
@@ -2029,11 +2033,23 @@ impl<'a> InterfaceInner<'a> {
             return Err(Error::Unaddressable);
         }
 
-        // Route via a router.
+        // Route via a router, or to the address itself where the route
+        // names no router: its network is on the link.
         match self.routes.lookup(addr, timestamp) {
+            Some(router_addr) if router_addr.is_unspecified() => Ok(*addr),
             Some(router_addr) => Ok(router_addr),
             None => Err(Error::Unaddressable),
         }
+    }
+
+    /// Whether a route says `addr` is reached with no router between: one
+    /// whose router is the unspecified address.
+    fn routed_on_link(&self, addr: &IpAddress, timestamp: Instant) -> bool {
+        addr.is_unicast()
+            && self
+                .routes
+                .lookup(addr, timestamp)
+                .is_some_and(|router| router.is_unspecified())
     }
 
     fn has_neighbor(&self, cx: &Context, addr: &IpAddress) -> bool {

@@ -15,6 +15,11 @@
 //!                           24  [u8; 16] the address (of IPv4: its four bytes, and zeroes)
 //! ROUTE  (kernel to stack)  the same, the network at 24, and
 //!                           40  [u8; 16] the router, or zeroes
+//!
+//! A `ROUTE` to have with no router (zeroes) is to a network on the
+//! card's link (`ip route add NETWORK dev eth0`): whoever is there is
+//! asked for as a neighbour, and can be a router in turn. A `MORE` says
+//! such a route with zeroes too.
 //! ```
 //!
 //! and the stack says what the card has of them, all of it each time it
@@ -49,7 +54,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
-use kernel_hal::drivers::net::stack_card::{Change, More, Sixes};
+use kernel_hal::drivers::net::stack_card::{self, Change, More, Sixes};
 use zcore_drivers::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address};
 
 use super::{header, StackLink};
@@ -139,7 +144,9 @@ pub fn parse_more(said: &[u8]) -> Option<Said> {
             (AN_ADDRESS, IpAddress::Ipv4(first)) if first.is_unicast() && prefix != 0 => {
                 addresses.push(Ipv4Cidr::new(first, prefix));
             }
-            (A_ROUTE, first) if second.is_unicast() && prefix != 0 => {
+            // A route with no router (zeroes) is to a network on the
+            // card's link.
+            (A_ROUTE, first) if (second.is_unicast() || second.is_unspecified()) && prefix != 0 => {
                 routes.push((IpCidr::new(first, prefix), second));
             }
             _ => return None,
@@ -228,8 +235,8 @@ impl StackLink {
                     }
                     (to, router) => self.more_of(card).change(|_, routes| {
                         routes.retain(|(have, _)| *have != to);
-                        if let (true, Some(router)) = (have, router) {
-                            routes.push((to, router));
+                        if have {
+                            routes.push((to, router.unwrap_or(stack_card::on_link(&to))));
                         }
                     }),
                 }
@@ -343,12 +350,16 @@ mod tests {
             Some((vec![other4], vec![(to, through), (to6, through6)]))
         );
         assert_eq!(parse_more(&[]), Some((vec![], vec![])));
-        // Cut short, a route with no router, an address of IPv6 (those
-        // are said in `SIX`), a prefix of too many bits, a kind there is
-        // none of.
+        // A route with no router is one to a network on the card's link.
+        let m = more_message(0, &[(A_ROUTE, to, None)]);
+        assert_eq!(
+            parse_more(&m[16..]),
+            Some((vec![], vec![(to, stack_card::on_link(&to))]))
+        );
+        // Cut short, an address of IPv6 (those are said in `SIX`), a
+        // prefix of too many bits, a kind there is none of.
         assert_eq!(parse_more(&m[16..m.len() - 1]), None);
         for bad in [
-            more_message(0, &[(A_ROUTE, to, None)]),
             more_message(0, &[(AN_ADDRESS, to6, None)]),
             more_message(0, &[(3, other, None)]),
         ] {

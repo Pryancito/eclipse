@@ -210,6 +210,17 @@ impl More {
     }
 }
 
+/// The router a route to `to` is kept with when it has none: the
+/// unspecified address of its family. Such a route is to a network on the
+/// card's link.
+pub fn on_link(to: &IpCidr) -> IpAddress {
+    match to {
+        IpCidr::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+        #[allow(unreachable_patterns)]
+        _ => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+    }
+}
+
 /// `cidr` with nothing past its prefix: the network it names.
 pub fn network(cidr: IpCidr) -> IpCidr {
     match cidr {
@@ -372,14 +383,20 @@ impl StackCard {
     }
 
     /// Whether `router` is a machine to send through: on a network of
-    /// one of the card's addresses, and not the card.
+    /// one of the card's addresses or on one a route says is on its
+    /// link, and not the card.
     fn near(&self, router: &IpAddress) -> bool {
         let ours = self.get_ip_address();
+        let routes = self.more.routes();
+        let mut on_link = routes
+            .iter()
+            .filter(|(_, through)| through.is_unspecified());
         router.is_unicast()
             && !ours.iter().any(|ours| ours.address() == *router)
-            && ours
+            && (ours
                 .iter()
                 .any(|ours| ours.prefix_len() > 0 && ours.contains_addr(router))
+                || on_link.any(|(to, _)| to.contains_addr(router)))
     }
 
     /// The card as a stack says it in three numbers, or `None` when they
@@ -527,11 +544,21 @@ impl NetScheme for StackCard {
 
     /// What is for `cidr` goes through `gateway`, a machine of a network
     /// of the card's: the gateway when `cidr` is everything, a route of
-    /// its own when it is a network. A route with no router is the
-    /// card's network, which an address gives.
+    /// its own when it is a network. A route with no router is to a
+    /// network on the card's link, whose machines are asked for as
+    /// neighbours: not to everything, and not to a network the card is
+    /// on already, which an address gave.
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
         let Some(gateway) = gateway else {
-            return Err(DeviceError::NotSupported);
+            let to = network(cidr);
+            if to.prefix_len() == 0 {
+                return Err(DeviceError::NotSupported);
+            }
+            let ours = self.get_ip_address();
+            if ours.iter().any(|ours| network(*ours) == to) {
+                return Err(DeviceError::AlreadyExists);
+            }
+            return self.ask(Change::Route(to, None, true));
         };
         let same = matches!(
             (&cidr, &gateway),
@@ -588,7 +615,8 @@ impl NetScheme for StackCard {
                 .into_iter()
                 .map(|(dst, gateway)| RouteInfo {
                     dst,
-                    gateway: Some(gateway),
+                    // On the link: no router to show.
+                    gateway: (!gateway.is_unspecified()).then_some(gateway),
                 }),
         );
         routes.extend(self.sixes.router().map(|router| RouteInfo {
@@ -762,7 +790,27 @@ mod tests {
         let to = IpCidr::new(IpAddress::v4(172, 16, 0, 0), 12);
         let through = IpAddress::v4(192, 168, 7, 1);
         assert_eq!(c.add_route(net, Some(through)), Ok(()));
-        assert_eq!(c.add_route(net, None), Err(DeviceError::NotSupported));
+        // With no router: a network on the link, which is not everything
+        // nor the one the card is on.
+        let all = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        assert_eq!(c.add_route(all, None), Err(DeviceError::NotSupported));
+        let own_net = IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24);
+        assert_eq!(c.add_route(own_net, None), Err(DeviceError::AlreadyExists));
+        let beside = IpCidr::new(IpAddress::v4(192, 0, 2, 0), 24);
+        assert_eq!(c.add_route(beside, None), Ok(()));
+        assert_eq!(
+            wire.0.lock().pop(),
+            Some((0, Change::Route(beside, None, true)))
+        );
+        // Shown with no router once the stack says it has it, and a
+        // machine of that network is one to send through.
+        more.say(vec![], vec![(beside, on_link(&beside))]);
+        assert!(c
+            .get_routes()
+            .iter()
+            .any(|r| r.dst == beside && r.gateway.is_none()));
+        assert!(c.near(&IpAddress::v4(192, 0, 2, 1)));
+        more.say(vec![], vec![]);
         for far in [IpAddress::v4(192, 168, 8, 1), other.address().into()] {
             assert_eq!(c.add_route(net, Some(far)), Err(DeviceError::InvalidParam));
         }
