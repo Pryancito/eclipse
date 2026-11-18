@@ -34,6 +34,17 @@ impl BlockDev {
         self.block.clone()
     }
 
+    /// How much of `len` bytes from `offset` is on the disk: a read stops at
+    /// its end, as a file's does, instead of asking the driver for sectors
+    /// past it. A disk that does not say its size (`block_count` 0) is read
+    /// as asked.
+    fn readable(&self, offset: usize, len: usize) -> usize {
+        match self.block.block_count().saturating_mul(512) {
+            0 => len,
+            size => len.min(size.saturating_sub(offset)),
+        }
+    }
+
     /// `read_at`, as a future, when the disk has an asynchronous read and the
     /// request is whole sectors: what `pread` on the node awaits instead of
     /// blocking its CPU. `None` sends the caller to `read_at`.
@@ -44,6 +55,10 @@ impl BlockDev {
     ) -> Option<impl core::future::Future<Output = Result<usize>> + 'a> {
         const BS: usize = 512;
         if buf.is_empty() || !offset.is_multiple_of(BS) || !buf.len().is_multiple_of(BS) {
+            return None;
+        }
+        // Up to the end, or past it: `read_at` cuts it.
+        if self.readable(offset, buf.len()) != buf.len() {
             return None;
         }
         let len = buf.len();
@@ -81,6 +96,9 @@ impl INode for BlockDev {
         struct AlignedBuf([u8; 512]);
         let mut temp_buf = AlignedBuf([0u8; 512]);
         let mut done = 0usize;
+        // At the end of the disk, 0 (what `cat` and `md5sum` stop on).
+        let n = self.readable(offset, buf.len());
+        let buf = &mut buf[..n];
 
         // Partial leading sector.
         let head_off = offset % BS;
@@ -1763,6 +1781,26 @@ mod tests {
     fn a_disk_with_no_table_at_all_yields_nothing() {
         let disk = FakeDisk::new(512, 4096);
         assert!(scan_partitions(&disk.into_scheme()).is_empty());
+    }
+
+    #[test]
+    fn a_read_stops_at_the_end_of_the_disk() {
+        let mut disk = FakeDisk::new(512, 8);
+        disk.data[8 * 512 - 1] = 7;
+        let dev = BlockDev::new(0, disk.into_scheme(), String::from("fake"));
+        let mut buf = [0u8; 4096];
+        // The whole 4 KiB disk, then its end: 0, not an error.
+        assert_eq!(dev.read_at(0, &mut buf).unwrap(), 4096);
+        assert_eq!(buf[4095], 7);
+        assert_eq!(dev.read_at(4096, &mut buf).unwrap(), 0);
+        assert_eq!(dev.read_at(1 << 20, &mut buf).unwrap(), 0);
+        // Straddling the end: the part on the disk.
+        assert_eq!(dev.read_at(3584, &mut buf).unwrap(), 512);
+        assert_eq!(buf[511], 7);
+        assert_eq!(dev.read_at(4000, &mut buf).unwrap(), 96);
+        // The sleeping read leaves both to the one above.
+        assert!(dev.read_at_async(4096, &mut buf).is_none());
+        assert!(dev.read_at_async(3584, &mut buf).is_none());
     }
 }
 
