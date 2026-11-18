@@ -41,8 +41,12 @@ pub const NVME: &str = "nvme";
 /// An AHCI (SATA) controller, with every disk on its ports, which the
 /// kernel drives itself unless `udriver=ahci@N` asks for it.
 pub const AHCI: &str = "ahci";
+/// A virtio input device (keyboard, mouse, tablet), which the kernel
+/// drives itself unless `udriver=virtio-input@N` asks for it: its driver
+/// in userspace serves it as `/dev/input/event*`.
+pub const VIRTIO_INPUT: &str = "virtio-input";
 /// The kinds that can be reserved.
-const KINDS: [&str; 5] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME, AHCI];
+const KINDS: [&str; 6] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME, AHCI, VIRTIO_INPUT];
 
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +258,7 @@ static SEEN: [AtomicUsize; KINDS.len()] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
+    AtomicUsize::new(0),
 ];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
 /// Whether the first e1000e is left to userspace without the boot naming
@@ -339,7 +344,7 @@ fn disk_unasked(index: usize) -> bool {
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
-/// `e1000e@N`, `nvme@N` or `ahci@N`.
+/// `e1000e@N`, `nvme@N`, `ahci@N` or `virtio-input@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -404,6 +409,18 @@ pub fn reserve_virtio_blk(transport: Transport, paddr: usize, size: usize, wirin
 /// one to hand to userspace. The kernel drives none of them either way.
 pub fn reserve_virtio_net(transport: Transport, paddr: usize, size: usize, wiring: Wiring) -> bool {
     reserve_if(VIRTIO_NET, true, transport, paddr, size, || wiring)
+}
+
+/// A bus found a virtio input device: count it, and answer whether it is
+/// the one to leave alone. When it is, the caller must not touch it: the
+/// kernel's own driver would reset it and take its events.
+pub fn reserve_virtio_input(
+    transport: Transport,
+    paddr: usize,
+    size: usize,
+    wiring: Wiring,
+) -> bool {
+    reserve_if(VIRTIO_INPUT, true, transport, paddr, size, || wiring)
 }
 
 /// [`reserve_virtio_blk`] for a disk that may not be fit to hand over
@@ -496,6 +513,7 @@ mod tests {
         assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
         assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
         assert_eq!(parse_spec("ahci@1"), Some((AHCI, 1)));
+        assert_eq!(parse_spec("virtio-input@0"), Some((VIRTIO_INPUT, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
     }

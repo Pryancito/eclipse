@@ -40,6 +40,9 @@ pub const ECLIPSE_DEVICE_NVME: usize = 4;
 /// [`ECLIPSE_TRANSPORT_PCI`]: the window is BAR 5 (ABAR), the HBA's
 /// registers and each port's.
 pub const ECLIPSE_DEVICE_AHCI: usize = 5;
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: a virtio
+/// input device, left to userspace by `udriver=virtio-input@N`.
+pub const ECLIPSE_DEVICE_VIRTIO_INPUT: usize = 6;
 
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
 /// function that is not virtio. The window is its first memory BAR, with
@@ -211,6 +214,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         ECLIPSE_DEVICE_E1000E => user::E1000E,
         ECLIPSE_DEVICE_NVME => user::NVME,
         ECLIPSE_DEVICE_AHCI => user::AHCI,
+        ECLIPSE_DEVICE_VIRTIO_INPUT => user::VIRTIO_INPUT,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);

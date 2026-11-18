@@ -330,10 +330,14 @@ impl ServedOpen {
     /// call returns.
     pub fn ioctl(&self, cmd: u32, arg: usize) -> LxResult<usize> {
         let (into, out) = wire::ioctl_carries(cmd);
+        // An argument that is not memory to read goes over with nothing in
+        // the slot: some commands say they carry an `int` in and take it by
+        // value (evdev's `EVIOCGRAB`), and only the server knows which. It
+        // answers `EFAULT` for any other (`udrivers::served`).
         let data = if into > 0 {
             kernel_hal::user::UserInPtr::<u8>::from(arg)
                 .read_array(into)
-                .map_err(|_| LxError::EFAULT)?
+                .unwrap_or_default()
         } else {
             Vec::new()
         };

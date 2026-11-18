@@ -283,11 +283,15 @@ fn true_bar_len(bar: BAR) -> BAR {
 
 /// The kind of device a userspace driver can be handed, by PCI device id:
 /// a block device, transitional (`0x1001`) or modern (`0x1042`), or a
-/// network card, transitional (`0x1000`) or modern (`0x1041`).
+/// network card, transitional (`0x1000`) or modern (`0x1041`), or an
+/// input device (`0x1052`).
 fn user_kind(device_id: u16) -> Option<&'static str> {
     match device_id {
         0x1001 | 0x1042 => Some(crate::user::VIRTIO_BLK),
         0x1000 | 0x1041 => Some(crate::user::VIRTIO_NET),
+        // An input device: modern only (`0x1052`), there is no
+        // transitional one. The kernel has no driver for it on PCI.
+        0x1052 => Some(crate::user::VIRTIO_INPUT),
         _ => None,
     }
 }

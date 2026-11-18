@@ -450,6 +450,18 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         {
             return Err(DeviceError::NotSupported);
         }
+        // An input device left to a userspace driver (`udriver=`): recorded
+        // and not touched, which `VirtIoInput::new` would.
+        if header.device_type() == DeviceType::Input
+            && crate::user::reserve_virtio_input(
+                crate::user::Transport::VirtioMmio,
+                paddr as usize,
+                size as usize,
+                wiring,
+            )
+        {
+            return Err(DeviceError::NotSupported);
+        }
         // A network card has no driver in the kernel: it is counted, and
         // recorded when the command line hands it to userspace.
         if header.device_type() == DeviceType::Network {
