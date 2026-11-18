@@ -812,6 +812,9 @@ struct Driven {
 /// before -- and a driver that comes later still finds the disk.
 pub(super) struct ServedDisk {
     sectors: u64,
+    /// What the node is called after: `virtio-blk-served` (a `vdX`) or
+    /// `nvme-served` (an `nvmeNn1`), by the kind of the device behind it.
+    name: &'static str,
     driven: lock::Mutex<Driven>,
     /// No driver, and none came in time: requests fail instead of waiting.
     gone: AtomicBool,
@@ -819,11 +822,12 @@ pub(super) struct ServedDisk {
 }
 
 impl ServedDisk {
-    fn new(link: Arc<Link>) -> (Self, usize) {
+    fn new(link: Arc<Link>, name: &'static str) -> (Self, usize) {
         let mut seat = Seat::new();
         let turn = seat.sit(link.clone()).unwrap_or(0);
         let disk = Self {
             sectors: link.sectors,
+            name,
             driven: lock::Mutex::new(Driven { link, seat }),
             gone: AtomicBool::new(false),
             stats: IoStats::new(),
@@ -927,9 +931,10 @@ impl ServedDisk {
 
 impl Scheme for ServedDisk {
     fn name(&self) -> &str {
-        // The `virtio` family, so the node is a `vdX`: what is behind it is
-        // a virtio disk, driven from userspace.
-        "virtio-blk-served"
+        // The family of the device behind it, so the node is what the
+        // kernel's own driver would have made: a `vdX` for a virtio disk,
+        // an `nvmeNn1` for an NVMe one.
+        self.name
     }
 }
 
@@ -1029,7 +1034,15 @@ const NEXT_DRIVER_STEP: Duration = Duration::from_millis(5);
 /// The disks that have been served from a device the kernel left to
 /// userspace, by that device's place among the reserved disks: what a
 /// second driver of the same device is given instead of a new disk.
-static DISKS: lock::Mutex<Vec<(usize, Arc<ServedDisk>)>> = lock::Mutex::new(Vec::new());
+static DISKS: lock::Mutex<Vec<((&'static str, usize), Arc<ServedDisk>)>> =
+    lock::Mutex::new(Vec::new());
+
+/// The kinds of reserved device a process can serve as a disk, with the
+/// name each one's node is made after.
+const DISK_KINDS: [(&str, &str); 2] = [
+    (kernel_hal::drivers::user::VIRTIO_BLK, "virtio-blk-served"),
+    (kernel_hal::drivers::user::NVME, "nvme-served"),
+];
 
 /// [`ECLIPSE_BLOCK_SERVE`](super::ECLIPSE_BLOCK_SERVE): `args[0]` the FIFO end
 /// the kernel keeps, `args[1]` the data window, `args[2]` the disk's size in
@@ -1047,12 +1060,17 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let _ = proc.remove_handle(args[1] as u32);
     let link = Arc::new(Link::new(fifo.clone(), window, args[2] as u64)?);
-    let device = super::device_claim::held_by(proc, kernel_hal::drivers::user::VIRTIO_BLK);
-    let known = device.and_then(|index| {
+    let device = DISK_KINDS
+        .iter()
+        .find_map(|(kind, _)| super::device_claim::held_by(proc, kind).map(|index| (*kind, index)));
+    let name = device
+        .and_then(|(kind, _)| DISK_KINDS.iter().find(|(k, _)| *k == kind))
+        .map_or(DISK_KINDS[0].1, |(_, name)| *name);
+    let known = device.and_then(|key| {
         let disks = DISKS.lock();
         disks
             .iter()
-            .find(|(i, _)| *i == index)
+            .find(|(k, _)| *k == key)
             .map(|(_, d)| d.clone())
     });
     let (disk, turn) = match known {
@@ -1062,13 +1080,13 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
             (disk, turn)
         }
         None => {
-            let (disk, turn) = ServedDisk::new(link.clone());
+            let (disk, turn) = ServedDisk::new(link.clone(), name);
             let disk = Arc::new(disk);
             if !kernel_hal::drivers::hotplug::add(Device::Block(disk.clone())) {
                 return Err(ZxError::NOT_SUPPORTED);
             }
-            if let Some(index) = device {
-                DISKS.lock().push((index, disk.clone()));
+            if let Some(key) = device {
+                DISKS.lock().push((key, disk.clone()));
             }
             (disk, turn)
         }
@@ -1105,7 +1123,7 @@ mod tests {
     #[test]
     fn a_disk_has_one_driver_at_a_time_and_the_next_takes_it_over() {
         let (first, first_end) = link(64);
-        let (disk, turn) = ServedDisk::new(first.clone());
+        let (disk, turn) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         assert_eq!(turn, 1);
         // While the first driver lives, nobody else gets the disk, and a
         // request has nowhere else to go.
@@ -1130,7 +1148,7 @@ mod tests {
     #[test]
     fn another_disk_is_not_let_in() {
         let (first, first_end) = link(64);
-        let (disk, _) = ServedDisk::new(first.clone());
+        let (disk, _) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         drop(first_end);
         disk.undrive(&first);
         let (other, _end) = link(128);
@@ -1140,7 +1158,7 @@ mod tests {
     #[test]
     fn requests_wait_for_the_next_driver_only_until_the_disk_gives_up() {
         let (first, first_end) = link(64);
-        let (disk, turn) = ServedDisk::new(first.clone());
+        let (disk, turn) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         drop(first_end);
         disk.undrive(&first);
         // Within the grace: not known yet.
@@ -1165,7 +1183,7 @@ mod tests {
     #[test]
     fn a_driver_that_came_in_time_is_not_given_up_on() {
         let (first, first_end) = link(64);
-        let (disk, turn) = ServedDisk::new(first.clone());
+        let (disk, turn) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         drop(first_end);
         disk.undrive(&first);
         let (second, _second_end) = link(64);
@@ -1177,7 +1195,7 @@ mod tests {
     #[test]
     fn a_request_the_driver_died_under_is_made_again_with_the_next() {
         let (first, first_end) = link(64);
-        let (disk, _) = ServedDisk::new(first.clone());
+        let (disk, _) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         drop(first_end);
         disk.undrive(&first);
         let (second, _second_end) = link(64);
@@ -1240,7 +1258,7 @@ mod tests {
     #[async_std::test]
     async fn a_write_asleep_goes_through_the_window_in_slots() {
         let (first, end) = link(64);
-        let (disk, _) = ServedDisk::new(first.clone());
+        let (disk, _) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         let served = driver(first.window.clone(), end, 64);
         // Two slots and a sector more, from sector 5.
         let data: Vec<u8> = (0..2 * 4096 + SECTOR).map(|i| (i % 251) as u8).collect();
@@ -1266,7 +1284,7 @@ mod tests {
     #[async_std::test]
     async fn a_write_asleep_past_the_end_is_refused_and_asks_nothing() {
         let (first, end) = link(64);
-        let (disk, _) = ServedDisk::new(first.clone());
+        let (disk, _) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         let write = disk.write_block_async(64, &[0u8; SECTOR]).unwrap();
         assert_eq!(write.await, Err(DeviceError::InvalidParam));
         let mut m = [0u8; BLOCK_MSG];
@@ -1276,7 +1294,7 @@ mod tests {
     #[async_std::test]
     async fn a_write_and_a_flush_asleep_fail_when_no_driver_is_left() {
         let (first, end) = link(64);
-        let (disk, turn) = ServedDisk::new(first.clone());
+        let (disk, turn) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
         drop(end);
         disk.undrive(&first);
         disk.give_up(turn);

@@ -29,6 +29,12 @@ use zircon_object::{ZxError, ZxResult};
 /// `udriver=e1000e@N`.
 pub const ECLIPSE_DEVICE_E1000E: usize = 3;
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an NVMe
+/// controller, left to userspace by `udriver=nvme@N`. Its transport is
+/// [`ECLIPSE_TRANSPORT_PCI`]: the window is BAR 0, the controller's
+/// registers and doorbells.
+pub const ECLIPSE_DEVICE_NVME: usize = 4;
+
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
 /// function that is not virtio. The window is its first memory BAR, with
 /// the registers as its datasheet lays them out; words 4 to 6 of the claim
@@ -197,6 +203,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
         ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
         ECLIPSE_DEVICE_E1000E => user::E1000E,
+        ECLIPSE_DEVICE_NVME => user::NVME,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
