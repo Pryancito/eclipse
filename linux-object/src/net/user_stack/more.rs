@@ -543,4 +543,100 @@ mod tests {
         );
         assert_eq!(ip(Socket::endpoint(&t).unwrap()), at(other, 6000));
     }
+
+    #[test]
+    fn a_port_is_a_sockets_at_the_address_it_was_bound_to() {
+        use super::super::tests::{any, at, ip};
+        use super::super::{listen_message, ServedTcpSocket, ServedUdpSocket};
+        use crate::error::LxError;
+        use crate::fs::{FileLike, OpenFlags};
+        use crate::net::{Endpoint, Socket};
+        use core::convert::TryInto;
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let link = stack.link.clone();
+        link.first_card(Card::first(MAC, STACK_ADDR, 24, 0), None);
+        let other = [192, 168, 7, 9];
+        stack.say(more_message(0, &[(AN_ADDRESS, v4(other, 24), None)]));
+        let udp = || {
+            let s = ServedUdpSocket::new(link.clone(), false).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        let recv = |s: &ServedUdpSocket| {
+            let mut buf = [0u8; 8];
+            let (n, from) = async_std::task::block_on(Socket::read(s, &mut buf));
+            n.map(|n| (buf[..n].to_vec(), ip(from)))
+        };
+
+        // One socket at each address has the port; a third cannot have
+        // it at one of them, nor at every address.
+        let (first, second, third) = (udp(), udp(), udp());
+        assert_eq!(
+            Socket::bind(&first, Endpoint::Ip(at(STACK_ADDR, 5000))),
+            Ok(0)
+        );
+        assert_eq!(Socket::bind(&second, Endpoint::Ip(at(other, 5000))), Ok(0));
+        for taken in [Endpoint::Ip(at(other, 5000)), any(5000)] {
+            assert_eq!(Socket::bind(&third, taken), Err(LxError::EADDRINUSE));
+        }
+        // Nor can one have at an address what another has at every one.
+        assert_eq!(Socket::bind(&third, any(5001)), Ok(0));
+        let fourth = udp();
+        assert_eq!(
+            Socket::bind(&fourth, Endpoint::Ip(at(other, 5001))),
+            Err(LxError::EADDRINUSE)
+        );
+        // What a program of this machine sends to an address goes to the
+        // socket bound to it, from the address the sender was bound to.
+        let to = Some(Endpoint::Ip(at(other, 5000)));
+        assert_eq!(Socket::write(&first, b"hi", to), Ok(2));
+        assert_eq!(recv(&second), Ok((b"hi".to_vec(), at(STACK_ADDR, 5000))));
+        assert_eq!(recv(&first), Err(LxError::EAGAIN));
+        // And to the one that has the port at every address otherwise.
+        let to = Some(Endpoint::Ip(at(other, 5001)));
+        assert_eq!(Socket::write(&first, b"yo", to), Ok(2));
+        assert_eq!(recv(&third).map(|got| got.0), Ok(b"yo".to_vec()));
+        // Once it is gone the port is free at its address alone.
+        drop(second);
+        assert_eq!(Socket::bind(&fourth, any(5000)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::bind(&fourth, Endpoint::Ip(at(other, 5000))), Ok(0));
+        while stack.told().is_some() {}
+
+        // Stream sockets the same, and the stack is told where each
+        // listens: four bytes after what a listen always said.
+        let tcp = || {
+            let s = ServedTcpSocket::new(link.clone(), false).unwrap();
+            FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+            s
+        };
+        let (one, two, three) = (tcp(), tcp(), tcp());
+        assert_eq!(
+            Socket::bind(&one, Endpoint::Ip(at(STACK_ADDR, 8080))),
+            Ok(0)
+        );
+        assert_eq!(Socket::bind(&two, Endpoint::Ip(at(other, 8080))), Ok(0));
+        assert_eq!(Socket::bind(&three, any(8080)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::listen(&one), Ok(0));
+        let told = stack.told().unwrap();
+        let (plain, where_) = told.split_at(told.len() - 4);
+        assert_eq!(where_, STACK_ADDR);
+        let sock = u64::from_le_bytes(plain[8..16].try_into().unwrap());
+        let backlog = u16::from_le_bytes(plain[18..20].try_into().unwrap());
+        let window = u32::from_le_bytes(plain[20..24].try_into().unwrap());
+        assert_eq!(plain, listen_message(sock, 8080, backlog, window));
+        assert_eq!(Socket::listen(&two), Ok(0));
+        assert_eq!(stack.told().unwrap()[24..], other);
+        // A program of this machine that connects to one address finds
+        // who listens there.
+        let client = tcp();
+        let to = Endpoint::Ip(at(other, 8080));
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&client, to)),
+            Ok(0)
+        );
+        assert!(async_std::task::block_on(Socket::accept(&one)).is_err());
+        let (_, from) = async_std::task::block_on(Socket::accept(&two)).unwrap();
+        assert_eq!(ip(from).addr, at(other, 0).addr);
+    }
 }

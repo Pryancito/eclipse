@@ -8,9 +8,9 @@
 //! ```text
 //! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window  (28  [u8; 4] from)
 //! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window  (40  [u8; 16] from)
-//! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
-//! LISTEN6  (kernel to stack)  as LISTEN
-//! LISTEN6ONLY (kernel to stack)  as LISTEN
+//! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window  (24  [u8; 4] at)
+//! LISTEN6  (kernel to stack)  as LISTEN  (24  [u8; 16] at)
+//! LISTEN6ONLY (kernel to stack)  as LISTEN6
 //! WRITE    (kernel to stack)  16  the bytes
 //! SHUTDOWN (kernel to stack)
 //! WINDOW   (kernel to stack)  16  u32 bytes
@@ -38,7 +38,10 @@
 //! socket does, and whoever knocks as IPv6 is refused; a `LISTEN6` takes
 //! both, as an `AF_INET6` socket does; a `LISTEN6ONLY` takes the ones
 //! that arrive as IPv6, as such a socket does once it was told
-//! `IPV6_V6ONLY`, and leaves the port to a `LISTEN` for the others. A
+//! `IPV6_V6ONLY`, and leaves the port to a `LISTEN` for the others. One
+//! that ends with an `at` is of a socket that was bound to that address
+//! of the machine's: it takes the connections that arrive there, and
+//! another socket can listen on the same port at another address. A
 //! `CONNECT6` is a connect to an
 //! IPv6 address, from the address of the card that
 //! [`six`](super::six) says goes there. A connect that ends with a
@@ -138,7 +141,9 @@ pub(super) struct Conn {
 
 /// A socket that takes connections.
 pub(super) struct Listener {
-    port: u16,
+    /// Its port, and the address of the machine's it was bound to when
+    /// it was: it takes what arrives there and nowhere else.
+    at: IpEndpoint,
     /// The one version of IP it takes what arrives as: IPv4 for a
     /// `LISTEN`, IPv6 for a `LISTEN6ONLY`, and none for a `LISTEN6`,
     /// which takes both.
@@ -239,17 +244,18 @@ fn socket() -> TcpSocket<'static> {
     socket
 }
 
-/// A socket that takes a connection to `port`: one that arrives as the
-/// version `only`, or as either. A handshake that starts on it and is not
+/// A socket that takes a connection to the port of `at`, at its address
+/// when it says one and at any when it says none: one that arrives as
+/// the version `only`, or as either. A handshake that starts on it and is not
 /// finished is given up on in the time a connect is.
-fn listening(port: u16, only: Option<IpVersion>) -> Option<TcpSocket<'static>> {
+fn listening(at: IpEndpoint, only: Option<IpVersion>) -> Option<TcpSocket<'static>> {
     let mut socket = socket();
-    listen_again(&mut socket, port, only).then_some(socket)
+    listen_again(&mut socket, at, only).then_some(socket)
 }
 
-/// Have `socket`, which is closed, take a connection to `port`.
-fn listen_again(socket: &mut TcpSocket<'_>, port: u16, only: Option<IpVersion>) -> bool {
-    if socket.listen(port).is_err() {
+/// Have `socket`, which is closed, take a connection to `at`.
+fn listen_again(socket: &mut TcpSocket<'_>, at: IpEndpoint, only: Option<IpVersion>) -> bool {
+    if socket.listen(at).is_err() {
         return false;
     }
     // After the listen, which forgets the ones before.
@@ -382,15 +388,23 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         m: &[u8],
         only: Option<IpVersion>,
     ) -> Result<bool, Refused> {
-        if m.len() != HEADER_LEN + 8 {
-            return Err(Refused::Malformed);
-        }
+        // After the eight bytes every listen says, the address the
+        // socket was bound to: four bytes of a `LISTEN`, sixteen of the
+        // others.
+        let at = match (m.len().saturating_sub(HEADER_LEN), only) {
+            (8, _) => IpAddress::Unspecified,
+            (12, Some(IpVersion::Ipv4)) => IpAddress::Ipv4(Ipv4Address::from_bytes(&m[24..28])),
+            (24, Some(IpVersion::Ipv6) | None) => {
+                IpAddress::Ipv6(Ipv6Address::from_bytes(&m[24..40]))
+            }
+            _ => return Err(Refused::Malformed),
+        };
         let port = u16_at(m, 16);
         if port == 0 || self.knows(sock) {
             return Err(Refused::Bind);
         }
         let listener = Listener {
-            port,
+            at: IpEndpoint::new(at, port),
             only,
             backlog: (u16_at(m, 18) as usize).clamp(1, BACKLOG_MAX),
             window: u32_at(m, 20) as usize,
@@ -547,7 +561,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 && listener.ready.len() < most
                 && sockets < STREAMS_MAX
             {
-                let Some(socket) = self::listening(listener.port, listener.only) else {
+                let Some(socket) = self::listening(listener.at, listener.only) else {
                     break;
                 };
                 listener.ready.push(self.set.add(socket));
@@ -609,7 +623,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                     // A socket whose handshake was given up on listens
                     // again.
                     TcpState::Closed | TcpState::TimeWait => {
-                        listen_again(&mut socket, listener.port, listener.only);
+                        listen_again(&mut socket, listener.at, listener.only);
                     }
                     // Made. Also one whose peer closed it at once: the
                     // program accepts it and reads the end.
@@ -1033,6 +1047,41 @@ mod tests {
         peer.ack = sent[0].end();
         let (_, events) = wire.hears(&peer.segment(TcpControl::None, first));
         (peer, events)
+    }
+
+    #[test]
+    fn a_listener_bound_to_an_address_takes_what_arrives_there_alone() {
+        let listen_at = |sock: u64, at: Ipv4Address| {
+            let mut m = listen(sock, 8080, 2, 4096);
+            m.extend_from_slice(&at.0);
+            m
+        };
+        // Bound to an address that is not the one THEIRS knocks at, the
+        // port is nobody's there.
+        let mut wire = Wire::new();
+        wire.asked(&listen_at(5, Ipv4Address([192, 168, 7, 9])));
+        let mut peer = Peer {
+            port: 40000,
+            ours: 8080,
+            seq: 9000,
+            ack: 0,
+        };
+        let mut syn = peer.segment(TcpControl::Syn, &[]);
+        syn.ack = None;
+        let (sent, events) = wire.hears(&syn);
+        assert_eq!(events, []);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].control, TcpControl::Rst);
+        // Another socket can listen on the same port at the address it
+        // does knock at, and gets the connection.
+        wire.asked(&listen_at(6, OUR_IP));
+        let (_, events) = arrives(&mut wire, 40001, b"");
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].0, events[0].1), (6, EV_ACCEPTED));
+        // An address is four bytes after a `LISTEN`, and nothing else is.
+        let mut long = listen_at(7, OUR_IP);
+        long.push(0);
+        assert_eq!(wire.stack.request(&long), Err(Refused::Malformed));
     }
 
     #[test]
