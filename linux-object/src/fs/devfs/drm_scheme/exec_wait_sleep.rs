@@ -6,9 +6,46 @@
 use super::*;
 
 /// How long the pre-wait may hold an `EXEC`: the arm's own `WAIT_TIMEOUT_US`.
-/// Past it the arm answers EIO either way, so a sleep here can never outlast
-/// the wait it stands in for.
+///
+/// Past it this answers `EIO` itself, which is what the arm answers for
+/// the same fences after the same 10 s. It used to hand the `EXEC` on to
+/// the arm instead, and the arm starts a 10 s deadline of its own and
+/// SPINS a core for it, since `io_control` cannot sleep: one fence that did
+/// not land in time cost 20 s, the second half of them a CPU spinning in
+/// the GPU driver. That is the ~20 s freeze of the GPU desktop that came in
+/// with this pre-wait (29c046eb, 2026-11-01); before it the same `EXEC`
+/// waited 10 s in all.
 pub(super) const EXEC_WAIT_TIMEOUT_US: u64 = 10_000_000;
+
+/// `EXEC`s this pre-wait ended with `EIO` (their CPU waits never landed).
+static EXEC_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+
+/// Lines [`exec_wait_gave_up`] writes to dmesg at most: a client whose
+/// fence never comes back retries and times out on every frame, and klog
+/// writes synchronously to the UART.
+const MAX_EXEC_WAIT_TIMEOUT_REPORTS: u32 = 8;
+
+/// The pre-wait ran out: say which fences, once per `EXEC` up to the
+/// budget, and answer the `EIO` the arm would have answered 10 s later.
+fn exec_wait_gave_up(handles: &[u32], points: &[u64]) -> LxResult<()> {
+    let n = EXEC_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    if n < MAX_EXEC_WAIT_TIMEOUT_REPORTS {
+        kernel_hal::klog_warn!(
+            "[drm] EXEC: {} CPU wait(s) still unsignaled after {} us -- EIO now, without \
+             the driver's second 10 s spin; pid={} (handle:target/current) {}{}",
+            handles.len(),
+            EXEC_WAIT_TIMEOUT_US,
+            drm::current_pid(),
+            zcore_drivers::scheme::syncobj::describe(handles, Some(points)),
+            if n + 1 == MAX_EXEC_WAIT_TIMEOUT_REPORTS {
+                " -- further EXEC wait timeouts will not be reported"
+            } else {
+                ""
+            }
+        );
+    }
+    Err(LxError::EIO)
+}
 
 impl DrmDev {
     /// Sleep until the waits of a nouveau `EXEC` that its arm would do on the
@@ -25,7 +62,8 @@ impl DrmDev {
     /// ([`drm::exec_cpu_waits`], exactly the one its arm would CPU-wait, so a
     /// wait the GPU takes is not held back here), this sleeps on it with
     /// `wait_ready`, and the arm then finds those syncobjs signaled. Every
-    /// early return leaves the `EXEC` behaving exactly as before.
+    /// early return leaves the `EXEC` behaving exactly as before; running
+    /// out of time answers `EIO` here (see [`EXEC_WAIT_TIMEOUT_US`]).
     pub async fn exec_wait_sleep(&self, cmd: u32, data: usize) -> LxResult<()> {
         if !zcore_drivers::display::nouveau_uapi_enabled()
             || !zcore_drivers::display::is_exec_ioctl(cmd)
@@ -73,13 +111,14 @@ impl DrmDev {
                         Err(zcore_drivers::scheme::syncobj::WaitOutcome::Timeout)
                     ) {
                         acct.timed_out();
+                        return exec_wait_gave_up(&handles, &points);
                     }
                     return Ok(());
                 }
                 None => {
                     if !fence_poll_wait(acct.probes, deadline).await? {
                         acct.timed_out();
-                        return Ok(());
+                        return exec_wait_gave_up(&handles, &points);
                     }
                     acct.probe();
                 }

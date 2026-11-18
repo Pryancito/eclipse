@@ -260,3 +260,29 @@ fn every_pre_wait_accounts_its_parking() {
         );
     }
 }
+
+/// An `EXEC` whose CPU waits did not land inside the pre-wait's 10 s ends
+/// there with `EIO`, both ways the pre-wait can run out. Handing it on to the
+/// driver's arm instead started a second 10 s deadline that spins a core:
+/// the ~20 s freeze of the GPU desktop.
+#[test]
+fn an_exec_pre_wait_that_runs_out_answers_eio_and_not_the_spinning_arm() {
+    let body = body(
+        include_str!("exec_wait_sleep.rs"),
+        "pub async fn exec_wait_sleep(",
+    );
+    let mut timeouts = 0;
+    let lines: alloc::vec::Vec<&str> = body.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("acct.timed_out();") {
+            timeouts += 1;
+            let next = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
+            assert_eq!(
+                next, "return exec_wait_gave_up(&handles, &points);",
+                "a timed-out EXEC pre-wait goes on to the arm's 10 s spin"
+            );
+        }
+    }
+    assert_eq!(timeouts, 2, "the pre-wait has two ways to run out");
+    assert!(include_str!("exec_wait_sleep.rs").contains("Err(LxError::EIO)"));
+}
