@@ -45,7 +45,7 @@ use crate::wire::{
 };
 
 use super::ip_cfg;
-use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
+use crate::scheme::{NeighbourInfo, NetScheme, NetStats, RouteInfo, Scheme};
 use crate::sync::Mutex;
 use crate::{DeviceError, DeviceResult};
 
@@ -161,11 +161,13 @@ impl Sixes {
 /// What a card has besides its first address of IPv4 and its gateway,
 /// kept by whoever is told: its other addresses of IPv4, and its routes
 /// to less than everything, each a network and the router it goes
-/// through. Nothing, until the stack says, and once it is gone.
+/// through; and the neighbours it has met. Nothing, until the stack
+/// says, and once it is gone.
 #[derive(Default)]
 pub struct More {
     #[allow(clippy::type_complexity)]
     said: Mutex<(Vec<Ipv4Cidr>, Vec<(IpCidr, IpAddress)>)>,
+    met: Mutex<Vec<NeighbourInfo>>,
 }
 
 impl More {
@@ -177,6 +179,17 @@ impl More {
     /// The stack that said them is gone.
     pub fn forget(&self) {
         self.say(Vec::new(), Vec::new());
+        self.meet(Vec::new());
+    }
+
+    /// The card has met these `neighbours`, and no others.
+    pub fn meet(&self, neighbours: Vec<NeighbourInfo>) {
+        *self.met.lock() = neighbours;
+    }
+
+    /// The neighbours, in the order they were said.
+    pub fn neighbours(&self) -> Vec<NeighbourInfo> {
+        self.met.lock().clone()
     }
 
     /// The addresses, in the order they were said.
@@ -597,6 +610,10 @@ impl NetScheme for StackCard {
         }
     }
 
+    fn get_neighbours(&self) -> Vec<NeighbourInfo> {
+        self.more.neighbours()
+    }
+
     fn get_routes(&self) -> Vec<RouteInfo> {
         // The default route, when the stack has a gateway; the routes
         // to a network; and the router of IPv6.
@@ -919,6 +936,22 @@ mod tests {
         let c = card(None).through(wire);
         assert!(c.can_send());
         assert_eq!(c.send(&[0u8; 64]), Err(DeviceError::NotReady));
+    }
+
+    #[test]
+    fn it_has_met_the_neighbours_the_stack_said_until_the_stack_is_gone() {
+        let more = Arc::new(More::default());
+        let c = card(Some([10, 0, 9, 1])).with_more(more.clone());
+        assert!(c.get_neighbours().is_empty());
+        let met = vec![NeighbourInfo {
+            address: IpAddress::v4(10, 0, 9, 1),
+            hardware: [2, 0, 0, 0, 0, 1],
+            until_ms: 60_000,
+        }];
+        more.meet(met.clone());
+        assert_eq!(c.get_neighbours(), met);
+        more.forget();
+        assert!(c.get_neighbours().is_empty());
     }
 
     #[test]

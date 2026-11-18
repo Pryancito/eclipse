@@ -104,6 +104,9 @@ pub struct Cache<'a> {
     /// its socket's silence ends, could hold the others back round after
     /// round.
     asked: [Option<Asked>; ASKED],
+    /// How many times what the cache would show of its neighbors has
+    /// changed: see [`changes`](Self::changes).
+    changes: u32,
     #[cfg(any(feature = "std", feature = "alloc"))]
     gc_threshold: usize,
 }
@@ -122,6 +125,11 @@ impl<'a> Cache<'a> {
 
     /// Neighbor entry lifetime, in milliseconds.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
+
+    /// How much of its lifetime a neighbor has left, at most, when
+    /// hearing from it again counts as a change of the cache
+    /// ([`changes`](Self::changes)), in milliseconds.
+    pub(crate) const RENEWED_TIME: Duration = Duration::from_millis(30_000);
 
     /// Default number of entries in the cache before GC kicks in
     #[cfg(any(feature = "std", feature = "alloc"))]
@@ -143,6 +151,7 @@ impl<'a> Cache<'a> {
             #[cfg(any(feature = "std", feature = "alloc"))]
             gc_threshold: Self::GC_THRESHOLD,
             asked: [None; ASKED],
+            changes: 0,
         }
     }
 
@@ -158,6 +167,7 @@ impl<'a> Cache<'a> {
             storage,
             gc_threshold,
             asked: [None; ASKED],
+            changes: 0,
         }
     }
 
@@ -195,6 +205,20 @@ impl<'a> Cache<'a> {
                 }
             }
         };
+        // News for whoever shows the neighbors: one not known, one at
+        // another hardware address, or one whose time was more than half
+        // gone and is whole again. Not every packet of a neighbor that
+        // keeps talking, which fills this each time.
+        let news = match self.storage.get(&protocol_addr) {
+            Some(known) => {
+                known.hardware_addr != hardware_addr
+                    || known.expires_at < timestamp + Self::RENEWED_TIME
+            }
+            None => true,
+        };
+        if news {
+            self.changes = self.changes.wrapping_add(1);
+        }
         let neighbor = Neighbor {
             expires_at: timestamp + Self::ENTRY_LIFETIME,
             hardware_addr,
@@ -249,6 +273,22 @@ impl<'a> Cache<'a> {
                 }
             }
         }
+    }
+
+    /// A number that is another each time the neighbors change as far
+    /// as someone who shows them cares: one more, one at another
+    /// hardware address, or one heard from again with less than
+    /// `RENEWED_TIME` of its lifetime left.
+    pub fn changes(&self) -> u32 {
+        self.changes
+    }
+
+    /// The neighbors there are: the address of each, its hardware
+    /// address, and when it stops being taken as there.
+    pub fn neighbors(&self) -> impl Iterator<Item = (IpAddress, EthernetAddress, Instant)> + '_ {
+        self.storage
+            .iter()
+            .map(|(addr, neighbor)| (*addr, neighbor.hardware_addr, neighbor.expires_at))
     }
 
     pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
