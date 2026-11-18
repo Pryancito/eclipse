@@ -647,6 +647,27 @@ impl Socket for NetlinkSocketState {
                     }
                     info!("[netlink] GetRoute: dumped routes");
                 }
+                NetlinkMessageType::GetNeigh => {
+                    // The family asked for, when one is: the first byte
+                    // behind the header.
+                    let family = data.get(size_of::<NetlinkMessageHeader>()).copied();
+                    let now = kernel_hal::timer::timer_now().as_millis() as u64;
+                    let ifaces = get_net_device();
+                    for (i, iface) in ifaces.iter().enumerate() {
+                        for neighbour in iface.get_neighbours() {
+                            let msg = neigh_dump_entry(
+                                header.nlmsg_seq,
+                                reply_pid,
+                                (i + 1) as u32,
+                                &neighbour,
+                                now,
+                            );
+                            if family.is_none_or(|f| f == 0 || f == msg[16]) {
+                                push_netlink_rx(&mut buffer, msg);
+                            }
+                        }
+                    }
+                }
                 NetlinkMessageType::DelAddr => {
                     let errno = match parse_ifaddr_cidr(data) {
                         None => {
@@ -786,6 +807,7 @@ impl Socket for NetlinkSocketState {
                 NetlinkMessageType::GetLink
                     | NetlinkMessageType::GetAddr
                     | NetlinkMessageType::GetRoute
+                    | NetlinkMessageType::GetNeigh
             );
             if is_dump {
                 let mut msg = Vec::new();
@@ -1085,6 +1107,10 @@ enum_with_unknown! {
         DelRoute = 25,
         /// Get route
         GetRoute = 26,
+        /// New neighbour
+        NewNeigh = 28,
+        /// Get neighbour
+        GetNeigh = 30,
     }
 }
 
@@ -1408,6 +1434,74 @@ fn push_route_dump_entry(
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
     push_netlink_rx(buffer, msg);
+}
+
+/// What a neighbour's message starts with (`struct ndmsg`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NeighMsg {
+    ndm_family: u8,
+    ndm_pad1: u8,
+    ndm_pad2: u16,
+    ndm_ifindex: i32,
+    ndm_state: u16,
+    ndm_flags: u8,
+    ndm_type: u8,
+}
+
+const _: () = {
+    assert!(size_of::<NeighMsg>() == 12);
+};
+
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+/// Heard from not long ago, and known from before that.
+const NUD_REACHABLE: u16 = 0x02;
+const NUD_STALE: u16 = 0x04;
+
+/// The `RTM_NEWNEIGH` that says `neighbour` of the interface `ifindex`
+/// in a dump, at `now` milliseconds since boot: reachable until its
+/// time is up, stale after.
+fn neigh_dump_entry(
+    seq: u32,
+    pid: u32,
+    ifindex: u32,
+    neighbour: &zcore_drivers::scheme::NeighbourInfo,
+    now: u64,
+) -> Vec<u8> {
+    let family: u16 = match neighbour.address {
+        IpAddress::Ipv4(_) => AddressFamily::Internet.into(),
+        _ => AddressFamily::Internet6.into(),
+    };
+    let mut msg = Vec::new();
+    msg.push_ext(NetlinkMessageHeader {
+        nlmsg_len: 0,
+        nlmsg_type: NetlinkMessageType::NewNeigh.into(),
+        nlmsg_flags: NetlinkMessageFlags::MULTI,
+        nlmsg_seq: seq,
+        nlmsg_pid: pid,
+    });
+    msg.push_ext(NeighMsg {
+        ndm_family: family as u8,
+        ndm_pad1: 0,
+        ndm_pad2: 0,
+        ndm_ifindex: ifindex as i32,
+        ndm_state: if now < neighbour.until_ms {
+            NUD_REACHABLE
+        } else {
+            NUD_STALE
+        },
+        ndm_flags: 0,
+        ndm_type: 1, // RTN_UNICAST
+    });
+    let mut attrs = Vec::new();
+    push_rtattr_bytes(&mut attrs, NDA_DST, neighbour.address.as_bytes());
+    push_rtattr_bytes(&mut attrs, NDA_LLADDR, &neighbour.hardware);
+    msg.align4();
+    msg.append(&mut attrs);
+    msg.align4();
+    msg.set_ext(0, msg.len() as u32);
+    msg
 }
 
 /// La interfaz por la que instalar una ruta cuya peticion trae pasarela pero
@@ -1867,6 +1961,51 @@ mod netlink_tests {
         assert_eq!(odd.len(), 7);
         push_rtattr_bytes(&mut odd, RTA_OIF, &[0, 0, 0, 0]);
         assert_eq!(odd.len(), 8 + 8);
+    }
+
+    #[test]
+    fn a_neighbour_is_dumped_with_its_addresses_and_whether_it_is_still_there() {
+        use zcore_drivers::scheme::NeighbourInfo;
+        let neighbour = NeighbourInfo {
+            address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)),
+            hardware: [0x52, 0x55, 10, 0, 2, 2],
+            until_ms: 5_000,
+        };
+        let msg = neigh_dump_entry(7, 9, 2, &neighbour, 4_999);
+        assert_eq!(
+            u32::from_ne_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize,
+            msg.len()
+        );
+        assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), 28, "RTM_NEWNEIGH");
+        let ndm: NeighMsg = read_struct(&msg, 16).unwrap();
+        assert_eq!(ndm.ndm_family, 2);
+        assert_eq!(ndm.ndm_ifindex, 2);
+        assert_eq!(ndm.ndm_state, NUD_REACHABLE);
+        let mut seen = Vec::new();
+        for_each_rtattr(&msg, 28, |kind, payload| {
+            seen.push((kind, payload.to_vec()))
+        });
+        assert_eq!(
+            seen,
+            [
+                (NDA_DST, alloc::vec![10, 0, 2, 2]),
+                (NDA_LLADDR, alloc::vec![0x52, 0x55, 10, 0, 2, 2]),
+            ]
+        );
+        // Its time up, it was there once.
+        let msg = neigh_dump_entry(7, 9, 2, &neighbour, 5_000);
+        let ndm: NeighMsg = read_struct(&msg, 16).unwrap();
+        assert_eq!(ndm.ndm_state, NUD_STALE);
+        // One of IPv6 carries its sixteen bytes.
+        let six = NeighbourInfo {
+            address: IpAddress::Ipv6(zcore_drivers::wire::Ipv6Address::new(
+                0xfe80, 0, 0, 0, 0, 0, 0, 2,
+            )),
+            ..neighbour
+        };
+        let msg = neigh_dump_entry(7, 9, 2, &six, 0);
+        assert_eq!(msg[16], 10);
+        assert_eq!(msg.len(), 16 + 12 + 20 + 12);
     }
 
     #[test]
