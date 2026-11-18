@@ -748,6 +748,8 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("ublk2", "respawn", "/usr/local/bin/eclipse-ublk 2", ""),
         ("ublk3", "respawn", "/usr/local/bin/eclipse-ublk 3", ""),
         ("ublk4", "respawn", "/usr/local/bin/eclipse-ublk 4", ""),
+        ("uinput", "respawn", "/usr/local/bin/eclipse-uinput 1", ""),
+        ("uinput2", "respawn", "/usr/local/bin/eclipse-uinput 2", ""),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         ("unvme", "respawn", "/usr/local/bin/eclipse-unvme 1", ""),
         ("unvme2", "respawn", "/usr/local/bin/eclipse-unvme 2", ""),
@@ -986,6 +988,8 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
             "ublk2",
             "ublk3",
             "ublk4",
+            "uinput",
+            "uinput2",
             "unet",
             "unvme",
             "unvme2"
@@ -1043,7 +1047,10 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         field(&gated[1].1, "after"),
         Some("ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2")
     );
-    controller(&gated[6..8], "unvme", "nvme");
+    controller(&gated[8..10], "unvme", "nvme");
+    // The input devices named on the command line, served as
+    // /dev/input/eventK: one service each, the Nth of the kind.
+    controller(&gated[5..7], "uinput", "virtio-input");
     // A service for each further disk, the Nth of the kernel's list.
     for (n, (name, body)) in gated[2..5].iter().enumerate() {
         let nth = n + 2;
@@ -1059,7 +1066,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     }
     let wrapper = |name: &str| fs::read_to_string(rootfs.join("usr/local/bin").join(name)).unwrap();
     // The card: the first one, by number.
-    assert_eq!(field(&gated[5].1, "udriver"), Some("virtio-net@0"));
+    assert_eq!(field(&gated[7].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
         unet.contains("exec /bin/eclipse-netstack 0"),
@@ -1849,6 +1856,10 @@ fn the_two_sessions_never_start_each_others_clients() {
         "uahci2",
         "ublk-mounts",
         "fat-mounts",
+        // An input device's driver: what it serves is for whichever
+        // session runs, or none.
+        "uinput",
+        "uinput2",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
