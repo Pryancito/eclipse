@@ -563,7 +563,12 @@ fn toggle_or_lock() -> Option<std::fs::File> {
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            if pid > 1 {
+            // Only a process that is this program: the lock can be held by
+            // one that has not written its pid yet, and the number in the
+            // file is then whoever had the lock before, which by now may be
+            // anybody.
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if pid > 1 && comm.trim() == "lunarnotes" {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
         }
