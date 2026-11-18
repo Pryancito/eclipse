@@ -602,6 +602,27 @@ ifneq ($(UNET),)
   endif
 endif
 
+# UINPUT=1: a virtio keyboard (`id=ukbd`) and a virtio tablet (`id=utab`),
+# for the userspace input driver: `udriver=virtio-input@0` in KOPTS leaves
+# the keyboard to it (`tools/eclipse-udrivers/src/input.rs`). QMP=<path>: a
+# QMP socket at that path, to type on them from this machine with
+# `input-send-event`.
+ifneq ($(UINPUT),)
+  ifeq ($(ARCH), x86_64)
+    qemu_opts += -device virtio-keyboard-pci,id=ukbd -device virtio-tablet-pci,id=utab
+  else ifeq ($(ARCH), aarch64)
+    # Beside the disk (.0) and UNET's card (.2): a device QEMU places by
+    # itself goes on the last transport, which the kernel does not reach.
+    qemu_opts += -device virtio-keyboard-device,id=ukbd,bus=virtio-mmio-bus.3 \
+		-device virtio-tablet-device,id=utab,bus=virtio-mmio-bus.4
+  else
+    qemu_opts += -device virtio-keyboard-device,id=ukbd -device virtio-tablet-device,id=utab
+  endif
+endif
+ifneq ($(QMP),)
+  qemu_opts += -qmp unix:$(QMP),server=on,wait=off
+endif
+
 ifeq ($(GRAPHIC), on)
   ifeq ($(ARCH), x86_64)
     ifeq ($(GL), 1)

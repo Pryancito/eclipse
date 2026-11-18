@@ -23,6 +23,8 @@ pub const KIND_NVME: usize = 4;
 /// An AHCI controller (`udriver=ahci@N`); its transport is a plain PCI
 /// function and the window is BAR 5, the ABAR.
 pub const KIND_AHCI: usize = 5;
+/// A virtio input device (`udriver=virtio-input@N`): see [`crate::input`].
+pub const KIND_VIRTIO_INPUT: usize = 6;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;

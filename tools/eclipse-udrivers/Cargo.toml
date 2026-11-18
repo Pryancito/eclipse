@@ -33,6 +33,14 @@ path = "src/bin/udrv-virtio-net.rs"
 name = "udrv-dev-echo"
 path = "src/bin/udrv-dev-echo.rs"
 
+[[bin]]
+name = "udrv-virtio-input"
+path = "src/bin/udrv-virtio-input.rs"
+
+[[bin]]
+name = "udrv-evdev-check"
+path = "src/bin/udrv-evdev-check.rs"
+
 [dependencies]
 libc = "0.2"
 

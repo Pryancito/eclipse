@@ -67,6 +67,13 @@ const DRIVERS: [&str; 4] = [
 /// What tests a node in `/dev` that a process serves, from the same
 /// package: `udrv-dev-echo check NAME`.
 const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
+/// The drivers of input devices, from the same package: each serves its
+/// device as a node of `/dev/input` (`udriver=virtio-input@N`); and what
+/// checks and times such a node, `udrv-evdev-check NODE`.
+const INPUT_DRIVERS: [&str; 2] = ["udrv-virtio-input", "udrv-evdev-check"];
+/// How many virtio input devices get a driver service of their own
+/// (`uinput`, `uinput2`): a keyboard and a mouse or tablet.
+const UINPUT_DEVICES: usize = 2;
 
 /// The network stack that runs as a process: its package, under `tools/`,
 /// its binaries -- the stack, and the UDP and TCP echo servers and the TCP
@@ -312,6 +319,45 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
         .unwrap();
     }
 
+    // The virtio input devices the boot leaves to userspace
+    // (`udriver=virtio-input@N`): one service for each of the first two,
+    // the Nth of the kernel's list, each serving its device as a node of
+    // `/dev/input`.
+    for nth in 1..=UINPUT_DEVICES {
+        let (name, which) = match nth {
+            1 => ("uinput".to_string(), "virtio-input".to_string()),
+            n => (format!("uinput{n}"), format!("virtio-input/{n}")),
+        };
+        fs::write(
+            svc_dir.join(format!("{name}.service")),
+            format!(
+                "# Driver of virtio input device number {nth} of those the kernel\n\
+                 # left to userspace (udriver=virtio-input@N), served as\n\
+                 # /dev/input/eventK. See /usr/local/bin/eclipse-uinput.\n\
+                 exec = /usr/local/bin/eclipse-uinput {nth}\n\
+                 type = respawn\n\
+                 udriver = {which}\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        localbin.join("eclipse-uinput"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of a virtio input device the\n\
+          # kernel left alone (udriver=virtio-input@N), in the foreground for\n\
+          # eclipse-init, which starts it again if it dies. It serves the\n\
+          # device as /dev/input/eventK. See tools/eclipse-udrivers.\n\
+          # Which device: the Nth virtio-input@K of /proc/udrivers (N is the\n\
+          # argument, 1 without one).\n\
+          nth=${1:-1}\n\
+          n=$(sed -n 's/^virtio-input@//p' /proc/udrivers | sed -n \"${nth}p\")\n\
+          [ -n \"$n\" ] || { echo \"eclipse-uinput: the kernel left no virtio input device number $nth to userspace\" >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-virtio-input ] || { echo 'eclipse-uinput: /bin/udrv-virtio-input is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-virtio-input \"$n\"\n",
+    )
+    .unwrap();
+
     // What `/etc/fstab` puts on that disk. The kernel goes through fstab
     // once, as init starts, and a disk whose driver is a service is not
     // there yet: its lines fail there, and without this nothing mounts
@@ -522,6 +568,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(DRIVERS_PACKAGE, &DEV_TESTS, &[]);
         for name in DEV_TESTS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(DRIVERS_PACKAGE, &INPUT_DRIVERS, &[]);
+        for name in INPUT_DRIVERS {
             put(&built.join(name), name);
         }
         let built = self.rust_tools(NETSTACK_PACKAGE, &NETSTACK, &NETSTACK_USES);

@@ -52,6 +52,8 @@ pub const SLOTS: usize = 16;
 
 /// The `errno`s a device answers with.
 pub const EAGAIN: i32 = 11;
+pub const EFAULT: i32 = 14;
+pub const EBUSY: i32 = 16;
 pub const EINVAL: i32 = 22;
 pub const ENOTTY: i32 = 25;
 
@@ -91,6 +93,15 @@ pub trait Device {
     ) -> Result<(i64, usize), i32> {
         let _ = (node, fh, cmd, arg, data);
         Err(ENOTTY)
+    }
+    /// Whether `cmd`, which says it carries something in, takes `arg` by
+    /// value instead (evdev's `EVIOCGRAB` says `int` and means one). The
+    /// kernel sends such a command with nothing in the slot when `arg` is
+    /// not memory it can read; every other command is then answered
+    /// `EFAULT` without reaching [`Device::ioctl`].
+    fn by_value(&self, cmd: u32) -> bool {
+        let _ = cmd;
+        false
     }
 }
 
@@ -201,13 +212,17 @@ impl Node {
                 dev.write(self, req.fh, req.a, data).map(|n| n as i64)
             }
             OP_IOCTL => {
-                let (_, out) = ioctl_carries(req.a as u32);
+                let cmd = req.a as u32;
+                let (into, out) = ioctl_carries(cmd);
                 let data = &mut self.slot(req.reqid)[..len.max(out)];
-                dev.ioctl(self, req.fh, req.a as u32, req.b, data)
-                    .map(|(ret, n)| {
+                if len < into && !dev.by_value(cmd) {
+                    Err(EFAULT)
+                } else {
+                    dev.ioctl(self, req.fh, cmd, req.b, data).map(|(ret, n)| {
                         reply.len = n.min(out) as u32;
                         ret
                     })
+                }
             }
             _ => Err(EINVAL),
         };

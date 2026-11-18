@@ -10,6 +10,7 @@ use crate::PAGE;
 /// Device ids (virtio 1.1 §5).
 pub const ID_NET: u32 = 1;
 pub const ID_BLOCK: u32 = 2;
+pub const ID_INPUT: u32 = 18;
 
 // Device status bits (virtio 1.1 §2.1).
 const STATUS_ACKNOWLEDGE: u8 = 1;
@@ -298,6 +299,12 @@ impl Device {
         self.rd32(self.config_base() + off)
     }
 
+    /// Write byte `off` of the device's own configuration: the parts of it
+    /// a driver selects, as virtio-input's.
+    pub fn set_config8(&self, off: u32, v: u8) {
+        self.wr8(self.config_base() + off, v)
+    }
+
     fn config_base(&self) -> u32 {
         match self.transport {
             Transport::Mmio => MMIO_CONFIG,
@@ -528,5 +535,7 @@ mod tests {
         let dev = unsafe { Device::new(window.ptr(), pci) };
         assert_eq!(dev.config32(0), 0x5678);
         assert_eq!(dev.config8(1), 0x56);
+        dev.set_config8(2, 0x9a);
+        assert_eq!(window.bytes()[0x302], 0x9a);
     }
 }
