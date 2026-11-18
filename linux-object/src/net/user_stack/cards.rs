@@ -50,11 +50,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
-use kernel_hal::drivers::net::stack_card::{Carried, Change, Sixes, StackCard};
+use kernel_hal::drivers::net::stack_card::{Carried, Change, More, Sixes, StackCard};
 use kernel_hal::drivers::prelude::Device;
 use kernel_hal::drivers::scheme::{NetScheme, NetStats};
 use kernel_hal::sync::Mutex;
-use zcore_drivers::wire::{Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
+use zcore_drivers::wire::{IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 
 use super::{header, StackLink, COUNTS};
 
@@ -158,6 +158,7 @@ struct Kept {
     name: Option<String>,
     carried: Arc<Carried>,
     sixes: Arc<Sixes>,
+    more: Arc<More>,
 }
 
 /// The other cards of the stack that serves now, by the stack's numbers,
@@ -226,6 +227,7 @@ impl Others {
             name: None,
             carried: Arc::new(Carried::default()),
             sixes: Arc::new(Sixes::default()),
+            more: Arc::new(More::default()),
         }))
     }
 }
@@ -305,26 +307,43 @@ impl StackLink {
         let Some(mut said) = said else {
             return false;
         };
+        // A gateway is a machine of a network of the card's: of its
+        // first address or of another.
+        let others = self.more_of(card).addresses();
+        let near = |first: Option<Ipv4Cidr>, gateway: &Ipv4Address| {
+            let mut ours = first.iter().chain(&others);
+            ours.any(|a| a.contains_addr(gateway) && a.address() != *gateway)
+        };
         let message = match change {
             Change::Address(address) => {
                 said.address = address;
-                // A gateway is on the card's network, or is none.
-                said.gateway = said
-                    .gateway
-                    .filter(|gateway| address.is_some_and(|a| a.contains_addr(gateway)));
+                said.gateway = said.gateway.filter(|gateway| near(address, gateway));
                 address_message(card, address)
             }
             Change::Gateway(gateway) => {
-                let near = |gateway: &Ipv4Address| {
-                    said.address
-                        .is_some_and(|a| a.contains_addr(gateway) && a.address() != *gateway)
-                };
-                if gateway.as_ref().is_some_and(|gateway| !near(gateway)) {
+                if gateway
+                    .as_ref()
+                    .is_some_and(|gateway| !near(said.address, gateway))
+                {
                     return false;
                 }
                 said.gateway = gateway;
                 gateway_message(card, gateway)
             }
+            // The first address goes: what comes in its place, another
+            // of the card's or one a server gives, is the stack's to
+            // say.
+            Change::Also(IpCidr::Ipv4(cidr), false)
+                if said.address.is_some_and(|a| a.address() == cidr.address()) =>
+            {
+                said.address = None;
+                said.gateway = None;
+                super::more::also_message(card, IpCidr::Ipv4(cidr), false, self.next_wish())
+            }
+            wish => match self.wish(card, wish) {
+                Some(message) => message,
+                None => return false,
+            },
         };
         if self.tell(message, true).is_err() {
             return false;
@@ -335,14 +354,15 @@ impl StackLink {
 
     /// Put `card` among the machine's interfaces.
     fn show(&self, card: u64, said: &Said) -> Option<Arc<StackCard>> {
-        let (name, carried, sixes) = self.others.keep(card, |kept| {
+        let (name, carried, sixes, more) = self.others.keep(card, |kept| {
             // The name it had while the kernel drove it; one of its own
             // otherwise, and the same from then on.
             let name = name_for(said.mac)
                 .or_else(|| kept.name.clone().filter(|name| !named(name)))
                 .unwrap_or_else(kernel_hal::drivers::net::next_eth_ifname);
             kept.name = Some(name.clone());
-            (name, kept.carried.clone(), kept.sixes.clone())
+            let said = (kept.sixes.clone(), kept.more.clone());
+            (name, kept.carried.clone(), said.0, said.1)
         });
         let wire: Arc<dyn kernel_hal::drivers::net::stack_card::Wire> = super::machine();
         let shown = Arc::new(
@@ -356,6 +376,7 @@ impl StackLink {
             .numbered(card)
             .counting(carried)
             .with_sixes(sixes)
+            .with_more(more)
             .through(wire),
         );
         if !kernel_hal::drivers::hotplug::add(Device::Net(shown.clone())) {
@@ -397,6 +418,7 @@ impl StackLink {
         }
         for kept in self.others.kept.lock().values() {
             kept.sixes.forget();
+            kept.more.forget();
         }
     }
 
@@ -419,6 +441,28 @@ impl StackLink {
         at.map_or(0, |at| at as u32 + 1)
     }
 
+    /// Where what card `card`, not the first, has of other addresses
+    /// and routes is kept, and of IPv6.
+    pub(super) fn kept_more(&self, card: u64) -> Arc<More> {
+        self.others.keep(card, |kept| kept.more.clone())
+    }
+
+    pub(super) fn kept_sixes(&self, card: u64) -> Arc<Sixes> {
+        self.others.keep(card, |kept| kept.sixes.clone())
+    }
+
+    /// Whether what some card that is not the first has `is`.
+    pub(super) fn any_kept_more(&self, is: impl Fn(&More) -> bool) -> bool {
+        self.others.kept.lock().values().any(|kept| is(&kept.more))
+    }
+
+    /// The first thing `find` finds in what a card that is not the
+    /// first has.
+    pub(super) fn find_kept_more<T>(&self, find: impl Fn(&More) -> Option<T>) -> Option<T> {
+        let kept = self.others.kept.lock();
+        kept.values().find_map(|kept| find(&kept.more))
+    }
+
     /// Whether `addr` is the address of a card that is not the first.
     pub(super) fn is_another(&self, addr: Ipv4Address) -> bool {
         let now = self.others.now.lock();
@@ -433,7 +477,10 @@ impl StackLink {
         let others = now.iter().filter(|(card, _)| **card != 0);
         let mut near = others.filter_map(|(_, other)| other.said.address);
         near.find(|address| address.contains_addr(&to))
-            .map_or_else(|| self.address(), |address| address.address())
+            .map(|address| address.address())
+            // Then an address a card has after its first.
+            .or_else(|| self.also_toward(to))
+            .unwrap_or_else(|| self.address())
     }
 
     /// The other cards, as they were said: for tests and for whoever

@@ -14,8 +14,9 @@
 //!   brought it, and a connection is accepted on any.
 //! * to one stack, when it has somewhere to go (`SEND`, `CONNECT`,
 //!   `ICMP`, `PACKET` and the same of IPv6): the stack whose card is on
-//!   the network of the destination; failing that the stack of the card
-//!   the kernel shows, if it has a way there (its gateway), and failing
+//!   the network of the destination; failing that one with a route to
+//!   that network (`socks::more`), then the stack of the card the
+//!   kernel shows, if it has a way there (its gateway), and failing
 //!   that the first that has. One that no stack reaches goes to the shown
 //!   card's, which refuses it as it would alone. What is for everybody or
 //!   for a group leaves by every card that can send it, except a
@@ -50,7 +51,9 @@
 //! ```
 //!
 //! all zero for none ([`asked`]). The card has that address from then
-//! on and asks no server for one, and is said again as it is.
+//! on and asks no server for one, and is said again as it is. Its
+//! other addresses and its other routes are asked for with `ALSO` and
+//! `ROUTE`, and said with `MORE` (`socks::more`).
 //!
 //! What this does not do: the frames of every card are the first
 //! interface's to a packet socket, a frame such a socket sends leaves by
@@ -212,8 +215,11 @@ where
 {
     let all = || (1u32 << stacks.len()) - 1;
     let only = 1u32 << shown;
-    // One of them: on the network, then the shown one, then any.
-    let one = |near: &dyn Fn(&Stack<D>) -> bool, reaches: &dyn Fn(&Stack<D>) -> bool| {
+    // One of them: on the network, then one with a route to just
+    // there, then the shown one, then any.
+    let one = |near: &dyn Fn(&Stack<D>) -> bool,
+               way: &dyn Fn(&Stack<D>) -> bool,
+               reaches: &dyn Fn(&Stack<D>) -> bool| {
         let first = |is: &dyn Fn(&Stack<D>) -> bool| {
             stacks
                 .iter()
@@ -221,6 +227,7 @@ where
                 .map(|at| 1u32 << at)
         };
         first(near)
+            .or_else(|| first(way))
             .or_else(|| reaches(stacks[shown]).then_some(only))
             .or_else(|| first(reaches))
             .unwrap_or(only)
@@ -249,11 +256,19 @@ where
         Whom::To { addr, once } if !once && (addr.is_broadcast() || addr.is_multicast()) => {
             each(&|stack| stack.reaches(addr))
         }
-        Whom::To { addr, .. } => one(&|stack| stack.on_link(addr), &|stack| stack.reaches(addr)),
+        Whom::To { addr, .. } => one(
+            &|stack| stack.on_link(addr),
+            &|stack| stack.has_way(addr.into()),
+            &|stack| stack.reaches(addr),
+        ),
         Whom::To6 { addr, once } if !once && addr.is_multicast() => {
             each(&|stack| stack.reaches6(addr))
         }
-        Whom::To6 { addr, .. } => one(&|stack| stack.on_link6(addr), &|stack| stack.reaches6(addr)),
+        Whom::To6 { addr, .. } => one(
+            &|stack| stack.on_link6(addr),
+            &|stack| stack.has_way(addr.into()),
+            &|stack| stack.reaches6(addr),
+        ),
     }
 }
 
@@ -461,6 +476,26 @@ mod tests {
             request(&mut stacks, 1, &to([1, 1, 1, 1])),
             Err(Refused::Unreachable)
         );
+    }
+
+    #[test]
+    fn a_route_to_a_network_is_the_way_there_whichever_card_is_shown() {
+        use crate::socks::more::Wish;
+        let mut a = card([10, 0, 2, 15], Some([10, 0, 2, 2]));
+        let mut b = card([192, 168, 7, 15], None);
+        let to_net = IpCidr::new(IpAddress::v4(172, 16, 0, 0), 12);
+        b.grant(Wish::Route(
+            to_net,
+            Some(IpAddress::v4(192, 168, 7, 1)),
+            true,
+        ))
+        .unwrap();
+        let stacks = [&mut a, &mut b];
+        // The shown card has a gateway, and the other the route.
+        assert_eq!(places(&stacks, 0, &to([172, 16, 5, 5])), 0b10);
+        assert_eq!(places(&stacks, 0, &to([172, 32, 5, 5])), 0b01);
+        // A card's own network before anybody's route.
+        assert_eq!(places(&stacks, 0, &to([10, 0, 2, 9])), 0b01);
     }
 
     #[test]

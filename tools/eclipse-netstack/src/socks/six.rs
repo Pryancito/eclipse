@@ -73,6 +73,11 @@ const AT_LEAST: Duration = Duration::from_secs(2 * 60 * 60);
 const FOREVER: u32 = u32::MAX;
 /// The bits of a prefix an address is made from, and of its network.
 const PREFIX_BITS: u8 = 64;
+/// The addresses written by hand, at most.
+pub const WRITTEN: usize = 8;
+/// How long a router written by hand is one: until it is taken away,
+/// which is sooner than this.
+const WRITTEN_LASTS: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// The messages that arrive in one turn, for the stack to read and for
 /// the sockets that hear ICMPv6, and the ones the stack has to send:
@@ -208,9 +213,11 @@ pub struct Sixes {
 }
 
 impl Sixes {
-    /// The `SIX` that says them.
-    pub fn message(&self) -> Vec<u8> {
+    /// The `SIX` that says them, from after the kernel's wish number
+    /// `wished` ([`super::more`]).
+    pub fn message(&self, wished: u32) -> Vec<u8> {
         let mut m = vec![0u8; SIX_ADDRESSES_AT];
+        m[..4].copy_from_slice(&wished.to_le_bytes());
         m[4..8].copy_from_slice(&OP_SIX.to_le_bytes());
         if let Some(router) = self.router {
             m[HEADER_LEN..].copy_from_slice(router.as_bytes());
@@ -251,6 +258,13 @@ pub(super) struct Six {
     named: Vec<Given>,
     /// Whether those changed since [`Stack::names6_news`] last asked.
     names_news: bool,
+    /// The addresses somebody on the machine wrote (`ip -6 addr add`):
+    /// no router gave them and none takes them away.
+    written: Vec<Ipv6Cidr>,
+    /// Whether the router is one somebody on the machine wrote
+    /// (`ip -6 route add default`): what the link's routers say of
+    /// themselves does not change it.
+    router_written: bool,
 }
 
 impl Six {
@@ -310,6 +324,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         }
         addr.is_multicast()
             || self.six.router.is_some()
+            || self.has_way(IpAddress::Ipv6(addr))
             || self.iface.ip_addrs().iter().any(|cidr| match cidr {
                 IpCidr::Ipv6(cidr) => cidr.contains_addr(&addr),
                 _ => false,
@@ -375,6 +390,106 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             }
         });
         self.mld_addresses();
+    }
+
+    /// Whether the card has `address`, whatever its network.
+    fn has_six(&self, address: Ipv6Address) -> bool {
+        let address = IpAddress::Ipv6(address);
+        self.iface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == address)
+    }
+
+    /// Whether `router` is a machine to send through: on the link, or on
+    /// a network of one of the card's addresses, and not the card.
+    pub(super) fn near6(&self, router: Ipv6Address) -> bool {
+        router.is_unicast()
+            && !router.is_loopback()
+            && !self.has_six(router)
+            && self.iface.ip_addrs().iter().any(|cidr| match cidr {
+                IpCidr::Ipv6(cidr) => cidr.contains_addr(&router),
+                _ => false,
+            })
+    }
+
+    /// The card has `cidr` too, because somebody on the machine says so
+    /// (`ip -6 addr add`): until it is taken away, whatever the link's
+    /// routers say. One it had already is that network's from now on.
+    /// `false`, and nothing changed, on a stack that speaks no IPv6, for
+    /// an address no machine has, and past [`WRITTEN`] of them.
+    pub fn write_six(&mut self, cidr: Ipv6Cidr) -> bool {
+        let address = cidr.address();
+        let had = self.six.written.iter().any(|w| w.address() == address);
+        if self.six.ear.is_none()
+            || !address.is_unicast()
+            || address.is_loopback()
+            || !(1..=128).contains(&cidr.prefix_len())
+            || address == link_local(self.iface.ethernet_addr())
+            || (!had && self.six.written.len() >= WRITTEN)
+        {
+            return false;
+        }
+        self.six.written.retain(|w| w.address() != address);
+        self.six.given.retain(|given| given.address != address);
+        self.six.written.push(cidr);
+        let address = IpAddress::Ipv6(address);
+        self.iface.update_ip_addrs(|addrs| {
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.retain(|have| have.address() != address);
+                addrs.push(IpCidr::Ipv6(cidr));
+            }
+        });
+        self.mld_addresses();
+        self.six.news = true;
+        true
+    }
+
+    /// Take `address` away, whoever gave it: `false` when the card has
+    /// no such address, or it is its own on the link, which it speaks to
+    /// its neighbours from. One a router gave comes back when the router
+    /// says it again.
+    pub fn unwrite_six(&mut self, address: Ipv6Address) -> bool {
+        if !self.has_six(address) || address == link_local(self.iface.ethernet_addr()) {
+            return false;
+        }
+        self.six.written.retain(|w| w.address() != address);
+        self.six.given.retain(|given| given.address != address);
+        let address = IpAddress::Ipv6(address);
+        self.iface.update_ip_addrs(|addrs| {
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.retain(|have| have.address() != address);
+            }
+        });
+        self.mld_addresses();
+        self.prune_ways();
+        self.six.news = true;
+        true
+    }
+
+    /// Send what is for no network of the card's to `router` from now
+    /// on, because somebody on the machine says so (`ip -6 route add
+    /// default`), or to nobody: then a router of the link is asked for
+    /// again. `false`, and nothing changed, for a router that is not
+    /// near and when there was none to take away.
+    pub fn write_router(&mut self, router: Option<Ipv6Address>) -> bool {
+        match router {
+            Some(router) => {
+                if self.six.ear.is_none() || !self.near6(router) {
+                    return false;
+                }
+                let until = self.now + WRITTEN_LASTS;
+                self.set_router(Some((router, until)));
+                self.six.router_written = self.six.router.is_some();
+                self.six.router_written
+            }
+            None => {
+                let had = self.six.router.is_some();
+                self.six.router_written = false;
+                self.set_router(None);
+                had
+            }
+        }
     }
 
     /// Before a poll: ask for a router when it is time to.
@@ -493,6 +608,8 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         let ours = self.six.router.map(|(router, _)| router);
         let lasts = now + Duration::from_secs(u64::from(said.lifetime));
         match (ours, said.lifetime) {
+            // The one written by hand is nobody's to change.
+            _ if self.six.router_written => {}
             // It is no router any more.
             (Some(ours), 0) if ours == said.router => self.set_router(None),
             (_, 0) => {}
@@ -505,6 +622,10 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             let address = with_card(prefix, mac);
             let until = (valid != FOREVER).then(|| now + Duration::from_secs(u64::from(valid)));
             let room = self.six.given.len() < PREFIXES;
+            // One written by hand is not the router's to give or take.
+            if self.six.written.iter().any(|w| w.address() == address) {
+                continue;
+            }
             match self.six.given.iter_mut().find(|g| g.address == address) {
                 Some(given) => {
                     // Longer is taken as said; shorter, only down to
@@ -1062,7 +1183,7 @@ pub(in crate::socks) mod tests {
         assert!(!stack.six_news());
 
         // What the kernel is told.
-        let m = sixes.message();
+        let m = sixes.message(0);
         assert_eq!(m.len(), SIX_ADDRESSES_AT + 2 * SIX_ADDRESS_LEN);
         assert_eq!(m[..4], [0; 4]);
         assert_eq!(m[4..8], OP_SIX.to_le_bytes());
@@ -1077,7 +1198,7 @@ pub(in crate::socks) mod tests {
             router: None,
             ..sixes
         };
-        assert_eq!(alone.message()[16..32], [0; 16]);
+        assert_eq!(alone.message(0)[16..32], [0; 16]);
 
         // There is a router: it is not asked for again. The same word
         // again is not news.

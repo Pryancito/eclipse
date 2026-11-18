@@ -900,7 +900,7 @@ impl Socket for ServedTcpSocket {
         // `tcp_v6_connect`: nobody to connect to at a group's address, and
         // nowhere to send it where the card has no way to.
         if let IpAddress::Ipv6(addr) = peer.addr {
-            if !here && (addr.is_multicast() || !self.link.sixes().reaches(&addr)) {
+            if !here && (addr.is_multicast() || !self.link.reaches6(&addr)) {
                 return Err(LxError::ENETUNREACH);
             }
         }

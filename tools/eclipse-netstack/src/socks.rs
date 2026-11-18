@@ -101,6 +101,7 @@ pub mod icmp6;
 pub mod isn;
 pub mod lease;
 pub mod mld;
+pub mod more;
 pub mod raw;
 pub mod raw6;
 pub mod six;
@@ -308,6 +309,8 @@ pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     gateway: Option<Ipv4Address>,
     lease: lease::Leasing,
     six: six::Six,
+    /// The other addresses and the routes.
+    more: more::More,
     /// The sockets that hear ICMPv6.
     hearing6: icmp6::Hearing6,
     /// The raw sockets of other protocols.
@@ -340,6 +343,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             gateway: None,
             lease: lease::Leasing::default(),
             six: six::Six::default(),
+            more: more::More::default(),
             hearing6: icmp6::Hearing6::default(),
             raws: raw::Raws::default(),
             raws6: raw6::Raws6::default(),
@@ -532,7 +536,9 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 #[allow(unreachable_patterns)]
                 _ => false,
             })
-            || (self.gateway.is_some() && addr.is_unicast() && !addr.is_loopback())
+            || (addr.is_unicast()
+                && !addr.is_loopback()
+                && (self.gateway.is_some() || self.has_way(IpAddress::Ipv4(addr))))
     }
 
     /// Whether `addr` is on the card's own network: reached with no

@@ -100,6 +100,7 @@ use netstack::governed;
 use netstack::port::Port;
 use netstack::resolv::{self, Applied, Named};
 use netstack::socks::lease::{Addressing, Lease};
+use netstack::socks::more;
 use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
 use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_FRAMES, OP_SEND};
@@ -543,6 +544,8 @@ struct Shared {
     /// Whether the card's IPv6 addresses changed and the kernel has not
     /// been told: it is, with the first turn it has sockets here.
     six_owed: bool,
+    /// The same of its other addresses and its routes.
+    more_owed: bool,
 }
 
 /// What every thread has: the stack, and the kernel once it has sockets
@@ -670,7 +673,13 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
     if core::mem::take(&mut shared.six_owed) {
         // A message of its own, as rare as an address changes. A kernel
         // that is gone took the machine with it.
-        let mut said = shared.stack.sixes().message();
+        let mut said = shared.stack.sixes().message(shared.stack.wished());
+        cards::of_card(&mut said, host.card());
+        let _ = kernel.channel.write(&said, &[]);
+    }
+    shared.more_owed |= shared.stack.more_news();
+    if core::mem::take(&mut shared.more_owed) {
+        let mut said = shared.stack.more_message();
         cards::of_card(&mut said, host.card());
         let _ = kernel.channel.write(&said, &[]);
     }
@@ -1013,9 +1022,14 @@ fn serve_sockets(kernel: Arc<Kernel>) {
         let (mut sends, mut answers) = (0u32, 0u32);
         for done in 1.. {
             let said = &message[..len];
-            let asked = match (cards::asked(said), hosts) {
-                // For a card's address, not for a socket.
-                (Some(ask), _) => ask.and_then(configure).map(|()| 0),
+            let wished = more::wished(said).map(|wish| wish.and_then(grant));
+            let asked = match (
+                wished.or_else(|| cards::asked(said).map(|ask| ask.and_then(configure))),
+                hosts,
+            ) {
+                // For a card's addresses and routes, not for a socket:
+                // the card's turn says what came of it.
+                (Some(done), _) => done,
                 (None, [host]) => locked(&host.shared).stack.request(said).map(u32::from),
                 // Each card's stack, all held while the message finds
                 // the ones it is for.
@@ -1165,7 +1179,7 @@ fn serve_kernel() {
 
 /// Do what the kernel asks of a card (`ADDRESS`, `GATEWAY`), and say the
 /// card back as that left it.
-fn configure((card, ask): (u64, cards::Ask)) -> Result<(), netstack::socks::Refused> {
+fn configure((card, ask): (u64, cards::Ask)) -> Result<u32, netstack::socks::Refused> {
     use netstack::socks::Refused;
     let host = hosts()
         .iter()
@@ -1214,7 +1228,58 @@ fn configure((card, ask): (u64, cards::Ask)) -> Result<(), netstack::socks::Refu
     }
     host.say_card();
     publish(host);
-    Ok(())
+    Ok(1 << host.slot)
+}
+
+/// Do what the kernel wishes of a card (`ALSO`, `ROUTE`): one address
+/// more or less, one route more or less. The card is said back as that
+/// left it, done or not, so that the kernel shows what there is.
+fn grant((card, wish, which): (u64, more::Wish, u32)) -> Result<u32, netstack::socks::Refused> {
+    use netstack::socks::Refused;
+    let host = hosts()
+        .iter()
+        .find(|host| host.card() == card)
+        .ok_or(Refused::NoSocket)?;
+    let index = host.index;
+    let (done, first) = {
+        let mut shared = locked(&host.shared);
+        let (was, leased) = (shared.stack.address(), shared.stack.leases());
+        let done = shared.stack.grant(wish);
+        // What is said of the card from now on is from after this wish.
+        shared.stack.wish_done(which);
+        // Refused or not, the kernel is told how the card is: it shows
+        // what it asked for until it hears.
+        shared.six_owed = true;
+        shared.more_owed = true;
+        // The first address changed hands when it is another and no
+        // server is asked for one, or when one no longer is.
+        let now = shared.stack.address();
+        let by_hand = !shared.stack.leases() && (was != now || leased);
+        (done, by_hand.then_some(now))
+    };
+    if let Some(now) = first {
+        host.by_hand.store(true, Ordering::Relaxed);
+        match now {
+            Some(now) => println!("{NAME}: card {index} is {now}, as it was asked to be"),
+            None => println!("{NAME}: card {index} has no address, as it was asked"),
+        }
+        // What a lease named goes with the lease.
+        name_servers(host, |named| named.lease.clear());
+    }
+    if done.is_ok() {
+        let (what, have) = match wish {
+            more::Wish::Also(address, have) => (format!("address {address}"), have),
+            more::Wish::Route(to, Some(router), have) => {
+                (format!("a route to {to} through {router}"), have)
+            }
+            more::Wish::Route(to, None, have) => (format!("a route to {to}"), have),
+        };
+        let has = if have { "has" } else { "no longer has" };
+        println!("{NAME}: card {index} {has} {what}, as it was asked");
+    }
+    host.say_card();
+    publish(host);
+    done.map(|()| 1 << host.slot)
 }
 
 /// `, with sockets` once the kernel has them here.
@@ -1568,6 +1633,7 @@ fn raise(
             wire: link.wire.clone(),
             answering: false,
             six_owed: false,
+            more_owed: false,
         }),
         kernel: OnceLock::new(),
         by_hand: AtomicBool::new(false),
@@ -1591,7 +1657,7 @@ fn raise(
 /// started, which eclipse-init never sees. lunarmon's SERVIDORES list
 /// reads it.
 fn publish(host: &Host) {
-    let (address, gateway, dns, leases, sixes) = {
+    let (address, gateway, dns, leases, sixes, others, ways) = {
         let shared = locked(&host.shared);
         let stack = &shared.stack;
         let dns = stack.lease().map(|lease| lease.dns.clone());
@@ -1601,8 +1667,12 @@ fn publish(host: &Host) {
             dns.unwrap_or_default(),
             stack.leases(),
             stack.sixes(),
+            stack.others(),
+            stack.ways().to_vec(),
         )
     };
+    let others: Vec<String> = others.iter().map(|a| a.to_string()).collect();
+    let ways: Vec<String> = ways.iter().map(|(to, by)| format!("{to}>{by}")).collect();
     let addr6: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
     let device = if host.kernels {
         format!("kernel-net@{}", host.index)
@@ -1639,6 +1709,13 @@ fn publish(host: &Host) {
         ),
         ("gateway6", or_none(sixes.router.map(|r| r.to_string()))),
     ];
+    // Only a card that has them says its other addresses and routes.
+    if !others.is_empty() {
+        fields.push(("addr_more", others.join(",")));
+    }
+    if !ways.is_empty() {
+        fields.push(("routes", ways.join(",")));
+    }
     // A driver that is this process, or the kernel, is no other process
     // to show.
     if host.kernels {

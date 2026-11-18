@@ -666,7 +666,7 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let address = (args[2] as u32).to_be_bytes();
     let serving = linux_object::net::user_stack::serve(channel, args[1], address)?;
     let link = serving.link();
-    let card = show_stack_card(address, args, link.carried(), link.sixes());
+    let card = show_stack_card(address, args, link.carried(), link.sixes(), link.more());
     // What the stack says of its first card from here on is that one's.
     let mac = (args[5] as u64).to_be_bytes();
     let said = linux_object::net::user_stack::cards::Said::first(
@@ -714,13 +714,15 @@ static STACK_CARD_NAME: lock::Mutex<Option<alloc::string::String>> = lock::Mutex
 /// (`COUNTS`), and what the interface answers with: the same place for
 /// every stack, so the counts of `eth0` do not start over when its stack
 /// does. `sixes` is where what it says of its IPv6 addresses is kept
-/// (`SIX`), which the interface shows after the address above.
+/// (`SIX`), which the interface shows after the address above, and
+/// `more` where its other addresses and its routes are (`MORE`).
 #[cfg(feature = "zircon-gateway")]
 fn show_stack_card(
     address: [u8; 4],
     args: &[usize; 6],
     carried: Arc<kernel_hal::drivers::net::stack_card::Carried>,
     sixes: Arc<kernel_hal::drivers::net::stack_card::Sixes>,
+    more: Arc<kernel_hal::drivers::net::stack_card::More>,
 ) -> Option<Arc<kernel_hal::drivers::net::stack_card::StackCard>> {
     use kernel_hal::drivers::net::stack_card::StackCard;
     let mut name = STACK_CARD_NAME.lock();
@@ -742,7 +744,12 @@ fn show_stack_card(
     // the wire instead of being refused.
     let wire: Arc<dyn kernel_hal::drivers::net::stack_card::Wire> =
         linux_object::net::user_stack::machine();
-    let card = Arc::new(said.counting(carried).with_sixes(sixes).through(wire));
+    let card = Arc::new(
+        said.counting(carried)
+            .with_sixes(sixes)
+            .with_more(more)
+            .through(wire),
+    );
     if !kernel_hal::drivers::hotplug::add(kernel_hal::drivers::prelude::Device::Net(card.clone())) {
         return None;
     }

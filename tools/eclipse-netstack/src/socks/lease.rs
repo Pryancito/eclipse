@@ -79,14 +79,14 @@ pub(super) struct Leasing {
 const NO_ADDRESS: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0);
 
 impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
-    /// The card's address and network, when it has one.
+    /// The card's address and network, when it has one: the first, which
+    /// is the one a lease gives. The others are in [`super::more`].
     pub fn address(&self) -> Option<Ipv4Cidr> {
-        self.iface.ip_addrs().iter().find_map(|cidr| match cidr {
-            IpCidr::Ipv4(cidr) if !cidr.address().is_unspecified() => Some(*cidr),
+        match self.iface.ip_addrs().first() {
+            Some(IpCidr::Ipv4(cidr)) if !cidr.address().is_unspecified() => Some(*cidr),
             _ => None,
-        })
+        }
     }
-
     /// Where what is not for the card's network goes.
     pub fn gateway(&self) -> Option<Ipv4Address> {
         self.gateway
@@ -138,7 +138,8 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// The card's address is `address` from now on, or it has none,
     /// because somebody on this machine says so (`ip addr`, `ifconfig`):
     /// no server is asked for one any more, and what a lease gave is
-    /// gone with it. The gateway stays while it is on the new network.
+    /// gone with it. The gateway and the routes stay while their way out
+    /// is on a network of the card's.
     pub fn write_address(&mut self, address: Option<Ipv4Cidr>) {
         if let Some(client) = self.lease.client.take() {
             self.set.remove(client);
@@ -149,8 +150,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         // goes, joined from the one that comes.
         self.say_groups(false);
         self.put_address(address.unwrap_or(NO_ADDRESS));
-        let gateway = self.gateway;
-        self.set_gateway(gateway.filter(|g| address.is_some_and(|a| a.contains_addr(g))));
+        self.prune_ways();
         self.say_groups(true);
     }
 
@@ -164,16 +164,12 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
 
     /// [`set_gateway`](Self::set_gateway) for one somebody on this
     /// machine names: `false`, and nothing changed, when it is not a
-    /// machine of the card's network.
+    /// machine of a network of the card's.
     pub fn write_gateway(&mut self, gateway: Option<Ipv4Address>) -> bool {
-        let near = |gateway: Ipv4Address| {
-            self.address()
-                .is_some_and(|a| a.contains_addr(&gateway) && a.address() != gateway)
-        };
-        gateway.is_none_or(near) && self.set_gateway(gateway)
+        gateway.is_none_or(|gateway| self.near(gateway)) && self.set_gateway(gateway)
     }
 
-    fn put_address(&mut self, address: Ipv4Cidr) {
+    pub(super) fn put_address(&mut self, address: Ipv4Cidr) {
         self.iface.update_ip_addrs(|addrs| {
             if let Some(first) = addrs.iter_mut().next() {
                 *first = IpCidr::Ipv4(address);
@@ -205,6 +201,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         self.say_groups(false);
         self.put_address(held.as_ref().map_or(NO_ADDRESS, |lease| lease.address));
         self.set_gateway(held.as_ref().and_then(|lease| lease.gateway));
+        self.prune_ways();
         self.say_groups(true);
         self.lease.held = held;
         self.lease.news = true;

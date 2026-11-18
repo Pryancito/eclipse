@@ -323,7 +323,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use kernel_hal::drivers::net::stack_card::{Carried, Sixes};
+use kernel_hal::drivers::net::stack_card::{Carried, More, Sixes};
 use kernel_hal::sync::Mutex;
 use log::warn;
 use zcore_drivers::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address, Ipv6Cidr};
@@ -338,6 +338,7 @@ mod groups;
 mod groups6;
 mod icmp;
 mod icmp6;
+pub mod more;
 mod raw;
 mod raw6;
 mod tcp;
@@ -1530,6 +1531,12 @@ pub struct StackLink {
     /// The IPv6 addresses of the card of the stack that serves now: see
     /// [`sixes`](Self::sixes).
     sixes: Arc<Sixes>,
+    /// The other addresses and the routes of that card: see
+    /// [`more`](Self::more).
+    more: Arc<More>,
+    /// How many addresses and routes have been wished of the stack that
+    /// serves now: see [`more`].
+    wishes: AtomicU32,
     /// Whether no stack is expected, ever: see
     /// [`alone`](Self::alone).
     alone: AtomicBool,
@@ -1688,6 +1695,8 @@ impl StackLink {
             carried: Arc::new(Carried::default()),
             counted: Mutex::new([0; COUNTS]),
             sixes: Arc::new(Sixes::default()),
+            more: Arc::new(More::default()),
+            wishes: AtomicU32::new(0),
             alone: AtomicBool::new(false),
             others: cards::Others::default(),
         })
@@ -1933,11 +1942,21 @@ impl StackLink {
                 ),
             },
             Some((OP_FRAMES, card)) => self.take_frames(card, &m[HEADER_LEN..]),
+            // Said before the stack had done the last wish: what
+            // answers that one follows.
+            Some((OP_SIX | more::OP_MORE, _)) if self.stale(m) => {}
             Some((OP_SIX, card)) => match parse_six(&m[HEADER_LEN..]) {
                 Some((router, addresses)) if card != 0 => self.take_six_of(card, router, addresses),
                 Some((router, addresses)) => self.sixes.say(addresses, router),
                 None => warn!(
                     "user stack: {} bytes that are no addresses of a card",
+                    m.len() - HEADER_LEN
+                ),
+            },
+            Some((more::OP_MORE, card)) => match more::parse_more(&m[HEADER_LEN..]) {
+                Some(said) => self.take_more(card, said),
+                None => warn!(
+                    "user stack: {} bytes that are no addresses and routes of a card",
                     m.len() - HEADER_LEN
                 ),
             },
@@ -2121,6 +2140,9 @@ impl StackLink {
             *self.counted.lock() = [0; COUNTS];
             // And says its own addresses.
             self.sixes.forget();
+            self.more.forget();
+            // The next one has done none of the wishes.
+            self.wishes.store(0, Ordering::Release);
         }
         self.forget_cards();
         warn!("user stack: the process is gone");
@@ -2252,6 +2274,7 @@ impl StackLink {
         addr.is_loopback()
             || (!self.address().is_unspecified() && addr == self.address())
             || self.is_another(addr)
+            || self.is_also(addr)
     }
 
     /// The address this machine speaks from to who it reaches at `to`,
@@ -2396,7 +2419,7 @@ impl ServedUdpSocket {
         if self.link.is_down() {
             return Err(self.link.down());
         }
-        if !sixes.reaches(&addr) {
+        if !self.link.reaches6(&addr) {
             return Err(LxError::ENETUNREACH);
         }
         if data.len() + IPV6_MORE > self.link.max_datagram.load(Ordering::Acquire) {
@@ -2624,7 +2647,7 @@ impl Socket for ServedUdpSocket {
             // `ip6_datagram_connect`: no way there is said now.
             IpAddress::Ipv6(addr) => {
                 let sixes = &self.link.sixes;
-                if !sixes.has(&addr) && !sixes.reaches(&addr) {
+                if !sixes.has(&addr) && !self.link.reaches6(&addr) {
                     return Err(LxError::ENETUNREACH);
                 }
             }

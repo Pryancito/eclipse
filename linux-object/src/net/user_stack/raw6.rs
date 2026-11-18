@@ -213,7 +213,7 @@ impl ServedRawSocket {
         if self.link.is_down() {
             return Err(self.link.down());
         }
-        if !self.link.sixes.reaches(&to) {
+        if !self.link.reaches6(&to) {
             return Err(LxError::ENETUNREACH);
         }
         // What one frame carries behind an IPv6 header: the stack does
