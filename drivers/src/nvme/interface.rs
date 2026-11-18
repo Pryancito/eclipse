@@ -1379,6 +1379,36 @@ impl PciDriver for NvmeDriverPci {
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
+            // `udriver=nvme@N`: the controller is a userspace driver's
+            // (`tools/eclipse-udrivers`), and the kernel does not so much as
+            // reset it until that driver dies. Counted either way, so `@N`
+            // names the same controller whatever the command line says.
+            if crate::user::reserve_if(
+                crate::user::NVME,
+                true,
+                crate::user::Transport::Pci,
+                addr as usize,
+                len as usize,
+                || crate::user::Wiring {
+                    // The MSI that `bus::pci` armed; x86 MSI numbers sit 32
+                    // below their vectors, which is what the APIC takes.
+                    irq: irq.map(|irq| {
+                        if cfg!(target_arch = "x86_64") {
+                            irq + 32
+                        } else {
+                            irq
+                        }
+                    }),
+                    // The kernel's own view of the registers, for the one
+                    // thing it does to the controller: reset it when its
+                    // driver dies.
+                    vaddr: mapper
+                        .as_ref()
+                        .and_then(|m| m.query_or_map(addr as usize, len as usize)),
+                },
+            ) {
+                return Err(crate::DeviceError::NotSupported);
+            }
             // The whole BAR, through the base the mapper returns, and its
             // length goes to the controller bring-up: see
             // `bus::resolve_window` and `controller_window`.

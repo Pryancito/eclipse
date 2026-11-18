@@ -22,6 +22,7 @@ pub mod fifo;
 pub mod hybrid;
 pub mod lent;
 pub mod net;
+pub mod nvme;
 pub mod queue;
 pub mod status;
 pub mod virtio;

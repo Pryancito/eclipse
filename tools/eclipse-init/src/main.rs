@@ -1633,7 +1633,9 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///   udriver = virtio-net@0            (optional; only start when the kernel
 ///                                      command line's `udriver=` names
 ///                                      this device, or one of this kind
-///                                      when there is no number)
+///                                      when there is no number; the Nth
+///                                      of the kind with `kind/N`; any
+///                                      of several with `a|b`)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
@@ -2743,11 +2745,17 @@ fn cmdline_udriver_device<'a>(cmdline: &'a str, device: &str) -> Option<&'a str>
 }
 
 /// The one of `devices` (`virtio-blk@1`, `virtio-net@0`) that `device`
-/// names: itself, or for a bare kind the first of that kind.
+/// names: itself, or for a bare kind the first of that kind. A kind with
+/// an ordinal (`virtio-blk/2`) is the second of that kind, and so on: a
+/// machine with several disks has a driver service for each, and which
+/// disks they are depends on the machine.
 fn device_among<'a>(mut devices: impl Iterator<Item = &'a str>, device: &str) -> Option<&'a str> {
-    devices.find(|d| {
-        *d == device || (!device.contains('@') && d.split_once('@').map(|(kind, _)| kind) == Some(device))
-    })
+    let of_kind = |d: &str, kind: &str| d.split_once('@').map(|(k, _)| k) == Some(kind);
+    if let Some((kind, nth)) = device.split_once('/') {
+        let nth: usize = nth.parse().ok().filter(|n| *n > 0)?;
+        return devices.filter(|d| of_kind(d, kind)).nth(nth - 1);
+    }
+    devices.find(|d| *d == device || (!device.contains('@') && of_kind(d, device)))
 }
 
 /// The device the kernel left to userspace that `device` names, which is
@@ -2756,11 +2764,14 @@ fn device_among<'a>(mut devices: impl Iterator<Item = &'a str>, device: &str) ->
 /// stood back from and that are there, named on the command line or not (the
 /// first virtio network card is left without a word, the kernel having no
 /// driver for it). A kernel with no such file says it with `udriver=` alone.
+///
+/// Several alternatives separated by `|` (`virtio-blk|nvme`): the first
+/// that the list has.
 fn udriver_device<'a>(left: Option<&'a str>, cmdline: &'a str, device: &str) -> Option<&'a str> {
-    match left {
+    device.split('|').find_map(|device| match left {
         Some(left) => device_among(left.lines().map(str::trim), device),
         None => cmdline_udriver_device(cmdline, device),
-    }
+    })
 }
 
 /// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the
