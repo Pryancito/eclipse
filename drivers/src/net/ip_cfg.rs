@@ -16,7 +16,7 @@
 
 use alloc::vec::Vec;
 
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use crate::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use crate::scheme::RouteInfo;
 use crate::DeviceResult;
@@ -193,8 +193,8 @@ mod tests {
     //! code got wrong at least once.
 
     use super::*;
+    use crate::wire::{Ipv6Address, Ipv6Cidr};
     use alloc::vec;
-    use smoltcp::wire::{Ipv6Address, Ipv6Cidr};
 
     fn v4(a: u8, b: u8, c: u8, d: u8, prefix: u8) -> IpCidr {
         IpCidr::new(IpAddress::v4(a, b, c, d), prefix)

@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::wire::*;
+use crate::wire::*;
 
 use super::dt;
 use super::rings::RX_BUF_LENGTH;

@@ -7,6 +7,7 @@
 use super::*;
 use crate::net::ip_cfg;
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
+use crate::wire::*;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -16,7 +17,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use lock::Mutex;
-use smoltcp::wire::*;
 
 /// The largest frame this interface puts on the wire. The standard one: the
 /// bring-up configures an MTU of 1500 and nothing here asks for jumbo.

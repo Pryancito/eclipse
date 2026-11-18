@@ -44,7 +44,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use smoltcp::wire::IpAddress;
+use zcore_drivers::wire::IpAddress;
 
 use crate::error::LxError;
 

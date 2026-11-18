@@ -4,7 +4,7 @@
 
 use alloc::collections::BTreeMap;
 use lock::Mutex;
-use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetAddress, Ipv4Address, Ipv4Packet};
+use zcore_drivers::wire::{EthernetAddress, Ipv4Address};
 
 use lazy_static::lazy_static;
 
@@ -74,10 +74,44 @@ fn insert_bounded(
     map.insert(ip, (mac, now_ms(), next_seq()));
 }
 
+/// The source address of an IPv4 packet whose header is whole: version
+/// 4, a header of twenty bytes or more that fits in the total length, and
+/// a total length that fits in what arrived.
+fn ipv4_source(packet: &[u8]) -> Option<Ipv4Address> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if header < 20 || header > total || total > packet.len() {
+        return None;
+    }
+    Some(Ipv4Address::from_bytes(&packet[12..16]))
+}
+
+/// Who sent an ARP request or reply for IPv4 over Ethernet: the hardware
+/// address and the protocol address it says are its own.
+fn arp_sender(packet: &[u8]) -> Option<(EthernetAddress, Ipv4Address)> {
+    if packet.len() < 28 {
+        return None;
+    }
+    let word = |at: usize| u16::from_be_bytes([packet[at], packet[at + 1]]);
+    // Ethernet, IPv4, six and four bytes of address, a request or a reply.
+    if word(0) != 1 || word(2) != 0x0800 || packet[4] != 6 || packet[5] != 4 {
+        return None;
+    }
+    if !matches!(word(6), 1 | 2) {
+        return None;
+    }
+    Some((
+        EthernetAddress::from_bytes(&packet[8..14]),
+        Ipv4Address::from_bytes(&packet[14..18]),
+    ))
+}
+
 /// Learn mappings from a complete Ethernet frame (called from `push_packet`).
 pub fn learn_from_frame(frame: &[u8]) {
-    // Same L2 parse as the other three parsers `push_packet` feeds
-    // (`ndp_cache`, `ra`): 14 bytes, or 18 with an 802.1Q tag.
+    // 14 bytes of Ethernet header, or 18 with an 802.1Q tag.
     let Some((l2, ethertype)) = crate::net::packet::eth_l2_header_len(frame) else {
         return;
     };
@@ -86,43 +120,27 @@ pub fn learn_from_frame(frame: &[u8]) {
     // source, and a frame we sent that the link reflects back would teach a
     // peer's IP our own MAC. Neither is a mapping worth a cache slot, whether
     // it arrives as IPv4 or as ARP, so the filter sits here and not in one
-    // branch (`ndp_cache` does the same).
+    // branch.
     if !src_mac.is_unicast() || is_local_mac(src_mac) {
         return;
     }
     match ethertype {
         0x0800 => {
-            let Ok(pkt) = Ipv4Packet::new_checked(&frame[l2..]) else {
+            let Some(src) = ipv4_source(&frame[l2..]) else {
                 return;
             };
-            let src = pkt.src_addr();
             if src.is_unicast() && !src.is_unspecified() {
                 insert_bounded(&mut CACHE.lock(), src, src_mac);
             }
         }
         0x0806 => {
-            let Ok(arp) = ArpPacket::new_checked(&frame[l2..]) else {
-                return;
-            };
-            if let Ok(ArpRepr::EthernetIpv4 {
-                operation,
-                source_protocol_addr,
-                source_hardware_addr,
-                ..
-            }) = ArpRepr::parse(&arp)
-            {
-                // `is_unicast` is what keeps an RFC 5227 ARP probe out: every
-                // DHCP client on the link sends one, with a sender protocol
-                // address of 0.0.0.0, and smoltcp counts the unspecified
-                // address as neither unicast nor broadcast nor multicast.
-                if matches!(operation, ArpOperation::Request | ArpOperation::Reply)
-                    && source_protocol_addr.is_unicast()
-                {
-                    insert_bounded(
-                        &mut CACHE.lock(),
-                        source_protocol_addr,
-                        source_hardware_addr,
-                    );
+            // `is_unicast` is what keeps an RFC 5227 ARP probe out: every
+            // DHCP client on the link sends one, with a sender protocol
+            // address of 0.0.0.0, which is neither unicast nor broadcast
+            // nor multicast.
+            if let Some((hardware, protocol)) = arp_sender(&frame[l2..]) {
+                if protocol.is_unicast() {
+                    insert_bounded(&mut CACHE.lock(), protocol, hardware);
                 }
             }
         }

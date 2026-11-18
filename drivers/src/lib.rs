@@ -108,6 +108,7 @@ pub(crate) mod test_globals {
 pub mod uart;
 pub mod user;
 pub mod utils;
+pub mod wire;
 
 #[cfg(all(
     any(feature = "xhci-usb-hid", feature = "legacy-usb-hid"),
@@ -372,8 +373,8 @@ mod tests {
         fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
             Ok(0)
         }
-        fn get_mac(&self) -> smoltcp::wire::EthernetAddress {
-            smoltcp::wire::EthernetAddress([0; 6])
+        fn get_mac(&self) -> crate::wire::EthernetAddress {
+            crate::wire::EthernetAddress([0; 6])
         }
         fn ifname(&self) -> &str {
             "stub0"
@@ -384,7 +385,7 @@ mod tests {
         fn get_ifname(&self) -> String {
             String::from("stub0")
         }
-        fn get_ip_address(&self) -> Vec<smoltcp::wire::IpCidr> {
+        fn get_ip_address(&self) -> Vec<crate::wire::IpCidr> {
             Vec::new()
         }
         fn poll(&self) -> DeviceResult {

@@ -1,9 +1,9 @@
 use super::Scheme;
+use crate::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
 use crate::{DeviceError, DeviceResult};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr};
 
 #[derive(Debug, Clone, Default)]
 pub struct NetStats {
@@ -21,7 +21,7 @@ pub struct NetStats {
 #[derive(Debug, Clone)]
 pub struct RouteInfo {
     pub dst: IpCidr,
-    pub gateway: Option<smoltcp::wire::IpAddress>,
+    pub gateway: Option<crate::wire::IpAddress>,
 }
 
 pub trait NetScheme: Scheme {
@@ -77,10 +77,10 @@ pub trait NetScheme: Scheme {
     fn remove_ip_address(&self, _cidr: IpCidr) -> DeviceResult {
         Err(DeviceError::NotSupported)
     }
-    fn add_route(&self, _cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+    fn add_route(&self, _cidr: IpCidr, _gateway: Option<crate::wire::IpAddress>) -> DeviceResult {
         Err(DeviceError::NotSupported)
     }
-    fn del_route(&self, _cidr: IpCidr, _gateway: Option<smoltcp::wire::IpAddress>) -> DeviceResult {
+    fn del_route(&self, _cidr: IpCidr, _gateway: Option<crate::wire::IpAddress>) -> DeviceResult {
         Err(DeviceError::NotSupported)
     }
     fn get_routes(&self) -> Vec<RouteInfo> {
@@ -125,7 +125,7 @@ pub trait NetScheme: Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::wire::{IpAddress, Ipv4Address};
+    use crate::wire::{IpAddress, Ipv4Address};
 
     /// A NIC that implements only what `NetScheme` requires, so every other
     /// answer a test reads is the trait's own default.

@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use smoltcp::wire::IpAddress;
+use zcore_drivers::wire::IpAddress;
 
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -664,7 +664,7 @@ mod tests {
     };
     use crate::error::LxError;
     use alloc::string::String;
-    use smoltcp::wire::{IpAddress, Ipv4Address};
+    use zcore_drivers::wire::{IpAddress, Ipv4Address};
 
     #[test]
     fn a_path_spelled_with_extra_slashes_is_one_path() {

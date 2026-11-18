@@ -9,8 +9,8 @@ use crate::fs::{FileLike, PollEvents};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 pub use socket_address::*;
+use zcore_drivers::wire::{EthernetAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 
 pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -96,14 +96,13 @@ pub fn init() {
 
 pub fn refresh_arp_local_macs() {
     let macs: alloc::vec::Vec<_> = get_net_device().iter().map(|d| d.get_mac()).collect();
-    arp_cache::refresh_local_macs(macs.clone());
-    ndp_cache::refresh_local_macs(macs);
+    arp_cache::refresh_local_macs(macs);
 }
 
 /// Derive the RFC 4862 link-local address (fe80::/64, EUI-64 IID) from a MAC.
-pub fn ipv6_link_local_from_mac(mac: &EthernetAddress) -> smoltcp::wire::Ipv6Address {
+pub fn ipv6_link_local_from_mac(mac: &EthernetAddress) -> zcore_drivers::wire::Ipv6Address {
     let b = mac.as_bytes();
-    smoltcp::wire::Ipv6Address::new(
+    zcore_drivers::wire::Ipv6Address::new(
         0xfe80,
         0,
         0,
@@ -170,9 +169,9 @@ pub fn link_scope_index() -> u32 {
 
 /// Pick the Ethernet netdev for an IPv4 destination (never loopback).
 pub fn netdev_for_ipv4(
-    dst: smoltcp::wire::Ipv4Address,
+    dst: zcore_drivers::wire::Ipv4Address,
 ) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
-    use smoltcp::wire::IpCidr;
+    use zcore_drivers::wire::IpCidr;
     let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
     for iface in get_net_device().iter() {
         if iface.is_loopback() {
@@ -293,12 +292,6 @@ pub use unix::*;
 /// IPv4 → MAC cache (fed from RX frames).
 pub mod arp_cache;
 pub use arp_cache::*;
-
-/// IPv6 → MAC cache (fed from RX frames).
-pub mod ndp_cache;
-
-/// IPv6 Router Advertisement handling (default route + SLAAC), fed from RX.
-pub mod ra;
 
 pub mod dns;
 
@@ -683,7 +676,7 @@ use kernel_hal::net::get_net_device;
 
 /// True once DHCP (or static config) assigned a real host IPv4 — not placeholder/0.0.0.0.
 pub fn has_usable_ipv4() -> bool {
-    use smoltcp::wire::IpCidr;
+    use zcore_drivers::wire::IpCidr;
     get_net_device().iter().any(|dev| {
         dev.get_ip_address().iter().any(|ip| match ip {
             IpCidr::Ipv4(cidr) => {
@@ -701,7 +694,7 @@ pub fn has_usable_ipv4() -> bool {
 /// Resolve the IPv4 default gateway from routes or `.1` on the host subnet.
 pub fn ipv4_default_gateway(
     dev: &dyn zcore_drivers::scheme::NetScheme,
-) -> Option<smoltcp::wire::Ipv4Address> {
+) -> Option<zcore_drivers::wire::Ipv4Address> {
     ipv4_gateway_from_routes(&dev.get_routes())
         .filter(|gw| !gw.is_unspecified())
         .or_else(|| infer_ipv4_gateway(dev))
@@ -1049,8 +1042,8 @@ pub fn drain_net_poll(rounds: usize) {
 }
 
 /// Pre-DHCP sentinel (Class E); must never be used for TX or ICMP.
-pub fn is_ipv4_placeholder(addr: smoltcp::wire::Ipv4Address) -> bool {
-    addr == smoltcp::wire::Ipv4Address::new(240, 0, 0, 0)
+pub fn is_ipv4_placeholder(addr: zcore_drivers::wire::Ipv4Address) -> bool {
+    addr == zcore_drivers::wire::Ipv4Address::new(240, 0, 0, 0)
 }
 
 /// A `SO_RCVTIMEO` / `SO_SNDTIMEO` value (`struct timeval`, 16 bytes) as the
@@ -1080,8 +1073,8 @@ pub(crate) fn sockopt_deadline(tv: &[u8; 16]) -> Option<core::time::Duration> {
 /// Guess the default gateway when DHCP/`ip route` did not install one.
 fn infer_ipv4_gateway(
     dev: &dyn zcore_drivers::scheme::NetScheme,
-) -> Option<smoltcp::wire::Ipv4Address> {
-    use smoltcp::wire::{IpCidr, Ipv4Address};
+) -> Option<zcore_drivers::wire::Ipv4Address> {
+    use zcore_drivers::wire::{IpCidr, Ipv4Address};
     for ip in dev.get_ip_address() {
         if let IpCidr::Ipv4(cidr) = ip {
             let addr = cidr.address();
@@ -1109,8 +1102,8 @@ fn infer_ipv4_gateway(
 
 fn ipv4_gateway_from_routes(
     routes: &[zcore_drivers::scheme::RouteInfo],
-) -> Option<smoltcp::wire::Ipv4Address> {
-    use smoltcp::wire::{IpAddress, IpCidr};
+) -> Option<zcore_drivers::wire::Ipv4Address> {
+    use zcore_drivers::wire::{IpAddress, IpCidr};
     routes
         .iter()
         .find_map(|route| match (route.dst, route.gateway) {
@@ -1125,7 +1118,7 @@ fn ipv4_gateway_from_routes(
 
 /// Install `0.0.0.0/0` via DHCP gateway or inferred gateway on the host subnet.
 pub fn ensure_ipv4_default_route(iface: &dyn zcore_drivers::scheme::NetScheme) {
-    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+    use zcore_drivers::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
     // A card of the stack that runs as a process has the routes that
     // stack was given: a guess made here would be asked of it, and put
     // back the default route somebody took away.
@@ -1509,7 +1502,7 @@ pub fn handle_net_ioctl(
             if ipv6 {
                 #[allow(unsafe_code)]
                 let rt = unsafe { &*(arg1 as *const In6RtMsg) };
-                use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
+                use zcore_drivers::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
                 let dst_addr = Ipv6Address::from_bytes(&rt.rtmsg_dst);
                 let gateway = if (rt.rtmsg_flags & RTF_GATEWAY as u32) != 0 {
                     let addr = Ipv6Address::from_bytes(&rt.rtmsg_gateway);
@@ -1571,7 +1564,7 @@ pub fn handle_net_ioctl(
             if ipv6 {
                 #[allow(unsafe_code)]
                 let rt = unsafe { &*(arg1 as *const In6RtMsg) };
-                use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
+                use zcore_drivers::wire::{IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
                 let dst_addr = Ipv6Address::from_bytes(&rt.rtmsg_dst);
                 let gateway = if (rt.rtmsg_flags & RTF_GATEWAY as u32) != 0 {
                     let addr = Ipv6Address::from_bytes(&rt.rtmsg_gateway);
@@ -2243,8 +2236,8 @@ impl From<SocketFlags> for OpenOptions {
 /// encoding `netstat`/`ss` parse (127.0.0.1:53 → "0100007F:0035").
 /// Non-IPv4 addresses render as unspecified; `/proc/net/tcp` is the
 /// IPv4 table on Linux too.
-fn proc_net_hex_addr(addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string::String {
-    use smoltcp::wire::IpAddress;
+fn proc_net_hex_addr(addr: zcore_drivers::wire::IpAddress, port: u16) -> alloc::string::String {
+    use zcore_drivers::wire::IpAddress;
     let v4 = match addr {
         IpAddress::Ipv4(a) => u32::from_le_bytes(a.0),
         _ => 0,
@@ -2272,7 +2265,7 @@ impl ProcNetFamily {
     }
 
     /// An address cell as this table writes it.
-    fn cell(self, addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string::String {
+    fn cell(self, addr: zcore_drivers::wire::IpAddress, port: u16) -> alloc::string::String {
         match self {
             ProcNetFamily::V4 => proc_net_hex_addr(addr, port),
             ProcNetFamily::V6 => proc_net_hex_addr6(addr, port),
@@ -2296,9 +2289,9 @@ impl ProcNetFamily {
 /// "00000000000000000000000001000000:0016"). An IPv4 address is written
 /// the way an `AF_INET6` socket says one, `::ffff:a.b.c.d`, and no address
 /// is `::`.
-fn proc_net_hex_addr6(addr: smoltcp::wire::IpAddress, port: u16) -> alloc::string::String {
+fn proc_net_hex_addr6(addr: zcore_drivers::wire::IpAddress, port: u16) -> alloc::string::String {
     use core::fmt::Write;
-    use smoltcp::wire::IpAddress;
+    use zcore_drivers::wire::IpAddress;
     let mut bytes = [0u8; 16];
     match addr {
         IpAddress::Ipv6(a) => bytes = a.0,
@@ -2377,11 +2370,11 @@ fn proc_net_tcp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> allo
 /// The peer's cell of a served socket's row: nobody when it has none.
 fn proc_net_peer(
     family: ProcNetFamily,
-    peer: Option<smoltcp::wire::IpEndpoint>,
+    peer: Option<zcore_drivers::wire::IpEndpoint>,
 ) -> alloc::string::String {
     match peer {
         Some(peer) => family.cell(peer.addr, peer.port),
-        None => family.cell(smoltcp::wire::IpAddress::Unspecified, 0),
+        None => family.cell(zcore_drivers::wire::IpAddress::Unspecified, 0),
     }
 }
 
@@ -2430,14 +2423,14 @@ fn proc_net_udp_of(family: ProcNetFamily, served: &[user_stack::Listed]) -> allo
 #[cfg(test)]
 mod proc_net_tests {
     use super::*;
-    use smoltcp::wire::Ipv4Address;
+    use zcore_drivers::wire::Ipv4Address;
 
     #[test]
     fn hex_addr_is_little_endian_ipv4_and_hex_port() {
         // The canonical example from proc_net_tcp.rst: 127.0.0.1:53.
-        let addr = smoltcp::wire::IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+        let addr = zcore_drivers::wire::IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
         assert_eq!(proc_net_hex_addr(addr, 53), "0100007F:0035");
-        let any = smoltcp::wire::IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+        let any = zcore_drivers::wire::IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
         assert_eq!(proc_net_hex_addr(any, 0), "00000000:0000");
     }
 
@@ -2447,8 +2440,8 @@ mod proc_net_tests {
     #[test]
     fn the_served_sockets_are_rows_of_the_same_tables() {
         use alloc::vec::Vec;
-        use smoltcp::wire::{IpAddress, IpEndpoint};
         use user_stack::{Listed, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
+        use zcore_drivers::wire::{IpAddress, IpEndpoint};
         let at = |a: [u8; 4], port| IpEndpoint::new(IpAddress::Ipv4(Ipv4Address(a)), port);
         let served = [
             Listed {
@@ -2545,8 +2538,8 @@ mod proc_net_tests {
     #[test]
     fn an_ipv6_socket_is_a_row_of_the_ipv6_tables() {
         use alloc::vec::Vec;
-        use smoltcp::wire::{IpAddress, IpEndpoint, Ipv6Address};
         use user_stack::{Listed, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
+        use zcore_drivers::wire::{IpAddress, IpEndpoint, Ipv6Address};
         // The cell, as Linux writes `::1` and `netstat` reads it back.
         assert_eq!(
             proc_net_hex_addr6(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 22),
@@ -2664,7 +2657,7 @@ pub fn proc_net_unix_content() -> alloc::string::String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::wire::Ipv4Address;
+    use zcore_drivers::wire::Ipv4Address;
 
     /// Six CPUs reaching the same throttle in the same interval: exactly one
     /// gets the turn.

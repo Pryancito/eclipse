@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::wire::*;
+use crate::wire::*;
 
 use super::realtek::rtl8211f::{self, RTL8211F};
 use super::{ip_cfg, timer_now_as_micros, ProviderImpl, PAGE_SIZE};

@@ -215,7 +215,7 @@ fn ro_and_rw_set_read_only() {
 /// `addr=` is Linux's "the server is at this address, do not resolve it".
 #[test]
 fn addr_takes_an_address_literal() {
-    use smoltcp::wire::Ipv4Address;
+    use zcore_drivers::wire::Ipv4Address;
     let o = NfsOptions::parse("addr=10.0.0.3").unwrap();
     assert_eq!(o.addr, Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 3))));
     assert_eq!(

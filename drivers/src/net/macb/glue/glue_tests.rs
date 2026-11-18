@@ -214,7 +214,7 @@ fn the_card_comes_up_without_an_address_nobody_gave_it() {
     let hw = Hw::new();
     let iface = interfaz(&hw);
     for cidr in iface.get_ip_address() {
-        if let smoltcp::wire::IpCidr::Ipv4(v4) = cidr {
+        if let crate::wire::IpCidr::Ipv4(v4) = cidr {
             assert!(
                 v4.address().is_unspecified(),
                 "arranco con la direccion {:?} puesta",

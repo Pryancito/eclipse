@@ -18,9 +18,9 @@ use core::{mem::size_of, slice};
 use kernel_hal::net::get_net_device;
 use kernel_hal::thread;
 use lock::Mutex;
-use smoltcp::wire::IpCidr;
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use zcore_drivers::scheme::RouteInfo;
+use zcore_drivers::wire::IpCidr;
+use zcore_drivers::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 /// Bound queued netlink replies (unread sockets must not grow without limit).
 const NETLINK_RX_QUEUE_MAX: usize = 64;
@@ -485,7 +485,7 @@ impl Socket for NetlinkSocketState {
                             // IPv4 broadcast if applicable.
                             if ip_bytes.len() == 4 {
                                 let bcast = ipv4_broadcast(
-                                    smoltcp::wire::Ipv4Address::from_bytes(ip_bytes),
+                                    zcore_drivers::wire::Ipv4Address::from_bytes(ip_bytes),
                                     ip.prefix_len(),
                                 );
                                 push_rtattr_bytes(
@@ -670,7 +670,7 @@ impl Socket for NetlinkSocketState {
                                     // negativa deliberada, no un fallo.
                                     let skip = matches!(
                                         cidr,
-                                        smoltcp::wire::IpCidr::Ipv6(v6) if v6.address().is_link_local()
+                                        zcore_drivers::wire::IpCidr::Ipv6(v6) if v6.address().is_link_local()
                                     );
                                     if skip {
                                         0
@@ -1227,12 +1227,12 @@ fn for_each_rtattr(data: &[u8], mut off: usize, mut f: impl FnMut(u16, &[u8])) {
 
 fn cidr_from_parts(addr: IpAddress, prefix_len: u8) -> Option<IpCidr> {
     match addr {
-        IpAddress::Ipv4(v4) if prefix_len <= 32 => {
-            Some(IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(v4, prefix_len)))
-        }
-        IpAddress::Ipv6(v6) if prefix_len <= 128 => {
-            Some(IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(v6, prefix_len)))
-        }
+        IpAddress::Ipv4(v4) if prefix_len <= 32 => Some(IpCidr::Ipv4(
+            zcore_drivers::wire::Ipv4Cidr::new(v4, prefix_len),
+        )),
+        IpAddress::Ipv6(v6) if prefix_len <= 128 => Some(IpCidr::Ipv6(
+            zcore_drivers::wire::Ipv6Cidr::new(v6, prefix_len),
+        )),
         _ => None,
     }
 }
@@ -1488,7 +1488,10 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32, 
     push_netlink_rx(buffer, msg);
 }
 
-fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::wire::Ipv4Address {
+fn ipv4_broadcast(
+    addr: zcore_drivers::wire::Ipv4Address,
+    prefix_len: u8,
+) -> zcore_drivers::wire::Ipv4Address {
     let ip = u32::from_be_bytes(addr.0);
     // Both ends are shifts a `u32` cannot take: `<< 32` for a /0, and a shift
     // count that wraps below zero for anything past /32. The first is the
@@ -1500,7 +1503,7 @@ fn ipv4_broadcast(addr: smoltcp::wire::Ipv4Address, prefix_len: u8) -> smoltcp::
         u32::MAX << (32 - prefix_len.min(32) as u32)
     };
     let bcast = ip | (!mask);
-    smoltcp::wire::Ipv4Address::from_bytes(&bcast.to_be_bytes())
+    zcore_drivers::wire::Ipv4Address::from_bytes(&bcast.to_be_bytes())
 }
 
 trait VecExt {
@@ -1688,7 +1691,7 @@ mod netlink_tests {
         assert_eq!(ifindex, 3);
         assert_eq!(
             cidr,
-            IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+            IpCidr::Ipv4(zcore_drivers::wire::Ipv4Cidr::new(
                 Ipv4Address::new(192, 168, 1, 50),
                 24
             ))
@@ -1745,7 +1748,7 @@ mod netlink_tests {
         assert_eq!(rtm.rtm_dst_len, 24);
         assert_eq!(
             dst,
-            IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+            IpCidr::Ipv4(zcore_drivers::wire::Ipv4Cidr::new(
                 Ipv4Address::new(10, 9, 0, 0),
                 24
             ))

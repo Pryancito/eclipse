@@ -6,7 +6,7 @@ use crate::net::user_stack::{self, StackLink};
 use alloc::{sync::Arc, vec::Vec};
 use core::time::Duration;
 use rcore_fs::vfs::INode;
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
+use zcore_drivers::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
 
 const DNS_PORT: u16 = 53;
 const QTYPE_A: u16 = 1;
