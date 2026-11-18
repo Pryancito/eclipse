@@ -25,6 +25,10 @@ path = "src/bin/udrv-nvme.rs"
 name = "udrv-virtio-net"
 path = "src/bin/udrv-virtio-net.rs"
 
+[[bin]]
+name = "udrv-dev-echo"
+path = "src/bin/udrv-dev-echo.rs"
+
 [dependencies]
 libc = "0.2"
 

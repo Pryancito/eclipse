@@ -59,6 +59,9 @@ const TOOLS: [&str; 2] = ["zx-virtio-net", "zx-virtio-blk"];
 /// The Rust drivers' package, under `tools/`, and its binaries.
 const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
 const DRIVERS: [&str; 3] = ["udrv-virtio-blk", "udrv-virtio-net", "udrv-nvme"];
+/// What tests a node in `/dev` that a process serves, from the same
+/// package: `udrv-dev-echo check NAME`.
+const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
 
 /// The network stack that runs as a process: its package, under `tools/`,
 /// its binaries -- the stack, and the UDP and TCP echo servers and the TCP
@@ -482,6 +485,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(DRIVERS_PACKAGE, &DRIVERS, &[]);
         for name in DRIVERS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(DRIVERS_PACKAGE, &DEV_TESTS, &[]);
+        for name in DEV_TESTS {
             put(&built.join(name), name);
         }
         let built = self.rust_tools(NETSTACK_PACKAGE, &NETSTACK, &NETSTACK_USES);

@@ -19,6 +19,8 @@ pub mod nvidia;
 pub mod nvidia_uvm;
 pub mod pty;
 mod random;
+/// `/dev` nodes that a process serves (`eclipse_dev_serve`).
+pub mod served;
 mod snd;
 mod uartdev;
 
@@ -32,5 +34,6 @@ pub use mixer::MixerDev;
 pub use nvidia::{NvidiaDev, NvidiaOpen};
 pub use pty::{PtmxINode, PtsDir};
 pub use random::RandomINode;
+pub use served::{ServedNode, ServedOpen};
 pub use snd::{new_audio_claim, AudioClaim, CtlDev, PcmBlockingIoctl, PcmDev, TimerDev};
 pub use uartdev::UartDev;
