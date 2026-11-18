@@ -65,6 +65,10 @@ struct Inner {
     credit: usize,
     /// The peer will send no more.
     eof: bool,
+    /// This end said that it sends no more before the peer did: the
+    /// connection's port is kept for a while after the socket is gone
+    /// (`TIME_WAIT`).
+    first: bool,
     /// What `SO_ERROR` answers, and the next read or write.
     error: Option<LxError>,
     port: Option<u16>,
@@ -111,6 +115,7 @@ impl Inner {
             unsaid: 0,
             credit: 0,
             eof: false,
+            first: false,
             error: None,
             port: None,
             holds_port: false,
@@ -868,11 +873,18 @@ impl ServedTcpSocket {
 
 impl Drop for ServedTcpSocket {
     fn drop(&mut self) {
-        let (port, waiting, known) = {
+        let (port, waiting, lingers, known) = {
             let mut inner = self.stream.inner.lock();
+            // `tcp_close`: one that closes with something left to read
+            // resets the connection, and a reset one leaves nothing. One
+            // that closes first waits for the peer's last, and then
+            // `TIME_WAIT`: its port is kept from now for that long.
+            let open = inner.phase == Phase::Open && inner.queued == 0;
+            let first = inner.first || !(inner.write_closed || inner.eof);
             (
                 inner.port.filter(|_| inner.holds_port),
                 core::mem::take(&mut inner.waiting),
+                open && first,
                 // What the stack, or the other end, has a socket for. One
                 // whose connection failed it has let go of already, and
                 // of a listener that is this machine's alone the stack
@@ -887,7 +899,13 @@ impl Drop for ServedTcpSocket {
         self.stop_listening(port);
         self.link.forget(self.sock, &self.stream);
         if let Some(port) = port {
-            self.link.table.lock().stream_ports.free(port, self.sock);
+            let mut table = self.link.table.lock();
+            if lingers {
+                let until = kernel_hal::timer::timer_now() + TIME_WAIT;
+                table.stream_ports.linger(port, self.sock, until);
+            } else {
+                table.stream_ports.free(port, self.sock);
+            }
         }
         self.unlisten(waiting);
         // A connection within this machine that was reset is known to
@@ -1219,6 +1237,7 @@ impl Socket for ServedTcpSocket {
             }
             Phase::Open => {
                 let fin = wr && !inner.write_closed;
+                inner.first |= fin && !inner.eof;
                 inner.read_closed |= rd;
                 inner.write_closed |= wr;
                 self.stream.sync(&inner, Event::READABLE | Event::WRITABLE);
@@ -2143,6 +2162,9 @@ mod tests {
         assert_eq!(read(&first, &mut buf), Ok(3));
         drop(first);
         assert_eq!(stack.told(), Some(close_message(one)));
+        // And, having closed first, for a while after.
+        assert_eq!(Socket::bind(&other, any(8080)), Err(LxError::EADDRINUSE));
+        a_minute_passes(&stack, 8080);
         assert_eq!(Socket::bind(&other, any(8080)), Ok(0));
 
         // A connection that arrives for a listener that is gone is closed
@@ -2221,6 +2243,9 @@ mod tests {
         assert_eq!(Socket::bind(&fourth, any(8080)), Ok(0));
         assert_eq!(Socket::listen(&fourth), Ok(0));
         // With every one of them gone the port is anybody's.
+        // The peer of the connection that was left says its last, and
+        // then nothing is left of it.
+        events(&stack, &[(one, EV_EOF, 0, &[])]);
         drop((third, fourth, left));
         assert_eq!(Socket::bind(&plain, any(8080)), Ok(0));
 
@@ -2248,8 +2273,104 @@ mod tests {
         let again = stream(&stack);
         reuse(&again);
         assert_eq!(Socket::bind(&again, any(8090)), Err(LxError::EADDRINUSE));
+        events(&stack, &[(two, EV_EOF, 0, &[])]);
         drop(left);
         assert_eq!(Socket::bind(&again, any(8090)), Ok(0));
+        while stack.told().is_some() {}
+    }
+
+    /// The time for which a closed connection keeps `port` is over.
+    fn a_minute_passes(stack: &Stack, port: u16) {
+        let then = kernel_hal::timer::timer_now() + TIME_WAIT;
+        stack.link.table.lock().stream_ports.sweep(port, then);
+    }
+
+    #[test]
+    fn who_closes_first_keeps_the_port_for_a_while() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let reuse = |s: &ServedTcpSocket| {
+            assert_eq!(
+                s.setsockopt(SOL_SOCKET, SO_REUSEADDR, &1i32.to_ne_bytes()),
+                Ok(0)
+            );
+        };
+        // A server that closes its connection and then itself (`TIME_WAIT`):
+        // the next takes the port only when both said `SO_REUSEADDR`.
+        let server = |port: u16, says: bool, number: u64| {
+            let l = stream(&stack);
+            if says {
+                reuse(&l);
+            }
+            assert_eq!(Socket::bind(&l, any(port)), Ok(0));
+            assert_eq!(Socket::listen(&l), Ok(0));
+            let sock = ACCEPTED_BIT | number;
+            let bytes = accepted_bytes(sock, HOST, 40000 + number as u16);
+            events(&stack, &[(l.sock, EV_ACCEPTED, 500, &bytes)]);
+            let (connection, _) = accepted(&l);
+            drop(l);
+            (connection, sock)
+        };
+        let plain = || stream(&stack);
+        let saying = || {
+            let s = stream(&stack);
+            reuse(&s);
+            s
+        };
+        let (connection, _) = server(8100, false, 1);
+        drop(connection);
+        assert_eq!(Socket::bind(&plain(), any(8100)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::bind(&saying(), any(8100)), Err(LxError::EADDRINUSE));
+        a_minute_passes(&stack, 8100);
+        assert_eq!(Socket::bind(&plain(), any(8100)), Ok(0));
+
+        let (connection, _) = server(8101, true, 2);
+        drop(connection);
+        assert_eq!(Socket::bind(&plain(), any(8101)), Err(LxError::EADDRINUSE));
+        let next = saying();
+        assert_eq!(Socket::bind(&next, any(8101)), Ok(0));
+        assert_eq!(Socket::listen(&next), Ok(0));
+        drop(next);
+        // Many that were alike leave what one leaves.
+        for number in 3..6 {
+            let (connection, _) = server(8101, true, number);
+            drop(connection);
+        }
+        let holds = |port: u16| {
+            let table = stack.link.table.lock();
+            table.stream_ports.taken.get(&port).map_or(0, Vec::len)
+        };
+        assert_eq!(holds(8101), 1);
+        a_minute_passes(&stack, 8101);
+        assert_eq!(holds(8101), 0);
+
+        // One that said first that it sends no more, and closed after
+        // its peer said so, closed first all the same.
+        let (connection, sock) = server(8102, false, 6);
+        assert_eq!(Socket::shutdown(&*connection, 1), Ok(0));
+        events(&stack, &[(sock, EV_EOF, 0, &[])]);
+        drop(connection);
+        assert_eq!(Socket::bind(&plain(), any(8102)), Err(LxError::EADDRINUSE));
+
+        // The one whose peer closed first leaves nothing.
+        let (connection, sock) = server(8103, false, 7);
+        events(&stack, &[(sock, EV_EOF, 0, &[])]);
+        drop(connection);
+        assert_eq!(Socket::bind(&plain(), any(8103)), Ok(0));
+        // Nor one that closes with something left to read, which is a
+        // reset.
+        let (connection, sock) = server(8104, false, 8);
+        events(&stack, &[(sock, EV_BYTES, 0, b"unread")]);
+        drop(connection);
+        assert_eq!(Socket::bind(&plain(), any(8104)), Ok(0));
+
+        // A port that was given to one that asked for any is nobody's
+        // when it is gone: who connects out and closes leaves nothing.
+        while stack.told().is_some() {}
+        let (client, _) = connected(&stack, 100);
+        let port = ip(Socket::endpoint(&client).unwrap()).port;
+        drop(client);
+        assert_eq!(holds(port), 0);
         while stack.told().is_some() {}
     }
 
@@ -2898,6 +3019,7 @@ mod tests {
             connect(&stream(&stack), at(HERE, 8080)),
             Err(LxError::ECONNREFUSED)
         );
+        a_minute_passes(&stack, 8080);
         // And the port is free for IPv4, and for no more than that.
         assert_eq!(
             Socket::bind(&stream6(), Endpoint::Ip(at6("::", 8080))),
