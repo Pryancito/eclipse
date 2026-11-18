@@ -208,6 +208,12 @@ fn writable(inner: &Inner) -> bool {
     }
 }
 
+/// The address of the machine's a socket has its port at, when it was
+/// bound to one: another socket can have the port at another.
+fn whose(inner: &Inner) -> Option<IpAddress> {
+    inner.here.map(IpAddress::Ipv4).or(inner.bound)
+}
+
 fn failed(inner: &Inner) -> bool {
     inner.error.is_some()
 }
@@ -309,13 +315,24 @@ impl Stream {
     /// IPv6 as well when it is an `AF_INET6` socket, or for that alone
     /// when it was told so.
     pub(super) fn listen_message(&self, sock: u64, port: u16) -> Vec<u8> {
-        let takes = self.takes(&self.inner.lock());
-        let message = match takes {
-            Takes::Four => listen_message,
-            Takes::Both => listen6_message,
-            Takes::Six => listen6only_message,
+        let inner = self.inner.lock();
+        let takes = self.takes(&inner);
+        // Bound to an address of a card's, it takes what arrives there
+        // and nowhere else, as the version of IP that address is of: the
+        // address is said after the rest, four bytes of IPv4's or sixteen
+        // of IPv6's.
+        let message = match (takes, inner.bound) {
+            (Takes::Four, _) | (_, Some(IpAddress::Ipv4(_))) => listen_message,
+            (Takes::Both, _) => listen6_message,
+            (Takes::Six, _) => listen6only_message,
         };
-        message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32)
+        let mut m = message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
+        match inner.bound {
+            Some(IpAddress::Ipv4(at)) => m.extend_from_slice(&at.0),
+            Some(IpAddress::Ipv6(at)) => m.extend_from_slice(&at.0),
+            _ => {}
+        }
+        m
     }
 
     /// How `/proc/net/tcp` lists it, when it does: a socket that listens,
@@ -467,6 +484,9 @@ impl StackLink {
                         child.credit = (number as usize).min(CREDIT_MAX);
                         child.port = inner.port;
                         child.only6 = inner.only6;
+                        // What a listener bound to an address takes
+                        // arrived at that address.
+                        child.bound = inner.bound;
                         child.remote = Some(from);
                         child.at = at;
                         let child = Stream::new(child, stream.v6);
@@ -547,7 +567,7 @@ impl StackLink {
     fn join(&self, sock: u64, to: IpAddress, port: u16, from: IpEndpoint, six: bool) {
         let listener = {
             let table = self.table.lock();
-            let listener = table.listening.get(port, six);
+            let listener = table.listening.get(port, six, to);
             listener
                 .and_then(|listener| table.streams.get(&listener))
                 .and_then(Weak::upgrade)
@@ -695,7 +715,7 @@ impl ServedTcpSocket {
             return Ok(port);
         }
         let takes = self.stream.takes(inner);
-        let port = self.link.table.lock().stream_ports.take(0, takes)?;
+        let port = self.link.table.lock().stream_ports.take(0, takes, None)?;
         inner.port = Some(port);
         inner.holds_port = true;
         Ok(port)
@@ -807,10 +827,11 @@ impl ServedTcpSocket {
 
 impl Drop for ServedTcpSocket {
     fn drop(&mut self) {
-        let (port, takes, waiting, known) = {
+        let (port, whose, takes, waiting, known) = {
             let mut inner = self.stream.inner.lock();
             (
                 inner.port.filter(|_| inner.holds_port),
+                whose(&inner),
                 self.stream.takes(&inner),
                 core::mem::take(&mut inner.waiting),
                 // What the stack, or the other end, has a socket for. One
@@ -827,7 +848,7 @@ impl Drop for ServedTcpSocket {
         self.stop_listening(port);
         self.link.forget(self.sock, &self.stream);
         if let Some(port) = port {
-            self.link.table.lock().stream_ports.free(port, takes);
+            self.link.table.lock().stream_ports.free(port, takes, whose);
         }
         self.unlisten(waiting);
         // A connection within this machine that was reset is known to
@@ -1071,12 +1092,11 @@ impl Socket for ServedTcpSocket {
             return Err(LxError::EINVAL);
         }
         let takes = self.stream.takes(&inner);
-        let port = self
-            .link
-            .table
-            .lock()
-            .stream_ports
-            .take(local.port, takes)?;
+        let port = self.link.table.lock().stream_ports.take(
+            local.port,
+            takes,
+            here.map(IpAddress::Ipv4).or(bound),
+        )?;
         inner.port = Some(port);
         inner.holds_port = true;
         inner.here = here;
@@ -1104,7 +1124,7 @@ impl Socket for ServedTcpSocket {
                 .table
                 .lock()
                 .listening
-                .insert(port, self.sock, takes);
+                .insert(port, self.sock, takes, whose(&inner));
             // Bound to an address of 127.0.0.0/8, it is theirs alone: the
             // stack, which would bring it what the card hears, is not
             // told.

@@ -48,7 +48,7 @@
 //!
 //! ```text
 //! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window  (28  [u8; 4] from)
-//! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
+//! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window  (24  [u8; 4] at)
 //! WRITE    (kernel to stack)  16  the bytes
 //! SHUTDOWN (kernel to stack)
 //! WINDOW   (kernel to stack)  16  u32 bytes
@@ -291,8 +291,8 @@
 //!
 //! ```text
 //! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window  (40  [u8; 16] from)
-//! LISTEN6  (kernel to stack)  as LISTEN
-//! LISTEN6ONLY (kernel to stack)  as LISTEN
+//! LISTEN6  (kernel to stack)  as LISTEN  (24  [u8; 16] at)
+//! LISTEN6ONLY (kernel to stack)  as LISTEN6
 //!     CONNECTED  bytes: none, or [u8; 16] the address it connected from
 //!     ACCEPTED6  as ACCEPTED.  bytes: u64 the new socket, [u8; 16] from,
 //!                u16 port, u16 zero, [u8; 16] the address it arrived at
@@ -1330,9 +1330,10 @@ impl Takes {
 /// The ports of one protocol: which are taken, and where the search for
 /// a free one starts.
 struct Ports {
-    /// Each port that is taken, and for which versions of IP
+    /// Each port that is taken: at which address of the machine's (none
+    /// when at every one), and for which versions of IP
     /// ([`Takes::bits`]).
-    taken: BTreeMap<u16, u8>,
+    taken: BTreeMap<u16, Vec<(Option<IpAddress>, u8)>>,
     next: u16,
 }
 
@@ -1345,19 +1346,30 @@ impl Default for Ports {
     }
 }
 
+/// Whether a socket at `one` and a socket at `other` are in each other's
+/// way on one port: at the same address, or either at every address.
+fn clash(one: Option<IpAddress>, other: Option<IpAddress>) -> bool {
+    one.is_none() || other.is_none() || one == other
+}
+
 impl Ports {
-    /// For which versions of IP `port` is taken.
-    fn held(&self, port: u16) -> u8 {
-        self.taken.get(&port).copied().unwrap_or(0)
+    /// For which versions of IP `port` is taken from a socket that would
+    /// be `at` that address (at every one when none).
+    fn held(&self, port: u16, at: Option<IpAddress>) -> u8 {
+        let holders = self.taken.get(&port).into_iter().flatten();
+        holders
+            .filter(|(theirs, _)| clash(*theirs, at))
+            .fold(0, |held, (_, bits)| held | bits)
     }
 
     /// Take the port `wanted`, or any when it is 0, for what a socket
-    /// `takes`. `EADDRINUSE` when another socket has it for any of that,
-    /// or none is left.
-    fn take(&mut self, wanted: u16, takes: Takes) -> LxResult<u16> {
+    /// `takes`, `at` an address of the machine's or at every one.
+    /// `EADDRINUSE` when another socket has it for any of that at that
+    /// address or at every one, or none is left.
+    fn take(&mut self, wanted: u16, takes: Takes, at: Option<IpAddress>) -> LxResult<u16> {
         let bits = takes.bits();
         let port = if wanted != 0 {
-            if self.held(wanted) & bits != 0 {
+            if self.held(wanted, at) & bits != 0 {
                 return Err(LxError::EADDRINUSE);
             }
             wanted
@@ -1369,7 +1381,7 @@ impl Ports {
                     let at = (first - EPHEMERAL.start()) as u32 + i;
                     EPHEMERAL.start() + (at % span) as u16
                 })
-                .find(|p| self.held(*p) & bits == 0)
+                .find(|p| self.held(*p, at) & bits == 0)
                 .ok_or(LxError::EADDRINUSE)?;
             self.next = if port == *EPHEMERAL.end() {
                 *EPHEMERAL.start()
@@ -1378,15 +1390,23 @@ impl Ports {
             };
             port
         };
-        *self.taken.entry(port).or_default() |= bits;
+        let holders = self.taken.entry(port).or_default();
+        match holders.iter_mut().find(|(theirs, _)| *theirs == at) {
+            Some((_, held)) => *held |= bits,
+            None => holders.push((at, bits)),
+        }
         Ok(port)
     }
 
-    /// The socket that took `port` for what it `takes` is gone.
-    fn free(&mut self, port: u16, takes: Takes) {
-        if let Some(held) = self.taken.get_mut(&port) {
-            *held &= !takes.bits();
-            if *held == 0 {
+    /// The socket that took `port` for what it `takes`, `at` that
+    /// address, is gone.
+    fn free(&mut self, port: u16, takes: Takes, at: Option<IpAddress>) {
+        if let Some(holders) = self.taken.get_mut(&port) {
+            if let Some((_, held)) = holders.iter_mut().find(|(theirs, _)| *theirs == at) {
+                *held &= !takes.bits();
+            }
+            holders.retain(|(_, held)| *held != 0);
+            if holders.is_empty() {
                 self.taken.remove(&port);
             }
         }
@@ -1394,55 +1414,72 @@ impl Ports {
 }
 
 /// Which socket has each port, for what is IPv4 and for what is IPv6:
-/// one socket for both, or one for each.
+/// one socket for both, or one for each; and at each address of the
+/// machine's a socket was bound to, one more.
 #[derive(Default)]
 struct Holders {
-    four: BTreeMap<u16, u64>,
-    six: BTreeMap<u16, u64>,
+    four: BTreeMap<u16, Vec<(Option<IpAddress>, u64)>>,
+    six: BTreeMap<u16, Vec<(Option<IpAddress>, u64)>>,
 }
 
 impl Holders {
-    /// `sock` has `port`, for what it `takes`.
-    fn insert(&mut self, port: u16, sock: u64, takes: Takes) {
+    /// `sock` has `port`, for what it `takes`, `at` an address of the
+    /// machine's or at every one.
+    fn insert(&mut self, port: u16, sock: u64, takes: Takes, at: Option<IpAddress>) {
         if takes.four() {
-            self.four.insert(port, sock);
+            self.four.entry(port).or_default().push((at, sock));
         }
         if takes.six() {
-            self.six.insert(port, sock);
+            self.six.entry(port).or_default().push((at, sock));
         }
     }
 
     /// `sock` has `port` no more.
     fn remove(&mut self, port: u16, sock: u64) {
         for holders in [&mut self.four, &mut self.six] {
-            if holders.get(&port) == Some(&sock) {
-                holders.remove(&port);
+            if let Some(at) = holders.get_mut(&port) {
+                at.retain(|(_, theirs)| *theirs != sock);
+                if at.is_empty() {
+                    holders.remove(&port);
+                }
             }
         }
     }
 
-    /// Who has `port` for what a program of this machine sends there: to
-    /// an address of IPv6 when `six`. `::1` is this machine with no
-    /// version of IP in between, so what is sent there finds a socket of
-    /// `AF_INET` when no other has the port; what is sent to 127.0.0.1
-    /// never finds one that is for IPv6 only.
-    fn get(&self, port: u16, six: bool) -> Option<u64> {
-        let four = || self.four.get(&port);
+    /// Who has `port` for what a program of this machine sends `to`
+    /// there: the socket bound to that address, or else the one that has
+    /// the port at every address. To an address of IPv6 when `six`:
+    /// `::1` is this machine with no version of IP in between, so what
+    /// is sent there finds a socket of `AF_INET` when no other has the
+    /// port; what is sent to 127.0.0.1 never finds one that is for IPv6
+    /// only.
+    fn get(&self, port: u16, six: bool, to: IpAddress) -> Option<u64> {
+        let pick = |holders: &BTreeMap<u16, Vec<(Option<IpAddress>, u64)>>| {
+            let at = holders.get(&port)?;
+            let exact = at.iter().find(|(theirs, _)| *theirs == Some(to));
+            let any = || at.iter().find(|(theirs, _)| theirs.is_none());
+            exact.or_else(any).map(|(_, sock)| *sock)
+        };
         if six {
-            self.six.get(&port).or_else(four).copied()
+            pick(&self.six).or_else(|| pick(&self.four))
         } else {
-            four().copied()
+            pick(&self.four)
         }
     }
 
     /// Every socket that has a port, once, and the port.
     fn each(&self) -> Vec<(u64, u16)> {
-        let both = self.four.iter().chain(
-            self.six
-                .iter()
-                .filter(|(port, sock)| self.four.get(port) != Some(sock)),
-        );
-        both.map(|(port, sock)| (*sock, *port)).collect()
+        let mut all: Vec<(u64, u16)> = Vec::new();
+        for holders in [&self.four, &self.six] {
+            for (port, at) in holders {
+                for (_, sock) in at {
+                    if !all.contains(&(*sock, *port)) {
+                        all.push((*sock, *port));
+                    }
+                }
+            }
+        }
+        all
     }
 }
 
@@ -1736,7 +1773,13 @@ impl StackLink {
             .filter(|shared| shared.hears == Hears::Datagrams)
             .filter_map(|shared| {
                 let inner = shared.inner.lock();
-                let addr = inner.here.unwrap_or(Ipv4Address::UNSPECIFIED);
+                // The address of IPv4 it was bound to, this machine's
+                // alone or a card's.
+                let addr = match (inner.here, inner.bound) {
+                    (Some(here), _) => here,
+                    (None, Some(IpAddress::Ipv4(bound))) => bound,
+                    _ => Ipv4Address::UNSPECIFIED,
+                };
                 Some(Listed {
                     local: IpEndpoint::new(IpAddress::Ipv4(addr), inner.port?),
                     remote: inner.remote,
@@ -2202,7 +2245,7 @@ impl StackLink {
     /// Give a socket the port `wanted`, or any when it is 0, for what it
     /// `takes`, and tell the stack, with the address `at` of a card's the
     /// socket was bound to, unless the socket is this machine's alone
-    /// (`told`). `EADDRINUSE` when another has it for any of that
+    /// (bound `here`, within 127.0.0.0/8). `EADDRINUSE` when another has it for any of that
     /// or none is left. With no stack to tell, the port is the socket's
     /// all the same: the next stack is told when it comes.
     fn bind(
@@ -2210,17 +2253,20 @@ impl StackLink {
         sock: u64,
         wanted: u16,
         takes: Takes,
-        told: bool,
+        here: Option<Ipv4Address>,
         at: Option<IpAddress>,
     ) -> LxResult<u16> {
         let _telling = self.telling.lock();
+        // The port is the socket's at the address it was bound to: another
+        // socket can have it at another.
+        let whose = here.map(IpAddress::Ipv4).or(at);
         let port = {
             let mut table = self.table.lock();
-            let port = table.ports.take(wanted, takes)?;
-            table.bound.insert(port, sock, takes);
+            let port = table.ports.take(wanted, takes, whose)?;
+            table.bound.insert(port, sock, takes, whose);
             port
         };
-        if told {
+        if here.is_none() {
             let _ = self.tell(bind_message(sock, port, takes, at), true);
         }
         Ok(port)
@@ -2228,12 +2274,12 @@ impl StackLink {
 
     /// A socket is gone: its number and its port are free, and the stack
     /// is told, if it was ever told of the socket (`told`).
-    fn close(&self, sock: u64, port: Option<u16>, takes: Takes, told: bool) {
+    fn close(&self, sock: u64, port: Option<u16>, takes: Takes, told: bool, at: Option<IpAddress>) {
         {
             let mut table = self.table.lock();
             table.socks.remove(&sock);
             if let Some(port) = port {
-                table.ports.free(port, takes);
+                table.ports.free(port, takes, at);
                 table.bound.remove(port, sock);
             }
         }
@@ -2260,7 +2306,7 @@ impl StackLink {
             table.socks.remove(&sock);
             table.hearing.remove(&sock);
             if let Some(ident) = ident {
-                table.idents.free(ident, Takes::Both);
+                table.idents.free(ident, Takes::Both, None);
             }
         }
         let _ = self.tell(close_message(sock), true);
@@ -2269,7 +2315,7 @@ impl StackLink {
     /// Give a socket that pings the identifier `wanted`, or any when it
     /// is 0. `EADDRINUSE` when another has it or none is left.
     fn ident(&self, wanted: u16) -> LxResult<u16> {
-        self.table.lock().idents.take(wanted, Takes::Both)
+        self.table.lock().idents.take(wanted, Takes::Both, None)
     }
 
     /// The sockets that hear ICMP, of either kind.
@@ -2325,7 +2371,7 @@ impl StackLink {
     fn send_here6(&self, from: IpEndpoint, port: u16, data: &[u8]) -> bool {
         let shared = {
             let table = self.table.lock();
-            let sock = table.bound.get(port, true);
+            let sock = table.bound.get(port, true, from.addr);
             sock.and_then(|sock| table.socks.get(&sock))
                 .and_then(Weak::upgrade)
         };
@@ -2354,7 +2400,7 @@ impl StackLink {
     ) -> bool {
         let shared = {
             let table = self.table.lock();
-            let sock = table.bound.get(port, six);
+            let sock = table.bound.get(port, six, IpAddress::Ipv4(to));
             sock.and_then(|sock| table.socks.get(&sock))
                 .and_then(Weak::upgrade)
         };
@@ -2478,7 +2524,7 @@ impl ServedUdpSocket {
         }
         let port = self
             .link
-            .bind(self.sock, 0, self.shared.takes(), true, None)?;
+            .bind(self.sock, 0, self.shared.takes(), None, None)?;
         self.shared.inner.lock().port = Some(port);
         Ok(port)
     }
@@ -2569,12 +2615,13 @@ impl Drop for ServedUdpSocket {
     fn drop(&mut self) {
         self.leave_every_group();
         self.link.leave_every_group6(&self.shared);
-        let (port, here) = {
+        let (port, here, bound) = {
             let inner = self.shared.inner.lock();
-            (inner.port, inner.here)
+            (inner.port, inner.here, inner.bound)
         };
+        let whose = here.map(IpAddress::Ipv4).or(bound);
         self.link
-            .close(self.sock, port, self.shared.takes(), here.is_none());
+            .close(self.sock, port, self.shared.takes(), here.is_none(), whose);
     }
 }
 
@@ -2744,9 +2791,7 @@ impl Socket for ServedUdpSocket {
             inner.bound = bound;
         }
         let takes = self.shared.takes();
-        let port = self
-            .link
-            .bind(self.sock, local.port, takes, here.is_none(), bound);
+        let port = self.link.bind(self.sock, local.port, takes, here, bound);
         let mut inner = self.shared.inner.lock();
         match port {
             Ok(port) => inner.port = Some(port),
