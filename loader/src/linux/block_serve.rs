@@ -1031,11 +1031,13 @@ impl BlockScheme for ServedDisk {
 /// How often a sleeping read looks for the next driver.
 const NEXT_DRIVER_STEP: Duration = Duration::from_millis(5);
 
+/// A device the kernel left to userspace, and the disk served from it.
+type Served = ((&'static str, usize), Arc<ServedDisk>);
+
 /// The disks that have been served from a device the kernel left to
 /// userspace, by that device's place among the reserved disks: what a
 /// second driver of the same device is given instead of a new disk.
-static DISKS: lock::Mutex<Vec<((&'static str, usize), Arc<ServedDisk>)>> =
-    lock::Mutex::new(Vec::new());
+static DISKS: lock::Mutex<Vec<Served>> = lock::Mutex::new(Vec::new());
 
 /// The kinds of reserved device a process can serve as a disk, with the
 /// name each one's node is made after.
