@@ -24,6 +24,16 @@ pub struct RouteInfo {
     pub gateway: Option<crate::wire::IpAddress>,
 }
 
+/// A machine of a card's link whose hardware address is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighbourInfo {
+    pub address: crate::wire::IpAddress,
+    pub hardware: [u8; 6],
+    /// The time, in milliseconds since boot, it is taken as there until:
+    /// past it, it was there once.
+    pub until_ms: u64,
+}
+
 pub trait NetScheme: Scheme {
     fn recv(&self, buf: &mut [u8]) -> DeviceResult<usize>;
     fn send(&self, buf: &[u8]) -> DeviceResult<usize>;
@@ -84,6 +94,10 @@ pub trait NetScheme: Scheme {
         Err(DeviceError::NotSupported)
     }
     fn get_routes(&self) -> Vec<RouteInfo> {
+        Vec::new()
+    }
+    /// The neighbours the card has met, when it knows.
+    fn get_neighbours(&self) -> Vec<NeighbourInfo> {
         Vec::new()
     }
     fn get_stats(&self) -> NetStats {

@@ -106,6 +106,7 @@ pub mod isn;
 pub mod lease;
 pub mod mld;
 pub mod more;
+pub mod neigh;
 pub mod raw;
 pub mod raw6;
 pub mod six;
@@ -315,6 +316,9 @@ pub struct Stack<D: for<'d> Device<'d> + crate::port::Listened> {
     six: six::Six,
     /// The other addresses and the routes.
     more: more::More,
+    /// What smoltcp's count of the changes of its neighbours was when the
+    /// kernel was last said them ([`neigh_news`](Self::neigh_news)).
+    neigh_said: u32,
     /// The sockets that hear ICMPv6.
     hearing6: icmp6::Hearing6,
     /// The raw sockets of other protocols.
@@ -348,6 +352,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             lease: lease::Leasing::default(),
             six: six::Six::default(),
             more: more::More::default(),
+            neigh_said: 0,
             hearing6: icmp6::Hearing6::default(),
             raws: raw::Raws::default(),
             raws6: raw6::Raws6::default(),

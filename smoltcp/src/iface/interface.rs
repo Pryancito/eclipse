@@ -644,6 +644,25 @@ where
         }
     }
 
+    /// A number that is another each time the neighbors change: see `NeighborCache::changes`.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn neighbors_changes(&self) -> u32 {
+        self.inner
+            .neighbor_cache
+            .as_ref()
+            .map_or(0, |cache| cache.changes())
+    }
+
+    /// The neighbors there are: the address of each, its hardware address, and when it stops
+    /// being taken as there.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn neighbors(&self) -> impl Iterator<Item = (IpAddress, EthernetAddress, Instant)> + '_ {
+        self.inner
+            .neighbor_cache
+            .iter()
+            .flat_map(|cache| cache.neighbors())
+    }
+
     /// Take the oldest packet that had nowhere to go and has not been taken: one for a
     /// neighbor that left several discovery requests, one after another, unanswered. What is
     /// given is what an ICMP message that said "host unreachable" would quote of it: its

@@ -44,6 +44,8 @@ mod layout;
 mod limits;
 #[cfg(test)]
 mod mounts_tests;
+#[cfg(test)]
+mod net_arp_tests;
 /// `/proc/<pid>/oom_score_adj`, `oom_adj` and `oom_score`.
 mod oom;
 pub(crate) mod owner;
@@ -4110,9 +4112,41 @@ fn proc_filesystems_content() -> String {
 }
 
 fn proc_net_arp_content() -> String {
-    // The neighbours are the stack's, which is a process and does not
-    // say them: the table has its heading and no rows.
-    String::from("IP address       HW type     Flags       HW address            Mask     Device\n")
+    // The neighbours are the stack's, which is a process and says the
+    // ones of each of its cards (`NEIGH`).
+    let ifaces = kernel_hal::net::get_net_device();
+    let met = ifaces
+        .iter()
+        .map(|iface| (iface.get_ifname(), iface.get_neighbours()));
+    proc_net_arp_of(met)
+}
+
+/// The table of `/proc/net/arp`: a row for each neighbour of IPv4 that
+/// the card of each name has `met`. One is "complete" (0x2) for as long
+/// as its hardware address is known, as in Linux, where a row stays long
+/// after the neighbour was last heard from.
+fn proc_net_arp_of(
+    met: impl Iterator<Item = (String, Vec<zcore_drivers::scheme::NeighbourInfo>)>,
+) -> String {
+    let mut s = String::from(
+        "IP address       HW type     Flags       HW address            Mask     Device\n",
+    );
+    for (name, neighbours) in met {
+        for neighbour in neighbours {
+            let IpAddress::Ipv4(address) = neighbour.address else {
+                continue;
+            };
+            // As text first: an address does not pad itself.
+            let address = alloc::format!("{address}");
+            let h = neighbour.hardware;
+            let _ = writeln!(
+                s,
+                "{:<16} 0x{:<10x}0x{:<10x}{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        {}",
+                address, 1, 2, h[0], h[1], h[2], h[3], h[4], h[5], name
+            );
+        }
+    }
+    s
 }
 
 fn proc_net_if_inet6_content() -> String {

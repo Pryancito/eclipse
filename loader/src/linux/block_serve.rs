@@ -1031,6 +1031,9 @@ impl BlockScheme for ServedDisk {
 /// How often a sleeping read looks for the next driver.
 const NEXT_DRIVER_STEP: Duration = Duration::from_millis(5);
 
+/// A device the kernel left to userspace, and the disk served from it.
+type Served = ((&'static str, usize), Arc<ServedDisk>);
+
 /// The disks that have been served from a device the kernel left to
 /// userspace, by that device's place among the reserved disks: what a
 /// second driver of the same device is given instead of a new disk.

@@ -683,6 +683,12 @@ fn turn<'a>(host: &'a Arc<Host>, mut shared: MutexGuard<'a, Shared>, data: &mut 
         cards::of_card(&mut said, host.card());
         let _ = kernel.channel.write(&said, &[]);
     }
+    if shared.stack.neigh_news() {
+        // As rare as a neighbour is met, or heard from after a while.
+        let mut said = shared.stack.neigh_message();
+        cards::of_card(&mut said, host.card());
+        let _ = kernel.channel.write(&said, &[]);
+    }
     tell_counts(host, &shared.stack.device().counts(), at);
     let mut bytes = false;
     loop {

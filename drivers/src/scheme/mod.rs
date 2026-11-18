@@ -33,7 +33,7 @@ pub use drm::{
 pub use event::EventScheme;
 pub use input::{AbsInfo, InputScheme};
 pub use irq::{IrqHandler, IrqScheme};
-pub use net::{NetScheme, NetStats, RouteInfo};
+pub use net::{NeighbourInfo, NetScheme, NetStats, RouteInfo};
 pub use uart::UartScheme;
 
 /// Common of all device drivers.
