@@ -1,0 +1,36 @@
+[package]
+name = "eclipse-btrfs"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS btrfs filesystem that runs as a process"
+
+# Standalone: NOT a workspace member. It targets userspace
+# (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
+# builds it on its own (see `xtask/src/linux/udriver.rs`), like the FAT
+# server it follows.
+[workspace]
+
+[lib]
+name = "btrfsserve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eclipse-btrfs"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+# The system calls and the FIFO.
+udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
+# What passes between the kernel and a server, and the disk as kept memory
+# the mount holds: the FAT server's, which this shares.
+fatserve = { package = "eclipse-fatfs", path = "../eclipse-fatfs" }
+# The same btrfs code the kernel links for its own btrfs (`vendor/btrfs-rs`).
+btrfs = { path = "../../vendor/btrfs-rs", features = ["std"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

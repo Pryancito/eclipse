@@ -58,6 +58,14 @@ pub const OP_TRUNCATE: u32 = 8;
 pub const OP_SYNC: u32 = 9;
 /// The file at the path was last written at `a`, seconds as an `i64`.
 pub const OP_SETTIME: u32 = 10;
+/// Only on a [`SERVE_POSIX`](super::SERVE_POSIX) mount: the file at the
+/// path belongs to the user `a >> 32` and the group `a & 0xffff_ffff`,
+/// with the permissions `b` (the low twelve bits of a mode).
+pub const OP_SETATTR: u32 = 11;
+/// Only on a [`SERVE_POSIX`](super::SERVE_POSIX) mount: the record of the
+/// file at the path itself, in the data area. What the top of the mount is
+/// asked, which no listing has.
+pub const OP_STAT: u32 = 12;
 
 /// [`OP_LIST`]'s `a` in a reply that holds the directory's last entries.
 pub const LIST_END: u64 = u64::MAX;
@@ -70,6 +78,21 @@ pub const STATFS_LEN: usize = 40;
 pub const RECORD_HEAD: usize = 40;
 /// `mode`'s bit for a directory: `S_IFDIR`. Anything else is a file.
 pub const MODE_DIR: u32 = 0o040000;
+
+/// The kind of file of a mode: its `S_IFMT` bits.
+pub const MODE_KIND: u32 = 0o170000;
+pub const MODE_FILE: u32 = 0o100000;
+pub const MODE_LINK: u32 = 0o120000;
+pub const MODE_FIFO: u32 = 0o010000;
+pub const MODE_SOCKET: u32 = 0o140000;
+pub const MODE_CHAR: u32 = 0o020000;
+pub const MODE_BLOCK: u32 = 0o060000;
+
+/// A record's fixed part on a [`SERVE_POSIX`](super::SERVE_POSIX) mount:
+/// the [`RECORD_HEAD`] bytes, then `uid, gid, nlink` (u32 each), four bytes
+/// of nothing, and `rdev` (u64), then the name. `mode` is the whole of the
+/// file's mode there: its kind and its permissions.
+pub const RECORD_HEAD_POSIX: usize = 64;
 
 /// A message as it comes back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,17 +170,40 @@ pub struct Entry {
     pub mtime: i64,
     pub atime: i64,
     pub ctime: i64,
+    /// Its kind and permissions. A server that is not POSIX's say nothing of
+    /// either but file or directory: `0o100644` or `0o040755`.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Its names: 1 for a file, 2 for a directory, from a server that is
+    /// not POSIX's.
+    pub nlink: u32,
+    pub rdev: u64,
+}
+
+/// The kinds of file a POSIX server may list.
+fn is_kind(mode: u32) -> bool {
+    matches!(
+        mode & MODE_KIND,
+        MODE_FILE | MODE_DIR | MODE_LINK | MODE_FIFO | MODE_SOCKET | MODE_CHAR | MODE_BLOCK
+    )
 }
 
 /// The `count` records in `data`, appended to `into`. `None` when they are
 /// not what a server may send: a record that runs past the data, a size
 /// past [`MAX_FILE`], a name that is empty, has a `/` or a NUL in it, is
 /// `.` or `..`, or is not text. A name like those would be a way out of the
-/// directory, or of the mount.
-pub fn records(data: &[u8], count: usize, into: &mut Vec<Entry>) -> Option<()> {
+/// directory, or of the mount. With `posix` the records are the longer ones
+/// of [`RECORD_HEAD_POSIX`], and a mode that is no kind of file is refused.
+pub fn records(data: &[u8], count: usize, into: &mut Vec<Entry>, posix: bool) -> Option<()> {
+    let head_len = if posix {
+        RECORD_HEAD_POSIX
+    } else {
+        RECORD_HEAD
+    };
     let mut at = 0;
     for _ in 0..count {
-        let head = data.get(at..at + RECORD_HEAD)?;
+        let head = data.get(at..at + head_len)?;
         let u16_at = |i: usize| u16::from_ne_bytes([head[i], head[i + 1]]) as usize;
         let i64_at = |i: usize| {
             let mut b = [0u8; 8];
@@ -165,11 +211,16 @@ pub fn records(data: &[u8], count: usize, into: &mut Vec<Entry>) -> Option<()> {
             i64::from_ne_bytes(b)
         };
         let (rec_len, name_len) = (u16_at(0), u16_at(2));
-        let mode = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
-        if rec_len < RECORD_HEAD + name_len || !rec_len.is_multiple_of(8) {
+        let u32_at =
+            |i: usize| u32::from_ne_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+        let mode = u32_at(4);
+        if rec_len < head_len + name_len || !rec_len.is_multiple_of(8) {
             return None;
         }
-        let name = data.get(at + RECORD_HEAD..at + RECORD_HEAD + name_len)?;
+        if posix && !is_kind(mode) {
+            return None;
+        }
+        let name = data.get(at + head_len..at + head_len + name_len)?;
         data.get(at..at + rec_len)?;
         let name = core::str::from_utf8(name).ok()?;
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
@@ -179,13 +230,27 @@ pub fn records(data: &[u8], count: usize, into: &mut Vec<Entry>) -> Option<()> {
         if size > MAX_FILE {
             return None;
         }
+        let is_dir = mode & MODE_KIND == MODE_DIR;
+        let (mode, uid, gid, nlink, rdev) = if posix {
+            let nlink = u32_at(48).max(1);
+            (mode, u32_at(40), u32_at(44), nlink, i64_at(56) as u64)
+        } else if is_dir {
+            (MODE_DIR | 0o755, 0, 0, 2, 0)
+        } else {
+            (MODE_FILE | 0o644, 0, 0, 1, 0)
+        };
         into.push(Entry {
             name: String::from(name),
-            is_dir: mode & 0o170000 == MODE_DIR,
+            is_dir,
             size,
             mtime: i64_at(16),
             atime: i64_at(24),
             ctime: i64_at(32),
+            mode,
+            uid,
+            gid,
+            nlink,
+            rdev,
         });
         at += rec_len;
     }
@@ -243,7 +308,7 @@ mod tests {
         let mut data = record(b"notes.txt", 0o100644, 1234);
         data.extend(record(b"photos", MODE_DIR | 0o755, 0));
         let mut entries = Vec::new();
-        records(&data, 2, &mut entries).unwrap();
+        records(&data, 2, &mut entries, false).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "notes.txt");
         assert!(!entries[0].is_dir);
@@ -259,30 +324,85 @@ mod tests {
     fn a_name_that_leads_out_of_the_directory_is_refused() {
         for name in [&b".."[..], b".", b"", b"a/b", b"a\0b", b"\xff\xfe"] {
             let data = record(name, 0o100644, 1);
-            assert!(records(&data, 1, &mut Vec::new()).is_none(), "{:?}", name);
+            assert!(
+                records(&data, 1, &mut Vec::new(), false).is_none(),
+                "{:?}",
+                name
+            );
         }
     }
 
     #[test]
     fn a_size_no_file_has_is_refused() {
         let data = record(b"file", 0o100644, MAX_FILE);
-        assert!(records(&data, 1, &mut Vec::new()).is_some());
+        assert!(records(&data, 1, &mut Vec::new(), false).is_some());
         let data = record(b"file", 0o100644, MAX_FILE + 1);
-        assert!(records(&data, 1, &mut Vec::new()).is_none());
+        assert!(records(&data, 1, &mut Vec::new(), false).is_none());
         let data = record(b"file", 0o100644, u64::MAX);
-        assert!(records(&data, 1, &mut Vec::new()).is_none());
+        assert!(records(&data, 1, &mut Vec::new(), false).is_none());
     }
 
     #[test]
     fn a_record_that_runs_past_the_data_is_refused() {
         let data = record(b"file", 0o100644, 1);
         // More records than there are.
-        assert!(records(&data, 2, &mut Vec::new()).is_none());
+        assert!(records(&data, 2, &mut Vec::new(), false).is_none());
         // A record cut short.
-        assert!(records(&data[..data.len() - 8], 1, &mut Vec::new()).is_none());
+        assert!(records(&data[..data.len() - 8], 1, &mut Vec::new(), false).is_none());
         // A length that does not hold the name.
         let mut short = data.clone();
         short[0..2].copy_from_slice(&40u16.to_ne_bytes());
-        assert!(records(&short, 1, &mut Vec::new()).is_none());
+        assert!(records(&short, 1, &mut Vec::new(), false).is_none());
+    }
+
+    fn posix_record(name: &[u8], mode: u32, uid: u32, gid: u32, nlink: u32) -> Vec<u8> {
+        let rec_len = (RECORD_HEAD_POSIX + name.len()).next_multiple_of(8);
+        let mut r = vec![0u8; rec_len];
+        r[0..2].copy_from_slice(&(rec_len as u16).to_ne_bytes());
+        r[2..4].copy_from_slice(&(name.len() as u16).to_ne_bytes());
+        r[4..8].copy_from_slice(&mode.to_ne_bytes());
+        r[8..16].copy_from_slice(&11u64.to_ne_bytes());
+        r[40..44].copy_from_slice(&uid.to_ne_bytes());
+        r[44..48].copy_from_slice(&gid.to_ne_bytes());
+        r[48..52].copy_from_slice(&nlink.to_ne_bytes());
+        r[56..64].copy_from_slice(&0x0801u64.to_ne_bytes());
+        r[RECORD_HEAD_POSIX..RECORD_HEAD_POSIX + name.len()].copy_from_slice(name);
+        r
+    }
+
+    #[test]
+    fn a_posix_record_carries_the_owner_the_links_and_the_kind() {
+        let mut data = posix_record(b"link", MODE_LINK | 0o777, 1000, 100, 1);
+        data.extend(posix_record(b"bin", MODE_DIR | 0o750, 0, 0, 3));
+        let mut entries = Vec::new();
+        records(&data, 2, &mut entries, true).unwrap();
+        let link = &entries[0];
+        assert_eq!(link.name, "link");
+        assert_eq!(
+            (link.mode, link.uid, link.gid, link.nlink, link.rdev),
+            (MODE_LINK | 0o777, 1000, 100, 1, 0x0801)
+        );
+        assert!(!link.is_dir);
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[1].nlink, 3);
+    }
+
+    #[test]
+    fn a_short_record_is_refused_on_a_posix_mount_and_a_mode_of_no_kind_too() {
+        // The record a FAT server sends is shorter than a POSIX one.
+        let data = record(b"file", 0o100644, 1);
+        assert!(records(&data, 1, &mut Vec::new(), true).is_none());
+        let data = posix_record(b"file", 0o644, 0, 0, 1);
+        assert!(records(&data, 1, &mut Vec::new(), true).is_none());
+    }
+
+    #[test]
+    fn a_server_that_is_not_posix_says_file_or_directory_and_nothing_more() {
+        let mut data = record(b"notes.txt", 0o104777, 1);
+        data.extend(record(b"photos", MODE_DIR | 0o700, 0));
+        let mut entries = Vec::new();
+        records(&data, 2, &mut entries, false).unwrap();
+        assert_eq!((entries[0].mode, entries[0].nlink), (MODE_FILE | 0o644, 1));
+        assert_eq!((entries[1].mode, entries[1].nlink), (MODE_DIR | 0o755, 2));
     }
 }

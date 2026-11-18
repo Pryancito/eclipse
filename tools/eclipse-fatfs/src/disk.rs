@@ -146,17 +146,26 @@ struct Head {
     word: u64,
     /// The sectors in the journal: those the group being made has
     /// written, as they were before it. 0 when no group is being made.
+    /// With [`WORD_HELD`] the group changed the word too, which was
+    /// `word_before`.
     journal: u64,
+    /// The word before the group being made changed it.
+    word_before: u64,
 }
 
-/// "eclfatk2": the layout below.
-const MAGIC: u64 = 0x326b_7461_666c_6365;
+/// [`Head::journal`]'s bit for a group that changed the word.
+const WORD_HELD: u64 = 1 << 63;
 
-/// The sectors of a group the journal has room for: 128 KiB, which is a
-/// directory's new cluster of the largest size and the entries and table
-/// sectors around it. A group that writes more is, from there on, written
-/// as it would be without one.
-pub const GROUP_MAX: usize = 256;
+/// "eclfatk3": the layout below.
+const MAGIC: u64 = 0x336b_7461_666c_6365;
+
+/// The sectors of a group the journal has room for: 512 KiB. A FAT group is
+/// a directory's new cluster of the largest size and the entries and table
+/// sectors around it, 128 KiB; the btrfs server's (`tools/eclipse-btrfs`)
+/// is the tree blocks one change wrote and the superblock's copies, 16 KiB
+/// each, which a change of a large directory makes a dozen or more. A group
+/// that writes more is, from there on, written as it would be without one.
+pub const GROUP_MAX: usize = 1024;
 
 /// What is known of the chunk in each place of [`Kept`].
 #[repr(C)]
@@ -181,7 +190,7 @@ const _: () = assert!(METAS_AT + CHUNKS_KEPT * core::mem::size_of::<Meta>() <= B
 /// The journal, after the chunks: which sector each of its places is of,
 /// then the places' bytes.
 const JOURNAL_AT: usize = BYTES_AT + CHUNKS_KEPT * CHUNK;
-const JOURNAL_BYTES_AT: usize = JOURNAL_AT + 4096;
+const JOURNAL_BYTES_AT: usize = JOURNAL_AT + (GROUP_MAX * 8).next_multiple_of(4096);
 const _: () = assert!(GROUP_MAX * 8 <= JOURNAL_BYTES_AT - JOURNAL_AT);
 
 /// The memory the chunks are kept in: a [`Head`], a [`Meta`] for each
@@ -265,13 +274,24 @@ impl Kept {
     /// Say how many sectors of the journal stand: the one store a sector
     /// is in it by, or the group is done with, so it is made where it is
     /// written and not moved before what it follows.
+    /// The journal holds `sectors`, and still says whether the group
+    /// changed the word.
     fn set_journaled(&mut self, sectors: usize) {
+        let held = self.head().journal & WORD_HELD;
+        self.set_journal_word(sectors as u64 | held);
+    }
+
+    /// The journal holds nothing, the word's change included: the group is
+    /// made, in one store.
+    fn clear_journal(&mut self) {
+        self.set_journal_word(0);
+    }
+
+    fn set_journal_word(&mut self, word: u64) {
         use core::sync::atomic::{compiler_fence, Ordering};
         compiler_fence(Ordering::SeqCst);
         // SAFETY: the head's own field.
-        unsafe {
-            core::ptr::write_volatile(&raw mut (*self.base.cast::<Head>()).journal, sectors as u64)
-        };
+        unsafe { core::ptr::write_volatile(&raw mut (*self.base.cast::<Head>()).journal, word) };
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -388,6 +408,7 @@ impl<B: Blocks> Disk<B> {
             }
             kept.head().device_len = len;
             kept.head().word = 0;
+            kept.head().word_before = 0;
             kept.head().journal = 0;
             // Last: until it is there the memory is new.
             kept.head().magic = MAGIC;
@@ -410,7 +431,8 @@ impl<B: Blocks> Disk<B> {
         };
         // A group the last `Disk` was making: its sectors go back to what
         // they were, which changes nothing where it was done before.
-        let journaled = disk.kept.head().journal as usize;
+        let journal = disk.kept.head().journal;
+        let journaled = (journal & !WORD_HELD) as usize;
         if journaled > GROUP_MAX {
             return None;
         }
@@ -421,7 +443,11 @@ impl<B: Blocks> Disk<B> {
             let n = SECTOR.min((len - at) as usize);
             disk.write_base(at, &bytes[..n]).ok()?;
         }
-        disk.kept.set_journaled(0);
+        if journal & WORD_HELD != 0 {
+            let before = disk.kept.head().word_before;
+            disk.kept.head().word = before;
+        }
+        disk.kept.clear_journal();
         Some(disk)
     }
 
@@ -447,8 +473,10 @@ impl<B: Blocks> Disk<B> {
 
     /// The group is made: nothing is left to take it back with.
     pub fn commit(&mut self) {
-        if self.group.take().is_some_and(|group| !group.is_empty()) && self.alive() {
-            self.kept.set_journaled(0);
+        let changed = self.group.take().is_some_and(|group| !group.is_empty())
+            || self.kept.head().journal & WORD_HELD != 0;
+        if changed && self.alive() {
+            self.kept.clear_journal();
         }
     }
 
@@ -469,7 +497,7 @@ impl<B: Blocks> Disk<B> {
                 // here, as without one, and what it wrote stays.
                 self.group = None;
                 if self.alive() {
-                    self.kept.set_journaled(0);
+                    self.kept.clear_journal();
                 }
                 return Ok(());
             }
@@ -503,6 +531,19 @@ impl<B: Blocks> Disk<B> {
     }
 
     pub fn set_word(&mut self, word: u64) {
+        self.kept.head().word = word;
+    }
+
+    /// Set the word as part of the group being made: a server that dies
+    /// before [`commit`](Self::commit) leaves the word it was, with the
+    /// sectors. Outside a group, the same as [`set_word`](Self::set_word).
+    pub fn set_word_in_group(&mut self, word: u64) {
+        if self.group.is_some() && self.kept.head().journal & WORD_HELD == 0 {
+            let before = self.kept.head().word;
+            self.kept.head().word_before = before;
+            let journal = self.kept.head().journal;
+            self.kept.set_journal_word(journal | WORD_HELD);
+        }
         self.kept.head().word = word;
     }
 
@@ -1284,8 +1325,44 @@ mod tests {
     }
 
     #[test]
-    fn a_group_longer_than_the_journal_is_written_and_stays() {
+    fn the_word_set_in_a_group_is_taken_back_with_it_and_kept_when_it_is_made() {
         let dev = device(8 * CHUNK);
+        let len = dev.len() as u64;
+        let mut mem = memory();
+        let base = mem.as_mut_ptr().cast::<u8>();
+        // SAFETY: the test's own memory, one disk over it at a time.
+        let mut disk = Disk::over(dev.clone(), len, unsafe { Kept::at(base) }).unwrap();
+        disk.set_word(7);
+        // A group that changed the word and no sector, and died.
+        disk.begin();
+        disk.set_word_in_group(8);
+        core::mem::forget(disk);
+        let mut disk = Disk::over(dev.clone(), len, unsafe { Kept::at(base) }).unwrap();
+        assert_eq!(disk.word(), 7);
+        // One that changed both, and died.
+        disk.begin();
+        disk.write_all_at(100, b"changed").unwrap();
+        disk.set_word_in_group(9);
+        let left = disk.blocks().clone();
+        core::mem::forget(disk);
+        let mut disk = Disk::over(left, len, unsafe { Kept::at(base) }).unwrap();
+        assert_eq!(disk.word(), 7);
+        assert_eq!(read_all(&mut disk, 100, 7), dev[100..107].to_vec());
+        // And one that was made.
+        disk.begin();
+        disk.write_all_at(100, b"changed").unwrap();
+        disk.set_word_in_group(10);
+        disk.commit();
+        let left = disk.blocks().clone();
+        core::mem::forget(disk);
+        let mut disk = Disk::over(left, len, unsafe { Kept::at(base) }).unwrap();
+        assert_eq!(disk.word(), 10);
+        assert_eq!(read_all(&mut disk, 100, 7), b"changed".to_vec());
+    }
+
+    #[test]
+    fn a_group_longer_than_the_journal_is_written_and_stays() {
+        let dev = device(GROUP_MAX * SECTOR + 4 * CHUNK);
         let len = dev.len() as u64;
         let mut mem = memory();
         let base = mem.as_mut_ptr().cast::<u8>();

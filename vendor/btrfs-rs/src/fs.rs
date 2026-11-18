@@ -67,6 +67,10 @@ pub struct Btrfs {
     read_only: bool,
     sb_dirty: bool,
     deferred_sb_commits: u32,
+    /// The changes a superblock commit is put off for:
+    /// [`SUPERBLOCK_COMMIT_INTERVAL`] unless [`Btrfs::set_commit_interval`]
+    /// said otherwise.
+    commit_interval: u32,
     clock: Option<fn() -> (u64, u32)>,
     /// Read-side cache of recently read files: inode plus the extent list
     /// looked up so far, in LRU order (most recently used last). Sequential
@@ -182,6 +186,7 @@ impl Btrfs {
             read_only,
             sb_dirty: false,
             deferred_sb_commits: 0,
+            commit_interval: SUPERBLOCK_COMMIT_INTERVAL,
             read_cache: Vec::new(),
             decompressed: None,
             clock: None,
@@ -194,6 +199,22 @@ impl Btrfs {
     }
 
     /// Provide a wall-clock source for timestamps (secs, nanos).
+    /// How many changes the tree blocks they dirtied and the superblock wait
+    /// for before they are written: 32 by default. `u32::MAX` writes them
+    /// only at [`sync`](Self::sync), which is what a caller that keeps its
+    /// own record of the changes since the last one wants: nothing reaches
+    /// the device's metadata between two of its syncs.
+    pub fn set_commit_interval(&mut self, changes: u32) {
+        self.commit_interval = changes;
+    }
+
+    /// What the first change of a mount does before it changes anything
+    /// (`invalidate_free_space_tree`), done now: so that the caller can have
+    /// it written when it chooses.
+    pub fn prepare_writes(&mut self) -> Result<()> {
+        self.begin_write()
+    }
+
     pub fn set_clock(&mut self, clock: fn() -> (u64, u32)) {
         self.clock = Some(clock);
     }
@@ -545,7 +566,7 @@ impl Btrfs {
             self.alloc.dev_used_delta = 0;
             self.sb_dirty = true;
         }
-        if force_sb || (self.sb_dirty && self.deferred_sb_commits >= SUPERBLOCK_COMMIT_INTERVAL) {
+        if force_sb || (self.sb_dirty && self.deferred_sb_commits >= self.commit_interval) {
             // Write-back invariant: every dirty tree block must reach the device
             // before the superblock that references it, otherwise a crash would
             // leave the SB pointing at unwritten blocks.

@@ -57,6 +57,11 @@ pub const OP_TRUNCATE: u32 = 8;
 pub const OP_SYNC: u32 = 9;
 /// The file at the path was last written at `a`, seconds as an `i64`.
 pub const OP_SETTIME: u32 = 10;
+/// On a [`SERVE_POSIX`] mount: the file at the path belongs to the user
+/// `a >> 32` and the group `a & 0xffff_ffff`, with the permissions `b`.
+pub const OP_SETATTR: u32 = 11;
+/// On a [`SERVE_POSIX`] mount: the record of the file at the path itself.
+pub const OP_STAT: u32 = 12;
 
 /// [`OP_CREATE`]'s `a` for a directory: `S_IFDIR`.
 pub const CREATE_DIR: u64 = 0o040000;
@@ -81,6 +86,10 @@ pub const SERVE_READ_ONLY: usize = 2;
 /// `eclipse_fs_serve` flag: take over a mount whose server is gone, and
 /// make none.
 pub const SERVE_TAKE_OVER: usize = 4;
+/// `eclipse_fs_serve` flag: the filesystem has owners, permissions and
+/// symbolic links, and its records say so: the longer records of the
+/// kernel's `wire::RECORD_HEAD_POSIX`, which a server of its own writes.
+pub const SERVE_POSIX: usize = 8;
 
 /// One entry of a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]

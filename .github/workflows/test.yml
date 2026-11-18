@@ -455,6 +455,14 @@ jobs:
           # message and of a listing's records is the one the kernel reads
           # (`linux-object/src/fs/served/wire.rs`).
           cargo test --manifest-path tools/eclipse-fatfs/Cargo.toml
+          # eclipse-btrfs, the btrfs filesystem that runs as a process, on
+          # the FAT server's library and the tree's btrfs code. The tests
+          # make a volume with that code's own mkfs and serve it as the
+          # kernel asks -- owners, permissions, symbolic links -- and serve
+          # it again from a server that died: at every write of a change,
+          # the next server finds the volume as it was before the change or
+          # after it, never between.
+          cargo test --manifest-path tools/eclipse-btrfs/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the

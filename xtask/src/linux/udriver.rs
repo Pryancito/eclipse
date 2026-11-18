@@ -90,6 +90,17 @@ const UBLK_DISKS: usize = 4;
 /// The same for NVMe controllers (`unvme`, `unvme2`).
 const UNVME_DISKS: usize = 2;
 
+/// The btrfs filesystem that runs as a process: `eclipse-btrfs DEVICE DIR`
+/// mounts a btrfs volume it serves. It is built from the FAT server's
+/// library (the wire and the kept disk) and the tree's btrfs code.
+const BTRFS_PACKAGE: &str = "eclipse-btrfs";
+const BTRFS: [&str; 1] = ["eclipse-btrfs"];
+const BTRFS_USES: [&str; 3] = [
+    "tools/eclipse-udrivers/src",
+    "tools/eclipse-fatfs/src",
+    "vendor/btrfs-rs/src",
+];
+
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk; and
 /// `fat-mounts`, which mounts fstab's FAT volumes with a server each.
@@ -497,6 +508,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(FATFS_PACKAGE, &FATFS, &FATFS_USES);
         for name in FATFS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(BTRFS_PACKAGE, &BTRFS, &BTRFS_USES);
+        for name in BTRFS {
             put(&built.join(name), name);
         }
     }
