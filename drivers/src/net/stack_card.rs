@@ -11,9 +11,11 @@
 //! stack said of them last ([`StackCard::set`]): none before its lease, the
 //! lease's after, another when it changes. To set them from here (`ip addr`,
 //! `ip route`, `ifconfig`) is to ask the stack, through the same [`Wire`] a
-//! frame goes by ([`Wire::configure`]): one IPv4 address, and the gateway
-//! for what is not on its network. It is made when the stack says what its
-//! card is and taken away when the stack is gone.
+//! frame goes by ([`Wire::configure`]): its first IPv4 address and the
+//! gateway for what is not on its network, and then other addresses, of
+//! IPv4 and of IPv6, and routes to one network or another ([`More`]). It
+//! is made when the stack says what its card is and taken away when the
+//! stack is gone.
 //!
 //! A frame sent on it goes to the stack, which has the card and puts it on
 //! the wire ([`Wire`]). It used to be refused, always and with
@@ -146,6 +148,78 @@ impl Sixes {
     }
 }
 
+impl Sixes {
+    /// Make of what was said what `change` makes of it: how the card is
+    /// shown between asking the stack for something and its saying so.
+    pub fn change(&self, change: impl FnOnce(&mut Vec<Ipv6Cidr>, &mut Option<Ipv6Address>)) {
+        let mut said = self.said.lock();
+        let (addresses, router) = &mut *said;
+        change(addresses, router);
+    }
+}
+
+/// What a card has besides its first address of IPv4 and its gateway,
+/// kept by whoever is told: its other addresses of IPv4, and its routes
+/// to less than everything, each a network and the router it goes
+/// through. Nothing, until the stack says, and once it is gone.
+#[derive(Default)]
+pub struct More {
+    #[allow(clippy::type_complexity)]
+    said: Mutex<(Vec<Ipv4Cidr>, Vec<(IpCidr, IpAddress)>)>,
+}
+
+impl More {
+    /// The card has `addresses` after its first, and these `routes`.
+    pub fn say(&self, addresses: Vec<Ipv4Cidr>, routes: Vec<(IpCidr, IpAddress)>) {
+        *self.said.lock() = (addresses, routes);
+    }
+
+    /// The stack that said them is gone.
+    pub fn forget(&self) {
+        self.say(Vec::new(), Vec::new());
+    }
+
+    /// The addresses, in the order they were said.
+    pub fn addresses(&self) -> Vec<Ipv4Cidr> {
+        self.said.lock().0.clone()
+    }
+
+    /// The routes, in the order they were said.
+    pub fn routes(&self) -> Vec<(IpCidr, IpAddress)> {
+        self.said.lock().1.clone()
+    }
+
+    /// Whether `address` is one of the card's.
+    pub fn has(&self, address: &Ipv4Address) -> bool {
+        let said = self.said.lock();
+        said.0.iter().any(|ours| ours.address() == *address)
+    }
+
+    /// Whether one of the routes is the way to `address`.
+    pub fn has_way(&self, address: &IpAddress) -> bool {
+        let said = self.said.lock();
+        said.1.iter().any(|(to, _)| to.contains_addr(address))
+    }
+
+    /// Make of what was said what `change` makes of it: how the card is
+    /// shown between asking the stack for something and its saying so.
+    pub fn change(&self, change: impl FnOnce(&mut Vec<Ipv4Cidr>, &mut Vec<(IpCidr, IpAddress)>)) {
+        let mut said = self.said.lock();
+        let (addresses, routes) = &mut *said;
+        change(addresses, routes);
+    }
+}
+
+/// `cidr` with nothing past its prefix: the network it names.
+pub fn network(cidr: IpCidr) -> IpCidr {
+    match cidr {
+        IpCidr::Ipv4(cidr) => IpCidr::Ipv4(cidr.network()),
+        IpCidr::Ipv6(cidr) => IpCidr::Ipv6(cidr.network()),
+        #[allow(unreachable_patterns)]
+        other => other,
+    }
+}
+
 /// Where a frame sent on a stack's card goes: to the stack, which has the
 /// card and puts it on the wire.
 ///
@@ -174,6 +248,12 @@ pub enum Change {
     Address(Option<Ipv4Cidr>),
     /// This gateway for what is not on the card's network, or none.
     Gateway(Option<Ipv4Address>),
+    /// This address too (`true`), or no more: its first, when it has
+    /// none of IPv4 or the first is the one to go.
+    Also(IpCidr, bool),
+    /// What is for this network through this router (`true`), or no
+    /// more, and then the router may go unsaid.
+    Route(IpCidr, Option<IpAddress>, bool),
 }
 
 /// The interface that shows the card of a stack that runs somewhere else.
@@ -188,6 +268,8 @@ pub struct StackCard {
     carried: Arc<Carried>,
     /// What the stack says the card has of IPv6.
     sixes: Arc<Sixes>,
+    /// What the stack says the card has of other addresses and routes.
+    more: Arc<More>,
     /// Where a frame sent on the card goes, when anyone has said.
     wire: Option<Arc<dyn Wire>>,
 }
@@ -212,6 +294,7 @@ impl StackCard {
             said: Mutex::new((address, gateway.map(Ipv4Address))),
             carried: Arc::new(Carried::default()),
             sixes: Arc::new(Sixes::default()),
+            more: Arc::new(More::default()),
             wire: None,
         }
     }
@@ -261,6 +344,42 @@ impl StackCard {
     pub fn with_sixes(mut self, sixes: Arc<Sixes>) -> Self {
         self.sixes = sixes;
         self
+    }
+
+    /// The same card, with its other addresses and its routes read from
+    /// `more`: where whoever hears the stack keeps what it says of them.
+    /// Without it the card has none.
+    pub fn with_more(mut self, more: Arc<More>) -> Self {
+        self.more = more;
+        self
+    }
+
+    /// The card's own address on its link: `fe80::` and the MAC, which
+    /// the stack speaks to its neighbours from and nobody takes away.
+    fn link_local(&self) -> Ipv6Address {
+        let m = self.mac.0;
+        let mut bytes = [0u8; 16];
+        bytes[..2].copy_from_slice(&[0xfe, 0x80]);
+        bytes[8..].copy_from_slice(&[m[0] ^ 2, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]);
+        Ipv6Address(bytes)
+    }
+
+    /// Whether the card has `address`.
+    fn has(&self, address: &IpAddress) -> bool {
+        self.get_ip_address()
+            .iter()
+            .any(|ours| ours.address() == *address)
+    }
+
+    /// Whether `router` is a machine to send through: on a network of
+    /// one of the card's addresses, and not the card.
+    fn near(&self, router: &IpAddress) -> bool {
+        let ours = self.get_ip_address();
+        router.is_unicast()
+            && !ours.iter().any(|ours| ours.address() == *router)
+            && ours
+                .iter()
+                .any(|ours| ours.prefix_len() > 0 && ours.contains_addr(router))
     }
 
     /// The card as a stack says it in three numbers, or `None` when they
@@ -346,12 +465,13 @@ impl NetScheme for StackCard {
 
     fn get_ip_address(&self) -> Vec<IpCidr> {
         let mut addrs: Vec<IpCidr> = self.said.lock().0.map(IpCidr::Ipv4).into_iter().collect();
+        addrs.extend(self.more.addresses().into_iter().map(IpCidr::Ipv4));
         addrs.extend(self.sixes.addresses().into_iter().map(IpCidr::Ipv6));
         addrs
     }
 
-    /// The card's one address of IPv4 is `cidr` from now on: asked of
-    /// the stack, which says it back when it is.
+    /// The card's first address of IPv4 is `cidr` from now on: asked of
+    /// the stack, which says it back when it is. Its others stay.
     fn set_ipv4_address(&self, cidr: Ipv4Cidr) -> DeviceResult {
         // 0.0.0.0 is no address: how `ifconfig` and a DHCP client's
         // script take the one there is away.
@@ -364,64 +484,95 @@ impl NetScheme for StackCard {
         if cidr.prefix_len() == 0 || !cidr.address().is_unicast() {
             return Err(DeviceError::InvalidParam);
         }
+        // The one it has, or one of its others, is its already: what
+        // `ip addr add` does after adding it, to an interface that has
+        // one address.
+        if self.said.lock().0 == Some(cidr) || self.more.has(&cidr.address()) {
+            return Ok(());
+        }
         self.ask(Change::Address(Some(cidr)))
     }
 
-    /// A card of the stack's has one address of IPv4: adding one is
-    /// setting it. Its IPv6 addresses are its router's to give.
+    /// One address more: the first of IPv4 for a card that has none, as
+    /// if it had been set, and one of its others for a card that has.
+    /// One it has already is nothing to ask for.
     fn add_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        match cidr {
-            IpCidr::Ipv4(cidr) => self.set_ipv4_address(cidr),
-            _ => Err(DeviceError::NotSupported),
+        let address = cidr.address();
+        if cidr.prefix_len() == 0 || !address.is_unicast() || address.is_loopback() {
+            return Err(DeviceError::InvalidParam);
         }
-    }
-
-    /// Take the card's address away, when `cidr` is it.
-    fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
-        let has = self.said.lock().0;
+        if self.has(&address) {
+            return Ok(());
+        }
         match cidr {
-            IpCidr::Ipv4(cidr) if has.is_some_and(|has| has.address() == cidr.address()) => {
-                self.ask(Change::Address(None))
+            IpCidr::Ipv4(cidr) if self.said.lock().0.is_none() => {
+                self.ask(Change::Address(Some(cidr)))
             }
-            IpCidr::Ipv4(_) => Err(DeviceError::InvalidParam),
-            _ => Err(DeviceError::NotSupported),
+            _ => self.ask(Change::Also(cidr, true)),
         }
     }
 
-    /// The default route of IPv4 is the stack's gateway; it has no
-    /// other route to add.
+    /// Take one of the card's addresses away: any but its own on the
+    /// link.
+    fn remove_ip_address(&self, cidr: IpCidr) -> DeviceResult {
+        let address = cidr.address();
+        if !self.has(&address) {
+            return Err(DeviceError::InvalidParam);
+        }
+        if address == IpAddress::Ipv6(self.link_local()) {
+            return Err(DeviceError::NotSupported);
+        }
+        self.ask(Change::Also(cidr, false))
+    }
+
+    /// What is for `cidr` goes through `gateway`, a machine of a network
+    /// of the card's: the gateway when `cidr` is everything, a route of
+    /// its own when it is a network. A route with no router is the
+    /// card's network, which an address gives.
     fn add_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
+        let Some(gateway) = gateway else {
+            return Err(DeviceError::NotSupported);
+        };
+        let same = matches!(
+            (&cidr, &gateway),
+            (IpCidr::Ipv4(_), IpAddress::Ipv4(_)) | (IpCidr::Ipv6(_), IpAddress::Ipv6(_))
+        );
+        if !same || !self.near(&gateway) {
+            return Err(DeviceError::InvalidParam);
+        }
         match (cidr, gateway) {
-            (IpCidr::Ipv4(cidr), Some(IpAddress::Ipv4(gateway))) if cidr.prefix_len() == 0 => {
-                // A gateway is a machine of the card's network.
-                let near = self.said.lock().0.is_some_and(|address| {
-                    address.contains_addr(&gateway) && address.address() != gateway
-                });
-                if !near {
-                    return Err(DeviceError::InvalidParam);
-                }
+            (IpCidr::Ipv4(cidr), IpAddress::Ipv4(gateway)) if cidr.prefix_len() == 0 => {
                 self.ask(Change::Gateway(Some(gateway)))
             }
-            _ => Err(DeviceError::NotSupported),
+            _ => self.ask(Change::Route(network(cidr), Some(gateway), true)),
         }
     }
 
     fn del_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
-        let has = self.said.lock().1;
-        match (cidr, gateway) {
-            (IpCidr::Ipv4(cidr), gateway) if cidr.prefix_len() == 0 => match gateway {
-                Some(IpAddress::Ipv4(gateway)) if has != Some(gateway) => {
-                    Err(DeviceError::InvalidParam)
-                }
-                Some(IpAddress::Ipv4(_)) | None if has.is_some() => self.ask(Change::Gateway(None)),
-                _ => Err(DeviceError::InvalidParam),
+        let cidr = network(cidr);
+        let through = match cidr {
+            IpCidr::Ipv4(_) if cidr.prefix_len() == 0 => self.said.lock().1.map(IpAddress::Ipv4),
+            IpCidr::Ipv6(_) if cidr.prefix_len() == 0 => self.sixes.router().map(IpAddress::Ipv6),
+            _ => {
+                let routes = self.more.routes();
+                let mut to = routes.iter().filter(|(to, _)| *to == cidr);
+                to.find(|(_, through)| gateway.is_none_or(|gateway| gateway == *through))
+                    .map(|(_, through)| *through)
+            }
+        };
+        // Only a route there is, through the router it is said with.
+        match through {
+            Some(through) if gateway.is_none_or(|gateway| gateway == through) => match cidr {
+                IpCidr::Ipv4(_) if cidr.prefix_len() == 0 => self.ask(Change::Gateway(None)),
+                _ => self.ask(Change::Route(cidr, gateway, false)),
             },
-            _ => Err(DeviceError::NotSupported),
+            _ => Err(DeviceError::InvalidParam),
         }
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
-        // The default route, when the stack has a gateway.
+        // The default route, when the stack has a gateway; the routes
+        // to a network; and the router of IPv6.
         let (address, gateway) = *self.said.lock();
         let mut routes: Vec<RouteInfo> = gateway
             .filter(|_| address.is_some())
@@ -431,11 +582,28 @@ impl NetScheme for StackCard {
             })
             .into_iter()
             .collect();
+        routes.extend(
+            self.more
+                .routes()
+                .into_iter()
+                .map(|(dst, gateway)| RouteInfo {
+                    dst,
+                    gateway: Some(gateway),
+                }),
+        );
         routes.extend(self.sixes.router().map(|router| RouteInfo {
             dst: IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0),
             gateway: Some(IpAddress::Ipv6(router)),
         }));
-        ip_cfg::reported_routes(&routes, &self.get_ip_address())
+        // Two addresses of one network are one network to show.
+        let mut shown: Vec<RouteInfo> = Vec::new();
+        for route in ip_cfg::reported_routes(&routes, &self.get_ip_address()) {
+            let said = |have: &RouteInfo| have.dst == route.dst && have.gateway == route.gateway;
+            if !shown.iter().any(said) {
+                shown.push(route);
+            }
+        }
+        shown
     }
 
     fn get_stats(&self) -> NetStats {
@@ -510,10 +678,11 @@ mod tests {
             wire.0.lock().as_slice(),
             &[
                 (2, Change::Address(Some(other))),
-                (2, Change::Address(Some(other))),
+                // A card that has one is asked for another.
+                (2, Change::Also(IpCidr::Ipv4(other), true)),
                 (2, Change::Gateway(Some(near))),
                 (2, Change::Gateway(None)),
-                (2, Change::Address(None)),
+                (2, Change::Also(own, false)),
             ]
         );
         // 0.0.0.0 takes the address away, too, and is nothing to ask of
@@ -537,13 +706,128 @@ mod tests {
         let group = Ipv4Cidr::new(Ipv4Address([224, 0, 0, 1]), 24);
         assert_eq!(c.set_ipv4_address(group), Err(DeviceError::InvalidParam));
         let six = IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 128);
-        assert_eq!(c.add_ip_address(six), Err(DeviceError::NotSupported));
-        let net = IpCidr::new(IpAddress::v4(10, 9, 0, 0), 16);
+        assert_eq!(c.add_ip_address(six), Err(DeviceError::InvalidParam));
+        assert_eq!(c.del_route(default, None), Err(DeviceError::InvalidParam));
+    }
+
+    #[test]
+    fn other_addresses_and_routes_are_asked_of_the_stack_and_shown_as_it_says() {
+        let wire = Arc::new(Asked::default());
+        let (sixes, more) = (Arc::new(Sixes::default()), Arc::new(More::default()));
+        let c = card(Some([10, 0, 9, 1]))
+            .through(wire.clone())
+            .with_sixes(sixes.clone())
+            .with_more(more.clone());
+        let asked = || core::mem::take(&mut *wire.0.lock());
+        let own = IpCidr::new(IpAddress::v4(10, 0, 9, 15), 24);
+        let other = Ipv4Cidr::new(Ipv4Address([192, 168, 7, 9]), 24);
+        let link = Ipv6Cidr::new(c.link_local(), 64);
         assert_eq!(
-            c.add_route(net, Some(IpAddress::Ipv4(router))),
+            link.address(),
+            Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 7)
+        );
+        sixes.say(vec![link], None);
+
+        // One it has is nothing to ask for; another is, and so is one
+        // of IPv6.
+        assert_eq!(c.add_ip_address(own), Ok(()));
+        assert_eq!(c.add_ip_address(IpCidr::Ipv4(other)), Ok(()));
+        let six = IpCidr::new(IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5), 64);
+        assert_eq!(c.add_ip_address(six), Ok(()));
+        assert_eq!(
+            asked(),
+            [
+                (0, Change::Also(IpCidr::Ipv4(other), true)),
+                (0, Change::Also(six, true))
+            ]
+        );
+        // The stack says so: the card shows its first, the others and
+        // the ones of IPv6, and each one's network.
+        more.say(vec![other], vec![]);
+        let IpCidr::Ipv6(six6) = six else {
+            unreachable!()
+        };
+        sixes.say(vec![link, six6], None);
+        assert_eq!(
+            c.get_ip_address(),
+            [own, IpCidr::Ipv4(other), IpCidr::Ipv6(link), six]
+        );
+        // What `ip addr add` does after adding it changes nothing.
+        assert_eq!(c.set_ipv4_address(other), Ok(()));
+        assert!(asked().is_empty());
+
+        // A route to a network, through a machine of any of the card's
+        // networks; what is past the prefix is not said.
+        let net = IpCidr::new(IpAddress::v4(172, 16, 9, 9), 12);
+        let to = IpCidr::new(IpAddress::v4(172, 16, 0, 0), 12);
+        let through = IpAddress::v4(192, 168, 7, 1);
+        assert_eq!(c.add_route(net, Some(through)), Ok(()));
+        assert_eq!(c.add_route(net, None), Err(DeviceError::NotSupported));
+        for far in [IpAddress::v4(192, 168, 8, 1), other.address().into()] {
+            assert_eq!(c.add_route(net, Some(far)), Err(DeviceError::InvalidParam));
+        }
+        let default6 = IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0);
+        let router = IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        assert_eq!(c.add_route(default6, Some(router)), Ok(()));
+        assert_eq!(
+            c.add_route(default6, Some(through)),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            asked(),
+            [
+                (0, Change::Route(to, Some(through), true)),
+                (0, Change::Route(default6, Some(router), true))
+            ]
+        );
+        more.say(vec![other], vec![(to, through)]);
+        sixes.say(
+            vec![link, six6],
+            Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        );
+        let routes = c.get_routes();
+        let shown = |dst: IpCidr, gateway: Option<IpAddress>| {
+            routes.iter().any(|r| r.dst == dst && r.gateway == gateway)
+        };
+        assert!(shown(to, Some(through)) && shown(default6, Some(router)));
+        assert!(shown(IpCidr::new(IpAddress::v4(192, 168, 7, 0), 24), None));
+        // Another address of a network it is on is no other network.
+        let twin = Ipv4Cidr::new(Ipv4Address([10, 0, 9, 77]), 24);
+        more.say(vec![other, twin], vec![(to, through)]);
+        let on_link = IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24);
+        let twice = c.get_routes();
+        assert_eq!(twice.iter().filter(|r| r.dst == on_link).count(), 1);
+        more.say(vec![other], vec![(to, through)]);
+
+        // Only a route there is goes, through the router it has.
+        assert_eq!(
+            c.del_route(net, Some(IpAddress::v4(192, 168, 7, 2))),
+            Err(DeviceError::InvalidParam)
+        );
+        let none = IpCidr::new(IpAddress::v4(172, 32, 0, 0), 12);
+        assert_eq!(c.del_route(none, None), Err(DeviceError::InvalidParam));
+        assert_eq!(c.del_route(net, None), Ok(()));
+        assert_eq!(c.del_route(default6, Some(router)), Ok(()));
+        // Any address but the link's own.
+        assert_eq!(c.remove_ip_address(IpCidr::Ipv4(other)), Ok(()));
+        assert_eq!(c.remove_ip_address(six), Ok(()));
+        assert_eq!(
+            c.remove_ip_address(IpCidr::Ipv6(link)),
             Err(DeviceError::NotSupported)
         );
-        assert_eq!(c.del_route(default, None), Err(DeviceError::InvalidParam));
+        assert_eq!(
+            asked(),
+            [
+                (0, Change::Route(to, None, false)),
+                (0, Change::Route(default6, Some(router), false)),
+                (0, Change::Also(IpCidr::Ipv4(other), false)),
+                (0, Change::Also(six, false)),
+            ]
+        );
+        // The stack is gone: so is what it said.
+        more.forget();
+        sixes.forget();
+        assert_eq!(c.get_ip_address(), [own]);
     }
 
     impl Wire for Kept {
