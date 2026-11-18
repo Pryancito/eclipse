@@ -1819,8 +1819,8 @@ fn the_minimal_table_has_no_service_the_apk_closure_would_have_to_supply() {
 /// One chime, and it is the end of the boot in every session.
 ///
 /// The row shipped twice, `desktop = labwc` and `desktop = xorg`, and the
-/// desktop image's own default session is `abyss` whenever `ec-abyss`
-/// landed in it (`abyss::session`): init drops every service tagged for
+/// desktop image's default session was `abyss` whenever `ec-abyss`
+/// landed in it (it can still be picked by hand): init drops every service tagged for
 /// another session, so BOTH rows were dropped before the boot began and
 /// the image played nothing. A `desktop =` back on this row, or a second
 /// chime for a third session, is that bug again.

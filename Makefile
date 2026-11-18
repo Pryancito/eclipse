@@ -31,8 +31,8 @@ AUDIO ?= on
 # full desktop in QEMU (X still hangs in its /sys/class/drm platform probe;
 # see the branch history). The kernel cmdline gets `desktop=$(DESKTOP)`, which
 # eclipse-init reads to pick the session. Real hardware images carry no such
-# argument and default to abyss via /etc/eclipse/desktop (Abyss is GL-only and
-# QEMU's virtio GPU is 2D-only, so qemu stays on labwc). Override with
+# argument and also default to labwc via /etc/eclipse/desktop (Abyss is
+# opt-in: `desktop=abyss` or `abyss` in that file). Override with
 # `make qemu DESKTOP=xorg` to work on the X session. The default follows
 # VARIANT, so it is set just below, once VARIANT is known.
 

@@ -19,7 +19,7 @@ igual que hace con el idioma y la zona horaria.
 ```sh
 eclipse-look            # imprime la actual
 eclipse-look tecno      # panel de instrumentos «Orbital HUD» (por defecto en labwc)
-eclipse-look abyss      # cristal negro cálido de Abyss (por defecto en la sesión Abyss)
+eclipse-look abyss      # cristal negro cálido de Abyss (pensado para la sesión Abyss)
 eclipse-look eclipse    # la violeta original
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
@@ -40,8 +40,8 @@ eclipse-look win11      # Windows 11
 cian de instrumentación `#38e1ff`, filete `#1d3550` y el oro `#f2c14e` de la
 media luna de lunarbg para marcar lo que tiene el foco.
 
-`abyss` es el aspecto de la sesión Abyss (el escritorio por defecto cuando la
-imagen trae `ec-abyss`, que entonces se instala con `look=abyss`). Los valores
+`abyss` es el aspecto pensado para la sesión Abyss (opcional; la imagen se
+instala con `look=tecno`, así que se activa con `eclipse-look abyss`). Los valores
 salen de la guía de estilo de Abyss (`desktop/docs/STYLE.md`), sin copiar su
 código: fondo `#0b0906`, tinta blanca (secundaria al 64 %), filetes blancos al
 12 %, esquinas redondeadas (ventana 16, tarjeta 13, celda 10) y el oro
@@ -492,14 +492,12 @@ una, según este orden (gana el primero que aparezca):
    defecto (`desktop=none` con `VARIANT=minimal`). Para la sesión Xorg
    (framebuffer/`fbdev` sobre `/dev/fb0`): `make qemu DESKTOP=xorg`.
 2. **Fichero** `/etc/eclipse/desktop` (primer token): override persistente por
-   instalación que puedes editar. Se instala con el valor `abyss` si la imagen
-   lleva Abyss, y `labwc` si no (ver [La sesión Abyss](#la-sesión-abyss)).
-3. Sin fichero: **labwc**.
+   instalación que puedes editar. Se instala con el valor `labwc`.
+3. Por defecto: **labwc**.
 
 Como el hardware real arranca con la cmdline instalada (sin `desktop=`), cae al
-fichero `/etc/eclipse/desktop` y usa **Abyss**. `make qemu` sigue arrancando
-labwc, salvo que se le pase `DESKTOP=`: la GPU virtio de QEMU es solo 2D y
-Abyss dibuja únicamente con GL. Los
+fichero `/etc/eclipse/desktop` y usa **labwc**; `make qemu` también, salvo que
+se le pase `DESKTOP=`. Los
 servicios de cada sesión llevan una etiqueta `desktop =` en su
 `*.service` (`/etc/eclipse/services/`): `seatd`/`labwc` son `desktop = labwc`,
 `xorg` es `desktop = xorg`, y los servicios sin etiqueta (p. ej. `network`)
@@ -511,19 +509,19 @@ es el instalador: cmdline `desktop=none` y SFS sin escritorio, así que
 `eclipse-init` deja la consola y no lanza el compositor. Tras `install-eclipse`,
 `./scripts/vbox-eclipse.sh --disk-only` arranca labwc desde el VDI instalado.
 
-## La sesión Abyss
+## La sesión Abyss (opcional)
 
 Hay una tercera sesión, **Abyss**: el compositor Wayland en Rust de
 [chasebrowndev/EclipseOS](https://github.com/chasebrowndev/EclipseOS), con su
 barra (`ec-hyperion-bar`), su lanzador (`ec-launcher`) y Ajustes
 (`ec-settings`), con el fondo lunarbg y las apps lunar de siempre. Viene del
 submódulo `desktop/`, que apunta al fork [Pryancito/desktop](https://github.com/Pryancito/desktop).
-**Abyss es la sesión por defecto** y labwc queda como opcional.
+**labwc sigue siendo la sesión por defecto**: Abyss solo arranca si lo eliges.
 
 ```sh
 git submodule update --init desktop   # una vez, para traer el código
-# volver a labwc: desktop=labwc en la cmdline, o de forma persistente:
-echo labwc > /etc/eclipse/desktop
+# arranque: desktop=abyss en la cmdline, o de forma persistente:
+echo abyss > /etc/eclipse/desktop
 ```
 
 - **Compilación**: `cargo xtask image` lo compila en el anfitrión, como
@@ -531,8 +529,7 @@ echo labwc > /etc/eclipse/desktop
   xkbcommon del sistema (`apt-get install libseat-dev libinput-dev libudev-dev
   libgbm-dev libegl-dev libgles-dev libxkbcommon-dev libwayland-dev
   libdrm-dev`). Si falta el submódulo, falta un paquete o la compilación falla,
-  la imagen sale igual, solo con labwc, y entonces labwc es la sesión por
-  defecto. Con anfitrión de otra arquitectura no
+  la imagen sale igual, solo con labwc. Con anfitrión de otra arquitectura no
   se compila.
 - **Servicios** (`desktop = abyss`): `abyss-seatd`, `abyss`
   (`/usr/local/bin/eclipse-abyss`, log en `/tmp/abyss.log`), la barra de Abyss
