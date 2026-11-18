@@ -1634,7 +1634,8 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///                                      command line's `udriver=` names
 ///                                      this device, or one of this kind
 ///                                      when there is no number; the Nth
-///                                      of the kind with `kind/N`)
+///                                      of the kind with `kind/N`; any
+///                                      of several with `a|b`)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
@@ -2763,11 +2764,14 @@ fn device_among<'a>(mut devices: impl Iterator<Item = &'a str>, device: &str) ->
 /// stood back from and that are there, named on the command line or not (the
 /// first virtio network card is left without a word, the kernel having no
 /// driver for it). A kernel with no such file says it with `udriver=` alone.
+///
+/// Several alternatives separated by `|` (`virtio-blk|nvme`): the first
+/// that the list has.
 fn udriver_device<'a>(left: Option<&'a str>, cmdline: &'a str, device: &str) -> Option<&'a str> {
-    match left {
+    device.split('|').find_map(|device| match left {
         Some(left) => device_among(left.lines().map(str::trim), device),
         None => cmdline_udriver_device(cmdline, device),
-    }
+    })
 }
 
 /// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the

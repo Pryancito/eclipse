@@ -317,6 +317,11 @@ fn the_kernels_list_of_what_it_left_is_what_a_driver_waits_for() {
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/3"), None);
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/0"), None);
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/x"), None);
+    // Alternatives: the first that is there.
+    let nvme = "nvme@0\nvirtio-net@0\n";
+    assert_eq!(udriver_device(Some(nvme), nothing, "virtio-blk|nvme"), Some("nvme@0"));
+    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk|nvme"), Some("virtio-blk@1"));
+    assert_eq!(udriver_device(Some("virtio-net@0\n"), nothing, "virtio-blk|nvme"), None);
     // A kernel with no list: what its command line names.
     assert_eq!(udriver_device(None, said, "virtio-net@0"), Some("virtio-net@0"));
     assert_eq!(udriver_device(None, nothing, "virtio-net@0"), None);

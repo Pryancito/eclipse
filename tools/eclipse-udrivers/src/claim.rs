@@ -17,6 +17,9 @@ pub const KIND_VIRTIO_BLK: usize = 1;
 pub const KIND_VIRTIO_NET: usize = 2;
 /// An Intel 82574 network card (QEMU's `e1000e`): see [`crate::e1000e`].
 pub const KIND_E1000E: usize = 3;
+/// An NVMe controller (`udriver=nvme@N`); its transport is a plain PCI
+/// function and the window is BAR 0.
+pub const KIND_NVME: usize = 4;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;

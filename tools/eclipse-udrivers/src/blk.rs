@@ -96,8 +96,61 @@ pub struct Io {
 }
 
 impl Io {
-    fn is_flush(&self) -> bool {
+    /// A flush: no sectors, no data.
+    pub fn is_flush(&self) -> bool {
         self.kind == T_FLUSH
+    }
+
+    /// A read: the device writes the window.
+    pub fn is_read(&self) -> bool {
+        self.kind == T_IN
+    }
+
+    /// The first sector.
+    pub fn sector(&self) -> u64 {
+        self.sector
+    }
+
+    /// Bytes of data.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it moves no data (a flush).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Where the data is, in bytes into the data window.
+    pub fn off(&self) -> usize {
+        self.off
+    }
+}
+
+/// A disk the requests of the kernel can be served from: a virtio one
+/// ([`Disk`]) or an NVMe namespace (`crate::nvme`).
+pub trait Backend {
+    /// Its size, in sectors of [`SECTOR`] bytes.
+    fn capacity(&self) -> u64;
+    /// Whether it has a write cache to flush.
+    fn has_flush(&self) -> bool;
+    /// Put `ios` on the device, all at once, and wait until it has
+    /// answered every one: `done[i]` says whether it did `ios[i]`. An error
+    /// is the device gone, and ends the serving.
+    fn run(&mut self, ios: &[Io], done: &mut [bool]) -> Result<(), Status>;
+}
+
+impl Backend for Disk {
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn has_flush(&self) -> bool {
+        self.has_flush
+    }
+
+    fn run(&mut self, ios: &[Io], done: &mut [bool]) -> Result<(), Status> {
+        Disk::run(self, ios, done)
     }
 }
 
@@ -405,7 +458,7 @@ fn turn(
 
 /// Serve `disk` on `fifo` until the kernel's end goes away (`PEER_CLOSED`)
 /// or the device stops answering. The status that ended it.
-pub fn serve(disk: &mut Disk, fifo: &Fifo<Msg>) -> Status {
+pub fn serve(disk: &mut impl Backend, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); FIFO_DEPTH];
     let mut look = Hybrid::new(true);
     // The replies to the requests of the turn before.
@@ -415,7 +468,7 @@ pub fn serve(disk: &mut Disk, fifo: &Fifo<Msg>) -> Status {
             Ok(got) => got,
             Err(status) => return status,
         };
-        let (capacity, has_flush) = (disk.capacity, disk.has_flush);
+        let (capacity, has_flush) = (disk.capacity(), disk.has_flush());
         let mut failed = None;
         answer(&mut msgs[..got], capacity, has_flush, |ios, done| {
             if failed.is_none() {

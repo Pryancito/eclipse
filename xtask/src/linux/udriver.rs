@@ -58,7 +58,7 @@ const TOOLS: [&str; 2] = ["zx-virtio-net", "zx-virtio-blk"];
 
 /// The Rust drivers' package, under `tools/`, and its binaries.
 const DRIVERS_PACKAGE: &str = "eclipse-udrivers";
-const DRIVERS: [&str; 2] = ["udrv-virtio-blk", "udrv-virtio-net"];
+const DRIVERS: [&str; 3] = ["udrv-virtio-blk", "udrv-virtio-net", "udrv-nvme"];
 
 /// The network stack that runs as a process: its package, under `tools/`,
 /// its binaries -- the stack, and the UDP and TCP echo servers and the TCP
@@ -84,6 +84,8 @@ const FATFS_USES: [&str; 1] = ["tools/eclipse-udrivers/src"];
 /// How many virtio disks get a driver service of their own (`ublk`,
 /// `ublk2`, ...): the ones the kernel leaves beyond these have none.
 const UBLK_DISKS: usize = 4;
+/// The same for NVMe controllers (`unvme`, `unvme2`).
+const UNVME_DISKS: usize = 2;
 
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk; and
@@ -238,6 +240,42 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     )
     .unwrap();
 
+    // The NVMe controllers the boot leaves to userspace (`udriver=nvme@N`):
+    // one service for each of the first two, the Nth of the kernel's list.
+    for nth in 1..=UNVME_DISKS {
+        let (name, which) = match nth {
+            1 => ("unvme".to_string(), "nvme".to_string()),
+            n => (format!("unvme{n}"), format!("nvme/{n}")),
+        };
+        fs::write(
+            svc_dir.join(format!("{name}.service")),
+            format!(
+                "# Driver of NVMe controller number {nth} of those the kernel left\n\
+                 # to userspace (udriver=nvme@N). See /usr/local/bin/eclipse-unvme.\n\
+                 exec = /usr/local/bin/eclipse-unvme {nth}\n\
+                 type = respawn\n\
+                 udriver = {which}\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        localbin.join("eclipse-unvme"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of an NVMe controller the kernel\n\
+          # left alone (udriver=nvme@N), in the foreground for eclipse-init,\n\
+          # which starts it again if it dies. The kernel keeps the disk\n\
+          # meanwhile, with what is mounted on it. See tools/eclipse-udrivers.\n\
+          # Which controller: the Nth nvme@K of /proc/udrivers (N is the\n\
+          # argument, 1 without one).\n\
+          nth=${1:-1}\n\
+          n=$(sed -n 's/^nvme@//p' /proc/udrivers | sed -n \"${nth}p\")\n\
+          [ -n \"$n\" ] || { echo \"eclipse-unvme: the kernel left no NVMe controller number $nth to userspace\" >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-nvme ] || { echo 'eclipse-unvme: /bin/udrv-nvme is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-nvme \"$n\"\n",
+    )
+    .unwrap();
+
     // What `/etc/fstab` puts on that disk. The kernel goes through fstab
     // once, as init starts, and a disk whose driver is a service is not
     // there yet: its lines fail there, and without this nothing mounts
@@ -247,12 +285,13 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     fs::write(
         svc_dir.join("ublk-mounts.service"),
         b"# What /etc/fstab puts on the disks the userspace driver serves\n\
-          # (every virtio disk, unless the boot says ublk=kernel). See\n\
+          # (every virtio disk unless the boot says ublk=kernel, and the NVMe\n\
+          # controllers udriver=nvme@N names). See\n\
           # /usr/local/bin/eclipse-ublk-mounts.\n\
           exec = /usr/local/bin/eclipse-ublk-mounts\n\
           type = oneshot\n\
-          after = ublk ublk2 ublk3 ublk4\n\
-          udriver = virtio-blk\n",
+          after = ublk ublk2 ublk3 ublk4 unvme unvme2\n\
+          udriver = virtio-blk|nvme\n",
     )
     .unwrap();
     fs::write(localbin.join("eclipse-ublk-mounts"), UBLK_MOUNTS).unwrap();
@@ -270,7 +309,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # /usr/local/bin/eclipse-fat-mounts.
           exec = /usr/local/bin/eclipse-fat-mounts
           type = oneshot
-          after = ublk ublk2 ublk3 ublk4
+          after = ublk ublk2 ublk3 ublk4 unvme unvme2
 ",
     )
     .unwrap();
@@ -320,7 +359,7 @@ set +f\n\
 # lines together): the kernel's disks are there before init.\n\
 left=0\n\
 while read -r device; do\n\
-    case \"$device\" in virtio-blk@*) left=50 ;; esac\n\
+    case \"$device\" in virtio-blk@*|nvme@*) left=50 ;; esac\n\
 done < /proc/udrivers\n\
 mounted() {\n\
     while read -r _ place _; do\n\

@@ -528,6 +528,15 @@ ifneq ($(UDISK),)
   endif
 endif
 
+# UNVME=<raw image>: an NVMe disk (QEMU `nvme`, on PCI). The kernel drives
+# it unless `udriver=nvme@N` in KOPTS leaves it to the driver in userspace
+# (`tools/eclipse-udrivers`, `udrv-nvme`). aarch64's kernel probes no PCI
+# bus, so there the disk is not seen at all.
+ifneq ($(UNVME),)
+  qemu_opts += -drive file=$(UNVME),if=none,format=raw,id=unvme
+  qemu_opts += -device nvme,serial=eclipse0,drive=unvme
+endif
+
 # UNET=1: a virtio network card on a user-mode network of its own
 # (10.0.3.0/24, so that it is not the kernel card's 10.0.2.0/24), for a
 # driver in userspace. The kernel has no virtio-net driver, so it leaves

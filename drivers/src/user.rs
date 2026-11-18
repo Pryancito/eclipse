@@ -35,8 +35,11 @@ pub const VIRTIO_NET: &str = "virtio-net";
 /// An Intel 82574 network card (QEMU's `e1000e`), which the kernel drives
 /// itself unless `udriver=e1000e@N` asks for it.
 pub const E1000E: &str = "e1000e";
+/// An NVMe controller, which the kernel drives itself unless
+/// `udriver=nvme@N` asks for it.
+pub const NVME: &str = "nvme";
 /// The kinds that can be reserved.
-const KINDS: [&str; 3] = [VIRTIO_BLK, VIRTIO_NET, E1000E];
+const KINDS: [&str; 4] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME];
 
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,15 @@ const E1000E_TCTL: usize = 0x0400;
 const E1000E_CTRL_RST: u32 = 1 << 26;
 /// How far into its window the registers above go.
 const E1000E_RESET_SPAN: usize = E1000E_TCTL + 4;
+/// An NVMe controller's registers (NVMe 1.4 §3.1): `CC` and `CSTS`, by
+/// byte offset, and the bit of each that enables it and says it is ready.
+const NVME_CC: usize = 0x14;
+const NVME_CSTS: usize = 0x1c;
+const NVME_CC_EN: u32 = 1;
+const NVME_CSTS_RDY: u32 = 1;
+/// How many times `CSTS` is read back after `CC.EN` is cleared. A real
+/// controller may take up to `CAP.TO` half-seconds; QEMU's is done at once.
+const NVME_RESET_READS: usize = 1_000_000;
 
 impl UserDevice {
     /// Take the device. Only one caller gets `true` until it is
@@ -186,6 +198,22 @@ impl UserDevice {
                 unsafe { reg(E1000E_IMC).write_volatile(u32::MAX) };
                 done
             }
+            Transport::Pci if self.kind == NVME => {
+                if self.size < NVME_CSTS + 4 {
+                    return false;
+                }
+                let reg = |off: usize| (vaddr + off) as *mut u32;
+                // SAFETY: as above; both registers are inside the window.
+                // Clearing `CC.EN` is the controller reset (§7.6.2): every
+                // queue is gone and nothing more is read or written of the
+                // memory they named.
+                unsafe {
+                    let cc = reg(NVME_CC).read_volatile();
+                    reg(NVME_CC).write_volatile(cc & !NVME_CC_EN);
+                }
+                (0..NVME_RESET_READS)
+                    .any(|_| unsafe { reg(NVME_CSTS).read_volatile() } & NVME_CSTS_RDY == 0)
+            }
             // A PCI function of a kind this does not know how to stop.
             Transport::Pci => false,
         }
@@ -202,7 +230,8 @@ impl UserDevice {
 /// What the command line asked for: each a `(kind, index)`.
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
-static SEEN: [AtomicUsize; 3] = [
+static SEEN: [AtomicUsize; KINDS.len()] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -290,8 +319,8 @@ fn disk_unasked(index: usize) -> bool {
         && !(index == 0 && KEEP_FIRST_DISK.load(Ordering::Acquire))
 }
 
-/// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N` or
-/// `e1000e@N`.
+/// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
+/// `e1000e@N` or `nvme@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -446,6 +475,7 @@ mod tests {
         assert_eq!(parse_spec("virtio-blk@x"), None);
         assert_eq!(parse_spec("virtio-net@0"), Some((VIRTIO_NET, 0)));
         assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
+        assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
     }
@@ -558,6 +588,29 @@ mod tests {
         assert_eq!(window[E1000E_IMC / 4], u32::MAX);
         assert_eq!((window[E1000E_RCTL / 4], window[E1000E_TCTL / 4]), (0, 0));
         assert_eq!(window[E1000E_CTRL / 4], 0x40 | E1000E_CTRL_RST);
+    }
+
+    #[test]
+    fn an_nvme_controller_is_reset_by_clearing_its_enable_bit() {
+        let mut window = [0u32; 0x40 / 4];
+        window[NVME_CC / 4] = 0x0046_0001; // IOSQES, IOCQES, EN
+        window[NVME_CSTS / 4] = 0; // plain memory: "ready" already clear
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(window.as_mut_ptr() as *mut u8, 0x40) };
+        let ctrl = UserDevice {
+            kind: NVME,
+            ..device(Transport::Pci, bytes)
+        };
+        assert!(ctrl.reset());
+        assert_eq!(window[NVME_CC / 4], 0x0046_0000, "only EN");
+        // A window too short for CSTS is not touched.
+        let mut short = [0xffu8; NVME_CSTS];
+        let ctrl = UserDevice {
+            kind: NVME,
+            ..device(Transport::Pci, &mut short)
+        };
+        assert!(!ctrl.reset());
+        assert!(short.iter().all(|b| *b == 0xff));
     }
 
     #[test]
