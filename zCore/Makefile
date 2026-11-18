@@ -537,6 +537,17 @@ ifneq ($(UNVME),)
   qemu_opts += -device nvme,serial=eclipse0,drive=unvme
 endif
 
+# UAHCI=<raw image>: one more AHCI controller with that SATA disk on its
+# first port. The kernel drives it unless `udriver=ahci@0` in KOPTS leaves
+# it to the driver in userspace (`udrv-ahci`): on x86_64 it is the first
+# AHCI controller on the bus, before q35's own (00:1f.2), which holds the
+# boot disk and is `ahci@1`.
+ifneq ($(UAHCI),)
+  qemu_opts += -device ahci,id=uahci
+  qemu_opts += -drive file=$(UAHCI),if=none,format=raw,id=uahcid
+  qemu_opts += -device ide-hd,drive=uahcid,bus=uahci.0
+endif
+
 # UNET=1: a virtio network card on a user-mode network of its own
 # (10.0.3.0/24, so that it is not the kernel card's 10.0.2.0/24), for a
 # driver in userspace. The kernel has no virtio-net driver, so it leaves

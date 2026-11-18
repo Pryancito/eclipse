@@ -38,8 +38,11 @@ pub const E1000E: &str = "e1000e";
 /// An NVMe controller, which the kernel drives itself unless
 /// `udriver=nvme@N` asks for it.
 pub const NVME: &str = "nvme";
+/// An AHCI (SATA) controller, with every disk on its ports, which the
+/// kernel drives itself unless `udriver=ahci@N` asks for it.
+pub const AHCI: &str = "ahci";
 /// The kinds that can be reserved.
-const KINDS: [&str; 4] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME];
+const KINDS: [&str; 5] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME, AHCI];
 
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +126,10 @@ const NVME_CSTS_RDY: u32 = 1;
 /// How many times `CSTS` is read back after `CC.EN` is cleared. A real
 /// controller may take up to `CAP.TO` half-seconds; QEMU's is done at once.
 const NVME_RESET_READS: usize = 1_000_000;
+/// An AHCI controller's global control register (AHCI 1.3.1 §3.1.2) and
+/// its HBA reset bit, which the controller clears when it is done.
+const AHCI_GHC: usize = 0x04;
+const AHCI_GHC_HR: u32 = 1;
 
 impl UserDevice {
     /// Take the device. Only one caller gets `true` until it is
@@ -214,6 +221,17 @@ impl UserDevice {
                 (0..NVME_RESET_READS)
                     .any(|_| unsafe { reg(NVME_CSTS).read_volatile() } & NVME_CSTS_RDY == 0)
             }
+            Transport::Pci if self.kind == AHCI => {
+                if self.size < AHCI_GHC + 4 {
+                    return false;
+                }
+                let ghc = (vaddr + AHCI_GHC) as *mut u32;
+                // SAFETY: as above. The HBA reset (§10.4.3) stops every port
+                // and forgets their command lists: nothing more is read or
+                // written of the memory they named.
+                unsafe { ghc.write_volatile(ghc.read_volatile() | AHCI_GHC_HR) };
+                (0..NVME_RESET_READS).any(|_| unsafe { ghc.read_volatile() } & AHCI_GHC_HR == 0)
+            }
             // A PCI function of a kind this does not know how to stop.
             Transport::Pci => false,
         }
@@ -231,6 +249,7 @@ impl UserDevice {
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
 static SEEN: [AtomicUsize; KINDS.len()] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -320,7 +339,7 @@ fn disk_unasked(index: usize) -> bool {
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
-/// `e1000e@N` or `nvme@N`.
+/// `e1000e@N`, `nvme@N` or `ahci@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -476,6 +495,7 @@ mod tests {
         assert_eq!(parse_spec("virtio-net@0"), Some((VIRTIO_NET, 0)));
         assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
         assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
+        assert_eq!(parse_spec("ahci@1"), Some((AHCI, 1)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
     }
@@ -611,6 +631,21 @@ mod tests {
         };
         assert!(!ctrl.reset());
         assert!(short.iter().all(|b| *b == 0xff));
+    }
+
+    #[test]
+    fn an_ahci_controller_is_reset_with_its_hba_reset_bit() {
+        let mut window = [0u32; 0x10 / 4];
+        window[AHCI_GHC / 4] = 0x8000_0002; // AE, IE
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(window.as_mut_ptr() as *mut u8, 0x10) };
+        let hba = UserDevice {
+            kind: AHCI,
+            ..device(Transport::Pci, bytes)
+        };
+        // Plain memory keeps the bit: the reset is not taken as done.
+        assert!(!hba.reset());
+        assert_eq!(window[AHCI_GHC / 4], 0x8000_0003);
     }
 
     #[test]

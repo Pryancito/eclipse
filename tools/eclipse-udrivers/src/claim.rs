@@ -20,6 +20,9 @@ pub const KIND_E1000E: usize = 3;
 /// An NVMe controller (`udriver=nvme@N`); its transport is a plain PCI
 /// function and the window is BAR 0.
 pub const KIND_NVME: usize = 4;
+/// An AHCI controller (`udriver=ahci@N`); its transport is a plain PCI
+/// function and the window is BAR 5, the ABAR.
+pub const KIND_AHCI: usize = 5;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;
