@@ -2,7 +2,7 @@
 name = "eclipse-btrfs"
 version = "0.1.0"
 edition = "2021"
-description = "Eclipse OS btrfs filesystem that runs as a process"
+description = "Eclipse OS btrfs and EclipseFS filesystems that run as processes"
 
 # Standalone: NOT a workspace member. It targets userspace
 # (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "eclipse-btrfs"
 path = "src/main.rs"
 
+[[bin]]
+name = "eclipse-eclipsefs"
+path = "src/bin/eclipse-eclipsefs.rs"
+
 [dependencies]
 libc = "0.2"
 # The system calls and the FIFO.
@@ -27,6 +31,8 @@ udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
 fatserve = { package = "eclipse-fatfs", path = "../eclipse-fatfs" }
 # The same btrfs code the kernel links for its own btrfs (`vendor/btrfs-rs`).
 btrfs = { path = "../../vendor/btrfs-rs", features = ["std"] }
+# The same EclipseFS code the kernel links (`vendor/eclipsefs-rs`).
+eclipsefs = { path = "../../vendor/eclipsefs-rs", features = ["std"] }
 
 [profile.release]
 opt-level = 2

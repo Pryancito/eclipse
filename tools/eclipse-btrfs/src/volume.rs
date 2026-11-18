@@ -1,18 +1,25 @@
-//! A btrfs volume as the kernel asks for it: by path, with what each
-//! request needs answered and nothing kept per open file.
+//! A btrfs or EclipseFS volume as the kernel asks for it: by path, with
+//! what each request needs answered and nothing kept per open file.
 //!
-//! The btrfs code keeps the tree blocks it changed in memory, and here
+//! The filesystem's code keeps the trees it changed in memory, and here
 //! writes them, with the superblock, every [`CHECKPOINT_EVERY`] changes
 //! and when asked to sync ([`Volume::checkpoint`]): not to the device, but
-//! into the disk's kept memory ([`fatserve::disk`]), as one group, so that
-//! the memory with the device under it is always a whole volume. The
-//! changes since are written down in the kept memory too ([`crate::log`]),
-//! as the kernel asked for them. A server that takes the mount over mounts
-//! the volume as the trees were last written and makes those changes
-//! again: the volume is then what the kernel was told. A server that dies
-//! inside a writing of the trees leaves the group, which the next one's
-//! disk takes back, with the number of the writing: the changes written
-//! down are then still the ones to make again.
+//! into the disk's kept memory ([`fatserve::disk`]), so that the memory
+//! with the device under it is always a whole volume. The changes since
+//! are written down in the kept memory too ([`crate::log`]), as the kernel
+//! asked for them, after the number of the last writing of the trees. A
+//! server that takes the mount over mounts the volume as the trees were
+//! last written and, if that writing is the one the changes follow, makes
+//! them again: the volume is then what the kernel was told.
+//!
+//! btrfs writes its trees in place, so a writing of them is one group of
+//! the disk's journal, which sets the disk's word to its number: a server
+//! that dies inside it leaves the group, which the next one's disk takes
+//! back, with the number. EclipseFS copies on write and writes its
+//! superblock last: a writing that did not end leaves the generation
+//! before it, which is the number ([`crate::tree`]). The code makes the
+//! same changes the same way, so the changes made again do not commit
+//! where the first making of them did not.
 //!
 //! What this keeps besides only saves work: which inode each path is, and
 //! the listing being sent.
@@ -21,12 +28,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use btrfs::{Btrfs, FileKind, InodeStat};
 use fatserve::disk::{Blocks, Disk, Kept};
 
 use crate::dev::{lock, Dev, DiskRef, Shared};
 use crate::log::{self, Log};
 use crate::tail::{self, Tail};
+use crate::tree::{Kind, Stat, Tree};
 use fatserve::wire::{
     OP_CREATE, OP_REMOVE, OP_RENAME, OP_SETATTR, OP_SETTIME, OP_TRUNCATE, OP_WRITE,
 };
@@ -36,14 +43,11 @@ use fatserve::wire::{
 pub const CHECKPOINT_EVERY: usize = 32;
 
 /// The most bytes of what was kept of a file that are written down when
-/// btrfs is given them: more is a writing of the trees instead.
+/// the code is given them: more is a writing of the trees instead.
 const WRITE_NOTED_MOST: usize = 64 * 1024;
 
 /// A Linux `errno`.
 pub type Errno = i32;
-
-/// The `statfs` magic of btrfs.
-pub const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 
 /// A record's fixed part on a POSIX mount: what the kernel's
 /// `served::wire::RECORD_HEAD_POSIX` says.
@@ -52,28 +56,6 @@ pub const RECORD_HEAD: usize = 64;
 /// What `stat` of the top of the mount is called in its record, which
 /// needs a name: the kernel takes nothing from it.
 const TOP_NAME: &str = "top";
-
-fn errno_of(e: btrfs::Error) -> Errno {
-    use btrfs::Error as E;
-    match e {
-        E::Io | E::Corrupt(_) => libc::EIO,
-        E::BadSuperblock | E::Invalid => libc::EINVAL,
-        E::Unsupported(_) => libc::EOPNOTSUPP,
-        E::NotFound => libc::ENOENT,
-        E::Exists => libc::EEXIST,
-        E::NotDir => libc::ENOTDIR,
-        E::IsDir => libc::EISDIR,
-        E::NotEmpty => libc::ENOTEMPTY,
-        E::NoSpace => libc::ENOSPC,
-    }
-}
-
-fn wall_clock() -> (u64, u32) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    (now.as_secs(), now.subsec_nanos())
-}
 
 /// A path's directory and its name in it.
 fn split(path: &str) -> (&str, &str) {
@@ -98,16 +80,16 @@ pub fn record_len(name: &str) -> usize {
 
 /// Write the record of the file `st` called `name` at the start of `out`,
 /// which holds it.
-pub fn put_record(name: &str, st: &InodeStat, out: &mut [u8]) {
+pub fn put_record(name: &str, st: &Stat, out: &mut [u8]) {
     let len = record_len(name);
     out[..len].fill(0);
     out[0..2].copy_from_slice(&(len as u16).to_ne_bytes());
     out[2..4].copy_from_slice(&(name.len() as u16).to_ne_bytes());
     out[4..8].copy_from_slice(&st.mode.to_ne_bytes());
     out[8..16].copy_from_slice(&st.size.to_ne_bytes());
-    out[16..24].copy_from_slice(&(st.mtime.0 as i64).to_ne_bytes());
-    out[24..32].copy_from_slice(&(st.atime.0 as i64).to_ne_bytes());
-    out[32..40].copy_from_slice(&(st.ctime.0 as i64).to_ne_bytes());
+    out[16..24].copy_from_slice(&st.mtime.to_ne_bytes());
+    out[24..32].copy_from_slice(&st.atime.to_ne_bytes());
+    out[32..40].copy_from_slice(&st.ctime.to_ne_bytes());
     out[40..44].copy_from_slice(&st.uid.to_ne_bytes());
     out[44..48].copy_from_slice(&st.gid.to_ne_bytes());
     out[48..52].copy_from_slice(&st.nlink.to_ne_bytes());
@@ -115,14 +97,14 @@ pub fn put_record(name: &str, st: &InodeStat, out: &mut [u8]) {
     out[RECORD_HEAD..RECORD_HEAD + name.len()].copy_from_slice(name.as_bytes());
 }
 
-/// The kind of file a mode asks for, as btrfs says it.
-fn kind_of(mode: u32) -> Option<FileKind> {
+/// The kind of file a mode asks for.
+fn kind_of(mode: u32) -> Option<Kind> {
     Some(match mode & 0o170000 {
-        0o100000 => FileKind::Regular,
-        0o040000 => FileKind::Dir,
-        0o120000 => FileKind::Symlink,
-        0o010000 => FileKind::Fifo,
-        0o140000 => FileKind::Socket,
+        0o100000 => Kind::Regular,
+        0o040000 => Kind::Dir,
+        0o120000 => Kind::Symlink,
+        0o010000 => Kind::Fifo,
+        0o140000 => Kind::Socket,
         _ => return None,
     })
 }
@@ -130,7 +112,13 @@ fn kind_of(mode: u32) -> Option<FileKind> {
 /// The memory a mount holds for its servers: the end of the file being
 /// written ([`tail`]), the changes since the trees were written
 /// ([`log`]), then the disk's chunks.
-pub const KEPT_LEN: usize = tail::LEN + log::LEN + Kept::LEN;
+pub const KEPT_LEN: usize = tail::LEN + log::LEN + Kept::len(DISK_CHUNKS);
+
+/// The disk's chunks kept: 32 MiB, eight times the FAT server's. A tree
+/// that copies on write moves what it changes, and its trees and checksums
+/// are read and written around the data: with fewer, a few hundred small
+/// writes over a file read most of what they touched from the device again.
+pub const DISK_CHUNKS: usize = 512;
 
 /// [`KEPT_LEN`] bytes of memory, cut in its three parts.
 pub struct Memory {
@@ -145,7 +133,7 @@ impl Memory {
         Memory {
             tail: Tail::private(),
             log: Log::private(),
-            disk: Kept::private(),
+            disk: Kept::private_with(DISK_CHUNKS),
         }
     }
 
@@ -158,7 +146,7 @@ impl Memory {
         Memory {
             tail: Tail::at(base),
             log: Log::at(base.add(tail::LEN)),
-            disk: Kept::at(base.add(tail::LEN + log::LEN)),
+            disk: Kept::at_with(base.add(tail::LEN + log::LEN), DISK_CHUNKS),
         }
     }
 }
@@ -166,11 +154,11 @@ impl Memory {
 /// One file of a listing being sent.
 struct Listed {
     name: String,
-    st: InodeStat,
+    st: Stat,
 }
 
-pub struct Volume<B: Blocks + Send + 'static> {
-    fs: Btrfs,
+pub struct Volume<F: Tree, B: Blocks + Send + 'static> {
+    fs: F,
     disk: DiskRef<B>,
     tail: Tail,
     log: Log,
@@ -179,12 +167,12 @@ pub struct Volume<B: Blocks + Send + 'static> {
     replaying: bool,
     read_only: bool,
     /// The inode of each path asked about, and its kind.
-    paths: HashMap<String, (u64, FileKind)>,
+    paths: HashMap<String, (u64, Kind)>,
     /// The directory whose listing is being sent, a reply at a time.
     listing: Option<(String, Vec<Listed>)>,
     /// How many tree changes were made into the kept memory.
     pub checkpoints: u64,
-    /// The bytes btrfs has written into it.
+    /// The bytes the code has written into it.
     written: Arc<AtomicU64>,
     /// The most bytes one checkpoint wrote.
     pub largest_checkpoint: u64,
@@ -192,22 +180,21 @@ pub struct Volume<B: Blocks + Send + 'static> {
     before_write: crate::dev::Hook,
 }
 
-impl<B: Blocks + Send + 'static> Volume<B> {
+impl<F: Tree, B: Blocks + Send + 'static> Volume<F, B> {
     /// The volume on `blocks`, `len` bytes, with what the servers before
     /// left in `memory`. Read-only, nothing is written whatever is asked.
     pub fn open(blocks: B, len: u64, memory: Memory, read_only: bool) -> Result<Self, String> {
-        let disk = Disk::over(blocks, len, memory.disk)
+        let mut disk = Disk::over(blocks, len, memory.disk)
             .ok_or("the memory the mount kept is another device's")?;
+        // The trees' nodes and the blocks of small writes are read again:
+        // only a chunk's worth or more is the kernel's to keep.
+        disk.set_direct_min(fatserve::disk::CHUNK);
         let disk: DiskRef<B> = Arc::new(Mutex::new(Shared(disk)));
         let written = Arc::new(AtomicU64::new(0));
         let dev = Dev::new(disk.clone(), len, written.clone());
         #[cfg(test)]
         let before_write = dev.before_write.clone();
-        let dev: Arc<dyn btrfs::BlockDevice> = Arc::new(dev);
-        let mut fs = Btrfs::mount(dev, read_only).map_err(|e| format!("{e:?}"))?;
-        fs.set_clock(wall_clock);
-        // The trees are written when this says, and only then.
-        fs.set_commit_interval(u32::MAX);
+        let fs = F::mount(dev, read_only)?;
         let mut volume = Volume {
             fs,
             disk,
@@ -229,24 +216,19 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         let failed = |e: Errno| format!("errno {e}");
         // The changes written down follow the last writing of the trees,
         // or one before it: then the trees have them.
-        let written_at = lock(&volume.disk).0.word();
+        let written_at = volume.written_at();
         if volume.log.base() != written_at {
             volume.log.restart(written_at);
         }
-        // What a first change does before any (a free space tree the code
-        // does not keep is marked stale), and, as the kernel's btrfs, an
-        // image written onto a larger partition takes the whole of it:
-        // neither changes what the volume holds, and both are written now,
-        // as one group.
-        lock(&volume.disk).0.begin();
-        let prepared = volume.fs.prepare_writes();
-        let grew = prepared.and_then(|()| volume.fs.grow_to_device());
-        let synced = volume.fs.sync();
-        lock(&volume.disk).0.commit();
-        prepared.map_err(|e| format!("{e:?}"))?;
-        synced.map_err(|e| format!("{e:?}"))?;
-        if grew.unwrap_or(false) {
-            eprintln!("eclipse-btrfs: the volume grew to its device");
+        // What a first change does before any, and, as the kernel's mount,
+        // an image written onto a larger partition takes the whole of it:
+        // neither changes what the volume holds. Written in place, both
+        // are written now, as one group, which leaves the number of the
+        // writing as it was. Copied, a writing is a new generation, which
+        // would make what was written down older than the trees: they are
+        // done after the changes are made again, and written with them.
+        if F::IN_PLACE {
+            volume.prepare(true).map_err(failed)?;
         }
         // What the server before had done since, then what it kept of a
         // file being written, which was the last thing it was told.
@@ -257,6 +239,9 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         }
         volume.replaying = false;
         volume.write_tail().map_err(failed)?;
+        if !F::IN_PLACE {
+            volume.prepare(false).map_err(failed)?;
+        }
         volume.checkpoint().map_err(failed)?;
         Ok(volume)
     }
@@ -288,22 +273,59 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         lock(&self.disk).0.adopted()
     }
 
-    /// The trees btrfs changed go into the kept memory, as one group with
-    /// the number of this writing of them; the changes written down are
-    /// then the trees', and nothing is written down after it.
+    /// What a first change does before any, and the volume taking the
+    /// whole of its device; with `write`, the trees are written then, in
+    /// one group.
+    fn prepare(&mut self, write: bool) -> Result<(), Errno> {
+        if write {
+            lock(&self.disk).0.begin();
+        }
+        let prepared = self.fs.prepare();
+        let synced = if write { self.fs.sync() } else { Ok(()) };
+        if write {
+            lock(&self.disk).0.commit();
+        }
+        if prepared? {
+            eprintln!("{}: the volume grew to its device", F::NAME);
+        }
+        synced
+    }
+
+    /// The number of the writing of the trees that the kept memory and the
+    /// device have: the disk's word where the trees are written in place,
+    /// the filesystem's generation where they are copied.
+    fn written_at(&mut self) -> u64 {
+        if F::IN_PLACE {
+            lock(&self.disk).0.word()
+        } else {
+            self.fs.generation()
+        }
+    }
+
+    /// The trees the code changed go into the kept memory, with the number
+    /// of this writing of them; the changes written down are then the
+    /// trees', and nothing is written down after it. Written in place,
+    /// they are one group, which sets the number too.
     fn checkpoint(&mut self) -> Result<(), Errno> {
         if self.read_only || self.replaying {
             return Ok(());
         }
         let before = self.written.load(Ordering::Relaxed);
-        let next = self.log.base() + 1;
-        lock(&self.disk).0.begin();
-        let done = self.fs.sync().map_err(errno_of);
-        {
+        let done;
+        let next = if F::IN_PLACE {
+            let next = self.log.base() + 1;
+            lock(&self.disk).0.begin();
+            done = self.fs.sync();
             let mut disk = lock(&self.disk);
             disk.0.set_word_in_group(next);
             disk.0.commit();
-        }
+            next
+        } else {
+            // A superblock is written last, with the next generation: the
+            // memory has the trees before it or after.
+            done = self.fs.sync();
+            self.fs.generation()
+        };
         self.log.restart(next);
         self.checkpoints += 1;
         let wrote = self.written.load(Ordering::Relaxed) - before;
@@ -318,6 +340,12 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         if self.replaying {
             return Ok(());
         }
+        if !F::IN_PLACE && self.fs.generation() != self.log.base() {
+            // The code committed on its own (it ran short of room for what
+            // it keeps): whatever it had, this change perhaps with it, is
+            // in the trees, and the rest goes there now.
+            return self.checkpoint();
+        }
         if !self.log.push(op, names, a, b, data) {
             // No room: not written down, so the trees must have it now.
             return self.checkpoint();
@@ -329,7 +357,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
     }
 
     /// A change: made, then written down as `op`, `names`, `a`, `b` and
-    /// `data`. What is kept of the file being written goes to btrfs first,
+    /// `data`. What is kept of the file being written goes to the code first,
     /// and what is known of paths that the change may have changed is
     /// forgotten. Written down whatever it answered: made again on the
     /// same volume it answers the same.
@@ -356,7 +384,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         done
     }
 
-    /// What is kept of the file being written goes to btrfs.
+    /// What is kept of the file being written goes to the code.
     fn write_tail(&mut self) -> Result<(), Errno> {
         if self.replaying {
             return Ok(());
@@ -368,10 +396,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         let (ino, _) = self.node(&path)?;
         let mut done = 0;
         while done < data.len() {
-            let n = self
-                .fs
-                .write(ino, offset + done as u64, &data[done..])
-                .map_err(errno_of)?;
+            let n = self.fs.write(ino, offset + done as u64, &data[done..])?;
             if n == 0 {
                 return Err(libc::ENOSPC);
             }
@@ -391,20 +416,20 @@ impl<B: Blocks + Send + 'static> Volume<B> {
     }
 
     /// The inode at `path`, and its kind.
-    fn node(&mut self, path: &str) -> Result<(u64, FileKind), Errno> {
+    fn node(&mut self, path: &str) -> Result<(u64, Kind), Errno> {
         if path.is_empty() {
-            return Ok((self.fs.root_ino(), FileKind::Dir));
+            return Ok((self.fs.root_ino(), Kind::Dir));
         }
         if let Some(known) = self.paths.get(path) {
             return Ok(*known);
         }
         let (dir, name) = split(path);
         let (dir_ino, kind) = self.node(dir)?;
-        if kind != FileKind::Dir {
+        if kind != Kind::Dir {
             return Err(libc::ENOTDIR);
         }
-        let ino = self.fs.lookup(dir_ino, name).map_err(errno_of)?;
-        let kind = self.fs.stat(ino).map_err(errno_of)?.kind;
+        let ino = self.fs.lookup(dir_ino, name)?;
+        let kind = self.fs.stat(ino)?.kind;
         self.paths.insert(path.to_string(), (ino, kind));
         Ok((ino, kind))
     }
@@ -418,20 +443,20 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         start: u64,
         out: &mut [u8],
     ) -> Result<(usize, usize, u64), Errno> {
-        // The size of the file being written is the one btrfs says.
+        // The size of the file being written is the one the code says.
         if !self.read_only {
             self.write_tail()?;
         }
         let fresh = start == 0 || self.listing.as_ref().is_none_or(|(p, _)| p != path);
         if fresh {
             let (ino, kind) = self.node(path)?;
-            if kind != FileKind::Dir {
+            if kind != Kind::Dir {
                 return Err(libc::ENOTDIR);
             }
-            let entries = self.fs.readdir(ino).map_err(errno_of)?;
+            let entries = self.fs.readdir(ino)?;
             let mut listed = Vec::with_capacity(entries.len());
             for entry in entries {
-                let st = self.fs.stat(entry.ino).map_err(errno_of)?;
+                let st = self.fs.stat(entry.ino)?;
                 let full = if path.is_empty() {
                     entry.name.clone()
                 } else {
@@ -466,7 +491,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
     /// The record of `path` itself, called `name`, in `out`: its bytes.
     fn record(&mut self, path: &str, name: &str, out: &mut [u8]) -> Result<usize, Errno> {
         let (ino, _) = self.node(path)?;
-        let st = self.fs.stat(ino).map_err(errno_of)?;
+        let st = self.fs.stat(ino)?;
         let len = record_len(name);
         if len > out.len() {
             return Err(libc::ENAMETOOLONG);
@@ -493,9 +518,9 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         }
         let (ino, kind) = self.node(path)?;
         match kind {
-            FileKind::Dir => Err(libc::EISDIR),
-            FileKind::Symlink => {
-                let target = self.fs.read_link(ino).map_err(errno_of)?;
+            Kind::Dir => Err(libc::EISDIR),
+            Kind::Symlink => {
+                let target = self.fs.read_link(ino)?;
                 let from = usize::try_from(offset)
                     .unwrap_or(usize::MAX)
                     .min(target.len());
@@ -503,7 +528,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
                 out[..n].copy_from_slice(&target[from..from + n]);
                 Ok(n)
             }
-            _ => self.fs.read(ino, offset, out).map_err(errno_of),
+            _ => self.fs.read(ino, offset, out),
         }
     }
 
@@ -520,11 +545,9 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         }
         let (ino, kind) = self.node(path)?;
         match kind {
-            FileKind::Dir => return Err(libc::EISDIR),
-            FileKind::Symlink => {
-                return self.change(noted, &[], |v| {
-                    v.fs.write_symlink(ino, offset, data).map_err(errno_of)
-                });
+            Kind::Dir => return Err(libc::EISDIR),
+            Kind::Symlink => {
+                return self.change(noted, &[], |v| v.fs.write_symlink(ino, offset, data));
             }
             _ => {}
         }
@@ -532,9 +555,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         if !self.replaying && data.len() < tail::TAIL_MAX && self.tail.start(path, offset, data) {
             return Ok(data.len());
         }
-        self.change(noted, &[], |v| {
-            v.fs.write(ino, offset, data).map_err(errno_of)
-        })
+        self.change(noted, &[], |v| v.fs.write(ino, offset, data))
     }
 
     /// Make `path` a file of the kind and permissions `mode` says; its
@@ -545,12 +566,10 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         let name = name.to_string();
         self.change((OP_CREATE, path, mode as u64, 0, &[]), &[], |v| {
             let (dir_ino, dir_kind) = v.node(dir)?;
-            if dir_kind != FileKind::Dir {
+            if dir_kind != Kind::Dir {
                 return Err(libc::ENOTDIR);
             }
-            let ino =
-                v.fs.create(dir_ino, &name, kind, mode & 0o7777, 0)
-                    .map_err(errno_of)?;
+            let ino = v.fs.create(dir_ino, &name, kind, mode & 0o7777)?;
             v.paths.insert(path.to_string(), (ino, kind));
             Ok(())
         })?;
@@ -563,7 +582,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         let name = name.to_string();
         self.change((OP_REMOVE, path, 0, 0, &[]), &[path], |v| {
             let (dir_ino, _) = v.node(dir)?;
-            v.fs.unlink(dir_ino, &name).map_err(errno_of)
+            v.fs.unlink(dir_ino, &name)
         })
     }
 
@@ -577,7 +596,6 @@ impl<B: Blocks + Send + 'static> Volume<B> {
             let (from_ino, _) = v.node(from_dir)?;
             let (to_ino, _) = v.node(to_dir)?;
             v.fs.rename(from_ino, &from_name, to_ino, &to_name)
-                .map_err(errno_of)
         })?;
         self.record(to, &to_name, out)
     }
@@ -586,7 +604,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
     pub fn truncate(&mut self, path: &str, len: u64) -> Result<(), Errno> {
         self.change((OP_TRUNCATE, path, len, 0, &[]), &[], |v| {
             let (ino, _) = v.node(path)?;
-            v.fs.truncate(ino, len).map_err(errno_of)
+            v.fs.truncate(ino, len)
         })
     }
 
@@ -594,8 +612,7 @@ impl<B: Blocks + Send + 'static> Volume<B> {
     pub fn set_time(&mut self, path: &str, secs: i64) -> Result<(), Errno> {
         self.change((OP_SETTIME, path, secs as u64, 0, &[]), &[], |v| {
             let (ino, _) = v.node(path)?;
-            v.fs.set_attr(ino, None, None, None, None, Some((secs.max(0) as u64, 0)))
-                .map_err(errno_of)
+            v.fs.set_attr(ino, None, None, None, Some(secs))
         })
     }
 
@@ -604,24 +621,17 @@ impl<B: Blocks + Send + 'static> Volume<B> {
         let owner = (uid as u64) << 32 | gid as u64;
         self.change((OP_SETATTR, path, owner, perms, &[]), &[], |v| {
             let (ino, _) = v.node(path)?;
-            v.fs.set_attr(ino, Some(perms & 0o7777), Some(uid), Some(gid), None, None)
-                .map_err(errno_of)
+            v.fs.set_attr(ino, Some(perms & 0o7777), Some(uid), Some(gid), None)
         })
     }
 
     /// The numbers of `statfs`, as five u64 in `out`: block size, blocks,
     /// free blocks, longest name and the magic.
     pub fn statfs(&mut self, out: &mut [u8]) -> Result<usize, Errno> {
-        let st = self.fs.fsinfo();
+        let st = self.fs.numbers();
         let bsize = st.block_size.max(512);
         let free = st.total_bytes.saturating_sub(st.bytes_used);
-        let numbers = [
-            bsize,
-            st.total_bytes / bsize,
-            free / bsize,
-            255,
-            BTRFS_SUPER_MAGIC,
-        ];
+        let numbers = [bsize, st.total_bytes / bsize, free / bsize, 255, F::MAGIC];
         for (i, n) in numbers.iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&n.to_ne_bytes());
         }

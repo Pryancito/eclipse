@@ -10,6 +10,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use btrfs::{Btrfs, Error as BtrfsError, FileKind};
 use lock::Mutex;
+
+use super::yielding::YieldingMutex;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -235,7 +237,9 @@ fn wall_clock() -> (u64, u32) {
 }
 
 pub struct BtrfsMountFs {
-    inner: Mutex<Btrfs>,
+    /// Waits by giving the CPU away ([`super::yielding`]): a holder may be
+    /// waiting for a disk served from userspace.
+    inner: YieldingMutex<Btrfs>,
     this: Mutex<Weak<Self>>,
     /// Cached directory listings keyed by inode number (cleared on any
     /// mutation of that directory).
@@ -345,7 +349,7 @@ impl BtrfsMountFs {
             }
         }
         let arc = Arc::new(Self {
-            inner: Mutex::new(fs),
+            inner: YieldingMutex::new(fs),
             this: Mutex::new(Weak::new()),
             dir_cache: Mutex::new(BTreeMap::new()),
             write_buf: Mutex::new(None),

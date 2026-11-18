@@ -1,8 +1,10 @@
-//! A volume made by the btrfs code's own `mkfs`, in memory, served as the
-//! kernel asks for it -- and served again by a server that comes after one
-//! that died.
+//! A volume made by the filesystem code's own `mkfs`, in memory, served as
+//! the kernel asks for it -- and served again by a server that comes after
+//! one that died. Each test runs on btrfs and on EclipseFS.
 
 use super::*;
+use btrfs::Btrfs;
+use eclipsefs::EclipseFS;
 use std::io;
 use std::sync::Mutex as StdMutex;
 
@@ -46,21 +48,96 @@ impl btrfs::BlockDevice for Platter {
     }
 }
 
+impl eclipsefs::BlockDevice for Platter {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> eclipsefs::Result<()> {
+        let v = self.0.lock().unwrap();
+        buf.copy_from_slice(&v[offset as usize..offset as usize + buf.len()]);
+        Ok(())
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> eclipsefs::Result<()> {
+        let mut v = self.0.lock().unwrap();
+        v[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn sync(&self) -> eclipsefs::Result<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> u64 {
+        self.0.lock().unwrap().len() as u64
+    }
+}
+
 const LEN: usize = 256 << 20;
 
-fn platter() -> Platter {
-    let platter = Platter(Arc::new(StdMutex::new(vec![0u8; LEN])));
-    let opts = btrfs::mkfs::MkfsOptions {
-        label: "served".into(),
-        fsid: [1; 16],
-        chunk_uuid: [2; 16],
-        dev_uuid: [3; 16],
-        subvol_uuid: [4; 16],
-        now: (1_700_000_000, 0),
-    };
-    btrfs::mkfs::format(&platter, &opts).unwrap();
-    platter
+/// A filesystem a test makes a volume of.
+trait Made: Tree {
+    /// A new volume of it on a device of [`LEN`] bytes.
+    fn platter() -> Platter;
 }
+
+impl Made for Btrfs {
+    fn platter() -> Platter {
+        let platter = Platter(Arc::new(StdMutex::new(vec![0u8; LEN])));
+        let opts = btrfs::mkfs::MkfsOptions {
+            label: "served".into(),
+            fsid: [1; 16],
+            chunk_uuid: [2; 16],
+            dev_uuid: [3; 16],
+            subvol_uuid: [4; 16],
+            now: (1_700_000_000, 0),
+        };
+        btrfs::mkfs::format(&platter, &opts).unwrap();
+        platter
+    }
+}
+
+impl Made for EclipseFS {
+    fn platter() -> Platter {
+        let platter = Platter(Arc::new(StdMutex::new(vec![0u8; LEN])));
+        let opts = eclipsefs::mkfs::MkfsOptions {
+            label: "served".into(),
+            fsid: [1; 16],
+            chunk_uuid: [2; 16],
+            dev_uuid: [3; 16],
+            subvol_uuid: [4; 16],
+            now: (1_700_000_000, 0),
+        };
+        eclipsefs::mkfs::format(&platter, &opts).unwrap();
+        platter
+    }
+}
+
+/// The test `$name::<F>` once for each filesystem.
+macro_rules! on_both {
+    ($($name:ident),* $(,)?) => {
+        $(mod $name {
+            #[test]
+            fn btrfs() {
+                super::$name::<super::Btrfs>()
+            }
+
+            #[test]
+            fn eclipsefs() {
+                super::$name::<super::EclipseFS>()
+            }
+        })*
+    };
+}
+
+on_both!(
+    what_is_made_and_written_lists_and_reads_back,
+    a_symbolic_link_is_made_its_target_written_and_read,
+    the_owner_permissions_and_time_are_kept,
+    renamed_and_removed_are_where_they_were_asked_to_be,
+    a_dead_servers_changes_are_the_next_ones_and_so_is_what_it_kept_of_a_file,
+    the_device_has_nothing_of_it_until_the_flush,
+    a_read_only_volume_changes_nothing,
+    a_server_that_dies_anywhere_after_a_change_leaves_it_made,
+    the_changes_since_the_trees_were_written_are_made_again_by_the_next_server,
+);
 
 /// A page of memory, aligned as a mapping's.
 #[derive(Clone)]
@@ -82,12 +159,12 @@ impl Held {
     }
 }
 
-fn open(platter: &Platter, held: &mut Held) -> Volume<Platter> {
+fn open<F: Tree>(platter: &Platter, held: &mut Held) -> Volume<F, Platter> {
     Volume::open(platter.clone(), LEN as u64, held.memory(), false).unwrap()
 }
 
 /// The names and modes of a listing.
-fn listing(v: &mut Volume<Platter>, path: &str) -> Vec<(String, u32, u64)> {
+fn listing<F: Tree>(v: &mut Volume<F, Platter>, path: &str) -> Vec<(String, u32, u64)> {
     let mut out = vec![0u8; 64 * 1024];
     let mut all = Vec::new();
     let mut next = 0;
@@ -109,7 +186,7 @@ fn listing(v: &mut Volume<Platter>, path: &str) -> Vec<(String, u32, u64)> {
     all
 }
 
-fn read_all(v: &mut Volume<Platter>, path: &str, len: usize) -> Vec<u8> {
+fn read_all<F: Tree>(v: &mut Volume<F, Platter>, path: &str, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut done = 0;
     while done < len {
@@ -129,10 +206,9 @@ fn bytes(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-#[test]
-fn what_is_made_and_written_lists_and_reads_back() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn what_is_made_and_written_lists_and_reads_back<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("docs", 0o040750, &mut out).unwrap();
     v.create("docs/a.txt", 0o100640, &mut out).unwrap();
@@ -158,17 +234,16 @@ fn what_is_made_and_written_lists_and_reads_back() {
     );
 }
 
-/// The size btrfs gives the directory `path` (its names, twice).
-fn listing_size(v: &mut Volume<Platter>, path: &str) -> u64 {
+/// The size the filesystem gives the directory `path`.
+fn listing_size<F: Tree>(v: &mut Volume<F, Platter>, path: &str) -> u64 {
     let mut out = vec![0u8; 4096];
     v.stat(path, &mut out).unwrap();
     u64::from_ne_bytes(out[8..16].try_into().unwrap())
 }
 
-#[test]
-fn a_symbolic_link_is_made_its_target_written_and_read() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn a_symbolic_link_is_made_its_target_written_and_read<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("lnk", 0o120777, &mut out).unwrap();
     v.write("lnk", 0, b"../elsewhere").unwrap();
@@ -176,10 +251,9 @@ fn a_symbolic_link_is_made_its_target_written_and_read() {
     assert_eq!(listing(&mut v, ""), [("lnk".to_string(), 0o120777, 12)]);
 }
 
-#[test]
-fn the_owner_permissions_and_time_are_kept() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn the_owner_permissions_and_time_are_kept<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("f", 0o100644, &mut out).unwrap();
     v.set_attr("f", 1000, 100, 0o4711).unwrap();
@@ -195,10 +269,9 @@ fn the_owner_permissions_and_time_are_kept() {
     );
 }
 
-#[test]
-fn renamed_and_removed_are_where_they_were_asked_to_be() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn renamed_and_removed_are_where_they_were_asked_to_be<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("d", 0o040755, &mut out).unwrap();
     v.create("d/x", 0o100644, &mut out).unwrap();
@@ -212,12 +285,11 @@ fn renamed_and_removed_are_where_they_were_asked_to_be() {
     assert!(listing(&mut v, "").is_empty());
 }
 
-#[test]
-fn a_dead_servers_changes_are_the_next_ones_and_so_is_what_it_kept_of_a_file() {
-    let (platter, mut held) = (platter(), Held::new());
+fn a_dead_servers_changes_are_the_next_ones_and_so_is_what_it_kept_of_a_file<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
     let data = bytes(200_000, 7);
     {
-        let mut v = open(&platter, &mut held);
+        let mut v = open::<F>(&platter, &mut held);
         let mut out = vec![0u8; 4096];
         v.create("keep", 0o040700, &mut out).unwrap();
         v.create("keep/big", 0o100600, &mut out).unwrap();
@@ -231,7 +303,7 @@ fn a_dead_servers_changes_are_the_next_ones_and_so_is_what_it_kept_of_a_file() {
         assert!(v.tail.kept().is_some());
         // Dies: nothing is flushed, nothing reaches the device.
     }
-    let mut v = open(&platter, &mut held);
+    let mut v = open::<F>(&platter, &mut held);
     assert!(v.adopted());
     let mut want = data.clone();
     want.extend_from_slice(b"end");
@@ -240,14 +312,14 @@ fn a_dead_servers_changes_are_the_next_ones_and_so_is_what_it_kept_of_a_file() {
     // And once it has flushed, a volume with nothing kept has it all.
     v.sync().unwrap();
     drop(v);
-    let mut fresh = Volume::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
+    let mut fresh =
+        Volume::<F, _>::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
     assert_eq!(read_all(&mut fresh, "keep/big", 300_000), want);
 }
 
-#[test]
-fn the_device_has_nothing_of_it_until_the_flush() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn the_device_has_nothing_of_it_until_the_flush<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     v.flush().unwrap();
     let before = platter.0.lock().unwrap().clone();
     let mut out = vec![0u8; 4096];
@@ -257,14 +329,14 @@ fn the_device_has_nothing_of_it_until_the_flush() {
     assert!(*platter.0.lock().unwrap() == before);
     v.flush().unwrap();
     assert!(!v.is_dirty());
-    let mut fresh = Volume::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
+    let mut fresh =
+        Volume::<F, _>::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
     assert_eq!(read_all(&mut fresh, "new", 10), b"hello");
 }
 
-#[test]
-fn a_read_only_volume_changes_nothing() {
-    let platter = platter();
-    let mut v = Volume::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
+fn a_read_only_volume_changes_nothing<F: Made>() {
+    let platter = F::platter();
+    let mut v = Volume::<F, _>::open(platter.clone(), LEN as u64, Memory::private(), true).unwrap();
     let mut out = vec![0u8; 4096];
     assert_eq!(v.create("f", 0o100644, &mut out), Err(libc::EROFS));
     assert_eq!(v.write("f", 0, b"x"), Err(libc::EROFS));
@@ -272,8 +344,9 @@ fn a_read_only_volume_changes_nothing() {
 
 #[test]
 fn a_change_writes_what_the_disks_journal_holds() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+    type F = Btrfs;
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("d", 0o040755, &mut out).unwrap();
     for i in 0..400 {
@@ -297,10 +370,9 @@ fn a_change_writes_what_the_disks_journal_holds() {
 /// A copy of the device and of the kept memory, as they are now.
 type Snapshot = (Vec<u8>, Vec<Page>);
 
-#[test]
-fn a_server_that_dies_anywhere_after_a_change_leaves_it_made() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+fn a_server_that_dies_anywhere_after_a_change_leaves_it_made<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     // Two directories far apart in the tree, so that moving a file from
     // one to the other changes several of its blocks.
@@ -335,17 +407,16 @@ fn a_server_that_dies_anywhere_after_a_change_leaves_it_made() {
     for (device, memory) in snapshots {
         let platter = Platter(Arc::new(StdMutex::new(device)));
         let mut held = Held(memory);
-        let mut next = open(&platter, &mut held);
+        let mut next = open::<F>(&platter, &mut held);
         assert_eq!(listing(&mut next, "z").len(), 1);
         assert_eq!(read_all(&mut next, "z/renamed", 10), b"one");
     }
 }
 
-#[test]
-fn the_changes_since_the_trees_were_written_are_made_again_by_the_next_server() {
-    let (platter, mut held) = (platter(), Held::new());
+fn the_changes_since_the_trees_were_written_are_made_again_by_the_next_server<F: Made>() {
+    let (platter, mut held) = (F::platter(), Held::new());
     {
-        let mut v = open(&platter, &mut held);
+        let mut v = open::<F>(&platter, &mut held);
         let mut out = vec![0u8; 4096];
         // Fewer changes than a writing of the trees waits for, of each kind.
         v.create("d", 0o040750, &mut out).unwrap();
@@ -364,7 +435,7 @@ fn the_changes_since_the_trees_were_written_are_made_again_by_the_next_server() 
         v.write("d/l", 0, b"z").unwrap();
         assert!(v.log.records() > 0 && v.log.records() < CHECKPOINT_EVERY);
     }
-    let mut v = open(&platter, &mut held);
+    let mut v = open::<F>(&platter, &mut held);
     assert_eq!(
         listing(&mut v, "d")
             .into_iter()
@@ -392,7 +463,7 @@ fn the_changes_since_the_trees_were_written_are_made_again_by_the_next_server() 
     );
     // And a third server, after the second wrote the trees, has the same.
     drop(v);
-    let mut v = open(&platter, &mut held);
+    let mut v = open::<F>(&platter, &mut held);
     assert_eq!(read_all(&mut v, "d/z", 10), b"first");
     assert_eq!(listing(&mut v, "d").len(), 3);
 }
@@ -400,8 +471,9 @@ fn the_changes_since_the_trees_were_written_are_made_again_by_the_next_server() 
 #[test]
 #[ignore]
 fn profile_writes() {
-    let (platter, mut held) = (platter(), Held::new());
-    let mut v = open(&platter, &mut held);
+    type F = Btrfs;
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
     let mut out = vec![0u8; 4096];
     v.create("big", 0o100644, &mut out).unwrap();
     let piece = bytes(64 * 1024, 3);
@@ -443,4 +515,44 @@ fn profile_writes() {
         t.elapsed() / 200,
         v.checkpoints
     );
+}
+
+#[test]
+#[ignore]
+fn profile_scattered() {
+    type F = EclipseFS;
+    let (platter, mut held) = (F::platter(), Held::new());
+    let mut v = open::<F>(&platter, &mut held);
+    let mut out = vec![0u8; 4096];
+    v.create("big", 0o100644, &mut out).unwrap();
+    let piece = bytes(64 * 1024, 3);
+    for i in 0..32 {
+        v.write("big", i * 65536, &piece).unwrap();
+    }
+    v.flush().unwrap();
+    eprintln!("before: reads {}", v.device_reads());
+    let t = std::time::Instant::now();
+    let mut at = 12345u64;
+    let small = bytes(4096, 5);
+    for _ in 0..500 {
+        at = at
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let offset = (at >> 20) % (2 * 1024 * 1024 - 4096);
+        v.write("big", offset, &small).unwrap();
+    }
+    eprintln!(
+        "pwrite 4k: {:?} each, reads {}",
+        t.elapsed() / 500,
+        v.device_reads()
+    );
+    let t = std::time::Instant::now();
+    v.flush().unwrap();
+    eprintln!("flush: {:?}, reads {}", t.elapsed(), v.device_reads());
+    let t = std::time::Instant::now();
+    let mut buf = vec![0u8; 65536];
+    for i in 0..32 {
+        v.read("big", i * 65536, &mut buf).unwrap();
+    }
+    eprintln!("read back: {:?}, reads {}", t.elapsed(), v.device_reads());
 }

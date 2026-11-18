@@ -1,4 +1,4 @@
-//! The device as btrfs reads and writes it: the FAT server's [`Disk`], whose
+//! The device as btrfs and EclipseFS read and write it: the FAT server's [`Disk`], whose
 //! chunks are in memory the mount holds.
 
 use std::io;
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use fatserve::disk::{Blocks, Disk};
 
-/// The disk, to be shared with btrfs, which asks for a device it can
+/// The disk, to be shared with the filesystem's code, which asks for a device it can
 /// send between threads.
 pub struct Shared<B: Blocks>(pub Disk<B>);
 
@@ -19,12 +19,12 @@ unsafe impl<B: Blocks + Send> Send for Shared<B> {}
 /// The shared disk.
 pub type DiskRef<B> = Arc<Mutex<Shared<B>>>;
 
-/// A [`Disk`] that btrfs can share: it asks for `&self`, and the server
+/// A [`Disk`] that the filesystem's code can share: it asks for `&self`, and the server
 /// flushes the same disk to the device.
 pub struct Dev<B: Blocks> {
     disk: DiskRef<B>,
     len: u64,
-    /// The bytes btrfs has written, for whoever measures.
+    /// The bytes the filesystem's code has written, for whoever measures.
     pub written: Arc<AtomicU64>,
     /// In a test: called before each write, to see the memory as a server
     /// that died there leaves it.
@@ -53,50 +53,56 @@ pub fn lock<B: Blocks>(disk: &DiskRef<B>) -> std::sync::MutexGuard<'_, Shared<B>
     disk.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn io_error(_: io::Error) -> btrfs::Error {
-    btrfs::Error::Io
-}
-
-impl<B: Blocks + Send + 'static> btrfs::BlockDevice for Dev<B> {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
-        if offset
-            .checked_add(buf.len() as u64)
-            .is_none_or(|end| end > self.len)
-        {
-            return Err(btrfs::Error::Io);
-        }
-        lock(&self.disk)
-            .0
-            .read_exact_at(offset, buf)
-            .map_err(io_error)
+impl<B: Blocks> Dev<B> {
+    /// `buf.len()` bytes at `offset`, all inside the device.
+    fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inside(offset, buf.len())?;
+        lock(&self.disk).0.read_exact_at(offset, buf)
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
-        if offset
-            .checked_add(buf.len() as u64)
-            .is_none_or(|end| end > self.len)
-        {
-            return Err(btrfs::Error::Io);
-        }
+    fn write(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.inside(offset, buf.len())?;
         self.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
         #[cfg(test)]
         if let Some(hook) = self.before_write.lock().unwrap().as_mut() {
             hook();
         }
-        lock(&self.disk)
-            .0
-            .write_all_at(offset, buf)
-            .map_err(io_error)
+        lock(&self.disk).0.write_all_at(offset, buf)
     }
 
-    /// What btrfs has written is in the disk's memory, which is what a
-    /// server after this one starts from: that is all a change asks. The
-    /// device has it when the server flushes the disk.
-    fn sync(&self) -> btrfs::Result<()> {
-        Ok(())
-    }
-
-    fn size(&self) -> u64 {
-        self.len
+    fn inside(&self, offset: u64, len: usize) -> io::Result<()> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.len => Ok(()),
+            _ => Err(io::ErrorKind::InvalidInput.into()),
+        }
     }
 }
+
+/// The device of each filesystem's code: what it has written is in the
+/// disk's memory, which is what a server after this one starts from, so a
+/// `sync` asks nothing more. The device has it when the server flushes
+/// the disk.
+macro_rules! device {
+    ($fs:ident) => {
+        impl<B: Blocks + Send + 'static> $fs::BlockDevice for Dev<B> {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> $fs::Result<()> {
+                self.read(offset, buf).map_err(|_| $fs::Error::Io)
+            }
+
+            fn write_at(&self, offset: u64, buf: &[u8]) -> $fs::Result<()> {
+                self.write(offset, buf).map_err(|_| $fs::Error::Io)
+            }
+
+            fn sync(&self) -> $fs::Result<()> {
+                Ok(())
+            }
+
+            fn size(&self) -> u64 {
+                self.len
+            }
+        }
+    };
+}
+
+device!(btrfs);
+device!(eclipsefs);
