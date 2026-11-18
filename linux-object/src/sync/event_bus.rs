@@ -484,6 +484,57 @@ pub fn subscribe_edge_on(
 /// `kill` can be, not on how fast data arrives.
 const INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
+/// How often a wait whose thread holds its waker for a signal still looks
+/// again on its own: the insurance against a wake lost in the readiness
+/// wiring.
+///
+/// Until 2026-11-17 every one of these waits had a tick (100 ms here, 20 ms
+/// on a unix socket, 100 ms for a covered poll/epoll). When the signal began
+/// to wake them by itself the tick went too (1 s for poll/epoll), on the
+/// grounds that insurance that is never expected to pay need not be paid
+/// for. Without it a wake lost anywhere between a writer and a reader is a
+/// wait that lasts until something else happens to that file -- and on a GPU
+/// desktop the whole session froze for tens of seconds at a time again.
+/// 100 ms bounds such a wake to a stutter, and [`note_lost_wake`] says in
+/// dmesg when the tick was what ended a wait.
+pub const LOST_WAKE_TICK_MS: u64 = 100;
+
+/// Waits that a [`LOST_WAKE_TICK_MS`] tick found ready although the file
+/// never woke them. 0 on a healthy machine.
+static LOST_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// When [`note_lost_wake`] last wrote a line, in ms of the monotonic clock.
+static LOST_WAKE_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many waits the insurance tick has rescued so far.
+pub fn lost_wake_count() -> u64 {
+    LOST_WAKES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A wait found its file ready with its readiness callback still on the
+/// file's list: the file changed and nobody told the wait, and it is only
+/// running now because its insurance tick fired. Counted always, and said in
+/// dmesg at most once a second, so a lost wake is a line to read and not a
+/// freeze to guess at.
+pub fn note_lost_wake(site: &'static str, events: Event, mask: Event) {
+    use core::sync::atomic::Ordering;
+    let n = LOST_WAKES.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_ms = kernel_hal::timer::timer_now().as_millis() as u64;
+    let last = LOST_WAKE_LAST_LOG_MS.load(Ordering::Relaxed);
+    if (last != 0 && now_ms.saturating_sub(last) < 1000)
+        || LOST_WAKE_LAST_LOG_MS
+            .compare_exchange(last, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    warn!(
+        "[wait] lost wake caught by the insurance tick: {} ready {:?} (wanted {:?}) with its \
+         callback still listed; {} so far",
+        site, events, mask, n
+    );
+}
+
 /// Whether a thread parked in a blocking wait must stop waiting -- because a
 /// signal is deliverable, the thread is dying, or the process has exited.
 ///
@@ -721,7 +772,8 @@ struct EventBusFuture {
     /// When the wait gives up with `EAGAIN`: see [`wait_for_event_until`].
     deadline: Option<Duration>,
     /// The number of this wait on the thread that holds its waker to wake
-    /// it for a signal: while it has one, no backstop timer is armed.
+    /// it for a signal: while it has one, only the `LOST_WAKE_TICK_MS`
+    /// insurance tick is armed.
     parked: Option<u64>,
 }
 
@@ -764,6 +816,14 @@ impl Future for EventBusFuture {
             let mut lock = this.bus.lock();
             if !(lock.event & this.mask).is_empty() {
                 if let Some(id) = this.sub_id.take() {
+                    // Still listed although the events it waits for are on:
+                    // the bus never fired it, and the tick is what woke us.
+                    if this.parked.is_some()
+                        && lock.is_subscribed(id)
+                        && this.timer.as_ref().is_some_and(|t| t.is_done())
+                    {
+                        note_lost_wake("event bus", lock.event, this.mask);
+                    }
                     lock.unsubscribe(id);
                 }
                 let event = lock.event;
@@ -839,9 +899,16 @@ impl Future for EventBusFuture {
             this.settle();
             return Poll::Ready(Err(err));
         }
-        let mut deadline = (!parked).then(|| {
-            kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS))
-        });
+        // Parked on the thread, a signal needs no tick; a wake lost on the
+        // bus still does (see `LOST_WAKE_TICK_MS`).
+        let tick_ms = if parked {
+            LOST_WAKE_TICK_MS
+        } else {
+            INTERRUPT_CHECK_TICK_MS
+        };
+        let mut deadline = Some(kernel_hal::timer::deadline_after(Duration::from_millis(
+            tick_ms,
+        )));
         // A wait with an end of its own: `EAGAIN` once it is past, and
         // until then the timer wakes it there and not a tick later.
         if let Some(until) = this.deadline {
@@ -854,15 +921,10 @@ impl Future for EventBusFuture {
             }
             deadline = Some(deadline.map_or(until, |tick| tick.min(until)));
         }
-        match deadline {
-            Some(deadline) => {
-                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
-                    cx.waker().wake_by_ref();
-                }
+        if let Some(deadline) = deadline {
+            if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+                cx.waker().wake_by_ref();
             }
-            // Parked on the thread and without an end of its own: only the
-            // bus or a signal ends this wait, and each wakes it by itself.
-            None => kernel_hal::timer_waker::kill_timer_waker(&mut this.timer),
         }
         Poll::Pending
     }
@@ -1154,12 +1216,12 @@ mod interruptible_wait_tests {
         ));
     }
 
-    /// A wait whose waker the thread takes arms no timer: the bus wakes it
-    /// for data and the thread wakes it for a signal, and when it is woken
+    /// A wait whose waker the thread takes arms only the insurance tick: the
+    /// bus wakes it for data and the thread wakes it for a signal, and when it is woken
     /// for one it comes back with the interruption and leaves nothing
     /// parked, on the bus or on the thread.
     #[test]
-    fn a_wait_parked_on_its_thread_arms_no_timer_and_ends_for_a_signal() {
+    fn a_wait_parked_on_its_thread_keeps_the_insurance_tick_and_ends_for_a_signal() {
         let _restore = Restore;
         static WOKE: AtomicBool = AtomicBool::new(false);
         WOKE.store(false, Ordering::SeqCst);
@@ -1171,9 +1233,10 @@ mod interruptible_wait_tests {
 
         let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, None);
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        // The insurance against a lost wake, and not later than 100 ms.
+        let tick = fut.timer.as_ref().expect("no insurance tick").deadline();
         assert!(
-            fut.timer.is_none(),
-            "a timer was armed for a wait the thread wakes"
+            tick <= kernel_hal::timer::deadline_after(Duration::from_millis(LOST_WAKE_TICK_MS))
         );
         assert_eq!(test_interrupt::parked_wait(), fut.parked);
         assert!(fut.parked.is_some());
@@ -1240,7 +1303,7 @@ mod interruptible_wait_tests {
         assert!(matches!(Pin::new(&mut first).poll(&mut cx), Poll::Pending));
         let mut second = EventBusFuture::new(bus.clone(), Event::WRITABLE, None);
         assert!(matches!(Pin::new(&mut second).poll(&mut cx), Poll::Pending));
-        assert!(first.timer.is_none());
+        assert!(first.timer.is_some(), "the insurance tick");
         assert!(second.timer.is_some());
         assert_eq!(second.parked, None);
 
@@ -1271,8 +1334,47 @@ mod interruptible_wait_tests {
         // The place is there for a wait without one.
         let mut other = EventBusFuture::new(bus.clone(), Event::WRITABLE, None);
         assert!(matches!(Pin::new(&mut other).poll(&mut cx), Poll::Pending));
-        assert!(other.timer.is_none());
+        assert!(other.timer.is_some(), "the insurance tick");
         assert_eq!(test_interrupt::parked_wait(), other.parked);
+    }
+
+    /// The events a wait waits for came on without the bus firing its
+    /// callback, and the insurance tick is what woke it: the wait still ends
+    /// with them, and the lost wake is counted.
+    #[test]
+    fn a_wake_the_bus_lost_is_caught_by_the_tick_and_counted() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        WOKE.store(false, Ordering::SeqCst);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        test_interrupt::clear();
+        test_interrupt::takes_wakers(true);
+
+        let mut fut = EventBusFuture::new(bus.clone(), Event::READABLE, None);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        // A change nobody announced: the flag is on, the callback still listed.
+        bus.lock().event = Event::READABLE;
+        assert_eq!(bus.lock().callbacks.len(), 1);
+        // The tick fires (the host timer is real; give it its 100 ms).
+        for _ in 0..1000 {
+            if WOKE.load(Ordering::SeqCst) {
+                break;
+            }
+            async_std::task::block_on(async_std::task::sleep(Duration::from_millis(5)));
+        }
+        assert!(
+            WOKE.load(Ordering::SeqCst),
+            "the insurance tick never fired"
+        );
+        let before = lost_wake_count();
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Ok(Event::READABLE))
+        ));
+        assert_eq!(lost_wake_count(), before + 1);
+        assert_eq!(bus.lock().callbacks.len(), 0);
     }
 
     #[test]
