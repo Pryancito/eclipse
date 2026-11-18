@@ -408,7 +408,10 @@ mod tests {
         assert_eq!(add(&s, GROUP), Ok(0));
         assert_eq!(Socket::bind(&s, any(5000)), Ok(0));
         let stack = stack_of(&link);
-        assert_eq!(stack.told(), Some(bind_message(s.sock, 5000, Takes::Four)));
+        assert_eq!(
+            stack.told(),
+            Some(bind_message(s.sock, 5000, Takes::Four, None))
+        );
         assert_eq!(stack.told(), Some(join_message(GROUP)));
         assert_eq!(stack.told(), None);
         // And the one after it.
@@ -419,7 +422,10 @@ mod tests {
         assert_eq!(drop_group(&s, GROUP), Ok(0));
         assert_eq!(add(&s, OTHER), Ok(0));
         let next = stack_of(&link);
-        assert_eq!(next.told(), Some(bind_message(s.sock, 5000, Takes::Four)));
+        assert_eq!(
+            next.told(),
+            Some(bind_message(s.sock, 5000, Takes::Four, None))
+        );
         assert_eq!(next.told(), Some(join_message(OTHER)));
         assert_eq!(next.told(), None);
         // What arrives for the group arrives for the port.
@@ -435,13 +441,13 @@ mod tests {
         assert_eq!(Socket::bind(&member, any(5000)), Ok(0));
         assert_eq!(
             stack.told(),
-            Some(bind_message(member.sock, 5000, Takes::Four))
+            Some(bind_message(member.sock, 5000, Takes::Four, None))
         );
         let sender = socket(&stack.link);
         assert_eq!(Socket::bind(&sender, any(6000)), Ok(0));
         assert_eq!(
             stack.told(),
-            Some(bind_message(sender.sock, 6000, Takes::Four))
+            Some(bind_message(sender.sock, 6000, Takes::Four, None))
         );
 
         // Nobody here is a member: out, one hop, and that is all.

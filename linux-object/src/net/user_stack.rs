@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! all:    0  u32 zero   4  u32 op   8  u64 socket
-//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero
+//! BIND    (kernel to stack)  16  u16 port  18  u8 only  19  u8 zero, or 4 or 6 and then  20  [u8; 16] address
 //! SEND    (kernel to stack)  16  [u8; 4] to    20  u16 port  22  u8 hop limit  23  u8 zero  24  the datagram
 //! CLOSE   (kernel to stack)
 //! DATA    (stack to kernel)  16  one record after another, to the end:
@@ -47,7 +47,7 @@
 //! `poll` answer without a trip:
 //!
 //! ```text
-//! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window
+//! CONNECT  (kernel to stack)  16  [u8; 4] to  20  u16 port  22  u16 local port  24  u32 window  (28  [u8; 4] from)
 //! LISTEN   (kernel to stack)  16  u16 port  18  u16 backlog  20  u32 window
 //! WRITE    (kernel to stack)  16  the bytes
 //! SHUTDOWN (kernel to stack)
@@ -290,7 +290,7 @@
 //! IPv6 is an `ACCEPTED6`:
 //!
 //! ```text
-//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window
+//! CONNECT6 (kernel to stack)  16  [u8; 16] to  32  u16 port  34  u16 local port  36  u32 window  (40  [u8; 16] from)
 //! LISTEN6  (kernel to stack)  as LISTEN
 //! LISTEN6ONLY (kernel to stack)  as LISTEN
 //!     CONNECTED  bytes: none, or [u8; 16] the address it connected from
@@ -454,10 +454,24 @@ fn header(op: u32, sock: u64, room: usize) -> Vec<u8> {
 }
 
 /// `BIND`: socket `sock` has port `port`, for what arrives as `takes`.
-pub fn bind_message(sock: u64, port: u16, takes: Takes) -> Vec<u8> {
-    let mut m = header(OP_BIND, sock, 4);
+/// When it was bound to the address `at` of a card's, sixteen bytes more
+/// say it, and the byte before them its version (4 or 6): the socket
+/// sends from that address and hears what arrives at it.
+pub fn bind_message(sock: u64, port: u16, takes: Takes, at: Option<IpAddress>) -> Vec<u8> {
+    let mut m = header(OP_BIND, sock, 20);
     m.extend_from_slice(&port.to_le_bytes());
-    m.extend_from_slice(&[takes.byte(), 0]);
+    match at {
+        Some(IpAddress::Ipv4(at)) => {
+            m.extend_from_slice(&[takes.byte(), 4]);
+            m.extend_from_slice(&at.0);
+            m.extend_from_slice(&[0; 12]);
+        }
+        Some(IpAddress::Ipv6(at)) => {
+            m.extend_from_slice(&[takes.byte(), 6]);
+            m.extend_from_slice(&at.0);
+        }
+        _ => m.extend_from_slice(&[takes.byte(), 0]),
+    }
     m
 }
 
@@ -1005,6 +1019,9 @@ struct Inner {
     /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
     /// of this machine alone, which the stack is not told of.
     here: Option<Ipv4Address>,
+    /// The address of a card's it was bound to, when it was: what it
+    /// sends leaves from it, and the stack is told so.
+    bound: Option<IpAddress>,
     /// The peer of a connected socket.
     remote: Option<IpEndpoint>,
     /// Whether the peer was said as an address of IPv6: `::1`, which is
@@ -1063,6 +1080,7 @@ impl Shared {
                 queued_bytes: 0,
                 port: None,
                 here: None,
+                bound: None,
                 remote: None,
                 remote_six: false,
                 flags: OpenFlags::RDWR,
@@ -1817,8 +1835,12 @@ impl StackLink {
             let _ = self.tell(said, true);
         }
         for (sock, port, shared) in bound {
-            if shared.inner.lock().here.is_none() {
-                let _ = self.tell(bind_message(sock, port, shared.takes()), true);
+            let (here, at) = {
+                let inner = shared.inner.lock();
+                (inner.here, inner.bound)
+            };
+            if here.is_none() {
+                let _ = self.tell(bind_message(sock, port, shared.takes(), at), true);
             }
         }
         for (sock, port, stream) in listening {
@@ -2178,11 +2200,19 @@ impl StackLink {
     }
 
     /// Give a socket the port `wanted`, or any when it is 0, for what it
-    /// `takes`, and tell the stack, unless the socket is this machine's
-    /// alone (`told`). `EADDRINUSE` when another has it for any of that
+    /// `takes`, and tell the stack, with the address `at` of a card's the
+    /// socket was bound to, unless the socket is this machine's alone
+    /// (`told`). `EADDRINUSE` when another has it for any of that
     /// or none is left. With no stack to tell, the port is the socket's
     /// all the same: the next stack is told when it comes.
-    fn bind(&self, sock: u64, wanted: u16, takes: Takes, told: bool) -> LxResult<u16> {
+    fn bind(
+        &self,
+        sock: u64,
+        wanted: u16,
+        takes: Takes,
+        told: bool,
+        at: Option<IpAddress>,
+    ) -> LxResult<u16> {
         let _telling = self.telling.lock();
         let port = {
             let mut table = self.table.lock();
@@ -2191,7 +2221,7 @@ impl StackLink {
             port
         };
         if told {
-            let _ = self.tell(bind_message(sock, port, takes), true);
+            let _ = self.tell(bind_message(sock, port, takes, at), true);
         }
         Ok(port)
     }
@@ -2446,7 +2476,9 @@ impl ServedUdpSocket {
         if let Some(port) = self.shared.inner.lock().port {
             return Ok(port);
         }
-        let port = self.link.bind(self.sock, 0, self.shared.takes(), true)?;
+        let port = self
+            .link
+            .bind(self.sock, 0, self.shared.takes(), true, None)?;
         self.shared.inner.lock().port = Some(port);
         Ok(port)
     }
@@ -2570,9 +2602,16 @@ impl Socket for ServedUdpSocket {
                 (inner.remote.ok_or(LxError::ENOTCONN)?, inner.remote_six)
             }
         };
-        let addr = match to.addr {
-            IpAddress::Ipv4(addr) => addr,
-            IpAddress::Ipv6(addr) => return self.write6(addr, to.port, data),
+        // From an address of one version of IP there is no way to one of
+        // the other.
+        let bound = self.shared.inner.lock().bound;
+        let addr = match (to.addr, bound) {
+            (IpAddress::Ipv4(_), Some(IpAddress::Ipv6(_)))
+            | (IpAddress::Ipv6(_), Some(IpAddress::Ipv4(_))) => {
+                return Err(LxError::ENETUNREACH);
+            }
+            (IpAddress::Ipv4(addr), _) => addr,
+            (IpAddress::Ipv6(addr), _) => return self.write6(addr, to.port, data),
             _ => return Err(LxError::EAFNOSUPPORT),
         };
         let here = {
@@ -2590,7 +2629,13 @@ impl Socket for ServedUdpSocket {
                 return Err(LxError::EMSGSIZE);
             }
             let port = self.autobind()?;
-            let from = here.unwrap_or_else(|| self.link.here_for(addr));
+            // To a program of this machine too, from the address the
+            // socket was bound to.
+            let from = match (here, bound) {
+                (Some(here), _) => here,
+                (None, Some(IpAddress::Ipv4(bound))) => bound,
+                _ => self.link.here_for(addr),
+            };
             let from = IpEndpoint::new(IpAddress::Ipv4(from), port);
             if !self.link.send_here(from, addr, to.port, data, six) {
                 // Nobody at the port, said as the ICMP message that
@@ -2667,13 +2712,19 @@ impl Socket for ServedUdpSocket {
         // `inet6_bind`: an address of IPv4 is none for a socket that is
         // for IPv6 only.
         local.addr = self.way(local.addr, LxError::EINVAL)?;
-        // An IPv6 address has to be one the card has; the socket then
-        // hears at its port, like one bound to `::`.
-        if let IpAddress::Ipv6(addr) = local.addr {
-            if !self.link.sixes.has(&addr) {
-                return Err(LxError::EADDRNOTAVAIL);
-            }
-        }
+        // An address has to be one the machine has (`inet_bind`,
+        // `inet6_bind`). At one of a card's the socket hears what arrives
+        // at it and sends from it, which the stack is told; at
+        // everybody's or a group's it is as one bound to no address.
+        let bound = match local.addr {
+            IpAddress::Ipv6(addr) if self.link.sixes.has(&addr) => Some(local.addr),
+            IpAddress::Ipv6(_) => return Err(LxError::EADDRNOTAVAIL),
+            IpAddress::Ipv4(addr) if addr.is_unspecified() || addr.is_loopback() => None,
+            IpAddress::Ipv4(addr) if self.link.is_here(addr) => Some(local.addr),
+            IpAddress::Ipv4(addr) if addr.is_broadcast() || addr.is_multicast() => None,
+            IpAddress::Ipv4(_) => return Err(LxError::EADDRNOTAVAIL),
+            _ => None,
+        };
         // `inet_bind`: a socket that has a port is `EINVAL`.
         if self.shared.inner.lock().port.is_some() {
             return Err(LxError::EINVAL);
@@ -2687,14 +2738,21 @@ impl Socket for ServedUdpSocket {
         // Said before the port is taken: a stack that starts to serve
         // just then is told of the sockets that are not this machine's
         // alone.
-        self.shared.inner.lock().here = here;
+        {
+            let mut inner = self.shared.inner.lock();
+            inner.here = here;
+            inner.bound = bound;
+        }
         let takes = self.shared.takes();
-        let bound = self.link.bind(self.sock, local.port, takes, here.is_none());
+        let port = self
+            .link
+            .bind(self.sock, local.port, takes, here.is_none(), bound);
         let mut inner = self.shared.inner.lock();
-        match bound {
+        match port {
             Ok(port) => inner.port = Some(port),
             Err(e) => {
                 inner.here = None;
+                inner.bound = None;
                 return Err(e);
             }
         }
@@ -2719,13 +2777,16 @@ impl Socket for ServedUdpSocket {
         // asks which address of the machine reaches somewhere. `arping`
         // asked, was told 0.0.0.0, and asked the wire who has an address
         // on behalf of nobody.
-        let from = inner.here.or_else(|| match inner.remote?.addr {
-            IpAddress::Ipv4(to) if self.link.is_here(to) => Some(self.link.here_for(to)),
-            IpAddress::Ipv4(to) => Some(self.link.address_toward(to)),
-            _ => None,
+        // One bound to an address of a card's speaks from that one.
+        let from = inner.here.map(IpAddress::Ipv4).or(inner.bound).or_else(|| {
+            Some(IpAddress::Ipv4(match inner.remote?.addr {
+                IpAddress::Ipv4(to) if self.link.is_here(to) => self.link.here_for(to),
+                IpAddress::Ipv4(to) => self.link.address_toward(to),
+                _ => return None,
+            }))
         });
         let local = IpEndpoint::new(
-            IpAddress::Ipv4(from.unwrap_or(Ipv4Address::UNSPECIFIED)),
+            from.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
             inner.port.unwrap_or(0),
         );
         Some(Endpoint::Ip(shown(self.shared.takes(), local)))

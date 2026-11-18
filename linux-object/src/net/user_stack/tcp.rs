@@ -69,6 +69,9 @@ struct Inner {
     /// The address of 127.0.0.0/8 it was bound to, when it was: a socket
     /// of this machine alone, which the stack is not told of.
     here: Option<Ipv4Address>,
+    /// The address of a card's it was bound to, when it was: a
+    /// connection it makes is from that address, which the stack is told.
+    bound: Option<IpAddress>,
     /// An `AF_INET6` socket that was told to carry IPv6 alone
     /// (`IPV6_V6ONLY`), which it can be told until it has a port; and so
     /// are the connections that arrive on it.
@@ -103,6 +106,7 @@ impl Inner {
             port: None,
             holds_port: false,
             here: None,
+            bound: None,
             only6: false,
             local: None,
             at: None,
@@ -219,6 +223,8 @@ fn address(inner: &Inner, link: &StackLink) -> IpAddress {
         local
     } else if let Some(here) = inner.here {
         IpAddress::Ipv4(here)
+    } else if let Some(bound) = inner.bound {
+        bound
     } else if let Some(at) = inner.at {
         IpAddress::Ipv6(at)
     } else {
@@ -917,20 +923,31 @@ impl Socket for ServedTcpSocket {
                     if inner.here.is_some() && !here {
                         return Err(LxError::EINVAL);
                     }
+                    // Nor from an address of one version of IP to one
+                    // of the other.
+                    if matches!(
+                        (inner.bound, peer.addr),
+                        (Some(IpAddress::Ipv4(_)), IpAddress::Ipv6(_))
+                            | (Some(IpAddress::Ipv6(_)), IpAddress::Ipv4(_))
+                    ) {
+                        return Err(LxError::ENETUNREACH);
+                    }
                     let local = self.autobind(&mut inner)?;
                     inner.phase = Phase::Connecting;
                     inner.error = None;
                     inner.remote = Some(peer);
                     if here {
                         inner.local = Some(match peer.addr {
-                            IpAddress::Ipv4(addr) => IpAddress::Ipv4(
-                                inner.here.unwrap_or_else(|| self.link.here_for(addr)),
-                            ),
-                            own => own,
+                            IpAddress::Ipv4(addr) => inner
+                                .here
+                                .map(IpAddress::Ipv4)
+                                .or(inner.bound)
+                                .unwrap_or_else(|| IpAddress::Ipv4(self.link.here_for(addr))),
+                            own => inner.bound.unwrap_or(own),
                         });
                     }
                     self.stream.sync(&inner, Event::empty());
-                    Some((local, inner.local))
+                    Some((local, inner.local, inner.bound))
                 }
                 // `__inet_stream_connect`: a second connect on a socket
                 // that does not wait is told the first is under way; one
@@ -942,14 +959,14 @@ impl Socket for ServedTcpSocket {
                 Phase::Open | Phase::Listening | Phase::Over => return Err(LxError::EISCONN),
             }
         };
-        if let Some((local, Some(from))) = started.filter(|_| here) {
+        if let Some((local, Some(from), _)) = started.filter(|_| here) {
             // Made or refused by the time this returns: there is nothing
             // to be in progress, and the wait below does not wait.
             let from = IpEndpoint::new(from, local);
             self.link.join(self.sock, peer.addr, peer.port, from, six);
-        } else if let Some((local, _)) = started {
+        } else if let Some((local, _, bound)) = started {
             let window = STREAM_WINDOW as u32;
-            let connect = match peer.addr {
+            let mut connect = match peer.addr {
                 IpAddress::Ipv6(addr) => {
                     connect6_message(self.sock, addr.0, peer.port, local, window)
                 }
@@ -958,6 +975,13 @@ impl Socket for ServedTcpSocket {
                 }
                 _ => return Err(LxError::EAFNOSUPPORT),
             };
+            // From the address the socket was bound to, said after the
+            // rest: a connect with none is as it always was.
+            match bound {
+                Some(IpAddress::Ipv4(from)) => connect.extend_from_slice(&from.0),
+                Some(IpAddress::Ipv6(from)) => connect.extend_from_slice(&from.0),
+                _ => {}
+            }
             // No stack, no way out of the machine: `ENETDOWN`, here and
             // not once more on what the socket does next.
             if let Err(e) = self.link.tell(connect, true) {
@@ -1021,19 +1045,23 @@ impl Socket for ServedTcpSocket {
         local.addr = either(self.v6, local.addr, LxError::EADDRNOTAVAIL)?;
         match local.addr {
             IpAddress::Unspecified => {}
-            IpAddress::Ipv4(addr) if addr.is_unspecified() || addr == self.link.address() => {}
-            IpAddress::Ipv4(addr) if self.link.is_another(addr) => {}
+            IpAddress::Ipv4(addr) if addr.is_unspecified() => {}
             // This machine's alone: see `listen`.
             IpAddress::Ipv4(addr) if addr.is_loopback() => {}
-            // An address of the card's is heard at like every address.
+            // An address of a card's, its first or another: heard at like
+            // every address, and what the socket connects from.
+            IpAddress::Ipv4(addr) if self.link.is_here(addr) => {}
             IpAddress::Ipv6(addr) if self.link.sixes().has(&addr) => {}
-            // The stack has one address of IPv4, and the ones it said of
-            // IPv6.
             IpAddress::Ipv4(_) | IpAddress::Ipv6(_) => return Err(LxError::EADDRNOTAVAIL),
             _ => return Err(LxError::EAFNOSUPPORT),
         }
         let here = match local.addr {
             IpAddress::Ipv4(addr) if addr.is_loopback() => Some(addr),
+            _ => None,
+        };
+        let bound = match local.addr {
+            IpAddress::Ipv4(addr) if !addr.is_unspecified() && here.is_none() => Some(local.addr),
+            IpAddress::Ipv6(_) => Some(local.addr),
             _ => None,
         };
         let mut inner = self.stream.inner.lock();
@@ -1052,6 +1080,7 @@ impl Socket for ServedTcpSocket {
         inner.port = Some(port);
         inner.holds_port = true;
         inner.here = here;
+        inner.bound = bound;
         Ok(0)
     }
 

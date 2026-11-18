@@ -454,4 +454,93 @@ mod tests {
         assert!(link.sixes().addresses().is_empty());
         assert!(!link.configure(0, also));
     }
+
+    #[test]
+    fn a_socket_bound_to_an_address_of_a_cards_says_so_to_the_stack() {
+        use super::super::tests::{at, ip};
+        use super::super::{
+            bind_message, connect_message, send_message, ServedTcpSocket, ServedUdpSocket, Takes,
+            HEADER_LEN,
+        };
+        use crate::error::LxError;
+        use crate::fs::{FileLike, OpenFlags};
+        use crate::net::{Endpoint, Socket};
+        use core::convert::TryInto;
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let link = stack.link.clone();
+        link.first_card(Card::first(MAC, STACK_ADDR, 24, 0), None);
+        let other = [192, 168, 7, 9];
+        let beside = (AN_ADDRESS, v4([10, 0, 9, 77], 24), None);
+        stack.say(more_message(
+            0,
+            &[beside, (AN_ADDRESS, v4(other, 24), None)],
+        ));
+        while stack.told().is_some() {}
+        // Where the card's first address and another are on one network,
+        // a socket bound to neither speaks from the first.
+        assert_eq!(
+            link.address_toward(Ipv4Address([10, 0, 9, 1])),
+            Ipv4Address(STACK_ADDR)
+        );
+
+        // Not at an address nobody of this machine has.
+        let s = ServedUdpSocket::new(link.clone(), false).unwrap();
+        assert_eq!(
+            Socket::bind(&s, Endpoint::Ip(at([192, 168, 8, 9], 5000))),
+            Err(LxError::EADDRNOTAVAIL)
+        );
+        // At the card's other address: the stack is told which, and the
+        // socket says it is there.
+        assert_eq!(Socket::bind(&s, Endpoint::Ip(at(other, 5000))), Ok(0));
+        let said = bind_message(s.sock, 5000, Takes::Four, Some(at(other, 0).addr));
+        assert_eq!(said.len(), HEADER_LEN + 20);
+        assert_eq!(said[16..24], [0x88, 0x13, 4, 4, 192, 168, 7, 9]);
+        assert_eq!(stack.told(), Some(said));
+        assert_eq!(ip(Socket::endpoint(&s).unwrap()), at(other, 5000));
+        // What it sends goes to the stack, which has it leave from there.
+        let far = Endpoint::Ip(at([10, 0, 9, 1], 53));
+        assert_eq!(Socket::write(&s, b"hi", Some(far)), Ok(2));
+        assert_eq!(
+            stack.told(),
+            Some(send_message(s.sock, [10, 0, 9, 1], 53, 64, b"hi"))
+        );
+        // At its first, the same.
+        let first = ServedUdpSocket::new(link.clone(), false).unwrap();
+        assert_eq!(
+            Socket::bind(&first, Endpoint::Ip(at(STACK_ADDR, 5001))),
+            Ok(0)
+        );
+        assert_eq!(
+            stack.told(),
+            Some(bind_message(
+                first.sock,
+                5001,
+                Takes::Four,
+                Some(at(STACK_ADDR, 0).addr)
+            ))
+        );
+
+        // A connection from a socket bound there is from there: four
+        // bytes after what a connect always said.
+        let t = ServedTcpSocket::new(link.clone(), false).unwrap();
+        FileLike::set_flags(&t, OpenFlags::NON_BLOCK).unwrap();
+        assert_eq!(Socket::bind(&t, Endpoint::Ip(at(other, 6000))), Ok(0));
+        assert_eq!(ip(Socket::endpoint(&t).unwrap()), at(other, 6000));
+        let far = Endpoint::Ip(at([10, 0, 9, 1], 80));
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&t, far)),
+            Err(LxError::EINPROGRESS)
+        );
+        let told = stack.told().unwrap();
+        let (plain, from) = told.split_at(told.len() - 4);
+        assert_eq!(from, other);
+        let window = u32::from_le_bytes(plain[24..28].try_into().unwrap());
+        let sock = u64::from_le_bytes(plain[8..16].try_into().unwrap());
+        assert_eq!(
+            plain,
+            connect_message(sock, [10, 0, 9, 1], 80, 6000, window)
+        );
+        assert_eq!(ip(Socket::endpoint(&t).unwrap()), at(other, 6000));
+    }
 }

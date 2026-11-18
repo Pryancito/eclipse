@@ -446,7 +446,10 @@ mod tests {
         assert_eq!(add(&s, GROUP), Ok(0));
         assert_eq!(Socket::bind(&s, Endpoint::Ip(at6("::", 5000))), Ok(0));
         let stack = stack_of(&link);
-        assert_eq!(stack.told(), Some(bind_message(s.sock, 5000, Takes::Both)));
+        assert_eq!(
+            stack.told(),
+            Some(bind_message(s.sock, 5000, Takes::Both, None))
+        );
         assert_eq!(stack.told(), Some(join(GROUP)));
         assert_eq!(stack.told(), None);
         // And the one after it.
@@ -457,7 +460,10 @@ mod tests {
         assert_eq!(drop_group(&s, GROUP), Ok(0));
         assert_eq!(add(&s, OTHER), Ok(0));
         let next = stack_of(&link);
-        assert_eq!(next.told(), Some(bind_message(s.sock, 5000, Takes::Both)));
+        assert_eq!(
+            next.told(),
+            Some(bind_message(s.sock, 5000, Takes::Both, None))
+        );
         assert_eq!(next.told(), Some(join(OTHER)));
         assert_eq!(next.told(), None);
     }
