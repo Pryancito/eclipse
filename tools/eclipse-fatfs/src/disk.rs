@@ -183,34 +183,69 @@ struct Meta {
 }
 
 const NO_CHUNK: u64 = u64::MAX;
-/// Where the [`Meta`]s start, and the chunks' bytes.
+/// Where the [`Meta`]s start.
 const METAS_AT: usize = 4096;
-const BYTES_AT: usize = 8192;
-const _: () = assert!(METAS_AT + CHUNKS_KEPT * core::mem::size_of::<Meta>() <= BYTES_AT);
-/// The journal, after the chunks: which sector each of its places is of,
-/// then the places' bytes.
-const JOURNAL_AT: usize = BYTES_AT + CHUNKS_KEPT * CHUNK;
-const JOURNAL_BYTES_AT: usize = JOURNAL_AT + (GROUP_MAX * 8).next_multiple_of(4096);
-const _: () = assert!(GROUP_MAX * 8 <= JOURNAL_BYTES_AT - JOURNAL_AT);
+
+/// Where the parts of a [`Kept`] of `chunks` places are: the chunks'
+/// bytes, after the [`Meta`]s; the journal, after the chunks (which sector
+/// each of its places is of, then the places' bytes); and the end.
+const fn layout(chunks: usize) -> (usize, usize, usize, usize) {
+    let bytes_at = (METAS_AT + chunks * core::mem::size_of::<Meta>()).next_multiple_of(4096);
+    let journal_at = bytes_at + chunks * CHUNK;
+    let journal_bytes_at = journal_at + (GROUP_MAX * 8).next_multiple_of(4096);
+    (
+        bytes_at,
+        journal_at,
+        journal_bytes_at,
+        journal_bytes_at + GROUP_MAX * SECTOR,
+    )
+}
 
 /// The memory the chunks are kept in: a [`Head`], a [`Meta`] for each
 /// place, the places' bytes, and the journal.
 pub struct Kept {
     base: *mut u8,
+    /// The places for chunks.
+    chunks: usize,
+    /// Where the chunks' bytes, the journal and its bytes are.
+    bytes_at: usize,
+    journal_at: usize,
+    journal_bytes_at: usize,
     /// The memory, when it is this process's own.
     _own: Option<Vec<u128>>,
 }
 
 impl Kept {
-    /// The bytes of it.
-    pub const LEN: usize = JOURNAL_BYTES_AT + GROUP_MAX * SECTOR;
+    /// The bytes of it, with [`CHUNKS_KEPT`] places.
+    pub const LEN: usize = Self::len(CHUNKS_KEPT);
+
+    /// The bytes of one with `chunks` places.
+    pub const fn len(chunks: usize) -> usize {
+        layout(chunks).3
+    }
 
     /// Memory of this process's own, which goes when it does.
     pub fn private() -> Self {
-        let mut own = vec![0u128; Self::LEN / 16];
+        Self::private_with(CHUNKS_KEPT)
+    }
+
+    /// The same, with `chunks` places.
+    pub fn private_with(chunks: usize) -> Self {
+        let mut own = vec![0u128; Self::len(chunks) / 16];
+        let mut kept = Self::laid_out(own.as_mut_ptr().cast(), chunks);
+        kept._own = Some(own);
+        kept
+    }
+
+    fn laid_out(base: *mut u8, chunks: usize) -> Self {
+        let (bytes_at, journal_at, journal_bytes_at, _) = layout(chunks);
         Kept {
-            base: own.as_mut_ptr().cast(),
-            _own: Some(own),
+            base,
+            chunks,
+            bytes_at,
+            journal_at,
+            journal_bytes_at,
+            _own: None,
         }
     }
 
@@ -221,7 +256,16 @@ impl Kept {
     /// are readable and writable for as long as this is used, and nothing
     /// else reads or writes them meanwhile.
     pub unsafe fn at(base: *mut u8) -> Self {
-        Kept { base, _own: None }
+        Self::laid_out(base, CHUNKS_KEPT)
+    }
+
+    /// The memory at `base`, with `chunks` places: the number the `Kept`
+    /// that was there before had.
+    ///
+    /// # Safety
+    /// As [`at`](Self::at), for [`Kept::len`]`(chunks)` bytes.
+    pub unsafe fn at_with(base: *mut u8, chunks: usize) -> Self {
+        Self::laid_out(base, chunks)
     }
 
     fn head(&mut self) -> &mut Head {
@@ -231,21 +275,21 @@ impl Kept {
     }
 
     fn meta(&self, place: usize) -> &Meta {
-        assert!(place < CHUNKS_KEPT);
+        assert!(place < self.chunks);
         // SAFETY: as `head`; the place is one of them.
         unsafe { &*self.base.add(METAS_AT).cast::<Meta>().add(place) }
     }
 
     fn meta_mut(&mut self, place: usize) -> &mut Meta {
-        assert!(place < CHUNKS_KEPT);
+        assert!(place < self.chunks);
         // SAFETY: as `meta`.
         unsafe { &mut *self.base.add(METAS_AT).cast::<Meta>().add(place) }
     }
 
     fn bytes(&self, place: usize) -> &[u8] {
-        assert!(place < CHUNKS_KEPT);
+        assert!(place < self.chunks);
         // SAFETY: the place's own stretch of the memory.
-        unsafe { core::slice::from_raw_parts(self.base.add(BYTES_AT + place * CHUNK), CHUNK) }
+        unsafe { core::slice::from_raw_parts(self.base.add(self.bytes_at + place * CHUNK), CHUNK) }
     }
 
     /// The sector the journal's place `i` is of, and its bytes.
@@ -255,8 +299,11 @@ impl Kept {
         // base is.
         unsafe {
             (
-                *self.base.add(JOURNAL_AT).cast::<u64>().add(i),
-                core::slice::from_raw_parts(self.base.add(JOURNAL_BYTES_AT + i * SECTOR), SECTOR),
+                *self.base.add(self.journal_at).cast::<u64>().add(i),
+                core::slice::from_raw_parts(
+                    self.base.add(self.journal_bytes_at + i * SECTOR),
+                    SECTOR,
+                ),
             )
         }
     }
@@ -265,9 +312,12 @@ impl Kept {
         assert!(i < GROUP_MAX);
         // SAFETY: as `journal`.
         unsafe {
-            *self.base.add(JOURNAL_AT).cast::<u64>().add(i) = sector;
-            core::slice::from_raw_parts_mut(self.base.add(JOURNAL_BYTES_AT + i * SECTOR), SECTOR)
-                .copy_from_slice(bytes);
+            *self.base.add(self.journal_at).cast::<u64>().add(i) = sector;
+            core::slice::from_raw_parts_mut(
+                self.base.add(self.journal_bytes_at + i * SECTOR),
+                SECTOR,
+            )
+            .copy_from_slice(bytes);
         }
     }
 
@@ -297,12 +347,15 @@ impl Kept {
 
     /// The place's metadata and its bytes, to change both.
     fn place_mut(&mut self, place: usize) -> (&mut Meta, &mut [u8]) {
-        assert!(place < CHUNKS_KEPT);
+        assert!(place < self.chunks);
         // SAFETY: as `meta` and `bytes`, which do not overlap.
         unsafe {
             (
                 &mut *self.base.add(METAS_AT).cast::<Meta>().add(place),
-                core::slice::from_raw_parts_mut(self.base.add(BYTES_AT + place * CHUNK), CHUNK),
+                core::slice::from_raw_parts_mut(
+                    self.base.add(self.bytes_at + place * CHUNK),
+                    CHUNK,
+                ),
             )
         }
     }
@@ -330,6 +383,9 @@ pub struct Disk<B> {
     /// In a test, how many times the stream was read.
     #[cfg(test)]
     pub reads: u64,
+    /// Reads this long, of whole sectors, go straight from the device
+    /// ([`set_direct_min`](Self::set_direct_min)).
+    direct_min: usize,
     /// How many times the device was read, and written.
     pub device_reads: u64,
     pub device_writes: u64,
@@ -383,7 +439,7 @@ impl<B: Blocks> Disk<B> {
             if kept.head().device_len != len {
                 return None;
             }
-            for place in 0..CHUNKS_KEPT {
+            for place in 0..kept.chunks {
                 let meta = *kept.meta(place);
                 if meta.index == NO_CHUNK {
                     continue;
@@ -398,7 +454,7 @@ impl<B: Blocks> Disk<B> {
                 clock = clock.max(meta.used);
             }
         } else {
-            for place in 0..CHUNKS_KEPT {
+            for place in 0..kept.chunks {
                 *kept.meta_mut(place) = Meta {
                     index: NO_CHUNK,
                     used: 0,
@@ -426,6 +482,7 @@ impl<B: Blocks> Disk<B> {
             changes_left: None,
             #[cfg(test)]
             reads: 0,
+            direct_min: DIRECT_MIN,
             device_reads: 0,
             device_writes: 0,
         };
@@ -518,6 +575,15 @@ impl<B: Blocks> Disk<B> {
         Ok(())
     }
 
+    /// Reads of `min` bytes or more, of whole sectors, go straight from the
+    /// device to whoever asked, and those shorter through the kept chunks:
+    /// [`DIRECT_MIN`] unless this says. A filesystem that reads its own
+    /// blocks again, a tree's nodes and the blocks a small write goes
+    /// into, keeps them by asking for more.
+    pub fn set_direct_min(&mut self, min: usize) {
+        self.direct_min = min;
+    }
+
     /// Whether the chunks were in the memory already: another `Disk`'s,
     /// that is gone.
     pub fn adopted(&self) -> bool {
@@ -555,7 +621,7 @@ impl<B: Blocks> Disk<B> {
 
     /// Whether something written has not reached the device.
     pub fn is_dirty(&self) -> bool {
-        (0..CHUNKS_KEPT).any(|place| self.kept.meta(place).dirty != 0)
+        (0..self.kept.chunks).any(|place| self.kept.meta(place).dirty != 0)
     }
 
     /// The bytes of the chunk `index`: the last one may be short.
@@ -624,7 +690,7 @@ impl<B: Blocks> Disk<B> {
         // Each stretch: where on the device it starts and ends, and whose
         // it is.
         let mut dirty: Vec<(u64, u64, usize, usize, usize)> = Vec::new();
-        for place in 0..CHUNKS_KEPT {
+        for place in 0..self.kept.chunks {
             let meta = self.kept.meta(place);
             if meta.index == NO_CHUNK || meta.dirty == 0 {
                 continue;
@@ -685,7 +751,7 @@ impl<B: Blocks> Disk<B> {
             Some(place) => *place,
             None => {
                 // A place nothing is in, or the one used least lately.
-                let place = (0..CHUNKS_KEPT)
+                let place = (0..self.kept.chunks)
                     .min_by_key(|place| match self.kept.meta(*place) {
                         meta if meta.index == NO_CHUNK => 0,
                         meta => meta.used + 1,
@@ -820,7 +886,7 @@ impl<B: Blocks> Disk<B> {
     /// [`read_exact_at`](Self::read_exact_at), the range being inside the
     /// device.
     fn read_base(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        if direct(offset, buf.len(), DIRECT_MIN) {
+        if direct(offset, buf.len(), self.direct_min) {
             self.device_reads += 1;
             read_fully(&self.blocks, offset, buf)?;
             // What a kept chunk holds of it is as new as the device or

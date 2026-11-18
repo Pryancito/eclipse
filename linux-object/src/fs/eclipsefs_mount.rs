@@ -67,6 +67,9 @@ fn wall_clock() -> (u64, u32) {
 /// shared for the reads that can run side by side
 /// ([`EclipseFS::read_shared`] through [`shared`](Self::shared)).
 ///
+/// Both wait by giving the CPU away ([`super::yielding`]): a holder may be
+/// waiting for a disk served from userspace.
+///
 /// The `RwLock` underneath lets readers in while any reader is inside, so
 /// a steady stream of them would keep a writer spinning for ever. A writer
 /// that wants in says so first, and while one does, `shared` answers `None`
@@ -88,9 +91,19 @@ impl FsLock {
     #[track_caller]
     pub(crate) fn lock(&self) -> RwLockWriteGuard<'_, EclipseFS> {
         self.writers.fetch_add(1, Ordering::SeqCst);
-        let g = self.fs.write();
+        let g = super::yielding::write(&self.fs);
         self.writers.fetch_sub(1, Ordering::SeqCst);
         g
+    }
+
+    /// The filesystem exclusively if nobody has it, else `None`: for the
+    /// committer, which must not wait. A holder may be parked inside a read
+    /// of a disk served from userspace, whose wait runs the other tasks of
+    /// this CPU (`loader/src/linux/block_serve.rs`): a task that spun on
+    /// the lock then would keep the CPU from the driver for ever.
+    #[cfg(not(test))]
+    pub(crate) fn try_lock(&self) -> Option<RwLockWriteGuard<'_, EclipseFS>> {
+        self.fs.try_write()
     }
 
     /// The filesystem shared with other readers, unless a writer is waiting.
@@ -99,7 +112,7 @@ impl FsLock {
         if self.writers.load(Ordering::SeqCst) != 0 {
             return None;
         }
-        Some(self.fs.read())
+        Some(super::yielding::read(&self.fs))
     }
 }
 
@@ -353,7 +366,10 @@ impl EclipseMountFs {
                 let tick = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(1);
                 kernel_hal::thread::sleep_until(tick).await;
                 let Some(fs) = fs.upgrade() else { break };
-                let mut inner = fs.inner.lock();
+                // Busy: the next tick commits (see `FsLock::try_lock`).
+                let Some(mut inner) = fs.inner.try_lock() else {
+                    continue;
+                };
                 if let Err(e) = inner.purge_orphans() {
                     warn!("eclipsefs: freeing closed unlinked files failed: {:?}", e);
                 }

@@ -6,6 +6,8 @@ use alloc::sync::Arc;
 use core::cmp::{max, min};
 
 use lock::Mutex;
+
+use super::yielding::YieldingMutex;
 use rcore_fs::dev::{DevError, Device, Result as DevResult};
 use rcore_fs::vfs::{FsError, INode, Result as VfsResult};
 use zcore_drivers::{scheme::BlockScheme, DeviceResult};
@@ -562,7 +564,9 @@ impl BlockCache {
 /// A [`Device`] decorator adding the [`BlockCache`] above to any backing device.
 pub struct CachedDevice {
     inner: Arc<dyn Device>,
-    cache: Mutex<BlockCache>,
+    /// Waits by giving the CPU away ([`super::yielding`]): a holder may be
+    /// waiting for the device, which may be a disk served from userspace.
+    cache: YieldingMutex<BlockCache>,
     /// One past the last addressable byte, rounded up to a sector. Read-ahead is
     /// clamped to this so a prefetch never runs off the end of the device.
     dev_end: usize,
@@ -743,7 +747,7 @@ impl CachedDevice {
         let capacity = capacity_sectors.min(dev_end / SECTOR);
         Self {
             inner,
-            cache: Mutex::new(BlockCache::new(capacity)),
+            cache: YieldingMutex::new(BlockCache::new(capacity)),
             dev_end,
             streams: Mutex::new(StreamTable::new()),
         }

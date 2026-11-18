@@ -48,6 +48,7 @@ mod syncobj_eventfd;
 mod syncobj_file;
 mod sysfs;
 mod timerfd;
+mod yielding;
 
 #[cfg(feature = "mock-disk")]
 pub mod mock;

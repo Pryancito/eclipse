@@ -103,15 +103,18 @@ const UBLK_DISKS: usize = 4;
 /// `uahci2`).
 const CONTROLLERS_SERVED: usize = 2;
 
-/// The btrfs filesystem that runs as a process: `eclipse-btrfs DEVICE DIR`
-/// mounts a btrfs volume it serves. It is built from the FAT server's
-/// library (the wire and the kept disk) and the tree's btrfs code.
+/// The btrfs and EclipseFS filesystems that run as processes:
+/// `eclipse-btrfs DEVICE DIR` and `eclipse-eclipsefs DEVICE DIR` mount a
+/// volume they serve. They are built from the FAT server's library (the
+/// wire and the kept disk) and the tree's btrfs and EclipseFS code.
 const BTRFS_PACKAGE: &str = "eclipse-btrfs";
-const BTRFS: [&str; 1] = ["eclipse-btrfs"];
-const BTRFS_USES: [&str; 3] = [
+const BTRFS: [&str; 2] = ["eclipse-btrfs", "eclipse-eclipsefs"];
+const BTRFS_USES: [&str; 5] = [
     "tools/eclipse-udrivers/src",
     "tools/eclipse-fatfs/src",
     "vendor/btrfs-rs/src",
+    "vendor/eclipsefs-rs/src",
+    "vendor/aes/src",
 ];
 
 /// The `unet` and `ublk` services and the wrappers they run, and

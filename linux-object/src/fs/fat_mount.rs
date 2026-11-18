@@ -26,6 +26,8 @@ fn fnv1a_path(path: &str) -> u64 {
 
 use fatfs::{Date, DateTime, FileSystem, FsOptions, IoBase, Read, Seek, SeekFrom, Time, Write};
 use lock::Mutex;
+
+use super::yielding::YieldingMutex;
 use rcore_fs::dev::Device;
 use rcore_fs::vfs::{
     FileSystem as VfsFileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Timespec,
@@ -378,7 +380,9 @@ pub struct FatMountFs {
     /// `None` sólo mientras `sync` cambia una instancia por otra, y de forma
     /// permanente si ese relevo falla (el montaje queda inservible a propósito
     /// en vez de seguir con un estado a medias).
-    inner: Mutex<Option<FatFs>>,
+    /// Waits by giving the CPU away ([`super::yielding`]): a holder may be
+    /// waiting for a disk served from userspace.
+    inner: YieldingMutex<Option<FatFs>>,
     this: Mutex<Weak<Self>>,
     /// Identificador de dispositivo único de este montaje (para st_dev).
     dev_id: u64,
@@ -409,7 +413,7 @@ impl FatMountFs {
             .map_err(|e| fat_open_failed(&dev, e))?;
         let cluster_size = fs.cluster_size();
         let arc = Arc::new(Self {
-            inner: Mutex::new(Some(fs)),
+            inner: YieldingMutex::new(Some(fs)),
             this: Mutex::new(Weak::new()),
             dev_id: FAT_DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
             dev,
