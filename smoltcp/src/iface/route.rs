@@ -9,7 +9,9 @@ use crate::wire::{Ipv4Address, Ipv4Cidr};
 use crate::wire::{Ipv6Address, Ipv6Cidr};
 use crate::{Error, Result};
 
-/// A prefix of addresses that should be routed via a router
+/// A prefix of addresses that should be routed via a router, or, when
+/// the router is the unspecified address of its family, that are on the
+/// link: each is asked for as a neighbour is.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Route {

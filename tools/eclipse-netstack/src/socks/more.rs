@@ -15,6 +15,11 @@
 //!                           24  [u8; 16] the address (of IPv4: its four bytes, and zeroes)
 //! ROUTE  (kernel to stack)  the same, the network at 24, and
 //!                           40  [u8; 16] the router, or zeroes
+//!
+//! A `ROUTE` to have with no router (zeroes) is to a network on the
+//! card's link (`ip route add NETWORK dev eth0`): whoever is there is
+//! asked for as a neighbour, and can be a router in turn. A `MORE` says
+//! such a route with zeroes too.
 //! ```
 //!
 //! What they come to:
@@ -139,9 +144,22 @@ pub fn wished(m: &[u8]) -> Option<Result<(u64, Wish, u32), Refused>> {
         }
         let router = cidr_of(family, 0, &said[24..40])?.address();
         let router = (!router.is_unspecified()).then_some(router);
-        (router.is_some() || !have).then(|| numbered(Wish::Route(network(first), router, have)))
+        // With no router, to a network that is on the card's link; to
+        // everything there is no such route.
+        let said = router.is_some() || !have || first.prefix_len() > 0;
+        said.then(|| numbered(Wish::Route(network(first), router, have)))
     };
     Some(wish().ok_or(Refused::Malformed))
+}
+
+/// The router of a route to `to` that has none: the unspecified address
+/// of its family, which is how the interface is told the network is on
+/// the link.
+fn on_link(to: &IpCidr) -> IpAddress {
+    match to {
+        IpCidr::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+        _ => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+    }
 }
 
 /// `cidr` with nothing past its prefix: the network it names.
@@ -224,6 +242,8 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             entry(AN_ADDRESS, IpCidr::Ipv4(other), None);
         }
         for (to, router) in &self.more.ways {
+            // No router is sixteen zeroes, which the unspecified address
+            // is.
             entry(A_ROUTE, *to, Some(router));
         }
         m
@@ -238,7 +258,22 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         });
         router.is_unicast()
             && !self.iface.has_ip_addr(router)
-            && ours.any(|cidr| cidr.contains_addr(&router))
+            && (ours.any(|cidr| cidr.contains_addr(&router))
+                || self.on_link_way(IpAddress::Ipv4(router)))
+    }
+
+    /// Whether a route says `addr` is on the card's link, with no router
+    /// between.
+    pub(super) fn on_link_way(&self, addr: IpAddress) -> bool {
+        let mut ways = self.more.ways.iter();
+        ways.any(|(to, router)| router.is_unspecified() && to.contains_addr(&addr))
+    }
+
+    /// Whether `to` is the network of one of the card's addresses.
+    fn has_network(&self, to: &IpCidr) -> bool {
+        self.iface.ip_addrs().iter().any(|cidr| {
+            !cidr.address().is_unspecified() && cidr.prefix_len() > 0 && network(*cidr) == *to
+        })
     }
 
     fn near_any(&self, router: &IpAddress) -> bool {
@@ -271,6 +306,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 _ => false,
             },
             Wish::Route(to, Some(router), true) => self.way(to, router),
+            Wish::Route(to, None, true) => self.way(to, on_link(&to)),
             Wish::Route(to, router, false) => self.no_way(to, router),
             _ => false,
         };
@@ -348,7 +384,18 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             (IpCidr::Ipv4(_), IpAddress::Ipv4(_)) | (IpCidr::Ipv6(_), IpAddress::Ipv6(_))
         );
         let known = self.more.ways.iter().position(|(have, _)| *have == to);
-        if !same || !self.near_any(&router) || (known.is_none() && self.more.ways.len() >= ROUTES) {
+        // A network on the link is one of a card that has an address to
+        // ask its neighbours from, and is not one the card has already.
+        let reached = if router.is_unspecified() {
+            !self.has_network(&to)
+                && match to {
+                    IpCidr::Ipv4(_) => self.address().is_some(),
+                    _ => self.speaks_six(),
+                }
+        } else {
+            self.near_any(&router)
+        };
+        if !same || !reached || (known.is_none() && self.more.ways.len() >= ROUTES) {
             return false;
         }
         let route = Route {
@@ -380,11 +427,15 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         let Some(at) = self.more.ways.iter().position(is) else {
             return false;
         };
-        self.more.ways.remove(at);
+        let (_, through) = self.more.ways.remove(at);
         self.iface.routes_mut().update(|routes| {
             routes.remove(&to);
         });
         self.more.news = true;
+        // What went through a machine of that network goes with it.
+        if through.is_unspecified() {
+            self.prune_ways();
+        }
         true
     }
 
@@ -398,7 +449,7 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             .more
             .ways
             .iter()
-            .filter(|(_, router)| !self.near_any(router))
+            .filter(|(_, router)| !router.is_unspecified() && !self.near_any(router))
             .map(|(to, _)| *to)
             .collect();
         for to in gone {
@@ -491,7 +542,8 @@ mod tests {
                 9
             )))
         );
-        // Taken away with no router said; had with none, never.
+        // Taken away with no router said; had with none, a network on
+        // the link, which everything is not.
         let to = v6("2001:db8:7::", 48);
         assert_eq!(
             wished(&ask(OP_ROUTE, 0, false, to, None)),
@@ -499,6 +551,10 @@ mod tests {
         );
         assert_eq!(
             wished(&ask(OP_ROUTE, 0, true, to, None)),
+            Some(Ok((0, Wish::Route(to, None, true), 9)))
+        );
+        assert_eq!(
+            wished(&ask(OP_ROUTE, 0, true, v4([0; 4], 0), None)),
             Some(Err(Refused::Malformed))
         );
         // No machine's address, a prefix of too many bits, a family
@@ -830,5 +886,56 @@ mod tests {
         let mut short = bind_at(4, 5002, IpAddress::Ipv4(other));
         short.pop();
         assert_eq!(stack.request(&short), Err(Refused::Malformed));
+    }
+
+    #[test]
+    fn a_route_with_no_router_is_to_a_network_on_the_link() {
+        let (mut stack, window) = stack();
+        let to = v4([192, 0, 2, 0], 24);
+        // Not the network the card is on already, which its address gave.
+        assert_eq!(
+            stack.grant(Wish::Route(v4([10, 0, 9, 0], 24), None, true)),
+            Err(Refused::Unreachable)
+        );
+        assert_eq!(stack.grant(Wish::Route(to, None, true)), Ok(()));
+        assert_eq!(
+            stack.ways(),
+            [(to, IpAddress::Ipv4(Ipv4Address::UNSPECIFIED))]
+        );
+        // Said to the kernel with no router: sixteen zeroes.
+        let m = stack.more_message();
+        assert_eq!(m[HEADER_LEN..HEADER_LEN + 3], [A_ROUTE, 4, 24]);
+        assert_eq!(m[HEADER_LEN + 24..HEADER_LEN + 40], [0; 16]);
+        // Who is there is asked for as a neighbour, and answers as one.
+        stack.request(&bind(1, 5000)).unwrap();
+        assert_eq!(stack.request(&send(1, FAR, 53, b"far")), Ok(true));
+        let sent = frames(&mut stack, &window, 1);
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&sent[0], FAR));
+        window.deliver(stack.device(), 0, &arp_reply_from(FAR));
+        let sent = frames(&mut stack, &window, 2);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(ends(&sent[0]), (OUR_IP, FAR));
+        // A machine of that network is one to send through.
+        let beyond = v4([172, 16, 0, 0], 12);
+        let through = IpAddress::Ipv4(Ipv4Address([192, 0, 2, 1]));
+        assert_eq!(
+            stack.grant(Wish::Route(beyond, Some(through), true)),
+            Ok(())
+        );
+        // Taken away, what went through it goes too, and nothing is
+        // there any more.
+        assert_eq!(stack.grant(Wish::Route(to, None, false)), Ok(()));
+        assert!(stack.ways().is_empty());
+        assert_eq!(
+            stack.request(&send(1, FAR, 53, b"far")),
+            Err(Refused::Unreachable)
+        );
+        // Of IPv6 the same, on a card that speaks it: this one does not.
+        let six = v6("2001:db8:7::", 48);
+        assert_eq!(
+            stack.grant(Wish::Route(six, None, true)),
+            Err(Refused::Unreachable)
+        );
     }
 }

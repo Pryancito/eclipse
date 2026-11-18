@@ -407,10 +407,15 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         router.is_unicast()
             && !router.is_loopback()
             && !self.has_six(router)
-            && self.iface.ip_addrs().iter().any(|cidr| match cidr {
+            && (self.iface.ip_addrs().iter().any(|cidr| match cidr {
                 IpCidr::Ipv6(cidr) => cidr.contains_addr(&router),
                 _ => false,
-            })
+            }) || self.on_link_way(IpAddress::Ipv6(router)))
+    }
+
+    /// Whether the card speaks IPv6 at all.
+    pub(super) fn speaks_six(&self) -> bool {
+        self.six.ear.is_some()
     }
 
     /// The card has `cidr` too, because somebody on the machine says so

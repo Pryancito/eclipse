@@ -1672,7 +1672,12 @@ fn publish(host: &Host) {
         )
     };
     let others: Vec<String> = others.iter().map(|a| a.to_string()).collect();
-    let ways: Vec<String> = ways.iter().map(|(to, by)| format!("{to}>{by}")).collect();
+    // A route with no router is to a network on the card's link.
+    let way = |(to, by): &(IpCidr, smoltcp::wire::IpAddress)| match by.is_unspecified() {
+        true => format!("{to}>link"),
+        false => format!("{to}>{by}"),
+    };
+    let ways: Vec<String> = ways.iter().map(way).collect();
     let addr6: Vec<String> = sixes.addresses.iter().map(|a| a.to_string()).collect();
     let device = if host.kernels {
         format!("kernel-net@{}", host.index)
