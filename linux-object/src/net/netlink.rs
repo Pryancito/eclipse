@@ -573,6 +573,20 @@ impl Socket for NetlinkSocketState {
                                         log::warn!("[netlink] NewRoute: unknown oif {}", oif);
                                         errno::ENODEV
                                     }
+                                    // `ip route add default dev eth0` on a
+                                    // card that has a default route: Linux
+                                    // says it is there, and `replace` puts
+                                    // the new one in its place.
+                                    Ok(iface)
+                                        if default_is_taken(
+                                            header.nlmsg_flags,
+                                            &dst_cidr,
+                                            gw_ip.is_none(),
+                                            &iface.get_routes(),
+                                        ) =>
+                                    {
+                                        errno::EEXIST
+                                    }
                                     Ok(iface) => match iface.add_route(dst_cidr, gw_ip) {
                                         Err(e) => {
                                             log::warn!(
@@ -1323,6 +1337,25 @@ fn parse_ifaddr_cidr(data: &[u8]) -> Option<(u32, IpCidr)> {
     Some((ifa.ifa_index, cidr))
 }
 
+/// Whether a request for a default route with no router (`on_link`) is
+/// one to refuse because the card has a default route of that family
+/// already: `NLM_F_EXCL` says so (`ip route add`), and without it
+/// (`ip route replace`) the new one takes its place.
+fn default_is_taken(
+    flags: NetlinkMessageFlags,
+    to: &IpCidr,
+    on_link: bool,
+    routes: &[RouteInfo],
+) -> bool {
+    let same = |have: &IpCidr| matches!(have, IpCidr::Ipv4(_)) == matches!(to, IpCidr::Ipv4(_));
+    on_link
+        && to.prefix_len() == 0
+        && flags.contains(NetlinkMessageFlags::EXCL)
+        && routes
+            .iter()
+            .any(|have| have.dst.prefix_len() == 0 && same(&have.dst))
+}
+
 fn parse_route_request(data: &[u8]) -> Option<(RouteMsg, IpCidr, Option<IpAddress>, u32)> {
     let rtm_off = size_of::<NetlinkMessageHeader>();
     let rtm: RouteMsg = read_struct(data, rtm_off)?;
@@ -2069,6 +2102,28 @@ mod netlink_tests {
         assert_eq!(odd.len(), 7);
         push_rtattr_bytes(&mut odd, RTA_OIF, &[0, 0, 0, 0]);
         assert_eq!(odd.len(), 8 + 8);
+    }
+
+    #[test]
+    fn a_second_default_route_is_refused_to_add_and_taken_to_replace() {
+        let all = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        let all6 = IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0);
+        let net = IpCidr::new(IpAddress::v4(192, 0, 2, 0), 24);
+        let through = |dst, gateway| RouteInfo { dst, gateway };
+        let gateway = [through(all, Some(IpAddress::v4(10, 0, 2, 2)))];
+        let on_link = [through(net, None), through(all, None)];
+        let add = NetlinkMessageFlags::REQUEST | NetlinkMessageFlags::EXCL;
+        let replace = NetlinkMessageFlags::REQUEST;
+        for have in [&gateway[..], &on_link[..]] {
+            assert!(default_is_taken(add, &all, true, have));
+            assert!(!default_is_taken(replace, &all, true, have));
+            // One through a router, to a network, or of the other family
+            // is not this question.
+            assert!(!default_is_taken(add, &all, false, have));
+            assert!(!default_is_taken(add, &net, true, have));
+            assert!(!default_is_taken(add, &all6, true, have));
+        }
+        assert!(!default_is_taken(add, &all, true, &on_link[..1]));
     }
 
     #[test]

@@ -551,7 +551,9 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
             })
             || (addr.is_unicast()
                 && !addr.is_loopback()
-                && (self.gateway.is_some() || self.has_way(IpAddress::Ipv4(addr))))
+                && (self.gateway.is_some()
+                    || self.all_on_link()
+                    || self.has_way(IpAddress::Ipv4(addr))))
     }
 
     /// Whether `addr` is on the card's own network: reached with no

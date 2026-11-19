@@ -144,9 +144,9 @@ pub fn wished(m: &[u8]) -> Option<Result<(u64, Wish, u32), Refused>> {
         }
         let router = cidr_of(family, 0, &said[24..40])?.address();
         let router = (!router.is_unspecified()).then_some(router);
-        // With no router, to a network that is on the card's link; to
-        // everything there is no such route.
-        let said = router.is_some() || !have || first.prefix_len() > 0;
+        // With no router, to a network that is on the card's link, which
+        // of IPv4 everything may be said to be.
+        let said = router.is_some() || !have || first.prefix_len() > 0 || family == 4;
         said.then(|| numbered(Wish::Route(network(first), router, have)))
     };
     Some(wish().ok_or(Refused::Malformed))
@@ -160,6 +160,11 @@ fn on_link(to: &IpCidr) -> IpAddress {
         IpCidr::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
         _ => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
     }
+}
+
+/// Whether `to` is the network of everything of IPv4.
+fn everything(to: &IpCidr) -> bool {
+    matches!(to, IpCidr::Ipv4(_)) && to.prefix_len() == 0
 }
 
 /// `cidr` with nothing past its prefix: the network it names.
@@ -203,7 +208,25 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
 
     /// Whether a route to less than everything is the way to `addr`.
     pub fn has_way(&self, addr: IpAddress) -> bool {
-        self.more.ways.iter().any(|(to, _)| to.contains_addr(&addr))
+        let mut ways = self.more.ways.iter();
+        ways.any(|(to, _)| to.prefix_len() > 0 && to.contains_addr(&addr))
+    }
+
+    /// Whether everything of IPv4 that has no other way is on the card's
+    /// link: a default route with no router (`ip route add default dev
+    /// eth0`), kept among the routes as one to the network of everything.
+    pub fn all_on_link(&self) -> bool {
+        self.more.ways.iter().any(|(to, _)| everything(to))
+    }
+
+    /// The route that says so goes, when there is one: a gateway takes
+    /// its place, or nothing does. The interface's own table is whose
+    /// calls this to change.
+    pub(super) fn forget_all_on_link(&mut self) {
+        if self.all_on_link() {
+            self.more.ways.retain(|(to, _)| !everything(to));
+            self.more.news = true;
+        }
     }
 
     /// Whether the other addresses or the routes changed since this was
@@ -269,6 +292,15 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
         ways.any(|(to, router)| router.is_unspecified() && to.contains_addr(&addr))
     }
 
+    /// [`on_link_way`](Self::on_link_way) by a route to less than
+    /// everything.
+    pub(super) fn on_link_net(&self, addr: IpAddress) -> bool {
+        let mut ways = self.more.ways.iter();
+        ways.any(|(to, router)| {
+            router.is_unspecified() && to.prefix_len() > 0 && to.contains_addr(&addr)
+        })
+    }
+
     /// Whether `to` is the network of one of the card's addresses.
     fn has_network(&self, to: &IpCidr) -> bool {
         self.iface.ip_addrs().iter().any(|cidr| {
@@ -301,7 +333,13 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
                 (IpCidr::Ipv6(_), Some(IpAddress::Ipv6(router))) if have => {
                     self.write_router(Some(router))
                 }
-                (IpCidr::Ipv4(_), _) if !have => self.gateway.is_some() && self.set_gateway(None),
+                // With no router, everything is on the card's link, and
+                // a gateway there was gives way to that.
+                (IpCidr::Ipv4(_), None) if have => {
+                    self.address().is_some() && self.set_gateway(None) && self.way(to, on_link(&to))
+                }
+                (IpCidr::Ipv4(_), _) if !have && self.gateway.is_some() => self.set_gateway(None),
+                (IpCidr::Ipv4(_), router) if !have => self.no_way(to, router),
                 (IpCidr::Ipv6(_), _) if !have => self.write_router(None),
                 _ => false,
             },
@@ -543,7 +581,7 @@ mod tests {
             )))
         );
         // Taken away with no router said; had with none, a network on
-        // the link, which everything is not.
+        // the link, which everything of IPv4 may be and of IPv6 not.
         let to = v6("2001:db8:7::", 48);
         assert_eq!(
             wished(&ask(OP_ROUTE, 0, false, to, None)),
@@ -553,8 +591,13 @@ mod tests {
             wished(&ask(OP_ROUTE, 0, true, to, None)),
             Some(Ok((0, Wish::Route(to, None, true), 9)))
         );
+        let all = v4([0; 4], 0);
         assert_eq!(
-            wished(&ask(OP_ROUTE, 0, true, v4([0; 4], 0), None)),
+            wished(&ask(OP_ROUTE, 0, true, all, None)),
+            Some(Ok((0, Wish::Route(all, None, true), 9)))
+        );
+        assert_eq!(
+            wished(&ask(OP_ROUTE, 0, true, v6("::", 0), None)),
             Some(Err(Refused::Malformed))
         );
         // No machine's address, a prefix of too many bits, a family
@@ -935,6 +978,70 @@ mod tests {
         let six = v6("2001:db8:7::", 48);
         assert_eq!(
             stack.grant(Wish::Route(six, None, true)),
+            Err(Refused::Unreachable)
+        );
+    }
+
+    #[test]
+    fn a_default_route_with_no_router_says_everything_is_on_the_link() {
+        let (mut stack, window) = stack();
+        let all = v4([0, 0, 0, 0], 0);
+        let link = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+        stack.request(&bind(1, 5000)).unwrap();
+        assert!(stack.write_gateway(Some(GATEWAY)));
+        // It takes the gateway's place.
+        assert_eq!(stack.grant(Wish::Route(all, None, true)), Ok(()));
+        assert_eq!(stack.gateway(), None);
+        assert_eq!(stack.ways(), [(all, link)]);
+        assert!(stack.all_on_link() && stack.reaches(FAR));
+        // It is not a route to less than everything, which a card is
+        // preferred for.
+        assert!(!stack.has_way(IpAddress::Ipv4(FAR)));
+        let m = stack.more_message();
+        assert_eq!(m[HEADER_LEN..HEADER_LEN + 3], [A_ROUTE, 4, 0]);
+        // Whoever it is for is asked for as a neighbour.
+        assert_eq!(stack.request(&send(1, FAR, 53, b"far")), Ok(true));
+        let sent = frames(&mut stack, &window, 1);
+        assert_eq!(sent.len(), 1);
+        assert!(is_arp_request_for(&sent[0], FAR));
+        window.deliver(stack.device(), 0, &arp_reply_from(FAR));
+        let sent = frames(&mut stack, &window, 2);
+        assert_eq!(ends(&sent[0]), (OUR_IP, FAR));
+        // A machine anywhere is one to send through while it holds.
+        let beyond = v4([172, 16, 0, 0], 12);
+        let through = IpAddress::Ipv4(Ipv4Address([192, 0, 2, 1]));
+        assert_eq!(
+            stack.grant(Wish::Route(beyond, Some(through), true)),
+            Ok(())
+        );
+        // A gateway is not near because of it; one of the card's network
+        // takes its place, and what went through a machine only it
+        // reached goes too.
+        assert!(!stack.write_gateway(Some(Ipv4Address([192, 0, 2, 1]))));
+        assert!(stack.all_on_link());
+        assert!(stack.write_gateway(Some(GATEWAY)));
+        assert!(!stack.all_on_link() && stack.ways().is_empty());
+        assert_eq!(stack.gateway(), Some(GATEWAY));
+        // Taken away with no gateway, nothing far is reached.
+        assert_eq!(stack.grant(Wish::Route(all, None, true)), Ok(()));
+        assert_eq!(stack.grant(Wish::Route(all, None, false)), Ok(()));
+        assert!(stack.ways().is_empty() && stack.gateway().is_none());
+        assert_eq!(
+            stack.request(&send(1, FAR, 53, b"far")),
+            Err(Refused::Unreachable)
+        );
+        assert_eq!(
+            stack.grant(Wish::Route(all, None, false)),
+            Err(Refused::Unreachable)
+        );
+        // Not on a card with no address to ask from, nor of IPv6.
+        assert_eq!(
+            stack.grant(Wish::Route(v6("::", 0), None, true)),
+            Err(Refused::Unreachable)
+        );
+        stack.write_address(None);
+        assert_eq!(
+            stack.grant(Wish::Route(all, None, true)),
             Err(Refused::Unreachable)
         );
     }

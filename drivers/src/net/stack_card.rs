@@ -582,7 +582,17 @@ impl NetScheme for StackCard {
         let Some(gateway) = gateway else {
             let to = network(cidr);
             if to.prefix_len() == 0 {
-                return Err(DeviceError::NotSupported);
+                // Everything on the card's link: of IPv4, for a card
+                // with an address to ask its neighbours from. It takes
+                // the place of a gateway there is.
+                return match to {
+                    IpCidr::Ipv4(_) if self.said.lock().0.is_some() => {
+                        self.ask(Change::Route(to, None, true))
+                    }
+                    IpCidr::Ipv4(_) => Err(DeviceError::InvalidParam),
+                    #[allow(unreachable_patterns)]
+                    _ => Err(DeviceError::NotSupported),
+                };
             }
             let ours = self.get_ip_address();
             if ours.iter().any(|ours| network(*ours) == to) {
@@ -607,11 +617,16 @@ impl NetScheme for StackCard {
 
     fn del_route(&self, cidr: IpCidr, gateway: Option<IpAddress>) -> DeviceResult {
         let cidr = network(cidr);
+        let routes = self.more.routes();
         let through = match cidr {
-            IpCidr::Ipv4(_) if cidr.prefix_len() == 0 => self.said.lock().1.map(IpAddress::Ipv4),
+            // The gateway, or the link itself when everything is on it.
+            IpCidr::Ipv4(_) if cidr.prefix_len() == 0 => {
+                let gateway = self.said.lock().1.map(IpAddress::Ipv4);
+                let on_link = || routes.iter().find(|(to, _)| *to == cidr).map(|(_, to)| *to);
+                gateway.or_else(on_link)
+            }
             IpCidr::Ipv6(_) if cidr.prefix_len() == 0 => self.sixes.router().map(IpAddress::Ipv6),
             _ => {
-                let routes = self.more.routes();
                 let mut to = routes.iter().filter(|(to, _)| *to == cidr);
                 to.find(|(_, through)| gateway.is_none_or(|gateway| gateway == *through))
                     .map(|(_, through)| *through)
@@ -620,7 +635,9 @@ impl NetScheme for StackCard {
         // Only a route there is, through the router it is said with.
         match through {
             Some(through) if gateway.is_none_or(|gateway| gateway == through) => match cidr {
-                IpCidr::Ipv4(_) if cidr.prefix_len() == 0 => self.ask(Change::Gateway(None)),
+                IpCidr::Ipv4(_) if cidr.prefix_len() == 0 && !through.is_unspecified() => {
+                    self.ask(Change::Gateway(None))
+                }
                 _ => self.ask(Change::Route(cidr, gateway, false)),
             },
             _ => Err(DeviceError::InvalidParam),
@@ -786,6 +803,43 @@ mod tests {
     }
 
     #[test]
+    fn a_default_route_with_no_router_is_asked_of_the_stack_and_goes_as_one() {
+        let wire = Arc::new(Asked::default());
+        let more = Arc::new(More::default());
+        let c = card(None).through(wire.clone()).with_more(more.clone());
+        let asked = || core::mem::take(&mut *wire.0.lock());
+        let all = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        assert_eq!(c.add_route(all, None), Ok(()));
+        assert_eq!(asked(), [(0, Change::Route(all, None, true))]);
+        // Shown with no router once the stack says it has it, and then
+        // any machine is one to send through.
+        assert!(!c.near(&IpAddress::v4(192, 0, 2, 1)));
+        more.say(vec![], vec![(all, on_link(&all))]);
+        let routes = c.get_routes();
+        assert!(routes.iter().any(|r| r.dst == all && r.gateway.is_none()));
+        assert!(c.near(&IpAddress::v4(192, 0, 2, 1)));
+        // It goes as a route, said with no router or with none at all.
+        assert_eq!(
+            c.del_route(all, Some(IpAddress::v4(10, 0, 9, 1))),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(c.del_route(all, None), Ok(()));
+        assert_eq!(asked(), [(0, Change::Route(all, None, false))]);
+        more.say(vec![], vec![]);
+        assert_eq!(c.del_route(all, None), Err(DeviceError::InvalidParam));
+        // A gateway goes as a gateway.
+        let c = card(Some([10, 0, 9, 1])).through(wire.clone());
+        assert_eq!(c.del_route(all, None), Ok(()));
+        assert_eq!(asked(), [(0, Change::Gateway(None))]);
+        // Of IPv6 there is none, nor on a card with no address.
+        let all6 = IpCidr::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0);
+        assert_eq!(c.add_route(all6, None), Err(DeviceError::NotSupported));
+        let bare = StackCard::new("eth9".into(), [2, 0, 0, 0, 0, 7], [0; 4], 0, None);
+        assert_eq!(c.add_route(all, None), Ok(()));
+        assert_eq!(bare.add_route(all, None), Err(DeviceError::InvalidParam));
+    }
+
+    #[test]
     fn other_addresses_and_routes_are_asked_of_the_stack_and_shown_as_it_says() {
         let wire = Arc::new(Asked::default());
         let (sixes, more) = (Arc::new(Sixes::default()), Arc::new(More::default()));
@@ -837,10 +891,8 @@ mod tests {
         let to = IpCidr::new(IpAddress::v4(172, 16, 0, 0), 12);
         let through = IpAddress::v4(192, 168, 7, 1);
         assert_eq!(c.add_route(net, Some(through)), Ok(()));
-        // With no router: a network on the link, which is not everything
-        // nor the one the card is on.
-        let all = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
-        assert_eq!(c.add_route(all, None), Err(DeviceError::NotSupported));
+        // With no router: a network on the link, which is not the one the
+        // card is on.
         let own_net = IpCidr::new(IpAddress::v4(10, 0, 9, 0), 24);
         assert_eq!(c.add_route(own_net, None), Err(DeviceError::AlreadyExists));
         let beside = IpCidr::new(IpAddress::v4(192, 0, 2, 0), 24);

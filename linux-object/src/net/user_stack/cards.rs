@@ -340,10 +340,18 @@ impl StackLink {
                 said.gateway = None;
                 super::more::also_message(card, IpCidr::Ipv4(cidr), false, self.next_wish())
             }
-            wish => match self.wish(card, wish) {
-                Some(message) => message,
-                None => return false,
-            },
+            wish => {
+                // Everything on the card's link takes the gateway's
+                // place.
+                if matches!(wish, Change::Route(IpCidr::Ipv4(to), None, true) if to.prefix_len() == 0)
+                {
+                    said.gateway = None;
+                }
+                match self.wish(card, wish) {
+                    Some(message) => message,
+                    None => return false,
+                }
+            }
         };
         if self.tell(message, true).is_err() {
             return false;
