@@ -22,7 +22,9 @@
 //! The virtio disks go to userspace unasked as well, when the boot names
 //! none ([`leave_virtio_disks`]): every one but the disk the kernel boots
 //! from, on a machine with no initrd, which is the first. `ublk=kernel`
-//! keeps them all for the kernel's own driver.
+//! keeps them all for the kernel's own driver. So do the NVMe and AHCI
+//! controllers ([`leave_pci_disks`]), on a machine with an initrd:
+//! `unvme=kernel` and `uahci=kernel` keep them.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -484,6 +486,41 @@ pub fn leave_virtio_disks(spec: Option<&str>, boot_disk: bool) {
     DISKS_UNASKED.store(true, Ordering::Release);
 }
 
+/// Whether the NVMe controllers are left to userspace without the boot
+/// naming them: see [`leave_pci_disks`].
+static NVME_UNASKED: AtomicBool = AtomicBool::new(false);
+/// The same for the AHCI controllers.
+static AHCI_UNASKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a boot whose `udriver=` value is `spec` leaves every device of
+/// `kind` to userspace unasked: it does unless it names one of them, and
+/// then that one is what it means, as with [`disks_unasked`].
+fn kind_unasked(spec: Option<&str>, kind: &str) -> bool {
+    !parse_specs(spec.unwrap_or(""))
+        .iter()
+        .any(|(k, _)| *k == kind)
+}
+
+/// Leave every NVMe controller (with `nvme`) and every AHCI controller
+/// (with `ahci`) to its driver in userspace, as the virtio disks are left
+/// ([`leave_virtio_disks`]), unless the boot names one of that kind. Not
+/// on a machine with no initrd (`boot_disk`): its root is on one of their
+/// disks, which one is not known yet, and it is mounted before any driver
+/// in userspace can run. Before the buses are probed.
+pub fn leave_pci_disks(spec: Option<&str>, nvme: bool, ahci: bool, boot_disk: bool) {
+    if boot_disk {
+        return;
+    }
+    if nvme && kind_unasked(spec, NVME) {
+        info!("udriver: every NVMe controller is for userspace");
+        NVME_UNASKED.store(true, Ordering::Release);
+    }
+    if ahci && kind_unasked(spec, AHCI) {
+        info!("udriver: every AHCI controller is for userspace");
+        AHCI_UNASKED.store(true, Ordering::Release);
+    }
+}
+
 /// Whether virtio disk `index` is left to userspace unasked.
 fn disk_unasked(index: usize) -> bool {
     DISKS_UNASKED.load(Ordering::Acquire)
@@ -628,7 +665,9 @@ pub fn reserve_if(
     let index = SEEN[slot].fetch_add(1, Ordering::AcqRel);
     let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
         || (kind == E1000E && index == 0 && first_e1000e_unasked())
-        || (kind == VIRTIO_BLK && disk_unasked(index));
+        || (kind == VIRTIO_BLK && disk_unasked(index))
+        || (kind == NVME && NVME_UNASKED.load(Ordering::Acquire))
+        || (kind == AHCI && AHCI_UNASKED.load(Ordering::Acquire));
     if !wanted {
         return false;
     }
@@ -676,6 +715,15 @@ pub fn find(kind: &str, index: usize) -> Option<Arc<UserDevice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvme_and_ahci_are_left_unasked_unless_the_boot_names_one_of_their_kind() {
+        assert!(kind_unasked(None, NVME) && kind_unasked(None, AHCI));
+        assert!(kind_unasked(Some("virtio-blk@1,e1000e@0"), NVME));
+        assert!(!kind_unasked(Some("nvme@1"), NVME));
+        assert!(kind_unasked(Some("nvme@1"), AHCI));
+        assert!(!kind_unasked(Some("virtio-net@0,ahci@0"), AHCI));
+    }
 
     #[test]
     fn the_spec_names_a_kind_and_an_index() {
