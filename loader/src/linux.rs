@@ -1661,14 +1661,23 @@ fn handle_signal(
         // SIGPIPE when a fetch connection resets, Xorg aborting in early init —
         // otherwise vanishes with no trace at all, and a `Done(139)`/silent exit
         // gives no clue which signal took it down.
+        // Who sent it, when a process did: a daemon that vanishes at boot on
+        // a SIGTERM is no fault of its own, and the line named only the
+        // victim, so the one to look at was nowhere.
+        let sender = signal_info.sender().map(|pid| {
+            let name = linux_object::process::find_task(pid as u64)
+                .map_or_else(|| String::from("gone"), |process| process.name());
+            alloc::format!(" sent by pid={pid} ({name})")
+        });
         error!(
-            "[exit] pid={} ({}) killed by signal {:?} ({}, shells print {}) at pc={:#x} \
+            "[exit] pid={} ({}) killed by signal {:?} ({}, shells print {}){} at pc={:#x} \
              [{}] (default disposition)",
             thread.proc().id(),
             thread.proc().name(),
             signal,
             signal as i32,
             128 + signal as i32,
+            sender.unwrap_or_default(),
             user_pc,
             resolve(user_pc).unwrap_or_else(|| String::from("unmapped")),
         );

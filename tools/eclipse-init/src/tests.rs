@@ -745,6 +745,29 @@ fn a_service_that_never_comes_up_is_given_up_on_instead_of_retried_for_ever() {
 
 // -- Reaping during the boot's bounded gates -----------------------------
 
+/// A child reaped during a gate, before the service was started, whose pid
+/// the kernel then gave to the service: its death is not the service's. Read
+/// as such it was "unet exited after 0ns (exit 0, crash)" with the network
+/// stack alive, and a second one started beside it that failed for ever.
+#[test]
+fn an_exit_from_before_the_service_started_is_not_the_services() {
+    let mut map = BTreeMap::new();
+    let mut svc = respawn_svc("unet", "");
+    let reaped = Instant::now();
+    let started = reaped + Duration::from_millis(300);
+    svc.pid = Some(1033);
+    svc.started_at = Some(started);
+    map.insert("unet".to_string(), svc);
+
+    note_exit(&mut map, 1033, 0, reaped);
+    assert_eq!(map["unet"].pid, Some(1033), "the service is alive");
+    assert_eq!(map["unet"].restart_at, None);
+
+    // Its own death, later, is.
+    note_exit(&mut map, 1033, 0, started + Duration::from_secs(60));
+    assert_eq!(map["unet"].pid, None);
+}
+
 /// A respawn service that dies during a `wait_socket` gate must be
 /// credited with the time IT lived, not with the gate as well.
 ///

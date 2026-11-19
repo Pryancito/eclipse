@@ -255,7 +255,7 @@ struct HandleCensus {
     on_lost: Vec<OneshotSender<()>>,
 }
 
-/// Recycling allocator for the ids userspace sees as Linux pids/tids.
+/// Allocator for the ids userspace sees as Linux pids/tids.
 ///
 /// Only `Process` and `Thread` draw from here (via
 /// [`KObjectBase::with_name_pooled`]); every other kernel object takes a
@@ -269,9 +269,20 @@ struct HandleCensus {
 /// an `Arc` of each child until it is reaped, so a pid cannot be reused while
 /// a zombie still wears it: Linux's rule, enforced by lifetime instead of
 /// bookkeeping.
+///
+/// The ids go round as Linux's do (`alloc_pid`, cyclic): each new one is the
+/// next above the last given that nobody wears, and only past `CEIL` does the
+/// count start again at `FLOOR`. A number that was just let go is so the last
+/// to come back. It used to be the first: the pool handed out what had been
+/// freed before anything fresh, so at boot, with a handful of short-lived
+/// children behind it, a new process got the pid one of them had a moment
+/// ago. Whoever still held that number took the new process for the old one:
+/// PID 1 counted the death of a helper it had reaped earlier as the death of
+/// the network service that had since been given its pid, and started a second
+/// one beside the first; a `kill` of a pid read from a file a moment too late
+/// landed on a stranger.
 mod pid_pool {
-    use alloc::collections::VecDeque;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use alloc::collections::BTreeSet;
     use lock::Mutex;
 
     /// First pooled pid. Everything below is reserved for fixed ids
@@ -281,49 +292,75 @@ mod pid_pool {
     /// value `/proc/sys/kernel/pid_max` reports.
     pub(super) const CEIL: u64 = 4_194_304;
 
-    struct Pool {
-        free: VecDeque<u32>,
-        next_fresh: u32,
+    pub(super) struct Pool {
+        /// The ids somebody wears.
+        live: BTreeSet<u32>,
+        /// Where the search for the next one starts: one past the last given.
+        next: u32,
+        floor: u32,
+        ceil: u32,
     }
 
-    static POOL: Mutex<Pool> = Mutex::new(Pool {
-        free: VecDeque::new(),
-        next_fresh: FLOOR as u32,
-    });
-    static RECYCLED: AtomicU64 = AtomicU64::new(0);
+    impl Pool {
+        pub(super) const fn new(floor: u32, ceil: u32) -> Pool {
+            Pool {
+                live: BTreeSet::new(),
+                next: floor,
+                floor,
+                ceil,
+            }
+        }
+
+        /// The next id round the circle that nobody wears, or `None` when
+        /// every one is worn.
+        pub(super) fn alloc(&mut self) -> Option<u32> {
+            if self.live.len() as u64 >= (self.ceil - self.floor) as u64 {
+                return None;
+            }
+            // The first gap at or after `next`: the worn ids from there on
+            // are in order, so the gap is where they stop being consecutive.
+            let mut id = self.next;
+            for worn in self.live.range(self.next..) {
+                if *worn != id {
+                    break;
+                }
+                id += 1;
+            }
+            if id >= self.ceil {
+                // Round: the same from the floor, where a gap is sure now.
+                id = self.floor;
+                for worn in self.live.range(self.floor..) {
+                    if *worn != id {
+                        break;
+                    }
+                    id += 1;
+                }
+            }
+            self.live.insert(id);
+            self.next = if id + 1 >= self.ceil {
+                self.floor
+            } else {
+                id + 1
+            };
+            Some(id)
+        }
+
+        pub(super) fn release(&mut self, id: u32) {
+            self.live.remove(&id);
+        }
+    }
+
+    static POOL: Mutex<Pool> = Mutex::new(Pool::new(FLOOR as u32, CEIL as u32));
 
     /// A pooled pid, or `None` when over 4M processes/threads are alive at
     /// once (the caller falls back to a high monotonic id rather than fail).
     pub(super) fn alloc() -> Option<u64> {
-        let mut p = POOL.lock();
-        if let Some(id) = p.free.pop_front() {
-            let n = RECYCLED.fetch_add(1, Ordering::Relaxed);
-            if n == 0 {
-                // One line per boot: proof in the log that recycling is live.
-                log::info!("[pid] first recycled pid: {}", id);
-            }
-            return Some(id as u64);
-        }
-        if (p.next_fresh as u64) < CEIL {
-            let id = p.next_fresh;
-            p.next_fresh += 1;
-            return Some(id as u64);
-        }
-        None
+        POOL.lock().alloc().map(u64::from)
     }
 
     pub(super) fn release(id: u64) {
         debug_assert!((FLOOR..CEIL).contains(&id));
-        static RELEASED: AtomicU64 = AtomicU64::new(0);
-        let n = RELEASED.fetch_add(1, Ordering::Relaxed);
-        if n == 0 {
-            // One line per boot: the release side of the pool is alive too —
-            // its absence under churn means task objects are being leaked
-            // (an Arc holder outliving reap), which is a bug to chase, not a
-            // pool problem.
-            log::info!("[pid] first pid released: {}", id);
-        }
-        POOL.lock().free.push_back(id as u32);
+        POOL.lock().release(id as u32);
     }
 }
 
@@ -471,11 +508,11 @@ impl KObjectBase {
         }
     }
 
-    /// Create a kernel object base whose id is a RECYCLING Linux pid/tid.
+    /// Create a kernel object base whose id is a Linux pid/tid, of the pool.
     ///
     /// Only `Process` and `Thread` use this: their ids are the pids/tids
     /// userspace sees, so they must stay small (< `pid_max`) and be reused
-    /// after death — Linux semantics. Every other object keeps a monotonic
+    /// once the count has come round — Linux semantics. Every other object keeps a monotonic
     /// id ≥ 2^32 that can never collide with a pid.
     pub fn with_name_pooled(name: &str) -> Self {
         if let Some(id) = pid_pool::alloc() {
@@ -1507,6 +1544,37 @@ mod tests {
             Poll::Ready(vec![Signal::READABLE, Signal::empty()])
         );
         assert_eq!((callbacks(&a), callbacks(&b)), (0, 0));
+    }
+
+    #[test]
+    fn a_pid_let_go_is_the_last_to_come_back() {
+        // A pool of eight: 100..108.
+        let mut pool = pid_pool::Pool::new(100, 108);
+        assert_eq!(pool.alloc(), Some(100));
+        assert_eq!(pool.alloc(), Some(101));
+        // The one a child just had is not the next child's: whoever still
+        // has the number written down does not find a stranger under it.
+        pool.release(100);
+        assert_eq!(pool.alloc(), Some(102));
+        pool.release(102);
+        assert_eq!(pool.alloc(), Some(103));
+        // Round the circle, past the ones still worn, and only then the
+        // ones that were let go, the oldest first.
+        for id in 104..108 {
+            assert_eq!(pool.alloc(), Some(id));
+        }
+        assert_eq!(pool.alloc(), Some(100));
+        assert_eq!(pool.alloc(), Some(102));
+        // All eight are worn.
+        assert_eq!(pool.alloc(), None);
+        pool.release(105);
+        assert_eq!(pool.alloc(), Some(105));
+        assert_eq!(pool.alloc(), None);
+        // The search goes on from the last given, over the top and round.
+        pool.release(104);
+        pool.release(107);
+        assert_eq!(pool.alloc(), Some(107));
+        assert_eq!(pool.alloc(), Some(104));
     }
 
     #[test]
