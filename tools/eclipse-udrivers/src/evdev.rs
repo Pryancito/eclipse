@@ -376,6 +376,12 @@ impl Evdev {
         &self.info
     }
 
+    /// Whether key `code` is down now: a driver whose device repeats a
+    /// held key by sending it again says so with value 2.
+    pub fn is_down(&self, code: u16) -> bool {
+        bit(&self.key, code as usize)
+    }
+
     /// The readiness that changed since the last call, to tell the kernel.
     pub fn take_told(&mut self) -> Vec<(u32, u64)> {
         core::mem::take(&mut self.told)
@@ -681,6 +687,27 @@ impl Evdev {
             _ => Err(EINVAL),
         }
     }
+}
+
+/// The major of input devices, and the minor of `event0`.
+pub const INPUT_MAJOR: u32 = 13;
+pub const EVENT_MINOR_BASE: u32 = 64;
+/// How many `eventK` are tried.
+pub const EVENT_NODES: u32 = 32;
+
+/// Serve the first `/dev/input/eventK` nobody has: the kernel's own input
+/// devices take theirs first, and other drivers theirs. The node and its
+/// name under `/dev`.
+pub fn serve_free() -> Result<(Node, String), String> {
+    let mut last = String::new();
+    for k in 0..EVENT_NODES {
+        let name = format!("input/event{k}");
+        match Node::serve(&name, INPUT_MAJOR, EVENT_MINOR_BASE + k, 0o660) {
+            Ok(node) => return Ok((node, name)),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("no /dev/input/event* to serve: {last}"))
 }
 
 /// Tell the kernel what readiness changed.

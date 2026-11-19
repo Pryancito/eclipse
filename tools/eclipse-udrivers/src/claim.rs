@@ -25,10 +25,16 @@ pub const KIND_NVME: usize = 4;
 pub const KIND_AHCI: usize = 5;
 /// A virtio input device (`udriver=virtio-input@N`): see [`crate::input`].
 pub const KIND_VIRTIO_INPUT: usize = 6;
+/// The keyboard and the aux port of the PC's i8042 (`udriver=i8042@0`):
+/// see [`crate::ps2`]. Their window is I/O ports, reached with
+/// [`port_in`] and [`port_out`].
+pub const KIND_I8042: usize = 7;
+pub const KIND_I8042_AUX: usize = 8;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;
 const TRANSPORT_PCI: u32 = 3;
+const TRANSPORT_PORTS: u32 = 4;
 
 const BTI_PERM_READ: usize = 1 << 0;
 const BTI_PERM_WRITE: usize = 1 << 1;
@@ -48,6 +54,9 @@ pub struct Claim {
     /// Whether it is a PCI function that is not virtio, whose window is its
     /// first memory BAR: registers as its datasheet lays them out.
     pub pci: bool,
+    /// Whether its window is I/O ports, from port `offset`, `size` of them:
+    /// there are no registers to map.
+    pub ports: bool,
     /// The interrupt line, for the record (`u32::MAX` when unknown).
     pub irq: u32,
     /// Where the register window starts inside the VMO, and its size.
@@ -79,6 +88,7 @@ impl Claim {
             bti: high(w[0]),
             transport,
             pci: low(w[1]) == TRANSPORT_PCI,
+            ports: low(w[1]) == TRANSPORT_PORTS,
             irq: high(w[1]),
             offset: w[2],
             size: w[3],
@@ -241,6 +251,33 @@ pub fn interrupt_wait(interrupt: Handle) -> Result<(), Status> {
     .map(|_| ())
 }
 
+/// Read `width` bytes (1, 2 or 4) at port `offset` of the window of
+/// device `index` of claim `kind`, which this process holds: the kernel
+/// does the `in` (`ECLIPSE_DEVICE_PORT`).
+pub fn port_in(kind: usize, index: usize, offset: usize, width: usize) -> Result<u32, Status> {
+    // SAFETY: no pointers.
+    unsafe { zx::call(nr::ECLIPSE_DEVICE_PORT, [kind, index, offset, width, 0, 0]) }
+        .map(|v| v as u32)
+}
+
+/// Write `width` bytes of `value` at port `offset`, as [`port_in`] reads.
+pub fn port_out(
+    kind: usize,
+    index: usize,
+    offset: usize,
+    width: usize,
+    value: u32,
+) -> Result<(), Status> {
+    // SAFETY: no pointers.
+    unsafe {
+        zx::call(
+            nr::ECLIPSE_DEVICE_PORT,
+            [kind, index, offset, width, value as usize, 1],
+        )
+    }
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,9 +333,9 @@ mod tests {
 
     #[test]
     fn a_transport_nobody_here_knows_is_not_guessed_at() {
-        let c = Claim::from_words(&[0, 4, 0, 0x1000, 0, 0, 0, 0]);
+        let c = Claim::from_words(&[0, 9, 0, 0x1000, 0, 0, 0, 0]);
         assert_eq!(c.transport, None);
-        assert!(!c.pci);
+        assert!(!c.pci && !c.ports);
     }
 
     #[test]
@@ -319,6 +356,24 @@ mod tests {
         assert_eq!(c.span(), 0x2_0000);
         let virtio = Claim::from_words(&[0, 1, 0, 0x200, 0, 0, 0, 0]);
         assert!(!virtio.pci);
+    }
+
+    #[test]
+    fn a_device_on_ports_has_its_first_port_and_no_registers() {
+        let c = Claim::from_words(&[
+            0x0000_0004_0000_0000, // no regs, bti 4
+            0x0000_0001_0000_0004, // ports, line 1
+            0x60,
+            5,
+            0,
+            0,
+            0,
+            8,
+        ]);
+        assert!(c.ports && !c.pci);
+        assert_eq!(c.transport, None);
+        assert_eq!((c.regs, c.offset, c.size), (0, 0x60, 5));
+        assert_eq!((c.irq, c.interrupt), (1, Some(8)));
     }
 
     #[test]

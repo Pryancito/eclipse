@@ -45,8 +45,24 @@ pub const AHCI: &str = "ahci";
 /// drives itself unless `udriver=virtio-input@N` asks for it: its driver
 /// in userspace serves it as `/dev/input/event*`.
 pub const VIRTIO_INPUT: &str = "virtio-input";
+/// The keyboard port of the PC's i8042 (PS/2) controller, which the kernel
+/// drives itself unless `udriver=i8042@0` asks for it: the controller is
+/// then left whole, this and [`I8042_AUX`], to one driver in userspace.
+pub const I8042: &str = "i8042";
+/// The aux (mouse) port of the same controller: its own interrupt line,
+/// the same two I/O ports.
+pub const I8042_AUX: &str = "i8042-aux";
 /// The kinds that can be reserved.
-const KINDS: [&str; 6] = [VIRTIO_BLK, VIRTIO_NET, E1000E, NVME, AHCI, VIRTIO_INPUT];
+const KINDS: [&str; 8] = [
+    VIRTIO_BLK,
+    VIRTIO_NET,
+    E1000E,
+    NVME,
+    AHCI,
+    VIRTIO_INPUT,
+    I8042,
+    I8042_AUX,
+];
 
 /// How the device is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +86,10 @@ pub enum Transport {
     /// A PCI function that is not virtio: the window is its first memory
     /// BAR, the registers as its datasheet lays them out.
     Pci,
+    /// I/O ports, x86's: the window is `size` ports from port `paddr`, which
+    /// the kernel reads and writes for the driver ([`UserDevice::port_in`]),
+    /// a process having no way of its own. No memory goes with it.
+    Ports,
 }
 
 /// A device reserved for userspace.
@@ -130,6 +150,16 @@ const NVME_CSTS_RDY: u32 = 1;
 /// How many times `CSTS` is read back after `CC.EN` is cleared. A real
 /// controller may take up to `CAP.TO` half-seconds; QEMU's is done at once.
 const NVME_RESET_READS: usize = 1_000_000;
+/// The i8042's two ports: data at `0x60`, status and commands at `0x64`,
+/// and the bit of the status that says the controller has not yet taken
+/// the last byte written to it.
+pub const I8042_PORT: usize = 0x60;
+pub const I8042_SPAN: usize = 5;
+const I8042_STATUS: usize = 4;
+const I8042_INPUT_FULL: u32 = 1 << 1;
+/// The ISA lines of its two ports.
+pub const I8042_KBD_IRQ: usize = 1;
+pub const I8042_AUX_IRQ: usize = 12;
 /// An AHCI controller's global control register (AHCI 1.3.1 §3.1.2) and
 /// its HBA reset bit, which the controller clears when it is done.
 const AHCI_GHC: usize = 0x04;
@@ -162,6 +192,9 @@ impl UserDevice {
     /// never answered zero -- and then the device must be taken to be
     /// running still.
     pub fn reset(&self) -> bool {
+        if self.transport == Transport::Ports {
+            return self.reset_ports();
+        }
         let Some(vaddr) = self.vaddr else {
             return false;
         };
@@ -238,7 +271,85 @@ impl UserDevice {
             }
             // A PCI function of a kind this does not know how to stop.
             Transport::Pci => false,
+            Transport::Ports => self.reset_ports(),
         }
+    }
+
+    /// Stop a device reached by I/O ports. An i8042 port is disabled
+    /// (`0xAD` for the keyboard, `0xA7` for the aux port): it sends no more
+    /// bytes and raises no more interrupts until a driver enables it again.
+    fn reset_ports(&self) -> bool {
+        if ![I8042, I8042_AUX].contains(&self.kind) || self.size < I8042_SPAN {
+            return false;
+        }
+        let disable = if self.kind == I8042 { 0xad } else { 0xa7 };
+        let ready = (0..RESET_READS).any(|_| {
+            self.port_in(I8042_STATUS, 1)
+                .is_some_and(|s| s & I8042_INPUT_FULL == 0)
+        });
+        ready && self.port_out(I8042_STATUS, 1, disable)
+    }
+
+    /// Read `width` bytes (1, 2 or 4) at port `offset` of the device's
+    /// window. `None` when that is not inside it, the device is not reached
+    /// by ports, or this machine has none.
+    pub fn port_in(&self, offset: usize, width: usize) -> Option<u32> {
+        let port = self.port(offset, width)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            // SAFETY: a port of the device's own window, which the kernel
+            // left to whoever drives it.
+            Some(unsafe {
+                match width {
+                    1 => Port::<u8>::new(port).read() as u32,
+                    2 => Port::<u16>::new(port).read() as u32,
+                    _ => Port::<u32>::new(port).read(),
+                }
+            })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = port;
+            None
+        }
+    }
+
+    /// Write `width` bytes of `value` at port `offset`, as
+    /// [`port_in`](Self::port_in) reads. Whether it was done.
+    pub fn port_out(&self, offset: usize, width: usize, value: u32) -> bool {
+        let Some(port) = self.port(offset, width) else {
+            return false;
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            // SAFETY: as `port_in`.
+            unsafe {
+                match width {
+                    1 => Port::<u8>::new(port).write(value as u8),
+                    2 => Port::<u16>::new(port).write(value as u16),
+                    _ => Port::<u32>::new(port).write(value),
+                }
+            }
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (port, value);
+            false
+        }
+    }
+
+    /// The port `offset` names, when `width` bytes there are the device's.
+    fn port(&self, offset: usize, width: usize) -> Option<u16> {
+        let inside = self.transport == Transport::Ports
+            && matches!(width, 1 | 2 | 4)
+            && offset
+                .checked_add(width)
+                .is_some_and(|end| end <= self.size);
+        let port = self.paddr.checked_add(offset)?;
+        (inside && port + width <= 0x1_0000).then_some(port as u16)
     }
 
     /// Hand the device back: the next [`claim`](Self::claim) gets it. For
@@ -252,14 +363,7 @@ impl UserDevice {
 /// What the command line asked for: each a `(kind, index)`.
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
-static SEEN: [AtomicUsize; KINDS.len()] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static SEEN: [AtomicUsize; KINDS.len()] = [const { AtomicUsize::new(0) }; KINDS.len()];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
 /// Whether the first e1000e is left to userspace without the boot naming
 /// it: see [`leave_first_e1000e`].
@@ -344,7 +448,7 @@ fn disk_unasked(index: usize) -> bool {
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
-/// `e1000e@N`, `nvme@N`, `ahci@N` or `virtio-input@N`.
+/// `e1000e@N`, `nvme@N`, `ahci@N`, `virtio-input@N` or `i8042@0`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -421,6 +525,33 @@ pub fn reserve_virtio_input(
     wiring: Wiring,
 ) -> bool {
     reserve_if(VIRTIO_INPUT, true, transport, paddr, size, || wiring)
+}
+
+/// The PC found an i8042: whether the boot leaves it to userspace
+/// (`udriver=i8042@0`). When it does both its ports are recorded, the
+/// keyboard as [`I8042`] and the mouse as [`I8042_AUX`], each with its
+/// line, and the caller must not touch the controller.
+pub fn reserve_i8042() -> bool {
+    if !WANTED
+        .get()
+        .is_some_and(|w| w.contains(&(I8042, 0)) || w.contains(&(I8042_AUX, 0)))
+    {
+        return false;
+    }
+    for (kind, irq) in [(I8042, I8042_KBD_IRQ), (I8042_AUX, I8042_AUX_IRQ)] {
+        info!("udriver: {kind} #0 at port {I8042_PORT:#x} (irq {irq}) left to userspace");
+        RESERVED.lock().push(Arc::new(UserDevice {
+            kind,
+            index: 0,
+            transport: Transport::Ports,
+            paddr: I8042_PORT,
+            size: I8042_SPAN,
+            irq: Some(irq),
+            vaddr: None,
+            claimed: AtomicBool::new(false),
+        }));
+    }
+    true
 }
 
 /// [`reserve_virtio_blk`] for a disk that may not be fit to hand over
@@ -514,6 +645,7 @@ mod tests {
         assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
         assert_eq!(parse_spec("ahci@1"), Some((AHCI, 1)));
         assert_eq!(parse_spec("virtio-input@0"), Some((VIRTIO_INPUT, 0)));
+        assert_eq!(parse_spec("i8042@0"), Some((I8042, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
         assert_eq!(parse_spec(""), None);
     }
@@ -678,6 +810,35 @@ mod tests {
         };
         assert!(!card.reset());
         assert!(short.iter().all(|b| *b == 0xff));
+    }
+
+    #[test]
+    fn a_device_on_ports_is_reached_only_inside_its_window() {
+        let ports = UserDevice {
+            kind: I8042,
+            index: 0,
+            transport: Transport::Ports,
+            paddr: I8042_PORT,
+            size: I8042_SPAN,
+            irq: Some(I8042_KBD_IRQ),
+            vaddr: None,
+            claimed: AtomicBool::new(false),
+        };
+        assert_eq!(ports.port(0, 1), Some(0x60));
+        assert_eq!(ports.port(4, 1), Some(0x64));
+        assert_eq!(ports.port(5, 1), None, "past the window");
+        assert_eq!(ports.port(4, 2), None, "runs past it");
+        assert_eq!(ports.port(0, 3), None, "no such width");
+        assert_eq!(ports.port(usize::MAX, 1), None);
+        let mut window = [0u8; 8];
+        let memory = device(Transport::VirtioMmio, &mut window);
+        assert_eq!(memory.port(0, 1), None, "memory is not ports");
+        // A kind of ports this does not know how to stop.
+        let other = UserDevice {
+            kind: NVME,
+            ..ports
+        };
+        assert!(!other.reset());
     }
 
     #[test]

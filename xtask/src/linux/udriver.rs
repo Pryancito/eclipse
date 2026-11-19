@@ -68,9 +68,10 @@ const DRIVERS: [&str; 4] = [
 /// package: `udrv-dev-echo check NAME`.
 const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
 /// The drivers of input devices, from the same package: each serves its
-/// device as a node of `/dev/input` (`udriver=virtio-input@N`); and what
-/// checks and times such a node, `udrv-evdev-check NODE`.
-const INPUT_DRIVERS: [&str; 2] = ["udrv-virtio-input", "udrv-evdev-check"];
+/// device as a node of `/dev/input` (`udriver=virtio-input@N`, and the
+/// PC's i8042 with `udriver=i8042@0`: its keyboard and its mouse); and
+/// what checks and times such a node, `udrv-evdev-check NODE`.
+const INPUT_DRIVERS: [&str; 3] = ["udrv-virtio-input", "udrv-ps2", "udrv-evdev-check"];
 /// How many virtio input devices get a driver service of their own
 /// (`uinput`, `uinput2`): a keyboard and a mouse or tablet.
 const UINPUT_DEVICES: usize = 2;
@@ -358,6 +359,31 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           [ -n \"$n\" ] || { echo \"eclipse-uinput: the kernel left no virtio input device number $nth to userspace\" >&2; sleep 5; exit 1; }\n\
           [ -x /bin/udrv-virtio-input ] || { echo 'eclipse-uinput: /bin/udrv-virtio-input is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           exec /bin/udrv-virtio-input \"$n\"\n",
+    )
+    .unwrap();
+
+    // The PC's i8042 (`udriver=i8042@0`, x86_64 only): one driver for its
+    // keyboard and its mouse, two nodes of `/dev/input`.
+    fs::write(
+        svc_dir.join("ups2.service"),
+        "# Driver of the i8042 (PS/2 keyboard and mouse) when the kernel\n\
+         # left it to userspace (udriver=i8042@0), served as two\n\
+         # /dev/input/eventK. See /usr/local/bin/eclipse-ups2.\n\
+         exec = /usr/local/bin/eclipse-ups2\n\
+         type = respawn\n\
+         udriver = i8042\n",
+    )
+    .unwrap();
+    fs::write(
+        localbin.join("eclipse-ups2"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of the i8042 the kernel left\n\
+          # alone (udriver=i8042@0), in the foreground for eclipse-init, which\n\
+          # starts it again if it dies. It serves the keyboard and the mouse\n\
+          # as /dev/input/eventK. See tools/eclipse-udrivers.\n\
+          grep -qx 'i8042@0' /proc/udrivers || { echo 'eclipse-ups2: the kernel left no i8042 to userspace' >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-ps2 ] || { echo 'eclipse-ups2: /bin/udrv-ps2 is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-ps2\n",
     )
     .unwrap();
 

@@ -753,6 +753,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
         ("unvme", "respawn", "/usr/local/bin/eclipse-unvme 1", ""),
         ("unvme2", "respawn", "/usr/local/bin/eclipse-unvme 2", ""),
+        ("ups2", "respawn", "/usr/local/bin/eclipse-ups2", ""),
         (
             "xkbmap",
             "oneshot",
@@ -992,7 +993,8 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
             "uinput2",
             "unet",
             "unvme",
-            "unvme2"
+            "unvme2",
+            "ups2"
         ],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
@@ -1051,6 +1053,9 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     // The input devices named on the command line, served as
     // /dev/input/eventK: one service each, the Nth of the kind.
     controller(&gated[5..7], "uinput", "virtio-input");
+    // The i8042, keyboard and mouse: one driver for both.
+    assert_eq!(gated[10].0, "ups2");
+    assert_eq!(field(&gated[10].1, "udriver"), Some("i8042"));
     // A service for each further disk, the Nth of the kernel's list.
     for (n, (name, body)) in gated[2..5].iter().enumerate() {
         let nth = n + 2;
@@ -1860,6 +1865,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         // session runs, or none.
         "uinput",
         "uinput2",
+        "ups2",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {

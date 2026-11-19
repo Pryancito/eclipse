@@ -44,6 +44,19 @@ pub const ECLIPSE_DEVICE_AHCI: usize = 5;
 /// input device, left to userspace by `udriver=virtio-input@N`.
 pub const ECLIPSE_DEVICE_VIRTIO_INPUT: usize = 6;
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kinds: the
+/// keyboard and the aux port of the PC's i8042, left to userspace by
+/// `udriver=i8042@0`. Their transport is [`ECLIPSE_TRANSPORT_PORTS`]; each
+/// has its own line, and one driver holds both.
+pub const ECLIPSE_DEVICE_I8042: usize = 7;
+pub const ECLIPSE_DEVICE_I8042_AUX: usize = 8;
+
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: I/O
+/// ports. The window is `size` ports from port `offset` (words 2 and 3),
+/// which the driver reaches through `ECLIPSE_DEVICE_PORT`; there is no
+/// register VMO (word 0 low is 0), and the line is an edge.
+pub const ECLIPSE_TRANSPORT_PORTS: u64 = 4;
+
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
 /// function that is not virtio. The window is its first memory BAR, with
 /// the registers as its datasheet lays them out; words 4 to 6 of the claim
@@ -106,6 +119,8 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
         Transport::VirtioMmio => true,
         Transport::VirtioPci { .. } => false,
         Transport::Pci => !cfg!(target_arch = "x86_64"),
+        // An ISA line, which the i8042 pulses.
+        Transport::Ports => false,
     };
     let line = Box::new(ControllerLine { controller, irq });
     match Interrupt::new_line(line, level) {
@@ -215,6 +230,8 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         ECLIPSE_DEVICE_NVME => user::NVME,
         ECLIPSE_DEVICE_AHCI => user::AHCI,
         ECLIPSE_DEVICE_VIRTIO_INPUT => user::VIRTIO_INPUT,
+        ECLIPSE_DEVICE_I8042 => user::I8042,
+        ECLIPSE_DEVICE_I8042_AUX => user::I8042_AUX,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
@@ -232,15 +249,25 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     if !device.claim() {
         return Err(ZxError::ALREADY_BOUND);
     }
-    let regs = VmObject::new_physical(base, (end - base) / PAGE_SIZE);
-    regs.set_cache_policy(CachePolicy::UncachedDevice)?;
+    // A device on I/O ports has no memory to hand out: its window is
+    // ports, which the kernel reads and writes for it.
+    let ports = device.transport == Transport::Ports;
+    let regs = if ports {
+        None
+    } else {
+        let regs = VmObject::new_physical(base, (end - base) / PAGE_SIZE);
+        regs.set_cache_policy(CachePolicy::UncachedDevice)?;
+        Some(regs)
+    };
     let held = Held {
         holder: proc.id(),
         bti: BusTransactionInitiator::create(Iommu::create(), 0),
         interrupt: device_interrupt(&device),
         device: device.clone(),
     };
-    let regs = proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO));
+    let regs: HandleValue = regs.map_or(0, |regs| {
+        proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO))
+    });
     let bti = proc.add_handle(Handle::new(held.bti.clone(), Rights::DEFAULT_BTI));
     let interrupt: Option<HandleValue> = held
         .interrupt
@@ -264,12 +291,17 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
             ],
         ),
         Transport::Pci => (ECLIPSE_TRANSPORT_PCI, [0; 3]),
+        Transport::Ports => (ECLIPSE_TRANSPORT_PORTS, [0; 3]),
     };
     let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
     let words: [u64; CLAIM_WORDS] = [
         pair(regs, bti),
         transport | (irq as u64) << 32,
-        (device.paddr - base) as u64,
+        if ports {
+            device.paddr as u64
+        } else {
+            (device.paddr - base) as u64
+        },
         device.size as u64,
         extra[0],
         extra[1],
@@ -277,7 +309,9 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         interrupt.unwrap_or(0) as u64,
     ];
     if out.write_array(&words).is_err() {
-        let _ = proc.remove_handle(regs);
+        if regs != 0 {
+            let _ = proc.remove_handle(regs);
+        }
         let _ = proc.remove_handle(bti);
         if let Some(interrupt) = interrupt {
             let _ = proc.remove_handle(interrupt);

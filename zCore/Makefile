@@ -401,8 +401,15 @@ endif
 # pointer role away from every relative one (USB_ABS_POINTER), so attaching
 # both would leave the mouse's reports decoded by nothing.
 USB_POINTER ?= tablet
+# USB_INPUT=off: no USB keyboard or pointer on the xhci, so what QEMU is
+# typed (QMP input-send-event) goes to the PS/2 keyboard and mouse, as it
+# must to try the i8042's driver (`KOPTS=udriver=i8042@0`).
+USB_INPUT ?= on
 
-qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-$(USB_POINTER),bus=xhci.0
+qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci
+ifneq ($(USB_INPUT),off)
+qemu_opts += -device usb-kbd,bus=xhci.0 -device usb-$(USB_POINTER),bus=xhci.0
+endif
 
 ifeq ($(ARCH), x86_64)
   qemu_opts += \

@@ -38,6 +38,10 @@ name = "udrv-virtio-input"
 path = "src/bin/udrv-virtio-input.rs"
 
 [[bin]]
+name = "udrv-ps2"
+path = "src/bin/udrv-ps2.rs"
+
+[[bin]]
 name = "udrv-evdev-check"
 path = "src/bin/udrv-evdev-check.rs"
 
