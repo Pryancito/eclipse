@@ -681,10 +681,10 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ),
         ("enet", "respawn", "/usr/local/bin/eclipse-unet e1000e", ""),
         (
-            "fat-mounts",
+            "fs-mounts",
             "oneshot",
-            "/usr/local/bin/eclipse-fat-mounts",
-            "ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2",
+            "/usr/local/bin/eclipse-fs-mounts",
+            "ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2 mountd",
         ),
         (
             "gtk-caches",
@@ -740,12 +740,6 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("uahci", "respawn", "/usr/local/bin/eclipse-uahci 1", ""),
         ("uahci2", "respawn", "/usr/local/bin/eclipse-uahci 2", ""),
         ("ublk", "respawn", "/usr/local/bin/eclipse-ublk", ""),
-        (
-            "ublk-mounts",
-            "oneshot",
-            "/usr/local/bin/eclipse-ublk-mounts",
-            "ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2",
-        ),
         ("ublk2", "respawn", "/usr/local/bin/eclipse-ublk 2", ""),
         ("ublk3", "respawn", "/usr/local/bin/eclipse-ublk 3", ""),
         ("ublk4", "respawn", "/usr/local/bin/eclipse-ublk 4", ""),
@@ -982,32 +976,13 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     assert_eq!(
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         [
-            "enet",
-            "knet",
-            "uahci",
-            "uahci2",
-            "ublk",
-            "ublk-mounts",
-            "ublk2",
-            "ublk3",
-            "ublk4",
-            "uhda",
-            "uinput",
-            "uinput2",
-            "unet",
-            "unvme",
-            "unvme2",
-            "ups2"
+            "enet", "knet", "uahci", "uahci2", "ublk", "ublk2", "ublk3", "ublk4", "uhda", "uinput",
+            "uinput2", "unet", "unvme", "unvme2", "ups2"
         ],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
     for (name, body) in &gated {
-        let kind = if name == "ublk-mounts" {
-            "oneshot"
-        } else {
-            "respawn"
-        };
-        assert_eq!(field(body, "type"), Some(kind), "{name}");
+        assert_eq!(field(body, "type"), Some("respawn"), "{name}");
     }
     // The HD Audio controller: the first one, served as /dev/dsp. Out of
     // the list after this, so what follows counts the others.
@@ -1054,21 +1029,15 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     };
     controller(&gated[0..2], "uahci", "ahci");
     let gated = &gated[2..];
-    // The mounts: on the boots the disk's driver runs on, after its start.
-    assert_eq!(field(&gated[1].1, "udriver"), Some("virtio-blk|nvme|ahci"));
-    assert_eq!(
-        field(&gated[1].1, "after"),
-        Some("ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2")
-    );
-    controller(&gated[8..10], "unvme", "nvme");
+    controller(&gated[7..9], "unvme", "nvme");
     // The input devices named on the command line, served as
     // /dev/input/eventK: one service each, the Nth of the kind.
-    controller(&gated[5..7], "uinput", "virtio-input");
+    controller(&gated[4..6], "uinput", "virtio-input");
     // The i8042, keyboard and mouse: one driver for both.
-    assert_eq!(gated[10].0, "ups2");
-    assert_eq!(field(&gated[10].1, "udriver"), Some("i8042"));
+    assert_eq!(gated[9].0, "ups2");
+    assert_eq!(field(&gated[9].1, "udriver"), Some("i8042"));
     // A service for each further disk, the Nth of the kernel's list.
-    for (n, (name, body)) in gated[2..5].iter().enumerate() {
+    for (n, (name, body)) in gated[1..4].iter().enumerate() {
         let nth = n + 2;
         assert_eq!(name, &format!("ublk{nth}"));
         assert_eq!(
@@ -1082,7 +1051,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     }
     let wrapper = |name: &str| fs::read_to_string(rootfs.join("usr/local/bin").join(name)).unwrap();
     // The card: the first one, by number.
-    assert_eq!(field(&gated[7].1, "udriver"), Some("virtio-net@0"));
+    assert_eq!(field(&gated[6].1, "udriver"), Some("virtio-net@0"));
     let unet = wrapper("eclipse-unet");
     assert!(
         unet.contains("exec /bin/eclipse-netstack 0"),
@@ -1380,148 +1349,26 @@ fn the_cards_wrapper_runs_the_stack_whatever_the_boot_says_of_the_kernels() {
     );
 }
 
-/// What `eclipse-ublk-mounts` makes of a fstab: the script itself, run
-/// here with the three things it reaches for swapped for files of this
-/// test's -- fstab, the mount table, and `busybox mount`, which only says
-/// what it was asked. `/dev/null` stands for a disk that is there.
-#[test]
-fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
-    let rootfs = init_rootfs("ublk-mounts");
-    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-ublk-mounts")).unwrap();
-    for needle in [
-        "fstab=/etc/fstab",
-        "< /proc/mounts",
-        "busybox mount -t",
-        "left=50",
-    ] {
-        assert_eq!(
-            script.matches(needle).count(),
-            1,
-            "{needle:?} is no longer in the script exactly once:\n{script}"
-        );
-    }
-    let dir = scratch("ublk-mounts-run");
-    let run = |fstab: &str, mounts: &str| {
-        let (f, m) = (dir.join("fstab"), dir.join("mounts"));
-        fs::write(&f, fstab).unwrap();
-        fs::write(&m, mounts).unwrap();
-        let script = script
-            .replace("fstab=/etc/fstab", &format!("fstab='{}'", f.display()))
-            .replace("< /proc/mounts", &format!("< '{}'", m.display()))
-            .replace("busybox mount -t", "echo mount -t")
-            // Two tenths of a second, not fifty: the wait is what is tested,
-            // not its length.
-            .replace("left=50", "left=2");
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        (
-            String::from_utf8(out.stdout).unwrap(),
-            String::from_utf8(out.stderr).unwrap(),
-            out.status.code(),
-        )
-    };
-    let at = |name: &str| dir.join(name).display().to_string();
-    let (data, taken, absent, fat) = (at("data"), at("taken"), at("absent"), at("fat"));
-    let fstab = format!(
-        "# /etc/fstab\n\
-         __ECLIPSE_ROOT_DEV__  /          eclipsefs defaults 0 1\n\
-         __ECLIPSE_EFI_DEV___  /boot/efi  vfat defaults,noatime 0 0\n\
-         /dev/null  /  btrfs defaults 0 0\n\
-         /dev/null  none  swap sw 0 0\n\
-         /dev/null  {}  btrfs defaults,noauto 0 0\n\
-         /dev/null  {taken}  btrfs defaults 0 0\n\
-         /dev/null  {data}  btrfs defaults,noatime 0 0\n\
-         server:/export  {}  nfs defaults 0 0\n",
-        at("noauto"),
-        at("nfs"),
-    );
-    let mounts = format!("rootfs / rootfs rw 0 0\n/dev/vdb2 {taken} btrfs rw 0 0\n");
-
-    // Only the line with a device, a place of its own, no `noauto`, and
-    // nothing mounted there yet.
-    let (out, err, code) = run(&fstab, &mounts);
-    assert_eq!(
-        out,
-        format!("mount -t btrfs -o defaults,noatime /dev/null {data}\n"),
-        "stderr: {err}"
-    );
-    assert_eq!(code, Some(0), "stderr: {err}");
-    assert!(dir.join("data").is_dir(), "the mount point is made");
-    for name in ["noauto", "taken", "nfs"] {
-        assert!(!dir.join(name).exists(), "{name} was not this script's");
-    }
-
-    // A FAT volume is `eclipse-fat-mounts`'s, in every spelling the kernel
-    // reads as FAT.
-    for fstype in ["vfat", "msdos", "FAT32"] {
-        let with_fat = format!("/dev/null  {fat}  {fstype} defaults 0 0\n");
-        let (out, err, code) = run(&with_fat, &mounts);
-        assert_eq!((out.as_str(), code), ("", Some(0)), "{fstype}: {err}");
-        assert!(!dir.join("fat").exists(), "{fstype}");
-    }
-
-    // A device that never comes: said, left, and the others still mounted.
-    let late = format!(
-        "/dev/eclipse-no-such-disk1  {absent}  btrfs defaults 0 0\n\
-         /dev/eclipse-no-such-disk2  {absent}2  btrfs defaults 0 0\n{fstab}"
-    );
-    let started = std::time::Instant::now();
-    let (out, err, code) = run(&late, &mounts);
-    let took = started.elapsed();
-    assert_eq!(
-        out,
-        format!("mount -t btrfs -o defaults,noatime /dev/null {data}\n")
-    );
-    assert_eq!(code, Some(1));
-    assert!(
-        err.contains("/dev/eclipse-no-such-disk1") && err.contains("/dev/eclipse-no-such-disk2"),
-        "a device that did not appear is not named: {err}"
-    );
-    assert!(!dir.join("absent").exists());
-    // One budget for every line: the second missing device costs nothing.
-    assert!(
-        took >= std::time::Duration::from_millis(200),
-        "the script did not wait for the device: {took:?}"
-    );
-
-    // An image with no fstab at all (riscv64's has none): nothing to do,
-    // and nothing to complain about.
-    let none = script
-        .replace("fstab=/etc/fstab", &format!("fstab='{}'", at("no-fstab")))
-        .replace("busybox mount -t", "echo mount -t");
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(none)
-        .output()
-        .unwrap();
-    assert_eq!(
-        (out.stdout.len(), out.stderr.len(), out.status.code()),
-        (0, 0, Some(0))
-    );
-}
-
-/// What `eclipse-fat-mounts` makes of a fstab: the script itself, with
+/// What `eclipse-fs-mounts` makes of a fstab: the script itself, with
 /// the things it reaches for swapped for files of this test's and for
 /// commands that only say what they were asked. `/dev/null` stands for a
 /// disk that is there; `SERVER` is how the stand-in for `eclipse-fatfs`
 /// ends.
 #[test]
-fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
-    let rootfs = init_rootfs("fat-mounts");
-    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-fat-mounts")).unwrap();
+fn the_lines_of_fstab_are_mounted_with_a_server_each() {
+    let rootfs = init_rootfs("fs-mounts");
+    let script = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-fs-mounts")).unwrap();
     for needle in [
         "fstab=/etc/fstab",
-        "< /proc/mounts",
         "< /proc/cmdline",
         "< /proc/udrivers",
         "/bin/eclipse-fatfs $ro",
         "ROOT=/dev/*[0-9]",
         "= /boot/efi ]",
         "left=50",
+        "helper=30",
+        "/run/eclipse-mountd",
+        "sleep 5",
     ] {
         assert_eq!(
             script.matches(needle).count(),
@@ -1531,7 +1378,7 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
     }
     // Every boot: no `udriver =` to keep it out of the ordinary one.
     let service =
-        fs::read_to_string(rootfs.join("etc/eclipse/services/fat-mounts.service")).unwrap();
+        fs::read_to_string(rootfs.join("etc/eclipse/services/fs-mounts.service")).unwrap();
     assert_eq!(field(&service, "udriver"), None);
     assert_eq!(field(&service, "type"), Some("oneshot"));
     // The mount helper too, started again when it dies: mount(2) of FAT
@@ -1544,7 +1391,9 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
         Some("/usr/local/bin/eclipse-mountd")
     );
 
-    let dir = scratch("fat-mounts-run");
+    let dir = scratch("fs-mounts-run");
+    let ready = dir.join("mountd-ready");
+    fs::write(&ready, b"").unwrap();
     let run = |cmdline: &str, udrivers: &str, server: &str, fstab: &str, mounts: &str| {
         let file = |name: &str, body: &str| {
             let path = dir.join(name);
@@ -1566,6 +1415,11 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
                 &format!("< '{}'", file("udrivers", udrivers)),
             )
             .replace("/bin/eclipse-fatfs $ro", "serve $ro")
+            .replace("busybox mount -t", "echo mount -t")
+            .replace("/run/eclipse-mountd", &format!("'{}'", ready.display()))
+            // Half a second for the helper, none between NFS tries.
+            .replace("helper=30", "helper=5")
+            .replace("sleep 5", "sleep 0")
             // The disk of ROOT= and the EFI place, in this test's directory.
             .replace("ROOT=/dev/*[0-9]", "ROOT=/*[0-9]")
             .replace(
@@ -1609,18 +1463,24 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
     let boot = "LOG=warn:ROOT=/dev/sda2\n";
 
     // The FAT lines on a device, each with its server; `ro` is the
-    // server's `-r`. Nothing else is this script's.
+    // server's `-r`. The btrfs line and then the NFS one through mount(2),
+    // which hands them to the mount helper. Nothing else is this script's.
+    let (home, nfs) = (at("home"), at("nfs"));
+    let rest = format!(
+        "mount -t btrfs -o defaults /dev/null {home}\n\
+         mount -t nfs -o defaults server:/export {nfs}\n"
+    );
     let (out, err, code) = run(boot, "", "true", &fstab, &mounts);
     assert_eq!(
         out,
-        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n"),
+        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n{rest}"),
         "stderr: {err}"
     );
     assert_eq!((err.as_str(), code), ("", Some(0)));
-    for name in ["efi", "old", "read"] {
+    for name in ["efi", "old", "read", "home", "nfs"] {
         assert!(dir.join(name).is_dir(), "{name}: the mount point is made");
     }
-    for name in ["taken", "noauto", "home", "nfs"] {
+    for name in ["taken", "noauto"] {
         assert!(!dir.join(name).exists(), "{name} was not this script's");
     }
 
@@ -1628,11 +1488,41 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
     let (out, err, code) = run(boot, "", "false", &fstab, &mounts);
     assert_eq!(
         out,
-        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n"),
+        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n{rest}"),
         "stderr: {err}"
     );
     assert_eq!(code, Some(0));
     assert_eq!(err.matches("no server mounted").count(), 3, "{err}");
+
+    // The mount helper is waited for before a mount(2) it would make,
+    // unless the boot keeps those mounts for the kernel; a mount(2) it is
+    // not there for is the kernel's own, so the line is still mounted.
+    let btrfs = format!("/dev/null  {home}  eclipsefs noatime 0 0\n");
+    fs::remove_file(&ready).unwrap();
+    for (cmdline, waits) in [("LOG=warn\n", true), ("LOG=warn:ufs=kernel\n", false)] {
+        let started = std::time::Instant::now();
+        let (out, err, _) = run(cmdline, "", "true", &btrfs, &mounts);
+        let took = started.elapsed();
+        assert_eq!(
+            out,
+            format!("mount -t eclipsefs -o noatime /dev/null {home}\n"),
+            "{err}"
+        );
+        assert_eq!(
+            took >= std::time::Duration::from_millis(500),
+            waits,
+            "{cmdline:?}: {took:?}"
+        );
+    }
+    fs::write(&ready, b"").unwrap();
+    // An NFS line, in either spelling.
+    let nfs_line = format!("server:/export  {nfs}  nfs3 vers=3 0 0\n");
+    let (out, err, _) = run(boot, "", "true", &nfs_line, &mounts);
+    assert_eq!(
+        out,
+        format!("mount -t nfs3 -o vers=3 server:/export {nfs}\n"),
+        "{err}"
+    );
 
     // The placeholder of an image nobody installed, at /boot/efi: the
     // first partition of the disk ROOT= names, in either way of naming it.
@@ -1874,8 +1764,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "unvme2",
         "uahci",
         "uahci2",
-        "ublk-mounts",
-        "fat-mounts",
+        "fs-mounts",
         // The mount helper, for whoever calls mount(2).
         "mountd",
         // An input device's driver: what it serves is for whichever

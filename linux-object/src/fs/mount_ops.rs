@@ -264,6 +264,13 @@ pub fn mount_fs(
     // is not a path and `lookup_inode` on it is `ENOENT` — so the branch has
     // to come before the lookup and not after it.
     if is_network_fstype(fstype) {
+        // Served by a process (`eclipse-nfs`) unless nothing would serve it.
+        if ask_helper(fstype, flags, data) {
+            match super::served::helper::ask(source, &target_norm, fstype, flags, data) {
+                Err(LxError::ENODEV) => {}
+                done => return done,
+            }
+        }
         return mount_nfs(source, &target_norm, &mount_node, flags, data);
     }
 
@@ -284,6 +291,22 @@ pub fn mount_fs(
     }
 
     let source_inode = proc.lookup_inode(source)?;
+    // btrfs and EclipseFS are served by a process (`eclipse-btrfs`,
+    // `eclipse-eclipsefs`) too. ENODEV is the helper saying the kernel's
+    // own code is the volume's: no helper, a volume its server does not
+    // take (one of several devices, an EclipseFS v0.3) or one it cannot read,
+    // which the kernel then refuses with its own errno.
+    if ask_helper(fstype, flags, data) {
+        let absolute = absolute_source(proc, source);
+        match super::served::helper::ask(&absolute, &target_norm, fstype, flags, data) {
+            Err(LxError::ENODEV) => {}
+            Err(e) => return Err(e),
+            Ok(()) => {
+                hunter::media::note_mount(&absolute, &target_norm, fstype);
+                return Ok(());
+            }
+        }
+    }
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
     let read_only = flags_read_only(flags, data);
     let fs = open_filesystem(backend, fstype, read_only, data)?;
@@ -298,6 +321,80 @@ pub fn mount_fs(
     hunter::media::note_mount(source, &target_norm, fstype);
     Ok(())
 }
+
+/// Whether a mount of `fstype` (as [`parse_fstype`] spells it) with these
+/// flags and options goes to the mount helper first, to be served by a
+/// process. FAT always does: the kernel has none ([`mount_fs`]).
+///
+/// btrfs, EclipseFS and NFS do on every boot but one that says
+/// `ufs=kernel`, and when nothing is asked that a served mount would drop:
+/// `nosuid`, `noexec`, `nodev` (a served mount keeps none of them), or for
+/// a filesystem on a device an option its server does not read (`subvol=`,
+/// `compress=`, ...). Those stay with the kernel's own code, which reads
+/// them.
+fn ask_helper(fstype: &str, flags: usize, data: &str) -> bool {
+    let cmdline = kernel_hal::boot::cmdline();
+    served_by_default(
+        fstype,
+        flags,
+        data,
+        kernel_hal::cmdline::value(&cmdline, "ufs"),
+    )
+}
+
+/// [`ask_helper`], with the boot's `ufs=` word given.
+pub(super) fn served_by_default(fstype: &str, flags: usize, data: &str, ufs: Option<&str>) -> bool {
+    if ufs == Some("kernel") {
+        return false;
+    }
+    if mount_state::flags_nosuid(flags, data)
+        || mount_state::flags_noexec(flags, data)
+        || mount_state::flags_nodev(flags, data)
+    {
+        return false;
+    }
+    match fstype {
+        // Its options are the server's own: it parses them as the kernel
+        // does (`nfs3::source::NfsOptions`).
+        "nfs" => true,
+        "btrfs" | "eclipsefs" => data
+            .split(',')
+            .map(str::trim)
+            .all(|o| SERVED_OPTIONS.contains(&o) || o.starts_with("x-")),
+        _ => false,
+    }
+}
+
+/// The options a served btrfs or EclipseFS mount honours or that change
+/// nothing for it: what `ro` and `rw` say is in the flags its server is
+/// given, and the times are its server's.
+const SERVED_OPTIONS: &[&str] = &[
+    "",
+    "defaults",
+    "rw",
+    "ro",
+    "suid",
+    "exec",
+    "dev",
+    "auto",
+    "noauto",
+    "nofail",
+    "user",
+    "nouser",
+    "users",
+    "async",
+    "atime",
+    "noatime",
+    "relatime",
+    "norelatime",
+    "strictatime",
+    "nodiratime",
+    "diratime",
+    "lazytime",
+    "silent",
+    "loud",
+    "_netdev",
+];
 
 /// `source` as a path from the root: the mount helper is another process,
 /// and its working directory is not the caller's.
@@ -931,6 +1028,41 @@ mod tests {
             "rw,vers=3,addr=10.0.0.3",
             "appended, and nothing already there is dropped"
         );
+    }
+
+    /// btrfs, EclipseFS and NFS are served by a process unless the boot
+    /// keeps them for the kernel or the mount asks what a served one
+    /// would drop.
+    #[test]
+    fn what_is_served_by_default_and_what_stays_with_the_kernel() {
+        use super::served_by_default as served;
+        for fstype in ["btrfs", "eclipsefs", "nfs"] {
+            assert!(served(fstype, 0, "", None), "{}", fstype);
+            assert!(
+                served(fstype, MS_RDONLY, "defaults,noatime", None),
+                "{}",
+                fstype
+            );
+            assert!(served(fstype, 0, "", Some("server")), "{}", fstype);
+            assert!(
+                !served(fstype, 0, "", Some("kernel")),
+                "{}: the way back",
+                fstype
+            );
+            assert!(!served(fstype, 8, "", None), "{}: MS_NOEXEC", fstype);
+            assert!(!served(fstype, 0, "rw,nosuid", None), "{}", fstype);
+            assert!(!served(fstype, 0, "nodev", None), "{}", fstype);
+        }
+        // A block filesystem's options its server does not read stay with
+        // the kernel; an NFS mount's are the server's own.
+        assert!(!served("btrfs", 0, "subvol=@home", None));
+        assert!(!served("btrfs", 0, "compress=zstd", None));
+        assert!(served("eclipsefs", 0, "x-systemd.automount, noatime", None));
+        assert!(served("nfs", 0, "vers=3,rsize=65536,addr=10.0.0.3", None));
+        // FAT is the helper's whatever is asked (`mount_fs`), and nothing
+        // else is.
+        assert!(!served("vfat", 0, "", None));
+        assert!(!served("tmpfs", 0, "", None));
     }
 }
 
