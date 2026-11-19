@@ -37,6 +37,15 @@ pub mod zx;
 pub const PAGE: usize = 4096;
 
 /// Nanoseconds on the monotonic clock.
+/// Whether this machine runs on one CPU: then a look for a client's next
+/// request is never answered while it lasts (the client cannot run), and
+/// when a timer tick lets the client in, the look seems to pay and goes
+/// on costing a system call per turn.
+pub fn one_cpu() -> bool {
+    // SAFETY: sysconf has no preconditions.
+    unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) <= 1 }
+}
+
 pub fn now_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,

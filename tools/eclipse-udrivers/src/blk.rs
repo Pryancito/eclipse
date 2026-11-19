@@ -460,7 +460,9 @@ fn turn(
 /// or the device stops answering. The status that ended it.
 pub fn serve(disk: &mut impl Backend, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); FIFO_DEPTH];
-    let mut look = Hybrid::new(true);
+    // A look for the next request only pays where the client runs on
+    // another CPU meanwhile.
+    let mut look = Hybrid::new(!crate::one_cpu());
     // The replies to the requests of the turn before.
     let mut got = 0;
     loop {
