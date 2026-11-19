@@ -323,6 +323,7 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
 use kernel_hal::drivers::net::stack_card::{Carried, More, Sixes};
 use kernel_hal::sync::Mutex;
 use log::warn;
@@ -1350,7 +1351,20 @@ struct Hold {
     sharing: Sharing,
     /// A stream socket that listens: nobody shares a port with it.
     listening: bool,
+    /// The socket asked for this port by its number: one that was given
+    /// any leaves nothing behind.
+    asked: bool,
+    /// Its socket is gone, and what it closed keeps the port until then
+    /// (`TIME_WAIT`).
+    until: Option<Duration>,
 }
+
+/// For how long a connection that this machine closed first keeps its
+/// port after it: Linux's `TCP_TIMEWAIT_LEN`.
+pub(super) const TIME_WAIT: Duration = Duration::from_secs(60);
+
+/// Whose a hold is when its socket is gone: no socket has this number.
+const GONE: u64 = u64::MAX;
 
 /// The ports that are taken, and the next to give to a socket that asks
 /// for any.
@@ -1363,7 +1377,9 @@ struct Hold {
 /// connection that arrived on a listener has the listener's port, with
 /// what the listener said, for as long as it lives: a server that ends
 /// and starts again while one is left takes its port back only with
-/// `SO_REUSEADDR`.
+/// `SO_REUSEADDR`. And so does one that closed before its peer did, for
+/// [`TIME_WAIT`] after it is gone (`inet_twsk_bind_hash`), if its port
+/// was asked for by number.
 struct Ports {
     taken: BTreeMap<u16, Vec<Hold>>,
     next: u16,
@@ -1415,6 +1431,7 @@ impl Ports {
         sharing: Sharing,
     ) -> LxResult<u16> {
         let bits = takes.bits();
+        self.sweep(wanted, kernel_hal::timer::timer_now());
         let port = if wanted != 0 {
             if self.in_way(wanted, at, bits, sharing) {
                 return Err(LxError::EADDRINUSE);
@@ -1443,6 +1460,8 @@ impl Ports {
             bits,
             sharing,
             listening: false,
+            asked: wanted != 0,
+            until: None,
         });
         Ok(port)
     }
@@ -1491,8 +1510,50 @@ impl Ports {
                 bits: theirs.bits,
                 sharing: theirs.sharing,
                 listening: false,
+                asked: theirs.asked,
+                until: None,
             };
             holds.push(hold);
+        }
+    }
+
+    /// The socket `sock` that had `port` is gone, having closed a
+    /// connection before its peer did: what it had of the port stays
+    /// `until` then, as it had it. One hold for all that were alike: a
+    /// server's thousand connections leave one.
+    fn linger(&mut self, port: u16, sock: u64, until: Duration) {
+        let Some(holds) = self.taken.get_mut(&port) else {
+            return;
+        };
+        if let Some(own) = holds.iter().position(|hold| hold.sock == sock) {
+            let mut hold = holds.remove(own);
+            let alike = holds.iter().position(|other| {
+                other.sock == GONE
+                    && (other.at, other.bits, other.sharing) == (hold.at, hold.bits, hold.sharing)
+            });
+            match alike {
+                _ if !hold.asked => {}
+                Some(other) => holds[other].until = Some(until),
+                None => {
+                    hold.sock = GONE;
+                    hold.listening = false;
+                    hold.until = Some(until);
+                    holds.push(hold);
+                }
+            }
+        }
+        if holds.is_empty() {
+            self.taken.remove(&port);
+        }
+    }
+
+    /// Forget what was left on `port` until a time that `now` is.
+    fn sweep(&mut self, port: u16, now: Duration) {
+        if let Some(holds) = self.taken.get_mut(&port) {
+            holds.retain(|hold| hold.until.is_none_or(|until| now < until));
+            if holds.is_empty() {
+                self.taken.remove(&port);
+            }
         }
     }
 
