@@ -196,7 +196,15 @@ fn writing(dir: &Path) {
 /// `-d`: time the device at `path`, writing back only what was read.
 fn device(path: &Path, only: Option<&str>) {
     const AT: u64 = 1 << 20;
-    const SPAN: usize = 8 << 20;
+    // `ECLIPSE_FS_BENCH_SPAN` (bytes, a multiple of 1 MiB down to 1 MiB)
+    // shortens the run, for an instruction trace of a few hundred
+    // requests instead of thousands.
+    let span: usize = std::env::var("ECLIPSE_FS_BENCH_SPAN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(8 << 20, |s: usize| (s >> 20).max(1) << 20);
+    #[allow(non_snake_case)]
+    let SPAN = span;
     let ok =
         |what: &str, r: std::io::Result<()>| r.unwrap_or_else(|e| die(format_args!("{what}: {e}")));
     let file = fs::OpenOptions::new()
@@ -244,7 +252,7 @@ fn device(path: &Path, only: Option<&str>) {
     }
     let mut at = 12345u64;
     let scattered = if only.is_none_or(|only| only == "4k") {
-        500
+        500.min(SPAN / 4096) as u64
     } else {
         0
     };

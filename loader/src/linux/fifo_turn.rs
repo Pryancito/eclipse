@@ -21,6 +21,22 @@ use zircon_object::object::{KernelObject, Rights, Signal};
 use zircon_object::task::Process;
 use zircon_object::{ZxError, ZxResult};
 
+/// The bytes a turn moves in a buffer of its own, not the heap's, up to
+/// here: a served disk's sixteen 32-byte messages. Every turn of every
+/// request used to allocate and free two.
+const SMALL: usize = 512;
+
+/// `len` bytes to work in: the start of `small` when they fit, otherwise
+/// `big`, grown to them. A FIFO holds at most 4 KiB.
+fn room_for<'a>(len: usize, small: &'a mut [u8; SMALL], big: &'a mut Vec<u8>) -> &'a mut [u8] {
+    if len <= SMALL {
+        &mut small[..len]
+    } else {
+        big.resize(len, 0);
+        &mut big[..]
+    }
+}
+
 /// A turn whose replies are on their way: what is left is the wait.
 pub(super) struct Turn {
     fifo: Arc<Fifo>,
@@ -89,10 +105,17 @@ pub(super) fn reply_then(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Tur
         let len = replies
             .checked_mul(elem_size)
             .ok_or(ZxError::INVALID_ARGS)?;
-        let bytes: Vec<u8> = UserInPtr::<u8>::from(buf)
-            .read_array(len)
-            .map_err(|_| ZxError::INVALID_ARGS)?;
-        if let Err((e, put)) = put_all(&fifo, elem_size, &bytes, replies) {
+        let mut small = [0u8; SMALL];
+        let mut big = Vec::new();
+        let bytes = room_for(len, &mut small, &mut big);
+        // Copied out before the FIFO's lock is taken: a fault on the
+        // caller's page must not happen with a lock held.
+        bytes.copy_from_slice(
+            UserInPtr::<u8>::from(buf)
+                .as_slice(len)
+                .map_err(|_| ZxError::INVALID_ARGS)?,
+        );
+        if let Err((e, put)) = put_all(&fifo, elem_size, bytes, replies) {
             let _ = count.write(put);
             return Err(e);
         }
@@ -110,8 +133,10 @@ impl Turn {
     /// The call from the wait on: the next elements into the caller's
     /// buffer, and how many into `*actual`.
     pub(super) async fn wait_then_read(self) -> ZxResult {
-        let mut data = alloc::vec![0u8; self.room * self.elem_size];
-        let got = take_next(&self.fifo, self.elem_size, &mut data, self.room).await?;
+        let mut small = [0u8; SMALL];
+        let mut big = Vec::new();
+        let data = room_for(self.room * self.elem_size, &mut small, &mut big);
+        let got = take_next(&self.fifo, self.elem_size, data, self.room).await?;
         // As `zx_fifo_read`: the elements are taken, and a buffer that
         // faults loses them.
         UserOutPtr::<u8>::from(self.buf)
