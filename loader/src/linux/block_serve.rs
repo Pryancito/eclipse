@@ -697,13 +697,17 @@ impl Link {
                 warn!("served disk: a request was not answered in time");
                 return Err(DeviceError::IoError);
             }
+            // Pinned here, in this future, not boxed: two allocations and two
+            // frees fewer for every sleep of every request.
+            let replies = core::pin::pin!(fifo.wait_signal(Signal::READABLE | Signal::PEER_CLOSED));
+            let timeout = core::pin::pin!(kernel_hal::thread::sleep_until(Duration::from_millis(
+                deadline,
+            )));
             Asleep {
                 disk: self,
                 parts,
-                replies: Box::pin(fifo.wait_signal(Signal::READABLE | Signal::PEER_CLOSED)),
-                timeout: Box::pin(kernel_hal::thread::sleep_until(Duration::from_millis(
-                    deadline,
-                ))),
+                replies,
+                timeout,
             }
             .await;
         }
@@ -712,14 +716,14 @@ impl Link {
 
 /// One sleep of [`Link::wait_async`]: over when a reply is there to
 /// read, when another waiter has read one of ours, or at the deadline.
-struct Asleep<'a, R, T> {
+struct Asleep<'a, 'f, R, T> {
     disk: &'a Link,
     parts: &'a [Part],
-    replies: Pin<Box<R>>,
-    timeout: Pin<Box<T>>,
+    replies: Pin<&'f mut R>,
+    timeout: Pin<&'f mut T>,
 }
 
-impl<R: Future, T: Future> Future for Asleep<'_, R, T> {
+impl<R: Future, T: Future> Future for Asleep<'_, '_, R, T> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
