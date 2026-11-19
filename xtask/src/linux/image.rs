@@ -1058,6 +1058,10 @@ impl super::LinuxRootfs {
 /// DEBUG: repackear solo el initramfs SFS desde rootfs/x86_64 sin reconstruir
 /// nada más. `cargo test -p xtask -- --ignored --nocapture dbg_repack_initramfs`.
 ///
+/// `REPACK_ROOTFS` y `REPACK_IMAGE` cambian el árbol de origen y la imagen de
+/// destino: `scripts/live-web/build.sh` empaqueta así el rootfs recortado de la
+/// demo en el navegador.
+///
 /// `#[ignore]`: this is a developer helper, not a test. It needs a rootfs
 /// that only `cargo rootfs` produces, so under plain `cargo test` (CI, a
 /// fresh checkout) it failed with "No such file or directory" and turned the
@@ -1065,8 +1069,12 @@ impl super::LinuxRootfs {
 #[test]
 #[ignore = "debug helper: needs rootfs/x86_64 built by `cargo rootfs`; run with --ignored"]
 fn dbg_repack_initramfs() {
-    let rootfs = PROJECT_DIR.join("rootfs").join("x86_64");
-    let image = PROJECT_DIR.join("zCore").join("x86_64.img");
+    let rootfs = std::env::var("REPACK_ROOTFS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| PROJECT_DIR.join("rootfs").join("x86_64"));
+    let image = std::env::var("REPACK_IMAGE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| PROJECT_DIR.join("zCore").join("x86_64.img"));
     // Size dynamically like the production images do — the old fixed 80 MiB
     // made this helper useless the moment the rootfs grew past it.
     let size = sfs_size_for(sfs_payload_bytes(&rootfs));

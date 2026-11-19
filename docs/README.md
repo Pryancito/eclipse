@@ -45,6 +45,7 @@ lleva arriba un enlace para cambiar de idioma. El punto de partida es el
 - [Placa Allwinner D1 (riscv64)](README-D1.md)
 - [Placa SiFive fu740 (riscv64)](README-fu740.md)
 - [Placa StarFive VisionFive (riscv64)](README-visionfive.md)
+- [Eclipse OS en el navegador (riscv64 en QEMU para WebAssembly)](../scripts/live-web/README.md)
 
 ## Herramientas
 

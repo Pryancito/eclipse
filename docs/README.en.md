@@ -45,6 +45,7 @@ has a link at the top to switch language. The starting point is the
 - [Allwinner D1 board (riscv64)](README-D1.en.md)
 - [SiFive fu740 board (riscv64)](README-fu740.en.md)
 - [StarFive VisionFive board (riscv64)](README-visionfive.en.md)
+- [Eclipse OS in the browser (riscv64 on QEMU for WebAssembly)](../scripts/live-web/README.en.md)
 
 ## Tools
 
