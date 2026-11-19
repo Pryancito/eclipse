@@ -4124,7 +4124,8 @@ fn proc_net_arp_content() -> String {
 /// The table of `/proc/net/arp`: a row for each neighbour of IPv4 that
 /// the card of each name has `met`. One is "complete" (0x2) for as long
 /// as its hardware address is known, as in Linux, where a row stays long
-/// after the neighbour was last heard from.
+/// after the neighbour was last heard from; and "permanent" too (0x4)
+/// when it was written by hand.
 fn proc_net_arp_of(
     met: impl Iterator<Item = (String, Vec<zcore_drivers::scheme::NeighbourInfo>)>,
 ) -> String {
@@ -4139,10 +4140,11 @@ fn proc_net_arp_of(
             // As text first: an address does not pad itself.
             let address = alloc::format!("{address}");
             let h = neighbour.hardware;
+            let flags = if neighbour.fixed() { 0x6 } else { 0x2 };
             let _ = writeln!(
                 s,
                 "{:<16} 0x{:<10x}0x{:<10x}{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}     *        {}",
-                address, 1, 2, h[0], h[1], h[2], h[3], h[4], h[5], name
+                address, 1, flags, h[0], h[1], h[2], h[3], h[4], h[5], name
             );
         }
     }

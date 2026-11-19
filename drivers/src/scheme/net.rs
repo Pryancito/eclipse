@@ -30,8 +30,19 @@ pub struct NeighbourInfo {
     pub address: crate::wire::IpAddress,
     pub hardware: [u8; 6],
     /// The time, in milliseconds since boot, it is taken as there until:
-    /// past it, it was there once.
+    /// past it, it was there once. [`Self::FIXED`] for one written by
+    /// hand, which is there until it is taken away.
     pub until_ms: u64,
+}
+
+impl NeighbourInfo {
+    /// The `until_ms` of a neighbour written by hand.
+    pub const FIXED: u64 = u64::MAX;
+
+    /// Whether it was written by hand (`ip neigh replace`, `arp -s`).
+    pub fn fixed(&self) -> bool {
+        self.until_ms == Self::FIXED
+    }
 }
 
 pub trait NetScheme: Scheme {
@@ -99,6 +110,15 @@ pub trait NetScheme: Scheme {
     /// The neighbours the card has met, when it knows.
     fn get_neighbours(&self) -> Vec<NeighbourInfo> {
         Vec::new()
+    }
+    /// Write by hand that `address` is at `hardware` on the card's link,
+    /// or with none forget where it is.
+    fn set_neighbour(
+        &self,
+        _address: crate::wire::IpAddress,
+        _hardware: Option<[u8; 6]>,
+    ) -> DeviceResult {
+        Err(DeviceError::NotSupported)
     }
     fn get_stats(&self) -> NetStats {
         NetStats::default()

@@ -654,13 +654,42 @@ where
     }
 
     /// The neighbors there are: the address of each, its hardware address, and when it stops
-    /// being taken as there.
+    /// being taken as there; never, for one written by hand.
     #[cfg(feature = "medium-ethernet")]
-    pub fn neighbors(&self) -> impl Iterator<Item = (IpAddress, EthernetAddress, Instant)> + '_ {
+    pub fn neighbors(
+        &self,
+    ) -> impl Iterator<Item = (IpAddress, EthernetAddress, Option<Instant>)> + '_ {
         self.inner
             .neighbor_cache
             .iter()
             .flat_map(|cache| cache.neighbors())
+    }
+
+    /// How many neighbors were written by hand.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn fixed_neighbors(&self) -> usize {
+        self.inner
+            .neighbor_cache
+            .as_ref()
+            .map_or(0, |cache| cache.fixed())
+    }
+
+    /// Write a neighbor by hand: see `NeighborCache::fix`.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn fix_neighbor(&mut self, protocol_addr: IpAddress, hardware_addr: EthernetAddress) -> bool {
+        self.inner
+            .neighbor_cache
+            .as_mut()
+            .is_some_and(|cache| cache.fix(protocol_addr, hardware_addr))
+    }
+
+    /// Forget a neighbor: see `NeighborCache::forget`.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn forget_neighbor(&mut self, protocol_addr: &IpAddress) -> bool {
+        self.inner
+            .neighbor_cache
+            .as_mut()
+            .is_some_and(|cache| cache.forget(protocol_addr))
     }
 
     /// Take the oldest packet that had nowhere to go and has not been taken: one for a

@@ -15,6 +15,9 @@ use crate::wire::{EthernetAddress, IpAddress};
 pub struct Neighbor {
     hardware_addr: EthernetAddress,
     expires_at: Instant,
+    /// Written by hand ([`Cache::fix`]): it does not expire, and what is
+    /// heard on the link does not change it.
+    fixed: bool,
 }
 
 /// An answer to a neighbor cache lookup.
@@ -187,6 +190,11 @@ impl<'a> Cache<'a> {
             }
         }
 
+        // One written by hand stays as it was written.
+        if matches!(self.storage.get(&protocol_addr), Some(known) if known.fixed) {
+            return;
+        }
+
         #[cfg(any(feature = "std", feature = "alloc"))]
         let current_storage_size = self.storage.len();
 
@@ -198,7 +206,7 @@ impl<'a> Cache<'a> {
                     let new_btree_map = map
                         .iter_mut()
                         .map(|(key, value)| (*key, *value))
-                        .filter(|(_, v)| timestamp < v.expires_at)
+                        .filter(|(_, v)| v.fixed || timestamp < v.expires_at)
                         .collect();
 
                     *map = new_btree_map;
@@ -222,6 +230,7 @@ impl<'a> Cache<'a> {
         let neighbor = Neighbor {
             expires_at: timestamp + Self::ENTRY_LIFETIME,
             hardware_addr,
+            fixed: false,
         };
         match self.storage.insert(protocol_addr, neighbor) {
             Ok(Some(old_neighbor)) => {
@@ -284,11 +293,54 @@ impl<'a> Cache<'a> {
     }
 
     /// The neighbors there are: the address of each, its hardware
-    /// address, and when it stops being taken as there.
-    pub fn neighbors(&self) -> impl Iterator<Item = (IpAddress, EthernetAddress, Instant)> + '_ {
-        self.storage
-            .iter()
-            .map(|(addr, neighbor)| (*addr, neighbor.hardware_addr, neighbor.expires_at))
+    /// address, and when it stops being taken as there; never, for one
+    /// written by hand ([`fix`](Self::fix)).
+    pub fn neighbors(
+        &self,
+    ) -> impl Iterator<Item = (IpAddress, EthernetAddress, Option<Instant>)> + '_ {
+        self.storage.iter().map(|(addr, neighbor)| {
+            let until = (!neighbor.fixed).then_some(neighbor.expires_at);
+            (*addr, neighbor.hardware_addr, until)
+        })
+    }
+
+    /// How many neighbors were written by hand.
+    pub fn fixed(&self) -> usize {
+        self.storage.iter().filter(|(_, n)| n.fixed).count()
+    }
+
+    /// `protocol_addr` is at `hardware_addr`, by hand (`ip neigh
+    /// replace ... nud permanent`): nobody is asked where it is, it does
+    /// not expire, and what it or anyone says on the link does not move
+    /// it. `false` when there is no room for it.
+    pub fn fix(&mut self, protocol_addr: IpAddress, hardware_addr: EthernetAddress) -> bool {
+        let neighbor = Neighbor {
+            hardware_addr,
+            // The last to make room for another, where room is short.
+            expires_at: Instant::from_micros(i64::MAX),
+            fixed: true,
+        };
+        if self.storage.insert(protocol_addr, neighbor).is_err() {
+            return false;
+        }
+        for asked in self.asked.iter_mut() {
+            if matches!(asked, Some(asked) if asked.protocol_addr == protocol_addr) {
+                *asked = None;
+            }
+        }
+        self.changes = self.changes.wrapping_add(1);
+        true
+    }
+
+    /// Forget `protocol_addr`, written by hand or learnt (`ip neigh
+    /// del`): the next packet for it asks where it is. Whether it was
+    /// known.
+    pub fn forget(&mut self, protocol_addr: &IpAddress) -> bool {
+        let known = self.storage.remove(protocol_addr).is_some();
+        if known {
+            self.changes = self.changes.wrapping_add(1);
+        }
+        known
     }
 
     pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
@@ -299,9 +351,10 @@ impl<'a> Cache<'a> {
         if let Some(&Neighbor {
             expires_at,
             hardware_addr,
+            fixed,
         }) = self.storage.get(protocol_addr)
         {
-            if timestamp < expires_at {
+            if fixed || timestamp < expires_at {
                 return Answer::Found(hardware_addr);
             }
         }
@@ -399,6 +452,40 @@ mod test {
         assert!(!cache
             .lookup(&MOCK_IP_ADDR_2, Instant::from_millis(0))
             .found());
+    }
+
+    #[test]
+    fn one_written_by_hand_stays_until_it_is_forgotten() {
+        let mut cache = Cache::new(BTreeMap::new());
+        let at = Instant::from_millis;
+        cache.fill(MOCK_IP_ADDR_1, HADDR_A, at(0));
+        let before = cache.changes();
+        assert!(cache.fix(MOCK_IP_ADDR_1, HADDR_B));
+        assert!(cache.fix(MOCK_IP_ADDR_2, HADDR_C));
+        assert_ne!(cache.changes(), before);
+        assert_eq!(cache.fixed(), 2);
+        // Long after any lifetime, and whatever is heard of it.
+        let late = at(0) + Cache::ENTRY_LIFETIME * 10;
+        cache.fill(MOCK_IP_ADDR_1, HADDR_D, late);
+        assert_eq!(cache.lookup(&MOCK_IP_ADDR_1, late), Answer::Found(HADDR_B));
+        assert_eq!(cache.lookup(&MOCK_IP_ADDR_2, late), Answer::Found(HADDR_C));
+        let shown: Vec<_> = cache.neighbors().collect();
+        assert_eq!(
+            shown,
+            [
+                (MOCK_IP_ADDR_1, HADDR_B, None),
+                (MOCK_IP_ADDR_2, HADDR_C, None)
+            ]
+        );
+        // Forgotten, it is asked for and learnt as any other.
+        let before = cache.changes();
+        assert!(cache.forget(&MOCK_IP_ADDR_1));
+        assert!(!cache.forget(&MOCK_IP_ADDR_1));
+        assert_ne!(cache.changes(), before);
+        assert!(!cache.lookup(&MOCK_IP_ADDR_1, late).found());
+        cache.fill(MOCK_IP_ADDR_1, HADDR_D, late);
+        assert_eq!(cache.lookup(&MOCK_IP_ADDR_1, late), Answer::Found(HADDR_D));
+        assert_eq!(cache.fixed(), 1);
     }
 
     #[test]

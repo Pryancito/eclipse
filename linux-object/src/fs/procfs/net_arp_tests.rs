@@ -45,3 +45,17 @@ fn the_table_has_a_row_for_each_neighbour_of_ipv4() {
         )
     );
 }
+
+#[test]
+fn one_written_by_hand_is_complete_and_permanent() {
+    let fixed = NeighbourInfo {
+        address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 77)),
+        hardware: [2, 0, 0, 0, 0, 0x77],
+        until_ms: NeighbourInfo::FIXED,
+    };
+    let table = proc_net_arp_of(core::iter::once((String::from("eth0"), alloc::vec![fixed])));
+    assert_eq!(
+        table.lines().nth(1),
+        Some("10.0.2.77        0x1         0x6         02:00:00:00:00:77     *        eth0")
+    );
+}
