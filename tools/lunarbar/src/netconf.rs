@@ -482,8 +482,8 @@ pub fn awaits_stack(udrivers: &str, servers: &Path) -> bool {
 /// runs as a process has a card. The card of such a stack is that stack's
 /// to configure, with the address it was started with or its own DHCP
 /// client: the kernel shows it to be looked at, and an `ip addr add` or a
-/// `udhcpc` on it would do nothing. So it is left out here, and with one
-/// around, an empty list is no reason to try `eth0` on the off chance.
+/// `udhcpc` on it would take the address away from its stack. So it is
+/// left out here. The second value says whether there is such a card.
 pub fn to_configure(sys: &Path, servers: &Path) -> (Vec<String>, bool) {
     let cards = stack_cards(servers);
     let mac = |n: &str| std::fs::read_to_string(sys.join(n).join("address")).map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
