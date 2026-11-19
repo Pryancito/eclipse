@@ -3618,6 +3618,27 @@ impl PciDriver for HdaDriverPci {
         }
 
         let vaddr = crate::bus::phys_to_virt(addr as usize);
+
+        // `udriver=hda@N`: the controller, with every codec behind it, is a
+        // userspace driver's (`tools/eclipse-udrivers`), which serves it as
+        // `/dev/dsp`; the kernel does not so much as reset it until that
+        // driver dies. Counted either way, so `@N` names the same
+        // controller whatever the command line says. The bus turned its
+        // memory decoding and bus mastering on already (`bus::pci`).
+        if crate::user::reserve_if(
+            crate::user::HDA,
+            true,
+            crate::user::Transport::Pci,
+            addr as usize,
+            0x4000,
+            || crate::user::Wiring {
+                irq: None,
+                vaddr: Some(vaddr),
+            },
+        ) {
+            return Err(DeviceError::NotSupported);
+        }
+
         let name = alloc::format!(
             "hda-{:02x}:{:02x}.{:x}{}",
             dev.loc.bus,

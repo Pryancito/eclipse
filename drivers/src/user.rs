@@ -52,8 +52,12 @@ pub const I8042: &str = "i8042";
 /// The aux (mouse) port of the same controller: its own interrupt line,
 /// the same two I/O ports.
 pub const I8042_AUX: &str = "i8042-aux";
+/// An Intel HD Audio controller, with every codec behind it, which the
+/// kernel drives itself unless `udriver=hda@N` asks for it: its driver in
+/// userspace serves it as `/dev/dsp`.
+pub const HDA: &str = "hda";
 /// The kinds that can be reserved.
-const KINDS: [&str; 8] = [
+const KINDS: [&str; 9] = [
     VIRTIO_BLK,
     VIRTIO_NET,
     E1000E,
@@ -62,6 +66,7 @@ const KINDS: [&str; 8] = [
     VIRTIO_INPUT,
     I8042,
     I8042_AUX,
+    HDA,
 ];
 
 /// How the device is reached.
@@ -164,6 +169,17 @@ pub const I8042_AUX_IRQ: usize = 12;
 /// its HBA reset bit, which the controller clears when it is done.
 const AHCI_GHC: usize = 0x04;
 const AHCI_GHC_HR: u32 = 1;
+/// An HDA controller's capabilities, the run bytes of its two command
+/// rings, its stream descriptors (0x20 bytes each, control byte first) and
+/// its global control register with the controller reset bit, which reads
+/// 0 once the controller is in reset (HDA 1.0a §3.3).
+const HDA_GCAP: usize = 0x00;
+const HDA_GCTL: usize = 0x08;
+const HDA_GCTL_CRST: u32 = 1;
+const HDA_CORBCTL: usize = 0x4c;
+const HDA_RIRBCTL: usize = 0x5c;
+const HDA_SD_BASE: usize = 0x80;
+const HDA_SD_LEN: usize = 0x20;
 
 impl UserDevice {
     /// Take the device. Only one caller gets `true` until it is
@@ -268,6 +284,33 @@ impl UserDevice {
                 // written of the memory they named.
                 unsafe { ghc.write_volatile(ghc.read_volatile() | AHCI_GHC_HR) };
                 (0..NVME_RESET_READS).any(|_| unsafe { ghc.read_volatile() } & AHCI_GHC_HR == 0)
+            }
+            Transport::Pci if self.kind == HDA => {
+                if self.size < HDA_RIRBCTL + 1 {
+                    return false;
+                }
+                // SAFETY: as above; every register written is inside the
+                // window, which holds the stream descriptors GCAP counts.
+                // Every DMA engine is stopped first, as the spec asks
+                // before a reset: the rings and each stream, which then
+                // read or write nothing more of the memory they named.
+                unsafe {
+                    let gcap = ((vaddr + HDA_GCAP) as *const u16).read_volatile() as usize;
+                    let streams = ((gcap >> 12) & 0xf) + ((gcap >> 8) & 0xf) + ((gcap >> 3) & 0x1f);
+                    ((vaddr + HDA_CORBCTL) as *mut u8).write_volatile(0);
+                    ((vaddr + HDA_RIRBCTL) as *mut u8).write_volatile(0);
+                    for n in 0..streams {
+                        let ctl = HDA_SD_BASE + n * HDA_SD_LEN;
+                        if ctl < self.size {
+                            ((vaddr + ctl) as *mut u8).write_volatile(0);
+                        }
+                    }
+                    let gctl = (vaddr + HDA_GCTL) as *mut u32;
+                    gctl.write_volatile(gctl.read_volatile() & !HDA_GCTL_CRST);
+                }
+                let gctl = (vaddr + HDA_GCTL) as *const u32;
+                // SAFETY: as above.
+                (0..NVME_RESET_READS).any(|_| unsafe { gctl.read_volatile() } & HDA_GCTL_CRST == 0)
             }
             // A PCI function of a kind this does not know how to stop.
             Transport::Pci => false,
@@ -448,7 +491,7 @@ fn disk_unasked(index: usize) -> bool {
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
-/// `e1000e@N`, `nvme@N`, `ahci@N`, `virtio-input@N` or `i8042@0`.
+/// `e1000e@N`, `nvme@N`, `ahci@N`, `virtio-input@N`, `i8042@0` or `hda@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -644,6 +687,7 @@ mod tests {
         assert_eq!(parse_spec("e1000e@0"), Some((E1000E, 0)));
         assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
         assert_eq!(parse_spec("ahci@1"), Some((AHCI, 1)));
+        assert_eq!(parse_spec("hda@0"), Some((HDA, 0)));
         assert_eq!(parse_spec("virtio-input@0"), Some((VIRTIO_INPUT, 0)));
         assert_eq!(parse_spec("i8042@0"), Some((I8042, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
@@ -758,6 +802,34 @@ mod tests {
         assert_eq!(window[E1000E_IMC / 4], u32::MAX);
         assert_eq!((window[E1000E_RCTL / 4], window[E1000E_TCTL / 4]), (0, 0));
         assert_eq!(window[E1000E_CTRL / 4], 0x40 | E1000E_CTRL_RST);
+    }
+
+    #[test]
+    fn an_hda_controller_stops_its_rings_and_streams_then_goes_into_reset() {
+        let mut words = [0u32; 0x40];
+        // SAFETY: the words' bytes, aligned as the registers are.
+        let window =
+            unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, 0x100) };
+        // One output stream, one input, no bidirectional.
+        window[HDA_GCAP..HDA_GCAP + 2].copy_from_slice(&0x1100u16.to_le_bytes());
+        window[HDA_GCTL] = 0x01;
+        window[HDA_CORBCTL] = 0x02;
+        window[HDA_RIRBCTL] = 0x03;
+        window[HDA_SD_BASE] = 0x02;
+        window[HDA_SD_BASE + HDA_SD_LEN] = 0x02;
+        window[HDA_SD_BASE + 2] = 0x40; // the stream tag: not the run byte
+        let ctrl = UserDevice {
+            kind: HDA,
+            ..device(Transport::Pci, window)
+        };
+        assert!(ctrl.reset());
+        assert_eq!(window[HDA_GCTL], 0);
+        assert_eq!((window[HDA_CORBCTL], window[HDA_RIRBCTL]), (0, 0));
+        assert_eq!(
+            (window[HDA_SD_BASE], window[HDA_SD_BASE + HDA_SD_LEN]),
+            (0, 0)
+        );
+        assert_eq!(window[HDA_SD_BASE + 2], 0x40);
     }
 
     #[test]
