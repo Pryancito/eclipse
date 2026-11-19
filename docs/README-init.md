@@ -272,6 +272,18 @@ comprueban las dos cosas: que esperan, y que ninguno se queda clavado.
 **Escotilla**: `init.serial_setup` en la línea de órdenes del núcleo los vuelve
 a correr uno detrás de otro, en el mismo orden de antes, sin recompilar nada.
 
+## `init.quiet`: la consola para quien escribe
+
+Con `init.quiet` en la línea de órdenes del núcleo, las líneas
+`[eclipse-init] ...` no salen por la consola: van a `/run/eclipse-init.log`. Lo
+que imprimen los tres guiones de arriba (`es`, `Europe/Madrid`) se tira también.
+Es para una consola en la que alguien escribe desde el primer segundo, como la
+demo en el navegador ([`scripts/live-web`](../scripts/live-web/README.md)): allí
+la CPU es emulada, los servicios arrancan cuando el intérprete ya ha sacado su
+`/ # ` y sus líneas caerían en mitad de la primera orden. Antes de que haya
+`/proc` montado no se sabe la línea de órdenes y se escribe en la consola, como
+siempre.
+
 ## Cola
 
 Nada pendiente de esta revisión. Lo que queda son decisiones tomadas (el

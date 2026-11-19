@@ -265,6 +265,17 @@ that none of them gets stuck.
 **Escape hatch**: `init.serial_setup` on the kernel command line runs them one
 after another again, in the same order as before, without recompiling anything.
 
+## `init.quiet`: the console belongs to whoever types
+
+With `init.quiet` on the kernel command line, the `[eclipse-init] ...` lines do
+not go to the console: they go to `/run/eclipse-init.log`. What the three
+scripts above print (`es`, `Europe/Madrid`) is dropped too. It is for a console
+someone types into from the first second, like the in-browser demo
+([`scripts/live-web`](../scripts/live-web/README.en.md)): there the CPU is
+emulated, the services start after the shell has printed its `/ # `, and their
+lines would land in the middle of the first command. Before `/proc` is mounted
+the command line is unknown and the lines go to the console, as always.
+
 ## Remaining
 
 Nothing pending from this review. What is left are decisions already made (the
