@@ -432,7 +432,7 @@ pub const LED_SCROLLL: u16 = 2;
 /// `BUS_I8042`, and the vendors psmouse and atkbd give.
 const BUS_I8042: u16 = 0x11;
 
-fn bitmap(codes: impl IntoIterator<Item = u16>) -> Vec<u8> {
+pub(crate) fn bitmap(codes: impl IntoIterator<Item = u16>) -> Vec<u8> {
     let mut map = Vec::new();
     for c in codes {
         let (byte, bit) = (c as usize / 8, c % 8);

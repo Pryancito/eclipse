@@ -34,7 +34,9 @@ pub mod queue;
 pub mod served;
 pub mod status;
 pub mod stream;
+pub mod usbhid;
 pub mod virtio;
+pub mod xhci;
 pub mod zx;
 
 /// The page size of every machine these run on.

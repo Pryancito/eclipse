@@ -7667,6 +7667,28 @@ impl PciDriver for XhciDriverPci {
 
         let vector = irq.map(|idx| idx + 32).unwrap_or(NO_MSI_VECTOR);
 
+        // `udriver=xhci@N`: the controller, with every device on its ports,
+        // is a userspace driver's (`tools/eclipse-udrivers`, `udrv-xhci`),
+        // which serves its keyboards and pointers as `/dev/input/eventN`;
+        // the kernel does not so much as take it from the firmware. Counted
+        // either way, so `@N` names the same controller whatever the
+        // command line says. The driver waits on the MSI the bus armed.
+        if dev.id.prog_if == 0x30
+            && crate::user::reserve_if(
+                crate::user::XHCI,
+                true,
+                crate::user::Transport::Pci,
+                base_addr + offset,
+                map_len - offset,
+                || crate::user::Wiring {
+                    irq: irq.map(|idx| idx + 32),
+                    vaddr: Some(vaddr),
+                },
+            )
+        {
+            return Err(DeviceError::NotSupported);
+        }
+
         // Handle xHCI
         if dev.id.prog_if == 0x30 {
             let input = XhciUsbHid::probe(dev, vaddr, map_len, vector)?;

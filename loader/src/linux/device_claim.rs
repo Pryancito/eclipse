@@ -56,6 +56,11 @@ pub const ECLIPSE_DEVICE_I8042_AUX: usize = 8;
 /// its memory BAR ([`ECLIPSE_TRANSPORT_PCI`]).
 pub const ECLIPSE_DEVICE_HDA: usize = 9;
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an xHCI USB
+/// controller, left to userspace by `udriver=xhci@N`. Its window is its
+/// memory BAR ([`ECLIPSE_TRANSPORT_PCI`]).
+pub const ECLIPSE_DEVICE_XHCI: usize = 10;
+
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: I/O
 /// ports. The window is `size` ports from port `offset` (words 2 and 3),
 /// which the driver reaches through `ECLIPSE_DEVICE_PORT`; there is no
@@ -238,6 +243,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         ECLIPSE_DEVICE_I8042 => user::I8042,
         ECLIPSE_DEVICE_I8042_AUX => user::I8042_AUX,
         ECLIPSE_DEVICE_HDA => user::HDA,
+        ECLIPSE_DEVICE_XHCI => user::XHCI,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);

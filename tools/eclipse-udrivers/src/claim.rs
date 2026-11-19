@@ -32,6 +32,8 @@ pub const KIND_I8042: usize = 7;
 pub const KIND_I8042_AUX: usize = 8;
 /// An Intel HD Audio controller (`udriver=hda@N`): see [`crate::hda`].
 pub const KIND_HDA: usize = 9;
+/// An xHCI USB controller (`udriver=xhci@N`): see [`crate::xhci`].
+pub const KIND_XHCI: usize = 10;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;
