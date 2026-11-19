@@ -397,6 +397,134 @@ fn drop_binary_fence(table: &mut SyncobjTable, handle: u32) {
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
 }
 
+/// Fences a reset or a re-arm would have taken from their dependents, and
+/// that [`keep_fence_for_dependents`] kept for them instead. Shown in
+/// `/proc/gpudbg` ([`stats_line`]).
+static FENCES_KEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `handle` is about to lose the fence it carries -- a `SYNCOBJ_RESET`, the
+/// re-arm of a binary slot by the next submit, an import or a binary
+/// transfer into it -- while links of other objects still wait on that
+/// fence. Give the fence a syncobj of its own first, and point those links
+/// at it.
+///
+/// In Linux nothing has to be done: a `sync_file`, a transferred point and
+/// a `dma_fence_array` each hold a reference to the `dma_fence` itself, and
+/// replacing the syncobj's fence leaves theirs alone. Here a link names its
+/// source BY HANDLE and reads the source's state as it is NOW, so the
+/// replace took the fence away from under every dependent: they went on to
+/// wait for the source's NEXT signal. That is a frame late when the
+/// producer submits again at once, and for as long as it stays idle when it
+/// does not -- with explicit sync, where every buffer hand-over is a chain
+/// of such links between the client and the compositor, hardware fences
+/// "landed" tens of seconds after the GPU had written them, held behind a
+/// link that was waiting for the wrong thing. [`export_fence`] already
+/// copies a lone hardware fence onto the file's carrier; this is every
+/// other shape: a source whose fence is itself a link, a chain of fences,
+/// a merge made straight on the source.
+///
+/// What is kept is an orphan (no reference, as [`destroy`] leaves one): the
+/// source's counter, the links and the hardware fences being discarded, and
+/// their timeout marks. Only the dependencies that state delivers are moved
+/// to it; a link to a point the source had not been promised still waits
+/// for the source's next signal, as [`export_snapshot`] documents. The
+/// orphan is collected when nothing names it ([`collect_orphans`]).
+///
+/// `binary_only`: the replace discards only the fences in binary range
+/// (point <= 1), as [`drop_binary_fence`] does; a reset discards them all.
+/// Callers hold the table lock, resolved, and go on to discard as before:
+/// what was moved is no longer there to drop.
+fn keep_fence_for_dependents(table: &mut SyncobjTable, handle: u32, binary_only: bool) {
+    // No link anywhere: no dependents. The same flag, and the same one-way
+    // staleness, as in `resolve_links_locked`.
+    if !ANY_LINKS.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(obj) = table.objects.iter().find(|o| o.handle == handle) else {
+        return;
+    };
+    let discarded = |f: &PendingFence| f.handle == handle && (!binary_only || f.point <= 1);
+    // The highest point the state being discarded delivers or has delivered.
+    let delivers = table
+        .pending
+        .iter()
+        .filter(|f| discarded(f))
+        .map(|f| f.point)
+        .chain(obj.links.iter().map(|l| l.dst_point.max(1)))
+        .fold(obj.point, u64::max);
+    let in_flight = !obj.links.is_empty() || table.pending.iter().any(|f| discarded(f));
+    // Who waits on it: a link of ANOTHER object, to a point that state
+    // delivers. With nothing in flight the counter is all there is, and it
+    // only matters when the replace rewinds it (a binary slot, or a reset).
+    let rewinds = !binary_only || obj.point <= 1;
+    let wanted = |src: u32, target: u64| {
+        src == handle && target <= delivers && (in_flight || (rewinds && target <= obj.point))
+    };
+    let dependents = table
+        .objects
+        .iter()
+        .filter(|o| o.handle != handle)
+        .flat_map(|o| o.links.iter())
+        .flat_map(|l| l.deps.iter())
+        .filter(|&&(src, target)| wanted(src, target))
+        .count();
+    if dependents == 0 {
+        return;
+    }
+    let (point, was_in_flight) = (obj.point, in_flight);
+    let kept = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    for dep in table
+        .objects
+        .iter_mut()
+        .filter(|o| o.handle != handle)
+        .flat_map(|o| o.links.iter_mut())
+        .flat_map(|l| l.deps.iter_mut())
+    {
+        if dep.0 == handle && dep.1 <= delivers && (was_in_flight || (rewinds && dep.1 <= point)) {
+            dep.0 = kept;
+        }
+    }
+    let links = table
+        .objects
+        .iter_mut()
+        .find(|o| o.handle == handle)
+        .map(|o| core::mem::take(&mut o.links))
+        .unwrap_or_default();
+    for f in table.pending.iter_mut() {
+        if f.handle == handle && (!binary_only || f.point <= 1) {
+            f.handle = kept;
+        }
+    }
+    let marks: Vec<Errored> = table
+        .errored
+        .iter()
+        .filter(|e| e.handle == handle)
+        .map(|e| Errored { handle: kept, ..*e })
+        .collect();
+    table.errored.extend(marks);
+    table.objects.push(Syncobj {
+        handle: kept,
+        point,
+        refs: 0,
+        holders: alloc::vec::Vec::new(),
+        links,
+    });
+    let n = FENCES_KEPT.fetch_add(1, Ordering::Relaxed);
+    if (n as u32) < MAX_STALL_REPORTS {
+        crate::klog_warn!(
+            "[syncobj] handle {} {} with {} link(s) still waiting on its fence (at {}, delivers {}): fence kept for them as {} (report {}/{} this boot)",
+            handle,
+            if binary_only { "re-armed" } else { "reset" },
+            dependents,
+            point,
+            delivers,
+            kept,
+            n + 1,
+            MAX_STALL_REPORTS
+        );
+    }
+}
+
 /// Whether `target` on `handle` was reached only by a fence that timed out
 /// (see [`Errored`]). Callers must hold the table lock, resolved.
 fn errored_locked(table: &SyncobjTable, handle: u32, target: u64) -> bool {
@@ -777,7 +905,7 @@ pub fn stats_line() -> alloc::string::String {
     let calls = WAIT_CALLS.load(Ordering::Relaxed);
     let landed = FENCES_LANDED.load(Ordering::Relaxed);
     alloc::format!(
-        "syncobj waits={} (table looks={}) cpu-spin={}us (avg {}us, max {}us, timeouts={}) | hw fences landed={} (submit->land avg {}us, max {}us) timed-out={} pending-now={}",
+        "syncobj waits={} (table looks={}) cpu-spin={}us (avg {}us, max {}us, timeouts={}) | hw fences landed={} (submit->land avg {}us, max {}us) timed-out={} pending-now={} kept-for-dependents={}",
         calls,
         WAIT_TABLE_PROBES.load(Ordering::Relaxed),
         WAIT_SPIN_US.load(Ordering::Relaxed),
@@ -789,6 +917,7 @@ pub fn stats_line() -> alloc::string::String {
         FENCE_LATENCY_MAX_US.load(Ordering::Relaxed),
         FENCES_TIMED_OUT.load(Ordering::Relaxed),
         PENDING_COUNT.load(Ordering::Relaxed),
+        FENCES_KEPT.load(Ordering::Relaxed),
     )
 }
 
@@ -1116,6 +1245,15 @@ pub fn attach_hw_fence(
             return false;
         };
         let cur = obj.point;
+        if binary && cur <= 1 {
+            // Whoever still waits on the fence this replaces keeps it.
+            keep_fence_for_dependents(&mut table, handle, true);
+        }
+        let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+            drop(table);
+            deferred.run();
+            return false;
+        };
         // A binary re-arm replaces the slot, links included; a timeline
         // point is a new node of the chain and leaves the links below it
         // waiting (its landing queues behind them, see `resolve_hw_locked`).
@@ -1731,6 +1869,8 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
         // link, and when it landed it advanced the object -- a waiter went
         // through before the source the import stood for had been reached,
         // and EXEC acquired that stale fence instead of the source's.
+        // (Whoever still waits on the fence replaced keeps it.)
+        keep_fence_for_dependents(&mut table, dst, true);
         drop_binary_fence(&mut table, dst);
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
             drop(table);
@@ -1844,6 +1984,10 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         if binary {
             // A binary transfer replaces the destination's fence, as an
             // import does (above); a timeline point is added to the chain.
+            // Whoever still waits on the fence replaced keeps it.
+            if dst != src {
+                keep_fence_for_dependents(&mut table, dst, true);
+            }
             drop_binary_fence(&mut table, dst);
         }
         let point = dst_point.max(1);
@@ -2069,6 +2213,9 @@ pub fn reset(handle: u32) -> bool {
         // it away. The reset empties THIS object; an importer that already
         // received its fence keeps it.
         let deferred = resolve_locked(&mut table);
+        // And one still in flight, or a link, that others wait on is kept
+        // for them: a `sync_file` holds its own reference to the fence.
+        keep_fence_for_dependents(&mut table, handle, false);
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
             drop(table);
             deferred.run();
