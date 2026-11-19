@@ -3625,9 +3625,10 @@ impl PciDriver for HdaDriverPci {
         // driver dies. Counted either way, so `@N` names the same
         // controller whatever the command line says. The bus turned its
         // memory decoding and bus mastering on already (`bus::pci`).
-        if crate::user::reserve_if(
-            crate::user::HDA,
-            true,
+        // With no `udriver=hda@N`, the first that is not a GPU's is left
+        // all the same (`uhda=kernel` keeps it: `user::leave_first_hda`).
+        if crate::user::reserve_hda(
+            dev.id.vendor_id == 0x10de,
             crate::user::Transport::Pci,
             addr as usize,
             0x4000,
