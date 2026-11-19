@@ -16,7 +16,7 @@
 
 use smoltcp::phy::Device;
 use smoltcp::socket::{Dhcpv4Event, Dhcpv4Socket, SocketHandle};
-use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use super::Stack;
 
@@ -96,6 +96,9 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// `false` when the interface was built with no room for a route, and
     /// then there is none.
     pub fn set_gateway(&mut self, gateway: Option<Ipv4Address>) -> bool {
+        // A route that said everything is on the link is the same entry
+        // of the interface's table: it goes either way.
+        self.forget_all_on_link();
         let routes = self.iface.routes_mut();
         let set = match gateway {
             Some(gateway) => routes.add_default_ipv4_route(gateway).is_ok(),
@@ -166,7 +169,23 @@ impl<D: for<'d> Device<'d> + crate::port::Listened> Stack<D> {
     /// machine names: `false`, and nothing changed, when it is not a
     /// machine of a network of the card's.
     pub fn write_gateway(&mut self, gateway: Option<Ipv4Address>) -> bool {
-        gateway.is_none_or(|gateway| self.near(gateway)) && self.set_gateway(gateway)
+        // Near by a network of the card's or by a route to one on its
+        // link, and not because everything was said to be: that route
+        // is the one the gateway replaces.
+        let near = |gateway: Ipv4Address| {
+            self.near(gateway)
+                && (self.on_link(gateway) || self.on_link_net(IpAddress::Ipv4(gateway)))
+        };
+        if !gateway.is_none_or(near) {
+            return false;
+        }
+        let was = self.all_on_link();
+        let set = self.set_gateway(gateway);
+        if was {
+            // What went through a machine only that route reached.
+            self.prune_ways();
+        }
+        set
     }
 
     pub(super) fn put_address(&mut self, address: Ipv4Cidr) {
