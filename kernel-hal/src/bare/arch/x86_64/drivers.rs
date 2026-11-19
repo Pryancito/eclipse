@@ -272,6 +272,12 @@ pub(super) fn init() -> DeviceResult {
         crate::cmdline::user_ahci(crate::KCONFIG.cmdline),
         super::init_ram_disk().is_none(),
     );
+    // The first HD Audio controller that is not a GPU's, for the driver in
+    // userspace that serves it as /dev/dsp and /dev/snd: `uhda=kernel`
+    // keeps it in the kernel.
+    if crate::cmdline::user_hda(crate::KCONFIG.cmdline) {
+        zcore_drivers::user::leave_first_hda(udriver);
+    }
     // The e1000e too, on this architecture, where its driver in userspace
     // has been run and measured: `unetcard=kernel` keeps it in the kernel.
     if crate::cmdline::user_e1000e(crate::KCONFIG.cmdline) {

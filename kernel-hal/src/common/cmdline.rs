@@ -155,6 +155,14 @@ pub fn user_ahci(cmdline: &str) -> bool {
     value(cmdline, "uahci") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
 }
 
+/// Whether a boot leaves its first HD Audio controller to the driver in
+/// userspace without naming it (`zcore_drivers::user::leave_first_hda`),
+/// which serves it as `/dev/dsp` and `/dev/snd`: as [`user_disks`], with
+/// `uhda=kernel` the boot that keeps it in the kernel.
+pub fn user_hda(cmdline: &str) -> bool {
+    value(cmdline, "uhda") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+}
+
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
 /// on in one go — `nvidia.cuda` for every switch CUDA needs.
 ///
@@ -927,6 +935,14 @@ mod tests {
         assert!(!user_ahci("uahci=kernel") && user_nvme("uahci=kernel"));
         assert!(!user_nvme("zircon.gateway=0") && !user_ahci("zircon.gateway=0"));
         assert!(user_nvme("notunvme=kernel"));
+    }
+
+    #[test]
+    fn the_first_hda_is_userspace_s_unless_the_boot_keeps_it() {
+        assert!(user_hda(""));
+        assert!(!user_hda("LOG=warn:uhda=kernel") && user_nvme("uhda=kernel"));
+        assert!(!user_hda("zircon.gateway=0"));
+        assert!(user_hda("notuhda=kernel"));
     }
 
     #[test]

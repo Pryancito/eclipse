@@ -24,7 +24,9 @@
 //! from, on a machine with no initrd, which is the first. `ublk=kernel`
 //! keeps them all for the kernel's own driver. So do the NVMe and AHCI
 //! controllers ([`leave_pci_disks`]), on a machine with an initrd:
-//! `unvme=kernel` and `uahci=kernel` keep them.
+//! `unvme=kernel` and `uahci=kernel` keep them. And the first HD Audio
+//! controller that is not a GPU's ([`leave_first_hda`]): `uhda=kernel`
+//! keeps it.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -521,6 +523,36 @@ pub fn leave_pci_disks(spec: Option<&str>, nvme: bool, ahci: bool, boot_disk: bo
     }
 }
 
+/// Whether the first HD Audio controller that is not a GPU's is left to
+/// userspace without the boot naming it: see [`leave_first_hda`].
+static HDA_UNASKED: AtomicBool = AtomicBool::new(false);
+
+/// Leave the first HD Audio controller that is not on a GPU to its driver
+/// in userspace, which serves it as `/dev/dsp` and `/dev/snd`, unless the
+/// boot names an `hda@N` itself. One: init starts one driver, for the
+/// first `hda@` of `/proc/udrivers`. Not a GPU's HDMI function, which that
+/// driver has no output for. Before the buses are probed.
+pub fn leave_first_hda(spec: Option<&str>) {
+    if kind_unasked(spec, HDA) {
+        info!("udriver: the first HD Audio controller is for userspace");
+        HDA_UNASKED.store(true, Ordering::Release);
+    }
+}
+
+/// An HD Audio controller was found (`gpu`: the HDMI function of a GPU):
+/// whether it is left to userspace, as [`reserve_if`] says, or unasked as
+/// the first that is not a GPU's ([`leave_first_hda`]).
+pub fn reserve_hda(
+    gpu: bool,
+    transport: Transport,
+    paddr: usize,
+    size: usize,
+    wiring: impl FnOnce() -> Wiring,
+) -> bool {
+    let unasked = !gpu && HDA_UNASKED.swap(false, Ordering::AcqRel);
+    reserve_with(HDA, true, unasked, transport, paddr, size, wiring)
+}
+
 /// Whether virtio disk `index` is left to userspace unasked.
 fn disk_unasked(index: usize) -> bool {
     DISKS_UNASKED.load(Ordering::Acquire)
@@ -659,11 +691,25 @@ pub fn reserve_if(
     size: usize,
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
+    reserve_with(kind, usable, false, transport, paddr, size, wiring)
+}
+
+/// [`reserve_if`], where `unasked` also leaves the device to userspace.
+fn reserve_with(
+    kind: &'static str,
+    usable: bool,
+    unasked: bool,
+    transport: Transport,
+    paddr: usize,
+    size: usize,
+    wiring: impl FnOnce() -> Wiring,
+) -> bool {
     let Some(slot) = KINDS.iter().position(|k| *k == kind) else {
         return false;
     };
     let index = SEEN[slot].fetch_add(1, Ordering::AcqRel);
-    let wanted = WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
+    let wanted = unasked
+        || WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
         || (kind == E1000E && index == 0 && first_e1000e_unasked())
         || (kind == VIRTIO_BLK && disk_unasked(index))
         || (kind == NVME && NVME_UNASKED.load(Ordering::Acquire))

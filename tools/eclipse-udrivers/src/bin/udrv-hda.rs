@@ -8,14 +8,15 @@
 //!
 //! A thread answers each node; another follows the stream every few
 //! milliseconds, giving back what the controller played and telling a
-//! writer waiting for room. When this process goes the nodes go with it;
+//! writer waiting for room. With nothing open and nothing playing that
+//! thread sleeps until a request comes, so an idle card costs nothing. When this process goes the nodes go with it;
 //! the kernel resets the controller, and the next driver starts it again.
 //!
 //! Exit status: 2 when the Zircon gateway is off, 1 on any other error and
 //! when the kernel lets go of the node.
 
 use std::process::exit;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use udrivers::alsa::{Ctl, CtlNode, Pcm, PcmNode};
@@ -106,9 +107,15 @@ fn main() {
         ctl: Ctl::default(),
     });
     let card = &card;
+    // Rung after every request to /dev/dsp or the PCM: one may have opened
+    // the card or started the stream, and the stream has to be followed.
+    let woken = &Condvar::new();
     let (dsp_node, ctl_node, pcm_node) = (&dsp_node, &ctl_node, &pcm_node);
     std::thread::scope(|s| {
         s.spawn(move || loop {
+            let c = card.lock().unwrap_or_else(|p| p.into_inner());
+            let idle = |c: &mut Card| c.stream.owner.is_none() && !c.stream.running();
+            drop(woken.wait_while(c, idle).unwrap_or_else(|p| p.into_inner()));
             std::thread::sleep(TICK);
             let mut c = card.lock().unwrap_or_else(|p| p.into_inner());
             let c = &mut *c;
@@ -133,26 +140,30 @@ fn main() {
         });
         s.spawn(move || {
             let left = pcm_node.run_with(card, |c, n, req| {
-                n.answer(
+                let reply = n.answer(
                     &mut PcmNode {
                         pcm: &mut c.pcm,
                         stream: &mut c.stream,
                     },
                     req,
-                )
+                );
+                woken.notify_one();
+                reply
             });
             die(format_args!(
                 "the kernel let go of /dev/snd/pcmC0D0p: {left}"
             ))
         });
         let left = dsp_node.run_with(card, |c, n, req| {
-            n.answer(
+            let reply = n.answer(
                 &mut DspNode {
                     dsp: &mut c.dsp,
                     stream: &mut c.stream,
                 },
                 req,
-            )
+            );
+            woken.notify_one();
+            reply
         });
         die(format_args!("the kernel let go of /dev/dsp: {left}"))
     })
