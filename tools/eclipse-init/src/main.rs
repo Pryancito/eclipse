@@ -28,7 +28,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -779,10 +779,51 @@ fn percent_of(part: Duration, total: Duration) -> u64 {
 /// ten-second gate and a ten-millisecond one looked identical. Unstamped only
 /// before `main` sets the origin (the `--exec-on-graphics-vt` helper path).
 fn log(msg: &str) {
+    let line = match since_boot() {
+        Some(t) => format!("[eclipse-init] [{:>8}] {msg}", secs(t)),
+        None => format!("[eclipse-init] {msg}"),
+    };
+    if log_quiet() {
+        // `init.quiet`: the console belongs to the shell. The lines go to
+        // QUIET_LOG instead, where `cat` still finds them.
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(QUIET_LOG)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+        return;
+    }
     // PID 1 has stdout/stderr wired to the console by the kernel.
-    match since_boot() {
-        Some(t) => println!("[eclipse-init] [{:>8}] {msg}", secs(t)),
-        None => println!("[eclipse-init] {msg}"),
+    println!("{line}");
+}
+
+/// Where [`log`] writes under `init.quiet`.
+const QUIET_LOG: &str = "/run/eclipse-init.log";
+
+/// 0: not known yet (no `/proc` mounted), 1: print on the console, 2: quiet.
+static LOG_QUIET: AtomicU8 = AtomicU8::new(0);
+
+/// Is `init.quiet` on the kernel command line? It keeps init's own lines off
+/// the console, for a console that someone types into from the first second:
+/// the web demo (eclipse-os.dev/live/), where the boot runs on an emulated CPU
+/// and these lines would land in the middle of the first command. Until
+/// `/proc` is mounted the answer is "not quiet", and it is not cached then.
+fn log_quiet() -> bool {
+    match LOG_QUIET.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let cmdline = read_cmdline();
+            if cmdline.is_empty() {
+                return false;
+            }
+            let quiet = cmdline_has_in(&cmdline, "init.quiet");
+            LOG_QUIET.store(if quiet { 2 } else { 1 }, Ordering::Relaxed);
+            quiet
+        }
     }
 }
 
@@ -1398,7 +1439,14 @@ fn apply_boot_settings() {
 
 /// Start one boot setting, or say on the console why it could not start.
 fn spawn_boot_setting(prog: &str) -> Option<std::process::Child> {
-    match std::process::Command::new(prog).arg("--boot").spawn() {
+    let mut cmd = std::process::Command::new(prog);
+    cmd.arg("--boot");
+    if log_quiet() {
+        // What the scripts echo ("es", "Europe/Madrid") is chatter for the
+        // console too: under `init.quiet` it is dropped with init's own lines.
+        cmd.stdout(std::process::Stdio::null());
+    }
+    match cmd.spawn() {
         Ok(child) => Some(child),
         Err(e) => {
             // Not fatal and never has been: an image without the desktop stack
