@@ -264,6 +264,14 @@ pub(super) fn init() -> DeviceResult {
     if crate::cmdline::user_hda(crate::KCONFIG.cmdline) {
         zcore_drivers::user::leave_first_hda(udriver);
     }
+    // The first virtio input devices and the i8042, for their drivers in
+    // userspace, which still reach the consoles: `uinput=kernel` and
+    // `ups2=kernel` keep them in the kernel.
+    zcore_drivers::user::leave_input(
+        udriver,
+        crate::cmdline::user_virtio_input(crate::KCONFIG.cmdline),
+        crate::cmdline::user_i8042(crate::KCONFIG.cmdline),
+    );
     // The e1000e too, on this architecture, where its driver in userspace
     // has been run and measured: `unetcard=kernel` keeps it in the kernel.
     if crate::cmdline::user_e1000e(crate::KCONFIG.cmdline) {

@@ -1992,7 +1992,7 @@ impl INode for SysDevCharDirINode {
             if let Ok(minor) = rest.parse::<usize>() {
                 if minor >= EVDEV_EVENT_MINOR_BASE {
                     let id = minor - EVDEV_EVENT_MINOR_BASE;
-                    if id < input_event_count() {
+                    if input_event_ids().contains(&id) {
                         return Ok(Arc::new(Pseudo::new(
                             &format!("../../class/input/event{}", id),
                             FileType::SymLink,
@@ -2010,7 +2010,7 @@ impl INode for SysDevCharDirINode {
             .iter()
             .map(|minor| format!("226:{}", minor))
             .collect();
-        for ev in 0..input_event_count() {
+        for ev in input_event_ids() {
             names.push(format!("13:{}", EVDEV_EVENT_MINOR_BASE + ev));
         }
         nth_entry(id, &names)
@@ -2035,27 +2035,56 @@ fn input_event_count() -> usize {
     drivers::all_input().as_vec().len()
 }
 
+/// The `N` of every `/dev/input/eventN` there is: the kernel's own input
+/// devices, `0..`[`input_event_count`], then those processes serve.
+fn input_event_ids() -> Vec<usize> {
+    let mut ids: Vec<usize> = (0..input_event_count()).collect();
+    for id in crate::fs::devfs::served::input::ids() {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 /// `ID_INPUT*` udev properties for input device `id`, derived from its evdev
 /// capability bitmaps (the same classification udev's `input_id` performs).
 fn input_id_props(id: usize) -> String {
     use kernel_hal::drivers::prelude::CapabilityType;
     let devs = drivers::all_input().as_vec();
     let Some(dev) = devs.get(id) else {
-        return String::from("ID_INPUT=1\n");
+        // One a process serves, when it is.
+        return match crate::fs::devfs::served::input::caps(id) {
+            Some(caps) => input_class_props(&|c| caps.has_key(c), &|c| caps.has_rel(c), &|c| {
+                caps.has_abs(c)
+            }),
+            None => String::from("ID_INPUT=1\n"),
+        };
     };
     let key = dev.capability(CapabilityType::Key);
     let rel = dev.capability(CapabilityType::RelAxis);
     let abs = dev.capability(CapabilityType::AbsAxis);
+    input_class_props(&|c| key.contains(c), &|c| rel.contains(c), &|c| {
+        abs.contains(c)
+    })
+}
 
+/// The `ID_INPUT*` properties of a device whose evdev bitmaps say which
+/// keys (`key`), relative axes (`rel`) and absolute axes (`abs`) it has.
+pub(crate) fn input_class_props(
+    key: &dyn Fn(u16) -> bool,
+    rel: &dyn Fn(u16) -> bool,
+    abs: &dyn Fn(u16) -> bool,
+) -> String {
     // Linux input-event-codes: REL_X=0 REL_Y=1; BTN_LEFT=0x110 BTN_TOUCH=0x14a;
     // KEY_ESC=1; ABS_X/Y=0/1. Keep in sync with the synthetic /run/udev/data
     // writer in `create_root_fs` — libudev reads both uevent props and the db.
-    let has_rel_xy = rel.contains(0) && rel.contains(1);
-    let has_abs_xy = abs.contains(0) && abs.contains(1);
-    let has_btn_left = key.contains(0x110);
-    let has_tool_pen = key.contains(0x140); // BTN_TOOL_PEN
-    let is_keyboard = key.contains(1); // KEY_ESC (do not also require KEY_SPACE)
-    let is_touch = has_abs_xy && key.contains(0x14a) && !has_tool_pen;
+    let has_rel_xy = rel(0) && rel(1);
+    let has_abs_xy = abs(0) && abs(1);
+    let has_btn_left = key(0x110);
+    let has_tool_pen = key(0x140); // BTN_TOOL_PEN
+    let is_keyboard = key(1); // KEY_ESC (do not also require KEY_SPACE)
+    let is_touch = has_abs_xy && key(0x14a) && !has_tool_pen;
     // QEMU's `usb-tablet` is an *absolute mouse* (ABS_X/Y + BTN_LEFT, no stylus).
     // Real tablets advertise BTN_TOOL_PEN (0x140); only those get ID_INPUT_TABLET.
     let is_tablet = has_abs_xy && has_tool_pen;
@@ -2076,7 +2105,7 @@ fn input_id_props(id: usize) -> String {
     }
     // If nothing matched but the device has keys, mark it a key device so
     // libinput still assigns it a capability instead of ignoring it.
-    if !is_keyboard && !is_mouse && !is_tablet && !is_touch && key.contains(1) {
+    if !is_keyboard && !is_mouse && !is_tablet && !is_touch && key(1) {
         s.push_str("ID_INPUT_KEY=1\n");
     }
     s
@@ -2117,7 +2146,7 @@ impl INode for SysClassInputDirINode {
                     .strip_prefix("event")
                     .and_then(|n| n.parse::<usize>().ok())
                 {
-                    if id < input_event_count() {
+                    if input_event_ids().contains(&id) {
                         return Ok(Arc::new(SysInputEventINode { id }));
                     }
                 }
@@ -2126,7 +2155,8 @@ impl INode for SysClassInputDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let names: Vec<String> = (0..input_event_count())
+        let names: Vec<String> = input_event_ids()
+            .into_iter()
             .map(|i| format!("event{}", i))
             .collect();
         nth_entry(id, &names)

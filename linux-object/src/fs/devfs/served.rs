@@ -29,6 +29,7 @@
 //! program that made the call, as its own `read` and `write` would. The
 //! server must not open its own node: the open would wait on itself.
 
+pub mod input;
 mod link;
 #[cfg(test)]
 mod tests;
@@ -416,6 +417,22 @@ impl ServedOpen {
         wire::Iov::decode(&head).ok_or(LxError::EIO)
     }
 
+    /// `ioctl(cmd)` for the kernel's own use: a command that only gives
+    /// back (`_IOR`), into `out`. How many bytes it gave.
+    pub fn ioctl_read(&self, cmd: u32, out: &mut [u8]) -> LxResult<usize> {
+        let answer = self
+            .node
+            .link
+            .call(OP_IOCTL, self.fh, 0, cmd as u64, 0, &[])
+            .map_err(lx_of)?;
+        if answer.a == wire::IOCTL_FETCH {
+            return Err(LxError::EIO);
+        }
+        let n = answer.len.min(out.len());
+        answer.data(&mut out[..n]).map_err(lx_of)?;
+        Ok(n)
+    }
+
     /// [`ServedOpen::ioctl`] on an open that waits: a server never waits,
     /// and answers `EAGAIN` for what cannot be done yet (ALSA's
     /// `WRITEI_FRAMES` with no room, its `DRAIN` with sound still to
@@ -602,6 +619,7 @@ pub fn serve(
     let root: Arc<dyn INode> = root.ok_or(LxError::ENODEV)?;
     add(&root, name, node.clone())?;
     info!("served dev: /dev/{name} ({major}:{minor})");
+    input::attach(&node);
     Ok(Served { node })
 }
 

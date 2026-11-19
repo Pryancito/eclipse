@@ -676,6 +676,63 @@ pub(crate) fn audio_cards_alsa_order() -> Vec<Arc<dyn zcore_drivers::scheme::Aud
     v.into_iter().map(|(_, _, a)| a).collect()
 }
 
+/// Where udev's database is (`/run/udev/data`, and the `seat` and `seat0`
+/// tags), for the records of input devices a process serves.
+struct UdevInputDirs {
+    data: Arc<dyn INode>,
+    seat: Option<Arc<dyn INode>>,
+    seat0: Option<Arc<dyn INode>>,
+}
+
+lazy_static! {
+    static ref UDEV_INPUT_DIRS: Mutex<Option<UdevInputDirs>> = Mutex::new(None);
+}
+
+/// The record udev would write for `/dev/input/event<id>`, a device a
+/// process serves (`devfs::served::input`): its `ID_INPUT_*` properties,
+/// from what it can report, as the boot writes them for the kernel's own.
+pub(crate) fn udev_input_record(id: usize, caps: &devfs::served::input::Caps) {
+    use rcore_fs::vfs::FileType;
+    let dirs = UDEV_INPUT_DIRS.lock();
+    let Some(dirs) = dirs.as_ref() else {
+        return;
+    };
+    let mut body = String::from("I:1\n");
+    for line in sysfs::input_class_props(&|c| caps.has_key(c), &|c| caps.has_rel(c), &|c| {
+        caps.has_abs(c)
+    })
+    .lines()
+    {
+        body.push_str("E:");
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("G:seat\nQ:seat\nV:1\n");
+    let name = alloc::format!("c13:{}", 64 + id);
+    match dirs.data.create(&name, FileType::File, 0o644) {
+        Ok(f) => {
+            let _ = f.write_at(0, body.as_bytes());
+        }
+        Err(e) => warn!("udev db {}: {:?}", name, e),
+    }
+    for tag in dirs.seat.iter().chain(dirs.seat0.iter()) {
+        let _ = tag.create(&name, FileType::File, 0o644);
+    }
+}
+
+/// Its server is gone: take its record away.
+pub(crate) fn udev_input_forget(id: usize) {
+    let dirs = UDEV_INPUT_DIRS.lock();
+    let Some(dirs) = dirs.as_ref() else {
+        return;
+    };
+    let name = alloc::format!("c13:{}", 64 + id);
+    let _ = dirs.data.unlink(&name);
+    for tag in dirs.seat.iter().chain(dirs.seat0.iter()) {
+        let _ = tag.unlink(&name);
+    }
+}
+
 /// Record a mount in the table `/proc/mounts` is read from.
 ///
 /// `state` is the live [`MountState`](mount_state::MountState) the mounted
@@ -1992,7 +2049,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         use rcore_fs::vfs::FileType;
         let devs = drivers::all_input().as_vec();
         let n_input = devs.len();
-        if n_input > 0 {
+        // Made with no kernel input device too: a process may serve one
+        // later (`devfs::served::input`), and its record goes here.
+        {
             let run_root = run_ramfs.root_inode();
             let udev_dir = run_root.create("udev", FileType::Dir, 0o755);
             let data_dir = udev_dir
@@ -2009,7 +2068,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             let seat0_tag_dir = tags_dir
                 .as_ref()
                 .and_then(|t| t.create("seat0", FileType::Dir, 0o755).ok());
-            if let Some(data_dir) = data_dir {
+            if let Some(ref data_dir) = data_dir {
+                *UDEV_INPUT_DIRS.lock() = Some(UdevInputDirs {
+                    data: data_dir.clone(),
+                    seat: seat_tag_dir.clone(),
+                    seat0: seat0_tag_dir.clone(),
+                });
+            }
+            if let Some(data_dir) = data_dir.filter(|_| n_input > 0) {
                 for (id, dev) in devs.iter().enumerate() {
                     // libinput's `evdev_configure_device` ignores any device
                     // tagged only `ID_INPUT` with no subtype ("not tagged as
