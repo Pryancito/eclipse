@@ -3422,7 +3422,13 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
 /// A pid that belongs to no service was a oneshot's leftover or an orphan
 /// reparented to init: reaping it was the whole job.
 fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at: Instant) {
-    if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
+    // A death from before the service was started is not the service's: it is
+    // of a child reaped during one of the boot's gates, whose pid the kernel
+    // has since given to the service. Taking it for the service's own left
+    // the service running and started a second one beside it ("unet exited
+    // after 0ns (exit 0, crash)", and then the second failing for ever).
+    let ours = |s: &&mut Service| s.pid == Some(pid) && s.started_at.is_none_or(|t| at >= t);
+    if let Some(svc) = services.values_mut().find(ours) {
         // Measured to `at`, the instant the child was REAPED, not to now: an
         // exit collected during one of the boot's bounded gates is handed over
         // with its own timestamp, and crediting it with the gate as well would
