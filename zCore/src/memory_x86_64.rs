@@ -2104,7 +2104,7 @@ cfg_if! {
             }
         }
 
-        fn hot_track(size: usize, delta: isize) {
+        fn hot_track(slot: usize, size: usize, delta: isize) {
             let home = hot_home(size);
             for probe in 0..HOT_PROBES {
                 let i = (home + probe) % HOT_SLOTS;
@@ -2115,7 +2115,7 @@ cfg_if! {
                             .compare_exchange(0, size, Ordering::Relaxed, Ordering::Relaxed)
                             .map_or_else(|racer| racer == size, |_| true));
                 if claimed {
-                    let row = HOT_LIVE.add(i, delta);
+                    let row = HOT_LIVE.add_on(slot, i, delta);
                     // The live count is a sum over every CPU, so it is only
                     // added up every 64 moves of this CPU's row, and only for
                     // the sizes being hunted. A threshold fires when the sum
@@ -2260,7 +2260,7 @@ cfg_if! {
                 free_ring, heap_regions, Mutex,
             };
             use core::alloc::Layout;
-            use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
+            use kernel_hal::cpu_topology::PERCPU_SLOTS;
 
             /// One cache per CPU, and the reason this module exists at all.
             ///
@@ -2307,15 +2307,6 @@ cfg_if! {
             static SLAB: [Mutex<SlabCache>; PERCPU_SLOTS] =
                 [const { Mutex::new(SlabCache::new()) }; PERCPU_SLOTS];
 
-            /// This CPU's cache.
-            #[inline]
-            fn mine() -> &'static Mutex<SlabCache> {
-                // `percpu_slot` bounds the index; the array is `PERCPU_SLOTS`
-                // long, which is `MAX_CORE_NUM + 1` -- the quarantine slot is
-                // the `+ 1`.
-                &SLAB[percpu_slot(kernel_hal::cpu::cpu_id() as usize)]
-            }
-
             /// Who freed each cached block, newest last, one ring per CPU. See
             /// [`free_ring`].
             ///
@@ -2360,11 +2351,11 @@ cfg_if! {
             /// SLAB) get a cache miss and fall through to the buddy allocator
             /// rather than spinning forever on a lock they already own.
             #[inline]
-            pub fn try_alloc(layout: Layout) -> *mut u8 {
+            pub fn try_alloc(slot: usize, layout: Layout) -> *mut u8 {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return core::ptr::null_mut();
                 };
-                let Some(mut c) = mine().try_lock() else {
+                let Some(mut c) = SLAB[slot].try_lock() else {
                     return core::ptr::null_mut();
                 };
                 match unsafe { c.pop(i, owns) } {
@@ -2421,11 +2412,15 @@ cfg_if! {
                 }
             }
 
-            pub fn try_free(ptr: *mut u8, layout: Layout, rets: [usize; free_ring::DEPTH]) -> Freed {
+            pub fn try_free(
+                slot: usize,
+                ptr: *mut u8,
+                layout: Layout,
+                rets: [usize; free_ring::DEPTH],
+            ) -> Freed {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return Freed::ToBuddy;
                 };
-                let slot = percpu_slot(kernel_hal::cpu::cpu_id() as usize);
                 let Some(mut c) = SLAB[slot].try_lock() else {
                     return Freed::ToBuddy;
                 };
@@ -2490,6 +2485,13 @@ cfg_if! {
 
         unsafe impl<const ORDER: usize> GlobalAlloc for LockedHeap<ORDER> {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // This CPU's row of every per-CPU table below, asked once:
+                // the front cache, the used and live counters and the
+                // exact-size tracker each asked it again, six times an
+                // allocation. A move to another CPU in between only means
+                // the counts land on that CPU's row and the block comes from
+                // that CPU's cache, under its lock, which is as right.
+                let slot = percpu_counter::this_slot();
                 let sz = layout.size();
                 let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
                 // See `kernel_hal::kstats::heap_prof_enabled`: off by default,
@@ -2503,7 +2505,7 @@ cfg_if! {
                 // coalescing scan never fires on the fork hot path.
                 #[cfg(not(feature = "mem-debug"))]
                 let p = {
-                    let cached = slab::try_alloc(ext);
+                    let cached = slab::try_alloc(slot, ext);
                     if cached.is_null() {
                         // See `report_heap_reentrancy`: asked BEFORE a ticket is
                         // drawn, because a drawn ticket can never be given back.
@@ -2579,10 +2581,10 @@ cfg_if! {
                     {
                         report_stack_double_alloc(p as usize, sz, base);
                     }
-                    HEAP_USED.add(sz);
+                    HEAP_USED.add_on(slot, sz as isize);
                     let used = HEAP_USED.approx();
-                    HEAP_LIVE.add(bucket_of(sz), 1);
-                    hot_track(sz, 1);
+                    HEAP_LIVE.add_on(slot, bucket_of(sz), 1);
+                    hot_track(slot, sz, 1);
                     try_grow_heap(used);
                     note_heap_pressure(used, p as usize, sz);
                     if sz >= BIG_ALLOC_MIN {
@@ -2605,6 +2607,8 @@ cfg_if! {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // See `alloc`.
+                let slot = percpu_counter::this_slot();
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
                 let sz = layout.size();
@@ -2633,14 +2637,14 @@ cfg_if! {
                 // its first free, and counting it again would lie about the
                 // heap in every report that reads these counters.
                 #[cfg(not(feature = "mem-debug"))]
-                let to_buddy = match slab::try_free(ptr, ext, caller_chain()) {
+                let to_buddy = match slab::try_free(slot, ptr, ext, caller_chain()) {
                     slab::Freed::Cached => false,
                     slab::Freed::ToBuddy => true,
                     slab::Freed::Refused => return,
                 };
                 #[cfg(feature = "mem-debug")]
                 let to_buddy = true;
-                hot_track(sz, -1);
+                hot_track(slot, sz, -1);
                 // Before the counters below, and whether or not the block
                 // reaches the buddy: a block the front cache keeps is still
                 // not live, and a site that is charged for it would be
@@ -2667,8 +2671,8 @@ cfg_if! {
                     // stale reader sees 0xa5a5... instead of plausible data.
                     core::ptr::write_bytes(ptr, POISON, sz);
                 }
-                HEAP_USED.sub(sz);
-                HEAP_LIVE.add(bucket_of(sz), -1);
+                HEAP_USED.add_on(slot, (sz as isize).wrapping_neg());
+                HEAP_LIVE.add_on(slot, bucket_of(sz), -1);
                 if sz >= BIG_ALLOC_MIN {
                     untrack_big_alloc(ptr as usize);
                 }

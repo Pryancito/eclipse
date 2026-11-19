@@ -113,7 +113,7 @@ pub struct BatchedCounter<const BATCH: isize> {
 
 // Every writer of this counter lives in the heap allocator, which is
 // `cfg(not(feature = "libos"))`; a libos build keeps only the readers
-// (`HEAP_USED.get()`), so `add`, `sub`, `add_on` and `approx` are the quiet
+// (`HEAP_USED.get()`), so `add_on` and `approx` are the quiet
 // dead code `#![deny(warnings)]` turns into a build error. Same `cfg_attr`
 // the allocator's own helpers in `memory_x86_64.rs` already carry, for the
 // same reason -- `new` and `get` stay live, so nothing here is blanket-allowed.
@@ -126,17 +126,9 @@ impl<const BATCH: isize> BatchedCounter<BATCH> {
         }
     }
 
-    #[inline]
-    pub fn add(&self, delta: usize) {
-        self.add_on(this_slot(), delta as isize);
-    }
-
-    #[inline]
-    pub fn sub(&self, delta: usize) {
-        self.add_on(this_slot(), (delta as isize).wrapping_neg());
-    }
-
-    /// Add on an explicit row; see [`PerCpuCounters::add_on`].
+    /// Add `delta` on row `slot` (this CPU's: the heap asks it once per
+    /// allocation for every per-CPU table it touches); see
+    /// [`PerCpuCounters::add_on`].
     #[inline]
     pub fn add_on(&self, slot: usize, delta: isize) {
         let v = self.local.add_on(slot, 0, delta);
