@@ -308,13 +308,17 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
-    // PS/2 Keyboard and Mouse initialization and registration
-    let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
-    irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
-    irq.unmask(trap::X86_ISA_IRQ_KEYBOARD)?;
-    irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
-    irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
-    drivers::add_device(Device::Input(ps2_input));
+    // PS/2 Keyboard and Mouse initialization and registration, unless the
+    // boot leaves the i8042 to a driver in userspace (`udriver=i8042@0`):
+    // then nothing here touches it, and its two lines are that driver's.
+    if !zcore_drivers::user::reserve_i8042() {
+        let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
+        irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
+        irq.unmask(trap::X86_ISA_IRQ_KEYBOARD)?;
+        irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
+        irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
+        drivers::add_device(Device::Input(ps2_input));
+    }
     // ACPI power button (SCI) — OPT-IN via `acpi.powerbtn`, default OFF.
     //
     // The SCI is a LEVEL-triggered, SHARED ACPI interrupt: on real hardware the

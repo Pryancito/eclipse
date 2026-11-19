@@ -19,15 +19,9 @@ use std::time::Duration;
 use udrivers::claim;
 use udrivers::evdev::{self, Evdev};
 use udrivers::input::{self, NoDevice};
-use udrivers::served::Node;
 use udrivers::status;
 
 const NAME: &str = "udrv-virtio-input";
-/// The major of input devices, and the minor of `event0`.
-const INPUT_MAJOR: u32 = 13;
-const EVENT_MINOR_BASE: u32 = 64;
-/// How many `eventK` are tried.
-const EVENT_NODES: u32 = 32;
 
 fn die(what: impl std::fmt::Display) -> ! {
     println!("{NAME}: {what}");
@@ -60,22 +54,7 @@ fn main() {
         println!("{NAME}: no interrupt from the device; polling");
     }
 
-    // The first eventK nobody has: the kernel's own input devices take
-    // theirs first, and other drivers like this one theirs.
-    let mut last = String::new();
-    let served = (0..EVENT_NODES).find_map(|k| {
-        let name = format!("input/event{k}");
-        match Node::serve(&name, INPUT_MAJOR, EVENT_MINOR_BASE + k, 0o660) {
-            Ok(node) => Some((node, name)),
-            Err(e) => {
-                last = e;
-                None
-            }
-        }
-    });
-    let Some((node, name)) = served else {
-        die(format_args!("no /dev/input/event* to serve: {last}"))
-    };
+    let (node, name) = evdev::serve_free().unwrap_or_else(|e| die(e));
 
     let place = format!("virtio-input@{index}");
     status::publish(

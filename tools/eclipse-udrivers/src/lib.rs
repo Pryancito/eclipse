@@ -26,6 +26,7 @@ pub mod input;
 pub mod lent;
 pub mod net;
 pub mod nvme;
+pub mod ps2;
 pub mod queue;
 pub mod served;
 pub mod status;

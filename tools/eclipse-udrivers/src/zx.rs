@@ -43,6 +43,7 @@ pub mod nr {
     pub const ECLIPSE_NET_LENT_TURN: i64 = 0x400c;
     pub const ECLIPSE_FS_SERVE: i64 = 0x400d;
     pub const ECLIPSE_DEV_SERVE: i64 = 0x4010;
+    pub const ECLIPSE_DEVICE_PORT: i64 = 0x4011;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

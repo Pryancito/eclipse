@@ -1,6 +1,7 @@
 //! `udrv-evdev-check NODE [KEYS]`: check an evdev node as a program sees
 //! it -- one that `udrv-virtio-input` serves, or one of the kernel's -- and
-//! `udrv-evdev-check time NODE [ROUNDS]`: time its ioctls.
+//! `udrv-evdev-check time NODE [ROUNDS]`: time its ioctls, and
+//! `udrv-evdev-check mouse NODE`: check a mouse's node.
 //!
 //! The check probes the node as libevdev does (version, ids, name, the
 //! types and keys it has), grabs it and lets go, sets the clock, and then
@@ -11,6 +12,10 @@
 //! clock that was set, and come to a second open as well. Then the LEDs:
 //! Caps Lock lit by a write, which the second open reads back.
 //!
+//! The mouse's check asks for what a mouse has (moves, a left button),
+//! prints `MOVE NOW` and waits, 60 s at most, for a move and a click of
+//! the left button; every frame must end in a `SYN_REPORT`.
+//!
 //! The last line is `PASS N` or `FAIL N of M`; the exit status is 0 only
 //! when every check passed.
 
@@ -19,7 +24,10 @@ use std::process::exit;
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
 const EV_LED: u16 = 0x11;
+const REL_X: u16 = 0;
+const BTN_LEFT: u16 = 0x110;
 const SYN_REPORT: u16 = 0;
 const LED_CAPSL: u16 = 1;
 const EVENT_LEN: usize = 24;
@@ -37,6 +45,7 @@ const EVIOCGKEY: u32 = ioc(R, 0x18, 96);
 const EVIOCGLED: u32 = ioc(R, 0x19, 8);
 const EVIOCGBIT_EV: u32 = ioc(R, 0x20, 8);
 const EVIOCGBIT_KEY: u32 = ioc(R, 0x21, 96);
+const EVIOCGBIT_REL: u32 = ioc(R, 0x22, 8);
 const EVIOCGRAB: u32 = ioc(W, 0x90, 4);
 const EVIOCSCLOCKID: u32 = ioc(W, 0xa0, 4);
 
@@ -329,6 +338,69 @@ fn check(node: &str, keys: usize) -> bool {
     c.failed == 0
 }
 
+fn mouse(node: &str) -> bool {
+    let mut c = Checks {
+        passed: 0,
+        failed: 0,
+    };
+    let fd = open(node, libc::O_RDONLY | libc::O_NONBLOCK);
+    let mut ev = [0u8; 8];
+    c.check(
+        "EVIOCGBIT(0) has EV_KEY and EV_REL",
+        ioctl_buf(fd, EVIOCGBIT_EV, &mut ev) > 0
+            && bit(&ev, EV_KEY as usize)
+            && bit(&ev, EV_REL as usize),
+    );
+    let mut rel = [0u8; 8];
+    c.check(
+        "EVIOCGBIT(EV_REL) has REL_X",
+        ioctl_buf(fd, EVIOCGBIT_REL, &mut rel) > 0 && bit(&rel, REL_X as usize),
+    );
+    let mut keys = [0u8; 96];
+    c.check(
+        "EVIOCGBIT(EV_KEY) has BTN_LEFT",
+        ioctl_buf(fd, EVIOCGBIT_KEY, &mut keys) > 0 && bit(&keys, BTN_LEFT as usize),
+    );
+    println!("MOVE NOW");
+    let (mut moved, mut down, mut up, mut unended) = (false, false, false, false);
+    let mut open_frame = false;
+    let start = monotonic_us();
+    while !(moved && down && up) && monotonic_us() - start < 60_000_000 {
+        match read_now(fd) {
+            Ok(evs) => {
+                for e in evs {
+                    println!("event {} {:#x} {}", e.kind, e.code, e.value);
+                    match (e.kind, e.code, e.value) {
+                        (EV_SYN, SYN_REPORT, _) => open_frame = false,
+                        (EV_REL, REL_X, v) if v != 0 => moved = true,
+                        (EV_KEY, BTN_LEFT, 1) => down = true,
+                        (EV_KEY, BTN_LEFT, 0) => up = down,
+                        _ => {}
+                    }
+                    if e.kind != EV_SYN {
+                        open_frame = true;
+                    }
+                }
+                unended |= open_frame;
+            }
+            Err(libc::EAGAIN) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(e) => {
+                println!("read: errno {e}");
+                break;
+            }
+        }
+    }
+    c.check("a move came", moved);
+    c.check("the left button went down and up", down && up);
+    c.check("every frame ended in SYN_REPORT", !unended);
+    if c.failed == 0 {
+        println!("PASS {}", c.passed);
+    } else {
+        println!("FAIL {} of {}", c.failed, c.passed + c.failed);
+    }
+    c.failed == 0
+}
+
 fn time(node: &str, rounds: u32) {
     let fd = open(node, libc::O_RDONLY | libc::O_NONBLOCK);
     let mut b = [0u8; 256];
@@ -358,8 +430,17 @@ fn time(node: &str, rounds: u32) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: udrv-evdev-check NODE [KEYS] | udrv-evdev-check time NODE [ROUNDS]";
+    let usage = "usage: udrv-evdev-check NODE [KEYS] | udrv-evdev-check time NODE [ROUNDS] \
+                 | udrv-evdev-check mouse NODE";
     match args.get(1).map(String::as_str) {
+        Some("mouse") => match args.get(2) {
+            Some(node) if mouse(node) => {}
+            Some(_) => exit(1),
+            None => {
+                println!("{usage}");
+                exit(1)
+            }
+        },
         Some("time") => {
             let Some(node) = args.get(2) else {
                 println!("{usage}");
