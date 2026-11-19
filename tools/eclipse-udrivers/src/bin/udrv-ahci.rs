@@ -1,6 +1,6 @@
 //! `udrv-ahci [N [REPORT_FD]]`: the driver of AHCI controller `N` (default
-//! 0) that the kernel left to userspace (`udriver=ahci@N` on its command
-//! line), and of every SATA disk on it.
+//! 0), which the kernel leaves to userspace (it has no AHCI driver), and
+//! of every SATA disk on it.
 //!
 //! Each disk goes to the kernel -- a new `/dev/sdX` -- and a thread of this
 //! process serves it until the process is killed, as `udrv-virtio-blk`

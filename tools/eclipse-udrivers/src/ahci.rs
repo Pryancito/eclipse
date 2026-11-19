@@ -1,7 +1,7 @@
 //! An AHCI (SATA) controller, each disk on its ports served to the kernel.
 //!
-//! The boot leaves the controller to userspace with `udriver=ahci@N`; the
-//! kernel then neither brings it up nor so much as resets it until the
+//! The kernel leaves every AHCI controller to userspace, having no driver
+//! of its own for one (`udriver=ahci@N` names it); it neither brings it up nor so much as resets it until the
 //! process that claimed it dies (`zcore_drivers::user`, which resets the
 //! HBA then). What the kernel sees of each disk is what a virtio disk
 //! served from userspace gives it: the same messages on the same FIFO and

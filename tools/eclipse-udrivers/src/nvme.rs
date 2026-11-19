@@ -1,7 +1,7 @@
 //! An NVMe controller, served to the kernel as a disk.
 //!
-//! The boot leaves the controller to userspace with `udriver=nvme@N`; the
-//! kernel then neither brings it up nor so much as resets it until the
+//! The kernel leaves every NVMe controller to userspace, having no driver
+//! of its own for one (`udriver=nvme@N` names it); it neither brings it up nor so much as resets it until the
 //! process that claimed it dies (`zcore_drivers::user`, which clears
 //! `CC.EN` then). What the kernel sees is what a virtio disk served from
 //! userspace gives it: the same messages on the same FIFO and a window of

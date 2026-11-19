@@ -15,6 +15,7 @@ mod shadow_fb;
 
 pub mod devicetree;
 pub mod dma;
+pub mod dma_provider;
 pub mod dma_sync;
 /// The kernel hooks, doubled for the host test build -- one definition for the
 /// whole crate, because `#[no_mangle]` allows exactly one.

@@ -51,7 +51,6 @@ pub mod mock;
 #[doc(cfg(feature = "virtio"))]
 pub mod virtio;
 
-pub mod ata;
 pub mod audio;
 pub mod builder;
 #[macro_use]
@@ -63,6 +62,7 @@ pub mod io;
 pub mod irq;
 pub mod net;
 pub mod nvme;
+pub mod pci_disks;
 pub mod prelude;
 pub mod scheme;
 pub mod sync;
