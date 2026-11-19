@@ -21,6 +21,9 @@
 //! at 500 scattered places, with an `fsync` after each pass of writes.
 //! `eclipse-fs-bench -d DEVICE 1M` (or `64k`, `4k`) keeps to the passes of
 //! that size, for a profile of one of them.
+//!
+//! `eclipse-fs-bench -x DIR` checks instead what EclipseFS does past
+//! reading and writing ([`extras`]).
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -28,6 +31,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[path = "eclipse-fs-bench/extras.rs"]
+mod extras;
 
 fn die(why: impl std::fmt::Display) -> ! {
     eprintln!("eclipse-fs-bench: {why}");
@@ -274,6 +280,9 @@ fn main() {
         if flag == "-d" {
             return device(Path::new(dir), None);
         }
+        if flag == "-x" {
+            return extras::extras(Path::new(dir));
+        }
     }
     if let [flag, dir, only] = args.as_slice() {
         if flag == "-d" {
@@ -282,7 +291,7 @@ fn main() {
     }
     let Some(dir) = args.first() else {
         eprintln!(
-            "usage: eclipse-fs-bench DIR [BIG]\n       eclipse-fs-bench -w DIR\n       eclipse-fs-bench -d DEVICE [1M|64k|4k]"
+            "usage: eclipse-fs-bench DIR [BIG]\n       eclipse-fs-bench -w DIR\n       eclipse-fs-bench -d DEVICE [1M|64k|4k]\n       eclipse-fs-bench -x DIR"
         );
         std::process::exit(2)
     };

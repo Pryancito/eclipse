@@ -2152,7 +2152,10 @@ fn a_subvolume_name_is_judged_before_the_mount_and_before_the_caller() {
 #[test]
 fn a_name_that_fills_its_field_leaves_no_room_for_the_terminator() {
     let mut b = [0xffu8; 16];
-    assert_eq!(put_cstr(&mut b, 4, 4, "abcd"), Err(LxError::ENAMETOOLONG));
+    assert_eq!(
+        put_cstr(&mut b, 4, 4, "abcd"),
+        Err(LxError::ENAMETOOLONG as i32)
+    );
     assert_eq!(b, [0xffu8; 16], "a refused name wrote something anyway");
     // One byte shorter fits, NUL and all, and nothing past the field is
     // touched.
@@ -2273,7 +2276,7 @@ fn the_nine_balance_profiles_are_the_nine_btrfs_bit_patterns() {
     // Two profiles at once is not a profile.
     assert_eq!(
         profile(BTRFS_BLOCK_GROUP_RAID1 | BTRFS_BLOCK_GROUP_RAID10),
-        Err(LxError::EINVAL)
+        Err(LxError::EINVAL as i32)
     );
 }
 

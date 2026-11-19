@@ -35,8 +35,11 @@ use crate::log::{self, Log};
 use crate::tail::{self, Tail};
 use crate::tree::{Kind, Stat, Tree};
 use fatserve::wire::{
-    OP_CREATE, OP_REMOVE, OP_RENAME, OP_SETATTR, OP_SETTIME, OP_TRUNCATE, OP_WRITE,
+    OP_CREATE, OP_FALLOCATE, OP_IOCTL, OP_REMOVE, OP_RENAME, OP_SETATTR, OP_SETTIME, OP_TRUNCATE,
+    OP_WRITE, OP_XATTR,
 };
+
+mod extras;
 
 /// The changes made between two writings of the trees: the number the
 /// kernel's btrfs waits for too.
@@ -264,6 +267,11 @@ impl<F: Tree, B: Blocks + Send + 'static> Volume<F, B> {
             OP_TRUNCATE => self.truncate(path, change.a),
             OP_SETTIME => self.set_time(path, change.a as i64),
             OP_SETATTR => self.set_attr(path, (change.a >> 32) as u32, change.a as u32, change.b),
+            OP_IOCTL => self.ioctl(path, &change.data, &mut out).map(|_| ()),
+            OP_XATTR => self
+                .xattr(path, change.a, &change.data, &mut out)
+                .map(|_| ()),
+            OP_FALLOCATE => self.fallocate(path, change.a, change.b, &change.data),
             _ => Ok(()),
         };
     }

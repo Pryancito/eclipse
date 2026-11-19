@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::tree::Tree;
 use crate::volume::{Memory, Volume, KEPT_LEN};
 use fatserve::wire::{
-    Msg, DATA_AREA, NAME_AREA, OP_CREATE, OP_LIST, OP_READ, OP_REMOVE, OP_RENAME, OP_SETATTR,
-    OP_SETTIME, OP_STAT, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE, SERVE_POSIX, SERVE_READ_ONLY,
-    SERVE_TAKE_OVER, SLOTS, SLOT_LEN, STATFS_LEN,
+    Msg, DATA_AREA, NAME_AREA, OP_CREATE, OP_FALLOCATE, OP_IOCTL, OP_LIST, OP_READ, OP_REMOVE,
+    OP_RENAME, OP_SEEK, OP_SETATTR, OP_SETTIME, OP_STAT, OP_STATFS, OP_SYNC, OP_TRUNCATE, OP_WRITE,
+    OP_XATTR, SERVE_EXTRAS, SERVE_POSIX, SERVE_READ_ONLY, SERVE_TAKE_OVER, SLOTS, SLOT_LEN,
+    STATFS_LEN,
 };
 use udrivers::fifo::Fifo;
 use udrivers::zx::{self, nr, Status};
@@ -108,6 +109,7 @@ fn answer<F: Tree>(volume: &mut Volume<F, File>, window: &Window, msg: &mut Msg,
     let record = |used: usize| (1, used);
     let done = match msg.op {
         OP_WRITE | OP_CREATE | OP_REMOVE | OP_RENAME | OP_TRUNCATE | OP_SETTIME | OP_SETATTR
+        | OP_FALLOCATE
             if read_only =>
         {
             Err(libc::EROFS)
@@ -138,6 +140,30 @@ fn answer<F: Tree>(volume: &mut Volume<F, File>, window: &Window, msg: &mut Msg,
             volume.read(path, msg.a, &mut data[..want]).map(|n| (n, n))
         }
         OP_STATFS => volume.statfs(&mut data[..STATFS_LEN]).map(|n| (0, n)),
+        // The argument comes in where it goes back out.
+        OP_IOCTL => {
+            let len = (msg.b as usize).min(DATA_AREA);
+            let mut input = data[..len].to_vec();
+            let done = volume.ioctl(path, &input, data);
+            // A raw key (`FS_IOC_ADD_ENCRYPTION_KEY`) is left nowhere.
+            input.fill(0);
+            let used = done.as_ref().map_or(0, |d| d.2);
+            data[used..len.max(used)].fill(0);
+            done.map(|(ret, changed, used)| {
+                msg.a = changed;
+                (ret, used)
+            })
+        }
+        OP_XATTR => {
+            let value = data[..(msg.b as usize).min(DATA_AREA)].to_vec();
+            volume.xattr(path, msg.a, &value, data).map(|n| (n, n))
+        }
+        OP_FALLOCATE => volume
+            .fallocate(path, msg.a, msg.b, &data[..8])
+            .map(|()| (0, 0)),
+        OP_SEEK => volume
+            .seek(path, msg.a as i64, msg.b)
+            .map(|at| (at as usize, 0)),
         _ => Err(libc::ENOSYS),
     };
     match done {
@@ -218,6 +244,7 @@ fn serve<F: Tree>(
     let window = Window { base };
     let names = format!("{dir}\0{device}\0{}", F::NAME);
     let flags = SERVE_POSIX
+        | if F::EXTRAS { SERVE_EXTRAS } else { 0 }
         | if read_only { SERVE_READ_ONLY } else { 0 }
         | if take_over { SERVE_TAKE_OVER } else { 0 };
     // SAFETY: three handles, which go to the kernel, and `names`, which it
