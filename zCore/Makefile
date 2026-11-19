@@ -535,18 +535,18 @@ ifneq ($(UDISK),)
   endif
 endif
 
-# UNVME=<raw image>: an NVMe disk (QEMU `nvme`, on PCI). The kernel drives
-# it unless `udriver=nvme@N` in KOPTS leaves it to the driver in userspace
-# (`tools/eclipse-udrivers`, `udrv-nvme`). aarch64's kernel probes no PCI
-# bus, so there the disk is not seen at all.
+# UNVME=<raw image>: an NVMe disk (QEMU `nvme`, on PCI), served by the
+# driver in userspace (`tools/eclipse-udrivers`, `udrv-nvme`): the kernel
+# has none of its own. aarch64's kernel probes no PCI bus, so there the
+# disk is not seen at all.
 ifneq ($(UNVME),)
   qemu_opts += -drive file=$(UNVME),if=none,format=raw,id=unvme
   qemu_opts += -device nvme,serial=eclipse0,drive=unvme
 endif
 
 # UAHCI=<raw image>: one more AHCI controller with that SATA disk on its
-# first port. The kernel drives it unless `udriver=ahci@0` in KOPTS leaves
-# it to the driver in userspace (`udrv-ahci`): on x86_64 it is the first
+# first port, served by the driver in userspace (`udrv-ahci`), as the
+# kernel has no AHCI driver of its own: on x86_64 it is the first
 # AHCI controller on the bus, before q35's own (00:1f.2), which holds the
 # boot disk and is `ahci@1`.
 ifneq ($(UAHCI),)

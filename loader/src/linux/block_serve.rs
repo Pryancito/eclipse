@@ -1136,7 +1136,7 @@ type ReservedPlace = (&'static str, usize, usize);
 const DISK_KINDS: [(&str, &str); 3] = [
     (kernel_hal::drivers::user::VIRTIO_BLK, "virtio-blk-served"),
     (kernel_hal::drivers::user::NVME, "nvme-served"),
-    // Not `nvme` nor `virtio`: an `sdX`, as the kernel's AHCI disks are.
+    // Not `nvme` nor `virtio`: an `sdX`, as a SATA disk is named.
     (kernel_hal::drivers::user::AHCI, "ahci-served"),
 ];
 

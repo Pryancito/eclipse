@@ -71,11 +71,10 @@ pub fn init_all() {
         warn!("[pci] init_all llamado dos veces; el registro ya tiene sus drivers");
         return;
     }
-    // NVMe
-    register(&crate::nvme::interface::NvmeDriverPci);
-
-    // AHCI / SATA
-    register(&crate::ata::ahci::AhciDriverPci);
+    // NVMe and AHCI / SATA: left to their drivers in userspace, always
+    // declined (the kernel has no driver for either).
+    register(&crate::pci_disks::NvmeForUser);
+    register(&crate::pci_disks::AhciForUser);
 
     // Ethernet Intel e1000 / e1000e
     register(&crate::net::e1000::E1000DriverPci);

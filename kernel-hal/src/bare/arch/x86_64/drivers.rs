@@ -264,14 +264,6 @@ pub(super) fn init() -> DeviceResult {
     if crate::cmdline::user_disks(crate::KCONFIG.cmdline) {
         zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
     }
-    // The NVMe and AHCI controllers as well, on a machine with an initrd:
-    // `unvme=kernel` and `uahci=kernel` keep them in the kernel.
-    zcore_drivers::user::leave_pci_disks(
-        udriver,
-        crate::cmdline::user_nvme(crate::KCONFIG.cmdline),
-        crate::cmdline::user_ahci(crate::KCONFIG.cmdline),
-        super::init_ram_disk().is_none(),
-    );
     // The first HD Audio controller that is not a GPU's, for the driver in
     // userspace that serves it as /dev/dsp and /dev/snd: `uhda=kernel`
     // keeps it in the kernel.

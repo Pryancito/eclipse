@@ -1,6 +1,5 @@
 //! `udrv-nvme [N [REPORT_FD]]`: the driver of NVMe controller `N` (default
-//! 0) that the kernel left to userspace (`udriver=nvme@N` on its command
-//! line).
+//! 0), which the kernel leaves to userspace: it has no NVMe driver.
 //!
 //! The first namespace goes to the kernel -- a new `/dev/nvmeXn1` -- and
 //! this process serves it until it is killed, as `udrv-virtio-blk` does a

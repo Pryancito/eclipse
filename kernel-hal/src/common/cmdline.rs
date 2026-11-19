@@ -141,20 +141,6 @@ pub fn user_disks(cmdline: &str) -> bool {
     value(cmdline, "ublk") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
 }
 
-/// Whether a boot leaves its NVMe controllers to the driver in userspace
-/// without naming them (`zcore_drivers::user::leave_pci_disks`): as
-/// [`user_disks`], with `unvme=kernel` the boot that keeps them in the
-/// kernel.
-pub fn user_nvme(cmdline: &str) -> bool {
-    value(cmdline, "unvme") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
-}
-
-/// The same for the AHCI controllers, every SATA disk on them:
-/// `uahci=kernel` keeps them in the kernel.
-pub fn user_ahci(cmdline: &str) -> bool {
-    value(cmdline, "uahci") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
-}
-
 /// Whether a boot leaves its first HD Audio controller to the driver in
 /// userspace without naming it (`zcore_drivers::user::leave_first_hda`),
 /// which serves it as `/dev/dsp` and `/dev/snd`: as [`user_disks`], with
@@ -929,18 +915,9 @@ mod tests {
     }
 
     #[test]
-    fn nvme_and_ahci_are_userspace_s_unless_the_boot_keeps_them() {
-        assert!(user_nvme("") && user_ahci(""));
-        assert!(!user_nvme("LOG=warn:unvme=kernel") && user_ahci("unvme=kernel"));
-        assert!(!user_ahci("uahci=kernel") && user_nvme("uahci=kernel"));
-        assert!(!user_nvme("zircon.gateway=0") && !user_ahci("zircon.gateway=0"));
-        assert!(user_nvme("notunvme=kernel"));
-    }
-
-    #[test]
     fn the_first_hda_is_userspace_s_unless_the_boot_keeps_it() {
         assert!(user_hda(""));
-        assert!(!user_hda("LOG=warn:uhda=kernel") && user_nvme("uhda=kernel"));
+        assert!(!user_hda("LOG=warn:uhda=kernel") && user_disks("uhda=kernel"));
         assert!(!user_hda("zircon.gateway=0"));
         assert!(user_hda("notuhda=kernel"));
     }
