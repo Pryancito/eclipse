@@ -132,26 +132,18 @@ pub fn user_e1000e(cmdline: &str) -> bool {
     user_devices(cmdline).1
 }
 
-/// Whether a boot leaves its virtio disks to the driver in userspace
-/// without naming them (`zcore_drivers::user::leave_virtio_disks`): it
-/// does unless it keeps them for the kernel's own driver (`ublk=kernel`)
-/// or has shut the gateway that driver claims a disk through
-/// (`zircon.gateway=0`). A disk `udriver=` names is left either way.
-pub fn user_disks(cmdline: &str) -> bool {
-    value(cmdline, "ublk") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
-}
-
 /// Whether a boot leaves its first HD Audio controller to the driver in
 /// userspace without naming it (`zcore_drivers::user::leave_first_hda`),
-/// which serves it as `/dev/dsp` and `/dev/snd`: as [`user_disks`], with
-/// `uhda=kernel` the boot that keeps it in the kernel.
+/// which serves it as `/dev/dsp` and `/dev/snd`, with `uhda=kernel` the
+/// boot that keeps it in the kernel and `zircon.gateway=0` the one that
+/// has no gateway for that driver.
 pub fn user_hda(cmdline: &str) -> bool {
     value(cmdline, "uhda") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
 }
 
 /// Whether a boot leaves its first virtio input devices to the driver in
 /// userspace without naming them (`zcore_drivers::user::leave_input`): as
-/// [`user_disks`], with `uinput=kernel` the boot that keeps them in the
+/// [`user_hda`], with `uinput=kernel` the boot that keeps them in the
 /// kernel.
 pub fn user_virtio_input(cmdline: &str) -> bool {
     value(cmdline, "uinput") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
@@ -917,21 +909,9 @@ mod tests {
     }
 
     #[test]
-    fn the_virtio_disks_are_userspace_s_unless_the_boot_keeps_them() {
-        assert!(user_disks("LOG=warn:ROOT=/dev/vda"));
-        assert!(user_disks(""));
-        assert!(user_disks("ublk=user:zircon.gateway=1"));
-        // The kernel's own driver, or no gateway to claim a disk through.
-        assert!(!user_disks("LOG=warn:ublk=kernel"));
-        assert!(!user_disks("zircon.gateway=0"));
-        // A word that only ends like it says nothing.
-        assert!(user_disks("notublk=kernel"));
-    }
-
-    #[test]
     fn the_first_hda_is_userspace_s_unless_the_boot_keeps_it() {
         assert!(user_hda(""));
-        assert!(!user_hda("LOG=warn:uhda=kernel") && user_disks("uhda=kernel"));
+        assert!(!user_hda("LOG=warn:uhda=kernel"));
         assert!(!user_hda("zircon.gateway=0"));
         assert!(user_hda("notuhda=kernel"));
     }

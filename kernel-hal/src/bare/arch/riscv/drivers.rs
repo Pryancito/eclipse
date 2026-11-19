@@ -84,12 +84,6 @@ pub(super) fn init() -> DeviceResult {
     let cmdline = super::cmdline();
     let (udriver, net_by_default) = crate::cmdline::user_devices(&cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
-    // The virtio disks too, for the driver in userspace: all of them, or
-    // all but the first when there is no initrd and that one is the disk
-    // the root comes from. `ublk=kernel` keeps them in the kernel.
-    if crate::cmdline::user_disks(&cmdline) {
-        zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
-    }
     // The first virtio input devices, for their drivers in userspace,
     // which still reach the consoles: `uinput=kernel` keeps them.
     zcore_drivers::user::leave_input(udriver, crate::cmdline::user_virtio_input(&cmdline), false);

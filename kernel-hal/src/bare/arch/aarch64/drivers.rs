@@ -42,12 +42,10 @@ pub fn init() {
     let cmdline = super::cmdline();
     let (udriver, net_by_default) = crate::cmdline::user_devices(&cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
-    // The virtio disks too, for the driver in userspace: all of them, or
-    // all but the first when there is no initrd and that one is the disk
-    // the root comes from. `ublk=kernel` keeps them in the kernel.
-    if crate::cmdline::user_disks(&cmdline) {
-        zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
-    }
+    // Every virtio disk goes to the driver in userspace but the first when
+    // there is no initrd: the root comes from that one, and it is the one
+    // disk the kernel still drives.
+    zcore_drivers::user::keep_boot_disk(super::init_ram_disk().is_none());
     // The first virtio input devices, for their drivers in userspace,
     // which still reach the consoles: `uinput=kernel` keeps them.
     zcore_drivers::user::leave_input(udriver, crate::cmdline::user_virtio_input(&cmdline), false);
@@ -58,9 +56,8 @@ pub fn init() {
         }
     }
     // The other transports of the bank are never bound by the kernel; they
-    // are only looked at, so that a disk on one of them can be left to a
-    // userspace driver (`udriver=virtio-blk@N`, counting the disk above as
-    // the first).
+    // are only looked at, so that a disk on one of them goes to its driver
+    // in userspace (the disk above counts as the first).
     for slot in 1..VIRTIO_SLOTS_MAPPED {
         let header =
             unsafe { &mut *(phys_to_virt(VIRTIO_BASE + slot * VIRTIO_SLOT) as *mut VirtIOHeader) };

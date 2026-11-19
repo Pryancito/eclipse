@@ -1,11 +1,11 @@
 //! Devices the kernel leaves to a userspace driver.
 //!
-//! `udriver=virtio-blk@N` on the command line keeps the kernel's hands off
-//! the `N`th virtio block device it finds (counting from 0, in probe order):
-//! it is not initialised, not registered as a block device, and its window
-//! and interrupt line are recorded here instead. `udriver=virtio-net@N` does
-//! the same for a virtio network card, which the kernel has no driver for at
-//! all: without the reservation it is simply not looked at. Several devices
+//! `udriver=e1000e@N` on the command line keeps the kernel's hands off the
+//! `N`th e1000e it finds (counting from 0, in probe order): it is not
+//! initialised, not registered, and its window and interrupt line are
+//! recorded here instead. `udriver=virtio-net@N` does the same for a virtio
+//! network card, which the kernel has no driver for at all: without the
+//! reservation it is simply not looked at. Several devices
 //! are named with commas: `udriver=virtio-blk@1,virtio-net@0`. A process can then claim
 //! it and drive it from userspace (`eclipse_device_claim` in the loader's
 //! Zircon gateway). One process at a time: the device goes back when its
@@ -19,14 +19,12 @@
 //! ([`wanted`]): there it is the card of the network stack that runs as a
 //! process, where otherwise it would be nobody's.
 //!
-//! The virtio disks go to userspace unasked as well, when the boot names
-//! none ([`leave_virtio_disks`]): every one but the disk the kernel boots
-//! from, on a machine with no initrd, which is the first. `ublk=kernel`
-//! keeps them all for the kernel's own driver. The NVMe and AHCI
-//! controllers always go, named or not: the kernel has no driver for
-//! them ([`crate::pci_disks`]). And the first HD Audio controller that is
-//! not a GPU's ([`leave_first_hda`]): `uhda=kernel` keeps it. And the
-//! first two virtio input devices and the PC's i8042 ([`leave_input`]),
+//! Every disk goes to userspace, named or not: the kernel has no driver for
+//! an NVMe or an AHCI controller ([`crate::pci_disks`]), and drives one
+//! virtio disk only, the root of an aarch64 machine with no initrd
+//! ([`keep_boot_disk`]). Everywhere else the root comes from the initrd. And the first HD Audio controller that is not a
+//! GPU's goes unasked ([`leave_first_hda`]): `uhda=kernel` keeps it. And
+//! the first two virtio input devices and the PC's i8042 ([`leave_input`]),
 //! whose events reach the consoles and `/sys` from their drivers too:
 //! `uinput=kernel` and `ups2=kernel` keep them.
 
@@ -454,45 +452,23 @@ pub fn keep_first_e1000e() {
     E1000E_UNASKED.store(false, Ordering::Release);
 }
 
-/// Whether the virtio disks are left to userspace without the boot naming
-/// them: see [`leave_virtio_disks`].
-static DISKS_UNASKED: AtomicBool = AtomicBool::new(false);
-/// Whether the first virtio disk is the kernel's all the same: the disk it
-/// boots from.
-static KEEP_FIRST_DISK: AtomicBool = AtomicBool::new(false);
+/// Whether the first virtio disk is the kernel's: the disk an aarch64
+/// machine with no initrd mounts its root from ([`keep_boot_disk`]).
+static KEEP_BOOT_DISK: AtomicBool = AtomicBool::new(false);
 
-/// Whether a boot whose `udriver=` value is `spec` leaves its virtio disks
-/// to userspace unasked: it does unless it names a disk itself, and then
-/// that one is what it means and the kernel drives the others, as it did
-/// before disks were left by default.
-pub fn disks_unasked(spec: Option<&str>) -> bool {
-    !parse_specs(spec.unwrap_or(""))
-        .iter()
-        .any(|(kind, _)| *kind == VIRTIO_BLK)
-}
-
-/// Leave every virtio disk to the driver in userspace, as the first
-/// virtio network card is left, unless the boot names a disk
-/// ([`disks_unasked`]). With `boot_disk` the first of them stays the
-/// kernel's: a machine that has no initrd boots from its first disk, and
-/// the root is mounted before any driver in userspace can run. Before the
-/// buses are probed.
-pub fn leave_virtio_disks(spec: Option<&str>, boot_disk: bool) {
-    if !disks_unasked(spec) {
-        return;
-    }
-    if boot_disk {
-        info!("udriver: every virtio disk but the first, the boot's, is for userspace");
-    } else {
-        info!("udriver: every virtio disk is for userspace");
-    }
-    KEEP_FIRST_DISK.store(boot_disk, Ordering::Release);
-    DISKS_UNASKED.store(true, Ordering::Release);
+/// Keep the first virtio disk for the kernel's own driver, the one disk it
+/// still drives: on a machine with no initrd (QEMU `virt` on aarch64, whose
+/// bootloader has no way to hand one over) the root is on it, and it is
+/// mounted before any driver in userspace can run. Before the buses are
+/// probed. Every other virtio disk goes to userspace, as on every other
+/// machine.
+pub fn keep_boot_disk(boot_disk: bool) {
+    KEEP_BOOT_DISK.store(boot_disk, Ordering::Release);
 }
 
 /// Whether a boot whose `udriver=` value is `spec` leaves every device of
 /// `kind` to userspace unasked: it does unless it names one of them, and
-/// then that one is what it means, as with [`disks_unasked`].
+/// then that one is what it means.
 fn kind_unasked(spec: Option<&str>, kind: &str) -> bool {
     !parse_specs(spec.unwrap_or(""))
         .iter()
@@ -556,12 +532,6 @@ pub fn leave_input(spec: Option<&str>, virtio: bool, i8042: bool) {
         info!("udriver: the i8042 is for userspace");
         I8042_UNASKED.store(true, Ordering::Release);
     }
-}
-
-/// Whether virtio disk `index` is left to userspace unasked.
-fn disk_unasked(index: usize) -> bool {
-    DISKS_UNASKED.load(Ordering::Acquire)
-        && !(index == 0 && KEEP_FIRST_DISK.load(Ordering::Acquire))
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
@@ -717,9 +687,11 @@ fn reserve_with(
     let wanted = unasked
         || WANTED.get().is_some_and(|w| w.contains(&(kind, index)))
         || (kind == E1000E && index == 0 && first_e1000e_unasked())
-        || (kind == VIRTIO_BLK && disk_unasked(index))
-        // The kernel has no NVMe or AHCI driver (`crate::pci_disks`): a
-        // controller is userspace's or nobody's.
+        // The kernel has no disk driver but for the boot disk of an aarch64
+        // machine with no initrd ([`keep_boot_disk`]): a virtio disk, an
+        // NVMe or an AHCI controller (`crate::pci_disks`) is userspace's or
+        // nobody's.
+        || (kind == VIRTIO_BLK && !(index == 0 && KEEP_BOOT_DISK.load(Ordering::Acquire)))
         || kind == NVME
         || kind == AHCI
         || (kind == VIRTIO_INPUT
@@ -798,15 +770,6 @@ mod tests {
         assert!(!e1000e_unasked(Some("virtio-net@0")));
         assert!(!e1000e_unasked(Some("virtio-blk@1,e1000e@1")));
         assert!(!e1000e_unasked(Some("e1000e@0")));
-    }
-
-    #[test]
-    fn the_virtio_disks_go_unasked_unless_the_boot_names_one() {
-        assert!(disks_unasked(None));
-        assert!(disks_unasked(Some("")));
-        assert!(disks_unasked(Some("virtio-net@0,e1000e@0")));
-        assert!(!disks_unasked(Some("virtio-blk@1")));
-        assert!(!disks_unasked(Some("virtio-net@0,virtio-blk@0")));
     }
 
     #[test]
@@ -1066,8 +1029,8 @@ mod tests {
 
     // The global state is set once per process, so one test walks it.
     #[test]
-    fn only_the_wanted_device_is_reserved() {
-        set_reservation(Some("virtio-blk@1,virtio-net@0"), true);
+    fn every_disk_and_only_the_wanted_card_are_reserved() {
+        set_reservation(Some("virtio-net@0"), true);
         let base = SEEN[0].load(Ordering::Acquire) + SEEN[1].load(Ordering::Acquire);
         // Other tests may not count devices, so the index is absolute only
         // when this test starts from zero.
@@ -1078,28 +1041,20 @@ mod tests {
             irq: Some(irq),
             vaddr: None,
         };
-        assert!(!reserve_virtio_blk(
-            Transport::VirtioMmio,
-            0x1000,
-            0x200,
-            wired(1)
-        ));
-        assert!(reserve_virtio_blk(
-            Transport::VirtioMmio,
-            0x2000,
-            0x200,
-            wired(2)
-        ));
-        assert!(!reserve_virtio_blk(
-            Transport::VirtioMmio,
-            0x3000,
-            0x200,
-            wired(3)
-        ));
+        // Every disk, named or not: the kernel has no disk driver.
+        for (n, paddr) in [0x1000, 0x2000, 0x3000].iter().copied().enumerate() {
+            assert!(reserve_virtio_blk(
+                Transport::VirtioMmio,
+                paddr,
+                0x200,
+                wired(n + 1)
+            ));
+        }
         let dev = find(VIRTIO_BLK, 1).unwrap();
         assert_eq!((dev.paddr, dev.size, dev.irq), (0x2000, 0x200, Some(2)));
-        assert!(find(VIRTIO_BLK, 0).is_none());
-        assert!(find(VIRTIO_BLK, 2).is_none());
+        assert!(find(VIRTIO_BLK, 0).is_some());
+        assert!(find(VIRTIO_BLK, 2).is_some());
+        assert!(find(VIRTIO_BLK, 3).is_none());
         // Each kind counts its own devices: the first card is #0 whatever
         // number of disks came before it.
         assert!(reserve_virtio_net(
