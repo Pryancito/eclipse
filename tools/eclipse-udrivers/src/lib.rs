@@ -15,6 +15,7 @@
 //! `cargo test`.
 
 pub mod ahci;
+pub mod alsa;
 pub mod blk;
 pub mod channel;
 pub mod claim;
@@ -32,6 +33,7 @@ pub mod ps2;
 pub mod queue;
 pub mod served;
 pub mod status;
+pub mod stream;
 pub mod virtio;
 pub mod zx;
 

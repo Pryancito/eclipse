@@ -45,12 +45,99 @@ pub const OP_WRITE: u32 = 4;
 /// (`_IOW`, `_IOWR`), its `len` bytes are in the slot; when it says it
 /// carries data out (`_IOR`, `_IOWR`), the server puts it in the slot and
 /// says how much in the reply's `len`, which is copied to the argument.
-/// The reply's `status` is what the `ioctl` returns.
+/// The reply's `status` is what the `ioctl` returns. [`IOCTL_WAITS`] in
+/// `a` says the open waits.
 pub const OP_IOCTL: u32 = 5;
+/// Above the command in `a`: the open waits (it is not `O_NONBLOCK`), so an
+/// answer of `EAGAIN` is asked again once the server says something of it,
+/// and the call goes on until then. A server that would rather take all of
+/// what it is given than some can tell the two apart by this.
+pub const IOCTL_WAITS: u64 = 1 << 32;
+
+/// An `ioctl` again, with what the server asked for of the program's
+/// memory ([`IOCTL_FETCH`]): `a` and `b` as in the [`OP_IOCTL`] it
+/// follows, and in the slot the [`Iov`] the server asked with, then the
+/// bytes of each of its ranges to read, one after the other. The reply is
+/// an [`OP_IOCTL`]'s, but what it puts in the slot goes to the ranges to
+/// write, in order; or it asks again.
+pub const OP_IOCTL_IOV: u32 = 6;
 
 /// From the server, unasked: the open `fh` is now as `a` says ([`POLLIN`]
 /// and the rest). `reqid` is not looked at.
 pub const OP_READY: u32 = 16;
+
+/// In the reply to an [`OP_IOCTL`] or [`OP_IOCTL_IOV`], in `a`: the server
+/// needs more of the program's memory than the command's number says,
+/// because the argument points further (ALSA's `WRITEI_FRAMES`, whose
+/// structure holds the address of the samples). The slot holds an [`Iov`]:
+/// the ranges to read for it and those to write what it answers to. The
+/// kernel asks again with [`OP_IOCTL_IOV`]; `status` is not looked at. It
+/// is CUSE's retry of an unrestricted `ioctl`.
+pub const IOCTL_FETCH: u64 = 1;
+/// How many ranges an [`Iov`] may name, each way.
+pub const IOV_MAX: usize = 8;
+/// How many times one `ioctl` may be asked again: an argument that holds
+/// the address of what holds an address takes two.
+pub const FETCH_ROUNDS: usize = 4;
+
+/// The ranges of the program's memory an `ioctl` reads and writes, as the
+/// server asks for them: `ins` (`u32`), `outs` (`u32`), then an address
+/// and a length (`u64` each) for every range, those to read first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Iov {
+    pub ins: alloc::vec::Vec<(u64, u64)>,
+    pub outs: alloc::vec::Vec<(u64, u64)>,
+}
+
+impl Iov {
+    /// How long an [`Iov`] of `ins` and `outs` ranges is in the slot.
+    pub fn len_of(ins: usize, outs: usize) -> usize {
+        8 + 16 * (ins + outs)
+    }
+
+    pub fn encode(&self) -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec::Vec::with_capacity(Self::len_of(self.ins.len(), self.outs.len()));
+        b.extend_from_slice(&(self.ins.len() as u32).to_ne_bytes());
+        b.extend_from_slice(&(self.outs.len() as u32).to_ne_bytes());
+        for (addr, len) in self.ins.iter().chain(self.outs.iter()) {
+            b.extend_from_slice(&addr.to_ne_bytes());
+            b.extend_from_slice(&len.to_ne_bytes());
+        }
+        b
+    }
+
+    /// The [`Iov`] at the start of `b`, when it is one the slot can carry:
+    /// at most [`IOV_MAX`] ranges each way, and what they read, after the
+    /// ranges themselves, and what they write each fit a slot.
+    pub fn decode(b: &[u8]) -> Option<Iov> {
+        use core::convert::TryInto;
+        let u32_at = |i: usize| -> Option<usize> {
+            Some(u32::from_ne_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize)
+        };
+        let u64_at = |i: usize| -> Option<u64> {
+            Some(u64::from_ne_bytes(b.get(i..i + 8)?.try_into().ok()?))
+        };
+        let (ins, outs) = (u32_at(0)?, u32_at(4)?);
+        if ins > IOV_MAX || outs > IOV_MAX {
+            return None;
+        }
+        let mut ranges = alloc::vec::Vec::with_capacity(ins + outs);
+        for i in 0..ins + outs {
+            ranges.push((u64_at(8 + 16 * i)?, u64_at(16 + 16 * i)?));
+        }
+        let outs_v = ranges.split_off(ins);
+        let iov = Iov {
+            ins: ranges,
+            outs: outs_v,
+        };
+        let total = |r: &[(u64, u64)]| r.iter().try_fold(0u64, |t, (_, l)| t.checked_add(*l));
+        let read = total(&iov.ins)?.checked_add(Self::len_of(ins, outs) as u64)?;
+        if read > SLOT_LEN as u64 || total(&iov.outs)? > SLOT_LEN as u64 {
+            return None;
+        }
+        Some(iov)
+    }
+}
 
 /// Readiness, as `poll(2)` spells it.
 pub const POLLIN: u64 = 0x1;
@@ -132,8 +219,9 @@ pub fn ioctl_carries(cmd: u32) -> (usize, usize) {
 /// anything else is the device failing (`EIO`).
 pub fn errno_of(status: i64) -> usize {
     match -status {
-        e @ (1 | 2 | 5 | 6 | 11 | 12 | 13 | 14 | 16 | 19 | 22 | 25 | 28 | 32 | 38 | 75 | 95
-        | 110) => e as usize,
+        // 77 is `EBADFD`, a stream in the wrong state (ALSA's).
+        e @ (1 | 2 | 5 | 6 | 11 | 12 | 13 | 14 | 16 | 19 | 22 | 25 | 28 | 32 | 38 | 75 | 77
+        | 95 | 110) => e as usize,
         _ => 5,
     }
 }
@@ -141,6 +229,33 @@ pub fn errno_of(status: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_come_back_as_they_went_and_too_many_are_refused() {
+        let iov = Iov {
+            ins: alloc::vec![(0x1000, 24), (0x2000, 4096)],
+            outs: alloc::vec![(0x1000, 24)],
+        };
+        let b = iov.encode();
+        assert_eq!(b.len(), Iov::len_of(2, 1));
+        assert_eq!(Iov::decode(&b), Some(iov));
+        assert_eq!(Iov::decode(&b[..b.len() - 1]), None);
+        let big = Iov {
+            ins: alloc::vec![(0, SLOT_LEN as u64)],
+            outs: alloc::vec![],
+        };
+        assert_eq!(Iov::decode(&big.encode()), None, "the ranges take room too");
+        let many = Iov {
+            ins: alloc::vec![(0, 1); IOV_MAX + 1],
+            outs: alloc::vec![],
+        };
+        assert_eq!(Iov::decode(&many.encode()), None);
+        let wrap = Iov {
+            ins: alloc::vec![(0, u64::MAX), (0, 2)],
+            outs: alloc::vec![],
+        };
+        assert_eq!(Iov::decode(&wrap.encode()), None);
+    }
 
     #[test]
     fn a_message_comes_back_as_it_went() {
@@ -182,6 +297,7 @@ mod tests {
     fn a_server_errno_is_one_a_device_answers_or_eio() {
         assert_eq!(errno_of(-11), 11);
         assert_eq!(errno_of(-25), 25);
+        assert_eq!(errno_of(-77), 77);
         assert_eq!(errno_of(-4), 5);
         assert_eq!(errno_of(-100_000), 5);
     }

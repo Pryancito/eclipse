@@ -9,6 +9,12 @@
 //! open is readable ([`Node::ready`]). A device says that from wherever its
 //! data comes, another thread included, and before it answers the request
 //! that changed it: the kernel reads the FIFO in order.
+//!
+//! An `ioctl` whose argument points further (a structure holding the
+//! address of more) asks the kernel for that memory ([`Device::fetch`]), and
+//! is answered with it ([`Device::ioctl_iov`]). One that cannot be done yet
+//! answers `EAGAIN`; on an open that waits, the kernel asks again once this
+//! process has said something of the open.
 
 use core::mem::size_of;
 
@@ -39,7 +45,17 @@ pub const OP_RELEASE: u32 = 2;
 pub const OP_READ: u32 = 3;
 pub const OP_WRITE: u32 = 4;
 pub const OP_IOCTL: u32 = 5;
+pub const OP_IOCTL_IOV: u32 = 6;
 pub const OP_READY: u32 = 16;
+
+/// In an `ioctl`'s reply, in `a`: the slot holds an [`Iov`], what more of
+/// the program's memory it needs.
+pub const IOCTL_FETCH: u64 = 1;
+/// In an `ioctl`'s request, above the command in `a`: the open waits, and
+/// an `EAGAIN` is asked again once the node says something of it.
+pub const IOCTL_WAITS: u64 = 1 << 32;
+/// How many ranges an [`Iov`] names, at most, each way.
+pub const IOV_MAX: usize = 8;
 
 pub const POLLIN: u64 = 0x1;
 pub const POLLOUT: u64 = 0x4;
@@ -56,6 +72,66 @@ pub const EFAULT: i32 = 14;
 pub const EBUSY: i32 = 16;
 pub const EINVAL: i32 = 22;
 pub const ENOTTY: i32 = 25;
+pub const EIO: i32 = 5;
+
+/// The ranges of the program's memory an `ioctl` reads (`ins`) and writes
+/// (`outs`): address and length. Laid out in the slot as the kernel's
+/// `wire::Iov`: the two counts (`u32`), then the ranges (`u64` pairs),
+/// those to read first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Iov {
+    pub ins: Vec<(u64, u64)>,
+    pub outs: Vec<(u64, u64)>,
+}
+
+impl Iov {
+    pub fn len_of(ins: usize, outs: usize) -> usize {
+        8 + 16 * (ins + outs)
+    }
+
+    /// How many bytes it reads, and writes.
+    pub fn totals(&self) -> (usize, usize) {
+        let sum = |r: &[(u64, u64)]| r.iter().map(|(_, l)| *l as usize).sum();
+        (sum(&self.ins), sum(&self.outs))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(Self::len_of(self.ins.len(), self.outs.len()));
+        b.extend_from_slice(&(self.ins.len() as u32).to_ne_bytes());
+        b.extend_from_slice(&(self.outs.len() as u32).to_ne_bytes());
+        for (addr, len) in self.ins.iter().chain(self.outs.iter()) {
+            b.extend_from_slice(&addr.to_ne_bytes());
+            b.extend_from_slice(&len.to_ne_bytes());
+        }
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Iov> {
+        let u32_at =
+            |i: usize| Some(u32::from_ne_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize);
+        let u64_at = |i: usize| Some(u64::from_ne_bytes(b.get(i..i + 8)?.try_into().ok()?));
+        let (ins, outs) = (u32_at(0)?, u32_at(4)?);
+        if ins > IOV_MAX || outs > IOV_MAX {
+            return None;
+        }
+        let mut ranges = Vec::with_capacity(ins + outs);
+        for i in 0..ins + outs {
+            ranges.push((u64_at(8 + 16 * i)?, u64_at(16 + 16 * i)?));
+        }
+        let outs = ranges.split_off(ins);
+        Some(Iov { ins: ranges, outs })
+    }
+
+    /// Whether the kernel can carry it: what it reads, after the ranges
+    /// themselves, and what it writes each fit a slot.
+    pub fn fits(&self) -> bool {
+        let (i, o) = self.totals();
+        self.ins.len() <= IOV_MAX
+            && self.outs.len() <= IOV_MAX
+            && i + Self::len_of(self.ins.len(), self.outs.len()) <= SLOT_LEN
+            && o <= SLOT_LEN
+    }
+}
 
 /// What an `ioctl` command's number says it carries in and out (the
 /// generic encoding: direction in bits 30-31, size in bits 16-29).
@@ -102,6 +178,41 @@ pub trait Device {
     fn by_value(&self, cmd: u32) -> bool {
         let _ = cmd;
         false
+    }
+    /// Asked before [`Device::ioctl`], with what `cmd` carried in: what
+    /// more of the program's memory it needs, when its argument points
+    /// further. `Some` has the kernel read the [`Iov`]'s ranges and ask
+    /// again ([`Device::ioctl_iov`]); `None` goes on to [`Device::ioctl`].
+    /// An `Err` answers the call.
+    /// `waits` is whether the open waits ([`IOCTL_WAITS`]).
+    fn fetch(
+        &mut self,
+        fh: u32,
+        cmd: u32,
+        arg: u64,
+        waits: bool,
+        data: &[u8],
+    ) -> Result<Option<Iov>, i32> {
+        let _ = (fh, cmd, arg, waits, data);
+        Ok(None)
+    }
+    /// `ioctl(cmd, arg)` with what [`Device::fetch`] asked for: `ins` is
+    /// the bytes of its ranges to read, one after the other, and what goes
+    /// in `out` is written to its ranges to write, in order. The call's
+    /// return value and how many bytes of `out` go back.
+    fn ioctl_iov(
+        &mut self,
+        node: &Node,
+        fh: u32,
+        cmd: u32,
+        arg: u64,
+        waits: bool,
+        iov: &Iov,
+        ins: &[u8],
+        out: &mut [u8],
+    ) -> Result<(i64, usize), i32> {
+        let _ = (node, fh, cmd, arg, waits, iov, ins, out);
+        Err(EINVAL)
     }
 }
 
@@ -218,10 +329,46 @@ impl Node {
                 if len < into && !dev.by_value(cmd) {
                     Err(EFAULT)
                 } else {
-                    dev.ioctl(self, req.fh, cmd, req.b, data).map(|(ret, n)| {
-                        reply.len = n.min(out) as u32;
-                        ret
-                    })
+                    let waits = req.a & IOCTL_WAITS != 0;
+                    match dev.fetch(req.fh, cmd, req.b, waits, &data[..len.min(into)]) {
+                        Err(e) => Err(e),
+                        Ok(Some(iov)) if !iov.fits() => Err(EIO),
+                        Ok(Some(iov)) => {
+                            let b = iov.encode();
+                            // Longer than what the command carries.
+                            self.slot(req.reqid)[..b.len()].copy_from_slice(&b);
+                            reply.len = b.len() as u32;
+                            reply.a = IOCTL_FETCH;
+                            Ok(0)
+                        }
+                        Ok(None) => dev.ioctl(self, req.fh, cmd, req.b, data).map(|(ret, n)| {
+                            reply.len = n.min(out) as u32;
+                            ret
+                        }),
+                    }
+                }
+            }
+            OP_IOCTL_IOV => {
+                let cmd = req.a as u32;
+                let slot = self.slot(req.reqid);
+                match Iov::decode(&slot[..len]) {
+                    None => Err(EIO),
+                    Some(iov) => {
+                        let (into, out) = iov.totals();
+                        let at = Iov::len_of(iov.ins.len(), iov.outs.len());
+                        if at + into > len || out > SLOT_LEN {
+                            Err(EIO)
+                        } else {
+                            let ins = slot[at..at + into].to_vec();
+                            let back = &mut slot[..out];
+                            let waits = req.a & IOCTL_WAITS != 0;
+                            dev.ioctl_iov(self, req.fh, cmd, req.b, waits, &iov, &ins, back)
+                                .map(|(ret, n)| {
+                                    reply.len = n.min(out) as u32;
+                                    ret
+                                })
+                        }
+                    }
                 }
             }
             _ => Err(EINVAL),
@@ -238,6 +385,17 @@ impl Node {
     /// the next. `lock` is where the device is, shared with whoever else
     /// says it is ready.
     pub fn run<D: Device>(&self, lock: &std::sync::Mutex<D>) -> Status {
+        self.run_with(lock, |dev, node, req| node.answer(dev, req))
+    }
+
+    /// [`Node::run`] for a node that is one of several over the same
+    /// device: `answer` answers a request with what is behind `lock`
+    /// ([`Node::answer`] on the part of it this node is).
+    pub fn run_with<T>(
+        &self,
+        lock: &std::sync::Mutex<T>,
+        mut answer: impl FnMut(&mut T, &Node, &Msg) -> Option<Msg>,
+    ) -> Status {
         let mut buf = [Msg::default(); SLOTS * 4];
         let mut replies = 0;
         let mut out: Vec<Msg> = Vec::with_capacity(SLOTS * 4);
@@ -250,7 +408,7 @@ impl Node {
             *self.held.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
             out.clear();
             for req in buf.iter().take(got) {
-                let reply = self.answer(&mut *dev, req);
+                let reply = answer(&mut *dev, self, req);
                 if let Some(held) = self.held.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
                     out.append(held);
                 }
@@ -272,6 +430,24 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_go_as_the_kernel_reads_them() {
+        let iov = Iov {
+            ins: vec![(0x1000, 4096)],
+            outs: vec![(0x2000, 24), (0x3000, 64)],
+        };
+        let b = iov.encode();
+        assert_eq!(b.len(), Iov::len_of(1, 2));
+        assert_eq!(Iov::decode(&b), Some(iov.clone()));
+        assert_eq!(iov.totals(), (4096, 88));
+        assert!(iov.fits());
+        let big = Iov {
+            ins: vec![(0, SLOT_LEN as u64)],
+            outs: vec![],
+        };
+        assert!(!big.fits());
+    }
 
     #[test]
     fn an_ioctl_number_says_what_it_carries() {

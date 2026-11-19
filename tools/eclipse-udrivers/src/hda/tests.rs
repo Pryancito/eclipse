@@ -202,7 +202,7 @@ fn the_ring_wraps_on_writes_and_on_plays() {
     let mut r = Ring::default();
     let chunk = vec![3u8; 16384];
     // Around the ring a few times, the play position chasing the writes.
-    for _ in 0..12 {
+    for _ in 0..4 * RING_LEN / chunk.len() {
         let n = r.write(&mut mem, &chunk);
         assert_eq!(n, chunk.len());
         let to = ((r.played + 16384) % RING_LEN as u64) as usize;

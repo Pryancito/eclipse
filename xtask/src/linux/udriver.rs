@@ -73,9 +73,10 @@ const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
 /// what checks and times such a node, `udrv-evdev-check NODE`.
 const INPUT_DRIVERS: [&str; 3] = ["udrv-virtio-input", "udrv-ps2", "udrv-evdev-check"];
 /// The driver of an Intel HD Audio controller, from the same package,
-/// serving it as `/dev/dsp` (`udriver=hda@N`); and what plays a tone
-/// through such a node and checks it, `udrv-dsp-check`.
-const AUDIO_DRIVERS: [&str; 2] = ["udrv-hda", "udrv-dsp-check"];
+/// serving it as `/dev/dsp` and ALSA's `/dev/snd` (`udriver=hda@N`); and
+/// what plays a tone through such nodes and checks them, `udrv-dsp-check`
+/// and `udrv-snd-check`.
+const AUDIO_DRIVERS: [&str; 3] = ["udrv-hda", "udrv-dsp-check", "udrv-snd-check"];
 /// How many virtio input devices get a driver service of their own
 /// (`uinput`, `uinput2`): a keyboard and a mouse or tablet.
 const UINPUT_DEVICES: usize = 2;

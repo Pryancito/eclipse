@@ -3,9 +3,10 @@
 
 extern crate std;
 
-use super::wire::{Msg, MSG, OP_READY, SLOTS, SLOT_LEN};
+use super::wire::{Iov, Msg, IOCTL_FETCH, MSG, OP_READY, SLOTS, SLOT_LEN};
 use super::*;
 use alloc::vec;
+use core::convert::TryInto;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use zircon_object::ZxError;
@@ -15,6 +16,12 @@ use zircon_object::ZxError;
 const REVERSE: u32 = 0xc010_5401;
 /// `_IO('T', 2)`: returns its argument plus one.
 const PLUS_ONE: u32 = 0x5402;
+/// `_IOW('T', 3, {addr: u64, len: u64})`: the sum of the `len` bytes at
+/// `addr`, as a `u64` over the argument. The server asks for them.
+const SUM: u32 = 0x4010_5403;
+/// `_IO('T', 4)`: `EAGAIN` the first time, and the open is said to be
+/// writable a little after; 5 the next.
+const LATER: u32 = 0x5404;
 
 struct Echo {
     node: Arc<ServedNode>,
@@ -41,6 +48,7 @@ fn echo() -> Echo {
     let server = thread::spawn(move || {
         let mut queues: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let mut next = 7u32;
+        let mut later = 0;
         loop {
             let mut m = [0u8; MSG];
             match theirs.read(MSG, &mut m, 1) {
@@ -121,6 +129,56 @@ fn echo() -> Echo {
                     7
                 }
                 OP_IOCTL if req.a == PLUS_ONE as u64 => req.b as i64 + 1,
+                OP_IOCTL if req.a == SUM as u64 => {
+                    let mut got = [0u8; 16];
+                    window.read(slot, &mut got).unwrap();
+                    let iov = Iov {
+                        ins: vec![(
+                            u64::from_ne_bytes(got[..8].try_into().unwrap()),
+                            u64::from_ne_bytes(got[8..].try_into().unwrap()),
+                        )],
+                        outs: vec![(req.b, 8)],
+                    }
+                    .encode();
+                    window.write(slot, &iov).unwrap();
+                    reply.len = iov.len() as u32;
+                    reply.a = IOCTL_FETCH;
+                    0
+                }
+                super::wire::OP_IOCTL_IOV if req.a == SUM as u64 => {
+                    let mut got = vec![0u8; req.len as usize];
+                    window.read(slot, &mut got).unwrap();
+                    let iov = Iov::decode(&got).unwrap();
+                    let at = Iov::len_of(1, 1);
+                    let sum: u64 = got[at..at + iov.ins[0].1 as usize]
+                        .iter()
+                        .map(|b| *b as u64)
+                        .sum();
+                    window.write(slot, &sum.to_ne_bytes()).unwrap();
+                    reply.len = 8;
+                    0
+                }
+                OP_IOCTL if req.a as u32 == LATER => {
+                    later += 1;
+                    // The open that waits is said to.
+                    assert_eq!(req.a & super::wire::IOCTL_WAITS != 0, later > 2);
+                    if later % 2 == 1 {
+                        reply.b = (-11i64) as u64;
+                        send(&theirs, reply);
+                        thread::sleep(std::time::Duration::from_millis(20));
+                        send(
+                            &theirs,
+                            Msg {
+                                op: OP_READY,
+                                fh: req.fh,
+                                a: POLLOUT,
+                                ..Msg::default()
+                            },
+                        );
+                        continue;
+                    }
+                    5
+                }
                 OP_IOCTL => -25,
                 _ => -22,
             };
@@ -220,6 +278,47 @@ fn an_ioctl_carries_what_its_number_says_and_returns_the_servers_answer() {
     assert_eq!(arg, want);
     assert_eq!(open.ioctl(PLUS_ONE, 41).unwrap(), 42);
     assert_eq!(open.ioctl(0x5403, 0), Err(LxError::ENOTTY));
+}
+
+#[test]
+fn an_ioctl_whose_argument_points_further_reads_and_writes_what_the_server_asks() {
+    let echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    let samples: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let want: u64 = samples.iter().map(|b| *b as u64).sum();
+    let mut arg = [0u64; 2];
+    arg[0] = samples.as_ptr() as u64;
+    arg[1] = samples.len() as u64;
+    assert_eq!(open.ioctl(SUM, arg.as_mut_ptr() as usize).unwrap(), 0);
+    assert_eq!(arg[0], want);
+}
+
+#[test]
+fn an_ioctl_that_cannot_be_done_yet_waits_for_the_server_on_an_open_that_waits() {
+    let echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    // One that does not wait is told.
+    assert_eq!(open.ioctl(LATER, 0), Err(LxError::EAGAIN));
+    assert_eq!(open.ioctl(LATER, 0).unwrap(), 5);
+    // One that waits is asked again once the server has said something,
+    // which the kernel reads as it does once the FIFO is readable.
+    let node = echo.node.clone();
+    let done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
+    let looker = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            node.look();
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    let start = std::time::Instant::now();
+    let got = async_std::task::block_on(open.ioctl_waiting(LATER, 0));
+    done.store(true, Ordering::SeqCst);
+    looker.join().unwrap();
+    assert_eq!(got.unwrap(), 5);
+    assert!(start.elapsed() >= std::time::Duration::from_millis(15));
 }
 
 #[test]

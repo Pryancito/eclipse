@@ -3010,6 +3010,18 @@ async fn pcm_sleeping_ioctl(
     }
     let file = file_like.downcast_ref::<File>()?;
     let inode = file.inode();
+    // A node a process serves, on an open that waits: its server answers
+    // `EAGAIN` for what cannot be done yet, and the call waits for it here
+    // (ALSA's `WRITEI_FRAMES` and `DRAIN` when the driver is a process).
+    if let Some(served) = inode
+        .as_any_ref()
+        .downcast_ref::<linux_object::fs::devfs::ServedOpen>()
+    {
+        if file_like.flags().non_block() {
+            return None;
+        }
+        return Some(served.ioctl_waiting(request as u32, arg1).await);
+    }
     // And `SNDCTL_DSP_SYNC` on `/dev/dsp`, which waits out the queue.
     if DspDev::is_sync_ioctl(request as u32) {
         let dsp = inode.as_any_ref().downcast_ref::<DspDev>()?;
