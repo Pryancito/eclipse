@@ -748,6 +748,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("ublk2", "respawn", "/usr/local/bin/eclipse-ublk 2", ""),
         ("ublk3", "respawn", "/usr/local/bin/eclipse-ublk 3", ""),
         ("ublk4", "respawn", "/usr/local/bin/eclipse-ublk 4", ""),
+        ("uhda", "respawn", "/usr/local/bin/eclipse-uhda", ""),
         ("uinput", "respawn", "/usr/local/bin/eclipse-uinput 1", ""),
         ("uinput2", "respawn", "/usr/local/bin/eclipse-uinput 2", ""),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
@@ -989,6 +990,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
             "ublk2",
             "ublk3",
             "ublk4",
+            "uhda",
             "uinput",
             "uinput2",
             "unet",
@@ -1006,6 +1008,14 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         };
         assert_eq!(field(body, "type"), Some(kind), "{name}");
     }
+    // The HD Audio controller: the first one, served as /dev/dsp. Out of
+    // the list after this, so what follows counts the others.
+    let (hda, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "uhda");
+    assert_eq!(field(&hda[0].1, "udriver"), Some("hda"));
+    assert_eq!(
+        field(&hda[0].1, "exec"),
+        Some("/usr/local/bin/eclipse-uhda")
+    );
     // The e1000e the boot leaves: the stack drives it, through the wrapper
     // of the other card told which this one is.
     assert_eq!(field(&gated[0].1, "udriver"), Some("e1000e@0"));
@@ -1866,6 +1876,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "uinput",
         "uinput2",
         "ups2",
+        "uhda",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
