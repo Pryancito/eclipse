@@ -452,7 +452,7 @@ fn keep_fence_for_dependents(table: &mut SyncobjTable, handle: u32, binary_only:
         .map(|f| f.point)
         .chain(obj.links.iter().map(|l| l.dst_point.max(1)))
         .fold(obj.point, u64::max);
-    let in_flight = !obj.links.is_empty() || table.pending.iter().any(|f| discarded(f));
+    let in_flight = !obj.links.is_empty() || table.pending.iter().any(discarded);
     // Who waits on it: a link of ANOTHER object, to a point that state
     // delivers. With nothing in flight the counter is all there is, and it
     // only matters when the replace rewinds it (a binary slot, or a reset).
