@@ -749,7 +749,7 @@ static ECLIPSEFS_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
 pub(super) fn disk_read_gate(inode: &Arc<dyn INode>) -> Option<&'static TurnGate> {
     let gates = if super::eclipsefs_mount::owns(&**inode) {
         &ECLIPSEFS_READ_GATES
-    } else if super::btrfs_mount::owns(&**inode) || super::fat_mount::owns(&**inode) {
+    } else if super::btrfs_mount::owns(&**inode) {
         &DISK_READ_GATES
     } else {
         return None;

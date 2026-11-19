@@ -23,12 +23,18 @@ path = "src/main.rs"
 name = "eclipse-fs-bench"
 path = "src/bin/eclipse-fs-bench.rs"
 
+# The mount helper: what the kernel asks to make a FAT mount that
+# `mount(2)` is asked for.
+[[bin]]
+name = "eclipse-mountd"
+path = "src/bin/eclipse-mountd.rs"
+
 [dependencies]
 libc = "0.2"
 # The system calls and the FIFO.
 udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
-# The same FAT code the kernel links for its own FAT (`vendor/fatfs`): what
-# runs here and what runs there differ in where, not in what.
+# The FAT code (`vendor/fatfs`): the only FAT there is, as the kernel has
+# none of its own.
 fatfs = { path = "../../vendor/fatfs", default-features = false, features = ["std", "alloc", "lfn", "log_level_warn"] }
 
 [profile.release]

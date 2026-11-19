@@ -213,7 +213,7 @@ impl INode for FlaggedINode {
 
     /// The wrapped inode's, as `MNode` does: `link` and `move_` take a
     /// second inode, and the filesystem underneath (`btrfs_mount`,
-    /// `fat_mount`, ramfs) downcasts it to its own inode type. Answering
+    /// ramfs) downcasts it to its own inode type. Answering
     /// with the wrapper made that downcast fail, `NotSameFs` (EXDEV) or
     /// `NotSupported` (ENOSYS), so on a mounted disk `ln` failed and `mv`
     /// fell back to a copy or failed outright. Nothing downcasts to
@@ -259,7 +259,7 @@ mod flagged_fs_tests {
         assert_eq!(b.metadata().unwrap().nlinks, 2);
     }
 
-    /// A directory that, like `btrfs_mount` and `fat_mount`, only accepts a
+    /// A directory that, like `btrfs_mount`, only accepts a
     /// `move_` target of its own type, and records which one it was given.
     struct StrictDir {
         moved_into: Mutex<Vec<usize>>,

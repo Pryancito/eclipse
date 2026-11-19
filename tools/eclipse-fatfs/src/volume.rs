@@ -131,7 +131,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// A date of a directory entry as seconds since 1970, the entry's clock
-/// read as UTC, which is how the kernel's own FAT reads it.
+/// read as UTC, as Linux's FAT reads it by default.
 fn unix_from_date(date: fatfs::Date) -> i64 {
     days_from_civil(date.year as i64, date.month as i64, date.day as i64) * 86_400
 }

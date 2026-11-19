@@ -293,47 +293,32 @@ fn the_runs_deadline_is_built_once_and_handed_out_again() {
     );
 }
 
-/// A FAT line on a device is the server's, and the kernel's own FAT keeps
-/// it on each boot where nothing would start that server: the boot that
-/// says so, and the root filesystem that has no service for it.
+/// Every FAT line is the server's: the kernel has no FAT to keep one.
 #[test]
-fn a_fat_line_is_left_to_its_server_unless_the_boot_or_the_root_keeps_it() {
+fn a_fat_line_is_left_to_its_server() {
     for fstype in ["vfat", "msdos", "FAT32", "fat16", "fat"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
-        assert!(
-            left_to_fat_server("/dev/sda1", parsed, None, true),
-            "{}",
-            fstype
-        );
-        assert!(
-            !left_to_fat_server("/dev/sda1", parsed, Some("kernel"), true),
-            "{}: `ufat=kernel` is the way back",
-            fstype
-        );
-        assert!(
-            !left_to_fat_server("/dev/sda1", parsed, None, false),
-            "{}: nothing in this root would mount it",
-            fstype
-        );
+        assert!(left_to_fat_server(parsed), "{}", fstype);
     }
-    assert!(
-        left_to_fat_server("/dev/sda1", "vfat", Some("server"), true),
-        "only `kernel` is the word"
-    );
-    // The placeholder of an image nobody installed: the kernel derives the
-    // device from `ROOT=`, which the service does not.
-    assert!(!left_to_fat_server(
-        "__ECLIPSE_EFI_DEV___",
-        "vfat",
-        None,
-        true
-    ));
     for fstype in ["btrfs", "eclipsefs"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
+        assert!(!left_to_fat_server(parsed), "{}", fstype);
+    }
+}
+
+/// `mount` with no `-t` tries the types of `/proc/filesystems` one by one,
+/// so a type that can be mounted and is not listed is never found. FAT is
+/// mounted by its server now, and still listed: `mount(2)` of it asks the
+/// mount helper.
+#[test]
+fn proc_filesystems_lists_every_type_that_mounts() {
+    let listed = crate::fs::procfs::proc_filesystems_for_test();
+    for ty in ["eclipsefs", "btrfs", "vfat"] {
         assert!(
-            !left_to_fat_server("/dev/sda2", parsed, None, true),
-            "{}",
-            fstype
+            listed.lines().any(|l| l == alloc::format!("\t{}", ty)),
+            "{} mounts and /proc/filesystems has it with no `nodev`: {:?}",
+            ty,
+            listed
         );
     }
 }
