@@ -50,19 +50,21 @@ pub(super) fn write_network_wrapper(localbin: &Path) {
           \x20   sleep 0.2; n=$((n + 1))\n\
           \x20 done\n\
           fi\n\
-          macs=$(sed -n 's/^mac=//p' /run/eclipse-servers/stack.* 2>/dev/null)\n\
-          for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
-          \x20 m=$(cat \"/sys/class/net/$i/address\" 2>/dev/null)\n\
-          \x20 [ -z \"$m\" ] || case \"$macs\" in *\"$m\"*) continue ;; esac\n\
-          \x20 exec udhcpc -i \"$i\" -f -R -s \"$SCRIPTv4\"\n\
-          done\n\
-          # Every card is such a stack's: nothing to do here but stay.\n\
-          [ -z \"$macs\" ] || { while sleep 86400; do :; done; exit 0; }\n\
-          # `ip` may not have listed anything yet (netlink dump raced the\n\
-          # NIC probe). eth0 is the sequential name the kernel assigns to\n\
-          # the first Ethernet NIC.\n\
-          echo 'eclipse-network-up: no interface from ip link; trying eth0' >&2\n\
-          exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
+          while :; do\n\
+          \x20 macs=$(sed -n 's/^mac=//p' /run/eclipse-servers/stack.* 2>/dev/null)\n\
+          \x20 for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
+          \x20   m=$(cat \"/sys/class/net/$i/address\" 2>/dev/null)\n\
+          \x20   [ -z \"$m\" ] || case \"$macs\" in *\"$m\"*) continue ;; esac\n\
+          \x20   exec udhcpc -i \"$i\" -f -R -s \"$SCRIPTv4\"\n\
+          \x20 done\n\
+          \x20 # Every card is such a stack's: nothing to do here but stay.\n\
+          \x20 [ -z \"$macs\" ] || { while sleep 86400; do :; done; exit 0; }\n\
+          \x20 # No interface yet. `eth0` is NOT tried on the off chance: the\n\
+          \x20 # card that takes that name a moment later is the one of the\n\
+          \x20 # stack that runs as a process, and a client started for the\n\
+          \x20 # guess took its address away. Look again when one has come.\n\
+          \x20 sleep 1\n\
+          done\n",
     )
     .unwrap();
 }

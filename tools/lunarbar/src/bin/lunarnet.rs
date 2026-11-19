@@ -1092,11 +1092,13 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
     }
     let conf = netconf::load(Path::new(netconf::CONF));
     let seen = netconf::to_configure(Path::new(SYS_NET), Path::new(netconf::SERVERS));
-    let mut names = seen.0.clone();
-    if names.is_empty() && !seen.1 {
-        // The NIC may not have probed yet; eth0 is the first one's name.
-        names.push("eth0".into());
-    }
+    // Only what there is. With no interface yet, `eth0` used to be tried
+    // on the off chance that a card was still probing; the card that takes
+    // that name a moment later is the one of the stack that runs as a
+    // process, and the `udhcpc` started for the guess took its address
+    // away from it. A card that comes later is seen by the service's
+    // loop, which applies the file again.
+    let names = seen.0.clone();
     let mut clients = Vec::new();
     let mut dns = Vec::new();
     for n in &names {

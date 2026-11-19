@@ -1973,9 +1973,13 @@ fn each_of_the_three_halt_wrappers_forces_its_own_verb() {
 
 /// `-s` is not optional: busybox udhcpc's compiled-in script path is not
 /// where Eclipse stages the script, so without it the lease is obtained
-/// and never applied -- no address, no resolv.conf, no route. Both execs
-/// need it, including the eth0 fallback for when the netlink dump raced
-/// the NIC probe and `ip link` listed nothing.
+/// and never applied -- no address, no resolv.conf, no route.
+///
+/// There is one exec, for an interface `ip link` listed. When it lists
+/// nothing the wrapper looks again; it used to try `eth0` on the off
+/// chance, and the card that took that name a moment later was the one
+/// of the network stack that runs as a process, which the client then
+/// took the address away from.
 #[test]
 fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
     let rootfs = init_rootfs("dhcp");
@@ -1985,10 +1989,14 @@ fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
         .map(str::trim)
         .filter(|l| l.contains("exec udhcpc"))
         .collect();
-    assert_eq!(
-        execs.len(),
-        2,
-        "expected the listed interface and the eth0 fallback"
+    assert_eq!(execs.len(), 1, "expected the listed interface only");
+    assert!(
+        !body.contains("-i eth0"),
+        "a client on a name nothing listed:\n{body}"
+    );
+    assert!(
+        body.contains("while :; do") && body.contains("sleep 1\ndone"),
+        "with no interface yet it does not look again:\n{body}"
     );
     for line in &execs {
         assert!(
@@ -2000,11 +2008,6 @@ fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
             "a backgrounded client init cannot supervise: {line}"
         );
     }
-    assert!(
-        execs[1].contains(" -i eth0"),
-        "no fallback interface: {}",
-        execs[1]
-    );
     assert!(
         body.contains("SCRIPTv4=/usr/share/udhcpc/default.script")
             && body.contains("SCRIPTv4=/etc/udhcpc/default.script"),
