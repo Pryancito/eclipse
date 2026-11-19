@@ -981,17 +981,21 @@ fn start_service() -> bool {
     // appearing is the signal that it came up; a child that exited instead is
     // the signal that it did not, and neither needs a fixed wait.
     let mut came_up = false;
+    let mut gone = false;
     for _ in 0..100 {
         if service_pid().is_some() {
             came_up = true;
             break;
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
+            gone = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if !came_up {
+    // One that was reaped has no pid any more: the number is whoever the
+    // kernel gave it to since.
+    if !came_up && !gone {
         // It never published its pid, and it is still running: it may already
         // be configuring interfaces and starting DHCP clients that nothing can
         // find again, and every retry would leave another one behind. Stop it.
@@ -1068,6 +1072,8 @@ struct Client {
     dev: String,
     script: &'static str,
     child: Option<std::process::Child>,
+    /// Whether it was ever started: the first start does not wait.
+    tried: bool,
     since: Instant,
 }
 
@@ -1104,10 +1110,10 @@ fn bring_up(added6: &mut Vec<(String, String)>) -> (Vec<Client>, (Vec<String>, b
             }
         }
         if p.dhcp4 {
-            clients.push(Client { prog: "udhcpc", dev: n.clone(), script: "default.script", child: None, since: Instant::now() });
+            clients.push(Client { prog: "udhcpc", dev: n.clone(), script: "default.script", child: None, tried: false, since: Instant::now() });
         }
         if p.dhcp6 {
-            clients.push(Client { prog: "udhcpc6", dev: n.clone(), script: "default6.script", child: None, since: Instant::now() });
+            clients.push(Client { prog: "udhcpc6", dev: n.clone(), script: "default6.script", child: None, tried: false, since: Instant::now() });
         }
         dns.extend(p.dns);
     }
@@ -1311,13 +1317,18 @@ fn service() -> ! {
                     None => true,
                     Some(ch) => !matches!(ch.try_wait(), Ok(None)),
                 };
+                // Reaped: its pid is not its own any more. Kept, the pass's
+                // end would send SIGTERM to that number, and to whoever the
+                // kernel gave it to meanwhile: at boot, when the stack's
+                // card appears, that was the stack itself.
+                if dead {
+                    c.child = None;
+                }
                 // A client that keeps dying is retried every five seconds, not
                 // in a loop.
-                if dead && (c.child.is_none() || c.since.elapsed() > Duration::from_secs(5)) {
-                    if let Some(mut ch) = c.child.take() {
-                        let _ = ch.wait();
-                    }
+                if dead && (!c.tried || c.since.elapsed() > Duration::from_secs(5)) {
                     c.child = spawn_client(c.prog, &c.dev, c.script);
+                    c.tried = true;
                     c.since = Instant::now();
                 }
             }
@@ -1325,7 +1336,10 @@ fn service() -> ! {
         }
         for c in &mut clients {
             if let Some(ch) = &mut c.child {
-                unsafe { libc::kill(ch.id() as i32, libc::SIGTERM) };
+                // Only one that still runs: see above.
+                if matches!(ch.try_wait(), Ok(None)) {
+                    unsafe { libc::kill(ch.id() as i32, libc::SIGTERM) };
+                }
                 let _ = ch.wait();
             }
         }
