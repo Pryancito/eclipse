@@ -12,11 +12,6 @@ mod epoll;
 pub use epoll::stats as epoll_stats;
 mod drm_bring_up;
 mod eventfd;
-mod fat_mount;
-/// Qué errno nace de montar vfat sobre un volumen que no es FAT: la segunda
-/// mitad del «I/O error» de los pendrives, sin bus USB de por medio.
-#[cfg(test)]
-mod fat_wrong_fs_tests;
 mod file;
 mod flagged_fs;
 pub mod flock;
@@ -2387,9 +2382,7 @@ async fn mount_fstab(root: &Arc<MNode>) {
     // server is actually dialled.
     let mut net_budget: Option<Budget> = None;
     // The FAT lines are a server process's, started by a service of this
-    // root filesystem, unless the boot keeps them for the kernel's FAT.
-    let cmdline = kernel_hal::boot::cmdline();
-    let ufat = kernel_hal::cmdline::value(&cmdline, "ufat");
+    // root filesystem: the kernel has no FAT.
     let root_dyn: Arc<dyn INode> = root.clone();
     let has_fat_service = root_dyn.lookup_follow(FAT_MOUNTS_SERVICE, 4).is_ok();
     if let Ok(etc) = root.find(true, "etc") {
@@ -2437,53 +2430,30 @@ async fn mount_fstab(root: &Arc<MNode>) {
                             }
                             FstabAction::Block(fstype_parsed) => fstype_parsed,
                         };
-                        if left_to_fat_server(source, fstype_parsed, ufat, has_fat_service) {
-                            info!("mount_fstab: {:?} is left to the FAT server", target);
+                        if left_to_fat_server(fstype_parsed) {
+                            if has_fat_service {
+                                info!("mount_fstab: {:?} is left to the FAT server", target);
+                            } else {
+                                warn!(
+                                    "mount_fstab: {:?} is FAT, and this root has no {} to mount it",
+                                    target, FAT_MOUNTS_SERVICE
+                                );
+                            }
                             continue;
                         }
 
                         // Resolve the source inode using coerced root_dyn
                         let source_rel = source.trim_start_matches('/');
 
-                        // When the installer left an unsubstituted __ECLIPSE_EFI_DEV*
-                        // placeholder for /boot/efi, try to derive the EFI partition
-                        // from ROOT= on the kernel command line (e.g. ROOT=/dev/sda2 →
-                        // EFI=/dev/sda1). This covers the edge case where raw-block
-                        // patching of fstab did not take effect on the first boot.
-                        let derived_efi: Option<String>;
-                        let effective_source = if source_rel.starts_with("__ECLIPSE_EFI")
-                            && target == "/boot/efi"
-                        {
-                            derived_efi = efi_dev_from_root_cmdline();
-                            match derived_efi.as_deref() {
-                                Some(dev) => {
-                                    warn!(
-                                        "mount_fstab: fstab EFI placeholder sin sustituir; \
-                                         intentando ROOT= derivado {:?} -> {:?}",
-                                        dev, target
-                                    );
-                                    dev
-                                }
-                                None => {
-                                    info!(
-                                        "mount_fstab: skipping unsubstituted EFI placeholder \
-                                         (ROOT= no disponible para derivar EFI)"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else if source_rel.starts_with("__ECLIPSE_") {
-                            // Other unsubstituted placeholders: skip silently.
+                        if source_rel.starts_with("__ECLIPSE_") {
+                            // Unsubstituted placeholders: skip silently.
                             info!(
                                 "mount_fstab: skipping unsubstituted placeholder source {:?} -> {:?}",
                                 source, target
                             );
                             continue;
-                        } else {
-                            derived_efi = None;
-                            source_rel
-                        };
-
+                        }
+                        let effective_source = source_rel;
                         let effective_source_rel = effective_source.trim_start_matches('/');
                         let root_dyn: Arc<dyn INode> = root.clone();
                         let source_inode = match root_dyn.lookup_follow(effective_source_rel, 4) {
@@ -2551,7 +2521,7 @@ async fn mount_fstab(root: &Arc<MNode>) {
                             continue;
                         }
 
-                        let mount_source = derived_efi.as_deref().unwrap_or(source);
+                        let mount_source = source;
                         let opts = mount_state::build_options_string(flags, options);
                         register_mount(mount_source, target, fstype_parsed, &opts, Some(state));
                         info!(
@@ -2562,33 +2532,6 @@ async fn mount_fstab(root: &Arc<MNode>) {
                 }
             }
         }
-    }
-}
-
-/// Derive the EFI partition path from `ROOT=` on the kernel command line.
-///
-/// `ROOT=` names the installed ext2 root (e.g. `/dev/sda2`). On a standard
-/// Eclipse OS layout the EFI system partition is always partition 1 on the
-/// same disk (e.g. `/dev/sda1`, `/dev/nvme0n1p1`, `/dev/vda1`).
-///
-/// Returns `None` when `ROOT=` is absent, unresolved (still a placeholder),
-/// or cannot be mapped to a partition-1 path.
-fn efi_dev_from_root_cmdline() -> Option<String> {
-    let cmdline = kernel_hal::boot::cmdline();
-    let root_dev = parse_root_cmdline(&cmdline)?;
-    // Strip trailing partition number. For NVMe paths (…p2) strip the 'p'
-    // separator too; for sda/vda paths the separator is implicit.
-    let without_digits = root_dev.trim_end_matches(|c: char| c.is_ascii_digit());
-    if without_digits.len() == root_dev.len() {
-        // No trailing digits — not a partition path we can map.
-        return None;
-    }
-    if let Some(stem) = without_digits.strip_suffix('p') {
-        // NVMe style: /dev/nvme0n1p2 → /dev/nvme0n1p1
-        Some(format!("{}p1", stem))
-    } else {
-        // SATA/virtio style: /dev/sda2 → /dev/sda1, /dev/vda2 → /dev/vda1
-        Some(format!("{}1", without_digits))
     }
 }
 

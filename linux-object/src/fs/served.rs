@@ -34,6 +34,7 @@
 //! memory: only the window it gave.
 
 mod extras;
+pub mod helper;
 mod link;
 pub(crate) use extras::{copy_reflink, fallocate, ioctl, seek, xattr};
 pub(crate) use link::between_looks;

@@ -18,7 +18,6 @@ use crate::process::LinuxProcess;
 use super::block_mount::MountBackend;
 use super::btrfs_mount::open_btrfs;
 use super::eclipsefs_mount::open_eclipsefs;
-use super::fat_mount::open_fat;
 use super::flagged_fs::{wrap_fs, wrap_fs_at};
 use super::nfs::connect::TcpConnector;
 use super::nfs::greeting::Budget;
@@ -160,9 +159,6 @@ pub(crate) fn open_filesystem(
     match fstype {
         "btrfs" => open_btrfs(&backend, read_only).map_err(LxError::from),
         "eclipsefs" => open_eclipsefs(&backend, read_only, data).map_err(LxError::from),
-        "vfat" => open_fat(&backend)
-            .map(|fs| fs as Arc<dyn FileSystem>)
-            .map_err(LxError::from),
         _ => Err(LxError::ENODEV),
     }
 }
@@ -271,6 +267,22 @@ pub fn mount_fs(
         return mount_nfs(source, &target_norm, &mount_node, flags, data);
     }
 
+    // FAT is served by a process (`eclipse-fatfs`), which the mount helper
+    // starts: the kernel has no FAT of its own.
+    if fstype == "vfat" {
+        proc.lookup_inode(source)?;
+        let source = absolute_source(proc, source);
+        // `ro` in the options is the flag, for the helper as for the
+        // kernel's own types.
+        let flags = match flags_read_only(flags, data) {
+            true => flags | super::mount_state::MS_RDONLY,
+            false => flags,
+        };
+        super::served::helper::ask(&source, &target_norm, fstype, flags, data)?;
+        hunter::media::note_mount(&source, &target_norm, fstype);
+        return Ok(());
+    }
+
     let source_inode = proc.lookup_inode(source)?;
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
     let read_only = flags_read_only(flags, data);
@@ -285,6 +297,16 @@ pub fn mount_fs(
     // scan is clean). The boot mounts from fstab do not come through here.
     hunter::media::note_mount(source, &target_norm, fstype);
     Ok(())
+}
+
+/// `source` as a path from the root: the mount helper is another process,
+/// and its working directory is not the caller's.
+fn absolute_source(proc: &LinuxProcess, source: &str) -> String {
+    if source.starts_with('/') {
+        return normalize_target(source);
+    }
+    let cwd = proc.current_working_directory();
+    normalize_target(&alloc::format!("{}/{}", cwd.trim_end_matches('/'), source))
 }
 
 /// Mount at `target` a filesystem that a process serves

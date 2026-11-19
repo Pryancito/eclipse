@@ -718,6 +718,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-lunarclip",
             "labwc",
         ),
+        ("mountd", "respawn", "/usr/local/bin/eclipse-mountd", ""),
         (
             "network",
             "respawn",
@@ -1390,7 +1391,6 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
     for needle in [
         "fstab=/etc/fstab",
         "< /proc/mounts",
-        "< /proc/cmdline",
         "busybox mount -t",
         "left=50",
     ] {
@@ -1401,15 +1401,13 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
         );
     }
     let dir = scratch("ublk-mounts-run");
-    let run_on = |cmdline: &str, fstab: &str, mounts: &str| {
-        let (f, m, c) = (dir.join("fstab"), dir.join("mounts"), dir.join("cmdline"));
+    let run = |fstab: &str, mounts: &str| {
+        let (f, m) = (dir.join("fstab"), dir.join("mounts"));
         fs::write(&f, fstab).unwrap();
         fs::write(&m, mounts).unwrap();
-        fs::write(&c, cmdline).unwrap();
         let script = script
             .replace("fstab=/etc/fstab", &format!("fstab='{}'", f.display()))
             .replace("< /proc/mounts", &format!("< '{}'", m.display()))
-            .replace("< /proc/cmdline", &format!("< '{}'", c.display()))
             .replace("busybox mount -t", "echo mount -t")
             // Two tenths of a second, not fifty: the wait is what is tested,
             // not its length.
@@ -1426,7 +1424,6 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
             out.status.code(),
         )
     };
-    let run = |fstab: &str, mounts: &str| run_on("LOG=warn:udriver=virtio-blk@0\n", fstab, mounts);
     let at = |name: &str| dir.join(name).display().to_string();
     let (data, taken, absent, fat) = (at("data"), at("taken"), at("absent"), at("fat"));
     let fstab = format!(
@@ -1459,25 +1456,12 @@ fn the_served_disks_mounts_are_the_dev_lines_nothing_has_mounted() {
     }
 
     // A FAT volume is `eclipse-fat-mounts`'s, in every spelling the kernel
-    // reads as FAT, and this script's again on the boot that keeps FAT
-    // for the kernel.
+    // reads as FAT.
     for fstype in ["vfat", "msdos", "FAT32"] {
         let with_fat = format!("/dev/null  {fat}  {fstype} defaults 0 0\n");
         let (out, err, code) = run(&with_fat, &mounts);
         assert_eq!((out.as_str(), code), ("", Some(0)), "{fstype}: {err}");
         assert!(!dir.join("fat").exists(), "{fstype}");
-        let (out, err, code) = run_on(
-            "LOG=warn:udriver=virtio-blk@0:ufat=kernel\n",
-            &with_fat,
-            &mounts,
-        );
-        assert_eq!(
-            out,
-            format!("mount -t {fstype} -o defaults /dev/null {fat}\n"),
-            "stderr: {err}"
-        );
-        assert_eq!(code, Some(0));
-        fs::remove_dir(dir.join("fat")).unwrap();
     }
 
     // A device that never comes: said, left, and the others still mounted.
@@ -1535,7 +1519,8 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
         "< /proc/cmdline",
         "< /proc/udrivers",
         "/bin/eclipse-fatfs $ro",
-        "busybox mount -t",
+        "ROOT=/dev/*[0-9]",
+        "= /boot/efi ]",
         "left=50",
     ] {
         assert_eq!(
@@ -1549,6 +1534,15 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
         fs::read_to_string(rootfs.join("etc/eclipse/services/fat-mounts.service")).unwrap();
     assert_eq!(field(&service, "udriver"), None);
     assert_eq!(field(&service, "type"), Some("oneshot"));
+    // The mount helper too, started again when it dies: mount(2) of FAT
+    // is ENODEV while it is not there.
+    let helper = fs::read_to_string(rootfs.join("etc/eclipse/services/mountd.service")).unwrap();
+    assert_eq!(field(&helper, "udriver"), None);
+    assert_eq!(field(&helper, "type"), Some("respawn"));
+    assert_eq!(
+        field(&helper, "exec"),
+        Some("/usr/local/bin/eclipse-mountd")
+    );
 
     let dir = scratch("fat-mounts-run");
     let run = |cmdline: &str, udrivers: &str, server: &str, fstab: &str, mounts: &str| {
@@ -1572,7 +1566,12 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
                 &format!("< '{}'", file("udrivers", udrivers)),
             )
             .replace("/bin/eclipse-fatfs $ro", "serve $ro")
-            .replace("busybox mount -t", "echo mount -t")
+            // The disk of ROOT= and the EFI place, in this test's directory.
+            .replace("ROOT=/dev/*[0-9]", "ROOT=/*[0-9]")
+            .replace(
+                "= /boot/efi ]",
+                &format!("= '{}' ]", dir.join("boot-efi").display()),
+            )
             // A second, so that "did not wait" has room on a busy machine.
             .replace("left=50", "left=10");
         let script = format!("serve() {{ echo serve \"$@\"; {server}; }}\n{script}");
@@ -1625,34 +1624,40 @@ fn the_fat_lines_of_fstab_are_mounted_with_a_server_each() {
         assert!(!dir.join(name).exists(), "{name} was not this script's");
     }
 
-    // A server that does not make the mount: the kernel's FAT mounts the
-    // volume, with the line's own type and options, and it is said.
+    // A server that does not make the mount: said, and the volume left.
     let (out, err, code) = run(boot, "", "false", &fstab, &mounts);
     assert_eq!(
         out,
-        format!(
-            "serve /dev/null {efi}\nmount -t vfat -o defaults,noatime /dev/null {efi}\n\
-             serve /dev/null {old}\nmount -t MSDOS -o defaults /dev/null {old}\n\
-             serve -r /dev/null {read}\nmount -t vfat -o noatime,ro /dev/null {read}\n"
-        ),
+        format!("serve /dev/null {efi}\nserve /dev/null {old}\nserve -r /dev/null {read}\n"),
         "stderr: {err}"
     );
     assert_eq!(code, Some(0));
-    assert_eq!(
-        err.matches("the kernel's FAT mounts it").count(),
-        3,
-        "{err}"
-    );
+    assert_eq!(err.matches("no server mounted").count(), 3, "{err}");
 
-    // `ufat=kernel`: the kernel mounted them itself, and nothing is done.
-    for cmdline in ["LOG=warn:ufat=kernel:ROOT=/dev/sda2\n", "ufat=kernel\n"] {
-        let (out, err, code) = run(cmdline, "", "true", &fstab, &mounts);
-        assert_eq!((out.as_str(), err.as_str(), code), ("", "", Some(0)));
+    // The placeholder of an image nobody installed, at /boot/efi: the
+    // first partition of the disk ROOT= names, in either way of naming it.
+    let boot_efi = at("boot-efi");
+    let placeholder = format!("__ECLIPSE_EFI_DEV___  {boot_efi}  vfat defaults 0 0\n");
+    for (root, first) in [("disk2", "disk1"), ("nvme0n1p2", "nvme0n1p1")] {
+        fs::write(dir.join(first), b"").unwrap();
+        let cmdline = format!("LOG=warn:ROOT={}\n", at(root));
+        let (out, err, code) = run(&cmdline, "", "true", &placeholder, &mounts);
+        assert_eq!(
+            out,
+            format!("serve {} {boot_efi}\n", at(first)),
+            "stderr: {err}"
+        );
+        assert_eq!((err.as_str(), code), ("", Some(0)));
+        fs::remove_dir(&boot_efi).unwrap();
     }
-    // Not that word: served.
-    for cmdline in ["LOG=warn:ufat=kernels\n", "LOG=warn:notufat=kernel\n"] {
-        let (out, _, _) = run(cmdline, "", "true", &fstab, &mounts);
-        assert_eq!(out.lines().count(), 3, "{cmdline:?}");
+    // With no ROOT= to go by, or one still a placeholder, it is left.
+    for cmdline in ["LOG=warn\n", "ROOT=/dev/__ECLIPSE_CMDROOTDEV\n"] {
+        let (out, err, code) = run(cmdline, "", "true", &placeholder, &mounts);
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("", "", Some(0)),
+            "{cmdline:?}"
+        );
     }
 
     // A device that is not there is waited for only when a userspace
@@ -1871,6 +1876,8 @@ fn the_two_sessions_never_start_each_others_clients() {
         "uahci2",
         "ublk-mounts",
         "fat-mounts",
+        // The mount helper, for whoever calls mount(2).
+        "mountd",
         // An input device's driver: what it serves is for whichever
         // session runs, or none.
         "uinput",
