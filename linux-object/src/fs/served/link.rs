@@ -116,6 +116,8 @@ pub(super) enum Fail {
     /// The server's answer: its `errno`, or a request that could not be
     /// made at all.
     Said(FsError),
+    /// The server's answer, as the `errno` it said (positive).
+    Errno(i32),
     /// The server is gone, and nothing says whether it did what was asked.
     Gone,
 }
@@ -124,6 +126,7 @@ impl From<Fail> for FsError {
     fn from(fail: Fail) -> Self {
         match fail {
             Fail::Said(e) => e,
+            Fail::Errno(n) => wire::error_of(-(n as i64)),
             Fail::Gone => FsError::DeviceError,
         }
     }
@@ -413,7 +416,9 @@ impl Link {
         let status = self.status[slot].load(Ordering::Relaxed);
         if status < 0 {
             give_back(self);
-            return Err(Fail::Said(wire::error_of(status)));
+            return Err(Fail::Errno(
+                status.saturating_neg().min(i32::MAX as i64) as i32
+            ));
         }
         Ok(Answer {
             link: self.clone(),

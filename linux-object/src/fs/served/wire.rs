@@ -67,6 +67,68 @@ pub const OP_SETATTR: u32 = 11;
 /// asked, which no listing has.
 pub const OP_STAT: u32 = 12;
 
+/// Only on a [`SERVE_EXTRAS`](super::SERVE_EXTRAS) mount: `ioctl(2)` on
+/// the file at the path. The names: that path, then for each open file
+/// the argument names a NUL, one byte of [`NAMED_BASE`] and its `NAMED_*`
+/// bits, and its path (none when it is on another filesystem); the
+/// argument has each descriptor in it replaced by the number of its name
+/// among those, from 0, or by -1 for one that is no open file. The data
+/// area: [`IOCTL_HEAD`] bytes (`cmd`, `euid`, `FACT_*` bits, and the bytes
+/// of the argument, u32 each), then the argument. The reply: `status` is
+/// what the ioctl returns, the argument as it goes back is in the data
+/// area (`b` bytes), and `a` has the `CHANGED_*` bits of what the kernel
+/// keeps that it made untrue.
+pub const OP_IOCTL: u32 = 13;
+/// Only on a [`SERVE_EXTRAS`](super::SERVE_EXTRAS) mount: an extended
+/// attribute of the file at the path. The names: the path, a NUL, the
+/// attribute's name (none to list them). `a`: an `XATTR_*` request, the
+/// `setxattr` flags shifted by 8, `FACT_*` bits shifted by 16 and the
+/// caller's `euid` shifted by 32; `b`: the bytes of the value to set, in
+/// the data area. The reply: in
+/// the data area the value, or the names each with a NUL after it, and
+/// `status` of their bytes.
+pub const OP_XATTR: u32 = 14;
+/// Only on a [`SERVE_EXTRAS`](super::SERVE_EXTRAS) mount: `fallocate(2)`
+/// of the file at the path from byte `a`, mode `b`, the length a u64 in
+/// the data area.
+pub const OP_FALLOCATE: u32 = 15;
+/// Only on a [`SERVE_EXTRAS`](super::SERVE_EXTRAS) mount: `lseek(2)` of
+/// the file at the path to `SEEK_DATA` or `SEEK_HOLE` (`b`) from `a` (an
+/// `i64`). The reply: `status` is the new position.
+pub const OP_SEEK: u32 = 16;
+
+/// [`OP_IOCTL`]'s fixed part of its data area.
+pub const IOCTL_HEAD: usize = 16;
+/// What the caller has and the file it asks about is (`FACT_*` bits):
+/// `CAP_FOWNER`, `CAP_LINUX_IMMUTABLE` and `CAP_SYS_ADMIN`; the file open
+/// for reading, for writing, for appending; and on a read-only mount.
+pub const FACT_FOWNER: u32 = 1 << 0;
+pub const FACT_IMMUTABLE: u32 = 1 << 1;
+pub const FACT_ADMIN: u32 = 1 << 2;
+pub const FACT_READABLE: u32 = 1 << 3;
+pub const FACT_WRITABLE: u32 = 1 << 4;
+pub const FACT_APPEND: u32 = 1 << 5;
+pub const FACT_READ_ONLY: u32 = 1 << 6;
+/// The byte before an open file's path among [`OP_IOCTL`]'s names, with
+/// its bits: open for reading, writing, appending; on another filesystem.
+pub const NAMED_BASE: u8 = 0x40;
+pub const NAMED_READABLE: u8 = 1 << 0;
+pub const NAMED_WRITABLE: u8 = 1 << 1;
+pub const NAMED_APPEND: u8 = 1 << 2;
+pub const NAMED_ELSEWHERE: u8 = 1 << 3;
+/// [`OP_IOCTL`]'s reply: the file's bytes or size changed; the entries of
+/// the directory it is; every directory's names may read otherwise; the
+/// bytes of a file the argument named changed.
+pub const CHANGED_BYTES: u64 = 1 << 0;
+pub const CHANGED_DIR: u64 = 1 << 1;
+pub const CHANGED_ALL_DIRS: u64 = 1 << 2;
+pub const CHANGED_NAMED: u64 = 1 << 3;
+/// [`OP_XATTR`]'s requests.
+pub const XATTR_GET: u64 = 0;
+pub const XATTR_SET: u64 = 1;
+pub const XATTR_LIST: u64 = 2;
+pub const XATTR_REMOVE: u64 = 3;
+
 /// [`OP_LIST`]'s `a` in a reply that holds the directory's last entries.
 pub const LIST_END: u64 = u64::MAX;
 /// The bytes of an [`OP_STATFS`] reply.

@@ -556,3 +556,94 @@ fn profile_scattered() {
     }
     eprintln!("read back: {:?}, reads {}", t.elapsed(), v.device_reads());
 }
+
+/// An ioctl's data area as the kernel fills it: the head, then the
+/// argument.
+fn ioctl_data(cmd: u32, euid: u32, facts: u32, arg: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for word in [cmd, euid, facts, arg.len() as u32] {
+        data.extend_from_slice(&word.to_le_bytes());
+    }
+    data.extend_from_slice(arg);
+    data
+}
+
+#[test]
+fn a_served_eclipsefs_answers_its_ioctls_and_attributes_and_a_takeover_keeps_them() {
+    use eclipsefs::ioctl::{
+        BTRFS_IOC_SUBVOL_CREATE, FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, SEEK_DATA,
+    };
+    use fatserve::wire::{
+        CHANGED_BYTES, CHANGED_DIR, FACT_ADMIN, FACT_FOWNER, FACT_READABLE, FACT_WRITABLE,
+        NAMED_BASE, NAMED_READABLE, XATTR_GET, XATTR_LIST, XATTR_SET,
+    };
+    const NOCOW: u32 = 0x0080_0000;
+    let (platter, mut held) = (EclipseFS::platter(), Held::new());
+    let src = bytes(64 * 1024, 3);
+    let facts = FACT_READABLE | FACT_WRITABLE | FACT_ADMIN | FACT_FOWNER;
+    let mut out = vec![0u8; 64 * 1024];
+    {
+        let mut v = open::<EclipseFS>(&platter, &mut held);
+        v.create("d", 0o040755, &mut out).unwrap();
+        v.create("d/src", 0o100644, &mut out).unwrap();
+        v.write("d/src", 0, &src).unwrap();
+        v.create("d/dst", 0o100644, &mut out).unwrap();
+        v.create("d/flagged", 0o100644, &mut out).unwrap();
+        // A reflink, its source named by its path.
+        let names = format!("d/dst\0{}d/src", (NAMED_BASE | NAMED_READABLE) as char);
+        let data = ioctl_data(FICLONE, 0, facts, &0i32.to_le_bytes());
+        let (ret, changed, _) = v.ioctl(&names, &data, &mut out).unwrap();
+        assert_eq!(ret, 0);
+        assert_ne!(changed & CHANGED_BYTES, 0, "the kernel is told to reload");
+        // A flag, an attribute, a preallocation, a subvolume.
+        let data = ioctl_data(FS_IOC_SETFLAGS, 0, facts, &NOCOW.to_le_bytes());
+        v.ioctl("d/flagged", &data, &mut out).unwrap();
+        let a = XATTR_SET | (facts as u64) << 16;
+        assert_eq!(v.xattr("d/src\0user.color", a, b"blue", &mut out), Ok(0));
+        v.fallocate("d/dst", 64 * 1024, 0, &4096u64.to_le_bytes())
+            .unwrap();
+        let mut arg = vec![0u8; 4096];
+        arg[8..11].copy_from_slice(b"sub");
+        let data = ioctl_data(BTRFS_IOC_SUBVOL_CREATE, 0, facts, &arg);
+        let (_, changed, _) = v.ioctl("d", &data, &mut out).unwrap();
+        assert_ne!(changed & CHANGED_DIR, 0, "the kernel is told to list again");
+        assert!(listing(&mut v, "d").iter().any(|e| e.0 == "sub"));
+        assert!(v.log.records() > 0 && v.log.records() < CHECKPOINT_EVERY);
+        // Dies.
+    }
+    let mut v = open::<EclipseFS>(&platter, &mut held);
+    let mut want = src.clone();
+    want.extend_from_slice(&[0; 4096]);
+    assert_eq!(read_all(&mut v, "d/dst", 100_000), want);
+    assert_eq!(
+        v.xattr("d/src\0user.color", XATTR_GET, &[], &mut out),
+        Ok(4)
+    );
+    assert_eq!(&out[..4], b"blue");
+    assert_eq!(v.xattr("d/src\0", XATTR_LIST, &[], &mut out), Ok(11));
+    assert_eq!(&out[..11], b"user.color\0");
+    let data = ioctl_data(FS_IOC_GETFLAGS, 0, facts, &[0; 4]);
+    let (_, _, used) = v.ioctl("d/flagged", &data, &mut out).unwrap();
+    assert_eq!(used, 4);
+    assert_ne!(u32::from_le_bytes(out[..4].try_into().unwrap()) & NOCOW, 0);
+    assert!(listing(&mut v, "d").iter().any(|e| e.0 == "sub"));
+    assert_eq!(v.seek("d/src", 0, SEEK_DATA as u32), Ok(0));
+    // An attribute that is not there, and a file of another filesystem.
+    assert_eq!(
+        v.xattr("d/src\0user.none", XATTR_GET, &[], &mut out),
+        Err(libc::ENODATA)
+    );
+    let names = format!("d/dst\0{}", (NAMED_BASE | NAMED_READABLE | 8) as char);
+    let data = ioctl_data(FICLONE, 0, facts, &0i32.to_le_bytes());
+    assert_eq!(v.ioctl(&names, &data, &mut out), Err(libc::EXDEV));
+}
+
+#[test]
+fn a_served_btrfs_answers_no_ioctl_and_keeps_no_attribute() {
+    let (platter, mut held) = (Btrfs::platter(), Held::new());
+    let mut v = open::<Btrfs>(&platter, &mut held);
+    let mut out = vec![0u8; 4096];
+    let data = ioctl_data(eclipsefs::ioctl::FS_IOC_GETFLAGS, 0, 0, &[0; 4]);
+    assert_eq!(v.ioctl("", &data, &mut out), Err(libc::ENOTTY));
+    assert_eq!(v.xattr("\0user.a", 0, &[], &mut out), Err(libc::EOPNOTSUPP));
+}

@@ -33,7 +33,9 @@
 //! anything outside its mount ([`wire::records`]), and it sees no kernel
 //! memory: only the window it gave.
 
+mod extras;
 mod link;
+pub(crate) use extras::{copy_reflink, fallocate, ioctl, seek, xattr};
 pub(crate) use link::between_looks;
 #[cfg(test)]
 mod tests;
@@ -83,6 +85,12 @@ pub const SERVE_TAKE_OVER: usize = 4;
 /// Without it every file is a plain file or a directory of root's, as on
 /// FAT, and that is all the server is asked to keep.
 pub const SERVE_POSIX: usize = 8;
+/// `eclipse_fs_serve` flag: the server answers ioctls, extended
+/// attributes, `fallocate` and `lseek(SEEK_DATA/SEEK_HOLE)` too
+/// ([`wire::OP_IOCTL`] and after): an EclipseFS's (`eclipsefs::ioctl`).
+/// Without it those are the kernel's, as for a file of no filesystem that
+/// has them.
+pub const SERVE_EXTRAS: usize = 16;
 
 /// How long a mount whose server died waits for the next one before its
 /// requests fail. The same as a served disk's wait for its next driver,
@@ -279,6 +287,8 @@ pub struct ServedFs {
     mounted: AtomicBool,
     /// [`SERVE_POSIX`].
     posix: bool,
+    /// [`SERVE_EXTRAS`].
+    extras: bool,
     /// The top's own owner and mode were asked for ([`OP_STAT`]): a listing
     /// only has what is below it.
     root_asked: AtomicBool,
@@ -346,6 +356,7 @@ impl ServedFs {
             info_stale: AtomicBool::new(false),
             mounted: AtomicBool::new(false),
             posix: flags & SERVE_POSIX != 0,
+            extras: flags & SERVE_EXTRAS != 0,
             root_asked: AtomicBool::new(false),
         })
     }
@@ -429,13 +440,26 @@ impl ServedFs {
     /// request it is made again with the next one, and the answer says so:
     /// the dead server may have done what was asked before it died.
     fn ask(&self, op: u32, names: &[u8], a: u64, b: u32, data: &[u8]) -> (Result<Answer>, bool) {
+        let (answer, again) = self.ask_errno(op, names, a, b, data);
+        (answer.map_err(FsError::from), again)
+    }
+
+    /// [`ask`](Self::ask), with the server's `errno` as it said it.
+    fn ask_errno(
+        &self,
+        op: u32,
+        names: &[u8],
+        a: u64,
+        b: u32,
+        data: &[u8],
+    ) -> (core::result::Result<Answer, Fail>, bool) {
         let mut link = self.link();
         let mut again = false;
         loop {
             match link.call_with(op, names, a, b, data) {
                 Ok(answer) => return (Ok(answer), again),
-                Err(Fail::Said(e)) => return (Err(e), again),
                 Err(Fail::Gone) => {}
+                Err(e) => return (Err(e), again),
             }
             let mut away = SyncWait::new();
             link = loop {
@@ -444,7 +468,7 @@ impl ServedFs {
                     break now;
                 }
                 if !self.mounted.load(Ordering::Acquire) || self.deserted(&link) {
-                    return (Err(FsError::DeviceError), again);
+                    return (Err(Fail::Said(FsError::DeviceError)), again);
                 }
                 link::between_looks(&mut away);
             };
@@ -1309,7 +1333,8 @@ pub fn serve(
         return Err(LxError::EPERM);
     }
     let shown = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
-    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY | SERVE_TAKE_OVER | SERVE_POSIX) != 0
+    if flags & !(SERVE_FOLD_CASE | SERVE_READ_ONLY | SERVE_TAKE_OVER | SERVE_POSIX | SERVE_EXTRAS)
+        != 0
         || !target.starts_with('/')
         || !shown(source)
         || !shown(fstype)

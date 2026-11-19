@@ -63,6 +63,51 @@ pub const OP_SETATTR: u32 = 11;
 /// On a [`SERVE_POSIX`] mount: the record of the file at the path itself.
 pub const OP_STAT: u32 = 12;
 
+/// With [`SERVE_EXTRAS`]: `ioctl(2)` on the file at the path. The names:
+/// the path, then for each open file the argument names a NUL, a byte of
+/// [`NAMED_BASE`] and `NAMED_*` bits, and its path (none when it is on
+/// another filesystem); each descriptor in the argument is the number of
+/// its name among those, or -1. The data area: `cmd`, `euid`, `FACT_*`
+/// bits and the bytes of the argument (u32 each, [`IOCTL_HEAD`]), then the
+/// argument. The reply: what the ioctl returns, the argument as it goes
+/// back (`b` bytes of the data area), and in `a` the `CHANGED_*` bits.
+pub const OP_IOCTL: u32 = 13;
+/// With [`SERVE_EXTRAS`]: an extended attribute of the file. The names:
+/// the path, a NUL and the attribute's name. `a`: an `XATTR_*` request,
+/// the `setxattr` flags shifted by 8, `FACT_*` bits shifted by 16 and the
+/// `euid` shifted by 32; `b`: the bytes of the value to set, in the data
+/// area. The reply: the value or
+/// the names in the data area, and their bytes.
+pub const OP_XATTR: u32 = 14;
+/// With [`SERVE_EXTRAS`]: `fallocate(2)` from byte `a` with mode `b`, the
+/// length a u64 in the data area.
+pub const OP_FALLOCATE: u32 = 15;
+/// With [`SERVE_EXTRAS`]: `lseek(2)` to `SEEK_DATA` or `SEEK_HOLE` (`b`)
+/// from `a`. The reply: the new position.
+pub const OP_SEEK: u32 = 16;
+
+pub const IOCTL_HEAD: usize = 16;
+pub const FACT_FOWNER: u32 = 1 << 0;
+pub const FACT_IMMUTABLE: u32 = 1 << 1;
+pub const FACT_ADMIN: u32 = 1 << 2;
+pub const FACT_READABLE: u32 = 1 << 3;
+pub const FACT_WRITABLE: u32 = 1 << 4;
+pub const FACT_APPEND: u32 = 1 << 5;
+pub const FACT_READ_ONLY: u32 = 1 << 6;
+pub const NAMED_BASE: u8 = 0x40;
+pub const NAMED_READABLE: u8 = 1 << 0;
+pub const NAMED_WRITABLE: u8 = 1 << 1;
+pub const NAMED_APPEND: u8 = 1 << 2;
+pub const NAMED_ELSEWHERE: u8 = 1 << 3;
+pub const CHANGED_BYTES: u64 = 1 << 0;
+pub const CHANGED_DIR: u64 = 1 << 1;
+pub const CHANGED_ALL_DIRS: u64 = 1 << 2;
+pub const CHANGED_NAMED: u64 = 1 << 3;
+pub const XATTR_GET: u64 = 0;
+pub const XATTR_SET: u64 = 1;
+pub const XATTR_LIST: u64 = 2;
+pub const XATTR_REMOVE: u64 = 3;
+
 /// [`OP_CREATE`]'s `a` for a directory: `S_IFDIR`.
 pub const CREATE_DIR: u64 = 0o040000;
 
@@ -90,6 +135,9 @@ pub const SERVE_TAKE_OVER: usize = 4;
 /// symbolic links, and its records say so: the longer records of the
 /// kernel's `wire::RECORD_HEAD_POSIX`, which a server of its own writes.
 pub const SERVE_POSIX: usize = 8;
+/// `eclipse_fs_serve` flag: the server answers [`OP_IOCTL`],
+/// [`OP_XATTR`], [`OP_FALLOCATE`] and [`OP_SEEK`] too.
+pub const SERVE_EXTRAS: usize = 16;
 
 /// One entry of a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]

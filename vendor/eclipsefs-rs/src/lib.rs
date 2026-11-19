@@ -40,6 +40,7 @@ pub mod device;
 pub mod extent;
 pub mod format;
 pub mod fs;
+pub mod ioctl;
 pub mod journal;
 pub mod mkfs;
 pub mod raid56;

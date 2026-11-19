@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use eclipsefs::ioctl::{XattrReply, XattrRequest};
 use fatserve::disk::Blocks;
 
 use crate::dev::Dev;
@@ -56,6 +57,18 @@ pub struct Numbers {
     pub bytes_used: u64,
 }
 
+/// Who asks for an ioctl, and the open files its argument names: as the
+/// kernel says ([`fatserve::wire::OP_IOCTL`]).
+pub struct Ask {
+    pub euid: u32,
+    /// `FACT_*` bits.
+    pub facts: u32,
+    /// Each open file the argument names, by the number the argument has
+    /// for it: its inode (none when it is on another filesystem) and
+    /// `NAMED_*` bits, or why its path is no file.
+    pub named: Vec<Result<(Option<u64>, u8), Errno>>,
+}
+
 /// A filesystem the volume serves, with the calls it uses.
 pub trait Tree: Sized {
     /// Its name in `/proc/mounts`.
@@ -98,6 +111,40 @@ pub trait Tree: Sized {
         mtime: Option<i64>,
     ) -> Result<(), Errno>;
     fn numbers(&self) -> Numbers;
+
+    /// Whether it answers ioctls, extended attributes, `fallocate` and
+    /// `lseek(SEEK_DATA/SEEK_HOLE)` ([`fatserve::wire::SERVE_EXTRAS`]).
+    const EXTRAS: bool = false;
+    /// Ioctl `cmd` on `ino`, its argument in `buf`, which gets what goes
+    /// back: what it returns, and the `CHANGED_*` bits of what the kernel
+    /// keeps that it made untrue.
+    fn ioctl(
+        &mut self,
+        _ino: u64,
+        _cmd: u32,
+        _buf: &mut [u8],
+        _ask: &Ask,
+    ) -> Result<(usize, u64), Errno> {
+        Err(libc::ENOTTY)
+    }
+    /// An extended attribute of `ino`.
+    fn xattr(
+        &mut self,
+        _ino: u64,
+        _req: XattrRequest<'_>,
+        _read_only: bool,
+        _euid: u32,
+        _admin: bool,
+    ) -> Result<XattrReply, Errno> {
+        Err(libc::EOPNOTSUPP)
+    }
+    fn fallocate(&mut self, _ino: u64, _mode: u32, _offset: u64, _len: u64) -> Result<(), Errno> {
+        Err(libc::EOPNOTSUPP)
+    }
+    /// `lseek(SEEK_DATA)` (3) or `lseek(SEEK_HOLE)` (4) from `offset`.
+    fn seek(&mut self, _ino: u64, _whence: usize, _offset: i64) -> Result<u64, Errno> {
+        Err(libc::EOPNOTSUPP)
+    }
 }
 
 fn wall_clock() -> (u64, u32) {
@@ -273,7 +320,97 @@ mod btrfs_tree {
 
 mod eclipsefs_tree {
     use super::*;
+    use eclipsefs::ioctl::{
+        self as shared, Caller, Open, CAP_FOWNER, CAP_LINUX_IMMUTABLE, CAP_SYS_ADMIN,
+    };
     use eclipsefs::EclipseFS;
+    use fatserve::wire::{
+        CHANGED_ALL_DIRS, CHANGED_BYTES, CHANGED_DIR, CHANGED_NAMED, FACT_ADMIN, FACT_APPEND,
+        FACT_FOWNER, FACT_IMMUTABLE, FACT_READABLE, FACT_READ_ONLY, FACT_WRITABLE, NAMED_APPEND,
+        NAMED_READABLE, NAMED_WRITABLE,
+    };
+    use std::cell::{Cell, RefCell};
+
+    /// An ioctl's [`Caller`] here: what the kernel said of it, and what
+    /// it changed of what the kernel keeps.
+    struct Asked<'a> {
+        fs: RefCell<&'a mut EclipseFS>,
+        ino: u64,
+        ask: &'a Ask,
+        changed: Cell<u64>,
+    }
+
+    impl Asked<'_> {
+        fn mark(&self, bit: u64) {
+            self.changed.set(self.changed.get() | bit);
+        }
+    }
+
+    impl Caller for Asked<'_> {
+        fn with<R>(&self, f: impl FnOnce(&mut EclipseFS) -> R) -> R {
+            f(&mut self.fs.borrow_mut())
+        }
+
+        fn capable(&self, cap: u32) -> bool {
+            let bit = match cap {
+                CAP_FOWNER => FACT_FOWNER,
+                CAP_LINUX_IMMUTABLE => FACT_IMMUTABLE,
+                CAP_SYS_ADMIN => FACT_ADMIN,
+                _ => return false,
+            };
+            self.ask.facts & bit != 0
+        }
+
+        fn euid(&self) -> u32 {
+            self.ask.euid
+        }
+
+        fn read_only(&self) -> bool {
+            self.ask.facts & FACT_READ_ONLY != 0
+        }
+
+        fn this(&self) -> Open {
+            let f = self.ask.facts;
+            Open {
+                ino: Some(self.ino),
+                readable: f & FACT_READABLE != 0,
+                writable: f & FACT_WRITABLE != 0,
+                append: f & FACT_APPEND != 0,
+            }
+        }
+
+        fn file(&self, fd: i32) -> Result<Open, Errno> {
+            let named = usize::try_from(fd)
+                .ok()
+                .and_then(|i| self.ask.named.get(i))
+                .ok_or(libc::EBADF)?;
+            let (ino, bits) = (*named)?;
+            Ok(Open {
+                ino,
+                readable: bits & NAMED_READABLE != 0,
+                writable: bits & NAMED_WRITABLE != 0,
+                append: bits & NAMED_APPEND != 0,
+            })
+        }
+
+        fn reload(&self, ino: u64, _off: u64, len: u64) {
+            if len > 0 {
+                self.mark(if ino == self.ino {
+                    CHANGED_BYTES
+                } else {
+                    CHANGED_NAMED
+                });
+            }
+        }
+
+        fn dir_changed(&self, _ino: u64) {
+            self.mark(CHANGED_DIR);
+        }
+
+        fn all_dirs_changed(&self) {
+            self.mark(CHANGED_ALL_DIRS);
+        }
+    }
 
     fn errno(e: eclipsefs::Error) -> Errno {
         use eclipsefs::Error as E;
@@ -341,5 +478,43 @@ mod eclipsefs_tree {
         }
 
         common!(eclipsefs);
+
+        const EXTRAS: bool = true;
+
+        fn ioctl(
+            &mut self,
+            ino: u64,
+            cmd: u32,
+            buf: &mut [u8],
+            ask: &Ask,
+        ) -> Result<(usize, u64), Errno> {
+            let asked = Asked {
+                fs: RefCell::new(self),
+                ino,
+                ask,
+                changed: Cell::new(0),
+            };
+            let ret = shared::ioctl(&asked, ino, cmd, buf)?;
+            Ok((ret, asked.changed.get()))
+        }
+
+        fn xattr(
+            &mut self,
+            ino: u64,
+            req: XattrRequest<'_>,
+            read_only: bool,
+            euid: u32,
+            admin: bool,
+        ) -> Result<XattrReply, Errno> {
+            shared::xattr(self, ino, req, read_only, euid, admin)
+        }
+
+        fn fallocate(&mut self, ino: u64, mode: u32, offset: u64, len: u64) -> Result<(), Errno> {
+            EclipseFS::fallocate(self, ino, mode, offset, len).map_err(errno)
+        }
+
+        fn seek(&mut self, ino: u64, whence: usize, offset: i64) -> Result<u64, Errno> {
+            shared::seek(self, ino, whence, offset)
+        }
     }
 }
