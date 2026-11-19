@@ -14,6 +14,8 @@ fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32)> {
     fences.first().copied()
 }
 use crate::nvme::nvme_queue::test_clock;
+
+mod kept_fence;
 use core::cell::RefCell;
 
 /// Every test here drives the one global [`TABLE`] and the two global
