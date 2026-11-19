@@ -34,6 +34,8 @@ rcore-fs-ramfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b"
 rcore-fs-mountfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 btrfs = { path = "../vendor/btrfs-rs" }
 eclipsefs = { path = "../vendor/eclipsefs-rs" }
+# The NFSv3 client below the VFS, shared with the NFS server process.
+nfs3 = { path = "../vendor/nfs3-rs" }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn", "log_level_warn"] }
 spin = "0.9"
 rcore-fs-devfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }

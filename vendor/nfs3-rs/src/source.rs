@@ -44,9 +44,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use zcore_drivers::wire::IpAddress;
+use core::net::IpAddr as IpAddress;
 
-use crate::error::LxError;
+use crate::errno::Errno;
 
 /// A parsed `host:/export` device string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,11 +68,11 @@ impl NfsSource {
     /// Returns `EINVAL` for anything that is not one, which is what Linux's
     /// `nfs_parse_devname` does: an empty host, an empty export, a string
     /// with no colon at all, or brackets that do not close.
-    pub fn parse(source: &str) -> Result<Self, LxError> {
+    pub fn parse(source: &str) -> Result<Self, Errno> {
         // An IPv6 literal is bracketed, and everything inside the brackets
         // is the host however many colons it holds.
         let (host, rest) = if let Some(after) = source.strip_prefix('[') {
-            let end = after.find(']').ok_or(LxError::EINVAL)?;
+            let end = after.find(']').ok_or(Errno::EINVAL)?;
             (&after[..end], &after[end + 1..])
         } else {
             // The first colon followed by a slash. See the module docs: the
@@ -83,17 +83,17 @@ impl NfsSource {
                 .as_bytes()
                 .windows(2)
                 .position(|w| w == b":/")
-                .ok_or(LxError::EINVAL)?;
+                .ok_or(Errno::EINVAL)?;
             (&source[..idx], &source[idx..])
         };
-        let export = rest.strip_prefix(':').ok_or(LxError::EINVAL)?;
+        let export = rest.strip_prefix(':').ok_or(Errno::EINVAL)?;
         if host.is_empty() || export.is_empty() {
-            return Err(LxError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         // Linux refuses a relative export path: the server names its exports
         // absolutely, and a relative one has nothing to be relative to.
         if !export.starts_with('/') {
-            return Err(LxError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         Ok(Self {
             host: host.to_string(),
@@ -211,7 +211,7 @@ impl NfsOptions {
     /// or `rsize=0` is a mistake in the line, and silently mounting with a
     /// default instead hides it until the mount behaves unlike what was
     /// asked for.
-    pub fn parse(data: &str) -> Result<Self, LxError> {
+    pub fn parse(data: &str) -> Result<Self, Errno> {
         let mut out = Self::default();
         for opt in data.split(',').filter(|s| !s.is_empty()) {
             let (key, value) = match opt.split_once('=') {
@@ -250,23 +250,23 @@ impl NfsOptions {
 /// them here. A name is refused: `addr=` means "do not resolve", so a name
 /// in it is a mistake in the line rather than something to look up, and
 /// looking it up anyway would make `addr=` mean nothing.
-fn parse_addr(value: Option<&str>) -> Result<IpAddress, LxError> {
-    let s = value.ok_or(LxError::EINVAL)?;
+fn parse_addr(value: Option<&str>) -> Result<IpAddress, Errno> {
+    let s = value.ok_or(Errno::EINVAL)?;
     let s = match s.strip_prefix('[') {
-        Some(rest) => rest.strip_suffix(']').ok_or(LxError::EINVAL)?,
+        Some(rest) => rest.strip_suffix(']').ok_or(Errno::EINVAL)?,
         None => s,
     };
-    crate::net::dns::parse_literal(s).ok_or(LxError::EINVAL)
+    s.parse::<IpAddress>().map_err(|_| Errno::EINVAL)
 }
 
 /// A port number option: 1 to 65535. Zero is refused — it is not a port, and
 /// `port=0` in Linux means "ask portmap", which is this client's default and
 /// is better asked for by leaving the option out than by a value that looks
 /// like a number.
-fn parse_port(value: Option<&str>) -> Result<u16, LxError> {
+fn parse_port(value: Option<&str>) -> Result<u16, Errno> {
     let v = parse_u64(value)?;
     if v == 0 || v > u64::from(u16::MAX) {
-        return Err(LxError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(v as u16)
 }
@@ -278,10 +278,10 @@ fn parse_port(value: Option<&str>) -> Result<u16, LxError> {
 /// [`MAX_TRANSFER_SIZE`]. Rounding *up* a value below 512 rather than
 /// refusing it is what Linux does with `rsize=100`, and the clamp is what
 /// keeps `rsize=1073741824` from being a kernel allocation of a gibibyte.
-fn parse_transfer_size(value: Option<&str>) -> Result<usize, LxError> {
+fn parse_transfer_size(value: Option<&str>) -> Result<usize, Errno> {
     let v = parse_u64(value)?;
     if v == 0 {
-        return Err(LxError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let v = v.min(MAX_TRANSFER_SIZE as u64) as usize;
     Ok(v.next_multiple_of(512).min(MAX_TRANSFER_SIZE))
@@ -289,12 +289,12 @@ fn parse_transfer_size(value: Option<&str>) -> Result<usize, LxError> {
 
 /// A decimal option value. A missing value, an empty one, or one with a
 /// non-digit in it is `EINVAL`.
-fn parse_u64(value: Option<&str>) -> Result<u64, LxError> {
-    let s = value.ok_or(LxError::EINVAL)?;
+fn parse_u64(value: Option<&str>) -> Result<u64, Errno> {
+    let s = value.ok_or(Errno::EINVAL)?;
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(LxError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    s.parse::<u64>().map_err(|_| LxError::EINVAL)
+    s.parse::<u64>().map_err(|_| Errno::EINVAL)
 }
 
 /// The hostname this client states in its `AUTH_UNIX` credential.

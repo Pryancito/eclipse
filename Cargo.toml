@@ -51,6 +51,9 @@ members = [
     # EclipseFS: the on-disk filesystem ported from eclipse-old's
     # `eclipsefs-lib`, with the same interface as `vendor/btrfs-rs`.
     "vendor/eclipsefs-rs",
+    # The NFSv3 client below the VFS: the kernel's NFS and the process that
+    # serves an NFS mount (`tools/eclipse-nfs`) share it.
+    "vendor/nfs3-rs",
     # The kernel heap's buddy allocator: crates.io 0.8.0 plus
     # `Heap::take_free_block`, so the heap can give grown memory back.
     "vendor/buddy_system_allocator",

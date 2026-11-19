@@ -119,7 +119,10 @@ pub(super) fn left_to_fat_server(
 /// network line spends none of it and the clock starts when the first
 /// server is actually dialled rather than when the file was opened.
 pub(super) fn run_budget(slot: &mut Option<Budget>) -> &Budget {
-    slot.get_or_insert_with(|| Budget::new(FSTAB_NETWORK_BUDGET_MS))
+    slot.get_or_insert_with(|| {
+        let now = kernel_hal::timer::timer_now().as_millis() as u64;
+        Budget::new(FSTAB_NETWORK_BUDGET_MS, now)
+    })
 }
 
 /// Whether `name` is one of the comma-separated options on an fstab line.

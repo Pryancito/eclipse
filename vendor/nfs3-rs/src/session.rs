@@ -51,7 +51,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::error::{LxError, LxResult};
+use crate::errno::{Errno, LxResult};
 
 use super::client::{CallError, RetryPolicy, RpcClient, RpcTransport, TransportError};
 use super::mount3::FileHandle;
@@ -123,79 +123,77 @@ pub const DIR_COUNT_GROWTH: usize = 4;
 /// informative and also breaks programs that treat anything but `EIO` from a
 /// read as fatal. Starting where Linux's default is means an `fstab` line
 /// copied from a Linux box behaves the same way.
-pub fn call_error_to_lx(e: CallError) -> LxError {
+pub fn call_error_to_lx(e: CallError) -> Errno {
     match e {
         CallError::Transport(t) => transport_error_to_lx(t),
         CallError::Rpc(r) => rpc_error_to_lx(r),
-        CallError::TimedOut => LxError::EIO,
+        CallError::TimedOut => Errno::EIO,
         // A reply cut off part-way through is not a short reply: there is no
         // answer, and the connection cannot be trusted for the next call
         // either.
-        CallError::TruncatedMessage => LxError::EIO,
+        CallError::TruncatedMessage => Errno::EIO,
     }
 }
 
 /// The errno for a transport failure.
-pub fn transport_error_to_lx(e: TransportError) -> LxError {
+pub fn transport_error_to_lx(e: TransportError) -> Errno {
     match e {
-        TransportError::NotConnected => LxError::ENOTCONN,
+        TransportError::NotConnected => Errno::ENOTCONN,
         // The peer closed or reset. `EPIPE` would be right for a write to a
         // socket; for a filesystem call it is `EIO`, because what failed was
         // the call and not a pipe the caller holds.
-        TransportError::Closed | TransportError::Reset => LxError::EIO,
-        TransportError::Other => LxError::EIO,
+        TransportError::Closed | TransportError::Reset => Errno::EIO,
+        TransportError::Other => Errno::EIO,
     }
 }
 
 /// The errno for a failure of the RPC envelope or its decoding.
-pub fn rpc_error_to_lx(e: RpcError) -> LxError {
+pub fn rpc_error_to_lx(e: RpcError) -> Errno {
     match e {
         RpcError::Xdr(x) => xdr_error_to_lx(x),
         // The stream is out of step, or the message was not a reply at all.
         // Either way the connection is unusable, and `EIO` is what the caller
         // can do something about.
-        RpcError::XidMismatch { .. } | RpcError::NotAReply(_) | RpcError::BadFraming => {
-            LxError::EIO
-        }
+        RpcError::XidMismatch { .. } | RpcError::NotAReply(_) | RpcError::BadFraming => Errno::EIO,
         RpcError::Rejected(r) => rejection_to_lx(r),
     }
 }
 
 /// The errno for a server that refused the envelope.
-fn rejection_to_lx(r: RpcRejection) -> LxError {
+fn rejection_to_lx(r: RpcRejection) -> Errno {
     match r {
         // The credential was refused. This is the one rejection that is about
         // *who asked* rather than about the protocol, and it is what a server
         // answers to a client whose uid it will not accept — so `EACCES`, the
         // same thing a local filesystem would say, and not a generic `EIO`
         // that hides a permissions problem behind an I/O error.
-        RpcRejection::AuthError(_) => LxError::EACCES,
+        RpcRejection::AuthError(_) => Errno::EACCES,
         // The program, version or procedure is not there. `EOPNOTSUPP` says
         // what happened: the server is answering, it just does not do this.
         RpcRejection::ProgramUnavailable
         | RpcRejection::ProgramMismatch { .. }
         | RpcRejection::ProcedureUnavailable
-        | RpcRejection::VersionMismatch { .. } => LxError::EOPNOTSUPP,
+        | RpcRejection::VersionMismatch { .. } => Errno::EOPNOTSUPP,
         // The server could not decode what this client sent. Always a bug on
         // this side, and `EIO` is the honest report of it.
-        RpcRejection::GarbageArgs => LxError::EIO,
-        RpcRejection::SystemError | RpcRejection::Unknown(_) => LxError::EIO,
+        RpcRejection::GarbageArgs => Errno::EIO,
+        RpcRejection::SystemError | RpcRejection::Unknown(_) => Errno::EIO,
     }
 }
 
 /// The errno for a malformed reply, or for arguments this client refused to
 /// encode.
-pub fn xdr_error_to_lx(e: XdrError) -> LxError {
+pub fn xdr_error_to_lx(e: XdrError) -> Errno {
     match e {
         // A name that is not one path component. The only one of these that
         // is about the *arguments* rather than about a reply, and the errno is
         // the one a local filesystem gives for the same name.
-        XdrError::NotOneComponent => LxError::EINVAL,
+        XdrError::NotOneComponent => Errno::EINVAL,
         // Everything else is a reply this client could not parse.
         XdrError::Truncated
         | XdrError::LengthTooLarge
         | XdrError::BadPadding
-        | XdrError::BadDiscriminant(_) => LxError::EIO,
+        | XdrError::BadDiscriminant(_) => Errno::EIO,
     }
 }
 
@@ -452,7 +450,7 @@ impl<T: RpcTransport> NfsSession<T> {
                 .checked_add(done as u64)
                 // A read past the end of the 64-bit offset space. Not an I/O
                 // failure: there is nothing there to read.
-                .ok_or(LxError::EINVAL)?;
+                .ok_or(Errno::EINVAL)?;
             let reply = self.read_once(fh, at, want)?;
             let n = reply.data.len().min(want);
             buf[done..done + n].copy_from_slice(&reply.data[..n]);
@@ -463,7 +461,7 @@ impl<T: RpcTransport> NfsSession<T> {
             if n == 0 {
                 // No bytes and not the end of the file. A correct server does
                 // not do this; one that does would spin this loop forever.
-                return Err(LxError::EIO);
+                return Err(Errno::EIO);
             }
         }
         Ok(done)
@@ -489,7 +487,7 @@ impl<T: RpcTransport> NfsSession<T> {
         // would compute next is wrong. Refusing is the only answer that does
         // not corrupt the file.
         if reply.count as usize > sent {
-            return Err(LxError::EIO);
+            return Err(Errno::EIO);
         }
         Ok(reply)
     }
@@ -518,13 +516,13 @@ impl<T: RpcTransport> NfsSession<T> {
         let mut weakest = StableHow::FileSync;
         let mut verf = [0u8; nfs3_write::VERF_SIZE];
         while done < data.len() {
-            let at = offset.checked_add(done as u64).ok_or(LxError::EFBIG)?;
+            let at = offset.checked_add(done as u64).ok_or(Errno::EFBIG)?;
             let reply = self.write_once(fh, at, &data[done..], stable)?;
             let n = reply.count as usize;
             if n == 0 {
                 // The server took nothing and did not fail. Another turn
                 // would send the same bytes to the same answer.
-                return Err(LxError::EIO);
+                return Err(Errno::EIO);
             }
             done += n;
             weakest = weakest_of(weakest, reply.committed);
@@ -723,7 +721,7 @@ impl<T: RpcTransport> NfsSession<T> {
         let mut restarted = false;
         loop {
             match self.readdir_pass(dir, plus) {
-                Err(LxError::EINVAL) if !restarted => {
+                Err(Errno::EINVAL) if !restarted => {
                     // `BAD_COOKIE` and `NOT_SYNC` both map to `EINVAL`, and
                     // only the first can happen here. Start over once.
                     restarted = true;
@@ -743,7 +741,7 @@ impl<T: RpcTransport> NfsSession<T> {
         loop {
             rounds += 1;
             if rounds > self.readdir_max_rounds {
-                return Err(LxError::EIO);
+                return Err(Errno::EIO);
             }
             let reply = self.readdir_chunk(dir, cookie, &verf, count, plus)?;
             // The verifier travels with the cookie taken from this reply.
@@ -753,7 +751,7 @@ impl<T: RpcTransport> NfsSession<T> {
                 // cannot grow any further the server will never fit an entry
                 // in a reply this client can ask for.
                 if count >= MAX_TRANSFER_SIZE {
-                    return Err(LxError::EIO);
+                    return Err(Errno::EIO);
                 }
                 count = count
                     .saturating_mul(DIR_COUNT_GROWTH)
@@ -761,7 +759,7 @@ impl<T: RpcTransport> NfsSession<T> {
                 continue;
             }
             if out.len().saturating_add(reply.list.entries.len()) > self.readdir_max_entries {
-                return Err(LxError::EIO);
+                return Err(Errno::EIO);
             }
             let next = reply.list.next_cookie();
             out.extend(reply.list.entries);
@@ -770,7 +768,7 @@ impl<T: RpcTransport> NfsSession<T> {
                 None => return Ok(out),
                 // A cookie this listing has already been given. The server is
                 // not advancing, and another round sends the same request.
-                Some(c) if c == cookie => return Err(LxError::EIO),
+                Some(c) if c == cookie => return Err(Errno::EIO),
                 Some(c) => cookie = c,
             }
         }
@@ -783,7 +781,7 @@ impl<T: RpcTransport> NfsSession<T> {
     /// even has one — would arrive after the call was made.
     fn check_writable(&self) -> LxResult<()> {
         if self.read_only {
-            return Err(LxError::EROFS);
+            return Err(Errno::EROFS);
         }
         Ok(())
     }

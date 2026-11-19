@@ -12,6 +12,9 @@
 //! measures two different servers: the copy that was not updated keeps
 //! passing tests about a protocol nobody speaks.
 
+// A harness, built by `new` and then told what to answer.
+#![allow(clippy::new_without_default)]
+
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -26,10 +29,10 @@ use super::xdr::{XdrDecoder, XdrEncoder};
 
 /// One call the session made, as the server saw it.
 #[derive(Debug, Clone)]
-pub(crate) struct Call {
-    pub(crate) xid: u32,
-    pub(crate) procedure: u32,
-    pub(crate) args: Vec<u8>,
+pub struct Call {
+    pub xid: u32,
+    pub procedure: u32,
+    pub args: Vec<u8>,
 }
 
 /// A server the test writes the answers for.
@@ -39,16 +42,16 @@ pub(crate) struct Call {
 /// times out, and fails — rather than being handed the previous answer again
 /// and looping on it.
 #[derive(Debug)]
-pub(crate) struct Server {
-    pub(crate) answers: VecDeque<Vec<u8>>,
-    pub(crate) calls: Vec<Call>,
-    pub(crate) pending: VecDeque<Vec<u8>>,
-    pub(crate) now: u64,
-    pub(crate) ms_per_poll: u64,
+pub struct Server {
+    pub answers: VecDeque<Vec<u8>>,
+    pub calls: Vec<Call>,
+    pub pending: VecDeque<Vec<u8>>,
+    pub now: u64,
+    pub ms_per_poll: u64,
     /// How many of the next calls get no answer at all.
-    pub(crate) silent: usize,
+    pub silent: usize,
     /// Whether the next call is answered with `MSG_DENIED`/`AUTH_ERROR`.
-    pub(crate) deny_next: bool,
+    pub deny_next: bool,
 }
 
 /// The most calls this server will take before refusing.
@@ -56,10 +59,10 @@ pub(crate) struct Server {
 /// A bound and not a behaviour, for the reason the RPC client's fake has one:
 /// an unbounded loop would otherwise grow [`Server::calls`] until the test
 /// process is killed for its memory, and a killed process names no test.
-pub(crate) const MAX_CALLS: usize = 100_000;
+pub const MAX_CALLS: usize = 100_000;
 
 impl Server {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             answers: VecDeque::new(),
             calls: Vec::new(),
@@ -74,13 +77,13 @@ impl Server {
     }
 
     /// Queue one procedure result, to be wrapped in a successful RPC reply.
-    pub(crate) fn answer(&mut self, results: Vec<u8>) -> &mut Self {
+    pub fn answer(&mut self, results: Vec<u8>) -> &mut Self {
         self.answers.push_back(results);
         self
     }
 
     /// Queue `n` copies of one answer.
-    pub(crate) fn answer_times(&mut self, n: usize, results: Vec<u8>) -> &mut Self {
+    pub fn answer_times(&mut self, n: usize, results: Vec<u8>) -> &mut Self {
         for _ in 0..n {
             self.answers.push_back(results.clone());
         }
@@ -153,7 +156,7 @@ impl RpcTransport for Server {
 }
 
 /// A reply refusing `xid`'s credential: `MSG_DENIED` with `AUTH_BADCRED`.
-pub(crate) fn denied_reply(xid: u32) -> Vec<u8> {
+pub fn denied_reply(xid: u32) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(xid);
     enc.u32(MSG_TYPE_REPLY);
@@ -164,7 +167,7 @@ pub(crate) fn denied_reply(xid: u32) -> Vec<u8> {
 }
 
 /// An accepted, successful RPC reply to `xid` carrying `results`.
-pub(crate) fn reply(xid: u32, results: &[u8]) -> Vec<u8> {
+pub fn reply(xid: u32, results: &[u8]) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(xid);
     enc.u32(MSG_TYPE_REPLY);
@@ -179,13 +182,13 @@ pub(crate) fn reply(xid: u32, results: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- fixtures
 
-pub(crate) fn a_handle() -> FileHandle {
+pub fn a_handle() -> FileHandle {
     FileHandle::new(&[1, 2, 3, 4]).unwrap()
 }
 
 /// Options with short timeouts: a test that means to reach a timeout should
 /// reach it in a few thousand polls, not a few million.
-pub(crate) fn quick_options() -> NfsOptions {
+pub fn quick_options() -> NfsOptions {
     NfsOptions {
         timeout_ms: 500,
         retrans: 0,
@@ -195,7 +198,7 @@ pub(crate) fn quick_options() -> NfsOptions {
     }
 }
 
-pub(crate) fn session(server: Server) -> NfsSession<Server> {
+pub fn session(server: Server) -> NfsSession<Server> {
     let mut s = NfsSession::new(server, 1, a_handle(), &quick_options());
     // No pause between jukebox retries: the pause is tested on its own, and
     // every other test would otherwise spend it.
@@ -203,13 +206,13 @@ pub(crate) fn session(server: Server) -> NfsSession<Server> {
     s
 }
 
-pub(crate) fn put_time(enc: &mut XdrEncoder, sec: u32, nsec: u32) {
+pub fn put_time(enc: &mut XdrEncoder, sec: u32, nsec: u32) {
     enc.u32(sec);
     enc.u32(nsec);
 }
 
 /// A `fattr3` of `size` bytes, as a file.
-pub(crate) fn put_fattr3(enc: &mut XdrEncoder, ftype: Ftype3, size: u64, fileid: u64) {
+pub fn put_fattr3(enc: &mut XdrEncoder, ftype: Ftype3, size: u64, fileid: u64) {
     enc.u32(match ftype {
         Ftype3::Reg => 1,
         Ftype3::Dir => 2,
@@ -235,24 +238,24 @@ pub(crate) fn put_fattr3(enc: &mut XdrEncoder, ftype: Ftype3, size: u64, fileid:
 }
 
 /// A `post_op_attr` that is present.
-pub(crate) fn put_post_op(enc: &mut XdrEncoder, size: u64) {
+pub fn put_post_op(enc: &mut XdrEncoder, size: u64) {
     enc.u32(1);
     put_fattr3(enc, Ftype3::Reg, size, 42);
 }
 
 /// A `post_op_attr` the server declined to send.
-pub(crate) fn put_no_post_op(enc: &mut XdrEncoder) {
+pub fn put_no_post_op(enc: &mut XdrEncoder) {
     enc.u32(0);
 }
 
 /// A `wcc_data` with neither half present, which is the legal short form.
-pub(crate) fn put_empty_wcc(enc: &mut XdrEncoder) {
+pub fn put_empty_wcc(enc: &mut XdrEncoder) {
     enc.u32(0);
     enc.u32(0);
 }
 
 /// `GETATTR` answering `size`.
-pub(crate) fn getattr_ok(size: u64) -> Vec<u8> {
+pub fn getattr_ok(size: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_fattr3(&mut enc, Ftype3::Reg, size, 42);
@@ -260,7 +263,7 @@ pub(crate) fn getattr_ok(size: u64) -> Vec<u8> {
 }
 
 /// A failure carrying only a status and a `post_op_attr`.
-pub(crate) fn failure(status: u32) -> Vec<u8> {
+pub fn failure(status: u32) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(status);
     put_no_post_op(&mut enc);
@@ -268,7 +271,7 @@ pub(crate) fn failure(status: u32) -> Vec<u8> {
 }
 
 /// `READ` answering `data`, with `eof` as given.
-pub(crate) fn read_ok(data: &[u8], eof: bool) -> Vec<u8> {
+pub fn read_ok(data: &[u8], eof: bool) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_post_op(&mut enc, 4096);
@@ -279,7 +282,7 @@ pub(crate) fn read_ok(data: &[u8], eof: bool) -> Vec<u8> {
 }
 
 /// `WRITE` reporting `count` bytes taken at `committed` durability.
-pub(crate) fn write_ok(count: u32, committed: u32) -> Vec<u8> {
+pub fn write_ok(count: u32, committed: u32) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_empty_wcc(&mut enc);
@@ -290,7 +293,7 @@ pub(crate) fn write_ok(count: u32, committed: u32) -> Vec<u8> {
 }
 
 /// `FSINFO` with the limits given and a `dtpref` of `dtpref`.
-pub(crate) fn fsinfo_ok(rtmax: u32, rtpref: u32, rtmult: u32, wtmax: u32, dtpref: u32) -> Vec<u8> {
+pub fn fsinfo_ok(rtmax: u32, rtpref: u32, rtmult: u32, wtmax: u32, dtpref: u32) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_no_post_op(&mut enc);
@@ -308,7 +311,7 @@ pub(crate) fn fsinfo_ok(rtmax: u32, rtpref: u32, rtmult: u32, wtmax: u32, dtpref
 }
 
 /// One `READDIR` entry in the chain.
-pub(crate) fn put_entry(enc: &mut XdrEncoder, fileid: u64, name: &str, cookie: u64) {
+pub fn put_entry(enc: &mut XdrEncoder, fileid: u64, name: &str, cookie: u64) {
     enc.u32(1); // an entry follows
     enc.u64(fileid);
     enc.string(name);
@@ -316,11 +319,7 @@ pub(crate) fn put_entry(enc: &mut XdrEncoder, fileid: u64, name: &str, cookie: u
 }
 
 /// A `READDIR` reply holding `entries`, ending with `eof`.
-pub(crate) fn readdir_ok(
-    entries: &[(u64, &str, u64)],
-    eof: bool,
-    verf: [u8; COOKIEVERF_SIZE],
-) -> Vec<u8> {
+pub fn readdir_ok(entries: &[(u64, &str, u64)], eof: bool, verf: [u8; COOKIEVERF_SIZE]) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_no_post_op(&mut enc);
@@ -334,14 +333,14 @@ pub(crate) fn readdir_ok(
 }
 
 /// The `READ` arguments of the n-th call: the offset and the count.
-pub(crate) fn read_args(server: &Server, n: usize) -> (u64, u32) {
+pub fn read_args(server: &Server, n: usize) -> (u64, u32) {
     let mut dec = XdrDecoder::new(&server.calls[n].args);
     dec.opaque().expect("handle");
     (dec.u64().expect("offset"), dec.u32().expect("count"))
 }
 
 /// The `WRITE` arguments of the n-th call: the offset and the data.
-pub(crate) fn write_args(server: &Server, n: usize) -> (u64, Vec<u8>) {
+pub fn write_args(server: &Server, n: usize) -> (u64, Vec<u8>) {
     let mut dec = XdrDecoder::new(&server.calls[n].args);
     dec.opaque().expect("handle");
     let offset = dec.u64().expect("offset");
@@ -353,7 +352,7 @@ pub(crate) fn write_args(server: &Server, n: usize) -> (u64, Vec<u8>) {
 
 /// The `READDIR` arguments of the n-th call: the cookie, the verifier, the
 /// count.
-pub(crate) fn readdir_args(server: &Server, n: usize) -> (u64, Vec<u8>, u32) {
+pub fn readdir_args(server: &Server, n: usize) -> (u64, Vec<u8>, u32) {
     let mut dec = XdrDecoder::new(&server.calls[n].args);
     dec.opaque().expect("handle");
     let cookie = dec.u64().expect("cookie");
@@ -367,7 +366,7 @@ pub(crate) fn readdir_args(server: &Server, n: usize) -> (u64, Vec<u8>, u32) {
 // ------------------------------------------- the replies the VFS layer needs
 
 /// `GETATTR` answering a node of `ftype`.
-pub(crate) fn getattr_of(ftype: Ftype3, size: u64, fileid: u64) -> Vec<u8> {
+pub fn getattr_of(ftype: Ftype3, size: u64, fileid: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_fattr3(&mut enc, ftype, size, fileid);
@@ -376,7 +375,7 @@ pub(crate) fn getattr_of(ftype: Ftype3, size: u64, fileid: u64) -> Vec<u8> {
 
 /// `LOOKUP` answering `fh`, with the entry's attributes and no directory
 /// attributes.
-pub(crate) fn lookup_ok(fh: &[u8], ftype: Ftype3, size: u64, fileid: u64) -> Vec<u8> {
+pub fn lookup_ok(fh: &[u8], ftype: Ftype3, size: u64, fileid: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     enc.opaque(fh);
@@ -387,7 +386,7 @@ pub(crate) fn lookup_ok(fh: &[u8], ftype: Ftype3, size: u64, fileid: u64) -> Vec
 }
 
 /// `READLINK` answering `target`.
-pub(crate) fn readlink_ok(target: &[u8]) -> Vec<u8> {
+pub fn readlink_ok(target: &[u8]) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_no_post_op(&mut enc);
@@ -397,7 +396,7 @@ pub(crate) fn readlink_ok(target: &[u8]) -> Vec<u8> {
 
 /// A reply that is only a `wcc_data`, which is what `REMOVE`, `RMDIR` and
 /// `RENAME` answer with. `RENAME` carries two, so `wccs` says how many.
-pub(crate) fn wcc_only(wccs: usize) -> Vec<u8> {
+pub fn wcc_only(wccs: usize) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     for _ in 0..wccs {
@@ -407,7 +406,7 @@ pub(crate) fn wcc_only(wccs: usize) -> Vec<u8> {
 }
 
 /// `SETATTR` answering a `wcc_data` whose `after` is present.
-pub(crate) fn setattr_ok(size: u64) -> Vec<u8> {
+pub fn setattr_ok(size: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     enc.u32(0); // no `before`
@@ -416,7 +415,7 @@ pub(crate) fn setattr_ok(size: u64) -> Vec<u8> {
 }
 
 /// One of the four `diropok3` replies: `CREATE`, `MKDIR`, `SYMLINK`, `MKNOD`.
-pub(crate) fn created(fh: Option<&[u8]>, ftype: Ftype3, fileid: u64) -> Vec<u8> {
+pub fn created(fh: Option<&[u8]>, ftype: Ftype3, fileid: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     match fh {
@@ -435,7 +434,7 @@ pub(crate) fn created(fh: Option<&[u8]>, ftype: Ftype3, fileid: u64) -> Vec<u8> 
 }
 
 /// `LINK`: the file's attributes and the directory's `wcc_data`.
-pub(crate) fn link_ok() -> Vec<u8> {
+pub fn link_ok() -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_post_op(&mut enc, 0);
@@ -445,20 +444,20 @@ pub(crate) fn link_ok() -> Vec<u8> {
 
 /// One `READDIRPLUS` entry: a name, a cookie, and what the server chose to
 /// attach to it.
-pub(crate) struct PlusEntry<'a> {
-    pub(crate) fileid: u64,
-    pub(crate) name: &'a str,
-    pub(crate) cookie: u64,
+pub struct PlusEntry<'a> {
+    pub fileid: u64,
+    pub name: &'a str,
+    pub cookie: u64,
     /// The type, when the server sent attributes. `None` is an entry sent
     /// bare, which the protocol allows and which the caller then has to look
     /// up for itself.
-    pub(crate) ftype: Option<Ftype3>,
+    pub ftype: Option<Ftype3>,
     /// The handle, when the server sent one.
-    pub(crate) fh: Option<&'a [u8]>,
+    pub fh: Option<&'a [u8]>,
 }
 
 /// A `READDIRPLUS` reply holding `entries`, ending with `eof`.
-pub(crate) fn readdirplus_ok(entries: &[PlusEntry<'_>], eof: bool) -> Vec<u8> {
+pub fn readdirplus_ok(entries: &[PlusEntry<'_>], eof: bool) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_no_post_op(&mut enc);
@@ -493,13 +492,7 @@ pub(crate) fn readdirplus_ok(entries: &[PlusEntry<'_>], eof: bool) -> Vec<u8> {
 }
 
 /// `FSSTAT` with the byte and file counters given.
-pub(crate) fn fsstat_ok(
-    tbytes: u64,
-    fbytes: u64,
-    abytes: u64,
-    tfiles: u64,
-    ffiles: u64,
-) -> Vec<u8> {
+pub fn fsstat_ok(tbytes: u64, fbytes: u64, abytes: u64, tfiles: u64, ffiles: u64) -> Vec<u8> {
     let mut enc = XdrEncoder::new();
     enc.u32(0);
     put_no_post_op(&mut enc);
@@ -515,7 +508,7 @@ pub(crate) fn fsstat_ok(
 
 /// A session over `server` mounted `ro`, for the checks that have to happen
 /// before anything reaches the wire.
-pub(crate) fn read_only_session(server: Server) -> NfsSession<Server> {
+pub fn read_only_session(server: Server) -> NfsSession<Server> {
     let opts = NfsOptions {
         read_only: true,
         ..quick_options()

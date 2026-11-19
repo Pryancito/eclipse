@@ -1,0 +1,12 @@
+[package]
+name = "nfs3"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS NFSv3 client (no_std): XDR, ONC RPC, portmap, MOUNT v3, NFSv3 and the session over them, shared by the kernel's NFS and the process that serves an NFS mount"
+
+[dependencies]
+# The VFS's `Timespec`, `Metadata` and `FileType`, which the kernel's NFS
+# fills from NFS attributes.
+rcore-fs = { path = "../rcore-fs" }
+# The scripted connector's log (`dialer`).
+spin = "0.9"

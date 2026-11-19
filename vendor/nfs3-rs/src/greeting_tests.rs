@@ -11,9 +11,9 @@
 //! perfectly decodable conversation and wrong, and only the log shows it.
 
 use super::*;
-use crate::fs::nfs::dialer::*;
-use crate::fs::nfs::nfs3;
-use crate::fs::nfs::xdr::XdrDecoder;
+use crate::dialer::*;
+use crate::nfs3;
+use crate::xdr::XdrDecoder;
 use alloc::vec;
 
 // --------------------------------------------------------------- portmap
@@ -67,7 +67,7 @@ fn an_answer_of_zero_is_not_a_port_and_is_never_dialled() {
 
     assert_eq!(
         greet(&mut d, &a_source(), &quick_options()),
-        Err(LxError::EOPNOTSUPP)
+        Err(Errno::EOPNOTSUPP)
     );
     assert!(
         !log.lock().dialled.contains(&0),
@@ -155,7 +155,7 @@ fn a_portmap_that_cannot_be_reached_does_not_guess_a_port_for_mountd() {
 
     assert_eq!(
         greet(&mut d, &a_source(), &quick_options()),
-        Err(LxError::ECONNREFUSED)
+        Err(Errno::ECONNREFUSED)
     );
     // Nothing but portmap: `does not contain mountd's port` would pass a
     // client that guessed some *other* port, which is the mistake.
@@ -180,7 +180,7 @@ fn a_portmap_that_says_nfs_is_not_registered_is_believed_rather_than_guessed() {
 
     assert_eq!(
         greet(&mut d, &a_source(), &quick_options()),
-        Err(LxError::EOPNOTSUPP)
+        Err(Errno::EOPNOTSUPP)
     );
     assert!(
         !log.lock().dialled.contains(&portmap::NFS_PORT),
@@ -250,7 +250,7 @@ fn a_server_that_lists_only_flavours_this_client_cannot_speak_is_refused_at_moun
         ..quick_options()
     };
 
-    assert_eq!(greet(&mut d, &a_source(), &opts), Err(LxError::EACCES));
+    assert_eq!(greet(&mut d, &a_source(), &opts), Err(Errno::EACCES));
 }
 
 #[test]
@@ -289,12 +289,12 @@ fn each_refusal_from_mountd_gets_its_own_errno() {
     // mount can act on: "no such export" and "your address is not allowed"
     // ask for different things, and both as `EIO` would ask for nothing.
     for (status, want) in [
-        (2u32, LxError::ENOENT),
-        (13, LxError::EACCES),
-        (20, LxError::ENOTDIR),
-        (63, LxError::ENAMETOOLONG),
-        (10_004, LxError::EOPNOTSUPP),
-        (1, LxError::EPERM),
+        (2u32, Errno::ENOENT),
+        (13, Errno::EACCES),
+        (20, Errno::ENOTDIR),
+        (63, Errno::ENAMETOOLONG),
+        (10_004, Errno::EOPNOTSUPP),
+        (1, Errno::EPERM),
     ] {
         let mut d = Dialer::new();
         d.answer(MOUNTD_PORT, mnt_err(status));
@@ -420,7 +420,7 @@ fn a_portmap_that_refuses_the_credential_is_not_a_portmap_that_is_absent() {
 
     let err = greet(&mut d, &a_source(), &opts).expect_err("a refused GETPORT");
 
-    assert_eq!(err, LxError::EACCES);
+    assert_eq!(err, Errno::EACCES);
     assert!(
         !log.lock().dialled.contains(&portmap::NFS_PORT),
         "2049 was dialled although portmap had answered"
@@ -474,7 +474,7 @@ fn a_local_failure_does_not_fall_back_because_nothing_was_asked() {
     // asked, so there is nothing to conclude about `nfsd` -- and 2049 would
     // be no more reachable than 111 was, with the same missing port.
     let mut d = Dialer::new();
-    d.refuse_locally(portmap::PORTMAP_PORT, LxError::EADDRNOTAVAIL);
+    d.refuse_locally(portmap::PORTMAP_PORT, Errno::EADDRNOTAVAIL);
     d.answer(MOUNTD_PORT, mnt_ok(ROOT, &[1]));
     let log = d.log();
     let opts = NfsOptions {
@@ -482,10 +482,7 @@ fn a_local_failure_does_not_fall_back_because_nothing_was_asked() {
         ..quick_options()
     };
 
-    assert_eq!(
-        greet(&mut d, &a_source(), &opts),
-        Err(LxError::EADDRNOTAVAIL)
-    );
+    assert_eq!(greet(&mut d, &a_source(), &opts), Err(Errno::EADDRNOTAVAIL));
     assert!(
         !log.lock().dialled.contains(&portmap::NFS_PORT),
         "2049 was dialled with no local port to dial it from"
@@ -498,14 +495,14 @@ fn running_out_of_memory_is_a_local_failure_too() {
     // `register_smoltcp_socket` answers: a socket set that is full is not a
     // server that is absent.
     let mut d = Dialer::new();
-    d.refuse_locally(portmap::PORTMAP_PORT, LxError::ENOMEM);
+    d.refuse_locally(portmap::PORTMAP_PORT, Errno::ENOMEM);
     d.answer(MOUNTD_PORT, mnt_ok(ROOT, &[1]));
     let opts = NfsOptions {
         mountport: Some(MOUNTD_PORT),
         ..quick_options()
     };
 
-    assert_eq!(greet(&mut d, &a_source(), &opts), Err(LxError::ENOMEM));
+    assert_eq!(greet(&mut d, &a_source(), &opts), Err(Errno::ENOMEM));
 }
 
 // --------------------------------------------- the flavours, and AUTH_NULL
@@ -524,7 +521,7 @@ fn an_export_that_lists_only_auth_null_is_refused_at_mount_time() {
 
     assert_eq!(
         greet(&mut d, &a_source(), &quick_options()),
-        Err(LxError::EACCES)
+        Err(Errno::EACCES)
     );
 }
 
@@ -584,7 +581,7 @@ fn a_greeting_with_no_budget_left_dials_nothing() {
 
     assert_eq!(
         greet_with_budget(&mut d, &a_source(), &quick_options(), 0),
-        Err(LxError::ETIMEDOUT)
+        Err(Errno::ETIMEDOUT)
     );
     assert!(log.lock().dialled.is_empty(), "a call was made out of time");
 }

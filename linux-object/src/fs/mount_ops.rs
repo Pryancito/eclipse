@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use zcore_drivers::wire::IpAddress;
+use zcore_drivers::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -356,7 +356,8 @@ pub(crate) fn mount_nfs_with_deadline(
     let parsed = NfsSource::parse(source)?;
     let opts = nfs_options_for(flags, data)?;
     let addr = match opts.addr {
-        Some(addr) => addr,
+        Some(core::net::IpAddr::V4(a)) => IpAddress::Ipv4(Ipv4Address::from_bytes(&a.octets())),
+        Some(core::net::IpAddr::V6(a)) => IpAddress::Ipv6(Ipv6Address::from_bytes(&a.octets())),
         // No resolver reachable from here: see `nfs_host_to_resolve`, which
         // is how the syscall layer resolves a name before this runs. A name
         // that gets this far is one nothing local knows.

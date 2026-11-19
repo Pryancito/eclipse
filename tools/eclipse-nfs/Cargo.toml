@@ -1,0 +1,35 @@
+[package]
+name = "eclipse-nfs"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS NFSv3 client that runs as a process"
+
+# Standalone: NOT a workspace member. It targets userspace
+# (<arch>-unknown-linux-musl), not the zCore bare-metal target, so `xtask`
+# builds it on its own (see `xtask/src/linux/udriver.rs`), like the other
+# filesystem servers.
+[workspace]
+
+[lib]
+name = "nfsserve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eclipse-nfs"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+# The system calls and the FIFO.
+udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
+# What passes between the kernel and a server: the FAT server's.
+fatserve = { package = "eclipse-fatfs", path = "../eclipse-fatfs" }
+# The same NFSv3 client the kernel links for its own NFS (`vendor/nfs3-rs`).
+nfs3 = { path = "../../vendor/nfs3-rs" }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

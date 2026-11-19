@@ -108,8 +108,8 @@ pub const NFS_SUPER_MAGIC: u64 = 0x6969;
 /// caller's answer to it is to look the name up again. Reported as a device
 /// error it reads as a broken disk, and a program that would have re-opened
 /// gives up on the mount instead. See [`FsError::StaleHandle`].
-pub fn fs_error_from_lx(e: LxError) -> FsError {
-    match e {
+pub fn fs_error_from_lx(e: impl Into<LxError>) -> FsError {
+    match e.into() {
         LxError::ESTALE => FsError::StaleHandle,
         LxError::ENOENT => FsError::EntryNotFound,
         LxError::EEXIST => FsError::EntryExist,

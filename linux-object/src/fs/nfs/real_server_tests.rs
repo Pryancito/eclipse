@@ -48,7 +48,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::error::{LxError, LxResult};
+use super::Errno;
 
 use super::client::{RpcTransport, TransportError};
 use super::connect::Connector;
@@ -133,19 +133,23 @@ impl StdConnector {
 impl Connector for StdConnector {
     type Transport = StdTransport;
 
-    fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport> {
+    fn connect(&mut self, port: u16, timeout_ms: u64) -> Result<Self::Transport, Errno> {
         self.dialled.push(port);
         let addr: SocketAddr = alloc::format!("{}:{}", self.host, port)
             .parse()
-            .map_err(|_| LxError::EINVAL)?;
+            .map_err(|_| Errno::EINVAL)?;
         let sock = TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms.max(1)))
-            .map_err(|_| LxError::ECONNREFUSED)?;
-        sock.set_nodelay(true).map_err(|_| LxError::EIO)?;
-        sock.set_nonblocking(true).map_err(|_| LxError::EIO)?;
+            .map_err(|_| Errno::ECONNREFUSED)?;
+        sock.set_nodelay(true).map_err(|_| Errno::EIO)?;
+        sock.set_nonblocking(true).map_err(|_| Errno::EIO)?;
         Ok(StdTransport {
             sock,
             started: Instant::now(),
         })
+    }
+
+    fn now_ns(&self) -> u64 {
+        kernel_hal::timer::timer_now().as_nanos() as u64
     }
 }
 
@@ -285,7 +289,7 @@ fn what_this_client_writes_is_what_the_server_reads_back() {
     session.remove(&root, name).expect("REMOVE");
     assert_eq!(
         session.lookup(&root, name).err(),
-        Some(LxError::ENOENT),
+        Some(Errno::ENOENT),
         "the file is gone from the server"
     );
 }
@@ -352,7 +356,7 @@ fn a_name_the_server_does_not_have_is_enoent_and_not_eio() {
     let root = session.root().clone();
     assert_eq!(
         session.lookup(&root, "no-existe-esto").err(),
-        Some(LxError::ENOENT),
+        Some(Errno::ENOENT),
         "a real NFS3ERR_NOENT has to come out as ENOENT and not as the \
          catch-all"
     );
@@ -378,7 +382,10 @@ fn an_export_the_server_does_not_have_is_refused_at_mount_time() {
         .err()
         .expect("a mount of an export the server does not have");
     assert!(
-        matches!(err, LxError::ENOENT | LxError::EACCES | LxError::EPERM),
+        matches!(
+            super::errno_of(err),
+            Errno::ENOENT | Errno::EACCES | Errno::EPERM
+        ),
         "a refused export came out as {:?}",
         err
     );

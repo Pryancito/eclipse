@@ -80,7 +80,7 @@ where
         connector,
         source,
         opts,
-        &Budget::new(greeting::greeting_budget(opts)),
+        &Budget::new(greeting::greeting_budget(opts), connector.now_ms()),
     )
 }
 
@@ -103,10 +103,10 @@ where
     C::Transport: Send + 'static,
 {
     let greeting = greeting::greet_with_deadline(connector, source, opts, budget)?;
-    let transport = connector.connect(greeting.nfs_port, budget.left()?)?;
+    let transport = connector.connect(greeting.nfs_port, budget.left(connector.now_ms())?)?;
     let mut session = NfsSession::new(
         transport,
-        greeting::first_xid(),
+        connector.first_xid(),
         greeting.root.clone(),
         opts,
     );
