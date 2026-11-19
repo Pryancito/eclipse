@@ -25,7 +25,10 @@
 //! keeps them all for the kernel's own driver. The NVMe and AHCI
 //! controllers always go, named or not: the kernel has no driver for
 //! them ([`crate::pci_disks`]). And the first HD Audio controller that is
-//! not a GPU's ([`leave_first_hda`]): `uhda=kernel` keeps it.
+//! not a GPU's ([`leave_first_hda`]): `uhda=kernel` keeps it. And the
+//! first two virtio input devices and the PC's i8042 ([`leave_input`]),
+//! whose events reach the consoles and `/sys` from their drivers too:
+//! `uinput=kernel` and `ups2=kernel` keep them.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -526,6 +529,35 @@ pub fn reserve_hda(
     reserve_with(HDA, true, unasked, transport, paddr, size, wiring)
 }
 
+/// Whether the first virtio input devices are left to userspace without
+/// the boot naming them: see [`leave_input`].
+static INPUT_UNASKED: AtomicBool = AtomicBool::new(false);
+/// The same for the i8042.
+static I8042_UNASKED: AtomicBool = AtomicBool::new(false);
+/// How many virtio input devices go unasked: init has a service for each
+/// of the first two (`uinput`, `uinput2`), and a third would have no
+/// driver.
+const INPUT_UNASKED_MAX: usize = 2;
+
+/// Leave the first two virtio input devices (with `virtio`) and the PC's
+/// i8042, keyboard and mouse (with `i8042`), to their drivers in userspace,
+/// unless the boot names one of that kind. Their events still reach the
+/// consoles, and libinput finds them in `/sys`, as a kernel device's
+/// (`linux_object::fs::devfs::served::input`). Before the buses are probed.
+pub fn leave_input(spec: Option<&str>, virtio: bool, i8042: bool) {
+    if virtio && kind_unasked(spec, VIRTIO_INPUT) {
+        info!("udriver: the first virtio input devices are for userspace");
+        INPUT_UNASKED.store(true, Ordering::Release);
+    }
+    let named = parse_specs(spec.unwrap_or(""))
+        .iter()
+        .any(|(k, _)| *k == I8042 || *k == I8042_AUX);
+    if i8042 && !named {
+        info!("udriver: the i8042 is for userspace");
+        I8042_UNASKED.store(true, Ordering::Release);
+    }
+}
+
 /// Whether virtio disk `index` is left to userspace unasked.
 fn disk_unasked(index: usize) -> bool {
     DISKS_UNASKED.load(Ordering::Acquire)
@@ -617,9 +649,10 @@ pub fn reserve_virtio_input(
 /// keyboard as [`I8042`] and the mouse as [`I8042_AUX`], each with its
 /// line, and the caller must not touch the controller.
 pub fn reserve_i8042() -> bool {
-    if !WANTED
-        .get()
-        .is_some_and(|w| w.contains(&(I8042, 0)) || w.contains(&(I8042_AUX, 0)))
+    if !I8042_UNASKED.load(Ordering::Acquire)
+        && !WANTED
+            .get()
+            .is_some_and(|w| w.contains(&(I8042, 0)) || w.contains(&(I8042_AUX, 0)))
     {
         return false;
     }
@@ -688,7 +721,10 @@ fn reserve_with(
         // The kernel has no NVMe or AHCI driver (`crate::pci_disks`): a
         // controller is userspace's or nobody's.
         || kind == NVME
-        || kind == AHCI;
+        || kind == AHCI
+        || (kind == VIRTIO_INPUT
+            && index < INPUT_UNASKED_MAX
+            && INPUT_UNASKED.load(Ordering::Acquire));
     if !wanted {
         return false;
     }

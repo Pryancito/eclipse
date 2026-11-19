@@ -985,6 +985,13 @@ pub fn vt_stdout(vt: usize) -> Arc<Stdout> {
 /// Keyboard handler: tracks modifiers, switches VTs on Ctrl+Alt+F1..F6, handles
 /// scrollback (Shift+PageUp/Down) and Ctrl+C, and feeds translated characters
 /// to the active terminal.
+/// A key of an input device the kernel does not drive itself (one a
+/// process serves: `devfs::served::input`), for the consoles, as a kernel
+/// keyboard's.
+pub(crate) fn console_key(event: &InputEvent) {
+    handle_key_event(event)
+}
+
 fn handle_key_event(event: &InputEvent) {
     use zcore_drivers::input::input_event_codes::key::*;
     if event.event_type != InputEventType::Key {

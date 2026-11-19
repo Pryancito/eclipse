@@ -90,6 +90,9 @@ pub(super) fn init() -> DeviceResult {
     if crate::cmdline::user_disks(&cmdline) {
         zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
     }
+    // The first virtio input devices, for their drivers in userspace,
+    // which still reach the consoles: `uinput=kernel` keeps them.
+    zcore_drivers::user::leave_input(udriver, crate::cmdline::user_virtio_input(&cmdline), false);
     // prase DTB and probe devices
     let dev_list =
         DevicetreeDriverBuilder::new(phys_to_virt(crate::KCONFIG.dtb_paddr), IoMapperImpl)?

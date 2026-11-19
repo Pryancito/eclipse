@@ -48,6 +48,9 @@ pub fn init() {
     if crate::cmdline::user_disks(&cmdline) {
         zcore_drivers::user::leave_virtio_disks(udriver, super::init_ram_disk().is_none());
     }
+    // The first virtio input devices, for their drivers in userspace,
+    // which still reach the consoles: `uinput=kernel` keeps them.
+    zcore_drivers::user::leave_input(udriver, crate::cmdline::user_virtio_input(&cmdline), false);
     let slot0 = unsafe { &mut *(phys_to_virt(VIRTIO_BASE) as *mut VirtIOHeader) };
     if !reserved_for_userspace(slot0, 0) {
         if let Ok(virtio_blk) = VirtIoBlk::new(slot0) {

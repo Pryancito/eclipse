@@ -149,6 +149,20 @@ pub fn user_hda(cmdline: &str) -> bool {
     value(cmdline, "uhda") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
 }
 
+/// Whether a boot leaves its first virtio input devices to the driver in
+/// userspace without naming them (`zcore_drivers::user::leave_input`): as
+/// [`user_disks`], with `uinput=kernel` the boot that keeps them in the
+/// kernel.
+pub fn user_virtio_input(cmdline: &str) -> bool {
+    value(cmdline, "uinput") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+}
+
+/// The same for the PC's i8042, its keyboard and its mouse: `ups2=kernel`
+/// keeps it in the kernel.
+pub fn user_i8042(cmdline: &str) -> bool {
+    value(cmdline, "ups2") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+}
+
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
 /// on in one go — `nvidia.cuda` for every switch CUDA needs.
 ///
@@ -920,6 +934,14 @@ mod tests {
         assert!(!user_hda("LOG=warn:uhda=kernel") && user_disks("uhda=kernel"));
         assert!(!user_hda("zircon.gateway=0"));
         assert!(user_hda("notuhda=kernel"));
+    }
+
+    #[test]
+    fn input_is_userspace_s_unless_the_boot_keeps_it() {
+        assert!(user_virtio_input("") && user_i8042(""));
+        assert!(!user_virtio_input("uinput=kernel") && user_i8042("uinput=kernel"));
+        assert!(!user_i8042("LOG=warn:ups2=kernel") && user_virtio_input("ups2=kernel"));
+        assert!(!user_virtio_input("zircon.gateway=0") && !user_i8042("zircon.gateway=0"));
     }
 
     #[test]
