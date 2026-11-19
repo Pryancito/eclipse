@@ -423,11 +423,6 @@ impl PciDriver for VirtIoPciDriver {
                             return Ok(Device::Drm(Arc::new(gpu)));
                         }
                     }
-                    0x1001 | 0x1042 => {
-                        if let Ok(blk) = crate::virtio::VirtIoBlk::new(header) {
-                            return Ok(Device::Block(Arc::new(blk)));
-                        }
-                    }
                     0x1003 | 0x1043 => {
                         if let Ok(console) = crate::virtio::VirtIoConsole::new(header) {
                             return Ok(Device::Uart(Arc::new(console)));

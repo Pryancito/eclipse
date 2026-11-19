@@ -142,7 +142,7 @@ const NFS_USES: [&str; 4] = [
 /// `udriver =` keeps each out of every boot where the kernel drives the
 /// device itself or the machine has none: the virtio disks and the first
 /// virtio network card are left unless the command line says otherwise
-/// (`ublk=kernel` keeps the disks in the kernel). Supervised: when a driver dies the kernel resets its device
+/// (every disk but the root of an aarch64 machine with no initrd). Supervised: when a driver dies the kernel resets its device
 /// and init starts the next one at once.
 ///
 /// `service` is a driver doing its job and nothing else: it hands the
@@ -252,8 +252,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
             svc_dir.join(format!("{name}.service")),
             format!(
                 "# Driver of virtio disk number {nth} of those the kernel left to\n\
-                 # userspace (all of them, unless the boot says ublk=kernel or\n\
-                 # names one with udriver=virtio-blk@N). See\n\
+                 # userspace (all of them but an aarch64 root disk). See\n\
                  # /usr/local/bin/eclipse-ublk.\n\
                  exec = /usr/local/bin/eclipse-ublk{arg}\n\
                  type = respawn\n\
