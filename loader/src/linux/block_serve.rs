@@ -1133,11 +1133,14 @@ type ReservedPlace = (&'static str, usize, usize);
 
 /// The kinds of reserved device a process can serve as a disk, with the
 /// name each one's node is made after.
-const DISK_KINDS: [(&str, &str); 3] = [
+const DISK_KINDS: [(&str, &str); 4] = [
     (kernel_hal::drivers::user::VIRTIO_BLK, "virtio-blk-served"),
     (kernel_hal::drivers::user::NVME, "nvme-served"),
     // Not `nvme` nor `virtio`: an `sdX`, as a SATA disk is named.
     (kernel_hal::drivers::user::AHCI, "ahci-served"),
+    // A USB disk on an xHCI controller (its root port says which): an
+    // `sdX` too, as the kernel's own USB disks are.
+    (kernel_hal::drivers::user::XHCI, "usbdisk-served"),
 ];
 
 /// [`ECLIPSE_BLOCK_SERVE`](super::ECLIPSE_BLOCK_SERVE): `args[0]` the FIFO end
