@@ -312,6 +312,21 @@ impl SigInfo {
         info
     }
 
+    /// The pid of the process that sent it, when a process did
+    /// (`kill`, `tkill`, `sigqueue`: `si_code` of `SI_USER`, `SI_TKILL`
+    /// or `SI_QUEUE`, which leave `si_pid`); none for what the kernel
+    /// raised itself.
+    pub fn sender(&self) -> Option<i32> {
+        let from_user = [SignalCode::USER, SignalCode::TKILL, SignalCode::QUEUE];
+        if !from_user.contains(&self.code) {
+            return None;
+        }
+        let mut pid = [0; 4];
+        pid.copy_from_slice(&self.field.pad[..4]);
+        // The kernel's own, sent as if by nobody, say pid 0.
+        Some(i32::from_ne_bytes(pid)).filter(|pid| *pid > 0)
+    }
+
     /// The `siginfo_t` glibc's `sigqueue(3)` hands to `rt_sigqueueinfo(2)`:
     /// `SI_QUEUE`, the sender's pid and real uid, and the `sigval` that is
     /// the whole point of the call.

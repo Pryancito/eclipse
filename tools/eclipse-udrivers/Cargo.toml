@@ -42,6 +42,14 @@ name = "udrv-ps2"
 path = "src/bin/udrv-ps2.rs"
 
 [[bin]]
+name = "udrv-hda"
+path = "src/bin/udrv-hda.rs"
+
+[[bin]]
+name = "udrv-dsp-check"
+path = "src/bin/udrv-dsp-check.rs"
+
+[[bin]]
 name = "udrv-evdev-check"
 path = "src/bin/udrv-evdev-check.rs"
 

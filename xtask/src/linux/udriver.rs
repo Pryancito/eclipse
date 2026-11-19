@@ -72,6 +72,10 @@ const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
 /// PC's i8042 with `udriver=i8042@0`: its keyboard and its mouse); and
 /// what checks and times such a node, `udrv-evdev-check NODE`.
 const INPUT_DRIVERS: [&str; 3] = ["udrv-virtio-input", "udrv-ps2", "udrv-evdev-check"];
+/// The driver of an Intel HD Audio controller, from the same package,
+/// serving it as `/dev/dsp` (`udriver=hda@N`); and what plays a tone
+/// through such a node and checks it, `udrv-dsp-check`.
+const AUDIO_DRIVERS: [&str; 2] = ["udrv-hda", "udrv-dsp-check"];
 /// How many virtio input devices get a driver service of their own
 /// (`uinput`, `uinput2`): a keyboard and a mouse or tablet.
 const UINPUT_DEVICES: usize = 2;
@@ -399,6 +403,32 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     )
     .unwrap();
 
+    // The HD Audio controller the boot leaves to userspace (`udriver=hda@N`):
+    // the first one, served as `/dev/dsp`.
+    fs::write(
+        svc_dir.join("uhda.service"),
+        "# Driver of the first Intel HD Audio controller the kernel left to\n\
+         # userspace (udriver=hda@N), served as /dev/dsp. See\n\
+         # /usr/local/bin/eclipse-uhda.\n\
+         exec = /usr/local/bin/eclipse-uhda\n\
+         type = respawn\n\
+         udriver = hda\n",
+    )
+    .unwrap();
+    fs::write(
+        localbin.join("eclipse-uhda"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of an HD Audio controller the\n\
+          # kernel left alone (udriver=hda@N), in the foreground for\n\
+          # eclipse-init, which starts it again if it dies. It serves the\n\
+          # controller as /dev/dsp. See tools/eclipse-udrivers.\n\
+          n=$(sed -n 's/^hda@//p' /proc/udrivers | sed -n 1p)\n\
+          [ -n \"$n\" ] || { echo 'eclipse-uhda: the kernel left no HD Audio controller to userspace' >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-hda ] || { echo 'eclipse-uhda: /bin/udrv-hda is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-hda \"$n\"\n",
+    )
+    .unwrap();
+
     // What `/etc/fstab` puts on that disk. The kernel goes through fstab
     // once, as init starts, and a disk whose driver is a service is not
     // there yet: its lines fail there, and without this nothing mounts
@@ -632,6 +662,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(DRIVERS_PACKAGE, &INPUT_DRIVERS, &[]);
         for name in INPUT_DRIVERS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(DRIVERS_PACKAGE, &AUDIO_DRIVERS, &[]);
+        for name in AUDIO_DRIVERS {
             put(&built.join(name), name);
         }
         let built = self.rust_tools(NETSTACK_PACKAGE, &NETSTACK, &NETSTACK_USES);

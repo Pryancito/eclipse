@@ -531,7 +531,8 @@ impl Syscall<'_> {
             || self.is_bounded_socket(file_like)
             || file_like
                 .downcast_ref::<linux_object::fs::EventFd>()
-                .is_some())
+                .is_some()
+            || is_served(file_like))
             && !file_like.flags().non_block()
     }
 
@@ -2972,6 +2973,18 @@ impl Syscall<'_> {
             let _ = dsp.sync_sleeping().await;
         }
     }
+}
+
+/// A node a process serves (`devfs::ServedOpen`): its server never waits,
+/// it answers `EAGAIN` when there is no room, and a blocking writer waits
+/// in the kernel for the server to say there is, as a blocking reader does.
+fn is_served(file_like: &Arc<dyn FileLike>) -> bool {
+    file_like.downcast_ref::<File>().is_some_and(|f| {
+        f.inode()
+            .as_any_ref()
+            .downcast_ref::<linux_object::fs::devfs::ServedOpen>()
+            .is_some()
+    })
 }
 
 fn blocking_dsp(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {

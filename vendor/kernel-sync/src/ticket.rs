@@ -7,7 +7,7 @@ use core::{
 };
 
 use crate::deadlock::report_deadlock;
-use crate::interrupt::{pop_off, push_off};
+use crate::interrupt::{pop_off, push_off, push_off_long, push_off_short};
 
 pub struct TicketMutex<T: ?Sized> {
     next_ticket: AtomicUsize,
@@ -186,10 +186,35 @@ impl<T: ?Sized> TicketMutex<T> {
     /// the free lock nothing: with them in here this function saved and
     /// restored five registers around a loop it almost never entered, and was
     /// a seventh of everything the kernel ran for a small TCP echo.
+    ///
+    /// The same goes for a CPU the short way of `cpu_id` cannot name:
+    /// [`lock_unnamed`](Self::lock_unnamed) asks the long way, out of line,
+    /// so that the call it makes does not cost every lock the registers it
+    /// clobbers.
     #[track_caller]
     pub fn lock(&self) -> TicketMutexGuard<'_, T> {
-        let cpu = push_off();
         let caller = core::panic::Location::caller();
+        let cpu = match push_off_short() {
+            Ok(cpu) => cpu,
+            Err(old) => return self.lock_unnamed(old, caller),
+        };
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        if self.next_serving.load(Ordering::Acquire) != ticket {
+            return self.lock_held(ticket, caller, cpu);
+        }
+        self.served(ticket, caller, cpu)
+    }
+
+    /// [`lock`](Self::lock) from where `push_off_short` left it: interrupts
+    /// off, the CPU not named yet, and `old` the interrupt state it found.
+    #[cold]
+    #[inline(never)]
+    fn lock_unnamed(
+        &self,
+        old: bool,
+        caller: &'static core::panic::Location<'static>,
+    ) -> TicketMutexGuard<'_, T> {
+        let cpu = push_off_long(old);
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         if self.next_serving.load(Ordering::Acquire) != ticket {
             return self.lock_held(ticket, caller, cpu);

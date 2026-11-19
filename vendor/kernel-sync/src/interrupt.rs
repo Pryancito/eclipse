@@ -334,14 +334,27 @@ static LOGICAL_IDS: LogicalIdMap = LogicalIdMap::new();
 /// way round, [`current_cpu_id_slow`], which asks all three again.
 #[inline]
 pub fn current_cpu_id() -> u8 {
-    if !LOGICAL_IDS.ap_boot_any() {
-        if let Some(published) = published_cpu_id() {
-            if LOGICAL_IDS.accepts_published(published) {
-                return published;
-            }
-        }
+    match short_cpu_id() {
+        Some(id) => id,
+        None => current_cpu_id_slow(),
     }
-    current_cpu_id_slow()
+}
+
+/// [`current_cpu_id`]'s short way alone, `None` where it would go the long
+/// way round. For the callers that keep the long way out of line themselves:
+/// a call in the middle of a function makes it save and restore the
+/// registers the call may clobber, on every pass, taken or not.
+#[inline(always)]
+fn short_cpu_id() -> Option<u8> {
+    if LOGICAL_IDS.ap_boot_any() {
+        return None;
+    }
+    let published = published_cpu_id()?;
+    if LOGICAL_IDS.accepts_published(published) {
+        Some(published)
+    } else {
+        None
+    }
 }
 
 /// [`current_cpu_id`] when the short way did not answer: all three sources,
@@ -544,31 +557,79 @@ pub fn lock_depth() -> i32 {
 /// (the lock's holder record) and would otherwise ask again.
 #[inline]
 pub(crate) fn push_off() -> u8 {
+    match push_off_short() {
+        Ok(id) => id,
+        Err(old) => push_off_long(old),
+    }
+}
+
+/// [`push_off`] where the short way names this CPU, with no call in it; the
+/// interrupt state it found when it does not, for [`push_off_long`].
+/// Interrupts are off either way.
+#[inline(always)]
+pub(crate) fn push_off_short() -> Result<u8, bool> {
     let old = intr_get();
     intr_off();
-    let id = cpu_id();
+    match short_cpu_id() {
+        Some(id) if (id as usize) < MAX_CORE_NUM => {
+            CPUS[id as usize].get().push(old);
+            Ok(id)
+        }
+        _ => Err(old),
+    }
+}
+
+/// The rest of [`push_off`] after [`push_off_short`] could not name this
+/// CPU: the long way round, with interrupts already off and `old` the state
+/// they were in.
+#[cold]
+#[inline(never)]
+pub(crate) fn push_off_long(old: bool) -> u8 {
+    let id = current_cpu_id_slow();
     cpu_slot(id).push(old);
     id
 }
 
 pub(crate) fn pop_off() {
+    let cpu = match short_cpu_id() {
+        Some(id) if (id as usize) < MAX_CORE_NUM => CPUS[id as usize].get(),
+        _ => cpu_the_long_way(),
+    };
     // NOTICE: intr_on() may lead to an immediate interrupt, so the Cpu borrow
     // must end before enabling IRQs — it ends with this statement.
-    let should_enable = match mycpu().pop(intr_get()) {
+    let should_enable = match cpu.pop(intr_get()) {
         Ok(enable) => enable,
-        // Two diagnoses, not one. Both mean the pair came apart, but they come
-        // apart for different reasons and a bare "pop_off" names neither.
-        Err(PopError::InterruptsEnabled) => panic!(
-            "pop_off on cpu {}: interrupts are already on inside a critical section",
-            cpu_id()
-        ),
-        Err(PopError::Underflow) => panic!(
-            "pop_off on cpu {}: more lock releases than acquires on this slot",
-            cpu_id()
-        ),
+        Err(e) => pop_off_failed(e),
     };
     if should_enable {
         intr_on();
+    }
+}
+
+/// [`mycpu`] for a [`pop_off`] whose short way named no CPU, out of line
+/// like the rest of what is rare there.
+#[cold]
+#[inline(never)]
+fn cpu_the_long_way() -> &'static mut Cpu {
+    mycpu()
+}
+
+/// The two ways a [`pop_off`] finds its pair came apart. Out of line, so
+/// that the formatting they need costs the pop that is fine nothing.
+#[cold]
+#[inline(never)]
+fn pop_off_failed(e: PopError) -> ! {
+    match e {
+        // Two diagnoses, not one. Both mean the pair came apart, but they come
+        // apart for different reasons and a bare "pop_off" names neither.
+        PopError::InterruptsEnabled => panic!(
+            "pop_off on cpu {}: interrupts are already on inside a critical section",
+            cpu_id()
+        ),
+        PopError::Underflow => panic!(
+            "pop_off on cpu {}: more lock releases than acquires on this slot",
+            cpu_id()
+        ),
     }
 }
 
