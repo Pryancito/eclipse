@@ -93,3 +93,102 @@ fn a_string_descriptor_is_utf16() {
     assert_eq!(string_text(&[]), "");
     assert_eq!(string_text(&[40, 3, b'A', 0]), "A", "a length past the end");
 }
+
+/// QEMU's `usb-storage`: one bulk-only SCSI interface, bulk IN 1 and bulk
+/// OUT 2.
+const DISK_CONFIG: [u8; 32] = [
+    9, 2, 32, 0, 1, 1, 0, 0xc0, 1, // configuration 1
+    9, 4, 0, 0, 2, 8, 6, 0x50, 0, // interface 0: storage, SCSI, bulk-only
+    7, 5, 0x81, 2, 0, 2, 0, // bulk IN 1, 512 bytes
+    7, 5, 0x02, 2, 0, 2, 0, // bulk OUT 2
+];
+
+#[test]
+fn a_configuration_says_its_disk() {
+    assert_eq!(
+        disk_interface(&DISK_CONFIG),
+        Some(DiskIface {
+            number: 0,
+            bulk_in: (0x81, 512),
+            bulk_out: (0x02, 512),
+        })
+    );
+    assert_eq!(hid_interfaces(&DISK_CONFIG).1, []);
+    // A keyboard is no disk; a disk with one endpoint is none either.
+    assert_eq!(disk_interface(&KEYBOARD_CONFIG), None);
+    assert_eq!(disk_interface(&DISK_CONFIG[..25]), None);
+}
+
+#[test]
+fn a_command_block_and_its_status() {
+    let b = cbw(7, 4096, true, &scsi_rw(false, 0x1234, 8));
+    assert_eq!(&b[0..4], b"USBC");
+    assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 7);
+    assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 4096);
+    assert_eq!((b[12], b[13], b[14]), (0x80, 0, 10));
+    assert_eq!(&b[15..25], [0x28, 0, 0, 0, 0x12, 0x34, 0, 0, 8, 0]);
+    let mut csw = [0u8; 13];
+    csw[0..4].copy_from_slice(b"USBS");
+    csw[4..8].copy_from_slice(&7u32.to_le_bytes());
+    csw[12] = 1;
+    assert_eq!(csw_status(&csw, 7), Some(1));
+    assert_eq!(csw_status(&csw, 8), None, "another command's");
+    assert_eq!(csw_status(&csw[..12], 7), None, "cut short");
+}
+
+#[test]
+fn a_far_lba_takes_the_sixteen_byte_command() {
+    let c = scsi_rw(true, 1 << 33, 16);
+    assert_eq!(c.len(), 16);
+    assert_eq!(c[0], 0x8a);
+    assert_eq!(&c[2..10], (1u64 << 33).to_be_bytes());
+    assert_eq!(&c[10..14], 16u32.to_be_bytes());
+    assert_eq!(scsi_rw(true, 5, 1)[0], 0x2a);
+}
+
+#[test]
+fn a_transfer_is_cut_at_each_64k_boundary() {
+    assert_eq!(pieces(0x1_0000, 4096), [(0x1_0000, 4096)]);
+    assert_eq!(
+        pieces(0xf000, 0x2_0000),
+        [(0xf000, 0x1000), (0x1_0000, 0x1_0000), (0x2_0000, 0xf000)]
+    );
+    assert_eq!(pieces(0, 0), []);
+}
+
+/// QEMU's `usb-hub`: one hub interface, its status change endpoint 1 IN.
+const HUB_CONFIG: [u8; 25] = [
+    9, 2, 25, 0, 1, 1, 0, 0xe0, 0, // configuration 1
+    9, 4, 0, 0, 1, 9, 0, 0, 0, // interface 0: hub
+    7, 5, 0x81, 3, 1, 0, 255, // interrupt IN 1, 1 byte
+];
+
+#[test]
+fn a_hub_says_its_status_change_endpoint() {
+    assert_eq!(class_interrupt_in(&HUB_CONFIG, CLASS_HUB), Some((0x81, 1, 255)));
+    assert_eq!(class_interrupt_in(&HUB_CONFIG, CLASS_HID), None);
+    assert_eq!(class_interrupt_in(&KEYBOARD_CONFIG, CLASS_HID), Some((0x81, 8, 7)));
+}
+
+#[test]
+fn a_hub_port_is_a_tier_of_the_route() {
+    assert_eq!(child_route(0, 0, 3), Some(3));
+    assert_eq!(child_route(0x3, 1, 2), Some(0x23));
+    assert_eq!(child_route(0, 0, 20), Some(15), "a port past 15 says 15");
+    assert_eq!(child_route(0x1_1111, 5, 1), None, "five tiers at most");
+}
+
+#[test]
+fn a_status_change_bitmap_names_ports_from_bit_one() {
+    assert_eq!(changed_ports(&[0b0000_0110], 4), [1, 2]);
+    assert_eq!(changed_ports(&[0b0000_0001], 4), [], "bit 0 is the hub");
+    assert_eq!(changed_ports(&[0, 0b1], 8), [8]);
+    assert_eq!(changed_ports(&[0xff], 3), [1, 2, 3]);
+}
+
+#[test]
+fn a_hub_port_says_its_speed() {
+    assert_eq!(hub_port_speed(0x0103), SPEED_FULL);
+    assert_eq!(hub_port_speed(0x0303), SPEED_LOW);
+    assert_eq!(hub_port_speed(0x0503), SPEED_HIGH);
+}

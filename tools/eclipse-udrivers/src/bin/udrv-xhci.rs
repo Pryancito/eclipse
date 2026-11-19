@@ -13,6 +13,12 @@
 //! kernel stops and resets the controller, and the next driver starts it
 //! again.
 //!
+//! A USB disk on a port is served to the kernel as a disk (an `sdX`), from
+//! a thread of its own, as `udrv-nvme` serves a namespace: the kernel's
+//! requests come on a FIFO, the data in a window the controller reads and
+//! writes directly. When the disk is pulled out its FIFO goes, and the
+//! kernel drops the disk once no driver has come back for it.
+//!
 //! Exit status: 2 when the Zircon gateway is off, 1 on any other error and
 //! when the kernel lets go of a node.
 
@@ -21,13 +27,15 @@ use std::process::exit;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+use udrivers::blk::{self, Backend, Io, Msg};
 use udrivers::claim::{self, Dma};
 use udrivers::evdev::{self, Evdev, EV_LED, EV_SYN, SYN_REPORT};
+use udrivers::fifo::Fifo;
 use udrivers::served::Node;
 use udrivers::status;
 use udrivers::usbhid;
 use udrivers::xhci::{self, Role, Xhci};
-use udrivers::zx::Status;
+use udrivers::zx::{self, nr, Handle, Status};
 
 const NAME: &str = "udrv-xhci";
 
@@ -52,6 +60,8 @@ struct Served {
 /// What every thread shares.
 struct Shared {
     index: usize,
+    /// The claim's BTI, for each disk's window.
+    bti: Handle,
     xhci: Mutex<Xhci>,
     /// The node of each HID, by its index in the controller's list.
     served: Mutex<BTreeMap<usize, &'static Served>>,
@@ -117,22 +127,27 @@ fn serve(shared: &'static Shared, hid: usize, info: evdev::Info, place: &str, ke
 /// Drive the device on `port`, and serve what it has.
 fn attach(shared: &'static Shared, x: &mut Xhci, port: u8, out: &mut Vec<Added>) {
     match x.attach(port) {
-        Ok(added) => {
-            for hid in added {
-                let Some(h) = x.hids[hid].as_ref() else {
-                    continue;
-                };
-                let place = format!("xhci@{}-{}.{}", shared.index, h.port, h.iface);
-                let phys = format!("usb-xhci{}-{}/input{}", shared.index, h.port, h.iface);
-                let (info, keyboard) = match &h.role {
-                    Role::Keyboard(_) => (usbhid::keyboard_info(&h.name, &phys, h.id), true),
-                    Role::Pointer(p) => (p.info(&h.name, &phys, h.id), false),
-                };
-                out.push((hid, info, place, keyboard));
+        Ok(new) => {
+            for hid in new {
+                describe(shared, x, hid, out);
             }
         }
         Err(e) => println!("{NAME}: port {port}: {e}"),
     }
+}
+
+/// What HID `hid`, just added, is to be served as.
+fn describe(shared: &'static Shared, x: &Xhci, hid: usize, out: &mut Vec<Added>) {
+    let Some(h) = x.hids[hid].as_ref() else {
+        return;
+    };
+    let place = format!("xhci@{}-{}.{}", shared.index, h.path, h.iface);
+    let phys = format!("usb-xhci{}-{}/input{}", shared.index, h.path, h.iface);
+    let (info, keyboard) = match &h.role {
+        Role::Keyboard(_) => (usbhid::keyboard_info(&h.name, &phys, h.id), true),
+        Role::Pointer(p) => (p.info(&h.name, &phys, h.id), false),
+    };
+    out.push((hid, info, place, keyboard));
 }
 
 /// Take what the controller has, and give it to the nodes. The lock of the
@@ -156,6 +171,21 @@ fn service(shared: &'static Shared) -> bool {
             };
             frames.push((hid, events));
         }
+        for (hub, bitmap) in found.hubs {
+            let changes = x.hub_changed(hub, &bitmap);
+            for hid in changes.added {
+                describe(shared, &x, hid, &mut added);
+            }
+            let mut served = lock(&shared.served);
+            for hid in changes.gone {
+                if let Some(s) = served.remove(&hid) {
+                    println!(
+                        "{NAME}: /dev/{} was pulled out of its hub: it is quiet",
+                        s.name
+                    );
+                }
+            }
+        }
         for port in found.ports {
             if x.connected(port) && !x.attached(port) {
                 attach(shared, &mut x, port, &mut added);
@@ -177,6 +207,7 @@ fn service(shared: &'static Shared) -> bool {
     for (hid, info, place, keyboard) in added {
         serve(shared, hid, info, &place, keyboard);
     }
+    serve_new_disks(shared);
     let served = lock(&shared.served).clone();
     for (hid, events) in frames {
         let Some(s) = served.get(&hid) else {
@@ -190,6 +221,218 @@ fn service(shared: &'static Shared) -> bool {
         evdev::tell(&s.node, &mut d);
     }
     pending
+}
+
+/// A disk on the controller, as the kernel's requests reach it.
+struct UsbDisk {
+    shared: &'static Shared,
+    disk: usize,
+    sectors: u64,
+    /// Where the controller sees the window.
+    daddr: u64,
+}
+
+impl Backend for UsbDisk {
+    fn capacity(&self) -> u64 {
+        self.sectors
+    }
+
+    fn has_flush(&self) -> bool {
+        true
+    }
+
+    fn run(&mut self, ios: &[Io], done: &mut [bool]) -> Result<(), Status> {
+        let mut gone = false;
+        {
+            let mut x = lock(&self.shared.xhci);
+            x.quiet(true);
+            let mut i = 0;
+            while i < ios.len() && !gone {
+                let io = &ios[i];
+                // Requests that follow one another on the disk and in the
+                // window go as one command.
+                let mut n = 1;
+                let mut len = io.len();
+                if !io.is_flush() {
+                    while let Some(next) = ios.get(i + n) {
+                        let follows = next.is_read() == io.is_read()
+                            && !next.is_flush()
+                            && next.sector() == io.sector() + (len / blk::SECTOR) as u64
+                            && next.off() == io.off() + len
+                            && len + next.len() <= blk::DATA_MAX;
+                        if !follows {
+                            break;
+                        }
+                        len += next.len();
+                        n += 1;
+                    }
+                }
+                let (sectors, at) = if io.is_flush() {
+                    (0, 0)
+                } else {
+                    ((len / blk::SECTOR) as u32, self.daddr + io.off() as u64)
+                };
+                let write = !io.is_read() && !io.is_flush();
+                let ok = match x.disk_io(self.disk, write, io.sector(), sectors, at) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        println!("{NAME}: disk {}: {e}", self.disk);
+                        gone = x.disks.get(self.disk).is_none_or(|d| d.is_none());
+                        false
+                    }
+                };
+                done[i..i + n].fill(ok);
+                i += n;
+            }
+            x.quiet(false);
+        }
+        // What came while the disk had the controller waits in its stash.
+        while service(self.shared) {}
+        if gone {
+            return Err(Status::PEER_CLOSED);
+        }
+        Ok(())
+    }
+}
+
+/// Serve disk `k` of the controller to the kernel, from a thread of its
+/// own, until it goes.
+fn serve_disk(
+    shared: &'static Shared,
+    k: usize,
+    name: String,
+    sectors: u64,
+    port: &str,
+    unit: usize,
+    iface: u8,
+) {
+    let dma = match Dma::new(shared.bti, blk::DATA_MAX, Some((0, blk::DATA_MAX))) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("{NAME}: disk on port {port}: {e}");
+            return;
+        }
+    };
+    let window = dma.window.expect("asked for above");
+    let (fifo, kernels) = match Fifo::<Msg>::create(blk::FIFO_DEPTH) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("{NAME}: disk on port {port}: fifo_create: {e}");
+            return;
+        }
+    };
+    // SAFETY: no pointers: two handles, which go to the kernel, a count
+    // and which of the controller's disks it is (its root port and route,
+    // which a driver started again finds it on).
+    if let Err(e) = unsafe {
+        zx::call(
+            nr::ECLIPSE_BLOCK_SERVE,
+            [
+                kernels as usize,
+                window as usize,
+                sectors as usize,
+                unit,
+                0,
+                0,
+            ],
+        )
+    } {
+        println!("{NAME}: disk on port {port}: block_serve: {e}");
+        return;
+    }
+    let place = format!("xhci@{}-{port}.{iface}", shared.index);
+    status::publish(
+        &format!("driver.{place}"),
+        &[
+            ("program", NAME),
+            ("device", &place),
+            ("serves", "kernel"),
+            ("sectors", &sectors.to_string()),
+            ("name", &name),
+        ],
+    );
+    println!("{NAME}: {place} \"{name}\" is a disk of {sectors} sectors");
+    // The window is mapped for good (`Dma` unmaps nothing): the kernel may
+    // still use it after the disk goes.
+    let daddr = dma.daddr;
+    std::thread::spawn(move || {
+        let mut disk = UsbDisk {
+            shared,
+            disk: k,
+            sectors,
+            daddr,
+        };
+        let why = serve_until_gone(&mut disk, &fifo);
+        println!("{NAME}: {place}: stopped serving: {why}");
+        // The FIFO goes with this thread: the kernel waits for a driver of
+        // this disk again, and drops it when none comes.
+        drop(fifo);
+    });
+}
+
+/// Answer the kernel's requests for `disk` until its end of the FIFO goes,
+/// the disk stops answering, or it is pulled out: a disk asked nothing
+/// notices that within half a second, and its FIFO goes then.
+fn serve_until_gone(disk: &mut UsbDisk, fifo: &Fifo<Msg>) -> Status {
+    let mut msgs = [Msg::default(); blk::FIFO_DEPTH];
+    loop {
+        match fifo.wait_readable_for(500_000_000) {
+            Ok(true) => {}
+            Ok(false) => {
+                let x = lock(&disk.shared.xhci);
+                if x.disks.get(disk.disk).is_none_or(|d| d.is_none()) {
+                    return Status::PEER_CLOSED;
+                }
+                continue;
+            }
+            Err(e) => return e,
+        }
+        let got = match fifo.read(&mut msgs) {
+            Ok(n) => n,
+            Err(Status::SHOULD_WAIT) => continue,
+            Err(e) => return e,
+        };
+        let (capacity, has_flush) = (disk.capacity(), disk.has_flush());
+        let mut failed = None;
+        blk::answer(&mut msgs[..got], capacity, has_flush, |ios, done| {
+            if failed.is_none() {
+                if let Err(status) = disk.run(ios, done) {
+                    failed = Some(status);
+                }
+            }
+        });
+        if let Err(e) = fifo.write(&msgs[..got]) {
+            return e;
+        }
+        if let Some(status) = failed {
+            return status;
+        }
+    }
+}
+
+/// Serve every disk the controller added since the last look.
+fn serve_new_disks(shared: &'static Shared) {
+    let fresh: Vec<_> = {
+        let mut x = lock(&shared.xhci);
+        let ks = x.new_disks();
+        ks.into_iter()
+            .filter_map(|k| {
+                x.disks[k].as_ref().map(|d| {
+                    (
+                        k,
+                        d.name.clone(),
+                        d.sectors,
+                        d.path.clone(),
+                        d.unit,
+                        d.iface,
+                    )
+                })
+            })
+            .collect()
+    };
+    for (k, name, sectors, path, unit, iface) in fresh {
+        serve_disk(shared, k, name, sectors, &path, unit, iface);
+    }
 }
 
 fn main() {
@@ -223,6 +466,7 @@ fn main() {
     let x = unsafe { Xhci::new(regs, &dma, claim.interrupt.is_some()) }.unwrap_or_else(|e| die(e));
     let shared: &'static Shared = Box::leak(Box::new(Shared {
         index,
+        bti: claim.bti,
         xhci: Mutex::new(x),
         served: Mutex::new(BTreeMap::new()),
         leds: Mutex::new(Vec::new()),
@@ -242,8 +486,9 @@ fn main() {
     for (hid, info, place, keyboard) in added {
         serve(shared, hid, info, &place, keyboard);
     }
-    if lock(&shared.served).is_empty() {
-        println!("{NAME}: no keyboard or pointer on the controller yet");
+    serve_new_disks(shared);
+    if lock(&shared.served).is_empty() && lock(&shared.xhci).disks.is_empty() {
+        println!("{NAME}: no keyboard, pointer or disk on the controller yet");
     }
 
     std::thread::spawn(move || loop {
@@ -282,3 +527,4 @@ fn main() {
         }
     }
 }
+

@@ -517,6 +517,19 @@ ifeq ($(DISK), on)
   qemu_opts += -drive format=qcow2,id=userdisk,if=none,file=$(qemu_disk)
 endif
 
+# USBDISK=<raw image>: a USB disk (usb-storage) on the xhci, which
+# `udriver=xhci@0` leaves to its driver in userspace with the keyboard.
+# USB_HUB=on: a hub on the xhci, with a USB mouse behind it and the USB disk
+# too when there is one.
+ifeq ($(USB_HUB),on)
+  qemu_opts += -device usb-hub,bus=xhci.0,port=3,id=usbhub -device usb-mouse,bus=xhci.0,port=3.2
+  usbdisk_at := ,port=3.1
+endif
+ifneq ($(USBDISK),)
+  qemu_opts += -drive file=$(USBDISK),if=none,format=raw,id=usbdisk
+  qemu_opts += -device usb-storage,bus=xhci.0,drive=usbdisk$(usbdisk_at)
+endif
+
 # UDISK=<raw image>: one more virtio disk, for the driver in userspace. The
 # kernel leaves every virtio disk to that driver but the one it boots from on
 # a machine with no initrd: on aarch64 the root disk is the first, so this

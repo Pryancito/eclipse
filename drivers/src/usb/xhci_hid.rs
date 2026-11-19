@@ -7672,7 +7672,8 @@ impl PciDriver for XhciDriverPci {
         // which serves its keyboards and pointers as `/dev/input/eventN`;
         // the kernel does not so much as take it from the firmware. Counted
         // either way, so `@N` names the same controller whatever the
-        // command line says. The driver waits on the MSI the bus armed.
+        // command line says. The driver waits on the MSI the bus armed, or
+        // on the first MSI-X vector, armed here.
         if dev.id.prog_if == 0x30
             && crate::user::reserve_if(
                 crate::user::XHCI,
@@ -7680,9 +7681,15 @@ impl PciDriver for XhciDriverPci {
                 crate::user::Transport::Pci,
                 base_addr + offset,
                 map_len - offset,
-                || crate::user::Wiring {
-                    irq: irq.map(|idx| idx + 32),
-                    vaddr: Some(vaddr),
+                || {
+                    // QEMU's qemu-xhci offers MSI-X and no MSI: without it
+                    // armed, the driver would have no interrupt at all.
+                    let irq = crate::bus::pci::arm_msix_now(dev.loc, mapper, irq).or(irq);
+                    crate::user::Wiring {
+                        // x86 MSI numbers sit 32 below their vectors.
+                        irq: irq.map(|idx| idx + 32),
+                        vaddr: Some(vaddr),
+                    }
                 },
             )
         {
