@@ -86,18 +86,37 @@ pub(super) fn fstab_line_action<'a>(
     }
 }
 
-/// The service of the root filesystem that mounts the FAT lines this pass
-/// leaves, from the root: `eclipse-fat-mounts`, which starts a server
-/// process (`eclipse-fatfs`) for each.
-pub(super) const FAT_MOUNTS_SERVICE: &str = "etc/eclipse/services/fat-mounts.service";
+/// The service of the root filesystem that mounts the lines this pass
+/// leaves, from the root: `eclipse-fs-mounts`, which starts a server
+/// process for each (`eclipse-fatfs`, `eclipse-btrfs`, `eclipse-eclipsefs`,
+/// `eclipse-nfs`).
+pub(super) const FS_MOUNTS_SERVICE: &str = "etc/eclipse/services/fs-mounts.service";
 
-/// Whether a block line is left to the FAT server: every FAT line, as the
-/// kernel has no FAT of its own. `parsed` is the type as
-/// [`mount_ops::parse_fstype`] spells it, so every spelling of FAT is left.
-/// The service in [`FAT_MOUNTS_SERVICE`] mounts them, the placeholder of
-/// an image nobody installed (`__ECLIPSE_EFI_DEV___`) too.
-pub(super) fn left_to_fat_server(parsed: &str) -> bool {
+/// Whether a line is left to its server, mounted by [`FS_MOUNTS_SERVICE`].
+///
+/// Every FAT line is, as the kernel has no FAT of its own. A btrfs,
+/// EclipseFS or NFS line is when the root filesystem has the service that
+/// mounts it, the boot does not keep those for the kernel (`ufs=kernel`),
+/// and the line asks nothing a served mount would drop
+/// ([`mount_ops::served_by_default`], the rule of `mount(2)`). A root
+/// filesystem older than this kernel has no such service, and there the
+/// kernel mounts them as it did. `parsed` is the type as
+/// [`mount_ops::parse_fstype`] spells it, so every spelling is left or none
+/// is.
+pub(super) fn left_to_server(
+    parsed: &str,
+    options: &str,
+    ufs: Option<&str>,
+    has_service: bool,
+) -> bool {
     parsed == "vfat"
+        || has_service
+            && mount_ops::served_by_default(
+                parsed,
+                fstab_flags(options),
+                fstab_mount_data(options),
+                ufs,
+            )
 }
 
 /// The deadline every network line of this fstab run shares, built on the

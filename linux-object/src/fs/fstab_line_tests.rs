@@ -293,17 +293,49 @@ fn the_runs_deadline_is_built_once_and_handed_out_again() {
     );
 }
 
-/// Every FAT line is the server's: the kernel has no FAT to keep one.
+/// Every FAT line is the server's: the kernel has no FAT to keep one. A
+/// btrfs, EclipseFS or NFS line is when the root has the service that
+/// mounts it and the boot does not keep it for the kernel.
 #[test]
-fn a_fat_line_is_left_to_its_server() {
+fn a_line_is_left_to_its_server() {
     for fstype in ["vfat", "msdos", "FAT32", "fat16", "fat"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
-        assert!(left_to_fat_server(parsed), "{}", fstype);
+        for has_service in [true, false] {
+            for ufs in [None, Some("kernel")] {
+                assert!(
+                    left_to_server(parsed, "defaults", ufs, has_service),
+                    "{}",
+                    fstype
+                );
+            }
+        }
     }
-    for fstype in ["btrfs", "eclipsefs"] {
+    for fstype in ["btrfs", "eclipsefs", "nfs"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
-        assert!(!left_to_fat_server(parsed), "{}", fstype);
+        assert!(left_to_server(parsed, "defaults", None, true), "{}", fstype);
+        assert!(
+            left_to_server(parsed, "defaults,noatime", Some("server"), true),
+            "{}",
+            fstype
+        );
+        assert!(
+            !left_to_server(parsed, "defaults", Some("kernel"), true),
+            "{}: `ufs=kernel` is the way back",
+            fstype
+        );
+        assert!(
+            !left_to_server(parsed, "defaults", None, false),
+            "{}: nothing in this root would mount it",
+            fstype
+        );
+        assert!(
+            !left_to_server(parsed, "noexec", None, true),
+            "{}: a served mount keeps no noexec",
+            fstype
+        );
     }
+    assert!(!left_to_server("btrfs", "subvol=@home", None, true));
+    assert!(!left_to_server("tmpfs", "defaults", None, true));
 }
 
 /// `mount` with no `-t` tries the types of `/proc/filesystems` one by one,

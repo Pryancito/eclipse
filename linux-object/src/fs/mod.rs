@@ -2371,8 +2371,8 @@ pub async fn mount_fstab_deferred() {
 }
 
 use fstab_line::{
-    fstab_flags, fstab_line_action, left_to_fat_server, mount_fstab_network, run_budget,
-    FstabAction, FAT_MOUNTS_SERVICE,
+    fstab_flags, fstab_line_action, left_to_server, mount_fstab_network, run_budget, FstabAction,
+    FS_MOUNTS_SERVICE,
 };
 
 async fn mount_fstab(root: &Arc<MNode>) {
@@ -2382,9 +2382,13 @@ async fn mount_fstab(root: &Arc<MNode>) {
     // server is actually dialled.
     let mut net_budget: Option<Budget> = None;
     // The FAT lines are a server process's, started by a service of this
-    // root filesystem: the kernel has no FAT.
+    // root filesystem: the kernel has no FAT. So are the btrfs, EclipseFS
+    // and NFS lines, on a root that has the service, unless the boot says
+    // `ufs=kernel`.
     let root_dyn: Arc<dyn INode> = root.clone();
-    let has_fat_service = root_dyn.lookup_follow(FAT_MOUNTS_SERVICE, 4).is_ok();
+    let has_fs_service = root_dyn.lookup_follow(FS_MOUNTS_SERVICE, 4).is_ok();
+    let cmdline = kernel_hal::boot::cmdline();
+    let ufs = kernel_hal::cmdline::value(&cmdline, "ufs");
     if let Ok(etc) = root.find(true, "etc") {
         if let Ok(fstab_inode) = etc.find(true, "fstab") {
             let fstab_dyn: Arc<dyn INode> = fstab_inode;
@@ -2416,6 +2420,12 @@ async fn mount_fstab(root: &Arc<MNode>) {
                                 warn!("mount_fstab: unsupported fstype {:?}: {:?}", fstype, e);
                                 continue;
                             }
+                            FstabAction::Network(fstype_parsed)
+                                if left_to_server(fstype_parsed, options, ufs, has_fs_service) =>
+                            {
+                                info!("mount_fstab: {:?} is left to its server", target);
+                                continue;
+                            }
                             FstabAction::Network(fstype_parsed) => {
                                 mount_fstab_network(
                                     root,
@@ -2430,13 +2440,13 @@ async fn mount_fstab(root: &Arc<MNode>) {
                             }
                             FstabAction::Block(fstype_parsed) => fstype_parsed,
                         };
-                        if left_to_fat_server(fstype_parsed) {
-                            if has_fat_service {
-                                info!("mount_fstab: {:?} is left to the FAT server", target);
+                        if left_to_server(fstype_parsed, options, ufs, has_fs_service) {
+                            if has_fs_service {
+                                info!("mount_fstab: {:?} is left to its server", target);
                             } else {
                                 warn!(
                                     "mount_fstab: {:?} is FAT, and this root has no {} to mount it",
-                                    target, FAT_MOUNTS_SERVICE
+                                    target, FS_MOUNTS_SERVICE
                                 );
                             }
                             continue;
