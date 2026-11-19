@@ -750,6 +750,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("unvme", "respawn", "/usr/local/bin/eclipse-unvme 1", ""),
         ("unvme2", "respawn", "/usr/local/bin/eclipse-unvme 2", ""),
         ("ups2", "respawn", "/usr/local/bin/eclipse-ups2", ""),
+        ("uxhci", "respawn", "/usr/local/bin/eclipse-uxhci", ""),
         (
             "xkbmap",
             "oneshot",
@@ -977,7 +978,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         [
             "enet", "knet", "uahci", "uahci2", "ublk", "ublk2", "ublk3", "ublk4", "uhda", "uinput",
-            "uinput2", "unet", "unvme", "unvme2", "ups2"
+            "uinput2", "unet", "unvme", "unvme2", "ups2", "uxhci"
         ],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
@@ -987,6 +988,13 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     // The HD Audio controller: the first one, served as /dev/dsp. Out of
     // the list after this, so what follows counts the others.
     let (hda, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "uhda");
+    // The xHCI controller: the first one, its keyboards and pointers.
+    let (xhci, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "uxhci");
+    assert_eq!(field(&xhci[0].1, "udriver"), Some("xhci"));
+    assert_eq!(
+        field(&xhci[0].1, "exec"),
+        Some("/usr/local/bin/eclipse-uxhci")
+    );
     assert_eq!(field(&hda[0].1, "udriver"), Some("hda"));
     assert_eq!(
         field(&hda[0].1, "exec"),
@@ -1773,6 +1781,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "uinput2",
         "ups2",
         "uhda",
+        "uxhci",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {

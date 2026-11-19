@@ -54,6 +54,10 @@ name = "udrv-snd-check"
 path = "src/bin/udrv-snd-check.rs"
 
 [[bin]]
+name = "udrv-xhci"
+path = "src/bin/udrv-xhci.rs"
+
+[[bin]]
 name = "udrv-evdev-check"
 path = "src/bin/udrv-evdev-check.rs"
 

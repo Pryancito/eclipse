@@ -71,7 +71,14 @@ const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
 /// device as a node of `/dev/input` (`udriver=virtio-input@N`, and the
 /// PC's i8042 with `udriver=i8042@0`: its keyboard and its mouse); and
 /// what checks and times such a node, `udrv-evdev-check NODE`.
-const INPUT_DRIVERS: [&str; 3] = ["udrv-virtio-input", "udrv-ps2", "udrv-evdev-check"];
+/// And the driver of an xHCI USB controller (`udriver=xhci@N`), serving the
+/// keyboards and pointers on it.
+const INPUT_DRIVERS: [&str; 4] = [
+    "udrv-virtio-input",
+    "udrv-ps2",
+    "udrv-xhci",
+    "udrv-evdev-check",
+];
 /// The driver of an Intel HD Audio controller, from the same package,
 /// serving it as `/dev/dsp` and ALSA's `/dev/snd` (`udriver=hda@N`); and
 /// what plays a tone through such nodes and checks them, `udrv-dsp-check`
@@ -426,6 +433,33 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           [ -n \"$n\" ] || { echo 'eclipse-uhda: the kernel left no HD Audio controller to userspace' >&2; sleep 5; exit 1; }\n\
           [ -x /bin/udrv-hda ] || { echo 'eclipse-uhda: /bin/udrv-hda is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
           exec /bin/udrv-hda \"$n\"\n",
+    )
+    .unwrap();
+
+    // The xHCI controller the boot leaves to userspace (`udriver=xhci@N`):
+    // the first one, its keyboards and pointers served as
+    // `/dev/input/eventK`.
+    fs::write(
+        svc_dir.join("uxhci.service"),
+        "# Driver of the first xHCI USB controller the kernel left to\n\
+         # userspace (udriver=xhci@N): its keyboards and pointers, served\n\
+         # as /dev/input/event*. See /usr/local/bin/eclipse-uxhci.\n\
+         exec = /usr/local/bin/eclipse-uxhci\n\
+         type = respawn\n\
+         udriver = xhci\n",
+    )
+    .unwrap();
+    fs::write(
+        localbin.join("eclipse-uxhci"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of an xHCI controller the\n\
+          # kernel left alone (udriver=xhci@N), in the foreground for\n\
+          # eclipse-init, which starts it again if it dies. It serves the\n\
+          # keyboards and pointers on it. See tools/eclipse-udrivers.\n\
+          n=$(sed -n 's/^xhci@//p' /proc/udrivers | sed -n 1p)\n\
+          [ -n \"$n\" ] || { echo 'eclipse-uxhci: the kernel left no xHCI controller to userspace' >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-xhci ] || { echo 'eclipse-uxhci: /bin/udrv-xhci is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-xhci \"$n\"\n",
     )
     .unwrap();
 

@@ -16,6 +16,10 @@
 //! prints `MOVE NOW` and waits, 60 s at most, for a move and a click of
 //! the left button; every frame must end in a `SYN_REPORT`.
 //!
+//! `udrv-evdev-check tablet NODE` checks a tablet's the same way: absolute
+//! X and Y with their ranges, a left button; it prints `MOVE ABS NOW` and
+//! waits for a position and a click.
+//!
 //! The last line is `PASS N` or `FAIL N of M`; the exit status is 0 only
 //! when every check passed.
 
@@ -25,8 +29,10 @@ use std::process::exit;
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
 const EV_LED: u16 = 0x11;
 const REL_X: u16 = 0;
+const ABS_X: u16 = 0;
 const BTN_LEFT: u16 = 0x110;
 const SYN_REPORT: u16 = 0;
 const LED_CAPSL: u16 = 1;
@@ -46,6 +52,9 @@ const EVIOCGLED: u32 = ioc(R, 0x19, 8);
 const EVIOCGBIT_EV: u32 = ioc(R, 0x20, 8);
 const EVIOCGBIT_KEY: u32 = ioc(R, 0x21, 96);
 const EVIOCGBIT_REL: u32 = ioc(R, 0x22, 8);
+const EVIOCGBIT_ABS: u32 = ioc(R, 0x23, 8);
+/// `EVIOCGABS(ABS_X)`: its `struct input_absinfo`, six ints.
+const EVIOCGABS_X: u32 = ioc(R, 0x40 + ABS_X as u32, 24);
 const EVIOCGRAB: u32 = ioc(W, 0x90, 4);
 const EVIOCSCLOCKID: u32 = ioc(W, 0xa0, 4);
 
@@ -338,30 +347,48 @@ fn check(node: &str, keys: usize) -> bool {
     c.failed == 0
 }
 
-fn mouse(node: &str) -> bool {
+/// A mouse's check, or with `abs` a tablet's.
+fn mouse(node: &str, abs: bool) -> bool {
     let mut c = Checks {
         passed: 0,
         failed: 0,
     };
     let fd = open(node, libc::O_RDONLY | libc::O_NONBLOCK);
     let mut ev = [0u8; 8];
+    let (axes, axes_name) = if abs {
+        (EV_ABS, "EV_ABS")
+    } else {
+        (EV_REL, "EV_REL")
+    };
     c.check(
-        "EVIOCGBIT(0) has EV_KEY and EV_REL",
+        &format!("EVIOCGBIT(0) has EV_KEY and {axes_name}"),
         ioctl_buf(fd, EVIOCGBIT_EV, &mut ev) > 0
             && bit(&ev, EV_KEY as usize)
-            && bit(&ev, EV_REL as usize),
+            && bit(&ev, axes as usize),
     );
-    let mut rel = [0u8; 8];
-    c.check(
-        "EVIOCGBIT(EV_REL) has REL_X",
-        ioctl_buf(fd, EVIOCGBIT_REL, &mut rel) > 0 && bit(&rel, REL_X as usize),
-    );
+    if abs {
+        let mut bits = [0u8; 8];
+        c.check(
+            "EVIOCGBIT(EV_ABS) has ABS_X",
+            ioctl_buf(fd, EVIOCGBIT_ABS, &mut bits) > 0 && bit(&bits, ABS_X as usize),
+        );
+        let mut info = [0u8; 24];
+        let n = ioctl_buf(fd, EVIOCGABS_X, &mut info);
+        let int = |i: usize| i32::from_ne_bytes(info[i * 4..i * 4 + 4].try_into().unwrap());
+        c.check("EVIOCGABS(ABS_X) says a range", n >= 0 && int(2) > int(1));
+    } else {
+        let mut rel = [0u8; 8];
+        c.check(
+            "EVIOCGBIT(EV_REL) has REL_X",
+            ioctl_buf(fd, EVIOCGBIT_REL, &mut rel) > 0 && bit(&rel, REL_X as usize),
+        );
+    }
     let mut keys = [0u8; 96];
     c.check(
         "EVIOCGBIT(EV_KEY) has BTN_LEFT",
         ioctl_buf(fd, EVIOCGBIT_KEY, &mut keys) > 0 && bit(&keys, BTN_LEFT as usize),
     );
-    println!("MOVE NOW");
+    println!("{}", if abs { "MOVE ABS NOW" } else { "MOVE NOW" });
     let (mut moved, mut down, mut up, mut unended) = (false, false, false, false);
     let mut open_frame = false;
     let start = monotonic_us();
@@ -372,7 +399,8 @@ fn mouse(node: &str) -> bool {
                     println!("event {} {:#x} {}", e.kind, e.code, e.value);
                     match (e.kind, e.code, e.value) {
                         (EV_SYN, SYN_REPORT, _) => open_frame = false,
-                        (EV_REL, REL_X, v) if v != 0 => moved = true,
+                        (EV_REL, REL_X, v) if v != 0 && !abs => moved = true,
+                        (EV_ABS, ABS_X, _) if abs => moved = true,
                         (EV_KEY, BTN_LEFT, 1) => down = true,
                         (EV_KEY, BTN_LEFT, 0) => up = down,
                         _ => {}
@@ -431,10 +459,10 @@ fn time(node: &str, rounds: u32) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: udrv-evdev-check NODE [KEYS] | udrv-evdev-check time NODE [ROUNDS] \
-                 | udrv-evdev-check mouse NODE";
+                 | udrv-evdev-check mouse NODE | udrv-evdev-check tablet NODE";
     match args.get(1).map(String::as_str) {
-        Some("mouse") => match args.get(2) {
-            Some(node) if mouse(node) => {}
+        Some(kind @ ("mouse" | "tablet")) => match args.get(2) {
+            Some(node) if mouse(node, kind == "tablet") => {}
             Some(_) => exit(1),
             None => {
                 println!("{usage}");

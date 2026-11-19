@@ -60,8 +60,13 @@ pub const I8042_AUX: &str = "i8042-aux";
 /// kernel drives itself unless `udriver=hda@N` asks for it: its driver in
 /// userspace serves it as `/dev/dsp`.
 pub const HDA: &str = "hda";
+/// An xHCI USB controller, with every device on its ports, which the kernel
+/// drives itself unless `udriver=xhci@N` asks for it: its driver in
+/// userspace serves the keyboards and pointers on it as
+/// `/dev/input/eventN`.
+pub const XHCI: &str = "xhci";
 /// The kinds that can be reserved.
-const KINDS: [&str; 9] = [
+const KINDS: [&str; 10] = [
     VIRTIO_BLK,
     VIRTIO_NET,
     E1000E,
@@ -71,6 +76,7 @@ const KINDS: [&str; 9] = [
     I8042,
     I8042_AUX,
     HDA,
+    XHCI,
 ];
 
 /// How the device is reached.
@@ -184,6 +190,17 @@ const HDA_CORBCTL: usize = 0x4c;
 const HDA_RIRBCTL: usize = 0x5c;
 const HDA_SD_BASE: usize = 0x80;
 const HDA_SD_LEN: usize = 0x20;
+/// An xHCI controller's capability length (the operational registers
+/// follow), its command register with the run/stop and reset bits, and its
+/// status register, whose halted bit is set once the controller has
+/// stopped (xHCI 1.2 §5.4.1, §5.4.2).
+const XHCI_CAPLENGTH: usize = 0x00;
+const XHCI_USBCMD: usize = 0x00;
+const XHCI_USBSTS: usize = 0x04;
+const XHCI_CMD_RUN: u32 = 1;
+const XHCI_CMD_RESET: u32 = 1 << 1;
+const XHCI_CMD_INTE: u32 = 1 << 2;
+const XHCI_STS_HALTED: u32 = 1;
 
 impl UserDevice {
     /// Take the device. Only one caller gets `true` until it is
@@ -315,6 +332,32 @@ impl UserDevice {
                 let gctl = (vaddr + HDA_GCTL) as *const u32;
                 // SAFETY: as above.
                 (0..NVME_RESET_READS).any(|_| unsafe { gctl.read_volatile() } & HDA_GCTL_CRST == 0)
+            }
+            Transport::Pci if self.kind == XHCI => {
+                // SAFETY: as above; the capability length is the first
+                // byte of the window.
+                let op = vaddr
+                    + unsafe { ((vaddr + XHCI_CAPLENGTH) as *const u8).read_volatile() } as usize;
+                if op + XHCI_USBSTS + 4 > vaddr + self.size {
+                    return false;
+                }
+                let cmd = (op + XHCI_USBCMD) as *mut u32;
+                let sts = (op + XHCI_USBSTS) as *const u32;
+                // SAFETY: both registers are inside the window. Stopped,
+                // the controller walks no ring and writes no event; then
+                // it is reset, which forgets every ring and context the
+                // driver gave it. The next driver waits for the reset to
+                // end, as it would after a firmware's.
+                unsafe {
+                    cmd.write_volatile(cmd.read_volatile() & !(XHCI_CMD_RUN | XHCI_CMD_INTE));
+                }
+                let halted = (0..NVME_RESET_READS)
+                    .any(|_| unsafe { sts.read_volatile() } & XHCI_STS_HALTED != 0);
+                if halted {
+                    // SAFETY: as above.
+                    unsafe { cmd.write_volatile(XHCI_CMD_RESET) };
+                }
+                halted
             }
             // A PCI function of a kind this does not know how to stop.
             Transport::Pci => false,
@@ -535,7 +578,8 @@ pub fn leave_input(spec: Option<&str>, virtio: bool, i8042: bool) {
 }
 
 /// Parse one item of a `udriver=` value: `virtio-blk@N`, `virtio-net@N`,
-/// `e1000e@N`, `nvme@N`, `ahci@N`, `virtio-input@N`, `i8042@0` or `hda@N`.
+/// `e1000e@N`, `nvme@N`, `ahci@N`, `virtio-input@N`, `i8042@0`, `hda@N` or
+/// `xhci@N`.
 /// Anything else reserves nothing (and says so). Not `kind:N`: the command
 /// line is split on `:`.
 pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
@@ -756,6 +800,7 @@ mod tests {
         assert_eq!(parse_spec("nvme@1"), Some((NVME, 1)));
         assert_eq!(parse_spec("ahci@1"), Some((AHCI, 1)));
         assert_eq!(parse_spec("hda@0"), Some((HDA, 0)));
+        assert_eq!(parse_spec("xhci@0"), Some((XHCI, 0)));
         assert_eq!(parse_spec("virtio-input@0"), Some((VIRTIO_INPUT, 0)));
         assert_eq!(parse_spec("i8042@0"), Some((I8042, 0)));
         assert_eq!(parse_spec("virtio-gpu@0"), None);
@@ -861,6 +906,27 @@ mod tests {
         assert_eq!(window[E1000E_IMC / 4], u32::MAX);
         assert_eq!((window[E1000E_RCTL / 4], window[E1000E_TCTL / 4]), (0, 0));
         assert_eq!(window[E1000E_CTRL / 4], 0x40 | E1000E_CTRL_RST);
+    }
+
+    #[test]
+    fn an_xhci_controller_is_stopped_then_reset() {
+        let mut words = [0u32; 0x20];
+        // SAFETY: the words' bytes, aligned as the registers are.
+        let window =
+            unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, 0x80) };
+        window[XHCI_CAPLENGTH] = 0x20;
+        let op = 0x20;
+        window[op..op + 4].copy_from_slice(&(XHCI_CMD_RUN | XHCI_CMD_INTE | 0x100).to_le_bytes());
+        window[op + 4..op + 8].copy_from_slice(&XHCI_STS_HALTED.to_le_bytes());
+        let ctrl = UserDevice {
+            kind: XHCI,
+            ..device(Transport::Pci, window)
+        };
+        assert!(ctrl.reset());
+        assert_eq!(window[op..op + 4], XHCI_CMD_RESET.to_le_bytes());
+        // One that never halts is not taken for stopped.
+        window[op + 4] = 0;
+        assert!(!ctrl.reset());
     }
 
     #[test]
