@@ -203,6 +203,12 @@ impl StackLink {
     /// until the stack says how it is; and the message that asks. `None`
     /// for a change that is not one of those.
     pub(super) fn wish(&self, card: u64, change: Change) -> Option<Vec<u8>> {
+        // A neighbour is none of what a `MORE` or a `SIX` says: no wish
+        // of those is numbered for it.
+        if let Change::Neighbour(address, hardware) = change {
+            self.more_of(card).befriend(address, hardware);
+            return Some(super::neigh::neighbour_message(card, &address, hardware));
+        }
         let which = self.next_wish();
         match change {
             Change::Also(IpCidr::Ipv4(cidr), have) => {

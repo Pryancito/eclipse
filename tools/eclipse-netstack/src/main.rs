@@ -101,6 +101,7 @@ use netstack::port::Port;
 use netstack::resolv::{self, Applied, Named};
 use netstack::socks::lease::{Addressing, Lease};
 use netstack::socks::more;
+use netstack::socks::neigh;
 use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
 use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_FRAMES, OP_SEND};
@@ -1029,6 +1030,7 @@ fn serve_sockets(kernel: Arc<Kernel>) {
         for done in 1.. {
             let said = &message[..len];
             let wished = more::wished(said).map(|wish| wish.and_then(grant));
+            let wished = wished.or_else(|| neigh::wished(said).map(|wish| wish.and_then(befriend)));
             let asked = match (
                 wished.or_else(|| cards::asked(said).map(|ask| ask.and_then(configure))),
                 hosts,
@@ -1286,6 +1288,28 @@ fn grant((card, wish, which): (u64, more::Wish, u32)) -> Result<u32, netstack::s
     host.say_card();
     publish(host);
     done.map(|()| 1 << host.slot)
+}
+
+/// Do what the kernel wishes of a card's neighbours (`NEIGHBOUR`): one
+/// written by hand, or one forgotten. The card's next turn says its
+/// neighbours as that left them.
+fn befriend((card, wish): (u64, neigh::Wish)) -> Result<u32, netstack::socks::Refused> {
+    use netstack::socks::Refused;
+    let host = hosts()
+        .iter()
+        .find(|host| host.card() == card)
+        .ok_or(Refused::NoSocket)?;
+    let index = host.index;
+    locked(&host.shared).stack.neighbour(wish)?;
+    match wish {
+        (address, Some(at)) => {
+            println!("{NAME}: card {index} has {address} at {at}, as it was asked")
+        }
+        (address, None) => {
+            println!("{NAME}: card {index} forgot where {address} is, as it was asked")
+        }
+    }
+    Ok(1 << host.slot)
 }
 
 /// `, with sockets` once the kernel has them here.

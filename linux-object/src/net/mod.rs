@@ -346,7 +346,51 @@ pub const SIOCGIFHWADDR: usize = 0x8927;
 pub const SIOCGIFINDEX: usize = 0x8933;
 pub const SIOCGIFTXQLEN: usize = 0x8942;
 pub const SIOCGIFMAP: usize = 0x8970;
+pub const SIOCDARP: usize = 0x8953;
 pub const SIOCGARP: usize = 0x8954;
+pub const SIOCSARP: usize = 0x8955;
+/// `arpreq.arp_flags`: the hardware address is known; and it was
+/// written by hand.
+pub const ATF_COM: u32 = 0x02;
+pub const ATF_PERM: u32 = 0x04;
+/// `struct arpreq`: `arp_pa` (a `sockaddr_in`), `arp_ha` (a `sockaddr`
+/// with the hardware address in its data), `arp_flags`, `arp_netmask`,
+/// `arp_dev`.
+pub const ARPREQ_LEN: usize = 68;
+
+/// The address of IPv4, the hardware address and the card's name (when
+/// it names one) that a `struct arpreq` says.
+pub fn arpreq_said(req: &[u8; ARPREQ_LEN]) -> LxResult<(IpAddress, [u8; 6], Option<&str>)> {
+    if u16::from_ne_bytes([req[0], req[1]]) != 2 {
+        return Err(LxError::EPFNOSUPPORT);
+    }
+    let address = IpAddress::v4(req[4], req[5], req[6], req[7]);
+    let mut hardware = [0u8; 6];
+    hardware.copy_from_slice(&req[18..24]);
+    let name = &req[52..];
+    let len = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+    let name = core::str::from_utf8(&name[..len]).map_err(|_| LxError::EINVAL)?;
+    Ok((address, hardware, (!name.is_empty()).then_some(name)))
+}
+
+/// The card an `arpreq` is about: the one it names, or else the one
+/// with a network of IPv4 that `address` is on.
+fn arpreq_iface(
+    address: &IpAddress,
+    name: Option<&str>,
+) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    if let Some(name) = name {
+        return iface_by_name(name);
+    }
+    let on = |iface: &Arc<dyn zcore_drivers::scheme::NetScheme>| {
+        let ours = iface.get_ip_address();
+        ours.iter().any(|ours| ours.contains_addr(address))
+    };
+    get_net_device()
+        .into_iter()
+        .find(on)
+        .ok_or(LxError::ENETUNREACH)
+}
 pub const ARPHRD_ETHER: u16 = 1;
 pub const ARPHRD_LOOPBACK: u16 = 772;
 
@@ -1335,8 +1379,42 @@ pub fn handle_net_ioctl(
             }
         }
 
-        // SIOCGARP
-        SIOCGARP => Err(LxError::ENOENT),
+        // `arp -s`, `arp -d` and what `arp` asked before it read
+        // `/proc/net/arp`: a neighbour of IPv4 written by hand, forgotten,
+        // or said.
+        SIOCSARP | SIOCDARP | SIOCGARP => {
+            #[allow(unsafe_code)]
+            let req = unsafe { &mut *(arg1 as *mut [u8; ARPREQ_LEN]) };
+            let (address, hardware, name) = arpreq_said(req)?;
+            let iface = arpreq_iface(&address, name)?;
+            let known = iface.get_neighbours();
+            let known = known.iter().find(|n| n.address == address);
+            match request {
+                SIOCGARP => {
+                    let known = known.ok_or(LxError::ENXIO)?;
+                    req[16..18].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
+                    req[18..24].copy_from_slice(&known.hardware);
+                    let flags = ATF_COM | if known.fixed() { ATF_PERM } else { 0 };
+                    req[32..36].copy_from_slice(&flags.to_ne_bytes());
+                    Ok(0)
+                }
+                _ => {
+                    let hardware = (request == SIOCSARP).then_some(hardware);
+                    if hardware.is_none() && known.is_none() {
+                        return Err(LxError::ENXIO);
+                    }
+                    iface.set_neighbour(address, hardware).map_err(|e| {
+                        use zcore_drivers::DeviceError::*;
+                        match e {
+                            NotSupported => LxError::EOPNOTSUPP,
+                            NotReady => LxError::ENETDOWN,
+                            _ => LxError::EINVAL,
+                        }
+                    })?;
+                    Ok(0)
+                }
+            }
+        }
 
         _ => Err(LxError::ENOSYS),
     }
@@ -2370,6 +2448,28 @@ pub fn proc_net_unix_content() -> alloc::string::String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_arpreq_says_an_address_where_it_is_and_on_which_card() {
+        // `arp -i eth0 -s 10.0.2.77 02:00:00:00:00:77`, as busybox fills it.
+        let mut req = [0u8; ARPREQ_LEN];
+        req[..2].copy_from_slice(&2u16.to_ne_bytes());
+        req[4..8].copy_from_slice(&[10, 0, 2, 77]);
+        req[16..18].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
+        req[18..24].copy_from_slice(&[2, 0, 0, 0, 0, 0x77]);
+        req[52..56].copy_from_slice(b"eth0");
+        let who = zcore_drivers::wire::IpAddress::v4(10, 0, 2, 77);
+        assert_eq!(
+            arpreq_said(&req),
+            Ok((who, [2, 0, 0, 0, 0, 0x77], Some("eth0")))
+        );
+        // With no card named, the one whose network it is on is looked for.
+        req[52..56].fill(0);
+        assert_eq!(arpreq_said(&req).map(|said| said.2), Ok(None));
+        // Not an address of IPv4.
+        req[..2].copy_from_slice(&10u16.to_ne_bytes());
+        assert_eq!(arpreq_said(&req), Err(LxError::EPFNOSUPPORT));
+    }
+
     use super::*;
     use zcore_drivers::wire::Ipv4Address;
 

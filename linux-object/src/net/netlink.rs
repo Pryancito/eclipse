@@ -45,6 +45,7 @@ const _: () = {
 /// viaja por el socket es el numero de Linux, y escribirlo a mano es la unica
 /// forma de que la tabla se lea de una vez.
 mod errno {
+    pub const ENOENT: i32 = 2;
     pub const ESRCH: i32 = 3;
     pub const EIO: i32 = 5;
     pub const EEXIST: i32 = 17;
@@ -647,6 +648,32 @@ impl Socket for NetlinkSocketState {
                     }
                     info!("[netlink] GetRoute: dumped routes");
                 }
+                NetlinkMessageType::NewNeigh | NetlinkMessageType::DelNeigh => {
+                    // `ip neigh add|replace|change|del`, and `ip neigh
+                    // flush`, which is a `DelNeigh` for each it was shown.
+                    let new = matches!(message_type, NetlinkMessageType::NewNeigh);
+                    let asked = parse_neigh_request(data).ok_or(errno::EINVAL);
+                    let done = asked.and_then(|(ndm, address, hardware)| {
+                        let iface = crate::net::iface_by_linux_ifindex(ndm.ndm_ifindex as u32)
+                            .map_err(|_| errno::ENODEV)?;
+                        let known = iface.get_neighbours();
+                        let hardware = neigh_request(
+                            new,
+                            header.nlmsg_flags,
+                            &ndm,
+                            address,
+                            hardware,
+                            &known,
+                        )?;
+                        iface
+                            .set_neighbour(address, hardware)
+                            .map_err(errno_del_driver)
+                    });
+                    if let Err(errno) = done {
+                        log::warn!("[netlink] {:?}: errno {}", message_type, errno);
+                    }
+                    push_ack(&mut buffer, header, reply_pid, done.err().unwrap_or(0));
+                }
                 NetlinkMessageType::GetNeigh => {
                     // The family asked for, when one is: the first byte
                     // behind the header.
@@ -1109,6 +1136,8 @@ enum_with_unknown! {
         GetRoute = 26,
         /// New neighbour
         NewNeigh = 28,
+        /// Delete neighbour
+        DelNeigh = 29,
         /// Get neighbour
         GetNeigh = 30,
     }
@@ -1458,6 +1487,83 @@ const NDA_LLADDR: u16 = 2;
 /// Heard from not long ago, and known from before that.
 const NUD_REACHABLE: u16 = 0x02;
 const NUD_STALE: u16 = 0x04;
+/// Written by hand: there until it is taken away.
+const NUD_PERMANENT: u16 = 0x80;
+
+/// What a `RTM_NEWNEIGH` or a `RTM_DELNEIGH` that asks says: its
+/// `ndmsg`, the address (`NDA_DST`) and the hardware address
+/// (`NDA_LLADDR`) when it has one. `None` when it is not whole or has no
+/// address.
+fn parse_neigh_request(data: &[u8]) -> Option<(NeighMsg, IpAddress, Option<[u8; 6]>)> {
+    let off = size_of::<NetlinkMessageHeader>();
+    let ndm: NeighMsg = read_struct(data, off)?;
+    let (mut address, mut hardware) = (None, None);
+    for_each_rtattr(
+        data,
+        off + size_of::<NeighMsg>(),
+        |kind, payload| match kind {
+            NDA_DST if payload.len() == 4 => {
+                address = Some(IpAddress::Ipv4(Ipv4Address::from_bytes(payload)));
+            }
+            NDA_DST if payload.len() == 16 => {
+                address = Some(IpAddress::Ipv6(Ipv6Address::from_bytes(payload)));
+            }
+            NDA_LLADDR if payload.len() == 6 => {
+                let mut at = [0u8; 6];
+                at.copy_from_slice(payload);
+                hardware = Some(at);
+            }
+            _ => {}
+        },
+    );
+    Some((ndm, address?, hardware))
+}
+
+/// What is to be done for a request about a neighbour of a card that
+/// has met `known`: the hardware address to write for it by hand, or
+/// none to forget it; or the errno Linux answers (`neigh_add`,
+/// `neigh_delete`).
+///
+/// A new one (`new`) needs a hardware address and is written to stay
+/// (`NUD_PERMANENT`, which is what `ip neigh add` says when it is told
+/// nothing): one that grows old is the stack's to learn, not anyone's to
+/// write. `NLM_F_EXCL` refuses one that is known, and without
+/// `NLM_F_CREATE` only a known one is changed.
+fn neigh_request(
+    new: bool,
+    flags: NetlinkMessageFlags,
+    ndm: &NeighMsg,
+    address: IpAddress,
+    hardware: Option<[u8; 6]>,
+    known: &[zcore_drivers::scheme::NeighbourInfo],
+) -> Result<Option<[u8; 6]>, i32> {
+    let family: u16 = match address {
+        IpAddress::Ipv4(_) => AddressFamily::Internet.into(),
+        _ => AddressFamily::Internet6.into(),
+    };
+    if ndm.ndm_family as u16 != family {
+        return Err(errno::EINVAL);
+    }
+    let is_known = known.iter().any(|n| n.address == address);
+    if !new {
+        return if is_known {
+            Ok(None)
+        } else {
+            Err(errno::ENOENT)
+        };
+    }
+    let hardware = hardware.ok_or(errno::EINVAL)?;
+    if ndm.ndm_state & NUD_PERMANENT == 0 {
+        return Err(errno::EOPNOTSUPP);
+    }
+    if is_known && flags.contains(NetlinkMessageFlags::EXCL) {
+        return Err(errno::EEXIST);
+    }
+    if !is_known && !flags.contains(NetlinkMessageFlags::CREATE) {
+        return Err(errno::ENOENT);
+    }
+    Ok(Some(hardware))
+}
 
 /// The `RTM_NEWNEIGH` that says `neighbour` of the interface `ifindex`
 /// in a dump, at `now` milliseconds since boot: reachable until its
@@ -1486,7 +1592,9 @@ fn neigh_dump_entry(
         ndm_pad1: 0,
         ndm_pad2: 0,
         ndm_ifindex: ifindex as i32,
-        ndm_state: if now < neighbour.until_ms {
+        ndm_state: if neighbour.fixed() {
+            NUD_PERMANENT
+        } else if now < neighbour.until_ms {
             NUD_REACHABLE
         } else {
             NUD_STALE
@@ -1964,6 +2072,76 @@ mod netlink_tests {
     }
 
     #[test]
+    fn a_neighbour_is_written_or_forgotten_as_the_request_and_its_flags_say() {
+        use zcore_drivers::scheme::NeighbourInfo;
+        const MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x77];
+        let who = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 77));
+        // `ip neigh add 10.0.2.77 lladdr 02:00:00:00:00:77 dev eth0`, as
+        // it is on the wire.
+        let mut data = alloc::vec![0u8; 16];
+        data.push_ext(NeighMsg {
+            ndm_family: 2,
+            ndm_pad1: 0,
+            ndm_pad2: 0,
+            ndm_ifindex: 2,
+            ndm_state: NUD_PERMANENT,
+            ndm_flags: 0,
+            ndm_type: 0,
+        });
+        push_rtattr_bytes(&mut data, NDA_DST, &[10, 0, 2, 77]);
+        push_rtattr_bytes(&mut data, NDA_LLADDR, &MAC);
+        let (ndm, address, hardware) = parse_neigh_request(&data).unwrap();
+        assert_eq!((ndm.ndm_ifindex, address, hardware), (2, who, Some(MAC)));
+        // With no address it asks nothing.
+        assert!(parse_neigh_request(&data[..28]).is_none());
+
+        let create = NetlinkMessageFlags::REQUEST | NetlinkMessageFlags::CREATE;
+        let add = create | NetlinkMessageFlags::EXCL;
+        let replace = create | NetlinkMessageFlags::REPLACE;
+        let change = NetlinkMessageFlags::REQUEST | NetlinkMessageFlags::REPLACE;
+        let met = [NeighbourInfo {
+            address: who,
+            hardware: [0x52, 0x55, 10, 0, 2, 2],
+            until_ms: 5_000,
+        }];
+        let ask = |new, flags, hardware, known: &[NeighbourInfo]| {
+            neigh_request(new, flags, &ndm, who, hardware, known)
+        };
+        // add: only one that is not known; replace: either; change: only
+        // one that is.
+        assert_eq!(ask(true, add, Some(MAC), &[]), Ok(Some(MAC)));
+        assert_eq!(ask(true, add, Some(MAC), &met), Err(errno::EEXIST));
+        assert_eq!(ask(true, replace, Some(MAC), &met), Ok(Some(MAC)));
+        assert_eq!(ask(true, replace, Some(MAC), &[]), Ok(Some(MAC)));
+        assert_eq!(ask(true, change, Some(MAC), &met), Ok(Some(MAC)));
+        assert_eq!(ask(true, change, Some(MAC), &[]), Err(errno::ENOENT));
+        // Without where it is, nothing to write.
+        assert_eq!(ask(true, add, None, &[]), Err(errno::EINVAL));
+        // del: one that is known, whatever else it says.
+        assert_eq!(ask(false, change, None, &met), Ok(None));
+        assert_eq!(ask(false, change, Some(MAC), &met), Ok(None));
+        assert_eq!(ask(false, change, None, &[]), Err(errno::ENOENT));
+        // One to grow old is not anyone's to write, and the family is
+        // the address's.
+        let learnt = NeighMsg {
+            ndm_state: NUD_REACHABLE,
+            ..ndm
+        };
+        assert_eq!(
+            neigh_request(true, add, &learnt, who, Some(MAC), &[]),
+            Err(errno::EOPNOTSUPP)
+        );
+        let six = NeighMsg {
+            ndm_family: 10,
+            ..ndm
+        };
+        assert_eq!(
+            neigh_request(true, add, &six, who, Some(MAC), &[]),
+            Err(errno::EINVAL)
+        );
+    }
+
+    #[test]
     fn a_neighbour_is_dumped_with_its_addresses_and_whether_it_is_still_there() {
         use zcore_drivers::scheme::NeighbourInfo;
         let neighbour = NeighbourInfo {
@@ -1993,6 +2171,14 @@ mod netlink_tests {
             ]
         );
         // Its time up, it was there once.
+        // Written by hand, it is there for good.
+        let fixed = NeighbourInfo {
+            until_ms: NeighbourInfo::FIXED,
+            ..neighbour.clone()
+        };
+        let msg = neigh_dump_entry(7, 9, 2, &fixed, 4_999);
+        let ndm: NeighMsg = read_struct(&msg, 16).unwrap();
+        assert_eq!(ndm.ndm_state, NUD_PERMANENT);
         let msg = neigh_dump_entry(7, 9, 2, &neighbour, 5_000);
         let ndm: NeighMsg = read_struct(&msg, 16).unwrap();
         assert_eq!(ndm.ndm_state, NUD_STALE);

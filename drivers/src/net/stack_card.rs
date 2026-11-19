@@ -192,6 +192,20 @@ impl More {
         self.met.lock().clone()
     }
 
+    /// `address` is at `hardware` by hand, or with none is forgotten:
+    /// shown so until the stack says its neighbours again.
+    pub fn befriend(&self, address: IpAddress, hardware: Option<[u8; 6]>) {
+        let mut met = self.met.lock();
+        met.retain(|known| known.address != address);
+        if let Some(hardware) = hardware {
+            met.push(NeighbourInfo {
+                address,
+                hardware,
+                until_ms: NeighbourInfo::FIXED,
+            });
+        }
+    }
+
     /// The addresses, in the order they were said.
     pub fn addresses(&self) -> Vec<Ipv4Cidr> {
         self.said.lock().0.clone()
@@ -278,6 +292,9 @@ pub enum Change {
     /// What is for this network through this router (`true`), or no
     /// more, and then the router may go unsaid.
     Route(IpCidr, Option<IpAddress>, bool),
+    /// This machine of the link is at this hardware address, by hand;
+    /// or with none, where it is is forgotten.
+    Neighbour(IpAddress, Option<[u8; 6]>),
 }
 
 /// The interface that shows the card of a stack that runs somewhere else.
@@ -612,6 +629,19 @@ impl NetScheme for StackCard {
 
     fn get_neighbours(&self) -> Vec<NeighbourInfo> {
         self.more.neighbours()
+    }
+
+    /// A neighbour is a machine: one address, not a group's nor
+    /// nobody's, at one card's hardware address. One to forget is one
+    /// the card has met.
+    fn set_neighbour(&self, address: IpAddress, hardware: Option<[u8; 6]>) -> DeviceResult {
+        let machine = address.is_unicast() && !address.is_loopback();
+        let card = hardware.is_none_or(|at| at[0] & 1 == 0 && at != [0; 6]);
+        let known = || self.more.neighbours().iter().any(|n| n.address == address);
+        if !machine || !card || (hardware.is_none() && !known()) {
+            return Err(DeviceError::InvalidParam);
+        }
+        self.ask(Change::Neighbour(address, hardware))
     }
 
     fn get_routes(&self) -> Vec<RouteInfo> {
@@ -952,6 +982,51 @@ mod tests {
         assert_eq!(c.get_neighbours(), met);
         more.forget();
         assert!(c.get_neighbours().is_empty());
+    }
+
+    #[test]
+    fn a_neighbour_written_by_hand_is_asked_of_the_stack() {
+        let wire = Arc::new(Asked::default());
+        let more = Arc::new(More::default());
+        let c = card(Some([10, 0, 9, 1]))
+            .with_more(more.clone())
+            .numbered(2)
+            .through(wire.clone());
+        let who = IpAddress::v4(10, 0, 9, 77);
+        let at = [2, 0, 0, 0, 0, 0x77];
+        assert_eq!(c.set_neighbour(who, Some(at)), Ok(()));
+        assert_eq!(
+            wire.0.lock().pop(),
+            Some((2, Change::Neighbour(who, Some(at))))
+        );
+        // Not a group, nobody, this machine alone, nor at a group's
+        // hardware address or at none.
+        for (who, at) in [
+            (IpAddress::v4(224, 0, 0, 1), at),
+            (IpAddress::v4(0, 0, 0, 0), at),
+            (IpAddress::v4(127, 0, 0, 1), at),
+            (who, [1, 0, 0, 0, 0, 1]),
+            (who, [0xff; 6]),
+            (who, [0; 6]),
+        ] {
+            assert_eq!(
+                c.set_neighbour(who, Some(at)),
+                Err(DeviceError::InvalidParam)
+            );
+        }
+        // Only one that is known is forgotten: written by hand, shown
+        // so, or learnt.
+        assert_eq!(c.set_neighbour(who, None), Err(DeviceError::InvalidParam));
+        more.befriend(who, Some(at));
+        let shown = c.get_neighbours();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].fixed());
+        assert_eq!((shown[0].address, shown[0].hardware), (who, at));
+        assert_eq!(c.set_neighbour(who, None), Ok(()));
+        assert_eq!(wire.0.lock().pop(), Some((2, Change::Neighbour(who, None))));
+        more.befriend(who, None);
+        assert!(c.get_neighbours().is_empty());
+        assert!(wire.0.lock().is_empty());
     }
 
     #[test]
