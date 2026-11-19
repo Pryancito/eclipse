@@ -1,11 +1,14 @@
 //! `udrv-hda [N]`: the driver of Intel HD Audio controller `N` (default 0)
 //! that the kernel left to userspace (`udriver=hda@N` on its command line),
-//! served as `/dev/dsp` (`udrivers::oss`): `mpg123 -o oss`, `sox -t oss`
-//! and the rest play through it as through the kernel's.
+//! served as `/dev/dsp` (`udrivers::oss`) and as ALSA's
+//! `/dev/snd/controlC0` and `/dev/snd/pcmC0D0p` (`udrivers::alsa`):
+//! `mpg123 -o oss`, `aplay`, PulseAudio's ALSA sink and the rest play
+//! through them as through the kernel's. One open plays at a time, of
+//! `/dev/dsp` and the PCM.
 //!
-//! One thread answers the node; another follows the stream every few
+//! A thread answers each node; another follows the stream every few
 //! milliseconds, giving back what the controller played and telling a
-//! writer waiting for room. When this process goes the node goes with it;
+//! writer waiting for room. When this process goes the nodes go with it;
 //! the kernel resets the controller, and the next driver starts it again.
 //!
 //! Exit status: 2 when the Zircon gateway is off, 1 on any other error and
@@ -15,18 +18,32 @@ use std::process::exit;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use udrivers::alsa::{Ctl, CtlNode, Pcm, PcmNode};
 use udrivers::hda::{self, Controller};
-use udrivers::oss::Dsp;
+use udrivers::oss::{Dsp, DspNode};
 use udrivers::served::Node;
 use udrivers::status;
+use udrivers::stream::{Owner, Stream};
 use udrivers::zx::Status;
 
 const NAME: &str = "udrv-hda";
 /// `/dev/dsp`: OSS's major and minor.
 const SOUND_MAJOR: u32 = 14;
 const DSP_MINOR: u32 = 3;
-/// How often the stream is followed: a tenth of what the ring holds past
-/// its guard, at 48 kHz.
+/// ALSA's major; card 0's control and its playback PCM.
+const ALSA_MAJOR: u32 = 116;
+const CONTROL_MINOR: u32 = 0;
+const PCM_MINOR: u32 = 16;
+
+/// The card: its stream, and the nodes over it.
+struct Card {
+    stream: Stream<Controller>,
+    dsp: Dsp,
+    pcm: Pcm,
+    ctl: Ctl,
+}
+/// How often the stream is followed: a period of 256 frames at 48 kHz, the
+/// shortest an ALSA client is likely to ask for, is 5.3 ms.
 const TICK: Duration = Duration::from_millis(5);
 
 fn die(what: impl std::fmt::Display) -> ! {
@@ -53,14 +70,19 @@ fn main() {
     };
     let ctl = Controller::start(&claim).unwrap_or_else(|e| die(e));
     let path = ctl.path;
-    let node = Node::serve("dsp", SOUND_MAJOR, DSP_MINOR, 0o666).unwrap_or_else(|e| die(e));
+    let serve = |name: &str, major: u32, minor: u32| {
+        Node::serve(name, major, minor, 0o666).unwrap_or_else(|e| die(e))
+    };
+    let dsp_node = serve("dsp", SOUND_MAJOR, DSP_MINOR);
+    let ctl_node = serve("snd/controlC0", ALSA_MAJOR, CONTROL_MINOR);
+    let pcm_node = serve("snd/pcmC0D0p", ALSA_MAJOR, PCM_MINOR);
     let place = format!("hda@{index}");
     status::publish(
         &format!("driver.{place}"),
         &[
             ("program", NAME),
             ("device", &place),
-            ("serves", "/dev/dsp"),
+            ("serves", "/dev/dsp /dev/snd/controlC0 /dev/snd/pcmC0D0p"),
             (
                 "path",
                 &format!(
@@ -73,22 +95,65 @@ fn main() {
         ],
     );
     println!(
-        "{NAME}: {place} is /dev/dsp, pin {:#x} from converter {:#x}",
+        "{NAME}: {place} is /dev/dsp and /dev/snd, pin {:#x} from converter {:#x}",
         path.pin, path.conv
     );
 
-    let dsp = Mutex::new(Dsp::new(ctl, udrivers::now_ns));
-    let (node, dsp) = (&node, &dsp);
+    let card = Mutex::new(Card {
+        stream: Stream::new(ctl),
+        dsp: Dsp::new(udrivers::now_ns),
+        pcm: Pcm::new(udrivers::now_ns),
+        ctl: Ctl::default(),
+    });
+    let card = &card;
+    let (dsp_node, ctl_node, pcm_node) = (&dsp_node, &ctl_node, &pcm_node);
     std::thread::scope(|s| {
         s.spawn(move || loop {
             std::thread::sleep(TICK);
-            dsp.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .tick(Some(node));
+            let mut c = card.lock().unwrap_or_else(|p| p.into_inner());
+            let c = &mut *c;
+            match c.stream.owner {
+                Some(Owner::Pcm(_)) => c.pcm.tick(&mut c.stream, Some(pcm_node)),
+                _ => c.dsp.tick(&mut c.stream, Some(dsp_node)),
+            }
         });
-        die(format_args!(
-            "the kernel let go of /dev/dsp: {}",
-            node.run(dsp)
-        ))
+        s.spawn(move || {
+            let left = ctl_node.run_with(card, |c, n, req| {
+                n.answer(
+                    &mut CtlNode {
+                        ctl: &mut c.ctl,
+                        stream: &mut c.stream,
+                    },
+                    req,
+                )
+            });
+            die(format_args!(
+                "the kernel let go of /dev/snd/controlC0: {left}"
+            ))
+        });
+        s.spawn(move || {
+            let left = pcm_node.run_with(card, |c, n, req| {
+                n.answer(
+                    &mut PcmNode {
+                        pcm: &mut c.pcm,
+                        stream: &mut c.stream,
+                    },
+                    req,
+                )
+            });
+            die(format_args!(
+                "the kernel let go of /dev/snd/pcmC0D0p: {left}"
+            ))
+        });
+        let left = dsp_node.run_with(card, |c, n, req| {
+            n.answer(
+                &mut DspNode {
+                    dsp: &mut c.dsp,
+                    stream: &mut c.stream,
+                },
+                req,
+            )
+        });
+        die(format_args!("the kernel let go of /dev/dsp: {left}"))
     })
 }

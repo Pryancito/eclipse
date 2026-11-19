@@ -23,8 +23,10 @@
 //! What this trusts: the server is a process root started for the purpose.
 //! Its answers are whatever it says, and it sees no kernel memory, only the
 //! window it gave; what an `ioctl` carries is copied through that window as
-//! the command's number says ([`wire::ioctl_carries`]), and an argument
-//! that points further (a structure holding pointers) is not followed. The
+//! the command's number says ([`wire::ioctl_carries`]). An argument that
+//! points further (a structure holding pointers) is followed only as far as
+//! the server asks ([`wire::IOCTL_FETCH`]), and only in the memory of the
+//! program that made the call, as its own `read` and `write` would. The
 //! server must not open its own node: the open would wait on itself.
 
 mod link;
@@ -49,7 +51,8 @@ use zircon_object::vm::VmObject;
 pub use self::link::LEFT as SERVER_LEFT;
 use self::link::{Fail, Link};
 use self::wire::{
-    OP_IOCTL, OP_OPEN, OP_READ, OP_RELEASE, OP_WRITE, POLLERR, POLLHUP, POLLIN, POLLOUT, SLOT_LEN,
+    OP_IOCTL, OP_IOCTL_IOV, OP_OPEN, OP_READ, OP_RELEASE, OP_WRITE, POLLERR, POLLHUP, POLLIN,
+    POLLOUT, SLOT_LEN,
 };
 use crate::error::{LxError, LxResult};
 use crate::process::LinuxProcess;
@@ -326,9 +329,17 @@ impl ServedOpen {
     }
 
     /// `ioctl(cmd, arg)`, with what the command carries copied in from the
-    /// program's `arg` and out to it. What the server answers is what the
-    /// call returns.
+    /// program's `arg` and out to it, and what else of the program's memory
+    /// the server asks for ([`wire::IOCTL_FETCH`]). What the server answers
+    /// is what the call returns.
     pub fn ioctl(&self, cmd: u32, arg: usize) -> LxResult<usize> {
+        self.ioctl_as(cmd, arg, false)
+    }
+
+    /// [`ServedOpen::ioctl`], said to the server to be on an open that
+    /// waits, or not ([`wire::IOCTL_WAITS`]).
+    fn ioctl_as(&self, cmd: u32, arg: usize, waits: bool) -> LxResult<usize> {
+        let a = cmd as u64 | if waits { wire::IOCTL_WAITS } else { 0 };
         let (into, out) = wire::ioctl_carries(cmd);
         // An argument that is not memory to read goes over with nothing in
         // the slot: some commands say they carry an `int` in and take it by
@@ -341,20 +352,93 @@ impl ServedOpen {
         } else {
             Vec::new()
         };
-        let answer = self
-            .node
-            .link
-            .call(OP_IOCTL, self.fh, 0, cmd as u64, arg as u64, &data)
+        let link = &self.node.link;
+        let mut answer = link
+            .call(OP_IOCTL, self.fh, 0, a, arg as u64, &data)
             .map_err(lx_of)?;
-        if out > 0 {
-            let n = answer.len.min(out);
-            let mut back = vec![0u8; n];
-            answer.data(&mut back).map_err(lx_of)?;
-            kernel_hal::user::UserOutPtr::<u8>::from(arg)
-                .write_array(&back)
-                .map_err(|_| LxError::EFAULT)?;
+        if answer.a != wire::IOCTL_FETCH {
+            if out > 0 {
+                let n = answer.len.min(out);
+                let mut back = vec![0u8; n];
+                answer.data(&mut back).map_err(lx_of)?;
+                kernel_hal::user::UserOutPtr::<u8>::from(arg)
+                    .write_array(&back)
+                    .map_err(|_| LxError::EFAULT)?;
+            }
+            return Ok(answer.count);
         }
-        Ok(answer.count)
+        for _ in 0..wire::FETCH_ROUNDS {
+            let iov = Self::asked(&answer)?;
+            drop(answer);
+            let mut req = iov.encode();
+            for &(addr, len) in &iov.ins {
+                let bytes = kernel_hal::user::UserInPtr::<u8>::from(addr as usize)
+                    .read_array(len as usize)
+                    .map_err(|_| LxError::EFAULT)?;
+                req.extend_from_slice(&bytes);
+            }
+            answer = link
+                .call(OP_IOCTL_IOV, self.fh, 0, a, arg as u64, &req)
+                .map_err(lx_of)?;
+            if answer.a == wire::IOCTL_FETCH {
+                continue;
+            }
+            let total = iov.outs.iter().map(|(_, l)| *l as usize).sum::<usize>();
+            let mut back = vec![0u8; answer.len.min(total)];
+            answer.data(&mut back).map_err(lx_of)?;
+            let mut at = 0;
+            for &(addr, len) in &iov.outs {
+                let n = (len as usize).min(back.len() - at);
+                if n == 0 {
+                    break;
+                }
+                kernel_hal::user::UserOutPtr::<u8>::from(addr as usize)
+                    .write_array(&back[at..at + n])
+                    .map_err(|_| LxError::EFAULT)?;
+                at += n;
+            }
+            return Ok(answer.count);
+        }
+        // A server that keeps asking is failing the call.
+        Err(LxError::EIO)
+    }
+
+    /// The ranges a [`wire::IOCTL_FETCH`] asks for: `EIO` when the server
+    /// asked for more than a slot carries.
+    fn asked(answer: &link::Answer) -> LxResult<wire::Iov> {
+        let mut head = vec![
+            0u8;
+            answer
+                .len
+                .min(wire::Iov::len_of(wire::IOV_MAX, wire::IOV_MAX))
+        ];
+        answer.data(&mut head).map_err(lx_of)?;
+        wire::Iov::decode(&head).ok_or(LxError::EIO)
+    }
+
+    /// [`ServedOpen::ioctl`] on an open that waits: a server never waits,
+    /// and answers `EAGAIN` for what cannot be done yet (ALSA's
+    /// `WRITEI_FRAMES` with no room, its `DRAIN` with sound still to
+    /// play). The call then waits for the server to say something of the
+    /// open again ([`OP_READY`]), and asks again. A signal ends the wait
+    /// with `EINTR`.
+    pub async fn ioctl_waiting(&self, cmd: u32, arg: usize) -> LxResult<usize> {
+        loop {
+            // Read before the call: what the server says on its way to the
+            // answer, or right after it, counts.
+            let seen = self.bus.lock().seq();
+            match self.ioctl_as(cmd, arg, true) {
+                Err(LxError::EAGAIN) => {}
+                done => return done,
+            }
+            let bus = self.bus.clone();
+            crate::process::interruptible(SaidSince {
+                bus,
+                seen,
+                sub: None,
+            })
+            .await?;
+        }
     }
 }
 
@@ -433,6 +517,39 @@ impl INode for ServedOpen {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+/// Until the server says something of an open again: its bus has been
+/// published to since `seen` ([`EventBus::seq`]), even with the readiness
+/// as it was.
+struct SaidSince {
+    bus: Arc<Mutex<EventBus>>,
+    seen: u64,
+    sub: Option<crate::sync::ReadinessSub>,
+}
+
+impl Future for SaidSince {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
+        // The last poll's parking goes first: it takes the bus's lock.
+        drop(self.sub.take());
+        let bus = self.bus.clone();
+        let mut b = bus.lock();
+        if b.seq() != self.seen {
+            return core::task::Poll::Ready(());
+        }
+        // Parked for the next publish of any readiness. `subscribe_edge`
+        // compares against the counter of the bits asked about, which for
+        // all four is the sum of theirs, not `seq`: compare as it does.
+        let seen = b.seq_for(READINESS);
+        let sub = b
+            .subscribe_edge(READINESS, cx.waker(), seen)
+            .map(|id| crate::sync::ReadinessSub::on_bus(bus.clone(), id));
+        drop(b);
+        self.sub = sub;
+        core::task::Poll::Pending
     }
 }
 

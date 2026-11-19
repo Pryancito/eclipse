@@ -91,9 +91,10 @@ const FUNCTION_AUDIO: u32 = 0x01;
 /// How long a codec gets to answer a verb.
 const VERB_NS: u64 = 200_000_000;
 
-/// The ring: 64 KiB in segments of 2 KiB, a third of a second of 48 kHz
-/// stereo.
-pub const RING_LEN: usize = 16 * PAGE;
+/// The ring: 128 KiB in segments of 2 KiB, two thirds of a second of
+/// 48 kHz stereo, as deep as the kernel's: an ALSA client asks for half a
+/// second (mpg123).
+pub const RING_LEN: usize = 32 * PAGE;
 pub const SEGMENT: usize = 2048;
 /// What of the ring is never written: the controller fetches ahead of the
 /// position it reports, and what it has fetched is not to be changed.
@@ -377,12 +378,21 @@ pub fn choose(paths: &[(Path, bool)]) -> Option<Path> {
 pub struct Ring {
     pub written: u64,
     pub played: u64,
+    /// Where the samples of the last write that found the ring empty
+    /// start: [`LEAD`] past where the controller was.
+    pub start: u64,
 }
 
 impl Ring {
     /// What is queued and not yet played.
     pub fn queued(&self) -> usize {
         self.written.saturating_sub(self.played) as usize
+    }
+
+    /// The samples queued and not yet played: [`Ring::queued`] without
+    /// the silence ahead of them.
+    pub fn queued_samples(&self) -> usize {
+        self.written.saturating_sub(self.played.max(self.start)) as usize
     }
 
     /// What can be written now: with nothing queued, the next write
@@ -401,6 +411,7 @@ impl Ring {
     pub fn write(&mut self, ring: &mut [u8], data: &[u8]) -> usize {
         if self.written <= self.played {
             self.written = self.played + LEAD as u64;
+            self.start = self.written;
         }
         let n = data.len().min(self.free()) / FRAME * FRAME;
         let mut done = 0;
@@ -685,11 +696,18 @@ impl Controller {
         Ok(())
     }
 
-    /// Stop the stream.
+    /// Stop the stream, where it is.
     pub fn stop(&mut self) {
         let r = self.regs();
         r.w32(self.sd + SD_CTL, r.r32(self.sd + SD_CTL) & !SD_CTL_RUN);
         self.running = false;
+    }
+
+    /// Go on from where [`Controller::stop`] left it.
+    pub fn resume(&mut self) {
+        let r = self.regs();
+        r.w32(self.sd + SD_CTL, TAG << 20 | SD_CTL_RUN);
+        self.running = true;
     }
 }
 

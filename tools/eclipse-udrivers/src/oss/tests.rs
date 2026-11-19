@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::hda::LEAD;
+use crate::served::Node;
+use crate::stream::Stream;
 
 /// A stream that plays where it is told to be.
 struct Fake {
@@ -29,6 +31,9 @@ impl Output for Fake {
     fn stop(&mut self) {
         self.running = false;
     }
+    fn resume(&mut self) {
+        self.running = true;
+    }
     fn position(&self) -> usize {
         self.pos
     }
@@ -40,28 +45,52 @@ fn clock() -> u64 {
     NOW.load(Ordering::Relaxed)
 }
 
-fn dsp() -> Dsp<Fake> {
-    let mut d = Dsp::new(
-        Fake {
+/// The node over a stream of its own.
+struct D {
+    s: Stream<Fake>,
+    d: Dsp,
+}
+
+impl D {
+    fn open(&mut self, _flags: u64) -> Result<(u32, u64), i32> {
+        self.d.open(&mut self.s)
+    }
+    fn release(&mut self, fh: u32) {
+        self.d.release(&mut self.s, fh)
+    }
+    fn control(&mut self, cmd: u32, data: &mut [u8]) -> Result<(i64, usize), i32> {
+        self.d.control(&mut self.s, cmd, data)
+    }
+    fn play(&mut self, data: &[u8]) -> Result<usize, i32> {
+        self.d.play(&mut self.s, data)
+    }
+    fn tick(&mut self, node: Option<&Node>) {
+        self.d.tick(&mut self.s, node)
+    }
+}
+
+fn dsp() -> D {
+    let mut d = D {
+        s: Stream::new(Fake {
             mem: vec![0; RING_LEN],
             running: false,
             rate: 0,
             runs: 0,
             pos: 0,
-        },
-        clock,
-    );
+        }),
+        d: Dsp::new(clock),
+    };
     d.open(1).unwrap();
     d
 }
 
-fn int(d: &mut Dsp<Fake>, cmd: u32, v: i32) -> i32 {
+fn int(d: &mut D, cmd: u32, v: i32) -> i32 {
     let mut b = v.to_ne_bytes().to_vec();
     d.control(cmd, &mut b).unwrap();
     i32::from_ne_bytes(b[..4].try_into().unwrap())
 }
 
-fn s16_stereo(d: &mut Dsp<Fake>) {
+fn s16_stereo(d: &mut D) {
     assert_eq!(int(d, SNDCTL_DSP_SETFMT, AFMT_S16_LE), AFMT_S16_LE);
     assert_eq!(int(d, SNDCTL_DSP_CHANNELS, 2), 2);
     assert_eq!(int(d, SNDCTL_DSP_SPEED, 48000), 48000);
@@ -82,7 +111,7 @@ fn an_open_starts_from_the_oss_defaults_and_can_write() {
     assert_eq!(int(&mut d, SOUND_PCM_READ_CHANNELS, 0), 1);
     assert_eq!(int(&mut d, SOUND_PCM_READ_RATE, 0), 8000);
     assert_eq!(d.open(0).err(), Some(EBUSY));
-    assert_eq!(d.said, POLLOUT);
+    assert_eq!(d.d.said, POLLOUT);
 }
 
 #[test]
@@ -114,16 +143,16 @@ fn a_write_starts_the_stream_at_its_rate_with_the_samples_as_they_were() {
         .flat_map(|s| s.to_le_bytes())
         .collect();
     assert_eq!(d.play(&samples), Ok(8));
-    assert!(d.out.running);
-    assert_eq!(d.out.rate, 48000);
-    assert_eq!(&d.out.mem[LEAD..LEAD + 8], &samples[..]);
+    assert!(d.s.out.running);
+    assert_eq!(d.s.out.rate, 48000);
+    assert_eq!(&d.s.out.mem[LEAD..LEAD + 8], &samples[..]);
 }
 
 #[test]
 fn mono_u8_is_made_16_bit_stereo() {
     let mut d = dsp();
     assert_eq!(d.play(&[0x80, 0xff, 0x00]), Ok(3));
-    let got: Vec<i16> = d.out.mem[LEAD..LEAD + 12]
+    let got: Vec<i16> = d.s.out.mem[LEAD..LEAD + 12]
         .chunks(2)
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect();
@@ -135,10 +164,10 @@ fn big_endian_and_signed_8_bit_come_out_the_same_sound() {
     let mut d = dsp();
     int(&mut d, SNDCTL_DSP_SETFMT, AFMT_S16_BE);
     d.play(&0x1234i16.to_be_bytes()).unwrap();
-    assert_eq!(&d.out.mem[LEAD..LEAD + 4], &[0x34, 0x12, 0x34, 0x12]);
+    assert_eq!(&d.s.out.mem[LEAD..LEAD + 4], &[0x34, 0x12, 0x34, 0x12]);
     int(&mut d, SNDCTL_DSP_SETFMT, AFMT_S8);
     d.play(&[0xff]).unwrap();
-    assert_eq!(&d.out.mem[LEAD + 4..LEAD + 8], &[0x00, 0xff, 0x00, 0xff]);
+    assert_eq!(&d.s.out.mem[LEAD + 4..LEAD + 8], &[0x00, 0xff, 0x00, 0xff]);
 }
 
 #[test]
@@ -150,10 +179,10 @@ fn a_full_ring_takes_nothing_and_says_so_until_it_has_played() {
     assert_eq!(taken, RING_LEN - GUARD - LEAD);
     assert_eq!(d.play(&lots), Err(EAGAIN));
     d.tick(None);
-    assert_eq!(d.said, 0, "no room: the writer waits");
-    d.out.pos = LEAD + 2 * FRAGMENT;
+    assert_eq!(d.d.said, 0, "no room: the writer waits");
+    d.s.out.pos = LEAD + 2 * FRAGMENT;
     d.tick(None);
-    assert_eq!(d.said, POLLOUT);
+    assert_eq!(d.d.said, POLLOUT);
     assert_eq!(d.play(&lots), Ok(LEAD + 2 * FRAGMENT));
 }
 
@@ -190,7 +219,7 @@ fn the_play_pointer_counts_bytes_and_fragments_played() {
     let mut d = dsp();
     s16_stereo(&mut d);
     d.play(&vec![0u8; 3 * FRAGMENT]).unwrap();
-    d.out.pos = 2 * FRAGMENT + 8;
+    d.s.out.pos = 2 * FRAGMENT + 8;
     d.tick(None);
     let mut info = [0u8; 12];
     d.control(SNDCTL_DSP_GETOPTR, &mut info).unwrap();
@@ -208,11 +237,11 @@ fn another_rate_drops_what_was_queued_at_the_last() {
     s16_stereo(&mut d);
     d.play(&[9; 64]).unwrap();
     int(&mut d, SNDCTL_DSP_SPEED, 44100);
-    assert!(!d.out.running);
+    assert!(!d.s.out.running);
     assert_eq!(int(&mut d, SNDCTL_DSP_GETODELAY, 0), 0);
-    assert!(d.out.mem.iter().all(|b| *b == 0));
+    assert!(d.s.out.mem.iter().all(|b| *b == 0));
     d.play(&[9; 64]).unwrap();
-    assert_eq!((d.out.rate, d.out.runs), (44100, 2));
+    assert_eq!((d.s.out.rate, d.s.out.runs), (44100, 2));
 }
 
 #[test]
@@ -220,16 +249,16 @@ fn a_stream_left_with_nothing_stops_after_a_while() {
     let mut d = dsp();
     s16_stereo(&mut d);
     d.play(&[1; 64]).unwrap();
-    d.out.pos = LEAD + 64;
+    d.s.out.pos = LEAD + 64;
     NOW.store(1_000, Ordering::Relaxed);
     d.tick(None);
-    assert!(d.out.running, "a gap is not the end");
+    assert!(d.s.out.running, "a gap is not the end");
     NOW.store(1_000 + IDLE_NS + 1, Ordering::Relaxed);
     d.tick(None);
-    assert!(!d.out.running);
+    assert!(!d.s.out.running);
     // And it starts again on the next write.
     d.play(&[1; 64]).unwrap();
-    assert_eq!(d.out.runs, 2);
+    assert_eq!(d.s.out.runs, 2);
 }
 
 #[test]

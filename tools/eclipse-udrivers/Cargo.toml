@@ -50,6 +50,10 @@ name = "udrv-dsp-check"
 path = "src/bin/udrv-dsp-check.rs"
 
 [[bin]]
+name = "udrv-snd-check"
+path = "src/bin/udrv-snd-check.rs"
+
+[[bin]]
 name = "udrv-evdev-check"
 path = "src/bin/udrv-evdev-check.rs"
 
