@@ -438,16 +438,15 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             irq: interrupts.first_irq().map(|irq| irq as usize),
             vaddr: Some(base_vaddr),
         };
-        // A disk left to a userspace driver (`udriver=`): recorded and not
-        // touched, not even reset, which `VirtIoBlk::new` would do.
-        if header.device_type() == DeviceType::Block
-            && crate::user::reserve_virtio_blk(
+        // A disk has no driver in the kernel either: it is counted, and
+        // left to its driver in userspace, not even reset.
+        if header.device_type() == DeviceType::Block {
+            crate::user::reserve_virtio_blk(
                 crate::user::Transport::VirtioMmio,
                 paddr as usize,
                 size as usize,
                 wiring,
-            )
-        {
+            );
             return Err(DeviceError::NotSupported);
         }
         // An input device left to a userspace driver (`udriver=`): recorded
@@ -480,7 +479,6 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         );
 
         let dev = match header.device_type() {
-            DeviceType::Block => Device::Block(Arc::new(VirtIoBlk::new(header)?)),
             DeviceType::GPU => Device::Display(Arc::new(VirtIoGpu::new(header)?)),
             DeviceType::Input => Device::Input(Arc::new(VirtIoInput::new(header)?)),
             DeviceType::Console => Device::Uart(Arc::new(VirtIoConsole::new(header)?)),
