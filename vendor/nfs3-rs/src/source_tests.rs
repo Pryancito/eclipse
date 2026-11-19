@@ -94,30 +94,30 @@ fn an_ipv6_host_and_a_path_full_of_colons_both_survive() {
 
 #[test]
 fn an_unclosed_bracket_is_refused() {
-    assert_eq!(NfsSource::parse("[fe80::1:/export"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("[fe80::1:/export"), Err(Errno::EINVAL));
 }
 
 #[test]
 fn a_bracketed_host_with_no_colon_after_it_is_refused() {
-    assert_eq!(NfsSource::parse("[fe80::1]/export"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("[fe80::1]/export"), Err(Errno::EINVAL));
 }
 
 #[test]
 fn a_string_with_no_colon_is_refused() {
-    assert_eq!(NfsSource::parse("nas.local"), Err(LxError::EINVAL));
-    assert_eq!(NfsSource::parse("/dev/sda1"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("nas.local"), Err(Errno::EINVAL));
+    assert_eq!(NfsSource::parse("/dev/sda1"), Err(Errno::EINVAL));
 }
 
 #[test]
 fn an_empty_host_is_refused() {
-    assert_eq!(NfsSource::parse(":/export"), Err(LxError::EINVAL));
-    assert_eq!(NfsSource::parse("[]:/export"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse(":/export"), Err(Errno::EINVAL));
+    assert_eq!(NfsSource::parse("[]:/export"), Err(Errno::EINVAL));
 }
 
 #[test]
 fn an_empty_export_is_refused() {
-    assert_eq!(NfsSource::parse("nas:"), Err(LxError::EINVAL));
-    assert_eq!(NfsSource::parse("[fe80::1]:"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("nas:"), Err(Errno::EINVAL));
+    assert_eq!(NfsSource::parse("[fe80::1]:"), Err(Errno::EINVAL));
 }
 
 /// Linux refuses a relative export path: the server names its exports
@@ -127,18 +127,18 @@ fn an_empty_export_is_refused() {
 /// at the same `EINVAL`.
 #[test]
 fn a_relative_export_path_is_refused() {
-    assert_eq!(NfsSource::parse("nas:srv/media"), Err(LxError::EINVAL));
-    assert_eq!(NfsSource::parse("nas:media"), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse("nas:srv/media"), Err(Errno::EINVAL));
+    assert_eq!(NfsSource::parse("nas:media"), Err(Errno::EINVAL));
     assert_eq!(
         NfsSource::parse("[fe80::1]:srv/media"),
-        Err(LxError::EINVAL),
+        Err(Errno::EINVAL),
         "and bracketed, where the separator IS found"
     );
 }
 
 #[test]
 fn an_empty_string_is_refused() {
-    assert_eq!(NfsSource::parse(""), Err(LxError::EINVAL));
+    assert_eq!(NfsSource::parse(""), Err(Errno::EINVAL));
 }
 
 // ----------------------------------------------------------- mount options
@@ -215,9 +215,9 @@ fn ro_and_rw_set_read_only() {
 /// `addr=` is Linux's "the server is at this address, do not resolve it".
 #[test]
 fn addr_takes_an_address_literal() {
-    use zcore_drivers::wire::Ipv4Address;
+    use core::net::Ipv4Addr;
     let o = NfsOptions::parse("addr=10.0.0.3").unwrap();
-    assert_eq!(o.addr, Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 3))));
+    assert_eq!(o.addr, Some(IpAddress::V4(Ipv4Addr::new(10, 0, 0, 3))));
     assert_eq!(
         NfsOptions::parse("").unwrap().addr,
         None,
@@ -235,7 +235,7 @@ fn an_ipv6_addr_is_accepted_bracketed_or_bare() {
     assert_eq!(bare, bracketed);
     // A bracket that does not close is a mistake in the line, as it is in
     // the device string.
-    assert_eq!(NfsOptions::parse("addr=[fe80::1"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("addr=[fe80::1"), Err(Errno::EINVAL));
 }
 
 /// A name in `addr=` is refused rather than resolved. `addr=` means "do not
@@ -243,10 +243,10 @@ fn an_ipv6_addr_is_accepted_bracketed_or_bare() {
 /// silently mounting without it would mount somewhere else.
 #[test]
 fn a_name_in_addr_is_refused_rather_than_resolved() {
-    assert_eq!(NfsOptions::parse("addr=nas"), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("addr="), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("addr"), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("addr=1.2.3"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("addr=nas"), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("addr="), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("addr"), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("addr=1.2.3"), Err(Errno::EINVAL));
 }
 
 /// Unknown options are ignored, not refused. `mount(8)` passes along a dozen
@@ -286,7 +286,7 @@ fn a_non_numeric_value_is_refused() {
     ] {
         assert_eq!(
             NfsOptions::parse(bad),
-            Err(LxError::EINVAL),
+            Err(Errno::EINVAL),
             "{} should be refused",
             bad
         );
@@ -295,15 +295,15 @@ fn a_non_numeric_value_is_refused() {
 
 #[test]
 fn an_option_that_needs_a_value_and_has_none_is_refused() {
-    assert_eq!(NfsOptions::parse("port"), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("port="), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("rsize"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("port"), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("port="), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("rsize"), Err(Errno::EINVAL));
 }
 
 #[test]
 fn port_zero_and_an_out_of_range_port_are_refused() {
-    assert_eq!(NfsOptions::parse("port=0"), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("port=65536"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("port=0"), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("port=65536"), Err(Errno::EINVAL));
     assert_eq!(
         NfsOptions::parse("port=65535").unwrap().port,
         Some(65535),
@@ -313,8 +313,8 @@ fn port_zero_and_an_out_of_range_port_are_refused() {
 
 #[test]
 fn a_zero_transfer_size_is_refused() {
-    assert_eq!(NfsOptions::parse("rsize=0"), Err(LxError::EINVAL));
-    assert_eq!(NfsOptions::parse("wsize=0"), Err(LxError::EINVAL));
+    assert_eq!(NfsOptions::parse("rsize=0"), Err(Errno::EINVAL));
+    assert_eq!(NfsOptions::parse("wsize=0"), Err(Errno::EINVAL));
 }
 
 /// A transfer size is rounded up to a multiple of 512, as Linux does with

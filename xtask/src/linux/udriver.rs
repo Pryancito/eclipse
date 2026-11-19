@@ -118,6 +118,18 @@ const BTRFS_USES: [&str; 5] = [
     "vendor/aes/src",
 ];
 
+/// The NFS client that runs as a process: `eclipse-nfs HOST:/EXPORT DIR`
+/// mounts an NFSv3 export it serves. Built from the FAT server's library
+/// (the wire) and the kernel's NFS code (`vendor/nfs3-rs`).
+const NFS_PACKAGE: &str = "eclipse-nfs";
+const NFS: [&str; 1] = ["eclipse-nfs"];
+const NFS_USES: [&str; 4] = [
+    "tools/eclipse-udrivers/src",
+    "tools/eclipse-fatfs/src",
+    "vendor/nfs3-rs/src",
+    "vendor/rcore-fs/src",
+];
+
 /// The `unet` and `ublk` services and the wrappers they run, and
 /// `ublk-mounts`, which mounts what fstab puts on the served disk; and
 /// `fat-mounts`, which mounts fstab's FAT volumes with a server each.
@@ -613,6 +625,10 @@ impl LinuxRootfs {
         }
         let built = self.rust_tools(BTRFS_PACKAGE, &BTRFS, &BTRFS_USES);
         for name in BTRFS {
+            put(&built.join(name), name);
+        }
+        let built = self.rust_tools(NFS_PACKAGE, &NFS, &NFS_USES);
+        for name in NFS {
             put(&built.join(name), name);
         }
     }

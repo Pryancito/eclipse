@@ -48,7 +48,7 @@
 
 use alloc::vec::Vec;
 
-use crate::error::{LxError, LxResult};
+use crate::errno::{Errno, LxResult};
 
 use super::client::{CallError, RpcClient};
 use super::connect::Connector;
@@ -102,26 +102,22 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// A deadline `total_ms` from now.
-    pub fn new(total_ms: u64) -> Self {
+    /// A deadline `total_ms` after `now_ms`, a reading of the clock the
+    /// connector keeps ([`Connector::now_ms`]).
+    pub fn new(total_ms: u64, now_ms: u64) -> Self {
         Self {
-            deadline: now_ms().saturating_add(total_ms),
+            deadline: now_ms.saturating_add(total_ms),
         }
     }
 
-    /// The milliseconds the next step may take, or `ETIMEDOUT` if the
-    /// greeting is already out of time.
-    pub fn left(&self) -> LxResult<u64> {
-        let now = now_ms();
+    /// The milliseconds the next step may take, the clock reading
+    /// `now_ms`, or `ETIMEDOUT` if the greeting is already out of time.
+    pub fn left(&self, now: u64) -> LxResult<u64> {
         if now >= self.deadline {
-            return Err(LxError::ETIMEDOUT);
+            return Err(Errno::ETIMEDOUT);
         }
         Ok(self.deadline - now)
     }
-}
-
-fn now_ms() -> u64 {
-    kernel_hal::timer::timer_now().as_millis() as u64
 }
 
 /// Why asking `rpcbind` did not produce a port.
@@ -137,19 +133,19 @@ fn now_ms() -> u64 {
 pub enum PortmapFailure {
     /// Nothing came back: the connection could not be made, or the call ran
     /// out of time. Says nothing at all about the program asked for.
-    Unreachable(LxError),
+    Unreachable(Errno),
     /// `rpcbind` answered, and the answer was not a port: no registration, a
     /// refused credential, a truncated or malformed reply. It spoke, so its
     /// word stands.
-    Answered(LxError),
+    Answered(Errno),
     /// This client could not make the call: no free local port, no memory.
     /// Nothing was asked, so nothing may be assumed.
-    Local(LxError),
+    Local(Errno),
 }
 
 impl PortmapFailure {
     /// The errno to report when this failure ends the mount.
-    pub fn errno(self) -> LxError {
+    pub fn errno(self) -> Errno {
         match self {
             Self::Unreachable(e) | Self::Answered(e) | Self::Local(e) => e,
         }
@@ -166,9 +162,9 @@ impl PortmapFailure {
 /// `EADDRNOTAVAIL` and `ENOMEM` are this machine's problem and not the
 /// server's; everything else the connector reports is a connection that did
 /// not happen.
-fn connect_failure(e: LxError) -> PortmapFailure {
+fn connect_failure(e: Errno) -> PortmapFailure {
     match e {
-        LxError::EADDRNOTAVAIL | LxError::ENOMEM => PortmapFailure::Local(e),
+        Errno::EADDRNOTAVAIL | Errno::ENOMEM => PortmapFailure::Local(e),
         _ => PortmapFailure::Unreachable(e),
     }
 }
@@ -222,7 +218,7 @@ pub fn ask_portmap<C: Connector>(
     let transport = connector
         .connect(portmap::PORTMAP_PORT, timeout_ms)
         .map_err(connect_failure)?;
-    let mut client = RpcClient::new(transport, first_xid(), policy(opts, timeout_ms));
+    let mut client = RpcClient::new(transport, connector.first_xid(), policy(opts, timeout_ms));
     let args = portmap::encode_getport(program, version, portmap::IPPROTO_TCP);
     let results = client
         .call(portmap::getport_target(), &PORTMAP_CRED, &args)
@@ -230,7 +226,7 @@ pub fn ask_portmap<C: Connector>(
     match portmap::decode_getport(&results) {
         // Zero: "I have no registration for that program". An answer, and
         // dialling it would fail somewhere else, as something else.
-        Ok(None) => Err(PortmapFailure::Answered(LxError::EOPNOTSUPP)),
+        Ok(None) => Err(PortmapFailure::Answered(Errno::EOPNOTSUPP)),
         Ok(Some(port)) => Ok(port),
         // Bytes that do not decode still came from `rpcbind`.
         Err(e) => Err(PortmapFailure::Answered(rpc_error_to_lx(e))),
@@ -251,7 +247,7 @@ pub fn mount_export<C: Connector>(
     let args = mount3::encode_path(export).map_err(super::session::xdr_error_to_lx)?;
     let reply = {
         let transport = connector.connect(port, timeout_ms)?;
-        let mut client = RpcClient::new(transport, first_xid(), policy(opts, timeout_ms));
+        let mut client = RpcClient::new(transport, connector.first_xid(), policy(opts, timeout_ms));
         let results = client
             .call(mount3::mnt_target(), &unix_cred(), &args)
             .map_err(call_error_to_lx)?;
@@ -276,9 +272,10 @@ pub fn unmount_export<C: Connector>(
     let args = mount3::encode_path(export).map_err(super::session::xdr_error_to_lx)?;
     // Its own budget, and not the mount's: an unmount happens long after the
     // greeting, and there is nothing left of that deadline to spend.
-    let budget = Budget::new(greeting_budget(opts));
-    let transport = connector.connect(port, budget.left()?)?;
-    let mut client = RpcClient::new(transport, first_xid(), policy(opts, budget.left()?));
+    let budget = Budget::new(greeting_budget(opts), connector.now_ms());
+    let transport = connector.connect(port, budget.left(connector.now_ms())?)?;
+    let left = budget.left(connector.now_ms())?;
+    let mut client = RpcClient::new(transport, connector.first_xid(), policy(opts, left));
     // `UMNT` is a void procedure: there is nothing to decode, and an empty
     // result is the success.
     client
@@ -330,7 +327,12 @@ pub fn greet_with_budget<C: Connector>(
     opts: &NfsOptions,
     budget_ms: u64,
 ) -> LxResult<Greeting> {
-    greet_with_deadline(connector, source, opts, &Budget::new(budget_ms))
+    greet_with_deadline(
+        connector,
+        source,
+        opts,
+        &Budget::new(budget_ms, connector.now_ms()),
+    )
 }
 
 /// [`greet`] against a deadline the caller owns.
@@ -352,7 +354,7 @@ pub fn greet_with_deadline<C: Connector>(
             connector,
             portmap::PROGRAM_MOUNT,
             mount3::MOUNT_VERSION,
-            budget.left()?,
+            budget.left(connector.now_ms())?,
             opts,
         )
         .map_err(PortmapFailure::errno)?,
@@ -363,7 +365,7 @@ pub fn greet_with_deadline<C: Connector>(
             connector,
             portmap::PROGRAM_NFS,
             super::nfs3::NFS_VERSION,
-            budget.left()?,
+            budget.left(connector.now_ms())?,
             opts,
         ) {
             Ok(port) => port,
@@ -383,8 +385,13 @@ pub fn greet_with_deadline<C: Connector>(
             Err(failure) => return Err(failure.errno()),
         },
     };
-    let (root, auth_flavors) =
-        mount_export(connector, mount_port, &source.export, budget.left()?, opts)?;
+    let (root, auth_flavors) = mount_export(
+        connector,
+        mount_port,
+        &source.export,
+        budget.left(connector.now_ms())?,
+        opts,
+    )?;
     Ok(Greeting {
         nfs_port,
         mount_port,
@@ -425,7 +432,7 @@ fn check_flavors(flavors: &[u32]) -> LxResult<()> {
     if flavors.contains(&AUTH_UNIX_FLAVOR) {
         return Ok(());
     }
-    Err(LxError::EACCES)
+    Err(Errno::EACCES)
 }
 
 /// The errno for `mountd`'s verdict on an export path.
@@ -434,26 +441,26 @@ fn check_flavors(flavors: &[u32]) -> LxResult<()> {
 /// mean there. The same mapping the session uses, written out again only
 /// because `MountStatus` is its own type and a `match` on it is what makes a
 /// new status a compile error rather than a silent `EIO`.
-pub fn mount_status_to_lx(status: MountStatus) -> LxError {
+pub fn mount_status_to_lx(status: MountStatus) -> Errno {
     match status {
         // Never reached through `mount_export`, which only maps a refusal --
         // but a `match` and not a `_`, so a status added to the protocol type
         // is a compile error here rather than a silent `EIO`.
-        MountStatus::Ok => LxError::EIO,
-        MountStatus::Perm => LxError::EPERM,
+        MountStatus::Ok => Errno::EIO,
+        MountStatus::Perm => Errno::EPERM,
         // The usual answer to an export path the server does not have.
-        MountStatus::NoEnt => LxError::ENOENT,
-        MountStatus::Io => LxError::EIO,
+        MountStatus::NoEnt => Errno::ENOENT,
+        MountStatus::Io => Errno::EIO,
         // For a mount this usually means this client's address is not in the
         // export's allowed list, which is a refusal and not an I/O error.
-        MountStatus::Acces => LxError::EACCES,
-        MountStatus::NotDir => LxError::ENOTDIR,
-        MountStatus::Inval => LxError::EINVAL,
-        MountStatus::NameTooLong => LxError::ENAMETOOLONG,
+        MountStatus::Acces => Errno::EACCES,
+        MountStatus::NotDir => Errno::ENOTDIR,
+        MountStatus::Inval => Errno::EINVAL,
+        MountStatus::NameTooLong => Errno::ENAMETOOLONG,
         // The server does not do this procedure of MOUNTv3.
-        MountStatus::NotSupp => LxError::EOPNOTSUPP,
-        MountStatus::ServerFault => LxError::EIO,
-        MountStatus::Unknown(_) => LxError::EIO,
+        MountStatus::NotSupp => Errno::EOPNOTSUPP,
+        MountStatus::ServerFault => Errno::EIO,
+        MountStatus::Unknown(_) => Errno::EIO,
     }
 }
 
@@ -490,16 +497,6 @@ fn policy(opts: &NfsOptions, timeout_ms: u64) -> super::client::RetryPolicy {
         soft: true,
         ..super::client::RetryPolicy::default()
     }
-}
-
-/// A starting transaction id for a connection that lives for one or two
-/// calls.
-///
-/// Derived from the clock for the reason [`RpcClient::new`] gives: a reply
-/// from a previous connection to the same server, arriving on a reused local
-/// port, must not carry an id this client is waiting for.
-pub(crate) fn first_xid() -> u32 {
-    kernel_hal::timer::timer_now().as_nanos() as u32
 }
 
 #[cfg(test)]

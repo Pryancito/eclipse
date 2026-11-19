@@ -272,12 +272,15 @@ fn the_runs_deadline_is_built_once_and_handed_out_again() {
     let mut slot: Option<Budget> = None;
     assert!(slot.is_none(), "nothing is built before a line needs one");
 
-    let first = run_budget(&mut slot).left().expect("time to start with");
-    let start = kernel_hal::timer::timer_now().as_millis() as u64;
+    let now = || kernel_hal::timer::timer_now().as_millis() as u64;
+    let first = run_budget(&mut slot)
+        .left(now())
+        .expect("time to start with");
+    let start = now();
     while (kernel_hal::timer::timer_now().as_millis() as u64) < start + BURN_MS {
         core::hint::spin_loop();
     }
-    let second = run_budget(&mut slot).left().expect("time still left");
+    let second = run_budget(&mut slot).left(now()).expect("time still left");
 
     assert!(
         first >= second + BURN_MS / 2,

@@ -5,49 +5,16 @@
 //! process ([`served`](super::served)): the network every program of this
 //! machine uses is the one a mount uses.
 //!
-//! # Why a trait
-//!
-//! [`Connector`] exists so the handshake in [`greeting`](super::greeting) can
-//! be measured. A `GETPORT` that asks for the wrong program, a `MNT` sent to
-//! the NFS port, a mount that leaves the mount daemon's connection open — all
-//! of those are mistakes about *which port is dialled and what is sent down
-//! it*, and a test can only see them if making a connection is something it
-//! can answer for. The real one dials TCP; the one in the tests hands back a
-//! scripted server and writes down which port was asked for.
+//! What a connector is, and the greeting's clock it keeps, is the `nfs3`
+//! crate's ([`Connector`]); this is the kernel's.
 
 use zcore_drivers::wire::IpAddress;
 
-use crate::error::LxResult;
+use super::{errno_of, Errno};
 
-use super::client::RpcTransport;
 use super::served::ServedTransport;
 
-/// How long to wait for a TCP handshake before giving up.
-///
-/// The thirty seconds a `connect(2)` waits, so a mount against an
-/// unreachable server fails when a `connect(2)` against it would.
-pub const CONNECT_TIMEOUT_MS: u64 = 30_000;
-
-/// Makes a connection to one port on the server.
-///
-/// The handshake dials up to three ports — portmap, `mountd`, `nfsd` — and
-/// which one it dials when is the thing worth measuring, so it goes through
-/// here rather than through a function the tests cannot answer for.
-pub trait Connector {
-    /// What a connection is, once made.
-    type Transport: RpcTransport;
-
-    /// Connect to `port` on the server this connector was built for, taking
-    /// no longer than `timeout_ms`.
-    ///
-    /// The timeout is an argument and not a property of the connector
-    /// because the caller is spending a budget: the greeting has one
-    /// deadline for all three of its steps, and a connection that may take
-    /// the connector's own thirty seconds whatever is left of that budget is
-    /// how three steps inside their own timeouts add up to a `mount(2)` that
-    /// hangs for minutes. A connector may still impose its own ceiling.
-    fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport>;
-}
+pub use nfs3::connect::{Connector, CONNECT_TIMEOUT_MS};
 
 /// The real one: a served TCP socket to a fixed address.
 ///
@@ -80,13 +47,17 @@ impl TcpConnector {
 impl Connector for TcpConnector {
     type Transport = ServedTransport;
 
-    fn connect(&mut self, port: u16, timeout_ms: u64) -> LxResult<Self::Transport> {
+    fn connect(&mut self, port: u16, timeout_ms: u64) -> Result<Self::Transport, Errno> {
         // The caller's budget and this connector's ceiling, whichever is
         // shorter: the ceiling is what a connector built with
         // `with_timeout` promised, and the budget is what is left of the
         // caller's deadline.
         let ms = timeout_ms.min(self.timeout_ms);
         let link = crate::net::user_stack::machine();
-        ServedTransport::connect(link, self.addr, port, ms)
+        ServedTransport::connect(link, self.addr, port, ms).map_err(errno_of)
+    }
+
+    fn now_ns(&self) -> u64 {
+        kernel_hal::timer::timer_now().as_nanos() as u64
     }
 }

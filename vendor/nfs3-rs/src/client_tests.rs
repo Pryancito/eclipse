@@ -7,10 +7,10 @@
 //! lines here and each is untestable against a real socket in CI.
 
 use super::*;
-use crate::fs::nfs::rpc::{
+use crate::rpc::{
     frame_message, AuthUnix, CallTarget, Credential, RpcError, RpcRejection, MSG_TYPE_REPLY,
 };
-use crate::fs::nfs::xdr::{XdrDecoder, XdrEncoder};
+use crate::xdr::{XdrDecoder, XdrEncoder};
 use alloc::collections::VecDeque;
 use alloc::vec;
 

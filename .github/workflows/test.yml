@@ -249,6 +249,10 @@ jobs:
           # goes in whole.
           cargo test -p eclipsefs --features std --lib --test model
           cargo test -p btrfs --features std
+          # The NFSv3 client below the VFS, shared by the kernel's NFS and
+          # the process that serves an NFS mount: XDR, RPC, portmap, MOUNT,
+          # NFSv3, the session and the greeting, against scripted servers.
+          cargo test -p nfs3
           # The SFS the initramfs root lives on. Its suite is in the tree but
           # had never run here: the crate is only reached through `[patch]`,
           # and `--features std` is what gives its tests a file-backed device
@@ -463,6 +467,10 @@ jobs:
           # again from a server that died: at every write of a change, the
           # next server finds the volume with every change it was told of.
           cargo test --manifest-path tools/eclipse-btrfs/Cargo.toml
+          # eclipse-nfs, the NFS client that runs as a process. What runs
+          # here is the records it answers with; the suite against a real
+          # NFS server (ganesha) is `--ignored`, as the kernel's is.
+          cargo test --manifest-path tools/eclipse-nfs/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the

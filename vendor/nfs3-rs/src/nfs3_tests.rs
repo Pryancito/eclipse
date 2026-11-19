@@ -171,7 +171,7 @@ fn a_status_this_client_does_not_know_is_kept_rather_than_guessed() {
         Nfs3Status::from_wire(u32::MAX),
         Nfs3Status::Unknown(u32::MAX)
     );
-    assert_eq!(Nfs3Status::Unknown(10009).to_lx_error(), LxError::EIO);
+    assert_eq!(Nfs3Status::Unknown(10009).to_lx_error(), Errno::EIO);
 }
 
 #[test]
@@ -196,20 +196,20 @@ fn the_statuses_above_ten_thousand_do_not_reach_userspace_as_numbers() {
     // kernel as errno 10004 -- a number no `errno` names and that `strerror`
     // prints as "Unknown error". Every one of these has to land on an errno
     // that exists.
-    let mapped: &[(Nfs3Status, LxError)] = &[
-        (Nfs3Status::BadHandle, LxError::ESTALE),
-        (Nfs3Status::NotSync, LxError::EINVAL),
-        (Nfs3Status::BadCookie, LxError::EINVAL),
-        (Nfs3Status::NotSupp, LxError::EOPNOTSUPP),
-        (Nfs3Status::TooSmall, LxError::EIO),
-        (Nfs3Status::ServerFault, LxError::EIO),
-        (Nfs3Status::BadType, LxError::EINVAL),
-        (Nfs3Status::JukeBox, LxError::EAGAIN),
+    let mapped: &[(Nfs3Status, Errno)] = &[
+        (Nfs3Status::BadHandle, Errno::ESTALE),
+        (Nfs3Status::NotSync, Errno::EINVAL),
+        (Nfs3Status::BadCookie, Errno::EINVAL),
+        (Nfs3Status::NotSupp, Errno::EOPNOTSUPP),
+        (Nfs3Status::TooSmall, Errno::EIO),
+        (Nfs3Status::ServerFault, Errno::EIO),
+        (Nfs3Status::BadType, Errno::EINVAL),
+        (Nfs3Status::JukeBox, Errno::EAGAIN),
     ];
     for &(status, err) in mapped {
         assert_eq!(status.to_lx_error(), err, "{:?}", status);
         assert!(
-            (err as isize) < 10_000,
+            err.0 < 10_000,
             "{:?} maps to a number that is not an errno",
             status
         );
@@ -218,26 +218,26 @@ fn the_statuses_above_ten_thousand_do_not_reach_userspace_as_numbers() {
 
 #[test]
 fn the_statuses_that_are_errno_map_to_the_same_one() {
-    let table: &[(Nfs3Status, LxError)] = &[
-        (Nfs3Status::Perm, LxError::EPERM),
-        (Nfs3Status::NoEnt, LxError::ENOENT),
-        (Nfs3Status::Io, LxError::EIO),
-        (Nfs3Status::NxIo, LxError::ENXIO),
-        (Nfs3Status::Acces, LxError::EACCES),
-        (Nfs3Status::Exist, LxError::EEXIST),
-        (Nfs3Status::XDev, LxError::EXDEV),
-        (Nfs3Status::NoDev, LxError::ENODEV),
-        (Nfs3Status::NotDir, LxError::ENOTDIR),
-        (Nfs3Status::IsDir, LxError::EISDIR),
-        (Nfs3Status::Inval, LxError::EINVAL),
-        (Nfs3Status::FBig, LxError::EFBIG),
-        (Nfs3Status::NoSpc, LxError::ENOSPC),
-        (Nfs3Status::RoFs, LxError::EROFS),
-        (Nfs3Status::MLink, LxError::EMLINK),
-        (Nfs3Status::NameTooLong, LxError::ENAMETOOLONG),
-        (Nfs3Status::NotEmpty, LxError::ENOTEMPTY),
-        (Nfs3Status::DQuot, LxError::EDQUOT),
-        (Nfs3Status::Remote, LxError::EREMOTE),
+    let table: &[(Nfs3Status, Errno)] = &[
+        (Nfs3Status::Perm, Errno::EPERM),
+        (Nfs3Status::NoEnt, Errno::ENOENT),
+        (Nfs3Status::Io, Errno::EIO),
+        (Nfs3Status::NxIo, Errno::ENXIO),
+        (Nfs3Status::Acces, Errno::EACCES),
+        (Nfs3Status::Exist, Errno::EEXIST),
+        (Nfs3Status::XDev, Errno::EXDEV),
+        (Nfs3Status::NoDev, Errno::ENODEV),
+        (Nfs3Status::NotDir, Errno::ENOTDIR),
+        (Nfs3Status::IsDir, Errno::EISDIR),
+        (Nfs3Status::Inval, Errno::EINVAL),
+        (Nfs3Status::FBig, Errno::EFBIG),
+        (Nfs3Status::NoSpc, Errno::ENOSPC),
+        (Nfs3Status::RoFs, Errno::EROFS),
+        (Nfs3Status::MLink, Errno::EMLINK),
+        (Nfs3Status::NameTooLong, Errno::ENAMETOOLONG),
+        (Nfs3Status::NotEmpty, Errno::ENOTEMPTY),
+        (Nfs3Status::DQuot, Errno::EDQUOT),
+        (Nfs3Status::Remote, Errno::EREMOTE),
     ];
     for &(status, err) in table {
         assert_eq!(status.to_lx_error(), err, "{:?}", status);
@@ -251,16 +251,16 @@ fn a_stale_handle_is_estale_and_nothing_else() {
     // NFS one can. Reporting `ENOENT` instead would make a program retry the
     // lookup, which is exactly the wrong move -- the *name* may still be
     // there, it is the handle that is dead.
-    assert_eq!(Nfs3Status::Stale.to_lx_error(), LxError::ESTALE);
-    assert_ne!(Nfs3Status::Stale.to_lx_error(), LxError::ENOENT);
-    assert_eq!(LxError::ESTALE as isize, 116);
-    assert_eq!(LxError::EDQUOT as isize, 122);
-    assert_eq!(LxError::EREMOTE as isize, 66);
+    assert_eq!(Nfs3Status::Stale.to_lx_error(), Errno::ESTALE);
+    assert_ne!(Nfs3Status::Stale.to_lx_error(), Errno::ENOENT);
+    assert_eq!(Errno::ESTALE.0, 116);
+    assert_eq!(Errno::EDQUOT.0, 122);
+    assert_eq!(Errno::EREMOTE.0, 66);
 }
 
 #[test]
 fn ok_is_not_an_error_and_says_so() {
-    assert_eq!(Nfs3Status::Ok.to_lx_error(), LxError::EUNDEF);
+    assert_eq!(Nfs3Status::Ok.to_lx_error(), Errno::EUNDEF);
 }
 
 // ------------------------------------------------------------------- ftype3

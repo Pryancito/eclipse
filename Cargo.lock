@@ -1388,6 +1388,7 @@ dependencies = [
  "linux-vdso",
  "lock",
  "log",
+ "nfs3",
  "numeric-enum-macro",
  "pci",
  "rcore-fs",
@@ -1511,6 +1512,14 @@ name = "nb"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "546c37ac5d9e56f55e73b677106873d9d9f5190605e41a856503623648488cae"
+
+[[package]]
+name = "nfs3"
+version = "0.1.0"
+dependencies = [
+ "rcore-fs",
+ "spin 0.9.4",
+]
 
 [[package]]
 name = "nix"

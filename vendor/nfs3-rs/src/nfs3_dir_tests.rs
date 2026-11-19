@@ -14,7 +14,7 @@
 
 use super::super::nfs3::MAXNAMLEN;
 use super::*;
-use crate::error::LxError;
+use crate::errno::Errno;
 
 /// A handle of `len` bytes, each one different from its neighbours so a test
 /// that compares them cannot pass on a slice of the wrong part.
@@ -377,7 +377,7 @@ fn a_failed_readdir_reads_only_the_attributes_and_not_a_verifier() {
 
     assert_eq!(status, Nfs3Status::Stale);
     assert_eq!(attr, None);
-    assert_eq!(status.to_lx_error(), LxError::ESTALE);
+    assert_eq!(status.to_lx_error(), Errno::ESTALE);
 }
 
 #[test]

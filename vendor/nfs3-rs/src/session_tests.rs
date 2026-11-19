@@ -9,11 +9,11 @@
 //! calls show it.
 
 use super::*;
-use crate::fs::nfs::fake::*;
+use crate::fake::*;
 
-use crate::fs::nfs::nfs3::{Ftype3, PreOpAttr};
-use crate::fs::nfs::nfs3_dir::COOKIEVERF_SIZE;
-use crate::fs::nfs::xdr::{XdrDecoder, XdrEncoder};
+use crate::nfs3::{Ftype3, PreOpAttr};
+use crate::nfs3_dir::COOKIEVERF_SIZE;
+use crate::xdr::{XdrDecoder, XdrEncoder};
 use alloc::vec;
 use rcore_fs::vfs::Timespec;
 
@@ -38,7 +38,7 @@ fn a_status_the_server_returns_becomes_the_errno_for_it() {
     let mut server = Server::new();
     server.answer(failure(13));
     let mut s = session(server);
-    assert_eq!(s.lookup(&a_handle(), "x"), Err(LxError::EACCES));
+    assert_eq!(s.lookup(&a_handle(), "x"), Err(Errno::EACCES));
 }
 
 #[test]
@@ -49,8 +49,8 @@ fn a_status_above_ten_thousand_does_not_leave_as_an_errno() {
     server.answer(failure(10_004));
     let mut s = session(server);
     let got = s.lookup(&a_handle(), "x");
-    assert_eq!(got, Err(LxError::EOPNOTSUPP));
-    assert_ne!(got, Err(LxError::EUNDEF));
+    assert_eq!(got, Err(Errno::EOPNOTSUPP));
+    assert_ne!(got, Err(Errno::EUNDEF));
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn a_stale_handle_is_estale_and_not_a_generic_io_error() {
     let mut server = Server::new();
     server.answer(failure(70));
     let mut s = session(server);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::ESTALE));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::ESTALE));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn a_name_with_a_slash_in_it_never_reaches_the_wire() {
     let mut server = Server::new();
     server.answer(getattr_ok(1));
     let mut s = session(server);
-    assert_eq!(s.lookup(&a_handle(), "a/b"), Err(LxError::EINVAL));
+    assert_eq!(s.lookup(&a_handle(), "a/b"), Err(Errno::EINVAL));
     assert!(
         s.transport().calls.is_empty(),
         "a name that is not one component was sent to the server anyway"
@@ -135,7 +135,7 @@ fn a_jukebox_that_never_clears_runs_out_of_retries_and_is_reported() {
     let mut server = Server::new();
     server.answer_times(JUKEBOX_RETRIES as usize + 1, failure(10_008));
     let mut s = session(server);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::EAGAIN));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::EAGAIN));
     assert_eq!(
         s.transport().calls.len(),
         JUKEBOX_RETRIES as usize + 1,
@@ -170,7 +170,7 @@ fn the_jukebox_pause_gives_up_on_a_clock_that_has_stopped() {
     server.answer_times(JUKEBOX_RETRIES as usize + 1, failure(10_008));
     let mut s = NfsSession::new(server, 1, a_handle(), &quick_options());
     s.set_jukebox_policy(JUKEBOX_RETRIES, JUKEBOX_PAUSE_MS);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::EAGAIN));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::EAGAIN));
     assert_eq!(
         s.transport().now_ms(),
         0,
@@ -239,7 +239,7 @@ fn a_read_of_nothing_without_eof_is_an_error_and_not_another_turn() {
     server.answer_times(4, read_ok(b"", false));
     let mut s = session(server);
     let mut buf = [0u8; 16];
-    assert_eq!(s.read_into(&a_handle(), 0, &mut buf), Err(LxError::EIO));
+    assert_eq!(s.read_into(&a_handle(), 0, &mut buf), Err(Errno::EIO));
     assert_eq!(s.transport().calls.len(), 1, "the loop went around again");
 }
 
@@ -268,7 +268,7 @@ fn a_read_that_would_run_off_the_offset_space_is_refused() {
     let mut buf = [0u8; 4];
     assert_eq!(
         s.read_into(&a_handle(), u64::MAX, &mut buf),
-        Err(LxError::EINVAL)
+        Err(Errno::EINVAL)
     );
     assert_eq!(
         s.transport().calls.len(),
@@ -321,7 +321,7 @@ fn a_write_the_server_took_nothing_of_is_an_error_and_not_another_turn() {
     let data = vec![7u8; 10];
     assert_eq!(
         s.write_all(&a_handle(), 0, &data, StableHow::FileSync),
-        Err(LxError::EIO)
+        Err(Errno::EIO)
     );
     assert_eq!(s.transport().calls.len(), 1);
 }
@@ -336,7 +336,7 @@ fn a_server_that_claims_to_have_written_more_than_it_was_sent_is_refused() {
     let data = vec![7u8; 10];
     assert_eq!(
         s.write_once(&a_handle(), 0, &data, StableHow::FileSync),
-        Err(LxError::EIO)
+        Err(Errno::EIO)
     );
 }
 
@@ -401,12 +401,12 @@ fn a_read_only_mount_refuses_a_write_before_the_wire_and_not_after_it() {
     let mut s = NfsSession::new(Server::new(), 1, a_handle(), &opts);
     assert_eq!(
         s.write_once(&a_handle(), 0, b"x", StableHow::FileSync),
-        Err(LxError::EROFS)
+        Err(Errno::EROFS)
     );
-    assert_eq!(s.remove(&a_handle(), "x"), Err(LxError::EROFS));
+    assert_eq!(s.remove(&a_handle(), "x"), Err(Errno::EROFS));
     assert_eq!(
         s.mkdir(&a_handle(), "d", &SetAttr::default()),
-        Err(LxError::EROFS)
+        Err(Errno::EROFS)
     );
     assert!(
         s.transport().calls.is_empty(),
@@ -495,7 +495,7 @@ fn a_server_that_never_fits_an_entry_fails_rather_than_growing_forever() {
     let mut server = Server::new();
     server.answer_times(64, readdir_ok(&[], false, [1; 8]));
     let mut s = session(server);
-    assert_eq!(s.readdir_all(&a_handle(), false), Err(LxError::EIO));
+    assert_eq!(s.readdir_all(&a_handle(), false), Err(Errno::EIO));
     assert!(
         s.transport().calls.len() < 64,
         "the count grew past every bound instead of giving up"
@@ -509,7 +509,7 @@ fn a_cookie_the_server_hands_back_unchanged_is_an_error_and_not_another_round() 
     let mut server = Server::new();
     server.answer_times(4, readdir_ok(&[(1, "a", 0)], false, [1; 8]));
     let mut s = session(server);
-    assert_eq!(s.readdir_all(&a_handle(), false), Err(LxError::EIO));
+    assert_eq!(s.readdir_all(&a_handle(), false), Err(Errno::EIO));
     assert_eq!(
         s.transport().calls.len(),
         1,
@@ -541,7 +541,7 @@ fn a_bad_cookie_restarts_the_listing_once_and_then_gives_up() {
     let mut server = Server::new();
     server.answer_times(4, failure(10_003));
     let mut s = session(server);
-    assert_eq!(s.readdir_all(&a_handle(), false), Err(LxError::EINVAL));
+    assert_eq!(s.readdir_all(&a_handle(), false), Err(Errno::EINVAL));
     assert_eq!(
         s.transport().calls.len(),
         2,
@@ -636,7 +636,7 @@ fn a_server_that_refuses_the_credential_is_eacces_and_not_an_io_error() {
     let mut server = Server::new();
     server.deny_next = true;
     let mut s = session(server);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::EACCES));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::EACCES));
 }
 
 #[test]
@@ -646,7 +646,7 @@ fn a_server_that_never_answers_fails_as_an_io_error_on_a_soft_mount() {
     let mut server = Server::new();
     server.silent = 1;
     let mut s = session(server);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::EIO));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::EIO));
 }
 
 #[test]
@@ -654,16 +654,16 @@ fn a_reply_this_client_cannot_parse_is_an_io_error() {
     let mut server = Server::new();
     server.answer(vec![0u8; 3]); // not even a status word
     let mut s = session(server);
-    assert_eq!(s.getattr(&a_handle()), Err(LxError::EIO));
+    assert_eq!(s.getattr(&a_handle()), Err(Errno::EIO));
 }
 
 #[test]
 fn a_transport_that_is_not_connected_says_so_rather_than_eio() {
     assert_eq!(
         transport_error_to_lx(TransportError::NotConnected),
-        LxError::ENOTCONN
+        Errno::ENOTCONN
     );
-    assert_eq!(transport_error_to_lx(TransportError::Reset), LxError::EIO);
+    assert_eq!(transport_error_to_lx(TransportError::Reset), Errno::EIO);
 }
 
 // ------------------------------------------------------------- the identity
@@ -721,7 +721,7 @@ fn a_directory_that_never_ends_stops_at_the_entry_bound() {
     }
     let mut s = session(server);
     s.set_readdir_limits(READDIR_MAX_ROUNDS, 4);
-    assert_eq!(s.readdir_all(&a_handle(), false), Err(LxError::EIO));
+    assert_eq!(s.readdir_all(&a_handle(), false), Err(Errno::EIO));
     assert!(
         s.transport().calls.len() <= 6,
         "it kept asking past the entry bound: {} calls",
@@ -741,7 +741,7 @@ fn a_directory_that_never_ends_stops_at_the_round_bound_too() {
     }
     let mut s = session(server);
     s.set_readdir_limits(3, READDIR_MAX_ENTRIES);
-    assert_eq!(s.readdir_all(&a_handle(), false), Err(LxError::EIO));
+    assert_eq!(s.readdir_all(&a_handle(), false), Err(Errno::EIO));
     assert!(
         s.transport().calls.len() <= 5,
         "it turned past the round bound: {} calls",

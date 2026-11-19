@@ -16,7 +16,7 @@
 
 use super::super::nfs3::MAXNAMLEN;
 use super::*;
-use crate::error::LxError;
+use crate::errno::Errno;
 use alloc::vec;
 
 /// A `wcc_data` with both halves present, which is the longer and therefore
@@ -330,7 +330,7 @@ fn a_guard_that_did_not_match_is_not_sync_and_not_an_io_error() {
         decode_setattr(&enc.into_bytes()).unwrap(),
         Err((Nfs3Status::NotSync, empty_wcc()))
     );
-    assert_eq!(Nfs3Status::NotSync.to_lx_error(), LxError::EINVAL);
+    assert_eq!(Nfs3Status::NotSync.to_lx_error(), Errno::EINVAL);
 }
 
 #[test]
@@ -791,7 +791,7 @@ fn an_rmdir_of_a_full_directory_is_not_empty_and_not_a_decode_error() {
         decode_remove(&enc.into_bytes()).unwrap(),
         Err((Nfs3Status::NotEmpty, sample_wcc()))
     );
-    assert_eq!(Nfs3Status::NotEmpty.to_lx_error(), LxError::ENOTEMPTY);
+    assert_eq!(Nfs3Status::NotEmpty.to_lx_error(), Errno::ENOTEMPTY);
 }
 
 #[test]
@@ -905,5 +905,5 @@ fn a_link_reply_carries_the_files_attributes_in_both_arms() {
 
 #[test]
 fn a_cross_device_link_is_exdev() {
-    assert_eq!(Nfs3Status::XDev.to_lx_error(), LxError::EXDEV);
+    assert_eq!(Nfs3Status::XDev.to_lx_error(), Errno::EXDEV);
 }

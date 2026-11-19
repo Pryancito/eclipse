@@ -177,7 +177,7 @@ fn a_mount_with_no_budget_left_never_reaches_the_session() {
     // for ever.
     let err = greeting::greet_with_budget(&mut d, &a_source(), &opts, 0)
         .expect_err("a greeting that fails");
-    assert_eq!(err, LxError::ETIMEDOUT);
+    assert_eq!(err, crate::fs::nfs::Errno::ETIMEDOUT);
     assert!(log.lock().dialled.is_empty());
 }
 
@@ -188,13 +188,14 @@ fn a_mount_with_no_budget_left_never_reaches_the_session() {
 /// does: a deadline per line means a boot that waits a minute *per*
 /// unreachable server before the shell appears, so the bound has to be on
 /// the run. Measured the same way the three-step version is — a step made
-/// to cost real time, and the later dial checked for having **less** —
-/// because an absolute deadline read from the real clock is indis-
-/// tinguishable from a fresh one until time passes.
+/// to cost time, and the later dial checked for having **less** — because
+/// an absolute deadline is indistinguishable from a fresh one until time
+/// passes. The second server's clock goes on from the first's: one clock,
+/// as the kernel has.
 #[test]
 fn a_second_mount_under_the_same_deadline_gets_what_the_first_left_of_it() {
     const BURN_MS: u64 = 40;
-    let budget = Budget::new(greeting::greeting_budget(&quick_options()));
+    let budget = Budget::new(greeting::greeting_budget(&quick_options()), 0);
 
     let mut first = a_mountable_server();
     first.slow(MOUNTD_PORT, BURN_MS);
@@ -203,6 +204,7 @@ fn a_second_mount_under_the_same_deadline_gets_what_the_first_left_of_it() {
         .expect("the first line mounts");
 
     let mut second = a_mountable_server();
+    second.clock = first.clock;
     let second_log = second.log();
     connect_export_with_deadline(&mut second, &a_source(), &quick_options(), &budget)
         .expect("the second line mounts");
@@ -228,7 +230,7 @@ fn a_second_mount_under_the_same_deadline_gets_what_the_first_left_of_it() {
 /// the same amount in smaller pieces.
 #[test]
 fn a_line_whose_deadline_is_already_spent_dials_nobody() {
-    let budget = Budget::new(0);
+    let budget = Budget::new(0, 0);
     let mut d = a_mountable_server();
     let log = d.log();
     let err = match connect_export_with_deadline(&mut d, &a_source(), &quick_options(), &budget) {

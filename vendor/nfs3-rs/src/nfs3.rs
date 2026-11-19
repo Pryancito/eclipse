@@ -39,7 +39,7 @@ use rcore_fs::vfs::{FileType, Metadata, Timespec};
 use super::mount3::{FileHandle, FHSIZE3};
 use super::rpc::{CallTarget, RpcError, RpcResult};
 use super::xdr::{XdrDecoder, XdrEncoder, XdrError};
-use crate::error::LxError;
+use crate::errno::Errno;
 
 /// The NFS program number.
 pub const PROGRAM_NFS: u32 = 100_003;
@@ -198,50 +198,50 @@ impl Nfs3Status {
     /// Explicit, one arm at a time, rather than casting the wire value. The
     /// values above 10000 are not errno, and a cast would send `10004` out as
     /// an error number that nothing names.
-    pub fn to_lx_error(self) -> LxError {
+    pub fn to_lx_error(self) -> Errno {
         match self {
             // Not an error; a caller that reaches here asked the wrong
             // question, and `EUNDEF` is the honest answer to it.
-            Self::Ok => LxError::EUNDEF,
-            Self::Perm => LxError::EPERM,
-            Self::NoEnt => LxError::ENOENT,
-            Self::Io => LxError::EIO,
-            Self::NxIo => LxError::ENXIO,
-            Self::Acces => LxError::EACCES,
-            Self::Exist => LxError::EEXIST,
-            Self::XDev => LxError::EXDEV,
-            Self::NoDev => LxError::ENODEV,
-            Self::NotDir => LxError::ENOTDIR,
-            Self::IsDir => LxError::EISDIR,
-            Self::Inval => LxError::EINVAL,
-            Self::FBig => LxError::EFBIG,
-            Self::NoSpc => LxError::ENOSPC,
-            Self::RoFs => LxError::EROFS,
-            Self::MLink => LxError::EMLINK,
-            Self::NameTooLong => LxError::ENAMETOOLONG,
-            Self::NotEmpty => LxError::ENOTEMPTY,
-            Self::DQuot => LxError::EDQUOT,
+            Self::Ok => Errno::EUNDEF,
+            Self::Perm => Errno::EPERM,
+            Self::NoEnt => Errno::ENOENT,
+            Self::Io => Errno::EIO,
+            Self::NxIo => Errno::ENXIO,
+            Self::Acces => Errno::EACCES,
+            Self::Exist => Errno::EEXIST,
+            Self::XDev => Errno::EXDEV,
+            Self::NoDev => Errno::ENODEV,
+            Self::NotDir => Errno::ENOTDIR,
+            Self::IsDir => Errno::EISDIR,
+            Self::Inval => Errno::EINVAL,
+            Self::FBig => Errno::EFBIG,
+            Self::NoSpc => Errno::ENOSPC,
+            Self::RoFs => Errno::EROFS,
+            Self::MLink => Errno::EMLINK,
+            Self::NameTooLong => Errno::ENAMETOOLONG,
+            Self::NotEmpty => Errno::ENOTEMPTY,
+            Self::DQuot => Errno::EDQUOT,
             // The handle names something that is gone. `ESTALE` exists for
             // exactly this and is what Linux reports.
-            Self::Stale | Self::BadHandle => LxError::ESTALE,
-            Self::Remote => LxError::EREMOTE,
+            Self::Stale | Self::BadHandle => Errno::ESTALE,
+            Self::Remote => Errno::EREMOTE,
             // A guard mismatch is a failed compare-and-set, not a bad
             // argument: `EINVAL` is what Linux's client reports.
-            Self::NotSync => LxError::EINVAL,
+            Self::NotSync => Errno::EINVAL,
             // A stale directory cookie. Linux restarts the readdir; a caller
             // that cannot sees `EINVAL`, as `lseek` on a bad offset does.
-            Self::BadCookie => LxError::EINVAL,
-            Self::NotSupp => LxError::EOPNOTSUPP,
+            Self::BadCookie => Errno::EINVAL,
+            Self::NotSupp => Errno::EOPNOTSUPP,
             // The reply did not fit. Not the caller's fault and not a bad
             // argument: `EIO` is the only honest answer, and the client should
             // have asked for less.
-            Self::TooSmall => LxError::EIO,
-            Self::ServerFault => LxError::EIO,
-            Self::BadType => LxError::EINVAL,
+            Self::TooSmall => Errno::EIO,
+            Self::ServerFault => Errno::EIO,
+            Self::BadType => Errno::EINVAL,
             // Should have been retried, not reported. If it reaches here the
             // retries ran out, and the file really was not available.
-            Self::JukeBox => LxError::EAGAIN,
-            Self::Unknown(_) => LxError::EIO,
+            Self::JukeBox => Errno::EAGAIN,
+            Self::Unknown(_) => Errno::EIO,
         }
     }
 }

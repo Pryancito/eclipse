@@ -1,33 +1,14 @@
 //! The NFS client: mounting a remote export over NFSv3.
 //!
-//! This is the first batch of it, and it is the whole protocol stack below
-//! the first byte of socket I/O:
+//! The protocol below the VFS is the `nfs3` crate (`vendor/nfs3-rs`), which
+//! the process that serves an NFS mount (`tools/eclipse-nfs`) links too; its
+//! modules are re-exported here under the names they had when they lived
+//! here. What is the kernel's:
 //!
-//! - [`xdr`]: the XDR encoding (RFC 4506) every ONC RPC protocol uses.
-//! - [`rpc`]: the RPC v2 call and reply envelope (RFC 5531) and the TCP
-//!   record marking that frames it (RFC 1831 section 10).
-//! - [`portmap`]: `GETPORT` against port 111, which is how a client finds
-//!   `mountd`.
-//! - [`mount3`]: the MOUNT v3 `MNT` call, which turns an export path into the
-//!   root filehandle every NFS call starts from.
-//! - [`nfs3`]: the NFSv3 types (RFC 1813) and the procedures of the read
-//!   path.
-//! - [`nfs3_write`]: the NFSv3 procedures that change something on the
-//!   server.
-//! - [`nfs3_dir`]: `READDIR` and `READDIRPLUS`, which read a directory.
-//! - [`client`]: one call out, one reply back, with transaction ids,
-//!   timeouts and retries, over a four-method transport trait.
-//! - [`session`]: one mounted export's conversation with its server: the
-//!   errno every failure becomes, and the loops `READ`, `WRITE` and `READDIR`
-//!   make mandatory.
-//! - [`source`]: the `host:/export` string `mount(8)` passes as the device.
-//!
-//! What is deliberately *not* here yet is the socket and the VFS types. The split is not arbitrary: everything in this batch is
-//! a pure function from bytes to bytes, so all of it is tested on the host,
-//! by tests that build a reply byte by byte and assert what the decoder makes
-//! of it. Nothing below needs a running kernel, a network or a server, and
-//! the layer above — which needs all three — is better written against a
-//! codec that is already known to be right.
+//! - [`fs`]: the VFS over a session.
+//! - [`connect`] and [`served`]: the connection, a stream socket of the
+//!   network stack that runs as a process.
+//! - [`mount`]: the greeting, the session, the filesystem, in that order.
 //!
 //! # Only a client, and only NFSv3
 //!
@@ -54,25 +35,30 @@
 //! and no arithmetic on one may wrap. [`xdr`] documents the reasoning and the
 //! tests hold it at the boundary.
 
-pub mod client;
+pub use ::nfs3::{
+    client, greeting, mount3, nfs3, nfs3_dir, nfs3_write, portmap, rpc, session, source, transport,
+    xdr,
+};
+#[cfg(test)]
+pub(crate) use ::nfs3::{dialer, fake};
+
 pub mod connect;
-#[cfg(test)]
-pub(crate) mod dialer;
-#[cfg(test)]
-pub(crate) mod fake;
 pub mod fs;
-pub mod greeting;
 pub mod mount;
-pub mod mount3;
-pub mod nfs3;
-pub mod nfs3_dir;
-pub mod nfs3_write;
-pub mod portmap;
 #[cfg(test)]
 mod real_server_tests;
-pub mod rpc;
 pub mod served;
-pub mod session;
-pub mod source;
-pub mod transport;
-pub mod xdr;
+
+pub use ::nfs3::errno::Errno;
+
+/// The kernel's errno for one of the NFS client's.
+impl From<Errno> for crate::error::LxError {
+    fn from(e: Errno) -> Self {
+        crate::error::LxError::from_errno(e.0)
+    }
+}
+
+/// The NFS client's errno for one of the kernel's.
+pub fn errno_of(e: crate::error::LxError) -> Errno {
+    Errno(e as i32)
+}
