@@ -3787,8 +3787,9 @@ fn proc_gpusnd_content() -> String {
         s.push_str("[gpusnd] no audio devices registered\n");
         return s;
     }
-    for (card, d) in devices.iter().enumerate() {
-        s.push_str(&format!("[gpusnd] --- card {} ---\n", card));
+    let first = super::first_kernel_audio_card();
+    for (idx, d) in devices.iter().enumerate() {
+        s.push_str(&format!("[gpusnd] --- card {} ---\n", idx + first));
         s.push_str(&d.diagnostics());
     }
     // The display side, which no amount of codec state can reveal.

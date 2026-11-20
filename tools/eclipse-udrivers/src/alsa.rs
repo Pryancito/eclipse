@@ -689,6 +689,8 @@ pub struct Pcm {
     drain_waits: bool,
     /// The readiness the open was last told.
     pub said: u64,
+    /// The card number it is (`/dev/snd/pcmC<card>D0p`).
+    pub card: i32,
     clock: fn() -> u64,
 }
 
@@ -720,6 +722,7 @@ impl Pcm {
             wants: None,
             drain_waits: false,
             said: 0,
+            card: 0,
             clock,
         };
         p.fresh();
@@ -728,11 +731,12 @@ impl Pcm {
 
     /// As a new open finds it.
     fn fresh(&mut self) {
-        let (open, next_fh, clock) = (self.open, self.next_fh, self.clock);
+        let (open, next_fh, clock, card) = (self.open, self.next_fh, self.clock, self.card);
         *self = Pcm {
             open,
             next_fh,
             clock,
+            card,
             ..Pcm {
                 open: None,
                 next_fh: 1,
@@ -759,6 +763,7 @@ impl Pcm {
                 wants: None,
                 drain_waits: false,
                 said: 0,
+                card,
                 clock,
             }
         };
@@ -1003,6 +1008,7 @@ impl Pcm {
 
     fn info(&self) -> SndPcmInfo {
         let mut info: SndPcmInfo = zeroed();
+        info.card = self.card;
         fill_cstr(&mut info.id, "Eclipse HDA");
         fill_cstr(&mut info.name, NAME);
         fill_cstr(&mut info.subname, "subdevice #0");
@@ -1493,6 +1499,8 @@ fn elem_at(index: u32) -> Option<Elem> {
 #[derive(Default)]
 pub struct Ctl {
     next_fh: u32,
+    /// The card number it is (`/dev/snd/controlC<card>`).
+    pub card: i32,
 }
 
 impl Ctl {
@@ -1512,7 +1520,8 @@ impl Ctl {
             // CARD_INFO
             0x01 => {
                 let mut info: SndCtlCardInfo = zeroed();
-                fill_cstr(&mut info.id, "EclipseHDA0");
+                info.card = self.card;
+                fill_cstr(&mut info.id, &format!("EclipseHDA{}", self.card));
                 fill_cstr(&mut info.driver, "eclipse-hda");
                 fill_cstr(&mut info.name, NAME);
                 fill_cstr(&mut info.longname, NAME);
@@ -1602,6 +1611,7 @@ impl Ctl {
                     return Err(ENOENT);
                 }
                 let mut info: SndPcmInfo = zeroed();
+                info.card = self.card;
                 info.subdevice = asked.subdevice;
                 fill_cstr(&mut info.id, "Eclipse HDA");
                 fill_cstr(&mut info.name, NAME);

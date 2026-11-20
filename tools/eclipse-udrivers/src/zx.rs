@@ -61,6 +61,7 @@ impl Status {
     pub const SHOULD_WAIT: Status = Status(-22);
     pub const PEER_CLOSED: Status = Status(-24);
     pub const NOT_FOUND: Status = Status(-25);
+    pub const ALREADY_EXISTS: Status = Status(-26);
     pub const ALREADY_BOUND: Status = Status(-27);
     pub const ACCESS_DENIED: Status = Status(-30);
     pub const IO: Status = Status(-40);

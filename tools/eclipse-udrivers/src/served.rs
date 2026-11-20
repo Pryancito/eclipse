@@ -234,9 +234,21 @@ impl Node {
     /// Put `/dev/<name>` there, a character device `major:minor` with
     /// permissions `mode`, answered by this process.
     pub fn serve(name: &str, major: u32, minor: u32, mode: u32) -> Result<Node, String> {
+        Node::serve_status(name, major, minor, mode).map_err(|(_, e)| e)
+    }
+
+    /// [`Node::serve`], with the kernel's status on a refusal:
+    /// [`Status::ALREADY_EXISTS`] when the name is someone else's (the
+    /// kernel's own driver of another card, or another server).
+    pub fn serve_status(
+        name: &str,
+        major: u32,
+        minor: u32,
+        mode: u32,
+    ) -> Result<Node, (Option<crate::zx::Status>, String)> {
         let (fifo, theirs) =
-            Fifo::<Msg>::create(SLOTS * 4).map_err(|e| format!("fifo_create: {e}"))?;
-        let (window, vmo) = zx::shared_memory(SLOTS * SLOT_LEN)?;
+            Fifo::<Msg>::create(SLOTS * 4).map_err(|e| (None, format!("fifo_create: {e}")))?;
+        let (window, vmo) = zx::shared_memory(SLOTS * SLOT_LEN).map_err(|e| (None, e))?;
         // SAFETY: the kernel reads `name.len()` bytes of `name`; both
         // handles go to it.
         unsafe {
@@ -252,7 +264,7 @@ impl Node {
                 ],
             )
         }
-        .map_err(|e| format!("dev_serve /dev/{name}: {e}"))?;
+        .map_err(|e| (Some(e), format!("dev_serve /dev/{name}: {e}")))?;
         Ok(Node {
             fifo,
             window,
