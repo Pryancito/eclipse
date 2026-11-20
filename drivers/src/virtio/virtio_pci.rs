@@ -428,11 +428,6 @@ impl PciDriver for VirtIoPciDriver {
                             return Ok(Device::Uart(Arc::new(console)));
                         }
                     }
-                    0x1012 | 0x1052 => {
-                        if let Ok(input) = crate::virtio::VirtIoInput::new(header) {
-                            return Ok(Device::Input(Arc::new(input)));
-                        }
-                    }
                     _ => {
                         warn!("VirtIO legacy device {:x} is not yet supported", device_id);
                     }

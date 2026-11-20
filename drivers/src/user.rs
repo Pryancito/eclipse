@@ -24,9 +24,9 @@
 //! virtio disk only, the root of an aarch64 machine with no initrd
 //! ([`keep_boot_disk`]). Everywhere else the root comes from the initrd. And the first HD Audio controller that is not a
 //! GPU's goes unasked ([`leave_first_hda`]): `uhda=kernel` keeps it. And
-//! the first two virtio input devices and the PC's i8042 ([`leave_input`]),
-//! whose events reach the consoles and `/sys` from their drivers too:
-//! `uinput=kernel` and `ups2=kernel` keep them.
+//! the first four virtio input devices and the PC's i8042 ([`leave_input`]),
+//! whose events reach the consoles and `/sys` from their drivers too: the
+//! kernel has no driver for either.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -45,13 +45,13 @@ pub const NVME: &str = "nvme";
 /// An AHCI (SATA) controller, with every disk on its ports, always left
 /// to userspace: the kernel has no driver for it.
 pub const AHCI: &str = "ahci";
-/// A virtio input device (keyboard, mouse, tablet), which the kernel
-/// drives itself unless `udriver=virtio-input@N` asks for it: its driver
-/// in userspace serves it as `/dev/input/event*`.
+/// A virtio input device (keyboard, mouse, tablet), always left to
+/// userspace: the kernel has no driver for it. Its driver in userspace
+/// serves it as `/dev/input/event*`.
 pub const VIRTIO_INPUT: &str = "virtio-input";
-/// The keyboard port of the PC's i8042 (PS/2) controller, which the kernel
-/// drives itself unless `udriver=i8042@0` asks for it: the controller is
-/// then left whole, this and [`I8042_AUX`], to one driver in userspace.
+/// The keyboard port of the PC's i8042 (PS/2) controller, always left to
+/// userspace with the rest of the controller, this and [`I8042_AUX`], to
+/// one driver there: the kernel has no driver for it.
 pub const I8042: &str = "i8042";
 /// The aux (mouse) port of the same controller: its own interrupt line,
 /// the same two I/O ports.
@@ -548,32 +548,29 @@ pub fn reserve_hda(
     reserve_with(HDA, true, unasked, transport, paddr, size, wiring)
 }
 
-/// Whether the first virtio input devices are left to userspace without
-/// the boot naming them: see [`leave_input`].
+/// Whether the virtio input devices are left to userspace without the
+/// boot naming them: see [`leave_input`].
 static INPUT_UNASKED: AtomicBool = AtomicBool::new(false);
 /// The same for the i8042.
 static I8042_UNASKED: AtomicBool = AtomicBool::new(false);
 /// How many virtio input devices go unasked: init has a service for each
-/// of the first two (`uinput`, `uinput2`), and a third would have no
-/// driver.
-const INPUT_UNASKED_MAX: usize = 2;
+/// of the first four (`uinput` to `uinput4`), and a fifth would have no
+/// driver. The kernel has none either: a fifth is nobody's.
+const INPUT_UNASKED_MAX: usize = 4;
 
-/// Leave the first two virtio input devices (with `virtio`) and the PC's
-/// i8042, keyboard and mouse (with `i8042`), to their drivers in userspace,
-/// unless the boot names one of that kind. Their events still reach the
+/// Leave the first four virtio input devices and the PC's i8042, keyboard
+/// and mouse, to their drivers in userspace (with `gateway`: the gateway
+/// they claim them through is open), whether the boot names them or not.
+/// The kernel has no driver for either. Their events still reach the
 /// consoles, and libinput finds them in `/sys`, as a kernel device's
 /// (`linux_object::fs::devfs::served::input`). Before the buses are probed.
-pub fn leave_input(spec: Option<&str>, virtio: bool, i8042: bool) {
-    if virtio && kind_unasked(spec, VIRTIO_INPUT) {
-        info!("udriver: the first virtio input devices are for userspace");
+pub fn leave_input(gateway: bool) {
+    if gateway {
+        info!("udriver: the virtio input devices and the i8042 are for userspace");
         INPUT_UNASKED.store(true, Ordering::Release);
-    }
-    let named = parse_specs(spec.unwrap_or(""))
-        .iter()
-        .any(|(k, _)| *k == I8042 || *k == I8042_AUX);
-    if i8042 && !named {
-        info!("udriver: the i8042 is for userspace");
         I8042_UNASKED.store(true, Ordering::Release);
+    } else {
+        warn!("udriver: zircon.gateway=0: no driver claims a virtio input device or the i8042, and the kernel has none");
     }
 }
 

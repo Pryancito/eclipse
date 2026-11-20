@@ -85,8 +85,10 @@ const INPUT_DRIVERS: [&str; 4] = [
 /// and `udrv-snd-check`.
 const AUDIO_DRIVERS: [&str; 3] = ["udrv-hda", "udrv-dsp-check", "udrv-snd-check"];
 /// How many virtio input devices get a driver service of their own
-/// (`uinput`, `uinput2`): a keyboard and a mouse or tablet.
-const UINPUT_DEVICES: usize = 2;
+/// (`uinput` to `uinput4`): a keyboard, a mouse or tablet, and two more.
+/// The kernel has no driver for one: the kernel leaves this many to
+/// userspace (`INPUT_UNASKED_MAX` in `drivers/src/user.rs`).
+const UINPUT_DEVICES: usize = 4;
 
 /// The network stack that runs as a process: its package, under `tools/`,
 /// its binaries -- the stack, and the UDP and TCP echo servers and the TCP
@@ -347,7 +349,7 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     }
 
     // The virtio input devices the boot leaves to userspace
-    // (`udriver=virtio-input@N`): one service for each of the first two,
+    // (all of them; the kernel has no driver): one service for each of the first four,
     // the Nth of the kernel's list, each serving its device as a node of
     // `/dev/input`.
     for nth in 1..=UINPUT_DEVICES {
