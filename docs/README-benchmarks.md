@@ -175,7 +175,7 @@ two agree the measurement is standing on something.
 | the 2D primitives every framebuffer backend inherits | — | `zcore-drivers` `scheme::display::blit_tests::benches::*` |
 | the capability bitmap behind `EVIOCGBIT` | — | `zcore-drivers` `scheme::input::benches::*` |
 | the console's shadow buffer and its dirty region | — | `zcore-drivers` `utils::shadow_fb::tests::benches::*` |
-| the pointer, both halves of it | — | `zcore-drivers` `input::ps2_input::tests::benches::*`, `input::mouse::mouse_tests::benches::*` |
+| the pointer, both halves of it | — | `zcore-drivers` `input::mouse::mouse_tests::benches::*` (the PS/2 decode was the kernel's `input::ps2_input`, deleted: its driver is `udrv-ps2` now) |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -1062,7 +1062,8 @@ inside the test module for the usual reason -- `take_dirty`, `cell_pixels`,
 
 ## What the pointer path said
 
-Two families, one per half. `input::ps2_input::tests::benches` (5 rows) is a
+Two families, one per half. `input::ps2_input::tests::benches` (5 rows, from
+before the kernel's PS/2 driver was deleted: `udrv-ps2` drives the i8042 now) was a
 hardware aux packet off the 8042 being decoded into deltas and buttons, in the
 IRQ handler, once per packet -- 125 a second at the default PS/2 sample rate
 and 200 at the highest the controller takes.

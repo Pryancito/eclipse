@@ -449,16 +449,15 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             );
             return Err(DeviceError::NotSupported);
         }
-        // An input device left to a userspace driver (`udriver=`): recorded
-        // and not touched, which `VirtIoInput::new` would.
-        if header.device_type() == DeviceType::Input
-            && crate::user::reserve_virtio_input(
+        // An input device has no driver in the kernel either: it is
+        // counted, and left to its driver in userspace, not even reset.
+        if header.device_type() == DeviceType::Input {
+            crate::user::reserve_virtio_input(
                 crate::user::Transport::VirtioMmio,
                 paddr as usize,
                 size as usize,
                 wiring,
-            )
-        {
+            );
             return Err(DeviceError::NotSupported);
         }
         // A network card has no driver in the kernel: it is counted, and
@@ -480,7 +479,6 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
 
         let dev = match header.device_type() {
             DeviceType::GPU => Device::Display(Arc::new(VirtIoGpu::new(header)?)),
-            DeviceType::Input => Device::Input(Arc::new(VirtIoInput::new(header)?)),
             DeviceType::Console => Device::Uart(Arc::new(VirtIoConsole::new(header)?)),
             _ => return Err(DeviceError::NotSupported),
         };
