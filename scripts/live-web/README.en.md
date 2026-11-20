@@ -33,6 +33,10 @@ The serial console goes to an [xterm.js](https://xtermjs.org/) terminal through
 [xterm-pty](https://github.com/mame/xterm-pty). On an ordinary laptop the shell
 prompt shows up in about 20-25 seconds.
 
+With networking, `live/live.js` swaps `-nic none` for
+`-netdev socket,id=net0,connect=eclipse-net:8888 -device virtio-net-device,netdev=net0`
+(see "The network" below).
+
 `init.quiet` is an `eclipse-init` option: its `[eclipse-init] ...` lines, and
 what the keyboard, language and timezone scripts print, go to
 `/run/eclipse-init.log` instead of the console, so they do not land in the
@@ -50,6 +54,23 @@ the benchmarks are removed, and two services are turned off:
 - `boot-sound`: there is no sound card.
 
 What is left is 15 MB (8 MB gzipped).
+
+### The network
+
+Under Emscripten the TCP socket of `-netdev socket` is a WebSocket.
+`live/net.js` puts a fake one in its place that never leaves the browser: it
+takes QEMU's Ethernet frames and hands them to [v86](https://github.com/copy/v86)'s
+TCP/IP stack (`fake_network.js`), which answers DHCP (Eclipse gets
+192.168.86.100), ARP, ping and NTP, and resolves DNS over DoH. Each TCP
+connection Eclipse opens goes out as a
+[Wisp](https://github.com/MercuryWorkshop/wisp-protocol) stream over
+`wss://…/wisp/` to a server that opens the real connection. That server, its
+nginx and what it allows (only ports 80 and 443, no private IPs) are in
+`deploy/wisp/` of the website repository.
+
+Inside Eclipse the card is driven by `eclipse-netstack` (`unet.service`), which
+asks for its address over DHCP about half a minute after the shell prompt.
+With `?net=0` in the URL the machine boots without a network.
 
 ## Building it
 
@@ -84,6 +105,7 @@ and an `.htaccess` for Apache.
 
 - It works in recent Chrome, Edge and Firefox. Safari has no
   `COEP: credentialless`, so there the page says it cannot run.
-- No network, no desktop and no persistent disk: everything is lost on reload.
+- The network is outgoing TCP only (no UDP), to the ports the Wisp server
+  allows. No desktop and no persistent disk: everything is lost on reload.
 - It is riscv64, not x86_64: a whole PC (UEFI, q35, 4 GB) in WebAssembly would
   be too slow and too big to download.
