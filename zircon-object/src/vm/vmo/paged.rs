@@ -161,6 +161,214 @@ fn apply_deferred_range_changes(range_changes: Vec<DeferredRangeChange>) {
     }
 }
 
+// ── Pages read from a file with no family lock held ──────────────────────────
+//
+// A page of a file mapping is read from its file the first time it is
+// committed. It used to be read right there, in `commit_page_internal`, with
+// the family lock held -- an interrupts-off spin lock. Every disk is served
+// by a process now (`loader/src/linux/block_serve.rs`): the read waits for
+// that process, the CPU goes to its other tasks, and the holder sits parked
+// with the lock. A task of that CPU that wants the same family's lock (a
+// fault of another process on the same library, a `read(2)` of the file) then
+// spins on it for ever, the driver never runs, and the machine stops. That is
+// what an installed root on NVMe did at the first `exec` of its init.
+//
+// So a commit that finds it has to read the file does not: it writes down
+// what it needs ([`FillNeed`]), gives up with `SHOULD_WAIT`, and its caller
+// lets the lock go, reads the page into a frame of its own, and runs the
+// operation again with that frame in hand ([`Staged`]) -- Linux's
+// `VM_FAULT_RETRY`. The retry walks the tree again under the lock and finds
+// either the page somebody else brought in meanwhile, or the place for the
+// staged frame, which then goes in exactly where the in-lock read used to put
+// its frame. Nothing about the shape of the tree is carried across the
+// unlocked read; only the bytes.
+//
+// The bytes can go stale while no lock is held: a `write(2)` to the file
+// writes the inode and then copies itself into the pages the cache HAS
+// (`cache_overlay_write`), which this page is not yet. So every such change
+// bumps the object's `fill_epoch` between the two
+// ([`VMObjectTrait::note_source_change`]), and a staged frame read under an
+// older epoch is thrown away and read again. The bump comes after the inode
+// has the new bytes and before the cache is looked at under the lock, so
+// either the staged read is refused, or it lands first and the overlay finds
+// it and writes over it -- the two orders the in-lock read had.
+
+/// What a commit found it has to read from a file before it can finish.
+enum FillNeed {
+    /// A page of `node`'s own backing source, the node that holds it (the
+    /// root, or the hidden parent the source moved to at a fork).
+    Source {
+        node: Arc<VMObjectPaged>,
+        source: Arc<dyn FrameFiller>,
+        page: usize,
+        epoch: u64,
+    },
+    /// A page of the page cache a borrower borrows from, not resident there:
+    /// the cache reads it (with no lock of either family held) and the
+    /// borrower commits again.
+    Cache { cache: Arc<VmObject>, page: usize },
+}
+
+/// A page read from its source with no lock held, for the retry to use.
+struct Staged {
+    node: Arc<VMObjectPaged>,
+    page: usize,
+    epoch: u64,
+    /// `None` when the page lay past the end of the source when it was read:
+    /// the commit then goes the demand-zero way, as it did when it asked the
+    /// source's length itself.
+    frame: Option<PhysFrame>,
+}
+
+impl FillNeed {
+    /// Read what is needed. Called with no family lock held: this is where a
+    /// read from a served disk waits for its driver.
+    fn fetch(self) -> ZxResult<Option<Staged>> {
+        match self {
+            FillNeed::Source {
+                node,
+                source,
+                page,
+                epoch,
+            } => {
+                FILLS_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+                let frame = if page * PAGE_SIZE < source.source_len() {
+                    let frame = PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?;
+                    let vaddr = phys_to_virt(frame.paddr());
+                    // SAFETY: a fresh frame is one page of memory nobody else
+                    // can see yet.
+                    let buf =
+                        unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, PAGE_SIZE) };
+                    source.fill_page(page * PAGE_SIZE, buf);
+                    Some(frame)
+                } else {
+                    None
+                };
+                Ok(Some(Staged {
+                    node,
+                    page,
+                    epoch,
+                    frame,
+                }))
+            }
+            FillNeed::Cache { cache, page } => {
+                cache.commit_page(page, MMUFlags::READ)?;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Times a page was read from its source outside the family lock, and times
+/// a read was thrown away because the source changed meanwhile.
+static FILLS_UNLOCKED: AtomicU64 = AtomicU64::new(0);
+static FILLS_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// `(pages read from their file outside the family lock, of those thrown
+/// away because the file changed meanwhile)`.
+pub fn unlocked_fill_stats() -> (u64, u64) {
+    (
+        FILLS_UNLOCKED.load(Ordering::Relaxed),
+        FILLS_STALE.load(Ordering::Relaxed),
+    )
+}
+
+/// What an operation under the family lock leaves for after it: the mapping
+/// changes it collected, and the file read it could not do there. Derefs to
+/// the mapping changes, which is what most of the tree code pushes into.
+struct Deferred {
+    ranges: Vec<DeferredRangeChange>,
+    staged: Option<Staged>,
+    need: Option<FillNeed>,
+    /// A page about to be dropped again is committed blank instead of read
+    /// from its source (`zero`'s whole pages).
+    blank_fills: bool,
+}
+
+impl core::ops::Deref for Deferred {
+    type Target = Vec<DeferredRangeChange>;
+    fn deref(&self) -> &Self::Target {
+        &self.ranges
+    }
+}
+
+impl core::ops::DerefMut for Deferred {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ranges
+    }
+}
+
+impl Deferred {
+    fn new() -> Self {
+        Self::with(None)
+    }
+
+    fn with(staged: Option<Staged>) -> Self {
+        Self {
+            ranges: Vec::new(),
+            staged,
+            need: None,
+            blank_fills: false,
+        }
+    }
+
+    /// The staged frame for page `page` of the node `node` (its `self_ref`),
+    /// if that is what is in hand and the source has not changed since it was
+    /// read. A stale one is dropped -- later, with the rest of `self`, once
+    /// the family lock is down.
+    fn take_staged(&mut self, node: &WeakRef, page: usize) -> Option<Option<PhysFrame>> {
+        let staged = self.staged.as_mut()?;
+        if Arc::as_ptr(&staged.node) != node.as_ptr() || staged.page != page {
+            return None;
+        }
+        if staged.node.fill_epoch.load(Ordering::Acquire) != staged.epoch {
+            FILLS_STALE.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // The `Arc` stays in `self` (its drop is out of the lock); only the
+        // frame moves.
+        Some(staged.frame.take())
+    }
+
+    /// Write down that page `page` of `node` has to be read from its source;
+    /// the commit gives up with `SHOULD_WAIT` right after. The first need
+    /// wins: the operation stops at it.
+    fn need_source(&mut self, node: &VMObjectPagedInner, page: usize) -> ZxError {
+        if self.need.is_none() {
+            if let (Some(arc), Some(source)) = (node.self_ref.upgrade(), node.source.clone()) {
+                let epoch = arc.fill_epoch.load(Ordering::Acquire);
+                self.need = Some(FillNeed::Source {
+                    node: arc,
+                    source,
+                    page,
+                    epoch,
+                });
+            }
+        }
+        ZxError::SHOULD_WAIT
+    }
+
+    /// Write down that page `page` of `cache` has to be brought in first.
+    fn need_cache(&mut self, cache: &Arc<VmObject>, page: usize) -> ZxError {
+        if self.need.is_none() {
+            self.need = Some(FillNeed::Cache {
+                cache: cache.clone(),
+                page,
+            });
+        }
+        ZxError::SHOULD_WAIT
+    }
+
+    /// Apply the mapping changes, and hand back the read still to do, if
+    /// any. Called with the family lock down; whatever was staged and not
+    /// used is dropped here.
+    fn finish(self) -> Option<FillNeed> {
+        apply_deferred_range_changes(self.ranges);
+        drop(self.staged);
+        self.need
+    }
+}
+
 /// Per-VMO mapping-list census: `(scans, entries walked, dead entries, longest
 /// list seen)`.
 pub fn mapping_list_stats() -> (u64, u64, u64, u64) {
@@ -280,6 +488,10 @@ pub struct VMObjectPaged {
     /// doc explains why re-locking across families on the fault path is not an
     /// option.
     cache_ref: Option<Arc<VmObject>>,
+    /// Goes up whenever the backing source may have changed under pages this
+    /// object has not read yet (see [`FillNeed`]): a page read from it
+    /// outside the family lock under an older value is read again.
+    fill_epoch: AtomicU64,
 }
 
 /// We always lock the lock before access to the Refcell, so it is actually sync
@@ -593,9 +805,55 @@ impl VMObjectPaged {
             decommit_begin: AtomicU64::new(0),
             decommit_end: AtomicU64::new(0),
             cache_ref,
+            fill_epoch: AtomicU64::new(0),
         });
         obj.inner.borrow_mut().self_ref = Arc::downgrade(&obj);
         obj
+    }
+
+    /// Run `op` -- which takes the family lock and lets it go before it
+    /// returns -- again for as long as it stops at a page it has to read from
+    /// a file first, doing each such read between two runs, with no family
+    /// lock held. See [`FillNeed`].
+    ///
+    /// `op` has to be safe to run again from the start after it gave up
+    /// partway: every operation here is (a page it already committed is a hit
+    /// the second time).
+    fn filling<R>(&self, mut op: impl FnMut(&mut Deferred) -> ZxResult<R>) -> ZxResult<R> {
+        let mut staged = None;
+        loop {
+            let mut deferred = Deferred::with(staged.take());
+            let ret = op(&mut deferred);
+            match deferred.finish() {
+                None => return ret,
+                Some(need) => staged = need.fetch()?,
+            }
+        }
+    }
+
+    /// One commit under the family lock, for the page-fault path and its
+    /// no-read variant.
+    #[track_caller]
+    fn commit_page_locked(
+        &self,
+        page_idx: usize,
+        flags: MMUFlags,
+        range_changes: &mut Deferred,
+    ) -> ZxResult<PhysAddr> {
+        let mut inner = self.get_inner_mut();
+        // The page-fault path arrives here, and a mapping outlives the
+        // pages it covers: `zx_vmo_set_size` can shrink the object under a
+        // mapping that was within it when it was made. A write fault past
+        // the end used to demand-allocate a frame at an index the object
+        // does not have -- one that `committed_pages_in_range`, which
+        // clamps to `size`, could never report again. Out of range is an
+        // error here, and the fault becomes an exception, which is what a
+        // read or a write of that same address already answers.
+        if page_idx >= inner.size / PAGE_SIZE {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
+        let flags = self.shared_commit_flags(&inner, flags);
+        inner.commit_page(page_idx, flags, range_changes)
     }
 
     /// A leaf whose pages other mappings or `read(2)` can observe: shared
@@ -995,8 +1253,7 @@ impl core::ops::DerefMut for InnerGuardMut<'_> {
 
 impl VMObjectTrait for VMObjectPaged {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
-        let mut range_changes = Vec::new();
-        let ret = {
+        self.filling(|range_changes| {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
                 Err(ZxError::BAD_STATE)
@@ -1005,20 +1262,19 @@ impl VMObjectTrait for VMObjectPaged {
                     offset,
                     buf.len(),
                     MMUFlags::READ,
-                    &mut range_changes,
+                    range_changes,
                     |paddr, buf_range| {
                         kernel_hal::mem::pmem_read(paddr, &mut buf[buf_range]);
                     },
                 )
             }
-        };
-        apply_deferred_range_changes(range_changes);
-        ret
+        })
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
-        let mut range_changes = Vec::new();
-        let ret = {
+        // Run again from the start after a page is read from the file: the
+        // pages written before it are written again with the same bytes.
+        self.filling(|range_changes| {
             let mut inner = self.get_inner_mut();
             if inner.cache_policy != CachePolicy::Cached {
                 Err(ZxError::BAD_STATE)
@@ -1027,19 +1283,16 @@ impl VMObjectTrait for VMObjectPaged {
                     offset,
                     buf.len(),
                     MMUFlags::WRITE,
-                    &mut range_changes,
+                    range_changes,
                     |paddr, buf_range| {
                         kernel_hal::mem::pmem_write(paddr, &buf[buf_range]);
                     },
                 )
             }
-        };
-        apply_deferred_range_changes(range_changes);
-        ret
+        })
     }
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
-        let mut range_changes = Vec::new();
         let mut graveyard = Graveyard::new();
         // The whole-page path below drops frames, so it releases memory just
         // like `decommit` does and takes the same window. See `set_len`.
@@ -1047,7 +1300,12 @@ impl VMObjectTrait for VMObjectPaged {
         // First page dropped, and how many: the blocks a `zero` walks are
         // consecutive, so the pages it drops are one run.
         let mut released: Option<(usize, usize)> = None;
-        let ret = (|| {
+        // A page read from the file midway runs the loop again from the
+        // start. Only the partial pages at the two ends are ever read: a whole
+        // page is committed only to be dropped, so its bytes do not matter
+        // and it is not read at all (`blank_fills`), or every run would read
+        // again the pages the one before had dropped, for ever.
+        let ret = self.filling(|range_changes| {
             let mut inner = self.get_inner_mut();
             // Checked, because `zx_vmo_op_range(ZX_VMO_OP_ZERO)` hands both
             // numbers through from userspace without a bound of its own: a
@@ -1066,7 +1324,10 @@ impl VMObjectTrait for VMObjectPaged {
             for block in iter {
                 //let paddr = self.commit_page(block.block, MMUFlags::READ)?;
                 if block.len() == PAGE_SIZE && !inner.is_contiguous() {
-                    let _ = inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
+                    range_changes.blank_fills = true;
+                    let committed = inner.commit_page(block.block, MMUFlags::WRITE, range_changes);
+                    range_changes.blank_fills = false;
+                    let _ = committed?;
                     unwanted.push_back(block.block + inner.parent_offset / PAGE_SIZE);
                     graveyard.extend(inner.frames.remove(&block.block).map(PageState::take));
                     released = Some(match released {
@@ -1077,15 +1338,13 @@ impl VMObjectTrait for VMObjectPaged {
                     || inner.uncommitted_page_reads_nonzero(block.block)
                 {
                     // check whether this page is initialized, otherwise nothing should be done
-                    let paddr =
-                        inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
+                    let paddr = inner.commit_page(block.block, MMUFlags::WRITE, range_changes)?;
                     kernel_hal::mem::pmem_zero(paddr + block.begin, block.len());
                 }
             }
             inner.release_unwanted_pages_in_parent(unwanted, &mut graveyard);
             Ok(())
-        })();
-        apply_deferred_range_changes(range_changes);
+        });
         // A dropped frame is a dropped frame whichever operation dropped it:
         // without this the next read through a mapping came back with the
         // bytes the caller had just asked to have zeroed, off a frame the
@@ -1142,53 +1401,76 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr> {
-        let mut range_changes = Vec::new();
-        let ret = {
-            let mut inner = self.get_inner_mut();
-            // The page-fault path arrives here, and a mapping outlives the
-            // pages it covers: `zx_vmo_set_size` can shrink the object under a
-            // mapping that was within it when it was made. A write fault past
-            // the end used to demand-allocate a frame at an index the object
-            // does not have -- one that `committed_pages_in_range`, which
-            // clamps to `size`, could never report again. Out of range is an
-            // error here, and the fault becomes an exception, which is what a
-            // read or a write of that same address already answers.
-            if page_idx >= inner.size / PAGE_SIZE {
-                return Err(ZxError::OUT_OF_RANGE);
-            }
-            let flags = self.shared_commit_flags(&inner, flags);
-            inner.commit_page(page_idx, flags, &mut range_changes)
-        };
-        apply_deferred_range_changes(range_changes);
-        ret
+        self.filling(|range_changes| self.commit_page_locked(page_idx, flags, range_changes))
+    }
+
+    fn try_commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<Option<PhysAddr>> {
+        let mut range_changes = Deferred::new();
+        let ret = self.commit_page_locked(page_idx, flags, &mut range_changes);
+        // The read still to do is not done: it goes with the rest, with the
+        // lock down, and the caller brings the page in itself.
+        match range_changes.finish() {
+            Some(_) => Ok(None),
+            None => ret.map(Some),
+        }
+    }
+
+    fn note_source_change(&self) {
+        self.fill_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     fn commit_pages_with(
         &self,
         f: &mut dyn FnMut(&mut dyn FnMut(usize, MMUFlags) -> ZxResult<PhysAddr>) -> ZxResult,
     ) -> ZxResult {
-        let mut range_changes = Vec::new();
-        let ret = {
-            let mut inner = self.get_inner_mut();
-            let shared = self.is_shared_leaf(&inner);
-            f(&mut |page_idx, flags| {
-                let flags = if shared {
+        // `f` maps each page it commits as it goes (`VmMapping::map`), so it
+        // is not run again after a read the way the other operations are: a
+        // second run would find its own PTEs and fail. The lock is let go
+        // around the read instead and taken again for the same page, in the
+        // same order (`f`'s locks, then this one) it was first taken in.
+        let mut ranges = Vec::new();
+        // What the reads leave behind (a used staged node's `Arc`): dropped
+        // with the lock down.
+        let mut spent: Vec<Deferred> = Vec::new();
+        let mut held = Some(self.get_inner_mut());
+        let ret = f(&mut |page_idx, flags| {
+            let mut staged = None;
+            loop {
+                let inner = held.get_or_insert_with(|| self.get_inner_mut());
+                let flags = if self.is_shared_leaf(inner) {
                     flags | MMUFlags::WRITE
                 } else {
                     flags
                 };
-                inner.commit_page(page_idx, flags, &mut range_changes)
-            })
-        };
-        apply_deferred_range_changes(range_changes);
+                let mut deferred = Deferred::with(staged.take());
+                let ret = inner.commit_page(page_idx, flags, &mut deferred);
+                ranges.append(&mut deferred.ranges);
+                let need = deferred.need.take();
+                spent.push(deferred);
+                let Some(need) = need else {
+                    return ret;
+                };
+                held = None;
+                let fetched = need.fetch();
+                match fetched {
+                    Ok(next) => staged = next,
+                    Err(e) => {
+                        held = Some(self.get_inner_mut());
+                        return Err(e);
+                    }
+                }
+            }
+        });
+        drop(held);
+        drop(spent);
+        apply_deferred_range_changes(ranges);
         ret
     }
 
     fn commit(&self, offset: usize, len: usize) -> ZxResult {
         let start_page = offset / PAGE_SIZE;
         let pages = len / PAGE_SIZE;
-        let mut range_changes = Vec::new();
-        let ret = (|| {
+        self.filling(|range_changes| {
             let mut inner = self.get_inner_mut();
             // The other half of the bound `zero` carries. Past the end,
             // `commit_page` demand-allocated real frames at page indices this
@@ -1201,12 +1483,10 @@ impl VMObjectTrait for VMObjectPaged {
                 return Err(ZxError::OUT_OF_RANGE);
             }
             for i in 0..pages {
-                inner.commit_page(start_page + i, MMUFlags::WRITE, &mut range_changes)?;
+                inner.commit_page(start_page + i, MMUFlags::WRITE, range_changes)?;
             }
             Ok(())
-        })();
-        apply_deferred_range_changes(range_changes);
-        ret
+        })
     }
 
     fn decommit(&self, offset: usize, len: usize) -> ZxResult {
@@ -1252,6 +1532,9 @@ impl VMObjectTrait for VMObjectPaged {
             for i in 0..pages {
                 inner.decommit(start_page + i, &mut graveyard);
             }
+            // A page read from the source before this (a truncate, which
+            // decommits past the new end) must not land after it.
+            self.note_source_change();
             inner
                 .mappings
                 .iter()
@@ -1347,7 +1630,34 @@ impl VMObjectTrait for VMObjectPaged {
             cache.prefill(idx, n);
             return;
         }
-        self.get_inner_mut().prefill(page_idx, pages);
+        // What is missing is looked at under the lock; the source is asked
+        // for its length and read with no lock held (see `FillNeed`), and the
+        // pages go in under the lock again -- those still missing, and only
+        // if the source did not change meanwhile.
+        let (source, epoch, missing) = {
+            let inner = self.get_inner();
+            let Some((source, missing)) = inner.prefill_plan(page_idx, pages) else {
+                return;
+            };
+            (source, self.fill_epoch.load(Ordering::Acquire), missing)
+        };
+        let source_pages = source.source_len().div_ceil(PAGE_SIZE);
+        let missing: Vec<usize> = missing.into_iter().filter(|&i| i < source_pages).collect();
+        // One missing page gains nothing over the commit that follows.
+        if missing.len() < 2 {
+            return;
+        }
+        let first = missing[0];
+        let span = missing[missing.len() - 1] + 1 - first;
+        let mut buf = alloc::vec![0u8; span * PAGE_SIZE];
+        FILLS_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+        source.fill_range(first * PAGE_SIZE, &mut buf);
+        let mut inner = self.get_inner_mut();
+        if self.fill_epoch.load(Ordering::Acquire) != epoch {
+            FILLS_STALE.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        inner.prefill_insert(first, &missing, &buf);
     }
 
     fn supply(&self, page_idx: usize, data: &[u8]) {
@@ -1453,8 +1763,9 @@ impl VMObjectTrait for VMObjectPaged {
     }
 
     fn pin(&self, offset: usize, len: usize) -> ZxResult {
-        let mut range_changes = Vec::new();
-        let ret = (|| {
+        // Nothing is pinned until every page is there: a run that stops at a
+        // page read from the file has pinned nothing yet.
+        self.filling(|range_changes| {
             let mut inner = self.get_inner_mut();
             if offset + len > inner.size {
                 return Err(ZxError::OUT_OF_RANGE);
@@ -1475,7 +1786,7 @@ impl VMObjectTrait for VMObjectPaged {
                 // brought back here: as a page of this object's own, the way
                 // a pinned page has to be, which is what a write would get.
                 if !inner.frames.contains_key(&i) {
-                    inner.commit_page(i, MMUFlags::WRITE, &mut range_changes)?;
+                    inner.commit_page(i, MMUFlags::WRITE, range_changes)?;
                 }
                 let frame = inner.frames.get(&i).ok_or(ZxError::BAD_STATE)?;
                 if frame.pin_count == VM_PAGE_OBJECT_MAX_PIN_COUNT {
@@ -1489,9 +1800,7 @@ impl VMObjectTrait for VMObjectPaged {
                 inner.pin_count += 1;
             }
             Ok(())
-        })();
-        apply_deferred_range_changes(range_changes);
-        ret
+        })
     }
 
     fn unpin(&self, offset: usize, len: usize) -> ZxResult {
@@ -1643,7 +1952,7 @@ impl VMObjectPagedInner {
         offset: usize,
         buf_len: usize,
         flags: MMUFlags,
-        range_changes: &mut Vec<DeferredRangeChange>,
+        range_changes: &mut Deferred,
         mut f: impl FnMut(PhysAddr, Range<usize>),
     ) -> ZxResult {
         // The range has to be inside this object. Without this, `read` and
@@ -1701,41 +2010,43 @@ impl VMObjectPagedInner {
         }
     }
 
-    /// Make the missing pages of `[page_idx, page_idx + pages)` resident from
-    /// the backing source with one `fill_range` over the span they cover, on
-    /// a root node (no parent, not hidden: after a fork the source has moved
-    /// to the hidden parent and the leaf resolves through it page by page as
-    /// before). The frames inserted are exactly what `commit_page_internal`
-    /// inserts for a page filled from the source, so a later commit of any
-    /// of them is a plain hit.
-    ///
-    /// Runs under the family lock, like the single-page fill: the source read
-    /// takes the filesystem lock inside it, in the same order as today.
-    fn prefill(&mut self, page_idx: usize, pages: usize) {
+    /// The first half of [`VMObjectTrait::prefill`], under the family lock:
+    /// the source and the pages of `[page_idx, page_idx + pages)` that are
+    /// missing, on a root node (no parent, not hidden: after a fork the
+    /// source has moved to the hidden parent and the leaf resolves through it
+    /// page by page as before), clipped to the object. The source's own end
+    /// is the caller's to clip to, outside the lock.
+    fn prefill_plan(
+        &self,
+        page_idx: usize,
+        pages: usize,
+    ) -> Option<(Arc<dyn FrameFiller>, Vec<usize>)> {
         if self.parent.is_some() || self.type_.is_hidden() {
-            return;
+            return None;
         }
-        let Some(source) = self.source.clone() else {
-            return;
-        };
-        let end = (page_idx + pages)
-            .min(self.size / PAGE_SIZE)
-            .min(source.source_len().div_ceil(PAGE_SIZE));
-        if page_idx >= end {
-            return;
+        let source = self.source.clone()?;
+        let end = (page_idx + pages).min(self.size / PAGE_SIZE);
+        if end < page_idx + 2 {
+            return None;
         }
         let missing: Vec<usize> = (page_idx..end)
             .filter(|i| !self.frames.contains_key(i))
             .collect();
-        // One missing page gains nothing over the commit that follows.
-        if missing.len() < 2 {
+        (missing.len() >= 2).then_some((source, missing))
+    }
+
+    /// The second half: the pages of `missing` still missing become `buf`'s
+    /// (read from page `first` on), a frame each. The frames inserted are
+    /// exactly what `commit_page_internal` inserts for a page filled from
+    /// the source, so a later commit of any of them is a plain hit.
+    fn prefill_insert(&mut self, first: usize, missing: &[usize], buf: &[u8]) {
+        if self.parent.is_some() || self.type_.is_hidden() || self.source.is_none() {
             return;
         }
-        let first = missing[0];
-        let span = missing[missing.len() - 1] + 1 - first;
-        let mut buf = alloc::vec![0u8; span * PAGE_SIZE];
-        source.fill_range(first * PAGE_SIZE, &mut buf);
-        for &i in &missing {
+        for &i in missing {
+            if i >= self.size / PAGE_SIZE || self.frames.contains_key(&i) {
+                continue;
+            }
             let Some(frame) = PhysFrame::new() else {
                 break;
             };
@@ -1752,7 +2063,7 @@ impl VMObjectPagedInner {
         &mut self,
         page_idx: usize,
         flags: MMUFlags,
-        range_changes: &mut Vec<DeferredRangeChange>,
+        range_changes: &mut Deferred,
     ) -> ZxResult<PhysAddr> {
         let ret = match self.commit_page_internal(page_idx, flags, &Weak::new(), range_changes)? {
             CommitResult::Ref(paddr) => Ok(paddr),
@@ -1770,7 +2081,7 @@ impl VMObjectPagedInner {
         page_idx: usize,
         flags: MMUFlags,
         child: &WeakRef,
-        range_changes: &mut Vec<DeferredRangeChange>,
+        range_changes: &mut Deferred,
     ) -> ZxResult<CommitResult> {
         // special case
         let no_parent = self.parent.is_none();
@@ -1794,14 +2105,21 @@ impl VMObjectPagedInner {
                 // BSS tail of a mapping) fall through to ordinary demand-zero.
                 //
                 // Lock order: this runs under OUR family lock and takes the
-                // CACHE's family lock inside `commit_page`. The two are
+                // CACHE's family lock inside `try_commit_page`. The two are
                 // different objects in different families, and a cache never
-                // references a borrower, so the order cannot invert.
+                // references a borrower, so the order cannot invert. A cache
+                // page that has to be read from the file first is not read
+                // here, under both locks: the borrower gives up and its
+                // caller brings the page in with neither held (`FillNeed`).
                 if !out_of_range {
                     if let Some((cache, base, cache_len)) = &self.cache {
                         let cache_byte = base + page_idx * PAGE_SIZE;
                         if cache_byte < *cache_len {
-                            let src = cache.commit_page(cache_byte / PAGE_SIZE, MMUFlags::READ)?;
+                            let cache_page = cache_byte / PAGE_SIZE;
+                            let Some(src) = cache.try_commit_page(cache_page, MMUFlags::READ)?
+                            else {
+                                return Err(range_changes.need_cache(cache, cache_page));
+                            };
                             if !flags.contains(MMUFlags::WRITE) {
                                 return Ok(CommitResult::Ref(src));
                             }
@@ -1818,27 +2136,33 @@ impl VMObjectPagedInner {
                     // lies within the source, it must be filled from the file — even
                     // on a read fault, since a shared zero page would expose zeros
                     // instead of the file's contents.
-                    let from_source = self
-                        .source
-                        .as_ref()
-                        .is_some_and(|s| page_idx * PAGE_SIZE < s.source_len());
+                    //
+                    // Neither the read nor the source's length is asked here,
+                    // under the family lock: both can wait for a disk's
+                    // driver. The page is read outside it and this commit
+                    // runs again with it in hand (see `FillNeed`); the read
+                    // also says whether the page lay within the source.
+                    let staged = if self.source.is_some() && !range_changes.blank_fills {
+                        match range_changes.take_staged(&self.self_ref, page_idx) {
+                            Some(staged) => staged,
+                            None => return Err(range_changes.need_source(self, page_idx)),
+                        }
+                    } else {
+                        None
+                    };
+                    let from_source = staged.is_some();
                     if !flags.contains(MMUFlags::WRITE) && !from_source {
                         // read-only, just return zero frame
                         return Ok(CommitResult::Ref(kernel_hal::mem::ZERO_FRAME.paddr()));
                     }
-                    // lazy allocate zero frame
+                    // lazy allocate zero frame, or take the one read from the
+                    // backing file (zeroed first, so bytes past end-of-file
+                    // stay zero: the BSS tail of the mapping).
                     // 这里会调用HAL层的hal_frame_alloc, 请注意实现该函数时参数要一样
-                    let target_frame = PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?;
-                    if from_source {
-                        // Read the page from the backing file into the fresh frame.
-                        // The frame is already zeroed, so bytes past end-of-file stay
-                        // zero (BSS tail of the mapping).
-                        let source = self.source.as_ref().unwrap();
-                        let vaddr = phys_to_virt(target_frame.paddr());
-                        let buf =
-                            unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, PAGE_SIZE) };
-                        source.fill_page(page_idx * PAGE_SIZE, buf);
-                    }
+                    let target_frame = match staged {
+                        Some(frame) => frame,
+                        None => PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?,
+                    };
                     if out_of_range {
                         // can never be a hidden vmo
                         assert!(!self.type_.is_hidden());
@@ -2005,7 +2329,7 @@ impl VMObjectPagedInner {
         offset: usize,
         len: usize,
         op: RangeChangeOp,
-        range_changes: &mut Vec<DeferredRangeChange>,
+        range_changes: &mut Deferred,
     ) -> u64 {
         let mut dead = 0;
         for map in self.mappings.iter() {
@@ -2036,7 +2360,7 @@ impl VMObjectPagedInner {
         parent_offset: usize,
         parent_limit: usize,
         op: RangeChangeOp,
-        range_changes: &mut Vec<DeferredRangeChange>,
+        range_changes: &mut Deferred,
     ) {
         let mut start = self.parent_offset.max(parent_offset);
         let mut end = self.parent_limit.min(parent_limit);
@@ -2775,10 +3099,12 @@ impl VMObjectPagedInner {
 
     fn as_mut_buf(&mut self) -> ZxResult<(usize, usize)> {
         if self.contiguous {
-            let mut range_changes = Vec::new();
+            // Contiguous, so never demand-paged from a source: nothing to
+            // read, nothing to unmap.
+            let mut range_changes = Deferred::new();
             let addr =
                 phys_to_virt(self.commit_page(0, MMUFlags::WRITE, &mut range_changes)?) as usize;
-            debug_assert!(range_changes.is_empty());
+            debug_assert!(range_changes.is_empty() && range_changes.need.is_none());
             let size = self.size;
             return Ok((addr, size));
         }
@@ -2922,919 +3248,10 @@ fn new_owner_id() -> u64 {
 const VM_PAGE_OBJECT_MAX_PIN_COUNT: u8 = 31;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_write() {
-        let vmo = VmObject::new_paged(2);
-        super::super::tests::read_write(&*vmo);
-    }
-
-    #[test]
-    fn create_child() {
-        let vmo = VmObject::new_paged(1);
-        let child_vmo = vmo.create_child(false, 0, PAGE_SIZE).unwrap();
-
-        // write to parent and make sure clone doesn't see it
-        vmo.test_write(0, 1);
-        assert_eq!(vmo.test_read(0), 1);
-        assert_eq!(child_vmo.test_read(0), 0);
-
-        // write to clone and make sure parent doesn't see it
-        child_vmo.test_write(0, 2);
-        assert_eq!(vmo.test_read(0), 1);
-        assert_eq!(child_vmo.test_read(0), 2);
-    }
-
-    /// A backing source that counts how it is read: page by page
-    /// (`fill_page`) or by range (`fill_range`), and what each range asked
-    /// for. Page `i` of the source reads as byte `i`.
-    struct CountingSource {
-        pages: usize,
-        page_reads: AtomicUsize,
-        range_reads: AtomicUsize,
-        ranges: Mutex<Vec<(usize, usize)>>,
-        /// Only `fill_page`: the default `fill_range` loop then applies.
-        pages_only: bool,
-    }
-
-    impl CountingSource {
-        fn new(pages: usize, pages_only: bool) -> Arc<Self> {
-            Arc::new(Self {
-                pages,
-                page_reads: AtomicUsize::new(0),
-                range_reads: AtomicUsize::new(0),
-                ranges: Mutex::new(Vec::new()),
-                pages_only,
-            })
-        }
-        fn page_reads(&self) -> usize {
-            self.page_reads.load(Ordering::Relaxed)
-        }
-        fn range_reads(&self) -> usize {
-            self.range_reads.load(Ordering::Relaxed)
-        }
-        fn ranges(&self) -> Vec<(usize, usize)> {
-            self.ranges.lock().clone()
-        }
-    }
-
-    impl FrameFiller for CountingSource {
-        fn source_len(&self) -> usize {
-            self.pages * PAGE_SIZE
-        }
-        fn fill_page(&self, offset: usize, buf: &mut [u8]) {
-            self.page_reads.fetch_add(1, Ordering::Relaxed);
-            if offset < self.source_len() {
-                buf.fill((offset / PAGE_SIZE) as u8);
-            }
-        }
-        fn fill_range(&self, offset: usize, buf: &mut [u8]) {
-            if self.pages_only {
-                // What a source that only knows `fill_page` gets.
-                for (i, chunk) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-                    self.fill_page(offset + i * PAGE_SIZE, chunk);
-                }
-                return;
-            }
-            self.range_reads.fetch_add(1, Ordering::Relaxed);
-            self.ranges.lock().push((offset, buf.len()));
-            for (i, chunk) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-                let off = offset + i * PAGE_SIZE;
-                if off < self.source_len() {
-                    chunk.fill((off / PAGE_SIZE) as u8);
-                }
-            }
-        }
-    }
-
-    fn page_byte(vmo: &VmObject, page: usize) -> u8 {
-        let mut b = [0u8; 1];
-        vmo.read(page * PAGE_SIZE, &mut b).unwrap();
-        b[0]
-    }
-
-    /// The point of `prefill`: a fault's 16-page window costs the source ONE
-    /// read, and every commit inside the window afterwards is a hit.
-    #[test]
-    fn prefill_reads_the_whole_window_with_one_source_read() {
-        let src = CountingSource::new(32, false);
-        let vmo = VmObject::new_paged_cache(32, src.clone());
-        vmo.prefill(0, 16);
-        assert_eq!(src.range_reads(), 1);
-        assert_eq!(src.ranges(), vec![(0, 16 * PAGE_SIZE)]);
-        assert_eq!(src.page_reads(), 0, "no page-by-page reads");
-        assert_eq!(vmo.committed_pages_in_range(0, 32), 16);
-        for page in 0..16 {
-            vmo.commit_page(page, MMUFlags::READ).unwrap();
-            assert_eq!(page_byte(&vmo, page), page as u8, "page {page}");
-        }
-        assert_eq!(
-            (src.range_reads(), src.page_reads()),
-            (1, 0),
-            "the commits inside a prefilled window must not touch the source"
-        );
-        // Outside the window the source is still read on demand.
-        vmo.commit_page(20, MMUFlags::READ).unwrap();
-        assert_eq!(page_byte(&vmo, 20), 20);
-        assert_eq!(src.page_reads(), 1);
-    }
-
-    /// Supplied pages are resident without the source being read, and a
-    /// page that was already there keeps what it held.
-    #[test]
-    fn supplied_pages_are_resident_and_the_source_is_not_read() {
-        let src = CountingSource::new(32, false);
-        let vmo = VmObject::new_paged_cache(32, src.clone());
-        vmo.commit_page(1, MMUFlags::READ).unwrap();
-        let reads = (src.range_reads(), src.page_reads());
-        vmo.supply(0, &vec![0xAAu8; 3 * PAGE_SIZE]);
-        assert_eq!(vmo.committed_pages_in_range(0, 32), 3);
-        assert_eq!(page_byte(&vmo, 0), 0xAA);
-        assert_eq!(page_byte(&vmo, 1), 1, "the resident page is kept");
-        assert_eq!(page_byte(&vmo, 2), 0xAA);
-        assert_eq!((src.range_reads(), src.page_reads()), reads);
-        // Past the end of the object nothing is taken.
-        vmo.supply(31, &vec![0xBBu8; 2 * PAGE_SIZE]);
-        assert_eq!(vmo.committed_pages_in_range(0, 32), 4);
-    }
-
-    /// Pages already resident are neither re-read nor replaced: the read
-    /// spans the missing pages only, and a page that was written keeps what
-    /// was written.
-    #[test]
-    fn prefill_reads_only_the_span_of_missing_pages_and_keeps_the_resident_ones() {
-        let src = CountingSource::new(32, false);
-        let vmo = VmObject::new_paged_cache(32, src.clone());
-        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
-        vmo.write(0, &[0xee]).unwrap();
-        vmo.commit_page(15, MMUFlags::READ).unwrap();
-        assert_eq!(src.page_reads(), 2);
-        vmo.prefill(0, 16);
-        assert_eq!(src.ranges(), vec![(PAGE_SIZE, 14 * PAGE_SIZE)]);
-        assert_eq!(vmo.committed_pages_in_range(0, 16), 16);
-        assert_eq!(page_byte(&vmo, 0), 0xee, "a resident page was replaced");
-        assert_eq!(page_byte(&vmo, 1), 1);
-        assert_eq!(page_byte(&vmo, 14), 14);
-        // One missing page is left to the commit that follows: there is no
-        // batch to gain, and a range read would cost an allocation.
-        vmo.commit_page(16, MMUFlags::READ).unwrap();
-        vmo.commit_page(18, MMUFlags::READ).unwrap();
-        let before = src.range_reads();
-        vmo.prefill(16, 3);
-        assert_eq!(src.range_reads(), before);
-        assert_eq!(vmo.committed_pages_in_range(17, 18), 0);
-    }
-
-    /// The window is clipped to the object and to the source: nothing is
-    /// read past either, and the pages past the source stay uncommitted
-    /// (they are the zero tail a commit hands out on its own).
-    #[test]
-    fn prefill_stops_at_the_end_of_the_source_and_of_the_object() {
-        let src = CountingSource::new(5, false);
-        let vmo = VmObject::new_paged_cache(8, src.clone());
-        vmo.prefill(2, 16);
-        assert_eq!(src.ranges(), vec![(2 * PAGE_SIZE, 3 * PAGE_SIZE)]);
-        assert_eq!(vmo.committed_pages_in_range(0, 8), 3);
-        assert_eq!(vmo.committed_pages_in_range(2, 5), 3);
-        // Entirely past the source, or past the object: nothing at all.
-        vmo.prefill(5, 16);
-        vmo.prefill(8, 16);
-        vmo.prefill(usize::MAX / PAGE_SIZE, 16);
-        assert_eq!(src.range_reads(), 1);
-        assert_eq!(vmo.committed_pages_in_range(0, 8), 3);
-    }
-
-    /// A `MAP_PRIVATE` file mapping is a borrower with no source of its own;
-    /// its prefill lands in the page cache it borrows from, at the borrowed
-    /// offset, and the borrower's commits then resolve to those frames.
-    #[test]
-    fn a_borrower_prefills_the_page_cache_it_borrows_from() {
-        let src = CountingSource::new(32, false);
-        let cache = VmObject::new_paged_cache(32, src.clone());
-        let borrower = VmObject::new_paged_borrowing(8, cache.clone(), 4 * PAGE_SIZE);
-        borrower.prefill(0, 16);
-        assert_eq!(src.ranges(), vec![(4 * PAGE_SIZE, 16 * PAGE_SIZE)]);
-        assert_eq!(cache.committed_pages_in_range(4, 20), 16);
-        assert_eq!(
-            borrower.committed_pages_in_range(0, 8),
-            0,
-            "a borrower owns no clean pages"
-        );
-        let paddr = borrower.commit_page(0, MMUFlags::READ).unwrap();
-        assert_eq!(Some(paddr), cache.committed_paddr(4));
-        assert_eq!(page_byte(&borrower, 0), 4);
-        assert_eq!((src.range_reads(), src.page_reads()), (1, 0));
-        // Past the cache: nothing.
-        let long = VmObject::new_paged_borrowing(8, cache.clone(), 30 * PAGE_SIZE);
-        long.prefill(2, 16);
-        assert_eq!(src.range_reads(), 1);
-    }
-
-    /// After a fork the source lives in the hidden parent and the leaf
-    /// resolves through it page by page as before: prefill does nothing there
-    /// rather than reaching into a node it does not own.
-    #[test]
-    fn prefill_is_a_no_op_below_a_hidden_parent() {
-        let src = CountingSource::new(32, false);
-        let vmo = VmObject::new_paged_with_source(32, src.clone());
-        let child = vmo.create_child(false, 0, 32 * PAGE_SIZE).unwrap();
-        child.prefill(0, 16);
-        vmo.prefill(0, 16);
-        assert_eq!(src.range_reads(), 0);
-        child.commit_page(3, MMUFlags::READ).unwrap();
-        assert_eq!(page_byte(&child, 3), 3);
-        assert_eq!(src.page_reads(), 1);
-    }
-
-    /// A source that only implements `fill_page` is still batched by the
-    /// trait's default loop: same pages resident, same contents.
-    #[test]
-    fn a_source_without_a_range_read_is_prefilled_page_by_page() {
-        let src = CountingSource::new(32, true);
-        let vmo = VmObject::new_paged_cache(32, src.clone());
-        vmo.prefill(0, 16);
-        assert_eq!(src.page_reads(), 16);
-        assert_eq!(vmo.committed_pages_in_range(0, 16), 16);
-        assert_eq!(page_byte(&vmo, 9), 9);
-        // And an object with no source at all has nothing to prefill.
-        let anon = VmObject::new_paged(32);
-        anon.prefill(0, 16);
-        assert_eq!(anon.committed_pages_in_range(0, 32), 0);
-    }
-
-    #[test]
-    fn fork_copy_lazy() {
-        struct Filler;
-        impl FrameFiller for Filler {
-            fn source_len(&self) -> usize {
-                2 * PAGE_SIZE
-            }
-            fn fill_page(&self, offset: usize, buf: &mut [u8]) {
-                buf.fill(if offset == 0 { 0xaa } else { 0xbb });
-            }
-        }
-        let vmo = VmObject::new_paged_with_source(2, Arc::new(Filler));
-        // Touch (and modify) only page 0; page 1 stays uncommitted.
-        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
-        vmo.test_write(0, 1);
-
-        let child = vmo.fork_copy().unwrap();
-        // The committed page was copied with the parent's modification…
-        assert_eq!(child.test_read(0), 1);
-        // …and further parent writes don't leak into the child (independent frame).
-        vmo.test_write(0, 7);
-        assert_eq!(child.test_read(0), 1);
-        // The untouched page still demand-fills from the shared source.
-        let mut buf = [0u8; 1];
-        child.read(PAGE_SIZE, &mut buf).unwrap();
-        assert_eq!(buf[0], 0xbb);
-    }
-
-    #[test]
-    #[ignore] // FIXME
-    fn zero_page_write() {
-        let vmo0 = VmObject::new_paged(1);
-        let vmo1 = vmo0.create_child(false, 0, PAGE_SIZE).unwrap();
-        let vmo2 = vmo0.create_child(false, 0, PAGE_SIZE).unwrap();
-        let vmos = [vmo0, vmo1, vmo2];
-        let origin = vmo_page_bytes();
-
-        // no committed pages
-        for vmo in &vmos {
-            assert_eq!(vmo.get_info().committed_bytes, 0);
-        }
-
-        // copy-on-write
-        for i in 0..3 {
-            vmos[i].test_write(0, i as u8);
-            for j in 0..3 {
-                assert_eq!(vmos[j].test_read(0), if j <= i { j as u8 } else { 0 });
-                assert_eq!(
-                    vmos[j].get_info().committed_bytes as usize,
-                    if j <= i { PAGE_SIZE } else { 0 }
-                );
-            }
-            assert_eq!(vmo_page_bytes() - origin, (i + 1) * PAGE_SIZE);
-        }
-    }
-
-    /// `VmoClone2TestCase.ObjMemAccounting` and `OffsetTest2`, on the
-    /// scaled figure: a shared page is half each side's, a forked page is
-    /// its forker's, and a snapshot's snapshots share their grandparent's
-    /// pages with the original by halves once the middle one is gone. And
-    /// the cousin's data: the snapshot's snapshot still reads what it saw.
-    /// A page read three ways is a third of a page each, and the third of
-    /// a byte left over is reported in the fraction field, in the units the
-    /// core tests read it in (`VmoClone2TestCase.Overflow`): a whole byte is
-    /// `1 << 63`.
-    #[test]
-    fn a_third_of_a_byte_is_reported_in_units_of_two_to_the_minus_63() {
-        let vmo = VmObject::new_paged(1);
-        vmo.test_write(0, 1);
-        let clone = vmo.create_child(false, 0, PAGE_SIZE).unwrap();
-        let clone2 = clone.create_child(false, 0, PAGE_SIZE).unwrap();
-        for v in [&vmo, &clone, &clone2] {
-            let info = v.get_info();
-            assert_eq!(info.populated_scaled_bytes as usize, PAGE_SIZE / 3);
-            assert_eq!(
-                info.populated_fractional_scaled_bytes,
-                0x8000_0000_0000_0000u64 / 3
-            );
-            assert_eq!(
-                info.committed_fractional_scaled_bytes,
-                0x8000_0000_0000_0000u64 / 3
-            );
-        }
-        drop(clone2);
-        for v in [&vmo, &clone] {
-            let info = v.get_info();
-            assert_eq!(info.populated_scaled_bytes as usize, PAGE_SIZE / 2);
-            assert_eq!(info.populated_fractional_scaled_bytes, 0);
-        }
-    }
-
-    /// A child's offset is counted from the root of its tree, and a chain
-    /// of offsets whose sum wraps around is refused where the wrap happens,
-    /// at `create_child` or at `set_size` (`VmoClone2TestCase.NoAccumulatedOverflow`).
-    #[test]
-    fn an_offset_that_wraps_counted_from_the_root_is_invalid() {
-        let vmo = VmObject::new_paged(0);
-        let child1 = vmo.create_child(false, 0xffff_ffff_ffff_8000, 0).unwrap();
-        assert_eq!(
-            child1.create_child(false, 0x8000, 0).err(),
-            Some(ZxError::INVALID_ARGS)
-        );
-        let child2 = child1.create_child(true, 0x4000, 0).unwrap();
-        assert_eq!(child2.set_len(0x8000).err(), Some(ZxError::INVALID_ARGS));
-        assert!(child2.set_len(0x2000).is_ok());
-    }
-
-    #[test]
-    fn a_shared_page_is_split_equally_between_the_vmos_that_read_it() {
-        let scaled = |vmo: &Arc<VmObject>| vmo.get_info().populated_scaled_bytes as usize;
-        let vmo = VmObject::new_paged(2);
-        vmo.test_write(0, 1);
-        vmo.test_write(1, 1);
-        assert_eq!(scaled(&vmo), 2 * PAGE_SIZE);
-        let clone = vmo.create_child(false, 0, 2 * PAGE_SIZE).unwrap();
-        assert_eq!((scaled(&vmo), scaled(&clone)), (PAGE_SIZE, PAGE_SIZE));
-        // The original forks page 0: that one is its own, the old one is the
-        // clone's alone, and page 1 stays shared.
-        vmo.test_write(0, 2);
-        assert_eq!(
-            (scaled(&vmo), scaled(&clone)),
-            (3 * PAGE_SIZE / 2, 3 * PAGE_SIZE / 2)
-        );
-        clone.test_write(1, 2);
-        assert_eq!(
-            (scaled(&vmo), scaled(&clone)),
-            (2 * PAGE_SIZE, 2 * PAGE_SIZE)
-        );
-
-        // OffsetTest2: four pages; a clone of pages 1..4; two clones of that
-        // one covering its pages 0..2 and 2..3; the middle clone writes its
-        // page 1 and is closed.
-        let vmo = VmObject::new_paged(4);
-        for i in 0..4 {
-            vmo.test_write(i, i as u8 + 1);
-        }
-        let offset_clone = vmo.create_child(false, PAGE_SIZE, 3 * PAGE_SIZE).unwrap();
-        let clone1 = offset_clone.create_child(false, 0, 2 * PAGE_SIZE).unwrap();
-        let clone2 = offset_clone
-            .create_child(false, 2 * PAGE_SIZE, PAGE_SIZE)
-            .unwrap();
-        offset_clone.test_write(1, 9);
-        drop(offset_clone);
-        assert_eq!((clone1.test_read(0), clone1.test_read(1)), (2, 3));
-        assert_eq!(clone2.test_read(0), 4);
-        assert_eq!(
-            vmo.test_read(2),
-            3,
-            "the original lost the page its grandchild forked"
-        );
-        assert_eq!(scaled(&vmo), 5 * PAGE_SIZE / 2, "1 + 1/2 + 1/2 + 1/2");
-        assert_eq!(scaled(&clone1), PAGE_SIZE, "1/2 + 1/2");
-        assert_eq!(scaled(&clone2), PAGE_SIZE / 2);
-        drop(clone1);
-        assert_eq!(scaled(&vmo), 7 * PAGE_SIZE / 2, "1 + 1 + 1 + 1/2");
-        assert_eq!(scaled(&clone2), PAGE_SIZE / 2);
-        assert_eq!(clone2.test_read(0), 4);
-        drop(clone2);
-        assert_eq!(scaled(&vmo), 4 * PAGE_SIZE);
-        assert_eq!(vmo.test_read(3), 4);
-        assert_ne!(vmo.get_info().populated_fractional_scaled_bytes, u64::MAX);
-    }
-
-    #[test]
-    fn overflow() {
-        let vmo0 = VmObject::new_paged(2);
-        vmo0.test_write(0, 1);
-        let vmo1 = vmo0.create_child(false, 0, 2 * PAGE_SIZE).unwrap();
-        vmo1.test_write(1, 2);
-        let vmo2 = vmo1.create_child(false, 0, 3 * PAGE_SIZE).unwrap();
-        vmo2.test_write(2, 3);
-        assert_eq!(vmo0.get_info().committed_bytes as usize, PAGE_SIZE);
-        assert_eq!(vmo1.get_info().committed_bytes as usize, PAGE_SIZE);
-        assert_eq!(vmo2.get_info().committed_bytes as usize, PAGE_SIZE);
-    }
-
-    #[test]
-    fn many_clones() {
-        const N: usize = 4;
-        let old: u8 = 0xa;
-        let new: u8 = 0xb;
-        let permutations = [
-            [0, 1, 2, 3],
-            [0, 1, 3, 2],
-            [0, 2, 1, 3],
-            [0, 2, 3, 1],
-            [0, 3, 1, 2],
-            [0, 3, 2, 1],
-            [1, 0, 2, 3],
-            [1, 0, 3, 2],
-            [1, 2, 0, 3],
-            [1, 2, 3, 0],
-            [1, 3, 0, 2],
-            [1, 3, 2, 0],
-            [2, 1, 0, 3],
-            [2, 1, 3, 0],
-            [2, 0, 1, 3],
-            [2, 0, 3, 1],
-            [2, 3, 1, 0],
-            [2, 3, 0, 1],
-            [3, 1, 2, 0],
-            [3, 1, 0, 2],
-            [3, 2, 1, 0],
-            [3, 2, 0, 1],
-            [3, 0, 1, 2],
-            [3, 0, 2, 1],
-        ];
-        for i in 0..24 {
-            let vmo0 = VmObject::new_paged(1);
-            vmo0.write(0, &[old]).unwrap();
-            let vmo1 = vmo0.create_child(false, 0, PAGE_SIZE).unwrap();
-            let vmo2 = vmo0.create_child(false, 0, PAGE_SIZE).unwrap();
-            let vmo3 = vmo1.create_child(false, 0, PAGE_SIZE).unwrap();
-            let vmos: [Arc<VmObject>; 4] = [vmo0.clone(), vmo1.clone(), vmo2.clone(), vmo3.clone()];
-            let mut write: [bool; 4] = [false; 4];
-            let perm = permutations[i];
-            println!("{:?}", perm);
-            for j in 0..N {
-                println!("j = {}, write = {}", j, perm[j]);
-                vmos[perm[j]].write(0, &[new]).unwrap();
-                write[perm[j]] = true;
-                let mut buf: [u8; 1] = [0];
-                for k in 0..N {
-                    vmos[k].read(0, &mut buf).unwrap();
-                    println!("vmo[{}] = {:x}", k, buf[0]);
-                    if write[k] {
-                        assert!(buf[0] == new);
-                    } else {
-                        assert!(buf[0] == old);
-                    }
-                    buf[0] = 0;
-                }
-            }
-        }
-    }
-
-    impl VmObject {
-        pub fn test_write(&self, page: usize, value: u8) {
-            self.write(page * PAGE_SIZE, &[value]).unwrap();
-        }
-
-        pub fn test_read(&self, page: usize) -> u8 {
-            let mut buf = [0; 1];
-            self.read(page * PAGE_SIZE, &mut buf).unwrap();
-            buf[0]
-        }
-    }
-
-    /// `read` and `write` had no bound at all: a read four pages into a
-    /// one-page object answered `Ok(())` after resolving page 4 through the
-    /// demand-zero path, and the matching write would have allocated a frame
-    /// at an index `len()` says does not exist, where nothing ever frees it.
-    #[test]
-    fn a_range_outside_the_object_is_refused_by_the_object() {
-        let vmo = VmObject::new_paged(1);
-        let mut buf = [0u8; 8];
-        assert_eq!(vmo.len(), PAGE_SIZE);
-        assert_eq!(vmo.read(PAGE_SIZE - 8, &mut buf), Ok(()));
-
-        assert_eq!(
-            vmo.read(4 * PAGE_SIZE, &mut buf),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-        assert_eq!(
-            vmo.read(PAGE_SIZE - 7, &mut buf),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-        assert_eq!(vmo.write(PAGE_SIZE, &[1u8; 1]), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(
-            vmo.committed_pages_in_range(0, 1),
-            0,
-            "a refused read must not have committed anything"
-        );
-    }
-
-    /// The three range operations share one shape of bound, and all three of
-    /// them have to survive a sum that wraps -- `zx_vmo_op_range(ZX_VMO_OP_
-    /// ZERO)` passes `offset` and `len` through from userspace untouched.
-    #[test]
-    fn a_range_whose_end_wraps_is_refused_too() {
-        let vmo = VmObject::new_paged(2);
-        let mut buf = [0u8; 8];
-        assert_eq!(
-            vmo.read(usize::MAX - 3, &mut buf),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-        assert_eq!(
-            vmo.write(usize::MAX - 3, &[0u8; 8]),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-        assert_eq!(vmo.zero(usize::MAX - 3, 8), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(
-            vmo.zero(usize::MAX - PAGE_SIZE + 1, 2 * PAGE_SIZE),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-        // The whole object is still in range.
-        assert_eq!(vmo.zero(0, 2 * PAGE_SIZE), Ok(()));
-    }
-
-    /// `align_log2` is an absolute log2, so 0 is not "page alignment": the
-    /// frame allocator is handed `align_log2 - PAGE_SIZE_LOG2`, and anything
-    /// below the page shift made that underflow. `sys_vmo_create_contiguous`
-    /// maps 0 to `PAGE_SIZE_LOG2` and rejects the rest, but it is the only
-    /// caller that knows, and it is two crates away.
-    #[test]
-    fn a_contiguous_vmo_takes_an_absolute_log2_alignment() {
-        assert!(VmObject::new_contiguous(1, PAGE_SIZE_LOG2).is_ok());
-        assert!(VmObject::new_contiguous(1, PAGE_SIZE_LOG2 + 1).is_ok());
-        assert_eq!(
-            VmObject::new_contiguous(1, 0).err(),
-            Some(ZxError::INVALID_ARGS)
-        );
-        assert_eq!(
-            VmObject::new_contiguous(1, PAGE_SIZE_LOG2 - 1).err(),
-            Some(ZxError::INVALID_ARGS)
-        );
-    }
-
-    /// Counting pages is a question, not a command: asking about pages the
-    /// object does not have answers zero. It used to assert, and the caller
-    /// that runs on every `/proc/<pid>/status` read carries a hand-written
-    /// clamp and an early return purely to stay out of that assertion.
-    #[test]
-    fn counting_pages_past_the_end_answers_zero_instead_of_panicking() {
-        let vmo = VmObject::new_paged(2);
-        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
-        assert_eq!(vmo.committed_pages_in_range(0, 2), 1);
-        assert_eq!(vmo.committed_pages_in_range(0, 64), 1);
-        assert_eq!(vmo.committed_pages_in_range(2, 64), 0);
-        assert_eq!(vmo.committed_pages_in_range(64, 65), 0);
-        assert_eq!(vmo.committed_pages_in_range(64, 8), 0);
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod pin_tests {
-    //! Pinning is the promise that a page stays where it is because a device
-    //! is about to do DMA into it. Three operations take pages away from a
-    //! VMO; two of them asked whether anything was pinned first and the third
-    //! did not, so the frame went back to the allocator with the IOMMU still
-    //! pointing at it.
-    use super::*;
-
-    /// A four-page object with every page committed.
-    fn committed() -> Arc<VmObject> {
-        let vmo = VmObject::new_paged(4);
-        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [true; 4]);
-        vmo
-    }
-
-    /// Holds a pin for as long as it is alive.
-    ///
-    /// `Drop for VMObjectPaged` asserts that no frame is left pinned, so a
-    /// test that fails an assertion with a pin still held panics a second
-    /// time on its way out and aborts the whole binary: the suite goes red
-    /// with no test name anywhere in it, which is most of what a CI failure
-    /// is for. Nothing reachable from userspace can trip that assert -- the
-    /// token holds the `Arc` -- but a test can, and letting go from a `Drop`
-    /// runs on the unwinding path too.
-    struct Pinned<'a> {
-        vmo: &'a Arc<VmObject>,
-        offset: usize,
-        len: usize,
-        held: bool,
-    }
-
-    impl Pinned<'_> {
-        /// Let go of the pin, and say whether the kernel agreed.
-        fn release(mut self) -> ZxResult {
-            self.held = false;
-            self.vmo.unpin(self.offset, self.len)
-        }
-    }
-
-    impl Drop for Pinned<'_> {
-        fn drop(&mut self) {
-            if self.held {
-                let _ = self.vmo.unpin(self.offset, self.len);
-            }
-        }
-    }
-
-    /// Pins a range and hands back the handle that lets go of it.
-    fn pin(vmo: &Arc<VmObject>, offset: usize, len: usize) -> Pinned<'_> {
-        vmo.pin(offset, len).unwrap();
-        Pinned {
-            vmo,
-            offset,
-            len,
-            held: true,
-        }
-    }
-
-    /// Which of the four pages the object is still holding a frame for.
-    fn held(vmo: &Arc<VmObject>) -> [bool; 4] {
-        let mut out = [false; 4];
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = vmo.committed_pages_in_range(i, i + 1) == 1;
-        }
-        out
-    }
-
-    #[test]
-    /// A pinned page is not handed back to the allocator. `zx_vmo_op_range`
-    /// passes its offset and length straight through from userspace, so this
-    /// used to hand a frame a device was about to write into back for someone
-    /// else to use, and answer `Ok`.
-    fn a_pinned_page_is_not_handed_back_to_the_allocator() {
-        let vmo = committed();
-        // Two pages, so a pin that only marked the first one shows up here.
-        let pinned = pin(&vmo, 0, 2 * PAGE_SIZE);
-        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
-        assert_eq!(vmo.decommit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::BAD_STATE));
-        assert_eq!(held(&vmo), [true; 4], "a page went under the pin");
-        // And with the pin released they go as usual.
-        pinned.release().unwrap();
-        vmo.decommit(0, 2 * PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [false, false, true, true]);
-    }
-
-    #[test]
-    /// The refusal is per page, not per object: the rest of a mostly-pinned
-    /// VMO can still be decommitted.
-    fn decommitting_around_a_pinned_page_still_works() {
-        let vmo = committed();
-        let pinned = pin(&vmo, PAGE_SIZE, PAGE_SIZE);
-        vmo.decommit(0, PAGE_SIZE).unwrap();
-        vmo.decommit(2 * PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
-        assert_eq!(vmo.decommit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::BAD_STATE));
-        assert_eq!(held(&vmo), [false, true, false, false]);
-        pinned.release().unwrap();
-    }
-
-    #[test]
-    /// And it is all or nothing: a range with one pinned page in it leaves
-    /// every page alone, including the ones before the pinned one.
-    fn a_refused_decommit_leaves_every_page_alone() {
-        let vmo = committed();
-        let pinned = pin(&vmo, 3 * PAGE_SIZE, PAGE_SIZE);
-        assert_eq!(vmo.decommit(0, 4 * PAGE_SIZE), Err(ZxError::BAD_STATE));
-        assert_eq!(held(&vmo), [true; 4]);
-        pinned.release().unwrap();
-    }
-
-    #[test]
-    /// Taking pages away is three operations, and all three answer the same
-    /// thing while something is pinned. Two of them always did.
-    fn the_three_ways_of_taking_pages_away_all_refuse_a_pinned_object() {
-        let vmo = VmObject::new_paged_with_resizable(true, 4);
-        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
-        let pinned = pin(&vmo, 0, PAGE_SIZE);
-        assert_eq!(vmo.set_len(PAGE_SIZE), Err(ZxError::BAD_STATE));
-        assert_eq!(
-            vmo.set_cache_policy(CachePolicy::Uncached),
-            Err(ZxError::BAD_STATE),
-        );
-        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
-
-        pinned.release().unwrap();
-        vmo.decommit(0, PAGE_SIZE).unwrap();
-        vmo.set_len(PAGE_SIZE).unwrap();
-    }
-
-    #[test]
-    /// Pinning a page the object does not have commits it on the spot, as
-    /// Zircon does. `zx_bti_pin` commits the range and then pins it, and
-    /// those are two turns of the object's lock: a decommit in between is
-    /// allowed, because the pages are not pinned yet, and this is where it
-    /// lands. It used to be a kernel panic, then `BAD_STATE`, which
-    /// `Bti.DecommitRace` races a decommitting thread to provoke.
-    fn pinning_a_page_that_is_not_there_commits_it() {
-        let vmo = VmObject::new_paged(4);
-        vmo.pin(0, PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [true, false, false, false]);
-        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
-        vmo.unpin(0, PAGE_SIZE).unwrap();
-
-        let vmo = committed();
-        vmo.decommit(2 * PAGE_SIZE, PAGE_SIZE).unwrap();
-        vmo.pin(0, 4 * PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [true, true, true, true]);
-        assert_eq!(
-            vmo.decommit(2 * PAGE_SIZE, PAGE_SIZE),
-            Err(ZxError::BAD_STATE)
-        );
-        vmo.unpin(0, 4 * PAGE_SIZE).unwrap();
-        vmo.decommit(0, PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [false, true, true, true]);
-    }
-
-    #[test]
-    /// A pinned page of a snapshot child is the child's own: pinning forks
-    /// it off the parent instead of pinning the page they share.
-    fn pinning_a_page_a_child_shares_forks_it() {
-        let vmo = committed();
-        let child = vmo.create_child(false, 0, 4 * PAGE_SIZE).unwrap();
-        child.pin(PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert_eq!(child.committed_pages_in_range(1, 2), 1);
-        assert_eq!(vmo.test_read(1), child.test_read(1));
-        child.unpin(PAGE_SIZE, PAGE_SIZE).unwrap();
-    }
-
-    #[test]
-    /// Unpinning one is the same answer rather than the same panic.
-    fn unpinning_a_page_that_is_not_there_is_an_error_not_a_panic() {
-        let vmo = VmObject::new_paged(4);
-        assert_eq!(vmo.unpin(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
-
-        // A page that is there but was never pinned is a different answer.
-        let vmo = committed();
-        assert_eq!(vmo.unpin(0, PAGE_SIZE), Err(ZxError::UNAVAILABLE));
-    }
-
-    #[test]
-    /// A VMO that goes away with a page still pinned is a hole worth saying
-    /// out loud, and saying it used to be an `assert_eq!` inside a
-    /// destructor. That costs the machine to report a leak, and in a test
-    /// binary it costs every test after this one: a panic raised while
-    /// something else is already unwinding does not unwind, it aborts, so
-    /// the run ends with no test name in it at all. It is also exactly
-    /// where a refused `unpin` in `PinnedMemoryToken`'s own `Drop` lands one
-    /// frame later, so the two have to agree.
-    fn a_vmo_that_goes_away_still_pinned_is_reported_not_a_panic() {
-        let vmo = committed();
-        vmo.pin(0, PAGE_SIZE).unwrap();
-        drop(vmo);
-    }
-
-    #[test]
-    /// A zero-length pin or unpin is nothing at all, whatever it names.
-    fn nothing_is_pinned_by_a_zero_length_range() {
-        let vmo = committed();
-        vmo.pin(0, 0).unwrap();
-        vmo.unpin(0, 0).unwrap();
-        vmo.decommit(0, PAGE_SIZE).unwrap();
-        assert_eq!(held(&vmo), [false, true, true, true]);
-    }
-}
+mod pin_tests;
 
 #[cfg(test)]
-mod range_bound_tests {
-    //! One question -- is this page inside the object? -- asked by six
-    //! operations that all take an offset and a length straight from
-    //! userspace, and answered by four of them.
-    //!
-    //! `zx_vmo_op_range` checks that both numbers are page-aligned and hands
-    //! them through; `VMObjectSlice` wrote the bound down for its own
-    //! `commit`/`decommit` ("hands `offset` and `len` through unbounded"), and
-    //! `zero` carries it too. The object underneath did not, so a commit past
-    //! the end demand-allocated real frames at page indices the object does
-    //! not have -- and `committed_pages_in_range` clamps to `size`, so no
-    //! counter that reports what a VMO is holding could see them afterwards.
-    use super::*;
-
-    /// A one-page object, so page 1 is the first one outside it.
-    fn one_page() -> Arc<VmObject> {
-        VmObject::new_paged(1)
-    }
-
-    #[test]
-    /// All six give the same answer for the same range. Two of them did not.
-    fn every_range_operation_answers_the_same_bound() {
-        let vmo = one_page();
-        let mut buf = [0u8; 1];
-        assert_eq!(vmo.read(PAGE_SIZE, &mut buf), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(vmo.write(PAGE_SIZE, &[9]), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(vmo.zero(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(vmo.pin(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(vmo.commit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(
-            vmo.decommit(PAGE_SIZE, PAGE_SIZE),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-    }
-
-    #[test]
-    /// And the frames are the point: `zx_vmo_op_range(ZX_VMO_OP_COMMIT)` over
-    /// sixty-four pages of a one-page object really allocated sixty-four
-    /// frames, while `zx_object_get_info` went on reporting one page
-    /// committed. Every accounting and memory-pressure figure in the kernel
-    /// reads those clamped counters, so an unprivileged process could hold
-    /// physical memory that nothing could account for.
-    ///
-    /// Counted on the object's own frame map, which means going one level below
-    /// [`VmObject`] to the [`VMObjectPaged`] under it. Two reasons, and both
-    /// rule out the obvious alternatives:
-    ///
-    /// * `vmo_page_bytes()`, which this test used to compare before and after,
-    ///   is `VMO_PAGE_ALLOC - VMO_PAGE_DEALLOC` for the WHOLE PROCESS. Any
-    ///   other test in the binary that commits or drops a page moves it under
-    ///   this one, which it did about twice in sixty parallel runs of the
-    ///   suite. It is not a witness a parallel test can read.
-    /// * `committed_pages_in_range` -- and so `get_info().committed_bytes` --
-    ///   clamps both indices to `size`, so it cannot see a frame at an index
-    ///   past the end. That is exactly the frame the bug left behind, which is
-    ///   why the lying counter cannot be the one that catches it.
-    ///
-    /// `frames.len()` is the honest witness restricted to this object: nothing
-    /// else can touch it, and it counts frames at any index.
-    fn a_commit_past_the_end_allocates_nothing() {
-        let vmo = VMObjectPaged::new(1);
-        assert_eq!(
-            vmo.commit(0, 64 * PAGE_SIZE),
-            Err(ZxError::OUT_OF_RANGE),
-            "a one-page object accepted a sixty-four-page commit"
-        );
-        assert_eq!(
-            vmo.get_inner().frames.len(),
-            0,
-            "the refused commit still allocated frames"
-        );
-        assert_eq!(vmo.committed_pages_in_range(0, 64), 0);
-    }
-
-    #[test]
-    /// All or nothing, like the pinned-page refusal next door: a range with
-    /// one page outside the object leaves the pages inside it alone, rather
-    /// than committing as far as it can and then failing.
-    fn a_partly_out_of_range_commit_leaves_the_object_alone() {
-        let vmo = one_page();
-        assert_eq!(
-            vmo.commit(0, 2 * PAGE_SIZE),
-            Err(ZxError::OUT_OF_RANGE),
-            "a two-page commit on a one-page object"
-        );
-        assert_eq!(
-            vmo.committed_pages_in_range(0, 1),
-            0,
-            "the page inside the object was committed by a refused call"
-        );
-    }
-
-    #[test]
-    /// A sum that wraps is out of range, not a short range that happens to
-    /// fit. `zx_vmo_op_range` page-aligns both numbers and nothing else, so
-    /// the pair below arrives exactly as written.
-    fn a_range_that_wraps_is_out_of_range() {
-        let vmo = one_page();
-        let high = usize::MAX - PAGE_SIZE + 1;
-        assert_eq!(vmo.commit(high, PAGE_SIZE * 2), Err(ZxError::OUT_OF_RANGE));
-        assert_eq!(
-            vmo.decommit(high, PAGE_SIZE * 2),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-    }
-
-    #[test]
-    /// The bound is on the end of the range, so an empty range that starts
-    /// exactly at the end of the object is inside it -- the same answer a
-    /// zero-length pin already gave.
-    fn an_empty_range_at_the_very_end_is_allowed() {
-        let vmo = one_page();
-        vmo.commit(PAGE_SIZE, 0).unwrap();
-        vmo.decommit(PAGE_SIZE, 0).unwrap();
-        vmo.pin(PAGE_SIZE, 0).unwrap();
-        vmo.zero(PAGE_SIZE, 0).unwrap();
-        // One past it is not.
-        assert_eq!(
-            vmo.commit(PAGE_SIZE + PAGE_SIZE, 0),
-            Err(ZxError::OUT_OF_RANGE)
-        );
-    }
-
-    #[test]
-    /// The whole object still commits, which is what the bound must not cost.
-    fn committing_the_whole_object_still_works() {
-        let vmo = VmObject::new_paged(4);
-        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
-        assert_eq!(vmo.committed_pages_in_range(0, 4), 4);
-        vmo.decommit(0, 4 * PAGE_SIZE).unwrap();
-        assert_eq!(vmo.committed_pages_in_range(0, 4), 0);
-    }
-}
+mod range_bound_tests;

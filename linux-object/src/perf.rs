@@ -995,6 +995,17 @@ pub fn kernel_report() -> String {
             paged, hidden, snapshots
         );
     }
+    // Pages of file mappings read from their file with no VMO lock held
+    // (all of them), and reads thrown away because the file was written
+    // meanwhile.
+    {
+        let (read, stale) = zircon_object::vm::unlocked_fill_stats();
+        let _ = writeln!(
+            out,
+            "file pages:   {} read outside the vmo lock, {} read again after a write",
+            read, stale
+        );
+    }
     // Where a fork's time actually goes, per mapping cloned.
     {
         let stats = zircon_object::vm::fork_phase_stats();

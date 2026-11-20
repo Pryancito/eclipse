@@ -15,7 +15,7 @@ use {
 
 mod paged;
 
-pub use paged::{cow_tree_stats, family_lock_held_here, mapping_list_stats};
+pub use paged::{cow_tree_stats, family_lock_held_here, mapping_list_stats, unlocked_fill_stats};
 mod physical;
 mod slice;
 
@@ -84,6 +84,20 @@ pub trait VMObjectTrait: Sync + Send {
 
     /// Commit a page.
     fn commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<PhysAddr>;
+
+    /// [`commit_page`](Self::commit_page), but without reading anything
+    /// from a backing source: `None` when the page would have to be read
+    /// first. A borrower asks its page cache this with its own family lock
+    /// held, and brings the page in with no lock held when the answer is
+    /// `None`.
+    fn try_commit_page(&self, page_idx: usize, flags: MMUFlags) -> ZxResult<Option<PhysAddr>> {
+        self.commit_page(page_idx, flags).map(Some)
+    }
+
+    /// The backing source may have changed where this object has no page
+    /// yet (a `write(2)` to the file, after the inode has the bytes): a page
+    /// being read from the source right now with no lock held is read again.
+    fn note_source_change(&self) {}
 
     /// Commit pages with an external function f.
     /// the vmo is internally locked before it calls f,
