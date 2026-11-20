@@ -1592,6 +1592,18 @@ impl FileLike for File {
             return Ok(len);
         }
 
+        // A disk served by a process, as in `read_at`: the task sleeps on
+        // the answer. A synchronous wait here would be a wait inside the
+        // syscall's own, which costs a whole executor made and torn down
+        // per read.
+        if let Some(dev) = inode.downcast_ref::<super::devfs::BlockDev>() {
+            if let Some(read) = dev.read_at_async(offset as usize, buf) {
+                let len = read.await?;
+                self.inner.write().offset += len as u64;
+                return Ok(len);
+            }
+        }
+
         let len = if !flags.non_block() {
             // block
             loop {

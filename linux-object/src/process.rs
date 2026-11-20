@@ -5933,12 +5933,21 @@ pub struct SignalPark {
     armed: bool,
     /// The deadline's timer, taken out when the park ends before it.
     timer: Option<kernel_hal::deadline::TimerId>,
+    /// The number of its waker's place on the thread, once it has it: see
+    /// [`Self::park`].
+    wait: Option<u64>,
 }
 
 impl Drop for SignalPark {
     fn drop(&mut self) {
         if let Some(timer) = self.timer.take() {
             kernel_hal::timer::timer_cancel(timer);
+        }
+        if let Some(wait) = self.wait.take() {
+            use crate::thread::ThreadExt;
+            if let Some(ext) = self.thread.linux_ext() {
+                ext.unpark_waiter(wait);
+            }
         }
     }
 }
@@ -5951,6 +5960,7 @@ impl SignalPark {
             object: thread.clone(),
             armed: false,
             timer: None,
+            wait: None,
         }
     }
 
@@ -5964,6 +5974,14 @@ impl SignalPark {
     /// only a signal ends the wait). The deadline timer is armed once per
     /// park, on the first call that passes one.
     pub async fn park(&mut self, deadline: Option<core::time::Duration>) {
+        // With no deadline, the waker goes in the thread's own place for
+        // it, which every path that sets `SIGNAL_WAKE` wakes: no observer
+        // made, kept and swept on the thread object per park, which was
+        // most of what a blocking syscall cost to wait. Only when another
+        // wait of the thread has the place does it park on the bit.
+        if deadline.is_none() && self.park_in_place().await {
+            return;
+        }
         if let Some(deadline) = deadline {
             if !self.armed {
                 self.armed = true;
@@ -5981,6 +5999,29 @@ impl SignalPark {
             }
         }
         self.object.wait_signal(SIGNAL_WAKE | SLEEP_DEADLINE).await;
+    }
+
+    /// [`Self::park`] on the thread's place for a waker: `false`, at once,
+    /// when another wait has it.
+    async fn park_in_place(&mut self) -> bool {
+        use crate::thread::ThreadExt;
+        let thread = self.thread.clone();
+        let Some(ext) = thread.linux_ext() else {
+            return false;
+        };
+        let wait = &mut self.wait;
+        core::future::poll_fn(|cx| {
+            // Parked before the look, so that a bit set after the look
+            // finds the waker.
+            if !ext.park_waiter(wait, cx.waker()) {
+                return core::task::Poll::Ready(false);
+            }
+            if thread.signal().intersects(SIGNAL_WAKE | SLEEP_DEADLINE) {
+                return core::task::Poll::Ready(true);
+            }
+            core::task::Poll::Pending
+        })
+        .await
     }
 }
 
