@@ -70,7 +70,7 @@ use present::proc_present_content;
 use status::{proc_pid_status, proc_task_status};
 use zcore_drivers::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 60] = [
+const PROC_ROOT_STATIC: [&str; 61] = [
     "net",
     "gpuready",
     "present",
@@ -131,6 +131,7 @@ const PROC_ROOT_STATIC: [&str; 60] = [
     "bootprofile",
     "kbd",
     "udrivers",
+    "switch_root",
 ];
 
 /// The machine's live processes. The census itself is
@@ -837,6 +838,7 @@ impl INode for ProcRootINode {
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
             "kbd" => Ok(PROC_KBD.clone()),
             "udrivers" => Ok(PROC_UDRIVERS.clone()),
+            "switch_root" => Ok(PROC_SWITCH_ROOT.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
             "thread-self" => Ok(Arc::new(ProcSelfSymINode { thread: true })),
             name => {
@@ -3390,6 +3392,11 @@ lazy_static! {
     static ref PROC_UDRIVERS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 165,
         generate: proc_udrivers_content,
+    });
+    static ref PROC_SWITCH_ROOT: Arc<dyn INode> = Arc::new(ProcSysWritableINode {
+        inode: 166,
+        generate: super::late_root::proc_content,
+        store: |dev| super::late_root::proc_store(dev, current_process_id()),
     });
 }
 

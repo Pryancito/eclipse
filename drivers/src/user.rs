@@ -509,63 +509,6 @@ pub fn keep_boot_disk(boot_disk: bool) {
     KEEP_BOOT_DISK.store(boot_disk, Ordering::Release);
 }
 
-/// Whether the kernel's own NVMe driver takes the NVMe controllers: the
-/// root of an installed system is on one ([`keep_root_controllers`]).
-static ROOT_ON_NVME: AtomicBool = AtomicBool::new(false);
-/// The same for the AHCI controllers (a root on a SATA disk).
-static ROOT_ON_AHCI: AtomicBool = AtomicBool::new(false);
-
-/// The kinds whose controllers the kernel keeps for the root device `root`
-/// (`ROOT=` on the command line, `/dev/nvme0n1p2`): NVMe for an `nvme`
-/// node, AHCI for an `sd` one, nothing for any other or for the
-/// installer's placeholder.
-pub fn root_kinds(root: Option<&str>) -> &'static [&'static str] {
-    let Some(root) = root.map(str::trim).filter(|r| !r.contains("__ECLIPSE_")) else {
-        return &[];
-    };
-    let name = root.rsplit('/').next().unwrap_or(root);
-    if name.starts_with("nvme") {
-        &[NVME]
-    } else if name.starts_with("sd") {
-        &[AHCI]
-    } else {
-        &[]
-    }
-}
-
-/// Keep the controllers of the root's kind for the kernel's own driver
-/// ([`root_kinds`]). The kernel mounts the root before any process runs,
-/// so a root on a disk served from userspace is not there when it looks,
-/// and the machine runs on its initramfs. Mounted, it would still hang:
-/// a page of a program is read from its file with the VMO's spin lock held,
-/// and a disk served from userspace is waited for by giving the CPU away
-/// with it. Every controller of that kind stays the kernel's, not only
-/// the root's, so the disks keep the names the installer wrote (`nvme0`).
-/// Before the buses are probed.
-pub fn keep_root_controllers(root: Option<&str>) {
-    for kind in root_kinds(root) {
-        info!(
-            "udriver: the root is on {}: the kernel drives those controllers",
-            kind
-        );
-        match *kind {
-            NVME => ROOT_ON_NVME.store(true, Ordering::Release),
-            AHCI => ROOT_ON_AHCI.store(true, Ordering::Release),
-            _ => {}
-        }
-    }
-}
-
-/// Whether the kernel drives the controllers of `kind` for the root
-/// ([`keep_root_controllers`]).
-pub fn kernel_keeps_for_root(kind: &str) -> bool {
-    match kind {
-        NVME => ROOT_ON_NVME.load(Ordering::Acquire),
-        AHCI => ROOT_ON_AHCI.load(Ordering::Acquire),
-        _ => false,
-    }
-}
-
 /// Whether a boot whose `udriver=` value is `spec` leaves every device of
 /// `kind` to userspace unasked: it does unless it names one of them, and
 /// then that one is what it means.
@@ -790,10 +733,8 @@ fn reserve_with(
         // NVMe or an AHCI controller (`crate::pci_disks`) is userspace's or
         // nobody's.
         || (kind == VIRTIO_BLK && !(index == 0 && KEEP_BOOT_DISK.load(Ordering::Acquire)))
-        // NVMe and AHCI as well, unless the root is on one of that kind and
-        // the kernel's own driver takes it ([`keep_root_controllers`]).
-        || (kind == NVME && !kernel_keeps_for_root(NVME))
-        || (kind == AHCI && !kernel_keeps_for_root(AHCI))
+        || kind == NVME
+        || kind == AHCI
         || (kind == VIRTIO_INPUT
             && index < INPUT_UNASKED_MAX
             && INPUT_UNASKED.load(Ordering::Acquire));
@@ -844,17 +785,6 @@ pub fn find(kind: &str, index: usize) -> Option<Arc<UserDevice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_root_keeps_the_controllers_of_its_kind() {
-        assert_eq!(root_kinds(Some("/dev/nvme0n1p2")), &[NVME]);
-        assert_eq!(root_kinds(Some("/dev/nvme1n1p3")), &[NVME]);
-        assert_eq!(root_kinds(Some("/dev/sda2")), &[AHCI]);
-        assert!(root_kinds(Some("/dev/vda")).is_empty());
-        assert!(root_kinds(Some("/dev/__ECLIPSE_CMDROOTDEV")).is_empty());
-        assert!(root_kinds(Some("__ECLIPSE_CMDROOTDEV")).is_empty());
-        assert!(root_kinds(None).is_empty());
-    }
 
     #[test]
     fn the_spec_names_a_kind_and_an_index() {

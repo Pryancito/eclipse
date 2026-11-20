@@ -33,6 +33,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod control;
+mod switch_root;
 
 /// A respawn service that exits sooner than this after starting is treated as
 /// "crashing", not "finished a unit of work", and its restart is delayed.
@@ -991,6 +992,14 @@ fn main() {
         },
     });
 
+    // The installed root, when its disk comes from a driver this init
+    // starts: the kernel kept the boot medium as `/` and awaits it. See
+    // `switch_root`. The init it hands over to adopts those drivers.
+    switch_root::adopt(&mut services);
+    if let Some(dev) = switch_root::awaited() {
+        switch_root::switch(&dev, &mut services);
+    }
+
     // Move the display to the dedicated graphics VT (tty7) BEFORE starting the
     // compositor/X, so its libseat binds that reserved, shell-free VT instead of
     // sharing tty1 with the boot shell. The kernel then keeps the display on
@@ -1027,6 +1036,11 @@ fn main() {
             ));
             continue;
         };
+        // Already running: adopted from the boot medium's init, or started
+        // for the root (`switch_root`).
+        if svc.pid.is_some() {
+            continue;
+        }
         guard(&format!("starting {name}"), || start_service(svc));
     }
 

@@ -22,6 +22,7 @@ pub mod hunter_feeds;
 mod inotify;
 pub mod ioctl;
 mod kbd_layout;
+mod late_root;
 mod mount_ops;
 mod mount_state;
 mod mountinfo;
@@ -1996,46 +1997,37 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             (boot_mountfs, String::from("rootfs"), "rootfs")
         }
     };
-    warn!("[boot] create_root_fs: root inode");
-    let root = rootfs.mountpoint_root_inode();
-    reset_mount_table();
-    register_mount(&root_source, "/", root_fstype, "rw", None);
-
-    // mount DevFS at /dev
-    let dev = resolve_mount_dir(&rootfs, &root, root_fstype, "dev", 0o666);
-    warn!("[boot] create_root_fs: mount devfs on /dev");
-    if let Err(e) = dev.mount(devfs) {
-        warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
-    } else {
-        register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", None);
-        // `/dev/shm` is served by a RamFS inserted directly into devfs (see the
-        // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
-        // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
-        // it in the mount table only so `/proc/mounts` reflects reality.
-        register_line("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts());
-        // The same for `/dev/pts`, with the options it behaves as having.
-        register_line(
-            "devpts",
-            "/dev/pts",
-            "devpts",
-            "rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000",
+    // The pseudo filesystems every root wears. Made here, once: a root that
+    // comes later (`late_root`) wears these same ones, so what was written
+    // to /run and /tmp before it came is still there after.
+    let tmp_ramfs = RamFS::new();
+    // RamFS at /run (essential for DHCP clients and other daemons)
+    let run_ramfs = RamFS::new();
+    fill_udev_db(&run_ramfs);
+    let root = dress_root(
+        &rootfs,
+        &root_source,
+        root_fstype,
+        devfs.clone(),
+        tmp_ramfs.clone(),
+        run_ramfs.clone(),
+    );
+    if root_source == "rootfs" {
+        late_root::note_boot_root(
+            &root,
+            late_root::Pseudo {
+                devfs,
+                tmp: tmp_ramfs,
+                run: run_ramfs,
+            },
         );
     }
+    warn!("[boot] create_root_fs: done");
+    root
+}
 
-    // mount RamFS at /tmp — frame-backed pages, shared MemTotal/2 ceiling with
-    // `/run`, `/dev/shm` and memfd (see `install_tmpfs_frame_backend`).
-    warn!("[boot] create_root_fs: mount /tmp");
-    let ramfs = RamFS::new();
-    let tmp = resolve_mount_dir(&rootfs, &root, root_fstype, "tmp", 0o666);
-    if let Err(e) = tmp.mount(ramfs) {
-        warn!("[boot] create_root_fs: mount /tmp failed: {:?}", e);
-    } else {
-        register_mount("tmpfs", "/tmp", "tmpfs", &tmpfs_mount_opts(), None);
-    }
-
-    // mount RamFS at /run (essential for DHCP clients and other daemons)
-    warn!("[boot] create_root_fs: mount /run");
-    let run_ramfs = RamFS::new();
+/// Write the synthetic udev database for the input devices into `/run`.
+fn fill_udev_db(run_ramfs: &Arc<RamFS>) {
     // Emulate udevd's database so libudev/libinput treat the input devices as
     // initialized and seat-assigned. With no udevd running there is no
     // /run/udev/data, and libudev's enumerate (MATCH_INITIALIZED_COMPAT)
@@ -2145,7 +2137,57 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             }
         }
     }
-    let run = resolve_mount_dir(&rootfs, &root, root_fstype, "run", 0o755);
+}
+
+/// Mount on `root` (of `rootfs`, from `root_source`, of type `root_fstype`)
+/// what every root carries -- /dev, /tmp, /run, /proc, /sys and the rest --
+/// register it all in the mount table, and make it the VFS root.
+fn dress_root(
+    rootfs: &Arc<MountFS>,
+    root_source: &str,
+    root_fstype: &'static str,
+    devfs: Arc<DevFS>,
+    tmp_ramfs: Arc<RamFS>,
+    run_ramfs: Arc<RamFS>,
+) -> Arc<MNode> {
+    warn!("[boot] create_root_fs: root inode");
+    let root = rootfs.mountpoint_root_inode();
+    reset_mount_table();
+    register_mount(root_source, "/", root_fstype, "rw", None);
+
+    // mount DevFS at /dev
+    let dev = resolve_mount_dir(rootfs, &root, root_fstype, "dev", 0o666);
+    warn!("[boot] create_root_fs: mount devfs on /dev");
+    if let Err(e) = dev.mount(devfs) {
+        warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
+    } else {
+        register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", None);
+        // `/dev/shm` is served by a RamFS inserted directly into devfs (see the
+        // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
+        // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
+        // it in the mount table only so `/proc/mounts` reflects reality.
+        register_line("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts());
+        // The same for `/dev/pts`, with the options it behaves as having.
+        register_line(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            "rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000",
+        );
+    }
+
+    // mount RamFS at /tmp — frame-backed pages, shared MemTotal/2 ceiling with
+    // `/run`, `/dev/shm` and memfd (see `install_tmpfs_frame_backend`).
+    warn!("[boot] create_root_fs: mount /tmp");
+    let tmp = resolve_mount_dir(rootfs, &root, root_fstype, "tmp", 0o666);
+    if let Err(e) = tmp.mount(tmp_ramfs) {
+        warn!("[boot] create_root_fs: mount /tmp failed: {:?}", e);
+    } else {
+        register_mount("tmpfs", "/tmp", "tmpfs", &tmpfs_mount_opts(), None);
+    }
+
+    warn!("[boot] create_root_fs: mount /run");
+    let run = resolve_mount_dir(rootfs, &root, root_fstype, "run", 0o755);
     if let Err(e) = run.mount(run_ramfs) {
         warn!("[boot] create_root_fs: mount /run failed: {:?}", e);
     } else {
@@ -2196,7 +2238,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 
     // mount ProcFS at /proc
     warn!("[boot] create_root_fs: mount /proc");
-    let proc = resolve_mount_dir(&rootfs, &root, root_fstype, "proc", 0o755);
+    let proc = resolve_mount_dir(rootfs, &root, root_fstype, "proc", 0o755);
     if let Err(e) = proc.mount(Arc::new(ProcFS::new())) {
         warn!("[boot] create_root_fs: mount /proc failed: {:?}", e);
     } else {
@@ -2211,7 +2253,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 
     // mount SysFS at /sys
     warn!("[boot] create_root_fs: mount /sys");
-    let sys = resolve_mount_dir(&rootfs, &root, root_fstype, "sys", 0o755);
+    let sys = resolve_mount_dir(rootfs, &root, root_fstype, "sys", 0o755);
     if let Err(e) = sys.mount(Arc::new(SysFS::new())) {
         warn!("[boot] create_root_fs: mount /sys failed: {:?}", e);
     } else {
@@ -2227,7 +2269,6 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     mount_ops::set_vfs_root(root.clone());
     // Defer non-root fstab mounts (/boot vfat, /home, …) until after init starts.
     // Mounting them here can stall disk boot (AHCI + SMP) before the shell appears.
-    warn!("[boot] create_root_fs: done");
     root
 }
 

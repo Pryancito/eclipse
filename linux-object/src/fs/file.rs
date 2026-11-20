@@ -1325,7 +1325,10 @@ impl File {
     /// get metadata of file
     /// fstat
     pub fn metadata(&self) -> LxResult<Metadata> {
-        Ok(self.inner.read().inode.metadata()?)
+        // Asked with the file's lock let go: a filesystem on a disk served
+        // from userspace may park the caller until its driver answers.
+        let inode = self.inner.read().inode.clone();
+        Ok(inode.metadata()?)
     }
 
     /// lookup the file following the link
