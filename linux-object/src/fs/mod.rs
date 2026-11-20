@@ -677,37 +677,60 @@ pub(crate) fn audio_cards_alsa_order() -> Vec<Arc<dyn zcore_drivers::scheme::Aud
     v.into_iter().map(|(_, _, a)| a).collect()
 }
 
-/// The card number the kernel's first audio card takes: 1 when an HD Audio
-/// controller was left to its driver in userspace, which serves card 0
-/// (`/dev/dsp`, `/dev/snd/controlC0`, `/dev/snd/pcmC0D0p`; `udrv-hda`),
-/// else 0. The controller left to userspace is the board's own (a GPU's
-/// HDMI function stays in the kernel: `user::reserve_hda`), and Linux too
-/// numbers the board's codec before a GPU's. On a machine with a GPU whose
-/// HDMI audio the kernel drives, the kernel's card took `/dev/dsp` first
-/// and the served driver died at every start with `dev_serve /dev/dsp: -26`
-/// (the name taken).
+/// The card number the kernel's first audio card took at boot
+/// ([`choose_first_kernel_card`]), for whoever labels its cards later
+/// (`/proc/gpusnd`).
+static FIRST_KERNEL_CARD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The card number the kernel's first audio card takes.
 pub(crate) fn first_kernel_audio_card() -> usize {
-    first_card_after(&zcore_drivers::user::reserved())
+    FIRST_KERNEL_CARD.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// [`first_kernel_audio_card`] on what the buses left to userspace, as
-/// `/proc/udrivers` lists it.
-fn first_card_after<S: AsRef<str>>(left_to_userspace: &[S]) -> usize {
-    left_to_userspace
+/// What `HdaInner::default_score` (`drivers/src/audio/hda.rs`) gives a card whose
+/// HDMI/DP pin has a display that hears it (present: 2, HDMI/DP and
+/// present: 4).
+const LIVE_HDMI_SCORE: i32 = 6;
+
+/// Which card number the kernel's first audio card takes, once at boot:
+/// `best_score` is that card's `default_score`, `left_to_userspace` what
+/// the buses left to userspace, as `/proc/udrivers` lists it.
+///
+/// With no HD Audio controller left to userspace, 0. With one (the board's
+/// codec, served by `udrv-hda`), the kernel's card is still card 0 when it
+/// is a GPU's HDMI/DP with a display that hears it -- the default the user
+/// wants, and the one the kernel's own ordering had -- and `udrv-hda` takes
+/// the next free card (1); else the kernel's cards start at 1 and the
+/// board's codec is card 0, as Linux numbers it. Either way the two never
+/// ask for the same names: when they did, `udrv-hda` died at every start
+/// with `dev_serve /dev/dsp: -26`.
+fn choose_first_kernel_card<S: AsRef<str>>(
+    left_to_userspace: &[S],
+    best_score: Option<i32>,
+) -> usize {
+    let served = left_to_userspace
         .iter()
-        .any(|left| left.as_ref().starts_with("hda@"))
-        .into()
+        .any(|left| left.as_ref().starts_with("hda@"));
+    let live_hdmi = best_score.is_some_and(|s| s >= LIVE_HDMI_SCORE);
+    usize::from(served && !live_hdmi)
 }
 
 #[cfg(test)]
 mod first_card_tests {
-    use super::first_card_after;
+    use super::choose_first_kernel_card as first;
 
     #[test]
-    fn the_kernels_cards_follow_a_served_one() {
-        assert_eq!(first_card_after(&["e1000e@0", "hda@1", "ahci@0"]), 1);
-        assert_eq!(first_card_after(&["e1000e@0", "ahci@0"]), 0);
-        assert_eq!(first_card_after::<&str>(&[]), 0);
+    fn a_monitor_that_hears_keeps_card_0_else_the_served_codec_has_it() {
+        let served = ["e1000e@0", "hda@1", "ahci@0"];
+        // The NVIDIA HDMI pin with a monitor: present + HDMI + ELD = 7.
+        assert_eq!(first(&served, Some(7)), 0);
+        assert_eq!(first(&served, Some(6)), 0);
+        // No display on it: the board's codec is card 0.
+        assert_eq!(first(&served, Some(1)), 1);
+        assert_eq!(first(&served, None), 1);
+        // Nothing served: the kernel's cards start at 0 whatever they are.
+        assert_eq!(first(&["e1000e@0", "ahci@0"], Some(0)), 0);
+        assert_eq!(first::<&str>(&[], None), 0);
     }
 }
 
@@ -1675,12 +1698,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // Linux, where one substream sits behind both nodes).
     // Card 0 is the served driver's when one was left an HD Audio
     // controller: the kernel's are numbered after it.
-    let first_card = first_kernel_audio_card();
-    if first_card != 0 && !audio_cards.is_empty() {
+    let best_score = audio_cards.first().map(|a| a.default_score());
+    let first_card = choose_first_kernel_card(&zcore_drivers::user::reserved(), best_score);
+    FIRST_KERNEL_CARD.store(first_card, core::sync::atomic::Ordering::Relaxed);
+    if !audio_cards.is_empty() {
         info!(
-            "[audio] card 0 is the HD Audio controller left to userspace (udrv-hda); the kernel's {} card(s) start at card {}",
+            "[audio] the kernel's {} card(s) start at card {} (its first scores {:?}; an HDMI/DP display that hears keeps card 0, else the served HD Audio card has it)",
             audio_cards.len(),
-            first_card
+            first_card,
+            best_score
         );
     }
     let audio_claims: Vec<devfs::AudioClaim> = audio_cards
