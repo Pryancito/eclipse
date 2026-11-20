@@ -3,10 +3,14 @@
 //! stream played by one client at a time.
 //!
 //! The controller is reset and its codecs found; verbs go to them through
-//! the CORB and come back through the RIRB, both polled. The codec's audio
-//! function is walked for output paths (a converter a pin can reach), and
-//! the best one is powered and routed: a pin that says something is plugged
-//! in first, a digital (HDMI/DP) one before an analog one. Sound goes out
+//! the CORB and come back through the RIRB, both polled. Every codec's
+//! audio function is walked for output paths (a converter a pin reaches,
+//! straight or through mixers and selectors, as a desktop Realtek's line
+//! out does), and the best one is powered and routed: a pin that says
+//! something is plugged in first, a digital (HDMI/DP) one before an analog
+//! one, an analog output jack before an S/PDIF or a silent HDMI pin. What
+//! was found and why one path was taken is said on the log, so a card that
+//! plays nothing on a machine nobody can look at says why. Sound goes out
 //! through one cyclic ring that a buffer descriptor list describes once;
 //! [`Ring`] keeps what of it the client has written and what the
 //! controller has played, as the stream's position (`LPIB`) says, and
@@ -25,6 +29,7 @@ use crate::{now_ns, PAGE};
 // Controller registers (HDA 1.0a §3.3).
 const GCAP: usize = 0x00;
 const GCTL: usize = 0x08;
+const WAKEEN: usize = 0x0c;
 const STATESTS: usize = 0x0e;
 const INTCTL: usize = 0x20;
 const CORBLBASE: usize = 0x40;
@@ -53,6 +58,9 @@ const SD_BDPL: usize = 0x18;
 const SD_BDPU: usize = 0x1c;
 
 const GCTL_CRST: u32 = 1;
+/// GCAP: the controller takes 64-bit DMA addresses.
+const GCAP_64OK: u16 = 1;
+const CORBRP_RST: u16 = 1 << 15;
 const RIRB_DMA_RUN: u8 = 1 << 1;
 const RIRB_IRQ_EN: u8 = 1 << 0;
 const RIRBSTS_ACK: u8 = 0x05;
@@ -81,15 +89,49 @@ const PAR_NODE_COUNT: u32 = 0x04;
 const PAR_FUNCTION_TYPE: u32 = 0x05;
 const PAR_AUDIO_WIDGET_CAP: u32 = 0x09;
 const PAR_PIN_CAP: u32 = 0x0c;
+const PAR_IN_AMP_CAP: u32 = 0x0d;
 const PAR_CONN_LIST_LEN: u32 = 0x0e;
 const PAR_OUT_AMP_CAP: u32 = 0x12;
 const WIDGET_AUDIO_OUT: u32 = 0x0;
+const WIDGET_MIXER: u32 = 0x2;
+const WIDGET_SELECTOR: u32 = 0x3;
 const WIDGET_PIN: u32 = 0x4;
+// Audio widget capabilities.
+const WCAP_IN_AMP: u32 = 1 << 1;
+const WCAP_OUT_AMP: u32 = 1 << 2;
+const WCAP_AMP_OVERRIDE: u32 = 1 << 3;
+const WCAP_DIGITAL: u32 = 1 << 9;
+// Pin capabilities.
+const PINCAP_TRIGGER: u32 = 1 << 1;
+const PINCAP_PRESENCE: u32 = 1 << 2;
+const PINCAP_HP_DRIVE: u32 = 1 << 3;
+const PINCAP_OUT: u32 = 1 << 4;
+const PINCAP_HDMI: u32 = 1 << 7;
+const PINCAP_EAPD: u32 = 1 << 16;
+const PINCAP_DP: u32 = 1 << 24;
 const PIN_CTL_OUT_EN: u32 = 0x40;
+const PIN_CTL_HP_EN: u32 = 0x80;
 const FUNCTION_AUDIO: u32 = 0x01;
+// A pin's default device (configuration default bits 23:20).
+pub const DEVICE_LINE_OUT: u32 = 0x0;
+pub const DEVICE_SPEAKER: u32 = 0x1;
+pub const DEVICE_HP_OUT: u32 = 0x2;
+pub const DEVICE_SPDIF_OUT: u32 = 0x4;
+pub const DEVICE_DIGITAL_OUT: u32 = 0x5;
+/// Its connectivity (bits 31:30): nothing there, and a fixed device (a
+/// laptop's speaker).
+const CONNECT_NONE: u32 = 1;
+const CONNECT_FIXED: u32 = 2;
+/// How many mixers and selectors a path goes through, at most, between
+/// its pin and its converter: a Realtek's is one mixer.
+pub const MAX_VIA: usize = 4;
 
 /// How long a codec gets to answer a verb.
 const VERB_NS: u64 = 200_000_000;
+/// After this many verbs in a row with no answer a codec is taken to be
+/// gone, and verbs to it fail at once: a walk of a dead codec would
+/// otherwise take [`VERB_NS`] a verb, hundreds of times.
+const DEAD_AFTER: u32 = 3;
 
 /// The ring: 128 KiB in segments of 2 KiB, two thirds of a second of
 /// 48 kHz stereo, as deep as the kernel's: an ALSA client asks for half a
@@ -222,109 +264,243 @@ impl<V: Verbs> Codec<V> {
             .find(|&nid| self.param(nid, PAR_FUNCTION_TYPE).unwrap_or(0) & 0xff == FUNCTION_AUDIO)
     }
 
-    /// Where `conv` is in `pin`'s connection list.
-    fn conn_index(&mut self, pin: u32, conv: u32) -> Option<u32> {
-        let len = self.param(pin, PAR_CONN_LIST_LEN)?;
+    /// `nid`'s connection list, ranges spelled out (HDA 1.0a §7.3.3.3): an
+    /// entry with the range bit set means every node from the one before it
+    /// to it. Indices into it are what `SET_CONN_SELECT` and an input amp
+    /// take.
+    pub fn connections(&mut self, nid: u32) -> Vec<u32> {
+        let Some(len) = self.param(nid, PAR_CONN_LIST_LEN) else {
+            return Vec::new();
+        };
         let long = len & 0x80 != 0;
         let len = len & 0x7f;
-        let per = if long { 2 } else { 4 };
-        let mut idx = 0;
+        let (per, bits) = if long { (2, 16) } else { (4, 8) };
+        let range = 1u32 << (bits - 1);
+        let mask = range - 1;
+        let mut out: Vec<u32> = Vec::new();
         let mut i = 0;
         while i < len {
-            let r = self.cmd(pin, VERB_GET_CONN_LIST, i)?;
+            let Some(r) = self.cmd(nid, VERB_GET_CONN_LIST, i) else {
+                break;
+            };
             for k in 0..per.min(len - i) {
-                let entry = if long {
-                    (r >> (16 * k)) & 0x7fff
-                } else {
-                    (r >> (8 * k)) & 0x7f
-                };
-                if entry == conv {
-                    return Some(idx);
+                let entry = (r >> (bits * k)) & (range | mask);
+                let node = entry & mask;
+                match out.last() {
+                    // A range, from the entry before it: at most a list's
+                    // worth, whatever a broken codec says.
+                    Some(&from) if entry & range != 0 && node > from => {
+                        out.extend((from + 1..=node).take(0x7f));
+                    }
+                    _ => out.push(node),
                 }
-                idx += 1;
             }
             i += per;
+        }
+        out
+    }
+
+    /// From `nid`, a converter its connection list reaches: straight, or
+    /// through mixers and selectors, `depth` of them at most. Where the
+    /// first step is in `nid`'s list, the converter, and the widgets on the
+    /// way, each with where its next step is in its own list. A converter
+    /// in `nid`'s own list is taken before any way round.
+    fn reach(
+        &mut self,
+        nid: u32,
+        widgets: &[(u32, u32)],
+        depth: usize,
+        seen: &mut Vec<u32>,
+    ) -> Option<(u32, u32, Vec<Hop>)> {
+        let list = self.connections(nid);
+        let kind = |n: u32| {
+            widgets
+                .iter()
+                .find(|(w, _)| *w == n)
+                .map(|(_, caps)| (caps >> 20) & 0xf)
+        };
+        if let Some(i) = list.iter().position(|&n| kind(n) == Some(WIDGET_AUDIO_OUT)) {
+            return Some((i as u32, list[i], Vec::new()));
+        }
+        if depth == 0 {
+            return None;
+        }
+        for (i, &w) in list.iter().enumerate() {
+            let k = kind(w);
+            if !matches!(k, Some(WIDGET_MIXER | WIDGET_SELECTOR)) || seen.contains(&w) {
+                continue;
+            }
+            seen.push(w);
+            if let Some((conn, conv, mut rest)) = self.reach(w, widgets, depth - 1, seen) {
+                rest.insert(
+                    0,
+                    Hop {
+                        nid: w,
+                        conn,
+                        mixer: k == Some(WIDGET_MIXER),
+                    },
+                );
+                return Some((i as u32, conv, rest));
+            }
         }
         None
     }
 
     /// Every output path of the function `afg`: each output pin with a
-    /// connector, and the first converter it reaches.
+    /// connector, and the converter it reaches. Pins whose default device
+    /// is an output (line out, speaker, headphone, S/PDIF, HDMI/DP) only,
+    /// unless no pin says so: then every output-capable one, for a codec
+    /// whose firmware left the configuration blank.
     pub fn paths(&mut self, afg: u32) -> Vec<Path> {
         let Some((start, count)) = self.sub_nodes(afg) else {
             return Vec::new();
         };
-        let mut convs = Vec::new();
+        let mut widgets = Vec::new();
         let mut pins = Vec::new();
         for nid in start..start + count {
             let caps = self.param(nid, PAR_AUDIO_WIDGET_CAP).unwrap_or(0);
-            let digital = caps & (1 << 9) != 0;
-            match (caps >> 20) & 0xf {
-                WIDGET_AUDIO_OUT => convs.push((nid, digital)),
-                WIDGET_PIN => {
-                    let pincap = self.param(nid, PAR_PIN_CAP).unwrap_or(0);
-                    let config = self.cmd(nid, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(0);
-                    // Output capable, and not "no physical connection".
-                    if pincap & (1 << 4) != 0 && (config >> 30) & 3 != 1 {
-                        pins.push((nid, pincap));
-                    }
+            widgets.push((nid, caps));
+            if (caps >> 20) & 0xf == WIDGET_PIN {
+                let pincap = self.param(nid, PAR_PIN_CAP).unwrap_or(0);
+                let config = self.cmd(nid, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(0);
+                // Output capable, and not "no physical connection".
+                if pincap & PINCAP_OUT != 0 && (config >> 30) & 3 != CONNECT_NONE {
+                    pins.push((nid, pincap, config));
                 }
-                _ => {}
             }
         }
+        let outputs = pins
+            .iter()
+            .any(|(_, _, config)| output_device((config >> 20) & 0xf));
         let mut out = Vec::new();
-        for (pin, pincap) in pins {
-            for &(conv, digital) in &convs {
-                if let Some(conn) = self.conn_index(pin, conv) {
-                    out.push(Path {
-                        conv,
-                        pin,
-                        conn,
-                        digital,
-                        hdmi: pincap & (1 << 7) != 0 || pincap & (1 << 24) != 0,
-                    });
-                    break;
-                }
+        for (pin, pincap, config) in pins {
+            let device = (config >> 20) & 0xf;
+            if outputs && !output_device(device) {
+                continue;
             }
+            let mut seen = vec![pin];
+            let Some((conn, conv, hops)) = self.reach(pin, &widgets, MAX_VIA, &mut seen) else {
+                continue;
+            };
+            let caps = widgets
+                .iter()
+                .find(|(w, _)| *w == conv)
+                .map_or(0, |(_, c)| *c);
+            let mut via = [Hop::default(); MAX_VIA];
+            via[..hops.len()].copy_from_slice(&hops);
+            out.push(Path {
+                cad: self.cad,
+                afg,
+                conv,
+                pin,
+                conn,
+                digital: caps & WCAP_DIGITAL != 0,
+                hdmi: pincap & (PINCAP_HDMI | PINCAP_DP) != 0,
+                via,
+                hops: hops.len(),
+                device,
+                fixed: (config >> 30) & 3 == CONNECT_FIXED,
+                // A pin that cannot sense, or whose firmware says not to
+                // trust it (misc bit 0, "jack detect override"), says
+                // nothing about what is plugged in.
+                senses: pincap & PINCAP_PRESENCE != 0 && config & (1 << 8) == 0,
+                trigger: pincap & PINCAP_TRIGGER != 0,
+                hp_drive: pincap & PINCAP_HP_DRIVE != 0,
+                eapd: pincap & PINCAP_EAPD != 0,
+            });
         }
         out
     }
 
-    /// Whether something is plugged into `path`'s pin: a digital pin is
-    /// asked to look first, as Linux's `snd_hda_pin_sense` does.
+    /// Whether something is plugged into `path`'s pin: a pin that needs it
+    /// (and an HDMI/DP one, which often does without saying so) is asked to
+    /// look first, as Linux's `snd_hda_pin_sense` does. A pin that cannot
+    /// tell is taken to have nothing.
     pub fn present(&mut self, path: &Path) -> bool {
-        if path.hdmi {
+        if !path.senses {
+            return false;
+        }
+        if path.trigger || path.hdmi {
             let _ = self.cmd(path.pin, VERB_SET_PIN_SENSE, 0);
+            // The kernel's driver gives the result 2 ms to settle; once,
+            // at start.
+            std::thread::sleep(Duration::from_millis(2));
         }
         self.cmd(path.pin, VERB_GET_PIN_SENSE, 0)
             .is_some_and(|s| s & (1 << 31) != 0)
     }
 
-    /// Power `path` up and route it: the function, its converter and its
-    /// pin in D0, the pin on its converter and driving, its amplifier on and
-    /// every amp at 0 dB.
+    /// The amplifier capabilities of `nid`'s input (`input`) or output amp,
+    /// `None` when it has none: its own when it overrides them, else its
+    /// function's (HDA 1.0a §7.3.4.10), and its own again when the function
+    /// has none to give.
+    pub fn amp_caps(&mut self, afg: u32, nid: u32, input: bool) -> Option<u32> {
+        let caps = self.param(nid, PAR_AUDIO_WIDGET_CAP)?;
+        let (present, par) = if input {
+            (WCAP_IN_AMP, PAR_IN_AMP_CAP)
+        } else {
+            (WCAP_OUT_AMP, PAR_OUT_AMP_CAP)
+        };
+        let own = self.param(nid, par).unwrap_or(0);
+        if caps & present == 0 {
+            // No amp, or one that only says so in its caps.
+            return (own != 0).then_some(own);
+        }
+        if caps & WCAP_AMP_OVERRIDE != 0 {
+            return Some(own);
+        }
+        match self.param(afg, par).unwrap_or(0) {
+            0 => Some(own),
+            shared => Some(shared),
+        }
+    }
+
+    /// Unmute `nid`'s output amp, or its input amp `index`, both channels,
+    /// at its 0 dB step.
+    fn open_amp(&mut self, afg: u32, nid: u32, input: Option<u32>) {
+        if let Some(amp) = self.amp_caps(afg, nid, input.is_some()) {
+            let side = match input {
+                Some(index) => 1 << 14 | (index & 0xf) << 8,
+                None => 1 << 15,
+            };
+            let _ = self.cmd16(nid, VERB16_SET_AMP, side | 1 << 13 | 1 << 12 | (amp & 0x7f));
+        }
+    }
+
+    /// Power `path` up and route it: the function, its converter, the
+    /// widgets between and its pin in D0; the pin and every selector on the
+    /// way set to the next step; the pin driving (a headphone jack with its
+    /// amplifier); every amp on the way open at 0 dB, a mixer's on the
+    /// input the path comes in by.
     pub fn route(&mut self, afg: u32, path: &Path) -> Option<()> {
         self.cmd(afg, VERB_SET_POWER_STATE, 0)?;
         std::thread::sleep(Duration::from_millis(1));
         self.cmd(path.conv, VERB_SET_POWER_STATE, 0)?;
+        for hop in path.via() {
+            let _ = self.cmd(hop.nid, VERB_SET_POWER_STATE, 0);
+        }
         self.cmd(path.pin, VERB_SET_POWER_STATE, 0)?;
         self.cmd(path.pin, VERB_SET_CONN_SELECT, path.conn)?;
-        self.cmd(path.pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN)?;
-        if self.param(path.pin, PAR_PIN_CAP)? & (1 << 16) != 0 {
+        let ctl = if path.device == DEVICE_HP_OUT && path.hp_drive {
+            PIN_CTL_OUT_EN | PIN_CTL_HP_EN
+        } else {
+            PIN_CTL_OUT_EN
+        };
+        self.cmd(path.pin, VERB_SET_PIN_CTL, ctl)?;
+        if path.eapd {
             let _ = self.cmd(path.pin, VERB_SET_EAPD, 0x2);
         }
-        for nid in [path.conv, path.pin] {
-            let amp = self.param(nid, PAR_OUT_AMP_CAP)?;
-            let has = amp != 0 || self.param(nid, PAR_AUDIO_WIDGET_CAP)? & (1 << 2) != 0;
-            if has {
-                // Output amp, both channels, at its 0 dB step.
-                let _ = self.cmd16(
-                    nid,
-                    VERB16_SET_AMP,
-                    1 << 15 | 1 << 13 | 1 << 12 | (amp & 0x7f),
-                );
+        for hop in path.via() {
+            if !hop.mixer {
+                let _ = self.cmd(hop.nid, VERB_SET_CONN_SELECT, hop.conn);
             }
+            // A mixer sums every input: the path's is opened. A selector's
+            // input amp, if it has one, is on the input it chose.
+            self.open_amp(afg, hop.nid, Some(hop.conn));
+            self.open_amp(afg, hop.nid, None);
         }
+        self.open_amp(afg, path.conv, None);
+        self.open_amp(afg, path.pin, None);
         if path.digital {
             let _ = self.cmd(path.conv, VERB_SET_DIGI_CVT1, 1);
             let _ = self.cmd(path.conv, VERB_SET_CVT_CHAN_COUNT, 1);
@@ -340,34 +516,131 @@ impl<V: Verbs> Codec<V> {
     }
 }
 
-/// An output path: a converter and the pin it plays through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether a pin's default device is one sound goes out of.
+fn output_device(device: u32) -> bool {
+    matches!(
+        device,
+        DEVICE_LINE_OUT | DEVICE_SPEAKER | DEVICE_HP_OUT | DEVICE_SPDIF_OUT | DEVICE_DIGITAL_OUT
+    )
+}
+
+/// A widget between a pin and its converter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hop {
+    pub nid: u32,
+    /// Where the next step to the converter is in its connection list.
+    pub conn: u32,
+    /// A mixer, which sums its inputs; else a selector, which takes one.
+    pub mixer: bool,
+}
+
+/// An output path: a converter and the pin it plays through, on codec
+/// `cad`'s function `afg`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Path {
+    pub cad: u32,
+    pub afg: u32,
     pub conv: u32,
     pub pin: u32,
-    /// Where the converter is in the pin's connection list.
+    /// Where the first step to the converter is in the pin's connection
+    /// list.
     pub conn: u32,
     pub digital: bool,
     pub hdmi: bool,
+    /// The mixers and selectors between pin and converter, pin side first:
+    /// the first [`Path::hops`] of them.
+    pub via: [Hop; MAX_VIA],
+    pub hops: usize,
+    /// The pin's default device: [`DEVICE_LINE_OUT`] and the rest.
+    pub device: u32,
+    /// A device fixed to the machine (a laptop's speaker), not a jack.
+    pub fixed: bool,
+    /// Whether the pin can tell something is plugged in.
+    pub senses: bool,
+    /// Whether it has to be asked to look first.
+    pub trigger: bool,
+    /// Whether it can drive headphones, and has an external amplifier.
+    pub hp_drive: bool,
+    pub eapd: bool,
 }
 
-/// Which path to play on: the best score, the first of them on a tie. A
-/// pin with something plugged in scores 2, and 4 more when it is HDMI/DP
-/// (a display that hears it); one with nothing plugged in still plays, for
-/// a codec that cannot tell (QEMU's).
-pub fn choose(paths: &[(Path, bool)]) -> Option<Path> {
-    let score = |(p, present): &(Path, bool)| {
-        let mut s = 0;
-        if *present {
-            s += 2;
-            if p.hdmi && p.digital {
-                s += 4;
-            }
+impl Path {
+    /// The widgets between pin and converter.
+    pub fn via(&self) -> &[Hop] {
+        &self.via[..self.hops.min(MAX_VIA)]
+    }
+
+    /// An analog output: a line out, a speaker or a headphone jack.
+    pub fn analog_out(&self) -> bool {
+        !self.digital
+            && !self.hdmi
+            && matches!(
+                self.device,
+                DEVICE_LINE_OUT | DEVICE_SPEAKER | DEVICE_HP_OUT
+            )
+    }
+
+    /// What the log says of it.
+    pub fn describe(&self) -> String {
+        let device = match self.device {
+            DEVICE_LINE_OUT => "line out",
+            DEVICE_SPEAKER => "speaker",
+            DEVICE_HP_OUT => "headphones",
+            DEVICE_SPDIF_OUT => "S/PDIF",
+            DEVICE_DIGITAL_OUT => "digital out",
+            _ => "other",
+        };
+        let mut s = format!(
+            "codec {} pin {:#x} ({device}{}{}) <- ",
+            self.cad,
+            self.pin,
+            if self.hdmi { ", HDMI/DP" } else { "" },
+            if self.fixed { ", built in" } else { "" },
+        );
+        for hop in self.via() {
+            s += &format!(
+                "{} {:#x} <- ",
+                if hop.mixer { "mixer" } else { "selector" },
+                hop.nid
+            );
         }
+        s += &format!(
+            "converter {:#x} ({})",
+            self.conv,
+            if self.digital { "digital" } else { "analog" }
+        );
         s
-    };
-    let best = paths.iter().map(score).max()?;
-    paths.iter().find(|p| score(p) == best).map(|(p, _)| *p)
+    }
+}
+
+/// How [`choose`] rates a path. A pin with something plugged in scores 2,
+/// and 4 more when it is HDMI/DP (a display that hears it); an analog
+/// output (line out, speaker, headphones) 1 more, so that with nothing
+/// sensed anywhere the board's jack plays and not an S/PDIF socket or an
+/// HDMI pin with no display.
+pub fn score(path: &Path, present: bool) -> i32 {
+    let mut s = 0;
+    if present {
+        s += 2;
+        if path.hdmi && path.digital {
+            s += 4;
+        }
+    }
+    if path.analog_out() {
+        s += 1;
+    }
+    s
+}
+
+/// Which path to play on: the best [`score`], the first of them on a tie.
+/// One with nothing plugged in still plays, for a codec that cannot tell
+/// (QEMU's).
+pub fn choose(paths: &[(Path, bool)]) -> Option<Path> {
+    let best = paths.iter().map(|(p, s)| score(p, *s)).max()?;
+    paths
+        .iter()
+        .find(|(p, s)| score(p, *s) == best)
+        .map(|(p, _)| *p)
 }
 
 /// What of the ring holds what: bytes the client wrote and bytes the
@@ -450,6 +723,10 @@ pub struct Rings<R> {
     corb_entries: usize,
     rirb_entries: usize,
     rirb_rp: usize,
+    /// Verbs in a row each codec has not answered.
+    missed: [u32; 16],
+    /// Verbs not answered in all, for the log.
+    pub timeouts: u32,
 }
 
 // SAFETY: the rings are this process's DMA memory, reached by one owner.
@@ -480,9 +757,23 @@ impl<R: Regs> Rings<R> {
         regs.w32(CORBUBASE, (corb >> 32) as u32);
         regs.w32(RIRBLBASE, rirb as u32);
         regs.w32(RIRBUBASE, (rirb >> 32) as u32);
-        regs.w16(CORBRP, 1 << 15);
-        std::thread::sleep(Duration::from_micros(100));
+        // The read pointer's reset is a handshake on real controllers: set,
+        // seen set, cleared, seen clear (Linux's `azx_init_cmd_io`). QEMU
+        // shows neither; a controller that does not is said on the log.
+        regs.w16(CORBRP, CORBRP_RST);
+        if !wait_for(|| regs.r16(CORBRP) & CORBRP_RST != 0, 1_000_000) {
+            println!(
+                "udrv-hda: the CORB read pointer did not show its reset (CORBRP {:#06x})",
+                regs.r16(CORBRP)
+            );
+        }
         regs.w16(CORBRP, 0);
+        if !wait_for(|| regs.r16(CORBRP) & CORBRP_RST == 0, 1_000_000) {
+            println!(
+                "udrv-hda: the CORB read pointer stayed in reset (CORBRP {:#06x})",
+                regs.r16(CORBRP)
+            );
+        }
         regs.w16(CORBWP, 0);
         regs.w16(RIRBWP, 1 << 15);
         // One answer per interrupt status, acked after every verb: QEMU
@@ -499,6 +790,8 @@ impl<R: Regs> Rings<R> {
             corb_entries,
             rirb_entries,
             rirb_rp: 0,
+            missed: [0; 16],
+            timeouts: 0,
         }
     }
 
@@ -509,6 +802,44 @@ impl<R: Regs> Rings<R> {
 
 impl<R: Regs> Verbs for Rings<R> {
     fn send(&mut self, word: u32) -> Option<u32> {
+        let cad = (word >> 28) as usize;
+        if self.missed[cad] >= DEAD_AFTER {
+            return None;
+        }
+        let answer = self.exchange(word, cad as u32);
+        match answer {
+            Some(_) => self.missed[cad] = 0,
+            None => {
+                self.timeouts += 1;
+                self.missed[cad] += 1;
+                if self.missed[cad] == DEAD_AFTER {
+                    println!(
+                        "udrv-hda: codec {cad} did not answer {DEAD_AFTER} verbs in a row (the last {word:#010x}): taken to be gone"
+                    );
+                }
+            }
+        }
+        answer
+    }
+}
+
+/// Wait up to `ns` for `done`.
+fn wait_for(mut done: impl FnMut() -> bool, ns: u64) -> bool {
+    let start = now_ns();
+    loop {
+        if done() {
+            return true;
+        }
+        if now_ns() - start > ns {
+            return done();
+        }
+        std::hint::spin_loop();
+    }
+}
+
+impl<R: Regs> Rings<R> {
+    /// Send one verb to codec `cad` and wait for its answer.
+    fn exchange(&mut self, word: u32, cad: u32) -> Option<u32> {
         self.regs.w8(RIRBSTS, RIRBSTS_ACK);
         // What is in the RIRB already is not this verb's answer: a late one
         // of a verb that gave up, or a jack's own.
@@ -530,8 +861,9 @@ impl<R: Regs> Verbs for Rings<R> {
                     )
                 };
                 self.regs.w8(RIRBSTS, RIRBSTS_ACK);
-                // An unsolicited answer (a jack event) is not this one.
-                if ext & (1 << 4) == 0 {
+                // An unsolicited answer (a jack event) is not this one, nor
+                // a late one of another codec.
+                if ext & (1 << 4) == 0 && ext & 0xf == cad {
                     return Some(answer);
                 }
             }
@@ -571,9 +903,29 @@ impl Controller {
         let regs = Mapped(claim.map_regs()?);
         let gcap = regs.r16(GCAP);
         let (iss, oss) = (((gcap >> 8) & 0xf) as usize, ((gcap >> 12) & 0xf) as usize);
+        let bss = ((gcap >> 3) & 0x1f) as usize;
+        println!(
+            "udrv-hda: controller: GCAP {gcap:#06x} ({iss} in, {oss} out, {bss} bidirectional streams{}), GCTL {:#010x}",
+            if gcap & GCAP_64OK != 0 { ", 64-bit DMA" } else { ", 32-bit DMA" },
+            regs.r32(GCTL),
+        );
+        if gcap == 0xffff {
+            return Err("GCAP reads 0xffff: the controller is not answering (powered off, or its BAR not decoded)".into());
+        }
         if oss == 0 {
             return Err(format!("GCAP {gcap:#06x}: no output stream"));
         }
+        // Whatever ran on it before (the firmware, or a driver of this one
+        // that died before the kernel got to it) stops before the reset:
+        // a stream or a ring still fetching while the link goes down is
+        // what Linux stops first too.
+        regs.w8(CORBCTL, 0);
+        regs.w8(RIRBCTL, 0);
+        for n in 0..iss + oss + bss {
+            let ctl = SD_BASE + n * SD_LEN + SD_CTL;
+            regs.w32(ctl, regs.r32(ctl) & !SD_CTL_RUN);
+        }
+        regs.w16(WAKEEN, 0);
         let crst = |on: bool| {
             let v = regs.r32(GCTL);
             regs.w32(GCTL, if on { v | GCTL_CRST } else { v & !GCTL_CRST });
@@ -594,16 +946,29 @@ impl Controller {
         {
             return Err("the controller did not come out of reset".into());
         }
-        // Codecs get 521 us to say they are there.
+        // Codecs get 521 us to say they are there; a slow one is given up
+        // to 100 ms more before the controller is taken to have none.
         std::thread::sleep(Duration::from_millis(2));
-        let codecs = regs.r16(STATESTS);
+        let mut codecs = regs.r16(STATESTS) & 0x7fff;
         if codecs == 0 {
-            return Err("no codec answered after the reset".into());
+            wait_for(|| regs.r16(STATESTS) & 0x7fff != 0, 100_000_000);
+            codecs = regs.r16(STATESTS) & 0x7fff;
         }
+        println!("udrv-hda: codecs on the link: STATESTS {codecs:#06x}");
+        if codecs == 0 {
+            return Err("no codec answered after the reset (STATESTS 0): the board's audio may be off in the firmware setup, or this controller has no codec".into());
+        }
+        regs.w16(STATESTS, codecs);
         regs.w32(INTCTL, 0);
         // The CORB and RIRB in two pages, the buffer descriptors in one,
         // the ring after them.
         let dma = Dma::new(claim.bti, 3 * PAGE + RING_LEN, None)?;
+        if gcap & GCAP_64OK == 0 && dma.daddr + dma.len as u64 > 1 << 32 {
+            return Err(format!(
+                "the DMA memory is at {:#x}, above 4 GiB, and this controller only takes 32-bit addresses",
+                dma.daddr
+            ));
+        }
         let bdl = dma.daddr + 2 * PAGE as u64;
         let ring = dma.daddr + 3 * PAGE as u64;
         for i in 0..RING_LEN / SEGMENT {
@@ -620,19 +985,29 @@ impl Controller {
             verbs: rings,
             cad: codecs.trailing_zeros(),
         };
+        let paths = survey(&mut codec, codecs);
+        let path = choose(&paths).ok_or_else(|| {
+            format!(
+                "no codec has an output path (STATESTS {codecs:#06x}, {} verbs unanswered)",
+                codec.verbs.timeouts
+            )
+        })?;
+        let (best, present) = paths.iter().find(|(p, _)| *p == path).copied().unwrap();
+        println!(
+            "udrv-hda: playing on {}{} (score {})",
+            path.describe(),
+            if present {
+                ", something plugged in"
+            } else {
+                ""
+            },
+            score(&best, present)
+        );
+        codec.cad = path.cad;
+        let afg = path.afg;
         codec
-            .param(0, PAR_VENDOR_ID)
-            .ok_or("the codec does not answer")?;
-        let afg = codec
-            .audio_function()
-            .ok_or("the codec has no audio function")?;
-        let paths: Vec<_> = codec
-            .paths(afg)
-            .into_iter()
-            .map(|p| (p, codec.present(&p)))
-            .collect();
-        let path = choose(&paths).ok_or("the codec has no output path")?;
-        codec.route(afg, &path).ok_or("routing the output path")?;
+            .route(afg, &path)
+            .ok_or_else(|| format!("routing {}: the codec stopped answering", path.describe()))?;
         Ok(Controller {
             codec,
             afg,
@@ -709,6 +1084,49 @@ impl Controller {
         r.w32(self.sd + SD_CTL, TAG << 20 | SD_CTL_RUN);
         self.running = true;
     }
+}
+
+/// Every codec of `codecs` (the STATESTS bits) asked for its output paths,
+/// each with whether something is plugged into it; what each codec is and
+/// has is said on the log. A codec that does not answer, or has no audio
+/// function (a modem), is passed over.
+pub fn survey<V: Verbs>(codec: &mut Codec<V>, codecs: u16) -> Vec<(Path, bool)> {
+    let mut out = Vec::new();
+    for cad in (0..15).filter(|c| codecs & (1 << c) != 0) {
+        codec.cad = cad;
+        let Some(vendor) = codec.param(0, PAR_VENDOR_ID) else {
+            println!("udrv-hda: codec {cad}: no answer");
+            continue;
+        };
+        let Some(afg) = codec.audio_function() else {
+            println!("udrv-hda: codec {cad} ({vendor:#010x}): no audio function (a modem?)");
+            continue;
+        };
+        // In D0 before its pins are asked what is plugged in: a codec
+        // whose function wakes in D3 (many Realteks) senses nothing there.
+        let _ = codec.cmd(afg, VERB_SET_POWER_STATE, 0);
+        std::thread::sleep(Duration::from_millis(1));
+        let paths = codec.paths(afg);
+        println!(
+            "udrv-hda: codec {cad} ({vendor:#010x}), audio function {afg:#x}: {} output path(s)",
+            paths.len()
+        );
+        for p in paths {
+            let present = codec.present(&p);
+            println!(
+                "udrv-hda:   {}: {}, score {}",
+                p.describe(),
+                match (p.senses, present) {
+                    (false, _) => "cannot sense",
+                    (true, true) => "plugged in",
+                    (true, false) => "nothing plugged in",
+                },
+                score(&p, present)
+            );
+            out.push((p, present));
+        }
+    }
+    out
 }
 
 /// Claim controller `index`.
