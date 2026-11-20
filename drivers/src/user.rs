@@ -23,7 +23,7 @@
 //! an NVMe or an AHCI controller ([`crate::pci_disks`]), and drives one
 //! virtio disk only, the root of an aarch64 machine with no initrd
 //! ([`keep_boot_disk`]). Everywhere else the root comes from the initrd. And the first HD Audio controller that is not a
-//! GPU's goes unasked ([`leave_first_hda`]): `uhda=kernel` keeps it. And
+//! GPU's goes unasked ([`leave_first_hda`]), on every boot with a gateway. And
 //! the first four virtio input devices and the PC's i8042 ([`leave_input`]),
 //! whose events reach the consoles and `/sys` from their drivers too: the
 //! kernel has no driver for either.

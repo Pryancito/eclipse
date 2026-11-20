@@ -259,8 +259,8 @@ pub(super) fn init() -> DeviceResult {
     let (udriver, net_by_default) = crate::cmdline::user_devices(crate::KCONFIG.cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
     // The first HD Audio controller that is not a GPU's, for the driver in
-    // userspace that serves it as /dev/dsp and /dev/snd: `uhda=kernel`
-    // keeps it in the kernel.
+    // userspace that serves it as /dev/dsp and /dev/snd. A GPU's HDMI
+    // function and a second controller stay with the kernel's driver.
     if crate::cmdline::user_hda(crate::KCONFIG.cmdline) {
         zcore_drivers::user::leave_first_hda(udriver);
     }
