@@ -258,6 +258,16 @@ pub(super) fn init() -> DeviceResult {
     // Before any bus is probed: a disk it finds may be one to leave alone.
     let (udriver, net_by_default) = crate::cmdline::user_devices(crate::KCONFIG.cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
+    // The NVMe or AHCI controllers of an installed root (`ROOT=`), for the
+    // kernel's own driver: the root is mounted before any process runs.
+    // `rootdriver=user` leaves them to the driver in userspace instead, and
+    // init hands the root over once that driver serves it
+    // (`linux-object/src/fs/late_root.rs`): it hung on a real NVMe machine.
+    let cmdline = crate::KCONFIG.cmdline;
+    zcore_drivers::user::keep_root_controllers(
+        crate::cmdline::value(cmdline, "ROOT"),
+        crate::cmdline::value(cmdline, "rootdriver"),
+    );
     // The first HD Audio controller that is not a GPU's, for the driver in
     // userspace that serves it as /dev/dsp and /dev/snd. A GPU's HDMI
     // function and a second controller stay with the kernel's driver.

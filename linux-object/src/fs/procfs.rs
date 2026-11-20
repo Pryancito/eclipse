@@ -2542,10 +2542,10 @@ impl INode for ProcSysValueINode {
 /// hands the whole payload to `store` — per-write-not-per-byte, which is how
 /// `/proc/sys` files behave on Linux (`sysctl(8)` and `echo x > file` both
 /// issue one write of the complete new value).
-struct ProcSysWritableINode {
-    inode: usize,
-    generate: fn() -> String,
-    store: fn(&str) -> Result<()>,
+pub(crate) struct ProcSysWritableINode {
+    pub(crate) inode: usize,
+    pub(crate) generate: fn() -> String,
+    pub(crate) store: fn(&str) -> Result<()>,
 }
 
 impl INode for ProcSysWritableINode {
