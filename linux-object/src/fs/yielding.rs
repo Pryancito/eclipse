@@ -19,9 +19,28 @@ use lock::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// disk lets go well before.
 const SPINS: usize = 128;
 
+/// The lock depth every task runs at with no lock of its own (the measure
+/// `loader/src/linux/block_serve.rs` uses too).
+const TASK_LOCK_DEPTH: i32 = 1;
+
 /// `try_` until it gives the lock, spinning [`SPINS`] times and then
 /// giving the CPU away between tries.
 fn take<G>(mut try_: impl FnMut() -> Option<G>) -> G {
+    // A caller that holds a spin lock of its own -- a page of a program is
+    // read from its file with the VMO's lock held -- must not park with
+    // it: the next task of this CPU to want that lock would spin on it for
+    // ever. It spins here instead, as it would on a plain spin lock; the
+    // holder of this one is running, or parked holding nothing. The VMO's
+    // lock is asked about by name: in the page fault a syscall takes on
+    // user memory, the depth alone did not show it.
+    if lock::lock_depth() > TASK_LOCK_DEPTH || zircon_object::vm::family_lock_held_here() {
+        loop {
+            if let Some(guard) = try_() {
+                return guard;
+            }
+            core::hint::spin_loop();
+        }
+    }
     for _ in 0..SPINS {
         if let Some(guard) = try_() {
             return guard;
