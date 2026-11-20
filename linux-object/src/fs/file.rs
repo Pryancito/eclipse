@@ -1656,6 +1656,26 @@ impl FileLike for File {
 
     fn write(&self, buf: &[u8]) -> LxResult<usize> {
         let mut inner = self.inner.write();
+        // A `/proc` setting is stored with the file's lock let go: it
+        // ignores the offset, and its store may read a disk served from
+        // userspace (`/proc/switch_root` reads the installed root's
+        // superblock). A wait for that disk with a kernel lock held can hang
+        // the CPU its driver needs.
+        if inner
+            .inode
+            .downcast_ref::<super::procfs::ProcSysWritableINode>()
+            .is_some()
+        {
+            if !inner.flags.writable() {
+                return Err(LxError::EBADF);
+            }
+            let inode = inner.inode.clone();
+            drop(inner);
+            let n = inode.write_at(0, buf)?;
+            let mut inner = self.inner.write();
+            inner.offset += n as u64;
+            return Ok(n);
+        }
         // The offset `FileInner::write` will actually try (O_APPEND writes at
         // the current end, not at `inner.offset`).
         let offset = if inner.flags.is_append() {
@@ -2155,6 +2175,8 @@ fn regular_file_readable_bytes(type_: FileType, size: usize, offset: u64) -> Opt
     }
 }
 
+#[cfg(test)]
+mod proc_write_tests;
 #[cfg(test)]
 mod seq_tests;
 
