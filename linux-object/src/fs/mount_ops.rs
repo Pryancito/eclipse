@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use zcore_drivers::wire::{IpAddress, Ipv4Address, Ipv6Address};
+use zcore_drivers::wire::IpAddress;
 
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -19,9 +19,6 @@ use super::block_mount::MountBackend;
 use super::btrfs_mount::open_btrfs;
 use super::eclipsefs_mount::open_eclipsefs;
 use super::flagged_fs::{wrap_fs, wrap_fs_at};
-use super::nfs::connect::TcpConnector;
-use super::nfs::greeting::Budget;
-use super::nfs::mount::{connect_export, connect_export_with_deadline};
 use super::nfs::source::{NfsOptions, NfsSource};
 use crate::net::dns::{self, DnsFamily};
 
@@ -264,14 +261,18 @@ pub fn mount_fs(
     // is not a path and `lookup_inode` on it is `ENOENT` — so the branch has
     // to come before the lookup and not after it.
     if is_network_fstype(fstype) {
-        // Served by a process (`eclipse-nfs`) unless nothing would serve it.
-        if ask_helper(fstype, flags, data) {
-            match super::served::helper::ask(source, &target_norm, fstype, flags, data) {
-                Err(LxError::ENODEV) => {}
-                done => return done,
-            }
-        }
-        return mount_nfs(source, &target_norm, &mount_node, flags, data);
+        // Served by a process (`eclipse-nfs`), which the mount helper
+        // starts: the kernel has no NFS client of its own. The strings are
+        // read here first, so a device string or an option nobody knows is
+        // `EINVAL` from the kernel, as it was when the kernel mounted it,
+        // and not whatever the server says about it.
+        NfsSource::parse(source)?;
+        let read_only = nfs_options_for(flags, data)?.read_only;
+        let flags = match read_only {
+            true => flags | super::mount_state::MS_RDONLY,
+            false => flags,
+        };
+        return ask_helper_for(source, &target_norm, fstype, flags, data);
     }
 
     // FAT is served by a process (`eclipse-fatfs`), which the mount helper
@@ -285,7 +286,7 @@ pub fn mount_fs(
             true => flags | super::mount_state::MS_RDONLY,
             false => flags,
         };
-        super::served::helper::ask(&source, &target_norm, fstype, flags, data)?;
+        ask_helper_for(&source, &target_norm, fstype, flags, data)?;
         hunter::media::note_mount(&source, &target_norm, fstype);
         return Ok(());
     }
@@ -298,7 +299,7 @@ pub fn mount_fs(
     // which the kernel then refuses with its own errno.
     if ask_helper(fstype, flags, data) {
         let absolute = absolute_source(proc, source);
-        match super::served::helper::ask(&absolute, &target_norm, fstype, flags, data) {
+        match ask_helper_for(&absolute, &target_norm, fstype, flags, data) {
             Err(LxError::ENODEV) => {}
             Err(e) => return Err(e),
             Ok(()) => {
@@ -326,12 +327,14 @@ pub fn mount_fs(
 /// flags and options goes to the mount helper first, to be served by a
 /// process. FAT always does: the kernel has none ([`mount_fs`]).
 ///
-/// btrfs, EclipseFS and NFS do on every boot but one that says
-/// `ufs=kernel`, and when nothing is asked that a served mount would drop:
-/// `nosuid`, `noexec`, `nodev` (a served mount keeps none of them), or for
-/// a filesystem on a device an option its server does not read (`subvol=`,
-/// `compress=`, ...). Those stay with the kernel's own code, which reads
-/// them.
+/// NFS always does too: the kernel has no NFS client, and a served mount
+/// keeps `nosuid`, `noexec` and `nodev` ([`ask_helper_for`]).
+///
+/// btrfs and EclipseFS do on every boot but one that says `ufs=kernel`,
+/// and when nothing is asked that their servers' mounts were not measured
+/// with: `nosuid`, `noexec`, `nodev`, or an option the server does not
+/// read (`subvol=`, `compress=`, ...). Those stay with the kernel's own
+/// code, which reads them.
 fn ask_helper(fstype: &str, flags: usize, data: &str) -> bool {
     let cmdline = kernel_hal::boot::cmdline();
     served_by_default(
@@ -344,6 +347,9 @@ fn ask_helper(fstype: &str, flags: usize, data: &str) -> bool {
 
 /// [`ask_helper`], with the boot's `ufs=` word given.
 pub(super) fn served_by_default(fstype: &str, flags: usize, data: &str, ufs: Option<&str>) -> bool {
+    if fstype == "nfs" {
+        return true;
+    }
     if ufs == Some("kernel") {
         return false;
     }
@@ -354,9 +360,6 @@ pub(super) fn served_by_default(fstype: &str, flags: usize, data: &str, ufs: Opt
         return false;
     }
     match fstype {
-        // Its options are the server's own: it parses them as the kernel
-        // does (`nfs3::source::NfsOptions`).
-        "nfs" => true,
         "btrfs" | "eclipsefs" => data
             .split(',')
             .map(str::trim)
@@ -406,6 +409,49 @@ fn absolute_source(proc: &LinuxProcess, source: &str) -> String {
     normalize_target(&alloc::format!("{}/{}", cwd.trim_end_matches('/'), source))
 }
 
+/// The flags of the `mount(2)`s the helper is making, by target: what
+/// [`mount_served`] gives the mount its server makes there.
+static ASKED: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+/// The flags of `mount(2)` a served mount keeps, besides `MS_RDONLY`,
+/// which its server is told.
+const KEPT_FLAGS: usize = mount_state::MS_NOSUID | mount_state::MS_NODEV | mount_state::MS_NOEXEC;
+
+/// Have the mount helper make this mount, with its server: see
+/// [`super::served::helper::ask`]. The server makes it from its own
+/// process, through [`mount_served`], and that mount keeps the
+/// `nosuid`, `nodev` and `noexec` asked for here.
+fn ask_helper_for(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: usize,
+    data: &str,
+) -> LxResult<()> {
+    let kept = flags & KEPT_FLAGS;
+    if kept != 0 {
+        ASKED.lock().push((String::from(target), kept));
+    }
+    let done = super::served::helper::ask(source, target, fstype, flags, data);
+    if kept != 0 {
+        let mut asked = ASKED.lock();
+        if let Some(i) = asked.iter().position(|(at, _)| at == target) {
+            asked.remove(i);
+        }
+    }
+    done
+}
+
+/// The flags a `mount(2)` asked for at `target` that a served mount there
+/// keeps: see [`ask_helper_for`].
+fn asked_at(target: &str) -> usize {
+    ASKED
+        .lock()
+        .iter()
+        .find(|(at, _)| at == target)
+        .map_or(0, |(_, flags)| *flags)
+}
+
 /// Mount at `target` a filesystem that a process serves
 /// ([`served`](super::served)) and return where it was mounted.
 /// `source` and `fstype` are what its line of the mount table says.
@@ -421,7 +467,8 @@ pub(crate) fn mount_served(
 ) -> LxResult<String> {
     let target_norm = normalize_target(target);
     let mount_node = resolve_mnode(&target_norm)?;
-    let flags = if read_only { mount_state::MS_RDONLY } else { 0 };
+    let read_only = if read_only { mount_state::MS_RDONLY } else { 0 };
+    let flags = read_only | asked_at(&target_norm);
     let (fs, state) = prepare_fs(fs, flags, "");
     mount_node.mount(fs).map_err(LxError::from)?;
     // `served` is the word that tells this mount's line from one of the
@@ -433,67 +480,6 @@ pub(crate) fn mount_served(
     // hunter queues it for the same scan.
     hunter::media::note_mount(source, &target_norm, fstype);
     Ok(target_norm)
-}
-
-/// `mount -t nfs host:/export target`.
-///
-/// Everything network-specific is here and nothing of it leaks into the
-/// block path: the device string is split, the options are parsed, the
-/// server is dialled, and what comes back goes into the tree and the table
-/// the same way a block filesystem does.
-///
-/// `hunter::media::note_mount` is deliberately not called. It queues a newly
-/// mounted filesystem for an antivirus scan, which is right for a USB stick
-/// and wrong for an export: the scan would read the whole of a remote
-/// filesystem over the network at mount time, and the thing it guards
-/// against — a stick carried in and plugged in — is not what an export is.
-pub(crate) fn mount_nfs(
-    source: &str,
-    target: &str,
-    mount_node: &Arc<MNode>,
-    flags: usize,
-    data: &str,
-) -> LxResult<()> {
-    mount_nfs_with_deadline(source, target, mount_node, flags, data, None)
-}
-
-/// [`mount_nfs`] with the deadline given rather than derived from the
-/// options.
-///
-/// `None` is [`mount_nfs`]'s own behaviour: a fresh budget sized by
-/// [`greeting_budget`](super::nfs::greeting::greeting_budget). `Some` is for
-/// `/etc/fstab`, which shares one deadline across every network line in the
-/// run — see [`connect_export_with_deadline`].
-pub(crate) fn mount_nfs_with_deadline(
-    source: &str,
-    target: &str,
-    mount_node: &Arc<MNode>,
-    flags: usize,
-    data: &str,
-    budget: Option<&Budget>,
-) -> LxResult<()> {
-    let parsed = NfsSource::parse(source)?;
-    let opts = nfs_options_for(flags, data)?;
-    let addr = match opts.addr {
-        Some(core::net::IpAddr::V4(a)) => IpAddress::Ipv4(Ipv4Address::from_bytes(&a.octets())),
-        Some(core::net::IpAddr::V6(a)) => IpAddress::Ipv6(Ipv6Address::from_bytes(&a.octets())),
-        // No resolver reachable from here: see `nfs_host_to_resolve`, which
-        // is how the syscall layer resolves a name before this runs. A name
-        // that gets this far is one nothing local knows.
-        None => server_address(&parsed.host)?,
-    };
-    let mut connector = TcpConnector::new(addr);
-    let mounted = match budget {
-        Some(budget) => connect_export_with_deadline(&mut connector, &parsed, &opts, budget)?,
-        None => connect_export(&mut connector, &parsed, &opts)?,
-    };
-    let (fs, state) = prepare_fs(mounted.fs, flags, data);
-    mount_node.mount(fs).map_err(LxError::from)?;
-    let line = build_options_string(flags, data);
-    // The device column keeps `host:/export` as it was written, which is
-    // what Linux records (`fc->source`) and what an `umount` names.
-    super::register_mount(source, target, "nfs", &line, Some(state));
-    Ok(())
 }
 
 /// Whether `fstype`, as [`parse_fstype`] spells it, is mounted over the
@@ -523,18 +509,6 @@ fn nfs_options_for(flags: usize, data: &str) -> LxResult<NfsOptions> {
         opts.read_only = true;
     }
     Ok(opts)
-}
-
-/// The server's address without asking the network: a literal, or a name
-/// `/etc/hosts` knows.
-///
-/// `ENOENT` when it is neither, which is the errno [`dns::resolve`] answers
-/// for a name that does not resolve: a name that reaches here has already
-/// been through the syscall layer's resolver, or has come from a caller that
-/// has none, and either way nothing local knows it.
-fn server_address(host: &str) -> LxResult<IpAddress> {
-    let root = super::dns_vfs_root().ok_or(LxError::ENOENT)?;
-    dns::resolve_local(&root, host, DnsFamily::Unspec).ok_or(LxError::ENOENT)
 }
 
 /// The hostname a network mount names and cannot resolve by itself, or
@@ -1030,13 +1004,34 @@ mod tests {
         );
     }
 
-    /// btrfs, EclipseFS and NFS are served by a process unless the boot
-    /// keeps them for the kernel or the mount asks what a served one
-    /// would drop.
+    /// What a `mount(2)` asked of the helper is kept for the served mount
+    /// only while the helper is being asked: with no helper the call is
+    /// `ENODEV`, and nothing is left behind for a later mount there.
+    #[test]
+    fn the_flags_kept_for_a_served_mount_last_as_long_as_the_ask() {
+        use super::mount_state::{MS_NOEXEC, MS_NOSUID};
+        use super::{ask_helper_for, asked_at};
+        let target = "/mnt/asked-flags-test";
+        assert_eq!(
+            ask_helper_for(
+                "nas:/srv",
+                target,
+                "nfs",
+                MS_NOSUID | MS_NOEXEC | MS_RDONLY,
+                ""
+            ),
+            Err(LxError::ENODEV)
+        );
+        assert_eq!(asked_at(target), 0);
+    }
+
+    /// btrfs and EclipseFS are served by a process unless the boot keeps
+    /// them for the kernel or the mount asks what their servers' mounts
+    /// were not measured with. NFS always is: the kernel has no client.
     #[test]
     fn what_is_served_by_default_and_what_stays_with_the_kernel() {
         use super::served_by_default as served;
-        for fstype in ["btrfs", "eclipsefs", "nfs"] {
+        for fstype in ["btrfs", "eclipsefs"] {
             assert!(served(fstype, 0, "", None), "{}", fstype);
             assert!(
                 served(fstype, MS_RDONLY, "defaults,noatime", None),
@@ -1059,6 +1054,11 @@ mod tests {
         assert!(!served("btrfs", 0, "compress=zstd", None));
         assert!(served("eclipsefs", 0, "x-systemd.automount, noatime", None));
         assert!(served("nfs", 0, "vers=3,rsize=65536,addr=10.0.0.3", None));
+        assert!(served("nfs", 0, "", Some("kernel")), "nfs: no way back");
+        assert!(
+            served("nfs", 8, "nosuid,nodev", None),
+            "nfs: kept by the mount"
+        );
         // FAT is the helper's whatever is asked (`mount_fs`), and nothing
         // else is.
         assert!(!served("vfat", 0, "", None));

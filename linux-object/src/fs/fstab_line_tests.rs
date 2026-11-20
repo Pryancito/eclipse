@@ -11,8 +11,7 @@
 use super::*;
 
 /// `noauto` is `mount -a`'s own rule: the line exists for a later `mount
-/// /mnt`, and boot leaves it alone. It is the escape hatch that makes
-/// [`FSTAB_NETWORK_BUDGET_MS`] something a user can avoid entirely.
+/// /mnt`, and boot leaves it alone.
 #[test]
 fn boot_skips_a_line_that_says_noauto() {
     assert!(fstab_has_option("noauto", "noauto"));
@@ -129,26 +128,6 @@ fn defaults_reaches_the_filesystem_as_no_options_at_all() {
     );
 }
 
-/// The whole run shares one budget, so the bound at boot is on the run and
-/// not on the line.
-///
-/// The arithmetic the constant exists to stop: a minute per line means an
-/// fstab with three unreachable servers holds the deferred task — and the
-/// shell — for three minutes. Asserted against `greeting_budget`'s own
-/// default so the two cannot drift apart silently.
-#[test]
-fn the_whole_fstab_run_is_bounded_and_not_each_of_its_lines() {
-    let per_mount =
-        crate::fs::nfs::greeting::greeting_budget(&crate::fs::nfs::source::NfsOptions::default());
-    assert!(
-        FSTAB_NETWORK_BUDGET_MS <= per_mount,
-        "a run of network lines must not be allowed more time than one \
-         mount(2) gets: {} vs {}",
-        FSTAB_NETWORK_BUDGET_MS,
-        per_mount
-    );
-}
-
 /// A network line is routed by **type**, before anything looks its source
 /// up.
 ///
@@ -260,45 +239,13 @@ fn a_netdev_line_is_mounted_because_this_run_is_already_the_late_one() {
     );
 }
 
-/// The run's deadline is built once and handed out again, so the second
-/// network line gets what the first left of it.
-///
-/// Measured against the real clock, because that is the only clock a
-/// `Budget` reads: a fresh deadline and a shared one are the same number
-/// until time actually passes.
-#[test]
-fn the_runs_deadline_is_built_once_and_handed_out_again() {
-    const BURN_MS: u64 = 30;
-    let mut slot: Option<Budget> = None;
-    assert!(slot.is_none(), "nothing is built before a line needs one");
-
-    let now = || kernel_hal::timer::timer_now().as_millis() as u64;
-    let first = run_budget(&mut slot)
-        .left(now())
-        .expect("time to start with");
-    let start = now();
-    while (kernel_hal::timer::timer_now().as_millis() as u64) < start + BURN_MS {
-        core::hint::spin_loop();
-    }
-    let second = run_budget(&mut slot).left(now()).expect("time still left");
-
-    assert!(
-        first >= second + BURN_MS / 2,
-        "the second line got {} ms of a deadline that started at {} ms, \
-         after {} ms had passed: a fresh minute per line, which is the \
-         arithmetic the shared deadline exists to stop",
-        second,
-        first,
-        BURN_MS
-    );
-}
-
-/// Every FAT line is the server's: the kernel has no FAT to keep one. A
-/// btrfs, EclipseFS or NFS line is when the root has the service that
-/// mounts it and the boot does not keep it for the kernel.
+/// Every FAT and NFS line is the server's: the kernel has no FAT and no
+/// NFS client to keep one. A btrfs or EclipseFS line is when the root has
+/// the service that mounts it and the boot does not keep it for the
+/// kernel.
 #[test]
 fn a_line_is_left_to_its_server() {
-    for fstype in ["vfat", "msdos", "FAT32", "fat16", "fat"] {
+    for fstype in ["vfat", "msdos", "FAT32", "fat16", "fat", "nfs", "NFS3"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
         for has_service in [true, false] {
             for ufs in [None, Some("kernel")] {
@@ -310,7 +257,8 @@ fn a_line_is_left_to_its_server() {
             }
         }
     }
-    for fstype in ["btrfs", "eclipsefs", "nfs"] {
+    assert!(left_to_server("nfs", "noexec,nosuid", None, true));
+    for fstype in ["btrfs", "eclipsefs"] {
         let parsed = mount_ops::parse_fstype(fstype).unwrap();
         assert!(left_to_server(parsed, "defaults", None, true), "{}", fstype);
         assert!(
