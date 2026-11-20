@@ -33,6 +33,10 @@ La consola serie va a una terminal [xterm.js](https://xtermjs.org/) a través de
 [xterm-pty](https://github.com/mame/xterm-pty). En un portátil normal el
 intérprete de órdenes sale en unos 20-25 segundos.
 
+Con red, `live/live.js` cambia `-nic none` por
+`-netdev socket,id=net0,connect=eclipse-net:8888 -device virtio-net-device,netdev=net0`
+(ver «La red», abajo).
+
 `init.quiet` es una opción de `eclipse-init`: sus líneas `[eclipse-init] ...` y
 lo que imprimen los scripts de teclado, idioma y zona horaria van a
 `/run/eclipse-init.log` en vez de a la consola, para que no caigan en medio de
@@ -50,6 +54,23 @@ quitan `lunar*`, `apk`, `wavplay`, los `*-probe`, `ecl-compute`,
 - `boot-sound`: no hay tarjeta de sonido.
 
 Queda en 15 MB (8 MB con gzip).
+
+### La red
+
+En Emscripten el socket TCP de `-netdev socket` es un WebSocket. `live/net.js`
+pone en su lugar uno falso que no sale del navegador: recibe las tramas
+Ethernet de QEMU y se las da a la pila TCP/IP de
+[v86](https://github.com/copy/v86) (`fake_network.js`), que contesta DHCP
+(Eclipse recibe 192.168.86.100), ARP, ping y NTP, y resuelve DNS por DoH. Cada
+conexión TCP de Eclipse sale como un stream de
+[Wisp](https://github.com/MercuryWorkshop/wisp-protocol) por `wss://…/wisp/`
+hasta un servidor que abre la conexión de verdad. Ese servidor, su nginx y lo
+que permite (solo los puertos 80 y 443, ninguna IP privada) están en
+`deploy/wisp/` del repositorio de la web.
+
+Dentro de Eclipse la tarjeta la lleva `eclipse-netstack` (`unet.service`), y
+pide su dirección por DHCP medio minuto después de que salga el intérprete. Con
+`?net=0` en la URL la máquina arranca sin red.
 
 ## Construirlo
 
@@ -84,6 +105,8 @@ El repositorio de la web trae la configuración para nginx
 
 - Funciona en Chrome, Edge y Firefox recientes. Safari no tiene
   `COEP: credentialless`, así que allí la página dice que no puede.
-- Sin red, sin escritorio y sin disco persistente: todo se pierde al recargar.
+- La red es solo TCP saliente (UDP no sale) y solo a los puertos que deje el
+  servidor Wisp. Sin escritorio y sin disco persistente: todo se pierde al
+  recargar.
 - Es riscv64, no x86_64: un PC completo (UEFI, q35, 4 GB) en WebAssembly sería
   demasiado lento y demasiado grande para descargarlo.
