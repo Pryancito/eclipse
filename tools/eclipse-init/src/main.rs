@@ -33,6 +33,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod control;
+mod skipped;
 mod switch_root;
 
 /// A respawn service that exits sooner than this after starting is treated as
@@ -976,6 +977,7 @@ fn main() {
     let left = fs::read_to_string("/proc/udrivers").ok();
     // What stays drives the device the list names: that is what the state
     // file says of it.
+    let mut not_left = Vec::new();
     services.retain(|name, s| match s.udriver.as_deref() {
         None => true,
         Some(device) => match udriver_device(left.as_deref(), &boot_cmdline, device) {
@@ -984,13 +986,17 @@ fn main() {
                 true
             }
             None => {
-                log(&format!(
-                    "{name}: skipped (the kernel left no '{device}' to userspace; 'udriver={device}' on its cmdline asks for it)"
-                ));
+                not_left.push((name.clone(), device.to_string()));
                 false
             }
         },
     });
+    // Why, from what is on the bus: see `skipped`.
+    if !not_left.is_empty() {
+        skipped::lines(&not_left, &skipped::bus())
+            .iter()
+            .for_each(|l| log(l));
+    }
 
     // The installed root, when its disk comes from a driver this init
     // starts: the kernel kept the boot medium as `/` and awaits it. See
