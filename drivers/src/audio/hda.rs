@@ -3626,7 +3626,8 @@ impl PciDriver for HdaDriverPci {
         // controller whatever the command line says. The bus turned its
         // memory decoding and bus mastering on already (`bus::pci`).
         // With no `udriver=hda@N`, the first that is not a GPU's is left
-        // all the same (`uhda=kernel` keeps it: `user::leave_first_hda`).
+        // all the same (`user::leave_first_hda`). A GPU's HDMI function is
+        // the kernel's: its driver in userspace has no output for it.
         if crate::user::reserve_hda(
             dev.id.vendor_id == 0x10de,
             crate::user::Transport::Pci,
