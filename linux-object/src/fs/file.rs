@@ -792,6 +792,10 @@ pub(crate) fn cache_overlay_write(inode: &Arc<dyn INode>, offset: usize, buf: &[
     let Some(vmo) = cache_vmo_of(inode) else {
         return;
     };
+    // The inode has the bytes now; a page of the cache being read from it
+    // with no lock held may have read the old ones, and it is not committed
+    // yet, so the loop below would not see it. It is read again.
+    vmo.note_source_change();
     let end = offset + buf.len();
     let last = (end - 1) / PAGE_SIZE;
     for page in offset / PAGE_SIZE..=last {
@@ -815,6 +819,8 @@ pub(crate) fn cache_reload(inode: &Arc<dyn INode>, offset: usize, len: usize) {
     let Some(vmo) = cache_vmo_of(inode) else {
         return;
     };
+    // Same as `cache_overlay_write`: a page being read meanwhile is read again.
+    vmo.note_source_change();
     let end = offset.saturating_add(len).min(vmo.len());
     let mut page = alloc::vec![0u8; PAGE_SIZE];
     let mut at = offset / PAGE_SIZE * PAGE_SIZE;

@@ -1303,6 +1303,17 @@ fn resolve_irelative_x86_64(
     let mut resolved = alloc::vec::Vec::with_capacity(entries.len());
     // One CR3 write for the whole batch rather than one per entry; nothing
     // between entries needs the kernel's own address space.
+    //
+    // What was loaded goes back afterwards, not the kernel's table: an
+    // `execve` relocates the new image after its address space is already
+    // the process's (and loaded), and goes back to user mode in the same
+    // poll. With the kernel's table loaded there, the new program faulted at
+    // its first instruction for ever: each fault mapped the page into the
+    // process's table, and the CPU went on translating through the kernel's
+    // (an installed system's first boot, now and then). It only worked when
+    // something on the way out gave the CPU away and the thread was taken
+    // up again, address space and all.
+    let loaded = kernel_hal::vm::current_vmtoken();
     kernel_hal::vm::activate_paging(vmar.table_phys());
 
     let mut aborted = false;
@@ -1350,7 +1361,7 @@ fn resolve_irelative_x86_64(
         }
     }
 
-    kernel_hal::vm::activate_kernel_paging();
+    kernel_hal::vm::activate_paging(loaded);
     unmap_scratch();
     Ok(resolved)
 }
