@@ -46,9 +46,10 @@ pub fn init() {
     // there is no initrd: the root comes from that one, and it is the one
     // disk the kernel still drives.
     zcore_drivers::user::keep_boot_disk(super::init_ram_disk().is_none());
-    // The first virtio input devices, for their drivers in userspace,
-    // which still reach the consoles: `uinput=kernel` keeps them.
-    zcore_drivers::user::leave_input(udriver, crate::cmdline::user_virtio_input(&cmdline), false);
+    // The virtio input devices, for their drivers in userspace, which
+    // still reach the consoles: the kernel has none.
+    zcore_drivers::user::leave_input(crate::cmdline::user_input(&cmdline));
+    crate::cmdline::warn_retired(&cmdline);
     let slot0 = unsafe { &mut *(phys_to_virt(VIRTIO_BASE) as *mut VirtIOHeader) };
     if !reserved_for_userspace(slot0, 0) {
         if let Ok(virtio_blk) = VirtIoBlk::new(slot0) {

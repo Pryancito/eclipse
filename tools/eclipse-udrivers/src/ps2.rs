@@ -1,6 +1,6 @@
 //! The PC's i8042 keyboard controller, with a keyboard on its first port
-//! and a mouse on its aux port, as a process drives it: what
-//! `drivers/src/input/ps2_input.rs` does in the kernel, port for port, but
+//! and a mouse on its aux port, as a process drives it: what the kernel's
+//! own driver (`drivers/src/input/ps2_input.rs`, deleted) did, port for port, but
 //! through [`claim::port_in`] and [`claim::port_out`] and with timeouts in
 //! time rather than in turns of a loop.
 //!

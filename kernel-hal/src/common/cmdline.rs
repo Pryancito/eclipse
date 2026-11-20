@@ -134,25 +134,45 @@ pub fn user_e1000e(cmdline: &str) -> bool {
 
 /// Whether a boot leaves its first HD Audio controller to the driver in
 /// userspace without naming it (`zcore_drivers::user::leave_first_hda`),
-/// which serves it as `/dev/dsp` and `/dev/snd`, with `uhda=kernel` the
-/// boot that keeps it in the kernel and `zircon.gateway=0` the one that
-/// has no gateway for that driver.
+/// which serves it as `/dev/dsp` and `/dev/snd`: every boot but the one
+/// that has no gateway for that driver (`zircon.gateway=0`). The kernel's
+/// own HD Audio driver is for what that driver does not take: a GPU's
+/// HDMI function, a second controller.
 pub fn user_hda(cmdline: &str) -> bool {
-    value(cmdline, "uhda") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+    !is_off(cmdline, "zircon.gateway")
 }
 
-/// Whether a boot leaves its first virtio input devices to the driver in
-/// userspace without naming them (`zcore_drivers::user::leave_input`): as
-/// [`user_hda`], with `uinput=kernel` the boot that keeps them in the
-/// kernel.
-pub fn user_virtio_input(cmdline: &str) -> bool {
-    value(cmdline, "uinput") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+/// Whether a boot leaves its virtio input devices and the PC's i8042 to
+/// their drivers in userspace (`zcore_drivers::user::leave_input`). The
+/// kernel has no driver for either: a boot that shut the gateway those
+/// drivers claim their devices through (`zircon.gateway=0`) has no
+/// keyboard or mouse but the serial line's.
+pub fn user_input(cmdline: &str) -> bool {
+    !is_off(cmdline, "zircon.gateway")
 }
 
-/// The same for the PC's i8042, its keyboard and its mouse: `ups2=kernel`
-/// keeps it in the kernel.
-pub fn user_i8042(cmdline: &str) -> bool {
-    value(cmdline, "ups2") != Some("kernel") && !is_off(cmdline, "zircon.gateway")
+/// The words of the command line that kept a device in the kernel, whose
+/// driver the kernel no longer has: still read, to tell whoever wrote one
+/// that it says nothing now.
+pub const RETIRED: &[(&str, &str)] =
+    &[("uinput", "kernel"), ("ups2", "kernel"), ("uhda", "kernel")];
+
+/// Say each [`RETIRED`] word this command line has, once, at boot.
+pub fn warn_retired(cmdline: &str) {
+    for (key, value) in retired(cmdline) {
+        crate::klog_warn!(
+            "{key}={value} says nothing now: that device is its driver's in userspace on every boot; ignored"
+        );
+    }
+}
+
+/// The [`RETIRED`] words this command line says, in its own order.
+pub fn retired(cmdline: &str) -> impl Iterator<Item = (&str, &str)> {
+    pairs(cmdline).filter(|(k, v)| {
+        RETIRED
+            .iter()
+            .any(|(rk, rv)| k.eq_ignore_ascii_case(rk) && v == rv)
+    })
 }
 
 /// Whether `key` is on, when it also belongs to a group that `umbrella` turns
@@ -909,19 +929,28 @@ mod tests {
     }
 
     #[test]
-    fn the_first_hda_is_userspace_s_unless_the_boot_keeps_it() {
+    fn the_first_hda_is_userspace_s_on_every_boot_with_a_gateway() {
         assert!(user_hda(""));
-        assert!(!user_hda("LOG=warn:uhda=kernel"));
+        assert!(
+            user_hda("LOG=warn:uhda=kernel"),
+            "uhda=kernel says nothing now"
+        );
         assert!(!user_hda("zircon.gateway=0"));
-        assert!(user_hda("notuhda=kernel"));
+        assert_eq!(retired("uhda=kernel").count(), 1);
     }
 
     #[test]
-    fn input_is_userspace_s_unless_the_boot_keeps_it() {
-        assert!(user_virtio_input("") && user_i8042(""));
-        assert!(!user_virtio_input("uinput=kernel") && user_i8042("uinput=kernel"));
-        assert!(!user_i8042("LOG=warn:ups2=kernel") && user_virtio_input("ups2=kernel"));
-        assert!(!user_virtio_input("zircon.gateway=0") && !user_i8042("zircon.gateway=0"));
+    fn input_is_userspace_s_whatever_the_boot_says_but_with_no_gateway() {
+        assert!(user_input(""));
+        assert!(user_input("uinput=kernel:ups2=kernel"));
+        assert!(!user_input("zircon.gateway=0"));
+    }
+
+    #[test]
+    fn the_words_that_kept_input_in_the_kernel_are_found_to_be_warned_about() {
+        let said: alloc::vec::Vec<_> = retired("LOG=warn:uinput=kernel:ups2=kernel").collect();
+        assert_eq!(said, [("uinput", "kernel"), ("ups2", "kernel")]);
+        assert_eq!(retired("uinput=user:notups2=kernel").count(), 0);
     }
 
     #[test]

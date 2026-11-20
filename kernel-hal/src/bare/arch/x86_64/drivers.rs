@@ -10,7 +10,7 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use zcore_drivers::irq::x86::Apic;
 use zcore_drivers::prelude::{IrqPolarity, IrqTriggerMode};
-use zcore_drivers::scheme::{IrqScheme, SchemeUpcast};
+use zcore_drivers::scheme::IrqScheme;
 use zcore_drivers::uart::{BufferedUart, Uart16550Pmio};
 use zcore_drivers::{Device, DeviceResult};
 
@@ -259,19 +259,15 @@ pub(super) fn init() -> DeviceResult {
     let (udriver, net_by_default) = crate::cmdline::user_devices(crate::KCONFIG.cmdline);
     zcore_drivers::user::set_reservation(udriver, net_by_default);
     // The first HD Audio controller that is not a GPU's, for the driver in
-    // userspace that serves it as /dev/dsp and /dev/snd: `uhda=kernel`
-    // keeps it in the kernel.
+    // userspace that serves it as /dev/dsp and /dev/snd. A GPU's HDMI
+    // function and a second controller stay with the kernel's driver.
     if crate::cmdline::user_hda(crate::KCONFIG.cmdline) {
         zcore_drivers::user::leave_first_hda(udriver);
     }
-    // The first virtio input devices and the i8042, for their drivers in
-    // userspace, which still reach the consoles: `uinput=kernel` and
-    // `ups2=kernel` keep them in the kernel.
-    zcore_drivers::user::leave_input(
-        udriver,
-        crate::cmdline::user_virtio_input(crate::KCONFIG.cmdline),
-        crate::cmdline::user_i8042(crate::KCONFIG.cmdline),
-    );
+    // The virtio input devices and the i8042, for their drivers in
+    // userspace, which still reach the consoles: the kernel has none.
+    zcore_drivers::user::leave_input(crate::cmdline::user_input(crate::KCONFIG.cmdline));
+    crate::cmdline::warn_retired(crate::KCONFIG.cmdline);
     // The e1000e too, on this architecture, where its driver in userspace
     // has been run and measured: `unetcard=kernel` keeps it in the kernel.
     if crate::cmdline::user_e1000e(crate::KCONFIG.cmdline) {
@@ -316,17 +312,10 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
-    // PS/2 Keyboard and Mouse initialization and registration, unless the
-    // boot leaves the i8042 to a driver in userspace (`udriver=i8042@0`):
-    // then nothing here touches it, and its two lines are that driver's.
-    if !zcore_drivers::user::reserve_i8042() {
-        let ps2_input = Arc::new(zcore_drivers::input::Ps2Input::new());
-        irq.register_device(trap::X86_ISA_IRQ_KEYBOARD, ps2_input.clone().upcast())?;
-        irq.unmask(trap::X86_ISA_IRQ_KEYBOARD)?;
-        irq.register_device(trap::X86_ISA_IRQ_MOUSE, ps2_input.clone().upcast())?;
-        irq.unmask(trap::X86_ISA_IRQ_MOUSE)?;
-        drivers::add_device(Device::Input(ps2_input));
-    }
+    // The PS/2 keyboard and mouse are the i8042 driver's in userspace:
+    // nothing here touches the controller, and its two lines are that
+    // driver's. The kernel has no driver for it.
+    zcore_drivers::user::reserve_i8042();
     // ACPI power button (SCI) — OPT-IN via `acpi.powerbtn`, default OFF.
     //
     // The SCI is a LEVEL-triggered, SHARED ACPI interrupt: on real hardware the

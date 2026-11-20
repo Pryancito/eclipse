@@ -457,8 +457,8 @@ mod mouse_tests {
     /// `update` runs **once per input event**, which on a moving pointer is
     /// three or four events per report and a report per hardware packet --
     /// 125 of them a second on a default PS/2 sample rate, more on USB. The
-    /// inbound half, where a hardware packet becomes those events, is
-    /// `ps2_input::tests::benches`. Pure arithmetic over a 16-byte struct, so
+    /// inbound half, where a hardware packet becomes those events, is the
+    /// i8042 driver's in userspace (`tools/eclipse-udrivers/src/ps2.rs`). Pure arithmetic over a 16-byte struct, so
     /// these figures are exact; what they leave out is the listener and the
     /// lock around them, which `handle_input_event` adds and no bench here
     /// can reach without a scheme and a subscriber.

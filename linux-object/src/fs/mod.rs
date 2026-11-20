@@ -2421,11 +2421,8 @@ pub async fn mount_vfs_fstab(root: &Arc<MNode>) {
 /// blocking block-device I/O that must not run on the early-boot path before
 /// the shell appears.
 ///
-/// `async` because a network line may name a server by a name only DNS
-/// knows; see [`mount_fstab_network`]. The caller already runs this inside
-/// an executor, which is what makes resolving from here possible at all —
-/// `mount_fs` itself is synchronous and is called from places that have no
-/// executor, which is why `addr=` exists.
+/// `async` for its callers, which run it inside an executor. A network
+/// line is not the kernel's: `eclipse-fs-mounts` mounts it, with a server.
 pub async fn mount_fstab_deferred() {
     match mount_ops::vfs_root() {
         Some(root) => {
@@ -2436,17 +2433,10 @@ pub async fn mount_fstab_deferred() {
     }
 }
 
-use fstab_line::{
-    fstab_flags, fstab_line_action, left_to_server, mount_fstab_network, run_budget, FstabAction,
-    FS_MOUNTS_SERVICE,
-};
+use fstab_line::{fstab_flags, fstab_line_action, left_to_server, FstabAction, FS_MOUNTS_SERVICE};
 
 async fn mount_fstab(root: &Arc<MNode>) {
     info!("mount_fstab: parsing /etc/fstab");
-    // Built on the first network line and not before, so a fstab with no
-    // network line spends none of it and the clock starts when the first
-    // server is actually dialled.
-    let mut net_budget: Option<Budget> = None;
     // The FAT lines are a server process's, started by a service of this
     // root filesystem: the kernel has no FAT. So are the btrfs, EclipseFS
     // and NFS lines, on a root that has the service, unless the boot says
@@ -2486,24 +2476,7 @@ async fn mount_fstab(root: &Arc<MNode>) {
                                 warn!("mount_fstab: unsupported fstype {:?}: {:?}", fstype, e);
                                 continue;
                             }
-                            FstabAction::Network(fstype_parsed)
-                                if left_to_server(fstype_parsed, options, ufs, has_fs_service) =>
-                            {
-                                info!("mount_fstab: {:?} is left to its server", target);
-                                continue;
-                            }
-                            FstabAction::Network(fstype_parsed) => {
-                                mount_fstab_network(
-                                    root,
-                                    source,
-                                    target,
-                                    fstype_parsed,
-                                    options,
-                                    run_budget(&mut net_budget),
-                                )
-                                .await;
-                                continue;
-                            }
+                            FstabAction::Network(fstype_parsed) => fstype_parsed,
                             FstabAction::Block(fstype_parsed) => fstype_parsed,
                         };
                         if left_to_server(fstype_parsed, options, ufs, has_fs_service) {
@@ -2511,8 +2484,8 @@ async fn mount_fstab(root: &Arc<MNode>) {
                                 info!("mount_fstab: {:?} is left to its server", target);
                             } else {
                                 warn!(
-                                    "mount_fstab: {:?} is FAT, and this root has no {} to mount it",
-                                    target, FS_MOUNTS_SERVICE
+                                    "mount_fstab: {:?} is {}, and this root has no {} to mount it",
+                                    target, fstype_parsed, FS_MOUNTS_SERVICE
                                 );
                             }
                             continue;
@@ -2617,7 +2590,6 @@ pub use mount_ops::{
 pub use mount_state::{
     check_umount_flags, MS_BIND, MS_MOVE, MS_REMOUNT, ST_VALID, UMOUNT_NOFOLLOW,
 };
-use nfs::greeting::Budget;
 
 /// VFS root for kernel services that need to read `/etc/*` (e.g. DNS/hosts).
 pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {
