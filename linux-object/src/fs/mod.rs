@@ -677,6 +677,40 @@ pub(crate) fn audio_cards_alsa_order() -> Vec<Arc<dyn zcore_drivers::scheme::Aud
     v.into_iter().map(|(_, _, a)| a).collect()
 }
 
+/// The card number the kernel's first audio card takes: 1 when an HD Audio
+/// controller was left to its driver in userspace, which serves card 0
+/// (`/dev/dsp`, `/dev/snd/controlC0`, `/dev/snd/pcmC0D0p`; `udrv-hda`),
+/// else 0. The controller left to userspace is the board's own (a GPU's
+/// HDMI function stays in the kernel: `user::reserve_hda`), and Linux too
+/// numbers the board's codec before a GPU's. On a machine with a GPU whose
+/// HDMI audio the kernel drives, the kernel's card took `/dev/dsp` first
+/// and the served driver died at every start with `dev_serve /dev/dsp: -26`
+/// (the name taken).
+pub(crate) fn first_kernel_audio_card() -> usize {
+    first_card_after(&zcore_drivers::user::reserved())
+}
+
+/// [`first_kernel_audio_card`] on what the buses left to userspace, as
+/// `/proc/udrivers` lists it.
+fn first_card_after<S: AsRef<str>>(left_to_userspace: &[S]) -> usize {
+    left_to_userspace
+        .iter()
+        .any(|left| left.as_ref().starts_with("hda@"))
+        .into()
+}
+
+#[cfg(test)]
+mod first_card_tests {
+    use super::first_card_after;
+
+    #[test]
+    fn the_kernels_cards_follow_a_served_one() {
+        assert_eq!(first_card_after(&["e1000e@0", "hda@1", "ahci@0"]), 1);
+        assert_eq!(first_card_after(&["e1000e@0", "ahci@0"]), 0);
+        assert_eq!(first_card_after::<&str>(&[]), 0);
+    }
+}
+
 /// Where udev's database is (`/run/udev/data`, and the `seat` and `seat0`
 /// tags), for the records of input devices a process serves.
 struct UdevInputDirs {
@@ -1639,6 +1673,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // ends onto it: `/dev/dsp<N>` and `/dev/snd/pcmC<N>D0p`. They drive the
     // same unmixed hardware ring, so the second opener must get EBUSY (as on
     // Linux, where one substream sits behind both nodes).
+    // Card 0 is the served driver's when one was left an HD Audio
+    // controller: the kernel's are numbered after it.
+    let first_card = first_kernel_audio_card();
+    if first_card != 0 && !audio_cards.is_empty() {
+        info!(
+            "[audio] card 0 is the HD Audio controller left to userspace (udrv-hda); the kernel's {} card(s) start at card {}",
+            audio_cards.len(),
+            first_card
+        );
+    }
     let audio_claims: Vec<devfs::AudioClaim> = audio_cards
         .iter()
         .map(|_| devfs::new_audio_claim())
@@ -1651,21 +1695,22 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     {
         use devfs::{DspDev, MixerDev, OssDefaults};
         for (idx, audio) in audio_cards.iter().enumerate() {
-            let suffix = if idx == 0 {
+            let card = idx + first_card;
+            let suffix = if card == 0 {
                 String::new()
             } else {
-                idx.to_string()
+                card.to_string()
             };
             let fname = format!("dsp{}", suffix);
             info!("/dev/{} -> audio device '{}'", fname, audio.name());
-            let dsp = DspDev::with_claim(audio.clone(), idx, audio_claims[idx].clone());
+            let dsp = DspDev::with_claim(audio.clone(), card, audio_claims[idx].clone());
             if let Err(e) = devfs_root.add(&fname, Arc::new(dsp)) {
                 warn!("failed to mknod /dev/{}: {:?}", fname, e);
             }
             let fname = format!("audio{}", suffix);
             let sun = DspDev::with_defaults(
                 audio.clone(),
-                idx,
+                card,
                 audio_claims[idx].clone(),
                 OssDefaults::Audio,
             );
@@ -1673,7 +1718,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 warn!("failed to mknod /dev/{}: {:?}", fname, e);
             }
             let fname = format!("mixer{}", suffix);
-            if let Err(e) = devfs_root.add(&fname, Arc::new(MixerDev::new(audio.clone(), idx))) {
+            if let Err(e) = devfs_root.add(&fname, Arc::new(MixerDev::new(audio.clone(), card))) {
                 warn!("failed to mknod /dev/{}: {:?}", fname, e);
             }
         }
@@ -1689,7 +1734,8 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             match devfs_root.add_dir("snd") {
                 Ok(snd_dir) => {
                     let mut pcms: Vec<Arc<PcmDev>> = Vec::with_capacity(audio_cards.len());
-                    for (card, audio) in audio_cards.iter().enumerate() {
+                    for (idx, audio) in audio_cards.iter().enumerate() {
+                        let card = idx + first_card;
                         let ctl = format!("controlC{}", card);
                         let pcm = format!("pcmC{}D0p", card);
                         info!(
@@ -1706,7 +1752,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         let pcm_dev = Arc::new(PcmDev::with_claim(
                             audio.clone(),
                             card,
-                            audio_claims[card].clone(),
+                            audio_claims[idx].clone(),
                         ));
                         pcms.push(pcm_dev.clone());
                         if let Err(e) = snd_dir.add(&pcm, pcm_dev) {
