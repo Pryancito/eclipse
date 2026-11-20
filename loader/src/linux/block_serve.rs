@@ -68,6 +68,9 @@ const OP_FLUSH: u32 = 4;
 const SECTOR: usize = 512;
 /// How long a request waits for its reply before it is an I/O error.
 pub(super) const REPLY_TIMEOUT_MS: u64 = 30_000;
+/// How often a link wakes the requests asleep on it, to look at their
+/// deadlines: so late, at most, a request gives up.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// The smallest slot worth serving through: one page.
 const MIN_SLOT: usize = 4096;
 /// The most slots, and so the most requests in flight: the driver's FIFO
@@ -698,16 +701,15 @@ impl Link {
                 return Err(DeviceError::IoError);
             }
             // Pinned here, in this future, not boxed: two allocations and two
-            // frees fewer for every sleep of every request.
+            // frees fewer for every sleep of every request. No timer of its
+            // own for the deadline: the link's watch wakes whoever sleeps
+            // every [`WATCH_EVERY`], and the look above it says when it is
+            // past.
             let replies = core::pin::pin!(fifo.wait_signal(Signal::READABLE | Signal::PEER_CLOSED));
-            let timeout = core::pin::pin!(kernel_hal::thread::sleep_until(Duration::from_millis(
-                deadline,
-            )));
             Asleep {
                 disk: self,
                 parts,
                 replies,
-                timeout,
             }
             .await;
         }
@@ -715,15 +717,15 @@ impl Link {
 }
 
 /// One sleep of [`Link::wait_async`]: over when a reply is there to
-/// read, when another waiter has read one of ours, or at the deadline.
-struct Asleep<'a, 'f, R, T> {
+/// read, when another waiter has read one of ours, or when the link's
+/// watch looks in.
+struct Asleep<'a, 'f, R> {
     disk: &'a Link,
     parts: &'a [Part],
     replies: Pin<&'f mut R>,
-    timeout: Pin<&'f mut T>,
 }
 
-impl<R: Future, T: Future> Future for Asleep<'_, '_, R, T> {
+impl<R: Future> Future for Asleep<'_, '_, R> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -735,7 +737,7 @@ impl<R: Future, T: Future> Future for Asleep<'_, '_, R, T> {
         if self.disk.verdict(self.parts).is_some() {
             return Poll::Ready(());
         }
-        if self.replies.as_mut().poll(cx).is_ready() || self.timeout.as_mut().poll(cx).is_ready() {
+        if self.replies.as_mut().poll(cx).is_ready() {
             return Poll::Ready(());
         }
         Poll::Pending
@@ -746,6 +748,19 @@ impl Link {
     /// Nothing will be answered on this link again: its driver is gone.
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// Wake whoever sleeps on an answer, to look at its deadline.
+    fn wake_sleepers(&self) {
+        let free = self.free.load(Ordering::Relaxed);
+        for (slot, waker) in self.wakers[..self.slots].iter().enumerate() {
+            if free & (1 << slot) != 0 {
+                continue;
+            }
+            if let Some(w) = waker.lock().as_ref() {
+                w.wake_by_ref();
+            }
+        }
     }
 
     /// The driver is gone: say so to whoever sleeps on an answer.
@@ -1195,9 +1210,31 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     };
     // Nothing reads the FIFO while no request is out, so nothing would
     // notice the driver going: this does, and starts the wait for the next.
+    // It is also the link's watch: every [`WATCH_EVERY`] it wakes the
+    // requests asleep on an answer, so that one past its deadline gives up
+    // without a timer of its own.
     kernel_hal::thread::spawn(async move {
         let wire: Arc<dyn KernelObject> = fifo;
-        wire.wait_signal(Signal::PEER_CLOSED).await;
+        let mut closed = core::pin::pin!(wire.wait_signal(Signal::PEER_CLOSED));
+        loop {
+            let mut tick = core::pin::pin!(kernel_hal::thread::sleep_until(
+                kernel_hal::timer::timer_now() + WATCH_EVERY
+            ));
+            let gone = core::future::poll_fn(|cx| {
+                if closed.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(true)
+                } else if tick.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(false)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if gone {
+                break;
+            }
+            link.wake_sleepers();
+        }
         disk.undrive(&link);
         drop(link);
         if device.is_some() {
