@@ -8,10 +8,11 @@
 //! to a controller is reset it when the process driving it dies, through the
 //! window recorded here.
 //!
-//! The kernel's own NVMe and AHCI drivers lived in `nvme/` and `ata/`. They
-//! went when every boot had a driver in userspace to take the controller:
-//! `zircon.gateway=0`, the boot with no gateway for that driver, now has no
-//! NVMe or SATA disk at all.
+//! The kernel's own NVMe and AHCI drivers (`nvme/`, `ata/`) take the
+//! controllers only for the root of an installed system
+//! (`user::keep_root_controllers`): it is mounted before any process runs.
+//! `zircon.gateway=0`, the boot with no gateway for a driver in userspace,
+//! has no other NVMe or SATA disk.
 
 use alloc::sync::Arc;
 
@@ -56,6 +57,11 @@ impl PciDriver for NvmeForUser {
         mapper: &Option<Arc<dyn IoMapper>>,
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
+        // The root of an installed system is on NVMe: the kernel drives it
+        // (`user::keep_root_controllers`).
+        if crate::user::kernel_keeps_for_root(crate::user::NVME) {
+            return crate::nvme::NvmeDriverPci.init(dev, mapper, irq);
+        }
         // The registers are BAR 0. A controller without it is counted all
         // the same, so `nvme@N` names the same controller either way.
         let (addr, len) = match dev.bars[0] {
@@ -104,6 +110,11 @@ impl PciDriver for AhciForUser {
         mapper: &Option<Arc<dyn IoMapper>>,
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
+        // The root of an installed system is on a SATA disk: the kernel
+        // drives it (`user::keep_root_controllers`).
+        if crate::user::kernel_keeps_for_root(crate::user::AHCI) {
+            return crate::ata::ahci::AhciDriverPci.init(dev, mapper, irq);
+        }
         let (addr, len) = abar(dev);
         // At least the 32 KiB the driver reaches: the generic registers and
         // all 32 ports.

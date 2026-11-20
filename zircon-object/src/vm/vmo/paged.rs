@@ -856,6 +856,19 @@ fn reentry_enter(lock_ptr: usize) {
     }
 }
 
+/// Whether this CPU is inside a VMO family lock: a page is being filled
+/// from its file, which a kernel fault on user memory (a `copy_from_user`
+/// in a syscall) does as well as a user one. A wait there must not give
+/// the CPU away: the next task of this CPU to touch the same object would
+/// spin on the lock for ever. The lock depth alone missed it in the fault a
+/// `statfs` took reading its path, on an installed system's first boot.
+pub fn family_lock_held_here() -> bool {
+    // SAFETY: this CPU's own slot; a holder has IRQs off, and a reader that
+    // holds nothing reads zeros that nothing on this CPU is writing.
+    let held = unsafe { &*HELD_LOCKS[stash_cpu()].0.get() };
+    held.iter().any(|p| *p != 0)
+}
+
 /// Pops one matching `lock_ptr` off this cpu's held-set on drop.
 struct ReentryPop(usize);
 impl Drop for ReentryPop {
