@@ -1527,7 +1527,9 @@ impl Xhci {
     /// code it ended with.
     fn bulk(&mut self, k: usize, device_in: bool, daddr: u64, len: usize) -> Result<usize, u32> {
         let slot = self.disks[k].as_ref().ok_or(0u32)?.slot;
-        let (dci, at) = self.queue_bulk(k, device_in, daddr, len, true).ok_or(0u32)?;
+        let (dci, at) = self
+            .queue_bulk(k, device_in, daddr, len, true)
+            .ok_or(0u32)?;
         self.ring_doorbell(slot, dci);
         let last = at.last().map(|a| a.0);
         loop {

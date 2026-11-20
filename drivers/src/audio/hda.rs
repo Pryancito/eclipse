@@ -3556,6 +3556,52 @@ impl AudioScheme for HdaDevice {
 
 // ── PCI driver registration ─────────────────────────────────────────────────
 
+/// Whether an HD Audio function is a GPU's HDMI/DP audio: function 0 of
+/// its slot is a display controller (PCI class 03). That is an NVIDIA
+/// card's `xx:00.1`, but also an AMD Radeon's or an AMD APU's iGPU audio
+/// (vendor 0x1002, `xx:00.1` beside the VGA function), which the bus finds
+/// before the board's own controller (`xx:00.6` on the same Ryzen bus): taken
+/// for the first controller that is not a GPU's, it was given to
+/// `udrv-hda`, which then played to an HDMI codec with nothing on it. A
+/// board controller sits beside an ISA bridge or an SMBus (Intel's
+/// `00:1f.3`, AMD's old `00:14.2`), never beside a display.
+fn gpu_audio_function(dev: &PCIDevice) -> bool {
+    if dev.loc.function == 0 {
+        return false;
+    }
+    let ops = &crate::bus::pci::PortOpsImpl;
+    let am = crate::bus::pci::PCI_ACCESS;
+    let f0 = pci::Location {
+        function: 0,
+        ..dev.loc
+    };
+    // SAFETY: a config-space read of a function on a slot the bus found.
+    let (vendor, class) = unsafe { (am.read16(ops, f0, 0x00), am.read8(ops, f0, 0x0b)) };
+    gpu_class(vendor, class)
+}
+
+/// [`gpu_audio_function`] on what function 0 of the slot says: present
+/// (not 0xffff) and a display controller.
+fn gpu_class(vendor0: u16, class0: u8) -> bool {
+    vendor0 != 0xffff && class0 == 0x03
+}
+
+#[cfg(test)]
+mod gpu_audio_tests {
+    use super::gpu_class;
+
+    #[test]
+    fn a_function_beside_a_display_is_a_gpus_audio() {
+        // AMD Radeon / APU iGPU: xx:00.0 is VGA (class 03).
+        assert!(gpu_class(0x1002, 0x03));
+        // Intel PCH 00:1f.0 is an ISA bridge (class 06), AMD 00:14.0 SMBus (0c).
+        assert!(!gpu_class(0x8086, 0x06));
+        assert!(!gpu_class(0x1002, 0x0c));
+        // No function 0 answering at all.
+        assert!(!gpu_class(0xffff, 0xff));
+    }
+}
+
 pub struct HdaDriverPci;
 
 impl PciDriver for HdaDriverPci {
@@ -3628,8 +3674,19 @@ impl PciDriver for HdaDriverPci {
         // With no `udriver=hda@N`, the first that is not a GPU's is left
         // all the same (`user::leave_first_hda`). A GPU's HDMI function is
         // the kernel's: its driver in userspace has no output for it.
+        let gpu = dev.id.vendor_id == 0x10de || gpu_audio_function(dev);
+        if gpu && dev.id.vendor_id != 0x10de {
+            info!(
+                "[hda] {:02x}:{:02x}.{:x} ({:04x}:{:04x}) is a GPU's HDMI/DP audio: the kernel keeps it",
+                dev.loc.bus,
+                dev.loc.device,
+                dev.loc.function,
+                dev.id.vendor_id,
+                dev.id.device_id
+            );
+        }
         if crate::user::reserve_hda(
-            dev.id.vendor_id == 0x10de,
+            gpu,
             crate::user::Transport::Pci,
             addr as usize,
             0x4000,

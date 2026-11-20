@@ -69,7 +69,7 @@ fn main() {
             "claim (boot with udriver=hda@N and a controller there): {e}"
         )),
     };
-    let ctl = Controller::start(&claim).unwrap_or_else(|e| die(e));
+    let ctl = Controller::start(&claim).unwrap_or_else(|e| die(format_args!("hda@{index}: {e}")));
     let path = ctl.path;
     let serve = |name: &str, major: u32, minor: u32| {
         Node::serve(name, major, minor, 0o666).unwrap_or_else(|e| die(e))
@@ -84,20 +84,12 @@ fn main() {
             ("program", NAME),
             ("device", &place),
             ("serves", "/dev/dsp /dev/snd/controlC0 /dev/snd/pcmC0D0p"),
-            (
-                "path",
-                &format!(
-                    "pin {:#x} converter {:#x} ({})",
-                    path.pin,
-                    path.conv,
-                    if path.digital { "digital" } else { "analog" }
-                ),
-            ),
+            ("path", &path.describe()),
         ],
     );
     println!(
-        "{NAME}: {place} is /dev/dsp and /dev/snd, pin {:#x} from converter {:#x}",
-        path.pin, path.conv
+        "{NAME}: {place} is /dev/dsp and /dev/snd, on {}",
+        path.describe()
     );
 
     let card = Mutex::new(Card {

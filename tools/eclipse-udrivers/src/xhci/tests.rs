@@ -165,9 +165,15 @@ const HUB_CONFIG: [u8; 25] = [
 
 #[test]
 fn a_hub_says_its_status_change_endpoint() {
-    assert_eq!(class_interrupt_in(&HUB_CONFIG, CLASS_HUB), Some((0x81, 1, 255)));
+    assert_eq!(
+        class_interrupt_in(&HUB_CONFIG, CLASS_HUB),
+        Some((0x81, 1, 255))
+    );
     assert_eq!(class_interrupt_in(&HUB_CONFIG, CLASS_HID), None);
-    assert_eq!(class_interrupt_in(&KEYBOARD_CONFIG, CLASS_HID), Some((0x81, 8, 7)));
+    assert_eq!(
+        class_interrupt_in(&KEYBOARD_CONFIG, CLASS_HID),
+        Some((0x81, 8, 7))
+    );
 }
 
 #[test]
