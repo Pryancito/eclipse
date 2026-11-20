@@ -1,5 +1,4 @@
-//! Reading one line of `/etc/fstab`, and mounting the ones that come over
-//! the network.
+//! Reading one line of `/etc/fstab`.
 //!
 //! Split out of [`super::mount_fstab`] rather than left in it, because the
 //! loop in there needs a root filesystem with an fstab inside it before it
@@ -7,26 +6,9 @@
 //! few lines inside a six-deep nesting with no test, which is how an `nfs`
 //! line could sit in the fstab doing nothing for as long as it did.
 
-use alloc::sync::Arc;
-
-use rcore_fs_mountfs::MNode;
-
 use crate::error::LxError;
 
-use super::nfs::greeting::Budget;
-use super::{mount_ops, mount_state, resolve_or_create_dir};
-
-/// How long the whole fstab run may spend greeting NFS servers, in total.
-///
-/// Not per line, and that is the point. A mount's own budget is a minute
-/// (`greeting_budget`), which is right for `mount(2)`: someone typed it and
-/// is waiting. At boot nobody is, and an fstab with three unreachable
-/// servers would hold the deferred task for three minutes. Linux does not
-/// need this bound because `mount -a` skips `_netdev` lines and leaves them
-/// to a network-online target that this kernel has no equivalent of, so the
-/// bound goes here instead. A **divergence**, and the reversible kind: a
-/// reachable server answers in milliseconds and never touches it.
-pub(super) const FSTAB_NETWORK_BUDGET_MS: u64 = 60_000;
+use super::{mount_ops, mount_state};
 
 /// What one line of `/etc/fstab` asks boot to do.
 ///
@@ -94,13 +76,13 @@ pub(super) const FS_MOUNTS_SERVICE: &str = "etc/eclipse/services/fs-mounts.servi
 
 /// Whether a line is left to its server, mounted by [`FS_MOUNTS_SERVICE`].
 ///
-/// Every FAT line is, as the kernel has no FAT of its own. A btrfs,
-/// EclipseFS or NFS line is when the root filesystem has the service that
-/// mounts it, the boot does not keep those for the kernel (`ufs=kernel`),
-/// and the line asks nothing a served mount would drop
+/// Every FAT and NFS line is, as the kernel has no FAT and no NFS client
+/// of its own. A btrfs or EclipseFS line is when the root filesystem has
+/// the service that mounts it, the boot does not keep those for the kernel
+/// (`ufs=kernel`), and the line asks nothing a served mount would drop
 /// ([`mount_ops::served_by_default`], the rule of `mount(2)`). A root
 /// filesystem older than this kernel has no such service, and there the
-/// kernel mounts them as it did. `parsed` is the type as
+/// kernel mounts them as it did; its FAT and NFS lines are not mounted. `parsed` is the type as
 /// [`mount_ops::parse_fstype`] spells it, so every spelling is left or none
 /// is.
 pub(super) fn left_to_server(
@@ -110,6 +92,7 @@ pub(super) fn left_to_server(
     has_service: bool,
 ) -> bool {
     parsed == "vfat"
+        || parsed == "nfs"
         || has_service
             && mount_ops::served_by_default(
                 parsed,
@@ -117,21 +100,6 @@ pub(super) fn left_to_server(
                 fstab_mount_data(options),
                 ufs,
             )
-}
-
-/// The deadline every network line of this fstab run shares, built on the
-/// first line that needs one.
-///
-/// `get_or_insert_with` and not `insert`, which is the whole of it: an
-/// `insert` per line is a fresh minute per line, which is the arithmetic
-/// [`FSTAB_NETWORK_BUDGET_MS`] exists to stop. Lazily, so a fstab with no
-/// network line spends none of it and the clock starts when the first
-/// server is actually dialled rather than when the file was opened.
-pub(super) fn run_budget(slot: &mut Option<Budget>) -> &Budget {
-    slot.get_or_insert_with(|| {
-        let now = kernel_hal::timer::timer_now().as_millis() as u64;
-        Budget::new(FSTAB_NETWORK_BUDGET_MS, now)
-    })
 }
 
 /// Whether `name` is one of the comma-separated options on an fstab line.
@@ -180,79 +148,6 @@ pub(super) fn fstab_mount_data(options: &str) -> &str {
         ""
     } else {
         options
-    }
-}
-
-/// Mount one network line from `/etc/fstab`.
-///
-/// Everything that differs from the block path is here, and it is the same
-/// list as in `mount_fs`: the source is a string and not a path, the
-/// options are the filesystem's own rather than a block device's, and the
-/// server's name may need resolving before the synchronous mount can run.
-///
-/// `budget` is the whole run's, not this line's: see
-/// [`FSTAB_NETWORK_BUDGET_MS`].
-pub(super) async fn mount_fstab_network(
-    root: &Arc<MNode>,
-    source: &str,
-    target: &str,
-    fstype: &str,
-    options: &str,
-    budget: &Budget,
-) {
-    let target_node = match resolve_or_create_dir(root, target) {
-        Ok(node) => node,
-        Err(e) => {
-            warn!(
-                "mount_fstab: failed to resolve/create target {:?}: {:?}",
-                target, e
-            );
-            return;
-        }
-    };
-    if target_node.is_mountpoint() {
-        warn!("mount_fstab: target {:?} is already a mountpoint", target);
-        return;
-    }
-
-    let flags = fstab_flags(options);
-    let data = fstab_mount_data(options);
-    // The name is resolved here and the address is passed in the options,
-    // which is exactly what `sys_mount` does and for the same reason: the
-    // mount itself is synchronous. `None` means the options already said
-    // everything, and that is every case but a name DNS alone knows.
-    let resolved = match mount_ops::with_resolved_addr(fstype, Some(source), data).await {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            warn!(
-                "mount_fstab: failed to resolve server for {:?}: {:?}",
-                source, e
-            );
-            return;
-        }
-    };
-    let data = resolved.as_deref().unwrap_or(data);
-
-    // The target is normalised the way `mount(2)` normalises it, so the
-    // mount table reads the same whether a mount came from the syscall or
-    // from this file. An fstab may well say `/mnt/nas/`.
-    let line_target = mount_ops::normalize_target(target);
-    match mount_ops::mount_nfs_with_deadline(
-        source,
-        &line_target,
-        &target_node,
-        flags,
-        data,
-        Some(budget),
-    ) {
-        Ok(()) => info!(
-            "mount_fstab: successfully mounted {:?} to {:?}",
-            source, line_target
-        ),
-        Err(e) => warn!(
-            "mount_fstab: failed to mount {:?} to {:?}: {:?}",
-            source, line_target, e
-        ),
     }
 }
 

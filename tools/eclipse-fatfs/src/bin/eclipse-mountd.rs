@@ -1,12 +1,12 @@
 //! `eclipse-mountd`: the mount helper. The kernel hands it each `mount(2)`
-//! of a filesystem a process serves -- FAT always, as the kernel has none;
-//! btrfs, EclipseFS and NFS unless the boot says `ufs=kernel` -- and this
+//! of a filesystem a process serves -- FAT and NFS always, as the kernel
+//! has neither; btrfs and EclipseFS unless the boot says `ufs=kernel` -- and this
 //! makes it with that filesystem's server and answers what `mount(2)`
 //! returns: so `mount -t ...`, the installer and whatever else calls
 //! `mount(2)` get a served mount without knowing.
 //!
 //! A service of init, started again when it dies; while there is none,
-//! `mount(2)` of FAT is `ENODEV` and the others are the kernel's own. One
+//! `mount(2)` of FAT and NFS is `ENODEV` and the others are the kernel's own. One
 //! mount at a time: the next waits in the FIFO until the server of this one
 //! has made it or said why not. What the kernel sends is in
 //! `linux-object/src/fs/served/helper.rs`.

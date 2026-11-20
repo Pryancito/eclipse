@@ -479,8 +479,8 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     fs::write(
         svc_dir.join("fs-mounts.service"),
         b"# The FAT, btrfs, EclipseFS and NFS lines of /etc/fstab, each\n\
-          # served by a process (ufs=kernel keeps all but FAT for the\n\
-          # kernel). See /usr/local/bin/eclipse-fs-mounts.\n\
+          # served by a process (ufs=kernel keeps btrfs and EclipseFS\n\
+          # for the kernel). See /usr/local/bin/eclipse-fs-mounts.\n\
           exec = /usr/local/bin/eclipse-fs-mounts\n\
           type = oneshot\n\
           after = ublk ublk2 ublk3 ublk4 unvme unvme2 uahci uahci2 mountd\n",
@@ -495,8 +495,8 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
         svc_dir.join("mountd.service"),
         b"# The mount helper: the kernel asks this process to make each\n\
           # mount(2) of FAT, btrfs, EclipseFS and NFS, which it does with\n\
-          # their servers. While it is not running, mount(2) of FAT is\n\
-          # ENODEV and the others are the kernel's. See\n\
+          # their servers. While it is not running, mount(2) of FAT and\n\
+          # NFS is ENODEV and the others are the kernel's. See\n\
           # /usr/local/bin/eclipse-mountd.\n\
           exec = /usr/local/bin/eclipse-mountd\n\
           type = respawn\n",
@@ -518,10 +518,10 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
 /// process.
 ///
 /// The kernel's pass leaves them (`left_to_server`, in the kernel): every
-/// FAT line, as the kernel has no FAT, and the others unless the boot says
-/// `ufs=kernel` or the line asks what a served mount drops (`nosuid`,
-/// `noexec`, `nodev`, a btrfs or EclipseFS option its server does not
-/// read). The types are the kernel's spellings.
+/// FAT and NFS line, as the kernel has no FAT and no NFS client, and the
+/// btrfs and EclipseFS ones unless the boot says `ufs=kernel` or the line
+/// asks what their served mounts were not measured with (`nosuid`,
+/// `noexec`, `nodev`, an option the server does not read). The types are the kernel's spellings.
 ///
 /// A FAT line is mounted with `eclipse-fatfs`. The others go through
 /// `mount(2)`, which applies that rule again: it hands them to the mount
@@ -529,8 +529,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
 /// for a volume they do not take or a line the kernel keeps. So this takes
 /// every such line nothing has mounted -- a line the kernel kept and could
 /// not mount yet, its disk served by a process, as well -- and waits for
-/// the helper first, three seconds at most, unless the boot keeps these
-/// for the kernel. NFS lines come last, each tried three
+/// the helper first, three seconds at most, unless the boot keeps btrfs
+/// and EclipseFS for the kernel (an NFS line always waits for it: nothing
+/// else mounts one). NFS lines come last, each tried three
 /// times five seconds apart: the network may still be coming up.
 ///
 /// The placeholder of an image nobody installed (`__ECLIPSE_EFI_DEV___`)
@@ -548,8 +549,8 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
 const FS_MOUNTS: &[u8] = b"#!/bin/sh\n\
 # Eclipse OS: mount the FAT, btrfs, EclipseFS and NFS lines of\n\
 # /etc/fstab, each with a process that serves it. The kernel leaves those\n\
-# lines to this service; ufs=kernel on its command line keeps all but FAT\n\
-# for the kernel.\n\
+# lines to this service; ufs=kernel on its command line keeps btrfs and\n\
+# EclipseFS for the kernel.\n\
 fstab=/etc/fstab\n\
 [ -r \"$fstab\" ] || exit 0\n\
 # (No program is run to read the boot's words or a line's type: on the\n\
@@ -599,7 +600,7 @@ kind_of() {\n\
     esac\n\
 }\n\
 wait_helper() {\n\
-    [ -z \"$kernel\" ] || return 0\n\
+    [ -z \"$kernel\" ] || [ \"$1\" = always ] || return 0\n\
     while [ ! -e /run/eclipse-mountd ] && [ \"$helper\" -gt 0 ]; do\n\
         sleep 0.1\n\
         helper=$((helper - 1))\n\
@@ -647,7 +648,7 @@ mounts() {\n\
         case \"$dev\" in ?*:/*) ;; *) continue ;; esac\n\
         mounted \"$at\" && continue\n\
         [ -d \"$at\" ] || mkdir -p \"$at\"\n\
-        wait_helper\n\
+        wait_helper always\n\
         for try in 1 2 3; do\n\
             busybox mount -t \"$type\" -o \"${opts:-defaults}\" \"$dev\" \"$at\" && break\n\
             [ \"$try\" = 3 ] && echo \"eclipse-fs-mounts: $dev was not mounted at $at\" >&2\n\
