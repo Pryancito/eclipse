@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::process::exit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -158,6 +159,7 @@ fn service(shared: &'static Shared) -> bool {
     let mut frames: Vec<Frame> = Vec::new();
     let mut added = Vec::new();
     let pending;
+    let mut gone_any = false;
     {
         let mut x = lock(&shared.xhci);
         let found = x.service();
@@ -173,6 +175,8 @@ fn service(shared: &'static Shared) -> bool {
         }
         for (hub, bitmap) in found.hubs {
             let changes = x.hub_changed(hub, &bitmap);
+            // A disk behind it may have gone: its thread looks.
+            gone_any = true;
             for hid in changes.added {
                 describe(shared, &x, hid, &mut added);
             }
@@ -191,6 +195,7 @@ fn service(shared: &'static Shared) -> bool {
                 attach(shared, &mut x, port, &mut added);
             } else if !x.connected(port) && x.attached(port) {
                 let gone = x.detach(port);
+                gone_any = true;
                 let mut served = lock(&shared.served);
                 for hid in gone {
                     if let Some(s) = served.remove(&hid) {
@@ -203,6 +208,9 @@ fn service(shared: &'static Shared) -> bool {
             }
         }
         pending = x.pending();
+    }
+    if gone_any {
+        kick_disks();
     }
     for (hid, info, place, keyboard) in added {
         serve(shared, hid, info, &place, keyboard);
@@ -243,6 +251,7 @@ impl Backend for UsbDisk {
 
     fn run(&mut self, ios: &[Io], done: &mut [bool]) -> Result<(), Status> {
         let mut gone = false;
+        let pending;
         {
             let mut x = lock(&self.shared.xhci);
             x.quiet(true);
@@ -285,9 +294,12 @@ impl Backend for UsbDisk {
                 i += n;
             }
             x.quiet(false);
+            pending = x.pending();
         }
         // What came while the disk had the controller waits in its stash.
-        while service(self.shared) {}
+        if pending {
+            while service(self.shared) {}
+        }
         if gone {
             return Err(Status::PEER_CLOSED);
         }
@@ -370,28 +382,80 @@ fn serve_disk(
     });
 }
 
+/// The threads serving disks, to wake with [`KICK`] when a disk may have
+/// gone.
+/// (As numbers: musl's `pthread_t` is a pointer, which a static cannot hold.)
+static DISK_THREADS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// The signal that wakes a disk's thread from its wait on the kernel.
+const KICK: libc::c_int = libc::SIGUSR1;
+
+extern "C" fn kicked(_: libc::c_int) {}
+
+/// Have [`KICK`] cut a wait short, without killing anyone.
+fn take_kicks() {
+    // SAFETY: a handler that does nothing, without SA_RESTART so that the
+    // wait it lands in ends.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = kicked as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(KICK, &sa, std::ptr::null_mut());
+    }
+}
+
+/// How many times [`kick_disks`] has been called: a kick that came while
+/// the thread was not waiting is seen by this.
+static KICKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Wake every disk's thread to look whether its disk is still there.
+fn kick_disks() {
+    KICKS.fetch_add(1, Ordering::SeqCst);
+    for &t in lock(&DISK_THREADS).iter() {
+        // SAFETY: a thread on the list has not ended: it takes itself off
+        // under this lock before it does.
+        unsafe { libc::pthread_kill(t as libc::pthread_t, KICK) };
+    }
+}
+
 /// Answer the kernel's requests for `disk` until its end of the FIFO goes,
-/// the disk stops answering, or it is pulled out: a disk asked nothing
-/// notices that within half a second, and its FIFO goes then.
+/// the disk stops answering, or it is pulled out. Each turn is one call:
+/// the replies go out and the next requests come in. A disk pulled out
+/// kicks the thread awake, and its FIFO goes then.
 fn serve_until_gone(disk: &mut UsbDisk, fifo: &Fifo<Msg>) -> Status {
+    // SAFETY: this thread's own id.
+    let me = unsafe { libc::pthread_self() } as usize;
+    lock(&DISK_THREADS).push(me);
+    let why = serve_turns(disk, fifo);
+    lock(&DISK_THREADS).retain(|&t| t != me);
+    why
+}
+
+fn serve_turns(disk: &mut UsbDisk, fifo: &Fifo<Msg>) -> Status {
     let mut msgs = [Msg::default(); blk::FIFO_DEPTH];
+    let mut got = 0;
+    let mut kicks = KICKS.load(Ordering::SeqCst);
+    let gone = |disk: &UsbDisk| {
+        let x = lock(&disk.shared.xhci);
+        x.disks.get(disk.disk).is_none_or(|d| d.is_none())
+    };
     loop {
-        match fifo.wait_readable_for(500_000_000) {
-            Ok(true) => {}
-            Ok(false) => {
-                let x = lock(&disk.shared.xhci);
-                if x.disks.get(disk.disk).is_none_or(|d| d.is_none()) {
-                    return Status::PEER_CLOSED;
-                }
-                continue;
+        let now = KICKS.load(Ordering::SeqCst);
+        if now != kicks {
+            kicks = now;
+            if gone(disk) {
+                let _ = fifo.write(&msgs[..got]);
+                return Status::PEER_CLOSED;
             }
-            Err(e) => return e,
         }
-        let got = match fifo.read(&mut msgs) {
+        got = match fifo.reply_wait_once(&mut msgs, got) {
             Ok(n) => n,
-            Err(Status::SHOULD_WAIT) => continue,
+            // The replies went before the kick; the next turn looks.
+            Err(Status::INTERNAL_INTR_RETRY) => 0,
             Err(e) => return e,
         };
+        if got == 0 {
+            continue;
+        }
         let (capacity, has_flush) = (disk.capacity(), disk.has_flush());
         let mut failed = None;
         blk::answer(&mut msgs[..got], capacity, has_flush, |ios, done| {
@@ -401,10 +465,8 @@ fn serve_until_gone(disk: &mut UsbDisk, fifo: &Fifo<Msg>) -> Status {
                 }
             }
         });
-        if let Err(e) = fifo.write(&msgs[..got]) {
-            return e;
-        }
         if let Some(status) = failed {
+            let _ = fifo.write(&msgs[..got]);
             return status;
         }
     }
@@ -455,6 +517,7 @@ fn main() {
     if !claim.pci {
         die("the claim is not of a PCI function");
     }
+    take_kicks();
     let regs = claim.map_regs().unwrap_or_else(|e| die(e));
     let dma = Dma::new(claim.bti, xhci::DMA_SIZE, None).unwrap_or_else(|e| die(e));
     if claim.interrupt.is_none() {
