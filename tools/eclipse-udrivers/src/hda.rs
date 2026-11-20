@@ -905,8 +905,7 @@ impl Controller {
         let (iss, oss) = (((gcap >> 8) & 0xf) as usize, ((gcap >> 12) & 0xf) as usize);
         let bss = ((gcap >> 3) & 0x1f) as usize;
         println!(
-            "udrv-hda: controller at {:#x}: GCAP {gcap:#06x} ({iss} in, {oss} out, {bss} bidirectional streams{}), GCTL {:#010x}",
-            claim.offset,
+            "udrv-hda: controller: GCAP {gcap:#06x} ({iss} in, {oss} out, {bss} bidirectional streams{}), GCTL {:#010x}",
             if gcap & GCAP_64OK != 0 { ", 64-bit DMA" } else { ", 32-bit DMA" },
             regs.r32(GCTL),
         );
