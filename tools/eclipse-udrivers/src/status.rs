@@ -29,7 +29,10 @@ pub const DIR: &str = "/run/eclipse-servers";
 pub fn render(pid: u32, fields: &[(&str, &str)]) -> String {
     let mut s = format!("pid={pid}\n");
     for (k, v) in fields {
-        let v: String = v.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let v: String = v
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         let _ = writeln!(s, "{k}={}", v.trim());
     }
     s
@@ -48,7 +51,10 @@ pub fn publish(name: &str, fields: &[(&str, &str)]) {
 
 /// `52:54:00:12:34:56`.
 pub fn mac_text(mac: [u8; 6]) -> String {
-    mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(test)]
@@ -57,7 +63,10 @@ mod tests {
 
     #[test]
     fn a_file_is_the_pid_then_the_fields_one_per_line() {
-        let t = render(7, &[("device", "virtio-net@0"), ("mac", "52:54:00:12:34:56")]);
+        let t = render(
+            7,
+            &[("device", "virtio-net@0"), ("mac", "52:54:00:12:34:56")],
+        );
         assert_eq!(t, "pid=7\ndevice=virtio-net@0\nmac=52:54:00:12:34:56\n");
     }
 
@@ -69,6 +78,9 @@ mod tests {
 
     #[test]
     fn a_mac_is_six_hex_pairs() {
-        assert_eq!(mac_text([0x52, 0x54, 0, 0x12, 0x34, 0xab]), "52:54:00:12:34:ab");
+        assert_eq!(
+            mac_text([0x52, 0x54, 0, 0x12, 0x34, 0xab]),
+            "52:54:00:12:34:ab"
+        );
     }
 }
