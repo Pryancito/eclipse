@@ -422,6 +422,9 @@ impl<V: Verbs> Codec<V> {
         }
         if path.trigger || path.hdmi {
             let _ = self.cmd(path.pin, VERB_SET_PIN_SENSE, 0);
+            // The kernel's driver gives the result 2 ms to settle; once,
+            // at start.
+            std::thread::sleep(Duration::from_millis(2));
         }
         self.cmd(path.pin, VERB_GET_PIN_SENSE, 0)
             .is_some_and(|s| s & (1 << 31) != 0)
