@@ -1606,6 +1606,8 @@ cfg_if! {
         const HEAP_GROW_CHUNKS: [usize; 3] =
             [32 * 1024 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024];
         const HEAP_MAX_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+        /// Growths one refused allocation may ask for before reclaim.
+        const HEAP_GROW_RETRIES: usize = 4;
         // The wild-block registry must be able to hold every region this
         // policy can ever create -- the static arena plus one per growth, all
         // of them at the SMALLEST fallback chunk. If it cannot, a machine
@@ -1655,7 +1657,7 @@ cfg_if! {
                 return false;
             }
             HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
-            let grew = grow_heap_once(used, total);
+            let grew = grow_heap_once(used, total, 0);
             HEAP_GROWER.store(0, Ordering::Release);
             HEAP_GROWING.store(false, Ordering::Release);
             grew
@@ -1683,14 +1685,18 @@ cfg_if! {
         /// every CPU but the grower to `alloc_error`: a burst of 200 parked
         /// readers in QEMU, needing new coroutine stacks on four CPUs at
         /// once, panicked with `Alloction Stack Failed` and 3 GiB of RAM free.
+        ///
+        /// `need` is the layout the buddy refused. The growth is made big
+        /// enough, and aligned enough, to hold one block of that size: see
+        /// [`buddy_block_size`].
         #[cold]
         #[inline(never)]
-        fn grow_heap_on_failure() -> bool {
+        fn grow_heap_on_failure(need: Layout) -> bool {
             let total = HEAP_TOTAL.load(Ordering::Relaxed);
             let used = HEAP_USED.get();
             if !HEAP_GROWING.swap(true, Ordering::AcqRel) {
                 HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
-                let grew = grow_heap_once(used, total);
+                let grew = grow_heap_once(used, total, buddy_block_size(need));
                 HEAP_GROWER.store(0, Ordering::Release);
                 HEAP_GROWING.store(false, Ordering::Release);
                 return grew;
@@ -1715,14 +1721,64 @@ cfg_if! {
             false
         }
 
+        /// The block the buddy hands out for `layout`: a power of two, at least
+        /// the size and the alignment, and aligned to itself. A growth that is
+        /// to serve `layout` has to contain one such aligned block, which the
+        /// buddy only finds if the region it is given covers one:
+        /// `add_to_heap` carves a region into the largest self-aligned blocks
+        /// that fit, and never merges two regions into a bigger one.
+        fn buddy_block_size(layout: Layout) -> usize {
+            layout
+                .size()
+                .next_power_of_two()
+                .max(layout.align())
+                .max(core::mem::size_of::<usize>())
+        }
+
+        /// The chunk sizes a growth tries, largest first, for a block of
+        /// `need` bytes (`0`: any): the usual chunks that can hold such a
+        /// block, then `need` itself if it is bigger than the smallest chunk
+        /// and none of them. On a fragmented machine where no 8 MiB run is
+        /// left, a 4 MiB stack still gets the exact 4 MiB it can use rather
+        /// than a 2 MiB chunk it cannot. Never below the smallest chunk, which
+        /// is what bounds the region registry (see the assert above).
+        fn heap_grow_chunks(need: usize) -> impl Iterator<Item = usize> {
+            let smallest = HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1];
+            let exact = (need > smallest && !HEAP_GROW_CHUNKS.contains(&need)).then_some(need);
+            HEAP_GROW_CHUNKS
+                .into_iter()
+                .filter(move |&c| c >= need)
+                .chain(exact)
+        }
+
+        /// The frame alignment (`align_log2`, in frames) that makes a chunk
+        /// start on a `need`-byte boundary, so the block that serves `need`
+        /// is whole inside it even when the chunk is exactly `need` bytes. A
+        /// page or less needs nothing beyond the page every frame has.
+        fn heap_grow_align_log2(need: usize) -> usize {
+            if need <= 1 << PAGE_BITS {
+                return 0;
+            }
+            (need.trailing_zeros() as usize).saturating_sub(PAGE_BITS)
+        }
+
         /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWER`].
         fn this_cpu_tag() -> usize {
             kernel_hal::cpu::cpu_id() as usize + 1
         }
 
+        /// One growth of the buddy from physical RAM.
+        ///
+        /// `need` is the buddy block (see [`buddy_block_size`]) the growth must
+        /// be able to serve, `0` for a growth ahead of demand. Before it was
+        /// passed, a refused 4 MiB coroutine stack could be "served" by a
+        /// 2 MiB chunk -- the fallback on a fragmented machine -- that cannot
+        /// hold it: the growth reported success, the retry failed again, and
+        /// `Executor::new` panicked with `Alloction Stack Failed`, the likeliest
+        /// reading of that panic on real hardware (a secondary CPU, idle).
         #[cold]
         #[inline(never)]
-        fn grow_heap_once(used: usize, total: usize) -> bool {
+        fn grow_heap_once(used: usize, total: usize, need: usize) -> bool {
             if !HEAP_GROW_LOG {
                 let _ = used;
             }
@@ -1763,15 +1819,17 @@ cfg_if! {
             // the second growth on the very first test boot was refused for
             // exactly that. Step down instead of giving up.
             let mut got = None;
-            for chunk in HEAP_GROW_CHUNKS {
+            for chunk in heap_grow_chunks(need) {
                 if ram_used + chunk + reserve > ram {
                     continue;
                 }
                 // align_log2 is in FRAMES, not bytes: 21 would demand an 8 GiB
                 // alignment and fail on any real machine (the first test boot
                 // only succeeded because the run happened to land on 8 GiB).
-                // The buddy needs no more than usize alignment.
-                if let Some(pa) = frame_alloc(chunk >> PAGE_BITS, 0) {
+                // A growth ahead of demand needs none; one for a refused block
+                // needs that block's alignment, or the chunk may straddle
+                // every boundary the block could sit on.
+                if let Some(pa) = frame_alloc(chunk >> PAGE_BITS, heap_grow_align_log2(need)) {
                     got = Some((pa, chunk));
                     break;
                 }
@@ -2522,7 +2580,7 @@ cfg_if! {
             // pages through `frame_dealloc`. So the heap has to be grown from
             // them before it can serve the request -- reclaiming without this
             // line frees real memory and still fails the allocation.
-            if !grow_heap_on_failure() {
+            if !grow_heap_on_failure(layout) {
                 return core::ptr::null_mut();
             }
             HEAP_ALLOCATOR
@@ -2592,15 +2650,27 @@ cfg_if! {
                 // catch this case. `held_by_current_cpu` means the null came
                 // from the re-entrancy refusal, not from an empty pool, so
                 // growing would not help and re-locking would deadlock.
-                let p = if p.is_null() && !self.0.held_by_current_cpu() && grow_heap_on_failure() {
-                    self.0
+                //
+                // More than once: a wait on another CPU's growth answers
+                // "retry" without this CPU's block being in it, and that
+                // CPU's new memory can be gone again by the time this one
+                // asks. Bounded, so a heap at its ceiling still falls through
+                // to reclaim.
+                let mut p = p;
+                let mut tries = 0;
+                while p.is_null()
+                    && tries < HEAP_GROW_RETRIES
+                    && !self.0.held_by_current_cpu()
+                    && grow_heap_on_failure(ext)
+                {
+                    tries += 1;
+                    p = self
+                        .0
                         .lock()
                         .alloc(ext)
                         .ok()
-                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
-                } else {
-                    p
-                };
+                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr());
+                }
                 // Growing failed too, which means physical RAM is gone and not
                 // just this pool. The last thing before the caller turns this
                 // into `alloc_error` -- which panics and ends the machine --
