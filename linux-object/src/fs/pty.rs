@@ -178,7 +178,14 @@ impl Pty {
         self.slave_bus.lock().set(Event::READABLE);
     }
 
-    /// Master read side is satisfiable now (data ready, or hangup → EOF).
+    /// Every slave that was opened has been closed again: the master's
+    /// `TTY_OTHER_CLOSED`. A master whose slave was never opened is not hung
+    /// up here (Linux already answers `EIO` then; this kernel keeps waiting).
+    fn slave_hung_up(&self) -> bool {
+        self.slave_ever_open.load(Ordering::Relaxed) && self.slave_open.load(Ordering::Relaxed) <= 0
+    }
+
+    /// Master read side is satisfiable now (data ready, or hangup → `EIO`).
     fn master_readable(&self) -> bool {
         let inner = self.inner.lock();
         // Output paused by flow control (Ctrl-S) is withheld from the master.
@@ -186,7 +193,7 @@ impl Pty {
             return true;
         }
         drop(inner);
-        self.slave_ever_open.load(Ordering::Relaxed) && self.slave_open.load(Ordering::Relaxed) <= 0
+        self.slave_hung_up()
     }
 
     /// Slave read side is satisfiable now (data ready, or master closed → EOF).
@@ -682,10 +689,12 @@ impl Pty {
         // master, but still surface EOF if the slave has hung up.
         if inner.output.is_empty() || inner.stopped {
             drop(inner);
-            if self.slave_ever_open.load(Ordering::Relaxed)
-                && self.slave_open.load(Ordering::Relaxed) <= 0
-            {
-                return Ok(0); // slave hung up → EOF
+            if self.slave_hung_up() {
+                // `n_tty_read` on the master: once the other side is closed
+                // and nothing is left, the answer is `EIO`, not end of file.
+                // Terminal emulators and `script` take either as "the child
+                // is gone"; a caller that tells them apart expects `EIO`.
+                return Err(FsError::DeviceError);
             }
             return Err(FsError::Again);
         }
@@ -1490,7 +1499,8 @@ impl INode for PtyMaster {
             read: self.pty.master_readable(),
             write: self.pty.master_writable(),
             error: false,
-            hangup: false,
+            // `n_tty_poll`: `TTY_OTHER_CLOSED` is `POLLHUP`.
+            hangup: self.pty.slave_hung_up(),
         })
     }
     fn async_poll<'a>(
@@ -1519,6 +1529,11 @@ impl INode for PtySlave {
         self.pty.slave_read(buf)
     }
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        // A hung-up terminal (`hung_up_tty_write`): nobody will ever read
+        // what is written, so the program learns at once with `EIO`.
+        if self.pty.master_closed.load(Ordering::Relaxed) {
+            return Err(FsError::DeviceError);
+        }
         let n = self.pty.slave_write(buf);
         // As on the master end: no room is EAGAIN, never a zero-byte write.
         if n == 0 && !buf.is_empty() {
@@ -1530,8 +1545,10 @@ impl INode for PtySlave {
         Ok(PollStatus {
             read: self.pty.slave_readable(),
             write: self.pty.slave_writable(),
-            error: false,
-            hangup: false,
+            // `hung_up_tty_poll`: a terminal whose master is gone is
+            // readable, writable, in error and hung up all at once.
+            error: self.pty.master_closed.load(Ordering::Relaxed),
+            hangup: self.pty.master_closed.load(Ordering::Relaxed),
         })
     }
     fn async_poll<'a>(
@@ -3092,6 +3109,41 @@ mod tests {
     // ---- hangup ---------------------------------------------------------
 
     #[test]
+    fn a_hung_up_end_says_so_in_poll_and_a_write_to_it_is_eio() {
+        // Linux: the master of a pair whose slave closed polls `POLLHUP`
+        // (`TTY_OTHER_CLOSED`), and a slave whose master closed is a hung-up
+        // terminal: `POLLHUP|POLLERR` to `poll`, `EIO` to `write`.
+        let p = Arc::new(pty());
+        let (master, slave) = ends(p.clone());
+        assert!(
+            !master.poll().unwrap().hangup,
+            "a fresh pair is not hung up"
+        );
+        assert!(!slave.poll().unwrap().hangup);
+        assert_eq!(slave.write_at(0, b"x"), Ok(1));
+
+        p.slave_ever_open.store(true, Ordering::Relaxed);
+        p.slave_open.store(0, Ordering::Relaxed);
+        assert!(
+            master.poll().unwrap().hangup,
+            "the master missed the hangup"
+        );
+
+        p.master_closed.store(true, Ordering::Relaxed);
+        let st = slave.poll().unwrap();
+        assert!(
+            st.hangup && st.error,
+            "the slave missed the hangup: {:?}",
+            st
+        );
+        assert_eq!(
+            slave.write_at(0, b"x"),
+            Err(FsError::DeviceError),
+            "a write to a hung-up terminal was taken"
+        );
+    }
+
+    #[test]
     fn an_empty_queue_is_eagain_until_the_far_end_hangs_up() {
         let p = pty();
         let mut buf = [0u8; 8];
@@ -3099,9 +3151,10 @@ mod tests {
         assert!(p.master_read(&mut buf).is_err());
         assert!(p.slave_read(&mut buf).is_err());
 
-        // Slave closes: the master now reads EOF.
+        // Slave closes: the master now reads EIO, as `n_tty_read` answers
+        // once the other side is closed.
         p.slave_open.store(0, Ordering::Relaxed);
-        assert_eq!(p.master_read(&mut buf).unwrap(), 0);
+        assert_eq!(p.master_read(&mut buf), Err(FsError::DeviceError));
         assert!(p.master_readable());
 
         // Master closes: the slave reads EOF.
@@ -3120,7 +3173,7 @@ mod tests {
         let mut buf = [0u8; 128];
         let n = p.master_read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"ultimas palabras\r\n");
-        assert_eq!(p.master_read(&mut buf).unwrap(), 0);
+        assert_eq!(p.master_read(&mut buf), Err(FsError::DeviceError));
     }
 
     // ---- flow control: both queues are bounded --------------------------
