@@ -1588,9 +1588,9 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// hands an opened DRM/input device to a Wayland compositor and how clients
     /// pass shm/dmabuf buffers back.
     fn send_fds(&self, _fds: alloc::vec::Vec<Arc<dyn FileLike>>) -> SysResult {
-        // `ENOSYS` told callers the *syscall* was missing; Linux answers
-        // `EOPNOTSUPP` for SCM_RIGHTS on a non-unix socket.
-        Err(LxError::EOPNOTSUPP)
+        // `__scm_send`: `SCM_RIGHTS` on a socket that is not `PF_UNIX` is
+        // `EINVAL` (`if (!ops || ops->family != PF_UNIX)`).
+        Err(LxError::EINVAL)
     }
     /// Take up to `_max` file descriptors the peer attached via `SCM_RIGHTS`.
     fn recv_fds(&self, _max: usize) -> alloc::vec::Vec<Arc<dyn FileLike>> {

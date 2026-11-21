@@ -260,14 +260,23 @@ const SOL_RAW: usize = 255;
 /// carries no message, so it is ignored rather than refused: that is what
 /// Linux does, and a caller that zeroes a `struct msghdr` and sets only
 /// `msg_control` depends on it.
+///
+/// In `____sys_sendmsg`'s order: no length is no control data, a length past
+/// the ceiling is `ENOBUFS` (`sock_kmalloc` refusing more than `optmem_max`),
+/// and anything else is copied in, so a NULL `msg_control` with a length is
+/// `EFAULT`. Both used to be quiet: NULL with any length was an ordinary
+/// send and the ceiling was `EINVAL`.
 fn scm_control_action(cmsg: CmsgLayout, is_null: bool, controllen: usize) -> LxResult<bool> {
-    if is_null || controllen < cmsg.hdr_len {
+    if controllen == 0 {
         return Ok(false);
     }
     if controllen > CONTROL_MAX {
-        return Err(LxError::EINVAL);
+        return Err(LxError::ENOBUFS);
     }
-    Ok(true)
+    if is_null {
+        return Err(LxError::EFAULT);
+    }
+    Ok(controllen >= cmsg.hdr_len)
 }
 /// `SOL_SOCKET`, as it appears in `cmsg_level`.
 const SOL_SOCKET_LEVEL: i32 = 1;
@@ -370,9 +379,13 @@ fn parse_scm_rights_fds(cmsg: CmsgLayout, ctrl: &[u8]) -> Result<Vec<i32>, LxErr
         let ints = off + cmsg.len_width;
         let level = i32::from_ne_bytes(ctrl[ints..ints + 4].try_into().unwrap());
         let typ = i32::from_ne_bytes(ctrl[ints + 4..ints + 8].try_into().unwrap());
+        // `CMSG_OK`, which `__scm_send` asks of every message it walks: a
+        // length shorter than its own header or past the end of the buffer
+        // refuses the whole `sendmsg` with `EINVAL`. It used to end the walk
+        // quietly and send the bytes anyway.
         let cmsg_end = match off.checked_add(cmsg_len) {
             Some(end) if cmsg_len >= cmsg.hdr_len && end <= ctrl.len() => end,
-            _ => break,
+            _ => return Err(LxError::EINVAL),
         };
         if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
             // A trailing partial fd is not one: `as_chunks` drops it, as the
@@ -1376,7 +1389,7 @@ impl Syscall<'_> {
         let fds_queued = !passed_fds.is_empty();
         if fds_queued {
             // Do not swallow the error: on a non-unix socket SCM_RIGHTS must
-            // fail the whole `sendmsg` (`EOPNOTSUPP`), not queue nothing and
+            // fail the whole `sendmsg` (`EINVAL`), not queue nothing and
             // still send the bytes.
             socket.send_fds(passed_fds)?;
         }
@@ -2234,20 +2247,20 @@ mod scm_rights_tests {
     }
 
     #[test]
-    fn a_length_past_the_end_of_the_buffer_stops_the_walk() {
+    fn a_length_past_the_end_of_the_buffer_is_einval() {
         let ctrl = cmsg_raw(4096, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
-        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Err(LxError::EINVAL));
     }
 
     #[test]
-    fn a_length_that_wraps_the_address_space_stops_the_walk() {
+    fn a_length_that_wraps_the_address_space_is_einval() {
         // `off + cmsg_len` overflowing would land back under `ctrl.len()` and
         // then slice with start > end, which is a kernel panic.
         for len in [u64::MAX, u64::MAX - 7, (usize::MAX as u64) - 16] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
             assert_eq!(
                 parse_scm_rights_fds(NATIVE, &ctrl),
-                Ok(vec![]),
+                Err(LxError::EINVAL),
                 "cmsg_len {}",
                 len
             );
@@ -2255,7 +2268,7 @@ mod scm_rights_tests {
     }
 
     #[test]
-    fn a_length_that_wraps_past_a_message_already_walked_stops_the_walk() {
+    fn a_length_that_wraps_past_a_message_already_walked_is_einval() {
         // The wrap that actually bites. At offset 0 a huge `cmsg_len` lands
         // past the end of the buffer and is refused on size alone; it takes a
         // first, well-formed message to move the walk forward before
@@ -2267,16 +2280,16 @@ mod scm_rights_tests {
         assert_eq!(ctrl.len(), 24);
         ctrl.extend(cmsg_raw(u64::MAX - 20, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]));
         assert_eq!(ctrl.len(), 40);
-        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![3]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Err(LxError::EINVAL));
     }
 
     #[test]
-    fn a_length_shorter_than_its_own_header_stops_the_walk() {
+    fn a_length_shorter_than_its_own_header_is_einval() {
         for len in [0u64, 1, 8, 15] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
             assert_eq!(
                 parse_scm_rights_fds(NATIVE, &ctrl),
-                Ok(vec![]),
+                Err(LxError::EINVAL),
                 "cmsg_len {}",
                 len
             );
@@ -3191,9 +3204,10 @@ mod control_and_batch_bounds_tests {
     /// message that has no payload.
     #[test]
     fn a_control_buffer_shorter_than_one_header_is_ignored_and_not_refused() {
-        // A null pointer, whatever the length claims.
+        // A null pointer with no length is no control data; with a length,
+        // Linux copies from it and faults.
         assert_eq!(scm_control_action(NATIVE, true, 0), Ok(false));
-        assert_eq!(scm_control_action(NATIVE, true, 4096), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, 4096), Err(LxError::EFAULT));
         // A buffer too short to hold `struct cmsghdr`.
         assert_eq!(scm_control_action(NATIVE, false, 0), Ok(false));
         assert_eq!(scm_control_action(NATIVE, false, 8), Ok(false));
@@ -3246,26 +3260,34 @@ mod control_and_batch_bounds_tests {
         assert_eq!(scm_control_action(NATIVE, false, 64 * 1024), Ok(true));
         assert_eq!(
             scm_control_action(NATIVE, false, 64 * 1024 + 1),
-            Err(LxError::EINVAL)
+            Err(LxError::ENOBUFS)
         );
         assert_eq!(
             scm_control_action(NATIVE, false, usize::MAX),
-            Err(LxError::EINVAL)
+            Err(LxError::ENOBUFS)
         );
         // The ceiling has to clear the floor, or no control message could ever
         // pass at all.
         assert!(CONTROL_MAX > CMSG_HDR_LEN);
     }
 
-    /// A null `msg_control` wins over any length, including one past the
-    /// ceiling.
-    ///
-    /// The order matters: a caller that leaves the pointer null and the length
-    /// as whatever was on the stack must get an ordinary send, not `EINVAL`.
+    /// The ceiling is answered before the pointer, as `____sys_sendmsg`
+    /// allocates before it copies: a NULL `msg_control` with a length past
+    /// it is `ENOBUFS`, and with a length under it `EFAULT`.
     #[test]
-    fn a_null_pointer_is_answered_before_the_ceiling() {
-        assert_eq!(scm_control_action(NATIVE, true, usize::MAX), Ok(false));
-        assert_eq!(scm_control_action(NATIVE, true, CONTROL_MAX + 1), Ok(false));
+    fn the_ceiling_is_answered_before_a_null_pointer() {
+        assert_eq!(
+            scm_control_action(NATIVE, true, usize::MAX),
+            Err(LxError::ENOBUFS)
+        );
+        assert_eq!(
+            scm_control_action(NATIVE, true, CONTROL_MAX + 1),
+            Err(LxError::ENOBUFS)
+        );
+        assert_eq!(
+            scm_control_action(NATIVE, true, CMSG_HDR_LEN),
+            Err(LxError::EFAULT)
+        );
     }
 
     /// One batch call walks at most 64 entries, whatever `vlen` says.
