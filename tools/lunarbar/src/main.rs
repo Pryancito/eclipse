@@ -618,7 +618,7 @@ enum PopupKind {
     /// is open, and an index would then act on whoever took its slot).
     TaskMenu { tid: u32, title: String, win: taskmenu::Win, sel: usize },
     /// Volume control popup slider.
-    Volume { level: u32, muted: bool, devices: Vec<String> },
+    Volume { level: u32, muted: bool, devices: Vec<volmenu::Output> },
     /// hunter's menu: modes, alerts and actions.
     Hunter(hunter_menu::Menu),
 }
@@ -662,6 +662,8 @@ enum Action {
     VolumePreset(u8),
     /// The mute switch.
     VolumeMute,
+    /// Send the sound to this output (its row in the popup).
+    VolumeOutput(u8),
     /// hunter: set a domain (index into `hunter::DOMAINS`) to a mode.
     HunterMode(u8, hunter::Mode),
     HunterLearning(bool),
@@ -1945,7 +1947,7 @@ impl State {
                 | Action::TaskFullscreen(_)
                 | Action::TaskClose(_)),
             ) => self.task_act(a),
-            Some(a @ (Action::VolumeGauge | Action::VolumeStep(_) | Action::VolumePreset(_) | Action::VolumeMute)) => {
+            Some(a @ (Action::VolumeGauge | Action::VolumeStep(_) | Action::VolumePreset(_) | Action::VolumeMute | Action::VolumeOutput(_))) => {
                 self.volume_act(qh, a, x)
             }
             Some(a @ (Action::HunterMode(..)
@@ -2965,7 +2967,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
         PopupKind::Calendar { .. } => calmenu::size(),
         PopupKind::PowerMenu { .. } => powermenu::size(),
         PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
-        PopupKind::Volume { .. } => volmenu::size(),
+        PopupKind::Volume { devices, .. } => volmenu::size(devices.len()),
         PopupKind::Hunter(_) => hunter_menu::size(),
     }
 }
@@ -4387,7 +4389,7 @@ fn main() {
             };
             if let Some(v) = std::env::var("LUNARBAR_DUMP_VOL").ok().and_then(|v| v.parse::<u32>().ok()) {
                 let muted = std::env::var("LUNARBAR_DUMP_VOL_MUTED").is_ok();
-                let devices = vec!["Audio interno analógico estéreo".to_string()];
+                let devices = volmenu::sample_outputs();
                 let (px, py, pw, _) = place(&PopupKind::Volume { level: v, muted, devices: devices.clone() }, false);
                 volmenu::draw(&mut cv, px - 120, py, pw, v, muted, &devices);
             } else if let Some(sel) = want_task {
