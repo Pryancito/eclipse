@@ -1592,7 +1592,10 @@ cfg_if! {
         /// to serve `layout` has to contain one such aligned block, which the
         /// buddy only finds if the region it is given covers one:
         /// `add_to_heap` carves a region into the largest self-aligned blocks
-        /// that fit, and never merges two regions into a bigger one.
+        /// that fit. (Free blocks of two regions that happen to touch DO
+        /// merge later, since the buddy of a block is `ptr ^ size`; growth
+        /// cannot count on that, and `heap_regions::absorb` is what keeps the
+        /// merged blocks freeable.)
         fn buddy_block_size(layout: Layout) -> usize {
             layout
                 .size()
@@ -2902,6 +2905,9 @@ pub mod heap_regions {
         if end <= start {
             return;
         }
+        if absorb(start, end) {
+            return;
+        }
         for i in 0..registered() {
             if STARTS[i].load(Ordering::SeqCst) == 0 {
                 RELEASED[i].store(0, Ordering::SeqCst);
@@ -2934,6 +2940,90 @@ pub mod heap_regions {
         }
     }
 
+    /// Fold `[start, end)` into the regions on record that it overlaps or
+    /// touches, so that the registry never holds two regions that share or
+    /// abut an address. Answers whether it did; `false` leaves the range for
+    /// [`register`] to put in a slot of its own.
+    ///
+    /// Both cases are real, and each turned sound blocks into wild ones:
+    ///
+    /// - **Touching.** Two growths that are neighbours in physical memory are
+    ///   neighbours in the linear map, and the buddy merges free blocks across
+    ///   them (its buddy is `ptr ^ size`, whatever region either half came
+    ///   from). A block of the merged size handed out and freed again lay in
+    ///   no ONE region, so [`contains`] said no, `dealloc` refused it as wild
+    ///   and the block was leaked -- still counted live, for good. Two 2 MiB
+    ///   fallback chunks side by side make exactly the 4 MiB block a
+    ///   coroutine stack used to be.
+    /// - **Overlapping.** A region given back in part stays on record with its
+    ///   holes (see [`note_released`]); a later growth can take the very
+    ///   frames of a hole. Recorded as a second region, every release of it
+    ///   was credited to both, so the first one's count ran ahead of what it
+    ///   had really given back until it was forgotten with blocks still live
+    ///   in it -- and from then on every free in it was refused and leaked.
+    ///
+    /// The frames a growth gets are free frames, so where it overlaps a
+    /// region on record it overlaps only that region's holes: those bytes are
+    /// the heap's again and come off the region's released count.
+    ///
+    /// Widening only: a reader of [`contains`] racing this sees the old pair
+    /// or a wider one, never a narrower, and the range is not the buddy's yet
+    /// (registering comes first, see the growth). Serialised with
+    /// [`note_released`] like [`register`].
+    fn absorb(start: usize, end: usize) -> bool {
+        let (mut lo, mut hi) = (start, end);
+        let mut keep: Option<usize> = None;
+        let mut released = 0usize;
+        // Bytes of `[start, end)` already inside a region on record.
+        let mut overlap = 0usize;
+        // A range can bridge two regions, and widening to one can make it
+        // touch another it was compared with earlier: go round until a pass
+        // folds nothing in.
+        loop {
+            let mut folded = false;
+            for i in 0..registered() {
+                if keep == Some(i) {
+                    continue;
+                }
+                let s = STARTS[i].load(Ordering::SeqCst);
+                if s == 0 {
+                    continue;
+                }
+                let e = ENDS[i].load(Ordering::SeqCst);
+                if e < lo || s > hi {
+                    continue;
+                }
+                overlap += end.min(e).saturating_sub(start.max(s));
+                released += RELEASED[i].load(Ordering::SeqCst);
+                lo = lo.min(s);
+                hi = hi.max(e);
+                match keep {
+                    None => keep = Some(i),
+                    Some(k) => {
+                        // Widen the kept slot over this one before this one
+                        // goes, so its addresses are never in neither.
+                        ENDS[k].store(hi, Ordering::SeqCst);
+                        STARTS[k].store(lo, Ordering::SeqCst);
+                        STARTS[i].store(0, Ordering::SeqCst);
+                        RELEASED[i].store(0, Ordering::SeqCst);
+                    }
+                }
+                folded = true;
+            }
+            if !folded {
+                break;
+            }
+        }
+        let Some(k) = keep else {
+            return false;
+        };
+        RELEASED[k].store(released.saturating_sub(overlap), Ordering::SeqCst);
+        // End first, then start: each store only widens.
+        ENDS[k].store(hi, Ordering::SeqCst);
+        STARTS[k].store(lo, Ordering::SeqCst);
+        true
+    }
+
     /// Record that `[start, end)` went back to the frame allocator, and
     /// forget every region that has now been given back whole. Answers how
     /// many regions were forgotten.
@@ -2944,8 +3034,8 @@ pub mod heap_regions {
     /// called wild, which is the same blind spot the guard has for a free
     /// into a part of the heap that is merely unused.
     ///
-    /// The range may cover more than one region: two growths can be
-    /// physically adjacent, and the buddy then merges blocks across them.
+    /// Regions on record never overlap or touch ([`absorb`] folds them
+    /// together), so a range given back is credited to one region only.
     /// Serialised with [`register`], for the same reason.
     pub fn note_released(start: usize, end: usize) -> usize {
         let mut forgotten = 0;
@@ -2971,8 +3061,9 @@ pub mod heap_regions {
 
     /// Whether `[addr, addr + size)` lies inside one region.
     ///
-    /// One region, not several: the heap's regions are separate allocations
-    /// and a block never straddles two.
+    /// One region is enough: regions that touch are recorded as one (see
+    /// [`absorb`]), so a block the buddy merged across two growths still
+    /// lies in a single region.
     pub fn contains(addr: usize, size: usize) -> bool {
         let Some(end) = addr.checked_add(size) else {
             return false;
