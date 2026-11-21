@@ -926,6 +926,15 @@ pub fn kernel_report() -> String {
             "sched weak:   {} created, peak live {}, soft-cap hits {}; stack-pool {}/overflow {}",
             created, peak, cap_hits, pool, overflow
         );
+        let (installed, refused, reserved, spent, starved, hardened, leaked, trimmed) =
+            kernel_hal::kstats::stack_guard_stats();
+        let _ = writeln!(
+            out,
+            "stack guard:  {} bands installed, {} refused; split frames {} spent of {} \
+             ({} starved); soft stacks {} hardened at retire, {} leaked; \
+             {} idle stacks given back to the heap",
+            installed, refused, spent, reserved, starved, hardened, leaked, trimmed
+        );
         // What the bounded stack poison is actually doing. `whole` climbing
         // with `bounded` at zero is the hook answering `None` (a huge leaf
         // over the kernel heap, or an architecture with no dirty bit): the

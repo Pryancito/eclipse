@@ -314,6 +314,51 @@ fn fill_split_pool() {
     }
 }
 
+/// Top the reserve back up to [`SPLIT_POOL_FRAMES`]. Answers how many frames
+/// it added.
+///
+/// From a task (the reclaim worker), where allocating is ordinary. The
+/// frames are taken first, with no lock held, and only the move into the
+/// reserve runs under [`SPLIT_LOCK`] -- the lock every take runs under -- so
+/// a CPU in `Executor::new` waits for a few hundred stores at most. A frame
+/// that did not fit goes back to the allocator.
+pub fn refill_split_pool() -> usize {
+    let want = SPLIT_POOL_FRAMES.saturating_sub(SPLIT_POOL.available());
+    if want == 0 {
+        return 0;
+    }
+    let mut got: alloc::vec::Vec<PhysFrame> = alloc::vec::Vec::new();
+    if got.try_reserve_exact(want).is_err() {
+        return 0;
+    }
+    for _ in 0..want {
+        let Some(frame) = PhysFrame::new_zero() else {
+            break;
+        };
+        got.push(frame);
+    }
+    if got.is_empty() {
+        return 0;
+    }
+    let added = {
+        let _guard = loop {
+            if let Some(g) = SPLIT_LOCK.try_lock() {
+                break g;
+            }
+            crate::common::ipi::tlb_shootdown_pump();
+            core::hint::spin_loop();
+        };
+        let mut paddrs = got.iter().map(|f| f.paddr());
+        SPLIT_POOL.refill(&mut paddrs)
+    };
+    // The first `added` are in the reserve now and become page tables:
+    // leaked deliberately, as in `fill_split_pool`. The rest go back.
+    for frame in got.drain(..added) {
+        core::mem::forget(frame);
+    }
+    added
+}
+
 /// Hand out one reserved frame, or `None` once the pool is spent.
 fn split_pool_take() -> Option<PhysAddr> {
     SPLIT_POOL.take()

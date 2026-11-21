@@ -490,6 +490,28 @@ pub fn stack_pool_stats() -> (usize, usize) {
     (0, 0)
 }
 
+/// What became of the coroutine stacks that were born with a soft canary
+/// instead of hard guard bands, and of the reserve of page-table frames whose
+/// exhaustion is what gives them one:
+/// `(bands installed, bands refused, split frames reserved, spent, starved,
+/// soft blocks hardened at retirement, soft blocks leaked, idle blocks given
+/// back to the heap)`.
+#[cfg(all(target_os = "none", not(feature = "libos")))]
+pub fn stack_guard_stats() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    let (installed, refused) = crate::imp::stack_guard::stats();
+    let (reserved, spent, starved) = crate::imp::stack_guard::split_pool_stats();
+    let (hardened, leaked) = executor::soft_stack_retire_stats();
+    let trimmed = executor::trimmed_stacks();
+    (
+        installed, refused, reserved, spent, starved, hardened, leaked, trimmed,
+    )
+}
+
+#[cfg(not(all(target_os = "none", not(feature = "libos"))))]
+pub fn stack_guard_stats() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    (0, 0, 0, 0, 0, 0, 0, 0)
+}
+
 /// `(deepest coroutine-stack use observed at a park, STACK_SIZE)` in bytes.
 /// The evidence for (or against) shrinking executor stacks.
 #[cfg(target_os = "none")]

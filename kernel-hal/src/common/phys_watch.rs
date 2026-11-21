@@ -248,6 +248,10 @@ pub struct FramePool<const N: usize> {
     len: AtomicUsize,
     taken: AtomicUsize,
     refused: AtomicUsize,
+    /// Frames handed out before the last [`refill`](Self::refill), which
+    /// moves the cursor back to the front. Keeps [`stats`](Self::stats)
+    /// counting since boot.
+    retired: AtomicUsize,
 }
 
 impl<const N: usize> Default for FramePool<N> {
@@ -263,6 +267,7 @@ impl<const N: usize> FramePool<N> {
             len: AtomicUsize::new(0),
             taken: AtomicUsize::new(0),
             refused: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
         }
     }
 
@@ -304,11 +309,56 @@ impl<const N: usize> FramePool<N> {
         }
     }
 
-    /// `(frames reserved, frames handed out, requests refused)`.
+    /// Frames still in the reserve, not handed out yet.
+    pub fn available(&self) -> usize {
+        self.len
+            .load(Ordering::Acquire)
+            .saturating_sub(self.taken.load(Ordering::Acquire))
+    }
+
+    /// Top the reserve up from `more`, after moving the frames not handed out
+    /// yet to the front. Answers how many of `more` it took; the iterator is
+    /// left holding the rest.
+    ///
+    /// A reserve filled only at boot is spent for good once enough stacks have
+    /// landed in fresh 2 MiB regions -- which a heap that grows into the
+    /// linear map does every time it grows -- and from then on every new
+    /// coroutine stack got a soft canary and was leaked when it retired
+    /// (`[stack-retire] leaking soft-guarded retired stack`), so the heap
+    /// grew again, into more fresh regions. Refilling from a task, where
+    /// allocating is ordinary, breaks that circle.
+    ///
+    /// The caller must keep every [`take`](Self::take) out while this runs
+    /// (the stack guards hold their split lock across both): the frames
+    /// move under the cursor.
+    pub fn refill(&self, more: &mut dyn Iterator<Item = usize>) -> usize {
+        let len = self.len.load(Ordering::Acquire);
+        let taken = self.taken.load(Ordering::Acquire).min(len);
+        let left = len - taken;
+        for i in 0..left {
+            let f = self.frames[taken + i].load(Ordering::Relaxed);
+            self.frames[i].store(f, Ordering::Relaxed);
+        }
+        self.retired.fetch_add(taken, Ordering::Relaxed);
+        self.taken.store(0, Ordering::Release);
+        self.len.store(left, Ordering::Release);
+        let mut added = 0;
+        while self.len.load(Ordering::Relaxed) < N {
+            let Some(paddr) = more.next() else {
+                break;
+            };
+            self.push(paddr);
+            added += 1;
+        }
+        added
+    }
+
+    /// `(frames reserved, frames handed out, requests refused)`, since boot.
     pub fn stats(&self) -> (usize, usize, usize) {
+        let retired = self.retired.load(Ordering::Relaxed);
         (
-            self.len.load(Ordering::Relaxed),
-            self.taken.load(Ordering::Relaxed),
+            retired + self.len.load(Ordering::Relaxed),
+            retired + self.taken.load(Ordering::Relaxed),
             self.refused.load(Ordering::Relaxed),
         )
     }
@@ -622,6 +672,30 @@ mod tests {
         assert_eq!(p.take(), None);
         assert_eq!(p.take(), None);
         assert_eq!(p.stats(), (2, 2, 3));
+    }
+
+    #[test]
+    fn a_refill_keeps_what_was_left_and_tops_up_to_the_cap() {
+        let p: FramePool<3> = FramePool::new();
+        p.push(0x1000);
+        p.push(0x2000);
+        p.push(0x3000);
+        assert_eq!(p.take(), Some(0x1000));
+        assert_eq!(p.take(), Some(0x2000));
+        assert_eq!(p.take(), Some(0x3000));
+        assert_eq!(p.take(), None, "spent");
+        let mut more = [0x4000usize, 0x5000, 0x6000, 0x7000].iter().copied();
+        assert_eq!(p.refill(&mut more), 3, "up to the cap");
+        assert_eq!(more.next(), Some(0x7000), "the rest stays with the caller");
+        assert_eq!(p.available(), 3);
+        assert_eq!(p.take(), Some(0x4000));
+        let mut more = [0x8000usize].iter().copied();
+        assert_eq!(p.refill(&mut more), 1);
+        assert_eq!(p.take(), Some(0x5000), "what was left comes out first");
+        assert_eq!(p.take(), Some(0x6000));
+        assert_eq!(p.take(), Some(0x8000));
+        assert_eq!(p.take(), None);
+        assert_eq!(p.stats(), (7, 7, 2), "counted since boot");
     }
 
     #[test]

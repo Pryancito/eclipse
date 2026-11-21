@@ -990,7 +990,7 @@ fn faulting_stack_callers(out: &mut [u64]) -> usize {
     let start = kernel_hal::kstats::last_fault_rsp() & !0x7;
     let words = (0..WORDS)
         .map(|i| start.wrapping_add(i * 8))
-        .take_while(|&a| kernel_hal::kaddr::is_kernel_addr(a) && mapped(a))
+        .take_while(|&a| kernel_hal::kaddr::is_kernel_stack_addr(a) && mapped(a))
         // SAFETY: on a present page of the kernel half, just asked.
         .map(|a| unsafe { core::ptr::read_volatile(a as *const u64) });
     let tail = |w: u64| {

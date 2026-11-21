@@ -27,6 +27,13 @@ use core::time::Duration;
 use kernel_hal::shrinker;
 use kernel_hal::timer::timer_now;
 
+/// Idle coroutine stacks kept ready for the next `Executor::new`; the rest go
+/// back to the heap, half the excess a period (`executor::trim_idle_stacks`).
+/// Sixteen covers the stacks a quiet desktop churns through, so the common
+/// case still reuses a pooled block and pays no guard install for it.
+#[cfg(not(feature = "libos"))]
+const IDLE_STACKS_KEPT: usize = 16;
+
 /// How often the worker looks. Linux's `kswapd` sleeps on a waitqueue with a
 /// 100 ms watchdog; this is the watchdog without the waitqueue.
 const PERIOD_MS: u64 = 200;
@@ -118,6 +125,29 @@ pub fn start() {
         }
         loop {
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(PERIOD_MS)).await;
+            // The page-table frames that let a coroutine stack get unmapped
+            // guard bands. Spent, every new stack got a soft canary instead
+            // and was leaked when it retired, 2.6 MiB at a time, until the
+            // heap reached its ceiling: see `refill_split_pool`.
+            #[cfg(not(feature = "libos"))]
+            {
+                let added = kernel_hal::stack_guard::refill_split_pool();
+                if added > 0 {
+                    log::info!(
+                        "reclaimd: {} page-table frame(s) back in the stack-guard reserve",
+                        added
+                    );
+                }
+                // Idle coroutine stacks a burst left behind, before the heap
+                // is given back below, so their blocks can go with it.
+                let trimmed = executor::trim_idle_stacks(IDLE_STACKS_KEPT);
+                if trimmed > 0 {
+                    log::info!(
+                        "reclaimd: gave {} KiB of idle coroutine stacks back to the heap",
+                        trimmed / 1024
+                    );
+                }
+            }
             // Before the figures are read, so a pass that gave memory back
             // sees it as free. Not tied to the watermark: memory the heap
             // grew into and no longer uses goes back to the frame allocator

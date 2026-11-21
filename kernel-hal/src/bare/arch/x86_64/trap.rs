@@ -514,7 +514,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
 fn report_dma_uaf_if_recycled(sp: u64) {
     use crate::vm::{GenericPageTable, PageTable};
     let va = sp as usize;
-    if !crate::kaddr::is_kernel_addr(va as u64) {
+    if !crate::kaddr::is_kernel_stack_addr(va as u64) {
         return;
     }
     let pt = PageTable::from_current();
