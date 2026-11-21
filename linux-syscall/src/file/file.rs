@@ -1258,6 +1258,14 @@ impl Syscall<'_> {
             _ => return Err(LxError::ENODEV),
         };
         let end = offset.checked_add(len).ok_or(LxError::EFBIG)?;
+        // `shmem_fallocate`: a memfd sealed against growing refuses a range
+        // past its end, `FALLOC_FL_KEEP_SIZE` or not, and one sealed against
+        // writes refuses a punch or a zeroing.
+        if !linux_object::fs::memfd_grow_allowed(&file.inode(), end as u64)
+            || (zeroing && !linux_object::fs::memfd_write_allowed(&file.inode()))
+        {
+            return Err(LxError::EPERM);
+        }
         let keep_size = match op {
             FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
         };
@@ -3753,3 +3761,7 @@ mod short_write_tests;
 
 #[cfg(test)]
 mod dsp_close_tests;
+
+/// `F_SEAL_GROW` refuses writes and allocations past the sealed size.
+#[cfg(test)]
+mod memfd_grow_seal_tests;

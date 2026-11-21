@@ -1688,6 +1688,12 @@ impl Syscall<'_> {
         UnixSocketState::connect_pair(&socket1, &socket2);
         socket1.set_socket_type(socket_type);
         socket2.set_socket_type(socket_type);
+        // `unix_socketpair`: `init_peercred` on both ends, so `SO_PEERCRED`
+        // on either names the caller. Neither end had an owner, and the
+        // answer was pid 0 with no ids.
+        let me = self.zircon_process().id() as i32;
+        socket1.set_owner_pid(me);
+        socket2.set_owner_pid(me);
         // The type argument packs SOCK_NONBLOCK / SOCK_CLOEXEC alongside the
         // socket type (same bit values as O_NONBLOCK / O_CLOEXEC, like
         // accept4). These used to be silently dropped, handing out BLOCKING
@@ -2306,6 +2312,55 @@ mod peercred_tests {
     fn words(bytes: [u8; 12]) -> [u32; 3] {
         let w = |i: usize| u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
         [w(0), w(1), w(2)]
+    }
+
+    #[test]
+    fn both_ends_of_a_socketpair_name_the_process_that_made_it() {
+        use crate::on_a_thread::on_a_thread;
+        use alloc::boxed::Box;
+        const AF_UNIX: usize = 1;
+        const SOCK_STREAM: usize = 1;
+        const SOL_SOCKET: usize = 1;
+        let proc = a_process(43_103);
+        proc.linux().set_resuid(0, 1000, 0).unwrap();
+        let got = on_a_thread(&proc, |sys| {
+            Box::pin(async move {
+                let mut own = Syscall {
+                    thread: sys.thread,
+                    thread_fn: sys.thread_fn,
+                    syscall_entry: sys.syscall_entry,
+                };
+                let mut sv = [0i32; 2];
+                own.sys_socketpair(
+                    AF_UNIX,
+                    SOCK_STREAM,
+                    0,
+                    UserOutPtr::from(sv.as_mut_ptr() as usize),
+                )
+                .unwrap();
+                sv.map(|fd| {
+                    let mut cred = [0u8; 12];
+                    let mut len: u32 = 12;
+                    own.sys_getsockopt(
+                        fd as usize,
+                        SOL_SOCKET,
+                        SO_PEERCRED,
+                        UserOutPtr::from(cred.as_mut_ptr() as usize),
+                        UserInOutPtr::from(&mut len as *mut u32 as usize),
+                    )
+                    .unwrap();
+                    cred
+                })
+            })
+        });
+        for cred in got {
+            assert_eq!(
+                words(cred)[0],
+                43_103,
+                "the pid of the process that made the pair"
+            );
+            assert_eq!(words(cred)[1], 1000, "its effective uid");
+        }
     }
 
     #[test]

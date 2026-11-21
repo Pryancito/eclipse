@@ -1129,6 +1129,12 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
+        // And one sealed against growing refuses a write past its end
+        // (`shmem_write_begin`), which used to grow it.
+        if !buf.is_empty() && !crate::fs::memfd_grow_allowed(&self.inode, offset + buf.len() as u64)
+        {
+            return Err(LxError::EPERM);
+        }
         // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
         // `INode::write_at` contract cannot carry (the same reason the ALSA
         // PCM ioctl is routed with its flags in `File::ioctl`).

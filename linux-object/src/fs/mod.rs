@@ -379,6 +379,18 @@ pub fn memfd_write_allowed(inode: &Arc<dyn INode>) -> bool {
     memfd_seals(inode).is_none_or(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0)
 }
 
+/// Whether a write or an allocation that ends at `end` is allowed by the
+/// seals of `inode`: `F_SEAL_GROW` refuses anything past the current size
+/// (`shmem_write_begin`, `shmem_fallocate`). Non-memfds are unsealed.
+pub fn memfd_grow_allowed(inode: &Arc<dyn INode>, end: u64) -> bool {
+    match memfd_seals(inode) {
+        Some(s) if s & F_SEAL_GROW != 0 => {
+            end <= inode.metadata().map(|m| m.size as u64).unwrap_or(0)
+        }
+        _ => true,
+    }
+}
+
 /// (created_total, live_count, live_bytes) for memfd inodes.
 ///
 /// Uses `try_lock`: this is called from the OOM handler, and a concurrent
