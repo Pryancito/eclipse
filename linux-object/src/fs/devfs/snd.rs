@@ -2440,8 +2440,10 @@ impl core::fmt::Debug for Timespec {
 /// tested without a sound device.
 struct TimerState {
     tread: bool,
-    /// Card index of the PCM timer bound by SELECT.
+    /// Card number of the PCM timer bound by SELECT.
     selected: Option<usize>,
+    /// Where that card's clock is read.
+    source: Option<TimerSource>,
     running: bool,
     auto: bool,
     /// Periods per delivered tick (PARAMS `ticks`, >= 1).
@@ -2466,6 +2468,7 @@ impl TimerState {
         TimerState {
             tread: false,
             selected: None,
+            source: None,
             running: false,
             auto: false,
             ticks: 1,
@@ -2508,8 +2511,9 @@ impl TimerState {
         self.queue.push_back(TimerEvent { event, tstamp, val });
     }
 
-    fn select(&mut self, card: usize) {
+    fn select(&mut self, card: usize, source: TimerSource) {
         self.selected = Some(card);
+        self.source = Some(source);
         self.running = false;
         self.queue.clear();
         self.overrun = 0;
@@ -2689,14 +2693,19 @@ fn timer_metadata(inode_id: usize) -> Metadata {
 /// gets its own [`TimerClient`].
 pub struct TimerDev {
     pcms: Vec<Arc<PcmDev>>,
+    first_card: usize,
     inode_id: usize,
 }
 
 impl TimerDev {
-    /// `pcms[card]` is the playback stream of card `card`.
-    pub fn new(pcms: Vec<Arc<PcmDev>>) -> Self {
+    /// `pcms[i]` is the playback stream of card `first_card + i`: the
+    /// kernel's cards are numbered after the served HD Audio card when it
+    /// has card 0 (`choose_first_kernel_card`), so a card number is not an
+    /// index into `pcms`. Any other card is a served one ([`TimerSource`]).
+    pub fn new(pcms: Vec<Arc<PcmDev>>, first_card: usize) -> Self {
         TimerDev {
             pcms,
+            first_card,
             inode_id: DevFS::new_inode_id(),
         }
     }
@@ -2704,9 +2713,133 @@ impl TimerDev {
     pub fn open_client(&self) -> Arc<dyn INode> {
         Arc::new(TimerClient {
             pcms: self.pcms.clone(),
+            first_card: self.first_card,
             inode_id: self.inode_id,
             st: Mutex::new(TimerState::new()),
         })
+    }
+}
+
+/// Where a selected card's period clock comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerSource {
+    /// The kernel's own card: index into `pcms`.
+    Kernel(usize),
+    /// A card a userspace driver serves (`udrv-hda`): see [`served_clock`].
+    Served(usize),
+}
+
+/// Which clock card `card` has, given the kernel's `kernel_cards` cards
+/// from `first_card` on and whether a served PCM node exists for it.
+/// `None` is a card nobody plays: ENODEV, as Linux answers.
+fn timer_source(
+    card: usize,
+    first_card: usize,
+    kernel_cards: usize,
+    served: impl FnOnce(usize) -> bool,
+) -> Option<TimerSource> {
+    if card >= first_card && card - first_card < kernel_cards {
+        return Some(TimerSource::Kernel(card - first_card));
+    }
+    if card < SERVED_TIMER_CARDS && served(card) {
+        return Some(TimerSource::Served(card));
+    }
+    None
+}
+
+// ── Timers of served cards ──────────────────────────────────────────────────
+//
+// A card a userspace driver serves (`udrv-hda`, `/dev/snd/pcmC0D0p` as a
+// served node) has its stream in that process: the kernel never sees its
+// hardware pointer. But alsa-lib's `hw` plugin binds THIS node for every PCM
+// whose client asks for `period_event` -- PulseAudio's `tsched=0` sinks --
+// and fails `snd_pcm_sw_params` when SELECT says ENODEV. That was the
+// `[alsa-hunt] ioctl TIMER_SELECT -> ENODEV` pair on the console and a sink
+// that never loaded. alsa-lib polls only the timer's fd once it is bound,
+// so what the client needs is one tick per elapsed period: the served card
+// ticks on the clock, at the period its last HW_PARAMS settled on (seen on
+// its way back to the program, [`note_served_hw_params`]). A client woken a
+// little early or late just finds less or more room in the ring, as with a
+// kernel card whose pointer advances in DMA-sized steps.
+
+/// Served cards with a timer here: `udrv-hda` takes card 0 or the first one
+/// after the kernel's, never far.
+const SERVED_TIMER_CARDS: usize = 8;
+/// The tick of a served card before any HW_PARAMS said its period: 10 ms,
+/// shorter than any period PulseAudio asks for, so it is never late.
+const SERVED_TICK_DEFAULT_NS: u64 = 10_000_000;
+/// The period, in ns, of each served card's stream (0: not known yet).
+static SERVED_PERIOD_NS: [core::sync::atomic::AtomicU64; SERVED_TIMER_CARDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SERVED_TIMER_CARDS];
+
+/// The period a successful HW_PARAMS on served node `name` settled on, from
+/// the `struct snd_pcm_hw_params` it gave back: kept for the card's timer.
+pub(crate) fn note_served_hw_params(name: &str, params: &[u8]) {
+    let Some(card) = served_pcm_card(name) else {
+        return;
+    };
+    if let Some(ns) = hw_params_period_ns(params) {
+        SERVED_PERIOD_NS[card].store(ns, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `snd/pcmC<card>D0p` -> `card`, for the cards a timer can be served for.
+fn served_pcm_card(name: &str) -> Option<usize> {
+    let card: usize = name
+        .strip_prefix("snd/pcmC")?
+        .strip_suffix("D0p")?
+        .parse()
+        .ok()?;
+    (card < SERVED_TIMER_CARDS).then_some(card)
+}
+
+/// The period length in ns that a refined `snd_pcm_hw_params` fixes:
+/// `period_size / rate`, both read as their intervals' `min` (after
+/// HW_PARAMS every interval is a single value).
+fn hw_params_period_ns(params: &[u8]) -> Option<u64> {
+    const INTERVALS: usize = core::mem::offset_of!(SndPcmHwParams, intervals);
+    const IV: usize = core::mem::size_of::<SndInterval>();
+    let min_of = |par: usize| -> Option<u64> {
+        let at = INTERVALS + (par - 8) * IV;
+        let b = params.get(at..at + 4)?;
+        Some(u64::from(u32::from_ne_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    let size = min_of(PAR_PERIOD_SIZE)?;
+    let rate = min_of(PAR_RATE)?;
+    if size == 0 || rate == 0 {
+        return None;
+    }
+    let ns = size.saturating_mul(1_000_000_000) / rate;
+    // Anything outside 1 ms .. 2 s is not a period anyone plays with.
+    (1_000_000..=2_000_000_000).contains(&ns).then_some(ns)
+}
+
+/// Whether `/dev/snd/pcmC<card>D0p` is a node a process serves.
+fn served_pcm_exists(card: usize) -> bool {
+    let Some(root) = crate::fs::DEVFS_ROOT.lock().clone() else {
+        return false;
+    };
+    let root: Arc<dyn INode> = root;
+    root.find("snd")
+        .and_then(|d| d.find(&format!("pcmC{}D0p", card)))
+        .map(|n| n.downcast_ref::<super::ServedNode>().is_some())
+        .unwrap_or(false)
+}
+
+/// A served card's clock: always running (the timer only counts while it
+/// is started itself), one period per `period` ns of monotonic time.
+fn served_clock(card: usize, now_ns: u64) -> PeriodClock {
+    let period = match SERVED_PERIOD_NS
+        .get(card)
+        .map(|p| p.load(core::sync::atomic::Ordering::Relaxed))
+    {
+        Some(ns) if ns > 0 => ns,
+        _ => SERVED_TICK_DEFAULT_NS,
+    };
+    PeriodClock {
+        running: true,
+        periods: now_ns / period,
+        resolution_ns: period,
     }
 }
 
@@ -2736,15 +2869,26 @@ impl INode for TimerDev {
 /// One open of `/dev/snd/timer`.
 pub struct TimerClient {
     pcms: Vec<Arc<PcmDev>>,
+    first_card: usize,
     inode_id: usize,
     st: Mutex<TimerState>,
 }
 
 impl TimerClient {
+    /// The bound card's clock now, `None` when nothing is selected.
+    fn clock(&self, st: &TimerState) -> Option<PeriodClock> {
+        match st.source? {
+            TimerSource::Kernel(i) => self.pcms.get(i).map(|pcm| pcm.period_clock()),
+            TimerSource::Served(card) => {
+                let now = kernel_hal::timer::timer_now();
+                Some(served_clock(card, now.as_nanos() as u64))
+            }
+        }
+    }
+
     /// Refresh the queue from the bound stream. Held lock: `st`.
     fn sample(&self, st: &mut TimerState) {
-        if let Some(pcm) = st.selected.and_then(|card| self.pcms.get(card)) {
-            let clock = pcm.period_clock();
+        if let Some(clock) = self.clock(st) {
             st.sample(clock, now_timespec());
         }
     }
@@ -2806,16 +2950,17 @@ impl INode for TimerClient {
                 let sel = unsafe { &*(data as *const SndTimerSelect) };
                 let id = sel.id;
                 let card = usize::try_from(id.card).map_err(|_| FsError::NoDevice)?;
-                if id.dev_class != TIMER_CLASS_PCM
-                    || id.device != 0
-                    || id.subdevice != 0
-                    || card >= self.pcms.len()
-                {
+                if id.dev_class != TIMER_CLASS_PCM || id.device != 0 || id.subdevice != 0 {
                     return Err(FsError::NoDevice);
                 }
+                let source =
+                    timer_source(card, self.first_card, self.pcms.len(), served_pcm_exists)
+                        .ok_or(FsError::NoDevice)?;
                 let mut st = self.st.lock();
-                st.select(card);
-                st.resolution_ns = self.pcms[card].period_clock().resolution_ns;
+                st.select(card, source);
+                if let Some(clock) = self.clock(&st) {
+                    st.resolution_ns = clock.resolution_ns;
+                }
                 Ok(0)
             }
             0x11 => {
