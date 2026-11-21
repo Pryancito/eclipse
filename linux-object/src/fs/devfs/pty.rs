@@ -29,12 +29,19 @@ use core::{
 };
 
 use kernel_hal::console::ConsoleWinSize;
+use kernel_hal::user::{UserInPtr, UserOutPtr};
 use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
 
 use super::super::ioctl::*;
 use crate::fs::stdio::wake_tty_intr_waiters;
+
+/// A user pointer an ioctl was handed, read or written as `copy_from_user`
+/// and `copy_to_user` do: `EFAULT` when it is not the caller's memory.
+fn user_copy<T>(r: core::result::Result<T, kernel_hal::user::Error>) -> Result<T> {
+    r.map_err(|_| FsError::BadAddress)
+}
 
 // c_iflag
 // c_lflag
@@ -570,28 +577,30 @@ fn pty_ioctl(inner: &Arc<Mutex<PtyInner>>, master: bool, cmd: u32, data: usize) 
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            unsafe { *(data as *mut Termios) = g.termios };
+            let v: Termios = g.termios;
+            user_copy(UserOutPtr::<Termios>::from(data).write(v))?;
             Ok(0)
         }
         TCGETS2 => {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            unsafe { *(data as *mut Termios2) = g.termios.into() };
+            let v: Termios2 = g.termios.into();
+            user_copy(UserOutPtr::<Termios2>::from(data).write(v))?;
             Ok(0)
         }
         TCSETS | TCSETSW | TCSETSF => {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            g.termios = unsafe { *(data as *const Termios) };
+            g.termios = user_copy(UserInPtr::<Termios>::from(data).read())?;
             Ok(0)
         }
         TCSETS2 | TCSETSW2 | TCSETSF2 => {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            let t2 = unsafe { *(data as *const Termios2) };
+            let t2 = user_copy(UserInPtr::<Termios2>::from(data).read())?;
             g.termios = t2.into();
             Ok(0)
         }
@@ -599,19 +608,20 @@ fn pty_ioctl(inner: &Arc<Mutex<PtyInner>>, master: bool, cmd: u32, data: usize) 
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            unsafe { *(data as *mut ConsoleWinSize) = g.winsize };
+            let v: ConsoleWinSize = g.winsize;
+            user_copy(UserOutPtr::<ConsoleWinSize>::from(data).write(v))?;
             Ok(0)
         }
         TIOCSWINSZ => {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            g.winsize = unsafe { *(data as *const ConsoleWinSize) };
+            g.winsize = user_copy(UserInPtr::<ConsoleWinSize>::from(data).read())?;
             Ok(0)
         }
         TIOCSPGRP => {
             if data != 0 {
-                g.fg_pgrp = unsafe { *(data as *const i32) };
+                g.fg_pgrp = user_copy(UserInPtr::<i32>::from(data).read())?;
             }
             Ok(0)
         }
@@ -637,21 +647,23 @@ fn pty_ioctl(inner: &Arc<Mutex<PtyInner>>, master: bool, cmd: u32, data: usize) 
                     pgid = 1;
                 }
             }
-            unsafe { *(data as *mut i32) = pgid };
+            let v: i32 = pgid;
+            user_copy(UserOutPtr::<i32>::from(data).write(v))?;
             Ok(0)
         }
         _ if cmd as u32 == TIOCGPTN => {
             if !master || data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            unsafe { *(data as *mut u32) = g.num };
+            let v: u32 = g.num;
+            user_copy(UserOutPtr::<u32>::from(data).write(v))?;
             Ok(0)
         }
         _ if cmd as u32 == TIOCSPTLCK => {
             if !master || data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            g.locked = unsafe { *(data as *const i32) };
+            g.locked = user_copy(UserInPtr::<i32>::from(data).read())?;
             Ok(0)
         }
         // TIOCSCTTY / TIOCNOTTY: accept (controlling-tty assignment is a no-op

@@ -421,7 +421,8 @@ fn complete_vt_switch(target: usize) {
 }
 
 fn user_copy<T>(r: core::result::Result<T, UserError>) -> Result<T> {
-    r.map_err(|_| FsError::InvalidParam)
+    // `copy_to_user`/`get_user` failing is `EFAULT` in `tty_ioctl`.
+    r.map_err(|_| FsError::BadAddress)
 }
 
 /// `c_cc[idx] == 0` means the special character is disabled (`_POSIX_VDISABLE`).
@@ -472,7 +473,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         TIOCSPGRP => {
-            let pgid = unsafe { *(data as *const i32) };
+            let pgid = user_copy(UserInPtr::<i32>::from(data).read())?;
             let vt_i = vt_clamp(vt);
             let old = tty_fg_pgrp(vt).swap(pgid, Ordering::Relaxed);
             if old != pgid {
@@ -550,7 +551,8 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         KDGETMODE => {
-            unsafe { *(data as *mut i32) = console::kd_mode_vt(vt) as i32 };
+            let v: i32 = console::kd_mode_vt(vt) as i32;
+            user_copy(UserOutPtr::<i32>::from(data).write(v))?;
             Ok(0)
         }
         KDSETMODE => {
@@ -589,11 +591,13 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         }
         // X validates a console fd with KDGKBTYPE; reply with a PC keyboard.
         KDGKBTYPE => {
-            unsafe { *(data as *mut u8) = KB_101 };
+            let v: u8 = KB_101;
+            user_copy(UserOutPtr::<u8>::from(data).write(v))?;
             Ok(0)
         }
         KDGKBMODE => {
-            unsafe { *(data as *mut i32) = tty_kbd_mode(vt) };
+            let v: i32 = tty_kbd_mode(vt);
+            user_copy(UserOutPtr::<i32>::from(data).write(v))?;
             Ok(0)
         }
         KDSKBMODE => {
@@ -617,12 +621,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
-            let p = data as *mut u8;
-            let (table, index) = unsafe { (*p, *p.add(1)) };
+            let [table, index] = user_copy(UserInPtr::<[u8; 2]>::from(data).read())?;
             let value = linux_keycode_to_evdev(index)
                 .map(|evdev| kdgkbent_value(evdev, table))
                 .unwrap_or(0);
-            unsafe { *(p.add(2) as *mut u16) = value };
+            user_copy(UserOutPtr::<u16>::from(data + 2).write(value))?;
             Ok(0)
         }
         KDGETLED => {
@@ -645,11 +648,13 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // Hand the caller the active VT: an X server then takes over the
             // terminal it was launched from, which always has a device node.
             let vtno = kernel_hal::console::active_vt() as i32 + 1;
-            unsafe { *(data as *mut i32) = vtno };
+            let v: i32 = vtno;
+            user_copy(UserOutPtr::<i32>::from(data).write(v))?;
             Ok(0)
         }
         VT_GETMODE => {
-            unsafe { *(data as *mut VtMode) = *tty_vt_mode(vt).lock() };
+            let v: VtMode = *tty_vt_mode(vt).lock();
+            user_copy(UserOutPtr::<VtMode>::from(data).write(v))?;
             Ok(0)
         }
         VT_SETMODE => {
@@ -657,7 +662,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             if mode.is_null() {
                 return Err(FsError::InvalidParam);
             }
-            let vm = unsafe { *mode };
+            let vm = user_copy(UserInPtr::<VtMode>::from(data).read())?;
             if !vt_mode_accepted(vm.mode) {
                 return Err(FsError::InvalidParam);
             }
@@ -692,13 +697,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             let active = kernel_hal::console::active_vt() as u16 + 1;
             // v_state is a bitmask of in-use VTs; bit N == VT N (bit 0 unused).
             let in_use = (((1u32 << kernel_hal::console::NUM_VTS) - 1) << 1) as u16;
-            unsafe {
-                *(data as *mut VtStat) = VtStat {
-                    v_active: active,
-                    v_signal: 0,
-                    v_state: in_use,
-                }
-            };
+            user_copy(UserOutPtr::<VtStat>::from(data).write(VtStat {
+                v_active: active,
+                v_signal: 0,
+                v_state: in_use,
+            }))?;
             Ok(0)
         }
         VT_ACTIVATE => {
@@ -790,7 +793,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             if p.is_null() {
                 return Err(FsError::InvalidParam);
             }
-            let subcmd = unsafe { *p };
+            let subcmd = user_copy(UserInPtr::<u8>::from(data).read())?;
             match subcmd {
                 TIOCL_GETSHIFTSTATE => {
                     let mut state = 0u8;
@@ -806,7 +809,7 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
                     if LEFT_ALT_DOWN.load(Ordering::SeqCst) {
                         state |= 1 << 3;
                     }
-                    unsafe { *p = state };
+                    user_copy(UserOutPtr::<u8>::from(data).write(state))?;
                     Ok(0)
                 }
                 other => {
