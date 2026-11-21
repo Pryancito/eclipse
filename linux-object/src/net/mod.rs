@@ -1502,6 +1502,13 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     async fn connect(&self, endpoint: Endpoint) -> SysResult;
+    /// `connect(2)` to an `AF_UNSPEC` address: a datagram socket forgets its
+    /// destination. A socket with nothing to forget refuses the address as
+    /// one of the wrong family, which is what a unix stream does
+    /// (`unix_validate_addr`).
+    fn disconnect(&self) -> SysResult {
+        Err(LxError::EINVAL)
+    }
     /// missing documentation
     fn bind(&self, _endpoint: Endpoint) -> SysResult {
         Err(LxError::EINVAL)

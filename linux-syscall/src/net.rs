@@ -88,6 +88,16 @@ fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode 
 /// `move_addr_to_kernel` semantics.
 #[allow(unsafe_code)]
 fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
+    // `move_addr_to_kernel`: a length that is negative as an `int` or longer
+    // than a `sockaddr_storage` is `EINVAL`, and none at all copies nothing
+    // -- the family's own check then refuses it (`sockaddr_to_endpoint`).
+    let len = addrlen as u32 as i32;
+    if !(0..=SOCKADDR_STORAGE_LEN).contains(&len) {
+        return Err(LxError::EINVAL);
+    }
+    if len == 0 {
+        return Ok(unsafe { core::mem::zeroed() });
+    }
     if addr == 0 {
         return Err(LxError::EFAULT);
     }
@@ -108,6 +118,17 @@ fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
     }
     Ok(storage)
 }
+
+/// A family `sockaddr_to_endpoint` parses.
+fn known_family(family: u16) -> bool {
+    matches!(family, 1 | 2 | 10 | 16 | 17)
+}
+
+/// `sizeof(struct sockaddr_storage)`: the most `move_addr_to_kernel` takes.
+const SOCKADDR_STORAGE_LEN: i32 = 128;
+
+/// `AF_UNSPEC`: to `connect(2)`, "dissolve the association".
+const AF_UNSPEC: u16 = 0;
 
 /// Copy an option value out to a `getsockopt` caller.
 ///
@@ -644,9 +665,33 @@ impl Syscall<'_> {
             "sys_connect: sockfd:{}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
-        let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
+        // `__sys_connect` in its order: the fd, the address copied in, then
+        // whether the fd is a socket at all, then the family's own checks.
         let proc = self.linux_process();
         let file_like = proc.get_file_like(sockfd.into())?;
+        let sa = read_sockaddr(addr.as_addr(), addrlen)?;
+        let socket = file_like.as_socket()?;
+        #[allow(unsafe_code)]
+        let family = unsafe { sa.family };
+        // `AF_UNSPEC` takes a datagram socket's destination away
+        // (`unix_dgram_connect`, `udp_disconnect`). It used to be `EINVAL`
+        // for every socket.
+        if addrlen >= size_of::<u16>() && family == AF_UNSPEC {
+            return socket.disconnect();
+        }
+        let endpoint = match sockaddr_to_endpoint(sa, addrlen) {
+            // An address of a family an IP socket does not speak is
+            // `EAFNOSUPPORT` (`inet_dgram_connect`, `tcp_v4_connect`); a unix
+            // socket checks the family as part of the address (`EINVAL`).
+            Err(LxError::EINVAL)
+                if addrlen >= size_of::<u16>()
+                    && matches!(socket.so_domain(), Some(2) | Some(10))
+                    && !known_family(family) =>
+            {
+                return Err(LxError::EAFNOSUPPORT);
+            }
+            r => r?,
+        };
         self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
 
         if let Endpoint::Unix(path) = &endpoint {
@@ -1123,6 +1168,8 @@ impl Syscall<'_> {
             "sys_sendto: sockfd:{:?}, buffer:{:?}, length:{:?}, flags:{:?} , optlen:{:?}, addrlen:{:?}",
             sockfd, buf, len, flags, dest_addr, addrlen
         );
+        // `__sys_sendto`: the fd before the address.
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let endpoint = if dest_addr.is_null() {
             None
         } else {
@@ -1132,7 +1179,6 @@ impl Syscall<'_> {
             self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
             Some(endpoint)
         };
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         // Return the socket's ACTUAL queued byte count, not the full requested
         // `len`. TCP `write()` can perform a short write (queues min(len, free TX
         // space)); reporting `len` regardless makes the caller believe bytes it
@@ -1232,6 +1278,10 @@ impl Syscall<'_> {
         // At the CALLER's width: a 32-bit caller's envelope is 28 bytes, not
         // 56, and reading it natively does not fail --- it pairs the halves
         // of two fields into one. See [`crate::narrow::msghdr`].
+        // `__sys_sendmsg`: the fd before the header.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let hdr = self.read_msghdr(msg.as_addr())?;
         self.sendmsg_hdr(sockfd, &hdr, flags).await
     }
@@ -1357,6 +1407,10 @@ impl Syscall<'_> {
             sockfd, msg, flags
         );
         let msg_addr = msg.as_addr();
+        // `__sys_recvmsg`: the fd before the header.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         // At the CALLER's width, as `sendmsg` does.
         let mut hdr = self.read_msghdr(msg_addr)?;
         let cmsg = self.cmsg_layout();
@@ -1506,6 +1560,10 @@ impl Syscall<'_> {
             "sys_bind: sockfd:{:?}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
+        // `__sys_bind`: the socket before the address.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
         self.hunter_net_gate(NetDirection::In, &endpoint).await?;
@@ -1795,6 +1853,11 @@ impl Syscall<'_> {
             "sys_sendmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
+        // `__sys_sendmmsg`: the fd first, so a bad one is `EBADF` even
+        // for an empty batch.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let base = msgvec.as_addr();
         // The stride and the count's offset as the CALLER writes them: 32 and
         // 28 for a 32-bit caller against 64 and 56. See
@@ -1804,7 +1867,13 @@ impl Syscall<'_> {
         let stride = l.stride;
         let mut sent = 0usize;
         for i in 0..mmsg_batch(vlen) {
-            let hdr = self.read_msghdr(base + i * stride)?;
+            // A header that cannot be read ends the batch like any other
+            // error: what went before is the answer.
+            let hdr = match self.read_msghdr(base + i * stride) {
+                Ok(hdr) => hdr,
+                Err(e) if sent == 0 => return Err(e),
+                Err(_) => break,
+            };
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
@@ -1849,6 +1918,9 @@ impl Syscall<'_> {
             let ts = crate::narrow::narrow_get(abi32, &timeout)?;
             Some(kernel_hal::timer::timer_now() + ts.try_into_duration()?)
         };
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let base = msgvec.as_addr();
         let l = self.mmsghdr_layout();
         let stride = l.stride;
@@ -2657,15 +2729,25 @@ mod read_sockaddr_tests {
     use super::*;
 
     #[test]
-    fn a_null_address_is_efault_even_with_nothing_to_read() {
-        // `addrlen == 0` is the length that tells the two apart: with no bytes
-        // to copy, the NULL check is the only thing left to refuse it, and
-        // without it `bind(fd, NULL, 0)` comes back with a zeroed address
-        // instead of an error.
-        for len in [0usize, 1, 2, size_of::<SockAddr>(), usize::MAX] {
+    fn a_null_address_is_efault_only_when_there_is_something_to_copy() {
+        // `move_addr_to_kernel`: no length copies nothing, so NULL with 0 is
+        // not a fault; the family's own check refuses the empty address
+        // (`bind(fd, NULL, 0)` is `EINVAL` on Linux, not a zeroed address).
+        let empty = read_sockaddr(0, 0).expect("nothing to copy");
+        assert_eq!(sockaddr_to_endpoint(empty, 0).err(), Some(LxError::EINVAL));
+        for len in [1usize, 2, size_of::<SockAddr>()] {
             assert_eq!(
                 read_sockaddr(0, len).err(),
                 Some(LxError::EFAULT),
+                "addrlen {}",
+                len
+            );
+        }
+        // Longer than a `sockaddr_storage`, or negative as an `int`.
+        for len in [129usize, usize::MAX, u32::MAX as usize] {
+            assert_eq!(
+                read_sockaddr(0, len).err(),
+                Some(LxError::EINVAL),
                 "addrlen {}",
                 len
             );

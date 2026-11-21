@@ -1114,6 +1114,20 @@ impl Socket for UnixSocketState {
         }
     }
 
+    /// `unix_dgram_connect` with `AF_UNSPEC`: the default destination goes,
+    /// and the socket receives from anyone again. A stream has no such
+    /// thing: the trait's `EINVAL`.
+    fn disconnect(&self) -> SysResult {
+        let mut inner = self.inner.lock();
+        if !inner.is_dgram() {
+            return Err(LxError::EINVAL);
+        }
+        inner.peer = None;
+        inner.peer_closed = false;
+        inner.connected = false;
+        Ok(0)
+    }
+
     // -----------------------------------------------------------------------
     // bind — record the local path
     // -----------------------------------------------------------------------

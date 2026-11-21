@@ -2919,6 +2919,14 @@ impl Socket for ServedUdpSocket {
         Ok(0)
     }
 
+    /// `udp_disconnect`: no destination any more, the port kept.
+    fn disconnect(&self) -> SysResult {
+        let mut inner = self.shared.inner.lock();
+        inner.remote = None;
+        inner.remote_six = false;
+        Ok(0)
+    }
+
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         let Endpoint::Ip(mut local) = endpoint else {
             return Err(LxError::EINVAL);

@@ -352,7 +352,9 @@ impl SockAddr {
         #[allow(unsafe_code)]
         match AddressFamily::from(unsafe { self.family }) {
             AddressFamily::Internet => Ok(size_of::<SockAddrIn>()),
-            AddressFamily::Internet6 => Ok(size_of::<SockAddrIn6>()),
+            // `SIN6_LEN_RFC2133`: `inet6_connect` and `inet6_bind` take a
+            // `sockaddr_in6` without its `sin6_scope_id`.
+            AddressFamily::Internet6 => Ok(24),
             AddressFamily::Packet => Ok(size_of::<SockAddrLl>()),
             AddressFamily::Netlink => Ok(size_of::<SockAddrNl>()),
             // Input-validation minimum: Linux accepts a `sockaddr_un` as short as

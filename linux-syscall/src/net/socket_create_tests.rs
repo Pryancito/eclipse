@@ -227,3 +227,48 @@ fn recvmmsg_waits_for_one_only_when_asked_and_takes_a_timeout() {
         })
     });
 }
+
+/// The fd is looked at before the address (`__sys_connect`,
+/// `__sys_bind`, `__sys_sendmmsg`), an address longer than a
+/// `sockaddr_storage` is `EINVAL`, and `AF_UNSPEC` dissolves a datagram
+/// socket's destination while a stream refuses it.
+#[test]
+fn the_fd_comes_before_the_address_and_af_unspec_disconnects_a_datagram() {
+    let proc = a_process(43_115);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut s = own(sys);
+            let (sa, len) = sockaddr_un("/run/socket-create-unspec");
+            let addr = sa.as_ptr() as usize;
+            // A bad fd and an address that is not even readable: EBADF.
+            assert_eq!(
+                s.sys_connect(999, 0x11.into(), len).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(s.sys_bind(999, 0x11.into(), len).await, Err(LxError::EBADF));
+            assert_eq!(
+                s.sys_sendmmsg(999, 0.into(), 0, 0).await,
+                Err(LxError::EBADF)
+            );
+            let rx = s.sys_socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+            assert_eq!(s.sys_bind(rx, addr.into(), 200).await, Err(LxError::EINVAL));
+            assert_eq!(s.sys_bind(rx, addr.into(), len).await, Ok(0));
+            let tx = s.sys_socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+            assert_eq!(s.sys_connect(tx, addr.into(), len).await, Ok(0));
+            let unspec = [0u8; 16];
+            let unspec_at = unspec.as_ptr() as usize;
+            assert_eq!(s.sys_connect(tx, unspec_at.into(), 16).await, Ok(0));
+            let msg = *b"x";
+            let msg_at = msg.as_ptr() as usize;
+            assert_eq!(
+                s.sys_write(tx.into(), msg_at.into(), 1).await,
+                Err(LxError::ENOTCONN)
+            );
+            let stream = s.sys_socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+            assert_eq!(
+                s.sys_connect(stream, unspec_at.into(), 16).await,
+                Err(LxError::EINVAL)
+            );
+        })
+    });
+}
