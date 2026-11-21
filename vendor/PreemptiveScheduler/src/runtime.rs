@@ -3029,7 +3029,13 @@ pub(crate) fn stack_in_danger(sp: usize, base: usize, low_water: usize) -> bool 
         return sp >= base.saturating_sub(GUARD_SIZE);
     }
     let top = base.saturating_add(STACK_SIZE);
-    if sp >= top {
+    // `sp == top` is an empty stack, not the top guard: the stack grows down,
+    // so the bytes in use are `[sp, top)` and none of them is above `top`.
+    // `executor_entry` holds exactly that value for the two instructions
+    // between its `pop rdi` and `call run_executor`, and an interrupt landing
+    // there panicked a real machine with "COROUTINE STACK NEAR OVERFLOW ...
+    // remaining=2097152 bytes", the whole stack still free.
+    if sp > top {
         // In the top guard, i.e. the executor above is growing down into it.
         return sp < top.saturating_add(TOP_GUARD_SIZE);
     }
@@ -3221,11 +3227,13 @@ pub struct FaultStackAttr {
 
 fn classify_stack_ptr(addr: usize, base: usize) -> Option<StackPtrRegion> {
     use crate::{GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE};
-    if addr >= base && addr < base + STACK_SIZE {
+    // `base + STACK_SIZE` itself is the empty stack's pointer (see
+    // `stack_in_danger`), so it is usable here as well.
+    if addr >= base && addr <= base + STACK_SIZE {
         Some(StackPtrRegion::Usable)
     } else if addr >= base.saturating_sub(GUARD_SIZE) && addr < base {
         Some(StackPtrRegion::BottomGuard)
-    } else if addr >= base + STACK_SIZE && addr < base + STACK_SIZE + TOP_GUARD_SIZE {
+    } else if addr > base + STACK_SIZE && addr < base + STACK_SIZE + TOP_GUARD_SIZE {
         Some(StackPtrRegion::TopGuard)
     } else {
         None
@@ -5971,14 +5979,25 @@ mod stack_danger_tests {
     #[test]
     fn a_stack_pointer_in_the_top_guard_is_the_neighbour_coming_down() {
         assert!(
-            stack_in_danger(TOP, BASE, LOW),
-            "the first byte past usable"
+            stack_in_danger(TOP + 8, BASE, LOW),
+            "the first slot past usable"
         );
         assert!(stack_in_danger(TOP + TOP_GUARD_SIZE - 1, BASE, LOW));
         assert!(
             !stack_in_danger(TOP + TOP_GUARD_SIZE, BASE, LOW),
             "past the top guard is another executor's allocation"
         );
+    }
+
+    #[test]
+    fn the_pointer_of_an_empty_stack_is_not_the_top_guard() {
+        // `executor_entry` sits at exactly `TOP` between `pop rdi` and `call
+        // run_executor`; an IRQ there must not read as an overflow.
+        assert!(!stack_in_danger(TOP, BASE, LOW), "nothing is in use at TOP");
+        assert!(matches!(
+            classify_stack_ptr(TOP, BASE),
+            Some(StackPtrRegion::Usable)
+        ));
     }
 
     #[test]
@@ -5992,7 +6011,7 @@ mod stack_danger_tests {
             BASE - GUARD_SIZE,
             BASE - 1,
             BASE,
-            TOP,
+            TOP + 8,
             TOP + TOP_GUARD_SIZE - 1,
         ] {
             let region = classify_stack_ptr(sp, BASE);
