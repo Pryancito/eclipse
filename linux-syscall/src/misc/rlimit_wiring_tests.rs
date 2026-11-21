@@ -781,3 +781,23 @@ fn a_finite_cpu_limit_arms_the_watch_on_the_process_it_was_set_for() {
         })
     });
 }
+
+#[test]
+fn getrlimit_and_setrlimit_with_no_buffer_are_efault_after_the_resource_is_judged() {
+    // `prlimit64` reads a NULL as "not asked"; the two old calls have no
+    // such reading. `getrlimit` copies the answer out and `setrlimit` copies
+    // the limit in, so a NULL is `EFAULT` -- after `do_prlimit` refused a
+    // resource that is not one, for `getrlimit`, and before it, for
+    // `setrlimit`, which copies first (`kernel/sys.c`).
+    let proc = a_process(47_189, "rlimit-null");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            assert_eq!(getrlimit(sys, RLIMIT_NOFILE, 0), Err(LxError::EFAULT));
+            assert_eq!(getrlimit(sys, RLIM_NLIMITS, 0), Err(LxError::EINVAL));
+            assert_eq!(setrlimit(sys, RLIMIT_NOFILE, 0), Err(LxError::EFAULT));
+            assert_eq!(setrlimit(sys, RLIM_NLIMITS, 0), Err(LxError::EFAULT));
+            // And prlimit64 keeps its meaning of NULL.
+            assert_eq!(prlimit(sys, 0, RLIMIT_NOFILE, 0, 0), Ok(0));
+        })
+    });
+}

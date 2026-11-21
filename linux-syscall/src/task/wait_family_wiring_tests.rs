@@ -158,8 +158,11 @@ fn waitid_by_pid_reports_the_child_in_infop_and_collects_it() {
             let ip = &mut info as *mut SigInfo as usize;
             let rp = &mut rusage as *mut RUsage as usize;
             let first = waitid(sys, P_PID, pid as usize, ip, WEXITED, rp).await;
+            // Read before the second call, which fails and, as on Linux,
+            // zeroes the struct on its way out.
+            let reported = info.clone();
             let second = waitid(sys, P_PID, pid as usize, ip, WEXITED, rp).await;
-            (first, info, rusage, second)
+            (first, reported, rusage, second)
         })
     });
     assert_eq!(first, 0, "waitid answers 0, and the pid goes in infop");
@@ -530,5 +533,29 @@ fn wait4_with_wnohang_and_nothing_ready_leaves_the_status_word_alone() {
     );
     alive.exit(0);
     stranger.exit(0);
+    parent.exit(0);
+}
+
+/// A wait that fails still answers in `infop`: `SYSCALL_DEFINE5(waitid)`
+/// writes the struct after `kernel_waitid` whatever it returned, so an
+/// `ECHILD` hands back zeros and not the previous call's child. The rusage
+/// is written only for a child found, and is left alone.
+#[test]
+fn waitid_that_finds_no_child_at_all_is_echild_and_still_zeroes_infop() {
+    let parent = a_process(48_319);
+    let (answer, info, rusage) = on_a_thread(&parent, move |sys| {
+        Box::pin(async move {
+            let mut info = a_stale_report();
+            let mut rusage = a_stale_rusage();
+            let ip = &mut info as *mut SigInfo as usize;
+            let rp = &mut rusage as *mut RUsage as usize;
+            let answer = waitid(sys, P_ALL, 0, ip, WEXITED, rp).await;
+            (answer, info, rusage)
+        })
+    });
+    assert_eq!(answer, ECHILD);
+    assert_eq!(info.signo, 0, "si_signo of a failed wait");
+    assert_eq!(word(&info, SI_PID), 0, "the stale child is still in infop");
+    assert_eq!(rusage.utime.sec, 99, "a failed wait wrote the rusage");
     parent.exit(0);
 }

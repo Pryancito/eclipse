@@ -133,6 +133,13 @@ fn kill_target(pid: i32) -> SendTarget {
 /// though it can still be in its job finishing its teardown -- which is
 /// where `tgkill` looked, and found it, and where it did not find a zombie
 /// that had already left.
+/// Whether `id` names a task anywhere on the machine: a process (live or
+/// a zombie), or a thread of one. What `find_vpid` answers.
+fn task_exists(id: KoID) -> bool {
+    linux_object::process::find_task(id).is_some()
+        || linux_object::process::find_thread(id).is_some()
+}
+
 fn specific_task(
     tgid: KoID,
     tid: KoID,
@@ -491,16 +498,20 @@ impl Syscall<'_> {
     ) -> SysResult {
         // sigaction(2) has no use for the probe: `do_sigaction()` rejects
         // signal 0 (`sig < 1`) alongside everything out of range.
-        let signal = Signal::from_syscall_arg(signum)?.ok_or(LxError::EINVAL)?;
+        //
+        // `rt_sigaction` in Linux's order: the size, then the copy of the new
+        // action (`EFAULT`), and only then `do_sigaction`'s judgement of the
+        // number (`EINVAL`).
         check_sigsetsize(sigsetsize)?;
+        let new_act = if act_is_null { None } else { Some(read_act()?) };
+        let signal = Signal::from_syscall_arg(signum)?.ok_or(LxError::EINVAL)?;
         if sigaction_refused(signal, act_is_null) {
             return Err(LxError::EINVAL);
         }
         let proc = self.linux_process();
         let old = proc.signal_action(signal);
         commit_and_report_old_with(old, write_old, || {
-            if !act_is_null {
-                let act = read_act()?;
+            if let Some(act) = new_act {
                 info!("new action: {:?} -> {:x?}", signal, act);
                 // `SignalAction::stored` is the fifth door into "which signals
                 // may be blocked", and the only one that was not shut: a
@@ -817,10 +828,14 @@ impl Syscall<'_> {
     /// Send a signal to a process specified by pid
     pub fn sys_kill(&self, pid: isize, signum: usize) -> SysResult {
         // `None` is signal 0: deliver nothing, but still report whether the
-        // target exists. (An invalid number is EINVAL here, before the target
-        // is resolved; Linux resolves first and answers ESRCH. Only a call
-        // that is wrong twice over can tell the difference.)
-        let signal = Signal::from_syscall_arg(signum)?;
+        // target exists. An invalid number is judged by
+        // `check_kill_permission`, which runs only on a task that was found:
+        // a pid that names nobody is ESRCH whatever the number.
+        let signal =
+            Signal::from_syscall_arg(signum).map_err(|e| match kill_target(pid_arg(pid)) {
+                SendTarget::Pid(pid) if !task_exists(pid) => LxError::ESRCH,
+                _ => e,
+            })?;
         info!(
             "kill: thread {} kill process {} with signal {:?}",
             self.thread.id(),
@@ -842,7 +857,15 @@ impl Syscall<'_> {
     /// Send a signal to a thread specified by tid
     pub fn sys_tkill(&mut self, tid: usize, signum: usize) -> SysResult {
         let tid = single_task_id(tid)?;
-        let signal = Signal::from_syscall_arg(signum)?;
+        // `do_send_specific`: no such thread is ESRCH before the number is
+        // looked at.
+        let signal = Signal::from_syscall_arg(signum).map_err(|e| {
+            if task_exists(tid) {
+                e
+            } else {
+                LxError::ESRCH
+            }
+        })?;
         info!(
             "tkill: thread {} kill thread {} with signal {:?}",
             self.thread.id(),
@@ -890,7 +913,12 @@ impl Syscall<'_> {
     pub fn sys_tgkill(&mut self, tgid: usize, tid: usize, signum: usize) -> SysResult {
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
-        let signal = Signal::from_syscall_arg(signum)?;
+        // As `tkill`: the thread is found first (`do_send_specific`).
+        let signal =
+            Signal::from_syscall_arg(signum).map_err(|e| match specific_task(tgid, tid) {
+                Err(found) => found,
+                Ok(_) => e,
+            })?;
         info!(
             "tgkill: thread {} kill thread {} in process {} with signal {:?}",
             self.thread.id(),
@@ -1059,7 +1087,12 @@ impl Syscall<'_> {
     /// Examine the set of signals that are pending for delivery to the calling
     /// thread — raised while blocked and not yet delivered (see sigpending(2)).
     pub fn sys_rt_sigpending(&self, mut set: UserOutPtr<Sigset>, sigsetsize: usize) -> SysResult {
-        check_sigsetsize(sigsetsize)?;
+        // The one sigset call that takes a SHORT size: `rt_sigpending` only
+        // refuses one larger than the kernel's set, and copies out
+        // `sigsetsize` bytes of it (`copy_to_user(uset, &set, sigsetsize)`).
+        if sigsetsize > core::mem::size_of::<Sigset>() {
+            return Err(LxError::EINVAL);
+        }
         let thread = self.thread.lock_linux();
         // Pending here means "sent but withheld by the mask": what is both in
         // the undelivered set and currently blocked. Unblocked entries are on
@@ -1070,6 +1103,12 @@ impl Syscall<'_> {
         let pending = Sigset::new((thread.signals.val() | shared) & thread.signal_mask().val());
         drop(thread);
         info!("rt_sigpending: pending={:#x}", pending.val());
+        if sigsetsize < core::mem::size_of::<Sigset>() {
+            let bytes = pending.val().to_ne_bytes();
+            let mut out: UserOutPtr<u8> = set.as_addr().into();
+            out.write_array(&bytes[..sigsetsize])?;
+            return Ok(0);
+        }
         // The same alignment form: see `sys_rt_sigprocmask` above.
         crate::narrow::wide_put_unaligned(self.narrow_abi(), &mut set, pending)?;
         Ok(0)
@@ -2228,5 +2267,130 @@ mod siginfo_head_layout_tests {
         assert_eq!(&bytes[0..4], &10i32.to_le_bytes());
         assert_eq!(&bytes[4..8], &0i32.to_le_bytes());
         assert_eq!(&bytes[8..12], &(-1i32).to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod bad_signal_order_tests {
+    //! `kill`, `tkill` and `tgkill` find the target before the signal number
+    //! is judged (`check_kill_permission` runs on a task that was found), so
+    //! a bad number at nobody is `ESRCH`, and at somebody `EINVAL`.
+
+    use super::*;
+    use crate::on_a_thread::on_a_thread;
+    use alloc::boxed::Box;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    const NOT_A_SIGNAL: usize = 999;
+    const NOBODY: usize = 4_000_000;
+
+    #[test]
+    fn a_bad_signal_number_at_nobody_is_esrch_and_at_somebody_einval() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_216,
+            "badsig",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let me = proc.id() as usize;
+        on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let mut own = Syscall {
+                    thread: sys.thread,
+                    thread_fn: sys.thread_fn,
+                    syscall_entry: sys.syscall_entry,
+                };
+                assert_eq!(
+                    sys.sys_kill(NOBODY as isize, NOT_A_SIGNAL),
+                    Err(LxError::ESRCH)
+                );
+                assert_eq!(
+                    sys.sys_kill(me as isize, NOT_A_SIGNAL),
+                    Err(LxError::EINVAL)
+                );
+                assert_eq!(own.sys_tkill(NOBODY, NOT_A_SIGNAL), Err(LxError::ESRCH));
+                let tid = own.thread.id() as usize;
+                assert_eq!(own.sys_tkill(tid, NOT_A_SIGNAL), Err(LxError::EINVAL));
+                assert_eq!(
+                    own.sys_tgkill(me, NOBODY, NOT_A_SIGNAL),
+                    Err(LxError::ESRCH)
+                );
+                assert_eq!(own.sys_tgkill(me, tid, NOT_A_SIGNAL), Err(LxError::EINVAL));
+            })
+        });
+    }
+    /// `rt_sigaction` copies the new action in before `do_sigaction` judges
+    /// the number: an unreadable action is `EFAULT` even for a signal that
+    /// would be refused, and a readable one at a bad number is `EINVAL`.
+    #[test]
+    fn rt_sigaction_reads_the_action_before_it_judges_the_signal() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_218,
+            "sigact",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                // Misaligned, so the copy refuses it without touching it: in
+                // this hosted build every other address is "user memory".
+                let unreadable = || UserInPtr::<SignalAction>::from(0x11usize);
+                let nowhere = || UserOutPtr::<SignalAction>::from(0usize);
+                for sig in [NOT_A_SIGNAL, Signal::SIGKILL as usize] {
+                    assert_eq!(
+                        sys.sys_rt_sigaction(sig, unreadable(), nowhere(), 8),
+                        Err(LxError::EFAULT),
+                        "signal {} was judged before its action was read",
+                        sig
+                    );
+                }
+                let act = SignalAction::default();
+                let readable =
+                    UserInPtr::<SignalAction>::from(&act as *const SignalAction as usize);
+                assert_eq!(
+                    sys.sys_rt_sigaction(NOT_A_SIGNAL, readable, nowhere(), 8),
+                    Err(LxError::EINVAL)
+                );
+                // The size still comes first of all.
+                assert_eq!(
+                    sys.sys_rt_sigaction(NOT_A_SIGNAL, unreadable(), nowhere(), 4),
+                    Err(LxError::EINVAL)
+                );
+            })
+        });
+    }
+
+    /// `rt_sigpending` refuses only a size larger than the kernel's set and
+    /// copies out that many bytes: a short size is a short answer.
+    #[test]
+    fn rt_sigpending_takes_a_short_size_and_copies_only_that_much() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_217,
+            "sigpend",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                // Two words, so the full-size write below is aligned.
+                let mut out = [u64::MAX; 2];
+                let addr = out.as_mut_ptr() as usize;
+                let at = || UserOutPtr::<Sigset>::from(addr);
+                assert_eq!(sys.sys_rt_sigpending(at(), 9), Err(LxError::EINVAL));
+                assert_eq!(sys.sys_rt_sigpending(at(), 0), Ok(0));
+                assert_eq!(out, [u64::MAX; 2], "a zero size wrote something");
+                assert_eq!(sys.sys_rt_sigpending(at(), 4), Ok(0));
+                let bytes = out[0].to_ne_bytes();
+                assert_eq!(&bytes[..4], &[0, 0, 0, 0]);
+                assert_eq!(&bytes[4..], &[0xff; 4], "a short size wrote past itself");
+                assert_eq!(sys.sys_rt_sigpending(at(), 8), Ok(0));
+                assert_eq!(out, [0, u64::MAX]);
+            })
+        });
     }
 }
