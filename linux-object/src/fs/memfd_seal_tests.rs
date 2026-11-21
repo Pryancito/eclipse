@@ -25,15 +25,17 @@ fn the_seals_have_their_linux_values_and_are_one_bit_each() {
     assert_eq!(F_SEAL_GROW, 0x0004);
     assert_eq!(F_SEAL_WRITE, 0x0008);
     assert_eq!(F_SEAL_FUTURE_WRITE, 0x0010);
+    assert_eq!(F_SEAL_EXEC, 0x0020);
     // `F_ADD_SEALS` refuses every bit outside this set, so it has to hold
-    // all five of them and nothing else.
-    assert_eq!(F_SEAL_ALL, 0x001F, "the set F_ADD_SEALS accepts moved");
+    // all six of them and nothing else (Linux's `F_ALL_SEALS` since 6.3).
+    assert_eq!(F_SEAL_ALL, 0x003F, "the set F_ADD_SEALS accepts moved");
     let each = [
         F_SEAL_SEAL,
         F_SEAL_SHRINK,
         F_SEAL_GROW,
         F_SEAL_WRITE,
         F_SEAL_FUTURE_WRITE,
+        F_SEAL_EXEC,
     ];
     for (i, a) in each.iter().enumerate() {
         assert_eq!(a.count_ones(), 1, "seal {i} is not a single bit");
@@ -78,9 +80,9 @@ fn a_seal_belongs_to_one_file_and_not_to_the_next() {
 }
 
 #[test]
-fn only_the_five_seals_that_exist_can_be_added() {
+fn only_the_six_seals_that_exist_can_be_added() {
     let inode = sealable();
-    for bad in [0x0020u32, 0x0040, 0x8000, u32::MAX] {
+    for bad in [0x0040u32, 0x0080, 0x8000, u32::MAX] {
         assert_eq!(
             memfd_add_seals(&inode, bad),
             Err(LxError::EINVAL),

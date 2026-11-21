@@ -76,7 +76,7 @@ const READ_AND_WRITE: usize = 0o600;
 
 /// `IPC_NOWAIT` in a `sembuf`: answer `EAGAIN` rather than park.
 const NOWAIT: i16 = SemFlags::IPC_NOWAIT.bits();
-/// A `sem_flg` bit no `semop` recognises.
+/// A `sem_flg` bit no `semop` recognises, and Linux ignores.
 const A_FLAG_OF_NOBODY: i16 = 0x1;
 
 /// An id the registry can never answer: ids are handed out from 1 and
@@ -481,16 +481,16 @@ fn how_many_operations_there_are_is_judged_before_the_array_is_read() {
                 Err(LxError::EFAULT),
                 "the id was looked up before the array was read"
             );
-            // A flag bit nobody defines is EINVAL for the WHOLE array, and
-            // nothing in it is applied.
+            // A flag bit nobody defines is ignored, as Linux ignores it:
+            // the operation is carried out.
             assert_eq!(
                 semop(sys, id, &[SemBuf::new(0, 1, A_FLAG_OF_NOBODY)]).await,
-                Err(LxError::EINVAL),
-                "an unknown sem_flg bit was accepted"
+                Ok(0),
+                "an unknown sem_flg bit failed the call"
             );
             assert!(
-                holds_zero(sys, id, 0).await,
-                "an operation refused for its flags was applied anyway"
+                held_exactly(sys, id, 0, 1).await,
+                "an operation with a stray flag bit was not applied"
             );
         })
     });
@@ -800,6 +800,14 @@ fn a_semaphore_outside_the_set_and_a_value_past_the_ceiling_are_both_refused() {
             assert!(
                 holds_zero(sys, id, 0).await,
                 "the first operation of an out-of-range array was applied"
+            );
+            // An operation that would have to wait, then a bad index: Linux
+            // answers EFBIG at once. Planning op by op used to stop at the
+            // wait and put the caller to sleep, for ever.
+            assert_eq!(
+                semop(sys, id, &[SemBuf::new(0, -1, 0), SemBuf::new(1, 1, 0)]).await,
+                Err(LxError::EFBIG),
+                "a bad index behind a waiting operation was not refused"
             );
 
             // The ceiling itself is allowed; one more is not.

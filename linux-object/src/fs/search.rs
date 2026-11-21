@@ -166,7 +166,13 @@ fn may_search(
 /// asking, so a new mode of a directory makes it forget what it remembers.
 /// A new owner needs nothing: a gate is asked with its metadata as it is,
 /// and a directory everybody may search stays one whoever owns it.
+///
+/// A memfd sealed with `F_SEAL_EXEC` refuses a change of its execute bits
+/// with `EPERM`, as `shmem_setattr` does.
 pub fn set_mode(inode: &Arc<dyn INode>, meta: &Metadata) -> LxResult {
+    if !super::memfd_mode_allowed(inode, meta.mode) {
+        return Err(LxError::EPERM);
+    }
     inode.set_metadata(meta)?;
     if meta.type_ == FileType::Dir {
         super::dcache_invalidate();

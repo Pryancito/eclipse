@@ -697,7 +697,11 @@ mod blocks {
             return None;
         }
         assert_eq!(size, super::ALLOC_SIZE);
-        let base = Global.allocate(super::ALLOC_LAYOUT).ok()?.cast::<u8>().as_ptr() as usize;
+        let base = Global
+            .allocate(super::ALLOC_LAYOUT)
+            .ok()?
+            .cast::<u8>()
+            .as_ptr() as usize;
         GIVEN.fetch_add(1, Ordering::SeqCst);
         LAST.store(base, Ordering::SeqCst);
         Some(base)
@@ -784,5 +788,9 @@ fn a_refused_block_comes_from_the_heap_and_goes_back_there() {
     IDLE_AT_LAST_TRIM.store(0, Ordering::SeqCst);
     assert_eq!(trim_idle_stacks(0), 0);
     assert_eq!(trim_idle_stacks(0), ALLOC_SIZE);
-    assert_eq!(blocks::TAKEN_BACK.load(Ordering::SeqCst), 0, "not its block");
+    assert_eq!(
+        blocks::TAKEN_BACK.load(Ordering::SeqCst),
+        0,
+        "not its block"
+    );
 }
