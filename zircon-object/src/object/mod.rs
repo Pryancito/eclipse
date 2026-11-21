@@ -390,7 +390,15 @@ struct KObjectBaseInner {
     name: String,
     signal: Signal,
     signal_callbacks: Vec<Observer>,
+    /// The length of `signal_callbacks` at which `add_observer` next sweeps
+    /// out the dead: twice what was left alive by the last sweep, so the
+    /// sweeps cost O(1) a registration and the dead never outnumber the
+    /// living by much. 0 is [`FIRST_CALLBACK_SWEEP`].
+    sweep_at: usize,
 }
+
+/// The length of a callback list at which its first sweep happens.
+const FIRST_CALLBACK_SWEEP: usize = 64;
 
 /// What an object tells of a change of its signals: a callback somebody
 /// boxed, or the waiter of one [`wait_signal`](KernelObject::wait_signal).
@@ -745,6 +753,17 @@ impl KObjectBase {
         // `add_signal_callback` (since lock is acquired inside it) and the callback is not triggered
         // in time.
         if !callback.told(inner.signal) {
+            // The dead pile up on an object whose signals never change: a
+            // cancelled `zx_object_wait_async`, the losers of every
+            // `wait_signal_many`. They used to stay until the list reached
+            // `MAX_SIGNAL_CALLBACKS`, megabytes of them, swept in one O(n)
+            // pass with interrupts off. Sweeping each time the list doubles
+            // costs the same per registration and keeps it near its live size.
+            if inner.signal_callbacks.len() >= inner.sweep_at.max(FIRST_CALLBACK_SWEEP) {
+                let signal = inner.signal;
+                inner.signal_callbacks.retain(|f| !f.told(signal));
+                inner.sweep_at = inner.signal_callbacks.len() * 2;
+            }
             if inner.signal_callbacks.len() >= MAX_SIGNAL_CALLBACKS {
                 // Full — but most of it is probably dead. A callback is only
                 // ever retired when it is *called*, which happens on a signal
@@ -1353,17 +1372,19 @@ mod tests {
             futures::pin_mut!(future);
             assert!(future.as_mut().poll(&mut cx).is_pending());
         }
-        assert_eq!(callbacks(&object), MAX_SIGNAL_CALLBACKS);
+        // The dead are swept each time the list doubles, so it never gets
+        // anywhere near the cap: it used to hold all 65536 of them.
+        assert!(
+            callbacks(&object) <= FIRST_CALLBACK_SWEEP,
+            "{} dead callbacks kept on an object whose signals never changed",
+            callbacks(&object)
+        );
         assert_eq!(counter.count(), 0);
 
         let future = waiter.wait_signal(Signal::READABLE);
         futures::pin_mut!(future);
         assert!(future.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(
-            callbacks(&object),
-            1,
-            "the thousand dead ones should have gone, and the new one stayed"
-        );
+        assert!(callbacks(&object) <= FIRST_CALLBACK_SWEEP);
         object.signal_set(Signal::READABLE);
         assert_eq!(
             counter.count(),
