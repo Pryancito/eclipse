@@ -2830,14 +2830,34 @@ lazy_static! {
     });
 }
 
-/// Comma-separated list of currently-online CPUs (e.g. "0,1,3").
+/// The currently-online CPUs as a list (e.g. "0-1,3").
 fn online_cpu_list(count: usize) -> String {
-    let mask = PM.lock().cpu_online;
+    cpu_list_text(PM.lock().cpu_online, count)
+}
+
+/// A CPU mask the way Linux's `%*pbl` prints it (`bitmap_print_to_pagebuf`
+/// with `list`): runs of two or more CPUs as `first-last`, the rest alone,
+/// comma separated. `0-3` and not `0,1,2,3`, which glibc's
+/// `sysconf(_SC_NPROCESSORS_ONLN)` and libnuma parse as ranges.
+fn cpu_list_text(mask: u64, count: usize) -> String {
+    let on = |i: usize| i < count.min(64) && mask & (1u64 << i) != 0;
     let mut parts: Vec<String> = Vec::new();
-    for i in 0..count.min(64) {
-        if mask & (1u64 << i) != 0 {
-            parts.push(format!("{}", i));
+    let mut i = 0;
+    while i < count.min(64) {
+        if !on(i) {
+            i += 1;
+            continue;
         }
+        let first = i;
+        while on(i + 1) {
+            i += 1;
+        }
+        parts.push(if i > first {
+            format!("{}-{}", first, i)
+        } else {
+            format!("{}", first)
+        });
+        i += 1;
     }
     format!("{}\n", parts.join(","))
 }
@@ -3535,3 +3555,23 @@ mod net_carrier_tests {
 
 #[cfg(test)]
 mod tree_tests;
+
+#[cfg(test)]
+mod cpu_list_tests {
+    use super::cpu_list_text;
+
+    /// `%*pbl`: consecutive CPUs are a range, a gap starts a new entry.
+    #[test]
+    fn a_cpu_mask_is_printed_as_linux_prints_a_cpu_list() {
+        assert_eq!(cpu_list_text(0b1, 1), "0\n");
+        assert_eq!(cpu_list_text(0b1111, 4), "0-3\n");
+        assert_eq!(cpu_list_text(0b1011, 4), "0-1,3\n");
+        assert_eq!(cpu_list_text(0b0101, 4), "0,2\n");
+        assert_eq!(
+            cpu_list_text(0b1111, 2),
+            "0-1\n",
+            "past the count is not a CPU"
+        );
+        assert_eq!(cpu_list_text(0, 4), "\n");
+    }
+}
