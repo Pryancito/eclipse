@@ -13,6 +13,9 @@ const SHM_RND: usize = 0o20000;
 /// Replace any mapping already at `shmaddr`. Requires a non-NULL address
 /// (`do_shmat`); with NULL it is EINVAL, not a silent "anywhere" attach.
 const SHM_REMAP: usize = 0o40000;
+/// Attach with `PROT_EXEC`. Linux maps without it otherwise; see
+/// `shmat_flags_and_place` for why Eclipse does not narrow that yet.
+const SHM_EXEC: usize = 0o100000;
 
 /// `SHMLBA`: the boundary `SHM_RND` rounds a requested attach address down to.
 /// Every architecture this kernel targets (x86-64, aarch64, riscv64) defines
@@ -68,6 +71,24 @@ enum ShmatPlace {
     At(VirtAddr),
 }
 
+/// An explicit attach address, or `EPERM` when it is under
+/// `vm.mmap_min_addr`.
+///
+/// `shmat` reached `Vmar::map`, which applies no floor, so this was the one
+/// mapping call in the Linux personality that could put a page at address 0
+/// -- `shmat(id, (void *) 1, SHM_RND)` rounds to 0, and an attach there maps
+/// the segment over the null page: the process loses its NULL-dereference
+/// protection for good, and every pointer into the segment is a pointer
+/// userspace and this kernel's own syscall checks read as NULL. Linux refuses
+/// it in `security_mmap_addr`, which `do_shmat` reaches through `MAP_FIXED`,
+/// with `EPERM` for a caller without `CAP_SYS_RAWIO`.
+fn rounded_attach_addr(addr: VirtAddr) -> Result<VirtAddr, LxError> {
+    if addr < crate::vm::MMAP_MIN_ADDR {
+        return Err(LxError::EPERM);
+    }
+    Ok(addr)
+}
+
 /// Decide the mapping permissions and placement for one
 /// `shmat(id, addr, shmflg)`.
 ///
@@ -99,29 +120,18 @@ enum ShmatPlace {
 /// that attached a segment read-only and then wrote to it succeeded silently
 /// where it must take `SIGSEGV`. `EXECUTE` is kept unconditionally, as the old
 /// fixed flags had it -- narrowing it to `SHM_EXEC` is a separate change with
-/// its own W^X risk, out of scope here.
-/// An explicit attach address, or `EPERM` when it is under
-/// `vm.mmap_min_addr`.
-///
-/// `shmat` reached `Vmar::map`, which applies no floor, so this was the one
-/// mapping call in the Linux personality that could put a page at address 0
-/// -- `shmat(id, (void *) 1, SHM_RND)` rounds to 0, and an attach there maps
-/// the segment over the null page: the process loses its NULL-dereference
-/// protection for good, and every pointer into the segment is a pointer
-/// userspace and this kernel's own syscall checks read as NULL. Linux refuses
-/// it in `security_mmap_addr`, which `do_shmat` reaches through `MAP_FIXED`,
-/// with `EPERM` for a caller without `CAP_SYS_RAWIO`.
-fn rounded_attach_addr(addr: VirtAddr) -> Result<VirtAddr, LxError> {
-    if addr < crate::vm::MMAP_MIN_ADDR {
-        return Err(LxError::EPERM);
-    }
-    Ok(addr)
-}
-
+/// its own W^X risk (the graphics stack attaches every MIT-SHM image here).
+/// `SHM_EXEC` is already read, so that narrowing is dropping `EXECUTE` from
+/// the base flags and nothing else.
 fn shmat_flags_and_place(shmflg: usize, addr: VirtAddr) -> Result<(MMUFlags, ShmatPlace), LxError> {
     let mut flags = MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER;
     if shmflg & SHM_RDONLY == 0 {
         flags |= MMUFlags::WRITE;
+    }
+    // `do_shmat`: `PROT_EXEC` only with `SHM_EXEC`. A no-op today, because
+    // the base flags above carry `EXECUTE` for every attach; see the note.
+    if shmflg & SHM_EXEC != 0 {
+        flags |= MMUFlags::EXECUTE;
     }
 
     let place = if addr == 0 {
@@ -703,8 +713,10 @@ impl Syscall<'_> {
     /// (see [linux man shmget(2)](https://www.man7.org/linux/man-pages/man2/shmget.2.html)).
     ///
     /// `shmget` returns the identifier of the System V shared memory segment
-    /// associated with the value of the argument key.
-    /// Differ from linux, this syscall always create a new set.
+    /// associated with the value of the argument key: an existing segment
+    /// for a known key (`EEXIST` under `IPC_CREAT | IPC_EXCL`, `ENOENT`
+    /// without `IPC_CREAT`), a new one for `IPC_PRIVATE` or a new key with
+    /// `IPC_CREAT`. See `ShmIdentifier::new_shared_guard`.
     pub fn sys_shmget(&self, key: usize, size: usize, shmflg: usize) -> SysResult {
         info!(
             "shmget: key: {}, size: {}, shmflg: {:#x}",
@@ -795,7 +807,14 @@ impl Syscall<'_> {
         // handed an address, and a 32-bit one cannot name a segment attached
         // above its address space any more than it can name a mapping there.
         // See `Syscall::task_max`.
-        let addr = vmar.map_ext_within(
+        //
+        // The attachment is counted BEFORE the map, while the id is checked
+        // to still name the segment, as `do_shmat` does `shm_nattch++`
+        // before `do_mmap`. Counted after, an `IPC_RMID` racing the map saw
+        // nobody attached, destroyed the id, and this attach then succeeded
+        // on a segment no id named. See `shm_attach_reserve`.
+        linux_object::ipc::shm_attach_reserve(id, &guard)?;
+        let addr = match vmar.map_ext_within(
             vmar_offset,
             vmo.clone(),
             0,
@@ -807,14 +826,20 @@ impl Syscall<'_> {
             false,
             crate::vm::MMAP_MIN_ADDR,
             self.task_max(),
-        )?;
-        // Account on the segment, then record where in the process -- one
-        // record per attachment, so a segment attached twice can be
-        // detached twice (the old table kept one address per id and lost
-        // the first). Neither lock is held while taking the other: the
+        ) {
+            Ok(addr) => addr,
+            Err(e) => {
+                linux_object::ipc::shm_attach_cancel(id, &guard);
+                return Err(e.into());
+            }
+        };
+        // Stamp the attachment on the segment, then record where in the
+        // process -- one record per attachment, so a segment attached twice
+        // can be detached twice (the old table kept one address per id and
+        // lost the first). Neither lock is held while taking the other: the
         // process lock is taken with segments locked under it by `fork` and
         // by the table's drop at `exit`.
-        guard.lock().attach(proc.id() as u32);
+        guard.lock().attached(proc.id() as u32);
         self.linux_process().shm_attach(id, guard, addr);
         Ok(addr)
     }
@@ -2089,8 +2114,8 @@ mod shmat_place_tests {
 
     use super::{
         msgrcv_bufsz, msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags,
-        ShmatPlace, IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_RDONLY,
-        SHM_REMAP, SHM_RND,
+        ShmatPlace, IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_EXEC,
+        SHM_RDONLY, SHM_REMAP, SHM_RND,
     };
     use crate::vm::MMAP_MIN_ADDR;
     use crate::LxError;
@@ -2129,6 +2154,17 @@ mod shmat_place_tests {
     /// runs over `shmat`, and narrowing it is a behaviour change that wants
     /// its own look. Dropping `EXECUTE` used to pass green, so the day
     /// somebody does narrow it, it will be on purpose and it will show here.
+    /// `shmat(id, NULL, SHM_EXEC)` and `SHM_EXEC | SHM_RDONLY`: executable
+    /// as Linux maps them, and the read-only one still read-only.
+    #[test]
+    fn shm_exec_attaches_executable() {
+        let (flags, _) = shmat_flags_and_place(SHM_EXEC, 0).unwrap();
+        assert!(flags.contains(MMUFlags::RXW | MMUFlags::USER));
+        let (flags, _) = shmat_flags_and_place(SHM_EXEC | SHM_RDONLY, 0).unwrap();
+        assert!(flags.contains(MMUFlags::READ | MMUFlags::EXECUTE));
+        assert!(!flags.contains(MMUFlags::WRITE));
+    }
+
     #[test]
     fn a_default_attach_is_read_write_and_executable() {
         let (flags, _) = shmat_flags_and_place(0, 0).unwrap();
@@ -2679,6 +2715,7 @@ mod command_number_tests {
         }
         assert_eq!(SHM_RND, SHM_RDONLY << 1);
         assert_eq!(SHM_REMAP, SHM_RND << 1);
+        assert_eq!(SHM_EXEC, 0o100000);
     }
 
     #[test]

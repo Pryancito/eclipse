@@ -105,8 +105,15 @@ impl SignalAction {
     /// set every single time the handler runs. It is also read back:
     /// `sigaction(sig, NULL, &old)` is how a program learns what it actually
     /// got, so the filtering has to happen on the way IN, not on each use.
+    ///
+    /// `sa_flags` is cut to the bits Linux knows (`do_sigaction`:
+    /// `sa_flags &= UAPI_SA_FLAGS`), so a program that sets a flag and reads
+    /// it back can tell whether the kernel supports it: that is what
+    /// `SA_UNSUPPORTED` (0x400) exists for, and a kernel that kept every bit
+    /// claimed to support all of them.
     pub fn stored(mut self) -> Self {
         self.mask = self.mask.blockable();
+        self.flags = SignalActionFlags::from_bits_truncate(self.flags.bits());
         self
     }
 
@@ -842,6 +849,17 @@ mod sigaction_tests {
             s.insert(*sig);
         }
         s
+    }
+
+    /// `SA_UNSUPPORTED` and any other bit Linux has no name for are dropped
+    /// on the way in, and every known flag survives.
+    #[test]
+    fn unknown_sa_flags_are_cleared_and_known_ones_kept() {
+        const SA_UNSUPPORTED: usize = 0x400;
+        let all = SignalActionFlags::all();
+        let asked =
+            unsafe { SignalActionFlags::from_bits_unchecked(all.bits() | SA_UNSUPPORTED | 0x100) };
+        assert_eq!(act(asked, Sigset::empty()).stored().flags, all);
     }
 
     /// The numbers are UABI: userspace ORs them into `sa_flags` itself, and a

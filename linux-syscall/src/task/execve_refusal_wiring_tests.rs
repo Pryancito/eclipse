@@ -320,30 +320,37 @@ fn execve_asks_for_permission_with_the_effective_uid_and_not_the_real_one() {
     proc.exit(0);
 }
 
-/// The arguments are measured before the path is resolved, so one string
-/// one byte over `MAX_ARG_STRLEN` is `E2BIG` for a path that does not even
-/// exist, while the same path with a short argument gets as far as its own
-/// `ENOENT`.
+/// The file is opened before the arguments are measured (Linux 6.8+:
+/// `alloc_bprm` -> `do_open_execat` comes first in `do_execveat_common`), so
+/// a path that does not exist is `ENOENT` however long the argument. On a
+/// file that does open, one string one byte over `MAX_ARG_STRLEN` is `E2BIG`,
+/// and one byte less gets as far as the file's own `ENOEXEC`.
 #[test]
-fn the_arguments_are_measured_before_the_path_is_resolved() {
+fn the_path_is_resolved_before_the_arguments_are_measured() {
     let proc = a_process(48_403, 1);
-    let (too_long, just_short_enough) = on_a_thread(&proc, move |sys| {
+    let (missing, too_long, just_short_enough) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let path = CStr::new("/does/not/exist");
+            let nowhere = CStr::new("/does/not/exist");
+            let junk = CStr::new("/junk");
             let over = "a".repeat(MAX_ARG_STRLEN);
             let under = "a".repeat(MAX_ARG_STRLEN - 1);
-            let too_long = execve(sys, path.at(), Argv::of(&over).at(), 0).await;
-            let just_short_enough = execve(sys, path.at(), Argv::of(&under).at(), 0).await;
-            (too_long, just_short_enough)
+            let missing = execve(sys, nowhere.at(), Argv::of(&over).at(), 0).await;
+            let too_long = execve(sys, junk.at(), Argv::of(&over).at(), 0).await;
+            let just_short_enough = execve(sys, junk.at(), Argv::of(&under).at(), 0).await;
+            (missing, too_long, just_short_enough)
         })
     });
+    assert_eq!(
+        missing, ENOENT,
+        "the arguments were measured before the file was opened"
+    );
     assert_eq!(
         too_long, E2BIG,
         "one string of MAX_ARG_STRLEN bytes needs MAX_ARG_STRLEN + 1 with its NUL"
     );
     assert_eq!(
-        just_short_enough, ENOENT,
-        "one byte less passes the measure and reaches the path's own errno"
+        just_short_enough, ENOEXEC,
+        "one byte less passes the measure and reaches the file's own errno"
     );
     assert!(all_alive(&proc));
     proc.exit(0);

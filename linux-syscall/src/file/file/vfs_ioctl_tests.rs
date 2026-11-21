@@ -551,6 +551,21 @@ fn a_window_size_is_synthesised_for_a_char_device_that_has_somewhere_to_put_it()
                 "the refused call wrote a size anyway"
             );
 
+            // Nor the `mem` devices (major 1): `cmd > /dev/null` is not a
+            // terminal on Linux, and musl's `isatty()` asks exactly this.
+            for dev in [&b"/dev/null\0"[..], b"/dev/zero\0", b"/dev/urandom\0"] {
+                let fd = FileDesc::from(
+                    sys.sys_openat(FileDesc::CWD, UserInPtr::from(dev.as_ptr() as usize), 2, 0)
+                        .unwrap() as i32,
+                );
+                assert_eq!(
+                    sys.sys_ioctl(fd, TIOCGWINSZ, out_ptr, 0, 0).await,
+                    errno(LxError::ENOTTY),
+                    "a mem device was given a window size, so isatty() lies"
+                );
+            }
+            assert_eq!((out[0], out[1]), (0, 0));
+
             // And one number away from TIOCGWINSZ on the same char device,
             // so the number is read and not just the device kind.
             let chr =

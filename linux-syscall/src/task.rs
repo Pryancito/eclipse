@@ -1400,7 +1400,19 @@ impl Syscall<'_> {
         // carries depends on which of the three things happened. Shifting it
         // down eight bits here threw that away and left every child reported
         // as `CLD_EXITED`.
-        let report = waitid_report(res?.map(|(pid, status, cpu)| {
+        let abi32 = self.narrow_abi();
+        // `SYSCALL_DEFINE5(waitid)` fills `infop` after `kernel_waitid`
+        // whatever it answered: a failed wait (`ECHILD`, a signal) leaves
+        // the caller a zeroed `siginfo_t` too, not the previous call's.
+        let res = match res {
+            Ok(res) => res,
+            Err(e) => {
+                let empty = waitid_report(None);
+                crate::narrow::siginfo::siginfo_put_if_not_null(abi32, &mut infop, empty.info)?;
+                return Err(e);
+            }
+        };
+        let report = waitid_report(res.map(|(pid, status, cpu)| {
             (
                 pid as i32,
                 linux_object::process::real_uid_of(pid),
@@ -1421,7 +1433,6 @@ impl Syscall<'_> {
         // `wait4` already went through the narrow put, which is what makes
         // the omission here visible: the same structure, out of two calls
         // that answer the same question, by two different routes.
-        let abi32 = self.narrow_abi();
         crate::narrow::siginfo::siginfo_put_if_not_null(abi32, &mut infop, report.info)?;
         if let Some(rusage_of_child) = report.rusage {
             crate::narrow::narrow_put_if_not_null(abi32, &mut rusage, rusage_of_child)?;
@@ -1475,49 +1486,6 @@ impl Syscall<'_> {
         // Normal program launch — keep at debug so shells / fork+exec loops
         // don't pay a synchronous serial write per exec at the default LOG=warn.
         debug!("EXECVE: path={:?}", path_str);
-        // Both arrays are read at the CALLING process's pointer width: a
-        // 32-bit program's `argv` is four bytes an entry, and reading it at
-        // eight does not fail, it invents the arguments. See
-        // `Syscall::read_cstring_array`.
-        let args = exec_args::argv_or_empty(if argv.is_null() {
-            Vec::new()
-        } else {
-            self.read_cstring_array(argv).inspect_err(|&e| {
-                error!("execve: reading argv failed: {:?}", e);
-            })?
-        });
-        let mut envs: Vec<String> = Vec::new();
-        if !envp.is_null() {
-            envs = self.read_cstring_array(envp).inspect_err(|&e| {
-                error!("execve: reading envp failed: {:?}", e);
-            })?;
-        }
-        // Bound argv+envp so a huge argument list -- a glob like `rm dir/*`
-        // expanding to thousands of paths -- fails with E2BIG instead of
-        // overrunning the initial stack image the loader builds. Without this
-        // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
-        // ordinary userspace command.
-        exec_args::check_exec_args(self.linux_process(), path_str, &args, &envs)
-            .inspect_err(|_| warn!("execve: argv+envp too large for {:?} -> E2BIG", path_str))?;
-        info!(
-            "execve: path: {:?}, args: {:?}, envs: {:?}",
-            path_str, args, envs
-        );
-        // Record every program launch in the dmesg ring (path + argv) so a
-        // captured trace shows the exact exec chain — crucially whether the X
-        // server (`Xorg`/`X`/`Xorg.wrap`) is ever invoked and with what
-        // arguments. `info!`/`debug!` are filtered out at the default WARN
-        // level and never reach the ring, so use the unconditional klog path.
-        kernel_hal::klog_info!(
-            "EXECVE[{}] {:?} argv={:?}",
-            self.zircon_process().id(),
-            path_str,
-            args
-        );
-        if args[0].is_empty() {
-            warn!("execve: argv[0] is empty for path {:?}", path_str);
-        }
-
         // Read program file
         let proc = self.linux_process();
         // ROOT-CAUSE FIX for the "intermittent" kernel corruption (see
@@ -1582,6 +1550,54 @@ impl Syscall<'_> {
         // `mnt_may_suid(bprm->file->f_path.mnt)`: a set-user-ID bit on a file
         // that lives on a `nosuid` mount grants nothing.
         let may_suid = !linux_object::fs::path_is_nosuid(absolute);
+
+        // Only now the two arrays: since Linux 6.8 `do_execveat_common`
+        // opens the executable (`alloc_bprm` -> `do_open_execat`: the
+        // lookup, the exec permission, `S_ISREG`, `noexec`) before it counts
+        // or copies a single argument, so a missing file is `ENOENT` and an
+        // unexecutable one `EACCES` whatever `argv` holds.
+        // Both arrays are read at the CALLING process's pointer width: a
+        // 32-bit program's `argv` is four bytes an entry, and reading it at
+        // eight does not fail, it invents the arguments. See
+        // `Syscall::read_cstring_array`.
+        let args = exec_args::argv_or_empty(if argv.is_null() {
+            Vec::new()
+        } else {
+            self.read_cstring_array(argv).inspect_err(|&e| {
+                error!("execve: reading argv failed: {:?}", e);
+            })?
+        });
+        let mut envs: Vec<String> = Vec::new();
+        if !envp.is_null() {
+            envs = self.read_cstring_array(envp).inspect_err(|&e| {
+                error!("execve: reading envp failed: {:?}", e);
+            })?;
+        }
+        // Bound argv+envp so a huge argument list -- a glob like `rm dir/*`
+        // expanding to thousands of paths -- fails with E2BIG instead of
+        // overrunning the initial stack image the loader builds. Without this
+        // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
+        // ordinary userspace command.
+        exec_args::check_exec_args(self.linux_process(), path_str, &args, &envs)
+            .inspect_err(|_| warn!("execve: argv+envp too large for {:?} -> E2BIG", path_str))?;
+        info!(
+            "execve: path: {:?}, args: {:?}, envs: {:?}",
+            path_str, args, envs
+        );
+        // Record every program launch in the dmesg ring (path + argv) so a
+        // captured trace shows the exact exec chain — crucially whether the X
+        // server (`Xorg`/`X`/`Xorg.wrap`) is ever invoked and with what
+        // arguments. `info!`/`debug!` are filtered out at the default WARN
+        // level and never reach the ring, so use the unconditional klog path.
+        kernel_hal::klog_info!(
+            "EXECVE[{}] {:?} argv={:?}",
+            self.zircon_process().id(),
+            path_str,
+            args
+        );
+        if args[0].is_empty() {
+            warn!("execve: argv[0] is empty for path {:?}", path_str);
+        }
         let vmo = inode.read_as_vmo_cached()?;
 
         // Everything below `vmar.clear()` is past the point of no return: the
@@ -2000,19 +2016,20 @@ impl Syscall<'_> {
             "sched_setaffinity: pid={} cpusetsize={} mask_ptr={:?}",
             pid, cpusetsize, mask_ptr
         );
-        if cpusetsize == 0 {
-            return Err(LxError::EINVAL);
-        }
+        // In Linux's order: the mask is copied in (`get_user_cpu_mask`:
+        // `EFAULT`, and a short or empty one is zero-filled, not refused),
+        // then the target is found (`ESRCH`) and asked (`EPERM`), and only
+        // then is a mask with no usable CPU `EINVAL`.
         // Only the low 64 CPUs are representable (MAX_CORE_NUM == 64).
         let n = cpusetsize.min(8);
-        let bytes = mask_ptr.read_array(n)?;
+        let bytes = if n == 0 {
+            Vec::new()
+        } else {
+            mask_ptr.read_array(n)?
+        };
         let mut mask = 0u64;
         for (i, b) in bytes.iter().enumerate() {
             mask |= (*b as u64) << (i * 8);
-        }
-        let eff = mask & Self::online_cpu_mask();
-        if eff == 0 {
-            return Err(LxError::EINVAL);
         }
         let thread = self.sched_target(pid)?;
         // __sched_setaffinity() asks `check_same_owner()` and falls back to
@@ -2023,6 +2040,10 @@ impl Syscall<'_> {
             &linux.credentials(),
         ) {
             return Err(LxError::EPERM);
+        }
+        let eff = mask & Self::online_cpu_mask();
+        if eff == 0 {
+            return Err(LxError::EINVAL);
         }
         let is_self = thread.id() == self.thread.id();
         thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
