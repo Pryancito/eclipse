@@ -399,12 +399,13 @@ impl ProcessExt for Process {
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
-                            inner.semaphores = Default::default();
+                            // SEM_UNDO replay takes `semop_guard`: never under this lock.
+                            let sems = core::mem::take(&mut inner.semaphores);
                             let shm = core::mem::take(&mut inner.shm_identifiers);
                             // And what waited on it, given back to its users.
                             inner.shared_pending = Sigset::empty();
                             let sigq = core::mem::take(&mut inner.shared_queue);
-                            (files, shm, futexes, leader, sigq)
+                            (files, sems, shm, futexes, leader, sigq)
                         };
                         drop(dropped);
                     }
@@ -809,12 +810,13 @@ impl NewChild for Process {
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
-                            inner.semaphores = Default::default();
+                            // SEM_UNDO replay takes `semop_guard`: never under this lock.
+                            let sems = core::mem::take(&mut inner.semaphores);
                             let shm = core::mem::take(&mut inner.shm_identifiers);
                             // And what waited on it, given back to its users.
                             inner.shared_pending = Sigset::empty();
                             let sigq = core::mem::take(&mut inner.shared_queue);
-                            (files, shm, futexes, leader, sigq)
+                            (files, sems, shm, futexes, leader, sigq)
                         };
                         drop(dropped);
                         // Only now may a `wait*` take it (`exit_handover`).

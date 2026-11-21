@@ -250,6 +250,45 @@ pub fn shm_destroy_if_orphaned(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) {
     }
 }
 
+/// `do_shmat`'s count before the map: one more attachment of `guard`, taken
+/// only while `id` still names it.
+///
+/// `shmat` looks the segment up, checks permissions, maps it and only then
+/// used to count the attachment. An `IPC_RMID` landing in that window saw
+/// `nattch == 0` and destroyed the id, and the late attach still succeeded on
+/// a segment nobody could name any more. Linux closes the window by taking
+/// `shm_nattch++` under the segment's lock, after `ipc_valid_object`, and
+/// before `do_mmap`; this is the same step. The id table is held (read) for
+/// the check and the count, and [`shm_unlink`] holds it (write) for its own
+/// read of `nattch`, so the two are ordered: either the remove sees the
+/// attachment and only marks [`SHM_DEST`] (and a `SHM_DEST` segment may still
+/// be attached, as on Linux), or the attach sees the id gone and answers
+/// `EIDRM`, as `do_shmat` does when `ipc_valid_object` fails.
+///
+/// A failed map must hand the count back with [`shm_attach_cancel`]; a
+/// successful one stamps it with [`ShmGuard::attached`].
+pub fn shm_attach_reserve(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) -> Result<(), LxError> {
+    // Tables before the segment -- same order as `shm_unlink`.
+    let ids = SHMID2SHM.read();
+    if !ids.get(&id).is_some_and(|filed| Arc::ptr_eq(filed, guard)) {
+        return Err(LxError::EIDRM);
+    }
+    guard.lock().shmid_ds.lock().nattch += 1;
+    Ok(())
+}
+
+/// `do_shmat`'s `out_nattch`: the map failed, so the attachment
+/// [`shm_attach_reserve`] counted never existed. Destroys the segment when it
+/// was removed meanwhile and this was the last count (`shm_may_destroy`).
+pub fn shm_attach_cancel(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) {
+    {
+        let g = guard.lock();
+        let mut ds = g.shmid_ds.lock();
+        ds.nattch = ds.nattch.saturating_sub(1);
+    }
+    shm_destroy_if_orphaned(id, guard);
+}
+
 /// Free the key of a segment nobody is going to remove by id. Only the tests
 /// of this module need it; `shmctl` goes through [`shm_unlink`].
 #[cfg(test)]
@@ -427,6 +466,14 @@ impl ShmGuard {
     pub fn attach(&self, pid: u32) {
         self.account_attach();
         self.shmid_ds.lock().lpid = pid;
+    }
+
+    /// The attachment [`shm_attach_reserve`] counted is mapped: its time,
+    /// and `pid` as the last to touch the segment (`shm_open`).
+    pub fn attached(&self, pid: u32) {
+        let mut ds = self.shmid_ds.lock();
+        ds.atime = TimeSpec::now().sec;
+        ds.lpid = pid;
     }
 
     /// `shmdt(2)` by `pid`: one attachment fewer, and the last pid to touch
@@ -781,6 +828,46 @@ mod shm_tests {
             shm_lookup(id).is_none(),
             "last detach destroys a SHM_DEST segment"
         );
+        clear_ids();
+    }
+
+    /// The `shmat`/`IPC_RMID` race, both ways round. An attach counted
+    /// before the remove keeps the id alive under `SHM_DEST`; one that comes
+    /// after the id is gone is `EIDRM`, never a mapping of a nameless
+    /// segment; and a map that fails after counting hands the count back and
+    /// destroys what the remove left for the last detach.
+    #[test]
+    fn shmat_counts_before_mapping_so_ipc_rmid_cannot_slip_in_between() {
+        let _guard = test_lock();
+        clear_ids();
+        // Reserved first: the remove sees the attachment.
+        let seg = get(0, 4096, CREAT | 0o600).unwrap();
+        let id = shm_register(&seg).unwrap();
+        shm_attach_reserve(id, &seg).unwrap();
+        assert!(shm_unlink(id, &seg));
+        assert!(shm_lookup(id).is_some(), "an attach in flight keeps the id");
+        assert_ne!(seg.lock().shmid_ds.lock().perm.mode & SHM_DEST, 0);
+        seg.lock().attached(PID);
+        assert_eq!(seg.lock().shmid_ds.lock().lpid, PID);
+        seg.lock().detach(PID);
+        shm_destroy_if_orphaned(id, &seg);
+        assert!(shm_lookup(id).is_none());
+
+        // Removed first: the late attach is refused.
+        let seg = get(0, 4096, CREAT | 0o600).unwrap();
+        let id = shm_register(&seg).unwrap();
+        assert!(shm_unlink(id, &seg));
+        assert_eq!(shm_attach_reserve(id, &seg), Err(LxError::EIDRM));
+        assert_eq!(seg.lock().shmid_ds.lock().nattch, 0);
+
+        // Counted, removed, then the map failed: nothing is left behind.
+        let seg = get(0, 4096, CREAT | 0o600).unwrap();
+        let id = shm_register(&seg).unwrap();
+        shm_attach_reserve(id, &seg).unwrap();
+        assert!(shm_unlink(id, &seg));
+        shm_attach_cancel(id, &seg);
+        assert_eq!(seg.lock().shmid_ds.lock().nattch, 0);
+        assert!(shm_lookup(id).is_none(), "the failed attach was the last");
         clear_ids();
     }
 
