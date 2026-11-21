@@ -239,14 +239,17 @@ pub fn unbalanced_unpins() -> u64 {
 
 /// Registry snapshot for OOM / `/proc` dumps: `(live_pins, held_frees,
 /// unbalanced_unpins, pin_push_ooms)`.
+///
+/// `try_lock`: the OOM report calls this, and `unpin`'s sweep pushes onto a
+/// `Vec` with the registry held, so an allocation that fails right there
+/// would otherwise wait on its own CPU with interrupts off. Contended, the
+/// two counts read as `usize::MAX`.
 pub fn stats() -> (usize, usize, u64, u64) {
-    let g = REGISTRY.lock();
-    (
-        g.pins.len(),
-        g.held.len(),
-        unbalanced_unpins(),
-        PIN_PUSH_OOM.load(Relaxed),
-    )
+    let (pins, held) = match REGISTRY.try_lock() {
+        Some(g) => (g.pins.len(), g.held.len()),
+        None => (usize::MAX, usize::MAX),
+    };
+    (pins, held, unbalanced_unpins(), PIN_PUSH_OOM.load(Relaxed))
 }
 
 #[cfg(test)]

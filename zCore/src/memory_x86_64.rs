@@ -1386,12 +1386,16 @@ cfg_if! {
             report_alloc_sites();
             #[cfg(feature = "linux")]
             {
-                let (created, live, bytes) = linux_object::fs::memfd_stats();
+                // Counts only: this runs inside `alloc`, maybe under a memfd
+                // inode's write lock (see `memfd_counts`). The bytes are the
+                // whole ramfs pool's, which memfd shares with /tmp and /dev/shm.
+                let (created, live) = linux_object::fs::memfd_counts();
+                let (ram_live, _, _) = linux_object::fs::ramfs_oom_stats();
                 emit(format_args!(
-                    "[heap-pressure]   memfd created={} live={} live_bytes={} MiB\n",
+                    "[heap-pressure]   memfd created={} live={}; ramfs live={} MiB\n",
                     created,
                     live,
-                    bytes >> 20,
+                    ram_live >> 20,
                 ));
             }
             emit(format_args!(

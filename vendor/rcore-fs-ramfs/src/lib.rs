@@ -10,7 +10,7 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rcore_fs::vfs::*;
 use spin::{Mutex, RwLock, RwLockWriteGuard};
 
@@ -63,22 +63,30 @@ struct PageBackend {
 }
 
 static PAGE_BACKEND: Mutex<Option<PageBackend>> = Mutex::new(None);
+/// Mirrors `PAGE_BACKEND.is_some()` for readers that must not wait: the OOM
+/// report asks it, and `RamBlock::alloc_zeroed` holds `PAGE_BACKEND` across a
+/// frame allocation whose failure path logs, and logging allocates.
+static PAGE_BACKEND_SET: AtomicBool = AtomicBool::new(false);
 
 /// Install page alloc/free hooks (kernel: PhysFrame). Leave unset for heap Box.
 /// Call once at boot before mounting tmpfs.
 pub fn set_page_backend(alloc: PageAllocFn, free: PageFreeFn) {
     *PAGE_BACKEND.lock() = Some(PageBackend { alloc, free });
+    PAGE_BACKEND_SET.store(true, Ordering::Release);
 }
 
 /// Clear the page backend (tests that need heap Box after a previous install).
 #[cfg(test)]
 pub fn clear_page_backend() {
     *PAGE_BACKEND.lock() = None;
+    PAGE_BACKEND_SET.store(false, Ordering::Release);
 }
 
 /// Whether [`set_page_backend`] is installed (frames) vs heap `Box`.
+///
+/// Lock-free: see [`PAGE_BACKEND_SET`].
 pub fn page_backend_installed() -> bool {
-    PAGE_BACKEND.lock().is_some()
+    PAGE_BACKEND_SET.load(Ordering::Acquire)
 }
 
 /// Cap that is safe when file pages are still `Box` on the kernel heap.
