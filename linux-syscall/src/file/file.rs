@@ -1116,6 +1116,13 @@ impl Syscall<'_> {
         let file = proc.get_file(fd)?;
         let metadata = file.metadata()?;
         Self::ftruncate_type(metadata.type_)?;
+        // `do_ftruncate`: a descriptor not open for writing is the same
+        // `EINVAL` as a non-file (`!S_ISREG(..) || !(f_mode & FMODE_WRITE)`),
+        // not the `EBADF` that `File::set_len` answers further down. That
+        // `EBADF` is `fallocate`'s errno, and `ftruncate` does not share it.
+        if !file.flags().writable() {
+            return Err(LxError::EINVAL);
+        }
         self.check_fsize_growth(metadata.size as u64, len as u64)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
         // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any

@@ -530,12 +530,6 @@ impl Syscall<'_> {
     ) -> SysResult {
         let proc = self.linux_process();
         let path = path.as_c_str()?;
-        // hard code special path
-        let path = if path == "/dev/shm/testshm" {
-            "/testshm"
-        } else {
-            path
-        };
         let flags = openat_flags(flags)?;
         info!(
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
