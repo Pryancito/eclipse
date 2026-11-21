@@ -932,8 +932,14 @@ pub fn kernel_report() -> String {
             out,
             "stack guard:  {} bands installed, {} refused; split frames {} spent of {} \
              ({} starved); soft stacks {} hardened at retire, {} leaked; \
-             {} idle stacks given back to the heap",
+             {} idle stacks given back",
             installed, refused, spent, reserved, starved, hardened, leaked, trimmed
+        );
+        let (vmapped, vfailed) = kernel_hal::kstats::vmap_stack_stats();
+        let _ = writeln!(
+            out,
+            "stack vmap:   {} stacks mapped from scattered frames, {} fell back to the heap",
+            vmapped, vfailed
         );
         // What the bounded stack poison is actually doing. `whole` climbing
         // with `bounded` at zero is the hook answering `None` (a huge leaf

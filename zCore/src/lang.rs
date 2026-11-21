@@ -199,6 +199,21 @@ fn alloc_error(layout: Layout) -> ! {
         heap_used / 1024 / 1024,
         heap_total / 1024 / 1024,
     ));
+    // Why the heap could not grow out of it: the one question the lines above
+    // leave open, and the one a photographed `Alloction Stack Failed` could
+    // not answer (ceiling, user-page reserve, or fragmentation).
+    {
+        let (refused, why, ram_used, ram, ceiling) = crate::memory::heap_grow_status();
+        emit(format_args!(
+            "heap growth: refused {} time(s), last because: {}; RAM committed then {} / {} MiB; \
+             heap ceiling {} MiB\n",
+            refused,
+            why,
+            ram_used >> 20,
+            ram >> 20,
+            ceiling >> 20,
+        ));
+    }
     // A refusal from the heap re-entrancy guard reaches this handler as a null
     // pointer, i.e. as an allocation failure indistinguishable from a real
     // one. Say which it was: a guard event count that moved means the heap may

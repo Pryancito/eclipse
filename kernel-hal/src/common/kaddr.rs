@@ -241,7 +241,32 @@ pub fn in_grown_heap(a: u64) -> bool {
 /// Whether `a` may be on a kernel stack: the kernel window, or a region the
 /// heap grew into (where coroutine stacks are carved from too).
 pub fn is_kernel_stack_addr(a: u64) -> bool {
-    is_kernel_addr(a) || in_grown_heap(a)
+    is_kernel_addr(a) || in_grown_heap(a) || in_vmap_stacks(a)
+}
+
+/// The window coroutine stacks are mapped into from scattered frames
+/// (`kernel_hal::vmap_stack`), so that no stack needs physically contiguous
+/// memory. One top-level entry of its own on x86_64: PML4 slot `0x1fc`, below
+/// the image (`0x1fe`) and far above the linear map (`0x100..`). Empty
+/// elsewhere, where stacks stay heap blocks.
+#[cfg(target_arch = "x86_64")]
+pub const VMAP_STACK_LO: u64 = 0xffff_fe00_0000_0000;
+#[cfg(not(target_arch = "x86_64"))]
+pub const VMAP_STACK_LO: u64 = 0;
+/// Bytes of window per stack: a 4 MiB slot holds one 2.6 MiB stack block,
+/// and what it does not use stays unmapped, which is guard too.
+pub const VMAP_STACK_SLOT: u64 = 4 * 1024 * 1024;
+/// Slots in the window. 2048 stacks is 8 GiB of window and 5 GiB of RAM,
+/// past anything a live system has needed (441 live at once, at the worst).
+#[cfg(target_arch = "x86_64")]
+pub const VMAP_STACK_SLOTS: u64 = 2048;
+#[cfg(not(target_arch = "x86_64"))]
+pub const VMAP_STACK_SLOTS: u64 = 0;
+pub const VMAP_STACK_HI: u64 = VMAP_STACK_LO + VMAP_STACK_SLOT * VMAP_STACK_SLOTS;
+
+/// Whether `a` is inside the stack window ([`VMAP_STACK_LO`]), mapped or not.
+pub fn in_vmap_stacks(a: u64) -> bool {
+    (VMAP_STACK_LO..VMAP_STACK_HI).contains(&a)
 }
 
 /// Whether `a` is a plausible kernel-stack pointer: in the kernel half or a
@@ -864,6 +889,22 @@ mod tests {
             !is_kernel_addr(RSP),
             "the kernel window itself is unchanged"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_stack_in_the_vmap_window_is_a_stack() {
+        let rsp = VMAP_STACK_LO + 5 * VMAP_STACK_SLOT + 0x27_d2e8;
+        assert!(is_kernel_stack_qword(rsp));
+        assert!(
+            !is_kernel_stack_qword(VMAP_STACK_HI),
+            "only inside the window"
+        );
+        assert!(!is_kernel_stack_qword(VMAP_STACK_LO - 8));
+        // Its own top-level entry: nothing else the kernel maps is in it.
+        assert_eq!((VMAP_STACK_LO >> 39) & 0x1ff, 0x1fc);
+        assert_eq!((VMAP_STACK_HI - 1) >> 39, VMAP_STACK_LO >> 39);
+        assert!(!is_kernel_addr(VMAP_STACK_LO) && !is_kernel_addr(VMAP_STACK_HI - 1));
     }
 
     // ── the residue predicates ──────────────────────────────────────────────

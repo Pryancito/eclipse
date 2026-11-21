@@ -122,182 +122,8 @@ fn track_mark_free(idx: usize) {
 /// poison and double-use bitset want every frame to round-trip through the
 /// bitmap, and a frame parked in a per-CPU list is neither allocated nor free.
 #[cfg(not(feature = "mem-debug"))]
-mod pcp {
-    use super::{Mutex, FRAMES_CACHED, FRAME_ALLOCATOR, PAGE_BITS};
-    use bitmap_allocator::BitAlloc;
-    use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
-
-    /// `pcp->high`: frames one CPU may park. 65 slots x 128 frames is 32 MiB
-    /// of RAM the bitmap cannot hand out, which is why [`drain_all`] exists
-    /// and why it runs before any allocation failure is believed.
-    pub const CAPACITY: usize = 128;
-    /// `pcp->batch`: frames moved per trip to the bitmap. The whole point is
-    /// that one lock acquisition serves `CAPACITY / 1` allocations instead of
-    /// one, so this is what sets the amortisation.
-    pub const BATCH: usize = 32;
-
-    /// A frame index, not an address: `BitAlloc16M` tops out at 2^24 frames,
-    /// so a `u32` holds any of them and the whole table costs 33 KiB of BSS.
-    pub struct Pcp {
-        frames: [u32; CAPACITY],
-        len: usize,
-    }
-
-    impl Pcp {
-        pub const fn new() -> Self {
-            Pcp {
-                frames: [0; CAPACITY],
-                len: 0,
-            }
-        }
-
-        pub fn len(&self) -> usize {
-            self.len
-        }
-
-        /// Park `idx`, or `false` when the list is full and the caller must
-        /// make room.
-        pub fn push(&mut self, idx: usize) -> bool {
-            if self.len == CAPACITY || idx > u32::MAX as usize {
-                return false;
-            }
-            self.frames[self.len] = idx as u32;
-            self.len += 1;
-            true
-        }
-
-        pub fn pop(&mut self) -> Option<usize> {
-            if self.len == 0 {
-                return None;
-            }
-            self.len -= 1;
-            Some(self.frames[self.len] as usize)
-        }
-    }
-
-    static LISTS: [Mutex<Pcp>; PERCPU_SLOTS] = [const { Mutex::new(Pcp::new()) }; PERCPU_SLOTS];
-
-    /// This CPU's list. Indexed by [`percpu_slot`], the dense slot the rest of
-    /// the kernel indexes per-CPU tables with, so a `cpu_id()` that names no
-    /// CPU lands in the quarantine slot rather than out of bounds.
-    #[inline]
-    fn mine() -> &'static Mutex<Pcp> {
-        &LISTS[percpu_slot(kernel_hal::cpu::cpu_id() as usize)]
-    }
-
-    /// Bytes parked in all the lists. Not part of `FRAMES_USED`: nobody holds
-    /// these frames, so to a caller of `frame_stats` they are free -- which is
-    /// true, and is exactly why a reader of a failed allocation needs to be
-    /// told they exist.
-    pub fn cached_bytes() -> usize {
-        FRAMES_CACHED.get()
-    }
-
-    /// A frame from this CPU's list, refilling it from the bitmap when empty.
-    ///
-    /// `try_lock`, for the reason the heap's front cache uses it: a fault taken
-    /// inside this critical section would otherwise wait, with interrupts off,
-    /// for a release only this CPU could perform. A miss is a trip to the
-    /// bitmap, which is where every allocation used to go anyway.
-    pub fn alloc() -> Option<usize> {
-        let mut p = mine().try_lock()?;
-        if let Some(idx) = p.pop() {
-            FRAMES_CACHED.sub(1 << PAGE_BITS);
-            return Some(idx);
-        }
-        // Refill with the list still held and the bitmap taken inside it. The
-        // order is always this way round -- list outer, bitmap inner -- in
-        // every function here, which is what keeps the pair deadlock-free.
-        let mut g = FRAME_ALLOCATOR.lock();
-        let mut batch = [0usize; BATCH];
-        let mut taken = 0;
-        for slot in batch.iter_mut() {
-            let Some(f) = g.alloc() else { break };
-            *slot = f;
-            taken += 1;
-        }
-        if taken == 0 {
-            return None;
-        }
-        // Parked HIGHEST FIRST, so the pops that follow hand the batch out in
-        // ascending order: the bitmap gave it ascending, and a list that is
-        // popped from the top would reverse it. The order matters to libos,
-        // where a guest page is one host `mmap` of the frame file at the
-        // frame's offset and the host merges neighbouring mappings only when
-        // their offsets ascend with the addresses. Handed out in reverse,
-        // every page of a 64-page thread stack was a host VMA of its own and
-        // `vm.max_map_count` (65530) ran out 2048 threads into
-        // `RseqTest.ManyConcurrent`; ascending, a batch is one VMA.
-        let mut parked = 0;
-        for &f in batch[1..taken].iter().rev() {
-            if !p.push(f) {
-                g.dealloc(f);
-                continue;
-            }
-            parked += 1;
-        }
-        if parked > 0 {
-            FRAMES_CACHED.add(parked << PAGE_BITS);
-        }
-        Some(batch[0])
-    }
-
-    /// Park a freed frame, or `false` when the caller must free it to the
-    /// bitmap itself.
-    pub fn free(idx: usize) -> bool {
-        let Some(mut p) = mine().try_lock() else {
-            return false;
-        };
-        if p.len() == CAPACITY {
-            // Full: give a batch back rather than refusing, so a CPU that
-            // frees far more than it allocates does not fall back to the
-            // global lock on every single page from here on.
-            let mut g = FRAME_ALLOCATOR.lock();
-            let mut given = 0;
-            for _ in 0..BATCH {
-                let Some(f) = p.pop() else { break };
-                g.dealloc(f);
-                given += 1;
-            }
-            drop(g);
-            FRAMES_CACHED.sub(given << PAGE_BITS);
-        }
-        if !p.push(idx) {
-            return false;
-        }
-        FRAMES_CACHED.add(1 << PAGE_BITS);
-        true
-    }
-
-    /// Give every list back to the bitmap, and answer how many frames moved.
-    ///
-    /// Linux drains the per-CPU lists before it believes a zone is empty, and
-    /// so must this: without it a contiguous request can be refused with up to
-    /// 32 MiB of single frames parked where the bitmap cannot see them, and
-    /// the refusal surfaces as an ENOMEM with free RAM on the meter. Best
-    /// effort on purpose -- a list whose lock is held is skipped rather than
-    /// waited for, because the caller is already on a failure path.
-    pub fn drain_all() -> usize {
-        let mut moved = 0;
-        for list in LISTS.iter() {
-            let Some(mut p) = list.try_lock() else {
-                continue;
-            };
-            if p.len() == 0 {
-                continue;
-            }
-            let mut g = FRAME_ALLOCATOR.lock();
-            while let Some(f) = p.pop() {
-                g.dealloc(f);
-                moved += 1;
-            }
-        }
-        if moved > 0 {
-            FRAMES_CACHED.sub(moved << PAGE_BITS);
-        }
-        moved
-    }
-}
+#[path = "memory_x86_64/pcp.rs"]
+mod pcp;
 
 /// Bytes of RAM parked in the per-CPU frame lists; always 0 under `mem-debug`,
 /// which bypasses them.
@@ -1626,6 +1452,46 @@ cfg_if! {
         /// user pages must still be commitable, or we trade an OOM here for a
         /// worse one in the page-fault path.
         const HEAP_LEAVE_FREE_PCT: usize = 25;
+        /// ... except for an allocation the buddy has already refused, which
+        /// may dig into that quarter down to this share. The quarter is for
+        /// growth ahead of demand. Refusing a 4 MiB coroutine stack to keep
+        /// it ends the whole machine (`Alloction Stack Failed`), which is
+        /// worse for every user page than the 4 MiB. Linux does the same: its
+        /// `min` watermark is the part of free memory only the kernel's own
+        /// urgent allocations may use.
+        const HEAP_EMERGENCY_FREE_PCT: usize = 2;
+
+        /// Why the last growth was refused, for the OOM report: one of the
+        /// `GROW_REFUSED_*` codes, and the RAM figures at that moment.
+        static HEAP_GROW_LAST_REFUSAL: AtomicUsize = AtomicUsize::new(0);
+        static HEAP_GROW_REFUSAL_RAM_USED: AtomicUsize = AtomicUsize::new(0);
+        const GROW_REFUSED_CEILING: usize = 1;
+        const GROW_REFUSED_RESERVE: usize = 2;
+        const GROW_REFUSED_NO_RUN: usize = 3;
+
+        fn note_grow_refusal(code: usize, ram_used: usize) {
+            HEAP_GROW_LAST_REFUSAL.store(code, Ordering::Relaxed);
+            HEAP_GROW_REFUSAL_RAM_USED.store(ram_used, Ordering::Relaxed);
+        }
+
+        /// The heap's growth, for the OOM report: refusals since boot, why the
+        /// last one was refused, RAM committed then and RAM in all (bytes),
+        /// and the ceiling. Allocates nothing.
+        pub fn heap_grow_status() -> (usize, &'static str, usize, usize, usize) {
+            let why = match HEAP_GROW_LAST_REFUSAL.load(Ordering::Relaxed) {
+                GROW_REFUSED_CEILING => "heap at its ceiling",
+                GROW_REFUSED_RESERVE => "RAM reserve for user pages",
+                GROW_REFUSED_NO_RUN => "no contiguous run of frames",
+                _ => "never refused",
+            };
+            (
+                HEAP_GROW_REFUSED.load(Ordering::Relaxed),
+                why,
+                HEAP_GROW_REFUSAL_RAM_USED.load(Ordering::Relaxed),
+                TOTAL_MEMORY.load(Ordering::Relaxed),
+                HEAP_MAX_TOTAL,
+            )
+        }
 
         /// Set for the duration of a growth attempt. Growth runs from INSIDE
         /// `alloc`, and `frame_alloc`'s failure path logs (which allocates),
@@ -1783,6 +1649,7 @@ cfg_if! {
                 let _ = used;
             }
             if total >= HEAP_MAX_TOTAL {
+                note_grow_refusal(GROW_REFUSED_CEILING, FRAMES_USED.get());
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: already at the {} MiB ceiling ({} MiB in use)\n",
@@ -1798,12 +1665,20 @@ cfg_if! {
             if HEAP_ALLOCATOR.0.held_by_current_cpu() {
                 return false;
             }
-            // Leave the machine room to commit user pages.
+            // Leave the machine room to commit user pages: a quarter of it
+            // ahead of demand, a sliver once the buddy has said no (see
+            // `HEAP_EMERGENCY_FREE_PCT`).
             let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
             let ram_used = FRAMES_USED.get();
-            let reserve = ram / 100 * HEAP_LEAVE_FREE_PCT;
-            if ram == 0 || ram_used + HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] + reserve > ram
-            {
+            let reserve_pct = if need > 0 {
+                HEAP_EMERGENCY_FREE_PCT
+            } else {
+                HEAP_LEAVE_FREE_PCT
+            };
+            let reserve = ram / 100 * reserve_pct;
+            let smallest = heap_grow_chunks(need).last().unwrap_or(HEAP_GROW_CHUNKS[0]);
+            if ram == 0 || ram_used + smallest + reserve > ram {
+                note_grow_refusal(GROW_REFUSED_RESERVE, ram_used);
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: {} MiB of {} MiB RAM already committed; \
@@ -1835,6 +1710,7 @@ cfg_if! {
                 }
             }
             let Some((pa, chunk)) = got else {
+                note_grow_refusal(GROW_REFUSED_NO_RUN, ram_used);
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: no contiguous run of frames left, down to {} MiB\n",
@@ -2821,6 +2697,11 @@ cfg_if! {
 
         pub fn heap_total() -> usize {
             0
+        }
+
+        #[allow(dead_code)]
+        pub fn heap_grow_status() -> (usize, &'static str, usize, usize, usize) {
+            (0, "no elastic heap", 0, 0, 0)
         }
 
         pub fn heap_grown() -> usize {

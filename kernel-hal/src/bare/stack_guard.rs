@@ -471,6 +471,19 @@ pub fn init() {
     // Before the hooks, so the first `Executor::new` already finds the frames
     // its guard bands need (see `SPLIT_POOL`).
     fill_split_pool();
+    // The window stacks are mapped into from scattered frames, and the hooks
+    // that put them there. Before the first `Executor::new`, and before any
+    // address space is cloned from the kernel's: see `vmap_stack::init`.
+    #[cfg(target_arch = "x86_64")]
+    {
+        super::vmap_stack::init();
+        // SAFETY: `alloc` hands out page-aligned, mapped, read-write blocks
+        // that nothing else owns, and `free` takes back only blocks `alloc`
+        // handed out (`owns`), answering `false` for any other.
+        unsafe {
+            executor::set_stack_alloc_hooks(super::vmap_stack::alloc, super::vmap_stack::free)
+        };
+    }
     // SAFETY: the contract is that `remove` restores any mapping `install`
     // took away before the VA goes back to the heap, and that no `.bss`-owned
     // frame is handed to the frame allocator. `install` never takes a frame out

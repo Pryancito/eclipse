@@ -512,6 +512,18 @@ pub fn stack_guard_stats() -> (usize, usize, usize, usize, usize, usize, usize, 
     (0, 0, 0, 0, 0, 0, 0, 0)
 }
 
+/// `(stacks mapped from scattered frames now, allocations that fell back to
+/// the heap)`: see `kernel_hal::vmap_stack`. Zeros where there is no window.
+#[cfg(all(target_os = "none", target_arch = "x86_64", not(feature = "libos")))]
+pub fn vmap_stack_stats() -> (usize, usize) {
+    crate::imp::vmap_stack::stats()
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64", not(feature = "libos"))))]
+pub fn vmap_stack_stats() -> (usize, usize) {
+    (0, 0)
+}
+
 /// `(deepest coroutine-stack use observed at a park, STACK_SIZE)` in bytes.
 /// The evidence for (or against) shrinking executor stacks.
 #[cfg(target_os = "none")]

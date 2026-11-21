@@ -28,7 +28,7 @@ use kernel_hal::shrinker;
 use kernel_hal::timer::timer_now;
 
 /// Idle coroutine stacks kept ready for the next `Executor::new`; the rest go
-/// back to the heap, half the excess a period (`executor::trim_idle_stacks`).
+/// back, half the excess a period (`executor::trim_idle_stacks`).
 /// Sixteen covers the stacks a quiet desktop churns through, so the common
 /// case still reuses a pooled block and pays no guard install for it.
 #[cfg(not(feature = "libos"))]
@@ -143,7 +143,7 @@ pub fn start() {
                 let trimmed = executor::trim_idle_stacks(IDLE_STACKS_KEPT);
                 if trimmed > 0 {
                     log::info!(
-                        "reclaimd: gave {} KiB of idle coroutine stacks back to the heap",
+                        "reclaimd: gave back {} KiB of idle coroutine stacks",
                         trimmed / 1024
                     );
                 }
