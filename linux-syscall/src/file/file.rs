@@ -3773,3 +3773,7 @@ mod dsp_close_tests;
 /// Memfd seals: `F_SEAL_GROW` and `F_SEAL_EXEC` kept, and who may add one.
 #[cfg(test)]
 mod memfd_seal_rule_tests;
+
+/// `/dev/full`: zeros to read, `ENOSPC` to every write.
+#[cfg(test)]
+mod dev_full_tests;

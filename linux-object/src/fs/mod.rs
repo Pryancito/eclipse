@@ -73,7 +73,7 @@ use lock::Mutex;
 use kernel_hal::drivers;
 use rcore_fs::vfs::{FileSystem, FileType, INode, Result, Walked};
 use rcore_fs_devfs::{
-    special::{NullINode, ZeroINode},
+    special::{FullINode, NullINode, ZeroINode},
     DevFS, DevINode,
 };
 use rcore_fs_mountfs::{MNode, MountFS};
@@ -1626,6 +1626,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     let (devfs, devfs_root) = devfs_root_once();
     devfs_mknod(&devfs_root, "null", Arc::new(NullINode::new()));
     devfs_mknod(&devfs_root, "zero", Arc::new(ZeroINode::new()));
+    devfs_mknod(&devfs_root, "full", Arc::new(FullINode::new()));
     devfs_mknod(&devfs_root, "random", Arc::new(RandomINode::new(false)));
     devfs_mknod(&devfs_root, "urandom", Arc::new(RandomINode::new(true)));
     // `/dev/shm` is a POSIX shared-memory tmpfs *directory*, not a device node:
