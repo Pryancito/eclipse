@@ -3121,7 +3121,9 @@ impl LinuxProcess {
         let (start, from) = if dirfd == FileDesc::CWD {
             self.working_directory()?
         } else {
-            let file = self.get_file(dirfd)?;
+            // `path_init`: a `dirfd` open on a socket or an eventfd is
+            // `ENOTDIR`, as one open on a regular file is.
+            let file = self.get_file_or(dirfd, LxError::ENOTDIR)?;
             (file.inode(), file.path().clone())
         };
         walked.set(&from);

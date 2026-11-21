@@ -70,6 +70,20 @@ impl LinuxProcess {
     pub fn lookup_parent_at(&self, dirfd: FileDesc, dir_path: &str) -> LxResult<Arc<dyn INode>> {
         Ok(self.lookup_parent_walked(dirfd, dir_path)?.0)
     }
+
+    /// The `File` with given `fd`, or `not_a_file` when `fd` is open on
+    /// something that is not one: a socket, an eventfd, an epoll, a timerfd.
+    ///
+    /// Linux has an inode behind every descriptor, so a call that wants a
+    /// file and is handed one of those does not answer `EBADF` -- the
+    /// descriptor is open -- but what it answers to any inode of the wrong
+    /// kind: `ENOTDIR` to `getdents64`, `EINVAL` to `fsync`, and so on.
+    /// `EBADF` stays the answer for a descriptor that is not open at all.
+    pub fn get_file_or(&self, fd: FileDesc, not_a_file: LxError) -> LxResult<Arc<super::File>> {
+        self.get_file_like(fd)?
+            .downcast_arc::<super::File>()
+            .map_err(|_| not_a_file)
+    }
 }
 
 /// What a process's walks ask each directory, by its effective ids and by

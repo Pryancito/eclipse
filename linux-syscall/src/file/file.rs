@@ -1113,7 +1113,8 @@ impl Syscall<'_> {
         // file to sixteen exabytes.
         let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        // A socket or an eventfd is "not a regular file" too.
+        let file = proc.get_file_or(fd, LxError::EINVAL)?;
         let metadata = file.metadata()?;
         Self::ftruncate_type(metadata.type_)?;
         // `do_ftruncate`: a descriptor not open for writing is the same
@@ -1217,7 +1218,7 @@ impl Syscall<'_> {
         // matters at the one step where two of them can both be wrong: a
         // caller probing for a mode on a read-only descriptor is told about
         // the mode, not about the descriptor.
-        let file = self.linux_process().get_file(fd)?;
+        let file_like = self.linux_process().get_file_like(fd)?;
         // `fallocate(2)`: EINVAL for a negative offset or a length that is
         // not positive.
         let offset = linux_object::fs::user_len(offset)?;
@@ -1226,7 +1227,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let op = fallocate_op(mode)?;
-        let flags = file.flags();
+        let flags = file_like.flags();
         // EBADF for a descriptor not open for writing. `set_len` and `write_at`
         // both check this, but only once they are reached: without the check
         // here, `fallocate(ro_fd, 0, 0, 1)` on a file already that long
@@ -1239,6 +1240,11 @@ impl Syscall<'_> {
         if zeroing && flags.is_append() {
             return Err(LxError::EPERM);
         }
+        // A socket, an eventfd, an epoll: neither a regular file nor a block
+        // device, which is `ENODEV` (`vfs_fallocate`), not `EBADF`.
+        let file = file_like
+            .downcast_arc::<linux_object::fs::File>()
+            .map_err(|_| LxError::ENODEV)?;
         let meta = file.metadata()?;
         let resizable = match meta.type_ {
             FileType::File => true,
@@ -1521,6 +1527,23 @@ pub(crate) async fn copy_range(
     })
 }
 
+/// The file `fsync(2)` and `fdatasync(2)` flush, or the `EINVAL` Linux gives
+/// a descriptor whose file has no `fsync` to call (`vfs_fsync_range`): a
+/// pipe, a FIFO, a socket, an eventfd. `EBADF` only when `fd` is not open.
+fn fsync_target(
+    proc: &linux_object::process::LinuxProcess,
+    fd: FileDesc,
+) -> LxResult<Arc<linux_object::fs::File>> {
+    let file = proc.get_file_or(fd, LxError::EINVAL)?;
+    if matches!(
+        file.metadata().map(|m| m.type_),
+        Ok(FileType::NamedPipe | FileType::Socket)
+    ) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(file)
+}
+
 impl Syscall<'_> {
     /// causes all buffered modifications to file metadata and data to be written to the underlying file systems.
     pub fn sys_sync(&self) -> SysResult {
@@ -1535,7 +1558,7 @@ impl Syscall<'_> {
     pub async fn sys_fsync(&self, fd: FileDesc) -> SysResult {
         info!("fsync: fd={:?}", fd);
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        let file = fsync_target(proc, fd)?;
         // The node of a disk served by a process: asleep until it has
         // flushed, which takes as long as the disk under it does.
         match file.sync_asleep().await {
@@ -1549,7 +1572,7 @@ impl Syscall<'_> {
     pub async fn sys_fdatasync(&self, fd: FileDesc) -> SysResult {
         info!("fdatasync: fd={:?}", fd);
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        let file = fsync_target(proc, fd)?;
         match file.sync_asleep().await {
             Some(synced) => synced?,
             None => file.sync_data()?,
@@ -1562,7 +1585,16 @@ impl Syscall<'_> {
     pub fn sys_syncfs(&self, fd: FileDesc) -> SysResult {
         info!("syncfs: fd={:?}", fd);
         let proc = self.linux_process();
-        proc.get_file(fd)?.inode().fs().sync()?;
+        // `syncfs` on a socket or an eventfd syncs the pseudo filesystem
+        // behind it, which has nothing to write: 0, not `EBADF`.
+        let Some(file) = proc
+            .get_file_like(fd)?
+            .downcast_arc::<linux_object::fs::File>()
+            .ok()
+        else {
+            return Ok(0);
+        };
+        file.inode().fs().sync()?;
         Ok(0)
     }
 
@@ -1576,12 +1608,16 @@ impl Syscall<'_> {
     pub fn sys_readahead(&self, fd: FileDesc, offset: u64, count: usize) -> SysResult {
         info!("readahead: fd={:?}, offset={}, count={}", fd, offset, count);
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        let file_like = proc.get_file_like(fd)?;
         // `ksys_readahead`: EBADF unless the descriptor is open for reading,
-        // then EINVAL unless it names something with a page cache to fill.
-        if !file.flags().readable() {
+        // then EINVAL unless it names something with a page cache to fill,
+        // which a socket or an eventfd does not.
+        if !file_like.flags().readable() {
             return Err(LxError::EBADF);
         }
+        let file = file_like
+            .downcast_arc::<linux_object::fs::File>()
+            .map_err(|_| LxError::EINVAL)?;
         if !matches!(
             file.metadata().map(|m| m.type_),
             Ok(FileType::File) | Ok(FileType::BlockDevice)
@@ -1619,7 +1655,15 @@ impl Syscall<'_> {
         // were accepted and the whole file synced.
         crate::intarg::loff_range(offset, nbytes)?;
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        // `sync_file_range`: `ESPIPE` for anything but a regular file, a
+        // block device, a directory or a symlink -- a pipe, a FIFO, a socket.
+        let file = proc.get_file_or(fd, LxError::ESPIPE)?;
+        if !matches!(
+            file.metadata()?.type_,
+            FileType::File | FileType::BlockDevice | FileType::Dir | FileType::SymLink
+        ) {
+            return Err(LxError::ESPIPE);
+        }
         if writes_back {
             file.sync_data()?;
         }
@@ -3175,6 +3219,9 @@ mod statfs_flags_tests;
 
 #[cfg(test)]
 mod statfs_pseudo_tests;
+
+#[cfg(test)]
+mod not_a_file_tests;
 
 #[cfg(test)]
 mod statfs_type_tests;

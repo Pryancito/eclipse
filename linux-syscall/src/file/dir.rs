@@ -224,7 +224,7 @@ impl Syscall<'_> {
             fd, buf, buf_size
         );
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        let file = proc.get_file_or(fd, LxError::ENOTDIR)?;
         let info = file.metadata()?;
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
@@ -504,7 +504,7 @@ impl Syscall<'_> {
         info!("fchdir: fd={:?}", fd);
 
         let proc = self.linux_process();
-        let file = proc.get_file(fd)?;
+        let file = proc.get_file_or(fd, LxError::ENOTDIR)?;
         let info = file.metadata()?;
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
