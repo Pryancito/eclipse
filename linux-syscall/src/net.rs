@@ -649,6 +649,20 @@ impl Syscall<'_> {
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                // A datagram socket's connect only names a default
+                // destination (`unix_dgram_connect`): no listener, no accept.
+                if client.sock_type() == SocketType::SOCK_DGRAM {
+                    client.connect_dgram(path)?;
+                    return Ok(0);
+                }
+                // `unix_find_other` matches the socket type before anything
+                // asks whether it listens: a stream connecting to a datagram
+                // socket's address is `EPROTOTYPE`, not `ECONNREFUSED`.
+                if let Some(other) = UnixSocketState::lookup(path) {
+                    if other.sock_type() != client.sock_type() {
+                        return Err(LxError::EPROTOTYPE);
+                    }
+                }
                 // `unix_stream_connect`: already connected (or a listener)
                 // is `EISCONN`. Without the check a second `connect` rewired
                 // the peer and queued another accept silently.

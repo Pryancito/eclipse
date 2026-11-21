@@ -95,3 +95,35 @@ fn socketpair_of_a_family_without_one_is_eopnotsupp() {
         })
     });
 }
+
+/// A `sockaddr_un` for `path`, and the length to pass with it.
+fn sockaddr_un(path: &str) -> ([u8; 110], usize) {
+    let mut sa = [0u8; 110];
+    sa[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    sa[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    (sa, 2 + path.len() + 1)
+}
+
+/// `connect(2)` of a unix datagram socket to a bound, non-listening one
+/// names its destination (`unix_dgram_connect`); a stream connecting to
+/// that address is `EPROTOTYPE` (`unix_find_other` matches the type).
+#[test]
+fn a_datagram_connect_reaches_a_bound_socket_and_a_stream_is_eprototype() {
+    let proc = a_process(43_112);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut s = own(sys);
+            let (sa, len) = sockaddr_un("/run/socket-create-dgram");
+            let addr = sa.as_ptr() as usize;
+            let rx = s.sys_socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+            assert_eq!(s.sys_bind(rx, addr.into(), len).await, Ok(0));
+            let tx = s.sys_socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+            assert_eq!(s.sys_connect(tx, addr.into(), len).await, Ok(0));
+            let stream = s.sys_socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+            assert_eq!(
+                s.sys_connect(stream, addr.into(), len).await,
+                Err(LxError::EPROTOTYPE)
+            );
+        })
+    });
+}
