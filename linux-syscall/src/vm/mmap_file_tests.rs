@@ -369,7 +369,7 @@ fn a_shared_mapping_of_a_pipe_is_refused_by_the_pipe_and_not_by_the_descriptor()
             assert_eq!(
                 sys.sys_mmap(0, PAGE, R, FILE_SHARED, FileDesc::from(fd), 0)
                     .await,
-                Err(LxError::ENOSYS),
+                Err(LxError::ENODEV),
                 "a shared mapping of a pipe was not refused by the pipe"
             );
             assert_eq!(
@@ -392,7 +392,7 @@ fn a_private_mapping_of_a_pipe_is_refused_too_and_by_its_own_call() {
             assert_eq!(
                 sys.sys_mmap(0, PAGE, R, FILE_PRIVATE, FileDesc::from(fd), 0)
                     .await,
-                Err(LxError::ENOSYS),
+                Err(LxError::ENODEV),
                 "a private mapping of a pipe was not refused by the pipe"
             );
         })
@@ -434,6 +434,55 @@ fn a_fixed_mapping_of_a_file_outside_the_address_space_is_refused_and_maps_nothi
                 mapped(sys.zircon_process()),
                 held,
                 "the mapping that could not be placed still took address space"
+            );
+        })
+    });
+}
+
+/// `/dev/zero` is the one character device every Unix lets you map: the
+/// mapping is fresh anonymous memory (`mmap_zero`), private or shared. It
+/// used to be `ENOSYS`, like every device without a `get_vmo`.
+#[test]
+fn a_mapping_of_dev_zero_is_zeroed_memory_private_or_shared() {
+    let proc = a_process(49_399);
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let path = b"/dev/zero\0";
+            let fd = FileDesc::from(
+                sys.sys_openat(FileDesc::CWD, UserInPtr::from(path.as_ptr() as usize), 2, 0)
+                    .unwrap() as i32,
+            );
+            for flags in [FILE_PRIVATE, FILE_SHARED] {
+                let addr = sys
+                    .sys_mmap(0, 2 * PAGE, RW, flags, fd, 0)
+                    .await
+                    .unwrap_or_else(|e| panic!("mmap /dev/zero {:#x}: {:?}", flags, e));
+                let vmar = sys.zircon_process().vmar();
+                let mut got = [0xffu8; 16];
+                vmar.read_memory(addr + PAGE, &mut got).unwrap();
+                assert_eq!(got, [0u8; 16], "a /dev/zero page was not zero");
+                vmar.write_memory(addr, b"written").unwrap();
+                vmar.read_memory(addr, &mut got[..7]).unwrap();
+                assert_eq!(&got[..7], b"written");
+            }
+        })
+    });
+}
+
+/// A device without an `mmap` method is `ENODEV` (`do_mmap`), not `ENOSYS`.
+#[test]
+fn a_mapping_of_a_device_that_cannot_be_mapped_is_enodev() {
+    let proc = a_process(49_400);
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let path = b"/dev/null\0";
+            let fd = FileDesc::from(
+                sys.sys_openat(FileDesc::CWD, UserInPtr::from(path.as_ptr() as usize), 2, 0)
+                    .unwrap() as i32,
+            );
+            assert_eq!(
+                sys.sys_mmap(0, PAGE, R, FILE_PRIVATE, fd, 0).await,
+                Err(LxError::ENODEV)
             );
         })
     });

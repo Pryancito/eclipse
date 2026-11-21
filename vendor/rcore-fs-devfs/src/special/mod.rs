@@ -54,8 +54,10 @@ macro_rules! impl_inode {
     };
 }
 
+mod full;
 mod null;
 mod zero;
 
+pub use self::full::*;
 pub use self::null::*;
 pub use self::zero::*;

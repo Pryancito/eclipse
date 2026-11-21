@@ -2110,10 +2110,22 @@ impl FileLike for File {
                     {
                         return Err(LxError::EINVAL);
                     }
-                    Err(LxError::ENOSYS)
+                    // `mmap_zero`: a mapping of /dev/zero is fresh anonymous
+                    // memory, private or shared (`shmem_zero_setup` makes a
+                    // new object per call, which a fork then shares).
+                    if inner
+                        .inode
+                        .downcast_ref::<rcore_fs_devfs::special::ZeroINode>()
+                        .is_some()
+                    {
+                        return Ok(VmObject::new_paged(pages(len)));
+                    }
+                    // A device with no `mmap` method: `ENODEV` (`do_mmap`).
+                    Err(LxError::ENODEV)
                 }
             }
-            _ => Err(LxError::ENOSYS),
+            // Pipes, FIFOs, directories and links have no `mmap` either.
+            _ => Err(LxError::ENODEV),
         }
     }
 
