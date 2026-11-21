@@ -673,3 +673,116 @@ fn soltar_una_reclamacion_que_nadie_pidio_tambien_se_delata() {
     executor.release_resume(0);
     assert_eq!(executor.resume_claim.holder(), None);
 }
+
+/// A fake block allocator for the stack-block hooks: heap blocks it counts,
+/// so a test can tell its blocks from the scheduler's own heap fallback.
+mod blocks {
+    use alloc::alloc::{Allocator, Global};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub static GIVEN: AtomicUsize = AtomicUsize::new(0);
+    pub static TAKEN_BACK: AtomicUsize = AtomicUsize::new(0);
+    pub static LAST: AtomicUsize = AtomicUsize::new(0);
+    pub static REFUSE: AtomicBool = AtomicBool::new(false);
+
+    pub fn reset() {
+        GIVEN.store(0, Ordering::SeqCst);
+        TAKEN_BACK.store(0, Ordering::SeqCst);
+        LAST.store(0, Ordering::SeqCst);
+        REFUSE.store(false, Ordering::SeqCst);
+    }
+
+    pub fn alloc(size: usize) -> Option<usize> {
+        if REFUSE.load(Ordering::SeqCst) {
+            return None;
+        }
+        assert_eq!(size, super::ALLOC_SIZE);
+        let base = Global.allocate(super::ALLOC_LAYOUT).ok()?.cast::<u8>().as_ptr() as usize;
+        GIVEN.fetch_add(1, Ordering::SeqCst);
+        LAST.store(base, Ordering::SeqCst);
+        Some(base)
+    }
+
+    /// Only the block it handed out last is its own; anything else is not.
+    pub fn free(base: usize, size: usize) -> bool {
+        if base != LAST.load(Ordering::SeqCst) {
+            return false;
+        }
+        assert_eq!(size, super::ALLOC_SIZE);
+        // SAFETY: `alloc` made it with this layout.
+        unsafe {
+            Global.deallocate(
+                core::ptr::NonNull::new_unchecked(base as *mut u8),
+                super::ALLOC_LAYOUT,
+            )
+        };
+        TAKEN_BACK.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
+/// Clears the block hooks when a test ends, passing or not.
+struct NoBlockHooks;
+
+impl Drop for NoBlockHooks {
+    fn drop(&mut self) {
+        *super::STACK_BLOCK_HOOKS.lock() = None;
+    }
+}
+
+/// **A fresh stack comes from the block allocator, and goes back to it.**
+///
+/// The kernel maps stacks from scattered frames, because a heap block is
+/// 4 MiB of contiguous RAM that a long-running machine stops having. The
+/// scheduler must take its blocks from there, and a trimmed block must go
+/// back there rather than to the heap, which never handed it out.
+#[test]
+fn a_stack_comes_from_the_block_allocator_and_goes_back_to_it() {
+    let _f = fresh(0);
+    let _h = NoBlockHooks;
+    hooks::reset();
+    blocks::reset();
+    unsafe { set_stack_guard_hooks(hooks::install_ok, hooks::remove) };
+    unsafe { super::set_stack_alloc_hooks(blocks::alloc, blocks::free) };
+
+    let executor = Executor::new(collection());
+    assert_eq!(blocks::GIVEN.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        executor.stack_base - GUARD_SIZE,
+        blocks::LAST.load(Ordering::SeqCst)
+    );
+    drop(executor);
+    assert_eq!(stack_pool_stats(), (1, 0), "retired to the pool as before");
+
+    IDLE_AT_LAST_TRIM.store(0, Ordering::SeqCst);
+    assert_eq!(trim_idle_stacks(0), 0);
+    assert_eq!(trim_idle_stacks(0), ALLOC_SIZE);
+    assert_eq!(
+        blocks::TAKEN_BACK.load(Ordering::SeqCst),
+        1,
+        "the trim gave it to the allocator that made it"
+    );
+}
+
+/// **When the block allocator says no, the heap still serves.**
+///
+/// And the block goes back to the heap: the allocator's `free` answers
+/// `false` for a block it never made.
+#[test]
+fn a_refused_block_comes_from_the_heap_and_goes_back_there() {
+    let _f = fresh(0);
+    let _h = NoBlockHooks;
+    hooks::reset();
+    blocks::reset();
+    blocks::REFUSE.store(true, Ordering::SeqCst);
+    unsafe { set_stack_guard_hooks(hooks::install_ok, hooks::remove) };
+    unsafe { super::set_stack_alloc_hooks(blocks::alloc, blocks::free) };
+
+    let executor = Executor::new(collection());
+    assert_eq!(blocks::GIVEN.load(Ordering::SeqCst), 0);
+    drop(executor);
+    IDLE_AT_LAST_TRIM.store(0, Ordering::SeqCst);
+    assert_eq!(trim_idle_stacks(0), 0);
+    assert_eq!(trim_idle_stacks(0), ALLOC_SIZE);
+    assert_eq!(blocks::TAKEN_BACK.load(Ordering::SeqCst), 0, "not its block");
+}
