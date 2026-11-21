@@ -238,6 +238,21 @@ fn frame_drain_percpu() -> usize {
     0
 }
 
+/// [`frame_alloc`] without its failure path: no drain of the per-CPU lists,
+/// no shrinkers, no log line. For a caller that has a cheaper answer to a
+/// refusal than reclaiming (the heap's growth ahead of demand, which can
+/// simply not grow).
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn frame_alloc_quiet(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
+    let idx = frame_alloc_from_pool(frame_count, align_log2)?;
+    FRAMES_USED.add(frame_count << PAGE_BITS);
+    #[cfg(feature = "mem-debug")]
+    for i in 0..frame_count {
+        track_mark_alloc(idx + i);
+    }
+    Some(frame_idx_to_phys_addr(idx))
+}
+
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // Single-frame allocations (the page-fault/commit hot path — every
     // demand-paged page in the system) MUST use the cascade fast path.
@@ -1497,16 +1512,30 @@ cfg_if! {
             )
         }
 
-        /// Set for the duration of a growth attempt. Growth runs from INSIDE
-        /// `alloc`, and `frame_alloc`'s failure path logs (which allocates),
-        /// so without this flag a failed growth would recurse into itself.
-        static HEAP_GROWING: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        /// Which CPU holds [`HEAP_GROWING`], as `cpu + 1` (`0`: none, or not
-        /// known yet). Lets a failed allocation on another CPU wait for it
-        /// (`grow_heap_on_failure`) and one on the same CPU not wait on
-        /// itself.
-        static HEAP_GROWER: AtomicUsize = AtomicUsize::new(0);
+        /// Who is growing the heap or giving growth back, as `cpu + 1` (`0`:
+        /// nobody). Growth runs from INSIDE `alloc`, and `frame_alloc`'s
+        /// failure path logs (which allocates), so without this flag a failed
+        /// growth would recurse into itself; the CPU in it lets a failed
+        /// allocation on another CPU wait for it (`grow_heap_on_failure`) and
+        /// one on the same CPU not wait on itself.
+        ///
+        /// One word, claimed with a compare-exchange. It used to be a flag
+        /// and a separate owner, stored one after the other: an interrupt
+        /// between the two stores whose allocation failed saw the flag up and
+        /// no owner, took it for another CPU's growth, spun 2^26 turns on
+        /// itself and went to `alloc_error`.
+        static HEAP_GROWING: AtomicUsize = AtomicUsize::new(0);
+
+        /// Claim [`HEAP_GROWING`] for this CPU; `false` if anyone holds it.
+        fn claim_growth() -> bool {
+            HEAP_GROWING
+                .compare_exchange(0, this_cpu_tag(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+
+        fn end_growth() {
+            HEAP_GROWING.store(0, Ordering::Release);
+        }
         static HEAP_GROW_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
         /// Grow the heap when it passes [`HEAP_GROW_AT_PCT`]. One relaxed
@@ -1517,19 +1546,47 @@ cfg_if! {
             if used < total / 100 * HEAP_GROW_AT_PCT {
                 return;
             }
+            if growth_backing_off() {
+                return;
+            }
             grow_heap_guarded(used, total);
+        }
+
+        /// How long growth ahead of demand stays quiet after the frame
+        /// allocator had no run to give it.
+        const HEAP_GROW_BACKOFF_MS: u64 = 100;
+        /// `timer_now` in ms until which growth ahead of demand is not tried.
+        static HEAP_GROW_BACKOFF_UNTIL_MS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+
+        /// Whether growth ahead of demand should sit this allocation out.
+        ///
+        /// Every allocation over the watermark asks for a growth, and on a
+        /// machine with free RAM but no free 2 MiB run each ask was three
+        /// contiguous bitmap scans from frame 0 under the frame lock, with
+        /// interrupts off, inside whatever the allocating caller held -- on
+        /// every allocation, since a refusal changed nothing for the next
+        /// one. A growth for an allocation the buddy refused is never held
+        /// back: that one is the machine's last chance.
+        #[cold]
+        fn growth_backing_off() -> bool {
+            let until = HEAP_GROW_BACKOFF_UNTIL_MS.load(Ordering::Relaxed);
+            until != 0 && (kernel_hal::timer::timer_now().as_millis() as u64) < until
+        }
+
+        fn back_off_growth() {
+            let now = kernel_hal::timer::timer_now().as_millis() as u64;
+            HEAP_GROW_BACKOFF_UNTIL_MS.store(now + HEAP_GROW_BACKOFF_MS, Ordering::Relaxed);
         }
 
         /// Run one growth attempt under the re-entrancy flag. Returns whether
         /// the heap actually got bigger.
         fn grow_heap_guarded(used: usize, total: usize) -> bool {
-            if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+            if !claim_growth() {
                 return false;
             }
-            HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
             let grew = grow_heap_once(used, total, 0);
-            HEAP_GROWER.store(0, Ordering::Release);
-            HEAP_GROWING.store(false, Ordering::Release);
+            end_growth();
             grew
         }
 
@@ -1564,16 +1621,14 @@ cfg_if! {
         fn grow_heap_on_failure(need: Layout) -> bool {
             let total = HEAP_TOTAL.load(Ordering::Relaxed);
             let used = HEAP_USED.get();
-            if !HEAP_GROWING.swap(true, Ordering::AcqRel) {
-                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
+            if claim_growth() {
                 let grew = grow_heap_once(used, total, buddy_block_size(need));
-                HEAP_GROWER.store(0, Ordering::Release);
-                HEAP_GROWING.store(false, Ordering::Release);
+                end_growth();
                 return grew;
             }
             // The flag is this CPU's own: an interrupt landed inside a growth
             // or a release. Waiting would wait on itself.
-            if HEAP_GROWER.load(Ordering::Acquire) == this_cpu_tag() {
+            if HEAP_GROWING.load(Ordering::Acquire) == this_cpu_tag() {
                 return false;
             }
             // Bounded, so a grower that never lets go turns into the OOM
@@ -1582,7 +1637,7 @@ cfg_if! {
             // CPU for one.
             const WAIT_SPINS: usize = 1 << 26;
             for _ in 0..WAIT_SPINS {
-                if !HEAP_GROWING.load(Ordering::Acquire) {
+                if HEAP_GROWING.load(Ordering::Acquire) == 0 {
                     return true;
                 }
                 kernel_hal::tlb_shootdown_pump();
@@ -1635,7 +1690,7 @@ cfg_if! {
             (need.trailing_zeros() as usize).saturating_sub(PAGE_BITS)
         }
 
-        /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWER`].
+        /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWING`].
         fn this_cpu_tag() -> usize {
             kernel_hal::cpu::cpu_id() as usize + 1
         }
@@ -1701,8 +1756,16 @@ cfg_if! {
             // the second growth on the very first test boot was refused for
             // exactly that. Step down instead of giving up.
             let mut got = None;
+            let mut capped = false;
             for chunk in heap_grow_chunks(need) {
                 if ram_used + chunk + reserve > ram {
+                    continue;
+                }
+                // The ceiling bounds the heap, not only where a growth may
+                // start: an exact-size growth for a big refused block could
+                // otherwise carry it past by that block.
+                if total + chunk > HEAP_MAX_TOTAL {
+                    capped = true;
                     continue;
                 }
                 // align_log2 is in FRAMES, not bytes: 21 would demand an 8 GiB
@@ -1711,12 +1774,31 @@ cfg_if! {
                 // A growth ahead of demand needs none; one for a refused block
                 // needs that block's alignment, or the chunk may straddle
                 // every boundary the block could sit on.
-                if let Some(pa) = frame_alloc(chunk >> PAGE_BITS, heap_grow_align_log2(need)) {
+                //
+                // Ahead of demand, only what the bitmap has: the full
+                // `frame_alloc` drains every CPU's frame list, runs the
+                // shrinkers and logs on each refusal, which is right for an
+                // allocation the buddy refused and far too much for a growth
+                // nobody is waiting on.
+                let align = heap_grow_align_log2(need);
+                let pa = if need > 0 {
+                    frame_alloc(chunk >> PAGE_BITS, align)
+                } else {
+                    frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                };
+                if let Some(pa) = pa {
                     got = Some((pa, chunk));
                     break;
                 }
             }
             let Some((pa, chunk)) = got else {
+                if capped {
+                    note_grow_refusal(GROW_REFUSED_CEILING, ram_used);
+                    return false;
+                }
+                if need == 0 {
+                    back_off_growth();
+                }
                 note_grow_refusal(GROW_REFUSED_NO_RUN, ram_used);
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
@@ -1872,10 +1954,9 @@ cfg_if! {
                 if HEAP_ALLOCATOR.0.held_by_current_cpu() {
                     break;
                 }
-                if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                if !claim_growth() {
                     break;
                 }
-                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
                 let taken = {
                     let mut h = HEAP_ALLOCATOR.0.lock();
                     let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
@@ -1893,8 +1974,7 @@ cfg_if! {
                     HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
                     heap_regions::note_released(va, va + size);
                 }
-                HEAP_GROWER.store(0, Ordering::Release);
-                HEAP_GROWING.store(false, Ordering::Release);
+                end_growth();
                 let Some((va, size)) = taken else {
                     break;
                 };
@@ -2567,6 +2647,25 @@ cfg_if! {
                 // allocates nothing and refuses a reclaim nested inside
                 // another on this CPU, so the recursion this invites cannot
                 // happen.
+                //
+                // Before that, the per-CPU front caches. Every small block
+                // they hold counts as allocated to the buddy and keeps its
+                // free buddies from merging back into the big block that was
+                // refused; up to ~5,000 of them per CPU, enough scattered
+                // ones to leave no whole 4 MiB block in a heap at its
+                // ceiling. The idle release drains them only every 10 s and
+                // only with room to spare, which a refused heap never has.
+                #[cfg(not(feature = "mem-debug"))]
+                let p = if p.is_null() && !self.0.held_by_current_cpu() {
+                    drain_front_caches();
+                    self.0
+                        .lock()
+                        .alloc(ext)
+                        .ok()
+                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                } else {
+                    p
+                };
                 let p = if p.is_null() && !self.0.held_by_current_cpu() {
                     reclaim_for_heap(ext)
                 } else {
