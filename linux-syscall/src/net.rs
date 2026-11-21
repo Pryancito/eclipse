@@ -16,6 +16,10 @@ use linux_object::{
 /// hunter's per-application firewall, asked by `connect`, `bind`, `sendto`
 /// and `sendmsg` before they touch the socket.
 mod hunter_firewall;
+
+/// `socket`/`socketpair` of a type or family that is not served.
+#[cfg(test)]
+mod socket_create_tests;
 use hunter::firewall::Direction as NetDirection;
 
 const MSG_DONTWAIT: usize = 0x40;
@@ -596,6 +600,18 @@ impl Syscall<'_> {
                 s.set_socket_type(socket_type);
                 s
             }
+            // `inet_create` / `inet6_create`: a type with no protocol
+            // registered for it at all (SEQPACKET without SCTP, RDM, DCCP,
+            // PACKET) is `ESOCKTNOSUPPORT`; a known type with the wrong
+            // protocol stays `EPROTONOSUPPORT`, below.
+            (
+                Domain::AF_INET | Domain::AF_INET6,
+                SocketType::SOCK_SEQPACKET
+                | SocketType::SOCK_RDM
+                | SocketType::SOCK_DCCP
+                | SocketType::SOCK_PACKET,
+                _,
+            ) => return Err(LxError::ESOCKTNOSUPPORT),
             (_, _, _) => {
                 // A domain/type/protocol combo this kernel does not wire up
                 // is `EPROTONOSUPPORT`, not `ENOSYS`. `ENOSYS` told callers
@@ -1672,12 +1688,23 @@ impl Syscall<'_> {
             domain, _type, protocol
         );
         if domain != Domain::AF_UNIX as usize {
-            return Err(LxError::EAFNOSUPPORT);
+            // `__sys_socketpair` creates both sockets and then asks the
+            // family: a family this kernel makes sockets of (inet, inet6,
+            // netlink, packet) has no `socketpair` (`sock_no_socketpair`):
+            // `EOPNOTSUPP`. A family it does not know is `EAFNOSUPPORT`, and
+            // a type out of range is `EINVAL` before either.
+            SocketType::try_from(_type & SOCKET_TYPE_MASK).map_err(|_| LxError::EINVAL)?;
+            return Err(match Domain::try_from(domain) {
+                Ok(Domain::AF_INET | Domain::AF_INET6 | Domain::AF_NETLINK | Domain::AF_PACKET) => {
+                    LxError::EOPNOTSUPP
+                }
+                _ => LxError::EAFNOSUPPORT,
+            });
         }
         // Same gate as `sys_socket`: an unrecognized type is `EINVAL`, not a
         // silent SOCK_STREAM pair. AF_UNIX only knows STREAM/DGRAM/SEQPACKET
-        // (`unix_create`); anything else named by `SocketType` is
-        // `EOPNOTSUPP` (Linux's `ESOCKTNOSUPPORT`).
+        // (`unix_create`), takes SOCK_RAW as a datagram, and anything else
+        // named by `SocketType` is `ESOCKTNOSUPPORT`.
         let socket_type = unix_socketpair_type(_type & SOCKET_TYPE_MASK)?;
         // `unix_create`: non-zero protocol other than PF_UNIX is
         // `EPROTONOSUPPORT`. The argument used to be logged and ignored.
@@ -1841,12 +1868,14 @@ impl Syscall<'_> {
     }
 }
 
-/// AF_UNIX socket types Linux's `unix_create` accepts. Anything else named
-/// by `SocketType` is `EOPNOTSUPP` (`ESOCKTNOSUPPORT`).
+/// AF_UNIX socket types as Linux's `unix_create` takes them: the three it
+/// knows, `SOCK_RAW` made a `SOCK_DGRAM` (`sock->type = SOCK_DGRAM;
+/// fallthrough`), and anything else `ESOCKTNOSUPPORT`.
 fn unix_socket_type(t: SocketType) -> Result<SocketType, LxError> {
     match t {
         SocketType::SOCK_STREAM | SocketType::SOCK_DGRAM | SocketType::SOCK_SEQPACKET => Ok(t),
-        _ => Err(LxError::EOPNOTSUPP),
+        SocketType::SOCK_RAW => Ok(SocketType::SOCK_DGRAM),
+        _ => Err(LxError::ESOCKTNOSUPPORT),
     }
 }
 
@@ -2663,8 +2692,9 @@ mod socket_type_flag_tests {
 
     /// `socket` / `socketpair` on AF_UNIX used to accept every `SocketType`
     /// (or, for socketpair, swallow unknowns as SOCK_STREAM). The three
-    /// Linux knows succeed; garbage is EINVAL; named-but-unsupported types
-    /// are EOPNOTSUPP.
+    /// Linux knows succeed, `SOCK_RAW` is a datagram socket as `unix_create`
+    /// makes it, garbage is EINVAL, and named-but-unsupported types are
+    /// `ESOCKTNOSUPPORT`.
     #[test]
     fn af_unix_refuses_a_type_that_is_not_a_unix_type() {
         assert_eq!(
@@ -2681,15 +2711,15 @@ mod socket_type_flag_tests {
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_RAW),
-            Err(LxError::EOPNOTSUPP)
+            Ok(SocketType::SOCK_DGRAM)
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_RDM),
-            Err(LxError::EOPNOTSUPP)
+            Err(LxError::ESOCKTNOSUPPORT)
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_PACKET),
-            Err(LxError::EOPNOTSUPP)
+            Err(LxError::ESOCKTNOSUPPORT)
         );
         assert_eq!(unix_socketpair_type(99), Err(LxError::EINVAL));
         assert_eq!(unix_socketpair_type(0), Err(LxError::EINVAL));

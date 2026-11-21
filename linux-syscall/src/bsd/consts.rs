@@ -206,6 +206,7 @@ pub mod errno {
     pub const EPROTOTYPE: i32 = 41;
     pub const ENOPROTOOPT: i32 = 42;
     pub const EPROTONOSUPPORT: i32 = 43;
+    pub const ESOCKTNOSUPPORT: i32 = 44;
     pub const EOPNOTSUPP: i32 = 45;
     pub const EPFNOSUPPORT: i32 = 46;
     pub const EAFNOSUPPORT: i32 = 47;

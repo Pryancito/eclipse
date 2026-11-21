@@ -133,6 +133,8 @@ pub enum LxError {
     ENOPROTOOPT = 92,
     /// Protocol not supported
     EPROTONOSUPPORT = 93,
+    /// Socket type not supported
+    ESOCKTNOSUPPORT = 94,
     /// Operation not supported
     EOPNOTSUPP = 95,
     /// Protocol family not supported
@@ -242,6 +244,7 @@ impl LxError {
             88 => ENOTSOCK,
             92 => ENOPROTOOPT,
             93 => EPROTONOSUPPORT,
+            94 => ESOCKTNOSUPPORT,
             95 => EOPNOTSUPP,
             96 => EPFNOSUPPORT,
             97 => EAFNOSUPPORT,
@@ -325,6 +328,7 @@ impl fmt::Display for LxError {
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
             EPROTONOSUPPORT => "Protocol not supported",
+            ESOCKTNOSUPPORT => "Socket type not supported",
             EOPNOTSUPP => "Operation not supported",
             EPFNOSUPPORT => "Protocol family not supported",
             EAFNOSUPPORT => "Address family not supported by protocol",
@@ -488,7 +492,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 75] = [
+    const EVERY_ERRNO: [(LxError, isize); 76] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -545,6 +549,7 @@ mod errno_tests {
         (LxError::EMSGSIZE, 90),
         (LxError::ENOPROTOOPT, 92),
         (LxError::EPROTONOSUPPORT, 93),
+        (LxError::ESOCKTNOSUPPORT, 94),
         (LxError::EOPNOTSUPP, 95),
         (LxError::EPFNOSUPPORT, 96),
         (LxError::EAFNOSUPPORT, 97),
@@ -638,6 +643,7 @@ mod errno_tests {
                 | LxError::EMSGSIZE
                 | LxError::ENOPROTOOPT
                 | LxError::EPROTONOSUPPORT
+                | LxError::ESOCKTNOSUPPORT
                 | LxError::EOPNOTSUPP
                 | LxError::EPFNOSUPPORT
                 | LxError::EAFNOSUPPORT
@@ -662,7 +668,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            75,
+            76,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }
