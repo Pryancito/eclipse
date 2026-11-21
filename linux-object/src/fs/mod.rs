@@ -3121,7 +3121,9 @@ impl LinuxProcess {
         let (start, from) = if dirfd == FileDesc::CWD {
             self.working_directory()?
         } else {
-            let file = self.get_file(dirfd)?;
+            // `path_init`: a `dirfd` open on a socket or an eventfd is
+            // `ENOTDIR`, as one open on a regular file is.
+            let file = self.get_file_or(dirfd, LxError::ENOTDIR)?;
             (file.inode(), file.path().clone())
         };
         walked.set(&from);
@@ -3560,6 +3562,15 @@ mod tests {
             }
             fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
                 self.inner.create(name, type_, mode)
+            }
+            fn create2(
+                &self,
+                name: &str,
+                type_: FileType,
+                mode: u32,
+                data: usize,
+            ) -> Result<Arc<dyn INode>> {
+                self.inner.create2(name, type_, mode, data)
             }
             fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
                 self.inner.link(name, other)

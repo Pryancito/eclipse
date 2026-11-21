@@ -3925,7 +3925,8 @@ impl LinuxProcess {
         } else if dirfd == FileDesc::CWD {
             self.current_working_directory()
         } else {
-            let file = self.get_file(dirfd)?;
+            // `path_init`: a `dirfd` that is no directory is `ENOTDIR`.
+            let file = self.get_file_or(dirfd, LxError::ENOTDIR)?;
             let file_path = file.path().clone();
             if let Some(stripped) = file_path.strip_prefix('/') {
                 String::from(stripped)

@@ -659,8 +659,14 @@ impl Syscall<'_> {
                         // this mask; `mkdir` has a narrower one of its own
                         // (`mkdir_perm`), which also drops the set-id bits.
                         let create_mode = proc.apply_umask(super::dir::create_perm(mode));
-                        let inode =
-                            dir_inode.create(file_name, FileType::File, create_mode as u32)?;
+                        // `lookup_open`: a directory with no `->create`
+                        // (`/proc`, `/sys`) is `EACCES` to `O_CREAT`.
+                        let inode = dir_inode
+                            .create(file_name, FileType::File, create_mode as u32)
+                            .map_err(|e| match e {
+                                rcore_fs::vfs::FsError::NotSupported => LxError::EACCES,
+                                e => e.into(),
+                            })?;
                         linux_object::fs::dcache_invalidate();
                         proc.initialize_created_metadata(
                             &inode,
