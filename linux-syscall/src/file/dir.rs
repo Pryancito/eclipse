@@ -319,12 +319,6 @@ impl Syscall<'_> {
     /// The unlinkat() system call operates in exactly the same way as either unlink or rmdir.
     pub fn sys_unlinkat(&self, dirfd: FileDesc, path: UserInPtr<u8>, flags: usize) -> SysResult {
         let path = path.as_c_str()?;
-        // hard code special path
-        let path = if path == "/dev/shm/testshm" {
-            "/testshm"
-        } else {
-            path
-        };
         let remove_dir = unlinkat_removes_a_directory(flags)?;
         info!(
             "unlinkat: dirfd={:?}, path={:?}, remove_dir={}",

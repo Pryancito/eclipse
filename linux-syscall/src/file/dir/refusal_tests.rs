@@ -448,29 +448,26 @@ fn rename_will_not_turn_a_file_into_a_directory_either_way_round() {
 }
 
 #[test]
-fn unlinkat_rewrites_the_one_path_it_is_asked_to() {
-    // `/dev/shm/testshm` is answered from `/testshm`, which is the only
-    // path in this file the kernel rewrites. The rewrite happens before the
-    // flags are read and before anything is looked up, so the proof is that
-    // the file at the rewritten path is the one that goes.
+fn unlinkat_of_dev_shm_testshm_is_an_ordinary_path() {
+    // `/dev/shm/testshm` used to be answered from `/testshm`. Linux rewrites
+    // no path: with no `/dev/shm` the unlink is `ENOENT`, and the file at
+    // `/testshm` is not the one that goes.
     let proc = a_process(48_808, "dir-unlink-shm");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             a_file_named(sys.linux_process(), "/", "testshm");
-            assert!(is_there(sys.linux_process(), "/testshm"));
-
             assert_eq!(
                 sys.sys_unlinkat(
                     FileDesc::CWD,
                     UserInPtr::from(at(&c("/dev/shm/testshm"))),
                     0
                 ),
-                Ok(0),
-                "the shm path answers, with no /dev/shm anywhere"
+                Err(LxError::ENOENT),
+                "the path was rewritten instead of looked up"
             );
             assert!(
-                !is_there(sys.linux_process(), "/testshm"),
-                "and what went is the file at the rewritten path"
+                is_there(sys.linux_process(), "/testshm"),
+                "an unlink of /dev/shm/testshm removed /testshm"
             );
         })
     });

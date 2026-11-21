@@ -316,6 +316,38 @@ fn truncate_asks_for_write_permission_on_the_file_and_ftruncate_asks_for_none() 
 }
 
 #[test]
+fn ftruncate_of_a_descriptor_not_open_for_writing_is_einval_not_ebadf() {
+    // `do_ftruncate` folds "not open for writing" into the same `EINVAL` as
+    // "not a regular file". `EBADF` is what `fallocate` answers to the same
+    // descriptor, and what this one used to answer, from `File::set_len`.
+    let proc = a_process(45_708, "trunc-ro", "trunc_ro");
+    let dir_path = String::from("/trunc_ro");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            let dir = lp.lookup_inode(&dir_path).unwrap();
+            let inode = dir.create("f", FileType::File, 0o644).unwrap();
+            inode.resize(TEN_DIGITS.len()).unwrap();
+            inode.write_at(0, TEN_DIGITS).unwrap();
+            let path = alloc::format!("{}/f", dir_path);
+            let fd: i32 = lp
+                .add_file(File::new(inode, OpenFlags::RDONLY, path.clone()))
+                .unwrap()
+                .into();
+            assert_eq!(
+                sys.sys_ftruncate(FileDesc::from(fd as usize), 0),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(
+                length_of(&lp, &path),
+                10,
+                "a refused ftruncate shortened the file anyway"
+            );
+        })
+    });
+}
+
+#[test]
 fn growing_past_rlimit_fsize_is_efbig_with_a_sigxfsz_and_shrinking_under_it_is_allowed() {
     // `RLIMIT_FSIZE` is asked of both calls, and only of the ones that
     // grow: a file that is already longer than the limit can still be cut

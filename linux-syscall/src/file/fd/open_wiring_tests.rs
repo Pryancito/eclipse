@@ -767,39 +767,32 @@ fn each_kind_of_file_is_refused_for_what_it_is() {
 }
 
 #[test]
-fn the_one_path_this_kernel_rewrites_is_dev_shm_testshm() {
-    // `sys_openat` has one hard-coded path: `/dev/shm/testshm` is opened as
-    // `/testshm`. It is not a flag or a mount, it is a string comparison in
-    // the syscall, so nothing but a call through the syscall sees it -- and
-    // a test that opens the name and the file it becomes is the only way to
-    // notice it going away.
+fn dev_shm_testshm_is_an_ordinary_path() {
+    // `sys_openat` used to open `/dev/shm/testshm` as `/testshm`, a string
+    // comparison left over from a libos test. Linux rewrites no path, and
+    // `/dev/shm` is a tmpfs of its own here too: the file is made in it, and
+    // nothing appears at `/testshm`.
     let proc = a_process(47_411, "open-testshm", "open_testshm");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let lp = sys.linux_process();
-            let fd = open(sys, &c("/dev/shm/testshm"), O_CREAT | O_RDWR)
-                .expect("the one path the syscall rewrites");
+            let fd =
+                open(sys, &c("/dev/shm/testshm"), O_CREAT | O_RDWR).expect("an open in /dev/shm");
             assert_eq!(write_to(sys, fd, b"shm").await, Ok(3));
-            // What was written is at the rewritten name, in this process's
-            // own root -- which is the whole of the rewrite: `/dev/shm` is
-            // no directory of this filesystem, so an open that had stopped
-            // rewriting would have had nowhere to put it.
             assert_eq!(
-                content_of(&lp, "/testshm", 3),
+                content_of(&lp, "/dev/shm/testshm", 3),
                 Vec::from(&b"shm"[..]),
-                "the rewritten open did not land on /testshm"
+                "what was written is not in /dev/shm"
             );
             assert!(
-                open(sys, &c("/testshm"), 0).is_ok(),
-                "the rewritten name is a file of this process's root"
+                open(sys, &c("/testshm"), 0).is_err(),
+                "the open was rewritten to /testshm"
             );
-
-            // The comparison is of the whole path and not of a prefix, asked
-            // without `O_CREAT` so that the question itself makes nothing.
-            assert!(
-                open(sys, &c("/dev/shm/testshm-and-more"), 0).is_err(),
-                "a neighbouring name was rewritten too"
-            );
+            // `/dev/shm` is every process's: leave it as it was.
+            lp.lookup_inode("/dev/shm")
+                .unwrap()
+                .unlink("testshm")
+                .unwrap();
         })
     });
 }
