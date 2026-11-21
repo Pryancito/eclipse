@@ -936,12 +936,24 @@ impl Syscall<'_> {
     /// `getrlimit` gets resource limits.
     pub fn sys_getrlimit(&mut self, resource: usize, rlim: UserOutPtr<RLimit>) -> SysResult {
         info!("getrlimit: resource={}, rlim={:?}", resource, rlim);
+        // `prlimit64` reads a NULL as "not asked"; `getrlimit` has nowhere
+        // else to put the answer, so Linux's `copy_to_user` fails: EFAULT,
+        // after the resource number was judged.
+        if rlim.is_null() {
+            self.do_prlimit(0, resource, None)?;
+            return Err(LxError::EFAULT);
+        }
         self.sys_prlimit64(0, resource, 0.into(), rlim)
     }
 
     /// `setrlimit` sets resource limits.
     pub fn sys_setrlimit(&mut self, resource: usize, rlim: UserInPtr<RLimit>) -> SysResult {
         info!("setrlimit: resource={}, rlim={:?}", resource, rlim);
+        // `setrlimit` copies the limit in before anything else: a NULL is
+        // EFAULT, not the "change nothing" it means to `prlimit64`.
+        if rlim.is_null() {
+            return Err(LxError::EFAULT);
+        }
         self.sys_prlimit64(0, resource, rlim, 0.into())
     }
 

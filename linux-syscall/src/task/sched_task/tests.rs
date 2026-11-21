@@ -497,3 +497,41 @@ fn a_zombie_is_its_leader_alone_while_its_other_threads_die() {
     reap(&parent, pid as KoID);
     parent.exit(0);
 }
+
+/// `sched_setaffinity` in Linux's order: the mask is copied (a short or
+/// empty one is zero-filled), the target is found (`ESRCH`) and asked
+/// (`EPERM`), and only then is a mask with no usable CPU `EINVAL`. The empty
+/// mask used to be `EINVAL` before anything was looked up.
+#[test]
+fn an_empty_affinity_mask_is_judged_after_the_target() {
+    let root = a_process_of(48_170, 0);
+    Thread::create_linux(&root).unwrap();
+    let stranger = a_process_of(48_171, 1000);
+    let root_pid = root.id() as usize;
+    let got = on_a_thread(&stranger, move |sys| {
+        Box::pin(async move {
+            let none = 0u64.to_le_bytes();
+            let at = UserInPtr::from(none.as_ptr() as usize);
+            (
+                sys.sys_sched_setaffinity(4_000_000, 8, at).await,
+                sys.sys_sched_setaffinity(root_pid, 8, UserInPtr::from(none.as_ptr() as usize))
+                    .await,
+                sys.sys_sched_setaffinity(0, 0, UserInPtr::from(none.as_ptr() as usize))
+                    .await,
+                sys.sys_sched_setaffinity(0, 8, UserInPtr::from(none.as_ptr() as usize))
+                    .await,
+            )
+        })
+    });
+    assert_eq!(
+        got,
+        (
+            Err(LxError::ESRCH),
+            Err(LxError::EPERM),
+            Err(LxError::EINVAL),
+            Err(LxError::EINVAL)
+        )
+    );
+    root.exit(0);
+    stranger.exit(0);
+}
