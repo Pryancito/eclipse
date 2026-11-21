@@ -127,3 +127,103 @@ fn a_datagram_connect_reaches_a_bound_socket_and_a_stream_is_eprototype() {
         })
     });
 }
+
+/// `getsockopt(2)` in `__sys_getsockopt`'s order: the fd first, then
+/// `optlen`, and a NULL `optval` is only a fault when something would be
+/// copied into it.
+#[test]
+fn getsockopt_checks_the_fd_then_optlen_and_null_optval_is_a_copy_fault() {
+    let proc = a_process(43_113);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut s = own(sys);
+            const SOL_SOCKET: usize = 1;
+            const SO_TYPE: usize = 3;
+            const SOL_PACKET: usize = 263;
+            let fd = s.sys_socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+            let mut len = [4u32];
+            let len_at = len.as_mut_ptr() as usize;
+            let mut val = [0u32];
+            let val_at = val.as_mut_ptr() as usize;
+            // An unknown level on a closed fd is about the fd.
+            assert_eq!(
+                s.sys_getsockopt(999, SOL_PACKET, 1, val_at.into(), len_at.into()),
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                s.sys_getsockopt(fd, SOL_PACKET, 1, val_at.into(), len_at.into()),
+                Err(LxError::ENOPROTOOPT)
+            );
+            // NULL with room to copy into is EFAULT; with none it is fine.
+            assert_eq!(
+                s.sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, 0.into(), len_at.into()),
+                Err(LxError::EFAULT)
+            );
+            let mut zero = [0u32];
+            let zero_at = zero.as_mut_ptr() as usize;
+            assert_eq!(
+                s.sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, 0.into(), zero_at.into()),
+                Ok(0)
+            );
+            // A negative optlen is EINVAL.
+            let mut neg = [u32::MAX];
+            let neg_at = neg.as_mut_ptr() as usize;
+            assert_eq!(
+                s.sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, val_at.into(), neg_at.into()),
+                Err(LxError::EINVAL)
+            );
+        })
+    });
+}
+
+/// `recvmmsg(2)` stops waiting after the first datagram only under
+/// `MSG_WAITFORONE`, and a timeout is checked like `do_recvmmsg` checks it:
+/// a bad one is `EINVAL` before the fd, and what was left is written back.
+#[test]
+fn recvmmsg_waits_for_one_only_when_asked_and_takes_a_timeout() {
+    let proc = a_process(43_114);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut s = own(sys);
+            const MSG_WAITFORONE: usize = 0x1_0000;
+            let mut sv = [-1i32; 2];
+            let sv_at = sv.as_mut_ptr() as usize;
+            assert_eq!(
+                s.sys_socketpair(AF_UNIX, SOCK_DGRAM, 0, sv_at.into()),
+                Ok(0)
+            );
+            let (a, b) = (sv[0] as usize, sv[1] as usize);
+            let msg = *b"uno";
+            let msg_at = msg.as_ptr() as usize;
+            assert_eq!(s.sys_write(b.into(), msg_at.into(), 3).await, Ok(3));
+            // Two `mmsghdr`s of 64 bytes, each with one 16-byte iovec.
+            let mut bufs = [[0u8; 16]; 2];
+            let mut iovs = [[0u64; 2]; 2];
+            let mut hdrs = [[0u64; 8]; 2];
+            for i in 0..2 {
+                iovs[i] = [bufs[i].as_mut_ptr() as u64, 16];
+                hdrs[i][2] = iovs[i].as_ptr() as u64;
+                hdrs[i][3] = 1;
+            }
+            let hdrs_at = hdrs.as_mut_ptr() as usize;
+            // A timeout with a bad tv_nsec, on a closed fd: the timeout first.
+            let mut bad = [0u64, 1_000_000_000];
+            let bad_at = bad.as_mut_ptr() as usize;
+            assert_eq!(
+                s.sys_recvmmsg(999, hdrs_at.into(), 2, 0, bad_at.into())
+                    .await,
+                Err(LxError::EINVAL)
+            );
+            let mut ts = [5u64, 0];
+            let ts_at = ts.as_mut_ptr() as usize;
+            assert_eq!(
+                s.sys_recvmmsg(a, hdrs_at.into(), 2, MSG_WAITFORONE, ts_at.into())
+                    .await,
+                Ok(1)
+            );
+            assert_eq!(&bufs[0][..3], b"uno");
+            assert_eq!(hdrs[0][7] as u32, 3, "msg_len");
+            assert!(ts[0] <= 5, "what was left is written back");
+        })
+    });
+}

@@ -70,9 +70,7 @@
 //! they take a per-option table --- [`crate::narrow::sockopt`], asked by both
 //! directions --- rather than a conversion the call can carry.
 //!
-//! **With those two, all twenty are wired.** The remaining gaps are inside
-//! handlers and are not ABI ones; the `recvmmsg` timeout below is the one
-//! worth naming.
+//! **With those two, all twenty are wired.**
 //!
 //! And **`sendmsg`(16), `recvmsg`(17), `recvmmsg`(19) and `sendmmsg`(20)** are
 //! wired, for the same reason `readv` and `writev` are: the conversion lives
@@ -84,14 +82,9 @@
 //! why none of them can be read at the wrong width without inventing a
 //! pointer.
 //!
-//! One gap, and it is not an ABI one: `recvmmsg`'s fifth word is a
-//! `struct timespec *` timeout, and [`Syscall::sys_recvmmsg`] does not honour
-//! a timeout in **either** ABI --- it forces every receive after the first
-//! non-blocking and returns when the queue drains. So the narrow caller is
-//! no worse off than the native one, and the five words are still read (the
-//! measured `nargs`), which is what keeps a block that ends at a page from
-//! answering `EFAULT`. Wiring the timeout is one piece of work for both
-//! ABIs, with the conversion already written ([`crate::narrow`]).
+//! `recvmmsg`'s fifth word is a `struct timespec *` timeout, which
+//! [`Syscall::sys_recvmmsg`] reads at the process's width through
+//! [`crate::narrow`], as it does the array.
 //!
 //! An unwired call answers `ENOSYS`, like every other name this layer has
 //! not vouched for, rather than being passed through on the guess that its
@@ -268,11 +261,12 @@ impl Syscall<'_> {
             // The batch pair, whose array has a stride of its own: 32 bytes
             // for a 32-bit caller against 64, with the count at 28 and not
             // at 56. Asked of the process, like the envelope.
-            // Word 5 of `recvmmsg` is a `timespec *` timeout, which
-            // `sys_recvmmsg` does not honour in either ABI; see the module
-            // documentation. It is still read, so a block that ends at a
-            // page does not answer EFAULT.
-            19 => self.sys_recvmmsg(a[0], a[1].into(), a[2], a[3]).await,
+            // Word 5 of `recvmmsg` is a `timespec *` timeout, read at the
+            // process's width like the array.
+            19 => {
+                self.sys_recvmmsg(a[0], a[1].into(), a[2], a[3], a[4].into())
+                    .await
+            }
             20 => self.sys_sendmmsg(a[0], a[1].into(), a[2], a[3]).await,
             18 => self.sys_accept4(a[0], a[1].into(), a[2].into(), a[3]).await,
             _ => {

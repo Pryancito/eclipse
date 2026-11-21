@@ -23,6 +23,8 @@ mod socket_create_tests;
 use hunter::firewall::Direction as NetDirection;
 
 const MSG_DONTWAIT: usize = 0x40;
+/// `MSG_WAITFORONE`: `recvmmsg` stops waiting once one datagram is in.
+const MSG_WAITFORONE: usize = 0x1_0000;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
 /// Close-on-exec for fds installed from `SCM_RIGHTS` (`linux/socket.h`).
@@ -759,13 +761,23 @@ impl Syscall<'_> {
         // return: what this option owes the caller's width, asked of the
         // process once. See [`crate::narrow::sockopt`].
         let out = self.sockopt_out(level, optname);
+        // `__sys_getsockopt` in its order: the fd (`EBADF`, `ENOTSOCK`)
+        // before the level or the name is looked at, then `optlen` (`EFAULT`,
+        // negative `EINVAL`). An unknown level used to be `ENOPROTOOPT` on a
+        // closed fd too.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
+        if (optlen.read()? as i32) < 0 {
+            return Err(LxError::EINVAL);
+        }
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
                 // A level only sockets of some family have (IPv6's,
                 // ICMPv6's, a raw socket's): the socket says what its option is, when it
                 // has it.
-                if matches!(level, SOL_IPV6 | SOL_ICMPV6 | SOL_RAW) && !optval.is_null() {
+                if matches!(level, SOL_IPV6 | SOL_ICMPV6 | SOL_RAW) {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let said = file_like.as_socket()?.getsockopt_own(level, optname);
                     if let Some(value) = said {
@@ -780,9 +792,10 @@ impl Syscall<'_> {
                 return Err(LxError::ENOPROTOOPT);
             }
         };
-        if optval.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        // A NULL `optval` is not refused up front: Linux copies out
+        // `min(len, size)` bytes, so with `*optlen == 0` it succeeds and
+        // otherwise the copy is `EFAULT` (`write_sockopt_out`). It used to be
+        // `EINVAL` before anything else.
         match level {
             Level::SOL_SOCKET => {
                 // SO_PEERCRED (17): `struct ucred { pid_t pid; uid_t uid;
@@ -1819,29 +1832,59 @@ impl Syscall<'_> {
         msgvec: UserInOutPtr<u8>,
         vlen: usize,
         flags: usize,
+        mut timeout: UserInOutPtr<linux_object::time::TimeSpec>,
     ) -> SysResult {
         info!(
             "sys_recvmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
+        // `do_recvmmsg`, in its order. The timeout is checked before the fd
+        // (`poll_select_set_timeout` is `EINVAL` for a bad one), and is a
+        // deadline looked at only after each datagram -- Linux's own
+        // documented limit: a receive that blocks is not cut short by it.
+        let abi32 = self.narrow_abi();
+        let deadline = if timeout.is_null() {
+            None
+        } else {
+            let ts = crate::narrow::narrow_get(abi32, &timeout)?;
+            Some(kernel_hal::timer::timer_now() + ts.try_into_duration()?)
+        };
         let base = msgvec.as_addr();
         let l = self.mmsghdr_layout();
         let stride = l.stride;
         let mut received = 0usize;
+        // Only `MSG_WAITFORONE` makes the receives after the first one
+        // non-blocking. Every receive used to be, so a blocking batch came
+        // back with whatever happened to be queued after the first datagram.
+        let mut per_flags = flags;
         for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
-            let per_flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     received += 1;
                 }
-                Err(LxError::EAGAIN) if received > 0 => break,
                 Err(e) => {
                     if received == 0 {
                         return Err(e);
                     }
+                    break;
+                }
+            }
+            if flags & MSG_WAITFORONE != 0 {
+                per_flags |= MSG_DONTWAIT;
+            }
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_sub(kernel_hal::timer::timer_now());
+                // Written back as it goes, as `do_recvmmsg` does; the
+                // caller learns what was left.
+                crate::narrow::narrow_put(
+                    abi32,
+                    &mut timeout,
+                    linux_object::time::TimeSpec::from_duration(left),
+                )?;
+                if left.is_zero() {
                     break;
                 }
             }
