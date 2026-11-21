@@ -187,6 +187,12 @@ struct UnixInner {
     /// target full: `POLLOUT` waits for that target's drain, which clears
     /// this, instead of answering at once and spinning `send_all`.
     waiting_room: bool,
+    /// For a datagram socket: the bound path of whoever sent each message
+    /// in `buffer`, tagged with the offset of its first byte, as
+    /// `pending_creds` is. `recvfrom` names the sender (`unix_copy_addr`
+    /// of the skb's socket); it used to name the receiver itself.
+    /// Consecutive messages from one path share an entry.
+    dgram_sources: VecDeque<(usize, String)>,
 }
 
 /// How many datagram senders one full queue keeps a wake for. A sender left
@@ -281,6 +287,7 @@ impl Default for UnixSocketState {
                 last_creds: None,
                 room_waiters: Vec::new(),
                 waiting_room: false,
+                dgram_sources: VecDeque::new(),
             })),
         }
     }
@@ -857,6 +864,22 @@ impl Socket for UnixSocketState {
                     None => inner.buffer.len(),
                 };
                 let len = core::cmp::min(data.len(), available);
+                // Who sent this message, which `recvfrom` reports. A
+                // datagram's sender is in `dgram_sources`; a connected
+                // stream or seqpacket end's is its peer (`unix_copy_addr`).
+                let source = if inner.is_dgram() {
+                    let at = inner.total_read;
+                    while inner.dgram_sources.len() > 1 && inner.dgram_sources[1].0 <= at {
+                        inner.dgram_sources.pop_front();
+                    }
+                    let name = match inner.dgram_sources.front() {
+                        Some((offset, name)) if *offset <= at => name.clone(),
+                        _ => String::new(),
+                    };
+                    Ok(name)
+                } else {
+                    Err(inner.live_peer())
+                };
                 // Bulk copy from the deque's two contiguous halves instead of a
                 // per-byte pop_front loop: every Wayland/D-Bus message crosses
                 // here, and the byte loop made each one O(n) branchy work under
@@ -887,7 +910,11 @@ impl Socket for UnixSocketState {
                     pulse_writable(&mut peer.lock().eventbus);
                 }
                 wake_room_waiters(waiters);
-                return (Ok(len), Endpoint::Unix(path));
+                let name = match source {
+                    Ok(name) => name,
+                    Err(peer) => peer.map(|p| p.lock().path.clone()).unwrap_or_default(),
+                };
+                return (Ok(len), Endpoint::Unix(name));
             }
 
             if inner.read_closed {
@@ -951,7 +978,7 @@ impl Socket for UnixSocketState {
         // that cycle hangs the whole machine — which is exactly what happened
         // when a Wayland client (alacritty) and the compositor (labwc) flooded
         // their socket bidirectionally. Mirrors `peer_pid`/`send_fds`.
-        let (own_peer, message, sock_type, connected) = {
+        let (own_peer, message, sock_type, connected, own_name) = {
             let inner = self.inner.lock();
             if inner.write_closed {
                 return Err(LxError::EPIPE);
@@ -960,11 +987,14 @@ impl Socket for UnixSocketState {
                 inner.sock_type,
                 SocketType::SOCK_SEQPACKET | SocketType::SOCK_DGRAM
             );
+            // Only a datagram's receiver keeps who sent each message.
+            let own_name = (inner.sock_type == SocketType::SOCK_DGRAM).then(|| inner.path.clone());
             (
                 inner.peer.clone(),
                 message,
                 inner.sock_type,
                 inner.connected,
+                own_name,
             )
         };
         // Where the bytes go. A datagram sent with an address goes there,
@@ -1080,6 +1110,16 @@ impl Socket for UnixSocketState {
         }
         // `extend(&slice)` takes VecDeque's Copy-slice specialization (a pair
         // of memcpys) instead of the element-wise TrustedLen loop.
+        if let Some(name) = own_name {
+            if n > 0
+                && pi
+                    .dgram_sources
+                    .back()
+                    .is_none_or(|(_, last)| *last != name)
+            {
+                pi.dgram_sources.push_back((n_offset, name));
+            }
+        }
         pi.buffer.extend(&data[..n]);
         pi.total_written += n;
         if message && n > 0 {
@@ -3171,6 +3211,43 @@ mod dgram_address_tests {
             Socket::write(&*a, b"x", to("/run/dgram-test-g")),
             Err(LxError::EISCONN)
         );
+    }
+
+    #[async_std::test]
+    async fn recvfrom_names_who_sent_each_datagram() {
+        let rx = bound("/run/dgram-test-i", SocketType::SOCK_DGRAM);
+        let a = bound("/run/dgram-test-j", SocketType::SOCK_DGRAM);
+        let unnamed = dgram();
+        Socket::write(&*a, b"1", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*a, b"2", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*unnamed, b"3", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*a, b"4", to("/run/dgram-test-i")).unwrap();
+        let mut buf = [0u8; 8];
+        for (want, from) in [
+            (b"1", "/run/dgram-test-j"),
+            (b"2", "/run/dgram-test-j"),
+            (b"3", ""),
+            (b"4", "/run/dgram-test-j"),
+        ] {
+            let (got, who) = Socket::read(&*rx, &mut buf).await;
+            assert_eq!(&buf[..got.unwrap()], want);
+            assert!(
+                matches!(who, Endpoint::Unix(ref p) if p == from),
+                "{}",
+                from
+            );
+        }
+    }
+
+    #[async_std::test]
+    async fn a_stream_end_names_its_peer() {
+        let (a, b) = (UnixSocketState::new(), UnixSocketState::new());
+        b.set_path("/run/dgram-test-server".into());
+        UnixSocketState::connect_pair(&a, &b);
+        Socket::write(&*b, b"hi", None).unwrap();
+        let mut buf = [0u8; 8];
+        let (_, who) = Socket::read(&*a, &mut buf).await;
+        assert!(matches!(who, Endpoint::Unix(ref p) if p == "/run/dgram-test-server"));
     }
 
     #[async_std::test]
