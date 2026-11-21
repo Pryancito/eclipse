@@ -245,11 +245,6 @@ impl Syscall<'_> {
         // Checked before reading the pointer, as Linux does.
         let num_ops = semop_count(num_ops)?;
         let ops = ops.as_slice(num_ops)?;
-        // Linux `ipc/sem.c`: any bit outside IPC_NOWAIT|SEM_UNDO is EINVAL for
-        // the whole array. Truncating used to drop garbage and keep going.
-        for op in ops.iter() {
-            sem_flags(op.flags)?;
-        }
         // `find_alloc_undo` makes the caller's undo list before it looks
         // for the set, so a `semop` that then fails leaves one too.
         let undo = |op: &SemBuf| sem_flags(op.flags).is_ok_and(|f| f.contains(SemFlags::SEM_UNDO));
@@ -261,6 +256,13 @@ impl Syscall<'_> {
             .linux_process()
             .semaphores_get(id)
             .ok_or(LxError::EINVAL)?;
+        // `do_semtimedop` finds the highest `sem_num` of the whole array and
+        // answers EFBIG before the permission check and before any wait, so
+        // a bad index late in the array cannot leave the caller blocked on
+        // an earlier operation forever.
+        if ops.iter().any(|op| op.num as usize >= sem_array.len()) {
+            return Err(LxError::EFBIG);
+        }
         // An operation that changes a semaphore needs write; one that only
         // waits for zero needs read (`semop` -> `ipcperms`). Nothing asked
         // before, so naming the id was the whole check.
@@ -1330,13 +1332,11 @@ impl SemBuf {
     }
 }
 
-/// Decode `sem_flg`, or `EINVAL` if it carries anything beyond
-/// `IPC_NOWAIT | SEM_UNDO` (Linux `perform_atomic_semop_slow`).
-///
-/// `SemFlags::from_bits_truncate` used to drop the rest in silence, so a
-/// caller's typo sailed through as a successful op.
+/// Decode `sem_flg`. Linux (`ipc/sem.c`) only ever tests `IPC_NOWAIT` and
+/// `SEM_UNDO` in it and ignores every other bit, so they are dropped here
+/// too rather than refused. Still a `Result` so callers keep one shape.
 fn sem_flags(flags: i16) -> Result<SemFlags, LxError> {
-    SemFlags::from_bits(flags).ok_or(LxError::EINVAL)
+    Ok(SemFlags::from_bits_truncate(flags))
 }
 
 /// Linux `SEMOPM`: the most operations one `semop(2)` may carry.
@@ -1411,6 +1411,12 @@ pub fn plan_semop(values: &[isize], ops: &[SemBuf]) -> Result<SemopPlan, LxError
     // Worked on a copy: the caller's values must not move until every
     // operation has been shown to fit.
     let mut planned: Vec<isize> = values.to_vec();
+    // Every index first, as `do_semtimedop` does with its `max`: an earlier
+    // operation that must wait would otherwise hide a bad index after it,
+    // and the caller would sleep on a call Linux refuses at once.
+    if ops.iter().any(|op| op.num as usize >= values.len()) {
+        return Err(LxError::EFBIG);
+    }
     for (op_index, op) in ops.iter().enumerate() {
         let num = op.num as usize;
         // `num` comes from userspace. semop(2) gives EFBIG for a semaphore
@@ -1754,6 +1760,11 @@ mod semop_plan_tests {
             plan_semop(&[0, 0], &[op(0, 1), op(9, 1)]),
             Err(LxError::EFBIG),
             "a bad index after a good one is still EFBIG, and applies nothing"
+        );
+        assert_eq!(
+            plan_semop(&[0, 0], &[op(0, -1), op(9, 1)]),
+            Err(LxError::EFBIG),
+            "a bad index after an operation that must wait is EFBIG, not a wait"
         );
     }
 
@@ -2155,10 +2166,10 @@ mod shmat_place_tests {
         assert_eq!(SEMOPM, 500);
     }
 
-    /// `sem_flg` may only carry IPC_NOWAIT and SEM_UNDO; anything else is
-    /// EINVAL for the whole array, not a truncated success.
+    /// `sem_flg` is read for IPC_NOWAIT and SEM_UNDO only; Linux ignores any
+    /// other bit, so a stray one neither fails the call nor hides a real one.
     #[test]
-    fn sem_flg_rejects_bits_outside_nowait_and_undo() {
+    fn sem_flg_keeps_nowait_and_undo_and_ignores_the_rest() {
         assert_eq!(sem_flags(0), Ok(SemFlags::empty()));
         assert_eq!(
             sem_flags(SemFlags::IPC_NOWAIT.bits()),
@@ -2169,11 +2180,11 @@ mod shmat_place_tests {
             sem_flags((SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO).bits()),
             Ok(SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO)
         );
-        assert_eq!(sem_flags(0x1), Err(LxError::EINVAL), "bit 0 is not a flag");
+        assert_eq!(sem_flags(0x1), Ok(SemFlags::empty()), "bit 0 is ignored");
         assert_eq!(
             sem_flags(SemFlags::IPC_NOWAIT.bits() | 0x1),
-            Err(LxError::EINVAL),
-            "a valid bit must not hide a stray one"
+            Ok(SemFlags::IPC_NOWAIT),
+            "a stray bit must not hide a valid one"
         );
     }
 
@@ -2476,7 +2487,7 @@ mod benches {
         b.iter(|| black_box(semop_count(black_box(16))));
     }
 
-    /// One `sembuf`'s `sem_flg`, which used to drop unknown bits silently.
+    /// One `sembuf`'s `sem_flg`, with a bit Linux ignores.
     #[bench]
     fn semop_flags_arg(b: &mut Bencher) {
         b.iter(|| black_box(sem_flags(black_box(0x1000))));

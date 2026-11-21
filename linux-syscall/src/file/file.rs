@@ -2493,14 +2493,16 @@ impl Syscall<'_> {
         if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
             // Seals exist only on memfds; every other fd answers EINVAL, as
             // Linux does for a filesystem without sealing support.
-            let inode = file_like
-                .downcast_ref::<File>()
-                .ok_or(LxError::EINVAL)?
-                .inode();
+            let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
+            let inode = file.inode();
+            let seals = linux_object::fs::memfd_seals(&inode).ok_or(LxError::EINVAL)?;
             return if cmd == F_GET_SEALS {
-                linux_object::fs::memfd_seals(&inode)
-                    .map(|s| s as usize)
-                    .ok_or(LxError::EINVAL)
+                Ok(seals as usize)
+            } else if !file.flags().writable() {
+                // `memfd_add_seals`: sealing needs a descriptor open for
+                // writing, so a read-only copy handed to a peer cannot seal
+                // the owner's buffer shut.
+                Err(LxError::EPERM)
             } else {
                 linux_object::fs::memfd_add_seals(&inode, arg as u32).map(|_| 0)
             };
@@ -3762,6 +3764,6 @@ mod short_write_tests;
 #[cfg(test)]
 mod dsp_close_tests;
 
-/// `F_SEAL_GROW` refuses writes and allocations past the sealed size.
+/// Memfd seals: `F_SEAL_GROW` and `F_SEAL_EXEC` kept, and who may add one.
 #[cfg(test)]
-mod memfd_grow_seal_tests;
+mod memfd_seal_rule_tests;

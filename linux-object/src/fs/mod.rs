@@ -292,8 +292,10 @@ pub const F_SEAL_SHRINK: u32 = 0x0002;
 pub const F_SEAL_GROW: u32 = 0x0004;
 pub const F_SEAL_WRITE: u32 = 0x0008;
 pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+/// Linux 6.3: the execute bits of the mode may no longer change.
+pub const F_SEAL_EXEC: u32 = 0x0020;
 const F_SEAL_ALL: u32 =
-    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE | F_SEAL_EXEC;
 
 fn same_inode(a: &Arc<dyn INode>, b: &Arc<dyn INode>) -> bool {
     Arc::as_ptr(a) as *const u8 == Arc::as_ptr(b) as *const u8
@@ -377,6 +379,17 @@ pub fn memfd_resize_allowed(inode: &Arc<dyn INode>, new_len: u64) -> bool {
 /// Whether writes to `inode` are allowed by its seals.
 pub fn memfd_write_allowed(inode: &Arc<dyn INode>) -> bool {
     memfd_seals(inode).is_none_or(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0)
+}
+
+/// Whether a new `mode` is allowed by the seals of `inode`: `F_SEAL_EXEC`
+/// refuses any change of the three execute bits (`shmem_setattr`).
+pub fn memfd_mode_allowed(inode: &Arc<dyn INode>, mode: u16) -> bool {
+    match memfd_seals(inode) {
+        Some(s) if s & F_SEAL_EXEC != 0 => {
+            inode.metadata().is_ok_and(|m| (m.mode ^ mode) & 0o111 == 0)
+        }
+        _ => true,
+    }
 }
 
 /// Whether a write or an allocation that ends at `end` is allowed by the
