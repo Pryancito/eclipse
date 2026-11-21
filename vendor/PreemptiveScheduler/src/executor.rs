@@ -455,6 +455,71 @@ pub fn sched_stats() -> (u64, u64, u64) {
     )
 }
 
+/// Idle stack blocks (pool + overflow list) that [`trim_idle_stacks`] saw on
+/// its previous call.
+static IDLE_AT_LAST_TRIM: AtomicUsize = AtomicUsize::new(0);
+/// Stack blocks [`trim_idle_stacks`] has given back to the heap, since boot.
+static TRIMMED_STACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many retained stack blocks have been given back to the heap.
+pub fn trimmed_stacks() -> usize {
+    TRIMMED_STACKS.load(Ordering::Relaxed)
+}
+
+/// Give idle stack blocks back to the heap, keeping `keep` of them. Answers
+/// the bytes freed.
+///
+/// Retired blocks are kept out of the heap (see [`STACK_POOL`]), and that
+/// used to be for ever: the set of blocks only grew to the highest number of
+/// executors ever alive at once. Each is 2.6 MiB of request and a 4 MiB
+/// buddy block, so one burst of synchronous waiters -- 200 `cat`s of a
+/// served FAT in QEMU, 63 parked per CPU -- pinned 546 MiB of kernel heap
+/// for the rest of the boot, and on real hardware 441 of them held the heap
+/// at its 2 GiB ceiling until an allocation failed (2026-11-20).
+///
+/// For the periodic reclaim worker, from a task: removing a guard band is a
+/// page-table change with a TLB shootdown. Only blocks that stayed idle
+/// across a whole period go, and half the excess at a time: a block counted
+/// at the last call and still idle now has been out of every grace period for
+/// at least that long, which is what keeping them out of the heap was for, and
+/// a burst that comes back within a period still finds its stacks waiting.
+pub fn trim_idle_stacks(keep: usize) -> usize {
+    let (pool, overflow) = stack_pool_stats();
+    let idle = pool + overflow;
+    let before = IDLE_AT_LAST_TRIM.swap(idle, Ordering::Relaxed);
+    let excess = idle.min(before).saturating_sub(keep);
+    let want = excess.div_ceil(2);
+    if want == 0 {
+        return 0;
+    }
+    let Some(remove) = *STACK_GUARD_REMOVE.lock() else {
+        return 0;
+    };
+    let mut freed = 0;
+    for _ in 0..want {
+        let Some(alloc_base) = stack_pool_pop() else {
+            break;
+        };
+        // Pooled blocks always have both hard bands (`reclaim_retired_stack`
+        // pools no other kind): give the pages back to the mapping first, as
+        // `set_stack_guard_hooks` requires before the heap sees the VA.
+        remove(alloc_base, GUARD_SIZE);
+        remove(alloc_base + GUARD_SIZE + STACK_SIZE, TOP_GUARD_SIZE);
+        // SAFETY: `alloc_base` came from `Global.allocate(ALLOC_LAYOUT)` in
+        // `Executor::new`, and the pool handed it to nobody else.
+        unsafe {
+            Global.deallocate(
+                core::ptr::NonNull::new_unchecked(alloc_base as *mut u8),
+                ALLOC_LAYOUT,
+            );
+        }
+        freed += ALLOC_SIZE;
+        TRIMMED_STACKS.fetch_add(1, Ordering::Relaxed);
+    }
+    IDLE_AT_LAST_TRIM.fetch_sub(freed / ALLOC_SIZE, Ordering::Relaxed);
+    freed
+}
+
 /// `(stack-pool occupied slots, overflow-list length)` — how many freed
 /// executor stacks are retained out of the buddy heap right now.
 pub fn stack_pool_stats() -> (usize, usize) {
@@ -1123,6 +1188,53 @@ fn overflow_push(base: usize) {
     }
 }
 
+/// Install the hard guard bands a retired block is missing, and answer which
+/// bands it has now as `(bottom, top)`.
+///
+/// All or nothing: a band installed here is taken away again if its partner
+/// cannot be, so a block that stays soft does not keep a guard slot it will
+/// never give back. The hooks are copied out of their locks first, for the
+/// reason `Executor::new` does it.
+fn harden_retired_guards(retired: &RetiredStack) -> (bool, bool) {
+    let had = (retired.hard_guard_bottom, retired.hard_guard_top);
+    if had.0 && had.1 {
+        return had;
+    }
+    let install = *STACK_GUARD_INSTALL.lock();
+    let remove = *STACK_GUARD_REMOVE.lock();
+    let (Some(install), Some(remove)) = (install, remove) else {
+        return had;
+    };
+    let bottom_base = retired.alloc_base;
+    let top_base = retired.alloc_base + GUARD_SIZE + STACK_SIZE;
+    let bottom = had.0 || install(bottom_base, GUARD_SIZE);
+    let top = had.1 || install(top_base, TOP_GUARD_SIZE);
+    if bottom && top {
+        HARDENED_AT_RETIRE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return (true, true);
+    }
+    if bottom && !had.0 {
+        remove(bottom_base, GUARD_SIZE);
+    }
+    if top && !had.1 {
+        remove(top_base, TOP_GUARD_SIZE);
+    }
+    had
+}
+
+/// Soft-guarded blocks that [`harden_retired_guards`] saved from the leak.
+static HARDENED_AT_RETIRE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Soft-guarded retired blocks leaked, since boot.
+static SOFT_LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `(soft blocks given hard guards when they retired, soft blocks leaked)`.
+pub fn soft_stack_retire_stats() -> (usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (HARDENED_AT_RETIRE.load(Relaxed), SOFT_LEAKED.load(Relaxed))
+}
+
 fn reclaim_retired_stack(slot: &mut RetiredStack) {
     let retired = *slot;
     if retired.alloc_base == 0 {
@@ -1145,6 +1257,20 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     // block left the registry at `Drop`). Keep every hard-guarded block in
     // coroutine-stack land: the fixed pool first, then the overflow retention
     // list, both with guards installed so reuse is a cheap re-poison.
+    // A block that got a soft canary at birth -- the guard hook refused, most
+    // often because the reserve of page-table frames for splitting a huge
+    // mapping was spent -- gets its hard guards now, if the hook can give them
+    // this time. It used to be leaked whole on the spot, and on a heap grown
+    // into the linear map every new stack landed in a fresh 2 MiB region,
+    // asked for a split frame, got none, and was leaked when it retired: the
+    // heap grew again to make the next one, until it hit its ceiling (441
+    // live 4 MiB blocks in the OOM report of 2026-11-20).
+    let (bottom, top) = harden_retired_guards(&retired);
+    let retired = RetiredStack {
+        hard_guard_bottom: bottom,
+        hard_guard_top: top,
+        ..retired
+    };
     if retired.hard_guard_bottom && retired.hard_guard_top {
         if !stack_pool_push(retired.alloc_base) {
             overflow_push(retired.alloc_base);
@@ -1154,11 +1280,10 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     }
     // A soft-guarded block cannot be pooled — `Executor::new`'s reuse path
     // assumes hard guards are already installed — and returning it to `Global` is
-    // the exact aliasing above, so leak it instead. This only happens before the
-    // guard hooks are registered (early boot) or when a huge PTE refused the
-    // unmap, never in the steady-state desktop workload, so the leak is bounded
-    // in practice.
-    static SOFT_LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    // the exact aliasing above, so leak it instead. With the hardening above
+    // this is left to blocks born before the hooks (early boot) and to bands
+    // the hook still refuses at retirement (registry full, split reserve spent
+    // again before the reclaim worker refilled it).
     let n = SOFT_LEAKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     warn!(
         "[stack-retire] leaking soft-guarded retired stack {:#x} rather than returning it to the \

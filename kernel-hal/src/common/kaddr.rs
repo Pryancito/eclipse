@@ -203,10 +203,52 @@ pub fn is_kernel_addr(a: u64) -> bool {
     (KERNEL_LO..KERNEL_HI).contains(&a)
 }
 
-/// Whether `a` is a plausible kernel-stack pointer: in the kernel half and
-/// eight-aligned, which is what makes it safe to read a qword from.
+/// The kernel heap's own answer to "is `a` inside a region I grew into?", or
+/// `0` while nothing has been registered (early boot, the host build).
+///
+/// The heap starts as an arena in the image (`KERNEL_LO..KERNEL_HI`), and when
+/// it passes its watermark it grows into frames of the linear map, which on
+/// x86_64 is `0xffff_8000_...`: below this window. Coroutine stacks are heap
+/// blocks, so on a machine whose heap has grown a stack can live there, and
+/// every probe that asked [`is_kernel_stack_qword`] said "not a stack" about
+/// it. The one that mattered is the null-call containment in the trap path:
+/// it declined at once, and a bad call it skips on a stack in the arena
+/// halted the machine on a stack in a grown region (two captures from real
+/// hardware, 2026-11-20, `rsp=0xffff800006e7d2e8` and `0xffff800007a7d288`,
+/// "no return address found on the faulting stack", with the heap at its
+/// ceiling a minute later). A plain `fn` in an atomic, so the probe is one
+/// load and no lock on the fault path.
+static GROWN_HEAP_PROBE: AtomicU64 = AtomicU64::new(0);
+
+/// Install the heap's probe for its grown regions. See [`GROWN_HEAP_PROBE`].
+pub fn set_grown_heap_probe(probe: fn(u64) -> bool) {
+    GROWN_HEAP_PROBE.store(probe as usize as u64, Ordering::Release);
+}
+
+/// Whether `a` lies in a region the kernel heap grew into, outside the
+/// kernel window. `false` until [`set_grown_heap_probe`] has run.
+pub fn in_grown_heap(a: u64) -> bool {
+    let p = GROWN_HEAP_PROBE.load(Ordering::Acquire);
+    if p == 0 {
+        return false;
+    }
+    // SAFETY: the only non-zero value ever stored is a `fn(u64) -> bool`
+    // (`set_grown_heap_probe`).
+    let probe: fn(u64) -> bool = unsafe { core::mem::transmute(p as usize) };
+    probe(a)
+}
+
+/// Whether `a` may be on a kernel stack: the kernel window, or a region the
+/// heap grew into (where coroutine stacks are carved from too).
+pub fn is_kernel_stack_addr(a: u64) -> bool {
+    is_kernel_addr(a) || in_grown_heap(a)
+}
+
+/// Whether `a` is a plausible kernel-stack pointer: in the kernel half or a
+/// grown heap region, and eight-aligned, which is what makes it safe to read
+/// a qword from.
 pub fn is_kernel_stack_qword(a: u64) -> bool {
-    is_kernel_addr(a) && a.is_multiple_of(8)
+    a.is_multiple_of(8) && is_kernel_stack_addr(a)
 }
 
 /// Whether `a` has the shape of an `RFLAGS` value rather than a pointer.
@@ -801,6 +843,27 @@ mod tests {
         assert!(!is_kernel_stack_qword(0));
         assert!(!is_kernel_stack_qword(0x1000));
         assert!(!is_kernel_stack_qword(0x7fff_ffff_f000));
+    }
+
+    /// The two stop screens of 2026-11-20: a null call on a coroutine stack
+    /// the heap had grown into, below the kernel window. Once the heap names
+    /// its regions, a stack there is a stack, and only there.
+    #[test]
+    fn a_stack_in_a_region_the_heap_grew_into_is_a_stack() {
+        const GROWN: u64 = 0xffff_8000_06e0_0000;
+        const RSP: u64 = 0xffff_8000_06e7_d2e8;
+        fn probe(a: u64) -> bool {
+            (GROWN..GROWN + 0x40_0000).contains(&a)
+        }
+        set_grown_heap_probe(probe);
+        assert!(is_kernel_stack_qword(RSP));
+        assert!(!is_kernel_stack_qword(RSP + 4), "still eight-aligned only");
+        assert!(!is_kernel_stack_qword(GROWN + 0x40_0000), "and only inside");
+        assert!(!is_kernel_stack_qword(0x7fff_ffff_f000));
+        assert!(
+            !is_kernel_addr(RSP),
+            "the kernel window itself is unchanged"
+        );
     }
 
     // ── the residue predicates ──────────────────────────────────────────────

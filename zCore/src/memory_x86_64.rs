@@ -1630,6 +1630,11 @@ cfg_if! {
         /// so without this flag a failed growth would recurse into itself.
         static HEAP_GROWING: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
+        /// Which CPU holds [`HEAP_GROWING`], as `cpu + 1` (`0`: none, or not
+        /// known yet). Lets a failed allocation on another CPU wait for it
+        /// (`grow_heap_on_failure`) and one on the same CPU not wait on
+        /// itself.
+        static HEAP_GROWER: AtomicUsize = AtomicUsize::new(0);
         static HEAP_GROW_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
         /// Grow the heap when it passes [`HEAP_GROW_AT_PCT`]. One relaxed
@@ -1649,7 +1654,9 @@ cfg_if! {
             if HEAP_GROWING.swap(true, Ordering::AcqRel) {
                 return false;
             }
+            HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
             let grew = grow_heap_once(used, total);
+            HEAP_GROWER.store(0, Ordering::Release);
             HEAP_GROWING.store(false, Ordering::Release);
             grew
         }
@@ -1668,12 +1675,49 @@ cfg_if! {
         /// well under the 70% trigger, so growth was never even considered.
         /// Growing here needs no accounting to be accurate: the buddy saying
         /// "no" is the ground truth.
+        ///
+        /// Another CPU holding the flag is not a refusal. That CPU is growing
+        /// the heap or giving growth back (`release_idle_heap`), and either
+        /// way what the buddy holds is about to change, so this waits for it
+        /// and has the caller ask the buddy again. Answering "no" there sent
+        /// every CPU but the grower to `alloc_error`: a burst of 200 parked
+        /// readers in QEMU, needing new coroutine stacks on four CPUs at
+        /// once, panicked with `Alloction Stack Failed` and 3 GiB of RAM free.
         #[cold]
         #[inline(never)]
         fn grow_heap_on_failure() -> bool {
             let total = HEAP_TOTAL.load(Ordering::Relaxed);
             let used = HEAP_USED.get();
-            grow_heap_guarded(used, total)
+            if !HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
+                let grew = grow_heap_once(used, total);
+                HEAP_GROWER.store(0, Ordering::Release);
+                HEAP_GROWING.store(false, Ordering::Release);
+                return grew;
+            }
+            // The flag is this CPU's own: an interrupt landed inside a growth
+            // or a release. Waiting would wait on itself.
+            if HEAP_GROWER.load(Ordering::Acquire) == this_cpu_tag() {
+                return false;
+            }
+            // Bounded, so a grower that never lets go turns into the OOM
+            // report it would have been anyway instead of a silent hang. The
+            // shootdown queue is pumped: the grower may be waiting on this
+            // CPU for one.
+            const WAIT_SPINS: usize = 1 << 26;
+            for _ in 0..WAIT_SPINS {
+                if !HEAP_GROWING.load(Ordering::Acquire) {
+                    return true;
+                }
+                kernel_hal::tlb_shootdown_pump();
+                core::hint::spin_loop();
+            }
+            false
+        }
+
+        /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWER`].
+        fn this_cpu_tag() -> usize {
+            kernel_hal::cpu::cpu_id() as usize + 1
         }
 
         #[cold]
@@ -1890,6 +1934,7 @@ cfg_if! {
                 if HEAP_GROWING.swap(true, Ordering::AcqRel) {
                     break;
                 }
+                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
                 let taken = {
                     let mut h = HEAP_ALLOCATOR.0.lock();
                     let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
@@ -1907,6 +1952,7 @@ cfg_if! {
                     HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
                     heap_regions::note_released(va, va + size);
                 }
+                HEAP_GROWER.store(0, Ordering::Release);
                 HEAP_GROWING.store(false, Ordering::Release);
                 let Some((va, size)) = taken else {
                     break;
@@ -1983,6 +2029,10 @@ cfg_if! {
             // lists. Before `init`, for the same reason as in
             // `grow_heap_once`: the registry must never lag the buddy.
             heap_regions::register(heap_start, heap_start + HEAP_BLOCK * MACHINE_ALIGN);
+            // A stack carved out of a region the heap grows into later lies
+            // below the kernel window; the fault paths ask this to know it is
+            // still a kernel stack. See `kaddr::GROWN_HEAP_PROBE`.
+            kernel_hal::kaddr::set_grown_heap_probe(|a| heap_regions::contains(a as usize, 8));
             unsafe {
                 HEAP_ALLOCATOR
                     .lock()

@@ -89,6 +89,12 @@ mod hooks {
         false
     }
 
+    /// Takes the bottom band and refuses the top one.
+    pub fn install_bottom_only(_base: usize, size: usize) -> bool {
+        INSTALLED.fetch_add(1, Ordering::SeqCst);
+        size == super::GUARD_SIZE
+    }
+
     pub fn remove(_base: usize, _size: usize) {
         REMOVED.fetch_add(1, Ordering::SeqCst);
     }
@@ -353,6 +359,102 @@ fn a_retired_soft_guarded_block_is_leaked_and_not_pooled() {
         (0, 0),
         "un bloque con guarda blanda entro en la reserva"
     );
+}
+
+/// **A soft-guarded block gets its hard guards when it retires, and is pooled.**
+///
+/// The leak above was meant for early boot, but a reserve of split frames
+/// that was spent made every new stack soft, and each was leaked as it
+/// retired: on real hardware that took the heap to its 2 GiB ceiling (441
+/// stack blocks live in the OOM report of 2026-11-20). If the hook can give
+/// the bands now, the block is as good as any pooled one.
+#[test]
+fn a_soft_block_that_can_be_hardened_at_retirement_is_pooled() {
+    let _f = fresh(0);
+    hooks::reset();
+    unsafe { set_stack_guard_hooks(hooks::install_refused, hooks::remove) };
+    let executor = Executor::new(collection());
+    assert!(!executor.hard_guard_bottom && !executor.hard_guard_top);
+    let alloc_base = executor.stack_base - GUARD_SIZE;
+
+    unsafe { set_stack_guard_hooks(hooks::install_ok, hooks::remove) };
+    let (hardened, leaked) = soft_stack_retire_stats();
+    drop(executor);
+    assert_eq!(
+        stack_pool_stats(),
+        (1, 0),
+        "el bloque no entro en la reserva"
+    );
+    assert_eq!(soft_stack_retire_stats(), (hardened + 1, leaked));
+
+    let installs = hooks::INSTALLED.load(Ordering::SeqCst);
+    let again = Executor::new(collection());
+    assert_eq!(again.stack_base - GUARD_SIZE, alloc_base);
+    assert!(again.hard_guard_bottom && again.hard_guard_top);
+    assert_eq!(hooks::INSTALLED.load(Ordering::SeqCst), installs);
+}
+
+/// **A soft block whose bands cannot all be installed is still leaked, whole,
+/// and keeps no guard it half got.**
+#[test]
+fn a_soft_block_half_hardened_at_retirement_gives_the_half_back_and_is_leaked() {
+    let _f = fresh(0);
+    hooks::reset();
+    unsafe { set_stack_guard_hooks(hooks::install_refused, hooks::remove) };
+    let executor = Executor::new(collection());
+
+    unsafe { set_stack_guard_hooks(hooks::install_bottom_only, hooks::remove) };
+    let removed = hooks::REMOVED.load(Ordering::SeqCst);
+    let (hardened, leaked) = soft_stack_retire_stats();
+    drop(executor);
+    assert_eq!(stack_pool_stats(), (0, 0));
+    assert_eq!(soft_stack_retire_stats(), (hardened, leaked + 1));
+    assert_eq!(
+        hooks::REMOVED.load(Ordering::SeqCst),
+        removed + 1,
+        "la banda de abajo se quedo puesta en un bloque filtrado"
+    );
+}
+
+/// **Idle blocks a burst left behind go back to the heap, a period at a time.**
+///
+/// Retention used to be for ever: 200 parked `cat`s in QEMU kept 546 MiB of
+/// kernel heap, and 441 stacks on real hardware kept it at its ceiling. A
+/// block goes only once it has been idle across two calls, half the excess
+/// a call, and never below `keep`; each loses its guard bands first.
+#[test]
+fn idle_blocks_beyond_keep_go_back_to_the_heap_half_the_excess_a_period() {
+    let _f = fresh(0);
+    hooks::reset();
+    unsafe { set_stack_guard_hooks(hooks::install_ok, hooks::remove) };
+    let burst: alloc::vec::Vec<_> = (0..6).map(|_| Executor::new(collection())).collect();
+    drop(burst);
+    assert_eq!(stack_pool_stats(), (6, 0));
+
+    IDLE_AT_LAST_TRIM.store(0, Ordering::SeqCst);
+    let trimmed = trimmed_stacks();
+    assert_eq!(
+        trim_idle_stacks(2),
+        0,
+        "first sight: nothing has been idle a period yet"
+    );
+    let removed = hooks::REMOVED.load(Ordering::SeqCst);
+    assert_eq!(
+        trim_idle_stacks(2),
+        2 * ALLOC_SIZE,
+        "half of the 4 over keep"
+    );
+    assert_eq!(stack_pool_stats(), (4, 0));
+    assert_eq!(
+        hooks::REMOVED.load(Ordering::SeqCst),
+        removed + 4,
+        "two bands a block"
+    );
+    assert_eq!(trim_idle_stacks(2), ALLOC_SIZE);
+    assert_eq!(trim_idle_stacks(2), ALLOC_SIZE);
+    assert_eq!(trim_idle_stacks(2), 0, "keep is kept");
+    assert_eq!(stack_pool_stats(), (2, 0));
+    assert_eq!(trimmed_stacks(), trimmed + 4);
 }
 
 /// **A block retired while other CPUs are online waits for all of them.**
