@@ -269,6 +269,13 @@ impl Clone for SemProc {
 ///
 /// What semop(2) actually asks for is that the accumulated adjustment be added
 /// to `semval`, whatever its sign, which is what happens now.
+///
+/// Lock order: the replay takes each set's `semop_guard`, and `sys_semop`
+/// holds that guard while it takes the process lock to record an undo
+/// (`semaphores_add_undo`). So a `SemProc` is never dropped under the process
+/// lock: `exit` and `unshare(CLONE_SYSVSEM)` take it out and drop it after.
+/// The exit paths used to drop it in place (`inner.semaphores =
+/// Default::default()`), which was the reverse order.
 impl Drop for SemProc {
     fn drop(&mut self) {
         for (&(id, num), &adj) in self.undos.iter() {

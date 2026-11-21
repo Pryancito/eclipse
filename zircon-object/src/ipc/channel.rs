@@ -380,6 +380,43 @@ impl Drop for Channel {
                 waker.wake();
             }
         }
+        // The messages nobody read go with this endpoint, and with them the
+        // handles in flight in them. A handle that held the last reference
+        // to another channel would free that channel right here, inside this
+        // drop, with its own messages, and so on as deep as a process cares
+        // to nest them: a recursion that went through any kernel stack (see
+        // `closing_a_deep_nest_of_channels_does_not_recurse`). Zircon defers
+        // the deletion of dispatchers for the same reason. Here the nested
+        // channel is taken out of its `Arc` once it is ours alone, and its
+        // messages join this loop, so the drop is as deep as one level
+        // whatever the nesting. Only a close with handles in flight gets here;
+        // reads and writes never do.
+        let mut unread: Vec<T> = {
+            let mut queue = self.recv_queue.lock();
+            if queue.iter().all(|msg| msg.handles.is_empty()) {
+                return;
+            }
+            core::mem::take(&mut *queue).into()
+        };
+        while let Some(msg) = unread.pop() {
+            for handle in msg.handles {
+                let object = handle.object.clone();
+                // Closes the handle; `object` may now be the last reference.
+                drop(handle);
+                let Ok(channel) = object.downcast_arc::<Channel>() else {
+                    continue;
+                };
+                if let Some(channel) = Arc::into_inner(channel) {
+                    unread.extend(
+                        core::mem::take(&mut *channel.recv_queue.lock())
+                            .into_iter()
+                            .filter(|msg| !msg.handles.is_empty()),
+                    );
+                    // Its own drop finds an empty queue.
+                    drop(channel);
+                }
+            }
+        }
     }
 }
 
@@ -942,5 +979,84 @@ mod tests {
             ),
         }
         assert!(channel0.call_reply.lock().is_empty());
+    }
+    /// Closing a channel frees the messages it holds, and with them the
+    /// handles in flight in those messages. When one of those is the last
+    /// reference to another channel, that channel is freed right there, with
+    /// its own messages -- and a process can nest channels as deep as it can
+    /// create them. That was a recursion as deep as the nesting, a few
+    /// hundred bytes of kernel stack a level: tens of thousands of levels
+    /// went straight through any kernel stack. Run on a thread with a small
+    /// stack, it crashed the test binary.
+    #[test]
+    fn closing_a_deep_nest_of_channels_does_not_recurse() {
+        extern crate std;
+        const DEPTH: usize = 50_000;
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let (top, top_peer) = Channel::create();
+                let mut kept = Vec::with_capacity(DEPTH);
+                let mut writer = top_peer;
+                for _ in 0..DEPTH {
+                    let (inner, inner_peer) = Channel::create();
+                    let msg = MessagePacket {
+                        data: Vec::new(),
+                        handles: alloc::vec![Handle::new(inner, Rights::DEFAULT_CHANNEL)],
+                    };
+                    // Lands in the queue of `writer`'s peer, which is the
+                    // channel one level up.
+                    writer.write(msg).unwrap();
+                    kept.push(writer);
+                    writer = inner_peer;
+                }
+                kept.push(writer);
+                // The ends that wrote stay alive: only the chain of read
+                // ends, each held by the queue above it, goes with `top`.
+                drop(top);
+                kept
+            })
+            .unwrap();
+        let kept = handle.join().expect("closing the nest blew the stack");
+        assert!(
+            kept.iter().all(|end| end.peer_closed()),
+            "every read end of the nest was freed"
+        );
+    }
+
+    /// A `call` racing the drop of its peer ends: either the peer was gone
+    /// before the call looked (`PEER_CLOSED` straight away), or the call
+    /// held the peer alive while it put its slot in, and the peer's drop --
+    /// which can then only start after the call let go of it -- found the
+    /// slot and failed it. There is no window between the two: the call's
+    /// `upgrade` is a strong reference, and a channel whose drop has started
+    /// has none left to upgrade to.
+    #[test]
+    fn a_call_racing_its_peer_close_always_ends() {
+        extern crate std;
+        for _ in 0..2_000 {
+            let (caller, callee) = Channel::create();
+            let closer = std::thread::spawn(move || drop(callee));
+            let result = match caller.call_counted(message(b"ping")) {
+                Err(e) => Err(e),
+                Ok((_, reply)) => {
+                    let mut reply = Box::pin(reply);
+                    let mut spins = 0u64;
+                    loop {
+                        match reply.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                            Poll::Ready(r) => break r.map(|_| ()),
+                            Poll::Pending => {
+                                spins += 1;
+                                assert!(spins < 50_000_000, "the call never ended");
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            };
+            closer.join().unwrap();
+            assert_eq!(result, Err(ZxError::PEER_CLOSED));
+            assert!(caller.call_reply.lock().is_empty());
+        }
     }
 }
