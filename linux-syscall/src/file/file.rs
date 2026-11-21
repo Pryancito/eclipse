@@ -975,7 +975,7 @@ impl Syscall<'_> {
         const SEEK_HOLE: usize = 4;
         if whence == SEEK_DATA || whence == SEEK_HOLE {
             let proc = self.linux_process();
-            let file_like = proc.get_file_like(fd)?;
+            let file_like = proc.get_open_file_like(fd)?;
             let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
             // A pipe or a FIFO has no `llseek` at all, so `vfs_llseek` fails
             // before the `whence` is looked at and all five answer ESPIPE.
@@ -1001,7 +1001,7 @@ impl Syscall<'_> {
         // Use the FileLike seek so it works on non-`File` fds too — notably the
         // DRM PRIME dma-buf fd, which Mesa's software importer sizes with
         // lseek(SEEK_END). `get_file` would reject it with EBADF.
-        let file = proc.get_file_like(fd)?;
+        let file = proc.get_open_file_like(fd)?;
         let offset = file.seek(pos)?;
         Ok(offset as usize)
     }
@@ -1114,7 +1114,7 @@ impl Syscall<'_> {
         let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         // A socket or an eventfd is "not a regular file" too.
-        let file = proc.get_file_or(fd, LxError::EINVAL)?;
+        let file = proc.get_open_file_or(fd, LxError::EINVAL)?;
         let metadata = file.metadata()?;
         Self::ftruncate_type(metadata.type_)?;
         // `do_ftruncate`: a descriptor not open for writing is the same
@@ -1177,7 +1177,7 @@ impl Syscall<'_> {
             fd, offset, len, advice
         );
         // Honour Linux's EBADF for an invalid descriptor.
-        let file = self.linux_process().get_file_like(fd)?;
+        let file = self.linux_process().get_open_file_like(fd)?;
         // `generic_fadvise` answers ESPIPE for a FIFO before it ever looks at
         // the hint: a node from `mkfifo` or a pipe from `pipe2`, which is a
         // FIFO to `fstat` as well.
@@ -1542,7 +1542,7 @@ fn fsync_target(
     proc: &linux_object::process::LinuxProcess,
     fd: FileDesc,
 ) -> LxResult<Arc<linux_object::fs::File>> {
-    let file = proc.get_file_or(fd, LxError::EINVAL)?;
+    let file = proc.get_open_file_or(fd, LxError::EINVAL)?;
     if matches!(
         file.metadata().map(|m| m.type_),
         Ok(FileType::NamedPipe | FileType::Socket)
@@ -1596,7 +1596,7 @@ impl Syscall<'_> {
         // `syncfs` on a socket or an eventfd syncs the pseudo filesystem
         // behind it, which has nothing to write: 0, not `EBADF`.
         let Some(file) = proc
-            .get_file_like(fd)?
+            .get_open_file_like(fd)?
             .downcast_arc::<linux_object::fs::File>()
             .ok()
         else {
@@ -1665,7 +1665,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         // `sync_file_range`: `ESPIPE` for anything but a regular file, a
         // block device, a directory or a symlink -- a pipe, a FIFO, a socket.
-        let file = proc.get_file_or(fd, LxError::ESPIPE)?;
+        let file = proc.get_open_file_or(fd, LxError::ESPIPE)?;
         if !matches!(
             file.metadata()?.type_,
             FileType::File | FileType::BlockDevice | FileType::Dir | FileType::SymLink
@@ -1976,7 +1976,7 @@ impl Syscall<'_> {
             fd, request, arg1, arg2, arg3
         );
         let proc = self.linux_process();
-        let file_like = match proc.get_file_like(fd) {
+        let file_like = match proc.get_open_file_like(fd) {
             Ok(f) => f,
             Err(e) => {
                 // A DRM ioctl ('d' = 0x64 family) on an fd that is NOT in the
@@ -2490,6 +2490,12 @@ impl Syscall<'_> {
         const F_GETPIPE_SZ: usize = 1032;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        // `check_fcntl_cmd`: an `O_PATH` descriptor takes only the commands
+        // about the descriptor itself; everything about the file is `EBADF`.
+        const F_DUPFD_CLOEXEC: usize = 1030;
+        if file_like.flags().is_path() && !matches!(cmd, 0..=3 | F_DUPFD_CLOEXEC) {
+            return Err(LxError::EBADF);
+        }
         if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
             // Seals exist only on memfds; every other fd answers EINVAL, as
             // Linux does for a filesystem without sealing support.
@@ -2721,7 +2727,7 @@ impl Syscall<'_> {
     /// Change file mode by descriptor.
     pub fn sys_fchmod(&self, fd: FileDesc, mode: usize) -> SysResult {
         let proc = self.linux_process();
-        let inode = proc.get_file(fd)?.inode();
+        let inode = proc.get_open_file(fd)?.inode();
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
         set_mode(&inode, &metadata)?;
@@ -2756,7 +2762,7 @@ impl Syscall<'_> {
     /// Change file owner/group by descriptor.
     pub fn sys_fchown(&self, fd: FileDesc, uid: usize, gid: usize) -> SysResult {
         let proc = self.linux_process();
-        let inode = proc.get_file(fd)?.inode();
+        let inode = proc.get_open_file(fd)?.inode();
         let mut metadata = inode.metadata()?;
         proc.chown_metadata(&mut metadata, uid as u32, gid as u32)?;
         inode.set_metadata(&metadata)?;
@@ -2872,7 +2878,7 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
             info!("futimens: fd: {:?}, times: {:?}", dirfd, times);
-            proc.get_file(dirfd)?.inode()
+            proc.get_open_file(dirfd)?.inode()
         } else {
             let pathname = pathname.as_c_str()?;
             info!(

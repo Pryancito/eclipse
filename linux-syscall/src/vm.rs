@@ -404,7 +404,7 @@ impl Syscall<'_> {
             verify_installed(&vmar, addr, len, "anon");
             Ok(addr)
         } else {
-            let file_like = self.linux_process().get_file_like(fd)?;
+            let file_like = self.linux_process().get_open_file_like(fd)?;
             mmap_file_access(shared, want_write, file_like.flags())?;
             // After the descriptor's own errors, as in Linux, where `EBADF`
             // and `EACCES` come before `mmap_region()` looks at the limit.

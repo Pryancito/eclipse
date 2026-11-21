@@ -1110,7 +1110,7 @@ impl Syscall<'_> {
             "flock: fd: {:?}, cmd: {:?}, nonblock: {}",
             fd, cmd, nonblock
         );
-        let file = self.linux_process().get_file(fd)?;
+        let file = self.linux_process().get_open_file(fd)?;
         let meta = file.metadata()?;
         let key = (meta.dev, meta.inode);
         let owner = Arc::as_ptr(&file) as usize;
@@ -2779,3 +2779,7 @@ mod itimerspec_layout_tests {
         assert_eq!(offset_of!(TimeSpec, nsec), 8);
     }
 }
+
+/// An `O_PATH` descriptor: `EBADF` for everything `fdget` serves.
+#[cfg(test)]
+mod opath_tests;

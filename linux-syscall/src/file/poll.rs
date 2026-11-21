@@ -518,10 +518,15 @@ impl Syscall<'_> {
                 // the classification, the scan and the subscriptions below
                 // all read from this instead of taking the table lock four
                 // times per fd.
-                let files = this
+                // An `O_PATH` descriptor is no open file to `do_pollfd`
+                // (`fdget` refuses it), so it is `POLLNVAL` like a closed one.
+                let files: Vec<_> = this
                     .syscall
                     .linux_process()
-                    .get_file_likes(this.polls.iter().map(|p| p.fd));
+                    .get_file_likes(this.polls.iter().map(|p| p.fd))
+                    .into_iter()
+                    .map(|f| f.filter(|f| !f.flags().is_path()))
+                    .collect();
                 // Asked of the FILE and not of the fd number. Sockets are
                 // handed out from `SOCKET_FD` only while the process may
                 // hold a descriptor that high (see
@@ -1328,8 +1333,8 @@ impl Syscall<'_> {
             event.read()?
         };
         let proc = self.linux_process();
-        let epoll_file = proc.get_file_like(epfd)?;
-        let file = proc.get_file_like(fd)?;
+        let epoll_file = proc.get_open_file_like(epfd)?;
+        let file = proc.get_open_file_like(fd)?;
         let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EINVAL)?;
         epoll.ctl(op, fd, event, Some(file))
     }

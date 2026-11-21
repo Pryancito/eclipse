@@ -8,7 +8,7 @@
 //! capabilities dropped.
 
 use super::proc_self::is_fd_dir_of;
-use super::FileDesc;
+use super::{FileDesc, FileLike};
 use crate::error::{LxError, LxResult};
 use crate::process::{
     Credentials, LinuxProcess, ACCESS_EXEC, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
@@ -81,6 +81,41 @@ impl LinuxProcess {
     /// `EBADF` stays the answer for a descriptor that is not open at all.
     pub fn get_file_or(&self, fd: FileDesc, not_a_file: LxError) -> LxResult<Arc<super::File>> {
         self.get_file_like(fd)?
+            .downcast_arc::<super::File>()
+            .map_err(|_| not_a_file)
+    }
+
+    /// The descriptor `fd` as `fdget` hands it out: an `O_PATH` descriptor
+    /// names a place, not an open file, so every call that does something
+    /// with the file (I/O, `lseek`, `ioctl`, `mmap`, `fchmod`, `fsync`...)
+    /// answers `EBADF` for it. Only the calls Linux serves with
+    /// `fdget_raw` (`fstat`, `fchdir`, `fstatfs`, `close`, `dup`, a `dirfd`
+    /// of the `*at` family, a few `fcntl` commands) take it, and those use
+    /// [`get_file_like`](Self::get_file_like).
+    pub fn get_open_file_like(&self, fd: FileDesc) -> LxResult<Arc<dyn FileLike>> {
+        let file = self.get_file_like(fd)?;
+        if file.flags().is_path() {
+            return Err(LxError::EBADF);
+        }
+        Ok(file)
+    }
+
+    /// [`get_open_file_like`](Self::get_open_file_like) for a regular `File`,
+    /// with `EBADF` for anything else, like [`get_file`](Self::get_file).
+    pub fn get_open_file(&self, fd: FileDesc) -> LxResult<Arc<super::File>> {
+        self.get_open_file_like(fd)?
+            .downcast_arc::<super::File>()
+            .map_err(|_| LxError::EBADF)
+    }
+
+    /// [`get_file_or`](Self::get_file_or), refusing an `O_PATH` descriptor
+    /// with `EBADF` first, as `fdget` does.
+    pub fn get_open_file_or(
+        &self,
+        fd: FileDesc,
+        not_a_file: LxError,
+    ) -> LxResult<Arc<super::File>> {
+        self.get_open_file_like(fd)?
             .downcast_arc::<super::File>()
             .map_err(|_| not_a_file)
     }
