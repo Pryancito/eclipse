@@ -157,6 +157,7 @@ fn timer_delete_of_another_process_s_timer_is_einval_and_leaves_it() {
             next: Duration::ZERO,
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         },
     );
     let deleted = on_a_thread(&proc, move |sys| {

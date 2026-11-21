@@ -25,6 +25,21 @@ struct TimerInner {
     /// longer matches was disarmed/re-armed and must not fire or re-schedule.
     generation: AtomicU64,
     eventbus: Arc<Mutex<EventBus>>,
+    /// The kernel timer last set for this fd, taken out again when the fd is
+    /// re-armed, disarmed or closed. A stale callback was always harmless
+    /// (the generation check), but it stayed queued on its CPU's timer heap,
+    /// a `TimerEvent` and a boxed closure, until its old deadline: an event
+    /// loop re-arming a far deadline a thousand times a second grew the
+    /// kernel heap without bound, and closing the fd did not stop it.
+    pending: Mutex<Option<kernel_hal::deadline::TimerId>>,
+}
+
+impl Drop for TimerInner {
+    fn drop(&mut self) {
+        if let Some(id) = self.pending.get_mut().take() {
+            kernel_hal::timer::timer_cancel(id);
+        }
+    }
 }
 
 impl TimerInner {
@@ -34,6 +49,11 @@ impl TimerInner {
     /// not always the one the kernel timer runs on.
     fn arm(self: &Arc<Self>, base: ClockBase, value_ns: u64, interval_ns: u64, abs: bool) {
         let generation = self.generation.fetch_add(1, SeqCst) + 1;
+        // Out of the lock: a cancel may take another CPU's timer heap.
+        let old = self.pending.lock().take();
+        if let Some(id) = old {
+            kernel_hal::timer::timer_cancel(id);
+        }
         self.interval_ns.store(interval_ns, SeqCst);
         if value_ns == 0 {
             self.next_deadline_ns.store(0, SeqCst);
@@ -89,7 +109,9 @@ impl TimerInner {
     fn schedule(self: &Arc<Self>, deadline_ns: u64, generation: u64) {
         self.next_deadline_ns.store(deadline_ns, SeqCst);
         let weak = Arc::downgrade(self);
-        kernel_hal::timer::timer_set(
+        // Replaced, not cancelled: from the callback below, the timer on
+        // record is the one running now. `arm` cancels before it gets here.
+        let id = kernel_hal::timer::timer_set_cancellable(
             Duration::from_nanos(deadline_ns),
             Box::new(move |_now| {
                 let Some(inner) = weak.upgrade() else { return };
@@ -99,6 +121,7 @@ impl TimerInner {
                 }
             }),
         );
+        *self.pending.lock() = id;
     }
 
     /// The kernel timer scheduled for `deadline_ns` has fired, at `now_ns`.
@@ -181,6 +204,7 @@ impl TimerFd {
                 next_deadline_ns: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
                 eventbus: EventBus::new(),
+                pending: Mutex::new(None),
             }),
             clock,
             flags: Mutex::new(flags),
@@ -749,6 +773,7 @@ mod periodic_grid_tests {
             next_deadline_ns: AtomicU64::new(0),
             generation: AtomicU64::new(7),
             eventbus: EventBus::new(),
+            pending: Mutex::new(None),
         })
     }
 

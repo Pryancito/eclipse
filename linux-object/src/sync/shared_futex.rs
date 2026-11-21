@@ -41,7 +41,7 @@
 use crate::process::ProcessExt;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicI32;
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering::Relaxed};
 use kernel_hal::sync::Mutex;
 use zircon_object::object::{KernelObject, KoID};
 use zircon_object::signal::Futex;
@@ -75,13 +75,41 @@ pub fn intern(key: SharedKey, vmo: Arc<VmObject>, word: &'static AtomicI32) -> A
             return futex;
         }
     }
-    // Absent, or present but dead: replace it. Pruning the rest here would
-    // cost a full walk on every futex call, and a dead entry is reclaimed the
-    // next time its own key is asked for.
+    // Absent, or present but dead: replace it. A dead entry of another key
+    // is reclaimed when the table has doubled since the last sweep. Waiting
+    // for its own key to be asked again was never: the key is a koid, and a
+    // koid is never reused, so every libxshmfence fence (a memfd per buffer,
+    // made again on each resize) left its entry here, and the entry's strong
+    // reference kept the fence's VmObject and its frame alive, for the life
+    // of the machine. The sweep's cost is spread over the inserts that made
+    // the table that big.
+    let dead = if table.len() >= PRUNE_AT.load(Relaxed) {
+        let mut dead = alloc::vec::Vec::new();
+        table.retain(|_, entry| {
+            if entry.0.strong_count() > 0 {
+                return true;
+            }
+            dead.push(entry.1.clone());
+            false
+        });
+        PRUNE_AT.store((table.len() * 2).max(PRUNE_MIN), Relaxed);
+        dead
+    } else {
+        alloc::vec::Vec::new()
+    };
     let futex = Futex::new(word);
     table.insert(key, (Arc::downgrade(&futex), vmo));
+    drop(table);
+    // The objects outside the lock: the last reference to a VmObject frees
+    // its frames under its own locks.
+    drop(dead);
     futex
 }
+
+/// Table size at which [`intern`] next sweeps the dead entries: twice what
+/// survived the last sweep, never under [`PRUNE_MIN`].
+static PRUNE_AT: AtomicUsize = AtomicUsize::new(PRUNE_MIN);
+const PRUNE_MIN: usize = 64;
 
 /// The `Futex` a process-shared futex word names, or `None` when this
 /// word is not shared and the per-process table is the right home for it.
@@ -258,6 +286,31 @@ mod tests {
             "two processes mapping the same object at different addresses must \
              share one queue, or a wake in one never reaches a waiter in the other"
         );
+    }
+
+    /// A koid is never asked for again once its object is gone, so a dead
+    /// entry has to be swept by somebody else's insert -- and with it the
+    /// object the entry kept alive.
+    #[test]
+    fn dead_entries_of_other_keys_are_swept_and_let_their_object_go() {
+        let _serialised = serialised();
+        clear_for_test();
+        PRUNE_AT.store(PRUNE_MIN, Relaxed);
+        let vmo = some_vmo();
+        let weak_vmo = Arc::downgrade(&vmo);
+        drop(intern((1000, 0), vmo, leaked_word()));
+        assert!(weak_vmo.upgrade().is_some(), "the entry holds it");
+        for i in 0..(4 * PRUNE_MIN) {
+            drop(intern((2000 + i as u64, 0), some_vmo(), leaked_word()));
+        }
+        assert!(weak_vmo.upgrade().is_none(), "swept, and the object freed");
+        assert!(len() < 2 * PRUNE_MIN, "the table stays near what is alive");
+        let kept = intern((3000, 0), some_vmo(), leaked_word());
+        for i in 0..(4 * PRUNE_MIN) {
+            drop(intern((4000 + i as u64, 0), some_vmo(), leaked_word()));
+        }
+        let again = intern((3000, 0), some_vmo(), leaked_word());
+        assert!(Arc::ptr_eq(&kept, &again), "a live entry is never swept");
     }
 
     #[test]

@@ -221,6 +221,10 @@ impl Drop for RamBlock {
 /// actually renders; the previous eager zero-filled `resize` allocated all
 /// 131k blocks from the kernel heap in that one call and OOM-panicked the
 /// whole desktop. Blocks now materialize only when first written.
+/// Slots a file may always have, whatever the pool's cap reads (tests set
+/// small caps): 1 GiB of length.
+const MIN_SLOTS: usize = (1 << 30) / BLOCK;
+
 #[derive(Default)]
 struct PagedBytes {
     blocks: Vec<Option<RamBlock>>,
@@ -237,13 +241,17 @@ impl PagedBytes {
     /// shrinking drops unreachable [`RamBlock`]s (which release the charge)
     /// and zeroes the stale tail of the last partial block so a later grow
     /// does not resurrect old bytes.
+    ///
+    /// Growing adds no slots either: past the last slot reads as a hole, and
+    /// [`write_at`](Self::write_at) adds slots up to what it writes. The
+    /// slots used to be made here, 24 bytes of kernel heap per 4 KiB of
+    /// LENGTH, uncharged and infallible: `ftruncate(memfd, 1 << 40)` asked
+    /// the heap for 6 GiB in one block and ended the machine in
+    /// `alloc_error`, and a 64 GiB sparse file held 384 MiB of it for good.
     fn resize(&mut self, new_len: usize) {
         let nblocks = new_len.div_ceil(BLOCK);
         if nblocks < self.blocks.len() {
             self.blocks.truncate(nblocks);
-        } else {
-            // Hole: slots exist but hold no storage until first written.
-            self.blocks.resize_with(nblocks, || None);
         }
         if new_len < self.len {
             let off = new_len % BLOCK;
@@ -283,10 +291,23 @@ impl PagedBytes {
     /// [`FsError::NoDeviceSpace`] when the shared ramfs ceiling is hit or the
     /// page/heap backend cannot hold another page — never panic the machine.
     fn write_at(&mut self, offset: usize, buf: &[u8]) -> Result<usize> {
-        let end = offset + buf.len();
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(FsError::NoDeviceSpace)?;
         let nblocks = end.div_ceil(BLOCK);
         if nblocks > self.blocks.len() {
-            // Any implicit gap between old EOF and `offset` stays a hole.
+            // Any implicit gap between old EOF and `offset` stays a hole --
+            // but its slots are kernel heap, so they are asked for, not
+            // taken: a write far past the end of a sparse file is refused
+            // (ENOSPC) instead of ending the machine, and no slot vector may
+            // outgrow what the whole ramfs pool could ever fill twice over.
+            let max_slots = (bytes_cap() / BLOCK).saturating_mul(2).max(MIN_SLOTS);
+            if nblocks > max_slots {
+                return Err(FsError::NoDeviceSpace);
+            }
+            self.blocks
+                .try_reserve(nblocks - self.blocks.len())
+                .map_err(|_| FsError::NoDeviceSpace)?;
             self.blocks.resize_with(nblocks, || None);
         }
         let mut done = 0;
@@ -1004,7 +1025,7 @@ mod tests {
             "an ftruncate is a promise about length, not about memory: foot sizes \
              its wl_shm pool to 512 MiB and writes a few of them"
         );
-        assert_eq!(p.blocks.len(), 100, "the slots exist, the storage does not");
+        assert_eq!(p.blocks.len(), 0, "no slots and no storage: only a length");
     }
 
     #[test]
