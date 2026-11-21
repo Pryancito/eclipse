@@ -148,6 +148,18 @@ impl INode for HNode {
         Ok(())
     }
 
+    /// `mknod` reaches the file system through `create2`; this one takes no
+    /// data (an `rdev`), so it is `create`.
+    fn create2(
+        &self,
+        name: &str,
+        type_: FileType,
+        mode: u32,
+        _data: usize,
+    ) -> Result<Arc<dyn INode>> {
+        self.create(name, type_, mode)
+    }
+
     fn create(&self, name: &str, type_: FileType, _mode: u32) -> Result<Arc<dyn INode>> {
         let new_path = self.path.join(name);
         if new_path.exists() {

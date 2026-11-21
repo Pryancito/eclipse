@@ -241,6 +241,18 @@ impl vfs::INode for INodeImpl {
         self.disk_inode.write().size = len as u32;
         Ok(())
     }
+    /// `mknod` reaches the file system through `create2`; this one takes no
+    /// data (an `rdev`), so it is `create`.
+    fn create2(
+        &self,
+        name: &str,
+        type_: vfs::FileType,
+        mode: u32,
+        _data: usize,
+    ) -> vfs::Result<Arc<dyn vfs::INode>> {
+        self.create(name, type_, mode)
+    }
+
     fn create(
         &self,
         name: &str,

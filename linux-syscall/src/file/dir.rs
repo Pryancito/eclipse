@@ -142,7 +142,9 @@ impl Syscall<'_> {
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
         let create_mode = proc.apply_umask(mkdir_perm(mode));
-        let created = inode.create(file_name, FileType::Dir, create_mode as u32)?;
+        let created = inode
+            .create(file_name, FileType::Dir, create_mode as u32)
+            .map_err(no_such_dir_op)?;
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -194,7 +196,9 @@ impl Syscall<'_> {
         } else {
             0
         };
-        let created = inode.create2(file_name, file_type, create_mode as u32, rdev)?;
+        let created = inode
+            .create2(file_name, file_type, create_mode as u32, rdev)
+            .map_err(no_such_dir_op)?;
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, false)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -302,7 +306,9 @@ impl Syscall<'_> {
         }
         proc.check_access(&new_dir_metadata, 0o3, true)?;
         proc.check_link(&inode.metadata()?)?;
-        new_dir_inode.link(new_file_name, &inode)?;
+        new_dir_inode
+            .link(new_file_name, &inode)
+            .map_err(no_such_dir_op)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }
@@ -352,7 +358,7 @@ impl Syscall<'_> {
         if !remove_dir {
             self.hunter_allows_unlink(&dir_walked, file_name)?;
         }
-        dir_inode.unlink(file_name)?;
+        dir_inode.unlink(file_name).map_err(no_such_dir_op)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }
@@ -441,7 +447,9 @@ impl Syscall<'_> {
             &new_dir_walked,
             new_file_name,
         )?;
-        old_dir_inode.move_(old_file_name, &new_dir_inode, new_file_name)?;
+        old_dir_inode
+            .move_(old_file_name, &new_dir_inode, new_file_name)
+            .map_err(no_such_dir_op)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }
@@ -550,7 +558,9 @@ impl Syscall<'_> {
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
         let mode = proc.apply_umask(0o777);
-        let symlink_inode = inode.create(file_name, FileType::SymLink, mode as u32)?;
+        let symlink_inode = inode
+            .create(file_name, FileType::SymLink, mode as u32)
+            .map_err(no_such_dir_op)?;
         proc.initialize_created_metadata(&symlink_inode, Some(&dir_metadata), mode, false)?;
         symlink_inode.write_at(0, target.as_bytes())?;
         linux_object::fs::dcache_invalidate();
@@ -1153,6 +1163,17 @@ pub(crate) fn mknod_file_type(mode: usize) -> LxResult<FileType> {
 /// mask's.
 pub(crate) fn mkdir_perm(mode: usize) -> u16 {
     (mode & 0o1777) as u16
+}
+
+/// The errno of a directory whose file system has no such operation: `/proc`,
+/// `/sys`, `/dev/pts`. `vfs_mkdir`, `vfs_mknod`, `vfs_symlink`, `vfs_link`,
+/// `vfs_unlink`, `vfs_rmdir` and `vfs_rename` all answer `EPERM` when the
+/// inode has no method for it, not the `ENOSYS` of a missing system call.
+pub(crate) fn no_such_dir_op(e: rcore_fs::vfs::FsError) -> LxError {
+    match e {
+        rcore_fs::vfs::FsError::NotSupported => LxError::EPERM,
+        e => e.into(),
+    }
 }
 
 /// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
@@ -2731,3 +2752,5 @@ mod mknod_file_type_tests {
         assert_eq!(mknod_file_type(0o027777), Ok(FileType::CharDevice));
     }
 }
+#[cfg(test)]
+mod no_such_op_tests;

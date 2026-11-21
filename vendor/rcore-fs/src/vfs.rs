@@ -63,7 +63,12 @@ pub trait INode: Any + Sync + Send {
         mode: u32,
         _data: usize,
     ) -> Result<Arc<dyn INode>> {
-        self.create(name, type_, mode)
+        // Not `self.create(..)`: `create`'s default is this one, so a
+        // directory that implements neither -- `/proc`, `/sys`, `/dev/pts`
+        // -- recursed until the stack ran out on `mkdir /proc/x`. A file
+        // system that implements only `create` forwards to it itself.
+        let _ = (name, type_, mode);
+        Err(FsError::NotSupported)
     }
 
     /// Create a hard link `name` to `other`
@@ -1938,6 +1943,16 @@ mod tests {
         assert_eq!(n.sync_data().err(), Some(FsError::NotSupported));
         assert_eq!(n.resize(0).err(), Some(FsError::NotSupported));
         assert_eq!(n.unlink("x").err(), Some(FsError::NotSupported));
+        // Neither `create` nor `create2`: each default used to call the
+        // other, and this was a stack overflow.
+        assert_eq!(
+            n.create("x", FileType::Dir, 0o755).err(),
+            Some(FsError::NotSupported)
+        );
+        assert_eq!(
+            n.create2("x", FileType::NamedPipe, 0o644, 0).err(),
+            Some(FsError::NotSupported)
+        );
         assert_eq!(n.find("x").err(), Some(FsError::NotSupported));
         assert_eq!(n.get_entry(0).err(), Some(FsError::NotSupported));
         assert_eq!(n.io_control(0, 0).err(), Some(FsError::NotSupported));
@@ -1945,8 +1960,10 @@ mod tests {
 
     #[test]
     fn create_and_create2_stand_in_for_each_other() {
-        // A file system may implement either; the one it does not implement
-        // must reach the one it does, and not recurse for ever.
+        // `create` reaches a file system that implements only `create2`. The
+        // other way round the file system forwards itself (`create2`'s
+        // default is `NotSupported`, so that one that implements neither
+        // does not recurse for ever).
         struct OnlyCreate2(Mutex<Vec<(String, usize)>>);
         impl INode for OnlyCreate2 {
             fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {

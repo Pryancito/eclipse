@@ -832,6 +832,18 @@ mod tests {
                 self.inner.create(name, type_, mode)?,
             ))
         }
+        fn create2(
+            &self,
+            name: &str,
+            type_: FileType,
+            mode: u32,
+            data: usize,
+        ) -> Result<Arc<dyn INode>> {
+            Ok(Self::wrap(
+                self.fs.clone(),
+                self.inner.create2(name, type_, mode, data)?,
+            ))
+        }
         fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
             self.inner.link(name, other)
         }
