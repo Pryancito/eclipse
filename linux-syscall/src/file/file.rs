@@ -229,6 +229,16 @@ mod drm_ioctl_layout_tests;
 #[cfg(test)]
 mod setlkw_tests;
 
+/// A char device of major 1 (`/dev/null`, `zero`, `full`, `random`,
+/// `urandom`, `kmsg`...): `mem` devices that Linux never answers a terminal
+/// ioctl for. `cmd > /dev/null` is the most common redirection there is, and
+/// a made-up window size on it made musl's `isatty()` (a `TIOCGWINSZ` probe)
+/// say the output was a terminal.
+fn is_a_memory_device(file: &Arc<dyn FileLike>) -> bool {
+    file.metadata()
+        .is_ok_and(|m| m.type_ == rcore_fs::vfs::FileType::CharDevice && (m.rdev >> 8) & 0xfff == 1)
+}
+
 /// Whether an `EINVAL` from the file's own ioctl handler should be reported
 /// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
 /// of the file ioctls that block also carries.
@@ -2393,7 +2403,8 @@ impl Syscall<'_> {
                 if request == TIOCGWINSZ
                     && arg1 != 0
                     && file_like.is_char_device()
-                    && !file_like.is_input_device() =>
+                    && !file_like.is_input_device()
+                    && !is_a_memory_device(&file_like) =>
             {
                 let mut ws = kernel_hal::console::console_win_size();
                 if ws.ws_col == 0 {

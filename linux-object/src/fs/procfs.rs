@@ -3005,29 +3005,32 @@ fn proc_net_route_content() -> String {
 }
 
 fn proc_uptime_content() -> String {
-    // Format: "<uptime_seconds> <idle_seconds>\n". `idle_seconds` is summed
-    // across all online CPUs then averaged back down to one CPU's worth, the
-    // same convention `/proc/perf/kernel`'s idle% uses — and it is real halt
-    // time (`kernel_hal::kstats::note_idle`, driven from the actual `hlt`/
-    // `mwait` idle path), not a placeholder.
+    // Format: "<uptime_seconds> <idle_seconds>\n". `idle_seconds` is real
+    // halt time (`kernel_hal::kstats::note_idle`, driven from the actual
+    // `hlt`/`mwait` idle path), summed over the CPUs as Linux sums it.
     uptime_text(
-        kernel_hal::timer::timer_now().as_secs_f64(),
+        kernel_hal::timer::timer_now().as_nanos() as u64,
         kernel_hal::kstats::snapshot().idle_ns,
-        kernel_hal::online_cpu_count(),
     )
 }
 
-/// `/proc/uptime` from its three inputs: seconds up, nanoseconds halted
-/// summed over the CPUs, and how many CPUs that sum came from.
+/// `/proc/uptime` from its two inputs: nanoseconds up, and nanoseconds
+/// halted summed over every CPU.
 ///
-/// Dividing is the whole point: the idle time is collected per CPU and
-/// `uptime(1)` wants one CPU's worth, so multiplying instead would report a
-/// two-CPU machine as having been idle for longer than it has been up.
-/// `ncpus` is an argument because `online_cpu_count()` never answers 0 here,
-/// which leaves the `.max(1)` guarding the division unreachable from a test.
-fn uptime_text(uptime_secs: f64, idle_ns: u64, ncpus: usize) -> String {
-    let idle = idle_ns as f64 / 1_000_000_000.0 / ncpus.max(1) as f64;
-    format!("{:.2} {:.2}\n", uptime_secs, idle)
+/// As `uptime_proc_show` prints it: the idle time is the SUM over the CPUs
+/// (`for_each_possible_cpu`), so on a machine with more than one CPU it can
+/// exceed the uptime, and both numbers are `%lu.%02lu` -- hundredths
+/// truncated, never rounded. It used to divide the idle sum by the CPU
+/// count and round, which no Linux reader expects.
+fn uptime_text(uptime_ns: u64, idle_ns: u64) -> String {
+    let two = |ns: u64| {
+        format!(
+            "{}.{:02}",
+            ns / 1_000_000_000,
+            ns % 1_000_000_000 / 10_000_000
+        )
+    };
+    format!("{} {}\n", two(uptime_ns), two(idle_ns))
 }
 
 /// `/proc/stat` — aggregate and per-CPU counters in USER_HZ jiffies
@@ -5896,24 +5899,19 @@ mod proc_numbers_tests {
 
     // ---------------- /proc/uptime ----------------
 
-    /// Four CPUs halted for two seconds each is two seconds idle, not eight:
-    /// the sum is collected per CPU and `uptime(1)` wants one CPU's worth.
+    /// Four CPUs halted for two seconds each is eight seconds idle, as
+    /// Linux sums it, even ten seconds after boot.
     #[test]
-    fn the_idle_seconds_of_uptime_are_one_cpu_s_worth() {
-        assert_eq!(uptime_text(10.0, 8_000_000_000, 4), "10.00 2.00\n");
-        assert_eq!(uptime_text(10.0, 8_000_000_000, 1), "10.00 8.00\n");
+    fn the_idle_seconds_of_uptime_are_the_sum_over_the_cpus() {
+        assert_eq!(uptime_text(10_000_000_000, 8_000_000_000), "10.00 8.00\n");
+        assert_eq!(uptime_text(1_000_000_000, 3_000_000_000), "1.00 3.00\n");
     }
 
-    /// Counting no CPUs is counting one. Dividing by zero here prints `inf`,
-    /// which every reader of the file parses as garbage or as nothing.
+    /// `%lu.%02lu`: hundredths are cut, not rounded, in both numbers.
     #[test]
-    fn a_count_of_no_cpus_is_treated_as_one() {
-        assert_eq!(uptime_text(1.0, 3_000_000_000, 0), "1.00 3.00\n");
-    }
-
-    #[test]
-    fn uptime_is_two_numbers_two_decimals_and_a_newline() {
-        assert_eq!(uptime_text(1234.5678, 0, 1), "1234.57 0.00\n");
+    fn uptime_is_two_numbers_two_truncated_decimals_and_a_newline() {
+        assert_eq!(uptime_text(1_234_567_800_000, 0), "1234.56 0.00\n");
+        assert_eq!(uptime_text(999_999_999, 5_009_999_999), "0.99 5.00\n");
     }
 
     // ---------------- /proc/loadavg ----------------
