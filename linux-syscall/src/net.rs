@@ -126,13 +126,21 @@ fn ucred_of(pid: i32) -> [u8; 12] {
     bytes
 }
 
-/// Bytes for `getsockopt(SO_PEERCRED)`: a live peer via [`ucred_of`], or an
-/// all-zero `ucred` when there is no peer (unconnected / non-unix). Used to
-/// invent pid 1, which made seatd authorize random TCP sockets as init.
+/// Bytes for `getsockopt(SO_PEERCRED)`: a live peer via [`ucred_of`], or
+/// `{ pid 0, uid -1, gid -1 }` when there is no peer (unconnected, non-unix):
+/// `cred_to_ucred` starts from `overflowuid`/`overflowgid` and only a peer
+/// with credentials changes them. An all-zero answer said uid 0, root, to
+/// anything that authorises by `SO_PEERCRED`; inventing pid 1 before that made
+/// seatd treat random TCP sockets as init.
 fn peercred_bytes(peer_pid: Option<i32>) -> [u8; 12] {
     match peer_pid {
         Some(pid) => ucred_of(pid),
-        None => [0u8; 12],
+        None => {
+            let mut bytes = [0u8; 12];
+            bytes[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+            bytes[8..12].copy_from_slice(&u32::MAX.to_ne_bytes());
+            bytes
+        }
     }
 }
 
@@ -2318,9 +2326,10 @@ mod peercred_tests {
     }
 
     #[test]
-    fn no_peer_is_an_all_zero_ucred_not_init() {
-        // Fabricating pid 1 made seatd treat an unconnected socket as init.
-        assert_eq!(words(peercred_bytes(None)), [0, 0, 0]);
+    fn no_peer_is_pid_0_and_no_ids_not_root_and_not_init() {
+        // Fabricating pid 1 made seatd treat an unconnected socket as init,
+        // and uid 0 said root. Linux (`cred_to_ucred`) answers no ids.
+        assert_eq!(words(peercred_bytes(None)), [0, u32::MAX, u32::MAX]);
         // A known-but-gone pid still reports overflowuid, not zeros.
         assert_eq!(
             words(peercred_bytes(Some(43_102))),

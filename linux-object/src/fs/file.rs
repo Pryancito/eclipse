@@ -1944,6 +1944,15 @@ impl FileLike for File {
         use super::devfs::PcmDev;
         if let Some(pcm) = inner.inode.downcast_ref::<PcmDev>() {
             pcm.io_control_with_flags(request as u32, arg1, inner.flags)?;
+        } else if inner
+            .inode
+            .downcast_ref::<super::devfs::EventDev>()
+            .is_some()
+        {
+            // evdev's string and bitmap ioctls (`EVIOCGNAME`, `EVIOCGBIT`,
+            // `EVIOCGKEY`, ...) return the bytes they copied (`str_to_user`,
+            // `bits_to_user`), and libevdev reads that length.
+            return Ok(inner.inode.io_control(request as u32, arg1)?);
         } else {
             inner.inode.io_control(request as u32, arg1)?;
         }

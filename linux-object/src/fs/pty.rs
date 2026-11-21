@@ -26,9 +26,17 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsiz
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::console::ConsoleWinSize;
+use kernel_hal::user::{UserInPtr, UserOutPtr};
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
+
+/// A user pointer an ioctl was handed, read or written as `copy_from_user`
+/// and `copy_to_user` do: `EFAULT` when it is not the caller's memory, never
+/// a dereference of whatever address the caller chose.
+fn user_copy<T>(r: core::result::Result<T, kernel_hal::user::Error>) -> Result<T> {
+    r.map_err(|_| FsError::BadAddress)
+}
 
 pub mod devpts;
 
@@ -793,36 +801,39 @@ impl Pty {
     fn ioctl(&self, cmd: u32, data: usize, is_master: bool) -> Result<usize> {
         match cmd as usize {
             TIOCGPTN => {
-                unsafe { *(data as *mut u32) = self.id };
+                let v: u32 = self.id;
+                user_copy(UserOutPtr::<u32>::from(data).write(v))?;
                 Ok(0)
             }
             TIOCSPTLCK => {
-                let lock = unsafe { *(data as *const i32) };
+                let lock = user_copy(UserInPtr::<i32>::from(data).read())?;
                 self.locked.store(lock != 0, Ordering::Relaxed);
                 Ok(0)
             }
             TCGETS => {
-                unsafe { *(data as *mut Termios) = self.inner.lock().termios };
+                let v: Termios = self.inner.lock().termios;
+                user_copy(UserOutPtr::<Termios>::from(data).write(v))?;
                 Ok(0)
             }
             TCGETS2 => {
                 let t = self.inner.lock().termios;
-                unsafe { *(data as *mut Termios2) = t.into() };
+                let v: Termios2 = t.into();
+                user_copy(UserOutPtr::<Termios2>::from(data).write(v))?;
                 Ok(0)
             }
             TCSETS | TCSETSW => {
-                let t = unsafe { *(data as *const Termios) };
+                let t = user_copy(UserInPtr::<Termios>::from(data).read())?;
                 self.inner.lock().termios = t;
                 Ok(0)
             }
             TCSETS2 | TCSETSW2 => {
-                let t2 = unsafe { *(data as *const Termios2) };
+                let t2 = user_copy(UserInPtr::<Termios2>::from(data).read())?;
                 self.inner.lock().termios = t2.into();
                 Ok(0)
             }
             TCSETSF => {
                 // Set attributes and flush the input queue (Linux TCSETSF).
-                let t = unsafe { *(data as *const Termios) };
+                let t = user_copy(UserInPtr::<Termios>::from(data).read())?;
                 {
                     let mut inner = self.inner.lock();
                     inner.termios = t;
@@ -841,7 +852,7 @@ impl Pty {
                 Ok(0)
             }
             TCSETSF2 => {
-                let t2 = unsafe { *(data as *const Termios2) };
+                let t2 = user_copy(UserInPtr::<Termios2>::from(data).read())?;
                 {
                     let mut inner = self.inner.lock();
                     inner.termios = t2.into();
@@ -853,11 +864,12 @@ impl Pty {
                 Ok(0)
             }
             TIOCGWINSZ => {
-                unsafe { *(data as *mut ConsoleWinSize) = self.inner.lock().winsize };
+                let v: ConsoleWinSize = self.inner.lock().winsize;
+                user_copy(UserOutPtr::<ConsoleWinSize>::from(data).write(v))?;
                 Ok(0)
             }
             TIOCSWINSZ => {
-                let ws = unsafe { *(data as *const ConsoleWinSize) };
+                let ws = user_copy(UserInPtr::<ConsoleWinSize>::from(data).read())?;
                 let changed = {
                     let mut inner = self.inner.lock();
                     let old = inner.winsize;
@@ -907,11 +919,12 @@ impl Pty {
                 if pgid == 0 {
                     pgid = 1;
                 }
-                unsafe { *(data as *mut i32) = pgid };
+                let v: i32 = pgid;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             TIOCSPGRP => {
-                let pgid = unsafe { *(data as *const i32) };
+                let pgid = user_copy(UserInPtr::<i32>::from(data).read())?;
                 let old = self.fg_pgrp.swap(pgid, Ordering::Relaxed);
                 if old != pgid {
                     crate::process::clear_interrupt_arm(&self.ctrl_c_armed_pgid);
@@ -978,7 +991,8 @@ impl Pty {
                 } else {
                     inner.input.len()
                 } as i32;
-                unsafe { *(data as *mut i32) = n };
+                let v: i32 = n;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             // Bytes still queued toward the other end.
@@ -989,7 +1003,8 @@ impl Pty {
                 } else {
                     inner.output.len()
                 } as i32;
-                unsafe { *(data as *mut i32) = n };
+                let v: i32 = n;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             TIOCGSID => {
@@ -997,32 +1012,35 @@ impl Pty {
                 if sid <= 0 {
                     sid = 1;
                 }
-                unsafe { *(data as *mut i32) = sid };
+                let v: i32 = sid;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             // Virtual modem control lines (no real hardware behind a PTY).
             TIOCMGET => {
-                unsafe { *(data as *mut i32) = self.inner.lock().modem };
+                let v: i32 = self.inner.lock().modem;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             TIOCMSET => {
-                let v = unsafe { *(data as *const i32) };
+                let v = user_copy(UserInPtr::<i32>::from(data).read())?;
                 self.inner.lock().modem = v;
                 Ok(0)
             }
             TIOCMBIS => {
-                let v = unsafe { *(data as *const i32) };
+                let v = user_copy(UserInPtr::<i32>::from(data).read())?;
                 self.inner.lock().modem |= v;
                 Ok(0)
             }
             TIOCMBIC => {
-                let v = unsafe { *(data as *const i32) };
+                let v = user_copy(UserInPtr::<i32>::from(data).read())?;
                 self.inner.lock().modem &= !v;
                 Ok(0)
             }
             // No real UART behind a PTY, so all serial line counters are zero.
             TIOCGICOUNT => {
-                unsafe { *(data as *mut SerialIcounter) = SerialIcounter::default() };
+                let v: SerialIcounter = SerialIcounter::default();
+                user_copy(UserOutPtr::<SerialIcounter>::from(data).write(v))?;
                 Ok(0)
             }
             _ => Err(FsError::NotSupported),
@@ -1669,6 +1687,32 @@ mod tests {
             ended,
             "a read nothing will ever answer must give up when the thread is \
              killed: FsError::Interrupted is what becomes EINTR"
+        );
+    }
+
+    /// The argument of a terminal ioctl is the caller's pointer, copied as
+    /// `copy_to_user`/`copy_from_user` copy it: a bad one is `EFAULT`. It
+    /// was dereferenced as it came, so `ioctl(ptmx, TCGETS, 0)` wrote a
+    /// `termios` to address 0 in the kernel.
+    #[test]
+    fn a_bad_ioctl_pointer_is_efault_and_a_good_one_is_written() {
+        let p = pty();
+        for cmd in [TCGETS, TCSETS, TIOCGWINSZ, TIOCSWINSZ, TIOCGPTN, TIOCSPTLCK] {
+            assert_eq!(
+                p.ioctl(cmd as u32, 0, true),
+                Err(FsError::BadAddress),
+                "ioctl {:#x} with a NULL argument",
+                cmd
+            );
+        }
+        let mut ws = ConsoleWinSize::default();
+        assert_eq!(
+            p.ioctl(
+                TIOCGWINSZ as u32,
+                &mut ws as *mut ConsoleWinSize as usize,
+                true
+            ),
+            Ok(0)
         );
     }
 

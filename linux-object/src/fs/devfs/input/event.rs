@@ -292,7 +292,7 @@ fn dropped() -> InputEvent {
 /// Mirrors `fs/stdio.rs`'s private `user_copy`, which cannot be reused across
 /// modules.
 fn user_copy<T>(r: core::result::Result<T, kernel_hal::user::Error>) -> Result<T> {
-    r.map_err(|_| FsError::InvalidParam)
+    r.map_err(|_| FsError::BadAddress)
 }
 
 impl EventDev {
