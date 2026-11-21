@@ -1756,7 +1756,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // "default" to hw:0,0 (S16LE stereo). Use `plug` for format conversion.
     {
         use devfs::{CtlDev, PcmDev, TimerDev};
-        if !audio_cards.is_empty() {
+        // Made even with no card of the kernel's: a served card
+        // (`udrv-hda`) puts its own nodes in this directory, and its
+        // PulseAudio sink needs `/dev/snd/timer` all the same.
+        {
             match devfs_root.add_dir("snd") {
                 Ok(snd_dir) => {
                     let mut pcms: Vec<Arc<PcmDev>> = Vec::with_capacity(audio_cards.len());
@@ -1789,7 +1792,8 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     // for `period_event` (PulseAudio's tsched=0 sinks open
                     // it from snd_pcm_sw_params). One node, one instance per
                     // open — see `TimerDev`.
-                    if let Err(e) = snd_dir.add("timer", Arc::new(TimerDev::new(pcms))) {
+                    if let Err(e) = snd_dir.add("timer", Arc::new(TimerDev::new(pcms, first_card)))
+                    {
                         warn!("failed to mknod /dev/snd/timer: {:?}", e);
                     }
                 }

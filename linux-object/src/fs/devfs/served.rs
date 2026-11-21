@@ -365,6 +365,11 @@ impl ServedOpen {
                 kernel_hal::user::UserOutPtr::<u8>::from(arg)
                     .write_array(&back)
                     .map_err(|_| LxError::EFAULT)?;
+                // ALSA's HW_PARAMS: the period the served card settled on,
+                // for its `/dev/snd/timer` ticks (`snd::note_served_hw_params`).
+                if cmd & 0xffff == 0x4111 {
+                    super::snd::note_served_hw_params(&self.node.name, &back);
+                }
             }
             return Ok(answer.count);
         }

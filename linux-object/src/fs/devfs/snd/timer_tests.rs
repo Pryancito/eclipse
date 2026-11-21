@@ -1011,7 +1011,7 @@ fn clock(running: bool, periods: u64) -> PeriodClock {
 fn alsa_lib_client() -> TimerState {
     let mut st = TimerState::new();
     st.tread = true;
-    st.select(0);
+    st.select(0, TimerSource::Kernel(0));
     st.resolution_ns = 25_000_000;
     let p = SndTimerParams {
         flags: TIMER_PSFLG_AUTO,
@@ -1089,7 +1089,7 @@ fn a_pointer_reset_or_a_stopped_stream_resynchronises_without_ticking_backwards(
 fn lifecycle_events_follow_the_filter_and_start_stop_answer_ebusy() {
     let mut st = TimerState::new();
     st.tread = true;
-    st.select(0);
+    st.select(0, TimerSource::Kernel(0));
     st.resolution_ns = 25_000_000;
     let p = SndTimerParams {
         flags: TIMER_PSFLG_AUTO,
@@ -1132,7 +1132,7 @@ fn lifecycle_events_follow_the_filter_and_start_stop_answer_ebusy() {
 fn one_shot_without_auto_ticks_once_then_stops() {
     let mut st = TimerState::new();
     st.tread = true;
-    st.select(0);
+    st.select(0, TimerSource::Kernel(0));
     let p = SndTimerParams {
         flags: 0,
         ticks: 1,
@@ -1153,7 +1153,7 @@ fn one_shot_without_auto_ticks_once_then_stops() {
 #[test]
 fn plain_reads_are_eight_byte_records_and_only_ticks() {
     let mut st = TimerState::new();
-    st.select(0);
+    st.select(0, TimerSource::Kernel(0));
     let p = SndTimerParams {
         flags: TIMER_PSFLG_AUTO,
         ticks: 1,
@@ -1199,7 +1199,7 @@ fn params_validates_like_linux_and_a_full_queue_counts_overruns() {
         ),
         Err(FsError::NoDevice)
     ));
-    st.select(0);
+    st.select(0, TimerSource::Kernel(0));
     assert!(matches!(
         st.params(
             &SndTimerParams {
@@ -1248,4 +1248,64 @@ fn params_validates_like_linux_and_a_full_queue_counts_overruns() {
     }
     assert_eq!(st.queue.len(), 32);
     assert!(st.overrun > 0);
+}
+
+/// The kernel's cards numbered from 1 (the served HD Audio card has 0):
+/// card 1 is `pcms[0]`, card 0 is the served one. Before, card N was
+/// `pcms[N]`, so the kernel's own card 1 answered ENODEV and card 0 read the
+/// HDMI's clock -- the `TIMER_SELECT -> ENODEV` pair of a real boot.
+#[test]
+fn a_card_number_is_not_an_index_into_the_kernels_cards() {
+    let served = |c: usize| c == 0;
+    assert_eq!(timer_source(1, 1, 1, served), Some(TimerSource::Kernel(0)));
+    assert_eq!(timer_source(0, 1, 1, served), Some(TimerSource::Served(0)));
+    assert_eq!(timer_source(2, 1, 1, served), None);
+    // HDMI that hears keeps card 0; udrv-hda takes card 1.
+    let served = |c: usize| c == 1;
+    assert_eq!(timer_source(0, 0, 1, served), Some(TimerSource::Kernel(0)));
+    assert_eq!(timer_source(1, 0, 1, served), Some(TimerSource::Served(1)));
+    assert_eq!(timer_source(5, 0, 1, served), None);
+    assert_eq!(timer_source(SERVED_TIMER_CARDS, 0, 0, |_| true), None);
+}
+
+#[test]
+fn a_served_card_ticks_once_a_period_once_started() {
+    let card = 3;
+    SERVED_PERIOD_NS[card].store(0, core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(served_clock(card, 0).resolution_ns, SERVED_TICK_DEFAULT_NS);
+
+    let mut p = vec![0u8; core::mem::size_of::<SndPcmHwParams>()];
+    let at = |par: usize| core::mem::offset_of!(SndPcmHwParams, intervals) + (par - 8) * 12;
+    p[at(PAR_PERIOD_SIZE)..at(PAR_PERIOD_SIZE) + 4].copy_from_slice(&3000u32.to_ne_bytes());
+    p[at(PAR_RATE)..at(PAR_RATE) + 4].copy_from_slice(&48000u32.to_ne_bytes());
+    assert_eq!(hw_params_period_ns(&p), Some(62_500_000));
+    note_served_hw_params("snd/pcmC3D0p", &p);
+    note_served_hw_params("snd/controlC3", &[0u8; 4]);
+    let period = 62_500_000u64;
+    assert_eq!(served_clock(card, 0).resolution_ns, period);
+
+    let mut st = TimerState::new();
+    st.select(card, TimerSource::Served(card));
+    let params = SndTimerParams {
+        flags: TIMER_PSFLG_AUTO,
+        ticks: 1,
+        queue_size: 0,
+        reserved0: 0,
+        filter: 1 << TIMER_EVENT_TICK,
+        reserved: [0; 60],
+    };
+    st.tread = true;
+    st.params(&params, ts(0)).unwrap();
+    let t0 = 10 * period + 1;
+    st.sample(served_clock(card, t0), ts(0));
+    st.start(TIMER_EVENT_START, ts(0)).unwrap();
+    st.sample(served_clock(card, t0), ts(0));
+    assert!(st.queue.is_empty(), "no tick before a period has passed");
+    st.sample(served_clock(card, t0 + period), ts(0));
+    assert_eq!(st.queue.len(), 1);
+    assert_eq!(st.queue[0].event, TIMER_EVENT_TICK);
+    assert_eq!(st.queue[0].val, 1);
+
+    assert_eq!(served_pcm_card("snd/pcmC9D0p"), None);
+    assert_eq!(served_pcm_card("snd/pcmC0D0p"), Some(0));
 }
