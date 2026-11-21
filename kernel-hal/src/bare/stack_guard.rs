@@ -234,11 +234,24 @@ pub fn paddr_aliases_stack(paddr: usize, len: usize) -> bool {
     STACK_FRAMES.aliases(paddr, len)
 }
 
-/// Live guard bands. Two per executor (bottom and top); the scheduler's own
-/// history shows a few dozen executors alive at once during a desktop session,
-/// so this is sized well past that. Exhausting it is not fatal — [`install`]
-/// refuses and that executor falls back to the soft canary.
-const MAX_GUARDS: usize = 1024;
+/// Live guard bands. Two per stack block, and a block keeps its bands while
+/// it is live, pooled, on the overflow list or retired. Exhausting it is not
+/// harmless: [`install`] refuses and that executor falls back to the soft
+/// canary, and a soft-guarded block cannot be pooled when it retires, so it
+/// is leaked -- a vmap slot and ~2.6 MiB of frames for good.
+///
+/// It was 1024, 512 blocks; a real desktop session had 441 stacks live, and
+/// the pool drains its excess only gradually, so a second burst crossed it.
+/// Sized for every slot of the vmap window plus as many heap blocks again as
+/// the pool, overflow list and retired table hold besides. 32 bytes a band.
+const MAX_GUARDS: usize = {
+    let blocks = crate::common::kaddr::VMAP_STACK_SLOTS as usize + 512;
+    if 2 * blocks > 1024 {
+        2 * blocks
+    } else {
+        1024
+    }
+};
 
 /// Registry of installed bands, with each band's original flags. Lock-free
 /// and allocation-free rather than a `Mutex<Vec<_>>` because
