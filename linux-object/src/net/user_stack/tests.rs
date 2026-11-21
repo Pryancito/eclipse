@@ -1191,7 +1191,8 @@ fn a_datagram_read_waits_as_long_as_so_rcvtimeo_says() {
     assert_eq!(Socket::so_sndtimeo(&s), tv);
     let mut wrong = tv;
     wrong[8..].copy_from_slice(&(-1i64).to_ne_bytes());
-    assert_eq!(Socket::setsockopt(&s, 1, 20, &wrong), Err(LxError::EINVAL));
+    // `sock_set_timeout`: a `tv_usec` out of range is `EDOM`.
+    assert_eq!(Socket::setsockopt(&s, 1, 20, &wrong), Err(LxError::EDOM));
     // What it keeps nowhere is answered as before.
     assert_eq!(Socket::setsockopt(&s, 1, 6, &1u32.to_ne_bytes()), Ok(0));
     assert_eq!(

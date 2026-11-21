@@ -1807,17 +1807,10 @@ impl StoredInetOpts {
                     return Some(Ok(0));
                 }
                 20 | 21 => {
-                    if data.len() < 16 {
-                        return Some(Err(LxError::EINVAL));
-                    }
-                    let mut tv = [0u8; 16];
-                    tv.copy_from_slice(&data[..16]);
-                    let usec = i64::from_ne_bytes([
-                        tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
-                    ]);
-                    if !(0..1_000_000).contains(&usec) {
-                        return Some(Err(LxError::EINVAL));
-                    }
+                    let tv = match sockopt_timeval(data) {
+                        Ok(tv) => tv,
+                        Err(e) => return Some(Err(e)),
+                    };
                     if opt == 20 {
                         self.rcv_timeo = tv;
                     } else {
@@ -1907,8 +1900,8 @@ pub(crate) fn setsockopt_unstored<S: Socket + ?Sized>(
 }
 
 /// The `struct timeval` a `SO_RCVTIMEO` or `SO_SNDTIMEO` is set to, as
-/// [`sockopt_deadline`] reads it. `tv_usec` must be in `0..1_000_000`
-/// (`sock_set_timeout`).
+/// [`sockopt_deadline`] reads it. `tv_usec` must be in `0..1_000_000`,
+/// and outside it `sock_set_timeout` answers `EDOM`, not `EINVAL`.
 pub(crate) fn sockopt_timeval(data: &[u8]) -> LxResult<[u8; 16]> {
     if data.len() < 16 {
         return Err(LxError::EINVAL);
@@ -1917,7 +1910,7 @@ pub(crate) fn sockopt_timeval(data: &[u8]) -> LxResult<[u8; 16]> {
     tv.copy_from_slice(&data[..16]);
     let usec = i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
     if !(0..1_000_000).contains(&usec) {
-        return Err(LxError::EINVAL);
+        return Err(LxError::EDOM);
     }
     Ok(tv)
 }
