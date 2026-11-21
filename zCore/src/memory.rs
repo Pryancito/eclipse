@@ -1492,6 +1492,13 @@ pub fn heap_total() -> usize {
     TOTAL_MEMORY.load(Ordering::Relaxed)
 }
 
+/// The heap's growth for the OOM report (mirrors
+/// `memory_x86_64::heap_grow_status`). This build's heap does not grow.
+#[allow(dead_code)]
+pub fn heap_grow_status() -> (usize, &'static str, usize, usize, usize) {
+    (0, "no elastic heap", 0, 0, 0)
+}
+
 /// Allocations refused by the heap re-entrancy guard (mirrors
 /// `memory_x86_64::heap_reentrancy_events`). This build has no such guard.
 #[allow(dead_code)]

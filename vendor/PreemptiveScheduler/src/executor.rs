@@ -4,7 +4,6 @@ use core::pin::Pin;
 use {
     alloc::boxed::Box,
     alloc::sync::Arc,
-    core::ptr::NonNull,
     core::task::{Context, Poll},
 };
 
@@ -458,10 +457,10 @@ pub fn sched_stats() -> (u64, u64, u64) {
 /// Idle stack blocks (pool + overflow list) that [`trim_idle_stacks`] saw on
 /// its previous call.
 static IDLE_AT_LAST_TRIM: AtomicUsize = AtomicUsize::new(0);
-/// Stack blocks [`trim_idle_stacks`] has given back to the heap, since boot.
+/// Stack blocks [`trim_idle_stacks`] has given back, since boot.
 static TRIMMED_STACKS: AtomicUsize = AtomicUsize::new(0);
 
-/// How many retained stack blocks have been given back to the heap.
+/// How many retained stack blocks have been given back to their allocator.
 pub fn trimmed_stacks() -> usize {
     TRIMMED_STACKS.load(Ordering::Relaxed)
 }
@@ -505,14 +504,8 @@ pub fn trim_idle_stacks(keep: usize) -> usize {
         // `set_stack_guard_hooks` requires before the heap sees the VA.
         remove(alloc_base, GUARD_SIZE);
         remove(alloc_base + GUARD_SIZE + STACK_SIZE, TOP_GUARD_SIZE);
-        // SAFETY: `alloc_base` came from `Global.allocate(ALLOC_LAYOUT)` in
-        // `Executor::new`, and the pool handed it to nobody else.
-        unsafe {
-            Global.deallocate(
-                core::ptr::NonNull::new_unchecked(alloc_base as *mut u8),
-                ALLOC_LAYOUT,
-            );
-        }
+        // The pool handed it to nobody else.
+        stack_block_free(alloc_base);
         freed += ALLOC_SIZE;
         TRIMMED_STACKS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1027,6 +1020,69 @@ pub fn hard_guard_executor_counts() -> (usize, usize) {
         HARD_GUARD_EXECUTORS.load(Relaxed),
         SOFT_GUARD_EXECUTORS.load(Relaxed),
     )
+}
+
+/// Where stack blocks come from, when not from the heap: `alloc(size)` hands
+/// out a page-aligned, mapped, read-write block or `None`; `free(base, size)`
+/// takes one back and answers `true`, or answers `false` for a block it did
+/// not hand out (one from the heap, made before the hooks or when `alloc`
+/// said no), which then goes back to the heap.
+type StackBlockAlloc = fn(size: usize) -> Option<usize>;
+type StackBlockFree = fn(base: usize, size: usize) -> bool;
+
+static STACK_BLOCK_HOOKS: spin::Mutex<Option<(StackBlockAlloc, StackBlockFree)>> =
+    spin::Mutex::new(None);
+
+/// Register where stack blocks come from. The kernel maps them from scattered
+/// frames (`kernel_hal::vmap_stack`), because a heap block is 4 MiB of
+/// physically contiguous memory, which a long-running machine runs out of
+/// while it still has gigabytes free.
+///
+/// # Safety
+/// `alloc` must hand out blocks nothing else owns, mapped read-write for
+/// `size` bytes; `free` must take back only blocks `alloc` handed out.
+pub unsafe fn set_stack_alloc_hooks(alloc: StackBlockAlloc, free: StackBlockFree) {
+    *STACK_BLOCK_HOOKS.lock() = Some((alloc, free));
+}
+
+/// A fresh stack block: from the registered allocator if it has one, from the
+/// heap otherwise. The kernel's OOM report runs if neither can.
+fn stack_block_alloc() -> usize {
+    // Copied out: an `if let` on `*lock()` would hold the lock through the
+    // allocation.
+    let hooks = *STACK_BLOCK_HOOKS.lock();
+    if let Some((alloc, _)) = hooks {
+        if let Some(base) = alloc(ALLOC_SIZE) {
+            return base;
+        }
+    }
+    // `handle_alloc_error`, not `expect`: the kernel's OOM report (heap
+    // figures, why growth was refused, the heaviest allocation sites) runs
+    // from the alloc error handler, and a bare panic here showed none of it
+    // on the photographed `Alloction Stack Failed` stops.
+    match Global.allocate(ALLOC_LAYOUT) {
+        Ok(block) => block.cast::<u8>().as_ptr() as usize,
+        Err(_) => alloc::alloc::handle_alloc_error(ALLOC_LAYOUT),
+    }
+}
+
+/// Give a stack block back to whichever allocator made it. Its guard bands
+/// must already be removed.
+fn stack_block_free(base: usize) {
+    let hooks = *STACK_BLOCK_HOOKS.lock();
+    if let Some((_, free)) = hooks {
+        if free(base, ALLOC_SIZE) {
+            return;
+        }
+    }
+    // SAFETY: not the hook's, so it came from `Global.allocate(ALLOC_LAYOUT)`
+    // in `stack_block_alloc`, and the caller owns it.
+    unsafe {
+        Global.deallocate(
+            core::ptr::NonNull::new_unchecked(base as *mut u8),
+            ALLOC_LAYOUT,
+        );
+    }
 }
 
 /// Register unmapped-guard hooks. Safe to call once at boot; later calls replace.
@@ -2005,13 +2061,7 @@ impl Executor {
         let pooled = stack_pool_pop();
         let alloc_base = match pooled {
             Some(base) => base,
-            None => {
-                let raw: NonNull<u8> = Global
-                    .allocate(ALLOC_LAYOUT)
-                    .expect("Alloction Stack Failed.")
-                    .cast();
-                raw.as_ptr() as usize
-            }
+            None => stack_block_alloc(),
         };
         debug_assert_eq!(alloc_base % PAGE_SIZE, 0);
         // Both registries, together, right here.
