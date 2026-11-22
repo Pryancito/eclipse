@@ -759,6 +759,10 @@ impl Syscall<'_> {
         let iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let total = iovs.total_len();
         let waits = self.waits_for_room(&file_like);
+        // A disk's node: written asleep, as in `sys_write`.
+        let disk = file_like
+            .downcast_ref::<linux_object::fs::File>()
+            .filter(|file| file.is_block_dev());
         let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
         while written < total {
@@ -778,7 +782,14 @@ impl Syscall<'_> {
                 }
                 return Err(LxError::EPERM);
             }
-            match file_like.write(&buf[..n]) {
+            let res = match disk {
+                Some(file) => match file.write_asleep(&buf[..n]).await {
+                    Some(res) => res,
+                    None => file_like.write(&buf[..n]),
+                },
+                None => file_like.write(&buf[..n]),
+            };
+            match res {
                 Ok(w) => {
                     written += w;
                     // A pipe that took part of a chunk has no room for the
@@ -846,7 +857,7 @@ impl Syscall<'_> {
     ///
     /// Gather-output twin of [`sys_preadv`](Self::sys_preadv); the file position
     /// is not changed.
-    pub fn sys_pwritev(
+    pub async fn sys_pwritev(
         &self,
         fd: FileDesc,
         iov_ptr: UserInPtr<IoVecIn>,
@@ -881,7 +892,14 @@ impl Syscall<'_> {
                 }
                 return Err(LxError::EPERM);
             }
-            match file_like.write_at(offset + written as u64, &buf[..n]) {
+            // A disk served by a process is written asleep: see
+            // `File::write_at_asleep`.
+            let at = offset + written as u64;
+            let asleep = match file_like.downcast_ref::<File>() {
+                Some(file) => file.write_at_asleep(at, &buf[..n]).await,
+                None => None,
+            };
+            match asleep.unwrap_or_else(|| file_like.write_at(at, &buf[..n])) {
                 Ok(w) => {
                     written += w;
                     if w < n {
@@ -948,7 +966,8 @@ impl Syscall<'_> {
         } else if offset == -1 {
             self.sys_writev(fd, iov_ptr, iov_count).await?
         } else {
-            self.sys_pwritev(fd, iov_ptr, iov_count, offset as u64)?
+            self.sys_pwritev(fd, iov_ptr, iov_count, offset as u64)
+                .await?
         };
         if flags & (RWF_DSYNC | RWF_SYNC) != 0 && written > 0 {
             let file = self.linux_process().get_file(fd)?;

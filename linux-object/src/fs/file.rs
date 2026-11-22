@@ -2022,6 +2022,14 @@ impl FileLike for File {
         if let Some(served) = inode.downcast_ref::<super::devfs::ServedOpen>() {
             return served.ioctl(request as u32, arg1);
         }
+        // A disk's too: `BLKRRPART` reads the partition table, from the
+        // driver's process when the disk is served, and a wait for it with
+        // this lock held is the hazard `block_serve` warns about. No disk
+        // ioctl looks at the file's flags or offset.
+        if inode.downcast_ref::<super::devfs::BlockDev>().is_some() {
+            inode.io_control(request as u32, arg1)?;
+            return Ok(0);
+        }
         let inner = self.inner.read();
         use super::devfs::PcmDev;
         if let Some(pcm) = inner.inode.downcast_ref::<PcmDev>() {

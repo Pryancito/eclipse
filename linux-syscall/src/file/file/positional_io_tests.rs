@@ -254,7 +254,9 @@ fn pwritev_leaves_the_offset_alone_and_writev_moves_it_by_the_total() {
                 an_iovec(&mut nothing),
                 an_iovec(&mut de),
             ];
-            let pwritev = sys.sys_pwritev(fd, UserInPtr::from(set.as_ptr() as usize), 3, 5);
+            let pwritev = sys
+                .sys_pwritev(fd, UserInPtr::from(set.as_ptr() as usize), 3, 5)
+                .await;
             assert_eq!(
                 pwritev,
                 Ok(5),
@@ -393,7 +395,8 @@ fn a_negative_offset_is_einval_in_every_one_of_the_four_positional_calls() {
                 "preadv took a negative offset"
             );
             assert_eq!(
-                sys.sys_pwritev(fd, UserInPtr::from(set.as_ptr() as usize), 1, minus_one),
+                sys.sys_pwritev(fd, UserInPtr::from(set.as_ptr() as usize), 1, minus_one)
+                    .await,
                 Err(LxError::EINVAL),
                 "pwritev took a negative offset"
             );
@@ -484,7 +487,8 @@ fn the_descriptor_is_judged_before_the_iovec_array() {
                 Err(LxError::EBADF)
             );
             assert_eq!(
-                sys.sys_pwritev(closed(), UserInPtr::from(0usize), 1, 0),
+                sys.sys_pwritev(closed(), UserInPtr::from(0usize), 1, 0)
+                    .await,
                 Err(LxError::EBADF)
             );
         })

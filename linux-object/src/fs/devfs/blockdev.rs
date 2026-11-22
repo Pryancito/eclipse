@@ -1949,13 +1949,24 @@ mod tests {
         let n = async_std::task::block_on(dev.write_at_partial_async(100, &buf).unwrap());
         assert_eq!(n.unwrap(), 1016);
         let after = disk.data.lock().clone();
-        assert_eq!(&after[..100], &before[..100], "the head's untouched bytes stay");
+        assert_eq!(
+            &after[..100],
+            &before[..100],
+            "the head's untouched bytes stay"
+        );
         assert_eq!(&after[100..1116], &buf[..]);
-        assert_eq!(&after[1116..], &before[1116..], "the tail's untouched bytes stay");
+        assert_eq!(
+            &after[1116..],
+            &before[1116..],
+            "the tail's untouched bytes stay"
+        );
         // Inside one sector.
         let n = async_std::task::block_on(dev.write_at_partial_async(2050, &[1, 2, 3]).unwrap());
         assert_eq!(n.unwrap(), 3);
-        assert_eq!(&disk.data.lock()[2049..2054], &[before[2049], 1, 2, 3, before[2053]]);
+        assert_eq!(
+            &disk.data.lock()[2049..2054],
+            &[before[2049], 1, 2, 3, before[2053]]
+        );
         // A disk with no asynchronous path keeps the synchronous one.
         let fake = BlockDev::new(0, FakeDisk::new(512, 8).into_scheme(), String::from("fake"));
         assert!(fake.write_at_partial_async(100, &buf).is_none());

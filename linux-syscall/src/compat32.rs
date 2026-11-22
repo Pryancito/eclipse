@@ -418,7 +418,7 @@ impl Syscall<'_> {
                 return syscall_ret(self.sys_get_robust_list32(a0 as i32, a1, a2));
             }
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
-            I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
+            I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4).await),
             _ => {}
         }
         match native_number(num) {
