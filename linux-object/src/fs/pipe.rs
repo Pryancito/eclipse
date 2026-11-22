@@ -61,6 +61,10 @@ pub struct PipeData {
     w_counter: u64,
     /// FIFO openers parked until the other side is opened.
     partner_waiters: Vec<Waker>,
+    /// Who the bytes in `buf` are charged to: their writers (`crate::kmem`).
+    /// A pipe can hold up to its capacity, which `F_SETPIPE_SZ` raises, and
+    /// a process can open as many pipes as it has descriptors.
+    charges: crate::kmem::ChargedBytes,
 }
 
 impl PipeData {
@@ -74,6 +78,7 @@ impl PipeData {
             r_counter: ends as u64,
             w_counter: ends as u64,
             partner_waiters: Vec::new(),
+            charges: crate::kmem::ChargedBytes::new(),
         };
         // An empty pipe has room: a writer subscribing for `WRITABLE` before
         // anything happened must not wait for a transition that never comes.
@@ -105,7 +110,9 @@ impl PipeData {
     /// changes: an empty queue is no longer readable, the freed room may make
     /// the write end ready.
     fn drain_front(&mut self, len: usize) {
+        let len = len.min(self.buf.len());
         self.buf.drain(..len);
+        self.charges.release(len);
         if self.buf.is_empty() {
             self.eventbus.clear(Event::READABLE);
         }
@@ -571,6 +578,10 @@ impl INode for Pipe {
                 }
                 min(room, buf.len())
             };
+            // Charged to the writer before it goes in: over its kernel
+            // memory quota, or into the heap's reserve, the write is
+            // `ENOMEM` and nothing is queued (`crate::kmem`).
+            data.charges.charge(take)?;
             // Copy-slice specialization (memcpy) instead of a per-byte
             // push_back loop.
             data.buf.extend(&buf[..take]);

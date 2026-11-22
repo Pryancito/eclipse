@@ -292,6 +292,7 @@ fn a_forked_child_sees_its_parent_hole() {
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             syscall_redirect: Default::default(),
+            kmem: crate::kmem::KmemAccount::with_limit(0),
             inner: Mutex::new(forked),
         }
     };

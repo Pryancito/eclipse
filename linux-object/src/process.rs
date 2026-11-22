@@ -658,6 +658,7 @@ impl NewChild for Process {
             syscall_redirect: syscall_redirect::RedirectSlot::forked(
                 &linux_parent.syscall_redirect,
             ),
+            kmem: linux_parent.kmem.forked(),
             inner: Mutex::new(linux_parent_inner.forked_child(
                 parent_pgid,
                 parent_sid,
@@ -1289,6 +1290,8 @@ pub struct LinuxProcess {
     /// Where this process's redirected syscalls go, if anywhere: see
     /// [`syscall_redirect`]. Outside `inner` because every syscall reads it.
     syscall_redirect: syscall_redirect::RedirectSlot,
+    /// Its kernel heap quota ([`crate::kmem`]), outside `inner` as hot.
+    kmem: Arc<crate::kmem::KmemAccount>,
 }
 
 /// Linux process mut inner data
@@ -1909,6 +1912,7 @@ impl LinuxProcess {
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             syscall_redirect: Default::default(),
+            kmem: crate::kmem::KmemAccount::with_limit(0),
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 start_ns: monotonic_now_ns(),

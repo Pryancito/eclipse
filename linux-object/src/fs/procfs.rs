@@ -40,6 +40,8 @@ mod hunter_net;
 mod hunter_proc;
 #[cfg(test)]
 mod hunter_proc_tests;
+/// `/proc/<pid>/kmem` and `kmem_limit`: its kernel memory quota.
+mod kmem;
 /// The addresses of `/proc/<pid>/stat` and the `[heap]` and `[stack]` of
 /// `maps`, in their own file for the size ratchet.
 mod layout;
@@ -934,7 +936,7 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 24] {
+    fn entries() -> [&'static str; 26] {
         [
             ".",
             "..",
@@ -960,6 +962,8 @@ impl ProcPidDirINode {
             "oom_score",
             "mounts",
             "mountinfo",
+            "kmem",
+            "kmem_limit",
         ]
     }
 }
@@ -1078,6 +1082,13 @@ impl INode for ProcPidDirINode {
             "auxv" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Auxv,
+            })),
+            "kmem" | "kmem_limit" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: match name {
+                    "kmem" => ProcPidFileKind::Kmem,
+                    _ => ProcPidFileKind::KmemLimit,
+                },
             })),
             "oom_score_adj" | "oom_adj" | "oom_score" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
@@ -2694,6 +2705,8 @@ enum ProcPidFileKind {
     OomScore,
     Mounts,
     MountInfo,
+    Kmem,
+    KmemLimit,
 }
 
 impl ProcPidFileKind {
@@ -2719,12 +2732,17 @@ impl ProcPidFileKind {
             Self::OomScore => 20,
             Self::Mounts => 21,
             Self::MountInfo => 22,
+            Self::Kmem => 23,
+            Self::KmemLimit => 24,
         }
     }
 
     /// `comm`, `oom_score_adj` and `oom_adj`, the files a write changes.
     fn writable(self) -> bool {
-        matches!(self, Self::Comm | Self::OomScoreAdj | Self::OomAdj)
+        matches!(
+            self,
+            Self::Comm | Self::OomScoreAdj | Self::OomAdj | Self::KmemLimit
+        )
     }
 
     /// `maps`, `environ` and `auxv`: `mm_access` guards their OPEN (and so
@@ -2828,6 +2846,8 @@ impl ProcPidFileINode {
             ProcPidFileKind::OomScoreAdj => oom::adj_text(&proc).into_bytes(),
             ProcPidFileKind::OomAdj => oom::legacy_text(&proc).into_bytes(),
             ProcPidFileKind::OomScore => oom::score_text(&proc).into_bytes(),
+            ProcPidFileKind::Kmem => kmem::text(&proc).into_bytes(),
+            ProcPidFileKind::KmemLimit => kmem::limit_text(&proc).into_bytes(),
             // One namespace: every process's is the machine's.
             ProcPidFileKind::Mounts => super::proc_mounts_content().into_bytes(),
             ProcPidFileKind::MountInfo => super::mountinfo::content(proc.try_linux()).into_bytes(),
@@ -2858,6 +2878,9 @@ impl INode for ProcPidFileINode {
             return Err(FsError::InvalidParam);
         }
         let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        if matches!(self.kind, ProcPidFileKind::KmemLimit) {
+            return kmem::write(&proc, buf);
+        }
         if !matches!(self.kind, ProcPidFileKind::Comm) {
             return oom::write(&proc, buf, matches!(self.kind, ProcPidFileKind::OomAdj));
         }

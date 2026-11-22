@@ -90,6 +90,7 @@ pub(super) fn a_process() -> LinuxProcess {
         itimers: Default::default(),
         aspace_lock: Mutex::new(()),
         syscall_redirect: Default::default(),
+        kmem: crate::kmem::KmemAccount::with_limit(0),
         inner: Mutex::new(LinuxProcessInner::default()),
     }
 }

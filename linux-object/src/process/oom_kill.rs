@@ -129,7 +129,12 @@ pub fn kill_worst(reason: &str) -> Option<Victim> {
     let rows = live.iter().map(|proc| {
         let vmar = proc.vmar();
         let stats = vmar.get_task_stats();
-        let held = stats.private_bytes() + stats.shared_bytes() + vmar.page_table_bytes() as u64;
+        // Plus what it has queued in the kernel's heap (`crate::kmem`): a
+        // process holding a gigabyte in unread socket buffers is the one to
+        // kill, though its own pages are few.
+        let kmem = proc.try_linux().map_or(0, |lp| lp.kmem().charged()) as u64;
+        let held =
+            stats.private_bytes() + stats.shared_bytes() + vmar.page_table_bytes() as u64 + kmem;
         Victim {
             pid: proc.id(),
             score: oom_badness(

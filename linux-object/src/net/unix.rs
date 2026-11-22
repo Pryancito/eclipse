@@ -115,6 +115,11 @@ struct UnixInner {
     peer: Option<Weak<Mutex<UnixInner>>>,
     /// Inbound data buffer
     buffer: VecDeque<u8>,
+    /// Who the bytes in `buffer` are charged to: the processes that wrote
+    /// them, as Linux charges queued bytes to their sender (`crate::kmem`).
+    /// Each end holds up to [`UNIX_STREAM_BUF_MAX`], and nothing else stops
+    /// one process from filling a few hundred of them.
+    charges: crate::kmem::ChargedBytes,
     /// Monotonic total bytes ever appended to `buffer` (for SCM_RIGHTS fd/byte
     /// stream synchronization).
     total_written: usize,
@@ -275,6 +280,7 @@ impl Default for UnixSocketState {
                 path: String::new(),
                 peer: None,
                 buffer: VecDeque::new(),
+                charges: crate::kmem::ChargedBytes::new(),
                 total_written: 0,
                 total_read: 0,
                 records: VecDeque::new(),
@@ -904,6 +910,7 @@ impl Socket for UnixSocketState {
                 }
                 let was_full = inner.send_space() == 0;
                 inner.buffer.drain(..len);
+                inner.charges.release(len);
                 inner.total_read += len;
                 if inner.buffer.is_empty() {
                     inner.eventbus.clear(Event::READABLE);
@@ -1087,6 +1094,10 @@ impl Socket for UnixSocketState {
             return Err(LxError::EAGAIN);
         }
         let n = data.len().min(space);
+        // Charged to the writer before anything is queued or stamped: over
+        // its kernel memory quota, or into the heap's reserve, the send is
+        // `ENOMEM` with nothing sent (`crate::kmem`).
+        pi.charges.charge(n)?;
         let n_offset = pi.total_written;
         // Stamp the writer's credentials onto this message before its bytes go
         // in, so `total_written` is still the index of its FIRST byte -- the

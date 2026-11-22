@@ -117,6 +117,18 @@ hal_fn_def! {
             (0, 0)
         }
 
+        /// `kernel_heap_usage`, with the used figure possibly behind by a
+        /// small batch per CPU: one load instead of a sum over every CPU.
+        pub fn kernel_heap_usage_approx() -> (usize, usize) {
+            (0, 0)
+        }
+
+        /// The most the kernel heap can reach from here, in bytes, `0` when
+        /// unknown. See `KernelHandler::kernel_heap_limit`.
+        pub fn kernel_heap_limit() -> usize {
+            0
+        }
+
         /// Live kernel-heap attribution by size class, rendered on demand.
         pub fn kernel_heap_report() -> alloc::string::String {
             alloc::string::String::new()

@@ -522,6 +522,14 @@ impl KernelHandler for ZcoreKernelHandler {
         (memory::heap_used(), memory::heap_total())
     }
 
+    fn kernel_heap_usage_approx(&self) -> (usize, usize) {
+        (memory::heap_used_approx(), memory::heap_total())
+    }
+
+    fn kernel_heap_limit(&self) -> usize {
+        memory::heap_limit()
+    }
+
     /// `/proc/kheap`: where the heap went, by size class, live right now —
     /// the same attribution the OOM handler prints, readable before the OOM.
     /// Read it twice a few minutes apart: the class that grew is the leak.

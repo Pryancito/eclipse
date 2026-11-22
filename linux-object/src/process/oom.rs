@@ -48,6 +48,13 @@ impl OomAdj {
 }
 
 impl LinuxProcess {
+    /// Its kernel memory account: what it has queued in the kernel's heap
+    /// and how much it may (`crate::kmem`). A fork's child gets a fresh one
+    /// with the parent's limit: what the parent queued stays the parent's.
+    pub fn kmem(&self) -> &Arc<crate::kmem::KmemAccount> {
+        &self.kmem
+    }
+
     /// Its OOM adjustment and the floor.
     pub fn oom_adj(&self) -> OomAdj {
         self.inner.lock().oom

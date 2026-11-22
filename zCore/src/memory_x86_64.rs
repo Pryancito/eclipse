@@ -538,6 +538,13 @@ pub fn heap_used() -> usize {
     HEAP_USED.get()
 }
 
+/// [`heap_used`] as one load: behind by less than the counter's batch per
+/// CPU. What a check on every queued byte reads (`linux_object::kmem`).
+#[allow(dead_code)]
+pub fn heap_used_approx() -> usize {
+    HEAP_USED.approx()
+}
+
 cfg_if! {
     if #[cfg(not(feature = "libos"))] {
         use buddy_system_allocator::Heap;
@@ -1430,6 +1437,23 @@ cfg_if! {
         /// arena: frames that are heap now, and counted as heap by [`stats`].
         pub fn heap_grown() -> usize {
             heap_total().saturating_sub(KERNEL_HEAP_SIZE)
+        }
+
+        /// The most the heap can reach from here: what it holds now, plus
+        /// the RAM a growth ahead of demand may still take (everything but
+        /// the quarter [`HEAP_LEAVE_FREE_PCT`] keeps for user pages), up to
+        /// [`HEAP_MAX_TOTAL`]. Never below what it holds.
+        ///
+        /// What the per-process kernel memory quota (`linux_object::kmem`)
+        /// measures against: the heap's size now says nothing on a machine
+        /// that has not needed to grow it yet. Allocates nothing.
+        pub fn heap_limit() -> usize {
+            let total = heap_total();
+            let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
+            let room = ram
+                .saturating_sub(FRAMES_USED.get())
+                .saturating_sub(ram / 100 * HEAP_LEAVE_FREE_PCT);
+            total.saturating_add(room).min(HEAP_MAX_TOTAL).max(total)
         }
 
         // ── Elastic heap ────────────────────────────────────────────────────
@@ -2802,6 +2826,11 @@ cfg_if! {
         pub fn init() {}
 
         pub fn heap_total() -> usize {
+            0
+        }
+
+        #[allow(dead_code)]
+        pub fn heap_limit() -> usize {
             0
         }
 
