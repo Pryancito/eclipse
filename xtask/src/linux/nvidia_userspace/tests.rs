@@ -197,14 +197,6 @@ fn the_plan_takes_this_versions_libraries_and_links_their_sonames() {
                 pool: "restricted/n/nvidia-graphics-drivers-580".into(),
                 prefix: "nvidia-utils-580_580.178.04-".into(),
             },
-            Deb::Release {
-                pool: "restricted/n/nvidia-graphics-drivers-580".into(),
-                prefix: "libnvidia-decode-580_580.178.04-".into(),
-            },
-            Deb::Release {
-                pool: "restricted/n/nvidia-graphics-drivers-580".into(),
-                prefix: "libnvidia-encode-580_580.178.04-".into(),
-            },
         ]
     );
     let takes: Vec<&Take> = plan.nvidia.iter().flat_map(|(_, t)| t).collect();
@@ -212,9 +204,6 @@ fn the_plan_takes_this_versions_libraries_and_links_their_sonames() {
         "usr/lib/x86_64-linux-gnu/libnvidia-ml.so.580.178.04",
         "usr/lib/x86_64-linux-gnu/libcuda.so.580.178.04",
         "usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.178.04",
-        "usr/lib/x86_64-linux-gnu/libnvcuvid.so.580.178.04",
-        "usr/lib/x86_64-linux-gnu/libnvidia-opticalflow.so.580.178.04",
-        "usr/lib/x86_64-linux-gnu/libnvidia-encode.so.580.178.04",
         "usr/bin/nvidia-smi",
     ] {
         assert!(takes.contains(&&same(path)), "{path}");
@@ -226,14 +215,6 @@ fn the_plan_takes_this_versions_libraries_and_links_their_sonames() {
         (
             "libnvidia-ptxjitcompiler.so.1",
             "libnvidia-ptxjitcompiler.so.580.178.04",
-        ),
-        ("libnvcuvid.so.1", "libnvcuvid.so.580.178.04"),
-        ("libnvcuvid.so", "libnvcuvid.so.1"),
-        ("libnvidia-encode.so.1", "libnvidia-encode.so.580.178.04"),
-        ("libnvidia-encode.so", "libnvidia-encode.so.1"),
-        (
-            "libnvidia-opticalflow.so.1",
-            "libnvidia-opticalflow.so.580.178.04",
         ),
     ] {
         let link = format!("usr/lib/x86_64-linux-gnu/{link}");

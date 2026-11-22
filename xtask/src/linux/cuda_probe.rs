@@ -23,9 +23,6 @@ pub(super) const INSTALL_OLLAMA_PATH: &str = "usr/bin/install-ollama-cuda";
 /// Wrapper that prefers `cuda_v*` when `cuda-status` is green.
 pub(super) const ECLIPSE_OLLAMA_PATH: &str = "usr/bin/eclipse-ollama";
 
-/// NVENC and NVDEC through NVIDIA's libraries (`tools/cuda-probe/nvcodec-probe.c`).
-pub(super) const NVCODEC_PATH: &str = "usr/bin/nvcodec-probe";
-
 /// Builds the probe and puts it in `rootfs`. Best-effort, like the rest of
 /// NVIDIA's userspace: a build machine that cannot make an x86_64 glibc
 /// program leaves the image without it.
@@ -43,29 +40,23 @@ pub(super) fn install(rootfs: &Path) {
         );
         return;
     }
-    install_program(rootfs, "cuda-probe", PATH, &["-ldl"]);
-    install_program(rootfs, "nvcodec-probe", NVCODEC_PATH, &["-ldl", "-lm"]);
-}
-
-/// `tools/cuda-probe/<name>.c` built with `cc` and put at `dest`.
-fn install_program(rootfs: &Path, name: &str, dest: &str, libs: &[&str]) {
     let dir = PROJECT_DIR.join("tools").join("cuda-probe");
-    let executable = dir.join(name);
+    let executable = dir.join("cuda-probe");
     let built = Command::new("cc")
         .args(["-O2", "-s", "-o"])
         .arg(&executable)
-        .arg(dir.join(format!("{name}.c")))
-        .args(libs)
+        .arg(dir.join("cuda-probe.c"))
+        .arg("-ldl")
         .status()
         .is_ok_and(|status| status.success());
     if !built {
-        eprintln!("warning: {name} not built (cc); not in the image");
+        eprintln!("warning: cuda-probe not built (cc); no CUDA probe in the image");
         return;
     }
-    let dst = rootfs.join(dest);
+    let dst = rootfs.join(PATH);
     let _ = fs::remove_file(&dst);
     if let Err(e) = fs::copy(&executable, &dst) {
-        eprintln!("warning: {name}: {}: {e}", dst.display());
+        eprintln!("warning: cuda-probe: {}: {e}", dst.display());
         return;
     }
     #[cfg(unix)]
