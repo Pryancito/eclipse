@@ -57,7 +57,7 @@ pub fn stats() -> (usize, usize) {
 pub fn owns(base: usize) -> bool {
     let a = base as u64;
     (VMAP_STACK_LO..VMAP_STACK_LO + VMAP_STACK_SLOT * VMAP_STACK_SLOTS).contains(&a)
-        && (a - VMAP_STACK_LO) % VMAP_STACK_SLOT == 0
+        && (a - VMAP_STACK_LO).is_multiple_of(VMAP_STACK_SLOT)
 }
 
 fn lock() -> spin::MutexGuard<'static, ()> {

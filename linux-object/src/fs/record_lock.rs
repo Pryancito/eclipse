@@ -6,12 +6,11 @@
 //! through this API and treat `ENOSYS` as either "no locking, race freely"
 //! or a hard error — both bad answers.
 //!
-//! One deliberate simplification, safe on this single-user system:
-//!
-//! * Locks are dropped when the owning **process dies** (a conflict scan
-//!   ignores and prunes entries whose owner pid no longer resolves), not on
-//!   the infamous POSIX "close of any fd to the file" trigger. Locks held by
-//!   a live process that closed the file linger until it exits.
+//! A process's locks on a file go when it closes ANY descriptor of that
+//! file (`close`, `close_range`, the descriptor a `dup2`/`dup3` replaces,
+//! and the close-on-exec ones an `execve` closes: [`release_file_owner`]),
+//! and all of them when it dies ([`release_owner`]; a conflict scan also
+//! prunes entries whose owner pid no longer resolves).
 //!
 //! Open-file-description locks (`F_OFD_*`) share the table, owned by the
 //! description (`ofd`) instead of the process: two descriptions of one file
