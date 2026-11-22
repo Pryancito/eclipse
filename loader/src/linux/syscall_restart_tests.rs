@@ -341,3 +341,37 @@ fn the_six_argument_registers_are_read_in_abi_order() {
     let ctx = a_call_with_distinct_registers();
     assert_eq!(syscall_args(&ctx), SIX);
 }
+
+const NANOSLEEP: usize = if cfg!(target_arch = "x86_64") { 35 } else { 101 };
+const RESTART_SYSCALL: usize = if cfg!(target_arch = "x86_64") {
+    219
+} else {
+    128
+};
+/// `nanosleep(&req, NULL)`.
+const SLEEP_ARGS: [usize; 6] = [0x7ff0_1000, 0, 0, 0, 0, 0];
+
+#[test]
+fn a_stop_finishes_a_relative_sleep_through_restart_syscall() {
+    // Ctrl-Z on `sleep 5` and `fg`: Linux goes on with what is left of the
+    // sleep (`restart_block`), not with the whole request and not EINTR.
+    // open_posix `clock_nanosleep/1-5` measured this.
+    let mut ctx = read_cut_short();
+    let mut slot = Interrupted::after(NANOSLEEP, &SLEEP_ARGS, eintr());
+    Interrupted::no_handler_ran(&mut slot);
+    Interrupted::leave(&mut slot, &mut ctx);
+    assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+    assert_eq!(syscall_num(&ctx), RESTART_SYSCALL);
+}
+
+#[test]
+fn a_handler_over_a_relative_sleep_leaves_it_eintr() {
+    let mut ctx = read_cut_short();
+    let mut slot = Interrupted::after(NANOSLEEP, &SLEEP_ARGS, eintr());
+    Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::RESTART), &mut ctx);
+    assert_eq!(
+        ctx.get_field(UserContextField::InstrPointer),
+        AT + Interrupted::SYSCALL_INSN_LEN
+    );
+    assert_eq!(slot, None);
+}
