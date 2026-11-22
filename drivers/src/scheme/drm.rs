@@ -511,6 +511,15 @@ pub trait DrmScheme: Scheme {
         alloc::vec::Vec::new()
     }
 
+    /// The panel's hardware frame counter, which advances once per real
+    /// vblank (`NV_PDISP_RG_DPCA_FRM_CNT` on NVIDIA, what Linux's
+    /// `get_vblank_counter` reads). `None` without one: page-flip events then
+    /// keep the synthetic vblank. Called from timer interrupts, so it takes
+    /// no lock and only reads a register.
+    fn hw_frame_count(&self) -> Option<u32> {
+        None
+    }
+
     /// The modes the panel's monitor can be set to, when this driver does
     /// real modesets (nvidia-modeset on the card it scans out). Empty: the
     /// panel keeps the one mode the firmware set.

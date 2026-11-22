@@ -452,6 +452,8 @@ pub(crate) struct EmuGpu {
     /// The modes this GPU can set the panel to, as nvkms lists them; empty
     /// for a driver that does no modesets.
     modes: Vec<DisplayMode>,
+    /// The hardware frame counter, `u32::MAX` for a GPU that has none.
+    frame: AtomicU32,
     calls: Mutex<GpuCalls>,
 }
 
@@ -478,6 +480,7 @@ impl EmuGpu {
             vram_objects: Vec::new(),
             sysmem_objects: Vec::new(),
             modes: Vec::new(),
+            frame: AtomicU32::new(u32::MAX),
             calls: Mutex::new(GpuCalls::default()),
         }
     }
@@ -670,6 +673,11 @@ impl DrmScheme for EmuGpu {
         self.modes.clone()
     }
 
+    fn hw_frame_count(&self) -> Option<u32> {
+        let f = self.frame.load(Ordering::Relaxed);
+        (f != u32::MAX).then_some(f)
+    }
+
     fn set_display_mode(
         &self,
         w: u32,
@@ -810,6 +818,12 @@ impl Gpu {
     /// DRIVER's ids, not the DRM core's.
     pub(crate) fn flips(&self) -> Vec<u32> {
         self.gpu.calls.lock().flips.clone()
+    }
+
+    /// Where the hardware frame counter stands, as if `n` vblanks had come;
+    /// a GPU never given one has none.
+    pub(crate) fn set_frame(&self, n: u32) {
+        self.gpu.frame.store(n, Ordering::Relaxed);
     }
 
     /// Every modeset the driver committed: (w, h, Hz, fb).

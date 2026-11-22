@@ -2344,6 +2344,8 @@ pub use card_fbs::PANEL_CARD;
 
 mod atomic_rollback;
 use atomic_rollback::restore_atomic_state;
+mod hw_vblank;
+use hw_vblank::complete_flip;
 mod panel_mode;
 pub use panel_mode::{driver_modes, needs_modeset, panel_mode, set_mode, ModeRefused};
 mod panel_state;
@@ -6083,6 +6085,12 @@ fn flip_in_flight_done() {
 
 fn deliver_pending_drm_timer() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
+    deliver_due_drm_timers();
+}
+
+/// The delivery itself, for [`hw_vblank::poll_soon`] too, which is not the
+/// armed timer and so leaves `DRM_TIMER_ARMED` alone.
+fn deliver_due_drm_timers() {
     // Everything scheduled for this vblank boundary completes together — the
     // queue holds at most one Flip (flush_pending_flip_completions drains any
     // outstanding one before accepting a new flip) plus any vblank waits.
@@ -6099,11 +6107,13 @@ fn deliver_pending_drm_timer() {
     // the one at fault.
     // One sample for the whole delivery: counter and time together.
     let (now_seq, now_time_ns) = vblank_seq_and_time_now();
+    let held = hw_vblank::flip_held();
     let jobs: Vec<PendingDrmTimer> = {
         let mut queue = PENDING_DRM_TIMERS.lock();
-        // Its vblank has come, wrap-safe; a flip's always has.
+        // Its vblank has come, wrap-safe; a flip's has unless the hardware
+        // counter says the real one has not ([`hw_vblank`]).
         let due_now = |job: &PendingDrmTimer| match job {
-            PendingDrmTimer::Flip { .. } => true,
+            PendingDrmTimer::Flip { .. } => !held,
             PendingDrmTimer::Vblank { due_seq, .. } | PendingDrmTimer::Sequence { due_seq, .. } => {
                 (due_seq.wrapping_sub(now_seq) as i32) <= 0
             }
@@ -6142,6 +6152,9 @@ fn deliver_pending_drm_timer() {
                 }
             }
         }
+    }
+    if held {
+        hw_vblank::poll_soon();
     }
     // Something scheduled while we delivered — arm one more shot.
     if !PENDING_DRM_TIMERS.lock().is_empty() {
@@ -6236,6 +6249,7 @@ fn schedule_flip_completion(
     // wlroots tears down the output on the very first few frames (real hardware,
     // where multi-core interleaving makes the race non-negligible).
     LAST_FLIP_PID.store(current_pid(), Ordering::Relaxed);
+    hw_vblank::note_flip();
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         // Inside the queue lock, for the same reason the latch store is: the
@@ -6251,34 +6265,6 @@ fn schedule_flip_completion(
         });
     }
     arm_coalesced_drm_timer_locked();
-}
-
-/// One flip's completion, `drm_send_event_helper`: the out-fence signals
-/// first, then the event goes on the fd when one was asked for and the fd is
-/// still open, and either way the flip leaves the in-flight population.
-fn complete_flip(
-    crtc_id: u32,
-    user_data: u64,
-    file: Weak<DrmFileState>,
-    event: bool,
-    out_fence: Option<u32>,
-) {
-    if let Some(handle) = out_fence {
-        // The syncobj is the sync_file's: closed already, there is nobody
-        // to tell.
-        let _ = zcore_drivers::scheme::syncobj::signal(handle);
-    }
-    match (event, file.upgrade()) {
-        (true, Some(file)) => queue_flip_event(&file, crtc_id, user_data),
-        // No event owed, or the drm_file closed before delivery: the event
-        // is dropped, and the flip leaves the in-flight population like any
-        // other. Clearing the latch alone here left the count one too high
-        // for good: from then on no delivery was ever the last one, the
-        // latch never cleared after a real flip, and the next PAGE_FLIP spun
-        // `settle_outstanding_flip` out into the EBUSY wlroots escalates
-        // into an output teardown.
-        _ => flip_in_flight_done(),
-    }
 }
 
 /// Deliver every queued page-flip completion to the card fd *now* instead of
