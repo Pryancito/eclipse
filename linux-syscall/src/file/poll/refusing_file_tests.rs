@@ -1,56 +1,21 @@
 //! A descriptor whose file will not say whether it is ready, and what
 //! `poll(2)` and `select(2)` answer then.
 //!
-//! Both waits ask every watched file for its readiness once per pass, and
-//! both keep one slot for the first file that answers with an error instead
-//! of a readiness word:
+//! In Linux `->poll` returns a mask and has no error to give, so a device
+//! that cannot answer reports `EPOLLERR` and the wait goes on: `poll` puts
+//! `POLLERR` in that entry's `revents` (whether or not it was asked for) and
+//! counts it, and `select` reports the descriptor ready for reading and
+//! writing (`POLLIN_SET` and `POLLOUT_SET` both hold `EPOLLERR`). Here the
+//! whole call used to fail with the file's errno, which a caller with a
+//! terminal and a broken device in one set could never get past.
 //!
-//! ```text
-//!     let status = match file_like.poll(..) {
-//!         Ok(ret) => ret,
-//!         Err(err) => { early_err = Some(err); break; }
-//!     };
-//!     ...
-//!     if let Some(err) = early_err { return Poll::Ready(Err(err)); }
-//! ```
+//! So what is asked below:
 //!
-//! That slot, the `break` that fills it and the check that reads it were 19
-//! of the lines this file still had at zero -- the largest single piece of
-//! `poll.rs` left after its blocking path was covered -- and the reason is
-//! that nothing a test could put in a descriptor table refuses to answer:
-//! ramfs is ready both ways, a pipe answers for its buffer, a terminal for
-//! its queue. Real descriptors do refuse: a character device whose hardware
-//! answered nothing (`EIO`), or one whose driver was torn down from under it
-//! (`ENODEV`).
-//!
-//! Three things are decided in those lines and none of them had ever been
-//! asked for:
-//!
-//! - **Whose error the caller gets.** It is the file's own, passed through,
-//!   and not an errno of the wait's choosing. A caller handed `EIO` knows to
-//!   drop that descriptor; one handed `EINVAL` or `ENOSYS` learns nothing.
-//! - **That the scan stops there.** The `break` means the files after the
-//!   refusing one are not asked at all, so the answer is the FIRST refusal's
-//!   and a later, different one is never seen.
-//! - **That the error beats a result.** `early_err` is checked BEFORE
-//!   `events > 0`, so a set holding both a ready descriptor and a refusing
-//!   one answers with the error and not with the count. Swap those two
-//!   checks and the error is swallowed for as long as anything else in the
-//!   set is ready -- which, for a set holding a terminal, is for ever.
-//!
-//! `select` has a fourth, and it is the one with a bug on record: its error
-//! path does not commit the ready bitmaps, so the caller's `fd_set`s come
-//! back as they were handed in. `FdSet::new` carries the note of what went
-//! wrong when a failing select did clear them -- the usual `while
-//! (select(...) < 0 && errno == EINTR) continue;` loop re-entered on an
-//! emptied set and waited for an event it could no longer ask about. The
-//! signal half of that bug has a test; this half had none, and it is the
-//! half where the caller cannot even retry, because the error is the
-//! descriptor's and not the wait's.
-//!
-//! None of these calls reaches a park: the refusal is found on the future's
-//! first pass. So the only claim made here about time is a lower bound -- a
-//! call that came back well inside its deadline did not wait for it.
+//! - the call succeeds and the refusing descriptor is reported as an error;
+//! - the scan does not stop there: every file is asked, and the ready ones
+//!   are reported beside it;
+//! - none of these calls waits out its timeout, because an error is an
+//!   event.
 //!
 //! Fixed pids live in 49_32x.
 
@@ -69,6 +34,8 @@ use zircon_object::task::{Process, ROOT_JOB};
 
 /// `POLLIN`, what a reader asks for.
 const POLLIN: u16 = 0x0001;
+/// `POLLERR`, which `revents` carries whether or not it was asked for.
+const POLLERR: u16 = 0x0008;
 
 /// A timeout no call here waits out: each one must come back on the future's
 /// first pass, so a refusal that was swallowed would show up as a run that
@@ -298,202 +265,87 @@ async fn select_them(
 }
 
 #[test]
-fn a_poll_whose_file_will_not_say_if_it_is_ready_hands_the_files_error_to_the_caller() {
-    let device = Refusing::new(Fault::Hardware);
-    let held: Arc<dyn rcore_fs::vfs::INode> = device.clone();
-    let (proc, fds) = a_process_holding(49_320, "poll-refused", &[held]);
-    let fd = fds[0] as i32;
-    let (got, took) = on_a_thread(&proc, move |sys| {
+fn a_poll_whose_file_will_not_say_if_it_is_ready_reports_pollerr_for_it() {
+    for (pid, fault) in [(49_320, Fault::Hardware), (49_321, Fault::Gone)] {
+        let device = Refusing::new(fault);
+        let held: Arc<dyn rcore_fs::vfs::INode> = device.clone();
+        let (proc, fds) = a_process_holding(pid, "poll-refused", &[held]);
+        let fd = fds[0] as i32;
+        let (got, revents, took) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let mut set = [an_entry(fd, POLLIN)];
+                let begin = mono_now();
+                let got = poll_them(sys, &mut set, A_CEILING).await;
+                (got, set[0].revents.bits(), mono_now().saturating_sub(begin))
+            })
+        });
+        assert_eq!(
+            got,
+            Ok(1),
+            "the refusing entry is counted, not the call failed"
+        );
+        assert_eq!(revents, POLLERR);
+        assert_eq!(device.asked(), 1, "asked once, on the future's first pass");
+        assert!(
+            took < WELL_INSIDE_IT,
+            "an error is an event, took {:?}",
+            took
+        );
+    }
+}
+
+#[test]
+fn a_poll_asks_every_file_and_reports_the_ready_ones_beside_the_refusing_one() {
+    let ready: Arc<dyn rcore_fs::vfs::INode> = Arc::new(Willing);
+    let first = Refusing::new(Fault::Hardware);
+    let second = Refusing::new(Fault::Gone);
+    let held: [Arc<dyn rcore_fs::vfs::INode>; 3] = [first.clone(), ready, second.clone()];
+    let (proc, fds) = a_process_holding(49_322, "poll-all", &held);
+    let (a, good, b) = (fds[0] as i32, fds[1] as i32, fds[2] as i32);
+    let (got, revents) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let mut set = [an_entry(fd, POLLIN)];
-            let begin = mono_now();
+            let mut set = [
+                an_entry(a, POLLIN),
+                an_entry(good, POLLIN),
+                an_entry(b, POLLIN),
+            ];
             let got = poll_them(sys, &mut set, A_CEILING).await;
-            (got, mono_now().saturating_sub(begin))
+            (
+                got,
+                [
+                    set[0].revents.bits(),
+                    set[1].revents.bits(),
+                    set[2].revents.bits(),
+                ],
+            )
         })
     });
-    assert_eq!(
-        got,
-        Err(LxError::EIO),
-        "the device's own error reaches the caller"
-    );
-    assert_eq!(device.asked(), 1, "asked once, on the future's first pass");
-    assert!(
-        took < WELL_INSIDE_IT,
-        "a poll whose file refuses must not wait out its timeout, took {:?}",
-        took
-    );
+    assert_eq!(got, Ok(3));
+    assert_eq!(revents[0], POLLERR);
+    assert_eq!(revents[1] & POLLIN, POLLIN, "the ready one is reported too");
+    assert_eq!(revents[2], POLLERR);
+    assert_eq!((first.asked(), second.asked()), (1, 1), "the scan goes on");
 }
 
 #[test]
-fn a_poll_hands_back_the_error_the_file_gave_and_not_an_errno_of_its_own() {
-    let device = Refusing::new(Fault::Gone);
-    let held: Arc<dyn rcore_fs::vfs::INode> = device.clone();
-    let (proc, fds) = a_process_holding(49_321, "poll-gone", &[held]);
-    let fd = fds[0] as i32;
-    let got = on_a_thread(&proc, move |sys| {
-        Box::pin(async move {
-            let mut set = [an_entry(fd, POLLIN)];
-            poll_them(sys, &mut set, A_CEILING).await
-        })
-    });
-    // The other refusing device in this module answers `EIO`; this one is a
-    // driver that went away, and the caller has to be able to tell them
-    // apart or it cannot know whether retrying is worth anything.
-    assert_eq!(got, Err(LxError::ENODEV), "a device that is gone, verbatim");
-    assert_eq!(device.asked(), 1);
-}
-
-#[test]
-fn a_poll_stops_at_the_first_file_that_refuses_and_never_asks_the_rest() {
+fn a_select_reports_a_refusing_file_ready_and_goes_on_with_the_set() {
+    let ready: Arc<dyn rcore_fs::vfs::INode> = Arc::new(Willing);
     let first = Refusing::new(Fault::Hardware);
     let second = Refusing::new(Fault::Gone);
-    let held: [Arc<dyn rcore_fs::vfs::INode>; 2] = [first.clone(), second.clone()];
-    let (proc, fds) = a_process_holding(49_322, "poll-break", &held);
-    let (a, b) = (fds[0] as i32, fds[1] as i32);
-    assert!(a < b, "the first inode must hold the lower descriptor");
-    let got = on_a_thread(&proc, move |sys| {
+    let held: [Arc<dyn rcore_fs::vfs::INode>; 3] = [first.clone(), ready, second.clone()];
+    let (proc, fds) = a_process_holding(49_324, "select-refused", &held);
+    let (a, good, b) = (fds[0], fds[1], fds[2]);
+    let nfds = b + 1;
+    let (got, read, took) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let mut set = [an_entry(a, POLLIN), an_entry(b, POLLIN)];
-            poll_them(sys, &mut set, A_CEILING).await
-        })
-    });
-    assert_eq!(
-        got,
-        Err(LxError::EIO),
-        "the first refusal's error, not the second's"
-    );
-    assert_eq!(first.asked(), 1);
-    assert_eq!(
-        second.asked(),
-        0,
-        "the scan breaks at the first refusal instead of asking on"
-    );
-}
-
-#[test]
-fn a_file_that_refuses_beats_the_descriptors_that_were_already_ready() {
-    let ready: Arc<dyn rcore_fs::vfs::INode> = Arc::new(Willing);
-    let device = Refusing::new(Fault::Hardware);
-    let refusing: Arc<dyn rcore_fs::vfs::INode> = device.clone();
-    let (proc, fds) = a_process_holding(49_323, "poll-beats", &[ready, refusing]);
-    let (good, bad) = (fds[0] as i32, fds[1] as i32);
-    assert!(good < bad, "the ready descriptor must be scanned first");
-    let (alone, together) = on_a_thread(&proc, move |sys| {
-        Box::pin(async move {
-            // The control: the ready descriptor on its own, so a failing
-            // assertion below cannot be a ready device that was never ready.
-            let mut one = [an_entry(good, POLLIN)];
-            let alone = poll_them(sys, &mut one, A_CEILING).await;
-            let mut both = [an_entry(good, POLLIN), an_entry(bad, POLLIN)];
-            let together = poll_them(sys, &mut both, A_CEILING).await;
-            (alone, together)
-        })
-    });
-    assert_eq!(alone, Ok(1), "the willing device really does report ready");
-    assert_eq!(
-        together,
-        Err(LxError::EIO),
-        "the error is answered even though one descriptor had an event"
-    );
-}
-
-#[test]
-fn a_select_whose_file_will_not_say_if_it_is_ready_hands_the_files_error_to_the_caller() {
-    let device = Refusing::new(Fault::Hardware);
-    let held: Arc<dyn rcore_fs::vfs::INode> = device.clone();
-    let (proc, fds) = a_process_holding(49_324, "select-refused", &[held]);
-    let fd = fds[0];
-    let nfds = fd + 1;
-    let (got, took) = on_a_thread(&proc, move |sys| {
-        Box::pin(async move {
-            let mut read = a_set(nfds, &[fd]);
+            let mut read = a_set(nfds, &[a, good, b]);
             let begin = mono_now();
             let got = select_them(sys, nfds, &mut read, A_CEILING).await;
-            (got, mono_now().saturating_sub(begin))
+            (got, read, mono_now().saturating_sub(begin))
         })
     });
-    assert_eq!(
-        got,
-        Err(LxError::EIO),
-        "the device's own error reaches the caller"
-    );
-    assert_eq!(device.asked(), 1, "asked once, on the future's first pass");
-    assert!(
-        took < WELL_INSIDE_IT,
-        "a select whose file refuses must not wait out its timeout, took {:?}",
-        took
-    );
-}
-
-#[test]
-fn a_select_that_fails_leaves_the_callers_set_exactly_as_it_was() {
-    let ready: Arc<dyn rcore_fs::vfs::INode> = Arc::new(Willing);
-    let device = Refusing::new(Fault::Hardware);
-    let refusing: Arc<dyn rcore_fs::vfs::INode> = device.clone();
-    let (proc, fds) = a_process_holding(49_325, "select-set", &[ready, refusing]);
-    let (good, bad) = (fds[0], fds[1]);
-    assert!(good < bad, "the ready descriptor must be scanned first");
-    let nfds = bad + 1;
-    let (narrowed, narrowed_set, got, asked_for, handed_back) = on_a_thread(&proc, move |sys| {
-        Box::pin(async move {
-            // The control: a select that succeeds DOES rewrite the set,
-            // down to the descriptors that are ready. Without this, the
-            // assertion below would also pass if `commit` never wrote
-            // anything at all.
-            let mut only_good = a_set(nfds, &[good]);
-            let before = only_good.clone();
-            let narrowed = select_them(sys, nfds, &mut only_good, A_CEILING).await;
-            let asked_for = a_set(nfds, &[good, bad]);
-            let mut read = asked_for.clone();
-            let got = select_them(sys, nfds, &mut read, A_CEILING).await;
-            (narrowed, (before, only_good), got, asked_for, read)
-        })
-    });
-    assert_eq!(
-        narrowed,
-        Ok(1),
-        "the willing device really does report ready"
-    );
-    assert_eq!(
-        narrowed_set.1, narrowed_set.0,
-        "a select that found that one descriptor hands back the bit it found"
-    );
-    assert_eq!(
-        got,
-        Err(LxError::EIO),
-        "the error is answered even though one descriptor was ready"
-    );
-    assert_eq!(
-        handed_back, asked_for,
-        "a select that failed must hand the set back untouched, or the \
-         caller's retry loop re-enters on a set with nothing in it"
-    );
-}
-
-#[test]
-fn a_select_stops_at_the_first_file_that_refuses_and_never_asks_the_rest() {
-    let first = Refusing::new(Fault::Hardware);
-    let second = Refusing::new(Fault::Gone);
-    let held: [Arc<dyn rcore_fs::vfs::INode>; 2] = [first.clone(), second.clone()];
-    let (proc, fds) = a_process_holding(49_326, "select-break", &held);
-    let (a, b) = (fds[0], fds[1]);
-    assert!(a < b, "select scans its set in ascending descriptor order");
-    let nfds = b + 1;
-    let got = on_a_thread(&proc, move |sys| {
-        Box::pin(async move {
-            let mut read = a_set(nfds, &[a, b]);
-            select_them(sys, nfds, &mut read, A_CEILING).await
-        })
-    });
-    assert_eq!(
-        got,
-        Err(LxError::EIO),
-        "the first refusal's error, not the second's"
-    );
-    assert_eq!(first.asked(), 1);
-    assert_eq!(
-        second.asked(),
-        0,
-        "the scan breaks at the first refusal instead of asking on"
-    );
+    assert_eq!(got, Ok(3), "EPOLLERR is in POLLIN_SET");
+    assert_eq!(read, a_set(nfds, &[a, good, b]));
+    assert_eq!((first.asked(), second.asked()), (1, 1));
+    assert!(took < WELL_INSIDE_IT, "took {:?}", took);
 }

@@ -151,6 +151,7 @@ fn somebody_else_holds(key: record_lock::FileKey, owner: KoID, exclusive: bool, 
         start: range.0,
         end: range.1,
         owner,
+        ofd: false,
     };
     assert!(
         record_lock::setlk(key, &req, false),
@@ -170,6 +171,7 @@ fn somebody_else_could_take(key: record_lock::FileKey, owner: KoID, range: (u64,
             start: range.0,
             end: range.1,
             owner,
+            ofd: false,
         },
     )
     .is_none()
@@ -566,4 +568,82 @@ fn the_type_the_range_the_descriptor_and_the_pointer_each_refuse_in_their_own_wa
             );
         })
     });
+}
+
+#[test]
+fn a_lock_needs_the_mode_it_names_and_an_ofd_lock_belongs_to_its_description() {
+    // `check_fmode_for_setlk`: a write lock on a read-only descriptor is
+    // `EBADF` (a probe asks nothing of the mode). And an `F_OFD_*` lock is
+    // owned by the open file description: two of them conflict inside one
+    // process, `F_OFD_GETLK` reports `l_pid` -1, `l_pid` must be 0 on the way
+    // in, and the last close of the description lets the lock go.
+    let proc = a_process(48_219, "ofd");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            let ro: i32 = lp
+                .add_file(File::new(
+                    Arc::new(Keyed {
+                        dev: 48_219,
+                        size: THE_SIZE,
+                    }),
+                    OpenFlags::RDONLY,
+                    String::from("/keyed"),
+                ))
+                .unwrap()
+                .into();
+            let ro = FileDesc::from(ro);
+            let wr = a_lock(F_WRLCK, SEEK_SET, 0, 10);
+            let rd = a_lock(F_RDLCK, SEEK_SET, 0, 10);
+            let at = |fl: &Flock| fl as *const Flock as usize;
+            assert_eq!(
+                sys.sys_fcntl(ro, F_SETLK, at(&wr)).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(sys.sys_fcntl(ro, F_SETLK, at(&rd)).await, Ok(0));
+            let mut probe = a_lock(F_WRLCK, SEEK_SET, 0, 10);
+            assert_eq!(sys.sys_fcntl(ro, F_GETLK, at(&probe)).await, Ok(0));
+            let unlock = a_lock(F_UNLCK, SEEK_SET, 0, 0);
+            assert_eq!(sys.sys_fcntl(ro, F_SETLK, at(&unlock)).await, Ok(0));
+
+            let (a, _) = Keyed::open(&lp, 48_219, THE_SIZE);
+            let (b, _) = Keyed::open(&lp, 48_219, THE_SIZE);
+            let (a, b) = (FileDesc::from(a as i32), FileDesc::from(b as i32));
+            assert_eq!(sys.sys_fcntl(a, F_OFD_SETLK, at(&wr)).await, Ok(0));
+            assert_eq!(
+                sys.sys_fcntl(b, F_OFD_SETLK, at(&wr)).await,
+                Err(LxError::EAGAIN),
+                "two descriptions of one file conflict in one process"
+            );
+            assert_eq!(
+                sys.sys_fcntl(a, F_OFD_SETLK, at(&wr)).await,
+                Ok(0),
+                "the description that holds it takes it again"
+            );
+            // The probe above came back `F_UNLCK`; a fresh one asks again.
+            probe = a_lock(F_WRLCK, SEEK_SET, 0, 10);
+            assert_eq!(sys.sys_fcntl(b, F_OFD_GETLK, at(&probe)).await, Ok(0));
+            probe = as_written(&probe);
+            assert_eq!(probe.l_type, F_WRLCK);
+            assert_eq!(probe.l_pid, -1, "an OFD lock has no pid");
+            let mut with_pid = a_lock(F_WRLCK, SEEK_SET, 0, 10);
+            with_pid.l_pid = 5;
+            assert_eq!(
+                sys.sys_fcntl(b, F_OFD_SETLK, at(&with_pid)).await,
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(sys.sys_close(a), Ok(0));
+            assert_eq!(
+                sys.sys_fcntl(b, F_OFD_SETLK, at(&wr)).await,
+                Ok(0),
+                "the last close of the description released its lock"
+            );
+        })
+    });
+}
+
+/// The kernel wrote into `fl` through a pointer the compiler did not see;
+/// read it back by value so the asserts look at what is there now.
+fn as_written(fl: &Flock) -> Flock {
+    core::hint::black_box(*fl)
 }

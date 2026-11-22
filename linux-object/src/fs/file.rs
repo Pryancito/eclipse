@@ -295,6 +295,7 @@ impl Drop for File {
     /// holding the file.
     fn drop(&mut self) {
         crate::fs::flock::release_owner(self as *const File as usize);
+        crate::fs::record_lock::release_description(self as *const File as usize);
     }
 }
 

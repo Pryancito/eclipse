@@ -5,9 +5,9 @@
 //! tests of their own. What none of them can see is the **wiring**, which
 //! is where the `chown` holes were:
 //!
-//! - `sendfile` is nothing but a call to `copy_file_range` with its
-//!   arguments moved around, and its whole contract is **which** of them
-//!   goes where: the offset it is given belongs to the **input**, and the
+//! - `sendfile` judges its arguments in its own order and then shares the
+//!   copy with `copy_file_range`, and its whole contract is **which** of
+//!   them goes where: the offset it is given belongs to the **input**, and the
 //!   output is written at its own cursor. Swap the two descriptors and a
 //!   web server writes its page back over the file it was serving.
 //! - an explicit offset means "do not touch the cursor, tell me where you
@@ -18,9 +18,10 @@
 //!   each by its own call, and the two errnos are different (`EINVAL` for a
 //!   negative position, `EOVERFLOW` for one that wraps) -- so a missing
 //!   check on one end is invisible from the other.
-//! - the output does not have to be a `File`. That is `sendfile`'s reason
+//! - `sendfile`'s output does not have to be a `File`. That is its reason
 //!   to exist, and asking `get_file` instead of `get_file_like` answered
-//!   `EBADF` to every socket.
+//!   `EBADF` to every socket. `copy_file_range` is the opposite: since
+//!   Linux 5.3 it takes two regular files and nothing else (`EINVAL`).
 
 use super::*;
 use crate::on_a_thread::on_a_thread;
@@ -101,8 +102,8 @@ fn no_offset() -> UserInOutPtr<u64> {
 
 #[test]
 fn sendfile_gives_the_offset_to_the_input_and_the_cursor_to_the_output() {
-    // All of `sendfile` is this: `copy_file_range(in, offset, out, NULL,
-    // count, 0)`. So the test has to be able to tell each of those four
+    // The copy of `sendfile` is `copy_file_range(in, offset, out, NULL,
+    // count, 0)`'s. So the test has to be able to tell each of those four
     // places apart from the others, and it is built so that it can:
     //
     // - the two files hold different bytes, so writing the wrong way round
@@ -244,12 +245,12 @@ fn a_null_offset_walks_the_cursor_on_both_ends() {
 }
 
 #[test]
-fn a_flag_this_kernel_does_not_define_is_einval_before_the_descriptors_are_looked_at() {
+fn a_flag_this_kernel_does_not_define_is_einval_once_the_descriptors_are_found() {
     // `copy_file_range(2)` defines no flags yet and Linux reserves the
     // word, so the day one means something a program can tell a kernel
-    // that honoured it from a kernel that dropped it. Asked against the
-    // same call with a flag of zero, which gets as far as the descriptors,
-    // so the `EINVAL` is the word and not the call.
+    // that honoured it from a kernel that dropped it. The syscall looks
+    // both descriptors up and copies the offsets in before it reads the
+    // word: closed descriptors are `EBADF` whatever the flags say.
     let proc = a_process(45_803, "copy-flag", "copy_flag");
     let dir_path = String::from("/copy_flag");
     on_a_thread(&proc, move |sys| {
@@ -268,8 +269,8 @@ fn a_flag_this_kernel_does_not_define_is_einval_before_the_descriptors_are_looke
                     1,
                 )
                 .await,
-                Err(LxError::EINVAL),
-                "the flag word was read after the descriptors"
+                Err(LxError::EBADF),
+                "the descriptors are looked up before the flag word"
             );
             assert_eq!(
                 sys.sys_copy_file_range(
@@ -433,12 +434,12 @@ fn a_window_that_walks_past_off_t_is_eoverflow_and_copying_everything_from_zero_
 }
 
 #[test]
-fn the_offsets_are_judged_before_a_descriptor_opened_the_wrong_way_round() {
+fn a_descriptor_opened_the_wrong_way_round_is_judged_before_the_offsets() {
     // Both answers are about arguments the caller passed, so which one it
-    // gets is an order, and the order is the one `copy_file_range` has:
-    // the window first, the access mode of the descriptions after. The
-    // same pair gives both answers here, so nothing but the offset can
-    // account for the difference.
+    // gets is an order, and the order is `vfs_copy_file_range`'s:
+    // `generic_copy_file_checks` (the access modes) before
+    // `rw_verify_area` (the window). A pair that is fine both ways gets
+    // the window's answer, so the order is what tells them apart.
     let proc = a_process(45_806, "copy-order", "copy_order");
     let dir_path = String::from("/copy_order");
     on_a_thread(&proc, move |sys| {
@@ -474,8 +475,23 @@ fn the_offsets_are_judged_before_a_descriptor_opened_the_wrong_way_round() {
                     0,
                 )
                 .await,
+                Err(LxError::EBADF),
+                "the access mode is judged before the window"
+            );
+            let dst = a_file_with(&lp, &dir_path, "dst", &[], OpenFlags::RDWR);
+            let mut bad = A_NEGATIVE_OFFSET;
+            assert_eq!(
+                sys.sys_copy_file_range(
+                    FileDesc::from(src),
+                    at(&mut bad),
+                    FileDesc::from(dst),
+                    no_offset(),
+                    4,
+                    0,
+                )
+                .await,
                 Err(LxError::EINVAL),
-                "the access mode was judged before the window"
+                "with the modes right, the window answers"
             );
         })
     });
@@ -538,4 +554,66 @@ fn an_output_that_is_not_a_file_is_the_whole_point_of_sendfile() {
             );
         })
     });
+}
+
+#[test]
+fn copy_file_range_takes_two_regular_files_and_sendfile_refuses_an_append_output() {
+    // `generic_file_rw_checks`: a directory is `EISDIR`, anything else that
+    // is not a regular file (here an eventfd) `EINVAL`, an `O_APPEND`
+    // output `EBADF`. `sendfile` takes the eventfd but refuses `O_APPEND`
+    // with `EINVAL` (`do_splice_direct`), after its offset was copied in.
+    let proc = a_process(45_808, "copy-kinds", "copy_kinds");
+    let dir_path = String::from("/copy_kinds");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            let src = FileDesc::from(a_file_with(
+                &lp,
+                &dir_path,
+                "src",
+                TEN_DIGITS,
+                OpenFlags::RDWR,
+            ));
+            let app = FileDesc::from(a_file_with(
+                &lp,
+                &dir_path,
+                "app",
+                &[],
+                OpenFlags::RDWR | OpenFlags::APPEND,
+            ));
+            let evt = FileDesc::from(sys.sys_eventfd2(0, 0).unwrap());
+            let dir = c_dir(sys, &dir_path);
+            let copy = |a: FileDesc, b: FileDesc| {
+                sys.sys_copy_file_range(a, no_offset(), b, no_offset(), 4, 0)
+            };
+            assert_eq!(copy(src, dir).await, Err(LxError::EISDIR));
+            assert_eq!(copy(src, evt).await, Err(LxError::EINVAL));
+            assert_eq!(copy(src, app).await, Err(LxError::EBADF));
+            assert_eq!(
+                sys.sys_sendfile(app, src, no_offset(), 4).await,
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(
+                sys.sys_sendfile(app, src, UserInOutPtr::from(0x11usize), 4)
+                    .await,
+                Err(LxError::EFAULT),
+                "the offset is copied in first"
+            );
+        })
+    });
+}
+
+/// A descriptor on the directory at `path`.
+fn c_dir(sys: &Syscall<'_>, path: &str) -> FileDesc {
+    let c = alloc::format!("{}\0", path);
+    const O_DIRECTORY: usize = 0o200000;
+    FileDesc::from(
+        sys.sys_openat(
+            FileDesc::CWD,
+            UserInPtr::from(c.as_ptr() as usize),
+            O_DIRECTORY,
+            0,
+        )
+        .unwrap(),
+    )
 }
