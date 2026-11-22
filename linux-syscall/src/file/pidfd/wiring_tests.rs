@@ -124,10 +124,15 @@ fn the_two_flag_words_are_read_before_the_descriptor() {
                 Err(LxError::EINVAL),
                 "and pidfd_getfd takes none either"
             );
+            // A negative target is no flag word: it is a descriptor the
+            // target does not have, `EBADF` from `fget_task`, after the
+            // pidfd itself has been looked up.
+            assert_eq!(sys.sys_pidfd_getfd(nobodys, -1, 0), Err(LxError::EBADF));
+            let own = FileDesc::from(sys.sys_pidfd_open(49_101, 0).expect("own pidfd"));
             assert_eq!(
-                sys.sys_pidfd_getfd(nobodys, -1, 0),
-                Err(LxError::EINVAL),
-                "a negative descriptor is refused the same way"
+                sys.sys_pidfd_getfd(own, -1, 0),
+                Err(LxError::EBADF),
+                "a negative target descriptor"
             );
             // With the flags right, the descriptor is what is wrong.
             assert_eq!(

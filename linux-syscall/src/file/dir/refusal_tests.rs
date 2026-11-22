@@ -178,13 +178,11 @@ fn chdir_and_fchdir_both_want_a_directory() {
 }
 
 #[test]
-fn a_device_node_needs_cap_mknod_and_the_check_comes_first() {
-    // `may_mknod` is asked before the parent is looked up, which is what
-    // makes the answer to an unprivileged device node `EPERM` whatever the
-    // path says. Asking it afterwards would hand out `ENOENT` for a path
-    // that is not there and `EACCES` for a directory the caller may not
-    // write, and a program could not tell "you may not" from "it is not
-    // there".
+fn a_device_node_needs_cap_mknod_after_the_path_is_found() {
+    // `vfs_mknod` asks for `CAP_MKNOD` after `filename_create` has found
+    // the parent (`ENOENT`) and `may_create` has judged it (`EACCES`), so a
+    // node in a directory that is not there is `ENOENT` for anybody. A
+    // character node of device 0 is a whiteout, which needs no capability.
     let proc = a_process(48_801, "dir-mknod-cap");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -218,8 +216,14 @@ fn a_device_node_needs_cap_mknod_and_the_check_comes_first() {
             );
             assert_eq!(
                 mknod(sys, &nowhere, S_IFCHR | 0o666, DEV_NULL),
-                Err(LxError::EPERM),
-                "and the capability is asked before the parent is looked up"
+                Err(LxError::ENOENT),
+                "the parent is looked up before the capability is asked"
+            );
+            let whiteout = c("/x/w/whiteout");
+            assert_eq!(
+                mknod(sys, &whiteout, S_IFCHR, 0),
+                Ok(0),
+                "a whiteout needs no CAP_MKNOD"
             );
             assert!(
                 !is_there(sys.linux_process(), "/x/w/plain-node"),

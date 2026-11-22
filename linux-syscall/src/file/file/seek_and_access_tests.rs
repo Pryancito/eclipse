@@ -318,14 +318,17 @@ fn a_seek_to_data_on_a_closed_descriptor_is_ebadf() {
     // The lookup this branch does for itself, before anything else it
     // decides. EBADF and not EINVAL: the descriptor is the problem.
     let (proc, _fd) = a_process_with_a_file(49_344, "seek-closed");
-    let (data, hole) = on_a_thread(&proc, move |sys| {
+    let (data, hole, unknown) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             (
                 sys.sys_lseek(FileDesc::from(A_CLOSED_FD), 0, SEEK_DATA),
                 sys.sys_lseek(FileDesc::from(A_CLOSED_FD), 0, SEEK_HOLE),
+                sys.sys_lseek(FileDesc::from(A_CLOSED_FD), 0, 99),
             )
         })
     });
     assert_eq!(data, Err(LxError::EBADF));
     assert_eq!(hole, Err(LxError::EBADF));
+    // `ksys_lseek` looks the descriptor up before the whence.
+    assert_eq!(unknown, Err(LxError::EBADF));
 }

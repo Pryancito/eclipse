@@ -691,9 +691,11 @@ impl Syscall<'_> {
         iov_count: usize,
     ) -> SysResult {
         info!("readv: fd={:?}, iov={:?}, count={}", fd, iov_ptr, iov_count);
-        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
+        // `do_readv`: the descriptor (`EBADF`) before the iovec array
+        // (`EFAULT`, `EINVAL`).
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
         // Mirror the sys_read hybrid buffer: many readv callers (e.g. socket
         // headers + payload split into two small iovecs) request totals well
@@ -741,10 +743,11 @@ impl Syscall<'_> {
             "writev: fd={:?}, iov={:?}, count={}",
             fd, iov_ptr, iov_count
         );
-        let iovs = self.read_iovecs(iov_ptr, iov_count)?;
-        let total = iovs.total_len();
+        // `do_writev`: the descriptor before the iovec array.
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        let iovs = self.read_iovecs(iov_ptr, iov_count)?;
+        let total = iovs.total_len();
         let waits = self.waits_for_room(&file_like);
         let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
@@ -816,10 +819,11 @@ impl Syscall<'_> {
             "preadv: fd={:?}, iov={:?}, count={}, offset={}",
             fd, iov_ptr, iov_count, offset
         );
+        // `do_preadv`: the offset, then the descriptor, then the iovecs.
         let offset = linux_object::fs::user_offset(offset)?;
-        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
         let mut buf = crate::try_zeroed_buf(total_len)?;
         let len = file_like.read_at(offset, &mut buf).await?;
@@ -843,14 +847,15 @@ impl Syscall<'_> {
             "pwritev: fd={:?}, iov={:?}, count={}, offset={}",
             fd, iov_ptr, iov_count, offset
         );
+        // `do_pwritev`: the offset, then the descriptor, then the iovecs.
         let offset = linux_object::fs::user_offset(offset)?;
+        let proc = self.linux_process();
+        let file_like = proc.get_file_like(fd)?;
         let iovs = self.read_iovecs(iov_ptr, iov_count)?;
         // Same chunked gather as sys_writev — no artificial total cap, short
         // write on a mid-stream failure — with the position carried in the
         // explicit offset instead of the file cursor.
         let total = iovs.total_len();
-        let proc = self.linux_process();
-        let file_like = proc.get_file_like(fd)?;
         let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
         while written < total {
@@ -983,9 +988,11 @@ impl Syscall<'_> {
     pub fn sys_lseek(&self, fd: FileDesc, offset: i64, whence: usize) -> SysResult {
         const SEEK_DATA: usize = 3;
         const SEEK_HOLE: usize = 4;
+        let proc = self.linux_process();
+        // `ksys_lseek`: the descriptor (`EBADF`) before the whence
+        // (`EINVAL`), so `lseek(-1, 0, 99)` is `EBADF`.
+        let file_like = proc.get_open_file_like(fd)?;
         if whence == SEEK_DATA || whence == SEEK_HOLE {
-            let proc = self.linux_process();
-            let file_like = proc.get_open_file_like(fd)?;
             let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
             // A pipe or a FIFO has no `llseek` at all, so `vfs_llseek` fails
             // before the `whence` is looked at and all five answer ESPIPE.
@@ -1007,12 +1014,10 @@ impl Syscall<'_> {
         let pos = seek_from(whence, offset)?;
         info!("lseek: fd={:?}, pos={:?}", fd, pos);
 
-        let proc = self.linux_process();
         // Use the FileLike seek so it works on non-`File` fds too — notably the
         // DRM PRIME dma-buf fd, which Mesa's software importer sizes with
         // lseek(SEEK_END). `get_file` would reject it with EBADF.
-        let file = proc.get_open_file_like(fd)?;
-        let offset = file.seek(pos)?;
+        let offset = file_like.seek(pos)?;
         Ok(offset as usize)
     }
 
@@ -2371,9 +2376,18 @@ impl Syscall<'_> {
                     .downcast_ref::<linux_object::fs::pty::PtyMaster>()
                 {
                     let slave = master.open_peer().ok_or(LxError::ENXIO)?;
-                    // Same open(2) flag word as `openat`: reject unnamed bits
-                    // (O_PATH, O_TMPFILE, …) instead of truncating them into
-                    // a normal peer fd.
+                    // `ptm_open_peer`: the flag word is open(2)'s, but only
+                    // the access mode, `O_NOCTTY`, `O_NONBLOCK` and
+                    // `O_CLOEXEC` may be in it; anything else (`O_PATH`,
+                    // `O_CREAT`, an unknown bit) is `EINVAL`.
+                    let peer_flags = OpenFlags::RDWR
+                        | OpenFlags::WRONLY
+                        | OpenFlags::NOCTTY
+                        | OpenFlags::NON_BLOCK
+                        | OpenFlags::CLOEXEC;
+                    if arg1 & !peer_flags.bits() != 0 {
+                        return Err(LxError::EINVAL);
+                    }
                     let flags = super::open_flags(arg1)?;
                     let path = alloc::format!("/dev/pts/{}", master.pty_id());
                     let peer = linux_object::fs::File::new(slave, flags, path);
@@ -2706,8 +2720,10 @@ impl Syscall<'_> {
         mode: usize,
         flags: usize,
     ) -> SysResult {
-        let path = path.as_c_str()?;
+        // `do_faccessat`: the mode, then the flags, then the name.
+        let requested = Self::access_mode(mode)?;
         let flags = super::dir::at_flags(flags, super::dir::FACCESSAT_FLAGS)?;
+        let path = path.as_c_str()?;
         info!(
             "faccessat: dirfd={:?}, path={:?}, mode={:#o}, flags={:?}",
             dirfd, path, mode, flags
@@ -2729,7 +2745,6 @@ impl Syscall<'_> {
             proc.lookup_inode_at_by(dirfd, path, follow, walker)?
         };
         let metadata = inode.metadata()?;
-        let requested = Self::access_mode(mode)?;
         let verdict = proc.check_access(&metadata, requested, use_effective);
         linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
         Ok(0)
@@ -2753,8 +2768,9 @@ impl Syscall<'_> {
         mode: usize,
         flags: usize,
     ) -> SysResult {
-        let path = path.as_c_str()?;
+        // The flags are judged before the name is read.
         let flags = super::dir::at_flags(flags, super::dir::FCHMODAT_FLAGS)?;
+        let path = path.as_c_str()?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
         // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchmodat`
@@ -2797,8 +2813,9 @@ impl Syscall<'_> {
         gid: usize,
         flags: usize,
     ) -> SysResult {
-        let path = path.as_c_str()?;
+        // The flags are judged before the name is read.
         let flags = super::dir::at_flags(flags, super::dir::FCHOWNAT_FLAGS)?;
+        let path = path.as_c_str()?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
         // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchownat`

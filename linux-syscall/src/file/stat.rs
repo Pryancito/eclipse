@@ -5,7 +5,22 @@
 //! - fstat(at)
 
 use super::*;
+use crate::file::dir::AT_STATX_SYNC_TYPE;
 use linux_object::fs::vfs::{FileType, Metadata};
+
+/// `STATX__RESERVED`: the mask bit kept for a future `struct statx`
+/// extension, `EINVAL` to ask for.
+const STATX__RESERVED: u32 = 0x8000_0000;
+
+/// `getname_maybe_null`: the name of a `stat` call, where `AT_EMPTY_PATH`
+/// lets a NULL pointer stand for the empty name (Linux 6.11+). Without the
+/// flag a NULL name is a bad address like any other.
+fn name_maybe_null<'a>(name: &'a UserInPtr<u8>, raw_flags: usize) -> LxResult<&'a str> {
+    if name.is_null() && raw_flags & AtFlags::EMPTY_PATH.bits() != 0 {
+        return Ok("");
+    }
+    Ok(name.as_c_str()?)
+}
 
 impl Syscall<'_> {
     /// Works exactly like the stat syscall, but if the file in question is a symbolic link,
@@ -66,8 +81,11 @@ impl Syscall<'_> {
         path: UserInPtr<u8>,
         flags: usize,
     ) -> Result<Metadata, LxError> {
+        // `getname_maybe_null` reads the name before `vfs_statx` looks at
+        // the flags, and under `AT_EMPTY_PATH` a NULL name is the empty one
+        // (Linux 6.11+).
+        let path = name_maybe_null(&path, flags)?;
         let flags = at_flags(flags, FSTATAT_FLAGS)?;
-        let path = path.as_c_str()?;
         info!(
             "fstatat: dirfd={:?}, path={:?}, flags={:?}",
             dirfd, path, flags
@@ -104,15 +122,20 @@ impl Syscall<'_> {
         dirfd: FileDesc,
         pathname: UserInPtr<u8>,
         flags: usize,
-        _mask: u32,
+        mask: u32,
         mut statxbuf: UserOutPtr<Statx>,
     ) -> SysResult {
+        // `SYSCALL_DEFINE5(statx)` reads the name, then `do_statx` refuses
+        // a reserved mask bit and both sync types at once, and then
+        // `vfs_statx` the flags.
+        let path = name_maybe_null(&pathname, flags)?;
+        if mask & STATX__RESERVED != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+            return Err(LxError::EINVAL);
+        }
         let flags = at_flags(flags, STATX_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let (meta, inode) = if flags.contains(AtFlags::EMPTY_PATH)
-            && (pathname.is_null() || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
-        {
+        let (meta, inode) = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
             if dirfd == FileDesc::CWD {
                 let inode = proc.working_directory()?.0;
                 (inode.metadata()?, Some(inode))
@@ -128,7 +151,6 @@ impl Syscall<'_> {
                 (file_like.metadata()?, inode)
             }
         } else {
-            let path = pathname.as_c_str()?;
             let inode = proc.lookup_inode_at(dirfd, path, follow)?;
             (inode.metadata()?, Some(inode))
         };

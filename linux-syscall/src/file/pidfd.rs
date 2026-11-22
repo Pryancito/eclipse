@@ -288,11 +288,11 @@ impl Syscall<'_> {
 
     /// Duplicate `targetfd` from the process referred to by `pidfd`.
     pub fn sys_pidfd_getfd(&self, pidfd: FileDesc, targetfd: i32, flags: u32) -> SysResult {
-        if flags != 0 || targetfd < 0 {
+        if flags != 0 {
             return Err(LxError::EINVAL);
         }
         let caller = self.linux_process();
-        let pidfd = PidFd::from_file_like(caller.get_file_like(pidfd)?)?;
+        let pidfd = PidFd::from_file_like(caller.get_open_file_like(pidfd)?)?;
         let target_proc = pidfd.target();
         // The descriptor comes out of the task the pid names
         // (`get_pid_task(pid, PIDTYPE_PID)`): a thread pidfd's thread, a
@@ -326,6 +326,11 @@ impl Syscall<'_> {
         // the offset and the status flags. `pidfd_getfd(2)`: "the
         // close-on-exec flag is set on the file descriptor" -- on THIS
         // descriptor, not on the description the target is still using.
+        // `fget_task`: a negative number is no descriptor of the target's,
+        // `EBADF` like any other that is not open there.
+        if targetfd < 0 {
+            return Err(LxError::EBADF);
+        }
         let file = target_linux.get_file_like(targetfd.into())?;
         let new_fd = caller.add_file_cloexec(file, true)?;
         Ok(new_fd.into())

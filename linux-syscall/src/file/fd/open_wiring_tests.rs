@@ -312,6 +312,21 @@ fn a_flag_this_kernel_does_not_name_is_refused_before_the_path_is_walked() {
                 "a refused open spent a descriptor anyway"
             );
 
+            // A well-formed `O_TMPFILE` (with `O_DIRECTORY`, for writing) is
+            // an unnamed file no filesystem here makes: `EOPNOTSUPP`, what
+            // glibc and systemd fall back from. Without write access, or with
+            // `O_CREAT`, it is `EINVAL` as on Linux.
+            let dir_c = c(&dir);
+            assert_eq!(
+                open(sys, &dir_c, O_TMPFILE | O_DIRECTORY | O_RDWR),
+                Err(LxError::EOPNOTSUPP)
+            );
+            assert_eq!(
+                open(sys, &dir_c, O_TMPFILE | O_DIRECTORY),
+                Err(LxError::EINVAL),
+                "an unnamed file nobody may write"
+            );
+
             // The same call without that one bit, so what was refused is the
             // bit and not the path.
             assert!(
@@ -319,6 +334,122 @@ fn a_flag_this_kernel_does_not_name_is_refused_before_the_path_is_walked() {
                 "the same open without the unnamed flag must work"
             );
             assert!(exists(&lp, &new_path));
+        })
+    });
+}
+
+#[test]
+fn a_bit_open_does_not_know_is_dropped_and_o_creat_o_directory_is_einval() {
+    // `build_open_how`: `flags & VALID_OPEN_FLAGS`, so `open` and `openat`
+    // ignore a bit nobody defined (only `openat2` refuses one). And since
+    // Linux 6.4 `O_CREAT|O_DIRECTORY` is `EINVAL` before the walk, where it
+    // used to create a regular file and then answer `ENOTDIR`.
+    let proc = a_process(47_414, "open-unknown-bit", "open_unknown_bit");
+    let dir = String::from("/open_unknown_bit");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            a_file_with(&lp, &dir, "f", 0, 0o644, b"x");
+            const NOBODYS_BIT: usize = 0o40000000;
+            let fd = open(sys, &c(&alloc::format!("{dir}/f")), NOBODYS_BIT)
+                .expect("an unknown bit is ignored");
+            assert_eq!(
+                status_flags(sys, fd).await,
+                Ok(O_LARGEFILE),
+                "the unknown bit must not reach F_GETFL"
+            );
+
+            let new_path = alloc::format!("{dir}/new");
+            assert_eq!(
+                open(sys, &c(&new_path), O_CREAT | O_DIRECTORY | O_RDWR),
+                Err(LxError::EINVAL)
+            );
+            assert!(!exists(&lp, &new_path), "the refused open created a file");
+            assert_eq!(
+                open(sys, &c("/nowhere/at/all"), O_CREAT | O_DIRECTORY),
+                Err(LxError::EINVAL),
+                "judged before the path is walked"
+            );
+        })
+    });
+}
+
+#[test]
+fn o_creat_through_a_dangling_link_creates_what_it_points_at() {
+    // `open_last_lookups` follows the link and creates its target:
+    // `ln -s new l; echo hi > l` makes `new`. Relative targets are read
+    // from the link's own directory, a chain is followed to its end, and
+    // `O_EXCL` / `O_NOFOLLOW` still stop at the link.
+    let proc = a_process(47_415, "open-dangling", "open_dangling");
+    let dir = String::from("/open_dangling");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            a_link_named(&lp, &dir, "l", "new");
+            let link = c(&alloc::format!("{dir}/l"));
+            assert_eq!(
+                open(sys, &link, O_CREAT | O_EXCL | O_WRONLY),
+                Err(LxError::EEXIST)
+            );
+            assert_eq!(
+                open(sys, &link, O_CREAT | O_NOFOLLOW | O_WRONLY),
+                Err(LxError::ELOOP)
+            );
+            assert!(!exists(&lp, &alloc::format!("{dir}/new")));
+
+            let fd = open(sys, &link, O_CREAT | O_WRONLY).expect("creates the target");
+            assert_eq!(write_to(sys, fd, b"hi").await, Ok(2));
+            assert_eq!(
+                content_of(&lp, &alloc::format!("{dir}/new"), 2),
+                Vec::from(&b"hi"[..])
+            );
+            assert_eq!(type_of(&lp, &alloc::format!("{dir}/l")), FileType::SymLink);
+
+            // A chain: a -> b -> made, absolute at the second hop.
+            a_link_named(&lp, &dir, "a", "b");
+            a_link_named(&lp, &dir, "b", &alloc::format!("{dir}/made"));
+            assert!(open(sys, &c(&alloc::format!("{dir}/a")), O_CREAT | O_WRONLY).is_ok());
+            assert_eq!(type_of(&lp, &alloc::format!("{dir}/made")), FileType::File);
+
+            // A target in a directory that is not there is still ENOENT.
+            a_link_named(&lp, &dir, "far", "missing/file");
+            assert_eq!(
+                open(sys, &c(&alloc::format!("{dir}/far")), O_CREAT | O_WRONLY),
+                Err(LxError::ENOENT)
+            );
+            // And a loop of links is ELOOP, not a hang.
+            a_link_named(&lp, &dir, "x", "y");
+            a_link_named(&lp, &dir, "y", "x");
+            assert_eq!(
+                open(sys, &c(&alloc::format!("{dir}/x")), O_CREAT | O_WRONLY),
+                Err(LxError::ELOOP)
+            );
+        })
+    });
+}
+
+#[test]
+fn access_mode_three_needs_read_and_write_permission() {
+    // `ACC_MODE`: the mode `3` opens for neither, but `may_open` asks the
+    // inode for both, so it is no way past a file's permissions.
+    let proc = a_process(47_416, "open-accmode3", "open_accmode3");
+    let dir = String::from("/open_accmode3");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            a_file_with(&lp, &dir, "ro", ANOTHER_USER, 0o444, b"x");
+            a_file_with(&lp, &dir, "rw", ANOTHER_USER, 0o666, b"x");
+            acting_as(sys, A_USER);
+            assert_eq!(
+                open(sys, &c(&alloc::format!("{dir}/ro")), 3),
+                Err(LxError::EACCES)
+            );
+            assert_eq!(
+                open(sys, &c(&alloc::format!("{dir}/ro")), O_CREAT | 3),
+                Err(LxError::EACCES),
+                "the O_CREAT open of a name that exists asks the same"
+            );
+            assert!(open(sys, &c(&alloc::format!("{dir}/rw")), 3).is_ok());
         })
     });
 }

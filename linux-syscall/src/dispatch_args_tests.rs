@@ -1821,11 +1821,11 @@ fn the_pointer_words_of_a_mount_and_an_unmount() {
                 "mount under MS_BIND did not resolve its FIRST word"
             );
 
-            // `umount2`'s two words are a pointer and a flag word, and the
-            // one thing a swap cannot survive is the flag word being zero: a
-            // null pointer is refused by the check that every user pointer
-            // goes through, before the path is read. Read the right way
-            // round, it asks to unmount the root, which is EBUSY.
+            // `umount2`'s two words are a pointer and a flag word. Swapped,
+            // the pointer lands in the flag word, which `ksys_umount` judges
+            // first: no flag has that many bits, so it is EINVAL before the
+            // null path is read. Read the right way round, it asks to unmount
+            // the root, which is EBUSY.
             assert_eq!(
                 by_number(sys, Sys::UMOUNT2, [at(&slash), 0, 0, 0, 0, 0]).await,
                 errno(LxError::EBUSY),
@@ -1833,8 +1833,8 @@ fn the_pointer_words_of_a_mount_and_an_unmount() {
             );
             assert_eq!(
                 by_number(sys, Sys::UMOUNT2, [0, at(&slash), 0, 0, 0, 0]).await,
-                errno(LxError::EFAULT),
-                "umount2 read a path out of a null pointer"
+                errno(LxError::EINVAL),
+                "umount2 did not judge the pointer in its flag word as flags"
             );
         })
     });

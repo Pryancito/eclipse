@@ -320,3 +320,31 @@ fn at_empty_path_names_the_file_the_descriptor_is_open_on_and_without_it_it_is_e
         })
     });
 }
+
+#[test]
+fn the_mode_and_the_flags_are_judged_before_the_name_is_read() {
+    // `do_faccessat` refuses a mode outside `S_IRWXO` and an unknown flag
+    // before `user_path_at` reads the name, and `do_fchmodat` /
+    // `do_fchownat` their flags likewise: a bad mode with a NULL name is
+    // `EINVAL`, not `EFAULT`.
+    let proc = a_process(45_596, "perm-order", "perm_order");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let null = || UserInPtr::<u8>::from(0usize);
+            assert_eq!(sys.sys_access(null(), 0o10), Err(LxError::EINVAL));
+            assert_eq!(
+                sys.sys_faccessat(FileDesc::CWD, null(), R_OK, 0x1),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(sys.sys_access(null(), R_OK), Err(LxError::EFAULT));
+            assert_eq!(
+                sys.sys_fchmodat(FileDesc::CWD, null(), 0o600, 0x1),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(
+                sys.sys_fchownat(FileDesc::CWD, null(), 0, 0, 0x1),
+                Err(LxError::EINVAL)
+            );
+        })
+    });
+}
