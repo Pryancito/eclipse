@@ -2472,7 +2472,7 @@ impl Syscall<'_> {
         // is no terminal goes on and answers `ENOTTY` itself.
         if cmd == TIOCSPGRP && file_like.is_terminal() {
             let pgid = UserInPtr::<i32>::from(arg1).read()?;
-            linux_object::process::foreground_group_verdict(&self.zircon_process(), pgid)?;
+            linux_object::process::foreground_group_verdict(self.zircon_process(), pgid)?;
         }
         // `TIOCGPTPEER` on a pty master: open its slave end and return a NEW
         // fd (Linux 4.13+). Needs the fd table, so it lives here rather than

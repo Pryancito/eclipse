@@ -12,6 +12,7 @@
 //!   ignores and prunes entries whose owner pid no longer resolves), not on
 //!   the infamous POSIX "close of any fd to the file" trigger. Locks held by
 //!   a live process that closed the file linger until it exits.
+//!
 //! Open-file-description locks (`F_OFD_*`) share the table, owned by the
 //! description (`ofd`) instead of the process: two descriptions of one file
 //! conflict even inside one process, a `dup` or a `fork` shares the lock,

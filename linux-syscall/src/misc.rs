@@ -508,7 +508,7 @@ impl Syscall<'_> {
         kernel_hal::kstats::note_futex_op();
         // `get_futex_key`: a word that is not aligned is `EINVAL` for every
         // operation, before anything is read.
-        if uaddr % core::mem::size_of::<u32>() != 0 {
+        if !uaddr.is_multiple_of(core::mem::size_of::<u32>()) {
             return Err(LxError::EINVAL);
         }
         let private = op & FUTEX_PRIVATE_FLAG != 0;
@@ -836,7 +836,7 @@ impl Syscall<'_> {
             // used to be `ENOSYS`.
             FUTEX_WAKE_OP => {
                 let (apply, test) = futex_wake_op_decode(val3)?;
-                if uaddr2 % core::mem::size_of::<u32>() != 0 {
+                if !uaddr2.is_multiple_of(core::mem::size_of::<u32>()) {
                     return Err(LxError::EINVAL);
                 }
                 let second: UserInPtr<i32> = uaddr2.into();
