@@ -18,13 +18,15 @@
 //! ([`gone`]); nor does `unetuse=all`, which is every boot.
 //!
 //! On x86_64 a machine with no such card whose first card is an Intel
-//! 82574 (QEMU's `e1000e`) leaves that one to userspace the same way
+//! e1000e (QEMU's 82574, an 82583, or a PCH part such as an I219) leaves
+//! that one to userspace the same way
 //! ([`E1000E_CARD`]), and the stack process is its driver;
 //! `unetcard=kernel` keeps its driver in the kernel, which then lends it
 //! as below.
 //!
 //! A machine with neither, whose first card the kernel drives itself
-//! (an I219, or any card on a boot that says `unetcard=kernel`), lends that card to the stack process
+//! (an e1000e on a boot that says `unetcard=kernel`, or any other card it
+//! drives), lends that card to the stack process
 //! ([`lends`]): the kernel goes on driving it, its frames go to the stack
 //! process and not to the kernel's stack, and it counts as the stack
 //! process's card in all of the above. That is the machine's network too
@@ -63,7 +65,7 @@
 /// service is started for.
 pub const CARD: &str = "virtio-net@0";
 
-/// The first Intel 82574 card, when the boot leaves it to userspace
+/// The first Intel e1000e card, when the boot leaves it to userspace
 /// (unasked on x86_64, or `udriver=e1000e@0`): the stack process claims it and is its driver,
 /// as with [`CARD`], and it counts as that card in all of the above. The
 /// `enet` boot service is started for it.
