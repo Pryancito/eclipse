@@ -1600,8 +1600,14 @@ fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
     // arch-neutral pattern above without breaking those builds.
     #[cfg(target_arch = "x86_64")]
     let watched = watched || matches!(Sys::try_from(num), Ok(Sys::POLL));
+    // Warn, not error: the boot's log level is `error`, and a release's
+    // console is no place for a hunt that is over. Most of what it names is
+    // an EINVAL Linux answers too -- `IPV6_V6ONLY` on a socket that already
+    // has its port is one (`do_ipv6_setsockopt`: `inet_num` set ->
+    // `e_inval`), and printed in red in the middle of the installer on
+    // real hardware. `LOG=warn` brings it back.
     if watched && BUDGET.fetch_add(1, Ordering::Relaxed) < 32 {
-        log::error!(
+        log::warn!(
             "[einval-hunt] pid={} syscall={} ({:?}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} -> EINVAL",
             pid,
             num,
