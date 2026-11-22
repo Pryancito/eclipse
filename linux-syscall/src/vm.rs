@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
 use linux_object::loader::heap_base_for;
-use linux_object::process::{RLIMIT_AS, RLIMIT_DATA, RLIM_INFINITY};
+use linux_object::process::{CAP_IPC_LOCK, RLIMIT_AS, RLIMIT_DATA, RLIMIT_MEMLOCK, RLIM_INFINITY};
 use zircon_object::vm::{
     pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
     USER_ASPACE_BASE, USER_ASPACE_SIZE,
@@ -1229,7 +1229,22 @@ impl Syscall<'_> {
     /// that secrets never hit backing store.
     pub fn sys_mlock(&self, addr: usize, len: usize) -> SysResult {
         info!("mlock: addr={:#x}, len={:#x}", addr, len);
+        self.may_lock_memory()?;
         self.check_locked_range(addr, len)
+    }
+
+    /// `can_do_mlock()`, asked before anything else `mlock`, `mlock2` and
+    /// `mlockall` look at but their flags: `EPERM` for a caller with neither
+    /// `CAP_IPC_LOCK` nor an `RLIMIT_MEMLOCK` above 0. Everyone was let lock
+    /// memory, so a process an administrator had limited to 0 still could
+    /// (open_posix `mlock/12-1`, `mlockall/15-1`: drop to a user with the
+    /// limit at 0 and expect `EPERM`). The limit itself is not counted
+    /// against: no page here is ever evicted, so what is "locked" is not
+    /// tracked.
+    fn may_lock_memory(&self) -> LxResult<()> {
+        let proc = self.linux_process();
+        let limit = proc.rlimit(RLIMIT_MEMLOCK, None, false)?;
+        mlock_permitted(limit.cur, proc.capable(CAP_IPC_LOCK))
     }
 
     /// `mlock2` = mlock plus a `flags` word; the only defined flag is
@@ -1254,7 +1269,9 @@ impl Syscall<'_> {
     /// exactly as Linux does; with residency permanent here, success follows.
     pub fn sys_mlockall(&self, flags: usize) -> SysResult {
         info!("mlockall: flags={:#x}", flags);
-        check_mlockall_flags(flags)
+        check_mlockall_flags(flags)?;
+        self.may_lock_memory()?;
+        Ok(0)
     }
 
     /// Undo `mlockall` (see munlockall(2)).
@@ -2577,6 +2594,16 @@ const MCL_ONFAULT: usize = 4;
 /// Validate an mlockall(2) `flags` word. Pure, so the matrix is unit-testable:
 /// empty or unknown flags are `EINVAL`, and `MCL_ONFAULT` is only meaningful
 /// alongside `MCL_CURRENT`/`MCL_FUTURE` — the exact rules from the man page.
+/// `can_do_mlock()`: a nonzero `RLIMIT_MEMLOCK` soft limit, or
+/// `CAP_IPC_LOCK`.
+fn mlock_permitted(limit_cur: u64, cap_ipc_lock: bool) -> LxResult<()> {
+    if limit_cur != 0 || cap_ipc_lock {
+        Ok(())
+    } else {
+        Err(LxError::EPERM)
+    }
+}
+
 fn check_mlockall_flags(flags: usize) -> SysResult {
     if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
         return Err(LxError::EINVAL);
@@ -2614,6 +2641,16 @@ mod mlockall_flag_tests {
                 "{flags:#x}"
             );
         }
+    }
+
+    /// `can_do_mlock()`: a limit of 0 is `EPERM` without `CAP_IPC_LOCK`,
+    /// and any other limit, or the capability, lets the call go on.
+    #[test]
+    fn a_zero_memlock_limit_without_cap_ipc_lock_is_eperm() {
+        assert_eq!(mlock_permitted(0, false), Err(LxError::EPERM));
+        assert_eq!(mlock_permitted(0, true), Ok(()));
+        assert_eq!(mlock_permitted(64 * 1024, false), Ok(()));
+        assert_eq!(mlock_permitted(RLIM_INFINITY, false), Ok(()));
     }
 }
 

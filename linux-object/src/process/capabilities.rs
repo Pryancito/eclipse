@@ -47,6 +47,9 @@ pub const CAP_SETPCAP: u32 = 8;
 /// `CAP_LINUX_IMMUTABLE`: set the immutable and append-only flags. Here only
 /// for [`CAP_FS_SET`].
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// `CAP_IPC_LOCK`: lock memory (`mlock(2)`, `mlockall(2)`) past
+/// `RLIMIT_MEMLOCK`, a limit of 0 included.
+pub const CAP_IPC_LOCK: u32 = 14;
 /// `CAP_SYS_CHROOT`: use `chroot(2)`.
 pub const CAP_SYS_CHROOT: u32 = 18;
 /// `CAP_SYS_PTRACE`: trace, inspect or reach into the innards of a process
