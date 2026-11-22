@@ -154,13 +154,15 @@ fn cargo_build(workspace: &Path, packages: &[&str], features: Option<&str>) -> b
 /// off (`devfs::drm::build_gpu_nodes`); its connectors are read through KMS
 /// once it is open, which works.
 ///
-/// `gpu-warmup`, `frame-pacing-off` and `explicit-sync-off`: without them,
-/// `vblank_mode=0 es2gears_wayland` on the RTX machine fell from ~4000 FPS to
-/// a frame every few seconds for tens of seconds at a time, with a hardware
-/// fence counted landed 93 s after its submit (`/proc/gpudbg`); with them it
-/// holds 3000-3200 FPS. The kernel side of explicit sync is what is suspect
-/// there (a fence held behind its chain; the `[syncobj] hw fence` dmesg
-/// line names it), so it stays off until that is found.
+/// No `gpu-warmup`, `frame-pacing-off` or `explicit-sync-off`. They were
+/// added for the RTX machine, where `vblank_mode=0 es2gears_wayland` fell
+/// from ~4000 FPS to a frame every few seconds with explicit sync offered (a
+/// hardware fence held behind its syncobj chain, fixed in the kernel by
+/// `keep_fence_for_dependents` in `drivers/src/scheme/syncobj.rs`). The
+/// pinned `desktop` commit does not know those keys: Abyss refused each one
+/// as an unknown `misc` key and started without it, so the image already ran
+/// with explicit sync and frame pacing on, and the keys only added three
+/// config errors. Abyss offers both, as on Linux.
 const DEFAULT_CONFIG: &str = "\
 // Eclipse OS: system defaults for the Abyss session (desktop=abyss).
 // Your own changes go in ~/.config/eclipse/abyss.kdl (or Settings).
@@ -169,9 +171,6 @@ mode \"de\"
 misc {
     render-device \"/dev/dri/card0\"
     terminal-command \"foot\"
-    gpu-warmup #true
-    frame-pacing-off #true
-    explicit-sync-off #true
 }
 launcher {
     bind {
@@ -373,11 +372,12 @@ mod tests {
     #[test]
     fn config_pins_the_console_gpu() {
         assert!(DEFAULT_CONFIG.contains("render-device \"/dev/dri/card0\"\n"));
-        // Without these a GPU client stalled for tens of seconds on the RTX box.
+        // Explicit sync and frame pacing stay on, as on Linux; the pinned
+        // Abyss does not know the keys that would turn them off anyway.
         for key in ["gpu-warmup", "frame-pacing-off", "explicit-sync-off"] {
             assert!(
-                DEFAULT_CONFIG.contains(&format!("    {key} #true\n")),
-                "{key} is not on in the system config"
+                !DEFAULT_CONFIG.contains(key),
+                "{key} is in the system config"
             );
         }
     }
