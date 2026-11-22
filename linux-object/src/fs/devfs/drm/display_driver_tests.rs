@@ -178,6 +178,27 @@ fn a_driver_that_does_modesets_takes_a_mode_the_firmware_did_not_set() {
     super::panel_mode::reset_for_test();
 }
 
+/// `resolution=WxH` in rboot.conf: the connector lists the driver's mode of
+/// that size as the preferred one, first, so the compositor enables the
+/// output at it and not at the monitor's native mode.
+#[test]
+fn the_rboot_resolution_is_the_connectors_preferred_mode() {
+    let screen = kms_emu::attach(64, 16);
+    super::panel_mode::reset_for_test();
+    let _gpu = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-nvkms")
+            .console_at(0x17, 0x00)
+            .with_modes(&[mode(64, 16, 60, true), mode(32, 8, 75, false)]),
+    );
+    zcore_drivers::display::set_requested_mode(32, 8);
+    let modes = driver_modes();
+    zcore_drivers::display::set_requested_mode(0, 0);
+    assert_eq!((modes[0].width, modes[0].height), (32, 8));
+    assert!(modes[0].preferred);
+    assert!(!modes[1].preferred, "only one preferred mode");
+    super::panel_mode::reset_for_test();
+}
+
 /// Without such a driver nothing changes: one mode, and any other refused.
 #[test]
 fn without_modesets_the_panel_keeps_the_firmware_mode() {

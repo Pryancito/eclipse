@@ -9,6 +9,10 @@
 // so every caller of this is dead in a VM and live on a real machine.
 pub mod edid;
 
+// `resolution=WxH` from rboot.conf, made the connector's preferred mode.
+mod requested_mode;
+pub use requested_mode::{prefer_requested, requested_mode, set_requested_mode};
+
 #[cfg(target_arch = "x86_64")]
 mod nouveau_uapi;
 #[cfg(target_arch = "x86_64")]

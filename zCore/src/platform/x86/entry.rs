@@ -46,6 +46,13 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
         fb_size: info.fb_size,
         fb_edid: boot_info.edid,
         fb_edid_size: boot_info.edid_size,
+        // Whether or not the GOP could set it: the GPU driver may offer the
+        // mode the firmware does not (see `zcore_drivers::display::requested_mode`).
+        fb_requested: if boot_info.gop.asked_kind == rboot::GOP_ASKED_EXACT {
+            (boot_info.gop.asked_width, boot_info.gop.asked_height)
+        } else {
+            (0, 0)
+        },
 
         acpi_rsdp: boot_info.acpi2_rsdp_addr,
         smbios: boot_info.smbios_addr,

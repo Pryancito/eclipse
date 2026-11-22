@@ -216,7 +216,7 @@ impl GopReport {
             }
             if self.asked_kind == GOP_ASKED_EXACT {
                 return Some(
-                    "the firmware does not enumerate that mode, and rboot only sets a mode it offers",
+                    "the firmware does not enumerate that mode, so the boot screen keeps the firmware's; the desktop still gets it if the GPU driver (nvkms) offers it",
                 );
             }
             return Some(
