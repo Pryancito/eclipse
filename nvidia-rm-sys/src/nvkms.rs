@@ -48,6 +48,8 @@ extern "C" {
         width: u32,
         height: u32,
         pitch: u32,
+        block_linear: u8,
+        log2_gobs_per_block_y: u32,
     ) -> *mut c_void;
     fn eclipse_kms_surface_free(device: *mut c_void, surface: *mut c_void);
     fn eclipse_kms_show_console(
@@ -316,9 +318,13 @@ impl KmsDevice {
         }
     }
 
-    /// A compositor's VRAM buffer (an XRGB8888 pitch-linear GEM, the RM
-    /// handle `h_memory` in the client `h_client`) as a surface to flip to.
-    /// `None` when the RM or kapi refused; the reason is in the NVKMS log.
+    /// A compositor's VRAM buffer (an XRGB8888 GEM, the RM handle
+    /// `h_memory` in the client `h_client`) as a surface to flip to:
+    /// pitch-linear, or block-linear with blocks `1 << h` GOBs high for
+    /// `block_linear = Some(h)` (nvidia-drm's `explicit_layout` from the fb
+    /// modifier). `pitch` is bytes either way. `None` when the RM or kapi
+    /// refused; the reason is in the NVKMS log.
+    #[allow(clippy::too_many_arguments)]
     pub fn import_surface(
         &self,
         h_client: u32,
@@ -327,6 +333,7 @@ impl KmsDevice {
         width: u32,
         height: u32,
         pitch: u32,
+        block_linear: Option<u8>,
     ) -> Option<KmsSurface> {
         #[cfg(target_os = "none")]
         {
@@ -339,13 +346,15 @@ impl KmsDevice {
                     width,
                     height,
                     pitch,
+                    u8::from(block_linear.is_some()),
+                    u32::from(block_linear.unwrap_or(0)),
                 )
             })
             .map(KmsSurface)
         }
         #[cfg(not(target_os = "none"))]
         {
-            let _ = (h_client, h_memory, size, width, height, pitch);
+            let _ = (h_client, h_memory, size, width, height, pitch, block_linear);
             None
         }
     }

@@ -802,6 +802,7 @@ fn page_flip_with_hwflip_refuses_what_the_copy_engine_cannot_copy() {
             size: 65536,
             h_memory: 0,
             vram_offset,
+            block_linear: None,
         });
         fbs.push(id);
         id

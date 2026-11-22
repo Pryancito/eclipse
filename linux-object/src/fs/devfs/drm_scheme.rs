@@ -1067,7 +1067,7 @@ impl DrmDev {
                     // DRM_CAP_ADDFB2_MODIFIERS, and it has to agree with
                     // what `addfb2_check` accepts: see
                     // `drm::scanout_modifiers_enabled` for why this is 0
-                    // until the copy engine can do the block-linear swizzle.
+                    // unless nvkms scans the framebuffers out as they are.
                     0x10 => cap.value = u64::from(drm::scanout_modifiers_enabled()),
                     // DRM_CAP_CRTC_IN_VBLANK_EVENT: our page-flip event carries
                     // the crtc_id, so report support (wlroots requires it).
@@ -2254,11 +2254,9 @@ impl DrmDev {
                     // Same gate as GETFB above; `drm_mode_getfb2_ioctl`
                     // carries the identical check.
                     cmd.handles = [self.fb_handle_for_caller(&fb), 0, 0, 0];
-                    // `fb.pitch` is the uAPI number ADDFB2 was handed, not a
-                    // byte count: `create_fb_with_layout` derives its byte
-                    // pitch for the size check and stores the request
-                    // verbatim. So a tiled framebuffer reads back in 64-byte
-                    // blocks, exactly as it was created, and
+                    // `fb.pitch` is the number ADDFB2 was handed, bytes for
+                    // every layout as in Linux. So a tiled framebuffer
+                    // reads back exactly as it was created, and
                     // `a_tiled_framebuffer_reads_back_the_pitch_it_was_made_with`
                     // is what notices if that stops being true.
                     cmd.pitches = [fb.pitch, 0, 0, 0];
@@ -3106,6 +3104,11 @@ impl DrmDev {
                 // of ids below it (see `edid_blob_id`).
                 if let Some(blob) = drm::get_blob(res.blob_id) {
                     return copy_out(res, &blob);
+                }
+                if res.blob_id == scanout_modifier::IN_FORMATS_BLOB_ID
+                    && drm::scanout_modifiers_enabled()
+                {
+                    return copy_out(res, &scanout_modifier::in_formats());
                 }
                 let connector_id = connector_of_edid_blob(res.blob_id);
                 if let Some(conn_id) = connector_id {
@@ -4442,6 +4445,9 @@ const PROP_OUT_FENCE_PTR: u32 = 28;
 /// property a compositor has no way to tell the kernel what it repainted, so
 /// every commit had to be treated as a full-frame present.
 const PROP_FB_DAMAGE_CLIPS: u32 = 29;
+/// The primary plane's formats and modifiers, a `drm_format_modifier_blob`;
+/// only while modifiers are advertised (see `scanout_modifier::in_formats`).
+const PROP_IN_FORMATS: u32 = 30;
 
 // Property flags (`drm_mode.h`).
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
@@ -5173,8 +5179,8 @@ fn scanout_layout_modifier(layout: drm::ScanoutLayout) -> u64 {
 /// The tests build their modifiers with the macro's own arithmetic rather
 /// than with hand-written hex, so a field that moves is caught by them
 /// disagreeing with [`decode_scanout_modifier`] rather than by both being
-/// wrong in the same way. The plane's `IN_FORMATS` list will be built from
-/// it too once there is a present path worth advertising.
+/// wrong in the same way, and `zero_copy_scanout_tests` checks the plane's
+/// `IN_FORMATS` list against it.
 #[cfg(test)]
 pub(super) const fn nvidia_block_linear_2d(c: u64, s: u64, g: u64, k: u64, h: u64) -> u64 {
     (DRM_FORMAT_MOD_VENDOR_NVIDIA << 56)
@@ -5257,13 +5263,16 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<drm::ScanoutLayout> {
         return Err(FsError::OutOfRange);
     }
     // "bad pitch": less than a row of pixels. (`create_fb` checks it against
-    // the buffer as well.) For a block-linear surface the pitch is counted
-    // in 64-byte BLOCKS, not bytes -- comparing it against a byte width
-    // would reject every legitimate tiled framebuffer by a factor of 64.
-    let pitch_bytes = match layout {
-        drm::ScanoutLayout::Linear => u64::from(cmd.pitches[0]),
-        drm::ScanoutLayout::BlockLinear { .. } => u64::from(cmd.pitches[0]) * drm::GOB_WIDTH_BYTES,
-    };
+    // the buffer as well.) Bytes for every layout, as in Linux: a
+    // block-linear pitch is the row of GOBs in bytes, which nvidia-drm hands
+    // nvkms as is (`nvkms-kapi.c` shifts it to GOBs). A pitch that is not a
+    // whole number of GOBs is refused there; here too.
+    let pitch_bytes = u64::from(cmd.pitches[0]);
+    if matches!(layout, drm::ScanoutLayout::BlockLinear { .. })
+        && pitch_bytes % drm::GOB_WIDTH_BYTES != 0
+    {
+        return Err(FsError::InvalidParam);
+    }
     if pitch_bytes < min_pitch {
         return Err(FsError::InvalidParam);
     }
@@ -6133,6 +6142,12 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
             values: &[],
             enums: &[],
         },
+        PROP_IN_FORMATS => PropSpec {
+            name: "IN_FORMATS",
+            flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE,
+            values: &[],
+            enums: &[],
+        },
         _ => return None,
     })
 }
@@ -6193,6 +6208,12 @@ fn crtc_props(atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
 fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
     props.push((PROP_TYPE, plane.plane_type as u64));
+    if plane.plane_type == 1 && drm::scanout_modifiers_enabled() {
+        props.push((
+            PROP_IN_FORMATS,
+            u64::from(scanout_modifier::IN_FORMATS_BLOB_ID),
+        ));
+    }
     if atomic {
         let (st, crtc_fb) = drm::atomic_snapshot();
         let crtc = if crtc_fb != 0 { plane.crtc_id } else { 0 };
@@ -7063,6 +7084,9 @@ mod wsi_refusal_trace_tests;
 /// same way.
 #[cfg(test)]
 mod scanout_modifier_tests;
+/// Block-linear scanout through a driver that takes it as it is (nvkms).
+#[cfg(test)]
+mod zero_copy_scanout_tests;
 
 /// `drm_gem_prime_handle_to_dmabuf`: ENOENT for a handle the file does not
 /// hold, EPERM for a `NO_SHARE` object.

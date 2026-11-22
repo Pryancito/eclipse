@@ -431,6 +431,9 @@ struct NvidiaKmsFramebuffer {
     h_memory: u32,
     /// FBMEM offset (`AT_GPU`) for VRAM BOs; `None` for sysmem.
     vram_offset: Option<u64>,
+    /// `Some(log2 GOBs per block)` for a block-linear fb, which only nvkms
+    /// can put on the panel; `None` for pitch-linear.
+    block_linear: Option<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -1191,7 +1194,7 @@ impl NvidiaGpu {
         let Some(fb) = self.kms_fb(fb_id) else {
             return false;
         };
-        if fb.phys_addr == 0 || fb.size < 4 || fb.pitch == 0 {
+        if fb.phys_addr == 0 || fb.size < 4 || fb.pitch == 0 || fb.block_linear.is_some() {
             return false;
         }
         let src_vaddr = phys_to_virt(fb.phys_addr as usize);
@@ -6322,7 +6325,25 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+        self.create_fb_tiled(handle_id, width, height, pitch, None)
+    }
+
+    fn scans_out_block_linear(&self) -> bool {
+        nvkms_takeover::scans_out_block_linear(self)
+    }
+
+    fn create_fb_tiled(
+        &self,
+        handle_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        block_linear: Option<u8>,
+    ) -> Option<u32> {
         if width == 0 || height == 0 || pitch == 0 {
+            return None;
+        }
+        if block_linear.is_some() && !self.scans_out_block_linear() {
             return None;
         }
         let size = (pitch as usize).checked_mul(height as usize)?;
@@ -6362,10 +6383,21 @@ impl DrmScheme for NvidiaGpu {
             height,
             pitch,
             phys_addr,
-            size: buf_size.min(size),
+            // Block-linear pads to whole blocks: nvkms checks the object.
+            size: if block_linear.is_some() {
+                buf_size
+            } else {
+                buf_size.min(size)
+            },
             h_memory,
             vram_offset,
+            block_linear,
         });
+        if block_linear.is_some() && !self.nvkms_takes_fb(fb_id) {
+            self.kms_framebuffers.lock().retain(|f| f.id != fb_id);
+            self.nvkms_forget_fbs(&[fb_id]);
+            return None;
+        }
         Some(fb_id)
     }
 
@@ -6375,6 +6407,10 @@ impl DrmScheme for NvidiaGpu {
         };
         if let Some(flipped) = self.nvkms_page_flip(&fb) {
             return flipped;
+        }
+        // Nothing below untiles a block-linear surface.
+        if fb.block_linear.is_some() {
+            return false;
         }
 
         // 1) NVC57E ISO surface flip (opt-in nvidia.surfaceflip) when we have

@@ -51,6 +51,7 @@ pub(super) fn console_gpu() -> NvidiaGpu {
         size: 0,
         h_memory: H_MEMORY,
         vram_offset: Some(0),
+        block_linear: None,
     });
     gpu
 }
@@ -123,6 +124,7 @@ fn rotating_a_swapchain_builds_one_ctxdma_per_buffer_not_one_per_flip() {
         size: 0,
         h_memory: H_MEMORY_B,
         vram_offset: Some(0),
+        block_linear: None,
     });
     for fb in [FB, FB_B, FB, FB_B, FB, FB_B] {
         assert!(gpu.page_flip(fb));

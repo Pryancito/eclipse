@@ -344,6 +344,7 @@ fn framebuffer(gpu: &NvidiaGpu, handle_id: u32) -> u32 {
         size: 16384,
         h_memory: 0,
         vram_offset: None,
+        block_linear: None,
     });
     id
 }
@@ -8675,6 +8676,7 @@ mod glxgears_vblank_mode {
             size: 0,
             h_memory: H_MEMORY,
             vram_offset: Some(0),
+            block_linear: None,
         });
         gpu
     }

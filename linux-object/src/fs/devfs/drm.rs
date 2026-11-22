@@ -851,7 +851,8 @@ static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// compositor fall back to linear by itself.
 ///
 /// Turn it on for a boot with `drm.scanout_modifiers` to exercise the
-/// negotiation.
+/// negotiation. A driver that scans block-linear out as it is (nvkms, with
+/// `nvidia.nvkms` and `nvidia.gem_vram`) turns it on by itself.
 static SCANOUT_MODIFIERS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -865,6 +866,7 @@ pub fn set_scanout_modifiers_enabled(on: bool) {
 /// Whether modifier advertising is armed for this boot.
 pub fn scanout_modifiers_enabled() -> bool {
     SCANOUT_MODIFIERS.load(Ordering::Relaxed)
+        || get_display_driver().is_some_and(|d| d.scans_out_block_linear())
 }
 
 /// The memory layout of a framebuffer's pixels, as its `ADDFB2` modifier
@@ -879,11 +881,10 @@ pub enum ScanoutLayout {
     /// `1 << log2_gobs_per_block_y` high into blocks, blocks laid out left to
     /// right then top to bottom.
     ///
-    /// Two things differ from `Linear` and both have bitten this layout
-    /// elsewhere: **`pitch` is counted in 64-byte blocks, not bytes**
-    /// (`nvkms-surface.c` does `planePitch <<= LOG_GOB_WIDTH` on the way in),
-    /// and the allocation is padded up to a whole number of blocks
-    /// vertically. [`block_linear_size`] is the one place that arithmetic
+    /// Two things differ from `Linear`: the pitch, in bytes as for every DRM
+    /// framebuffer, is a whole number of 64-byte GOBs (nvkms turns it into
+    /// GOBs itself, `nvkms-kapi.c` `pitch >> 6`), and the allocation is
+    /// padded up to a whole number of blocks vertically. [`block_linear_size`] is the one place that arithmetic
     /// lives.
     BlockLinear {
         /// `h`, bits 3:0 of the modifier; `SET_SRC_BLOCK_SIZE_HEIGHT` takes
@@ -902,22 +903,22 @@ pub const GOB_HEIGHT_ROWS: u64 = 8;
 
 /// The bytes a block-linear surface of this pitch and height occupies.
 ///
-/// `pitch_in_blocks` is the `ADDFB2` pitch verbatim (blocks, not bytes) and
-/// the height is rounded UP to a whole block, because the hardware addresses
-/// the padding rows and a size computed from the unpadded height would let a
-/// present read past the buffer on the last block row.
-pub fn block_linear_size(
-    pitch_in_blocks: u32,
-    height: u32,
-    log2_gobs_per_block_y: u8,
-) -> Option<usize> {
+/// `pitch` is the `ADDFB2` pitch, in BYTES as for any DRM framebuffer, and a
+/// whole number of 64-byte GOBs (`nvkms-kapi.c`'s `GetSurfaceParams` refuses
+/// any other: "Invalid block-linear pitch alignment"). The height is rounded
+/// UP to a whole block, because the hardware addresses the padding rows and a
+/// size computed from the unpadded height would let a present read past the
+/// buffer on the last block row.
+pub fn block_linear_size(pitch: u32, height: u32, log2_gobs_per_block_y: u8) -> Option<usize> {
+    if u64::from(pitch) % GOB_WIDTH_BYTES != 0 {
+        return None;
+    }
     let block_rows = GOB_HEIGHT_ROWS.checked_shl(log2_gobs_per_block_y as u32)?;
     let padded = (height as u64)
         .checked_add(block_rows - 1)?
         .checked_div(block_rows)?
         .checked_mul(block_rows)?;
-    let row_bytes = (pitch_in_blocks as u64).checked_mul(GOB_WIDTH_BYTES)?;
-    usize::try_from(row_bytes.checked_mul(padded)?).ok()
+    usize::try_from((pitch as u64).checked_mul(padded)?).ok()
 }
 
 /// Turn the present repair pass on (or back off) for this boot.
@@ -3374,7 +3375,7 @@ pub fn create_fb_with_layout(
             ..
         } => (
             block_linear_size(pitch, height, log2_gobs_per_block_y)?,
-            (pitch as usize).checked_mul(GOB_WIDTH_BYTES as usize)?,
+            pitch as usize,
         ),
     };
     if size == 0 || size > buf_size || pitch_bytes < (width as usize).saturating_mul(4) {
@@ -3390,9 +3391,8 @@ pub fn create_fb_with_layout(
     // so the two present paths would also disagree about the same image.
     // Linux rejects this in `drm_mode_addfb2` through the format's cpp
     // alignment; here the format is always 4 bytes per pixel.
-    // (A block-linear pitch is counted in 64-byte blocks, so it is a whole
-    // number of pixels by construction and the copy engine never divides it
-    // the way the CPU path does.)
+    // (A block-linear pitch is a whole number of 64-byte GOBs, so it is a
+    // whole number of pixels by construction; `block_linear_size` checks it.)
     if layout == ScanoutLayout::Linear && !pitch.is_multiple_of(4) {
         warn!(
             "[drm] create_fb (ADDFB2): pitch={} is not a multiple of 4 bytes              (XRGB8888) -- rejecting rather than scanning out a sheared image",
@@ -3404,7 +3404,16 @@ pub fn create_fb_with_layout(
     // Create a driver-private fb when hardware/CE/surface flip may need it.
     // Under pure software KMS (no surfaceflip) skip it to avoid leaking
     // driver fbs with no destroy path.
-    let want_driver_fb = !software_kms_active()
+    // A tiled one always: only the driver can put it on the panel.
+    let tiled = match layout {
+        ScanoutLayout::Linear => None,
+        ScanoutLayout::BlockLinear {
+            log2_gobs_per_block_y,
+            ..
+        } => Some(log2_gobs_per_block_y),
+    };
+    let want_driver_fb = tiled.is_some()
+        || !software_kms_active()
         || zcore_drivers::display::surfaceflip_enabled()
         || zcore_drivers::display::hwflip_enabled();
     // `get_display_driver`, not the first entry: a driver fb exists to be
@@ -3412,10 +3421,20 @@ pub fn create_fb_with_layout(
     // to be the same card `page_flip` below is offered, or the flip would
     // carry an id from another card's namespace.
     let driver_fb_id = if want_driver_fb {
-        get_display_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch))
+        get_display_driver()
+            .and_then(|driver| driver.create_fb_tiled(handle_id, width, height, pitch, tiled))
     } else {
         None
     };
+    // A driver that scans tiled fbs out refused this one, and nothing here
+    // untiles it: `ADDFB2`'s EINVAL sends the compositor back to linear.
+    // (Under `drm.scanout_modifiers` alone it is declined at the flip.)
+    if tiled.is_some()
+        && driver_fb_id.is_none()
+        && get_display_driver().is_some_and(|d| d.scans_out_block_linear())
+    {
+        return None;
+    }
 
     // Before `DRM_STATE`: this takes `gem_mmap`'s lock, and no other path
     // nests the two in this order.
