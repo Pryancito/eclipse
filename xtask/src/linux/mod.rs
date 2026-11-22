@@ -1425,8 +1425,16 @@ impl LinuxRootfs {
               # output and keeps it off the compute GPU. Physical pixels always\n\
               # land on the GOP framebuffer via the kernel's software-KMS\n\
               # scanout regardless, so this is really about presenting one\n\
-              # output, not about which port lights up.\n\
+              # output, not about which port lights up. With nvidia.nvkms every\n\
+              # card lights its own monitors (as on Linux), so the session\n\
+              # opens every card, card0 first; eclipse-init does the same.\n\
               export WLR_DRM_DEVICES=/dev/dri/card0\n\
+              case \" $(tr ':' ' ' </proc/cmdline 2>/dev/null) \" in\n\
+              \x20 *\" nvidia.nvkms \"*)\n\
+              \x20   for c in /dev/dri/card[1-9]*; do\n\
+              \x20     [ -e \"$c\" ] && WLR_DRM_DEVICES=\"$WLR_DRM_DEVICES:$c\"\n\
+              \x20   done ;;\n\
+              esac\n\
               # Last-resort software-GL override, kept commented. The renderer\n\
               # block above already picks the right stack per the two-condition\n\
               # gate: hardware GL (vulkan+zink) only on NVIDIA+flag, software GL\n\

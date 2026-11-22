@@ -608,6 +608,12 @@ impl Syscall<'_> {
                     protocol,
                 )?)
             }
+            // Device events (udev, libudev monitors): NETLINK_KOBJECT_UEVENT.
+            (Domain::AF_NETLINK, SocketType::SOCK_RAW | SocketType::SOCK_DGRAM, _)
+                if protocol_num == linux_object::net::uevent::NETLINK_KOBJECT_UEVENT =>
+            {
+                Arc::new(linux_object::net::uevent::UeventSocket::new(socket_type))
+            }
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
             | (Domain::AF_NETLINK, SocketType::SOCK_DGRAM, _) => {

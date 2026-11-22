@@ -35,16 +35,60 @@ use nvidia_rm_sys::nvkms_os;
 /// channel, so nothing hands the card back.
 pub(super) struct NvkmsCard {
     device: KmsDevice,
-    /// What nvkms scans out, on the card that had the firmware console, once
-    /// the console modeset is done.
+    /// What nvkms scans out: on the card that had the firmware console from
+    /// the console modeset on, on any other card from a client's first
+    /// modeset on.
     scanout: Option<Scanout>,
+    /// The card's displays as the last probe found them: at load, and again
+    /// each time the output poll saw a monitor come or go.
+    info: Option<alloc::boxed::Box<KmsInfo>>,
+    /// [`nvkms::hotplug_count`] when this card was last probed.
+    hotplugs: u32,
+    /// The output poll's own state for this card.
+    poll: Poll,
+}
+
+/// What [`NvidiaGpu::nvkms_poll_connectors`] remembers between passes.
+#[derive(Default)]
+struct Poll {
+    /// Passes so far.
+    passes: u32,
+    /// The connected mask the RM's last detection pass gave.
+    rm_connected: Option<u32>,
+    /// The connectors have been announced since nvkms took the card.
+    announced: bool,
+}
+
+/// The RM detection pass runs every this many output-poll passes: 10 s at
+/// the DRM layer's 2 s, Linux's `DRM_OUTPUT_POLL_PERIOD`. nvkms's own
+/// hotplug events are looked at on every pass.
+const RM_DETECT_EVERY: u32 = 5;
+
+/// What the probe says about the monitors: which display is connected, and
+/// which monitor it is (the EDID's vendor, product and serial).
+fn monitors(info: Option<&KmsInfo>) -> Vec<(u32, [u8; 10])> {
+    let Some(info) = info else {
+        return Vec::new();
+    };
+    info.displays()
+        .iter()
+        .filter(|d| d.connected != 0)
+        .map(|d| {
+            let mut id = [0u8; 10];
+            id.copy_from_slice(&d.edid[8..18]);
+            (d.handle, id)
+        })
+        .collect()
 }
 
 /// One card's screen since the console modeset: nvidia-drm's CRTC, plane and
 /// framebuffer state, reduced to one picture cloned on every lit head.
 struct Scanout {
     state: KmsScanout,
-    console: KmsSurface,
+    /// The firmware console's surface, on the card that had it; `None` on a
+    /// card whose first modeset was a client's, which has no console to
+    /// put back.
+    console: Option<KmsSurface>,
     /// The surfaces made for the compositor's framebuffers, by fb id. `None`
     /// for one nvkms refused, so it is not asked again.
     fbs: Vec<(u32, Option<KmsSurface>)>,
@@ -113,6 +157,30 @@ pub(super) fn scans_out_block_linear(gpu: &NvidiaGpu) -> bool {
     gpu.vblank_head.load(Ordering::Acquire) < 8 && super::gem_vram::enabled()
 }
 
+/// `nvidia.nvkms` is on the cmdline: nvkms is going to take every NVIDIA
+/// card's display, the way `nvidia-drm.modeset=1` does in Linux.
+static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Called from `zCore`'s cmdline parsing when `nvidia.nvkms` is present,
+/// before init runs, so a compositor started before nvkms has loaded
+/// already sees each card's CRTC.
+pub fn set_requested(v: bool) {
+    REQUESTED.store(v, Ordering::Relaxed);
+}
+
+/// [`NvidiaGpu::drives_own_display`]: this card lights its own monitors
+/// through nvkms, as its own DRM device does in Linux: `nvidia.nvkms` (and
+/// `nvidia.gem_vram`, since nvkms only scans out VRAM) on a card that is
+/// not the boot console's. The console's card keeps the panel path, which
+/// already reaches nvkms. True from boot on, before nvkms has loaded: DRM
+/// lists the card's CRTC from the start (a compositor never looks for new
+/// CRTCs), and its connectors read disconnected until nvkms holds the card
+/// ([`NvidiaGpu::nvkms_display_pending`]); the output poll then sends the
+/// hotplug that makes the compositor light them.
+pub(super) fn drives_own_display(gpu: &NvidiaGpu) -> bool {
+    REQUESTED.load(Ordering::Relaxed) && super::gem_vram::enabled() && !gpu.drives_boot_display()
+}
+
 fn now_us() -> u64 {
     unsafe { crate::bus::drivers_timer_now_as_micros() }
 }
@@ -120,7 +188,7 @@ fn now_us() -> u64 {
 impl Scanout {
     fn surface_of(&self, fb_id: u32) -> Option<&KmsSurface> {
         if fb_id == 0 {
-            return Some(&self.console);
+            return self.console.as_ref();
         }
         self.fbs
             .iter()
@@ -303,6 +371,7 @@ impl NvidiaGpu {
             tag, gpu_id
         )];
         lines.extend(console_note);
+        let hotplugs = nvkms::hotplug_count();
         let info = device.probe();
         match &info {
             Some(info) => {
@@ -312,22 +381,33 @@ impl NvidiaGpu {
             }
             None => lines.push(format!("{}: no se pudo consultar el dispositivo", tag)),
         }
-        let scanout = match info {
+        let scanout = match &info {
             Some(info) if self.drives_boot_display() => {
-                self.show_console(&device, gpu_id, &info, &tag, &mut lines)
+                self.show_console(&device, gpu_id, info, &tag, &mut lines)
             }
             // The probe failure is already in `lines`.
             None if self.drives_boot_display() => None,
             _ => {
                 lines.push(format!(
                     "{}: sin consola de arranque; la pantalla no cambia hasta que un \
-                     compositor haga el modeset",
-                    tag
+                     compositor haga el modeset{}",
+                    tag,
+                    if drives_own_display(self) {
+                        " (sus monitores aparecen ahora como conectados: hotplug)"
+                    } else {
+                        ""
+                    }
                 ));
                 None
             }
         };
-        *self.nvkms_device.lock() = Some(NvkmsCard { device, scanout });
+        *self.nvkms_device.lock() = Some(NvkmsCard {
+            device,
+            scanout,
+            info,
+            hotplugs,
+            poll: Poll::default(),
+        });
         lines
     }
 
@@ -389,7 +469,7 @@ impl NvidiaGpu {
                 }
                 Some(Scanout {
                     state,
-                    console,
+                    console: Some(console),
                     fbs: Vec::new(),
                     on_screen: 0,
                     cursor: None,
@@ -473,7 +553,7 @@ impl NvidiaGpu {
         let device = &card.device;
         let scanout = card.scanout.as_mut()?;
         let in_vram = fb.h_memory != 0 && fb.vram_offset.is_some();
-        if !in_vram || !self.nvkms_import(device, scanout, fb) {
+        if !in_vram || !self.nvkms_import(device, &mut scanout.fbs, fb) {
             // A tiled fb has no copy to fall back to, and the console stays.
             if fb.block_linear.is_some() {
                 return Some(false);
@@ -531,8 +611,9 @@ impl NvidiaGpu {
     }
 
     /// The modes the monitor on screen can take, for the DRM connector:
-    /// nvkms's validated modes of the first lit display. Empty when nvkms
-    /// does not scan out this card, or without `nvidia.gem_vram`.
+    /// nvkms's validated modes of the first lit display still connected, or
+    /// of the first connected one on a card no client has lit yet. Empty
+    /// when nvkms does not hold this card, or without `nvidia.gem_vram`.
     pub(super) fn nvkms_modes(&self) -> Vec<KmsMode> {
         // A modeset scans out the compositor's buffer, and only one in VRAM
         // can be: without `nvidia.gem_vram` every modeset would be refused,
@@ -544,17 +625,42 @@ impl NvidiaGpu {
         let Some(card) = guard.as_ref() else {
             return Vec::new();
         };
-        let Some(set) = card.scanout.as_ref().and_then(|s| s.sets.first()) else {
+        let connected = |handle: u32| {
+            card.info.as_ref().is_none_or(|i| {
+                i.displays()
+                    .iter()
+                    .any(|d| d.handle == handle && d.connected != 0)
+            })
+        };
+        let lit = card
+            .scanout
+            .as_ref()
+            .and_then(|s| s.sets.iter().map(|s| s.display).find(|&d| connected(d)));
+        let first = || {
+            card.info.as_ref().and_then(|i| {
+                i.displays()
+                    .iter()
+                    .find(|d| d.connected != 0)
+                    .map(|d| d.handle)
+            })
+        };
+        let Some(display) = lit.or_else(first) else {
             return Vec::new();
         };
-        nvkms::connector_modes(&card.device.modes(set.display))
+        nvkms::connector_modes(&card.device.modes(display))
     }
 
-    /// A modeset through nvkms: every lit head to `width`x`height` at the
-    /// refresh rate closest to `refresh_hz`, scanning out `fb` -- nvidia-drm's
-    /// atomic commit of a new MODE_ID. `fb` has to be in VRAM: the console
-    /// only fits the mode it was made at. `test_only` validates it and
-    /// changes nothing. `None` when nvkms does not scan out this card.
+    /// A modeset through nvkms: every connected monitor of the card to
+    /// `width`x`height` at the refresh rate closest to `refresh_hz`, all
+    /// scanning out `fb` -- nvidia-drm's atomic commit of a new MODE_ID, with
+    /// the card's monitors mirrored on its one DRM CRTC. A monitor lit
+    /// already keeps its head, one plugged in since is lit, one unplugged
+    /// since goes dark ([`nvkms::mode_plan`]). On a card with no scanout yet
+    /// (no firmware console) this is the first modeset, which lights the
+    /// card. `fb` has to be in VRAM: the console only fits the mode it was
+    /// made at. `test_only` validates it and changes nothing. `None` when
+    /// nvkms does not hold this card, or holds the console's card but could
+    /// not show the console on it.
     pub(super) fn nvkms_set_mode(
         &self,
         width: u32,
@@ -566,8 +672,15 @@ impl NvidiaGpu {
         let tag = self.bdf_tag();
         let mut guard = self.nvkms_device.lock();
         let card = guard.as_mut()?;
-        let device = &card.device;
-        let scanout = card.scanout.as_mut()?;
+        if card.scanout.is_none() && !drives_own_display(self) {
+            return None;
+        }
+        let NvkmsCard {
+            device,
+            scanout,
+            info,
+            ..
+        } = card;
         let result = (|| {
             let Some(fb) = fb.filter(|fb| fb.h_memory != 0 && fb.vram_offset.is_some()) else {
                 return Err(String::from(
@@ -577,56 +690,120 @@ impl NvidiaGpu {
             if fb.width < width || fb.height < height {
                 return Err(format!("el fb {}x{} no cubre el modo", fb.width, fb.height));
             }
-            let mut sets = scanout.sets.clone();
-            for set in sets.iter_mut() {
-                let modes = device.modes(set.display);
-                let Some(i) = nvkms::requested_mode(&modes, width, height, refresh_hz) else {
-                    return Err(format!("la pantalla {:#x} no tiene ese modo", set.display));
-                };
-                set.mode_index = i as u32;
-            }
-            if !self.nvkms_import(device, scanout, fb) {
-                return Err(String::from("nvkms no acepta el fb como superficie"));
-            }
-            let surface = scanout
-                .surface_of(fb.id)
-                .ok_or_else(|| String::from("sin superficie"))?;
-            let start = now_us();
-            loop {
-                match device.set_mode(&scanout.state, surface, &sets, test_only) {
-                    Err(ShowError::FlipPending) if now_us().wrapping_sub(start) < FLIP_WAIT_US => {
-                        core::hint::spin_loop()
-                    }
-                    Err(e) => return Err(String::from(e.describe())),
-                    Ok(()) => break,
-                }
+            let Some(info) = info.as_deref() else {
+                return Err(String::from("nvkms no pudo consultar la tarjeta"));
+            };
+            let current = scanout.as_ref().map_or(&[][..], |s| s.sets.as_slice());
+            let (sets, dark) = nvkms::mode_plan(
+                info,
+                |d| device.modes(d),
+                current,
+                width,
+                height,
+                refresh_hz,
+            );
+            if sets.is_empty() {
+                return Err(if dark.is_empty() {
+                    String::from("ningun monitor conectado")
+                } else {
+                    dark.join("; ")
+                });
             }
             if !test_only {
-                let console = super::BOOT_FB_INFO
-                    .lock()
-                    .is_some_and(|c| c.width == width && c.height == height);
-                if let Some(set) = sets.first() {
-                    self.vblank_head.store(set.head, Ordering::Release);
+                for line in &dark {
+                    crate::klog_info!("[nvkms] {}: {}", tag, line);
                 }
-                scanout.sets = sets;
-                scanout.on_screen = fb.id;
-                scanout.mode = (!console).then_some((width, height, refresh_hz));
-                let mut kms = self.kms_state.lock();
-                kms.crtc_fb = fb.id;
-                kms.plane_fb = fb.id;
-                kms.last_vblank_us = now_us();
             }
-            Ok(())
+            match scanout {
+                Some(scanout) => {
+                    if !self.nvkms_import(device, &mut scanout.fbs, fb) {
+                        return Err(String::from("nvkms no acepta el fb como superficie"));
+                    }
+                    let surface = scanout
+                        .surface_of(fb.id)
+                        .ok_or_else(|| String::from("sin superficie"))?;
+                    let start = now_us();
+                    loop {
+                        match device.set_mode(&scanout.state, surface, &sets, test_only) {
+                            Err(ShowError::FlipPending)
+                                if now_us().wrapping_sub(start) < FLIP_WAIT_US =>
+                            {
+                                core::hint::spin_loop()
+                            }
+                            Err(e) => return Err(String::from(e.describe())),
+                            Ok(()) => break,
+                        }
+                    }
+                    if test_only {
+                        return Ok(sets.len());
+                    }
+                    let console_size = super::BOOT_FB_INFO
+                        .lock()
+                        .is_some_and(|c| c.width == width && c.height == height);
+                    scanout.on_screen = fb.id;
+                    scanout.mode = (!(console_size && scanout.console.is_some()))
+                        .then_some((width, height, refresh_hz));
+                    scanout.sets = sets.clone();
+                }
+                None => {
+                    let mut fbs = Vec::new();
+                    if !self.nvkms_import(device, &mut fbs, fb) {
+                        return Err(String::from("nvkms no acepta el fb como superficie"));
+                    }
+                    if test_only {
+                        // Nothing is on screen to test against: the plan and
+                        // the surface are what can be checked.
+                        for (_, surface) in fbs {
+                            if let Some(surface) = surface {
+                                device.free_surface(surface);
+                            }
+                        }
+                        return Ok(sets.len());
+                    }
+                    let shown = match fbs.first().and_then(|(_, s)| s.as_ref()) {
+                        Some(surface) => device.show_console(surface, &sets, info.num_heads),
+                        None => Err(ShowError::BadRequest),
+                    };
+                    let state = match shown {
+                        Ok(state) => state,
+                        Err(e) => {
+                            for (_, surface) in fbs {
+                                if let Some(surface) = surface {
+                                    device.free_surface(surface);
+                                }
+                            }
+                            return Err(String::from(e.describe()));
+                        }
+                    };
+                    *scanout = Some(Scanout {
+                        state,
+                        console: None,
+                        fbs,
+                        on_screen: fb.id,
+                        cursor: None,
+                        sets: sets.clone(),
+                        mode: Some((width, height, refresh_hz)),
+                    });
+                }
+            }
+            if let Some(set) = sets.first() {
+                self.vblank_head.store(set.head, Ordering::Release);
+            }
+            let mut kms = self.kms_state.lock();
+            kms.crtc_fb = fb.id;
+            kms.plane_fb = fb.id;
+            kms.last_vblank_us = now_us();
+            Ok(sets.len())
         })();
         if !test_only {
             match &result {
-                Ok(()) => crate::klog_info!(
+                Ok(heads) => crate::klog_info!(
                     "[nvkms] {}: modeset hecho: {}x{} a {} Hz en {} cabeza(s)",
                     tag,
                     width,
                     height,
                     refresh_hz,
-                    scanout.sets.len()
+                    heads
                 ),
                 Err(why) => crate::klog_warn!(
                     "[nvkms] {}: modeset a {}x{} a {} Hz rechazado: {}; la pantalla sigue igual",
@@ -638,7 +815,7 @@ impl NvidiaGpu {
                 ),
             }
         }
-        Some(result)
+        Some(result.map(|_| ()))
     }
 
     /// Whether nvkms takes the fb `fb_id` as a surface, made now: a
@@ -659,7 +836,7 @@ impl NvidiaGpu {
         let Some(scanout) = card.scanout.as_mut() else {
             return false;
         };
-        self.nvkms_import(device, scanout, &fb)
+        self.nvkms_import(device, &mut scanout.fbs, &fb)
     }
 
     /// Make sure `fb` has its nvkms surface: its GEM duped into kapi's RM
@@ -667,10 +844,10 @@ impl NvidiaGpu {
     fn nvkms_import(
         &self,
         device: &KmsDevice,
-        scanout: &mut Scanout,
+        fbs: &mut Vec<(u32, Option<KmsSurface>)>,
         fb: &NvidiaKmsFramebuffer,
     ) -> bool {
-        if let Some((_, surface)) = scanout.fbs.iter().find(|(id, _)| *id == fb.id) {
+        if let Some((_, surface)) = fbs.iter().find(|(id, _)| *id == fb.id) {
             return surface.is_some();
         }
         let dev = *self.rm_device_instance.lock();
@@ -726,7 +903,7 @@ impl NvidiaGpu {
             });
         }
         let ok = surface.is_some();
-        scanout.fbs.push((fb.id, surface));
+        fbs.push((fb.id, surface));
         ok
     }
 
@@ -859,6 +1036,93 @@ impl NvidiaGpu {
                 .cursor(&scanout.state, None, cursor.x, cursor.y, false)
                 .is_ok(),
         )
+    }
+
+    /// One pass of the output poll on this card (Linux's
+    /// `output_poll_execute` plus nvidia-drm's hotplug event): whether a
+    /// monitor came or went since the last pass, so the DRM layer sends the
+    /// hotplug uevent. A pass looks at nvkms's hotplug events, and every
+    /// [`RM_DETECT_EVERY`] passes asks the RM to detect again, for a
+    /// monitor whose event never arrived. On a change the card is probed
+    /// again (the modes and EDID nvkms lists) and the RM's connector answer
+    /// is read again, so `GETCONNECTOR` tells the new monitor. Also true
+    /// once when nvkms has just taken a card that lights its own monitors:
+    /// its connectors read disconnected until then.
+    pub(super) fn nvkms_poll_connectors(&self) -> bool {
+        if !REQUESTED.load(Ordering::Relaxed) {
+            return false;
+        }
+        let instance = *self.rm_device_instance.lock();
+        let mut guard = self.nvkms_device.lock();
+        let Some(card) = guard.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        if !card.poll.announced {
+            card.poll.announced = true;
+            changed = drives_own_display(self);
+        }
+        card.poll.passes = card.poll.passes.wrapping_add(1);
+        let hotplugs = nvkms::hotplug_count();
+        let mut probe = hotplugs != card.hotplugs;
+        if card.poll.passes % RM_DETECT_EVERY == 0 {
+            if let Some(mask) = instance.and_then(|i| nvidia_rm_sys::rm_init::connect_state(i).ok())
+            {
+                probe |= card.poll.rm_connected.is_some_and(|was| was != mask);
+                card.poll.rm_connected = Some(mask);
+            }
+        }
+        if !probe {
+            return changed;
+        }
+        card.hotplugs = hotplugs;
+        let before = monitors(card.info.as_deref());
+        if let Some(info) = card.device.probe() {
+            card.info = Some(info);
+        }
+        let after = monitors(card.info.as_deref());
+        drop(guard);
+        if before == after {
+            return changed;
+        }
+        crate::klog_info!(
+            "[nvkms] {}: los monitores cambiaron: {} conectado(s) antes, {} ahora",
+            self.bdf_tag(),
+            before.len(),
+            after.len()
+        );
+        if let Some(instance) = instance {
+            self.rm_display_refresh(instance);
+        }
+        true
+    }
+
+    /// Read the RM's connectors and EDID again after a hotplug, replacing
+    /// the answer `rm_display_state` kept for the boot. On a failed read the
+    /// old answer stays, with only its connected mask brought up to date.
+    fn rm_display_refresh(&self, instance: u32) {
+        use nvidia_rm_sys::rm_init;
+        rm_init::edid_forget(instance);
+        let fresh = rm_init::edid(instance)
+            .ok()
+            .filter(|d| d.supported_status == 0 && d.display_mask != 0);
+        let mut snap = self.rm_display_snap.lock();
+        match (fresh, snap.as_mut()) {
+            (Some(d), _) => *snap = Some((instance, d)),
+            (None, Some((_, d))) => {
+                if let Ok(mask) = rm_init::connect_state(instance) {
+                    d.connected_mask = mask;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The connectors of a card that lights its own monitors read
+    /// disconnected until nvkms holds it: before that no modeset can light
+    /// them.
+    pub(super) fn nvkms_display_pending(&self) -> bool {
+        drives_own_display(self) && !self.nvkms_owns_display()
     }
 
     /// Run nvkms's due timers, and say how many microseconds until the next

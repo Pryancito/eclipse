@@ -488,6 +488,15 @@ pub fn set_gem_vram_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_vram_enabled(_v: bool) {}
 
+/// `nvidia.nvkms`: every NVIDIA card's display goes to nvkms, so DRM lists a
+/// CRTC on each card from boot on. Default off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nvkms_requested(v: bool) {
+    zcore_drivers::display::set_nvkms_requested(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_nvkms_requested(_v: bool) {}
+
 /// Creates `/dev/nvidiactl` and `/dev/nvidia<N>` for NVIDIA's own user-mode
 /// driver (`nvidia.nvidiactl`). Default off: see
 /// `linux-object/src/fs/devfs/nvidia.rs`.

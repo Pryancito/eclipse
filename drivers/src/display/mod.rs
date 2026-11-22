@@ -71,6 +71,10 @@ pub use nvidia::implicit_sync::{
 /// `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::pushbuf::set_enabled as set_gem_pushbuf_enabled;
+/// `nvidia.nvkms` was asked for, so every NVIDIA card's display is nvkms's,
+/// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::set_nvkms_requested;
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
     boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,

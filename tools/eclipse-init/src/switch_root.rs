@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn only_a_device_line_is_awaited() {
-        assert_eq!(awaited_in("/dev/nvme0n1p2\n"), Some("/dev/nvme0n1p2".into()));
+        assert_eq!(
+            awaited_in("/dev/nvme0n1p2\n"),
+            Some("/dev/nvme0n1p2".into())
+        );
         assert_eq!(awaited_in(""), None);
         assert_eq!(awaited_in("\n"), None);
         assert_eq!(awaited_in("rootfs\n"), None);

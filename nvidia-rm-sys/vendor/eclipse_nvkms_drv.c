@@ -94,9 +94,19 @@ static NvBool eclipse_kms_table(void)
     return g_nvKmsValid;
 }
 
+/* Hotplug events kapi delivered, on any device: what nv_drm_event_callback
+ * schedules nv_drm_handle_hotplug_event for. The DRM side reads it from its
+ * output poll (eclipse_kms_hotplug_count) and probes the cards again. */
+static volatile NvU32 g_eclipseKmsHotplugs;
+
+NvU32 eclipse_kms_hotplug_count(void)
+{
+    return g_eclipseKmsHotplugs;
+}
+
 /*
- * nv_drm_event_callback, minus the DRM side that has nothing to tell yet:
- * every event kapi delivers is logged, so a hotplug or a flip shows up.
+ * nv_drm_event_callback: every event kapi delivers is logged, so a hotplug
+ * or a flip shows up, and a hotplug is counted for the DRM side.
  */
 static void eclipse_kms_event(const struct NvKmsKapiEvent *event)
 {
@@ -104,10 +114,12 @@ static void eclipse_kms_event(const struct NvKmsKapiEvent *event)
     case NVKMS_EVENT_TYPE_DPY_CHANGED:
         eclipse_kms_logf(NVKMS_LOG_LEVEL_INFO, "display 0x%x changed",
                          event->u.displayChanged.display);
+        g_eclipseKmsHotplugs++;
         break;
     case NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED:
         eclipse_kms_logf(NVKMS_LOG_LEVEL_INFO, "dynamic display 0x%x connected",
                          event->u.dynamicDisplayConnected.display);
+        g_eclipseKmsHotplugs++;
         break;
     case NVKMS_EVENT_TYPE_FLIP_OCCURRED:
         break;
@@ -857,13 +869,15 @@ int eclipse_kms_flip(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *s
 }
 
 /*
- * A modeset on the configuration on screen: each head in `sets` (all of them
- * lit already) goes to its mode `modeIndex`, scanning out `s` unscaled at the
- * top left -- nvidia-drm's atomic commit of a CRTC whose MODE_ID and primary
- * plane changed. Validated first (commit = false, as atomic_check does);
- * `testOnly` stops there. When the commit fails, or `testOnly`, the
- * configuration is put back as it was, so what is on screen and what the
- * next flip starts from still agree.
+ * A modeset on the configuration on screen: each head in `sets` goes to its
+ * mode `modeIndex` on its display, scanning out `s` unscaled at the top left
+ * -- nvidia-drm's atomic commit of a CRTC whose MODE_ID and primary plane
+ * changed. A head in `sets` that is dark is lit (a monitor plugged in since),
+ * and a lit head left out of `sets` goes dark (its monitor went away), as
+ * nvidia-drm's commit of a CRTC whose `active` changed. Validated first
+ * (commit = false, as atomic_check does); `testOnly` stops there. When the
+ * commit fails, or `testOnly`, the configuration is put back as it was, so
+ * what is on screen and what the next flip starts from still agree.
  */
 int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *scanout,
                          const struct EclipseKmsSurface *s,
@@ -874,26 +888,33 @@ int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanou
     struct NvKmsKapiModeSetReplyConfig *reply = NULL;
     struct NvKmsKapiRequestedModeSetConfig *req;
     int result = ECLIPSE_KMS_BAD_REQUEST;
-    NvU32 i;
+    NvU32 i, head, layer, newLit = 0, savedLit;
 
     if (device == NULL || scanout == NULL || s == NULL || sets == NULL || numSets == 0 ||
         !g_nvKmsValid)
         return ECLIPSE_KMS_BAD_REQUEST;
     req = &scanout->req;
     for (i = 0; i < numSets; i++) {
-        NvBool pending = NV_FALSE;
-
         if (sets[i].head >= NVKMS_KAPI_MAX_HEADS ||
-            (scanout->litMask & (1u << sets[i].head)) == 0)
+            (req->headsMask & (1u << sets[i].head)) == 0 ||
+            (newLit & (1u << sets[i].head)) != 0)
             return ECLIPSE_KMS_BAD_REQUEST;
-        if (!testOnly) {
-            if (!g_nvKms.getFlipPendingStatus(device, sets[i].head,
+        newLit |= 1u << sets[i].head;
+    }
+    if (!testOnly) {
+        for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+            NvBool pending = NV_FALSE;
+
+            if ((scanout->litMask & (1u << head)) == 0)
+                continue;
+            if (!g_nvKms.getFlipPendingStatus(device, head,
                                               NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending))
                 return ECLIPSE_KMS_REFUSED;
             if (pending)
                 return ECLIPSE_KMS_FLIP_PENDING;
         }
     }
+    savedLit = scanout->litMask;
 
     /* Both are tens of kilobytes. */
     saved = nvkms_alloc(sizeof(*saved), NV_FALSE);
@@ -924,7 +945,31 @@ int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanou
         primary->flags.srcWHChanged = NV_TRUE;
         primary->flags.dstXYChanged = NV_TRUE;
         primary->flags.dstWHChanged = NV_TRUE;
+        if ((savedLit & (1u << sets[i].head)) == 0) {
+            h->flags.activeChanged = NV_TRUE;
+            primary->flags.cscChanged = NV_TRUE;
+        }
     }
+    /* A lit head no set names: dark, with nothing on its layers. */
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        struct NvKmsKapiHeadRequestedConfig *h = &req->headRequestedConfig[head];
+
+        if ((savedLit & ~newLit & (1u << head)) == 0)
+            continue;
+        h->modeSetConfig.bActive = NV_FALSE;
+        h->modeSetConfig.numDisplays = 0;
+        h->flags.activeChanged = NV_TRUE;
+        h->flags.displaysChanged = NV_TRUE;
+        for (layer = 0; layer < NVKMS_KAPI_LAYER_MAX; layer++) {
+            eclipse_kms_layer_clear(&h->layerRequestedConfig[layer].config);
+            h->layerRequestedConfig[layer].flags.surfaceChanged = NV_TRUE;
+        }
+        if (h->cursorRequestedConfig.surface != NULL) {
+            h->cursorRequestedConfig.surface = NULL;
+            h->cursorRequestedConfig.flags.surfaceChanged = NV_TRUE;
+        }
+    }
+    scanout->litMask = newLit;
 
     if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_FALSE)) {
         result = ECLIPSE_KMS_REFUSED;
@@ -945,6 +990,7 @@ int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanou
 
 restore:
     nvkms_memcpy(req, saved, sizeof(*req));
+    scanout->litMask = savedLit;
     eclipse_kms_settled(req);
 done:
     if (reply != NULL)

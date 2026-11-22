@@ -1616,11 +1616,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
             if nv.nvkms {
+                kernel_hal::drivers::set_nvkms_requested(true);
                 // The cursor is nvkms's cursor plane once it scans out the
                 // console card, as nvidia-drm's is; until then, and on any
                 // failure, the software cursor stays in charge.
                 linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
                 schedule_nvkms();
+                // Linux's output poll, for the monitors of every card: no
+                // driver here detects its connectors again but nvkms's, so
+                // without `nvidia.nvkms` it would only ever find nothing.
+                linux_object::fs::devfs::drm::spawn_hotplug_poll();
             }
 
             kernel_hal::console::early_progress_bar(95);

@@ -2465,6 +2465,11 @@ fn the_compositor_gets_the_console_card_and_keeps_its_hardware_cursor() {
         Some("/dev/dri/card0"),
         "the compositor is no longer pinned to the console GPU"
     );
+    assert!(
+        profile.contains("*\" nvidia.nvkms \"*)")
+            && profile.contains("WLR_DRM_DEVICES=\"$WLR_DRM_DEVICES:$c\""),
+        "with nvidia.nvkms the session opens every card, card0 first"
+    );
     assert_eq!(
         export(&profile, "WLR_LIBINPUT_NO_DEVICES"),
         Some("1"),
