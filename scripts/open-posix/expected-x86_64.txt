@@ -1,0 +1,297 @@
+# Tests de conformance/interfaces que NO pasan en Eclipse OS x86_64 (QEMU,
+# 3 CPUs, musl estatico), medido el 2026-11-22 con LTP 3b962a95. run.py da por
+# regresion cualquier test que no este aqui y no pase.
+#
+# Formato: <test> <estado> [# motivo]. FLAKY: sale de las dos maneras segun
+# los tiempos (TCG, carga del host); no cuenta ni como regresion ni como arreglo.
+#
+# Linux con los mismos binarios (contenedor, root) no pasa 184 de los 1596:
+# casi todo planificacion (musl), parte de AIO y de colas por limites del
+# contenedor. Eclipse no pasa los de esta lista; la diferencia con Linux son
+# sobre todo las colas de mensajes.
+
+conformance/interfaces/aio_cancel/2-1.run-test HUNG  # tambien se cuelga en Linux con musl
+conformance/interfaces/aio_cancel/3-1.run-test FAIL
+conformance/interfaces/aio_cancel/4-1.run-test FAIL
+conformance/interfaces/aio_cancel/5-1.run-test FAIL
+conformance/interfaces/aio_cancel/6-1.run-test FAIL
+conformance/interfaces/aio_cancel/7-1.run-test FAIL
+conformance/interfaces/aio_error/2-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/aio_error/3-1.run-test UNTESTED
+conformance/interfaces/aio_fsync/5-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/aio_read/10-1.run-test FAIL
+conformance/interfaces/aio_read/11-2.run-test FAIL
+conformance/interfaces/aio_read/8-1.run-test UNTESTED
+conformance/interfaces/aio_read/9-1.run-test UNSUPPORTED
+conformance/interfaces/aio_return/2-1.run-test UNTESTED
+conformance/interfaces/aio_return/3-2.run-test UNTESTED
+conformance/interfaces/aio_return/4-1.run-test UNTESTED
+conformance/interfaces/aio_suspend/1-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/aio_suspend/5-1.run-test UNSUPPORTED
+conformance/interfaces/aio_suspend/9-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/aio_write/6-1.run-test UNTESTED
+conformance/interfaces/aio_write/7-1.run-test UNSUPPORTED
+conformance/interfaces/aio_write/8-1.run-test FAIL
+conformance/interfaces/aio_write/9-2.run-test FAIL
+conformance/interfaces/clock_getcpuclockid/5-1.run-test UNTESTED
+conformance/interfaces/clock_settime/4-1.run-test UNTESTED
+conformance/interfaces/clock_settime/4-2.run-test FAIL
+conformance/interfaces/clock_settime/7-1.run-test UNTESTED
+conformance/interfaces/clock_settime/7-2.run-test UNTESTED
+conformance/interfaces/clock_settime/speculative/4-3.run-test FAIL
+conformance/interfaces/fork/17-1.run-test UNRESOLVED
+conformance/interfaces/fork/17-2.run-test UNRESOLVED
+conformance/interfaces/fork/19-1.run-test UNRESOLVED
+conformance/interfaces/fork/7-1.run-test UNRESOLVED
+conformance/interfaces/lio_listio/13-1.run-test FAIL
+conformance/interfaces/lio_listio/14-1.run-test FAIL
+conformance/interfaces/lio_listio/18-1.run-test FAIL
+conformance/interfaces/lio_listio/5-1.run-test FAIL
+conformance/interfaces/mlockall/3-6.run-test FAIL
+conformance/interfaces/mlockall/3-7.run-test FAIL
+conformance/interfaces/mmap/11-2.run-test FAIL
+conformance/interfaces/mmap/11-3.run-test FAIL
+conformance/interfaces/mmap/11-4.run-test UNTESTED
+conformance/interfaces/mmap/18-1.run-test FAIL
+conformance/interfaces/mmap/24-1.run-test HUNG  # no hay tope vm.max_map_count: mapea hasta agotar el tiempo
+conformance/interfaces/mmap/31-1.run-test UNSUPPORTED
+conformance/interfaces/mq_close/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_close/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_close/3-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_close/4-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_getattr/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_getattr/2-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_getattr/3-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_getattr/4-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_getattr/speculative/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/3-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/4-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/5-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/8-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_notify/9-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/1-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/11-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/12-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/13-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/15-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/16-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/18-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/19-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/20-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/23-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/25-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/27-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/27-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/29-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/7-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/7-3.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/8-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/8-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/9-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/9-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_open/speculative/26-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/1-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/10-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/11-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/11-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/12-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/13-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/5-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_receive/8-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/10-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/11-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/11-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/12-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/13-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/14-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/3-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/3-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/4-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/4-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/4-3.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/5-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/5-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/8-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_send/9-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_setattr/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_setattr/1-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_setattr/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_setattr/5-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/1-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/10-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/10-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/11-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/13-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/14-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/15-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/17-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/17-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/17-3.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/18-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/18-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/5-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/5-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/5-3.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/8-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedreceive/speculative/10-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/10-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/11-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/11-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/12-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/13-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/14-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/15-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/16-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/18-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/19-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/20-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/3-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/3-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/4-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/4-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/4-3.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/5-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/5-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/5-3.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/7-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/8-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/9-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_timedsend/speculative/18-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_unlink/1-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_unlink/2-1.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_unlink/2-2.run-test UNRESOLVED  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_unlink/7-1.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/mq_unlink/speculative/7-2.run-test FAIL  # no hay colas de mensajes POSIX (mq_* = ENOSYS)
+conformance/interfaces/pthread_attr_getstack/1-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setdetachstate/2-1.run-test SIGNAL
+conformance/interfaces/pthread_attr_setschedparam/speculative/3-1.run-test FAIL
+conformance/interfaces/pthread_attr_setschedparam/speculative/3-2.run-test FAIL
+conformance/interfaces/pthread_attr_setschedpolicy/2-1.run-test FAIL
+conformance/interfaces/pthread_attr_setschedpolicy/4-1.run-test FAIL
+conformance/interfaces/pthread_attr_setstack/1-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setstack/2-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setstack/4-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setstack/6-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setstack/7-1.run-test UNRESOLVED
+conformance/interfaces/pthread_attr_setstacksize/4-1.run-test UNRESOLVED
+conformance/interfaces/pthread_barrier_destroy/2-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_cancel/5-1.run-test SIGNAL
+conformance/interfaces/pthread_cond_broadcast/1-2.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/pthread_cond_destroy/speculative/4-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_create/1-5.run-test UNTESTED
+conformance/interfaces/pthread_create/1-6.run-test FAIL
+conformance/interfaces/pthread_create/14-1.run-test UNTESTED
+conformance/interfaces/pthread_create/15-1.run-test UNTESTED
+conformance/interfaces/pthread_create/3-2.run-test UNTESTED
+conformance/interfaces/pthread_detach/1-1.run-test SIGNAL
+conformance/interfaces/pthread_detach/2-2.run-test UNTESTED
+conformance/interfaces/pthread_detach/4-1.run-test SIGNAL
+conformance/interfaces/pthread_detach/4-2.run-test SIGNAL
+conformance/interfaces/pthread_detach/4-3.run-test UNTESTED
+conformance/interfaces/pthread_exit/1-2.run-test UNTESTED
+conformance/interfaces/pthread_exit/2-2.run-test UNTESTED
+conformance/interfaces/pthread_exit/3-2.run-test UNTESTED
+conformance/interfaces/pthread_exit/4-1.run-test UNTESTED
+conformance/interfaces/pthread_exit/5-1.run-test UNTESTED
+conformance/interfaces/pthread_exit/6-1.run-test UNTESTED
+conformance/interfaces/pthread_exit/6-2.run-test UNTESTED
+conformance/interfaces/pthread_getcpuclockid/speculative/3-1.run-test SIGNAL
+conformance/interfaces/pthread_join/1-2.run-test UNTESTED
+conformance/interfaces/pthread_join/4-1.run-test UNTESTED
+conformance/interfaces/pthread_join/6-2.run-test SIGNAL
+conformance/interfaces/pthread_join/6-3.run-test UNTESTED
+conformance/interfaces/pthread_join/speculative/6-1.run-test SIGNAL
+conformance/interfaces/pthread_mutex_getprioceiling/1-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_mutex_getprioceiling/3-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_mutex_getprioceiling/3-2.run-test UNSUPPORTED
+conformance/interfaces/pthread_mutex_getprioceiling/3-3.run-test UNSUPPORTED
+conformance/interfaces/pthread_mutex_init/1-2.run-test HUNG  # tambien se cuelga en Linux con musl
+conformance/interfaces/pthread_mutex_init/3-2.run-test HUNG  # tambien se cuelga en Linux con musl
+conformance/interfaces/pthread_mutex_init/speculative/5-2.run-test UNTESTED
+conformance/interfaces/pthread_mutex_setprioceiling/1-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_mutex_trylock/4-3.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/pthread_mutexattr_getprotocol/1-2.run-test UNRESOLVED
+conformance/interfaces/pthread_mutexattr_gettype/speculative/3-1.run-test UNTESTED
+conformance/interfaces/pthread_mutexattr_setprotocol/1-1.run-test UNRESOLVED
+conformance/interfaces/pthread_rwlock_unlock/3-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/pthread_rwlock_unlock/4-1.run-test UNSUPPORTED
+conformance/interfaces/pthread_rwlock_unlock/4-2.run-test UNSUPPORTED
+conformance/interfaces/pthread_rwlock_wrlock/3-1.run-test HUNG  # tambien se cuelga en Linux con musl
+conformance/interfaces/pthread_setcanceltype/1-1.run-test FAIL
+conformance/interfaces/sched_get_priority_max/1-3.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_get_priority_min/1-3.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getparam/1-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getparam/2-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getparam/3-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getparam/4-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getparam/6-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_getparam/speculative/7-1.run-test UNRESOLVED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getscheduler/1-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getscheduler/3-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getscheduler/4-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_getscheduler/7-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_rr_get_interval/1-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_rr_get_interval/2-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_rr_get_interval/3-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/1-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/2-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/2-2.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/22-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/23-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/23-2.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setparam/23-3.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setparam/23-4.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setparam/23-5.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setparam/23-6.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/23-7.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/25-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/26-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/27-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/5-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setparam/9-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/1-1.run-test UNRESOLVED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/15-1.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/16-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/17-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/17-2.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/17-3.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/17-4.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/17-5.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/17-6.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/17-7.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_setscheduler/19-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/19-2.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/19-3.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/19-4.run-test UNSUPPORTED  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/19-5.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/20-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/21-1.run-test FAIL  # musl: la planificacion POSIX de musl es ENOSYS
+conformance/interfaces/sched_setscheduler/4-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sched_yield/1-1.run-test UNRESOLVED  # musl: sched_setscheduler/getparam son ENOSYS a proposito (con glibc pasan)
+conformance/interfaces/sem_init/7-1.run-test FAIL
+conformance/interfaces/sem_post/8-1.run-test UNTESTED
+conformance/interfaces/sem_unlink/3-1.run-test FAIL
+conformance/interfaces/shm_open/23-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/shm_open/39-2.run-test UNTESTED
+conformance/interfaces/shm_unlink/10-2.run-test UNTESTED
+conformance/interfaces/shm_unlink/8-1.run-test UNRESOLVED
+conformance/interfaces/shm_unlink/9-1.run-test UNRESOLVED
+conformance/interfaces/sigaction/21-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/sigismember/5-1.run-test FAIL
+conformance/interfaces/sigpause/4-1.run-test HUNG  # tambien se cuelga en Linux con musl
+conformance/interfaces/sigwaitinfo/6-1.run-test FAIL
+conformance/interfaces/timer_getoverrun/2-3.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
+conformance/interfaces/timer_settime/2-1.run-test FLAKY  # depende de tiempos; visto pasar y fallar en la misma imagen
