@@ -1,11 +1,13 @@
 //! NVIDIA's own userspace for the vendored RM: `nvidia-smi`, NVML
-//! (`libnvidia-ml`) and the CUDA driver (`libcuda` and its PTX JIT), with the
+//! (`libnvidia-ml`), the CUDA driver (`libcuda` and its PTX JIT) and the video
+//! engines' libraries (`libnvcuvid` for NVDEC, `libnvidia-encode` for NVENC), with the
 //! glibc runtime they need. They are the real clients of `/dev/nvidiactl`
 //! (the `nvidia.nvidiactl` hatch). Installed unless the build is run with
 //! `ECLIPSE_NVIDIA_USERSPACE=0`, which also takes out NVIDIA's files an earlier
 //! build left in the rootfs. They never reach the QEMU live root, where there
 //! is no NVIDIA GPU for them. `/usr/bin/cuda-probe` (`cuda_probe.rs`), a
-//! check of CUDA through libcuda, comes and goes with them.
+//! check of CUDA through libcuda, and `/usr/bin/nvcodec-probe`, one of NVENC
+//! and NVDEC, come and go with them.
 //!
 //! # The version must match the vendored RM exactly
 //!
@@ -166,6 +168,25 @@ fn plan(version: &str) -> Plan {
         ));
     }
     links.push((format!("{LIBDIR}/libcuda.so"), "libcuda.so.1".to_string()));
+    // The video engines' libraries: NVDEC (`libnvcuvid`, and the optical
+    // flow library built on it) and NVENC (`libnvidia-encode`), which ffmpeg
+    // and the rest dlopen by their unversioned names as well. Like libcuda
+    // they need only glibc; `libvdpau_nvidia`, in the same package, needs
+    // X11 and is left out.
+    let decode = ["libnvcuvid", "libnvidia-opticalflow"];
+    let encode = ["libnvidia-encode"];
+    for lib in decode.iter().chain(encode.iter()) {
+        links.push((
+            format!("{LIBDIR}/{lib}.so.1"),
+            format!("{lib}.so.{version}"),
+        ));
+        links.push((format!("{LIBDIR}/{lib}.so"), format!("{lib}.so.1")));
+    }
+    let takes_of = |libs: &[&str]| -> Vec<Take> {
+        libs.iter()
+            .map(|lib| same(&format!("{LIBDIR}/{lib}.so.{version}")))
+            .collect()
+    };
     Plan {
         runtime: vec![
             (glibc, libc),
@@ -179,6 +200,8 @@ fn plan(version: &str) -> Plan {
                     .collect(),
             ),
             (nvidia("nvidia-utils"), vec![same("usr/bin/nvidia-smi")]),
+            (nvidia("libnvidia-decode"), takes_of(&decode)),
+            (nvidia("libnvidia-encode"), takes_of(&encode)),
         ],
         links,
         programs: vec!["usr/bin/nvidia-smi".to_string()],
@@ -450,7 +473,8 @@ pub(super) fn remove(root: &Path, why: &str) {
     let probe = fs::remove_file(root.join(super::cuda_probe::PATH)).is_ok() as usize
         + fs::remove_file(root.join(super::cuda_probe::STATUS_PATH)).is_ok() as usize
         + fs::remove_file(root.join(super::cuda_probe::INSTALL_OLLAMA_PATH)).is_ok() as usize
-        + fs::remove_file(root.join(super::cuda_probe::ECLIPSE_OLLAMA_PATH)).is_ok() as usize;
+        + fs::remove_file(root.join(super::cuda_probe::ECLIPSE_OLLAMA_PATH)).is_ok() as usize
+        + fs::remove_file(root.join(super::cuda_probe::NVCODEC_PATH)).is_ok() as usize;
     let removed = remove_with(root, &plan(&version)) + probe;
     if removed > 0 {
         println!(
@@ -470,7 +494,9 @@ pub(super) fn install(rootfs: &Path) {
         );
         return;
     };
-    println!("Installing NVIDIA's userspace {version} (nvidia-smi, NVML, libcuda) and glibc...");
+    println!(
+        "Installing NVIDIA's userspace {version} (nvidia-smi, NVML, libcuda, NVDEC, NVENC) and glibc..."
+    );
     let cache = PROJECT_DIR.join("ignored").join("nvidia-userspace-cache");
     match install_with(rootfs, &cache, &version, &plan(&version), &download) {
         Ok(()) => {

@@ -35,9 +35,11 @@ que coincidir con el `libcuda.so` del rootfs.
 `cargo image` instala (salvo `ECLIPSE_NVIDIA_USERSPACE=0`):
 
 - `libcuda.so.1`, `libnvidia-ptxjitcompiler`, `libnvidia-ml`, `nvidia-smi`
+- `libnvcuvid` (NVDEC), `libnvidia-opticalflow`, `libnvidia-encode` (NVENC)
 - glibc Ubuntu 26.10 + `/lib64/ld-linux-x86-64.so.2` (libcuda es glibc)
 - `/usr/bin/cuda-probe` — `cuInit` → devices → context → alloc/memset → **launch PTX**
 - `/usr/bin/cuda-status` — hatch + nodos + libcuda (`-p` lanza el probe)
+- `/usr/bin/nvcodec-probe` — NVENC codifica y NVDEC decodifica unos frames en cada GPU (`-g N` para una)
 
 No hace falta cuBLAS del sistema: el runner de Ollama trae sus libs CUDA y
 habla con este `libcuda` (driver API).
@@ -75,6 +77,16 @@ que el RM deja ir por PCIe. En GeForce el RM suele decir que no también en
 Linux; `nvidia.registry=ForceP2P=0x11` (como `NVreg_RegistryDwords`) le pide
 que lo intente. Sin P2P, `cuMemcpyPeer` copia pasando por la memoria del
 sistema. `cuda-probe -d` prueba las dos cosas (paso `peer`).
+
+**Vídeo (NVDEC/NVENC):** la imagen trae `libnvcuvid` (NVDEC, con
+`libnvidia-opticalflow`) y `libnvidia-encode` (NVENC), de los paquetes
+`libnvidia-decode` y `libnvidia-encode` de la misma versión que el RM. Como
+libcuda, hablan con el RM por `/dev/nvidiactl` y no necesitan nada más del
+kernel: los motores NVDEC/NVENC los reparte GSP-RM. `nvcodec-probe` lo
+comprueba en cada GPU: codifica 16 frames con NVENC (H.264 y HEVC), los
+decodifica con NVDEC y compara cada imagen con la original (PSNR ≥ 30 dB).
+Es lo que usan `ffmpeg -hwaccel cuda` y `-c:v h264_nvenc`. VDPAU
+(`libvdpau_nvidia`) no se incluye porque necesita X11.
 
 **Aún no:** page tables UVM propias / GPU page faults / HMM; el resto de ioctls
 UVM → `ENOSYS` (una línea en dmesg la primera vez).
