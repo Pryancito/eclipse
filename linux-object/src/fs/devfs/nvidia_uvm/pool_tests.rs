@@ -176,7 +176,7 @@ fn a_pool_is_refused_as_the_module_refuses_it() {
     }
     assert!(process.rm.state().lent.is_empty());
     assert!(process.rm.mapped().is_empty());
-    assert_eq!(cpu_map(&process).map(|_| ()), Err(LxError::ENODEV));
+    assert!(process.uvm.va_space.lock().pools.is_empty());
     // Each GPU named once, one of them cached, is a pool.
     assert_eq!(
         alloc(&process, &[(GPU0, 0, FORCE_CACHED), (GPU1, 0, 1)]),
@@ -302,8 +302,8 @@ fn a_pool_mapped_on_the_cpu_is_not_freed() {
 }
 
 /// An mmap maps exactly a pool, as its own pages; a range that only
-/// overlaps one, or an external range, is in use; any other would be
-/// managed memory; and an open that is not a VA space maps nothing.
+/// overlaps one, or an external range, is in use; any other is managed
+/// memory; and an open that is not a VA space maps nothing.
 #[test]
 fn mmap_maps_exactly_a_pool() {
     let process = with_both();
@@ -316,7 +316,9 @@ fn mmap_maps_exactly_a_pool() {
     assert_eq!(got(POOL, LENGTH - 0x1000), Err(LxError::EADDRINUSE));
     assert_eq!(got(POOL + 0x1000, LENGTH), Err(LxError::EADDRINUSE));
     assert_eq!(got(0x10_0000, 0x4000), Err(LxError::EADDRINUSE));
-    assert_eq!(got(0x40_0000, 0x1000), Err(LxError::ENODEV));
+    assert!(uvm.va_space.lock().managed.is_empty());
+    assert_eq!(got(0x40_0000, 0x1000), Ok(()));
+    assert!(uvm.va_space.lock().managed.contains_key(&0x40_0000));
     assert_eq!(
         uvm_on(&FakeRm::new())
             .get_vmo(POOL as usize, LENGTH as usize)
@@ -422,5 +424,6 @@ fn a_closed_ctl_open_makes_no_pool() {
     process.ctl = None;
     assert_eq!(alloc(&process, &[]), nvctl::NV_ERR_INVALID_CLIENT);
     assert!(process.rm.state().lent.is_empty());
-    assert_eq!(cpu_map(&process).map(|_| ()), Err(LxError::ENODEV));
+    // Nor managed memory, which needs that client as much.
+    assert_eq!(cpu_map(&process).map(|_| ()), Err(LxError::ENOMEM));
 }

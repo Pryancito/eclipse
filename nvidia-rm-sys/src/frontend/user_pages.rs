@@ -76,6 +76,17 @@ pub fn rm_escape_lending(
     status
 }
 
+/// Lend `pages` to the RM call in flight, made under [`CallScope`] by
+/// another front-end call than an escape ([`super::uvm::user_pages`]).
+pub(super) fn lend(pages: UserPages) {
+    *LENT.lock() = Some(pages);
+}
+
+/// What the RM did not take of [`lend`]'s pages, once the call is over.
+pub(super) fn take_back() -> Option<UserPages> {
+    LENT.lock().take()
+}
+
 /// The pages lent, if they are `count` pages from user address `va`, pinned
 /// for writing when `write` asks.
 fn take_if_fits(

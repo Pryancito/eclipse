@@ -29,6 +29,9 @@
 //   vmm       llama.cpp's buffer pool: a 32 GiB reservation with physical
 //             memory mapped into it piece by piece (cuMemCreate, cuMemMap,
 //             cuMemSetAccess), written by a kernel across the pieces.
+//   managed   cuMemAllocManaged memory written by the CPU, then a kernel,
+//             then read by the CPU; advised and prefetched both ways when
+//             the device has concurrent managed access.
 //   kernels   elementwise over many blocks, a block reduction (shuffles and
 //             shared memory), 64 KiB of dynamic shared memory, local memory
 //             (a per-thread array indexed at run time), atomics, int8 dot
@@ -58,6 +61,7 @@
 // CUDA headers.
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -277,6 +281,9 @@ static CUresult (*d_release)(CUmemGenericAllocationHandle);
 static CUresult (*d_map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
 static CUresult (*d_unmap)(CUdeviceptr, size_t);
 static CUresult (*d_set_access)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+static CUresult (*d_alloc_managed)(CUdeviceptr *, size_t, unsigned);
+static CUresult (*d_advise)(CUdeviceptr, size_t, int, CUdevice);
+static CUresult (*d_prefetch)(CUdeviceptr, size_t, CUdevice, CUstream);
 
 #define DEEP_SYM(var, name) (var = (__typeof__(var))sym(name)) != NULL
 
@@ -304,7 +311,8 @@ static int deep_symbols(void)
            DEEP_SYM(d_reserve, "cuMemAddressReserve") && DEEP_SYM(d_address_free, "cuMemAddressFree") &&
            DEEP_SYM(d_create, "cuMemCreate") && DEEP_SYM(d_release, "cuMemRelease") &&
            DEEP_SYM(d_map, "cuMemMap") && DEEP_SYM(d_unmap, "cuMemUnmap") &&
-           DEEP_SYM(d_set_access, "cuMemSetAccess");
+           DEEP_SYM(d_set_access, "cuMemSetAccess") && DEEP_SYM(d_alloc_managed, "cuMemAllocManaged") &&
+           DEEP_SYM(d_advise, "cuMemAdvise") && DEEP_SYM(d_prefetch, "cuMemPrefetchAsync");
 }
 
 // The check under way, for the watchdog to name.
@@ -602,6 +610,59 @@ static int deep_axpy(struct deep *g)
     return 1;
 }
 
+// cudaMallocManaged: one pointer the CPU and the GPU both use. The CPU
+// writes it, a kernel reads and writes it, and the CPU reads the answer
+// back with no copy. With concurrent managed access the memory is also
+// advised to the GPU and prefetched there and back, as llama.cpp's
+// GGML_CUDA_ENABLE_UNIFIED_MEMORY does.
+static int deep_managed(struct deep *g, CUdevice dev)
+{
+    enum { WORDS = 1 << 20, BYTES = WORDS * 4 };
+    deep_begin("managed");
+    int managed = 0, concurrent = 0;
+    // CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, _CONCURRENT_MANAGED_ACCESS
+    if (!deep_call("attribute", d_attribute(&managed, 83, dev)) ||
+        !deep_call("attribute", d_attribute(&concurrent, 89, dev)))
+        return 0;
+    if (!managed) {
+        printf("  managed    not offered by this device: skipped\n");
+        return 1;
+    }
+    CUdeviceptr m = 0;
+    CUfunction fn;
+    // CU_MEM_ATTACH_GLOBAL
+    if (!deep_call("cuMemAllocManaged", d_alloc_managed(&m, 3 * BYTES, 1)))
+        return 0;
+    unsigned *p = (unsigned *)(uintptr_t)m;
+    CUdeviceptr a = m, b = m + BYTES, c = m + 2 * BYTES;
+    deep_fill(p, WORDS, 0x3a3a);
+    deep_fill(p + WORDS, WORDS, 0x5c5c);
+    memset(p + 2 * WORDS, 0, BYTES);
+    for (size_t i = 0; i < WORDS; i++)
+        g->want[i] = p[i] * 3u + p[WORDS + i];
+    int ok = 1;
+    if (concurrent) {
+        // CU_MEM_ADVISE_SET_PREFERRED_LOCATION, _SET_ACCESSED_BY
+        ok = deep_call("cuMemAdvise", d_advise(m, 3 * BYTES, 3, dev)) &&
+             deep_call("cuMemAdvise", d_advise(m, 3 * BYTES, 5, dev)) &&
+             deep_call("cuMemPrefetchAsync", d_prefetch(m, 3 * BYTES, dev, g->stream));
+    }
+    unsigned n = WORDS;
+    void *args[] = {&c, &a, &b, &n};
+    ok = ok && deep_fn(g, "axpy_u32", &fn) && deep_run(g, fn, 256, DEEP_THREADS, 0, args, NULL) &&
+         deep_call("sync", d_ctx_sync());
+    // CU_DEVICE_CPU
+    if (ok && concurrent)
+        ok = deep_call("cuMemPrefetchAsync", d_prefetch(m, 3 * BYTES, -1, g->stream)) &&
+             deep_call("sync", d_stream_sync(g->stream));
+    ok = ok && deep_same(p + 2 * WORDS, g->want, WORDS);
+    if (ok)
+        printf("  managed    4 MiB written by the CPU, the GPU and the CPU%s  ok\n",
+               concurrent ? ", prefetched both ways" : "");
+    d_free(m);
+    return ok;
+}
+
 static int deep_reduce(struct deep *g)
 {
     deep_begin("reduce");
@@ -884,7 +945,7 @@ static int deep_gpu(CUdevice dev, int index, int sleeping)
         ok = deep_call("cuModuleLoadData", d_mod_load(&g.mod, kernels_ptx));
     }
     ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_file(&g) && deep_axpy(&g) &&
-         deep_vmm(&g, dev) && deep_reduce(&g) &&
+         deep_vmm(&g, dev) && deep_managed(&g, dev) && deep_reduce(&g) &&
          deep_shared(&g, dev) && deep_local(&g) && deep_atomics(&g) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
          deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g) &&
          (!sleeping || deep_sleeping(&g));

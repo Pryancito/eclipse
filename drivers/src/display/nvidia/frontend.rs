@@ -152,6 +152,22 @@ pub fn uvm_pages(
     nvidia_rm_sys::frontend::uvm::pages(caller, h_client, h_device, pages, gpu_cached)
 }
 
+/// `nvidia_rm_sys::frontend::uvm::user_pages`, refused with
+/// `NV_ERR_NOT_READY` while there is no RM core to lend the pages to (they
+/// are unpinned again then, as the RM never took them).
+pub fn uvm_user_pages(
+    caller: &Caller,
+    h_client: u32,
+    h_device: u32,
+    pages: UserPages,
+    gpu_cached: bool,
+) -> Result<u32, NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::user_pages(caller, h_client, h_device, pages, gpu_cached)
+}
+
 /// `nvidia_rm_sys::frontend::uvm::sked_reflected`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to map in.
 pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
