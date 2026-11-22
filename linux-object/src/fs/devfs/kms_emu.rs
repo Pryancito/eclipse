@@ -346,7 +346,9 @@ pub(crate) fn poke(pitch_px: u32, x: u32, y: u32, v: u32) {
 /// hardware KMS, and the only one is `NvidiaGpu` behind MMIO. So this is one,
 /// recording what it was asked to do and answering as a real driver would --
 /// including refusing a flip, which is the case the fallback exists for.
-use kernel_hal::drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture};
+use kernel_hal::drivers::scheme::drm::{
+    DisplayMode, DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture,
+};
 use kernel_hal::drivers::scheme::DrmScheme;
 
 /// First framebuffer id the emulated GPU hands out. Deliberately nowhere near
@@ -388,6 +390,8 @@ struct GpuCalls {
     /// Positions `hw_cursor_move` was given, in order.
     cursor_moves: Vec<(i32, i32)>,
     cursor_hides: u32,
+    /// Every `set_display_mode` that was not a test: (w, h, Hz, fb).
+    modesets: Vec<(u32, u32, u32, u32)>,
 }
 
 /// An emulated GPU driver. Build one with [`EmuGpu::new`], set what it claims,
@@ -445,6 +449,9 @@ pub(crate) struct EmuGpu {
     /// `gem_mmap` has them and `gem_aperture` answers `Sysmem`. What a PRIME
     /// import resolves to, and the only kind a second card can scan out of.
     sysmem_objects: Vec<(u32, u64)>,
+    /// The modes this GPU can set the panel to, as nvkms lists them; empty
+    /// for a driver that does no modesets.
+    modes: Vec<DisplayMode>,
     calls: Mutex<GpuCalls>,
 }
 
@@ -470,6 +477,7 @@ impl EmuGpu {
             nouveau_ready: AtomicBool::new(false),
             vram_objects: Vec::new(),
             sysmem_objects: Vec::new(),
+            modes: Vec::new(),
             calls: Mutex::new(GpuCalls::default()),
         }
     }
@@ -531,6 +539,13 @@ impl EmuGpu {
 
     /// The block this GPU reports for its connector, whatever it is. Passing one
     /// that is not a valid EDID is the point: the core has to refuse it.
+    /// A GPU that does real modesets (nvkms): it lists `modes` and sets any
+    /// of them.
+    pub(crate) fn with_modes(mut self, modes: &[DisplayMode]) -> EmuGpu {
+        self.modes = modes.to_vec();
+        self
+    }
+
     pub(crate) fn with_edid(mut self, block: [u8; 128]) -> EmuGpu {
         self.edid = Some(block);
         self
@@ -649,6 +664,30 @@ impl DrmScheme for EmuGpu {
             driver_fb_id,
         });
         Some(driver_fb_id)
+    }
+
+    fn display_modes(&self) -> Vec<DisplayMode> {
+        self.modes.clone()
+    }
+
+    fn set_display_mode(
+        &self,
+        w: u32,
+        h: u32,
+        hz: u32,
+        fb: u32,
+        test_only: bool,
+    ) -> Option<Result<(), alloc::string::String>> {
+        if self.modes.is_empty() {
+            return None;
+        }
+        if !self.modes.iter().any(|m| m.width == w && m.height == h) {
+            return Some(Err(alloc::string::String::from("no such mode")));
+        }
+        if !test_only {
+            self.calls.lock().modesets.push((w, h, hz, fb));
+        }
+        Some(Ok(()))
     }
 
     fn page_flip(&self, fb_id: u32) -> bool {
@@ -771,6 +810,11 @@ impl Gpu {
     /// DRIVER's ids, not the DRM core's.
     pub(crate) fn flips(&self) -> Vec<u32> {
         self.gpu.calls.lock().flips.clone()
+    }
+
+    /// Every modeset the driver committed: (w, h, Hz, fb).
+    pub(crate) fn modesets(&self) -> Vec<(u32, u32, u32, u32)> {
+        self.gpu.calls.lock().modesets.clone()
     }
 
     /// Every `create_fb` the driver served.

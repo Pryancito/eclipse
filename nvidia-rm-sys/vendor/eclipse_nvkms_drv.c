@@ -829,6 +829,104 @@ int eclipse_kms_flip(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *s
     return result;
 }
 
+/*
+ * A modeset on the configuration on screen: each head in `sets` (all of them
+ * lit already) goes to its mode `modeIndex`, scanning out `s` unscaled at the
+ * top left -- nvidia-drm's atomic commit of a CRTC whose MODE_ID and primary
+ * plane changed. Validated first (commit = false, as atomic_check does);
+ * `testOnly` stops there. When the commit fails, or `testOnly`, the
+ * configuration is put back as it was, so what is on screen and what the
+ * next flip starts from still agree.
+ */
+int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *scanout,
+                         const struct EclipseKmsSurface *s,
+                         const struct EclipseKmsHeadSet *sets, NvU32 numSets,
+                         NvBool testOnly)
+{
+    struct NvKmsKapiRequestedModeSetConfig *saved = NULL;
+    struct NvKmsKapiModeSetReplyConfig *reply = NULL;
+    struct NvKmsKapiRequestedModeSetConfig *req;
+    int result = ECLIPSE_KMS_BAD_REQUEST;
+    NvU32 i;
+
+    if (device == NULL || scanout == NULL || s == NULL || sets == NULL || numSets == 0 ||
+        !g_nvKmsValid)
+        return ECLIPSE_KMS_BAD_REQUEST;
+    req = &scanout->req;
+    for (i = 0; i < numSets; i++) {
+        NvBool pending = NV_FALSE;
+
+        if (sets[i].head >= NVKMS_KAPI_MAX_HEADS ||
+            (scanout->litMask & (1u << sets[i].head)) == 0)
+            return ECLIPSE_KMS_BAD_REQUEST;
+        if (!testOnly) {
+            if (!g_nvKms.getFlipPendingStatus(device, sets[i].head,
+                                              NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending))
+                return ECLIPSE_KMS_REFUSED;
+            if (pending)
+                return ECLIPSE_KMS_FLIP_PENDING;
+        }
+    }
+
+    /* Both are tens of kilobytes. */
+    saved = nvkms_alloc(sizeof(*saved), NV_FALSE);
+    reply = nvkms_alloc(sizeof(*reply), NV_TRUE);
+    if (saved == NULL || reply == NULL)
+        goto done;
+    nvkms_memcpy(saved, req, sizeof(*saved));
+
+    for (i = 0; i < numSets; i++) {
+        struct NvKmsKapiHeadRequestedConfig *h = &req->headRequestedConfig[sets[i].head];
+        struct NvKmsKapiLayerRequestedConfig *primary =
+            &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+        NvBool valid = NV_FALSE, preferred = NV_FALSE;
+
+        if (g_nvKms.getDisplayMode(device, sets[i].display, sets[i].modeIndex,
+                                   &h->modeSetConfig.mode, &valid, &preferred) < 0 ||
+            !valid) {
+            result = ECLIPSE_KMS_MODE_GONE;
+            goto restore;
+        }
+        h->modeSetConfig.bActive = NV_TRUE;
+        h->modeSetConfig.numDisplays = 1;
+        h->modeSetConfig.displays[0] = sets[i].display;
+        h->flags.modeChanged = NV_TRUE;
+        h->flags.displaysChanged = NV_TRUE;
+        eclipse_kms_primary(h, s);
+        primary->flags.srcXYChanged = NV_TRUE;
+        primary->flags.srcWHChanged = NV_TRUE;
+        primary->flags.dstXYChanged = NV_TRUE;
+        primary->flags.dstWHChanged = NV_TRUE;
+    }
+
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_FALSE)) {
+        result = ECLIPSE_KMS_REFUSED;
+        goto restore;
+    }
+    if (testOnly) {
+        result = ECLIPSE_KMS_SHOWN;
+        goto restore;
+    }
+    nvkms_memset(reply, 0, sizeof(*reply));
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        result = ECLIPSE_KMS_COMMIT_FAILED;
+        goto restore;
+    }
+    eclipse_kms_settled(req);
+    result = ECLIPSE_KMS_SHOWN;
+    goto done;
+
+restore:
+    nvkms_memcpy(req, saved, sizeof(*req));
+    eclipse_kms_settled(req);
+done:
+    if (reply != NULL)
+        nvkms_free(reply, sizeof(*reply));
+    if (saved != NULL)
+        nvkms_free(saved, sizeof(*saved));
+    return result;
+}
+
 /* Whether a flip on any lit head has yet to land: 1 yes, 0 no, -1 unknown. */
 int eclipse_kms_flip_pending(struct NvKmsKapiDevice *device,
                              const struct EclipseKmsScanout *scanout)

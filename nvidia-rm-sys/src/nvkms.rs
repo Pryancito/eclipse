@@ -60,6 +60,14 @@ extern "C" {
     ) -> i32;
     fn eclipse_kms_flip(device: *mut c_void, scanout: *mut c_void, surface: *const c_void) -> i32;
     fn eclipse_kms_flip_pending(device: *mut c_void, scanout: *const c_void) -> i32;
+    fn eclipse_kms_set_mode(
+        device: *mut c_void,
+        scanout: *mut c_void,
+        surface: *const c_void,
+        sets: *const KmsHeadSet,
+        num_sets: u32,
+        test_only: u8,
+    ) -> i32;
     fn eclipse_kms_cursor_surface(
         device: *mut c_void,
         h_client: *mut u32,
@@ -412,6 +420,38 @@ impl KmsDevice {
         }
     }
 
+    /// A modeset on the configuration on screen: each head in `sets`, all
+    /// lit already, goes to its mode and scans out `surface` unscaled.
+    /// `test_only` only validates it (DRM's `TEST_ONLY`). On any failure,
+    /// and after a test, the configuration is what it was.
+    /// [`ShowError::FlipPending`] while a flip has yet to land.
+    pub fn set_mode(
+        &self,
+        scanout: &KmsScanout,
+        surface: &KmsSurface,
+        sets: &[KmsHeadSet],
+        test_only: bool,
+    ) -> Result<(), ShowError> {
+        #[cfg(target_os = "none")]
+        {
+            ShowError::from_code(unsafe {
+                eclipse_kms_set_mode(
+                    self.0.as_ptr(),
+                    scanout.0.as_ptr(),
+                    surface.0.as_ptr(),
+                    sets.as_ptr(),
+                    sets.len() as u32,
+                    test_only as u8,
+                )
+            })
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (scanout, surface, sets, test_only);
+            Err(ShowError::BadRequest)
+        }
+    }
+
     /// The cursor plane's surface: [`CURSOR_SIZE`] square, A8R8G8B8, in
     /// video memory, with the RM client and handle its image is written
     /// through ([`crate::rm_init::write_memory`]).
@@ -610,6 +650,64 @@ pub fn console_mode(modes: &[KmsMode], width: u32, height: u32) -> Option<usize>
         .map(|(i, _)| i)
 }
 
+/// Rounded to whole hertz, as `drm_mode_modeinfo::vrefresh` carries it.
+pub fn refresh_hz(m: &KmsMode) -> u32 {
+    (m.refresh_millihz + 500) / 1000
+}
+
+/// The modes a DRM connector lists for a display, the way
+/// `nv_drm_connector_get_modes` adds nvkms's validated modes: valid and
+/// progressive only, one per size and whole refresh rate (the first nvkms
+/// gave), the preferred one first and the rest largest first.
+pub fn connector_modes(modes: &[KmsMode]) -> Vec<KmsMode> {
+    let mut out: Vec<KmsMode> = Vec::new();
+    for m in modes.iter().filter(|m| m.valid != 0 && m.interlaced == 0) {
+        let same = |o: &KmsMode| {
+            o.width == m.width && o.height == m.height && refresh_hz(o) == refresh_hz(m)
+        };
+        if let Some(o) = out.iter_mut().find(|o| same(o)) {
+            o.preferred |= m.preferred;
+            continue;
+        }
+        out.push(*m);
+    }
+    out.sort_by(|a, b| {
+        (b.preferred != 0)
+            .cmp(&(a.preferred != 0))
+            .then((b.width * b.height).cmp(&(a.width * a.height)))
+            .then(b.refresh_millihz.cmp(&a.refresh_millihz))
+    });
+    out
+}
+
+/// The index, in nvkms's own list, of the mode a DRM client asked for:
+/// `width`x`height` and, among those, the refresh rate closest to
+/// `refresh_hz` (0: the preferred one, else the one closest to 60 Hz).
+/// Valid and progressive only.
+pub fn requested_mode(
+    modes: &[KmsMode],
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> Option<usize> {
+    let fits =
+        |m: &KmsMode| m.valid != 0 && m.interlaced == 0 && m.width == width && m.height == height;
+    let target = if refresh_hz == 0 {
+        if let Some(i) = modes.iter().position(|m| fits(m) && m.preferred != 0) {
+            return Some(i);
+        }
+        60_000
+    } else {
+        refresh_hz * 1000
+    };
+    modes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| fits(m))
+        .min_by_key(|(_, m)| (m.refresh_millihz.abs_diff(target), m.preferred == 0))
+        .map(|(i, _)| i)
+}
+
 /// The console modeset for one GPU: which head and mode each connected
 /// display gets, and one line for each display left dark. Displays take the
 /// lowest free head they can be driven from, in nvkms's order, the way the
@@ -777,6 +875,78 @@ mod tests {
         d[5..5 + name.len()].copy_from_slice(name);
         d[5 + name.len()] = b'\n';
         e
+    }
+
+    fn mode_mhz(w: u32, h: u32, mhz: u32, preferred: bool) -> KmsMode {
+        KmsMode {
+            width: w,
+            height: h,
+            refresh_millihz: mhz,
+            pixel_clock_khz: 1,
+            valid: 1,
+            preferred: preferred as u8,
+            interlaced: 0,
+            pad: 0,
+        }
+    }
+
+    #[test]
+    fn connector_modes_put_the_preferred_first_and_drop_duplicates() {
+        let mut interlaced = mode_mhz(1920, 1080, 60_000, false);
+        interlaced.interlaced = 1;
+        let mut invalid = mode_mhz(3840, 2160, 60_000, false);
+        invalid.valid = 0;
+        let modes = [
+            mode_mhz(1280, 720, 60_000, false),
+            mode_mhz(1366, 768, 59_790, true),
+            mode_mhz(1366, 768, 60_000, false),
+            interlaced,
+            invalid,
+            mode_mhz(1920, 1080, 60_000, false),
+            mode_mhz(1920, 1080, 50_000, false),
+        ];
+        let list = connector_modes(&modes);
+        let got: Vec<(u32, u32, u32)> = list
+            .iter()
+            .map(|m| (m.width, m.height, refresh_hz(m)))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1366, 768, 60),
+                (1920, 1080, 60),
+                (1920, 1080, 50),
+                (1280, 720, 60)
+            ]
+        );
+        assert_eq!(
+            list[0].preferred, 1,
+            "the duplicate kept the preferred mark"
+        );
+    }
+
+    #[test]
+    fn requested_mode_matches_size_then_refresh() {
+        let modes = [
+            mode_mhz(1920, 1080, 60_000, false),
+            mode_mhz(1920, 1080, 50_000, false),
+            mode_mhz(1366, 768, 59_790, true),
+            mode_mhz(1366, 768, 75_000, false),
+        ];
+        assert_eq!(requested_mode(&modes, 1920, 1080, 50), Some(1));
+        assert_eq!(requested_mode(&modes, 1920, 1080, 60), Some(0));
+        assert_eq!(requested_mode(&modes, 1366, 768, 60), Some(2));
+        assert_eq!(
+            requested_mode(&modes, 1366, 768, 0),
+            Some(2),
+            "the preferred one"
+        );
+        assert_eq!(
+            requested_mode(&modes, 1920, 1080, 0),
+            Some(0),
+            "closest to 60 Hz"
+        );
+        assert_eq!(requested_mode(&modes, 800, 600, 60), None);
     }
 
     #[test]

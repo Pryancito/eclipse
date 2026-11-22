@@ -4158,6 +4158,21 @@ impl DrmScheme for NvidiaGpu {
         NvidiaGpu::nvkms_service(self)
     }
 
+    fn display_modes(&self) -> Vec<crate::scheme::drm::DisplayMode> {
+        nvkms_takeover::display_modes(self)
+    }
+
+    fn set_display_mode(
+        &self,
+        w: u32,
+        h: u32,
+        hz: u32,
+        fb: u32,
+        test: bool,
+    ) -> Option<Result<(), String>> {
+        self.nvkms_set_mode(w, h, hz, self.kms_fb(fb).as_ref(), test)
+    }
+
     fn build_console_gr_ladder(&self) -> String {
         if !self.drives_boot_display() {
             return String::new();

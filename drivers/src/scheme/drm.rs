@@ -76,6 +76,18 @@ pub enum GemAperture {
     Unknown,
 }
 
+/// One mode a display can take, as a driver that does real modesets lists
+/// it for the panel's connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMode {
+    pub width: u32,
+    pub height: u32,
+    /// Whole hertz, as `drm_mode_modeinfo::vrefresh`.
+    pub refresh_hz: u32,
+    pub pixel_clock_khz: u32,
+    pub preferred: bool,
+}
+
 /// DRM Connector (output)
 #[derive(Debug, Clone, Copy)]
 pub struct DrmConnector {
@@ -497,6 +509,27 @@ pub trait DrmScheme: Scheme {
     /// to log; empty for a card that is not NVIDIA's or is already nvkms's.
     fn nvkms_load(&self) -> alloc::vec::Vec<alloc::string::String> {
         alloc::vec::Vec::new()
+    }
+
+    /// The modes the panel's monitor can be set to, when this driver does
+    /// real modesets (nvidia-modeset on the card it scans out). Empty: the
+    /// panel keeps the one mode the firmware set.
+    fn display_modes(&self) -> alloc::vec::Vec<DisplayMode> {
+        alloc::vec::Vec::new()
+    }
+
+    /// Set the panel's monitor to `width`x`height` at about `refresh_hz`,
+    /// scanning out `fb_id`; `test_only` validates it and changes nothing.
+    /// `None` when this driver does not do modesets; the error says why.
+    fn set_display_mode(
+        &self,
+        _width: u32,
+        _height: u32,
+        _refresh_hz: u32,
+        _fb_id: u32,
+        _test_only: bool,
+    ) -> Option<Result<(), alloc::string::String>> {
+        None
     }
 
     /// Run nvidia-modeset's due timers (Linux runs them from a kthread).

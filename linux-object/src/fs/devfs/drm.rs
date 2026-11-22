@@ -2342,6 +2342,10 @@ mod card_fbs;
 use card_fbs::CardFbs;
 pub use card_fbs::PANEL_CARD;
 
+mod atomic_rollback;
+use atomic_rollback::restore_atomic_state;
+mod panel_mode;
+pub use panel_mode::{driver_modes, needs_modeset, panel_mode, set_mode, ModeRefused};
 mod panel_state;
 #[cfg(test)]
 pub(crate) use panel_state::panel_fb_for_test;
@@ -7283,29 +7287,9 @@ pub enum AtomicError {
 ///
 /// The pipeline is fixed (one CRTC/connector/plane, one mode), so "check"
 /// means: referenced objects exist, the mode blob is a well-formed
-/// `drm_mode_modeinfo` matching the native mode, source rects fit the
+/// `drm_mode_modeinfo` of the panel's mode or one its driver can set
+/// ([`panel_mode`]), source rects fit the
 /// framebuffer, and mode/active changes carry `ALLOW_MODESET`.
-/// Put back the state [`atomic_commit`] saved before its commit phase, so a
-/// commit that fails at the present is all-or-nothing the way Linux's is.
-fn restore_atomic_state(saved: (AtomicKmsState, u32, Option<(u32, Vec<u8>)>)) {
-    let (atomic, crtc_fb, blob) = saved;
-    let mut state = DRM_STATE.lock();
-    state.atomic = atomic;
-    state.crtc_fb.set(PANEL_CARD, crtc_fb);
-    if let Some((id, data)) = blob {
-        if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == id) {
-            existing.data = data;
-        }
-    }
-    drop(state);
-    reset_vblank_period();
-    if atomic.mode_blob_id != 0 {
-        if let Some(data) = get_blob(atomic.mode_blob_id) {
-            set_vblank_period_from_modeinfo(&data);
-        }
-    }
-}
-
 pub fn atomic_commit(
     upd: &AtomicUpdate,
     test_only: bool,
@@ -7339,7 +7323,7 @@ pub fn atomic_commit(
 
     // MODE_ID blob: must exist, be exactly one drm_mode_modeinfo (68 bytes),
     // and name the panel's fixed mode — there is nothing else to program.
-    let mut mode_change = false;
+    let (mut mode_change, mut modeset) = (false, None);
     if let Some(blob_id) = upd.mode_blob {
         if blob_id != 0 {
             let Some(data) = get_blob(blob_id) else {
@@ -7359,14 +7343,17 @@ pub fn atomic_commit(
             }
             let hdisplay = u16::from_ne_bytes([data[4], data[5]]) as u32;
             let vdisplay = u16::from_ne_bytes([data[14], data[15]]) as u32;
-            let (w, h, _) = display_mode().ok_or(AtomicError::Device)?;
-            if hdisplay != w || vdisplay != h {
-                log::error!(
-                    "[drm] ATOMIC reject (test_only={}): requested mode {}x{} != panel fixed mode {}x{} \
-                     (wlroots picked a mode we don't scan out; the connector should advertise only {}x{})",
-                    test_only, hdisplay, vdisplay, w, h, w, h
-                );
-                return Err(AtomicError::Invalid);
+            let hz = u32::from_ne_bytes([data[24], data[25], data[26], data[27]]);
+            let (w, h) = panel_mode().ok_or(AtomicError::Device)?;
+            if needs_modeset(hdisplay, vdisplay) {
+                // Only a driver that does real modesets (nvkms) can take it.
+                let fb = upd.plane_fb_id.unwrap_or_else(crtc_fb);
+                if let Err(why) = set_mode(hdisplay, vdisplay, hz, fb, true) {
+                    let m = (hdisplay, vdisplay, hz);
+                    log::error!("[drm] ATOMIC reject: mode {m:?} != panel {w}x{h}: {why:?}");
+                    return Err(AtomicError::Invalid);
+                }
+                modeset = Some((hdisplay, vdisplay, hz, fb));
             }
             mode_change = cur.mode_blob_id == 0;
         } else {
@@ -7554,6 +7541,10 @@ pub fn atomic_commit(
     // for a delivery that never finishes.
     if completion && !settle_outstanding_flip() {
         return Err(AtomicError::Busy);
+    }
+    // The modeset goes first, before any state: a refusal leaves it all.
+    if let Some((w, h, hz, fb)) = modeset {
+        set_mode(w, h, hz, fb, false).map_err(|_| AtomicError::Device)?;
     }
 
     // --- Commit phase ---

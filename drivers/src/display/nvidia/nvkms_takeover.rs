@@ -26,7 +26,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use nvidia_rm_sys::nvkms::{self, KmsDevice, KmsInfo, KmsScanout, KmsSurface, ShowError};
+use nvidia_rm_sys::nvkms::{
+    self, KmsDevice, KmsHeadSet, KmsInfo, KmsMode, KmsScanout, KmsSurface, ShowError,
+};
 use nvidia_rm_sys::nvkms_os;
 
 /// What nvkms holds of one card, for the rest of the boot: nvkms has its core
@@ -49,6 +51,13 @@ struct Scanout {
     /// The fb on screen; 0 for the console.
     on_screen: u32,
     cursor: Option<Cursor>,
+    /// The lit heads, with the display and mode index each one shows.
+    sets: Vec<KmsHeadSet>,
+    /// The mode a DRM client set (width, height, refresh in Hz), `None`
+    /// while the heads still show the console's mode. Away from the
+    /// console's mode the console no longer fits the screen, so it is never
+    /// put back on it.
+    mode: Option<(u32, u32, u32)>,
 }
 
 /// The cursor plane's surface, and where the pointer is.
@@ -64,6 +73,20 @@ struct Cursor {
 /// How long a flip waits for the previous one to land: three frames at
 /// 60 Hz. A flip past it loses its frame, as `surfaceflip_drain` does.
 const FLIP_WAIT_US: u64 = 50_000;
+
+/// [`NvidiaGpu::nvkms_modes`] in the shape the DRM layer lists.
+pub(super) fn display_modes(gpu: &NvidiaGpu) -> Vec<crate::scheme::drm::DisplayMode> {
+    gpu.nvkms_modes()
+        .iter()
+        .map(|m| crate::scheme::drm::DisplayMode {
+            width: m.width,
+            height: m.height,
+            refresh_hz: nvkms::refresh_hz(m),
+            pixel_clock_khz: m.pixel_clock_khz,
+            preferred: m.preferred != 0,
+        })
+        .collect()
+}
 
 fn now_us() -> u64 {
     unsafe { crate::bus::drivers_timer_now_as_micros() }
@@ -155,6 +178,7 @@ pub(super) fn console_depth(width: u32, pitch: u32) -> u32 {
 static FIRST_FLIP: AtomicBool = AtomicBool::new(false);
 static FLIP_FAILED: AtomicBool = AtomicBool::new(false);
 static CONSOLE_BACK_FAILED: AtomicBool = AtomicBool::new(false);
+static OFF_MODE_COPY: AtomicBool = AtomicBool::new(false);
 static CURSOR_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// One `[nvkms]` line per boot for a per-frame event.
@@ -333,6 +357,8 @@ impl NvidiaGpu {
                     fbs: Vec::new(),
                     on_screen: 0,
                     cursor: None,
+                    sets,
+                    mode: None,
                 })
             }
             Err(e) => {
@@ -412,6 +438,18 @@ impl NvidiaGpu {
         let scanout = card.scanout.as_mut()?;
         let in_vram = fb.h_memory != 0 && fb.vram_offset.is_some();
         if !in_vram || !self.nvkms_import(device, scanout, fb) {
+            if scanout.mode.is_some() {
+                // The console does not fit a mode a client set.
+                log_once(&OFF_MODE_COPY, || {
+                    format!(
+                        "{}: fb {} no se puede voltear y la consola no cabe en el modo {:?};                          ese frame se pierde",
+                        self.bdf_tag(),
+                        fb.id,
+                        scanout.mode
+                    )
+                });
+                return Some(false);
+            }
             if scanout.flip_to(device, 0).is_err() {
                 log_once(&CONSOLE_BACK_FAILED, || {
                     format!("{}: no se pudo volver a la consola", self.bdf_tag())
@@ -450,6 +488,114 @@ impl NvidiaGpu {
                 Some(false)
             }
         }
+    }
+
+    /// The modes the monitor on screen can take, for the DRM connector:
+    /// nvkms's validated modes of the first lit display. Empty when nvkms
+    /// does not scan out this card, or without `nvidia.gem_vram`.
+    pub(super) fn nvkms_modes(&self) -> Vec<KmsMode> {
+        // A modeset scans out the compositor's buffer, and only one in VRAM
+        // can be: without `nvidia.gem_vram` every modeset would be refused,
+        // so the connector keeps listing the firmware's one mode.
+        if !super::gem_vram::enabled() {
+            return Vec::new();
+        }
+        let guard = self.nvkms_device.lock();
+        let Some(card) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let Some(set) = card.scanout.as_ref().and_then(|s| s.sets.first()) else {
+            return Vec::new();
+        };
+        nvkms::connector_modes(&card.device.modes(set.display))
+    }
+
+    /// A modeset through nvkms: every lit head to `width`x`height` at the
+    /// refresh rate closest to `refresh_hz`, scanning out `fb` -- nvidia-drm's
+    /// atomic commit of a new MODE_ID. `fb` has to be in VRAM: the console
+    /// only fits the mode it was made at. `test_only` validates it and
+    /// changes nothing. `None` when nvkms does not scan out this card.
+    pub(super) fn nvkms_set_mode(
+        &self,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        fb: Option<&NvidiaKmsFramebuffer>,
+        test_only: bool,
+    ) -> Option<Result<(), String>> {
+        let tag = self.bdf_tag();
+        let mut guard = self.nvkms_device.lock();
+        let card = guard.as_mut()?;
+        let device = &card.device;
+        let scanout = card.scanout.as_mut()?;
+        let result = (|| {
+            let Some(fb) = fb.filter(|fb| fb.h_memory != 0 && fb.vram_offset.is_some()) else {
+                return Err(String::from(
+                    "el fb no esta en VRAM (arranca con nvidia.gem_vram); nvkms solo escanea VRAM",
+                ));
+            };
+            if fb.width < width || fb.height < height {
+                return Err(format!("el fb {}x{} no cubre el modo", fb.width, fb.height));
+            }
+            let mut sets = scanout.sets.clone();
+            for set in sets.iter_mut() {
+                let modes = device.modes(set.display);
+                let Some(i) = nvkms::requested_mode(&modes, width, height, refresh_hz) else {
+                    return Err(format!("la pantalla {:#x} no tiene ese modo", set.display));
+                };
+                set.mode_index = i as u32;
+            }
+            if !self.nvkms_import(device, scanout, fb) {
+                return Err(String::from("nvkms no acepta el fb como superficie"));
+            }
+            let surface = scanout
+                .surface_of(fb.id)
+                .ok_or_else(|| String::from("sin superficie"))?;
+            let start = now_us();
+            loop {
+                match device.set_mode(&scanout.state, surface, &sets, test_only) {
+                    Err(ShowError::FlipPending) if now_us().wrapping_sub(start) < FLIP_WAIT_US => {
+                        core::hint::spin_loop()
+                    }
+                    Err(e) => return Err(String::from(e.describe())),
+                    Ok(()) => break,
+                }
+            }
+            if !test_only {
+                let console = super::BOOT_FB_INFO
+                    .lock()
+                    .is_some_and(|c| c.width == width && c.height == height);
+                scanout.sets = sets;
+                scanout.on_screen = fb.id;
+                scanout.mode = (!console).then_some((width, height, refresh_hz));
+                let mut kms = self.kms_state.lock();
+                kms.crtc_fb = fb.id;
+                kms.plane_fb = fb.id;
+                kms.last_vblank_us = now_us();
+            }
+            Ok(())
+        })();
+        if !test_only {
+            match &result {
+                Ok(()) => crate::klog_info!(
+                    "[nvkms] {}: modeset hecho: {}x{} a {} Hz en {} cabeza(s)",
+                    tag,
+                    width,
+                    height,
+                    refresh_hz,
+                    scanout.sets.len()
+                ),
+                Err(why) => crate::klog_warn!(
+                    "[nvkms] {}: modeset a {}x{} a {} Hz rechazado: {}; la pantalla sigue igual",
+                    tag,
+                    width,
+                    height,
+                    refresh_hz,
+                    why
+                ),
+            }
+        }
+        Some(result)
     }
 
     /// Make sure `fb` has its nvkms surface: its GEM duped into kapi's RM
@@ -514,8 +660,11 @@ impl NvidiaGpu {
         let Some(scanout) = card.scanout.as_mut() else {
             return;
         };
+        // Away from the console's mode there is nothing to put back: the
+        // surface on screen stays until the next flip or modeset.
         if ids.contains(&scanout.on_screen)
-            && !(scanout.flip_to(device, 0).is_ok() && scanout.wait_landed(device))
+            && (scanout.mode.is_some()
+                || !(scanout.flip_to(device, 0).is_ok() && scanout.wait_landed(device)))
         {
             // Still on screen: keep the surface (and the memory it holds a
             // reference on) rather than have nvkms scan out freed VRAM.
