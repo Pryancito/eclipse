@@ -34,6 +34,7 @@ fn a_timer(owner: KoID, notify: TimerNotify) -> usize {
             next: ms(1000),
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         },
     );
     id

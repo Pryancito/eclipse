@@ -404,7 +404,28 @@ pub fn memfd_grow_allowed(inode: &Arc<dyn INode>, end: u64) -> bool {
     }
 }
 
+/// `(created_total, live_count)` for memfd inodes, touching no inode.
+///
+/// For the callers that run inside the kernel heap's own `alloc` (the
+/// `[heap-pressure]` report) or inside `alloc_error`. [`memfd_stats`] reads
+/// each inode's size through `metadata()`, which takes that inode's spin
+/// `RwLock`: a memfd `write_at` or `ftruncate` holds it for writing while it
+/// grows the file -- a heap allocation -- so the report that allocation
+/// triggers spun on a lock its own CPU held, for good. Upgrading a weak ref
+/// there could also run the inode's `Drop` inside the allocator. Only weak
+/// counts are read here; the registry is not pruned.
+pub fn memfd_counts() -> (usize, usize) {
+    let created = MEMFD_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+    let Some(live) = MEMFD_LIVE.try_lock() else {
+        return (created, 0);
+    };
+    let count = live.iter().filter(|(_, w, _)| w.strong_count() > 0).count();
+    (created, count)
+}
+
 /// (created_total, live_count, live_bytes) for memfd inodes.
+///
+/// Not from inside the allocator or the OOM handler: see [`memfd_counts`].
 ///
 /// Uses `try_lock`: this is called from the OOM handler, and a concurrent
 /// `new_memfd` registration (or a caller further up the stack) may hold the

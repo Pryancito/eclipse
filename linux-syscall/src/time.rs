@@ -925,6 +925,9 @@ impl Syscall<'_> {
         let now = itimer_now(self.zircon_process(), which);
         let owner = self.zircon_process().id();
         let (old, arm) = set_itimer(self.linux_process().itimers(), which, value, interval, now);
+        if which == ITIMER_REAL {
+            self.linux_process().itimers().cancel_real_timer();
+        }
         // Reported LAST, after the timer is armed. Writing it here used to
         // abort the call on a faulting pointer with the slot ALREADY changed
         // and `arm_itimer` never reached: the process was left with a timer
@@ -984,6 +987,7 @@ impl Syscall<'_> {
                 deadline.map(|deadline| (deadline, generation)),
             )
         };
+        self.linux_process().itimers().cancel_real_timer();
         if let Some((deadline, generation)) = arm {
             arm_itimer(owner, ITIMER_REAL, deadline, generation);
         }
@@ -1025,6 +1029,7 @@ impl Syscall<'_> {
             next: Duration::ZERO,
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         };
         register_posix_timer(timer, |id| {
             let mut out: UserOutPtr<i32> = timerid.into();
@@ -1091,6 +1096,14 @@ impl Syscall<'_> {
         let now = kernel_hal::timer::timer_now();
         let now_wall = kernel_hal::timer::wall_clock_now();
         let (old, arm) = set_posix_timer(id, owner, base, abs, init, interval, now, now_wall)?;
+        // The owner is checked: take out the kernel timer of the arm before.
+        let old_wheel = POSIX_TIMERS
+            .lock()
+            .get_mut(&id)
+            .and_then(|t| t.wheel.take());
+        if let Some(w) = old_wheel {
+            kernel_hal::timer::timer_cancel(w);
+        }
         stale::drop_signal_from_before(id, owner);
         // Same as `setitimer`: armed first, reported after. A faulting
         // `old_value` used to leave the timer recorded as due and never armed.
@@ -1477,6 +1490,20 @@ struct PosixTimer {
     /// What `si_overrun` and `timer_getoverrun(2)` say about the expiries
     /// that went by without a signal of their own.
     overrun: Overrun,
+    /// The kernel timer last set for it, taken out when it is re-armed
+    /// (`timer_settime`) and when it goes (`timer_delete`, its owner's exit:
+    /// `Drop`). A replaced one always expired silently (`generation`), but it
+    /// stayed queued on its CPU's timer heap until its old deadline, one
+    /// event and boxed closure per `timer_settime`.
+    wheel: Option<kernel_hal::deadline::TimerId>,
+}
+
+impl Drop for PosixTimer {
+    fn drop(&mut self) {
+        if let Some(id) = self.wheel.take() {
+            kernel_hal::timer::timer_cancel(id);
+        }
+    }
 }
 
 lazy_static! {
@@ -1852,8 +1879,13 @@ fn rearm_itimer_slot(slot: &mut ItimerSlot, deadline: Option<Duration>, interval
 /// exited process fails the lookup, or finds the process its pid went to,
 /// whose slot never has `gen` (see [`rearm_itimer_slot`]), and the chain stops
 /// without the timer wheel keeping the process object alive.
+///
+/// The kernel timer is put on record in the process's [`Itimers`] so that a
+/// re-arm or disarm can take it out (see `Itimers::cancel_real_timer`).
+/// Replaced, not cancelled, from the callback: the one on record then is
+/// the one running.
 fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
-    kernel_hal::timer::timer_set(
+    let id = kernel_hal::timer::timer_set_cancellable(
         deadline,
         Box::new(move |now| {
             if let Some(next) = expire_itimer(owner, which, gen, now) {
@@ -1861,6 +1893,13 @@ fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
             }
         }),
     );
+    if which == ITIMER_REAL {
+        if let Some(proc) = ROOT_JOB.find_process(owner) {
+            if let Some(lp) = proc.try_linux() {
+                lp.itimers().set_real_timer(id);
+            }
+        }
+    }
 }
 
 /// The largest overrun count `timer_getoverrun(2)` and `si_overrun` report
@@ -2054,7 +2093,7 @@ fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info:
 /// the timer still exists and its generation matches `gen`. A periodic timer
 /// re-arms itself from the callback.
 fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
-    kernel_hal::timer::timer_set(
+    let wheel = kernel_hal::timer::timer_set_cancellable(
         deadline,
         Box::new(move |now| {
             if let Some(next) = expire_posix_timer(id, gen, now) {
@@ -2062,6 +2101,22 @@ fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
             }
         }),
     );
+    // On record, or out again if the timer was re-armed or deleted in the
+    // meantime. Replaced, not cancelled, from the callback: the one on
+    // record then is the one running.
+    let stale = {
+        let mut timers = POSIX_TIMERS.lock();
+        match timers.get_mut(&id) {
+            Some(t) if t.generation == gen => {
+                t.wheel = wheel;
+                None
+            }
+            _ => wheel,
+        }
+    };
+    if let Some(w) = stale {
+        kernel_hal::timer::timer_cancel(w);
+    }
 }
 
 /// One expiry of POSIX timer `id`, at `now`: tell its owner
@@ -3042,6 +3097,7 @@ mod exec_timer_tests {
                 next: Duration::from_secs(1),
                 generation: 0,
                 overrun: Overrun::default(),
+                wheel: None,
             },
         );
         id
@@ -3108,6 +3164,7 @@ mod exec_timer_tests {
             next: Duration::ZERO,
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         };
         assert_eq!(
             register_posix_timer(fresh(), |_| Err(LxError::EFAULT)),
@@ -3172,6 +3229,7 @@ mod exit_timer_tests {
                 next: Duration::from_secs(1),
                 generation: 0,
                 overrun: Overrun::default(),
+                wheel: None,
             },
         );
         id

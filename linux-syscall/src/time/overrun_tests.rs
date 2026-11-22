@@ -117,6 +117,7 @@ fn a_periodic_timer(owner: KoID) -> usize {
             next: ms(1000),
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         },
     );
     id

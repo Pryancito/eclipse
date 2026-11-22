@@ -226,6 +226,7 @@ fn a_cpu_timer(owner: KoID, clock: CpuClock, notify: TimerNotify) -> usize {
             next: Duration::ZERO,
             generation: 0,
             overrun: Overrun::default(),
+            wheel: None,
         },
     );
     id

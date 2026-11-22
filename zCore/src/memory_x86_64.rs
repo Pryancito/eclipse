@@ -238,6 +238,21 @@ fn frame_drain_percpu() -> usize {
     0
 }
 
+/// [`frame_alloc`] without its failure path: no drain of the per-CPU lists,
+/// no shrinkers, no log line. For a caller that has a cheaper answer to a
+/// refusal than reclaiming (the heap's growth ahead of demand, which can
+/// simply not grow).
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn frame_alloc_quiet(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
+    let idx = frame_alloc_from_pool(frame_count, align_log2)?;
+    FRAMES_USED.add(frame_count << PAGE_BITS);
+    #[cfg(feature = "mem-debug")]
+    for i in 0..frame_count {
+        track_mark_alloc(idx + i);
+    }
+    Some(frame_idx_to_phys_addr(idx))
+}
+
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // Single-frame allocations (the page-fault/commit hot path — every
     // demand-paged page in the system) MUST use the cascade fast path.
@@ -1386,12 +1401,16 @@ cfg_if! {
             report_alloc_sites();
             #[cfg(feature = "linux")]
             {
-                let (created, live, bytes) = linux_object::fs::memfd_stats();
+                // Counts only: this runs inside `alloc`, maybe under a memfd
+                // inode's write lock (see `memfd_counts`). The bytes are the
+                // whole ramfs pool's, which memfd shares with /tmp and /dev/shm.
+                let (created, live) = linux_object::fs::memfd_counts();
+                let (ram_live, _, _) = linux_object::fs::ramfs_oom_stats();
                 emit(format_args!(
-                    "[heap-pressure]   memfd created={} live={} live_bytes={} MiB\n",
+                    "[heap-pressure]   memfd created={} live={}; ramfs live={} MiB\n",
                     created,
                     live,
-                    bytes >> 20,
+                    ram_live >> 20,
                 ));
             }
             emit(format_args!(
@@ -1493,16 +1512,30 @@ cfg_if! {
             )
         }
 
-        /// Set for the duration of a growth attempt. Growth runs from INSIDE
-        /// `alloc`, and `frame_alloc`'s failure path logs (which allocates),
-        /// so without this flag a failed growth would recurse into itself.
-        static HEAP_GROWING: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        /// Which CPU holds [`HEAP_GROWING`], as `cpu + 1` (`0`: none, or not
-        /// known yet). Lets a failed allocation on another CPU wait for it
-        /// (`grow_heap_on_failure`) and one on the same CPU not wait on
-        /// itself.
-        static HEAP_GROWER: AtomicUsize = AtomicUsize::new(0);
+        /// Who is growing the heap or giving growth back, as `cpu + 1` (`0`:
+        /// nobody). Growth runs from INSIDE `alloc`, and `frame_alloc`'s
+        /// failure path logs (which allocates), so without this flag a failed
+        /// growth would recurse into itself; the CPU in it lets a failed
+        /// allocation on another CPU wait for it (`grow_heap_on_failure`) and
+        /// one on the same CPU not wait on itself.
+        ///
+        /// One word, claimed with a compare-exchange. It used to be a flag
+        /// and a separate owner, stored one after the other: an interrupt
+        /// between the two stores whose allocation failed saw the flag up and
+        /// no owner, took it for another CPU's growth, spun 2^26 turns on
+        /// itself and went to `alloc_error`.
+        static HEAP_GROWING: AtomicUsize = AtomicUsize::new(0);
+
+        /// Claim [`HEAP_GROWING`] for this CPU; `false` if anyone holds it.
+        fn claim_growth() -> bool {
+            HEAP_GROWING
+                .compare_exchange(0, this_cpu_tag(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+
+        fn end_growth() {
+            HEAP_GROWING.store(0, Ordering::Release);
+        }
         static HEAP_GROW_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
         /// Grow the heap when it passes [`HEAP_GROW_AT_PCT`]. One relaxed
@@ -1513,19 +1546,47 @@ cfg_if! {
             if used < total / 100 * HEAP_GROW_AT_PCT {
                 return;
             }
+            if growth_backing_off() {
+                return;
+            }
             grow_heap_guarded(used, total);
+        }
+
+        /// How long growth ahead of demand stays quiet after the frame
+        /// allocator had no run to give it.
+        const HEAP_GROW_BACKOFF_MS: u64 = 100;
+        /// `timer_now` in ms until which growth ahead of demand is not tried.
+        static HEAP_GROW_BACKOFF_UNTIL_MS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+
+        /// Whether growth ahead of demand should sit this allocation out.
+        ///
+        /// Every allocation over the watermark asks for a growth, and on a
+        /// machine with free RAM but no free 2 MiB run each ask was three
+        /// contiguous bitmap scans from frame 0 under the frame lock, with
+        /// interrupts off, inside whatever the allocating caller held -- on
+        /// every allocation, since a refusal changed nothing for the next
+        /// one. A growth for an allocation the buddy refused is never held
+        /// back: that one is the machine's last chance.
+        #[cold]
+        fn growth_backing_off() -> bool {
+            let until = HEAP_GROW_BACKOFF_UNTIL_MS.load(Ordering::Relaxed);
+            until != 0 && (kernel_hal::timer::timer_now().as_millis() as u64) < until
+        }
+
+        fn back_off_growth() {
+            let now = kernel_hal::timer::timer_now().as_millis() as u64;
+            HEAP_GROW_BACKOFF_UNTIL_MS.store(now + HEAP_GROW_BACKOFF_MS, Ordering::Relaxed);
         }
 
         /// Run one growth attempt under the re-entrancy flag. Returns whether
         /// the heap actually got bigger.
         fn grow_heap_guarded(used: usize, total: usize) -> bool {
-            if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+            if !claim_growth() {
                 return false;
             }
-            HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
             let grew = grow_heap_once(used, total, 0);
-            HEAP_GROWER.store(0, Ordering::Release);
-            HEAP_GROWING.store(false, Ordering::Release);
+            end_growth();
             grew
         }
 
@@ -1560,16 +1621,14 @@ cfg_if! {
         fn grow_heap_on_failure(need: Layout) -> bool {
             let total = HEAP_TOTAL.load(Ordering::Relaxed);
             let used = HEAP_USED.get();
-            if !HEAP_GROWING.swap(true, Ordering::AcqRel) {
-                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
+            if claim_growth() {
                 let grew = grow_heap_once(used, total, buddy_block_size(need));
-                HEAP_GROWER.store(0, Ordering::Release);
-                HEAP_GROWING.store(false, Ordering::Release);
+                end_growth();
                 return grew;
             }
             // The flag is this CPU's own: an interrupt landed inside a growth
             // or a release. Waiting would wait on itself.
-            if HEAP_GROWER.load(Ordering::Acquire) == this_cpu_tag() {
+            if HEAP_GROWING.load(Ordering::Acquire) == this_cpu_tag() {
                 return false;
             }
             // Bounded, so a grower that never lets go turns into the OOM
@@ -1578,7 +1637,7 @@ cfg_if! {
             // CPU for one.
             const WAIT_SPINS: usize = 1 << 26;
             for _ in 0..WAIT_SPINS {
-                if !HEAP_GROWING.load(Ordering::Acquire) {
+                if HEAP_GROWING.load(Ordering::Acquire) == 0 {
                     return true;
                 }
                 kernel_hal::tlb_shootdown_pump();
@@ -1592,7 +1651,10 @@ cfg_if! {
         /// to serve `layout` has to contain one such aligned block, which the
         /// buddy only finds if the region it is given covers one:
         /// `add_to_heap` carves a region into the largest self-aligned blocks
-        /// that fit, and never merges two regions into a bigger one.
+        /// that fit. (Free blocks of two regions that happen to touch DO
+        /// merge later, since the buddy of a block is `ptr ^ size`; growth
+        /// cannot count on that, and `heap_regions::absorb` is what keeps the
+        /// merged blocks freeable.)
         fn buddy_block_size(layout: Layout) -> usize {
             layout
                 .size()
@@ -1628,7 +1690,7 @@ cfg_if! {
             (need.trailing_zeros() as usize).saturating_sub(PAGE_BITS)
         }
 
-        /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWER`].
+        /// `cpu + 1`, so `0` can mean "nobody" in [`HEAP_GROWING`].
         fn this_cpu_tag() -> usize {
             kernel_hal::cpu::cpu_id() as usize + 1
         }
@@ -1694,8 +1756,16 @@ cfg_if! {
             // the second growth on the very first test boot was refused for
             // exactly that. Step down instead of giving up.
             let mut got = None;
+            let mut capped = false;
             for chunk in heap_grow_chunks(need) {
                 if ram_used + chunk + reserve > ram {
+                    continue;
+                }
+                // The ceiling bounds the heap, not only where a growth may
+                // start: an exact-size growth for a big refused block could
+                // otherwise carry it past by that block.
+                if total + chunk > HEAP_MAX_TOTAL {
+                    capped = true;
                     continue;
                 }
                 // align_log2 is in FRAMES, not bytes: 21 would demand an 8 GiB
@@ -1704,12 +1774,31 @@ cfg_if! {
                 // A growth ahead of demand needs none; one for a refused block
                 // needs that block's alignment, or the chunk may straddle
                 // every boundary the block could sit on.
-                if let Some(pa) = frame_alloc(chunk >> PAGE_BITS, heap_grow_align_log2(need)) {
+                //
+                // Ahead of demand, only what the bitmap has: the full
+                // `frame_alloc` drains every CPU's frame list, runs the
+                // shrinkers and logs on each refusal, which is right for an
+                // allocation the buddy refused and far too much for a growth
+                // nobody is waiting on.
+                let align = heap_grow_align_log2(need);
+                let pa = if need > 0 {
+                    frame_alloc(chunk >> PAGE_BITS, align)
+                } else {
+                    frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                };
+                if let Some(pa) = pa {
                     got = Some((pa, chunk));
                     break;
                 }
             }
             let Some((pa, chunk)) = got else {
+                if capped {
+                    note_grow_refusal(GROW_REFUSED_CEILING, ram_used);
+                    return false;
+                }
+                if need == 0 {
+                    back_off_growth();
+                }
                 note_grow_refusal(GROW_REFUSED_NO_RUN, ram_used);
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
@@ -1865,10 +1954,9 @@ cfg_if! {
                 if HEAP_ALLOCATOR.0.held_by_current_cpu() {
                     break;
                 }
-                if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                if !claim_growth() {
                     break;
                 }
-                HEAP_GROWER.store(this_cpu_tag(), Ordering::Release);
                 let taken = {
                     let mut h = HEAP_ALLOCATOR.0.lock();
                     let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
@@ -1886,8 +1974,7 @@ cfg_if! {
                     HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
                     heap_regions::note_released(va, va + size);
                 }
-                HEAP_GROWER.store(0, Ordering::Release);
-                HEAP_GROWING.store(false, Ordering::Release);
+                end_growth();
                 let Some((va, size)) = taken else {
                     break;
                 };
@@ -2560,6 +2647,25 @@ cfg_if! {
                 // allocates nothing and refuses a reclaim nested inside
                 // another on this CPU, so the recursion this invites cannot
                 // happen.
+                //
+                // Before that, the per-CPU front caches. Every small block
+                // they hold counts as allocated to the buddy and keeps its
+                // free buddies from merging back into the big block that was
+                // refused; up to ~5,000 of them per CPU, enough scattered
+                // ones to leave no whole 4 MiB block in a heap at its
+                // ceiling. The idle release drains them only every 10 s and
+                // only with room to spare, which a refused heap never has.
+                #[cfg(not(feature = "mem-debug"))]
+                let p = if p.is_null() && !self.0.held_by_current_cpu() {
+                    drain_front_caches();
+                    self.0
+                        .lock()
+                        .alloc(ext)
+                        .ok()
+                        .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr())
+                } else {
+                    p
+                };
                 let p = if p.is_null() && !self.0.held_by_current_cpu() {
                     reclaim_for_heap(ext)
                 } else {
@@ -2825,306 +2931,8 @@ mod table_walk_tests;
 // the quiet dead code it is. The host test suite (which builds libos) does
 // exercise it.
 #[cfg_attr(feature = "libos", allow(dead_code))]
-pub mod heap_regions {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Regions the registry can hold: the static arena, plus one per elastic
-    /// growth.
-    ///
-    /// This has to cover the allocator's *worst* case, not its typical one. A
-    /// growth takes 32 MiB when it can, but under memory pressure it falls
-    /// back to 8 MiB and then 2 MiB, so the heap can reach its 2 GiB ceiling
-    /// from a 512 MiB arena in 768 small steps. An overflow does not merely
-    /// lose a region: `check` then stops answering `Outside` at all, so the
-    /// whole guard would switch itself off exactly on the machine that is
-    /// short of memory. A `const` assertion next to the growth policy ties
-    /// this number to those chunk sizes, so it cannot silently fall behind.
-    ///
-    /// At three words a region this is 24 KiB of `.bss`, which is the
-    /// cheapest part of the bargain.
-    pub const MAX_REGIONS: usize = 1024;
-
-    static STARTS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
-    static ENDS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
-    /// Slots handed out. Always `>= COUNT`: a slot is reserved here, written,
-    /// and only then published through `COUNT`.
-    static RESERVED: AtomicUsize = AtomicUsize::new(0);
-    /// Slots that are fully written. Readers never look past this.
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    static UNREGISTERED: AtomicUsize = AtomicUsize::new(0);
-    /// Bytes of each region the heap has given back to the frame allocator.
-    /// See [`note_released`].
-    static RELEASED: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
-    /// The region that answered last. Every free runs through [`contains`], so
-    /// the common case -- block after block out of the same region -- is two
-    /// comparisons instead of a walk over every region the heap has grown.
-    static HINT: AtomicUsize = AtomicUsize::new(0);
-
-    /// Why a block must not be handed to the allocator.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum BlockFault {
-        /// A null pointer.
-        Null,
-        /// Not aligned to what its own layout asked for.
-        Unaligned,
-        /// `ptr + size` wraps the address space.
-        Wraps,
-        /// Inside no region the heap owns.
-        Outside,
-    }
-
-    impl BlockFault {
-        /// One phrase for a report.
-        pub fn why(self) -> &'static str {
-            match self {
-                BlockFault::Null => "null pointer",
-                BlockFault::Unaligned => "not aligned to its own layout",
-                BlockFault::Wraps => "ptr + size wraps the address space",
-                BlockFault::Outside => "outside every region the kernel heap owns",
-            }
-        }
-    }
-
-    /// Record a region the heap owns, `[start, end)`.
-    ///
-    /// Called from `init` for the static arena and from the elastic growth
-    /// right where it hands the frames to the buddy. A region that does not
-    /// fit is counted, not dropped: see [`check`].
-    ///
-    /// A slot that [`note_released`] emptied is used again before a new one
-    /// is taken: the heap can grow, give the growth back and grow again for
-    /// as long as the machine runs, and taking a fresh slot each time would
-    /// fill the registry and turn the guard off. Callers are serialised (the
-    /// heap's growth and its release both run under `HEAP_GROWING`, and
-    /// `init` runs before either), so two of them never pick the same empty
-    /// slot.
-    pub fn register(start: usize, end: usize) {
-        if end <= start {
-            return;
-        }
-        for i in 0..registered() {
-            if STARTS[i].load(Ordering::SeqCst) == 0 {
-                RELEASED[i].store(0, Ordering::SeqCst);
-                // End first, as below: the slot reads as empty until the
-                // start lands, and then as the complete new pair.
-                ENDS[i].store(end, Ordering::SeqCst);
-                STARTS[i].store(start, Ordering::SeqCst);
-                return;
-            }
-        }
-        let slot = RESERVED.fetch_add(1, Ordering::SeqCst);
-        if slot >= MAX_REGIONS {
-            RESERVED.store(MAX_REGIONS, Ordering::SeqCst);
-            UNREGISTERED.fetch_add(1, Ordering::SeqCst);
-            return;
-        }
-        // End first: a reader that sees the start must see a complete pair.
-        ENDS[slot].store(end, Ordering::SeqCst);
-        STARTS[slot].store(start, Ordering::SeqCst);
-        // Publish last, and in slot order. A reader that saw `COUNT` cover a
-        // slot still being written would find it empty and call a perfectly
-        // sound block wild -- which leaks it and prints a false accusation.
-        // Growth is serialised behind the heap lock, so this never spins in
-        // practice; it is here so that the invariant does not rest on that.
-        while COUNT
-            .compare_exchange(slot, slot + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    /// Record that `[start, end)` went back to the frame allocator, and
-    /// forget every region that has now been given back whole. Answers how
-    /// many regions were forgotten.
-    ///
-    /// A region given back only in part stays on record, holes and all: the
-    /// registry has one range per region, and splitting it would take slots
-    /// a growth may need. The cost is that a wild free into a hole is not
-    /// called wild, which is the same blind spot the guard has for a free
-    /// into a part of the heap that is merely unused.
-    ///
-    /// The range may cover more than one region: two growths can be
-    /// physically adjacent, and the buddy then merges blocks across them.
-    /// Serialised with [`register`], for the same reason.
-    pub fn note_released(start: usize, end: usize) -> usize {
-        let mut forgotten = 0;
-        for i in 0..registered() {
-            let s = STARTS[i].load(Ordering::SeqCst);
-            if s == 0 {
-                continue;
-            }
-            let e = ENDS[i].load(Ordering::SeqCst);
-            let (lo, hi) = (start.max(s), end.min(e));
-            if lo >= hi {
-                continue;
-            }
-            let gone = RELEASED[i].fetch_add(hi - lo, Ordering::SeqCst) + (hi - lo);
-            if gone >= e - s {
-                STARTS[i].store(0, Ordering::SeqCst);
-                RELEASED[i].store(0, Ordering::SeqCst);
-                forgotten += 1;
-            }
-        }
-        forgotten
-    }
-
-    /// Whether `[addr, addr + size)` lies inside one region.
-    ///
-    /// One region, not several: the heap's regions are separate allocations
-    /// and a block never straddles two.
-    pub fn contains(addr: usize, size: usize) -> bool {
-        let Some(end) = addr.checked_add(size) else {
-            return false;
-        };
-        let n = COUNT.load(Ordering::SeqCst).min(MAX_REGIONS);
-        let hint = HINT.load(Ordering::Relaxed);
-        if hint < n && in_region(hint, addr, end) {
-            return true;
-        }
-        for i in 0..n {
-            if i != hint && in_region(i, addr, end) {
-                HINT.store(i, Ordering::Relaxed);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn in_region(i: usize, addr: usize, end: usize) -> bool {
-        let start = STARTS[i].load(Ordering::SeqCst);
-        start != 0 && addr >= start && end <= ENDS[i].load(Ordering::SeqCst)
-    }
-
-    /// One registered region, as `(start, end)`.
-    pub type Region = (usize, usize);
-
-    /// The region `ptr` STARTS in, ignoring the block's size: `(index,
-    /// start, end)`.
-    ///
-    /// [`contains`] asks the question a free has to answer -- does the whole
-    /// block lie in one region -- and answers "no" the same way for a pointer
-    /// that is nowhere near the heap and for one that is a sound block's
-    /// address with a corrupt size on it. A refusal that cannot tell those
-    /// apart sends the reader hunting for the wrong bug: the first is memory
-    /// the heap never owned, the second is a `Layout` that stopped matching
-    /// its allocation. So the report asks this as well.
-    pub fn region_of(ptr: usize) -> Option<(usize, usize, usize)> {
-        let n = registered();
-        (0..n).find_map(|i| {
-            let start = STARTS[i].load(Ordering::SeqCst);
-            let end = ENDS[i].load(Ordering::SeqCst);
-            (start != 0 && ptr >= start && ptr < end).then_some((i, start, end))
-        })
-    }
-
-    /// The registered regions nearest `ptr` on each side: the one with the
-    /// greatest `end` at or below it, and the one with the smallest `start`
-    /// above it.
-    ///
-    /// What a refusal is missing is a yardstick. "Outside every region" from a
-    /// registry whose regions are a page away from the pointer says the block
-    /// is sound and the registry lost a growth; the same words with the
-    /// nearest region a gigabyte away say the pointer was never the heap's.
-    /// Returned rather than printed so the pure part can be tested on the
-    /// host, where the allocator itself is not compiled at all.
-    pub fn neighbours(ptr: usize) -> (Option<Region>, Option<Region>) {
-        let n = registered();
-        let mut below: Option<Region> = None;
-        let mut above: Option<Region> = None;
-        for i in 0..n {
-            let start = STARTS[i].load(Ordering::SeqCst);
-            let end = ENDS[i].load(Ordering::SeqCst);
-            if start == 0 {
-                continue;
-            }
-            if end <= ptr {
-                if below.is_none_or(|(_, e)| end > e) {
-                    below = Some((start, end));
-                }
-            } else if start > ptr && above.is_none_or(|(s, _)| start < s) {
-                above = Some((start, end));
-            }
-        }
-        (below, above)
-    }
-
-    /// Regions on record.
-    pub fn registered() -> usize {
-        COUNT.load(Ordering::SeqCst).min(MAX_REGIONS)
-    }
-
-    /// Regions the heap owns that did not fit in the registry.
-    pub fn unregistered() -> usize {
-        UNREGISTERED.load(Ordering::SeqCst)
-    }
-
-    /// Judge a block the allocator is about to take back, or has just handed
-    /// out. `None` means "nothing to say" — which is not the same as "sound".
-    ///
-    /// Two deliberate silences, both so that a healthy kernel is never
-    /// slandered. Before `init` there are no regions and no basis for an
-    /// opinion; and once a growth has failed to fit in the registry, the
-    /// registry no longer knows the whole heap, so `Outside` stops being
-    /// evidence. The cheap checks — null, alignment, wrap — hold either way,
-    /// because they need no map of the heap at all.
-    pub fn check(ptr: usize, size: usize, align: usize) -> Option<BlockFault> {
-        if ptr == 0 {
-            return Some(BlockFault::Null);
-        }
-        if align != 0 && !ptr.is_multiple_of(align) {
-            return Some(BlockFault::Unaligned);
-        }
-        if ptr.checked_add(size).is_none() {
-            return Some(BlockFault::Wraps);
-        }
-        if registered() == 0 || unregistered() > 0 {
-            return None;
-        }
-        if contains(ptr, size) {
-            return None;
-        }
-        Some(BlockFault::Outside)
-    }
-
-    /// The first [`SNAPSHOT`] regions, in the order they were taken, for a
-    /// reader that wants the map rather than a verdict (`/proc/kheap`).
-    /// Empty slots come back as `(0, 0)`.
-    pub fn snapshot() -> [Region; SNAPSHOT] {
-        let n = registered().min(SNAPSHOT);
-        core::array::from_fn(|i| {
-            if i < n {
-                (
-                    STARTS[i].load(Ordering::SeqCst),
-                    ENDS[i].load(Ordering::SeqCst),
-                )
-            } else {
-                (0, 0)
-            }
-        })
-    }
-
-    /// Regions one [`snapshot`] carries. Enough for the static arena plus the
-    /// growths a 2 GiB heap needs at the usual 32 MiB chunk, which is the
-    /// shape every reading so far has had; a heap that fell back to smaller
-    /// chunks prints the first of them and says how many it did not.
-    pub const SNAPSHOT: usize = 64;
-
-    /// Forget every region. Tests only: while the kernel runs, a region is
-    /// forgotten only once [`note_released`] has seen all of it given back.
-    #[cfg(test)]
-    pub(super) fn reset() {
-        for i in 0..MAX_REGIONS {
-            STARTS[i].store(0, Ordering::SeqCst);
-            ENDS[i].store(0, Ordering::SeqCst);
-            RELEASED[i].store(0, Ordering::SeqCst);
-        }
-        COUNT.store(0, Ordering::SeqCst);
-        RESERVED.store(0, Ordering::SeqCst);
-        UNREGISTERED.store(0, Ordering::SeqCst);
-        HINT.store(0, Ordering::SeqCst);
-    }
-}
+#[path = "memory_x86_64/heap_regions.rs"]
+pub mod heap_regions;
 
 /// Regions the kernel heap owns right now, for `/proc/kheap`.
 #[allow(dead_code)]

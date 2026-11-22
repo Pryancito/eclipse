@@ -125,9 +125,39 @@ pub struct Itimers {
     /// threads', may be armed. Set and cleared with that timer table's lock
     /// held, for the reason `set_cpu_armed` gives.
     posix_cpu_armed: AtomicBool,
+    /// The kernel timer last set for ITIMER_REAL (the one slot the timer
+    /// wheel fires), taken out when the slot is re-armed or disarmed and
+    /// when the process goes. A replaced timer always expired silently (the
+    /// generation), but it stayed queued on its CPU's timer heap, an event
+    /// and a boxed closure, until its old deadline: a program re-arming
+    /// `alarm` or `setitimer` far ahead in a loop grew the kernel heap by one
+    /// entry a call.
+    real_timer: Mutex<Option<kernel_hal::deadline::TimerId>>,
+}
+
+impl Drop for Itimers {
+    fn drop(&mut self) {
+        if let Some(id) = self.real_timer.get_mut().take() {
+            kernel_hal::timer::timer_cancel(id);
+        }
+    }
 }
 
 impl Itimers {
+    /// Record the kernel timer just set for ITIMER_REAL.
+    pub fn set_real_timer(&self, id: Option<kernel_hal::deadline::TimerId>) {
+        *self.real_timer.lock() = id;
+    }
+
+    /// Take out the kernel timer set for ITIMER_REAL, if one is on record:
+    /// the slot was just re-armed or disarmed.
+    pub fn cancel_real_timer(&self) {
+        let id = self.real_timer.lock().take();
+        if let Some(id) = id {
+            kernel_hal::timer::timer_cancel(id);
+        }
+    }
+
     /// A forked child's: no timer at all (fork(2): "a child created via fork
     /// does not inherit its parent's interval timers"), but the `RLIMIT_CPU`
     /// it does inherit is watched from its first return from user mode.
@@ -139,6 +169,7 @@ impl Itimers {
             slots: Default::default(),
             cpu_armed: AtomicBool::new(cpu_limited),
             posix_cpu_armed: AtomicBool::new(false),
+            real_timer: Mutex::new(None),
         }
     }
 

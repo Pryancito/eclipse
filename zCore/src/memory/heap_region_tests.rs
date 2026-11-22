@@ -97,16 +97,45 @@ fn alternating_between_two_regions_passes_every_time() {
     );
 }
 
-/// A block never straddles two regions, because they are separate
-/// allocations -- so one that appears to is a corrupt size, not a merge.
+/// Two regions that touch are one stretch of the linear map, and the buddy
+/// merges free blocks across them (its buddy is `ptr ^ size`). A block of the
+/// merged size, freed, is sound: refusing it leaked it for good, counted live.
 #[test]
-fn a_block_straddling_two_regions_is_refused() {
+fn a_block_across_two_touching_regions_is_freed() {
     let _alone = alone();
     heap_regions::reset();
     heap_regions::register(0x1_0000, 0x2_0000);
     heap_regions::register(0x2_0000, 0x3_0000);
+    assert_eq!(heap_regions::check(0x1_fff0, 0x40, 8), None);
+    assert_eq!(heap_regions::check(0x1_0000, 0x2_0000, 0x1_0000), None);
+    assert_eq!(heap_regions::registered(), 1, "folded into one slot");
+    // Past the end of the pair is still outside.
+    assert_eq!(
+        heap_regions::check(0x2_fff0, 0x40, 8),
+        Some(BlockFault::Outside)
+    );
+}
+
+/// A growth that lands between two regions bridges them into one.
+#[test]
+fn a_growth_between_two_regions_joins_them() {
+    let _alone = alone();
+    heap_regions::reset();
+    heap_regions::register(0x1_0000, 0x2_0000);
+    heap_regions::register(0x3_0000, 0x4_0000);
     assert_eq!(
         heap_regions::check(0x1_fff0, 0x40, 8),
+        Some(BlockFault::Outside)
+    );
+    heap_regions::register(0x2_0000, 0x3_0000);
+    assert_eq!(heap_regions::check(0x1_0000, 0x3_0000, 8), None);
+    assert_eq!(heap_regions::snapshot()[0], (0x1_0000, 0x4_0000));
+    // Given back whole, piece by piece, it is forgotten once, at the end.
+    assert_eq!(heap_regions::note_released(0x1_0000, 0x2_0000), 0);
+    assert_eq!(heap_regions::note_released(0x3_0000, 0x4_0000), 0);
+    assert_eq!(heap_regions::note_released(0x2_0000, 0x3_0000), 1);
+    assert_eq!(
+        heap_regions::check(0x2_0000, 0x40, 8),
         Some(BlockFault::Outside)
     );
 }
@@ -343,9 +372,10 @@ fn growing_and_giving_back_forever_does_not_fill_the_registry() {
 }
 
 /// Two growths that are neighbours in physical memory: the buddy merges free
-/// blocks across them, so one block given back covers part of each.
+/// blocks across them, so one block given back covers part of each. They are
+/// one region now, forgotten once all of it is back.
 #[test]
-fn a_block_across_two_adjacent_growths_counts_for_both() {
+fn a_block_across_two_adjacent_growths_counts_once() {
     let _alone = alone();
     with_arena();
     heap_regions::register(GROWTH, GROWTH + CHUNK);
@@ -354,16 +384,48 @@ fn a_block_across_two_adjacent_growths_counts_for_both() {
         heap_regions::note_released(GROWTH + CHUNK / 2, GROWTH + CHUNK + CHUNK / 2),
         0
     );
-    assert_eq!(heap_regions::note_released(GROWTH, GROWTH + CHUNK / 2), 1);
-    assert_eq!(
-        heap_regions::check(GROWTH + 64, 64, 8),
-        Some(BlockFault::Outside)
-    );
+    assert_eq!(heap_regions::note_released(GROWTH, GROWTH + CHUNK / 2), 0);
     assert_eq!(
         heap_regions::check(GROWTH + 2 * CHUNK - 64, 64, 8),
         None,
-        "the second growth is only half given back"
+        "the last quarter is still the heap's"
     );
+    assert_eq!(
+        heap_regions::note_released(GROWTH + CHUNK + CHUNK / 2, GROWTH + 2 * CHUNK),
+        1
+    );
+    assert_eq!(
+        heap_regions::check(GROWTH + 2 * CHUNK - 64, 64, 8),
+        Some(BlockFault::Outside)
+    );
+}
+
+/// A growth can take back the very frames of a hole a partial release left.
+/// Recorded as a second region, its own release was counted against the
+/// first region too, which was then forgotten with live blocks in it, and
+/// every later free there was refused and leaked.
+#[test]
+fn a_growth_into_a_hole_does_not_forget_the_region_around_it() {
+    let _alone = alone();
+    with_arena();
+    const HOLE: usize = 4 * 1024 * 1024;
+    heap_regions::register(GROWTH, GROWTH + CHUNK);
+    // Round after round: give a hole back, grow into it, give it back again.
+    for _ in 0..(CHUNK / HOLE) * 2 {
+        assert_eq!(heap_regions::note_released(GROWTH, GROWTH + HOLE), 0);
+        heap_regions::register(GROWTH, GROWTH + HOLE);
+    }
+    assert_eq!(heap_regions::registered(), 2, "arena + one growth");
+    // The rest of the growth still holds live blocks; their frees are sound.
+    assert_eq!(heap_regions::check(GROWTH + CHUNK - 64, 64, 8), None);
+    assert_eq!(heap_regions::check(GROWTH + 64, 64, 8), None);
+    // And it is forgotten exactly when all of it has gone back.
+    assert_eq!(
+        heap_regions::note_released(GROWTH + HOLE, GROWTH + CHUNK),
+        0,
+        "the hole was grown into again: not all of it is back"
+    );
+    assert_eq!(heap_regions::note_released(GROWTH, GROWTH + HOLE), 1);
 }
 
 #[test]

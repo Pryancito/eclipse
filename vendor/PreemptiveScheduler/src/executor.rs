@@ -766,6 +766,23 @@ pub(crate) unsafe fn poison_usable_region_bounded(base: usize, size: usize) {
     }
 }
 
+/// Envenenar toda la zona utilizable, sin preguntar la cota, y olvidar lo
+/// escrito en ella. Para un bloque recien salido del asignador.
+///
+/// # Safety
+///
+/// Como [`poison_usable_region`].
+pub(crate) unsafe fn poison_usable_region_whole(base: usize, size: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    POISON_WHOLE.fetch_add(1, Relaxed);
+    // SAFETY: lo que promete el llamante.
+    unsafe { poison_usable_region(base, size) };
+    let hook = *STACK_MARK_CLEAN.lock();
+    if let Some(hook) = hook {
+        hook(base, size);
+    }
+}
+
 /// La palabra que le toca al hueco `i` de la banda de guarda.
 ///
 /// El indice va DENTRO de cada palabra para que un `memset` del valor magico
@@ -2161,7 +2178,20 @@ impl Executor {
         // SAFETY: `[stack_base, stack_base + STACK_SIZE)` is this block's usable
         // region, mapped and 8-aligned, and this executor is its only owner
         // until it publishes itself below.
-        unsafe { poison_usable_region_bounded(stack_base, STACK_SIZE) };
+        //
+        // A block that did not come from the pool is poisoned whole. The
+        // bound reads the page table's dirty bits, and a fresh vmap stack is
+        // fresh frames in fresh entries: every page present and clean, so the
+        // bound said "nothing written" and nothing was poisoned -- the stack
+        // started out holding whatever its recycled frames last held, old
+        // kernel stacks' return addresses included, which a stray RET then
+        // follows and every stack scan reads as real frames. (A heap block's
+        // pages read dirty and were poisoned whole anyway.)
+        if pooled.is_some() {
+            unsafe { poison_usable_region_bounded(stack_base, STACK_SIZE) };
+        } else {
+            unsafe { poison_usable_region_whole(stack_base, STACK_SIZE) };
+        }
         note_first_executor_created(hard_guard_bottom, hard_guard_top);
         let mut pin_executor = Pin::new(Box::new(Executor {
             id: executor_alloc_id(),

@@ -291,13 +291,11 @@ fn alloc_error(layout: Layout) -> ! {
         // desktop's big page consumers are wl_shm pools backed by memfd.
         #[cfg(feature = "linux")]
         {
-            let (created, live, bytes) = linux_object::fs::memfd_stats();
-            emit(format_args!(
-                "memfd: created={} live={} live_bytes={} MiB\n",
-                created,
-                live,
-                bytes >> 20,
-            ));
+            // Counts only: the failed allocation may be a memfd write's,
+            // under that inode's lock (see `memfd_counts`). The bytes are
+            // in the ramfs line below.
+            let (created, live) = linux_object::fs::memfd_counts();
+            emit(format_args!("memfd: created={} live={}\n", created, live));
             // Shared with /tmp /run /dev/shm: frame-backed after boot, else
             // heap Box. A high live_bytes with page_backend=0 is the old
             // densify-the-heap failure mode.
@@ -311,13 +309,20 @@ fn alloc_error(layout: Layout) -> ! {
         }
         // DMA/GEM pin registry: growth of this list was the photographed
         // `UserPin` OOM victim inside `epoll_pwait` when the heap was already
-        // gone. Counts are lock + atomics only (no alloc).
+        // gone. Counts are a try_lock + atomics only (no alloc, no wait).
         {
             let (pins, held, unbalanced, oom) = kernel_hal::dma_pin::stats();
-            emit(format_args!(
-                "dma_pin: live={} held={} unbalanced={} push_oom={}\n",
-                pins, held, unbalanced, oom,
-            ));
+            if pins == usize::MAX {
+                emit(format_args!(
+                    "dma_pin: registry busy unbalanced={} push_oom={}\n",
+                    unbalanced, oom,
+                ));
+            } else {
+                emit(format_args!(
+                    "dma_pin: live={} held={} unbalanced={} push_oom={}\n",
+                    pins, held, unbalanced, oom,
+                ));
+            }
         }
         emit(format_args!("hot exact sizes (heaviest first):\n"));
         let (hot, more_hot, more_hot_bytes) =
