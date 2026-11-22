@@ -2015,7 +2015,13 @@ impl LinuxRootfs {
         dircpy::copy_dir(source, &target).unwrap();
         // 配置
         Make::new().current_dir(&target).arg("defconfig").invoke();
-        // Force static linking and disable PIE (Type EXEC is more stable in zCore)
+        // Force static linking and disable PIE (Type EXEC is more stable in zCore).
+        //
+        // rpm and rpm2cpio are left out: nothing here installs RPMs, and
+        // busybox master since 2026-11-20 ("rpm: check tag value accesses to
+        // fit into RPM header") no longer builds them on architectures without
+        // a fixed page size (aarch64): it commented out `G.pagesize` but kept
+        // `INIT_PAGESIZE(G.pagesize)`.
         Ext::new("sed")
             .current_dir(&target)
             .arg("-i")
@@ -2033,7 +2039,9 @@ impl LinuxRootfs {
                   s/^# CONFIG_INIT is not set$/CONFIG_INIT=y/;\
                   s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/;\
                   s/^# CONFIG_NTPD is not set$/CONFIG_NTPD=y/;\
-                  s/^# CONFIG_FEATURE_NTPD_SERVER is not set$/CONFIG_FEATURE_NTPD_SERVER=n/",
+                  s/^# CONFIG_FEATURE_NTPD_SERVER is not set$/CONFIG_FEATURE_NTPD_SERVER=n/;\
+                  s/^CONFIG_RPM=y$/# CONFIG_RPM is not set/;\
+                  s/^CONFIG_RPM2CPIO=y$/# CONFIG_RPM2CPIO is not set/",
             )
             .arg(".config")
             .invoke();
