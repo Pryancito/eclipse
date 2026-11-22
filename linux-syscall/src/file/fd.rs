@@ -276,21 +276,75 @@ pub(crate) fn anon_fd_flags(flags: usize, allowed: usize) -> Result<OpenFlags, L
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
-/// Decode an `open`/`openat` flag word, or `EINVAL` for any bit this kernel
-/// does not name.
+/// Decode an `open`/`openat` flag word as `build_open_flags` does.
 ///
-/// `OpenFlags::from_bits_truncate` alone drops anything unnamed in silence,
-/// so `openat(..., O_TMPFILE)` would hand back a normal readable fd — the
-/// same silent lie the FreeBSD personality already refuses one layer up.
-/// Also used by `TIOCGPTPEER`, whose `arg` is the same open(2) flag word.
-///
-/// `O_PATH` is named now and so is honoured; `O_TMPFILE` is still `EINVAL`,
-/// because it changes what the call CREATES and nothing here does that.
+/// A bit Linux does not define is dropped, as `open(2)` drops it. The one it
+/// defines and this kernel cannot honour is `O_TMPFILE`: `EINVAL` when it is
+/// malformed, `EOPNOTSUPP` when it is not, but never a normal fd to a named
+/// file. Also used by `TIOCGPTPEER`, after its own narrower check.
 pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
-    if flags & !OpenFlags::all().bits() != 0 {
+    // `build_open_how`: `how.flags = flags & VALID_OPEN_FLAGS`. `open` and
+    // `openat` drop a bit they do not know without a word (only `openat2`
+    // refuses one), so a program built against newer headers still opens
+    // its file.
+    let flags = flags & (OpenFlags::all().bits() | O_TMPFILE_BIT);
+    // Linux 6.4+: "Block bugs where O_DIRECTORY | O_CREAT created regular
+    // files", ahead of everything else `build_open_flags` looks at.
+    let create_dir = OpenFlags::CREATE.bits() | OpenFlags::DIRECTORY.bits();
+    if flags & create_dir == create_dir {
         return Err(LxError::EINVAL);
     }
+    if flags & O_TMPFILE_BIT != 0 {
+        // `O_TMPFILE` is `__O_TMPFILE | O_DIRECTORY`; the bit alone (or with
+        // `O_CREAT`) is `EINVAL`, and so is an unnamed file nobody may write.
+        let tmpfile = O_TMPFILE_BIT | OpenFlags::DIRECTORY.bits();
+        if flags & (tmpfile | OpenFlags::CREATE.bits()) != tmpfile || flags & 0b11 == 0 {
+            return Err(LxError::EINVAL);
+        }
+        // A well-formed one asks for an unnamed file, which no filesystem
+        // here can make: what `vfs_tmpfile` answers for a directory with
+        // no `->tmpfile`, and what glibc and systemd take to mean "fall
+        // back to a named temporary file". A normal fd would be a lie.
+        return Err(LxError::EOPNOTSUPP);
+    }
     Ok(path_open_flags(OpenFlags::from_bits_truncate(flags)))
+}
+
+/// `__O_TMPFILE`, which `OpenFlags` does not name: nothing here creates an
+/// unnamed file.
+const O_TMPFILE_BIT: usize = 0o20000000;
+
+/// `MAXSYMLINKS`: how many links one walk follows before it is `ELOOP`.
+const FOLLOW_MAX_LINKS: usize = 40;
+
+/// Where `open(O_CREAT)` goes on after the dangling link `link`, found in
+/// `dir_path`: its target, read the way the walk reads it -- from the root
+/// when it starts with `/`, from the link's own directory otherwise.
+fn dangling_link_target(link: &Arc<dyn INode>, dir_path: &str) -> LxResult<String> {
+    let mut buf = [0u8; 4096];
+    let len = link.read_at(0, &mut buf)?;
+    let target = core::str::from_utf8(&buf[..len]).map_err(|_| LxError::ENOENT)?;
+    if target.is_empty() {
+        return Err(LxError::ENOENT);
+    }
+    Ok(if target.starts_with('/') {
+        String::from(target)
+    } else {
+        alloc::format!("{}/{}", dir_path.trim_end_matches('/'), target)
+    })
+}
+
+/// What `may_open` asks of the inode for an access mode: `ACC_MODE` maps
+/// the mode `3`, which opens neither for reading nor for writing (ioctl-only
+/// opens, `fdformat`), to BOTH permissions, so it is no way round them.
+fn open_needs(flags: OpenFlags) -> (bool, bool) {
+    if flags.is_path() {
+        return (false, false);
+    }
+    if flags.bits() & 0b11 == 0b11 {
+        return (true, true);
+    }
+    (flags.readable(), flags.writable())
 }
 
 /// What `open`/`openat` keep of a flag word: [`open_flags`], plus the
@@ -361,26 +415,25 @@ impl Syscall<'_> {
         mut old_value: UserOutPtr<ITimerSpec>,
         abi32: bool,
     ) -> SysResult {
-        if !timerfd_settime_flags_ok(flags) {
+        // `SYSCALL_DEFINE4(timerfd_settime)` copies the new value in first
+        // (`EFAULT`); `do_timerfd_settime` then refuses a bad flag or an
+        // out-of-range `timespec` (`EINVAL`, the same rule as
+        // `timer_settime`) before it looks the descriptor up (`EBADF`, or
+        // `EINVAL` for one that is no timerfd).
+        let v = crate::narrow::narrow_get(abi32, &new_value)?;
+        if !timerfd_settime_flags_ok(flags) || !v.it_interval.valid() || !v.it_value.valid() {
             return Err(LxError::EINVAL);
         }
-        let file_like = self.linux_process().get_file_like(fd)?;
+        let file_like = self.linux_process().get_open_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
         let (iv, rem) = tfd.get_time();
         let old = ITimerSpec::from_ns(iv, rem);
         // The old value is reported LAST, after the timer is set, as
-        // timerfd_settime(2) does: reading `new_value` can fault and an
-        // out-of-range timespec is EINVAL, and neither of those may have
-        // already written the caller's `old_value`.
+        // timerfd_settime(2) does.
         commit_and_report_old_with(
             old,
             |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
             || {
-                let v = crate::narrow::narrow_get(abi32, &new_value)?;
-                // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
-                if !v.it_interval.valid() || !v.it_value.valid() {
-                    return Err(LxError::EINVAL);
-                }
                 info!(
                     "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
                     fd,
@@ -417,7 +470,7 @@ impl Syscall<'_> {
         mut curr_value: UserOutPtr<ITimerSpec>,
         abi32: bool,
     ) -> SysResult {
-        let file_like = self.linux_process().get_file_like(fd)?;
+        let file_like = self.linux_process().get_open_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
         let (iv, rem) = tfd.get_time();
         crate::narrow::narrow_put(abi32, &mut curr_value, ITimerSpec::from_ns(iv, rem))?;
@@ -429,8 +482,8 @@ impl Syscall<'_> {
     /// replaced. The caller is expected to also block those signals
     /// (`sigprocmask`) so they stay pending for the fd — which libwayland does.
     ///
-    /// The order below is `do_signalfd4`'s: the flag word, then `sizemask`,
-    /// then the set itself.
+    /// The order below is Linux's: `sizemask`, then the set itself, then
+    /// (in `do_signalfd4`) the flag word.
     pub fn sys_signalfd4(
         &self,
         fd: FileDesc,
@@ -438,22 +491,25 @@ impl Syscall<'_> {
         sizemask: usize,
         flags: usize,
     ) -> SysResult {
-        // Checked before anything else, as Linux does: the flag word is
-        // rejected whether or not `fd` names an existing signalfd.
-        let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         // How wide the caller's `sigset_t` is. Every other syscall in this
         // tree that takes one asks (see [`check_sigsetsize`]); this one took
         // the word, named it `_sizemask`, and read eight bytes regardless.
+        // `SYSCALL_DEFINE4(signalfd4)` asks it, then copies the mask in,
+        // and only then does `do_signalfd4` look at the flag word -- which
+        // is refused whether or not `fd` names an existing signalfd.
         crate::signal::check_sigsetsize(sizemask)?;
         let sigmask = mask.read()?;
+        let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         info!(
             "signalfd4: fd={:?}, mask={:#x}, flags={:#x}",
             fd, sigmask, flags
         );
         let proc = self.linux_process();
-        if <FileDesc as Into<i32>>::into(fd) >= 0 {
+        // Only `-1` asks for a new one: any other number is a descriptor
+        // to look up (`fdget`), so `-2` is `EBADF`, not a new signalfd.
+        if <FileDesc as Into<i32>>::into(fd) != -1 {
             // Update an existing signalfd's accepted-signal set.
-            let file_like = proc.get_file_like(fd)?;
+            let file_like = proc.get_open_file_like(fd)?;
             let sfd = file_like
                 .downcast_ref::<SignalFd>()
                 .ok_or(LxError::EINVAL)?;
@@ -604,80 +660,106 @@ impl Syscall<'_> {
 
             // `walked` is where the walk ended: what the file is named.
             let (inode, created, walked) = if flags.contains(OpenFlags::CREATE) {
-                // `open("", O_CREAT)` is `ENOENT`; `open("/", O_CREAT)`, like
-                // `.` and `..`, names a directory, `EISDIR`. Split as a plain
-                // name, either used to create a file called "" in the working
-                // directory.
-                let (dir_path, last) = super::dir::last_component(path)?;
-                let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
-                // relative to cwd
-                let (dir_inode, mut walked) = proc.lookup_parent_walked(dir_fd, dir_path)?;
-                let dir_metadata = dir_inode.metadata()?;
-                // Only a name to make needs `w` on the directory: `lookup_open`
-                // keeps `may_o_create`'s error for a name that is not there,
-                // so `O_CREAT` opens one that is, and `O_EXCL` is EEXIST.
-                match dir_inode.find(file_name) {
-                    Ok(file_inode) => {
-                        if flags.contains(OpenFlags::EXCLUSIVE) {
-                            return Err(LxError::EEXIST);
-                        }
-                        // `O_CREAT` over a name that is already a symbolic
-                        // link still opens what the link points AT:
-                        // `open_last_lookups` resolves the final component
-                        // like any other open, and only `O_EXCL` (the EEXIST
-                        // above) or `O_NOFOLLOW` stop it. `find` hands back
-                        // the link's own inode, so without this the write
-                        // went into the link and not into the file.
-                        let file_inode = if file_inode.metadata()?.type_ == FileType::SymLink {
-                            if !follow {
-                                return Err(LxError::ELOOP);
+                // A dangling link names the file to create: the name the walk
+                // goes on with, once one was followed, and how many were.
+                let mut through_link: Option<String> = None;
+                let mut hops = 0usize;
+                loop {
+                    let path: &str = through_link.as_deref().unwrap_or(path);
+                    // `open("", O_CREAT)` is `ENOENT`; `open("/", O_CREAT)`, like
+                    // `.` and `..`, names a directory, `EISDIR`. Split as a plain
+                    // name, either used to create a file called "" in the working
+                    // directory.
+                    let (dir_path, last) = super::dir::last_component(path)?;
+                    let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
+                    // relative to cwd
+                    let (dir_inode, mut walked) = proc.lookup_parent_walked(dir_fd, dir_path)?;
+                    let dir_metadata = dir_inode.metadata()?;
+                    // Only a name to make needs `w` on the directory: `lookup_open`
+                    // keeps `may_o_create`'s error for a name that is not there,
+                    // so `O_CREAT` opens one that is, and `O_EXCL` is EEXIST.
+                    break match dir_inode.find(file_name) {
+                        Ok(file_inode) => {
+                            if flags.contains(OpenFlags::EXCLUSIVE) {
+                                return Err(LxError::EEXIST);
                             }
-                            let (file_inode, at) = proc.lookup_inode_walked(dir_fd, path, true)?;
-                            walked = at;
-                            file_inode
-                        } else {
+                            // `O_CREAT` over a name that is already a symbolic
+                            // link still opens what the link points AT:
+                            // `open_last_lookups` resolves the final component
+                            // like any other open, and only `O_EXCL` (the EEXIST
+                            // above) or `O_NOFOLLOW` stop it. `find` hands back
+                            // the link's own inode, so without this the write
+                            // went into the link and not into the file.
+                            let file_inode = if file_inode.metadata()?.type_ == FileType::SymLink {
+                                if !follow {
+                                    return Err(LxError::ELOOP);
+                                }
+                                match proc.lookup_inode_walked(dir_fd, path, true) {
+                                    Ok((file_inode, at)) => {
+                                        walked = at;
+                                        file_inode
+                                    }
+                                    // `open_last_lookups` follows a link whose
+                                    // target is not there and creates the
+                                    // target: `ln -s new l; echo > l` makes
+                                    // `new`. Only `O_EXCL` (above) and
+                                    // `O_NOFOLLOW` keep it from doing so.
+                                    Err(LxError::ENOENT) => {
+                                        hops += 1;
+                                        if hops > FOLLOW_MAX_LINKS {
+                                            return Err(LxError::ELOOP);
+                                        }
+                                        let next = dangling_link_target(&file_inode, dir_path)?;
+                                        through_link = Some(next);
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            } else {
+                                walked.enter(String::from(file_name));
+                                file_inode
+                            };
+                            let metadata = file_inode.metadata()?;
+                            // `do_open`: what the name turned out to be is judged
+                            // before what the caller may do with it.
+                            open_resolved_type(flags, metadata.type_)?;
+                            let (read, write) = open_needs(flags);
+                            if write || flags.contains(OpenFlags::TRUNCATE) {
+                                proc.check_access(&metadata, 0o2, true)?;
+                            }
+                            if read {
+                                proc.check_access(&metadata, 0o4, true)?;
+                            }
+                            (file_inode, false, walked)
+                        }
+                        Err(FsError::EntryNotFound) => {
+                            proc.check_access(&dir_metadata, 0o3, true)?;
+                            // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
+                            // Without the mask, `open(..., O_CREAT, 0o100644)`
+                            // left `S_IFREG` in the inode mode. `mknod` shares
+                            // this mask; `mkdir` has a narrower one of its own
+                            // (`mkdir_perm`), which also drops the set-id bits.
+                            let create_mode = proc.apply_umask(super::dir::create_perm(mode));
+                            // `lookup_open`: a directory with no `->create`
+                            // (`/proc`, `/sys`) is `EACCES` to `O_CREAT`.
+                            let inode = dir_inode
+                                .create(file_name, FileType::File, create_mode as u32)
+                                .map_err(|e| match e {
+                                    rcore_fs::vfs::FsError::NotSupported => LxError::EACCES,
+                                    e => e.into(),
+                                })?;
+                            linux_object::fs::dcache_invalidate();
+                            proc.initialize_created_metadata(
+                                &inode,
+                                Some(&dir_metadata),
+                                create_mode,
+                                false,
+                            )?;
                             walked.enter(String::from(file_name));
-                            file_inode
-                        };
-                        let metadata = file_inode.metadata()?;
-                        // `do_open`: what the name turned out to be is judged
-                        // before what the caller may do with it.
-                        open_resolved_type(flags, metadata.type_)?;
-                        if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
-                            proc.check_access(&metadata, 0o2, true)?;
+                            (inode, true, walked)
                         }
-                        if flags.readable() {
-                            proc.check_access(&metadata, 0o4, true)?;
-                        }
-                        (file_inode, false, walked)
-                    }
-                    Err(FsError::EntryNotFound) => {
-                        proc.check_access(&dir_metadata, 0o3, true)?;
-                        // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
-                        // Without the mask, `open(..., O_CREAT, 0o100644)`
-                        // left `S_IFREG` in the inode mode. `mknod` shares
-                        // this mask; `mkdir` has a narrower one of its own
-                        // (`mkdir_perm`), which also drops the set-id bits.
-                        let create_mode = proc.apply_umask(super::dir::create_perm(mode));
-                        // `lookup_open`: a directory with no `->create`
-                        // (`/proc`, `/sys`) is `EACCES` to `O_CREAT`.
-                        let inode = dir_inode
-                            .create(file_name, FileType::File, create_mode as u32)
-                            .map_err(|e| match e {
-                                rcore_fs::vfs::FsError::NotSupported => LxError::EACCES,
-                                e => e.into(),
-                            })?;
-                        linux_object::fs::dcache_invalidate();
-                        proc.initialize_created_metadata(
-                            &inode,
-                            Some(&dir_metadata),
-                            create_mode,
-                            false,
-                        )?;
-                        walked.enter(String::from(file_name));
-                        (inode, true, walked)
-                    }
-                    Err(e) => return Err(LxError::from(e)),
+                        Err(e) => return Err(LxError::from(e)),
+                    };
                 }
             } else {
                 // `O_NOFOLLOW` refuses a symbolic link as the LAST component
@@ -728,11 +810,12 @@ impl Syscall<'_> {
                 // `may_open`: the type's refusals (ELOOP, EISDIR) come before
                 // `inode_permission`.
                 open_resolved_type(flags, metadata.type_)?;
-                if flags.readable() {
+                let (read, write) = open_needs(flags);
+                if read {
                     let verdict = proc.check_access(&metadata, 0o4, true);
                     linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
                 }
-                if flags.writable() {
+                if write {
                     proc.check_access(&metadata, 0o2, true)?;
                 }
                 (inode, false, walked)
@@ -2645,8 +2728,8 @@ mod benches {
         b.iter(|| black_box(open_flags(black_box(raw))));
     }
 
-    /// A flag word with a bit this kernel does not name: `EINVAL`, and the
-    /// answer costs no more than accepting one.
+    /// A flag word with a bit nobody defined: dropped, as `build_open_how`
+    /// drops it, at the cost of one mask.
     #[bench]
     fn open_flags_unknown_bit(b: &mut Bencher) {
         b.iter(|| black_box(open_flags(black_box(1 << 31))));

@@ -712,11 +712,12 @@ fn the_same_path_twice_is_the_same_watch_and_rm_watch_takes_it_away() {
 
 #[test]
 fn what_signalfd4_judges_before_it_reads_the_mask() {
-    // Three judgements in order, each told apart by its errno: the flag
-    // word first (as Linux does, whether or not the descriptor is good),
-    // then how wide the caller says its `sigset_t` is -- which this call
-    // took, named `_sizemask`, and ignored while reading eight bytes
-    // regardless -- and only then the read of the mask itself.
+    // Three judgements in `SYSCALL_DEFINE4(signalfd4)`'s order, each told
+    // apart by its errno: how wide the caller says its `sigset_t` is --
+    // which this call took, named `_sizemask`, and ignored while reading
+    // eight bytes regardless -- then the read of the mask, and only then,
+    // in `do_signalfd4`, the flag word (whether or not the descriptor is
+    // good). Then any number but -1 is a descriptor to look up.
     let proc = a_process(47_369, "anon-signalfd-order", "anon_signalfd_order");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -725,8 +726,17 @@ fn what_signalfd4_judges_before_it_reads_the_mask() {
 
             assert_eq!(
                 signalfd4_at_a_null_mask(sys, -1, A_SIGSET, A_FLAG_OF_NOBODY),
-                Err(LxError::EINVAL),
-                "the flags were not judged before the mask was read"
+                Err(LxError::EFAULT),
+                "the mask is read before the flags are judged"
+            );
+            assert_eq!(
+                signalfd4(sys, -1, &TWO_SIGNALS, A_SIGSET, A_FLAG_OF_NOBODY),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(
+                signalfd4(sys, -2, &TWO_SIGNALS, A_SIGSET, 0),
+                Err(LxError::EBADF),
+                "only -1 asks for a new signalfd"
             );
             assert_eq!(
                 signalfd4_at_a_null_mask(sys, -1, A_SIGSET_OF_ANOTHER_KERNEL, 0),
@@ -1006,6 +1016,47 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
                 Err(LxError::EBADF),
                 "the range was marked instead of closed"
             );
+        })
+    });
+}
+
+#[test]
+fn timerfd_settime_reads_the_value_then_judges_it_then_finds_the_descriptor() {
+    // `SYSCALL_DEFINE4(timerfd_settime)` copies the new value in (`EFAULT`)
+    // before `do_timerfd_settime` refuses a bad flag or `timespec`
+    // (`EINVAL`), and only then is the descriptor looked up (`EBADF`).
+    let proc = a_process(47_373, "anon-timerfd-order", "anon_timerfd_order");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            const NOT_OPEN: usize = 90;
+            let settime = |fd: usize, flags: usize, value: &[u64; 4]| {
+                sys.sys_timerfd_settime(
+                    FileDesc::from(fd),
+                    flags,
+                    UserInPtr::from(value.as_ptr() as usize),
+                    UserOutPtr::from(0usize),
+                )
+            };
+            let one_second = [0u64, 0, 1, 0];
+            let too_many_nanoseconds = [0u64, 0, 0, 1_000_000_000];
+            assert_eq!(
+                sys.sys_timerfd_settime(
+                    FileDesc::from(NOT_OPEN),
+                    0,
+                    UserInPtr::from(0usize),
+                    UserOutPtr::from(0usize)
+                ),
+                Err(LxError::EFAULT),
+                "the value is read before the descriptor is looked up"
+            );
+            assert_eq!(settime(NOT_OPEN, 4, &one_second), Err(LxError::EINVAL));
+            assert_eq!(
+                settime(NOT_OPEN, 0, &too_many_nanoseconds),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(settime(NOT_OPEN, 0, &one_second), Err(LxError::EBADF));
+            let tfd = sys.sys_timerfd_create(1, 0).unwrap();
+            assert_eq!(settime(tfd, 0, &one_second), Ok(0));
         })
     });
 }

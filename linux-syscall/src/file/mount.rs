@@ -66,10 +66,12 @@ impl Syscall<'_> {
             "mount: source={:?}, target={:?}, fstype={:?}, flags={:#x}",
             source, target, fstype, flags
         );
-        may_mount(self)?;
         let proc = self.linux_process();
-        // `do_mount` looks the target up before anything else is read.
+        // `do_mount` looks the target up before anything else is read, and
+        // `path_mount` asks `may_mount` only once it has it: an
+        // unprivileged `mount` of a target that is not there is `ENOENT`.
         let target = mount_path(proc, target, true)?;
+        may_mount(self)?;
         // What a bind or a move takes is a path too (`do_loopback`,
         // `do_move_mount_old`), and an empty one is no name at all. A device
         // is opened from the caller's directory further in, and its line
@@ -103,14 +105,15 @@ impl Syscall<'_> {
 
     /// Unmount a filesystem.
     pub fn sys_umount2(&self, target: UserInPtr<u8>, flags: usize) -> SysResult {
+        // `ksys_umount`: the word before the path, so an option this kernel
+        // does not know is `EINVAL` whether or not the path is there; then
+        // `user_path_at`, and only `path_umount` asks `may_mount`.
+        check_umount_flags(flags)?;
         let target = target.as_c_str()?;
         info!("umount2: target={:?}, flags={:#x}", target, flags);
-        may_mount(self)?;
-        // `ksys_umount`: the word before the path, so an option this kernel
-        // does not know is `EINVAL` whether or not the path is there.
-        check_umount_flags(flags)?;
         let follow = flags & UMOUNT_NOFOLLOW == 0;
         let target = mount_path(self.linux_process(), target, follow)?;
+        may_mount(self)?;
         umount_fs(&target, flags)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -153,11 +156,12 @@ mod tests {
     //! `Ok(())` to everyone would have passed the suite.
     //!
     //! What is asked below is not only that the gate refuses, but that it
-    //! refuses FIRST. An error from further in -- EINVAL for an empty
-    //! filesystem type, ENODEV for one this kernel has never heard of --
-    //! tells an unprivileged caller something about the system it was not
-    //! allowed to ask about, and that is why Linux puts `may_mount` ahead of
-    //! all of it.
+    //! refuses before the filesystem is looked at. An error from further in
+    //! -- EINVAL for an empty filesystem type, ENODEV for one this kernel has
+    //! never heard of -- tells an unprivileged caller something about the
+    //! system it was not allowed to ask about. What Linux does judge first is
+    //! the target path (`user_path_at`) and `umount2`'s flag word, and so
+    //! does this.
 
     use super::*;
     use crate::on_a_thread::on_a_thread;
@@ -194,7 +198,7 @@ mod tests {
     }
 
     /// An umount option no kernel defines, so `check_umount_flags` refuses
-    /// it -- from inside `umount_fs`, which is past the gate.
+    /// it, ahead of the gate as `ksys_umount` does.
     const AN_UNKNOWN_UMOUNT_FLAG: usize = 0x8000;
 
     /// The three answers this process gets to three requests that are each
@@ -275,6 +279,13 @@ mod tests {
         let (none, target, fstype) = (c("none"), c(A_TARGET_OF_ITS_OWN), c("proc"));
         let (got, mounts) = on_a_thread(&proc, move |sys| {
             Box::pin(async move {
+                // The target is there: `do_mount` looks it up before the
+                // gate, so a missing one would be `ENOENT` for anybody.
+                let probe = A_TARGET_OF_ITS_OWN.trim_start_matches('/');
+                sys.linux_process()
+                    .root_inode()
+                    .create(probe, rcore_fs::vfs::FileType::Dir, 0o755)
+                    .unwrap();
                 let got = async_std::task::block_on(sys.sys_mount(
                     at(&none),
                     at(&target),
@@ -339,8 +350,10 @@ mod tests {
             "root did not reach check_umount_flags"
         );
 
-        // The same three requests, from a caller that may not mount, get the
-        // same answer every time, and it is the gate's.
+        // The same requests, from a caller that may not mount: the two
+        // mounts get the gate's answer, because `path_mount` asks it before
+        // the type is parsed. `ksys_umount` judges its flag word before
+        // anything else, so that one is `EINVAL` for anybody.
         let (empty, unknown, flag) =
             the_three_requests(&an_unprivileged_process(45_543, "mount-as-other"));
         assert_eq!(
@@ -355,8 +368,8 @@ mod tests {
         );
         assert_eq!(
             flag,
-            Err(LxError::EPERM),
-            "an unknown umount flag answered EINVAL to a caller that may not mount"
+            Err(LxError::EINVAL),
+            "umount2 judges its flags before it asks who is calling"
         );
     }
 

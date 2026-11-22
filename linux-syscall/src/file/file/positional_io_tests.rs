@@ -460,3 +460,33 @@ fn a_flag_this_kernel_does_not_implement_is_refused_and_not_silently_ignored() {
         })
     });
 }
+
+#[test]
+fn the_descriptor_is_judged_before_the_iovec_array() {
+    // `do_readv` / `do_writev` / `do_preadv` / `do_pwritev` look the
+    // descriptor up before `import_iovec` reads the array, so a closed
+    // descriptor with a bad array is `EBADF`, not `EFAULT`.
+    let proc = a_process(45_586, "pio-order", "pio_order");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let closed = || FileDesc::from(90usize);
+            assert_eq!(
+                sys.sys_readv(closed(), UserInPtr::from(0usize), 1).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                sys.sys_writev(closed(), UserInPtr::from(0usize), 1).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                sys.sys_preadv(closed(), UserInPtr::from(0usize), 1, 0)
+                    .await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                sys.sys_pwritev(closed(), UserInPtr::from(0usize), 1, 0),
+                Err(LxError::EBADF)
+            );
+        })
+    });
+}

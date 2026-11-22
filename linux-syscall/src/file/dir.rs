@@ -172,14 +172,6 @@ impl Syscall<'_> {
         let (dir_path, last) = last_component(path)?;
         let file_name = last.to_create(has_trailing_slash(path))?;
         let proc = self.linux_process();
-        // `may_mknod`: a character or block device node needs `CAP_MKNOD`, and
-        // it is asked before anything else. Nothing asked it here, so any
-        // process could make a node naming any major and minor it liked.
-        if matches!(file_type, FileType::CharDevice | FileType::BlockDevice)
-            && !proc.capable(linux_object::process::CAP_MKNOD)
-        {
-            return Err(LxError::EPERM);
-        }
         let inode = proc.lookup_parent_at(dirfd, dir_path)?;
         let dir_metadata = inode.metadata()?;
         // The name is looked up BEFORE the parent's mode, as `filename_create`
@@ -190,6 +182,16 @@ impl Syscall<'_> {
             return Err(LxError::EEXIST);
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
+        // `vfs_mknod`: a character or block device node needs `CAP_MKNOD`,
+        // asked after `may_create`. A character node of device 0 is a
+        // whiteout (overlayfs), which anybody may make.
+        let whiteout = file_type == FileType::CharDevice && dev == 0;
+        if matches!(file_type, FileType::CharDevice | FileType::BlockDevice)
+            && !whiteout
+            && !proc.capable(linux_object::process::CAP_MKNOD)
+        {
+            return Err(LxError::EPERM);
+        }
         let create_mode = proc.apply_umask(create_perm(mode));
         let rdev = if matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
             dev
@@ -1054,12 +1056,16 @@ pub(crate) fn at_flags(flags: usize, allowed: usize) -> Result<AtFlags, LxError>
     Ok(AtFlags::from_bits_truncate(flags))
 }
 
-/// What `fstatat(2)` accepts (`vfs_fstatat`, `fs/stat.c`).
-pub(crate) const FSTATAT_FLAGS: usize =
-    AtFlags::SYMLINK_NOFOLLOW.bits() | AT_NO_AUTOMOUNT | AtFlags::EMPTY_PATH.bits();
+/// What `fstatat(2)` accepts: `vfs_fstatat` hands its flags to the same
+/// `vfs_statx` as `statx(2)`, whose test lets the sync-type bits through.
+pub(crate) const FSTATAT_FLAGS: usize = AtFlags::SYMLINK_NOFOLLOW.bits()
+    | AT_NO_AUTOMOUNT
+    | AtFlags::EMPTY_PATH.bits()
+    | AT_STATX_SYNC_TYPE;
 
-/// What `statx(2)` accepts: `fstatat`'s set plus the sync-type bits.
-pub(crate) const STATX_FLAGS: usize = FSTATAT_FLAGS | AT_STATX_SYNC_TYPE;
+/// What `statx(2)` accepts: `fstatat`'s set. Only `do_statx` refuses the
+/// two sync-type bits together, which `fstatat` never asks about.
+pub(crate) const STATX_FLAGS: usize = FSTATAT_FLAGS;
 
 /// What `linkat(2)` accepts (`do_linkat`, `fs/namei.c`).
 pub(crate) const LINKAT_FLAGS: usize = AtFlags::SYMLINK_FOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
@@ -1133,7 +1139,10 @@ pub(crate) fn mknod_file_type(mode: usize) -> LxResult<FileType> {
         0o060000 => FileType::BlockDevice, // S_IFBLK
         0o140000 => FileType::Socket,      // S_IFSOCK
         0o100000 | 0 => FileType::File,    // S_IFREG / unspecified
-        _ => return Err(LxError::EINVAL),  // directories must use mkdir
+        // `may_mknod`: a directory is `EPERM` (it goes through `mkdir`),
+        // any other type `EINVAL`.
+        0o040000 => return Err(LxError::EPERM),
+        _ => return Err(LxError::EINVAL),
     })
 }
 
@@ -1802,7 +1811,7 @@ mod at_flags_tests {
         assert_eq!(AT_NO_AUTOMOUNT, 0x800);
         assert_eq!(AtFlags::EMPTY_PATH.bits(), 0x1000);
         assert_eq!(AT_STATX_SYNC_TYPE, 0x6000);
-        assert_eq!(FSTATAT_FLAGS, 0x100 | 0x800 | 0x1000);
+        assert_eq!(FSTATAT_FLAGS, 0x100 | 0x800 | 0x1000 | 0x6000);
         assert_eq!(STATX_FLAGS, 0x100 | 0x800 | 0x1000 | 0x6000);
         assert_eq!(LINKAT_FLAGS, 0x400 | 0x1000);
     }
@@ -1837,13 +1846,15 @@ mod at_flags_tests {
         );
     }
 
+    /// `vfs_statx` lets the sync bits through for both calls; `statx`'s
+    /// refusal of the two together is `do_statx`'s, tested by the syscall.
     #[test]
-    fn statx_takes_its_sync_bits_and_fstatat_does_not() {
+    fn statx_and_fstatat_both_take_the_sync_bits() {
         for bit in [0x2000, 0x4000, AT_STATX_SYNC_TYPE] {
             assert_eq!(at_flags(bit, STATX_FLAGS), Ok(AtFlags::empty()), "{bit:#x}");
             assert_eq!(
-                at_flags(bit, FSTATAT_FLAGS).err(),
-                Some(LxError::EINVAL),
+                at_flags(bit, FSTATAT_FLAGS),
+                Ok(AtFlags::empty()),
                 "{bit:#x}"
             );
         }
@@ -2723,15 +2734,16 @@ mod mknod_file_type_tests {
         assert_eq!(mknod_file_type(0o120000), Err(LxError::EINVAL));
     }
 
-    /// A directory is the one type `mknod` refuses.
+    /// A directory is the one type `mknod` refuses with `EPERM`
+    /// (`may_mknod`); a code that is no type at all is `EINVAL`.
     ///
     /// Directories go through `mkdir`, which is the only path that links `.`
     /// and `..`, so a directory made here would be a directory nothing could
     /// walk out of.
     #[test]
     fn a_directory_has_to_go_through_mkdir() {
-        assert_eq!(mknod_file_type(0o040000), Err(LxError::EINVAL), "S_IFDIR");
-        assert_eq!(mknod_file_type(0o040755), Err(LxError::EINVAL));
+        assert_eq!(mknod_file_type(0o040000), Err(LxError::EPERM), "S_IFDIR");
+        assert_eq!(mknod_file_type(0o040755), Err(LxError::EPERM));
         // And the mask itself is not a type.
         assert_eq!(mknod_file_type(0o170000), Err(LxError::EINVAL));
     }

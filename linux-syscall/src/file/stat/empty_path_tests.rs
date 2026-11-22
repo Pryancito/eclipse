@@ -306,3 +306,51 @@ fn statx_leaves_the_last_link_with_at_symlink_nofollow() {
     });
     assert_eq!(got, [Ok(REG), Ok(LNK), Ok(REG)]);
 }
+
+/// `do_statx` refuses a reserved mask bit and both sync types at once, after
+/// the name is read and before the flags are judged; `fstatat` takes the
+/// sync bits (`vfs_statx` lets them through) and, like `statx`, a NULL name
+/// under `AT_EMPTY_PATH` (Linux 6.11+).
+#[test]
+fn statx_judges_its_mask_and_sync_bits_and_fstatat_takes_a_null_name() {
+    const FORCE_SYNC: usize = 0x2000;
+    const DONT_SYNC: usize = 0x4000;
+    let proc = a_process(45_546, "ep_order");
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let f = open_at(sys, "/ep_order/f", 0);
+            let path = c_path("/ep_order/f");
+            let mut x = [0u64; 32];
+            let mut statx = |p: usize, flags: usize, mask: u32| {
+                sys.sys_statx(
+                    FileDesc::CWD,
+                    UserInPtr::from(p),
+                    flags,
+                    mask,
+                    UserOutPtr::from(x.as_mut_ptr() as usize),
+                )
+            };
+            let named = path.as_ptr() as usize;
+            assert_eq!(statx(named, 0, 0x8000_0000), Err(LxError::EINVAL));
+            assert_eq!(
+                statx(named, FORCE_SYNC | DONT_SYNC, BASIC_STATS),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(statx(named, FORCE_SYNC, BASIC_STATS), Ok(0));
+            assert_eq!(
+                statx(0, 0, 0x8000_0000),
+                Err(LxError::EFAULT),
+                "the name is read before the mask is judged"
+            );
+            assert_eq!(
+                statx(0, 0x1, BASIC_STATS),
+                Err(LxError::EFAULT),
+                "and before the flags"
+            );
+
+            assert_eq!(stat_raw(sys, f, 0, EMPTY_PATH).map(|(t, _)| t), Ok(REG));
+            assert_eq!(stat_raw(sys, f, 0, 0), Err(LxError::EFAULT));
+            assert!(stat_at(sys, FileDesc::CWD, "/ep_order/f", FORCE_SYNC).is_ok());
+        })
+    });
+}
