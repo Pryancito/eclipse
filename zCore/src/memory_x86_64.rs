@@ -538,6 +538,13 @@ pub fn heap_used() -> usize {
     HEAP_USED.get()
 }
 
+/// [`heap_used`] as one load: behind by less than the counter's batch per
+/// CPU. What a check on every queued byte reads (`linux_object::kmem`).
+#[allow(dead_code)]
+pub fn heap_used_approx() -> usize {
+    HEAP_USED.approx()
+}
+
 cfg_if! {
     if #[cfg(not(feature = "libos"))] {
         use buddy_system_allocator::Heap;

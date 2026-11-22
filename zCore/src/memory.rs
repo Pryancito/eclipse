@@ -1492,6 +1492,13 @@ pub fn heap_total() -> usize {
     TOTAL_MEMORY.load(Ordering::Relaxed)
 }
 
+/// Bytes of heap in use, read cheaply (mirrors
+/// `memory_x86_64::heap_used_approx`). This build's counter is one word.
+#[allow(dead_code)]
+pub fn heap_used_approx() -> usize {
+    heap_used()
+}
+
 /// The most the heap can reach (mirrors `memory_x86_64::heap_limit`). This
 /// build's heap does not grow, so it is the heap.
 #[allow(dead_code)]

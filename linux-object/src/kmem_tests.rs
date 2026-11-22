@@ -135,8 +135,8 @@ fn bytes_are_given_back_to_whoever_wrote_them() {
     assert_eq!(b.charged(), 0);
     // The kernel's last three and `a`'s last byte.
     q.release(4);
-    assert_eq!(a.charged(), 0);
-    assert_eq!(q.charged(), 0);
+    assert_eq!(a.charged(), RUN_COST);
+    assert_eq!(q.charged(), RUN_COST);
 }
 
 #[test]
@@ -162,7 +162,28 @@ fn a_write_over_the_quota_queues_nothing() {
     assert_eq!(b.charged(), 0);
     assert_eq!(a.charged(), 500 + RUN_COST);
     q.release(500);
+    assert_eq!(a.charged(), RUN_COST);
+}
+
+#[test]
+fn a_drained_queue_keeps_its_last_run_for_the_next_message() {
+    let a = KmemAccount::with_limit(0);
+    let b = KmemAccount::with_limit(0);
+    let mut q = ChargedBytes::new();
+    for _ in 0..3 {
+        q.charge_to(Some(a.clone()), 64).unwrap();
+        q.release(64);
+    }
+    // One run all along: its bookkeeping was charged once.
+    assert_eq!(a.charged(), RUN_COST);
+    // Somebody else's bytes behind the empty run; the empty one goes with
+    // the next release.
+    q.charge_to(Some(b.clone()), 8).unwrap();
+    q.release(8);
     assert_eq!(a.charged(), 0);
+    assert_eq!(b.charged(), RUN_COST);
+    drop(q);
+    assert_eq!(b.charged(), 0);
 }
 
 #[test]
@@ -171,7 +192,7 @@ fn releasing_more_than_was_charged_stops_at_the_end() {
     let mut q = ChargedBytes::new();
     q.charge_to(Some(a.clone()), 10).unwrap();
     q.release(1000);
-    assert_eq!(a.charged(), 0);
+    assert_eq!(a.charged(), RUN_COST);
     q.release(1);
 }
 

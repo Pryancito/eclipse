@@ -61,6 +61,12 @@ pub trait KernelHandler: Send + Sync + 'static {
     /// The heap of every architecture but x86_64 is a fixed arena, so this
     /// is its size. x86_64 grows its heap out of RAM up to a ceiling, and a
     /// heap at 90 % of what it holds now may still be far from its end.
+    /// [`Self::kernel_heap_usage`] read cheaply: the used figure may be
+    /// behind by a small batch per CPU. For checks made on hot paths.
+    fn kernel_heap_usage_approx(&self) -> (usize, usize) {
+        self.kernel_heap_usage()
+    }
+
     fn kernel_heap_limit(&self) -> usize {
         self.kernel_heap_usage().1
     }

@@ -522,6 +522,10 @@ impl KernelHandler for ZcoreKernelHandler {
         (memory::heap_used(), memory::heap_total())
     }
 
+    fn kernel_heap_usage_approx(&self) -> (usize, usize) {
+        (memory::heap_used_approx(), memory::heap_total())
+    }
+
     fn kernel_heap_limit(&self) -> usize {
         memory::heap_limit()
     }

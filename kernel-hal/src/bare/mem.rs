@@ -60,6 +60,10 @@ hal_fn_impl! {
             crate::KHANDLER.kernel_heap_usage()
         }
 
+        fn kernel_heap_usage_approx() -> (usize, usize) {
+            crate::KHANDLER.kernel_heap_usage_approx()
+        }
+
         fn kernel_heap_limit() -> usize {
             crate::KHANDLER.kernel_heap_limit()
         }

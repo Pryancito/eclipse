@@ -156,7 +156,10 @@ impl KmemAccount {
 
     /// Charge `n` bytes, or refuse them and charge nothing.
     pub fn try_charge(&self, n: usize) -> Result<(), Refusal> {
-        let (used, total) = kernel_hal::mem::kernel_heap_usage();
+        // The cheap reading: a check on every queued byte must not sum a
+        // counter over every CPU, and a few batches of slack on a reserve
+        // of an eighth of the heap change nothing.
+        let (used, total) = kernel_hal::mem::kernel_heap_usage_approx();
         self.try_charge_on(
             n,
             Heap {
@@ -356,6 +359,21 @@ impl ChargedBytes {
                 return;
             }
             n -= held;
+            // The last run stays, emptied, with its bookkeeping still
+            // charged: a queue its one writer fills and its reader drains
+            // on every call (every pipe and socket in a request/response
+            // loop) would otherwise charge, push, pop and uncharge a run
+            // per message. Its writer's next bytes join it; anybody else's
+            // start a new run behind it, and the empty one goes at the next
+            // release. Dropping the queue gives its bookkeeping back.
+            if self.runs.len() == 1 {
+                let front = self.runs.front_mut().unwrap();
+                if let Some(to) = &front.to {
+                    to.uncharge(held);
+                }
+                front.bytes = overhead;
+                return;
+            }
             let run = self.runs.pop_front().unwrap();
             if let Some(to) = &run.to {
                 to.uncharge(run.bytes);
