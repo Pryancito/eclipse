@@ -5,8 +5,10 @@
 //! versions have no PHY to bring up, and are not taken.
 //!
 //! What is done is what Linux's `82571.c` does that is more than the
-//! 82574's bring-up: the bus quiesced and the PHY's owner held around the
-//! MAC reset, the NVM's automatic read waited for, the errata bits of
+//! 82574's bring-up: the bus quiesced, the MAC reset (under MDIO ownership
+//! on an 82573; an 82571 or 82572 takes no semaphore for it), the NVM's
+//! automatic read waited for and, on the 82571 and 82572, its `EECD`
+//! request and grant let go of, the errata bits of
 //! `e1000_initialize_hw_bits_82571`, LPLU off in an IGP PHY
 //! (`e1000_set_d0_lplu_state_82571`), and auto-negotiation restarted with
 //! everything offered. After the reset the card loads its own address from
@@ -35,6 +37,8 @@ const SWSM: usize = 0x5b50;
 const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2;
 const CTRL_RST: u32 = 1 << 26;
 const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19;
+const EECD_REQ: u32 = 1 << 6;
+const EECD_GNT: u32 = 1 << 7;
 const EECD_AUTO_RD: u32 = 1 << 9;
 const CTRL_EXT_DMA_DYN_CLK_EN: u32 = 1 << 19;
 const EXTCNF_CTRL_MDIO_SW_OWNERSHIP: u32 = 1 << 5;
@@ -129,7 +133,8 @@ impl<H: Hw> Drop for Owner<'_, H> {
 pub struct Report {
     /// Whether the card stopped mastering the bus before its reset.
     pub quiesced: bool,
-    /// Whether the PHY's owner could be had around the reset.
+    /// Whether the 82573's MDIO ownership could be had around the reset
+    /// (an 82571 or 82572 takes none, and says true).
     pub owned: bool,
     /// Whether the NVM said its automatic read was done.
     pub nvm_read: bool,
@@ -157,10 +162,12 @@ pub fn reset<H: Hw>(hw: &H, part: Part) -> Result<Report, String> {
     let _ = hw.rd(STATUS);
     hw.delay_us(10_000);
 
-    // The PHY's owner is held across the reset: on a dual 82571 the other
-    // port's driver may be talking to it.
-    let owner = Owner::take(hw, part);
-    let owned = owner.is_some();
+    // An 82573 resets with the firmware's MDIO ownership held; an 82571 or
+    // 82572 takes no semaphore for its reset (Linux `e1000_reset_hw_82571`).
+    let owner = (part == Part::E82573)
+        .then(|| Owner::take(hw, part))
+        .flatten();
+    let owned = part != Part::E82573 || owner.is_some();
     hw.wr(CTRL, hw.rd(CTRL) | CTRL_RST);
     drop(owner);
     let mut out = false;
@@ -183,6 +190,9 @@ pub fn reset<H: Hw>(hw: &H, part: Part) -> Result<Report, String> {
     });
     if part == Part::E82573 {
         hw.delay_us(25_000);
+    } else {
+        // The automatic read leaves the EEPROM's request and grant set.
+        hw.wr(EECD, hw.rd(EECD) & !(EECD_REQ | EECD_GNT));
     }
     hw.wr(super::IMC, u32::MAX);
     let _ = hw.rd(super::ICR);

@@ -56,7 +56,7 @@ impl Hw for Card {
             CTRL if v & CTRL_RST != 0 => {
                 self.reset_owned.set(Some(self.owned()));
                 self.set(CTRL, 0);
-                self.set(EECD, EECD_AUTO_RD);
+                self.set(EECD, EECD_AUTO_RD | EECD_REQ | EECD_GNT);
             }
             CTRL if v & CTRL_GIO_MASTER_DISABLE != 0 => {
                 self.set(CTRL, v);
@@ -113,7 +113,7 @@ fn the_copper_82571_82572_and_82573_are_parts_and_the_fiber_ones_are_not() {
 }
 
 #[test]
-fn an_82571_is_reset_under_swsm_with_its_errata_bits_and_lplu_cleared() {
+fn an_82571_is_reset_without_a_semaphore_with_its_errata_bits_and_lplu_cleared() {
     let card = card();
     card.phy
         .borrow_mut()
@@ -123,9 +123,10 @@ fn an_82571_is_reset_under_swsm_with_its_errata_bits_and_lplu_cleared() {
     let report = reset(&card, Part::E82571).unwrap();
     assert_eq!(
         card.reset_owned.get(),
-        Some(true),
-        "the reset without the PHY's owner"
+        Some(false),
+        "Linux takes no semaphore for an 82571's reset"
     );
+    assert_eq!(card.reg(EECD) & (EECD_REQ | EECD_GNT), 0);
     assert!(report.quiesced && report.owned && report.nvm_read);
     assert!(report.lplu_cleared && report.autoneg);
     assert_eq!(card.phy(IGP02_POWER_MGMT), 1);
@@ -166,7 +167,10 @@ fn a_held_swsm_leaves_the_phy_alone_but_the_card_comes_up() {
     let card = card();
     card.swsm_held.set(true);
     let report = reset(&card, Part::E82571).unwrap();
-    assert!(!report.owned && !report.autoneg);
+    assert!(
+        report.owned && !report.autoneg,
+        "the reset needs no SWSM, the PHY does"
+    );
     assert!(!card.unowned_phy.get(), "the PHY was touched without SWSM");
 }
 
