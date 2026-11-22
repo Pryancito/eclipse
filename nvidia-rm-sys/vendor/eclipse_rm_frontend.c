@@ -98,6 +98,8 @@
 #include "rmapi/event.h"       /* EVENTNOTIFICATION */
 #include "nv-unix-nvos-params-wrappers.h" /* nv_ioctl_nvos33_parameters_with_fd */
 #include "eclipse_rm_mem.h"
+#include "platform/p2p/p2p_caps.h" /* p2pGetCapsStatus */
+#include "ctrl/ctrl0000/ctrl0000system.h" /* NV0000_P2P_CAPS_STATUS_* */
 
 extern RsServer g_resServ;
 
@@ -2037,6 +2039,65 @@ NV_STATUS eclipse_rm_frontend_uvm_user_pages(
     }
     *phMemory = hMemory;
     return NV_OK;
+}
+
+/*
+ * What the RM says of peer access between RM GPU instances `gpuInstanceA`
+ * and `gpuInstanceB`: the NV0000_P2P_CAPS_STATUS_* of reads, writes and
+ * atomics, and the P2P_CONNECTIVITY it would go over. This is the answer
+ * NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS gives libcuda's cuDeviceCanAccessPeer
+ * and nvGpuOpsGetP2PCaps gives nvidia-uvm when it registers the GPUs, and
+ * the one UVM_ENABLE_PEER_ACCESS is checked against.
+ */
+NV_STATUS eclipse_rm_frontend_uvm_p2p_caps(
+    NvU32   gpuInstanceA,
+    NvU32   gpuInstanceB,
+    NvU8   *pReadStatus,
+    NvU8   *pWriteStatus,
+    NvU8   *pAtomicsStatus,
+    NvU32  *pConnectivity)
+{
+    THREAD_STATE_NODE threadState;
+    P2P_CONNECTIVITY connectivity = P2P_CONNECTIVITY_UNKNOWN;
+    NvU8 atomics = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+    NV_STATUS status;
+
+    if ((pReadStatus == NULL) || (pWriteStatus == NULL) || (pAtomicsStatus == NULL) ||
+        (pConnectivity == NULL) || (gpuInstanceA == gpuInstanceB) ||
+        (gpuInstanceA >= 32) || (gpuInstanceB >= 32))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    *pReadStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+    *pWriteStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_P2P);
+        if (status == NV_OK)
+        {
+            NvU32 gpuMask = NVBIT(gpuInstanceA) | NVBIT(gpuInstanceB);
+
+            if ((gpumgrGetGpu(gpuInstanceA) == NULL) || (gpumgrGetGpu(gpuInstanceB) == NULL))
+            {
+                status = NV_ERR_INVALID_DEVICE;
+            }
+            else
+            {
+                status = p2pGetCapsStatus(gpuMask, pWriteStatus, pReadStatus,
+                                          (NvBool *)&atomics, &connectivity);
+            }
+            rmapiLockRelease();
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    *pAtomicsStatus = atomics;
+    *pConnectivity = (NvU32)connectivity;
+    return status;
 }
 
 /* NV_MMU_PTE_KIND_SMSKED_MESSAGE (dev_mmu.h), the same from Turing on. */

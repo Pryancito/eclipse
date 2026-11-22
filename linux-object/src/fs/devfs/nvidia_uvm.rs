@@ -54,6 +54,10 @@
 //!   The `cudaMemAdvise` calls, range groups and UVM_MIGRATE
 //!   (`cudaMemPrefetchAsync`) are checked and recorded, and a prefetch is
 //!   done at once; see the `managed` module.
+//! - UVM_ENABLE_PEER_ACCESS gives two registered GPUs peer access when the
+//!   RM's P2P caps say they have it over PCIe, and UVM_DISABLE_PEER_ACCESS
+//!   takes it back; the caps of each GPU pair are logged the first time
+//!   both are registered. See the `peer` module.
 //! - UVM_VALIDATE_VA_RANGE answers whether a range is exactly one here,
 //!   external, a semaphore pool, SKED reflected or managed. Linux also counts the
 //!   ranges it makes for a channel's buffers, which this port leaves to the
@@ -146,9 +150,12 @@ pub mod cmd {
     pub const MIGRATE_RANGE_GROUP: u32 = 53;
     pub const ENABLE_SYSTEM_WIDE_ATOMICS: u32 = 54;
     pub const DISABLE_SYSTEM_WIDE_ATOMICS: u32 = 55;
+    pub const ENABLE_PEER_ACCESS: u32 = 29;
+    pub const DISABLE_PEER_ACCESS: u32 = 30;
 }
 
 mod managed;
+mod peer;
 use managed::ManagedRange;
 
 /// `UVM_INITIALIZE_PARAMS`: `NvU64 flags`, `NV_STATUS rmStatus`.
@@ -316,6 +323,7 @@ fn layout(cmd: u32) -> Option<(usize, usize)> {
         cmd::ENABLE_SYSTEM_WIDE_ATOMICS | cmd::DISABLE_SYSTEM_WIDE_ATOMICS => {
             (managed::GPU_ONLY_SIZE, managed::GPU_ONLY_STATUS)
         }
+        cmd::ENABLE_PEER_ACCESS | cmd::DISABLE_PEER_ACCESS => (peer::PEER_SIZE, peer::PEER_STATUS),
         _ => return None,
     })
 }
@@ -414,6 +422,8 @@ struct VaSpace {
     skeds: BTreeMap<u64, SkedRange>,
     /// The ranges of managed memory, by first byte.
     managed: BTreeMap<u64, ManagedRange>,
+    /// The GPU pairs given peer access, lower UUID first ([`peer::pair`]).
+    peers: BTreeSet<(Uuid, Uuid)>,
     /// Whom the last call on the VA space was for: what an mmap, which has
     /// no caller to ask, makes its RM calls as. Always the process that
     /// made the VA space, or one it forked.
@@ -686,6 +696,8 @@ trait Rm: Send + Sync {
     ) -> core::result::Result<(u32, u32), u32>;
     /// `nvctl::uvm_free`.
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32);
+    /// `nvctl::uvm_p2p_caps` between two RM GPU instances.
+    fn p2p_caps(&self, a: u32, b: u32) -> core::result::Result<nvctl::P2pCaps, u32>;
 }
 
 struct KernelRm;
@@ -746,6 +758,10 @@ impl Rm for KernelRm {
         if status != NV_OK {
             unmap_refused(status);
         }
+    }
+
+    fn p2p_caps(&self, a: u32, b: u32) -> core::result::Result<nvctl::P2pCaps, u32> {
+        nvctl::uvm_p2p_caps(a, b)
     }
 }
 
@@ -821,6 +837,12 @@ impl UvmOpen {
                 NV_OK
             }
             cmd::REGISTER_GPU => self.register_gpu(params),
+            cmd::ENABLE_PEER_ACCESS => {
+                self.enable_peer_access(&uuid_at(params, 0), &uuid_at(params, 16))
+            }
+            cmd::DISABLE_PEER_ACCESS => {
+                self.disable_peer_access(&uuid_at(params, 0), &uuid_at(params, 16))
+            }
             cmd::UNREGISTER_GPU => self.unregister_gpu(&uuid_at(params, 0), Who::of(caller)),
             cmd::CREATE_RANGE_GROUP => self.create_range_group(params),
             cmd::DESTROY_RANGE_GROUP => self.destroy_range_group(u64_at(params, 0)),
@@ -912,6 +934,7 @@ impl UvmOpen {
         params[REGISTER_GPU_NUMA_ENABLED] = 0;
         params[REGISTER_GPU_NUMA_NODE_ID..REGISTER_GPU_NUMA_NODE_ID + 4]
             .copy_from_slice(&(-1i32).to_le_bytes());
+        self.note_peers_of(&uuid);
         NV_OK
     }
 
@@ -922,6 +945,7 @@ impl UvmOpen {
         if !va_space.gpus.remove(uuid) {
             return NV_ERR_INVALID_DEVICE;
         }
+        va_space.drop_peers_of(uuid);
         self.remove_gpu_va_space(&mut va_space, uuid, who);
         NV_OK
     }
@@ -2097,6 +2121,8 @@ pub fn create_node(root: &Arc<DevINode>) {
 mod managed_tests;
 #[cfg(test)]
 mod mapping_tests;
+#[cfg(test)]
+mod peer_tests;
 #[cfg(test)]
 mod pool_tests;
 #[cfg(test)]

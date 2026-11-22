@@ -67,9 +67,17 @@ Límites frente a Linux: la memoria nunca migra a VRAM (velocidad de PCIe desde
 la GPU), se reserva y fija entera en el mmap (no bajo demanda) y no hay
 oversubscription.
 
-**Aún no:** page tables UVM propias / GPU page faults / HMM; P2P entre GPUs
-(`ENABLE_PEER_ACCESS`); el resto de ioctls UVM → `ENOSYS` (una línea en dmesg
-la primera vez).
+**P2P entre GPUs:** `cuDeviceCanAccessPeer` es la respuesta del RM
+(`p2pGetCapsStatus`), y la primera vez que dos GPUs se registran en la UVM el
+log lo dice con el motivo (`[nvidia-uvm] P2P ... no (reads NOT_SUPPORTED...)`).
+`UVM_ENABLE_PEER_ACCESS`/`DISABLE` se sirven como en Linux: solo para una pareja
+que el RM deja ir por PCIe. En GeForce el RM suele decir que no también en
+Linux; `nvidia.registry=ForceP2P=0x11` (como `NVreg_RegistryDwords`) le pide
+que lo intente. Sin P2P, `cuMemcpyPeer` copia pasando por la memoria del
+sistema. `cuda-probe -d` prueba las dos cosas (paso `peer`).
+
+**Aún no:** page tables UVM propias / GPU page faults / HMM; el resto de ioctls
+UVM → `ENOSYS` (una línea en dmesg la primera vez).
 
 ## Prueba en la máquina
 

@@ -62,6 +62,11 @@ pub(super) struct FakeState {
     /// A managed range's pages made RM memory and not freed, by the handle
     /// of their memory: (by, hClient, hDevice, the pages).
     pub user_pages: BTreeMap<u32, (By, u32, u32, nvctl::UserPages)>,
+    /// What the RM says of peer access between two instances, lower first;
+    /// a pair not here has none (NOT_SUPPORTED both ways).
+    pub p2p: BTreeMap<(u32, u32), core::result::Result<nvctl::P2pCaps, u32>>,
+    /// Every P2P caps query, as (instance, instance).
+    pub p2p_asked: Vec<(u32, u32)>,
 }
 
 /// Pages made RM memory, with the hold the RM keeps on them.
@@ -178,6 +183,18 @@ impl Rm for FakeRm {
         let h_virtual = 0xcaf0_0000 + state.last_virtual;
         state.skeds.insert(h_virtual, (By::of(by), *r, h_memory));
         Ok((h_memory, h_virtual))
+    }
+
+    fn p2p_caps(&self, a: u32, b: u32) -> core::result::Result<nvctl::P2pCaps, u32> {
+        let mut state = self.state();
+        state.p2p_asked.push((a, b));
+        let key = (a.min(b), a.max(b));
+        state.p2p.get(&key).copied().unwrap_or(Ok(nvctl::P2pCaps {
+            read: 5,
+            write: 5,
+            atomics: 5,
+            connectivity: 0,
+        }))
     }
 
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
@@ -520,7 +537,7 @@ fn mm_initialize_leaves_its_own_open_alone() {
 fn deinitialize_succeeds_and_the_rest_is_enosys() {
     let open = uvm();
     assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &plain()), Ok(0));
-    let unserved: Vec<u32> = vec![29, 30, 35, 69, 71, 74, 2047, 0x3000_0003];
+    let unserved: Vec<u32> = vec![35, 69, 71, 74, 2047, 0x3000_0003];
     for cmd in unserved {
         assert_eq!(
             open.ioctl(cmd, 0, &plain()),

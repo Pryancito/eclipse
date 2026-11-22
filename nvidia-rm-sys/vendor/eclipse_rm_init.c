@@ -768,13 +768,18 @@ NV_STATUS eclipse_rm_init_gsp(NvU32 gpuInstance, const void *pBuf, NvU32 size)
  * arch/nvalloc/unix/src/registry.c and depends on the Linux nv_state_t
  * registry chain Eclipse does not have). The GSP SET_REGISTRY RPC
  * (rpcSetRegistry_v17_00, kernel_gsp.c:3376 via kgspQueueAsyncInitRpcs) hands
- * GSP-RM the set of driver registry-key overrides. Eclipse sets none, so we
- * emit a well-formed *empty* PACKED_REGISTRY_TABLE (header only, zero
- * entries): GSP-RM reads numEntries == 0 and simply applies its own built-in
- * defaults. We must return NV_OK here rather than the NV_WARN_NOTHING_TO_DO
- * the Linux implementation returns for an empty table, because the RPC caller
- * treats any status != NV_OK as failure and would abort GSP boot.
+ * GSP-RM the set of driver registry-key overrides: the DWORD keys of
+ * `nvidia.registry=` (registry.rs), packed as RmPackageRegistry packs
+ * NVreg_RegistryDwords -- the entry table, then each name, NUL-terminated.
+ * With none set the table is well-formed and empty (header only), and GSP-RM
+ * applies its own built-in defaults. We must return NV_OK for an empty table
+ * rather than the NV_WARN_NOTHING_TO_DO the Linux implementation returns,
+ * because the RPC caller treats any status != NV_OK as failure and would
+ * abort GSP boot.
  */
+extern NvU32 eclipse_rm_registry_count(void);
+extern NvU32 eclipse_rm_registry_entry(NvU32 index, NvU8 *name, NvU32 cap, NvU32 *value);
+
 NV_STATUS osPackageRegistry(
     OBJGPU                *pGpu,
     PACKED_REGISTRY_TABLE *pRegTable,
@@ -782,26 +787,52 @@ NV_STATUS osPackageRegistry(
 )
 {
     const NvU32 headerSize = (NvU32)NV_OFFSETOF(PACKED_REGISTRY_TABLE, entries);
+    NvU32 numEntries = eclipse_rm_registry_count();
+    NvU32 totalSize = headerSize + numEntries * (NvU32)sizeof(PACKED_REGISTRY_ENTRY);
+    NvU32 dataOffset;
+    NvU32 i;
+    NvU8 *pByte;
 
     (void)pGpu;
 
     if (pSize == NULL)
         return NV_ERR_INVALID_ARGUMENT;
 
-    /* Sizing pass: report the size of the (empty) table. */
+    for (i = 0; i < numEntries; i++)
+        totalSize += eclipse_rm_registry_entry(i, NULL, 0, NULL);
+
+    /* Sizing pass. */
     if (pRegTable == NULL)
     {
-        *pSize = headerSize;
+        *pSize = totalSize;
         return NV_OK;
     }
 
-    /* Fill pass: caller-provided buffer must hold at least the header. */
-    if (*pSize < headerSize)
+    /* Fill pass: caller-provided buffer must hold all of it. */
+    if (*pSize < totalSize)
         return NV_ERR_BUFFER_TOO_SMALL;
 
-    pRegTable->size       = headerSize;
-    pRegTable->numEntries = 0;
-    *pSize                = headerSize;
+    pByte = (NvU8 *)pRegTable;
+    dataOffset = headerSize + numEntries * (NvU32)sizeof(PACKED_REGISTRY_ENTRY);
+    for (i = 0; i < numEntries; i++)
+    {
+        PACKED_REGISTRY_ENTRY *pEntry = &pRegTable->entries[i];
+        NvU32 value = 0;
+        NvU32 len = eclipse_rm_registry_entry(i, &pByte[dataOffset],
+                                              totalSize - dataOffset, &value);
+
+        if (len == 0)
+            return NV_ERR_INVALID_STATE;
+        pEntry->nameOffset = dataOffset;
+        pEntry->type       = REGISTRY_TABLE_ENTRY_TYPE_DWORD;
+        pEntry->data       = value;
+        pEntry->length     = sizeof(NvU32);
+        dataOffset += len;
+    }
+
+    pRegTable->size       = totalSize;
+    pRegTable->numEntries = numEntries;
+    *pSize                = totalSize;
 
     return NV_OK;
 }

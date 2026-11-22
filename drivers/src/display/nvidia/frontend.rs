@@ -23,7 +23,9 @@ pub use nvidia_rm_sys::frontend::events::{
     alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
 };
 pub use nvidia_rm_sys::frontend::user_pages::UserPages;
-pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, SkedRange, NV_ERR_INVALID_CLIENT};
+pub use nvidia_rm_sys::frontend::uvm::{
+    ExternalMapping, P2pCaps, Pages, SkedRange, NV_ERR_INVALID_CLIENT,
+};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
     Caller, CpuCaching, MmapContext, MmapMemory, CALLER_NAME_LEN, GPU_UUID_LEN, LAYOUT,
@@ -166,6 +168,15 @@ pub fn uvm_user_pages(
         return Err(NV_ERR_NOT_READY);
     }
     nvidia_rm_sys::frontend::uvm::user_pages(caller, h_client, h_device, pages, gpu_cached)
+}
+
+/// `nvidia_rm_sys::frontend::uvm::p2p_caps` between RM GPU instances `a`
+/// and `b`, refused with `NV_ERR_NOT_READY` while there is no RM core.
+pub fn uvm_p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::p2p_caps(a, b)
 }
 
 /// `nvidia_rm_sys::frontend::uvm::sked_reflected`, refused with

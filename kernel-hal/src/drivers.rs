@@ -488,6 +488,18 @@ pub fn set_gem_vram_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_vram_enabled(_v: bool) {}
 
+/// `nvidia.registry=Key=Value;...`: the NVIDIA RM's registry keys, as
+/// `NVreg_RegistryDwords` sets them on Linux. Read by the RM and handed to
+/// GSP-RM; empty unless set. The (key, value) pairs taken.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nvidia_registry(text: &str) -> alloc::vec::Vec<(alloc::string::String, u32)> {
+    zcore_drivers::display::set_nvidia_registry(text)
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_nvidia_registry(_text: &str) -> alloc::vec::Vec<(alloc::string::String, u32)> {
+    alloc::vec::Vec::new()
+}
+
 /// `nvidia.nvkms`: every NVIDIA card's display goes to nvkms, so DRM lists a
 /// CRTC on each card from boot on. Default off.
 #[cfg(target_arch = "x86_64")]
