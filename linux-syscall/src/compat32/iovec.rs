@@ -56,7 +56,7 @@ impl Syscall<'_> {
     }
 
     /// `pwritev(2)`, i386 334: the offset in two registers, **low first**.
-    pub fn sys_pwritev32(
+    pub async fn sys_pwritev32(
         &self,
         fd: usize,
         iov: usize,
@@ -70,6 +70,7 @@ impl Syscall<'_> {
             count,
             super::wide::join(offset_low, offset_high),
         )
+        .await
     }
 }
 

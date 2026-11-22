@@ -587,7 +587,7 @@ impl Syscall<'_> {
             // (pos_l, pos_h) halves; on 64-bit both musl and glibc put the whole
             // offset in pos_l, and the kernel ignores pos_h — so do we.
             Sys::PREADV => self.sys_preadv(a0.into(), a1.into(), a2, a3 as u64).await,
-            Sys::PWRITEV => self.sys_pwritev(a0.into(), a1.into(), a2, a3 as u64),
+            Sys::PWRITEV => self.sys_pwritev(a0.into(), a1.into(), a2, a3 as u64).await,
             Sys::PREADV2 => {
                 self.sys_preadv2(a0.into(), a1.into(), a2, a3 as i64, a5)
                     .await
@@ -1600,8 +1600,14 @@ fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
     // arch-neutral pattern above without breaking those builds.
     #[cfg(target_arch = "x86_64")]
     let watched = watched || matches!(Sys::try_from(num), Ok(Sys::POLL));
+    // Warn, not error: the boot's log level is `error`, and a release's
+    // console is no place for a hunt that is over. Most of what it names is
+    // an EINVAL Linux answers too -- `IPV6_V6ONLY` on a socket that already
+    // has its port is one (`do_ipv6_setsockopt`: `inet_num` set ->
+    // `e_inval`), and printed in red in the middle of the installer on
+    // real hardware. `LOG=warn` brings it back.
     if watched && BUDGET.fetch_add(1, Ordering::Relaxed) < 32 {
-        log::error!(
+        log::warn!(
             "[einval-hunt] pid={} syscall={} ({:?}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} -> EINVAL",
             pid,
             num,

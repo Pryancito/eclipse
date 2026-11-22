@@ -352,6 +352,7 @@ fn a_gather_positional_write_the_file_only_partly_takes_reports_what_went_in() {
                 1,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
@@ -374,6 +375,7 @@ fn a_gather_positional_write_that_refuses_outright_is_the_error_and_not_a_count(
                 1,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
@@ -397,6 +399,7 @@ fn a_gather_positional_write_that_fails_after_a_whole_chunk_reports_the_chunk() 
                 2,
                 0,
             )
+            .await
         })
     });
     assert_eq!(
