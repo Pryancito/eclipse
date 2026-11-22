@@ -486,16 +486,139 @@ pub(super) fn kmrn_copper_timeouts<H: Hw>(hw: &H) {
 /// 802.3x flow control's registers, and the PHY's copy of the pause time
 /// (Linux `e1000e_reset`, `e1000e_set_fc_watermarks`). Which directions
 /// are on is decided when the link comes up ([`on_link_up`]).
-fn flow_control<H: Hw>(hw: &H) {
+fn flow_control<H: Hw>(hw: &H, part: Part) {
+    // The first PCH (82577/82578) has its own: lower watermarks "to work
+    // around adapter hangs with certain network loads", the default
+    // pause, a shorter refresh.
+    let (high, low, pause, refresh) = if part.is_pch1() {
+        (
+            PCH1_HIGH_WATER,
+            PCH1_LOW_WATER,
+            PCH1_PAUSE_TIME,
+            PCH1_REFRESH_TIME,
+        )
+    } else {
+        (FC_HIGH_WATER, FC_LOW_WATER, FC_PAUSE_TIME, FC_PAUSE_TIME)
+    };
     hw.wr(PBA, PBA_KB);
-    hw.wr(FCTTV, FC_PAUSE_TIME);
-    hw.wr(FCRTV_PCH, FC_PAUSE_TIME);
-    hw.wr(FCRTL, FC_LOW_WATER | FCRTL_XONE);
-    hw.wr(FCRTH, FC_HIGH_WATER);
+    hw.wr(FCTTV, pause);
+    hw.wr(FCRTV_PCH, refresh);
+    hw.wr(FCRTL, low | FCRTL_XONE);
+    hw.wr(FCRTH, high);
     flush(hw);
     if let Some(flag) = Swflag::take(hw) {
-        flag.hv_write(BM_PORT_PAUSE_TIME, FC_PAUSE_TIME as u16);
+        flag.hv_write(BM_PORT_PAUSE_TIME, pause as u16);
     }
+}
+
+// The first PCH's flow control (Linux `e1000e_reset`, `e1000_pchlan`).
+const PCH1_HIGH_WATER: u32 = 0x5000;
+const PCH1_LOW_WATER: u32 = 0x3000;
+const PCH1_PAUSE_TIME: u32 = 0x0680;
+const PCH1_REFRESH_TIME: u32 = 0x1000;
+
+// The 82577/82578 PHY registers of Linux `e1000_hv_phy_workarounds_ich8lan`
+// and `e1000_k1_gig_workaround_hv`.
+const HV_KMRN_MODE_CTRL: (u32, u32) = (769, 16);
+const HV_KMRN_MDIO_SLOW: u16 = 1 << 10;
+const BM_PORT_GEN_CFG: (u32, u32) = (769, 17);
+const HV_EARLY_PREAMBLE: (u32, u32) = (769, 25);
+const HV_KMRN_FIFO_CTRLSTA: (u32, u32) = (770, 16);
+const HV_LINK_STALL: (u32, u32) = (770, 19);
+const HV_LINK_STALL_UP: u16 = 0x0100;
+const HV_LINK_STALL_DOWN: u16 = 0x4100;
+const MII_PHYSID2: u32 = 0x03;
+const MII_BMCR_RESET: u16 = 1 << 15;
+/// The PHY's page-0 registers at MDIO address 2: the EMI window.
+const HV_PHY_PAGE0: u8 = 2;
+const EMI_ADDR: u32 = 0x10;
+const EMI_DATA: u32 = 0x11;
+const I82577_MSE_THRESHOLD: u16 = 0x0887;
+
+/// What [`pch1_workarounds`] did, for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pch1 {
+    /// The PHY's revision (`PHYSID2`'s low nibble), when it answered.
+    pub revision: Option<u16>,
+    /// Whether the early-preamble and SSC tuning of those revisions went in.
+    pub preamble: bool,
+    /// Whether an 82578 of revision 1 was reset to its defaults.
+    pub soft_reset: bool,
+}
+
+/// What Linux does to an 82577/82578 PHY after every reset
+/// (`e1000_hv_phy_workarounds_ich8lan`): MDIO slow mode on an 82577 before
+/// anything else on the PHY; early preamble off and preamble tuning on the
+/// first revisions; an 82578 of revision 1 back to defaults; the link
+/// stall fix as if the link were up; no link drops on a busy half-duplex
+/// hub; a higher MSE threshold so the link stays up in noise.
+fn pch1_workarounds<H: Hw>(hw: &H, part: Part) -> Option<Pch1> {
+    let flag = Swflag::take(hw)?;
+    let m82578 = part == Part::Pch82578;
+    if !m82578 {
+        if let Some(v) = flag.hv_read(HV_KMRN_MODE_CTRL) {
+            flag.hv_write(HV_KMRN_MODE_CTRL, v | HV_KMRN_MDIO_SLOW);
+        }
+    }
+    let revision = mdic_read(hw, HV_PHY_PAGE0, MII_PHYSID2)
+        .filter(|&id| id != 0xffff)
+        .map(|id| id & 0xf);
+    let preamble = match revision {
+        Some(r) => (!m82578 && (r == 1 || r == 2)) || (m82578 && r == 1),
+        None => false,
+    };
+    if preamble {
+        flag.hv_write(HV_EARLY_PREAMBLE, 0x4431);
+        flag.hv_write(HV_KMRN_FIFO_CTRLSTA, 0xa204);
+    }
+    let soft_reset = m82578 && revision.is_some_and(|r| r < 2);
+    if soft_reset {
+        if let Some(bmcr) = mdic_read(hw, HV_PHY_PAGE0, MII_BMCR) {
+            mdic_write(hw, HV_PHY_PAGE0, MII_BMCR, bmcr | MII_BMCR_RESET);
+            for _ in 0..500 {
+                hw.delay_us(1_000);
+                if mdic_read(hw, HV_PHY_PAGE0, MII_BMCR).is_some_and(|b| b & MII_BMCR_RESET == 0) {
+                    break;
+                }
+            }
+        }
+        mdic_write(hw, HV_PHY_PAGE0, MII_BMCR, 0x3140);
+    }
+    mdic_write(hw, HV_PHY, PHY_PAGE_SELECT, 0);
+    flag.hv_write(HV_LINK_STALL, HV_LINK_STALL_UP);
+    if let Some(v) = flag.hv_read(BM_PORT_GEN_CFG) {
+        flag.hv_write(BM_PORT_GEN_CFG, v & 0x00ff);
+    }
+    // EMI: page 0 at address 2, above the registers every page has.
+    if mdic_write(hw, HV_PHY_PAGE0, PHY_PAGE_SELECT, 0) {
+        mdic_write(hw, HV_PHY_PAGE0, EMI_ADDR, I82577_MSE_THRESHOLD);
+        mdic_write(hw, HV_PHY_PAGE0, EMI_DATA, 0x0034);
+    }
+    Some(Pch1 {
+        revision,
+        preamble,
+        soft_reset,
+    })
+}
+
+/// The first PCH's K1 erratum on every link change (Linux
+/// `e1000_k1_gig_workaround_hv`): K1 off while the link is at gigabit, the
+/// link stall fix for up or down.
+pub fn pch1_link_changed<H: Hw>(hw: &H, part: Part, up_at: Option<u32>) {
+    if !part.is_pch1() {
+        return;
+    }
+    if let Some(flag) = Swflag::take(hw) {
+        flag.hv_write(
+            HV_LINK_STALL,
+            if up_at.is_some() {
+                HV_LINK_STALL_UP
+            } else {
+                HV_LINK_STALL_DOWN
+            },
+        );
+    }
+    configure_k1(hw, up_at != Some(1000));
 }
 
 /// Offer everything the PHY at `phy` can do -- every 10/100 mode, PAUSE
@@ -551,6 +674,8 @@ pub struct Report {
     pub k1: bool,
     /// The MDIO address auto-negotiation was restarted at.
     pub autoneg: Option<u8>,
+    /// What was done to the PHY of an 82577/82578.
+    pub pch1: Option<Pch1>,
 }
 
 /// Reset a PCH part and get its PHY ready, up to where the rings are
@@ -591,6 +716,12 @@ pub fn reset<H: Hw>(hw: &H, part: Part) -> Result<Report, String> {
     hw.delay_us(10_000);
     hw.wr(super::IMC, u32::MAX);
     let _ = hw.rd(super::ICR);
+    // Before anything else talks to an 82577/82578's PHY.
+    let pch1 = if part.is_pch1() {
+        pch1_workarounds(hw, part)
+    } else {
+        None
+    };
 
     // Interrupts are not masked by their own delivery (the card's thread
     // reads `ICR` and asks again), relaxed ordering off, the driver loaded.
@@ -618,7 +749,7 @@ pub fn reset<H: Hw>(hw: &H, part: Part) -> Result<Report, String> {
     let ctrl = (hw.rd(CTRL) & !(CTRL_FRCSPD | CTRL_FRCDPX)) | super::CTRL_SLU | super::CTRL_ASDE;
     hw.wr(CTRL, ctrl);
     let _ = hw.rd(CTRL);
-    flow_control(hw);
+    flow_control(hw, part);
     kmrn_copper_timeouts(hw);
     let k1 = configure_k1(hw, true);
     let autoneg = restart_autoneg(hw);
@@ -628,6 +759,7 @@ pub fn reset<H: Hw>(hw: &H, part: Part) -> Result<Report, String> {
         oem_bits,
         k1,
         autoneg,
+        pch1,
     })
 }
 

@@ -23,7 +23,8 @@ fn user_driver_takes(device_id: u16) -> bool {
 
 /// The parts only the userspace driver drives, which this kernel's e1000e
 /// does not: the copper 82571, 82572 and 82573 (Linux `82571.c`), and the
-/// MACs of the ICH8, ICH9 and ICH10 chipsets (`ich8lan.c`). They are
+/// MACs of the ICH8, ICH9 and ICH10 chipsets and of the first PCH, with
+/// an 82577 or 82578 PHY (`ich8lan.c`). They are
 /// matched here so that they are counted and left to it; with no driver
 /// in userspace for them (a second card, `unetcard=kernel`) nobody drives
 /// them, as before.
@@ -37,6 +38,8 @@ pub(super) fn userspace_only(device_id: u16) -> bool {
             | 0x10bd | 0x294c | 0x10bf | 0x10f5 | 0x10cb | 0x10c0 | 0x10c3 | 0x10c2 | 0x10e5
             // ICH10.
             | 0x10cc | 0x10cd | 0x10ce | 0x10de | 0x10df | 0x1525
+            // The first PCH: 82577 and 82578.
+            | 0x10ea | 0x10eb | 0x10ef | 0x10f0
     )
 }
 
@@ -122,7 +125,9 @@ mod tests {
         }
         // The copper 82571, 82572 and 82573 and the ICHs: the userspace
         // driver's only.
-        for id in [0x105e, 0x10b9, 0x108c, 0x1049, 0x10f5, 0x1525] {
+        for id in [
+            0x105e, 0x10b9, 0x108c, 0x1049, 0x10f5, 0x1525, 0x10ea, 0x10f0,
+        ] {
             assert!(user_driver_takes(id) && userspace_only(id), "{:#x}", id);
         }
         assert!(!userspace_only(0x15b8));

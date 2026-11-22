@@ -62,6 +62,11 @@ pub enum Part {
     Ich8,
     /// The MAC of an ICH9 or ICH10 chipset ([`ich`]).
     Ich9,
+    /// The first PCH (Ibex Peak), with an 82577 PHY (the mobile parts) or
+    /// an 82578 (the desktop ones): [`pch`] with Linux's `pchlan`
+    /// workarounds.
+    Pch82577,
+    Pch82578,
     /// A PCH part before Sunrise Point: 82579 (PCH2), I217 and I218 (LPT).
     Pch,
     /// Sunrise Point and later: every I219. Its queues have to be enabled
@@ -96,6 +101,9 @@ impl Part {
             // ICH10: R_BM (LM, LF, V), D_BM (LM, LF, V).
             0x10bd | 0x294c | 0x10bf | 0x10f5 | 0x10cb | 0x10c0 | 0x10c3 | 0x10c2 | 0x10e5
             | 0x10cc | 0x10cd | 0x10ce | 0x10de | 0x10df | 0x1525 => Some(Part::Ich9),
+            // 82577LM/LC (M_HV), 82578DM/DC (D_HV).
+            0x10ea | 0x10eb => Some(Part::Pch82577),
+            0x10ef | 0x10f0 => Some(Part::Pch82578),
             // 82579LM/V; I217-LM/V; I218-LM/V and the LPT-LP ones.
             0x1502 | 0x1503 | 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 => {
                 Some(Part::Pch)
@@ -123,7 +131,15 @@ impl Part {
     }
 
     pub fn is_pch(self) -> bool {
-        matches!(self, Part::Pch | Part::PchSpt)
+        matches!(
+            self,
+            Part::Pch82577 | Part::Pch82578 | Part::Pch | Part::PchSpt
+        )
+    }
+
+    /// The first PCH: an 82577 or 82578.
+    pub fn is_pch1(self) -> bool {
+        matches!(self, Part::Pch82577 | Part::Pch82578)
     }
 
     /// An ICH8, ICH9 or ICH10 MAC: brought up by [`ich`].
@@ -606,9 +622,11 @@ impl Taker {
         }
         let status = self.regs.read(STATUS);
         if status & STATUS_LU == 0 {
+            pch::pch1_link_changed(&self.regs, self.part, None);
             println!("e1000e: link down");
             return;
         }
+        pch::pch1_link_changed(&self.regs, self.part, Some(pch::speed_of(status)));
         if self.part.is_ich() {
             let link = ich::on_link_up(&self.regs, status);
             println!(
