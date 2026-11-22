@@ -647,3 +647,59 @@ fn a_lock_needs_the_mode_it_names_and_an_ofd_lock_belongs_to_its_description() {
 fn as_written(fl: &Flock) -> Flock {
     core::hint::black_box(*fl)
 }
+
+/// A process's POSIX locks on a file go when it closes ANY descriptor of
+/// the file (`filp_close` -> `locks_remove_posix`): a `close` of a second
+/// descriptor, the one a `dup2` replaces and a `close_range` over it. The
+/// descriptor that took the lock does not have to be the one closed.
+#[test]
+fn closing_any_descriptor_of_the_file_lets_the_process_s_locks_go() {
+    let proc = a_process(48_225, "close-unlocks");
+    let other = a_process(48_226, "close-unlocks-other");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            let (fd, key) = Keyed::open(&lp, 48_225, THE_SIZE);
+            let fd = FileDesc::from(fd as i32);
+            let (spare, _) = Keyed::open(&lp, 48_227, THE_SIZE);
+            let spare = FileDesc::from(spare as i32);
+            let who = other.id();
+            let lock = a_lock(F_WRLCK, SEEK_SET, 0, 10);
+            let take = || async {
+                assert_eq!(
+                    sys.sys_fcntl(fd, F_SETLK, &lock as *const Flock as usize)
+                        .await,
+                    Ok(0)
+                );
+                assert!(!somebody_else_could_take(key, who, (0, 10)), "not taken");
+            };
+
+            take().await;
+            let second = FileDesc::from(sys.sys_dup(fd).unwrap());
+            assert_eq!(sys.sys_close(second), Ok(0));
+            assert!(
+                somebody_else_could_take(key, who, (0, 10)),
+                "closing a second descriptor kept the lock"
+            );
+
+            take().await;
+            let second = FileDesc::from(sys.sys_dup(fd).unwrap());
+            assert_eq!(
+                sys.sys_dup2(spare, usize::from(second)),
+                Ok(usize::from(second))
+            );
+            assert!(
+                somebody_else_could_take(key, who, (0, 10)),
+                "the descriptor a dup2 replaced kept the lock"
+            );
+
+            take().await;
+            let third = usize::from(FileDesc::from(sys.sys_dup(fd).unwrap()));
+            assert_eq!(sys.sys_close_range(third, third, 0), Ok(0));
+            assert!(
+                somebody_else_could_take(key, who, (0, 10)),
+                "a close_range kept the lock"
+            );
+        })
+    });
+}

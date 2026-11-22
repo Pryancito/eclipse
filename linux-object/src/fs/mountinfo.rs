@@ -102,7 +102,7 @@ fn split_options(options: &str) -> (String, String) {
 
 /// An `st_dev` taken apart as glibc's `major()` and `minor()` do, so the
 /// field says what `stat` on the mount point says.
-fn major_minor(dev: u64) -> (u64, u64) {
+pub(super) fn major_minor(dev: u64) -> (u64, u64) {
     let major = ((dev & 0x0000_0000_000f_ff00) >> 8) | ((dev & 0xffff_f000_0000_0000) >> 32);
     let minor = (dev & 0xff) | ((dev & 0x0000_0fff_fff0_0000) >> 12);
     (major, minor)

@@ -90,6 +90,7 @@ const SENDER_UID: i32 = 0x3333_4444;
 const SENDER_VALUE: u32 = 0x8000_0000;
 
 fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "queueinfo", lp).unwrap();

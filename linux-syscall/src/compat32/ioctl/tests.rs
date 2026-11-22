@@ -129,6 +129,7 @@ fn the_vouched_numbers_are_the_kernels_own_constants() {
         (k::FIONCLEX, "FIONCLEX"),
         (k::TIOCGPTN, "TIOCGPTN"),
         (k::TIOCSPTLCK, "TIOCSPTLCK"),
+        (k::TIOCGPTLCK, "TIOCGPTLCK"),
         (k::KDGETMODE, "KDGETMODE"),
         (k::KDSETMODE, "KDSETMODE"),
         (k::VT_GETMODE, "VT_GETMODE"),

@@ -1091,3 +1091,27 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
         })
     });
 }
+
+#[test]
+fn a_read_only_sys_file_refuses_a_writer_at_open_and_a_proc_one_at_write() {
+    // `kernfs_fop_open` and `proc_sys_permission` refuse to open a file with
+    // no write bit for writing, root included: `EACCES`. Elsewhere in
+    // `/proc` root opens it, and `proc_reg_write` with no `proc_write`
+    // answers the write `EIO`.
+    let proc = a_process(47_417, "open-ro-pseudo", "open_ro_pseudo");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            assert_eq!(
+                open(sys, &c("/sys/devices/system/cpu/kernel_max"), O_WRONLY),
+                Err(LxError::EACCES)
+            );
+            assert_eq!(
+                open(sys, &c("/proc/sys/kernel/osrelease"), O_WRONLY),
+                Err(LxError::EACCES)
+            );
+            assert!(open(sys, &c("/proc/sys/kernel/osrelease"), 0).is_ok());
+            let fd = open(sys, &c("/proc/uptime"), O_WRONLY).expect("root opens it");
+            assert_eq!(write_to(sys, fd, b"1").await, Err(LxError::EIO));
+        })
+    });
+}

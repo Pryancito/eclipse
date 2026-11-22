@@ -196,7 +196,7 @@ fn the_files_are_written_through_the_directory() {
     assert_eq!(old.write_at(0, b"15"), Ok(2));
     assert_eq!(read(proc.id(), "oom_score_adj"), "1000\n");
     let score = dir.find("oom_score").unwrap();
-    assert_eq!(score.write_at(0, b"1"), Err(FsError::NotSupported));
+    assert_eq!(score.write_at(0, b"1"), Err(FsError::InvalidParam));
     assert!(score.resize(0).is_err());
     for name in ["auxv", "oom_score_adj", "oom_adj", "oom_score"] {
         assert!(ProcPidDirINode::entries().contains(&name), "{}", name);

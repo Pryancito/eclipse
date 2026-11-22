@@ -351,6 +351,16 @@ hal_fn_impl! {
             alloc::string::String::from(brand_str)
         }
 
+        fn cpu_vendor() -> alloc::string::String {
+            use core::arch::x86_64::__cpuid;
+            let res = __cpuid(0);
+            let mut vendor = alloc::vec::Vec::with_capacity(12);
+            for reg in &[res.ebx, res.edx, res.ecx] {
+                vendor.extend_from_slice(&reg.to_le_bytes());
+            }
+            alloc::string::String::from_utf8(vendor).unwrap_or_default()
+        }
+
         fn cpuinfo_flags() -> alloc::string::String {
             cpuinfo_flags_string()
         }

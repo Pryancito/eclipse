@@ -871,6 +871,16 @@ pub struct VtStat {
 // Misc TTY control ioctls an X server may issue; accepted as no-ops.
 /// Flush the terminal queues.
 pub const TCFLSH: usize = 0x540B;
+/// Wait for output to drain (`tcdrain(3)` sends 1), or send a break (0).
+pub const TCSBRK: usize = 0x5409;
+/// Suspend or resume output or input (`tcflow(3)`; the action by value).
+pub const TCXONC: usize = 0x540A;
+/// POSIX `tcsendbreak(3)` (a break of the given length, 0 = the default).
+pub const TCSBRKP: usize = 0x5425;
+/// Start sending a break.
+pub const TIOCSBRK: usize = 0x5427;
+/// Stop sending a break.
+pub const TIOCCBRK: usize = 0x5428;
 /// Make the terminal the controlling TTY of the calling process.
 pub const TIOCSCTTY: usize = 0x540E;
 /// Give up the controlling TTY.
@@ -882,6 +892,8 @@ pub const TIOCNOTTY: usize = 0x5422;
 pub const TIOCGPTN: usize = 0x8004_5430;
 /// Lock/unlock the PTY slave (`int` in); `unlockpt(3)` writes 0 here.
 pub const TIOCSPTLCK: usize = 0x4004_5431;
+/// Read the PTY slave lock (`int` out): 1 until `unlockpt(3)`.
+pub const TIOCGPTLCK: usize = 0x8004_5439;
 /// Open the slave side of the master without a path (returns an fd). Accepted
 /// best-effort; most libcs fall back to `open("/dev/pts/N")`.
 pub const TIOCGPTPEER: usize = 0x5441;
@@ -1853,6 +1865,11 @@ mod request_number_tests {
         assert_eq!(TCSETSW, io(b'T', 0x03), "tcsetattr TCSADRAIN");
         assert_eq!(TCSETSF, io(b'T', 0x04), "tcsetattr TCSAFLUSH");
         assert_eq!(TCFLSH, io(b'T', 0x0B), "tcflush");
+        assert_eq!(TCSBRK, io(b'T', 0x09), "tcdrain / tcsendbreak");
+        assert_eq!(TCXONC, io(b'T', 0x0A), "tcflow");
+        assert_eq!(TCSBRKP, io(b'T', 0x25));
+        assert_eq!(TIOCSBRK, io(b'T', 0x27));
+        assert_eq!(TIOCCBRK, io(b'T', 0x28));
         assert_eq!(TIOCSCTTY, io(b'T', 0x0E));
         assert_eq!(TIOCGPGRP, io(b'T', 0x0F), "tcgetpgrp");
         assert_eq!(TIOCSPGRP, io(b'T', 0x10), "tcsetpgrp");
@@ -1898,6 +1915,7 @@ mod request_number_tests {
             "_IOR('T', 0x30, unsigned int)"
         );
         assert_eq!(TIOCSPTLCK, iow(b'T', 0x31, 4), "_IOW('T', 0x31, int)");
+        assert_eq!(TIOCGPTLCK, ior(b'T', 0x39, 4), "_IOR('T', 0x39, int)");
         assert_eq!(TIOCGPTPEER, io(b'T', 0x41), "_IO('T', 0x41), no argument");
         // Spelled out once, because getting these two swapped is the kind of
         // mistake that leaves the number looking plausible: read is 2 and
@@ -1968,6 +1986,11 @@ mod request_number_tests {
             ("TCSETSW", TCSETSW),
             ("TCSETSF", TCSETSF),
             ("TCFLSH", TCFLSH),
+            ("TCSBRK", TCSBRK),
+            ("TCXONC", TCXONC),
+            ("TCSBRKP", TCSBRKP),
+            ("TIOCSBRK", TIOCSBRK),
+            ("TIOCCBRK", TIOCCBRK),
             ("TIOCSCTTY", TIOCSCTTY),
             ("TIOCGPGRP", TIOCGPGRP),
             ("TIOCSPGRP", TIOCSPGRP),
@@ -1990,6 +2013,7 @@ mod request_number_tests {
             ("FIOQSIZE", FIOQSIZE),
             ("TIOCGPTN", TIOCGPTN),
             ("TIOCSPTLCK", TIOCSPTLCK),
+            ("TIOCGPTLCK", TIOCGPTLCK),
             ("TIOCGPTPEER", TIOCGPTPEER),
             ("KDMKTONE", KDMKTONE),
             ("KDGETLED", KDGETLED),

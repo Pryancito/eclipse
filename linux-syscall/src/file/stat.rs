@@ -15,7 +15,7 @@ const STATX__RESERVED: u32 = 0x8000_0000;
 /// `getname_maybe_null`: the name of a `stat` call, where `AT_EMPTY_PATH`
 /// lets a NULL pointer stand for the empty name (Linux 6.11+). Without the
 /// flag a NULL name is a bad address like any other.
-fn name_maybe_null<'a>(name: &'a UserInPtr<u8>, raw_flags: usize) -> LxResult<&'a str> {
+fn name_maybe_null(name: &UserInPtr<u8>, raw_flags: usize) -> LxResult<&str> {
     if name.is_null() && raw_flags & AtFlags::EMPTY_PATH.bits() != 0 {
         return Ok("");
     }

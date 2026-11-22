@@ -334,6 +334,11 @@ fn dangling_link_target(link: &Arc<dyn INode>, dir_path: &str) -> LxResult<Strin
     })
 }
 
+/// `/sys` and `/proc/sys`, whose read-only files refuse a writer at open.
+fn kernfs_like(path: &str) -> bool {
+    path.starts_with("/sys/") || path.starts_with("/proc/sys/")
+}
+
 /// What `may_open` asks of the inode for an access mode: `ACC_MODE` maps
 /// the mode `3`, which opens neither for reading nor for writing (ioctl-only
 /// opens, `fdformat`), to BOTH permissions, so it is no way round them.
@@ -645,7 +650,7 @@ impl Syscall<'_> {
                     let file = f.downcast_ref::<File>()?;
                     let inode = file.inode();
                     let slave = inode.as_any_ref().downcast_ref::<pty::PtySlave>()?;
-                    pty::open_pts(slave.pty_id())
+                    pty::reopen_pts(slave.pty_id())
                 });
                 if let Some(inode) = pts {
                     let file = File::new(inode, flags, String::from("/dev/tty"));
@@ -822,6 +827,11 @@ impl Syscall<'_> {
             };
             let metadata = inode.metadata()?;
             open_resolved_type(flags, metadata.type_)?;
+            // `proc_mem_open`: `maps`, `environ` and `auxv` of a process the
+            // caller may not read are `EACCES` to open, though `stat` sees them.
+            if !flags.is_path() {
+                linux_object::fs::proc_open_check(&*inode)?;
+            }
             // `may_open`: `case S_IFBLK: case S_IFCHR: if (!may_open_dev(path))
             // return -EACCES;`. Here, because every branch above funnels through
             // this line, so one check covers all of them.
@@ -840,6 +850,17 @@ impl Syscall<'_> {
             // through: a link in `/tmp` to `/dev/null` opens it.
             let opened = walked.path();
             if nodev_blocks(flags, metadata.type_) && linux_object::fs::path_is_nodev(&opened) {
+                return Err(LxError::EACCES);
+            }
+            // `kernfs_fop_open` and `proc_sys_permission`: on `/sys` and
+            // `/proc/sys` a file with no write bit cannot be opened for
+            // writing at all, root included (`CAP_DAC_OVERRIDE` does not
+            // reach them). Elsewhere in `/proc` root opens it and the write
+            // says what it says.
+            if (open_needs(flags).1 || flags.contains(OpenFlags::TRUNCATE))
+                && metadata.mode & 0o222 == 0
+                && kernfs_like(&opened)
+            {
                 return Err(LxError::EACCES);
             }
             // `may_open`: "O_NOATIME can only be set by the owner or

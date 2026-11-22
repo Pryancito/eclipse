@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
+use core::convert::TryFrom;
 use core::task::{Context, Poll};
 use core::{any::Any, future::Future, mem::size_of, pin::Pin};
 
@@ -358,8 +359,43 @@ impl INode for EventDev {
         self.inner.lock().read_at(buf)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+    /// What a program writes is events (`evdev_write`): whole
+    /// `struct input_event`s, each passed to every reader as the device's own
+    /// are, if the device has events of that type (`input_inject_event`). A
+    /// count short of one event is `EINVAL`; a tail short of one is left.
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        const SIZE: usize = size_of::<TimedInputEvent>();
+        if !buf.is_empty() && buf.len() < SIZE {
+            return Err(FsError::InvalidParam);
+        }
+        let types = self.capability_for_ev(0);
+        let mut done = 0;
+        let readable = {
+            let mut g = self.inner.lock();
+            while done + SIZE <= buf.len() {
+                let rec = &buf[done..done + SIZE];
+                done += SIZE;
+                let ty = u16::from_ne_bytes([rec[16], rec[17]]);
+                let code = u16::from_ne_bytes([rec[18], rec[19]]);
+                let value = i32::from_ne_bytes([rec[20], rec[21], rec[22], rec[23]]);
+                // `EV_SYN` every device has (`input_register_device`).
+                if ty != 0 && !types.contains(ty) {
+                    continue;
+                }
+                if let Ok(event_type) = InputEventType::try_from(ty) {
+                    g.handle_input_event(&InputEvent {
+                        event_type,
+                        code,
+                        value,
+                    });
+                }
+            }
+            g.can_read()
+        };
+        if readable {
+            super::wait::wake_input_waiters();
+        }
+        Ok(done)
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -495,9 +531,11 @@ impl INode for EventDev {
         // answered as a get, writing the current values over the caller's
         // buffer and reporting success having set nothing.
         let Request { dir, typ, nr, size } = Request::decode(cmd);
-        // Only the input ioctl group ('E').
+        // Only the input ioctl group ('E'). Anything evdev does not know is
+        // `EINVAL` (`evdev_do_ioctl`'s last line), not `ENOTTY`: the node is
+        // a character device that does take ioctls.
         if typ != 'E' as u32 {
-            return Err(FsError::NotSupported);
+            return Err(FsError::InvalidParam);
         }
         // EVIOCGRAB / EVIOCREVOKE pass their argument by value and never
         // dereference the pointer; in particular seatd issues EVIOCREVOKE with
@@ -511,6 +549,10 @@ impl INode for EventDev {
         // `EVIOCSCLOCKID` is NOT one of them: its argument is a pointer Linux
         // reads with `get_user`, and answering it by value meant answering it
         // without ever looking at what was asked for.
+        // (`EVIOCREVOKE` takes 0 and nothing else.)
+        if nr == 0x91 && data != 0 {
+            return Err(FsError::InvalidParam);
+        }
         if matches!(nr, 0x90 | 0x91) {
             return Ok(0);
         }
@@ -532,9 +574,9 @@ impl INode for EventDev {
             return Ok(0);
         }
         // Everything below reports something back, so it must have been asked
-        // for with the read direction. Linux answers `ENOTTY` otherwise.
+        // for with the read direction. Linux answers `EINVAL` otherwise.
         if dir != Request::READ {
-            return Err(FsError::NotSupported);
+            return Err(FsError::InvalidParam);
         }
         match nr {
             // EVIOCGVERSION -> EV_VERSION (0x010001).
@@ -633,7 +675,7 @@ impl INode for EventDev {
                 user_copy(ptr.write_array(&bytes[..n]))?;
                 Ok(n)
             }
-            _ => Err(FsError::NotSupported),
+            _ => Err(FsError::InvalidParam),
         }
     }
 
@@ -700,6 +742,8 @@ mod interruptible_read_tests {
     #[derive(Default)]
     struct SilentDevice {
         listener: EventListener<InputEvent>,
+        /// Says it has relative axes (`EV_REL`), though it never moves.
+        rel: bool,
     }
 
     impl EventScheme for SilentDevice {
@@ -725,13 +769,75 @@ mod interruptible_read_tests {
     }
 
     impl InputScheme for SilentDevice {
-        fn capability(&self, _cap_type: CapabilityType) -> InputCapability {
-            InputCapability::empty()
+        fn capability(&self, cap_type: CapabilityType) -> InputCapability {
+            let mut cap = InputCapability::empty();
+            if self.rel && matches!(cap_type, CapabilityType::Event) {
+                cap.set(0x02);
+            }
+            cap
         }
     }
 
     fn dev() -> EventDev {
         EventDev::new(Arc::new(SilentDevice::default()), 0)
+    }
+
+    /// `struct input_event` as a program writes it.
+    fn written(ty: u16, code: u16, value: i32) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[16..18].copy_from_slice(&ty.to_ne_bytes());
+        b[18..20].copy_from_slice(&code.to_ne_bytes());
+        b[20..24].copy_from_slice(&value.to_ne_bytes());
+        b
+    }
+
+    /// A write to the node is events for every reader (`evdev_write`), of
+    /// the types the device has; it answered `ENOSYS`. A count short of one
+    /// event is `EINVAL`, and so is a request evdev does not know: it was
+    /// `ENOTTY`, which says the node takes no ioctls at all.
+    #[test]
+    fn what_is_written_is_read_back_as_events() {
+        let d = EventDev::new(
+            Arc::new(SilentDevice {
+                rel: true,
+                ..Default::default()
+            }),
+            0,
+        );
+        assert_eq!(d.write_at(0, &[0u8; 23]), Err(FsError::InvalidParam));
+        assert_eq!(d.write_at(0, &[]), Ok(0));
+        let mut buf = alloc::vec::Vec::new();
+        buf.extend_from_slice(&written(0x02, 0, 5)); // REL_X
+        buf.extend_from_slice(&written(0x01, 30, 1)); // EV_KEY: the device has none
+        buf.extend_from_slice(&written(0x00, 0, 0)); // SYN_REPORT
+        buf.extend_from_slice(&[0u8; 7]); // a tail short of an event
+        assert_eq!(d.write_at(0, &buf), Ok(72));
+        let mut out = [0u8; 72];
+        let n = d.read_at(0, &mut out).expect("the frame is readable");
+        assert_eq!(n, 48, "REL_X and its SYN_REPORT; the key was dropped");
+        assert_eq!(&out[16..24], &written(0x02, 0, 5)[16..24]);
+        assert_eq!(&out[40..48], &written(0x00, 0, 0)[40 - 24..48 - 24]);
+
+        let ioc = |dir: u32, typ: u8, nr: u32, size: u32| {
+            (dir << 30) | (size << 16) | ((typ as u32) << 8) | nr
+        };
+        let mut word = 0i32;
+        let p = &mut word as *mut i32 as usize;
+        for cmd in [
+            ioc(Request::READ, b'E', 0x0f, 4),
+            ioc(Request::READ, b'T', 0x01, 4),
+            ioc(Request::WRITE, b'E', 0x01, 4),
+        ] {
+            assert_eq!(
+                d.io_control(cmd, p),
+                Err(FsError::InvalidParam),
+                "{:#x}",
+                cmd
+            );
+        }
+        let revoke = ioc(Request::WRITE, b'E', 0x91, 4);
+        assert_eq!(d.io_control(revoke, 1), Err(FsError::InvalidParam));
+        assert_eq!(d.io_control(revoke, 0), Ok(0));
     }
 
     /// A waker that does nothing. These tests poll by hand rather than

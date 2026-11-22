@@ -51,6 +51,7 @@ const A_DIFFERENT_OLD_SECOND: u32 = 2_000_000;
 /// A 32-bit (or native) process with a page of its own and a `/f` whose times
 /// are both zero.
 fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let inode = lp.root_inode().create("f", FileType::File, 0o644).unwrap();

@@ -152,3 +152,43 @@ impl Sizes {
 
 #[cfg(test)]
 mod tests;
+
+/// The `dev` and `inode` columns of a `maps` row: those of the file it maps
+/// (`MAJOR:MINOR` of `st_dev`, and `st_ino`), and `00:00 0` for anonymous
+/// memory, which has neither. The koid of the backing object used to stand
+/// in for the inode, so every anonymous row named an inode no file has.
+///
+/// `last` keeps the previous row's answer: a library is several rows of one
+/// file in a row, and each would otherwise be a walk of its own.
+pub(super) fn row_device(
+    proc: &Process,
+    name: &str,
+    last: &mut Option<(String, (u64, u64, u64))>,
+) -> (u64, u64, u64) {
+    if !name.starts_with('/') {
+        return (0, 0, 0);
+    }
+    if let Some((n, dev)) = last {
+        if n == name {
+            return *dev;
+        }
+    }
+    let found = proc
+        .try_linux()
+        .and_then(|lp| {
+            lp.lookup_inode_at_by(
+                crate::fs::FileDesc::CWD,
+                name,
+                true,
+                crate::fs::Walker::Kernel,
+            )
+            .ok()
+        })
+        .and_then(|inode| inode.metadata().ok())
+        .map_or((0, 0, 0), |m| {
+            let (major, minor) = crate::fs::mountinfo::major_minor(m.dev as u64);
+            (major, minor, m.inode as u64)
+        });
+    *last = Some((String::from(name), found));
+    found
+}

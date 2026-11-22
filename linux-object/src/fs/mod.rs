@@ -151,6 +151,8 @@ pub fn user_offset_end(offset: u64, len: usize) -> LxResult<u64> {
 use crate::net::Socket;
 use crate::process::LinuxProcess;
 use devfs::RandomINode;
+/// What opening a `/proc/<pid>` file asks beyond its mode.
+pub use procfs::open_check as proc_open_check;
 use procfs::ProcFS;
 use pseudo::Pseudo;
 use sysfs::SysFS;

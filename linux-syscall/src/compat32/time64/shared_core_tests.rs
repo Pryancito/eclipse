@@ -55,6 +55,7 @@ const AN_OLD_SECOND: u64 = 1_000_000;
 const A_DIFFERENT_OLD_SECOND: u64 = 2_000_000;
 
 fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let inode = lp.root_inode().create("f", FileType::File, 0o644).unwrap();

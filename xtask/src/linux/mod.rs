@@ -33,7 +33,7 @@ use crate::{
     variant::Variant,
     Arch, PROJECT_DIR, REPOS, TARGET,
 };
-use os_xtask_utils::{dir, CommandExt, Ext, Git, Make};
+use os_xtask_utils::{dir, CommandExt, Ext, Make};
 use std::{
     env,
     ffi::OsString,
@@ -1999,15 +1999,22 @@ impl LinuxRootfs {
         }
         // 获得源码
         let source = REPOS.join("busybox");
-        if !source.is_dir() {
-            fetch_online!(source, |tmp| {
+        if !busybox_source_is_pinned(&source) {
+            fetch_online!(source, |tmp: PathBuf| {
                 // The upstream cgit endpoint intermittently drops shallow
-                // clones in CI; use its GitHub mirror instead.
-                Git::clone("https://github.com/vda-linux/busybox_mirror.git")
-                    .dir(tmp)
-                    .single_branch()
-                    .depth(1)
-                    .done()
+                // clones in CI; use its GitHub mirror instead. Fetch only the
+                // pinned commit, so upstream master cannot break the build.
+                let mut sh = Ext::new("sh");
+                sh.arg("-c")
+                    .arg(
+                        "set -e; git init -q \"$0\"; cd \"$0\"; \
+                         git fetch -q --depth 1 \"$1\" \"$2\"; \
+                         git checkout -q FETCH_HEAD",
+                    )
+                    .arg(&tmp)
+                    .arg(BUSYBOX_REPO)
+                    .arg(BUSYBOX_COMMIT);
+                sh
             });
         }
         // 拷贝
@@ -2015,7 +2022,13 @@ impl LinuxRootfs {
         dircpy::copy_dir(source, &target).unwrap();
         // 配置
         Make::new().current_dir(&target).arg("defconfig").invoke();
-        // Force static linking and disable PIE (Type EXEC is more stable in zCore)
+        // Force static linking and disable PIE (Type EXEC is more stable in zCore).
+        //
+        // rpm and rpm2cpio are left out: nothing here installs RPMs, and
+        // busybox master since 2026-11-20 ("rpm: check tag value accesses to
+        // fit into RPM header") no longer builds them on architectures without
+        // a fixed page size (aarch64): it commented out `G.pagesize` but kept
+        // `INIT_PAGESIZE(G.pagesize)`.
         Ext::new("sed")
             .current_dir(&target)
             .arg("-i")
@@ -2033,7 +2046,9 @@ impl LinuxRootfs {
                   s/^# CONFIG_INIT is not set$/CONFIG_INIT=y/;\
                   s/^# CONFIG_FEATURE_USE_INITTAB is not set$/CONFIG_FEATURE_USE_INITTAB=y/;\
                   s/^# CONFIG_NTPD is not set$/CONFIG_NTPD=y/;\
-                  s/^# CONFIG_FEATURE_NTPD_SERVER is not set$/CONFIG_FEATURE_NTPD_SERVER=n/",
+                  s/^# CONFIG_FEATURE_NTPD_SERVER is not set$/CONFIG_FEATURE_NTPD_SERVER=n/;\
+                  s/^CONFIG_RPM=y$/# CONFIG_RPM is not set/;\
+                  s/^CONFIG_RPM2CPIO=y$/# CONFIG_RPM2CPIO is not set/",
             )
             .arg(".config")
             .invoke();
@@ -5625,4 +5640,29 @@ mod desktop_lands_tests {
             assert!(!super::desktop_lands_in_image(arch, Variant::Minimal));
         }
     }
+}
+
+/// busybox's GitHub mirror.
+const BUSYBOX_REPO: &str = "https://github.com/vda-linux/busybox_mirror.git";
+
+/// The busybox commit every image is built from (master of 2026-11-21).
+///
+/// Pinned because upstream master moves every day and once broke the
+/// aarch64 build overnight (rpm.c, 2026-11-20). Move it on purpose, after
+/// building busybox for x86_64, aarch64 and riscv64 at the new commit.
+const BUSYBOX_COMMIT: &str = "dce43df74e27c19cc615439d2cbcdf597f698651";
+
+/// Whether `source` already holds the pinned busybox commit. A clone of an
+/// older master (from before the pin) counts as not pinned and is fetched again.
+fn busybox_source_is_pinned(source: &Path) -> bool {
+    source.is_dir()
+        && std::process::Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).trim() == BUSYBOX_COMMIT
+            })
 }
