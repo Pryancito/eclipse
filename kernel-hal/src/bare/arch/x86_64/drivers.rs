@@ -411,6 +411,7 @@ pub(super) fn init() -> DeviceResult {
             (stride * 4) as u32,
         );
         zcore_drivers::display::set_boot_edid(&KCONFIG.fb_edid, KCONFIG.fb_edid_size);
+        zcore_drivers::display::set_requested_mode(KCONFIG.fb_requested.0, KCONFIG.fb_requested.1);
 
         if KCONFIG.fb_addr != 0
             && width != 0

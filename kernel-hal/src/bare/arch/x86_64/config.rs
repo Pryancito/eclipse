@@ -20,6 +20,10 @@ pub struct KernelConfig {
     /// `fb_edid_size` is 0 when the firmware exposed none.
     pub fb_edid: [u8; 128],
     pub fb_edid_size: u32,
+    /// `resolution=WxH` from rboot.conf, `(0, 0)` for `auto` or no key. The
+    /// GOP may not have offered it; the DRM connector prefers it anyway, so
+    /// the compositor sets it through the GPU driver (nvkms).
+    pub fb_requested: (u32, u32),
 
     pub acpi_rsdp: u64,
     pub smbios: u64,

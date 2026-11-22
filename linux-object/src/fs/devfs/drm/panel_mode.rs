@@ -32,10 +32,15 @@ pub fn panel_mode() -> Option<(u32, u32)> {
 
 /// The modes the panel's driver can set, preferred first. Empty when it
 /// cannot set any: the connector then lists the firmware's one mode.
+///
+/// With `resolution=WxH` in rboot.conf, the driver's mode of that size is the
+/// preferred one, so the compositor enables the output at it instead of at
+/// the monitor's native mode (`zcore_drivers::display::prefer_requested`).
 pub fn driver_modes() -> alloc::vec::Vec<DisplayMode> {
-    get_display_driver()
+    let modes = get_display_driver()
         .map(|d| d.display_modes())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    zcore_drivers::display::prefer_requested(modes, zcore_drivers::display::requested_mode())
 }
 
 /// Why [`set_mode`] did not set a mode.
