@@ -6,15 +6,17 @@
 //! through this API and treat `ENOSYS` as either "no locking, race freely"
 //! or a hard error — both bad answers.
 //!
-//! Two deliberate simplifications, both safe on this single-user system:
+//! One deliberate simplification, safe on this single-user system:
 //!
 //! * Locks are dropped when the owning **process dies** (a conflict scan
 //!   ignores and prunes entries whose owner pid no longer resolves), not on
 //!   the infamous POSIX "close of any fd to the file" trigger. Locks held by
 //!   a live process that closed the file linger until it exits.
-//! * Open-file-description locks (`F_OFD_*`) share the classic table with
-//!   the process as owner, which collapses their one behavioural difference
-//!   (per-description ownership) into per-process ownership.
+//! Open-file-description locks (`F_OFD_*`) share the table, owned by the
+//! description (`ofd`) instead of the process: two descriptions of one file
+//! conflict even inside one process, a `dup` or a `fork` shares the lock,
+//! and the last close of the description (`File`'s `Drop`) releases it.
+//! `F_GETLK` reports an `l_pid` of -1 for one, as Linux does.
 
 use crate::error::{LxError, LxResult};
 use alloc::vec::Vec;
@@ -42,6 +44,7 @@ struct Held {
     start: u64,
     end: u64,
     owner: KoID,
+    ofd: bool,
 }
 
 /// A lock request/probe after `l_whence` resolution.
@@ -53,8 +56,10 @@ pub struct LockRequest {
     pub start: u64,
     /// One past the last byte; `u64::MAX` = unbounded (`l_len == 0`).
     pub end: u64,
-    /// Owning process.
+    /// Owning process, or the description's address when `ofd`.
     pub owner: KoID,
+    /// An open-file-description lock: `owner` names a `File`, not a process.
+    pub ofd: bool,
 }
 
 /// What `F_GETLK` reports about a conflicting lock.
@@ -66,7 +71,7 @@ pub struct ConflictInfo {
     pub start: u64,
     /// `l_len` encoding: 0 for unbounded, else the byte count.
     pub len: u64,
-    /// Owner pid.
+    /// Owner pid; [`OFD_PID`] for a description's lock.
     pub pid: KoID,
 }
 
@@ -122,7 +127,7 @@ fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// Two locks conflict when their ranges overlap, the owners differ, and at
 /// least one side is exclusive — fcntl(2)'s compatibility rule.
 fn conflicts(held: &Held, req: &LockRequest) -> bool {
-    held.owner != req.owner
+    !same_owner(held, req)
         && (held.exclusive || req.exclusive)
         && ranges_overlap(held.start, held.end, req.start, req.end)
 }
@@ -151,14 +156,42 @@ fn subtract(held: &Held, start: u64, end: u64) -> Vec<Held> {
     out
 }
 
-fn owner_alive(owner: KoID) -> bool {
-    ROOT_JOB.find_process(owner).is_some()
+/// What `F_GETLK` puts in `l_pid` for a description's lock: -1 once it is
+/// cut to the `int` of `struct flock`.
+pub const OFD_PID: KoID = KoID::MAX;
+
+/// Whether any `F_OFD_*` lock was ever taken, so a close need not look.
+static OFD_EVER_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn same_owner(held: &Held, req: &LockRequest) -> bool {
+    held.owner == req.owner && held.ofd == req.ofd
+}
+
+fn owner_alive(held: &Held) -> bool {
+    // A description's lock goes with its last close, not with a process.
+    held.ofd || ROOT_JOB.find_process(held.owner).is_some()
 }
 
 /// Drop every entry whose owner no longer exists (exit-time cleanup, done
 /// lazily on each table visit).
 fn prune_dead(locks: &mut Vec<Held>) {
-    locks.retain(|l| owner_alive(l.owner));
+    locks.retain(owner_alive);
+}
+
+/// The last close of the open file description at `description`: every
+/// `F_OFD_*` lock it holds goes (`locks_remove_file`).
+pub fn release_description(description: usize) {
+    // Called from every `File`'s drop: one load when no process ever took a
+    // description's lock, which is nearly always.
+    if !OFD_EVER_TAKEN.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let owner = description as KoID;
+    let mut table = LOCKS.lock();
+    table.retain(|_, locks| {
+        locks.retain(|l| !(l.ofd && l.owner == owner));
+        !locks.is_empty()
+    });
 }
 
 /// Release every lock `owner` holds, on any file. Called when the process
@@ -171,7 +204,7 @@ fn prune_dead(locks: &mut Vec<Held>) {
 pub fn release_owner(owner: KoID) {
     let mut table = LOCKS.lock();
     table.retain(|_, locks| {
-        locks.retain(|l| l.owner != owner);
+        locks.retain(|l| l.ofd || l.owner != owner);
         !locks.is_empty()
     });
 }
@@ -183,7 +216,7 @@ pub fn release_owner(owner: KoID) {
 pub fn release_file_owner(key: FileKey, owner: KoID) {
     let mut table = LOCKS.lock();
     if let Some(locks) = table.get_mut(&key) {
-        locks.retain(|l| l.owner != owner);
+        locks.retain(|l| l.ofd || l.owner != owner);
         if locks.is_empty() {
             table.remove(&key);
         }
@@ -207,7 +240,7 @@ pub fn getlk(key: FileKey, req: &LockRequest) -> Option<ConflictInfo> {
             } else {
                 held.end - held.start
             },
-            pid: held.owner,
+            pid: if held.ofd { OFD_PID } else { held.owner },
         })
 }
 
@@ -224,18 +257,22 @@ pub fn setlk(key: FileKey, req: &LockRequest, unlock: bool) -> bool {
     }
     let mut next: Vec<Held> = Vec::with_capacity(locks.len() + 1);
     for held in locks.iter() {
-        if held.owner == req.owner {
+        if same_owner(held, req) {
             next.extend(subtract(held, req.start, req.end));
         } else {
             next.push(*held);
         }
     }
     if !unlock {
+        if req.ofd {
+            OFD_EVER_TAKEN.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         next.push(Held {
             exclusive: req.exclusive,
             start: req.start,
             end: req.end,
             owner: req.owner,
+            ofd: req.ofd,
         });
     }
     if next.is_empty() {
@@ -256,6 +293,7 @@ mod tests {
             start,
             end,
             owner,
+            ofd: false,
         }
     }
 
@@ -265,7 +303,43 @@ mod tests {
             start,
             end,
             owner,
+            ofd: false,
         }
+    }
+
+    /// A description's lock: owned by the `File`, not by the process.
+    #[test]
+    fn a_description_lock_conflicts_inside_one_process_and_goes_with_its_close() {
+        let key = (0xd0fd, 1);
+        let pid = 9_001;
+        let ofd = |exclusive, at: usize| LockRequest {
+            exclusive,
+            start: 0,
+            end: 10,
+            owner: at as KoID,
+            ofd: true,
+        };
+        assert!(setlk(key, &ofd(true, 0x1000), false));
+        assert!(
+            !setlk(key, &ofd(true, 0x2000), false),
+            "two descriptions conflict"
+        );
+        assert!(
+            setlk(key, &ofd(true, 0x1000), false),
+            "the same one re-locks"
+        );
+        let posix = req(false, 0, 10, pid);
+        assert_eq!(getlk(key, &posix).map(|c| c.pid as i32), Some(-1));
+        // An owner koid that happens to equal the address is not the owner.
+        assert!(getlk(key, &req(false, 0, 10, 0x1000)).is_some());
+        release_owner(0x1000);
+        assert!(
+            getlk(key, &posix).is_some(),
+            "a process exit is not its close"
+        );
+        release_description(0x1000);
+        assert!(getlk(key, &posix).is_none());
+        assert!(setlk(key, &ofd(true, 0x2000), true));
     }
 
     #[test]

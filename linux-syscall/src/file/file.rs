@@ -1233,7 +1233,7 @@ impl Syscall<'_> {
         // matters at the one step where two of them can both be wrong: a
         // caller probing for a mode on a read-only descriptor is told about
         // the mode, not about the descriptor.
-        let file_like = self.linux_process().get_file_like(fd)?;
+        let file_like = self.linux_process().get_open_file_like(fd)?;
         // `fallocate(2)`: EINVAL for a negative offset or a length that is
         // not positive.
         let offset = linux_object::fs::user_len(offset)?;
@@ -1251,10 +1251,9 @@ impl Syscall<'_> {
             return Err(LxError::EBADF);
         }
         let zeroing = matches!(op, FallocateOp::ZeroRange { .. });
-        // "It is not possible to punch hole on an append-only file."
-        if zeroing && flags.is_append() {
-            return Err(LxError::EPERM);
-        }
+        // `vfs_fallocate`'s `EPERM` for a punch is about an append-only
+        // INODE (`IS_APPEND`, `chattr +a`), which nothing here can set; a
+        // descriptor opened `O_APPEND` punches like any other.
         // A socket, an eventfd, an epoll: neither a regular file nor a block
         // device, which is `ENODEV` (`vfs_fallocate`), not `EBADF`.
         let file = file_like
@@ -1328,11 +1327,46 @@ impl Syscall<'_> {
         &self,
         out_fd: FileDesc,
         in_fd: FileDesc,
-        offset_ptr: UserInOutPtr<u64>,
+        mut offset_ptr: UserInOutPtr<u64>,
         count: usize,
     ) -> SysResult {
-        self.sys_copy_file_range(in_fd, offset_ptr, out_fd, 0.into(), count, 0)
-            .await
+        // `SYSCALL_DEFINE4(sendfile64)` copies `*offset` in first; then
+        // `do_sendfile` takes the input (`EBADF` unless it is open for
+        // reading), checks its window (`rw_verify_area`), and only then the
+        // output (`EBADF` unless open for writing, `EINVAL` when it is
+        // `O_APPEND`, from `do_splice_direct`).
+        let read_offset = if offset_ptr.is_null() {
+            None
+        } else {
+            Some(offset_ptr.read()?)
+        };
+        let proc = self.linux_process();
+        let in_file = proc.get_open_file_like(in_fd)?;
+        if !in_file.flags().readable() {
+            return Err(LxError::EBADF);
+        }
+        if let Some(offset) = read_offset {
+            linux_object::fs::user_offset_end(offset, count)?;
+        }
+        // Any file-like will do as the output: `sendfile(2)`'s reason to
+        // exist is `out_fd` being a socket, and a socket is not a `File`.
+        let out_file = proc.get_open_file_like(out_fd)?;
+        if !out_file.flags().writable() {
+            return Err(LxError::EBADF);
+        }
+        if out_file.flags().is_append() {
+            return Err(LxError::EINVAL);
+        }
+        self.copy_files(
+            &in_file,
+            &mut offset_ptr,
+            read_offset,
+            &out_file,
+            &mut UserInOutPtr::from(0usize),
+            None,
+            count,
+        )
+        .await
     }
 
     /// copies data between one file descriptor and anothe, read from specified offset and write new offset back
@@ -1349,41 +1383,76 @@ impl Syscall<'_> {
             "copy_file_range: in={:?}, out={:?}, in_offset={:?}, out_offset={:?}, count={}, flags={}",
             in_fd, out_fd, in_offset, out_offset, count, flags
         );
-        // `copy_file_range(2)` defines no flags yet and Linux reserves the
-        // word, so that the day one means something a program can tell a
-        // kernel that honoured it from a kernel that dropped it.
-        copy_file_range_flags(flags)?;
+        // `SYSCALL_DEFINE6(copy_file_range)`: both descriptors, then both
+        // offsets copied in, then the flag word -- which Linux reserves, so
+        // that the day one means something a program can tell a kernel that
+        // honoured it from a kernel that dropped it.
         let proc = self.linux_process();
-        // Any file-like will do on either side: `sendfile(2)`'s reason to
-        // exist is `out_fd` being a socket, and a socket is not a `File`, so
-        // `get_file` used to answer EBADF to every web server's fast path.
-        let in_file = proc.get_file_like(in_fd)?;
-        let out_file = proc.get_file_like(out_fd)?;
-
-        // for in_offset and out_offset
-        // null means update file offset
-        // non-null means update {in,out}_offset instead
-
+        let in_file = proc.get_open_file_like(in_fd)?;
+        let out_file = proc.get_open_file_like(out_fd)?;
+        let read_offset = if in_offset.is_null() {
+            None
+        } else {
+            Some(in_offset.read()?)
+        };
+        let write_offset = if out_offset.is_null() {
+            None
+        } else {
+            Some(out_offset.read()?)
+        };
+        copy_file_range_flags(flags)?;
+        // `generic_file_rw_checks`: a directory on either side is `EISDIR`,
+        // anything but two regular files `EINVAL` (since 5.3 this call is
+        // for files only; `sendfile` and `splice` are for the rest), then
+        // the access modes and an `O_APPEND` output are `EBADF`.
+        let kinds = [copy_file_kind(&in_file)?, copy_file_kind(&out_file)?];
+        if kinds.contains(&Some(FileType::Dir)) {
+            return Err(LxError::EISDIR);
+        }
+        if kinds.iter().any(|k| *k != Some(FileType::File)) {
+            return Err(LxError::EINVAL);
+        }
+        if !in_file.flags().readable()
+            || !out_file.flags().writable()
+            || out_file.flags().is_append()
+        {
+            return Err(LxError::EBADF);
+        }
         // Both offsets are `off_t` read from a user pointer, and both are
         // *walked* by the copy below, so each needs the window checked and not
         // just the starting position -- see `user_offset_end`. Unvalidated, a
         // negative one arrived here as a number near 2^64 and went straight
         // into `read_at`/`seek`, and the `+=` further down wrapped on top.
-        let read_offset = if !in_offset.is_null() {
-            let offset = in_offset.read()?;
+        // `rw_verify_area` asks this after the checks above.
+        for &offset in [read_offset, write_offset].iter().flatten() {
             linux_object::fs::user_offset_end(offset, count)?;
-            Some(offset)
-        } else {
-            None
-        };
-        let write_offset = if !out_offset.is_null() {
-            let offset = out_offset.read()?;
-            linux_object::fs::user_offset_end(offset, count)?;
-            Some(offset)
-        } else {
-            None
-        };
+        }
+        self.copy_files(
+            &in_file,
+            &mut in_offset,
+            read_offset,
+            &out_file,
+            &mut out_offset,
+            write_offset,
+            count,
+        )
+        .await
+    }
 
+    /// The copy `sendfile` and `copy_file_range` share once each has judged
+    /// its arguments: a reflink where one can be made, else `copy_range`,
+    /// and the explicit offsets written back.
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_files(
+        &self,
+        in_file: &Arc<dyn FileLike>,
+        in_offset: &mut UserInOutPtr<u64>,
+        read_offset: Option<u64>,
+        out_file: &Arc<dyn FileLike>,
+        out_offset: &mut UserInOutPtr<u64>,
+        write_offset: Option<u64>,
+        count: usize,
+    ) -> SysResult {
         // Two files of one EclipseFS mount at block-aligned offsets: share
         // the blocks (a reflink, as btrfs does here) instead of copying them.
         if let (Some(src), Some(dst)) = (
@@ -1423,10 +1492,10 @@ impl Syscall<'_> {
                 }
             }
         }
-        let waits = self.waits_for_room(&out_file);
-        let copied = copy_range(&in_file, read_offset, &out_file, write_offset, count, waits)
+        let waits = self.waits_for_room(out_file);
+        let copied = copy_range(in_file, read_offset, out_file, write_offset, count, waits)
             .await
-            .inspect_err(|&e| self.raise_sigpipe_if_due(e, self.is_stream(&out_file)))?;
+            .inspect_err(|&e| self.raise_sigpipe_if_due(e, self.is_stream(out_file)))?;
         if let Some(off) = copied.in_offset {
             in_offset.write(off)?;
         }
@@ -1434,6 +1503,16 @@ impl Syscall<'_> {
             out_offset.write(off)?;
         }
         Ok(copied.moved)
+    }
+}
+
+/// What `copy_file_range` asks of each side before anything else: the type
+/// of the file behind it, or `None` for a descriptor that is no file at all
+/// (a socket, an eventfd), which is refused like any other non-regular one.
+fn copy_file_kind(file: &Arc<dyn FileLike>) -> LxResult<Option<FileType>> {
+    match file.downcast_ref::<File>() {
+        Some(f) => Ok(Some(f.metadata()?.type_)),
+        None => Ok(None),
     }
 }
 
@@ -2544,7 +2623,10 @@ impl Syscall<'_> {
         ) {
             let get = cmd == F_GETLK || cmd == F_OFD_GETLK;
             let wait = cmd == F_SETLKW || cmd == F_OFD_SETLKW;
-            return self.fcntl_record_lock(&file_like, get, wait, arg).await;
+            let ofd = cmd >= F_OFD_GETLK;
+            return self
+                .fcntl_record_lock(&file_like, get, wait, ofd, arg)
+                .await;
         }
         // Pipe capacity (fcntl(2), F_SETPIPE_SZ/F_GETPIPE_SZ): valid only on
         // pipe fds — Linux answers EBADF for other fd kinds.
@@ -2605,11 +2687,14 @@ impl Syscall<'_> {
         file_like: &Arc<dyn FileLike>,
         get: bool,
         wait: bool,
+        ofd: bool,
         arg: usize,
     ) -> SysResult {
         let mut ptr: UserInOutPtr<Flock> = arg.into();
         let fl = ptr.read()?;
-        let (ret, back) = self.do_lock_file_wait(file_like, get, wait, fl).await?;
+        let (ret, back) = self
+            .do_lock_file_wait(file_like, get, wait, ofd, fl)
+            .await?;
         if let Some(fl) = back {
             ptr.write(fl)?;
         }
@@ -2630,6 +2715,7 @@ impl Syscall<'_> {
         file_like: &Arc<dyn FileLike>,
         get: bool,
         wait: bool,
+        ofd: bool,
         mut fl: Flock,
     ) -> Result<(usize, Option<Flock>), LxError> {
         use core::time::Duration;
@@ -2648,7 +2734,34 @@ impl Syscall<'_> {
             _ => return Err(LxError::EINVAL),
         };
         let (start, end) = record_lock::resolve_range(base, fl.l_start, fl.l_len)?;
-        let owner = self.zircon_process().id();
+        // `fcntl_getlk` judges the type with the range, `fcntl_setlk` after
+        // it; either way before the descriptor's mode.
+        match fl.l_type {
+            F_RDLCK | F_WRLCK => {}
+            F_UNLCK if !get => {}
+            _ => return Err(LxError::EINVAL),
+        }
+        // `check_fmode_for_setlk`: a read lock needs a descriptor open for
+        // reading and a write lock one open for writing. A probe asks
+        // nothing of the mode.
+        if !get {
+            let flags = file.flags();
+            if (fl.l_type == F_RDLCK && !flags.readable())
+                || (fl.l_type == F_WRLCK && !flags.writable())
+            {
+                return Err(LxError::EBADF);
+            }
+        }
+        // An OFD lock's owner is the description, and its `l_pid` must be
+        // 0 on the way in.
+        if ofd && fl.l_pid != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let owner = if ofd {
+            file as *const File as usize as KoID
+        } else {
+            self.zircon_process().id()
+        };
 
         match fl.l_type {
             F_UNLCK if !get => {
@@ -2657,6 +2770,7 @@ impl Syscall<'_> {
                     start,
                     end,
                     owner,
+                    ofd,
                 };
                 record_lock::setlk(key, &req, true);
                 Ok((0, None))
@@ -2667,6 +2781,7 @@ impl Syscall<'_> {
                     start,
                     end,
                     owner,
+                    ofd,
                 };
                 if get {
                     match record_lock::getlk(key, &req) {

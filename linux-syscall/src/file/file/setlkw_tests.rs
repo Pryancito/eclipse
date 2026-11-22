@@ -50,6 +50,7 @@ fn a_kill_ends_an_f_setlkw_wait() {
                 start: 0,
                 end: u64::MAX,
                 owner: holder.id(),
+                ofd: false,
             };
             assert!(record_lock::setlk((meta.dev, meta.inode), &whole, false));
             let fl = Flock {

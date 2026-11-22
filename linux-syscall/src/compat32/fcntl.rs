@@ -202,11 +202,16 @@ impl Syscall<'_> {
         arg: usize,
         width: usize,
     ) -> SysResult {
+        // `compat_sys_fcntl64`: the descriptor first (`fdget_raw`, and
+        // `check_fcntl_cmd` refuses a lock on an `O_PATH` one), then the
+        // structure.
+        let file_like = self.linux_process().get_open_file_like(fd)?;
         if arg == 0 {
             return Err(LxError::EFAULT);
         }
         let get = cmd == F_GETLK || cmd == F_GETLK64 || cmd == F_OFD_GETLK;
         let wait = cmd == F_SETLKW || cmd == F_SETLKW64 || cmd == F_OFD_SETLKW;
+        let ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
 
         let mut raw = [0u8; FLOCK64_SIZE];
         let input: UserInPtr<u8> = arg.into();
@@ -214,8 +219,9 @@ impl Syscall<'_> {
         raw[..width].copy_from_slice(&read);
         let fl = flock_from_bytes(&raw, width)?;
 
-        let file_like = self.linux_process().get_file_like(fd)?;
-        let (ret, back) = self.do_lock_file_wait(&file_like, get, wait, fl).await?;
+        let (ret, back) = self
+            .do_lock_file_wait(&file_like, get, wait, ofd, fl)
+            .await?;
         if let Some(fl) = back {
             let mut raw = [0u8; FLOCK64_SIZE];
             flock_to_bytes(&fl, width, &mut raw)?;

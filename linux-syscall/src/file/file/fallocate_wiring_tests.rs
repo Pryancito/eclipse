@@ -410,12 +410,10 @@ fn only_a_fallocate_that_grows_the_file_answers_to_rlimit_fsize() {
 }
 
 #[test]
-fn an_append_only_descriptor_may_allocate_but_may_not_punch() {
-    // "It is not possible to punch hole on an append-only file": the point
-    // of `O_APPEND` on a log is that what is already in it cannot be
-    // rewritten, and zeroing a range inside it is rewriting it. Allocating
-    // more room is not, so that one still goes through -- which is what
-    // makes this a test of the condition and not of the flag.
+fn an_o_append_descriptor_may_punch_as_well_as_allocate() {
+    // `vfs_fallocate` refuses a punch on an append-only INODE (`IS_APPEND`,
+    // what `chattr +a` sets), not on a descriptor opened `O_APPEND`: Linux
+    // punches through one of those like through any other.
     let proc = a_process(46_006, "falloc-append", "falloc_append");
     let dir_path = String::from("/falloc_append");
     on_a_thread(&proc, move |sys| {
@@ -433,20 +431,12 @@ fn an_append_only_descriptor_may_allocate_but_may_not_punch() {
 
             assert_eq!(
                 sys.sys_fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4),
-                Err(LxError::EPERM),
-                "a hole was punched in an append-only file"
-            );
-            assert_eq!(
-                bytes_of(&lp, &dir_path, "log", 10),
-                TEN_DIGITS.to_vec(),
-                "a refused punch rewrote the file anyway"
-            );
-
-            assert_eq!(
-                sys.sys_fallocate(fd, 0, 10, 6),
                 Ok(0),
-                "an append-only file was refused room it was only growing into"
+                "an O_APPEND descriptor may punch"
             );
+            assert_eq!(&bytes_of(&lp, &dir_path, "log", 10)[..4], &[0u8; 4]);
+
+            assert_eq!(sys.sys_fallocate(fd, 0, 10, 6), Ok(0));
             assert_eq!(length_of(&lp, &dir_path, "log"), 16);
         })
     });

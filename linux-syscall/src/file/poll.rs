@@ -569,7 +569,6 @@ impl Syscall<'_> {
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let mut events = 0;
-                let mut early_err = None;
 
                 // iterate each poll to check whether it is ready
                 for (poll, file_like) in this.polls.iter_mut().zip(&files) {
@@ -579,14 +578,7 @@ impl Syscall<'_> {
                         // Sync poll only — see Epoll::wait. async_poll per fd
                         // here nested huge futures on the coroutine stack and
                         // #DF'd `__from_user` when labwc/libinput started.
-                        let status = match file_like.poll(poll.events) {
-                            Ok(ret) => ret,
-                            Err(err) => {
-                                debug!("poll ret err: {:?}", err);
-                                early_err = Some(err);
-                                break;
-                            }
-                        };
+                        let status = status_or_error(file_like.poll(poll.events));
                         // POLLHUP/POLLERR are return-only: always reported
                         // when set, even if the caller did not list them in
                         // `events`; the rest is what the caller asked for.
@@ -608,15 +600,6 @@ impl Syscall<'_> {
                         poll.revents |= PE::INVAL;
                         events += 1;
                     }
-                }
-                if let Some(err) = early_err {
-                    clear_poll_io(
-                        &mut this.timer,
-                        &mut this.io_waker,
-                        watch_net,
-                        watch_interactive,
-                    );
-                    return Poll::Ready(Err(err));
                 }
                 // some event happens, so evoke the process
                 if events > 0 {
@@ -1100,7 +1083,6 @@ impl Syscall<'_> {
                 };
 
                 let mut events = 0;
-                let mut early_err = None;
                 // Iterate only the fds in the select set instead of every open
                 // fd in the process.
                 for (&fd, file_like) in this.members.iter().zip(&files) {
@@ -1110,13 +1092,7 @@ impl Syscall<'_> {
                     };
                     // Sync poll only — same stack-overflow rationale as sys_poll /
                     // Epoll::wait (labwc bring-up #DF in `__from_user`).
-                    let status = match file_like.poll(PollEvents::all()) {
-                        Ok(ret) => ret,
-                        Err(err) => {
-                            early_err = Some(err);
-                            break;
-                        }
-                    };
+                    let status = status_or_error(file_like.poll(PollEvents::all()));
                     let ready = select_ready(&status);
                     if ready.except && this.err_fds.contains(fd) {
                         this.err_fds.set(fd);
@@ -1130,15 +1106,6 @@ impl Syscall<'_> {
                         this.write_fds.set(fd);
                         events += 1;
                     }
-                }
-                if let Some(err) = early_err {
-                    clear_poll_io(
-                        &mut this.timer,
-                        &mut this.io_waker,
-                        watch_net,
-                        watch_interactive,
-                    );
-                    return Poll::Ready(Err(err));
                 }
 
                 // some event happens, so evoke the process
@@ -1485,6 +1452,22 @@ pub(crate) struct SelectReady {
 /// `select(writefds)`, when Linux returns it writable so the write can fail
 /// with EPIPE; and a socket that hung up was not readable to `select`, though
 /// its `read` of 0 was waiting.
+/// What a wait reads off a file whose readiness check failed: `->poll`
+/// returns a mask and has no error of its own, so a file that cannot say
+/// is `EPOLLERR` -- reported by `poll`, ready both ways to `select` -- and
+/// the call goes on with the rest of the set.
+fn status_or_error(status: Result<PollStatus, LxError>) -> PollStatus {
+    status.unwrap_or_else(|err| {
+        debug!("poll ret err: {:?}", err);
+        PollStatus {
+            read: false,
+            write: false,
+            error: true,
+            hangup: false,
+        }
+    })
+}
+
 pub(crate) fn select_ready(status: &PollStatus) -> SelectReady {
     SelectReady {
         read: status.read || status.hangup || status.error,
