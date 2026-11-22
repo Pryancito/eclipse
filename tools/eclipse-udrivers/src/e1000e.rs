@@ -44,6 +44,7 @@ use crate::net::{Msg, BUF_SIZE, FRAME_MAX, OP_RX, OP_TX, RX_BUFS, TX_BUFS, TX_HE
 use crate::zx::{Handle, Status};
 use crate::PAGE;
 
+pub mod legacy;
 pub mod pch;
 
 /// Which kind of e1000e a card is, as far as bringing it up goes.
@@ -51,6 +52,11 @@ pub mod pch;
 pub enum Part {
     /// A discrete part: the 82574L/LA (QEMU's) and the 82583V.
     Discrete,
+    /// An 82571 or 82572, copper: an IGP PHY behind `SWSM` ([`legacy`]).
+    E82571,
+    /// An 82573: an M88 PHY whose MDIO the firmware hands over
+    /// ([`legacy`]).
+    E82573,
     /// A PCH part before Sunrise Point: 82579 (PCH2), I217 and I218 (LPT).
     Pch,
     /// Sunrise Point and later: every I219. Its queues have to be enabled
@@ -74,6 +80,11 @@ impl Part {
         match pci_id as u16 {
             // 82574L, 82574LA, 82583V.
             0x10d3 | 0x10f6 | 0x150c => Some(Part::Discrete),
+            // 82571EB copper (dual, quad, quad low profile), 82571PT quad,
+            // 82572PI and EI copper. Not the fiber or SerDes ones.
+            0x105e | 0x10a4 | 0x10bc | 0x10d5 | 0x107d | 0x10b9 => Some(Part::E82571),
+            // 82573V, E, L.
+            0x108b | 0x108c | 0x109a => Some(Part::E82573),
             // 82579LM/V; I217-LM/V; I218-LM/V and the LPT-LP ones.
             0x1502 | 0x1503 | 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 => {
                 Some(Part::Pch)
@@ -101,7 +112,12 @@ impl Part {
     }
 
     pub fn is_pch(self) -> bool {
-        self != Part::Discrete
+        matches!(self, Part::Pch | Part::PchSpt)
+    }
+
+    /// An 82571, 82572 or 82573: brought up by [`legacy`].
+    pub fn is_legacy(self) -> bool {
+        matches!(self, Part::E82571 | Part::E82573)
     }
 
     /// How much of the window bringing it up needs.
@@ -578,9 +594,11 @@ impl Taker {
             return;
         }
         if !self.part.is_pch() {
+            let speed = pch::speed_of(status);
+            legacy::on_link_up(&self.regs, self.part, speed);
             println!(
                 "e1000e: link up, {} Mb/s {} duplex",
-                pch::speed_of(status),
+                speed,
                 if status & 1 != 0 { "full" } else { "half" }
             );
             return;
@@ -778,6 +796,10 @@ pub unsafe fn bring_up(
         regs.write(pch::WUC, 0);
         regs.write(pch::WUFC, 0);
         mac
+    } else if part.is_legacy() {
+        let report = legacy::reset(&regs, part)?;
+        println!("e1000e: {report:?}");
+        mac_of(regs)
     } else {
         reset_discrete(regs)?;
         mac_of(regs)
@@ -813,6 +835,10 @@ pub unsafe fn bring_up(
         regs.write(TXDCTL, TXDCTL_VALUE);
     }
     regs.write(TARC0, regs.read(TARC0) | 1);
+    if part == Part::E82571 {
+        // Cleared again when the link comes up below gigabit.
+        regs.write(TARC0, regs.read(TARC0) | legacy::TARC0_SPEED_MODE);
+    }
     regs.write(TCTL, TCTL_EN | TCTL_PSP | TCTL_RTLC | TCTL_CT | TCTL_COLD);
 
     // Receive (datasheet §4.6.7): legacy descriptors, 2 KiB buffers, the
