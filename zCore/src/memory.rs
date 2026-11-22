@@ -1492,6 +1492,13 @@ pub fn heap_total() -> usize {
     TOTAL_MEMORY.load(Ordering::Relaxed)
 }
 
+/// The most the heap can reach (mirrors `memory_x86_64::heap_limit`). This
+/// build's heap does not grow, so it is the heap.
+#[allow(dead_code)]
+pub fn heap_limit() -> usize {
+    heap_total()
+}
+
 /// The heap's growth for the OOM report (mirrors
 /// `memory_x86_64::heap_grow_status`). This build's heap does not grow.
 #[allow(dead_code)]

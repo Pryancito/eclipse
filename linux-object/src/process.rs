@@ -658,6 +658,9 @@ impl NewChild for Process {
             syscall_redirect: syscall_redirect::RedirectSlot::forked(
                 &linux_parent.syscall_redirect,
             ),
+            // A fresh account with the parent's limit: what the parent has
+            // queued stays charged to the parent.
+            kmem: linux_parent.kmem.forked(),
             inner: Mutex::new(linux_parent_inner.forked_child(
                 parent_pgid,
                 parent_sid,
@@ -1289,6 +1292,9 @@ pub struct LinuxProcess {
     /// Where this process's redirected syscalls go, if anywhere: see
     /// [`syscall_redirect`]. Outside `inner` because every syscall reads it.
     syscall_redirect: syscall_redirect::RedirectSlot,
+    /// What it leaves in the kernel heap and how much it may: see
+    /// [`crate::kmem`]. Outside `inner` because every queued byte charges it.
+    kmem: Arc<crate::kmem::KmemAccount>,
 }
 
 /// Linux process mut inner data
@@ -1763,6 +1769,11 @@ const INIT_RLIMITS: [RLimit; RLIM_NLIMITS] = {
 pub type ExitCode = i32;
 
 impl LinuxProcess {
+    /// Its kernel memory account: see [`crate::kmem`].
+    pub fn kmem(&self) -> &Arc<crate::kmem::KmemAccount> {
+        &self.kmem
+    }
+
     /// Whether `pid` is a child of this process that has exited and has not
     /// been collected by `wait*` yet -- a zombie. Its `Process` has already
     /// left the job (`ROOT_JOB.find_process` misses it), but `kill(2)` must
@@ -1909,6 +1920,7 @@ impl LinuxProcess {
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             syscall_redirect: Default::default(),
+            kmem: crate::kmem::KmemAccount::with_limit(0),
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 start_ns: monotonic_now_ns(),

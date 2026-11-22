@@ -1432,6 +1432,23 @@ cfg_if! {
             heap_total().saturating_sub(KERNEL_HEAP_SIZE)
         }
 
+        /// The most the heap can reach from here: what it holds now, plus
+        /// the RAM a growth ahead of demand may still take (everything but
+        /// the quarter [`HEAP_LEAVE_FREE_PCT`] keeps for user pages), up to
+        /// [`HEAP_MAX_TOTAL`]. Never below what it holds.
+        ///
+        /// What the per-process kernel memory quota (`linux_object::kmem`)
+        /// measures against: the heap's size now says nothing on a machine
+        /// that has not needed to grow it yet. Allocates nothing.
+        pub fn heap_limit() -> usize {
+            let total = heap_total();
+            let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
+            let room = ram
+                .saturating_sub(FRAMES_USED.get())
+                .saturating_sub(ram / 100 * HEAP_LEAVE_FREE_PCT);
+            total.saturating_add(room).min(HEAP_MAX_TOTAL).max(total)
+        }
+
         // ── Elastic heap ────────────────────────────────────────────────────
         //
         // The arena is a fixed `static mut HEAP: [usize; _]` in .bss, and
@@ -2802,6 +2819,11 @@ cfg_if! {
         pub fn init() {}
 
         pub fn heap_total() -> usize {
+            0
+        }
+
+        #[allow(dead_code)]
+        pub fn heap_limit() -> usize {
             0
         }
 

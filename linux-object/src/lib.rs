@@ -30,6 +30,7 @@ pub mod fs;
 
 // layer 2
 pub mod ipc;
+pub mod kmem;
 pub mod loadavg;
 pub mod loader;
 pub mod net;
