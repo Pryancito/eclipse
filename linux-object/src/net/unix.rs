@@ -193,6 +193,11 @@ struct UnixInner {
     /// of the skb's socket); it used to name the receiver itself.
     /// Consecutive messages from one path share an entry.
     dgram_sources: VecDeque<(usize, String)>,
+    /// The peer's bound path when `connect_pair` wired it, which `recvfrom`
+    /// on a stream or seqpacket end reports. Kept here so a read clones one
+    /// string under its own lock, as it always did, instead of locking the
+    /// peer for its name.
+    peer_name: String,
 }
 
 /// How many datagram senders one full queue keeps a wake for. A sender left
@@ -288,6 +293,7 @@ impl Default for UnixSocketState {
                 room_waiters: Vec::new(),
                 waiting_room: false,
                 dgram_sources: VecDeque::new(),
+                peer_name: String::new(),
             })),
         }
     }
@@ -320,8 +326,11 @@ impl UnixSocketState {
     /// Wire two sockets together bidirectionally.
     /// Must be called while neither inner lock is held.
     pub fn connect_pair(a: &Arc<Self>, b: &Arc<Self>) {
+        let a_name = a.inner.lock().path.clone();
+        let b_name = b.inner.lock().path.clone();
         {
             let mut ai = a.inner.lock();
+            ai.peer_name = b_name;
             ai.peer = Some(Arc::downgrade(&b.inner));
             ai.connected = true;
             // Do NOT latch WRITABLE on the eventbus. Stream sockets report
@@ -333,6 +342,7 @@ impl UnixSocketState {
         }
         {
             let mut bi = b.inner.lock();
+            bi.peer_name = a_name;
             bi.peer = Some(Arc::downgrade(&a.inner));
             bi.connected = true;
         }
@@ -829,7 +839,8 @@ impl Socket for UnixSocketState {
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
         loop {
             let mut inner = self.inner.lock();
-            let path = inner.path.clone();
+            // Who sent a message is named where one is read; an EOF or an
+            // error names nobody (Linux leaves `msg_namelen` at 0 then).
 
             // `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)
             // return -EINVAL;` -- a socket that was never connected (or is a
@@ -841,7 +852,7 @@ impl Socket for UnixSocketState {
             // A datagram socket is the exception: it receives from whoever
             // sends to its address, connected or not.
             if !inner.connected && !inner.is_dgram() {
-                return (Err(LxError::EINVAL), Endpoint::Unix(path));
+                return (Err(LxError::EINVAL), Endpoint::Unix(String::new()));
             }
 
             // Queued bytes come out before a receive-side shutdown is honoured:
@@ -876,9 +887,9 @@ impl Socket for UnixSocketState {
                         Some((offset, name)) if *offset <= at => name.clone(),
                         _ => String::new(),
                     };
-                    Ok(name)
+                    name
                 } else {
-                    Err(inner.live_peer())
+                    inner.peer_name.clone()
                 };
                 // Bulk copy from the deque's two contiguous halves instead of a
                 // per-byte pop_front loop: every Wayland/D-Bus message crosses
@@ -904,30 +915,32 @@ impl Socket for UnixSocketState {
                 let peer = if was_full { inner.live_peer() } else { None };
                 // A datagram that did not fit waits on any drain, full or
                 // not: it may have needed more room than was left.
-                let waiters = core::mem::take(&mut inner.room_waiters);
+                let waiters = if inner.room_waiters.is_empty() {
+                    None
+                } else {
+                    Some(core::mem::take(&mut inner.room_waiters))
+                };
                 drop(inner);
                 if let Some(peer) = peer {
                     pulse_writable(&mut peer.lock().eventbus);
                 }
-                wake_room_waiters(waiters);
-                let name = match source {
-                    Ok(name) => name,
-                    Err(peer) => peer.map(|p| p.lock().path.clone()).unwrap_or_default(),
-                };
-                return (Ok(len), Endpoint::Unix(name));
+                if let Some(waiters) = waiters {
+                    wake_room_waiters(waiters);
+                }
+                return (Ok(len), Endpoint::Unix(source));
             }
 
             if inner.read_closed {
-                return (Ok(0), Endpoint::Unix(path));
+                return (Ok(0), Endpoint::Unix(String::new()));
             }
 
             // EOF: peer gone
             if inner.peer_gone() && inner.connected {
-                return (Ok(0), Endpoint::Unix(path));
+                return (Ok(0), Endpoint::Unix(String::new()));
             }
 
             if inner.flags.contains(OpenFlags::NON_BLOCK) {
-                return (Err(LxError::EAGAIN), Endpoint::Unix(path));
+                return (Err(LxError::EAGAIN), Endpoint::Unix(String::new()));
             }
 
             drop(inner);
@@ -989,8 +1002,9 @@ impl Socket for UnixSocketState {
             );
             // Only a datagram's receiver keeps who sent each message.
             let own_name = (inner.sock_type == SocketType::SOCK_DGRAM).then(|| inner.path.clone());
+            // Upgraded under our lock, as before: no `Weak` clone per write.
             (
-                inner.peer.clone(),
+                inner.peer.as_ref().map(|w| w.upgrade()),
                 message,
                 inner.sock_type,
                 inner.connected,
@@ -1023,15 +1037,11 @@ impl Socket for UnixSocketState {
                 None => return Err(LxError::ENOTCONN),
                 // A datagram whose connected destination went away is
                 // `ECONNREFUSED` on Linux; a stream's is `EPIPE`.
-                Some(peer_weak) => {
-                    peer_weak
-                        .upgrade()
-                        .ok_or(if sock_type == SocketType::SOCK_DGRAM {
-                            LxError::ECONNREFUSED
-                        } else {
-                            LxError::EPIPE
-                        })?
-                }
+                Some(peer) => peer.ok_or(if sock_type == SocketType::SOCK_DGRAM {
+                    LxError::ECONNREFUSED
+                } else {
+                    LxError::EPIPE
+                })?,
             },
         };
         let mut pi = peer.lock();
