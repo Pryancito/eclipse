@@ -506,8 +506,30 @@ impl Syscall<'_> {
         //
         // reproducible to the byte across boots, from PulseAudio.
         kernel_hal::kstats::note_futex_op();
+        // `get_futex_key`: a word that is not aligned is `EINVAL` for every
+        // operation, before anything is read.
+        if uaddr % core::mem::size_of::<u32>() != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let private = op & FUTEX_PRIVATE_FLAG != 0;
         let word: UserInPtr<i32> = uaddr.into();
-        word.check()?;
+        if let Err(e) = word.check() {
+            // A private key is made from the address alone (`access_ok` is
+            // a range check), so the operations that never read the word --
+            // a wake, a plain requeue, a wake-op (whose atomic step is on
+            // the SECOND word) -- find nobody and answer 0 even for
+            // an unmapped one. Everything else reads it and faults; so does
+            // a shared key, which has to look the page up.
+            if private
+                && matches!(
+                    cmd,
+                    FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_WAKE_OP
+                )
+            {
+                return Ok(0);
+            }
+            return Err(e.into());
+        }
         // The bounds check above descended the VMAR once. Counted here rather
         // than inside `check`, which every syscall uses: the question is what
         // the *futex* path costs.
@@ -605,6 +627,14 @@ impl Syscall<'_> {
                     if owner == tid {
                         return Err(LxError::EDEADLK);
                     }
+                    // `attach_to_pi_owner`: an owner TID no task has is
+                    // `ESRCH`, for a try as much as for a lock. Waiting on it,
+                    // as this used to, waited for an unlock nobody could make.
+                    if linux_object::process::find_thread(owner as u64).is_none()
+                        && linux_object::process::find_task(owner as u64).is_none()
+                    {
+                        return Err(LxError::ESRCH);
+                    }
                     if cmd == FUTEX_TRYLOCK_PI {
                         return Err(LxError::EAGAIN);
                     }
@@ -681,18 +711,21 @@ impl Syscall<'_> {
                 // future and engaging the blocking machinery — the slow path
                 // re-checks under the queue lock so this is purely an
                 // optimization.
+                //
+                // The timeout is read first, though: `SYSCALL_DEFINE6(futex)`
+                // copies and validates it before `do_futex` compares the word,
+                // so an unreadable or malformed one is `EFAULT`/`EINVAL` even
+                // when the word has already moved.
+                let timeout_addr: UserInPtr<TimeSpec> = val2.into();
+                let timeout = crate::narrow::narrow_get_if_not_null(abi32, &timeout_addr)?
+                    .map(|timeout| timeout.try_into_duration())
+                    .transpose()?;
                 if !futex.value_eq(val as i32) {
                     return Err(LxError::EAGAIN);
                 }
                 // FUTEX_WAIT_BITSET with a mask is approximated as match-any;
                 // both musl and glibc only use FUTEX_BITSET_MATCH_ANY here.
                 let future = futex.wait(val as _);
-                let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                // Validated: a `timespec` out of range is EINVAL, and it is
-                // rejected whether or not we end up waiting.
-                let timeout = crate::narrow::narrow_get_if_not_null(abi32, &timeout_addr)?
-                    .map(|timeout| timeout.try_into_duration())
-                    .transpose()?;
                 // FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET takes
                 // an ABSOLUTE one on the clock FUTEX_CLOCK_REALTIME selects.
                 let on_clock = (cmd == FUTEX_WAIT_BITSET).then(|| {
@@ -795,8 +828,49 @@ impl Syscall<'_> {
                     Err(e) => Err(e.into()),
                 }
             }
-            FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(futex.wake(val as _)),
+            // `futex_wake` wakes one before it compares the count
+            // (`if (++ret >= nr_wake) break;`), so 0 or a negative `int`
+            // wakes one, not none and not everybody.
+            FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(futex.wake(futex_wake_count(val))),
+            // Old glibc condvars (before 2.25) signal through this one. It
+            // used to be `ENOSYS`.
+            FUTEX_WAKE_OP => {
+                let (apply, test) = futex_wake_op_decode(val3)?;
+                if uaddr2 % core::mem::size_of::<u32>() != 0 {
+                    return Err(LxError::EINVAL);
+                }
+                let second: UserInPtr<i32> = uaddr2.into();
+                second.check()?;
+                let futex2 = match (op & FUTEX_PRIVATE_FLAG == 0)
+                    .then(|| self.shared_futex(uaddr2))
+                    .flatten()
+                {
+                    Some(futex) => futex,
+                    None => self
+                        .linux_process()
+                        .get_futex(uaddr2)
+                        .ok_or(LxError::EINVAL)?,
+                };
+                // `arch_futex_atomic_op_inuser`: one atomic step on the
+                // second word, which keeps the value it had.
+                let old = loop {
+                    let old = futex2.load();
+                    if futex2.compare_exchange(old, apply(old)).is_ok() {
+                        break old;
+                    }
+                };
+                let mut woken = futex.wake(futex_wake_count(val));
+                if test(old) {
+                    woken += futex2.wake(futex_wake_count(val2 as u32));
+                }
+                Ok(woken)
+            }
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+                // `futex_requeue`: either count negative as an `int` is
+                // `EINVAL`. They used to be read as huge unsigned counts.
+                if (val as i32) < 0 || (val2 as u32 as i32) < 0 {
+                    return Err(LxError::EINVAL);
+                }
                 // The TARGET word is resolved exactly like the source one
                 // above. A requeue that carries no FUTEX_PRIVATE_FLAG names a
                 // word another process may be waiting on, and taking its
@@ -1081,6 +1155,7 @@ pub(crate) const FUTEX_WAIT: u32 = 0;
 pub(crate) const FUTEX_WAKE: u32 = 1;
 pub(crate) const FUTEX_REQUEUE: u32 = 3;
 pub(crate) const FUTEX_CMP_REQUEUE: u32 = 4;
+pub(crate) const FUTEX_WAKE_OP: u32 = 5;
 pub(crate) const FUTEX_LOCK_PI: u32 = 6;
 pub(crate) const FUTEX_UNLOCK_PI: u32 = 7;
 pub(crate) const FUTEX_TRYLOCK_PI: u32 = 8;
@@ -1106,6 +1181,49 @@ const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
 const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
 /// `FUTEX_TID_MASK`: the rest of the word is the owner's TID, 0 meaning free.
 const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+
+/// How many a `FUTEX_WAKE` of `val` wakes: at least one, as `futex_wake`
+/// counts after waking.
+pub(crate) fn futex_wake_count(val: u32) -> usize {
+    (val as i32).max(1) as usize
+}
+
+/// `FUTEX_WAKE_OP`'s `val3`, decoded as `futex_atomic_op_inuser` does:
+/// the operation applied to the old value of the second word, and the
+/// comparison of that old value that decides whether its waiters are woken.
+/// An operation or a comparison Linux does not have is `ENOSYS`.
+pub(crate) fn futex_wake_op_decode(
+    val3: u32,
+) -> LxResult<(impl Fn(i32) -> i32, impl Fn(i32) -> bool)> {
+    let op = (val3 >> 28) & 7;
+    let cmp = (val3 >> 24) & 15;
+    // Twelve-bit signed fields (`sign_extend32(.., 11)`).
+    let mut oparg = (((val3 >> 12) & 0xfff) as i32) << 20 >> 20;
+    let cmparg = ((val3 & 0xfff) as i32) << 20 >> 20;
+    // `FUTEX_OP_OPARG_SHIFT`: the argument is a bit number, masked to 31.
+    if val3 & (8 << 28) != 0 {
+        oparg = 1i32.wrapping_shl((oparg & 31) as u32);
+    }
+    if op > 4 || cmp > 5 {
+        return Err(LxError::ENOSYS);
+    }
+    let apply = move |old: i32| match op {
+        0 => oparg,
+        1 => old.wrapping_add(oparg),
+        2 => old | oparg,
+        3 => old & !oparg,
+        _ => old ^ oparg,
+    };
+    let test = move |old: i32| match cmp {
+        0 => old == cmparg,
+        1 => old != cmparg,
+        2 => old < cmparg,
+        3 => old <= cmparg,
+        4 => old > cmparg,
+        _ => old >= cmparg,
+    };
+    Ok((apply, test))
+}
 
 /// What `do_futex` decides from `op` and `val3` BEFORE it touches `uaddr`,
 /// answered in the same order Linux answers it, with the command it settled
@@ -1138,8 +1256,8 @@ pub(crate) fn futex_op_check(op: u32, val3: u32) -> LxResult<u32> {
         return Err(LxError::ENOSYS);
     }
     match cmd {
-        FUTEX_WAIT | FUTEX_WAKE | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | FUTEX_LOCK_PI
-        | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI | FUTEX_LOCK_PI2 => Ok(cmd),
+        FUTEX_WAIT | FUTEX_WAKE | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | FUTEX_WAKE_OP
+        | FUTEX_LOCK_PI | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI | FUTEX_LOCK_PI2 => Ok(cmd),
         FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET => {
             if val3 == 0 {
                 Err(LxError::EINVAL)
@@ -2475,9 +2593,9 @@ mod futex_op_tests {
     fn an_unknown_command_is_enosys_before_the_word_is_read() {
         // 0x11 is FUTEX_WAKE with a bit above the highest command set: a
         // command read from its low bits alone would take it for a wake.
+        // 5 (FUTEX_WAKE_OP) is served now; 2 is FUTEX_FD, gone from Linux.
         for cmd in [
             2,
-            5,
             14,
             15,
             0x11,

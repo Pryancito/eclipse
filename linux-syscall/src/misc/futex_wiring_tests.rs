@@ -241,19 +241,13 @@ async fn a_wake_that_finds_somebody(
     None
 }
 
-/// Give the waiters time to park, asking for ZERO wakes all the while.
+/// Give the waiters time to park.
 ///
-/// A count of zero wakes nobody however many waiters are queued, so this
-/// both settles the test and asserts something: a kernel that passed a
-/// constant to `Futex::wake` instead of the count it was given answers 1
-/// here long before the test gets to the call it is about.
-async fn nobody_is_woken_while_the_count_is_zero(sys: &Syscall<'_>, addr: usize) {
+/// This used to ask for ZERO wakes all the while, on the belief that a
+/// count of zero wakes nobody. On Linux it wakes one (`futex_wake` counts
+/// after waking), so the waiters are just given the time.
+async fn the_waiters_have_time_to_park() {
     for _ in 0..60 {
-        assert_eq!(
-            futex(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
-            Ok(0),
-            "a wake asking for nobody woke somebody"
-        );
         async_std::task::sleep(A_MOMENT).await;
     }
 }
@@ -315,14 +309,13 @@ fn an_operation_this_kernel_does_not_serve_is_judged_before_the_word_is_looked_a
 }
 
 /// The word is checked on every call, before any command does anything with
-/// it, and a bad one is `EFAULT` rather than the `EINVAL` the futex table
-/// would answer for the same address.
+/// it, which is what keeps an unmapped word from taking the machine down
+/// through whichever command happened to be asked.
 ///
-/// Both halves matter. The check being in the preamble rather than in each
-/// arm is what keeps an unmapped word from taking the machine down through
-/// whichever command happened to be asked, and the errno being `EFAULT` is
-/// what tells a caller the pointer is the problem: `EINVAL` reads as "that
-/// is not a futex operation" and sends musl down the wrong path.
+/// What a bad word answers is `get_futex_key`'s: an unaligned one is
+/// `EINVAL` for every command. A NULL one makes a private key from the
+/// address alone, so the commands that never read the word (a wake, a
+/// plain requeue) find nobody and answer 0, and the rest fault (`EFAULT`).
 #[test]
 fn a_futex_word_that_is_null_or_unaligned_is_refused_whatever_the_operation_asked() {
     let proc = a_process(47_261, "futex-bad-word");
@@ -344,9 +337,14 @@ fn a_futex_word_that_is_null_or_unaligned_is_refused_whatever_the_operation_aske
                 FUTEX_WAIT_BITSET,
                 FUTEX_WAKE_BITSET,
             ] {
+                let never_reads = matches!(op, FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE);
                 assert_eq!(
                     futex(sys, 0, op | FUTEX_PRIVATE_FLAG, 0, 0, target, MATCH_ANY).await,
-                    Err(LxError::EFAULT),
+                    if never_reads {
+                        Ok(0)
+                    } else {
+                        Err(LxError::EFAULT)
+                    },
                     "op {:#x} with a null word",
                     op
                 );
@@ -363,7 +361,7 @@ fn a_futex_word_that_is_null_or_unaligned_is_refused_whatever_the_operation_aske
                         MATCH_ANY
                     )
                     .await,
-                    Err(LxError::EFAULT),
+                    Err(LxError::EINVAL),
                     "op {:#x} one byte off an aligned word",
                     op
                 );
@@ -412,7 +410,7 @@ fn a_futex_word_that_is_null_or_unaligned_is_refused_whatever_the_operation_aske
 /// timeout is read fine and is then merely `EINVAL`, which measures the
 /// order of nothing.
 #[test]
-fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
+fn the_timeout_is_read_before_the_word_is_compared() {
     let proc = a_process(47_262, "futex-eagain");
     let moved = a_futex_word(7);
     let still = a_futex_word(0);
@@ -424,7 +422,9 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
             // and the futex words themselves are host-heap addresses, which
             // are in the user half.
             let _strict = StrictUserHalf::on();
-            // The value is what it is judged on, and nothing else is read.
+            // `SYSCALL_DEFINE6(futex)` copies the timeout in before
+            // `do_futex` compares anything, so an unreadable one is EFAULT
+            // even on a word that has already moved. It used to be EAGAIN.
             assert_eq!(
                 futex(
                     sys,
@@ -436,11 +436,16 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                     0
                 )
                 .await,
+                Err(LxError::EFAULT),
+                "an unreadable timespec on a word that had already moved"
+            );
+            // With no timeout at all, the moved word is EAGAIN.
+            assert_eq!(
+                futex(sys, changed, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
                 Err(LxError::EAGAIN),
                 "a wait on a word that had already moved"
             );
-            // Same call on a word that did NOT move: now the timeout is
-            // read, and the pointer above was unreadable all along.
+            // Same call on a word that did NOT move: EFAULT too.
             assert_eq!(
                 futex(
                     sys,
@@ -455,9 +460,7 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                 Err(LxError::EFAULT),
                 "an unreadable timespec on a word that matched"
             );
-            // The value compared is the one the caller GAVE, not zero: a
-            // word holding seven and a wait expecting seven do match, and
-            // the proof is that the unreadable timeout gets read after all.
+            // And on a word holding the value the caller gave.
             assert_eq!(
                 futex(
                     sys,
@@ -639,7 +642,7 @@ fn the_realtime_bit_says_which_clock_an_absolute_deadline_is_on() {
 /// either way, so the flag must not fork the queue; if it did, that waiter
 /// would sit through its whole 10 seconds and answer `ETIMEDOUT`.
 #[test]
-fn a_wake_releases_the_waiters_one_at_a_time_and_a_count_of_zero_releases_none() {
+fn a_wake_releases_the_waiters_one_at_a_time_and_a_count_of_zero_releases_one() {
     let proc = a_process(47_265, "futex-pair");
     let word = a_futex_word(0);
     let addr = addr_of(word);
@@ -647,11 +650,13 @@ fn a_wake_releases_the_waiters_one_at_a_time_and_a_count_of_zero_releases_none()
     let timed = a_waiter(&proc, addr, FUTEX_WAIT, Some(Duration::from_secs(10)));
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            nobody_is_woken_while_the_count_is_zero(sys, addr).await;
+            the_waiters_have_time_to_park().await;
+            // A count of zero wakes one: `futex_wake` wakes before it
+            // compares (`if (++ret >= nr_wake) break;`).
             assert_eq!(
-                a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1).await,
+                a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 0).await,
                 Some(1),
-                "the first wake did not take exactly one of the two waiters"
+                "a wake of zero did not take exactly one of the two waiters"
             );
             assert_eq!(
                 a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1).await,
@@ -694,7 +699,9 @@ fn an_uncontended_priority_lock_takes_the_word_and_gives_it_back() {
     let proc = a_process(47_266, "futex-pi");
     let free = a_futex_word(0);
     let flagged = a_futex_word(FUTEX_WAITERS | FUTEX_OWNER_DIED);
-    let theirs = a_futex_word(0x1234);
+    // A task that exists and is not the calling thread: another process.
+    let _holder = a_process(47_277, "futex-pi-holder");
+    let theirs = a_futex_word(47_277);
     let second = a_futex_word(0);
     let mine = addr_of(free);
     let marked = addr_of(flagged);
@@ -786,7 +793,7 @@ fn an_uncontended_priority_lock_takes_the_word_and_gives_it_back() {
             );
             assert_eq!(
                 theirs.load(Ordering::SeqCst),
-                0x1234,
+                47_277,
                 "a refused PI operation wrote to the word anyway"
             );
             // `FUTEX_TRYLOCK_PI` never sleeps, so it never reads the
@@ -946,7 +953,7 @@ fn a_requeue_wakes_the_count_it_was_given_and_moves_the_rest_to_the_word_it_name
     ];
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            nobody_is_woken_while_the_count_is_zero(sys, from).await;
+            the_waiters_have_time_to_park().await;
             assert_eq!(
                 futex(
                     sys,
@@ -1002,10 +1009,10 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let private = (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as usize;
-            // First: the word. One byte off and it is EFAULT.
+            // First: the word. One byte off and it is EINVAL.
             assert_eq!(
                 by_number(sys, [addr + 1, private, 1, 0, 0, 0]).await,
-                -(LxError::EFAULT as isize),
+                -(LxError::EINVAL as isize),
                 "the word is not the first argument"
             );
             assert_eq!(
@@ -1269,9 +1276,11 @@ fn a_contended_priority_lock_passes_the_word_from_its_owner_to_the_waiter() {
 fn a_contended_priority_lock_times_out_on_the_clock_its_command_chooses() {
     let proc = a_process(47_272, "futex-pi-clock");
     // One word per case: a lock that timed out leaves its mark behind.
-    let on_the_wall = addr_of(a_futex_word(0x1234));
-    let on_the_tick = addr_of(a_futex_word(0x1234));
-    let told_otherwise = addr_of(a_futex_word(0x1234));
+    // Held by a task that exists (another process), so the lock waits.
+    let _holder = a_process(47_278, "futex-pi-clock-holder");
+    let on_the_wall = addr_of(a_futex_word(47_278));
+    let on_the_tick = addr_of(a_futex_word(47_278));
+    let told_otherwise = addr_of(a_futex_word(47_278));
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let wall = Duration::from(TimeSpec::now());
@@ -1732,4 +1741,96 @@ fn a_shared_requeue_moves_its_waiters_somewhere_a_shared_wake_can_reach() {
         Ok(0),
         "the waiter that was moved and then woken"
     );
+}
+
+/// `attach_to_pi_owner`: a PI word held by a TID no task has is `ESRCH`, for
+/// a lock and a try alike; and `futex_requeue` refuses a count that is
+/// negative as an `int`.
+#[test]
+fn a_pi_word_held_by_nobody_is_esrch_and_a_negative_requeue_count_einval() {
+    let proc = a_process(47_276, "futex-dead-owner");
+    let dead = addr_of(a_futex_word(0x1234));
+    let from = addr_of(a_futex_word(0));
+    let to = addr_of(a_futex_word(0));
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            for op in [FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI] {
+                assert_eq!(
+                    futex(sys, dead, op | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
+                    Err(LxError::ESRCH),
+                    "op {:#x} on a word whose owner does not exist",
+                    op
+                );
+            }
+            assert_eq!(
+                futex(
+                    sys,
+                    from,
+                    FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG,
+                    u32::MAX,
+                    0,
+                    to,
+                    0
+                )
+                .await,
+                Err(LxError::EINVAL),
+                "a negative wake count"
+            );
+            assert_eq!(
+                futex(
+                    sys,
+                    from,
+                    FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG,
+                    1,
+                    u32::MAX as usize,
+                    to,
+                    0
+                )
+                .await,
+                Err(LxError::EINVAL),
+                "a negative requeue count"
+            );
+        })
+    });
+}
+
+/// `FUTEX_WAKE_OP` does its atomic step on the second word, wakes the first
+/// one's waiters, and the second one's when the old value passes the
+/// comparison. An operation Linux does not have is `ENOSYS`.
+#[test]
+fn a_wake_op_changes_the_second_word_atomically() {
+    let proc = a_process(47_279, "futex-wake-op");
+    let first = addr_of(a_futex_word(0));
+    let second_word = a_futex_word(5);
+    let second = addr_of(second_word);
+    // op ADD (1), cmp GT (4), oparg 1, cmparg 4.
+    let add_one_if_over_four = (1 << 28) | (4 << 24) | (1 << 12) | 4;
+    // Shifted SET: the word becomes 1 << 3.
+    let set_bit_three = (8 << 28) | (3 << 12);
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            const FUTEX_WAKE_OP: u32 = 5;
+            let op = FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG;
+            assert_eq!(
+                futex(sys, first, op, 1, 1, second, add_one_if_over_four).await,
+                Ok(0)
+            );
+            assert_eq!(second_word.load(Ordering::SeqCst), 6);
+            assert_eq!(
+                futex(sys, first, op, 1, 1, second, set_bit_three).await,
+                Ok(0)
+            );
+            assert_eq!(second_word.load(Ordering::SeqCst), 8);
+            // Operation 7 and comparison 9 are nobody's.
+            assert_eq!(
+                futex(sys, first, op, 1, 1, second, 7 << 28).await,
+                Err(LxError::ENOSYS)
+            );
+            assert_eq!(
+                futex(sys, first, op, 1, 1, second, 9 << 24).await,
+                Err(LxError::ENOSYS)
+            );
+            assert_eq!(second_word.load(Ordering::SeqCst), 8);
+        })
+    });
 }
