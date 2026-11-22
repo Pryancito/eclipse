@@ -44,6 +44,7 @@ use crate::net::{Msg, BUF_SIZE, FRAME_MAX, OP_RX, OP_TX, RX_BUFS, TX_BUFS, TX_HE
 use crate::zx::{Handle, Status};
 use crate::PAGE;
 
+pub mod ich;
 pub mod legacy;
 pub mod pch;
 
@@ -57,6 +58,10 @@ pub enum Part {
     /// An 82573: an M88 PHY whose MDIO the firmware hands over
     /// ([`legacy`]).
     E82573,
+    /// The MAC of an ICH8 chipset ([`ich`]).
+    Ich8,
+    /// The MAC of an ICH9 or ICH10 chipset ([`ich`]).
+    Ich9,
     /// A PCH part before Sunrise Point: 82579 (PCH2), I217 and I218 (LPT).
     Pch,
     /// Sunrise Point and later: every I219. Its queues have to be enabled
@@ -85,6 +90,12 @@ impl Part {
             0x105e | 0x10a4 | 0x10bc | 0x10d5 | 0x107d | 0x10b9 => Some(Part::E82571),
             // 82573V, E, L.
             0x108b | 0x108c | 0x109a => Some(Part::E82573),
+            // ICH8: IGP3 (M_AMT, AMT, C, M), IFE (IFE, GT, G).
+            0x1049 | 0x104a | 0x104b | 0x104d | 0x104c | 0x10c4 | 0x10c5 => Some(Part::Ich8),
+            // ICH9: IGP (AMT, C, M, M_AMT, M_V), IFE (IFE, GT, G), BM;
+            // ICH10: R_BM (LM, LF, V), D_BM (LM, LF, V).
+            0x10bd | 0x294c | 0x10bf | 0x10f5 | 0x10cb | 0x10c0 | 0x10c3 | 0x10c2 | 0x10e5
+            | 0x10cc | 0x10cd | 0x10ce | 0x10de | 0x10df | 0x1525 => Some(Part::Ich9),
             // 82579LM/V; I217-LM/V; I218-LM/V and the LPT-LP ones.
             0x1502 | 0x1503 | 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 => {
                 Some(Part::Pch)
@@ -115,6 +126,11 @@ impl Part {
         matches!(self, Part::Pch | Part::PchSpt)
     }
 
+    /// An ICH8, ICH9 or ICH10 MAC: brought up by [`ich`].
+    pub fn is_ich(self) -> bool {
+        matches!(self, Part::Ich8 | Part::Ich9)
+    }
+
     /// An 82571, 82572 or 82573: brought up by [`legacy`].
     pub fn is_legacy(self) -> bool {
         matches!(self, Part::E82571 | Part::E82573)
@@ -122,7 +138,7 @@ impl Part {
 
     /// How much of the window bringing it up needs.
     pub fn regs_span(self) -> usize {
-        if self.is_pch() {
+        if self.is_pch() || self.is_ich() {
             pch::REGS_SPAN
         } else {
             REGS_SPAN
@@ -593,6 +609,16 @@ impl Taker {
             println!("e1000e: link down");
             return;
         }
+        if self.part.is_ich() {
+            let link = ich::on_link_up(&self.regs, status);
+            println!(
+                "e1000e: link up, {} Mb/s {} duplex, flow control {:?}",
+                link.speed,
+                if link.full_duplex { "full" } else { "half" },
+                link.pause
+            );
+            return;
+        }
         if !self.part.is_pch() {
             let speed = pch::speed_of(status);
             legacy::on_link_up(&self.regs, self.part, speed);
@@ -754,7 +780,7 @@ fn reset_discrete(regs: Regs) -> Result<(), String> {
     Ok(())
 }
 
-/// The address of a PCH part: what the reset loaded into the first receive
+/// The address of a PCH or ICH part: what the reset loaded into the first receive
 /// address, or else the NVM's, or else one made up (locally administered)
 /// so that the card works at all, as the kernel's driver does.
 fn mac_of_pch(regs: Regs, part: Part) -> [u8; 6] {
@@ -796,6 +822,11 @@ pub unsafe fn bring_up(
         regs.write(pch::WUC, 0);
         regs.write(pch::WUFC, 0);
         mac
+    } else if part.is_ich() {
+        let report = ich::reset(&regs, part)?;
+        println!("e1000e: {report:?}");
+        // No EERD on an ICH: that offset is another register there.
+        mac_of_pch(regs, part)
     } else if part.is_legacy() {
         let report = legacy::reset(&regs, part)?;
         println!("e1000e: {report:?}");

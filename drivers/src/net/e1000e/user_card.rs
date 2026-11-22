@@ -22,7 +22,8 @@ fn user_driver_takes(device_id: u16) -> bool {
 }
 
 /// The parts only the userspace driver drives, which this kernel's e1000e
-/// does not: the copper 82571, 82572 and 82573 (Linux `82571.c`). They are
+/// does not: the copper 82571, 82572 and 82573 (Linux `82571.c`), and the
+/// MACs of the ICH8, ICH9 and ICH10 chipsets (`ich8lan.c`). They are
 /// matched here so that they are counted and left to it; with no driver
 /// in userspace for them (a second card, `unetcard=kernel`) nobody drives
 /// them, as before.
@@ -30,6 +31,12 @@ pub(super) fn userspace_only(device_id: u16) -> bool {
     matches!(
         device_id,
         0x105e | 0x10a4 | 0x10bc | 0x10d5 | 0x107d | 0x10b9 | 0x108b | 0x108c | 0x109a
+            // ICH8.
+            | 0x1049 | 0x104a | 0x104b | 0x104c | 0x104d | 0x10c4 | 0x10c5
+            // ICH9.
+            | 0x10bd | 0x294c | 0x10bf | 0x10f5 | 0x10cb | 0x10c0 | 0x10c3 | 0x10c2 | 0x10e5
+            // ICH10.
+            | 0x10cc | 0x10cd | 0x10ce | 0x10de | 0x10df | 0x1525
     )
 }
 
@@ -103,7 +110,7 @@ mod tests {
         for id in [0x10d3, 0x10f6, 0x150c, 0x15b8, 0x153a, 0x1502] {
             assert!(user_driver_unasked(id), "{:#x}", id);
         }
-        assert!(!user_driver_unasked(0x10f5));
+        assert!(!user_driver_unasked(0x1533));
     }
 
     #[test]
@@ -113,13 +120,13 @@ mod tests {
         ] {
             assert!(user_driver_takes(id), "{:#x}", id);
         }
-        // The copper 82571, 82572 and 82573: the userspace driver's only.
-        for id in [0x105e, 0x10b9, 0x108c] {
+        // The copper 82571, 82572 and 82573 and the ICHs: the userspace
+        // driver's only.
+        for id in [0x105e, 0x10b9, 0x108c, 0x1049, 0x10f5, 0x1525] {
             assert!(user_driver_takes(id) && userspace_only(id), "{:#x}", id);
         }
         assert!(!userspace_only(0x15b8));
-        // ICH9 and an I210 (igb): no driver of ours.
-        assert!(!user_driver_takes(0x10f5));
+        // An I210 (igb): no driver of ours.
         assert!(!user_driver_takes(0x1533));
     }
 }

@@ -189,8 +189,7 @@ fn every_i219_and_pch_id_the_kernel_takes_is_a_part_here() {
     }
     // A kernel that does not say only ever left the 82574.
     assert_eq!(Part::of(0), Some(Part::Discrete));
-    // ICH9, an I210 (igb), and the right device from another vendor.
-    assert_eq!(Part::of(0x8086_10f5), None);
+    // An I210 (igb), and the right device from another vendor.
     assert_eq!(Part::of(0x8086_1533), None);
     assert_eq!(Part::of(0x10ec_15b8), None);
 }

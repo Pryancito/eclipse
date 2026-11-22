@@ -192,7 +192,7 @@ const HSFSTS_FLCINPROG: u32 = 1 << 5;
 const HSFSTS_FLDESVALID: u32 = 1 << 14;
 const FLASH_LINEAR_ADDR_MASK: u32 = 0x00ff_ffff;
 
-fn flush<H: Hw>(hw: &H) {
+pub(super) fn flush<H: Hw>(hw: &H) {
     let _ = hw.rd(STATUS);
 }
 
@@ -227,10 +227,10 @@ pub(super) fn mdic_write<H: Hw>(hw: &H, phy: u8, reg: u32, value: u16) -> bool {
 /// The SW/FW semaphore, held until dropped (Linux
 /// `e1000_acquire_swflag_ich8lan`): wait up to 100 ms for the ME to let go
 /// of it, then up to a second for the bit to stick.
-struct Swflag<'a, H: Hw>(&'a H);
+pub(super) struct Swflag<'a, H: Hw>(&'a H);
 
 impl<'a, H: Hw> Swflag<'a, H> {
-    fn take(hw: &'a H) -> Option<Self> {
+    pub(super) fn take(hw: &'a H) -> Option<Self> {
         let mut free = false;
         for _ in 0..100 {
             if hw.rd(EXTCNF_CTRL) & EXTCNF_CTRL_SWFLAG == 0 {
@@ -393,7 +393,7 @@ fn toggle_lanphypc<H: Hw>(hw: &H, part: Part) {
 
 /// Stop the card mastering the bus before its reset (Linux
 /// `e1000e_disable_pcie_master`): whether it stopped within 80 ms.
-fn disable_pcie_master<H: Hw>(hw: &H) -> bool {
+pub(super) fn disable_pcie_master<H: Hw>(hw: &H) -> bool {
     hw.wr(CTRL, hw.rd(CTRL) | CTRL_GIO_MASTER_DISABLE);
     for _ in 0..800 {
         if hw.rd(STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
@@ -475,7 +475,7 @@ fn configure_k1<H: Hw>(hw: &H, enable: bool) -> bool {
 /// The Kumeran half of Linux `e1000_setup_copper_link_ich8lan`: the longest
 /// wait between PHY polls and the in-band parameter floor ("fixes erroneous
 /// timeouts at 10Mbps").
-fn kmrn_copper_timeouts<H: Hw>(hw: &H) {
+pub(super) fn kmrn_copper_timeouts<H: Hw>(hw: &H) {
     if let Some(flag) = Swflag::take(hw) {
         flag.kmrn_write(KMRN_TIMEOUTS, 0xffff);
         let inband = flag.kmrn_read(KMRN_INBAND_PARAM);
@@ -503,8 +503,14 @@ fn flow_control<H: Hw>(hw: &H) {
 /// auto-negotiation. Bits are only added: firmware or a previous OS may
 /// have taken gigabit away, and a restart alone does not give it back.
 fn restart_autoneg<H: Hw>(hw: &H) -> Option<u8> {
+    restart_autoneg_at(hw, &[2, 1])
+}
+
+/// [`restart_autoneg`] at the first of `phys` that answers, under the
+/// SW/FW semaphore.
+pub(super) fn restart_autoneg_at<H: Hw>(hw: &H, phys: &[u8]) -> Option<u8> {
     let _flag = Swflag::take(hw)?;
-    for phy in [2, 1] {
+    for &phy in phys {
         let Some(bmcr) = mdic_read(hw, phy, MII_BMCR) else {
             continue;
         };
@@ -806,16 +812,27 @@ pub fn on_link_up<H: Hw>(hw: &H, part: Part, status: u32) -> Link {
     if want != f4 {
         hw.wr(FEXTNVM4, want);
     }
-    let mut link = Link {
-        speed,
-        full_duplex,
-        pause: None,
-        phy_says: None,
-    };
+    resolve_pause(
+        hw,
+        &[2, 1],
+        Link {
+            speed,
+            full_duplex,
+            pause: None,
+            phy_says: None,
+        },
+    )
+}
+
+/// Flow control resolved against what the partner advertised, read from
+/// the first of `phys` that answers, into `CTRL`; and what that PHY says
+/// was negotiated, when it is not what `link` (the MAC's `STATUS`) says.
+pub(super) fn resolve_pause<H: Hw>(hw: &H, phys: &[u8], mut link: Link) -> Link {
     let Some(_flag) = Swflag::take(hw) else {
         return link;
     };
-    for phy in [2, 1] {
+    let (speed, full_duplex) = (link.speed, link.full_duplex);
+    for &phy in phys {
         let Some(bmsr) = mdic_read(hw, phy, MII_BMSR).filter(|&b| b != 0xffff) else {
             continue;
         };
