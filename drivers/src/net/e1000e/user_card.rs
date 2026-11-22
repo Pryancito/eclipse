@@ -21,12 +21,13 @@ fn user_driver_takes(device_id: u16) -> bool {
     super::e1000e_device_matched(device_id)
 }
 
-/// Whether it goes to userspace with no word on the command line: only the
-/// parts that driver has run on, the 82574L and 82574LA of QEMU. A real
-/// 82583 or PCH part stays the kernel's (lent to the stack process) until
-/// someone has seen the userspace driver bring one up.
+/// Whether it goes to userspace with no word on the command line: every
+/// part its driver there takes. The PCH parts and the 82583 have only been
+/// run against a pretend card (QEMU has none of them), so a boot that
+/// finds that driver wanting goes back with `unetcard=kernel`: the kernel
+/// drives the card and lends it to the stack process, as before.
 fn user_driver_unasked(device_id: u16) -> bool {
-    matches!(device_id, 0x10d3 | 0x10f6)
+    user_driver_takes(device_id)
 }
 
 /// Whether the machine has a virtio network card on PCI: the card the
@@ -86,12 +87,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_82574_goes_to_the_userspace_driver_unasked() {
-        assert!(user_driver_unasked(0x10d3));
-        assert!(user_driver_unasked(0x10f6));
-        // An I219-V and an 82583V: the kernel keeps them unless asked.
-        assert!(!user_driver_unasked(0x15b8));
-        assert!(!user_driver_unasked(0x150c));
+    fn every_part_the_userspace_driver_takes_goes_to_it_unasked() {
+        for id in [0x10d3, 0x10f6, 0x150c, 0x15b8, 0x153a, 0x1502] {
+            assert!(user_driver_unasked(id), "{:#x}", id);
+        }
+        assert!(!user_driver_unasked(0x10f5));
     }
 
     #[test]

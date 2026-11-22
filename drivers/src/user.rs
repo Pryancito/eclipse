@@ -36,8 +36,9 @@ use spin::{Mutex, Once};
 pub const VIRTIO_BLK: &str = "virtio-blk";
 /// A virtio network card.
 pub const VIRTIO_NET: &str = "virtio-net";
-/// An Intel 82574 network card (QEMU's `e1000e`), which the kernel drives
-/// itself unless `udriver=e1000e@N` asks for it.
+/// An Intel e1000e network card (QEMU's 82574, an 82583, a PCH part such
+/// as an I219): the first one is userspace's on x86_64 unless the boot
+/// says `unetcard=kernel`, the others only if `udriver=e1000e@N` asks.
 pub const E1000E: &str = "e1000e";
 /// An NVMe controller, always left to userspace: the kernel has no
 /// driver for it.
@@ -481,7 +482,7 @@ pub fn e1000e_unasked(spec: Option<&str>) -> bool {
 pub fn leave_first_e1000e(spec: Option<&str>) {
     if e1000e_unasked(spec) {
         info!(
-            "udriver: e1000e #0, if it is an 82574 and there is no virtio card, is for userspace"
+            "udriver: e1000e #0, if its userspace driver takes it and there is no virtio card, is for userspace"
         );
         E1000E_UNASKED.store(true, Ordering::Release);
     }

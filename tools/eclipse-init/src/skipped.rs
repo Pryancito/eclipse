@@ -136,7 +136,7 @@ pub fn why(device: &str, bus: &[Pci]) -> Why {
     }
     match kind {
         "e1000e" => Why::KernelDrives(format!(
-            "the kernel drives the network card itself ({}); the userspace e1000e driver takes only the 82574",
+            "the kernel drives the network card itself ({}): the userspace e1000e driver does not take it, or the boot said 'unetcard=kernel'",
             ids(&found)
         )),
         "xhci" => Why::KernelDrives(format!(
