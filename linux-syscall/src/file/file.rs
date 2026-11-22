@@ -419,6 +419,10 @@ impl Syscall<'_> {
         let waits = self.waits_for_room(&file_like);
         let dsp = blocking_dsp(&file_like);
         let tty = console_tty(&file_like);
+        // A disk's node: written asleep, see `File::write_asleep`.
+        let disk = file_like
+            .downcast_ref::<linux_object::fs::File>()
+            .filter(|file| file.is_block_dev());
         // The bytes are copied into kernel memory before the file sees them;
         // see `Staging` for the deadlock that a raw user slice caused here.
         let mut staging = Staging::new(chunk_size)?;
@@ -458,7 +462,13 @@ impl Syscall<'_> {
                 .and_then(|i| i.as_any_ref().downcast_ref::<DspDev>())
             {
                 Some(dsp) => dsp.write_pcm_sleeping(chunk).await,
-                None => file_like.write(chunk),
+                None => match disk {
+                    Some(file) => match file.write_asleep(chunk).await {
+                        Some(res) => res,
+                        None => file_like.write(chunk),
+                    },
+                    None => file_like.write(chunk),
+                },
             };
             let res = res.inspect_err(|&e| {
                 if e == LxError::EBADF {

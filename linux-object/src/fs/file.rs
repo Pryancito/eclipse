@@ -1542,14 +1542,61 @@ impl File {
             (inner.flags, inner.inode.clone())
         };
         let dev = inode.downcast_ref::<super::devfs::BlockDev>()?;
-        let write = dev.write_at_async(offset as usize, buf)?;
-        if !flags.writable() {
-            return Some(Err(LxError::EBADF));
-        }
-        let written = write.await.map_err(LxError::from);
+        // Whole sectors in one transfer; anything else (a GPT header, an odd
+        // `dd bs`) as the read-modify-write, asleep all the same: the
+        // synchronous `write_at` waits with this file's lock held.
+        let written = if let Some(write) = dev.write_at_async(offset as usize, buf) {
+            if !flags.writable() {
+                return Some(Err(LxError::EBADF));
+            }
+            write.await
+        } else {
+            let write = dev.write_at_partial_async(offset as usize, buf)?;
+            if !flags.writable() {
+                return Some(Err(LxError::EBADF));
+            }
+            write.await
+        };
+        let written = written.map_err(LxError::from);
         if let Ok(n) = written {
             // As after `write_at`: the mappings of the node see the write.
             cache_overlay_write(&inode, offset as usize, &buf[..n]);
+        }
+        Some(written)
+    }
+
+    /// Whether this is the node of a disk (`/dev/nvme0n1`, a partition of
+    /// one): what `write(2)` asks once, before it tries
+    /// [`write_asleep`](Self::write_asleep) on every chunk.
+    pub fn is_block_dev(&self) -> bool {
+        self.inner
+            .read()
+            .inode
+            .downcast_ref::<super::devfs::BlockDev>()
+            .is_some()
+    }
+
+    /// `write` on the node of a disk served by a process, at the file's
+    /// offset, asleep as [`write_at_asleep`](Self::write_at_asleep) is:
+    /// `None` for everything else, which is written with
+    /// [`write`](FileLike::write).
+    ///
+    /// `write` itself waits for the disk with the file's lock held, which
+    /// is the hazard `block_serve` warns about. The offset is read, the
+    /// lock let go for the wait, and the offset set after it, as Linux
+    /// leaves a disk's (no `FMODE_ATOMIC_POS` but on files and
+    /// directories). `O_APPEND` keeps the synchronous path.
+    pub async fn write_asleep(&self, buf: &[u8]) -> Option<LxResult<usize>> {
+        let (append, offset) = {
+            let inner = self.inner.read();
+            (inner.flags.is_append(), inner.offset)
+        };
+        if append {
+            return None;
+        }
+        let written = self.write_at_asleep(offset, buf).await?;
+        if let Ok(n) = written {
+            self.inner.write().offset = offset + n as u64;
         }
         Some(written)
     }

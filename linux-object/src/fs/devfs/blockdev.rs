@@ -82,6 +82,81 @@ impl BlockDev {
         Some(async move { write.await.map(|()| len).map_err(convert_error) })
     }
 
+    /// `write_at`, as a future, for a write that does not start or end on a
+    /// sector: the read-modify-write of `write_at` with every transfer
+    /// awaited. `None` when the disk has no asynchronous path (only a disk
+    /// served by a process has one), which sends the caller to `write_at`.
+    ///
+    /// Without it such a write -- the installer's GPT header, a `dd` with an
+    /// odd `bs` -- waited for the driver's process inside `write_at`, under
+    /// the open file's lock: the hazard `block_serve` warns about, since a
+    /// task spinning on that lock meanwhile keeps the driver from running.
+    pub fn write_at_partial_async<'a>(
+        &'a self,
+        offset: usize,
+        buf: &'a [u8],
+    ) -> Option<impl core::future::Future<Output = Result<usize>> + 'a> {
+        const BS: usize = 512;
+        // A disk with an asynchronous flush answers everything that way.
+        if buf.is_empty() || self.block.flush_async().is_none() {
+            return None;
+        }
+        Some(async move {
+            let mut sector = [0u8; BS];
+            let mut done = 0usize;
+
+            // Partial leading sector.
+            let head_off = offset % BS;
+            if head_off != 0 {
+                let take = buf.len().min(BS - head_off);
+                let block_id = offset / BS;
+                self.read_blocks_async(block_id, &mut sector).await?;
+                sector[head_off..head_off + take].copy_from_slice(&buf[..take]);
+                self.write_blocks_async(block_id, &sector).await?;
+                done += take;
+            }
+
+            // Whole-sector middle: one transfer, straight from `buf`.
+            let mid = ((buf.len() - done) / BS) * BS;
+            if mid > 0 {
+                self.write_blocks_async((offset + done) / BS, &buf[done..done + mid])
+                    .await?;
+                done += mid;
+            }
+
+            // Partial trailing sector.
+            if done < buf.len() {
+                let take = buf.len() - done;
+                let block_id = (offset + done) / BS;
+                self.read_blocks_async(block_id, &mut sector).await?;
+                sector[..take].copy_from_slice(&buf[done..]);
+                self.write_blocks_async(block_id, &sector).await?;
+                done += take;
+            }
+            Ok(done)
+        })
+    }
+
+    /// One awaited read on a disk known to read asynchronously: `None` from
+    /// it is a partition's range check, which `read_block` answers with
+    /// `InvalidParam` too.
+    async fn read_blocks_async(&self, block_id: usize, buf: &mut [u8]) -> Result<()> {
+        let read = self
+            .block
+            .read_block_async(block_id, buf)
+            .ok_or(FsError::InvalidParam)?;
+        read.await.map_err(convert_error)
+    }
+
+    /// The write that goes with [`read_blocks_async`](Self::read_blocks_async).
+    async fn write_blocks_async(&self, block_id: usize, buf: &[u8]) -> Result<()> {
+        let write = self
+            .block
+            .write_block_async(block_id, buf)
+            .ok_or(FsError::InvalidParam)?;
+        write.await.map_err(convert_error)
+    }
+
     /// `fsync` on the node, as a future, when the disk has one.
     pub fn sync_async(&self) -> Option<impl core::future::Future<Output = Result<()>> + '_> {
         let flush = self.block.flush_async()?;
@@ -1801,6 +1876,89 @@ mod tests {
         // The sleeping read leaves both to the one above.
         assert!(dev.read_at_async(4096, &mut buf).is_none());
         assert!(dev.read_at_async(3584, &mut buf).is_none());
+    }
+
+    /// A disk that answers only asynchronously, as a served one does: its
+    /// synchronous calls fail, so a test passes only if nothing waits on
+    /// them.
+    struct AsyncDisk {
+        data: Mutex<Vec<u8>>,
+    }
+
+    impl Scheme for AsyncDisk {
+        fn name(&self) -> &str {
+            "async"
+        }
+    }
+
+    impl BlockScheme for AsyncDisk {
+        fn read_block(&self, _block_id: usize, _buf: &mut [u8]) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn write_block(&self, _block_id: usize, _buf: &[u8]) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn flush(&self) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn read_block_async<'a>(
+            &'a self,
+            block_id: usize,
+            buf: &'a mut [u8],
+        ) -> Option<zcore_drivers::scheme::BlockReadFuture<'a>> {
+            Some(alloc::boxed::Box::pin(async move {
+                let data = self.data.lock();
+                let off = block_id * 512;
+                buf.copy_from_slice(&data[off..off + buf.len()]);
+                Ok(())
+            }))
+        }
+        fn write_block_async<'a>(
+            &'a self,
+            block_id: usize,
+            buf: &'a [u8],
+        ) -> Option<zcore_drivers::scheme::BlockReadFuture<'a>> {
+            assert!(buf.len().is_multiple_of(512), "whole sectors only");
+            Some(alloc::boxed::Box::pin(async move {
+                let mut data = self.data.lock();
+                let off = block_id * 512;
+                data[off..off + buf.len()].copy_from_slice(buf);
+                Ok(())
+            }))
+        }
+        fn flush_async(&self) -> Option<zcore_drivers::scheme::BlockReadFuture<'_>> {
+            Some(alloc::boxed::Box::pin(async { Ok(()) }))
+        }
+        fn block_count(&self) -> usize {
+            self.data.lock().len() / 512
+        }
+    }
+
+    #[test]
+    fn a_partial_write_to_a_served_disk_is_awaited() {
+        let disk = Arc::new(AsyncDisk {
+            data: Mutex::new((0..8 * 512).map(|i| (i % 251) as u8).collect()),
+        });
+        let dev = BlockDev::new(0, disk.clone(), String::from("async"));
+        let before = disk.data.lock().clone();
+        // Head, middle and tail: from byte 100 of sector 0 to byte 92 of
+        // sector 3 (a GPT header's 92 bytes end the same way).
+        let buf: Vec<u8> = (0..1016).map(|i| 0x80 | (i % 64) as u8).collect();
+        // Not whole sectors: the sector-aligned path declines it.
+        assert!(dev.write_at_async(100, &buf).is_none());
+        let n = async_std::task::block_on(dev.write_at_partial_async(100, &buf).unwrap());
+        assert_eq!(n.unwrap(), 1016);
+        let after = disk.data.lock().clone();
+        assert_eq!(&after[..100], &before[..100], "the head's untouched bytes stay");
+        assert_eq!(&after[100..1116], &buf[..]);
+        assert_eq!(&after[1116..], &before[1116..], "the tail's untouched bytes stay");
+        // Inside one sector.
+        let n = async_std::task::block_on(dev.write_at_partial_async(2050, &[1, 2, 3]).unwrap());
+        assert_eq!(n.unwrap(), 3);
+        assert_eq!(&disk.data.lock()[2049..2054], &[before[2049], 1, 2, 3, before[2053]]);
+        // A disk with no asynchronous path keeps the synchronous one.
+        let fake = BlockDev::new(0, FakeDisk::new(512, 8).into_scheme(), String::from("fake"));
+        assert!(fake.write_at_partial_async(100, &buf).is_none());
     }
 }
 
