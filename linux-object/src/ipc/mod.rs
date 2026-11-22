@@ -256,6 +256,9 @@ impl Clone for SemProc {
     }
 }
 
+/// `SEMVMX` (`include/uapi/linux/sem.h`), the most a semaphore holds.
+const SEMVMX: isize = 32767;
+
 /// Auto perform semaphores undo on drop
 ///
 /// This runs while a process is being torn down, which is the worst possible
@@ -294,7 +297,10 @@ impl Drop for SemProc {
             // held for ever by a process that no longer exists, which is the
             // exact failure `SEM_UNDO` is for.
             let _atomic = sem_array.semop_guard();
-            sem.adjust(adj as isize);
+            // `exit_sem`: the result is clamped to `[0, SEMVMX]`. A `SETVAL`
+            // that lowered the semaphore after this process's `semop` left
+            // it negative here before.
+            sem.undo(adj as isize, SEMVMX);
         }
     }
 }

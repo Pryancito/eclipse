@@ -262,6 +262,16 @@ impl Semaphore {
         inner.store(count);
     }
 
+    /// Apply a `SEM_UNDO` adjustment at exit, clamped as `exit_sem` clamps
+    /// it: never below 0 and never above `max` (`SEMVMX`). A plain
+    /// [`adjust`](Self::adjust) could leave a semaphore negative after a
+    /// `SETVAL` took it below what the exiting process had added.
+    pub fn undo(&self, delta: isize, max: isize) {
+        let mut inner = self.lock.lock();
+        let count = inner.count.saturating_add(delta).clamp(0, max);
+        inner.store(count);
+    }
+
     /// Set the current count.
     ///
     /// Used by `semctl(SETVAL/SETALL)` and by the `semop` apply. It CLEARS
@@ -474,6 +484,16 @@ mod tests {
         assert_eq!(sem.get(), 1);
         sem.acquire().await.unwrap();
         assert_eq!(sem.get(), 0);
+    }
+
+    #[test]
+    fn an_undo_at_exit_is_clamped_to_the_range_a_semaphore_has() {
+        let sem = Semaphore::new(1);
+        sem.undo(-3, 32767);
+        assert_eq!(sem.get(), 0);
+        sem.set(32760);
+        sem.undo(100, 32767);
+        assert_eq!(sem.get(), 32767);
     }
 
     #[async_std::test]

@@ -322,34 +322,43 @@ fn a_queue_made_by_one_process_carries_a_message_to_another() {
     });
 }
 
-/// `msgsnd` judges the size before it reads the message, and reads the
-/// message before it looks the id up.
+/// `msgsnd` reads the type first (`ksys_msgsnd`'s `get_user`), then judges
+/// the size, then reads the text, and only then looks the id up.
 ///
-/// Both of the first two refusals are answered with a null pointer, and the
-/// third call shows that pointer would be `EFAULT` if it were read first. The
-/// id coming last is the other half: a message too big is refused whatever
-/// queue it was aimed at, and a bad pointer is `EFAULT` even for an id that
-/// names nothing.
+/// A null message is `EFAULT` whatever size it claims; a readable one past
+/// `MSGMAX` is `EINVAL` whatever queue it was aimed at; and a bad pointer is
+/// `EFAULT` even for an id that names nothing.
 #[test]
-fn the_size_of_a_message_is_judged_before_the_message_is_read() {
+fn the_type_is_read_then_the_size_judged_then_the_message_read() {
     const MINE: usize = KEY + 3;
     let proc = a_process(47_322, "msgsnd-order");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let id = msgget(sys, MINE, CREAT | EVERYBODY).unwrap();
-            let nothing = AMessage::new(0, [0; A_PAYLOAD]);
+            let nothing = AMessage::new(1, [0; A_PAYLOAD]);
             // A message at address zero, which is the one address `UserInPtr`
             // refuses on its own.
             let at_nothing = |sz, flg| sys.sys_msgsnd(id, 0, sz, flg);
 
             assert_eq!(
                 at_nothing(linux_object::ipc::MSGMAX + 1, 0).await,
+                Err(LxError::EFAULT),
+                "the type is read before the size is judged"
+            );
+            assert_eq!(
+                sys.sys_msgsnd(id, nothing.at(), linux_object::ipc::MSGMAX + 1, 0)
+                    .await,
                 Err(LxError::EINVAL),
                 "a message past MSGMAX was not EINVAL"
             );
             assert_eq!(
-                sys.sys_msgsnd(NO_SUCH_QUEUE, 0, linux_object::ipc::MSGMAX + 1, 0)
-                    .await,
+                sys.sys_msgsnd(
+                    NO_SUCH_QUEUE,
+                    nothing.at(),
+                    linux_object::ipc::MSGMAX + 1,
+                    0
+                )
+                .await,
                 Err(LxError::EINVAL),
                 "the size is judged before the id, so this is the same answer"
             );

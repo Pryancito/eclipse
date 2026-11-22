@@ -872,3 +872,35 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
         })
     });
 }
+
+/// `semctl` in Linux's order for the two commands that check something
+/// before the set is found: `SETVAL` judges its value (`ERANGE`) and then,
+/// once the set is found, its semaphore number before the permissions;
+/// `IPC_SET` copies its buffer in (`EFAULT`) before the id is looked up.
+#[test]
+fn setval_and_ipc_set_check_their_argument_before_the_set() {
+    const SETVAL: usize = 16;
+    const IPC_SET: usize = 1;
+    let proc = a_process(47_299, "semctl-order");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let id = semget(sys, KEY + 99, 1, CREAT | 0o600).unwrap();
+            assert_eq!(
+                sys.sys_semctl(NO_SUCH_SET, 0, SETVAL, 40_000),
+                Err(LxError::ERANGE)
+            );
+            assert_eq!(
+                sys.sys_semctl(NO_SUCH_SET, 0, IPC_SET, 0),
+                Err(LxError::EFAULT)
+            );
+            // Somebody who may not write the set: the number is still
+            // judged first.
+            acting_as(sys, 1000, 1000, &[]);
+            assert_eq!(
+                sys.sys_semctl(id, NO_SUCH_SEMAPHORE as usize, SETVAL, 1),
+                Err(LxError::EINVAL)
+            );
+            assert_eq!(sys.sys_semctl(id, 0, SETVAL, 1), Err(LxError::EACCES));
+        })
+    });
+}
