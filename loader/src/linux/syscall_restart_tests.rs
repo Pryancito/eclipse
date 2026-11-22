@@ -342,7 +342,11 @@ fn the_six_argument_registers_are_read_in_abi_order() {
     assert_eq!(syscall_args(&ctx), SIX);
 }
 
-const NANOSLEEP: usize = if cfg!(target_arch = "x86_64") { 35 } else { 101 };
+const NANOSLEEP: usize = if cfg!(target_arch = "x86_64") {
+    35
+} else {
+    101
+};
 const RESTART_SYSCALL: usize = if cfg!(target_arch = "x86_64") {
     219
 } else {

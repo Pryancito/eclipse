@@ -213,12 +213,11 @@ pub(crate) async fn sleep_or_eintr(
                 // runs before the thread goes on, the loader makes
                 // `restart_syscall` instead of the sleep, and that one sleeps
                 // to this same end (`Syscall::sys_restart_syscall`).
-                thread.lock_linux().restart_sleep =
-                    Some(linux_object::thread::SleepRestart {
-                        deadline,
-                        rem: rem.as_addr(),
-                        abi32,
-                    });
+                thread.lock_linux().restart_sleep = Some(linux_object::thread::SleepRestart {
+                    deadline,
+                    rem: rem.as_addr(),
+                    abi32,
+                });
                 // `abi32`, and not a `Syscall` to ask, because this is a free
                 // helper: the remainder is a `struct timespec` and so half as
                 // wide to a 32-bit caller. See [`crate::narrow`].

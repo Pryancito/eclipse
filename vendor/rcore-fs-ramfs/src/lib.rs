@@ -47,7 +47,9 @@ pub fn set_clock(clock: fn() -> Timespec) {
 
 /// The time now, or 0 when no clock was set.
 fn now() -> Timespec {
-    CLOCK.get().map_or(Timespec { sec: 0, nsec: 0 }, |clock| clock())
+    CLOCK
+        .get()
+        .map_or(Timespec { sec: 0, nsec: 0 }, |clock| clock())
 }
 
 /// How long an access time may lag behind before a read moves it again,
