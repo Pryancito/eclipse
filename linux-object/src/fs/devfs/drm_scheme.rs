@@ -1812,6 +1812,25 @@ impl DrmDev {
                 // the panel's.
                 let panel = drm::is_panel_node(self.minor);
                 if let Some(area) = active_area {
+                    if panel && drm::needs_modeset(area.0, area.1) {
+                        // A mode the panel is not at goes to a driver that
+                        // does real modesets (nvkms), and its refusal is the
+                        // caller's EINVAL. Without one the legacy path keeps
+                        // what it always did: the fb shown in the firmware's
+                        // mode, cropped to the active area.
+                        let hz = DrmModeModeinfo::from_bytes(&req.mode).vrefresh;
+                        let set = drm::set_mode(area.0, area.1, hz, fb_id, false);
+                        if let Err(why @ drm::ModeRefused::Driver(_)) = set {
+                            kernel_hal::klog_warn!(
+                                "[drm] SETCRTC {}x{}@{}: {:?}",
+                                area.0,
+                                area.1,
+                                hz,
+                                why
+                            );
+                            return Err(FsError::InvalidParam);
+                        }
+                    }
                     if panel {
                         drm::set_vblank_period_from_modeinfo(&req.mode);
                     }
@@ -1916,7 +1935,7 @@ impl DrmDev {
                     ) {
                         return Err(FsError::NoDeviceSpace);
                     }
-                } else if let Some((w, h, _)) = drm::display_mode() {
+                } else if let Some((w, h)) = drm::panel_mode() {
                     if fb.width < w || fb.height < h {
                         return Err(FsError::NoDeviceSpace);
                     }
@@ -2767,8 +2786,25 @@ impl DrmDev {
                     }
                     conn_res.count_encoders = 1;
 
-                    // Report exactly one mode: the display's native resolution.
-                    if let Some((w, h, _)) = drm::display_mode() {
+                    // The monitor's own modes when the driver can set them
+                    // (nvkms), else exactly one: the firmware's.
+                    let modes = drm::driver_modes();
+                    if !modes.is_empty() {
+                        let n = modes.len();
+                        if conn_res.count_modes as usize >= n {
+                            ucheck(conn_res.modes_ptr as usize, n * 68)?;
+                            for (i, m) in modes.iter().enumerate() {
+                                let info = modeinfo::make_modeinfo_for(m);
+                                unsafe {
+                                    ucopy_out(
+                                        (conn_res.modes_ptr as usize + i * 68) as u64,
+                                        &info[..],
+                                    )
+                                };
+                            }
+                        }
+                        conn_res.count_modes = n as u32;
+                    } else if let Some((w, h, _)) = drm::display_mode() {
                         if conn_res.count_modes >= 1 {
                             let mode = make_modeinfo(w, h);
                             ucheck(conn_res.modes_ptr as usize, mode.len())?;
@@ -2884,8 +2920,8 @@ impl DrmDev {
                     crtc_res.x = crtc.x;
                     crtc_res.y = crtc.y;
                     crtc_res.gamma_size = CRTC_GAMMA_SIZE;
-                    match drm::display_mode() {
-                        Some((w, h, _)) if enabled => {
+                    match drm::panel_mode() {
+                        Some((w, h)) if enabled => {
                             let (st, _) = drm::atomic_snapshot();
                             let committed = drm::get_blob(st.mode_blob_id).and_then(|b| {
                                 let mut m = [0u8; 68];

@@ -70,6 +70,31 @@ pub(super) fn make_modeinfo_with(w: u32, h: u32, panel: Option<&edid::DetailedTi
     m
 }
 
+/// The `drm_mode_modeinfo` of one mode a driver that does real modesets
+/// lists (nvkms). The firmware's mode keeps the panel's own timing; the
+/// others get the nominal porches at their refresh rate, which is all a
+/// client reads back from them -- the driver programs its own timing for the
+/// size and rate a client picks. Only the preferred one is marked so.
+pub(super) fn make_modeinfo_for(m: &zcore_drivers::scheme::drm::DisplayMode) -> [u8; 68] {
+    let firmware = drm::display_mode().is_some_and(|(w, h, _)| (w, h) == (m.width, m.height));
+    let mut info = if firmware && m.preferred {
+        make_modeinfo(m.width, m.height)
+    } else {
+        let mut ml = Modeline::synthetic(m.width, m.height);
+        let hz = m.refresh_hz.max(1);
+        ml.clock_khz = clock_khz_for_refresh_mhz(ml.htotal as u32, ml.vtotal as u32, hz * 1000);
+        ml.vrefresh = hz;
+        let mut info = make_modeinfo_with(m.width, m.height, None);
+        info[0..4].copy_from_slice(&ml.clock_khz.to_ne_bytes());
+        info[24..28].copy_from_slice(&ml.vrefresh.to_ne_bytes());
+        info
+    };
+    // DRM_MODE_TYPE_DRIVER, and DRM_MODE_TYPE_PREFERRED for the preferred one.
+    let kind: u32 = if m.preferred { 0x48 } else { 0x40 };
+    info[32..36].copy_from_slice(&kind.to_ne_bytes());
+    info
+}
+
 /// `struct drm_mode_modeinfo` (`drm_mode.h`): the 68 bytes `SETCRTC`,
 /// `GETCRTC` and `GETCONNECTOR` carry, read and written by name rather than
 /// by offset. The layout is the uapi one, `repr(C)` with no padding (every

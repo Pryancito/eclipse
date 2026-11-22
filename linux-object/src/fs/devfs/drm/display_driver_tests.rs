@@ -1,5 +1,6 @@
 use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};
+use zcore_drivers::scheme::drm::DisplayMode;
 
 /// Moebius's box: one RTX drives the monitor and has real hardware scanout, the
 /// other is a headless compute card. Registration order is the reverse of the
@@ -104,5 +105,94 @@ fn the_panel_limits_come_from_the_card_the_panel_is_on() {
         (caps.max_width, caps.max_height),
         (3840, 2160),
         "the caps came off the compute card, which has no monitor on it"
+    );
+}
+
+fn mode(width: u32, height: u32, refresh_hz: u32, preferred: bool) -> DisplayMode {
+    DisplayMode {
+        width,
+        height,
+        refresh_hz,
+        pixel_clock_khz: 1,
+        preferred,
+    }
+}
+
+/// A mode blob for `w`x`h` at `hz`, as a client builds one for MODE_ID.
+fn mode_blob(w: u16, h: u16, hz: u32) -> u32 {
+    let mut m = alloc::vec![0u8; 68];
+    m[0..4].copy_from_slice(&1000u32.to_ne_bytes());
+    m[4..6].copy_from_slice(&w.to_ne_bytes());
+    m[14..16].copy_from_slice(&h.to_ne_bytes());
+    m[24..28].copy_from_slice(&hz.to_ne_bytes());
+    create_blob(m, true)
+}
+
+/// With nvkms on the panel's card (`nvidia.nvkms`), the panel is no longer
+/// stuck at the firmware's mode: a MODE_ID of another size the driver lists
+/// passes the check, and one it does not list is refused as before.
+#[test]
+fn a_driver_that_does_modesets_takes_a_mode_the_firmware_did_not_set() {
+    let screen = kms_emu::attach(64, 16);
+    super::panel_mode::reset_for_test();
+    let _gpu = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-nvkms")
+            .console_at(0x17, 0x00)
+            .with_modes(&[mode(64, 16, 60, true), mode(32, 8, 75, false)]),
+    );
+    assert_eq!(driver_modes().len(), 2);
+    assert!(!needs_modeset(64, 16), "the firmware's mode is the panel's");
+    assert!(needs_modeset(32, 8));
+
+    let file = DrmFileState::new();
+    let listed = AtomicUpdate {
+        mode_blob: Some(mode_blob(32, 8, 75)),
+        connector_crtc_id: Some(SYNTH_CRTC_ID),
+        ..AtomicUpdate::default()
+    };
+    assert_eq!(
+        atomic_commit(&listed, true, true, false, 0, &file, None),
+        Ok(())
+    );
+    let unlisted = AtomicUpdate {
+        mode_blob: Some(mode_blob(48, 12, 60)),
+        connector_crtc_id: Some(SYNTH_CRTC_ID),
+        ..AtomicUpdate::default()
+    };
+    assert_eq!(
+        atomic_commit(&unlisted, true, true, false, 0, &file, None),
+        Err(AtomicError::Invalid)
+    );
+    assert_eq!(
+        panel_mode(),
+        Some((64, 16)),
+        "a TEST_ONLY commit sets nothing"
+    );
+
+    assert_eq!(set_mode(32, 8, 75, 0, false), Ok(()));
+    assert_eq!(panel_mode(), Some((32, 8)));
+    assert_eq!(_gpu.modesets(), [(32, 8, 75, 0)]);
+    assert_eq!(set_mode(64, 16, 60, 0, false), Ok(()));
+    assert_eq!(panel_mode(), Some((64, 16)), "back at the firmware's mode");
+    super::panel_mode::reset_for_test();
+}
+
+/// Without such a driver nothing changes: one mode, and any other refused.
+#[test]
+fn without_modesets_the_panel_keeps_the_firmware_mode() {
+    let screen = kms_emu::attach(64, 16);
+    super::panel_mode::reset_for_test();
+    let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-fixed").console_at(0x17, 0x00));
+    assert!(driver_modes().is_empty());
+    assert_eq!(set_mode(32, 8, 60, 0, false), Err(ModeRefused::Fixed));
+    let file = DrmFileState::new();
+    let other = AtomicUpdate {
+        mode_blob: Some(mode_blob(32, 8, 60)),
+        connector_crtc_id: Some(SYNTH_CRTC_ID),
+        ..AtomicUpdate::default()
+    };
+    assert_eq!(
+        atomic_commit(&other, true, true, false, 0, &file, None),
+        Err(AtomicError::Invalid)
     );
 }
