@@ -8,13 +8,24 @@ use pci::PCIDevice;
 
 use crate::builder::IoMapper;
 
-/// The register BAR of an 82574 (datasheet §9.1.1.4: 128 KiB of memory).
+/// The register BAR of an 82574 (datasheet §9.1.1.4: 128 KiB of memory),
+/// and of the PCH parts, whose flash window sits at 0xE000 in it.
 const E1000E_BAR0_LEN: usize = 128 * 1024;
 
-/// Whether the userspace e1000e driver can drive this part: the 82574L and
-/// 82574LA, which is what QEMU's `e1000e` is. The PCH parts (I217 to I219)
-/// need the PHY and flash work only the kernel's driver does.
+/// Whether the userspace e1000e driver can drive this part when the boot
+/// names it (`udriver=e1000e@N`): every part this kernel's driver takes,
+/// the 82574/82583 and the PCH ones (82579, I217, I218, I219), which it
+/// brings up as this driver does (ULP, LANPHYPC, K1, the PHY's LPLU bits,
+/// the NVM in the flash window).
 fn user_driver_takes(device_id: u16) -> bool {
+    super::e1000e_device_matched(device_id)
+}
+
+/// Whether it goes to userspace with no word on the command line: only the
+/// parts that driver has run on, the 82574L and 82574LA of QEMU. A real
+/// 82583 or PCH part stays the kernel's (lent to the stack process) until
+/// someone has seen the userspace driver bring one up.
+fn user_driver_unasked(device_id: u16) -> bool {
     matches!(device_id, 0x10d3 | 0x10f6)
 }
 
@@ -41,14 +52,14 @@ pub(super) fn left(
     // it and no virtio card is the stack process's already: otherwise the
     // kernel drives it, as it always has, and says nothing of it.
     if crate::user::first_e1000e_unasked()
-        && (!user_driver_takes(dev.id.device_id) || virtio_net_on_the_bus())
+        && (!user_driver_unasked(dev.id.device_id) || virtio_net_on_the_bus())
     {
         crate::user::keep_first_e1000e();
     }
-    crate::user::reserve_if(
+    crate::user::reserve_pci_if(
         crate::user::E1000E,
         user_driver_takes(dev.id.device_id),
-        crate::user::Transport::Pci,
+        (dev.id.vendor_id as u32) << 16 | dev.id.device_id as u32,
         bar0,
         E1000E_BAR0_LEN,
         || crate::user::Wiring {
@@ -75,10 +86,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_82574_goes_to_the_userspace_driver() {
-        assert!(user_driver_takes(0x10d3));
-        assert!(user_driver_takes(0x10f6));
-        // An I219-V: the kernel keeps it.
-        assert!(!user_driver_takes(0x15b8));
+    fn only_the_82574_goes_to_the_userspace_driver_unasked() {
+        assert!(user_driver_unasked(0x10d3));
+        assert!(user_driver_unasked(0x10f6));
+        // An I219-V and an 82583V: the kernel keeps them unless asked.
+        assert!(!user_driver_unasked(0x15b8));
+        assert!(!user_driver_unasked(0x150c));
+    }
+
+    #[test]
+    fn asked_for_every_part_the_kernel_driver_takes_goes() {
+        for id in [0x10d3, 0x10f6, 0x150c, 0x1502, 0x153a, 0x15a1, 0x1570, 0x15b8, 0x0d4f, 0x550b] {
+            assert!(user_driver_takes(id), "{:#x}", id);
+        }
+        // ICH9 and an I210 (igb): no driver of ours.
+        assert!(!user_driver_takes(0x10f5));
+        assert!(!user_driver_takes(0x1533));
     }
 }

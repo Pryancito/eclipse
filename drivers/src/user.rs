@@ -126,6 +126,10 @@ pub struct UserDevice {
     /// Where the kernel itself reaches that window, when the bus that found
     /// the device mapped it. Only [`reset`](Self::reset) goes through it.
     pub vaddr: Option<usize>,
+    /// A PCI function's identity, `vendor << 16 | device`, for a driver
+    /// that drives more than one part (the e1000e's); 0 when not known or
+    /// not asked for. The claim hands it over ([`reserve_pci_if`]).
+    pub pci_id: u32,
     claimed: AtomicBool,
 }
 
@@ -608,7 +612,7 @@ pub fn reserve_hda(
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
     let unasked = !gpu && HDA_UNASKED.swap(false, Ordering::AcqRel);
-    reserve_with(HDA, true, unasked, transport, paddr, size, wiring)
+    reserve_with(HDA, true, unasked, transport, 0, paddr, size, wiring)
 }
 
 /// Whether the virtio input devices are left to userspace without the
@@ -740,6 +744,7 @@ pub fn reserve_i8042() -> bool {
             size: I8042_SPAN,
             irq: Some(irq),
             vaddr: None,
+            pci_id: 0,
             claimed: AtomicBool::new(false),
         }));
     }
@@ -771,15 +776,31 @@ pub fn reserve_if(
     size: usize,
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
-    reserve_with(kind, usable, false, transport, paddr, size, wiring)
+    reserve_with(kind, usable, false, transport, 0, paddr, size, wiring)
+}
+
+/// [`reserve_if`] for a PCI function whose driver needs to know which part
+/// it is: `pci_id` is `vendor << 16 | device`, handed to it with the claim
+/// ([`UserDevice::pci_id`]).
+pub fn reserve_pci_if(
+    kind: &'static str,
+    usable: bool,
+    pci_id: u32,
+    paddr: usize,
+    size: usize,
+    wiring: impl FnOnce() -> Wiring,
+) -> bool {
+    reserve_with(kind, usable, false, Transport::Pci, pci_id, paddr, size, wiring)
 }
 
 /// [`reserve_if`], where `unasked` also leaves the device to userspace.
+#[allow(clippy::too_many_arguments)]
 fn reserve_with(
     kind: &'static str,
     usable: bool,
     unasked: bool,
     transport: Transport,
+    pci_id: u32,
     paddr: usize,
     size: usize,
     wiring: impl FnOnce() -> Wiring,
@@ -823,6 +844,7 @@ fn reserve_with(
         size,
         irq,
         vaddr,
+        pci_id,
         claimed: AtomicBool::new(false),
     }));
     true
@@ -911,6 +933,7 @@ mod tests {
             size: window.len(),
             irq: None,
             vaddr: Some(window.as_mut_ptr() as usize),
+            pci_id: 0,
             claimed: AtomicBool::new(false),
         }
     }
@@ -1092,6 +1115,7 @@ mod tests {
             size: I8042_SPAN,
             irq: Some(I8042_KBD_IRQ),
             vaddr: None,
+            pci_id: 0,
             claimed: AtomicBool::new(false),
         };
         assert_eq!(ports.port(0, 1), Some(0x60));

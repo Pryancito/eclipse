@@ -935,8 +935,9 @@ fn serve_e1000e(host: &Arc<Host>, own: &Own, card: &mut e1000e::Taker) -> String
                 regs.ask(want);
                 asked = want;
             }
-            if let Err(e) = e1000e::wait(interrupt, regs) {
-                return format!("interrupt_wait: {e}");
+            match e1000e::wait(interrupt, regs) {
+                Ok(causes) => card.saw(causes),
+                Err(e) => return format!("interrupt_wait: {e}"),
             }
         }
         let mut any = false;

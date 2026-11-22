@@ -1,5 +1,8 @@
-//! An Intel 82574 network card (QEMU's `e1000e`), driven by the network
-//! stack that runs as a process (`tools/eclipse-netstack`).
+//! An Intel e1000e network card, driven by the network stack that runs as
+//! a process (`tools/eclipse-netstack`): the 82574 (QEMU's `e1000e`) and
+//! 82583, and the PCH parts of the kernel's e1000e driver (82579, I217,
+//! I218, I219), which need their PHY brought up first ([`pch`]). Which
+//! part it is comes with the claim ([`Part::of`]).
 //!
 //! The boot leaves the card to userspace with `udriver=e1000e@N`; the
 //! kernel then neither brings it up nor so much as resets it, until the
@@ -40,6 +43,76 @@ use crate::claim::{self, Dma};
 use crate::net::{Msg, BUF_SIZE, FRAME_MAX, OP_RX, OP_TX, RX_BUFS, TX_BUFS, TX_HEADROOM};
 use crate::zx::{Handle, Status};
 use crate::PAGE;
+
+pub mod pch;
+
+/// Which kind of e1000e a card is, as far as bringing it up goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// A discrete part: the 82574L/LA (QEMU's) and the 82583V.
+    Discrete,
+    /// A PCH part before Sunrise Point: 82579 (PCH2), I217 and I218 (LPT).
+    Pch,
+    /// Sunrise Point and later: every I219. Its queues have to be enabled
+    /// by hand, its PHY may be in ULP, and its NVM is in the flash window.
+    PchSpt,
+}
+
+impl Part {
+    /// The part with this `vendor << 16 | device`, `None` for one this
+    /// driver does not know. The same parts as the kernel's driver takes
+    /// (`drivers/src/net/e1000e.rs`), so that a card the boot leaves to
+    /// userspace is always one that can be driven here. 0 is a kernel
+    /// that does not say, which only ever left the 82574.
+    pub fn of(pci_id: u32) -> Option<Part> {
+        if pci_id == 0 {
+            return Some(Part::Discrete);
+        }
+        if pci_id >> 16 != 0x8086 {
+            return None;
+        }
+        match pci_id as u16 {
+            // 82574L, 82574LA, 82583V.
+            0x10d3 | 0x10f6 | 0x150c => Some(Part::Discrete),
+            // 82579LM/V; I217-LM/V; I218-LM/V and the LPT-LP ones.
+            0x1502 | 0x1503 | 0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 => {
+                Some(Part::Pch)
+            }
+            // I219: SPT, SPT-H, KBP, CNP, ICP, CMP, TGP, ADP, RPL, MTP,
+            // LNP, ARL, PTP, NVL.
+            0x156f
+            | 0x1570
+            | 0x15b7..=0x15be
+            | 0x15d6..=0x15d8
+            | 0x15e3
+            | 0x15df..=0x15e2
+            | 0x0d4c..=0x0d4f
+            | 0x0d53
+            | 0x0d55
+            | 0x15f4..=0x15fc
+            | 0x1a1c..=0x1a1f
+            | 0x0dc5..=0x0dc8
+            | 0x550a..=0x5511
+            | 0x57a0
+            | 0x57a1
+            | 0x57b3..=0x57ba => Some(Part::PchSpt),
+            _ => None,
+        }
+    }
+
+    pub fn is_pch(self) -> bool {
+        self != Part::Discrete
+    }
+
+    /// How much of the window bringing it up needs.
+    pub fn regs_span(self) -> usize {
+        if self.is_pch() {
+            pch::REGS_SPAN
+        } else {
+            REGS_SPAN
+        }
+    }
+}
 
 // Registers, by byte offset (82574 datasheet §10.2).
 const CTRL: usize = 0x0000;
@@ -113,9 +186,11 @@ const TCTL_PSP: u32 = 1 << 3;
 const TCTL_CT: u32 = 15 << 4;
 const TCTL_COLD: u32 = 63 << 12;
 const TCTL_RTLC: u32 = 1 << 24;
-/// `TXDCTL`: write back every descriptor, and the kernel driver's burst
-/// thresholds.
-const TXDCTL_VALUE: u32 = 0x0101_0000 | (1 << 22) | (1 << 8) | 1;
+/// The kernel driver's burst thresholds (`TXDCTL`).
+const TXDCTL_BURST: u32 = (1 << 22) | (1 << 8) | 1;
+/// `TXDCTL` on a discrete part: write back every descriptor, and the
+/// burst thresholds.
+const TXDCTL_VALUE: u32 = 0x0101_0000 | TXDCTL_BURST;
 const RFCTL_EXTEN: u32 = 1 << 15;
 const RFCTL_NFSW_DIS: u32 = 1 << 6;
 const RFCTL_NFSR_DIS: u32 = 1 << 7;
@@ -199,6 +274,30 @@ impl Regs {
     /// Moderate the card's interrupts: at most one per `itr` x 256 ns.
     pub fn moderate(&self, itr: u32) {
         self.write(ITR, itr);
+    }
+}
+
+impl pch::Hw for Regs {
+    fn rd(&self, reg: usize) -> u32 {
+        self.read(reg)
+    }
+
+    fn wr(&self, reg: usize, value: u32) {
+        self.write(reg, value)
+    }
+
+    /// A wait under a millisecond is spun, as the kernel's driver does: the
+    /// PHY's handshakes are polled every few microseconds, and a sleep is a
+    /// tick at least.
+    fn delay_us(&self, us: u64) {
+        if us >= 1000 {
+            pause_us(us);
+            return;
+        }
+        let end = crate::now_ns() + us * 1000;
+        while crate::now_ns() < end {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -364,6 +463,7 @@ impl Giver {
 /// slots done with. The card's thread.
 pub struct Taker {
     regs: Regs,
+    part: Part,
     mem: Mem,
     rx_next: usize,
     tx_next: usize,
@@ -463,6 +563,42 @@ impl Taker {
     pub fn regs(&self) -> Regs {
         self.regs
     }
+
+    /// What the card raised, read when its thread woke: on a link change,
+    /// a line in the log, and on a PCH part what Linux does each time its
+    /// link comes up ([`pch::on_link_up`]). Done on the card's thread,
+    /// which is the only one that talks to the PHY once the card is up.
+    pub fn saw(&self, causes: u32) {
+        if causes & ICR_LSC == 0 {
+            return;
+        }
+        let status = self.regs.read(STATUS);
+        if status & STATUS_LU == 0 {
+            println!("e1000e: link down");
+            return;
+        }
+        if !self.part.is_pch() {
+            println!(
+                "e1000e: link up, {} Mb/s {} duplex",
+                pch::speed_of(status),
+                if status & 1 != 0 { "full" } else { "half" }
+            );
+            return;
+        }
+        let link = pch::on_link_up(&self.regs, self.part, status);
+        println!(
+            "e1000e: link up, {} Mb/s {} duplex, flow control {}",
+            link.speed,
+            if link.full_duplex { "full" } else { "half" },
+            match link.pause {
+                Some(p) => format!("{p:?}"),
+                None => "unchanged (the PHY did not answer)".into(),
+            }
+        );
+        if let Some(phy) = link.phy_says {
+            println!("e1000e: but the PHY says {phy:?}: the MAC and the PHY disagree");
+        }
+    }
 }
 
 /// A card the stack drives: claimed, brought up, every receive slot given.
@@ -489,11 +625,18 @@ pub fn drive(index: usize) -> Result<Driven, crate::net::NoCard> {
         Err(Status::NO_GATEWAY) => return Err(NoCard::NoGateway),
         Err(e) => {
             return Err(other(format!(
-                "claim (boot with udriver=e1000e@N and an 82574 there): {e}"
+                "claim (boot with udriver=e1000e@N and an e1000e there): {e}"
             )))
         }
     };
-    if !claim.pci || (claim.size as usize) < REGS_SPAN {
+    let Some(part) = Part::of(claim.pci_id) else {
+        return Err(other(format!(
+            "{:04x}:{:04x} is not an e1000e this driver knows",
+            claim.pci_id >> 16,
+            claim.pci_id & 0xffff
+        )));
+    };
+    if !claim.pci || (claim.size as usize) < part.regs_span() {
         return Err(other(format!(
             "not an e1000e's registers: {} bytes{}",
             claim.size,
@@ -511,7 +654,12 @@ pub fn drive(index: usize) -> Result<Driven, crate::net::NoCard> {
     let regs = unsafe { Regs::new(base) };
     // SAFETY: DMA_SIZE bytes the card sees at `daddr`, mapped for good,
     // zeroed, nobody else's.
-    let (giver, taker, mac) = unsafe { bring_up(regs, dma.ptr, dma.daddr) }.map_err(other)?;
+    println!(
+        "e1000e: {:04x}:{:04x}, {part:?}",
+        claim.pci_id >> 16,
+        claim.pci_id & 0xffff
+    );
+    let (giver, taker, mac) = unsafe { bring_up(regs, part, dma.ptr, dma.daddr) }.map_err(other)?;
     Ok(Driven {
         regs,
         giver,
@@ -557,19 +705,9 @@ fn mac_of(regs: Regs) -> [u8; 6] {
     mac
 }
 
-/// Reset the card and bring it up: receive and transmit rings in the
-/// memory at `dma` (the card sees it at `daddr`), every receive slot given,
-/// receive on, the interrupts of [`IMS_WAKE`] asked for. The two sides and
-/// the card's address.
-///
-/// # Safety
-/// `regs` is the card's; `dma` is [`DMA_SIZE`] zeroed bytes the card sees
-/// at `daddr`, mapped for as long as the sides live, and nobody else's.
-pub unsafe fn bring_up(
-    regs: Regs,
-    dma: *mut u8,
-    daddr: u64,
-) -> Result<(Giver, Taker, [u8; 6]), String> {
+/// Reset a discrete part (82574, 82583): interrupts masked, receive and
+/// transmit off, a MAC reset, and the link asked for.
+fn reset_discrete(regs: Regs) -> Result<(), String> {
     regs.write(IMC, u32::MAX);
     regs.write(RCTL, 0);
     regs.write(TCTL, TCTL_PSP);
@@ -595,8 +733,55 @@ pub unsafe fn bring_up(
     regs.write(IAM, 0);
     let ctrl = (regs.read(CTRL) & !(CTRL_FRCSPD | CTRL_FRCDPX)) | CTRL_SLU | CTRL_ASDE;
     regs.write(CTRL, ctrl);
+    Ok(())
+}
 
-    let mac = mac_of(regs);
+/// The address of a PCH part: what the reset loaded into the first receive
+/// address, or else the NVM's, or else one made up (locally administered)
+/// so that the card works at all, as the kernel's driver does.
+fn mac_of_pch(regs: Regs, part: Part) -> [u8; 6] {
+    let (low, high) = (regs.read(RAL0), regs.read(RAH0));
+    let [a, b, c, d] = low.to_le_bytes();
+    let [e, f, _, _] = high.to_le_bytes();
+    let valid = |m: &[u8; 6]| *m != [0; 6] && *m != [0xff; 6] && m[0] & 1 == 0;
+    let mac = [a, b, c, d, e, f];
+    if valid(&mac) {
+        return mac;
+    }
+    if let Some(mac) = pch::mac_from_flash(&regs, part).filter(valid) {
+        return mac;
+    }
+    println!("e1000e: no address in the card or its NVM; using a made-up one");
+    [0x02, 0x0e, 0x10, 0xde, 0xad, 0x01]
+}
+
+/// Reset the card and bring it up: receive and transmit rings in the
+/// memory at `dma` (the card sees it at `daddr`), every receive slot given,
+/// receive on, the interrupts of [`IMS_WAKE`] asked for. The two sides and
+/// the card's address.
+///
+/// # Safety
+/// `regs` is the card's, [`Part::regs_span`] bytes of it at least; `dma` is
+/// [`DMA_SIZE`] zeroed bytes the card sees at `daddr`, mapped for as long
+/// as the sides live, and nobody else's.
+pub unsafe fn bring_up(
+    regs: Regs,
+    part: Part,
+    dma: *mut u8,
+    daddr: u64,
+) -> Result<(Giver, Taker, [u8; 6]), String> {
+    let mac = if part.is_pch() {
+        let report = pch::reset(&regs, part)?;
+        println!("e1000e: {report:?}");
+        let mac = mac_of_pch(regs, part);
+        regs.write(pch::VET, 0);
+        regs.write(pch::WUC, 0);
+        regs.write(pch::WUFC, 0);
+        mac
+    } else {
+        reset_discrete(regs)?;
+        mac_of(regs)
+    };
     for i in 0..128 {
         regs.write(MTA + 4 * i, 0);
         regs.write(VFTA + 4 * i, 0);
@@ -615,7 +800,18 @@ pub unsafe fn bring_up(
     regs.write(TIDV, 0);
     regs.write(TADV, 0);
     regs.write(TIPG, 8 | (8 << 10) | (6 << 20));
-    regs.write(TXDCTL, TXDCTL_VALUE);
+    if part == Part::PchSpt {
+        // The queue has to be enabled by hand, and seen to be (Linux
+        // `e1000_configure_tx`); queue 1 the same, and IOSF compliance.
+        regs.write(pch::TXDCTL, TXDCTL_BURST | pch::TXDCTL_QUEUE_ENABLE);
+        if !latched(regs, pch::TXDCTL, pch::TXDCTL_QUEUE_ENABLE) {
+            println!("e1000e: the transmit queue did not come on in 10 ms");
+        }
+        regs.write(pch::TXDCTL1, regs.read(pch::TXDCTL));
+        regs.write(pch::IOSFPC, regs.read(pch::IOSFPC) | pch::IOSFPC_COMPLIANCE);
+    } else {
+        regs.write(TXDCTL, TXDCTL_VALUE);
+    }
     regs.write(TARC0, regs.read(TARC0) | 1);
     regs.write(TCTL, TCTL_EN | TCTL_PSP | TCTL_RTLC | TCTL_CT | TCTL_COLD);
 
@@ -634,9 +830,24 @@ pub unsafe fn bring_up(
     let rfctl = (regs.read(RFCTL) & !RFCTL_EXTEN) | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS;
     regs.write(RFCTL, rfctl);
     regs.write(MRQC, 0);
+    if part.is_pch() {
+        regs.write(pch::SRRCTL, pch::SRRCTL_VALUE);
+    }
+    if part == Part::PchSpt {
+        // Before receive is turned on (the kernel's driver; Linux's burst
+        // thresholds left out, as it leaves them: on I219 they gave
+        // write-backs that looked corrupt).
+        regs.write(
+            pch::RXDCTL,
+            regs.read(pch::RXDCTL) | pch::RXDCTL_QUEUE_ENABLE,
+        );
+        if !latched(regs, pch::RXDCTL, pch::RXDCTL_QUEUE_ENABLE) {
+            println!("e1000e: the receive queue did not come on in 10 ms");
+        }
+    }
     regs.write(RXCSUM, 0);
 
-    let (mut giver, taker) = sides(regs, mem);
+    let (mut giver, taker) = sides(regs, part, mem);
     let all: Vec<Msg> = (0..RX_BUFS as u32)
         .map(|slot| Msg {
             op: OP_RX,
@@ -651,8 +862,19 @@ pub unsafe fn bring_up(
     Ok((giver, taker, mac))
 }
 
+/// Whether `bit` of `reg` reads back set within 10 ms.
+fn latched(regs: Regs, reg: usize, bit: u32) -> bool {
+    for _ in 0..100 {
+        pch::Hw::delay_us(&regs, 100);
+        if regs.read(reg) & bit != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// The two sides of a card whose rings are new.
-fn sides(regs: Regs, mem: Mem) -> (Giver, Taker) {
+fn sides(regs: Regs, part: Part, mem: Mem) -> (Giver, Taker) {
     let told = Arc::new(AtomicUsize::new(0));
     (
         Giver {
@@ -664,6 +886,7 @@ fn sides(regs: Regs, mem: Mem) -> (Giver, Taker) {
         },
         Taker {
             regs,
+            part,
             mem,
             rx_next: 0,
             tx_next: 0,
@@ -705,7 +928,7 @@ mod tests {
                 ptr: self.dma.as_mut_ptr().cast(),
                 daddr: 0x10_0000,
             };
-            sides(self.regs(), mem)
+            sides(self.regs(), Part::Discrete, mem)
         }
 
         fn desc(&mut self, at: usize) -> *mut u8 {

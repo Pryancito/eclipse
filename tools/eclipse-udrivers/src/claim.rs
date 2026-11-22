@@ -15,7 +15,8 @@ use crate::PAGE;
 /// Claim kinds.
 pub const KIND_VIRTIO_BLK: usize = 1;
 pub const KIND_VIRTIO_NET: usize = 2;
-/// An Intel 82574 network card (QEMU's `e1000e`): see [`crate::e1000e`].
+/// An Intel e1000e network card (QEMU's 82574, or a PCH part such as an
+/// I219): see [`crate::e1000e`].
 pub const KIND_E1000E: usize = 3;
 /// An NVMe controller (`udriver=nvme@N`); its transport is a plain PCI
 /// function and the window is BAR 0.
@@ -68,6 +69,10 @@ pub struct Claim {
     pub size: u64,
     /// The device's interrupt object, `None` when there is none to wait on.
     pub interrupt: Option<Handle>,
+    /// A plain PCI function's `vendor << 16 | device`, when the kernel says
+    /// (it does for an e1000e); 0 otherwise, and from a kernel that did
+    /// not yet.
+    pub pci_id: u32,
 }
 
 impl Claim {
@@ -99,6 +104,11 @@ impl Claim {
             interrupt: match low(w[7]) {
                 0 => None,
                 handle => Some(handle),
+            },
+            pci_id: if low(w[1]) == TRANSPORT_PCI {
+                low(w[4])
+            } else {
+                0
             },
         }
     }
@@ -358,8 +368,18 @@ mod tests {
         assert_eq!(c.transport, None);
         assert_eq!((c.irq, c.interrupt), (0x29, Some(6)));
         assert_eq!(c.span(), 0x2_0000);
+        assert_eq!(c.pci_id, 0, "a kernel that does not say");
         let virtio = Claim::from_words(&[0, 1, 0, 0x200, 0, 0, 0, 0]);
         assert!(!virtio.pci);
+    }
+
+    #[test]
+    fn a_pci_function_says_which_part_it_is_in_word_four() {
+        let c = Claim::from_words(&[0, 3, 0, 0x2_0000, 0x8086_15b8, 0, 0, 0]);
+        assert_eq!(c.pci_id, 0x8086_15b8);
+        // A virtio function's word four is its structures, not an identity.
+        let v = Claim::from_words(&[0, 2, 0, 0x4000, 0x8086_15b8, 0, 0, 0]);
+        assert_eq!(v.pci_id, 0);
     }
 
     #[test]

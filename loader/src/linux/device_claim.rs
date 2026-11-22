@@ -25,8 +25,8 @@ use zircon_object::vm::VmObject;
 use zircon_object::{ZxError, ZxResult};
 
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an Intel
-/// 82574 network card (QEMU's `e1000e`), left to userspace by
-/// `udriver=e1000e@N`.
+/// e1000e network card (an 82574/82583 or a PCH part: 82579, I217 to
+/// I219), left to userspace by `udriver=e1000e@N`; word 4 says which.
 pub const ECLIPSE_DEVICE_E1000E: usize = 3;
 
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an NVMe
@@ -69,8 +69,10 @@ pub const ECLIPSE_TRANSPORT_PORTS: u64 = 4;
 
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: a PCI
 /// function that is not virtio. The window is its first memory BAR, with
-/// the registers as its datasheet lays them out; words 4 to 6 of the claim
-/// are zero, and its line is an MSI on x86_64 and a level elsewhere.
+/// the registers as its datasheet lays them out; word 4 is the function's
+/// `vendor << 16 | device` when the bus recorded it (an e1000e's), else 0,
+/// words 5 and 6 are zero, and its line is an MSI on x86_64 and a level
+/// elsewhere.
 pub const ECLIPSE_TRANSPORT_PCI: u64 = 3;
 
 /// The controllers a reserved device's interrupt can be on, by the name
@@ -302,7 +304,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 notify_multiplier as u64,
             ],
         ),
-        Transport::Pci => (ECLIPSE_TRANSPORT_PCI, [0; 3]),
+        Transport::Pci => (ECLIPSE_TRANSPORT_PCI, [device.pci_id as u64, 0, 0]),
         Transport::Ports => (ECLIPSE_TRANSPORT_PORTS, [0; 3]),
     };
     let irq = device.irq.map_or(u32::MAX, |irq| irq as u32);
