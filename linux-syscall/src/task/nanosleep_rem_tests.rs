@@ -73,6 +73,16 @@ fn a_signal_ends_the_sleep_and_leaves_the_rest_in_rem() {
         "rem {:?}",
         slot
     );
+    // And what `restart_syscall` goes on with, if a stop rather than this
+    // handler had ended it: the same end and the same `rem`.
+    assert_eq!(
+        thread.lock_linux().restart_sleep,
+        Some(linux_object::thread::SleepRestart {
+            deadline,
+            rem: &mut slot as *mut TimeSpec as usize,
+            abi32: false,
+        })
+    );
 }
 
 /// And the remainder at the other width: to a 32-bit caller a `struct

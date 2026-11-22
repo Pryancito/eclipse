@@ -31,6 +31,52 @@ const BLOCK: usize = 4096;
 /// [`FsError::NoDeviceSpace`] instead of panicking the machine.
 static RAMFS_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// The wall clock the inode times are read from, set once by the kernel
+/// ([`set_clock`]). Without one every time is 0, which is what every time
+/// was: a ramfs kept no time of its own, so `stat` on anything in `/tmp`,
+/// `/run` or `/dev/shm` said 1970 for all three, whatever had been written
+/// (open_posix `mmap/13-1`, `mmap/14-1`), and `make` over files there could
+/// never tell old from new.
+static CLOCK: spin::Once<fn() -> Timespec> = spin::Once::new();
+
+/// Give every ramfs its clock: seconds and nanoseconds since the epoch.
+/// Only the first call counts.
+pub fn set_clock(clock: fn() -> Timespec) {
+    CLOCK.call_once(|| clock);
+}
+
+/// The time now, or 0 when no clock was set.
+fn now() -> Timespec {
+    CLOCK
+        .get()
+        .map_or(Timespec { sec: 0, nsec: 0 }, |clock| clock())
+}
+
+/// How long an access time may lag behind before a read moves it again,
+/// with nothing changed since: Linux's `relatime` day.
+const RELATIME_SECS: i64 = 24 * 60 * 60;
+
+/// Whether a read at `now` moves the access time, as `relatime` decides
+/// (`relatime_need_update()`): when the last access is not later than the
+/// last change, or a day old.
+fn read_moves_atime(extra: &Metadata, now: Timespec) -> bool {
+    !later(extra.atime, extra.mtime)
+        || !later(extra.atime, extra.ctime)
+        || now.sec - extra.atime.sec >= RELATIME_SECS
+}
+
+/// Whether `a` is strictly later than `b`.
+fn later(a: Timespec, b: Timespec) -> bool {
+    (a.sec, a.nsec) > (b.sec, b.nsec)
+}
+
+/// `inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode))`: the
+/// content (of a file, or the names in a directory) changed now.
+fn modified(extra: &mut Metadata, now: Timespec) {
+    extra.mtime = now;
+    extra.ctime = now;
+}
+
 /// Shared ceiling for all ramfs content (`/tmp`, `/run`, `/dev/shm`, memfd).
 /// Boot sets this to **MemTotal / 2** (Linux tmpfs default). Fallback before
 /// that (and in unit tests) is 128 MiB.
@@ -407,9 +453,9 @@ impl RamFS {
                 size: 0,
                 blk_size: 0,
                 blocks: 0,
-                atime: Timespec { sec: 0, nsec: 0 },
-                mtime: Timespec { sec: 0, nsec: 0 },
-                ctime: Timespec { sec: 0, nsec: 0 },
+                atime: now(),
+                mtime: now(),
+                ctime: now(),
                 type_: FileType::Dir,
                 mode: 0o777,
                 nlinks: 1,
@@ -537,6 +583,10 @@ impl LockedINode {
             from.children.insert(String::from(new_name), this);
             // `..` did not change, but say so where a reader looks for it.
             moved.parent = Weak::clone(&from.this);
+            // `simple_rename_timestamp()`.
+            let at = now();
+            modified(&mut from.extra, at);
+            moved.extra.ctime = at;
         } else {
             let mut to = guards.next().unwrap();
             let mut moved = guards.next().unwrap();
@@ -551,6 +601,10 @@ impl LockedINode {
             let this = moved.this.upgrade().ok_or(FsError::EntryNotFound)?;
             to.children.insert(String::from(new_name), this);
             moved.parent = Weak::clone(&to.this);
+            let at = now();
+            modified(&mut from.extra, at);
+            modified(&mut to.extra, at);
+            moved.extra.ctime = at;
         }
         Ok(())
     }
@@ -563,6 +617,13 @@ impl INode for LockedINode {
             return Err(FsError::IsDir);
         }
         let n = file.content.read_at(offset, buf);
+        // `touch_atime()` under `relatime`: most reads move nothing, so the
+        // write lock is only taken for the one after a change.
+        let at = now();
+        if read_moves_atime(&file.extra, at) {
+            drop(file);
+            self.0.write().extra.atime = at;
+        }
         Ok(n)
     }
 
@@ -573,6 +634,10 @@ impl INode for LockedINode {
         }
         let before = file.content.len();
         let n = file.content.write_at(offset, buf)?;
+        // `file_update_time()`; a write of nothing changes nothing.
+        if n > 0 {
+            modified(&mut file.extra, now());
+        }
         // Growth telemetry: a ramfs file silently growing without bound is a
         // kernel-heap leak (each 4 KiB block is a heap allocation) — the
         // desktop OOM was ~456 MiB of such blocks with no obvious owner. Warn
@@ -644,6 +709,8 @@ impl INode for LockedINode {
                 );
             }
             file.content.resize(len);
+            // `do_truncate()` asks for both times whatever the new size.
+            modified(&mut file.extra, now());
             Ok(())
         } else {
             Err(FsError::NotFile)
@@ -672,6 +739,10 @@ impl INode for LockedINode {
             if file.children.contains_key(name) {
                 return Err(FsError::EntryExist);
             }
+            // `shmem_mknod()`: the new inode's three times, and the
+            // directory's change, are one moment.
+            let at = now();
+            modified(&mut file.extra, at);
             let temp_file = Arc::new(LockedINode(RwLock::new(RamFSINode {
                 parent: Weak::clone(&file.this),
                 this: Weak::default(),
@@ -683,9 +754,9 @@ impl INode for LockedINode {
                     size: 0,
                     blk_size: 0,
                     blocks: 0,
-                    atime: Timespec { sec: 0, nsec: 0 },
-                    mtime: Timespec { sec: 0, nsec: 0 },
-                    ctime: Timespec { sec: 0, nsec: 0 },
+                    atime: at,
+                    mtime: at,
+                    ctime: at,
                     type_,
                     mode: mode as u16,
                     nlinks: 1,
@@ -757,6 +828,11 @@ impl INode for LockedINode {
         file.children
             .insert(String::from(name), other_l.this.upgrade().unwrap());
         other_l.extra.nlinks += 1;
+        // `shmem_link()`: a name more in the directory, a link more on the
+        // inode.
+        let at = now();
+        modified(&mut file.extra, at);
+        other_l.extra.ctime = at;
         Ok(())
     }
 
@@ -772,8 +848,15 @@ impl INode for LockedINode {
         if !other.0.read().children.is_empty() {
             return Err(FsError::DirNotEmpty);
         }
-        other.0.write().extra.nlinks -= 1;
+        // `shmem_unlink()`: the same moment on the inode and the directory.
+        let at = now();
+        {
+            let mut other = other.0.write();
+            other.extra.nlinks -= 1;
+            other.extra.ctime = at;
+        }
         file.children.remove(name);
+        modified(&mut file.extra, at);
         Ok(())
     }
 
@@ -943,6 +1026,106 @@ fn new_inode_id() -> usize {
 mod tests {
     use super::*;
     use core::time::Duration;
+
+    /// Every ramfs of the test binary reads this clock: each reading is one
+    /// second past the one before, so "later" is always tellable.
+    fn ticking_clock() {
+        static TICK: AtomicUsize = AtomicUsize::new(1_000_000);
+        fn tick() -> Timespec {
+            Timespec {
+                sec: TICK.fetch_add(1, Ordering::SeqCst) as i64,
+                nsec: 0,
+            }
+        }
+        set_clock(tick);
+    }
+
+    fn times(n: &Arc<dyn INode>) -> (Timespec, Timespec, Timespec) {
+        let m = n.metadata().unwrap();
+        (m.atime, m.mtime, m.ctime)
+    }
+
+    #[test]
+    fn a_new_file_has_its_three_times_and_its_directory_changes() {
+        ticking_clock();
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let (_, dir_m, _) = times(&root);
+        let f = file_at(&root, "f");
+        let (a, m, c) = times(&f);
+        assert_ne!(m.sec, 0, "a file born in 1970");
+        assert_eq!((a, m), (m, c), "one moment for all three");
+        let (_, dir_m2, dir_c2) = times(&root);
+        assert!(later(dir_m2, dir_m), "the directory got a name more");
+        assert_eq!(dir_m2, dir_c2);
+    }
+
+    #[test]
+    fn a_write_or_a_truncate_moves_mtime_and_ctime_and_not_atime() {
+        ticking_clock();
+        let fs = RamFS::new();
+        let f = file_at(&fs.root_inode(), "f");
+        let (a0, m0, _) = times(&f);
+        f.write_at(0, b"hi").unwrap();
+        let (a1, m1, c1) = times(&f);
+        assert!(later(m1, m0));
+        assert_eq!(m1, c1);
+        assert_eq!(a1, a0);
+        f.resize(1).unwrap();
+        let (_, m2, c2) = times(&f);
+        assert!(later(m2, m1));
+        assert_eq!(m2, c2);
+        // A write of nothing changes nothing.
+        f.write_at(0, b"").unwrap();
+        assert_eq!(times(&f).1, m2);
+    }
+
+    #[test]
+    fn a_read_moves_atime_once_after_a_change_as_relatime_does() {
+        ticking_clock();
+        let fs = RamFS::new();
+        let f = file_at(&fs.root_inode(), "f");
+        f.write_at(0, b"hi").unwrap();
+        let mut buf = [0u8; 2];
+        f.read_at(0, &mut buf).unwrap();
+        let (a1, m1, _) = times(&f);
+        assert!(later(a1, m1), "the read after the write is an access");
+        f.read_at(0, &mut buf).unwrap();
+        assert_eq!(times(&f).0, a1, "and the next one is not, under relatime");
+    }
+
+    #[test]
+    fn unlink_and_link_change_the_directory_and_the_inode() {
+        ticking_clock();
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let f = file_at(&root, "f");
+        let (_, _, c0) = times(&f);
+        root.link("g", &f).unwrap();
+        let (_, _, c1) = times(&f);
+        assert!(later(c1, c0), "a link more is a change of the inode");
+        assert_eq!(times(&root).1, c1, "and of the directory, at once");
+        root.unlink("f").unwrap();
+        let (_, _, c2) = times(&f);
+        assert!(later(c2, c1));
+        assert_eq!(times(&root).1, c2);
+    }
+
+    #[test]
+    fn a_rename_changes_both_directories() {
+        ticking_clock();
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let a = dir_at(&root, "a");
+        let b = dir_at(&root, "b");
+        dir_at(&a, "d");
+        let (_, bm0, _) = times(&b);
+        a.move_("d", &b, "e").unwrap();
+        let (_, am, _) = times(&a);
+        let (_, bm, _) = times(&b);
+        assert!(later(bm, bm0));
+        assert_eq!(am, bm, "one moment for both");
+    }
 
     // ---------------------------------------------------------------- helpers
 

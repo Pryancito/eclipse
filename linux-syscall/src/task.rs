@@ -209,6 +209,15 @@ pub(crate) async fn sleep_or_eintr(
         Ok(()) => Ok(()),
         Err(e) => {
             if e == LxError::EINTR {
+                // Linux's `restart_block`: if this was a stop and no handler
+                // runs before the thread goes on, the loader makes
+                // `restart_syscall` instead of the sleep, and that one sleeps
+                // to this same end (`Syscall::sys_restart_syscall`).
+                thread.lock_linux().restart_sleep = Some(linux_object::thread::SleepRestart {
+                    deadline,
+                    rem: rem.as_addr(),
+                    abi32,
+                });
                 // `abi32`, and not a `Syscall` to ask, because this is a free
                 // helper: the remainder is a `struct timespec` and so half as
                 // wide to a 32-bit caller. See [`crate::narrow`].
@@ -1964,6 +1973,23 @@ impl Syscall<'_> {
         // `nanosleep` loop that restarts on EINTR with `rem` restarted from
         // whatever was in the buffer.
         sleep_or_eintr(self.thread, deadline, rem, self.narrow_abi()).await?;
+        Ok(0)
+    }
+
+    /// `restart_syscall(2)`: what is left of a relative `nanosleep` or
+    /// `clock_nanosleep` a job-control stop cut short, made when the process
+    /// is continued. The loader rewinds onto it in place of the sleep
+    /// (`linux_syscall::restart_number`), as Linux's signal code does with
+    /// `__NR_restart_syscall`, so the sleep ends when it was due to: not a
+    /// whole request later, and not `EINTR`, which Linux never shows a
+    /// program that ran no handler. A call with nothing to go on with is
+    /// `EINTR`, as Linux's `do_no_restart_syscall` answers.
+    pub async fn sys_restart_syscall(&self) -> SysResult {
+        let block = self.thread.lock_linux().restart_sleep.take();
+        let Some(block) = block else {
+            return Err(LxError::EINTR);
+        };
+        sleep_or_eintr(self.thread, block.deadline, block.rem.into(), block.abi32).await?;
         Ok(0)
     }
 

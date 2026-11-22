@@ -48,7 +48,7 @@ use self::consts::SyscallType as Sys;
 use self::file::poll_timeout_msecs;
 use self::file::{XattrOp, XattrTarget};
 pub use self::restart::{
-    restarts_after_handler, restarts_after_stop, restarts_whatever_the_handler,
+    restart_number, restarts_after_handler, restarts_after_stop, restarts_whatever_the_handler,
 };
 pub use self::time::run_cpu_timers;
 
@@ -837,6 +837,7 @@ impl Syscall<'_> {
 
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,
+            Sys::RESTART_SYSCALL => self.sys_restart_syscall().await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
             // `alarm` only exists in the x86_64 syscall table; the generic ABI

@@ -2942,7 +2942,10 @@ impl Interrupted {
     fn after(num: usize, args: &[usize; 6], ret: usize) -> Option<Self> {
         let eintr = -(linux_object::error::LxError::EINTR as isize) as usize;
         (ret == eintr && linux_syscall::restarts_after_stop(num as u32, args)).then(|| Self {
-            num,
+            // A relative sleep is made again as `restart_syscall`, which
+            // sleeps to the end it had (`linux_syscall::restart_number`). It
+            // is only ever rewound past a stop: no handler makes it again.
+            num: linux_syscall::restart_number(num as u32, args) as usize,
             arg0: args[0],
             by_handler: if linux_syscall::restarts_whatever_the_handler(num as u32, args) {
                 ByHandler::Always

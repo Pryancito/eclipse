@@ -132,11 +132,12 @@ const FUTEX_FLAGS: usize = 0x80 | 0x100;
 /// `select`, a timed `futex` wait, `msgrcv`/`msgsnd`, `clock_nanosleep`. But
 /// only where making the call again with the same registers waits for what the
 /// first one did -- no timeout, or an absolute one. A relative timeout
-/// (`nanosleep`, a `poll` for 100 ms) would start over from the top, and
-/// Linux keeps the original end in `restart_block` for that; with nothing
-/// here to keep it in, those come back `EINTR` with what they were left
-/// (`nanosleep` writes `rem`), which every caller of them already handles,
-/// because any handler at all gets them the same answer.
+/// (a `poll` for 100 ms) would start over from the top, and Linux keeps the
+/// original end in `restart_block` for that. The sleeps keep theirs here too
+/// (`LinuxThread::restart_sleep`) and go on through `restart_syscall`
+/// ([`restart_number`]); the other relative waits come back `EINTR` with
+/// what they were left, which every caller of them already handles, because
+/// any handler at all gets them the same answer.
 ///
 /// `epoll_wait`, `rt_sigtimedwait`, `semop` are plain `-EINTR` in Linux, and
 /// signal(7) lists them as the calls a stop and a continue DO fail.
@@ -160,7 +161,9 @@ pub fn restarts_after_stop(num: u32, args: &[usize; 6]) -> bool {
         // A null timeout is "forever".
         Sys::PPOLL => args[2] == 0,
         Sys::PSELECT6 => args[4] == 0,
-        Sys::CLOCK_NANOSLEEP => args[1] & TIMER_ABSTIME != 0,
+        // An absolute end is made again as it was; a relative one through
+        // `restart_syscall`, to the end it had ([`restart_number`]).
+        Sys::NANOSLEEP | Sys::CLOCK_NANOSLEEP | Sys::RESTART_SYSCALL => true,
         Sys::FUTEX => match args[1] & !FUTEX_FLAGS {
             // FUTEX_WAIT's timeout is the one relative one.
             FUTEX_WAIT => args[3] == 0,
@@ -168,6 +171,20 @@ pub fn restarts_after_stop(num: u32, args: &[usize; 6]) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// The syscall number a stop makes again in place of `num`: Linux's
+/// `__NR_restart_syscall` for a relative `nanosleep` or `clock_nanosleep`,
+/// which finishes the sleep to the end the first call had
+/// (`hrtimer_nanosleep_restart`), and `num` itself for everything else.
+/// Making the relative sleep again with its own registers would sleep the
+/// whole request once more.
+pub fn restart_number(num: u32, args: &[usize; 6]) -> u32 {
+    match Sys::try_from(num) {
+        Ok(Sys::NANOSLEEP) => Sys::RESTART_SYSCALL as u32,
+        Ok(Sys::CLOCK_NANOSLEEP) if args[1] & TIMER_ABSTIME == 0 => Sys::RESTART_SYSCALL as u32,
+        _ => num,
     }
 }
 
@@ -363,17 +380,43 @@ mod tests {
     }
 
     #[test]
-    fn a_sleep_is_made_again_only_to_an_absolute_end() {
-        assert!(after_stop(
-            Sys::CLOCK_NANOSLEEP,
-            [1, TIMER_ABSTIME, 0x1000, 0, 0, 0]
-        ));
-        assert!(!after_stop(
-            Sys::CLOCK_NANOSLEEP,
-            [1, 0, 0x1000, 0x2000, 0, 0]
-        ));
-        // A relative sleep comes back EINTR with `rem`, as from a handler.
-        assert!(!after_stop(Sys::NANOSLEEP, [0x1000, 0x2000, 0, 0, 0, 0]));
+    fn a_sleep_is_made_again_an_absolute_one_as_it_was() {
+        let abs = [1, TIMER_ABSTIME, 0x1000, 0, 0, 0];
+        assert!(after_stop(Sys::CLOCK_NANOSLEEP, abs));
+        assert_eq!(
+            restart_number(Sys::CLOCK_NANOSLEEP as u32, &abs),
+            Sys::CLOCK_NANOSLEEP as u32
+        );
+    }
+
+    /// A relative sleep goes on through `restart_syscall`, to the end it
+    /// had: open_posix `clock_nanosleep/1-5` stops and continues a child in
+    /// a 5 s sleep and wants it to return 0 no earlier than 5 s on. It came
+    /// back `EINTR`, which Linux never shows a program that ran no handler.
+    #[test]
+    fn a_relative_sleep_goes_on_through_restart_syscall() {
+        let rel = [1, 0, 0x1000, 0x2000, 0, 0];
+        let nano = [0x1000, 0x2000, 0, 0, 0, 0];
+        assert!(after_stop(Sys::CLOCK_NANOSLEEP, rel));
+        assert!(after_stop(Sys::NANOSLEEP, nano));
+        let restart = Sys::RESTART_SYSCALL as u32;
+        assert_eq!(restart_number(Sys::CLOCK_NANOSLEEP as u32, &rel), restart);
+        assert_eq!(restart_number(Sys::NANOSLEEP as u32, &nano), restart);
+        // A second stop over the restarted sleep makes it again as well.
+        assert!(after_stop(Sys::RESTART_SYSCALL, [0; 6]));
+        assert_eq!(restart_number(restart, &[0; 6]), restart);
+        // Everything else is made again as itself.
+        assert_eq!(restart_number(Sys::READ as u32, &[0; 6]), Sys::READ as u32);
+    }
+
+    /// A handler still gets the relative sleep `EINTR` with `rem`, with or
+    /// without `SA_RESTART` (`-ERESTART_RESTARTBLOCK`).
+    #[test]
+    fn a_handler_still_cuts_a_relative_sleep_short() {
+        let nano = [0x1000, 0x2000, 0, 0, 0, 0];
+        assert!(!restarts_after_handler(Sys::NANOSLEEP as u32, &nano));
+        let rel = [1, 0, 0x1000, 0x2000, 0, 0];
+        assert!(!restarts_after_handler(Sys::CLOCK_NANOSLEEP as u32, &rel));
     }
 
     #[test]

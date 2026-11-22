@@ -986,6 +986,26 @@ pub struct LinuxThread {
     /// The `siginfo_t` handed to the handler now running, so `sigreturn` can
     /// tell what the handler changed from what the kernel wrote.
     handling_info: SigInfo,
+    /// What `restart_syscall(2)` goes on with: the end of a relative
+    /// `nanosleep`/`clock_nanosleep` a signal cut short, Linux's
+    /// `restart_block`. A job-control stop and continue with no handler run
+    /// makes that sleep again through `restart_syscall` (the loader rewinds
+    /// onto it), and it sleeps to the ORIGINAL end rather than the whole
+    /// request over again or `EINTR`. See [`SleepRestart`].
+    pub restart_sleep: Option<SleepRestart>,
+}
+
+/// A relative sleep a signal cut short, for `restart_syscall(2)` to finish:
+/// the deadline on `kernel_hal::timer::timer_now`'s clock, the `rem` the
+/// caller passed (0 for none) and whether it is a 32-bit `timespec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepRestart {
+    /// When the sleep was due to end.
+    pub deadline: core::time::Duration,
+    /// The user address of the caller's `rem`, 0 when it passed none.
+    pub rem: usize,
+    /// Whether `rem` is the 32-bit layout.
+    pub abi32: bool,
 }
 
 /// Size of the kernel's per-task `comm` buffer, including the trailing NUL
@@ -1253,6 +1273,7 @@ impl LinuxThread {
             ioprio: 0,
             queue: SigQueue::default(),
             handling_info: SigInfo::default(),
+            restart_sleep: None,
         }
     }
 
@@ -1353,6 +1374,9 @@ impl LinuxThread {
             // Pending signals are fresh (above), and so is what went with them.
             queue: SigQueue::default(),
             handling_info: SigInfo::default(),
+            // `copy_process` gives the new task a `restart_block` that
+            // restarts nothing: the sleep was the creator's.
+            restart_sleep: None,
         }
     }
 
@@ -1388,7 +1412,10 @@ impl LinuxThread {
             // Pending signals survive `execve`, and what went with them too.
             queue: _,
             handling_info: _,
+            // The sleep it would finish belongs to the image being replaced.
+            restart_sleep,
         } = self;
+        *restart_sleep = None;
 
         // `mm_release()`: the address the kernel writes a 0 into, and
         // futex-wakes, when this thread dies. It points into the image being
@@ -1634,6 +1661,7 @@ mod signal_delivery_tests {
             ioprio: IDLE_IOPRIO,
             queue: SigQueue::default(),
             handling_info: SigInfo::default(),
+            restart_sleep: None,
         }
     }
 
@@ -2787,6 +2815,7 @@ mod exec_reset_tests {
             ioprio: IDLE_IOPRIO,
             queue: SigQueue::default(),
             handling_info: SigInfo::default(),
+            restart_sleep: None,
         }
     }
 
@@ -2966,6 +2995,7 @@ mod clone_inheritance_tests {
             ioprio: IDLE_IOPRIO,
             queue: SigQueue::default(),
             handling_info: SigInfo::default(),
+            restart_sleep: None,
         }
     }
 

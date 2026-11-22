@@ -1509,6 +1509,15 @@ const EVDEV_EVENT_MINOR_BASE: usize = 64;
 
 /// Install frame-backed tmpfs pages and a Linux-style size cap (MemTotal/2)
 /// before any RamFS mount materializes file data.
+/// The wall clock, as the inode times of a ramfs carry it.
+fn ramfs_wall_clock() -> rcore_fs::vfs::Timespec {
+    let now = kernel_hal::timer::wall_clock_now();
+    rcore_fs::vfs::Timespec {
+        sec: now.as_secs() as i64,
+        nsec: now.subsec_nanos() as i32,
+    }
+}
+
 fn install_tmpfs_frame_backend() {
     fn alloc_page() -> Option<*mut u8> {
         let frame = kernel_hal::mem::PhysFrame::new_zero()?;
@@ -1635,6 +1644,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     // Pages for /tmp, /run, /dev/shm come from the frame allocator (not the
     // fixed kernel heap), with a shared MemTotal/2 ceiling — like Linux tmpfs.
     install_tmpfs_frame_backend();
+    // And their clock: without it every time in a ramfs is 0, and `stat` on
+    // anything in `/tmp` said 1970 (see `rcore_fs_ramfs::set_clock`).
+    rcore_fs_ramfs::set_clock(ramfs_wall_clock);
     // Filesystem from the boot medium (initrd / SFS). We use it to read the boot
     // `/etc/fstab` and, when an installed btrfs/ext2 ROOT partition is
     // detected, to pivot the real root onto it (similar to an initramfs
