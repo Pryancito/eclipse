@@ -2,6 +2,11 @@
 # Eclipse OS en el navegador: construye los ficheros de eclipse-os.dev/live/emu/.
 #
 #   scripts/live-web/build.sh [DESTINO]        (por defecto ../Pryancito.github.io/live/emu)
+#   scripts/live-web/build.sh --solo-eclipse [DESTINO]
+#
+# Con --solo-eclipse solo rehace el paso 1 (núcleo y rootfs, para una versión
+# nueva de Eclipse) y el manifest; QEMU y OpenSBI se quedan como están en
+# DESTINO. Así no hace falta docker.
 #
 # Hace cuatro cosas y deja el resultado en DESTINO:
 #   1. el núcleo riscv64 (zcore.bin) y un rootfs mínimo recortado para la web
@@ -20,6 +25,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+SOLO_ECLIPSE=0
+if [ "${1:-}" = --solo-eclipse ]; then SOLO_ECLIPSE=1; shift; fi
 DEST=${1:-$ROOT/../Pryancito.github.io/live/emu}
 WORK=${LIVE_WEB_WORK:-$ROOT/ignored/live-web}
 mkdir -p "$DEST" "$WORK"
@@ -61,6 +68,11 @@ make -C zCore build ARCH=riscv64 LINUX=1 MODE=release
 gzip -9c target/riscv64/release/zcore.bin > "$DEST/zcore.bin.gz"
 gzip -9c "$WORK/initrd.img" > "$DEST/initrd.img.gz"
 
+if [ "$SOLO_ECLIPSE" = 1 ]; then
+  for f in qemu-system-riscv64.wasm qemu-system-riscv64.js qemu-system-riscv64.worker.js opensbi.bin; do
+    [ -f "$DEST/$f" ] || { echo "--solo-eclipse: falta $DEST/$f (hace falta un build completo antes)" >&2; exit 1; }
+  done
+else
 # ------------------------------------------------------ 2. QEMU para la web
 say "qemu-wasm: fuentes"
 Q="$WORK/qemu-wasm"
@@ -125,6 +137,7 @@ cp "$OUT/qemu-system-riscv64.wasm" "$OUT/qemu-system-riscv64.js" "$OUT/qemu-syst
 
 # --------------------------------------------------------------- 3. OpenSBI
 cp "$Q/pc-bios/opensbi-riscv64-generic-fw_dynamic.bin" "$DEST/opensbi.bin"
+fi
 
 # -------------------------------------------------------------- 4. manifest
 say "manifest.json"
