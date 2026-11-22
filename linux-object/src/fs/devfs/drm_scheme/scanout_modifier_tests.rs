@@ -167,25 +167,35 @@ fn foreign_reserved_and_invalid_modifiers_are_refused() {
 }
 
 /// The size arithmetic a block-linear framebuffer needs, which differs
-/// from `pitch * height` in both terms: the pitch counts 64-byte blocks,
-/// and the height is padded up to a whole block.
+/// from `pitch * height` in the height: it is padded up to a whole block.
+/// The pitch is bytes, as for every DRM framebuffer, and a whole GOB.
 #[test]
-fn a_block_linear_surface_is_measured_in_blocks_and_padded_to_one() {
-    // 1920 pixels of 4 bytes is 7680 bytes, which is 120 blocks.
+fn a_block_linear_surface_is_padded_to_a_whole_block() {
+    // 1920 pixels of 4 bytes is 7680 bytes, 120 GOBs wide.
     // h = 4 means blocks are 8 << 4 = 128 rows tall, so 1080 rows pad up
     // to 1152.
     assert_eq!(
-        drm::block_linear_size(120, 1080, 4),
-        Some(120 * 64 * 1152),
+        drm::block_linear_size(7680, 1080, 4),
+        Some(7680 * 1152),
         "the last block row is addressed whole; a size from 1080 would \
          let a present read past the buffer"
     );
     // Exactly one block tall: no padding to add.
-    assert_eq!(drm::block_linear_size(1, 8, 0), Some(64 * 8));
+    assert_eq!(drm::block_linear_size(64, 8, 0), Some(64 * 8));
     // One row past it: a second whole block.
-    assert_eq!(drm::block_linear_size(1, 9, 0), Some(2 * 64 * 8));
-    // The arithmetic must not wrap: a pitch and height a client is free
-    // to send have to come back as None, not as a small size that would
-    // pass the buffer check.
-    assert_eq!(drm::block_linear_size(u32::MAX, u32::MAX, 5), None);
+    assert_eq!(drm::block_linear_size(64, 9, 0), Some(2 * 64 * 8));
+    // A pitch that is not a whole GOB is no block-linear surface.
+    assert_eq!(drm::block_linear_size(100, 8, 0), None);
+    // The arithmetic must not wrap: the largest pitch and height a client
+    // is free to send come back as their whole size (or None where usize
+    // is too small), never as a small size that would pass the buffer
+    // check.
+    let pitch = u32::MAX - 63;
+    let padded_rows = 1u64 << 32;
+    assert_eq!(
+        drm::block_linear_size(pitch, u32::MAX, 5),
+        u64::from(pitch)
+            .checked_mul(padded_rows)
+            .and_then(|n| core::convert::TryFrom::try_from(n).ok())
+    );
 }

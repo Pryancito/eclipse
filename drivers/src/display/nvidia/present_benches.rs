@@ -17,6 +17,7 @@ fn with_swapchain(gpu: &NvidiaGpu, extra: u32) {
             size: 0,
             h_memory: H_MEMORY,
             vram_offset: Some(0),
+            block_linear: None,
         });
     }
 }

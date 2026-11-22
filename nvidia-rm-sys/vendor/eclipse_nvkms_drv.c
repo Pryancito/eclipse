@@ -335,11 +335,19 @@ struct EclipseKmsSurface {
  * A surface on `memory`, pitch-linear. Takes `memory`: on failure it is
  * freed.
  */
+/*
+ * blockLinear: the surface is block-linear with blocks 1 << log2GobsPerBlockY
+ * GOBs high, said explicitly the way nvidia-drm says it from the fb's
+ * modifier (nv_drm_framebuffer_init, explicit_layout); pitch is then bytes,
+ * a whole number of GOBs, and kapi turns it into GOBs itself.
+ */
 static struct EclipseKmsSurface *eclipse_kms_wrap(struct NvKmsKapiDevice *device,
                                                   struct NvKmsKapiMemory *memory,
                                                   NvU32 width, NvU32 height,
                                                   NvU32 pitch,
-                                                  enum NvKmsSurfaceMemoryFormat format)
+                                                  enum NvKmsSurfaceMemoryFormat format,
+                                                  NvBool blockLinear,
+                                                  NvU32 log2GobsPerBlockY)
 {
     struct NvKmsKapiCreateSurfaceParams params = { };
     struct EclipseKmsSurface *s = nvKmsKapiCalloc(1, sizeof(*s));
@@ -354,10 +362,17 @@ static struct EclipseKmsSurface *eclipse_kms_wrap(struct NvKmsKapiDevice *device
     params.width = width;
     params.height = height;
     params.format = format;
+    if (blockLinear) {
+        params.explicit_layout = NV_TRUE;
+        params.layout = NvKmsSurfaceMemoryLayoutBlockLinear;
+        params.log2GobsPerBlockY = log2GobsPerBlockY;
+    }
     s->surface = g_nvKms.createSurface(device, &params);
     if (s->surface == NULL) {
         eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
-                         "createSurface refused %ux%u pitch %u", width, height, pitch);
+                         "createSurface refused %ux%u pitch %u (%s, log2 GOBs %u)",
+                         width, height, pitch, blockLinear ? "block-linear" : "pitch",
+                         log2GobsPerBlockY);
         g_nvKms.freeMemory(device, memory);
         nvKmsKapiFree(s);
         return NULL;
@@ -431,12 +446,13 @@ struct EclipseKmsSurface *eclipse_kms_console_surface(struct NvKmsKapiDevice *de
     memory->isVidmem = NV_TRUE;
     /* The CPU keeps drawing into it while it is on screen. */
     memory->noDisplayCaching = NV_TRUE;
-    return eclipse_kms_wrap(device, memory, width, height, pitch, format);
+    return eclipse_kms_wrap(device, memory, width, height, pitch, format, NV_FALSE, 0);
 }
 
 /*
  * A compositor's VRAM GEM as a surface nvkms can flip to: XRGB8888,
- * pitch-linear, the only kind the driver's ADDFB makes.
+ * pitch-linear, or block-linear when its ADDFB2 carried an NVIDIA
+ * block-linear modifier (blockLinear, log2GobsPerBlockY from its h field).
  *
  * nvidia-drm gets here through importMemory, which takes the GEM from the
  * RM client of nvidia.ko's fd (NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD).
@@ -448,13 +464,16 @@ struct EclipseKmsSurface *eclipse_kms_console_surface(struct NvKmsKapiDevice *de
 struct EclipseKmsSurface *eclipse_kms_import_surface(struct NvKmsKapiDevice *device,
                                                      NvU32 hSrcClient, NvU32 hSrcMemory,
                                                      NvU64 size, NvU32 width,
-                                                     NvU32 height, NvU32 pitch)
+                                                     NvU32 height, NvU32 pitch,
+                                                     NvU8 blockLinear,
+                                                     NvU32 log2GobsPerBlockY)
 {
     struct NvKmsKapiMemory *memory;
     NvU32 hMemory, ret;
 
     if (device == NULL || !g_nvKmsValid || hSrcClient == 0 || hSrcMemory == 0 ||
-        width == 0 || height == 0 || (NvU64)pitch * height > size)
+        width == 0 || height == 0 || (NvU64)pitch * height > size ||
+        (blockLinear && ((pitch & 63) != 0 || log2GobsPerBlockY > 5)))
         return NULL;
 
     memory = nvKmsKapiCalloc(1, sizeof(*memory));
@@ -477,10 +496,18 @@ struct EclipseKmsSurface *eclipse_kms_import_surface(struct NvKmsKapiDevice *dev
     }
     memory->hRmHandle = hMemory;
     memory->size = size;
-    memory->surfaceParams.layout = NvKmsSurfaceMemoryLayoutPitch;
+    if (blockLinear) {
+        memory->surfaceParams.layout = NvKmsSurfaceMemoryLayoutBlockLinear;
+        memory->surfaceParams.blockLinear.log2GobsPerBlock.y = log2GobsPerBlockY;
+        memory->surfaceParams.blockLinear.pitchInBlocks = pitch >> 6;
+        memory->surfaceParams.blockLinear.genericMemory = NV_TRUE;
+    } else {
+        memory->surfaceParams.layout = NvKmsSurfaceMemoryLayoutPitch;
+    }
     memory->isVidmem = NV_TRUE;
     return eclipse_kms_wrap(device, memory, width, height, pitch,
-                            NvKmsSurfaceMemoryFormatX8R8G8B8);
+                            NvKmsSurfaceMemoryFormatX8R8G8B8, blockLinear != 0,
+                            log2GobsPerBlockY);
 }
 
 void eclipse_kms_surface_free(struct NvKmsKapiDevice *device, struct EclipseKmsSurface *s)
@@ -983,7 +1010,7 @@ struct EclipseKmsSurface *eclipse_kms_cursor_surface(struct NvKmsKapiDevice *dev
     *phClient = device->hRmClient;
     *phMemory = memory->hRmHandle;
     s = eclipse_kms_wrap(device, memory, ECLIPSE_KMS_CURSOR, ECLIPSE_KMS_CURSOR,
-                         ECLIPSE_KMS_CURSOR * 4, NvKmsSurfaceMemoryFormatA8R8G8B8);
+                         ECLIPSE_KMS_CURSOR * 4, NvKmsSurfaceMemoryFormatA8R8G8B8, NV_FALSE, 0);
     if (s == NULL) {
         *phClient = 0;
         *phMemory = 0;

@@ -527,6 +527,35 @@ pub trait DrmScheme: Scheme {
         alloc::vec::Vec::new()
     }
 
+    /// Whether this driver scans block-linear framebuffers out as they are,
+    /// with no copy: NVIDIA 2D block-linear, Turing page kinds, generic
+    /// (uncompressed) kind, any block height up to 32 GOBs -- the surfaces
+    /// nvidia-drm advertises on its planes' `IN_FORMATS`. Only then does the
+    /// DRM core advertise modifiers. Default: no.
+    fn scans_out_block_linear(&self) -> bool {
+        false
+    }
+
+    /// [`Self::create_fb`] for a framebuffer whose pixels are block-linear
+    /// with blocks `1 << log2_gobs_per_block_y` GOBs high (`Some`), or
+    /// pitch-linear (`None`). `pitch` is bytes either way. A tiled one is
+    /// refused unless the driver can put it on the panel as it is, so that
+    /// `ADDFB2` fails and the compositor falls back to linear. Default: only
+    /// linear.
+    fn create_fb_tiled(
+        &self,
+        handle_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        log2_gobs_per_block_y: Option<u8>,
+    ) -> Option<u32> {
+        match log2_gobs_per_block_y {
+            None => self.create_fb(handle_id, width, height, pitch),
+            Some(_) => None,
+        }
+    }
+
     /// Set the panel's monitor to `width`x`height` at about `refresh_hz`,
     /// scanning out `fb_id`; `test_only` validates it and changes nothing.
     /// `None` when this driver does not do modesets; the error says why.

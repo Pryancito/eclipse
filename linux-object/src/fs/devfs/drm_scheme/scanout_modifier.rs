@@ -2,6 +2,7 @@
 //! `drm_scheme.rs` for its size ceiling; its tests are `scanout_modifier_tests`.
 
 use super::*;
+use alloc::vec::Vec;
 
 /// The page kinds a block-linear scanout buffer may carry: just
 /// `NV_MMU_VER2_PTE_KIND_GENERIC_MEMORY` (0x06), which is what NVK's layout
@@ -70,4 +71,56 @@ pub(super) fn decode_scanout_modifier(modifier: u64) -> Option<drm::ScanoutLayou
         log2_gobs_per_block_y: h as u8,
         page_kind: k as u8,
     })
+}
+
+/// The id `GETPROPBLOB` serves [`in_formats`] under: one below the EDID
+/// range, so it is no connector's and no id the blob store hands out.
+pub(super) const IN_FORMATS_BLOB_ID: u32 = EDID_BLOB_BASE - 1;
+
+/// The primary plane's `IN_FORMATS` blob (`struct drm_format_modifier_blob`,
+/// version 1), as nvidia-drm builds it for Turing: the block-linear
+/// modifiers with the generic page kind from 32 GOBs high down to one, then
+/// `LINEAR`, each for every format of [`drm::SCANOUT_FORMATS`]. Each one is
+/// a layout [`decode_scanout_modifier`] accepts, so what wlroots picks from
+/// here `ADDFB2` takes.
+pub(super) fn in_formats() -> Vec<u8> {
+    let formats = &drm::SCANOUT_FORMATS;
+    let mut modifiers: Vec<u64> = (0..=NVIDIA_MOD_MAX_LOG2_GOBS_Y as u8)
+        .rev()
+        .map(|h| {
+            scanout_layout_modifier(drm::ScanoutLayout::BlockLinear {
+                log2_gobs_per_block_y: h,
+                page_kind: NVIDIA_SCANOUT_PAGE_KINDS[0],
+            })
+        })
+        .collect();
+    modifiers.push(DRM_FORMAT_MOD_LINEAR);
+    const HEADER: usize = 24;
+    let formats_offset = HEADER;
+    // `drm_format_modifier` holds a u64: the array starts 8-aligned.
+    let modifiers_offset = (formats_offset + 4 * formats.len()).next_multiple_of(8);
+    let mut blob = Vec::with_capacity(modifiers_offset + 24 * modifiers.len());
+    for word in [
+        1, // version: FORMAT_BLOB_CURRENT
+        0, // flags
+        formats.len() as u32,
+        formats_offset as u32,
+        modifiers.len() as u32,
+        modifiers_offset as u32,
+    ] {
+        blob.extend_from_slice(&word.to_ne_bytes());
+    }
+    for f in formats {
+        blob.extend_from_slice(&f.to_ne_bytes());
+    }
+    blob.resize(modifiers_offset, 0);
+    // Every modifier applies to every format: mask bits 0..n from index 0.
+    let mask: u64 = (1u64 << formats.len()) - 1;
+    for m in modifiers {
+        blob.extend_from_slice(&mask.to_ne_bytes());
+        blob.extend_from_slice(&0u32.to_ne_bytes()); // offset
+        blob.extend_from_slice(&0u32.to_ne_bytes()); // pad
+        blob.extend_from_slice(&m.to_ne_bytes());
+    }
+    blob
 }

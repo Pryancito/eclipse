@@ -194,14 +194,14 @@ fn the_modifier_cap_and_what_addfb2_takes_are_the_same_switch() {
 
     // DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 0): one GOB
     // per block, so the surface is its own 64x8 block and a 64x64 dumb
-    // buffer is big enough. The pitch counts BLOCKS: 64 pixels of 4
-    // bytes is 256 bytes, which is 4 blocks.
+    // buffer is big enough. The pitch is bytes, as in Linux: 64 pixels
+    // of 4 bytes is 256 bytes, four GOBs wide.
     let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
     let tiled = |b: &DrmModeCreateDumb| {
         let mut c = cmd(b);
         c.flags = DRM_MODE_FB_MODIFIERS;
         c.modifier[0] = turing;
-        c.pitches[0] = 4;
+        c.pitches[0] = 256;
         c
     };
 
@@ -263,7 +263,7 @@ fn a_tiled_framebuffer_reads_back_as_the_modifier_it_was_made_with() {
         let mut c = cmd(&buf);
         c.flags = DRM_MODE_FB_MODIFIERS;
         c.modifier[0] = turing;
-        c.pitches[0] = 4;
+        c.pitches[0] = 256;
         let fb = accepted(&client, c, "a Turing block-linear modifier");
         let back = getfb2(&client, fb);
         assert_eq!(back.modifier[0], turing, "h={} did not round-trip", h);
@@ -284,14 +284,9 @@ fn a_tiled_framebuffer_reads_back_as_the_modifier_it_was_made_with() {
     drm::set_scanout_modifiers_enabled(false);
 }
 
-/// `GETFB2` answers the pitch in the units `ADDFB2` took it, which for a
-/// tiled framebuffer is 64-byte blocks.
-///
-/// The framebuffer stores bytes, so reporting the stored number straight
-/// describes a surface 64 times wider than the one that exists -- and a
-/// client that re-creates the framebuffer from its own readback gets
-/// EINVAL at best and the wrong surface at worst. Round-tripping it is
-/// the whole point of answering the modifier in the first place.
+/// `GETFB2` answers the pitch `ADDFB2` took, which for a tiled framebuffer
+/// is bytes like any other: a client that re-creates the framebuffer from
+/// its own readback has to get the same surface.
 #[test]
 fn a_tiled_framebuffer_reads_back_the_pitch_it_was_made_with() {
     let _serialised = drm::test_globals::lock();
@@ -300,57 +295,50 @@ fn a_tiled_framebuffer_reads_back_the_pitch_it_was_made_with() {
     let buf = client.create_dumb(64, 64);
     let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
 
-    // 64 pixels x 4 bytes = 256 bytes = 4 blocks of 64.
     let mut c = cmd(&buf);
     c.flags = DRM_MODE_FB_MODIFIERS;
     c.modifier[0] = turing;
-    c.pitches[0] = 4;
+    c.pitches[0] = 256;
     let fb = accepted(&client, c, "a Turing block-linear modifier");
-    assert_eq!(
-        getfb2(&client, fb).pitches[0],
-        4,
-        "the readback has to be in blocks, like the request was"
-    );
+    assert_eq!(getfb2(&client, fb).pitches[0], 256);
 
-    // A linear framebuffer keeps speaking bytes.
     let plain = accepted(&client, cmd(&buf), "a plain linear framebuffer");
     assert_eq!(getfb2(&client, plain).pitches[0], cmd(&buf).pitches[0]);
 
     drm::set_scanout_modifiers_enabled(false);
 }
 
-/// The pitch of a block-linear framebuffer counts 64-byte blocks, so the
-/// "shorter than a row" check has to multiply before it compares.
-/// Reading it as bytes rejects every real tiled framebuffer by a factor
-/// of 64; not reading it at all accepts one 64 times too small and lets
-/// the present walk off the buffer.
+/// The pitch of a block-linear framebuffer is bytes, as nvidia-drm hands it
+/// to nvkms (`nvkms-kapi.c`: "Invalid block-linear pitch alignment" unless a
+/// whole 64-byte GOB, then `pitch >> 6`) and as nouveau checks it
+/// (`nouveau_check_bl_size`, `DIV_ROUND_UP(stride, 64)`). It must cover a
+/// row, be a whole GOB, and fit the buffer with the block padding.
 #[test]
-fn a_block_linear_pitch_is_counted_in_blocks() {
+fn a_block_linear_pitch_is_bytes_and_a_whole_gob() {
     let _serialised = drm::test_globals::lock();
     drm::set_scanout_modifiers_enabled(true);
     let client = Client::open(0);
     let buf = client.create_dumb(64, 64);
     let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
-    let with_pitch = |blocks: u32| {
+    let with_pitch = |bytes: u32| {
         let mut c = cmd(&buf);
         c.flags = DRM_MODE_FB_MODIFIERS;
         c.modifier[0] = turing;
-        c.pitches[0] = blocks;
+        c.pitches[0] = bytes;
         c
     };
 
-    // 64 pixels x 4 bytes = 256 bytes = 4 blocks. Four is exactly a row.
-    let fb = accepted(&client, with_pitch(4), "a pitch of exactly one row");
+    // 64 pixels x 4 bytes = 256 bytes, exactly a row.
+    let fb = accepted(&client, with_pitch(256), "a pitch of exactly one row");
     assert_ne!(fb, 0);
-    // Three blocks is 192 bytes, short of the 256 a row needs.
-    refused(&client, with_pitch(3), "a pitch shorter than a row");
-    // And the byte count that would be right for a LINEAR fb is 256
-    // blocks, i.e. 16 KiB per row -- far past this 16 KiB buffer once
-    // the eight rows of the block are counted.
+    refused(&client, with_pitch(192), "a pitch shorter than a row");
+    refused(&client, with_pitch(260), "a pitch that is not a whole GOB");
+    // Sixteen times the row, 4 KiB: 64 rows of it are past this 16 KiB
+    // buffer.
     refused(
         &client,
-        with_pitch(256),
-        "a pitch given in bytes by mistake",
+        with_pitch(4096),
+        "a surface bigger than its buffer",
     );
 
     drm::set_scanout_modifiers_enabled(false);

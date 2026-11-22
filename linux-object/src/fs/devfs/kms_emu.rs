@@ -366,6 +366,8 @@ pub(crate) struct CreatedFb {
     pub(crate) height: u32,
     pub(crate) pitch: u32,
     pub(crate) driver_fb_id: u32,
+    /// `Some(log2 GOBs per block)` for a block-linear one.
+    pub(crate) block_linear: Option<u8>,
 }
 
 /// One cursor image the emulated GPU was offered, exactly as the core handed it
@@ -454,6 +456,10 @@ pub(crate) struct EmuGpu {
     modes: Vec<DisplayMode>,
     /// The hardware frame counter, `u32::MAX` for a GPU that has none.
     frame: AtomicU32,
+    /// Whether it scans block-linear out (nvkms), and whether it then takes
+    /// the block-linear fbs it is offered.
+    block_linear: AtomicBool,
+    takes_block_linear: AtomicBool,
     calls: Mutex<GpuCalls>,
 }
 
@@ -481,6 +487,8 @@ impl EmuGpu {
             sysmem_objects: Vec::new(),
             modes: Vec::new(),
             frame: AtomicU32::new(u32::MAX),
+            block_linear: AtomicBool::new(false),
+            takes_block_linear: AtomicBool::new(true),
             calls: Mutex::new(GpuCalls::default()),
         }
     }
@@ -658,6 +666,27 @@ impl DrmScheme for EmuGpu {
     }
 
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+        self.create_fb_tiled(handle_id, width, height, pitch, None)
+    }
+
+    fn scans_out_block_linear(&self) -> bool {
+        self.block_linear.load(Ordering::Relaxed)
+    }
+
+    fn create_fb_tiled(
+        &self,
+        handle_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        block_linear: Option<u8>,
+    ) -> Option<u32> {
+        if block_linear.is_some()
+            && !(self.block_linear.load(Ordering::Relaxed)
+                && self.takes_block_linear.load(Ordering::Relaxed))
+        {
+            return None;
+        }
         let driver_fb_id = self.next_fb.fetch_add(1, Ordering::Relaxed);
         self.calls.lock().created_fbs.push(CreatedFb {
             gem_handle: handle_id,
@@ -665,6 +694,7 @@ impl DrmScheme for EmuGpu {
             height,
             pitch,
             driver_fb_id,
+            block_linear,
         });
         Some(driver_fb_id)
     }
@@ -824,6 +854,13 @@ impl Gpu {
     /// a GPU never given one has none.
     pub(crate) fn set_frame(&self, n: u32) {
         self.gpu.frame.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether the GPU scans block-linear out as it is (nvkms), and whether
+    /// it then takes the block-linear fbs it is offered.
+    pub(crate) fn set_block_linear(&self, scans: bool, takes: bool) {
+        self.gpu.block_linear.store(scans, Ordering::Relaxed);
+        self.gpu.takes_block_linear.store(takes, Ordering::Relaxed);
     }
 
     /// Every modeset the driver committed: (w, h, Hz, fb).

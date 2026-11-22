@@ -105,6 +105,14 @@ pub(super) fn hw_frame_count(gpu: &NvidiaGpu) -> Option<u32> {
     (v >> 16 != 0xBADF).then_some(v >> 16)
 }
 
+/// [`NvidiaGpu::scans_out_block_linear`]: nvkms lit a head of this card,
+/// and the compositor's buffers can be in VRAM, the only memory nvkms scans.
+/// Then nvkms flips to a block-linear surface as it is, as nvidia-drm does
+/// for the modifiers it lists. Lock-free: the DRM core asks it per ioctl.
+pub(super) fn scans_out_block_linear(gpu: &NvidiaGpu) -> bool {
+    gpu.vblank_head.load(Ordering::Acquire) < 8 && super::gem_vram::enabled()
+}
+
 fn now_us() -> u64 {
     unsafe { crate::bus::drivers_timer_now_as_micros() }
 }
@@ -196,6 +204,14 @@ static FIRST_FLIP: AtomicBool = AtomicBool::new(false);
 static FLIP_FAILED: AtomicBool = AtomicBool::new(false);
 static CONSOLE_BACK_FAILED: AtomicBool = AtomicBool::new(false);
 static OFF_MODE_COPY: AtomicBool = AtomicBool::new(false);
+static FIRST_BLOCK_LINEAR: AtomicBool = AtomicBool::new(false);
+
+fn layout_name(block_linear: Option<u8>) -> String {
+    match block_linear {
+        None => String::from("lineal"),
+        Some(h) => format!("block-linear de {} GOBs", 1u32 << h),
+    }
+}
 static CURSOR_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// One `[nvkms]` line per boot for a per-frame event.
@@ -458,6 +474,10 @@ impl NvidiaGpu {
         let scanout = card.scanout.as_mut()?;
         let in_vram = fb.h_memory != 0 && fb.vram_offset.is_some();
         if !in_vram || !self.nvkms_import(device, scanout, fb) {
+            // A tiled fb has no copy to fall back to, and the console stays.
+            if fb.block_linear.is_some() {
+                return Some(false);
+            }
             if scanout.mode.is_some() {
                 // The console does not fit a mode a client set.
                 log_once(&OFF_MODE_COPY, || {
@@ -621,6 +641,27 @@ impl NvidiaGpu {
         Some(result)
     }
 
+    /// Whether nvkms takes the fb `fb_id` as a surface, made now: a
+    /// block-linear fb it refuses is refused at `ADDFB2`, so the compositor
+    /// goes back to linear before a frame is lost.
+    pub(super) fn nvkms_takes_fb(&self, fb_id: u32) -> bool {
+        let Some(fb) = self.kms_fb(fb_id) else {
+            return false;
+        };
+        if fb.h_memory == 0 || fb.vram_offset.is_none() {
+            return false;
+        }
+        let mut guard = self.nvkms_device.lock();
+        let Some(card) = guard.as_mut() else {
+            return false;
+        };
+        let device = &card.device;
+        let Some(scanout) = card.scanout.as_mut() else {
+            return false;
+        };
+        self.nvkms_import(device, scanout, &fb)
+    }
+
     /// Make sure `fb` has its nvkms surface: its GEM duped into kapi's RM
     /// client. Whether it has one.
     fn nvkms_import(
@@ -650,19 +691,39 @@ impl NvidiaGpu {
                     fb.width,
                     fb.height,
                     fb.pitch,
+                    fb.block_linear,
                 )
             });
         if surface.is_none() {
             crate::klog_warn!(
-                "[nvkms] {}: nvkms no acepta el fb {} ({}x{} pitch {}, hMem {:#x}) como superficie; \
-                 ese fb se copia a la consola",
+                "[nvkms] {}: nvkms no acepta el fb {} ({}x{} pitch {}, hMem {:#x}, {}) como \
+                 superficie; {}",
                 self.bdf_tag(),
                 fb.id,
                 fb.width,
                 fb.height,
                 fb.pitch,
-                fb.h_memory
+                fb.h_memory,
+                layout_name(fb.block_linear),
+                if fb.block_linear.is_some() {
+                    "ADDFB2 lo rechaza y el compositor vuelve a lineal"
+                } else {
+                    "ese fb se copia a la consola"
+                }
             );
+        } else if let Some(h) = fb.block_linear {
+            log_once(&FIRST_BLOCK_LINEAR, || {
+                format!(
+                    "{}: primera superficie block-linear (bloques de {} GOBs, fb {} {}x{} pitch {}): \
+                     nvkms la escanea sin copia",
+                    self.bdf_tag(),
+                    1u32 << h,
+                    fb.id,
+                    fb.width,
+                    fb.height,
+                    fb.pitch
+                )
+            });
         }
         let ok = surface.is_some();
         scanout.fbs.push((fb.id, surface));
