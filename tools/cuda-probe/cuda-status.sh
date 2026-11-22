@@ -51,16 +51,6 @@ else
   ok=0
 fi
 
-# NVDEC/NVENC (ffmpeg -hwaccel cuda, h264_nvenc): informational only.
-echo "[video]"
-for lib in libnvcuvid.so.1 libnvidia-encode.so.1; do
-  if [ -e "/usr/lib/x86_64-linux-gnu/$lib" ]; then
-    echo "  $lib ok (nvcodec-probe tests it)"
-  else
-    echo "  $lib missing (an image built before NVDEC/NVENC were packaged)"
-  fi
-done
-
 # Ollama on Linux resolves LibOllamaPath as dirname(exe)/../lib/ollama.
 echo "[ollama]"
 if ! command -v ollama >/dev/null 2>&1; then
