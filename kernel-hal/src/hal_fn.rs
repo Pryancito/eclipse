@@ -41,6 +41,11 @@ hal_fn_def! {
         /// Get the CPU brand/model name.
         pub fn cpu_brand() -> String { String::new() }
 
+        /// The vendor string `/proc/cpuinfo` calls `vendor_id` (CPUID leaf 0
+        /// on x86: `GenuineIntel`, `AuthenticAMD`...), or empty when there
+        /// is none to read.
+        pub fn cpu_vendor() -> String { String::new() }
+
         /// Space-separated `/proc/cpuinfo` `flags` tokens for this CPU: features
         /// the hardware has **and** the kernel has made usable in userspace.
         /// AVX/AVX2 appear only when XSAVE+XCR0 were enabled at boot (so a

@@ -21,8 +21,11 @@ use crate::process::ProcessExt;
 mod arg_area;
 #[cfg(test)]
 mod comm_tests;
+/// `/proc/cpuinfo`, in its own file for the size ratchet.
+mod cpuinfo;
 #[cfg(test)]
 mod cwd_tests;
+use cpuinfo::proc_cpuinfo_content;
 /// `/proc/diskstats`: what each disk has read and written.
 mod diskstats;
 #[cfg(test)]
@@ -247,22 +250,11 @@ fn sanitize_comm(name: &str) -> String {
 /// A name as the ONE-LINE files have to carry it: `\n` escaped so the line
 /// stays one line, and `\` escaped so that escape can be undone.
 ///
-/// [`sanitize_comm`] takes the parentheses out, which is what field 2 of
-/// `/proc/<pid>/stat` needs. It left the newline in, and
-/// `prctl(PR_SET_NAME, "mal\nnombre")` is one call from any program:
-/// `comm_from_user_bytes` stores those bytes as they came, so the stat line
-/// ended mid-name and a second line followed it. `ps`, `top` and `htop` read
-/// that file whole and split it after the last `)`, so the tail of one
-/// process's name became another process's fields -- and `ps` walks every pid,
-/// so one process with such a name was enough to spoil the whole listing.
-/// `/proc/<pid>/status` came apart the same way: `Name:` stopped at the
-/// newline and what followed was a line no key matched.
-///
-/// Linux escapes these same two characters in these same files
-/// (`proc_task_name` in `fs/proc/array.c` calls `seq_escape_str` with
-/// `ESCAPE_SPACE | ESCAPE_SPECIAL` limited to `"\n\\"`), and it escapes
-/// nothing in `/proc/<pid>/comm`, which is a whole file for one name and has
-/// no line to break. Neither does this.
+/// Linux escapes these same two characters in `status` (`proc_task_name`
+/// calls `seq_escape_str` with `ESCAPE_SPACE | ESCAPE_SPECIAL` limited to
+/// `"\n\\"`), and nothing in `stat` or `comm`, which take the name as it
+/// is. The listings of this kernel's own (`threads`, the top table) escape
+/// it too, being positional lines.
 fn escaped_comm(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -609,7 +601,10 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     rest[41 - 5] = policy;
     layout::fill_stat(&mut rest, layout::Mm::of(proc), may_read_innards_of(proc));
 
-    let mut out = format!("{} ({}) {} {}", pid, escaped_comm(&comm), state, ppid);
+    // `do_task_stat` calls `proc_task_name(m, task, false)`: field 2 is the
+    // name as it is, unescaped (only `status` escapes it). A reader splits
+    // after the last `)`, which is what makes that work.
+    let mut out = format!("{} ({}) {} {}", pid, comm, state, ppid);
     for v in rest.iter() {
         let _ = write!(out, " {}", v);
     }
@@ -1042,13 +1037,10 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Perf,
             })),
-            "maps" => {
-                self.check_read_innards()?;
-                Ok(Arc::new(ProcPidFileINode {
-                    pid: self.pid,
-                    kind: ProcPidFileKind::Maps,
-                }))
-            }
+            "maps" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Maps,
+            })),
             // Reuse the /proc/self/fd directory for any pid: it resolves the
             // fd table of the process it is handed at lookup time.
             "fd" => {
@@ -1067,13 +1059,10 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Comm,
             })),
-            "environ" => {
-                self.check_read_innards()?;
-                Ok(Arc::new(ProcPidFileINode {
-                    pid: self.pid,
-                    kind: ProcPidFileKind::Environ,
-                }))
-            }
+            "environ" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Environ,
+            })),
             "statm" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Statm,
@@ -1086,13 +1075,10 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Limits,
             })),
-            "auxv" => {
-                self.check_read_innards()?;
-                Ok(Arc::new(ProcPidFileINode {
-                    pid: self.pid,
-                    kind: ProcPidFileKind::Auxv,
-                }))
-            }
+            "auxv" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Auxv,
+            })),
             "oom_score_adj" | "oom_adj" | "oom_score" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: match name {
@@ -1410,8 +1396,9 @@ impl INode for ProcTidFileINode {
         Some(self.bytes())
     }
 
+    /// No `->write`, so `vfs_write` says `EINVAL` (no `FMODE_CAN_WRITE`).
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+        Err(FsError::InvalidParam)
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -2480,8 +2467,10 @@ impl INode for ProcSeqINode {
         Some(Ok((self.generate)().into_bytes()))
     }
 
+    /// `proc_reg_write` with no `proc_write`: `EIO`, the "write error:
+    /// Input/output error" of `echo 1 > /proc/uptime` as root.
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+        Err(FsError::DeviceError)
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -2737,6 +2726,24 @@ impl ProcPidFileKind {
     fn writable(self) -> bool {
         matches!(self, Self::Comm | Self::OomScoreAdj | Self::OomAdj)
     }
+
+    /// `maps`, `environ` and `auxv`: `mm_access` guards their OPEN (and so
+    /// their read), not their lookup, so `stat` of them works for anybody.
+    fn guarded(self) -> bool {
+        matches!(self, Self::Maps | Self::Environ | Self::Auxv)
+    }
+}
+
+/// What `open(2)` of a `/proc/<pid>` file asks beyond its mode: `EACCES` for
+/// a guarded one of a process the caller may not read (`proc_mem_open`).
+pub fn open_check(inode: &dyn INode) -> crate::error::LxResult {
+    match inode.downcast_ref::<ProcPidFileINode>() {
+        Some(f) if f.kind.guarded() => match crate::process::find_task(f.pid as _) {
+            Some(proc) if !may_read_innards_of(&proc) => Err(crate::error::LxError::EACCES),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
 }
 
 /// `/proc/<pid>/maps` in the format of Documentation/filesystems/proc.rst:
@@ -2749,6 +2756,7 @@ fn proc_pid_maps(proc: &Arc<Process>) -> String {
     use zircon_object::vm::MMUFlags;
     let mut s = String::new();
     let mm = layout::Mm::of(proc);
+    let mut last = None;
     for m in proc.vmar().mappings_dump() {
         let r = if m.flags.contains(MMUFlags::READ) {
             'r'
@@ -2766,18 +2774,12 @@ fn proc_pid_maps(proc: &Arc<Process>) -> String {
             '-'
         };
         let p = if m.shared { 's' } else { 'p' };
+        let name = layout::row_name(&m, mm.as_ref());
+        let (major, minor, ino) = layout::row_device(proc, name, &mut last);
         let _ = writeln!(
             s,
-            "{:08x}-{:08x} {}{}{}{} {:08x} 00:00 {:<10} {}",
-            m.start,
-            m.end,
-            r,
-            w,
-            x,
-            p,
-            m.file_offset,
-            m.vmo_id,
-            layout::row_name(&m, mm.as_ref())
+            "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {:<10} {}",
+            m.start, m.end, r, w, x, p, m.file_offset, major, minor, ino, name
         );
     }
     s
@@ -2792,6 +2794,9 @@ struct ProcPidFileINode {
 impl ProcPidFileINode {
     fn bytes(&self) -> Result<Vec<u8>> {
         let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        if self.kind.guarded() && !may_read_innards_of(&proc) {
+            return Err(FsError::NoPermission);
+        }
         Ok(match self.kind {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
             ProcPidFileKind::Cmdline => {
@@ -2848,8 +2853,9 @@ impl INode for ProcPidFileINode {
     /// `comm` renames the process's leader, as `task/<pid>/comm` does;
     /// `oom_score_adj` and `oom_adj` move its OOM adjustment.
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        // The rest have no `->write`: `EINVAL` from `vfs_write`.
         if !self.kind.writable() {
-            return Err(FsError::NotSupported);
+            return Err(FsError::InvalidParam);
         }
         let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         if !matches!(self.kind, ProcPidFileKind::Comm) {
@@ -3206,6 +3212,11 @@ fn meminfo_text(
     let _ = writeln!(s, "MemAvailable: {:>10} kB", available / 1024);
     let _ = writeln!(s, "Buffers:               0 kB");
     let _ = writeln!(s, "Cached:       {:>10} kB", cached / 1024);
+    // No swap device exists (`/proc/swaps` lists none), so these three are
+    // true zeros; `free(1)` and `vmstat` read the swap line from them.
+    let _ = writeln!(s, "SwapCached:            0 kB");
+    let _ = writeln!(s, "SwapTotal:             0 kB");
+    let _ = writeln!(s, "SwapFree:              0 kB");
     // The kernel heap is a FIXED arena, separate from the frames above, and
     // running it out kills the machine (`alloc_error` -> panic). It appeared
     // in no /proc file, so its growth could only be seen as the crash. Not a
@@ -4026,58 +4037,6 @@ fn proc_usbhid_content() -> String {
     }
     if !any {
         s.push_str("[usbhid] no USB HID input devices reporting diagnostics\n");
-    }
-    s
-}
-
-fn proc_cpuinfo_content() -> String {
-    let mut brand = kernel_hal::cpu::cpu_brand();
-    if brand.is_empty() {
-        brand = "Eclipse CPU".into();
-    }
-    let cpu_count = kernel_hal::cpu::cpu_count() as usize;
-    // Feature flags the kernel has made usable. Missing this line made Ollama
-    // (and anything that greps `flags`) guess wrong and load an AVX2/CUDA
-    // runner that then died with SIGILL (`illegal instruction`).
-    let flags = kernel_hal::cpu::cpuinfo_flags();
-    let mut s = String::new();
-    for i in 0..cpu_count {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use core::fmt::Write;
-            let _ = writeln!(
-                s,
-                "processor\t: {}\n\
-                 vendor_id\t: GenuineIntel\n\
-                 model name\t: {}\n\
-                 stepping\t: 0\n\
-                 cpu MHz\t\t: {:.3}\n\
-                 cache size\t: 4096 KB\n\
-                 physical id\t: {}\n\
-                 core id\t\t: {}\n\
-                 cpu cores\t: {}\n\
-                 flags\t\t: {}",
-                i,
-                brand,
-                kernel_hal::cpu::cpu_frequency() as f64,
-                i,
-                i,
-                cpu_count,
-                flags
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            use core::fmt::Write;
-            let _ = writeln!(
-                s,
-                "processor\t: {}\n\
-                 model name\t: {}\n\
-                 cpu cores\t: {}",
-                i, brand, cpu_count
-            );
-            let _ = flags; // unused on non-x86 until we grow a flags path
-        }
     }
     s
 }
@@ -5367,22 +5326,12 @@ mod comm_field_tests {
     }
 
     #[test]
-    fn a_newline_in_a_name_cannot_split_the_stat_line_in_two() {
+    fn field_two_of_stat_is_the_name_as_it_is() {
+        // `do_task_stat` writes the name with `proc_task_name(.., false)`:
+        // unescaped, newline and all; only `status` escapes it.
         let proc = a_process(9201, "mal\nnombre");
         let line = proc_pid_stat(&proc);
-        assert_eq!(
-            line.lines().count(),
-            1,
-            "/proc/<pid>/stat es UNA linea: {:?}",
-            line
-        );
-        assert!(
-            line.ends_with('\n') && line.matches('\n').count() == 1,
-            "el unico salto de linea es el del final: {:?}",
-            line
-        );
-        // The name survives, escaped the way Linux escapes it.
-        assert_eq!(comm_of(&line), "mal\\nnombre", "{:?}", line);
+        assert_eq!(comm_of(&line), "mal\nnombre", "{:?}", line);
         // And the fields after it still parse: field 3 is the state letter and
         // field 4 the ppid.
         let mut tail = tail_of(&line).split(' ');
@@ -5848,6 +5797,10 @@ mod proc_numbers_tests {
         assert_eq!(mem_kb(&text, "MemTotal:"), 16 * 1024);
         assert_eq!(mem_kb(&text, "MemFree:"), 12 * 1024);
         assert_eq!(mem_kb(&text, "MemAvailable:"), 12 * 1024);
+        // No swap device: the keys are there, and zero.
+        for key in ["SwapCached:", "SwapTotal:", "SwapFree:"] {
+            assert_eq!(mem_kb(&text, key), 0, "{}", key);
+        }
         // `free` divides by 1024 again to show MiB: bytes printed here are a
         // machine claiming a thousand times the memory it has.
         for line in text.lines() {

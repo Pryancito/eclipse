@@ -117,3 +117,34 @@ fn a_process_that_is_not_root_writes_the_comm_of_its_threads() {
     });
     assert_eq!(got.as_deref(), Ok("renamed\n"));
 }
+
+#[test]
+fn stat_sees_a_guarded_file_that_open_refuses() {
+    // `maps`, `environ` and `auxv` are guarded by `mm_access` at OPEN
+    // (`proc_mem_open`), not at lookup: `stat` of another user's works,
+    // `open` is `EACCES`.
+    let root = a_process(45_597);
+    let pid = root.id();
+    let proc = a_process(45_598);
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            become_a_user(sys);
+            let mut st = [0u64; 32];
+            ["maps", "environ", "auxv"].map(|name| {
+                let path = c(&format!("/proc/{}/{}", pid, name));
+                let stat = sys.sys_fstatat(
+                    FileDesc::CWD,
+                    UserInPtr::from(path.as_ptr() as usize),
+                    UserOutPtr::from(st.as_mut_ptr() as usize),
+                    0,
+                );
+                (stat, open(sys, &format!("/proc/{}/{}", pid, name), 0))
+            })
+        })
+    });
+    let _ = &root;
+    for (stat, open) in got {
+        assert_eq!(stat, Ok(0));
+        assert_eq!(open, Err(LxError::EACCES));
+    }
+}

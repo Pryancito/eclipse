@@ -63,6 +63,7 @@ const SIGSETSIZE: usize = 8;
 const BLOCKED: Signal = Signal::SIGRT34;
 
 fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "sigmask", lp).unwrap();

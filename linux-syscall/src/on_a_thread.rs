@@ -81,6 +81,31 @@ fn run_call(current: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send>> 
     })
 }
 
+static LOW_USER_PAGES: Mutex<()> = Mutex::new(());
+
+std::thread_local! {
+    static HOLDS_LOW_USER_PAGES: core::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Claim the fixed user addresses a test maps its process's pages at
+/// (`map_at(0x2x00_0000, ..)`), until the test's thread ends.
+///
+/// On the host every process's pages are the test binary's own address
+/// space: two tests that map the same address replace each other's page,
+/// and the first to exit unmaps the other's, which then faults (SIGSEGV
+/// for the whole run). Several files share a base, and every test of a
+/// file shares its file's, so whoever maps one holds this. Calling it again
+/// on the same thread is a no-op; a test that panicked does not keep it.
+pub(crate) fn claim_low_user_pages() {
+    HOLDS_LOW_USER_PAGES.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(LOW_USER_PAGES.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    });
+}
+
 /// Make `call` from a new thread of `proc` and return what it returns.
 ///
 /// The thread exits when the call returns, and with it the process if it

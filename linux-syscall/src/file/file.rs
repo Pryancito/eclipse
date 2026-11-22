@@ -14,7 +14,7 @@ use linux_object::error::LxResult;
 use linux_object::fs::devfs::DspDev;
 use linux_object::fs::ioctl::{
     FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TCGETS2, TCSETS2, TCSETSF2, TCSETSW2,
-    TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
+    TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP,
 };
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
@@ -2282,9 +2282,32 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EINVAL);
                 }
+                // A regular file past its end says how far past, as a
+                // negative count (`i_size - f_pos` in `file_ioctl`).
+                let left = file_like
+                    .downcast_ref::<linux_object::fs::File>()
+                    .and_then(|f| f.regular_bytes_left());
+                if let Some(left) = left {
+                    let mut out: UserOutPtr<i32> = arg1.into();
+                    out.write(left.clamp(i32::MIN as i64, i32::MAX as i64) as i32)?;
+                    return Ok(0);
+                }
                 if let Some(n) = file_like.readable_bytes() {
                     let mut out: UserOutPtr<i32> = arg1.into();
                     out.write(n.min(i32::MAX as usize) as i32)?;
+                    return Ok(0);
+                }
+            }
+            // `FIOQSIZE`: the size of a directory, a regular file or a
+            // symlink, as a `loff_t` (`ioctl_fioqsize`); anything else goes
+            // on to `ENOTTY`.
+            FIOQSIZE => {
+                let size = file_like
+                    .downcast_ref::<linux_object::fs::File>()
+                    .and_then(|f| f.quantity_size());
+                if let Some(size) = size {
+                    let mut out: UserOutPtr<i64> = arg1.into();
+                    out.write(size)?;
                     return Ok(0);
                 }
             }
@@ -2443,6 +2466,14 @@ impl Syscall<'_> {
                 }
             }
         }
+        // `tcsetpgrp(3)`: the group must exist and be in the caller's
+        // session (`tiocspgrp`). The terminal stores whatever it is handed
+        // and has no process context to ask, so it is asked here; a file that
+        // is no terminal goes on and answers `ENOTTY` itself.
+        if cmd == TIOCSPGRP && file_like.is_terminal() {
+            let pgid = UserInPtr::<i32>::from(arg1).read()?;
+            linux_object::process::foreground_group_verdict(&self.zircon_process(), pgid)?;
+        }
         // `TIOCGPTPEER` on a pty master: open its slave end and return a NEW
         // fd (Linux 4.13+). Needs the fd table, so it lives here rather than
         // in the inode's ioctl. `arg1` carries the open flags (O_RDWR |
@@ -2454,7 +2485,9 @@ impl Syscall<'_> {
                     .as_any_ref()
                     .downcast_ref::<linux_object::fs::pty::PtyMaster>()
                 {
-                    let slave = master.open_peer().ok_or(LxError::ENXIO)?;
+                    // `None` is a locked pair (`pty_open`: `EIO` until
+                    // `unlockpt(3)`); the master is open, it is our fd.
+                    let slave = master.open_peer().ok_or(LxError::EIO)?;
                     // `ptm_open_peer`: the flag word is open(2)'s, but only
                     // the access mode, `O_NOCTTY`, `O_NONBLOCK` and
                     // `O_CLOEXEC` may be in it; anything else (`O_PATH`,

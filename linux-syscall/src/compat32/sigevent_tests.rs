@@ -111,6 +111,7 @@ impl Drop for Fixture {
 }
 
 fn a_process(pid: KoID, abi: Abi) -> Fixture {
+    crate::on_a_thread::claim_low_user_pages();
     // `create_linux` and not `create_with_fixed_id_ext`, which is what the
     // sibling files use: the exit callback that runs the exit hooks ---
     // and with them `drop_posix_timers_of` --- is installed by `create_linux`

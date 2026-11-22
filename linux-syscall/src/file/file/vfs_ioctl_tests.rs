@@ -371,7 +371,7 @@ fn what_is_left_to_read_is_counted_from_the_position_and_written_as_an_int() {
             );
 
             // At the end there is nothing left, and past the end the
-            // subtraction saturates rather than wrapping into a huge count.
+            // difference is negative, as `i_size - f_pos` put in an int is.
             assert_eq!(sys.sys_lseek(fd, 10, SEEK_SET), Ok(10));
             assert_eq!(sys.sys_ioctl(fd, FIONREAD, pair_ptr, 0, 0).await, Ok(0));
             assert_eq!(pair, [0, -1], "a file read to its end has bytes waiting");
@@ -379,9 +379,15 @@ fn what_is_left_to_read_is_counted_from_the_position_and_written_as_an_int() {
             assert_eq!(sys.sys_ioctl(fd, FIONREAD, pair_ptr, 0, 0).await, Ok(0));
             assert_eq!(
                 pair,
-                [0, -1],
-                "a position past the end answered with a wrapped count"
+                [-30, -1],
+                "a position past the end is how far past it, negative"
             );
+
+            // `FIOQSIZE` is the size, as a `loff_t`, wherever the position is.
+            let mut size = [0_i64, -1];
+            let size_ptr = size.as_mut_ptr() as usize;
+            assert_eq!(sys.sys_ioctl(fd, FIOQSIZE, size_ptr, 0, 0).await, Ok(0));
+            assert_eq!(size, [10, -1], "FIOQSIZE of a ten-byte file");
 
             assert_eq!(
                 sys.sys_ioctl(fd, FIONREAD, 0, 0, 0).await,
