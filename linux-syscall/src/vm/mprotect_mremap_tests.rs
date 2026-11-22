@@ -336,3 +336,52 @@ fn a_grow_in_place_keeps_the_history_of_the_part_that_stays() {
         })
     });
 }
+
+/// `do_mprotect_pkey` judges the range before the protection bits: an empty
+/// range is 0 and one that wraps is `ENOMEM`, whatever `prot` says. Only
+/// both grow bits together come first.
+#[test]
+fn mprotect_looks_at_the_range_before_the_protection_bits() {
+    let proc = a_process(48_908);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            const JUNK: usize = 0x100;
+            const GROWS_BOTH: usize = 0x0100_0000 | 0x0200_0000;
+            assert_eq!(sys.sys_mprotect(0x1000, 0, JUNK), Ok(0));
+            assert_eq!(
+                sys.sys_mprotect(0x1000, usize::MAX, JUNK),
+                Err(LxError::ENOMEM)
+            );
+            assert_eq!(sys.sys_mprotect(0x1000, PAGE, JUNK), Err(LxError::EINVAL));
+            assert_eq!(
+                sys.sys_mprotect(0x1000, 0, GROWS_BOTH),
+                Err(LxError::EINVAL)
+            );
+        })
+    });
+}
+
+/// `mmap` with a closed fd is `EBADF` before the length or the mapping
+/// type are judged; a misaligned offset still comes first.
+#[test]
+fn mmap_looks_at_the_fd_before_the_length_and_the_type() {
+    let proc = a_process(48_909);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            const MAP_PRIVATE: usize = 0x02;
+            let closed = FileDesc::from(999usize);
+            assert_eq!(
+                sys.sys_mmap(0, 0, RW, MAP_PRIVATE, closed, 0).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                sys.sys_mmap(0, PAGE, RW, 0, closed, 0).await,
+                Err(LxError::EBADF)
+            );
+            assert_eq!(
+                sys.sys_mmap(0, PAGE, RW, MAP_PRIVATE, closed, 1).await,
+                Err(LxError::EINVAL)
+            );
+        })
+    });
+}

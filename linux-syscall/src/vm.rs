@@ -231,6 +231,16 @@ impl Syscall<'_> {
         offset: u64,
     ) -> SysResult {
         let prot = MmapProt::from_bits_truncate(prot);
+        // Linux's order: the offset's alignment (the arch `sys_mmap`), then
+        // the descriptor (`ksys_mmap_pgoff`'s `fget`, `EBADF`), and only then
+        // what `do_mmap` judges -- the length, the mapping type, the flags.
+        // A bad fd used to lose to all of those.
+        if !offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(LxError::EINVAL);
+        }
+        if flags & MMAP_ANONYMOUS == 0 {
+            self.linux_process().get_open_file_like(fd)?;
+        }
         let shared = mmap_shared(flags, flags & MMAP_ANONYMOUS != 0)?;
         shared_validate_flags(flags)?;
         // No hugepages here. `MAP_HUGETLB` is in `LEGACY_MAP_MASK` so
@@ -958,11 +968,17 @@ impl Syscall<'_> {
         // that, racing a fork's copy loop, gave the child an address space
         // that never existed (llvmpipe's W^X churn vs the Xwayland fork).
         let _aspace = self.linux_process().aspace_lock().lock();
-        let prot = mprotect_prot(prot)?;
         info!(
-            "mprotect: addr={:#x}, size={:#x}, prot={:?}",
+            "mprotect: addr={:#x}, size={:#x}, prot={:#x}",
             addr, len, prot
         );
+        // `do_mprotect_pkey` in its order: both grow bits, the address, an
+        // empty range (0) and one that wraps (ENOMEM), and only then the
+        // protection bits themselves (`arch_validate_prot`). They used to
+        // be judged first, so `mprotect(p, 0, junk)` was EINVAL.
+        if prot & PROT_GROWSDOWN != 0 && prot & PROT_GROWSUP != 0 {
+            return Err(LxError::EINVAL);
+        }
         // Linux UAPI: addr must be page-aligned; len is rounded up to pages.
         let Some(len) = mprotect_args(addr, len)? else {
             // `if (!len) return 0;` (mm/mprotect.c), before Linux has looked at
@@ -972,6 +988,7 @@ impl Syscall<'_> {
             // under W^X enforcement answered `EINVAL`.
             return Ok(0);
         };
+        let prot = mprotect_prot(prot)?;
         // hunter W^X: reject (or audit) transitions to writable+executable,
         // including the two-step mmap(W)-then-mprotect(X) bypass (it tracks the
         // ever-writable history of this exact range).
@@ -1808,6 +1825,12 @@ fn msync_args(addr: usize, len: usize, flags: usize) -> LxResult<Option<usize>> 
     {
         return Err(LxError::EINVAL);
     }
+    // `len = (len + ~PAGE_MASK) & PAGE_MASK`, wrapping as Linux's does: a
+    // length within a page of `SIZE_MAX` rounds to nothing, and msync
+    // answers 0 for it (`if (end == start) goto out;` with `error = 0`).
+    if len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1) == 0 {
+        return Ok(None);
+    }
     match user_range(addr, len) {
         UserRange::Empty => Ok(None),
         UserRange::Pages(len) => Ok(Some(len)),
@@ -1837,7 +1860,10 @@ fn mincore_args(addr: usize, len: usize) -> LxResult<usize> {
 /// What `madvise(2)` answers for `(addr, len, advice)` (`mm/madvise.c`):
 /// unrecognised advice and a misaligned address are `EINVAL`, and so is a
 /// length whose round-up wrapped -- Linux spells that one out on its own line,
-/// `if (len_in && !len) return -EINVAL;`. An empty range succeeds.
+/// `if (len_in && !len) return -EINVAL;`, and an end that wraps below the
+/// start is too. An empty range succeeds. A range that does not wrap but
+/// runs past the address space reaches the VMA walk, which finds a hole
+/// there: `ENOMEM`, as for any unmapped part. It used to be `EINVAL`.
 fn madvise_args(addr: usize, len: usize, advice: usize) -> LxResult<Option<usize>> {
     if !madvise_advice_known(advice) || !addr.is_multiple_of(PAGE_SIZE) {
         return Err(LxError::EINVAL);
@@ -1845,7 +1871,14 @@ fn madvise_args(addr: usize, len: usize, advice: usize) -> LxResult<Option<usize
     match user_range(addr, len) {
         UserRange::Empty => Ok(None),
         UserRange::Pages(len) => Ok(Some(len)),
-        UserRange::Beyond => Err(LxError::EINVAL),
+        UserRange::Beyond => {
+            let rounded = roundup_pages(len);
+            if rounded == 0 || addr.checked_add(rounded).is_none() {
+                Err(LxError::EINVAL)
+            } else {
+                Err(LxError::ENOMEM)
+            }
+        }
     }
 }
 
@@ -1863,17 +1896,27 @@ fn madvise_args(addr: usize, len: usize, advice: usize) -> LxResult<Option<usize
 /// then let the round-up wrap to zero. An `end` of zero is below every `start`,
 /// so the walk ran zero times and `mlock` reported the whole address space
 /// locked.
+///
+/// The arithmetic is Linux's own, wrapping included (`do_mlock`, then
+/// `apply_vma_lock_flags`): a length that rounds to nothing is success, an
+/// end that wraps below the start is `EINVAL`, and one past the address
+/// space finds no VMA (`ENOMEM`). `mlock(p, SIZE_MAX)` is therefore 0 on
+/// Linux, and so it is here.
 fn mlock_args(addr: usize, len: usize) -> LxResult<Option<(usize, usize)>> {
-    if len == 0 {
+    let off = addr & (PAGE_SIZE - 1);
+    let start = addr - off;
+    let len = len.wrapping_add(off).wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Err(LxError::EINVAL);
+    }
+    if end == start {
         return Ok(None);
     }
-    let start = round_down_pages(addr);
-    let span = (addr - start).checked_add(len).ok_or(LxError::ENOMEM)?;
-    match user_range(start, span) {
-        UserRange::Empty => Ok(None),
-        UserRange::Pages(span) => Ok(Some((start, start + span))),
-        UserRange::Beyond => Err(LxError::ENOMEM),
+    if end > USER_ASPACE_END {
+        return Err(LxError::ENOMEM);
     }
+    Ok(Some((start, end)))
 }
 
 /// The two lengths `mremap(2)` works with (`mm/mremap.c`). `old_addr` must be
@@ -2720,9 +2763,52 @@ mod mm_range_tests {
     fn no_memory_syscall_takes_a_length_that_names_the_whole_address_space() {
         for len in HOSTILE {
             for (name, answer) in answers(0x1000, len) {
+                // msync and mlock round with a wrapping add, as Linux does,
+                // and a length within a page of `SIZE_MAX` rounds to nothing:
+                // success, on Linux too. See the test below.
+                let wraps_to_nothing = len.wrapping_add(PAGE - 1) & !(PAGE - 1) == 0;
+                if matches!(name, "msync" | "mlock") && wraps_to_nothing {
+                    assert_eq!(answer, Ok(()), "{} len={:#x}", name, len);
+                    continue;
+                }
                 assert!(answer.is_err(), "{} accepted len={:#x}", name, len);
             }
         }
+    }
+
+    #[test]
+    fn msync_and_mlock_round_the_length_with_linuxs_wrapping_add() {
+        // `mm/msync.c`: `len = (len + ~PAGE_MASK) & PAGE_MASK;` and an empty
+        // range is 0. `mm/mlock.c` the same, and an end below the start is
+        // EINVAL (`apply_vma_lock_flags`).
+        assert_eq!(msync_args(0x1000, usize::MAX, MS_SYNC), Ok(None));
+        assert_eq!(mlock_args(0x1000, usize::MAX), Ok(None));
+        assert_eq!(
+            msync_args(0x1000, usize::MAX - 4095, MS_SYNC),
+            Err(LxError::ENOMEM)
+        );
+        assert_eq!(mlock_args(0x1000, usize::MAX - 4095), Err(LxError::EINVAL));
+        // An unaligned address with no length still covers its page.
+        assert_eq!(mlock_args(0x1001, 0), Ok(Some((0x1000, 0x2000))));
+    }
+
+    #[test]
+    fn madvise_past_the_address_space_is_a_hole_and_a_wrap_is_einval() {
+        // `do_madvise`: a length whose round-up wraps, or an end below the
+        // start, is EINVAL; a range that merely runs past the top finds a
+        // hole in the VMA walk, which is ENOMEM.
+        assert_eq!(
+            madvise_args(0x1000, usize::MAX, MADV_DONTNEED),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            madvise_args(0x1000, usize::MAX - 4095, MADV_DONTNEED),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            madvise_args(0x1000, 1 << 63, MADV_DONTNEED),
+            Err(LxError::ENOMEM)
+        );
     }
 
     #[test]
@@ -2730,13 +2816,14 @@ mod mm_range_tests {
         let len = usize::MAX;
         assert_eq!(munmap_args(0x1000, len), Err(LxError::EINVAL));
         assert_eq!(mprotect_args(0x1000, len), Err(LxError::ENOMEM));
-        assert_eq!(msync_args(0x1000, len, MS_SYNC), Err(LxError::ENOMEM));
+        assert_eq!(msync_args(0x1000, len, MS_SYNC), Ok(None));
         assert_eq!(mincore_args(0x1000, len), Err(LxError::ENOMEM));
         assert_eq!(
             madvise_args(0x1000, len, MADV_DONTNEED),
             Err(LxError::EINVAL)
         );
-        assert_eq!(mlock_args(0x1000, len), Err(LxError::ENOMEM));
+        assert_eq!(mlock_args(0x1000, len), Ok(None));
+        assert_eq!(mlock_args(0x1000, 1 << 63), Err(LxError::ENOMEM));
         assert_eq!(mremap_args(0x1000, len, PAGE), Err(LxError::EINVAL));
         assert_eq!(mremap_args(0x1000, PAGE, len), Err(LxError::EINVAL));
     }
@@ -2822,7 +2909,8 @@ mod mm_range_tests {
         // ran zero times and `mlock` reported the whole space locked.
         let addr = 0x1000;
         assert_eq!(roundup_pages(addr + (usize::MAX - addr)), 0);
-        assert_eq!(mlock_args(addr, usize::MAX - addr), Err(LxError::ENOMEM));
+        // On Linux that end wraps below the start, which is EINVAL.
+        assert_eq!(mlock_args(addr, usize::MAX - addr), Err(LxError::EINVAL));
     }
 
     #[test]

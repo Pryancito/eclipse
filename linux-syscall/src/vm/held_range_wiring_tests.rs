@@ -426,14 +426,14 @@ fn msync_takes_its_flags_and_its_range_from_the_man_page() {
             // An address that is not the start of a page.
             assert_eq!(sys.sys_msync(at + 1, PAGE, MS_SYNC), Err(LxError::EINVAL));
 
-            // The length that used to report success over a range it never
-            // looked at: `addr + roundup_pages(len)` wrapped to zero, so
-            // the walk ran zero times and `msync(p, -1, MS_SYNC)` said the
-            // file was written back.
+            // `msync(p, -1, MS_SYNC)` is 0 on Linux: `mm/msync.c` rounds
+            // the length up with a wrapping add, `SIZE_MAX` rounds to 0, and
+            // an empty range is success. A length that does not wrap to
+            // nothing but runs past the top is still ENOMEM, below.
             assert_eq!(
                 sys.sys_msync(at, usize::MAX, MS_SYNC),
-                Err(LxError::ENOMEM),
-                "a length that covers the whole address space was accepted"
+                Ok(0),
+                "a length that rounds to nothing, as Linux rounds it"
             );
             assert_eq!(
                 sys.sys_msync(at, usize::MAX - PAGE, MS_SYNC),
