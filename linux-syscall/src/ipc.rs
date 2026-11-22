@@ -374,6 +374,17 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
+        // Before the set is looked up, as Linux does: `ksys_semctl` copies
+        // `IPC_SET`'s buffer in (EFAULT), and `semctl_setval` judges the
+        // value (ERANGE) before it finds the set.
+        let set_ds = match cmd {
+            SemctlCmds::IPC_SET => Some(ipcbuf::get_semid_ds(self.narrow_abi(), arg)?),
+            _ => None,
+        };
+        let setval = match cmd {
+            SemctlCmds::SETVAL => Some(setval_from_arg(arg)?),
+            _ => None,
+        };
         // As in `shmctl`: what the first argument names depends on the
         // command, and looking it up as an id first made `semctl(0, 0,
         // SEM_INFO)` EINVAL (busybox `ipcs -s`: "kernel not configured").
@@ -398,6 +409,12 @@ impl Syscall<'_> {
                     .ok_or(LxError::EINVAL)?,
             ),
         };
+        // `semctl_setval` checks the semaphore number before the
+        // permissions; the other per-semaphore commands ask permission
+        // first (`semctl_main`).
+        if cmd == SemctlCmds::SETVAL && sem_array.get_sem(num).is_none() {
+            return Err(LxError::EINVAL);
+        }
         if let Some(want) = semctl_access(&cmd) {
             let proc = self.linux_process();
             if !sem_array.may_access(proc.euid(), proc.egid(), &proc.groups(), want) {
@@ -419,7 +436,7 @@ impl Syscall<'_> {
                 // bytes to a 32-bit process and 104 here, and not the same
                 // fields in smaller words either. See
                 // [`crate::narrow::ipcbuf`].
-                let ds = ipcbuf::get_semid_ds(self.narrow_abi(), arg)?;
+                let ds = set_ds.ok_or(LxError::EFAULT)?;
                 // update IpcPerm
                 sem_array.set(&ds, self.linux_process().euid())?;
                 sem_array.ctime();
@@ -475,7 +492,7 @@ impl Syscall<'_> {
                     SemctlCmds::GETNCNT => Ok(sem.get_ncnt()),
                     SemctlCmds::GETZCNT => Ok(0),
                     SemctlCmds::SETVAL => {
-                        let value = setval_from_arg(arg)?;
+                        let value = setval.ok_or(LxError::ERANGE)?;
                         // Under the set-wide lock, as `semctl_main` holds
                         // `sem_lock(sma)` for `SETVAL` exactly as for `SETALL`
                         // -- and as `GETALL` and `SETALL` do here. Without it
@@ -551,10 +568,12 @@ impl Syscall<'_> {
             "msgsnd: id={}, msgp={:#x}, msgsz={}, flags={:#x}, abi32={}",
             id, msgp, msgsz, msgflg, abi32
         );
+        // `ksys_msgsnd` reads `mtype` (EFAULT) before `do_msgsnd` judges
+        // the size.
+        let mtype = read_mtype(msgp, abi32)?;
         if msgsz > MSGMAX {
             return Err(LxError::EINVAL);
         }
-        let mtype = read_mtype(msgp, abi32)?;
         // msgsnd(2): the type must be strictly positive.
         if mtype < 1 {
             return Err(LxError::EINVAL);
@@ -663,13 +682,14 @@ impl Syscall<'_> {
         match cmd {
             IPC_RMID => msg_remove(id, self.linux_process().euid()).map(|_| 0),
             IPC_SET => {
-                let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
                 // `msg_qbytes` is the one field read back in, and it is at
                 // offset 68 to a 32-bit caller against 88 here --- which is
                 // also the whole LENGTH of the narrow structure, so reading
                 // at the native offset reads past the end of the caller's
-                // buffer.
+                // buffer. Read before the lookup, as `ksys_msgctl` copies it
+                // in first (EFAULT before EINVAL).
                 let ds = ipcbuf::get_msqid_ds(self.narrow_abi(), buf)?;
+                let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
                 queue.set(&ds, self.linux_process().euid())?;
                 Ok(0)
             }
@@ -911,6 +931,12 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
+        // `ksys_shmctl` copies `IPC_SET`'s buffer in before it looks the id
+        // up: an unreadable one is EFAULT even for an id that names nothing.
+        let set_ds = match cmd {
+            ShmctlCmds::IPC_SET => Some(ipcbuf::get_shmid_ds(self.narrow_abi(), buffer)?),
+            _ => None,
+        };
         // What the first argument names depends on the command: the two
         // table commands ignore it, the two `SHM_STAT`s take an INDEX, the
         // rest an id. Looking the id up first, for every command, made
@@ -987,9 +1013,10 @@ impl Syscall<'_> {
                 Ok(0)
             }
             ShmctlCmds::IPC_SET => {
-                // Read userspace BEFORE locking the segment, and at the
-                // caller's width: 84 bytes to a 32-bit process, 112 here.
-                let set_ds = ipcbuf::get_shmid_ds(self.narrow_abi(), buffer)?;
+                // Read from userspace above, BEFORE the lookup and so before
+                // locking the segment, at the caller's width: 84 bytes to a
+                // 32-bit process, 112 here.
+                let set_ds = set_ds.ok_or(LxError::EFAULT)?;
                 let shm_guard = guard.lock();
                 shm_guard.set(&set_ds, self.linux_process().euid())?;
                 shm_guard.ctime();
