@@ -527,6 +527,24 @@ pub trait DrmScheme: Scheme {
         alloc::vec::Vec::new()
     }
 
+    /// Detect the connectors again, as Linux's output poll does for a
+    /// connector with no hotplug interrupt (`drm_kms_helper_poll`): `true`
+    /// when one of them came or went since the last call, and the DRM core
+    /// then sends userspace a hotplug uevent for this card. Called every few
+    /// seconds from a kernel thread, never with a DRM lock held. Default: no
+    /// change.
+    fn poll_connectors(&self) -> bool {
+        false
+    }
+
+    /// Whether this card lights its own monitors: a real modeset and flips
+    /// of its own (nvkms), not only the firmware's panel. Such a card's node
+    /// lists its own CRTC and connectors beside the panel's card, as every
+    /// card that scans out does in Linux. Default: no.
+    fn drives_own_display(&self) -> bool {
+        false
+    }
+
     /// Whether this driver scans block-linear framebuffers out as they are,
     /// with no copy: NVIDIA 2D block-linear, Turing page kinds, generic
     /// (uncompressed) kind, any block height up to 32 GOBs -- the surfaces

@@ -253,19 +253,13 @@ fn a_driver_starts_only_when_the_kernel_left_it_its_device() {
         "virtio-net@0"
     ));
     // Not handed over: no option, another device, or a longer name.
-    assert!(!cmdline_udriver_in("LOG=warn:desktop=labwc", "virtio-net@0"));
     assert!(!cmdline_udriver_in(
-        "udriver=virtio-blk@1",
+        "LOG=warn:desktop=labwc",
         "virtio-net@0"
     ));
-    assert!(!cmdline_udriver_in(
-        "udriver=virtio-net@10",
-        "virtio-net@1"
-    ));
-    assert!(!cmdline_udriver_in(
-        "udriver=virtio-net@1",
-        "virtio-net@10"
-    ));
+    assert!(!cmdline_udriver_in("udriver=virtio-blk@1", "virtio-net@0"));
+    assert!(!cmdline_udriver_in("udriver=virtio-net@10", "virtio-net@1"));
+    assert!(!cmdline_udriver_in("udriver=virtio-net@1", "virtio-net@10"));
     assert!(!cmdline_udriver_in("udriver=", "virtio-net@0"));
     // A kind with no number: any device of that kind, and of no other.
     assert!(cmdline_udriver_in("udriver=virtio-blk@1", "virtio-blk"));
@@ -273,8 +267,14 @@ fn a_driver_starts_only_when_the_kernel_left_it_its_device() {
     assert!(cmdline_udriver_in(listed, "virtio-net"));
     assert!(!cmdline_udriver_in(alone, "virtio-blk"));
     // What the state file says the service drives.
-    assert_eq!(cmdline_udriver_device(listed, "virtio-blk"), Some("virtio-blk@1"));
-    assert_eq!(cmdline_udriver_device(listed, "virtio-net@0"), Some("virtio-net@0"));
+    assert_eq!(
+        cmdline_udriver_device(listed, "virtio-blk"),
+        Some("virtio-blk@1")
+    );
+    assert_eq!(
+        cmdline_udriver_device(listed, "virtio-net@0"),
+        Some("virtio-net@0")
+    );
     assert_eq!(cmdline_udriver_device(alone, "virtio-blk"), None);
     assert!(!cmdline_udriver_in("udriver=virtio-blk@1", "virtio"));
     assert!(!cmdline_udriver_in("udriver=virtio-blk", "virtio-blk@0"));
@@ -306,24 +306,51 @@ fn the_kernels_list_of_what_it_left_is_what_a_driver_waits_for() {
     assert_eq!(udriver_device(Some(""), said, "virtio-blk"), None);
     // Several, a bare kind, and a name that is only the start of another.
     let left = "virtio-blk@1\nvirtio-net@0\n";
-    assert_eq!(udriver_device(Some(left), nothing, "virtio-blk"), Some("virtio-blk@1"));
-    assert_eq!(udriver_device(Some(left), nothing, "virtio-net@0"), Some("virtio-net@0"));
-    assert_eq!(udriver_device(Some("virtio-net@10\n"), nothing, "virtio-net@1"), None);
+    assert_eq!(
+        udriver_device(Some(left), nothing, "virtio-blk"),
+        Some("virtio-blk@1")
+    );
+    assert_eq!(
+        udriver_device(Some(left), nothing, "virtio-net@0"),
+        Some("virtio-net@0")
+    );
+    assert_eq!(
+        udriver_device(Some("virtio-net@10\n"), nothing, "virtio-net@1"),
+        None
+    );
     assert_eq!(udriver_device(Some(left), nothing, "virtio"), None);
     // The Nth of a kind: a service for each disk the kernel left.
     let disks = "virtio-blk@1\nvirtio-net@0\nvirtio-blk@2\n";
-    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/1"), Some("virtio-blk@1"));
-    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/2"), Some("virtio-blk@2"));
+    assert_eq!(
+        udriver_device(Some(disks), nothing, "virtio-blk/1"),
+        Some("virtio-blk@1")
+    );
+    assert_eq!(
+        udriver_device(Some(disks), nothing, "virtio-blk/2"),
+        Some("virtio-blk@2")
+    );
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/3"), None);
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/0"), None);
     assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk/x"), None);
     // Alternatives: the first that is there.
     let nvme = "nvme@0\nvirtio-net@0\n";
-    assert_eq!(udriver_device(Some(nvme), nothing, "virtio-blk|nvme"), Some("nvme@0"));
-    assert_eq!(udriver_device(Some(disks), nothing, "virtio-blk|nvme"), Some("virtio-blk@1"));
-    assert_eq!(udriver_device(Some("virtio-net@0\n"), nothing, "virtio-blk|nvme"), None);
+    assert_eq!(
+        udriver_device(Some(nvme), nothing, "virtio-blk|nvme"),
+        Some("nvme@0")
+    );
+    assert_eq!(
+        udriver_device(Some(disks), nothing, "virtio-blk|nvme"),
+        Some("virtio-blk@1")
+    );
+    assert_eq!(
+        udriver_device(Some("virtio-net@0\n"), nothing, "virtio-blk|nvme"),
+        None
+    );
     // A kernel with no list: what its command line names.
-    assert_eq!(udriver_device(None, said, "virtio-net@0"), Some("virtio-net@0"));
+    assert_eq!(
+        udriver_device(None, said, "virtio-net@0"),
+        Some("virtio-net@0")
+    );
     assert_eq!(udriver_device(None, nothing, "virtio-net@0"), None);
 }
 
@@ -3231,4 +3258,20 @@ fn una_sesion_sin_gpu_no_espera_por_la_gpu() {
         "LOG=error:nvidia.nouveau_uapi:nvidia.wlr_pixman"
     ));
     assert!(gpu_compositor_requested_in("LOG=error:nvidia.nouveau_uapi"));
+}
+
+#[test]
+fn the_session_opens_every_card_only_with_nvkms() {
+    assert_eq!(wlr_drm_devices("desktop=labwc", &[0, 1]), "/dev/dri/card0");
+    assert_eq!(wlr_drm_devices("nvidia.nvkms", &[0]), "/dev/dri/card0");
+    assert_eq!(wlr_drm_devices("nvidia.nvkms", &[]), "/dev/dri/card0");
+    assert_eq!(
+        wlr_drm_devices("desktop=labwc:nvidia.nvkms:nvidia.gem_vram", &[0, 1]),
+        "/dev/dri/card0:/dev/dri/card1"
+    );
+    assert_eq!(
+        wlr_drm_devices("nvidia.nvkms", &[0, 1, 2]),
+        "/dev/dri/card0:/dev/dri/card1:/dev/dri/card2",
+        "any number of cards"
+    );
 }

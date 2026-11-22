@@ -1324,6 +1324,46 @@ pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
     }
 }
 
+#[cfg(target_os = "none")]
+extern "C" {
+    fn eclipse_rm_connect_state(device_instance: NvU32, connected: *mut NvU32) -> NV_STATUS;
+    fn eclipse_rm_edid_forget(device_instance: NvU32);
+}
+
+/// Which outputs of this GPU have a monitor now: one real detection pass
+/// over the outputs [`edid`] found, with no EDID read. What the DRM output
+/// poll runs to see a monitor come or go. Fails until [`edid`] has answered
+/// once for this GPU; always fails in a hosted build.
+pub fn connect_state(device_instance: u32) -> Result<u32, NV_STATUS> {
+    #[cfg(target_os = "none")]
+    {
+        let _gate = RmGate::lock();
+        let mut mask = 0;
+        let status = unsafe { eclipse_rm_connect_state(device_instance, &mut mask) };
+        if status == NV_OK {
+            Ok(mask)
+        } else {
+            Err(status)
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = device_instance;
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+}
+
+/// A monitor came or went: the next [`edid`] asks the RM again instead of
+/// replaying the answer it cached for the boot.
+pub fn edid_forget(device_instance: u32) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        eclipse_rm_edid_forget(device_instance)
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = device_instance;
+}
+
 /// Mirror of `EclipseHdmiAudioOut` (vendor/eclipse_rm_init.c): result of the
 /// HDMI/DP audio enable pass (ELD push + audio packet enable per display).
 #[repr(C)]

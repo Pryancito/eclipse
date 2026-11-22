@@ -70,6 +70,9 @@ pub struct NodeFacts {
     pub own_hardware_kms: bool,
     /// Some card in the machine has it.
     pub any_hardware_kms: bool,
+    /// This node's card lights its own monitors (a real modeset of its own,
+    /// nvkms), whether or not the panel is on the software blit.
+    pub own_display: bool,
 }
 
 /// Which topology a node with these facts advertises.
@@ -86,6 +89,10 @@ pub fn topology_for(f: NodeFacts) -> NodeTopology {
             f.drives_the_panel || (!f.panel_belongs_to_a_node && f.is_first_node);
         return if carries_the_panel {
             NodeTopology::SoftwarePanel
+        } else if f.own_display {
+            // Another card with monitors of its own: its own CRTC and
+            // connectors, as every card that scans out lists in Linux.
+            NodeTopology::OwnCard
         } else {
             NodeTopology::RenderOnly
         };
@@ -93,7 +100,7 @@ pub fn topology_for(f: NodeFacts) -> NodeTopology {
     // Its own card, when that card can scan out -- or when nothing in the
     // machine can, which is the VirtIO-only box the merged walk also let
     // through rather than leaving userspace with no topology at all.
-    if f.own_hardware_kms || !f.any_hardware_kms {
+    if f.own_hardware_kms || f.own_display || !f.any_hardware_kms {
         NodeTopology::OwnCard
     } else {
         NodeTopology::RenderOnly
@@ -122,6 +129,7 @@ pub(super) fn facts_for(minor: u32) -> NodeFacts {
             is_first_node: true,
             own_hardware_kms: own,
             any_hardware_kms,
+            own_display: false,
         };
     };
 
@@ -136,6 +144,7 @@ pub(super) fn facts_for(minor: u32) -> NodeFacts {
         is_first_node: lowest_node_index().is_some_and(|i| card_index_of_minor(minor) == Some(i)),
         own_hardware_kms: node.has_hardware_kms(),
         any_hardware_kms,
+        own_display: node.drives_own_display(),
     }
 }
 

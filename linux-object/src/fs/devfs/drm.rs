@@ -2347,7 +2347,12 @@ mod atomic_rollback;
 use atomic_rollback::restore_atomic_state;
 mod hw_vblank;
 use hw_vblank::complete_flip;
+mod card_display;
 mod panel_mode;
+pub use card_display::{
+    driver_modes_on, poll_hotplug, present_on_checked, present_on_region, set_mode_on,
+    spawn_hotplug_poll,
+};
 pub use panel_mode::{driver_modes, needs_modeset, panel_mode, set_mode, ModeRefused};
 mod panel_state;
 #[cfg(test)]
@@ -3291,13 +3296,33 @@ pub fn create_fb_with_format(
 /// [`create_fb_with_format`] for a framebuffer whose `ADDFB2` carried an
 /// explicit modifier.
 ///
-/// `layout` changes what `pitch` MEANS and how big the surface is, so every
-/// bound check below has to read it: a block-linear pitch counts 64-byte
-/// blocks, and the surface is padded up to a whole block vertically. Taking
-/// the linear arithmetic for a tiled framebuffer under-measures it by a
-/// factor of 64 and then lets the present read past the buffer on the last
-/// block row.
+/// `layout` changes how big the surface is, so every bound check below has
+/// to read it: a block-linear surface is padded up to a whole block
+/// vertically, and the linear arithmetic would let a present read past the
+/// buffer on the last block row.
 pub fn create_fb_with_layout(
+    handle_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    pixel_format: u32,
+    layout: ScanoutLayout,
+) -> Option<u32> {
+    create_fb_on(
+        PANEL_CARD,
+        handle_id,
+        width,
+        height,
+        pitch,
+        pixel_format,
+        layout,
+    )
+}
+
+/// [`create_fb_with_layout`] on `card`, whose own driver makes the driver fb
+/// when it lights its own monitors (see [`card_display::fb_driver`]).
+pub fn create_fb_on(
+    card: u32,
     handle_id: u32,
     width: u32,
     height: u32,
@@ -3412,7 +3437,10 @@ pub fn create_fb_with_layout(
             ..
         } => Some(log2_gobs_per_block_y),
     };
+    let driver = card_display::fb_driver(card);
+    let own_card = driver.as_ref().is_some_and(|d| d.drives_own_display()) && card != PANEL_CARD;
     let want_driver_fb = tiled.is_some()
+        || own_card
         || !software_kms_active()
         || zcore_drivers::display::surfaceflip_enabled()
         || zcore_drivers::display::hwflip_enabled();
@@ -3421,8 +3449,9 @@ pub fn create_fb_with_layout(
     // to be the same card `page_flip` below is offered, or the flip would
     // carry an id from another card's namespace.
     let driver_fb_id = if want_driver_fb {
-        get_display_driver()
-            .and_then(|driver| driver.create_fb_tiled(handle_id, width, height, pitch, tiled))
+        driver
+            .as_ref()
+            .and_then(|d| d.create_fb_tiled(handle_id, width, height, pitch, tiled))
     } else {
         None
     };
@@ -3431,7 +3460,7 @@ pub fn create_fb_with_layout(
     // (Under `drm.scanout_modifiers` alone it is declined at the flip.)
     if tiled.is_some()
         && driver_fb_id.is_none()
-        && get_display_driver().is_some_and(|d| d.scans_out_block_linear())
+        && driver.is_some_and(|d| d.scans_out_block_linear())
     {
         return None;
     }
@@ -3470,6 +3499,10 @@ pub fn create_fb_with_layout(
         state.fb_backing.push((fb_id, vmo));
     }
     state.framebuffers.push(fb);
+    drop(state);
+    if own_card && driver_fb_id.is_some() {
+        card_display::note_fb_card(fb_id, card);
+    }
     Some(fb_id)
 }
 
@@ -6822,47 +6855,6 @@ pub fn present_now_checked(
     // A DRM client owns the framebuffer now: stop text console drawing.
     claim_graphics_vt();
     Ok(())
-}
-
-/// [`present_now_checked`] for a request that arrived on node `minor`.
-///
-/// The panel's card presents exactly as before. Any other card's frame goes to
-/// that card and nowhere else, as it would on its own `drm_device` in Linux:
-/// its CRTC records it, so `GETCRTC` there reads it back, and it never touches
-/// the panel, the VT ownership or the software cursor, which are all the
-/// panel's. A client on `card1` used to blit its frames over `card0`'s desktop.
-///
-/// Nothing is scanned out on that card yet: its engine has no modeset of its
-/// own (it only reuses the head the firmware lit, which only the boot card
-/// has), and the fb's `driver_fb_id` belongs to the panel driver's namespace
-/// (see `create_fb`), so offering it to this card's `page_flip` would name
-/// another card's object.
-pub fn present_on_checked(
-    minor: u32,
-    fb_id: u32,
-    crtc_id: u32,
-    rect: Option<(u32, u32, u32, u32)>,
-) -> Result<(), PresentError> {
-    let card = card_of_minor(minor);
-    if card == PANEL_CARD {
-        return present_now_checked(fb_id, crtc_id, rect);
-    }
-    if !DRM_STATE.lock().framebuffers.iter().any(|f| f.id == fb_id) {
-        return Err(PresentError::NoSuchFb);
-    }
-    set_crtc_fb_on(card, fb_id);
-    Ok(())
-}
-
-/// [`present_now_region`] for a request that arrived on node `minor`; see
-/// [`present_on_checked`].
-pub fn present_on_region(
-    minor: u32,
-    fb_id: u32,
-    crtc_id: u32,
-    rect: Option<(u32, u32, u32, u32)>,
-) -> bool {
-    present_on_checked(minor, fb_id, crtc_id, rect).is_ok()
 }
 
 /// Whether node `minor` is the panel's card, i.e. whether a modeset on it

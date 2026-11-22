@@ -460,6 +460,10 @@ pub(crate) struct EmuGpu {
     /// the block-linear fbs it is offered.
     block_linear: AtomicBool,
     takes_block_linear: AtomicBool,
+    /// Whether it lights monitors of its own (nvkms on that card).
+    own_display: AtomicBool,
+    /// A connector change the next `poll_connectors` reports.
+    hotplug: AtomicBool,
     calls: Mutex<GpuCalls>,
 }
 
@@ -489,6 +493,8 @@ impl EmuGpu {
             frame: AtomicU32::new(u32::MAX),
             block_linear: AtomicBool::new(false),
             takes_block_linear: AtomicBool::new(true),
+            own_display: AtomicBool::new(false),
+            hotplug: AtomicBool::new(false),
             calls: Mutex::new(GpuCalls::default()),
         }
     }
@@ -673,6 +679,14 @@ impl DrmScheme for EmuGpu {
         self.block_linear.load(Ordering::Relaxed)
     }
 
+    fn drives_own_display(&self) -> bool {
+        self.own_display.load(Ordering::Relaxed)
+    }
+
+    fn poll_connectors(&self) -> bool {
+        self.hotplug.swap(false, Ordering::Relaxed)
+    }
+
     fn create_fb_tiled(
         &self,
         handle_id: u32,
@@ -854,6 +868,16 @@ impl Gpu {
     /// a GPU never given one has none.
     pub(crate) fn set_frame(&self, n: u32) {
         self.gpu.frame.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether the GPU lights monitors of its own (nvkms on that card).
+    pub(crate) fn set_own_display(&self, on: bool) {
+        self.gpu.own_display.store(on, Ordering::Relaxed);
+    }
+
+    /// A monitor came or went: the next poll of the connectors says so.
+    pub(crate) fn plug(&self) {
+        self.gpu.hotplug.store(true, Ordering::Relaxed);
     }
 
     /// Whether the GPU scans block-linear out as it is (nvkms), and whether

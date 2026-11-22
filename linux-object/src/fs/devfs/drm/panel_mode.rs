@@ -63,7 +63,11 @@ pub fn set_mode(
     test_only: bool,
 ) -> Result<(), ModeRefused> {
     let driver = get_display_driver().ok_or(ModeRefused::Fixed)?;
-    match driver.set_display_mode(width, height, refresh_hz, fb_id, test_only) {
+    // The driver knows its own fb ids, not the DRM core's.
+    let own = super::get_fb(fb_id)
+        .and_then(|fb| fb.driver_fb_id)
+        .unwrap_or(0);
+    match driver.set_display_mode(width, height, refresh_hz, own, test_only) {
         None => Err(ModeRefused::Fixed),
         Some(Err(why)) => Err(ModeRefused::Driver(why)),
         Some(Ok(())) => {

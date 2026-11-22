@@ -8164,6 +8164,107 @@ unlock:
     return status;
 }
 
+/*
+ * Which outputs have a monitor now: one real detection pass
+ * (GET_CONNECT_STATE _METHOD_DEFAULT) over the outputs eclipse_rm_edid
+ * found, nothing else -- no EDID read, no trace line. The DRM side's output
+ * poll (Linux's drm_kms_helper_poll) runs it every few seconds to see a
+ * monitor come or go. NV_ERR_INVALID_STATE until eclipse_rm_edid has a
+ * cached answer for this GPU (the outputs and the DispCommon pair).
+ */
+NV_STATUS eclipse_rm_connect_state(NvU32 gpuInstance, NvU32 *pConnected)
+{
+    OBJGPU *pGpu;
+    RM_API *pRmApi;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    GPU_MASK gpusLockedMask = 0;
+    KernelDisplay *pKernelDisplay;
+    NvHandle hDispClient, hDispCommon;
+    NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_PARAMS cs;
+    NvU32 attempt;
+
+    if (pConnected == NULL || gpuInstance >= NV_MAX_DEVICES)
+        return NV_ERR_INVALID_ARGUMENT;
+    if (!g_edidDone[gpuInstance] || g_edidCache[gpuInstance].displayMask == 0)
+        return NV_ERR_INVALID_STATE;
+
+    /* Same lock/visibility context as eclipse_rm_edid. */
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuGroupLockAcquire(pGpu->gpuInstance, GPU_LOCK_GRP_ALL,
+                                   GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT,
+                                   &gpusLockedMask);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
+    hDispClient = pKernelDisplay ? kdispGetInternalClientHandle(pKernelDisplay) : 0;
+    hDispCommon = pKernelDisplay ? kdispGetDispCommonHandle(pKernelDisplay) : 0;
+    status = NV_ERR_INVALID_STATE;
+    if (hDispClient != 0 && hDispCommon != 0)
+    {
+        /* The documented NVOS_STATUS_ERROR_RETRY handshake, bounded, as in
+         * eclipse_rm_edid. */
+        for (attempt = 0; attempt < 4; attempt++)
+        {
+            portMemSet(&cs, 0, sizeof(cs));
+            cs.displayMask = g_edidCache[gpuInstance].displayMask;
+            cs.flags = NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_FLAGS_METHOD_DEFAULT;
+            status = pRmApi->Control(pRmApi, hDispClient, hDispCommon,
+                                     NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE,
+                                     &cs, sizeof(cs));
+            if (status != NV_ERR_TIMEOUT_RETRY)
+                break;
+            osDelay((cs.retryTimeMs != 0 && cs.retryTimeMs < 500) ? cs.retryTimeMs : 100);
+        }
+        if (status == NV_OK)
+            *pConnected = cs.displayMask;
+    }
+
+    rmGpuGroupLockRelease(gpusLockedMask, GPUS_LOCK_FLAGS_NONE);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * A monitor came or went: the next eclipse_rm_edid queries the RM again
+ * instead of replaying the boot's answer, so the connected mask and the
+ * EDID are the new monitor's (Linux re-reads the EDID on every detect).
+ */
+void eclipse_rm_edid_forget(NvU32 gpuInstance)
+{
+    if (gpuInstance < NV_MAX_DEVICES)
+        g_edidDone[gpuInstance] = NV_FALSE;
+}
+
 /* ===================================================================
  * HDMI/DP audio enable: push the monitor's ELD to the GPU's HDA codec
  * and turn on audio packet transmission for the connected outputs.

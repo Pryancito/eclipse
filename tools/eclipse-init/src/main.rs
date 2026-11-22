@@ -1857,12 +1857,7 @@ const AFTER_EVERYTHING: &str = "*";
 fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     let mut pending: Vec<String> = services.keys().cloned().collect();
-    let last_of_all = |name: &String| {
-        services[name]
-            .after
-            .iter()
-            .any(|d| d == AFTER_EVERYTHING)
-    };
+    let last_of_all = |name: &String| services[name].after.iter().any(|d| d == AFTER_EVERYTHING);
 
     loop {
         let mut progressed = false;
@@ -1875,9 +1870,9 @@ fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
                 // (treat as already-met) rather than deadlock.
                 .all(|d| {
                     if d == AFTER_EVERYTHING {
-                        return services
-                            .keys()
-                            .all(|other| *other == name || last_of_all(other) || order.contains(other));
+                        return services.keys().all(|other| {
+                            *other == name || last_of_all(other) || order.contains(other)
+                        });
                     }
                     !services.contains_key(d) || order.contains(d)
                 });
@@ -2903,7 +2898,50 @@ fn build_child_env() -> Vec<CString> {
     );
     overlay_locale(&mut env);
     overlay_tz(&mut env);
+    let devices = wlr_drm_devices(&cmdline, &drm_cards());
+    if let Some(slot) = env
+        .iter_mut()
+        .find(|e| e.as_bytes().starts_with(b"WLR_DRM_DEVICES="))
+    {
+        *slot = CString::new(format!("WLR_DRM_DEVICES={devices}")).unwrap();
+    }
     env
+}
+
+/// The `/dev/dri/cardN` nodes, in card order.
+fn drm_cards() -> Vec<u32> {
+    let mut cards: Vec<u32> = fs::read_dir("/dev/dri")
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_prefix("card"))
+                        .and_then(|n| n.parse().ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    cards.sort_unstable();
+    cards
+}
+
+/// `WLR_DRM_DEVICES` for the session. With `nvidia.nvkms` every card lights
+/// its own monitors, as on Linux, so the compositor opens every card -- the
+/// panel's first, which wlroots renders on, then the others, whose monitors
+/// it shows the desktop on too -- however many there are. Without it only
+/// card0 scans out, and the session stays on card0 alone, as before.
+fn wlr_drm_devices(cmdline: &str, cards: &[u32]) -> String {
+    if !cmdline_has_in(cmdline, "nvidia.nvkms") || cards.len() < 2 {
+        return String::from("/dev/dri/card0");
+    }
+    let mut ordered: Vec<u32> = cards.iter().copied().filter(|&c| c == 0).collect();
+    ordered.extend(cards.iter().copied().filter(|&c| c != 0));
+    ordered
+        .iter()
+        .map(|c| format!("/dev/dri/card{c}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// The renderer half of the child environment, as plain strings so a test can

@@ -1558,12 +1558,14 @@ impl DrmDev {
                 if drm::resolve_gem_backing_for(cmd.handle, drm::current_pid()).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
-                if let Some(fb_id) = drm::create_fb_with_format(
+                if let Some(fb_id) = drm::create_fb_on(
+                    drm::card_of_minor(self.minor),
                     cmd.handle,
                     cmd.width,
                     cmd.height,
                     cmd.pitch,
                     pixel_format,
+                    drm::ScanoutLayout::Linear,
                 ) {
                     cmd.fb_id = fb_id;
                     Ok(0)
@@ -1585,7 +1587,8 @@ impl DrmDev {
                 if drm::resolve_gem_backing_for(cmd.handles[0], drm::current_pid()).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
-                if let Some(fb_id) = drm::create_fb_with_layout(
+                if let Some(fb_id) = drm::create_fb_on(
+                    drm::card_of_minor(self.minor),
                     cmd.handles[0],
                     cmd.width,
                     cmd.height,
@@ -1833,6 +1836,21 @@ impl DrmDev {
                     }
                     if panel {
                         drm::set_vblank_period_from_modeinfo(&req.mode);
+                    } else {
+                        // Another card's monitors, by its own driver when it
+                        // has modesets of its own.
+                        let hz = DrmModeModeinfo::from_bytes(&req.mode).vrefresh;
+                        let set = drm::set_mode_on(self.minor, area.0, area.1, hz, fb_id);
+                        if let Err(why @ drm::ModeRefused::Driver(_)) = set {
+                            kernel_hal::klog_warn!(
+                                "[drm] SETCRTC card {}x{}@{}: {:?}",
+                                area.0,
+                                area.1,
+                                hz,
+                                why
+                            );
+                            return Err(FsError::InvalidParam);
+                        }
                     }
                     if let Err(e) = drm::present_on_checked(self.minor, fb_id, req.crtc_id, None) {
                         present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
@@ -2785,8 +2803,10 @@ impl DrmDev {
                     conn_res.count_encoders = 1;
 
                     // The monitor's own modes when the driver can set them
-                    // (nvkms), else exactly one: the firmware's.
-                    let modes = drm::driver_modes();
+                    // (nvkms), else exactly one: the firmware's, which only
+                    // the panel's card has.
+                    let modes = drm::driver_modes_on(self.minor);
+                    let panel_node = drm::is_panel_node(self.minor);
                     if !modes.is_empty() {
                         let n = modes.len();
                         if conn_res.count_modes as usize >= n {
@@ -2802,7 +2822,7 @@ impl DrmDev {
                             }
                         }
                         conn_res.count_modes = n as u32;
-                    } else if let Some((w, h, _)) = drm::display_mode() {
+                    } else if let Some((w, h, _)) = drm::display_mode().filter(|_| panel_node) {
                         if conn_res.count_modes >= 1 {
                             let mode = make_modeinfo(w, h);
                             ucheck(conn_res.modes_ptr as usize, mode.len())?;

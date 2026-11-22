@@ -30,6 +30,7 @@ fn hardware_kms_card() -> NodeFacts {
         is_first_node: true,
         own_hardware_kms: true,
         any_hardware_kms: true,
+        own_display: false,
     }
 }
 
@@ -43,6 +44,7 @@ fn software_panel_card() -> NodeFacts {
         is_first_node: true,
         own_hardware_kms: false,
         any_hardware_kms: false,
+        own_display: false,
     }
 }
 
@@ -118,6 +120,7 @@ fn with_no_kms_anywhere_a_node_still_answers_for_its_own_card() {
         topology_for(NodeFacts {
             own_hardware_kms: false,
             any_hardware_kms: false,
+            own_display: false,
             ..hardware_kms_card()
         }),
         NodeTopology::OwnCard

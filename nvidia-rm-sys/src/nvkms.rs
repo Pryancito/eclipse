@@ -75,6 +75,7 @@ extern "C" {
         h_client: *mut u32,
         h_memory: *mut u32,
     ) -> *mut c_void;
+    fn eclipse_kms_hotplug_count() -> u32;
     fn eclipse_kms_cursor(
         device: *mut c_void,
         scanout: *mut c_void,
@@ -723,9 +724,59 @@ pub fn requested_mode(
 /// firmware clones its console onto every monitor.
 pub fn console_plan(
     info: &KmsInfo,
-    mut modes_of: impl FnMut(u32) -> Vec<KmsMode>,
+    modes_of: impl FnMut(u32) -> Vec<KmsMode>,
     width: u32,
     height: u32,
+) -> (Vec<KmsHeadSet>, Vec<String>) {
+    plan_heads(
+        info,
+        modes_of,
+        &[],
+        |modes| console_mode(modes, width, height),
+        |d| {
+            format!(
+                "pantalla {:#x}: ningun modo de {}x{} para la consola; se queda apagada",
+                d, width, height
+            )
+        },
+    )
+}
+
+/// A client's modeset for one GPU, every connected monitor mirrored at
+/// `width`x`height` (the refresh as [`requested_mode`] picks it): which head
+/// and mode each connected display gets, and one line for each display left
+/// dark. A display lit in `current` keeps its head, so a modeset never moves
+/// a monitor that is already on; a monitor plugged in since takes a free
+/// head, and one unplugged since is left out, which darkens its head
+/// ([`KmsDevice::set_mode`]).
+pub fn mode_plan(
+    info: &KmsInfo,
+    modes_of: impl FnMut(u32) -> Vec<KmsMode>,
+    current: &[KmsHeadSet],
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> (Vec<KmsHeadSet>, Vec<String>) {
+    plan_heads(
+        info,
+        modes_of,
+        current,
+        |modes| requested_mode(modes, width, height, refresh_hz),
+        |d| {
+            format!(
+                "pantalla {:#x}: sin modo {}x{}; se queda apagada",
+                d, width, height
+            )
+        },
+    )
+}
+
+fn plan_heads(
+    info: &KmsInfo,
+    mut modes_of: impl FnMut(u32) -> Vec<KmsMode>,
+    keep: &[KmsHeadSet],
+    pick: impl Fn(&[KmsMode]) -> Option<usize>,
+    no_mode: impl Fn(u32) -> String,
 ) -> (Vec<KmsHeadSet>, Vec<String>) {
     let mut sets: Vec<KmsHeadSet> = Vec::new();
     let mut dark = Vec::new();
@@ -734,31 +785,63 @@ pub fn console_plan(
     } else {
         (1u32 << info.num_heads) - 1
     };
-    for d in info.displays().iter().filter(|d| d.connected != 0) {
+    let connected: Vec<&KmsDisplay> = info
+        .displays()
+        .iter()
+        .filter(|d| d.connected != 0)
+        .collect();
+    // The heads kept for displays still connected, which nobody else takes.
+    let kept = |d: &KmsDisplay| {
+        keep.iter()
+            .find(|s| s.display == d.handle && d.head_mask & heads & (1 << s.head) != 0)
+            .map(|s| s.head)
+    };
+    let reserved = connected
+        .iter()
+        .filter_map(|d| kept(d))
+        .fold(0u32, |m, h| m | (1 << h));
+    for d in connected {
         let modes = modes_of(d.handle);
-        let Some(mode_index) = console_mode(&modes, width, height) else {
-            dark.push(format!(
-                "pantalla {:#x}: ningun modo de {}x{} para la consola; se queda apagada",
-                d.handle, width, height
-            ));
+        let Some(mode_index) = pick(&modes) else {
+            dark.push(no_mode(d.handle));
             continue;
         };
-        let used = sets.iter().fold(0u32, |m, s| m | (1 << s.head));
-        let free = d.head_mask & heads & !used;
-        if free == 0 {
-            dark.push(format!(
-                "pantalla {:#x}: sin cabeza libre (cabezas {:#x}); se queda apagada",
-                d.handle, d.head_mask
-            ));
-            continue;
-        }
+        let head = match kept(d) {
+            Some(head) => head,
+            None => {
+                let used = sets.iter().fold(reserved, |m, s| m | (1 << s.head));
+                let free = d.head_mask & heads & !used;
+                if free == 0 {
+                    dark.push(format!(
+                        "pantalla {:#x}: sin cabeza libre (cabezas {:#x}); se queda apagada",
+                        d.handle, d.head_mask
+                    ));
+                    continue;
+                }
+                free.trailing_zeros()
+            }
+        };
         sets.push(KmsHeadSet {
-            head: free.trailing_zeros(),
+            head,
             display: d.handle,
             mode_index: mode_index as u32,
         });
     }
     (sets, dark)
+}
+
+/// How many hotplug events nvkms has delivered, on any card, since it was
+/// loaded: what `nv_drm_event_callback` turns into a hotplug uevent. A
+/// change is a reason to probe the cards again. 0 in a hosted build.
+pub fn hotplug_count() -> u32 {
+    #[cfg(target_os = "none")]
+    {
+        unsafe { eclipse_kms_hotplug_count() }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
 }
 
 /// `NvKmsConnectorTypeString` of nvkms-api-types.h.
@@ -1151,6 +1234,67 @@ mod tests {
         );
         assert!(sets.is_empty());
         assert_eq!(dark.len(), 1);
+    }
+
+    #[test]
+    fn a_modeset_keeps_lit_heads_and_lights_a_monitor_plugged_in_since() {
+        let mut info = KmsInfo::zeroed();
+        info.num_heads = 4;
+        info.num_displays = 3;
+        for (i, d) in info.displays.iter_mut().take(3).enumerate() {
+            d.handle = 0x10 << i;
+            d.head_mask = 0xf;
+            d.connected = 1;
+        }
+        // 0x10 was lit on head 2 before; 0x40 is gone; 0x20 is new.
+        info.displays[2].connected = 0;
+        let current = [
+            KmsHeadSet {
+                head: 2,
+                display: 0x10,
+                mode_index: 0,
+            },
+            KmsHeadSet {
+                head: 0,
+                display: 0x40,
+                mode_index: 0,
+            },
+        ];
+        let (sets, dark) = mode_plan(
+            &info,
+            |_| alloc::vec![mode(1920, 1080, 60, true), mode(1280, 720, 60, false)],
+            &current,
+            1280,
+            720,
+            60,
+        );
+        assert_eq!(
+            sets,
+            [
+                KmsHeadSet {
+                    head: 2,
+                    display: 0x10,
+                    mode_index: 1
+                },
+                KmsHeadSet {
+                    head: 0,
+                    display: 0x20,
+                    mode_index: 1
+                },
+            ],
+            "the lit monitor keeps head 2; the new one takes head 0, freed by the unplugged one"
+        );
+        assert!(dark.is_empty());
+        let (sets, dark) = mode_plan(
+            &info,
+            |_| alloc::vec![mode(1920, 1080, 60, true)],
+            &[],
+            800,
+            600,
+            0,
+        );
+        assert!(sets.is_empty());
+        assert_eq!(dark.len(), 2);
     }
 
     #[test]

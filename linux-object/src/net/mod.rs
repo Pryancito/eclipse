@@ -283,6 +283,9 @@ pub use netlink::*;
 pub mod unix;
 pub use unix::*;
 
+/// `NETLINK_KOBJECT_UEVENT`: device events (hotplug) for udev and libudev.
+pub mod uevent;
+
 pub mod dns;
 
 pub mod wait;

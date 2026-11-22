@@ -755,6 +755,7 @@ fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
 mod eld;
 use eld::build_eld_from_base_edid;
 mod nvkms_takeover;
+pub use nvkms_takeover::set_requested as set_nvkms_requested;
 
 impl NvidiaGpu {
     fn pitch_pixels(&self) -> usize {
@@ -6332,6 +6333,14 @@ impl DrmScheme for NvidiaGpu {
         nvkms_takeover::scans_out_block_linear(self)
     }
 
+    fn drives_own_display(&self) -> bool {
+        nvkms_takeover::drives_own_display(self)
+    }
+
+    fn poll_connectors(&self) -> bool {
+        self.nvkms_poll_connectors()
+    }
+
     fn create_fb_tiled(
         &self,
         handle_id: u32,
@@ -6407,6 +6416,10 @@ impl DrmScheme for NvidiaGpu {
         };
         if let Some(flipped) = self.nvkms_page_flip(&fb) {
             return flipped;
+        }
+        // A card that lights its own monitors does it through nvkms only.
+        if nvkms_takeover::drives_own_display(self) {
+            return false;
         }
         // Nothing below untiles a block-linear surface.
         if fb.block_linear.is_some() {
@@ -6728,7 +6741,7 @@ impl DrmScheme for NvidiaGpu {
             // also covers masks that start at a higher bit and instances > 0.
             let bit = Self::rm_connector_bit(instance, id, &d)?;
             let did = 1u32 << bit;
-            let connected = d.connected_mask & did != 0;
+            let connected = d.connected_mask & did != 0 && !self.nvkms_display_pending();
             // EDID bytes 21/22 = max image size in cm; only known for the
             // output whose EDID the RM actually read.
             let (mm_width, mm_height) =
@@ -6753,7 +6766,7 @@ impl DrmScheme for NvidiaGpu {
         if id == 1001 {
             Some(DrmConnector {
                 id,
-                connected: true,
+                connected: !self.nvkms_display_pending(),
                 mm_width: 0,
                 mm_height: 0,
                 connector_type: 11,
