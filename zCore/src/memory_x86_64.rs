@@ -2632,6 +2632,9 @@ cfg_if! {
         /// still pending, and room for four reserves on top of what is in
         /// use, so that taking it back does not cause the next OOM by itself.
         /// For `reclaimd`. Answers whether this call re-armed a spent one.
+        // `reclaimd` is `linux` only: a zircon kernel keeps the boot reserve
+        // and never re-arms it.
+        #[cfg_attr(not(feature = "linux"), allow(dead_code))]
         pub fn rearm_oom_reserve() -> bool {
             if OOM_RESERVE.load(Ordering::Acquire) != 0 || crate::oom::kill_pending() {
                 return false;
