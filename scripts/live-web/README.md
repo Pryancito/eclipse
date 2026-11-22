@@ -84,6 +84,17 @@ Emscripten (en `scripts/live-web/Dockerfile`, que es el de qemu-wasm con las
 fuentes descargadas y comprobadas por `build.sh`). Lo intermedio queda en
 `ignored/live-web/`.
 
+Para una versión nueva de Eclipse basta con rehacer el núcleo y el rootfs, sin
+docker ni QEMU (los de `live/emu/` se quedan como están):
+
+```sh
+git pull
+scripts/live-web/build.sh --solo-eclipse ../Pryancito.github.io/live/emu
+```
+
+Deja `zcore.bin.gz`, `initrd.img.gz` y `manifest.json` (con la versión y el
+commit nuevos) en `live/emu/`. Tarda unos minutos.
+
 Si el build pasa por un proxy que necesita su propio certificado, se puede dar
 otro Dockerfile con `LIVE_WEB_DOCKERFILE=...` y argumentos de `docker build`
 con `LIVE_WEB_DOCKER_ARGS=...`.

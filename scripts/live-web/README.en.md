@@ -84,6 +84,17 @@ Emscripten (in `scripts/live-web/Dockerfile`, which is qemu-wasm's own with the
 sources downloaded and checked by `build.sh`). Intermediate files go to
 `ignored/live-web/`.
 
+For a new Eclipse version only the kernel and the rootfs need rebuilding, with
+no docker or QEMU (the ones in `live/emu/` stay as they are):
+
+```sh
+git pull
+scripts/live-web/build.sh --solo-eclipse ../Pryancito.github.io/live/emu
+```
+
+It leaves `zcore.bin.gz`, `initrd.img.gz` and `manifest.json` (with the new
+version and commit) in `live/emu/`. It takes a few minutes.
+
 If the build goes through a proxy that needs its own certificate, another
 Dockerfile can be given with `LIVE_WEB_DOCKERFILE=...` and extra `docker build`
 arguments with `LIVE_WEB_DOCKER_ARGS=...`.
