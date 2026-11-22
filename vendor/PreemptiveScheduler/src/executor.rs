@@ -1073,6 +1073,7 @@ fn stack_block_alloc() -> usize {
             return base;
         }
     }
+    HEAP_STACK_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // `handle_alloc_error`, not `expect`: the kernel's OOM report (heap
     // figures, why growth was refused, the heaviest allocation sites) runs
     // from the alloc error handler, and a bare panic here showed none of it
@@ -1092,6 +1093,7 @@ fn stack_block_free(base: usize) {
             return;
         }
     }
+    HEAP_STACK_BLOCKS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: not the hook's, so it came from `Global.allocate(ALLOC_LAYOUT)`
     // in `stack_block_alloc`, and the caller owns it.
     unsafe {
@@ -1155,7 +1157,12 @@ static QUAR_RING_IDX: core::sync::atomic::AtomicUsize = core::sync::atomic::Atom
 /// was merely late, not dead. Keep the block off the allocator until every
 /// online CPU has reached the runtime stack once after retirement; only then is
 /// it quiescent enough to recycle.
-const RETIRED_STACKS_CAP: usize = 256;
+///
+/// 1024, up from 256: a slot is 32 bytes, and a full table leaks every later
+/// stack whole (2.6 MiB each). One CPU slow to reach a quiescent point while
+/// a GL client spawns and kills threads in bursts filled 256 slots, and the
+/// leak then ran until the heap hit its ceiling.
+const RETIRED_STACKS_CAP: usize = 1024;
 
 #[derive(Copy, Clone)]
 struct RetiredStack {
@@ -1357,6 +1364,33 @@ fn reclaim_retired_stack(slot: &mut RetiredStack) {
     // this is left to blocks born before the hooks (early boot) and to bands
     // the hook still refuses at retirement (registry full, split reserve spent
     // again before the reclaim worker refilled it).
+    //
+    // Except a block from the vmap window. Giving it back there UNMAPS it:
+    // its frames go to the frame allocator and its slot stays empty until a
+    // TLB flush, so a write that turns out to be one grace period late
+    // faults on an unmapped page instead of corrupting the next owner of the
+    // frames. That is safer than the leak, which on a machine where every
+    // stack came out soft ran the window dry and then sent every new stack
+    // to the kernel heap until it hit its ceiling.
+    let hooks = *STACK_BLOCK_HOOKS.lock();
+    let remove = *STACK_GUARD_REMOVE.lock();
+    if let (Some((_, free)), Some(remove)) = (hooks, remove) {
+        // `free` wants the mapping as `alloc` made it: a band that did get
+        // installed (one of the two) comes out first, as `trim_idle_stacks`
+        // does for pooled blocks. For a heap block that is then leaked
+        // anyway this only maps its own pages back.
+        if retired.hard_guard_bottom {
+            remove(retired.alloc_base, GUARD_SIZE);
+        }
+        if retired.hard_guard_top {
+            remove(retired.alloc_base + GUARD_SIZE + STACK_SIZE, TOP_GUARD_SIZE);
+        }
+        if free(retired.alloc_base, ALLOC_SIZE) {
+            SOFT_FREED_TO_VMAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            *slot = RetiredStack::EMPTY;
+            return;
+        }
+    }
     let n = SOFT_LEAKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     warn!(
         "[stack-retire] leaking soft-guarded retired stack {:#x} rather than returning it to the \
@@ -1449,14 +1483,64 @@ pub(crate) fn note_cpu_quiescent(cpu: usize) {
     }
 }
 
+/// Stacks leaked because the retired-stack table was full.
+static RETIRED_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+/// Stacks leaked because a CPU still stood on them at `Drop`.
+static CLAIMED_AT_DROP_LEAKED: AtomicUsize = AtomicUsize::new(0);
+/// Soft-guarded retired stacks given back to the vmap window instead of
+/// being leaked: unmapped there, so a late write faults rather than
+/// corrupting whatever the frames hold next.
+static SOFT_FREED_TO_VMAP: AtomicUsize = AtomicUsize::new(0);
+/// Stack blocks taken from the kernel heap and not yet given back. Each is a
+/// 4 MiB buddy block: this number times four is what stacks cost the heap.
+static HEAP_STACK_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Where every coroutine stack block has gone, for the OOM report and
+/// `/proc/perf/kernel`. Allocates nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StackLeakStats {
+    /// Blocks in the kernel heap now (each a 4 MiB buddy block).
+    pub heap_blocks: usize,
+    /// Leaked: the retired-stack table was full.
+    pub table_full: usize,
+    /// Leaked: soft-guarded at retirement, and not a vmap block.
+    pub soft: usize,
+    /// Soft-guarded at retirement, given back to the vmap window.
+    pub soft_freed: usize,
+    /// Leaked: a CPU still stood on the stack when its executor dropped.
+    pub claimed_at_drop: usize,
+    /// Waiting out a grace period in the retired table now.
+    pub retired_waiting: usize,
+    /// Idle in the pool and the overflow list now.
+    pub pooled: usize,
+}
+
+/// See [`StackLeakStats`].
+pub fn stack_leak_stats() -> StackLeakStats {
+    use core::sync::atomic::Ordering::Relaxed;
+    StackLeakStats {
+        heap_blocks: HEAP_STACK_BLOCKS.load(Relaxed),
+        table_full: RETIRED_OVERFLOW.load(Relaxed),
+        soft: SOFT_LEAKED.load(Relaxed),
+        soft_freed: SOFT_FREED_TO_VMAP.load(Relaxed),
+        claimed_at_drop: CLAIMED_AT_DROP_LEAKED.load(Relaxed),
+        retired_waiting: RETIRED_OCCUPIED.load(Relaxed),
+        pooled: {
+            let pool = STACK_POOL.iter().filter(|s| s.load(Relaxed) != 0).count();
+            // `try_lock`: this runs from the OOM report, maybe on a CPU
+            // that holds the list's lock.
+            pool + STACK_OVERFLOW.try_lock().map_or(0, |l| l.len())
+        },
+    }
+}
+
 fn retire_stack_after_grace(
     alloc_base: usize,
     hard_guard_bottom: bool,
     hard_guard_top: bool,
     protected: bool,
 ) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    static RETIRED_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+    use core::sync::atomic::Ordering;
 
     let cpu = crate::arch::cpu_id() as usize;
     let mut pending = crate::runtime::executor_ready_mask();
@@ -3026,9 +3110,8 @@ impl Drop for Executor {
         // traced to where an executor is dropped while claimed.
         let owner = self.resume_claim.holder().map(|cpu| cpu + 1).unwrap_or(0);
         if owner != 0 {
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static LEAKED: AtomicUsize = AtomicUsize::new(0);
-            let n = LEAKED.fetch_add(1, Ordering::Relaxed) + 1;
+            use core::sync::atomic::Ordering;
+            let n = CLAIMED_AT_DROP_LEAKED.fetch_add(1, Ordering::Relaxed) + 1;
             // Drop the tracking entries (bounded registries) but NOT the memory.
             retract_live_stack(alloc_base);
             spine_unregister_by_stack(self.stack_base);

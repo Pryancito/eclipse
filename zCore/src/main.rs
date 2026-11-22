@@ -30,6 +30,8 @@ mod logging;
 mod lang;
 #[cfg(any(not(feature = "libos"), test))]
 mod oops;
+// The kernel's out-of-memory policy: reserve, OOM kill, `PANICONOOM=1`.
+mod oom;
 
 // hunter's measured boot and the watch on the kernel's own code.
 mod boot_integrity;
@@ -413,6 +415,14 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 "Eclipse: kernel fault containment ENABLED -- a kernel fault while \
                  serving a process kills that process, not the system \
                  (disable with PANICONOOPS=1)"
+            );
+        }
+        // Linux's `vm.panic_on_oom`: off by default. See `oom`.
+        if kernel_hal::cmdline::flag(&options.cmdline, "PANICONOOM") {
+            oom::set_panic_on_oom(true);
+            klog_info!(
+                "Eclipse: PANICONOOM=1 -- a kernel heap OOM halts the machine \
+                 (no emergency reserve, no OOM kill, no containment)"
             );
         }
         // `STACKQUARANTINE=1` holds every freed coroutine stack write-protected

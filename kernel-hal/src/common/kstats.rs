@@ -524,6 +524,53 @@ pub fn vmap_stack_stats() -> (usize, usize) {
     (0, 0)
 }
 
+/// Where every coroutine stack block has gone: see
+/// `executor::StackLeakStats`, whose fields these are. Zeros on the host.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StackBlocks {
+    /// Blocks in the kernel heap now (each a 4 MiB buddy block).
+    pub heap_blocks: usize,
+    /// Leaked: the retired-stack table was full.
+    pub table_full: usize,
+    /// Leaked: soft-guarded at retirement, and not a vmap block.
+    pub soft: usize,
+    /// Soft-guarded at retirement, given back to the vmap window.
+    pub soft_freed: usize,
+    /// Leaked: a CPU still stood on the stack when its executor dropped.
+    pub claimed_at_drop: usize,
+    /// Waiting out a grace period now.
+    pub retired_waiting: usize,
+    /// Idle in the pool now.
+    pub pooled: usize,
+}
+
+/// See [`StackBlocks`]. Allocates nothing.
+#[cfg(target_os = "none")]
+pub fn stack_blocks() -> StackBlocks {
+    let l = executor::stack_leak_stats();
+    StackBlocks {
+        heap_blocks: l.heap_blocks,
+        table_full: l.table_full,
+        soft: l.soft,
+        soft_freed: l.soft_freed,
+        claimed_at_drop: l.claimed_at_drop,
+        retired_waiting: l.retired_waiting,
+        pooled: l.pooled,
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn stack_blocks() -> StackBlocks {
+    StackBlocks::default()
+}
+
+/// Why coroutine stacks are (or are not) in the vmap window: see
+/// `kernel_hal::vmap_stack::Detail`. Allocates nothing.
+#[cfg(all(target_os = "none", target_arch = "x86_64", not(feature = "libos")))]
+pub fn vmap_stack_detail() -> crate::imp::vmap_stack::Detail {
+    crate::imp::vmap_stack::detail()
+}
+
 /// `(deepest coroutine-stack use observed at a park, STACK_SIZE)` in bytes.
 /// The evidence for (or against) shrinking executor stacks.
 #[cfg(target_os = "none")]

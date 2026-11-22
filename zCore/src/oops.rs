@@ -81,6 +81,9 @@ macro_rules! oops_report {
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
 
+/// The label the panic handler gives a kernel OOM (`crate::oom`).
+pub const OOM_LABEL: &str = "kernel OOM";
+
 /// How many faults to contain before giving up and halting.
 ///
 /// Not a resource limit (each leak is a couple of MiB out of a heap of
@@ -171,6 +174,16 @@ fn claim_fault_budget() -> Option<u32> {
 /// Must be called with interrupts already disabled, from the fault path, having
 /// touched nothing on the way.
 pub fn try_contain(what: &str, restore_kd: Option<u32>) {
+    // A kernel OOM (`crate::oom`): Linux's `vm.panic_on_oom` is the switch
+    // for it, not `panic_on_oops`.
+    let is_oom = what == OOM_LABEL;
+    if is_oom && crate::oom::panic_on_oom() {
+        serial_write_fmt_spin(format_args!(
+            "\n[oops] {} NOT contained: PANICONOOM=1 — halting\n",
+            what
+        ));
+        return;
+    }
     if PANIC_ON_OOPS.load(Ordering::Relaxed) {
         serial_write_fmt_spin(format_args!(
             "\n[oops] {} NOT contained: PANICONOOPS=1 — halting\n",
@@ -390,6 +403,15 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
                 MAX_CONTAINED,
             );
         }
+    }
+
+    // A contained OOM freed only what the abandoned call chain held, and not
+    // even that (nothing of it is unwound). The memory is still gone: have
+    // `reclaimd` kill the process that holds the most of it, as Linux's OOM
+    // killer would have before the allocation ever failed.
+    if is_oom {
+        crate::oom::request_kill();
+        serial_write_str("[oom] kernel OOM contained; OOM killer requested\n");
     }
 
     // Give the console back to whoever had it. The fault path forced it to text

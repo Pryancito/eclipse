@@ -1513,6 +1513,20 @@ pub fn heap_grow_status() -> (usize, &'static str, usize, usize, usize) {
     (0, "no elastic heap", 0, 0, 0)
 }
 
+/// The OOM emergency reserve (mirrors `memory_x86_64::rearm_oom_reserve`).
+/// This build has none.
+#[allow(dead_code)]
+pub fn rearm_oom_reserve() -> bool {
+    false
+}
+
+/// `(held, times spent)` of the OOM emergency reserve (mirrors
+/// `memory_x86_64::oom_reserve_status`). This build has none.
+#[allow(dead_code)]
+pub fn oom_reserve_status() -> (bool, usize) {
+    (false, 0)
+}
+
 /// Allocations refused by the heap re-entrancy guard (mirrors
 /// `memory_x86_64::heap_reentrancy_events`). This build has no such guard.
 #[allow(dead_code)]

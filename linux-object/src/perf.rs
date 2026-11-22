@@ -941,6 +941,20 @@ pub fn kernel_report() -> String {
             "stack vmap:   {} stacks mapped from scattered frames, {} fell back to the heap",
             vmapped, vfailed
         );
+        let l = kernel_hal::kstats::stack_blocks();
+        let _ = writeln!(
+            out,
+            "stack blocks: {} in the kernel heap ({} MiB of it), {} pooled, {} waiting a grace \
+             period; leaked: {} table full, {} soft, {} claimed at drop; {} soft freed to vmap",
+            l.heap_blocks,
+            l.heap_blocks * 4,
+            l.pooled,
+            l.retired_waiting,
+            l.table_full,
+            l.soft,
+            l.claimed_at_drop,
+            l.soft_freed
+        );
         // What the bounded stack poison is actually doing. `whole` climbing
         // with `bounded` at zero is the hook answering `None` (a huge leaf
         // over the kernel heap, or an architecture with no dirty bit): the
