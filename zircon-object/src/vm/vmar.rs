@@ -2651,7 +2651,7 @@ pub struct MappingDump {
     /// Whether the mapping is `MAP_SHARED`: the backing VMO is shared with
     /// every child rather than copied.
     pub shared: bool,
-    /// Koid of the backing VMO — stands in for the inode column.
+    /// Koid of the backing VMO.
     pub vmo_id: u64,
     /// Kernel-object name of the backing VMO; empty for plain anonymous memory.
     pub name: alloc::string::String,

@@ -45,7 +45,8 @@ fn the_other_files_take_no_writes() {
         pid: 45_442,
         kind: ProcPidFileKind::Stat,
     };
-    assert_eq!(stat.write_at(0, b"x"), Err(FsError::NotSupported));
+    // No `->write`: `EINVAL` from `vfs_write`, as Linux says.
+    assert_eq!(stat.write_at(0, b"x"), Err(FsError::InvalidParam));
     assert_eq!(stat.resize(0), Err(FsError::NotSupported));
 }
 

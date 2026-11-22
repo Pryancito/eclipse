@@ -1227,6 +1227,34 @@ fn report_enospc(path: &str, offset: u64, len: usize, size: Option<u64>) {
 }
 
 impl File {
+    /// `FIONREAD` of a regular file as Linux writes it: `i_size - f_pos`,
+    /// which is negative once the position is past the end. `None` for
+    /// anything else.
+    pub fn regular_bytes_left(&self) -> Option<i64> {
+        let inner = self.inner.read();
+        if inner.inode.downcast_ref::<super::pipe::Pipe>().is_some() {
+            return None;
+        }
+        let metadata = inner.inode.metadata().ok()?;
+        (metadata.type_ == FileType::File)
+            .then(|| (metadata.size as i64).wrapping_sub(inner.offset as i64))
+    }
+
+    /// `FIOQSIZE` (`ioctl_fioqsize`): the size of a directory, a regular
+    /// file or a symlink; `None`, which is `ENOTTY`, for anything else.
+    pub fn quantity_size(&self) -> Option<i64> {
+        let inner = self.inner.read();
+        if inner.inode.downcast_ref::<super::pipe::Pipe>().is_some() {
+            return None;
+        }
+        let metadata = inner.inode.metadata().ok()?;
+        matches!(
+            metadata.type_,
+            FileType::File | FileType::Dir | FileType::SymLink
+        )
+        .then_some(metadata.size as i64)
+    }
+
     /// create a file struct
     pub fn new(inode: Arc<dyn INode>, flags: OpenFlags, path: String) -> Arc<Self> {
         Arc::new(File {
@@ -2973,6 +3001,14 @@ mod async_poll_tests {
         // and a hung-up terminal answers every poll at once for the wrong
         // reason. `core::mem::forget` rather than a binding, because
         // `Drop for PtyMaster` reaches into the global map.
+        // `unlockpt(3)`: a new pair's slave does not open until then.
+        let unlock = 0i32;
+        master
+            .io_control(
+                crate::fs::ioctl::TIOCSPTLCK as u32,
+                &unlock as *const i32 as usize,
+            )
+            .expect("unlockpt");
         core::mem::forget(master);
         let slave = open_pts(id).expect("the pair is registered");
         File::new(slave, OpenFlags::RDWR, String::from("/dev/pts/x"))

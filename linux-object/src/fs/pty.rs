@@ -155,8 +155,9 @@ pub struct Pty {
     slave_ever_open: AtomicBool,
     /// The master fd has been closed: the slave then sees EOF.
     master_closed: AtomicBool,
-    /// `TIOCSPTLCK` flag. Stored for `TIOCGPTLCK`-style queries but not enforced
-    /// on slave open, so programs that skip `unlockpt(3)` still work.
+    /// `TIOCSPTLCK` flag: set when `/dev/ptmx` makes the pair, as Linux sets
+    /// `TTY_PTY_LOCK`; while it is set the slave does not open (`EIO`, as
+    /// `pty_open` answers) until `unlockpt(3)` clears it. `TIOCGPTLCK` reads it.
     locked: AtomicBool,
     /// Non-canonical `VTIME`: the monotonic deadline (ns) the slave read in
     /// progress is waiting on. Zero means no timer is running.
@@ -809,6 +810,10 @@ impl Pty {
     /// count ioctl (`FIONREAD`/`TIOCOUTQ`) reports on.
     fn ioctl(&self, cmd: u32, data: usize, is_master: bool) -> Result<usize> {
         match cmd as usize {
+            // The pair's number and lock are the master's requests
+            // (`pty_unix98_ioctl`); the slave's ops have neither, so they are
+            // `ENOTTY` there.
+            TIOCGPTN | TIOCSPTLCK | TIOCGPTLCK if !is_master => Err(FsError::NotSupported),
             TIOCGPTN => {
                 let v: u32 = self.id;
                 user_copy(UserOutPtr::<u32>::from(data).write(v))?;
@@ -817,6 +822,63 @@ impl Pty {
             TIOCSPTLCK => {
                 let lock = user_copy(UserInPtr::<i32>::from(data).read())?;
                 self.locked.store(lock != 0, Ordering::Relaxed);
+                Ok(0)
+            }
+            // `tcdrain(3)` is `TCSBRK` with 1: output reaches the master's
+            // queue as it is written, so there is nothing to wait for. A break
+            // (0, `TCSBRKP`, `TIOCSBRK`/`TIOCCBRK`) has no line to go on: a pty
+            // has no `break_ctl`, and `send_break` answers 0 then.
+            TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => Ok(0),
+            // `tcflow(3)`, the action by value (`n_tty_ioctl_helper`).
+            // `TCOOFF`/`TCOON` hold and release this end's output, as Ctrl-S
+            // and Ctrl-Q do on the slave; `TCIOFF`/`TCION` send the STOP or
+            // START character to the other end; anything else is `EINVAL`.
+            TCXONC => {
+                const TCOOFF: usize = 0;
+                const TCOON: usize = 1;
+                const TCIOFF: usize = 2;
+                const TCION: usize = 3;
+                if !matches!(data, TCOOFF | TCOON | TCIOFF | TCION) {
+                    return Err(FsError::InvalidParam);
+                }
+                // The master's own output is the slave's input, which is
+                // never held here; only the slave's flow has a state.
+                if is_master {
+                    return Ok(0);
+                }
+                let mut inner = self.inner.lock();
+                let mut wake = false;
+                match data {
+                    TCOOFF => {
+                        inner.stopped = true;
+                        drop(inner);
+                        self.master_bus.lock().clear(Event::READABLE);
+                        return Ok(0);
+                    }
+                    TCOON => {
+                        if inner.stopped {
+                            inner.stopped = false;
+                            wake = !inner.output.is_empty();
+                        }
+                    }
+                    _ => {
+                        let cc = inner.termios.c_cc;
+                        let c = cc[if data == TCIOFF { VSTOP } else { VSTART }];
+                        // `__DISABLED_CHAR`: nothing is sent.
+                        if c != 0 && out_extend(&mut inner.output, &[c]) {
+                            wake = !inner.stopped;
+                        }
+                    }
+                }
+                drop(inner);
+                if wake {
+                    self.wake_master();
+                }
+                Ok(0)
+            }
+            TIOCGPTLCK => {
+                let v = self.locked.load(Ordering::Relaxed) as i32;
+                user_copy(UserOutPtr::<i32>::from(data).write(v))?;
                 Ok(0)
             }
             TCGETS => {
@@ -1203,7 +1265,7 @@ pub fn alloc_ptmx(uid: u32) -> Arc<dyn INode> {
         slave_open: AtomicI32::new(0),
         slave_ever_open: AtomicBool::new(false),
         master_closed: AtomicBool::new(false),
-        locked: AtomicBool::new(false),
+        locked: AtomicBool::new(true),
         vtime_deadline_ns: AtomicU64::new(0),
         slave_need: AtomicUsize::new(0),
         owner: Mutex::new(devpts::Owner::of(uid)),
@@ -1213,14 +1275,31 @@ pub fn alloc_ptmx(uid: u32) -> Arc<dyn INode> {
 }
 
 /// Open the slave `/dev/pts/N`. Returns `None` if the pair no longer exists
-/// (its master was closed).
+/// (its master was closed) or is still locked (no `unlockpt(3)` yet).
 pub fn open_pts(id: u32) -> Option<Arc<dyn INode>> {
     let pty = PTYS.lock().get(&id).cloned()?;
     open_slave(pty)
 }
 
-/// Open the slave of `pty`, unless its master is closed.
+/// Open the slave `/dev/pts/N` again for a caller that already has it open
+/// (`/dev/tty`): the pair's lock is not asked again. `None` once the master
+/// is closed.
+pub fn reopen_pts(id: u32) -> Option<Arc<dyn INode>> {
+    let pty = PTYS.lock().get(&id).cloned()?;
+    open_slave_unlocked(pty)
+}
+
+/// Open the slave of `pty`, unless its master is closed or the pair is
+/// locked (`pty_open`: `-EIO` while `TTY_PTY_LOCK` is set).
 fn open_slave(pty: Arc<Pty>) -> Option<Arc<dyn INode>> {
+    if pty.locked.load(Ordering::Relaxed) {
+        return None;
+    }
+    open_slave_unlocked(pty)
+}
+
+/// [`open_slave`] without the lock check.
+fn open_slave_unlocked(pty: Arc<Pty>) -> Option<Arc<dyn INode>> {
     if pty.master_closed.load(Ordering::Relaxed) {
         return None;
     }
@@ -1247,7 +1326,7 @@ impl PtyMaster {
 
     /// `TIOCGPTPEER`: open this master's slave end directly, without going
     /// through `/dev/pts/N` (Linux 4.13+). Same bookkeeping as opening the
-    /// path. `None` once the master is closed.
+    /// path. `None` once the master is closed or while the pair is locked.
     ///
     /// rustix-openpty (alacritty and every other Rust terminal built on it)
     /// tries this ioctl FIRST and only falls back to `ptsname()` + `open()`
@@ -1711,6 +1790,51 @@ mod tests {
     /// `copy_to_user`/`copy_from_user` copy it: a bad one is `EFAULT`. It
     /// was dereferenced as it came, so `ioctl(ptmx, TCGETS, 0)` wrote a
     /// `termios` to address 0 in the kernel.
+    /// `tcdrain(3)` (`TCSBRK` 1) and `tcsendbreak(3)` answered `ENOTTY`, so
+    /// a program that drains before it exits saw its terminal as no
+    /// terminal. `tcflow(3)` (`TCXONC`) holds and releases the slave's output
+    /// as Ctrl-S and Ctrl-Q do, sends STOP/START, and refuses a fifth action.
+    #[test]
+    fn tcdrain_and_tcflow_are_terminal_requests() {
+        let p = pty();
+        for cmd in [TCSBRK, TCSBRKP, TIOCSBRK, TIOCCBRK] {
+            for arg in [0, 1] {
+                assert_eq!(p.ioctl(cmd as u32, arg, false), Ok(0), "{:#x} {}", cmd, arg);
+            }
+        }
+        p.slave_write(b"x");
+        assert_eq!(p.ioctl(TCXONC as u32, 0, false), Ok(0), "TCOOFF");
+        assert!(!p.master_readable(), "output held by TCOOFF");
+        assert_eq!(p.ioctl(TCXONC as u32, 1, false), Ok(0), "TCOON");
+        assert!(p.master_readable(), "output released by TCOON");
+        p.inner.lock().output.clear();
+        assert_eq!(p.ioctl(TCXONC as u32, 2, false), Ok(0), "TCIOFF");
+        assert_eq!(p.ioctl(TCXONC as u32, 3, false), Ok(0), "TCION");
+        let sent: Vec<u8> = p.inner.lock().output.iter().copied().collect();
+        assert_eq!(sent, [0x13, 0x11], "STOP then START, as c_cc names them");
+        assert_eq!(p.ioctl(TCXONC as u32, 4, false), Err(FsError::InvalidParam));
+        assert_eq!(p.ioctl(TCXONC as u32, 4, true), Err(FsError::InvalidParam));
+    }
+
+    /// `ptsname(3)` and `unlockpt(3)` are asked of the master; the slave
+    /// answered `TIOCGPTN` too, where Linux says `ENOTTY`.
+    #[test]
+    fn the_pair_s_number_and_lock_are_the_master_s() {
+        let p = pty();
+        let mut v = 0u32;
+        let at = &mut v as *mut u32 as usize;
+        for cmd in [TIOCGPTN, TIOCSPTLCK, TIOCGPTLCK] {
+            assert_eq!(
+                p.ioctl(cmd as u32, at, false),
+                Err(FsError::NotSupported),
+                "{:#x}",
+                cmd
+            );
+        }
+        assert_eq!(p.ioctl(TIOCGPTLCK as u32, at, true), Ok(0));
+        assert_eq!(v, 0, "the fixture's pair is unlocked");
+    }
+
     #[test]
     fn a_bad_ioctl_pointer_is_efault_and_a_good_one_is_written() {
         let p = pty();

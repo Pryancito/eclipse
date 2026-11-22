@@ -15,6 +15,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::convert::TryInto;
+use linux_object::fs::ioctl::{TIOCGPTLCK, TIOCSPTLCK};
 use linux_object::process::LinuxProcess;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
@@ -95,12 +96,30 @@ fn open(sys: &Syscall<'_>, path: &str) -> LxResult<FileDesc> {
 /// A new pair, as `posix_openpt` and `ptsname` make it: the master, and the
 /// name of its slave.
 async fn a_pair(sys: &Syscall<'_>) -> (FileDesc, String) {
+    let (master, name) = a_locked_pair(sys).await;
+    let unlock = 0i32;
+    sys.sys_ioctl(master, TIOCSPTLCK, &unlock as *const i32 as usize, 0, 0)
+        .await
+        .unwrap();
+    (master, name)
+}
+
+/// A pair as `/dev/ptmx` makes it: locked until `unlockpt(3)`.
+async fn a_locked_pair(sys: &Syscall<'_>) -> (FileDesc, String) {
     let master = open(sys, "/dev/ptmx").unwrap();
     let mut n = 0u32;
     sys.sys_ioctl(master, TIOCGPTN, &mut n as *mut u32 as usize, 0, 0)
         .await
         .unwrap();
     (master, format!("/dev/pts/{}", n))
+}
+
+async fn lock_of(sys: &Syscall<'_>, master: FileDesc) -> i32 {
+    let mut v = -1i32;
+    sys.sys_ioctl(master, TIOCGPTLCK, &mut v as *mut i32 as usize, 0, 0)
+        .await
+        .unwrap();
+    v
 }
 
 fn number(name: &str) -> u64 {
@@ -299,6 +318,79 @@ fn dev_pts_n_is_gone_once_its_master_is_closed() {
         listed
     );
     assert_eq!(still, Ok(()), "the open slave is still a descriptor");
+}
+
+/// `/dev/ptmx` hands out a locked pair (`TTY_PTY_LOCK`), and its slave does
+/// not open, by name or by `TIOCGPTPEER`, until `unlockpt(3)` clears it:
+/// `EIO`, as `pty_open` answers. The lock was stored and never asked.
+#[test]
+fn a_new_pair_is_locked_until_unlockpt() {
+    const TIOCGPTPEER: usize = 0x5441;
+    const O_RDWR: usize = 2;
+    let proc = a_process(45_673, "pts_lock");
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let (master, name) = a_locked_pair(sys).await;
+            let fresh = lock_of(sys, master).await;
+            let by_name = open(sys, &name).map(|_| ());
+            let by_peer = sys
+                .sys_ioctl(master, TIOCGPTPEER, O_RDWR, 0, 0)
+                .await
+                .map(|_| ());
+            let unlock = 0i32;
+            sys.sys_ioctl(master, TIOCSPTLCK, &unlock as *const i32 as usize, 0, 0)
+                .await
+                .unwrap();
+            let unlocked = lock_of(sys, master).await;
+            let after_name = open(sys, &name).map(|_| ());
+            let after_peer = sys
+                .sys_ioctl(master, TIOCGPTPEER, O_RDWR, 0, 0)
+                .await
+                .map(|_| ());
+            (fresh, by_name, by_peer, unlocked, after_name, after_peer)
+        })
+    });
+    assert_eq!(got.0, 1, "TIOCGPTLCK of a new pair");
+    assert_eq!(got.1, Err(LxError::EIO), "the slave by name, still locked");
+    assert_eq!(got.2, Err(LxError::EIO), "TIOCGPTPEER, still locked");
+    assert_eq!(got.3, 0, "TIOCGPTLCK after unlockpt");
+    assert_eq!(got.4, Ok(()), "the slave by name, unlocked");
+    assert_eq!(got.5, Ok(()), "TIOCGPTPEER, unlocked");
+}
+
+/// `tcsetpgrp(3)` names a group of the caller's own session (`tiocspgrp`):
+/// a negative one is `EINVAL`, one nobody is in `ESRCH`, another session's
+/// `EPERM`. The terminal took any number and signalled it at the next Ctrl-C.
+#[test]
+fn the_foreground_group_is_one_of_the_caller_s_session() {
+    const TIOCSPGRP: usize = 0x5410;
+    let proc = a_process(45_674, "pts_fg");
+    let other = a_process(45_675, "pts_fg_other");
+    other.linux().become_session_leader(other.id());
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let (_master, name) = a_pair(sys).await;
+            let slave = open(sys, &name).unwrap();
+            let mut answers = Vec::new();
+            for pgid in [-1i32, 987_654, 45_675, 45_674] {
+                answers.push(
+                    sys.sys_ioctl(slave, TIOCSPGRP, &pgid as *const i32 as usize, 0, 0)
+                        .await
+                        .map(|_| ()),
+                );
+            }
+            answers
+        })
+    });
+    assert_eq!(
+        got,
+        [
+            Err(LxError::EINVAL),
+            Err(LxError::ESRCH),
+            Err(LxError::EPERM),
+            Ok(())
+        ]
+    );
 }
 
 #[test]

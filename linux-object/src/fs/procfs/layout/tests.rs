@@ -390,3 +390,26 @@ fn status_and_statm_say_how_much_there_is_of_each_kind() {
         .collect();
     assert_eq!((statm[3], statm[4], statm[5], statm[6]), (3, 0, 4 + 6, 0));
 }
+
+#[test]
+fn a_maps_row_names_its_files_device_and_inode_and_anonymous_memory_none() {
+    let proc = a_process(49_409);
+    let lp = proc.linux();
+    let file = lp
+        .root_inode()
+        .create("layout_lib.so", rcore_fs::vfs::FileType::File, 0o755)
+        .unwrap();
+    let ino = file.metadata().unwrap().inode as u64;
+    let mut last = None;
+    for anon in ["", "[heap]", "[stack]", "[vdso]"] {
+        assert_eq!(row_device(&proc, anon, &mut last), (0, 0, 0), "{}", anon);
+    }
+    assert_eq!(row_device(&proc, "/layout_lib.so", &mut last).2, ino);
+    // The next row of the same file is answered from `last`.
+    assert_eq!(
+        last.as_ref().map(|(n, _)| n.as_str()),
+        Some("/layout_lib.so")
+    );
+    assert_eq!(row_device(&proc, "/layout_lib.so", &mut last).2, ino);
+    assert_eq!(row_device(&proc, "/no_such_lib.so", &mut last), (0, 0, 0));
+}

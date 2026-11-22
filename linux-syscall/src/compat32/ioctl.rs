@@ -125,6 +125,11 @@ const SAME: &[(u32, &str)] = &[
     (0x402c542d, "TCSETSF2"),
     // A scalar in the argument, nothing read or written through it.
     (0x540b, "TCFLSH"),
+    (0x5409, "TCSBRK"),
+    (0x540a, "TCXONC"),
+    (0x5425, "TCSBRKP"),
+    (0x5427, "TIOCSBRK"),
+    (0x5428, "TIOCCBRK"),
     (0x540e, "TIOCSCTTY"),
     (0x5422, "TIOCNOTTY"),
     (0x5441, "TIOCGPTPEER"),
@@ -142,6 +147,7 @@ const SAME: &[(u32, &str)] = &[
     (0x5452, "FIOASYNC"),
     (0x80045430, "TIOCGPTN"),
     (0x40045431, "TIOCSPTLCK"),
+    (0x80045439, "TIOCGPTLCK"),
     // No argument at all: the fd's close-on-exec bit.
     (0x5450, "FIONCLEX"),
     (0x5451, "FIOCLEX"),

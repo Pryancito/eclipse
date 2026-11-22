@@ -550,6 +550,27 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             }
             Ok(0)
         }
+        // `tcdrain(3)` is `TCSBRK` with 1: what was written is on the screen
+        // already. A break has no line to go on: the console has no
+        // `break_ctl`, and `send_break` answers 0 then.
+        TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => Ok(0),
+        // `tcflow(3)`: `TCOOFF`/`TCOON` hold and release the output as
+        // Ctrl-S and Ctrl-Q do; `TCIOFF`/`TCION` would send STOP or START to
+        // the device, and the screen does not listen; anything else `EINVAL`.
+        TCXONC => {
+            const TCOOFF: usize = 0;
+            const TCOON: usize = 1;
+            const TCIOFF: usize = 2;
+            const TCION: usize = 3;
+            let state = &TTY_STATES[vt_clamp(vt)].flow_stopped;
+            match data {
+                TCOOFF => state.store(true, Ordering::Relaxed),
+                TCOON => state.store(false, Ordering::Relaxed),
+                TCIOFF | TCION => {}
+                _ => return Err(FsError::InvalidParam),
+            }
+            Ok(0)
+        }
         KDGETMODE => {
             let v: i32 = console::kd_mode_vt(vt) as i32;
             user_copy(UserOutPtr::<i32>::from(data).write(v))?;
@@ -3235,6 +3256,24 @@ mod line_discipline_tests {
     }
 
     // ---- software flow control -----------------------------------------
+
+    /// `tcdrain(3)` and `tcflow(3)` on a VT: `TCSBRK` answered `ENOTTY`, so
+    /// a program that drains before exiting saw no terminal; `TCOOFF` and
+    /// `TCOON` are Ctrl-S and Ctrl-Q from the program's side.
+    #[test]
+    fn tcdrain_and_tcflow_on_a_vt() {
+        let _g = SERIAL.lock();
+        for cmd in [TCSBRK, TCSBRKP, TIOCSBRK, TIOCCBRK] {
+            assert_eq!(tty_ioctl(VT, cmd as u32, 1), Ok(0), "{:#x}", cmd);
+        }
+        assert_eq!(tty_ioctl(VT, TCXONC as u32, 0), Ok(0));
+        assert!(flow_stopped(), "TCOOFF holds the output");
+        assert_eq!(tty_ioctl(VT, TCXONC as u32, 1), Ok(0));
+        assert!(!flow_stopped(), "TCOON releases it");
+        assert_eq!(tty_ioctl(VT, TCXONC as u32, 2), Ok(0));
+        assert_eq!(tty_ioctl(VT, TCXONC as u32, 3), Ok(0));
+        assert_eq!(tty_ioctl(VT, TCXONC as u32, 4), Err(FsError::InvalidParam));
+    }
 
     #[test]
     fn ixon_consumes_stop_and_start_without_delivering_them() {

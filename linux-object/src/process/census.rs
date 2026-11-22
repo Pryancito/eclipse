@@ -29,6 +29,26 @@ pub fn get_process_pgid(pid: KoID) -> LxResult<KoID> {
     Ok(effective_pgid(&find_task(pid).ok_or(LxError::ESRCH)?))
 }
 
+/// `tcsetpgrp(3)` (`TIOCSPGRP`): whether the caller may make `pgid` the
+/// foreground group of its terminal, as `tiocspgrp` decides: a negative
+/// number is `EINVAL`, one no live process is in is `ESRCH`, and a group of
+/// another session is `EPERM`. (Whether the terminal is the caller's
+/// controlling one is not asked: no controlling terminal is recorded.)
+pub fn foreground_group_verdict(caller: &Arc<Process>, pgid: i32) -> LxResult<()> {
+    if pgid < 0 {
+        return Err(LxError::EINVAL);
+    }
+    let pgid = pgid as KoID;
+    let member = all_live_processes()
+        .into_iter()
+        .find(|p| effective_pgid(p) == pgid)
+        .ok_or(LxError::ESRCH)?;
+    if effective_sid(&member) != effective_sid(caller) {
+        return Err(LxError::EPERM);
+    }
+    Ok(())
+}
+
 /// `getsid`: the effective session id of process `pid`, as [`get_process_pgid`].
 pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
     Ok(effective_sid(&find_task(pid).ok_or(LxError::ESRCH)?))

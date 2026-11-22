@@ -67,6 +67,7 @@ const ARGV_AT: usize = USER_AT + 0x23_000;
 /// pages of its own memory at [`USER_AT`], mapped eagerly so the kernel's
 /// writes below land on pages that are really there.
 fn a_process(pid: KoID, abi: Abi) -> Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     // `arg_limit` is a quarter of `RLIMIT_STACK` within Linux's own bounds,

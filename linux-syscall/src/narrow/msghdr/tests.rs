@@ -233,6 +233,7 @@ const EFAULT: isize = -(LxError::EFAULT as isize);
 /// A process of `abi` with four pages of its own at [`USER_AT`], mapped
 /// eagerly so the kernel's writes land on pages that are really there.
 fn a_process(pid: KoID, abi: Abi) -> Arc<Process> {
+    crate::on_a_thread::claim_low_user_pages();
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "msghdr32", lp).unwrap();
