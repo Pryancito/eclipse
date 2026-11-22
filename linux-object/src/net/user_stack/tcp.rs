@@ -3373,7 +3373,7 @@ mod tests {
         assert_eq!(Socket::so_sndtimeo(&s), [0u8; 16]);
         assert_eq!(
             Socket::setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &timeval(0, 1_000_000)),
-            Err(LxError::EINVAL)
+            Err(LxError::EDOM)
         );
         assert_eq!(
             Socket::setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &tv[..8]),

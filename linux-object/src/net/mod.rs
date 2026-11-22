@@ -1502,6 +1502,13 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     async fn connect(&self, endpoint: Endpoint) -> SysResult;
+    /// `connect(2)` to an `AF_UNSPEC` address: a datagram socket forgets its
+    /// destination. A socket with nothing to forget refuses the address as
+    /// one of the wrong family, which is what a unix stream does
+    /// (`unix_validate_addr`).
+    fn disconnect(&self) -> SysResult {
+        Err(LxError::EINVAL)
+    }
     /// missing documentation
     fn bind(&self, _endpoint: Endpoint) -> SysResult {
         Err(LxError::EINVAL)
@@ -1581,9 +1588,9 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// hands an opened DRM/input device to a Wayland compositor and how clients
     /// pass shm/dmabuf buffers back.
     fn send_fds(&self, _fds: alloc::vec::Vec<Arc<dyn FileLike>>) -> SysResult {
-        // `ENOSYS` told callers the *syscall* was missing; Linux answers
-        // `EOPNOTSUPP` for SCM_RIGHTS on a non-unix socket.
-        Err(LxError::EOPNOTSUPP)
+        // `__scm_send`: `SCM_RIGHTS` on a socket that is not `PF_UNIX` is
+        // `EINVAL` (`if (!ops || ops->family != PF_UNIX)`).
+        Err(LxError::EINVAL)
     }
     /// Take up to `_max` file descriptors the peer attached via `SCM_RIGHTS`.
     fn recv_fds(&self, _max: usize) -> alloc::vec::Vec<Arc<dyn FileLike>> {
@@ -1807,17 +1814,10 @@ impl StoredInetOpts {
                     return Some(Ok(0));
                 }
                 20 | 21 => {
-                    if data.len() < 16 {
-                        return Some(Err(LxError::EINVAL));
-                    }
-                    let mut tv = [0u8; 16];
-                    tv.copy_from_slice(&data[..16]);
-                    let usec = i64::from_ne_bytes([
-                        tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
-                    ]);
-                    if !(0..1_000_000).contains(&usec) {
-                        return Some(Err(LxError::EINVAL));
-                    }
+                    let tv = match sockopt_timeval(data) {
+                        Ok(tv) => tv,
+                        Err(e) => return Some(Err(e)),
+                    };
                     if opt == 20 {
                         self.rcv_timeo = tv;
                     } else {
@@ -1907,8 +1907,8 @@ pub(crate) fn setsockopt_unstored<S: Socket + ?Sized>(
 }
 
 /// The `struct timeval` a `SO_RCVTIMEO` or `SO_SNDTIMEO` is set to, as
-/// [`sockopt_deadline`] reads it. `tv_usec` must be in `0..1_000_000`
-/// (`sock_set_timeout`).
+/// [`sockopt_deadline`] reads it. `tv_usec` must be in `0..1_000_000`,
+/// and outside it `sock_set_timeout` answers `EDOM`, not `EINVAL`.
 pub(crate) fn sockopt_timeval(data: &[u8]) -> LxResult<[u8; 16]> {
     if data.len() < 16 {
         return Err(LxError::EINVAL);
@@ -1917,7 +1917,7 @@ pub(crate) fn sockopt_timeval(data: &[u8]) -> LxResult<[u8; 16]> {
     tv.copy_from_slice(&data[..16]);
     let usec = i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
     if !(0..1_000_000).contains(&usec) {
-        return Err(LxError::EINVAL);
+        return Err(LxError::EDOM);
     }
     Ok(tv)
 }

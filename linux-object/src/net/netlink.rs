@@ -875,13 +875,26 @@ impl Socket for NetlinkSocketState {
         Ok(whole.len())
     }
 
-    /// connect (netlink sockets do not support connect)
-    async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        // Netlink sockets do not support connect(2). `EOPNOTSUPP` (= Linux
-        // `ENOTSUP`) is the answer; `EINVAL` made probes think the address
-        // was wrong rather than the operation.
-        warn!("[netlink] connect: not supported on netlink sockets");
-        Err(LxError::EOPNOTSUPP)
+    /// `netlink_connect`. Connecting to the kernel (port 0) is what a
+    /// netlink socket's sends do anyway, so it succeeds and changes nothing;
+    /// an address of another family is `EINVAL`. Another process's port is
+    /// a destination this kernel cannot deliver to, so it stays refused
+    /// (`EOPNOTSUPP`) rather than quietly sending to the kernel instead.
+    async fn connect(&self, endpoint: Endpoint) -> SysResult {
+        match endpoint {
+            Endpoint::Netlink(nl) if nl.port_id == 0 => Ok(0),
+            Endpoint::Netlink(_) => {
+                warn!("[netlink] connect: to another process's port is not supported");
+                Err(LxError::EOPNOTSUPP)
+            }
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    /// `netlink_connect` with `AF_UNSPEC`: back to the kernel, which is
+    /// where this socket sends already.
+    fn disconnect(&self) -> SysResult {
+        Ok(0)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -2572,5 +2585,28 @@ mod netlink_tests {
         let cola = nl.data.lock();
         assert_eq!(cola.len(), 1);
         assert_eq!(lee_error(&cola[0]).1, -3, "-ESRCH");
+    }
+}
+
+/// `netlink_connect`: to the kernel it succeeds, `AF_UNSPEC` too, and an
+/// address of another family is `EINVAL`. It used to be `EOPNOTSUPP` for
+/// all of them, which libraries that connect before they send took for a
+/// kernel without netlink.
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[async_std::test]
+    async fn connecting_to_the_kernel_works_and_another_family_is_einval() {
+        let nl = NetlinkSocketState::new(SocketType::SOCK_RAW);
+        assert_eq!(
+            Socket::connect(&nl, Endpoint::Netlink(NetlinkEndpoint::new(0, 0))).await,
+            Ok(0)
+        );
+        assert_eq!(Socket::disconnect(&nl), Ok(0));
+        assert_eq!(
+            Socket::connect(&nl, Endpoint::Unix("/x".into())).await,
+            Err(LxError::EINVAL)
+        );
     }
 }

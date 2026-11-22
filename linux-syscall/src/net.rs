@@ -16,9 +16,15 @@ use linux_object::{
 /// hunter's per-application firewall, asked by `connect`, `bind`, `sendto`
 /// and `sendmsg` before they touch the socket.
 mod hunter_firewall;
+
+/// `socket`/`socketpair` of a type or family that is not served.
+#[cfg(test)]
+mod socket_create_tests;
 use hunter::firewall::Direction as NetDirection;
 
 const MSG_DONTWAIT: usize = 0x40;
+/// `MSG_WAITFORONE`: `recvmmsg` stops waiting once one datagram is in.
+const MSG_WAITFORONE: usize = 0x1_0000;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
 /// Close-on-exec for fds installed from `SCM_RIGHTS` (`linux/socket.h`).
@@ -82,6 +88,16 @@ fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode 
 /// `move_addr_to_kernel` semantics.
 #[allow(unsafe_code)]
 fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
+    // `move_addr_to_kernel`: a length that is negative as an `int` or longer
+    // than a `sockaddr_storage` is `EINVAL`, and none at all copies nothing
+    // -- the family's own check then refuses it (`sockaddr_to_endpoint`).
+    let len = addrlen as u32 as i32;
+    if !(0..=SOCKADDR_STORAGE_LEN).contains(&len) {
+        return Err(LxError::EINVAL);
+    }
+    if len == 0 {
+        return Ok(unsafe { core::mem::zeroed() });
+    }
     if addr == 0 {
         return Err(LxError::EFAULT);
     }
@@ -102,6 +118,17 @@ fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
     }
     Ok(storage)
 }
+
+/// A family `sockaddr_to_endpoint` parses.
+fn known_family(family: u16) -> bool {
+    matches!(family, 1 | 2 | 10 | 16 | 17)
+}
+
+/// `sizeof(struct sockaddr_storage)`: the most `move_addr_to_kernel` takes.
+const SOCKADDR_STORAGE_LEN: i32 = 128;
+
+/// `AF_UNSPEC`: to `connect(2)`, "dissolve the association".
+const AF_UNSPEC: u16 = 0;
 
 /// Copy an option value out to a `getsockopt` caller.
 ///
@@ -233,14 +260,23 @@ const SOL_RAW: usize = 255;
 /// carries no message, so it is ignored rather than refused: that is what
 /// Linux does, and a caller that zeroes a `struct msghdr` and sets only
 /// `msg_control` depends on it.
+///
+/// In `____sys_sendmsg`'s order: no length is no control data, a length past
+/// the ceiling is `ENOBUFS` (`sock_kmalloc` refusing more than `optmem_max`),
+/// and anything else is copied in, so a NULL `msg_control` with a length is
+/// `EFAULT`. Both used to be quiet: NULL with any length was an ordinary
+/// send and the ceiling was `EINVAL`.
 fn scm_control_action(cmsg: CmsgLayout, is_null: bool, controllen: usize) -> LxResult<bool> {
-    if is_null || controllen < cmsg.hdr_len {
+    if controllen == 0 {
         return Ok(false);
     }
     if controllen > CONTROL_MAX {
-        return Err(LxError::EINVAL);
+        return Err(LxError::ENOBUFS);
     }
-    Ok(true)
+    if is_null {
+        return Err(LxError::EFAULT);
+    }
+    Ok(controllen >= cmsg.hdr_len)
 }
 /// `SOL_SOCKET`, as it appears in `cmsg_level`.
 const SOL_SOCKET_LEVEL: i32 = 1;
@@ -343,9 +379,13 @@ fn parse_scm_rights_fds(cmsg: CmsgLayout, ctrl: &[u8]) -> Result<Vec<i32>, LxErr
         let ints = off + cmsg.len_width;
         let level = i32::from_ne_bytes(ctrl[ints..ints + 4].try_into().unwrap());
         let typ = i32::from_ne_bytes(ctrl[ints + 4..ints + 8].try_into().unwrap());
+        // `CMSG_OK`, which `__scm_send` asks of every message it walks: a
+        // length shorter than its own header or past the end of the buffer
+        // refuses the whole `sendmsg` with `EINVAL`. It used to end the walk
+        // quietly and send the bytes anyway.
         let cmsg_end = match off.checked_add(cmsg_len) {
             Some(end) if cmsg_len >= cmsg.hdr_len && end <= ctrl.len() => end,
-            _ => break,
+            _ => return Err(LxError::EINVAL),
         };
         if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
             // A trailing partial fd is not one: `as_chunks` drops it, as the
@@ -596,6 +636,18 @@ impl Syscall<'_> {
                 s.set_socket_type(socket_type);
                 s
             }
+            // `inet_create` / `inet6_create`: a type with no protocol
+            // registered for it at all (SEQPACKET without SCTP, RDM, DCCP,
+            // PACKET) is `ESOCKTNOSUPPORT`; a known type with the wrong
+            // protocol stays `EPROTONOSUPPORT`, below.
+            (
+                Domain::AF_INET | Domain::AF_INET6,
+                SocketType::SOCK_SEQPACKET
+                | SocketType::SOCK_RDM
+                | SocketType::SOCK_DCCP
+                | SocketType::SOCK_PACKET,
+                _,
+            ) => return Err(LxError::ESOCKTNOSUPPORT),
             (_, _, _) => {
                 // A domain/type/protocol combo this kernel does not wire up
                 // is `EPROTONOSUPPORT`, not `ENOSYS`. `ENOSYS` told callers
@@ -626,13 +678,51 @@ impl Syscall<'_> {
             "sys_connect: sockfd:{}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
-        let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
+        // `__sys_connect` in its order: the fd, the address copied in, then
+        // whether the fd is a socket at all, then the family's own checks.
         let proc = self.linux_process();
         let file_like = proc.get_file_like(sockfd.into())?;
+        let sa = read_sockaddr(addr.as_addr(), addrlen)?;
+        let socket = file_like.as_socket()?;
+        #[allow(unsafe_code)]
+        let family = unsafe { sa.family };
+        // `AF_UNSPEC` takes a datagram socket's destination away
+        // (`unix_dgram_connect`, `udp_disconnect`). It used to be `EINVAL`
+        // for every socket.
+        if addrlen >= size_of::<u16>() && family == AF_UNSPEC {
+            return socket.disconnect();
+        }
+        let endpoint = match sockaddr_to_endpoint(sa, addrlen) {
+            // An address of a family an IP socket does not speak is
+            // `EAFNOSUPPORT` (`inet_dgram_connect`, `tcp_v4_connect`); a unix
+            // socket checks the family as part of the address (`EINVAL`).
+            Err(LxError::EINVAL)
+                if addrlen >= size_of::<u16>()
+                    && matches!(socket.so_domain(), Some(2) | Some(10))
+                    && !known_family(family) =>
+            {
+                return Err(LxError::EAFNOSUPPORT);
+            }
+            r => r?,
+        };
         self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                // A datagram socket's connect only names a default
+                // destination (`unix_dgram_connect`): no listener, no accept.
+                if client.sock_type() == SocketType::SOCK_DGRAM {
+                    client.connect_dgram(path)?;
+                    return Ok(0);
+                }
+                // `unix_find_other` matches the socket type before anything
+                // asks whether it listens: a stream connecting to a datagram
+                // socket's address is `EPROTOTYPE`, not `ECONNREFUSED`.
+                if let Some(other) = UnixSocketState::lookup(path) {
+                    if other.sock_type() != client.sock_type() {
+                        return Err(LxError::EPROTOTYPE);
+                    }
+                }
                 // `unix_stream_connect`: already connected (or a listener)
                 // is `EISCONN`. Without the check a second `connect` rewired
                 // the peer and queued another accept silently.
@@ -729,13 +819,23 @@ impl Syscall<'_> {
         // return: what this option owes the caller's width, asked of the
         // process once. See [`crate::narrow::sockopt`].
         let out = self.sockopt_out(level, optname);
+        // `__sys_getsockopt` in its order: the fd (`EBADF`, `ENOTSOCK`)
+        // before the level or the name is looked at, then `optlen` (`EFAULT`,
+        // negative `EINVAL`). An unknown level used to be `ENOPROTOOPT` on a
+        // closed fd too.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
+        if (optlen.read()? as i32) < 0 {
+            return Err(LxError::EINVAL);
+        }
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
                 // A level only sockets of some family have (IPv6's,
                 // ICMPv6's, a raw socket's): the socket says what its option is, when it
                 // has it.
-                if matches!(level, SOL_IPV6 | SOL_ICMPV6 | SOL_RAW) && !optval.is_null() {
+                if matches!(level, SOL_IPV6 | SOL_ICMPV6 | SOL_RAW) {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let said = file_like.as_socket()?.getsockopt_own(level, optname);
                     if let Some(value) = said {
@@ -750,9 +850,10 @@ impl Syscall<'_> {
                 return Err(LxError::ENOPROTOOPT);
             }
         };
-        if optval.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        // A NULL `optval` is not refused up front: Linux copies out
+        // `min(len, size)` bytes, so with `*optlen == 0` it succeeds and
+        // otherwise the copy is `EFAULT` (`write_sockopt_out`). It used to be
+        // `EINVAL` before anything else.
         match level {
             Level::SOL_SOCKET => {
                 // SO_PEERCRED (17): `struct ucred { pid_t pid; uid_t uid;
@@ -1080,6 +1181,8 @@ impl Syscall<'_> {
             "sys_sendto: sockfd:{:?}, buffer:{:?}, length:{:?}, flags:{:?} , optlen:{:?}, addrlen:{:?}",
             sockfd, buf, len, flags, dest_addr, addrlen
         );
+        // `__sys_sendto`: the fd before the address.
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let endpoint = if dest_addr.is_null() {
             None
         } else {
@@ -1089,7 +1192,6 @@ impl Syscall<'_> {
             self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
             Some(endpoint)
         };
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         // Return the socket's ACTUAL queued byte count, not the full requested
         // `len`. TCP `write()` can perform a short write (queues min(len, free TX
         // space)); reporting `len` regardless makes the caller believe bytes it
@@ -1189,6 +1291,10 @@ impl Syscall<'_> {
         // At the CALLER's width: a 32-bit caller's envelope is 28 bytes, not
         // 56, and reading it natively does not fail --- it pairs the halves
         // of two fields into one. See [`crate::narrow::msghdr`].
+        // `__sys_sendmsg`: the fd before the header.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let hdr = self.read_msghdr(msg.as_addr())?;
         self.sendmsg_hdr(sockfd, &hdr, flags).await
     }
@@ -1283,7 +1389,7 @@ impl Syscall<'_> {
         let fds_queued = !passed_fds.is_empty();
         if fds_queued {
             // Do not swallow the error: on a non-unix socket SCM_RIGHTS must
-            // fail the whole `sendmsg` (`EOPNOTSUPP`), not queue nothing and
+            // fail the whole `sendmsg` (`EINVAL`), not queue nothing and
             // still send the bytes.
             socket.send_fds(passed_fds)?;
         }
@@ -1314,6 +1420,10 @@ impl Syscall<'_> {
             sockfd, msg, flags
         );
         let msg_addr = msg.as_addr();
+        // `__sys_recvmsg`: the fd before the header.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         // At the CALLER's width, as `sendmsg` does.
         let mut hdr = self.read_msghdr(msg_addr)?;
         let cmsg = self.cmsg_layout();
@@ -1463,6 +1573,10 @@ impl Syscall<'_> {
             "sys_bind: sockfd:{:?}, addr:{:?}, addrlen:{}",
             sockfd, addr, addrlen
         );
+        // `__sys_bind`: the socket before the address.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
         self.hunter_net_gate(NetDirection::In, &endpoint).await?;
@@ -1672,12 +1786,23 @@ impl Syscall<'_> {
             domain, _type, protocol
         );
         if domain != Domain::AF_UNIX as usize {
-            return Err(LxError::EAFNOSUPPORT);
+            // `__sys_socketpair` creates both sockets and then asks the
+            // family: a family this kernel makes sockets of (inet, inet6,
+            // netlink, packet) has no `socketpair` (`sock_no_socketpair`):
+            // `EOPNOTSUPP`. A family it does not know is `EAFNOSUPPORT`, and
+            // a type out of range is `EINVAL` before either.
+            SocketType::try_from(_type & SOCKET_TYPE_MASK).map_err(|_| LxError::EINVAL)?;
+            return Err(match Domain::try_from(domain) {
+                Ok(Domain::AF_INET | Domain::AF_INET6 | Domain::AF_NETLINK | Domain::AF_PACKET) => {
+                    LxError::EOPNOTSUPP
+                }
+                _ => LxError::EAFNOSUPPORT,
+            });
         }
         // Same gate as `sys_socket`: an unrecognized type is `EINVAL`, not a
         // silent SOCK_STREAM pair. AF_UNIX only knows STREAM/DGRAM/SEQPACKET
-        // (`unix_create`); anything else named by `SocketType` is
-        // `EOPNOTSUPP` (Linux's `ESOCKTNOSUPPORT`).
+        // (`unix_create`), takes SOCK_RAW as a datagram, and anything else
+        // named by `SocketType` is `ESOCKTNOSUPPORT`.
         let socket_type = unix_socketpair_type(_type & SOCKET_TYPE_MASK)?;
         // `unix_create`: non-zero protocol other than PF_UNIX is
         // `EPROTONOSUPPORT`. The argument used to be logged and ignored.
@@ -1741,6 +1866,11 @@ impl Syscall<'_> {
             "sys_sendmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
+        // `__sys_sendmmsg`: the fd first, so a bad one is `EBADF` even
+        // for an empty batch.
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let base = msgvec.as_addr();
         // The stride and the count's offset as the CALLER writes them: 32 and
         // 28 for a 32-bit caller against 64 and 56. See
@@ -1750,7 +1880,13 @@ impl Syscall<'_> {
         let stride = l.stride;
         let mut sent = 0usize;
         for i in 0..mmsg_batch(vlen) {
-            let hdr = self.read_msghdr(base + i * stride)?;
+            // A header that cannot be read ends the batch like any other
+            // error: what went before is the answer.
+            let hdr = match self.read_msghdr(base + i * stride) {
+                Ok(hdr) => hdr,
+                Err(e) if sent == 0 => return Err(e),
+                Err(_) => break,
+            };
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
@@ -1778,29 +1914,62 @@ impl Syscall<'_> {
         msgvec: UserInOutPtr<u8>,
         vlen: usize,
         flags: usize,
+        mut timeout: UserInOutPtr<linux_object::time::TimeSpec>,
     ) -> SysResult {
         info!(
             "sys_recvmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
+        // `do_recvmmsg`, in its order. The timeout is checked before the fd
+        // (`poll_select_set_timeout` is `EINVAL` for a bad one), and is a
+        // deadline looked at only after each datagram -- Linux's own
+        // documented limit: a receive that blocks is not cut short by it.
+        let abi32 = self.narrow_abi();
+        let deadline = if timeout.is_null() {
+            None
+        } else {
+            let ts = crate::narrow::narrow_get(abi32, &timeout)?;
+            Some(kernel_hal::timer::timer_now() + ts.try_into_duration()?)
+        };
+        self.linux_process()
+            .get_file_like(sockfd.into())?
+            .as_socket()?;
         let base = msgvec.as_addr();
         let l = self.mmsghdr_layout();
         let stride = l.stride;
         let mut received = 0usize;
+        // Only `MSG_WAITFORONE` makes the receives after the first one
+        // non-blocking. Every receive used to be, so a blocking batch came
+        // back with whatever happened to be queued after the first datagram.
+        let mut per_flags = flags;
         for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
-            let per_flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     received += 1;
                 }
-                Err(LxError::EAGAIN) if received > 0 => break,
                 Err(e) => {
                     if received == 0 {
                         return Err(e);
                     }
+                    break;
+                }
+            }
+            if flags & MSG_WAITFORONE != 0 {
+                per_flags |= MSG_DONTWAIT;
+            }
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_sub(kernel_hal::timer::timer_now());
+                // Written back as it goes, as `do_recvmmsg` does; the
+                // caller learns what was left.
+                crate::narrow::narrow_put(
+                    abi32,
+                    &mut timeout,
+                    linux_object::time::TimeSpec::from_duration(left),
+                )?;
+                if left.is_zero() {
                     break;
                 }
             }
@@ -1841,12 +2010,14 @@ impl Syscall<'_> {
     }
 }
 
-/// AF_UNIX socket types Linux's `unix_create` accepts. Anything else named
-/// by `SocketType` is `EOPNOTSUPP` (`ESOCKTNOSUPPORT`).
+/// AF_UNIX socket types as Linux's `unix_create` takes them: the three it
+/// knows, `SOCK_RAW` made a `SOCK_DGRAM` (`sock->type = SOCK_DGRAM;
+/// fallthrough`), and anything else `ESOCKTNOSUPPORT`.
 fn unix_socket_type(t: SocketType) -> Result<SocketType, LxError> {
     match t {
         SocketType::SOCK_STREAM | SocketType::SOCK_DGRAM | SocketType::SOCK_SEQPACKET => Ok(t),
-        _ => Err(LxError::EOPNOTSUPP),
+        SocketType::SOCK_RAW => Ok(SocketType::SOCK_DGRAM),
+        _ => Err(LxError::ESOCKTNOSUPPORT),
     }
 }
 
@@ -2076,20 +2247,20 @@ mod scm_rights_tests {
     }
 
     #[test]
-    fn a_length_past_the_end_of_the_buffer_stops_the_walk() {
+    fn a_length_past_the_end_of_the_buffer_is_einval() {
         let ctrl = cmsg_raw(4096, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
-        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Err(LxError::EINVAL));
     }
 
     #[test]
-    fn a_length_that_wraps_the_address_space_stops_the_walk() {
+    fn a_length_that_wraps_the_address_space_is_einval() {
         // `off + cmsg_len` overflowing would land back under `ctrl.len()` and
         // then slice with start > end, which is a kernel panic.
         for len in [u64::MAX, u64::MAX - 7, (usize::MAX as u64) - 16] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
             assert_eq!(
                 parse_scm_rights_fds(NATIVE, &ctrl),
-                Ok(vec![]),
+                Err(LxError::EINVAL),
                 "cmsg_len {}",
                 len
             );
@@ -2097,7 +2268,7 @@ mod scm_rights_tests {
     }
 
     #[test]
-    fn a_length_that_wraps_past_a_message_already_walked_stops_the_walk() {
+    fn a_length_that_wraps_past_a_message_already_walked_is_einval() {
         // The wrap that actually bites. At offset 0 a huge `cmsg_len` lands
         // past the end of the buffer and is refused on size alone; it takes a
         // first, well-formed message to move the walk forward before
@@ -2109,16 +2280,16 @@ mod scm_rights_tests {
         assert_eq!(ctrl.len(), 24);
         ctrl.extend(cmsg_raw(u64::MAX - 20, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]));
         assert_eq!(ctrl.len(), 40);
-        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![3]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Err(LxError::EINVAL));
     }
 
     #[test]
-    fn a_length_shorter_than_its_own_header_stops_the_walk() {
+    fn a_length_shorter_than_its_own_header_is_einval() {
         for len in [0u64, 1, 8, 15] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
             assert_eq!(
                 parse_scm_rights_fds(NATIVE, &ctrl),
-                Ok(vec![]),
+                Err(LxError::EINVAL),
                 "cmsg_len {}",
                 len
             );
@@ -2571,15 +2742,25 @@ mod read_sockaddr_tests {
     use super::*;
 
     #[test]
-    fn a_null_address_is_efault_even_with_nothing_to_read() {
-        // `addrlen == 0` is the length that tells the two apart: with no bytes
-        // to copy, the NULL check is the only thing left to refuse it, and
-        // without it `bind(fd, NULL, 0)` comes back with a zeroed address
-        // instead of an error.
-        for len in [0usize, 1, 2, size_of::<SockAddr>(), usize::MAX] {
+    fn a_null_address_is_efault_only_when_there_is_something_to_copy() {
+        // `move_addr_to_kernel`: no length copies nothing, so NULL with 0 is
+        // not a fault; the family's own check refuses the empty address
+        // (`bind(fd, NULL, 0)` is `EINVAL` on Linux, not a zeroed address).
+        let empty = read_sockaddr(0, 0).expect("nothing to copy");
+        assert_eq!(sockaddr_to_endpoint(empty, 0).err(), Some(LxError::EINVAL));
+        for len in [1usize, 2, size_of::<SockAddr>()] {
             assert_eq!(
                 read_sockaddr(0, len).err(),
                 Some(LxError::EFAULT),
+                "addrlen {}",
+                len
+            );
+        }
+        // Longer than a `sockaddr_storage`, or negative as an `int`.
+        for len in [129usize, usize::MAX, u32::MAX as usize] {
+            assert_eq!(
+                read_sockaddr(0, len).err(),
+                Some(LxError::EINVAL),
                 "addrlen {}",
                 len
             );
@@ -2663,8 +2844,9 @@ mod socket_type_flag_tests {
 
     /// `socket` / `socketpair` on AF_UNIX used to accept every `SocketType`
     /// (or, for socketpair, swallow unknowns as SOCK_STREAM). The three
-    /// Linux knows succeed; garbage is EINVAL; named-but-unsupported types
-    /// are EOPNOTSUPP.
+    /// Linux knows succeed, `SOCK_RAW` is a datagram socket as `unix_create`
+    /// makes it, garbage is EINVAL, and named-but-unsupported types are
+    /// `ESOCKTNOSUPPORT`.
     #[test]
     fn af_unix_refuses_a_type_that_is_not_a_unix_type() {
         assert_eq!(
@@ -2681,15 +2863,15 @@ mod socket_type_flag_tests {
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_RAW),
-            Err(LxError::EOPNOTSUPP)
+            Ok(SocketType::SOCK_DGRAM)
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_RDM),
-            Err(LxError::EOPNOTSUPP)
+            Err(LxError::ESOCKTNOSUPPORT)
         );
         assert_eq!(
             unix_socket_type(SocketType::SOCK_PACKET),
-            Err(LxError::EOPNOTSUPP)
+            Err(LxError::ESOCKTNOSUPPORT)
         );
         assert_eq!(unix_socketpair_type(99), Err(LxError::EINVAL));
         assert_eq!(unix_socketpair_type(0), Err(LxError::EINVAL));
@@ -3022,9 +3204,10 @@ mod control_and_batch_bounds_tests {
     /// message that has no payload.
     #[test]
     fn a_control_buffer_shorter_than_one_header_is_ignored_and_not_refused() {
-        // A null pointer, whatever the length claims.
+        // A null pointer with no length is no control data; with a length,
+        // Linux copies from it and faults.
         assert_eq!(scm_control_action(NATIVE, true, 0), Ok(false));
-        assert_eq!(scm_control_action(NATIVE, true, 4096), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, 4096), Err(LxError::EFAULT));
         // A buffer too short to hold `struct cmsghdr`.
         assert_eq!(scm_control_action(NATIVE, false, 0), Ok(false));
         assert_eq!(scm_control_action(NATIVE, false, 8), Ok(false));
@@ -3077,26 +3260,34 @@ mod control_and_batch_bounds_tests {
         assert_eq!(scm_control_action(NATIVE, false, 64 * 1024), Ok(true));
         assert_eq!(
             scm_control_action(NATIVE, false, 64 * 1024 + 1),
-            Err(LxError::EINVAL)
+            Err(LxError::ENOBUFS)
         );
         assert_eq!(
             scm_control_action(NATIVE, false, usize::MAX),
-            Err(LxError::EINVAL)
+            Err(LxError::ENOBUFS)
         );
         // The ceiling has to clear the floor, or no control message could ever
         // pass at all.
         assert!(CONTROL_MAX > CMSG_HDR_LEN);
     }
 
-    /// A null `msg_control` wins over any length, including one past the
-    /// ceiling.
-    ///
-    /// The order matters: a caller that leaves the pointer null and the length
-    /// as whatever was on the stack must get an ordinary send, not `EINVAL`.
+    /// The ceiling is answered before the pointer, as `____sys_sendmsg`
+    /// allocates before it copies: a NULL `msg_control` with a length past
+    /// it is `ENOBUFS`, and with a length under it `EFAULT`.
     #[test]
-    fn a_null_pointer_is_answered_before_the_ceiling() {
-        assert_eq!(scm_control_action(NATIVE, true, usize::MAX), Ok(false));
-        assert_eq!(scm_control_action(NATIVE, true, CONTROL_MAX + 1), Ok(false));
+    fn the_ceiling_is_answered_before_a_null_pointer() {
+        assert_eq!(
+            scm_control_action(NATIVE, true, usize::MAX),
+            Err(LxError::ENOBUFS)
+        );
+        assert_eq!(
+            scm_control_action(NATIVE, true, CONTROL_MAX + 1),
+            Err(LxError::ENOBUFS)
+        );
+        assert_eq!(
+            scm_control_action(NATIVE, true, CMSG_HDR_LEN),
+            Err(LxError::EFAULT)
+        );
     }
 
     /// One batch call walks at most 64 entries, whatever `vlen` says.

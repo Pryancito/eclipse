@@ -178,7 +178,32 @@ struct UnixInner {
     /// new message: Linux answers such a call with the credentials still
     /// associated with the connection rather than with nothing.
     last_creds: Option<[u8; 12]>,
+    /// Datagram senders that found this end's queue full and are waiting
+    /// for room. A datagram sent by address (or through a one-way
+    /// `connect`) has no `peer` pointing back at its sender, so the drain
+    /// that makes room could not name whom to wake without this list.
+    room_waiters: Vec<Weak<Mutex<UnixInner>>>,
+    /// A datagram socket with no peer whose last send by address found the
+    /// target full: `POLLOUT` waits for that target's drain, which clears
+    /// this, instead of answering at once and spinning `send_all`.
+    waiting_room: bool,
+    /// For a datagram socket: the bound path of whoever sent each message
+    /// in `buffer`, tagged with the offset of its first byte, as
+    /// `pending_creds` is. `recvfrom` names the sender (`unix_copy_addr`
+    /// of the skb's socket); it used to name the receiver itself.
+    /// Consecutive messages from one path share an entry.
+    dgram_sources: VecDeque<(usize, String)>,
+    /// The peer's bound path when `connect_pair` wired it, which `recvfrom`
+    /// on a stream or seqpacket end reports. Kept here so a read clones one
+    /// string under its own lock, as it always did, instead of locking the
+    /// peer for its name.
+    peer_name: String,
 }
+
+/// How many datagram senders one full queue keeps a wake for. A sender left
+/// out polls again on its next `EAGAIN`, so the cap costs latency, not
+/// correctness.
+const ROOM_WAITERS_MAX: usize = 64;
 
 /// How many per-message credential records may pile up unclaimed before
 /// `write` starts retiring the ones whose bytes have already been read. Small
@@ -204,6 +229,39 @@ impl UnixInner {
     /// (self→peer nested inside peer→self is the AB-BA cycle `write` names).
     fn live_peer(&self) -> Option<Arc<Mutex<UnixInner>>> {
         self.peer.as_ref().and_then(|w| w.upgrade())
+    }
+
+    fn is_dgram(&self) -> bool {
+        self.sock_type == SocketType::SOCK_DGRAM
+    }
+
+    /// The other end is gone, which a read or a poll reports as EOF. An
+    /// unconnected datagram socket has no other end to lose: it receives
+    /// from whoever sends to its address, and waits like Linux's
+    /// `unix_dgram_recvmsg` does.
+    fn peer_gone(&self) -> bool {
+        if self.is_dgram() && !self.connected {
+            return false;
+        }
+        self.peer_closed || self.peer.as_ref().is_none_or(|w| w.strong_count() == 0)
+    }
+
+    /// Whether `peer` points at `me`.
+    fn peer_is(&self, me: &Arc<Mutex<UnixInner>>) -> bool {
+        self.peer
+            .as_ref()
+            .is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(me)))
+    }
+}
+
+/// Wake every datagram sender `waiters` names: there is room now (or the
+/// target is gone, which their next send reports). Called with no
+/// `UnixInner` lock held.
+fn wake_room_waiters(waiters: Vec<Weak<Mutex<UnixInner>>>) {
+    for waiter in waiters.into_iter().filter_map(|w| w.upgrade()) {
+        let mut wi = waiter.lock();
+        wi.waiting_room = false;
+        pulse_writable(&mut wi.eventbus);
     }
 }
 
@@ -232,6 +290,10 @@ impl Default for UnixSocketState {
                 passcred: false,
                 pending_creds: VecDeque::new(),
                 last_creds: None,
+                room_waiters: Vec::new(),
+                waiting_room: false,
+                dgram_sources: VecDeque::new(),
+                peer_name: String::new(),
             })),
         }
     }
@@ -264,8 +326,11 @@ impl UnixSocketState {
     /// Wire two sockets together bidirectionally.
     /// Must be called while neither inner lock is held.
     pub fn connect_pair(a: &Arc<Self>, b: &Arc<Self>) {
+        let a_name = a.inner.lock().path.clone();
+        let b_name = b.inner.lock().path.clone();
         {
             let mut ai = a.inner.lock();
+            ai.peer_name = b_name;
             ai.peer = Some(Arc::downgrade(&b.inner));
             ai.connected = true;
             // Do NOT latch WRITABLE on the eventbus. Stream sockets report
@@ -277,6 +342,7 @@ impl UnixSocketState {
         }
         {
             let mut bi = b.inner.lock();
+            bi.peer_name = a_name;
             bi.peer = Some(Arc::downgrade(&a.inner));
             bi.connected = true;
         }
@@ -382,6 +448,63 @@ impl UnixSocketState {
         Ok(server)
     }
 
+    /// The datagram socket a `connect()` or a `sendto()` by address from
+    /// `me` reaches at `path`, as `unix_dgram_connect` / `unix_dgram_sendmsg`
+    /// find it: nobody bound there is `ENOENT` for a pathname and
+    /// `ECONNREFUSED` for an abstract name (the split `resolve_listener`
+    /// explains), a socket of another type is `EPROTOTYPE`
+    /// (`unix_find_other` matches the type), and one connected to somebody
+    /// else is `EPERM` (`unix_may_send`).
+    fn resolve_dgram(path: &String, me: &Arc<Mutex<UnixInner>>) -> LxResult<Arc<Self>> {
+        let Some(target) = Self::lookup(path) else {
+            return Err(if path.starts_with('\0') {
+                LxError::ECONNREFUSED
+            } else {
+                LxError::ENOENT
+            });
+        };
+        if !Arc::ptr_eq(&target.inner, me) {
+            let ti = target.inner.lock();
+            if !ti.is_dgram() {
+                return Err(LxError::EPROTOTYPE);
+            }
+            if ti.peer.is_some() && !ti.peer_is(me) {
+                return Err(LxError::EPERM);
+            }
+        }
+        Ok(target)
+    }
+
+    /// After a datagram send found `target` full: `POLLOUT` waits for the
+    /// target's drain. Set, then checked against the target again, because
+    /// the drain may have run between the failed send and the set, and its
+    /// wake would then be lost under our late `true`.
+    fn wait_for_room(&self, target: &Arc<Mutex<UnixInner>>, need: usize) {
+        {
+            let mut inner = self.inner.lock();
+            if !inner.is_dgram() || inner.peer.is_some() {
+                return;
+            }
+            inner.waiting_room = true;
+        }
+        if target.lock().send_space() >= need {
+            self.inner.lock().waiting_room = false;
+        }
+    }
+
+    /// `connect(2)` of a datagram socket: it only names the default
+    /// destination, one way. The target is not told and keeps receiving
+    /// from anyone, and connecting again just changes the destination
+    /// (`unix_dgram_connect` has no `EISCONN`).
+    pub fn connect_dgram(&self, path: &String) -> LxResult<()> {
+        let target = Self::resolve_dgram(path, &self.inner)?;
+        let mut inner = self.inner.lock();
+        inner.peer = Some(Arc::downgrade(&target.inner));
+        inner.peer_closed = false;
+        inner.connected = true;
+        Ok(())
+    }
+
     /// Look up a registered socket by path.
     pub fn lookup(path: &String) -> Option<Arc<Self>> {
         let mut map = UNIX_SOCKETS.lock();
@@ -457,15 +580,24 @@ impl Drop for UnixSocketState {
         // are event-driven now, so without this they would never notice a peer
         // that vanished without calling shutdown().
         if Arc::strong_count(&self.inner) == 1 {
-            let peer = {
-                let inner = self.inner.lock();
-                inner.peer.as_ref().and_then(|w| w.upgrade())
+            let (peer, waiters) = {
+                let mut inner = self.inner.lock();
+                let waiters = core::mem::take(&mut inner.room_waiters);
+                (inner.peer.as_ref().and_then(|w| w.upgrade()), waiters)
             };
+            // Only an end that points back at us loses its peer. A datagram
+            // socket we merely sent to (a one-way `connect`) was never ours
+            // to close: telling it so made its poll say POLLIN forever.
             if let Some(peer) = peer {
                 let mut pi = peer.lock();
-                pi.peer_closed = true;
-                pi.eventbus.set(Event::READABLE | Event::CLOSED);
+                if pi.peer_is(&self.inner) {
+                    pi.peer_closed = true;
+                    pi.eventbus.set(Event::READABLE | Event::CLOSED);
+                }
             }
+            // Senders waiting for room here learn on their next try that
+            // there is nobody to send to.
+            wake_room_waiters(waiters);
         }
     }
 }
@@ -626,16 +758,19 @@ impl Future for UnixPollWait<'_> {
         // the look.
         let (ready, write_closed, peer) = {
             let mut inner = this.sock.inner.lock();
-            let peer_gone =
-                inner.peer_closed || inner.peer.as_ref().is_none_or(|w| w.strong_count() == 0);
+            let peer_gone = inner.peer_gone();
+            // An unconnected datagram socket sends by address: writable
+            // unless its last target was full (`waiting_room`).
+            let free_dgram = inner.is_dgram() && inner.peer.is_none() && !inner.waiting_room;
             let readable = !inner.buffer.is_empty()
                 || (inner.is_listening && !inner.accept_queue.is_empty())
                 || inner.read_closed
                 || peer_gone;
             let want_read = this.events.wants_read();
             let want_write = this.events.wants_write();
-            let ready =
-                (want_read && readable) || (want_write && peer_gone) || (!want_read && !want_write);
+            let ready = (want_read && readable)
+                || (want_write && (peer_gone || free_dgram))
+                || (!want_read && !want_write);
             if ready {
                 if let Some(id) = this.sub_id.take() {
                     inner.eventbus.unsubscribe(id);
@@ -704,7 +839,8 @@ impl Socket for UnixSocketState {
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
         loop {
             let mut inner = self.inner.lock();
-            let path = inner.path.clone();
+            // Who sent a message is named where one is read; an EOF or an
+            // error names nobody (Linux leaves `msg_namelen` at 0 then).
 
             // `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)
             // return -EINVAL;` -- a socket that was never connected (or is a
@@ -713,8 +849,10 @@ impl Socket for UnixSocketState {
             // socket with no peer to write to it. `connected` is set by every
             // wiring path (`connect_pair`, `mark_connected`) and stays set
             // after the peer goes away, so this only names the never-wired.
-            if !inner.connected {
-                return (Err(LxError::EINVAL), Endpoint::Unix(path));
+            // A datagram socket is the exception: it receives from whoever
+            // sends to its address, connected or not.
+            if !inner.connected && !inner.is_dgram() {
+                return (Err(LxError::EINVAL), Endpoint::Unix(String::new()));
             }
 
             // Queued bytes come out before a receive-side shutdown is honoured:
@@ -737,6 +875,22 @@ impl Socket for UnixSocketState {
                     None => inner.buffer.len(),
                 };
                 let len = core::cmp::min(data.len(), available);
+                // Who sent this message, which `recvfrom` reports. A
+                // datagram's sender is in `dgram_sources`; a connected
+                // stream or seqpacket end's is its peer (`unix_copy_addr`).
+                let source = if inner.is_dgram() {
+                    let at = inner.total_read;
+                    while inner.dgram_sources.len() > 1 && inner.dgram_sources[1].0 <= at {
+                        inner.dgram_sources.pop_front();
+                    }
+                    let name = match inner.dgram_sources.front() {
+                        Some((offset, name)) if *offset <= at => name.clone(),
+                        _ => String::new(),
+                    };
+                    name
+                } else {
+                    inner.peer_name.clone()
+                };
                 // Bulk copy from the deque's two contiguous halves instead of a
                 // per-byte pop_front loop: every Wayland/D-Bus message crosses
                 // here, and the byte loop made each one O(n) branchy work under
@@ -759,26 +913,34 @@ impl Socket for UnixSocketState {
                 // drain from full is the one that has anyone to wake. The
                 // wake goes to the *peer's* bus, after our lock is released.
                 let peer = if was_full { inner.live_peer() } else { None };
+                // A datagram that did not fit waits on any drain, full or
+                // not: it may have needed more room than was left.
+                let waiters = if inner.room_waiters.is_empty() {
+                    None
+                } else {
+                    Some(core::mem::take(&mut inner.room_waiters))
+                };
                 drop(inner);
                 if let Some(peer) = peer {
                     pulse_writable(&mut peer.lock().eventbus);
                 }
-                return (Ok(len), Endpoint::Unix(path));
+                if let Some(waiters) = waiters {
+                    wake_room_waiters(waiters);
+                }
+                return (Ok(len), Endpoint::Unix(source));
             }
 
             if inner.read_closed {
-                return (Ok(0), Endpoint::Unix(path));
+                return (Ok(0), Endpoint::Unix(String::new()));
             }
 
             // EOF: peer gone
-            let peer_gone =
-                inner.peer_closed || inner.peer.as_ref().is_none_or(|w| w.strong_count() == 0);
-            if peer_gone && inner.connected {
-                return (Ok(0), Endpoint::Unix(path));
+            if inner.peer_gone() && inner.connected {
+                return (Ok(0), Endpoint::Unix(String::new()));
             }
 
             if inner.flags.contains(OpenFlags::NON_BLOCK) {
-                return (Err(LxError::EAGAIN), Endpoint::Unix(path));
+                return (Err(LxError::EAGAIN), Endpoint::Unix(String::new()));
             }
 
             drop(inner);
@@ -821,7 +983,7 @@ impl Socket for UnixSocketState {
         Some(0)
     }
 
-    fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
+    fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         // Resolve the peer and release our own lock BEFORE taking the peer's, so
         // two connected ends writing concurrently can't deadlock: holding
         // self→peer here while the peer's `write` holds peer→self is a classic
@@ -829,7 +991,7 @@ impl Socket for UnixSocketState {
         // that cycle hangs the whole machine — which is exactly what happened
         // when a Wayland client (alacritty) and the compositor (labwc) flooded
         // their socket bidirectionally. Mirrors `peer_pid`/`send_fds`.
-        let (peer, message) = {
+        let (own_peer, message, sock_type, connected, own_name) = {
             let inner = self.inner.lock();
             if inner.write_closed {
                 return Err(LxError::EPIPE);
@@ -838,15 +1000,66 @@ impl Socket for UnixSocketState {
                 inner.sock_type,
                 SocketType::SOCK_SEQPACKET | SocketType::SOCK_DGRAM
             );
-            match &inner.peer {
-                None => return Err(LxError::ENOTCONN),
-                Some(peer_weak) => (peer_weak.upgrade().ok_or(LxError::EPIPE)?, message),
+            // Only a datagram's receiver keeps who sent each message.
+            let own_name = (inner.sock_type == SocketType::SOCK_DGRAM).then(|| inner.path.clone());
+            // Upgraded under our lock, as before: no `Weak` clone per write.
+            (
+                inner.peer.as_ref().map(|w| w.upgrade()),
+                message,
+                inner.sock_type,
+                inner.connected,
+                own_name,
+            )
+        };
+        // Where the bytes go. A datagram sent with an address goes there,
+        // connected or not (`unix_dgram_sendmsg`); a stream refuses an
+        // address (`unix_stream_sendmsg`: `EISCONN` connected, `EOPNOTSUPP`
+        // not); a seqpacket ignores it (`unix_seqpacket_sendmsg` clears
+        // `msg_namelen`). The target is looked up with our lock released:
+        // its lock nests under none of ours.
+        let by_address = match (sock_type, sendto_endpoint) {
+            (SocketType::SOCK_DGRAM, Some(Endpoint::Unix(path))) => {
+                Some(Self::resolve_dgram(&path, &self.inner)?.inner.clone())
             }
+            (SocketType::SOCK_DGRAM, Some(_)) => return Err(LxError::EINVAL),
+            (SocketType::SOCK_STREAM, Some(_)) => {
+                return Err(if connected {
+                    LxError::EISCONN
+                } else {
+                    LxError::EOPNOTSUPP
+                });
+            }
+            _ => None,
+        };
+        let peer = match by_address {
+            Some(target) => target,
+            None => match own_peer {
+                None => return Err(LxError::ENOTCONN),
+                // A datagram whose connected destination went away is
+                // `ECONNREFUSED` on Linux; a stream's is `EPIPE`.
+                Some(peer) => peer.ok_or(if sock_type == SocketType::SOCK_DGRAM {
+                    LxError::ECONNREFUSED
+                } else {
+                    LxError::EPIPE
+                })?,
+            },
         };
         let mut pi = peer.lock();
         if pi.read_closed {
             return Err(LxError::EPIPE);
         }
+        // A full datagram target remembers us so that its drain can wake
+        // us: nothing else points from it back at a sender by address.
+        let full = |pi: &mut UnixInner| {
+            if sock_type == SocketType::SOCK_DGRAM {
+                let me = Arc::downgrade(&self.inner);
+                if pi.room_waiters.len() < ROOM_WAITERS_MAX
+                    && !pi.room_waiters.iter().any(|w| w.ptr_eq(&me))
+                {
+                    pi.room_waiters.push(me);
+                }
+            }
+        };
         // Bound the peer's inbound buffer so a peer that never reads cannot grow
         // it without limit and exhaust the fixed kernel heap (a local DoS). Write
         // only what fits and return that count (correct stream semantics — the
@@ -855,6 +1068,9 @@ impl Socket for UnixSocketState {
         // before, so no blocking behavior is lost.
         let space = pi.send_space();
         if space == 0 {
+            full(&mut pi);
+            drop(pi);
+            self.wait_for_room(&peer, 1);
             return Err(LxError::EAGAIN);
         }
         // A message goes in whole or not at all: a short write would split
@@ -862,11 +1078,13 @@ impl Socket for UnixSocketState {
         // too big for the room left now is `EAGAIN`, which `sendmsg` waits on
         // for a blocking caller.
         if message && data.len() > space {
-            return Err(if data.len() > UNIX_STREAM_BUF_MAX {
-                LxError::EMSGSIZE
-            } else {
-                LxError::EAGAIN
-            });
+            if data.len() > UNIX_STREAM_BUF_MAX {
+                return Err(LxError::EMSGSIZE);
+            }
+            full(&mut pi);
+            drop(pi);
+            self.wait_for_room(&peer, data.len());
+            return Err(LxError::EAGAIN);
         }
         let n = data.len().min(space);
         let n_offset = pi.total_written;
@@ -902,6 +1120,16 @@ impl Socket for UnixSocketState {
         }
         // `extend(&slice)` takes VecDeque's Copy-slice specialization (a pair
         // of memcpys) instead of the element-wise TrustedLen loop.
+        if let Some(name) = own_name {
+            if n > 0
+                && pi
+                    .dgram_sources
+                    .back()
+                    .is_none_or(|(_, last)| *last != name)
+            {
+                pi.dgram_sources.push_back((n_offset, name));
+            }
+        }
         pi.buffer.extend(&data[..n]);
         pi.total_written += n;
         if message && n > 0 {
@@ -934,6 +1162,20 @@ impl Socket for UnixSocketState {
         } else {
             Err(LxError::EINVAL)
         }
+    }
+
+    /// `unix_dgram_connect` with `AF_UNSPEC`: the default destination goes,
+    /// and the socket receives from anyone again. A stream has no such
+    /// thing: the trait's `EINVAL`.
+    fn disconnect(&self) -> SysResult {
+        let mut inner = self.inner.lock();
+        if !inner.is_dgram() {
+            return Err(LxError::EINVAL);
+        }
+        inner.peer = None;
+        inner.peer_closed = false;
+        inner.connected = false;
+        Ok(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1219,7 +1461,7 @@ impl Socket for UnixSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        let (readable, write_closed, peer) = {
+        let (readable, write_closed, peer, free_dgram) = {
             let inner = self.inner.lock();
             // `read_closed` counts as readable: a read would return immediately
             // (EOF), which is exactly what POLLIN promises.
@@ -1227,15 +1469,17 @@ impl Socket for UnixSocketState {
                 || (inner.is_listening && !inner.accept_queue.is_empty())
                 || inner.peer_closed
                 || inner.read_closed;
-            (readable, inner.write_closed, inner.live_peer())
+            let free_dgram = inner.is_dgram() && inner.peer.is_none() && !inner.waiting_room;
+            (readable, inner.write_closed, inner.live_peer(), free_dgram)
         };
         // POLLOUT is "a write would not block": a live peer with room, or one
         // a write answers at once. The peer's queue is read under its own
         // lock, after ours is gone.
-        let writable = peer.is_some_and(|peer| {
-            let queue = peer.lock().as_peer_queue();
-            write_would_not_block(write_closed, Some(queue))
-        });
+        let writable = free_dgram
+            || peer.is_some_and(|peer| {
+                let queue = peer.lock().as_peer_queue();
+                write_would_not_block(write_closed, Some(queue))
+            });
         (readable, writable, false)
     }
 }
@@ -2852,5 +3096,190 @@ mod signal_wake_tests {
         assert!(first.parked && !second.parked);
         assert!(first.timer.is_some(), "the insurance tick");
         assert!(second.timer.is_some());
+    }
+}
+
+/// `SOCK_DGRAM` by address, as `unix_dgram_sendmsg` / `unix_dgram_connect`
+/// do it: a bound datagram socket receives from anyone who sends to its
+/// path, `connect` only names a default destination, and the receiver is
+/// never told. syslog's `/dev/log` and `sd_notify`'s `NOTIFY_SOCKET` are
+/// both this, and both used to fail: `connect` asked for a listener.
+#[cfg(test)]
+mod dgram_address_tests {
+    use super::*;
+
+    fn bound(path: &str, ty: SocketType) -> Arc<UnixSocketState> {
+        let s = UnixSocketState::new();
+        s.set_socket_type(ty);
+        Socket::bind(&*s, Endpoint::Unix(path.into())).unwrap();
+        UnixSocketState::register(path.into(), s.clone()).unwrap();
+        s
+    }
+
+    fn dgram() -> Arc<UnixSocketState> {
+        let s = UnixSocketState::new();
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        s
+    }
+
+    fn to(path: &str) -> Option<Endpoint> {
+        Some(Endpoint::Unix(path.into()))
+    }
+
+    async fn read(at: &Arc<UnixSocketState>) -> Vec<u8> {
+        let mut buf = vec![0u8; 64];
+        let got = Socket::read(&**at, &mut buf).await.0.expect("read");
+        buf.truncate(got);
+        buf
+    }
+
+    #[async_std::test]
+    async fn two_senders_reach_one_bound_socket_by_address() {
+        let rx = bound("/run/dgram-test-a", SocketType::SOCK_DGRAM);
+        let (a, b) = (dgram(), dgram());
+        assert_eq!(Socket::write(&*a, b"uno", to("/run/dgram-test-a")), Ok(3));
+        assert_eq!(Socket::write(&*b, b"dos", to("/run/dgram-test-a")), Ok(3));
+        assert_eq!(read(&rx).await, b"uno");
+        assert_eq!(read(&rx).await, b"dos");
+    }
+
+    #[async_std::test]
+    async fn connect_names_the_destination_and_the_receiver_is_not_told() {
+        let rx = bound("/run/dgram-test-b", SocketType::SOCK_DGRAM);
+        let tx = dgram();
+        tx.connect_dgram(&"/run/dgram-test-b".into()).unwrap();
+        // Connecting again is allowed: there is no EISCONN for datagrams.
+        tx.connect_dgram(&"/run/dgram-test-b".into()).unwrap();
+        assert_eq!(Socket::write(&*tx, b"hola", None), Ok(4));
+        assert!(rx.inner.lock().peer.is_none());
+        assert_eq!(read(&rx).await, b"hola");
+        // The sender going away is no EOF for a receiver that never had a
+        // peer: its poll stays quiet.
+        drop(tx);
+        assert!(!Socket::poll(&*rx, PollEvents::IN).0);
+    }
+
+    #[test]
+    fn who_is_not_there_answers_as_linux() {
+        let tx = dgram();
+        assert_eq!(
+            Socket::write(&*tx, b"x", to("/run/dgram-test-nobody")),
+            Err(LxError::ENOENT)
+        );
+        assert_eq!(
+            Socket::write(&*tx, b"x", to("\0dgram-test-nobody")),
+            Err(LxError::ECONNREFUSED)
+        );
+        let _stream = bound("/run/dgram-test-c", SocketType::SOCK_STREAM);
+        assert_eq!(
+            Socket::write(&*tx, b"x", to("/run/dgram-test-c")),
+            Err(LxError::EPROTOTYPE)
+        );
+        assert_eq!(
+            tx.connect_dgram(&"/run/dgram-test-c".into()),
+            Err(LxError::EPROTOTYPE)
+        );
+        // No address and no destination.
+        assert_eq!(Socket::write(&*tx, b"x", None), Err(LxError::ENOTCONN));
+    }
+
+    #[test]
+    fn a_socket_connected_elsewhere_refuses_others() {
+        let rx = bound("/run/dgram-test-d", SocketType::SOCK_DGRAM);
+        let other = bound("/run/dgram-test-e", SocketType::SOCK_DGRAM);
+        rx.connect_dgram(&"/run/dgram-test-e".into()).unwrap();
+        let tx = dgram();
+        assert_eq!(
+            Socket::write(&*tx, b"x", to("/run/dgram-test-d")),
+            Err(LxError::EPERM)
+        );
+        // Its own peer may still send to it.
+        other.connect_dgram(&"/run/dgram-test-d".into()).unwrap();
+        assert_eq!(Socket::write(&*other, b"x", None), Ok(1));
+    }
+
+    #[async_std::test]
+    async fn an_unconnected_datagram_socket_waits_to_read_instead_of_einval() {
+        let rx = bound("/run/dgram-test-f", SocketType::SOCK_DGRAM);
+        rx.inner.lock().flags |= OpenFlags::NON_BLOCK;
+        let mut buf = [0u8; 8];
+        assert_eq!(Socket::read(&*rx, &mut buf).await.0, Err(LxError::EAGAIN));
+        // And it is writable: it sends by address.
+        assert!(Socket::poll(&*rx, PollEvents::OUT).1);
+    }
+
+    #[test]
+    fn a_stream_refuses_an_address() {
+        let s = UnixSocketState::new();
+        assert_eq!(
+            Socket::write(&*s, b"x", to("/run/dgram-test-g")),
+            Err(LxError::EOPNOTSUPP)
+        );
+        let (a, b) = (UnixSocketState::new(), UnixSocketState::new());
+        UnixSocketState::connect_pair(&a, &b);
+        assert_eq!(
+            Socket::write(&*a, b"x", to("/run/dgram-test-g")),
+            Err(LxError::EISCONN)
+        );
+    }
+
+    #[async_std::test]
+    async fn recvfrom_names_who_sent_each_datagram() {
+        let rx = bound("/run/dgram-test-i", SocketType::SOCK_DGRAM);
+        let a = bound("/run/dgram-test-j", SocketType::SOCK_DGRAM);
+        let unnamed = dgram();
+        Socket::write(&*a, b"1", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*a, b"2", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*unnamed, b"3", to("/run/dgram-test-i")).unwrap();
+        Socket::write(&*a, b"4", to("/run/dgram-test-i")).unwrap();
+        let mut buf = [0u8; 8];
+        for (want, from) in [
+            (b"1", "/run/dgram-test-j"),
+            (b"2", "/run/dgram-test-j"),
+            (b"3", ""),
+            (b"4", "/run/dgram-test-j"),
+        ] {
+            let (got, who) = Socket::read(&*rx, &mut buf).await;
+            assert_eq!(&buf[..got.unwrap()], want);
+            assert!(
+                matches!(who, Endpoint::Unix(ref p) if p == from),
+                "{}",
+                from
+            );
+        }
+    }
+
+    #[async_std::test]
+    async fn a_stream_end_names_its_peer() {
+        let (a, b) = (UnixSocketState::new(), UnixSocketState::new());
+        b.set_path("/run/dgram-test-server".into());
+        UnixSocketState::connect_pair(&a, &b);
+        Socket::write(&*b, b"hi", None).unwrap();
+        let mut buf = [0u8; 8];
+        let (_, who) = Socket::read(&*a, &mut buf).await;
+        assert!(matches!(who, Endpoint::Unix(ref p) if p == "/run/dgram-test-server"));
+    }
+
+    #[async_std::test]
+    async fn a_full_target_holds_pollout_until_it_drains() {
+        let rx = bound("/run/dgram-test-h", SocketType::SOCK_DGRAM);
+        let tx = dgram();
+        let big = vec![7u8; UNIX_STREAM_BUF_MAX - 8];
+        assert_eq!(
+            Socket::write(&*tx, &big, to("/run/dgram-test-h")),
+            Ok(big.len())
+        );
+        assert_eq!(
+            Socket::write(&*tx, &[1u8; 16], to("/run/dgram-test-h")),
+            Err(LxError::EAGAIN)
+        );
+        assert!(!Socket::poll(&*tx, PollEvents::OUT).1);
+        let mut buf = vec![0u8; big.len()];
+        assert_eq!(Socket::read(&*rx, &mut buf).await.0, Ok(big.len()));
+        assert!(Socket::poll(&*tx, PollEvents::OUT).1);
+        assert_eq!(
+            Socket::write(&*tx, &[1u8; 16], to("/run/dgram-test-h")),
+            Ok(16)
+        );
     }
 }
