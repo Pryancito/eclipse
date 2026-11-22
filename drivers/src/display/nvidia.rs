@@ -503,6 +503,9 @@ pub struct NvidiaGpu {
     hwcur_state: core::sync::atomic::AtomicU8,
     /// The nvkms device and what it scans out, once `nvidia.nvkms` gave it this card.
     nvkms_device: spin::Mutex<Option<nvkms_takeover::NvkmsCard>>,
+    /// The head nvkms scans the panel out of, `u32::MAX` for none: whose
+    /// `NV_PDISP_RG_DPCA` frame counter is the hardware vblank.
+    vblank_head: AtomicU32,
     /// Boot-stable KMS topology snapshot: the FIRST successful RM display
     /// query, frozen for the rest of the boot. Every KMS-visible fact
     /// (connector ids, supported/connected masks, EDID head) is served from
@@ -907,6 +910,7 @@ impl NvidiaGpu {
             surfaceflip_state: core::sync::atomic::AtomicU8::new(0),
             hwcur_state: core::sync::atomic::AtomicU8::new(0),
             nvkms_device: spin::Mutex::new(None),
+            vblank_head: AtomicU32::new(u32::MAX),
             rm_display_snap: Mutex::new(None),
             auto_bringup_done: AtomicBool::new(false),
             gsp_firmware: Mutex::new(None),
@@ -4156,6 +4160,10 @@ impl DrmScheme for NvidiaGpu {
 
     fn nvkms_service(&self) -> Option<u64> {
         NvidiaGpu::nvkms_service(self)
+    }
+
+    fn hw_frame_count(&self) -> Option<u32> {
+        nvkms_takeover::hw_frame_count(self)
     }
 
     fn display_modes(&self) -> Vec<crate::scheme::drm::DisplayMode> {

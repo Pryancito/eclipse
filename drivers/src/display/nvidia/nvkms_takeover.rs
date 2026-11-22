@@ -88,6 +88,23 @@ pub(super) fn display_modes(gpu: &NvidiaGpu) -> Vec<crate::scheme::drm::DisplayM
         .collect()
 }
 
+/// [`NvidiaGpu::hw_frame_count`]: the frame counter of the head nvkms
+/// scans the panel out of, read straight from `NV_PDISP_RG_DPCA(head)`
+/// (`FRM_CNT`, bits 31:16; `disp/v03_00/dev_disp.h`, which the RM's own
+/// `kdispReadRgLineCountAndFrameCount_v03_00` reads). Only once nvkms has
+/// lit the head, which is after the GSP boot: the display PRI cluster is
+/// never touched near the STARTCPU window. Lock-free, for timer interrupts.
+pub(super) fn hw_frame_count(gpu: &NvidiaGpu) -> Option<u32> {
+    let head = gpu.vblank_head.load(Ordering::Acquire);
+    if head >= 8 || gpu._bar0 == 0 {
+        return None;
+    }
+    let reg = gpu._bar0 + 0x0061_6330 + head as usize * 2048;
+    let v = unsafe { core::ptr::read_volatile(reg as *const u32) };
+    // 0xBADFxxxx: a PRI error, not a counter.
+    (v >> 16 != 0xBADF).then_some(v >> 16)
+}
+
 fn now_us() -> u64 {
     unsafe { crate::bus::drivers_timer_now_as_micros() }
 }
@@ -351,6 +368,9 @@ impl NvidiaGpu {
                         tag, set.display, set.head, fb.width, fb.height
                     ));
                 }
+                if let Some(set) = sets.first() {
+                    self.vblank_head.store(set.head, Ordering::Release);
+                }
                 Some(Scanout {
                     state,
                     console,
@@ -565,6 +585,9 @@ impl NvidiaGpu {
                 let console = super::BOOT_FB_INFO
                     .lock()
                     .is_some_and(|c| c.width == width && c.height == height);
+                if let Some(set) = sets.first() {
+                    self.vblank_head.store(set.head, Ordering::Release);
+                }
                 scanout.sets = sets;
                 scanout.on_screen = fb.id;
                 scanout.mode = (!console).then_some((width, height, refresh_hz));

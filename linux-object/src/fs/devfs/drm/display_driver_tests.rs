@@ -1,3 +1,4 @@
+extern crate std;
 use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};
 use zcore_drivers::scheme::drm::DisplayMode;
@@ -195,4 +196,41 @@ fn without_modesets_the_panel_keeps_the_firmware_mode() {
         atomic_commit(&other, true, true, false, 0, &file, None),
         Err(AtomicError::Invalid)
     );
+}
+
+/// With a hardware frame counter the flip's completion waits for the real
+/// vblank: held until the counter moves, and not a moment longer.
+#[test]
+fn a_flip_completes_once_the_hardware_frame_counter_moves() {
+    let screen = kms_emu::attach(64, 16);
+    let gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-vblank").console_at(0x17, 0x00));
+    gpu.set_frame(41);
+    super::hw_vblank::note_flip();
+    assert!(
+        super::hw_vblank::flip_held(),
+        "no vblank yet since the flip"
+    );
+    assert!(super::hw_vblank::flip_held());
+    gpu.set_frame(42);
+    assert!(!super::hw_vblank::flip_held(), "the vblank came");
+    gpu.set_frame(41);
+    assert!(
+        !super::hw_vblank::flip_held(),
+        "released until the next flip"
+    );
+
+    // A counter that never moves holds the flip for three frames at most.
+    super::hw_vblank::note_flip();
+    assert!(super::hw_vblank::flip_held());
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert!(!super::hw_vblank::flip_held());
+}
+
+/// Without a counter nothing waits: the synthetic vblank paces the event.
+#[test]
+fn without_a_frame_counter_no_flip_is_held() {
+    let screen = kms_emu::attach(64, 16);
+    let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-plain").console_at(0x17, 0x00));
+    super::hw_vblank::note_flip();
+    assert!(!super::hw_vblank::flip_held());
 }
