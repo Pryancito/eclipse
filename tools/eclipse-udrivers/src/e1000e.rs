@@ -1,7 +1,9 @@
 //! An Intel e1000e network card, driven by the network stack that runs as
-//! a process (`tools/eclipse-netstack`): the 82574 (QEMU's `e1000e`) and
-//! 82583, and the PCH parts of the kernel's e1000e driver (82579, I217,
-//! I218, I219), which need their PHY brought up first ([`pch`]). Which
+//! a process (`tools/eclipse-netstack`): the copper parts of Linux's
+//! e1000e. The 82574 (QEMU's `e1000e`) and 82583; the 82571, 82572 and
+//! 82573 ([`legacy`]); the 80003ES2LAN ([`es2`]); the MACs of ICH8, ICH9
+//! and ICH10 ([`ich`]); and the PCH parts, from the 82577/82578 to every
+//! I219 ([`pch`]). All but the first need their PHY brought up. Which
 //! part it is comes with the claim ([`Part::of`]).
 //!
 //! The boot leaves the card to userspace with `udriver=e1000e@N`; the
@@ -44,6 +46,7 @@ use crate::net::{Msg, BUF_SIZE, FRAME_MAX, OP_RX, OP_TX, RX_BUFS, TX_BUFS, TX_HE
 use crate::zx::{Handle, Status};
 use crate::PAGE;
 
+pub mod es2;
 pub mod ich;
 pub mod legacy;
 pub mod pch;
@@ -58,6 +61,9 @@ pub enum Part {
     /// An 82573: an M88 PHY whose MDIO the firmware hands over
     /// ([`legacy`]).
     E82573,
+    /// An 80003ES2LAN port, copper: a GG82563 PHY behind `SW_FW_SYNC`
+    /// ([`es2`]).
+    Es2,
     /// The MAC of an ICH8 chipset ([`ich`]).
     Ich8,
     /// The MAC of an ICH9 or ICH10 chipset ([`ich`]).
@@ -95,6 +101,8 @@ impl Part {
             0x105e | 0x10a4 | 0x10bc | 0x10d5 | 0x107d | 0x10b9 => Some(Part::E82571),
             // 82573V, E, L.
             0x108b | 0x108c | 0x109a => Some(Part::E82573),
+            // 80003ES2LAN copper, DPT and SPT. Not the SerDes ones.
+            0x1096 | 0x10ba => Some(Part::Es2),
             // ICH8: IGP3 (M_AMT, AMT, C, M), IFE (IFE, GT, G).
             0x1049 | 0x104a | 0x104b | 0x104d | 0x104c | 0x10c4 | 0x10c5 => Some(Part::Ich8),
             // ICH9: IGP (AMT, C, M, M_AMT, M_V), IFE (IFE, GT, G), BM;
@@ -154,7 +162,7 @@ impl Part {
 
     /// How much of the window bringing it up needs.
     pub fn regs_span(self) -> usize {
-        if self.is_pch() || self.is_ich() {
+        if self.is_pch() || self.is_ich() || self == Part::Es2 {
             pch::REGS_SPAN
         } else {
             REGS_SPAN
@@ -637,6 +645,22 @@ impl Taker {
             );
             return;
         }
+        if self.part == Part::Es2 {
+            let speed = pch::speed_of(status);
+            let full = status & 1 != 0;
+            let set = es2::on_link_up(&self.regs, speed, full);
+            println!(
+                "e1000e: link up, {} Mb/s {} duplex{}",
+                speed,
+                if full { "full" } else { "half" },
+                if set {
+                    ""
+                } else {
+                    " (the Kumeran set-up for it failed)"
+                }
+            );
+            return;
+        }
         if !self.part.is_pch() {
             let speed = pch::speed_of(status);
             legacy::on_link_up(&self.regs, self.part, speed);
@@ -845,6 +869,10 @@ pub unsafe fn bring_up(
         println!("e1000e: {report:?}");
         // No EERD on an ICH: that offset is another register there.
         mac_of_pch(regs, part)
+    } else if part == Part::Es2 {
+        let report = es2::reset(&regs)?;
+        println!("e1000e: {report:?}");
+        mac_of(regs)
     } else if part.is_legacy() {
         let report = legacy::reset(&regs, part)?;
         println!("e1000e: {report:?}");
@@ -884,6 +912,10 @@ pub unsafe fn bring_up(
         regs.write(TXDCTL, TXDCTL_VALUE);
     }
     regs.write(TARC0, regs.read(TARC0) | 1);
+    if part == Part::Es2 {
+        // An erratum (Linux `FLAG_TARC_SET_BIT_ZERO`): bit 0 of both.
+        regs.write(es2::TARC1, regs.read(es2::TARC1) | 1);
+    }
     if part == Part::E82571 {
         // Cleared again when the link comes up below gigabit.
         regs.write(TARC0, regs.read(TARC0) | legacy::TARC0_SPEED_MODE);
