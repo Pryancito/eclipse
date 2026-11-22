@@ -189,8 +189,7 @@ fn every_i219_and_pch_id_the_kernel_takes_is_a_part_here() {
     }
     // A kernel that does not say only ever left the 82574.
     assert_eq!(Part::of(0), Some(Part::Discrete));
-    // ICH9, an I210 (igb), and the right device from another vendor.
-    assert_eq!(Part::of(0x8086_10f5), None);
+    // An I210 (igb), and the right device from another vendor.
     assert_eq!(Part::of(0x8086_1533), None);
     assert_eq!(Part::of(0x10ec_15b8), None);
 }
@@ -490,4 +489,105 @@ fn the_pause_table_is_ieee_annex_28b() {
     assert_eq!(pause_for(c | a, a, true), Pause::Rx);
     assert_eq!(pause_for(c | a, 0, true), Pause::None);
     assert_eq!(pause_for(c, a, true), Pause::None);
+}
+
+#[test]
+fn the_first_pch_ids_are_its_two_phys() {
+    assert_eq!(Part::of(0x8086_10ea), Some(Part::Pch82577));
+    assert_eq!(Part::of(0x8086_10eb), Some(Part::Pch82577));
+    assert_eq!(Part::of(0x8086_10ef), Some(Part::Pch82578));
+    assert_eq!(Part::of(0x8086_10f0), Some(Part::Pch82578));
+}
+
+#[test]
+fn an_82577_of_revision_1_gets_slow_mdio_first_and_every_workaround() {
+    let card = ready_card();
+    card.set_phy(2, (0, MII_PHYSID2), 0x15a1);
+    card.set_phy(HV_PHY, BM_PORT_GEN_CFG, 0xab12);
+    let report = reset(&card, Part::Pch82577).unwrap();
+    let writes = card.phy_writes.borrow();
+    assert_eq!(
+        (writes[0].1, writes[0].2),
+        HV_KMRN_MODE_CTRL,
+        "slow mode is not the first PHY write: {:x?}",
+        &writes[..3]
+    );
+    assert_ne!(card.phy(HV_PHY, HV_KMRN_MODE_CTRL) & HV_KMRN_MDIO_SLOW, 0);
+    assert_eq!(card.phy(HV_PHY, HV_EARLY_PREAMBLE), 0x4431);
+    assert_eq!(card.phy(HV_PHY, HV_KMRN_FIFO_CTRLSTA), 0xa204);
+    assert_eq!(card.phy(HV_PHY, HV_LINK_STALL), HV_LINK_STALL_UP);
+    assert_eq!(card.phy(HV_PHY, BM_PORT_GEN_CFG), 0x0012);
+    assert_eq!(card.phy(2, (0, EMI_ADDR)), I82577_MSE_THRESHOLD);
+    assert_eq!(card.phy(2, (0, EMI_DATA)), 0x0034);
+    assert_eq!(
+        report.pch1,
+        Some(Pch1 {
+            revision: Some(1),
+            preamble: true,
+            soft_reset: false
+        })
+    );
+    drop(writes);
+    // Its own flow control.
+    assert_eq!(
+        (
+            card.reg(FCRTH),
+            card.reg(FCRTL),
+            card.reg(FCTTV),
+            card.reg(FCRTV_PCH)
+        ),
+        (
+            PCH1_HIGH_WATER,
+            PCH1_LOW_WATER | FCRTL_XONE,
+            PCH1_PAUSE_TIME,
+            PCH1_REFRESH_TIME
+        )
+    );
+    assert!(!card.phy_unlocked.get());
+}
+
+#[test]
+fn an_82578_of_revision_1_is_reset_to_its_defaults_and_gets_no_slow_mode() {
+    let card = ready_card();
+    card.set_phy(2, (0, MII_PHYSID2), 0x15a1);
+    let report = reset(&card, Part::Pch82578).unwrap();
+    assert!(report.pch1.unwrap().soft_reset);
+    assert!(card
+        .phy_writes
+        .borrow()
+        .iter()
+        .any(|w| (w.0, w.2, w.3) == (2, MII_BMCR, 0x3140)));
+    assert_eq!(card.phy(HV_PHY, HV_KMRN_MODE_CTRL), 0);
+}
+
+#[test]
+fn a_later_revision_gets_no_preamble_tuning_and_other_parts_none_of_it() {
+    let card = ready_card();
+    card.set_phy(2, (0, MII_PHYSID2), 0x15a3);
+    let report = reset(&card, Part::Pch82577).unwrap();
+    assert!(!report.pch1.unwrap().preamble);
+    assert_eq!(card.phy(HV_PHY, HV_EARLY_PREAMBLE), 0);
+    let card = ready_card();
+    let report = reset(&card, Part::Pch).unwrap();
+    assert_eq!(report.pch1, None);
+    assert_eq!(card.phy(HV_PHY, HV_LINK_STALL), 0);
+    assert_eq!(card.reg(FCRTH), FC_HIGH_WATER);
+}
+
+#[test]
+fn on_the_first_pch_k1_is_off_at_gigabit_and_back_on_below_or_down() {
+    let card = ready_card();
+    let k1 = |card: &Card| card.reg(KMRNCTRLSTA) as u16 & KMRN_K1_ENABLE != 0;
+    pch1_link_changed(&card, Part::Pch82577, Some(1000));
+    assert!(!k1(&card));
+    assert_eq!(card.phy(HV_PHY, HV_LINK_STALL), HV_LINK_STALL_UP);
+    pch1_link_changed(&card, Part::Pch82577, None);
+    assert!(k1(&card));
+    assert_eq!(card.phy(HV_PHY, HV_LINK_STALL), HV_LINK_STALL_DOWN);
+    pch1_link_changed(&card, Part::Pch82578, Some(100));
+    assert!(k1(&card));
+    // Not the first PCH: nothing.
+    card.set(KMRNCTRLSTA, 0);
+    pch1_link_changed(&card, Part::PchSpt, Some(1000));
+    assert_eq!(card.reg(KMRNCTRLSTA), 0);
 }

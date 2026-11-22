@@ -91,27 +91,37 @@ impl<'a, H: Hw> Owner<'a, H> {
             );
             return None;
         }
-        // The software half: reading `SWSM` takes `SMBI` when it is clear.
-        if !(0..SWSM_TRIES).any(|_| {
-            let free = hw.rd(SWSM) & SWSM_SMBI == 0;
-            if !free {
-                hw.delay_us(50);
-            }
-            free
-        }) {
-            return None;
-        }
-        // The firmware half: `SWESMBI` latches when the firmware lets go.
-        for _ in 0..SWSM_TRIES {
-            hw.wr(SWSM, hw.rd(SWSM) | SWSM_SWESMBI);
-            if hw.rd(SWSM) & SWSM_SWESMBI != 0 {
-                return Some(Owner { hw, part });
-            }
+        swsm_take(hw).then_some(Owner { hw, part })
+    }
+}
+
+/// The hardware semaphore `SWSM` (Linux `e1000e_get_hw_semaphore`): the
+/// software half (`SMBI`, taken by reading it clear), then the firmware's
+/// (`SWESMBI`, which latches when the firmware lets go). Whether it was
+/// had; [`swsm_put`] gives it back.
+pub(super) fn swsm_take<H: Hw>(hw: &H) -> bool {
+    if !(0..SWSM_TRIES).any(|_| {
+        let free = hw.rd(SWSM) & SWSM_SMBI == 0;
+        if !free {
             hw.delay_us(50);
         }
-        hw.wr(SWSM, hw.rd(SWSM) & !(SWSM_SMBI | SWSM_SWESMBI));
-        None
+        free
+    }) {
+        return false;
     }
+    for _ in 0..SWSM_TRIES {
+        hw.wr(SWSM, hw.rd(SWSM) | SWSM_SWESMBI);
+        if hw.rd(SWSM) & SWSM_SWESMBI != 0 {
+            return true;
+        }
+        hw.delay_us(50);
+    }
+    swsm_put(hw);
+    false
+}
+
+pub(super) fn swsm_put<H: Hw>(hw: &H) {
+    hw.wr(SWSM, hw.rd(SWSM) & !(SWSM_SMBI | SWSM_SWESMBI));
 }
 
 impl<H: Hw> Drop for Owner<'_, H> {
@@ -123,7 +133,7 @@ impl<H: Hw> Drop for Owner<'_, H> {
                 hw.rd(EXTCNF_CTRL) & !EXTCNF_CTRL_MDIO_SW_OWNERSHIP,
             );
         } else {
-            hw.wr(SWSM, hw.rd(SWSM) & !(SWSM_SMBI | SWSM_SWESMBI));
+            swsm_put(hw);
         }
     }
 }
