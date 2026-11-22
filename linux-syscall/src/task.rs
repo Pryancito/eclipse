@@ -1664,6 +1664,22 @@ impl Syscall<'_> {
         // something; `reset_for_exec` then finds it already forgotten.
         self.thread.release_robust_locks();
 
+        // `do_close_on_exec` closes through `filp_close`, which drops the
+        // process's POSIX record locks on each file it closes, as `close(2)`
+        // does (`locks_remove_posix`).
+        if let Ok(files) = proc.get_files() {
+            let pid = self.zircon_process().id();
+            for (fd, f) in files {
+                if proc.fd_cloexec(fd).unwrap_or(false) {
+                    if let Ok(meta) = f.metadata() {
+                        linux_object::fs::record_lock::release_file_owner(
+                            (meta.dev, meta.inode),
+                            pid,
+                        );
+                    }
+                }
+            }
+        }
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across
         // exec (SIG_IGN stays). Otherwise the child keeps inherited handler
