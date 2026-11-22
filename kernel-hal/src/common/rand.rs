@@ -436,14 +436,19 @@ mod tests {
         // instruction declines, the flag is ignored, and sixteen zero bytes
         // become a process's stack canary. Whatever the hardware does, the
         // software fill has already run underneath it.
+        //
+        // A random byte is zero once in 256 fills, so the short lengths are
+        // judged over eight fills: all zero is then a 2^-64 event for one
+        // byte (it failed CI once as a single fill), and still certain for
+        // the canary bug, which zeroes every fill.
         for len in [1usize, 8, 16, 63, 64, 4096] {
-            let mut buf = vec![0u8; len];
-            fill_random(&mut buf);
-            assert!(
-                buf.iter().any(|&b| b != 0),
-                "a {}-byte fill came back all zero",
-                len
-            );
+            let mut any = false;
+            for _ in 0..8 {
+                let mut buf = vec![0u8; len];
+                fill_random(&mut buf);
+                any |= buf.iter().any(|&b| b != 0);
+            }
+            assert!(any, "every {}-byte fill came back all zero", len);
         }
     }
 
