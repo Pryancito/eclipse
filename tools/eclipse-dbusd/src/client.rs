@@ -7,6 +7,7 @@
 //! stream of framed messages back.
 
 use std::io::{self, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -90,11 +91,21 @@ impl Client {
             if Instant::now() > deadline {
                 return Err("timed out waiting for an auth line".into());
             }
-            self.fill()?;
+            self.fill(deadline)?;
         }
     }
 
-    fn fill(&mut self) -> Result<(), String> {
+    /// Read whatever the bus has sent, waiting until `deadline` at most.
+    ///
+    /// The wait is `poll(2)` on the descriptor, not the socket's
+    /// `SO_RCVTIMEO`: Eclipse's AF_UNIX sockets accept that option and ignore
+    /// it, so a read with nothing to read blocks until the peer writes. See
+    /// [`readable`].
+    fn fill(&mut self, deadline: Instant) -> Result<(), String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if !readable(self.sock.as_raw_fd(), left).map_err(|e| format!("poll: {e}"))? {
+            return Err("timed out waiting for the bus".into());
+        }
         let mut chunk = [0u8; 4096];
         let n = self
             .sock
@@ -118,7 +129,7 @@ impl Client {
             if Instant::now() > deadline {
                 return Err("timed out waiting for a message".into());
             }
-            self.fill()?;
+            self.fill(deadline)?;
         }
     }
 
@@ -137,14 +148,18 @@ impl Client {
             self.buf.drain(..used);
             return Ok(Some(m));
         }
-        self.sock
-            .set_read_timeout(Some(within))
-            .map_err(|e| e.to_string())?;
+        // Wait with `poll(2)`, never with `SO_RCVTIMEO`. Eclipse's AF_UNIX
+        // sockets accept the option and ignore it, so the read used to block
+        // until the NEXT message reached this connection. For the portal that
+        // was the whole bug: the dialog closed, the answer sat in its file, and
+        // `reap` -- which runs between polls -- never ran, because the bus was
+        // quiet. Firefox waited for a `Response` that only a later, unrelated
+        // message would have released.
+        if !readable(self.sock.as_raw_fd(), within).map_err(|e| format!("poll: {e}"))? {
+            return Ok(None);
+        }
         let mut chunk = [0u8; 4096];
         let got = self.sock.read(&mut chunk);
-        // Put the long timeout back, so a later `call` keeps its own bound
-        // rather than inheriting this poll's few milliseconds.
-        let _ = self.sock.set_read_timeout(Some(TIMEOUT));
         match got {
             Ok(0) => Err("the bus closed the connection".into()),
             Ok(n) => {
@@ -245,6 +260,45 @@ impl Client {
             if Instant::now() > deadline {
                 return Err("timed out waiting for the expected message".into());
             }
+        }
+    }
+}
+
+/// Does `fd` have something to read (or a hang-up to report) within `within`?
+///
+/// This is the client's only way of waiting. `SO_RCVTIMEO` looks like the
+/// simpler tool and is what this client used, but on Eclipse it is a no-op for
+/// AF_UNIX sockets (the kernel accepts the option and never consults it), so a
+/// timed read became an untimed one. `poll(2)` with a timeout is honoured on
+/// every kernel this runs on: it is what every Wayland client here waits with.
+///
+/// `EINTR` is not an answer: the wait is resumed for whatever time is left.
+/// A hang-up or an error on the socket counts as readable, so that the `read`
+/// which follows reports it (as end of file or as the error) instead of the
+/// caller polling a dead socket for ever.
+fn readable(fd: RawFd, within: Duration) -> io::Result<bool> {
+    let end = Instant::now() + within;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        // Rounded UP to the millisecond: a 0.4 ms wait that became 0 would be
+        // a busy loop for a caller that polls in short slices.
+        let ms = left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` for the duration of the call.
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n > 0 {
+            return Ok(true);
+        }
+        if n == 0 {
+            return Ok(false);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
         }
     }
 }
@@ -602,6 +656,82 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1500));
         });
         path
+    }
+
+    #[test]
+    fn a_quiet_bus_does_not_hold_a_poll_past_its_slice() {
+        // Eclipse's AF_UNIX sockets accept `SO_RCVTIMEO` and ignore it, so a
+        // poll there behaves as if the socket had no read timeout at all. That
+        // is the state this socket is put in, and the poll still has to come
+        // back when its slice is up. A poll that blocked instead is what kept
+        // `eclipse-portald` from ever answering a file dialog: it only looks at
+        // the dialog BETWEEN polls. Linux honours the option, so the test
+        // below this one checks that no wait goes back to relying on it.
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |_| {});
+        let mut c = Client::connect(&path).expect("connect");
+        c.sock.set_read_timeout(None).expect("sin plazo");
+        let t0 = Instant::now();
+        assert!(
+            c.poll(Duration::from_millis(100))
+                .expect("un bus callado no es un error")
+                .is_none(),
+            "nadie escribio nada"
+        );
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_millis(1000),
+            "poll de 100 ms tardo {took:?}: espero al socket, no al plazo"
+        );
+        assert!(
+            took >= Duration::from_millis(90),
+            "poll de 100 ms volvio en {took:?}: no espero nada"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_wait_relies_on_the_socket_read_timeout() {
+        // `SO_RCVTIMEO` is set once, in `connect`, as a backstop where the
+        // kernel honours it. Every wait goes through `readable` (poll(2)),
+        // because on Eclipse the option is accepted and ignored.
+        let src = include_str!("client.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let body: Vec<&str> = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            body.iter()
+                .filter(|l| l.contains(".set_read_timeout("))
+                .count(),
+            1,
+            "una espera volvio a fiarse de SO_RCVTIMEO"
+        );
+        // poll and fill, the two places that read the socket.
+        assert_eq!(
+            body.iter()
+                .filter(|l| l.contains("readable(self.sock.as_raw_fd()"))
+                .count(),
+            2,
+            "una lectura del socket ya no espera con poll(2)"
+        );
+    }
+
+    #[test]
+    fn readable_says_yes_to_data_and_to_a_hang_up_and_no_to_silence() {
+        let (mut a, b) = UnixStream::pair().expect("pair");
+        let t0 = Instant::now();
+        assert!(!readable(b.as_raw_fd(), Duration::from_millis(50)).unwrap());
+        assert!(t0.elapsed() >= Duration::from_millis(45), "no espero");
+        a.write_all(b"x").unwrap();
+        assert!(readable(b.as_raw_fd(), Duration::from_millis(50)).unwrap());
+        // A zero wait is a look, not an error and not a block.
+        assert!(readable(b.as_raw_fd(), Duration::ZERO).unwrap());
+        // A peer that hangs up is readable, so the read that follows sees the
+        // end of file instead of the caller polling a dead socket for ever.
+        let (c, d) = UnixStream::pair().expect("pair");
+        drop(c);
+        assert!(readable(d.as_raw_fd(), Duration::from_millis(50)).unwrap());
     }
 
     #[test]
