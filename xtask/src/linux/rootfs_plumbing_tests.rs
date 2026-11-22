@@ -1714,6 +1714,12 @@ fn the_ollama_service_install_ollama_cuda_writes_follows_the_table_rules() {
     assert_eq!(field(&body, "type"), Some("respawn"));
     let exec = format!("{} serve", bin.display());
     assert_eq!(field(&body, "exec"), Some(exec.as_str()));
+    // Started after the compositor, once its Wayland socket is up -- but not
+    // tied to the session, so no `requires =` / `desktop =`.
+    assert_eq!(field(&body, "after"), Some("labwc"));
+    assert_eq!(field(&body, "wait_socket"), Some("/run/user/0/wayland-0"));
+    assert_eq!(field(&body, "requires"), None);
+    assert_eq!(field(&body, "desktop"), None);
     assert!(
         !svc.join("ollama.service.tmp").exists(),
         "the temporary file was left behind"
