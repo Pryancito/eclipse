@@ -48,8 +48,14 @@
 //!   GPU it names: what a kernel writes there is a message to SKED, the unit
 //!   that launches the kernels a kernel launches (dynamic parallelism).
 //!   UVM_FREE gives it back.
+//! - An mmap of any other range of the VA space is managed memory
+//!   (`cudaMallocManaged`): pinned system memory that the CPU and every GPU
+//!   with a GPU VA space map at the same address, until the CPU unmaps it.
+//!   The `cudaMemAdvise` calls, range groups and UVM_MIGRATE
+//!   (`cudaMemPrefetchAsync`) are checked and recorded, and a prefetch is
+//!   done at once; see the `managed` module.
 //! - UVM_VALIDATE_VA_RANGE answers whether a range is exactly one here,
-//!   external, a semaphore pool or SKED reflected. Linux also counts the
+//!   external, a semaphore pool, SKED reflected or managed. Linux also counts the
 //!   ranges it makes for a channel's buffers, which this port leaves to the
 //!   RM (below), so one of those is not a range here.
 //!
@@ -127,7 +133,23 @@ pub mod cmd {
     pub const VALIDATE_VA_RANGE: u32 = 72;
     pub const CREATE_EXTERNAL_RANGE: u32 = 73;
     pub const MM_INITIALIZE: u32 = 75;
+    pub const SET_RANGE_GROUP: u32 = 31;
+    pub const PREVENT_MIGRATION_RANGE_GROUPS: u32 = 40;
+    pub const ALLOW_MIGRATION_RANGE_GROUPS: u32 = 41;
+    pub const SET_PREFERRED_LOCATION: u32 = 42;
+    pub const UNSET_PREFERRED_LOCATION: u32 = 43;
+    pub const ENABLE_READ_DUPLICATION: u32 = 44;
+    pub const DISABLE_READ_DUPLICATION: u32 = 45;
+    pub const SET_ACCESSED_BY: u32 = 46;
+    pub const UNSET_ACCESSED_BY: u32 = 47;
+    pub const MIGRATE: u32 = 51;
+    pub const MIGRATE_RANGE_GROUP: u32 = 53;
+    pub const ENABLE_SYSTEM_WIDE_ATOMICS: u32 = 54;
+    pub const DISABLE_SYSTEM_WIDE_ATOMICS: u32 = 55;
 }
+
+mod managed;
+use managed::ManagedRange;
 
 /// `UVM_INITIALIZE_PARAMS`: `NvU64 flags`, `NV_STATUS rmStatus`.
 const INITIALIZE_SIZE: usize = 16;
@@ -273,6 +295,27 @@ fn layout(cmd: u32) -> Option<(usize, usize)> {
             (GPU_RANGE_SIZE, GPU_RANGE_STATUS)
         }
         cmd::ALLOC_SEMAPHORE_POOL => (POOL_SIZE, POOL_STATUS),
+        cmd::UNSET_PREFERRED_LOCATION
+        | cmd::ENABLE_READ_DUPLICATION
+        | cmd::DISABLE_READ_DUPLICATION => (RANGE_SIZE, RANGE_STATUS),
+        cmd::SET_ACCESSED_BY | cmd::UNSET_ACCESSED_BY => (GPU_RANGE_SIZE, GPU_RANGE_STATUS),
+        cmd::SET_PREFERRED_LOCATION => (managed::PREFERRED_SIZE, managed::PREFERRED_STATUS),
+        cmd::SET_RANGE_GROUP => (
+            managed::SET_RANGE_GROUP_SIZE,
+            managed::SET_RANGE_GROUP_STATUS,
+        ),
+        cmd::PREVENT_MIGRATION_RANGE_GROUPS | cmd::ALLOW_MIGRATION_RANGE_GROUPS => (
+            managed::MIGRATION_GROUPS_SIZE,
+            managed::MIGRATION_GROUPS_STATUS,
+        ),
+        cmd::MIGRATE => (managed::MIGRATE_SIZE, managed::MIGRATE_STATUS),
+        cmd::MIGRATE_RANGE_GROUP => (
+            managed::MIGRATE_RANGE_GROUP_SIZE,
+            managed::MIGRATE_RANGE_GROUP_STATUS,
+        ),
+        cmd::ENABLE_SYSTEM_WIDE_ATOMICS | cmd::DISABLE_SYSTEM_WIDE_ATOMICS => {
+            (managed::GPU_ONLY_SIZE, managed::GPU_ONLY_STATUS)
+        }
         _ => return None,
     })
 }
@@ -369,6 +412,12 @@ struct VaSpace {
     /// The SKED reflected ranges, by first byte. No two ranges overlap, of
     /// any kind ([`VaSpace::overlaps`]).
     skeds: BTreeMap<u64, SkedRange>,
+    /// The ranges of managed memory, by first byte.
+    managed: BTreeMap<u64, ManagedRange>,
+    /// Whom the last call on the VA space was for: what an mmap, which has
+    /// no caller to ask, makes its RM calls as. Always the process that
+    /// made the VA space, or one it forked.
+    who: Option<Who>,
 }
 
 impl VaSpace {
@@ -390,7 +439,12 @@ impl VaSpace {
             .range(..end)
             .next_back()
             .is_some_and(|(_, sked)| sked.end > base);
-        range || pool || sked
+        let managed = self
+            .managed
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, managed)| managed.end > base);
+        range || pool || sked || managed
     }
 
     /// `uvm_va_range_find`: the range here, of any kind, that holds `addr`,
@@ -411,10 +465,16 @@ impl VaSpace {
             .range(..=addr)
             .next_back()
             .map(|(&base, sked)| (base, sked.end));
+        let managed = self
+            .managed
+            .range(..=addr)
+            .next_back()
+            .map(|(&base, managed)| (base, managed.end));
         range
             .into_iter()
             .chain(pool)
             .chain(sked)
+            .chain(managed)
             .find(|&(_, end)| end > addr)
     }
 }
@@ -609,6 +669,15 @@ trait Rm: Send + Sync {
         pages: &nvctl::Pages,
         gpu_cached: bool,
     ) -> RmResult;
+    /// `nvctl::uvm_user_pages`, not cached by the GPU: a managed range's
+    /// pages.
+    fn user_pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: nvctl::UserPages,
+    ) -> RmResult;
     /// `nvctl::uvm_sked_reflected`: the memory, then the virtual object.
     fn sked(
         &self,
@@ -652,6 +721,16 @@ impl Rm for KernelRm {
         gpu_cached: bool,
     ) -> RmResult {
         nvctl::uvm_pages(by, h_client, h_device, pages, gpu_cached)
+    }
+
+    fn user_pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: nvctl::UserPages,
+    ) -> RmResult {
+        nvctl::uvm_user_pages(by, h_client, h_device, pages, false)
     }
 
     fn sked(
@@ -723,6 +802,13 @@ impl UvmOpen {
     /// A served command on the kernel copy of its params: its answer goes in
     /// their `rmStatus`.
     fn call(&self, cmd: u32, params: &mut [u8], caller: &NvCaller) {
+        if cmd != cmd::INITIALIZE && cmd != cmd::MM_INITIALIZE && self.is_va_space() {
+            // Whom an mmap's RM calls are made as, and the managed ranges
+            // the CPU let go of since the last call (the VMA's close).
+            let mut va_space = self.va_space.lock();
+            va_space.who = Some(Who::of(caller));
+            self.reap_managed(&mut va_space, Who::of(caller));
+        }
         let status = match cmd {
             cmd::INITIALIZE => self.initialize(u64_at(params, 0)),
             cmd::MM_INITIALIZE => mm_initialize(i32_at(params, 0), caller.open_of_fd),
@@ -756,6 +842,29 @@ impl UvmOpen {
                 Who::of(caller),
             ),
             cmd::VALIDATE_VA_RANGE => self.validate_va_range(u64_at(params, 0), u64_at(params, 8)),
+            cmd::SET_PREFERRED_LOCATION => self.set_preferred_location(params),
+            cmd::UNSET_PREFERRED_LOCATION => {
+                self.unset_preferred_location(u64_at(params, 0), u64_at(params, 8))
+            }
+            cmd::SET_ACCESSED_BY => self.set_accessed_by(params, true),
+            cmd::UNSET_ACCESSED_BY => self.set_accessed_by(params, false),
+            cmd::ENABLE_READ_DUPLICATION => {
+                self.set_read_duplication(u64_at(params, 0), u64_at(params, 8), true)
+            }
+            cmd::DISABLE_READ_DUPLICATION => {
+                self.set_read_duplication(u64_at(params, 0), u64_at(params, 8), false)
+            }
+            cmd::SET_RANGE_GROUP => self.set_range_group(params),
+            cmd::PREVENT_MIGRATION_RANGE_GROUPS | cmd::ALLOW_MIGRATION_RANGE_GROUPS => {
+                self.migration_range_groups(params)
+            }
+            cmd::MIGRATE_RANGE_GROUP => self.migrate_range_group(params),
+            cmd::ENABLE_SYSTEM_WIDE_ATOMICS | cmd::DISABLE_SYSTEM_WIDE_ATOMICS => {
+                self.system_wide_atomics(&uuid_at(params, 0))
+            }
+            cmd::MIGRATE => self.migrate(params, &|at, value| {
+                UserOutPtr::<u32>::from(at as usize).write(value).is_ok()
+            }),
             cmd::REGISTER_CHANNEL => self.register_channel(params),
             cmd::UNREGISTER_CHANNEL => self.unregister_channel(
                 u32_at(params, UNREGISTER_CHANNEL_CLIENT),
@@ -888,6 +997,12 @@ impl UvmOpen {
             self.remove_gpu_va_space(&mut va_space, &uuid, Who::of(caller));
             return status;
         }
+        // The same of each managed range, which Linux maps on the GPU's
+        // first fault instead.
+        if let Err(status) = self.map_managed_on(&mut va_space, &uuid, Who::of(caller)) {
+            self.remove_gpu_va_space(&mut va_space, &uuid, Who::of(caller));
+            return status;
+        }
         first_time(
             &FIRST_GPU_VA_SPACE,
             "UVM_REGISTER_GPU_VASPACE: the first GPU VA space registered; its page tables stay the RM's",
@@ -928,6 +1043,7 @@ impl UvmOpen {
                 self.unmap_memory(&gpu_va_space, map, who);
             }
         }
+        self.unmap_managed_from(va_space, uuid, &gpu_va_space, who);
         true
     }
 
@@ -1339,7 +1455,8 @@ impl UvmOpen {
     /// open from `offset`, which must be a VA space. A semaphore pool that is
     /// exactly that range maps its own pages (`uvm_mem_map_cpu_user`); a
     /// range that overlaps one here otherwise, of either kind, is in use;
-    /// and any other is a range of managed memory, not served yet.
+    /// and any other is a new range of managed memory
+    /// ([`UvmOpen::mmap_managed`]).
     ///
     /// Linux also refuses a mapping that is not where the offset says, or
     /// not both readable and writable; neither reaches here, and the pages
@@ -1350,7 +1467,9 @@ impl UvmOpen {
         }
         let base = offset as u64;
         let end = base.checked_add(len as u64).ok_or(LxError::EINVAL)?;
-        let va_space = self.va_space.lock();
+        let mut va_space = self.va_space.lock();
+        let who = va_space.who.unwrap_or(Who::NOBODY);
+        self.reap_managed(&mut va_space, who);
         if let Some(pool) = va_space.pools.get(&base).filter(|pool| pool.end == end) {
             first_time(
                 &FIRST_POOL_CPU,
@@ -1361,11 +1480,7 @@ impl UvmOpen {
         if va_space.overlaps(base, end) {
             return Err(LxError::EADDRINUSE);
         }
-        first_time(
-            &FIRST_MANAGED,
-            "mmap: a range of managed memory (cudaMallocManaged) is not served yet: ENODEV",
-        );
-        Err(LxError::ENODEV)
+        self.mmap_managed(&mut va_space, base, end)
     }
 
     /// `uvm_api_validate_va_range`: whether `[base, base + length)` is
@@ -1518,6 +1633,9 @@ impl Drop for UvmOpen {
         }
         for sked in va_space.skeds.into_values() {
             self.unmap_sked(&va_space.gpu_va_spaces, sked, Who::NOBODY);
+        }
+        for range in va_space.managed.into_values() {
+            self.unmap_managed_everywhere(&va_space.gpu_va_spaces, range, Who::NOBODY);
         }
     }
 }
@@ -1975,6 +2093,8 @@ pub fn create_node(root: &Arc<DevINode>) {
     );
 }
 
+#[cfg(test)]
+mod managed_tests;
 #[cfg(test)]
 mod mapping_tests;
 #[cfg(test)]

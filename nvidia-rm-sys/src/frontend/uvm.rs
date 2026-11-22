@@ -67,6 +67,15 @@ extern "C" {
         gpu_cached: NvU32,
         h_memory: *mut NvU32,
     ) -> NV_STATUS;
+    fn eclipse_rm_frontend_uvm_user_pages(
+        os_info: *mut c_void,
+        h_client: NvU32,
+        h_device: NvU32,
+        va: NvU64,
+        size: NvU64,
+        gpu_cached: NvU32,
+        h_memory: *mut NvU32,
+    ) -> NV_STATUS;
     fn eclipse_rm_frontend_uvm_sked(
         os_info: *mut c_void,
         admin: NvU32,
@@ -124,6 +133,18 @@ unsafe fn eclipse_rm_frontend_uvm_pages(
     _h_client: NvU32,
     _h_device: NvU32,
     _phys: NvU64,
+    _size: NvU64,
+    _gpu_cached: NvU32,
+    _h_memory: *mut NvU32,
+) -> NV_STATUS {
+    NV_ERR_INVALID_CLIENT
+}
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_frontend_uvm_user_pages(
+    _os_info: *mut c_void,
+    _h_client: NvU32,
+    _h_device: NvU32,
+    _va: NvU64,
     _size: NvU64,
     _gpu_cached: NvU32,
     _h_memory: *mut NvU32,
@@ -319,6 +340,50 @@ pub fn pages(
             &mut h_memory,
         )
     };
+    if status == NV_OK {
+        Ok(h_memory)
+    } else {
+        Err(status)
+    }
+}
+
+/// `pages`, the process's own pages pinned by the kernel, as RM memory of
+/// `h_client` under `h_device`, cached by the GPU when `gpu_cached`: the
+/// handle of an NV01_MEMORY_SYSTEM_OS_DESCRIPTOR of their page array, which
+/// [`map_external`] maps and [`free`] frees. A range of managed memory, on
+/// one GPU. The RM keeps them pinned for as long as that memory lives;
+/// pages it did not take are unpinned once the call is over.
+pub fn user_pages(
+    caller: &Caller,
+    h_client: u32,
+    h_device: u32,
+    pages: super::user_pages::UserPages,
+    gpu_cached: bool,
+) -> Result<u32, NV_STATUS> {
+    if caller.os_info == 0 {
+        return Err(NV_ERR_INVALID_ARGUMENT);
+    }
+    let va = pages.va as u64;
+    let size = pages.phys.len() as u64 * 4096;
+    let mut h_memory = 0;
+    let (status, untaken) = {
+        let _scope = CallScope::enter(caller);
+        super::user_pages::lend(pages);
+        let status = unsafe {
+            eclipse_rm_frontend_uvm_user_pages(
+                caller.os_info as *mut c_void,
+                h_client,
+                h_device,
+                va,
+                size,
+                gpu_cached as NvU32,
+                &mut h_memory,
+            )
+        };
+        (status, super::user_pages::take_back())
+    };
+    // Unpinned with the gate open.
+    drop(untaken);
     if status == NV_OK {
         Ok(h_memory)
     } else {

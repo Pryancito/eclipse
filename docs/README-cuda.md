@@ -53,9 +53,23 @@ OS events, `RM_ALLOC`/`FREE`/`CONTROL`/`DUP`/`SHARE`, `RM_MAP_MEMORY` + mmap,
 `REGISTER`/`UNREGISTER_GPU`, range groups, GPU VA space, channels, external
 map/unmap/free, semaphore pool (+ mmap CPU), SKED reflected, `VALIDATE_VA_RANGE`.
 
-**Aún no:** page tables UVM propias / GPU page faults / HMM;
-`cudaMallocManaged` (mmap managed → `ENODEV`); el resto de ioctls UVM →
-`ENOSYS` (una línea en dmesg la primera vez).
+**Memoria managed (`cudaMallocManaged`, `cuMemAllocManaged`):** el mmap de la
+UVM crea páginas de sistema fijadas (pinned) que la CPU y cada GPU con GPU VA
+space mapean en la misma dirección (memoria del RM con OS descriptor, como
+`cuMemHostRegister`), también en las GPU que registran su VA space después.
+La GPU las lee por PCIe (snooped), sin copias ni faults. `cudaMemAdvise`
+(preferred location, accessed-by, read duplication), range groups y
+system-wide atomics se validan como en uvm.c y se guardan; `cudaMemPrefetchAsync`
+(`UVM_MIGRATE`) se completa al momento y libera su semáforo. El rango se libera
+cuando la CPU lo desmapea (en la siguiente llamada a la UVM).
+
+Límites frente a Linux: la memoria nunca migra a VRAM (velocidad de PCIe desde
+la GPU), se reserva y fija entera en el mmap (no bajo demanda) y no hay
+oversubscription.
+
+**Aún no:** page tables UVM propias / GPU page faults / HMM; P2P entre GPUs
+(`ENABLE_PEER_ACCESS`); el resto de ioctls UVM → `ENOSYS` (una línea en dmesg
+la primera vez).
 
 ## Prueba en la máquina
 

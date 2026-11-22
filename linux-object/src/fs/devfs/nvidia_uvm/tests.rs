@@ -59,6 +59,9 @@ pub(super) struct FakeState {
     /// The status a SKED reflected range in a VA space answers with, for
     /// those that fail.
     pub refuse_sked: BTreeMap<u32, u32>,
+    /// A managed range's pages made RM memory and not freed, by the handle
+    /// of their memory: (by, hClient, hDevice, the pages).
+    pub user_pages: BTreeMap<u32, (By, u32, u32, nvctl::UserPages)>,
 }
 
 /// Pages made RM memory, with the hold the RM keeps on them.
@@ -141,6 +144,25 @@ impl Rm for FakeRm {
         Ok(h_memory)
     }
 
+    fn user_pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: nvctl::UserPages,
+    ) -> RmResult {
+        let mut state = self.state();
+        if let Some(&status) = state.refuse_pages.get(&h_device) {
+            return Err(status);
+        }
+        state.last_memory += 1;
+        let h_memory = 0xbee0_0000 + state.last_memory;
+        state
+            .user_pages
+            .insert(h_memory, (By::of(by), h_client, h_device, pages));
+        Ok(h_memory)
+    }
+
     fn sked(
         &self,
         by: &nvctl::Caller,
@@ -163,9 +185,11 @@ impl Rm for FakeRm {
         state.maps.remove(&h_object);
         state.skeds.remove(&h_object);
         let hold = state.lent.remove(&h_object);
+        let pages = state.user_pages.remove(&h_object);
         state.frees.push((By::of(by), h_client, h_object));
         drop(state);
         drop(hold);
+        drop(pages);
     }
 }
 
@@ -260,7 +284,7 @@ pub(super) fn unregister_gpu(open: &UvmOpen, uuid: &Uuid) -> u32 {
 }
 
 /// The id and the status.
-fn create_range_group(open: &UvmOpen) -> (u64, u32) {
+pub(super) fn create_range_group(open: &UvmOpen) -> (u64, u32) {
     let mut params = vec![0u8; RANGE_GROUP_SIZE];
     open.call(cmd::CREATE_RANGE_GROUP, &mut params, &plain());
     (u64_at(&params, 0), status_at(&params, RANGE_GROUP_STATUS))
@@ -496,7 +520,7 @@ fn mm_initialize_leaves_its_own_open_alone() {
 fn deinitialize_succeeds_and_the_rest_is_enosys() {
     let open = uvm();
     assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &plain()), Ok(0));
-    let unserved: Vec<u32> = vec![31, 35, 69, 71, 74, 2047, 0x3000_0003];
+    let unserved: Vec<u32> = vec![29, 30, 35, 69, 71, 74, 2047, 0x3000_0003];
     for cmd in unserved {
         assert_eq!(
             open.ioctl(cmd, 0, &plain()),

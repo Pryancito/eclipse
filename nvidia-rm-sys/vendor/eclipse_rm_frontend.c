@@ -1955,6 +1955,90 @@ NV_STATUS eclipse_rm_frontend_uvm_pages(
     return status;
 }
 
+/*
+ * A range of managed memory (cudaMallocManaged) on one GPU: `size` bytes of
+ * the process's own pages from user address `va`, which the kernel pinned
+ * and lends for this call (frontend/user_pages.rs), made RM memory of
+ * `hClient` under `hDevice` -- an NV01_MEMORY_SYSTEM_OS_DESCRIPTOR of the
+ * page array os_lock_user_pages hands out, as RmCreateOsDescriptor makes of
+ * a cuMemHostRegister range. Its handle goes to `phMemory`; the memory keeps
+ * the pages pinned until the RM destroys it. On Linux UVM writes the GPU's
+ * PTEs for these pages itself; here the memory is mapped like any other
+ * (eclipse_rm_frontend_uvm_map).
+ */
+NV_STATUS eclipse_rm_frontend_uvm_user_pages(
+    void     *pOsInfo,
+    NvHandle  hClient,
+    NvHandle  hDevice,
+    NvU64     va,
+    NvU64     size,
+    NvU32     bGpuCached,
+    NvHandle *phMemory)
+{
+    THREAD_STATE_NODE threadState;
+    API_SECURITY_INFO secInfo;
+    NV_OS_DESC_MEMORY_ALLOCATION_PARAMS allocParams;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
+    NvHandle hMemory = NV01_NULL_OBJECT;
+    NvU32 lockFlags = DRF_NUM(_LOCK_USER_PAGES, _FLAGS, _WRITE, 1);
+    NvU64 pageCount;
+    void *pPageArray = NULL;
+    NV_STATUS status;
+
+    if ((pOsInfo == NULL) || (phMemory == NULL) || (size == 0) ||
+        ((va & ~os_page_mask) != 0) || ((size & ~os_page_mask) != 0))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    pageCount = size / os_page_size;
+
+    status = os_lock_user_pages((void *)(NvUPtr)va, pageCount, &pPageArray, lockFlags);
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    secInfo = _eclipse_rm_frontend_uvm_sec_info(pOsInfo, NV_FALSE);
+    secInfo.privLevel = RS_PRIV_LEVEL_KERNEL;
+
+    portMemSet(&allocParams, 0, sizeof(allocParams));
+    allocParams.type = NVOS32_TYPE_IMAGE;
+    allocParams.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
+                       DRF_DEF(OS32, _ATTR, _PHYSICALITY, _NONCONTIGUOUS) |
+                       DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
+    allocParams.attr2 = bGpuCached ? DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES)
+                                   : DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _NO);
+    allocParams.descriptor = NV_PTR_TO_NvP64(pPageArray);
+    allocParams.limit = size - 1;
+    allocParams.descriptorType = NVOS32_DESCRIPTOR_TYPE_OS_PAGE_ARRAY;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = pRmApi->AllocWithSecInfo(pRmApi, hClient, hDevice, &hMemory,
+                                          NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+                                          NV_PTR_TO_NvP64(&allocParams),
+                                          sizeof(allocParams),
+                                          RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
+                                          &secInfo);
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (status != NV_OK)
+    {
+        /* Unless the memdesc took them (osdescConstruct clears the
+         * descriptor then, and its teardown unpins them), unpinned as
+         * RmCreateOsDescriptor does. */
+        if (allocParams.descriptor != NvP64_NULL)
+            os_unlock_user_pages(pageCount, pPageArray, lockFlags);
+        return status;
+    }
+    *phMemory = hMemory;
+    return NV_OK;
+}
+
 /* NV_MMU_PTE_KIND_SMSKED_MESSAGE (dev_mmu.h), the same from Turing on. */
 #define ECLIPSE_UVM_KIND_SMSKED_MESSAGE 0x0F
 
