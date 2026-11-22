@@ -791,7 +791,16 @@ pub fn reserve_pci_if(
     size: usize,
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
-    reserve_with(kind, usable, false, Transport::Pci, pci_id, paddr, size, wiring)
+    reserve_with(
+        kind,
+        usable,
+        false,
+        Transport::Pci,
+        pci_id,
+        paddr,
+        size,
+        wiring,
+    )
 }
 
 /// [`reserve_if`], where `unasked` also leaves the device to userspace.

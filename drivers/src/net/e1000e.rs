@@ -3995,7 +3995,8 @@ impl PciDriver for E1000eDriverPci {
     }
 
     fn matched(&self, vendor_id: u16, device_id: u16) -> bool {
-        vendor_id == 0x8086 && e1000e_device_matched(device_id)
+        vendor_id == 0x8086
+            && (e1000e_device_matched(device_id) || user_card::userspace_only(device_id))
     }
 
     fn init(
@@ -4017,6 +4018,13 @@ impl PciDriver for E1000eDriverPci {
         };
 
         if user_card::left(dev, mapper, irq, bar0_addr) {
+            return Err(DeviceError::NotSupported);
+        }
+        if user_card::userspace_only(dev.id.device_id) {
+            crate::klog_warn!(
+                "e1000e: {:#x} has no driver in the kernel and was not left to userspace\n",
+                dev.id.device_id
+            );
             return Err(DeviceError::NotSupported);
         }
         // Through the base the mapper returns: see `bus::resolve_window`.
