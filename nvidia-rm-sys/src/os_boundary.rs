@@ -2125,16 +2125,32 @@ pub extern "C" fn osReadRegistryBinary(
     NV_ERR_NOT_SUPPORTED
 }
 
+/// `RmReadRegistryDword`: a key the user set with `nvidia.registry=`
+/// ([`crate::registry`]), the same for every GPU as `NVreg_RegistryDwords`
+/// is; any other is not there, which every caller takes as "use the
+/// default".
 #[no_mangle]
 pub extern "C" fn osReadRegistryDwordBase(
-    arg0: *mut c_void,
-    arg1: *mut c_char,
-    arg2: *mut NvU32,
+    pGpu: *mut c_void,
+    pRegParmStr: *mut c_char,
+    pData: *mut NvU32,
 ) -> NV_STATUS {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    NV_ERR_NOT_SUPPORTED
+    let _ = pGpu;
+    if pRegParmStr.is_null() || pData.is_null() {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    let name = unsafe { core::ffi::CStr::from_ptr(pRegParmStr) };
+    let Ok(name) = name.to_str() else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    match crate::registry::dword(name) {
+        Some(value) => {
+            unsafe { *pData = value };
+            log::info!("[nvrm] registry: {} = {:#x} (nvidia.registry)", name, value);
+            NV_OK
+        }
+        None => NV_ERR_NOT_SUPPORTED,
+    }
 }
 
 #[no_mangle]

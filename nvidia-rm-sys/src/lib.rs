@@ -19,6 +19,7 @@ pub mod nvkms_os;
 pub mod os_boundary;
 pub mod os_interface;
 pub mod os_services;
+pub mod registry;
 pub mod rm_init;
 pub mod survival;
 pub mod types;

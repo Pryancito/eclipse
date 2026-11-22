@@ -64,6 +64,13 @@ pub use nvidia::frontend as nvctl;
 /// cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::gem_vram::set_enabled as set_gem_vram_enabled;
+/// `nvidia.registry=`: the RM's registry keys, `NVreg_RegistryDwords` of
+/// Linux, for `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
+/// Must run before the RM comes up. The keys taken.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nvidia_registry(text: &str) -> alloc::vec::Vec<(alloc::string::String, u32)> {
+    nvidia_rm_sys::registry::set(text)
+}
 /// The implicit-sync hatch (`nvidia.implicit_sync=off`), for `zCore`'s
 /// cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]

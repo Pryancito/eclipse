@@ -38,6 +38,8 @@
 //             products (dp4a, a decoded token), int8 and f16 tensor cores
 //             (mma, a prompt), and a CUDA graph (how llama.cpp decodes).
 //   latency   what a launch costs, and a launch and the wait for it.
+//   peer      with two GPUs or more, after them: 64 MiB GPU 0 -> GPU 1 with
+//             cuMemcpyPeer, and again with peer access when the RM gives it.
 //   sleeping  a launch and a wait that sleeps (CU_EVENT_BLOCKING_SYNC)
 //             instead of spinning: the wake needs the GPU's interrupt. Last
 //             GPU only, at the very end.
@@ -284,6 +286,10 @@ static CUresult (*d_set_access)(CUdeviceptr, size_t, const CUmemAccessDesc *, si
 static CUresult (*d_alloc_managed)(CUdeviceptr *, size_t, unsigned);
 static CUresult (*d_advise)(CUdeviceptr, size_t, int, CUdevice);
 static CUresult (*d_prefetch)(CUdeviceptr, size_t, CUdevice, CUstream);
+static CUresult (*d_ctx_set)(CUcontext);
+static CUresult (*d_copy_peer)(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, size_t);
+static CUresult (*d_enable_peer)(CUcontext, unsigned);
+static CUresult (*d_disable_peer)(CUcontext);
 
 #define DEEP_SYM(var, name) (var = (__typeof__(var))sym(name)) != NULL
 
@@ -312,7 +318,9 @@ static int deep_symbols(void)
            DEEP_SYM(d_create, "cuMemCreate") && DEEP_SYM(d_release, "cuMemRelease") &&
            DEEP_SYM(d_map, "cuMemMap") && DEEP_SYM(d_unmap, "cuMemUnmap") &&
            DEEP_SYM(d_set_access, "cuMemSetAccess") && DEEP_SYM(d_alloc_managed, "cuMemAllocManaged") &&
-           DEEP_SYM(d_advise, "cuMemAdvise") && DEEP_SYM(d_prefetch, "cuMemPrefetchAsync");
+           DEEP_SYM(d_advise, "cuMemAdvise") && DEEP_SYM(d_prefetch, "cuMemPrefetchAsync") &&
+           DEEP_SYM(d_ctx_set, "cuCtxSetCurrent") && DEEP_SYM(d_copy_peer, "cuMemcpyPeer") &&
+           DEEP_SYM(d_enable_peer, "cuCtxEnablePeerAccess") && DEEP_SYM(d_disable_peer, "cuCtxDisablePeerAccess");
 }
 
 // The check under way, for the watchdog to name.
@@ -968,6 +976,59 @@ static int deep_gpu(CUdevice dev, int index, int sleeping)
     return ok;
 }
 
+// 64 MiB from GPU 0 to GPU 1 with cuMemcpyPeer (how llama.cpp moves a
+// layer's output to the next GPU), checked on GPU 1. Without peer access
+// libcuda stages it through system memory; with it (cuDeviceCanAccessPeer
+// says yes) it is copied again after cuCtxEnablePeerAccess, GPU to GPU.
+static int deep_peer(CUdevice d0, CUdevice d1, int can_peer)
+{
+    deep_begin("peer");
+    CUcontext c0 = NULL, c1 = NULL;
+    CUdeviceptr a0 = 0, a1 = 0;
+    unsigned *h = malloc(DEEP_BYTES), *back = malloc(DEEP_BYTES);
+    int ok = h && back;
+    if (!ok)
+        printf("  %-10s FAILED: no host memory\n", deep_step);
+    if (ok) {
+        deep_fill(h, DEEP_WORDS, 0x9e37);
+        ok = deep_call("cuCtxCreate", d_ctx_create(&c0, 0, d0)) &&
+             deep_call("cuMemAlloc", d_alloc(&a0, DEEP_BYTES)) &&
+             deep_call("HtoD", d_htod(a0, h, DEEP_BYTES)) &&
+             deep_call("cuCtxCreate", d_ctx_create(&c1, 0, d1)) &&
+             deep_call("cuMemAlloc", d_alloc(&a1, DEEP_BYTES));
+    }
+    for (int direct = 0; ok && direct <= can_peer; direct++) {
+        if (direct)
+            ok = deep_call("cuCtxEnablePeerAccess", d_enable_peer(c0, 0));
+        memset(back, 0, DEEP_BYTES);
+        double t0 = now_us();
+        ok = ok && deep_call("cuMemcpyPeer", d_copy_peer(a1, c1, a0, c0, DEEP_BYTES)) &&
+             deep_call("sync", d_ctx_sync());
+        double t1 = now_us();
+        ok = ok && deep_call("DtoH", d_dtoh(back, a1, DEEP_BYTES)) && deep_same(back, h, DEEP_WORDS);
+        if (ok)
+            printf("  peer       64 MiB GPU 0 -> GPU 1 %s  %5.0f MB/s  ok\n",
+                   direct ? "direct (peer access)" : "through system memory", mbps(DEEP_BYTES, t1 - t0));
+        if (direct)
+            d_disable_peer(c0);
+    }
+    if (a1) {
+        d_ctx_set(c1);
+        d_free(a1);
+    }
+    if (c1)
+        d_ctx_destroy(c1);
+    if (a0) {
+        d_ctx_set(c0);
+        d_free(a0);
+    }
+    if (c0)
+        d_ctx_destroy(c0);
+    free(h);
+    free(back);
+    return ok;
+}
+
 static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
 {
     if (!deep_symbols()) {
@@ -975,11 +1036,12 @@ static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
         return 1;
     }
     signal(SIGALRM, deep_hung);
-    if (gpus > 1) {
-        CUdevice d0, d1;
-        int peer = 0;
-        if (get(&d0, 0) == 0 && get(&d1, 1) == 0 && d_can_peer(&peer, d0, d1) == 0)
-            printf("[peer] GPU 0 -> GPU 1 direct access: %s\n", peer ? "yes" : "no (copies go through the host)");
+    CUdevice d0, d1;
+    int peer = 0, peers_known = 0;
+    if (gpus > 1 && get(&d0, 0) == 0 && get(&d1, 1) == 0 && d_can_peer(&peer, d0, d1) == 0) {
+        peers_known = 1;
+        printf("[peer] GPU 0 -> GPU 1 direct access: %s\n",
+               peer ? "yes" : "no (copies go through the host; dmesg | grep 'P2P' says why)");
     }
     int failed = 0;
     for (int i = 0; i < gpus; i++) {
@@ -988,6 +1050,9 @@ static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
         if (!deep_call("cuDeviceGet", get(&dev, i)) || !deep_gpu(dev, i, i == gpus - 1))
             failed++;
     }
+    if (peers_known && !deep_peer(d0, d1, peer != 0))
+        failed++;
+    alarm(0);
     if (failed) {
         printf("DEEP FAILED on %d of %d GPU(s); the line above each FAILED names the check\n", failed, gpus);
         return 1;

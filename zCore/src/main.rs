@@ -1495,6 +1495,14 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      (dos dispositivos NVK en un proceso ya no comparten VM ni anillo)"
                 );
             }
+            // `NVreg_RegistryDwords` of Linux: the RM's registry keys, before
+            // the RM comes up. `nvidia.registry=ForceP2P=0x11` is the one for
+            // peer access between two GeForce cards over PCIe.
+            if let Some(text) = kernel_hal::cmdline::value(&options.cmdline, "nvidia.registry") {
+                for (key, value) in kernel_hal::drivers::set_nvidia_registry(text) {
+                    klog_info!("Eclipse: nvidia.registry -- {} = {:#x}", key, value);
+                }
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram") {
                 kernel_hal::drivers::set_gem_vram_enabled(true);
                 klog_info!(

@@ -87,6 +87,14 @@ extern "C" {
         h_memory: *mut NvU32,
         h_virtual: *mut NvU32,
     ) -> NV_STATUS;
+    fn eclipse_rm_frontend_uvm_p2p_caps(
+        gpu_instance_a: NvU32,
+        gpu_instance_b: NvU32,
+        read: *mut u8,
+        write: *mut u8,
+        atomics: *mut u8,
+        connectivity: *mut NvU32,
+    ) -> NV_STATUS;
 }
 
 // Hosted builds compile no RM C (build.rs): no client exists, so there is
@@ -165,6 +173,65 @@ unsafe fn eclipse_rm_frontend_uvm_sked(
     _h_virtual: *mut NvU32,
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_frontend_uvm_p2p_caps(
+    _gpu_instance_a: NvU32,
+    _gpu_instance_b: NvU32,
+    _read: *mut u8,
+    _write: *mut u8,
+    _atomics: *mut u8,
+    _connectivity: *mut NvU32,
+) -> NV_STATUS {
+    NV_ERR_INVALID_DEVICE
+}
+
+/// `NV_ERR_INVALID_DEVICE` (nvstatuscodes.h).
+#[cfg(not(target_os = "none"))]
+const NV_ERR_INVALID_DEVICE: NV_STATUS = 0x0000_0026;
+
+/// What the RM says of peer access between two GPUs: each
+/// `NV0000_P2P_CAPS_STATUS_*` (0 is OK) and the `P2P_CONNECTIVITY` it goes
+/// over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct P2pCaps {
+    pub read: u8,
+    pub write: u8,
+    pub atomics: u8,
+    pub connectivity: u32,
+}
+
+impl P2pCaps {
+    /// Whether peer access is possible both ways, as nvidia-uvm counts it
+    /// (`UVM_LINK_TYPE_PCIE` or better): reads and writes both OK.
+    pub fn supported(&self) -> bool {
+        self.read == 0 && self.write == 0
+    }
+}
+
+/// The RM's P2P caps between RM GPU instances `a` and `b`, as
+/// `NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS` answers libcuda.
+pub fn p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+    let mut caps = P2pCaps::default();
+    let status = {
+        let _scope = CallScope::enter_kernel();
+        unsafe {
+            eclipse_rm_frontend_uvm_p2p_caps(
+                a,
+                b,
+                &mut caps.read,
+                &mut caps.write,
+                &mut caps.atomics,
+                &mut caps.connectivity,
+            )
+        }
+    };
+    if status == NV_OK {
+        Ok(caps)
+    } else {
+        Err(status)
+    }
 }
 
 /// UVM_REGISTER_GPU_VASPACE's check: `h_va_space` must be a FERMI_VASPACE_A
