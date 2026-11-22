@@ -129,11 +129,11 @@ fn ich8_gets_its_fifo_workaround_and_its_own_bits() {
 }
 
 #[test]
-fn ich9_has_a_10k_buffer_and_none_of_ich8s_workarounds() {
+fn ich9_has_an_18k_buffer_and_none_of_ich8s_workarounds() {
     let card = Card::default();
     card.gigabit_phy();
     reset(&card, Part::Ich9).unwrap();
-    assert_eq!(card.reg(PBA), 10);
+    assert_eq!(card.reg(PBA), 18);
     assert_eq!(card.reg(PBS), 0);
     assert_eq!(card.reg(TARC0) & (3 << 28), 0);
     assert_eq!(card.reg(GCR), 0);
@@ -169,7 +169,7 @@ fn an_ife_phy_is_not_offered_gigabit() {
 
 #[test]
 fn the_watermarks_leave_room_for_a_frame() {
-    for kb in [8, 10] {
+    for kb in [8, 18] {
         let (high, low) = watermarks(kb);
         assert!(high + MAX_FRAME <= kb << 10);
         assert_eq!(high % 8, 0);

@@ -51,18 +51,20 @@ const RFCTL_NEW_IPV6_EXT_DIS: u32 = 1 << 17;
 const GCR_NO_SNOOP_ALL: u32 = 0x3f;
 const FCRTL_XONE: u32 = 1 << 31;
 const FC_PAUSE_TIME: u32 = 0x0680;
-const MAX_FRAME: u32 = 1518;
+/// The largest frame at the standard MTU with a VLAN tag and the FCS
+/// (Linux `max_frame_size`: 1500 + `VLAN_ETH_HLEN` + `ETH_FCS_LEN`).
+const MAX_FRAME: u32 = 1522;
 
 /// The MDIO address of the PHY on these chipsets.
 pub const PHY: u8 = 1;
 
-/// The receive packet buffer, in KiB (Linux `e1000e_reset`): 8 on ICH8,
-/// 10 on ICH9 and ICH10.
+/// The receive packet buffer, in KiB (Linux's `pba` in `e1000_ich8_info`
+/// and `e1000_ich9_info`): 8 on ICH8, 18 on ICH9 and ICH10.
 fn pba_kb(part: Part) -> u32 {
     if part == Part::Ich8 {
         8
     } else {
-        10
+        18
     }
 }
 
