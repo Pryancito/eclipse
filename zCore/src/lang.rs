@@ -159,6 +159,10 @@ fn alloc_error(layout: Layout) -> ! {
     // also stops the panic handler below from repainting a second time.
     claim_text_console();
 
+    // The panic at the end of this handler is a kernel OOM, and the oops path
+    // labels and treats it as one (see `crate::oom`).
+    crate::oom::note_oom_panic(kernel_hal::cpu::cpu_id() as usize);
+
     let heap_used = crate::memory::heap_used();
     let heap_total = crate::memory::heap_total();
 
@@ -212,6 +216,44 @@ fn alloc_error(layout: Layout) -> ! {
             ram_used >> 20,
             ram >> 20,
             ceiling >> 20,
+        ));
+        let (reserve_held, reserve_spent) = crate::memory::oom_reserve_status();
+        emit(format_args!(
+            "OOM reserve: {}, spent {} time(s); OOM kills requested {}{}\n",
+            if reserve_held { "held" } else { "SPENT" },
+            reserve_spent,
+            crate::oom::kills_requested(),
+            if crate::oom::panic_on_oom() {
+                "; PANICONOOM=1"
+            } else {
+                ""
+            },
+        ));
+    }
+    // Coroutine stacks: each one in the heap is a 4 MiB block, and on
+    // 2026-11-22 426 of them held the heap at its ceiling. Where they came
+    // from and where the missing ones went, in one line.
+    #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+    {
+        let st = kernel_hal::kstats::stack_blocks();
+        let v = kernel_hal::kstats::vmap_stack_detail();
+        emit(format_args!(
+            "stacks: {} in heap (~{} MiB), vmap {} {}/{} live, heap fallbacks: \
+             {} off/{} no slot/{} no frame; leaked: {} table/{} soft/{} claimed; \
+             {} pooled, {} in grace\n",
+            st.heap_blocks,
+            st.heap_blocks * 4,
+            v.window,
+            v.live,
+            v.slots,
+            v.not_ready,
+            v.no_slot,
+            v.no_frame,
+            st.table_full,
+            st.soft,
+            st.claimed_at_drop,
+            st.pooled,
+            st.retired_waiting,
         ));
     }
     // A refusal from the heap re-entrancy guard reaches this handler as a null
@@ -1715,7 +1757,14 @@ fn panic(info: &PanicInfo) -> ! {
     // coroutine and will not return, so a fault *inside* containment is still
     // caught as the re-entry it is.
     if !cfg!(feature = "baremetal-test") {
-        crate::oops::try_contain("kernel panic", Some(prev_kd));
+        // A panic the `#[alloc_error_handler]` raised is a kernel OOM, and is
+        // reported and contained as one (`crate::oom`), not as a bug.
+        let what = if crate::oom::take_oom_panic(kernel_hal::cpu::cpu_id() as usize) {
+            crate::oops::OOM_LABEL
+        } else {
+            "kernel panic"
+        };
+        crate::oops::try_contain(what, Some(prev_kd));
     }
 
     panic_halt()

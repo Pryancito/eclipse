@@ -70,9 +70,9 @@ pub use executor::{
     poison_bound_counts, set_stack_alloc_hooks, set_stack_dirty_depth_hook, set_stack_guard_hooks,
     set_stack_mark_clean_hook, set_stack_quarantine_enabled, set_stack_quarantine_hooks,
     soft_stack_retire_stats, spine_gen, spine_owner_of, spine_sample, spine_snapshot, spine_verify,
-    stack_guard_hooks_registered, stack_pool_stats, trim_idle_stacks, trimmed_stacks,
-    untracked_alloc_stacks, untracked_live_stacks, unwatched_spine_slots, SpineSmash, GUARD_SIZE,
-    STACK_SIZE, TOP_GUARD_SIZE,
+    stack_guard_hooks_registered, stack_leak_stats, stack_pool_stats, trim_idle_stacks,
+    trimmed_stacks, untracked_alloc_stacks, untracked_live_stacks, unwatched_spine_slots,
+    SpineSmash, StackLeakStats, GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE,
 };
 pub use runtime::{
     abandon_current_executor, abandon_current_task, abandon_executor_chain,

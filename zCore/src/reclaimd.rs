@@ -162,6 +162,30 @@ pub fn start() {
                     released / 1024
                 );
             }
+            // A kernel heap OOM the emergency reserve absorbed (see
+            // `crate::oom`): the allocator could not kill from where it was,
+            // so the kill is served here, first, before anything else gets a
+            // chance to allocate. Then, once the heap has room again, the
+            // reserve goes back where the next OOM can find it.
+            if crate::oom::take_kill_request() {
+                match linux_object::process::kill_worst("kernel heap exhausted") {
+                    Some(_) => {}
+                    None => log::warn!(
+                        "[oom] kernel heap exhausted: no process to kill (or the last \
+                         victim is still exiting)"
+                    ),
+                }
+            }
+            if crate::memory::rearm_oom_reserve() {
+                let (_, spent) = crate::memory::oom_reserve_status();
+                log::warn!(
+                    "[oom] kernel heap recovered ({} / {} MiB): emergency reserve re-armed \
+                     (spent {} time(s) this boot)",
+                    crate::memory::heap_used() >> 20,
+                    crate::memory::heap_total() >> 20,
+                    spent,
+                );
+            }
             let (used, total) = crate::memory::stats();
             let freed = pass(used, total);
             if out_of_memory(used, total, freed) {

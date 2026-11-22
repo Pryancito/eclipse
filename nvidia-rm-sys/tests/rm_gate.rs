@@ -56,6 +56,9 @@ const UNGATED: &[&str] = &[
     "hwflip_ready",
     "hwflip_pending",
     "hwflip_iso_builds",
+    // Clears the per-GPU "EDID read" flag on a hotplug (one C store, no RM
+    // call); the next `edid` takes the gate as before.
+    "edid_forget",
     // The cursor follows the mouse: a cursor that waits for a bring-up stage
     // is a cursor that stutters for eight seconds.
     "hwcursor_move",

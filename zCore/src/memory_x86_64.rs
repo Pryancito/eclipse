@@ -1442,7 +1442,7 @@ cfg_if! {
         /// The most the heap can reach from here: what it holds now, plus
         /// the RAM a growth ahead of demand may still take (everything but
         /// the quarter [`HEAP_LEAVE_FREE_PCT`] keeps for user pages), up to
-        /// [`HEAP_MAX_TOTAL`]. Never below what it holds.
+        /// [`heap_max_total`]. Never below what it holds.
         ///
         /// What the per-process kernel memory quota (`linux_object::kmem`)
         /// measures against: the heap's size now says nothing on a machine
@@ -1453,7 +1453,7 @@ cfg_if! {
             let room = ram
                 .saturating_sub(FRAMES_USED.get())
                 .saturating_sub(ram / 100 * HEAP_LEAVE_FREE_PCT);
-            total.saturating_add(room).min(HEAP_MAX_TOTAL).max(total)
+            total.saturating_add(room).min(heap_max_total()).max(total)
         }
 
         // ── Elastic heap ────────────────────────────────────────────────────
@@ -1474,7 +1474,40 @@ cfg_if! {
         /// Tried in order: see the fallback in `grow_heap_once`.
         const HEAP_GROW_CHUNKS: [usize; 3] =
             [32 * 1024 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024];
-        const HEAP_MAX_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+        /// The heap's ceiling never goes under this, however little RAM.
+        const HEAP_MAX_FLOOR: usize = 2 * 1024 * 1024 * 1024;
+        /// ... nor over this, however much. What the region registry is
+        /// sized for (the assertion below).
+        const HEAP_MAX_CAP: usize = 8 * 1024 * 1024 * 1024;
+        /// The ceiling is this share of RAM, between the two bounds.
+        const HEAP_MAX_RAM_DIV: usize = 8;
+
+        /// The most the kernel heap may grow to: an eighth of RAM, never under
+        /// 2 GiB nor over 8 GiB.
+        ///
+        /// It was a flat 2 GiB, and on a 60 GiB desktop the heap hit it with
+        /// 9 of 60 GiB of RAM committed (2026-11-22: 426 coroutine stacks as
+        /// 4 MiB blocks held 1.7 GiB of it). Linux has no ceiling of its own
+        /// for slab at all; RAM is the ceiling. An eighth keeps the heap from
+        /// eating the RAM user pages need, and the watermarks in
+        /// `grow_heap_once` still keep a quarter free ahead of demand.
+        fn heap_max_total() -> usize {
+            heap_max_for_ram(TOTAL_MEMORY.load(Ordering::Relaxed))
+        }
+
+        /// [`heap_max_total`] for a machine with `ram` bytes. Pure.
+        pub(crate) const fn heap_max_for_ram(ram: usize) -> usize {
+            let share = ram / HEAP_MAX_RAM_DIV;
+            if share < HEAP_MAX_FLOOR {
+                HEAP_MAX_FLOOR
+            } else if share > HEAP_MAX_CAP {
+                HEAP_MAX_CAP
+            } else {
+                // Whole 2 MiB, the smallest growth chunk, so a growth never
+                // stops a fraction of a chunk short of the ceiling.
+                share & !(2 * 1024 * 1024 - 1)
+            }
+        }
         /// Growths one refused allocation may ask for before reclaim.
         const HEAP_GROW_RETRIES: usize = 4;
         // The wild-block registry must be able to hold every region this
@@ -1488,7 +1521,7 @@ cfg_if! {
         // rejects the other spelling.
         const _: () = assert!(
             heap_regions::MAX_REGIONS
-                > (HEAP_MAX_TOTAL - KERNEL_HEAP_SIZE)
+                > (HEAP_MAX_CAP - KERNEL_HEAP_SIZE)
                     / HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1]
         );
         /// Never take the machine's last quarter of RAM for the kernel heap:
@@ -1532,7 +1565,7 @@ cfg_if! {
                 why,
                 HEAP_GROW_REFUSAL_RAM_USED.load(Ordering::Relaxed),
                 TOTAL_MEMORY.load(Ordering::Relaxed),
-                HEAP_MAX_TOTAL,
+                heap_max_total(),
             )
         }
 
@@ -1734,7 +1767,8 @@ cfg_if! {
             if !HEAP_GROW_LOG {
                 let _ = used;
             }
-            if total >= HEAP_MAX_TOTAL {
+            let ceiling = heap_max_total();
+            if total >= ceiling {
                 note_grow_refusal(GROW_REFUSED_CEILING, FRAMES_USED.get());
                 if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
@@ -1788,7 +1822,7 @@ cfg_if! {
                 // The ceiling bounds the heap, not only where a growth may
                 // start: an exact-size growth for a big refused block could
                 // otherwise carry it past by that block.
-                if total + chunk > HEAP_MAX_TOTAL {
+                if total + chunk > ceiling {
                     capped = true;
                     continue;
                 }
@@ -2097,6 +2131,15 @@ cfg_if! {
                 KERNEL_HEAP_SIZE / 1024,
                 heap_start
             );
+            // The emergency reserve, taken while the arena is empty.
+            if arm_oom_reserve() {
+                crate::klog_info!(
+                    "memory: {} MiB OOM emergency reserve set aside",
+                    OOM_RESERVE_SIZE >> 20
+                );
+            } else {
+                crate::klog_info!("memory: could not set aside the OOM emergency reserve");
+            }
         }
 
         pub struct LockedHeap<const ORDER: usize>(Mutex<Heap<ORDER>>);
@@ -2536,6 +2579,126 @@ cfg_if! {
             }
         }
 
+        // ── Emergency reserve ──────────────────────────────────────────────
+        //
+        // Linux's memory reserves: a block of heap held back from everybody,
+        // given to the buddy only when an allocation has failed after growth,
+        // the caches and the shrinkers. That one allocation then succeeds and
+        // the kernel goes on, while `reclaimd` runs the OOM killer (see
+        // `crate::oom`). Without it the allocation fails, and a failed kernel
+        // allocation is a panic: an oops at best, and only when no kernel
+        // lock is held, which inside a syscall it usually is.
+
+        /// 16 MiB: one buddy block that, split, serves any request up to
+        /// 16 MiB -- a refused coroutine stack is a 4 MiB block, and the
+        /// largest request in the 2026-11-22 report was 4 MiB + 2 KiB, an
+        /// 8 MiB block.
+        const OOM_RESERVE_SIZE: usize = 16 * 1024 * 1024;
+        const OOM_RESERVE_LAYOUT: Layout = match Layout::from_size_align(OOM_RESERVE_SIZE, 4096) {
+            Ok(l) => l,
+            Err(_) => panic!("OOM reserve layout"),
+        };
+        /// The held block's address, or 0 while it is spent.
+        static OOM_RESERVE: AtomicUsize = AtomicUsize::new(0);
+        /// Times the reserve was given to the buddy, since boot.
+        static OOM_RESERVE_SPENT: AtomicUsize = AtomicUsize::new(0);
+
+        /// Take the reserve out of the buddy, if it is not held already.
+        /// Straight from the buddy, not through `GlobalAlloc`: it is not an
+        /// allocation anybody made, and the counters and trackers must not
+        /// show it as one. `true` when the reserve is held afterwards.
+        pub fn arm_oom_reserve() -> bool {
+            if OOM_RESERVE.load(Ordering::Acquire) != 0 {
+                return true;
+            }
+            if crate::oom::panic_on_oom() || HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                return false;
+            }
+            let Ok(block) = HEAP_ALLOCATOR.0.lock().alloc(OOM_RESERVE_LAYOUT) else {
+                return false;
+            };
+            let base = block.as_ptr() as usize;
+            if OOM_RESERVE
+                .compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // Somebody armed it meanwhile: give this one back.
+                HEAP_ALLOCATOR.0.lock().dealloc(block, OOM_RESERVE_LAYOUT);
+            }
+            true
+        }
+
+        /// Re-arm the reserve once the heap has clearly recovered: no kill
+        /// still pending, and room for four reserves on top of what is in
+        /// use, so that taking it back does not cause the next OOM by itself.
+        /// For `reclaimd`. Answers whether this call re-armed a spent one.
+        // `reclaimd` is `linux` only: a zircon kernel keeps the boot reserve
+        // and never re-arms it.
+        #[cfg_attr(not(feature = "linux"), allow(dead_code))]
+        pub fn rearm_oom_reserve() -> bool {
+            if OOM_RESERVE.load(Ordering::Acquire) != 0 || crate::oom::kill_pending() {
+                return false;
+            }
+            if heap_used().saturating_add(4 * OOM_RESERVE_SIZE) > heap_max_total() {
+                return false;
+            }
+            arm_oom_reserve() && OOM_RESERVE_SPENT.load(Ordering::Relaxed) > 0
+        }
+
+        /// `(held now, times spent since boot)`, for the OOM report.
+        pub fn oom_reserve_status() -> (bool, usize) {
+            (
+                OOM_RESERVE.load(Ordering::Acquire) != 0,
+                OOM_RESERVE_SPENT.load(Ordering::Relaxed),
+            )
+        }
+
+        /// Give the reserve to the buddy and try `layout` on it. Null if the
+        /// reserve was already spent or the request does not fit even so.
+        ///
+        /// Allocates nothing and prints only through the spin writer: it runs
+        /// on a heap that has just said no.
+        unsafe fn alloc_from_oom_reserve(layout: Layout) -> *mut u8 {
+            if crate::oom::panic_on_oom() || HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                return core::ptr::null_mut();
+            }
+            let base = OOM_RESERVE.swap(0, Ordering::AcqRel);
+            if base == 0 {
+                return core::ptr::null_mut();
+            }
+            let n = OOM_RESERVE_SPENT.fetch_add(1, Ordering::Relaxed) + 1;
+            // SAFETY: `arm_oom_reserve` took exactly this block, with this
+            // layout, from the buddy, and the swap above made it ours alone.
+            HEAP_ALLOCATOR
+                .0
+                .lock()
+                .dealloc(NonNull::new_unchecked(base as *mut u8), OOM_RESERVE_LAYOUT);
+            crate::oom::request_kill();
+            let p = HEAP_ALLOCATOR
+                .0
+                .lock()
+                .alloc(layout)
+                .ok()
+                .map_or(core::ptr::null_mut::<u8>(), |a| a.as_ptr());
+            let outcome = if p.is_null() {
+                "still did not fit"
+            } else {
+                "served"
+            };
+            kernel_hal::console::serial_write_fmt_spin(format_args!(
+                "\n[oom] kernel heap exhausted ({} / {} MiB, ceiling {} MiB): emergency reserve \
+                 released for a {} byte allocation ({}, {} time(s) this boot); OOM killer \
+                 requested\n",
+                heap_used() >> 20,
+                heap_total() >> 20,
+                heap_max_total() >> 20,
+                layout.size(),
+                outcome,
+                n,
+            ));
+            p
+        }
+
         /// Ask the registered caches for memory and try `layout` once more.
         ///
         /// A null answer means the caches had nothing to give, or gave it and
@@ -2695,6 +2858,14 @@ cfg_if! {
                 } else {
                     p
                 };
+                // Everything else has failed: the emergency reserve, then the
+                // OOM killer (see `crate::oom`). Before this the next stop
+                // was `alloc_error`, a panic.
+                let p = if p.is_null() {
+                    alloc_from_oom_reserve(ext)
+                } else {
+                    p
+                };
                 if !p.is_null() {
                     // [diag] Double-alloc tripwire. Every crash zeroes a live
                     // coroutine stack; if the buddy hands out a block that
@@ -2824,6 +2995,16 @@ cfg_if! {
         }
     } else {
         pub fn init() {}
+
+        #[allow(dead_code)]
+        pub fn rearm_oom_reserve() -> bool {
+            false
+        }
+
+        #[allow(dead_code)]
+        pub fn oom_reserve_status() -> (bool, usize) {
+            (false, 0)
+        }
 
         pub fn heap_total() -> usize {
             0

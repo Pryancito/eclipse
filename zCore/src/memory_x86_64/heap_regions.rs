@@ -17,7 +17,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// At three words a region this is 24 KiB of `.bss`, which is the
 /// cheapest part of the bargain.
-pub const MAX_REGIONS: usize = 1024;
+///
+/// 4608 since the ceiling follows RAM up to 8 GiB: (8 GiB - 512 MiB) / 2 MiB
+/// is 3840 growths, plus the arena, plus room. 108 KiB of `.bss`.
+pub const MAX_REGIONS: usize = 4608;
 
 static STARTS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
 static ENDS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];

@@ -47,10 +47,62 @@ static LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// The failures split by cause, for the OOM report: every one of them is a
+/// stack that went to the kernel heap as a 4 MiB block instead.
+static FAILED_NOT_READY: AtomicUsize = AtomicUsize::new(0);
+static FAILED_NO_SLOT: AtomicUsize = AtomicUsize::new(0);
+static FAILED_NO_FRAME: AtomicUsize = AtomicUsize::new(0);
+/// Why [`init`] left the window off, as one of the `INIT_*` codes.
+static INIT_STATE: AtomicUsize = AtomicUsize::new(INIT_NOT_RUN);
+const INIT_NOT_RUN: usize = 0;
+const INIT_OK: usize = 1;
+const INIT_NO_SLOTS: usize = 2;
+const INIT_WRONG_TABLE: usize = 3;
+const INIT_ALREADY_MAPPED: usize = 4;
+const INIT_NO_FRAME: usize = 5;
+const INIT_MAP_FAILED: usize = 6;
 
 /// `(stacks mapped now, allocations that found no frame or no slot)`.
 pub fn stats() -> (usize, usize) {
     (LIVE.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
+}
+
+/// Everything the OOM report needs to say why stacks ended up in the heap.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Detail {
+    /// What [`init`] made of the window.
+    pub window: &'static str,
+    /// Stacks mapped in the window now.
+    pub live: usize,
+    /// Slots in the window.
+    pub slots: usize,
+    /// Refusals because the window was off.
+    pub not_ready: usize,
+    /// Refusals because every slot was taken.
+    pub no_slot: usize,
+    /// Refusals because a frame could not be had or mapped.
+    pub no_frame: usize,
+}
+
+/// See [`Detail`]. Allocates nothing.
+pub fn detail() -> Detail {
+    let window = match INIT_STATE.load(Ordering::Relaxed) {
+        INIT_OK => "on",
+        INIT_NO_SLOTS => "off (no slots on this arch)",
+        INIT_WRONG_TABLE => "off (init not on the kernel page table)",
+        INIT_ALREADY_MAPPED => "off (its PML4 slot was already mapped)",
+        INIT_NO_FRAME => "off (no frame to build it)",
+        INIT_MAP_FAILED => "off (could not build its tables)",
+        _ => "off (init never ran)",
+    };
+    Detail {
+        window,
+        live: LIVE.load(Ordering::Relaxed),
+        slots: SLOTS,
+        not_ready: FAILED_NOT_READY.load(Ordering::Relaxed),
+        no_slot: FAILED_NO_SLOT.load(Ordering::Relaxed),
+        no_frame: FAILED_NO_FRAME.load(Ordering::Relaxed),
+    }
 }
 
 /// Whether `base` is a block [`alloc`] handed out (a slot's first byte).
@@ -94,9 +146,11 @@ fn flush_everywhere() {
 /// already taken or the tables cannot be made.
 pub fn init() {
     if SLOTS == 0 {
+        INIT_STATE.store(INIT_NO_SLOTS, Ordering::Relaxed);
         return;
     }
     if crate::vm::current_vmtoken() != crate::vm::kernel_vmtoken() {
+        INIT_STATE.store(INIT_WRONG_TABLE, Ordering::Relaxed);
         warn!("vmap_stack: not on the kernel's own page table, stacks stay in the heap");
         return;
     }
@@ -104,6 +158,7 @@ pub fn init() {
     // The entry must be ours alone: anything already mapped in the window
     // means another user of this top-level slot.
     if pt.query(VMAP_STACK_LO as usize).is_ok() {
+        INIT_STATE.store(INIT_ALREADY_MAPPED, Ordering::Relaxed);
         warn!(
             "vmap_stack: {:#x} is already mapped, stacks stay in the heap",
             VMAP_STACK_LO
@@ -115,6 +170,7 @@ pub fn init() {
     // been cloned yet; the tables under them are shared by construction, so
     // what `alloc` adds later needs no copying anywhere.
     let Some(frame) = PhysFrame::new() else {
+        INIT_STATE.store(INIT_NO_FRAME, Ordering::Relaxed);
         warn!("vmap_stack: no frame to build the window, stacks stay in the heap");
         return;
     };
@@ -128,6 +184,7 @@ pub fn init() {
             .is_err()
             || pt.unmap_no_shootdown(va).is_err()
         {
+            INIT_STATE.store(INIT_MAP_FAILED, Ordering::Relaxed);
             warn!("vmap_stack: could not build the window, stacks stay in the heap");
             flush_everywhere();
             return;
@@ -136,6 +193,7 @@ pub fn init() {
     flush_everywhere();
     drop(frame);
     READY.store(true, Ordering::Release);
+    INIT_STATE.store(INIT_OK, Ordering::Relaxed);
     info!(
         "vmap_stack: {} coroutine-stack slots of {} KiB at {:#x}",
         SLOTS,
@@ -195,11 +253,27 @@ fn unmap_range(pt: &mut PageTable, base: usize, mapped: usize) {
 /// A block of `size` bytes, page-aligned and mapped read-write, in a slot of
 /// the window, or `None` (no window, no slot, or no frames).
 pub fn alloc(size: usize) -> Option<usize> {
-    if !READY.load(Ordering::Acquire) || size == 0 || size > SLOT {
+    if size == 0 || size > SLOT {
+        return None;
+    }
+    if !READY.load(Ordering::Acquire) {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+        FAILED_NOT_READY.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let Some(slot) = take_slot() else {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        if FAILED_NO_SLOT.fetch_add(1, Ordering::Relaxed) == 0 {
+            // Once: from here every new stack is a 4 MiB heap block, and the
+            // heap has a ceiling. 2048 slots is far past any live peak, so
+            // reaching it means stacks are being leaked, not used.
+            warn!(
+                "vmap_stack: all {} slots taken ({} live) -- new coroutine stacks fall back \
+                 to the kernel heap; stacks are probably leaking (see /proc/perf/kernel)",
+                SLOTS,
+                LIVE.load(Ordering::Relaxed),
+            );
+        }
         return None;
     };
     let base = VMAP_STACK_LO as usize + slot * SLOT;
@@ -227,6 +301,7 @@ pub fn alloc(size: usize) -> Option<usize> {
         flush_everywhere();
         give_slot(slot);
         FAILED.fetch_add(1, Ordering::Relaxed);
+        FAILED_NO_FRAME.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     drop(guard);
