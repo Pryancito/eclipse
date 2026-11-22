@@ -22,6 +22,7 @@
 #      DEST=/usr/local
 #      OLLAMA_SERVICE=0  do not write the init service
 #      SERVICE_DIR=/etc/eclipse/services
+#      WAYLAND_SOCKET=/run/user/0/wayland-0  socket the service waits for
 set -eu
 
 SERVICE_ONLY=0
@@ -75,6 +76,14 @@ trap cleanup EXIT
 # next boot. eclipse-ollama picks the cuda_v* runner (init has no env key to
 # set OLLAMA_LLM_LIBRARY), but it looks in /usr/local, so any other DEST runs
 # the binary directly. A respawn service: `killall ollama` gets it restarted.
+#
+# Ordered after labwc and gated on its Wayland socket, so ollama (1.4 GiB of
+# CUDA runners paging in, GPU context creation) does not compete with the
+# compositor's own GPU bring-up. `after =` only orders labwc's fork, hence the
+# `wait_socket =` too. No `requires =`/`desktop =`: ollama is not part of the
+# session, so under Xorg or a console boot (no labwc) init ignores the missing
+# dep and the bounded socket wait times out, and ollama starts anyway.
+WAYLAND_SOCKET=${WAYLAND_SOCKET:-/run/user/0/wayland-0}
 write_service() {
   exec_line="$BIN serve"
   if [ "$BIN" = /usr/local/bin/ollama ] && [ -x /usr/bin/eclipse-ollama ]; then
@@ -99,12 +108,15 @@ write_service() {
 # starting it at boot (OLLAMA_SERVICE=0 install-ollama-cuda skips writing it).
 exec = $exec_line
 type = respawn
+after = labwc
+wait_socket = $WAYLAND_SOCKET
 log = /tmp/ollama.log
 EOF
   mv -f "$svc.tmp" "$svc"
   echo "Init service: $svc"
   echo "  exec = $exec_line"
-  echo "  Starts ollama serve at boot; init restarts it if it dies."
+  echo "  Starts ollama serve at boot, after labwc and its Wayland socket"
+  echo "  ($WAYLAND_SOCKET); init restarts it if it dies."
   echo "  Log: /tmp/ollama.log"
   if [ "$fresh" = 1 ]; then
     echo "Init reads it at the next boot. To start serve now:"
