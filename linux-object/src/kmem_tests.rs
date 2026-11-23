@@ -368,6 +368,40 @@ mod queues {
     }
 
     #[test]
+    fn record_locks_are_charged_to_their_taker_and_a_split_needs_room() {
+        use crate::fs::record_lock::{release_description, setlk, LockRequest, HELD_COST};
+        as_a_process_limited_to(45_208, 2 * HELD_COST, |acct| {
+            let key = (usize::MAX - 3, 1);
+            let r = |exclusive, start, end| LockRequest {
+                exclusive,
+                start,
+                end,
+                owner: 0xF10C,
+                ofd: true,
+            };
+            assert_eq!(setlk(key, &r(true, 0, 10), false), Ok(true));
+            assert_eq!(charged(acct), HELD_COST);
+            // Every other byte: one more lock fits, the next is ENOLCK.
+            assert_eq!(setlk(key, &r(true, 20, 30), false), Ok(true));
+            assert_eq!(
+                setlk(key, &r(true, 40, 50), false),
+                Err(crate::error::LxError::ENOLCK)
+            );
+            // A hole needs a lock for the far piece, and leaves both as they were.
+            assert_eq!(
+                setlk(key, &r(true, 4, 6), true),
+                Err(crate::error::LxError::ENOLCK)
+            );
+            assert_eq!(charged(acct), 2 * HELD_COST);
+            // Filling the gap merges all into one, and gives a lock back.
+            assert_eq!(setlk(key, &r(true, 10, 20), false), Ok(true));
+            assert_eq!(charged(acct), HELD_COST);
+            release_description(0xF10C);
+            assert_eq!(charged(acct), 0);
+        });
+    }
+
+    #[test]
     fn a_property_blob_is_charged_to_its_maker_until_it_goes() {
         use crate::fs::devfs::drm;
         let cost = crate::fs::devfs::drm_scheme::blob_cost(64);

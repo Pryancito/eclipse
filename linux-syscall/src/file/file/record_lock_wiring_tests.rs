@@ -154,7 +154,7 @@ fn somebody_else_holds(key: record_lock::FileKey, owner: KoID, exclusive: bool, 
         ofd: false,
     };
     assert!(
-        record_lock::setlk(key, &req, false),
+        record_lock::setlk(key, &req, false).unwrap(),
         "the other process could not take [{}, {})",
         range.0,
         range.1
