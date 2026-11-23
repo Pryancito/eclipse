@@ -220,7 +220,7 @@ fn maps_names_the_heap_and_the_stack() {
         ..ImageLayout::default()
     }));
     proc.linux().set_brk(heap + 0x2010);
-    let maps = proc_pid_maps(&proc);
+    let maps = proc_pid_maps(&proc).unwrap();
     let name_of = |at: usize| {
         let line = maps
             .lines()
