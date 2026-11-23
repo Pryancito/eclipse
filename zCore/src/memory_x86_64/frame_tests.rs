@@ -13,7 +13,7 @@ const PAGE: usize = 1 << PAGE_BITS;
 /// failed on exactly that, which is the per-CPU lists working as intended
 /// and the fixture not knowing about them.
 #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
-fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
+pub(super) fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
     static GUARD: spin::Mutex<()> = spin::Mutex::new(());
     let guard = GUARD.lock();
     frame_drain_percpu();

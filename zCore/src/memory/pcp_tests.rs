@@ -11,13 +11,11 @@ use super::*;
 const PAGE: usize = 1 << PAGE_BITS;
 
 /// The bitmap and the lists are both `static`s; serialise, and start from
-/// empty lists.
+/// empty lists. The turnstile is the frame tests' own: with one each, a
+/// frame test and a per-CPU test ran at once and took each other's frames.
 #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
 fn alone() -> spin::MutexGuard<'static, ()> {
-    static GUARD: spin::Mutex<()> = spin::Mutex::new(());
-    let guard = GUARD.lock();
-    frame_drain_percpu();
-    guard
+    super::frame_tests::alone_with_the_allocator()
 }
 
 // --- the list itself -----------------------------------------------------
