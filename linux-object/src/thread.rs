@@ -1,6 +1,6 @@
 //! Linux Thread
 
-use crate::error::SysResult;
+use crate::error::{LxError, LxResult, SysResult};
 use crate::process::ProcessExt;
 use crate::signal::queue::{QueueFull, Receiver, SigQueue};
 #[cfg(target_arch = "x86_64")]
@@ -10,7 +10,7 @@ use crate::sync::shared_futex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 use kernel_hal::context::{UserContext, UserContextField};
 use kernel_hal::sync::{Mutex, MutexGuard};
@@ -195,6 +195,88 @@ pub struct LinuxThreadExt {
     /// The thread's own kernel memory, [`THREAD_KMEM_COST`], charged to its
     /// process until the thread goes.
     _charge: crate::kmem::Charge,
+    /// The thread's place in [`LIVE_TASKS`].
+    _slot: TaskSlot,
+}
+
+/// Linux threads that exist, machine-wide: Linux's `nr_threads`.
+static LIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+/// Linux processes that exist, machine-wide, zombies included.
+static LIVE_PROCS: AtomicUsize = AtomicUsize::new(0);
+
+/// One count in [`LIVE_TASKS`], for as long as the thread lives.
+struct TaskSlot;
+
+impl TaskSlot {
+    fn take() -> Self {
+        LIVE_TASKS.fetch_add(1, Ordering::Relaxed);
+        TaskSlot
+    }
+}
+
+impl Drop for TaskSlot {
+    fn drop(&mut self) {
+        LIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One count in [`LIVE_PROCS`], for as long as the process object lives.
+pub struct ProcSlot(());
+
+impl ProcSlot {
+    /// Count one more process.
+    pub fn take() -> Self {
+        LIVE_PROCS.fetch_add(1, Ordering::Relaxed);
+        ProcSlot(())
+    }
+}
+
+impl Drop for ProcSlot {
+    fn drop(&mut self) {
+        LIVE_PROCS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `copy_process`'s `max_threads` test: `EAGAIN` once the machine has as
+/// many Linux threads, or as many processes, as
+/// `/proc/sys/kernel/threads-max` says, root included, as in Linux.
+///
+/// The per-process kmem quota stops one process; it does not stop a fork
+/// bomb, whose every process is small. In QEMU (2 GiB) about 19,000 of them
+/// filled the kernel heap at ~27 KiB each while user pages held all RAM, so
+/// the heap could not grow and the next allocation in `fork` ended the
+/// machine. Linux's own cap, an eighth of RAM in 16 KiB stacks, is ~7,700
+/// there. Processes are counted apart from threads because a zombie has no
+/// thread left and keeps its kernel objects until it is reaped, and an OOM
+/// killer that kills the children of a bomb that never waits makes nothing
+/// but zombies; Linux counts a zombie in `nr_threads` until `release_task`.
+/// Read without a lock, as Linux does: two forks racing may both get the
+/// last place.
+pub fn may_add_task() -> LxResult {
+    let memory = kernel_hal::mem::memory_usage().1;
+    if memory == 0 {
+        // A HAL that does not know its memory (libos) has no cap to hold.
+        return Ok(());
+    }
+    let max = crate::process::max_threads(memory);
+    let threads = LIVE_TASKS.load(Ordering::Relaxed) as u64;
+    let procs = LIVE_PROCS.load(Ordering::Relaxed) as u64;
+    if threads >= max || procs >= max {
+        warn!(
+            "fork: threads-max ({}) reached: {} threads, {} processes",
+            max, threads, procs
+        );
+        return Err(LxError::EAGAIN);
+    }
+    Ok(())
+}
+
+/// [`LIVE_TASKS`] and [`LIVE_PROCS`], for the tests.
+pub fn live_tasks() -> (usize, usize) {
+    (
+        LIVE_TASKS.load(Ordering::Relaxed),
+        LIVE_PROCS.load(Ordering::Relaxed),
+    )
 }
 
 /// What a thread costs the kernel's heap besides its stack, as charged to
@@ -228,6 +310,7 @@ impl LinuxThreadExt {
             inner: Mutex::new(linux),
             waiter: Mutex::new(None),
             _charge: crate::kmem::Charge::none(),
+            _slot: TaskSlot::take(),
         }
     }
 

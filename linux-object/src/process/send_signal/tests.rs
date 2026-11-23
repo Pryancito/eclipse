@@ -200,3 +200,11 @@ fn a_dying_forked_child_gives_back_what_waited_on_it() {
     child.exit(0);
     assert_eq!(queued_for_user(51_108), 0);
 }
+
+#[test]
+fn max_threads_is_an_eighth_of_memory_in_16_kib_stacks() {
+    const GIB: usize = 1 << 30;
+    assert_eq!(max_threads(16 * GIB), 131_072);
+    assert_eq!(max_threads(967 << 20), 7_736);
+    assert_eq!(max_threads(0), 20);
+}

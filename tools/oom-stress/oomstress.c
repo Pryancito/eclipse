@@ -652,8 +652,9 @@ static int case_sysv(void) {
     /* Segments stay attached and are marked for removal at once, so whatever
      * kills this process (the OOM killer, the deadline) takes them with it:
      * an unattached segment outlives everyone and holds the memory until the
-     * next boot. Bounded by what is available, or ARG MiB. */
-    long cap = arg_n ? arg_n / 4 : meminfo("MemAvailable") / 4096;
+     * next boot. Bounded by half of what is available (all of it is the OOM killer's
+     * case, not this one), or ARG MiB. */
+    long cap = arg_n ? arg_n / 4 : meminfo("MemAvailable") / 4096 / 2;
     if (cap > 4096 || cap <= 0) cap = 4096;
     while (segs < cap) {
         int s = shmget(IPC_PRIVATE, 4 * MIB, 0600);

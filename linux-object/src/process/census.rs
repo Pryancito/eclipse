@@ -222,7 +222,11 @@ impl LinuxProcess {
     /// costs a census per `fork`, `clone` and `pthread_create`. The census is
     /// taken before the task exists, so two of them racing can both get the
     /// last one (Linux charges first and tests after, atomically).
+    ///
+    /// The machine-wide `threads-max` comes first and holds root too
+    /// ([`crate::thread::may_add_task`]).
     pub fn may_start_task(&self) -> LxResult {
+        crate::thread::may_add_task()?;
         let limit = self
             .rlimit(RLIMIT_NPROC, None, false)
             .map_or(RLIM_INFINITY, |limit| limit.cur);

@@ -2297,7 +2297,10 @@ fn proc_sys_ngroups_max_content() -> String {
 }
 
 fn proc_sys_threads_max_content() -> String {
-    String::from("65536\n")
+    format!(
+        "{}\n",
+        crate::process::max_threads(kernel_hal::mem::memory_usage().1)
+    )
 }
 
 /// The UID/GID substituted for one that does not fit the caller's view of a
