@@ -156,7 +156,8 @@ impl FreeSet {
         Some(found)
     }
 
-    /// Whether the block at `x` is in the set.
+    /// Whether the block at `x` is in the set, for the tests.
+    #[cfg(test)]
     pub fn contains(&self, x: usize) -> bool {
         // SAFETY: as in `remove`.
         unsafe {
@@ -173,12 +174,6 @@ impl FreeSet {
             }
             false
         }
-    }
-
-    /// Every block of the set, lowest address first.
-    pub fn for_each(&self, mut f: impl FnMut(usize)) {
-        // SAFETY: as in `remove`.
-        unsafe { visit(self.root, &mut f) }
     }
 
     /// Depth of the deepest node, for the tests.
@@ -206,7 +201,7 @@ unsafe fn split(mut t: usize, x: usize) -> (usize, usize) {
         // second time would make the tree a cycle and every later walk of
         // this class endless; better to stop here, where the culprit is on
         // the stack.
-        assert!(t != x, "buddy: the block at {x:#x} is freed twice");
+        assert!(t != x, "buddy: the block at {:#x} is freed twice", x);
         if t < x {
             *lt = t;
             lt = addr_of_mut!((*node(t)).right);
@@ -259,12 +254,4 @@ unsafe fn first_where(t: usize, accept: &mut impl FnMut(usize) -> bool) -> Optio
         return Some(t);
     }
     first_where((*node(t)).right, accept)
-}
-
-unsafe fn visit(t: usize, f: &mut impl FnMut(usize)) {
-    if t != 0 {
-        visit((*node(t)).left, f);
-        f(t);
-        visit((*node(t)).right, f);
-    }
 }

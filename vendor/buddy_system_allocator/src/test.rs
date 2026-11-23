@@ -275,7 +275,7 @@ fn the_higher_region_is_used_first_and_the_lower_given_back_whole() {
     let l = Layout::from_size_align(256, 8).unwrap();
     for _ in 0..SIZE / 256 / 2 {
         let p = heap.alloc(l).unwrap().as_ptr() as usize;
-        assert!(p >= high, "{p:#x} came from the lower region");
+        assert!(p >= high, "{:#x} came from the lower region", p);
     }
     assert_eq!(
         heap.take_free_block(SIZE, |a, _| a < high),
