@@ -233,3 +233,39 @@ fn reserving_the_boot_page_tables_is_a_no_op_without_paging() {
     );
     reserve_active_page_table_frames();
 }
+
+/// What the heap gives back goes to the bitmap whole: the next contiguous
+/// request, the heap's own growth ahead of demand among them, finds the
+/// run again. Freed a frame at a time, its first frames stayed parked on
+/// this CPU's list, out of the bitmap's sight.
+#[test]
+fn a_run_given_back_whole_can_be_taken_whole_again() {
+    let _alone = alone_with_the_allocator();
+    let base = 0x200_0000;
+    insert_regions(&[base..base + 64 * PAGE]);
+    let used_before = frame_stats().0;
+    let run = frame_alloc(64, 6).expect("the whole region, aligned to itself");
+    assert_eq!(run, base);
+    assert_eq!(frame_stats().0 - used_before, 64 * PAGE);
+    frame_dealloc_run(run, 64);
+    assert_eq!(frame_stats().0, used_before);
+    assert_eq!(
+        frame_alloc_quiet(64, 6),
+        Some(base),
+        "the bitmap has the run back"
+    );
+    frame_dealloc_run(base, 64);
+}
+
+/// A frame of the run that is already free is a double free.
+#[cfg(not(feature = "mem-debug"))]
+#[test]
+#[should_panic(expected = "already free")]
+fn giving_back_a_run_twice_is_a_double_free() {
+    let _alone = alone_with_the_allocator();
+    let base = 0x300_0000;
+    insert_regions(&[base..base + 4 * PAGE]);
+    let run = frame_alloc(4, 2).expect("four frames");
+    frame_dealloc_run(run, 4);
+    frame_dealloc_run(run, 4);
+}

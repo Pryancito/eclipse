@@ -21,6 +21,7 @@ use core::ptr::NonNull;
 use spin::Mutex;
 
 mod frame;
+mod free_set;
 pub mod linked_list;
 #[cfg(test)]
 mod test;
@@ -42,13 +43,15 @@ pub use frame::*;
 /// # let size: usize = 100 * size_of::<usize>();
 /// unsafe {
 ///     heap.init(begin, size);
-///     // or
-///     heap.add_to_heap(begin, end);
+///     // or, the same range given by its ends (never both: a range
+///     // added twice is a double free of every block in it):
+///     // heap.add_to_heap(begin, end);
 /// }
 /// ```
 pub struct Heap<const ORDER: usize> {
-    // buddy system with max order of `ORDER`
-    free_list: [linked_list::LinkedList; ORDER],
+    // buddy system with max order of `ORDER`: one address-ordered set of free
+    // blocks per class (see `free_set`)
+    free_list: [free_set::FreeSet; ORDER],
 
     // statistics
     user: usize,
@@ -56,11 +59,27 @@ pub struct Heap<const ORDER: usize> {
     total: usize,
 }
 
+/// The smallest block: a free block holds its two tree links.
+pub const MIN_BLOCK: usize = free_set::NODE_SIZE;
+
+/// The block `layout` takes: a power of two, at least its size, its alignment
+/// and [`MIN_BLOCK`].
+pub const fn block_size(layout: Layout) -> usize {
+    let mut size = layout.size().next_power_of_two();
+    if layout.align() > size {
+        size = layout.align();
+    }
+    if MIN_BLOCK > size {
+        size = MIN_BLOCK;
+    }
+    size
+}
+
 impl<const ORDER: usize> Heap<ORDER> {
     /// Create an empty heap
     pub const fn new() -> Self {
         Heap {
-            free_list: [linked_list::LinkedList::new(); ORDER],
+            free_list: [free_set::FreeSet::new(); ORDER],
             user: 0,
             allocated: 0,
             total: 0,
@@ -74,20 +93,20 @@ impl<const ORDER: usize> Heap<ORDER> {
 
     /// Add a range of memory [start, end) to the heap
     pub unsafe fn add_to_heap(&mut self, mut start: usize, mut end: usize) {
-        // avoid unaligned access on some platforms
-        start = (start + size_of::<usize>() - 1) & (!size_of::<usize>() + 1);
-        end = end & (!size_of::<usize>() + 1);
+        // Whole smallest blocks only: each must hold its node.
+        start = (start + MIN_BLOCK - 1) & !(MIN_BLOCK - 1);
+        end &= !(MIN_BLOCK - 1);
         assert!(start <= end);
 
         let mut total = 0;
         let mut current_start = start;
 
-        while current_start + size_of::<usize>() <= end {
+        while current_start + MIN_BLOCK <= end {
             let lowbit = current_start & (!current_start + 1);
             let size = min(lowbit, prev_power_of_two(end - current_start));
             total += size;
 
-            self.free_list[size.trailing_zeros() as usize].push(current_start as *mut usize);
+            self.free_list[size.trailing_zeros() as usize].insert(current_start);
             current_start += size;
         }
 
@@ -100,41 +119,31 @@ impl<const ORDER: usize> Heap<ORDER> {
     }
 
     /// Alloc a range of memory from the heap satifying `layout` requirements
+    ///
+    /// From the smallest class that has a free block, and of that class the
+    /// block with the highest address; split, the block keeps its top half
+    /// and frees the bottom one. Live blocks gather at the top of the heap
+    /// and free space at the bottom, where it can merge back into large
+    /// blocks. In the Eclipse kernel the static arena is the highest memory
+    /// the heap has, above every region it grows into, so this also uses the
+    /// arena before any growth and leaves a growth whole for as long as it
+    /// can, ready to be given back.
     pub fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ()> {
-        let size = max(
-            layout.size().next_power_of_two(),
-            max(layout.align(), size_of::<usize>()),
-        );
+        let size = block_size(layout);
         let class = size.trailing_zeros() as usize;
         for i in class..self.free_list.len() {
             // Find the first non-empty size class
-            if !self.free_list[i].is_empty() {
+            if let Some(mut block) = self.free_list[i].pop_highest() {
                 // Split buffers
                 for j in (class + 1..i + 1).rev() {
-                    if let Some(block) = self.free_list[j].pop() {
-                        unsafe {
-                            self.free_list[j - 1]
-                                .push((block as usize + (1 << (j - 1))) as *mut usize);
-                            self.free_list[j - 1].push(block);
-                        }
-                    } else {
-                        return Err(());
-                    }
+                    // SAFETY: the bottom half is free memory of the heap,
+                    // aligned to its size, which is at least `MIN_BLOCK`.
+                    unsafe { self.free_list[j - 1].insert(block) };
+                    block += 1 << (j - 1);
                 }
-
-                let result = NonNull::new(
-                    self.free_list[class]
-                        .pop()
-                        .expect("current block should have free space now")
-                        as *mut u8,
-                );
-                if let Some(result) = result {
-                    self.user += layout.size();
-                    self.allocated += size;
-                    return Ok(result);
-                } else {
-                    return Err(());
-                }
+                self.user += layout.size();
+                self.allocated += size;
+                return NonNull::new(block as *mut u8).ok_or(());
             }
         }
         Err(())
@@ -142,41 +151,24 @@ impl<const ORDER: usize> Heap<ORDER> {
 
     /// Dealloc a range of memory from the heap
     pub fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
-        let size = max(
-            layout.size().next_power_of_two(),
-            max(layout.align(), size_of::<usize>()),
-        );
+        let size = block_size(layout);
         let class = size.trailing_zeros() as usize;
 
-        unsafe {
-            // Put back into free list
-            self.free_list[class].push(ptr.as_ptr() as *mut usize);
-
-            // Merge free buddy lists
-            let mut current_ptr = ptr.as_ptr() as usize;
-            let mut current_class = class;
-            while current_class < self.free_list.len() {
-                let buddy = current_ptr ^ (1 << current_class);
-                let mut flag = false;
-                for block in self.free_list[current_class].iter_mut() {
-                    if block.value() as usize == buddy {
-                        block.pop();
-                        flag = true;
-                        break;
-                    }
-                }
-
-                // Free buddy found
-                if flag {
-                    self.free_list[current_class].pop();
-                    current_ptr = min(current_ptr, buddy);
-                    current_class += 1;
-                    self.free_list[current_class].push(current_ptr as *mut usize);
-                } else {
-                    break;
-                }
+        // Merge with the buddy while it is free: one search of its class's
+        // set per level, not a walk of the class.
+        let mut current_ptr = ptr.as_ptr() as usize;
+        let mut current_class = class;
+        while current_class + 1 < self.free_list.len() {
+            let buddy = current_ptr ^ (1 << current_class);
+            if !self.free_list[current_class].remove(buddy) {
+                break;
             }
+            current_ptr = min(current_ptr, buddy);
+            current_class += 1;
         }
+        // SAFETY: the caller frees a block this heap handed out, so its bytes,
+        // and its free buddies' that were merged into it, are the heap's.
+        unsafe { self.free_list[current_class].insert(current_ptr) };
 
         self.user -= layout.size();
         self.allocated -= size;
@@ -196,28 +188,42 @@ impl<const ORDER: usize> Heap<ORDER> {
     /// buddy in the free lists. The caller now owns the block's memory.
     ///
     /// Searches the largest classes first, so the call gives back as much as
-    /// it can, and visits only classes of `min_size` and up. Those lists are
-    /// short: a large free block means a large stretch of nothing in use.
+    /// it can, and visits only classes of `min_size` and up. Within a class,
+    /// the lowest address first: the end of the heap `alloc` keeps away from.
     pub fn take_free_block(
         &mut self,
         min_size: usize,
         mut accept: impl FnMut(usize, usize) -> bool,
     ) -> Option<(usize, usize)> {
-        let min_class = max(min_size, size_of::<usize>())
+        let min_class = max(min_size, MIN_BLOCK)
             .next_power_of_two()
             .trailing_zeros() as usize;
         for class in (min_class..self.free_list.len()).rev() {
             let size = 1usize << class;
-            for block in self.free_list[class].iter_mut() {
-                let addr = block.value() as usize;
-                if accept(addr, size) {
-                    block.pop();
-                    self.total -= size;
-                    return Some((addr, size));
-                }
+            if let Some(addr) = self.free_list[class].take_lowest_where(|a| accept(a, size)) {
+                self.total -= size;
+                return Some((addr, size));
             }
         }
         None
+    }
+
+    /// Free blocks of each class: entry `i` counts the blocks of `1 << i`
+    /// bytes. Allocates nothing and walks nothing.
+    pub fn free_blocks(&self) -> [usize; ORDER] {
+        let mut out = [0; ORDER];
+        for (o, set) in out.iter_mut().zip(self.free_list.iter()) {
+            *o = set.len();
+        }
+        out
+    }
+
+    /// Bytes in the largest free block, 0 for none.
+    pub fn largest_free(&self) -> usize {
+        self.free_list
+            .iter()
+            .rposition(|s| !s.is_empty())
+            .map_or(0, |i| 1 << i)
     }
 
     /// Return the number of bytes that user requests
@@ -233,6 +239,18 @@ impl<const ORDER: usize> Heap<ORDER> {
     /// Return the total number of bytes in the heap
     pub fn stats_total_bytes(&self) -> usize {
         self.total
+    }
+
+    /// Whether the block of `size` bytes at `addr` is free, for the tests.
+    #[cfg(test)]
+    pub(crate) fn is_free(&self, addr: usize, size: usize) -> bool {
+        self.free_list[size.trailing_zeros() as usize].contains(addr)
+    }
+
+    /// The deepest set's depth, for the tests.
+    #[cfg(test)]
+    pub(crate) fn max_depth(&self) -> usize {
+        self.free_list.iter().map(|s| s.depth()).max().unwrap_or(0)
     }
 }
 
@@ -261,8 +279,8 @@ impl<const ORDER: usize> fmt::Debug for Heap<ORDER> {
 /// # let size: usize = 100 * size_of::<usize>();
 /// unsafe {
 ///     heap.lock().init(begin, size);
-///     // or
-///     heap.lock().add_to_heap(begin, end);
+///     // or, never both:
+///     // heap.lock().add_to_heap(begin, end);
 /// }
 /// ```
 #[cfg(feature = "use_spin")]
