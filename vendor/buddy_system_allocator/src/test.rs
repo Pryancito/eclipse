@@ -5,6 +5,7 @@ use crate::LockedHeapWithRescue;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 use core::mem::size_of;
+use core::ptr::NonNull;
 
 #[test]
 fn test_linked_list() {
@@ -204,4 +205,145 @@ fn take_free_block_asks_before_it_takes() {
     assert!(heap
         .alloc(Layout::from_size_align(65536, 8).unwrap())
         .is_ok());
+}
+
+/// A 1 MiB arena aligned to itself, leaked, for the tree tests.
+fn arena(size: usize) -> usize {
+    let layout = Layout::from_size_align(size, size).unwrap();
+    unsafe { std::alloc::alloc(layout) as usize }
+}
+
+/// The bug the address-ordered sets fix: freeing a block whose buddy is in
+/// use walked every free block of its class. Here 16 384 free 32-byte
+/// blocks whose buddies are live; each free must stay cheap and right.
+#[test]
+fn a_free_finds_its_buddy_without_walking_the_class() {
+    const SIZE: usize = 1 << 20;
+    let base = arena(SIZE);
+    let mut heap = Heap::<32>::new();
+    unsafe { heap.add_to_heap(base, base + SIZE) };
+    let l32 = Layout::from_size_align(32, 8).unwrap();
+    let blocks: std::vec::Vec<_> = (0..SIZE / 32).map(|_| heap.alloc(l32).unwrap()).collect();
+    assert!(heap.alloc(l32).is_err(), "the arena is full");
+    // Free every other block: none of them can merge.
+    for b in blocks.iter().step_by(2) {
+        heap.dealloc(*b, l32);
+    }
+    assert_eq!(heap.free_blocks()[5], SIZE / 64);
+    assert!(heap.max_depth() < 64, "depth {}", heap.max_depth());
+    // Now the rest: every free merges, all the way up.
+    for b in blocks.iter().skip(1).step_by(2) {
+        heap.dealloc(*b, l32);
+    }
+    assert_eq!(heap.largest_free(), SIZE);
+    assert_eq!(heap.free_blocks().iter().sum::<usize>(), 1);
+    assert_eq!(heap.stats_alloc_actual(), 0);
+}
+
+/// Allocations come from the highest free block, and a split keeps the top
+/// half: the bottom of the heap stays free in large blocks.
+#[test]
+fn allocations_pile_up_at_the_top() {
+    const SIZE: usize = 1 << 16;
+    let base = arena(SIZE);
+    let mut heap = Heap::<32>::new();
+    unsafe { heap.add_to_heap(base, base + SIZE) };
+    let l = Layout::from_size_align(64, 8).unwrap();
+    let a = heap.alloc(l).unwrap().as_ptr() as usize;
+    assert_eq!(a, base + SIZE - 64, "the topmost 64 bytes");
+    let b = heap.alloc(l).unwrap().as_ptr() as usize;
+    assert_eq!(b, base + SIZE - 128);
+    assert!(heap.is_free(base, SIZE / 2), "the bottom half is one free block");
+}
+
+/// Two regions: the higher one (the arena, in the kernel) fills first, and
+/// the lower one (a growth) is given back whole.
+#[test]
+fn the_higher_region_is_used_first_and_the_lower_given_back_whole() {
+    const SIZE: usize = 1 << 16;
+    let low = arena(SIZE);
+    let high = arena(SIZE);
+    let (low, high) = (low.min(high), low.max(high));
+    let mut heap = Heap::<32>::new();
+    unsafe {
+        heap.add_to_heap(high, high + SIZE);
+        heap.add_to_heap(low, low + SIZE);
+    }
+    let l = Layout::from_size_align(256, 8).unwrap();
+    for _ in 0..SIZE / 256 / 2 {
+        let p = heap.alloc(l).unwrap().as_ptr() as usize;
+        assert!(p >= high, "{p:#x} came from the lower region");
+    }
+    assert_eq!(
+        heap.take_free_block(SIZE, |a, _| a < high),
+        Some((low, SIZE)),
+        "the lower region is one free block"
+    );
+}
+
+/// The release looks at the lowest addresses first.
+#[test]
+fn take_free_block_gives_the_lowest_accepted_block() {
+    const SIZE: usize = 1 << 16;
+    let base = arena(SIZE);
+    let mut heap = Heap::<32>::new();
+    unsafe { heap.add_to_heap(base, base + SIZE) };
+    let l = Layout::from_size_align(4096, 4096).unwrap();
+    let all: std::vec::Vec<_> = (0..16).map(|_| heap.alloc(l).unwrap()).collect();
+    // Free blocks 3, 5 and 9: no two are buddies.
+    for i in [9, 3, 5] {
+        heap.dealloc(all[i], l);
+    }
+    let mut freed: std::vec::Vec<usize> = [3, 5, 9].iter().map(|&i| all[i].as_ptr() as usize).collect();
+    freed.sort();
+    assert_eq!(heap.take_free_block(4096, |_, _| true), Some((freed[0], 4096)));
+    assert_eq!(
+        heap.take_free_block(4096, |a, _| a != freed[1]),
+        Some((freed[2], 4096)),
+        "a refused block is skipped, not taken"
+    );
+    assert!(heap.is_free(freed[1], 4096));
+}
+
+/// Random churn against a model: every block handed out is inside the
+/// arena, aligned, and overlaps no other live block; at the end everything
+/// merges back into one block.
+#[test]
+fn random_churn_keeps_blocks_disjoint_and_merges_back() {
+    const SIZE: usize = 1 << 22;
+    let base = arena(SIZE);
+    let mut heap = Heap::<32>::new();
+    unsafe { heap.add_to_heap(base, base + SIZE) };
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut live: std::collections::BTreeMap<usize, (usize, Layout)> = Default::default();
+    for _ in 0..200_000 {
+        if live.len() < 4000 && rnd() % 3 != 0 {
+            let size = 1 + (rnd() as usize % (1 << (4 + rnd() % 12)));
+            let l = Layout::from_size_align(size, 8).unwrap();
+            if let Ok(p) = heap.alloc(l) {
+                let a = p.as_ptr() as usize;
+                let bs = crate::block_size(l);
+                assert!(a >= base && a + bs <= base + SIZE);
+                assert_eq!(a % bs, 0);
+                if let Some((&pa, &(ps, _))) = live.range(..a + bs).next_back() {
+                    assert!(pa + ps <= a, "overlap");
+                }
+                live.insert(a, (bs, l));
+            }
+        } else if let Some(&k) = live.keys().nth(rnd() as usize % live.len().max(1)) {
+            let (_, l) = live.remove(&k).unwrap();
+            heap.dealloc(NonNull::new(k as *mut u8).unwrap(), l);
+        }
+    }
+    for (k, (_, l)) in std::mem::take(&mut live) {
+        heap.dealloc(NonNull::new(k as *mut u8).unwrap(), l);
+    }
+    assert_eq!(heap.largest_free(), SIZE);
+    assert!(heap.max_depth() < 64);
 }

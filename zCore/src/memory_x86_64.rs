@@ -1778,12 +1778,11 @@ cfg_if! {
         /// cannot count on that, and `heap_regions::absorb` is what keeps the
         /// merged blocks freeable.)
         fn buddy_block_size(layout: Layout) -> usize {
-            layout
-                .size()
-                .next_power_of_two()
-                .max(layout.align())
-                .max(core::mem::size_of::<usize>())
+            buddy_system_allocator::block_size(layout)
         }
+        // The front cache rounds with its own copy of the formula (it is
+        // compiled for the host tests, where this crate is not linked).
+        const _: () = assert!(1 << free_lists::MIN_CLASS == buddy_system_allocator::MIN_BLOCK);
 
         /// The chunk sizes a growth tries, largest first, for a block of
         /// `need` bytes (`0`: any): the usual chunks that can hold such a
@@ -2046,6 +2045,27 @@ cfg_if! {
             heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual()).min(grown)
         }
 
+
+        /// Free blocks of each buddy class (entry `i`: blocks of `1 << i`
+        /// bytes), or `None` while the heap lock is busy. For `/proc/kheap`.
+        pub fn heap_free_blocks() -> Option<[usize; ORDER]> {
+            HEAP_ALLOCATOR.0.try_lock().map(|h| h.free_blocks())
+        }
+
+        /// Bytes of buddy blocks handed out, rounding included, or `None`
+        /// while the heap lock is busy. Front-cache blocks count as handed
+        /// out here.
+        pub fn heap_alloc_actual() -> Option<usize> {
+            HEAP_ALLOCATOR.0.try_lock().map(|h| h.stats_alloc_actual())
+        }
+
+        /// Bytes parked in the per-CPU front caches.
+        pub fn heap_front_cached() -> usize {
+            #[cfg(not(feature = "mem-debug"))]
+            return slab::cached_bytes();
+            #[cfg(feature = "mem-debug")]
+            0
+        }
 
         /// The most often [`release_idle_heap`] drains the front caches.
         const FRONT_CACHE_DRAIN_EVERY_MS: u64 = 10_000;
@@ -2665,6 +2685,20 @@ cfg_if! {
                         super::report_broken_free_block(b, size);
                     }
                 }
+            }
+
+            /// Bytes every CPU's cache holds, the caches busy right now left
+            /// out. Counted as free by the heap's figures, and as in use by
+            /// the buddy, which cannot merge them.
+            pub fn cached_bytes() -> usize {
+                SLAB.iter()
+                    .filter_map(|c| c.try_lock())
+                    .map(|c| {
+                        (0..free_lists::NUM_CLASSES)
+                            .map(|i| c.count(i) as usize * free_lists::class_size(i))
+                            .sum::<usize>()
+                    })
+                    .sum()
             }
 
             pub fn try_free(
@@ -3638,11 +3672,12 @@ pub mod alloc_sites {
 pub mod free_lists {
     use core::alloc::Layout;
 
-    // Cache buddy classes 2^3 (8 B, the buddy minimum) .. 2^12 (4 KiB).
+    // Cache buddy classes 2^4 (16 B, the buddy minimum: a free block holds
+    // the buddy's two tree links) .. 2^12 (4 KiB).
     // That covers every hot fork object and the general small-allocation
     // churn; larger buffers (I/O, 1 MiB readahead) churn rarely and would
     // pin too much idle RAM, so they go straight to the buddy.
-    pub const MIN_CLASS: usize = 3; // 2^3 = 8 B
+    pub const MIN_CLASS: usize = 4; // 2^4 = 16 B
     pub const MAX_CLASS: usize = 12; // 2^12 = 4 KiB
     pub const NUM_CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
     // Per-class ceiling on the number of cached blocks. A freed block past
@@ -3732,11 +3767,14 @@ pub mod free_lists {
         if layout.size() > (1 << MAX_CLASS) || layout.align() > (1 << MAX_CLASS) {
             return None;
         }
+        // The buddy's own rounding (`buddy_system_allocator::block_size`,
+        // asserted equal beside `buddy_block_size`), so a cached block is
+        // byte-for-byte what the buddy would have handed out.
         let size = core::cmp::max(
             layout.size().next_power_of_two(),
-            core::cmp::max(layout.align(), core::mem::size_of::<usize>()),
+            core::cmp::max(layout.align(), 1 << MIN_CLASS),
         );
-        // size ∈ [8, 4096] given the guard, so class ∈ [3, 12].
+        // size ∈ [16, 4096] given the guard, so class ∈ [4, 12].
         Some(size.trailing_zeros() as usize - MIN_CLASS)
     }
 
@@ -3803,7 +3841,6 @@ pub mod free_lists {
         }
 
         /// Blocks cached in class `i`.
-        #[cfg(test)]
         pub fn count(&self, i: usize) -> u32 {
             self.count[i]
         }
