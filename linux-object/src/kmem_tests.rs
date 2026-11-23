@@ -196,6 +196,22 @@ fn releasing_more_than_was_charged_stops_at_the_end() {
     q.release(1);
 }
 
+#[test]
+fn a_charge_is_all_or_nothing_and_goes_back_when_dropped() {
+    let a = KmemAccount::with_limit(100);
+    let c = Charge::try_to(Some(a.clone()), 60).unwrap();
+    assert_eq!((c.bytes(), a.charged()), (60, 60));
+    assert_eq!(
+        Charge::try_to(Some(a.clone()), 41).unwrap_err(),
+        Refusal::Quota
+    );
+    assert_eq!(a.charged(), 60, "a refused charge takes nothing");
+    let kernel = Charge::try_to(None, 1 << 40).unwrap();
+    assert_eq!(kernel.bytes(), 0, "the kernel's own work is not charged");
+    drop(c);
+    assert_eq!(a.charged(), 0);
+}
+
 /// The queues themselves, written by a process whose limit is `limit`.
 mod queues {
     extern crate std;

@@ -594,6 +594,7 @@ impl Syscall<'_> {
             let since = match queue.try_send(mtype, &data, sender) {
                 Ok(()) => return Ok(0),
                 Err(MsgSendError::Removed) => return Err(LxError::EIDRM),
+                Err(MsgSendError::NoMemory) => return Err(LxError::ENOMEM),
                 Err(MsgSendError::Full(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::EAGAIN);

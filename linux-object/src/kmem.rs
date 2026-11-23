@@ -401,6 +401,65 @@ impl Drop for ChargedBytes {
     }
 }
 
+/// A charge for one kernel object a process made the kernel keep -- a
+/// queued message, a watch, a timer -- given back when it is dropped, by
+/// whoever drops it.
+///
+/// [`ChargedBytes`] is for a byte queue, where bytes of many writers come
+/// and go in order; this is for an object that is made and freed whole. It
+/// is the size of a pointer and a length, and the kernel's own work (no
+/// calling process) costs nothing: no account, nothing charged.
+#[derive(Debug, Default)]
+pub struct Charge {
+    to: Option<Arc<KmemAccount>>,
+    bytes: usize,
+}
+
+impl Charge {
+    /// Nothing charged to anybody.
+    pub const fn none() -> Self {
+        Charge { to: None, bytes: 0 }
+    }
+
+    /// Charge `n` bytes to the calling process, or refuse them.
+    pub fn try_new(n: usize) -> Result<Self, Refusal> {
+        Self::try_to(current(), n)
+    }
+
+    /// Charge `n` bytes to `to` (`None`: the kernel's own, uncharged), or
+    /// refuse them.
+    pub fn try_to(to: Option<Arc<KmemAccount>>, n: usize) -> Result<Self, Refusal> {
+        match to {
+            Some(acct) if n != 0 => {
+                acct.try_charge(n)?;
+                Ok(Charge {
+                    to: Some(acct),
+                    bytes: n,
+                })
+            }
+            _ => Ok(Self::none()),
+        }
+    }
+
+    /// Bytes this charge holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The account the bytes are charged to.
+    pub fn account(&self) -> Option<&Arc<KmemAccount>> {
+        self.to.as_ref()
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(to) = &self.to {
+            to.uncharge(self.bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "kmem_tests.rs"]
 mod kmem_tests;
