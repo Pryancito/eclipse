@@ -474,6 +474,8 @@ impl From<Error> for LxError {
             Error::BufferTooSmall => LxError::ENOBUFS,
             Error::InvalidLength => LxError::EINVAL,
             Error::InvalidVectorAddress => LxError::EINVAL,
+            Error::NoMemory => LxError::ENOMEM,
+            Error::TooBig => LxError::E2BIG,
         }
     }
 }
@@ -796,6 +798,10 @@ mod errno_tests {
         assert_eq!(LxError::from(Error::BufferTooSmall), LxError::ENOBUFS);
         assert_eq!(LxError::from(Error::InvalidLength), LxError::EINVAL);
         assert_eq!(LxError::from(Error::InvalidVectorAddress), LxError::EINVAL);
+        // A copy the heap could not hold is the process's ENOMEM, never a
+        // kernel panic; an argv over ARG_MAX is E2BIG, as Linux says it.
+        assert_eq!(LxError::from(Error::NoMemory), LxError::ENOMEM);
+        assert_eq!(LxError::from(Error::TooBig), LxError::E2BIG);
     }
 
     #[test]

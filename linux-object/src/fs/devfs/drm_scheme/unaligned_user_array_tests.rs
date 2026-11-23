@@ -377,3 +377,26 @@ fn an_atomic_commit_reads_its_four_arrays_at_whatever_address_the_client_gave() 
     };
     assert_eq!(c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut req), Ok(0));
 }
+
+/// `uget_vec` copies what `uget` reads one element at a time, at any
+/// address, and a count the heap cannot hold is ENOMEM -- the
+/// `memdup_array_user` answer -- not the `alloc_error` panic an infallible
+/// `collect()` of it was.
+#[test]
+fn a_user_array_is_copied_fallibly() {
+    let odd = Odd::new(3 * 4);
+    for (i, v) in [7u32, 8, 9].iter().copied().enumerate() {
+        unsafe { uput::<u32>(odd.at, i, v) };
+    }
+    assert_eq!(
+        unsafe { uget_vec::<u32>(odd.at, 3) },
+        Ok(alloc::vec![7, 8, 9])
+    );
+    // More elements than the address space holds: capacity overflow, which
+    // `try_reserve_exact` reports and `with_capacity` would have panicked on.
+    // Nothing is read.
+    assert_eq!(
+        unsafe { uget_vec::<u64>(odd.at, usize::MAX / 4) },
+        Err(FsError::NoMemory)
+    );
+}

@@ -239,6 +239,8 @@ impl From<Error> for ZxError {
             Error::BufferTooSmall => ZxError::BUFFER_TOO_SMALL,
             Error::InvalidLength => ZxError::INVALID_ARGS,
             Error::InvalidVectorAddress => ZxError::NOT_FOUND,
+            Error::NoMemory => ZxError::NO_MEMORY,
+            Error::TooBig => ZxError::OUT_OF_RANGE,
         }
     }
 }
@@ -412,6 +414,7 @@ mod tests {
             ZxError::from(Error::InvalidVectorAddress),
             ZxError::NOT_FOUND
         );
+        assert_eq!(ZxError::from(Error::NoMemory), ZxError::NO_MEMORY);
         // Nothing in the bridge maps on to OK: every one of these is a failure,
         // and a mapping that returned OK would make the syscall report success
         // after touching memory it could not read.
@@ -421,6 +424,8 @@ mod tests {
             Error::BufferTooSmall,
             Error::InvalidLength,
             Error::InvalidVectorAddress,
+            Error::NoMemory,
+            Error::TooBig,
         ] {
             assert_ne!(ZxError::from(e), ZxError::OK, "{e:?}");
         }

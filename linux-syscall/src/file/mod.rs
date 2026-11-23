@@ -98,14 +98,20 @@ impl Syscall<'_> {
     /// this an `execve` from a 32-bit program read its `argv` at the native
     /// width, which does not fail --- it builds the new program's arguments
     /// out of addresses the caller never wrote.
+    ///
+    /// What it copies comes out of `budget` (see
+    /// [`ArgBudget`](kernel_hal::user::ArgBudget)): the walk stops with
+    /// `E2BIG` at the string that would not fit, before the kernel heap is
+    /// asked for it, and a copy the heap cannot hold is `ENOMEM`.
     pub(crate) fn read_cstring_array(
         &self,
         array: UserInPtr<UserInPtr<u8>>,
+        budget: &mut kernel_hal::user::ArgBudget,
     ) -> LxResult<alloc::vec::Vec<alloc::string::String>> {
         if self.linux_process().abi().is_32bit() {
-            array.read_cstring_array32()
+            array.read_cstring_array32_within(budget)
         } else {
-            array.read_cstring_array()
+            array.read_cstring_array_within(budget)
         }
         .map_err(Into::into)
     }

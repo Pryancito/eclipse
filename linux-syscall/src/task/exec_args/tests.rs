@@ -103,3 +103,54 @@ fn an_exec_answers_to_the_caller_s_rlimit_stack() {
         "300 KiB under a 1 MiB stack, whose quarter is 256"
     );
 }
+
+/// The walk spends the same bytes [`check_arg_sizes`] counts, so it says
+/// `E2BIG` exactly where the check would -- but while copying, at the first
+/// string that does not fit, and without allocating for it.
+#[test]
+fn the_walk_says_e2big_where_the_check_would_and_before_copying_it() {
+    let big = "a".repeat(MAX_ARG_STRLEN - 1);
+    let mut s = big.clone().into_bytes();
+    s.push(0);
+    // A thousand pointers to one longest-allowed string: 128 MiB the old
+    // read allocated before anything said E2BIG.
+    let mut pointers = vec![s.as_ptr() as usize; 1000];
+    pointers.push(0);
+    let limit = arg_limit(RLIM_INFINITY);
+    let mut budget = budget_for(limit, "f");
+    assert_eq!(
+        argv_at(&pointers).read_cstring_array_within(&mut budget),
+        Err(kernel_hal::user::Error::TooBig)
+    );
+    // What fits by the walk fits by the check, and one more does not.
+    let fit = (limit - 2) / (MAX_ARG_STRLEN + 8);
+    let mut budget = budget_for(limit, "f");
+    let mut pointers = vec![s.as_ptr() as usize; fit];
+    pointers.push(0);
+    let args = argv_at(&pointers)
+        .read_cstring_array_within(&mut budget)
+        .unwrap();
+    assert_eq!(args.len(), fit);
+    assert!(check_arg_sizes("f", &args, &[], limit, 8).is_ok());
+    let mut more = args.clone();
+    more.push(big.clone());
+    assert_eq!(
+        check_arg_sizes("f", &more, &[], limit, 8),
+        Err(LxError::E2BIG)
+    );
+    let mut budget = budget_for(limit, "f");
+    *pointers.last_mut().unwrap() = s.as_ptr() as usize;
+    pointers.push(0);
+    assert_eq!(
+        argv_at(&pointers).read_cstring_array_within(&mut budget),
+        Err(kernel_hal::user::Error::TooBig)
+    );
+    // One string over MAX_ARG_STRLEN is refused on its own, like the check.
+    let mut over = "a".repeat(MAX_ARG_STRLEN).into_bytes();
+    over.push(0);
+    let mut budget = budget_for(limit, "f");
+    assert_eq!(
+        argv_at(&[over.as_ptr() as usize, 0]).read_cstring_array_within(&mut budget),
+        Err(kernel_hal::user::Error::TooBig)
+    );
+}
