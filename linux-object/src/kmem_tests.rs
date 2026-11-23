@@ -321,6 +321,22 @@ mod queues {
     }
 
     #[test]
+    fn a_semaphore_set_is_charged_to_its_maker_until_it_goes() {
+        use crate::ipc::SemArray;
+        let ten = SemArray::cost(10);
+        as_a_process_limited_to(45_204, ten, |acct| {
+            let set = SemArray::get_or_create(0, 10, 0o1600, 0, 0, &[]).unwrap();
+            assert_eq!(acct.charged(), ten);
+            assert_eq!(
+                SemArray::get_or_create(0, 1, 0o1600, 0, 0, &[]).err(),
+                Some(crate::error::LxError::ENOMEM)
+            );
+            drop(set);
+            assert_eq!(acct.charged(), 0);
+        });
+    }
+
+    #[test]
     fn a_unix_send_over_the_quota_is_enomem_and_closing_gives_it_back() {
         as_a_process_limited_to(45_202, 64 * 1024, |acct| {
             let a = UnixSocketState::new();

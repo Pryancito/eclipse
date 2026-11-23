@@ -50,6 +50,11 @@ pub struct SemArray {
     /// both see a state neither of them ever agreed to. Linux keeps one lock
     /// per set for exactly this; so does this.
     semop_lock: Mutex<()>,
+    /// The set and its semaphores, charged to the process that made it until
+    /// the set goes (`IPC_RMID` and the last user): a set outlives its maker,
+    /// and `SEMMNI` sets of `SEMMSL` semaphores are gigabytes. Linux
+    /// allocates it with `GFP_KERNEL_ACCOUNT` (`sem_alloc`).
+    _charge: crate::kmem::Charge,
 }
 
 impl SemArray {
@@ -63,6 +68,14 @@ impl SemArray {
     /// caller's [`semop_guard`](Self::semop_guard).
     pub fn snapshot(&self) -> Vec<(isize, u64)> {
         self.sems.iter().map(|s| s.get_versioned()).collect()
+    }
+
+    /// What a set of `nsems` semaphores costs the kernel, as charged to its
+    /// maker: the set, its `Arc` and its semaphores.
+    pub fn cost(nsems: usize) -> usize {
+        core::mem::size_of::<Self>()
+            + 2 * core::mem::size_of::<usize>()
+            + nsems.saturating_mul(core::mem::size_of::<Semaphore>())
     }
 
     /// Number of semaphores in the set.
@@ -327,6 +340,9 @@ impl SemArray {
         if nsems == 0 {
             return Err(LxError::EINVAL);
         }
+        // Over the maker's kernel memory quota, or into the kernel's
+        // reserve, is ENOMEM, which semget(2) lists.
+        let charge = crate::kmem::Charge::try_new(Self::cost(nsems))?;
         let mut semaphores = Vec::new();
         for _ in 0..nsems {
             semaphores.push(Semaphore::new(0));
@@ -357,6 +373,7 @@ impl SemArray {
             }),
             sems: semaphores,
             semop_lock: Mutex::new(()),
+            _charge: charge,
         });
         // A private set has no name, so nothing may ever look it up again.
         if key != 0 {
