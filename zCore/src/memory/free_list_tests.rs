@@ -12,7 +12,7 @@ use super::free_ring::{FreeRing, DEPTH};
 use std::alloc::Layout;
 
 /// 64-byte blocks: a tagged class.
-const C64: usize = 3;
+const C64: usize = 2;
 /// Fewest blocks a class has to keep for the cache to be worth its lookup.
 ///
 /// Its own number rather than `MIN_CAP`, because `cap >= MIN_CAP` is the one
@@ -36,8 +36,6 @@ const _: () = assert!(
 /// a mutation that puts `CAP` back in `push` survives it. This class is where
 /// the two numbers differ.
 const CTOP: usize = NUM_CLASSES - 1;
-/// 8-byte blocks: one word, no room for the free mark.
-const C8: usize = 0;
 
 /// Real memory for the lists to write their links and marks into.
 struct Arena {
@@ -211,26 +209,6 @@ fn a_zeroed_link_with_blocks_behind_it_is_caught() {
     );
 }
 
-/// One-word blocks have no mark, so a link to another block of the heap
-/// passes the address test -- but not out of the last block.
-#[test]
-fn a_link_out_of_the_last_block_is_caught() {
-    let arena = Arena::new(4096);
-    let mut c = SlabCache::new();
-    let (a, other) = (arena.block(C8, 0), arena.block(C8, 9));
-    unsafe { c.push(C8, a) }.unwrap();
-    arena.write(a, other);
-    assert_eq!(
-        unsafe { c.pop(C8, arena.owns()) },
-        Err(Broken::Link {
-            block: a,
-            link: other,
-            lost: 0,
-            why: LinkFault::PastEnd,
-        })
-    );
-}
-
 /// Before: the second free put the block in the list twice, and two
 /// allocations later two owners shared it.
 #[test]
@@ -249,21 +227,6 @@ fn a_block_freed_twice_is_refused_and_the_list_stays_sound() {
     assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(b)));
     assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(a)));
     assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
-}
-
-/// Without a mark, the head is the one double free a one-word class can
-/// still see -- and the one that would make the list point at itself.
-#[test]
-fn a_one_word_block_freed_twice_in_a_row_is_refused() {
-    let arena = Arena::new(4096);
-    let mut c = SlabCache::new();
-    let a = arena.block(C8, 0);
-    unsafe { c.push(C8, a) }.unwrap();
-    assert_eq!(
-        unsafe { c.push(C8, a) },
-        Err(Broken::DoubleFree { block: a })
-    );
-    assert_eq!(c.count(C8), 1);
 }
 
 /// The everyday case must stay quiet: a block that was handed out and

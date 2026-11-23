@@ -6,6 +6,7 @@
 
 use super::{IpcGetFlag, IpcPerm};
 use crate::error::LxError;
+use crate::kmem::{Charge, KmemAccount};
 use crate::time::TimeSpec;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -67,7 +68,17 @@ pub struct MsqidDs {
 struct MsgItem {
     mtype: isize,
     data: Vec<u8>,
+    /// The message's bytes and its header, charged to its sender until it is
+    /// received or its queue goes -- after the sender has exited, too: Linux
+    /// allocates `msg_msg` with `GFP_KERNEL_ACCOUNT` and the charge stays
+    /// with the sender's cgroup.
+    _charge: Charge,
 }
+
+/// What a queued message costs the kernel besides its payload, charged with
+/// it: a loop of empty messages would otherwise fill a queue nobody pays for
+/// (Linux charges the `struct msg_msg` header for the same reason).
+const MSG_ITEM_COST: usize = core::mem::size_of::<MsgItem>();
 
 /// Outcome of a non-blocking send attempt.
 #[derive(Debug)]
@@ -78,6 +89,9 @@ pub enum MsgSendError {
     /// [`MsgQueue::wait_for_change`] with the generation carried here and
     /// retries.
     Full(u64),
+    /// The queue has room but the kernel will not take the message: the
+    /// sender's kernel memory quota or the kernel's reserve (`ENOMEM`).
+    NoMemory,
 }
 
 /// Outcome of a non-blocking receive attempt.
@@ -128,6 +142,9 @@ impl MsgQueueInner {
 /// A System V message queue.
 pub struct MsgQueue {
     inner: Mutex<MsgQueueInner>,
+    /// The queue itself, charged to the process that made it until
+    /// `IPC_RMID` and the last waiter let it go.
+    _charge: Charge,
 }
 
 lazy_static! {
@@ -153,8 +170,14 @@ lazy_static! {
 static NEXT_MSG_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl MsgQueue {
+    #[cfg(test)]
     fn new(key: u32, mode: u32, uid: u32, gid: u32) -> Self {
+        Self::with_charge(key, mode, uid, gid, Charge::none())
+    }
+
+    fn with_charge(key: u32, mode: u32, uid: u32, gid: u32, charge: Charge) -> Self {
         MsgQueue {
+            _charge: charge,
             inner: Mutex::new(MsgQueueInner {
                 ds: MsqidDs {
                     perm: IpcPerm {
@@ -188,9 +211,24 @@ impl MsgQueue {
     }
 
     /// Try to append a message. `Full` asks the caller to block and retry
-    /// (the payload is only copied in on success); bookkeeping
+    /// (the payload is only copied in on success), `NoMemory` is the
+    /// sender's kernel memory quota or the kernel's reserve saying no
+    /// (`ENOMEM`, which msgsnd(2) lists for a message the kernel has no
+    /// memory to copy); bookkeeping
     /// (`cbytes`/`qnum`/`stime`/`lspid`) matches msgsnd(2).
     pub fn try_send(&self, mtype: isize, data: &[u8], sender: u32) -> Result<(), MsgSendError> {
+        self.try_send_charged(mtype, data, sender, crate::kmem::current())
+    }
+
+    /// [`try_send`](Self::try_send) charging the message to `to` (`None`:
+    /// the kernel's own, uncharged).
+    fn try_send_charged(
+        &self,
+        mtype: isize,
+        data: &[u8],
+        sender: u32,
+        to: Option<Arc<KmemAccount>>,
+    ) -> Result<(), MsgSendError> {
         let mut inner = self.inner.lock();
         if inner.removed {
             return Err(MsgSendError::Removed);
@@ -212,13 +250,24 @@ impl MsgQueue {
         if inner.ds.qnum >= inner.ds.qbytes {
             return Err(MsgSendError::Full(inner.generation));
         }
+        // The queue has room; whether the kernel does is the sender's quota
+        // and the reserve's to say, and then the heap's: none of the three
+        // may be an allocation that panics.
+        let charge =
+            Charge::try_to(to, data.len() + MSG_ITEM_COST).map_err(|_| MsgSendError::NoMemory)?;
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(data.len()).is_err() || inner.messages.try_reserve(1).is_err() {
+            return Err(MsgSendError::NoMemory);
+        }
+        copy.extend_from_slice(data);
         inner.ds.cbytes = cbytes;
         inner.ds.qnum += 1;
         inner.ds.stime = TimeSpec::now().sec;
         inner.ds.lspid = sender;
         inner.messages.push_back(MsgItem {
             mtype,
-            data: data.to_vec(),
+            data: copy,
+            _charge: charge,
         });
         inner.touch();
         Ok(())
@@ -244,14 +293,20 @@ impl MsgQueue {
         if inner.messages[idx].data.len() > max_size && !noerror {
             return Err(MsgRecvError::TooBig);
         }
-        let mut msg = inner.messages.remove(idx).unwrap();
+        let msg = inner.messages.remove(idx).unwrap();
         inner.ds.cbytes -= msg.data.len();
         inner.ds.qnum -= 1;
         inner.ds.rtime = TimeSpec::now().sec;
         inner.ds.lrpid = receiver;
         inner.touch();
-        msg.data.truncate(max_size);
-        Ok((msg.mtype, msg.data))
+        drop(inner);
+        // The message leaves the kernel's keeping here: its charge goes back
+        // to its sender as `msg` is taken apart.
+        let MsgItem {
+            mtype, mut data, ..
+        } = msg;
+        data.truncate(max_size);
+        Ok((mtype, data))
     }
 
     /// Park until this queue may have changed since `since`, the generation a
@@ -501,10 +556,23 @@ pub fn msg_get(
     if queues.len() >= MSGMNI {
         return Err(LxError::ENOSPC);
     }
+    // A queue outlives its maker until `IPC_RMID`, so it is charged to the
+    // maker: `MSGMNI` empty queues are megabytes, and Linux accounts them
+    // (`GFP_KERNEL_ACCOUNT` in newque). msgget(2) lists ENOMEM.
+    let charge = Charge::try_new(MSG_QUEUE_COST)?;
     let id = NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed);
-    queues.insert(id, Arc::new(MsgQueue::new(key, flags as u32, uid, gid)));
+    queues.insert(
+        id,
+        Arc::new(MsgQueue::with_charge(key, flags as u32, uid, gid, charge)),
+    );
     Ok(id)
 }
+
+/// What an empty queue costs the kernel: the queue, its `Arc` and its slot
+/// in the table.
+const MSG_QUEUE_COST: usize = core::mem::size_of::<MsgQueue>()
+    + 2 * core::mem::size_of::<usize>()
+    + core::mem::size_of::<(usize, Arc<MsgQueue>)>();
 
 /// Look up a queue by id.
 pub fn msg_queue(id: usize) -> Option<Arc<MsgQueue>> {
@@ -698,6 +766,40 @@ mod msg_control_tests {
     /// A queue owned by `uid`, off the global table.
     fn owned_by(uid: u32) -> MsgQueue {
         MsgQueue::new(0, 0o600, uid, uid)
+    }
+
+    // ------------------------------------------------------- kernel memory
+
+    /// A message is charged to its sender, payload and header, until it is
+    /// received: a sender over its quota gets `NoMemory` (ENOMEM) and the
+    /// queue is left as it was, and what is still queued when the queue goes
+    /// is given back with it.
+    #[test]
+    fn a_message_is_charged_to_its_sender_until_it_is_received() {
+        let acct = crate::kmem::KmemAccount::with_limit(3 * (100 + MSG_ITEM_COST));
+        let queue = owned_by(OWNER);
+        for _ in 0..3 {
+            queue
+                .try_send_charged(1, &[1u8; 100], OWNER, Some(acct.clone()))
+                .unwrap();
+        }
+        assert_eq!(acct.charged(), 3 * (100 + MSG_ITEM_COST));
+        assert!(matches!(
+            queue.try_send_charged(1, &[], OWNER, Some(acct.clone())),
+            Err(MsgSendError::NoMemory)
+        ));
+        assert_eq!(queue.stat().qnum, 3, "a refused message is not queued");
+        assert_eq!(queue.stat().cbytes, 300);
+        let (_, data) = queue.try_recv(0, 40, true, false, OWNER).unwrap();
+        assert_eq!(data.len(), 40);
+        assert_eq!(acct.charged(), 2 * (100 + MSG_ITEM_COST));
+        // Room again, for an empty message too: its header is what it costs.
+        queue
+            .try_send_charged(2, &[], OWNER, Some(acct.clone()))
+            .unwrap();
+        assert_eq!(acct.charged(), 2 * (100 + MSG_ITEM_COST) + MSG_ITEM_COST);
+        drop(queue);
+        assert_eq!(acct.charged(), 0, "a removed queue gives its messages back");
     }
 
     // ---------------------------------------------------------------- msgrcv

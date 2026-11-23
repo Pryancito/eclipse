@@ -14,6 +14,7 @@
 //! amount.
 
 use super::*;
+use kernel_hal::user::ArgBudget;
 use linux_object::process::{LinuxProcess, RLIMIT_STACK, RLIM_INFINITY};
 
 /// `MAX_ARG_STRLEN`: the longest one argument or environment string may be,
@@ -93,6 +94,28 @@ pub(super) fn check_exec_args(
         arg_limit(stack),
         pointer_size(proc.abi()),
     )
+}
+
+/// What `argv` and `envp` may copy between them once `filename` is counted:
+/// [`MAX_ARG_STRLEN`] a string, and what `RLIMIT_STACK` leaves of
+/// [`arg_limit`] after the name and its NUL.
+///
+/// It is spent while the arrays are copied, so an over-long list is `E2BIG`
+/// at the first string that does not fit instead of after the kernel has
+/// allocated for all of them. [`check_exec_args`] still runs on what was
+/// copied: it counts the empty `argv[0]` [`argv_or_empty`] adds, and the
+/// name itself when that alone is too long.
+pub(super) fn arg_budget(proc: &LinuxProcess, filename: &str) -> LxResult<ArgBudget> {
+    let stack = proc.rlimit(RLIMIT_STACK, None, false)?.cur;
+    Ok(budget_for(arg_limit(stack), filename))
+}
+
+/// [`arg_budget`] for a limit already worked out.
+pub(super) fn budget_for(limit: usize, filename: &str) -> ArgBudget {
+    ArgBudget {
+        max_str: MAX_ARG_STRLEN,
+        left: limit.saturating_sub(filename.len() + 1),
+    }
 }
 
 /// What one pointer of the initial stack costs the limit: four bytes for a

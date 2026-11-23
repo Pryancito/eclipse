@@ -1011,6 +1011,13 @@ impl Hears {
     }
 }
 
+/// What a queued datagram costs besides its bytes, counted against
+/// [`RX_QUEUE_BYTES`] with them, as Linux counts an skb's `truesize` and not
+/// its length: a loop of empty datagrams added nothing to `queued_bytes`, so
+/// a socket nobody read queued them without end, a heap entry each.
+/// `queued_bytes` stays the payload, which is what `/proc/net/udp` shows.
+const DATAGRAM_COST: usize = core::mem::size_of::<(IpEndpoint, Vec<u8>, u8)>();
+
 struct Inner {
     /// What arrived: who sent it, the bytes, and the hops it had left
     /// when that is known (ICMPv6), else 0.
@@ -1061,11 +1068,18 @@ impl Shared {
     /// [`deliver`](Self::deliver), of what had `hops` left.
     fn deliver_with(&self, from: IpEndpoint, data: &[u8], hops: u8) -> bool {
         let mut inner = self.inner.lock();
-        if inner.read_closed || inner.queued_bytes + data.len() > RX_QUEUE_BYTES {
+        // What the queue would hold, its datagrams' entries included.
+        let held = inner.queued_bytes + data.len() + (inner.queue.len() + 1) * DATAGRAM_COST;
+        if inner.read_closed || held > RX_QUEUE_BYTES {
             return false;
         }
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(data.len()).is_err() || inner.queue.try_reserve(1).is_err() {
+            return false;
+        }
+        copy.extend_from_slice(data);
         inner.queued_bytes += data.len();
-        inner.queue.push_back((from, data.to_vec(), hops));
+        inner.queue.push_back((from, copy, hops));
         self.bus.lock().set(Event::READABLE);
         true
     }

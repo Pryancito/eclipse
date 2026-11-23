@@ -34,6 +34,12 @@ use kernel_hal::timer::timer_now;
 #[cfg(not(feature = "libos"))]
 const IDLE_STACKS_KEPT: usize = 16;
 
+/// Bytes of freed large heap blocks (`kernel_hal::vmalloc`) a pass leaves
+/// mapped, for the next large allocation to take over without mapping or
+/// flushing anything: a pipe or socket buffer that grows and shrinks.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+const VMALLOC_KEPT: usize = 32 * 1024 * 1024;
+
 /// How often the worker looks. Linux's `kswapd` sleeps on a waitqueue with a
 /// 100 ms watchdog; this is the watchdog without the waitqueue.
 const PERIOD_MS: u64 = 200;
@@ -77,6 +83,20 @@ fn watermark(total: usize) -> usize {
         .min(total / 4)
 }
 
+/// Free bytes under which reclaim is due: the watermark, ABOVE the frames
+/// userspace may not take ([`crate::memory::frame_reserve`]). A machine
+/// sitting on its reserve is short, even though that RAM reads as free.
+fn low_line(total: usize) -> usize {
+    watermark(total) + crate::memory::reserve_for(total)
+}
+
+/// Free bytes under which a pass that freed nothing kills: a fifth of the
+/// watermark, above the reserve. User allocations stop at the reserve, so the
+/// victim has to be picked while the kernel still has it.
+fn oom_line(total: usize) -> usize {
+    watermark(total) / OOM_WATERMARK_DIV + crate::memory::reserve_for(total)
+}
+
 /// Bytes the worker should ask for, given what the allocator reports.
 ///
 /// Zero means "above the watermark, leave the caches alone" -- including
@@ -84,7 +104,7 @@ fn watermark(total: usize) -> usize {
 /// figure derived from it is meaningless.
 fn target(used: usize, total: usize) -> usize {
     let free = total.saturating_sub(used);
-    watermark(total).saturating_sub(free)
+    low_line(total).saturating_sub(free)
 }
 
 /// One pass. Separate from the loop so that what it decides can be tested
@@ -108,8 +128,7 @@ fn out_of_memory(used: usize, total: usize, freed: usize) -> bool {
         return false;
     }
     let free = total.saturating_sub(used);
-    let floor = watermark(total) / OOM_WATERMARK_DIV;
-    floor > 0 && free < floor
+    watermark(total) > 0 && free < oom_line(total)
 }
 
 /// Start the worker. Called once, during boot.
@@ -141,6 +160,19 @@ pub fn start() {
                 // Idle coroutine stacks a burst left behind, before the heap
                 // is given back below, so their blocks can go with it.
                 let trimmed = executor::trim_idle_stacks(IDLE_STACKS_KEPT);
+                // Large heap blocks freed since the last pass are still
+                // mapped (a free cannot wait for the TLB flush): give back
+                // all but a few for the next large allocation to reuse.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let purged = kernel_hal::vmalloc::purge(VMALLOC_KEPT);
+                    if purged > 0 {
+                        log::info!(
+                            "reclaimd: gave back {} KiB of freed large heap blocks",
+                            purged / 1024
+                        );
+                    }
+                }
                 if trimmed > 0 {
                     log::info!(
                         "reclaimd: gave back {} KiB of idle coroutine stacks",
@@ -154,8 +186,9 @@ pub fn start() {
             // as soon as it is spare, which is what lets a program that
             // exits give back all it took. One relaxed load when the heap
             // never grew. Bounded per pass, so a gigabyte to give back is
-            // spread over a few seconds rather than held in one tick.
-            let released = crate::memory::release_idle_heap(HEAP_RELEASE_PER_PASS);
+            // spread over a few seconds rather than held in one tick. Not
+            // within a few seconds of a growth: see `release_spare_heap`.
+            let released = crate::memory::release_spare_heap(HEAP_RELEASE_PER_PASS);
             if released > 0 {
                 log::info!(
                     "reclaimd: gave {} KiB of spare kernel heap back to the frame allocator",

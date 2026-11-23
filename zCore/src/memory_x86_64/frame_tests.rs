@@ -13,7 +13,7 @@ const PAGE: usize = 1 << PAGE_BITS;
 /// failed on exactly that, which is the per-CPU lists working as intended
 /// and the fixture not knowing about them.
 #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
-fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
+pub(super) fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
     static GUARD: spin::Mutex<()> = spin::Mutex::new(());
     let guard = GUARD.lock();
     frame_drain_percpu();
@@ -181,22 +181,14 @@ fn a_contiguous_request_comes_back_contiguous_and_aligned() {
     }
 }
 
-/// A heap chunk taken from RAM is heap: counted once, and its unused part
-/// free. Counted as frames AND as heap, a 64 MiB chunk that is empty again
-/// read as 64 MiB used after the program that grew it had exited.
+/// Memory userspace can be told about is the frames, and only the frames:
+/// the kernel heap arena added to both sides read as 500 MiB of free memory
+/// no process could allocate.
 #[test]
-fn a_grown_heap_chunk_is_counted_once_and_its_free_part_reads_free() {
-    const MIB: usize = 1 << 20;
-    // 512 MiB arena + one 64 MiB chunk, 10 MiB of heap in use; 4 GiB of
-    // RAM of which 100 MiB are frames, the chunk among them.
-    let (used, total) = combined_stats(10 * MIB, 576 * MIB, 64 * MIB, 100 * MIB, 4096 * MIB);
-    assert_eq!(used, 10 * MIB + 36 * MIB, "the chunk was counted twice");
-    assert_eq!(total, 576 * MIB + 4032 * MIB, "and so was the total");
-    // Without growth it is the plain sum it always was.
-    assert_eq!(
-        combined_stats(10 * MIB, 512 * MIB, 0, 100 * MIB, 4096 * MIB),
-        (110 * MIB, 4608 * MIB)
-    );
+fn reported_memory_is_the_frames_without_the_heap_arena() {
+    let _alone = alone_with_the_allocator();
+    insert_regions(&[0x90_0000..0x90_0000 + 8 * PAGE]);
+    assert_eq!(stats(), frame_stats());
 }
 
 /// The managed total is the bytes that went INTO the allocator, not the
@@ -232,4 +224,53 @@ fn reserving_the_boot_page_tables_is_a_no_op_without_paging() {
         "libos reports no page-table root; this test would walk a null tree"
     );
     reserve_active_page_table_frames();
+}
+
+/// What the heap gives back goes to the bitmap whole: the next contiguous
+/// request, the heap's own growth ahead of demand among them, finds the
+/// run again. Freed a frame at a time, its first frames stayed parked on
+/// this CPU's list, out of the bitmap's sight.
+#[test]
+fn a_run_given_back_whole_can_be_taken_whole_again() {
+    let _alone = alone_with_the_allocator();
+    let base = 0x200_0000;
+    insert_regions(&[base..base + 64 * PAGE]);
+    let used_before = frame_stats().0;
+    let run = frame_alloc(64, 6).expect("the whole region, aligned to itself");
+    assert_eq!(run, base);
+    assert_eq!(frame_stats().0 - used_before, 64 * PAGE);
+    frame_dealloc_run(run, 64);
+    assert_eq!(frame_stats().0, used_before);
+    assert_eq!(
+        frame_alloc_quiet(64, 6),
+        Some(base),
+        "the bitmap has the run back"
+    );
+    frame_dealloc_run(base, 64);
+}
+
+/// A frame of the run that is already free is a double free.
+#[cfg(not(feature = "mem-debug"))]
+#[test]
+#[should_panic(expected = "already free")]
+fn giving_back_a_run_twice_is_a_double_free() {
+    let _alone = alone_with_the_allocator();
+    let base = 0x300_0000;
+    insert_regions(&[base..base + 4 * PAGE]);
+    let run = frame_alloc(4, 2).expect("four frames");
+    frame_dealloc_run(run, 4);
+    frame_dealloc_run(run, 4);
+}
+
+/// The reserve kept from userspace is 1/64 of RAM between 16 and 64 MiB, and
+/// never more than an eighth: a tiny machine still gives most of itself to
+/// its programs.
+#[test]
+fn the_kernel_reserve_scales_with_ram_within_its_bounds() {
+    const MIB: usize = 1 << 20;
+    assert_eq!(reserve_for(2048 * MIB), 32 * MIB);
+    assert_eq!(reserve_for(512 * MIB), 16 * MIB);
+    assert_eq!(reserve_for(64 * 1024 * MIB), 64 * MIB);
+    assert_eq!(reserve_for(64 * MIB), 8 * MIB);
+    assert_eq!(reserve_for(0), 0);
 }

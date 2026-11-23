@@ -12,6 +12,12 @@ pub trait KernelHandler: Send + Sync + 'static {
         unimplemented!()
     }
 
+    /// Allocate one physical frame for a user mapping or a page cache page:
+    /// the kernel may refuse it to keep RAM back for itself.
+    fn frame_alloc_user(&self) -> Option<PhysAddr> {
+        self.frame_alloc()
+    }
+
     /// Allocate contiguous `frame_count` physical frames.
     fn frame_alloc_contiguous(&self, _frame_count: usize, _align_log2: usize) -> Option<PhysAddr> {
         unimplemented!()

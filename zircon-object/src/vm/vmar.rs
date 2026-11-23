@@ -1370,21 +1370,30 @@ impl VmAddressRegion {
     }
 
     /// Snapshot every live mapping in this VMAR tree, sorted by start address —
-    /// the data `/proc/<pid>/maps` renders. Geometry and the backing object's
-    /// identity are read under the locks; the rows themselves are plain data.
+    /// the data `/proc/<pid>/maps` renders. For the kernel's own callers; what
+    /// a process asks for goes through [`try_mappings_dump`](Self::try_mappings_dump).
     pub fn mappings_dump(&self) -> Vec<MappingDump> {
-        let mut out = Vec::new();
-        self.collect_mappings(&mut out);
-        out.sort_by_key(|m| m.start);
-        out
+        self.try_mappings_dump()
+            .expect("mappings_dump: kernel heap full")
     }
 
-    fn collect_mappings(&self, out: &mut Vec<MappingDump>) {
+    /// [`mappings_dump`](Self::mappings_dump), `None` when the heap cannot hold
+    /// it. A process picks the row count (its mappings) and the name lengths
+    /// (file paths): 100k maps of a 4000-byte path were ~800 MiB asked
+    /// infallibly by one read of `/proc/self/maps`, a kernel panic.
+    pub fn try_mappings_dump(&self) -> Option<Vec<MappingDump>> {
+        let mut out = Vec::new();
+        self.collect_mappings(&mut out).ok()?;
+        out.sort_by_key(|m| m.start);
+        Some(out)
+    }
+
+    fn collect_mappings(&self, out: &mut Vec<MappingDump>) -> Result<(), ()> {
         let children: Vec<_> = {
             let guard = self.inner.lock();
             let inner = match guard.as_ref() {
                 Some(i) => i,
-                None => return,
+                None => return Ok(()),
             };
             for map in inner.mappings.values() {
                 let m = map.inner.lock();
@@ -1416,6 +1425,10 @@ impl VmAddressRegion {
                 for (page, pages, flags) in m.flags.runs() {
                     let offset = page * PAGE_SIZE;
                     let start = m.addr + offset;
+                    out.try_reserve(1).map_err(drop)?;
+                    let mut row_name = alloc::string::String::new();
+                    row_name.try_reserve_exact(name.len()).map_err(drop)?;
+                    row_name.push_str(&name);
                     out.push(MappingDump {
                         start,
                         end: start + pages * PAGE_SIZE,
@@ -1424,15 +1437,16 @@ impl VmAddressRegion {
                         file_offset: file_base + offset,
                         shared,
                         vmo_id,
-                        name: name.clone(),
+                        name: row_name,
                     });
                 }
             }
             inner.children.to_vec()
         };
         for child in children {
-            child.collect_mappings(out);
+            child.collect_mappings(out)?;
         }
+        Ok(())
     }
 
     /// Unmap all mappings within the VMAR, and destroy all sub-regions of the region.
@@ -5442,43 +5456,7 @@ mod past_end_tests;
 mod vdso_code_mapping_tests;
 
 #[cfg(test)]
-mod process_memory_tests {
-    use super::*;
-
-    #[test]
-    fn an_unmapped_address_is_not_found_and_the_vdso_is_not_written() {
-        let root = VmAddressRegion::new_root();
-        let mut buf = [0u8; 8];
-        assert_eq!(
-            root.read_memory(root.addr(), &mut buf),
-            Err(ZxError::NOT_FOUND)
-        );
-        assert_eq!(
-            root.write_memory(root.addr(), &buf),
-            Err(ZxError::NOT_FOUND)
-        );
-
-        let vdso = VmObject::new_paged(1);
-        crate::task::register_vdso_vmo(vdso.id());
-        let at = root
-            .map(
-                None,
-                vdso.clone(),
-                0,
-                PAGE_SIZE,
-                MMUFlags::READ | MMUFlags::EXECUTE,
-            )
-            .unwrap();
-        assert_eq!(root.write_memory(at, &buf), Err(ZxError::ACCESS_DENIED));
-        assert_eq!(root.read_memory(at, &mut buf), Ok(8));
-
-        let plain = VmObject::new_paged(1);
-        let at = root
-            .map(None, plain, 0, PAGE_SIZE, MMUFlags::READ | MMUFlags::WRITE)
-            .unwrap();
-        assert_eq!(root.write_memory(at, &[1, 2, 3]), Ok(3));
-    }
-}
+mod process_memory_tests;
 
 #[cfg(test)]
 mod user_limit_tests {

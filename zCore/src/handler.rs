@@ -227,6 +227,10 @@ impl KernelHandler for ZcoreKernelHandler {
         memory::frame_alloc(1, 0)
     }
 
+    fn frame_alloc_user(&self) -> Option<usize> {
+        memory::frame_alloc_user()
+    }
+
     fn frame_alloc_contiguous(&self, frame_count: usize, align_log2: usize) -> Option<usize> {
         memory::frame_alloc(frame_count, align_log2)
     }
@@ -552,6 +556,61 @@ impl KernelHandler for ZcoreKernelHandler {
             "KernelHeapGivenBack: {:>6} kB",
             memory::heap_released_total() / 1024
         );
+        // Fragmentation: what the buddy has handed out against what was
+        // asked of it, what it could still give back, and the largest block
+        // it could hand out right now. `-` while the heap lock is busy.
+        let busy = |v: Option<usize>| v.map_or("-".into(), |v| alloc::format!("{}", v / 1024));
+        let free_blocks = memory::heap_free_blocks();
+        let largest =
+            free_blocks.map(|f| f.iter().rposition(|&n| n > 0).map_or(0, |i| 1usize << i));
+        let _ = writeln!(
+            s,
+            "KernelHeapRounded: {:>8} kB",
+            busy(memory::heap_alloc_actual())
+        );
+        let _ = writeln!(
+            s,
+            "KernelHeapFrontCache: {:>5} kB",
+            memory::heap_front_cached() / 1024
+        );
+        let _ = writeln!(s, "KernelHeapGrown: {:>10} kB", memory::heap_grown() / 1024);
+        let _ = writeln!(
+            s,
+            "KernelHeapReleasable: {:>5} kB",
+            memory::heap_releasable() / 1024
+        );
+        let _ = writeln!(s, "KernelHeapLimit: {:>10} kB", memory::heap_limit() / 1024);
+        let _ = writeln!(s, "KernelHeapLargestFree: {:>4} kB", busy(largest));
+        // Large blocks mapped from scattered frames (`kernel_hal::vmalloc`):
+        // live, and freed but still mapped for reuse until `reclaimd` purges.
+        let (vlive, vcached, vreused, vfailed, vpurged) = kernel_hal::vmalloc::stats();
+        let _ = writeln!(s, "KernelHeapVmalloc: {:>8} kB", vlive / 1024);
+        let _ = writeln!(s, "KernelHeapVmallocCached: {:>2} kB", vcached / 1024);
+        let _ = writeln!(
+            s,
+            "VmallocReused: {} VmallocFailed: {} VmallocPurged: {} kB",
+            vreused,
+            vfailed,
+            vpurged / 1024
+        );
+        let (grow_refused, why, _, _, _) = memory::heap_grow_status();
+        let _ = writeln!(s, "KernelHeapGrowRefusals: {} ({})", grow_refused, why);
+        // RAM userspace may not take, so that the heap can still grow and
+        // the OOM killer still run once processes have eaten the rest.
+        let _ = writeln!(
+            s,
+            "FramesKeptForKernel: {:>6} kB",
+            memory::frame_reserve() / 1024
+        );
+        let _ = writeln!(s, "UserFrameRefusals: {}", memory::user_frame_refusals());
+        if let Some(free) = free_blocks {
+            let _ = writeln!(s, "free blocks by size:");
+            for (i, n) in free.iter().enumerate() {
+                if *n > 0 {
+                    let _ = writeln!(s, "  {:>10}B x {}", 1usize << i, n);
+                }
+            }
+        }
         let refused = memory::heap_reentrancy_events();
         if refused > 0 {
             let _ = writeln!(s, "ReentrancyRefusals: {}", refused);

@@ -296,8 +296,8 @@ impl Syscall<'_> {
             // to every other process and then waited forever holding it.
             let blocked_on = {
                 let _guard = sem_array.semop_guard();
-                let snapshot = sem_array.snapshot();
-                let values: Vec<isize> = snapshot.iter().map(|&(v, _)| v).collect();
+                let snapshot = sem_array.snapshot()?;
+                let values = try_collect(snapshot.iter().map(|&(v, _)| v))?;
                 match plan_semop(&values, ops)? {
                     SemopPlan::Apply(new_values) => {
                         for (idx, value) in new_values {
@@ -455,7 +455,7 @@ impl Syscall<'_> {
             SemctlCmds::GETALL => {
                 let values = {
                     let _atomic = sem_array.semop_guard();
-                    getall_values(&sem_array.snapshot())
+                    getall_values(&sem_array.snapshot()?)?
                 };
                 let mut ptr: UserOutPtr<u16> = UserOutPtr::from(arg);
                 ptr.write_array(&values)?;
@@ -594,6 +594,7 @@ impl Syscall<'_> {
             let since = match queue.try_send(mtype, &data, sender) {
                 Ok(()) => return Ok(0),
                 Err(MsgSendError::Removed) => return Err(LxError::EIDRM),
+                Err(MsgSendError::NoMemory) => return Err(LxError::ENOMEM),
                 Err(MsgSendError::Full(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::EAGAIN);
@@ -1077,11 +1078,22 @@ const SEMVMX: i32 = 32767;
 /// `unsigned short[]` userspace reads. Values never exceed `SEMVMX`, so the
 /// narrowing loses nothing; a value below zero cannot exist either, and is
 /// clamped rather than wrapped in case it ever does.
-fn getall_values(snapshot: &[(isize, u64)]) -> Vec<u16> {
-    snapshot
-        .iter()
-        .map(|&(value, _)| value.clamp(0, SEMVMX as isize) as u16)
-        .collect()
+fn getall_values(snapshot: &[(isize, u64)]) -> Result<Vec<u16>, LxError> {
+    try_collect(
+        snapshot
+            .iter()
+            .map(|&(value, _)| value.clamp(0, SEMVMX as isize) as u16),
+    )
+}
+
+/// `collect()` of an iterator as long as a semaphore set, `SEMMSL` entries
+/// at most, into a `Vec` asked for fallibly: `ENOMEM` and not a panic.
+fn try_collect<T>(it: impl ExactSizeIterator<Item = T>) -> Result<Vec<T>, LxError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(it.len())
+        .map_err(|_| LxError::ENOMEM)?;
+    out.extend(it);
+    Ok(out)
 }
 
 /// `semctl(SETALL)`: the `unsigned short[]` userspace wrote, judged whole
@@ -1091,7 +1103,7 @@ fn setall_values(raw: &[u16]) -> Result<Vec<isize>, LxError> {
     if raw.iter().any(|&v| v as i32 > SEMVMX) {
         return Err(LxError::ERANGE);
     }
-    Ok(raw.iter().map(|&v| v as isize).collect())
+    try_collect(raw.iter().map(|&v| v as isize))
 }
 
 fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
@@ -1462,7 +1474,7 @@ pub enum SemopPlan {
 pub fn plan_semop(values: &[isize], ops: &[SemBuf]) -> Result<SemopPlan, LxError> {
     // Worked on a copy: the caller's values must not move until every
     // operation has been shown to fit.
-    let mut planned: Vec<isize> = values.to_vec();
+    let mut planned = try_collect(values.iter().copied())?;
     // Every index first, as `do_semtimedop` does with its `max`: an earlier
     // operation that must wait would otherwise hide a bad index after it,
     // and the caller would sleep on a call Linux refuses at once.
@@ -2044,11 +2056,11 @@ mod semctl_all_tests {
     fn getall_is_one_unsigned_short_per_semaphore_in_order() {
         assert_eq!(
             getall_values(&[(3, 0), (0, 5), (32767, 1)]),
-            vec![3, 0, 32767]
+            Ok(vec![3, 0, 32767])
         );
-        assert_eq!(getall_values(&[]), Vec::<u16>::new());
+        assert_eq!(getall_values(&[]), Ok(Vec::<u16>::new()));
         // A value that cannot exist is clamped, not wrapped to 65535.
-        assert_eq!(getall_values(&[(-1, 0)]), vec![0]);
+        assert_eq!(getall_values(&[(-1, 0)]), Ok(vec![0]));
     }
 
     /// `SETALL` refuses the whole array on one value over `SEMVMX`, before

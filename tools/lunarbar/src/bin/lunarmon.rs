@@ -92,16 +92,19 @@ enum Tab {
     Procs,
     Svcs,
     Servers,
+    /// The kernel heap, from `/proc/kheap`.
+    Heap,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Procs, Tab::Svcs, Tab::Servers];
+    const ALL: [Tab; 4] = [Tab::Procs, Tab::Svcs, Tab::Servers, Tab::Heap];
 
     fn next(self) -> Tab {
         match self {
             Tab::Procs => Tab::Svcs,
             Tab::Svcs => Tab::Servers,
-            Tab::Servers => Tab::Procs,
+            Tab::Servers => Tab::Heap,
+            Tab::Heap => Tab::Procs,
         }
     }
 }
@@ -176,6 +179,9 @@ struct Mon {
     rows: Vec<Row>,
     svcs: Vec<Svc>,
     servers: Vec<Server>,
+    kheap: sysmon::Kheap,
+    /// `(used, total)` of the kernel heap at each sample, oldest first.
+    kheap_hist: std::collections::VecDeque<(u64, u64)>,
     log: Vec<String>,
     sort: Sort,
     filter: String,
@@ -199,6 +205,8 @@ impl Mon {
             rows: Vec::new(),
             svcs: Vec::new(),
             servers: Vec::new(),
+            kheap: sysmon::Kheap::default(),
+            kheap_hist: std::collections::VecDeque::new(),
             log: Vec::new(),
             sort: Sort::Cpu,
             filter: String::new(),
@@ -303,6 +311,7 @@ impl Mon {
                     self.reload_log();
                 }
             }
+            Tab::Heap => {}
         }
     }
 
@@ -503,6 +512,7 @@ impl Mon {
             &read(sysmon::SERVICES_FILE),
         );
         self.fold_servers(&servers::read_dir(Path::new(servers::DIR)), &servers::Kernel::read());
+        self.fold_kheap(sysmon::parse_kheap(&read("/proc/kheap")));
         self.m.root_pct = sysinfo::disk_root_percent();
         self.m.uptime = read("/proc/uptime")
             .split_whitespace()
@@ -525,6 +535,21 @@ impl Mon {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.reload_log();
+    }
+}
+
+/// Samples of the heap history kept: two minutes at one a second.
+const KHEAP_HIST: usize = 120;
+
+impl Mon {
+    fn fold_kheap(&mut self, k: sysmon::Kheap) {
+        if !k.is_empty() {
+            self.kheap_hist.push_back((k.used, k.total));
+            while self.kheap_hist.len() > KHEAP_HIST {
+                self.kheap_hist.pop_front();
+            }
+        }
+        self.kheap = k;
     }
 }
 
@@ -577,11 +602,11 @@ fn hit(r: Rect, x: i32, y: i32) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
-fn tabs(w: i32) -> [Rect; 3] {
+fn tabs(w: i32) -> [Rect; 4] {
     let _ = w;
     let x = PAD + 96;
     let y = (HEAD_H - TAB_H) / 2;
-    [(x, y, TAB_W, TAB_H), (x + TAB_W, y, TAB_W, TAB_H), (x + 2 * TAB_W, y, TAB_W, TAB_H)]
+    core::array::from_fn(|k| (x + k as i32 * TAB_W, y, TAB_W, TAB_H))
 }
 
 /// The top of the process rows, and how many fit.
@@ -674,7 +699,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
     // Head.
     let hy = (HEAD_H - GLYPH_H) / 2;
     cv.text_bold("MONITOR", PAD, hy, ink().cyan);
-    let labels = [m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services), m.lang.s(Key::mon_servers)];
+    let labels = [m.lang.s(Key::mon_processes), m.lang.s(Key::mon_services), m.lang.s(Key::mon_servers), m.lang.s(Key::mon_heap)];
     for ((r, label), tab) in tabs(w).iter().zip(labels).zip(Tab::ALL) {
         let on = tab == m.tab;
         glass::cell(cv, r.0, r.1, r.2, r.3, if on { ink().cyan } else { ink().well }, if on { 0.16 } else { 1.0 });
@@ -715,8 +740,15 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
                 m.lang.s(Key::mon_restarts).to_lowercase()
             )
         }
+        Tab::Heap if m.kheap.is_empty() => String::new(),
+        Tab::Heap => format!(
+            "{} · {} / {}",
+            m.lang.s(Key::mon_kernel_heap),
+            sysmon::fmt_kib(m.kheap.used, m.lang),
+            sysmon::fmt_kib(m.kheap.total, m.lang)
+        ),
     };
-    let room = w - (tabs(w)[2].0 + TAB_W) - 2 * PAD;
+    let room = w - (tabs(w)[3].0 + TAB_W) - 2 * PAD;
     let summary = fit(&summary, room);
     text_right(cv, &summary, w - PAD, hy, ink().muted);
     cv.hline(0, HEAD_H - 1, w, ink().hairline, 1.0);
@@ -725,7 +757,118 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         Tab::Procs => draw_procs(cv, w, h, m),
         Tab::Svcs => draw_svcs(cv, w, h, m),
         Tab::Servers => draw_servers(cv, w, h, m),
+        Tab::Heap => draw_heap(cv, w, h, m),
     }
+}
+
+/// `4096 B`, `64 KiB`, `4 MiB`: a power-of-two block size.
+fn fmt_block(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{} GiB", bytes >> 30)
+    } else if bytes >= 1 << 20 {
+        format!("{} MiB", bytes >> 20)
+    } else if bytes >= 1 << 10 {
+        format!("{} KiB", bytes >> 10)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The HEAP tab: four plates (use, growth, fragmentation, history), then
+/// the free blocks by size, the regions and the live blocks by size.
+fn draw_heap(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
+    let k = &m.kheap;
+    let l = m.lang;
+    let top = HEAD_H + PAD;
+    if k.is_empty() {
+        cv.text(&fit(l.s(Key::mon_heap_none), w - 2 * PAD), PAD, top + 8, ink().muted);
+        return;
+    }
+    let gap = PAD;
+    let pw = (w - 2 * PAD - 3 * gap) / 4;
+    let xs: Vec<i32> = (0..4).map(|i| PAD + i * (pw + gap)).collect();
+    let line = GLYPH_H + 8;
+    let kib = |v: u64| sysmon::fmt_kib(v, l);
+
+    // In use.
+    plate_head(cv, xs[0], top, pw, l.s(Key::mon_heap_in_use), &format!("{} / {}", kib(k.used), kib(k.total)));
+    let frac = if k.total > 0 { k.used as f32 / k.total as f32 } else { 0.0 };
+    bar(cv, xs[0], top + line + (GLYPH_H - BAR_H) / 2, pw, frac, ink().cyan);
+    let rounded = match k.rounded {
+        Some(r) => format!("{} {} ({} %)", l.s(Key::mon_heap_rounded), kib(r), k.rounding_pct()),
+        None => format!("{} —", l.s(Key::mon_heap_rounded)),
+    };
+    cv.text(&fit(&rounded, pw), xs[0], top + 2 * line, ink().muted);
+    cv.text(&fit(&format!("{} {}", l.s(Key::mon_heap_front_cache), kib(k.front_cache)), pw), xs[0], top + 3 * line, ink().muted);
+
+    // Growth.
+    plate_head(cv, xs[1], top, pw, l.s(Key::mon_heap_growth), &kib(k.grown));
+    let frac = if k.limit > 0 { k.total as f32 / k.limit as f32 } else { 0.0 };
+    bar(cv, xs[1], top + line + (GLYPH_H - BAR_H) / 2, pw, frac, ink().cyan);
+    cv.text(&fit(&format!("{} {} · {} {}", l.s(Key::mon_heap_limit), kib(k.limit), l.s(Key::mon_heap_given_back), kib(k.given_back)), pw), xs[1], top + 2 * line, ink().muted);
+    // The kernel's reason is English; none to give when nothing was refused.
+    let refusals = if k.grow_refusals.starts_with("0 ") { "0" } else { k.grow_refusals.as_str() };
+    cv.text(&fit(&format!("{} {}", l.s(Key::mon_heap_refusals), refusals), pw), xs[1], top + 3 * line, ink().muted);
+
+    // Fragmentation.
+    plate_head(cv, xs[2], top, pw, l.s(Key::mon_heap_fragmentation), "");
+    cv.text(l.s(Key::mon_heap_largest_free), xs[2], top + line, ink().muted);
+    text_right(cv, &k.largest_free.map_or("—".into(), kib), xs[2] + pw, top + line, ink().text);
+    cv.text(l.s(Key::mon_heap_releasable), xs[2], top + 2 * line, ink().muted);
+    text_right(cv, &kib(k.releasable), xs[2] + pw, top + 2 * line, ink().text);
+    let free_blocks: u64 = k.free_by_size.iter().map(|(_, n)| n).sum();
+    cv.text(&fit(&format!("{free_blocks} {}", l.s(Key::mon_heap_free_by_size).to_lowercase()), pw), xs[2], top + 3 * line, ink().muted);
+
+    // History: one column per sample, total in the well, used in cyan.
+    plate_head(cv, xs[3], top, pw, l.s(Key::mon_heap_history), "");
+    let gh = 3 * line - 8;
+    let gy = top + line;
+    let peak = m.kheap_hist.iter().map(|&(_, t)| t).max().unwrap_or(1).max(1);
+    let n = m.kheap_hist.len().max(1) as i32;
+    let cw = (pw / KHEAP_HIST as i32).max(1);
+    let x0 = xs[3] + pw - n * cw;
+    for (i, &(used, total)) in m.kheap_hist.iter().enumerate() {
+        let x = x0 + i as i32 * cw;
+        let th = (total as f64 / peak as f64 * gh as f64) as i32;
+        let uh = (used as f64 / peak as f64 * gh as f64) as i32;
+        cv.fill_rect_a(x, gy + gh - th, cw, th, ink().hairline, 1.0);
+        cv.fill_rect_a(x, gy + gh - uh, cw, uh, ink().cyan, 0.8);
+    }
+    cv.hline(0, HEAD_H + STRIP_H - 1, w, ink().hairline, 1.0);
+
+    // Lists: free blocks by size | regions | live blocks by size.
+    let ly = HEAD_H + STRIP_H + PAD;
+    let cw = (w - 2 * PAD - 2 * gap) / 3;
+    let rows = ((h - ly - FOOT_H) / (GLYPH_H + 6) - 1).max(0) as usize;
+    let list = |cv: &mut Canvas, x: i32, title: &str, items: Vec<(String, String)>| {
+        cv.text_bold(title, x, ly, ink().cyan);
+        for (i, (a, b)) in items.iter().take(rows).enumerate() {
+            let y = ly + (i as i32 + 1) * (GLYPH_H + 6);
+            cv.text(&fit(a, cw - 12 * GLYPH_W), x, y, ink().muted);
+            text_right(cv, b, x + cw, y, ink().text);
+        }
+    };
+    let free: Vec<_> = k
+        .free_by_size
+        .iter()
+        .rev()
+        .map(|&(size, n)| (fmt_block(size), format!("{n} · {}", kib(size * n / 1024))))
+        .collect();
+    list(cv, PAD, l.s(Key::mon_heap_free_by_size), free);
+    let regions: Vec<_> = k
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(i, &(s, e))| {
+            let name = if i == 0 { l.s(Key::mon_heap_arena).to_string() } else { format!("#{i} {s:#x}") };
+            (name, kib((e - s) / 1024))
+        })
+        .collect();
+    list(cv, PAD + cw + gap, l.s(Key::mon_heap_regions), regions);
+    let mut live: Vec<_> = k.live_by_size.clone();
+    live.sort_by_key(|&(size, n)| std::cmp::Reverse(size * n));
+    let live: Vec<_> = live.iter().map(|&(size, n)| (format!("≤ {}", fmt_block(size)), format!("{n} · {}", kib(size * n / 1024)))).collect();
+    list(cv, PAD + 2 * (cw + gap), l.s(Key::mon_heap_live_by_size), live);
 }
 
 fn plate_head(cv: &mut Canvas, x: i32, y: i32, w: i32, title: &str, value: &str) {
@@ -1283,6 +1426,7 @@ impl Mon {
                     }
                 }
             }
+            Tab::Heap => {}
             Tab::Servers => {
                 for (r, v) in b.iter().zip([Verb::Start, Verb::Restart, Verb::Stop]) {
                     if hit(*r, x, y) {
@@ -1476,6 +1620,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 match st.mon.tab {
                     Tab::Procs => st.mon.scroll(if value > 0.0 { 3 } else { -3 }, n),
                     Tab::Svcs | Tab::Servers => st.mon.move_sel(if value > 0.0 { 1 } else { -1 }, n),
+                    Tab::Heap => {}
                 }
                 st.render();
             }
@@ -1573,6 +1718,20 @@ fn sample_mon(lang: Lang) -> Mon {
         "ntpd: reply from 162.159.200.123: offset:+0.0029".into(),
         "ntpd: adjusting clock by 0.003s".into(),
     ];
+    // The heap as a desktop that grew once and gave most of it back.
+    for k in 0..30u64 {
+        m.fold_kheap(sysmon::parse_kheap(&format!(
+            "KernelHeapUsed: {} kB\nKernelHeapTotal: {} kB\nKernelHeapGivenBack: 32768 kB\n\
+             KernelHeapRounded: 61440 kB\nKernelHeapFrontCache: 812 kB\nKernelHeapGrown: 32768 kB\n\
+             KernelHeapReleasable: 16384 kB\nKernelHeapLimit: 2097152 kB\nKernelHeapLargestFree: 262144 kB\n\
+             KernelHeapGrowRefusals: 0 (never refused)\nfree blocks by size:\n        16B x 310\n      4096B x 21\n  \
+             268435456B x 1\nheap regions: 2 on record\n  #0   [0xffffff0000200000, 0xffffff0020200000)  512 MiB\n  \
+             #1   [0xffff800100000000, 0xffff800102000000)  32 MiB\nlive by size class:\n  <=        64B x 120000   (<= 7 MiB)\n  \
+             <=      4096B x 3000     (<= 11 MiB)\n",
+            40_000 + k * 300,
+            if k < 12 { 524_288 } else { 557_056 },
+        )));
+    }
     m
 }
 
@@ -1590,6 +1749,7 @@ fn dump(spec: &str) -> ! {
     let mut m = sample_mon(Lang::current());
     match parts.next() {
         Some("servicios") => m.tab = Tab::Svcs,
+        Some("heap") => m.tab = Tab::Heap,
         Some("servidores") => {
             m.tab = Tab::Servers;
             m.sel_srv = m.servers.iter().position(|s| s.service == "unet").unwrap_or(0);
@@ -1619,9 +1779,9 @@ fn main() {
     match args.next().as_deref() {
         None => {}
         Some("--dump") => dump(&args.next().unwrap_or_else(|| "lunarmon.raw".into())),
-        Some("--servicios" | "--servidores") => {}
+        Some("--servicios" | "--servidores" | "--heap") => {}
         Some(_) => {
-            eprintln!("usage: lunarmon [--servicios | --servidores | --dump PATH:WxH[:servicios|:servidores]]");
+            eprintln!("usage: lunarmon [--servicios | --servidores | --heap | --dump PATH:WxH[:servicios|:servidores|:heap]]");
             std::process::exit(2);
         }
     }
@@ -1630,6 +1790,7 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--servicios") => mon.tab = Tab::Svcs,
         Some("--servidores") => mon.tab = Tab::Servers,
+        Some("--heap") => mon.tab = Tab::Heap,
         _ => {}
     }
     let mut prev = Prev::default();
@@ -1863,7 +2024,7 @@ mod tests {
         assert_eq!(net.program, "eclipse-netstack");
         assert_eq!((net.driver_pid, net.driver_restarts), (Some(263), 2));
         assert_eq!(gives_long(&net.gives, Lang::Es), "pila propia 10.0.9.15/24 · 52:54:00:12:34:57");
-        // Tab goes round all three lists.
+        // Tab goes round all four views.
         m.key(KEY_TAB_WL, false, 10, &mut nothing);
         assert_eq!(m.tab, Tab::Svcs);
         m.key(KEY_TAB_WL, false, 10, &mut nothing);
@@ -1875,6 +2036,8 @@ mod tests {
             Ok(())
         }); // R
         assert_eq!(asked, vec![Pending::Service("unet".into(), Verb::Restart)]);
+        m.key(KEY_TAB_WL, false, 10, &mut nothing);
+        assert_eq!(m.tab, Tab::Heap);
         m.key(KEY_TAB_WL, false, 10, &mut nothing);
         assert_eq!(m.tab, Tab::Procs);
     }

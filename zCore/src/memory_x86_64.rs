@@ -221,11 +221,15 @@ fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize>
         if let Some(idx) = pcp::alloc() {
             return Some(idx);
         }
-        FRAME_ALLOCATOR.lock().alloc()
+        let got = FRAME_ALLOCATOR.lock().alloc();
+        note_frames_level();
+        got
     } else {
-        FRAME_ALLOCATOR
+        let got = FRAME_ALLOCATOR
             .lock()
-            .alloc_contiguous(frame_count, align_log2)
+            .alloc_contiguous(frame_count, align_log2);
+        note_frames_level();
+        got
     }
 }
 
@@ -251,6 +255,83 @@ fn frame_alloc_quiet(frame_count: usize, align_log2: usize) -> Option<PhysAddr> 
         track_mark_alloc(idx + i);
     }
     Some(frame_idx_to_phys_addr(idx))
+}
+
+/// RAM userspace may not take: what the kernel keeps to grow its heap, map
+/// page tables and fill vmalloc blocks once processes have eaten the rest.
+/// Linux's `min_free_kbytes`, sized the same way it ends up in practice: 1/64
+/// of RAM between 16 and 64 MiB (32 MiB at 2 GiB), never more than 1/8.
+///
+/// Without it a fork bomb took every frame (967 / 967 MiB), the heap could
+/// not grow past its arena, and the next large kernel allocation was a panic
+/// with the emergency reserve already spent -- the user had starved the
+/// kernel of the memory it needs to kill the user.
+pub fn frame_reserve() -> usize {
+    reserve_for(TOTAL_MEMORY.load(Ordering::Relaxed))
+}
+
+/// [`frame_reserve`] for `total` bytes of RAM: reclaimd sizes its
+/// watermarks from the same `total` it was handed.
+pub fn reserve_for(total: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    (total / 64).clamp(16 * MIB, 64 * MIB).min(total / 8)
+}
+
+/// Set while free RAM is within twice the reserve, so that a user frame
+/// allocation takes the exact (and dearer) look at the counters. Clear, the
+/// user path costs one relaxed load. Refreshed every time a per-CPU list goes
+/// to the bitmap for a batch, so it lags by at most a list per CPU.
+static FRAMES_LOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// User frame allocations refused to keep the reserve, since boot.
+static USER_FRAME_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Free RAM, exactly: frames parked in the per-CPU lists are free.
+fn frames_free() -> usize {
+    TOTAL_MEMORY
+        .load(Ordering::Relaxed)
+        .saturating_sub(FRAMES_USED.get())
+}
+
+/// Recompute [`FRAMES_LOW`]. Sums every CPU's row, so it runs where the
+/// bitmap is visited anyway, not on every page.
+fn note_frames_level() {
+    let low = frames_free() < frame_reserve().saturating_mul(2);
+    if FRAMES_LOW.load(Ordering::Relaxed) != low {
+        FRAMES_LOW.store(low, Ordering::Relaxed);
+    }
+}
+
+/// User frame allocations refused since boot, for `/proc/kheap`.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+pub fn user_frame_refusals() -> u64 {
+    USER_FRAME_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// One frame for a user mapping or a page cache page: [`frame_alloc`], except
+/// that it will not take RAM out of the [`frame_reserve`].
+///
+/// A refusal reclaims first, as Linux's allocator does below its min
+/// watermark, and then asks reclaimd for the reserve: reclaimd sees the same
+/// shortage, and when the caches give nothing its OOM killer picks a victim
+/// while the kernel still has the RAM to do it.
+pub fn frame_alloc_user() -> Option<PhysAddr> {
+    if FRAMES_LOW.load(Ordering::Relaxed) {
+        let reserve = frame_reserve();
+        let need = reserve + (1 << PAGE_BITS);
+        let free = frames_free();
+        if free < need {
+            kernel_hal::shrinker::shrink(need - free);
+            if frames_free() < need {
+                USER_FRAME_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                kernel_hal::shrinker::request(reserve);
+                return None;
+            }
+        } else if free >= reserve.saturating_mul(2) {
+            FRAMES_LOW.store(false, Ordering::Relaxed);
+        }
+    }
+    frame_alloc(1, 0)
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
@@ -404,6 +485,54 @@ pub fn frame_dealloc(target: PhysAddr) {
     FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
+/// Give `count` frames starting at `start` back to the bitmap in one go,
+/// past the per-CPU lists.
+///
+/// For a run the kernel heap gives back (`release_free_blocks`). Freed one
+/// frame at a time, a run went through [`frame_dealloc`] and so through
+/// `pcp::free`, which parks up to a list's capacity on this CPU: the first
+/// frames of the run, the ones pushed while the list had room. The bitmap
+/// then saw the run with a hole at its start, and the heap's next growth
+/// ahead of demand -- which asks the bitmap only (`frame_alloc_quiet`) --
+/// could not take back the very run it had just returned.
+///
+/// The bitmap's lock is taken once per 2 MiB, so a 32 MiB run holds it, with
+/// interrupts off, sixteen short times rather than once for the whole run.
+/// A frame of the run that the bitmap already holds free is a double free,
+/// and ends the kernel as [`frame_dealloc`]'s would.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn frame_dealloc_run(start: PhysAddr, count: usize) {
+    // `mem-debug` wants every frame through the tracker and the poison.
+    #[cfg(feature = "mem-debug")]
+    for i in 0..count {
+        frame_dealloc(start + (i << PAGE_BITS));
+    }
+    #[cfg(not(feature = "mem-debug"))]
+    {
+        use bitmap_allocator::BitAlloc;
+        const BATCH: usize = 512;
+        let first = phys_addr_to_frame_idx(start);
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(BATCH);
+            let run = first + done..first + done + n;
+            {
+                let mut ba = FRAME_ALLOCATOR.lock();
+                if let Some(free) = run.clone().find(|&i| ba.test(i)) {
+                    drop(ba);
+                    panic!(
+                        "frame_dealloc_run: frame {:#x} is already free",
+                        free << PAGE_BITS
+                    );
+                }
+                ba.insert(run);
+            }
+            FRAMES_USED.sub(n << PAGE_BITS);
+            done += n;
+        }
+    }
+}
+
 pub fn frame_stats() -> (usize, usize) {
     (FRAMES_USED.get(), TOTAL_MEMORY.load(Ordering::Relaxed))
 }
@@ -502,40 +631,23 @@ pub fn reserve_active_page_table_frames() {
     );
 }
 
-/// Combined usage for `/proc/meminfo` and diagnostics.
+/// Usage for `/proc/meminfo`, `sysinfo(2)` and reclaimd's watermark: the
+/// RAM the frame allocator manages, and how much of it is taken.
 ///
-/// The chunks the elastic heap took from RAM are counted ONCE, as heap. They
-/// are frames too -- `frame_alloc` charged them to `FRAMES_USED` and they are
-/// inside `TOTAL_MEMORY` -- and adding the two figures as they stand counted
-/// every grown MiB as used RAM *plus* as heap: the part of a chunk nobody was
-/// using any more still read as used. So after a big program exited, the heap
-/// it had made grow kept `used` up for the rest of the boot, and to `free` that
-/// is memory a closed program never gave back. Taken out of the frame side
-/// here, a chunk is what the static arena already is: its live bytes are used,
-/// the rest is free.
+/// The kernel heap is NOT added on top, the way Linux leaves its slab out of
+/// `MemTotal` and counts it as used. The 512 MiB arena is kernel BSS, outside
+/// the frames, and only the kernel can allocate from it; added to both sides,
+/// its free part read as free memory. On a 2 GiB machine `MemFree` said
+/// 1.45 GiB while a program could get about 900 MiB, so anything sized by
+/// `MemAvailable` overshot by the whole arena -- and reclaimd's watermark and
+/// OOM check, which read the same figure, saw 500 MiB of slack that no process
+/// could use.
+///
+/// Grown heap chunks are frames, so they are in here once, as used. The part
+/// of a chunk the heap could give back is `heap_releasable`, which the heap
+/// shrinker reports and `MemAvailable` counts, like any cache.
 pub fn stats() -> (usize, usize) {
-    combined_stats(
-        HEAP_USED.get(),
-        heap_total(),
-        heap_grown(),
-        FRAMES_USED.get(),
-        TOTAL_MEMORY.load(Ordering::Relaxed),
-    )
-}
-
-/// [`stats`] for given counters, so the arithmetic can be tested on the host,
-/// where the heap is the host's and every counter reads zero.
-fn combined_stats(
-    heap_used: usize,
-    heap_total: usize,
-    heap_grown: usize,
-    frames_used: usize,
-    ram: usize,
-) -> (usize, usize) {
-    (
-        heap_used + frames_used.saturating_sub(heap_grown),
-        heap_total + ram.saturating_sub(heap_grown),
-    )
+    frame_stats()
 }
 
 /// What the kernel heap keeps after it gives growth back: the buddy's bytes
@@ -1159,6 +1271,12 @@ cfg_if! {
         /// Costs nothing on the hot path: only allocations already ≥2 MiB touch
         /// it, and the walk is the same frame-pointer chain the reporters use.
         const BIG_ALLOC_MIN: usize = 2 * 1024 * 1024;
+        /// The smallest buddy block served from `kernel_hal::vmalloc` instead.
+        /// Below it a block is a few pages, contiguous runs of which are easy
+        /// to find, and a page-table walk per block would cost more than the
+        /// rounding it saves.
+        #[cfg_attr(feature = "mem-debug", allow(dead_code))]
+        const KVMALLOC_MIN: usize = 1024 * 1024;
         const BIG_TRACK_SLOTS: usize = 128;
         const BIG_TRACK_FRAMES: usize = 3;
 
@@ -1450,12 +1568,32 @@ cfg_if! {
         /// chunk [`try_grow_heap`] has taken from physical RAM.
         static HEAP_TOTAL: AtomicUsize = AtomicUsize::new(KERNEL_HEAP_SIZE);
 
+        /// Bytes of buddy blocks the heap's callers hold: [`HEAP_USED`] with
+        /// every request rounded the way the buddy rounds it (see
+        /// [`buddy_block_size`]). What the growth watermark compares with
+        /// [`HEAP_TOTAL`], because that is what the buddy has given out.
+        ///
+        /// [`HEAP_USED`] counts requested bytes, and against a heap made of
+        /// power-of-two blocks that undercounts by up to half: a 4 MiB + 2 KiB
+        /// request takes an 8 MiB block, a 64 KiB + 16 one takes 128 KiB. A
+        /// desktop session ran the pool out with [`HEAP_USED`] at ~54 %, so
+        /// growth ahead of demand at 70 % fired late or never, and the growth
+        /// happened instead on the failure path, inside the caller whose
+        /// allocation had just been refused.
+        static HEAP_ROUNDED: BatchedCounter<{ 64 * 1024 }> = BatchedCounter::new();
+
+        /// [`HEAP_ROUNDED`], for the diagnostics.
+        #[allow(dead_code)]
+        pub fn heap_used_rounded() -> usize {
+            HEAP_ROUNDED.get()
+        }
+
         pub fn heap_total() -> usize {
             HEAP_TOTAL.load(Ordering::Relaxed)
         }
 
         /// Bytes the heap has taken from the frame allocator past its static
-        /// arena: frames that are heap now, and counted as heap by [`stats`].
+        /// arena: frames that are heap now, counted as used frames by [`stats`].
         pub fn heap_grown() -> usize {
             heap_total().saturating_sub(KERNEL_HEAP_SIZE)
         }
@@ -1734,12 +1872,11 @@ cfg_if! {
         /// cannot count on that, and `heap_regions::absorb` is what keeps the
         /// merged blocks freeable.)
         fn buddy_block_size(layout: Layout) -> usize {
-            layout
-                .size()
-                .next_power_of_two()
-                .max(layout.align())
-                .max(core::mem::size_of::<usize>())
+            buddy_system_allocator::block_size(layout)
         }
+        // The front cache rounds with its own copy of the formula (it is
+        // compiled for the host tests, where this crate is not linked).
+        const _: () = assert!(1 << free_lists::MIN_CLASS == buddy_system_allocator::MIN_BLOCK);
 
         /// The chunk sizes a growth tries, largest first, for a block of
         /// `need` bytes (`0`: any): the usual chunks that can hold such a
@@ -1859,12 +1996,33 @@ cfg_if! {
                 // shrinkers and logs on each refusal, which is right for an
                 // allocation the buddy refused and far too much for a growth
                 // nobody is waiting on.
+                //
+                // First, though, a run aligned to the chunk itself, from the
+                // bitmap alone. `add_to_heap` carves a region into the largest
+                // self-aligned blocks that fit, so a 32 MiB run on a mere page
+                // boundary became some twenty blocks and never one of 32 MiB:
+                // the heap could not hand out what it had just taken in one
+                // piece, and could never give it all back either, because the
+                // release takes whole free blocks of at least
+                // `HEAP_RELEASE_MIN` and the run's ragged edges are smaller.
+                // Each region left a few hundred KiB with the heap for good
+                // (12 MiB over 47 growths in a host model of the release).
+                // Aligned, the chunk is one block, and once free it goes back
+                // whole and the region with it.
                 let align = heap_grow_align_log2(need);
-                let pa = if need > 0 {
-                    frame_alloc(chunk >> PAGE_BITS, align)
+                let whole = heap_grow_align_log2(chunk).max(align);
+                let aligned = if whole > align {
+                    frame_alloc_quiet(chunk >> PAGE_BITS, whole)
                 } else {
-                    frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                    None
                 };
+                let pa = aligned.or_else(|| {
+                    if need > 0 {
+                        frame_alloc(chunk >> PAGE_BITS, align)
+                    } else {
+                        frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                    }
+                });
                 if let Some(pa) = pa {
                     got = Some((pa, chunk));
                     break;
@@ -1905,6 +2063,10 @@ cfg_if! {
                 HEAP_ALLOCATOR.0.lock().add_to_heap(va, va + chunk);
             }
             HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed);
+            HEAP_GREW_AT_MS.store(
+                kernel_hal::timer::timer_now().as_millis() as u64,
+                Ordering::Relaxed,
+            );
             // The vtable-liveness ceiling (`set_vtable_max`) is deliberately
             // LEFT ALONE here. It rests on "the image links .rodata below
             // .bss, so no real vtable is at or above the static heap base" —
@@ -1977,6 +2139,27 @@ cfg_if! {
             heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual()).min(grown)
         }
 
+
+        /// Free blocks of each buddy class (entry `i`: blocks of `1 << i`
+        /// bytes), or `None` while the heap lock is busy. For `/proc/kheap`.
+        pub fn heap_free_blocks() -> Option<[usize; ORDER]> {
+            HEAP_ALLOCATOR.0.try_lock().map(|h| h.free_blocks())
+        }
+
+        /// Bytes of buddy blocks handed out, rounding included, or `None`
+        /// while the heap lock is busy. Front-cache blocks count as handed
+        /// out here.
+        pub fn heap_alloc_actual() -> Option<usize> {
+            HEAP_ALLOCATOR.0.try_lock().map(|h| h.stats_alloc_actual())
+        }
+
+        /// Bytes parked in the per-CPU front caches.
+        pub fn heap_front_cached() -> usize {
+            #[cfg(not(feature = "mem-debug"))]
+            return slab::cached_bytes();
+            #[cfg(feature = "mem-debug")]
+            0
+        }
 
         /// The most often [`release_idle_heap`] drains the front caches.
         const FRONT_CACHE_DRAIN_EVERY_MS: u64 = 10_000;
@@ -2058,9 +2241,7 @@ cfg_if! {
                     break;
                 };
                 let pa = kernel_hal::mem::virt_to_phys(va);
-                for i in 0..size >> PAGE_BITS {
-                    frame_dealloc(pa + (i << PAGE_BITS));
-                }
+                frame_dealloc_run(pa, size >> PAGE_BITS);
                 freed += size;
             }
             (freed, starved)
@@ -2107,6 +2288,35 @@ cfg_if! {
             freed
         }
 
+        /// How long after a growth the periodic release leaves the heap alone.
+        const HEAP_RELEASE_QUIET_MS: u64 = 5_000;
+        /// `timer_now` in ms of the last growth, `0` for none since boot.
+        static HEAP_GREW_AT_MS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+
+        /// [`release_idle_heap`] for `reclaimd`'s periodic pass: the same,
+        /// except within [`HEAP_RELEASE_QUIET_MS`] of a growth, when it gives
+        /// nothing back.
+        ///
+        /// A growth means the heap was short a moment ago, and the room
+        /// [`heap_release_room`] sees then is mostly the growth itself plus
+        /// free space the arena has in pieces too small to use. Released at
+        /// once, the next large block (a 4 MiB coroutine stack in a burst)
+        /// fails again, the failure path takes a fresh 32 MiB run, and the
+        /// next pass, 200 ms later, gives most of it back: a scan of the
+        /// frame bitmap and thousands of frames freed for each turn of a
+        /// cycle that ends where it started. The shrinker keeps calling
+        /// [`release_idle_heap`] itself, unhindered, because that call comes
+        /// from a frame allocation that is short of RAM right now.
+        pub fn release_spare_heap(want: usize) -> usize {
+            let grew = HEAP_GREW_AT_MS.load(Ordering::Relaxed);
+            let now = kernel_hal::timer::timer_now().as_millis() as u64;
+            if grew != 0 && now.saturating_sub(grew) < HEAP_RELEASE_QUIET_MS {
+                return 0;
+            }
+            release_idle_heap(want)
+        }
+
         /// The release as a cache the reclaim paths can ask: a frame
         /// allocation that fails, and `drop_caches`, then get the heap's spare
         /// growth back as well. It never answers for the heap's own failures:
@@ -2144,6 +2354,8 @@ cfg_if! {
             // and must be leaked, not dispatched. See
             // `zcore_drivers::utils::fat_ptr`.
             kernel_hal::drivers::utils::set_vtable_max(heap_start);
+            #[cfg(not(feature = "mem-debug"))]
+            kernel_hal::vmalloc::register_shrinker();
             if !kernel_hal::shrinker::register(&HEAP_SHRINKER) {
                 crate::klog_info!("memory: shrinker registry full, heap growth is given back only by reclaimd");
             }
@@ -2571,6 +2783,20 @@ cfg_if! {
                 }
             }
 
+            /// Bytes every CPU's cache holds, the caches busy right now left
+            /// out. Counted as free by the heap's figures, and as in use by
+            /// the buddy, which cannot merge them.
+            pub fn cached_bytes() -> usize {
+                SLAB.iter()
+                    .filter_map(|c| c.try_lock())
+                    .map(|c| {
+                        (0..free_lists::NUM_CLASSES)
+                            .map(|i| c.count(i) as usize * free_lists::class_size(i))
+                            .sum::<usize>()
+                    })
+                    .sum()
+            }
+
             pub fn try_free(
                 slot: usize,
                 ptr: *mut u8,
@@ -2778,6 +3004,25 @@ cfg_if! {
                 // path.
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
+                // A block the buddy would make 1 MiB or more: mapped from
+                // scattered frames instead, page by page, no power of two and
+                // no contiguous run. See `kernel_hal::vmalloc`. `None` (no
+                // window, no frames, the window busy on this CPU) falls
+                // through to the buddy, as before.
+                #[cfg(not(feature = "mem-debug"))]
+                if buddy_block_size(ext) >= KVMALLOC_MIN && layout.align() <= 4096 {
+                    if let Some(p) = kernel_hal::vmalloc::alloc(sz) {
+                        if sz >= BIG_ALLOC_MIN {
+                            track_big_alloc(p, sz);
+                        }
+                        kernel_hal::kstats::note_heap_alloc(if prof {
+                            core::arch::x86_64::_rdtsc().wrapping_sub(t0)
+                        } else {
+                            0
+                        });
+                        return p as *mut u8;
+                    }
+                }
                 // Front cache first (default build); a miss falls through to the
                 // buddy. The cache serves the common small alloc/free pair in
                 // O(1), keeping the buddy's class free lists short so its O(n)
@@ -2901,9 +3146,10 @@ cfg_if! {
                     }
                     HEAP_USED.add_on(slot, sz as isize);
                     let used = HEAP_USED.approx();
+                    HEAP_ROUNDED.add_on(slot, buddy_block_size(ext) as isize);
                     HEAP_LIVE.add_on(slot, bucket_of(sz), 1);
                     hot_track(slot, sz, 1);
-                    try_grow_heap(used);
+                    try_grow_heap(HEAP_ROUNDED.approx());
                     note_heap_pressure(used, p as usize, sz);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
@@ -2930,6 +3176,22 @@ cfg_if! {
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
                 let sz = layout.size();
+                // A large block from the vmalloc window: none of the heap's
+                // bookkeeping below ever saw it.
+                #[cfg(not(feature = "mem-debug"))]
+                if kernel_hal::vmalloc::owns(ptr as usize) {
+                    if sz >= BIG_ALLOC_MIN {
+                        untrack_big_alloc(ptr as usize);
+                    }
+                    if !kernel_hal::vmalloc::free(ptr as usize) {
+                        emit(format_args!(
+                            "\n[vmalloc] free of {:#x} ({} bytes): not a live block, leaked\n",
+                            ptr as usize, sz
+                        ));
+                    }
+                    let _ = slot;
+                    return;
+                }
                 // BEFORE anything touches this block, and before the front
                 // cache gets a chance to keep it. The buddy's free lists are
                 // intrusive -- a freed block's own first words become the
@@ -2990,6 +3252,7 @@ cfg_if! {
                     core::ptr::write_bytes(ptr, POISON, sz);
                 }
                 HEAP_USED.add_on(slot, (sz as isize).wrapping_neg());
+                HEAP_ROUNDED.add_on(slot, (buddy_block_size(ext) as isize).wrapping_neg());
                 HEAP_LIVE.add_on(slot, bucket_of(sz), -1);
                 if sz >= BIG_ALLOC_MIN {
                     untrack_big_alloc(ptr as usize);
@@ -3041,6 +3304,8 @@ cfg_if! {
             (0, "no elastic heap", 0, 0, 0)
         }
 
+        // Read only by `/proc/kheap`, which libos does not build.
+        #[allow(dead_code)]
         pub fn heap_grown() -> usize {
             0
         }
@@ -3066,6 +3331,12 @@ cfg_if! {
         /// surface, which is exactly what this attribute is for here.
         #[allow(dead_code)]
         pub fn release_idle_heap(_want: usize) -> usize {
+            0
+        }
+
+        /// See the bare-metal [`release_spare_heap`]; nothing to give here.
+        #[allow(dead_code)]
+        pub fn release_spare_heap(_want: usize) -> usize {
             0
         }
 
@@ -3531,279 +3802,8 @@ pub mod alloc_sites {
 // That is why the feature sat here since it was written with no way to turn it
 // on -- no Makefile switch, and no job compiling it.
 #[cfg_attr(any(feature = "libos", feature = "mem-debug"), allow(dead_code))]
-pub mod free_lists {
-    use core::alloc::Layout;
-
-    // Cache buddy classes 2^3 (8 B, the buddy minimum) .. 2^12 (4 KiB).
-    // That covers every hot fork object and the general small-allocation
-    // churn; larger buffers (I/O, 1 MiB readahead) churn rarely and would
-    // pin too much idle RAM, so they go straight to the buddy.
-    pub const MIN_CLASS: usize = 3; // 2^3 = 8 B
-    pub const MAX_CLASS: usize = 12; // 2^12 = 4 KiB
-    pub const NUM_CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
-    // Per-class ceiling on the number of cached blocks. A freed block past
-    // the cap is handed to the buddy (where its buddy may coalesce) instead
-    // of cached: bounding the cache keeps the buddy from starving of large
-    // contiguous blocks and stops idle RAM accumulating in it.
-    //
-    // This is the ceiling, not the cap: see [`cap_of`], which is what `push`
-    // asks. The cap used to be this number for every class, which is a cap on
-    // *blocks* and therefore a cap on bytes that grows with the class -- 8 KiB
-    // in the 8-byte class and 4 MiB in the 4 KiB one. With one cache in the
-    // system that came to ~8 MiB of a 512 MiB heap and nobody minded; with a
-    // cache per CPU (`PERCPU_SLOTS` of them) the same number would reserve
-    // ~520 MiB, which is the whole heap. So the cap is now a cap on BYTES.
-    pub const CAP: u32 = 1024;
-
-    /// Bytes a single class of a single CPU's cache may hold.
-    ///
-    /// The quantity worth bounding, because what the cache costs the buddy is
-    /// RAM it cannot hand out, not list entries. 64 KiB per class is 10 classes
-    /// x 64 KiB ~ 504 KiB per CPU once [`CAP`] clips the small classes, so the
-    /// whole table is ~31 MiB of a 512 MiB heap at `MAX_CORE_NUM = 64` -- and
-    /// that is the worst case, every class of every CPU full at once.
-    pub const CLASS_BUDGET: usize = 64 * 1024;
-
-    /// Fewest blocks a class keeps whatever its size, so the top classes still
-    /// cache something. 4 KiB x 16 = 64 KiB, which is `CLASS_BUDGET` exactly;
-    /// it is a floor only if `CLASS_BUDGET` is ever lowered.
-    pub const MIN_CAP: u32 = 16;
-
-    /// How many blocks of class `i` one CPU's cache may hold.
-    ///
-    /// `CLASS_BUDGET / class_size(i)`, clamped into `MIN_CAP..=CAP`. This is
-    /// the `limit` of Linux's per-CPU array caches, and for the same reason:
-    /// a small object churns far more than a 4 KiB one and is far cheaper to
-    /// keep, so the two must not get the same block count.
-    pub const fn cap_of(i: usize) -> u32 {
-        let blocks = CLASS_BUDGET / class_size(i);
-        if blocks < MIN_CAP as usize {
-            MIN_CAP
-        } else if blocks > CAP as usize {
-            CAP
-        } else {
-            blocks as u32
-        }
-    }
-
-    /// Bytes one CPU's cache may hold with every class full.
-    ///
-    /// Nothing in the kernel reads it -- the figure it checks is a compile-time
-    /// property of the constants above, so the test is the only caller there
-    /// can be, and the crate denies warnings.
-    #[cfg(test)]
-    pub const fn budget_per_cpu() -> usize {
-        let mut total = 0;
-        let mut i = 0;
-        while i < NUM_CLASSES {
-            total += cap_of(i) as usize * class_size(i);
-            i += 1;
-        }
-        total
-    }
-
-    /// What a free block of the cache holds in its second word. Mixed with
-    /// the block's own address, so a value copied out of one free block into
-    /// another live object can never pass for the tag of the second.
-    const FREE_TAG: usize = 0x5a1b_f4ee_b10c_c0de;
-
-    pub fn tag_of(block: usize) -> usize {
-        FREE_TAG ^ block
-    }
-
-    /// Bytes in a block of class `i`.
-    pub const fn class_size(i: usize) -> usize {
-        1 << (i + MIN_CLASS)
-    }
-
-    /// Cache-array index for `layout`, or `None` when it is larger than
-    /// the top cached class. The class formula matches
-    /// buddy_system_allocator exactly, so a cached block is byte-for-byte
-    /// what the buddy would have handed out.
-    #[inline]
-    pub fn cache_slot(layout: Layout) -> Option<usize> {
-        // Guard before `next_power_of_two` so an oversize request can
-        // never overflow it (and matches the buddy's own bypass of the
-        // cache for large blocks).
-        if layout.size() > (1 << MAX_CLASS) || layout.align() > (1 << MAX_CLASS) {
-            return None;
-        }
-        let size = core::cmp::max(
-            layout.size().next_power_of_two(),
-            core::cmp::max(layout.align(), core::mem::size_of::<usize>()),
-        );
-        // size ∈ [8, 4096] given the guard, so class ∈ [3, 12].
-        Some(size.trailing_zeros() as usize - MIN_CLASS)
-    }
-
-    /// What was wrong with a free block's link.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum LinkFault {
-        /// Not a block of this class the heap owns.
-        Outside,
-        /// A block of the heap's, but one that does not carry the free mark.
-        NotFree,
-        /// Zero, with more free blocks still counted behind it.
-        Zeroed,
-        /// Non-zero, from the last free block of its class.
-        PastEnd,
-    }
-
-    /// A block the cache refused, and what was found in it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Broken {
-        /// `block`'s link to the next free block is `link`, which is wrong in
-        /// the way `why` says: something wrote over the block's first word
-        /// after it was freed. `lost` more blocks were behind it.
-        Link {
-            block: usize,
-            link: usize,
-            lost: u32,
-            why: LinkFault,
-        },
-        /// `block`'s second word holds `found` instead of its free mark:
-        /// something wrote into the block after it was freed. `lost` more
-        /// blocks were behind it.
-        Tag {
-            block: usize,
-            found: usize,
-            lost: u32,
-        },
-        /// `block` was freed while already free.
-        DoubleFree { block: usize },
-    }
-
-    impl Broken {
-        pub fn block(self) -> usize {
-            match self {
-                Broken::Link { block, .. }
-                | Broken::Tag { block, .. }
-                | Broken::DoubleFree { block } => block,
-            }
-        }
-    }
-
-    pub struct SlabCache {
-        // head[i]: first free block of class MIN_CLASS+i (0 = empty). The
-        // block's first word holds the next pointer while it is cached.
-        head: [usize; NUM_CLASSES],
-        count: [u32; NUM_CLASSES],
-    }
-
-    impl SlabCache {
-        pub const fn new() -> Self {
-            SlabCache {
-                head: [0; NUM_CLASSES],
-                count: [0; NUM_CLASSES],
-            }
-        }
-
-        /// Blocks cached in class `i`.
-        #[cfg(test)]
-        pub fn count(&self, i: usize) -> u32 {
-            self.count[i]
-        }
-
-        /// Take a block of class `i`; `Ok(None)` when the class is empty.
-        ///
-        /// `owns(addr, size)` answers whether `[addr, addr + size)` is a block
-        /// of the heap's, aligned to `size`.
-        ///
-        /// # Safety
-        /// Every block in the lists must have been given to [`push`] and be
-        /// memory this cache may read and write.
-        pub unsafe fn pop(
-            &mut self,
-            i: usize,
-            owns: impl Fn(usize, usize) -> bool,
-        ) -> Result<Option<usize>, Broken> {
-            let block = self.head[i];
-            if block == 0 {
-                return Ok(None);
-            }
-            let size = class_size(i);
-            let word = core::mem::size_of::<usize>();
-            let tagged = size >= 2 * word;
-            // Whatever is refused below, the rest of the list goes with it:
-            // nothing behind this block can be reached without trusting a
-            // word that was just shown to have been written by someone else.
-            let lost = self.count[i].saturating_sub(1);
-            if tagged {
-                let found = unsafe { core::ptr::read((block + word) as *const usize) };
-                if found != tag_of(block) {
-                    self.drop_class(i);
-                    return Err(Broken::Tag { block, found, lost });
-                }
-            }
-            let link = unsafe { core::ptr::read(block as *const usize) };
-            let why = if link == 0 {
-                (lost > 0).then_some(LinkFault::Zeroed)
-            } else if !owns(link, size) {
-                Some(LinkFault::Outside)
-            } else if tagged
-                // A link that lands on a block of the heap's can still be
-                // wrong -- a heap pointer is exactly what a stale owner
-                // stores -- so the block it names must be free as well.
-                && unsafe { core::ptr::read((link + word) as *const usize) } != tag_of(link)
-            {
-                Some(LinkFault::NotFree)
-            } else if lost == 0 {
-                Some(LinkFault::PastEnd)
-            } else {
-                None
-            };
-            if let Some(why) = why {
-                self.drop_class(i);
-                return Err(Broken::Link {
-                    block,
-                    link,
-                    lost,
-                    why,
-                });
-            }
-            if tagged {
-                // A live block must not carry the mark: `push` reads it as
-                // "already free".
-                unsafe { core::ptr::write((block + word) as *mut usize, 0) };
-            }
-            self.head[i] = link;
-            self.count[i] -= 1;
-            Ok(Some(block))
-        }
-
-        /// Forget class `i`'s list, leaking every block in it.
-        fn drop_class(&mut self, i: usize) {
-            self.head[i] = 0;
-            self.count[i] = 0;
-        }
-
-        /// Cache a freed block of class `i`. `Ok(false)` means the class is
-        /// full and the caller must hand the block to the buddy.
-        ///
-        /// # Safety
-        /// `block` must be a block of class `i` that the caller is freeing.
-        pub unsafe fn push(&mut self, i: usize, block: usize) -> Result<bool, Broken> {
-            let size = class_size(i);
-            let tagged = size >= 2 * core::mem::size_of::<usize>();
-            let tag = (block + core::mem::size_of::<usize>()) as *mut usize;
-            if block == self.head[i] || (tagged && unsafe { core::ptr::read(tag) } == tag_of(block))
-            {
-                return Err(Broken::DoubleFree { block });
-            }
-            if self.count[i] >= cap_of(i) {
-                return Ok(false);
-            }
-            // Push: stash the old head in the block's first word.
-            unsafe { core::ptr::write(block as *mut usize, self.head[i]) };
-            if tagged {
-                unsafe { core::ptr::write(tag, tag_of(block)) };
-            }
-            self.head[i] = block;
-            self.count[i] += 1;
-            Ok(true)
-        }
-    }
-}
+#[path = "memory_x86_64/free_lists.rs"]
+pub mod free_lists;
 
 /// Who freed a block, for the report that finds it written after the free.
 ///

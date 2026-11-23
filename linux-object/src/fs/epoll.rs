@@ -363,6 +363,28 @@ struct EpollInner {
     /// [`EpollInner::watch`], [`EpollInner::unwatch`] and
     /// [`EpollInner::forget_one`] add or remove an entry of either.
     by_file: BTreeSet<(usize, FileDesc)>,
+    /// The process every entry of `interest_list` is charged to,
+    /// [`EPITEM_COST`] each: the one that made this epoll. Linux charges an
+    /// `epitem` to whoever calls `epoll_ctl` (`GFP_KERNEL_ACCOUNT`), which
+    /// is the maker unless the epoll was passed to another process; charging
+    /// the maker needs no record per entry. An event loop of a few thousand
+    /// connections is a few hundred KiB, and without a charge a process
+    /// with `n` epolls of `RLIMIT_NOFILE` entries each held `n` times that.
+    account: Option<Arc<crate::kmem::KmemAccount>>,
+}
+
+/// What one entry of an interest list costs the kernel, as charged: its
+/// share of the three trees that hold it.
+pub const EPITEM_COST: usize = core::mem::size_of::<(FileDesc, (EpollEvent, Arc<dyn FileLike>))>()
+    + core::mem::size_of::<(usize, FileDesc)>()
+    + core::mem::size_of::<(FileDesc, EdgeState)>();
+
+impl Drop for EpollInner {
+    fn drop(&mut self) {
+        if let Some(acct) = &self.account {
+            acct.uncharge(self.interest_list.len() * EPITEM_COST);
+        }
+    }
 }
 
 impl EpollInner {
@@ -374,22 +396,42 @@ impl EpollInner {
 
     /// Watch `file` under `fd` with `event`, in place of whatever `fd`
     /// watched before.
-    fn watch(&mut self, fd: FileDesc, event: EpollEvent, file: Arc<dyn FileLike>) {
+    /// Says whether it replaced an entry.
+    fn watch(&mut self, fd: FileDesc, event: EpollEvent, file: Arc<dyn FileLike>) -> bool {
         let key = Self::description_key(&file);
-        if let Some((_, old)) = self.interest_list.insert(fd, (event, file)) {
+        let old = self.interest_list.insert(fd, (event, file));
+        if let Some((_, old)) = &old {
             // Out before the new pair goes in: an `EPOLL_CTL_MOD` of the same
             // file has the same pair, and taking it out afterwards would
             // leave that entry with none.
-            self.by_file.remove(&(Self::description_key(&old), fd));
+            self.by_file.remove(&(Self::description_key(old), fd));
         }
         self.by_file.insert((key, fd));
+        old.is_some()
     }
 
     /// Stop watching `fd`, and hand back what it watched.
     fn unwatch(&mut self, fd: FileDesc) -> Option<(EpollEvent, Arc<dyn FileLike>)> {
         let entry = self.interest_list.remove(&fd)?;
         self.by_file.remove(&(Self::description_key(&entry.1), fd));
+        self.uncharge_one();
         Some(entry)
+    }
+
+    /// Charge the entry `EPOLL_CTL_ADD` is about to make, or refuse it
+    /// (`ENOMEM`, which epoll_ctl(2) lists).
+    fn charge_one(&self) -> LxResult<()> {
+        if let Some(acct) = &self.account {
+            acct.try_charge(EPITEM_COST)?;
+        }
+        Ok(())
+    }
+
+    /// An entry left `interest_list`: give its charge back.
+    fn uncharge_one(&self) {
+        if let Some(acct) = &self.account {
+            acct.uncharge(EPITEM_COST);
+        }
     }
 
     /// Drop one entry that watches the description at `key`, and say
@@ -404,7 +446,9 @@ impl EpollInner {
             return false;
         };
         self.by_file.remove(&(key, fd));
-        self.interest_list.remove(&fd);
+        if self.interest_list.remove(&fd).is_some() {
+            self.uncharge_one();
+        }
         self.edge.remove(&fd);
         true
     }
@@ -432,6 +476,7 @@ impl Epoll {
                 interest_list: BTreeMap::new(),
                 edge: BTreeMap::new(),
                 by_file: BTreeSet::new(),
+                account: crate::kmem::current(),
             }),
             flags: Mutex::new(flags),
             changes: crate::sync::EventBus::new(),
@@ -528,7 +573,12 @@ impl Epoll {
                         }
                     }
                 }
-                inner.watch(fd, event, file);
+                inner.charge_one()?;
+                // A number another thread filled while the lock was down
+                // for the nesting check is replaced: one entry, one charge.
+                if inner.watch(fd, event, file) {
+                    inner.uncharge_one();
+                }
             }
             EPOLL_CTL_DEL => {
                 inner.unwatch(fd).ok_or(LxError::ENOENT)?;

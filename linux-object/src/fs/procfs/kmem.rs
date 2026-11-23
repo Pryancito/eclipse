@@ -10,7 +10,12 @@
 //! limit: 536870912
 //! refused_quota: 0
 //! refused_reserve: 0
+//! inflight_fds: 0
+//! inotify_watches: 0
 //! ```
+//!
+//! `inflight_fds` is how many descriptors the process has sent over unix
+//! sockets that nobody has received yet (`crate::kmem::InFlight`).
 //!
 //! `kmem_limit` reads the limit as set, `0` for the default share, and takes
 //! a new one in bytes (`0`: back to the default). Lowering it is the owner's
@@ -36,12 +41,14 @@ pub(super) fn text(proc: &Process) -> String {
         let (quota, reserve) = acct.refused();
         let _ = write!(
             out,
-            "charged: {}\npeak: {}\nlimit: {}\nrefused_quota: {}\nrefused_reserve: {}\n",
+            "charged: {}\npeak: {}\nlimit: {}\nrefused_quota: {}\nrefused_reserve: {}\ninflight_fds: {}\ninotify_watches: {}\n",
             acct.charged(),
             acct.peak(),
             acct.limit(),
             quota,
             reserve,
+            acct.inflight(),
+            acct.inotify_watches(),
         );
     }
     out

@@ -123,7 +123,10 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
         // touches them. Linux writes `max(hiwater_rss, rss)` for the same
         // reason the max is here: VmHWM is never below VmRSS.
         let vm_hwm_kb = (vmar.resident_peak_bytes() as u64).max(vm_rss) / 1024;
-        let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
+        // A dump the heap cannot hold counts as no rows: a `read` of this
+        // file must not be a kernel panic (see `proc_pid_maps`).
+        let rows = vmar.try_mappings_dump().unwrap_or_default();
+        let sizes = layout::Sizes::of(&rows, layout::Mm::of(proc).as_ref());
         let _ = write!(
             out,
             "VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmHWM:\t{:8} kB\nVmRSS:\t{:8} kB\n\

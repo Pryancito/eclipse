@@ -15,7 +15,6 @@
 //! here cannot wait for a reader.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -454,8 +453,14 @@ impl<'a> Target<'a> {
         };
         if efs_of(&inode).is_some_and(|(fs, _)| Arc::ptr_eq(&fs, &self.fs)) {
             // From a file of this same filesystem: read it all first.
+            // The file's size, which a sparse `ftruncate` makes whatever the
+            // caller likes: asked for fallibly, ENOMEM and not a kernel panic.
             let size = inode.metadata()?.size as u64;
-            let mut stream = vec![0u8; size.saturating_sub(start) as usize];
+            let len: usize = core::convert::TryFrom::try_from(size.saturating_sub(start))
+                .map_err(|_| LxError::ENOMEM)?;
+            let mut stream = Vec::new();
+            stream.try_reserve_exact(len).map_err(|_| LxError::ENOMEM)?;
+            stream.resize(len, 0u8);
             read_exact(&mut pos, &mut stream).map_err(errno)?;
             let mut at = 0;
             self.with(|fs| {

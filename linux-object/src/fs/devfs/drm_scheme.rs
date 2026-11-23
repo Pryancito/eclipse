@@ -2482,9 +2482,8 @@ impl DrmDev {
                 } else {
                     let count = req.object_count as usize;
                     ucheck_n::<u32>(req.object_ids as usize, count)?;
-                    let ids: alloc::vec::Vec<u32> = (0..count)
-                        .map(|i| unsafe { uget::<u32>(req.object_ids, i) })
-                        .collect();
+                    let ids: alloc::vec::Vec<u32> =
+                        unsafe { uget_vec::<u32>(req.object_ids, count)? };
                     lease_objects(self.minor, &ids, self.file.universal_planes())?
                 };
                 // `drm_lease_create`: an object a live lessee of this master
@@ -3379,9 +3378,8 @@ impl DrmDev {
                 // The whole array is looked up first, in the caller's own
                 // handles (`drm_syncobj_array_find`): one it does not hold
                 // is ENOENT and none of the others is touched.
-                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
-                    .collect();
+                let handles: alloc::vec::Vec<u32> =
+                    unsafe { uget_vec::<u32>(req.handles, req.count_handles as usize)? };
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
                 }
@@ -3423,9 +3421,8 @@ impl DrmDev {
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 // The caller's own handles, all of them, before any is
                 // signaled (`drm_syncobj_array_find`).
-                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
-                    .collect();
+                let handles: alloc::vec::Vec<u32> =
+                    unsafe { uget_vec::<u32>(req.handles, req.count_handles as usize)? };
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
                 }
@@ -3546,9 +3543,8 @@ impl DrmDev {
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 // The caller's own handles, all of them, before any point is
                 // written back (`drm_syncobj_array_find`).
-                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
-                    .collect();
+                let handles: alloc::vec::Vec<u32> =
+                    unsafe { uget_vec::<u32>(req.handles, req.count_handles as usize)? };
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
                 }
@@ -4741,6 +4737,22 @@ unsafe fn uget<T: Copy>(ptr: u64, i: usize) -> T {
     core::ptr::read_unaligned((ptr as *const T).wrapping_add(i))
 }
 
+/// The `count` elements of a user array `ucheck_n` passed, copied into a
+/// kernel `Vec` that is asked for fallibly: `memdup_array_user`, ENOMEM
+/// when the heap cannot hold it. The count is the caller's -- a `u32`, so
+/// up to 16 GiB of `u32`s -- and a `collect()` of it was an infallible
+/// allocation, which is `alloc_error` and a kernel panic, not ENOMEM.
+///
+/// # Safety
+/// `ucheck_n::<T>(ptr, count)` passed.
+unsafe fn uget_vec<T: Copy>(ptr: u64, count: usize) -> Result<alloc::vec::Vec<T>> {
+    let mut out = alloc::vec::Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| FsError::NoMemory)?;
+    out.extend((0..count).map(|i| uget::<T>(ptr, i)));
+    Ok(out)
+}
+
 /// `put_user` of `v` as element `i` of a user array `ucheck_n` passed.
 ///
 /// # Safety
@@ -4897,15 +4909,10 @@ fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
     if timeline && points_ptr != 0 {
         ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
     }
-    let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-        .map(|i| unsafe { uget::<u32>(handles_ptr, i) })
-        .collect();
+    let handles: alloc::vec::Vec<u32> =
+        unsafe { uget_vec::<u32>(handles_ptr, count_handles as usize)? };
     let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-        Some(
-            (0..count_handles as usize)
-                .map(|i| unsafe { uget::<u64>(points_ptr, i) })
-                .collect(),
-        )
+        Some(unsafe { uget_vec::<u64>(points_ptr, count_handles as usize)? })
     } else {
         None
     };
@@ -5906,7 +5913,12 @@ fn propertyless_lookup_error(obj_id: u32, obj_type: u32) -> FsError {
 /// primary and cursor planes whose `possible_crtcs` has the CRTC's bit), and
 /// an id that lands in the set twice is the `idr_alloc` collision, ENOSPC.
 fn lease_objects(minor: u32, ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<u32>> {
-    let mut kinds = alloc::vec::Vec::with_capacity(ids.len());
+    // As long as the caller's list, which is as long as the caller said:
+    // asked for fallibly, like the list itself (`uget_vec`).
+    let mut kinds = alloc::vec::Vec::new();
+    kinds
+        .try_reserve_exact(ids.len())
+        .map_err(|_| FsError::NoMemory)?;
     for &id in ids {
         let kind = mode_object_kind(minor, id).ok_or(FsError::EntryNotFound)?;
         if !matches!(
@@ -5931,7 +5943,10 @@ fn lease_objects(minor: u32, ids: &[u32], universal_planes: bool) -> Result<allo
             drm::get_planes_typed_on(minor),
         )
     };
-    let mut leased = alloc::vec::Vec::with_capacity(ids.len());
+    let mut leased = alloc::vec::Vec::new();
+    leased
+        .try_reserve(ids.len())
+        .map_err(|_| FsError::NoMemory)?;
     let mut add = |id: u32| -> Result<()> {
         if leased.contains(&id) {
             return Err(FsError::NoDeviceSpace);

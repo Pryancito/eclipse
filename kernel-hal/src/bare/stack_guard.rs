@@ -490,6 +490,9 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         super::vmap_stack::init();
+        // The large-block window has the same need: a top-level entry made
+        // before any address space is cloned.
+        super::vmalloc::init();
         // SAFETY: `alloc` hands out page-aligned, mapped, read-write blocks
         // that nothing else owns, and `free` takes back only blocks `alloc`
         // handed out (`owns`), answering `false` for any other.
