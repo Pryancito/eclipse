@@ -55,6 +55,13 @@ impl LinuxProcess {
         &self.kmem
     }
 
+    /// The soft `RLIMIT_NOFILE`: how many descriptors this process may have
+    /// open, and (`too_many_unix_fds` in Linux) how many it may have in
+    /// flight over unix sockets.
+    pub fn nofile_limit(&self) -> usize {
+        self.inner.lock().nofile()
+    }
+
     /// Its OOM adjustment and the floor.
     pub fn oom_adj(&self) -> OomAdj {
         self.inner.lock().oom
