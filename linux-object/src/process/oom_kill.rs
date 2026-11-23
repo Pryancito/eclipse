@@ -15,7 +15,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
@@ -103,6 +103,13 @@ pub fn worst_of(rows: impl IntoIterator<Item = Victim>) -> Option<Victim> {
 /// the order of their size.
 static DYING: AtomicU64 = AtomicU64::new(0);
 
+/// Whether `pid` is the victim the killer last chose. A faulting thread of
+/// the victim stops waiting for memory: what it is waiting for is its own
+/// death, which comes on its way out of the trap.
+pub fn is_oom_victim(pid: KoID) -> bool {
+    pid != 0 && DYING.load(Ordering::Relaxed) == pid
+}
+
 /// Whether a process this killer signalled is still on its way out, and so
 /// whether a new kill must wait for it.
 ///
@@ -120,9 +127,88 @@ fn still_dying(live: impl IntoIterator<Item = KoID>) -> bool {
 /// `reason` goes in the report, which is the whole point of having one: an OOM
 /// kill that leaves no line is a process that "just vanished".
 pub fn kill_worst(reason: &str) -> Option<Victim> {
+    match locked_kill(reason)? {
+        Kill::Killed(victim) => Some(victim),
+        Kill::StillDying | Kill::Nobody => None,
+    }
+}
+
+/// [`select_and_kill`] under [`OOM_LOCK`], or `None` when another CPU is
+/// already choosing: what it frees is what this caller wanted.
+fn locked_kill(reason: &str) -> Option<Kill> {
+    if OOM_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return None;
+    }
+    let outcome = select_and_kill(reason);
+    OOM_LOCK.store(false, Ordering::Release);
+    Some(outcome)
+}
+
+/// What one go of the OOM killer did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kill {
+    /// It signalled this victim.
+    Killed(Victim),
+    /// The last victim is still on its way out: its memory is coming.
+    StillDying,
+    /// Nothing on the machine may be killed.
+    Nobody,
+}
+
+/// `oom_lock`: one OOM killer at a time. Two CPUs faulting at once would
+/// both see no victim dying and both kill, and a machine short by one page
+/// would lose two processes.
+static OOM_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// What a user page fault that found no memory should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultOom {
+    /// Wait a little and fault again: a victim is dying, or another CPU is
+    /// choosing one.
+    Retry,
+    /// Nothing can be freed: the fault fails as it did before.
+    GiveUp,
+}
+
+/// How many times a faulting thread waits for the killer before giving up.
+/// With the 20 ms the loader waits between tries, about 4 s: an exit that
+/// takes longer than that is stuck, and the thread is better off failing.
+pub const FAULT_OOM_RETRIES: u32 = 200;
+
+/// `pagefault_out_of_memory`: a user page fault found no frame. In Linux the
+/// fault does not fail; the OOM killer frees memory by badness and the fault
+/// is taken again. Before this the thread that happened to touch the page got
+/// SIGSEGV, whoever held the memory: a 16 MiB process at `oom_score_adj`
+/// 1000 kept its pages, and whichever process was unlucky died (often the
+/// shell or the desktop, the ones that touch memory most).
+///
+/// Answers whether the caller should wait and fault again. The caller is the
+/// trap path of a user thread, which holds no kernel lock and may allocate.
+pub fn pagefault_out_of_memory(attempt: u32) -> FaultOom {
+    if attempt >= FAULT_OOM_RETRIES {
+        return FaultOom::GiveUp;
+    }
+    match locked_kill("page fault: out of memory") {
+        Some(outcome) => fault_oom_after(outcome),
+        None => FaultOom::Retry,
+    }
+}
+
+/// The decision of [`pagefault_out_of_memory`] once the killer has run.
+fn fault_oom_after(outcome: Kill) -> FaultOom {
+    match outcome {
+        Kill::Killed(_) | Kill::StillDying => FaultOom::Retry,
+        Kill::Nobody => FaultOom::GiveUp,
+    }
+}
+
+fn select_and_kill(reason: &str) -> Kill {
     let live = live_processes();
     if still_dying(live.iter().map(|p| p.id())) {
-        return None;
+        return Kill::StillDying;
     }
     let (_, total) = kernel_hal::mem::memory_usage();
     let total_pages = total as u64 / BADNESS_PAGE;
@@ -149,7 +235,10 @@ pub fn kill_worst(reason: &str) -> Option<Victim> {
             held_bytes: held,
         }
     });
-    let victim = worst_of(rows)?;
+    let victim = match worst_of(rows) {
+        Some(victim) => victim,
+        None => return Kill::Nobody,
+    };
 
     // The report goes out BEFORE the signal: the kill frees memory, and the
     // first thing that happens with freed memory is that something else
@@ -173,7 +262,7 @@ pub fn kill_worst(reason: &str) -> Option<Victim> {
     // Best effort: a process that has exited between the census and here is
     // one whose memory is already coming back, which is what was wanted.
     let _ = send_signal_to_process(victim.pid as usize, LinuxSignal::SIGKILL);
-    Some(victim)
+    Kill::Killed(victim)
 }
 
 #[cfg(test)]
