@@ -39,6 +39,35 @@ struct InotifyInner {
     /// watched path returns the SAME wd (Linux semantics) and `inotify_rm_watch`
     /// can validate the descriptor.
     watches: BTreeMap<i32, (String, u32)>,
+    /// The process every watch is charged to, [`watch_cost`] each and one
+    /// of its [`MAX_USER_WATCHES`]: the one that made this instance, which
+    /// is the one that calls `inotify_add_watch` unless the descriptor was
+    /// passed on. Linux charges the mark to the caller's memory cgroup and
+    /// counts it against the user's `max_user_watches`; neither was here,
+    /// and a watch keeps a copy of a path of up to `PATH_MAX` bytes.
+    account: Option<Arc<crate::kmem::KmemAccount>>,
+}
+
+/// `/proc/sys/fs/inotify/max_user_watches`: how many watches one process may
+/// hold, over every instance it made (Linux counts them per user). Past it
+/// `inotify_add_watch` is `ENOSPC`, as in Linux.
+pub const MAX_USER_WATCHES: usize = 65536;
+
+/// What a watch on `path` costs the kernel, as charged: the path it keeps
+/// and its entry.
+pub fn watch_cost(path: &str) -> usize {
+    path.len() + core::mem::size_of::<(i32, (String, u32))>()
+}
+
+impl Drop for InotifyInner {
+    fn drop(&mut self) {
+        if let Some(acct) = &self.account {
+            for (path, _) in self.watches.values() {
+                acct.uncharge(watch_cost(path));
+            }
+            acct.inotify_watches_put(self.watches.len());
+        }
+    }
 }
 
 impl_kobject!(Inotify);
@@ -120,6 +149,7 @@ impl Inotify {
             inner: Arc::new(Mutex::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
+                account: crate::kmem::current(),
             })),
             eventbus: EventBus::new(),
             flags: Mutex::new(flags),
@@ -155,6 +185,13 @@ impl Inotify {
             inner.watches.insert(wd, (path.into(), new));
             return Ok(wd as usize);
         }
+        if let Some(acct) = &inner.account {
+            acct.inotify_watches_get(MAX_USER_WATCHES)?;
+            if let Err(why) = acct.try_charge(watch_cost(path)) {
+                acct.inotify_watches_put(1);
+                return Err(why.into());
+            }
+        }
         let wd = inner.next_wd;
         inner.next_wd += 1;
         inner.watches.insert(wd, (path.into(), stored));
@@ -165,7 +202,11 @@ impl Inotify {
     /// as Linux does.
     pub fn rm_watch(&self, wd: i32) -> LxResult<usize> {
         let mut inner = self.inner.lock();
-        if inner.watches.remove(&wd).is_some() {
+        if let Some((path, _)) = inner.watches.remove(&wd) {
+            if let Some(acct) = &inner.account {
+                acct.uncharge(watch_cost(&path));
+                acct.inotify_watches_put(1);
+            }
             Ok(0)
         } else {
             Err(LxError::EINVAL)

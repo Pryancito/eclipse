@@ -11,6 +11,7 @@
 //! refused_quota: 0
 //! refused_reserve: 0
 //! inflight_fds: 0
+//! inotify_watches: 0
 //! ```
 //!
 //! `inflight_fds` is how many descriptors the process has sent over unix
@@ -40,13 +41,14 @@ pub(super) fn text(proc: &Process) -> String {
         let (quota, reserve) = acct.refused();
         let _ = write!(
             out,
-            "charged: {}\npeak: {}\nlimit: {}\nrefused_quota: {}\nrefused_reserve: {}\ninflight_fds: {}\n",
+            "charged: {}\npeak: {}\nlimit: {}\nrefused_quota: {}\nrefused_reserve: {}\ninflight_fds: {}\ninotify_watches: {}\n",
             acct.charged(),
             acct.peak(),
             acct.limit(),
             quota,
             reserve,
             acct.inflight(),
+            acct.inotify_watches(),
         );
     }
     out

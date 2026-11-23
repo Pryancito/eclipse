@@ -213,6 +213,17 @@ fn a_charge_is_all_or_nothing_and_goes_back_when_dropped() {
 }
 
 #[test]
+fn inotify_watches_stop_at_the_limit() {
+    let a = KmemAccount::with_limit(0);
+    a.inotify_watches_get(2).unwrap();
+    a.inotify_watches_get(2).unwrap();
+    assert_eq!(a.inotify_watches_get(2), Err(crate::error::LxError::ENOSPC));
+    assert_eq!(a.inotify_watches(), 2);
+    a.inotify_watches_put(2);
+    assert_eq!(a.inotify_watches(), 0);
+}
+
+#[test]
 fn descriptors_in_flight_stop_past_the_limit_and_come_back_when_received() {
     use crate::error::LxError;
     let a = KmemAccount::with_limit(0);
@@ -333,6 +344,57 @@ mod queues {
             );
             drop(set);
             assert_eq!(acct.charged(), 0);
+        });
+    }
+
+    #[test]
+    fn epoll_entries_are_charged_to_the_epolls_maker() {
+        use crate::fs::epoll::{Epoll, EpollEvent, EPITEM_COST};
+        use crate::fs::{FileDesc, OpenFlags};
+        as_a_process_limited_to(45_205, 2 * EPITEM_COST, |acct| {
+            let ep = Epoll::new(OpenFlags::empty());
+            let ev = EpollEvent { events: 1, data: 0 };
+            let file = || -> Arc<dyn crate::fs::FileLike> { UnixSocketState::new() };
+            const ADD: i32 = 1;
+            const DEL: i32 = 2;
+            const MOD: i32 = 3;
+            ep.ctl(ADD, FileDesc::from(3usize), ev, Some(file()))
+                .unwrap();
+            ep.ctl(ADD, FileDesc::from(4usize), ev, Some(file()))
+                .unwrap();
+            assert_eq!(acct.charged(), 2 * EPITEM_COST);
+            assert_eq!(
+                ep.ctl(ADD, FileDesc::from(5usize), ev, Some(file())),
+                Err(crate::error::LxError::ENOMEM)
+            );
+            let f4 = ep.watched(FileDesc::from(4usize), 0).unwrap();
+            ep.ctl(MOD, FileDesc::from(4usize), ev, Some(f4)).unwrap();
+            assert_eq!(acct.charged(), 2 * EPITEM_COST, "a MOD is no new entry");
+            ep.ctl(DEL, FileDesc::from(3usize), ev, None).unwrap();
+            assert_eq!(acct.charged(), EPITEM_COST);
+            drop(ep);
+            assert_eq!(acct.charged(), 0);
+        });
+    }
+
+    #[test]
+    fn inotify_watches_are_charged_and_counted() {
+        use crate::fs::{inotify::watch_cost, Inotify, OpenFlags};
+        as_a_process_limited_to(45_206, 0, |acct| {
+            let ino = Inotify::new(OpenFlags::empty());
+            let a = ino.add_watch("/tmp", 2).unwrap();
+            assert_eq!(
+                ino.add_watch("/tmp", 2),
+                Ok(a),
+                "the same path, the same watch"
+            );
+            ino.add_watch("/etc", 2).unwrap();
+            assert_eq!(acct.charged(), watch_cost("/tmp") + watch_cost("/etc"));
+            assert_eq!(acct.inotify_watches(), 2);
+            ino.rm_watch(a as i32).unwrap();
+            assert_eq!(acct.inotify_watches(), 1);
+            drop(ino);
+            assert_eq!((acct.charged(), acct.inotify_watches()), (0, 0));
         });
     }
 
