@@ -221,11 +221,15 @@ fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize>
         if let Some(idx) = pcp::alloc() {
             return Some(idx);
         }
-        FRAME_ALLOCATOR.lock().alloc()
+        let got = FRAME_ALLOCATOR.lock().alloc();
+        note_frames_level();
+        got
     } else {
-        FRAME_ALLOCATOR
+        let got = FRAME_ALLOCATOR
             .lock()
-            .alloc_contiguous(frame_count, align_log2)
+            .alloc_contiguous(frame_count, align_log2);
+        note_frames_level();
+        got
     }
 }
 
@@ -251,6 +255,82 @@ fn frame_alloc_quiet(frame_count: usize, align_log2: usize) -> Option<PhysAddr> 
         track_mark_alloc(idx + i);
     }
     Some(frame_idx_to_phys_addr(idx))
+}
+
+/// RAM userspace may not take: what the kernel keeps to grow its heap, map
+/// page tables and fill vmalloc blocks once processes have eaten the rest.
+/// Linux's `min_free_kbytes`, sized the same way it ends up in practice: 1/64
+/// of RAM between 16 and 64 MiB (32 MiB at 2 GiB), never more than 1/8.
+///
+/// Without it a fork bomb took every frame (967 / 967 MiB), the heap could
+/// not grow past its arena, and the next large kernel allocation was a panic
+/// with the emergency reserve already spent -- the user had starved the
+/// kernel of the memory it needs to kill the user.
+pub fn frame_reserve() -> usize {
+    reserve_for(TOTAL_MEMORY.load(Ordering::Relaxed))
+}
+
+/// [`frame_reserve`] for `total` bytes of RAM: reclaimd sizes its
+/// watermarks from the same `total` it was handed.
+pub fn reserve_for(total: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    (total / 64).clamp(16 * MIB, 64 * MIB).min(total / 8)
+}
+
+/// Set while free RAM is within twice the reserve, so that a user frame
+/// allocation takes the exact (and dearer) look at the counters. Clear, the
+/// user path costs one relaxed load. Refreshed every time a per-CPU list goes
+/// to the bitmap for a batch, so it lags by at most a list per CPU.
+static FRAMES_LOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// User frame allocations refused to keep the reserve, since boot.
+static USER_FRAME_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Free RAM, exactly: frames parked in the per-CPU lists are free.
+fn frames_free() -> usize {
+    TOTAL_MEMORY
+        .load(Ordering::Relaxed)
+        .saturating_sub(FRAMES_USED.get())
+}
+
+/// Recompute [`FRAMES_LOW`]. Sums every CPU's row, so it runs where the
+/// bitmap is visited anyway, not on every page.
+fn note_frames_level() {
+    let low = frames_free() < frame_reserve().saturating_mul(2);
+    if FRAMES_LOW.load(Ordering::Relaxed) != low {
+        FRAMES_LOW.store(low, Ordering::Relaxed);
+    }
+}
+
+/// User frame allocations refused since boot, for `/proc/kheap`.
+pub fn user_frame_refusals() -> u64 {
+    USER_FRAME_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// One frame for a user mapping or a page cache page: [`frame_alloc`], except
+/// that it will not take RAM out of the [`frame_reserve`].
+///
+/// A refusal reclaims first, as Linux's allocator does below its min
+/// watermark, and then asks reclaimd for the reserve: reclaimd sees the same
+/// shortage, and when the caches give nothing its OOM killer picks a victim
+/// while the kernel still has the RAM to do it.
+pub fn frame_alloc_user() -> Option<PhysAddr> {
+    if FRAMES_LOW.load(Ordering::Relaxed) {
+        let reserve = frame_reserve();
+        let need = reserve + (1 << PAGE_BITS);
+        let free = frames_free();
+        if free < need {
+            kernel_hal::shrinker::shrink(need - free);
+            if frames_free() < need {
+                USER_FRAME_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                kernel_hal::shrinker::request(reserve);
+                return None;
+            }
+        } else if free >= reserve.saturating_mul(2) {
+            FRAMES_LOW.store(false, Ordering::Relaxed);
+        }
+    }
+    frame_alloc(1, 0)
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {

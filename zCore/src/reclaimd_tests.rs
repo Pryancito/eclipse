@@ -15,7 +15,7 @@ fn a_machine_with_memory_to_spare_asks_for_nothing() {
     assert_eq!(target(1024 * MIB, 4096 * MIB), 0);
     // Exactly at the watermark is still not under it.
     let total = 4096 * MIB;
-    assert_eq!(target(total - watermark(total), total), 0);
+    assert_eq!(target(total - low_line(total), total), 0);
 }
 
 /// Under the watermark, the target is the shortfall and nothing more: asking
@@ -23,7 +23,7 @@ fn a_machine_with_memory_to_spare_asks_for_nothing() {
 #[test]
 fn the_target_is_the_shortfall_and_not_the_whole_watermark() {
     let total = 4096 * MIB;
-    let wm = watermark(total);
+    let wm = low_line(total);
     let free = wm / 4;
     assert_eq!(target(total - free, total), wm - free);
 }
@@ -32,10 +32,10 @@ fn the_target_is_the_shortfall_and_not_the_whole_watermark() {
 #[test]
 fn a_machine_with_nothing_free_asks_for_the_watermark() {
     let total = 1024 * MIB;
-    assert_eq!(target(total, total), watermark(total));
+    assert_eq!(target(total, total), low_line(total));
     // And `used` past `total` (the heap and the frames are counted together,
     // and both move) is the same case, not an underflow.
-    assert_eq!(target(total + MIB, total), watermark(total));
+    assert_eq!(target(total + MIB, total), low_line(total));
 }
 
 /// Before the allocator has any memory, every figure derived from the total is
@@ -126,7 +126,7 @@ fn a_pass_under_the_watermark_asks_the_deferred_caches_for_the_shortfall() {
         "the deferred registry refused the fake"
     );
     let total = 1024 * MIB;
-    let wm = watermark(total);
+    let wm = low_line(total);
     fake_cache::HELD.store(wm, Ordering::Relaxed);
 
     // Nothing free at all: the shortfall is the whole watermark.
@@ -177,7 +177,7 @@ fn nothing_left_to_reclaim_and_nothing_to_allocate_from_is_an_oom() {
 #[test]
 fn being_under_the_low_watermark_is_not_yet_an_oom() {
     let total = 1024 * MIB;
-    let wm = watermark(total);
+    let wm = low_line(total);
     assert!(
         target(total - wm / 2, total) > 0,
         "this test needs reclaim to be due"
@@ -187,7 +187,7 @@ fn being_under_the_low_watermark_is_not_yet_an_oom() {
         "a machine merely under the low watermark was killed for"
     );
     // Just under the OOM floor, it is.
-    let floor = wm / OOM_WATERMARK_DIV;
+    let floor = oom_line(total);
     assert!(
         out_of_memory(total - floor / 2, total, 0),
         "a machine under the OOM floor was not an OOM"
@@ -200,4 +200,18 @@ fn being_under_the_low_watermark_is_not_yet_an_oom() {
 #[test]
 fn an_allocator_with_no_memory_yet_is_not_an_oom() {
     assert!(!out_of_memory(0, 0, 0), "boot was declared out of memory");
+}
+
+/// The reserve the kernel keeps from userspace sits UNDER both lines: user
+/// allocations stop at it, so reclaim and the OOM killer have to act while
+/// free RAM is still above it, or they never would.
+#[test]
+fn both_lines_sit_above_the_frames_userspace_may_not_take() {
+    let total = 2048 * MIB;
+    let reserve = crate::memory::reserve_for(total);
+    assert!(reserve > 0, "x86_64 keeps a reserve");
+    assert!(oom_line(total) > reserve);
+    assert!(low_line(total) > oom_line(total));
+    // A machine whose processes have stopped at the reserve is an OOM.
+    assert!(out_of_memory(total - reserve, total, 0));
 }

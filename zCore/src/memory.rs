@@ -1432,6 +1432,28 @@ mod quarantine {
     }
 }
 
+/// No reserve kept from userspace here: only x86_64 has one.
+#[allow(dead_code)]
+pub fn frame_reserve() -> usize {
+    0
+}
+
+/// [`frame_reserve`] for a given total; none here.
+pub fn reserve_for(_total: usize) -> usize {
+    0
+}
+
+/// [`frame_alloc`] for one user frame; no reserve on this architecture.
+pub fn frame_alloc_user() -> Option<PhysAddr> {
+    frame_alloc(1, 0)
+}
+
+/// No reserve, so nothing is ever refused for it.
+#[allow(dead_code)]
+pub fn user_frame_refusals() -> u64 {
+    0
+}
+
 pub fn stats() -> (usize, usize) {
     (
         USED_MEMORY.load(Ordering::Relaxed),

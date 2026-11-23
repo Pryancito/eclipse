@@ -116,6 +116,9 @@ pub fn alloc() -> Option<usize> {
     if parked > 0 {
         FRAMES_CACHED.add(parked << PAGE_BITS);
     }
+    drop(g);
+    // A refill is where the level is looked at: once per batch, not per page.
+    super::note_frames_level();
     Some(batch[0])
 }
 

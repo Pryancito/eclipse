@@ -261,3 +261,16 @@ fn giving_back_a_run_twice_is_a_double_free() {
     frame_dealloc_run(run, 4);
     frame_dealloc_run(run, 4);
 }
+
+/// The reserve kept from userspace is 1/64 of RAM between 16 and 64 MiB, and
+/// never more than an eighth: a tiny machine still gives most of itself to
+/// its programs.
+#[test]
+fn the_kernel_reserve_scales_with_ram_within_its_bounds() {
+    const MIB: usize = 1 << 20;
+    assert_eq!(reserve_for(2048 * MIB), 32 * MIB);
+    assert_eq!(reserve_for(512 * MIB), 16 * MIB);
+    assert_eq!(reserve_for(64 * 1024 * MIB), 64 * MIB);
+    assert_eq!(reserve_for(64 * MIB), 8 * MIB);
+    assert_eq!(reserve_for(0), 0);
+}

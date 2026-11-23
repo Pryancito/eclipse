@@ -83,6 +83,20 @@ fn watermark(total: usize) -> usize {
         .min(total / 4)
 }
 
+/// Free bytes under which reclaim is due: the watermark, ABOVE the frames
+/// userspace may not take ([`crate::memory::frame_reserve`]). A machine
+/// sitting on its reserve is short, even though that RAM reads as free.
+fn low_line(total: usize) -> usize {
+    watermark(total) + crate::memory::reserve_for(total)
+}
+
+/// Free bytes under which a pass that freed nothing kills: a fifth of the
+/// watermark, above the reserve. User allocations stop at the reserve, so the
+/// victim has to be picked while the kernel still has it.
+fn oom_line(total: usize) -> usize {
+    watermark(total) / OOM_WATERMARK_DIV + crate::memory::reserve_for(total)
+}
+
 /// Bytes the worker should ask for, given what the allocator reports.
 ///
 /// Zero means "above the watermark, leave the caches alone" -- including
@@ -90,7 +104,7 @@ fn watermark(total: usize) -> usize {
 /// figure derived from it is meaningless.
 fn target(used: usize, total: usize) -> usize {
     let free = total.saturating_sub(used);
-    watermark(total).saturating_sub(free)
+    low_line(total).saturating_sub(free)
 }
 
 /// One pass. Separate from the loop so that what it decides can be tested
@@ -114,8 +128,7 @@ fn out_of_memory(used: usize, total: usize, freed: usize) -> bool {
         return false;
     }
     let free = total.saturating_sub(used);
-    let floor = watermark(total) / OOM_WATERMARK_DIV;
-    floor > 0 && free < floor
+    watermark(total) > 0 && free < oom_line(total)
 }
 
 /// Start the worker. Called once, during boot.

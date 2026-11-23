@@ -18,6 +18,24 @@ impl PhysFrame {
         })
     }
 
+    /// Allocate one physical frame for user memory (a VMO page). Unlike
+    /// [`new`](Self::new) it may be refused while RAM is down to what the
+    /// kernel keeps for itself.
+    pub fn new_user() -> Option<Self> {
+        KHANDLER.frame_alloc_user().map(|paddr| Self {
+            paddr,
+            allocated: true,
+        })
+    }
+
+    /// [`new_user`](Self::new_user), filled with zero.
+    pub fn new_user_zero() -> Option<Self> {
+        Self::new_user().map(|mut f| {
+            f.zero();
+            f
+        })
+    }
+
     /// Allocate one physical frame and fill with zero.
     pub fn new_zero() -> Option<Self> {
         Self::new().map(|mut f| {
