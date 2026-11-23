@@ -2575,19 +2575,20 @@ cfg_if! {
 
         // ── Front cache: per-size-class free lists over the buddy allocator ──
         //
-        // The buddy's `dealloc` coalesces by SCANNING `free_list[class]` for the
-        // sibling block (buddy_system_allocator 0.8 lib.rs:161) — O(free-list
-        // length). A fork storm allocates and frees thousands of same-sized
-        // objects (VMObjectPaged inner, VmMapping, VmMappingInner) whose buddies
-        // are still live, so those class free lists grow long and *every*
-        // dealloc pays O(n): the fork loop is O(n²). HEAPPROF confirmed it —
-        // dealloc climbed from ~18 K to ~284 K cyc/call across a 512-map loop.
+        // The buddy's `dealloc` used to coalesce by SCANNING `free_list[class]`
+        // for the sibling block -- O(free-list length). A fork storm allocates
+        // and frees thousands of same-sized objects whose buddies are still
+        // live, so the fork loop was O(n^2): HEAPPROF saw dealloc climb from
+        // ~18 K to ~284 K cyc/call across a 512-map loop. The buddy's free sets
+        // are treaps now (vendor/buddy_system_allocator/src/free_set.rs), so a
+        // free that reaches it is O(log n); an exit dropping 10000 eventfds in
+        // hash order went from 7.8 s to 0.07 s in QEMU.
         //
-        // This cache keeps recently-freed small blocks in per-class LIFO stacks
+        // This cache still pays for itself on the common pair. It keeps
+        // recently-freed small blocks in per-class LIFO stacks
         // (the next pointer lives in the freed block's first word, like the
         // buddy's own list) and serves allocations from them in O(1). The common
-        // alloc/free pair never touches the buddy, so the buddy free lists stay
-        // short and the O(n) scan never fires on the hot path. The buddy is
+        // alloc/free pair never touches the buddy or its lock. The buddy is
         // consulted only to refill an empty class or to absorb frees past the
         // per-class cap.
         //
