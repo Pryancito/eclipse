@@ -118,3 +118,61 @@ fn dropping_one_of_two_mappings_leaves_the_other_counted() {
         "one mapping left, and the VMO says otherwise"
     );
 }
+
+fn meter(vmar: &Arc<VmAddressRegion>) -> Arc<super::vmar_vm_size::VmSizeMeter> {
+    vmar.inner.lock().as_ref().unwrap().vm_size.clone()
+}
+
+/// `vm.max_map_count`: the address space counts its mappings, the whole
+/// tree's, and refuses the one past 65530 with NO_MEMORY (ENOMEM), as
+/// `mmap_region` does -- and a hole punched in the middle of a mapping,
+/// which leaves two, as `__split_vma` does.
+#[test]
+fn the_mappings_of_an_address_space_stop_at_max_map_count() {
+    use super::vmar_vm_size::MAX_MAP_COUNT;
+    let vmar = VmAddressRegion::new_root_zircon();
+    let base = vmar.addr();
+    let m = meter(&vmar);
+    vmar.map_at(0, VmObject::new_paged(3), 0, 3 * PAGE_SIZE, MMUFlags::READ)
+        .unwrap();
+    let child = vmar
+        .allocate_at(
+            16 * PAGE_SIZE,
+            4 * PAGE_SIZE,
+            VmarFlags::CAN_MAP_RXW,
+            PAGE_SIZE,
+        )
+        .unwrap();
+    child
+        .map_at(0, one_page_vmo(), 0, PAGE_SIZE, MMUFlags::READ)
+        .unwrap();
+    assert_eq!(m.count(), 2, "a child region's mappings count too");
+
+    // Stand in for 65527 more without making them.
+    m.mapped(MAX_MAP_COUNT - 3);
+    vmar.map_at(8 * PAGE_SIZE, one_page_vmo(), 0, PAGE_SIZE, MMUFlags::READ)
+        .unwrap();
+    assert_eq!(
+        vmar.map_at(10 * PAGE_SIZE, one_page_vmo(), 0, PAGE_SIZE, MMUFlags::READ)
+            .err(),
+        Some(ZxError::NO_MEMORY)
+    );
+    // A hole in the middle needs one more: refused, and nothing is cut.
+    assert_eq!(
+        vmar.unmap(base + PAGE_SIZE, PAGE_SIZE).err(),
+        Some(ZxError::NO_MEMORY)
+    );
+    assert_eq!(
+        vmar.mapped_bytes_in(base, base + 3 * PAGE_SIZE),
+        3 * PAGE_SIZE
+    );
+    // Trimming an edge leaves one, and unmapping gives room back.
+    vmar.unmap(base, PAGE_SIZE).unwrap();
+    vmar.unmap(base + 8 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    assert_eq!(m.count(), MAX_MAP_COUNT - 1);
+    vmar.unmap(base + 2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    m.unmapped(MAX_MAP_COUNT - 3);
+    assert_eq!(m.count(), 2);
+    child.destroy().unwrap();
+    assert_eq!(m.count(), 1, "a region torn down takes its mappings off");
+}

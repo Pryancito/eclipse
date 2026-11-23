@@ -2078,6 +2078,7 @@ struct DrmBlob {
     /// commit fail with ENOENT.
     owner: usize,
     data: Vec<u8>,
+    _charge: crate::kmem::Charge,
 }
 
 /// Last-committed atomic state of the synthetic pipeline, echoed back through
@@ -6083,6 +6084,7 @@ enum PendingDrmTimer {
         signal: u64,
         due_seq: u32,
         file: Weak<DrmFileState>,
+        _slot: file_state::EventSlot,
     },
     /// A `CRTC_QUEUE_SEQUENCE` event: paced exactly like a vblank wait,
     /// delivered as a `DRM_EVENT_CRTC_SEQUENCE` (`user_data`, `time_ns`
@@ -6091,6 +6093,7 @@ enum PendingDrmTimer {
         user_data: u64,
         due_seq: u32,
         file: Weak<DrmFileState>,
+        _slot: file_state::EventSlot,
     },
 }
 
@@ -6433,24 +6436,30 @@ fn settle_outstanding_flip() -> bool {
 /// next vblank boundary even if `due_seq` has already passed, for the same
 /// anti-spin reason as [`schedule_flip_event`]. `signal` is the caller's
 /// opaque token echoed back in the event's `user_data`.
-pub fn schedule_vblank_event(signal: u64, due_seq: u32, file: &Arc<DrmFileState>) {
+pub fn schedule_vblank_event(signal: u64, due_seq: u32, file: &Arc<DrmFileState>) -> Option<()> {
+    let _slot = file.reserve_event()?;
     arm_coalesced_drm_timer(PendingDrmTimer::Vblank {
         signal,
         due_seq,
         file: Arc::downgrade(file),
+        _slot,
     });
+    Some(())
 }
 
 /// Deliver a `DRM_EVENT_CRTC_SEQUENCE` (from `CRTC_QUEUE_SEQUENCE`) once the
 /// counter reaches `due_seq`, paced like [`schedule_vblank_event`]: Linux
 /// sends a passed target's event at once (`drm_crtc_queue_sequence_ioctl`),
 /// which here would turn Xorg's sequence-paced loop into a spin.
-pub fn schedule_crtc_sequence_event(user_data: u64, due_seq: u32, file: &Arc<DrmFileState>) {
+pub fn schedule_crtc_sequence_event(data: u64, due: u32, f: &Arc<DrmFileState>) -> Option<()> {
+    let _slot = f.reserve_event()?;
     arm_coalesced_drm_timer(PendingDrmTimer::Sequence {
-        user_data,
-        due_seq,
-        file: Arc::downgrade(file),
+        user_data: data,
+        due_seq: due,
+        file: Arc::downgrade(f),
+        _slot,
     });
+    Some(())
 }
 
 /// Drop not-yet-posted flip/vblank timer jobs (device-wide).
@@ -7008,6 +7017,7 @@ fn set_mode_blob_locked(state: &mut DrmState, data: Vec<u8>) {
             user_created: false,
             owner: 0,
             data,
+            _charge: crate::kmem::Charge::none(),
         });
         state.atomic.mode_blob_id = id;
     }

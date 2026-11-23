@@ -19,6 +19,7 @@
 //! `F_GETLK` reports an `l_pid` of -1 for one, as Linux does.
 
 use crate::error::{LxError, LxResult};
+use crate::kmem::Charge;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
@@ -38,14 +39,24 @@ pub type FileKey = (usize, usize);
 
 /// One held lock: `[start, end)` with `end == u64::MAX` meaning "to EOF and
 /// beyond" (`l_len == 0`).
-#[derive(Debug, Clone, Copy)]
+///
+/// Each one is charged to the process that took it (Linux's
+/// `filelock_cache` is `SLAB_ACCOUNT`) and given back when it goes, by any
+/// road: unlocked, carved, merged, pruned, or released on close or exit.
+/// Locking every other byte of a file made one entry per byte, kept for
+/// as long as the file was open, with nothing to stop it.
+#[derive(Debug)]
 struct Held {
     exclusive: bool,
     start: u64,
     end: u64,
     owner: KoID,
     ofd: bool,
+    charge: Charge,
 }
+
+/// What one held lock costs its taker.
+pub const HELD_COST: usize = core::mem::size_of::<Held>();
 
 /// A lock request/probe after `l_whence` resolution.
 #[derive(Debug, Clone, Copy)]
@@ -130,30 +141,6 @@ fn conflicts(held: &Held, req: &LockRequest) -> bool {
     !same_owner(held, req)
         && (held.exclusive || req.exclusive)
         && ranges_overlap(held.start, held.end, req.start, req.end)
-}
-
-/// Remove `[start, end)` from a held range, returning the surviving pieces
-/// (0, 1 or 2). This is what lets an unlock or a re-lock punch a hole in the
-/// middle of an existing lock, per POSIX.
-fn subtract(held: &Held, start: u64, end: u64) -> Vec<Held> {
-    let mut out = Vec::new();
-    if !ranges_overlap(held.start, held.end, start, end) {
-        out.push(*held);
-        return out;
-    }
-    if held.start < start {
-        out.push(Held {
-            end: start,
-            ..*held
-        });
-    }
-    if held.end > end {
-        out.push(Held {
-            start: end,
-            ..*held
-        });
-    }
-    out
 }
 
 /// What `F_GETLK` puts in `l_pid` for a description's lock: -1 once it is
@@ -245,22 +232,87 @@ pub fn getlk(key: FileKey, req: &LockRequest) -> Option<ConflictInfo> {
 }
 
 /// `F_SETLK` (one attempt): acquire, convert or release `req`'s range.
-/// Returns false on conflict — the caller answers `EAGAIN` or, for
+/// `Ok(false)` on conflict -- the caller answers `EAGAIN` or, for
 /// `F_SETLKW`, retries. An acquisition first carves the owner's existing
 /// locks out of the range (POSIX replace semantics), an unlock only carves.
-pub fn setlk(key: FileKey, req: &LockRequest, unlock: bool) -> bool {
+///
+/// As `posix_lock_inode` does, the owner's locks of the same type that
+/// touch or overlap the new one merge into it, so a file locked a byte at
+/// a time in order holds one lock, not one per byte. And as it does, the
+/// two locks a request may need (the new one, and the far piece of a lock
+/// it splits) are taken up front: without them the request is `ENOLCK`
+/// and the table is as it was.
+pub fn setlk(key: FileKey, req: &LockRequest, unlock: bool) -> LxResult<bool> {
     let mut table = LOCKS.lock();
     let locks = table.entry(key).or_default();
     prune_dead(locks);
     if !unlock && locks.iter().any(|held| conflicts(held, req)) {
-        return false;
+        return Ok(false);
     }
-    let mut next: Vec<Held> = Vec::with_capacity(locks.len() + 1);
-    for held in locks.iter() {
-        if same_owner(held, req) {
-            next.extend(subtract(held, req.start, req.end));
+    let merges = |h: &Held, start: u64, end: u64| {
+        !unlock
+            && same_owner(h, req)
+            && h.exclusive == req.exclusive
+            && h.start <= end
+            && start <= h.end
+    };
+    // The owner's locks never overlap each other, so at most one holds the
+    // whole range with room on both sides; one of the same type merges
+    // instead. And a lock that merges lends the new one its charge, so
+    // filling the gap between two locks needs no room at all.
+    let splits = locks
+        .iter()
+        .filter(|h| same_owner(h, req) && h.start < req.start && h.end > req.end)
+        .filter(|h| !merges(h, req.start, req.end))
+        .count();
+    let lends = locks.iter().any(|h| merges(h, req.start, req.end));
+    let mut spare = Vec::new();
+    let mut next: Vec<Held> = Vec::new();
+    let need = splits + (!unlock && !lends) as usize;
+    if spare.try_reserve_exact(need).is_err() || next.try_reserve(locks.len() + need).is_err() {
+        return Err(LxError::ENOLCK);
+    }
+    for _ in 0..need {
+        spare.push(Charge::try_new(HELD_COST).map_err(|_| LxError::ENOLCK)?);
+    }
+    let (mut start, mut end) = (req.start, req.end);
+    let mut lent = None;
+    for held in locks.drain(..) {
+        if !same_owner(&held, req) {
+            next.push(held);
+        } else if merges(&held, start, end) {
+            // Same type, touching or overlapping: one lock now.
+            start = start.min(held.start);
+            end = end.max(held.end);
+            lent = lent.or(Some(held.charge));
+        } else if !ranges_overlap(held.start, held.end, req.start, req.end) {
+            next.push(held);
         } else {
-            next.push(*held);
+            // Carve `req`'s range out: 0, 1 or 2 pieces survive.
+            let Held {
+                exclusive,
+                start: from,
+                end: to,
+                owner,
+                ofd,
+                charge,
+            } = held;
+            let mut charge = Some(charge);
+            let piece = |start, end, charge| Held {
+                exclusive,
+                start,
+                end,
+                owner,
+                ofd,
+                charge,
+            };
+            if from < req.start {
+                next.push(piece(from, req.start, charge.take().unwrap()));
+            }
+            if to > req.end {
+                let charge = charge.take().or_else(|| spare.pop()).unwrap();
+                next.push(piece(req.end, to, charge));
+            }
         }
     }
     if !unlock {
@@ -269,18 +321,19 @@ pub fn setlk(key: FileKey, req: &LockRequest, unlock: bool) -> bool {
         }
         next.push(Held {
             exclusive: req.exclusive,
-            start: req.start,
-            end: req.end,
+            start,
+            end,
             owner: req.owner,
             ofd: req.ofd,
+            charge: lent.or_else(|| spare.pop()).unwrap(),
         });
     }
     if next.is_empty() {
         table.remove(&key);
     } else {
-        *table.get_mut(&key).unwrap() = next;
+        *locks = next;
     }
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -304,7 +357,18 @@ mod tests {
             end,
             owner,
             ofd: false,
+            charge: Charge::none(),
         }
+    }
+
+    fn ranges(key: FileKey) -> Vec<(bool, u64, u64)> {
+        let mut v: Vec<_> = LOCKS
+            .lock()
+            .get(&key)
+            .map(|l| l.iter().map(|h| (h.exclusive, h.start, h.end)).collect())
+            .unwrap_or_default();
+        v.sort_by_key(|r| r.1);
+        v
     }
 
     /// A description's lock: owned by the `File`, not by the process.
@@ -319,13 +383,13 @@ mod tests {
             owner: at as KoID,
             ofd: true,
         };
-        assert!(setlk(key, &ofd(true, 0x1000), false));
+        assert!(setlk(key, &ofd(true, 0x1000), false).unwrap());
         assert!(
-            !setlk(key, &ofd(true, 0x2000), false),
+            !setlk(key, &ofd(true, 0x2000), false).unwrap(),
             "two descriptions conflict"
         );
         assert!(
-            setlk(key, &ofd(true, 0x1000), false),
+            setlk(key, &ofd(true, 0x1000), false).unwrap(),
             "the same one re-locks"
         );
         let posix = req(false, 0, 10, pid);
@@ -339,7 +403,7 @@ mod tests {
         );
         release_description(0x1000);
         assert!(getlk(key, &posix).is_none());
-        assert!(setlk(key, &ofd(true, 0x2000), true));
+        assert!(setlk(key, &ofd(true, 0x2000), true).unwrap());
     }
 
     #[test]
@@ -358,23 +422,56 @@ mod tests {
     }
 
     #[test]
-    fn subtract_splits_middle_and_trims_edges() {
-        let h = held(true, 10, 50, 1);
-        // Hole in the middle → two pieces.
-        let pieces = subtract(&h, 20, 30);
-        assert_eq!(pieces.len(), 2);
-        assert_eq!((pieces[0].start, pieces[0].end), (10, 20));
-        assert_eq!((pieces[1].start, pieces[1].end), (30, 50));
+    fn an_unlock_splits_the_middle_and_trims_the_edges() {
+        let key = (usize::MAX - 2, 1);
+        let pid = 0; // never a live process, but `ofd` keeps it from the prune
+        let r = |exclusive, start, end| LockRequest {
+            exclusive,
+            start,
+            end,
+            owner: pid,
+            ofd: true,
+        };
+        assert_eq!(setlk(key, &r(true, 10, 50), false), Ok(true));
+        // A hole in the middle: two pieces.
+        assert_eq!(setlk(key, &r(true, 20, 30), true), Ok(true));
+        assert_eq!(ranges(key), [(true, 10, 20), (true, 30, 50)]);
         // Trim the head.
-        let pieces = subtract(&h, 0, 20);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!((pieces[0].start, pieces[0].end), (20, 50));
-        // Full cover → nothing left.
-        assert!(subtract(&h, 0, 100).is_empty());
-        // Disjoint → untouched.
-        let pieces = subtract(&h, 50, 60);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!((pieces[0].start, pieces[0].end), (10, 50));
+        assert_eq!(setlk(key, &r(true, 0, 15), true), Ok(true));
+        assert_eq!(ranges(key), [(true, 15, 20), (true, 30, 50)]);
+        // Disjoint: untouched.
+        assert_eq!(setlk(key, &r(true, 50, 60), true), Ok(true));
+        assert_eq!(ranges(key), [(true, 15, 20), (true, 30, 50)]);
+        // Full cover: nothing left, and the file leaves the table.
+        assert_eq!(setlk(key, &r(true, 0, 100), true), Ok(true));
+        assert!(!LOCKS.lock().contains_key(&key));
+    }
+
+    #[test]
+    fn locks_of_one_type_that_touch_merge_and_another_type_carves() {
+        let key = (usize::MAX - 2, 2);
+        let r = |exclusive, start, end| LockRequest {
+            exclusive,
+            start,
+            end,
+            owner: 0,
+            ofd: true,
+        };
+        // A byte at a time, in order: one lock.
+        for b in 0..100 {
+            assert_eq!(setlk(key, &r(true, b, b + 1), false), Ok(true));
+        }
+        assert_eq!(ranges(key), [(true, 0, 100)]);
+        // A read lock in the middle converts that part only.
+        assert_eq!(setlk(key, &r(false, 40, 60), false), Ok(true));
+        assert_eq!(
+            ranges(key),
+            [(true, 0, 40), (false, 40, 60), (true, 60, 100)]
+        );
+        // Writing it back merges all three again.
+        assert_eq!(setlk(key, &r(true, 40, 60), false), Ok(true));
+        assert_eq!(ranges(key), [(true, 0, 100)]);
+        assert_eq!(setlk(key, &r(true, 0, u64::MAX), true), Ok(true));
     }
 
     #[test]

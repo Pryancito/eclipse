@@ -2378,10 +2378,11 @@ fn proc_sysvipc_shm_content() -> String {
     crate::ipc::shm_proc_table()
 }
 
-/// Linux's default vm.max_map_count. Address-space-hungry runtimes (JVMs,
-/// wasm engines) read it to size their reservation strategy.
+/// `vm.max_map_count`, Linux's default and the limit the address space
+/// keeps. Address-space-hungry runtimes (JVMs, wasm engines) read it to
+/// size their reservation strategy.
 fn proc_sys_max_map_count_content() -> String {
-    String::from("65530\n")
+    alloc::format!("{}\n", zircon_object::vm::MAX_MAP_COUNT)
 }
 
 /// `/proc/sys/vm/drop_caches` reads back 0, as on Linux: it is a trigger,

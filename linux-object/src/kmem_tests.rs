@@ -368,6 +368,61 @@ mod queues {
     }
 
     #[test]
+    fn record_locks_are_charged_to_their_taker_and_a_split_needs_room() {
+        use crate::fs::record_lock::{release_description, setlk, LockRequest, HELD_COST};
+        as_a_process_limited_to(45_208, 2 * HELD_COST, |acct| {
+            let key = (usize::MAX - 3, 1);
+            let r = |exclusive, start, end| LockRequest {
+                exclusive,
+                start,
+                end,
+                owner: 0xF10C,
+                ofd: true,
+            };
+            assert_eq!(setlk(key, &r(true, 0, 10), false), Ok(true));
+            assert_eq!(charged(acct), HELD_COST);
+            // Every other byte: one more lock fits, the next is ENOLCK.
+            assert_eq!(setlk(key, &r(true, 20, 30), false), Ok(true));
+            assert_eq!(
+                setlk(key, &r(true, 40, 50), false),
+                Err(crate::error::LxError::ENOLCK)
+            );
+            // A hole needs a lock for the far piece, and leaves both as they were.
+            assert_eq!(
+                setlk(key, &r(true, 4, 6), true),
+                Err(crate::error::LxError::ENOLCK)
+            );
+            assert_eq!(charged(acct), 2 * HELD_COST);
+            // Filling the gap merges all into one, and gives a lock back.
+            assert_eq!(setlk(key, &r(true, 10, 20), false), Ok(true));
+            assert_eq!(charged(acct), HELD_COST);
+            release_description(0xF10C);
+            assert_eq!(charged(acct), 0);
+        });
+    }
+
+    #[test]
+    fn a_property_blob_is_charged_to_its_maker_until_it_goes() {
+        use crate::fs::devfs::drm;
+        let cost = crate::fs::devfs::drm_scheme::blob_cost(64);
+        as_a_process_limited_to(45_207, cost, |acct| {
+            let owner = 0xB10B_0001;
+            let charge = || Charge::try_new(cost);
+            let a = drm::create_blob_owned(alloc::vec![0; 64], true, owner, charge().unwrap());
+            assert_eq!(charged(acct), cost);
+            assert!(charge().is_err(), "a second one is over the limit");
+            assert!(matches!(
+                drm::destroy_blob(a, owner),
+                drm::BlobDestroy::Destroyed
+            ));
+            assert_eq!(charged(acct), 0);
+            drm::create_blob_owned(alloc::vec![0; 64], true, owner, charge().unwrap());
+            drm::destroy_blobs_of(owner);
+            assert_eq!(charged(acct), 0, "the fd closing frees it");
+        });
+    }
+
+    #[test]
     fn a_semaphore_set_is_charged_to_its_maker_until_it_goes() {
         use crate::ipc::SemArray;
         let ten = SemArray::cost(10);
