@@ -91,6 +91,13 @@ pub enum Error {
     BufferTooSmall,
     InvalidLength,
     InvalidVectorAddress,
+    /// The kernel heap could not hold the copy. Every copy whose size the
+    /// caller chose is asked for fallibly: an infallible one that does not
+    /// fit is `alloc_error`, which is a kernel panic, so one process's
+    /// oversized argument took the machine.
+    NoMemory,
+    /// An `argv`/`envp` walk ran over its [`ArgBudget`]: `E2BIG`.
+    TooBig,
 }
 
 // 本模块用到的只是用户指针操作结果的类型。
@@ -402,7 +409,10 @@ impl<T, P: Read> UserPtr<T, P> {
             // and the following copy would write out of bounds.
             len.checked_mul(core::mem::size_of::<T>())
                 .ok_or(Error::InvalidLength)?;
-            let mut ret = Vec::<T>::with_capacity(len);
+            // `len` is the caller's: `with_capacity` would be `alloc_error`
+            // when it does not fit, and that is a kernel panic.
+            let mut ret = Vec::<T>::new();
+            ret.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
             unsafe {
                 ret.set_len(len);
                 ret.as_mut_ptr().copy_from_nonoverlapping(self.0, len);
@@ -454,6 +464,53 @@ const MAX_C_STR_LEN: usize = 4 * 1024 * 1024;
 /// (e.g. `argv`/`envp`), to bound kernel work and allocations.
 const MAX_C_STR_ARRAY_LEN: usize = 1 << 20;
 
+/// What an `argv`/`envp` walk may still copy, in the bytes Linux counts
+/// against `ARG_MAX`: each string with its NUL, and one pointer for it.
+///
+/// The walk is where the kernel allocates for the strings, so it is where the
+/// limits have to be: checking them once both arrays were copied, as
+/// `execve` did, let an `argv` of a thousand pointers to one 4 MiB string ask
+/// the heap for 4 GiB before anything said `E2BIG`, and the heap's answer to
+/// that is a kernel panic. Linux counts as it copies (`copy_strings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgBudget {
+    /// The longest one string may be, its NUL included (`MAX_ARG_STRLEN`).
+    pub max_str: usize,
+    /// What the strings and their pointers may still take.
+    pub left: usize,
+}
+
+impl ArgBudget {
+    /// No limit but the walk's own ([`MAX_C_STR_LEN`] a string).
+    pub const UNLIMITED: Self = Self {
+        max_str: usize::MAX,
+        left: usize::MAX,
+    };
+
+    /// Takes one string of `len` bytes (its NUL not counted) and its
+    /// `pointer`-byte entry, or says `E2BIG`.
+    fn take(&mut self, len: usize, pointer: usize) -> Result<()> {
+        let with_nul = len.checked_add(1).ok_or(Error::TooBig)?;
+        if with_nul > self.max_str {
+            return Err(Error::TooBig);
+        }
+        let cost = with_nul.checked_add(pointer).ok_or(Error::TooBig)?;
+        self.left = self.left.checked_sub(cost).ok_or(Error::TooBig)?;
+        Ok(())
+    }
+}
+
+/// One string of an `argv`/`envp` copied fallibly, after the budget took it.
+fn copy_arg(s: &str, pointer: usize, budget: &mut ArgBudget, out: &mut Vec<String>) -> Result<()> {
+    budget.take(s.len(), pointer)?;
+    out.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    let mut owned = String::new();
+    owned.try_reserve_exact(s.len()).map_err(|_| Error::NoMemory)?;
+    owned.push_str(s);
+    out.push(owned);
+    Ok(())
+}
+
 impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
     // 拷贝一组 C 风格的零结尾字符串到 `String`，
     // 并收集到一个 `Vec` 中。
@@ -464,6 +521,14 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
     /// [`as_c_str`](UserPtr::as_c_str): an `argv` with no `NULL` before the
     /// end of its mapping used to be read on past it.
     pub fn read_cstring_array(&self) -> Result<Vec<String>> {
+        let mut budget = ArgBudget::UNLIMITED;
+        self.read_cstring_array_within(&mut budget)
+    }
+
+    /// [`read_cstring_array`](Self::read_cstring_array) that takes what it
+    /// copies out of `budget`, and stops with [`Error::TooBig`] where it runs
+    /// out -- before allocating for the string that would not fit.
+    pub fn read_cstring_array_within(&self, budget: &mut ArgBudget) -> Result<Vec<String>> {
         let mut result = Vec::new();
         for i in 0..MAX_C_STR_ARRAY_LEN {
             let at = self.add(i);
@@ -474,7 +539,12 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
             if sptr.is_null() {
                 return Ok(result);
             }
-            result.push(sptr.as_c_str()?.into());
+            copy_arg(
+                sptr.as_c_str()?,
+                core::mem::size_of::<usize>(),
+                budget,
+                &mut result,
+            )?;
         }
         Err(Error::InvalidLength)
     }
@@ -501,6 +571,13 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
     /// mapping is `EFAULT`, not a walk into whatever comes next. That is
     /// what the per-page check does, exactly as in the native version.
     pub fn read_cstring_array32(&self) -> Result<Vec<String>> {
+        let mut budget = ArgBudget::UNLIMITED;
+        self.read_cstring_array32_within(&mut budget)
+    }
+
+    /// [`read_cstring_array32`](Self::read_cstring_array32) against
+    /// `budget`, each entry costing the 4 bytes of a 32-bit pointer.
+    pub fn read_cstring_array32_within(&self, budget: &mut ArgBudget) -> Result<Vec<String>> {
         let mut result = Vec::new();
         let base: UserPtr<u32, P> = UserPtr::from(self.0 as usize);
         for i in 0..MAX_C_STR_ARRAY_LEN {
@@ -513,7 +590,7 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
                 return Ok(result);
             }
             let string: UserPtr<u8, P> = UserPtr::from(sptr as usize);
-            result.push(string.as_c_str()?.into());
+            copy_arg(string.as_c_str()?, 4, budget, &mut result)?;
         }
         Err(Error::InvalidLength)
     }

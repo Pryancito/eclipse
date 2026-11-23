@@ -1569,16 +1569,20 @@ impl Syscall<'_> {
         // 32-bit program's `argv` is four bytes an entry, and reading it at
         // eight does not fail, it invents the arguments. See
         // `Syscall::read_cstring_array`.
+        // Counted as the strings are copied: each one is a kernel allocation,
+        // and an argv of a thousand pointers to one 4 MiB string asked the
+        // heap for 4 GiB before the check below ever saw it.
+        let mut budget = exec_args::arg_budget(self.linux_process(), path_str)?;
         let args = exec_args::argv_or_empty(if argv.is_null() {
             Vec::new()
         } else {
-            self.read_cstring_array(argv).inspect_err(|&e| {
+            self.read_cstring_array(argv, &mut budget).inspect_err(|&e| {
                 error!("execve: reading argv failed: {:?}", e);
             })?
         });
         let mut envs: Vec<String> = Vec::new();
         if !envp.is_null() {
-            envs = self.read_cstring_array(envp).inspect_err(|&e| {
+            envs = self.read_cstring_array(envp, &mut budget).inspect_err(|&e| {
                 error!("execve: reading envp failed: {:?}", e);
             })?;
         }
