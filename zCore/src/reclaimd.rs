@@ -34,6 +34,12 @@ use kernel_hal::timer::timer_now;
 #[cfg(not(feature = "libos"))]
 const IDLE_STACKS_KEPT: usize = 16;
 
+/// Bytes of freed large heap blocks (`kernel_hal::vmalloc`) a pass leaves
+/// mapped, for the next large allocation to take over without mapping or
+/// flushing anything: a pipe or socket buffer that grows and shrinks.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+const VMALLOC_KEPT: usize = 32 * 1024 * 1024;
+
 /// How often the worker looks. Linux's `kswapd` sleeps on a waitqueue with a
 /// 100 ms watchdog; this is the watchdog without the waitqueue.
 const PERIOD_MS: u64 = 200;
@@ -141,6 +147,19 @@ pub fn start() {
                 // Idle coroutine stacks a burst left behind, before the heap
                 // is given back below, so their blocks can go with it.
                 let trimmed = executor::trim_idle_stacks(IDLE_STACKS_KEPT);
+                // Large heap blocks freed since the last pass are still
+                // mapped (a free cannot wait for the TLB flush): give back
+                // all but a few for the next large allocation to reuse.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let purged = kernel_hal::vmalloc::purge(VMALLOC_KEPT);
+                    if purged > 0 {
+                        log::info!(
+                            "reclaimd: gave back {} KiB of freed large heap blocks",
+                            purged / 1024
+                        );
+                    }
+                }
                 if trimmed > 0 {
                     log::info!(
                         "reclaimd: gave back {} KiB of idle coroutine stacks",

@@ -940,6 +940,16 @@ mod virtio_drivers_ffi {
                 return paddr;
             }
         }
+        // The fallback is the linear map's arithmetic, and a large heap block
+        // is mapped page by page outside it (`crate::vmalloc`): the answer
+        // would be an address nobody owns, handed to a device for DMA.
+        #[cfg(target_arch = "x86_64")]
+        if crate::imp::vmalloc::owns(vaddr) {
+            panic!(
+                "virt_to_phys: {:#x} is a large heap block but not mapped",
+                vaddr
+            );
+        }
         vaddr - KCONFIG.phys_to_virt_offset
     }
 }
@@ -1186,6 +1196,16 @@ mod drivers_ffi {
             if let Ok((paddr, _, _)) = pt.query(vaddr) {
                 return paddr;
             }
+        }
+        // The fallback is the linear map's arithmetic, and a large heap block
+        // is mapped page by page outside it (`crate::vmalloc`): the answer
+        // would be an address nobody owns, handed to a device for DMA.
+        #[cfg(target_arch = "x86_64")]
+        if crate::imp::vmalloc::owns(vaddr) {
+            panic!(
+                "virt_to_phys: {:#x} is a large heap block but not mapped",
+                vaddr
+            );
         }
         vaddr - KCONFIG.phys_to_virt_offset
     }
