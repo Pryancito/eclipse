@@ -23,6 +23,13 @@ pub struct DrmFileState {
     /// Without it `GETCRTC` masks the aspect-ratio bits out of the mode.
     aspect_ratio: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
+    /// The bytes of the events in `events`, kept beside it under its lock.
+    event_bytes: AtomicUsize,
+    /// The vblank and sequence events still waiting for their vblank: one
+    /// [`EventSlot`] each. Shared with the slots, so a slot that outlives
+    /// its file (a timer job dropped late) gives back to a counter nobody
+    /// reads, not to freed memory, and its drop takes no lock.
+    event_jobs: Arc<AtomicUsize>,
     eventbus: Arc<Mutex<EventBus>>,
     /// The nouveau GEM handles this open imported through `PRIME_FD_TO_HANDLE`
     /// and has not `GEM_CLOSE`d: Linux's `drm_prime_file_private.lookup`, the
@@ -66,6 +73,8 @@ impl DrmFileState {
             universal_planes: AtomicBool::new(false),
             aspect_ratio: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
+            event_bytes: AtomicUsize::new(0),
+            event_jobs: Arc::new(AtomicUsize::new(0)),
             eventbus: EventBus::new(),
             prime_imports: Mutex::new(Vec::new()),
             minor,
@@ -241,6 +250,7 @@ impl DrmFileState {
             buf[total..total + len].copy_from_slice(&ev[..len]);
             total += len;
         }
+        self.event_bytes.fetch_sub(total, Ordering::Relaxed);
         if events.is_empty() {
             self.eventbus.lock().clear(Event::READABLE);
         }
@@ -253,8 +263,43 @@ impl DrmFileState {
 
     pub(super) fn push_event(&self, bytes: Vec<u8>) {
         let mut events = self.events.lock();
+        self.event_bytes.fetch_add(bytes.len(), Ordering::Relaxed);
         events.push_back(bytes);
         self.eventbus.lock().set(Event::READABLE);
+    }
+
+    /// `drm_event_reserve_init`: room for one more event that waits for its
+    /// vblank, or `None` (ENOMEM) when the events this file has not read
+    /// and the ones it still waits for fill [`EVENT_SPACE`]. Without it a
+    /// client that queued `WAIT_VBLANK` events far ahead, or never read
+    /// its fd, grew the timer queue and its own event queue for ever.
+    pub(super) fn reserve_event(&self) -> Option<EventSlot> {
+        let waiting = self.event_jobs.fetch_add(1, Ordering::AcqRel) + 1;
+        let unread = self.event_bytes.load(Ordering::Relaxed);
+        if unread + waiting * DRM_EVENT_SIZE > EVENT_SPACE {
+            self.event_jobs.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(EventSlot(self.event_jobs.clone()))
+    }
+}
+
+/// `drm_file.event_space`: what one open file may hold in events not yet
+/// read plus events reserved and not yet sent, as Linux starts it (4096).
+pub(super) const EVENT_SPACE: usize = 4096;
+
+/// Every event this kernel sends is a 32-byte `drm_event_vblank` or
+/// `drm_event_crtc_sequence`.
+pub(super) const DRM_EVENT_SIZE: usize = 32;
+
+/// One reserved event of [`DrmFileState::reserve_event`], given back when
+/// its timer job goes: sent (its bytes are then in the queue), cancelled,
+/// or dropped with the file.
+pub struct EventSlot(Arc<AtomicUsize>);
+
+impl Drop for EventSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

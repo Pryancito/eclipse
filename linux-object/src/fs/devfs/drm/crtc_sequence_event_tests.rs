@@ -39,6 +39,7 @@ fn the_event_names_the_vblank_in_nanoseconds_waits_for_it_and_dies_with_its_file
             user_data: 0x5EC0_0001,
             due_seq: seq_before,
             file: Arc::downgrade(&file),
+            _slot: file.reserve_event().unwrap(),
         });
     deliver_pending_drm_timer();
     let (seq_after, time_after) = vblank_seq_and_time_now();
@@ -85,6 +86,7 @@ fn the_event_names_the_vblank_in_nanoseconds_waits_for_it_and_dies_with_its_file
             user_data: 2,
             due_seq: seq_after.wrapping_add(1_000),
             file: Arc::downgrade(&file),
+            _slot: file.reserve_event().unwrap(),
         });
     deliver_pending_drm_timer();
     assert!(!file.has_events(), "an event before its vblank");
@@ -140,6 +142,7 @@ fn the_crtc_going_off_sends_the_waiting_events_with_the_count_there_is() {
             signal: 0x0FF0_0001,
             due_seq: far,
             file: Arc::downgrade(&file),
+            _slot: file.reserve_event().unwrap(),
         });
         q.push_back(PendingDrmTimer::Flip {
             crtc_id: SYNTH_CRTC_ID,
@@ -152,6 +155,7 @@ fn the_crtc_going_off_sends_the_waiting_events_with_the_count_there_is() {
             user_data: 0x0FF0_0003,
             due_seq: far,
             file: Arc::downgrade(&file),
+            _slot: file.reserve_event().unwrap(),
         });
     }
     assert_eq!(pending_jobs(), (1, 1, 1));
@@ -196,10 +200,59 @@ fn the_crtc_going_off_sends_the_waiting_events_with_the_count_there_is() {
             signal: 0x0FF0_0005,
             due_seq: far,
             file: Arc::downgrade(&file),
+            _slot: file.reserve_event().unwrap(),
         });
     set_crtc_blanked(true);
     assert_eq!(pending_jobs(), (1, 1, 0), "no transition, nothing sent");
     assert!(!file.has_events());
     PENDING_DRM_TIMERS.lock().clear();
     DRM_TIMER_ARMED.store(false, Ordering::Release);
+}
+
+#[test]
+fn the_events_a_file_waits_for_and_has_not_read_fit_in_its_event_space() {
+    let _serialised = super::test_globals::lock();
+    PENDING_DRM_TIMERS.lock().clear();
+    let file = DrmFileState::new();
+    let room = file_state::EVENT_SPACE / file_state::DRM_EVENT_SIZE;
+    let far = vblank_seq_now().wrapping_add(1_000_000);
+
+    // `drm_event_reserve_init`: 128 events far ahead, then ENOMEM.
+    for i in 0..room {
+        assert!(
+            schedule_vblank_event(i as u64, far, &file).is_some(),
+            "event {}",
+            i
+        );
+    }
+    assert!(
+        schedule_vblank_event(0, far, &file).is_none(),
+        "past event_space"
+    );
+    assert!(
+        schedule_crtc_sequence_event(0, far, &file).is_none(),
+        "shared space"
+    );
+
+    // A job that goes gives its room back.
+    PENDING_DRM_TIMERS.lock().pop_front();
+    assert!(schedule_crtc_sequence_event(7, far, &file).is_some());
+    assert!(schedule_vblank_event(0, far, &file).is_none());
+
+    // Sent but unread events take the room too, until read.
+    PENDING_DRM_TIMERS.lock().clear();
+    let now = vblank_seq_now();
+    for i in 0..room {
+        queue_vblank_event(&file, now, i as u64);
+    }
+    assert!(
+        schedule_vblank_event(0, far, &file).is_none(),
+        "unread events fill it"
+    );
+    let mut buf = [0u8; 64];
+    assert_eq!(file.read_events(&mut buf), EventRead::Read(64));
+    assert!(schedule_vblank_event(1, far, &file).is_some());
+    assert!(schedule_vblank_event(2, far, &file).is_some());
+    assert!(schedule_vblank_event(3, far, &file).is_none());
+    PENDING_DRM_TIMERS.lock().clear();
 }

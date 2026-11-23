@@ -14,11 +14,21 @@ use alloc::vec::Vec;
 /// creator) from kernel-owned ones (current mode), mirroring Linux's
 /// ownership rule.
 pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
-    create_blob_owned(data, user_created, 0)
+    create_blob_owned(data, user_created, 0, crate::kmem::Charge::none())
 }
 
 /// [`create_blob`] on behalf of the open file `owner` (see [`DrmBlob::owner`]).
-pub fn create_blob_owned(data: Vec<u8>, user_created: bool, owner: usize) -> u32 {
+///
+/// `charge` is the blob's memory on its creator's kernel memory account
+/// (`drm_property_create_blob` allocates with `GFP_KERNEL_ACCOUNT`): a
+/// client's blobs live until it destroys them or closes the fd, and were
+/// the one KMS object a loop of `CREATEPROPBLOB` could pile up without end.
+pub fn create_blob_owned(
+    data: Vec<u8>,
+    user_created: bool,
+    owner: usize,
+    charge: crate::kmem::Charge,
+) -> u32 {
     let mut state = DRM_STATE.lock();
     let id = state.next_object_id;
     state.next_object_id += 1;
@@ -27,6 +37,7 @@ pub fn create_blob_owned(data: Vec<u8>, user_created: bool, owner: usize) -> u32
         user_created,
         owner,
         data,
+        _charge: charge,
     });
     id
 }
