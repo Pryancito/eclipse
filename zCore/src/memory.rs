@@ -1438,7 +1438,9 @@ pub fn frame_reserve() -> usize {
     0
 }
 
-/// [`frame_reserve`] for a given total; none here.
+/// [`frame_reserve`] for a given total; none here. Only `reclaimd` asks,
+/// and a zircon-only kernel (the core tests) does not build it.
+#[allow(dead_code)]
 pub fn reserve_for(_total: usize) -> usize {
     0
 }
