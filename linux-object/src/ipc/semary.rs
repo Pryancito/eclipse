@@ -61,8 +61,15 @@ impl SemArray {
 
     /// The value and generation of every semaphore in the set, read under the
     /// caller's [`semop_guard`](Self::semop_guard).
-    pub fn snapshot(&self) -> Vec<(isize, u64)> {
-        self.sems.iter().map(|s| s.get_versioned()).collect()
+    ///
+    /// Up to `SEMMSL` entries, 512 KiB, on every `semop` attempt and wake:
+    /// asked for fallibly, so a heap that cannot hold it is `ENOMEM`.
+    pub fn snapshot(&self) -> crate::error::LxResult<Vec<(isize, u64)>> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.sems.len())
+            .map_err(|_| crate::error::LxError::ENOMEM)?;
+        out.extend(self.sems.iter().map(|s| s.get_versioned()));
+        Ok(out)
     }
 
     /// Number of semaphores in the set.
