@@ -1,8 +1,8 @@
 use super::page_flags::PageFlags;
 #[path = "vmar_vm_size.rs"]
 mod vmar_vm_size;
-pub use vmar_vm_size::MAX_MAP_COUNT;
 use vmar_vm_size::VmSizeMeter;
+pub use vmar_vm_size::MAX_MAP_COUNT;
 use {
     super::*,
     crate::object::*,

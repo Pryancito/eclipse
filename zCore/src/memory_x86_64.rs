@@ -2289,6 +2289,8 @@ cfg_if! {
         }
 
         /// How long after a growth the periodic release leaves the heap alone.
+        // Only `reclaimd` reads it, and `reclaimd` is `linux` only.
+        #[cfg_attr(not(feature = "linux"), allow(dead_code))]
         const HEAP_RELEASE_QUIET_MS: u64 = 5_000;
         /// `timer_now` in ms of the last growth, `0` for none since boot.
         static HEAP_GREW_AT_MS: core::sync::atomic::AtomicU64 =
@@ -2308,6 +2310,7 @@ cfg_if! {
         /// cycle that ends where it started. The shrinker keeps calling
         /// [`release_idle_heap`] itself, unhindered, because that call comes
         /// from a frame allocation that is short of RAM right now.
+        #[cfg_attr(not(feature = "linux"), allow(dead_code))]
         pub fn release_spare_heap(want: usize) -> usize {
             let grew = HEAP_GREW_AT_MS.load(Ordering::Relaxed);
             let now = kernel_hal::timer::timer_now().as_millis() as u64;
