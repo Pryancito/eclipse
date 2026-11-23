@@ -281,7 +281,14 @@ mod queues {
         .unwrap();
         let thread = Thread::create_linux(&proc).unwrap();
         let acct = proc.linux().kmem().clone();
-        acct.set_limit(limit);
+        // The thread itself is charged to the process: the limit is on top
+        // of it, and `charged` leaves it out.
+        assert_eq!(acct.charged(), crate::thread::THREAD_KMEM_COST);
+        acct.set_limit(if limit == 0 {
+            0
+        } else {
+            limit + crate::thread::THREAD_KMEM_COST
+        });
         let r = async_std::task::block_on(async {
             kernel_hal::thread::set_current_thread(Some(thread.clone()));
             let r = f(&acct);
@@ -292,19 +299,48 @@ mod queues {
         r
     }
 
+    /// What `acct` holds besides the thread of `as_a_process_limited_to`.
+    fn charged(acct: &KmemAccount) -> usize {
+        acct.charged() - crate::thread::THREAD_KMEM_COST
+    }
+
+    #[test]
+    fn a_thread_is_charged_to_its_process_until_it_goes() {
+        use crate::thread::THREAD_KMEM_COST;
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            45_207,
+            "kmem",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let acct = proc.linux().kmem().clone();
+        acct.set_limit(2 * THREAD_KMEM_COST);
+        let one = Thread::create_linux(&proc).unwrap();
+        let two = Thread::create_linux(&proc).unwrap();
+        assert_eq!(acct.charged(), 2 * THREAD_KMEM_COST);
+        assert_eq!(
+            Thread::create_linux(&proc).err(),
+            Some(zircon_object::ZxError::NO_MEMORY)
+        );
+        one.terminate_abandoned();
+        two.terminate_abandoned();
+        drop((one, two));
+    }
+
     #[test]
     fn a_pipe_write_over_the_quota_is_enomem_and_a_read_gives_it_back() {
         as_a_process_limited_to(45_201, 4096 + RUN_COST, |acct| {
             let (r, w) = Pipe::create_pair();
             assert_eq!(w.write_at(0, &[1u8; 4096]), Ok(4096));
-            assert_eq!(acct.charged(), 4096 + RUN_COST);
+            assert_eq!(charged(acct), 4096 + RUN_COST);
             assert_eq!(w.write_at(0, &[1u8; 1]), Err(FsError::NoMemory));
             let mut sink = [0u8; 1000];
             assert_eq!(r.read_at(0, &mut sink), Ok(1000));
-            assert_eq!(acct.charged(), 3096 + RUN_COST);
+            assert_eq!(charged(acct), 3096 + RUN_COST);
             assert_eq!(w.write_at(0, &[1u8; 1000]), Ok(1000));
             drop((r, w));
-            assert_eq!(acct.charged(), 0);
+            assert_eq!(charged(acct), 0);
         });
     }
 
@@ -318,16 +354,16 @@ mod queues {
             Socket::send_fds(&*a, alloc::vec![file(), file(), file()]).unwrap();
             assert_eq!(Socket::write(&*a, b"x", None), Ok(1));
             assert_eq!(acct.inflight(), 3);
-            let before = acct.charged();
+            let before = charged(acct);
             let mut byte = [0u8; 1];
             let (r, _) = async_std::task::block_on(Socket::read(&*b, &mut byte));
             assert_eq!(r, Ok(1));
             assert_eq!(Socket::recv_fds(&*b, 2).len(), 2);
             assert_eq!(acct.inflight(), 1, "two received, one still in flight");
-            assert_eq!(acct.charged(), before - 2 * INFLIGHT_FD_COST - 1);
+            assert_eq!(charged(acct), before - 2 * INFLIGHT_FD_COST - 1);
             // The last one never comes out: closing the socket gives it back.
             drop((a, b));
-            assert_eq!((acct.inflight(), acct.charged()), (0, 0));
+            assert_eq!((acct.inflight(), charged(acct)), (0, 0));
         });
     }
 
@@ -337,13 +373,13 @@ mod queues {
         let ten = SemArray::cost(10);
         as_a_process_limited_to(45_204, ten, |acct| {
             let set = SemArray::get_or_create(0, 10, 0o1600, 0, 0, &[]).unwrap();
-            assert_eq!(acct.charged(), ten);
+            assert_eq!(charged(acct), ten);
             assert_eq!(
                 SemArray::get_or_create(0, 1, 0o1600, 0, 0, &[]).err(),
                 Some(crate::error::LxError::ENOMEM)
             );
             drop(set);
-            assert_eq!(acct.charged(), 0);
+            assert_eq!(charged(acct), 0);
         });
     }
 
@@ -362,18 +398,18 @@ mod queues {
                 .unwrap();
             ep.ctl(ADD, FileDesc::from(4usize), ev, Some(file()))
                 .unwrap();
-            assert_eq!(acct.charged(), 2 * EPITEM_COST);
+            assert_eq!(charged(acct), 2 * EPITEM_COST);
             assert_eq!(
                 ep.ctl(ADD, FileDesc::from(5usize), ev, Some(file())),
                 Err(crate::error::LxError::ENOMEM)
             );
             let f4 = ep.watched(FileDesc::from(4usize), 0).unwrap();
             ep.ctl(MOD, FileDesc::from(4usize), ev, Some(f4)).unwrap();
-            assert_eq!(acct.charged(), 2 * EPITEM_COST, "a MOD is no new entry");
+            assert_eq!(charged(acct), 2 * EPITEM_COST, "a MOD is no new entry");
             ep.ctl(DEL, FileDesc::from(3usize), ev, None).unwrap();
-            assert_eq!(acct.charged(), EPITEM_COST);
+            assert_eq!(charged(acct), EPITEM_COST);
             drop(ep);
-            assert_eq!(acct.charged(), 0);
+            assert_eq!(charged(acct), 0);
         });
     }
 
@@ -389,12 +425,12 @@ mod queues {
                 "the same path, the same watch"
             );
             ino.add_watch("/etc", 2).unwrap();
-            assert_eq!(acct.charged(), watch_cost("/tmp") + watch_cost("/etc"));
+            assert_eq!(charged(acct), watch_cost("/tmp") + watch_cost("/etc"));
             assert_eq!(acct.inotify_watches(), 2);
             ino.rm_watch(a as i32).unwrap();
             assert_eq!(acct.inotify_watches(), 1);
             drop(ino);
-            assert_eq!((acct.charged(), acct.inotify_watches()), (0, 0));
+            assert_eq!((charged(acct), acct.inotify_watches()), (0, 0));
         });
     }
 
@@ -414,9 +450,9 @@ mod queues {
                 assert!(sent <= 64 * 1024, "the quota did not hold");
             };
             assert_eq!(refused, crate::error::LxError::ENOMEM);
-            assert_eq!(acct.charged(), sent + RUN_COST);
+            assert_eq!(charged(acct), sent + RUN_COST);
             drop((a, b));
-            assert_eq!(acct.charged(), 0);
+            assert_eq!(charged(acct), 0);
         });
     }
 }

@@ -192,7 +192,18 @@ pub struct LinuxThreadExt {
     /// The waker of the wait this thread is parked in, when the wait asked
     /// to be told of a signal: see [`Self::park_waiter`].
     waiter: Mutex<Option<(u64, Waker)>>,
+    /// The thread's own kernel memory, [`THREAD_KMEM_COST`], charged to its
+    /// process until the thread goes.
+    _charge: crate::kmem::Charge,
 }
+
+/// What a thread costs the kernel's heap besides its stack, as charged to
+/// its process: the thread objects, its signal and wait state, its share
+/// of the scheduler's tables. 31,000 threads of one process took about 17
+/// KiB each in QEMU, uncharged, and nothing stopped a process at any count
+/// (Linux has `threads-max` and `RLIMIT_NPROC`; here the quota is the stop,
+/// `ENOMEM` from `clone`, which clone(2) lists).
+pub const THREAD_KMEM_COST: usize = 16 * 1024;
 
 /// The numbers [`LinuxThreadExt::park_waiter`] hands out. One counter for
 /// every thread: a wait that is dropped on another thread than the one it
@@ -216,7 +227,21 @@ impl LinuxThreadExt {
             deliverable,
             inner: Mutex::new(linux),
             waiter: Mutex::new(None),
+            _charge: crate::kmem::Charge::none(),
         }
+    }
+
+    /// [`new`](Self::new), charged to `proc`'s account, or refused.
+    fn charged_to(linux: LinuxThread, proc: &Process) -> ZxResult<Self> {
+        let charge = crate::kmem::Charge::try_to(
+            proc.try_linux().map(|lp| lp.kmem().clone()),
+            THREAD_KMEM_COST,
+        )
+        .map_err(|_| ZxError::NO_MEMORY)?;
+        Ok(Self {
+            _charge: charge,
+            ..Self::new(linux)
+        })
     }
 
     /// Leave `waker` to be woken when a signal is queued to this thread or
@@ -333,7 +358,7 @@ impl ThreadExt for Thread {
         let leader = Thread::create_with_ext_id(
             proc,
             &self.name(),
-            LinuxThreadExt::new(LinuxThread::initial()),
+            LinuxThreadExt::charged_to(LinuxThread::initial(), &proc)?,
             Some(proc.id()),
         )?;
         core::mem::swap(&mut *self.lock_linux(), &mut *leader.lock_linux());
@@ -349,7 +374,7 @@ impl ThreadExt for Thread {
     }
 
     fn create_linux_with(proc: &Arc<Process>, linux: LinuxThread) -> ZxResult<Arc<Self>> {
-        let linux_thread = LinuxThreadExt::new(linux);
+        let linux_thread = LinuxThreadExt::charged_to(linux, proc)?;
         // The thread-group leader (the process's first/main thread) must have a
         // TID equal to the process PID, just like Linux. Userspace relies on
         // this: e.g. winit's `is_main_thread()` panics unless gettid()==getpid()
