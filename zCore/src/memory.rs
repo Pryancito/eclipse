@@ -1486,6 +1486,12 @@ pub fn release_idle_heap(_want: usize) -> usize {
     0
 }
 
+/// The periodic flavour of [`release_idle_heap`] (see `memory_x86_64`).
+#[allow(dead_code)]
+pub fn release_spare_heap(_want: usize) -> usize {
+    0
+}
+
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
 #[allow(dead_code)]
 pub fn heap_total() -> usize {

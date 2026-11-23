@@ -154,8 +154,9 @@ pub fn start() {
             // as soon as it is spare, which is what lets a program that
             // exits give back all it took. One relaxed load when the heap
             // never grew. Bounded per pass, so a gigabyte to give back is
-            // spread over a few seconds rather than held in one tick.
-            let released = crate::memory::release_idle_heap(HEAP_RELEASE_PER_PASS);
+            // spread over a few seconds rather than held in one tick. Not
+            // within a few seconds of a growth: see `release_spare_heap`.
+            let released = crate::memory::release_spare_heap(HEAP_RELEASE_PER_PASS);
             if released > 0 {
                 log::info!(
                     "reclaimd: gave {} KiB of spare kernel heap back to the frame allocator",

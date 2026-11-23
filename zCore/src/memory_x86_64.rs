@@ -383,6 +383,51 @@ pub fn frame_dealloc(target: PhysAddr) {
     FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
+/// Give `count` frames starting at `start` back to the bitmap in one go,
+/// past the per-CPU lists.
+///
+/// For a run the kernel heap gives back (`release_free_blocks`). Freed one
+/// frame at a time, a run went through [`frame_dealloc`] and so through
+/// `pcp::free`, which parks up to a list's capacity on this CPU: the first
+/// frames of the run, the ones pushed while the list had room. The bitmap
+/// then saw the run with a hole at its start, and the heap's next growth
+/// ahead of demand -- which asks the bitmap only (`frame_alloc_quiet`) --
+/// could not take back the very run it had just returned.
+///
+/// The bitmap's lock is taken once per 2 MiB, so a 32 MiB run holds it, with
+/// interrupts off, sixteen short times rather than once for the whole run.
+/// A frame of the run that the bitmap already holds free is a double free,
+/// and ends the kernel as [`frame_dealloc`]'s would.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn frame_dealloc_run(start: PhysAddr, count: usize) {
+    // `mem-debug` wants every frame through the tracker and the poison.
+    #[cfg(feature = "mem-debug")]
+    for i in 0..count {
+        frame_dealloc(start + (i << PAGE_BITS));
+    }
+    #[cfg(not(feature = "mem-debug"))]
+    {
+        use bitmap_allocator::BitAlloc;
+        const BATCH: usize = 512;
+        let first = phys_addr_to_frame_idx(start);
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(BATCH);
+            let run = first + done..first + done + n;
+            {
+                let mut ba = FRAME_ALLOCATOR.lock();
+                if let Some(free) = run.clone().find(|&i| ba.test(i)) {
+                    drop(ba);
+                    panic!("frame_dealloc_run: frame {:#x} is already free", free << PAGE_BITS);
+                }
+                ba.insert(run);
+            }
+            FRAMES_USED.sub(n << PAGE_BITS);
+            done += n;
+        }
+    }
+}
+
 pub fn frame_stats() -> (usize, usize) {
     (FRAMES_USED.get(), TOTAL_MEMORY.load(Ordering::Relaxed))
 }
@@ -1429,6 +1474,26 @@ cfg_if! {
         /// chunk [`try_grow_heap`] has taken from physical RAM.
         static HEAP_TOTAL: AtomicUsize = AtomicUsize::new(KERNEL_HEAP_SIZE);
 
+        /// Bytes of buddy blocks the heap's callers hold: [`HEAP_USED`] with
+        /// every request rounded the way the buddy rounds it (see
+        /// [`buddy_block_size`]). What the growth watermark compares with
+        /// [`HEAP_TOTAL`], because that is what the buddy has given out.
+        ///
+        /// [`HEAP_USED`] counts requested bytes, and against a heap made of
+        /// power-of-two blocks that undercounts by up to half: a 4 MiB + 2 KiB
+        /// request takes an 8 MiB block, a 64 KiB + 16 one takes 128 KiB. A
+        /// desktop session ran the pool out with [`HEAP_USED`] at ~54 %, so
+        /// growth ahead of demand at 70 % fired late or never, and the growth
+        /// happened instead on the failure path, inside the caller whose
+        /// allocation had just been refused.
+        static HEAP_ROUNDED: BatchedCounter<{ 64 * 1024 }> = BatchedCounter::new();
+
+        /// [`HEAP_ROUNDED`], for the diagnostics.
+        #[allow(dead_code)]
+        pub fn heap_used_rounded() -> usize {
+            HEAP_ROUNDED.get()
+        }
+
         pub fn heap_total() -> usize {
             HEAP_TOTAL.load(Ordering::Relaxed)
         }
@@ -1838,12 +1903,33 @@ cfg_if! {
                 // shrinkers and logs on each refusal, which is right for an
                 // allocation the buddy refused and far too much for a growth
                 // nobody is waiting on.
+                //
+                // First, though, a run aligned to the chunk itself, from the
+                // bitmap alone. `add_to_heap` carves a region into the largest
+                // self-aligned blocks that fit, so a 32 MiB run on a mere page
+                // boundary became some twenty blocks and never one of 32 MiB:
+                // the heap could not hand out what it had just taken in one
+                // piece, and could never give it all back either, because the
+                // release takes whole free blocks of at least
+                // `HEAP_RELEASE_MIN` and the run's ragged edges are smaller.
+                // Each region left a few hundred KiB with the heap for good
+                // (12 MiB over 47 growths in a host model of the release).
+                // Aligned, the chunk is one block, and once free it goes back
+                // whole and the region with it.
                 let align = heap_grow_align_log2(need);
-                let pa = if need > 0 {
-                    frame_alloc(chunk >> PAGE_BITS, align)
+                let whole = heap_grow_align_log2(chunk).max(align);
+                let aligned = if whole > align {
+                    frame_alloc_quiet(chunk >> PAGE_BITS, whole)
                 } else {
-                    frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                    None
                 };
+                let pa = aligned.or_else(|| {
+                    if need > 0 {
+                        frame_alloc(chunk >> PAGE_BITS, align)
+                    } else {
+                        frame_alloc_quiet(chunk >> PAGE_BITS, align)
+                    }
+                });
                 if let Some(pa) = pa {
                     got = Some((pa, chunk));
                     break;
@@ -1884,6 +1970,10 @@ cfg_if! {
                 HEAP_ALLOCATOR.0.lock().add_to_heap(va, va + chunk);
             }
             HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed);
+            HEAP_GREW_AT_MS.store(
+                kernel_hal::timer::timer_now().as_millis() as u64,
+                Ordering::Relaxed,
+            );
             // The vtable-liveness ceiling (`set_vtable_max`) is deliberately
             // LEFT ALONE here. It rests on "the image links .rodata below
             // .bss, so no real vtable is at or above the static heap base" —
@@ -2037,9 +2127,7 @@ cfg_if! {
                     break;
                 };
                 let pa = kernel_hal::mem::virt_to_phys(va);
-                for i in 0..size >> PAGE_BITS {
-                    frame_dealloc(pa + (i << PAGE_BITS));
-                }
+                frame_dealloc_run(pa, size >> PAGE_BITS);
                 freed += size;
             }
             (freed, starved)
@@ -2084,6 +2172,35 @@ cfg_if! {
                 }
             }
             freed
+        }
+
+        /// How long after a growth the periodic release leaves the heap alone.
+        const HEAP_RELEASE_QUIET_MS: u64 = 5_000;
+        /// `timer_now` in ms of the last growth, `0` for none since boot.
+        static HEAP_GREW_AT_MS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+
+        /// [`release_idle_heap`] for `reclaimd`'s periodic pass: the same,
+        /// except within [`HEAP_RELEASE_QUIET_MS`] of a growth, when it gives
+        /// nothing back.
+        ///
+        /// A growth means the heap was short a moment ago, and the room
+        /// [`heap_release_room`] sees then is mostly the growth itself plus
+        /// free space the arena has in pieces too small to use. Released at
+        /// once, the next large block (a 4 MiB coroutine stack in a burst)
+        /// fails again, the failure path takes a fresh 32 MiB run, and the
+        /// next pass, 200 ms later, gives most of it back: a scan of the
+        /// frame bitmap and thousands of frames freed for each turn of a
+        /// cycle that ends where it started. The shrinker keeps calling
+        /// [`release_idle_heap`] itself, unhindered, because that call comes
+        /// from a frame allocation that is short of RAM right now.
+        pub fn release_spare_heap(want: usize) -> usize {
+            let grew = HEAP_GREW_AT_MS.load(Ordering::Relaxed);
+            let now = kernel_hal::timer::timer_now().as_millis() as u64;
+            if grew != 0 && now.saturating_sub(grew) < HEAP_RELEASE_QUIET_MS {
+                return 0;
+            }
+            release_idle_heap(want)
         }
 
         /// The release as a cache the reclaim paths can ask: a frame
@@ -2880,9 +2997,10 @@ cfg_if! {
                     }
                     HEAP_USED.add_on(slot, sz as isize);
                     let used = HEAP_USED.approx();
+                    HEAP_ROUNDED.add_on(slot, buddy_block_size(ext) as isize);
                     HEAP_LIVE.add_on(slot, bucket_of(sz), 1);
                     hot_track(slot, sz, 1);
-                    try_grow_heap(used);
+                    try_grow_heap(HEAP_ROUNDED.approx());
                     note_heap_pressure(used, p as usize, sz);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
@@ -2969,6 +3087,7 @@ cfg_if! {
                     core::ptr::write_bytes(ptr, POISON, sz);
                 }
                 HEAP_USED.add_on(slot, (sz as isize).wrapping_neg());
+                HEAP_ROUNDED.add_on(slot, (buddy_block_size(ext) as isize).wrapping_neg());
                 HEAP_LIVE.add_on(slot, bucket_of(sz), -1);
                 if sz >= BIG_ALLOC_MIN {
                     untrack_big_alloc(ptr as usize);
@@ -3045,6 +3164,12 @@ cfg_if! {
         /// surface, which is exactly what this attribute is for here.
         #[allow(dead_code)]
         pub fn release_idle_heap(_want: usize) -> usize {
+            0
+        }
+
+        /// See the bare-metal [`release_spare_heap`]; nothing to give here.
+        #[allow(dead_code)]
+        pub fn release_spare_heap(_want: usize) -> usize {
             0
         }
 
