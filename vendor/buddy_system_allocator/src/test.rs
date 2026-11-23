@@ -347,3 +347,18 @@ fn random_churn_keeps_blocks_disjoint_and_merges_back() {
     assert_eq!(heap.largest_free(), SIZE);
     assert!(heap.max_depth() < 64);
 }
+
+/// A block freed twice is caught, not linked twice.
+#[test]
+#[should_panic(expected = "freed twice")]
+fn a_double_free_is_caught() {
+    const SIZE: usize = 1 << 12;
+    let base = arena(SIZE);
+    let mut heap = Heap::<32>::new();
+    unsafe { heap.add_to_heap(base, base + SIZE) };
+    let l = Layout::from_size_align(64, 8).unwrap();
+    let a = heap.alloc(l).unwrap();
+    let _b = heap.alloc(l).unwrap();
+    heap.dealloc(a, l);
+    heap.dealloc(a, l);
+}

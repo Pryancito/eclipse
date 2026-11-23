@@ -202,6 +202,11 @@ unsafe fn split(mut t: usize, x: usize) -> (usize, usize) {
     let mut lt: *mut usize = addr_of_mut!(l);
     let mut rt: *mut usize = addr_of_mut!(r);
     while t != 0 {
+        // A block that is already free is being freed again. Linking it a
+        // second time would make the tree a cycle and every later walk of
+        // this class endless; better to stop here, where the culprit is on
+        // the stack.
+        assert!(t != x, "buddy: the block at {x:#x} is freed twice");
         if t < x {
             *lt = t;
             lt = addr_of_mut!((*node(t)).right);

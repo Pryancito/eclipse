@@ -43,8 +43,9 @@ pub use frame::*;
 /// # let size: usize = 100 * size_of::<usize>();
 /// unsafe {
 ///     heap.init(begin, size);
-///     // or
-///     heap.add_to_heap(begin, end);
+///     // or, the same range given by its ends (never both: a range
+///     // added twice is a double free of every block in it):
+///     // heap.add_to_heap(begin, end);
 /// }
 /// ```
 pub struct Heap<const ORDER: usize> {
@@ -276,8 +277,8 @@ impl<const ORDER: usize> fmt::Debug for Heap<ORDER> {
 /// # let size: usize = 100 * size_of::<usize>();
 /// unsafe {
 ///     heap.lock().init(begin, size);
-///     // or
-///     heap.lock().add_to_heap(begin, end);
+///     // or, never both:
+///     // heap.lock().add_to_heap(begin, end);
 /// }
 /// ```
 #[cfg(feature = "use_spin")]
