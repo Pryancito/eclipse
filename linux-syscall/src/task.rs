@@ -1701,7 +1701,7 @@ impl Syscall<'_> {
         // A `vfork` child runs in its parent's address space, and so does the
         // parent while that child has not exec'd: the new image goes into one
         // of this process's own, which leaves the other its program.
-        let vmar = self.zircon_process().own_address_space();
+        let vmar = self.zircon_process().try_own_address_space()?;
         let (load, privileged) = {
             // mmap_lock across the whole swap: tearing down the old image and
             // loading the new one is one layout mutation — a sibling thread's

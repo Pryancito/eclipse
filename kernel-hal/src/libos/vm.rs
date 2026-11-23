@@ -150,6 +150,11 @@ impl PageTable {
     pub fn clone_kernel(&self) -> Self {
         Self::new()
     }
+
+    /// The bare kernel's fallible twin; a hosted table needs no frame.
+    pub fn try_clone_kernel(&self) -> Option<Self> {
+        Some(Self::new())
+    }
 }
 
 impl Default for PageTable {

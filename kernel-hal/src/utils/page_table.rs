@@ -398,15 +398,24 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
     }
 
     pub fn new() -> Self {
-        let root = PhysFrame::new_zero().expect("failed to alloc frame");
-        Self {
+        Self::try_new().expect("failed to alloc frame")
+    }
+
+    /// [`Self::new`], or `None` when there is no frame for the root.
+    ///
+    /// A process is born with one: `fork` with every frame taken used to end
+    /// on the `expect` above, a kernel panic holding a lock (QEMU 2 GiB, a
+    /// fork bomb, 2026-11-23), where Linux answers `fork` with ENOMEM.
+    pub fn try_new() -> Option<Self> {
+        let root = PhysFrame::new_zero()?;
+        Some(Self {
             root,
             intrm_tables: Vec::new(),
             gather: 0,
             gather_pending: false,
             resident: Resident::default(),
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Create a new `PageTable` from current VM token. (e.g. CR3, SATP, ...)
@@ -523,9 +532,14 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
     }
 
     pub fn clone_kernel(&self) -> Self {
-        let pt = Self::new();
+        self.try_clone_kernel().expect("failed to alloc frame")
+    }
+
+    /// [`Self::clone_kernel`], or `None` when there is no frame for the root.
+    pub fn try_clone_kernel(&self) -> Option<Self> {
+        let pt = Self::try_new()?;
         crate::vm::pt_clone_kernel_space(pt.table_phys(), self.table_phys());
-        pt
+        Some(pt)
     }
 }
 

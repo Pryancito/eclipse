@@ -471,6 +471,13 @@ impl Drop for VmAddressRegion {
 impl VmAddressRegion {
     /// Create a new root VMAR.
     pub fn new_root() -> Arc<Self> {
+        Self::try_new_root().expect("failed to alloc frame")
+    }
+
+    /// [`Self::new_root`], or `NO_MEMORY` when there is no frame for the
+    /// root page table: what a `fork` or a new process answers with every
+    /// frame taken, as ENOMEM, rather than a kernel panic.
+    pub fn try_new_root() -> ZxResult<Arc<Self>> {
         #[cfg(feature = "aspace-separate")]
         let (addr, size) = {
             let i = aspace_window::take();
@@ -481,7 +488,7 @@ impl VmAddressRegion {
         };
         #[cfg(not(feature = "aspace-separate"))]
         let (addr, size) = (USER_ASPACE_BASE as usize, USER_ASPACE_SIZE as usize);
-        Self::new_root_at(addr, size)
+        Self::try_new_root_at(addr, size)
     }
 
     /// The range every hosted (`aspace-separate`) root VMAR is carved from:
@@ -508,14 +515,18 @@ impl VmAddressRegion {
         #[cfg(feature = "aspace-separate")]
         return Self::new_root();
         #[cfg(not(feature = "aspace-separate"))]
-        Self::new_root_at(
+        Self::try_new_root_at(
             ZIRCON_USER_ASPACE_BASE as usize,
             (USER_ASPACE_SIZE - ZIRCON_USER_ASPACE_BASE) as usize,
         )
+        .expect("failed to alloc frame")
     }
 
-    fn new_root_at(addr: usize, size: usize) -> Arc<Self> {
-        Arc::new(VmAddressRegion {
+    fn try_new_root_at(addr: usize, size: usize) -> ZxResult<Arc<Self>> {
+        let page_table = PageTable::from_current()
+            .try_clone_kernel()
+            .ok_or(ZxError::NO_MEMORY)?;
+        Ok(Arc::new(VmAddressRegion {
             flags: VmarFlags::ROOT_FLAGS,
             base: KObjectBase::new(),
             _counter: CountHelper::new(),
@@ -524,9 +535,9 @@ impl VmAddressRegion {
             parent: None,
             vdso_code: Arc::new(Mutex::new(None)),
             max_height: ROOT_VMAR_MAX_HEIGHT,
-            page_table: Arc::new(Mutex::new(PageTable::from_current().clone_kernel())), //hal PageTable
+            page_table: Arc::new(Mutex::new(page_table)), //hal PageTable
             inner: Mutex::new(Some(VmarInner::default())),
-        })
+        }))
     }
 
     /// Create a kernel root VMAR.
