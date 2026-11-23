@@ -219,6 +219,7 @@ pub mod errno {
     pub const ENOBUFS: i32 = 55;
     pub const EISCONN: i32 = 56;
     pub const ENOTCONN: i32 = 57;
+    pub const ETOOMANYREFS: i32 = 59;
     pub const ETIMEDOUT: i32 = 60;
     pub const ECONNREFUSED: i32 = 61;
     pub const ELOOP: i32 = 62;

@@ -136,6 +136,7 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         LxError::ENOBUFS => bsd::ENOBUFS,
         LxError::EISCONN => bsd::EISCONN,
         LxError::ENOTCONN => bsd::ENOTCONN,
+        LxError::ETOOMANYREFS => bsd::ETOOMANYREFS,
         LxError::ETIMEDOUT => bsd::ETIMEDOUT,
         LxError::ECONNREFUSED => bsd::ECONNREFUSED,
         LxError::EHOSTUNREACH => bsd::EHOSTUNREACH,

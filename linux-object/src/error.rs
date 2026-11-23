@@ -155,6 +155,9 @@ pub enum LxError {
     EISCONN = 106,
     /// Transport endpoint is not connected
     ENOTCONN = 107,
+    /// Too many references: cannot splice (a process has more descriptors
+    /// in flight over unix sockets than it may have open)
+    ETOOMANYREFS = 109,
     /// Connection timeout
     ETIMEDOUT = 110,
     /// Connection refused
@@ -257,6 +260,7 @@ impl LxError {
             105 => ENOBUFS,
             106 => EISCONN,
             107 => ENOTCONN,
+            109 => ETOOMANYREFS,
             110 => ETIMEDOUT,
             111 => ECONNREFUSED,
             113 => EHOSTUNREACH,
@@ -342,6 +346,7 @@ impl fmt::Display for LxError {
             ENOBUFS => "No buffer space available",
             EISCONN => "Transport endpoint is already connected",
             ENOTCONN => "Transport endpoint is not connected",
+            ETOOMANYREFS => "Too many references: cannot splice",
             ETIMEDOUT => "Connection timed out",
             ECONNREFUSED => "Connection refused",
             EHOSTUNREACH => "No route to host",
@@ -498,7 +503,7 @@ mod errno_tests {
     /// difference between a socket that is connected and one that is not --
     /// passed every test of `linux-object` and of `linux-syscall`. So did
     /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
-    const EVERY_ERRNO: [(LxError, isize); 77] = [
+    const EVERY_ERRNO: [(LxError, isize); 78] = [
         (LxError::EUNDEF, 0),
         (LxError::EPERM, 1),
         (LxError::ENOENT, 2),
@@ -568,6 +573,7 @@ mod errno_tests {
         (LxError::ENOBUFS, 105),
         (LxError::EISCONN, 106),
         (LxError::ENOTCONN, 107),
+        (LxError::ETOOMANYREFS, 109),
         (LxError::ETIMEDOUT, 110),
         (LxError::ECONNREFUSED, 111),
         (LxError::EHOSTUNREACH, 113),
@@ -663,6 +669,7 @@ mod errno_tests {
                 | LxError::ENOBUFS
                 | LxError::EISCONN
                 | LxError::ENOTCONN
+                | LxError::ETOOMANYREFS
                 | LxError::ETIMEDOUT
                 | LxError::ECONNREFUSED
                 | LxError::EHOSTUNREACH
@@ -676,7 +683,7 @@ mod errno_tests {
         }
         assert_eq!(
             EVERY_ERRNO.len(),
-            77,
+            78,
             "an error was added to EVERY_ERRNO without a number of its own"
         );
     }

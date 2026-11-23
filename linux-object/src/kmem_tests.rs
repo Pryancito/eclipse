@@ -196,6 +196,51 @@ fn releasing_more_than_was_charged_stops_at_the_end() {
     q.release(1);
 }
 
+#[test]
+fn a_charge_is_all_or_nothing_and_goes_back_when_dropped() {
+    let a = KmemAccount::with_limit(100);
+    let c = Charge::try_to(Some(a.clone()), 60).unwrap();
+    assert_eq!((c.bytes(), a.charged()), (60, 60));
+    assert_eq!(
+        Charge::try_to(Some(a.clone()), 41).unwrap_err(),
+        Refusal::Quota
+    );
+    assert_eq!(a.charged(), 60, "a refused charge takes nothing");
+    let kernel = Charge::try_to(None, 1 << 40).unwrap();
+    assert_eq!(kernel.bytes(), 0, "the kernel's own work is not charged");
+    drop(c);
+    assert_eq!(a.charged(), 0);
+}
+
+#[test]
+fn descriptors_in_flight_stop_past_the_limit_and_come_back_when_received() {
+    use crate::error::LxError;
+    let a = KmemAccount::with_limit(0);
+    let mut first = InFlight::try_to(Some(a.clone()), 3, 4).unwrap();
+    assert_eq!(a.inflight(), 3);
+    assert_eq!(a.charged(), 3 * INFLIGHT_FD_COST + INFLIGHT_BATCH_COST);
+    // At the limit is not over it: like Linux, the batch that starts there
+    // goes, and the one after is refused.
+    let second = InFlight::try_to(Some(a.clone()), 2, 4).unwrap();
+    assert_eq!(a.inflight(), 5);
+    assert_eq!(
+        InFlight::try_to(Some(a.clone()), 1, 4).unwrap_err(),
+        LxError::ETOOMANYREFS
+    );
+    assert_eq!(a.inflight(), 5, "a refused batch counts nothing");
+    first.received(2);
+    assert_eq!((first.fds(), a.inflight()), (1, 3));
+    drop((first, second));
+    assert_eq!((a.inflight(), a.charged()), (0, 0));
+    // Over the memory quota is ENOMEM, and counts nothing either.
+    let tight = KmemAccount::with_limit(INFLIGHT_BATCH_COST);
+    assert_eq!(
+        InFlight::try_to(Some(tight.clone()), 1, 100).unwrap_err(),
+        LxError::ENOMEM
+    );
+    assert_eq!((tight.inflight(), tight.charged()), (0, 0));
+}
+
 /// The queues themselves, written by a process whose limit is `limit`.
 mod queues {
     extern crate std;
@@ -248,6 +293,45 @@ mod queues {
             assert_eq!(acct.charged(), 3096 + RUN_COST);
             assert_eq!(w.write_at(0, &[1u8; 1000]), Ok(1000));
             drop((r, w));
+            assert_eq!(acct.charged(), 0);
+        });
+    }
+
+    #[test]
+    fn passed_descriptors_are_the_senders_until_the_peer_takes_them() {
+        as_a_process_limited_to(45_203, 0, |acct| {
+            let a = UnixSocketState::new();
+            let b = UnixSocketState::new();
+            UnixSocketState::connect_pair(&a, &b);
+            let file = || -> Arc<dyn crate::fs::FileLike> { UnixSocketState::new() };
+            Socket::send_fds(&*a, alloc::vec![file(), file(), file()]).unwrap();
+            assert_eq!(Socket::write(&*a, b"x", None), Ok(1));
+            assert_eq!(acct.inflight(), 3);
+            let before = acct.charged();
+            let mut byte = [0u8; 1];
+            let (r, _) = async_std::task::block_on(Socket::read(&*b, &mut byte));
+            assert_eq!(r, Ok(1));
+            assert_eq!(Socket::recv_fds(&*b, 2).len(), 2);
+            assert_eq!(acct.inflight(), 1, "two received, one still in flight");
+            assert_eq!(acct.charged(), before - 2 * INFLIGHT_FD_COST - 1);
+            // The last one never comes out: closing the socket gives it back.
+            drop((a, b));
+            assert_eq!((acct.inflight(), acct.charged()), (0, 0));
+        });
+    }
+
+    #[test]
+    fn a_semaphore_set_is_charged_to_its_maker_until_it_goes() {
+        use crate::ipc::SemArray;
+        let ten = SemArray::cost(10);
+        as_a_process_limited_to(45_204, ten, |acct| {
+            let set = SemArray::get_or_create(0, 10, 0o1600, 0, 0, &[]).unwrap();
+            assert_eq!(acct.charged(), ten);
+            assert_eq!(
+                SemArray::get_or_create(0, 1, 0o1600, 0, 0, &[]).err(),
+                Some(crate::error::LxError::ENOMEM)
+            );
+            drop(set);
             assert_eq!(acct.charged(), 0);
         });
     }

@@ -137,6 +137,9 @@ pub struct KmemAccount {
     limit: AtomicUsize,
     refused_quota: AtomicU64,
     refused_reserve: AtomicU64,
+    /// Descriptors this process has sent over unix sockets that nobody has
+    /// received yet: see [`InFlight`].
+    inflight: AtomicUsize,
 }
 
 impl KmemAccount {
@@ -236,6 +239,11 @@ impl KmemAccount {
         self.limit.store(limit, Ordering::Relaxed);
     }
 
+    /// Descriptors sent over unix sockets and not received yet.
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
     /// Charges refused by the limit, and by the reserve.
     pub fn refused(&self) -> (u64, u64) {
         (
@@ -263,10 +271,16 @@ pub fn refused_total() -> u64 {
 /// The account of the process making the call; `None` for the kernel's own
 /// work, which is never charged.
 pub fn current() -> Option<Arc<KmemAccount>> {
+    with_current(|lp| lp.kmem().clone())
+}
+
+/// `f` of the Linux process making the call; `None` for the kernel's own
+/// work.
+fn with_current<R>(f: impl FnOnce(&crate::process::LinuxProcess) -> R) -> Option<R> {
     let arc = kernel_hal::thread::get_current_thread()?;
     let thread = arc.downcast::<zircon_object::task::Thread>().ok()?;
     let proc = thread.proc();
-    Some(proc.try_linux()?.kmem().clone())
+    Some(f(proc.try_linux()?))
 }
 
 /// A run of queued bytes and who they are charged to.
@@ -397,6 +411,172 @@ impl Drop for ChargedBytes {
             if let Some(to) = &run.to {
                 to.uncharge(run.bytes);
             }
+        }
+    }
+}
+
+/// A charge for one kernel object a process made the kernel keep -- a
+/// queued message, a watch, a timer -- given back when it is dropped, by
+/// whoever drops it.
+///
+/// [`ChargedBytes`] is for a byte queue, where bytes of many writers come
+/// and go in order; this is for an object that is made and freed whole. It
+/// is the size of a pointer and a length, and the kernel's own work (no
+/// calling process) costs nothing: no account, nothing charged.
+#[derive(Debug, Default)]
+pub struct Charge {
+    to: Option<Arc<KmemAccount>>,
+    bytes: usize,
+}
+
+impl Charge {
+    /// Nothing charged to anybody.
+    pub const fn none() -> Self {
+        Charge { to: None, bytes: 0 }
+    }
+
+    /// Charge `n` bytes to the calling process, or refuse them.
+    pub fn try_new(n: usize) -> Result<Self, Refusal> {
+        Self::try_to(current(), n)
+    }
+
+    /// Charge `n` bytes to `to` (`None`: the kernel's own, uncharged), or
+    /// refuse them.
+    pub fn try_to(to: Option<Arc<KmemAccount>>, n: usize) -> Result<Self, Refusal> {
+        match to {
+            Some(acct) if n != 0 => {
+                acct.try_charge(n)?;
+                Ok(Charge {
+                    to: Some(acct),
+                    bytes: n,
+                })
+            }
+            _ => Ok(Self::none()),
+        }
+    }
+
+    /// Bytes this charge holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The account the bytes are charged to.
+    pub fn account(&self) -> Option<&Arc<KmemAccount>> {
+        self.to.as_ref()
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(to) = &self.to {
+            to.uncharge(self.bytes);
+        }
+    }
+}
+
+/// What one descriptor in flight costs the kernel: its slot in the batch
+/// and the open file description it keeps alive, which its sender may have
+/// closed. A unix socket end held only by a queue measured 760 bytes of
+/// heap in QEMU (root, which no `RLIMIT_NOFILE` stops, took the heap to its
+/// ceiling with 16 bytes a descriptor charged); a kibibyte covers the
+/// common descriptions. What the file holds besides itself -- bytes queued
+/// on it -- is charged to whoever queued them.
+pub const INFLIGHT_FD_COST: usize = 1024;
+
+/// What a batch of descriptors in flight costs besides its slots: the
+/// batch's own entry in its queue.
+pub const INFLIGHT_BATCH_COST: usize = 64;
+
+/// A batch of descriptors one process sent over a unix socket
+/// (`SCM_RIGHTS`) and nobody has received yet, counted and charged to the
+/// sender until they are received or the socket that holds them goes.
+///
+/// A descriptor in flight is an open file the kernel keeps for nobody: the
+/// sender may close its own copy, and a socket sent into its own queue and
+/// closed is held by nothing but itself. Linux bounds them per user at the
+/// sender's `RLIMIT_NOFILE` (`too_many_unix_fds`, `ETOOMANYREFS` past it,
+/// unless `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`); here the bound is per
+/// process, which every process's own descriptor limit is too, and the
+/// batch's bytes are charged as well.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    to: Option<Arc<KmemAccount>>,
+    fds: usize,
+}
+
+impl InFlight {
+    /// Count and charge `n` descriptors the calling process is sending.
+    pub fn try_new(n: usize) -> Result<Self, crate::error::LxError> {
+        use crate::process::{CAP_SYS_ADMIN, CAP_SYS_RESOURCE};
+        let Some((acct, limit)) = with_current(|lp| {
+            let unbounded = lp.capable(CAP_SYS_RESOURCE) || lp.capable(CAP_SYS_ADMIN);
+            (
+                lp.kmem().clone(),
+                if unbounded {
+                    usize::MAX
+                } else {
+                    lp.nofile_limit()
+                },
+            )
+        }) else {
+            return Ok(Self::default());
+        };
+        Self::try_to(Some(acct), n, limit)
+    }
+
+    /// Count and charge `n` descriptors to `to` (`None`: the kernel's own,
+    /// neither), which may have at most `limit` in flight.
+    pub fn try_to(
+        to: Option<Arc<KmemAccount>>,
+        n: usize,
+        limit: usize,
+    ) -> Result<Self, crate::error::LxError> {
+        let Some(acct) = to else {
+            return Ok(Self::default());
+        };
+        if n == 0 {
+            return Ok(Self::default());
+        }
+        // Linux refuses the send that starts while the count is already
+        // over the limit (`unix_inflight > rlimit`), so a single batch may
+        // overshoot by up to `SCM_MAX_FD`; the same here.
+        let before = acct.inflight.fetch_add(n, Ordering::Relaxed);
+        if before > limit {
+            acct.inflight.fetch_sub(n, Ordering::Relaxed);
+            return Err(crate::error::LxError::ETOOMANYREFS);
+        }
+        if let Err(why) = acct.try_charge(n * INFLIGHT_FD_COST + INFLIGHT_BATCH_COST) {
+            acct.inflight.fetch_sub(n, Ordering::Relaxed);
+            return Err(why.into());
+        }
+        Ok(InFlight {
+            to: Some(acct),
+            fds: n,
+        })
+    }
+
+    /// `k` of the batch's descriptors were received: give them back. The
+    /// rest, and the batch's own cost, stay until the batch goes.
+    pub fn received(&mut self, k: usize) {
+        let k = k.min(self.fds);
+        if let Some(acct) = &self.to {
+            acct.inflight.fetch_sub(k, Ordering::Relaxed);
+            acct.uncharge(k * INFLIGHT_FD_COST);
+        }
+        self.fds -= k;
+    }
+
+    /// Descriptors of the batch still in flight.
+    pub fn fds(&self) -> usize {
+        self.fds
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(acct) = &self.to {
+            acct.inflight.fetch_sub(self.fds, Ordering::Relaxed);
+            acct.uncharge(self.fds * INFLIGHT_FD_COST + INFLIGHT_BATCH_COST);
         }
     }
 }

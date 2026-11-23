@@ -163,7 +163,10 @@ struct UnixInner {
     /// byte/fd synchronization a `recvmsg` reading an fd-less message (e.g.
     /// seatd's ENABLE_SEAT event) would steal the fd queued for a later
     /// OPEN_DEVICE reply, so the compositor's device fd arrives mismatched.
-    pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>)>,
+    ///
+    /// Each batch is counted and charged to the process that sent it until
+    /// it is received or this end goes ([`crate::kmem::InFlight`]).
+    pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>, crate::kmem::InFlight)>,
     /// `SO_PASSCRED`: hand the peer's credentials to every `recvmsg` on this
     /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
     /// asks for it, as in Linux.
@@ -367,7 +370,7 @@ impl UnixSocketState {
             if pi
                 .pending_fds
                 .back()
-                .is_some_and(|(offset, _)| *offset == pi.total_written)
+                .is_some_and(|(offset, _, _)| *offset == pi.total_written)
             {
                 pi.pending_fds.pop_back();
             }
@@ -1378,6 +1381,10 @@ impl Socket for UnixSocketState {
         if fds.is_empty() {
             return Ok(0);
         }
+        // Counted and charged before anything is queued: past the sender's
+        // `RLIMIT_NOFILE` in flight is ETOOMANYREFS, as in Linux, and over
+        // its kernel memory quota ENOMEM.
+        let inflight = crate::kmem::InFlight::try_new(fds.len())?;
         // Append to the *peer's* queue, mirroring how `write` appends bytes to
         // the peer's buffer.
         let peer = {
@@ -1394,7 +1401,8 @@ impl Socket for UnixSocketState {
                 // recvmsg that reads past this offset (see `recv_fds`), matching
                 // Linux, where a passed fd arrives with the first data byte.
                 let offset = pi.total_written;
-                pi.pending_fds.push_back((offset, fds));
+                pi.pending_fds.try_reserve(1).map_err(|_| LxError::ENOMEM)?;
+                pi.pending_fds.push_back((offset, fds, inflight));
                 Ok(0)
             }
             None => Err(LxError::ENOTCONN),
@@ -1426,19 +1434,22 @@ impl Socket for UnixSocketState {
                 break;
             }
             let ready = match inner.pending_fds.front() {
-                Some((offset, _)) => *offset < inner.total_read,
+                Some((offset, _, _)) => *offset < inner.total_read,
                 None => false,
             };
             if !ready {
                 break;
             }
-            let (offset, mut batch) = inner.pending_fds.pop_front().unwrap();
+            let (offset, mut batch, mut inflight) = inner.pending_fds.pop_front().unwrap();
             if batch.len() <= room {
+                // Received whole: `inflight` goes with this iteration and
+                // gives the batch back to its sender.
                 out.extend(batch);
             } else {
                 let rest = batch.split_off(room);
+                inflight.received(batch.len());
                 out.extend(batch);
-                inner.pending_fds.push_front((offset, rest));
+                inner.pending_fds.push_front((offset, rest, inflight));
                 break;
             }
         }
