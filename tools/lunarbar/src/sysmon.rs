@@ -465,3 +465,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// What `/proc/kheap` says about the kernel heap, in KiB where it is a size.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Kheap {
+    pub used: u64,
+    pub total: u64,
+    /// Buddy blocks handed out, rounding included (`None`: the heap was busy).
+    pub rounded: Option<u64>,
+    pub front_cache: u64,
+    pub grown: u64,
+    pub releasable: u64,
+    pub limit: u64,
+    pub largest_free: Option<u64>,
+    pub given_back: u64,
+    pub grow_refusals: String,
+    /// `(start, end)` of each region; the first is the static arena.
+    pub regions: Vec<(u64, u64)>,
+    /// `(block bytes, free blocks)`, smallest first.
+    pub free_by_size: Vec<(u64, u64)>,
+    /// `(class bytes, live blocks)`, smallest first.
+    pub live_by_size: Vec<(u64, u64)>,
+}
+
+impl Kheap {
+    /// Whether the file said anything: an older kernel, or no `/proc/kheap`.
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// The share of the heap the rounding takes: 0 when nothing is known.
+    pub fn rounding_pct(&self) -> u64 {
+        match self.rounded {
+            Some(r) if r > 0 => r.saturating_sub(self.used) * 100 / r,
+            _ => 0,
+        }
+    }
+}
+
+/// Parse `/proc/kheap`. Unknown lines are skipped, so a kernel that prints
+/// more, or less, still reads.
+pub fn parse_kheap(text: &str) -> Kheap {
+    let mut k = Kheap::default();
+    #[derive(PartialEq)]
+    enum Sect {
+        None,
+        Regions,
+        Free,
+        Live,
+    }
+    let mut sect = Sect::None;
+    let num = |v: &str| v.split_whitespace().next().and_then(|x| x.parse::<u64>().ok());
+    let hex = |v: &str| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    for l in text.lines() {
+        if !l.starts_with(' ') {
+            sect = Sect::None;
+        }
+        if l.starts_with("heap regions:") {
+            sect = Sect::Regions;
+            continue;
+        }
+        if l.starts_with("free blocks by size:") {
+            sect = Sect::Free;
+            continue;
+        }
+        if l.starts_with("live by size class:") {
+            sect = Sect::Live;
+            continue;
+        }
+        let t = l.trim();
+        match sect {
+            Sect::Regions => {
+                // "#0   [0xffff..., 0xffff...)  512 MiB"
+                if let (Some(a), Some(b)) = (t.find('['), t.find(')')) {
+                    if let Some((s, e)) = t[a + 1..b].split_once(',') {
+                        if let (Some(s), Some(e)) = (hex(s), hex(e)) {
+                            k.regions.push((s, e));
+                        }
+                    }
+                }
+                continue;
+            }
+            Sect::Free | Sect::Live => {
+                // "  4096B x 12" or "<=      4096B x 12       (<= 0 MiB)"
+                let t = t.trim_start_matches("<=").trim();
+                if let Some((size, rest)) = t.split_once("B x") {
+                    if let (Ok(size), Some(n)) = (size.trim().parse::<u64>(), num(rest)) {
+                        let list = if sect == Sect::Free { &mut k.free_by_size } else { &mut k.live_by_size };
+                        list.push((size, n));
+                    }
+                }
+                continue;
+            }
+            Sect::None => {}
+        }
+        let Some((key, v)) = l.split_once(':') else { continue };
+        match key {
+            "KernelHeapUsed" => k.used = num(v).unwrap_or(0),
+            "KernelHeapTotal" => k.total = num(v).unwrap_or(0),
+            "KernelHeapGivenBack" => k.given_back = num(v).unwrap_or(0),
+            "KernelHeapRounded" => k.rounded = num(v),
+            "KernelHeapFrontCache" => k.front_cache = num(v).unwrap_or(0),
+            "KernelHeapGrown" => k.grown = num(v).unwrap_or(0),
+            "KernelHeapReleasable" => k.releasable = num(v).unwrap_or(0),
+            "KernelHeapLimit" => k.limit = num(v).unwrap_or(0),
+            "KernelHeapLargestFree" => k.largest_free = num(v),
+            "KernelHeapGrowRefusals" => k.grow_refusals = v.trim().to_string(),
+            _ => {}
+        }
+    }
+    k
+}
+
+#[cfg(test)]
+mod kheap_tests {
+    use super::*;
+
+    const SAMPLE: &str = "KernelHeapUsed:       40960 kB
+KernelHeapTotal:     557056 kB
+KernelHeapGivenBack:  32768 kB
+KernelHeapRounded:    61440 kB
+KernelHeapFrontCache:   512 kB
+KernelHeapGrown:      32768 kB
+KernelHeapReleasable: 16384 kB
+KernelHeapLimit:    2097152 kB
+KernelHeapLargestFree: 262144 kB
+KernelHeapGrowRefusals: 0 (never refused)
+free blocks by size:
+          16B x 3
+     268435456B x 1
+heap regions: 2 on record
+  #0   [0xffffff0000200000, 0xffffff0020200000)  512 MiB
+  #1   [0xffff800100000000, 0xffff800102000000)  32 MiB
+live by size class:
+  <=        64B x 1200     (<= 0 MiB)
+  <=      4096B x 30       (<= 0 MiB)
+memfd: created=1 live=0 live_bytes=0 MiB
+";
+
+    #[test]
+    fn every_figure_of_a_kheap_report_is_read() {
+        let k = parse_kheap(SAMPLE);
+        assert_eq!(k.used, 40960);
+        assert_eq!(k.total, 557056);
+        assert_eq!(k.rounded, Some(61440));
+        assert_eq!(k.front_cache, 512);
+        assert_eq!(k.grown, 32768);
+        assert_eq!(k.releasable, 16384);
+        assert_eq!(k.limit, 2097152);
+        assert_eq!(k.largest_free, Some(262144));
+        assert_eq!(k.given_back, 32768);
+        assert_eq!(k.grow_refusals, "0 (never refused)");
+        assert_eq!(k.free_by_size, vec![(16, 3), (268435456, 1)]);
+        assert_eq!(k.regions, vec![(0xffffff0000200000, 0xffffff0020200000), (0xffff800100000000, 0xffff800102000000)]);
+        assert_eq!(k.live_by_size, vec![(64, 1200), (4096, 30)]);
+        assert_eq!(k.rounding_pct(), 33);
+    }
+
+    #[test]
+    fn a_busy_heap_and_an_old_kernel_still_read() {
+        let k = parse_kheap("KernelHeapUsed: 1 kB\nKernelHeapTotal: 2 kB\nKernelHeapRounded: - kB\n");
+        assert_eq!(k.rounded, None);
+        assert_eq!(k.rounding_pct(), 0);
+        assert!(parse_kheap("").is_empty());
+    }
+}
