@@ -529,40 +529,23 @@ pub fn reserve_active_page_table_frames() {
     );
 }
 
-/// Combined usage for `/proc/meminfo` and diagnostics.
+/// Usage for `/proc/meminfo`, `sysinfo(2)` and reclaimd's watermark: the
+/// RAM the frame allocator manages, and how much of it is taken.
 ///
-/// The chunks the elastic heap took from RAM are counted ONCE, as heap. They
-/// are frames too -- `frame_alloc` charged them to `FRAMES_USED` and they are
-/// inside `TOTAL_MEMORY` -- and adding the two figures as they stand counted
-/// every grown MiB as used RAM *plus* as heap: the part of a chunk nobody was
-/// using any more still read as used. So after a big program exited, the heap
-/// it had made grow kept `used` up for the rest of the boot, and to `free` that
-/// is memory a closed program never gave back. Taken out of the frame side
-/// here, a chunk is what the static arena already is: its live bytes are used,
-/// the rest is free.
+/// The kernel heap is NOT added on top, the way Linux leaves its slab out of
+/// `MemTotal` and counts it as used. The 512 MiB arena is kernel BSS, outside
+/// the frames, and only the kernel can allocate from it; added to both sides,
+/// its free part read as free memory. On a 2 GiB machine `MemFree` said
+/// 1.45 GiB while a program could get about 900 MiB, so anything sized by
+/// `MemAvailable` overshot by the whole arena -- and reclaimd's watermark and
+/// OOM check, which read the same figure, saw 500 MiB of slack that no process
+/// could use.
+///
+/// Grown heap chunks are frames, so they are in here once, as used. The part
+/// of a chunk the heap could give back is `heap_releasable`, which the heap
+/// shrinker reports and `MemAvailable` counts, like any cache.
 pub fn stats() -> (usize, usize) {
-    combined_stats(
-        HEAP_USED.get(),
-        heap_total(),
-        heap_grown(),
-        FRAMES_USED.get(),
-        TOTAL_MEMORY.load(Ordering::Relaxed),
-    )
-}
-
-/// [`stats`] for given counters, so the arithmetic can be tested on the host,
-/// where the heap is the host's and every counter reads zero.
-fn combined_stats(
-    heap_used: usize,
-    heap_total: usize,
-    heap_grown: usize,
-    frames_used: usize,
-    ram: usize,
-) -> (usize, usize) {
-    (
-        heap_used + frames_used.saturating_sub(heap_grown),
-        heap_total + ram.saturating_sub(heap_grown),
-    )
+    frame_stats()
 }
 
 /// What the kernel heap keeps after it gives growth back: the buddy's bytes

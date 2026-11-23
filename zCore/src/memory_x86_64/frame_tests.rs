@@ -181,22 +181,14 @@ fn a_contiguous_request_comes_back_contiguous_and_aligned() {
     }
 }
 
-/// A heap chunk taken from RAM is heap: counted once, and its unused part
-/// free. Counted as frames AND as heap, a 64 MiB chunk that is empty again
-/// read as 64 MiB used after the program that grew it had exited.
+/// Memory userspace can be told about is the frames, and only the frames:
+/// the kernel heap arena added to both sides read as 500 MiB of free memory
+/// no process could allocate.
 #[test]
-fn a_grown_heap_chunk_is_counted_once_and_its_free_part_reads_free() {
-    const MIB: usize = 1 << 20;
-    // 512 MiB arena + one 64 MiB chunk, 10 MiB of heap in use; 4 GiB of
-    // RAM of which 100 MiB are frames, the chunk among them.
-    let (used, total) = combined_stats(10 * MIB, 576 * MIB, 64 * MIB, 100 * MIB, 4096 * MIB);
-    assert_eq!(used, 10 * MIB + 36 * MIB, "the chunk was counted twice");
-    assert_eq!(total, 576 * MIB + 4032 * MIB, "and so was the total");
-    // Without growth it is the plain sum it always was.
-    assert_eq!(
-        combined_stats(10 * MIB, 512 * MIB, 0, 100 * MIB, 4096 * MIB),
-        (110 * MIB, 4608 * MIB)
-    );
+fn reported_memory_is_the_frames_without_the_heap_arena() {
+    let _alone = alone_with_the_allocator();
+    insert_regions(&[0x90_0000..0x90_0000 + 8 * PAGE]);
+    assert_eq!(stats(), frame_stats());
 }
 
 /// The managed total is the bytes that went INTO the allocator, not the
