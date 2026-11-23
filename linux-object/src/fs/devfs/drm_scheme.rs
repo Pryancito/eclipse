@@ -2047,7 +2047,11 @@ impl DrmDev {
                     // before the next synthetic vblank: delivering it instantly
                     // turns a vblank-paced client loop into a busy spin (see
                     // `schedule_flip_event`).
-                    drm::schedule_vblank_event(signal, target, &self.file);
+                    if drm::schedule_vblank_event(signal, target, &self.file).is_none() {
+                        // `drm_event_reserve_init`: the file's event space
+                        // is full of events it has not read or still waits for.
+                        return Err(FsError::NoMemory);
+                    }
                     // The reply names the vblank the event was queued for
                     // (`drm_queue_vblank_event`: `reply.sequence = req_seq`,
                     // or the current count when the target had already
@@ -2147,7 +2151,9 @@ impl DrmDev {
                 if passed && req.flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS != 0 {
                     target = now_seq.wrapping_add(1);
                 }
-                drm::schedule_crtc_sequence_event(req.user_data, target, &self.file);
+                if drm::schedule_crtc_sequence_event(req.user_data, target, &self.file).is_none() {
+                    return Err(FsError::NoMemory);
+                }
                 let still_passed = (target.wrapping_sub(now_seq) as i32) <= 0;
                 req.sequence = if still_passed { now_seq } else { target } as u64;
                 Ok(0)
@@ -3162,7 +3168,13 @@ impl DrmDev {
                 // On this file's list, as `drm_mode_createblob_ioctl` puts
                 // it on `file_priv->blobs`: only this open may destroy it,
                 // and it goes when the open does.
-                req.blob_id = drm::create_blob_owned(src.to_vec(), true, self.file_owner());
+                let charge = crate::kmem::Charge::try_new(blob_cost(src.len()))
+                    .map_err(|_| FsError::NoMemory)?;
+                let mut data = alloc::vec::Vec::new();
+                data.try_reserve_exact(src.len())
+                    .map_err(|_| FsError::NoMemory)?;
+                data.extend_from_slice(src);
+                req.blob_id = drm::create_blob_owned(data, true, self.file_owner(), charge);
                 log::debug!(
                     "[drm] CREATEPROPBLOB len={} -> blob={}",
                     req.length,
@@ -4222,6 +4234,12 @@ const DRM_IOCTL_SET_VERSION: u32 = 0xC0106407;
 // (`MODE_ID` blobs are created/destroyed by the client per modeset).
 const DRM_IOCTL_MODE_ATOMIC: u32 = 0xC03864BC;
 const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = 0xC01064BD;
+
+/// What a user blob of `len` bytes costs its creator: the bytes and the
+/// table entry around them (id, owner, the `Vec` header and the charge).
+pub(crate) fn blob_cost(len: usize) -> usize {
+    len + 64
+}
 const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = 0xC00464BE;
 
 // DRM sync objects (`drm.h`): core, driver-independent -- their nr range
