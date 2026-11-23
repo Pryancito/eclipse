@@ -27,6 +27,12 @@ define_count_helper!(Timer);
 struct TimerInner {
     deadline: Option<Duration>,
     slack: Duration,
+    /// The HAL timer the last `set` armed, taken out again by the next `set`
+    /// or a `cancel`. It was never taken out: a loop of `zx_timer_set` with
+    /// a far deadline (a driver re-arming a watchdog) left one HAL timer and
+    /// its closure per call in the heap until each deadline came, and a
+    /// deadline a day away is a day of them.
+    pending: Option<kernel_hal::deadline::TimerId>,
 }
 
 /// Slack specifies how much a timer or event is allowed to deviate from its deadline.
@@ -118,9 +124,10 @@ impl Timer {
         // timer anything -- `cancel`, `get_info`, another `set` -- and a HAL
         // that ever calls a deadline back inline are each a CPU that never
         // comes back, and two of those have already been found in this kernel.
-        let already_passed = {
+        let (already_passed, replaced) = {
             let mut inner = self.inner.lock();
-            if has_arrived(deadline, timer_now()) {
+            let replaced = inner.pending.take();
+            let passed = if has_arrived(deadline, timer_now()) {
                 inner.deadline = None;
                 inner.slack = Duration::ZERO;
                 true
@@ -128,26 +135,41 @@ impl Timer {
                 inner.deadline = Some(deadline);
                 inner.slack = slack;
                 false
-            }
+            };
+            (passed, replaced)
         };
+        if let Some(old) = replaced {
+            kernel_hal::timer::timer_cancel(old);
+        }
         if already_passed {
             self.base.signal_set(Signal::SIGNALED);
             return;
         }
         self.base.signal_clear(Signal::SIGNALED);
         let me = Arc::downgrade(self);
-        kernel_hal::timer::timer_set(
+        let id = kernel_hal::timer::timer_set_cancellable(
             deadline,
             Box::new(move |now| me.upgrade().map(|timer| timer.touch(now)).unwrap_or(())),
         );
+        // A `set` that raced this one may have stored its own already: the
+        // later of the two keeps the record, and the other is taken out.
+        // Either callback is harmless if it runs: `touch` asks the deadline.
+        let displaced = core::mem::replace(&mut self.inner.lock().pending, id);
+        if let Some(old) = displaced {
+            kernel_hal::timer::timer_cancel(old);
+        }
     }
 
     /// Cancel the pending timer started by `set`.
     pub fn cancel(&self) {
-        {
+        let pending = {
             let mut inner = self.inner.lock();
             inner.deadline = None;
             inner.slack = Duration::ZERO;
+            inner.pending.take()
+        };
+        if let Some(old) = pending {
+            kernel_hal::timer::timer_cancel(old);
         }
         // Outside the lock, as in `set`.
         self.base.signal_clear(Signal::SIGNALED);
