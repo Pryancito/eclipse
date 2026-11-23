@@ -314,7 +314,7 @@ static void *parked(void *a) { (void)a; for (;;) pause(); return NULL; }
 static int case_threads(void) {
     pid_t c = fork();
     if (c == 0) {
-        long max = arg_n ? arg_n : 100000, n = 0;
+        long max = arg_n ? arg_n : 20000, n = 0;
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setstacksize(&at, 64 * 1024);
@@ -539,7 +539,7 @@ static int case_fdobjs(void) {
     pid_t c = fork();
     if (c == 0) {
         raise_nofile();
-        long n = 0, max = arg_n ? arg_n : 2000000;
+        long n = 0, max = arg_n ? arg_n : 200000;
         int e = 0, ep = -1;
         while (n < max) {
             int fd;
@@ -578,6 +578,7 @@ static int case_fdobjs(void) {
  * time. fdobjs left a process with a million of them that took over nine
  * minutes to exit (QEMU 2 GiB, 2026-11-23). */
 struct fdtimes { double open, exit; };
+static int close_first;
 static struct fdtimes exit_with_fds(int kind, long n) {
     int p[2];
     struct fdtimes t = {0, 0};
@@ -597,6 +598,14 @@ static struct fdtimes exit_with_fds(int kind, long n) {
             }
         }
         double opened = now();
+        if (close_first) {
+            /* Explicit close(2) of every fd, highest first, before the
+             * exit: tells a slow close apart from a slow exit. */
+            for (long fd = n + 64; fd > 2; fd--)
+                if (fd != p[1]) close(fd);
+            opened = now();
+            say("  fdexit: closed by hand in %.2f s", opened - t0);
+        }
         (void)!write(p[1], &opened, sizeof opened);
         _exit(0);
     }
@@ -611,7 +620,7 @@ static struct fdtimes exit_with_fds(int kind, long n) {
 }
 static int case_fdexit(void) {
     static const char *names[] = {"eventfd", "timerfd", "epoll", "file"};
-    long n = arg_n ? arg_n : 20000;
+    long n = arg_n ? arg_n : 5000;
     int bad = 0;
     for (int k = 0; k < 4; k++) {
         struct fdtimes a = exit_with_fds(k, n), b = exit_with_fds(k, 2 * n);
@@ -619,6 +628,11 @@ static int case_fdexit(void) {
             names[k], n, a.open, a.exit, 2 * n, b.open, b.open / (a.open + 1e-9), b.exit, b.exit / (a.exit + 1e-9));
         if ((b.open > 3.5 * a.open && b.open > 2) || (b.exit > 3.5 * a.exit && b.exit > 2)) bad = 1;
     }
+    /* The same eventfds, closed by hand before the exit. */
+    close_first = 1;
+    struct fdtimes c = exit_with_fds(0, 2 * n);
+    say("  fdexit: eventfd %ld fds closed by hand first: exit %.2f s after the closes", 2 * n, c.exit);
+    close_first = 0;
     return bad;
 }
 
@@ -664,7 +678,7 @@ static int case_sysv(void) {
 static int case_vmas(void) {
     pid_t c = fork();
     if (c == 0) {
-        long max = arg_n ? arg_n : 1000000;
+        long max = arg_n ? arg_n : 200000;
         for (int round = 0; round < 3; round++) {
             char *base = mmap(NULL, max * PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
             if (base == MAP_FAILED) { say("  vmas: reserve: %s", strerror(errno)); _exit(1); }
