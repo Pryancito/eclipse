@@ -499,9 +499,11 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # mount(2) of FAT, btrfs, EclipseFS and NFS, which it does with\n\
           # their servers. While it is not running, mount(2) of FAT and\n\
           # NFS is ENODEV and the others are the kernel's. See\n\
-          # /usr/local/bin/eclipse-mountd.\n\
+          # /usr/local/bin/eclipse-mountd. Out of the OOM killer's reach,\n\
+          # with the filesystem servers it starts, as the drivers are.\n\
           exec = /usr/local/bin/eclipse-mountd\n\
-          type = respawn\n",
+          type = respawn\n\
+          oom_score_adj = -1000\n",
     )
     .unwrap();
     fs::write(

@@ -593,7 +593,7 @@ impl Process {
         name: &str,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
-        Self::create_with_vmar(job, name, VmAddressRegion::new_root(), ext)
+        Self::create_with_vmar(job, name, VmAddressRegion::try_new_root()?, ext)
     }
 
     /// Create the initial userspace process with KoID 1 (Linux `init` / PID 1).
@@ -602,7 +602,7 @@ impl Process {
         name: &str,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
-        Self::create_init_with_vmar(job, name, VmAddressRegion::new_root(), ext)
+        Self::create_init_with_vmar(job, name, VmAddressRegion::try_new_root()?, ext)
     }
 
     fn create_init_with_vmar(
@@ -654,7 +654,7 @@ impl Process {
             _counter: CountHelper::new(),
             job: job.clone(),
             policy: job.policy(),
-            space: Mutex::new(Space::own(VmAddressRegion::new_root())),
+            space: Mutex::new(Space::own(VmAddressRegion::try_new_root()?)),
             canary_lo: EXT_CANARY,
             ext: Box::new(ext),
             canary_hi: EXT_CANARY,
@@ -1201,15 +1201,28 @@ impl Process {
     /// Called by a thread of this process, which goes back to user mode in
     /// the new one: this CPU is switched to it here.
     pub fn own_address_space(&self) -> Arc<VmAddressRegion> {
+        self.try_own_address_space().expect("failed to alloc frame")
+    }
+
+    /// [`Self::own_address_space`], or `NO_MEMORY` when a shared space has
+    /// to be left and there is no frame for the new one's page table: what
+    /// `execve` from a `vfork` child answers with every frame taken (a fork
+    /// bomb of shells, QEMU 2 GiB, 2026-11-23), where it was a kernel panic.
+    pub fn try_own_address_space(&self) -> ZxResult<Arc<VmAddressRegion>> {
+        let fresh = if self.space.lock().is_shared() {
+            Some(VmAddressRegion::try_new_root()?)
+        } else {
+            None
+        };
         // The image being replaced leaves its peak with the process, as
         // `exec_mmap()` folds the old `mm`'s into `signal->maxrss`: the
         // caller empties this space next, or it goes back to the process
         // that lent it, and either way it is not this process's any more.
         self.keep_resident_peak(&self.vmar());
-        if !self.space.lock().is_shared() {
-            return self.vmar();
-        }
-        let vmar = VmAddressRegion::new_root();
+        let vmar = match fresh {
+            Some(vmar) => vmar,
+            None => return Ok(self.vmar()),
+        };
         let lent = {
             let mut space = self.space.lock();
             space.vmar = vmar.clone();
@@ -1218,7 +1231,7 @@ impl Process {
         // The last hold unmaps, so let go with the lock released.
         drop(lent);
         super::thread::activate_user_paging(vmar.table_phys());
-        vmar
+        Ok(vmar)
     }
 
     /// Get the job of the process.

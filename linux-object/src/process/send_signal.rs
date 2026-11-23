@@ -28,11 +28,18 @@ pub(super) enum SharedSend {
 /// `sigqueue` entries nobody takes, and the heap running out ends the
 /// machine. A 16 GiB machine gets 65536, as Linux gives it.
 pub fn default_sigpending_limit(memory: usize) -> u64 {
+    max_threads(memory) / 2
+}
+
+/// Linux's `max_threads` (`set_max_threads()`) for a machine of `memory`
+/// bytes: as many tasks as there are 16 KiB kernel stacks in an eighth of
+/// memory, kept between 20 and `FUTEX_TID_MASK`. `/proc/sys/kernel/threads-max`
+/// and the cap [`crate::thread::may_add_task`] holds every `fork` and `clone` to.
+pub fn max_threads(memory: usize) -> u64 {
     const THREAD_SIZE: u64 = 16 * 1024;
     const MIN_THREADS: u64 = 20;
     const MAX_THREADS: u64 = 0x3fff_ffff;
-    let threads = (memory as u64 / (THREAD_SIZE * 8)).clamp(MIN_THREADS, MAX_THREADS);
-    threads / 2
+    (memory as u64 / (THREAD_SIZE * 8)).clamp(MIN_THREADS, MAX_THREADS)
 }
 
 impl LinuxProcessInner {

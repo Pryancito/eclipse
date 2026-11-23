@@ -18,7 +18,7 @@ const K: usize = PAGE_SIZE;
 /// windows `aspace-separate` hands out and far above the low addresses the
 /// other suites' address spaces start at.
 fn space(n: usize) -> Arc<VmAddressRegion> {
-    VmAddressRegion::new_root_at(0x1_0000_0000 + n * 0x100_0000, 0x100_0000)
+    VmAddressRegion::try_new_root_at(0x1_0000_0000 + n * 0x100_0000, 0x100_0000).unwrap()
 }
 
 /// Map `pages` fresh pages at page `at` and write each one, the way a process

@@ -53,6 +53,26 @@ fn sigframe_top(user_sp: usize, alt: &SignalStack, want_alt_stack: bool) -> Opti
     user_sp.checked_sub(RED_ZONE_MAX_SIZE)
 }
 
+/// Fault in, for writing, every page of `[base, end)`: a range the caller has
+/// already found inside one writable user mapping, about to be written by
+/// the kernel through a raw pointer.
+fn prefault_writable(
+    vmar: &Arc<zircon_object::vm::VmAddressRegion>,
+    base: usize,
+    end: usize,
+) -> ZxResult {
+    const PAGE: usize = 4096;
+    let mut page = base & !(PAGE - 1);
+    while page < end {
+        vmar.handle_page_fault(
+            page,
+            kernel_hal::MMUFlags::WRITE | kernel_hal::MMUFlags::USER,
+        )?;
+        page += PAGE;
+    }
+    Ok(())
+}
+
 /// Does `[base, base + len)` lie inside one writable user mapping?
 ///
 /// The kernel writes the signal frame through a raw pointer, so this is the
@@ -1863,6 +1883,29 @@ fn handle_signal(
             return ctx;
         }
     };
+    // The frame's pages, faulted in now through the address space, where a
+    // page that cannot be had is an answer. The pushes below are raw stores
+    // from the kernel: on a page not yet committed they take a KERNEL page
+    // fault, and with no memory for it that fault is unresolvable -- an
+    // `[isolate]`d kernel #PF in `run_user` (QEMU 2 GiB under a fork bomb,
+    // 2026-11-23) rather than the forced SIGSEGV Linux gives a process
+    // whose signal frame cannot be written (`force_sigsegv` after a failed
+    // `copy_to_user`).
+    if let Err(err) = prefault_writable(&thread.proc().vmar(), sp.saturating_sub(frame_size), sp) {
+        error!(
+            "[exit] pid={} no memory for the {:?} frame at sp={:#x}: {:?} (forcing SIGSEGV)",
+            thread.proc().id(),
+            signal,
+            sp,
+            err,
+        );
+        thread
+            .proc()
+            .exit(linux_object::process::exit_code_killed_by(
+                Signal::SIGSEGV as u8,
+            ));
+        return ctx;
+    }
     // Work out the return address before anything is pushed: a handler we
     // cannot bring back is one we must not enter. Without a restorer and
     // without the kernel's trampoline its `ret` goes to address 0, which is
@@ -2731,7 +2774,35 @@ async fn handle_user_trap(
             let pc = thread
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
-            let fault_result = vmar.handle_page_fault(vaddr, flags);
+            let mut fault_result = vmar.handle_page_fault(vaddr, flags);
+            // No frame for the page: the OOM killer frees memory by badness
+            // and the fault is taken again (`pagefault_out_of_memory`), as in
+            // Linux. Before, the thread that touched the page got SIGSEGV,
+            // whoever held the memory.
+            let mut oom_attempt = 0;
+            while fault_result == Err(ZxError::NO_MEMORY) {
+                use linux_object::process::{pagefault_out_of_memory, FaultOom};
+                if pagefault_out_of_memory(oom_attempt) == FaultOom::GiveUp {
+                    break;
+                }
+                oom_attempt += 1;
+                kernel_hal::thread::sleep_until(
+                    kernel_hal::timer::timer_now() + core::time::Duration::from_millis(20),
+                )
+                .await;
+                if thread_should_stop(thread) || linux_object::process::is_oom_victim(pid) {
+                    // This process was the victim: its SIGKILL ends it on the
+                    // way out of the trap, with no SIGSEGV report on top.
+                    return Ok(None);
+                }
+                fault_result = vmar.handle_page_fault(vaddr, flags);
+            }
+            if oom_attempt > 0 && fault_result.is_ok() {
+                debug!(
+                    "page fault @ {:#x} served after {} OOM wait(s), pid={}",
+                    vaddr, oom_attempt, pid
+                );
+            }
             if fault_result.is_ok() {
                 // `ru_minflt`: every fault the address space resolves is one.
                 thread.note_minor_fault();

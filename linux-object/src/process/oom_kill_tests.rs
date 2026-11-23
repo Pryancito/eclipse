@@ -160,3 +160,21 @@ fn the_badness_is_the_share_of_memory_held_plus_the_adjustment() {
         "a negative adjustment did not help"
     );
 }
+
+/// A fault that found no memory waits for a victim that is dying or was just
+/// killed, and fails only when nothing on the machine may be killed.
+#[test]
+fn a_fault_waits_for_a_kill_and_gives_up_only_with_nobody_to_kill() {
+    assert_eq!(
+        fault_oom_after(Kill::Killed(v(7, 900, 1 << 20))),
+        FaultOom::Retry
+    );
+    assert_eq!(fault_oom_after(Kill::StillDying), FaultOom::Retry);
+    assert_eq!(fault_oom_after(Kill::Nobody), FaultOom::GiveUp);
+}
+
+/// However long a victim takes to leave, the fault does not wait forever.
+#[test]
+fn a_fault_gives_up_after_its_retries() {
+    assert_eq!(pagefault_out_of_memory(FAULT_OOM_RETRIES), FaultOom::GiveUp);
+}

@@ -74,11 +74,6 @@ impl PageFlags {
         }
     }
 
-    /// First page after run `r`.
-    fn run_end(&self, r: usize) -> usize {
-        self.starts.get(r + 1).copied().unwrap_or(self.len)
-    }
-
     /// Append one run, merging into the last one when the flags are equal.
     /// Does not touch `len`; the caller sets it.
     fn push_run(&mut self, flags: MMUFlags, start: usize) {
@@ -203,20 +198,43 @@ impl PageFlags {
 
     /// Scratch space for [`update_range_in`](Self::update_range_in): two
     /// vectors with this much capacity make the update allocation-free.
+    ///
+    /// Zero while the lists have room for the two runs an update can add,
+    /// which is nearly always: the update is done in place. Otherwise twice
+    /// the list, so that the next updates find room again -- growth is
+    /// amortized, as a `Vec`'s is.
     pub fn scratch_capacity(&self) -> usize {
         // A range update splits at most two runs, so the list grows by at
         // most two.
-        self.runs.len() + 2
+        if self.spare() >= 2 {
+            0
+        } else {
+            (self.runs.len() + 2).max(2 * self.runs.len())
+        }
     }
 
-    /// Replace the flags of every page in `range` with `f(old)`: one rebuild
-    /// of the run list, however many pages the range spans. The new list is
-    /// built in `scratch` and swapped in, so with `scratch` allocated up
-    /// front (see [`scratch_capacity`](Self::scratch_capacity)) nothing here
-    /// allocates -- `protect` calls this holding the mapping and page-table
-    /// locks, where an allocation failure would halt the CPU with them held
-    /// (#1136). On return `scratch` holds the previous list; drop it with
-    /// the locks released.
+    /// Room left in the run lists before they would reallocate.
+    fn spare(&self) -> usize {
+        (self.starts.capacity() - self.starts.len()).min(self.runs.capacity() - self.runs.len())
+    }
+
+    /// Replace the flags of every page in `range` with `f(old)`, in place:
+    /// O(log runs) to find the range, plus the runs it covers, plus one
+    /// memmove of the runs after it.
+    ///
+    /// Until 2026-11-23 this rebuilt the whole list into `scratch` on every
+    /// call, with `scratch` allocated at the size of the list: a process that
+    /// `mprotect`s alternate pages of one reservation (a GC card table, a
+    /// guard page per object) paid O(runs) per call and two allocations of
+    /// the list's size, O(n^2) in all -- 20,000 such calls did not finish in
+    /// ten minutes in QEMU. Linux splits a VMA in O(log n).
+    ///
+    /// `protect` calls this holding the mapping and page-table locks, where
+    /// an allocation failure would halt the CPU with them held (#1136). So it
+    /// does not allocate as long as `scratch` was reserved with
+    /// [`scratch_capacity`](Self::scratch_capacity): with room in the lists
+    /// that is nothing at all; without it the lists move into `scratch` and
+    /// `scratch` gets the old ones, to be dropped with the locks released.
     pub fn update_range_in(
         &mut self,
         range: Range<usize>,
@@ -231,30 +249,57 @@ impl PageFlags {
         if range.is_empty() {
             return;
         }
-        let (starts, runs) = scratch;
-        starts.clear();
-        runs.clear();
-        let mut push = |start: usize, flags: MMUFlags| {
-            if runs.last() != Some(&flags) {
-                starts.push(start);
-                runs.push(flags);
-            }
+        if self.spare() < 2 {
+            let (starts, runs) = scratch;
+            starts.clear();
+            runs.clear();
+            starts.extend_from_slice(&self.starts);
+            runs.extend_from_slice(&self.runs);
+            core::mem::swap(&mut self.starts, starts);
+            core::mem::swap(&mut self.runs, runs);
+        }
+        // Boundaries at both ends of the range, so that runs r0..r1 are
+        // exactly the range.
+        let r0 = self.split_at(range.start);
+        let r1 = if range.end < self.len {
+            self.split_at(range.end)
+        } else {
+            self.runs.len()
         };
-        for r in 0..self.runs.len() {
-            let (s, e, g) = (self.starts[r], self.run_end(r), self.runs[r]);
-            if s < range.start {
-                push(s, g);
-            }
-            let (is, ie) = (s.max(range.start), e.min(range.end));
-            if is < ie {
-                push(is, f(g));
-            }
-            if e > range.end {
-                push(s.max(range.end), g);
+        for flags in &mut self.runs[r0..r1] {
+            *flags = f(*flags);
+        }
+        // Equal neighbours merge, from the run before the range to the run
+        // after it: nothing outside can have changed.
+        let lo = r0.saturating_sub(1);
+        let hi = (r1 + 1).min(self.runs.len());
+        let mut w = lo + 1;
+        for r in lo + 1..hi {
+            if self.runs[r] != self.runs[w - 1] {
+                self.starts[w] = self.starts[r];
+                self.runs[w] = self.runs[r];
+                w += 1;
             }
         }
-        core::mem::swap(&mut self.starts, starts);
-        core::mem::swap(&mut self.runs, runs);
+        if w < hi {
+            self.starts.drain(w..hi);
+            self.runs.drain(w..hi);
+        }
+    }
+
+    /// Make `page` (`0 < page < len`, or 0) start a run, splitting the run
+    /// holding it, and answer that run's index.
+    fn split_at(&mut self, page: usize) -> usize {
+        if page == 0 {
+            return 0;
+        }
+        let r = self.run_of(page);
+        if self.starts[r] == page {
+            return r;
+        }
+        self.starts.insert(r + 1, page);
+        self.runs.insert(r + 1, self.runs[r]);
+        r + 1
     }
 
     /// [`update_range_in`](Self::update_range_in) with its own scratch.
@@ -433,18 +478,67 @@ mod tests {
         for (i, f) in [(10usize, RW), (20, RX), (30, NONE), (40, RW)] {
             pf.set(i, f);
         }
-        for range in [0..1, 5..50, 99..100, 0..100, 15..16, 45..46] {
+        for range in [
+            0..1,
+            5..50,
+            99..100,
+            0..100,
+            15..16,
+            45..46,
+            7..8,
+            60..61,
+            62..63,
+        ] {
             let cap = pf.scratch_capacity();
             let mut scratch = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+            // Where the lists will live after the update: their own buffers
+            // when there is room, else the scratch's, never a new allocation.
+            let want = if cap == 0 {
+                (pf.starts.as_ptr(), pf.runs.as_ptr())
+            } else {
+                (scratch.0.as_ptr(), scratch.1.as_ptr())
+            };
             pf.update_range_in(range.clone(), |old| old | MMUFlags::USER, &mut scratch);
-            // the previous list came back in `scratch`; the new one grew by at most 2
-            assert!(pf.run_count() <= cap);
-            assert!(pf.starts.capacity() >= pf.run_count());
+            assert_eq!(
+                (pf.starts.as_ptr(), pf.runs.as_ptr()),
+                want,
+                "{:?} allocated",
+                range
+            );
             for i in 0..100 {
-                assert_eq!(pf[i].contains(MMUFlags::USER), range.contains(&i) || false);
+                assert_eq!(pf[i].contains(MMUFlags::USER), range.contains(&i));
             }
             pf.update_range(0..100, |old| old - MMUFlags::USER);
         }
+    }
+
+    /// Alternate pages of one reservation, protected one by one in order:
+    /// one run per page, and every update in place (amortized growth).
+    #[test]
+    fn alternating_pages_are_one_run_each_and_grow_amortized() {
+        let n = 20_000;
+        let mut pf = PageFlags::uniform(NONE, n);
+        let mut grown = 0;
+        for i in 0..n {
+            let cap = pf.scratch_capacity();
+            grown += (cap != 0) as usize;
+            let mut scratch = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+            let f = if i % 2 == 0 { RW } else { R };
+            pf.update_range_in(i..i + 1, |_| f, &mut scratch);
+        }
+        assert_eq!(pf.run_count(), n);
+        assert!(
+            grown < 40,
+            "the run lists grew {} times for {} runs",
+            grown,
+            n
+        );
+        for i in 0..n {
+            assert_eq!(pf[i], if i % 2 == 0 { RW } else { R });
+        }
+        // And back: one run again.
+        pf.update_range(0..n, |_| NONE);
+        assert_eq!(pf.run_count(), 1);
     }
 
     /// Random operations against a plain `Vec<MMUFlags>` model.
