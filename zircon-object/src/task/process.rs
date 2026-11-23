@@ -1201,8 +1201,7 @@ impl Process {
     /// Called by a thread of this process, which goes back to user mode in
     /// the new one: this CPU is switched to it here.
     pub fn own_address_space(&self) -> Arc<VmAddressRegion> {
-        self.try_own_address_space()
-            .expect("failed to alloc frame")
+        self.try_own_address_space().expect("failed to alloc frame")
     }
 
     /// [`Self::own_address_space`], or `NO_MEMORY` when a shared space has

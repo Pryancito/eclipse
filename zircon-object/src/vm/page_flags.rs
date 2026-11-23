@@ -478,7 +478,17 @@ mod tests {
         for (i, f) in [(10usize, RW), (20, RX), (30, NONE), (40, RW)] {
             pf.set(i, f);
         }
-        for range in [0..1, 5..50, 99..100, 0..100, 15..16, 45..46, 7..8, 60..61, 62..63] {
+        for range in [
+            0..1,
+            5..50,
+            99..100,
+            0..100,
+            15..16,
+            45..46,
+            7..8,
+            60..61,
+            62..63,
+        ] {
             let cap = pf.scratch_capacity();
             let mut scratch = (Vec::with_capacity(cap), Vec::with_capacity(cap));
             // Where the lists will live after the update: their own buffers
@@ -489,7 +499,12 @@ mod tests {
                 (scratch.0.as_ptr(), scratch.1.as_ptr())
             };
             pf.update_range_in(range.clone(), |old| old | MMUFlags::USER, &mut scratch);
-            assert_eq!((pf.starts.as_ptr(), pf.runs.as_ptr()), want, "{:?} allocated", range);
+            assert_eq!(
+                (pf.starts.as_ptr(), pf.runs.as_ptr()),
+                want,
+                "{:?} allocated",
+                range
+            );
             for i in 0..100 {
                 assert_eq!(pf[i].contains(MMUFlags::USER), range.contains(&i));
             }
@@ -512,7 +527,12 @@ mod tests {
             pf.update_range_in(i..i + 1, |_| f, &mut scratch);
         }
         assert_eq!(pf.run_count(), n);
-        assert!(grown < 40, "the run lists grew {} times for {} runs", grown, n);
+        assert!(
+            grown < 40,
+            "the run lists grew {} times for {} runs",
+            grown,
+            n
+        );
         for i in 0..n {
             assert_eq!(pf[i], if i % 2 == 0 { RW } else { R });
         }

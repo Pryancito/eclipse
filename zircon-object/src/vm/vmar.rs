@@ -469,14 +469,10 @@ impl Drop for VmAddressRegion {
 }
 
 impl VmAddressRegion {
-    /// Create a new root VMAR.
+    /// Create a new root VMAR ([`Self::try_new_root`]: `NO_MEMORY`, no panic).
     pub fn new_root() -> Arc<Self> {
         Self::try_new_root().expect("failed to alloc frame")
     }
-
-    /// [`Self::new_root`], or `NO_MEMORY` when there is no frame for the
-    /// root page table: what a `fork` or a new process answers with every
-    /// frame taken, as ENOMEM, rather than a kernel panic.
     pub fn try_new_root() -> ZxResult<Arc<Self>> {
         #[cfg(feature = "aspace-separate")]
         let (addr, size) = {
@@ -523,9 +519,8 @@ impl VmAddressRegion {
     }
 
     fn try_new_root_at(addr: usize, size: usize) -> ZxResult<Arc<Self>> {
-        let page_table = PageTable::from_current()
-            .try_clone_kernel()
-            .ok_or(ZxError::NO_MEMORY)?;
+        let pt = PageTable::from_current().try_clone_kernel();
+        let page_table = pt.ok_or(ZxError::NO_MEMORY)?;
         Ok(Arc::new(VmAddressRegion {
             flags: VmarFlags::ROOT_FLAGS,
             base: KObjectBase::new(),
