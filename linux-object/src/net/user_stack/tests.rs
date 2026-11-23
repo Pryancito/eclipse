@@ -1976,3 +1976,22 @@ fn a_connected_socket_says_the_address_it_speaks_from() {
         IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
     );
 }
+
+/// Empty datagrams to a socket nobody reads stop where full ones do: each
+/// costs its entry in the queue, as an skb's `truesize` counts in Linux.
+/// They cost nothing, and the queue took them without end.
+#[test]
+fn empty_datagrams_fill_a_queue_too() {
+    let _g = LOCK.lock();
+    let stack = stack();
+    let here = [127, 0, 0, 1];
+    let server = stack.socket();
+    assert_eq!(Socket::bind(&server, any(5354)), Ok(0));
+    let client = stack.socket();
+    for _ in 0..RX_QUEUE_BYTES {
+        assert_eq!(Socket::write(&client, b"", to(here, 5354)), Ok(0));
+    }
+    let queued = server.shared.inner.lock().queue.len();
+    assert_eq!(queued, RX_QUEUE_BYTES / DATAGRAM_COST);
+    while stack.told().is_some() {}
+}
