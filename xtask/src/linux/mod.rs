@@ -4521,6 +4521,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               # wait_path = /dev/input/event0              (optional; block each start,\n\
               #                                             bounded, until this path\n\
               #                                             exists -- any file type)\n\
+              # oom_score_adj = -1000                      (optional; -1000..=1000, what\n\
+              #                                             the OOM killer reads. A\n\
+              #                                             'udriver' service gets -1000\n\
+              #                                             unless it says otherwise)\n\
               #\n\
               # 'oneshot' runs to completion in order during boot; 'respawn' is\n\
               # supervised and restarted if it exits. No shell is involved.\n",
