@@ -303,6 +303,7 @@ fn note_frames_level() {
 }
 
 /// User frame allocations refused since boot, for `/proc/kheap`.
+#[cfg_attr(feature = "libos", allow(dead_code))]
 pub fn user_frame_refusals() -> u64 {
     USER_FRAME_REFUSALS.load(Ordering::Relaxed)
 }
@@ -1571,7 +1572,7 @@ cfg_if! {
         }
 
         /// Bytes the heap has taken from the frame allocator past its static
-        /// arena: frames that are heap now, and counted as heap by [`stats`].
+        /// arena: frames that are heap now, counted as used frames by [`stats`].
         pub fn heap_grown() -> usize {
             heap_total().saturating_sub(KERNEL_HEAP_SIZE)
         }
@@ -3282,6 +3283,8 @@ cfg_if! {
             (0, "no elastic heap", 0, 0, 0)
         }
 
+        // Read only by `/proc/kheap`, which libos does not build.
+        #[allow(dead_code)]
         pub fn heap_grown() -> usize {
             0
         }
