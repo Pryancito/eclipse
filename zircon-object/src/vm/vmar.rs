@@ -1,6 +1,7 @@
 use super::page_flags::PageFlags;
 #[path = "vmar_vm_size.rs"]
 mod vmar_vm_size;
+pub use vmar_vm_size::MAX_MAP_COUNT;
 use vmar_vm_size::VmSizeMeter;
 use {
     super::*,
@@ -332,6 +333,7 @@ impl VmarInner {
     /// that adds a mapping goes through here so the total cannot drift.
     fn insert_mapping(&mut self, mapping: Arc<VmMapping>) {
         self.note_grown(mapping.size());
+        self.vm_size.mapped(1);
         self.mappings.insert(mapping.addr(), mapping);
     }
 
@@ -340,6 +342,7 @@ impl VmarInner {
     fn remove_mapping(&mut self, key: VirtAddr) -> Option<Arc<VmMapping>> {
         let mapping = self.mappings.remove(&key)?;
         self.vm_size.shrank(mapping.size());
+        self.vm_size.unmapped(1);
         Some(mapping)
     }
 
@@ -353,6 +356,7 @@ impl VmarInner {
         let taken = core::mem::take(&mut self.mappings);
         let freed: usize = taken.values().map(|m| m.size()).sum();
         self.vm_size.shrank(freed);
+        self.vm_size.unmapped(taken.len());
         taken
     }
 }
@@ -825,6 +829,9 @@ impl VmAddressRegion {
         let _allow_faults = allow_faults;
         let mut guard = self.inner.lock();
         let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
+        // `vm.max_map_count`, before anything changes: the new mapping, and
+        // a hole an `overwrite` may punch in the middle of another.
+        inner.vm_size.room_for(1 + overwrite as usize)?;
         // `determine_offset` refuses an explicit offset whose range is not FREE
         // (`test_map`) and reports INVALID_ARGS. That made `overwrite` dead code
         // for explicit placement: the range being occupied is precisely the case
@@ -981,8 +988,15 @@ impl VmAddressRegion {
         // inserted at its own start. Non-overlap of the result guarantees no key
         // collision: at most one mapping straddles `end`, so at most one
         // reinsertion lands at `end`.
+        // A hole in the middle of one mapping leaves two: `__split_vma`'s
+        // `vm.max_map_count` check, before anything is cut.
+        let keys = Self::overlapping_keys(inner, begin, end);
+        let splits = keys
+            .iter()
+            .any(|k| *k < begin && inner.mappings[k].end_addr() > end);
+        inner.vm_size.room_for(splits as usize)?;
         let mut new_maps = Vec::new();
-        for key in Self::overlapping_keys(inner, begin, end) {
+        for key in keys {
             let map = inner
                 .remove_mapping(key)
                 .expect("overlapping key must be present");
@@ -996,6 +1010,7 @@ impl VmAddressRegion {
                     // one just subtracted, so the live total returns to a value
                     // it already held (at or below the peak) and the peak stays.
                     inner.note_grown(map.size());
+                    inner.vm_size.mapped(1);
                     inner.mappings.insert(key, map);
                     return Err(err);
                 }
@@ -1269,6 +1284,9 @@ impl VmAddressRegion {
                 && old_end + delta <= self.addr + max_offset.min(self.size)
                 && self.test_map(inner, old_end - self.addr, delta, PAGE_SIZE);
             if in_place_ok {
+                if vmo_window < new_len {
+                    inner.vm_size.room_for(1)?;
+                }
                 if vmo_window >= new_len {
                     // The VMO already covers the extension: stretch the mapping.
                     {
@@ -1303,6 +1321,8 @@ impl VmAddressRegion {
 
         // Move: reserve the target range, re-map the same VMO window there, add
         // an anonymous tail for growth past the VMO, then drop the old range.
+        // Room for all three first, as `mremap` asks `map_count` for 3.
+        inner.vm_size.room_for(3)?;
         let target_offset = match fixed {
             Some(new_addr) => {
                 // MREMAP_FIXED unmaps whatever occupied the target, like MAP_FIXED.

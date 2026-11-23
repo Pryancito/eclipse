@@ -28,7 +28,15 @@ pub(super) struct VmSizeMeter {
     /// reused space's new baseline, because Linux gives the new image a fresh
     /// `mm` whose peak starts over.
     peak: AtomicUsize,
+    /// Mappings across the whole tree -- Linux's `mm->map_count`.
+    count: AtomicUsize,
 }
+
+/// Linux's default `vm.max_map_count` (`DEFAULT_MAX_MAP_COUNT`), what
+/// `/proc/sys/vm/max_map_count` reads. Each mapping is a few hundred bytes
+/// of kernel heap and its own VMO; a loop of one-page `mmap`s, or of
+/// `munmap`s punching holes, made them until the heap ran out.
+pub const MAX_MAP_COUNT: usize = 65530;
 
 impl VmSizeMeter {
     /// The address space grew by `delta` bytes: raise the live total and the
@@ -49,6 +57,34 @@ impl VmSizeMeter {
     /// down). The live total falls; the peak is deliberately left where it is.
     pub(super) fn shrank(&self, delta: usize) {
         self.live.fetch_sub(delta, Ordering::Relaxed);
+    }
+
+    /// `n` mappings came (`+`) or went: the count follows the tree.
+    pub(super) fn mapped(&self, n: usize) {
+        self.count.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// See [`mapped`](Self::mapped).
+    pub(super) fn unmapped(&self, n: usize) {
+        self.count.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Room for `n` more mappings, or `NO_MEMORY` (ENOMEM), as
+    /// `mmap_region`, `__split_vma` and `mremap` answer past
+    /// `vm.max_map_count`. Checked before anything changes; the count
+    /// itself moves only with the tree, so a check that is a little
+    /// generous never leaves it wrong.
+    pub(super) fn room_for(&self, n: usize) -> crate::ZxResult {
+        if self.count.load(Ordering::Relaxed) + n > MAX_MAP_COUNT {
+            return Err(crate::ZxError::NO_MEMORY);
+        }
+        Ok(())
+    }
+
+    /// Mappings across the tree now (`map_count`).
+    #[cfg(test)]
+    pub(super) fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// The current high-water mark — `VmPeak:`.
