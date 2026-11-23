@@ -358,7 +358,7 @@ impl ThreadExt for Thread {
         let leader = Thread::create_with_ext_id(
             proc,
             &self.name(),
-            LinuxThreadExt::charged_to(LinuxThread::initial(), &proc)?,
+            LinuxThreadExt::charged_to(LinuxThread::initial(), proc)?,
             Some(proc.id()),
         )?;
         core::mem::swap(&mut *self.lock_linux(), &mut *leader.lock_linux());

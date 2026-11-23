@@ -100,6 +100,10 @@ pub struct UnixSocketState {
     inner: Arc<Mutex<UnixInner>>,
 }
 
+/// One SCM_RIGHTS batch in flight: the stream offset it rides at, the fds,
+/// and their charge.
+type PendingFds = (usize, Vec<Arc<dyn FileLike>>, crate::kmem::InFlight);
+
 #[derive(Debug)]
 struct UnixInner {
     flags: OpenFlags,
@@ -166,7 +170,7 @@ struct UnixInner {
     ///
     /// Each batch is counted and charged to the process that sent it until
     /// it is received or this end goes ([`crate::kmem::InFlight`]).
-    pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>, crate::kmem::InFlight)>,
+    pending_fds: VecDeque<PendingFds>,
     /// `SO_PASSCRED`: hand the peer's credentials to every `recvmsg` on this
     /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
     /// asks for it, as in Linux.
