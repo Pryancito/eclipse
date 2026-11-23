@@ -1366,19 +1366,36 @@ impl VmAddressRegion {
     /// Snapshot every live mapping in this VMAR tree, sorted by start address —
     /// the data `/proc/<pid>/maps` renders. Geometry and the backing object's
     /// identity are read under the locks; the rows themselves are plain data.
+    ///
+    /// For the kernel's own callers (the loader, fault reports); what a
+    /// process can ask for goes through [`try_mappings_dump`](Self::try_mappings_dump).
     pub fn mappings_dump(&self) -> Vec<MappingDump> {
-        let mut out = Vec::new();
-        self.collect_mappings(&mut out);
-        out.sort_by_key(|m| m.start);
-        out
+        self.try_mappings_dump()
+            .expect("mappings_dump: the kernel heap cannot hold the rows")
     }
 
-    fn collect_mappings(&self, out: &mut Vec<MappingDump>) {
+    /// [`mappings_dump`](Self::mappings_dump) that answers `None` when the
+    /// kernel heap cannot hold it, instead of `alloc_error`.
+    ///
+    /// The dump is a row per run of uniform protection with a copy of the
+    /// object's name in each, and a process chooses both how many rows there
+    /// are (nothing caps its mappings) and how long the names are (a file's
+    /// path): a hundred thousand one-page maps of a file with a 4000-byte
+    /// path made one `read` of `/proc/self/maps` ask the heap for some
+    /// 800 MiB, infallibly -- a kernel panic, from an unprivileged read.
+    pub fn try_mappings_dump(&self) -> Option<Vec<MappingDump>> {
+        let mut out = Vec::new();
+        self.collect_mappings(&mut out).ok()?;
+        out.sort_by_key(|m| m.start);
+        Some(out)
+    }
+
+    fn collect_mappings(&self, out: &mut Vec<MappingDump>) -> Result<(), ()> {
         let children: Vec<_> = {
             let guard = self.inner.lock();
             let inner = match guard.as_ref() {
                 Some(i) => i,
-                None => return,
+                None => return Ok(()),
             };
             for map in inner.mappings.values() {
                 let m = map.inner.lock();
@@ -1410,6 +1427,10 @@ impl VmAddressRegion {
                 for (page, pages, flags) in m.flags.runs() {
                     let offset = page * PAGE_SIZE;
                     let start = m.addr + offset;
+                    out.try_reserve(1).map_err(drop)?;
+                    let mut row_name = alloc::string::String::new();
+                    row_name.try_reserve_exact(name.len()).map_err(drop)?;
+                    row_name.push_str(&name);
                     out.push(MappingDump {
                         start,
                         end: start + pages * PAGE_SIZE,
@@ -1418,15 +1439,16 @@ impl VmAddressRegion {
                         file_offset: file_base + offset,
                         shared,
                         vmo_id,
-                        name: name.clone(),
+                        name: row_name,
                     });
                 }
             }
             inner.children.to_vec()
         };
         for child in children {
-            child.collect_mappings(out);
+            child.collect_mappings(out)?;
         }
+        Ok(())
     }
 
     /// Unmap all mappings within the VMAR, and destroy all sub-regions of the region.

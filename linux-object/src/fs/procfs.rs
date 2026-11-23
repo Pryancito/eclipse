@@ -646,7 +646,10 @@ fn proc_pid_statm(proc: &Process) -> String {
     let size = stats.mapped_bytes() / PROC_PAGE_SIZE;
     let shared = stats.shared_bytes() / PROC_PAGE_SIZE;
     let resident = stats.private_bytes() / PROC_PAGE_SIZE + shared;
-    let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
+    // A dump the heap cannot hold counts as no rows: a `read` of this
+    // file must not be a kernel panic (see `proc_pid_maps`).
+    let rows = vmar.try_mappings_dump().unwrap_or_default();
+    let sizes = layout::Sizes::of(&rows, layout::Mm::of(proc).as_ref());
     let (text, data) = (sizes.text as u64, (sizes.data + sizes.stack) as u64);
     alloc::format!(
         "{} {} {} {} 0 {} 0\n",
@@ -2770,12 +2773,17 @@ pub fn open_check(inode: &dyn INode) -> crate::error::LxResult {
 /// than their exact widths. The backing VMO's koid stands in for the inode and
 /// its kernel-object name for the pathname (empty for anonymous memory, like
 /// Linux prints anonymous VMAs).
-fn proc_pid_maps(proc: &Arc<Process>) -> String {
+///
+/// Built whole on every read, so every allocation in it is asked for
+/// fallibly and a process with more mappings than the heap can describe gets
+/// ENOMEM, not a kernel panic: both the row count and the name lengths are
+/// the process's to choose (see `VmAddressRegion::try_mappings_dump`).
+fn proc_pid_maps(proc: &Arc<Process>) -> Result<String> {
     use zircon_object::vm::MMUFlags;
     let mut s = String::new();
     let mm = layout::Mm::of(proc);
     let mut last = None;
-    for m in proc.vmar().mappings_dump() {
+    for m in proc.vmar().try_mappings_dump().ok_or(FsError::NoMemory)? {
         let r = if m.flags.contains(MMUFlags::READ) {
             'r'
         } else {
@@ -2794,14 +2802,22 @@ fn proc_pid_maps(proc: &Arc<Process>) -> String {
         let p = if m.shared { 's' } else { 'p' };
         let name = layout::row_name(&m, mm.as_ref());
         let (major, minor, ino) = layout::row_device(proc, name, &mut last);
+        // The fixed columns are at most 95 bytes; the name is the rest.
+        s.try_reserve(MAPS_ROW_FIXED + name.len())
+            .map_err(|_| FsError::NoMemory)?;
         let _ = writeln!(
             s,
             "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {:<10} {}",
             m.start, m.end, r, w, x, p, m.file_offset, major, minor, ino, name
         );
     }
-    s
+    Ok(s)
 }
+
+/// The most a `maps` row takes besides its name: two 16-digit addresses, the
+/// perms, a 16-digit offset, two 8-digit device numbers, a 20-digit inode
+/// and the separators and newline.
+const MAPS_ROW_FIXED: usize = 16 + 1 + 16 + 1 + 4 + 1 + 16 + 1 + 8 + 1 + 8 + 1 + 20 + 1 + 1;
 
 /// `/proc/<pid>/{stat,cmdline,status}` without snapshotting at lookup time.
 struct ProcPidFileINode {
@@ -2825,7 +2841,7 @@ impl ProcPidFileINode {
                 Some(lp) => crate::perf::proc_report(lp, self.pid).into_bytes(),
                 None => Vec::new(),
             },
-            ProcPidFileKind::Maps => proc_pid_maps(&proc).into_bytes(),
+            ProcPidFileKind::Maps => proc_pid_maps(&proc)?.into_bytes(),
             ProcPidFileKind::Comm => alloc::format!("{}\n", proc_comm(&proc)).into_bytes(),
             // NUL-separated KEY=VALUE list, exactly like cmdline's encoding.
             ProcPidFileKind::Environ => arg_area::read(&proc, true).unwrap_or_else(|| {
