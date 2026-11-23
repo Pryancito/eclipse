@@ -29,6 +29,8 @@ pub mod stack_guard;
 pub mod thread;
 pub mod timer;
 #[cfg(target_arch = "x86_64")]
+pub mod vmalloc;
+#[cfg(target_arch = "x86_64")]
 pub mod vmap_stack;
 
 pub use self::arch::{config, cpu, interrupt, vm};

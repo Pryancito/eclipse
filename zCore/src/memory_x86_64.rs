@@ -1186,6 +1186,12 @@ cfg_if! {
         /// Costs nothing on the hot path: only allocations already ≥2 MiB touch
         /// it, and the walk is the same frame-pointer chain the reporters use.
         const BIG_ALLOC_MIN: usize = 2 * 1024 * 1024;
+        /// The smallest buddy block served from `kernel_hal::vmalloc` instead.
+        /// Below it a block is a few pages, contiguous runs of which are easy
+        /// to find, and a page-table walk per block would cost more than the
+        /// rounding it saves.
+        #[cfg_attr(feature = "mem-debug", allow(dead_code))]
+        const KVMALLOC_MIN: usize = 1024 * 1024;
         const BIG_TRACK_SLOTS: usize = 128;
         const BIG_TRACK_FRAMES: usize = 3;
 
@@ -2263,6 +2269,8 @@ cfg_if! {
             // and must be leaked, not dispatched. See
             // `zcore_drivers::utils::fat_ptr`.
             kernel_hal::drivers::utils::set_vtable_max(heap_start);
+            #[cfg(not(feature = "mem-debug"))]
+            kernel_hal::vmalloc::register_shrinker();
             if !kernel_hal::shrinker::register(&HEAP_SHRINKER) {
                 crate::klog_info!("memory: shrinker registry full, heap growth is given back only by reclaimd");
             }
@@ -2911,6 +2919,25 @@ cfg_if! {
                 // path.
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
+                // A block the buddy would make 1 MiB or more: mapped from
+                // scattered frames instead, page by page, no power of two and
+                // no contiguous run. See `kernel_hal::vmalloc`. `None` (no
+                // window, no frames, the window busy on this CPU) falls
+                // through to the buddy, as before.
+                #[cfg(not(feature = "mem-debug"))]
+                if buddy_block_size(ext) >= KVMALLOC_MIN && layout.align() <= 4096 {
+                    if let Some(p) = kernel_hal::vmalloc::alloc(sz) {
+                        if sz >= BIG_ALLOC_MIN {
+                            track_big_alloc(p, sz);
+                        }
+                        kernel_hal::kstats::note_heap_alloc(if prof {
+                            core::arch::x86_64::_rdtsc().wrapping_sub(t0)
+                        } else {
+                            0
+                        });
+                        return p as *mut u8;
+                    }
+                }
                 // Front cache first (default build); a miss falls through to the
                 // buddy. The cache serves the common small alloc/free pair in
                 // O(1), keeping the buddy's class free lists short so its O(n)
@@ -3064,6 +3091,22 @@ cfg_if! {
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
                 let sz = layout.size();
+                // A large block from the vmalloc window: none of the heap's
+                // bookkeeping below ever saw it.
+                #[cfg(not(feature = "mem-debug"))]
+                if kernel_hal::vmalloc::owns(ptr as usize) {
+                    if sz >= BIG_ALLOC_MIN {
+                        untrack_big_alloc(ptr as usize);
+                    }
+                    if !kernel_hal::vmalloc::free(ptr as usize) {
+                        emit(format_args!(
+                            "\n[vmalloc] free of {:#x} ({} bytes): not a live block, leaked\n",
+                            ptr as usize, sz
+                        ));
+                    }
+                    let _ = slot;
+                    return;
+                }
                 // BEFORE anything touches this block, and before the front
                 // cache gets a chance to keep it. The buddy's free lists are
                 // intrusive -- a freed block's own first words become the

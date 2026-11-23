@@ -577,6 +577,18 @@ impl KernelHandler for ZcoreKernelHandler {
         );
         let _ = writeln!(s, "KernelHeapLimit: {:>10} kB", memory::heap_limit() / 1024);
         let _ = writeln!(s, "KernelHeapLargestFree: {:>4} kB", busy(largest));
+        // Large blocks mapped from scattered frames (`kernel_hal::vmalloc`):
+        // live, and freed but still mapped for reuse until `reclaimd` purges.
+        let (vlive, vcached, vreused, vfailed, vpurged) = kernel_hal::vmalloc::stats();
+        let _ = writeln!(s, "KernelHeapVmalloc: {:>8} kB", vlive / 1024);
+        let _ = writeln!(s, "KernelHeapVmallocCached: {:>2} kB", vcached / 1024);
+        let _ = writeln!(
+            s,
+            "VmallocReused: {} VmallocFailed: {} VmallocPurged: {} kB",
+            vreused,
+            vfailed,
+            vpurged / 1024
+        );
         let (grow_refused, why, _, _, _) = memory::heap_grow_status();
         let _ = writeln!(s, "KernelHeapGrowRefusals: {} ({})", grow_refused, why);
         if let Some(free) = free_blocks {
