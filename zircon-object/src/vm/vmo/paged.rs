@@ -233,7 +233,7 @@ impl FillNeed {
             } => {
                 FILLS_UNLOCKED.fetch_add(1, Ordering::Relaxed);
                 let frame = if page * PAGE_SIZE < source.source_len() {
-                    let frame = PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?;
+                    let frame = PhysFrame::new_user_zero().ok_or(ZxError::NO_MEMORY)?;
                     let vaddr = phys_to_virt(frame.paddr());
                     // SAFETY: a fresh frame is one page of memory nobody else
                     // can see yet.
@@ -729,7 +729,7 @@ impl VMObjectPaged {
         }
         let mut frames = BTreeMap::new();
         for (&idx, state) in inner.frames.iter() {
-            let frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
+            let frame = PhysFrame::new_user().ok_or(ZxError::NO_MEMORY)?;
             kernel_hal::mem::pmem_copy(frame.paddr(), state.frame.paddr(), PAGE_SIZE);
             frames.insert(idx, PageState::new(frame));
         }
@@ -1999,7 +1999,7 @@ impl VMObjectPagedInner {
             if self.frames.contains_key(&page) {
                 continue;
             }
-            let Some(frame) = PhysFrame::new() else {
+            let Some(frame) = PhysFrame::new_user() else {
                 break;
             };
             let dst = phys_to_virt(frame.paddr()) as *mut u8;
@@ -2047,7 +2047,7 @@ impl VMObjectPagedInner {
             if i >= self.size / PAGE_SIZE || self.frames.contains_key(&i) {
                 continue;
             }
-            let Some(frame) = PhysFrame::new() else {
+            let Some(frame) = PhysFrame::new_user() else {
                 break;
             };
             let src = &buf[(i - first) * PAGE_SIZE..(i - first + 1) * PAGE_SIZE];
@@ -2123,7 +2123,7 @@ impl VMObjectPagedInner {
                             if !flags.contains(MMUFlags::WRITE) {
                                 return Ok(CommitResult::Ref(src));
                             }
-                            let target_frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
+                            let target_frame = PhysFrame::new_user().ok_or(ZxError::NO_MEMORY)?;
                             kernel_hal::mem::pmem_copy(target_frame.paddr(), src, PAGE_SIZE);
                             self.frames.insert(page_idx, PageState::new(target_frame));
                         }
@@ -2161,7 +2161,7 @@ impl VMObjectPagedInner {
                     // 这里会调用HAL层的hal_frame_alloc, 请注意实现该函数时参数要一样
                     let target_frame = match staged {
                         Some(frame) => frame,
-                        None => PhysFrame::new_zero().ok_or(ZxError::NO_MEMORY)?,
+                        None => PhysFrame::new_user_zero().ok_or(ZxError::NO_MEMORY)?,
                     };
                     if out_of_range {
                         // can never be a hidden vmo
@@ -2311,7 +2311,7 @@ impl VMObjectPagedInner {
         let frame = self.frames.get_mut(&page_idx).unwrap();
         if flags.contains(MMUFlags::WRITE) && child_tag.is_split() {
             // copy-on-write
-            let target_frame = PhysFrame::new().ok_or(ZxError::NO_MEMORY)?;
+            let target_frame = PhysFrame::new_user().ok_or(ZxError::NO_MEMORY)?;
             kernel_hal::mem::pmem_copy(target_frame.paddr(), frame.frame.paddr(), PAGE_SIZE);
             frame.tag = child_tag;
             return Ok(CommitResult::CopyOnWrite(target_frame, true));

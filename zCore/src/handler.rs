@@ -227,6 +227,10 @@ impl KernelHandler for ZcoreKernelHandler {
         memory::frame_alloc(1, 0)
     }
 
+    fn frame_alloc_user(&self) -> Option<usize> {
+        memory::frame_alloc_user()
+    }
+
     fn frame_alloc_contiguous(&self, frame_count: usize, align_log2: usize) -> Option<usize> {
         memory::frame_alloc(frame_count, align_log2)
     }
@@ -591,6 +595,14 @@ impl KernelHandler for ZcoreKernelHandler {
         );
         let (grow_refused, why, _, _, _) = memory::heap_grow_status();
         let _ = writeln!(s, "KernelHeapGrowRefusals: {} ({})", grow_refused, why);
+        // RAM userspace may not take, so that the heap can still grow and
+        // the OOM killer still run once processes have eaten the rest.
+        let _ = writeln!(
+            s,
+            "FramesKeptForKernel: {:>6} kB",
+            memory::frame_reserve() / 1024
+        );
+        let _ = writeln!(s, "UserFrameRefusals: {}", memory::user_frame_refusals());
         if let Some(free) = free_blocks {
             let _ = writeln!(s, "free blocks by size:");
             for (i, n) in free.iter().enumerate() {
