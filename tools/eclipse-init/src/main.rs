@@ -417,6 +417,9 @@ struct Service {
     udriver: Option<String>,
     /// If set, child stdout/stderr append here instead of `/dev/null`.
     log: Option<String>,
+    /// `oom_score_adj` the service runs at (systemd's `OOMScoreAdjust=`), or
+    /// `None` to leave init's. See [`service_oom_score_adj`].
+    oom_score_adj: Option<i16>,
     /// `timeout = <seconds>` from the service file: how long a `oneshot` may
     /// run before init stops waiting for it (see [`start_timeout`]). `None`
     /// means the file said nothing and the default applies.
@@ -1688,6 +1691,40 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
     out
 }
 
+/// The `oom_score_adj` a service runs at: what its file says, and for a
+/// driver (`udriver =`) -1000 when it says nothing.
+///
+/// The drivers and the network stack are this microkernel's servers: the disk
+/// a filesystem reads, the card the network is. Under a fork bomb in QEMU
+/// (2 GiB, 2026-11-23) the kernel's OOM killer, choosing by size as Linux
+/// does, took `udrv-ahci`, `eclipse-netstack` and `udrv-hda` before the
+/// bomb's processes, each smaller than any of them: a machine that kept its
+/// kernel and lost its disk. Linux's own answer is the same knob, set by
+/// whoever starts the daemon (systemd-udevd, `OOMScoreAdjust=-1000`).
+fn service_oom_score_adj(stated: Option<i16>, udriver: Option<&str>) -> Option<i16> {
+    stated.or_else(|| udriver.map(|_| -1000))
+}
+
+/// Write `adj` to `/proc/self/oom_score_adj`. Called in the forked child
+/// before `execve`, so the service and everything it starts inherit it.
+/// Best effort: a kernel without the file runs the service as it is.
+/// `text` is the number already formatted, by the parent: nothing is
+/// allocated between `fork` and `execve`.
+fn set_own_oom_score_adj(text: &str) {
+    // SAFETY: open/write/close on a NUL-terminated literal path and a local
+    // buffer; async-signal-safe, as the child of `fork` requires.
+    unsafe {
+        let fd = libc::open(
+            b"/proc/self/oom_score_adj\0".as_ptr() as *const libc::c_char,
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if fd >= 0 {
+            libc::write(fd, text.as_ptr() as *const libc::c_void, text.len());
+            libc::close(fd);
+        }
+    }
+}
+
 /// Parse a single service file. Format is line-based `key = value`, `#`
 /// comments and blank lines ignored:
 ///   exec    = /usr/sbin/foo --flag    (required; whitespace-split into argv)
@@ -1705,6 +1742,9 @@ fn load_services(dir: &Path) -> BTreeMap<String, Service> {
 ///                                      of the kind with `kind/N`; any
 ///                                      of several with `a|b`)
 ///   log     = /tmp/foo.log            (optional; capture child stdout/stderr)
+///   oom_score_adj = -1000             (optional; -1000..=1000, what the OOM
+///                                      killer reads; a `udriver =` service
+///                                      gets -1000 unless it says otherwise)
 fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
     let mut kind = Kind::Oneshot;
@@ -1717,6 +1757,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut wait_socket: Option<String> = None;
     let mut wait_path: Option<String> = None;
     let mut timeout: Option<Limit> = None;
+    let mut oom_score_adj: Option<i16> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -1765,6 +1806,13 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
                      (or 0/none for no limit); using the default"
                 )),
             },
+            "oom_score_adj" => match value.parse::<i16>() {
+                Ok(adj) if (-1000..=1000).contains(&adj) => oom_score_adj = Some(adj),
+                _ => log(&format!(
+                    "warning: {name}: 'oom_score_adj = {value}' is not a number from \
+                     -1000 to 1000; ignored"
+                )),
+            },
             "wait_socket" => wait_socket = Some(value.to_string()),
             "wait_path" => wait_path = Some(value.to_string()),
             // Same reason: a misspelled key is a gate that does not exist.
@@ -1809,6 +1857,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         requires,
         desktop,
         cmdline,
+        oom_score_adj: service_oom_score_adj(oom_score_adj, udriver.as_deref()),
         udriver,
         log: log_path,
         timeout,
@@ -2423,7 +2472,7 @@ fn start_service(svc: &mut Service) {
     match svc.kind {
         Kind::Oneshot => {
             log(&format!("oneshot: {}", svc.name));
-            if let Some(pid) = spawn(&svc.exec, svc.log.as_deref()) {
+            if let Some(pid) = spawn(&svc.exec, svc.log.as_deref(), svc.oom_score_adj) {
                 // Wait for this child specifically -- but not for ever: a
                 // oneshot that never exits used to hang the whole boot.
                 let limit = start_timeout(svc.kind, svc.timeout);
@@ -2459,7 +2508,7 @@ fn start_service(svc: &mut Service) {
                 return;
             }
             log(&format!("respawn: {} (starting)", svc.name));
-            svc.pid = spawn(&svc.exec, svc.log.as_deref());
+            svc.pid = spawn(&svc.exec, svc.log.as_deref(), svc.oom_score_adj);
             svc.started_at = Some(now);
             svc.total_starts += 1;
             svc.restart_at = None;
@@ -3101,7 +3150,7 @@ fn push_sdl_render_env(env: &mut Vec<CString>, mode: SdlRender) {
     env.push(CString::new(format!("SDL_FRAMEBUFFER_ACCELERATION={fb}")).unwrap());
 }
 
-fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
+fn spawn(argv: &[String], log_path: Option<&str>, oom_score_adj: Option<i16>) -> Option<i32> {
     let prog = CString::new(argv[0].as_str()).ok()?;
     // Same treatment as argv[0]: an interior NUL in an `exec =` argument
     // (corrupted .service file) fails this spawn instead of aborting init.
@@ -3115,6 +3164,8 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
     let c_env: Vec<CString> = build_child_env();
     let mut p_env: Vec<*const libc::c_char> = c_env.iter().map(|e| e.as_ptr()).collect();
     p_env.push(core::ptr::null());
+
+    let adj_text = oom_score_adj.map(|adj| adj.to_string());
 
     // SAFETY: standard fork/exec. The child only calls async-signal-safe libc
     // functions (signal reset, setsid, open/dup2, execve) before exec.
@@ -3147,6 +3198,9 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
             // and dies in initgroups(3) opening /etc/group:
             //   Failed to change group list: No file descriptors available
             close_inherited_fds();
+            if let Some(adj) = adj_text.as_deref() {
+                set_own_oom_score_adj(adj);
+            }
             libc::execve(prog.as_ptr(), p_args.as_ptr(), p_env.as_ptr());
             // execve only returns on failure.
             libc::_exit(127);

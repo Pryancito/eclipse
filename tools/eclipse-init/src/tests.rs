@@ -3275,3 +3275,24 @@ fn the_session_opens_every_card_only_with_nvkms() {
         "any number of cards"
     );
 }
+
+/// Drivers run where the OOM killer does not reach them unless their file
+/// says otherwise; everything else keeps init's adjustment, and a value out
+/// of range is ignored rather than clamped.
+#[test]
+fn oom_score_adj_protects_drivers_and_follows_the_file() {
+    let driver = parse_service("uahci", "exec = /bin/x\ntype = respawn\nudriver = ahci\n").unwrap();
+    assert_eq!(driver.oom_score_adj, Some(-1000));
+    let said = parse_service(
+        "uahci",
+        "exec = /bin/x\nudriver = ahci\noom_score_adj = -500\n",
+    )
+    .unwrap();
+    assert_eq!(said.oom_score_adj, Some(-500));
+    let plain = parse_service("labwc", "exec = /bin/x\ntype = respawn\n").unwrap();
+    assert_eq!(plain.oom_score_adj, None);
+    let mountd = parse_service("mountd", "exec = /bin/x\noom_score_adj = -1000\n").unwrap();
+    assert_eq!(mountd.oom_score_adj, Some(-1000));
+    let wrong = parse_service("x", "exec = /bin/x\noom_score_adj = -2000\n").unwrap();
+    assert_eq!(wrong.oom_score_adj, None);
+}
