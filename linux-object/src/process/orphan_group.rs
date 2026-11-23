@@ -131,6 +131,11 @@ fn members_of(live: &[Arc<Process>], pgid: KoID) -> Vec<GroupMember> {
 /// the members have now -- a child handed to INIT has lost its protector,
 /// and that is the whole point.
 pub fn wake_orphaned_stopped_groups(candidates: &[KoID]) {
+    // No stopped process anywhere: no group owes a wake, and the census
+    // below would be read for nothing (see `any_job_stopped`).
+    if !super::exit_path::any_job_stopped() {
+        return;
+    }
     let mut seen: Vec<KoID> = Vec::new();
     let live = all_live_processes();
     for &pgid in candidates {

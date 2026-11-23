@@ -80,6 +80,24 @@ impl Default for ExitPathSummary {
     }
 }
 
+/// Processes whose `job_stopped` mirror is set, machine-wide.
+///
+/// Kept where the mirror is written, the one place it changes. It lets an
+/// exit skip the orphaned-group check (`wake_orphaned_stopped_groups`), which
+/// walks every live process and wakes nobody unless some process is
+/// stopped: run on every exit, a mass kill of N processes was N censuses of
+/// up to N each, with a vector the size of the census allocated each time --
+/// in a fork bomb (QEMU 2 GiB, 2026-11-23) a 1.5 MiB allocation that failed
+/// and took the kernel down. A process that dies still stopped leaves the
+/// count high, which only costs the fast path, never a wake.
+static JOB_STOPPED_PROCESSES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any process on the machine may be job-control stopped.
+pub fn any_job_stopped() -> bool {
+    JOB_STOPPED_PROCESSES.load(Ordering::Acquire) != 0
+}
+
 impl LinuxProcess {
     /// Re-publishes the two words the return to user mode reads.
     ///
@@ -98,9 +116,19 @@ impl LinuxProcess {
         self.exit_path
             .shared_pending_bits
             .store(inner.shared_pending.val(), Ordering::Release);
-        self.exit_path
+        let was = self
+            .exit_path
             .job_stopped
-            .store(inner.job_stopped, Ordering::Release);
+            .swap(inner.job_stopped, Ordering::AcqRel);
+        match (was, inner.job_stopped) {
+            (false, true) => {
+                JOB_STOPPED_PROCESSES.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                JOB_STOPPED_PROCESSES.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
     }
 
     /// True while this process is job-control stopped.
