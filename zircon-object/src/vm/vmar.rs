@@ -1364,25 +1364,17 @@ impl VmAddressRegion {
     }
 
     /// Snapshot every live mapping in this VMAR tree, sorted by start address —
-    /// the data `/proc/<pid>/maps` renders. Geometry and the backing object's
-    /// identity are read under the locks; the rows themselves are plain data.
-    ///
-    /// For the kernel's own callers (the loader, fault reports); what a
-    /// process can ask for goes through [`try_mappings_dump`](Self::try_mappings_dump).
+    /// the data `/proc/<pid>/maps` renders. For the kernel's own callers; what
+    /// a process asks for goes through [`try_mappings_dump`](Self::try_mappings_dump).
     pub fn mappings_dump(&self) -> Vec<MappingDump> {
         self.try_mappings_dump()
-            .expect("mappings_dump: the kernel heap cannot hold the rows")
+            .expect("mappings_dump: kernel heap full")
     }
 
-    /// [`mappings_dump`](Self::mappings_dump) that answers `None` when the
-    /// kernel heap cannot hold it, instead of `alloc_error`.
-    ///
-    /// The dump is a row per run of uniform protection with a copy of the
-    /// object's name in each, and a process chooses both how many rows there
-    /// are (nothing caps its mappings) and how long the names are (a file's
-    /// path): a hundred thousand one-page maps of a file with a 4000-byte
-    /// path made one `read` of `/proc/self/maps` ask the heap for some
-    /// 800 MiB, infallibly -- a kernel panic, from an unprivileged read.
+    /// [`mappings_dump`](Self::mappings_dump), `None` when the heap cannot hold
+    /// it. A process picks the row count (its mappings) and the name lengths
+    /// (file paths): 100k maps of a 4000-byte path were ~800 MiB asked
+    /// infallibly by one read of `/proc/self/maps`, a kernel panic.
     pub fn try_mappings_dump(&self) -> Option<Vec<MappingDump>> {
         let mut out = Vec::new();
         self.collect_mappings(&mut out).ok()?;
@@ -5458,43 +5450,7 @@ mod past_end_tests;
 mod vdso_code_mapping_tests;
 
 #[cfg(test)]
-mod process_memory_tests {
-    use super::*;
-
-    #[test]
-    fn an_unmapped_address_is_not_found_and_the_vdso_is_not_written() {
-        let root = VmAddressRegion::new_root();
-        let mut buf = [0u8; 8];
-        assert_eq!(
-            root.read_memory(root.addr(), &mut buf),
-            Err(ZxError::NOT_FOUND)
-        );
-        assert_eq!(
-            root.write_memory(root.addr(), &buf),
-            Err(ZxError::NOT_FOUND)
-        );
-
-        let vdso = VmObject::new_paged(1);
-        crate::task::register_vdso_vmo(vdso.id());
-        let at = root
-            .map(
-                None,
-                vdso.clone(),
-                0,
-                PAGE_SIZE,
-                MMUFlags::READ | MMUFlags::EXECUTE,
-            )
-            .unwrap();
-        assert_eq!(root.write_memory(at, &buf), Err(ZxError::ACCESS_DENIED));
-        assert_eq!(root.read_memory(at, &mut buf), Ok(8));
-
-        let plain = VmObject::new_paged(1);
-        let at = root
-            .map(None, plain, 0, PAGE_SIZE, MMUFlags::READ | MMUFlags::WRITE)
-            .unwrap();
-        assert_eq!(root.write_memory(at, &[1, 2, 3]), Ok(3));
-    }
-}
+mod process_memory_tests;
 
 #[cfg(test)]
 mod user_limit_tests {
