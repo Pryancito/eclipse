@@ -7,7 +7,7 @@ pub mod devfs;
 mod dmabuf;
 mod eclipsefs_ioctl;
 mod eclipsefs_mount;
-mod epoll;
+pub(crate) mod epoll;
 /// System-wide `epoll_wait(2)` usage counters, for `/proc/perf/kernel`.
 pub use epoll::stats as epoll_stats;
 mod drm_bring_up;
@@ -19,7 +19,7 @@ mod fstab_line;
 mod handle_fd;
 pub mod hunter_config;
 pub mod hunter_feeds;
-mod inotify;
+pub(crate) mod inotify;
 pub mod ioctl;
 mod kbd_layout;
 mod late_root;

@@ -140,6 +140,8 @@ pub struct KmemAccount {
     /// Descriptors this process has sent over unix sockets that nobody has
     /// received yet: see [`InFlight`].
     inflight: AtomicUsize,
+    /// inotify watches this process holds over all its instances.
+    inotify_watches: AtomicUsize,
 }
 
 impl KmemAccount {
@@ -242,6 +244,26 @@ impl KmemAccount {
     /// Descriptors sent over unix sockets and not received yet.
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// Take one of at most `limit` inotify watches, or refuse it (`ENOSPC`,
+    /// as `inotify_add_watch` answers past `max_user_watches`).
+    pub fn inotify_watches_get(&self, limit: usize) -> Result<(), crate::error::LxError> {
+        if self.inotify_watches.fetch_add(1, Ordering::Relaxed) >= limit {
+            self.inotify_watches.fetch_sub(1, Ordering::Relaxed);
+            return Err(crate::error::LxError::ENOSPC);
+        }
+        Ok(())
+    }
+
+    /// Give back `n` inotify watches.
+    pub fn inotify_watches_put(&self, n: usize) {
+        self.inotify_watches.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// inotify watches held now.
+    pub fn inotify_watches(&self) -> usize {
+        self.inotify_watches.load(Ordering::Relaxed)
     }
 
     /// Charges refused by the limit, and by the reserve.

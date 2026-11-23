@@ -2023,7 +2023,7 @@ impl INode for ProcSysFsInotifyDirINode {
 
 /// Linux's own default since 5.x (`inotify_user.c`: `watches_max`).
 fn proc_sys_inotify_max_user_watches_content() -> String {
-    String::from("65536\n")
+    alloc::format!("{}\n", crate::fs::inotify::MAX_USER_WATCHES)
 }
 
 /// `instances_max`.
