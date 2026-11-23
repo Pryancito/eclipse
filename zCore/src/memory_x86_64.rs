@@ -320,15 +320,36 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         // per-CPU lists were the problem: a non-zero figure HERE means the
         // drain could not take some list's lock, which is a different fault
         // from the machine being out of RAM.
-        log::error!(
-            "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed \
-             | {} KiB still parked in the per-CPU lists",
-            frame_count,
-            align_log2,
-            used / (1024 * 1024),
-            total / (1024 * 1024),
-            frames_cached() / 1024,
-        );
+        //
+        // At most one line a second, with the failures in between counted on
+        // it. Out of RAM, every CPU fails every fault: a fork bomb in QEMU
+        // (2 GiB, 2026-11-23) printed 100,000 of these, ~150 bytes each at
+        // 115200 baud, ~13 ms of console per line -- the machine spent its
+        // shortage printing about it, and the OOM killer's own line was lost
+        // among them.
+        static LAST_REPORT_NS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        static UNREPORTED: AtomicUsize = AtomicUsize::new(0);
+        let now = kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now());
+        let last = LAST_REPORT_NS.load(Ordering::Relaxed);
+        if (last == 0 || now.saturating_sub(last) >= 1_000_000_000)
+            && LAST_REPORT_NS
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            log::error!(
+                "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed \
+                 | {} KiB still parked in the per-CPU lists | {} more failure(s) since the last line",
+                frame_count,
+                align_log2,
+                used / (1024 * 1024),
+                total / (1024 * 1024),
+                frames_cached() / 1024,
+                UNREPORTED.swap(0, Ordering::Relaxed),
+            );
+        } else {
+            UNREPORTED.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
