@@ -275,12 +275,66 @@ const MIN_SLOTS: usize = (1 << 30) / BLOCK;
 struct PagedBytes {
     blocks: Vec<Option<RamBlock>>,
     len: usize,
+    /// Slots of `blocks` charged to [`RAMFS_SLOTS`]: its capacity.
+    slots_charged: usize,
+}
+
+/// Slots of every file's block vector, across every ramfs. A slot is kernel
+/// heap (24 bytes per 4 KiB of length) even where it is a hole, and the
+/// bound on them was per file: a byte written 12 GiB into each of a hundred
+/// files in `/tmp` held 72 MiB of heap apiece. They are one budget now,
+/// [`slot_budget`].
+static RAMFS_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many slots all files together may hold: twice what it takes to map
+/// the whole pool, and never fewer than [`MIN_SLOTS`].
+fn slot_budget() -> usize {
+    (bytes_cap() / BLOCK).saturating_mul(2).max(MIN_SLOTS)
+}
+
+/// Take `n` slots of the shared budget, or refuse them all.
+fn charge_slots(n: usize) -> Result<()> {
+    let budget = slot_budget();
+    let mut cur = RAMFS_SLOTS.load(Ordering::Relaxed);
+    loop {
+        let new = cur.checked_add(n).ok_or(FsError::NoDeviceSpace)?;
+        if new > budget {
+            return Err(FsError::NoDeviceSpace);
+        }
+        match RAMFS_SLOTS.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Slots held by every file right now (tests).
+pub fn ramfs_slots() -> usize {
+    RAMFS_SLOTS.load(Ordering::Relaxed)
+}
+
+impl Drop for PagedBytes {
+    fn drop(&mut self) {
+        RAMFS_SLOTS.fetch_sub(self.slots_charged, Ordering::Release);
+    }
 }
 
 impl PagedBytes {
     #[inline]
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Make the charge what the vector holds: its capacity, which the
+    /// allocator may round up past what was asked for.
+    fn sync_slots(&mut self) {
+        let cap = self.blocks.capacity();
+        if cap > self.slots_charged {
+            RAMFS_SLOTS.fetch_add(cap - self.slots_charged, Ordering::AcqRel);
+        } else {
+            RAMFS_SLOTS.fetch_sub(self.slots_charged - cap, Ordering::AcqRel);
+        }
+        self.slots_charged = cap;
     }
 
     /// Resize to `new_len`. Growing exposes a hole (zeros, no allocation);
@@ -298,6 +352,10 @@ impl PagedBytes {
         let nblocks = new_len.div_ceil(BLOCK);
         if nblocks < self.blocks.len() {
             self.blocks.truncate(nblocks);
+            // The slots go back too, or a file grown sparse and cut back
+            // would keep its slot vector for as long as it lives.
+            self.blocks.shrink_to(nblocks);
+            self.sync_slots();
         }
         if new_len < self.len {
             let off = new_len % BLOCK;
@@ -351,9 +409,18 @@ impl PagedBytes {
             if nblocks > max_slots {
                 return Err(FsError::NoDeviceSpace);
             }
-            self.blocks
-                .try_reserve(nblocks - self.blocks.len())
-                .map_err(|_| FsError::NoDeviceSpace)?;
+            let need = nblocks.saturating_sub(self.slots_charged);
+            charge_slots(need)?;
+            self.slots_charged += need;
+            if self
+                .blocks
+                .try_reserve_exact(nblocks - self.blocks.len())
+                .is_err()
+            {
+                self.sync_slots();
+                return Err(FsError::NoDeviceSpace);
+            }
+            self.sync_slots();
             self.blocks.resize_with(nblocks, || None);
         }
         let mut done = 0;
@@ -431,8 +498,8 @@ impl FileSystem for RamFS {
             blocks: total,
             bfree: free,
             bavail: free,
-            files: 0,
-            ffree: 0,
+            files: inode_cap(),
+            ffree: inode_cap().saturating_sub(ramfs_inodes()),
             namemax: 255,
             ftype: rcore_fs::vfs::TMPFS_MAGIC,
         }
@@ -464,6 +531,7 @@ impl RamFS {
                 rdev: 0,
             },
             fs: Weak::default(),
+            _counted: InodeCount::root(),
         })));
         let fs = Arc::new(RamFS {
             root,
@@ -505,6 +573,53 @@ struct RamFSINode {
     extra: Metadata,
     /// Reference to FS
     fs: Weak<RamFS>,
+    /// Its place among [`RAMFS_INODES`], given back when it goes.
+    _counted: InodeCount,
+}
+
+/// Inodes of every ramfs, files and directories. Each one is kernel heap (a
+/// couple of hundred bytes and its name) however little it holds, and
+/// nothing counted them: a loop of `open(O_CREAT)` in `/tmp` took the heap
+/// a few hundred bytes at a time. Linux bounds a tmpfs by `nr_inodes`
+/// (`ENOSPC` past it); this is that bound, shared by every mount.
+static RAMFS_INODES: AtomicUsize = AtomicUsize::new(0);
+
+/// How many inodes every ramfs together may hold: one for every four blocks
+/// of the pool, and never fewer than 65536. Linux's default is one per two
+/// pages of RAM, but its inodes do not come out of a heap an eighth of RAM.
+pub fn inode_cap() -> usize {
+    (bytes_cap() / BLOCK / 4).max(65536)
+}
+
+/// Inodes held by every ramfs right now.
+pub fn ramfs_inodes() -> usize {
+    RAMFS_INODES.load(Ordering::Relaxed)
+}
+
+/// One inode counted in [`RAMFS_INODES`].
+struct InodeCount(());
+
+impl InodeCount {
+    /// Count one more inode, or refuse it (`ENOSPC`).
+    fn take() -> Result<Self> {
+        if RAMFS_INODES.fetch_add(1, Ordering::AcqRel) >= inode_cap() {
+            RAMFS_INODES.fetch_sub(1, Ordering::AcqRel);
+            return Err(FsError::NoDeviceSpace);
+        }
+        Ok(InodeCount(()))
+    }
+
+    /// Count a mount's root, which a mount cannot do without.
+    fn root() -> Self {
+        RAMFS_INODES.fetch_add(1, Ordering::AcqRel);
+        InodeCount(())
+    }
+}
+
+impl Drop for InodeCount {
+    fn drop(&mut self) {
+        RAMFS_INODES.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct LockedINode(RwLock<RamFSINode>);
@@ -739,6 +854,7 @@ impl INode for LockedINode {
             if file.children.contains_key(name) {
                 return Err(FsError::EntryExist);
             }
+            let counted = InodeCount::take()?;
             // `shmem_mknod()`: the new inode's three times, and the
             // directory's change, are one moment.
             let at = now();
@@ -765,6 +881,7 @@ impl INode for LockedINode {
                     rdev: data,
                 },
                 fs: Weak::clone(&file.fs),
+                _counted: counted,
             })));
             temp_file.0.write().this = Arc::downgrade(&temp_file);
             file.children
@@ -1196,6 +1313,32 @@ mod tests {
     }
 
     // ------------------------------------------------- PagedBytes: the holes
+
+    /// The slots a write far into a hole adds are charged to the shared
+    /// budget, and a truncate gives them back: the charge is the vector's
+    /// capacity, whatever happened to it.
+    #[test]
+    fn the_slots_of_a_sparse_file_are_charged_and_given_back() {
+        let mut p = PagedBytes::default();
+        p.write_at(1000 * BLOCK, &[1u8]).unwrap();
+        assert!(p.blocks.capacity() >= 1001);
+        assert_eq!(p.slots_charged, p.blocks.capacity());
+        assert!(ramfs_slots() >= p.slots_charged);
+        p.resize(BLOCK);
+        assert_eq!(p.slots_charged, p.blocks.capacity());
+        assert!(
+            p.slots_charged < 1001,
+            "a cut-back file keeps no slots past its end"
+        );
+        // More than the whole budget at once is refused, and charges nothing.
+        let mut q = PagedBytes::default();
+        let before = q.slots_charged;
+        let far = slot_budget().saturating_add(1) * BLOCK;
+        if far / BLOCK <= (bytes_cap() / BLOCK).saturating_mul(2).max(MIN_SLOTS) {
+            assert!(q.write_at(far, &[1u8]).is_err());
+        }
+        assert_eq!(q.slots_charged, before);
+    }
 
     #[test]
     fn growing_a_file_exposes_a_hole_and_allocates_nothing() {
