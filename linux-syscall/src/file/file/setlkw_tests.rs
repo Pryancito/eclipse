@@ -52,7 +52,7 @@ fn a_kill_ends_an_f_setlkw_wait() {
                 owner: holder.id(),
                 ofd: false,
             };
-            assert!(record_lock::setlk((meta.dev, meta.inode), &whole, false));
+            assert!(record_lock::setlk((meta.dev, meta.inode), &whole, false).unwrap());
             let fl = Flock {
                 l_type: F_WRLCK,
                 ..Flock::default()

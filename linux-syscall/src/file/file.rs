@@ -2834,7 +2834,8 @@ impl Syscall<'_> {
                     owner,
                     ofd,
                 };
-                record_lock::setlk(key, &req, true);
+                // Carving a hole needs a lock for the far piece: ENOLCK.
+                record_lock::setlk(key, &req, true)?;
                 Ok((0, None))
             }
             F_RDLCK | F_WRLCK => {
@@ -2862,7 +2863,7 @@ impl Syscall<'_> {
                     // rare (package-manager style whole-file locks), so a poll
                     // loop beats wiring a waiter queue through the table.
                     loop {
-                        if record_lock::setlk(key, &req, false) {
+                        if record_lock::setlk(key, &req, false)? {
                             return Ok((0, None));
                         }
                         // An interruptible wait in Linux: a kill did not end
@@ -2874,7 +2875,7 @@ impl Syscall<'_> {
                         ))
                         .await;
                     }
-                } else if record_lock::setlk(key, &req, false) {
+                } else if record_lock::setlk(key, &req, false)? {
                     Ok((0, None))
                 } else {
                     Err(LxError::EAGAIN)
