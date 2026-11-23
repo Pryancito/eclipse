@@ -195,7 +195,9 @@ impl<const ORDER: usize> Heap<ORDER> {
         min_size: usize,
         mut accept: impl FnMut(usize, usize) -> bool,
     ) -> Option<(usize, usize)> {
-        let min_class = max(min_size, MIN_BLOCK).next_power_of_two().trailing_zeros() as usize;
+        let min_class = max(min_size, MIN_BLOCK)
+            .next_power_of_two()
+            .trailing_zeros() as usize;
         for class in (min_class..self.free_list.len()).rev() {
             let size = 1usize << class;
             if let Some(addr) = self.free_list[class].take_lowest_where(|a| accept(a, size)) {

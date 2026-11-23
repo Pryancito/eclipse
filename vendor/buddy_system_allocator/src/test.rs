@@ -253,7 +253,10 @@ fn allocations_pile_up_at_the_top() {
     assert_eq!(a, base + SIZE - 64, "the topmost 64 bytes");
     let b = heap.alloc(l).unwrap().as_ptr() as usize;
     assert_eq!(b, base + SIZE - 128);
-    assert!(heap.is_free(base, SIZE / 2), "the bottom half is one free block");
+    assert!(
+        heap.is_free(base, SIZE / 2),
+        "the bottom half is one free block"
+    );
 }
 
 /// Two regions: the higher one (the arena, in the kernel) fills first, and
@@ -294,9 +297,15 @@ fn take_free_block_gives_the_lowest_accepted_block() {
     for i in [9, 3, 5] {
         heap.dealloc(all[i], l);
     }
-    let mut freed: std::vec::Vec<usize> = [3, 5, 9].iter().map(|&i| all[i].as_ptr() as usize).collect();
+    let mut freed: std::vec::Vec<usize> = [3, 5, 9]
+        .iter()
+        .map(|&i| all[i].as_ptr() as usize)
+        .collect();
     freed.sort();
-    assert_eq!(heap.take_free_block(4096, |_, _| true), Some((freed[0], 4096)));
+    assert_eq!(
+        heap.take_free_block(4096, |_, _| true),
+        Some((freed[0], 4096))
+    );
     assert_eq!(
         heap.take_free_block(4096, |a, _| a != freed[1]),
         Some((freed[2], 4096)),

@@ -249,7 +249,11 @@ fn a_run_given_back_whole_can_be_taken_whole_again() {
     assert_eq!(frame_stats().0 - used_before, 64 * PAGE);
     frame_dealloc_run(run, 64);
     assert_eq!(frame_stats().0, used_before);
-    assert_eq!(frame_alloc_quiet(64, 6), Some(base), "the bitmap has the run back");
+    assert_eq!(
+        frame_alloc_quiet(64, 6),
+        Some(base),
+        "the bitmap has the run back"
+    );
     frame_dealloc_run(base, 64);
 }
 

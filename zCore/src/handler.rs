@@ -557,11 +557,24 @@ impl KernelHandler for ZcoreKernelHandler {
         // it could hand out right now. `-` while the heap lock is busy.
         let busy = |v: Option<usize>| v.map_or("-".into(), |v| alloc::format!("{}", v / 1024));
         let free_blocks = memory::heap_free_blocks();
-        let largest = free_blocks.map(|f| f.iter().rposition(|&n| n > 0).map_or(0, |i| 1usize << i));
-        let _ = writeln!(s, "KernelHeapRounded: {:>8} kB", busy(memory::heap_alloc_actual()));
-        let _ = writeln!(s, "KernelHeapFrontCache: {:>5} kB", memory::heap_front_cached() / 1024);
+        let largest =
+            free_blocks.map(|f| f.iter().rposition(|&n| n > 0).map_or(0, |i| 1usize << i));
+        let _ = writeln!(
+            s,
+            "KernelHeapRounded: {:>8} kB",
+            busy(memory::heap_alloc_actual())
+        );
+        let _ = writeln!(
+            s,
+            "KernelHeapFrontCache: {:>5} kB",
+            memory::heap_front_cached() / 1024
+        );
         let _ = writeln!(s, "KernelHeapGrown: {:>10} kB", memory::heap_grown() / 1024);
-        let _ = writeln!(s, "KernelHeapReleasable: {:>5} kB", memory::heap_releasable() / 1024);
+        let _ = writeln!(
+            s,
+            "KernelHeapReleasable: {:>5} kB",
+            memory::heap_releasable() / 1024
+        );
         let _ = writeln!(s, "KernelHeapLimit: {:>10} kB", memory::heap_limit() / 1024);
         let _ = writeln!(s, "KernelHeapLargestFree: {:>4} kB", busy(largest));
         let (grow_refused, why, _, _, _) = memory::heap_grow_status();
