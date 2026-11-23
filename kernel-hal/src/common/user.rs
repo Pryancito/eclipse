@@ -505,7 +505,9 @@ fn copy_arg(s: &str, pointer: usize, budget: &mut ArgBudget, out: &mut Vec<Strin
     budget.take(s.len(), pointer)?;
     out.try_reserve(1).map_err(|_| Error::NoMemory)?;
     let mut owned = String::new();
-    owned.try_reserve_exact(s.len()).map_err(|_| Error::NoMemory)?;
+    owned
+        .try_reserve_exact(s.len())
+        .map_err(|_| Error::NoMemory)?;
     owned.push_str(s);
     out.push(owned);
     Ok(())

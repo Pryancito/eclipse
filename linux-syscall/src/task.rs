@@ -1569,22 +1569,22 @@ impl Syscall<'_> {
         // 32-bit program's `argv` is four bytes an entry, and reading it at
         // eight does not fail, it invents the arguments. See
         // `Syscall::read_cstring_array`.
-        // Counted while copied: 1000 pointers to one 4 MiB string asked the
-        // heap for 4 GiB before the check below saw them (a kernel panic).
+        // Counted while copied, not after: see `exec_args::arg_budget`.
         let mut budget = exec_args::arg_budget(self.linux_process(), path_str)?;
+        let mut read = |array: UserInPtr<UserInPtr<u8>>, what: &str| {
+            self.read_cstring_array(array, &mut budget)
+                .inspect_err(|&e| error!("execve: reading {} failed: {:?}", what, e))
+        };
         let args = exec_args::argv_or_empty(if argv.is_null() {
             Vec::new()
         } else {
-            self.read_cstring_array(argv, &mut budget).inspect_err(|&e| {
-                error!("execve: reading argv failed: {:?}", e);
-            })?
+            read(argv, "argv")?
         });
-        let mut envs: Vec<String> = Vec::new();
-        if !envp.is_null() {
-            envs = self.read_cstring_array(envp, &mut budget).inspect_err(|&e| {
-                error!("execve: reading envp failed: {:?}", e);
-            })?;
-        }
+        let envs: Vec<String> = if envp.is_null() {
+            Vec::new()
+        } else {
+            read(envp, "envp")?
+        };
         // Bound argv+envp so a huge argument list -- a glob like `rm dir/*`
         // expanding to thousands of paths -- fails with E2BIG instead of
         // overrunning the initial stack image the loader builds. Without this

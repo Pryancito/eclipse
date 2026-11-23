@@ -134,7 +134,10 @@ fn the_walk_says_e2big_where_the_check_would_and_before_copying_it() {
     assert!(check_arg_sizes("f", &args, &[], limit, 8).is_ok());
     let mut more = args.clone();
     more.push(big.clone());
-    assert_eq!(check_arg_sizes("f", &more, &[], limit, 8), Err(LxError::E2BIG));
+    assert_eq!(
+        check_arg_sizes("f", &more, &[], limit, 8),
+        Err(LxError::E2BIG)
+    );
     let mut budget = budget_for(limit, "f");
     *pointers.last_mut().unwrap() = s.as_ptr() as usize;
     pointers.push(0);
