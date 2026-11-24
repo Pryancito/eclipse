@@ -870,6 +870,37 @@ pub fn fence_poll_step(probes: u32) -> PollStep {
     PollStep::Sleep { us }
 }
 
+/// How long a fence poll keeps yielding, from the moment the wait began,
+/// before it arms its first timer.
+///
+/// [`FENCE_POLL_YIELDS`] yields go by in a few microseconds when nothing else
+/// is runnable, and the first sleep can not be shorter than the timer's
+/// 200 us floor. A fence that lands 30 us after the wait began -- the GPU
+/// work of an ordinary `glmark2` frame on a 2060 -- was therefore seen 200 us
+/// later, every frame: `glmark2-drm` (zink + NVK, 1366x768) measured
+/// 0.21 ms per frame in nearly every scene, shaders, loops and conditionals
+/// alike, which is that floor and not the GPU (score 4062, 2026-11-24).
+/// Linux takes the GPU's nonstall interrupt and wakes the waiter the moment
+/// the fence lands; with no fence interrupt here, re-probing on every yield
+/// for this long is the nearest equivalent. A fence later than this is a
+/// frame bound by something else (vblank, the compositor), and the backoff
+/// takes over from there.
+pub const FENCE_POLL_YIELD_WINDOW_US: u64 = 500;
+
+/// [`fence_poll_step`] for a wait that began `waited_us` ago: yields while
+/// the wait is younger than [`FENCE_POLL_YIELD_WINDOW_US`] (and for at least
+/// [`FENCE_POLL_YIELDS`] probes), then sleeps about as long as it has
+/// already waited, between [`FENCE_POLL_FLOOR_US`] and [`FENCE_POLL_CAP_US`]
+/// -- the same doubling the probe count gives, measured on the clock.
+pub fn fence_poll_step_at(probes: u32, waited_us: u64) -> PollStep {
+    if probes < FENCE_POLL_YIELDS || waited_us < FENCE_POLL_YIELD_WINDOW_US {
+        return PollStep::Yield;
+    }
+    PollStep::Sleep {
+        us: waited_us.clamp(FENCE_POLL_FLOOR_US, FENCE_POLL_CAP_US),
+    }
+}
+
 // --- Counters for /proc/gpudbg -----------------------------------------------
 static WAIT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WAIT_SPIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

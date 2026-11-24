@@ -254,6 +254,43 @@ fn a_fence_poll_backs_off_monotonically_and_settles_at_the_cap() {
     assert!(wakes <= 110, "{} wakeups to wait out 100 ms", wakes);
 }
 
+/// A fence that lands well inside the timer's floor is seen on a yield,
+/// whatever the probe count: the poll keeps yielding for the whole window,
+/// so a 30 us fence is not seen 200 us late (glmark2-drm's 0.21 ms frames).
+#[test]
+fn a_fence_poll_keeps_yielding_for_its_window_then_backs_off_on_the_clock() {
+    assert!(FENCE_POLL_YIELD_WINDOW_US >= FENCE_POLL_FLOOR_US);
+    for probes in [0, FENCE_POLL_YIELDS, 50, 10_000] {
+        for waited in [0, 30, FENCE_POLL_FLOOR_US, FENCE_POLL_YIELD_WINDOW_US - 1] {
+            assert_eq!(
+                fence_poll_step_at(probes, waited),
+                PollStep::Yield,
+                "probe {} at {} us armed a timer inside the window",
+                probes,
+                waited
+            );
+        }
+    }
+    // The minimum yields still hold on a clock that reads late.
+    assert_eq!(fence_poll_step_at(0, 1_000_000), PollStep::Yield);
+    // Past the window: sleep about as long as already waited, inside the
+    // floor..cap band, and never less than the sleep before.
+    let mut prev = 0;
+    let mut waited = FENCE_POLL_YIELD_WINDOW_US;
+    let mut wakes = 0;
+    while waited < 100_000 {
+        let PollStep::Sleep { us } = fence_poll_step_at(FENCE_POLL_YIELDS, waited) else {
+            panic!("still yielding at {} us", waited);
+        };
+        assert!((FENCE_POLL_FLOOR_US..=FENCE_POLL_CAP_US).contains(&us));
+        assert!(us >= prev);
+        prev = us;
+        waited += us;
+        wakes += 1;
+    }
+    assert!(wakes <= 110, "{} wakeups to wait out 100 ms", wakes);
+}
+
 std::thread_local! {
     static SIGNALS: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
     /// `(ctx_idx, handle, point)` of each fence the timeout hook was
