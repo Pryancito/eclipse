@@ -488,7 +488,7 @@ does it. `eclipse-udriver instalar VVVV DDDD FILE` copies it to
 (`instalado = si`, which goes before the shipped ones) in
 `/etc/eclipse/claves.d`; the panel adds `pci-VVVV-DDDD@0` to `rboot.conf`'s
 `udriver=`, and after a restart the kernel leaves it the device. REMOVE
-DRIVER undoes it.
+DRIVER undoes it. How to write one: [README-drivers.en.md](README-drivers.en.md).
 
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH

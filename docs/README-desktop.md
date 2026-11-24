@@ -504,7 +504,7 @@ servicio de eclipse-init (`udriver = pci-VVVV-DDDD@0`) y el bloque
 `[driver:udrv-VVVV-DDDD]` (`instalado = si`, que va antes que los de serie)
 en `/etc/eclipse/claves.d`; el panel añade `pci-VVVV-DDDD@0` al `udriver=`
 de `rboot.conf`, y al reiniciar el núcleo le deja el dispositivo. QUITAR
-DRIVER lo deshace.
+DRIVER lo deshace. Cómo escribir uno: [README-drivers.md](README-drivers.md).
 
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
