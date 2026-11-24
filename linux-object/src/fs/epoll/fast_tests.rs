@@ -176,3 +176,31 @@ fn a_modified_entry_is_looked_at_again() {
     next_look_quick(&ep);
     assert_eq!(wait_once(&ep, 0), Some(alloc::vec![(IN, 8)]));
 }
+
+#[test]
+fn an_empty_pipe_stays_quiet_after_a_full_look() {
+    use crate::fs::pipe::Pipe;
+    use crate::fs::File;
+    let (r, _w) = Pipe::create_pair();
+    let read_end: Arc<dyn FileLike> = File::new(
+        Arc::new(r),
+        OpenFlags::RDONLY,
+        alloc::string::String::from("pipe"),
+    );
+    let ep = Epoll::new(OpenFlags::empty());
+    ep.ctl(
+        ADD,
+        FileDesc::from(5),
+        EpollEvent {
+            events: IN,
+            data: 7,
+        },
+        Some(read_end),
+    )
+    .unwrap();
+    assert_eq!(wait_once(&ep, 0), Some(alloc::vec![]));
+    let inner = ep.inner.lock();
+    let armed = inner.armed.get(&FileDesc::from(5)).expect("armed");
+    assert!(!armed.fired(), "fired at once");
+    assert!(armed.quiet());
+}
