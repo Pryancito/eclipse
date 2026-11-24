@@ -5,6 +5,23 @@ fn shipped() -> Catalogo {
 }
 
 #[test]
+fn a_services_page_keeps_its_essentials_and_an_openers_page_its_programs() {
+    let c = Catalogo::de_serie();
+    let s = c.claves.iter().find(|k| k.id == "servicios").unwrap();
+    assert_eq!(s.tipo, Tipo::Servicios);
+    assert!(s.valores.iter().any(|v| v.v == "seatd"));
+    let a = c.claves.iter().find(|k| k.id == "aperturas").unwrap();
+    assert_eq!(a.tipo, Tipo::Aperturas);
+    let progs: Vec<&str> = a.valores.iter().map(|v| v.v.as_str()).collect();
+    assert_eq!(progs, ["eclipse-edit", "eclipse-view", "eclipse-firefox", "wavplay", "mpg123"]);
+    assert_eq!(a.etiqueta("eclipse-view", true), "Viewer");
+    // Every program the page offers is one the image's table already uses.
+    for p in progs {
+        assert!(crate::open::BUILTIN.iter().any(|(_, c)| c.starts_with(p)), "{p}");
+    }
+}
+
+#[test]
 fn every_shipped_block_is_used_and_none_is_left_out() {
     let c = shipped();
     assert!(c.avisos.is_empty(), "{:#?}", c.avisos);
@@ -38,11 +55,13 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "arranque.nvidia.render",
             "arranque.nvkms",
             "arranque.medida",
-            "dispositivos"
+            "dispositivos",
+            "servicios",
+            "aperturas"
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado", "dispositivos"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado", "dispositivos", "servicios", "aperturas"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));

@@ -149,3 +149,49 @@ fn every_page_and_size_draws_without_a_panic() {
     empty.status = "x".into();
     draw(&mut Canvas::new(800, 600), 800, 600, &empty);
 }
+
+#[test]
+fn the_services_and_openers_pages_draw_their_rows_at_every_size() {
+    for lang in [Lang::Es, Lang::En] {
+        let mut p = panel();
+        p.lang = lang;
+        tablas::muestra(&mut p);
+        for id in ["servicios", "aperturas"] {
+            p.grupo = group_index(&p.cat, Some(id));
+            assert!(p.pagina_serv().is_some() || p.pagina_aper().is_some(), "{id}");
+            for (w, h) in [(1600, 900), (1024, 600), (640, 480), (320, 240)] {
+                draw(&mut Canvas::new(w, h), w as i32, h as i32, &p);
+            }
+        }
+        assert_eq!(p.cuenta_grupo(group_index(&p.cat, Some("servicios"))), 13);
+    }
+}
+
+#[test]
+fn a_held_boot_or_program_is_dropped_by_choosing_what_is_in_force() {
+    let mut p = panel();
+    tablas::muestra(&mut p);
+    p.serv.pendiente.clear();
+    p.serv.elige("hunterd", false);
+    assert_eq!(p.serv.pendiente.get("hunterd"), Some(&false));
+    p.serv.elige("hunterd", true);
+    assert!(p.serv.pendiente.is_empty());
+    // An essential service is never held off.
+    p.serv.elige("abyss", false);
+    assert!(p.serv.pendiente.is_empty());
+
+    p.aper.pendiente.clear();
+    p.aper.paso("txt", 1);
+    assert_eq!(
+        p.aper.pendiente.get("txt"),
+        Some(&Some("eclipse-view".to_string()))
+    );
+    p.aper.paso("txt", -1);
+    assert!(p.aper.pendiente.is_empty());
+    // `.svg` is the viewer in the file: "as the image does" is held.
+    p.aper.elige("svg", None);
+    assert_eq!(p.aper.pendiente.get("svg"), Some(&None));
+    // The driver installer is not one of the page's programs.
+    p.aper.paso("drv", 1);
+    assert!(!p.aper.pendiente.contains_key("drv"));
+}
