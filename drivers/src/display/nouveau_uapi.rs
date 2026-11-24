@@ -961,8 +961,9 @@ pub fn is_cpu_prep_ioctl(request: u32) -> bool {
         && size as usize >= CPU_PREP_REQUEST_BYTES
 }
 
-/// Whether `request` is one of the three driver ioctls that cannot be served
-/// at all until this card's RM is attached: `GEM_NEW`, `VM_BIND` and `EXEC`.
+/// Whether `request` is one of the driver ioctls that cannot be served right
+/// until this card's RM is attached: `GEM_NEW`, `VM_BIND`, `EXEC` and
+/// `CHANNEL_ALLOC`.
 ///
 /// Linux never answers any of them `ENODEV`. `nouveau_drm_device_init` runs in
 /// `probe`, so by the time a client can `open` the node the device is there.
@@ -979,9 +980,35 @@ pub fn is_cpu_prep_ioctl(request: u32) -> bool {
 /// as that bring-up takes instead of refusing it. By NR alone, like
 /// [`is_cpu_prep_ioctl`], and with no size floor: the wait reads none of the
 /// request.
+///
+/// `CHANNEL_ALLOC` is here although a cold card CAN answer it, because the
+/// answer it gives is a trap. On a cold card it hands out a DISCOVERY channel:
+/// an id with no GPFIFO behind it, enough for NVK's enumeration. But that id
+/// is the one NVK keeps for the device's queue. The `EXEC` on it then parks
+/// until the card is up, as it should, and then is refused `ENODEV` all the
+/// same, because the channel was born without a ring and nothing promotes it.
+/// NVK reads that as `VK_ERROR_DEVICE_LOST`. On a dual-2060 box, at the text
+/// console with no session (so nothing read `/proc/gpuready` and the deferred
+/// bring-up waited out its 45 s), `glmark2-drm` started at 44.7 s:
+///
+/// ```text
+/// 44.672  CHANNEL_ALLOC -> channel=1 DISCOVERY ONLY (console card cold)
+/// 45.202  CHANNEL_ALLOC -> channel=1 DISCOVERY ONLY
+/// 52.333  first GEM_NEW (parked until the card attached)
+/// 52.771  EXEC: channel=1 ... is a DISCOVERY channel -> errno 19
+///         MESA: error: ZINK: vkQueueSubmit failed (VK_ERROR_DEVICE_LOST)
+/// ```
+///
+/// Linux has no cold window at all, so holding the call until the card is up
+/// is the closest match: the client gets a real channel, as on Linux. The
+/// cost is that a client enumerating during that window waits for the
+/// console card even when it will end up using another card; the wait is
+/// bounded and `^C` ends it, and the discovery answer is still what it gets
+/// if the bring-up never finishes.
 pub fn needs_rm_attached(request: u32) -> bool {
     let (_dir, nr, _size) = decode_ioc(request);
-    (request >> 8) & 0xff == 0x64 && matches!(nr, NR_GEM_NEW | NR_VM_BIND | NR_EXEC)
+    (request >> 8) & 0xff == 0x64
+        && matches!(nr, NR_GEM_NEW | NR_VM_BIND | NR_EXEC | NR_CHANNEL_ALLOC)
 }
 
 /// Whether `request` is the nouveau `EXEC`, carrying a whole request.
@@ -2896,16 +2923,16 @@ mod gl_client_abi_tests {
         assert!(!is_cpu_prep_ioctl(ioc(RW, 0x65, NR_GEM_CPU_PREP, full)));
     }
 
-    /// The three ioctls that cannot be served with the RM cold, and only
-    /// those three. Each one's absence is a whole session: a client refused
+    /// The four ioctls that cannot be served right with the RM cold, and only
+    /// those four. Each one's absence is a whole session: a client refused
     /// `GEM_NEW` reports `VK_ERROR_OUT_OF_DEVICE_MEMORY` and wlroots falls
-    /// back to pixman, and the two beside it are the next calls that would.
-    /// The ones deliberately NOT here are the discovery calls -- `GETPARAM`,
-    /// `CHANNEL_ALLOC`, `NVIF` -- which answer correctly on a cold card and
-    /// must not be held: NVK makes them while enumerating, before it has
-    /// decided to use the device at all.
+    /// back to pixman, and the ones beside it are the next calls that would.
+    /// `CHANNEL_ALLOC` on a cold card gives a discovery channel that NVK
+    /// keeps as its queue, and the first `EXEC` on it is device-lost (see
+    /// `needs_rm_attached`). The ones deliberately NOT here -- `GETPARAM`,
+    /// `NVIF` and the rest -- answer correctly on a cold card.
     #[test]
-    fn only_the_three_ioctls_that_need_the_rm_take_the_bring_up_wait() {
+    fn only_the_ioctls_that_need_the_rm_take_the_bring_up_wait() {
         let ioc = |dir: u32, ty: u32, nr: u32, size: usize| -> u32 {
             (dir << 30) | ((size as u32) << 16) | (ty << 8) | nr
         };
@@ -2915,6 +2942,7 @@ mod gl_client_abi_tests {
             ("GEM_NEW", NR_GEM_NEW),
             ("VM_BIND", NR_VM_BIND),
             ("EXEC", NR_EXEC),
+            ("CHANNEL_ALLOC", NR_CHANNEL_ALLOC),
         ] {
             assert!(
                 needs_rm_attached(ioc(RW, DRM, nr, 48)),
@@ -2937,7 +2965,6 @@ mod gl_client_abi_tests {
         }
         for (name, nr) in [
             ("GETPARAM", NR_GETPARAM),
-            ("CHANNEL_ALLOC", NR_CHANNEL_ALLOC),
             ("NVIF", NR_NVIF),
             ("VM_INIT", NR_VM_INIT),
             ("GEM_PUSHBUF", NR_GEM_PUSHBUF),

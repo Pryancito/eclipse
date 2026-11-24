@@ -2213,7 +2213,7 @@ impl Syscall<'_> {
             }
         }
         // And the one wait that is not about the GPU finishing something, but
-        // about it having STARTED: `GEM_NEW`/`VM_BIND`/`EXEC` on the card that
+        // about it having STARTED: `GEM_NEW`/`VM_BIND`/`EXEC`/`CHANNEL_ALLOC` on the card that
         // scans out the console, while the deferred bring-up that attaches its
         // RM is still to come. The sync arm can only answer ENODEV, and NVK
         // turns one of those into `VK_ERROR_OUT_OF_DEVICE_MEMORY` and loses
