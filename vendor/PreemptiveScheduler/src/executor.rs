@@ -2416,6 +2416,9 @@ impl Executor {
         // The last pick was a rescue (see below): the next pass with work of
         // our own queued serves that work first.
         let mut last_rescued = false;
+        // The last poll ended with its task blocked, so a task it woke on
+        // another CPU may be taken here next (see `crate::sync_wake`).
+        let mut sync_after_block = false;
         // Entry attribution (see `runtime::WAKE_ENTRY_RESUMED`): this CPU is
         // about to look at its run queue having just arrived on this stack,
         // which is neither "waited for an interrupt" nor "waited out someone
@@ -2559,6 +2562,9 @@ impl Executor {
                 }
             }
             last_rescued = task_info.is_some();
+            if task_info.is_none() && core::mem::take(&mut sync_after_block) {
+                task_info = crate::sync_wake::take_task();
+            }
             if task_info.is_none() {
                 task_info = self.task_collection.take_task();
             }
@@ -2609,6 +2615,7 @@ impl Executor {
                     .store(Arc::as_ptr(&waker_ref).cast_mut(), Ordering::Relaxed);
                 self.current_task
                     .store(Arc::as_ptr(&task).cast_mut(), Ordering::Release);
+                crate::sync_wake::clear();
                 critical.set(false);
                 let ret = task.poll(&mut cx);
                 critical.set(true);
@@ -2673,6 +2680,10 @@ impl Executor {
                 // is made. Only this case pays for the clone.
                 if waker_ref.waiting_for_cpu() {
                     set_aside = Some(waker_ref.clone());
+                } else {
+                    // Blocked (or finished): whatever it woke on another CPU
+                    // may follow it here.
+                    sync_after_block = true;
                 }
                 polls_since_weak = polls_since_weak.saturating_add(1);
                 // The next scan is reached by a poll returning, so a wake it

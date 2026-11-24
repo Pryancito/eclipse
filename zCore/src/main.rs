@@ -380,6 +380,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // Direct hand-off (see `executor::set_handoff`): off by default until
         // it is shown to pay off on real hardware; under QEMU/TCG it made no
         // measurable difference to `eclipse.ipcbench`.
+        // Sync wake (see `executor::set_sync_wake`): on by default; a task
+        // woken from another CPU by a task that then blocks runs on the
+        // waker's CPU, as Linux's `WF_SYNC` does. `SYNCWAKE=0` turns it off.
+        if kernel_hal::cmdline::is_off(&options.cmdline, "SYNCWAKE") {
+            executor::set_sync_wake(false);
+            klog_info!("Eclipse: sync wake DISABLED (SYNCWAKE=0)");
+        }
         if kernel_hal::cmdline::flag(&options.cmdline, "HANDOFF") {
             executor::set_handoff(true);
             klog_info!("Eclipse: direct hand-off ENABLED (HANDOFF=1)");
