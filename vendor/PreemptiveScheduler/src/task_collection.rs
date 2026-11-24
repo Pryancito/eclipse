@@ -564,6 +564,53 @@ impl TaskCollection {
         self.schedule(&mut generator, &mut inner)
     }
 
+    /// Take slot `subpage_idx` of the page at `page_addr`, and nothing else:
+    /// a sync wake's task (see `crate::sync_wake`), polled on the CPU of the
+    /// task that woke it. `None` unless the slot is still a woken task here,
+    /// not running, not dead, and allowed on the calling CPU -- or when either
+    /// lock is busy, since a thief never waits for one.
+    ///
+    /// The round-robin cursors are left where they were, like a hand-off:
+    /// the task is taken out of turn, and the ones it jumped are next.
+    pub fn try_take_slot(
+        &self,
+        page_addr: usize,
+        subpage_idx: usize,
+    ) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+        if subpage_idx >= WAKER_PAGE_SIZE {
+            return None;
+        }
+        let generator = self.generator.as_ref()?;
+        let _generator = generator.try_lock()?;
+        let mut inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
+        let page_idx = inner
+            .pages
+            .iter()
+            .position(|page| Arc::as_ptr(page) as usize == page_addr)?;
+        let bit = 1u64 << subpage_idx;
+        let (notified, _voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
+        if notified & !dropped & !borrowed & bit == 0 {
+            return None;
+        }
+        let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+        let task = inner.slab.get(slot)?.clone();
+        let page = &inner.pages[page_idx];
+        if !task.allowed_on(crate::arch::cpu_id() as usize) {
+            return None;
+        }
+        if page.reclaim_notified(bit) == 0 {
+            return None;
+        }
+        page.mark_borrowed(subpage_idx, true);
+        crate::runtime::note_wake_serviced(page.take_wake_stamp(subpage_idx));
+        let waker = task.waker().clone();
+        Some((
+            pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx),
+            task,
+            waker,
+        ))
+    }
+
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
         // See `report_missing_generator`: never `unwrap` here.
         let Some(generator) = self.generator.as_ref() else {
@@ -1995,6 +2042,43 @@ mod collection_tests {
         let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[page_idx].clone();
         crate::waker_page::HANDOFF_IDX[0].store(idx, Ordering::Relaxed);
         crate::waker_page::HANDOFF_PAGE[0].store(Arc::as_ptr(&page) as usize, Ordering::Relaxed);
+    }
+
+    /// The sync wake's take (see `crate::sync_wake`): exactly the slot it is
+    /// pointed at, only while that slot is a woken task nobody is polling,
+    /// and the round-robin order is left as it was.
+    #[test]
+    fn a_slot_is_taken_only_while_it_is_woken_and_not_running() {
+        let tc = TaskCollection::new(0);
+        let a = tc.add_task(pending(), None);
+        let b = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        let addr = Arc::as_ptr(&page) as usize;
+        let (_, _, ib) = unpack_key(b);
+        assert!(
+            tc.try_take_slot(addr, ib).is_none(),
+            "asleep: nothing to take"
+        );
+        page.notify(unpack_key(a).2);
+        page.notify(ib);
+        let (key, _, waker) = tc.try_take_slot(addr, ib).expect("the woken slot");
+        assert_eq!(key, b);
+        assert!(
+            tc.try_take_slot(addr, ib).is_none(),
+            "a slot being polled is not handed out twice"
+        );
+        assert!(
+            tc.try_take_slot(0x1000, ib).is_none(),
+            "a page that is not here"
+        );
+        assert!(tc.try_take_slot(addr, WAKER_PAGE_SIZE).is_none());
+        waker.mark_borrowed(false);
+        assert_eq!(
+            tc.take_task().unwrap().0,
+            a,
+            "the queue's own order is untouched"
+        );
     }
 
     #[test]

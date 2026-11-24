@@ -720,13 +720,18 @@ impl WakerRef {
                 // Woken by code running on its own CPU: the scheduler there
                 // may hand that CPU straight to it (see `HANDOFF_PAGE`).
                 let owner = self.page.owner_cpu as usize;
-                if crate::runtime::handoff_enabled()
+                // With sync wakes on, the hint is also kept for the poll
+                // that blocks right after the wake (`crate::sync_wake`).
+                if (crate::runtime::handoff_enabled() || crate::sync_wake::sync_wake_enabled())
                     && owner < lock::MAX_CORE_NUM
                     && crate::arch::cpu_id() as usize == owner
                 {
                     HANDOFF_IDX[owner].store(self.idx, Ordering::Relaxed);
                     HANDOFF_PAGE[owner].store(Arc::as_ptr(&self.page) as usize, Ordering::Relaxed);
                 }
+                // Woken from another CPU: if the code that woke it is about to
+                // block, that CPU polls it next (see `crate::sync_wake`).
+                crate::sync_wake::note(Arc::as_ptr(&self.page) as usize, self.idx, owner);
                 crate::runtime::request_resched(self.page.owner_cpu);
             }
         }

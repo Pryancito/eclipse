@@ -2493,6 +2493,29 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
     None
 }
 
+/// Whether `cpu` is halted (or on its way into the halt).
+pub(crate) fn cpu_is_sleeping(cpu: usize) -> bool {
+    cpu < MAX_CORE_NUM && SLEEPING_CPUS.load(Ordering::SeqCst) & (1u64 << cpu) != 0
+}
+
+/// Take one specific woken task off `cpu`'s queue for this CPU to poll: the
+/// sync wake (`crate::sync_wake`). Same locks, taken the same way, as
+/// [`steal_task_inner`]: the victim's runtime and then its collection, both
+/// `try_lock`, so a busy victim is a miss and never a wait.
+pub(crate) fn try_take_slot_from(
+    cpu: usize,
+    page_addr: usize,
+    subpage_idx: usize,
+) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+    if cpu == crate::arch::cpu_id() as usize {
+        return None;
+    }
+    let runtime = GLOBAL_RUNTIME.try_lock_cpu(cpu)?;
+    runtime
+        .task_collection
+        .try_take_slot(page_addr, subpage_idx)
+}
+
 /// Load of `cpu` for placement purposes: runnable tasks if the collection can
 /// be inspected without blocking, otherwise the total task count as a
 /// conservative stand-in (a locked collection is by definition in use).

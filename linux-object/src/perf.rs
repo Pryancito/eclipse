@@ -903,6 +903,12 @@ pub fn kernel_report() -> String {
             empty,
             kernel_hal::kstats::sched_idle_backlog_kicks()
         );
+        let (sync_taken, sync_missed, handoffs) = kernel_hal::kstats::sched_sync_wake_stats();
+        let _ = writeln!(
+            out,
+            "sync wake:    {} taken on the waker's CPU, {} missed, {} same-CPU hand-offs",
+            sync_taken, sync_missed, handoffs
+        );
         let (denied, armed) = kernel_hal::thread::wake_floor_stats();
         let _ = writeln!(
             out,

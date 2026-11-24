@@ -61,6 +61,7 @@ mod context;
 mod diag;
 mod executor;
 mod runtime;
+mod sync_wake;
 mod task_collection;
 mod waker_page;
 
@@ -93,6 +94,7 @@ pub use runtime::{
     WAKE_ENTRY_RESUMED, WAKE_ENTRY_SKIPPED_HALT, WAKE_ENTRY_UNKNOWN, WAKE_LATENCY_BUCKETS,
     WAKE_SAMPLE_PERIOD,
 };
+pub use sync_wake::{set_sync_wake, sync_wake_enabled, sync_wake_stats};
 
 #[doc(hidden)]
 pub struct InterruptGuard {

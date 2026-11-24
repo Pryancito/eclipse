@@ -456,6 +456,20 @@ pub fn sched_idle_backlog_kicks() -> u64 {
     0
 }
 
+/// `(sync wakes taken, sync wakes missed, same-CPU hand-offs)`: tasks woken
+/// from another CPU by a task that then blocked, polled on the waker's CPU
+/// (`executor::sync_wake`), and tasks woken on their own CPU polled next there.
+#[cfg(target_os = "none")]
+pub fn sched_sync_wake_stats() -> (u64, u64, u64) {
+    let (taken, missed) = executor::sync_wake_stats();
+    (taken, missed, executor::handoff_stats())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_sync_wake_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
 /// rebalance pulls, scans skipped by the stealable hint, rescue pulls)`.
 #[cfg(target_os = "none")]
