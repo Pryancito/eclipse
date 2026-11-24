@@ -2601,7 +2601,7 @@ fn the_login_shell_gets_the_path_the_home_and_the_certificate_bundle() {
     let profile = profile_text("env");
     assert_eq!(
         export(&profile, "PATH"),
-        Some("/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin"),
+        Some("/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/games:/usr/games"),
         "the wrappers only win over the busybox applets while /usr/local/bin is first"
     );
     assert_eq!(export(&profile, "HOME"), Some("/root"));

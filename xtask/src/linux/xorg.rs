@@ -1464,6 +1464,12 @@ const LIVE_TREES: &[&str] = &[
     // wholesale, so this list is the only way in.
     "usr/share/games",
     "usr/share/doom",
+    // And the engines + launchers themselves, which on Ubuntu/Debian are NOT
+    // in `usr/bin`: policy 9.1.1 puts game binaries in `/usr/games`
+    // (/usr/games/chocolate-doom, /usr/games/freedoom{1,2}). `usr/bin` above
+    // used to cover them because Alpine shipped them there; on the apt rootfs
+    // this tree is the only way the engine reaches the QEMU live root.
+    "usr/games",
     "etc/fonts",
     "etc/alsa",
     "etc/libinput", // local-overrides.quirks (if present)
@@ -1565,16 +1571,45 @@ pub(super) fn report_freedoom(root: &Path, what: &str) {
     let one = wad("freedoom1.wad");
     let two = wad("freedoom2.wad");
     let bash = root.join("bin/bash").is_file() || root.join("usr/bin/bash").is_file();
+    // The ENGINE, which is the half that went missing when the rootfs moved to
+    // apt: Debian/Ubuntu put game binaries in /usr/games (policy 9.1.1) and
+    // that tree was in neither MERGE_TREES nor LIVE_TREES, so the wads landed
+    // and `chocolate-doom` did not. The wads without an engine are 57 MiB that
+    // launch nothing, so say so in the same line.
+    let engine = ["chocolate-doom", "crispy-doom", "prboom-plus", "gzdoom"]
+        .iter()
+        .flat_map(|e| {
+            [
+                "usr/games",
+                "usr/local/games",
+                "usr/bin",
+                "usr/local/bin",
+                "bin",
+            ]
+            .iter()
+            .map(move |d| root.join(d).join(e))
+        })
+        .find(|p| p.symlink_metadata().is_ok());
+    let engine_txt = match &engine {
+        Some(p) => format!("/{}", p.strip_prefix(root).unwrap_or(p).display()),
+        None => "NONE".to_string(),
+    };
+    if engine.is_none() {
+        eprintln!(
+            "warning: Freedoom: {what} has no Doom engine (/usr/games/chocolate-doom and the \
+             other spellings are all absent) -- `eclipse-freedoom` there exits 127"
+        );
+    }
     match (&one, &two) {
         (Some(a), Some(b)) => println!(
-            "Freedoom: {what} has both IWADs ({}, {}), bash={}",
+            "Freedoom: {what} has both IWADs ({}, {}), engine={engine_txt}, bash={}",
             a.strip_prefix(root).unwrap_or(a).display(),
             b.strip_prefix(root).unwrap_or(b).display(),
             if bash { "yes" } else { "NO" }
         ),
         _ => eprintln!(
             "warning: Freedoom: {what} is missing {} -- `eclipse-freedoom` there will \
-             say \"no IWAD found\" (bash={})",
+             say \"no IWAD found\" (engine={engine_txt}, bash={})",
             [
                 ("freedoom1.wad", one.is_some()),
                 ("freedoom2.wad", two.is_some())
@@ -2241,6 +2276,14 @@ mod tests {
                 "{p} is part of the shipped Freedoom stack"
             );
         }
+        // And the engine, which on the apt rootfs is NOT under usr/bin:
+        // Debian policy 9.1.1 puts game binaries in /usr/games. With this
+        // tree missing the live root carried 57 MiB of wads and no engine.
+        assert!(
+            LIVE_TREES.contains(&"usr/games"),
+            "usr/games holds chocolate-doom and the packaged freedoom{{1,2}} \
+             launchers on the apt rootfs"
+        );
     }
 
     /// The image viewer has to be in the shipped set and reach the live root,
@@ -2275,12 +2318,15 @@ mod tests {
         let full = base.join("full");
         let live = base.join("live");
         let _ = std::fs::remove_dir_all(&base);
-        for d in ["usr/bin", "usr/share/games/doom"] {
+        for d in ["usr/bin", "usr/games", "usr/share/games/doom"] {
             std::fs::create_dir_all(full.join(d)).unwrap();
         }
         // `copy_into_live` only runs when a compositor or Xorg is installed.
         std::fs::write(full.join("usr/bin/labwc"), b"#!/bin/sh\n").unwrap();
         std::fs::write(full.join("usr/bin/freedoom2"), b"#!/usr/bin/env bash\n").unwrap();
+        // The apt layout: engine and launcher under /usr/games.
+        std::fs::write(full.join("usr/games/chocolate-doom"), b"ELF").unwrap();
+        std::fs::write(full.join("usr/games/freedoom2"), b"#!/usr/bin/env bash\n").unwrap();
         std::fs::write(
             full.join("usr/share/games/doom/freedoom2.wad"),
             b"IWAD not really",
@@ -2295,6 +2341,11 @@ mod tests {
             "the wad must reach the live root, not just the launcher"
         );
         assert!(live.join("usr/bin/freedoom2").is_file());
+        assert!(
+            live.join("usr/games/chocolate-doom").is_file(),
+            "the engine lives in /usr/games on the apt rootfs and has to cross too"
+        );
+        assert!(live.join("usr/games/freedoom2").is_file());
         let _ = std::fs::remove_dir_all(&base);
     }
 

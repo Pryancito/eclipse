@@ -410,6 +410,18 @@ const BOOTSTRAP_PKGS: &[&str] = &[
 const MERGE_TREES: &[&str] = &[
     "usr/bin",
     "usr/sbin",
+    // Debian Policy 9.1.1 puts GAME binaries in `/usr/games`, not `/usr/bin`:
+    // `freedoom` ships /usr/games/freedoom{1,2} and `chocolate-doom` ships
+    // /usr/games/chocolate-doom (+ heretic/hexen/strife/setup/server). Alpine
+    // put all of them in /usr/bin, so while the rootfs came from apk this tree
+    // did not exist and nothing missed it. On the apt path its absence meant
+    // the WADS reached the image (they are under `usr/share`, which IS merged)
+    // and the ENGINE did not: `eclipse-freedoom` found an IWAD, then no engine,
+    // and exited 127 -- which is exactly how Freedoom "stopped working" when
+    // the rootfs switched to apt. See also LIVE_TREES in xorg.rs, which has to
+    // carry the same tree for the QEMU live root, and the `/usr/games` entries
+    // in the guest PATH.
+    "usr/games",
     "usr/lib",
     "usr/lib64",
     "usr/libexec",
@@ -1958,6 +1970,58 @@ mod tests {
             MERGE_TREES.contains(&"etc/alsa"),
             "etc/alsa must be in MERGE_TREES so /etc/alsa/conf.d reaches the rootfs"
         );
+    }
+
+    /// **The batch's bug, as a test.** Debian Policy 9.1.1 puts game binaries
+    /// in `/usr/games`: `freedoom` ships /usr/games/freedoom{1,2} and
+    /// `chocolate-doom` ships /usr/games/chocolate-doom. `usr/games` was in no
+    /// merge list, so on the apt rootfs the WADs arrived (they are under
+    /// `usr/share`, which is merged) and the engine did not -- Freedoom
+    /// "stopped working" the day the rootfs left apk, with the launcher
+    /// exiting 127 on a machine that had the game data sitting on disk.
+    #[test]
+    fn el_usr_games_de_debian_se_funde_en_la_rootfs() {
+        assert!(
+            MERGE_TREES.contains(&"usr/games"),
+            "sin usr/games en MERGE_TREES el motor de Doom no sale de la staging root"
+        );
+        for pkg in ["freedoom", "chocolate-doom"] {
+            assert!(
+                DESKTOP_UBUNTU.contains(&pkg),
+                "{pkg} sigue siendo parte de la pila de Freedoom"
+            );
+        }
+    }
+
+    /// And the merge itself, measured rather than asserted from the list: a
+    /// staging root shaped like the two `.deb`s (engine in `usr/games`, wads
+    /// in `usr/share/games/doom`) has to land BOTH halves in the rootfs.
+    #[test]
+    fn merge_stage_trae_el_motor_y_los_wads() {
+        let base = tempfile_dir("apt-merge-doom");
+        let stage = base.join("stage");
+        let root = base.join("root");
+        fs::create_dir_all(stage.join("usr/games")).unwrap();
+        fs::create_dir_all(stage.join("usr/share/games/doom")).unwrap();
+        fs::write(stage.join("usr/games/chocolate-doom"), b"ELF").unwrap();
+        fs::write(stage.join("usr/games/freedoom2"), b"#!/usr/bin/env bash\n").unwrap();
+        fs::write(stage.join("usr/share/games/doom/freedoom2.wad"), b"IWAD").unwrap();
+
+        merge_stage(&stage, &root);
+
+        assert!(
+            root.join("usr/games/chocolate-doom").is_file(),
+            "el motor no llego a la rootfs"
+        );
+        assert!(
+            root.join("usr/games/freedoom2").is_file(),
+            "el lanzador del paquete no llego a la rootfs"
+        );
+        assert!(
+            root.join("usr/share/games/doom/freedoom2.wad").is_file(),
+            "el wad no llego a la rootfs"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// Everything `startx` reaches for on its way to the server, which is NOT
