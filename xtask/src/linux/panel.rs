@@ -283,12 +283,18 @@ mod tests {
         assert!(lib.is_file());
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&lib).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::metadata(&lib).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         let svc = fs::read_to_string(tmp.join("svc/udrv-14c3-0616.service")).unwrap();
         assert!(svc.contains("type = respawn\n"), "{svc}");
         assert!(svc.contains("\nudriver = pci-14c3-0616@0\n"), "{svc}");
-        assert!(svc.contains(&format!("exec = {} pci-14c3-0616@0\n", lib.display())), "{svc}");
+        assert!(
+            svc.contains(&format!("exec = {} pci-14c3-0616@0\n", lib.display())),
+            "{svc}"
+        );
         let block = fs::read_to_string(tmp.join("claves/90-udrv-14c3-0616.claves")).unwrap();
         assert!(block.contains("[driver:udrv-14c3-0616]\n"), "{block}");
         assert!(block.contains("ids = 14c3:0616\n"), "{block}");
