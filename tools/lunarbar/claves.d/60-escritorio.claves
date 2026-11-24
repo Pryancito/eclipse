@@ -1,0 +1,90 @@
+# Eclipse OS: ajustes del escritorio que antes eran solo variables de
+# entorno. Van a /etc/eclipse/entorno con eclipse-entorno, que solo admite
+# estos nombres y reinicia el cliente que los lee (fondo o barra). Los demás
+# programas lo leen al abrirse; una variable puesta a mano sigue mandando.
+# Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:escritorio]
+es = Escritorio
+en = Desktop
+
+[fondo.animado]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_STATIC
+tipo    = si-no
+valores = 0 1
+defecto = 0
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_STATIC {}
+es      = Fondo animado
+en      = Animated wallpaper
+ayuda   = Quieto gasta menos CPU; el fondo se reinicia
+ayuda.en = Still uses less CPU; the wallpaper restarts
+
+[fondo.fps]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_FPS
+tipo    = elegir
+valores = 4 8 15 24 30
+defecto = 8
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_FPS {}
+es      = Imágenes por segundo del fondo
+en      = Wallpaper frame rate
+ayuda   = Más es más suave y gasta más CPU; el fondo se reinicia
+ayuda.en = More is smoother and uses more CPU; the wallpaper restarts
+
+[barra.alto]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_HEIGHT
+tipo    = elegir
+valores = auto:Automática 28 32 36 40 44 48 56 64
+valores.en = auto:Automatic
+defecto = auto
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_HEIGHT {}
+es      = Altura de la barra
+en      = Bar height
+ayuda   = Automática sigue al aspecto; la barra se reinicia
+ayuda.en = Automatic follows the look; the bar restarts
+
+[efectos]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = LUNAR_FX
+tipo    = si-no
+valores = on off
+defecto = on
+aplicar = /usr/local/bin/eclipse-entorno LUNAR_FX {}
+reabrir = si
+es      = Efectos de menús y paneles
+en      = Menu and panel effects
+ayuda   = Entrada suave y cristal; sin ellos, todo aparece de golpe
+ayuda.en = Soft entrance and glass; without them everything appears at once
+
+[texto]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = LUNAR_TEXT
+tipo    = si-no
+valores = vector bitmap
+defecto = vector
+aplicar = /usr/local/bin/eclipse-entorno LUNAR_TEXT {}
+reabrir = si
+es      = Texto suavizado
+en      = Smooth text
+ayuda   = Sin él, letra de mapa de bits, más nítida en pantallas pequeñas
+ayuda.en = Without it, a bitmap face, crisper on small screens
+
+[navegador.anuncios]
+grupo   = escritorio
+fichero = /etc/eclipse/entorno
+clave   = SILVERSURFER_ADBLOCK
+tipo    = si-no
+valores = 1 0
+defecto = 1
+aplicar = /usr/local/bin/eclipse-entorno SILVERSURFER_ADBLOCK {}
+es      = SilverSurfer bloquea anuncios
+en      = SilverSurfer blocks ads
+ayuda   = Vale para las ventanas que se abran después
+ayuda.en = Holds for the windows opened after it

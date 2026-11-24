@@ -58,6 +58,54 @@ pub(super) fn write_panel(rootfs: &Path) {
         &PROJECT_DIR.join("tools/lunarbar/claves.d"),
         &rootfs.join(CLAVES_DIR),
     );
+    write_entorno(&localbin);
+}
+
+/// `eclipse-entorno NAME VALUE`: writes one setting into
+/// `/etc/eclipse/entorno` (lunartext::entorno reads it) and restarts the
+/// client that read it at start. Only the names below are taken, and only
+/// a value made of letters, digits and `_.:+@,-` (the panel's own rule):
+/// whatever reads the file reads plain words. `auto` removes the line, so
+/// the program's own default holds again. `ECLIPSE_ENTORNO`,
+/// `ECLIPSE_INIT_CTL` and `ECLIPSE_INIT_PID` are for the tests.
+fn write_entorno(localbin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = localbin.join("eclipse-entorno");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: one desktop setting into /etc/eclipse/entorno.\n\
+          # Written by xtask/src/linux/panel.rs; read by lunartext::entorno.\n\
+          F=\"${ECLIPSE_ENTORNO:-/etc/eclipse/entorno}\"\n\
+          CTL=\"${ECLIPSE_INIT_CTL:-/run/eclipse-init/ctl}\"\n\
+          name=\"$1\"; value=\"$2\"\n\
+          case \"$name\" in\n\
+          \x20 LUNARBG_FPS|LUNARBG_STATIC) restart=lunarbg ;;\n\
+          \x20 LUNARBAR_HEIGHT) restart=lunarbar ;;\n\
+          \x20 LUNAR_FX|LUNAR_TEXT) restart='lunarbar lunarbg' ;;\n\
+          \x20 SILVERSURFER_ADBLOCK) restart= ;;\n\
+          \x20 *) echo \"eclipse-entorno: $name no es un ajuste del entorno\" >&2; exit 2 ;;\n\
+          esac\n\
+          case \"$value\" in\n\
+          \x20 ''|*[!A-Za-z0-9_.:+@,-]*) echo \"eclipse-entorno: valor no admitido: $value\" >&2; exit 2 ;;\n\
+          esac\n\
+          [ ${#value} -le 64 ] || { echo 'eclipse-entorno: valor demasiado largo' >&2; exit 2; }\n\
+          mkdir -p \"$(dirname \"$F\")\" || exit 1\n\
+          tmp=\"$F.$$\"\n\
+          { grep -v \"^$name=\" \"$F\" 2>/dev/null || true\n\
+          \x20 [ \"$value\" = auto ] || echo \"$name=$value\"\n\
+          } > \"$tmp\" && mv \"$tmp\" \"$F\" || { rm -f \"$tmp\"; exit 1; }\n\
+          # eclipse-init restarts a respawn service asked for in its ctl\n\
+          # directory (tools/eclipse-init/src/control.rs). Without init, or\n\
+          # with the service not running, the next start reads the file.\n\
+          if [ -n \"$restart\" ] && [ -d \"$CTL\" ]; then\n\
+          \x20 for s in $restart; do : > \"$CTL/restart.$s\"; done\n\
+          \x20 kill -HUP \"${ECLIPSE_INIT_PID:-1}\" 2>/dev/null || true\n\
+          fi\n\
+          exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Every `*.claves` in `from` into `to`, and nothing else: a block that was
@@ -114,6 +162,48 @@ mod tests {
     }
 
     #[test]
+    fn eclipse_entorno_writes_one_line_restarts_its_client_and_refuses_the_rest() {
+        let tmp = std::env::temp_dir().join(format!("xtask-entorno-{}", std::process::id()));
+        let bin = tmp.join("bin");
+        let ctl = tmp.join("ctl");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&ctl).unwrap();
+        write_entorno(&bin);
+        let file = tmp.join("etc/entorno");
+        let run = |name: &str, value: &str| {
+            std::process::Command::new("/bin/sh")
+                .arg(bin.join("eclipse-entorno"))
+                .args([name, value])
+                .env("ECLIPSE_ENTORNO", &file)
+                .env("ECLIPSE_INIT_CTL", &ctl)
+                // No such process: the HUP goes nowhere.
+                .env("ECLIPSE_INIT_PID", "2147483646")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run("LUNARBAR_HEIGHT", "44"));
+        assert!(run("LUNAR_FX", "off"));
+        assert!(run("LUNARBAR_HEIGHT", "48"));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "LUNAR_FX=off\nLUNARBAR_HEIGHT=48\n"
+        );
+        assert!(ctl.join("restart.lunarbar").is_file());
+        assert!(ctl.join("restart.lunarbg").is_file());
+        // `auto` hands the setting back to the program.
+        assert!(run("LUNARBAR_HEIGHT", "auto"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "LUNAR_FX=off\n");
+        // Fail-closed: another name, or a value that is not a plain word.
+        assert!(!run("LD_PRELOAD", "/tmp/x.so"));
+        assert!(!run("LUNAR_FX", "off;reboot"));
+        assert!(!run("LUNAR_FX", "$(id)"));
+        assert!(!run("LUNAR_FX", ""));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "LUNAR_FX=off\n");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn every_command_a_block_runs_is_one_the_image_has() {
         // The blocks name scripts by absolute path; each must be one xtask
         // writes, or the row would fail the day it is used.
@@ -126,6 +216,7 @@ mod tests {
             "desktop/locale.rs",
             "network.rs",
             "monitor.rs",
+            "panel.rs",
         ] {
             sources += &fs::read_to_string(linux.join(f)).unwrap();
         }

@@ -4,7 +4,8 @@
 //! - El motor cancela la carga vía `WebResourceLoad::intercept(...).cancel()`.
 //! - Opcional: UserScript que inyecta CSS `display:none` en selectores comunes.
 //!
-//! Desactivar con `SILVERSURFER_ADBLOCK=0`.
+//! Desactivar con `SILVERSURFER_ADBLOCK=0` (o el panel de control, que lo
+//! escribe en `/etc/eclipse/entorno`).
 
 use url::Url;
 
@@ -55,14 +56,17 @@ div[id^=\"div-gpt-ad\"],div[class*=\"ad-container\"],div[class*=\"ad_container\"
 div[class*=\"ad-banner\"],div[class*=\"adsbox\"],aside[class*=\"advert\"],\
 ins.adsbygoogle,[data-ad-client],[aria-label=\"Ads\"]{display:none!important;max-height:0!important;overflow:hidden!important;}";
 
+/// Leído una vez por proceso (entorno o `/etc/eclipse/entorno`): se
+/// pregunta en cada petición.
 pub fn enabled() -> bool {
-    match std::env::var("SILVERSURFER_ADBLOCK") {
-        Ok(v) => {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match lunartext::entorno::var("SILVERSURFER_ADBLOCK") {
+        Some(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
         }
-        Err(_) => true,
-    }
+        None => true,
+    })
 }
 
 /// `true` si la URL debe cancelarse.

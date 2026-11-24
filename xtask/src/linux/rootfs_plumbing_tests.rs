@@ -2159,7 +2159,7 @@ fn the_wallpaper_keeps_the_aspect_and_the_frame_rate_it_defaults_to() {
         "the default aspect changed"
     );
     assert!(
-        body.contains("--fps \"${LUNARBG_FPS:-8}\""),
+        body.contains("--fps \"${LUNARBG_FPS:-${fps:-8}}\""),
         "the default frame rate changed"
     );
 }

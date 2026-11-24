@@ -445,6 +445,14 @@ holds the value alone (`/etc/eclipse/desktop`); `montar = /boot/efi` mounts
 the ESP as `/etc/fstab` says (`eclipse-fs-mounts`) before touching
 `rboot.conf`; `reinicio = si` marks what is read at boot.
 
+The desktop settings that used to be environment variables only
+(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`,
+`SILVERSURFER_ADBLOCK`) live in `/etc/eclipse/entorno`, `NAME=value` lines.
+`eclipse-entorno NAME VALUE` writes them: it takes those names and plain
+words only, removes the line for `auto`, and asks eclipse-init to restart
+the wallpaper or the bar. Programs read the file when they start
+(`lunartext::entorno`); a variable set in the environment still wins.
+
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH
 [group]` draws it without a compositor.

@@ -22,11 +22,17 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "monitor",
             "seguridad",
             "sesion",
-            "resolucion"
+            "resolucion",
+            "fondo.animado",
+            "fondo.fps",
+            "barra.alto",
+            "efectos",
+            "texto",
+            "navegador.anuncios"
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));
@@ -226,4 +232,29 @@ fn the_boot_blocks_say_they_are_read_at_boot() {
     let r = c.claves.iter().find(|k| k.id == "resolucion").unwrap();
     assert_eq!(r.montar.as_deref(), Some(Path::new("/boot/efi")));
     assert!(r.admite("1920x1080") && r.admite("auto") && !r.admite("1x1"));
+}
+
+#[test]
+fn the_desktop_blocks_go_through_eclipse_entorno_and_read_its_file() {
+    let c = shipped();
+    let g = c.grupos.iter().position(|g| g.id == "escritorio").unwrap();
+    let desk = c.del_grupo(g);
+    assert_eq!(desk.len(), 6);
+    for &i in &desk {
+        let k = &c.claves[i];
+        let var = k.clave.as_deref().unwrap();
+        assert_eq!(k.fichero.as_deref(), Some(Path::new("/etc/eclipse/entorno")), "{}", k.id);
+        assert_eq!(
+            k.aplicar.as_deref(),
+            Some(format!("/usr/local/bin/eclipse-entorno {var} {{}}").as_str()),
+            "{}",
+            k.id
+        );
+        // What the panel reads back is what the program reads: the first line.
+        let d = k.defecto.as_deref().unwrap();
+        let text = pon_clave("# x\n", var, d);
+        assert_eq!(lunartext::entorno::de_texto(&text, var).as_deref(), Some(d));
+    }
+    let alto = c.claves.iter().find(|k| k.id == "barra.alto").unwrap();
+    assert!(alto.admite("auto") && alto.admite("44") && !alto.admite("100"));
 }
