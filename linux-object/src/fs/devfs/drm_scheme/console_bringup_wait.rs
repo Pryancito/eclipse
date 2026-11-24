@@ -1,5 +1,6 @@
-//! Hold a GPU client's `GEM_NEW`/`VM_BIND`/`EXEC` while the console GPU's
-//! deferred bring-up runs, instead of answering it `ENODEV`.
+//! Hold a GPU client's `GEM_NEW`/`VM_BIND`/`EXEC`/`CHANNEL_ALLOC` while the
+//! console GPU's deferred bring-up runs, instead of answering it `ENODEV` (or,
+//! for `CHANNEL_ALLOC`, a discovery channel with no ring behind it).
 //!
 //! Linux has no equivalent of this wait because it has no equivalent of the
 //! race: `nouveau_drm_device_init` runs in `probe`, so by the time anything
@@ -28,6 +29,14 @@
 //! and its gate is shut until scanout is parked, so the first call that truly
 //! needs the RM is also the first one that can fail -- and it is the one NVK
 //! makes its device out of.
+//!
+//! `CHANNEL_ALLOC` was left out at first, on the grounds that a cold card
+//! answers it correctly. It answers it with a discovery channel, and NVK keeps
+//! that id as its queue: `glmark2-drm` run from the text console at 44.7 s,
+//! before the 45 s bring-up, got `channel=1 DISCOVERY ONLY`, had its `GEM_NEW`
+//! parked here until the card was up at 52 s, and then its first `EXEC` on
+//! channel 1 was `ENODEV` -- `VK_ERROR_DEVICE_LOST`. Parking was right; it
+//! started one call too late. See `needs_rm_attached`.
 //!
 //! So: park the call. An async pre-wait ahead of the synchronous arm, the same
 //! split as `wait_vblank_sleep`, `syncobj_wait_sleep`, `atomic_in_fence_sleep`
@@ -97,7 +106,8 @@ fn cold_console_card(dev: &DrmDev) -> Option<String> {
 
 impl DrmDev {
     /// Wait for the console GPU's bring-up before the sync arm answers
-    /// `ENODEV` to a `GEM_NEW`, `VM_BIND` or `EXEC` on it.
+    /// `ENODEV` to a `GEM_NEW`, `VM_BIND` or `EXEC` on it, or a discovery
+    /// channel to a `CHANNEL_ALLOC`.
     ///
     /// Called from `sys_ioctl` (async) before the request reaches
     /// `io_control` (sync), which then finds the card attached and serves the
