@@ -37,12 +37,17 @@ use crate::MMUFlags;
 
 /// The window: PML4 slot `0x1fd`, between the stack window (`0x1fc`) and the
 /// kernel image (`0x1fe`).
-pub const VMALLOC_LO: usize = 0xffff_fe80_0000_0000;
+///
+/// Declared in [`crate::kaddr`], not here, because the fault path has to know
+/// it too: a coroutine stack is a ~2.6 MiB heap block, so it is served from
+/// this window whenever `vmap_stack` declines, and a probe that does not know
+/// the window answers "not a kernel stack" about a live stack pointer.
+pub const VMALLOC_LO: usize = crate::kaddr::VMALLOC_LO as usize;
 /// Bytes of window per block: the largest block served from here.
-pub const SLOT: usize = 64 * 1024 * 1024;
+pub const SLOT: usize = crate::kaddr::VMALLOC_SLOT as usize;
 /// Blocks in the window: 64 GiB of address space.
-pub const SLOTS: usize = 1024;
-pub const VMALLOC_HI: usize = VMALLOC_LO + SLOT * SLOTS;
+pub const SLOTS: usize = crate::kaddr::VMALLOC_SLOTS as usize;
+pub const VMALLOC_HI: usize = crate::kaddr::VMALLOC_HI as usize;
 
 const PAGE: usize = 4096;
 const SLOT_PAGES: usize = SLOT / PAGE;

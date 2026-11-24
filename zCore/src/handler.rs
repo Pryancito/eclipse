@@ -1160,7 +1160,25 @@ fn write_stop_screen_registers(
     let execute = access_flags.contains(MMUFlags::EXECUTE);
     let now_ns = kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now());
     let mask = base_candidate_mask(&gprs, fault_vaddr as u64, execute);
-    if mask == 0 {
+    if mask == 0 && execute {
+        // The serial twin has said this since #1794 and the screen did not:
+        // for a branch no register holds, "an index register or a larger
+        // displacement formed it" is the one reading that cannot apply. A
+        // branch target is not an effective address with a displacement; it
+        // came out of memory, which for `vaddr=0` means a zeroed function
+        // pointer, vtable slot or return slot. The capture of 2026-11-24 put
+        // that sentence on a photograph of a `rip=0x0` fault.
+        let _ = write!(
+            b,
+            "\nno register holds the branch target, so it came from memory: a ret, \
+             or a call/jmp through a pointer in memory{}",
+            if fault_vaddr == 0 {
+                " — at vaddr=0, that pointer was zero"
+            } else {
+                ""
+            },
+        );
+    } else if mask == 0 {
         let _ = write!(
             b,
             "\nno register holds the faulting address or a base within {:#x} of it: \
@@ -1568,8 +1586,15 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     //    fixed offsets from it (the stack scan advances by 8 bytes at a time,
     //    at most 4 KiB total) -- addresses that stay local to a known-live
     //    pointer regardless of how wide this bound is.
-    // `kaddr::is_kernel_addr` is that bound, written once.
-    let plausible = kernel_hal::kaddr::is_kernel_addr;
+    // `kaddr::is_kernel_stack_addr` is that bound, written once: the kernel
+    // window and every other window a stack can live in. `is_kernel_addr`
+    // alone is the kernel window only, and a coroutine stack is a ~2.6 MiB
+    // heap block, which the heap serves out of the large-block window
+    // (`kaddr::VMALLOC_LO`) whenever `vmap_stack` has declined -- so on the
+    // capture of 2026-11-24 (`rsp=0xfffffe803827d218`) the walk below stopped
+    // on its first iteration and the report named nobody. Every dereference
+    // is gated on `mapped` regardless.
+    let plausible = kernel_hal::kaddr::is_kernel_stack_addr;
     // The frame-pointer walk runs FIRST, and unconditionally.
     //
     // It used to be skipped whenever `[rsp0]` looked like smash residue -- which
@@ -1621,7 +1646,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     // here. See the top-of-function comment for why this needed widening at
     // all: two real captures showed a live rsp being rejected by the
     // original 256 MiB bound.
-    let plausible_sp = kernel_hal::kaddr::is_kernel_addr;
+    let plausible_sp = kernel_hal::kaddr::is_kernel_stack_addr;
     // [diag] The single most reliable value here, but its interpretation
     // depends on the fault type:
     //   EXECUTE fault (indirect `call` through a null/corrupted fn-ptr):
