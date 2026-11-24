@@ -273,8 +273,21 @@ fn a_fence_poll_keeps_yielding_for_its_window_then_backs_off_on_the_clock() {
     }
     // The minimum yields still hold on a clock that reads late.
     assert_eq!(fence_poll_step_at(0, 1_000_000), PollStep::Yield);
-    // Past the window: sleep about as long as already waited, inside the
-    // floor..cap band, and never less than the sleep before.
+    // Past the window: a fence is seen at most a quarter (or one floor)
+    // after it lands. A fence at 510 us was seen at ~1000 us when the poll
+    // slept as long as it had waited.
+    for waited in [FENCE_POLL_YIELD_WINDOW_US, 510, 800, 2_000, 4_000, 50_000] {
+        let PollStep::Sleep { us } = fence_poll_step_at(FENCE_POLL_YIELDS, waited) else {
+            panic!("still yielding at {} us", waited);
+        };
+        assert!(
+            us <= (waited / 4).max(FENCE_POLL_FLOOR_US),
+            "{} us after {} us: overshoots a fence by more than a quarter",
+            us,
+            waited
+        );
+    }
+    // Inside the floor..cap band, and never less than the sleep before.
     let mut prev = 0;
     let mut waited = FENCE_POLL_YIELD_WINDOW_US;
     let mut wakes = 0;

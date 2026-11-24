@@ -887,17 +887,31 @@ pub fn fence_poll_step(probes: u32) -> PollStep {
 /// takes over from there.
 pub const FENCE_POLL_YIELD_WINDOW_US: u64 = 500;
 
+/// Past the yield window a fence poll sleeps this fraction of what it has
+/// already waited (1/4), so a fence is seen at most 25% (or one
+/// [`FENCE_POLL_FLOOR_US`]) after it lands.
+///
+/// It slept as long as it had already waited, a doubling: a fence landing
+/// at 510 us was probed again at ~1000 us, so any frame whose GPU work ran
+/// a little past the window cost about twice its GPU time. In `glmark2-drm`
+/// that is the scenes with real GPU work: buffer (0.83-1.02 ms), terrain
+/// (0.94 ms) and refract (0.73 ms) sat right at the 1 ms that the 500 us
+/// sleep after the 500 us window gives (2026-11-24). A quarter still backs
+/// off geometrically (x1.25 per probe) to [`FENCE_POLL_CAP_US`], so a hung
+/// fence costs about as many wakeups as before.
+pub const FENCE_POLL_SLEEP_DIVISOR: u64 = 4;
+
 /// [`fence_poll_step`] for a wait that began `waited_us` ago: yields while
 /// the wait is younger than [`FENCE_POLL_YIELD_WINDOW_US`] (and for at least
-/// [`FENCE_POLL_YIELDS`] probes), then sleeps about as long as it has
-/// already waited, between [`FENCE_POLL_FLOOR_US`] and [`FENCE_POLL_CAP_US`]
-/// -- the same doubling the probe count gives, measured on the clock.
+/// [`FENCE_POLL_YIELDS`] probes), then sleeps a quarter of what it has
+/// already waited ([`FENCE_POLL_SLEEP_DIVISOR`]), between
+/// [`FENCE_POLL_FLOOR_US`] and [`FENCE_POLL_CAP_US`].
 pub fn fence_poll_step_at(probes: u32, waited_us: u64) -> PollStep {
     if probes < FENCE_POLL_YIELDS || waited_us < FENCE_POLL_YIELD_WINDOW_US {
         return PollStep::Yield;
     }
     PollStep::Sleep {
-        us: waited_us.clamp(FENCE_POLL_FLOOR_US, FENCE_POLL_CAP_US),
+        us: (waited_us / FENCE_POLL_SLEEP_DIVISOR).clamp(FENCE_POLL_FLOOR_US, FENCE_POLL_CAP_US),
     }
 }
 
