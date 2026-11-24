@@ -238,10 +238,57 @@ pub fn in_grown_heap(a: u64) -> bool {
     probe(a)
 }
 
-/// Whether `a` may be on a kernel stack: the kernel window, or a region the
-/// heap grew into (where coroutine stacks are carved from too).
+/// The window large kernel-heap blocks are mapped into from scattered frames
+/// ([`crate::vmalloc`] on the bare build): PML4 slot `0x1fd` on x86_64, above
+/// the stack window (`0x1fc`) and below the image (`0x1fe`).
+///
+/// A coroutine stack is a heap block of `ALLOC_SIZE` (~2.6 MiB), and the heap
+/// sends every block the buddy would make 1 MiB or larger here instead. So
+/// whenever `vmap_stack` declines (its slot already mapped, no frame to build
+/// the window, not on the kernel's own table — all of which leave stacks
+/// "in the heap"), **every** coroutine stack lives in this window, and every
+/// fault-path probe that asked [`is_kernel_stack_addr`] about one said no.
+///
+/// That is exactly the capture of 2026-11-24 off real hardware:
+///
+/// ```text
+/// KERNEL NULL-RANGE PAGE FAULT cpu=2 vaddr=0x0 flags=EXECUTE
+/// rip=0x0
+/// no return address found on the faulting stack
+/// rsp=0xfffffe803827d218
+/// ```
+///
+/// `rsp` is 898 MiB into this window: slot 14, `0x27d218` inside it, which is
+/// 11.7 KiB below the top of the usable region of a stack whose block starts
+/// at the slot base. The call that jumped to zero pushed its return address at
+/// `[rsp]`, and both the walker and the null-call containment declined to read
+/// it — so the one line that names the caller was never printed, and a fault
+/// that could have been contained halted the machine.
+#[cfg(target_arch = "x86_64")]
+pub const VMALLOC_LO: u64 = 0xffff_fe80_0000_0000;
+#[cfg(not(target_arch = "x86_64"))]
+pub const VMALLOC_LO: u64 = 0;
+/// Bytes of window per block: the largest block served from there.
+pub const VMALLOC_SLOT: u64 = 64 * 1024 * 1024;
+/// Blocks in the window: 64 GiB of address space on x86_64, and none
+/// elsewhere, where the window is never built.
+#[cfg(target_arch = "x86_64")]
+pub const VMALLOC_SLOTS: u64 = 1024;
+#[cfg(not(target_arch = "x86_64"))]
+pub const VMALLOC_SLOTS: u64 = 0;
+pub const VMALLOC_HI: u64 = VMALLOC_LO + VMALLOC_SLOT * VMALLOC_SLOTS;
+
+/// Whether `a` is inside the large-block window ([`VMALLOC_LO`]), mapped or
+/// not. Always `false` where the window does not exist.
+pub fn in_vmalloc(a: u64) -> bool {
+    VMALLOC_SLOTS != 0 && (VMALLOC_LO..VMALLOC_HI).contains(&a)
+}
+
+/// Whether `a` may be on a kernel stack: the kernel window, a region the heap
+/// grew into (where coroutine stacks are carved from too), the stack window,
+/// or the large-block window ([`VMALLOC_LO`]) a stack falls back to.
 pub fn is_kernel_stack_addr(a: u64) -> bool {
-    is_kernel_addr(a) || in_grown_heap(a) || in_vmap_stacks(a)
+    is_kernel_addr(a) || in_grown_heap(a) || in_vmap_stacks(a) || in_vmalloc(a)
 }
 
 /// The window coroutine stacks are mapped into from scattered frames
@@ -558,7 +605,8 @@ impl WordShape {
             WordShape::TruncatedText => ".text with its top half gone (soft smash)",
             WordShape::KernelText => "kernel .text",
             WordShape::KernelNonText => {
-                "kernel-half but not .text (physmap, heap or stack residue)"
+                "kernel-half but not .text (physmap, heap, stack or large-block \
+                 window residue)"
             }
             WordShape::NonCanonical => "not a canonical address",
             WordShape::UserHalf => "a user-half address in a kernel code slot",
@@ -598,11 +646,20 @@ pub fn classify_word(text: (u64, u64), a: u64) -> WordShape {
     if is_kernel_addr(a) {
         return WordShape::KernelNonText;
     }
-    // Canonical: the top seventeen bits all agree. A kernel-half address that
-    // is outside this kernel's own window has already been answered above, so
-    // what is left here is either nonsense or userspace.
+    // Canonical: the top seventeen bits all agree.
     let top = a >> 47;
-    if top != 0 && top != 0x1_ffff {
+    if top == 0x1_ffff {
+        // The kernel half, outside this kernel's own `KERNEL_LO..KERNEL_HI`
+        // window. It used to fall through to `UserHalf`, which is the one
+        // reading it cannot have: the user half is the *other* sign. The
+        // kernel maps itself into three more windows than that pair bounds --
+        // the stacks (`VMAP_STACK_LO`), the large blocks (`VMALLOC_LO`) and
+        // the regions the heap grew into -- and a word off any of them was
+        // reported as "a user-half address in a kernel code slot", which sends
+        // the reader hunting a userspace pointer that was never there.
+        return WordShape::KernelNonText;
+    }
+    if top != 0 {
         return WordShape::NonCanonical;
     }
     WordShape::UserHalf
@@ -905,6 +962,64 @@ mod tests {
         assert_eq!((VMAP_STACK_LO >> 39) & 0x1ff, 0x1fc);
         assert_eq!((VMAP_STACK_HI - 1) >> 39, VMAP_STACK_LO >> 39);
         assert!(!is_kernel_addr(VMAP_STACK_LO) && !is_kernel_addr(VMAP_STACK_HI - 1));
+    }
+
+    /// The capture of 2026-11-24 off real hardware, by its own numbers.
+    ///
+    /// `rsp=0xfffffe803827d218` with `vaddr=0x0 flags=EXECUTE`, and the screen
+    /// said "no return address found on the faulting stack" — because this
+    /// address is in neither the kernel window nor the stack window, so every
+    /// probe declined the live stack pointer it was handed. The `call` that
+    /// jumped to zero had pushed its return address at `[rsp]`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_hardware_rsp_of_2026_11_24_is_a_stack() {
+        const RSP: u64 = 0xffff_fe80_3827_d218;
+        assert!(in_vmalloc(RSP));
+        assert!(is_kernel_stack_addr(RSP), "the walker has to read it");
+        assert!(is_kernel_stack_qword(RSP), "and it is eight-aligned");
+        // Slot 14, 0x27d218 into it: the usable region of a ~2.6 MiB stack
+        // block runs [0x80000, 0x280000) from the slot base, so this is
+        // 11.7 KiB below its top. A stack, not a stray large block.
+        assert_eq!((RSP - VMALLOC_LO) / VMALLOC_SLOT, 14);
+        let off = (RSP - VMALLOC_LO) % VMALLOC_SLOT;
+        assert!((0x8_0000..0x28_0000).contains(&off));
+        // And the register file stops calling it userspace.
+        assert_eq!(
+            classify_word((KERNEL_LO, KERNEL_LO + 0x100_0000), RSP),
+            WordShape::KernelNonText,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_large_block_window_is_its_own_entry_and_bounded() {
+        // PML4 slot 0x1fd: above the stacks (0x1fc), below the image (0x1fe).
+        assert_eq!((VMALLOC_LO >> 39) & 0x1ff, 0x1fd);
+        assert_eq!((VMALLOC_HI - 1) >> 39, VMALLOC_LO >> 39);
+        assert!(!in_vmalloc(VMALLOC_LO - 8) && !in_vmalloc(VMALLOC_HI));
+        assert!(in_vmalloc(VMALLOC_LO) && in_vmalloc(VMALLOC_HI - 1));
+        // The two windows do not touch, and neither is the kernel window.
+        assert!(VMAP_STACK_HI <= VMALLOC_LO);
+        assert!(!is_kernel_addr(VMALLOC_LO) && !is_kernel_addr(VMALLOC_HI - 1));
+        assert!(!in_vmap_stacks(VMALLOC_LO));
+    }
+
+    /// A canonical kernel-half word is never "a user-half address".
+    #[test]
+    fn a_kernel_half_word_outside_the_window_is_not_userspace() {
+        const TEXT: (u64, u64) = (KERNEL_LO, KERNEL_LO + 0x100_0000);
+        // The grown-heap window the heap maps itself into.
+        assert_eq!(
+            classify_word(TEXT, 0xffff_8000_06e7_d2e8),
+            WordShape::KernelNonText,
+        );
+        // And the user half still reads as the user half.
+        assert_eq!(classify_word(TEXT, 0x7fff_ffff_f000), WordShape::UserHalf);
+        assert_eq!(
+            classify_word(TEXT, 0x0001_0000_0000_0000),
+            WordShape::NonCanonical
+        );
     }
 
     // ── the residue predicates ──────────────────────────────────────────────
