@@ -288,6 +288,7 @@ fn a_forked_child_sees_its_parent_hole() {
             exit_stage: Default::default(),
             exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
+            abi: Default::default(),
             _slot: crate::thread::ProcSlot::take(),
             futexes: Default::default(),
             itimers: Default::default(),

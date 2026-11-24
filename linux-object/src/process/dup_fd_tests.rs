@@ -86,6 +86,7 @@ pub(super) fn a_process() -> LinuxProcess {
         exit_stage: Default::default(),
         exited_leader: Default::default(),
         perf: crate::perf::ProcPerf::new(),
+        abi: Default::default(),
         _slot: crate::thread::ProcSlot::take(),
         futexes: Default::default(),
         itimers: Default::default(),

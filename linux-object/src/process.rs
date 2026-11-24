@@ -652,6 +652,7 @@ impl NewChild for Process {
             exit_stage: Default::default(),
             exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
+            abi: abi::AbiCell::new(linux_parent.abi()),
             _slot: crate::thread::ProcSlot::take(),
             futexes: Default::default(),
             itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
@@ -1234,6 +1235,9 @@ pub struct LinuxProcess {
     exited_leader: exited_leader::ExitedLeader,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
+    /// System-call personality, out of `inner`: see [`abi::AbiCell`]. Set by
+    /// the loader from the ELF header, inherited across `fork`.
+    abi: abi::AbiCell,
     /// Counted against `threads-max` until reaped ([`crate::thread::may_add_task`]).
     _slot: crate::thread::ProcSlot,
     /// The process's futex objects, keyed by the address of their word.
@@ -1498,9 +1502,6 @@ struct LinuxProcessInner {
     credentials: Credentials,
     /// What a path walk asks each directory, made for these credentials.
     searches: crate::fs::Searches,
-    /// System-call personality (Linux vs FreeBSD). Set by the loader from the
-    /// ELF header and inherited across `fork`; re-evaluated at `execve`.
-    abi: Abi,
 }
 
 #[derive(Clone)]
@@ -1863,6 +1864,7 @@ impl LinuxProcess {
             exit_stage: Default::default(),
             exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
+            abi: Default::default(),
             _slot: crate::thread::ProcSlot::take(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -3931,13 +3933,13 @@ impl LinuxProcess {
 
     /// The process's system-call personality (Linux or FreeBSD).
     pub fn abi(&self) -> Abi {
-        self.inner.lock().abi
+        self.abi.get()
     }
 
     /// Set the system-call personality. The loader calls this after detecting
     /// the ABI of the ELF it just mapped (at initial load and at `execve`).
     pub fn set_abi(&self, abi: Abi) {
-        self.inner.lock().abi = abi;
+        self.abi.set(abi);
     }
 
     /// Set argv for `/proc/<pid>/cmdline`.
@@ -4661,7 +4663,6 @@ impl LinuxProcessInner {
             sugid: self.sugid,
             dumpable: self.dumpable,
             personality: self.personality,
-            abi: self.abi,
             thp_disable: self.thp_disable,
             keep_caps: self.keep_caps,
             // The heap. `fork` copies the address space, so the heap is there
