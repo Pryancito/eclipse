@@ -1376,6 +1376,7 @@ fn main() {
 
 /// The colours of one look, the same shape `lunarfile` uses so the picker and
 /// the file chooser are visibly the same desktop.
+#[derive(Clone)]
 struct Palette {
     scrim: Rgb,
     scrim_a: f32,
@@ -1457,7 +1458,10 @@ fn palette(look: Look) -> &'static Palette {
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Win11 => &PAL_WIN11,
-        Look::Tecno => &PAL_TECNO,
+        Look::Tecno => {
+            static T: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+            lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
+        }
         Look::Abyss => &PAL_ABYSS,
     }
 }

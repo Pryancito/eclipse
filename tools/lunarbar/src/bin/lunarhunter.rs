@@ -109,6 +109,7 @@ mod net_tab;
 
 /// The colours of one look, the same shape `lunarfile` uses so the two read as
 /// the same desktop.
+#[derive(Clone)]
 struct Palette {
     bg: Rgb,
     rail: Rgb,
@@ -206,7 +207,10 @@ fn palette(look: Look) -> &'static Palette {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
-        Look::Tecno => &PAL_TECNO,
+        Look::Tecno => {
+            static T: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+            lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
+        }
         Look::Abyss => &PAL_ABYSS,
     }
 }
@@ -1458,14 +1462,14 @@ impl Paint<'_> {
     fn stat(&mut self, x: i32, y: i32, w: i32, caption: &str, value: &str, c: Rgb) {
         let p = self.p;
         self.cv.round_rect(x, y, w, 58, 8, p.field);
-        let caption = if std::ptr::eq(p, &PAL_TECNO) { caption.to_uppercase() } else { caption.to_string() };
+        let caption = if std::ptr::eq(p, palette(Look::Tecno)) { caption.to_uppercase() } else { caption.to_string() };
         self.text(&fit(&caption, w - 20), x + 10, y + 8, p.dim);
         self.bold(&fit(value, w - 20), x + 10, y + 32, c);
     }
 
     fn section(&mut self, x: i32, y: i32, w: i32, title: &str) {
         let p = self.p;
-        if std::ptr::eq(p, &PAL_TECNO) {
+        if std::ptr::eq(p, palette(Look::Tecno)) {
             self.bold(&title.to_uppercase(), x, y, p.dim);
         } else {
             self.bold(title, x, y, p.text);
@@ -1534,7 +1538,7 @@ fn stance(st: &State, r: &Report) -> (String, Rgb) {
 fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
     let p = st.pal;
     // Tecno: mockup A's straight plates and caps headings.
-    let hud = std::ptr::eq(p, &PAL_TECNO);
+    let hud = std::ptr::eq(p, palette(Look::Tecno));
     cv.set_square(hud);
     cv.fill_rect_a(0, 0, w, h, p.bg, 1.0);
     let mut g = Paint {

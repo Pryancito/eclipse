@@ -452,6 +452,11 @@ The desktop settings that used to be environment variables only
 words only, removes the line for `auto`, and asks eclipse-init to restart
 the wallpaper or the bar. Programs read the file when they start
 (`lunartext::entorno`); a variable set in the environment still wins.
+`LUNAR_ACCENT` lives there too (`cian`, `verde`, `violeta`, `rojo`: the
+accent of the `tecno` look, replacing the cyan of the bar, menus, panel and
+lunar tools; the gold brackets do not change), and so does `LUNAR_CLOCK`
+(`24` or `12`, the clock of the bar and the lock screen). labwc's borders,
+Abyss and the wallpaper keep their colour for now.
 
 `arranque = KEY` edits one option inside the kernel command line that `clave`
 holds (`rboot.conf`'s `cmdline=`, whose last line is the one rboot reads): it
