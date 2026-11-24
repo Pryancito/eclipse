@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     any::Any,
-    sync::atomic::{AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 use futures::channel::oneshot::{self, Receiver, Sender};
@@ -134,6 +134,19 @@ pub struct Process {
     /// hint `terminate` invents `Exited(0)`. Written before the thread leaves
     /// the list; consumed when the list empties.
     exit_code_hint: AtomicI64,
+    /// Whether `inner.status` has reached `Exited`, readable without `inner`.
+    ///
+    /// The run loop of every thread asks "has my process exited?" before and
+    /// after each trip to user mode (`thread_should_stop`), so through
+    /// [`Process::exit_code`] every syscall of every thread took this
+    /// process's big IRQ-off spin lock two or three times. One thread does
+    /// not notice; twenty threads of one process making syscalls at once
+    /// queue on that one lock, and eclipse-bench's `getpid/s x20` came out
+    /// LOWER than `x1` on a 20-CPU machine (0.95 against 2.52 Mops/s, Linux
+    /// 7.0 on the same machine 123 Mops/s). `Exited` is terminal, so a flag
+    /// set under the lock, at each place the status becomes `Exited`, is the
+    /// whole answer: [`Process::has_exited`].
+    exited: AtomicBool,
     /// The process's futex objects, keyed by the address of their word.
     ///
     /// Outside `inner` ON PURPOSE, for the same reason as `LinuxProcess`'s
@@ -631,6 +644,7 @@ impl Process {
             left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
+            exited: AtomicBool::new(false),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -668,6 +682,7 @@ impl Process {
             left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
+            exited: AtomicBool::new(false),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -732,6 +747,7 @@ impl Process {
             left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
+            exited: AtomicBool::new(false),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -916,6 +932,7 @@ impl Process {
             let already_exited = matches!(inner.status, Status::Exited(_));
             if !already_exited {
                 inner.status = Status::Exited(retcode);
+                self.exited.store(true, Ordering::Release);
             }
             // BEFORE the clone, which is a `lock incq` through every entry:
             // see `thread_entry_looks_live` for the capture that made this
@@ -980,6 +997,7 @@ impl Process {
             Status::Exited(retcode) => retcode,
             _ => {
                 inner.status = Status::Exited(0);
+                self.exited.store(true, Ordering::Release);
                 0
             }
         };
@@ -1141,6 +1159,13 @@ impl Process {
     /// Get process status.
     pub fn status(&self) -> Status {
         self.inner.lock().status
+    }
+
+    /// Whether the process has exited: [`exit_code`](Self::exit_code)`.is_some()`
+    /// without taking the process lock. See the `exited` field.
+    #[inline]
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     /// Get process exit code if it exited, else returns `None`.
@@ -1595,6 +1620,7 @@ impl Process {
             if !matches!(inner.status, Status::Exited(_)) {
                 let hint = self.exit_code_hint.load(Ordering::Acquire);
                 inner.status = Status::Exited(if hint == i64::MIN { 0 } else { hint });
+                self.exited.store(true, Ordering::Release);
             }
             drop(inner);
             self.terminate();
@@ -2969,6 +2995,7 @@ mod ext_and_lifecycle_tests {
         assert!(info.has_exited, "{:?}", proc.status());
         assert_eq!(info.return_code, 5, "the exit code was overwritten");
         assert_eq!(proc.exit_code(), Some(5));
+        assert!(proc.has_exited());
     }
 
     /// The first exit code is the one on file. A second `exit` -- the
@@ -2981,6 +3008,7 @@ mod ext_and_lifecycle_tests {
         proc.exit(5);
         proc.exit(7);
         assert_eq!(proc.exit_code(), Some(5));
+        assert!(proc.has_exited());
         assert_eq!(proc.get_info().return_code, 5);
     }
 
@@ -3003,8 +3031,13 @@ mod ext_and_lifecycle_tests {
         hinted.hint_exit_code(3);
         first.terminate_abandoned();
         assert_eq!(hinted.exit_code(), None, "a thread is still in it");
+        assert!(
+            !hinted.has_exited(),
+            "the lock-free flag agrees with the status"
+        );
         last.terminate_abandoned();
         assert_eq!(hinted.exit_code(), Some(3));
+        assert!(hinted.has_exited(), "set where the status becomes Exited");
     }
 
     /// The first thread's first argument is the handle `zx_process_start` gave

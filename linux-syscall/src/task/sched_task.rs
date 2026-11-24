@@ -30,7 +30,7 @@ fn exiting(thread: &Thread) -> bool {
 /// processes that have not exited.
 fn released(thread: &Thread) -> bool {
     let proc = thread.proc();
-    thread.id() != proc.id() && proc.exit_code().is_some()
+    thread.id() != proc.id() && proc.has_exited()
 }
 
 /// A task as `find_task_by_vpid()` finds it.

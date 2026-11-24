@@ -1381,10 +1381,14 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
 /// loop:
 /// - wait for the thread to be ready
 /// - get user thread context
+///
+/// Asked two or three times on every trip through the loop below, so on every
+/// syscall: `has_exited`, not `exit_code`, which takes the process's big lock
+/// and made twenty threads of one process queue on it (see
+/// `Process::has_exited`).
 #[inline]
 fn thread_should_stop(thread: &CurrentThread) -> bool {
-    matches!(thread.state(), ThreadState::Dying | ThreadState::Dead)
-        || thread.proc().exit_code().is_some()
+    matches!(thread.state(), ThreadState::Dying | ThreadState::Dead) || thread.proc().has_exited()
 }
 
 /// - enter user mode
