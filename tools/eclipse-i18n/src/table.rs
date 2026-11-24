@@ -1210,4 +1210,24 @@ strings! {
     mon_restart => { es: "REINICIAR", en: "RESTART" },
     mon_stop => { es: "PARAR", en: "STOP" },
     mon_system_monitor => { es: "Monitor del sistema", en: "System monitor" },
+
+    // ── lunarpanel: the control panel ────────────────────────────────────
+    panel_title => { es: "PANEL DE CONTROL", en: "CONTROL PANEL" },
+    panel_keys => {
+        es: "↑↓ ajuste · ←→ valor · Tab grupo · Intro aplica · Esc deshace o cierra",
+        en: "↑↓ setting · ←→ value · Tab group · Enter applies · Esc undoes or closes",
+    },
+    /// The search field, empty: `buscar entre 8 claves`.
+    panel_search_in => { es: "escribe para buscar entre {} claves", en: "type to search {} settings" },
+    panel_results => { es: "resultados", en: "results" },
+    panel_no_results => { es: "ninguna clave coincide", en: "no setting matches" },
+    /// `8 claves · 5 grupos`.
+    panel_settings => { es: "claves", en: "settings" },
+    panel_groups => { es: "grupos", en: "groups" },
+    panel_warnings => { es: "avisos en claves.d", en: "warnings in claves.d" },
+    panel_undone => { es: "cambios deshechos", en: "changes undone" },
+    panel_open_caps => { es: "ABRIR", en: "OPEN" },
+    panel_on => { es: "sí", en: "on" },
+    /// `sin aplicar · antes: tecno`: what a held change replaces.
+    panel_was => { es: "antes:", en: "was:" },
 }

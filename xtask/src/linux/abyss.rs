@@ -188,6 +188,7 @@ bind \"SUPER\" \"d\" { spawn \"/usr/local/bin/eclipse-showdesktop\"; }
 bind \"SUPER\" \"l\" { spawn \"lunarlock\"; }
 bind \"SUPER\" \"Tab\" { spawn \"lunardesk\"; }
 bind \"SUPER\" \"n\" { spawn \"lunarnotes\"; }
+bind \"SUPER\" \"i\" { spawn \"/usr/local/bin/eclipse-panel\"; }
 bind \"SUPER\" \"k\" { spawn \"/usr/local/bin/eclipse-kbd toggle\"; }
 bind \"Print\" { spawn \"lunarshot\"; }
 bind \"SHIFT\" \"Print\" { spawn \"lunarshot --region\"; }

@@ -1,0 +1,19 @@
+# Eclipse OS: fecha y hora. Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:fecha]
+es = Fecha y hora
+en = Date and time
+
+[pais]
+grupo   = fecha
+fichero = /etc/eclipse/timezone
+clave   = country
+tipo    = elegir
+valores = ES:España US:Estados_Unidos
+valores.en = ES:Spain US:United_States
+defecto = ES
+aplicar = /usr/local/bin/eclipse-tz {}
+es      = País y zona horaria
+en      = Country and time zone
+ayuda   = España: Europe/Madrid · Estados Unidos: America/New_York
+ayuda.en = Spain: Europe/Madrid · United States: America/New_York

@@ -12,6 +12,7 @@ mod image;
 mod locales;
 mod logo;
 mod monitor;
+mod panel;
 mod network;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
@@ -91,6 +92,8 @@ struct LunarTools {
     net: PathBuf,
     /// The system monitor: processes, load and the init services.
     mon: PathBuf,
+    /// The control panel (Super+I), built from the blocks in claves.d.
+    panel: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -3483,6 +3486,7 @@ impl LinuxRootfs {
             notes: lunarnotes,
             net: lunarnet,
             mon: lunarmon,
+            panel: lunarpanel,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -3589,6 +3593,14 @@ impl LinuxRootfs {
             fs::copy(&lunarmon, bin.join("lunarmon")).unwrap();
         } else {
             eprintln!("warning: lunarmon not built; the monitor opens a terminal on top");
+        }
+        // lunarpanel: the control panel. Its settings are data (claves.d,
+        // installed by `panel::write_panel`), so only the binary goes here.
+        if lunarpanel.is_file() {
+            let _ = dir::rm(bin.join("lunarpanel"));
+            fs::copy(&lunarpanel, bin.join("lunarpanel")).unwrap();
+        } else {
+            eprintln!("warning: lunarpanel not built; Super+I does nothing");
         }
     }
 
@@ -3791,6 +3803,7 @@ impl LinuxRootfs {
         let notes = out.join("lunarnotes");
         let net = out.join("lunarnet");
         let mon = out.join("lunarmon");
+        let panel = out.join("lunarpanel");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3798,6 +3811,9 @@ impl LinuxRootfs {
         // reaches the image.
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
+            // The shipped claves are built into lunarpanel (`include_str!`)
+            // as its fallback and its `--dump`.
+            newest_mtime_under(&dir.join("claves.d")),
             lunartext_mtime(),
             // The UI strings live in another crate, so a translation changed
             // there is a source change HERE: without this line the binaries
@@ -3827,6 +3843,7 @@ impl LinuxRootfs {
             &notes,
             &net,
             &mon,
+            &panel,
         ]
         .iter()
         .map(|p| fs::metadata(p).ok()?.modified().ok())
@@ -3845,6 +3862,7 @@ impl LinuxRootfs {
                     notes,
                     net,
                     mon,
+                    panel,
                 };
             }
         }
@@ -3884,6 +3902,7 @@ impl LinuxRootfs {
             notes,
             net,
             mon,
+            panel,
         }
     }
 
