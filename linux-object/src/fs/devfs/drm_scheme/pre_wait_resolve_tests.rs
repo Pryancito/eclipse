@@ -152,7 +152,7 @@ fn every_pre_wait_can_be_interrupted_by_a_signal() {
         assert!(
             code.contains("interruptible(kernel_hal::thread::sleep_until(")
                 || code.contains("interruptible(until_vblank_or_crtc_off(")
-                || code.contains("fence_poll_wait(acct.probes, deadline).await?"),
+                || code.contains("fence_poll_wait(acct.probes, acct.start, deadline).await?"),
             "{} waits without ever asking whether a signal arrived",
             name
         );

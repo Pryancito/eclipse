@@ -116,7 +116,7 @@ impl DrmDev {
                     return Ok(());
                 }
                 None => {
-                    if !fence_poll_wait(acct.probes, deadline).await? {
+                    if !fence_poll_wait(acct.probes, acct.start, deadline).await? {
                         acct.timed_out();
                         return exec_wait_gave_up(&handles, &points);
                     }

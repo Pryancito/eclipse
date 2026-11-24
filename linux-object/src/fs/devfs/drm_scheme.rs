@@ -392,7 +392,7 @@ impl DrmDev {
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.
-                    if !fence_poll_wait(acct.probes, deadline).await? {
+                    if !fence_poll_wait(acct.probes, acct.start, deadline).await? {
                         acct.timed_out();
                         return Ok(());
                     }
@@ -472,7 +472,7 @@ impl DrmDev {
                     return Ok(());
                 }
                 None => {
-                    if !fence_poll_wait(acct.probes, deadline).await? {
+                    if !fence_poll_wait(acct.probes, acct.start, deadline).await? {
                         acct.timed_out();
                         return Ok(());
                     }
@@ -538,7 +538,7 @@ impl DrmDev {
             if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
                 return Ok(());
             }
-            if !fence_poll_wait(acct.probes, deadline).await? {
+            if !fence_poll_wait(acct.probes, acct.start, deadline).await? {
                 acct.timed_out();
                 return Ok(());
             }
@@ -678,7 +678,7 @@ impl DrmDev {
                 }
                 return Ok(());
             }
-            if !fence_poll_wait(acct.probes, deadline).await? {
+            if !fence_poll_wait(acct.probes, acct.start, deadline).await? {
                 acct.timed_out();
                 FENCE_PRESENTS_TIMEOUT.fetch_add(1, Ordering::Relaxed);
                 // Budgeted for the same reason as the atomic wait: a ring that
@@ -3984,8 +3984,8 @@ fn pre_wait_parked_us(elapsed_us: u64, probes: u32) -> u64 {
 }
 
 /// Wait out one interval of a fence poll, on the schedule
-/// [`zcore_drivers::scheme::syncobj::fence_poll_step`] sets: `probes` is how
-/// many probes this wait has already made.
+/// [`zcore_drivers::scheme::syncobj::fence_poll_step_at`] sets: `probes` is
+/// how many probes this wait has already made, `start` when it began.
 ///
 /// `false` means the deadline has arrived (or a clock stepped backwards) and
 /// the caller must stop polling -- the same answer [`next_poll_wake`]'s `None`
@@ -3995,13 +3995,17 @@ fn pre_wait_parked_us(elapsed_us: u64, probes: u32) -> u64 {
 /// hardware lands in far less than the old 1 ms tick, so the tick, not the
 /// GPU, was setting the frame rate: see `fence_poll_step` for the whole
 /// reasoning and for why the backoff ends up at that same tick.
-async fn fence_poll_wait(probes: u32, deadline: Duration) -> LxResult<bool> {
-    use zcore_drivers::scheme::syncobj::{fence_poll_step, PollStep};
+async fn fence_poll_wait(probes: u32, start: Duration, deadline: Duration) -> LxResult<bool> {
+    use zcore_drivers::scheme::syncobj::{fence_poll_step_at, PollStep};
     // Asked on every look, so the yield arm is interruptible too: it sleeps
     // for no time at all, but a client that spends a whole frame in the busy
     // phase would otherwise take no signal for that frame.
     crate::process::check_signals()?;
-    match fence_poll_step(probes) {
+    let waited_us = kernel_hal::timer::timer_now()
+        .saturating_sub(start)
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
+    match fence_poll_step_at(probes, waited_us) {
         PollStep::Yield => {
             if kernel_hal::timer::timer_now() >= deadline {
                 return Ok(false);
