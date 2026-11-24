@@ -152,6 +152,22 @@ void eclipse_kms_free_device(struct NvKmsKapiDevice *device)
         g_nvKms.freeDevice(device);
 }
 
+/*
+ * nv_drm_connector_mode_valid: nvidia-drm lists a mode only when
+ * getDisplayMode calls it valid AND validateDisplayMode, which DRM's probe
+ * helper runs on every mode, agrees. The two differ for the modes nvkms can
+ * only drive as YUV 4:2:0 (HDMI 4K@60 on a sink without 6G RGB): kapi's
+ * NvKmsKapiDisplayMode has no yuv420 field, so the mode it hands back
+ * validates with yuv420Mode = NONE, which nvkms refuses -- as it then refuses
+ * the modeset itself. Listing such a mode offered clients (glmark2-drm, which
+ * takes the largest) one that every SETCRTC answered EINVAL.
+ */
+static NvBool eclipse_kms_mode_usable(struct NvKmsKapiDevice *device, NvU32 display,
+                                      const struct NvKmsKapiDisplayMode *mode)
+{
+    return g_nvKms.validateDisplayMode(device, display, mode);
+}
+
 static void eclipse_kms_probe_modes(struct NvKmsKapiDevice *device,
                                     struct EclipseKmsDisplay *out)
 {
@@ -167,6 +183,8 @@ static void eclipse_kms_probe_modes(struct NvKmsKapiDevice *device,
                                       &preferred);
         if (more < 0)
             break;
+        if (valid && !eclipse_kms_mode_usable(device, out->handle, &mode))
+            valid = NV_FALSE;
         if (valid) {
             out->numModes++;
             /* The first preferred mode, else the first valid one: what
@@ -325,6 +343,8 @@ int eclipse_kms_mode(struct NvKmsKapiDevice *device, NvU32 display, NvU32 index,
     out->height = mode.timings.vVisible;
     out->refreshMilliHz = mode.timings.refreshRate;
     out->pixelClockKHz = mode.timings.pixelClockHz / 1000;
+    if (valid && !eclipse_kms_mode_usable(device, display, &mode))
+        valid = NV_FALSE;
     out->valid = valid ? 1 : 0;
     out->preferred = preferred ? 1 : 0;
     out->interlaced = mode.timings.flags.interlaced ? 1 : 0;
