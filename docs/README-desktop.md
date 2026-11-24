@@ -506,6 +506,25 @@ en `/etc/eclipse/claves.d`; el panel añade `pci-VVVV-DDDD@0` al `udriver=`
 de `rboot.conf`, y al reiniciar el núcleo le deja el dispositivo. QUITAR
 DRIVER lo deshace. Cómo escribir uno: [README-drivers.md](README-drivers.md).
 
+La página «Servicios» (bloque `tipo = servicios`) enseña los servicios de
+eclipse-init: los ficheros de `/etc/eclipse/services` unidos a lo que init
+dice de ellos (`/run/eclipse-init/services`), con su estado, desde cuándo y
+si arrancan al iniciar. Filtra por escritorio, drivers o parados. «Al
+arrancar: no» renombra `NOMBRE.service` a `NOMBRE.service.off`, y eclipse-init,
+que solo carga los `*.service`, deja de verlo; init no cambia. Los
+`esenciales` del bloque (la sesión, seatd, dbus, los montajes, la red) no se
+apagan desde aquí. INICIAR, PARAR y REINICIAR se lo piden a init por su
+directorio de control, como lunarmon, y VER REGISTRO abre su registro.
+Formato en `tools/lunarbar/src/servicios.rs`.
+
+La página «Aperturas» (bloque `tipo = aperturas`) dice con qué programa abre
+lunarfile cada tipo de fichero: lo de serie (`open::BUILTIN`) cambiado por
+`/etc/eclipse/openers`. Ofrece solo los programas de los `valores` del bloque
+que la imagen trae; un tipo que abre otro programa (`.drv`, el instalador de
+drivers) sale como fijo. Volver al programa de serie, o DE SERIE, quita su
+línea del fichero, y el resto del fichero, comentarios incluidos, se queda
+como estaba. Formato en `tools/lunarbar/src/aperturas.rs`.
+
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
 `lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.

@@ -131,6 +131,9 @@ impl Panel {
 
     /// The count a page shows in the list: its devices, for this one.
     pub(super) fn cuenta_grupo(&self, g: usize) -> usize {
+        if let Some(n) = self.cuenta_tabla(g) {
+            return n;
+        }
         let ids = self.cat.del_grupo(g);
         if self.disp.leido
             && ids

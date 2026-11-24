@@ -1,0 +1,17 @@
+# Eclipse OS: con qué programa se abre cada tipo de fichero en lunarfile.
+# Lo de serie es open::BUILTIN; lo cambiado va a /etc/eclipse/openers.
+# Solo se ofrecen estos programas, y de ellos los que la imagen trae.
+# Formato: tools/lunarbar/src/aperturas.rs.
+
+[grupo:aperturas]
+es = Aperturas
+en = File types
+
+[aperturas]
+grupo      = aperturas
+tipo       = aperturas
+fichero    = /etc/eclipse/openers
+es         = Con qué se abre cada fichero
+en         = What opens each file
+valores    = eclipse-edit:Editor eclipse-view:Visor eclipse-firefox:Navegador wavplay:wavplay mpg123:mpg123
+valores.en = eclipse-view:Viewer eclipse-firefox:Browser

@@ -1316,4 +1316,78 @@ strings! {
     panel_inst_ok_caps => { es: "INSTALAR", en: "INSTALL" },
     panel_inst_done => { es: "driver instalado", en: "driver installed" },
     panel_inst_removed => { es: "driver quitado", en: "driver removed" },
+    // The "Servicios" page (tools/lunarbar/src/servicios.rs).
+    panel_svc_desktop => { es: "Escritorio", en: "Desktop" },
+    panel_svc_drivers => { both: "Drivers" },
+    panel_svc_stopped_filter => { es: "Parados", en: "Stopped" },
+    panel_svc_col_boot => { es: "AL ARRANCAR", en: "AT BOOT" },
+    panel_svc_waiting => { es: "esperando", en: "waiting" },
+    panel_svc_stopped => { es: "parado", en: "stopped" },
+    panel_svc_done => { es: "terminado", en: "finished" },
+    panel_svc_given_up => { es: "abandonado", en: "given up" },
+    panel_svc_not_loaded => { es: "sin cargar", en: "not loaded" },
+    panel_svc_essential => { es: "esencial", en: "essential" },
+    /// `5 reintentos`: how often a service init gave up on was started.
+    panel_svc_retries => { es: "{} reintentos", en: "{} retries" },
+    panel_svc_log_caps => { es: "VER REGISTRO", en: "VIEW LOG" },
+    panel_svc_n_stopped => { es: "parados", en: "stopped" },
+    panel_svc_n_given_up => { es: "abandonados", en: "given up" },
+    panel_svc_why_running => { es: "En marcha desde hace {}", en: "Running for {}" },
+    panel_svc_why_waiting => {
+        es: "Espera su turno o lo que necesita",
+        en: "Waiting for its turn or for what it needs",
+    },
+    panel_svc_why_stopped => { es: "Parado a mano", en: "Stopped by hand" },
+    panel_svc_why_done => { es: "Hizo su trabajo y terminó", en: "It did its work and ended" },
+    panel_svc_why_given_up => {
+        es: "eclipse-init lo dejó tras caer demasiadas veces seguidas",
+        en: "eclipse-init gave up after it died too often in a row",
+    },
+    panel_svc_why_off => {
+        es: "Desactivado: eclipse-init no lo carga al arrancar",
+        en: "Turned off: eclipse-init does not load it at boot",
+    },
+    panel_svc_why_new => {
+        es: "eclipse-init no lo cargó: lo hará al reiniciar",
+        en: "eclipse-init did not load it: it will after a restart",
+    },
+    panel_svc_boots => { es: "Arranca al iniciar", en: "Starts at boot" },
+    panel_svc_log => { es: "Registro:", en: "Log:" },
+    panel_svc_off_hint => {
+        es: "«Al arrancar: no» lo renombra a {}.service.off; eclipse-init no lo carga más.",
+        en: "“At boot: off” renames it {}.service.off; eclipse-init no longer loads it.",
+    },
+    panel_svc_essential_hint => {
+        es: "Esencial: sin él no hay escritorio, discos o red; esta página no lo apaga.",
+        en: "Essential: without it there is no desktop, disk or network; this page keeps it on.",
+    },
+    panel_svc_asked => { es: "pedido a eclipse-init:", en: "asked of eclipse-init:" },
+    panel_svc_none => { es: "no hay servicios en {}", en: "no services in {}" },
+    // The "Aperturas" page (tools/lunarbar/src/aperturas.rs).
+    panel_ap_col_program => { es: "PROGRAMA", en: "PROGRAM" },
+    panel_ap_col_origin => { es: "ORIGEN", en: "ORIGIN" },
+    panel_ap_builtin => { es: "de serie", en: "built-in" },
+    panel_ap_yours => { es: "tuyo", en: "yours" },
+    panel_ap_fixed => { es: "fijo", en: "fixed" },
+    panel_ap_builtin_caps => { es: "DE SERIE", en: "BUILT-IN" },
+    panel_ap_kinds => { es: "tipos", en: "kinds" },
+    panel_ap_changed => { es: "cambiados", en: "changed" },
+    panel_ap_why_builtin => { es: "De serie: lo abre {}.", en: "Built-in: {} opens it." },
+    panel_ap_why_yours => {
+        es: "Cambiado por ti: de serie lo abre {}. Está en {}.",
+        en: "Changed by you: built-in, {} opens it. It is in {}.",
+    },
+    panel_ap_why_own => { es: "Lo añadiste tú, en {}.", en: "You added it, in {}." },
+    panel_ap_why_fixed => {
+        es: "Lo abre un programa que esta página no cambia.",
+        en: "A program this page does not change opens it.",
+    },
+    panel_ap_why_held => {
+        es: "Sin aplicar: Intro o APLICAR lo escribe en {}.",
+        en: "Not applied: Enter or APPLY writes it to {}.",
+    },
+    panel_ap_only => {
+        es: "Solo se ofrecen los programas que trae la imagen.",
+        en: "Only the programs the image has are offered.",
+    },
 }

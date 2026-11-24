@@ -91,6 +91,14 @@ pub const DE_SERIE: &[(&str, &str)] = &[
         "80-dispositivos.claves",
         include_str!("../claves.d/80-dispositivos.claves"),
     ),
+    (
+        "82-servicios.claves",
+        include_str!("../claves.d/82-servicios.claves"),
+    ),
+    (
+        "84-aperturas.claves",
+        include_str!("../claves.d/84-aperturas.claves"),
+    ),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +112,13 @@ pub enum Tipo {
     /// the kernel command line is, for the `udriver=` a driver is turned on
     /// with.
     Dispositivos,
+    /// The page of eclipse-init's services ([`crate::servicios`]):
+    /// `fichero` is their directory, `esenciales` the ones the page will
+    /// not turn off (kept as its values).
+    Servicios,
+    /// The page of what opens each kind of file ([`crate::aperturas`]):
+    /// `fichero` is `/etc/eclipse/openers`, `valores` the programs offered.
+    Aperturas,
 }
 
 /// What of the kernel command line a block edits (see the module notes).
@@ -229,7 +244,7 @@ impl Clave {
         match &self.tipo {
             Tipo::Elegir | Tipo::SiNo => self.valores.iter().any(|x| x.v == v),
             Tipo::Numero { min, max, .. } => v.parse::<i64>().is_ok_and(|n| n >= *min && n <= *max),
-            Tipo::Abrir | Tipo::Dispositivos => false,
+            Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas => false,
         }
     }
 
@@ -257,7 +272,7 @@ impl Clave {
                     .unwrap_or(*min);
                 n.clamp(*min, *max).to_string()
             }
-            Tipo::Abrir | Tipo::Dispositivos => String::new(),
+            Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas => String::new(),
         }
     }
 
@@ -277,7 +292,7 @@ impl Clave {
                 let n = v.parse::<i64>().unwrap_or(*min);
                 (n + dir as i64 * paso).clamp(*min, *max).to_string()
             }
-            Tipo::Abrir | Tipo::Dispositivos => String::new(),
+            Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas => String::new(),
         }
     }
 
@@ -374,6 +389,8 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
         },
         "abrir" => Tipo::Abrir,
         "dispositivos" => Tipo::Dispositivos,
+        "servicios" => Tipo::Servicios,
+        "aperturas" => Tipo::Aperturas,
         t => return Err(format!("tipo desconocido «{t}»")),
     };
     let fichero = b.get("fichero").map(PathBuf::from);
@@ -388,7 +405,8 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
         Some("palabra") => true,
         Some(f) => return Err(format!("formato desconocido «{f}»")),
     };
-    if !matches!(tipo, Tipo::Abrir) && (fichero.is_none() || (key.is_none() && !palabra)) {
+    let sin_clave = matches!(tipo, Tipo::Servicios | Tipo::Aperturas);
+    if !matches!(tipo, Tipo::Abrir) && (fichero.is_none() || (key.is_none() && !palabra && !sin_clave)) {
         return Err("falta «fichero» o «clave»".into());
     }
     let montar = b.get("montar").map(PathBuf::from);
@@ -398,7 +416,9 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
     if fichero.as_ref().is_some_and(|f| !f.is_absolute()) {
         return Err("«fichero» tiene que ser una ruta absoluta".into());
     }
-    let mut vals: Vec<Valor> = match b.get("valores") {
+    // A services page's values are the services it will not turn off.
+    let valores_de = if matches!(tipo, Tipo::Servicios) { "esenciales" } else { "valores" };
+    let mut vals: Vec<Valor> = match b.get(valores_de) {
         Some(s) => valores(s)
             .ok_or("un valor lleva caracteres que no puede llevar")?
             .into_iter()

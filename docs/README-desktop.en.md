@@ -490,6 +490,25 @@ does it. `eclipse-udriver instalar VVVV DDDD FILE` copies it to
 `udriver=`, and after a restart the kernel leaves it the device. REMOVE
 DRIVER undoes it. How to write one: [README-drivers.en.md](README-drivers.en.md).
 
+The "Services" page (a `tipo = servicios` block) shows eclipse-init's
+services: the files in `/etc/eclipse/services` joined with what init says of
+them (`/run/eclipse-init/services`), with their state, how long they have
+run and whether they start at boot. It filters by desktop, drivers or
+stopped. "At boot: off" renames `NAME.service` to `NAME.service.off`, and
+eclipse-init, which only loads `*.service`, no longer sees it; init does not
+change. The block's `esenciales` (the session, seatd, dbus, the mounts, the
+network) cannot be turned off here. START, STOP and RESTART ask init through
+its control directory, as lunarmon does, and VIEW LOG opens its log. Format
+in `tools/lunarbar/src/servicios.rs`.
+
+The "File types" page (a `tipo = aperturas` block) says which program
+lunarfile opens each kind of file with: the built-in table
+(`open::BUILTIN`) as `/etc/eclipse/openers` changes it. It only offers the
+block's `valores` that the image has; a kind another program opens (`.drv`,
+the driver installer) shows as fixed. Going back to the built-in program, or
+BUILT-IN, takes its line out of the file, and the rest of the file, comments
+included, stays as it was. Format in `tools/lunarbar/src/aperturas.rs`.
+
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH
 [group]` draws it without a compositor.

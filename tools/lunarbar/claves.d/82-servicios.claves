@@ -1,0 +1,16 @@
+# Eclipse OS: la página de servicios de eclipse-init. Cada servicio es un
+# fichero de /etc/eclipse/services; uno que no debe arrancar al iniciar se
+# renombra NOMBRE.service.off. Formato: tools/lunarbar/src/servicios.rs.
+
+[grupo:servicios]
+es = Servicios
+en = Services
+
+[servicios]
+grupo      = servicios
+tipo       = servicios
+fichero    = /etc/eclipse/services
+es         = Servicios
+en         = Services
+# Los que la página no apaga: sin ellos no hay escritorio, discos ni red.
+esenciales = abyss abyss-seatd labwc xorg seatd dbus dbus-system fs-mounts fat-mounts ublk-mounts mountd network unet knet enet

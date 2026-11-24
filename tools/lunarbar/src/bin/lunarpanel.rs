@@ -43,6 +43,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 #[path = "lunarpanel/disp.rs"]
 mod disp;
+#[path = "lunarpanel/tablas.rs"]
+mod tablas;
 
 // ── the measures the computation starts from ─────────────────────────────────
 
@@ -215,7 +217,7 @@ fn control(c: &Clave, x: i32, y: i32, room: i32, lang: Lang) -> Control {
                 caja: (after, y, VAL_W, CTRL_H),
             }
         }
-        Tipo::Abrir | Tipo::Dispositivos => {
+        Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas => {
             let w = up4(Canvas::text_width(lang.s(Key::panel_open_caps)) + 2 * PAD);
             Control::Boton((x, y, w, CTRL_H))
         }
@@ -331,6 +333,10 @@ struct Panel {
     lang: Lang,
     /// The devices page's rows and focus.
     disp: disp::Disp,
+    /// The services page's.
+    serv: tablas::Serv,
+    /// The openers page's.
+    aper: tablas::Aper,
 }
 
 impl Panel {
@@ -348,6 +354,8 @@ impl Panel {
             tono: Tono::Plano,
             lang,
             disp: disp::Disp::default(),
+            serv: tablas::Serv::default(),
+            aper: tablas::Aper::default(),
         }
     }
 
@@ -397,6 +405,7 @@ impl Panel {
             self.top = 0;
             self.busca.clear();
             self.carga_disp();
+            self.carga_tablas();
         }
     }
 
@@ -666,7 +675,8 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
             ty,
             if on { ink().text } else { ink().muted },
         );
-        let held = p.cat.del_grupo(g).iter().any(|&i| p.pendiente[i].is_some());
+        let held = p.cat.del_grupo(g).iter().any(|&i| p.pendiente[i].is_some())
+            || p.tabla_pendiente(g);
         let count = format!("{:02}", p.cuenta_grupo(g));
         let cw = Canvas::text_width(&count);
         let col = if held {
@@ -682,6 +692,14 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
     // The devices page draws its own body and foot.
     if let Some(ci) = p.pagina_disp() {
         disp::draw(cv, &l, p, ci);
+        return;
+    }
+    if let Some(ci) = p.pagina_serv() {
+        tablas::draw_serv(cv, &l, p, ci);
+        return;
+    }
+    if let Some(ci) = p.pagina_aper() {
+        tablas::draw_aper(cv, &l, p, ci);
         return;
     }
 
@@ -912,7 +930,10 @@ impl State {
     fn step(&mut self, dir: i32) {
         let Some(i) = self.focused() else { return };
         let c = &self.panel.cat.claves[i];
-        if matches!(c.tipo, Tipo::Abrir | Tipo::Dispositivos) {
+        if matches!(
+            c.tipo,
+            Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas
+        ) {
             return;
         }
         let v = c.paso(self.panel.valor(i), dir);
@@ -922,15 +943,18 @@ impl State {
     fn activate(&mut self) {
         let Some(i) = self.focused() else { return };
         match self.panel.cat.claves[i].tipo {
-            Tipo::Abrir | Tipo::Dispositivos => self.open(i),
+            Tipo::Abrir | Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas => self.open(i),
             Tipo::SiNo => self.step(1),
             _ => self.apply(),
         }
     }
 
     fn open(&mut self, i: usize) {
-        // The devices block, found by a search: its page.
-        if self.panel.cat.claves[i].tipo == Tipo::Dispositivos {
+        // A block that is a page of its own, found by a search: its page.
+        if matches!(
+            self.panel.cat.claves[i].tipo,
+            Tipo::Dispositivos | Tipo::Servicios | Tipo::Aperturas
+        ) {
             let g = self.panel.cat.claves[i].grupo.clone();
             let g = group_index(&self.panel.cat, Some(&g));
             self.panel.pagina(g);
@@ -946,7 +970,10 @@ impl State {
     }
 
     fn key(&mut self, key: u32) {
-        if self.panel.pagina_disp().is_some() && self.disp_key(key) {
+        let propia = (self.panel.pagina_disp().is_some() && self.disp_key(key))
+            || (self.panel.pagina_serv().is_some() && self.serv_key(key))
+            || (self.panel.pagina_aper().is_some() && self.aper_key(key));
+        if propia {
             self.render();
             return;
         }
@@ -1005,7 +1032,10 @@ impl State {
             }
             return;
         }
-        if self.panel.pagina_disp().is_some() && self.disp_click(x, y) {
+        let propia = (self.panel.pagina_disp().is_some() && self.disp_click(x, y))
+            || (self.panel.pagina_serv().is_some() && self.serv_click(x, y))
+            || (self.panel.pagina_aper().is_some() && self.aper_click(x, y));
+        if propia {
             self.render();
             return;
         }
@@ -1263,6 +1293,7 @@ fn sample(grupo: Option<&str>) -> Panel {
     if let Some(i) = p.cat.claves.iter().position(|c| c.id == "teclado.idioma") {
         p.elige(i, "no".into());
     }
+    tablas::muestra(&mut p);
     if p.pagina_disp().is_some() {
         disp::muestra(&mut p);
         if instalar {
@@ -1378,6 +1409,7 @@ fn main() {
     let mut panel = Panel::new(cat, actual, Lang::current());
     panel.grupo = group_index(&panel.cat, arg("--grupo").as_deref());
     panel.carga_disp();
+    panel.carga_tablas();
     if let Some(path) = instalar {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         panel.instala_fichero(path);
