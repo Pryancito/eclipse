@@ -1122,14 +1122,6 @@ impl Epoll {
             let now = kernel_hal::timer::timer_now();
             for (i, (fd, event, file)) in interest_list.iter().enumerate() {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
-                // Armed BEFORE the poll: whatever happens to the file after
-                // the poll below fires it, so a quick look that passes the
-                // entry for being quiet cannot pass a change it never saw.
-                let armed = if arm[i] {
-                    fast::Armed::arm(&**file, interest)
-                } else {
-                    None
-                };
                 // The publication counter of an edge-triggered entry, for
                 // the files that keep one. Read BEFORE the level: a
                 // publication after this line moves it past what is stored,
@@ -1149,6 +1141,19 @@ impl Epoll {
                 };
                 let mut ready = ready_events(event.events, &status);
                 if !edge_triggered {
+                    // Armed only when the poll found nothing, since only a
+                    // quiet entry is ever passed, and AFTER the poll: the bus
+                    // latches its flags and fires a subscription taken on one
+                    // already up at once (see `FileLike::subscribe_readiness`),
+                    // so a change between the poll and this line leaves the
+                    // entry fired, not quiet. A ready entry is polled on every
+                    // look anyway, and arming it would cost a subscription per
+                    // call to an fd that is always ready.
+                    let armed = if arm[i] && ready == 0 {
+                        fast::Armed::arm(&**file, interest)
+                    } else {
+                        None
+                    };
                     scanned_levels.push((*fd, file.clone(), armed, ready != 0));
                 }
                 if edge_triggered {

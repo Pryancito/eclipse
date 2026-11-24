@@ -8,8 +8,9 @@
 //! callbacks fill, and touches no other entry.
 //!
 //! Here a level-triggered entry carries an [`Armed`] subscription on its file
-//! for as long as it is quiet: taken before the poll that found the entry not
-//! ready, so any change after that poll fires it. The first look of a wait
+//! for as long as it is quiet: taken right after the poll that found the
+//! entry not ready, and fired at once when the file's bus already has the
+//! flag up, so any change after that poll fires it. The first look of a wait
 //! polls only the entries that fired, were ready last time, or have no
 //! subscription. A file whose producers do not publish everything would be
 //! missed by that look, so it is never the last word:
