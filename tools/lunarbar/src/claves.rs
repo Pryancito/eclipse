@@ -36,6 +36,13 @@
 //! in force), `reabrir = si` (the panel reopens after applying it) and
 //! `reinicio = si` (the value is read at boot).
 //!
+//! `arranque` edits one item of a kernel command line held in `clave`
+//! (rboot.conf's `cmdline=`, whose LAST line is the one rboot reads):
+//! `arranque = LOG` reads and writes `LOG=value`, `arranque = bandera` makes
+//! one of `valores` the token present (`nvidia.wlr_vulkan`). The kernel
+//! reads the first spelling of a key, so the first one is the one edited and
+//! later ones are dropped; `auto` removes the item and leaves the default.
+//!
 //! Fail-closed on bad data: a block the panel cannot use is LEFT OUT and
 //! named in [`Catalogo::avisos`], which the panel's footer counts. A value
 //! the file holds that is not one of `valores` reads as `defecto`. A value is
@@ -76,6 +83,10 @@ pub const DE_SERIE: &[(&str, &str)] = &[
         "60-escritorio.claves",
         include_str!("../claves.d/60-escritorio.claves"),
     ),
+    (
+        "70-avanzado.claves",
+        include_str!("../claves.d/70-avanzado.claves"),
+    ),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +95,15 @@ pub enum Tipo {
     SiNo,
     Numero { min: i64, max: i64, paso: i64 },
     Abrir,
+}
+
+/// What of the kernel command line a block edits (see the module notes).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Arranque {
+    /// `KEY=value`, the key compared without case as the kernel does.
+    Clave(String),
+    /// One of the block's values present as a bare token, or none (`auto`).
+    Bandera,
 }
 
 /// One allowed value and how it reads in each language.
@@ -127,6 +147,9 @@ pub struct Clave {
     /// `reinicio = si`: what is written is read at boot, so the row and the
     /// status after applying say it takes effect on the next start.
     pub reinicio: bool,
+    /// `arranque = KEY | bandera`: `clave` holds a kernel command line and
+    /// the block edits one item of it.
+    pub arranque: Option<Arranque>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +197,15 @@ impl Clave {
     /// `/etc/eclipse/look · look`, what the row says it writes.
     pub fn origen(&self) -> String {
         match (&self.fichero, &self.clave, &self.orden) {
+            // The file's name alone: the row has no room for the path and
+            // the item, and the item is what tells two rows apart.
+            (Some(f), Some(k), _) if self.arranque.is_some() => {
+                let f = f.file_name().unwrap_or(f.as_os_str()).to_string_lossy();
+                match &self.arranque {
+                    Some(Arranque::Clave(a)) => format!("{f} · {k} · {a}"),
+                    _ => format!("{f} · {k}"),
+                }
+            }
             (Some(f), _, _) if self.palabra => f.display().to_string(),
             (Some(f), Some(k), _) => format!("{} · {k}", f.display()),
             (_, _, Some(o)) => o.clone(),
@@ -373,6 +405,24 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
             }
         }
     }
+    let arranque = match b.get("arranque") {
+        None => None,
+        Some("bandera") => Some(Arranque::Bandera),
+        Some(k) if palabra_ok(k) && !k.contains([':', '=']) => Some(Arranque::Clave(k.to_string())),
+        Some(_) => return Err("«arranque» no válido".into()),
+    };
+    if arranque.is_some() {
+        if key.is_none() || palabra || b.get("aplicar").is_some() {
+            return Err("«arranque» va en la «clave» de una línea de órdenes".into());
+        }
+        if !matches!(tipo, Tipo::Elegir | Tipo::SiNo) {
+            return Err("«arranque» es para «elegir» o «si-no»".into());
+        }
+        // A ':' would add an item of its own to the command line.
+        if vals.iter().any(|x| x.v.contains(':')) {
+            return Err("un valor de «arranque» no puede llevar «:»".into());
+        }
+    }
     match &mut tipo {
         Tipo::Elegir if vals.is_empty() => return Err("«elegir» sin «valores»".into()),
         Tipo::SiNo if vals.len() != 2 => return Err("«si-no» lleva dos valores: sí y no".into()),
@@ -402,6 +452,7 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
         reinicio: matches!(b.get("reinicio"), Some("si" | "sí" | "yes")),
         palabra,
         montar,
+        arranque,
         id,
         grupo,
         tipo,
@@ -554,6 +605,94 @@ pub fn lee_clave(text: &str, key: &str) -> Option<String> {
     })
 }
 
+/// `key = value` read the way rboot reads its file: the LAST line wins.
+pub fn lee_ultima(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .map(|l| l.trim_end_matches('\r').trim())
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .filter(|(k, _)| k.trim() == key)
+        .last()
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// `text` with `key=value` in place of the LAST `key=` line (rboot's), or
+/// added at the end.
+pub fn pon_ultima(text: &str, key: &str, value: &str) -> String {
+    let is_it = |l: &str| {
+        let l = l.trim();
+        !l.starts_with('#') && l.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(last) = lines.iter().rposition(|l| is_it(l)) else {
+        return pon_clave(text, key, value);
+    };
+    let mut out = String::with_capacity(text.len() + value.len());
+    for (i, l) in lines.iter().enumerate() {
+        if i == last {
+            out.push_str(&format!("{key}={value}\n"));
+        } else {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The items of a `:`-separated command line, as `(key, value)`.
+fn items(cmdline: &str) -> impl Iterator<Item = (&str, &str)> {
+    cmdline.split(':').map(|p| match p.split_once('=') {
+        Some((k, v)) => (k.trim(), v.trim()),
+        None => (p.trim(), ""),
+    })
+}
+
+/// What `a` finds in `cmdline`: the first `KEY=`'s value, or the first of
+/// `valores` present as a token. `None` when it is not there.
+pub fn lee_arranque(cmdline: &str, a: &Arranque, valores: &[Valor]) -> Option<String> {
+    match a {
+        Arranque::Clave(k) => items(cmdline)
+            .find(|(x, _)| x.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.to_string()),
+        Arranque::Bandera => cmdline
+            .split(':')
+            .map(str::trim)
+            .find(|t| valores.iter().any(|x| x.v != "auto" && x.v == *t))
+            .map(str::to_string),
+    }
+}
+
+/// `cmdline` with `a` set to `v`: the item takes the place of its first
+/// spelling (or goes at the end), later spellings go, and `auto` removes
+/// it. Every other item is kept as it was, in its order.
+pub fn pon_arranque(cmdline: &str, a: &Arranque, valores: &[Valor], v: &str) -> String {
+    let mine = |p: &str| match a {
+        Arranque::Clave(k) => items(p).next().is_some_and(|(x, _)| x.eq_ignore_ascii_case(k)),
+        Arranque::Bandera => valores.iter().any(|x| x.v != "auto" && x.v == p.trim()),
+    };
+    let new = match a {
+        _ if v == "auto" => None,
+        Arranque::Clave(k) => Some(format!("{k}={v}")),
+        Arranque::Bandera => Some(v.to_string()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut placed = false;
+    for p in cmdline.split(':').filter(|p| !p.trim().is_empty()) {
+        if mine(p) {
+            if !placed {
+                out.extend(new.clone());
+                placed = true;
+            }
+        } else {
+            out.push(p.to_string());
+        }
+    }
+    if !placed {
+        out.extend(new);
+    }
+    out.join(":")
+}
+
 /// `text` with `key=value` in place of the first `key=` line, or added at
 /// the end. Every other line, comments included, is left as it was.
 pub fn pon_clave(text: &str, key: &str, value: &str) -> String {
@@ -609,6 +748,10 @@ pub fn valor_actual(c: &Clave) -> String {
     }
     let text = c.fichero.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
     let raw = match (&text, &c.clave) {
+        (Some(t), Some(k)) if c.arranque.is_some() => {
+            let line = lee_ultima(t, k).unwrap_or_default();
+            lee_arranque(&line, c.arranque.as_ref().unwrap(), &c.valores)
+        }
         (Some(t), _) if c.palabra => lee_palabra(t),
         (Some(t), Some(k)) => lee_clave(t, k),
         _ => None,
@@ -686,9 +829,23 @@ pub fn aplica(c: &Clave, v: &str) -> Result<(), String> {
     if let Some(m) = &c.montar {
         asegura_montaje(m)?;
     }
+    // A file on a mounted volume is edited, never made: an empty one in its
+    // place would be an rboot.conf with nothing but this key.
+    let old = match std::fs::read_to_string(f) {
+        Ok(t) => t,
+        Err(e) if c.montar.is_some() || c.arranque.is_some() => {
+            return Err(format!("{}: {e}", f.display()))
+        }
+        Err(_) => String::new(),
+    };
     let new = match &c.clave {
+        Some(k) if c.arranque.is_some() => {
+            let line = lee_ultima(&old, k).unwrap_or_default();
+            let line = pon_arranque(&line, c.arranque.as_ref().unwrap(), &c.valores, v);
+            pon_ultima(&old, k, &line)
+        }
         _ if c.palabra => format!("{v}\n"),
-        Some(k) => pon_clave(&std::fs::read_to_string(f).unwrap_or_default(), k, v),
+        Some(k) => pon_clave(&old, k, v),
         None => return Err(format!("{} no dice qué clave escribir", c.id)),
     };
     if let Some(d) = f.parent() {

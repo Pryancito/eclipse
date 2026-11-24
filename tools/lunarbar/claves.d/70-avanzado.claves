@@ -1,0 +1,117 @@
+# Eclipse OS: opciones del arranque para quien sabe lo que toca. Viven en
+# rboot.conf, casi todas dentro de su cmdline=, y se leen al arrancar.
+# hunter fija la suma de rboot.conf y avisará del cambio. Si una opción deja
+# el escritorio sin arrancar, se deshace editando rboot.conf en la ESP desde
+# la consola. «auto» quita la opción de la línea. Formato:
+# tools/lunarbar/src/claves.rs.
+
+[grupo:avanzado]
+es = Arranque avanzado
+en = Advanced boot
+
+[arranque.log]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = LOG
+tipo     = elegir
+valores  = error warn info debug trace
+defecto  = error
+reinicio = si
+es       = Mensajes del núcleo
+en       = Kernel messages
+ayuda    = debug y trace llenan la consola y frenan el arranque
+ayuda.en = debug and trace fill the console and slow the boot
+
+[arranque.smp]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = smp
+tipo     = elegir
+valores  = auto:Todos off:Uno 2 4 8 16
+valores.en = auto:All off:One
+defecto  = auto
+reinicio = si
+es       = Núcleos de CPU
+en       = CPU cores
+ayuda    = Uno sirve para probar una máquina dudosa
+ayuda.en = One is for trying a suspect machine
+
+[arranque.renderer]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = renderer
+tipo     = elegir
+valores  = auto:Automático pixman:Pixman_(CPU) gl:GL gl-sw:GL_por_software
+valores.en = auto:Automatic gl-sw:Software_GL
+defecto  = auto
+reinicio = si
+es       = Dibujo del escritorio
+en       = Desktop renderer
+ayuda    = Automático mira la tarjeta; Pixman siempre funciona
+ayuda.en = Automatic looks at the card; Pixman always works
+
+[arranque.nvidia]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = bandera
+tipo     = si-no
+valores  = nvidia.nouveau_uapi auto
+defecto  = auto
+reinicio = si
+es       = GPU NVIDIA con NVK
+en       = NVIDIA GPU through NVK
+ayuda    = nvidia.nouveau_uapi: el escritorio dibuja en la NVIDIA
+ayuda.en = nvidia.nouveau_uapi: the desktop draws on the NVIDIA card
+
+[arranque.nvidia.render]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = bandera
+tipo     = elegir
+valores  = auto:GLES2 nvidia.wlr_vulkan:Vulkan nvidia.wlr_pixman:Pixman
+defecto  = auto
+reinicio = si
+es       = Compositor en la NVIDIA
+en       = Compositor on the NVIDIA card
+ayuda    = Solo con NVK; Pixman es la salida de emergencia
+ayuda.en = NVK only; Pixman is the way out
+
+[arranque.nvkms]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = cmdline
+arranque = bandera
+tipo     = si-no
+valores  = nvidia.nvkms auto
+defecto  = auto
+reinicio = si
+es       = Monitores en todas las tarjetas
+en       = Monitors on every card
+ayuda    = nvidia.nvkms: cada tarjeta enciende sus monitores
+ayuda.en = nvidia.nvkms: every card lights its own monitors
+
+[arranque.medida]
+grupo    = avanzado
+fichero  = /boot/efi/EFI/Boot/rboot.conf
+montar   = /boot/efi
+clave    = measure
+tipo     = elegir
+valores  = off:Nada kernel:Núcleo all:Todo
+valores.en = off:Nothing kernel:Kernel all:Everything
+defecto  = kernel
+reinicio = si
+es       = Arranque medido
+en       = Measured boot
+ayuda    = Lo que rboot mide para hunter; Todo tarda más
+ayuda.en = What rboot measures for hunter; Everything is slower

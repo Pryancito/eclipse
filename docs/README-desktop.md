@@ -469,6 +469,14 @@ palabras sencillas, borra la línea con `auto` y pide a eclipse-init que
 reinicie el fondo o la barra. Los programas lo leen al arrancar
 (`lunartext::entorno`); una variable puesta en el entorno sigue mandando.
 
+`arranque = CLAVE` edita una opción dentro de la línea de órdenes del núcleo
+que guarda `clave` (el `cmdline=` de `rboot.conf`, cuya última línea es la que
+lee rboot): escribe `CLAVE=valor` en el sitio de la primera vez que aparece y
+quita las demás, porque el núcleo lee la primera. `arranque = bandera` deja
+presente uno de los `valores` como palabra suelta (`nvidia.wlr_vulkan`).
+`auto` quita la opción. El grupo «Arranque avanzado» usa esto para `LOG`,
+`smp`, `renderer`, las banderas de NVIDIA y `measure`.
+
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
 `lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.
