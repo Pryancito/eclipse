@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/statvfs.h>
 #include <linux/fs.h>
 #include <errno.h>
 #include <zlib.h>
@@ -152,6 +153,11 @@ struct config {
     int layout_set;
     enum table_mode table;
     int table_set;
+    /* Modo actualización: renovar en la raíz instalada los ficheros de
+     * Eclipse (envoltorios, filas de servicios, eclipse-init). Por defecto
+     * sí: sin eso el kernel nuevo arranca sobre los programas del día en que
+     * se instaló. `--no-root-refresh` lo apaga. */
+    int no_root_refresh;
 };
 
 struct partition_plan {
@@ -526,10 +532,11 @@ static int partition_dev_path(const char *disk_path, int part_num, char *out, si
 static int discover_partitions(const char *disk_path, struct discovered_partitions *out);
 static int shell_mkdir_p(const char *path, int dry_run);
 static int shell_copy_file(const char *src, const char *dst, int dry_run);
+static int copy_file_replace(const char *src, const char *dst, int dry_run);
 static int shell_mount(const char *source, const char *target, const char *fstype, int loop, int dry_run);
 static int shell_umount(const char *target, int dry_run);
 static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int dry_run);
-static int run_upgrade(const char *disk_path, int dry_run);
+static int run_upgrade(const char *disk_path, int refresh_root, int dry_run);
 static int write_fstab_to_root(const char *disk_path, const struct partition_plan *parts,
                                int part_count, enum layout_mode layout, int dry_run);
 static int resize_root_to_partition(const char *root_dev, int dry_run);
@@ -1031,6 +1038,8 @@ static int parse_args(int argc, char **argv, struct config *cfg) {
             cfg->auto_yes = 1;
         } else if (strcmp(argv[i], "--dry-run") == 0) {
             cfg->dry_run = 1;
+        } else if (strcmp(argv[i], "--no-root-refresh") == 0) {
+            cfg->no_root_refresh = 1;
         } else if (strcmp(argv[i], "--simple") == 0) {
             if (cfg->layout_set && cfg->layout != LAYOUT_SIMPLE) {
                 log(TC(COLOR_RED COLOR_BOLD, S_ERR_LAYOUT_EXCLUSIVE));
@@ -2840,7 +2849,10 @@ static int copy_upgrade_payload_if_exists(const char *src, const char *dst, int 
         log(TC(COLOR_YELLOW, S_SKIPPED_FILE), src);
         return 0;
     }
-    if (shell_copy_file(src, dst, dry_run) != 0) {
+    /* Atómica: se escribe al lado y se renombra. El destino es el cargador o
+     * el kernel de una máquina que ya funciona, y un fallo de escritura a
+     * mitad de un `O_TRUNC` la deja sin arrancar. */
+    if (copy_file_replace(src, dst, dry_run) != 0) {
         log(TC(COLOR_RED COLOR_BOLD, S_ERR_COPY), src, dst);
         return -1;
     }
@@ -3128,14 +3140,22 @@ static void report_missing_payload(const char *path) {
     }
 }
 
-static int run_upgrade(const char *disk_path, int dry_run) {
+/* La parte de la actualización que vive en la raíz instalada. Es un fichero
+ * aparte por tamaño, y se incluye AQUÍ y no arriba porque usa las funciones de
+ * copia, montaje y fstab que se definen antes de esta línea. Está en la lista
+ * de fuentes de `install_eclipse` del xtask: si no, un cambio en él dejaría el
+ * binario del medio con el código viejo y nada lo diría. */
+#include "upgrade.h"
+
+static int run_upgrade(const char *disk_path, int refresh_root, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
     char root_dev[160];
     int rc = 0;
     const char *src_mnt = NULL;
     int mount_needed = 0;
-    int root_mounted = 0;
+    int root_we_mounted = 0;
+    char root_mnt[256] = "";
     char root_img_path[512] = "";
 
     if (discover_partitions(disk_path, &parts) != 0) {
@@ -3150,29 +3170,57 @@ static int run_upgrade(const char *disk_path, int dry_run) {
     log(T(S_PART_EFI), efi_dev);
     log(T(S_PART_ROOT), root_dev);
 
-    if (struct_file_exists("/boot/efi-staging/EFI/Boot/BootX64.efi")) {
+    /* La raíz instalada se monta SIEMPRE: de ella sale la versión que hay
+     * puesta, en ella se renuevan los ficheros de Eclipse y, cuando el medio
+     * no trae la ESP ya extraída, es donde cabe la imagen descomprimida (en
+     * RAM no cabe). */
+    if (mount_installed_root(root_dev, root_mnt, sizeof(root_mnt), &root_we_mounted,
+                             dry_run) != 0) {
+        root_mnt[0] = '\0';
+    }
+
+    if (root_mnt[0] != '\0') {
+        report_versions(root_mnt);
+    }
+
+    if (staging_dir_has_loader("/boot/efi-staging")) {
         log(T(S_EFI_STAGING));
         src_mnt = "/boot/efi-staging";
     } else {
+        uint64_t needed = 0;
+        uint64_t libres;
+
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
             report_missing_payload(EFI_IMAGE_GZ);
             log(T(S_NEED_LIVE_MEDIUM));
-            return -1;
+            rc = -1;
+            goto cleanup;
         }
-
-        /* Mount ROOT partition onto UPD_ROOT_MNT so we can write the decompressed image on disk instead of RAM (tmpfs) */
-        if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
-            return -1;
-        }
-        /* El ROOT ya instalado puede ser EclipseFS o btrfs: se prueban ambos. */
-        if (shell_mount(root_dev, UPD_ROOT_MNT, "eclipsefs", 0, dry_run) != 0 &&
-            shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
+        if (root_mnt[0] == '\0') {
             log(TC(COLOR_RED COLOR_BOLD, S_ERR_MOUNT_ROOT), root_dev);
-            return -1;
+            rc = -1;
+            goto cleanup;
         }
-        root_mounted = 1;
 
-        snprintf(root_img_path, sizeof(root_img_path), "%s/eclipse-upd-efi.img", UPD_ROOT_MNT);
+        snprintf(root_img_path, sizeof(root_img_path), "%s/eclipse-upd-efi.img", root_mnt);
+        /* Un intento anterior interrumpido deja esa imagen ahí: estorba en la
+         * raíz del sistema y se come el sitio que hace falta ahora. */
+        if (!dry_run) {
+            unlink(root_img_path);
+        }
+
+        /* La imagen EFI descomprimida es del tamaño de la partición (1 GiB con
+         * el resto a ceros), así que esto no es un detalle: sin sitio, el
+         * `gzread` muere a mitad y la actualización se queda sin fuente. */
+        if (gzip_uncompressed_size(EFI_IMAGE_GZ, &needed) == 0 && needed > 0) {
+            libres = fs_available_bytes(root_mnt);
+            if (libres > 0 && libres < needed + MIB) {
+                log(TC(COLOR_RED COLOR_BOLD, S_ERR_ROOT_NO_ROOM),
+                    needed / MIB, libres / MIB);
+                rc = -1;
+                goto cleanup;
+            }
+        }
 
         if (decompress_gz_to_path(EFI_IMAGE_GZ, root_img_path, dry_run) != 0) {
             log(TC(COLOR_RED COLOR_BOLD, S_ERR_EXTRACT_ROOT), EFI_IMAGE_GZ);
@@ -3223,31 +3271,108 @@ static int run_upgrade(const char *disk_path, int dry_run) {
 
     char dst_boot_dir[320], dst_zcore_dir[320];
     char dst_boot[400], dst_zcore[400], dst_initramfs[400];
-    snprintf(dst_boot_dir, sizeof(dst_boot_dir), "%s/EFI/Boot", efi_dest);
-    snprintf(dst_zcore_dir, sizeof(dst_zcore_dir), "%s/EFI/zCore", efi_dest);
+    if (snprintf(dst_boot_dir, sizeof(dst_boot_dir), "%s/EFI/Boot", efi_dest) < 0 ||
+        snprintf(dst_zcore_dir, sizeof(dst_zcore_dir), "%s/EFI/zCore", efi_dest) < 0) {
+        rc = -1;
+        goto cleanup_mount;
+    }
     if (shell_mkdir_p(dst_boot_dir, dry_run) != 0 ||
         shell_mkdir_p(dst_zcore_dir, dry_run) != 0) {
         rc = -1;
         goto cleanup_mount;
     }
 
-    /* Copiamos solamente el kernel y el bootloader, preservando rboot.conf */
-    char src_boot[256], src_zcore[256], src_initramfs[256];
-    snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/BootX64.efi", src_mnt);
+    /* Copiamos solamente el cargador, el kernel y el initramfs, preservando
+     * rboot.conf (la cmdline del usuario) y cualquier otra cosa de la ESP. */
+    char src_boot[400], src_zcore[400], src_initramfs[400];
+    const char *loader_name = NULL;
+
+    for (size_t i = 0; i < ESP_LOADER_COUNT; i++) {
+        snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/%s", src_mnt, ESP_LOADER_NAMES[i]);
+        if (struct_file_exists(src_boot)) {
+            loader_name = ESP_LOADER_NAMES[i];
+            break;
+        }
+    }
+    if (loader_name == NULL && dry_run) {
+        /* En seco no hay montaje, así que no hay nada que mirar: se dice qué
+         * nombre se buscaría y se sigue contando el resto del plan. */
+        loader_name = ESP_LOADER_NAMES[0];
+        log(TC(COLOR_YELLOW, S_DRY_LOADER_ASSUMED), loader_name);
+        snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/%s", src_mnt, loader_name);
+    }
+    if (loader_name == NULL) {
+        /* Ni un nombre de cargador conocido: antes esto terminaba con
+         * «ACTUALIZACIÓN COMPLETADA CON ÉXITO» sin haber copiado nada. */
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_LOADER_IN_MEDIUM));
+        snprintf(src_boot, sizeof(src_boot), "%s/EFI/Boot/%s", src_mnt, ESP_LOADER_NAMES[0]);
+        report_missing_payload(src_boot);
+        rc = -1;
+        goto cleanup_mount;
+    }
+    log(T(S_LOADER_NAME), loader_name);
+
     snprintf(src_zcore, sizeof(src_zcore), "%s/EFI/zCore/zcore.elf", src_mnt);
     snprintf(src_initramfs, sizeof(src_initramfs), "%s/EFI/zCore/initramfs.img", src_mnt);
-    snprintf(dst_boot, sizeof(dst_boot), "%s/EFI/Boot/BootX64.efi", efi_dest);
+    snprintf(dst_boot, sizeof(dst_boot), "%s/EFI/Boot/%s", efi_dest, loader_name);
     snprintf(dst_zcore, sizeof(dst_zcore), "%s/EFI/zCore/zcore.elf", efi_dest);
     snprintf(dst_initramfs, sizeof(dst_initramfs), "%s/EFI/zCore/initramfs.img", efi_dest);
+
+    if (!dry_run && !struct_file_exists(src_zcore)) {
+        /* Un cargador nuevo con el kernel viejo no es media actualización:
+         * es un arranque que puede no volver. */
+        log(TC(COLOR_RED COLOR_BOLD, S_ERR_NO_KERNEL_IN_MEDIUM), src_zcore);
+        rc = -1;
+        goto cleanup_mount;
+    }
+
+    /* Se escribe al lado y se renombra, así que hace falta sitio para la copia
+     * nueva ADEMÁS de la vieja. Una ESP llena a mitad de copia es una máquina
+     * que ya no arranca. */
+    {
+        uint64_t need = file_size_or_zero(src_boot) + file_size_or_zero(src_zcore) +
+                        file_size_or_zero(src_initramfs);
+        uint64_t libres = fs_available_bytes(efi_dest);
+
+        if (libres > 0 && need > 0 && libres < need + MIB) {
+            log(TC(COLOR_RED COLOR_BOLD, S_ERR_ESP_NO_ROOM),
+                need / 1024, libres / 1024);
+            rc = -1;
+            goto cleanup_mount;
+        }
+    }
 
     if (copy_upgrade_payload_if_exists(src_boot, dst_boot, dry_run) != 0 ||
         copy_upgrade_payload_if_exists(src_zcore, dst_zcore, dry_run) != 0) {
         rc = -1;
         goto cleanup_mount;
     }
-    copy_upgrade_payload_if_exists(src_initramfs, dst_initramfs, dry_run);
+    /* El initramfs va emparejado con el kernel: si el medio lo trae y la copia
+     * falla, el sistema arranca el kernel nuevo con el initramfs viejo. Antes
+     * ese fallo se descartaba sin mirarlo. */
+    if (copy_upgrade_payload_if_exists(src_initramfs, dst_initramfs, dry_run) != 0) {
+        rc = -1;
+        goto cleanup_mount;
+    }
     if (!dry_run) {
         sync();
+    }
+
+    /* La ESP ya está hecha: ahora los ficheros de Eclipse de la raíz. Este
+     * orden importa: si la ESP falla, la raíz se queda sin tocar y el sistema
+     * sigue siendo el de antes, entero. */
+    if (rc == 0 && root_mnt[0] != '\0') {
+        if (refresh_root) {
+            if (refresh_installed_root("", root_mnt, dry_run) != 0) {
+                rc = -1;
+            }
+            repair_fstab_placeholders(root_mnt, root_dev, efi_dev, dry_run);
+        } else {
+            log(TC(COLOR_YELLOW, S_REFRESH_ROOT_SKIPPED));
+        }
+        if (!dry_run) {
+            sync();
+        }
     }
 
 cleanup_mount:
@@ -3261,11 +3386,13 @@ cleanup:
     if (mount_needed) {
         shell_umount(UPD_STAGING_MNT, dry_run);
     }
-    if (root_mounted) {
+    if (root_mnt[0] != '\0') {
         if (root_img_path[0] != '\0' && !dry_run) {
             unlink(root_img_path);
         }
-        shell_umount(UPD_ROOT_MNT, dry_run);
+        if (root_we_mounted) {
+            shell_umount(root_mnt, dry_run);
+        }
     }
     if (rc == 0) {
         /* La partición EFI ya está desmontada: fija ROOT= en rboot.conf (no fatal). */
@@ -3519,7 +3646,7 @@ int main(int argc, char **argv) {
             patch_rboot_root_on_efi(efi_dev, root_dev, cfg.dry_run);
         }
     } else {
-        if (run_upgrade(cfg.disk_path, cfg.dry_run) != 0) {
+        if (run_upgrade(cfg.disk_path, !cfg.no_root_refresh, cfg.dry_run) != 0) {
             return 1;
         }
     }

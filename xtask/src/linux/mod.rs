@@ -2464,7 +2464,7 @@ impl LinuxRootfs {
         // string table lives in its own header, and a translation changed
         // there leaves the installer looking up to date while the image still
         // carries the old text, with nothing in any log to say so.
-        let sources = [source.clone(), dir.join("i18n.h")];
+        let sources = [source.clone(), dir.join("i18n.h"), dir.join("upgrade.h")];
         if executable.is_file()
             && sources.iter().all(|src| src.is_file())
             && self.cached_for_target(&executable)
@@ -5297,6 +5297,9 @@ mod installer_i18n_tests;
 
 #[cfg(test)]
 mod fstab_template_tests;
+
+#[cfg(test)]
+mod installer_upgrade_tests;
 
 #[cfg(test)]
 mod lunar_client_tests;

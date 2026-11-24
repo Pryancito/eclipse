@@ -60,8 +60,8 @@
     XB(S_TABLE_GPT, "GPT/UEFI") \
     X(S_TABLE_UNCHANGED, "Sin cambios", \
         "Unchanged") \
-    X(S_UPGRADE_SUMMARY, "Actualización selectiva (EFI: bootloader + kernel + initramfs)", \
-        "Selective upgrade (EFI: bootloader + kernel + initramfs)") \
+    X(S_UPGRADE_SUMMARY, "Actualización selectiva (EFI: cargador + kernel + initramfs; raíz: ficheros de Eclipse)", \
+        "Selective upgrade (EFI: bootloader + kernel + initramfs; root: Eclipse's own files)") \
     X(S_WORD_YES, "Sí", \
         "Yes") \
     XB(S_WORD_NO, "No") \
@@ -151,8 +151,8 @@
         "Choose the install mode:") \
     X(S_MODE_OPT_NEW, "  [1] Nueva instalación (reparticiona y reescribe imágenes)", \
         "  [1] New install (repartitions and rewrites images)") \
-    X(S_MODE_OPT_UPGRADE, "  [2] Actualización (Sin reparticionado ni reinstalacion de sistema.)", \
-        "  [2] Upgrade (no repartitioning and no system reinstall.)") \
+    X(S_MODE_OPT_UPGRADE, "  [2] Actualización (cargador, kernel y ficheros de Eclipse; sin reparticionar ni borrar datos)", \
+        "  [2] Upgrade (bootloader, kernel and Eclipse's own files; no repartitioning, no data loss)") \
     X(S_YES_MODE, "--yes activo: usando modo sugerido (%s).", \
         "--yes is on: using the suggested mode (%s).") \
     X(S_LAYOUT_FROM_CLI, "Esquema de particiones preseleccionado por CLI: %s", \
@@ -457,6 +457,48 @@
         "Eclipse OS has been installed on %s.") \
     X(S_UPGRADED_OK, "Eclipse OS se ha actualizado correctamente en %s.", \
         "Eclipse OS has been upgraded on %s.") \
+    X(S_VERSION_INSTALLED, " Versión instalada: %s", \
+        " Installed version: %s") \
+    X(S_VERSION_MEDIUM, " Versión del medio:  %s", \
+        " Medium version:    %s") \
+    X(S_VERSION_UNKNOWN, "La raíz instalada no tiene un /etc/os-release legible: no se sabe de qué versión viene.", \
+        "The installed root has no readable /etc/os-release: which version it comes from is unknown.") \
+    X(S_DRY_LOADER_ASSUMED, "[dry-run] Sin montar el medio no se puede mirar: se buscaría el cargador %s.", \
+        "[dry-run] With the medium unmounted there is nothing to look at: bootloader %s would be looked up.") \
+    X(S_LOADER_NAME, "Cargador que trae el medio: %s", \
+        "Bootloader the medium carries: %s") \
+    X(S_ERR_NO_LOADER_IN_MEDIUM, "ERROR: el medio no trae ningún cargador EFI conocido: no se actualiza nada.", \
+        "ERROR: the medium carries no known EFI bootloader: nothing is upgraded.") \
+    X(S_ERR_NO_KERNEL_IN_MEDIUM, "ERROR: el medio no trae el kernel (%s): un cargador nuevo con el kernel viejo puede no arrancar.", \
+        "ERROR: the medium carries no kernel (%s): a new bootloader with the old kernel may not boot.") \
+    X(S_ERR_ESP_NO_ROOM, "ERROR: en la partición EFI no caben los %" PRIu64 " KiB del cargador, el kernel y el initramfs (libres: %" PRIu64 " KiB).", \
+        "ERROR: the EFI partition has no room for the %" PRIu64 " KiB of bootloader, kernel and initramfs (free: %" PRIu64 " KiB).") \
+    X(S_ERR_ROOT_NO_ROOM, "ERROR: en la raíz instalada no caben los %" PRIu64 " MiB de la imagen EFI descomprimida (libres: %" PRIu64 " MiB).", \
+        "ERROR: the installed root has no room for the %" PRIu64 " MiB of the decompressed EFI image (free: %" PRIu64 " MiB).") \
+    X(S_ROOT_ALREADY_MOUNTED, "La raíz %s ya está montada en %s: se usa ese montaje.", \
+        "Root %s is already mounted at %s: that mount is used.") \
+    X(S_REFRESH_ROOT, "Renovando en la raíz instalada los ficheros de Eclipse (envoltorios, servicios, init)...", \
+        "Refreshing Eclipse's own files in the installed root (wrappers, services, init)...") \
+    X(S_REFRESH_ROOT_KEEPS, "  Se conservan /home, /root, los paquetes de apt y la configuración que ya haya.", \
+        "  /home, /root, the apt packages and whatever configuration is there are kept.") \
+    X(S_REFRESH_ROOT_DONE, "Raíz instalada: %d fichero(s) renovado(s).", \
+        "Installed root: %d file(s) refreshed.") \
+    X(S_REFRESH_ROOT_SKIPPED, "No se renueva la raíz instalada (--no-root-refresh): solo se ha actualizado la partición EFI.", \
+        "The installed root is not refreshed (--no-root-refresh): only the EFI partition was updated.") \
+    X(S_SKIPPED_SYMLINK, "Omitido (es un enlace simbólico): %s", \
+        "Skipped (it is a symbolic link): %s") \
+    X(S_WARN_NO_RENAME, "ADVERTENCIA: no se pudo renombrar sobre %s (%s): se copia encima.", \
+        "WARNING: could not rename onto %s (%s): copying over it instead.") \
+    X(S_WARN_CHMOD, "ADVERTENCIA: chmod en %s: %s", \
+        "WARNING: chmod on %s: %s") \
+    X(S_FSTAB_PLACEHOLDERS_FOUND, "El %s de la raíz instalada tenía marcadores sin sustituir: se arreglan.", \
+        "The installed root's %s had unreplaced placeholders: they are being fixed.") \
+    X(S_FSTAB_REPAIRED, "fstab de la raíz instalada arreglado (ROOT=%s, EFI=%s).", \
+        "The installed root's fstab is fixed (ROOT=%s, EFI=%s).") \
+    X(S_FSTAB_COMMENTED, "Comentada la línea de %s del fstab: su partición no se conoce desde aquí.", \
+        "Commented out the %s line of fstab: its partition is not known from here.") \
+    X(S_WARN_FSTAB_REPAIR, "ADVERTENCIA: no se pudo arreglar %s: %s", \
+        "WARNING: could not fix %s: %s") \
     X(S_APT_HINT, "El resto del sistema puede actualizarse con apt (p. ej. apt-get update && apt-get upgrade).", \
         "The rest of the system can be upgraded with apt (for example apt-get update && apt-get upgrade).") \
     X(S_ELAPSED, "Tiempo total transcurrido: %02d:%02d:%02d", \
