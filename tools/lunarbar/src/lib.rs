@@ -27,6 +27,7 @@ pub mod apps;
 pub mod clip;
 pub mod calc;
 pub mod claves;
+pub mod dispositivos;
 pub mod draw;
 pub mod files;
 pub mod fileops;

@@ -461,6 +461,18 @@ the bare token present (`nvidia.wlr_vulkan`). `auto` removes the option. The
 "Advanced boot" group uses this for `LOG`, `smp`, `renderer`, the NVIDIA flags
 and `measure`.
 
+The "Devices" page (a `tipo = dispositivos` block) shows each PCI function in
+`/sys/bus/pci/devices` with `lspci`'s names (`pci.ids`, the `hwdata-pci`
+package), who drives it and in what state: in use by the kernel, in use by
+its userspace driver, handed over but stopped, with a driver not enabled,
+with no driver, or needing none. Who drives what is data, `[driver:ID]`
+blocks in `80-dispositivos.claves` (`ids`, `fabricante`, `clase`, `nucleo`,
+`udriver`, `necesita`), and the state comes from `/proc/udrivers` and
+eclipse-init's services. TO USERSPACE / TO THE KERNEL adds or removes the
+device (`nvme@0`) in `rboot.conf`'s `udriver=` for the next boot; COPY IDS
+puts it on the clipboard and REPORT writes `~/dispositivos.txt`. The format is
+in `tools/lunarbar/src/dispositivos.rs`.
+
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH
 [group]` draws it without a compositor.

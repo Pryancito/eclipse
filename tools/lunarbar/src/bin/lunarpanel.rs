@@ -41,6 +41,9 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
 };
 
+#[path = "lunarpanel/disp.rs"]
+mod disp;
+
 // ── the measures the computation starts from ─────────────────────────────────
 
 const MARGIN: i32 = 48;
@@ -212,7 +215,7 @@ fn control(c: &Clave, x: i32, y: i32, room: i32, lang: Lang) -> Control {
                 caja: (after, y, VAL_W, CTRL_H),
             }
         }
-        Tipo::Abrir => {
+        Tipo::Abrir | Tipo::Dispositivos => {
             let w = up4(Canvas::text_width(lang.s(Key::panel_open_caps)) + 2 * PAD);
             Control::Boton((x, y, w, CTRL_H))
         }
@@ -326,6 +329,8 @@ struct Panel {
     status: String,
     tono: Tono,
     lang: Lang,
+    /// The devices page's rows and focus.
+    disp: disp::Disp,
 }
 
 impl Panel {
@@ -342,6 +347,7 @@ impl Panel {
             status: String::new(),
             tono: Tono::Plano,
             lang,
+            disp: disp::Disp::default(),
         }
     }
 
@@ -390,6 +396,7 @@ impl Panel {
             self.foco = 0;
             self.top = 0;
             self.busca.clear();
+            self.carga_disp();
         }
     }
 
@@ -660,7 +667,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
             if on { ink().text } else { ink().muted },
         );
         let held = p.cat.del_grupo(g).iter().any(|&i| p.pendiente[i].is_some());
-        let count = format!("{:02}", p.cat.del_grupo(g).len());
+        let count = format!("{:02}", p.cuenta_grupo(g));
         let cw = Canvas::text_width(&count);
         let col = if held {
             ink().gold
@@ -670,6 +677,12 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
             ink().dim
         };
         cv.text(&count, r.0 + r.2 - PAD - cw, ty, col);
+    }
+
+    // The devices page draws its own body and foot.
+    if let Some(ci) = p.pagina_disp() {
+        disp::draw(cv, &l, p, ci);
+        return;
     }
 
     // The page.
@@ -899,7 +912,7 @@ impl State {
     fn step(&mut self, dir: i32) {
         let Some(i) = self.focused() else { return };
         let c = &self.panel.cat.claves[i];
-        if c.tipo == Tipo::Abrir {
+        if matches!(c.tipo, Tipo::Abrir | Tipo::Dispositivos) {
             return;
         }
         let v = c.paso(self.panel.valor(i), dir);
@@ -909,13 +922,20 @@ impl State {
     fn activate(&mut self) {
         let Some(i) = self.focused() else { return };
         match self.panel.cat.claves[i].tipo {
-            Tipo::Abrir => self.open(i),
+            Tipo::Abrir | Tipo::Dispositivos => self.open(i),
             Tipo::SiNo => self.step(1),
             _ => self.apply(),
         }
     }
 
     fn open(&mut self, i: usize) {
+        // The devices block, found by a search: its page.
+        if self.panel.cat.claves[i].tipo == Tipo::Dispositivos {
+            let g = self.panel.cat.claves[i].grupo.clone();
+            let g = group_index(&self.panel.cat, Some(&g));
+            self.panel.pagina(g);
+            return;
+        }
         match claves::abre(&self.panel.cat.claves[i]) {
             Ok(()) => self.done = self.panel.pendientes() == 0,
             Err(e) => {
@@ -926,6 +946,10 @@ impl State {
     }
 
     fn key(&mut self, key: u32) {
+        if self.panel.pagina_disp().is_some() && self.disp_key(key) {
+            self.render();
+            return;
+        }
         let caben = self.layout().caben;
         let groups = self.panel.cat.grupos.len().max(1);
         match key {
@@ -979,6 +1003,10 @@ impl State {
             if self.panel.pendientes() == 0 {
                 self.done = true;
             }
+            return;
+        }
+        if self.panel.pagina_disp().is_some() && self.disp_click(x, y) {
+            self.render();
             return;
         }
         if hit(l.apply, x, y) {
@@ -1232,6 +1260,9 @@ fn sample(grupo: Option<&str>) -> Panel {
     if let Some(i) = p.cat.claves.iter().position(|c| c.id == "teclado.idioma") {
         p.elige(i, "no".into());
     }
+    if p.pagina_disp().is_some() {
+        disp::muestra(&mut p);
+    }
     p
 }
 
@@ -1318,6 +1349,7 @@ fn main() {
     let actual = cat.claves.iter().map(claves::valor_actual).collect();
     let mut panel = Panel::new(cat, actual, Lang::current());
     panel.grupo = group_index(&panel.cat, arg("--grupo").as_deref());
+    panel.carga_disp();
     let mut st = State::new(panel);
 
     let Ok(conn) = lunarbar::wl::connect() else {

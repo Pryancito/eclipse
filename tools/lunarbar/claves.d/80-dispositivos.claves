@@ -1,0 +1,105 @@
+# Eclipse OS: la página de dispositivos y la tabla de qué driver lleva cada
+# uno. Los nombres salen de pci.ids (hwdata-pci, lo que lee lspci); esto
+# solo dice quién los conduce. Se prueba en orden y gana el primero que
+# casa: los de ids concretos van antes que los de clase.
+# Formato: tools/lunarbar/src/dispositivos.rs.
+
+[grupo:dispositivos]
+es = Dispositivos
+en = Devices
+
+# Dónde está la línea de órdenes del núcleo, para el udriver= que pasa un
+# dispositivo a su driver de usuario en el siguiente arranque.
+[dispositivos]
+grupo   = dispositivos
+tipo    = dispositivos
+fichero = /boot/efi/EFI/Boot/rboot.conf
+montar  = /boot/efi
+clave   = cmdline
+es      = Dispositivos y drivers
+en      = Devices and drivers
+
+# ── discos: el núcleo los deja al usuario, salvo el de la raíz ──
+[driver:nvme]
+es      = udrv-nvme
+clase   = 0108
+udriver = nvme
+
+[driver:ahci]
+es      = udrv-ahci
+clase   = 010601
+udriver = ahci
+
+[driver:virtio-blk]
+es      = udrv-virtio-blk
+ids     = 1af4:1001 1af4:1042
+nucleo  = no
+udriver = virtio-blk
+
+# ── red ──
+[driver:virtio-net]
+es      = udrv-virtio-net
+ids     = 1af4:1000 1af4:1041
+nucleo  = no
+udriver = virtio-net
+
+[driver:e1000]
+es      = e1000
+ids     = 8086:100e 8086:100f
+
+[driver:pcnet32]
+es      = pcnet32
+ids     = 1022:2000 1022:2001
+
+[driver:e1000e]
+es      = e1000e
+fabricante = 8086
+clase   = 0200
+udriver = e1000e
+
+# ── entrada ──
+[driver:virtio-input]
+es      = udrv-virtio-input
+ids     = 1af4:1052
+nucleo  = no
+udriver = virtio-input
+
+[driver:xhci]
+es      = xhci
+clase   = 0c0330
+udriver = xhci
+
+# ── sonido e imagen ──
+[driver:hda]
+es      = hda
+clase   = 0403
+udriver = hda
+
+[driver:nvidia]
+es      = nvidia
+fabricante = 10de
+clase   = 03
+
+[driver:virtio]
+es      = virtio
+fabricante = 1af4
+
+[driver:gop]
+es      = framebuffer UEFI
+clase   = 0300
+
+# ── lo que no lleva driver propio ──
+[driver:puente]
+es       = —
+clase    = 06
+necesita = no
+
+[driver:sistema]
+es       = —
+clase    = 08
+necesita = no
+
+[driver:procesador]
+es       = —
+clase    = 0b
+necesita = no

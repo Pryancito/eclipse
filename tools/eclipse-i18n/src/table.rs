@@ -1232,4 +1232,43 @@ strings! {
     panel_on_reboot => { es: "se verá al reiniciar", en: "takes effect after a restart" },
     /// `sin aplicar · antes: tecno`: what a held change replaces.
     panel_was => { es: "antes:", en: "was:" },
+    // The "Dispositivos y drivers" page (tools/lunarbar/src/dispositivos.rs).
+    panel_dev_col_where => { es: "DÓNDE", en: "WHERE" },
+    panel_dev_col_driver => { both: "DRIVER" },
+    panel_dev_user => { es: "en uso · usuario", en: "in use · userspace" },
+    panel_dev_stopped => { es: "cedido, parado", en: "handed over, stopped" },
+    panel_dev_kernel => { es: "en uso · núcleo", en: "in use · kernel" },
+    panel_dev_free => { es: "driver sin activar", en: "driver not enabled" },
+    panel_dev_none => { es: "sin driver", en: "no driver" },
+    panel_dev_system => { es: "no necesita", en: "needs none" },
+    panel_dev_why_user => { es: "Lo lleva su driver de usuario", en: "Its userspace driver runs it" },
+    panel_dev_why_stopped => {
+        es: "El núcleo lo cedió, pero su servicio no está en marcha",
+        en: "The kernel handed it over, but its service is not running",
+    },
+    panel_dev_why_kernel => { es: "Lo lleva el núcleo", en: "The kernel runs it" },
+    panel_dev_why_free => {
+        es: "Tiene driver de usuario: actívalo y reinicia",
+        en: "It has a userspace driver: enable it and restart",
+    },
+    panel_dev_why_none => {
+        es: "Ningún driver lo reclama; copia sus ids para buscar uno",
+        en: "No driver claims it; copy its ids to look for one",
+    },
+    panel_dev_why_system => { es: "No lleva driver propio", en: "It takes no driver of its own" },
+    panel_dev_named => {
+        es: "pedido en udriver= de rboot.conf",
+        en: "asked for in rboot.conf's udriver=",
+    },
+    panel_dev_enable_caps => { es: "AL USUARIO", en: "TO USERSPACE" },
+    panel_dev_return_caps => { es: "AL NÚCLEO", en: "TO THE KERNEL" },
+    panel_dev_copy_caps => { es: "COPIAR IDS", en: "COPY IDS" },
+    panel_dev_report_caps => { es: "INFORME", en: "REPORT" },
+    panel_dev_devices => { es: "dispositivos", en: "devices" },
+    panel_dev_with_driver => { es: "con driver", en: "with a driver" },
+    panel_dev_no_names => {
+        es: "sin pci.ids (hwdata-pci): solo ids",
+        en: "no pci.ids (hwdata-pci): ids only",
+    },
+    panel_dev_no_bus => { es: "no hay bus PCI que leer", en: "no PCI bus to read" },
 }
