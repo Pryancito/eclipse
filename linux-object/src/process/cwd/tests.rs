@@ -239,3 +239,50 @@ fn a_directory_removed_in_dev_shm_is_gone_and_one_made_again_is_not_it() {
     assert!(!same(&proc.lookup_inode(".").unwrap(), &again));
     shm.unlink("wdr_l").unwrap();
 }
+
+/// A relative name is answered by the path cache under the absolute path it
+/// has from the working directory, and that answer follows the names: a file
+/// made or removed afterwards is seen, and one that was missing is found.
+#[test]
+fn a_relative_name_from_the_path_cache_follows_the_names() {
+    let proc = a_process_in("wdr_rel");
+    let d = proc.lookup_inode("/wdr_rel/d").unwrap();
+    assert!(proc.lookup_inode("x").is_err(), "not there yet");
+    let x = d.create("x", FileType::File, 0o644).unwrap();
+    crate::fs::dcache_invalidate();
+    assert!(same(&proc.lookup_inode("x").unwrap(), &x));
+    assert!(
+        same(&proc.lookup_inode("x").unwrap(), &x),
+        "a second time, from the cache"
+    );
+    assert!(same(&proc.lookup_inode("./x").unwrap(), &x));
+    assert!(same(
+        &proc.lookup_inode("../f").unwrap(),
+        &proc.lookup_inode("/wdr_rel/f").unwrap()
+    ));
+    d.unlink("x").unwrap();
+    crate::fs::dcache_invalidate();
+    assert!(proc.lookup_inode("x").is_err(), "removed");
+}
+
+/// After the working directory is renamed, a relative name is the one in it,
+/// not one at its old path, even when the old path now names another
+/// directory holding the same name.
+#[test]
+fn a_relative_name_after_a_rename_is_looked_up_where_the_directory_went() {
+    let proc = a_process_in("wdr_mv");
+    let top = proc.root_inode().lookup("wdr_mv").unwrap();
+    let inside = top
+        .lookup("d")
+        .unwrap()
+        .create("n", FileType::File, 0o644)
+        .unwrap();
+    assert!(same(&proc.lookup_inode("n").unwrap(), &inside));
+    top.move_("d", &top, "e").unwrap();
+    let other = top.create("d", FileType::Dir, 0o755).unwrap();
+    let decoy = other.create("n", FileType::File, 0o644).unwrap();
+    crate::fs::dcache_invalidate();
+    let found = proc.lookup_inode("n").unwrap();
+    assert!(same(&found, &inside));
+    assert!(!same(&found, &decoy));
+}

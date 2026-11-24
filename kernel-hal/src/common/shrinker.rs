@@ -311,7 +311,38 @@ pub fn registered_deferred() -> usize {
 /// Runs their `count`, which in the deferred registry may be as slow as their
 /// `scan`: for the reclaim worker only.
 pub fn deferred_reclaimable() -> usize {
-    DEFERRED.reclaimable()
+    let bytes = DEFERRED.reclaimable();
+    DEFERRED_COUNT.store(bytes, Ordering::Relaxed);
+    DEFERRED_COUNTED_AT.store(now_ns().saturating_add(1), Ordering::Relaxed);
+    bytes
+}
+
+/// [`deferred_reclaimable`] as last counted, `0` with [`DEFERRED_COUNTED_AT`]
+/// at `0` for never.
+static DEFERRED_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// When [`DEFERRED_COUNT`] was counted: the timer in ns, plus one so that `0`
+/// can mean never, or that what it counted has since been reclaimed.
+static DEFERRED_COUNTED_AT: AtomicU64 = AtomicU64::new(0);
+/// How old a count [`deferred_reclaimable_recent`] still answers with.
+pub const DEFERRED_COUNT_FRESH_NS: u64 = 1_000_000_000;
+
+fn now_ns() -> u64 {
+    crate::timer::timer_now().as_nanos() as u64
+}
+
+/// [`deferred_reclaimable`], counted at most once a second: for readers that
+/// only report the figure (`/proc/meminfo`'s `Cached:`).
+///
+/// Counting walks every page-cache entry and asks each VMO for its resident
+/// pages. `/proc/meminfo` counted on every read: 1.48 ms a read on hardware,
+/// Linux 4 us, and `free`, `top` and every task manager read it again and
+/// again.
+pub fn deferred_reclaimable_recent() -> usize {
+    let at = DEFERRED_COUNTED_AT.load(Ordering::Relaxed);
+    if at != 0 && now_ns().saturating_sub(at - 1) < DEFERRED_COUNT_FRESH_NS {
+        return DEFERRED_COUNT.load(Ordering::Relaxed);
+    }
+    deferred_reclaimable()
 }
 
 /// Ask the worker for `want` bytes, without doing any of the work.
@@ -341,7 +372,12 @@ pub fn run_deferred() -> usize {
     if want == 0 {
         return 0;
     }
-    DEFERRED.shrink_on(percpu_slot(crate::cpu::cpu_id() as usize), want)
+    let freed = DEFERRED.shrink_on(percpu_slot(crate::cpu::cpu_id() as usize), want);
+    if freed > 0 {
+        // What was counted has partly gone: the next reader counts again.
+        DEFERRED_COUNTED_AT.store(0, Ordering::Relaxed);
+    }
+    freed
 }
 
 /// Deferred reclaim passes, bytes freed, and passes refused as re-entrant.
