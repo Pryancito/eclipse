@@ -273,9 +273,11 @@ impl Link {
         for m in back.as_chunks::<BLOCK_MSG>().0.iter().take(n) {
             let (id, status) = decode(m);
             let slot = (id as usize) & (SLOTS - 1);
+            // In the order the request is not written in: a slot seen
+            // waiting has its own id already.
             let mine = slot < self.slots
-                && self.expect[slot].load(Ordering::Acquire) == id
-                && self.answers[slot].load(Ordering::Acquire) == PENDING;
+                && self.answers[slot].load(Ordering::Acquire) == PENDING
+                && self.expect[slot].load(Ordering::Acquire) == id;
             if !mine {
                 // A reply to nothing in flight: a driver answering twice, or
                 // late, after its request gave up and left the slot.
@@ -449,8 +451,10 @@ impl Link {
             }
             let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
             let id = (seq << SLOT_BITS) | slot as u32;
-            self.answers[slot].store(PENDING, Ordering::Relaxed);
+            // The id first: while the slot still waits under the id before,
+            // a late second answer to that one would pass for this one's.
             self.expect[slot].store(id, Ordering::Release);
+            self.answers[slot].store(PENDING, Ordering::Release);
             let sector = block_id as u64 + (part.at / SECTOR) as u64;
             let m = encode(op, id, (part.len / SECTOR) as u32, off as u32, sector);
             msgs[k * BLOCK_MSG..(k + 1) * BLOCK_MSG].copy_from_slice(&m);
@@ -484,8 +488,10 @@ impl Link {
         }];
         let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = (seq << SLOT_BITS) | slot as u32;
-        self.answers[slot].store(PENDING, Ordering::Relaxed);
+        // The id first: while the slot still waits under the id before,
+        // a late second answer to that one would pass for this one's.
         self.expect[slot].store(id, Ordering::Release);
+        self.answers[slot].store(PENDING, Ordering::Release);
         // On failure it may be on its way: the slot does not come back.
         self.send(&encode(OP_FLUSH, id, 0, 0, 0), 1, deadline)?;
         Ok((part, deadline))

@@ -259,9 +259,6 @@ impl Link {
                 return 0;
             }
         };
-        if n > 0 {
-            self.answered_at.store(now_ms(), Ordering::Release);
-        }
         for m in back.as_chunks::<MSG>().0.iter().take(n) {
             let reply = wire::decode(m);
             let slot = (reply.reqid as usize) & (SLOTS - 1);
@@ -274,6 +271,10 @@ impl Link {
                 warn!("served fs: an answer to no request ({})", reply.reqid);
                 continue;
             }
+            // Only an answer to a request counts as the server answering:
+            // one that writes anything else now and then is as hung as one
+            // that writes nothing, and is not to pass for alive.
+            self.answered_at.store(now_ms(), Ordering::Release);
             self.status[slot].store(reply.status, Ordering::Relaxed);
             self.ret_a[slot].store(reply.a, Ordering::Relaxed);
             self.ret_b[slot].store(reply.b, Ordering::Relaxed);
