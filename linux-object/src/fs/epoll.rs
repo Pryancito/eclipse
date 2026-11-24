@@ -327,6 +327,9 @@ pub struct Epoll {
     /// take a fresh snapshot -- as `ep_insert`/`ep_modify` wake `ep->wq` --
     /// instead of leaving it asleep until the covered backstop.
     changes: Arc<Mutex<crate::sync::EventBus>>,
+    /// When a look of a wait last polled every entry: the timer in ns, `0`
+    /// for never (see `fast`).
+    last_full_look: core::sync::atomic::AtomicU64,
 }
 
 struct EpollInner {
@@ -363,6 +366,12 @@ struct EpollInner {
     /// [`EpollInner::watch`], [`EpollInner::unwatch`] and
     /// [`EpollInner::forget_one`] add or remove an entry of either.
     by_file: BTreeSet<(usize, FileDesc)>,
+    /// The subscriptions of the level-triggered entries the first look of a
+    /// wait may pass (see `fast`). A subset of `interest_list`'s numbers;
+    /// [`EpollInner::watch`], [`EpollInner::unwatch`] and
+    /// [`EpollInner::forget_one`] drop an entry's, so a change of the mask or
+    /// the file is armed again from nothing.
+    armed: BTreeMap<FileDesc, fast::Armed>,
     /// The process every entry of `interest_list` is charged to,
     /// [`EPITEM_COST`] each: the one that made this epoll. Linux charges an
     /// `epitem` to whoever calls `epoll_ctl` (`GFP_KERNEL_ACCOUNT`), which
@@ -399,6 +408,7 @@ impl EpollInner {
     /// Says whether it replaced an entry.
     fn watch(&mut self, fd: FileDesc, event: EpollEvent, file: Arc<dyn FileLike>) -> bool {
         let key = Self::description_key(&file);
+        self.armed.remove(&fd);
         let old = self.interest_list.insert(fd, (event, file));
         if let Some((_, old)) = &old {
             // Out before the new pair goes in: an `EPOLL_CTL_MOD` of the same
@@ -413,6 +423,7 @@ impl EpollInner {
     /// Stop watching `fd`, and hand back what it watched.
     fn unwatch(&mut self, fd: FileDesc) -> Option<(EpollEvent, Arc<dyn FileLike>)> {
         let entry = self.interest_list.remove(&fd)?;
+        self.armed.remove(&fd);
         self.by_file.remove(&(Self::description_key(&entry.1), fd));
         self.uncharge_one();
         Some(entry)
@@ -450,6 +461,7 @@ impl EpollInner {
             self.uncharge_one();
         }
         self.edge.remove(&fd);
+        self.armed.remove(&fd);
         true
     }
 }
@@ -476,10 +488,12 @@ impl Epoll {
                 interest_list: BTreeMap::new(),
                 edge: BTreeMap::new(),
                 by_file: BTreeSet::new(),
+                armed: BTreeMap::new(),
                 account: crate::kmem::current(),
             }),
             flags: Mutex::new(flags),
             changes: crate::sync::EventBus::new(),
+            last_full_look: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -685,6 +699,39 @@ impl Epoll {
             };
             if current {
                 inner.edge.insert(*fd, *state);
+            }
+        }
+    }
+
+    /// Keep what a look learnt about the level-triggered entries it polled:
+    /// a subscription taken for one, and whether it was ready. Only for an
+    /// entry that still watches the file the look polled, with a mask that
+    /// is still level-triggered.
+    fn store_armed(&self, scanned: Vec<(FileDesc, Arc<dyn FileLike>, Option<fast::Armed>, bool)>) {
+        if scanned.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for (fd, file, armed, ready) in scanned {
+            let current = match inner.interest_list.get(&fd) {
+                Some((event, current)) => {
+                    event.events & EPOLLET == 0 && Arc::ptr_eq(current, &file)
+                }
+                None => false,
+            };
+            if !current {
+                continue;
+            }
+            match armed {
+                Some(mut armed) => {
+                    armed.ready = ready;
+                    inner.armed.insert(fd, armed);
+                }
+                None => {
+                    if let Some(kept) = inner.armed.get_mut(&fd) {
+                        kept.ready = ready;
+                    }
+                }
             }
         }
     }
@@ -959,6 +1006,16 @@ impl Epoll {
         // The place this wait has on its thread to be woken by a signal,
         // kept for the whole call and given back when it returns.
         let mut signal = crate::sync::SignalWake::new();
+        // The first look of the call may pass the quiet entries (see
+        // `fast`); every look after a sleep is a full one, as is the one a
+        // wait takes before it sleeps.
+        let mut quick = {
+            let now = begin_time.as_nanos() as u64;
+            let last = self
+                .last_full_look
+                .load(core::sync::atomic::Ordering::Relaxed);
+            last != 0 && now.saturating_sub(last) < fast::FULL_LOOK_NS
+        };
         loop {
             // Snapshot the interest list, keeping each watched file's OWN
             // `Arc<dyn FileLike>`. Two reasons this is the handle to poll,
@@ -977,26 +1034,49 @@ impl Epoll {
             //    faulting register). The Arc keeps exactly what we touch
             //    alive for as long as we touch it.
             let changes_seen = self.change_seq();
-            let (interest_list, edges): (Vec<Watched>, _) = {
+            if !quick {
+                self.last_full_look.store(
+                    kernel_hal::timer::timer_now().as_nanos() as u64,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            // Asked of the FILE and not of the fd number: a socket on a low
+            // descriptor (see `LinuxProcess::add_socket`) is still a socket,
+            // and a wait that misses it never pumps the network stack. Asked
+            // of every entry, the ones a quick look passes too: a quiet
+            // socket only wakes once the stack is pumped.
+            let (interest_list, arm, edges, watch_net, watch_interactive) = {
                 let inner = self.inner.lock();
                 let n = inner.interest_list.len();
-                let mut list = Vec::new();
+                let mut list: Vec<Watched> = Vec::new();
+                let mut arm: Vec<bool> = Vec::new();
                 // Fallible: a multi-GB download that densified the heap used
                 // to panic on the next `collect` / `grow_one` inside this wait.
-                if list.try_reserve_exact(n).is_err() {
+                if list.try_reserve_exact(n).is_err() || arm.try_reserve_exact(n).is_err() {
                     stats::returned_error();
                     return Err(LxError::ENOMEM);
                 }
+                let (mut net, mut interactive) = (false, false);
+                let mut armed = inner.armed.iter().peekable();
                 for (fd, (event, file)) in &inner.interest_list {
+                    if file.is_socket() {
+                        net = true;
+                    } else {
+                        interactive = true;
+                    }
+                    while armed.peek().is_some_and(|(k, _)| *k < fd) {
+                        armed.next();
+                    }
+                    let entry = armed.peek().filter(|(k, _)| *k == fd).map(|(_, a)| *a);
+                    let level = event.events & EPOLLET == 0;
+                    if quick && level && (event.events == 0 || entry.is_some_and(|a| a.quiet())) {
+                        continue;
+                    }
                     list.push((*fd, *event, file.clone()));
+                    arm.push(level && event.events != 0 && entry.is_none_or(|a| a.fired()));
                 }
-                (list, inner.edge.clone())
+                (list, arm, inner.edge.clone(), net, interactive)
             };
-            // Asked of the FILE and not of the fd number: a socket on a low
-            // descriptor (see `LinuxProcess::add_socket`) is still a socket,
-            // and a wait that misses it never pumps the network stack.
-            let watch_net = interest_list.iter().any(|(_, _, f)| f.is_socket());
-            let watch_interactive = interest_list.iter().any(|(_, _, f)| !f.is_socket());
             // (`watch_hid`, below, is asked only once the scan found nothing
             // and the wait is about to sleep: a call that returns at once has
             // no wait to choose a wake source for.)
@@ -1023,6 +1103,11 @@ impl Epoll {
             let mut events = Vec::new();
             let mut delivered = Vec::new();
             let mut scanned_edges = Vec::new();
+            let mut scanned_levels = Vec::new();
+            if scanned_levels.try_reserve(interest_list.len()).is_err() {
+                stats::returned_error();
+                return Err(LxError::ENOMEM);
+            }
             if events
                 .try_reserve(maxevents.min(interest_list.len()))
                 .is_err()
@@ -1035,8 +1120,16 @@ impl Epoll {
                 return Err(LxError::ENOMEM);
             }
             let now = kernel_hal::timer::timer_now();
-            for (fd, event, file) in &interest_list {
+            for (i, (fd, event, file)) in interest_list.iter().enumerate() {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
+                // Armed BEFORE the poll: whatever happens to the file after
+                // the poll below fires it, so a quick look that passes the
+                // entry for being quiet cannot pass a change it never saw.
+                let armed = if arm[i] {
+                    fast::Armed::arm(&**file, interest)
+                } else {
+                    None
+                };
                 // The publication counter of an edge-triggered entry, for
                 // the files that keep one. Read BEFORE the level: a
                 // publication after this line moves it past what is stored,
@@ -1055,6 +1148,9 @@ impl Epoll {
                     }
                 };
                 let mut ready = ready_events(event.events, &status);
+                if !edge_triggered {
+                    scanned_levels.push((*fd, file.clone(), armed, ready != 0));
+                }
                 if edge_triggered {
                     // A file that keeps no counter is measured against
                     // `UNCOUNTED_SEQ`, leaving `edge_step` the level alone to
@@ -1091,6 +1187,7 @@ impl Epoll {
             }
 
             self.store_edges(&scanned_edges);
+            self.store_armed(scanned_levels);
             if !events.is_empty() {
                 self.disarm_oneshot(&delivered);
                 stats::returned(timeout_msecs, events.len());
@@ -1103,6 +1200,13 @@ impl Epoll {
                     stats::returned(timeout_msecs, 0);
                     return Ok(Vec::new());
                 }
+            }
+            // A quick look that found nothing is not enough to sleep on: look
+            // at every entry first, as every look did before there was a
+            // quick one.
+            if quick {
+                quick = false;
+                continue;
             }
 
             // A blocking wait may be interrupted by a deliverable signal, but a
@@ -2043,6 +2147,11 @@ mod flag_tests {
         assert!(ep.poll(PollEvents::IN).unwrap().read);
     }
 }
+
+mod fast;
+
+#[cfg(test)]
+mod fast_tests;
 
 #[cfg(test)]
 mod by_file_tests;
