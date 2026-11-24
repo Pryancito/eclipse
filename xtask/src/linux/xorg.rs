@@ -388,6 +388,10 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // an id-and-class scan (`devices/`, `vendor`, `device`, `class`) are the
     // ones the kernel's `/sys/bus/pci` already publishes for libdrm.
     "pciutils-libs",
+    // The names `lspci` prints, `/usr/share/hwdata/pci.ids`: the control
+    // panel's "Dispositivos" page reads it for each card's maker, model and
+    // class (tools/lunarbar/src/dispositivos.rs). Data only, no program.
+    "hwdata-pci",
     // ── The image viewer ────────────────────────────────────────────────────
     // Until this was here, lunarfile's opener table pointed every image format
     // at `eclipse-firefox`: a PNG opened a browser tab, with the whole engine
@@ -2361,6 +2365,11 @@ mod tests {
     /// `[GFX1-]: glxtest: libpci missing` when the library is not there. The
     /// library comes in its own Alpine package, separate from `pciutils`
     /// (the `lspci` tool, which nothing in the image needs).
+    #[test]
+    fn the_devices_page_has_the_names_lspci_prints() {
+        assert!(DEFAULT_PACKAGES.contains(&"hwdata-pci"));
+    }
+
     #[test]
     fn firefox_gpu_probe_finds_libpci() {
         assert!(

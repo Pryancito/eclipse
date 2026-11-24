@@ -477,6 +477,18 @@ presente uno de los `valores` como palabra suelta (`nvidia.wlr_vulkan`).
 `auto` quita la opción. El grupo «Arranque avanzado» usa esto para `LOG`,
 `smp`, `renderer`, las banderas de NVIDIA y `measure`.
 
+La página «Dispositivos» (bloque `tipo = dispositivos`) enseña cada función
+PCI de `/sys/bus/pci/devices` con los nombres de `lspci` (`pci.ids`, paquete
+`hwdata-pci`), quién la conduce y en qué estado: en uso por el núcleo, en uso
+por su driver de usuario, cedida pero parada, con driver sin activar, sin
+driver o sin necesidad de uno. Quién conduce qué son datos, bloques
+`[driver:ID]` en `80-dispositivos.claves` (`ids`, `fabricante`, `clase`,
+`nucleo`, `udriver`, `necesita`), y el estado sale de `/proc/udrivers` y de
+los servicios de eclipse-init. AL USUARIO / AL NÚCLEO añade o quita el
+dispositivo (`nvme@0`) en el `udriver=` de `rboot.conf` para el siguiente
+arranque; COPIAR IDS lo pasa al portapapeles y INFORME escribe
+`~/dispositivos.txt`. Formato en `tools/lunarbar/src/dispositivos.rs`.
+
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
 `lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.

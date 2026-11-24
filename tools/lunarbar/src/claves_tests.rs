@@ -35,11 +35,12 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "arranque.nvidia",
             "arranque.nvidia.render",
             "arranque.nvkms",
-            "arranque.medida"
+            "arranque.medida",
+            "dispositivos"
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado", "dispositivos"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));

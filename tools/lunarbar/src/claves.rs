@@ -87,6 +87,10 @@ pub const DE_SERIE: &[(&str, &str)] = &[
         "70-avanzado.claves",
         include_str!("../claves.d/70-avanzado.claves"),
     ),
+    (
+        "80-dispositivos.claves",
+        include_str!("../claves.d/80-dispositivos.claves"),
+    ),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +99,11 @@ pub enum Tipo {
     SiNo,
     Numero { min: i64, max: i64, paso: i64 },
     Abrir,
+    /// The page of the machine's devices and their drivers
+    /// ([`crate::dispositivos`]): its `fichero`/`montar`/`clave` say where
+    /// the kernel command line is, for the `udriver=` a driver is turned on
+    /// with.
+    Dispositivos,
 }
 
 /// What of the kernel command line a block edits (see the module notes).
@@ -166,6 +175,8 @@ pub struct Catalogo {
     pub claves: Vec<Clave>,
     /// One line per block left out, and why.
     pub avisos: Vec<String>,
+    /// The `[driver:ID]` blocks: which driver takes which device.
+    pub drivers: Vec<crate::dispositivos::Driver>,
 }
 
 /// A value the data may carry: no spaces, quotes, `$`, `;` or newlines, so
@@ -218,7 +229,7 @@ impl Clave {
         match &self.tipo {
             Tipo::Elegir | Tipo::SiNo => self.valores.iter().any(|x| x.v == v),
             Tipo::Numero { min, max, .. } => v.parse::<i64>().is_ok_and(|n| n >= *min && n <= *max),
-            Tipo::Abrir => false,
+            Tipo::Abrir | Tipo::Dispositivos => false,
         }
     }
 
@@ -246,7 +257,7 @@ impl Clave {
                     .unwrap_or(*min);
                 n.clamp(*min, *max).to_string()
             }
-            Tipo::Abrir => String::new(),
+            Tipo::Abrir | Tipo::Dispositivos => String::new(),
         }
     }
 
@@ -266,7 +277,7 @@ impl Clave {
                 let n = v.parse::<i64>().unwrap_or(*min);
                 (n + dir as i64 * paso).clamp(*min, *max).to_string()
             }
-            Tipo::Abrir => String::new(),
+            Tipo::Abrir | Tipo::Dispositivos => String::new(),
         }
     }
 
@@ -362,6 +373,7 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
             paso: 1,
         },
         "abrir" => Tipo::Abrir,
+        "dispositivos" => Tipo::Dispositivos,
         t => return Err(format!("tipo desconocido «{t}»")),
     };
     let fichero = b.get("fichero").map(PathBuf::from);
@@ -376,7 +388,7 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
         Some("palabra") => true,
         Some(f) => return Err(format!("formato desconocido «{f}»")),
     };
-    if tipo != Tipo::Abrir && (fichero.is_none() || (key.is_none() && !palabra)) {
+    if !matches!(tipo, Tipo::Abrir) && (fichero.is_none() || (key.is_none() && !palabra)) {
         return Err("falta «fichero» o «clave»".into());
     }
     let montar = b.get("montar").map(PathBuf::from);
@@ -472,6 +484,19 @@ impl Catalogo {
     /// Adds one file's blocks. `origen` names it in the warnings.
     pub fn lee_texto(&mut self, text: &str, origen: &str) {
         for b in bloques(text, origen, &mut self.avisos) {
+            if let Some(d) = b.cabecera.strip_prefix("driver:") {
+                match crate::dispositivos::Driver::de_campos(d.trim(), |k| b.get(k)) {
+                    Ok(x) if self.drivers.iter().any(|y| y.id == x.id) => self.avisos.push(format!(
+                        "{}: [{}] repetido, se queda el primero",
+                        b.donde, b.cabecera
+                    )),
+                    Ok(x) => self.drivers.push(x),
+                    Err(why) => self
+                        .avisos
+                        .push(format!("{}: [{}] {why}", b.donde, b.cabecera)),
+                }
+                continue;
+            }
             if let Some(g) = b.cabecera.strip_prefix("grupo:") {
                 let g = g.trim();
                 let grupo = Grupo {
@@ -611,8 +636,7 @@ pub fn lee_ultima(text: &str, key: &str) -> Option<String> {
         .map(|l| l.trim_end_matches('\r').trim())
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
-        .filter(|(k, _)| k.trim() == key)
-        .last()
+        .rfind(|(k, _)| k.trim() == key)
         .map(|(_, v)| v.trim().to_string())
 }
 
@@ -848,18 +872,38 @@ pub fn aplica(c: &Clave, v: &str) -> Result<(), String> {
         Some(k) => pon_clave(&old, k, v),
         None => return Err(format!("{} no dice qué clave escribir", c.id)),
     };
+    escribe(f, &new)
+}
+
+/// `f` holds `new`: through a sibling temp file renamed over it, or written
+/// in place where the filesystem cannot rename over a file.
+fn escribe(f: &Path, new: &str) -> Result<(), String> {
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
     let tmp = f.with_extension(format!("lunarpanel.{}", std::process::id()));
-    let atomic = std::fs::write(&tmp, &new).and_then(|()| std::fs::rename(&tmp, f));
+    let atomic = std::fs::write(&tmp, new).and_then(|()| std::fs::rename(&tmp, f));
     if atomic.is_ok() {
         return Ok(());
     }
     // A filesystem that cannot rename over a file (the ESP's FAT server may
     // not): the file is rewritten in place instead.
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(f, &new).map_err(|e| format!("{}: {e}", f.display()))
+    std::fs::write(f, new).map_err(|e| format!("{}: {e}", f.display()))
+}
+
+/// `c`'s file changed by `cambia`, which is handed what is there: for an
+/// edit no single value spells (a driver added to `udriver=`). The volume
+/// is mounted first and the file must be there: it is edited, never made.
+pub fn edita(c: &Clave, cambia: impl FnOnce(&str) -> String) -> Result<(), String> {
+    let Some(f) = &c.fichero else {
+        return Err(format!("{} no dice dónde escribir", c.id));
+    };
+    if let Some(m) = &c.montar {
+        asegura_montaje(m)?;
+    }
+    let old = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+    escribe(f, &cambia(&old))
 }
 
 /// Starts an `abrir`'s command and does not wait for it.
