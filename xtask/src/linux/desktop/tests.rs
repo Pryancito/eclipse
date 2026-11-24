@@ -2853,7 +2853,9 @@ fn a_zone_in_the_timezone_file_beats_its_country_at_boot() {
     let _ = fs::remove_dir_all(&dir);
     let start = text.find("resolve_boot() {").expect("resolve_boot");
     let body = &text[start..start + text[start..].find("\n}\n").unwrap()];
-    let file_tz = body.find("file_val tz").expect("resolve_boot reads the file's tz");
+    let file_tz = body
+        .find("file_val tz")
+        .expect("resolve_boot reads the file's tz");
     let file_country = body.find("file_val country").unwrap();
     let cmd_country = body.find("cmdline_val country").unwrap();
     assert!(

@@ -365,6 +365,12 @@ impl ReadinessSub {
             kind: UnsubKind::Noop,
         }
     }
+
+    /// Whether nothing was stored: the waker fired at subscribe time, or the
+    /// bus could not hold the callback. Either way no later event reaches it.
+    pub fn is_noop(&self) -> bool {
+        matches!(self.kind, UnsubKind::Noop)
+    }
 }
 
 impl Drop for ReadinessSub {
