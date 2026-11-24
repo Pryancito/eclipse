@@ -475,6 +475,25 @@ const LIVE_KEEP: [&str; 9] = [
     "usr/local/bin",
 ];
 
+/// Whether `rel` (a path relative to the root, no leading slash) travels in
+/// the live/installer root, i.e. whether it is under a [`LIVE_KEEP`] entry.
+///
+/// The installer's `--mode upgrade` refreshes Eclipse's own files in the
+/// installed root by copying them from its OWN root, which is this list and
+/// nothing else. A path that falls out of `LIVE_KEEP` makes that refresh copy
+/// nothing, with no error anywhere: see
+/// `installer_upgrade_tests::la_actualizacion_solo_renueva_rutas_que_el_medio_lleva`.
+#[cfg(test)]
+pub(crate) fn live_keep_covers(rel: &str) -> bool {
+    let rel = rel.trim_start_matches('/');
+    LIVE_KEEP.iter().any(|keep| {
+        rel == *keep
+            || (rel.len() > keep.len()
+                && rel.starts_with(keep)
+                && rel.as_bytes()[keep.len()] == b'/')
+    })
+}
+
 /// The services whose row ships in `etc` and whose program does not: taken out
 /// of the live/installer root after [`build_live_rootfs`] has copied it.
 ///
