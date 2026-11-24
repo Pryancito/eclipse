@@ -1,6 +1,7 @@
 //! `/etc/eclipse/entorno`: the desktop settings that used to live only in
 //! environment variables (`LUNAR_TEXT`, `LUNAR_FX`, `LUNARBAR_HEIGHT`,
-//! `LUNARBG_STATIC`, `SILVERSURFER_ADBLOCK`), kept in a file so that the
+//! `LUNARBG_STATIC`, `SILVERSURFER_ADBLOCK`; and `LUNAR_ACCENT`,
+//! `LUNAR_CLOCK`, which never were variables), kept in a file so that the
 //! control panel can change them.
 //!
 //! The file is `NAME=value` lines, `#` comments; `eclipse-entorno` (written

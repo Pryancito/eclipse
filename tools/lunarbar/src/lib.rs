@@ -23,6 +23,7 @@
 //! over wlr-data-control, lunarhunter over xdg-shell + wl_shm: no GTK, no
 //! D-Bus, no gdk-pixbuf, no fontconfig, no locale.
 
+pub mod acento;
 pub mod apps;
 pub mod clip;
 pub mod calc;

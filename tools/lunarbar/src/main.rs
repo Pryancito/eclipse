@@ -124,7 +124,7 @@ use wp_cursor_shape_device_v1::Shape;
 
 /// Every colour the panel draws with, so a look is one value and not a
 /// scattering of constants.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct Pal {
     bar_bg: Rgb,
     rule: Rgb,
@@ -284,7 +284,10 @@ fn pal_of(look: Look) -> &'static Pal {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
-        Look::Tecno => &PAL_TECNO,
+        Look::Tecno => {
+            static T: std::sync::OnceLock<Pal> = std::sync::OnceLock::new();
+            lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
+        }
         Look::Abyss => &PAL_ABYSS,
     }
 }

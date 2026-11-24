@@ -128,8 +128,29 @@ pub fn set_kbd_layout(layout: &str) {
     let _ = f.write_all(b"\n");
 }
 
-/// Wall clock "HH:MM" (24h). Uses libc localtime_r so a set TZ is honoured;
-/// with no TZ, musl returns UTC — fine for a bar clock.
+/// Whether the clock is on 12 hours: `LUNAR_CLOCK=12` in the environment or
+/// `/etc/eclipse/entorno` (the control panel's "Formato del reloj"). Read
+/// once per process.
+pub fn reloj_12() -> bool {
+    static DOCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DOCE.get_or_init(|| lunartext::entorno::var("LUNAR_CLOCK").is_some_and(|v| v.trim() == "12"))
+}
+
+/// `17:42`, or `5:42 PM` on 12 hours (`12:05 AM` just after midnight).
+pub fn hora(h: i32, m: i32, doce: bool) -> String {
+    if !doce {
+        return format!("{h:02}:{m:02}");
+    }
+    let h12 = match h % 12 {
+        0 => 12,
+        x => x,
+    };
+    format!("{h12}:{m:02} {}", if h < 12 { "AM" } else { "PM" })
+}
+
+/// Wall clock: "HH:MM", or "H:MM AM/PM" with [`reloj_12`]. Uses libc
+/// localtime_r so a set TZ is honoured; with no TZ, musl returns UTC — fine
+/// for a bar clock.
 pub fn clock_hhmm() -> String {
     unsafe {
         // Infer the platform time type — naming `libc::time_t` is deprecated
@@ -140,7 +161,7 @@ pub fn clock_hhmm() -> String {
         if libc::localtime_r(&t, &mut tm).is_null() {
             return "--:--".into();
         }
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+        hora(tm.tm_hour, tm.tm_min, reloj_12())
     }
 }
 
@@ -616,6 +637,16 @@ fn volume_amixer() -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_clock_reads_on_24_or_12_hours() {
+        assert_eq!(hora(17, 42, false), "17:42");
+        assert_eq!(hora(7, 5, false), "07:05");
+        assert_eq!(hora(17, 42, true), "5:42 PM");
+        assert_eq!(hora(0, 5, true), "12:05 AM");
+        assert_eq!(hora(12, 0, true), "12:00 PM");
+        assert_eq!(hora(11, 59, true), "11:59 AM");
+    }
     use super::*;
 
     /// The two header lines this kernel's `proc_net_dev_content` writes.

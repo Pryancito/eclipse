@@ -13,6 +13,8 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
         ids,
         [
             "aspecto",
+            "acento",
+            "reloj",
             "idioma",
             "teclado",
             "teclado.idioma",

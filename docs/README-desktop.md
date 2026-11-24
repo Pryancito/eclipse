@@ -468,6 +468,11 @@ Los escribe `eclipse-entorno NOMBRE VALOR`, que solo admite esos nombres y
 palabras sencillas, borra la línea con `auto` y pide a eclipse-init que
 reinicie el fondo o la barra. Los programas lo leen al arrancar
 (`lunartext::entorno`); una variable puesta en el entorno sigue mandando.
+Ahí viven también `LUNAR_ACCENT` (`cian`, `verde`, `violeta`, `rojo`: el
+acento del aspecto `tecno`, que cambia el cian de la barra, los menús, el
+panel y las herramientas lunar; los corchetes dorados no cambian) y
+`LUNAR_CLOCK` (`24` o `12`, el reloj de la barra y de la pantalla de bloqueo).
+Los bordes de labwc, Abyss y el fondo conservan su color por ahora.
 
 `arranque = CLAVE` edita una opción dentro de la línea de órdenes del núcleo
 que guarda `clave` (el `cmdline=` de `rboot.conf`, cuya última línea es la que

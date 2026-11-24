@@ -19,3 +19,35 @@ es      = Aspecto del escritorio
 en      = Desktop look
 ayuda   = Colores, bordes y barras de todo el escritorio; la barra y el fondo se reinician
 ayuda.en = Colours, borders and bars of the whole desktop; the bar and wallpaper restart
+
+# El color de señal de tecno (el cian): barra, menús, lanzador, panel y las
+# herramientas lunar. El oro de los corchetes no cambia. Va a
+# /etc/eclipse/entorno con eclipse-entorno, que reinicia la barra y el fondo.
+[acento]
+grupo   = apariencia
+fichero = /etc/eclipse/entorno
+clave   = LUNAR_ACCENT
+tipo    = elegir
+valores = cian:Cian verde:Verde violeta:Violeta rojo:Rojo
+valores.en = cian:Cyan verde:Green violeta:Violet rojo:Red
+defecto = cian
+aplicar = /usr/local/bin/eclipse-entorno LUNAR_ACCENT {}
+reabrir = si
+es      = Color de acento
+en      = Accent colour
+ayuda   = Aspecto tecno: barra, menús, panel y herramientas; el oro no cambia
+ayuda.en = Tecno look: bar, menus, panel and tools; the gold stays
+
+[reloj]
+grupo   = apariencia
+fichero = /etc/eclipse/entorno
+clave   = LUNAR_CLOCK
+tipo    = elegir
+valores = 24:24_horas 12:12_horas
+valores.en = 24:24-hour 12:12-hour
+defecto = 24
+aplicar = /usr/local/bin/eclipse-entorno LUNAR_CLOCK {}
+es      = Formato del reloj
+en      = Clock format
+ayuda   = La barra y la pantalla de bloqueo
+ayuda.en = The bar and the lock screen

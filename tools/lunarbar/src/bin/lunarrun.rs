@@ -62,6 +62,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 // ── palette ──────────────────────────────────────────────────────────────────
 
 /// The colours of one look. Two instances, picked from `/etc/eclipse/look`.
+#[derive(Clone)]
 struct Palette {
     /// Full-screen dim behind the panel (KRunner dims the desktop too).
     scrim: Rgb,
@@ -157,7 +158,10 @@ fn palette(look: Look) -> &'static Palette {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
-        Look::Tecno => &PAL_TECNO,
+        Look::Tecno => {
+            static T: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+            lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
+        }
         Look::Abyss => &PAL_ABYSS,
     }
 }

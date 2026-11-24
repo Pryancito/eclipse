@@ -50,6 +50,7 @@ const GRACE_MS: u128 = 600;
 
 // ── palette ──────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Palette {
     ground: Rgb,
     text: Rgb,
@@ -111,7 +112,10 @@ const PAL_ABYSS: Palette = Palette {
 
 fn palette(look: Look) -> &'static Palette {
     match look {
-        Look::Tecno => &PAL_TECNO,
+        Look::Tecno => {
+            static T: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+            lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
+        }
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Kde => &PAL_KDE,
         Look::Win11 => &PAL_WIN11,
@@ -171,7 +175,8 @@ fn date_line(c: &Clock, lang: Lang) -> String {
 }
 
 fn hm(c: &Clock) -> String {
-    format!("{:02}:{:02}", c.hour, c.min)
+    // The bar's format: 24 hours, or 12 with LUNAR_CLOCK=12.
+    lunarbar::sysinfo::hora(c.hour as i32, c.min as i32, lunarbar::sysinfo::reloj_12())
 }
 
 /// How long it has been locked: "hace 1 h 05 min" / "for 1 h 05 min".

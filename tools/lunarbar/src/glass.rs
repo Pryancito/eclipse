@@ -91,7 +91,7 @@ pub fn frost(cv: &mut Canvas) {
 /// The colours of the clients that were drawn for `tecno` alone (lunarmon,
 /// lunarnet, lunarnotes, lunardesk, lunarshot), by role, in the two looks
 /// they wear: `tecno` everywhere but the Abyss session, and the glass in it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ink {
     /// The window ground; under `abyss`, what [`frost`] makes the tint.
     pub ground: Rgb,
@@ -171,10 +171,14 @@ pub fn on() -> bool {
 
 /// This process's [`Ink`].
 pub fn ink() -> &'static Ink {
+    // The accent chosen in the panel takes the place of tecno's cyan.
+    static ABYSS: std::sync::OnceLock<Ink> = std::sync::OnceLock::new();
+    static TECNO: std::sync::OnceLock<Ink> = std::sync::OnceLock::new();
+    let tine = |i: &mut Ink| i.cyan = crate::acento::tinta(i.cyan);
     if on() {
-        &INK_ABYSS
+        crate::acento::tenida(&ABYSS, &INK_ABYSS, tine)
     } else {
-        &INK_TECNO
+        crate::acento::tenida(&TECNO, &INK_TECNO, tine)
     }
 }
 
