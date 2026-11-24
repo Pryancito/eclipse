@@ -343,6 +343,7 @@ fn with_fakes<T>(direct_held: usize, deferred_held: usize, body: impl FnOnce() -
     direct_one::reset(direct_held);
     deferred_one::reset(deferred_held);
     DEMAND.store(0, Ordering::Relaxed);
+    DEFERRED_COUNTED_AT.store(0, Ordering::Relaxed);
     let out = body();
     direct_one::reset(0);
     deferred_one::reset(0);
@@ -504,6 +505,32 @@ fn the_demand_is_what_direct_reclaim_left_short() {
             pending(),
             2 << 20,
             "the demand is not what direct reclaim left short"
+        );
+    });
+}
+
+/// `/proc/meminfo`'s count is the last one for a second, and a pass that gave
+/// something back makes the next reader count again.
+#[test]
+fn a_reported_count_is_reused_until_a_pass_gives_something_back() {
+    with_deferred_fake(8 << 20, || {
+        assert_eq!(
+            deferred_reclaimable_recent(),
+            8 << 20,
+            "the first read counts"
+        );
+        deferred_one::reset(6 << 20);
+        assert_eq!(
+            deferred_reclaimable_recent(),
+            8 << 20,
+            "a second read within the second counted again"
+        );
+        request(1 << 20);
+        assert!(run_deferred() > 0);
+        assert_eq!(
+            deferred_reclaimable_recent(),
+            deferred_reclaimable(),
+            "a read after a pass that freed memory kept the old count"
         );
     });
 }

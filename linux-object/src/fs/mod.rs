@@ -3178,6 +3178,12 @@ impl LinuxProcess {
             }
             return Ok(inode);
         }
+        if dirfd == FileDesc::CWD && follow {
+            if let Some(found) = self.lookup_from_cwd_cached(&root, path, follow_max_depth, walked)
+            {
+                return found;
+            }
+        }
         // The walk goes on from where the directory is, by its name.
         let (start, from) = if dirfd == FileDesc::CWD {
             self.working_directory()?

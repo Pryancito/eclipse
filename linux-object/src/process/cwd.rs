@@ -19,6 +19,7 @@
 use super::*;
 use crate::fs::{FileDesc, Walker};
 use core::any::Any;
+use rcore_fs::vfs::Walked;
 use rcore_fs_mountfs::MNode;
 
 /// The directory a process is in, held.
@@ -125,6 +126,61 @@ impl LinuxProcess {
             }
         }
         Some(path)
+    }
+
+    /// What the relative `path` leads to from the working directory, found
+    /// by the absolute path it has there, so the path cache can answer it.
+    /// `None` when that is not known to be the same walk: the directory's
+    /// path was not checked at the cache's epoch now, it is in `/proc`,
+    /// `/sys` or `/dev`, or the walk from the root failed in a way the walk
+    /// from the directory might not (a directory above it that the caller
+    /// may not search, which Linux never asks about). The caller walks then.
+    ///
+    /// Relative names were walked from the directory every time, one
+    /// filesystem lookup per component: eclipse-bench on hardware gave
+    /// 3.4 us a component and 10 us for `stat("./dir/file")`, Linux 27 ns
+    /// and 0.5 us.
+    pub(crate) fn lookup_from_cwd_cached(
+        &self,
+        root: &Arc<dyn INode>,
+        path: &str,
+        follow_max_depth: usize,
+        walked: &mut Walked,
+    ) -> Option<LxResult<Arc<dyn INode>>> {
+        let now = crate::fs::dcache::epoch();
+        let from = self.working_directory_path()?;
+        if self.inner.lock().working_directory.as_ref()?.seen != now {
+            return None;
+        }
+        let abs = match from.as_str() {
+            "/" => format!("/{}", path),
+            _ => format!("{}/{}", from, path),
+        };
+        if crate::fs::virtual_fs_top(&abs).is_some() {
+            return None;
+        }
+        let mut tried = walked.clone();
+        if let Some(inode) = crate::fs::dcache::get(root, &abs, &mut tried) {
+            *walked = tried;
+            return Some(Ok(inode));
+        }
+        if crate::fs::dcache::is_absent(root, &abs) {
+            return Some(Err(LxError::ENOENT));
+        }
+        match root.lookup_walked(&abs, follow_max_depth, Some(&mut tried)) {
+            Ok(inode) => {
+                crate::fs::dcache::remember(now, root, &abs, &inode, &tried);
+                *walked = tried;
+                Some(Ok(inode))
+            }
+            // No directory on the way was a question: the miss is the walk
+            // from the working directory's too.
+            Err(rcore_fs::vfs::FsError::EntryNotFound) if tried.gates.is_empty() => {
+                crate::fs::dcache::note_absent(now, root, &abs, &tried);
+                Some(Err(LxError::ENOENT))
+            }
+            Err(_) => None,
+        }
     }
 
     /// What `path`, from the root and through no link, names now. From the

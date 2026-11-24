@@ -3218,7 +3218,7 @@ fn proc_meminfo_content() -> String {
     // which is the point of a cache, and which `free` showed as memory the
     // program never returned.
     let cached = kernel_hal::shrinker::reclaimable()
-        .saturating_add(kernel_hal::shrinker::deferred_reclaimable());
+        .saturating_add(kernel_hal::shrinker::deferred_reclaimable_recent());
     meminfo_text(used, total, kheap_used, kheap_total, cached)
 }
 
