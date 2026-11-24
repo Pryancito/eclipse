@@ -996,7 +996,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // nvidia.nouveau_uapi, but with a software-default labwc
                 // session unless explicit wlroots GPU flags are present)
                 // shadows the apk-installed binary.
-                "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+                "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games".into(),
                 "ENV=/etc/profile".into(),
                 "HOME=/root".into(),
                 "TERM=xterm-256color".into(),

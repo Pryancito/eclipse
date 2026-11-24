@@ -1454,15 +1454,35 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           \x20 \x20 export DBUS_SESSION_BUS_ADDRESS\n\
           \x20 \x20 say \"eclipse-freedoom: session bus muzzled for the engine (ECLIPSE_FREEDOOM_BUS=1 keeps it)\" ;;\n\
           esac\n\
+          # Where an engine can live. Debian/Ubuntu put GAME binaries in\n\
+          # /usr/games (policy 9.1.1): the image's engine is\n\
+          # /usr/games/chocolate-doom, and the apt-era launchers are\n\
+          # /usr/games/freedoom{1,2}. Alpine put all of them in /usr/bin, so\n\
+          # a plain `command -v` used to be enough and stopped being enough\n\
+          # the day the rootfs switched to apt -- this wrapper then reported\n\
+          # \"no Doom engine installed\" with the engine sitting in the image.\n\
+          # PATH is EXTENDED and not merely searched, so an engine that execs\n\
+          # a sibling of its own (chocolate-setup, chocolate-server) finds it.\n\
+          case \":$PATH:\" in\n\
+          \x20 *:/usr/games:*) ;;\n\
+          \x20 *) PATH=\"$PATH:/usr/local/games:/usr/games\"; export PATH ;;\n\
+          esac\n\
+          engine_path() {\n\
+          \x20 command -v \"$1\" 2>/dev/null && return 0\n\
+          \x20 for d in /usr/games /usr/local/games /usr/bin /usr/local/bin /bin; do\n\
+          \x20 \x20 [ -x \"$d/$1\" ] && { echo \"$d/$1\"; return 0; }\n\
+          \x20 done\n\
+          \x20 return 1\n\
+          }\n\
           # Software-rendering engines first: on a stack whose best GL is\n\
           # llvmpipe they are the ones that run at full speed.\n\
-          for e in chocolate-doom crispy-doom prboom-plus prboom; do\n\
-          \x20 if command -v \"$e\" >/dev/null 2>&1; then\n\
-          \x20 \x20 echo \"eclipse-freedoom: engine $e\"\n\
-          \x20 \x20 exec \"$e\" -iwad \"$IWAD\" \"$@\"\n\
+          for e in chocolate-doom crispy-doom dsda-doom woof prboom-plus prboom; do\n\
+          \x20 if bin=$(engine_path \"$e\"); then\n\
+          \x20 \x20 echo \"eclipse-freedoom: engine $bin\"\n\
+          \x20 \x20 exec \"$bin\" -iwad \"$IWAD\" \"$@\"\n\
           \x20 fi\n\
           done\n\
-          if command -v gzdoom >/dev/null 2>&1; then\n\
+          if bin=$(engine_path gzdoom); then\n\
           \x20 # GZDoom needs GL 3.3+. Without a GL driver (the pixman session)\n\
           \x20 # that can only be llvmpipe; the GPU sessions pin their own env\n\
           \x20 # and are left alone.\n\
@@ -1472,11 +1492,20 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           \x20 \x20 gles2|vulkan) ;;\n\
           \x20 \x20 *) LIBGL_ALWAYS_SOFTWARE=1; export LIBGL_ALWAYS_SOFTWARE ;;\n\
           \x20 esac\n\
-          \x20 echo \"eclipse-freedoom: engine gzdoom\"\n\
-          \x20 exec gzdoom -iwad \"$IWAD\" \"$@\"\n\
+          \x20 echo \"eclipse-freedoom: engine $bin\"\n\
+          \x20 exec \"$bin\" -iwad \"$IWAD\" \"$@\"\n\
           fi\n\
-          say 'eclipse-freedoom: no Doom engine installed. gzdoom ships in the'\n\
-          say 'image; if it is absent there the build dropped it.'\n\
+          say 'eclipse-freedoom: no Doom engine found. Directories searched:'\n\
+          for d in /usr/games /usr/local/games /usr/bin /usr/local/bin /bin; do\n\
+          \x20 if [ -d \"$d\" ]; then\n\
+          \x20 \x20 say \"  $d: $(ls \"$d\" 2>/dev/null | grep -E 'doom|woof' | tr '\\n' ' ')\"\n\
+          \x20 else\n\
+          \x20 \x20 say \"  $d: does not exist\"\n\
+          \x20 fi\n\
+          done\n\
+          say 'chocolate-doom ships in the image at /usr/games/chocolate-doom;'\n\
+          say 'if it is absent there the build dropped it (apt-get install'\n\
+          say 'chocolate-doom restores it on a machine with a mirror in reach).'\n\
           exit 127\n",
     )
     .unwrap();
@@ -1735,15 +1764,57 @@ fn sha512_of(path: &Path) -> Option<String> {
 }
 
 /// Launcher entries for both Freedoom phases, so the panel's application menu
-/// lists them and both run through the wrapper rather than through GZDoom's
-/// own `freedoom1`/`freedoom2` scripts (which do not pick a renderer).
+/// lists them and both run through the wrapper rather than through the
+/// packages' own `freedoom1`/`freedoom2` scripts (which do not pick a
+/// renderer, and whose engine search is a bare `$PATH` walk).
+///
+/// A user entry overrides a system one **by file name**, and the file name is
+/// not the same in the two package worlds: Alpine's `freedoom` shipped
+/// `freedoom1.desktop` / `freedoom2.desktop`, Ubuntu's ships
+/// `io.github.freedoom.Phase1.desktop` / `Phase2`. So both spellings are
+/// written when the packaged one is there to be shadowed, and the legacy pair
+/// is written on its own only when no Ubuntu entry exists -- otherwise the
+/// menu would list Freedoom twice, once through the wrapper and once through
+/// `Exec=freedoom1`, which is the entry that fails.
+///
+/// `chocolate-doom`'s own entries get the same treatment: `Doom` is pointed at
+/// the wrapper (it otherwise starts with no `-iwad` and opens the engine's
+/// own WAD prompt), and Heretic/Hexen/Strife/Setup are hidden, because the
+/// image ships no IWAD for any of them -- clicking one is a window that
+/// appears and dies. (The screensaver entry needs nothing: dpkg puts it under
+/// `usr/share/applications/screensavers`, which no menu scans.)
 fn write_freedoom_desktop_entries(rootfs: &Path) {
     let dir = rootfs.join("root/.local/share/applications");
     let _ = fs::create_dir_all(&dir);
-    for (file, phase, name) in [
-        ("freedoom1.desktop", "1", "Freedoom: Phase 1"),
-        ("freedoom2.desktop", "2", "Freedoom: Phase 2"),
-    ] {
+    let packaged = |name: &str| {
+        rootfs
+            .join("usr/share/applications")
+            .join(name)
+            .symlink_metadata()
+            .is_ok()
+    };
+    let ubuntu_entries = packaged("io.github.freedoom.Phase1.desktop")
+        || packaged("io.github.freedoom.Phase2.desktop");
+    let mut entries: Vec<(&str, &str, &str)> = vec![
+        (
+            "io.github.freedoom.Phase1.desktop",
+            "1",
+            "Freedoom: Phase 1",
+        ),
+        (
+            "io.github.freedoom.Phase2.desktop",
+            "2",
+            "Freedoom: Phase 2",
+        ),
+    ];
+    if !ubuntu_entries {
+        entries.push(("freedoom1.desktop", "1", "Freedoom: Phase 1"));
+        entries.push(("freedoom2.desktop", "2", "Freedoom: Phase 2"));
+    }
+    if packaged("org.chocolate_doom.Doom.desktop") {
+        entries.push(("org.chocolate_doom.Doom.desktop", "2", "Doom (Freedoom)"));
+    }
+    for (file, phase, name) in entries {
         let body = format!(
             "[Desktop Entry]\n\
              Version=1.0\n\
@@ -1759,6 +1830,30 @@ fn write_freedoom_desktop_entries(rootfs: &Path) {
              StartupNotify=false\n"
         );
         fs::write(dir.join(file), body).unwrap();
+    }
+    // The engines the image has no game data for. Hidden rather than deleted:
+    // the packaged file stays where dpkg put it, and a user entry of the same
+    // name with Hidden=true takes it out of every menu that follows the XDG
+    // spec. `apt-get install`ing a real IWAD and removing these two lines is
+    // all it takes to get them back.
+    for file in [
+        "org.chocolate_doom.Heretic.desktop",
+        "org.chocolate_doom.Hexen.desktop",
+        "org.chocolate_doom.Strife.desktop",
+        "org.chocolate_doom.Setup.desktop",
+    ] {
+        if !packaged(file) {
+            continue;
+        }
+        let body = format!(
+            "[Desktop Entry]\n\
+             Version=1.0\n\
+             Type=Application\n\
+             Name={file}\n\
+             NoDisplay=true\n\
+             Hidden=true\n"
+        );
+        let _ = fs::write(dir.join(file), body);
     }
 }
 
@@ -2464,7 +2559,7 @@ fn write_labwc_environment(rootfs: &Path) {
           # /usr/local/bin - bypassing the labwc wrapper and making keybinds\n\
           # and autostart unable to find eclipse-terminal (seen as the\n\
           # terminal retry loop failing with rc=127 while foot was installed).\n\
-          PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
+          PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/games:/usr/games\n\
           # Xwayland display: pinned again, now that Xwayland is verified\n\
           # healthy on hardware (it survives its spawn, serves pure-X clients,\n\
           # and GLX clients render through it). The pin was removed while the\n\

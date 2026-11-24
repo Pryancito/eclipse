@@ -515,6 +515,65 @@ fn firefox_desktop_override_follows_the_installed_package() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// With the Ubuntu packages in the tree, the entries that the MENU shows must
+/// all go through the wrapper. dpkg leaves
+/// `io.github.freedoom.Phase{1,2}.desktop` with `Exec=freedoom1`, which is a
+/// bare PATH lookup of a /usr/games script, and `org.chocolate_doom.*` with
+/// an engine launched without `-iwad`. A user entry of the same FILE NAME is
+/// what shadows each one; the Alpine-era `freedoom1.desktop` pair must then
+/// NOT be written, or Freedoom appears twice and one of the two is the broken
+/// one.
+#[test]
+fn las_entradas_de_ubuntu_quedan_tapadas_y_sin_duplicar() {
+    let dir = std::env::temp_dir().join(format!("eclipse-fd-apt-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let sys = dir.join("usr/share/applications");
+    fs::create_dir_all(&sys).unwrap();
+    for f in [
+        "io.github.freedoom.Phase1.desktop",
+        "io.github.freedoom.Phase2.desktop",
+        "org.chocolate_doom.Doom.desktop",
+        "org.chocolate_doom.Heretic.desktop",
+        "org.chocolate_doom.Setup.desktop",
+    ] {
+        fs::write(sys.join(f), "[Desktop Entry]\nExec=freedoom1\n").unwrap();
+    }
+
+    write_freedoom_desktop_entries(&dir);
+
+    let user = dir.join("root/.local/share/applications");
+    for (f, phase) in [
+        ("io.github.freedoom.Phase1.desktop", "1"),
+        ("io.github.freedoom.Phase2.desktop", "2"),
+        ("org.chocolate_doom.Doom.desktop", "2"),
+    ] {
+        let body = fs::read_to_string(user.join(f)).unwrap();
+        assert!(
+            body.contains(&format!("Exec=/usr/local/bin/eclipse-freedoom {phase}")),
+            "{f} no pasa por el wrapper: {body}"
+        );
+    }
+    for f in ["freedoom1.desktop", "freedoom2.desktop"] {
+        assert!(
+            !user.join(f).exists(),
+            "{f} duplica la entrada de Ubuntu en el menu"
+        );
+    }
+    for f in [
+        "org.chocolate_doom.Heretic.desktop",
+        "org.chocolate_doom.Setup.desktop",
+    ] {
+        let body = fs::read_to_string(user.join(f)).unwrap();
+        assert!(
+            body.contains("Hidden=true"),
+            "{f} se queda en el menu sin datos de juego que abrir"
+        );
+    }
+    // Y lo que NO existe en el arbol no se tapa: el paquete puede no estar.
+    assert!(!user.join("org.chocolate_doom.Strife.desktop").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Wads already in the rootfs -- put there by the `freedoom` package, or
 /// by hand -- must short-circuit the fetch. Getting this wrong means every
 /// image build re-downloads and re-unpacks 57 MiB it already had, and
@@ -581,8 +640,21 @@ fn freedoom_wrapper_parses_and_always_picks_an_iwad() {
     // Compare where the engines are RUN, not where their names first
     // appear: a comment mentioning one of them must not decide this.
     assert!(
-        src.find("for e in chocolate-doom").unwrap() < src.find("command -v gzdoom").unwrap(),
+        src.find("for e in chocolate-doom").unwrap() < src.find("engine_path gzdoom").unwrap(),
         "the software engines must be tried before gzdoom"
+    );
+    // The engine is NOT in /usr/bin on the apt rootfs: Debian policy 9.1.1
+    // puts game binaries in /usr/games, which is where `chocolate-doom` and
+    // the packaged `freedoom1`/`freedoom2` launchers live. A wrapper that only
+    // walks PATH reported "no Doom engine installed" with the engine present
+    // in the image -- the whole of this batch.
+    assert!(
+        src.contains("/usr/games"),
+        "the engine search has to cover /usr/games"
+    );
+    assert!(
+        src.contains("engine_path()"),
+        "the engine is looked up by directory, not only through PATH"
     );
     assert!(
         src.contains("LIBGL_ALWAYS_SOFTWARE=1"),
@@ -616,7 +688,14 @@ fn freedoom_wrapper_parses_and_always_picks_an_iwad() {
         "the wads ship in the image; `apk add` is not the fix"
     );
 
-    for (file, phase) in [("freedoom1.desktop", "1"), ("freedoom2.desktop", "2")] {
+    for (file, phase) in [
+        ("io.github.freedoom.Phase1.desktop", "1"),
+        ("io.github.freedoom.Phase2.desktop", "2"),
+        // Written as well while no Ubuntu entry exists to be shadowed, which
+        // is the case in this empty rootfs.
+        ("freedoom1.desktop", "1"),
+        ("freedoom2.desktop", "2"),
+    ] {
         let entry =
             fs::read_to_string(dir.join("root/.local/share/applications").join(file)).unwrap();
         assert!(

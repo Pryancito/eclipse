@@ -1223,7 +1223,7 @@ impl LinuxRootfs {
         // tapa. Ver `logo::profile_stanza`.
         fs::write(
             etc.join("profile"),
-            [&b"export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
+            [&b"export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/games:/usr/games\n\
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
@@ -4900,7 +4900,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         let wait_wayland = "\
               : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
               [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
-              export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
+              export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/games:/usr/games\n\
               export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
               export TZ=\"${TZ:-Europe/Madrid}\"\n\
               i=0\n\

@@ -488,7 +488,7 @@ struct Service {
 /// also asserts: init now launches that wrapper too, but keeping the base
 /// variables here preserves the boot session if the wrapper ever gets bypassed.
 const CHILD_ENV: &[&str] = &[
-    "PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin",
+    "PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/games:/usr/games",
     "HOME=/root",
     "TERM=xterm-256color",
     "LANG=es_ES.UTF-8",
