@@ -461,6 +461,14 @@ lleva el valor solo (`/etc/eclipse/desktop`); `montar = /boot/efi` monta la
 ESP como dice `/etc/fstab` (`eclipse-fs-mounts`) antes de tocar
 `rboot.conf`; `reinicio = si` marca lo que se lee al arrancar.
 
+Los ajustes del escritorio que antes solo eran variables de entorno
+(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`,
+`SILVERSURFER_ADBLOCK`) viven en `/etc/eclipse/entorno`, líneas `NOMBRE=valor`.
+Los escribe `eclipse-entorno NOMBRE VALOR`, que solo admite esos nombres y
+palabras sencillas, borra la línea con `auto` y pide a eclipse-init que
+reinicie el fondo o la barra. Los programas lo leen al arrancar
+(`lunartext::entorno`); una variable puesta en el entorno sigue mandando.
+
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
 `lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.

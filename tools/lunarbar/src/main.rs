@@ -4242,8 +4242,7 @@ fn main() {
     // draws glyphs taller than the pills that frame them. The default follows
     // the look: 44 is Plasma's panel height, and the KDE layout needs the room
     // for a two-line clock; 34 is what the waybar config this replaces used.
-    let height: u32 = std::env::var("LUNARBAR_HEIGHT")
-        .ok()
+    let height: u32 = lunartext::entorno::var("LUNARBAR_HEIGHT")
         .and_then(|v| v.parse().ok())
         .filter(|h| (26..=64).contains(h))
         .unwrap_or(match look() {

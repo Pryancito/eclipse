@@ -26,9 +26,12 @@ const RISE: f32 = 8.0;
 /// read as glass, not so much that text over a busy wallpaper suffers.
 pub const GLASS: f32 = 0.86;
 
-/// Whether effects are on (`LUNAR_FX=off` switches them off).
+/// Whether effects are on (`LUNAR_FX=off`, in the environment or in
+/// `/etc/eclipse/entorno`, switches them off). Read once per process: it is
+/// asked on every frame.
 pub fn on() -> bool {
-    !std::env::var("LUNAR_FX").is_ok_and(|v| v == "off" || v == "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !lunartext::entorno::var("LUNAR_FX").is_some_and(|v| v == "off" || v == "0"))
 }
 
 /// Where the entrance is `elapsed` after the menu first drew: `(opacity,

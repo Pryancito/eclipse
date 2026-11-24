@@ -4958,7 +4958,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
                  # this client is started by eclipse-init — not as a labwc\n\
                  # child — so re-export a default for panels without EDID mm.\n\
                  export LUNARBG_ASPECT=\"${{LUNARBG_ASPECT:-16:9}}\"\n\
-                 exec lunarbg --fps \"${{LUNARBG_FPS:-8}}\"\n",
+                 # The panel's frame rate, from /etc/eclipse/entorno\n\
+                 # (eclipse-entorno): digits only, else the image's 8.\n\
+                 fps=$(sed -n 's/^LUNARBG_FPS=\\([0-9][0-9]*\\)$/\\1/p' /etc/eclipse/entorno 2>/dev/null | head -n 1)\n\
+                 exec lunarbg --fps \"${{LUNARBG_FPS:-${{fps:-8}}}}\"\n",
                 wait = wait_wayland
             )
             .as_bytes(),

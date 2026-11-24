@@ -72,6 +72,10 @@ pub const DE_SERIE: &[(&str, &str)] = &[
         "50-arranque.claves",
         include_str!("../claves.d/50-arranque.claves"),
     ),
+    (
+        "60-escritorio.claves",
+        include_str!("../claves.d/60-escritorio.claves"),
+    ),
 ];
 
 #[derive(Clone, Debug, PartialEq)]

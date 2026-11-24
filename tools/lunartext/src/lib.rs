@@ -14,10 +14,12 @@
 //!
 //! The face is read from disk once, from the directories the image installs
 //! DejaVu into (or `LUNAR_FONT_DIR`). When it is not there, or
-//! `LUNAR_TEXT=bitmap` is set, [`available`] is false and the client keeps its
+//! `LUNAR_TEXT=bitmap` is set (environment or `/etc/eclipse/entorno`), [`available`] is false and the client keeps its
 //! bitmap face; a character the face has no outline for is
 //! [`Glyph::Missing`], and the client draws that one cell with its bitmap
 //! face.
+
+pub mod entorno;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -106,7 +108,7 @@ fn load_face(dir: &str, file: &str) -> Option<Face<'static>> {
 }
 
 fn load() -> Option<Faces> {
-    if std::env::var("LUNAR_TEXT").is_ok_and(|v| v == "bitmap") {
+    if entorno::var("LUNAR_TEXT").is_some_and(|v| v == "bitmap") {
         return None;
     }
     let dirs: Vec<String> = match std::env::var("LUNAR_FONT_DIR") {

@@ -1646,7 +1646,7 @@ fn main() {
     let display = conn.display();
     display.get_registry(&qh, ());
 
-    let animate = animate_from(cli.static_, std::env::var("LUNARBG_STATIC").ok().as_deref());
+    let animate = animate_from(cli.static_, lunartext::entorno::var("LUNARBG_STATIC").as_deref());
     let mut state = State {
         animate,
         aspect_cli: cli.aspect.or_else(scene::aspect_from_env),
