@@ -81,6 +81,9 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("wav", "wavplay %f"),
     ("mp3", "mpg123 %f"),
     ("ogg", "mpg123 %f"),
+    // A driver: the control panel's "Instalar driver", for the device the
+    // file names (`mt7922-14c3-0616.drv`).
+    ("drv", "eclipse-panel --instalar %f"),
 ];
 
 /// The program a command template runs, for the "is it even installed?" check.
@@ -300,7 +303,7 @@ vacio=
             assert!(cmd.contains("%f"), "{ext} -> {cmd} never gets the file");
             assert!(program_of(cmd).is_some(), "{ext} -> {cmd} names no program");
         }
-        // The five programs the table is allowed to name, so an entry pointing
+        // The six programs the table is allowed to name, so an entry pointing
         // at something this image does not ship is a visible line in the diff.
         // `eclipse-firefox` and not `firefox`, `eclipse-view` and not
         // `swayimg`: every activation path in the image is required to go
@@ -316,7 +319,8 @@ vacio=
                     "eclipse-firefox",
                     "eclipse-view",
                     "wavplay",
-                    "mpg123"
+                    "mpg123",
+                    "eclipse-panel"
                 ]
                 .contains(p),
                 "{p} is not one of the image's openers"

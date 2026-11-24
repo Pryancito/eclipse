@@ -379,6 +379,8 @@ pub enum Kind {
     Archive,
     /// Disk images: `.iso`, `.img`.
     Disk,
+    /// A driver for a device, `.drv`: opening it installs it.
+    Driver,
     Media,
     /// Scripts and source code.
     Code,
@@ -399,6 +401,7 @@ pub fn kind_of(name: &str) -> Kind {
             Kind::Archive
         }
         "iso" | "img" | "qcow2" | "vdi" | "raw" => Kind::Disk,
+        "drv" => Kind::Driver,
         "mp3" | "ogg" | "opus" | "flac" | "wav" | "m4a" | "mp4" | "mkv" | "webm" | "avi"
         | "mov" => Kind::Media,
         "sh" | "py" | "rs" | "c" | "h" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
@@ -1043,6 +1046,7 @@ mod tests {
         assert_eq!(kind_of("informe.pdf"), Kind::Document);
         assert_eq!(kind_of("backup.tar.zst"), Kind::Archive);
         assert_eq!(kind_of("eclipse.iso"), Kind::Disk);
+        assert_eq!(kind_of("mt7922-14c3-0616.drv"), Kind::Driver);
         assert_eq!(kind_of("arrancar.sh"), Kind::Code);
         assert_eq!(kind_of("tema.flac"), Kind::Media);
         assert_eq!(kind_of(".bashrc"), Kind::Other);

@@ -478,6 +478,18 @@ device (`nvme@0`) in `rboot.conf`'s `udriver=` for the next boot; COPY IDS
 puts it on the clipboard and REPORT writes `~/dispositivos.txt`. The format is
 in `tools/lunarbar/src/dispositivos.rs`.
 
+A userspace driver ships as a `.drv` file with the device's ids in its name
+(`mt7922-14c3-0616.drv`). Opening one in lunarfile, or INSTALL DRIVER… on a
+device with no driver, opens the install dialog: it finds the `.drv` files
+in `~`, `~/Descargas` and `~/Downloads` and says what it will do before it
+does it. `eclipse-udriver instalar VVVV DDDD FILE` copies it to
+`/usr/lib/eclipse/udrivers/udrv-VVVV-DDDD`, writes its eclipse-init service
+(`udriver = pci-VVVV-DDDD@0`) and the `[driver:udrv-VVVV-DDDD]` block
+(`instalado = si`, which goes before the shipped ones) in
+`/etc/eclipse/claves.d`; the panel adds `pci-VVVV-DDDD@0` to `rboot.conf`'s
+`udriver=`, and after a restart the kernel leaves it the device. REMOVE
+DRIVER undoes it. How to write one: [README-drivers.en.md](README-drivers.en.md).
+
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH
 [group]` draws it without a compositor.

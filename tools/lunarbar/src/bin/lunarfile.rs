@@ -1273,6 +1273,8 @@ fn kind_color(kind: files::Kind, p: &Palette) -> Rgb {
         files::Kind::Document => (0xe0, 0x87, 0x5e),
         files::Kind::Archive => (0xd6, 0xb2, 0x5c),
         files::Kind::Disk => (0xb4, 0x8c, 0xf0),
+        // The panel's gold: opening one starts an install.
+        files::Kind::Driver => (0xf2, 0xc1, 0x4e),
         files::Kind::Media => (0xe0, 0x7a, 0xb0),
         files::Kind::Code => (0x8f, 0xd1, 0x8a),
         files::Kind::Other => p.dim,

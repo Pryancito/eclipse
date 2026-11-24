@@ -18,6 +18,10 @@ name = "udrv-virtio-blk"
 path = "src/bin/udrv-virtio-blk.rs"
 
 [[bin]]
+name = "udrv-ejemplo"
+path = "src/bin/udrv-ejemplo.rs"
+
+[[bin]]
 name = "udrv-ahci"
 path = "src/bin/udrv-ahci.rs"
 

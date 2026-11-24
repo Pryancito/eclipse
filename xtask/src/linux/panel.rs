@@ -59,6 +59,59 @@ pub(super) fn write_panel(rootfs: &Path) {
         &rootfs.join(CLAVES_DIR),
     );
     write_entorno(&localbin);
+    write_udriver(&localbin);
+}
+
+/// `eclipse-udriver instalar VVVV DDDD FICHERO` and `eclipse-udriver quitar
+/// VVVV DDDD`: the panel's "Instalar driver" for the PCI device with that
+/// vendor and device. Installing copies the file to
+/// `/usr/lib/eclipse/udrivers/udrv-VVVV-DDDD`, writes its eclipse-init
+/// service (`udriver = pci-VVVV-DDDD@0`: started once the kernel leaves it
+/// that device) and the `[driver:udrv-VVVV-DDDD]` block the devices page
+/// reads; removing deletes the three. The panel then adds the device to
+/// (or takes it from) `udriver=` in rboot.conf, so it takes effect at the
+/// next boot. The ids are four lowercase hex digits each, and nothing else
+/// is taken. `ECLIPSE_UDRIVERS`, `ECLIPSE_SERVICES` and `ECLIPSE_CLAVES`
+/// are for the tests.
+fn write_udriver(localbin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = localbin.join("eclipse-udriver");
+    fs::write(
+        &script,
+        b"#!/bin/sh\n\
+          # Eclipse OS: installs or removes a userspace driver for one PCI device.\n\
+          # Written by xtask/src/linux/panel.rs; run by lunarpanel.\n\
+          LIB=\"${ECLIPSE_UDRIVERS:-/usr/lib/eclipse/udrivers}\"\n\
+          SVC=\"${ECLIPSE_SERVICES:-/etc/eclipse/services}\"\n\
+          CLV=\"${ECLIPSE_CLAVES:-/etc/eclipse/claves.d}\"\n\
+          verb=\"$1\"; v=\"$2\"; d=\"$3\"; file=\"$4\"\n\
+          for x in \"$v\" \"$d\"; do\n\
+          \x20 case \"$x\" in\n\
+          \x20   [0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;\n\
+          \x20   *) echo \"eclipse-udriver: $x no es un id de cuatro cifras hex\" >&2; exit 2 ;;\n\
+          \x20 esac\n\
+          done\n\
+          name=\"udrv-$v-$d\"; item=\"pci-$v-$d@0\"\n\
+          case \"$verb\" in\n\
+          \x20 instalar)\n\
+          \x20   [ -f \"$file\" ] || { echo \"eclipse-udriver: $file no es un fichero\" >&2; exit 2; }\n\
+          \x20   mkdir -p \"$LIB\" \"$SVC\" \"$CLV\" || exit 1\n\
+          \x20   cp \"$file\" \"$LIB/$name.tmp\" && chmod 755 \"$LIB/$name.tmp\" && mv \"$LIB/$name.tmp\" \"$LIB/$name\" \\\n\
+          \x20     || { rm -f \"$LIB/$name.tmp\"; echo \"eclipse-udriver: no se pudo copiar $file\" >&2; exit 1; }\n\
+          \x20   printf '# Driver del dispositivo PCI %s:%s, instalado desde el panel de control.\\n# Lo quita: eclipse-udriver quitar %s %s\\nexec = %s %s\\ntype = respawn\\nudriver = %s\\n' \\\n\
+          \x20     \"$v\" \"$d\" \"$v\" \"$d\" \"$LIB/$name\" \"$item\" \"$item\" > \"$SVC/$name.service\" || exit 1\n\
+          \x20   printf '# Instalado por eclipse-udriver.\\n[driver:%s]\\nes = %s\\nids = %s:%s\\nnucleo = no\\nudriver = pci-%s-%s\\ninstalado = si\\n' \\\n\
+          \x20     \"$name\" \"$name\" \"$v\" \"$d\" \"$v\" \"$d\" > \"$CLV/90-$name.claves\" || exit 1\n\
+          \x20   ;;\n\
+          \x20 quitar)\n\
+          \x20   rm -f \"$LIB/$name\" \"$SVC/$name.service\" \"$CLV/90-$name.claves\" || exit 1\n\
+          \x20   ;;\n\
+          \x20 *) echo 'uso: eclipse-udriver instalar VVVV DDDD FICHERO | quitar VVVV DDDD' >&2; exit 2 ;;\n\
+          esac\n\
+          exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// `eclipse-entorno NAME VALUE`: writes one setting into
@@ -202,6 +255,54 @@ mod tests {
         assert!(!run("LUNAR_FX", "$(id)"));
         assert!(!run("LUNAR_FX", ""));
         assert_eq!(fs::read_to_string(&file).unwrap(), "LUNAR_FX=off\n");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn eclipse_udriver_installs_three_files_and_removes_them() {
+        let tmp = std::env::temp_dir().join(format!("xtask-udriver-{}", std::process::id()));
+        let bin = tmp.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        write_udriver(&bin);
+        let drv = tmp.join("udrv-mt7922");
+        fs::write(&drv, "#!/bin/sh\n").unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("/bin/sh")
+                .arg(bin.join("eclipse-udriver"))
+                .args(args)
+                .env("ECLIPSE_UDRIVERS", tmp.join("lib"))
+                .env("ECLIPSE_SERVICES", tmp.join("svc"))
+                .env("ECLIPSE_CLAVES", tmp.join("claves"))
+                .status()
+                .unwrap()
+                .success()
+        };
+        let d = drv.to_str().unwrap();
+        assert!(run(&["instalar", "14c3", "0616", d]));
+        let lib = tmp.join("lib/udrv-14c3-0616");
+        assert!(lib.is_file());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&lib).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        let svc = fs::read_to_string(tmp.join("svc/udrv-14c3-0616.service")).unwrap();
+        assert!(svc.contains("type = respawn\n"), "{svc}");
+        assert!(svc.contains("\nudriver = pci-14c3-0616@0\n"), "{svc}");
+        assert!(svc.contains(&format!("exec = {} pci-14c3-0616@0\n", lib.display())), "{svc}");
+        let block = fs::read_to_string(tmp.join("claves/90-udrv-14c3-0616.claves")).unwrap();
+        assert!(block.contains("[driver:udrv-14c3-0616]\n"), "{block}");
+        assert!(block.contains("ids = 14c3:0616\n"), "{block}");
+        assert!(block.contains("udriver = pci-14c3-0616\n"), "{block}");
+        assert!(block.contains("instalado = si\n"), "{block}");
+        // Fail-closed: ids that are not four hex digits, a missing file.
+        assert!(!run(&["instalar", "14C3", "0616", d]));
+        assert!(!run(&["instalar", "14c3", "06;6", d]));
+        assert!(!run(&["instalar", "14c3", "0617", "/no/such/file"]));
+        assert!(!run(&["borrar", "14c3", "0616"]));
+        assert!(run(&["quitar", "14c3", "0616"]));
+        assert!(!lib.exists());
+        assert!(!tmp.join("svc/udrv-14c3-0616.service").exists());
+        assert!(!tmp.join("claves/90-udrv-14c3-0616.claves").exists());
         let _ = fs::remove_dir_all(&tmp);
     }
 

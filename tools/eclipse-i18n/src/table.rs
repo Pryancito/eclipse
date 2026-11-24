@@ -358,6 +358,7 @@ strings! {
     file_kind_document => { es: "Documento", en: "Document" },
     file_kind_archive => { es: "Archivo comprimido", en: "Compressed archive" },
     file_kind_disk => { es: "Imagen de disco", en: "Disk image" },
+    file_kind_driver => { es: "Driver de dispositivo", en: "Device driver" },
     file_kind_media => { es: "Multimedia", en: "Media" },
     file_kind_code => { es: "Código", en: "Code" },
     file_kind_other => { es: "Archivo", en: "File" },
@@ -1252,8 +1253,8 @@ strings! {
         en: "It has a userspace driver: enable it and restart",
     },
     panel_dev_why_none => {
-        es: "Ningún driver lo reclama; copia sus ids para buscar uno",
-        en: "No driver claims it; copy its ids to look for one",
+        es: "Ningún driver lo reclama; instala uno (.drv) o copia sus ids",
+        en: "No driver claims it; install one (.drv) or copy its ids",
     },
     panel_dev_why_system => { es: "No lleva driver propio", en: "It takes no driver of its own" },
     panel_dev_named => {
@@ -1271,4 +1272,48 @@ strings! {
         en: "no pci.ids (hwdata-pci): ids only",
     },
     panel_dev_no_bus => { es: "no hay bus PCI que leer", en: "no PCI bus to read" },
+    panel_dev_install_caps => { es: "INSTALAR DRIVER…", en: "INSTALL DRIVER…" },
+    panel_dev_remove_caps => { es: "QUITAR DRIVER", en: "REMOVE DRIVER" },
+    panel_inst_title => { es: "INSTALAR DRIVER", en: "INSTALL DRIVER" },
+    panel_inst_driver => { both: "Driver" },
+    panel_inst_service => { es: "Servicio", en: "Service" },
+    panel_inst_driver_hint => {
+        es: "Un fichero .drv: el driver de Eclipse OS para este dispositivo.",
+        en: "A .drv file: the Eclipse OS driver for this device.",
+    },
+    panel_inst_no_file => {
+        es: "Ningún .drv en ~, ~/Descargas ni ~/Downloads.",
+        en: "No .drv file in ~, ~/Descargas or ~/Downloads.",
+    },
+    panel_inst_service_hint => {
+        es: "eclipse-init lo arranca con este nombre y lo relanza si cae.",
+        en: "eclipse-init starts it under this name, again if it dies.",
+    },
+    panel_inst_will => { es: "LO QUE HARÁ", en: "WHAT IT WILL DO" },
+    panel_inst_step_copy => { es: "Copia el driver a {}", en: "Copies the driver to {}" },
+    panel_inst_step_service => { es: "Crea {}", en: "Creates {}" },
+    panel_inst_step_boot => {
+        es: "Añade {} a udriver= en rboot.conf (monta /boot/efi)",
+        en: "Adds {} to udriver= in rboot.conf (mounts /boot/efi)",
+    },
+    panel_inst_step_reboot => {
+        es: "Al reiniciar, el núcleo deja el dispositivo al driver",
+        en: "After a restart, the kernel leaves the device to the driver",
+    },
+    panel_inst_warn1 => {
+        es: "El driver tiene acceso directo al dispositivo y a su DMA: instala solo",
+        en: "The driver has direct access to the device and its DMA: install only",
+    },
+    panel_inst_warn2 => {
+        es: "drivers en los que confíes. Si se cae, el dispositivo espera al reinicio.",
+        en: "drivers you trust. If it dies, the device waits for the next restart.",
+    },
+    panel_inst_keys => {
+        es: "↑↓ dispositivo · ←→ driver · Intro · Esc",
+        en: "↑↓ device · ←→ driver · Enter · Esc",
+    },
+    panel_inst_cancel_caps => { es: "CANCELAR", en: "CANCEL" },
+    panel_inst_ok_caps => { es: "INSTALAR", en: "INSTALL" },
+    panel_inst_done => { es: "driver instalado", en: "driver installed" },
+    panel_inst_removed => { es: "driver quitado", en: "driver removed" },
 }

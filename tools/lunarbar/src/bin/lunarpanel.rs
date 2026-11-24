@@ -1256,12 +1256,27 @@ fn sample(grupo: Option<&str>) -> Panel {
     let cat = Catalogo::de_serie();
     let actual = cat.claves.iter().map(|c| c.normaliza(None)).collect();
     let mut p = Panel::new(cat, actual, Lang::current());
+    // `dispositivos/instalar`: the page with the "Instalar driver" dialog open.
+    let instalar = grupo.is_some_and(|g| g.ends_with("/instalar"));
+    let grupo = grupo.map(|g| g.trim_end_matches("/instalar"));
     p.grupo = group_index(&p.cat, grupo);
     if let Some(i) = p.cat.claves.iter().position(|c| c.id == "teclado.idioma") {
         p.elige(i, "no".into());
     }
     if p.pagina_disp().is_some() {
         disp::muestra(&mut p);
+        if instalar {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+            let home = std::path::Path::new(&home);
+            p.disp.instala = Some(disp::Instala {
+                fila: p.disp.foco,
+                candidatos: vec![
+                    home.join("Descargas/mt7922-14c3-0616.drv"),
+                    home.join("prueba.drv"),
+                ],
+                elegido: 0,
+            });
+        }
     }
     p
 }
@@ -1290,7 +1305,9 @@ fn dump(spec: &str, grupo: Option<&str>) -> ! {
 }
 
 /// Super+I twice closes it: a second start signals the first and leaves.
-fn toggle_or_lock() -> Option<std::fs::File> {
+/// With `takeover` (a driver opened from the file browser) the second one
+/// stays instead, once the first has gone.
+fn toggle_or_lock(takeover: bool) -> Option<std::fs::File> {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let path = std::path::Path::new(&dir).join("lunarpanel.lock");
     let f = std::fs::OpenOptions::new()
@@ -1312,7 +1329,15 @@ fn toggle_or_lock() -> Option<std::fs::File> {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }
         }
-        std::process::exit(0);
+        let gone = takeover
+            && (0..40).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // SAFETY: as above.
+                unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+            });
+        if !gone {
+            std::process::exit(0);
+        }
     }
     let _ = std::fs::write(&path, std::process::id().to_string());
     Some(f)
@@ -1327,7 +1352,7 @@ fn main() {
             .cloned()
     };
     match args.first().map(String::as_str) {
-        None | Some("--grupo") => {}
+        None | Some("--grupo") | Some("--instalar") => {}
         Some("--dump") => dump(
             &args
                 .get(1)
@@ -1336,11 +1361,14 @@ fn main() {
             args.get(2).map(String::as_str),
         ),
         Some(_) => {
-            eprintln!("usage: lunarpanel [--grupo ID] | --dump PATH:WxH [GRUPO]");
+            eprintln!(
+                "usage: lunarpanel [--grupo ID] | --instalar FILE.drv | --dump PATH:WxH [GRUPO[/instalar]]"
+            );
             std::process::exit(2);
         }
     }
-    let lock = toggle_or_lock();
+    let instalar = arg("--instalar").map(std::path::PathBuf::from);
+    let lock = toggle_or_lock(instalar.is_some());
     let dirs: Vec<&std::path::Path> = claves::DIRS.iter().map(std::path::Path::new).collect();
     let cat = Catalogo::carga(&dirs);
     for a in &cat.avisos {
@@ -1350,6 +1378,10 @@ fn main() {
     let mut panel = Panel::new(cat, actual, Lang::current());
     panel.grupo = group_index(&panel.cat, arg("--grupo").as_deref());
     panel.carga_disp();
+    if let Some(path) = instalar {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        panel.instala_fichero(path);
+    }
     let mut st = State::new(panel);
 
     let Ok(conn) = lunarbar::wl::connect() else {

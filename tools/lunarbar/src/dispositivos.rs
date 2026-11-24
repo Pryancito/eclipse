@@ -243,6 +243,10 @@ pub struct Driver {
     /// `necesita = no`: the device needs no driver of its own (a bridge,
     /// the interrupt controller); the page says so instead of "sin driver".
     pub necesita: bool,
+    /// `instalado = si`: a driver installed from the panel
+    /// (`eclipse-udriver`), which it can also remove. It goes before the
+    /// shipped blocks for its device.
+    pub instalado: bool,
 }
 
 impl Driver {
@@ -286,6 +290,7 @@ impl Driver {
             clase,
             nucleo: !matches!(get("nucleo"), Some("no")),
             necesita: !matches!(get("necesita"), Some("no")),
+            instalado: matches!(get("instalado"), Some("si")),
             udriver,
         })
     }
@@ -400,7 +405,10 @@ pub fn calcula(
     let mut cuenta: HashMap<String, usize> = HashMap::new();
     bus.iter()
         .map(|p| {
-            let driver = drivers.iter().position(|d| d.casa(p));
+            let driver = drivers
+                .iter()
+                .position(|d| d.instalado && d.casa(p))
+                .or_else(|| drivers.iter().position(|d| d.casa(p)));
             let item = driver.and_then(|i| drivers[i].udriver.as_ref()).map(|k| {
                 let n = cuenta.entry(k.clone()).or_insert(0);
                 *n += 1;
@@ -475,6 +483,110 @@ pub fn cambia(c: &Clave, item: &str, on: bool) -> Result<(), String> {
         let line = claves::lee_ultima(old, &key).unwrap_or_default();
         claves::pon_ultima(old, &key, &con_udriver(&line, item, on))
     })
+}
+
+// ── installing a driver ──────────────────────────────────────────────────────
+
+/// The script that installs and removes a driver (xtask writes it).
+pub const INSTALADOR: &str = "/usr/local/bin/eclipse-udriver";
+
+/// The name a driver installed for this device takes: its file, its
+/// service and its block are all called this.
+pub fn servicio(p: &Pci) -> String {
+    format!("udrv-{:04x}-{:04x}", p.vendor, p.device)
+}
+
+/// What the kernel calls the first device with this identity
+/// (`udriver=pci-VVVV-DDDD@0`): the one an installed driver is for.
+pub fn item_pci(p: &Pci) -> String {
+    format!("pci-{:04x}-{:04x}@0", p.vendor, p.device)
+}
+
+/// Where the panel looks for a driver to install: the home directory and
+/// its downloads.
+pub fn dirs_candidatos(home: &Path) -> Vec<std::path::PathBuf> {
+    vec![home.to_path_buf(), home.join("Descargas"), home.join("Downloads")]
+}
+
+/// Whether `path` is a driver file: its name ends in `.drv`.
+pub fn es_drv(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("drv"))
+}
+
+/// The device a driver file says it is for, by its name: the last
+/// `VVVV-DDDD` (or `VVVV:DDDD`, `VVVV_DDDD`) in it, as in
+/// `mt7922-14c3-0616.drv` (the last, so a model number before the ids is
+/// not taken for a vendor). `None` when the name holds no such pair.
+pub fn ids_de_nombre(path: &Path) -> Option<(u16, u16)> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let b = name.as_bytes();
+    let hex4 = |i: usize| {
+        b.get(i..i + 4)
+            .filter(|w| w.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|w| u16::from_str_radix(std::str::from_utf8(w).ok()?, 16).ok())
+    };
+    // A pair on its own: not the tail of a longer run of hex digits.
+    let alone = |i: usize| i == 0 || !b[i - 1].is_ascii_hexdigit();
+    let ends = |i: usize| b.get(i).is_none_or(|c| !c.is_ascii_hexdigit());
+    (0..b.len()).rev().find_map(|i| {
+        let ok = alone(i) && matches!(b.get(i + 4), Some(b'-' | b':' | b'_')) && ends(i + 9);
+        ok.then(|| Some((hex4(i)?, hex4(i + 5)?))).flatten()
+    })
+}
+
+/// The driver files (`*.drv`) in `dirs`, the ones whose name says they are
+/// for `ids` first, then by name. A downloaded file has no execute bit;
+/// the installer gives it one.
+pub fn candidatos(dirs: &[std::path::PathBuf], ids: (u16, u16)) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<(bool, std::path::PathBuf)> = Vec::new();
+    for d in dirs {
+        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if es_drv(&p) && e.metadata().is_ok_and(|m| m.is_file()) {
+                out.push((ids_de_nombre(&p) != Some(ids), p));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Installs `fichero` as the driver of `p` (`instalar`) or removes the one
+/// installed (`fichero` None), through [`INSTALADOR`]; then hands the
+/// device to it at the next boot, or back to the kernel, in the command
+/// line `c` names. A removal hands the device back first.
+pub fn instala(c: &Clave, p: &Pci, fichero: Option<&Path>) -> Result<(), String> {
+    instala_con(INSTALADOR, c, p, fichero)
+}
+
+/// [`instala`] with the script named, for the tests.
+pub fn instala_con(script: &str, c: &Clave, p: &Pci, fichero: Option<&Path>) -> Result<(), String> {
+    let v = format!("{:04x}", p.vendor);
+    let d = format!("{:04x}", p.device);
+    let item = item_pci(p);
+    if fichero.is_none() {
+        cambia(c, &item, false)?;
+    }
+    let mut cmd = std::process::Command::new(script);
+    match fichero {
+        Some(f) => cmd.arg("instalar").args([&v, &d]).arg(f),
+        None => cmd.arg("quitar").args([&v, &d]),
+    };
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{script}: {e}"))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(why.lines().last().unwrap_or("eclipse-udriver falló").to_string());
+    }
+    if fichero.is_some() {
+        cambia(c, &item, true)?;
+    }
+    Ok(())
 }
 
 /// A plain-text report of the page, for whoever is asked for a driver.

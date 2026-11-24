@@ -178,3 +178,123 @@ fn handing_a_device_over_edits_rboot_conf_and_refuses_a_bad_item() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_installed_driver_takes_its_device_before_the_shipped_blocks() {
+    let mut c = Catalogo::de_serie();
+    // The shipped `virtio` block takes every 1af4 device; an installed
+    // driver for one of them goes first.
+    c.lee_texto(
+        "[driver:udrv-1af4-1050]\nes = udrv-1af4-1050\nids = 1af4:1050\nnucleo = no\n\
+         udriver = pci-1af4-1050\ninstalado = si\n\
+         [driver:udrv-14c3-0616]\nes = udrv-14c3-0616\nids = 14c3:0616\nnucleo = no\n\
+         udriver = pci-14c3-0616\ninstalado = si\n",
+        "t",
+    );
+    assert!(c.avisos.is_empty(), "{:?}", c.avisos);
+    let bus = [
+        pci("0000:00:02.0", 0x1af4, 0x1050, 0x038000),
+        pci("0000:05:00.0", 0x14c3, 0x0616, 0x028000),
+        pci("0000:06:00.0", 0x14c3, 0x0616, 0x028000),
+    ];
+    let filas = calcula(
+        &bus,
+        &c.drivers,
+        &Nombres::lee(IDS),
+        "pci-14c3-0616@0\n",
+        &[],
+        "udriver=pci-14c3-0616@0,pci-1af4-1050@0",
+    );
+    let es = |f: &Fila| c.drivers[f.driver.unwrap()].es.clone();
+    assert_eq!(es(&filas[0]), "udrv-1af4-1050");
+    assert!(c.drivers[filas[0].driver.unwrap()].instalado);
+    // Counted per identity, as the kernel counts them.
+    assert_eq!(filas[1].item.as_deref(), Some("pci-14c3-0616@0"));
+    assert_eq!(filas[2].item.as_deref(), Some("pci-14c3-0616@1"));
+    assert_eq!(filas[1].estado, Estado::Parado, "left to userspace, no service");
+    assert!(filas[1].pedido);
+    // Not handed over yet (the next boot does): pending, can go back.
+    assert_eq!(filas[0].estado, Estado::Libre);
+    assert_eq!(filas[0].accion(), Some(false));
+    assert!(!Catalogo::de_serie().drivers.iter().any(|d| d.instalado));
+}
+
+#[test]
+fn the_driver_files_found_are_drv_files_with_their_device_first() {
+    let dir = std::env::temp_dir().join(format!("disp-cand-{}", std::process::id()));
+    let dl = dir.join("Descargas");
+    std::fs::create_dir_all(&dl).unwrap();
+    for p in [
+        dir.join("otro.drv"),
+        dl.join("mt7922-14c3-0616.DRV"),
+        dir.join("udrv-14c3-0616"),
+        dir.join("notas.txt"),
+    ] {
+        std::fs::write(p, "x").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("carpeta.drv")).unwrap();
+    let found = candidatos(&dirs_candidatos(&dir), (0x14c3, 0x0616));
+    assert_eq!(found, [dl.join("mt7922-14c3-0616.DRV"), dir.join("otro.drv")]);
+    assert!(candidatos(&[dir.join("nada")], (0, 0)).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_driver_file_names_its_device() {
+    let ids = |n: &str| ids_de_nombre(Path::new(n));
+    assert_eq!(ids("/x/mt7922-14c3-0616.drv"), Some((0x14c3, 0x0616)));
+    assert_eq!(ids("14C3_0616.drv"), Some((0x14c3, 0x0616)));
+    assert_eq!(ids("wifi-8086:7aa3-v2.drv"), Some((0x8086, 0x7aa3)));
+    assert_eq!(ids("mt7922.drv"), None);
+    assert_eq!(ids("a14c3-06161.drv"), None, "not four digits each");
+    assert!(es_drv(Path::new("a.DRV")) && !es_drv(Path::new("a.drv.txt")));
+}
+
+#[test]
+fn installing_runs_the_script_then_names_the_device_in_rboot_conf() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("disp-inst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("rboot.conf");
+    std::fs::write(&f, "cmdline=LOG=error\n").unwrap();
+    let log = dir.join("log");
+    let script = dir.join("eclipse-udriver");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\n[ \"$3\" = bad ] && {{ echo 'eclipse-udriver: no' >&2; exit 2; }}\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut c = Catalogo::default();
+    c.lee_texto(
+        &format!("[d]\ngrupo = g\ntipo = dispositivos\nfichero = {}\nclave = cmdline\n", f.display()),
+        "t",
+    );
+    let k = &c.claves[0];
+    let s = script.to_str().unwrap();
+    let wifi = pci("0000:05:00.0", 0x14c3, 0x0616, 0x028000);
+    assert_eq!(servicio(&wifi), "udrv-14c3-0616");
+    instala_con(s, k, &wifi, Some(Path::new("/home/x/mt7922.drv"))).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "cmdline=LOG=error:udriver=pci-14c3-0616@0\n"
+    );
+    instala_con(s, k, &wifi, None).unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "cmdline=LOG=error\n");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "instalar 14c3 0616 /home/x/mt7922.drv\nquitar 14c3 0616\n"
+    );
+    // A script that fails leaves rboot.conf alone and says why.
+    let bad = pci("0000:07:00.0", 0x14c3, 0x0bad, 0x028000);
+    std::fs::write(&script, "#!/bin/sh\necho 'eclipse-udriver: no' >&2\nexit 2\n").unwrap();
+    assert_eq!(
+        instala_con(s, k, &bad, Some(Path::new("/x"))),
+        Err("eclipse-udriver: no".into())
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "cmdline=LOG=error\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
