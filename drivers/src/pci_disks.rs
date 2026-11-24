@@ -25,7 +25,7 @@ use crate::{Device, DeviceError, DeviceResult};
 /// The interrupt a userspace driver waits on: the MSI that `bus::pci`
 /// armed. x86 MSI numbers sit 32 below their vectors, and the vector is
 /// what the APIC's `register_handler` takes.
-fn vector(irq: Option<usize>) -> Option<usize> {
+pub(crate) fn vector(irq: Option<usize>) -> Option<usize> {
     irq.map(|irq| {
         if cfg!(target_arch = "x86_64") {
             irq + 32

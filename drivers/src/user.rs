@@ -27,6 +27,15 @@
 //! the first four virtio input devices and the PC's i8042 ([`leave_input`]),
 //! whose events reach the consoles and `/sys` from their drivers too: the
 //! kernel has no driver for either.
+//!
+//! Any other PCI function is named by its identity instead of a kind:
+//! `udriver=pci-14c3-0616@0` keeps the kernel's hands off the first function
+//! whose vendor is `14c3` and device `0616` (four hex digits each, counting
+//! per identity in probe order), whether or not the kernel has a driver for
+//! it ([`reserve_pci_by_id`]). It is how a driver installed later reaches a
+//! device none of the kinds above covers. The kernel knows no way to stop
+//! such a device, so when its driver dies it stays out of use until the
+//! next boot ([`UserDevice::reset`]).
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -66,6 +75,9 @@ pub const HDA: &str = "hda";
 /// userspace serves the keyboards and pointers on it as
 /// `/dev/input/eventN`.
 pub const XHCI: &str = "xhci";
+/// A PCI function named by its identity, `pci-VVVV-DDDD@N`: see
+/// [`parse_pci_spec`]. Not one of [`KINDS`]: it is counted per identity.
+pub const PCI: &str = "pci";
 /// The kinds that can be reserved.
 const KINDS: [&str; 10] = [
     VIRTIO_BLK,
@@ -364,7 +376,9 @@ impl UserDevice {
                 }
                 halted
             }
-            // A PCI function of a kind this does not know how to stop.
+            // A PCI function of a kind this does not know how to stop,
+            // and one named by its identity (`pci-VVVV-DDDD@N`): it stays
+            // out of use, with what it was given, until the next boot.
             Transport::Pci => false,
             Transport::Ports => self.reset_ports(),
         }
@@ -457,6 +471,11 @@ impl UserDevice {
 
 /// What the command line asked for: each a `(kind, index)`.
 static WANTED: Once<Vec<(&'static str, usize)>> = Once::new();
+/// The PCI functions the command line names by identity: each a
+/// `(vendor << 16 | device, index)`.
+static WANTED_PCI: Once<Vec<(u32, usize)>> = Once::new();
+/// Functions of each identity in [`WANTED_PCI`] seen so far, reserved or not.
+static SEEN_PCI: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
 /// Devices of each of [`KINDS`] seen so far, reserved or not.
 static SEEN: [AtomicUsize; KINDS.len()] = [const { AtomicUsize::new(0) }; KINDS.len()];
 static RESERVED: Mutex<Vec<Arc<UserDevice>>> = Mutex::new(Vec::new());
@@ -654,6 +673,38 @@ pub fn parse_spec(spec: &str) -> Option<(&'static str, usize)> {
     Some((kind, index))
 }
 
+/// Parse an item that names a PCI function by its identity:
+/// `pci-VVVV-DDDD@N`, the vendor and device as four hex digits each (as
+/// `lspci -n` prints them), `N` its place among the functions with that
+/// identity. `(vendor << 16 | device, N)`.
+pub fn parse_pci_spec(spec: &str) -> Option<(u32, usize)> {
+    let (name, index) = spec.split_once('@')?;
+    let ids = name.strip_prefix("pci-")?;
+    let (vendor, device) = ids.split_once('-')?;
+    let hex = |s: &str| {
+        (s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u16::from_str_radix(s, 16).ok())
+            .flatten()
+    };
+    let id = (hex(vendor)? as u32) << 16 | hex(device)? as u32;
+    Some((id, index.parse().ok()?))
+}
+
+/// Every [`parse_pci_spec`] item of a whole `udriver=` value.
+pub fn parse_pci_specs(spec: &str) -> Vec<(u32, usize)> {
+    spec.split(',').filter_map(parse_pci_spec).collect()
+}
+
+/// How [`reserved`] and `/proc/udrivers` name a device: `kind@N`, or
+/// `pci-VVVV-DDDD@N` for one named by its identity.
+pub fn spec_name(kind: &str, pci_id: u32, index: usize) -> alloc::string::String {
+    if kind == PCI {
+        alloc::format!("pci-{:04x}-{:04x}@{index}", pci_id >> 16, pci_id & 0xffff)
+    } else {
+        alloc::format!("{kind}@{index}")
+    }
+}
+
 /// Parse a whole `udriver=` value: items separated by commas. The ones
 /// that name nothing reservable are left out.
 pub fn parse_specs(spec: &str) -> Vec<(&'static str, usize)> {
@@ -678,9 +729,19 @@ pub fn wanted(spec: Option<&str>, net_by_default: bool) -> Vec<((&'static str, u
 /// Set the reservation from the command line's `udriver=` value, before
 /// the buses are probed: see [`wanted`]. Only the first call counts.
 pub fn set_reservation(spec: Option<&str>, net_by_default: bool) {
+    WANTED_PCI.call_once(|| {
+        let ids = parse_pci_specs(spec.unwrap_or(""));
+        for (id, index) in &ids {
+            info!(
+                "udriver: reserving {} for userspace",
+                spec_name(PCI, *id, *index)
+            );
+        }
+        ids
+    });
     WANTED.call_once(|| {
         for item in spec.unwrap_or("").split(',').filter(|s| !s.is_empty()) {
-            if parse_spec(item).is_none() {
+            if parse_spec(item).is_none() && parse_pci_spec(item).is_none() {
                 warn!("udriver={item}: not a device this kernel can reserve");
             }
         }
@@ -860,14 +921,90 @@ fn reserve_with(
     true
 }
 
+/// Whether the command line names any PCI function with this identity
+/// (`vendor << 16 | device`): only those are counted.
+pub fn pci_id_wanted(pci_id: u32) -> bool {
+    WANTED_PCI
+        .get()
+        .is_some_and(|w| w.iter().any(|(id, _)| *id == pci_id))
+}
+
+/// The index the next function with identity `pci_id` takes, counted.
+fn next_pci_index(pci_id: u32) -> usize {
+    let mut seen = SEEN_PCI.lock();
+    match seen.iter_mut().find(|(id, _)| *id == pci_id) {
+        Some((_, n)) => {
+            *n += 1;
+            *n - 1
+        }
+        None => {
+            seen.push((pci_id, 1));
+            0
+        }
+    }
+}
+
+/// A bus found a PCI function with identity `pci_id` (`vendor << 16 |
+/// device`), before any kernel driver looks at it: whether the boot leaves
+/// it to userspace by that identity (`udriver=pci-VVVV-DDDD@N`). When it
+/// does, its window (`paddr`, `size`: its first memory BAR) is recorded
+/// and no kernel driver may touch it. `usable` false (no memory BAR) keeps
+/// it counted and the kernel's.
+pub fn reserve_pci_by_id(
+    pci_id: u32,
+    usable: bool,
+    paddr: usize,
+    size: usize,
+    wiring: impl FnOnce() -> Wiring,
+) -> bool {
+    if !pci_id_wanted(pci_id) {
+        return false;
+    }
+    let index = next_pci_index(pci_id);
+    let name = spec_name(PCI, pci_id, index);
+    if !WANTED_PCI
+        .get()
+        .is_some_and(|w| w.contains(&(pci_id, index)))
+    {
+        return false;
+    }
+    if !usable {
+        warn!("udriver: {name} has no memory BAR a userspace driver can use; the kernel keeps it");
+        return false;
+    }
+    let Wiring { irq, vaddr } = wiring();
+    info!("udriver: {name} at {paddr:#x} (+{size:#x}, irq {irq:?}) left to userspace");
+    RESERVED.lock().push(Arc::new(UserDevice {
+        kind: PCI,
+        index,
+        transport: Transport::Pci,
+        paddr,
+        size,
+        irq,
+        vaddr,
+        pci_id,
+        claimed: AtomicBool::new(false),
+    }));
+    true
+}
+
 /// The devices left to userspace, as `udriver=` would name each
-/// (`virtio-net@0`), in the order the buses found them.
+/// (`virtio-net@0`, `pci-14c3-0616@0`), in the order the buses found them.
 pub fn reserved() -> Vec<alloc::string::String> {
     RESERVED
         .lock()
         .iter()
-        .map(|d| alloc::format!("{}@{}", d.kind, d.index))
+        .map(|d| spec_name(d.kind, d.pci_id, d.index))
         .collect()
+}
+
+/// The PCI function reserved by its identity (`pci-VVVV-DDDD@N`).
+pub fn find_pci(pci_id: u32, index: usize) -> Option<Arc<UserDevice>> {
+    RESERVED
+        .lock()
+        .iter()
+        .find(|d| d.kind == PCI && d.pci_id == pci_id && d.index == index)
+        .cloned()
 }
 
 /// The reserved device of `kind` with this index, if there is one.
@@ -920,6 +1057,24 @@ mod tests {
         assert!(!e1000e_unasked(Some("virtio-net@0")));
         assert!(!e1000e_unasked(Some("virtio-blk@1,e1000e@1")));
         assert!(!e1000e_unasked(Some("e1000e@0")));
+    }
+
+    #[test]
+    fn a_pci_function_is_named_by_its_identity() {
+        assert_eq!(parse_pci_spec("pci-14c3-0616@0"), Some((0x14c3_0616, 0)));
+        assert_eq!(parse_pci_spec("pci-8086-7AA3@2"), Some((0x8086_7aa3, 2)));
+        assert_eq!(parse_pci_spec("pci-14c3-616@0"), None, "four digits");
+        assert_eq!(parse_pci_spec("pci-14c3-0616"), None);
+        assert_eq!(parse_pci_spec("pci-14c3-06x6@0"), None);
+        assert_eq!(parse_pci_spec("pci-14c30616@0"), None);
+        assert_eq!(parse_pci_spec("e1000e@0"), None);
+        assert_eq!(parse_spec("pci-14c3-0616@0"), None, "not a kind");
+        assert_eq!(
+            parse_pci_specs("hda@0,pci-14c3-0616@0,pci-8086-7aa3@1"),
+            [(0x14c3_0616, 0), (0x8086_7aa3, 1)]
+        );
+        assert_eq!(spec_name(PCI, 0x14c3_0616, 0), "pci-14c3-0616@0");
+        assert_eq!(spec_name(HDA, 0, 1), "hda@1");
     }
 
     #[test]

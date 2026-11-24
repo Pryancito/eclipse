@@ -61,6 +61,14 @@ pub const ECLIPSE_DEVICE_HDA: usize = 9;
 /// memory BAR ([`ECLIPSE_TRANSPORT_PCI`]).
 pub const ECLIPSE_DEVICE_XHCI: usize = 10;
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: a PCI
+/// function left to userspace by its identity, `udriver=pci-VVVV-DDDD@N`.
+/// Argument 3 is that identity, `vendor << 16 | device`, and the index
+/// counts the functions that have it. Its window is its first memory BAR
+/// ([`ECLIPSE_TRANSPORT_PCI`]). The kernel knows no way to stop it, so once
+/// its driver is gone it stays out of use until the next boot.
+pub const ECLIPSE_DEVICE_PCI: usize = 11;
+
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: I/O
 /// ports. The window is `size` ports from port `offset` (words 2 and 3),
 /// which the driver reaches through `ECLIPSE_DEVICE_PORT`; there is no
@@ -246,13 +254,21 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         ECLIPSE_DEVICE_I8042_AUX => user::I8042_AUX,
         ECLIPSE_DEVICE_HDA => user::HDA,
         ECLIPSE_DEVICE_XHCI => user::XHCI,
+        ECLIPSE_DEVICE_PCI => user::PCI,
         _ => return Err(ZxError::INVALID_ARGS),
     };
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
     // Look before taking anything: a bad pointer must not cost the device.
     out.write_array(&[0; CLAIM_WORDS])
         .map_err(|_| ZxError::INVALID_ARGS)?;
-    let device = user::find(kind, args[1]).ok_or(ZxError::NOT_FOUND)?;
+    let device = if kind == user::PCI {
+        let pci_id = <u32 as core::convert::TryFrom<usize>>::try_from(args[3])
+            .map_err(|_| ZxError::INVALID_ARGS)?;
+        user::find_pci(pci_id, args[1])
+    } else {
+        user::find(kind, args[1])
+    }
+    .ok_or(ZxError::NOT_FOUND)?;
     let base = device.paddr & !(PAGE_SIZE - 1);
     let end = device
         .paddr
