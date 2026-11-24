@@ -494,6 +494,18 @@ dispositivo (`nvme@0`) en el `udriver=` de `rboot.conf` para el siguiente
 arranque; COPIAR IDS lo pasa al portapapeles y INFORME escribe
 `~/dispositivos.txt`. Formato en `tools/lunarbar/src/dispositivos.rs`.
 
+Un driver de usuario se reparte como un fichero `.drv`, con los ids del
+dispositivo en el nombre (`mt7922-14c3-0616.drv`). Abrirlo en lunarfile, o
+INSTALAR DRIVER… sobre un dispositivo sin driver, abre el diálogo de
+instalación: busca los `.drv` de `~`, `~/Descargas` y `~/Downloads` y dice
+lo que va a hacer antes de hacerlo. `eclipse-udriver instalar VVVV DDDD
+FICHERO` lo copia a `/usr/lib/eclipse/udrivers/udrv-VVVV-DDDD`, crea su
+servicio de eclipse-init (`udriver = pci-VVVV-DDDD@0`) y el bloque
+`[driver:udrv-VVVV-DDDD]` (`instalado = si`, que va antes que los de serie)
+en `/etc/eclipse/claves.d`; el panel añade `pci-VVVV-DDDD@0` al `udriver=`
+de `rboot.conf`, y al reiniciar el núcleo le deja el dispositivo. QUITAR
+DRIVER lo deshace.
+
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.
 `lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.

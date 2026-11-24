@@ -81,6 +81,7 @@ pub fn kind_label(kind: Kind, is_dir: bool, lang: Lang) -> &'static str {
         Kind::Document => Key::file_kind_document,
         Kind::Archive => Key::file_kind_archive,
         Kind::Disk => Key::file_kind_disk,
+        Kind::Driver => Key::file_kind_driver,
         Kind::Media => Key::file_kind_media,
         Kind::Code => Key::file_kind_code,
         Kind::Other => Key::file_kind_other,

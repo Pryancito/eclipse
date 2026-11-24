@@ -23,6 +23,25 @@ pub(super) struct Disp {
     pub sin_nombres: bool,
     pub foco: usize,
     pub top: usize,
+    /// The "Instalar driver" dialog, while it is open.
+    pub instala: Option<Instala>,
+}
+
+/// The dialog's state: the device it is for and the files that could be
+/// its driver, one of them chosen.
+pub(super) struct Instala {
+    pub fila: usize,
+    pub candidatos: Vec<std::path::PathBuf>,
+    pub elegido: usize,
+}
+
+/// `path` with the home directory written `~`.
+fn corto(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+        _ => s,
+    }
 }
 
 impl Disp {
@@ -41,6 +60,51 @@ impl Disp {
 }
 
 impl Panel {
+    /// Opens the "Instalar driver" dialog for row `fila`, with the `.drv`
+    /// files found and `fichero` (the one opened from the file browser, or
+    /// the one chosen before) first.
+    pub(super) fn abre_instala_con(&mut self, fila: usize, fichero: Option<std::path::PathBuf>) {
+        let Some(f) = self.disp.filas.get(fila) else { return };
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let mut candidatos = dispositivos::candidatos(
+            &dispositivos::dirs_candidatos(std::path::Path::new(&home)),
+            (f.pci.vendor, f.pci.device),
+        );
+        if let Some(p) = fichero {
+            candidatos.retain(|c| *c != p);
+            candidatos.insert(0, p);
+        }
+        self.disp.foco = fila;
+        self.disp.instala = Some(Instala {
+            fila,
+            candidatos,
+            elegido: 0,
+        });
+        self.status.clear();
+    }
+
+    /// `lunarpanel --instalar FILE`: the devices page, with the dialog open
+    /// for the device the file's name says (`mt7922-14c3-0616.drv`), else
+    /// the first one without a driver.
+    pub(super) fn instala_fichero(&mut self, path: std::path::PathBuf) {
+        if let Some(g) = (0..self.cat.grupos.len()).find(|&g| {
+            self.cat
+                .del_grupo(g)
+                .iter()
+                .any(|&i| self.cat.claves[i].tipo == Tipo::Dispositivos)
+        }) {
+            self.grupo = g;
+            self.busca.clear();
+        }
+        self.carga_disp();
+        let filas = &self.disp.filas;
+        let fila = dispositivos::ids_de_nombre(&path)
+            .and_then(|(v, d)| filas.iter().position(|f| f.pci.vendor == v && f.pci.device == d))
+            .or_else(|| filas.iter().position(|f| f.estado == Estado::SinDriver))
+            .unwrap_or(0);
+        self.abre_instala_con(fila, Some(path));
+    }
+
     /// The `dispositivos` block of the page on screen, when it is that page.
     pub(super) fn pagina_disp(&self) -> Option<usize> {
         if !self.busca.trim().is_empty() {
@@ -90,6 +154,8 @@ pub(super) struct DL {
     pub accion: Rect,
     pub copiar: Rect,
     pub informe: Rect,
+    /// "Quitar driver", for a driver installed from the panel.
+    pub quitar: Option<Rect>,
 }
 
 fn btn_w(label: &str) -> i32 {
@@ -116,6 +182,10 @@ pub(super) fn layout_disp(l: &Layout, p: &Panel) -> DL {
     let copiar = (accion.0 - 12 - wc, fy, wc, BTN_H);
     let wi = btn_w(p.lang.s(Key::panel_dev_report_caps));
     let informe = (copiar.0 - 12 - wi, fy, wi, BTN_H);
+    let quitar = instalado(p).then(|| {
+        let wq = btn_w(p.lang.s(Key::panel_dev_remove_caps));
+        (informe.0 - 12 - wq, fy, wq, BTN_H)
+    });
     DL {
         cols: [rx, col(46), col(60), col(78)],
         head_y,
@@ -125,20 +195,30 @@ pub(super) fn layout_disp(l: &Layout, p: &Panel) -> DL {
         accion,
         copiar,
         informe,
+        quitar,
     }
+}
+
+/// Whether the focused row's driver is one installed from the panel.
+fn instalado(p: &Panel) -> bool {
+    p.disp
+        .filas
+        .get(p.disp.foco)
+        .and_then(|f| f.driver)
+        .and_then(|j| p.cat.drivers.get(j))
+        .is_some_and(|d| d.instalado)
 }
 
 /// The focused row's action, as its button says it.
 fn accion_label(p: &Panel) -> Option<String> {
     let f = p.disp.filas.get(p.disp.foco)?;
-    Some(
-        p.lang
-            .s(match f.accion()? {
-                true => Key::panel_dev_enable_caps,
-                false => Key::panel_dev_return_caps,
-            })
-            .into(),
-    )
+    let key = match f.accion() {
+        Some(true) => Key::panel_dev_enable_caps,
+        Some(false) => Key::panel_dev_return_caps,
+        None if f.estado == Estado::SinDriver => Key::panel_dev_install_caps,
+        None => return None,
+    };
+    Some(p.lang.s(key).into())
 }
 
 fn estado(e: Estado, lang: Lang) -> (&'static str, Rgb) {
@@ -279,8 +359,17 @@ pub(super) fn draw(cv: &mut Canvas, l: &Layout, p: &Panel, ci: usize) {
     );
     button(cv, d.copiar, p.lang.s(Key::panel_dev_copy_caps), false);
     button(cv, d.informe, p.lang.s(Key::panel_dev_report_caps), false);
+    if let Some(q) = d.quitar {
+        button(cv, q, p.lang.s(Key::panel_dev_remove_caps), false);
+    }
+    if p.disp.instala.is_some() {
+        draw_instala(cv, l, p);
+    }
     let fy = top + (FOOT_H - GLYPH_H) / 2;
-    let room = d.informe.0 - px - 2 * PAD;
+    let room = d.quitar.unwrap_or(d.informe).0 - px - 2 * PAD;
+    if p.disp.instala.is_some() {
+        return;
+    }
     if !p.status.is_empty() {
         let col = match p.tono {
             Tono::Plano => ink().muted,
@@ -312,6 +401,166 @@ pub(super) fn draw(cv: &mut Canvas, l: &Layout, p: &Panel, ci: usize) {
     }
 }
 
+// ── the "Instalar driver" dialog ─────────────────────────────────────────────
+
+const INST_W: i32 = 760;
+const INST_H: i32 = 480;
+/// Where the fields start, from the dialog's left edge.
+const INST_FIELD_X: i32 = 160;
+const INST_FIELD_H: i32 = 28;
+
+/// Where the dialog's parts are.
+pub(super) struct IL {
+    pub caja: Rect,
+    pub campo: Rect,
+    pub cancelar: Rect,
+    pub ok: Rect,
+}
+
+pub(super) fn layout_instala(l: &Layout, p: &Panel) -> IL {
+    let (px, py, pw, ph) = l.panel;
+    let w = INST_W.min(pw - 2 * PAD);
+    let caja = (px + up4((pw - w) / 2), py + up4((ph - INST_H) / 2), w, INST_H);
+    let campo = (
+        caja.0 + INST_FIELD_X,
+        caja.1 + 84,
+        w - INST_FIELD_X - 3 * PAD / 2,
+        INST_FIELD_H,
+    );
+    let by = caja.1 + INST_H - BTN_H - 20;
+    let wo = btn_w(p.lang.s(Key::panel_inst_ok_caps));
+    let ok = (caja.0 + w - 3 * PAD / 2 - wo, by, wo, BTN_H);
+    let wc = btn_w(p.lang.s(Key::panel_inst_cancel_caps));
+    let cancelar = (ok.0 - 12 - wc, by, wc, BTN_H);
+    IL {
+        caja,
+        campo,
+        cancelar,
+        ok,
+    }
+}
+
+fn draw_instala(cv: &mut Canvas, l: &Layout, p: &Panel) {
+    let Some(ins) = &p.disp.instala else { return };
+    let Some(f) = p.disp.filas.get(ins.fila) else { return };
+    let lang = p.lang;
+    let il = layout_instala(l, p);
+    let (px, py, pw, ph) = l.panel;
+    cv.fill_rect_a(px, py, pw, ph, ink().ground, 0.55);
+    let (x, y, w, h) = il.caja;
+    glass::panel(cv, x, y, w, h, ink().surface);
+    frame(cv, il.caja, ink().hairline);
+    glass::brackets(cv, x - 3, y - 3, w + 6, h + 6, 12, 2, ink().gold);
+    let lx = x + 3 * PAD / 2;
+    let room = w - 3 * PAD;
+    cv.text_bold(lang.s(Key::panel_inst_title), lx, y + 20, ink().gold);
+    let mut who = f.nombre.clone();
+    if let Some(m) = &f.fabricante {
+        who = format!("{m} · {who}");
+    }
+    who += &format!(" · {} · {}", f.pci.ids(), f.pci.donde());
+    cv.text(&fit(&who, room), lx, y + 44, ink().muted);
+    cv.hline(lx, y + 68, room, ink().hairline, 1.0);
+
+    // Driver: the file chosen among the ones found.
+    let c = il.campo;
+    let fty = c.1 + (INST_FIELD_H - GLYPH_H) / 2;
+    cv.text(lang.s(Key::panel_inst_driver), lx, fty, ink().text);
+    glass::cell(cv, c.0, c.1, c.2, c.3, ink().well, 1.0);
+    frame(cv, c, ink().cyan);
+    let fw = c.2 - 2 * 10;
+    match ins.candidatos.get(ins.elegido) {
+        Some(path) => {
+            let mut t = corto(path);
+            if ins.candidatos.len() > 1 {
+                t = format!("{t}   {}/{}", ins.elegido + 1, ins.candidatos.len());
+            }
+            cv.text(&fit(&t, fw), c.0 + 10, fty, ink().text);
+            cv.text(&fit(lang.s(Key::panel_inst_driver_hint), c.2), c.0, c.1 + c.3 + 6, ink().dim);
+        }
+        None => {
+            cv.text("—", c.0 + 10, fty, ink().dim);
+            cv.text(&fit(lang.s(Key::panel_inst_no_file), c.2), c.0, c.1 + c.3 + 6, ink().warn);
+        }
+    }
+
+    // Service: computed from the ids.
+    let name = dispositivos::servicio(&f.pci);
+    let sy = c.1 + 70;
+    let s = (c.0, sy, c.2, INST_FIELD_H);
+    let sty = sy + (INST_FIELD_H - GLYPH_H) / 2;
+    cv.text(lang.s(Key::panel_inst_service), lx, sty, ink().text);
+    glass::cell(cv, s.0, s.1, s.2, s.3, ink().well, 1.0);
+    frame(cv, s, ink().hairline);
+    cv.text(&name, s.0 + 10, sty, ink().text);
+    cv.text(&fit(lang.s(Key::panel_inst_service_hint), s.2), s.0, sy + s.3 + 6, ink().dim);
+
+    // What it will do.
+    let item = dispositivos::item_pci(&f.pci);
+    let wy = sy + 76;
+    cv.text(lang.s(Key::panel_inst_will), lx, wy, ink().dim);
+    let steps = [
+        (
+            Some(1),
+            lang.s(Key::panel_inst_step_copy)
+                .replace("{}", &format!("/usr/lib/eclipse/udrivers/{name}")),
+        ),
+        (
+            Some(2),
+            lang.s(Key::panel_inst_step_service)
+                .replace("{}", &format!("/etc/eclipse/services/{name}.service")),
+        ),
+        (None, format!("respawn · udriver = {item}")),
+        (Some(3), lang.s(Key::panel_inst_step_boot).replace("{}", &item)),
+        (Some(4), lang.s(Key::panel_inst_step_reboot).to_string()),
+    ];
+    for (k, (n, t)) in steps.iter().enumerate() {
+        let ty = wy + 22 + k as i32 * 22;
+        match n {
+            Some(n) => {
+                cv.text_bold(&n.to_string(), lx, ty, ink().cyan);
+                cv.text(&fit(t, room - 24), lx + 24, ty, ink().text);
+            }
+            None => {
+                cv.text(&fit(t, room - 48), lx + 48, ty, ink().muted);
+            }
+        }
+    }
+
+    // The warning.
+    let ay = wy + 22 + steps.len() as i32 * 22 + 8;
+    let a = (lx, ay, room, 2 * GLYPH_H + 20);
+    glass::cell(cv, a.0, a.1, a.2, a.3, ink().warn, 0.08);
+    frame(cv, a, ink().warn);
+    cv.text(&fit(lang.s(Key::panel_inst_warn1), room - 24), lx + 12, ay + 8, ink().warn);
+    cv.text(
+        &fit(lang.s(Key::panel_inst_warn2), room - 24),
+        lx + 12,
+        ay + 8 + GLYPH_H + 4,
+        ink().warn,
+    );
+
+    // Foot of the dialog.
+    let by = il.ok.1 + (BTN_H - GLYPH_H) / 2;
+    if !p.status.is_empty() {
+        cv.text(&fit(&p.status, il.cancelar.0 - lx - PAD), lx, by, ink().warn);
+    } else {
+        cv.text(
+            &fit(lang.s(Key::panel_inst_keys), il.cancelar.0 - lx - PAD),
+            lx,
+            by,
+            ink().dim,
+        );
+    }
+    button(cv, il.cancelar, lang.s(Key::panel_inst_cancel_caps), false);
+    button(
+        cv,
+        il.ok,
+        lang.s(Key::panel_inst_ok_caps),
+        !ins.candidatos.is_empty(),
+    );
+}
+
 // ── what the page does ───────────────────────────────────────────────────────
 
 impl State {
@@ -321,6 +570,10 @@ impl State {
         let Some(f) = self.panel.disp.filas.get(self.panel.disp.foco) else {
             return;
         };
+        if f.accion().is_none() && f.estado == Estado::SinDriver {
+            self.abre_instala();
+            return;
+        }
         let (Some(on), Some(item)) = (f.accion(), f.item.clone()) else {
             return;
         };
@@ -340,6 +593,111 @@ impl State {
             Err(e) => {
                 self.panel.status = e;
                 self.panel.tono = Tono::Mal;
+            }
+        }
+    }
+
+    /// Opens the dialog for the focused device, with the files found.
+    pub(super) fn abre_instala(&mut self) {
+        let fila = self.panel.disp.foco;
+        self.panel.abre_instala_con(fila, None);
+    }
+
+    /// The chosen file becomes the device's driver, or the installed one
+    /// goes (`fichero` None); either takes effect at the next boot.
+    fn instala(&mut self, fila: usize, fichero: Option<std::path::PathBuf>) {
+        let Some(ci) = self.panel.pagina_disp() else { return };
+        let Some(f) = self.panel.disp.filas.get(fila) else { return };
+        let pci = f.pci.clone();
+        let lang = self.panel.lang;
+        match dispositivos::instala(&self.panel.cat.claves[ci], &pci, fichero.as_deref()) {
+            Ok(()) => {
+                self.panel.disp.instala = None;
+                let what = lang.s(if fichero.is_some() {
+                    Key::panel_inst_done
+                } else {
+                    Key::panel_inst_removed
+                });
+                self.panel.status = format!(
+                    "{} {what} · {}",
+                    dispositivos::servicio(&pci),
+                    lang.s(Key::panel_on_reboot)
+                );
+                self.panel.tono = Tono::Bien;
+                // The installed block is read again: it names the device.
+                let dirs: Vec<&std::path::Path> =
+                    claves::DIRS.iter().map(std::path::Path::new).collect();
+                self.panel.cat.drivers = Catalogo::carga(&dirs).drivers;
+                self.panel.disp.leido = false;
+                self.panel.carga_disp();
+            }
+            Err(e) => {
+                self.panel.status = e;
+                self.panel.tono = Tono::Mal;
+            }
+        }
+    }
+
+    /// INSTALAR in the dialog.
+    fn confirma_instala(&mut self) {
+        let Some(ins) = &self.panel.disp.instala else { return };
+        let Some(path) = ins.candidatos.get(ins.elegido).cloned() else {
+            return;
+        };
+        let fila = ins.fila;
+        self.instala(fila, Some(path));
+    }
+
+    /// QUITAR DRIVER on the focused row.
+    pub(super) fn disp_quita(&mut self) {
+        if instalado(&self.panel) {
+            self.instala(self.panel.disp.foco, None);
+        }
+    }
+
+    /// A key while the dialog is open: it takes them all.
+    fn instala_key(&mut self, key: u32) {
+        let Some(ins) = self.panel.disp.instala.as_mut() else { return };
+        let n = ins.candidatos.len();
+        match key {
+            KEY_ESC_WL => {
+                self.panel.disp.instala = None;
+                self.panel.status.clear();
+            }
+            KEY_LEFT_WL if n > 0 => ins.elegido = (ins.elegido + n - 1) % n,
+            KEY_RIGHT_WL | KEY_TAB_WL if n > 0 => ins.elegido = (ins.elegido + 1) % n,
+            // Another device: the files are sorted again for it.
+            KEY_UP_WL | KEY_DOWN_WL => {
+                let rows = self.panel.disp.filas.len();
+                let fila = ins.fila;
+                let elegido = ins.candidatos.get(ins.elegido).cloned();
+                if rows > 0 {
+                    let fila = if key == KEY_UP_WL {
+                        (fila + rows - 1) % rows
+                    } else {
+                        (fila + 1) % rows
+                    };
+                    self.panel.abre_instala_con(fila, elegido);
+                }
+            }
+            KEY_ENTER_WL | KEY_KPENTER_WL => self.confirma_instala(),
+            _ => {}
+        }
+    }
+
+    /// A click while the dialog is open.
+    fn instala_click(&mut self, x: i32, y: i32) {
+        let l = self.layout();
+        let il = layout_instala(&l, &self.panel);
+        if hit(il.ok, x, y) {
+            self.confirma_instala();
+        } else if hit(il.cancelar, x, y) {
+            self.panel.disp.instala = None;
+            self.panel.status.clear();
+        } else if hit(il.campo, x, y) {
+            if let Some(ins) = self.panel.disp.instala.as_mut() {
+                let n = ins.candidatos.len().max(1);
+                ins.elegido = (ins.elegido + 1) % n;
             }
         }
     }
@@ -389,6 +747,10 @@ impl State {
 
     /// A key on this page; `false` when it is not one the page takes.
     pub(super) fn disp_key(&mut self, key: u32) -> bool {
+        if self.panel.disp.instala.is_some() {
+            self.instala_key(key);
+            return true;
+        }
         let l = self.layout();
         let caben = layout_disp(&l, &self.panel).caben;
         match key {
@@ -409,9 +771,15 @@ impl State {
 
     /// A click on this page; `false` when it is not on one of its parts.
     pub(super) fn disp_click(&mut self, x: i32, y: i32) -> bool {
+        if self.panel.disp.instala.is_some() {
+            self.instala_click(x, y);
+            return true;
+        }
         let l = self.layout();
         let d = layout_disp(&l, &self.panel);
-        if hit(d.accion, x, y) {
+        if d.quitar.is_some_and(|q| hit(q, x, y)) {
+            self.disp_quita();
+        } else if hit(d.accion, x, y) {
             self.disp_accion();
         } else if hit(d.copiar, x, y) {
             self.disp_copia();
