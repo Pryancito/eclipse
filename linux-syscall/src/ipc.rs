@@ -254,7 +254,11 @@ impl Syscall<'_> {
         // semop(2): EINVAL for an empty array, E2BIG for one over SEMOPM.
         // Checked before reading the pointer, as Linux does.
         let num_ops = semop_count(num_ops)?;
-        let ops = ops.as_slice(num_ops)?;
+        // The kernel's copy, read once: the call may sleep and plan again,
+        // and what it plans from must not be memory the caller can change
+        // or unmap meanwhile.
+        let ops = ops.read_array(num_ops)?;
+        let ops = &ops[..];
         // `find_alloc_undo` makes the caller's undo list before it looks
         // for the set, so a `semop` that then fails leaves one too.
         let undo = |op: &SemBuf| sem_flags(op.flags).is_ok_and(|f| f.contains(SemFlags::SEM_UNDO));

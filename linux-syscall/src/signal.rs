@@ -1011,8 +1011,8 @@ impl Syscall<'_> {
                     // old frame has no `ucontext` to point at, and the slot
                     // that would hold the `siginfo` is zero.
                     //
-                    // And this one can FAIL, which the two older paths cannot
-                    // say: it reads the frame through a checked access, so a
+                    // This can fail, as the other two can: each reads its
+                    // frame through a checked access, so a
                     // handler that unmapped its own stack gets an error here
                     // instead of taking the machine down. Nothing is restored
                     // in that case, so the thread is left as it was.
@@ -1020,8 +1020,7 @@ impl Syscall<'_> {
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 let _ = old_frame;
-                linux.restore_after_a_handler(ctx, &old_ctx, siginfo_ptr, uctx_ptr, narrow);
-                Ok(())
+                linux.restore_after_a_handler(ctx, &old_ctx, siginfo_ptr, uctx_ptr, narrow)
             })
             .map_err(|_| LxError::EINVAL)??;
         // sigreturn has no return value of its own: the generic syscall-return
