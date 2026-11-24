@@ -1107,11 +1107,6 @@ fn setcrtc_page_flip_and_setplane_look_the_crtc_and_the_connectors_up() {
     let buf = c.create_dumb(32, 8);
     paint(&buf, 0x0000_3333);
     let fb = c.addfb2(&buf);
-    // What the CRTC shows before this test touches it (the core's
-    // `crtc_fb` is process-wide, so it may carry a neighbour's id).
-    let before = get_crtc_fb(&c, 60);
-    assert_ne!(before, fb);
-
     let setcrtc = |crtc_id: u32, connectors: &[u32], mode_valid: u32, fb_id: u32| {
         let mut req = DrmModeGetCrtc {
             set_connectors_ptr: connectors.as_ptr() as u64,
@@ -1151,6 +1146,12 @@ fn setcrtc_page_flip_and_setplane_look_the_crtc_and_the_connectors_up() {
         enoent,
         "a mode with fb 0: the fb lookup comes before the connector rules"
     );
+    // What the CRTC shows before this test touches it (the core's
+    // `crtc_fb` is process-wide, so it may carry a neighbour's id). Read
+    // after the fb-0 check: a file `GETCRTC` showed the console to may hand
+    // fb 0 back (see `setcrtc_hands_the_console_config_back`).
+    let before = get_crtc_fb(&c, 60);
+    assert_ne!(before, fb);
     assert_eq!(
         get_crtc_fb(&c, 60),
         before,

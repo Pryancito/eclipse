@@ -430,3 +430,89 @@ fn removing_the_scanout_fb_takes_the_mode_and_active_with_it() {
     c.destroy_dumb(other_buf.handle).expect("DESTROY_DUMB");
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
+
+/// What `glmark2-drm` and kmscube do from a tty: `GETCRTC` at start, which
+/// with the kernel console on the CRTC reads a mode on fb 0, their own
+/// `SETCRTC`, and at exit that saved config back through `SETCRTC`. Linux
+/// never reports fb 0 there (fbcon scans out an fb of its own), so the
+/// round trip always worked on Linux and was ENOENT here: "Failed to
+/// restore original CRTC: -2", and the tty kept the client's last frame.
+/// The config is the console's, so the console gets the CRTC back; a file
+/// that was never shown it still gets Linux's ENOENT for fb 0.
+#[test]
+fn setcrtc_hands_the_console_config_back() {
+    let (_screen, c) = atomic_client(32, 8);
+    let conn = [CONN];
+    let console_req = |saved: &DrmModeGetCrtc| DrmModeGetCrtc {
+        set_connectors_ptr: conn.as_ptr() as u64,
+        count_connectors: 1,
+        crtc_id: CRTC,
+        fb_id: saved.fb_id,
+        x: saved.x,
+        y: saved.y,
+        gamma_size: 0,
+        mode_valid: saved.mode_valid,
+        mode: saved.mode,
+    };
+
+    // A file that never read the CRTC: fb 0 under a mode is ENOENT.
+    let stranger = Client::open(0);
+    let mut req = console_req(&DrmModeGetCrtc {
+        set_connectors_ptr: 0,
+        count_connectors: 0,
+        crtc_id: CRTC,
+        fb_id: 0,
+        x: 0,
+        y: 0,
+        gamma_size: 0,
+        mode_valid: 1,
+        mode: make_modeinfo(32, 8),
+    });
+    assert_eq!(
+        stranger.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+        Err(FsError::EntryNotFound),
+        "fb 0 from a file the console config was never shown to"
+    );
+    drop(stranger);
+
+    let saved = get_crtc(&c);
+    assert_eq!(
+        (saved.fb_id, saved.mode_valid),
+        (0, 1),
+        "the console: a mode, no fb"
+    );
+    let buf = c.create_dumb(32, 8);
+    let fb = c.addfb2(&buf);
+    set_crtc(&c, fb, Some((32, 8, 0, 0)));
+    assert_eq!(get_crtc(&c).fb_id, fb);
+
+    let mut req = console_req(&saved);
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+        Ok(0),
+        "the saved console config goes back"
+    );
+    let now = get_crtc(&c);
+    assert_eq!(
+        (now.fb_id, now.mode_valid),
+        (0, 1),
+        "GETCRTC reads the console back"
+    );
+    // And the client's fb is no longer on the CRTC, so removing it does
+    // not turn the pipe off under the console.
+    c.rmfb(fb).expect("RMFB");
+    assert_eq!(get_crtc(&c).mode_valid, 1, "RMFB left the console lit");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
+
+/// `drm_lastclose`: only a primary node's master hands the screen back on
+/// close, and not under a seat, which does it through its VT handshake.
+#[test]
+fn only_a_primary_master_without_a_seat_restores_the_console_on_close() {
+    assert!(drm::console_restore_on_master_close(0, false));
+    assert!(!drm::console_restore_on_master_close(0, true));
+    assert!(!drm::console_restore_on_master_close(
+        drm::RENDER_MINOR_BASE,
+        false
+    ));
+}

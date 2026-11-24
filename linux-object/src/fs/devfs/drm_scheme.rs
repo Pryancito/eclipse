@@ -1735,6 +1735,33 @@ impl DrmDev {
                 // -1 was looked up as an fb id.
                 let mut fb_id = req.fb_id;
                 let mut active_area = None;
+                // A mode on fb 0: the CRTC as `GETCRTC` reported it while the
+                // kernel console was on it. Linux never reports 0 there
+                // (fbcon scans out an fb of its own), so a bare KMS client
+                // that saves the CRTC at start and puts it back at exit --
+                // `glmark2-drm`, kmscube -- hands the kernel exactly this,
+                // and got ENOENT for it: "Failed to restore original CRTC:
+                // -2", and the tty stayed black. It is the console's
+                // config, so the console gets the screen back -- for a file
+                // that was shown that config; anyone else gets Linux's ENOENT.
+                if req.mode_valid != 0
+                    && fb_id == 0
+                    && req.count_connectors > 0
+                    && self.file.saw_console_crtc()
+                {
+                    let mode = DrmModeModeinfo::from_bytes(&req.mode);
+                    let area = modeinfo_active_area(&mode)?;
+                    if drm::is_panel_node(self.minor) {
+                        drm::set_crtc_fb(req.crtc_id, 0);
+                        drm::legacy_set_config(&req.mode, area, (req.x, req.y));
+                        drm::set_crtc_enabled(true);
+                        drm::set_crtc_blanked(false);
+                    } else {
+                        drm::set_crtc_fb_on(drm::card_of_minor(self.minor), 0);
+                    }
+                    drm::hand_screen_to_console(self.minor, "SETCRTC back to the console");
+                    return Ok(0);
+                }
                 if req.mode_valid != 0 {
                     if fb_id == u32::MAX {
                         fb_id = crtc.fb_id;
@@ -2960,6 +2987,11 @@ impl DrmDev {
                             crtc_res.mode_valid = 1;
                         }
                         _ => crtc_res.mode_valid = 0,
+                    }
+                    // The console's config, which this file may hand back to
+                    // SETCRTC at exit (see the SETCRTC arm).
+                    if crtc_res.mode_valid != 0 && crtc_res.fb_id == 0 {
+                        self.file.note_console_crtc();
                     }
                     Ok(0)
                 } else {

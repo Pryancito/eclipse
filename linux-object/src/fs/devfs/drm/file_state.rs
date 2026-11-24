@@ -22,6 +22,11 @@ pub struct DrmFileState {
     /// `drm_file.aspect_ratio_allowed`: set by `DRM_CLIENT_CAP_ASPECT_RATIO`.
     /// Without it `GETCRTC` masks the aspect-ratio bits out of the mode.
     aspect_ratio: AtomicBool,
+    /// `GETCRTC` told this file the kernel console was on a CRTC: a mode
+    /// with fb 0, which Linux never reports (fbcon has an fb of its own).
+    /// Only such a file may hand that config back to `SETCRTC` to give the
+    /// screen to the console again; to anyone else fb 0 is ENOENT.
+    saw_console_crtc: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
     /// The bytes of the events in `events`, kept beside it under its lock.
     event_bytes: AtomicUsize,
@@ -72,6 +77,7 @@ impl DrmFileState {
             atomic_client: AtomicBool::new(false),
             universal_planes: AtomicBool::new(false),
             aspect_ratio: AtomicBool::new(false),
+            saw_console_crtc: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             event_bytes: AtomicUsize::new(0),
             event_jobs: Arc::new(AtomicUsize::new(0)),
@@ -216,6 +222,16 @@ impl DrmFileState {
         self.aspect_ratio.load(Ordering::Relaxed)
     }
 
+    /// Note that `GETCRTC` reported the console's config (a mode, fb 0).
+    pub fn note_console_crtc(&self) {
+        self.saw_console_crtc.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::note_console_crtc`] ran for this file.
+    pub fn saw_console_crtc(&self) -> bool {
+        self.saw_console_crtc.load(Ordering::Relaxed)
+    }
+
     pub fn eventbus(&self) -> Arc<Mutex<EventBus>> {
         self.eventbus.clone()
     }
@@ -326,7 +342,9 @@ impl Drop for DrmFileState {
         destroy_blobs_of(self as *const DrmFileState as usize);
         // `drm_master_release`: the master goes with the file that held it,
         // and so does the magic it minted.
-        master_release(self.minor, self as *const DrmFileState as usize);
+        if master_release(self.minor, self as *const DrmFileState as usize) {
+            restore_console_after_master(self.minor);
+        }
         super::super::drm_scheme::master_check::forget(self as *const DrmFileState as usize);
         // And its nouveau VM (`nouveau_cli`), for a driver that keeps one per
         // file. Only marked here: the teardown runs on the next ioctl.
