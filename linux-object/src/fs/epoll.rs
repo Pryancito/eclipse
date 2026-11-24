@@ -993,8 +993,20 @@ impl FileLike for Epoll {
     }
 }
 
-/// One interest-list entry as a scan sees it: the fd, its mask, its file.
-type Watched = (FileDesc, EpollEvent, Arc<dyn FileLike>);
+/// One interest-list entry as a scan sees it: the fd, its mask, its file,
+/// and what the quick look keeps for it (see [`Kept`]).
+type Watched = (FileDesc, EpollEvent, Arc<dyn FileLike>, Kept);
+
+/// What a scan knows of an entry's [`fast::Armed`] before it polls it.
+#[derive(Clone, Copy)]
+struct Kept {
+    /// Whether to take a new subscription if the poll finds the entry quiet:
+    /// a level entry with no subscription, or one that has fired.
+    arm: bool,
+    /// The `ready` its subscription holds, when it has one: a poll that
+    /// agrees with it and takes no new one leaves nothing to store.
+    ready: Option<bool>,
+}
 
 impl Epoll {
     /// wait for events on the interest list
@@ -1045,14 +1057,13 @@ impl Epoll {
             // and a wait that misses it never pumps the network stack. Asked
             // of every entry, the ones a quick look passes too: a quiet
             // socket only wakes once the stack is pumped.
-            let (interest_list, arm, edges, watch_net, watch_interactive) = {
+            let (interest_list, edges, watch_net, watch_interactive) = {
                 let inner = self.inner.lock();
                 let n = inner.interest_list.len();
                 let mut list: Vec<Watched> = Vec::new();
-                let mut arm: Vec<bool> = Vec::new();
                 // Fallible: a multi-GB download that densified the heap used
                 // to panic on the next `collect` / `grow_one` inside this wait.
-                if list.try_reserve_exact(n).is_err() || arm.try_reserve_exact(n).is_err() {
+                if list.try_reserve_exact(n).is_err() {
                     stats::returned_error();
                     return Err(LxError::ENOMEM);
                 }
@@ -1072,10 +1083,13 @@ impl Epoll {
                     if quick && level && (event.events == 0 || entry.is_some_and(|a| a.quiet())) {
                         continue;
                     }
-                    list.push((*fd, *event, file.clone()));
-                    arm.push(level && event.events != 0 && entry.is_none_or(|a| a.fired()));
+                    let kept = Kept {
+                        arm: level && event.events != 0 && entry.is_none_or(|a| a.fired()),
+                        ready: entry.map(|a| a.ready),
+                    };
+                    list.push((*fd, *event, file.clone(), kept));
                 }
-                (list, arm, inner.edge.clone(), net, interactive)
+                (list, inner.edge.clone(), net, interactive)
             };
             // (`watch_hid`, below, is asked only once the scan found nothing
             // and the wait is about to sleep: a call that returns at once has
@@ -1103,11 +1117,9 @@ impl Epoll {
             let mut events = Vec::new();
             let mut delivered = Vec::new();
             let mut scanned_edges = Vec::new();
+            // Only the entries whose subscription changes: a wait on fds
+            // that stay as they were allocates nothing for it.
             let mut scanned_levels = Vec::new();
-            if scanned_levels.try_reserve(interest_list.len()).is_err() {
-                stats::returned_error();
-                return Err(LxError::ENOMEM);
-            }
             if events
                 .try_reserve(maxevents.min(interest_list.len()))
                 .is_err()
@@ -1120,7 +1132,7 @@ impl Epoll {
                 return Err(LxError::ENOMEM);
             }
             let now = kernel_hal::timer::timer_now();
-            for (i, (fd, event, file)) in interest_list.iter().enumerate() {
+            for (fd, event, file, kept) in interest_list.iter() {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
                 // The publication counter of an edge-triggered entry, for
                 // the files that keep one. Read BEFORE the level: a
@@ -1149,12 +1161,22 @@ impl Epoll {
                     // entry fired, not quiet. A ready entry is polled on every
                     // look anyway, and arming it would cost a subscription per
                     // call to an fd that is always ready.
-                    let armed = if arm[i] && ready == 0 {
+                    let armed = if kept.arm && ready == 0 {
                         fast::Armed::arm(&**file, interest)
                     } else {
                         None
                     };
-                    scanned_levels.push((*fd, file.clone(), armed, ready != 0));
+                    let changed = match kept.ready {
+                        Some(was) => armed.is_some() || was != (ready != 0),
+                        None => armed.is_some(),
+                    };
+                    if changed {
+                        if scanned_levels.try_reserve(1).is_err() {
+                            stats::returned_error();
+                            return Err(LxError::ENOMEM);
+                        }
+                        scanned_levels.push((*fd, file.clone(), armed, ready != 0));
+                    }
                 }
                 if edge_triggered {
                     // A file that keeps no counter is measured against
@@ -1257,7 +1279,7 @@ impl Epoll {
             // An `epoll_ctl` from another thread changes what this wait
             // should be watching: re-snapshot when it happens.
             subs.push(self.subscribe_change(&waker, changes_seen));
-            for (fd, event, file) in &interest_list {
+            for (fd, event, file, _) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
                 let edge = scanned_edges
                     .iter()
@@ -1283,7 +1305,7 @@ impl Epoll {
                     None => covered = false,
                 }
             }
-            let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
+            let watch_hid = interest_list.iter().any(|(_, _, f, _)| f.is_input_device());
             let tick_ms = if covered {
                 crate::net::wait::covered_tick_ms(parked)
             } else {
