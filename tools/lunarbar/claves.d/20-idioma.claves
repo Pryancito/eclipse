@@ -1,0 +1,43 @@
+# Eclipse OS: idioma y teclado. Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:idioma]
+es = Idioma y teclado
+en = Language and keyboard
+
+[idioma]
+grupo   = idioma
+fichero = /etc/eclipse/locale
+clave   = lang
+tipo    = elegir
+valores = es:Español en:English
+defecto = es
+aplicar = /usr/local/bin/eclipse-locale {}
+reabrir = si
+es      = Idioma
+en      = Language
+ayuda   = Las ventanas que se abran a partir de ahora
+ayuda.en = Windows opened from now on
+
+[teclado]
+grupo   = idioma
+fichero = /etc/eclipse/keyboard
+clave   = layout
+tipo    = elegir
+valores = es:Español us:Inglés_(EE._UU.)
+valores.en = es:Spanish us:English_(US)
+defecto = es
+# /proc/kbd es el que manda: el fichero puede llevar la distribución sola.
+leer    = /usr/local/bin/eclipse-kbd
+aplicar = /usr/local/bin/eclipse-kbd {}
+es      = Distribución del teclado
+en      = Keyboard layout
+
+[teclado.idioma]
+grupo   = idioma
+fichero = /etc/eclipse/keyboard
+clave   = language
+tipo    = si-no
+valores = yes no
+defecto = yes
+es      = Super+K cambia también el idioma
+en      = Super+K also switches the language

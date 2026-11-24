@@ -1,0 +1,21 @@
+# Eclipse OS: las claves que el panel de control (lunarpanel) enseña.
+# Cada bloque es un ajuste; el panel calcula su pantalla a partir de esto.
+# Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:apariencia]
+es = Apariencia
+en = Appearance
+
+[aspecto]
+grupo   = apariencia
+fichero = /etc/eclipse/look
+clave   = look
+tipo    = elegir
+valores = tecno abyss eclipse kde win11 gnome
+defecto = tecno
+aplicar = /usr/local/bin/eclipse-look {}
+reabrir = si
+es      = Aspecto del escritorio
+en      = Desktop look
+ayuda   = Colores, bordes y barras de todo el escritorio; la barra y el fondo se reinician
+ayuda.en = Colours, borders and bars of the whole desktop; the bar and wallpaper restart

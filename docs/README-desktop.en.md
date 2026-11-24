@@ -403,6 +403,7 @@ Both games failed on real hardware for different reasons, and both are fixed:
 | `Super+↓` | Minimise |
 | `Super+Space` | Desktop menu |
 | `Super+K` | Cycle keyboard layout (`es` / `us`) |
+| `Super+I` | Control panel (`lunarpanel`) |
 | `Alt+Tab` | Switch window |
 | `Alt+F4` | Close window |
 | `Super+↑` | Maximise / restore |
@@ -425,6 +426,25 @@ The time zone follows the **country**, not the keyboard: Spain by default
 switches to `America/New_York`; `tz=Europe/Paris` sets an arbitrary Olson zone.
 `ntpd` (OpenNTPD, or busybox if the applet is there) starts with the system after
 DHCP and sets the clock.
+
+## The control panel (`lunarpanel`, Super+I)
+
+The control panel has no hand-written screens: it is **computed** from
+data. Each setting is a block in `/usr/share/eclipse/claves.d/*.claves` (in
+the tree, `tools/lunarbar/claves.d/`; a machine's own, in
+`/etc/eclipse/claves.d/`). The pages (the groups, in the order they first
+appear), each row's control (chips when they fit, a `‹ ›` stepper when they
+do not, a switch, a segmented meter or a button), every control's width (its
+text rounded up to the 4 px grid) and the label column (the page's longest
+label) all follow from those blocks. A new setting is a new block; the panel
+is not rebuilt. Each row says which file and key it writes. A block that
+cannot be used is left out and counted in the footer as a warning; a value
+that is not one of its `valores` is never written. The format is documented
+in `tools/lunarbar/src/claves.rs`.
+
+A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
+searches every setting, in both languages. `lunarpanel --dump PATH:WxH
+[group]` draws it without a compositor.
 
 ## The panel and system stability
 
@@ -537,7 +557,7 @@ echo abyss > /etc/eclipse/desktop
   `/etc/eclipse/abyss.kdl`: Super+Return (terminal), Alt+Space and Alt+F2
   (lunarrun), Super+E (lunarfile), Super+V (clipboard), Super+D (show
   desktop), Super+L (lunarlock), Super+Tab (lunardesk), Super+N (lunarnotes),
-  Super+K (keyboard), Print and Shift+Print (lunarshot) and Ctrl+Shift+Esc
+  Super+I (lunarpanel), Super+K (keyboard), Print and Shift+Print (lunarshot) and Ctrl+Shift+Esc
   (lunarmon). Abyss's launcher stays on Super+R.
 - **Permissions**: Abyss hides its privileged protocols from any program not
   named in `/etc/eclipse/policy.kdl`. It lists lunarclip

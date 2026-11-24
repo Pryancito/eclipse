@@ -1,0 +1,37 @@
+# Eclipse OS: lo que tiene ventana propia. El panel solo la abre.
+# Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:red]
+es = Red
+en = Network
+
+[red]
+grupo   = red
+tipo    = abrir
+orden   = /usr/local/bin/eclipse-network
+es      = Direcciones de cada interfaz
+en      = Addresses of each interface
+ayuda   = IPv4, IPv6 y DNS: DHCP, automática o manual
+ayuda.en = IPv4, IPv6 and DNS: DHCP, automatic or manual
+
+[grupo:sistema]
+es = Sistema
+en = System
+
+[monitor]
+grupo   = sistema
+tipo    = abrir
+orden   = /usr/local/bin/eclipse-monitor
+es      = Procesos y servicios
+en      = Processes and services
+ayuda   = Monitor del sistema (Ctrl+Mayús+Esc)
+ayuda.en = System monitor (Ctrl+Shift+Esc)
+
+[seguridad]
+grupo   = sistema
+tipo    = abrir
+orden   = /usr/local/bin/eclipse-security
+es      = Seguridad
+en      = Security
+ayuda   = hunter: análisis, cuarentena y cortafuegos
+ayuda.en = hunter: scans, quarantine and firewall

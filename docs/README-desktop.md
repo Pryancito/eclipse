@@ -405,6 +405,7 @@ resueltas:
 | `Super+↓` | Minimizar |
 | `Super+Espacio` | Menú de escritorio |
 | `Super+K` | Ciclar layout de teclado (`es` / `us`) |
+| `Super+I` | Panel de control (`lunarpanel`) |
 | `Alt+Tab` | Cambiar de ventana |
 | `Alt+F4` | Cerrar ventana |
 | `Super+↑` | Maximizar / restaurar |
@@ -427,6 +428,39 @@ La zona horaria sigue el **país**, no el teclado: por defecto España
 `eclipse-tz US` pasa a `America/New_York`; `tz=Europe/Paris` fija un Olson
 arbitrario. `ntpd` (OpenNTPD, o busybox si está el applet) arranca con el
 sistema tras DHCP y pone el reloj.
+
+## El panel de control (`lunarpanel`, Super+I)
+
+El panel de control no tiene pantallas escritas a mano: se **calcula** a
+partir de datos. Cada ajuste es un bloque en
+`/usr/share/eclipse/claves.d/*.claves` (en el árbol,
+`tools/lunarbar/claves.d/`; los de la máquina, en `/etc/eclipse/claves.d/`):
+
+```ini
+[aspecto]
+grupo   = apariencia
+fichero = /etc/eclipse/look
+clave   = look
+tipo    = elegir            # elegir | si-no | numero | abrir
+valores = tecno abyss eclipse kde win11 gnome
+aplicar = /usr/local/bin/eclipse-look {}
+es      = Aspecto del escritorio
+en      = Desktop look
+```
+
+De ahí salen las páginas (los grupos, en el orden en que aparecen), el
+control de cada fila (fichas si caben, un selector `‹ ›` si no, interruptor,
+medidor por segmentos o botón), el ancho de cada control (su texto
+redondeado a la rejilla de 4 px) y la columna de etiquetas (la más larga de
+la página). Un ajuste nuevo es un bloque nuevo; el panel no se recompila.
+Cada fila dice qué fichero y qué clave escribe. Un bloque que no se puede
+usar se deja fuera y se cuenta en el pie como aviso; un valor que no está en
+`valores` no se escribe nunca. El formato completo está en
+`tools/lunarbar/src/claves.rs`.
+
+Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
+quita. Escribir busca entre todas las claves, en los dos idiomas.
+`lunarpanel --dump RUTA:AnchoxAlto [grupo]` lo dibuja sin compositor.
 
 ## El panel y la estabilidad del sistema
 
@@ -541,7 +575,7 @@ echo abyss > /etc/eclipse/desktop
   van en `/etc/eclipse/abyss.kdl`: Super+Intro (terminal), Alt+Espacio y
   Alt+F2 (lunarrun), Super+E (lunarfile), Super+V (portapapeles), Super+D
   (mostrar escritorio), Super+L (lunarlock), Super+Tab (lunardesk), Super+N
-  (lunarnotes), Super+K (teclado), Impr y Mayús+Impr (lunarshot) y
+  (lunarnotes), Super+I (lunarpanel), Super+K (teclado), Impr y Mayús+Impr (lunarshot) y
   Ctrl+Mayús+Esc (lunarmon). El lanzador de Abyss se queda en Super+R.
 - **Permisos**: Abyss esconde sus protocolos privilegiados a cualquier programa
   que no esté nombrado en `/etc/eclipse/policy.kdl`. Ahí se listan lunarclip
