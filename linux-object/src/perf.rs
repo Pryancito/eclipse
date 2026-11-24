@@ -136,14 +136,43 @@ pub fn record(proc: &LinuxProcess, num: u32, ns: u64, timed: bool) {
 
 /// Per-process syscall accounting, stored inline on [`LinuxProcess`] so it is
 /// freed with the process.
+///
+/// The call counts are kept per CPU ([`CallShard`]), allocated on the first
+/// call a CPU makes for this process. They were one table for the process,
+/// and every syscall of every thread did two atomic adds on it, the total and
+/// the call's own row: lines that twenty threads calling `getpid` pulled from
+/// one another on every call. eclipse-bench on hardware gave `syscall
+/// scaling` 24.7 % (Linux 64.5 %). The times stay shared: only one call in
+/// [`sample_interval`] writes them.
 pub struct ProcPerf {
-    count: AtomicU64,
+    shards: Box<[spin::Once<CallShard>]>,
     ns: AtomicU64,
-    /// Per-syscall call count.
-    per: Box<[AtomicU32]>,
     /// Per-syscall cumulative time (ns), so `/proc/<pid>/perf` shows latency.
     per_ns: Box<[AtomicU64]>,
 }
+
+/// One CPU's share of a process's call counts.
+struct CallShard {
+    count: AtomicU64,
+    /// Per-syscall call count.
+    per: Box<[AtomicU32]>,
+}
+
+impl CallShard {
+    fn new() -> Self {
+        let mut per = Vec::with_capacity(PERF_NR);
+        for _ in 0..PERF_NR {
+            per.push(AtomicU32::new(0));
+        }
+        CallShard {
+            count: AtomicU64::new(0),
+            per: per.into_boxed_slice(),
+        }
+    }
+}
+
+/// How many CPUs keep a shard of their own; past that they share by modulo.
+const CALL_SHARDS: usize = kernel_hal::config::MAX_CORE_NUM;
 
 impl Default for ProcPerf {
     fn default() -> Self {
@@ -154,22 +183,30 @@ impl Default for ProcPerf {
 impl ProcPerf {
     /// Create a zeroed per-process accounting table.
     pub fn new() -> Self {
-        let mut per = Vec::with_capacity(PERF_NR);
         let mut per_ns = Vec::with_capacity(PERF_NR);
         for _ in 0..PERF_NR {
-            per.push(AtomicU32::new(0));
             per_ns.push(AtomicU64::new(0));
         }
+        let mut shards = Vec::with_capacity(CALL_SHARDS);
+        for _ in 0..CALL_SHARDS {
+            shards.push(spin::Once::new());
+        }
         ProcPerf {
-            count: AtomicU64::new(0),
+            shards: shards.into_boxed_slice(),
             ns: AtomicU64::new(0),
-            per: per.into_boxed_slice(),
             per_ns: per_ns.into_boxed_slice(),
         }
     }
 
+    /// The shard of the CPU this runs on, made on its first call there.
+    fn shard(&self) -> &CallShard {
+        let cpu = kernel_hal::cpu::cpu_id() as usize % CALL_SHARDS;
+        self.shards[cpu].call_once(CallShard::new)
+    }
+
     fn record(&self, num: u32, ns: u64, timed: bool) {
-        self.count.fetch_add(1, Relaxed);
+        let shard = self.shard();
+        shard.count.fetch_add(1, Relaxed);
         // `ns` is already zero when untimed, so dropping this guard changes
         // no reading: it is an *equivalent* mutant, and no unit test can
         // fall for it. It stays because the two totals are a cacheline the
@@ -178,21 +215,32 @@ impl ProcPerf {
         if timed {
             self.ns.fetch_add(ns, Relaxed);
         }
-        if (num as usize) < self.per.len() {
-            self.per[num as usize].fetch_add(1, Relaxed);
+        if (num as usize) < shard.per.len() {
+            shard.per[num as usize].fetch_add(1, Relaxed);
             if timed {
                 self.per_ns[num as usize].fetch_add(ns, Relaxed);
             }
         }
     }
 
+    /// Calls to syscall `num`, on every CPU.
+    pub fn calls(&self, num: usize) -> u64 {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.get())
+            .map(|shard| shard.per.get(num).map_or(0, |c| c.load(Relaxed) as u64))
+            .sum()
+    }
+
     /// Whether the dispatch should read the clock around this process's next
     /// syscall.
     ///
     /// Asked at syscall entry, and it has to be cheap or it defeats itself:
-    /// one relaxed load of `count`, a counter the exit path of this same
-    /// syscall is about to increment anyway, so the line is one this CPU
-    /// already wants. **Per process on purpose** -- a global sampling counter
+    /// one relaxed load of this CPU's shard `count`, a counter the exit path
+    /// of this same syscall is about to increment anyway, so the line is one
+    /// this CPU already wants. Each shard samples one call in `n` of its own,
+    /// so the process as a whole does too. **Per process on purpose** -- a
+    /// global sampling counter
     /// would be exactly the machine-wide atomic increment that
     /// `syscall_stats` just had removed from this path, and sampling a
     /// process's own calls is also the right denominator for
@@ -208,12 +256,22 @@ impl ProcPerf {
         let n = sample_interval();
         // `n == 1` first only to skip the divide in exact mode; the
         // remainder would answer the same.
-        n == 1 || self.count.load(Relaxed).is_multiple_of(n as u64)
+        n == 1
+            || self.shards[kernel_hal::cpu::cpu_id() as usize % CALL_SHARDS]
+                .get()
+                .map_or(0, |shard| shard.count.load(Relaxed))
+                .is_multiple_of(n as u64)
     }
 
     /// `(total calls, total nanoseconds)`.
     pub fn totals(&self) -> (u64, u64) {
-        (self.count.load(Relaxed), self.ns.load(Relaxed))
+        let calls = self
+            .shards
+            .iter()
+            .filter_map(|shard| shard.get())
+            .map(|shard| shard.count.load(Relaxed))
+            .sum();
+        (calls, self.ns.load(Relaxed))
     }
 }
 
@@ -1821,8 +1879,8 @@ pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
     let perf = proc.perf();
     let (total, ns) = perf.totals();
     let mut rows: Vec<(u32, u64, u64)> = Vec::new();
-    for i in 0..perf.per.len() {
-        let calls = perf.per[i].load(Relaxed) as u64;
+    for i in 0..PERF_NR {
+        let calls = perf.calls(i);
         if calls != 0 {
             rows.push((i as u32, calls, perf.per_ns[i].load(Relaxed)));
         }
@@ -2739,7 +2797,7 @@ mod tests {
         p.record(PERF_NR as u32, 500, true); // out of range, must not index
         p.record(u32::MAX, 500, true);
         assert_eq!(p.totals(), (4, 5_000));
-        assert_eq!(p.per[3].load(Relaxed), 2);
+        assert_eq!(p.calls(3), 2);
         assert_eq!(p.per_ns[3].load(Relaxed), 4_000);
     }
 
