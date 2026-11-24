@@ -1,0 +1,36 @@
+# Eclipse OS: lo que se lee al arrancar. Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:arranque]
+es = Arranque
+en = Boot
+
+[sesion]
+grupo   = arranque
+fichero = /etc/eclipse/desktop
+formato = palabra
+tipo    = elegir
+valores = labwc:labwc abyss:Abyss xorg:Xorg
+defecto = labwc
+reinicio = si
+es      = Sesión gráfica
+en      = Desktop session
+ayuda   = La línea de órdenes (desktop=) manda sobre esto
+ayuda.en = The command line (desktop=) overrides this
+
+# rboot.conf está en la ESP. Si /boot/efi no está montada, el panel la monta
+# como dice /etc/fstab (eclipse-fs-mounts). hunter fija la suma de este
+# fichero, así que avisará del cambio en el siguiente arranque.
+[resolucion]
+grupo   = arranque
+fichero = /boot/efi/EFI/Boot/rboot.conf
+montar  = /boot/efi
+clave   = resolution
+tipo    = elegir
+valores = auto:Automática 1024x768 1280x720 1280x800 1366x768 1600x900 1920x1080 1920x1200 2560x1440 3840x2160
+valores.en = auto:Automatic
+defecto = auto
+reinicio = si
+es      = Resolución de pantalla
+en      = Screen resolution
+ayuda   = rboot.conf; hunter avisará del cambio al arrancar
+ayuda.en = rboot.conf; hunter will report the change at boot

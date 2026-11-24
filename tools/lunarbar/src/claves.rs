@@ -30,6 +30,12 @@
 //! `numero` (`rango = a..b`, optional `paso`) and `abrir` (a button that runs
 //! `orden`, for a setting that has a window of its own, like the network).
 //!
+//! Optional fields: `formato = palabra` (the file holds the value alone, like
+//! `/etc/eclipse/desktop`), `montar = /boot/efi` (mount that volume through
+//! fstab before touching the file), `leer` (a command that prints the value
+//! in force), `reabrir = si` (the panel reopens after applying it) and
+//! `reinicio = si` (the value is read at boot).
+//!
 //! Fail-closed on bad data: a block the panel cannot use is LEFT OUT and
 //! named in [`Catalogo::avisos`], which the panel's footer counts. A value
 //! the file holds that is not one of `valores` reads as `defecto`. A value is
@@ -61,6 +67,10 @@ pub const DE_SERIE: &[(&str, &str)] = &[
     (
         "40-sistema.claves",
         include_str!("../claves.d/40-sistema.claves"),
+    ),
+    (
+        "50-arranque.claves",
+        include_str!("../claves.d/50-arranque.claves"),
     ),
 ];
 
@@ -104,6 +114,15 @@ pub struct Clave {
     /// `reabrir = si`: the panel opens itself again after applying it, so it
     /// is drawn in the look or the language just chosen.
     pub reabrir: bool,
+    /// `formato = palabra`: the file holds the value alone, as its first
+    /// word (`/etc/eclipse/desktop`), instead of `clave=valor` lines.
+    pub palabra: bool,
+    /// `montar = /boot/efi`: the file lives on a volume fstab mounts; when
+    /// it is not mounted, fstab's mounting is run before reading or writing.
+    pub montar: Option<PathBuf>,
+    /// `reinicio = si`: what is written is read at boot, so the row and the
+    /// status after applying say it takes effect on the next start.
+    pub reinicio: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +170,7 @@ impl Clave {
     /// `/etc/eclipse/look · look`, what the row says it writes.
     pub fn origen(&self) -> String {
         match (&self.fichero, &self.clave, &self.orden) {
+            (Some(f), _, _) if self.palabra => f.display().to_string(),
             (Some(f), Some(k), _) => format!("{} · {k}", f.display()),
             (_, _, Some(o)) => o.clone(),
             _ => String::new(),
@@ -315,8 +335,17 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
             return Err("«clave» no válida".into());
         }
     }
-    if tipo != Tipo::Abrir && (fichero.is_none() || key.is_none()) {
+    let palabra = match b.get("formato") {
+        None | Some("clave") => false,
+        Some("palabra") => true,
+        Some(f) => return Err(format!("formato desconocido «{f}»")),
+    };
+    if tipo != Tipo::Abrir && (fichero.is_none() || (key.is_none() && !palabra)) {
         return Err("falta «fichero» o «clave»".into());
+    }
+    let montar = b.get("montar").map(PathBuf::from);
+    if montar.as_ref().is_some_and(|m| !m.is_absolute()) {
+        return Err("«montar» tiene que ser una ruta absoluta".into());
     }
     if fichero.as_ref().is_some_and(|f| !f.is_absolute()) {
         return Err("«fichero» tiene que ser una ruta absoluta".into());
@@ -366,6 +395,9 @@ fn clave(b: &Bloque) -> Result<Clave, String> {
         leer: b.get("leer").map(str::to_string),
         orden: b.get("orden").map(str::to_string),
         reabrir: matches!(b.get("reabrir"), Some("si" | "sí" | "yes")),
+        reinicio: matches!(b.get("reinicio"), Some("si" | "sí" | "yes")),
+        palabra,
+        montar,
         id,
         grupo,
         tipo,
@@ -566,13 +598,62 @@ pub fn valor_actual(c: &Clave) -> String {
             }
         }
     }
-    let raw = match (&c.fichero, &c.clave) {
-        (Some(f), Some(k)) => std::fs::read_to_string(f)
-            .ok()
-            .and_then(|t| lee_clave(&t, k)),
+    if let Some(m) = &c.montar {
+        if let Err(e) = asegura_montaje(m) {
+            eprintln!("lunarpanel: {e}");
+        }
+    }
+    let text = c.fichero.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
+    let raw = match (&text, &c.clave) {
+        (Some(t), _) if c.palabra => lee_palabra(t),
+        (Some(t), Some(k)) => lee_clave(t, k),
         _ => None,
     };
     c.normaliza(raw.as_deref())
+}
+
+/// The first word of a one-word settings file, comments skipped.
+pub fn lee_palabra(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+}
+
+/// Whether `/proc/mounts` (as `text`) has something mounted at `at`.
+pub fn montado_en(text: &str, at: &Path) -> bool {
+    let at = at.to_string_lossy();
+    let at = at.trim_end_matches('/');
+    text.lines().any(|l| l.split_whitespace().nth(1) == Some(at))
+}
+
+/// What mounts fstab's FAT, btrfs, EclipseFS and NFS lines (the
+/// `fs-mounts` service); it skips what is already mounted.
+const FS_MOUNTS: &str = "/usr/local/bin/eclipse-fs-mounts";
+
+/// `at` mounted, through fstab when it is not yet: the same script the boot
+/// runs, then up to 6 s for the mount to show in /proc/mounts (the script
+/// leaves its servers starting in the background).
+pub fn asegura_montaje(at: &Path) -> Result<(), String> {
+    let now = || {
+        std::fs::read_to_string("/proc/mounts")
+            .map(|t| montado_en(&t, at))
+            .unwrap_or(false)
+    };
+    if now() {
+        return Ok(());
+    }
+    let _ = std::process::Command::new(FS_MOUNTS)
+        .stdin(std::process::Stdio::null())
+        .status();
+    for _ in 0..60 {
+        if now() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("{} no está montada (fstab)", at.display()))
 }
 
 /// Sets `c` to `v`: through `aplicar` when the block has one, else by
@@ -595,21 +676,29 @@ pub fn aplica(c: &Clave, v: &str) -> Result<(), String> {
         }
         return Ok(());
     }
-    let (Some(f), Some(k)) = (&c.fichero, &c.clave) else {
+    let Some(f) = &c.fichero else {
         return Err(format!("{} no dice dónde escribir", c.id));
     };
-    let old = std::fs::read_to_string(f).unwrap_or_default();
-    let new = pon_clave(&old, k, v);
+    if let Some(m) = &c.montar {
+        asegura_montaje(m)?;
+    }
+    let new = match &c.clave {
+        _ if c.palabra => format!("{v}\n"),
+        Some(k) => pon_clave(&std::fs::read_to_string(f).unwrap_or_default(), k, v),
+        None => return Err(format!("{} no dice qué clave escribir", c.id)),
+    };
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
     let tmp = f.with_extension(format!("lunarpanel.{}", std::process::id()));
-    std::fs::write(&tmp, new)
-        .and_then(|()| std::fs::rename(&tmp, f))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", f.display())
-        })
+    let atomic = std::fs::write(&tmp, &new).and_then(|()| std::fs::rename(&tmp, f));
+    if atomic.is_ok() {
+        return Ok(());
+    }
+    // A filesystem that cannot rename over a file (the ESP's FAT server may
+    // not): the file is rewritten in place instead.
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(f, &new).map_err(|e| format!("{}: {e}", f.display()))
 }
 
 /// Starts an `abrir`'s command and does not wait for it.

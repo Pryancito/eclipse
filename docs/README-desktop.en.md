@@ -440,7 +440,10 @@ label) all follow from those blocks. A new setting is a new block; the panel
 is not rebuilt. Each row says which file and key it writes. A block that
 cannot be used is left out and counted in the footer as a warning; a value
 that is not one of its `valores` is never written. The format is documented
-in `tools/lunarbar/src/claves.rs`.
+in `tools/lunarbar/src/claves.rs`. `formato = palabra` is for a file that
+holds the value alone (`/etc/eclipse/desktop`); `montar = /boot/efi` mounts
+the ESP as `/etc/fstab` says (`eclipse-fs-mounts`) before touching
+`rboot.conf`; `reinicio = si` marks what is read at boot.
 
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH

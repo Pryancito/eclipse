@@ -17,3 +17,17 @@ es      = País y zona horaria
 en      = Country and time zone
 ayuda   = España: Europe/Madrid · Estados Unidos: America/New_York
 ayuda.en = Spain: Europe/Madrid · United States: America/New_York
+
+[zona]
+grupo   = fecha
+fichero = /etc/eclipse/timezone
+clave   = tz
+tipo    = elegir
+valores = Europe/Madrid:Madrid Atlantic/Canary:Canarias Europe/Lisbon:Lisboa Europe/London:Londres Europe/Paris:París Europe/Berlin:Berlín Europe/Rome:Roma UTC:UTC America/New_York:Nueva_York America/Chicago:Chicago America/Denver:Denver America/Los_Angeles:Los_Ángeles America/Mexico_City:Ciudad_de_México America/Bogota:Bogotá America/Argentina/Buenos_Aires:Buenos_Aires America/Sao_Paulo:São_Paulo Asia/Tokyo:Tokio
+valores.en = Atlantic/Canary:Canary_Islands Europe/Lisbon:Lisbon Europe/London:London Europe/Paris:Paris Europe/Berlin:Berlin Europe/Rome:Rome America/New_York:New_York America/Los_Angeles:Los_Angeles America/Mexico_City:Mexico_City Asia/Tokyo:Tokyo
+defecto = Europe/Madrid
+aplicar = /usr/local/bin/eclipse-tz {}
+es      = Zona horaria
+en      = Time zone
+ayuda   = Afina la del país; los programas que se abran a partir de ahora
+ayuda.en = Refines the country's; programs opened from now on

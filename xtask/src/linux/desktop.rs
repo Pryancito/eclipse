@@ -549,6 +549,12 @@ fn write_eclipse_tz(rootfs: &Path) {
           \x20 if [ -n \"$t\" ]; then echo \"$t\"; return; fi\n\
           \x20 c=$(cmdline_val country)\n\
           \x20 if country_ok \"$c\"; then tz_for_country \"$c\"; return; fi\n\
+          # A zone in the file beats the file's country: `eclipse-tz Area/City`\n\
+          # keeps the country and writes the zone, and reading the country\n\
+          # first put every boot back on that country's zone. eclipse-init\n\
+          # already reads tz= first.\n\
+          \x20 t=$(file_val tz)\n\
+          \x20 if [ -n \"$t\" ]; then echo \"$t\"; return; fi\n\
           \x20 c=$(file_val country)\n\
           \x20 if country_ok \"$c\"; then tz_for_country \"$c\"; return; fi\n\
           \x20 current_tz\n\

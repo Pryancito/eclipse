@@ -17,13 +17,16 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "teclado",
             "teclado.idioma",
             "pais",
+            "zona",
             "red",
             "monitor",
-            "seguridad"
+            "seguridad",
+            "sesion",
+            "resolucion"
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));
@@ -174,4 +177,53 @@ fn search_matches_either_language_without_accents() {
         name(c.del_grupo(1)),
         ["idioma", "teclado", "teclado.idioma"]
     );
+}
+
+#[test]
+fn a_one_word_file_is_read_and_written_whole() {
+    assert_eq!(lee_palabra("# sesión\n\n  abyss  extra\n").as_deref(), Some("abyss"));
+    assert_eq!(lee_palabra("\n# nada\n"), None);
+    let dir = std::env::temp_dir().join(format!("claves-palabra-{}", std::process::id()));
+    let f = dir.join("desktop");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&f, "xorg\n").unwrap();
+    let mut c = Catalogo::default();
+    c.lee_texto(
+        &format!(
+            "[s]\ngrupo = g\ntipo = elegir\nfichero = {}\nformato = palabra\nvalores = labwc abyss xorg\n\
+             [mal]\ngrupo = g\ntipo = elegir\nfichero = /x\nformato = raro\nvalores = a\n\
+             [sin]\ngrupo = g\ntipo = elegir\nfichero = /x\nvalores = a\n",
+            f.display()
+        ),
+        "t",
+    );
+    assert_eq!(c.claves.len(), 1, "{:?}", c.avisos);
+    assert_eq!(c.avisos.len(), 2);
+    let k = &c.claves[0];
+    assert_eq!(k.origen(), f.display().to_string());
+    assert_eq!(valor_actual(k), "xorg");
+    aplica(k, "abyss").unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "abyss\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_mount_point_is_found_in_proc_mounts() {
+    let mounts = "/dev/vda2 / btrfs rw 0 0\n/dev/vda1 /boot/efi vfat rw 0 0\n";
+    assert!(montado_en(mounts, Path::new("/boot/efi")));
+    assert!(montado_en(mounts, Path::new("/boot/efi/")));
+    assert!(!montado_en(mounts, Path::new("/boot")));
+    assert!(!montado_en("", Path::new("/boot/efi")));
+}
+
+#[test]
+fn the_boot_blocks_say_they_are_read_at_boot() {
+    let c = shipped();
+    for id in ["sesion", "resolucion"] {
+        let k = c.claves.iter().find(|k| k.id == id).unwrap();
+        assert!(k.reinicio, "{id}");
+    }
+    let r = c.claves.iter().find(|k| k.id == "resolucion").unwrap();
+    assert_eq!(r.montar.as_deref(), Some(Path::new("/boot/efi")));
+    assert!(r.admite("1920x1080") && r.admite("auto") && !r.admite("1x1"));
 }
