@@ -770,6 +770,25 @@ fn sh(cmd: &str) -> std::io::Result<std::process::Output> {
 
 /// The value in force: `leer`'s first line, else the file, else `defecto`.
 pub fn valor_actual(c: &Clave) -> String {
+    if let Some(m) = &c.montar {
+        if let Err(e) = asegura_montaje(m) {
+            eprintln!("lunarpanel: {e}");
+        }
+    }
+    valor_leido(c)
+}
+
+/// The volume `c` lives on when it is not mounted now: what
+/// [`valor_actual`] would wait for.
+pub fn sin_montar(c: &Clave) -> Option<&Path> {
+    let m = c.montar.as_deref()?;
+    let mounted = std::fs::read_to_string("/proc/mounts").is_ok_and(|t| montado_en(&t, m));
+    (!mounted).then_some(m)
+}
+
+/// [`valor_actual`] without mounting anything: what the file says if its
+/// volume is there, else the default. It never waits.
+pub fn valor_leido(c: &Clave) -> String {
     if let Some(cmd) = &c.leer {
         if let Ok(o) = sh(cmd) {
             let out = String::from_utf8_lossy(&o.stdout);
@@ -783,11 +802,6 @@ pub fn valor_actual(c: &Clave) -> String {
             if o.status.success() && known {
                 return c.normaliza(Some(line));
             }
-        }
-    }
-    if let Some(m) = &c.montar {
-        if let Err(e) = asegura_montaje(m) {
-            eprintln!("lunarpanel: {e}");
         }
     }
     let text = c.fichero.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
@@ -826,7 +840,14 @@ const FS_MOUNTS: &str = "/usr/local/bin/eclipse-fs-mounts";
 /// `at` mounted, through fstab when it is not yet: the same script the boot
 /// runs, then up to 6 s for the mount to show in /proc/mounts (the script
 /// leaves its servers starting in the background).
+///
+/// Tried once per volume and process: every boot setting lives on
+/// `/boot/efi`, and a volume fstab cannot mount cost 6 s for each of them,
+/// a minute before the panel showed up.
 pub fn asegura_montaje(at: &Path) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static PROBADOS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
     let now = || {
         std::fs::read_to_string("/proc/mounts")
             .map(|t| montado_en(&t, at))
@@ -834,6 +855,15 @@ pub fn asegura_montaje(at: &Path) -> Result<(), String> {
     };
     if now() {
         return Ok(());
+    }
+    // Held through the attempt: a second caller (the panel's APLICAR while
+    // its reader thread mounts) waits for the first one's answer.
+    let mut probados = PROBADOS.lock().unwrap_or_else(|e| e.into_inner());
+    if now() {
+        return Ok(());
+    }
+    if !probados.get_or_insert_with(HashSet::new).insert(at.to_path_buf()) {
+        return Err(format!("{} no está montada (fstab)", at.display()));
     }
     let _ = std::process::Command::new(FS_MOUNTS)
         .stdin(std::process::Stdio::null())

@@ -388,6 +388,9 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // an id-and-class scan (`devices/`, `vendor`, `device`, `class`) are the
     // ones the kernel's `/sys/bus/pci` already publishes for libdrm.
     "pciutils-libs",
+    // `lspci` itself: the driver guide (docs/README-drivers.md) and the
+    // "Dispositivos" page send people to `lspci -n` for a card's ids.
+    "pciutils",
     // The names `lspci` prints, `/usr/share/hwdata/pci.ids`: the control
     // panel's "Dispositivos" page reads it for each card's maker, model and
     // class (tools/lunarbar/src/dispositivos.rs). Data only, no program.
@@ -2364,7 +2367,7 @@ mod tests {
     /// sees `/sys/bus/pci/` (which the kernel publishes for libdrm) and logs
     /// `[GFX1-]: glxtest: libpci missing` when the library is not there. The
     /// library comes in its own Alpine package, separate from `pciutils`
-    /// (the `lspci` tool, which nothing in the image needs).
+    /// (the `lspci` tool, which the image ships too, for the driver guide).
     #[test]
     fn the_devices_page_has_the_names_lspci_prints() {
         assert!(DEFAULT_PACKAGES.contains(&"hwdata-pci"));
@@ -2377,8 +2380,8 @@ mod tests {
             "pciutils-libs (libpci.so.3, what glxtest dlopens) must be in the default package set"
         );
         assert!(
-            !DEFAULT_PACKAGES.contains(&"pciutils"),
-            "the lspci tool is not what Firefox needs; only the library package"
+            DEFAULT_PACKAGES.contains(&"pciutils"),
+            "lspci: the driver guide and the devices page point people at `lspci -n`"
         );
     }
 

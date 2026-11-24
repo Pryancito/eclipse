@@ -1230,6 +1230,8 @@ strings! {
     panel_open_caps => { es: "ABRIR", en: "OPEN" },
     panel_on => { es: "sí", en: "on" },
     /// After applying a setting that is read at boot.
+    /// While a thread mounts the volume the boot settings live on.
+    panel_mounting => { es: "montando {}…", en: "mounting {}…" },
     panel_on_reboot => { es: "se verá al reiniciar", en: "takes effect after a restart" },
     /// `sin aplicar · antes: tecno`: what a held change replaces.
     panel_was => { es: "antes:", en: "was:" },

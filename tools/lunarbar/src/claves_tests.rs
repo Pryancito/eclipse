@@ -421,3 +421,21 @@ fn the_advanced_boot_blocks_edit_rboot_conf_on_the_esp() {
     let r = c.claves.iter().find(|k| k.id == "arranque.renderer").unwrap();
     assert_eq!(r.origen(), "rboot.conf · cmdline · renderer");
 }
+
+#[test]
+fn a_volume_fstab_cannot_mount_is_waited_for_once_not_once_per_setting() {
+    let at = Path::new("/no/hay/tal/volumen");
+    assert!(asegura_montaje(at).is_err());
+    let t = std::time::Instant::now();
+    for _ in 0..10 {
+        assert!(asegura_montaje(at).is_err());
+    }
+    assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
+    // What the panel reads first does not wait at all.
+    let c = Catalogo::de_serie();
+    let t = std::time::Instant::now();
+    for k in &c.claves {
+        let _ = valor_leido(k);
+    }
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+}
