@@ -2839,3 +2839,25 @@ fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
          (lunarbar, lunarbg, silversurfer)"
     );
 }
+
+#[test]
+fn a_zone_in_the_timezone_file_beats_its_country_at_boot() {
+    // `eclipse-tz Europe/Paris` (the control panel's "Zona horaria") keeps
+    // `country=ES` and writes `tz=Europe/Paris`. With the file's country read
+    // first, every boot put the machine back on Madrid. eclipse-init reads
+    // `tz=` first; the script must agree.
+    let dir = std::env::temp_dir().join(format!("eclipse-tz-order-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_eclipse_tz(&dir);
+    let text = fs::read_to_string(dir.join("usr/local/bin/eclipse-tz")).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    let start = text.find("resolve_boot() {").expect("resolve_boot");
+    let body = &text[start..start + text[start..].find("\n}\n").unwrap()];
+    let file_tz = body.find("file_val tz").expect("resolve_boot reads the file's tz");
+    let file_country = body.find("file_val country").unwrap();
+    let cmd_country = body.find("cmdline_val country").unwrap();
+    assert!(
+        cmd_country < file_tz && file_tz < file_country,
+        "order must be cmdline tz, cmdline country, file tz, file country:\n{body}"
+    );
+}

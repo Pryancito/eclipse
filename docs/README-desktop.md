@@ -456,7 +456,10 @@ la página). Un ajuste nuevo es un bloque nuevo; el panel no se recompila.
 Cada fila dice qué fichero y qué clave escribe. Un bloque que no se puede
 usar se deja fuera y se cuenta en el pie como aviso; un valor que no está en
 `valores` no se escribe nunca. El formato completo está en
-`tools/lunarbar/src/claves.rs`.
+`tools/lunarbar/src/claves.rs`. `formato = palabra` sirve para un fichero que
+lleva el valor solo (`/etc/eclipse/desktop`); `montar = /boot/efi` monta la
+ESP como dice `/etc/fstab` (`eclipse-fs-mounts`) antes de tocar
+`rboot.conf`; `reinicio = si` marca lo que se lee al arrancar.
 
 Un cambio queda en dorado hasta `Intro` o APLICAR; `Esc` o DESHACER lo
 quita. Escribir busca entre todas las claves, en los dos idiomas.

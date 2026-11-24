@@ -183,7 +183,10 @@ fn control(c: &Clave, x: i32, y: i32, room: i32, lang: Lang) -> Control {
                     .collect();
                 Control::Fichas(rects)
             } else {
-                let widest = ws.iter().copied().max().unwrap_or(0);
+                // The box holds the widest label AND its `n/m` count.
+                let n = ws.len();
+                let count = Canvas::text_width(&format!("{n}/{n}"));
+                let widest = up4(ws.iter().copied().max().unwrap_or(0) + count + 8);
                 // Down to the grid, so the box never pokes past the room.
                 let hi = ((room - 2 * (STEP_W + CHIP_GAP)) / 4 * 4).max(VAL_W);
                 let caja_w = widest.max(VAL_W * 2).min(hi);
@@ -260,7 +263,10 @@ fn layout(w: i32, h: i32, cat: &Catalogo, shown: &[usize], top: usize, lang: Lan
         })
         .max()
         .unwrap_or(0);
-    let label_w = up4(widest + 2 * PAD).clamp(LABEL_MIN_W, (rw / 2).max(LABEL_MIN_W));
+    // Capped at half the room, down to the grid: a long origin (rboot.conf
+    // on the ESP) must not push the controls off the panel.
+    let half = (rw / 2) / 4 * 4;
+    let label_w = up4(widest + 2 * PAD).clamp(LABEL_MIN_W, half.max(LABEL_MIN_W));
 
     let caben = (((body.3 - PAD) / ROW_H).max(1)) as usize;
     let first_y = body.1 + PAD / 2 + NAV_ROW_H;
@@ -401,6 +407,7 @@ impl Panel {
         let mut hechos = 0;
         let mut fallo = None;
         let mut reabrir = false;
+        let mut al_reiniciar = false;
         for i in 0..self.cat.claves.len() {
             let Some(v) = self.pendiente[i].take() else {
                 continue;
@@ -409,6 +416,7 @@ impl Panel {
                 Ok(()) => {
                     hechos += 1;
                     reabrir |= self.cat.claves[i].reabrir;
+                    al_reiniciar |= self.cat.claves[i].reinicio;
                 }
                 Err(e) => {
                     eprintln!("lunarpanel: {e}");
@@ -425,6 +433,9 @@ impl Panel {
             }
             None => {
                 self.status = format!("{} · {hechos}", self.lang.s(Key::hunt_applied));
+                if al_reiniciar {
+                    self.status += &format!(" · {}", self.lang.s(Key::panel_on_reboot));
+                }
                 self.tono = Tono::Bien;
                 reabrir
             }
