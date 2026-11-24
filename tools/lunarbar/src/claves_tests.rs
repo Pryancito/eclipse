@@ -28,11 +28,18 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "barra.alto",
             "efectos",
             "texto",
-            "navegador.anuncios"
+            "navegador.anuncios",
+            "arranque.log",
+            "arranque.smp",
+            "arranque.renderer",
+            "arranque.nvidia",
+            "arranque.nvidia.render",
+            "arranque.nvkms",
+            "arranque.medida"
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));
@@ -257,4 +264,138 @@ fn the_desktop_blocks_go_through_eclipse_entorno_and_read_its_file() {
     }
     let alto = c.claves.iter().find(|k| k.id == "barra.alto").unwrap();
     assert!(alto.admite("auto") && alto.admite("44") && !alto.admite("100"));
+}
+
+fn vals(s: &str) -> Vec<Valor> {
+    s.split_whitespace()
+        .map(|v| Valor {
+            v: v.into(),
+            es: v.into(),
+            en: v.into(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_boot_key_is_read_first_spelling_first_and_written_in_its_place() {
+    let line = "LOG=error:TERM=xterm-256color:nvidia.cuda:log=info:ROOT=/dev/sda2";
+    let log = Arranque::Clave("LOG".into());
+    let v = vals("error warn info");
+    assert_eq!(lee_arranque(line, &log, &v).as_deref(), Some("error"));
+    assert_eq!(
+        pon_arranque(line, &log, &v, "debug"),
+        "LOG=debug:TERM=xterm-256color:nvidia.cuda:ROOT=/dev/sda2"
+    );
+    assert_eq!(
+        pon_arranque(line, &log, &v, "auto"),
+        "TERM=xterm-256color:nvidia.cuda:ROOT=/dev/sda2"
+    );
+    let smp = Arranque::Clave("smp".into());
+    assert_eq!(lee_arranque(line, &smp, &v), None);
+    assert_eq!(pon_arranque(line, &smp, &v, "off"), format!("{line}:smp=off"));
+    assert_eq!(pon_arranque("", &smp, &v, "4"), "smp=4");
+    // `ROOTPROC=/bin/busybox?sh` and the like go through untouched.
+    let odd = "ROOTPROC=/bin/busybox?sh:LOG=warn";
+    assert_eq!(pon_arranque(odd, &log, &v, "info"), "ROOTPROC=/bin/busybox?sh:LOG=info");
+}
+
+#[test]
+fn a_boot_flag_is_one_of_its_values_or_none() {
+    let f = Arranque::Bandera;
+    let v = vals("auto nvidia.wlr_vulkan nvidia.wlr_pixman");
+    let line = "LOG=error:nvidia.wlr_pixman:nvidia.cuda:nvidia.wlr_vulkan";
+    assert_eq!(lee_arranque(line, &f, &v).as_deref(), Some("nvidia.wlr_pixman"));
+    assert_eq!(
+        pon_arranque(line, &f, &v, "nvidia.wlr_vulkan"),
+        "LOG=error:nvidia.wlr_vulkan:nvidia.cuda"
+    );
+    assert_eq!(pon_arranque(line, &f, &v, "auto"), "LOG=error:nvidia.cuda");
+    // `nvidia.cuda` is not one of them, and neither is a longer token.
+    assert_eq!(lee_arranque("nvidia.cuda:nvidia.wlr_vulkanx", &f, &v), None);
+}
+
+#[test]
+fn rboot_conf_is_read_and_written_on_its_last_line() {
+    let t = "# cmdline=x\ncmdline=LOG=info\nresolution=auto\ncmdline=LOG=warn:smp=2\n";
+    assert_eq!(lee_ultima(t, "cmdline").as_deref(), Some("LOG=warn:smp=2"));
+    assert_eq!(
+        pon_ultima(t, "cmdline", "LOG=error"),
+        "# cmdline=x\ncmdline=LOG=info\nresolution=auto\ncmdline=LOG=error\n"
+    );
+    assert_eq!(pon_ultima("a=1\n", "cmdline", "LOG=error"), "a=1\ncmdline=LOG=error\n");
+}
+
+#[test]
+fn applying_a_boot_option_edits_the_command_line_and_nothing_else() {
+    let dir = std::env::temp_dir().join(format!("claves-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("rboot.conf");
+    let conf = "# rboot\nkernel_path=\\EFI\\zCore\\zcore.elf\nresolution=auto\n\
+                cmdline=LOG=error:TERM=xterm-256color:nvidia.cuda:ROOT=__ECLIPSE_CMDROOTDEV\n";
+    let mut c = Catalogo::default();
+    c.lee_texto(
+        &format!(
+            "[smp]\ngrupo = g\ntipo = elegir\nfichero = {f}\nclave = cmdline\narranque = smp\n\
+             valores = auto off 2\ndefecto = auto\n\
+             [gpu]\ngrupo = g\ntipo = si-no\nfichero = {f}\nclave = cmdline\narranque = bandera\n\
+             valores = nvidia.nvkms auto\ndefecto = auto\n",
+            f = f.display()
+        ),
+        "t",
+    );
+    assert!(c.avisos.is_empty(), "{:?}", c.avisos);
+    let (smp, gpu) = (&c.claves[0], &c.claves[1]);
+    // No file: nothing is made in its place.
+    assert!(aplica(smp, "off").is_err());
+    assert!(!f.exists());
+    std::fs::write(&f, conf).unwrap();
+    assert_eq!(valor_actual(smp), "auto");
+    aplica(smp, "off").unwrap();
+    aplica(gpu, "nvidia.nvkms").unwrap();
+    assert_eq!(valor_actual(smp), "off");
+    assert_eq!(valor_actual(gpu), "nvidia.nvkms");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        conf.replace(
+            "ROOT=__ECLIPSE_CMDROOTDEV",
+            "ROOT=__ECLIPSE_CMDROOTDEV:smp=off:nvidia.nvkms"
+        )
+    );
+    aplica(smp, "auto").unwrap();
+    aplica(gpu, "auto").unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), conf);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_boot_block_must_say_where_its_command_line_is() {
+    let mut c = Catalogo::default();
+    c.lee_texto(
+        "[a]\ngrupo = g\ntipo = elegir\nfichero = /x\narranque = LOG\nvalores = info\n\
+         [b]\ngrupo = g\ntipo = elegir\nfichero = /x\nclave = cmdline\narranque = LOG\nvalores = info\naplicar = echo {}\n\
+         [c]\ngrupo = g\ntipo = elegir\nfichero = /x\nclave = cmdline\narranque = LOG:smp\nvalores = info\n\
+         [d]\ngrupo = g\ntipo = numero\nrango = 1..4\nfichero = /x\nclave = cmdline\narranque = smp\n",
+        "t",
+    );
+    assert!(c.claves.is_empty());
+    assert_eq!(c.avisos.len(), 4, "{:?}", c.avisos);
+}
+
+#[test]
+fn the_advanced_boot_blocks_edit_rboot_conf_on_the_esp() {
+    let c = shipped();
+    let g = c.grupos.iter().position(|g| g.id == "avanzado").unwrap();
+    for i in c.del_grupo(g) {
+        let k = &c.claves[i];
+        assert!(k.reinicio, "{}", k.id);
+        assert_eq!(k.montar.as_deref(), Some(Path::new("/boot/efi")), "{}", k.id);
+        assert_eq!(
+            k.fichero.as_deref(),
+            Some(Path::new("/boot/efi/EFI/Boot/rboot.conf")),
+            "{}",
+            k.id
+        );
+    }
+    let r = c.claves.iter().find(|k| k.id == "arranque.renderer").unwrap();
+    assert_eq!(r.origen(), "rboot.conf · cmdline · renderer");
 }

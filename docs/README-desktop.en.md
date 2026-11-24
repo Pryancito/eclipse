@@ -453,6 +453,14 @@ words only, removes the line for `auto`, and asks eclipse-init to restart
 the wallpaper or the bar. Programs read the file when they start
 (`lunartext::entorno`); a variable set in the environment still wins.
 
+`arranque = KEY` edits one option inside the kernel command line that `clave`
+holds (`rboot.conf`'s `cmdline=`, whose last line is the one rboot reads): it
+writes `KEY=value` where the key first appears and drops later spellings,
+since the kernel reads the first. `arranque = bandera` makes one of `valores`
+the bare token present (`nvidia.wlr_vulkan`). `auto` removes the option. The
+"Advanced boot" group uses this for `LOG`, `smp`, `renderer`, the NVIDIA flags
+and `measure`.
+
 A change stays gold until `Enter` or APPLY; `Esc` or UNDO drops it. Typing
 searches every setting, in both languages. `lunarpanel --dump PATH:WxH
 [group]` draws it without a compositor.
