@@ -533,7 +533,9 @@ pub const ECLIPSE_CHANNEL_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 4;
 ///   quiets the device in between; an MSI (virtio-pci) is not masked.
 ///
 /// `kind` 1 is a virtio block device, 2 a virtio network card, 3 an Intel
-/// 82574 network card (`e1000e`). `NOT_FOUND` when no such device was
+/// 82574 network card (`e1000e`); 11 a PCI function named by its identity
+/// (`udriver=pci-VVVV-DDDD@N`), whose `vendor << 16 | device` is argument 3
+/// (`device_claim::ECLIPSE_DEVICE_PCI`). `NOT_FOUND` when no such device was
 /// reserved, `ALREADY_BOUND` while a process has it: one driver per device
 /// at a time. When that process terminates the kernel resets the device,
 /// lets go of what was pinned for it and of its interrupt, and the device

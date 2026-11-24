@@ -495,12 +495,41 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
     // And, if the hatch is open, MSI-X instead of the MSI that just got armed.
     let irq = arm_msix(dev.loc, mapper, irq).or(irq);
 
+    // A function the boot leaves to userspace by its identity
+    // (`udriver=pci-VVVV-DDDD@N`): no kernel driver looks at it.
+    if reserve_by_id(dev, mapper, irq) {
+        return Err(DeviceError::NotSupported);
+    }
+
     // Try modular PCI drivers (ArceOS style)
     if let Ok(device) = super::pci_drivers::probe_pci_device(dev, mapper, irq) {
         return Ok(device);
     }
 
     Err(DeviceError::NotSupported)
+}
+
+/// [`crate::user::reserve_pci_by_id`] for `dev`: its window is its first
+/// memory BAR, its interrupt the MSI [`enable`] armed.
+fn reserve_by_id(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> bool {
+    let pci_id = (dev.id.vendor_id as u32) << 16 | dev.id.device_id as u32;
+    if !crate::user::pci_id_wanted(pci_id) {
+        return false;
+    }
+    let (addr, len) = dev
+        .bars
+        .iter()
+        .find_map(|bar| match bar {
+            Some(BAR::Memory(addr, len, _, _)) if *addr != 0 => {
+                Some((*addr as usize, *len as usize))
+            }
+            _ => None,
+        })
+        .unwrap_or((0, 0));
+    crate::user::reserve_pci_by_id(pci_id, addr != 0, addr, len, || crate::user::Wiring {
+        irq: crate::pci_disks::vector(irq),
+        vaddr: mapper.as_ref().and_then(|m| m.query_or_map(addr, len)),
+    })
 }
 
 pub fn detach_driver(_loc: &Location) -> bool {

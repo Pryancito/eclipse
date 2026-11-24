@@ -35,6 +35,10 @@ pub const KIND_I8042_AUX: usize = 8;
 pub const KIND_HDA: usize = 9;
 /// An xHCI USB controller (`udriver=xhci@N`): see [`crate::xhci`].
 pub const KIND_XHCI: usize = 10;
+/// Any PCI function, named by its identity (`udriver=pci-VVVV-DDDD@N`):
+/// see [`claim_pci`]. Its transport is a plain PCI function and the window
+/// its first memory BAR.
+pub const KIND_PCI: usize = 11;
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;
@@ -132,6 +136,24 @@ impl Claim {
 /// before this one may have died a moment ago, and the kernel resets the
 /// device before it gives it out.
 pub fn claim(kind: usize, index: usize, patience: u32) -> Result<Claim, Status> {
+    claim_with(kind, index, 0, patience)
+}
+
+/// Claim the `index`th PCI function whose vendor is `vendor` and device
+/// `device` (`udriver=pci-VVVV-DDDD@N`), as [`claim`] does. Such a device
+/// is not reset by the kernel when its driver dies: it stays out of use
+/// until the next boot.
+pub fn claim_pci(vendor: u16, device: u16, index: usize, patience: u32) -> Result<Claim, Status> {
+    claim_with(
+        KIND_PCI,
+        index,
+        (vendor as usize) << 16 | device as usize,
+        patience,
+    )
+}
+
+/// [`claim`] with argument 3 of the call, the identity for [`KIND_PCI`].
+fn claim_with(kind: usize, index: usize, id: usize, patience: u32) -> Result<Claim, Status> {
     let mut words = [0u64; 8];
     let mut tries = patience.max(1);
     loop {
@@ -139,7 +161,7 @@ pub fn claim(kind: usize, index: usize, patience: u32) -> Result<Claim, Status> 
         let r = unsafe {
             zx::call(
                 nr::ECLIPSE_DEVICE_CLAIM,
-                [kind, index, words.as_mut_ptr() as usize, 0, 0, 0],
+                [kind, index, words.as_mut_ptr() as usize, id, 0, 0],
             )
         };
         tries -= 1;
