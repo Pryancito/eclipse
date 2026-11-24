@@ -977,7 +977,112 @@ pub(crate) static NET_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
 
 // ============= IOCTL =============
 
+/// How many bytes of the caller's a request's argument is, and whether the
+/// answer is written into them; `None` for a request this family has not.
+fn net_ioctl_arg(request: usize, ipv6: bool) -> Option<(usize, bool)> {
+    Some(match request {
+        SIOCGIFCONF => (size_of::<IfConf>(), true),
+        SIOCGIFINDEX | SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFDSTADDR
+        | SIOCGIFNETMASK | SIOCGIFHWADDR | SIOCGIFTXQLEN | SIOCGIFMAP | SIOCGIFMTU
+        | SIOCGIFMETRIC => (size_of::<IfReq>(), true),
+        SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFBRDADDR | SIOCSIFNETMASK => (size_of::<IfReq>(), false),
+        SIOCADDRT | SIOCDELRT if ipv6 => (size_of::<In6RtMsg>(), false),
+        SIOCADDRT | SIOCDELRT => (size_of::<RtEntry>(), false),
+        SIOCGARP => (ARPREQ_LEN, true),
+        SIOCSARP | SIOCDARP => (ARPREQ_LEN, false),
+        _ => return None,
+    })
+}
+
+/// The kernel's copy of a request's argument, in words so that every
+/// structure of [`net_ioctl_arg`] is aligned in it.
+const NET_IOCTL_WORDS: usize = 16;
+const _: () = assert!(size_of::<RtEntry>() <= NET_IOCTL_WORDS * 8);
+const _: () = assert!(size_of::<In6RtMsg>() <= NET_IOCTL_WORDS * 8);
+const _: () = assert!(size_of::<IfReq>() <= NET_IOCTL_WORDS * 8);
+const _: () = assert!(ARPREQ_LEN <= NET_IOCTL_WORDS * 8);
+
+/// The interface requests (`SIOC*`) of any socket.
+///
+/// `arg1` is the caller's pointer, and what it points at is read and
+/// written here as user memory is: checked, and an address that is not the
+/// caller's to read or write is `EFAULT`. The requests themselves
+/// ([`net_ioctl_held`]) work on the kernel's copy and never see it. So do
+/// the two pointers a structure carries inside: the list `SIOCGIFCONF`
+/// fills and the interface name of a route.
 pub fn handle_net_ioctl(
+    request: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    ipv6: bool,
+) -> LxResult<usize> {
+    let (len, answers) = net_ioctl_arg(request, ipv6).ok_or(LxError::ENOSYS)?;
+    let said = UserInPtr::<u8>::from(arg1).read_array(len)?;
+    let mut held = [0u64; NET_IOCTL_WORDS];
+    #[allow(unsafe_code)]
+    // SAFETY: `held` is the kernel's, `len` fits it (asserted above), and
+    // any bytes are a `u64`.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(held.as_mut_ptr() as *mut u8, len) };
+    bytes.copy_from_slice(&said);
+    let at = held.as_mut_ptr() as usize;
+
+    if request == SIOCGIFCONF {
+        #[allow(unsafe_code)]
+        // SAFETY: an `IfConf` of the kernel's, aligned, filled above.
+        let ifc = unsafe { &mut *(at as *mut IfConf) };
+        if ifc.ifc_len < 0 {
+            return Err(LxError::EINVAL);
+        }
+        let theirs = ifc.ifc_buf;
+        let all = get_net_device().len() * size_of::<IfReq>();
+        if theirs == 0 {
+            // No list to fill: how long one would be, as Linux answers.
+            ifc.ifc_len = all.min(i32::MAX as usize) as i32;
+        } else {
+            let room = (ifc.ifc_len as usize).min(all);
+            let mut list = alloc::vec![0u8; room];
+            ifc.ifc_buf = list.as_mut_ptr() as usize;
+            ifc.ifc_len = room as i32;
+            net_ioctl_held(request, at, arg2, arg3, ipv6)?;
+            let filled = (ifc.ifc_len.max(0) as usize).min(room);
+            UserInOutPtr::<u8>::from(theirs).write_array(&list[..filled])?;
+            ifc.ifc_buf = theirs;
+            ifc.ifc_len = filled as i32;
+        }
+        UserInOutPtr::<u8>::from(arg1).write_array(bytes)?;
+        return Ok(0);
+    }
+
+    // A route names its interface through a pointer: the name comes into
+    // the kernel too, and the route points at that.
+    let mut name = [0u8; 17];
+    if matches!(request, SIOCADDRT | SIOCDELRT) && !ipv6 {
+        #[allow(unsafe_code)]
+        // SAFETY: an `RtEntry` of the kernel's, aligned, filled above.
+        let rt = unsafe { &mut *(at as *mut RtEntry) };
+        if !rt.rt_dev.is_null() {
+            let theirs = UserInPtr::<u8>::from(rt.rt_dev as usize);
+            for (i, byte) in name.iter_mut().take(16).enumerate() {
+                *byte = theirs.add(i).read()?;
+                if *byte == 0 {
+                    break;
+                }
+            }
+            rt.rt_dev = name.as_mut_ptr();
+        }
+    }
+
+    let ret = net_ioctl_held(request, at, arg2, arg3, ipv6)?;
+    if answers {
+        UserInOutPtr::<u8>::from(arg1).write_array(bytes)?;
+    }
+    Ok(ret)
+}
+
+/// [`handle_net_ioctl`] once the argument is the kernel's: `arg1` is the
+/// address of the kernel's copy, and so is every pointer inside it.
+fn net_ioctl_held(
     request: usize,
     arg1: usize,
     _arg2: usize,
@@ -1014,10 +1119,12 @@ pub fn handle_net_ioctl(
                 let addr = iface_ipv4_cidr(&**iface)
                     .map(|cidr| ipv4_sockaddr(cidr.address()))
                     .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
-                let ifr = IfReq {
-                    ifr_name,
-                    ifr_ifru: IfReqUnion { addr },
-                };
+                // Zeroed first: the address is not all of the union, and
+                // the rest of it goes to the caller as well.
+                #[allow(unsafe_code)]
+                let mut ifr: IfReq = unsafe { core::mem::zeroed() };
+                ifr.ifr_name = ifr_name;
+                ifr.ifr_ifru.addr = addr;
 
                 let start = i * req_size;
                 let end = start + req_size;
@@ -2556,5 +2663,59 @@ mod tests {
         assert!(is_ipv4_placeholder(Ipv4Address::new(240, 0, 0, 0)));
         assert!(!is_ipv4_placeholder(Ipv4Address::new(192, 168, 1, 1)));
         assert!(!is_ipv4_placeholder(Ipv4Address::new(0, 0, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod ioctl_arg_tests {
+    use super::*;
+
+    #[test]
+    fn every_request_with_an_arm_has_a_length_that_fits_the_copy() {
+        for request in 0x8900..0x8a00 {
+            for ipv6 in [false, true] {
+                if let Some((len, _)) = net_ioctl_arg(request, ipv6) {
+                    assert!(len != 0 && len <= NET_IOCTL_WORDS * 8, "{:#x}", request);
+                }
+            }
+        }
+        // Only the ones that ask are written back to.
+        assert_eq!(
+            net_ioctl_arg(SIOCGIFADDR, false),
+            Some((size_of::<IfReq>(), true))
+        );
+        assert_eq!(
+            net_ioctl_arg(SIOCSIFADDR, false),
+            Some((size_of::<IfReq>(), false))
+        );
+        assert_eq!(net_ioctl_arg(0x89ff, false), None);
+    }
+
+    #[test]
+    fn a_null_argument_is_efault_and_an_unknown_request_enosys() {
+        assert_eq!(
+            handle_net_ioctl(SIOCGIFMETRIC, 0, 0, 0, false),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(
+            handle_net_ioctl(SIOCGIFCONF, 0, 0, 0, false),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(
+            handle_net_ioctl(0x89ff, 0, 0, 0, false),
+            Err(LxError::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn the_answer_goes_into_the_callers_structure() {
+        #[allow(unsafe_code)]
+        let mut ifr: IfReq = unsafe { core::mem::zeroed() };
+        ifr.ifr_ifru.ifmetric = 7;
+        let at = &mut ifr as *mut IfReq as usize;
+        assert_eq!(handle_net_ioctl(SIOCGIFMETRIC, at, 0, 0, false), Ok(0));
+        #[allow(unsafe_code)]
+        let metric = unsafe { ifr.ifr_ifru.ifmetric };
+        assert_eq!(metric, 0);
     }
 }
