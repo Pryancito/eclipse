@@ -855,6 +855,38 @@ struct State {
 }
 
 impl State {
+    /// The volume thread's answer: the settings on it read again, the
+    /// devices page too, and a hold that is now the value dropped.
+    fn montado(&mut self, r: Result<(), String>) {
+        let p = &mut self.panel;
+        if p.status.starts_with(p.lang.s(Key::panel_mounting).split("{}").next().unwrap_or("")) {
+            p.status.clear();
+        }
+        match r {
+            Ok(()) => {
+                for i in 0..p.cat.claves.len() {
+                    if p.cat.claves[i].montar.is_none() {
+                        continue;
+                    }
+                    p.actual[i] = claves::valor_leido(&p.cat.claves[i]);
+                    if p.pendiente[i].as_deref() == Some(p.actual[i].as_str()) {
+                        p.pendiente[i] = None;
+                    }
+                }
+                if p.disp.leido {
+                    p.disp.leido = false;
+                    p.carga_disp();
+                }
+            }
+            Err(e) => {
+                eprintln!("lunarpanel: {e}");
+                p.status = e;
+                p.tono = Tono::Mal;
+            }
+        }
+        self.render();
+    }
+
     fn new(panel: Panel) -> Self {
         State {
             compositor: None,
@@ -1374,6 +1406,41 @@ fn toggle_or_lock(takeover: bool) -> Option<std::fs::File> {
     Some(f)
 }
 
+/// Mounts `paths` on a thread of its own. Returns what wakes the event loop
+/// when it is done (the read end of a pipe, which then reads end of file)
+/// and the answer.
+fn monta_aparte(
+    paths: Vec<std::path::PathBuf>,
+) -> Option<(std::fs::File, std::sync::mpsc::Receiver<Result<(), String>>)> {
+    use std::os::fd::FromRawFd;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is the two ints pipe2 fills.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        // No pipe: mount here, as before.
+        for p in &paths {
+            let _ = claves::asegura_montaje(p);
+        }
+        return None;
+    }
+    // SAFETY: both fds were just made by pipe2 and nothing else owns them.
+    let (rd, wr) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = paths.iter().try_for_each(|p| claves::asegura_montaje(p));
+        let _ = tx.send(r);
+        drop(wr); // the loop wakes on end of file
+    });
+    Some((rd, rx))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |name: &str| {
@@ -1405,8 +1472,24 @@ fn main() {
     for a in &cat.avisos {
         eprintln!("lunarpanel: {a}");
     }
-    let actual = cat.claves.iter().map(claves::valor_actual).collect();
+    // Read without waiting for a volume: one fstab has not mounted yet
+    // (`/boot/efi`) is mounted by a thread while the panel is already up,
+    // and its settings are read again when it answers.
+    let actual = cat.claves.iter().map(claves::valor_leido).collect();
+    let mut montar: Vec<std::path::PathBuf> = cat
+        .claves
+        .iter()
+        .filter_map(|c| claves::sin_montar(c).map(Into::into))
+        .collect();
+    montar.dedup();
     let mut panel = Panel::new(cat, actual, Lang::current());
+    if let Some(m) = montar.first() {
+        panel.status = panel
+            .lang
+            .s(Key::panel_mounting)
+            .replace("{}", &m.display().to_string());
+    }
+    let mut montaje = monta_aparte(montar);
     panel.grupo = group_index(&panel.cat, arg("--grupo").as_deref());
     panel.carga_disp();
     panel.carga_tablas();
@@ -1450,7 +1533,37 @@ fn main() {
     st.surface = Some(surface);
     st.layer = Some(layer);
     while !st.done {
-        if queue.blocking_dispatch(&mut st).is_err() {
+        let _ = conn.flush();
+        if let Some(guard) = queue.prepare_read() {
+            let mut fds = [
+                libc::pollfd {
+                    fd: guard.connection_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: montaje.as_ref().map_or(-1, |(fd, _)| fd.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: two pollfds that live through the call; a negative fd
+            // is ignored by poll.
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if n > 0 && fds[0].revents & libc::POLLIN != 0 {
+                if guard.read().is_err() {
+                    break;
+                }
+            } else {
+                drop(guard);
+            }
+            if fds[1].revents != 0 {
+                if let Some((_, rx)) = montaje.take() {
+                    st.montado(rx.try_recv().unwrap_or(Ok(())));
+                }
+            }
+        }
+        if queue.dispatch_pending(&mut st).is_err() {
             break;
         }
     }
