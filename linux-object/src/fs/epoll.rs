@@ -707,7 +707,7 @@ impl Epoll {
     /// a subscription taken for one, and whether it was ready. Only for an
     /// entry that still watches the file the look polled, with a mask that
     /// is still level-triggered.
-    fn store_armed(&self, scanned: Vec<(FileDesc, Arc<dyn FileLike>, Option<fast::Armed>, bool)>) {
+    fn store_armed(&self, scanned: Vec<Scanned>) {
         if scanned.is_empty() {
             return;
         }
@@ -996,6 +996,10 @@ impl FileLike for Epoll {
 /// One interest-list entry as a scan sees it: the fd, its mask, its file,
 /// and what the quick look keeps for it (see [`Kept`]).
 type Watched = (FileDesc, EpollEvent, Arc<dyn FileLike>, Kept);
+
+/// A level entry whose quick-look state a scan changed: the fd, the file it
+/// polled, the subscription it took (if any), and whether it was ready.
+type Scanned = (FileDesc, Arc<dyn FileLike>, Option<fast::Armed>, bool);
 
 /// What a scan knows of an entry's [`fast::Armed`] before it polls it.
 #[derive(Clone, Copy)]
