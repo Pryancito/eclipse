@@ -1070,6 +1070,10 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Ok(()) => 0,
             Err(e) => status(e),
         },
+        dev_serve::ECLIPSE_DRM_SERVE => match dev_serve::drm_serve(proc, args) {
+            Ok(()) => 0,
+            Err(e) => status(e),
+        },
         device_port::ECLIPSE_DEVICE_PORT => device_port::device_port(proc, args),
         device_pci::ECLIPSE_DEVICE_PCI_FN => device_pci::device_pci_fn(proc, args),
         dev_serve::ECLIPSE_DEV_MEMORY => {

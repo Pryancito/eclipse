@@ -4,7 +4,7 @@
 
 use alloc::sync::Arc;
 use linux_object::error::LxError;
-use linux_object::fs::devfs::served::{self, SERVER_LEFT};
+use linux_object::fs::devfs::served::{self, card, SERVER_LEFT};
 use linux_object::process::ProcessExt;
 use zircon_object::ipc::Fifo;
 use zircon_object::object::{KernelObject, Rights, Signal};
@@ -57,6 +57,72 @@ pub const ECLIPSE_DEV_SERVE: u32 = super::ECLIPSE_GATEWAY_EXT + 16;
 /// not of a node served on `fifo`; `INVALID_ARGS` for other `flags` or a
 /// `buf` of this process's that cannot be read or written.
 pub const ECLIPSE_DEV_MEMORY: u32 = super::ECLIPSE_GATEWAY_EXT + 20;
+
+/// `eclipse_drm_serve(fifo, window, hello, hello_len)`: a DRM card this
+/// process drives. The DRM core counts it with the others and gives it a
+/// node in `/dev/dri`, and every call it makes of the card is a message on
+/// `fifo`, through `window`, as with [`ECLIPSE_DEV_SERVE`] (the messages
+/// and what they carry are `zcore_drivers::scheme::drm_remote`'s).
+/// `hello` is `hello_len` bytes, what the driver says of the card: its
+/// answer to `drm_remote::op::HELLO`. Both handles go to the kernel,
+/// whatever the answer.
+///
+/// When the process is gone so is the card; one that answers nothing for
+/// ten seconds while a call waits is killed.
+///
+/// `ACCESS_DENIED` to a process that may not `mount(2)`, `INVALID_ARGS`
+/// for a `hello` that does not parse, a window that does not hold a slot
+/// or a FIFO of another message size.
+pub const ECLIPSE_DRM_SERVE: u32 = super::ECLIPSE_GATEWAY_EXT + 22;
+
+/// The longest `hello`: a name and a few numbers.
+const HELLO_MAX: usize = 4096;
+
+pub(super) fn drm_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    let fifo = proc.get_object_with_rights::<Fifo>(args[0] as u32, Rights::READ | Rights::WRITE);
+    let window =
+        proc.get_object_with_rights::<VmObject>(args[1] as u32, Rights::READ | Rights::WRITE);
+    for handle in [args[0], args[1]] {
+        if handle != 0 {
+            let _ = proc.remove_handle(handle as u32);
+        }
+    }
+    let (fifo, window) = (fifo?, window?);
+    if args[3] == 0 || args[3] > HELLO_MAX {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let hello = kernel_hal::user::UserInPtr::<u8>::from(args[2])
+        .read_array(args[3])
+        .map_err(|_| ZxError::INVALID_ARGS)?;
+    let card =
+        card::serve_card(proc.linux(), fifo.clone(), window, &hello).map_err(|e| match e {
+            LxError::EPERM => ZxError::ACCESS_DENIED,
+            _ => ZxError::INVALID_ARGS,
+        })?;
+    let pid = proc.id() as usize;
+    card.killed_with(alloc::boxed::Box::new(move || {
+        let kill = linux_object::signal::Signal::SIGKILL;
+        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            warn!("served drm: the hung server {pid} was not killed: {e:?}");
+        }
+    }));
+    // Its going is read here, as a served node's is.
+    kernel_hal::thread::spawn(async move {
+        let wire: Arc<dyn KernelObject> = fifo;
+        loop {
+            let seen = wire
+                .wait_signal(Signal::READABLE | Signal::PEER_CLOSED | SERVER_LEFT)
+                .await;
+            if seen.contains(Signal::READABLE) && card.look() {
+                continue;
+            }
+            break;
+        }
+        drop(wire);
+        card.gone();
+    });
+    Ok(())
+}
 
 /// [`ECLIPSE_DEV_MEMORY`]'s program: the address space of the one that
 /// made request `args[1]` on the server's FIFO `args[0]`.
