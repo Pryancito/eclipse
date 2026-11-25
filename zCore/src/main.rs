@@ -51,6 +51,8 @@ mod reclaimd;
 // `allow(dead_code)` at the top covers that.
 #[cfg(all(feature = "linux", not(feature = "libos")))]
 mod ipc_bench;
+#[cfg(all(feature = "linux", not(feature = "libos")))]
+mod ktest;
 #[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
 mod utils;
@@ -766,6 +768,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // In-kernel memory self-tests on the real MMU, then power off: see ktest.rs.
+    #[cfg(all(feature = "linux", not(feature = "libos")))]
+    if ktest::wanted(&options.cmdline) {
+        ktest::run_and_power_off();
+    }
     // What the buses left to userspace, now that they have been probed
     // (`zcore_drivers::user`). The first virtio network card is left there
     // without a word, since the kernel has no driver for one, and a device
