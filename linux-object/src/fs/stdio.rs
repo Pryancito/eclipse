@@ -3824,3 +3824,6 @@ mod terminal_readiness_tests;
 
 #[cfg(test)]
 mod tty_uapi_tests;
+
+#[cfg(test)]
+mod vt_ioctl_tests;
