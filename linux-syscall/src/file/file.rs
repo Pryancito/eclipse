@@ -1592,10 +1592,16 @@ pub(crate) async fn copy_range(
         Some(off) => off,
         None => in_file.seek(SeekFrom::Current(0))?,
     };
+    // `MAX_RW_COUNT` (`do_sendfile`); a signal ends the copy between chunks.
+    let count = count.min(0x7fff_f000);
     let mut buffer = crate::try_zeroed_buf(count.min(super::SYSCALL_IO_MAX))?;
     let mut moved = 0usize;
     let mut error = None;
     'copy: while moved < count {
+        if let Err(e) = linux_object::process::check_signals() {
+            error = Some(e);
+            break;
+        }
         let len = buffer.len().min(count - moved);
         // `user_offset_end` bounds the whole window for an explicit offset;
         // `checked_add` keeps the fd's own position honest too.
