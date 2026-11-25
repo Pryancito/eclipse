@@ -619,7 +619,11 @@ impl FileExtent {
                     || c.disk_blocks >= c.ram_blocks
                     || c.ram_blocks > ZCHUNK
                     || c.blocks == 0
-                    || c.offset + c.blocks > c.ram_blocks
+                    // Checked: both are off the disk, and a wrapped sum
+                    // (offset near u64::MAX) passed this test and sent the
+                    // read to a block index far outside the decompressed
+                    // chunk. Found by Kani (`cow_file_extent_never_panics`).
+                    || c.offset.checked_add(c.blocks).is_none_or(|end| end > c.ram_blocks)
                 {
                     return Err(Error::Corrupt("compressed extent item"));
                 }
@@ -1289,6 +1293,12 @@ mod tests {
             Comp {
                 offset: 4,
                 blocks: 5,
+                ..good
+            },
+            // offset + blocks wraps to 1: in range only if the sum is not checked.
+            Comp {
+                offset: u64::MAX,
+                blocks: 2,
                 ..good
             },
         ] {
