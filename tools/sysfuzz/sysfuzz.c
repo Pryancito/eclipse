@@ -36,7 +36,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -307,6 +311,38 @@ static void make_maps(void) {
     mprotect(edge + PAGE, PAGE, PROT_NONE);
 }
 
+/* The SysV objects a program made, for the parent to remove once it is
+ * gone: IPC_PRIVATE objects outlive their creator (on Linux too), and
+ * thousands of programs left them to fill the kernel heap, which tested
+ * the OOM path and not the calls. Shared with the children. */
+#define IPC_LOG_MAX 500
+static struct ipc_log {
+    int n;
+    struct { long nr; int id; } e[IPC_LOG_MAX];
+} *ipc_log;
+
+static void log_ipc(long nr, long id) {
+    if (ipc_log && id >= 0 && ipc_log->n < IPC_LOG_MAX) {
+        ipc_log->e[ipc_log->n].nr = nr;
+        ipc_log->e[ipc_log->n].id = (int)id;
+        ipc_log->n++;
+    }
+}
+
+static void remove_ipc(void) {
+    for (int i = 0; ipc_log && i < ipc_log->n && i < IPC_LOG_MAX; i++) {
+        int id = ipc_log->e[i].id;
+        if (ipc_log->e[i].nr == SYS_shmget)
+            shmctl(id, IPC_RMID, NULL);
+        else if (ipc_log->e[i].nr == SYS_semget)
+            semctl(id, 0, IPC_RMID);
+        else
+            msgctl(id, IPC_RMID, NULL);
+    }
+    if (ipc_log)
+        ipc_log->n = 0;
+}
+
 /* One program: CALLS calls, in the child, from `seed`. */
 static void run_program(uint64_t seed, int ncalls) {
     rng = seed;
@@ -337,7 +373,9 @@ static void run_program(uint64_t seed, int ncalls) {
             c->nr == SYS_madvise || c->nr == SYS_brk) {
             /* Never take away the pages the generator itself lives on. */
             uint64_t lo = a[0], hi = a[0] + a[1];
+            uint64_t log = (uint64_t)ipc_log, log_end = log + sizeof *ipc_log;
             if ((lo < (uint64_t)buf + BUF_PAGES * PAGE && hi > (uint64_t)buf) ||
+                (lo < log_end && hi > log) ||
                 (lo < (uint64_t)ro + PAGE && hi > (uint64_t)ro) ||
                 (lo < (uint64_t)edge + 2 * PAGE && hi > (uint64_t)edge) || hi < lo)
                 continue;
@@ -353,6 +391,8 @@ static void run_program(uint64_t seed, int ncalls) {
         long r = syscall(c->nr, a[0], a[1], a[2], a[3], a[4], a[5]);
         if (verbose)
             dprintf(LOGFD, "FZ-RET %ld errno=%d\n", r, r < 0 ? errno : 0);
+        if (c->nr == SYS_shmget || c->nr == SYS_semget || c->nr == SYS_msgget)
+            log_ipc(c->nr, r);
         if (c->keeps_fd && r >= 0)
             keep_fd(r);
         if (c->nr == SYS_pipe2 && r == 0 && a[0] == (uint64_t)buf) {
@@ -401,6 +441,7 @@ static int one(uint64_t seed, int ncalls) {
             kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             waitpid(pid, &st, 0);
+            remove_ipc();
             return 1;
         }
         struct timespec ts = {0, 5000000};
@@ -410,6 +451,7 @@ static int one(uint64_t seed, int ncalls) {
     kill(-pid, SIGKILL);
     while (waitpid(-1, NULL, WNOHANG) > 0)
         ;
+    remove_ipc();
     return 0;
 }
 
@@ -432,6 +474,9 @@ int main(int argc, char **argv) {
     }
     mkdir("/tmp/fz", 0700);
     setvbuf(stdout, NULL, _IOLBF, 0);
+    ipc_log = mmap(NULL, sizeof *ipc_log, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (ipc_log == MAP_FAILED)
+        ipc_log = NULL;
     if (have_replay) {
         printf("FZ-PROG 0 %#llx\n", (unsigned long long)replay);
         int h = one(replay, (int)ncalls);
