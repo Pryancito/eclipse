@@ -87,6 +87,8 @@ fn a_card_the_machine_has_not_is_enodev() {
         SIOCGIFHWADDR,
         SIOCGIFMAP,
         SIOCGIFMTU,
+        SIOCGIFTXQLEN,
+        SIOCGIFMETRIC,
     ] {
         let mut ifr = ifreq("wlan9");
         assert_eq!(ask(request, &mut ifr), Err(LxError::ENODEV), "{request:#x}");
@@ -166,6 +168,55 @@ fn the_address_broadcast_and_mask_are_the_cards() {
     let mut ifr = ifreq("lo");
     assert_eq!(ask(SIOCGIFNETMASK, &mut ifr), Ok(0));
     assert_eq!(addr_of(&ifr), (AF_INET, [255, 0, 0, 0]));
+}
+
+/// `devinet_ioctl`: a card that is not point-to-point answers its own
+/// address for the peer (`ifa_address == ifa_local`), and a card with no
+/// IPv4 address has none of the four to give: `EADDRNOTAVAIL`, not
+/// 0.0.0.0, and the caller's structure is left as it was.
+#[test]
+fn a_card_with_no_ipv4_address_has_none_to_give() {
+    let _m = plug(vec![
+        Card::ether("eth0", [2, 0, 0, 0, 0, 1])
+            .with_address(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)),
+        Card::ether("eth1", [2, 0, 0, 0, 0, 2]),
+    ]);
+    let mut ifr = ifreq("eth0");
+    assert_eq!(ask(SIOCGIFDSTADDR, &mut ifr), Ok(0));
+    assert_eq!(addr_of(&ifr), (AF_INET, [10, 0, 2, 15]));
+    for request in [SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFNETMASK, SIOCGIFDSTADDR] {
+        let mut ifr = ifreq("eth1");
+        ifr.ifr_ifru.addr = sin([9, 9, 9, 9]);
+        assert_eq!(
+            ask(request, &mut ifr),
+            Err(LxError::EADDRNOTAVAIL),
+            "{request:#x}"
+        );
+        assert_eq!(addr_of(&ifr).1, [9, 9, 9, 9], "{request:#x}");
+    }
+    // The card is there all the same.
+    let mut ifr = ifreq("eth1");
+    assert_eq!(ask(SIOCGIFFLAGS, &mut ifr), Ok(0));
+}
+
+/// `SIOCGIFCONF` lists IPv4 addresses (`inet_gifconf`), so a card with
+/// none is not in it.
+#[test]
+fn the_list_leaves_out_a_card_with_no_ipv4_address() {
+    let _m = plug(vec![
+        Card::loopback(),
+        Card::ether("eth0", [2, 0, 0, 0, 0, 1]),
+        Card::ether("eth1", [2, 0, 0, 0, 0, 2])
+            .with_address(IpCidr::new(IpAddress::v4(192, 168, 1, 5), 24)),
+    ]);
+    let mut list = [ifreq(""), ifreq(""), ifreq("")];
+    let mut ifc = ifconf(core::mem::size_of_val(&list) as i32, &mut list);
+    assert_eq!(ask_conf(&mut ifc), Ok(0));
+    assert_eq!(ifc.ifc_len as usize, 2 * size_of::<IfReq>());
+    assert_eq!(list[0].name(), "eth1");
+    assert_eq!(addr_of(&list[0]), (AF_INET, [192, 168, 1, 5]));
+    assert_eq!(list[1].name(), "lo");
+    assert_eq!(list[2].name(), "");
 }
 
 /// `ifconfig eth0 192.168.7.9 netmask 255.255.0.0`: two requests, the
