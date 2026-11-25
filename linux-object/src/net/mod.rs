@@ -994,6 +994,23 @@ fn net_ioctl_arg(request: usize, ipv6: bool) -> Option<(usize, bool)> {
     })
 }
 
+/// Whether a `SIOC*` request changes the machine's network (an address,
+/// a flag, a route, a neighbour): those are for `CAP_NET_ADMIN`, which the
+/// caller of [`handle_net_ioctl`] asks, since only it knows who calls.
+pub fn net_ioctl_changes(request: usize) -> bool {
+    matches!(
+        request,
+        SIOCSIFFLAGS
+            | SIOCSIFADDR
+            | SIOCSIFBRDADDR
+            | SIOCSIFNETMASK
+            | SIOCADDRT
+            | SIOCDELRT
+            | SIOCSARP
+            | SIOCDARP
+    )
+}
+
 /// The kernel's copy of a request's argument, in words so that every
 /// structure of [`net_ioctl_arg`] is aligned in it.
 const NET_IOCTL_WORDS: usize = 16;

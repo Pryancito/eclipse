@@ -2541,6 +2541,14 @@ impl Syscall<'_> {
         // spinning inside the synchronous `io_control`: see
         // `PcmDev::writei_sleeping`. Its answer goes through the same
         // errno normalisation and logging as every other ioctl below.
+        // The `SIOC*` requests that change the network are the
+        // administrator's (`dev_ioctl`, `ip_rt_ioctl`, `arp_ioctl`).
+        if linux_object::net::net_ioctl_changes(request)
+            && file_like.as_socket().is_ok()
+            && !proc.capable(linux_object::process::CAP_NET_ADMIN)
+        {
+            return Err(LxError::EPERM);
+        }
         let pcm_wait = pcm_sleeping_ioctl(&file_like, request, arg1).await;
         // `TIOCGWINSZ` (get terminal window size).
         let ret = match pcm_wait.unwrap_or_else(|| file_like.ioctl(request, arg1, arg2, arg3)) {

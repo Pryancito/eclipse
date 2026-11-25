@@ -45,6 +45,7 @@ const _: () = {
 /// viaja por el socket es el numero de Linux, y escribirlo a mano es la unica
 /// forma de que la tabla se lea de una vez.
 mod errno {
+    pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
     pub const ESRCH: i32 = 3;
     pub const EIO: i32 = 5;
@@ -95,6 +96,9 @@ pub struct NetlinkSocketState {
     sock_type: SocketType,
     /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
     last_msg_flags: Mutex<i32>,
+    /// Whether whoever opened it held `CAP_NET_ADMIN`: without it the
+    /// socket asks and is told, and changes nothing (`EPERM`).
+    admin: bool,
 }
 
 impl Default for NetlinkSocketState {
@@ -105,7 +109,14 @@ impl Default for NetlinkSocketState {
 impl NetlinkSocketState {
     /// Create a netlink socket of the given type (`SOCK_RAW` or `SOCK_DGRAM`).
     pub fn new(sock_type: SocketType) -> Self {
+        Self::new_of(sock_type, true)
+    }
+
+    /// [`Self::new`], for an opener that holds `CAP_NET_ADMIN` (`admin`) or
+    /// does not.
+    pub fn new_of(sock_type: SocketType, admin: bool) -> Self {
         Self {
+            admin,
             base: zircon_object::object::KObjectBase::new(),
             data: Arc::new(Mutex::new(Vec::new())),
             local_endpoint: Arc::new(Mutex::new(None)),
@@ -250,6 +261,24 @@ impl Socket for NetlinkSocketState {
             let local_port = self.local_port_id();
             let reply_pid = reply_nl_pid(header, local_port);
             let mut buffer = self.data.lock();
+            // `rtnetlink_rcv_msg`: everything that is not a `GET` is for
+            // `CAP_NET_ADMIN`.
+            let changes = matches!(
+                message_type,
+                NetlinkMessageType::NewLink
+                    | NetlinkMessageType::DelLink
+                    | NetlinkMessageType::SetLink
+                    | NetlinkMessageType::NewAddr
+                    | NetlinkMessageType::DelAddr
+                    | NetlinkMessageType::NewRoute
+                    | NetlinkMessageType::DelRoute
+                    | NetlinkMessageType::NewNeigh
+                    | NetlinkMessageType::DelNeigh
+            );
+            if changes && !self.admin {
+                push_ack(&mut buffer, header, reply_pid, errno::EPERM);
+                continue;
+            }
             match message_type {
                 NetlinkMessageType::GetLink => {
                     let ifaces = get_net_device();

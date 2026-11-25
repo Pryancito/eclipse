@@ -529,6 +529,19 @@ impl Syscall<'_> {
             "sys_socket: domain:{:?}, type:{:?}, protocol:{:?}",
             domain, socket_type, protocol
         );
+        // `inet_create` and `packet_create`: a socket that writes its own
+        // packets, or hears everybody's, is for `CAP_NET_RAW`. The socket
+        // that only pings (`SOCK_DGRAM` of ICMP) is not one of them.
+        let raw = matches!(domain, Domain::AF_PACKET)
+            || (matches!(domain, Domain::AF_INET | Domain::AF_INET6)
+                && matches!(socket_type, SocketType::SOCK_RAW));
+        if raw
+            && !self
+                .linux_process()
+                .capable(linux_object::process::CAP_NET_RAW)
+        {
+            return Err(LxError::EPERM);
+        }
 
         let socket: Arc<dyn FileLike> = match (domain, socket_type, protocol) {
             // Stream and datagram sockets are the stack's that runs as a
@@ -617,7 +630,12 @@ impl Syscall<'_> {
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
             | (Domain::AF_NETLINK, SocketType::SOCK_DGRAM, _) => {
-                Arc::new(NetlinkSocketState::new(socket_type))
+                // What it may change is decided by who opens it, as
+                // `netlink_ns_capable` asks of the socket's opener.
+                let admin = self
+                    .linux_process()
+                    .capable(linux_object::process::CAP_NET_ADMIN);
+                Arc::new(NetlinkSocketState::new_of(socket_type, admin))
             }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
@@ -1595,6 +1613,16 @@ impl Syscall<'_> {
         let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
         self.hunter_net_gate(NetDirection::In, &endpoint).await?;
+        // `inet_bind`: a port below 1024 is for `CAP_NET_BIND_SERVICE`.
+        if let Endpoint::Ip(ip) = &endpoint {
+            if (1..1024).contains(&ip.port)
+                && !self
+                    .linux_process()
+                    .capable(linux_object::process::CAP_NET_BIND_SERVICE)
+            {
+                return Err(LxError::EACCES);
+            }
+        }
 
         let proc = self.linux_process();
         if let Endpoint::Unix(path) = &endpoint {

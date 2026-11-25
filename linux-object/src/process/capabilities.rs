@@ -47,6 +47,13 @@ pub const CAP_SETPCAP: u32 = 8;
 /// `CAP_LINUX_IMMUTABLE`: set the immutable and append-only flags. Here only
 /// for [`CAP_FS_SET`].
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// `CAP_NET_BIND_SERVICE`: bind a socket to a port below 1024.
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
+/// `CAP_NET_ADMIN`: change the network's configuration -- addresses,
+/// routes, neighbours, an interface's flags.
+pub const CAP_NET_ADMIN: u32 = 12;
+/// `CAP_NET_RAW`: open raw and packet sockets.
+pub const CAP_NET_RAW: u32 = 13;
 /// `CAP_IPC_LOCK`: lock memory (`mlock(2)`, `mlockall(2)`) past
 /// `RLIMIT_MEMLOCK`, a limit of 0 included.
 pub const CAP_IPC_LOCK: u32 = 14;
