@@ -685,6 +685,18 @@ fn release_robust_locks_of(thread: &Thread) {
         // the queue a waiter in another process sleeps on when the lock is
         // a process-shared one in shared memory. The per-process table it
         // used to wake is a queue nobody in that process was on.
+        // The word is `entry + futex_offset`, both from userspace, and the
+        // futex below loads and stores it as an atomic with no fault fixup.
+        // Linux's `handle_futex_death` is a `get_user` that skips a fault;
+        // this is `sys_futex`'s own check. A garbage offset (tools/sysfuzz)
+        // was a #GP on a non-canonical address at every exit of that thread.
+        let word: UserInPtr<i32> = lock.addr.into();
+        if word
+            .check_for(kernel_hal::MMUFlags::READ | kernel_hal::MMUFlags::WRITE)
+            .is_err()
+        {
+            continue;
+        }
         let Some(futex) = shared_futex::futex_for_shared_op(proc, lock.addr) else {
             continue;
         };

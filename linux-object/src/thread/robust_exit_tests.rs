@@ -178,3 +178,27 @@ fn the_list_is_released_once_however_many_death_paths_reach_it() {
         "the second death path walked the list again"
     );
 }
+
+/// A list whose `futex_offset` points the lock word outside the address
+/// space (non-canonical, or simply unmapped) is skipped, the way Linux's
+/// `get_user` fault skips it. Found by tools/sysfuzz as a kernel #GP in
+/// `release_robust_locks` at the thread's exit.
+#[test]
+fn a_lock_word_outside_the_address_space_is_skipped() {
+    let owner = a_linux_process("robust-garbage");
+    let dying = Thread::create_linux(&owner).unwrap();
+    let base = Box::leak(Box::new([0usize; 16])).as_ptr() as usize;
+    unsafe { hold_one_robust_lock(&dying, base, base, dying.id() as u32) };
+    // Rewrite the head's `futex_offset` so `node + offset` is non-canonical.
+    let offset = 0xf0a0_e40b_ea18_f348usize.wrapping_sub(base + NODE) & !3;
+    unsafe { (*((base + 8) as *const AtomicUsize)).store(offset, Ordering::SeqCst) };
+    // The user-half bound the machine applies (host addresses pass it).
+    kernel_hal::user::set_strict_user_half(true);
+    release_robust_locks_of(&dying);
+    kernel_hal::user::set_strict_user_half(false);
+    assert_eq!(
+        lock_word(base),
+        dying.id() as u32 | FUTEX_WAITERS,
+        "the real word is untouched"
+    );
+}
