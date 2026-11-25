@@ -118,6 +118,23 @@ jobs:
       - name: Xtask Build bare-metal linux
         run: cargo bin -m virt-${{ matrix.arch }}
 
+      # The in-kernel memory self-tests (`eclipse.ktest`, zCore/src/ktest.rs):
+      # the host suites run the page-table walker and the VMO tree on a model
+      # of memory, and these are the cases only the machine can answer -- the
+      # MMU reading the entries the walker wrote, an unmap really leaving the
+      # TLB, the dirty bit the stack poison trusts. No root filesystem: the
+      # kernel powers off before the first process. About a minute per arch.
+      - name: In-kernel memory self-tests (${{ matrix.arch }})
+        run: |
+          sudo apt-get install -y qemu-system mtools dosfstools
+          cd zCore && make build ARCH=${{ matrix.arch }} LINUX=1 && cd ..
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            mkdir -p ignored/target/aarch64/firmware
+            curl -sSL https://github.com/Luchangcheng2333/rayboot/releases/download/2.0.0/aarch64_firmware.tar.gz \
+              | tar xz -C ignored/target/aarch64/firmware
+          fi
+          scripts/qemu-ktest.sh ${{ matrix.arch }}
+
   # The memory-debugging build, in a job of its own.
   #
   # `MEM_DEBUG=1` turns on the redzone canary after every allocation, the
