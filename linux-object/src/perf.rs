@@ -1923,6 +1923,9 @@ pub(crate) fn with_interval(n: u32, f: impl FnOnce()) {
 }
 
 #[cfg(test)]
+mod report_tests;
+
+#[cfg(test)]
 mod sampling_tests {
     //! The latency sampler: which syscalls get a clock reading, and what the
     //! stored totals mean once only one call in `n` is timed.
