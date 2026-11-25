@@ -298,7 +298,25 @@ impl Walked {
     /// `/dev/shm` inside `/dev`) `..` is that top again, or nothing at all,
     /// so `/proc/..` was `/proc` and `/dev/..` was `ENOENT`. The directory
     /// the top is in is then found from the root, by name.
+    ///
+    /// And from the root of whoever walks, `..` is that root: a process
+    /// whose root is not the file system's (`chroot`) does not climb out of
+    /// it. The file system knows nothing of that root and would answer the
+    /// directory above.
     fn up(&self, dir: &dyn INode) -> Result<Arc<dyn INode>> {
+        if let Some(root) = &self.root {
+            let same_object = core::ptr::eq(
+                dir as *const dyn INode as *const (),
+                Arc::as_ptr(root) as *const (),
+            );
+            let same_node = || match (dir.metadata(), root.metadata()) {
+                (Ok(here), Ok(top)) => (here.dev, here.inode) == (top.dev, top.inode),
+                _ => false,
+            };
+            if same_object || (self.names.is_empty() && same_node()) {
+                return Ok(root.clone());
+            }
+        }
         let found = dir.find("..");
         let (Some(root), Some((_, parent))) = (&self.root, self.names.split_last()) else {
             return found;
@@ -1209,6 +1227,39 @@ mod lookup_tests {
             in_proc.lookup_walked("abs", 4, Some(&mut own)).err(),
             Some(FsError::EntryNotFound)
         );
+    }
+
+    /// A walker whose root is a directory below the file system's (a
+    /// `chroot`) stays in it: `..` from that root is that root, by an
+    /// absolute path as by a relative one, however many of them.
+    #[test]
+    fn dot_dot_does_not_climb_out_of_the_root_of_whoever_walks() {
+        let tree = tree();
+        let secret = tree.root.file("secret", b"");
+        let jail = tree.root.dir("jail");
+        let inside = jail.dir("inside");
+        let at_jail = &*jail as &dyn INode;
+        for path in ["/..", "/../..", "..", "inside/../..", "/inside/../../.."] {
+            let mut walked = Walked::default();
+            walked.root = Some(jail.clone());
+            let found = at_jail.lookup_walked(path, 4, Some(&mut walked)).unwrap();
+            assert!(same(&found, &jail), "{}", path);
+            assert_eq!(walked.path(), "/", "{}", path);
+        }
+        for path in ["/../secret", "../secret", "inside/../../secret"] {
+            let mut walked = Walked::default();
+            walked.root = Some(jail.clone());
+            let found = at_jail.lookup_walked(path, 4, Some(&mut walked));
+            assert_eq!(found.err(), Some(FsError::EntryNotFound), "{}", path);
+        }
+        // Inside it, `..` is still the directory above.
+        let mut walked = Walked::at("/inside");
+        walked.root = Some(jail.clone());
+        let found = (&*inside as &dyn INode)
+            .lookup_walked("..", 4, Some(&mut walked))
+            .unwrap();
+        assert!(same(&found, &jail));
+        let _ = secret;
     }
 
     /// A magic link leads to an inode, where the walk goes on, and the walk
