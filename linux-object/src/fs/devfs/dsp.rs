@@ -175,7 +175,7 @@ fn uread<T: Copy>(addr: usize) -> Result<T> {
 }
 
 fn uwrite<T: Copy>(addr: usize, val: T) -> Result<()> {
-    if !kernel_hal::user::user_range_ok(addr, core::mem::size_of::<T>())
+    if !kernel_hal::user::user_range_ok_to_write(addr, core::mem::size_of::<T>())
         || !addr.is_multiple_of(core::mem::align_of::<T>())
     {
         return Err(FsError::BadAddress);
