@@ -17,6 +17,11 @@ pub struct EventFd {
     base: KObjectBase,
     counter: Arc<AtomicU64>,
     eventbus: Arc<Mutex<EventBus>>,
+    /// Where a blocked writer whose value does not fit sleeps; see
+    /// [`EventFd::wait_for_room`]. Not `eventbus`: its `WRITABLE` is
+    /// `poll`'s, set whenever the counter is below the ceiling, which says
+    /// nothing about a large value fitting.
+    room: Arc<Mutex<EventBus>>,
     /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
     flags: Mutex<OpenFlags>,
     semaphore: bool,
@@ -37,6 +42,7 @@ impl EventFd {
             base: KObjectBase::new(),
             counter: Arc::new(AtomicU64::new(initval as u64)),
             eventbus: EventBus::new(),
+            room: EventBus::new(),
             flags: Mutex::new(flags),
             semaphore,
         };
@@ -82,6 +88,32 @@ impl EventFd {
         } else {
             bus.clear(Event::WRITABLE);
         }
+    }
+}
+
+impl EventFd {
+    /// Sleep until a read has lowered the counter since the last `write`
+    /// that found no room, or a signal ends the wait.
+    ///
+    /// What a blocking writer waits on after `EAGAIN`. `async_poll(OUT)` is
+    /// the wrong wait for it: POLLOUT is "the counter is below the ceiling",
+    /// true for any counter but `u64::MAX - 1`, so a value too big for the
+    /// room left saw it ready at once, wrote, got `EAGAIN` and asked again,
+    /// for ever, in the kernel and deaf to signals (`tools/sysfuzz`: a
+    /// `write` that `SIGALRM` never ended, the task at 100 % CPU).
+    pub async fn wait_for_room(&self) -> LxResult<()> {
+        crate::sync::wait_for_event(self.room.clone(), Event::WRITABLE).await?;
+        Ok(())
+    }
+}
+
+/// What a blocking writer that got `EAGAIN` waits on: room for its write.
+/// That is POLLOUT for everything but an eventfd, whose POLLOUT does not say
+/// whether the value being written fits ([`EventFd::wait_for_room`]).
+pub async fn wait_for_write_room(file_like: &Arc<dyn FileLike>) -> LxResult<()> {
+    match file_like.downcast_ref::<EventFd>() {
+        Some(efd) => efd.wait_for_room().await,
+        None => file_like.async_poll(PollEvents::OUT).await.map(|_| ()),
     }
 }
 
@@ -142,6 +174,8 @@ impl FileLike for EventFd {
                 };
                 buf[..8].copy_from_slice(&res.to_ne_bytes());
                 self.publish_readiness();
+                // After the counter fell: see `write`'s side of this.
+                self.room.lock().set(Event::WRITABLE);
                 return Ok(8);
             }
             if self.flags().non_block() {
@@ -171,6 +205,14 @@ impl FileLike for EventFd {
                     return Ok(8);
                 }
             } else {
+                // No room for THIS value. Clear the room bit first and then
+                // look again: a read that lowers the counter after that look
+                // sets the bit after this clear, so `wait_for_room` cannot
+                // sleep through it.
+                self.room.lock().clear(Event::WRITABLE);
+                if u64::MAX - self.counter.load(Ordering::SeqCst) > val {
+                    continue;
+                }
                 // Full: non-blocking writers get EAGAIN; blocking ones also
                 // return EAGAIN here so `sys_write`'s `waits_for_room` path
                 // can `async_poll(OUT)` until a read frees the ceiling — the
@@ -563,6 +605,35 @@ mod tests {
             }
         }
         assert_eq!(fd.write(&1u64.to_ne_bytes()).unwrap(), 8);
+    }
+
+    /// A value too big for the room left, while POLLOUT is still true: the
+    /// writer must sleep until a read, not see "writable" at once and spin.
+    /// `tools/sysfuzz` found the spin as a `write` no signal could end.
+    #[test]
+    fn a_write_too_big_for_the_room_left_sleeps_until_a_read() {
+        use core::future::Future;
+        use core::task::{Context, Poll};
+
+        let fd = efd(0x3e32_33f9, OpenFlags::empty());
+        let big = u64::MAX - 0x1000;
+        assert_eq!(write8(&fd, big), Err(LxError::EAGAIN));
+        assert!(
+            fd.poll(PollEvents::OUT).unwrap().write,
+            "POLLOUT is still true: the counter is far from the ceiling"
+        );
+        let (waker, woke) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fd.wait_for_room());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the writer must sleep, not be told there is room"
+        );
+        assert_eq!(read8(&fd), Ok(0x3e32_33f9));
+        assert!(woke(), "the read never woke the writer");
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        drop(fut);
+        assert_eq!(write8(&fd, big), Ok(8));
     }
 
     #[test]
