@@ -227,6 +227,10 @@ impl UeventSocket {
             if self.flags.lock().contains(OpenFlags::NON_BLOCK) {
                 return (Err(LxError::EAGAIN), none);
             }
+            // A signal ends the wait (EINTR); see blocking_read_signal_tests.
+            if let Err(e) = crate::process::check_signals() {
+                return (Err(e), none);
+            }
             kernel_hal::thread::sleep_until(
                 kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
             )
