@@ -532,7 +532,13 @@ fn asker_with(text: &[u8]) -> (Arc<VmAddressRegion>, Arc<VmObject>, u64) {
     let vmo = VmObject::new_paged(1);
     vmo.write(0, text).unwrap();
     let flags = zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE;
-    let at = vmar.map(None, vmo.clone(), 0, 4096, flags).unwrap();
+    // Over a page of the host's own, as `nvidia/pin/tests.rs` does: on libos
+    // a root VMAR starts at 0, so `map(None, ..)` picks address 0, which the
+    // host refuses (EPERM, `vm.mmap_min_addr`) to anyone but root.
+    let page = core::alloc::Layout::from_size_align(4096, 4096).unwrap();
+    let at = unsafe { std::alloc::alloc_zeroed(page) } as usize;
+    vmar.map_at(at - vmar.addr(), vmo.clone(), 0, 4096, flags)
+        .unwrap();
     (vmar, vmo, at as u64)
 }
 
