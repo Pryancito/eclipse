@@ -3291,6 +3291,12 @@ mod fault_signal_tests {
 #[cfg(test)]
 mod loader_tests;
 
+#[cfg(all(test, feature = "zircon-gateway"))]
+mod gateway_tests;
+
+#[cfg(all(test, feature = "zircon-gateway"))]
+mod serve_tests;
+
 #[cfg(test)]
 mod park_tests {
     //! The one place in the kernel that knows a thread has stopped running:

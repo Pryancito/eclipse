@@ -3446,3 +3446,6 @@ mod legacy_irq_tests {
         assert!(other_inner.irq.handlers.iter().all(|s| !s.get_masked()));
     }
 }
+
+#[cfg(test)]
+mod allocation_tests;
