@@ -1665,6 +1665,68 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
 
+    // The interrupted context's own frames. The walk above starts at the
+    // panic handler's RBP, which for a CPU exception is the trap handler on
+    // an IST stack: a double fault from a kernel stack overflow came back as
+    // `panic_fmt`, `trap_handler`, `trap_return` and nothing of the code that
+    // ate the stack (2026-11-25, frame-fault injection, two CPUs at once in
+    // the frame allocator). The faulting RBP was recorded on the way in; its
+    // chain is the overflowing stack, deepest frame first. Bounded to frames
+    // at or above the faulting RSP and to 1 MiB of it, so a wild RBP cannot
+    // send the handler into another fault.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(fault_rsp) = kernel_hal::kstats::current_fault_rsp() {
+        let mut rbp = kernel_hal::kstats::last_fault_rbp() as usize;
+        let lo = fault_rsp as usize;
+        let hi = lo.saturating_add(1 << 20);
+        let line = |s: core::fmt::Arguments| {
+            kernel_hal::console::serial_write_fmt_spin(s);
+            kernel_hal::console::graphic_console_write_fmt_spin(s);
+        };
+        line(format_args!(
+            "[fault backtrace] rsp={:#x} rbp={:#x}\n",
+            lo, rbp
+        ));
+        let mut last_ret = 0usize;
+        let mut repeats = 0usize;
+        for _ in 0..48 {
+            if rbp & 0x7 != 0 || rbp < lo || rbp >= hi - 16 {
+                break;
+            }
+            let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+            let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+            if ret == 0 {
+                break;
+            }
+            // A recursion prints one frame and a count, so the frames that
+            // entered it still fit on the screen.
+            if ret == last_ret {
+                repeats += 1;
+            } else {
+                if repeats > 0 {
+                    line(format_args!("  (x{} more)\n", repeats));
+                }
+                repeats = 0;
+                line(format_args!(
+                    "  ret={}\n",
+                    kernel_hal::ksyms::Addr(ret as u64)
+                ));
+            }
+            last_ret = ret;
+            if next <= rbp {
+                break;
+            }
+            rbp = next;
+        }
+        if repeats > 0 {
+            line(format_args!("  (x{} more)\n", repeats));
+        }
+        line(format_args!(
+            "[fault backtrace] {} KiB of stack above the fault\n",
+            (rbp.saturating_sub(lo)) / 1024
+        ));
+    }
+
     // The last word on the screen. The early framebuffer console does not
     // scroll: it clears and restarts at the top when it fills, so on a 25-line
     // display the backtrace just printed above can have wiped the panic

@@ -1,7 +1,6 @@
 //! The per-CPU frame lists; see the note on `mod pcp` in `memory_x86_64.rs`.
 
-use super::{frames_lock, Mutex, FRAMES_CACHED, PAGE_BITS};
-use core::sync::atomic::Ordering;
+use super::{Mutex, FRAMES_CACHED, FRAME_ALLOCATOR, PAGE_BITS};
 use bitmap_allocator::BitAlloc;
 use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 
@@ -81,14 +80,12 @@ pub fn alloc() -> Option<usize> {
     let mut p = mine().try_lock()?;
     if let Some(idx) = p.pop() {
         FRAMES_CACHED.sub(1 << PAGE_BITS);
-        super::PCP_HITS.fetch_add(1, Ordering::Relaxed);
         return Some(idx);
     }
-    super::PCP_REFILLS.fetch_add(1, Ordering::Relaxed);
     // Refill with the list still held and the bitmap taken inside it. The
     // order is always this way round -- list outer, bitmap inner -- in
     // every function here, which is what keeps the pair deadlock-free.
-    let mut g = frames_lock();
+    let mut g = FRAME_ALLOCATOR.lock();
     let mut batch = [0usize; BATCH];
     let mut taken = 0;
     for slot in batch.iter_mut() {
@@ -135,7 +132,7 @@ pub fn free(idx: usize) -> bool {
         // Full: give a batch back rather than refusing, so a CPU that
         // frees far more than it allocates does not fall back to the
         // global lock on every single page from here on.
-        let mut g = frames_lock();
+        let mut g = FRAME_ALLOCATOR.lock();
         let mut given = 0;
         for _ in 0..BATCH {
             let Some(f) = p.pop() else { break };
@@ -169,7 +166,7 @@ pub fn drain_all() -> usize {
         if p.len() == 0 {
             continue;
         }
-        let mut g = frames_lock();
+        let mut g = FRAME_ALLOCATOR.lock();
         while let Some(f) = p.pop() {
             g.dealloc(f);
             moved += 1;

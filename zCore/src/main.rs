@@ -370,27 +370,32 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
         }
+        // Frame fault injection for tests (see `kernel_hal::mem::failpage`).
+        if let Some(fail) = kernel_hal::mem::failpage::Config::parse(&options.cmdline) {
+            kernel_hal::mem::failpage::configure(fail);
+            klog_warn!(
+                "Eclipse: frame fault injection ON: 1 in {} {} frame(s) refused, \
+                 from {} s to {} s of uptime (FAILPAGE)",
+                fail.every,
+                if fail.no_user {
+                    "kernel"
+                } else if fail.kernel {
+                    "user and kernel"
+                } else {
+                    "user"
+                },
+                fail.after_s,
+                if fail.until_s == 0 {
+                    "the end".into()
+                } else {
+                    alloc::format!("{}", fail.until_s)
+                },
+            );
+        }
         // A thread taken off the CPU in user mode waits behind the woken
         // ones (see `kernel_hal::thread::preempt_behind`): off by default,
         // because on a GPU desktop it froze the screen ~20 s every minute;
         // `PREEMPTBEHIND=1` turns it on.
-        if let Some(n) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGE")
-            .and_then(kernel_hal::cmdline::parse_number)
-        {
-            let k = kernel_hal::cmdline::flag(&options.cmdline, "FAILPAGEK");
-            if let Some(after) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGEAFTER")
-                .and_then(kernel_hal::cmdline::parse_number)
-            {
-                kernel_hal::mem::failpage::set_start_ns(after.saturating_mul(1_000_000_000));
-            }
-            if let Some(until) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGEUNTIL")
-                .and_then(kernel_hal::cmdline::parse_number)
-            {
-                kernel_hal::mem::failpage::set_end_ns(until.saturating_mul(1_000_000_000));
-            }
-            kernel_hal::mem::failpage::set(n, k);
-            klog_info!("Eclipse: PROTOTYPE frame fault injection 1/{} (kernel frames: {})", n, k);
-        }
         let behind = kernel_hal::cmdline::flag(&options.cmdline, "PREEMPTBEHIND");
         kernel_hal::thread::set_preempt_behind(behind);
         if behind {

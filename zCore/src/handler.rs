@@ -605,19 +605,6 @@ impl KernelHandler for ZcoreKernelHandler {
         let _ = writeln!(s, "UserFrameRefusals: {}", memory::user_frame_refusals());
         let (fu, fk) = kernel_hal::mem::failpage::stats();
         let _ = writeln!(s, "FailPageInjected: user {} kernel {}", fu, fk);
-        #[cfg(target_arch = "x86_64")]
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            let _ = writeln!(
-                s,
-                "FrameLock: taken {} contended {} wait_cycles {} pcp_hits {} pcp_refills {}",
-                memory::FA_TAKEN.load(Relaxed),
-                memory::FA_CONTENDED.load(Relaxed),
-                memory::FA_WAIT_CYCLES.load(Relaxed),
-                memory::PCP_HITS.load(Relaxed),
-                memory::PCP_REFILLS.load(Relaxed),
-            );
-        }
         if let Some(free) = free_blocks {
             let _ = writeln!(s, "free blocks by size:");
             for (i, n) in free.iter().enumerate() {

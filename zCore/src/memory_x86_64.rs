@@ -46,28 +46,6 @@ const MAX_MANAGED_PADDR_EXCLUSIVE: PhysAddr = 1usize << (PAGE_BITS + 24); // 64G
 
 static FRAME_ALLOCATOR: Mutex<FrameAlloc> = Mutex::new(FrameAlloc::DEFAULT);
 
-/// PROTOTYPE (measurement only): how often the global frame bitmap lock is
-/// taken, how often it was already held, and the TSC cycles spent waiting.
-pub static FA_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static FA_CONTENDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static FA_WAIT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PCP_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static PCP_REFILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-#[inline]
-pub(crate) fn frames_lock() -> impl core::ops::DerefMut<Target = FrameAlloc> {
-    FA_TAKEN.fetch_add(1, Ordering::Relaxed);
-    if let Some(g) = FRAME_ALLOCATOR.try_lock() {
-        return g;
-    }
-    FA_CONTENDED.fetch_add(1, Ordering::Relaxed);
-    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-    let g = frames_lock();
-    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
-    FA_WAIT_CYCLES.fetch_add(t1.wrapping_sub(t0), Ordering::Relaxed);
-    g
-}
-
 // ─── DEBUG: detector de doble-uso / use-after-free de frames físicos ───────────
 //
 // Bitset "frame actualmente asignado", paralelo al bitmap allocator. Cubre hasta
@@ -202,7 +180,7 @@ fn frames_inside(region: &Range<PhysAddr>) -> Range<usize> {
 
 pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     debug!("init_frame_allocator regions: {regions:x?}");
-    let mut ba = frames_lock();
+    let mut ba = FRAME_ALLOCATOR.lock();
     for region in regions {
         let frames = frames_inside(region);
         if frames.is_empty() {
@@ -238,6 +216,7 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 /// case, the bitmap for everything else. Split out of [`frame_alloc`] so the
 /// drain-and-retry below has exactly one thing to retry.
 fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize> {
+    // Test-only refusal (`FAILPAGE`); one relaxed load when off.
     if kernel_hal::mem::failpage::kernel() {
         return None;
     }
@@ -246,7 +225,7 @@ fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize>
         if let Some(idx) = pcp::alloc() {
             return Some(idx);
         }
-        let got = frames_lock().alloc();
+        let got = FRAME_ALLOCATOR.lock().alloc();
         note_frames_level();
         got
     } else {
@@ -341,6 +320,7 @@ pub fn user_frame_refusals() -> u64 {
 /// shortage, and when the caches give nothing its OOM killer picks a victim
 /// while the kernel still has the RAM to do it.
 pub fn frame_alloc_user() -> Option<PhysAddr> {
+    // Test-only refusal (`FAILPAGE`); one relaxed load when off.
     if kernel_hal::mem::failpage::user() {
         return None;
     }
@@ -510,7 +490,7 @@ pub fn frame_dealloc(target: PhysAddr) {
     if pcp::free(idx) {
         return;
     }
-    frames_lock().dealloc(idx);
+    FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
 /// Give `count` frames starting at `start` back to the bitmap in one go,
@@ -545,7 +525,7 @@ fn frame_dealloc_run(start: PhysAddr, count: usize) {
             let n = (count - done).min(BATCH);
             let run = first + done..first + done + n;
             {
-                let mut ba = frames_lock();
+                let mut ba = FRAME_ALLOCATOR.lock();
                 if let Some(free) = run.clone().find(|&i| ba.test(i)) {
                     drop(ba);
                     panic!(
@@ -623,7 +603,7 @@ pub fn reserve_active_page_table_frames() {
     if root == 0 {
         return; // libos / no paging context: nothing to reserve
     }
-    let mut ba = frames_lock();
+    let mut ba = FRAME_ALLOCATOR.lock();
     let mut reserved = 0usize;
     // Depth-first walk of the 4-level tree. Huge-page entries (PS bit) have no
     // lower table; entry bit 0 = present. Physical addresses are masked to 52
