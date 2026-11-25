@@ -173,7 +173,7 @@ pub(crate) fn hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// the rule that word must pass — judged against the `.text` window before the
 /// jump — was exercised only where `fn_slot` tests the predicate, never where
 /// these four slots use it.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

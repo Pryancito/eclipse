@@ -73,6 +73,12 @@ jobs:
           # build compiled nothing but no-op shims. A `cargo test` build now
           # compiles the real thing against a host interrupt backend.
           cargo test -p lock --lib -- --test-threads=1
+          # The same locks under loom: every interleaving and every outcome
+          # the C11 memory model allows for two contenders, not the few this
+          # runner's x86 cores happen to show. A crate of its own outside the
+          # workspace (loom would otherwise enter the kernel's Cargo.lock), and
+          # under a second, in release, for the 13 models.
+          cargo test --release --manifest-path vendor/kernel-sync/loom/Cargo.toml
           # `vendor/trapframe` is the other `[patch]`ed vendor crate, and the
           # one the kernel cannot take a single trap without: the GDT, the TSS,
           # the IDT, the syscall MSRs and the entry stubs that build a

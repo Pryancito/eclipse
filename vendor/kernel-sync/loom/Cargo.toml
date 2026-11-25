@@ -1,0 +1,30 @@
+# Loom models of the `lock` crate's mutexes and rwlock: every interleaving
+# and every memory-order outcome of two or three CPUs contending, instead of
+# whichever ones a test run happens to hit. See `models.rs`.
+#
+#     cargo test --release --manifest-path vendor/kernel-sync/loom/Cargo.toml
+#
+# A crate of its own, outside the workspace, so that loom and its
+# dependencies (tracing-subscriber, regex) never enter the kernel's
+# `Cargo.lock`: they would move `memchr` and friends under every kernel
+# build for the sake of a test. It compiles the lock sources straight out of
+# `../src` (`#[path]` in `lib.rs`), so what it checks is the kernel's code,
+# not a copy.
+[package]
+name = "lock-loom"
+version = "0.1.0"
+edition = "2018"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+# The doc examples in `../src` are the `spin` crate's, run by `cargo test -p lock`.
+doctest = false
+
+[dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

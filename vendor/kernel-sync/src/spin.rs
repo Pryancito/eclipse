@@ -3,22 +3,23 @@ use core::{
     default::Default,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
 };
 
 use crate::deadlock::report_deadlock;
 use crate::interrupt::{pop_off, push_off};
+use crate::prims::{loom_const_fn, spin_loop, AtomicBool, AtomicUsize};
 
 pub struct SpinMutex<T: ?Sized> {
     locked: AtomicBool,
     /// Deadlock forensics: `file.as_ptr()` of the current holder's
     /// `#[track_caller]` acquire site (0 = unheld). See `TicketMutex` for the
     /// full rationale — a stuck waiter reports the HOLDER alongside itself.
-    holder_file: core::sync::atomic::AtomicUsize,
+    holder_file: AtomicUsize,
     /// Byte length of the holder's file string.
-    holder_file_len: core::sync::atomic::AtomicUsize,
+    holder_file_len: AtomicUsize,
     /// `(cpu << 32) | line` of the holder's acquire.
-    holder_line_cpu: core::sync::atomic::AtomicUsize,
+    holder_line_cpu: AtomicUsize,
     data: UnsafeCell<T>,
 }
 
@@ -29,7 +30,7 @@ pub struct SpinMutex<T: ?Sized> {
 pub struct SpinMutexGuard<'a, T: ?Sized + 'a> {
     lock: &'a AtomicBool,
     /// Cleared on drop so the lock reads as unheld between owners.
-    holder_file: &'a core::sync::atomic::AtomicUsize,
+    holder_file: &'a AtomicUsize,
     data: &'a mut T,
 }
 
@@ -37,14 +38,16 @@ unsafe impl<T: ?Sized + Send> Sync for SpinMutex<T> {}
 unsafe impl<T: ?Sized + Send> Send for SpinMutex<T> {}
 
 impl<T> SpinMutex<T> {
-    #[inline(always)]
-    pub const fn new(data: T) -> Self {
-        SpinMutex {
-            locked: AtomicBool::new(false),
-            holder_file: core::sync::atomic::AtomicUsize::new(0),
-            holder_file_len: core::sync::atomic::AtomicUsize::new(0),
-            holder_line_cpu: core::sync::atomic::AtomicUsize::new(0),
-            data: UnsafeCell::new(data),
+    loom_const_fn! {
+        #[inline(always)]
+        pub fn new(data: T) -> Self {
+            SpinMutex {
+                locked: AtomicBool::new(false),
+                holder_file: AtomicUsize::new(0),
+                holder_file_len: AtomicUsize::new(0),
+                holder_line_cpu: AtomicUsize::new(0),
+                data: UnsafeCell::new(data),
+            }
         }
     }
 
@@ -83,7 +86,7 @@ impl<T: ?Sized> SpinMutex<T> {
     /// they did not.
     #[inline(always)]
     fn wait_turn(&self, spins: &mut u64, caller: &'static core::panic::Location<'static>) {
-        core::hint::spin_loop();
+        spin_loop();
         *spins += 1;
         // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
         // IPIs, and a peer may be spin-waiting for our ack — drain our

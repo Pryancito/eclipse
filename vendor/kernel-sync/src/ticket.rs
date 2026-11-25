@@ -3,11 +3,14 @@ use core::{
     default::Default,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::Ordering,
 };
 
 use crate::deadlock::report_deadlock;
 use crate::interrupt::{pop_off, push_off, push_off_long, push_off_short};
+#[cfg(loom)]
+use crate::prims::TryUpdate;
+use crate::prims::{loom_const_fn, spin_loop, AtomicUsize};
 
 pub struct TicketMutex<T: ?Sized> {
     next_ticket: AtomicUsize,
@@ -65,7 +68,7 @@ fn wait_turn(
 ) {
     let mut spins: u64 = 0;
     while next_serving.load(Ordering::Acquire) != ticket {
-        core::hint::spin_loop();
+        spin_loop();
         spins += 1;
         // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
         // IPIs, and someone else is spin-waiting for our ack — see
@@ -136,15 +139,17 @@ fn wait_turn(
 }
 
 impl<T> TicketMutex<T> {
-    #[inline(always)]
-    pub const fn new(data: T) -> Self {
-        TicketMutex {
-            next_ticket: AtomicUsize::new(0),
-            next_serving: AtomicUsize::new(0),
-            holder_file: AtomicUsize::new(0),
-            holder_file_len: AtomicUsize::new(0),
-            holder_line_cpu: AtomicUsize::new(0),
-            data: UnsafeCell::new(data),
+    loom_const_fn! {
+        #[inline(always)]
+        pub fn new(data: T) -> Self {
+            TicketMutex {
+                next_ticket: AtomicUsize::new(0),
+                next_serving: AtomicUsize::new(0),
+                holder_file: AtomicUsize::new(0),
+                holder_file_len: AtomicUsize::new(0),
+                holder_line_cpu: AtomicUsize::new(0),
+                data: UnsafeCell::new(data),
+            }
         }
     }
 
