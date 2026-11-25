@@ -180,12 +180,36 @@ fn echo() -> Echo {
                     5
                 }
                 OP_IOCTL => -25,
+                // The device's memory: page 0 is the second page of the
+                // writable VMO (handle 5), page 1 the read-only one
+                // (handle 6) from its start; nothing past them.
+                super::wire::OP_MMAP if req.a == 0 && req.b <= 4096 => {
+                    window.write(slot, &4096u64.to_ne_bytes()).unwrap();
+                    reply.len = 8;
+                    reply.a = 5;
+                    0
+                }
+                super::wire::OP_MMAP if req.a == 4096 => {
+                    reply.a = 6;
+                    0
+                }
+                // A handle that names nothing.
+                super::wire::OP_MMAP if req.a == 8192 => {
+                    reply.a = 99;
+                    0
+                }
+                super::wire::OP_MMAP => -6,
                 _ => -22,
             };
             reply.b = status as u64;
             send(&theirs, reply);
         }
     });
+    node.vmos_from(alloc::boxed::Box::new(|handle| match handle {
+        5 => Some((device_memory(), true)),
+        6 => Some((device_memory(), false)),
+        _ => None,
+    }));
     Echo {
         node,
         released,
@@ -209,6 +233,17 @@ impl Drop for Echo {
             let _ = server.join();
         }
     }
+}
+
+/// The memory the echo device maps: two pages, the second starting `M`.
+fn device_memory() -> Arc<VmObject> {
+    static MEM: std::sync::OnceLock<Arc<VmObject>> = std::sync::OnceLock::new();
+    MEM.get_or_init(|| {
+        let vmo = VmObject::new_paged(2);
+        vmo.write(4096, b"M").unwrap();
+        vmo
+    })
+    .clone()
 }
 
 fn ready(open: &Arc<dyn INode>) -> (bool, bool, bool, bool) {
@@ -319,6 +354,55 @@ fn an_ioctl_that_cannot_be_done_yet_waits_for_the_server_on_an_open_that_waits()
     looker.join().unwrap();
     assert_eq!(got.unwrap(), 5);
     assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+}
+
+#[test]
+fn an_mmap_is_the_window_of_the_vmo_the_server_names() {
+    let echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    let (vmo, at, read_only) = open.map(0, 4096, true, true).unwrap();
+    assert_eq!((at, read_only), (4096, false));
+    let mut b = [0u8; 1];
+    vmo.read(at, &mut b).unwrap();
+    assert_eq!(&b, b"M");
+    // A window the VMO does not hold from where the server says.
+    assert_eq!(open.map(0, 8192, true, false).err(), Some(LxError::ENXIO));
+}
+
+#[test]
+fn an_mmap_of_a_read_only_vmo_is_read_only_and_never_shared_writable() {
+    let echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    let (_, at, read_only) = open.map(4096, 4096, true, false).unwrap();
+    assert_eq!((at, read_only), (0, true));
+    assert!(open.map(4096, 4096, false, true).unwrap().2);
+    assert_eq!(
+        open.map(4096, 4096, true, true).err(),
+        Some(LxError::EACCES)
+    );
+}
+
+#[test]
+fn an_mmap_the_server_refuses_or_names_no_vmo_for_fails() {
+    let echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    assert_eq!(open.map(8192, 4096, true, false).err(), Some(LxError::EIO));
+    assert_eq!(
+        open.map(12288, 4096, true, false).err(),
+        Some(LxError::ENXIO)
+    );
+}
+
+#[test]
+fn a_node_with_no_way_to_find_vmos_cannot_be_mapped() {
+    let echo = echo();
+    *echo.node.0.vmos.lock() = None;
+    let open = echo.node.open_client(2).unwrap();
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    assert_eq!(open.map(0, 4096, true, false).err(), Some(LxError::ENODEV));
 }
 
 #[test]

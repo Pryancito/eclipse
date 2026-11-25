@@ -25,7 +25,8 @@ use zircon_object::{ZxError, ZxResult};
 ///
 /// The process answers each message on the other end of the FIFO, and
 /// says there, unasked, when an open of the node becomes readable or
-/// writable. When the process is gone the node goes too, and its opens
+/// writable. An `mmap` of the node it answers with a VMO handle of its own
+/// table, which the kernel maps in the program that asked. When the process is gone the node goes too, and its opens
 /// read as hung up; one that answers nothing for ten seconds while a
 /// request waits is killed. The next server puts the node back with this
 /// same call.
@@ -67,6 +68,18 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
             _ => ZxError::INVALID_ARGS,
         })?;
     let node = served.node;
+    // Its answers to an `mmap` name a VMO by a handle in its own table,
+    // looked up there while it lives: one it may map and read, and write
+    // only when the handle says so.
+    let server = Arc::downgrade(proc);
+    node.vmos_from(alloc::boxed::Box::new(move |handle| {
+        let server = server.upgrade()?;
+        let handle: u32 = core::convert::TryFrom::try_from(handle).ok()?;
+        let (vmo, rights) = server.get_object_and_rights::<VmObject>(handle).ok()?;
+        rights
+            .contains(Rights::MAP | Rights::READ)
+            .then(|| (vmo, rights.contains(Rights::WRITE)))
+    }));
     // A server that stops answering is killed, by its pid, which is its
     // own for as long as it holds the other end of the FIFO.
     let pid = proc.id() as usize;

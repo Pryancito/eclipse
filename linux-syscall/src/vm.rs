@@ -419,10 +419,19 @@ impl Syscall<'_> {
             // After the descriptor's own errors, as in Linux, where `EBADF`
             // and `EACCES` come before `mmap_region()` looks at the limit.
             self.as_rlimit_allows(&vmar, len, replaced)?;
+            // A device a process serves answers the mapping itself: its VMO,
+            // where the window starts in it, and whether it is read-only.
+            let served = served_map(&file_like, offset, len, shared, want_write)?;
+            let served_read_only = served.as_ref().is_some_and(|s| s.2);
             // MAP_SHARED must hand every mapper of the file the SAME VmObject
             // (stores propagate between processes — the wl_shm pixel path);
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
-            let (vmo, vmo_offset) = if shared {
+            let (vmo, vmo_offset) = if let Some((vmo, at, _)) = served {
+                if shared {
+                    vmo.set_share_on_fork();
+                }
+                (vmo, at)
+            } else if shared {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset, len)
                     .inspect_err(|e| {
@@ -493,6 +502,13 @@ impl Syscall<'_> {
             // made writable, so WRITE leaves the ceiling too.
             #[cfg(target_arch = "x86_64")]
             let (ceiling, prot) = if Self::nvidia_mmap_read_only(&file_like) {
+                (ceiling - MMUFlags::WRITE, prot - MmapProt::WRITE)
+            } else {
+                (ceiling, prot)
+            };
+            // The same for a served device whose server handed a VMO it
+            // may not write (`ServedOpen::map`).
+            let (ceiling, prot) = if served_read_only {
                 (ceiling - MMUFlags::WRITE, prot - MmapProt::WRITE)
             } else {
                 (ceiling, prot)
@@ -1685,6 +1701,27 @@ fn mmap_no_hugetlb(flags: usize) -> LxResult<()> {
         return Err(LxError::EINVAL);
     }
     Ok(())
+}
+
+/// `mmap` of an open of a device a process serves
+/// (`linux_object::fs::devfs::served`): the server's VMO, where the window
+/// starts in it, and whether it is read-only. `None` for any other file.
+fn served_map(
+    file_like: &Arc<dyn linux_object::fs::FileLike>,
+    offset: usize,
+    len: usize,
+    shared: bool,
+    want_write: bool,
+) -> LxResult<Option<(Arc<VmObject>, usize, bool)>> {
+    use linux_object::fs::devfs::served::ServedOpen;
+    let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() else {
+        return Ok(None);
+    };
+    let inode = file.inode();
+    let Some(open) = inode.downcast_ref::<ServedOpen>() else {
+        return Ok(None);
+    };
+    open.map(offset, len, shared, want_write).map(Some)
 }
 
 /// `do_mmap`'s check of the descriptor's open mode against the mapping

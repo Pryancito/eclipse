@@ -46,6 +46,9 @@ pub const OP_READ: u32 = 3;
 pub const OP_WRITE: u32 = 4;
 pub const OP_IOCTL: u32 = 5;
 pub const OP_IOCTL_IOV: u32 = 6;
+/// `mmap` of an open: answered with a VMO handle of this process's own
+/// table, and where the window starts in that VMO ([`Device::mmap`]).
+pub const OP_MMAP: u32 = 7;
 pub const OP_READY: u32 = 16;
 
 /// In an `ioctl`'s reply, in `a`: the slot holds an [`Iov`], what more of
@@ -73,6 +76,12 @@ pub const EBUSY: i32 = 16;
 pub const EINVAL: i32 = 22;
 pub const ENOTTY: i32 = 25;
 pub const EIO: i32 = 5;
+pub const ENODEV: i32 = 19;
+
+/// In [`Device::mmap`]'s `how`: the program maps `MAP_SHARED`.
+pub const MMAP_SHARED: u32 = 1;
+/// In [`Device::mmap`]'s `how`: the program asked for `PROT_WRITE`.
+pub const MMAP_WRITE: u32 = 2;
 
 /// The ranges of the program's memory an `ioctl` reads (`ins`) and writes
 /// (`outs`): address and length. Laid out in the slot as the kernel's
@@ -195,6 +204,25 @@ pub trait Device {
     ) -> Result<Option<Iov>, i32> {
         let _ = (fh, cmd, arg, waits, data);
         Ok(None)
+    }
+    /// `mmap(offset, len)` of the open, `how` it is mapped ([`MMAP_SHARED`],
+    /// [`MMAP_WRITE`]): a handle in this process's table to a VMO that holds
+    /// the window, and where the window starts in it (whole pages). The
+    /// handle stays this process's: keep it while the device lasts, since
+    /// the kernel looks it up as it answers. Its rights are the mapping's
+    /// ceiling: `MAP` and `READ` are needed, and a handle without `WRITE`
+    /// is mapped read-only. `ENODEV`, the default, for a device that maps
+    /// nothing.
+    fn mmap(
+        &mut self,
+        node: &Node,
+        fh: u32,
+        offset: u64,
+        len: u64,
+        how: u32,
+    ) -> Result<(u32, u64), i32> {
+        let _ = (node, fh, offset, len, how);
+        Err(ENODEV)
     }
     /// `ioctl(cmd, arg)` with what [`Device::fetch`] asked for: `ins` is
     /// the bytes of its ranges to read, one after the other, and what goes
@@ -383,6 +411,16 @@ impl Node {
                     }
                 }
             }
+            OP_MMAP => dev
+                .mmap(self, req.fh, req.a, req.b, req.len)
+                .map(|(handle, at)| {
+                    reply.a = handle as u64;
+                    if at != 0 {
+                        self.slot(req.reqid)[..8].copy_from_slice(&at.to_ne_bytes());
+                        reply.len = 8;
+                    }
+                    0
+                }),
             _ => Err(EINVAL),
         };
         reply.b = match status {

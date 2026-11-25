@@ -62,6 +62,21 @@ pub const IOCTL_WAITS: u64 = 1 << 32;
 /// write, in order; or it asks again.
 pub const OP_IOCTL_IOV: u32 = 6;
 
+/// `mmap` of the open `fh`: `a` is the offset into the device and `b` the
+/// length, both in bytes and whole pages; `len` says how it is mapped
+/// ([`MMAP_SHARED`], [`MMAP_WRITE`]). The reply: in `a`, a handle in the
+/// server's own table to a VMO that holds the window, and in the slot, when
+/// the reply's `len` is 8, where the window starts in that VMO (at 0
+/// otherwise). The handle stays the server's; the mapping holds the VMO
+/// for as long as it lasts. The handle's rights are the mapping's ceiling:
+/// it needs `MAP` and `READ`, and without `WRITE` the mapping is
+/// read-only. A negative `status` refuses the `mmap`.
+pub const OP_MMAP: u32 = 7;
+/// In an [`OP_MMAP`]'s `len`: the mapping is `MAP_SHARED`.
+pub const MMAP_SHARED: u32 = 1;
+/// In an [`OP_MMAP`]'s `len`: the program asked for `PROT_WRITE`.
+pub const MMAP_WRITE: u32 = 2;
+
 /// From the server, unasked: the open `fh` is now as `a` says ([`POLLIN`]
 /// and the rest). `reqid` is not looked at.
 pub const OP_READY: u32 = 16;
