@@ -270,10 +270,17 @@ impl Link {
     /// close says, which must not hold up the closer. The `reqid` is
     /// [`NO_REPLY`].
     pub fn tell(&self, op: u32, fh: u32) {
+        self.tell_with(op, fh, 0, 0)
+    }
+
+    /// [`tell`](Self::tell), with the words `a` and `b`.
+    pub fn tell_with(&self, op: u32, fh: u32, a: u64, b: u64) {
         let msg = Msg {
             op,
             reqid: NO_REPLY,
             fh,
+            a,
+            b,
             ..Msg::default()
         }
         .encode();

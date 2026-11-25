@@ -14,6 +14,7 @@ use zircon_object::ZxError;
 #[derive(Default)]
 struct Card {
     flipped: AtomicU32,
+    closed: AtomicU32,
 }
 
 impl Scheme for Card {
@@ -33,6 +34,15 @@ impl DrmScheme for Card {
     }
     fn drives_own_display(&self) -> bool {
         true
+    }
+    /// Doubles the u32 its struct holds, for the caller `pid`.
+    fn ioctl_file(&self, _cmd: u32, arg: usize, pid: u64, _file: usize) -> Result<usize, i32> {
+        let v = unsafe { &mut *(arg as *mut u32) };
+        *v *= 2;
+        Ok(pid as usize)
+    }
+    fn nouveau_file_closed(&self, file: usize) {
+        self.closed.store(file as u32, Ordering::SeqCst);
     }
     fn create_fb(&self, handle: u32, _w: u32, _h: u32, _pitch: u32) -> Option<u32> {
         Some(500 + handle)
@@ -120,6 +130,7 @@ fn served() -> Served {
             Err(_) => return,
         }
         let req = Msg::decode(&m);
+        let told = req.reqid == super::super::link::NO_REPLY;
         let slot = (req.reqid as usize & (SLOTS - 1)) * SLOT_LEN;
         let mut data = vec![0u8; req.len.min(SLOT_LEN as u32) as usize];
         window.read(slot, &mut data).unwrap();
@@ -139,7 +150,9 @@ fn served() -> Served {
             }
             Err(errno) => reply.b = (-(errno as i64)) as u64,
         }
-        server.write(MSG, &reply.encode(), 1).unwrap();
+        if !told {
+            server.write(MSG, &reply.encode(), 1).unwrap();
+        }
     });
     Served {
         remote,
@@ -176,6 +189,25 @@ fn calls_cross_the_link_and_come_back() {
     for fb in 0..(SLOTS as u32 * 3) {
         assert!(s.remote.page_flip(fb));
     }
+}
+
+#[test]
+fn an_ioctl_crosses_the_link_with_its_struct() {
+    let s = served();
+    // `_IOWR('d', 0x50, u32)`.
+    let mut v = 21u32;
+    let arg = &mut v as *mut u32 as usize;
+    assert_eq!(s.remote.ioctl_file(0xc004_6450, arg, 9, 0), Ok(9));
+    assert_eq!(v, 42);
+}
+
+#[test]
+fn a_closed_file_is_told_and_waits_for_no_answer() {
+    let s = served();
+    s.remote.nouveau_file_closed(0x77);
+    // Told, not asked: the next call is what shows it arrived.
+    assert!(s.remote.page_flip(1));
+    assert_eq!(s.card.closed.load(Ordering::SeqCst), 0x77);
 }
 
 #[test]

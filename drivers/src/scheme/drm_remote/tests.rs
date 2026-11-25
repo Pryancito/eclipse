@@ -4,6 +4,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::convert::TryInto;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// A card with two connectors, one CRTC, a primary and a cursor plane.
@@ -12,6 +13,25 @@ struct Card {
     flipped: AtomicU32,
     cursor: lock::Mutex<Option<(i32, i32)>>,
     ready: core::sync::atomic::AtomicBool,
+    /// The last ioctl's (cmd, pid, file, arg), and what was told.
+    asked: lock::Mutex<Option<(u32, u64, usize, usize)>>,
+    told: lock::Mutex<Vec<(&'static str, u64)>>,
+}
+
+/// `DRM_IOCTL_NOUVEAU_EXEC`: `_IOWR('d', 0x52, struct drm_nouveau_exec)`.
+const EXEC: u32 = 0xc028_6452;
+
+/// `struct drm_nouveau_exec`, as a caller lays it out.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Exec {
+    channel: u32,
+    push_count: u32,
+    wait_count: u32,
+    sig_count: u32,
+    wait_ptr: u64,
+    sig_ptr: u64,
+    push_ptr: u64,
 }
 
 impl Scheme for Card {
@@ -157,6 +177,37 @@ impl DrmScheme for Card {
             _ => None,
         }
     }
+    /// EXEC: the sum of the pushes' `va` and the waits' handles, in
+    /// `channel`; `channel` 99 is refused after it is written, as
+    /// GEM_PUSHBUF writes its suffixes before an error. Any other command
+    /// answers its argument word.
+    fn ioctl_file(&self, cmd: u32, arg: usize, pid: u64, file: usize) -> Result<usize, i32> {
+        *self.asked.lock() = Some((cmd, pid, file, arg));
+        if cmd != EXEC {
+            return Ok(arg);
+        }
+        let e = unsafe { &mut *(arg as *mut Exec) };
+        let pushes = unsafe {
+            core::slice::from_raw_parts(e.push_ptr as *const [u64; 2], e.push_count as usize)
+        };
+        let waits = match e.wait_count {
+            0 => &[][..],
+            n => unsafe { core::slice::from_raw_parts(e.wait_ptr as *const [u32; 4], n as usize) },
+        };
+        let refuse = e.channel == 99;
+        e.channel = pushes.iter().map(|p| p[0] as u32).sum::<u32>()
+            + waits.iter().map(|w| w[1]).sum::<u32>();
+        if refuse {
+            return Err(16);
+        }
+        Ok(7)
+    }
+    fn nouveau_file_closed(&self, file: usize) {
+        self.told.lock().push(("closed", file as u64));
+    }
+    fn nouveau_release_process(&self, pid: u64) {
+        self.told.lock().push(("released", pid));
+    }
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
         (id == 50).then(|| {
             let mut e = [0u8; 128];
@@ -168,8 +219,15 @@ impl DrmScheme for Card {
 }
 
 /// The transport of the test: the message goes to `answer` at once.
-/// With each answer, the flags, as the driver's process sends them.
-struct Direct(Arc<Card>);
+/// With each answer, the flags, as the driver's process sends them. The
+/// caller's memory is this process's, and its writes are counted.
+struct Direct(Arc<Card>, AtomicU32);
+
+impl Direct {
+    fn new(card: Arc<Card>) -> Self {
+        Direct(card, AtomicU32::new(0))
+    }
+}
 
 impl Transport for Direct {
     fn call(&self, op: u32, a: u64, b: u64, data: &[u8]) -> Result<(u64, Vec<u8>), i32> {
@@ -178,6 +236,17 @@ impl Transport for Direct {
     }
     fn flags(&self) -> Option<Flags> {
         Some(Flags::of(&*self.0))
+    }
+    fn read_user(&self, addr: usize, len: usize) -> Result<Vec<u8>, i32> {
+        if addr == 0 {
+            return Err(ioctl::EFAULT);
+        }
+        Ok(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }.to_vec())
+    }
+    fn write_user(&self, addr: usize, bytes: &[u8]) -> Result<(), i32> {
+        self.1.fetch_add(1, Ordering::Relaxed);
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+        Ok(())
     }
 }
 
@@ -192,7 +261,7 @@ impl Transport for Gone {
 
 fn pair() -> (Arc<Card>, Remote<Direct>) {
     let card = Arc::new(Card::default());
-    let remote = Remote::new(Direct(card.clone())).expect("the card says who it is");
+    let remote = Remote::new(Direct::new(card.clone())).expect("the card says who it is");
     (card, remote)
 }
 
@@ -341,4 +410,135 @@ fn a_message_that_does_not_parse_is_einval() {
     // A list that claims more than the bytes hold.
     let mut i = In(&[0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0]);
     assert_eq!(i.list(), None);
+}
+
+/// An EXEC as a caller makes it: the struct and its arrays in its memory.
+fn exec_of(pushes: &[[u64; 2]], waits: &[[u32; 4]]) -> Exec {
+    Exec {
+        push_count: pushes.len() as u32,
+        wait_count: waits.len() as u32,
+        push_ptr: pushes.as_ptr() as u64,
+        wait_ptr: if waits.is_empty() {
+            0
+        } else {
+            waits.as_ptr() as u64
+        },
+        ..Exec::default()
+    }
+}
+
+#[test]
+fn an_ioctl_reaches_the_driver_with_its_struct_and_arrays_and_comes_back() {
+    let (card, remote) = pair();
+    let pushes = [[3u64, 0], [4, 0]];
+    let waits = [[0u32, 10, 0, 0]];
+    let mut e = exec_of(&pushes, &waits);
+    let asked = e;
+    let arg = &mut e as *mut Exec as usize;
+    assert_eq!(remote.ioctl_file(EXEC, arg, 77, 0xf11e), Ok(7));
+    // The driver wrote the sum into the caller's struct; every pointer
+    // there is still the caller's own.
+    assert_eq!(
+        e,
+        Exec {
+            channel: 17,
+            ..asked
+        }
+    );
+    let (cmd, pid, file, at) = card.asked.lock().unwrap();
+    assert_eq!((cmd, pid, file), (EXEC, 77, 0xf11e));
+    // The driver was handed its own copy, not the caller's address.
+    assert_ne!(at, arg);
+}
+
+#[test]
+fn what_the_driver_writes_before_an_error_still_reaches_the_caller() {
+    let (_, remote) = pair();
+    let pushes = [[5u64, 0]];
+    let mut e = Exec {
+        channel: 99,
+        ..exec_of(&pushes, &[])
+    };
+    assert_eq!(remote.ioctl(EXEC, &mut e as *mut Exec as usize), Err(16));
+    assert_eq!(e.channel, 5);
+}
+
+#[test]
+fn a_struct_the_driver_left_alone_is_not_written_back() {
+    let (_, remote) = pair();
+    // `_IOW('d', 0x50, u64)`: a struct the test card does not touch.
+    let cmd = 0x4008_6450;
+    let word = 0x1234u64;
+    let arg = &word as *const u64 as usize;
+    // The card answers the address it was handed: the copy's.
+    assert!(remote.ioctl(cmd, arg).is_ok());
+    assert_eq!(remote.transport().1.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_command_with_no_struct_hands_its_word_through() {
+    let (card, remote) = pair();
+    // `_IO('d', 0x50)`: no struct, the argument is a value.
+    assert_eq!(remote.ioctl(0x6450, 0xabcd), Ok(0xabcd));
+    assert_eq!(card.asked.lock().unwrap().3, 0xabcd);
+}
+
+#[test]
+fn an_array_with_a_count_and_no_pointer_is_efault_before_the_driver() {
+    let (card, remote) = pair();
+    let mut e = Exec {
+        push_count: 1,
+        ..Exec::default()
+    };
+    assert_eq!(
+        remote.ioctl(EXEC, &mut e as *mut Exec as usize),
+        Err(ioctl::EFAULT)
+    );
+    assert!(card.asked.lock().is_none());
+}
+
+#[test]
+fn a_message_short_of_its_arrays_is_refused_and_writes_nothing() {
+    let card = Card::default();
+    let e = Exec {
+        push_count: 2,
+        push_ptr: 0x1000,
+        ..Exec::default()
+    };
+    let top = unsafe {
+        core::slice::from_raw_parts(&e as *const Exec as *const u8, core::mem::size_of::<Exec>())
+    };
+    let mut msg = vec![0u8; 16];
+    msg.extend_from_slice(top);
+    msg.extend_from_slice(&[0u8; 16]); // one push of the two
+    let mut out = Vec::new();
+    answer(&card, op::IOCTL, EXEC as u64, 1, &msg, &mut out).unwrap();
+    assert_eq!(
+        i64::from_le_bytes(out[..8].try_into().unwrap()),
+        -(EINVAL as i64)
+    );
+    assert_eq!(&out[8..], top);
+    assert!(card.asked.lock().is_none());
+}
+
+#[test]
+fn a_closed_file_and_a_gone_process_are_told_to_the_driver() {
+    let (card, remote) = pair();
+    remote.nouveau_file_closed(0xf11e);
+    remote.nouveau_release_process(42);
+    assert_eq!(
+        *card.told.lock(),
+        vec![("closed", 0xf11e), ("released", 42)]
+    );
+}
+
+#[test]
+fn an_ioctl_to_a_gone_driver_is_its_errno() {
+    let remote = Remote::with_hello(Gone, &hello(&Card::default())).unwrap();
+    let word = 0u64;
+    assert_eq!(
+        remote.ioctl(0x4008_6450, &word as *const u64 as usize),
+        Err(ioctl::EFAULT)
+    );
+    assert_eq!(remote.ioctl(0x6450, 1), Err(ENODEV));
 }
