@@ -185,6 +185,7 @@ pub(crate) fn wipe_stack_pool_for_test() {
     use core::sync::atomic::Ordering;
     *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
     RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
+    RETIRED_PENDING_CPUS.store(0, Ordering::SeqCst);
     for slot in STACK_POOL.iter() {
         slot.store(0, Ordering::SeqCst);
     }
@@ -1208,6 +1209,20 @@ static RETIRED_STACKS: spin::Mutex<[RetiredStack; RETIRED_STACKS_CAP]> =
 /// conjunto reclamado con el del recorrido entero.
 static RETIRED_OCCUPIED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// CPUs que algun hueco de [`RETIRED_STACKS`] puede estar esperando todavia.
+///
+/// Un **superconjunto** de la union de los `pending_cpus` de la tabla: los bits
+/// se encienden bajo el cerrojo al aparcar un bloque, y cada CPU apaga el suyo
+/// bajo el cerrojo al terminar un barrido que lo ha quitado de todos los
+/// huecos. Un bit encendido de mas solo cuesta tomar el cerrojo una vez; uno
+/// apagado de menos no puede pasar, porque nadie lo apaga sin haber barrido.
+///
+/// Sirve para que [`note_cpu_quiescent_between_polls`] pueda llamarse en
+/// **cada** vuelta del bucle de `Executor::run` sin tocar el cerrojo global:
+/// sin nada que esperar de esta CPU es una lectura de una linea de cache que
+/// casi nunca se escribe.
+static RETIRED_PENDING_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Register the quarantine protect/unprotect hooks (kernel-hal, bare-metal).
 ///
 /// # Safety
@@ -1459,6 +1474,11 @@ fn observe_cpu_quiescent_locked(
         *slot = RetiredStack::EMPTY;
         RETIRED_OCCUPIED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
+    // Este barrido ha quitado el bit de `cpu` de todos los huecos: ya no hay
+    // nada en la tabla que lo espere (ver [`RETIRED_PENDING_CPUS`]).
+    if bit != 0 {
+        RETIRED_PENDING_CPUS.fetch_and(!bit, core::sync::atomic::Ordering::Relaxed);
+    }
     batch
 }
 
@@ -1466,6 +1486,31 @@ fn observe_cpu_quiescent_locked(
 fn reclaim_batch(batch: &mut ReclaimBatch) {
     for slot in batch.stacks[..batch.len].iter_mut() {
         reclaim_retired_stack(slot);
+    }
+}
+
+/// [`note_cpu_quiescent`] for the top of `Executor::run`'s loop, between two
+/// polls: takes the global lock only when some retired block may still be
+/// waiting on this CPU.
+///
+/// Between two polls this CPU stands on its own executor's stack, which it
+/// holds claimed (so it is not a retired block: `Drop` leaks a claimed stack
+/// instead of retiring it), and the only way it resumes a parked frame is the
+/// `switch` in `run_until_idle`, which it has left. The same argument as the
+/// halt point further down the same loop, already a quiescent point.
+///
+/// It has to be one: a CPU that always has another task to poll never halts,
+/// and polls that never run past their time slice never send it back to
+/// `run_until_idle` either. Such a CPU kept its bit in every retired block's
+/// `pending_cpus` for as long as it stayed busy, the 1024-slot table filled
+/// about two minutes after boot on a 20-CPU desktop, and every stack freed
+/// after that was leaked whole (`[stack-retire] retired-stack table full`).
+#[inline]
+pub(crate) fn note_cpu_quiescent_between_polls(cpu: usize) {
+    if cpu < 64
+        && RETIRED_PENDING_CPUS.load(core::sync::atomic::Ordering::Relaxed) & (1u64 << cpu) != 0
+    {
+        note_cpu_quiescent(cpu);
     }
 }
 
@@ -1573,6 +1618,7 @@ fn retire_stack_after_grace(
                 pending_cpus: pending,
             };
             RETIRED_OCCUPIED.fetch_add(1, Ordering::Relaxed);
+            RETIRED_PENDING_CPUS.fetch_or(pending, Ordering::Relaxed);
             return;
         }
     }
@@ -1581,8 +1627,11 @@ fn retire_stack_after_grace(
     if n <= 16 {
         error!(
             "[stack-retire] retired-stack table full while parking {:#x} (report {}/16) — \
-             leaking the block instead of returning it to the allocator before quiescence",
-            alloc_base, n
+             leaking the block instead of returning it to the allocator before quiescence \
+             (cpus not yet quiescent: {:#x})",
+            alloc_base,
+            n,
+            RETIRED_PENDING_CPUS.load(Ordering::Relaxed)
         );
     }
 }
@@ -2425,6 +2474,9 @@ impl Executor {
         // else's turn".
         crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_RESUMED);
         loop {
+            // Between two polls: a quiescent point for the retired-stack
+            // grace period. See `note_cpu_quiescent_between_polls`.
+            note_cpu_quiescent_between_polls(crate::arch::cpu_id() as usize);
             // Balance pull: a CPU that always has exactly one local task never
             // hits the idle steal below, so a peer sitting on a backlog stays
             // overloaded. Every 32 polls, if we have one runnable task and a
@@ -3367,6 +3419,7 @@ mod grace_period_tests {
             crate::runtime::set_executor_ready_mask_for_test(self.saved_ready);
             *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
             RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
+            RETIRED_PENDING_CPUS.store(0, Ordering::SeqCst);
             for slot in STACK_POOL.iter() {
                 slot.store(0, Ordering::SeqCst);
             }
@@ -3379,6 +3432,7 @@ mod grace_period_tests {
         let saved_ready = crate::runtime::set_executor_ready_mask_for_test(ready);
         *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
         RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
+        RETIRED_PENDING_CPUS.store(0, Ordering::SeqCst);
         for slot in STACK_POOL.iter() {
             slot.store(0, Ordering::SeqCst);
         }
@@ -3510,6 +3564,7 @@ mod grace_period_tests {
         // `RETIRED_OCCUPIED`. Sin esto el contador se queda en cero, el barrido
         // sale por la salida rapida y lo aparcado aqui no se reclama nunca.
         RETIRED_OCCUPIED.fetch_add(1, Ordering::SeqCst);
+        RETIRED_PENDING_CPUS.fetch_or(pending_cpus, Ordering::SeqCst);
         *slot = RetiredStack {
             alloc_base: base,
             hard_guard_bottom: true,
@@ -3820,6 +3875,16 @@ mod grace_period_tests {
                 "el contador se desincronizo en el paso {}",
                 step
             );
+            let waited = RETIRED_STACKS
+                .lock()
+                .iter()
+                .fold(0u64, |m, s| m | s.pending_cpus);
+            assert_eq!(
+                waited & !RETIRED_PENDING_CPUS.load(Ordering::SeqCst),
+                0,
+                "un hueco espera a una CPU que la mascara ya no tiene, paso {}",
+                step
+            );
         }
     }
 
@@ -3871,6 +3936,54 @@ mod grace_period_tests {
             !bounded.is_empty(),
             "ninguno de los dos reclamo nada: el test no prueba nada"
         );
+    }
+
+    /// Una CPU que nunca se queda sin trabajo ni agota su turno solo pasa por
+    /// la cima del bucle de `Executor::run`: ese punto basta para soltar lo
+    /// que la tabla le esperaba, y sin el, el bloque se quedaba aparcado para
+    /// siempre (en hardware real, la tabla llena a los dos minutos).
+    #[test]
+    fn a_cpu_that_only_polls_releases_what_waits_on_it() {
+        let _f = fresh(0b0111);
+        retire(0x3_0000_0000);
+        assert_eq!(parked(0x3_0000_0000), Some(0b0110));
+        assert_eq!(RETIRED_PENDING_CPUS.load(Ordering::SeqCst), 0b0110);
+
+        // Una CPU a la que nadie espera no toca la tabla.
+        note_cpu_quiescent_between_polls(3);
+        assert_eq!(parked(0x3_0000_0000), Some(0b0110));
+
+        note_cpu_quiescent_between_polls(1);
+        assert_eq!(parked(0x3_0000_0000), Some(0b0100));
+        assert_eq!(RETIRED_PENDING_CPUS.load(Ordering::SeqCst), 0b0100);
+        assert!(!pooled(0x3_0000_0000));
+
+        note_cpu_quiescent_between_polls(2);
+        assert!(pooled(0x3_0000_0000), "la CPU ocupada no solto el bloque");
+        assert_eq!(parked(0x3_0000_0000), None);
+        assert_eq!(RETIRED_PENDING_CPUS.load(Ordering::SeqCst), 0);
+        assert_eq!(RETIRED_OCCUPIED.load(Ordering::SeqCst), 0);
+    }
+
+    /// Mas bloques que huecos, retirados mientras dos CPUs solo hacen polls:
+    /// ninguno se pierde por tabla llena.
+    #[test]
+    fn busy_cpus_keep_the_table_from_filling() {
+        let _f = fresh(0b0111);
+        let leaked = RETIRED_OVERFLOW.load(Ordering::SeqCst);
+        for i in 0..(3 * RETIRED_STACKS_CAP) {
+            retire(0x4_0000_0000 + i * ALLOC_SIZE);
+            note_cpu_quiescent_between_polls(1);
+            note_cpu_quiescent_between_polls(2);
+            // El fondo es acotado; vaciarlo para no confundir "reclamado" con
+            // "no cabia en el fondo".
+            for slot in STACK_POOL.iter() {
+                slot.store(0, Ordering::SeqCst);
+            }
+            STACK_OVERFLOW.lock().clear();
+        }
+        assert_eq!(RETIRED_OVERFLOW.load(Ordering::SeqCst), leaked);
+        assert_eq!(RETIRED_OCCUPIED.load(Ordering::SeqCst), 0);
     }
 
     /// Y la salida rapida solo se toma con la tabla de verdad vacia: un bloque
