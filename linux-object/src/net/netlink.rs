@@ -8,7 +8,7 @@ use crate::{
     net::{
         shutdown_sides, AddressFamily, Endpoint, Socket, SocketType, SysResult, ARPHRD_ETHER,
         ARPHRD_LOOPBACK, IFF_BROADCAST, IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST,
-        IFF_NOARP, IFF_RUNNING, IFF_UP,
+        IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -301,7 +301,9 @@ impl Socket for NetlinkSocketState {
                             ARPHRD_ETHER
                         };
                         let ifi_flags = if is_loopback {
-                            IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP | IFF_LOWER_UP
+                            // `loopback_setup`: `dev->flags = IFF_LOOPBACK`, no
+                            // NOARP, so `ip link` shows `<LOOPBACK,UP,LOWER_UP>`.
+                            IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
                         } else {
                             // Always report RUNNING like v0.5.0. Gating on
                             // STATUS.LU made `ip link` show NO-CARRIER while
@@ -343,8 +345,13 @@ impl Socket for NetlinkSocketState {
                             );
                         }
 
-                        // MTU (best-effort default; drivers can expose real value later).
-                        push_rtattr_u32(&mut attrs, RouteAttrTypes::MTU.into(), 1500);
+                        // IFLA_MTU: the card's own, as SIOCGIFMTU says it
+                        // (65536 for `lo`, what a driver set for the rest).
+                        push_rtattr_u32(
+                            &mut attrs,
+                            RouteAttrTypes::MTU.into(),
+                            iface.get_mtu() as u32,
+                        );
 
                         // ifOperStatus: 6 == IF_OPER_UP.
                         push_rtattr_bytes(&mut attrs, RouteAttrTypes::OperState.into(), &[6u8]);

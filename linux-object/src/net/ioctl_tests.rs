@@ -129,6 +129,8 @@ fn an_ethernet_card_that_is_up_says_so() {
         IFF_UP | IFF_LOOPBACK | IFF_RUNNING
     );
     assert_eq!(flags & IFF_BROADCAST, 0, "lo has no broadcast");
+    // `ifconfig lo`: `flags=73<UP,LOOPBACK,RUNNING>`, no NOARP.
+    assert_eq!(flags, 73);
 }
 
 /// `ifconfig eth0 promisc up`, then `ifconfig eth0 down`: the card is told

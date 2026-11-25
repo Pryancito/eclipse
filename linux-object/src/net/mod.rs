@@ -1195,7 +1195,7 @@ fn net_ioctl_held(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let flags = if iface_by_name(ifname)?.is_loopback() {
-                IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_NOARP
+                IFF_UP | IFF_LOOPBACK | IFF_RUNNING
             } else {
                 // Do not hide the NIC behind STATUS.LU. udhcpc uses
                 // SIOCGIFFLAGS and waits forever without IFF_RUNNING if the
