@@ -643,9 +643,13 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
                 return Err(FsError::InvalidParam);
             }
             let [table, index] = user_copy(UserInPtr::<[u8; 2]>::from(data).read())?;
-            let value = linux_keycode_to_evdev(index)
-                .map(|evdev| kdgkbent_value(evdev, table))
-                .unwrap_or(0);
+            // `kb_index` is the keycode, and a console keycode is the input
+            // layer's: `drivers/tty/vt/keyboard.c` indexes its keymaps with
+            // the evdev number itself. This went through a table of 1-88
+            // that left out both Ctrls, both Shifts and Alt, and everything
+            // past 88, so every modifier and every cursor key read 0 and
+            // an X server that loads its keymap this way lost them.
+            let value = kdgkbent_value(u16::from(index), table);
             user_copy(UserOutPtr::<u16>::from(data + 2).write(value))?;
             Ok(0)
         }
@@ -1214,78 +1218,6 @@ fn translate_key(code: u16, mods: KeyMods) -> Option<KeySym> {
     }
 
     Some(KeySym::Char(c))
-}
-
-/// Map a Linux VT keycode (`kb_index` in `struct kbentry`) to evdev `KEY_*`.
-fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
-    use zcore_drivers::input::input_event_codes::key::*;
-    match kc {
-        1 => Some(KEY_ESC),
-        2 => Some(KEY_1),
-        3 => Some(KEY_2),
-        4 => Some(KEY_3),
-        5 => Some(KEY_4),
-        6 => Some(KEY_5),
-        7 => Some(KEY_6),
-        8 => Some(KEY_7),
-        9 => Some(KEY_8),
-        10 => Some(KEY_9),
-        11 => Some(KEY_0),
-        12 => Some(KEY_MINUS),
-        13 => Some(KEY_EQUAL),
-        14 => Some(KEY_BACKSPACE),
-        15 => Some(KEY_TAB),
-        16 => Some(KEY_Q),
-        17 => Some(KEY_W),
-        18 => Some(KEY_E),
-        19 => Some(KEY_R),
-        20 => Some(KEY_T),
-        21 => Some(KEY_Y),
-        22 => Some(KEY_U),
-        23 => Some(KEY_I),
-        24 => Some(KEY_O),
-        25 => Some(KEY_P),
-        26 => Some(KEY_LEFTBRACE),
-        27 => Some(KEY_RIGHTBRACE),
-        28 => Some(KEY_ENTER),
-        30 => Some(KEY_A),
-        31 => Some(KEY_S),
-        32 => Some(KEY_D),
-        33 => Some(KEY_F),
-        34 => Some(KEY_G),
-        35 => Some(KEY_H),
-        36 => Some(KEY_J),
-        37 => Some(KEY_K),
-        38 => Some(KEY_L),
-        39 => Some(KEY_SEMICOLON),
-        40 => Some(KEY_APOSTROPHE),
-        41 => Some(KEY_GRAVE),
-        43 => Some(KEY_BACKSLASH),
-        44 => Some(KEY_Z),
-        45 => Some(KEY_X),
-        46 => Some(KEY_C),
-        47 => Some(KEY_V),
-        48 => Some(KEY_B),
-        49 => Some(KEY_N),
-        50 => Some(KEY_M),
-        51 => Some(KEY_COMMA),
-        52 => Some(KEY_DOT),
-        53 => Some(KEY_SLASH),
-        57 => Some(KEY_SPACE),
-        59 => Some(KEY_F1),
-        60 => Some(KEY_F2),
-        61 => Some(KEY_F3),
-        62 => Some(KEY_F4),
-        63 => Some(KEY_F5),
-        64 => Some(KEY_F6),
-        65 => Some(KEY_F7),
-        66 => Some(KEY_F8),
-        67 => Some(KEY_F9),
-        68 => Some(KEY_F10),
-        87 => Some(KEY_F11),
-        88 => Some(KEY_F12),
-        _ => None,
-    }
 }
 
 /// Build the `kb_value` for a `KDGKBENT` query (kdrive/TinyX keymap loader).
