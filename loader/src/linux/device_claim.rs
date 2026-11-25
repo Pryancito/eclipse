@@ -315,6 +315,13 @@ impl Held {
             *holder != self.holder || bti.upgrade().is_some_and(|b| !Arc::ptr_eq(&b, &self.bti))
         });
         self.silence();
+        // Its fences can never land: their waiters are let go, and the
+        // kernel stops reading their landing zones, before those are
+        // anyone else's.
+        let fences = super::syncobj_serve::driver_gone(self.holder);
+        if fences > 0 {
+            info!("udriver: {kind} #{index}: {fences} fences of its driver abandoned");
+        }
         // GEM objects it named are in memory it pinned, and a client may
         // still have one mapped: the pins stay, for good, so that memory
         // is never anyone else's while a mapping of it lives.

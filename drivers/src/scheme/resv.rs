@@ -31,9 +31,44 @@
 //! `CPU_PREP` for reading, a scanout) waits for the WRITE fences only; a
 //! **writer** waits for READ and WRITE alike.
 
+// A driver in a process asks the kernel's reservations (`remote`); the
+// rest of this is the kernel's alone.
+#![cfg_attr(feature = "process", allow(dead_code, unused_imports))]
+
 use super::syncobj;
 use alloc::vec::Vec;
 use lock::Mutex;
+
+#[cfg(feature = "process")]
+pub use remote::*;
+
+/// The reservations of a driver in a process are the kernel's: what it
+/// asks of them, it asks the kernel (`syncobj::wire`).
+#[cfg(feature = "process")]
+mod remote {
+    use crate::scheme::syncobj::remote::{call, list};
+    use crate::scheme::syncobj::wire::{RESV_FENCES, RESV_FORGET};
+    use alloc::vec::Vec;
+
+    pub fn fences(phys: u64, write: bool) -> Vec<(u32, u64)> {
+        list(RESV_FENCES, &[phys, write as u64], 2)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| (f[0] as u32, f[1]))
+            .collect()
+    }
+
+    pub fn forget(phys: u64) {
+        if let Err(e) = call(RESV_FORGET, &[phys], &mut []) {
+            log::warn!(
+                "[resv] the kernel refused to forget {:#x} (errno {})",
+                phys,
+                e
+            );
+        }
+    }
+}
 
 /// One imported fence: "`carrier` reaches 1".
 struct Entry {
@@ -57,6 +92,7 @@ pub(crate) fn reset_for_tests() {
 /// `dma_resv_add_fence`: the buffer at `phys` now carries the fence "`src`
 /// reaches `point`", as a write into it when `write`. Returns `false` when
 /// `src` is not a live syncobj.
+#[cfg(not(feature = "process"))]
 pub fn add_fence(phys: u64, src: u32, point: u64, write: bool) -> bool {
     let carrier = syncobj::create(false);
     if !syncobj::transfer(carrier, 1, src, point) {
@@ -82,6 +118,7 @@ pub fn add_fence(phys: u64, src: u32, point: u64, write: bool) -> bool {
 /// **reader** has to wait for, as `(syncobj, point)` pairs. A reader waits
 /// for the writes only (`DMA_RESV_USAGE_WRITE`); a writer for every fence
 /// (`DMA_RESV_USAGE_READ`). Fences that have signaled are dropped on the way.
+#[cfg(not(feature = "process"))]
 pub fn fences(phys: u64, write: bool) -> Vec<(u32, u64)> {
     let (out, gone) = {
         let mut list = RESV.lock();
@@ -98,6 +135,7 @@ pub fn fences(phys: u64, write: bool) -> Vec<(u32, u64)> {
 }
 
 /// How many fences, of either usage, the buffer at `phys` still carries.
+#[cfg(not(feature = "process"))]
 pub fn count(phys: u64) -> usize {
     let (n, gone) = {
         let mut list = RESV.lock();
@@ -113,6 +151,7 @@ pub fn count(phys: u64) -> usize {
 /// buffer: its carrier stays in the syncobj table as an orphan until the
 /// source signals ([`syncobj::destroy`]'s orphan rule), as a `dma_fence`
 /// outlives the reservation that held it.
+#[cfg(not(feature = "process"))]
 pub fn forget(phys: u64) {
     let gone: Vec<u32> = {
         let mut list = RESV.lock();
@@ -133,6 +172,7 @@ pub fn forget(phys: u64) {
 /// Pull out the entries whose fence has signaled (or whose syncobj is
 /// gone). Callers hold the list lock; the carriers go to [`release`] once it
 /// is dropped.
+#[cfg(not(feature = "process"))]
 fn take_reached(list: &mut Vec<Entry>) -> Vec<u32> {
     let mut gone = Vec::new();
     list.retain(|e| {
@@ -145,6 +185,7 @@ fn take_reached(list: &mut Vec<Entry>) -> Vec<u32> {
     gone
 }
 
+#[cfg(not(feature = "process"))]
 fn release(carriers: Vec<u32>) {
     for c in carriers {
         syncobj::destroy(c);
