@@ -481,3 +481,6 @@ mod clone_unwind_tests;
 /// mode and its own thread area. Own file, own subject.
 #[cfg(test)]
 mod thread_context_tests;
+
+#[cfg(test)]
+mod file_io_tests;
