@@ -2801,6 +2801,16 @@ async fn handle_user_trap(
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
             let mut fault_result = vmar.handle_page_fault(vaddr, flags);
+            // PROTOTYPE: under frame fault injection, an injected miss is
+            // retried before the OOM killer is asked, so the experiment
+            // measures the kernel's failure paths, not the killer's choice.
+            if kernel_hal::mem::failpage::enabled() {
+                let mut tries = 0;
+                while fault_result == Err(ZxError::NO_MEMORY) && tries < 16 {
+                    tries += 1;
+                    fault_result = vmar.handle_page_fault(vaddr, flags);
+                }
+            }
             // No frame for the page: the OOM killer frees memory by badness
             // and the fault is taken again (`pagefault_out_of_memory`), as in
             // Linux. Before, the thread that touched the page got SIGSEGV,

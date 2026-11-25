@@ -122,3 +122,74 @@ lazy_static! {
     /// The global physical frame contains all zeros.
     pub static ref ZERO_FRAME: PhysFrame = PhysFrame::new_zero().expect("failed to alloc zero frame");
 }
+
+/// PROTOTYPE (measurement only): frame-allocation fault injection, like
+/// Linux's `fail_page_alloc`. `FAILPAGE=N` fails about one frame allocation
+/// in N; `FAILPAGEK=1` extends it from user frames to kernel ones. Off (0)
+/// unless the cmdline asks.
+pub mod failpage {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static EVERY: AtomicU64 = AtomicU64::new(0);
+    static KERNEL: AtomicBool = AtomicBool::new(false);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static INJECTED_USER: AtomicU64 = AtomicU64::new(0);
+    static INJECTED_KERNEL: AtomicU64 = AtomicU64::new(0);
+    static START_NS: AtomicU64 = AtomicU64::new(0);
+    static END_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn set_end_ns(ns: u64) {
+        END_NS.store(ns, Ordering::Relaxed);
+    }
+    pub fn set_start_ns(ns: u64) {
+        START_NS.store(ns, Ordering::Relaxed);
+    }
+    pub fn set(every: u64, kernel: bool) {
+        KERNEL.store(kernel, Ordering::Relaxed);
+        EVERY.store(every, Ordering::Relaxed);
+    }
+    pub fn enabled() -> bool {
+        EVERY.load(Ordering::Relaxed) != 0
+    }
+    #[inline]
+    fn roll() -> bool {
+        let n = EVERY.load(Ordering::Relaxed);
+        if n == 0 {
+            return false;
+        }
+        let start = START_NS.load(Ordering::Relaxed);
+        let end = END_NS.load(Ordering::Relaxed);
+        if start != 0 || end != 0 {
+            let now = crate::timer::timer_now().as_nanos() as u64;
+            if now < start || (end != 0 && now >= end) {
+                return false;
+            }
+        }
+        let mut x = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        x % n == 0
+    }
+    pub fn user() -> bool {
+        let hit = roll();
+        if hit {
+            INJECTED_USER.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+    pub fn kernel() -> bool {
+        if !KERNEL.load(Ordering::Relaxed) {
+            return false;
+        }
+        let hit = roll();
+        if hit {
+            INJECTED_KERNEL.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+    pub fn stats() -> (u64, u64) {
+        (
+            INJECTED_USER.load(Ordering::Relaxed),
+            INJECTED_KERNEL.load(Ordering::Relaxed),
+        )
+    }
+}
