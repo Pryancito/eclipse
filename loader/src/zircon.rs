@@ -1866,3 +1866,203 @@ mod syscall_abi_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod boot_tests {
+    //! The pieces of `run_userboot` that decide something before userboot runs:
+    //! which userboot the ZBI asks for, how big a stack it gets, and what the
+    //! vDSO's clock page says when this machine has no TSC userspace can read
+    //! (every host test, and QEMU under TCG). Each on the blobs that ship.
+
+    use super::*;
+    use alloc::vec;
+
+    /// A ZBI container of `CMDLINE` items, laid out as `for_each_zbi_cmdline`
+    /// reads one: a 32-byte container header, then each item's 32-byte header
+    /// and its payload padded to 8.
+    fn zbi(cmdlines: &[&str]) -> Vec<u8> {
+        let mut out = vec![0u8; ZBI_HEADER_SIZE];
+        for line in cmdlines {
+            let mut header = [0u8; ZBI_HEADER_SIZE];
+            header[0..4].copy_from_slice(&ZBI_TYPE_CMDLINE.to_le_bytes());
+            header[4..8].copy_from_slice(&(line.len() as u32).to_le_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(line.as_bytes());
+            out.resize((out.len() + 7) & !7, 0);
+        }
+        let len = (out.len() - ZBI_HEADER_SIZE) as u32;
+        out[4..8].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn the_test_userboot_is_chosen_only_when_the_zbi_asks_for_it() {
+        assert!(zbi_selects_test_userboot(&zbi(&[
+            "kernel.select.userboot=userboot-test.so"
+        ])));
+        assert!(!zbi_selects_test_userboot(&zbi(&[
+            "kernel.select.userboot=userboot.so"
+        ])));
+        assert!(!zbi_selects_test_userboot(&zbi(&["console=ttyS0"])));
+        assert!(!zbi_selects_test_userboot(&zbi(&[])));
+        // A word that merely ends in the option is not the option.
+        assert!(!zbi_selects_test_userboot(&zbi(&[
+            "xkernel.select.userboot=userboot-test"
+        ])));
+        // The last one said wins, across items as across words.
+        assert!(!zbi_selects_test_userboot(&zbi(&[
+            "kernel.select.userboot=userboot-test",
+            "kernel.select.userboot=userboot",
+        ])));
+        assert!(zbi_selects_test_userboot(&zbi(&[
+            "kernel.select.userboot=userboot kernel.select.userboot=userboot-test"
+        ])));
+        // A container too short to have a header asks for nothing.
+        assert!(!zbi_selects_test_userboot(&[0u8; 8]));
+    }
+
+    #[test]
+    fn a_container_whose_items_run_past_its_end_is_read_no_further() {
+        let mut z = zbi(&["kernel.select.userboot=userboot-test"]);
+        // The item claims more payload than the container holds.
+        z[ZBI_HEADER_SIZE + 4..ZBI_HEADER_SIZE + 8].copy_from_slice(&4096u32.to_le_bytes());
+        assert!(!zbi_selects_test_userboot(&z));
+        // And a container that claims more than there is.
+        let mut z = zbi(&["kernel.select.userboot=userboot-test"]);
+        z[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!zbi_selects_test_userboot(&z));
+    }
+
+    #[test]
+    fn userboot_gets_the_stack_its_elf_asks_for_in_whole_pages() {
+        for (name, blob) in [
+            ("userboot", &boot_library!("userboot")[..]),
+            ("userboot-test", boot_library!("userboot-test")),
+        ] {
+            let elf = ElfFile::new(blob).expect(name);
+            let size = elf_stack_size(&elf);
+            assert_eq!(
+                size % PAGE_SIZE,
+                0,
+                "{}: {:#x} is not whole pages",
+                name,
+                size
+            );
+            let asked = elf
+                .program_iter()
+                .find(|ph| ph.get_type() == Ok(xmas_elf::program::Type::OsSpecific(0x6474_e551)))
+                .map(|ph| ph.mem_size() as usize)
+                .filter(|s| *s != 0);
+            match asked {
+                Some(asked) => assert!(
+                    size >= asked && size - asked < PAGE_SIZE,
+                    "{}: asked {:#x}, given {:#x}",
+                    name,
+                    asked,
+                    size
+                ),
+                None => assert_eq!(size, 256 * 1024, "{}: Zircon's default", name),
+            }
+        }
+    }
+
+    /// The vDSO as a VMO, the way `run_userboot` makes one.
+    fn vdso_vmo(vdso: &[u8]) -> Arc<VmObject> {
+        let vmo = VmObject::new_paged(vdso.len() / PAGE_SIZE + 1);
+        vmo.write(0, vdso).unwrap();
+        vmo
+    }
+
+    fn bytes_of(vmo: &VmObject, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        vmo.read(0, &mut out).unwrap();
+        out
+    }
+
+    fn time_values(vdso: &[u8], vmo: &VmObject) -> (u64, u64, u64, u32, u32) {
+        let base = ElfFile::new(vdso)
+            .unwrap()
+            .get_symbol_address("DATA_TIME_VALUES")
+            .expect("the vDSO has its clock page") as usize;
+        let mut page = [0u8; 0x28];
+        vmo.read(base, &mut page).unwrap();
+        let u64_at = |o: usize| u64::from_ne_bytes(page[o..o + 8].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_ne_bytes(page[o..o + 4].try_into().unwrap());
+        (
+            u64_at(0x08),
+            u64_at(0x10),
+            u64_at(0x18),
+            u32_at(0x20),
+            u32_at(0x24),
+        )
+    }
+
+    #[test]
+    fn without_a_usable_tsc_the_clock_page_says_nanoseconds_and_the_calls_go_to_the_kernel() {
+        assert!(
+            kernel_hal::timer::vdso_tsc_ratio().is_none(),
+            "the host HAL has no TSC for userspace"
+        );
+        for (name, vdso) in [
+            ("libzircon", &boot_library!("libzircon")[..]),
+            ("libzircon-libos", boot_library!("libzircon-libos")),
+        ] {
+            let vmo = vdso_vmo(vdso);
+            write_vdso_time_values(vdso, &vmo, "");
+            // One tick is one nanosecond, the unit the kernel answers in, with
+            // the identity scale: a denominator of zero (the blob's `ud2`) and
+            // the shipped marker are both gone.
+            assert_eq!(
+                time_values(vdso, &vmo),
+                (1_000_000_000, 0, 0, 1, 1),
+                "{}: the clock page",
+                name
+            );
+            // And the entry points were pointed at the kernel's stubs: the image
+            // changed beyond the page.
+            let page = ElfFile::new(vdso)
+                .unwrap()
+                .get_symbol_address("DATA_TIME_VALUES")
+                .unwrap() as usize;
+            let after = bytes_of(&vmo, vdso.len());
+            let changed: Vec<usize> = (0..vdso.len()).filter(|&i| after[i] != vdso[i]).collect();
+            assert!(
+                changed.iter().any(|&i| !(page..page + 0x28).contains(&i)),
+                "{}: the time entry points were left reading the page",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_clock_off_leaves_the_vdso_exactly_as_it_shipped() {
+        let vdso = boot_library!("libzircon");
+        let vmo = vdso_vmo(vdso);
+        // The kernel command line is `KEY=value` pairs between colons.
+        write_vdso_time_values(vdso, &vmo, "LOG=warn:vdso.kernel_clock=off");
+        let after = bytes_of(&vmo, vdso.len());
+        let first = (0..vdso.len()).find(|&i| after[i] != vdso[i]);
+        assert_eq!(first, None, "the hatch wrote to the vDSO");
+    }
+
+    #[test]
+    fn a_vdso_that_is_not_an_elf_is_not_redirected() {
+        let junk = vec![0x5au8; 4096];
+        let vmo = vdso_vmo(&junk);
+        assert!(!redirect_vdso_time_to_kernel(&junk, &vmo));
+        assert!(bytes_of(&vmo, junk.len()) == junk);
+    }
+
+    #[test]
+    fn the_kernel_counters_reach_userboot_as_named_vmos_with_a_valid_header() {
+        let (desc, arena) = kcounter_vmos();
+        assert_eq!(desc.name(), "counters/desc");
+        assert_eq!(arena.name(), "counters/arena");
+        use zircon_object::util::kcounter::DescriptorVmoHeader;
+        let mut header = [0u8; core::mem::size_of::<DescriptorVmoHeader>()];
+        desc.read(0, &mut header).unwrap();
+        let shipped: [u8; core::mem::size_of::<DescriptorVmoHeader>()] =
+            unsafe { core::mem::transmute(DescriptorVmoHeader::default()) };
+        assert_eq!(header, shipped);
+    }
+}
