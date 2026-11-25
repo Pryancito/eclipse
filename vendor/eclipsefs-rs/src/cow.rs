@@ -185,6 +185,15 @@ pub struct CowFs {
     /// The subvolume mounted as `/`.
     default_subvol: u64,
     read_only: bool,
+    /// A commit failed while writing the tree nodes of its transaction.
+    /// Those nodes are no longer dirty (the store started the next
+    /// transaction when it handed them over) and may be gone from the cache
+    /// too, so a later commit would point the superblock at blocks that
+    /// never reached the disk. Like a Linux transaction abort: every commit
+    /// and fsync of this mount fails from here on, the unmount writes
+    /// nothing, and the next mount starts from the last commit (and its
+    /// fsync log), which is still whole on the disk.
+    aborted: bool,
     nested: bool,
     /// A write that must not stop short ([`write_atomic`](Self::write_atomic)
     /// checked the room up front, and its size is bounded).
@@ -589,6 +598,7 @@ impl CowFs {
             subvols: BTreeMap::new(),
             default_subvol: subvol,
             read_only,
+            aborted: false,
             nested: false,
             atomic: false,
             pending_ops: 0,
@@ -793,6 +803,9 @@ impl CowFs {
 
     /// Commit the open transaction.
     fn flush(&mut self) -> Result<()> {
+        if self.aborted {
+            return Err(Error::Io);
+        }
         self.pending_ops = 0;
         self.compress_pending()?;
         let changed = self.st.dirty_count() > 0
@@ -863,8 +876,14 @@ impl CowFs {
         self.store_root(CSUM_TREE, self.csum_root)?;
         // New nodes first, made durable before the superblock points at them.
         let nodes = self.st.take_dirty();
-        write_home(&*self.raw, &nodes)?;
-        self.raw.sync()?;
+        if let Err(e) = write_home(&*self.raw, &nodes).and_then(|_| self.raw.sync()) {
+            warn!(
+                "eclipsefs: writing the tree nodes of a commit failed ({:?}); no more commits on this mount",
+                e
+            );
+            self.aborted = true;
+            return Err(e);
+        }
         // Superblock, bitmaps and their checksums, atomically through the
         // journal.
         self.place_bitmap_sums()?;
@@ -5041,7 +5060,7 @@ impl CowFs {
 
 impl Drop for CowFs {
     fn drop(&mut self) {
-        if !self.read_only {
+        if !self.read_only && !self.aborted {
             if let Err(e) = self.flush().and_then(|_| self.raw.sync()) {
                 warn!("eclipsefs: commit on unmount failed: {:?}", e);
             }

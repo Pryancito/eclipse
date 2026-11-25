@@ -392,6 +392,11 @@ impl CowFs {
         if self.read_only {
             return Ok(());
         }
+        // A record is written against the last commit and replayed on top
+        // of it; after an aborted commit nothing new may be promised.
+        if self.aborted {
+            return Err(Error::Io);
+        }
         let (sv, ino) = split(h);
         let state = match self.log.inodes.get(&(sv, ino)) {
             // Nothing since the last commit or record, both flushed.
@@ -700,6 +705,13 @@ impl CowFs {
             let rec = match self.read_record(area + pos, end, seq) {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
+                // The device did not answer: that says nothing about the
+                // record, which may be whole. Ending the log here would
+                // replay only the records before it and commit, which makes
+                // the rest obsolete: fsynced data lost to a transient read
+                // error at boot. Fail the mount instead; the log is still
+                // there for the next one.
+                Err(Error::Io) => return Err(Error::Io),
                 Err(e) => {
                     warn!("eclipsefs: fsync log record {} unreadable: {:?}", seq, e);
                     break;
@@ -732,10 +744,17 @@ impl CowFs {
         let cur = self.subvol;
         for &(sv, ino) in merged.keys() {
             self.enter(sv)?;
-            if self.inode(ino).is_err() {
-                warn!("eclipsefs: fsync log names a missing inode, not replayed");
-                self.enter(cur)?;
-                return Ok(0);
+            match self.inode(ino) {
+                Ok(_) => {}
+                // Same as above: an inode the device could not read is not
+                // a missing one, and judging the log invalid for it would
+                // let the next commit throw the log away.
+                Err(Error::Io) => return Err(Error::Io),
+                Err(_) => {
+                    warn!("eclipsefs: fsync log names a missing inode, not replayed");
+                    self.enter(cur)?;
+                    return Ok(0);
+                }
             }
         }
         if claim
