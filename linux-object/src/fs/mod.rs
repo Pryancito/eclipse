@@ -193,7 +193,7 @@ pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::
     }
     None
 }
-pub use eventfd::EventFd;
+pub use eventfd::{wait_for_write_room, EventFd};
 pub use file::{
     cache_truncate, fs_grow_error, sync_shared_file_vmo, File, OpenFlags, PollEvents, SeekFrom,
 };
