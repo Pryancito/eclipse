@@ -33,7 +33,9 @@ pub use structs::*;
 // would leak `std` into the kernel's no_std build under the workspace's
 // resolver 1, so say what to type instead of failing on a missing impl.
 #[cfg(all(test, not(feature = "std")))]
-compile_error!("rcore-fs-sfs tests need `--features std`: cargo test -p rcore-fs-sfs --features std");
+compile_error!(
+    "rcore-fs-sfs tests need `--features std`: cargo test -p rcore-fs-sfs --features std"
+);
 #[cfg(all(test, feature = "std"))]
 mod dot_tests;
 #[cfg(all(test, feature = "std"))]
