@@ -386,3 +386,56 @@ async fn the_copy_walks_forward_on_both_ends_across_reads() {
     assert_eq!(dst.read_at(0, &mut out).await.unwrap(), 24);
     assert_eq!(out, bytes(24), "the output is not the input, in order");
 }
+
+/// `/dev/zero` and `/dev/null` in one: reads fill nothing and never end,
+/// writes take everything.
+struct Endless {
+    base: KObjectBase,
+    written: AtomicUsize,
+}
+
+impl_kobject!(Endless);
+
+#[async_trait::async_trait]
+impl FileLike for Endless {
+    fn flags(&self) -> OpenFlags {
+        OpenFlags::RDWR
+    }
+    fn set_flags(&self, _: OpenFlags) -> LxResult {
+        Ok(())
+    }
+    async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
+        Ok(buf.len())
+    }
+    fn write(&self, buf: &[u8]) -> LxResult<usize> {
+        self.written.fetch_add(buf.len(), Ordering::SeqCst);
+        Ok(buf.len())
+    }
+    async fn read_at(&self, _: u64, buf: &mut [u8]) -> LxResult<usize> {
+        Ok(buf.len())
+    }
+    fn poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+        Ok(PollStatus::default())
+    }
+    async fn async_poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+        Ok(PollStatus::default())
+    }
+}
+
+/// `sendfile(null, zero, NULL, huge)` copied until the count ran out, which
+/// for a count near 2^64 is never, with no signal able to stop it
+/// (tools/sysfuzz: a task at 100 % CPU with SIGALRM pending). Linux clamps
+/// to `MAX_RW_COUNT`, and so does this now.
+#[async_std::test]
+async fn a_huge_count_is_clamped_to_max_rw_count() {
+    let endless = Arc::new(Endless {
+        base: KObjectBase::new(),
+        written: AtomicUsize::new(0),
+    });
+    let f: Arc<dyn FileLike> = endless.clone();
+    let c = copy_range(&f, Some(0), &f, None, 0xe615_e4bf_a4fb_9e69, false)
+        .await
+        .unwrap();
+    assert_eq!(c.moved, 0x7fff_f000);
+    assert_eq!(endless.written.load(Ordering::SeqCst), 0x7fff_f000);
+}
