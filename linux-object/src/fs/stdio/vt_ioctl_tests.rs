@@ -153,6 +153,45 @@ fn kdgkbent_answers_in_the_entry_it_was_given() {
     );
 }
 
+fn kbent(table: u8, index: u8) -> u16 {
+    let mut entry = [table, index, 0xff, 0xff];
+    assert_eq!(
+        tty_ioctl(VT, KDGKBENT as u32, entry.as_mut_ptr() as usize),
+        Ok(0)
+    );
+    u16::from_ne_bytes([entry[2], entry[3]])
+}
+
+/// `kb_index` is the console keycode, which is the input layer's: the
+/// modifiers and the cursor keys are answered from their own tables, as
+/// `loadkeys` and a kdrive X server read them back. They all read 0.
+#[test]
+fn kdgkbent_answers_the_modifiers_and_the_cursor_keys() {
+    let _alone = SERIAL.lock();
+    // keycode, KT_SHIFT (7) or KT_CUR (6) or KT_SPEC (2) entry.
+    for (code, want, name) in [
+        (42u8, 0x0700u16, "Shift_L: K_SHIFT"),
+        (54, 0x0700, "Shift_R: K_SHIFT"),
+        (29, 0x0702, "Control_L: K_CTRL"),
+        (97, 0x0702, "Control_R: K_CTRL"),
+        (56, 0x0703, "Alt: K_ALT"),
+        (100, 0x0701, "AltGr: K_ALTGR"),
+        (108, 0x0600, "Down: K_DOWN"),
+        (105, 0x0601, "Left: K_LEFT"),
+        (106, 0x0602, "Right: K_RIGHT"),
+        (103, 0x0603, "Up: K_UP"),
+        (96, 0x0201, "KP_Enter: K_ENTER"),
+        (28, 0x0201, "Return: K_ENTER"),
+    ] {
+        assert_eq!(kbent(0, code), want, "{} (keycode {})", name, code);
+    }
+    // A letter is Latin, and the shift table gives its capital.
+    assert_eq!(kbent(0, 30), 0x0061, "a");
+    assert_eq!(kbent(1, 30), 0x0041, "A");
+    // Nothing bound (KEY_RESERVED) is still the zero it was.
+    assert_eq!(kbent(0, 0), 0);
+}
+
 /// What the VT layer says of itself: the VT the caller is on is the one
 /// `VT_OPENQRY` hands out, `VT_GETSTATE` counts VTs from 1 with bit 0
 /// unused, and a mode set with `VT_SETMODE` is the one `VT_GETMODE` reads.
