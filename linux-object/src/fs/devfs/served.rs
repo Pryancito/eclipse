@@ -47,7 +47,8 @@ use core::pin::Pin;
 use lock::Mutex;
 use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Result, Timespec};
 use zircon_object::ipc::Fifo;
-use zircon_object::vm::VmObject;
+use zircon_object::object::KernelObject;
+use zircon_object::vm::{VmAddressRegion, VmObject};
 
 pub use self::link::LEFT as SERVER_LEFT;
 use self::link::{Fail, Link};
@@ -421,8 +422,11 @@ impl ServedOpen {
             Vec::new()
         };
         let link = &self.node.link;
+        // The caller's memory, which the server may reach while it answers
+        // ([`asker_of`]): what NVIDIA's commands hold is pointers to more.
+        let asker = current_vmar();
         let mut answer = link
-            .call(OP_IOCTL, self.fh, 0, a, arg as u64, &data)
+            .call_for(asker.clone(), OP_IOCTL, self.fh, 0, a, arg as u64, &data)
             .map_err(lx_of)?;
         if answer.a != wire::IOCTL_FETCH {
             if out > 0 {
@@ -451,7 +455,7 @@ impl ServedOpen {
                 req.extend_from_slice(&bytes);
             }
             answer = link
-                .call(OP_IOCTL_IOV, self.fh, 0, a, arg as u64, &req)
+                .call_for(asker.clone(), OP_IOCTL_IOV, self.fh, 0, a, arg as u64, &req)
                 .map_err(lx_of)?;
             if answer.a == wire::IOCTL_FETCH {
                 continue;
@@ -685,11 +689,18 @@ pub fn serve(
     if !valid_name(name) || mode & !0o777 != 0 || major > 0xfff || minor > 0xff {
         return Err(LxError::EINVAL);
     }
+    let koid = fifo.id();
     let link = Arc::new(Link::new(fifo, window).map_err(|_| LxError::EINVAL)?);
-    let node = ServedNode::new(link, name, rcore_fs::vfs::make_rdev(major, minor), mode);
+    let node = ServedNode::new(
+        link.clone(),
+        name,
+        rcore_fs::vfs::make_rdev(major, minor),
+        mode,
+    );
     let root = crate::fs::DEVFS_ROOT.lock().clone();
     let root: Arc<dyn INode> = root.ok_or(LxError::ENODEV)?;
     add(&root, name, node.clone())?;
+    remember(koid, &link);
     info!("served dev: /dev/{name} ({major}:{minor})");
     input::attach(&node);
     Ok(Served { node })
@@ -746,4 +757,33 @@ pub fn unserve(node: &ServedNode) {
         let _ = d.remove(last);
         info!("served dev: /dev/{} is gone", node.name);
     }
+}
+
+/// The links of the nodes being served, by the kernel's end of each FIFO:
+/// how [`asker_of`] finds a request from the server's end.
+static LINKS: Mutex<BTreeMap<u64, Weak<Link>>> = Mutex::new(BTreeMap::new());
+
+fn remember(koid: u64, link: &Arc<Link>) {
+    let mut links = LINKS.lock();
+    // The links of servers that are gone go as new ones come.
+    links.retain(|_, l| l.strong_count() > 0);
+    links.insert(koid, Arc::downgrade(link));
+}
+
+/// The address space of the program whose `ioctl` is request `reqid` of
+/// the node served at the other end of `server_end`, while it waits for
+/// the answer. `None` for a FIFO that serves no node, or a request that is
+/// not waiting or lent no memory. Holding the server's end of the FIFO is
+/// the authority, as answering on it is.
+pub fn asker_of(server_end: &dyn KernelObject, reqid: u32) -> Option<Arc<VmAddressRegion>> {
+    let link = LINKS.lock().get(&server_end.related_koid())?.upgrade()?;
+    link.asker(reqid)
+}
+
+/// The address space of the process making this system call.
+fn current_vmar() -> Option<Arc<VmAddressRegion>> {
+    let thread = kernel_hal::thread::get_current_thread()?
+        .downcast::<zircon_object::task::Thread>()
+        .ok()?;
+    Some(thread.proc().vmar())
 }

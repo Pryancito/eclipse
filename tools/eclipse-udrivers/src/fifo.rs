@@ -47,6 +47,11 @@ impl<M: Message> Fifo<M> {
         ))
     }
 
+    /// The handle of this end.
+    pub fn handle(&self) -> Handle {
+        self.handle
+    }
+
     /// The end `handle` names: one that came from somewhere else, such as
     /// the end a driver gave away.
     pub fn from_handle(handle: Handle) -> Fifo<M> {

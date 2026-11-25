@@ -31,6 +31,11 @@ const QUIET: u32 = 0x5403;
 /// `_IO('T', 5)`: the byte of the device's memory at the argument.
 const PEEK: u32 = 0x5405;
 
+/// `_IOW('T', 6, {addr: u64, len: u64})`: the `len` bytes at `addr` in
+/// the caller's memory are upper-cased in place, followed there by the
+/// server as it goes (`served::caller_read`); returns how many.
+const SHOUT: u32 = 0x4010_5406;
+
 /// What a mapping of the device shows: its first page, writable, starts
 /// `eco`; its second, read-only, starts `solo`.
 const PAGE: usize = 4096;
@@ -130,6 +135,15 @@ impl Device for Echo {
             QUIET => {
                 self.quiet.insert(fh);
                 Ok((0, 0))
+            }
+            SHOUT => {
+                let word = |i: usize| u64::from_ne_bytes(data[i..i + 8].try_into().unwrap());
+                let (addr, len) = (word(0), word(8) as usize);
+                let mut text = vec![0u8; len.min(4096)];
+                let n = served::caller_read(addr, &mut text).map_err(|_| served::EFAULT)?;
+                text[..n].make_ascii_uppercase();
+                let put = served::caller_write(addr, &text[..n]).map_err(|_| served::EFAULT)?;
+                Ok((put as i64, 0))
             }
             PEEK => match &self.mem {
                 // SAFETY: inside the two pages.
@@ -301,6 +315,21 @@ fn run_check(name: &str, rounds: usize) {
         "an unknown ioctl is ENOTTY",
         r == -1 && e == Some(libc::ENOTTY),
     );
+
+    // A command whose argument points further, followed by the server
+    // in the caller's memory while it answers.
+    let mut text = *b"pointer followed";
+    let arg: [u64; 2] = [text.as_mut_ptr() as u64, text.len() as u64];
+    // SAFETY: the 16 bytes the command carries, pointing at `text`.
+    let r = unsafe { libc::ioctl(fd, SHOUT as _, arg.as_ptr()) };
+    check(
+        "the server reads and writes what an ioctl points to",
+        r == 16 && &text == b"POINTER FOLLOWED",
+    );
+    let arg: [u64; 2] = [8, 4];
+    // SAFETY: as above; the kernel reads only `arg`.
+    let r = unsafe { libc::ioctl(fd, SHOUT as _, arg.as_ptr()) };
+    check("...and no further than the caller could", r == 0);
 
     // The device's memory, mapped.
     let map = |offset: usize, prot: i32| -> Result<*mut u8, i32> {
