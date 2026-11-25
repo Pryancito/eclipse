@@ -204,7 +204,8 @@ fn dir_metadata(inode: usize) -> Metadata {
         mtime: Timespec { sec: 0, nsec: 0 },
         ctime: Timespec { sec: 0, nsec: 0 },
         type_: FileType::Dir,
-        mode: 0o555,
+        // `kernfs` makes a sysfs directory `S_IRWXU | S_IRUGO | S_IXUGO`.
+        mode: 0o755,
         nlinks: 2,
         uid: 0,
         gid: 0,
@@ -2381,9 +2382,45 @@ struct SysNetIfaceINode {
 }
 
 impl SysNetIfaceINode {
-    fn entries() -> [&'static str; 3] {
-        ["address", "operstate", "carrier"]
+    fn entries() -> [&'static str; 7] {
+        [
+            "address",
+            "operstate",
+            "carrier",
+            "mtu",
+            "type",
+            "ifindex",
+            "flags",
+        ]
     }
+}
+
+/// `mtu`, `type`, `ifindex` and `flags` of the card `name`, as
+/// `net-sysfs.c` prints them (`flags` is `dev->flags`, in hex: no
+/// `IFF_RUNNING`, which is `dev_get_flags`'s), and as `SIOCGIFMTU`,
+/// `SIOCGIFHWADDR` and `SIOCGIFINDEX` say them. `None` for a card the
+/// machine has not.
+fn net_iface_number(name: &str, attr: &str) -> Option<String> {
+    use crate::net::{
+        ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST, IFF_LOOPBACK, IFF_MULTICAST, IFF_UP,
+    };
+    let cards = get_net_device();
+    let (i, card) = cards.iter().enumerate().find(|(_, c)| c.ifname() == name)?;
+    let lo = card.is_loopback();
+    Some(match attr {
+        "mtu" => format!("{}\n", card.get_mtu()),
+        "type" => format!("{}\n", if lo { ARPHRD_LOOPBACK } else { ARPHRD_ETHER }),
+        "ifindex" => format!("{}\n", i + 1),
+        "flags" => {
+            let flags = if lo {
+                IFF_UP | IFF_LOOPBACK
+            } else {
+                IFF_UP | IFF_BROADCAST | IFF_MULTICAST
+            };
+            format!("{:#x}\n", flags)
+        }
+        _ => return None,
+    })
 }
 
 impl INode for SysNetIfaceINode {
@@ -2437,11 +2474,22 @@ impl INode for SysNetIfaceINode {
                 );
                 Ok(Arc::new(Pseudo::new(&content, FileType::File)))
             }
+            "mtu" | "type" | "ifindex" | "flags" => net_iface_number(&self.name, name)
+                .map(|v| Arc::new(Pseudo::new(&v, FileType::File)) as Arc<dyn INode>)
+                .ok_or(FsError::EntryNotFound),
             _ => Err(FsError::EntryNotFound),
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        nth_entry(id, &Self::entries())
+        // The four numbers are the card's: a name sysfs lists that the
+        // registry has not (see `net_iface_carrier`) lists only the rest.
+        let all = Self::entries();
+        let there = if net_iface_number(&self.name, "mtu").is_some() {
+            &all[..]
+        } else {
+            &all[..3]
+        };
+        nth_entry(id, there)
     }
 }
 
@@ -2812,8 +2860,12 @@ impl INode for SysThermalCoolingDirINode {
 // (a compatibility shim) rather than driving real hardware transitions.
 // ---------------------------------------------------------------------------
 
-/// System sleep states advertised by `/sys/power/state`.
-const POWER_STATES: &str = "freeze mem disk";
+/// System sleep states advertised by `/sys/power/state`: none. Eclipse
+/// enters no sleep state, and Linux lists only the states `state_store`
+/// can enter (`pm_states[]` that `valid_state` allows, `disk` only with
+/// hibernation), so a power manager that reads the list sees it cannot
+/// suspend instead of being told "mem" worked while nothing slept.
+const POWER_STATES: &str = "";
 
 /// Mutable PM state shared by the (stateless) sysfs INodes.
 struct PmState {
@@ -2917,14 +2969,12 @@ impl INode for PmAttrINode {
             .trim();
         match self.attr {
             PmAttr::PowerState => {
-                // Validate against the advertised states; we don't actually
-                // suspend, so a successful write is a logged no-op.
-                if POWER_STATES.split_whitespace().any(|st| st == s) || s == "standby" {
+                // `state_store`: a state not listed is EINVAL, and none is.
+                if !POWER_STATES.split_whitespace().any(|st| st == s) {
                     warn!(
-                        "/sys/power/state: '{}' requested (suspend not implemented)",
+                        "/sys/power/state: '{}' requested (no sleep state is supported)",
                         s
                     );
-                } else {
                     return Err(FsError::InvalidParam);
                 }
             }
@@ -3078,8 +3128,10 @@ impl INode for SysDevicesSystemCpuDirINode {
                 FileType::File,
             ))),
             "present" | "possible" => Ok(Arc::new(Pseudo::new(&cpu_range(count), FileType::File))),
+            // `NR_CPUS - 1`: the most CPUs this kernel was built for, not
+            // the ones there are.
             "kernel_max" => Ok(Arc::new(Pseudo::new(
-                &format!("{}\n", count.saturating_sub(1)),
+                &format!("{}\n", kernel_hal::config::MAX_CORE_NUM - 1),
                 FileType::File,
             ))),
             _ => {

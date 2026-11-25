@@ -96,6 +96,12 @@ fn power_state_refuses_a_state_it_does_not_list() {
     let state = at("power/state");
     assert!(state.write_at(0, b"hibernate-now\n").is_err());
     assert!(state.write_at(0, b"\n").is_err());
+    // Nothing here sleeps, so nothing is listed, and "mem" (what a power
+    // manager writes to suspend) is EINVAL rather than a lie.
+    assert_eq!(listed, "\n");
+    for st in [&b"mem\n"[..], b"freeze", b"disk", b"standby"] {
+        assert_eq!(state.write_at(0, st), Err(FsError::InvalidParam));
+    }
     assert_eq!(read("power/state"), listed, "unchanged");
     assert_eq!(read("power/wakeup_count"), "0\n");
 }
@@ -129,6 +135,12 @@ fn the_cpus_are_listed_as_ranges_and_one_directory_each() {
     assert_eq!(read("devices/system/cpu/present"), range);
     assert_eq!(read("devices/system/cpu/possible"), range);
     assert_eq!(read("devices/system/cpu/online"), range);
+    // `kernel_max` is `NR_CPUS - 1`, what the kernel was built for, not
+    // the CPUs there are.
+    assert_eq!(
+        read("devices/system/cpu/kernel_max"),
+        format!("{}\n", kernel_hal::config::MAX_CORE_NUM - 1)
+    );
     let cpu = at("devices/system/cpu");
     for i in 0..count {
         let n = cpu.find(&format!("cpu{}", i)).unwrap();
