@@ -1485,8 +1485,8 @@ fn after_everything_comes_out_last_however_the_table_is_named() {
     // order alone would put the chime first.
     let order = order_of(&[
         ("boot-sound", &["*"]),
-        ("abyss", &["abyss-seatd"]),
-        ("abyss-seatd", &[]),
+        ("labwc", &["seatd"]),
+        ("seatd", &[]),
         ("zzz", &[]),
     ]);
     assert_eq!(
@@ -2600,11 +2600,6 @@ fn the_compositor_degrades_only_when_its_tolerance_runs_out() {
         .expect("the last exit of the tolerance was not counted");
     assert_eq!(count, COMPOSITOR_DEGRADE_AFTER);
     assert!(out, "the tolerance ran out and it did not degrade");
-    // The Abyss session's compositor counts the same way.
-    let (count, out) = compositor_exit("abyss", false, true, || COMPOSITOR_DEGRADE_AFTER - 1)
-        .expect("abyss's exits were not counted");
-    assert_eq!(count, COMPOSITOR_DEGRADE_AFTER);
-    assert!(out, "abyss ran out of tries and did not degrade");
 
     // Not counted at all when it is not the compositor, when no GPU
     // renderer was asked for, or when it has already degraded -- the last

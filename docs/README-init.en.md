@@ -105,8 +105,8 @@ come out together at the end, in name order, instead of each waiting for the
 other and both falling out of the sort as a cycle.
 
 The chime carries no `desktop =` either. It carried two, `labwc` and `xorg`,
-and the desktop image's default session is `abyss` as soon as `ec-abyss` lands
-in it: init drops every service tagged for another session, so **both rows were
+and the desktop image's default session was `abyss` as soon as `ec-abyss` landed
+in it (that session is gone now): init drops every service tagged for another session, so **both rows were
 dropped before the boot began and nothing played at all**.
 
 ## What the third round closed

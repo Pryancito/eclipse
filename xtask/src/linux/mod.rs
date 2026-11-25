@@ -1,4 +1,3 @@
-mod abyss;
 mod apt_rootfs;
 mod boot_sound;
 mod btrfs_image;
@@ -255,7 +254,6 @@ impl LinuxRootfs {
             // Not into `bin`: that tree is copied into the live root with a
             // 16 MiB cap, and this binary is far past it.
             self.install_silversurfer(&dir);
-            self.install_abyss(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
             // `/sbin/init` always resolves to *some* PID 1; `install_eclipse_init`
@@ -695,7 +693,6 @@ impl LinuxRootfs {
         self.install_lunar_tools(&bin);
         // Same as the incremental path: `usr/bin`, not the capped `bin`.
         self.install_silversurfer(&dir);
-        self.install_abyss(&dir);
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
         // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
@@ -1987,7 +1984,6 @@ impl LinuxRootfs {
             Ok(()) => println!("desktop session: {session} ({})", path.display()),
             Err(e) => eprintln!("warning: could not write {path:?}: {e}"),
         }
-        abyss::default_look(rootfs, session);
     }
 
     /// 编译 busybox。
@@ -3327,7 +3323,6 @@ impl LinuxRootfs {
         .unwrap();
         portal::write_wrapper(localbin);
         portal::write_notify_wrapper(localbin);
-        abyss::write_wrapper(localbin);
 
         // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
         // refuses uid 0), and in that mode its main.c connects to the system
@@ -4444,7 +4439,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         Self::write_init_wrappers(&localbin, &svc_dir);
 
         // Default desktop selector: `labwc` on the desktop variant (the
-        // hardware default; Abyss is opt-in), `none` on the minimal one. A boot with
+        // hardware default), `none` on the minimal one. A boot with
         // `desktop=xorg` on the kernel cmdline (see `make qemu`) overrides this;
         // editing this file changes the default persistently. See
         // eclipse-init's `selected_desktop`.
@@ -4601,7 +4596,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
 
         portal::write_service(svc_dir);
         portal::write_notify_service(svc_dir);
-        abyss::write_services(svc_dir);
 
         // D-Bus system bus, on libdbus's compiled-in default address. A second
         // bus, independent of the session one above; see eclipse-dbus-system

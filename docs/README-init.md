@@ -107,8 +107,8 @@ Dos filas con `*` salen juntas al final, en orden de nombre, en vez de esperarse
 la una a la otra y caerse del orden como un ciclo.
 
 El chime tampoco lleva `desktop =`. Lo llevaba dos veces, `labwc` y `xorg`, y la
-sesión por defecto de la imagen de escritorio es `abyss` en cuanto `ec-abyss`
-entra en ella: init descarta todo servicio etiquetado para otra sesión, así que
+sesión por defecto de la imagen de escritorio era `abyss` en cuanto `ec-abyss`
+entraba en ella (esa sesión ya no existe): init descarta todo servicio etiquetado para otra sesión, así que
 **las dos filas se caían antes de empezar el arranque y no sonaba nada**.
 
 ## Lo que se cerró en la tercera tanda

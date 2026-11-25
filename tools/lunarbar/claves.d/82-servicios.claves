@@ -13,4 +13,4 @@ fichero    = /etc/eclipse/services
 es         = Servicios
 en         = Services
 # Los que la página no apaga: sin ellos no hay escritorio, discos ni red.
-esenciales = abyss abyss-seatd labwc xorg seatd dbus dbus-system fs-mounts fat-mounts ublk-mounts mountd network unet knet enet
+esenciales = labwc xorg seatd dbus dbus-system fs-mounts fat-mounts ublk-mounts mountd network unet knet enet

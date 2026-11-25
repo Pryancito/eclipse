@@ -114,7 +114,7 @@ fn lee_fichero(nombre: &str, text: &str, al_arrancar: bool) -> Servicio {
         let line = line.trim();
         if let Some(c) = line.strip_prefix('#') {
             if s.que.is_empty() && s.exec.is_empty() {
-                // Its first sentence: "Abyss Wayland session. See …".
+                // Its first sentence: "labwc Wayland session. See …".
                 let c = c.trim();
                 let c = c.split_once(". ").map_or(c, |(a, _)| a);
                 s.que = c.trim_end_matches(['.', ':']).to_string();

@@ -216,7 +216,7 @@ fn search_matches_either_language_without_accents() {
 
 #[test]
 fn a_one_word_file_is_read_and_written_whole() {
-    assert_eq!(lee_palabra("# sesión\n\n  abyss  extra\n").as_deref(), Some("abyss"));
+    assert_eq!(lee_palabra("# sesión\n\n  xorg  extra\n").as_deref(), Some("xorg"));
     assert_eq!(lee_palabra("\n# nada\n"), None);
     let dir = std::env::temp_dir().join(format!("claves-palabra-{}", std::process::id()));
     let f = dir.join("desktop");
@@ -225,7 +225,7 @@ fn a_one_word_file_is_read_and_written_whole() {
     let mut c = Catalogo::default();
     c.lee_texto(
         &format!(
-            "[s]\ngrupo = g\ntipo = elegir\nfichero = {}\nformato = palabra\nvalores = labwc abyss xorg\n\
+            "[s]\ngrupo = g\ntipo = elegir\nfichero = {}\nformato = palabra\nvalores = labwc xorg\n\
              [mal]\ngrupo = g\ntipo = elegir\nfichero = /x\nformato = raro\nvalores = a\n\
              [sin]\ngrupo = g\ntipo = elegir\nfichero = /x\nvalores = a\n",
             f.display()
@@ -237,8 +237,8 @@ fn a_one_word_file_is_read_and_written_whole() {
     let k = &c.claves[0];
     assert_eq!(k.origen(), f.display().to_string());
     assert_eq!(valor_actual(k), "xorg");
-    aplica(k, "abyss").unwrap();
-    assert_eq!(std::fs::read_to_string(&f).unwrap(), "abyss\n");
+    aplica(k, "labwc").unwrap();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "labwc\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

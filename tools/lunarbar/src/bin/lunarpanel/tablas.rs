@@ -1234,7 +1234,7 @@ pub(super) fn muestra(p: &mut Panel) {
     }
 }
 
-/// A made-up machine for `--dump servicios`: the Abyss session up, the
+/// A made-up machine for `--dump servicios`: the labwc session up, the
 /// antivirus stopped by hand, its scheduler off at boot, a driver init gave
 /// up on, and ntpd held off.
 fn muestra_serv(p: &mut Panel, ci: usize) {
@@ -1255,33 +1255,6 @@ fn muestra_serv(p: &mut Panel, ci: usize) {
         bool,
         Option<&str>,
     ); 13] = [
-        (
-            "abyss",
-            "Abyss Wayland session",
-            "respawn",
-            Some(("running", 8040)),
-            true,
-            true,
-            None,
-        ),
-        (
-            "abyss-hyperion-bar",
-            "hyperion-bar for the Abyss session",
-            "respawn",
-            Some(("running", 8030)),
-            true,
-            true,
-            None,
-        ),
-        (
-            "abyss-seatd",
-            "Seat manager for the Abyss session",
-            "respawn",
-            Some(("running", 8050)),
-            true,
-            true,
-            None,
-        ),
         (
             "boot-sound",
             "Sonido de arranque",
@@ -1319,6 +1292,24 @@ fn muestra_serv(p: &mut Panel, ci: usize) {
             None,
         ),
         (
+            "labwc",
+            "Sesión Wayland labwc",
+            "respawn",
+            Some(("running", 8040)),
+            true,
+            true,
+            None,
+        ),
+        (
+            "lunarbar",
+            "Barra del escritorio",
+            "respawn",
+            Some(("running", 8030)),
+            true,
+            true,
+            None,
+        ),
+        (
             "network",
             "Red",
             "oneshot",
@@ -1343,6 +1334,15 @@ fn muestra_serv(p: &mut Panel, ci: usize) {
             Some(("stopped", 0)),
             true,
             false,
+            None,
+        ),
+        (
+            "seatd",
+            "Gestor de asientos",
+            "respawn",
+            Some(("running", 8050)),
+            true,
+            true,
             None,
         ),
         (
