@@ -337,8 +337,12 @@ jobs:
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the
           # prebuilt userboot blobs is not in a plain checkout, so the test
-          # target is built for the Linux personality alone.
-          cargo test -p zcore-loader --lib --no-default-features --features linux,libos
+          # target is built for the Linux personality alone. `zircon-gateway`
+          # too, as the kernel builds it (`zCore/Cargo.toml`): without it
+          # nothing under `loader/src/linux/` but the signal frame compiles,
+          # and the calls that hand a process a device, a disk or the
+          # network, and the tests that check who may make them, never ran.
+          cargo test -p zcore-loader --lib --no-default-features --features linux,libos,zircon-gateway
           # The vDSO. `default-members` hid this one too, and nothing else in
           # the tree builds it as a test target, so neither the symbol lookup
           # nor the tests that map the linked image and *call* it had ever run

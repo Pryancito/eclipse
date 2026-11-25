@@ -70,6 +70,19 @@ cfg_if! {
 #[path = "bare/percpu.rs"]
 mod bare_percpu;
 
+#[cfg(all(test, feature = "libos", target_arch = "x86_64"))]
+#[path = "bare/vmalloc.rs"]
+mod bare_vmalloc;
+/// The two x86_64 windows of scattered frames -- coroutine stacks and large
+/// heap blocks -- pulled into the host build for their tests, the same way:
+/// they run on [`utils::page_table`] with the x86 entry format, and only the
+/// loaded root is a test seam. Their failure paths (a window that cannot be
+/// built, a stack that gets half its frames, a full window) are exactly what
+/// an emulator boot never reaches and what real hardware did.
+#[cfg(all(test, feature = "libos", target_arch = "x86_64"))]
+#[path = "bare/vmap_stack.rs"]
+mod bare_vmap_stack;
+
 pub(crate) use config::KCONFIG;
 pub(crate) use kernel_handler::KHANDLER;
 

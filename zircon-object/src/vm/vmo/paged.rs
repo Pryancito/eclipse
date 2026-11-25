@@ -1904,6 +1904,10 @@ enum CommitResult {
     NewPage(PhysFrame),
 }
 
+/// A survivor's range in the hidden node it is connected to by
+/// `replace_child`, and whether it still reads a page of that node.
+type SurvivorRange<'a> = (usize, usize, &'a dyn Fn(usize) -> bool);
+
 impl VMObjectPagedInner {
     fn validate_create_child(&self) -> ZxResult {
         // clone contiguous vmo is no longer permitted
@@ -2560,11 +2564,22 @@ impl VMObjectPagedInner {
         child.parent_offset += self.parent_offset;
         child.parent_limit += self.parent_offset;
         if let Some(parent) = &self.parent {
+            // Whether the survivor still reads a page of the parent through
+            // it, asked by the parent: it cannot borrow the survivor itself,
+            // which is borrowed here (see `replace_child`).
+            let first = child.parent_offset / PAGE_SIZE;
+            let limit = child.parent_limit / PAGE_SIZE;
+            let survivor = &*child;
+            let new_reads = |i: usize| {
+                (first..limit).contains(&i)
+                    && !survivor.frames.contains_key(&(i - first))
+                    && survivor.readers_below(i - first) > 0
+            };
             parent.inner.borrow_mut().replace_child(
                 &self.self_ref,
                 self.owner,
                 other_child,
-                Some((child.parent_offset, child.parent_limit)),
+                Some((child.parent_offset, child.parent_limit, &new_reads)),
                 deferred,
                 graveyard,
             );
@@ -2676,7 +2691,9 @@ impl VMObjectPagedInner {
         old: &WeakRef,
         old_id: KoID,
         new: WeakRef,
-        new_range: Option<(usize, usize)>,
+        // The survivor's range in this node, and which of this node's
+        // pages it still reads through it.
+        new_range: Option<SurvivorRange<'_>>,
         deferred: &mut Vec<Arc<VMObjectPaged>>,
         graveyard: &mut Graveyard,
     ) {
@@ -2693,7 +2710,7 @@ impl VMObjectPagedInner {
         };
         let mut other_child = arc_other_child.inner.borrow_mut();
         let mut unwanted = VecDeque::<usize>::new();
-        if let Some((new_start, new_end)) = new_range {
+        if let Some((new_start, new_end, new_reads)) = new_range {
             let other_start = other_child.parent_offset / PAGE_SIZE;
             let other_end = other_child.parent_limit / PAGE_SIZE;
             let start = new_start / PAGE_SIZE;
@@ -2712,8 +2729,20 @@ impl VMObjectPagedInner {
                     }
                 } else {
                     // if in this node's range, check if it can be moved
-                    if let Some(frame) = self.frames.get(&i) {
-                        if frame.tag.is_split() {
+                    if let Some(frame) = self.frames.get_mut(&i) {
+                        // A split tag says the replaced side forked this page,
+                        // which is true of ONE of its leaves: when that side
+                        // was a hidden node, its other leaf -- the survivor
+                        // taking its place -- may still read the page here.
+                        // Moving it to the sibling then lost the survivor its
+                        // page (it read zeros after the original of a
+                        // snapshot pair exited; `cow_model` in the tests).
+                        // The page stays, shared again; whether a later
+                        // write copies it is decided by looking
+                        // (`side_reads`), not by this tag.
+                        if frame.tag.is_split() && new_reads(i) {
+                            frame.tag = PageStateTag::Owned;
+                        } else if frame.tag.is_split() {
                             let mut new_frame = self.frames.remove(&i).unwrap();
                             if self.contiguous
                                 && !other_child.contiguous

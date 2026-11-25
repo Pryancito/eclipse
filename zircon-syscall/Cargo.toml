@@ -33,3 +33,9 @@ kernel-hal = { path = "../kernel-hal", features = ["libos"] }
 [[test]]
 name = "regressions"
 required-features = ["libos"]
+
+# `zx_object_*` through the syscall table, with the buffers in the calling
+# process's own address space: `libos` maps it in the host process.
+[[test]]
+name = "object"
+required-features = ["libos"]

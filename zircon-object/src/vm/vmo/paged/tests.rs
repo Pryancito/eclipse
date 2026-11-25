@@ -717,3 +717,174 @@ fn counting_pages_past_the_end_answers_zero_instead_of_panicking() {
     assert_eq!(vmo.committed_pages_in_range(64, 65), 0);
     assert_eq!(vmo.committed_pages_in_range(64, 8), 0);
 }
+
+/// A copy-on-write family checked against a model of what each object must
+/// read, through random snapshots of sub-ranges, writes and drops.
+///
+/// The hand-written cases above each pin one shape; the collapse of a hidden
+/// node (`remove_child` -> `replace_child` on the grandparent ->
+/// `release_unwanted_pages_in_parent`) has a branch per combination of which
+/// sibling is gone, which ranges overlap and which side already copied a
+/// page, and most of those were reached by no test at all (the 2026-11-25
+/// coverage run: `replace_child`'s range filter, split-frame move and owner
+/// walk at 0 %). A wrong branch there is a process reading another one's
+/// page after a fork, so here every live object is read back after every
+/// step, and the lone survivor of each family is checked for frames it can
+/// no longer see.
+mod cow_model {
+    use super::*;
+
+    /// What one live object must read: `None` is a page nothing ever wrote
+    /// (reads as zero, and must not be charged to anyone).
+    struct Model {
+        vmo: Arc<VmObject>,
+        pages: Vec<Option<u8>>,
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*: deterministic, so a failing seed is a repro.
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn check(live: &[Model], seed: u64, step: usize) {
+        for (n, m) in live.iter().enumerate() {
+            for (p, want) in m.pages.iter().enumerate() {
+                let got = m.vmo.test_read(p);
+                assert_eq!(
+                    got,
+                    want.unwrap_or(0),
+                    "seed {} step {}: object {} page {}",
+                    seed,
+                    step,
+                    n,
+                    p
+                );
+            }
+        }
+    }
+
+    fn run(seed: u64, steps: usize) {
+        let mut rng = Rng(seed | 1);
+        let root_pages = 1 + rng.below(6);
+        let mut live = vec![Model {
+            vmo: VmObject::new_paged(root_pages),
+            pages: vec![None; root_pages],
+        }];
+        let mut value = 1u8;
+        for step in 0..steps {
+            match rng.below(10) {
+                // Snapshot a sub-range of a live object.
+                0..=2 if live.len() < 8 => {
+                    let i = rng.below(live.len());
+                    let len = live[i].pages.len();
+                    let off = rng.below(len);
+                    let n = 1 + rng.below(len - off);
+                    let vmo = live[i]
+                        .vmo
+                        .create_child(false, off * PAGE_SIZE, n * PAGE_SIZE)
+                        .unwrap();
+                    let pages = live[i].pages[off..off + n].to_vec();
+                    live.push(Model { vmo, pages });
+                }
+                // Write one page of one object.
+                0..=6 => {
+                    let i = rng.below(live.len());
+                    let p = rng.below(live[i].pages.len());
+                    value = value.wrapping_add(1).max(1);
+                    live[i].vmo.test_write(p, value);
+                    live[i].pages[p] = Some(value);
+                }
+                // Drop one object (never the last).
+                _ if live.len() > 1 => {
+                    let i = rng.below(live.len());
+                    live.swap_remove(i);
+                }
+                _ => {}
+            }
+            check(&live, seed, step);
+        }
+        // Down to one survivor, in a random order: every collapse on the way.
+        while live.len() > 1 {
+            let i = rng.below(live.len());
+            live.swap_remove(i);
+            check(&live, seed, steps);
+        }
+        let last = &live[0];
+        let written = last.pages.iter().filter(|p| p.is_some()).count();
+        let committed = last.vmo.get_info().committed_bytes as usize;
+        // Alone, it is charged whole for every frame it reads. A page it
+        // reads as written must be one of them; anything above that is a
+        // frame the collapse kept that no one can reach any more.
+        assert!(
+            committed <= last.pages.len() * PAGE_SIZE,
+            "seed {}: {} committed bytes in a {}-page object",
+            seed,
+            committed,
+            last.pages.len()
+        );
+        assert!(
+            committed >= written * PAGE_SIZE,
+            "seed {}: {} committed bytes, {} pages written",
+            seed,
+            committed,
+            written
+        );
+    }
+
+    #[test]
+    fn random_families_read_what_the_model_says() {
+        for seed in 0..3000u64 {
+            run(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) + 7, 60);
+        }
+    }
+
+    /// The shape `replace_child`'s range filter is for: a hidden node whose
+    /// two children each see only part of it, collapsing under a grandparent.
+    #[test]
+    fn a_collapse_under_a_grandparent_keeps_only_what_the_survivors_read() {
+        let a = VmObject::new_paged(4);
+        for p in 0..4 {
+            a.test_write(p, 0x10 + p as u8);
+        }
+        // a -> H1(a', b); a' -> H2(a'', c), each child a sub-range.
+        let b = a.create_child(false, PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+        let c = a.create_child(false, 2 * PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+        b.test_write(0, 0xb0);
+        a.test_write(2, 0xa2);
+        drop(a);
+        // c alone above H2's range: what it reads must survive both merges.
+        assert_eq!(c.test_read(0), 0x12);
+        assert_eq!(c.test_read(1), 0x13);
+        assert_eq!(b.test_read(0), 0xb0);
+        assert_eq!(b.test_read(1), 0x12);
+        drop(b);
+        assert_eq!(c.test_read(0), 0x12);
+        assert_eq!(c.test_read(1), 0x13);
+        assert_eq!(c.get_info().committed_bytes as usize, 2 * PAGE_SIZE);
+    }
+}
+/// A process that forks twice, writes a page and exits: both children must
+/// still read the page as it was at their fork. On master the second child
+/// read zeros -- the original page went to the first child alone when the
+/// parent's hidden node collapsed (see `replace_child`).
+#[test]
+fn two_forks_then_the_parent_writes_and_exits() {
+    let a = VmObject::new_paged(1);
+    a.test_write(0, 0x10);
+    let b = a.create_child(false, 0, PAGE_SIZE).unwrap();
+    let c = a.create_child(false, 0, PAGE_SIZE).unwrap();
+    a.test_write(0, 0xa0);
+    drop(a);
+    assert_eq!(b.test_read(0), 0x10);
+    assert_eq!(c.test_read(0), 0x10);
+}

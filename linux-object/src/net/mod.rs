@@ -975,6 +975,12 @@ pub(crate) fn shutdown_sides(howto: usize) -> LxResult<(bool, bool)> {
 #[cfg(test)]
 pub(crate) static NET_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
 
+#[cfg(test)]
+mod ioctl_tests;
+/// A card the tests plug in, and the `SIOC*` requests asked of it.
+#[cfg(test)]
+pub(crate) mod test_card;
+
 // ============= IOCTL =============
 
 /// How many bytes of the caller's a request's argument is, and whether the

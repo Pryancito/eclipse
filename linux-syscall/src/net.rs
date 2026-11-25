@@ -20,6 +20,8 @@ mod hunter_firewall;
 /// `socket`/`socketpair` of a type or family that is not served.
 #[cfg(test)]
 mod socket_create_tests;
+#[cfg(test)]
+mod sockopt_roundtrip_tests;
 use hunter::firewall::Direction as NetDirection;
 
 const MSG_DONTWAIT: usize = 0x40;

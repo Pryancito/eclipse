@@ -32,7 +32,9 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::mem::PhysFrame;
-use crate::vm::{GenericPageTable, Page, PageSize, PageTable};
+#[cfg(not(test))]
+use crate::vm::PageTable;
+use crate::vm::{GenericPageTable, Page, PageSize};
 use crate::MMUFlags;
 
 /// The window: PML4 slot `0x1fd`, between the stack window (`0x1fc`) and the
@@ -120,9 +122,19 @@ fn lock() -> Locked {
 }
 
 /// See `vmap_stack::tables`: every address space shares the window's tables.
+#[cfg(not(test))]
 fn tables() -> ManuallyDrop<PageTable> {
     ManuallyDrop::new(PageTable::from_current())
 }
+
+/// Whether the loaded root is the kernel's own (see [`init`]).
+#[cfg(not(test))]
+fn on_kernel_table() -> bool {
+    crate::vm::current_vmtoken() == crate::vm::kernel_vmtoken()
+}
+
+#[cfg(test)]
+use self::tests::{on_kernel_table, tables};
 
 fn flush_everywhere() {
     crate::vm::flush_tlb(None);
@@ -132,7 +144,7 @@ fn flush_everywhere() {
 /// Make the window. Called once at boot with `vmap_stack::init`, on the
 /// kernel's own page table, before any address space is cloned from it.
 pub fn init() {
-    if crate::vm::current_vmtoken() != crate::vm::kernel_vmtoken() {
+    if !on_kernel_table() {
         warn!("vmalloc: not on the kernel's own page table, large blocks stay in the heap");
         return;
     }
@@ -357,5 +369,263 @@ static SHRINKER: crate::shrinker::Shrinker = crate::shrinker::Shrinker {
 pub fn register_shrinker() {
     if !crate::shrinker::register_deferred(&SHRINKER) {
         warn!("vmalloc: deferred shrinker registry full, cached blocks go back only on reclaimd's pass");
+    }
+}
+
+/// The large-block window on a host, on the walker and entry format the
+/// machine uses; only the loaded root is a seam (see `vmap_stack`'s tests).
+///
+/// What these pin is the part of the design that is unusual: a free never
+/// unmaps, a cached slot is taken over as it is by a similar size and only by
+/// a similar size, an allocation that gets half its frames keeps them mapped
+/// for the purge instead of flushing, and the purge gives every frame back.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::page_table::{PageTableImpl, PageTableLevel4};
+    use crate::utils::pte::x86_64::X86PTE;
+    use crate::utils::test_frames;
+
+    pub(super) type PageTable = PageTableImpl<PageTableLevel4, X86PTE>;
+
+    static ROOT: AtomicUsize = AtomicUsize::new(0);
+    static ON_KERNEL: AtomicBool = AtomicBool::new(true);
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn tables() -> ManuallyDrop<PageTable> {
+        // SAFETY: `ROOT` is a zeroed frame `fresh` took and never frees.
+        ManuallyDrop::new(unsafe { PageTable::from_root(ROOT.load(Ordering::Relaxed)) })
+    }
+
+    pub(super) fn on_kernel_table() -> bool {
+        ON_KERNEL.load(Ordering::Relaxed)
+    }
+
+    fn fresh() -> std::sync::MutexGuard<'static, ()> {
+        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_frames::install();
+        test_frames::frame_budget(None);
+        for s in &STATE {
+            s.store(FREE, Ordering::Relaxed);
+        }
+        for m in &MAPPED {
+            m.store(0, Ordering::Relaxed);
+        }
+        READY.store(false, Ordering::Relaxed);
+        LOCK_OWNER.store(0, Ordering::Relaxed);
+        for c in [&LIVE_BYTES, &CACHED_BYTES, &REUSED, &FAILED, &PURGED_BYTES] {
+            c.store(0, Ordering::Relaxed);
+        }
+        ON_KERNEL.store(true, Ordering::Relaxed);
+        let root = PhysFrame::new_zero().expect("root frame");
+        ROOT.store(root.paddr(), Ordering::Relaxed);
+        core::mem::forget(root);
+        g
+    }
+
+    fn mapped(va: usize) -> Option<usize> {
+        tables().query(va).ok().map(|q| q.0)
+    }
+
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn no_window_no_blocks() {
+        let _g = fresh();
+        assert_eq!(alloc(MIB), None);
+        ON_KERNEL.store(false, Ordering::Relaxed);
+        init();
+        assert_eq!(alloc(MIB), None, "init off the kernel table builds nothing");
+        assert_eq!(stats(), (0, 0, 0, 0, 0), "and none of that is a failure");
+    }
+
+    #[test]
+    fn init_refuses_a_window_someone_already_mapped() {
+        let _g = fresh();
+        let f = PhysFrame::new().unwrap();
+        let page = Page::new_aligned(VMALLOC_LO, PageSize::Size4K);
+        tables().map(page, f.paddr(), MMUFlags::READ).unwrap();
+        init();
+        assert_eq!(alloc(MIB), None);
+        assert_eq!(mapped(VMALLOC_LO), Some(f.paddr()));
+    }
+
+    #[test]
+    fn init_without_frames_leaves_the_window_off() {
+        let _g = fresh();
+        test_frames::frame_budget(Some(0));
+        init();
+        test_frames::frame_budget(Some(2));
+        init();
+        test_frames::frame_budget(None);
+        assert_eq!(alloc(MIB), None);
+    }
+
+    #[test]
+    fn a_block_is_exactly_the_pages_asked_for() {
+        let _g = fresh();
+        init();
+        assert_eq!(mapped(VMALLOC_LO), None, "init leaves nothing mapped");
+        let base = alloc(MIB + 1).expect("block");
+        assert_eq!(base, VMALLOC_LO);
+        assert!(owns(base) && owns(VMALLOC_HI - 1) && !owns(VMALLOC_HI));
+        let pages = (MIB + 1).div_ceil(PAGE);
+        let mut seen = std::collections::BTreeSet::new();
+        for p in 0..pages {
+            assert!(seen.insert(mapped(base + p * PAGE).expect("mapped")));
+        }
+        assert_eq!(mapped(base + pages * PAGE), None);
+        assert_eq!(stats().0, pages * PAGE);
+        assert_eq!(alloc(MIB).unwrap(), base + SLOT, "next slot");
+    }
+
+    #[test]
+    fn sizes_past_a_slot_and_zero_go_to_the_buddy() {
+        let _g = fresh();
+        init();
+        assert_eq!(alloc(0), None);
+        assert_eq!(alloc(SLOT + 1), None);
+        assert_eq!(stats().3, 0, "not failures: the caller asks the buddy");
+    }
+
+    #[test]
+    fn free_keeps_the_mapping_and_a_similar_size_takes_it_over() {
+        let _g = fresh();
+        init();
+        let base = alloc(4 * MIB).unwrap();
+        let first = mapped(base).unwrap();
+        let before = test_frames::live_frames();
+        assert!(free(base));
+        assert!(!free(base), "a cached block is not freed twice");
+        assert_eq!(mapped(base), Some(first), "free never unmaps");
+        assert_eq!(test_frames::live_frames(), before, "and keeps its frames");
+        assert_eq!(cached_bytes(), 4 * MIB);
+        // 3 MiB: the 4 MiB slot is within twice that, so it is reused as is.
+        assert_eq!(alloc(3 * MIB), Some(base));
+        assert_eq!(mapped(base), Some(first));
+        assert_eq!(test_frames::live_frames(), before, "no new frame");
+        let (live, cached, reused, _, _) = stats();
+        assert_eq!((live, cached, reused), (4 * MIB, 0, 1));
+    }
+
+    #[test]
+    fn a_cached_slot_is_not_given_to_a_size_it_does_not_fit() {
+        let _g = fresh();
+        init();
+        let base = alloc(4 * MIB).unwrap();
+        assert!(free(base));
+        // Larger than what is mapped: a new slot.
+        assert_eq!(alloc(5 * MIB), Some(base + SLOT));
+        // Less than half of it: a new slot too, not 4 MiB for 1 MiB.
+        assert_eq!(alloc(MIB), Some(base + 2 * SLOT));
+        assert_eq!(stats().2, 0);
+    }
+
+    #[test]
+    fn free_refuses_what_is_not_a_live_block() {
+        let _g = fresh();
+        init();
+        let base = alloc(MIB).unwrap();
+        assert!(!free(base + PAGE));
+        assert!(!free(base + SLOT), "a slot never handed out");
+        assert!(!free(0x1000));
+        assert_eq!(stats().0, MIB);
+    }
+
+    #[test]
+    fn purge_gives_back_every_frame_down_to_keep() {
+        let _g = fresh();
+        init();
+        let a = alloc(2 * MIB).unwrap();
+        let b = alloc(MIB + 3 * PAGE).unwrap();
+        let held = test_frames::live_frames();
+        assert!(free(a) && free(b));
+        // Keep a little: the first slot goes, then the cache is under `keep`.
+        assert_eq!(purge(MIB + 4 * PAGE), 2 * MIB);
+        assert_eq!(mapped(a), None);
+        assert!(mapped(b).is_some(), "second still cached");
+        assert_eq!(test_frames::live_frames(), held - 2 * MIB / PAGE);
+        assert_eq!(purge(0), MIB + 3 * PAGE);
+        assert_eq!(
+            test_frames::live_frames(),
+            held - (3 * MIB + 3 * PAGE) / PAGE
+        );
+        assert_eq!(cached_bytes(), 0);
+        assert_eq!(stats().4, 3 * MIB + 3 * PAGE);
+        // A purged slot is free again, and a live one was never touched.
+        let c = alloc(MIB).unwrap();
+        assert_eq!(c, a);
+        assert_eq!(purge(0), 0, "nothing cached, nothing given");
+        assert!(mapped(c).is_some());
+    }
+
+    /// More than one purge batch (256 pages) in one slot.
+    #[test]
+    fn purge_of_a_block_past_one_batch_takes_all_of_it() {
+        let _g = fresh();
+        init();
+        let a = alloc(3 * MIB).unwrap();
+        assert!(free(a));
+        assert_eq!(purge(0), 3 * MIB);
+        for p in (0..3 * MIB / PAGE).step_by(97) {
+            assert_eq!(mapped(a + p * PAGE), None, "page {}", p);
+        }
+    }
+
+    #[test]
+    fn running_out_of_frames_keeps_what_was_mapped_for_the_purge() {
+        let _g = fresh();
+        init();
+        let warm = alloc(MIB).unwrap();
+        assert!(free(warm));
+        assert_eq!(purge(0), MIB);
+        let before = test_frames::live_frames();
+        test_frames::frame_budget(Some(5));
+        assert_eq!(alloc(MIB), None);
+        test_frames::frame_budget(None);
+        assert_eq!(stats().3, 1);
+        assert_eq!(cached_bytes(), 5 * PAGE, "kept, not flushed");
+        assert!(mapped(warm + 4 * PAGE).is_some());
+        // A cached slot of 5 pages is not a 1 MiB block.
+        assert_eq!(alloc(MIB), Some(warm + SLOT));
+        assert_eq!(purge(0), 5 * PAGE);
+        assert_eq!(mapped(warm), None);
+        // The new block's pages, and the page table its slot needed.
+        assert_eq!(test_frames::live_frames(), before + MIB / PAGE + 1);
+    }
+
+    #[test]
+    fn running_out_before_the_first_frame_frees_the_slot() {
+        let _g = fresh();
+        init();
+        test_frames::frame_budget(Some(0));
+        assert_eq!(alloc(MIB), None);
+        test_frames::frame_budget(None);
+        assert_eq!(cached_bytes(), 0);
+        assert_eq!(alloc(MIB), Some(VMALLOC_LO), "slot 0 is free again");
+    }
+
+    /// An interrupt that allocates while this CPU holds the window's lock
+    /// must not spin on it: it is told no and goes to the buddy.
+    #[test]
+    fn an_allocation_inside_the_lock_holder_is_refused() {
+        let _g = fresh();
+        init();
+        let held = lock();
+        assert_eq!(alloc(MIB), None);
+        drop(held);
+        assert_eq!(LOCK_OWNER.load(Ordering::Relaxed), 0);
+        assert!(alloc(MIB).is_some());
+    }
+
+    #[test]
+    fn a_full_window_is_a_failure_and_a_freed_slot_comes_back() {
+        let _g = fresh();
+        init();
+        let bases: Vec<usize> = (0..SLOTS).map(|_| alloc(PAGE).unwrap()).collect();
+        assert_eq!(alloc(PAGE), None);
+        assert_eq!(stats().3, 1);
+        assert!(free(bases[3]));
+        assert_eq!(alloc(PAGE), Some(bases[3]));
     }
 }
