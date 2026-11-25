@@ -926,7 +926,7 @@ pub fn parse_undelivered6(bytes: &[u8]) -> Option<(IpEndpoint, u8, u8)> {
 /// `SO_RCVTIMEO` and `SO_SNDTIMEO` as they were set: how long a socket that
 /// blocks waits in a read or an accept (the first), in a write or a connect
 /// (the second), before the call gives up. All zero waits without limit.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub(super) struct Patience {
     pub(super) receive: [u8; 16],
     pub(super) send: [u8; 16],
