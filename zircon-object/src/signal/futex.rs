@@ -305,6 +305,7 @@ impl Futex {
                 let mut inner = self.waiter.inner.lock();
                 // check wakeup
                 if inner.woken {
+                    inner.reported = true;
                     // set new owner on success
                     inner.futex.inner.lock().set_owner(self.new_owner.clone());
                     return Poll::Ready(Ok(()));
@@ -350,6 +351,20 @@ impl Futex {
         impl Drop for FutexFuture {
             fn drop(&mut self) {
                 let mut inner = self.waiter.inner.lock();
+                if inner.woken && !inner.reported && inner.waker.is_none() {
+                    // A wake counted this waiter, and the wait ended (timeout,
+                    // signal, kill) before a poll reported it. Linux answers 0
+                    // there, so the wake is never lost; this future can no
+                    // longer answer, so the wake goes to the next waiter
+                    // instead. Without it, the unlocker of a mutex whose one
+                    // woken waiter timed out leaves the others asleep behind
+                    // a free lock. After the waiter lock: `wake` takes the
+                    // futex lock and then other waiters' locks.
+                    let futex = inner.futex.clone();
+                    drop(inner);
+                    futex.wake(1);
+                    return;
+                }
                 if !inner.woken {
                     // Tombstone the waiter: if a concurrent wake/requeue
                     // already popped it from the queue (so the search below
@@ -370,6 +385,7 @@ impl Futex {
                 inner: Mutex::new(WaiterInner {
                     waker: None,
                     woken: false,
+                    reported: false,
                     futex: self.clone(),
                 }),
             }),
@@ -683,6 +699,9 @@ struct WaiterInner {
     /// The waker of waiting future. `None` indicates first poll.
     waker: Option<Waker>,
     woken: bool,
+    /// A poll answered `Ready(Ok)` for the wake. A future dropped woken but
+    /// not reported hands its wake on; see `FutexFuture::drop`.
+    reported: bool,
     futex: Arc<Futex>,
 }
 
@@ -795,6 +814,7 @@ mod tests {
             inner: Mutex::new(WaiterInner {
                 waker: None,
                 woken: true,
+                reported: false,
                 futex: futex.clone(),
             }),
         });
@@ -994,6 +1014,63 @@ mod tests {
             Poll::Ready(Ok(())),
             "the wake is still there for the next poll, not lost with it"
         );
+    }
+
+    /// The same race when nobody polls again: a timeout, a kill, or a
+    /// signal whose last poll came just before the wake. The future is
+    /// dropped woken and unreported, so it hands the wake to the next waiter
+    /// rather than eating it.
+    #[test]
+    fn a_wake_dropped_unreported_goes_to_the_next_waiter() {
+        let futex = futex_with(1);
+        let (first, first_counter) = queue_waiter(&futex, 1, None);
+        let (mut second, second_counter) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(futex.wake(1), 1);
+        assert_eq!(first_counter.count(), 1, "the wake went to the first");
+        assert_eq!(second_counter.count(), 0);
+
+        drop(first);
+        assert_eq!(
+            second_counter.count(),
+            1,
+            "the first waiter ended without reporting its wake: the second gets it"
+        );
+        let waker = waker(second_counter.clone());
+        assert_eq!(
+            second.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert!(futex.is_idle());
+    }
+
+    /// A wake that WAS reported is not handed on: that would wake two
+    /// threads for one `FUTEX_WAKE`.
+    #[test]
+    fn a_reported_wake_is_not_handed_on() {
+        let futex = futex_with(1);
+        let (mut first, first_counter) = queue_waiter(&futex, 1, None);
+        let (_second, second_counter) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(futex.wake(1), 1);
+        let waker = waker(first_counter);
+        assert_eq!(
+            first.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(()))
+        );
+        drop(first);
+        assert_eq!(second_counter.count(), 0, "the second sleeps on");
+    }
+
+    /// A cancelled waiter that nobody woke hands nothing on either.
+    #[test]
+    fn a_cancel_with_no_wake_wakes_nobody() {
+        let futex = futex_with(1);
+        let (first, _) = queue_waiter(&futex, 1, None);
+        let (_second, second_counter) = queue_waiter(&futex, 1, None);
+        drop(first);
+        assert_eq!(second_counter.count(), 0);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
     }
 
     #[test]
