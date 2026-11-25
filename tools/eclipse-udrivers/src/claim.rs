@@ -39,6 +39,69 @@ pub const KIND_XHCI: usize = 10;
 /// see [`claim_pci`]. Its transport is a plain PCI function and the window
 /// its first memory BAR.
 pub const KIND_PCI: usize = 11;
+/// An NVIDIA GPU (`udriver=nvidia@N`): its window is BAR 0; the rest of
+/// it is reached through [`PciFn`].
+pub const KIND_NVIDIA: usize = 12;
+
+/// The rest of a PCI function this process holds, beyond the window of its
+/// claim (`ECLIPSE_DEVICE_PCI_FN`): its other memory BARs, and its
+/// configuration space, which the kernel reads and writes for it.
+#[derive(Debug, Clone, Copy)]
+pub struct PciFn {
+    kind: usize,
+    index: usize,
+}
+
+const PCI_FN_BAR: usize = 0;
+const PCI_FN_CONFIG_READ: usize = 1;
+const PCI_FN_CONFIG_WRITE: usize = 2;
+
+impl PciFn {
+    /// Device `index` of claim `kind` ([`KIND_NVIDIA`]).
+    pub fn of(kind: usize, index: usize) -> PciFn {
+        PciFn { kind, index }
+    }
+
+    /// The `index`th function of identity `vendor:device` ([`claim_pci`]).
+    pub fn of_pci(vendor: u16, device: u16, index: usize) -> PciFn {
+        let id = (vendor as usize) << 16 | device as usize;
+        PciFn {
+            kind: KIND_PCI | id << 32,
+            index,
+        }
+    }
+
+    fn call(&self, op: usize, a: usize, b: usize, c: usize) -> Result<usize, Status> {
+        // SAFETY: no memory of this process is named.
+        unsafe {
+            zx::call(
+                nr::ECLIPSE_DEVICE_PCI_FN,
+                [self.kind, self.index, op, a, b, c],
+            )
+        }
+    }
+
+    /// A VMO of memory BAR `bar`, write-combining when `combine` (an
+    /// aperture of memory rather than registers), uncached otherwise.
+    pub fn bar(&self, bar: usize, combine: bool) -> Result<Handle, Status> {
+        self.call(PCI_FN_BAR, bar, combine as usize, 0)
+            .map(|h| h as Handle)
+    }
+
+    /// `width` bytes (1, 2 or 4) of the configuration space at `offset`.
+    pub fn config_read(&self, offset: usize, width: usize) -> Result<u32, Status> {
+        self.call(PCI_FN_CONFIG_READ, offset, width, 0)
+            .map(|v| v as u32)
+    }
+
+    /// Write the low `width` bytes of `value` at `offset`.
+    /// [`Status::ACCESS_DENIED`] for a register only the kernel sets: the
+    /// identity, the BARs, the ROM.
+    pub fn config_write(&self, offset: usize, width: usize, value: u32) -> Result<(), Status> {
+        self.call(PCI_FN_CONFIG_WRITE, offset, width, value as usize)
+            .map(|_| ())
+    }
+}
 
 const TRANSPORT_VIRTIO_MMIO: u32 = 1;
 const TRANSPORT_VIRTIO_PCI: u32 = 2;

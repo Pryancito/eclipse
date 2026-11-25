@@ -65,8 +65,10 @@ const DRIVERS: [&str; 4] = [
     "udrv-ahci",
 ];
 /// What tests a node in `/dev` that a process serves, from the same
-/// package: `udrv-dev-echo check NAME`.
-const DEV_TESTS: [&str; 1] = ["udrv-dev-echo"];
+/// package: `udrv-dev-echo check NAME`; and what tests the rest of a PCI
+/// function a driver holds (`ECLIPSE_DEVICE_PCI_FN`), `udrv-pci-check VVVV
+/// DDDD` on a function the boot leaves to userspace by its identity.
+const DEV_TESTS: [&str; 2] = ["udrv-dev-echo", "udrv-pci-check"];
 /// The drivers of input devices, from the same package: each serves its
 /// device as a node of `/dev/input` (`udriver=virtio-input@N`, and the
 /// PC's i8042 with `udriver=i8042@0`: its keyboard and its mouse); and
