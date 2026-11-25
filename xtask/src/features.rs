@@ -72,11 +72,19 @@ const CRATES: &[&str] = &[
 ];
 
 /// Los crates con `[features]` que el libro NO cubre, y por que.
-const FUERA: &[(&str, &str)] = &[(
-    "smoltcp",
-    "bifurcacion de upstream: sus features son de upstream, y lo que \
-     construimos de el es su `cargo test` con los defaults",
-)];
+const FUERA: &[(&str, &str)] = &[
+    (
+        "smoltcp",
+        "bifurcacion de upstream: sus features son de upstream, y lo que \
+         construimos de el es su `cargo test` con los defaults",
+    ),
+    (
+        "nvidia-rm-sys",
+        "su unica feature, `user`, la enciende solo tools/udrv-nvidia (el \
+         driver NVIDIA como proceso, un paquete aparte que make no construye); \
+         el nucleo nunca la pide, y el CI la prueba en test-bare-metal",
+    ),
+];
 
 /// La rejilla de interruptores que se le pregunta a `make`.
 ///
