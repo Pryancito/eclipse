@@ -40,12 +40,23 @@
 
 use core::sync::atomic::Ordering;
 
+#[cfg(test)]
+use self::tests::{current_table, PageTable};
 use crate::common::guard_band::{self, BandRefusal, Take};
 use crate::fault_slots::SlotTable;
 use crate::mem::PhysFrame;
 use crate::phys_watch::{FramePool, FrameSet, FreedRing};
-use crate::vm::{GenericPageTable, PageTable};
+use crate::vm::GenericPageTable;
+#[cfg(not(test))]
+use crate::vm::PageTable;
 use crate::{MMUFlags, PhysAddr};
+
+/// The table loaded on this CPU. The kernel half is shared by every address
+/// space, so whichever one it is reaches the stacks (see [`install`]).
+#[cfg(not(test))]
+fn current_table() -> PageTable {
+    PageTable::from_current()
+}
 
 const PAGE_SIZE: usize = 4096;
 
@@ -136,6 +147,7 @@ pub fn dma_pin_user(paddr: usize, pages: usize) {
 
 /// Drop one pin. When the last pin on a range goes away, any DMA free that was
 /// waiting on it is released into the quarantine.
+#[cfg(not(test))]
 pub fn dma_unpin_user(paddr: usize, pages: usize) {
     // Released outside the registry's lock: `frame_dealloc` and the
     // quarantine's poison scan must not run under it.
@@ -159,7 +171,7 @@ pub fn dma_hold_if_pinned(paddr: usize, pages: usize) -> bool {
 /// usable_base + STACK_SIZE)` in the stack-frame bitset, by querying the live
 /// page table for each page's physical address.
 fn mark_stack_frames(usable_base: usize, set: bool) {
-    let pt = PageTable::from_current();
+    let pt = current_table();
     let stack_size = executor::STACK_SIZE;
     for off in (0..stack_size).step_by(PAGE_SIZE) {
         let Ok((paddr, _, _)) = pt.query(usable_base + off) else {
@@ -444,7 +456,7 @@ fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), BandRef
 fn dirty_depth(base: usize, size: usize) -> Option<usize> {
     // Same reasoning as `install`: the kernel half of every address space
     // walks into the same sub-tables, so whichever table is loaded will do.
-    PageTable::from_current().dirty_depth_from_top(base, size)
+    current_table().dirty_depth_from_top(base, size)
 }
 
 /// Forget the writes recorded on a stack's usable region that has just
@@ -467,7 +479,7 @@ fn dirty_depth(base: usize, size: usize) -> Option<usize> {
 /// entry, a page it wrote would read clean and keep its frames past the
 /// next recycle -- the state every stack was in before the poison existed.
 fn mark_clean(base: usize, size: usize) {
-    let mut pt = PageTable::from_current();
+    let mut pt = current_table();
     if pt.clear_dirty_range(base, size) == 0 {
         return;
     }
@@ -477,9 +489,13 @@ fn mark_clean(base: usize, size: usize) {
 
 /// Register this module's hooks with the scheduler.
 ///
+/// Not in the host build: it installs the hooks in the real scheduler and
+/// builds the x86_64 windows, which have tests of their own.
+///
 /// Must run after the kernel page tables are pinned and *before* the first
 /// `Executor::new`, which is why `primary_init` calls it immediately before
 /// `executor::warm_runtimes()`. Boot asserts that the hooks got registered.
+#[cfg(not(test))]
 pub fn init() {
     // Before the hooks, so the first `Executor::new` already finds the frames
     // its guard bands need (see `SPLIT_POOL`).
@@ -562,7 +578,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
     // sub-tables), which is why editing through whatever page table happens to
     // be loaded is enough — and necessary, since this can run under a user CR3
     // left behind by lazy TLB.
-    let mut pt = PageTable::from_current();
+    let mut pt = current_table();
 
     // Huge mappings first. On riscv64 and aarch64 the kernel heap is part of
     // the physmap, which the kernel page table covers with 2 MiB pages, so
@@ -652,7 +668,7 @@ fn remove(guard_base: usize, guard_size: usize) {
         return;
     };
     let flags = MMUFlags::from_bits_truncate(bits);
-    let mut pt = PageTable::from_current();
+    let mut pt = current_table();
     if guard_band::set_band_flags(&mut pt, guard_base, guard_size, flags).is_err() {
         panic!(
             "stack_guard: could not restore guard band {:#x}+{:#x} — refusing to \
@@ -730,7 +746,7 @@ pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
     if let Err(reason) = guard_band::check_alignment(usable_base, size) {
         return refuse(reason);
     }
-    let mut pt = PageTable::from_current();
+    let mut pt = current_table();
     // Split the covering huge entries first, exactly as `install` does. Without
     // this the quarantine was silently unavailable on riscv64 and aarch64,
     // where the kernel heap is a window of a physmap mapped with 2 MiB pages:
@@ -783,7 +799,7 @@ pub fn quarantine_unprotect(usable_base: usize, size: usize) {
         return;
     };
     let flags = MMUFlags::from_bits_truncate(bits);
-    let mut pt = PageTable::from_current();
+    let mut pt = current_table();
     if guard_band::set_band_flags(&mut pt, usable_base, size, flags).is_err() {
         panic!(
             "stack_guard: could not un-protect quarantined stack {:#x}+{:#x} — \
@@ -811,4 +827,255 @@ pub fn is_quarantine_fault(fault_vaddr: usize) -> bool {
 pub fn quarantine_stats() -> (usize, usize, usize) {
     let (ever, refused) = QUARANTINE.stats();
     (QUARANTINE.live(), ever, refused)
+}
+
+/// The guard bands on a host, on the walker and entry format of the machine
+/// (x86_64 here) and on a root this module builds: the only seam is which
+/// table is "loaded" ([`current_table`]).
+///
+/// What these pin is the path riscv64 and aarch64 depend on and the x86_64
+/// emulator never takes: a band inside a 2 MiB mapping is split out of it
+/// with a frame from the boot reserve, the rest of the huge page keeps
+/// mapping exactly what it did, and with the reserve spent the band is
+/// refused with the mapping untouched. And the contract `remove` exists for:
+/// a band taken away keeps its frame in the entry and comes back with the
+/// flags it had.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use crate::utils::page_table::{PageTableImpl, PageTableLevel4};
+    use crate::utils::pte::x86_64::X86PTE;
+    use crate::utils::test_frames;
+    use crate::vm::{Page, PageSize};
+    use core::sync::atomic::AtomicUsize;
+
+    pub(super) type PageTable = PageTableImpl<PageTableLevel4, X86PTE>;
+
+    static ROOT: AtomicUsize = AtomicUsize::new(0);
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn current_table() -> PageTable {
+        // SAFETY: `ROOT` is a zeroed frame `fresh` took and never frees; a
+        // table made from a root does not free it when dropped.
+        unsafe { PageTable::from_root(ROOT.load(Ordering::Relaxed)) }
+    }
+
+    const RW: MMUFlags = MMUFlags::READ.union(MMUFlags::WRITE);
+    /// Where the tests' stacks live: the kernel half, as on the machine.
+    const BASE: usize = 0xffff_ffa0_0000_0000;
+    /// Physical memory the mappings name. Never read or written: the guard
+    /// code only ever reads entries.
+    const PHYS: usize = 0x1_0000_0000;
+
+    fn fresh() -> std::sync::MutexGuard<'static, ()> {
+        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        test_frames::install();
+        test_frames::frame_budget(None);
+        let root = PhysFrame::new_zero().expect("root frame");
+        ROOT.store(root.paddr(), Ordering::Relaxed);
+        core::mem::forget(root);
+        g
+    }
+
+    /// `[va, va + len)` mapped with 4 KiB pages onto `PHYS + (va - BASE)`.
+    fn map_4k(va: usize, len: usize, flags: MMUFlags) {
+        // Kept: the tables `map` makes belong to the root, not to this value
+        // (the module itself never maps, so never makes one).
+        let mut pt = core::mem::ManuallyDrop::new(current_table());
+        for off in (0..len).step_by(PAGE_SIZE) {
+            let page = Page::new_aligned(va + off, PageSize::Size4K);
+            pt.map(page, PHYS + (va - BASE) + off, flags).unwrap();
+        }
+    }
+
+    fn map_2m(va: usize, flags: MMUFlags) {
+        let page = Page::new_aligned(va, PageSize::Size2M);
+        core::mem::ManuallyDrop::new(current_table())
+            .map(page, PHYS + (va - BASE), flags)
+            .unwrap();
+    }
+
+    fn entry(va: usize) -> Option<(usize, MMUFlags, PageSize)> {
+        current_table().query(va).ok()
+    }
+
+    fn drain_split_pool() {
+        while split_pool_take().is_some() {}
+    }
+
+    /// The whole executor block: bottom guard, usable stack, top guard.
+    const BLOCK: usize = executor::GUARD_SIZE + executor::STACK_SIZE + executor::TOP_GUARD_SIZE;
+
+    #[test]
+    fn a_band_faults_keeps_its_frames_and_comes_back_as_it_was() {
+        let _g = fresh();
+        let base = BASE;
+        map_4k(base, BLOCK, RW);
+        let (accepted, _) = stats();
+        assert!(install(base, executor::GUARD_SIZE));
+        assert_eq!(stats().0, accepted + 1);
+        for off in (0..executor::GUARD_SIZE).step_by(PAGE_SIZE) {
+            assert!(
+                !current_table().is_present(base + off),
+                "page {:#x} of the band still present",
+                off
+            );
+        }
+        assert!(
+            current_table().is_present(base + executor::GUARD_SIZE),
+            "the stack is not the band"
+        );
+        assert!(is_guard_fault(base));
+        assert!(is_guard_fault(base + executor::GUARD_SIZE - 1));
+        assert!(!is_guard_fault(base + executor::GUARD_SIZE));
+        // The usable stack's frames are known to the physmap guard.
+        let usable_pa = PHYS + executor::GUARD_SIZE;
+        assert!(paddr_aliases_stack(usable_pa, 1));
+        assert!(paddr_aliases_stack(usable_pa + executor::STACK_SIZE - 1, 1));
+        assert!(
+            !paddr_aliases_stack(PHYS, PAGE_SIZE),
+            "the band is not the stack"
+        );
+
+        remove(base, executor::GUARD_SIZE);
+        assert!(!is_guard_fault(base));
+        assert!(!paddr_aliases_stack(usable_pa, executor::STACK_SIZE));
+        for off in (0..executor::GUARD_SIZE).step_by(PAGE_SIZE) {
+            let (pa, flags, size) = entry(base + off).expect("restored");
+            assert_eq!((pa, size), (PHYS + off, PageSize::Size4K));
+            assert!(flags.contains(RW), "{:?}", flags);
+        }
+    }
+
+    #[test]
+    fn the_top_band_does_not_mark_the_stack() {
+        let _g = fresh();
+        let base = BASE + 0x1000_0000;
+        map_4k(base, BLOCK, RW);
+        let top = base + executor::GUARD_SIZE + executor::STACK_SIZE;
+        assert!(install(top, executor::TOP_GUARD_SIZE));
+        assert!(is_guard_fault(top));
+        assert!(!paddr_aliases_stack(
+            PHYS + 0x1000_0000 + executor::GUARD_SIZE,
+            PAGE_SIZE
+        ));
+        remove(top, executor::TOP_GUARD_SIZE);
+        assert!(current_table().is_present(top));
+    }
+
+    /// riscv64 and aarch64: the heap is the physmap, mapped with 2 MiB pages.
+    #[test]
+    fn a_band_inside_a_huge_page_is_split_out_and_the_rest_maps_the_same() {
+        let _g = fresh();
+        let huge = BASE + 0x2000_0000;
+        map_2m(huge, RW);
+        drain_split_pool();
+        assert_eq!(refill_split_pool(), SPLIT_POOL_FRAMES);
+        let (_, spent, _) = split_pool_stats();
+        let band = huge + 0x10_0000;
+        assert!(install(band, executor::TOP_GUARD_SIZE));
+        assert_eq!(split_pool_stats().1, spent + 1, "one table for one split");
+        for off in (0..0x20_0000).step_by(PAGE_SIZE) {
+            let va = huge + off;
+            let in_band = (band..band + executor::TOP_GUARD_SIZE).contains(&va);
+            assert_eq!(current_table().is_present(va), !in_band, "{:#x}", off);
+            let (pa, _, size) = entry(va).unwrap_or((0, MMUFlags::empty(), PageSize::Size4K));
+            if !in_band {
+                assert_eq!((pa, size), (PHYS + 0x2000_0000 + off, PageSize::Size4K));
+            }
+        }
+        remove(band, executor::TOP_GUARD_SIZE);
+        let (pa, flags, size) = entry(band).unwrap();
+        assert_eq!(
+            (pa, size),
+            (PHYS + 0x2000_0000 + 0x10_0000, PageSize::Size4K)
+        );
+        assert!(flags.contains(RW));
+        // A second band in the same region needs no frame: it is 4 KiB now.
+        assert!(install(band, executor::TOP_GUARD_SIZE));
+        assert_eq!(split_pool_stats().1, spent + 1);
+        remove(band, executor::TOP_GUARD_SIZE);
+    }
+
+    #[test]
+    fn with_the_reserve_spent_a_band_in_a_huge_page_is_refused_untouched() {
+        let _g = fresh();
+        let huge = BASE + 0x3000_0000;
+        map_2m(huge, RW);
+        drain_split_pool();
+        let (_, refused) = stats();
+        assert!(!install(huge, executor::TOP_GUARD_SIZE));
+        assert_eq!(stats().1, refused + 1);
+        assert!(!is_guard_fault(huge));
+        assert_eq!(entry(huge).map(|e| e.2), Some(PageSize::Size2M));
+        assert!(split_pool_stats().2 > 0, "counted as a missing frame");
+    }
+
+    #[test]
+    fn a_band_that_is_not_all_mapped_or_not_all_alike_is_refused_untouched() {
+        let _g = fresh();
+        // A hole in the middle of the band.
+        let a = BASE + 0x4000_0000;
+        map_4k(a, PAGE_SIZE * 8, RW);
+        map_4k(
+            a + PAGE_SIZE * 9,
+            executor::TOP_GUARD_SIZE - PAGE_SIZE * 9,
+            RW,
+        );
+        assert!(!install(a, executor::TOP_GUARD_SIZE));
+        assert!(!is_guard_fault(a));
+        assert!(current_table().is_present(a));
+        // One read-only page in it.
+        let b = BASE + 0x4100_0000;
+        map_4k(b, PAGE_SIZE, MMUFlags::READ);
+        map_4k(b + PAGE_SIZE, executor::TOP_GUARD_SIZE - PAGE_SIZE, RW);
+        assert!(!install(b, executor::TOP_GUARD_SIZE));
+        for off in (0..executor::TOP_GUARD_SIZE).step_by(PAGE_SIZE) {
+            assert!(current_table().is_present(b + off));
+        }
+        // Not page-aligned.
+        assert!(!install(b + 8, executor::TOP_GUARD_SIZE));
+    }
+
+    #[test]
+    fn remove_of_a_band_never_installed_changes_nothing() {
+        let _g = fresh();
+        let a = BASE + 0x5000_0000;
+        map_4k(a, executor::TOP_GUARD_SIZE, RW);
+        remove(a, executor::TOP_GUARD_SIZE);
+        assert!(current_table().is_present(a));
+        assert!(!is_guard_fault(a));
+    }
+
+    #[test]
+    fn a_quarantined_stack_reads_but_does_not_write_and_comes_back() {
+        let _g = fresh();
+        let a = BASE + 0x6000_0000;
+        let size = PAGE_SIZE * 32;
+        map_4k(a, size, RW);
+        let (live, ever, _) = quarantine_stats();
+        assert!(quarantine_protect(a, size));
+        assert_eq!(quarantine_stats().0, live + 1);
+        assert_eq!(quarantine_stats().1, ever + 1);
+        for off in (0..size).step_by(PAGE_SIZE) {
+            let (pa, flags, _) = entry(a + off).unwrap();
+            assert_eq!(pa, PHYS + 0x6000_0000 + off);
+            assert!(flags.contains(MMUFlags::READ) && !flags.contains(MMUFlags::WRITE));
+        }
+        assert!(is_quarantine_fault(a + size - 1));
+        assert!(!is_guard_fault(a), "a UAF, not an overflow");
+        quarantine_unprotect(a, size);
+        assert!(!is_quarantine_fault(a));
+        assert!(entry(a).unwrap().1.contains(RW));
+        assert_eq!(quarantine_stats().0, live);
+    }
+
+    #[test]
+    fn a_read_only_region_is_not_quarantined() {
+        let _g = fresh();
+        let a = BASE + 0x7000_0000;
+        map_4k(a, PAGE_SIZE * 4, MMUFlags::READ);
+        assert!(!quarantine_protect(a, PAGE_SIZE * 4));
+        assert!(!is_quarantine_fault(a));
+    }
 }
