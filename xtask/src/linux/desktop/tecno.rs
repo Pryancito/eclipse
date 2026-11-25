@@ -35,8 +35,6 @@ pub(super) fn install(rootfs: &Path) {
     write_theme(rootfs);
     write_foot(rootfs);
     write_gtk(rootfs);
-    // The Abyss session's look rides along: it borrows these buttons.
-    super::abyss_look::install(rootfs);
 }
 
 /// The widgets both GTK versions share: square, hairline-framed, cyan focus.

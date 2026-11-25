@@ -20,7 +20,7 @@
 //! fichero = /etc/eclipse/look
 //! clave   = look
 //! tipo    = elegir
-//! valores = tecno abyss eclipse kde win11 gnome
+//! valores = tecno eclipse kde win11 gnome
 //! aplicar = /usr/local/bin/eclipse-look {}
 //! es      = Aspecto del escritorio
 //! en      = Desktop look

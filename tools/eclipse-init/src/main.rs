@@ -3904,9 +3904,7 @@ fn compositor_exit(
     gpu: bool,
     bump: impl FnOnce() -> u32,
 ) -> Option<(u32, bool)> {
-    // Both sessions' compositors: Abyss renders on the same zink+NVK stack
-    // (it gets the same env from `build_child_env`) and can wedge the same way.
-    if !matches!(name, "labwc" | "abyss") || degraded || !gpu {
+    if name != "labwc" || degraded || !gpu {
         return None;
     }
     let n = bump() + 1;

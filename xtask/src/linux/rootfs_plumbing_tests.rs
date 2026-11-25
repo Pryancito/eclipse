@@ -633,31 +633,6 @@ fn a_service_gated_on_another_services_socket_requires_it() {
 fn every_boot_service_names_its_program_and_how_it_is_supervised() {
     // name, type, exec, after
     const BOOT: &[(&str, &str, &str, &str)] = &[
-        (
-            "abyss",
-            "respawn",
-            "/usr/local/bin/eclipse-abyss",
-            "abyss-seatd dbus",
-        ),
-        (
-            "abyss-hyperion-bar",
-            "respawn",
-            "/usr/local/bin/eclipse-abyss-client ec-hyperion-bar",
-            "abyss",
-        ),
-        (
-            "abyss-lunarbg",
-            "respawn",
-            "/usr/local/bin/eclipse-lunarbg",
-            "abyss",
-        ),
-        (
-            "abyss-lunarclip",
-            "respawn",
-            "/usr/local/bin/eclipse-lunarclip",
-            "abyss",
-        ),
-        ("abyss-seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
         // `*`: after every other service, in every session. See
         // `AFTER_EVERYTHING` in tools/eclipse-init.
         (
@@ -854,10 +829,8 @@ fn every_order_names_a_service_that_exists() {
 #[test]
 fn a_service_that_waits_for_a_socket_is_ordered_after_whatever_binds_it() {
     const BOUND_BY: &[(&str, &str)] = &[
-        // One seatd per session: a service has a single `desktop`.
-        ("/run/seatd.sock", "seatd abyss-seatd"),
+        ("/run/seatd.sock", "seatd"),
         ("/run/user/0/wayland-0", "labwc"),
-        ("/run/user/0/eclipse/abyss.sock", "abyss"),
         ("/run/user/0/bus", "dbus"),
     ];
     /// Everything a service is ordered after, directly or through another:
@@ -1618,10 +1591,7 @@ fn nothing_on_the_boot_path_waits_for_a_sound_card() {
         .collect();
     assert_eq!(
         waits,
-        [
-            ("abyss".to_string(), "/dev/input".to_string()),
-            ("labwc".to_string(), "/dev/input".to_string()),
-        ],
+        [("labwc".to_string(), "/dev/input".to_string())],
         "a service waits for a path that is not the compositor's input directory"
     );
 }
@@ -1742,13 +1712,6 @@ fn the_two_sessions_never_start_each_others_clients() {
         "xkbmap",
     ];
     const XORG: &[&str] = &["xorg"];
-    const ABYSS: &[&str] = &[
-        "abyss",
-        "abyss-hyperion-bar",
-        "abyss-seatd",
-        "abyss-lunarbg",
-        "abyss-lunarclip",
-    ];
     const EITHER: &[&str] = &[
         // The chime belongs to the boot, not to a session: tagged
         // `labwc`/`xorg` it was dropped on an image whose default session
@@ -1799,8 +1762,6 @@ fn the_two_sessions_never_start_each_others_clients() {
             Some("labwc")
         } else if XORG.contains(&name.as_str()) {
             Some("xorg")
-        } else if ABYSS.contains(&name.as_str()) {
-            Some("abyss")
         } else {
             assert!(
                 EITHER.contains(&name.as_str()),
@@ -1868,7 +1829,7 @@ fn the_minimal_table_has_no_service_the_apk_closure_would_have_to_supply() {
 ///
 /// The row shipped twice, `desktop = labwc` and `desktop = xorg`, and the
 /// desktop image's default session was `abyss` whenever `ec-abyss`
-/// landed in it (it can still be picked by hand): init drops every service tagged for
+/// landed in it (that session is gone now): init drops every service tagged for
 /// another session, so BOTH rows were dropped before the boot began and
 /// the image played nothing. A `desktop =` back on this row, or a second
 /// chime for a third session, is that bug again.

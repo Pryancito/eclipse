@@ -173,7 +173,7 @@ Al arrancar, `eclipse-boot-sound` reproduce
 `/usr/share/eclipse/Eclipse_Awakening.mp3` (`mpg123` por Pulse, o por la
 tarjeta ALSA 0 si no hay Pulse). Es **una sola fila de servicio**, sin
 `desktop =` y con `after = *`: suena al final del arranque en cualquier sesión
-(labwc, Xorg, Abyss) y también en una consola sin escritorio. Es de mejor
+(labwc, Xorg) y también en una consola sin escritorio. Es de mejor
 esfuerzo: sin reproductor o sin PCM sale con 0 y no se reintenta.
 
 En la imagen de instalación (la ISO) no se instala `pulseaudio.service`: su

@@ -151,7 +151,7 @@ si un hilo desalojado en modo usuario ha pasado más de la mitad de la CPU en mo
 usuario en la última ventana de 20 ms, va detrás de los despertados
 (`kernel_hal::thread::preempt_behind`), y la cuota del carril de cesión le da
 turnos de 250 µs mientras haya despertados esperando. Estuvo encendido por
-defecto y congelaba el escritorio en GPU (2x RTX 2060 SUPER, labwc y Abyss) unos
+defecto y congelaba el escritorio en GPU (2x RTX 2060 SUPER, labwc) unos
 20 s cada minuto: en un escritorio en GPU siempre hay despertados esperando
 (timers de vblank, sondeos de fences), así que el hilo que pinta se quedaba con
 turnos de 250 µs hasta que vencían los timeouts de 10 s de las fences. Con él

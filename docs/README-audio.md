@@ -162,7 +162,7 @@ DAI -- the HDA stream and its ring -- never sees a client.
 On boot, `eclipse-boot-sound` plays `/usr/share/eclipse/Eclipse_Awakening.mp3`
 (`mpg123` via Pulse, or ALSA card 0 without it). It is **one** service row, with
 no `desktop =` and `after = *`: it plays at the end of the boot under any
-session (labwc, Xorg, Abyss) and on a console with no desktop at all. It is
+session (labwc, Xorg) and on a console with no desktop at all. It is
 best-effort: with no player or no PCM it exits 0 and is not retried.
 
 The install medium (the ISO) installs no `pulseaudio.service`: its root is

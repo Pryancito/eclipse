@@ -39,9 +39,9 @@ fn the_control_follows_from_the_data() {
     let p = panel();
     let c = |id: &str| p.cat.claves.iter().find(|c| c.id == id).unwrap();
     assert!(
-        matches!(control(c("aspecto"), 0, 0, 800, Lang::Es), Control::Fichas(ref r) if r.len() == 6)
+        matches!(control(c("aspecto"), 0, 0, 800, Lang::Es), Control::Fichas(ref r) if r.len() == 5)
     );
-    // The same six values in too little room become a stepper.
+    // The same five values in too little room become a stepper.
     assert!(matches!(
         control(c("aspecto"), 0, 0, 200, Lang::Es),
         Control::Lista { .. }
@@ -109,9 +109,9 @@ fn a_held_change_is_dropped_by_undo_and_by_choosing_the_old_value() {
     assert_eq!(p.valor(i), "kde");
     p.elige(i, "tecno".into());
     assert_eq!(p.pendientes(), 0);
-    p.elige(i, "abyss".into());
+    p.elige(i, "gnome".into());
     p.elige(i, "nope".into());
-    assert_eq!(p.valor(i), "abyss");
+    assert_eq!(p.valor(i), "gnome");
     p.deshaz();
     assert_eq!(p.pendientes(), 0);
     assert_eq!(p.valor(i), "tecno");
@@ -177,7 +177,7 @@ fn a_held_boot_or_program_is_dropped_by_choosing_what_is_in_force() {
     p.serv.elige("hunterd", true);
     assert!(p.serv.pendiente.is_empty());
     // An essential service is never held off.
-    p.serv.elige("abyss", false);
+    p.serv.elige("labwc", false);
     assert!(p.serv.pendiente.is_empty());
 
     p.aper.pendiente.clear();

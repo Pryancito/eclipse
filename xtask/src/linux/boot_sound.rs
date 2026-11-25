@@ -18,7 +18,7 @@ pub(super) fn service(svc_dir: &Path) {
     //
     // It shipped as TWO rows, `desktop = labwc` and `desktop = xorg`,
     // while the desktop image's default session was `abyss` whenever
-    // `ec-abyss` landed in it (it can still be picked by hand). Init drops every service
+    // `ec-abyss` landed in it (the Abyss session is gone now). Init drops every service
     // tagged for another session, so BOTH were dropped before the boot
     // began and the image played nothing; a third row would have fixed
     // that boot and broken the next session added.
