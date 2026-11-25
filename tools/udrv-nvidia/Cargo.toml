@@ -1,0 +1,90 @@
+[package]
+name = "udrv-nvidia"
+version = "0.1.0"
+edition = "2021"
+description = "The NVIDIA GPU driver as a process: the kernel's driver, unchanged, over Zircon"
+
+# Standalone, like eclipse-udrivers: it targets userspace
+# (x86_64-unknown-linux-musl), not the zCore bare-metal target.
+[workspace]
+
+[dependencies]
+zcore-drivers = { path = "../../drivers" }
+nvidia-rm-sys = { path = "../../nvidia-rm-sys", features = ["user"] }
+pci = { git = "https://github.com/elliott10/pci-rs", rev = "8f33774b" }
+
+
+# The kernel workspace's own [patch] sections (root Cargo.toml), so the
+# driver resolves the same vendored crates it is built with in the kernel.
+[patch."https://github.com/DeathWish5/PreemptiveScheduler"]
+executor = { path = "../../vendor/PreemptiveScheduler" }
+
+[patch.crates-io]
+funty = { git = "https://github.com/ferrilab/funty", rev = "7ef0d89" }
+# Evita dependencias clap >= 4.6 (edition 2024) con este Cargo.
+clap = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
+clap_builder = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
+clap_derive = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
+clap_lex = { git = "https://github.com/clap-rs/clap", tag = "v4.4.18" }
+# `idna_adapter` >= 1.2.x usa edition 2024; fijamos a una versión compatible.
+idna_adapter = { git = "https://github.com/hsivonen/idna_adapter", tag = "v1.1.0" }
+# `x86_64` ≤0.15.4 no implementa `Step::{forward,backward}_overflowing`
+# (nightly ≥ 2026-07-10). 0.15.5 es el primer release compatible.
+x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.5" }
+# Cargo 1.74 (toolchain nightly-2023-10-01) no soporta crates con edition 2024.
+# `time-core` >= 0.1.8 usa edition 2024; fijamos `time` a una versión anterior.
+time = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
+time-core = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
+# trapframe vendorizado en vendor/trapframe: añade almacenamiento per-CPU en la
+# región apuntada por GSBASE (estilo ProcessorControlRegion de Redox), para
+# acceder al PercpuBlock por registro en lugar de indexar arrays por CPU id.
+trapframe = { path = "../../vendor/trapframe" }
+# buddy_system_allocator 0.8.0 plus `Heap::take_free_block`: the kernel heap
+# grows by taking chunks of RAM, and without a way to take a free block back
+# out of the buddy that memory never went back to the frame allocator.
+buddy_system_allocator = { path = "../../vendor/buddy_system_allocator" }
+
+# kernel-sync (`lock`) vendorizado en vendor/kernel-sync: añade el mapeo
+# APIC ID -> id lógico denso para que los arrays per-CPU no se desborden bajo SMP.
+[patch."https://github.com/DeathWish5/kernel-sync"]
+lock = { path = "../../vendor/kernel-sync" }
+
+[patch."https://github.com/rcore-os/rcore-fs"]
+rcore-fs = { path = "../../vendor/rcore-fs" }
+rcore-fs-mountfs = { path = "../../vendor/rcore-fs-mountfs" }
+rcore-fs-ramfs = { path = "../../vendor/rcore-fs-ramfs" }
+# And a third time, the same trap as -devfs and -sefs below: 6839247 added
+# `ftype` to vendor/rcore-fs's FsInfo (Linux `statfs.f_type`), and -hostfs was
+# the last member of this repository still resolving to the upstream checkout,
+# whose `info()` builds FsInfo with a struct literal -- E0063, which is what
+# turned the `test-libos` job red: `loader` depends on it unconditionally.
+rcore-fs-hostfs = { path = "../../vendor/rcore-fs-hostfs" }
+# rcore-fs-sfs was vendored in the same import as the three above (with
+# `alloc_block` returning `None` -> `FsError::NoDeviceSpace` instead of
+# `panic!`), but never listed here, so every build still linked the upstream
+# checkout -- whose `alloc_block` panics the kernel the moment the root SFS
+# image runs out of blocks ("[Dirty] SuperBlock { ..., unused_blocks: 0 }"
+# at rcore-fs-sfs/src/lib.rs:857). A full disk must be ENOSPC to the writer,
+# not a halted CPU.
+rcore-fs-sfs = { path = "../../vendor/rcore-fs-sfs" }
+# Same story again, and the reason the x86_64 kernel and `cargo xtask` both
+# stopped building: c48e2bb added a `hangup` field to vendor/rcore-fs's
+# PollStatus (Linux POLLHUP), but these two were still resolving to the
+# upstream git checkout, whose `poll()` builds PollStatus with a struct
+# literal and therefore fails E0063. -devfs is a direct dependency of
+# linux-object (11 use sites); -sefs comes in transitively through
+# rcore-fs-fuse, which xtask needs to build the rootfs image.
+rcore-fs-devfs = { path = "../../vendor/rcore-fs-devfs" }
+rcore-fs-sefs = { path = "../../vendor/rcore-fs-sefs" }
+
+[patch."https://github.com/rcore-os/rcore-console"]
+rcore-console = { path = "../../vendor/rcore-console" }
+
+# Without this the tree vendored the virtio drivers and then built the git rev
+# anyway: `Cargo.lock` resolved `virtio-drivers` to
+# `git+...?rev=2aaf7d6`, so `vendor/virtio-drivers` was a copy nothing
+# compiled. It had already drifted -- it carries a `VirtIOGpu::flush_region`
+# (damage-rectangle flush) that has never been built and has no caller.
+[patch."https://github.com/rcore-os/virtio-drivers"]
+virtio-drivers = { path = "../../vendor/virtio-drivers" }
+

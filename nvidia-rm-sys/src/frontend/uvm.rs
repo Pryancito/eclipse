@@ -30,7 +30,7 @@ use lock::Mutex;
 /// `NV_ERR_INVALID_CLIENT` (nvstatuscodes.h).
 pub const NV_ERR_INVALID_CLIENT: NV_STATUS = 0x0000_0023;
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_frontend_uvm_va_space(
         os_info: *mut c_void,
@@ -99,7 +99,7 @@ extern "C" {
 
 // Hosted builds compile no RM C (build.rs): no client exists, so there is
 // none to find a VA space in, map in or free from.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_va_space(
     _os_info: *mut c_void,
     _h_client: NvU32,
@@ -109,7 +109,7 @@ unsafe fn eclipse_rm_frontend_uvm_va_space(
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn eclipse_rm_frontend_uvm_map(
     _os_info: *mut c_void,
@@ -126,7 +126,7 @@ unsafe fn eclipse_rm_frontend_uvm_map(
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_free(
     _os_info: *mut c_void,
     _admin: NvU32,
@@ -135,7 +135,7 @@ unsafe fn eclipse_rm_frontend_uvm_free(
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_pages(
     _os_info: *mut c_void,
     _h_client: NvU32,
@@ -147,7 +147,7 @@ unsafe fn eclipse_rm_frontend_uvm_pages(
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_user_pages(
     _os_info: *mut c_void,
     _h_client: NvU32,
@@ -159,7 +159,7 @@ unsafe fn eclipse_rm_frontend_uvm_user_pages(
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn eclipse_rm_frontend_uvm_sked(
     _os_info: *mut c_void,
@@ -175,7 +175,7 @@ unsafe fn eclipse_rm_frontend_uvm_sked(
     NV_ERR_INVALID_CLIENT
 }
 
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_p2p_caps(
     _gpu_instance_a: NvU32,
     _gpu_instance_b: NvU32,
@@ -188,7 +188,7 @@ unsafe fn eclipse_rm_frontend_uvm_p2p_caps(
 }
 
 /// `NV_ERR_INVALID_DEVICE` (nvstatuscodes.h).
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 const NV_ERR_INVALID_DEVICE: NV_STATUS = 0x0000_0026;
 
 /// What the RM says of peer access between two GPUs: each

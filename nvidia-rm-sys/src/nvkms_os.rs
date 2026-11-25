@@ -19,7 +19,7 @@
 //!   deadlock against the thread that holds it on the same CPU. The driver
 //!   that loads nvkms (PR 3) is the one that calls it.
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 use crate::rm_init::RmGate;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -420,7 +420,7 @@ pub extern "C" fn nvkms_log(level: c_int, gpu_prefix: *const c_char, msg: *const
 // The RM
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_kernel_rmapi_op(ops: *mut c_void);
     fn eclipse_rm_enumerate_gpus(gpu_info: *mut c_void) -> u32;
@@ -443,12 +443,12 @@ extern "C" {
 /// one more client of the RM, and the RM here takes one caller at a time.
 #[no_mangle]
 pub extern "C" fn nvkms_call_rm(ops: *mut c_void) {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let _gate = RmGate::lock();
         unsafe { eclipse_rm_kernel_rmapi_op(ops) };
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         // Hosted builds compile no RM and never load nvkms.
         let _ = ops;
@@ -459,12 +459,12 @@ pub extern "C" fn nvkms_call_rm(ops: *mut c_void) {
 /// gpu id. `gpu_info` has room for `NV_MAX_GPUS` entries.
 #[no_mangle]
 pub extern "C" fn nvkms_enumerate_gpus(gpu_info: *mut c_void) -> u32 {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let _gate = RmGate::lock();
         unsafe { eclipse_rm_enumerate_gpus(gpu_info) }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         let _ = gpu_info;
         0
@@ -476,12 +476,12 @@ pub extern "C" fn nvkms_enumerate_gpus(gpu_info: *mut c_void) -> u32 {
 /// so opening one only has to find it.
 #[no_mangle]
 pub extern "C" fn nvkms_open_gpu(gpu_id: u32) -> u8 {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let _gate = RmGate::lock();
         unsafe { eclipse_rm_gpu_id_attached(gpu_id) }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         let _ = gpu_id;
         0
@@ -495,7 +495,7 @@ pub extern "C" fn nvkms_open_gpu(gpu_id: u32) -> u8 {
 /// `allocateDevice`, which is where nvkms imports the console. The RM status
 /// on failure; a GPU that already has a console region answers `Ok`.
 pub fn describe_console(gpu_id: u32) -> Result<(), u32> {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let _gate = RmGate::lock();
         match unsafe { eclipse_nvkms_describe_console(gpu_id) } {
@@ -503,7 +503,7 @@ pub fn describe_console(gpu_id: u32) -> Result<(), u32> {
             status => Err(status),
         }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         let _ = gpu_id;
         Err(0x56) // NV_ERR_NOT_SUPPORTED
@@ -705,7 +705,7 @@ pub fn check_vidmem(
     size: u32,
     repair: bool,
 ) -> Result<VidmemCheck, u32> {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let mut out = VidmemCheck::default();
         let _gate = RmGate::lock();
@@ -725,7 +725,7 @@ pub fn check_vidmem(
             status => Err(status),
         }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         let _ = (gpu_id, h_client, h_memory, want, cpu, size, repair);
         Err(0x56) // NV_ERR_NOT_SUPPORTED
@@ -817,7 +817,7 @@ pub extern "C" fn eclipse_boot_console(out: *mut BootConsole) -> u8 {
 // Loading nvkms
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn nvKmsModuleLoad() -> u8;
 }
@@ -837,10 +837,10 @@ pub fn module_load() -> bool {
     NVKMS_LOCK.down();
     let mut state = MODULE_STATE.load(Ordering::Relaxed);
     if state == 0 {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         let ok = unsafe { nvKmsModuleLoad() } != 0;
         // Hosted builds compile no nvkms.
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         let ok = false;
         state = if ok { LOADED } else { LOAD_FAILED };
         MODULE_STATE.store(state, Ordering::Relaxed);
