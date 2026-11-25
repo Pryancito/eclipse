@@ -11,17 +11,17 @@ use super::*;
 use alloc::vec;
 
 /// One node of the tree, with where it was found and who found it.
-struct Node {
-    path: String,
-    inode: Arc<dyn INode>,
-    parent_ino: usize,
-    type_: FileType,
+pub(super) struct Node {
+    pub(super) path: String,
+    pub(super) inode: Arc<dyn INode>,
+    pub(super) parent_ino: usize,
+    pub(super) type_: FileType,
 }
 
 /// Every node reachable from `/sys`, without following a symlink --
 /// following them would make the walk infinite, and they get a test of
 /// their own.
-fn whole_tree() -> Vec<Node> {
+pub(super) fn whole_tree() -> Vec<Node> {
     let mut out: Vec<Node> = vec![];
     let root = SYS_ROOT.clone();
     let root_ino = root.metadata().unwrap().inode;
@@ -57,7 +57,7 @@ fn whole_tree() -> Vec<Node> {
 }
 
 /// What `readdir` would return: `get_entry` from 0 until it stops.
-fn listing(node: &Arc<dyn INode>) -> Vec<String> {
+pub(super) fn listing(node: &Arc<dyn INode>) -> Vec<String> {
     let mut names = vec![];
     for id in 0.. {
         match node.get_entry(id) {
@@ -72,7 +72,7 @@ fn listing(node: &Arc<dyn INode>) -> Vec<String> {
     names
 }
 
-fn contents(node: &Arc<dyn INode>) -> Vec<u8> {
+pub(super) fn contents(node: &Arc<dyn INode>) -> Vec<u8> {
     let mut out = vec![];
     let mut buf = [0u8; 64];
     loop {

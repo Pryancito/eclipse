@@ -3238,6 +3238,9 @@ mod devfs_once_tests;
 mod mount_lookup_tests;
 
 #[cfg(test)]
+mod udev_db_tests;
+
+#[cfg(test)]
 mod tests {
     use super::split_path;
 

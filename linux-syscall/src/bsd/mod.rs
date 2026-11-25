@@ -37,6 +37,9 @@ pub mod fs;
 pub mod sysctl;
 pub mod translate;
 
+#[cfg(test)]
+mod dispatch_tests;
+
 /// The three values a FreeBSD/amd64 syscall hands back to userland.
 pub struct BsdRet {
     /// Primary return value (`rax`), or the positive errno on error.

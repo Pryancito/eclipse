@@ -58,6 +58,8 @@ pub(crate) mod owner;
 mod owner_tests;
 #[cfg(test)]
 mod pid_stat_tests;
+#[cfg(test)]
+mod pid_tree_tests;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 #[cfg(test)]
@@ -66,6 +68,8 @@ mod seq_tests;
 mod stat_tests;
 /// `/proc/<pid>/status`, in its own file for the same reason.
 mod status;
+#[cfg(test)]
+mod sys_tests;
 #[cfg(test)]
 mod zombie_tests;
 use hunter_feed_proc::ProcHunterFeedINode;
