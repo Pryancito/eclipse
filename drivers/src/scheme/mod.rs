@@ -9,6 +9,7 @@ pub(super) mod audio;
 pub(super) mod block;
 pub(super) mod display;
 pub mod drm;
+pub mod drm_remote;
 pub mod gem_mmap;
 pub(super) mod input;
 pub(super) mod irq;

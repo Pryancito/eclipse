@@ -29,6 +29,7 @@
 //! program that made the call, as its own `read` and `write` would. The
 //! server must not open its own node: the open would wait on itself.
 
+pub mod card;
 pub mod input;
 mod link;
 #[cfg(test)]

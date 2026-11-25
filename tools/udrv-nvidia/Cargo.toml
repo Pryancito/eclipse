@@ -12,6 +12,7 @@ description = "The NVIDIA GPU driver as a process: the kernel's driver, unchange
 zcore-drivers = { path = "../../drivers", features = ["process"] }
 udrivers = { package = "eclipse-udrivers", path = "../eclipse-udrivers" }
 nvidia-rm-sys = { path = "../../nvidia-rm-sys", features = ["user"] }
+libc = "0.2"
 pci = { git = "https://github.com/elliott10/pci-rs", rev = "8f33774b" }
 
 

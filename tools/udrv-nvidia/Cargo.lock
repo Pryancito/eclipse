@@ -345,6 +345,7 @@ name = "udrv-nvidia"
 version = "0.1.0"
 dependencies = [
  "eclipse-udrivers",
+ "libc",
  "nvidia-rm-sys",
  "pci",
  "zcore-drivers",

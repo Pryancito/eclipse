@@ -13,6 +13,7 @@
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
 //!   through the mapper, DMA memory through the claim. The driver itself
 //!   is not run.
+mod drm;
 mod gpu;
 mod mapper;
 mod platform;
@@ -41,6 +42,7 @@ fn main() {
             };
             check(hex(1), hex(2))
         }
+        Some("drm-check") => drm_check(),
         n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
     }
 }
@@ -54,14 +56,136 @@ fn run(index: usize) {
         "{NAME}: {:04x}:{:04x} at {:02x}:{:02x}.{}",
         gpu.dev.id.vendor_id, gpu.dev.id.device_id, gpu.loc.bus, gpu.loc.device, gpu.loc.function
     );
-    match drv.init(&gpu.dev, &Some(mapper), None) {
-        Ok(_device) => println!("{NAME}: {} up", drv.name()),
+    let card = match drv.init(&gpu.dev, &Some(mapper), None) {
+        Ok(zcore_drivers::Device::DrmDisplay(card, _)) => card,
+        Ok(_) => fail(format!("{}: not a DRM card", drv.name())),
         Err(e) => fail(format!("{}: {e:?}", drv.name())),
+    };
+    println!("{NAME}: {} up, serving it", drv.name());
+    match drm::serve(card) {
+        Ok(why) => fail(format!("the kernel let go of the card: {why}")),
+        Err(e) => fail(e),
     }
-    // Nothing serves it yet: hold the GPU, as its driver.
-    loop {
-        std::thread::park();
+}
+
+/// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.
+const GETRESOURCES: u64 = 0xc040_64a0;
+
+#[repr(C)]
+#[derive(Default)]
+struct CardRes {
+    fbs: u64,
+    crtcs: u64,
+    connectors: u64,
+    encoders: u64,
+    count_fbs: u32,
+    count_crtcs: u32,
+    count_connectors: u32,
+    count_encoders: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+/// The CRTCs and connectors the node at `path` lists.
+fn resources(path: &str) -> Option<(Vec<u32>, Vec<u32>)> {
+    resources_of(&open_rw(path)?)
+}
+
+fn open_rw(path: &str) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()
+}
+
+/// `DRM_IOCTL_VERSION` with no buffers: the lengths only.
+fn version_of(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    const VERSION: u64 = 0xc040_6400;
+    let mut v = [0u64; 8];
+    // SAFETY: `v` is the 64 bytes of `struct drm_version`, with every
+    // buffer pointer null and every length 0.
+    unsafe { libc::ioctl(file.as_raw_fd(), VERSION as _, v.as_mut_ptr()) };
+}
+
+/// What `GETRESOURCES` on `file` lists.
+fn resources_of(file: &std::fs::File) -> Option<(Vec<u32>, Vec<u32>)> {
+    use std::os::fd::AsRawFd;
+    let mut crtcs = vec![0u32; 16];
+    let mut connectors = vec![0u32; 16];
+    let mut res = CardRes {
+        crtcs: crtcs.as_mut_ptr() as u64,
+        connectors: connectors.as_mut_ptr() as u64,
+        count_crtcs: 16,
+        count_connectors: 16,
+        ..CardRes::default()
+    };
+    // SAFETY: `res` and the two arrays it points to outlive the call.
+    if unsafe { libc::ioctl(file.as_raw_fd(), GETRESOURCES as _, &mut res) } != 0 {
+        return None;
     }
+    crtcs.truncate(res.count_crtcs.min(16) as usize);
+    connectors.truncate(res.count_connectors.min(16) as usize);
+    Some((crtcs, connectors))
+}
+
+/// `udrv-nvidia drm-check`: serve a card with nothing behind it
+/// (`drm::check::Card`) and check, through its node, that the kernel's
+/// DRM core asks it: the card the driver of a GPU is served as, without
+/// the GPU.
+fn drm_check() {
+    use drm::check::{Card, CONNECTOR, CRTC};
+    let ok = |what: &str, ok: bool| {
+        println!("{NAME}: {what}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            exit(1);
+        }
+    };
+    let card = std::sync::Arc::new(Card::default());
+    let served = card.clone();
+    std::thread::spawn(move || match drm::serve(served) {
+        Ok(why) => fail(format!("the kernel let go of the card: {why}")),
+        Err(e) => fail(e),
+    });
+    let mut node = None;
+    for _ in 0..200 {
+        node = (0..8)
+            .map(|n| format!("/dev/dri/card{n}"))
+            .find(|path| resources(path).is_some_and(|(crtcs, _)| crtcs.contains(&CRTC)));
+        if node.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    println!("{NAME}: node {node:?}");
+    let node = node.unwrap_or_else(|| fail("no node lists the card's CRTC".into()));
+    ok("the card is served as a node of /dev/dri", true);
+    ok(
+        "its node lists its own CRTC and connector",
+        resources(&node) == Some((vec![CRTC], vec![CONNECTOR])),
+    );
+    // What a call to the card costs, there and back, beside an ioctl the
+    // kernel answers alone (`DRM_IOCTL_VERSION`, of the cached name).
+    let file = open_rw(&node).unwrap_or_else(|| fail("the node does not open".into()));
+    let n = 2000;
+    let time = |what: &str, f: &dyn Fn()| {
+        let answered = || drm::ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
+        let (t, calls) = (std::time::Instant::now(), answered());
+        for _ in 0..n {
+            f();
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let calls = (answered() - calls) as f64 / n as f64;
+        println!("{NAME}: {what}: {us:.1} us, {calls:.1} calls to the card");
+    };
+    time("GETRESOURCES through the served card", &|| {
+        let _ = resources_of(&file);
+    });
+    time("VERSION, the kernel alone", &|| version_of(&file));
+    println!("{NAME}: drm-check: ok");
 }
 
 fn check(vendor: u16, device: u16) {

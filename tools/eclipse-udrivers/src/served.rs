@@ -360,6 +360,44 @@ impl Node {
         })
     }
 
+    /// Serve a DRM card (`ECLIPSE_DRM_SERVE`): the kernel's DRM core
+    /// counts it with the others and puts a node in `/dev/dri` for it, and
+    /// each call it makes of the card is a request here. `hello` is what
+    /// the card says of itself (`zcore_drivers::scheme::drm_remote::hello`).
+    pub fn serve_drm(hello: &[u8]) -> Result<Node, String> {
+        let (fifo, theirs) =
+            Fifo::<Msg>::create(SLOTS * 4).map_err(|e| format!("fifo_create: {e}"))?;
+        let (window, vmo) = zx::shared_memory(SLOTS * SLOT_LEN)?;
+        // SAFETY: the kernel reads `hello.len()` bytes of `hello`; both
+        // handles go to it.
+        unsafe {
+            zx::call(
+                nr::ECLIPSE_DRM_SERVE,
+                [
+                    theirs as usize,
+                    vmo as usize,
+                    hello.as_ptr() as usize,
+                    hello.len(),
+                    0,
+                    0,
+                ],
+            )
+        }
+        .map_err(|e| format!("drm_serve: {e}"))?;
+        Ok(Node {
+            fifo,
+            window,
+            held: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The bytes of request `req`'s slot: what it carries in, and where its
+    /// answer goes out. Only while it is being answered.
+    #[allow(clippy::mut_from_ref)]
+    pub fn slot_of(&self, req: &Msg) -> &mut [u8] {
+        self.slot(req.reqid)
+    }
+
     /// Say that open `fh` is now as `mask` says. From any thread. Said
     /// while a batch is being answered, it goes out with the replies, in
     /// the same write: a message apart wakes the kernel for nothing but
