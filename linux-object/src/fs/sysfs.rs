@@ -3557,6 +3557,15 @@ mod net_carrier_tests {
 mod tree_tests;
 
 #[cfg(test)]
+mod linux_shape_tests;
+
+#[cfg(test)]
+mod attr_tests;
+
+#[cfg(test)]
+mod input_tests;
+
+#[cfg(test)]
 mod cpu_list_tests {
     use super::cpu_list_text;
 
