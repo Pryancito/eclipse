@@ -59,7 +59,8 @@ fn every_directory_is_a_directory_nobody_writes_into() {
             let md = node.inode.metadata().unwrap();
             assert!(md.nlinks >= 2, "{}", node.path);
             assert_eq!((md.uid, md.gid), (0, 0), "{}", node.path);
-            assert_ne!(md.mode & 0o555, 0, "{} can be listed", node.path);
+            // `kernfs_create_dir`: `S_IRWXU | S_IRUGO | S_IXUGO`, `drwxr-xr-x`.
+            assert_eq!(md.mode & 0o7777, 0o755, "{}", node.path);
             assert!(node.inode.write_at(0, b"x").is_err(), "{}", node.path);
             let poll = node.inode.poll().unwrap();
             assert!(poll.read && !poll.error, "{}", node.path);
@@ -171,6 +172,22 @@ fn a_network_card_says_its_hardware_address() {
         assert_eq!(read("eth0", "operstate"), "up\n");
         assert_eq!(read("lo", "address"), "00:00:00:00:00:00\n");
         assert_eq!(read("lo", "operstate"), "unknown\n");
+        // `net-sysfs.c`: the MTU `SIOCGIFMTU` gives, `ARPHRD_*`, the index
+        // `if_nametoindex` gives, and `dev->flags` in hex (UP|BROADCAST|
+        // MULTICAST is 0x1003, UP|LOOPBACK is 0x9: no RUNNING, which is
+        // not a flag of the device but of `dev_get_flags`).
+        assert_eq!(read("eth0", "mtu"), "9000\n");
+        assert_eq!(read("lo", "mtu"), "65536\n");
+        assert_eq!(read("eth0", "type"), "1\n");
+        assert_eq!(read("lo", "type"), "772\n");
+        assert_eq!(read("eth0", "ifindex"), "1\n");
+        assert_eq!(read("lo", "ifindex"), "2\n");
+        assert_eq!(read("eth0", "flags"), "0x1003\n");
+        assert_eq!(read("lo", "flags"), "0x9\n");
+        let attrs = listing(&net.find("eth0").unwrap());
+        for a in ["mtu", "type", "ifindex", "flags"] {
+            assert!(attrs.contains(&String::from(a)), "{} is listed", a);
+        }
         // A card that is listed is a directory of its own, numbered apart
         // from the other.
         let a = net.find("eth0").unwrap().metadata().unwrap();
