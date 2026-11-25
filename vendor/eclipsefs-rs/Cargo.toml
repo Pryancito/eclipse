@@ -10,7 +10,8 @@ std = []
 
 [lints.rust]
 # Set by `cargo llvm-cov` on nightly: test modules are left out of coverage.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+# `cfg(kani)` is set by `cargo kani` (see `src/kani_proofs.rs`).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(kani)"] }
 
 [dependencies]
 log = "0.4"

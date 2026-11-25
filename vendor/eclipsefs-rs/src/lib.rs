@@ -51,6 +51,10 @@ pub(crate) mod testdisk;
 pub mod v3;
 pub mod volume;
 
+// `cargo kani` from this directory: see `kani_proofs.rs`.
+#[cfg(kani)]
+mod kani_proofs;
+
 #[cfg(all(test, coverage_nightly))]
 extern crate self as eclipsefs;
 #[cfg(all(test, coverage_nightly, feature = "std"))]

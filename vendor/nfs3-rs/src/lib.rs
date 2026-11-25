@@ -65,5 +65,9 @@ pub mod source;
 pub mod transport;
 pub mod xdr;
 
+// `cargo kani` from this directory: see `kani_proofs.rs`.
+#[cfg(kani)]
+mod kani_proofs;
+
 /// The time every NFS attribute carries, as the kernel's VFS has it.
 pub use rcore_fs::vfs::Timespec;

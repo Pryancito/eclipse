@@ -28,6 +28,10 @@ pub mod structs;
 pub mod tree;
 pub mod volume;
 
+// `cargo kani` from this directory: see `kani_proofs.rs`.
+#[cfg(kani)]
+mod kani_proofs;
+
 pub use device::BlockDevice;
 pub use fs::{Btrfs, DirEntry, FsStat, InodeStat};
 pub use structs::FileKind;
