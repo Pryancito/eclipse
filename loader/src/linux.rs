@@ -868,7 +868,7 @@ async fn wait_then_read(channel: Arc<zircon_object::ipc::Channel>, args: [usize;
 /// kernel: `Err` only when the caller's own buffer fails.
 #[cfg(feature = "zircon-gateway")]
 fn copy_client_memory(
-    client: &Arc<Process>,
+    vmar: &zircon_object::vm::VmAddressRegion,
     addr: usize,
     buf: usize,
     len: usize,
@@ -877,7 +877,6 @@ fn copy_client_memory(
     use kernel_hal::user::{UserInPtr, UserOutPtr};
     use linux_object::process::remote_memory;
     use zircon_object::vm::PAGE_SIZE;
-    let vmar = client.vmar();
     let mut page = alloc::vec![0u8; PAGE_SIZE];
     let mut done = 0;
     while done < len {
@@ -890,9 +889,9 @@ fn copy_client_memory(
                 .read_array(n)
                 .map_err(|_| ZxError::INVALID_ARGS)?;
             chunk.copy_from_slice(&bytes);
-            remote_memory::write(&vmar, there, chunk)
+            remote_memory::write(vmar, there, chunk)
         } else {
-            let got = remote_memory::read(&vmar, there, chunk);
+            let got = remote_memory::read(vmar, there, chunk);
             UserOutPtr::<u8>::from(here)
                 .write_array(&chunk[..got])
                 .map_err(|_| ZxError::INVALID_ARGS)?;
@@ -1049,7 +1048,7 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
                 Err(e) => return status(e),
             };
             let to_client = args[5] & ECLIPSE_MEMORY_TO_CLIENT != 0;
-            match copy_client_memory(&client, args[2], args[3], args[4], to_client) {
+            match copy_client_memory(&client.vmar(), args[2], args[3], args[4], to_client) {
                 Ok(n) => n as isize,
                 Err(e) => status(e),
             }
@@ -1072,6 +1071,16 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
             Err(e) => status(e),
         },
         device_port::ECLIPSE_DEVICE_PORT => device_port::device_port(proc, args),
+        dev_serve::ECLIPSE_DEV_MEMORY => {
+            let to_client = args[5] & ECLIPSE_MEMORY_TO_CLIENT != 0;
+            match dev_serve::asker(proc, args) {
+                Ok(vmar) => match copy_client_memory(&vmar, args[2], args[3], args[4], to_client) {
+                    Ok(n) => n as isize,
+                    Err(e) => status(e),
+                },
+                Err(e) => status(e),
+            }
+        }
         ECLIPSE_NETSTACK_SERVE => match netstack_serve(proc, args) {
             Ok(()) => 0,
             Err(e) => status(e),

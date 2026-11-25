@@ -470,3 +470,94 @@ fn a_name_is_a_few_plain_names() {
         assert!(!valid_name(bad), "{}", bad);
     }
 }
+
+/// A request on a bare link whose server, a thread, reads `len` bytes of
+/// the asker's memory at `addr` while the request waits, writes them back
+/// upper-cased, and answers with how many it read. What the server saw
+/// of the request (its id) comes back for the checks after the answer.
+fn lend(asker: Option<Arc<VmAddressRegion>>, addr: u64, len: u64) -> (i64, u32, Arc<Fifo>) {
+    use crate::process::remote_memory;
+    let (ours, theirs) = Fifo::create(SLOTS * 2, MSG);
+    let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+    let koid = ours.id();
+    let link = Arc::new(Link::new(ours, window).unwrap());
+    remember(koid, &link);
+    let server_end = theirs.clone();
+    let server = thread::spawn(move || loop {
+        let mut m = [0u8; MSG];
+        match theirs.read(MSG, &mut m, 1) {
+            Ok(_) => {}
+            Err(ZxError::SHOULD_WAIT) => {
+                thread::yield_now();
+                continue;
+            }
+            Err(e) => panic!("{:?}", e),
+        }
+        let req = Msg::decode(&m);
+        // Another request's id, or another FIFO, reaches nothing.
+        assert!(asker_of(theirs.as_ref(), req.reqid ^ (1 << 20)).is_none());
+        let status = match asker_of(theirs.as_ref(), req.reqid) {
+            None => -14,
+            Some(vmar) => {
+                let mut got = vec![0u8; req.b as usize];
+                let n = remote_memory::read(&vmar, req.a as usize, &mut got);
+                got.make_ascii_uppercase();
+                remote_memory::write(&vmar, req.a as usize, &got[..n]);
+                n as i64
+            }
+        };
+        let reply = Msg {
+            op: req.op,
+            reqid: req.reqid,
+            fh: req.fh,
+            b: status as u64,
+            ..Msg::default()
+        };
+        send(&theirs, reply);
+        return req.reqid;
+    });
+    let answer = link.call_for(asker, OP_IOCTL, 1, 0, addr, len, &[]);
+    let reqid = server.join().unwrap();
+    let status = match answer {
+        Ok(a) => a.count as i64,
+        Err(Fail::Said(e)) => -(e as i64),
+        Err(Fail::Gone) => panic!("gone"),
+    };
+    (status, reqid, server_end)
+}
+
+/// An address space with `text` at the address returned.
+fn asker_with(text: &[u8]) -> (Arc<VmAddressRegion>, Arc<VmObject>, u64) {
+    let vmar = VmAddressRegion::new_root();
+    let vmo = VmObject::new_paged(1);
+    vmo.write(0, text).unwrap();
+    let flags = zircon_object::vm::MMUFlags::READ | zircon_object::vm::MMUFlags::WRITE;
+    let at = vmar.map(None, vmo.clone(), 0, 4096, flags).unwrap();
+    (vmar, vmo, at as u64)
+}
+
+#[test]
+fn a_waiting_ioctl_lends_its_memory_to_the_server_until_it_is_answered() {
+    let (vmar, vmo, at) = asker_with(b"hello, nvidia");
+    let (status, reqid, server_end) = lend(Some(vmar), at, 5);
+    assert_eq!(status, 5);
+    let mut back = [0u8; 13];
+    vmo.read(0, &mut back).unwrap();
+    assert_eq!(&back, b"HELLO, nvidia");
+    // Answered: out of reach again.
+    assert!(asker_of(server_end.as_ref(), reqid).is_none());
+}
+
+#[test]
+fn the_server_reads_no_further_than_the_asker_could() {
+    let (vmar, _vmo, at) = asker_with(b"edge");
+    // The page after the mapping is a hole: the copy stops at it.
+    let (status, _, _) = lend(Some(vmar), at + 4096 - 2, 8);
+    assert_eq!(status, 2);
+}
+
+#[test]
+fn a_request_that_lent_nothing_reaches_nothing() {
+    let (status, _, _) = lend(None, 0x1000, 4);
+    assert_eq!(status, -14);
+}

@@ -244,6 +244,66 @@ pub trait Device {
     }
 }
 
+std::thread_local! {
+    /// The request this thread is answering whose program's memory can be
+    /// reached ([`caller_read`]): the FIFO it came on, and its id.
+    static ASKER: core::cell::Cell<Option<(zx::Handle, u32)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Sets [`ASKER`] while an `ioctl` is answered, and empties it after.
+struct Asking;
+
+impl Asking {
+    fn new(fifo: zx::Handle, reqid: u32) -> Asking {
+        ASKER.with(|a| a.set(Some((fifo, reqid))));
+        Asking
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        ASKER.with(|a| a.set(None));
+    }
+}
+
+/// Copy `buf.len()` bytes of the memory of the program whose `ioctl` this
+/// thread is answering, from its `addr`: how many were copied, fewer where
+/// a page on the way is one the program could not read itself. Only from
+/// inside [`Device::ioctl`] or [`Device::ioctl_iov`]: anywhere else, or once
+/// the answer is gone, it is [`Status::NOT_FOUND`]. For a command whose
+/// argument holds pointers, to follow them as the driver goes.
+pub fn caller_read(addr: u64, buf: &mut [u8]) -> Result<usize, Status> {
+    caller_memory(addr, buf.as_mut_ptr() as usize, buf.len(), 0)
+}
+
+/// [`caller_read`]'s other way: `data` into the program's memory at `addr`.
+pub fn caller_write(addr: u64, data: &[u8]) -> Result<usize, Status> {
+    caller_memory(addr, data.as_ptr() as usize, data.len(), 1)
+}
+
+fn caller_memory(addr: u64, buf: usize, len: usize, flags: usize) -> Result<usize, Status> {
+    let (fifo, reqid) = ASKER.with(|a| a.get()).ok_or(Status::NOT_FOUND)?;
+    if len == 0 {
+        return Ok(0);
+    }
+    // SAFETY: the kernel reads, or writes, `len` bytes at `buf`, which the
+    // caller lends for the call.
+    unsafe {
+        zx::call(
+            nr::ECLIPSE_DEV_MEMORY,
+            [
+                fifo as usize,
+                reqid as usize,
+                addr as usize,
+                buf,
+                len,
+                flags,
+            ],
+        )
+    }
+}
+
 /// A node this process serves.
 pub struct Node {
     fifo: Fifo<Msg>,
@@ -363,6 +423,7 @@ impl Node {
                 dev.write(self, req.fh, req.a, data).map(|n| n as i64)
             }
             OP_IOCTL => {
+                let _asking = Asking::new(self.fifo.handle(), req.reqid);
                 let cmd = req.a as u32;
                 let (into, out) = ioctl_carries(cmd);
                 let data = &mut self.slot(req.reqid)[..len.max(out)];
@@ -389,6 +450,7 @@ impl Node {
                 }
             }
             OP_IOCTL_IOV => {
+                let _asking = Asking::new(self.fifo.handle(), req.reqid);
                 let cmd = req.a as u32;
                 let slot = self.slot(req.reqid);
                 match Iov::decode(&slot[..len]) {

@@ -45,6 +45,7 @@ pub mod nr {
     pub const ECLIPSE_MOUNT_HELP: i64 = 0x400e;
     pub const ECLIPSE_DEV_SERVE: i64 = 0x4010;
     pub const ECLIPSE_DEVICE_PORT: i64 = 0x4011;
+    pub const ECLIPSE_DEV_MEMORY: i64 = 0x4014;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

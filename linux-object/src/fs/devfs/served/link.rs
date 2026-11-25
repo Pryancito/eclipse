@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, 
 use kernel_hal::thread::SyncWait;
 use zircon_object::ipc::Fifo;
 use zircon_object::object::{KernelObject, KickOn, Signal};
-use zircon_object::vm::VmObject;
+use zircon_object::vm::{VmAddressRegion, VmObject};
 use zircon_object::{ZxError, ZxResult};
 
 use super::wire::{self, Msg, MSG, OP_READY, SLOTS, SLOT_LEN};
@@ -42,6 +42,9 @@ const ANSWERED: u8 = 1;
 /// that says nothing for this long is hung, and is killed.
 const HUNG_AFTER_MS: u64 = 10_000;
 
+/// A slot's lent address space, with the id of the request it is lent for.
+type Lent = lock::Mutex<Option<(u32, Arc<VmAddressRegion>)>>;
+
 /// What the server says unasked: open `fh` is now as the mask says.
 pub(super) type Ready = Box<dyn Fn(u32, u64) + Send + Sync>;
 /// What ends a server that hangs.
@@ -58,6 +61,10 @@ pub(super) struct Link {
     ret_a: [AtomicU64; SLOTS],
     ret_len: [AtomicU32; SLOTS],
     ret_fh: [AtomicU32; SLOTS],
+    /// The address space of the program whose `ioctl` is in each slot, for
+    /// as long as it waits: what the server may read and write of it
+    /// ([`Link::asker`]).
+    asker: [Lent; SLOTS],
     dead: AtomicBool,
     answered_at: AtomicU64,
     pub hung_after_ms: AtomicU64,
@@ -128,6 +135,7 @@ impl Link {
             ret_a: [const { AtomicU64::new(0) }; SLOTS],
             ret_len: [const { AtomicU32::new(0) }; SLOTS],
             ret_fh: [const { AtomicU32::new(0) }; SLOTS],
+            asker: [const { lock::Mutex::new(None) }; SLOTS],
             dead: AtomicBool::new(false),
             answered_at: AtomicU64::new(0),
             hung_after_ms: AtomicU64::new(HUNG_AFTER_MS),
@@ -299,6 +307,22 @@ impl Link {
         b: u64,
         data: &[u8],
     ) -> Result<Answer, Fail> {
+        self.call_for(None, op, fh, len, a, b, data)
+    }
+
+    /// [`Link::call`] for a program whose memory the server may reach
+    /// while the request waits: `asker`, its address space.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_for(
+        self: &Arc<Self>,
+        asker: Option<Arc<VmAddressRegion>>,
+        op: u32,
+        fh: u32,
+        len: usize,
+        a: u64,
+        b: u64,
+        data: &[u8],
+    ) -> Result<Answer, Fail> {
         if data.len() > SLOT_LEN || len > SLOT_LEN {
             return Err(Fail::Said(22));
         }
@@ -312,6 +336,15 @@ impl Link {
         let id = (self.next_id.fetch_add(1, Ordering::Relaxed) << SLOT_BITS) | slot as u32;
         self.expect[slot].store(id, Ordering::Release);
         self.state[slot].store(PENDING, Ordering::Release);
+        // Gone with the request, however it ends: answered, refused, or
+        // left waiting on a server that is gone.
+        // (Each request empties its own, so a request that lends nothing
+        // finds the slot empty and takes no lock: reads and writes stay as
+        // cheap as they were.)
+        let _forget = asker.map(|vmar| {
+            *self.asker[slot].lock() = Some((id, vmar));
+            Forget(&self.asker[slot], id)
+        });
         let give_back = |link: &Link| {
             link.free.fetch_or(1 << slot, Ordering::AcqRel);
         };
@@ -391,5 +424,44 @@ impl Link {
             fh: self.ret_fh[slot].load(Ordering::Relaxed),
             len: (self.ret_len[slot].load(Ordering::Relaxed) as usize).min(SLOT_LEN),
         })
+    }
+}
+
+impl Link {
+    /// The address space of the program whose request `reqid` is, while it
+    /// waits for its answer: `None` once it is answered, for a request that
+    /// is not one of this link's, or one that lent no memory (only an
+    /// `ioctl` does). The server reaches it through this, and only for a
+    /// request it has been asked and not yet answered: what CUSE's
+    /// unrestricted `ioctl` lets a server read and write, without the
+    /// rounds of asking again.
+    pub fn asker(&self, reqid: u32) -> Option<Arc<VmAddressRegion>> {
+        let slot = (reqid as usize) & (SLOTS - 1);
+        if slot >= self.slots || self.expect[slot].load(Ordering::Acquire) != reqid {
+            return None;
+        }
+        let asker = match &*self.asker[slot].lock() {
+            Some((id, vmar)) if *id == reqid => vmar.clone(),
+            _ => return None,
+        };
+        // Looked at after the address space: an answer between the two
+        // would otherwise hand it out once the request was over.
+        if self.state[slot].load(Ordering::Acquire) != PENDING {
+            return None;
+        }
+        Some(asker)
+    }
+}
+
+/// Empties a slot's [`Link::asker`] when the request ends: only if it is
+/// still this request's, since the slot may already be the next one's.
+struct Forget<'a>(&'a Lent, u32);
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        let mut asker = self.0.lock();
+        if matches!(&*asker, Some((id, _)) if *id == self.1) {
+            *asker = None;
+        }
     }
 }
