@@ -17,6 +17,10 @@ no-pci = []
 xhci-usb-hid = []
 # USB “legacy” (UHCI/OHCI/EHCI) + HID — scaffolding (sin implementación aún)
 legacy-usb-hid = []
+# The driver runs in a process (tools/udrv-nvidia), not the kernel: I/O
+# ports, PCI configuration space included, are the process's to answer
+# (drivers_port_read/write).
+process = []
 
 # special drivers for hardwares
 

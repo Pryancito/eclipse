@@ -30,6 +30,12 @@ use super::device_claim::{held_device, kind_of};
 /// - [`OP_CONFIG_READ`]: `b` bytes (1, 2 or 4) of the configuration space
 ///   at `a`, aligned to them, in the first 256 bytes.
 /// - [`OP_CONFIG_WRITE`]: the low `b` bytes of `c` there; zero.
+/// - [`OP_PLACE`]: where the function is, `bus << 8 | device << 3 |
+///   function`, as a driver names it to the code it runs.
+/// - [`OP_BAR_LEN`]: the length of memory BAR `a`, 0 for a BAR that is
+///   not one (an I/O BAR, the upper half of a 64-bit one, none). A driver
+///   cannot size a BAR itself, by writing all ones to it, as the kernel
+///   did when it scanned the bus: the BARs are the kernel's to write.
 ///
 /// `ACCESS_DENIED` when this process does not hold that device, or for a
 /// write to a register only the kernel sets; `NOT_SUPPORTED` for a device
@@ -43,6 +49,8 @@ pub const ECLIPSE_DEVICE_PCI_FN: u32 = super::ECLIPSE_GATEWAY_EXT + 21;
 pub const OP_BAR: usize = 0;
 pub const OP_CONFIG_READ: usize = 1;
 pub const OP_CONFIG_WRITE: usize = 2;
+pub const OP_PLACE: usize = 3;
+pub const OP_BAR_LEN: usize = 4;
 
 /// [`ECLIPSE_DEVICE_PCI_FN`].
 pub(super) fn device_pci_fn(proc: &Arc<Process>, args: &[usize; 6]) -> isize {
@@ -96,6 +104,14 @@ fn pci_fn(proc: &Arc<Process>, args: &[usize; 6]) -> Result<usize, ZxError> {
                 Err(ConfigRefused::NotHere) => Err(ZxError::NOT_SUPPORTED),
             }
         }
+        OP_PLACE => {
+            Ok((place.bus as usize) << 8 | (place.device as usize) << 3 | place.function as usize)
+        }
+        OP_BAR_LEN => place
+            .bars
+            .get(a)
+            .map(|&(paddr, len)| if paddr == 0 { 0 } else { len })
+            .ok_or(ZxError::OUT_OF_RANGE),
         _ => Err(ZxError::INVALID_ARGS),
     }
 }

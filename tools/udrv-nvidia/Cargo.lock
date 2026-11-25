@@ -108,6 +108,13 @@ version = "1.0.3"
 source = "git+https://github.com/rcore-os/device_tree-rs?rev=2f2e55f#2f2e55fb5238466747fef49d9ce0f59b2e808154"
 
 [[package]]
+name = "eclipse-udrivers"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,6 +144,12 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 dependencies = [
  "spin 0.5.2",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.190"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "lock"
@@ -331,6 +344,7 @@ dependencies = [
 name = "udrv-nvidia"
 version = "0.1.0"
 dependencies = [
+ "eclipse-udrivers",
  "nvidia-rm-sys",
  "pci",
  "zcore-drivers",

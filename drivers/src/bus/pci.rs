@@ -124,10 +124,10 @@ pub(crate) unsafe fn probe_bar_size<T: PortOps>(
     size
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "process")))]
 use x86_64::instructions::port::Port;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "process")))]
 impl PortOps for PortOpsImpl {
     unsafe fn read8(&self, port: u16) -> u8 {
         unsafe { Port::new(port).read() }
@@ -152,6 +152,37 @@ impl PortOps for PortOpsImpl {
         unsafe {
             Port::new(port as u16).write(val);
         }
+    }
+}
+
+// A driver built into a process (`udrv-nvidia`) cannot touch an I/O port:
+// every access, the PCI configuration mechanism's 0xCF8/0xCFC among them,
+// goes to the process, which answers for the one function it holds.
+#[cfg(all(target_arch = "x86_64", feature = "process"))]
+extern "C" {
+    fn drivers_port_read(port: u32, width: u8) -> u32;
+    fn drivers_port_write(port: u32, width: u8, value: u32);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "process"))]
+impl PortOps for PortOpsImpl {
+    unsafe fn read8(&self, port: u16) -> u8 {
+        unsafe { drivers_port_read(port as u32, 1) as u8 }
+    }
+    unsafe fn read16(&self, port: u16) -> u16 {
+        unsafe { drivers_port_read(port as u32, 2) as u16 }
+    }
+    unsafe fn read32(&self, port: u32) -> u32 {
+        unsafe { drivers_port_read(port, 4) }
+    }
+    unsafe fn write8(&self, port: u16, val: u8) {
+        unsafe { drivers_port_write(port as u32, 1, val as u32) }
+    }
+    unsafe fn write16(&self, port: u16, val: u16) {
+        unsafe { drivers_port_write(port as u32, 2, val as u32) }
+    }
+    unsafe fn write32(&self, port: u32, val: u32) {
+        unsafe { drivers_port_write(port, 4, val) }
     }
 }
 
@@ -540,11 +571,25 @@ fn reserve_by_id(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Optio
 }
 
 /// `dev`'s place on the bus and its memory BARs, as a claim hands them on.
+/// The length of a memory BAR the `pci` crate decoded. It computes
+/// `!(mask + 1)` where the size is `!mask + 1`, so it comes out 2 short (a
+/// 16 MiB BAR reads 0xfffffe); a BAR's size is a power of two, and the
+/// next one up is the true size. The kernel's own drivers map by pages and
+/// never noticed; a driver in a process is told the length
+/// (`ECLIPSE_DEVICE_PCI_FN`), so it is told the right one.
+fn bar_len(decoded: u32) -> usize {
+    if decoded == 0 {
+        0
+    } else {
+        (decoded as usize).next_power_of_two()
+    }
+}
+
 fn place_of(dev: &PCIDevice) -> crate::user::PciPlace {
     let mut bars = [(0, 0); 6];
     for (slot, bar) in bars.iter_mut().zip(dev.bars.iter()) {
         if let Some(BAR::Memory(addr, len, _, _)) = bar {
-            *slot = (*addr as usize, *len as usize);
+            *slot = (*addr as usize, bar_len(*len));
         }
     }
     crate::user::PciPlace {
@@ -1285,5 +1330,20 @@ mod config_space_tests {
             0xf000_0000,
             "a BAR holds a base address, and the low bits of one are type flags"
         );
+    }
+}
+
+#[cfg(test)]
+mod bar_len_tests {
+    use super::bar_len;
+
+    #[test]
+    fn a_bar_s_length_is_the_power_of_two_the_pci_crate_came_2_short_of() {
+        assert_eq!(bar_len(0x00ff_fffe), 16 << 20);
+        assert_eq!(bar_len(0x0fff_fffe), 256 << 20);
+        assert_eq!(bar_len(0xffe), 0x1000);
+        // An exact one stays as it is, and none is none.
+        assert_eq!(bar_len(0x1000), 0x1000);
+        assert_eq!(bar_len(0), 0);
     }
 }
