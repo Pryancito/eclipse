@@ -1333,7 +1333,9 @@ impl VmAddressRegion {
             Some(new_addr) => {
                 // MREMAP_FIXED unmaps whatever occupied the target, like MAP_FIXED.
                 self.unmap_inner_why(new_addr, new_len, inner, "mremap_fixed_target")?;
-                let offset = new_addr - self.addr;
+                let offset = new_addr
+                    .checked_sub(self.addr)
+                    .ok_or(ZxError::INVALID_ARGS)?;
                 if !self.test_map(inner, offset, new_len, PAGE_SIZE) {
                     return Err(ZxError::NO_MEMORY);
                 }
@@ -1973,11 +1975,15 @@ impl VmAddressRegion {
     fn test_map(&self, inner: &VmarInner, offset: usize, len: usize, align: usize) -> bool {
         debug_assert!(check_aligned(offset, align));
         debug_assert!(page_aligned(len));
-        let begin = self.addr + offset;
-        let end = begin + len;
-        if end > self.addr + self.size {
+        // Checked: `offset` and `len` come from userspace (a MAP_FIXED or
+        // shmat address minus the VMAR base), and a wrapped `end` below
+        // `begin` used to reach `BTreeMap::range` and panic the kernel.
+        // Found by tools/sysfuzz: `shmat(id, 0xfffffffffffffff5, SHM_RND)`.
+        let Some(rel_end) = offset.checked_add(len).filter(|&e| e <= self.size) else {
             return false;
-        }
+        };
+        let begin = self.addr + offset;
+        let end = self.addr + rel_end;
         // Children are few (the ELF loader creates a handful of sub-VMARs), so a
         // linear scan of them is fine; the mapping check that used to dominate is
         // now an O(log n) range probe.
@@ -4155,6 +4161,10 @@ pub const USER_STACK_PAGES: usize = 2048;
 mod vmar_peak_tests;
 
 #[cfg(test)]
+#[path = "vmar_placement_tests.rs"]
+mod vmar_placement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4234,39 +4244,6 @@ mod tests {
             fn getpid() -> i32;
         }
         getpid as unsafe extern "C" fn() -> i32 as *const () as usize
-    }
-
-    /// `ZX_VM_ALIGN_*` names where a sub-region STARTS, not how long it is.
-    /// `determine_offset` required the length to be a multiple of the
-    /// alignment too, so `zx_vmar_allocate(ZX_VM_ALIGN_1MB, size = one page)`
-    /// -- a legal request -- was `INVALID_ARGS`.
-    #[test]
-    fn a_sub_region_is_aligned_by_its_base_and_not_by_its_length() {
-        let root = VmAddressRegion::new_root();
-        const ALIGN: usize = 1 << 20;
-        let child = root
-            .allocate(None, PAGE_SIZE, VmarFlags::CAN_MAP_RXW, ALIGN)
-            .expect("a megabyte-aligned page is a legal region");
-        assert_eq!(child.addr() % ALIGN, 0, "the base carries the alignment");
-        assert_eq!(child.size, PAGE_SIZE, "the length is the one asked for");
-
-        // A length that is not even a whole page is still refused.
-        assert_eq!(
-            root.allocate(None, PAGE_SIZE - 1, VmarFlags::CAN_MAP_RXW, ALIGN)
-                .err(),
-            Some(ZxError::INVALID_ARGS)
-        );
-        // And an explicit offset still has to carry the alignment itself.
-        assert_eq!(
-            root.allocate(
-                Some(child.addr() - root.addr() + PAGE_SIZE),
-                PAGE_SIZE,
-                VmarFlags::CAN_MAP_RXW,
-                ALIGN
-            )
-            .err(),
-            Some(ZxError::INVALID_ARGS)
-        );
     }
 
     /// Lets go of a thread this test parked, however the test ends.
