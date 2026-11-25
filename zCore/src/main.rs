@@ -374,6 +374,23 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // ones (see `kernel_hal::thread::preempt_behind`): off by default,
         // because on a GPU desktop it froze the screen ~20 s every minute;
         // `PREEMPTBEHIND=1` turns it on.
+        if let Some(n) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGE")
+            .and_then(kernel_hal::cmdline::parse_number)
+        {
+            let k = kernel_hal::cmdline::flag(&options.cmdline, "FAILPAGEK");
+            if let Some(after) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGEAFTER")
+                .and_then(kernel_hal::cmdline::parse_number)
+            {
+                kernel_hal::mem::failpage::set_start_ns(after.saturating_mul(1_000_000_000));
+            }
+            if let Some(until) = kernel_hal::cmdline::value(&options.cmdline, "FAILPAGEUNTIL")
+                .and_then(kernel_hal::cmdline::parse_number)
+            {
+                kernel_hal::mem::failpage::set_end_ns(until.saturating_mul(1_000_000_000));
+            }
+            kernel_hal::mem::failpage::set(n, k);
+            klog_info!("Eclipse: PROTOTYPE frame fault injection 1/{} (kernel frames: {})", n, k);
+        }
         let behind = kernel_hal::cmdline::flag(&options.cmdline, "PREEMPTBEHIND");
         kernel_hal::thread::set_preempt_behind(behind);
         if behind {
