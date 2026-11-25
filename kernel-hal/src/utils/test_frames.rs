@@ -89,6 +89,30 @@ fn overlaps(vaddr: usize, len: usize, base: usize, n: usize) -> bool {
     vaddr < base.saturating_add(n) && base < vaddr.saturating_add(len)
 }
 
+std::thread_local! {
+    /// Frames this test thread may still take, or `None` for no limit.
+    static BUDGET: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Let this test thread take only `n` more frames (`None`: no limit), so a
+/// test can run out of memory at the exact step it wants to: the rollback of
+/// an allocation that got half its frames is the path no emulator run ever
+/// takes.
+pub(crate) fn frame_budget(n: Option<usize>) {
+    BUDGET.with(|b| b.set(n));
+}
+
+fn take_from_budget() -> bool {
+    BUDGET.with(|b| match b.get() {
+        None => true,
+        Some(0) => false,
+        Some(n) => {
+            b.set(Some(n - 1));
+            true
+        }
+    })
+}
+
 pub(crate) struct TestKernelHandler;
 
 impl KernelHandler for TestKernelHandler {
@@ -107,6 +131,9 @@ impl KernelHandler for TestKernelHandler {
     }
 
     fn frame_alloc(&self) -> Option<PhysAddr> {
+        if !take_from_budget() {
+            return None;
+        }
         let mut arena = ARENA.lock();
         let paddr = match arena.free.pop() {
             Some(paddr) => paddr,

@@ -117,7 +117,7 @@ pub struct PageTableImpl<L: PageTableLevel, PTE: GenericPTE> {
 
 /// Private implementation.
 impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
-    unsafe fn from_root(root_paddr: PhysAddr) -> Self {
+    pub(crate) unsafe fn from_root(root_paddr: PhysAddr) -> Self {
         Self {
             root: unsafe { PhysFrame::from_paddr(root_paddr) },
             intrm_tables: Vec::new(),
