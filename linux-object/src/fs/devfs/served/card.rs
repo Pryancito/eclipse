@@ -53,6 +53,21 @@ impl Transport for OverLink {
         }
     }
 
+    fn tell(&self, op: u32, a: u64, b: u64) {
+        self.0.tell_with(op, 0, a, b);
+    }
+
+    fn read_user(&self, addr: usize, len: usize) -> Result<Vec<u8>, i32> {
+        kernel_hal::user::UserInPtr::<u8>::from(addr)
+            .read_array(len)
+            .map_err(|_| drm_remote::ioctl::EFAULT)
+    }
+
+    fn write_user(&self, addr: usize, bytes: &[u8]) -> Result<(), i32> {
+        let mut to = kernel_hal::user::UserOutPtr::<u8>::from(addr);
+        to.write_array(bytes).map_err(|_| drm_remote::ioctl::EFAULT)
+    }
+
     fn flags(&self) -> Option<drm_remote::Flags> {
         match self.1.load(Ordering::Relaxed) {
             NO_FLAGS => None,

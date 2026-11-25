@@ -13,10 +13,16 @@ use zcore_drivers::scheme::DrmScheme;
 pub fn serve(card: Arc<dyn DrmScheme>) -> Result<String, String> {
     let node = Node::serve_drm(&drm_remote::hello(&*card))?;
     let why = node.run_with(&Mutex::new(()), |_, node, req| {
-        Some(reply(&*card, node, req))
+        let answer = reply(&*card, node, req);
+        // A file closing, a process gone: told, and answered by nothing.
+        (req.reqid != NO_REPLY).then_some(answer)
     });
     Ok(format!("{why}"))
 }
+
+/// The `reqid` of a message the kernel waits on no answer for
+/// (`served::link::NO_REPLY`).
+const NO_REPLY: u32 = u32::MAX;
 
 /// The requests answered so far, for `drm-check` to say how many calls an
 /// ioctl costs.
@@ -58,6 +64,22 @@ pub mod check {
     use zcore_drivers::scheme::{DrmScheme, Scheme};
 
     pub const CRTC: u32 = 0x5a_0031;
+
+    /// `DRM_IOCTL_NOUVEAU_EXEC`: `_IOWR('d', 0x52, struct drm_nouveau_exec)`.
+    pub const EXEC: u32 = 0xc028_6452;
+
+    /// `struct drm_nouveau_exec`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    pub struct Exec {
+        pub channel: u32,
+        pub push_count: u32,
+        pub wait_count: u32,
+        pub sig_count: u32,
+        pub wait_ptr: u64,
+        pub sig_ptr: u64,
+        pub push_ptr: u64,
+    }
     pub const CONNECTOR: u32 = 0x5a_0041;
 
     #[derive(Default)]
@@ -97,6 +119,25 @@ pub mod check {
         }
         fn wait_vblank(&self, crtc: u32) -> bool {
             crtc == CRTC
+        }
+        /// `EXEC` ([`Exec`]): the sum of its pushes' `va`, in `channel`,
+        /// read from the arrays as the real driver reads them, through the
+        /// pointers in its struct. Every other ioctl is ENOSYS.
+        fn ioctl_file(&self, cmd: u32, arg: usize, _pid: u64, _file: usize) -> Result<usize, i32> {
+            if cmd != EXEC {
+                return Err(38);
+            }
+            // SAFETY: what the kernel's end copied: `_IOC_SIZE` bytes of
+            // struct, and `push_count` pushes where `push_ptr` says.
+            let e = unsafe { &mut *(arg as *mut Exec) };
+            let pushes = match e.push_count {
+                0 => &[][..],
+                n => unsafe {
+                    core::slice::from_raw_parts(e.push_ptr as *const [u64; 2], n as usize)
+                },
+            };
+            e.channel = pushes.iter().map(|p| p[0] as u32).sum();
+            Ok(0)
         }
         fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
             (vec![], vec![CRTC], vec![CONNECTOR])

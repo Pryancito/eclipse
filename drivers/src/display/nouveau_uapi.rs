@@ -3293,6 +3293,11 @@ mod direct_submit_tests;
 #[cfg(test)]
 mod gpudbg_tests;
 
+/// The arrays `scheme::drm_remote::ioctl` copies for a driver in its own
+/// process are at the offsets these structs put them.
+#[cfg(test)]
+mod remote_layout_tests;
+
 #[cfg(test)]
 mod errno_reporter_tests {
     use super::*;

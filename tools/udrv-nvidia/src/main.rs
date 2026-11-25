@@ -167,9 +167,31 @@ fn drm_check() {
         "its node lists its own CRTC and connector",
         resources(&node) == Some((vec![CRTC], vec![CONNECTOR])),
     );
+    let file = open_rw(&node).unwrap_or_else(|| fail("the node does not open".into()));
+    // The driver's own ioctl, with an array its struct points at.
+    let pushes = [[3u64, 0], [4, 0], [5, 0]];
+    let mut exec = drm::check::Exec {
+        push_count: pushes.len() as u32,
+        push_ptr: pushes.as_ptr() as u64,
+        ..Default::default()
+    };
+    let asked = exec;
+    let r = {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `exec` and the pushes it points at outlive the call.
+        unsafe { libc::ioctl(file.as_raw_fd(), drm::check::EXEC as _, &mut exec) }
+    };
+    ok(
+        "EXEC reaches the card with its pushes and comes back",
+        r == 0
+            && exec
+                == drm::check::Exec {
+                    channel: 12,
+                    ..asked
+                },
+    );
     // What a call to the card costs, there and back, beside an ioctl the
     // kernel answers alone (`DRM_IOCTL_VERSION`, of the cached name).
-    let file = open_rw(&node).unwrap_or_else(|| fail("the node does not open".into()));
     let n = 2000;
     let time = |what: &str, f: &dyn Fn()| {
         let answered = || drm::ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
@@ -185,6 +207,12 @@ fn drm_check() {
         let _ = resources_of(&file);
     });
     time("VERSION, the kernel alone", &|| version_of(&file));
+    time("EXEC with 3 pushes", &|| {
+        use std::os::fd::AsRawFd;
+        let mut e = asked;
+        // SAFETY: as above.
+        unsafe { libc::ioctl(file.as_raw_fd(), drm::check::EXEC as _, &mut e) };
+    });
     println!("{NAME}: drm-check: ok");
 }
 

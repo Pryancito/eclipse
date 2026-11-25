@@ -11,9 +11,9 @@
 //!
 //! What this covers is the calls whose arguments and answers are values:
 //! the card's resources, connectors, CRTCs and planes, framebuffers made
-//! from GEM handles, flips, the cursor, modes. The driver's own ioctls,
-//! whose arguments point into the caller's memory, and the GEM and fence
-//! registries both ends share, come in their own steps.
+//! from GEM handles, flips, the cursor, modes; and the driver's own
+//! ioctls, whose arguments are copied both ways ([`ioctl`]). The GEM and
+//! fence registries both ends share come in their own steps.
 //!
 //! A message is an op, two words `a` and `b`, and bytes; an answer is a
 //! word, bytes, or an `errno`. Numbers in the bytes are little-endian.
@@ -49,7 +49,15 @@ pub mod op {
     pub const HW_CURSOR_HIDE: u32 = 80;
     pub const POLL: u32 = 81;
     pub const EDID: u32 = 82;
+    /// A driver's own ioctl: [`ioctl`](super::ioctl) says what travels.
+    pub const IOCTL: u32 = 83;
+    /// A DRM file closed (`a`, as `ioctl_file` names it). Told, not asked.
+    pub const FILE_CLOSED: u32 = 84;
+    /// A process (`a`) is gone. Told, not asked.
+    pub const RELEASE_PROCESS: u32 = 85;
 }
+
+pub mod ioctl;
 
 /// The `errno` of a call the other end does not know, or whose answer did
 /// not parse.
@@ -326,6 +334,18 @@ pub fn answer(
             o.0.extend_from_slice(&edid);
             Ok(0)
         }
+        op::IOCTL => {
+            ioctl::answer(gpu, a as u32, b, data, o.0);
+            Ok(0)
+        }
+        op::FILE_CLOSED => {
+            gpu.nouveau_file_closed(a as usize);
+            Ok(0)
+        }
+        op::RELEASE_PROCESS => {
+            gpu.nouveau_release_process(a);
+            Ok(0)
+        }
         _ => Err(EINVAL),
     }
 }
@@ -348,6 +368,23 @@ pub trait Transport: Send + Sync {
     /// carry them.
     fn flags(&self) -> Option<Flags> {
         None
+    }
+
+    /// Send `op` and wait for no answer: what a close or an exit says,
+    /// which must not wait on the driver (the one exiting may be it).
+    fn tell(&self, op: u32, a: u64, b: u64) {
+        let _ = self.call(op, a, b, &[]);
+    }
+
+    /// `len` bytes of the caller's memory at `addr`, or `EFAULT`. None by
+    /// default: a transport that cannot reach the caller carries no ioctl.
+    fn read_user(&self, _addr: usize, _len: usize) -> Result<Vec<u8>, i32> {
+        Err(ioctl::EFAULT)
+    }
+
+    /// Write `bytes` into the caller's memory at `addr`, or `EFAULT`.
+    fn write_user(&self, _addr: usize, _bytes: &[u8]) -> Result<(), i32> {
+        Err(ioctl::EFAULT)
     }
 }
 
@@ -489,6 +526,36 @@ impl<T: Transport> DrmScheme for Remote<T> {
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
         core::convert::TryFrom::try_from(self.bytes(op::EDID, id as u64)?).ok()
+    }
+
+    fn ioctl(&self, request: u32, arg: usize) -> Result<usize, i32> {
+        self.ioctl_file(request, arg, 0, 0)
+    }
+
+    fn ioctl_owned(&self, request: u32, arg: usize, owner_pid: u64) -> Result<usize, i32> {
+        self.ioctl_file(request, arg, owner_pid, 0)
+    }
+
+    fn ioctl_file(
+        &self,
+        request: u32,
+        arg: usize,
+        owner_pid: u64,
+        file: usize,
+    ) -> Result<usize, i32> {
+        let send = |msg: &[u8]| {
+            self.call(op::IOCTL, request as u64, owner_pid, msg)
+                .map(|(_, back)| back)
+        };
+        ioctl::call(&self.to, send, request, arg, file)
+    }
+
+    fn nouveau_file_closed(&self, file: usize) {
+        self.to.tell(op::FILE_CLOSED, file as u64, 0);
+    }
+
+    fn nouveau_release_process(&self, pid: u64) {
+        self.to.tell(op::RELEASE_PROCESS, pid, 0);
     }
 
     fn display_modes(&self) -> Vec<DisplayMode> {
