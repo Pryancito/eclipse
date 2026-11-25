@@ -2801,6 +2801,17 @@ async fn handle_user_trap(
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
             let mut fault_result = vmar.handle_page_fault(vaddr, flags);
+            // Under test frame fault injection (`FAILPAGE`), a refused frame is
+            // not a shortage: retry it before the OOM killer is asked, or the
+            // test measures whom the killer picks instead of the kernel's own
+            // failure paths. A real shortage still ends in the loop below.
+            if kernel_hal::mem::failpage::enabled() {
+                let mut tries = 0;
+                while fault_result == Err(ZxError::NO_MEMORY) && tries < 16 {
+                    tries += 1;
+                    fault_result = vmar.handle_page_fault(vaddr, flags);
+                }
+            }
             // No frame for the page: the OOM killer frees memory by badness
             // and the fault is taken again (`pagefault_out_of_memory`), as in
             // Linux. Before, the thread that touched the page got SIGSEGV,

@@ -603,6 +603,8 @@ impl KernelHandler for ZcoreKernelHandler {
             memory::frame_reserve() / 1024
         );
         let _ = writeln!(s, "UserFrameRefusals: {}", memory::user_frame_refusals());
+        let (fu, fk) = kernel_hal::mem::failpage::stats();
+        let _ = writeln!(s, "FailPageInjected: user {} kernel {}", fu, fk);
         if let Some(free) = free_blocks {
             let _ = writeln!(s, "free blocks by size:");
             for (i, n) in free.iter().enumerate() {

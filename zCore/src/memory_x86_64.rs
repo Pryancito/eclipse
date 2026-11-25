@@ -216,6 +216,10 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 /// case, the bitmap for everything else. Split out of [`frame_alloc`] so the
 /// drain-and-retry below has exactly one thing to retry.
 fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize> {
+    // Test-only refusal (`FAILPAGE`); one relaxed load when off.
+    if kernel_hal::mem::failpage::kernel() {
+        return None;
+    }
     if frame_count == 1 && align_log2 == 0 {
         #[cfg(not(feature = "mem-debug"))]
         if let Some(idx) = pcp::alloc() {
@@ -316,6 +320,10 @@ pub fn user_frame_refusals() -> u64 {
 /// shortage, and when the caches give nothing its OOM killer picks a victim
 /// while the kernel still has the RAM to do it.
 pub fn frame_alloc_user() -> Option<PhysAddr> {
+    // Test-only refusal (`FAILPAGE`); one relaxed load when off.
+    if kernel_hal::mem::failpage::user() {
+        return None;
+    }
     if FRAMES_LOW.load(Ordering::Relaxed) {
         let reserve = frame_reserve();
         let need = reserve + (1 << PAGE_BITS);
