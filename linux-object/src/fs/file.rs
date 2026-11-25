@@ -355,6 +355,29 @@ pub(super) mod page_cache_reclaim;
 /// `unimplemented!()` -- the `write(2)` to `/dev/null` that halted the
 /// desktop. Anything that is not a regular file keys by its Arc pointer and
 /// is never asked.
+/// Whether `inode` is a file of `/proc` or `/sys`: text made when it is
+/// read, with no pages to map. `mmap` of one is `ENODEV`, as on Linux.
+///
+/// It used to be given a page cache like a file on a disk, and that cache
+/// then stood between every later `read(2)` of the file and its text: the
+/// size of such a file is 0, so the page was zeros, and the cache's key
+/// ([`cache_key`]) is made of the address of a file system object that
+/// `/proc` and `/sys` make anew on each call, which the next file's lands
+/// on. One `mmap` by anybody, and `/proc/meminfo` read as NULs for all.
+fn made_when_read(inode: &Arc<dyn INode>) -> bool {
+    match inode.metadata() {
+        Ok(md) if md.inode != 0 && md.type_ == FileType::File => {
+            let fs = inode.fs();
+            !rcore_fs::vfs::is_no_fs(&fs)
+                && matches!(
+                    fs.info().ftype,
+                    rcore_fs::vfs::PROC_SUPER_MAGIC | rcore_fs::vfs::SYSFS_MAGIC
+                )
+        }
+        _ => false,
+    }
+}
+
 fn cache_key(inode: &Arc<dyn INode>) -> (usize, usize) {
     let by_pointer = (Arc::as_ptr(inode) as *const () as usize, usize::MAX);
     match inode.metadata() {
@@ -2102,6 +2125,9 @@ impl FileLike for File {
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
         let inner = self.inner.read();
+        if made_when_read(&inner.inode) {
+            return Err(LxError::ENODEV);
+        }
         match inner.inode.metadata()?.type_ {
             FileType::File => {
                 // Back the file mapping with a *paged* (non-contiguous) VMO that
@@ -2228,6 +2254,9 @@ impl FileLike for File {
             // Devices keep their own get_vmo (fb/drm are inherently shared).
             drop(inner);
             return self.get_vmo(offset, len).map(|vmo| (vmo, 0));
+        }
+        if made_when_read(&inner.inode) {
+            return Err(LxError::ENODEV);
         }
         if !offset.is_multiple_of(4096) {
             return Err(LxError::EINVAL);

@@ -1127,6 +1127,7 @@ impl Syscall<'_> {
         data: &[u8],
         endpoint: Option<Endpoint>,
         mode: SendMode,
+        theirs: Option<UserInPtr<u8>>,
     ) -> SysResult {
         use crate::file::{after_write_error, sigpipe_due, AfterWriteError};
         let socket = file_like.as_socket()?;
@@ -1145,7 +1146,15 @@ impl Syscall<'_> {
                     // `SO_SNDTIMEO`: what went in before is the answer
                     // (`tcp_sendmsg`'s `do_error`), or else the error.
                     AfterWriteError::Wait => match file_like.async_poll(PollEvents::OUT).await {
-                        Ok(_) => {}
+                        // `data` may be the caller's own memory (`theirs`),
+                        // looked at before the wait: it is asked again
+                        // after it, since what was mapped then need not be
+                        // now, and the next copy has no fault fixup.
+                        Ok(_) => match theirs.as_ref().map(|p| p.as_slice(data.len())) {
+                            Some(Err(_)) if sent > 0 => return Ok(sent),
+                            Some(Err(e)) => return Err(e.into()),
+                            _ => {}
+                        },
                         Err(_) if sent > 0 => return Ok(sent),
                         Err(e) => return Err(e),
                     },
@@ -1204,7 +1213,7 @@ impl Syscall<'_> {
         // never sent were delivered, silently truncating the stream.
         let mode = self.send_mode_for(&file_like, flags);
         let written = self
-            .send_all(&file_like, buf.as_slice(len)?, endpoint, mode)
+            .send_all(&file_like, buf.as_slice(len)?, endpoint, mode, Some(buf))
             .await?;
         Ok(written)
     }
@@ -1400,7 +1409,7 @@ impl Syscall<'_> {
             socket.send_fds(passed_fds)?;
         }
         let mode = self.send_mode_for(&file_like, flags);
-        let sent = self.send_all(&file_like, &data, endpoint, mode).await;
+        let sent = self.send_all(&file_like, &data, endpoint, mode, None).await;
         // A message that did not go in takes its descriptors with it, as the
         // skb they rode on is freed on Linux. Leaving them queued meant the
         // caller's retry of the same `sendmsg` (the normal answer to EAGAIN

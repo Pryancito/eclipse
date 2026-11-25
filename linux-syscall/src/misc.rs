@@ -4,6 +4,7 @@ use core::time::Duration;
 use futures::future::{select, Either};
 use futures::{pin_mut, poll};
 use kernel_hal::timer::timer_now;
+use kernel_hal::MMUFlags;
 use linux_object::process::{
     check_signals_of, Capabilities, SignalPark, CAP_FULL_SET, CAP_SETPCAP, CAP_SYSLOG,
     CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
@@ -513,7 +514,19 @@ impl Syscall<'_> {
         }
         let private = op & FUTEX_PRIVATE_FLAG != 0;
         let word: UserInPtr<i32> = uaddr.into();
-        if let Err(e) = word.check() {
+        // Mapped is enough for the operations that only make a key of the
+        // address. The ones that load the word need to be allowed to read
+        // it, and the priority-inheritance ones store into it as well: a
+        // word in a page that does not allow that passed for good here and
+        // was then a kernel fault with the futex's lock held.
+        let checked = match cmd {
+            FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_WAKE_OP => word.check(),
+            FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI | FUTEX_UNLOCK_PI => {
+                word.check_for(MMUFlags::READ | MMUFlags::WRITE)
+            }
+            _ => word.check_for(MMUFlags::READ),
+        };
+        if let Err(e) = checked {
             // A private key is made from the address alone (`access_ok` is
             // a range check), so the operations that never read the word --
             // a wake, a plain requeue, a wake-op (whose atomic step is on
@@ -840,7 +853,8 @@ impl Syscall<'_> {
                     return Err(LxError::EINVAL);
                 }
                 let second: UserInPtr<i32> = uaddr2.into();
-                second.check()?;
+                // Loaded and stored below.
+                second.check_for(MMUFlags::READ | MMUFlags::WRITE)?;
                 let futex2 = match (op & FUTEX_PRIVATE_FLAG == 0)
                     .then(|| self.shared_futex(uaddr2))
                     .flatten()

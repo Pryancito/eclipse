@@ -199,11 +199,28 @@ fn in_user_half_with(libos: bool, addr: usize, bytes: usize) -> bool {
 /// Alignment is deliberately not required here: userspace structs arrive
 /// however libdrm laid them out, and the callers read them with plain loads
 /// on x86_64 where unaligned access is legal.
+///
+/// And mapped for reading: in the user half says nothing about anything
+/// being there, and the handler is about to dereference it with no fault
+/// fixup behind it (see `KernelHandler::check_user_access`). An ioctl on an
+/// address nothing is mapped at, or a `PROT_NONE` one, was a kernel page
+/// fault the user's address space refuses to resolve. A handler that only
+/// writes asks [`user_range_ok_to_write`].
 pub fn user_range_ok(addr: usize, bytes: usize) -> bool {
+    user_range_allows(addr, bytes, MMUFlags::READ)
+}
+
+/// [`user_range_ok`] for a range the handler is about to write: every page
+/// of it must allow that, or the write is the same unresolvable fault.
+pub fn user_range_ok_to_write(addr: usize, bytes: usize) -> bool {
+    user_range_allows(addr, bytes, MMUFlags::WRITE)
+}
+
+fn user_range_allows(addr: usize, bytes: usize, access: MMUFlags) -> bool {
     if bytes == 0 {
         return true;
     }
-    addr != 0 && in_user_half(addr, bytes)
+    addr != 0 && in_user_half(addr, bytes) && crate::KHANDLER.check_user_access(addr, bytes, access)
 }
 
 // FIXME: this is a workaround for `clear_child_tid`.
@@ -276,6 +293,14 @@ impl<T, P: Policy> UserPtr<T, P> {
             return Err(Error::InvalidPointer);
         }
         Ok(())
+    }
+
+    /// [`check`](Self::check) for a value the caller is about to `access`
+    /// through something other than this pointer's own `read` and `write`
+    /// (a futex word, loaded and stored as an atomic): mapped is not enough
+    /// for that, the page must allow it.
+    pub fn check_for(&self, access: MMUFlags) -> Result<()> {
+        self.check_len_for(1, access)
     }
 
     /// [`check_len`](Self::check_len) for a copy that is about to `access`
