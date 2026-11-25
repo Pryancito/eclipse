@@ -70,6 +70,12 @@ cfg_if! {
 #[path = "bare/percpu.rs"]
 mod bare_percpu;
 
+/// The coroutine stacks' guard bands, the same way. The split of a huge
+/// mapping they test is the path riscv64 and aarch64 take on every stack, and
+/// the x86_64 emulator never does.
+#[cfg(all(test, feature = "libos", target_arch = "x86_64"))]
+#[path = "bare/stack_guard.rs"]
+mod bare_stack_guard;
 #[cfg(all(test, feature = "libos", target_arch = "x86_64"))]
 #[path = "bare/vmalloc.rs"]
 mod bare_vmalloc;
