@@ -65,9 +65,43 @@ impl From<Termios> for Termios2 {
             c_lflag: t.c_lflag,
             c_line: t.c_line,
             c_cc: t.c_cc,
-            c_ispeed: 38400,
-            c_ospeed: 38400,
+            c_ispeed: baud_of(t.c_cflag >> IBSHIFT).unwrap_or_else(|| baud_or_38400(t.c_cflag)),
+            c_ospeed: baud_or_38400(t.c_cflag),
         }
+    }
+}
+
+/// `CBAUD | CBAUDEX`: the bits of `c_cflag` that name the line speed.
+const CBAUD: u32 = 0o010017;
+/// `CBAUDEX`: the speeds past `B38400`.
+const CBAUDEX: u32 = 0o010000;
+/// `IBSHIFT`: the input speed, when it differs, is `CBAUD` shifted this far.
+const IBSHIFT: u32 = 16;
+
+/// The speed `CBAUD` of `cflag` names, as `tty_termios_baud_rate` reads
+/// it from `baud_table`; `None` for `B0` of the input speed ("the same as
+/// the output") and for `BOTHER`, whose number no `struct termios` keeps.
+fn baud_of(cflag: u32) -> Option<u32> {
+    const TABLE: [u32; 31] = [
+        0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+        115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000,
+        2500000, 3000000, 3500000, 4000000,
+    ];
+    let cbaud = cflag & CBAUD;
+    let i = match cbaud {
+        0 | CBAUDEX => return None,
+        c if c & CBAUDEX != 0 => (c & 0o17) as usize + 15,
+        c => c as usize,
+    };
+    TABLE.get(i).copied()
+}
+
+/// The output speed: `B0` is 0 (hang up), and a `BOTHER` that was not kept
+/// is said as the console's `B38400`.
+fn baud_or_38400(cflag: u32) -> u32 {
+    match cflag & CBAUD {
+        0 => 0,
+        _ => baud_of(cflag).unwrap_or(38400),
     }
 }
 

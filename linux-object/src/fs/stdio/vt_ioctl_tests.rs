@@ -130,6 +130,18 @@ fn the_keyboard_is_a_pc_keyboard_in_the_mode_it_was_given() {
     assert_eq!(out::<i32>(KDGETLED), 0b110);
     assert_eq!(tty_ioctl(VT, KDSETLED as u32, 0), Ok(0));
     assert_eq!(out::<i32>(KDGETLED), 0);
+    // `vt_do_kdskled`: a bit past the LEDs (0x07) and their mode (0x70) is
+    // EINVAL, and the LEDs stay as they were.
+    assert_eq!(tty_ioctl(VT, KDSETLED as u32, 0x77), Ok(0));
+    for bad in [0x08, 0x80, 0x100, 0xff] {
+        assert_eq!(
+            tty_ioctl(VT, KDSETLED as u32, bad),
+            Err(FsError::InvalidParam),
+            "{bad:#x}"
+        );
+    }
+    assert_eq!(out::<i32>(KDGETLED), 0x77);
+    assert_eq!(tty_ioctl(VT, KDSETLED as u32, 0), Ok(0));
     assert_eq!(tty_ioctl(VT, KDMKTONE as u32, 0x1234), Ok(0));
 }
 
@@ -193,6 +205,57 @@ fn kdgkbent_answers_the_modifiers_and_the_cursor_keys() {
 }
 
 /// What the VT layer says of itself: the VT the caller is on is the one
+/// `cfgetospeed`/`cfgetispeed` of `TCGETS2`: the speeds `CBAUD` names
+/// (`tty_termios_baud_rate`), the input's own when `CIBAUD` names one and
+/// the output's when it is `B0`, and 0 for a line hung up with `B0`.
+#[test]
+fn termios2_says_the_speed_the_cbaud_bits_name() {
+    let _alone = SERIAL.lock();
+    let saved = tcgetattr();
+    for (cbaud, speed) in [
+        (0o15, 9600),       // B9600
+        (0o17, 38400),      // B38400
+        (0o10002, 115200),  // B115200
+        (0o10017, 4000000), // B4000000
+        (0o1, 50),          // B50
+    ] {
+        let mut t = saved;
+        t.c_cflag = (t.c_cflag & !0o10017) | cbaud;
+        assert_eq!(set(TCSETS, &t), Ok(0));
+        let t2: Termios2 = out(TCGETS2);
+        assert_eq!((t2.c_ispeed, t2.c_ospeed), (speed, speed), "{cbaud:#o}");
+    }
+    // CIBAUD (`<< IBSHIFT`) B9600 with B115200 out.
+    let mut t = saved;
+    t.c_cflag = (t.c_cflag & !0o10017) | 0o10002 | (0o15 << 16);
+    assert_eq!(set(TCSETS, &t), Ok(0));
+    let t2: Termios2 = out(TCGETS2);
+    assert_eq!((t2.c_ispeed, t2.c_ospeed), (9600, 115200));
+    // B0: hang up.
+    let mut t = saved;
+    t.c_cflag &= !0o10017;
+    assert_eq!(set(TCSETS, &t), Ok(0));
+    let t2: Termios2 = out(TCGETS2);
+    assert_eq!((t2.c_ispeed, t2.c_ospeed), (0, 0));
+    assert_eq!(set(TCSETS, &saved), Ok(0));
+}
+
+/// `VT_ACTIVATE 0` and one past `MAX_NR_CONSOLES` (63) are ENXIO, as
+/// `vt_ioctl` answers `chvt 0`; the active VT does not move.
+#[test]
+fn vt_activate_of_no_vt_is_enxio() {
+    let _alone = SERIAL.lock();
+    let active = kernel_hal::console::active_vt();
+    for bad in [0usize, 64, 1000] {
+        assert_eq!(
+            tty_ioctl(VT, VT_ACTIVATE as u32, bad),
+            Err(FsError::NoSuchDeviceOrAddress),
+            "{bad}"
+        );
+    }
+    assert_eq!(kernel_hal::console::active_vt(), active);
+}
+
 /// `VT_OPENQRY` hands out, `VT_GETSTATE` counts VTs from 1 with bit 0
 /// unused, and a mode set with `VT_SETMODE` is the one `VT_GETMODE` reads.
 #[test]

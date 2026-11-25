@@ -129,6 +129,9 @@ lazy_static! {
         .collect();
 }
 
+/// `MAX_NR_CONSOLES` of `linux/tty.h`: the VTs a `VT_ACTIVATE` may name.
+const MAX_NR_CONSOLES: usize = 63;
+
 #[inline]
 fn vt_clamp(vt: usize) -> usize {
     vt.min(kernel_hal::console::NUM_VTS - 1)
@@ -661,6 +664,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             Ok(0)
         }
         KDSETLED => {
+            // `vt_do_kdskled`: only LED_SCR|LED_NUM|LED_CAP (0x07) and their
+            // "mode" bits (0x70) mean anything; any other bit is EINVAL.
+            if data & !0x77 != 0 {
+                return Err(FsError::InvalidParam);
+            }
             TTY_STATES[vt_clamp(vt)]
                 .kbd_leds
                 .store(data as u8, Ordering::Relaxed);
@@ -740,7 +748,14 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
                 kernel_hal::console::num_vts(),
                 kernel_hal::console::active_vt()
             );
-            if data >= 1 && data <= kernel_hal::console::num_vts() {
+            // `vt_ioctl`: 0 and past MAX_NR_CONSOLES are ENXIO. A VT not
+            // there yet is one Linux allocates; here it is dropped, quietly
+            // as before, since eclipse-init asks for tty7 before the
+            // graphic console is up.
+            if data == 0 || data > MAX_NR_CONSOLES {
+                return Err(FsError::NoSuchDeviceOrAddress);
+            }
+            if data <= kernel_hal::console::num_vts() {
                 // Route through the VT_PROCESS handshake: if the current VT is
                 // owned by a graphics session, this defers until it releases.
                 request_vt_switch(data - 1);
