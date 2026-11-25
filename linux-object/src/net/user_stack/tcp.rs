@@ -716,6 +716,67 @@ pub struct ServedTcpSocket {
     /// sockets" at the top of [`super`].
     v6: bool,
     stream: Arc<Stream>,
+    /// The options `setsockopt` was told that nothing below the socket
+    /// asks for, kept so that `getsockopt` says them back.
+    opts: Mutex<TcpOpts>,
+}
+
+/// What a TCP socket keeps of `SOL_SOCKET`, `IPPROTO_IP` and
+/// `IPPROTO_TCP` for `getsockopt`. A connection `accept` gives has the
+/// listener's (`sk_clone_lock` copies the whole socket).
+#[derive(Debug, Clone, Default)]
+struct TcpOpts {
+    inet: StoredInetOpts,
+    nodelay: bool,
+    keepidle: Option<u32>,
+    keepintvl: Option<u32>,
+    keepcnt: Option<u32>,
+}
+
+/// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` (seconds) and `TCP_KEEPCNT` past
+/// these are `EINVAL` (`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL`,
+/// `MAX_TCP_KEEPCNT`).
+const MAX_TCP_KEEPIDLE: u32 = 32767;
+const MAX_TCP_KEEPINTVL: u32 = 32767;
+const MAX_TCP_KEEPCNT: u32 = 127;
+
+impl TcpOpts {
+    /// `do_tcp_setsockopt` for what is kept: `None` for an option it does
+    /// not keep.
+    fn set_tcp(&mut self, opt: usize, data: &[u8]) -> Option<SysResult> {
+        const TCP_NODELAY: usize = 1;
+        const TCP_KEEPIDLE: usize = 4;
+        const TCP_KEEPINTVL: usize = 5;
+        const TCP_KEEPCNT: usize = 6;
+        if !matches!(
+            opt,
+            TCP_NODELAY | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT
+        ) {
+            return None;
+        }
+        // Every one of them is an `int`.
+        if data.len() < 4 {
+            return Some(Err(LxError::EINVAL));
+        }
+        let val = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+        let within = |max: u32| -> LxResult<u32> {
+            if val < 1 || val as u32 > max {
+                Err(LxError::EINVAL)
+            } else {
+                Ok(val as u32)
+            }
+        };
+        let kept = match opt {
+            TCP_NODELAY => {
+                self.nodelay = val != 0;
+                Ok(())
+            }
+            TCP_KEEPIDLE => within(MAX_TCP_KEEPIDLE).map(|v| self.keepidle = Some(v)),
+            TCP_KEEPINTVL => within(MAX_TCP_KEEPINTVL).map(|v| self.keepintvl = Some(v)),
+            _ => within(MAX_TCP_KEEPCNT).map(|v| self.keepcnt = Some(v)),
+        };
+        Some(kept.map(|()| 0))
+    }
 }
 
 impl ServedTcpSocket {
@@ -735,6 +796,7 @@ impl ServedTcpSocket {
             sock,
             v6,
             stream,
+            opts: Mutex::new(TcpOpts::default()),
         })
     }
 
@@ -1265,6 +1327,7 @@ impl Socket for ServedTcpSocket {
                         sock,
                         v6: self.v6,
                         stream,
+                        opts: Mutex::new(self.opts.lock().clone()),
                     });
                     let from = shown(takes, from.unwrap_or(IpEndpoint::UNSPECIFIED));
                     return Ok((socket as Arc<dyn FileLike>, Endpoint::Ip(from)));
@@ -1350,12 +1413,75 @@ impl Socket for ServedTcpSocket {
             self.stream.inner.lock().reuse = icmp6::flag(data)?;
             return Ok(0);
         }
-        let kept = self.stream.inner.lock().patience.set(level, opt, data);
+        if let Some(kept) = self.stream.inner.lock().patience.set(level, opt, data) {
+            return kept;
+        }
+        const IPPROTO_TCP: usize = 6;
+        let mut opts = self.opts.lock();
+        let kept = if level == IPPROTO_TCP {
+            opts.set_tcp(opt, data)
+        } else {
+            opts.inet.try_setsockopt(level, opt, data)
+        };
+        drop(opts);
         kept.unwrap_or_else(|| setsockopt_unstored(self, level, opt, data))
     }
 
     fn so_reuseaddr(&self) -> bool {
         self.stream.inner.lock().reuse
+    }
+
+    fn so_broadcast(&self) -> bool {
+        self.opts.lock().inet.broadcast
+    }
+
+    fn so_keepalive(&self) -> bool {
+        self.opts.lock().inet.keepalive
+    }
+
+    fn so_reuseport(&self) -> bool {
+        self.opts.lock().inet.reuse_port
+    }
+
+    fn so_linger(&self) -> (bool, i32) {
+        let opts = self.opts.lock();
+        (opts.inet.linger_on, opts.inet.linger_sec)
+    }
+
+    fn ip_tos(&self) -> u32 {
+        self.opts.lock().inet.ip_tos
+    }
+
+    fn ip_ttl(&self) -> u32 {
+        self.opts.lock().inet.ip_ttl
+    }
+
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.opts.lock().inet.mcast_ttl
+    }
+
+    fn ip_multicast_loop(&self) -> bool {
+        self.opts.lock().inet.mcast_loop
+    }
+
+    fn ip_multicast_if(&self) -> u32 {
+        self.opts.lock().inet.mcast_if
+    }
+
+    fn tcp_nodelay(&self) -> bool {
+        self.opts.lock().nodelay
+    }
+
+    fn tcp_keepidle(&self) -> Option<u32> {
+        self.opts.lock().keepidle
+    }
+
+    fn tcp_keepintvl(&self) -> Option<u32> {
+        self.opts.lock().keepintvl
+    }
+
+    fn tcp_keepcnt(&self) -> Option<u32> {
+        self.opts.lock().keepcnt
     }
 
     fn so_rcvtimeo(&self) -> [u8; 16] {
@@ -2373,6 +2499,84 @@ mod tests {
         let socket = socket.downcast_arc::<ServedTcpSocket>().ok().unwrap();
         FileLike::set_flags(&*socket, OpenFlags::NON_BLOCK).unwrap();
         (socket, from)
+    }
+
+    fn int(v: i32) -> [u8; 4] {
+        v.to_ne_bytes()
+    }
+
+    /// What `setsockopt` was told of a TCP socket is what `getsockopt` says
+    /// back, and a connection `accept` gives has the listener's
+    /// (`sk_clone_lock`). These were taken and forgotten: `TCP_NODELAY`,
+    /// `SO_KEEPALIVE` and `IP_TTL` read back as their defaults whatever
+    /// had been set.
+    #[test]
+    fn a_tcp_socket_keeps_its_options_and_a_connection_has_the_listeners() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = stream(&stack);
+        for (level, opt, v) in [(1, 9, 1), (1, 6, 1), (1, 15, 1), (0, 2, 12), (0, 1, 0x10)] {
+            assert_eq!(Socket::setsockopt(&l, level, opt, &int(v)), Ok(0));
+        }
+        for (opt, v) in [(1, 1), (4, 60), (5, 10), (6, 3)] {
+            assert_eq!(Socket::setsockopt(&l, 6, opt, &int(v)), Ok(0));
+        }
+        let mut linger = [0u8; 8];
+        linger[..4].copy_from_slice(&int(1));
+        linger[4..].copy_from_slice(&int(5));
+        assert_eq!(Socket::setsockopt(&l, 1, 13, &linger), Ok(0));
+        assert_eq!(Socket::bind(&l, any(8090)), Ok(0));
+        assert_eq!(Socket::listen(&l), Ok(0));
+        while stack.told().is_some() {}
+
+        let c = stream(&stack);
+        assert_eq!(connect(&c, at(HERE, 8090)), Ok(0));
+        let (s, _) = accepted(&l);
+        for sock in [&l, &*s] {
+            assert!(sock.so_keepalive() && sock.so_broadcast() && sock.so_reuseport());
+            assert_eq!(sock.so_linger(), (true, 5));
+            assert_eq!((sock.ip_ttl(), sock.ip_tos()), (12, 0x10));
+            assert!(sock.tcp_nodelay());
+            assert_eq!(
+                (
+                    sock.tcp_keepidle(),
+                    sock.tcp_keepintvl(),
+                    sock.tcp_keepcnt()
+                ),
+                (Some(60), Some(10), Some(3))
+            );
+        }
+        // The one that connected was told nothing.
+        assert!(!c.so_keepalive() && !c.tcp_nodelay());
+        assert_eq!(c.ip_ttl(), 64);
+        assert_eq!(c.tcp_keepidle(), None);
+    }
+
+    /// `do_tcp_setsockopt`: a keepalive time or count out of its range, or
+    /// shorter than an `int`, is `EINVAL`, and the one kept stays.
+    #[test]
+    fn a_keepalive_out_of_range_is_einval() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let c = stream(&stack);
+        for (opt, bad) in [(4, 0), (4, 32768), (5, -1), (5, 32768), (6, 0), (6, 128)] {
+            assert_eq!(
+                Socket::setsockopt(&c, 6, opt, &int(bad)),
+                Err(LxError::EINVAL),
+                "{} {}",
+                opt,
+                bad
+            );
+        }
+        assert_eq!(Socket::setsockopt(&c, 6, 1, &[1]), Err(LxError::EINVAL));
+        assert_eq!(Socket::setsockopt(&c, 6, 4, &int(32767)), Ok(0));
+        assert_eq!(Socket::setsockopt(&c, 6, 6, &int(127)), Ok(0));
+        assert_eq!(
+            (c.tcp_keepidle(), c.tcp_keepcnt()),
+            (Some(32767), Some(127))
+        );
+        // An option of TCP it does not keep is still taken.
+        assert_eq!(Socket::setsockopt(&c, 6, 13, b"cubic\0"), Ok(0));
     }
 
     #[test]

@@ -112,10 +112,6 @@ fn a_flag_of_the_socket_level_reads_back_what_was_set() {
             for (domain, ty) in [(AF_INET, SOCK_STREAM), (AF_INET, SOCK_DGRAM)] {
                 let fd = s.sys_socket(domain, ty, 0).unwrap();
                 for name in [SO_REUSEADDR, SO_KEEPALIVE, SO_BROADCAST, SO_REUSEPORT] {
-                    // A served TCP socket keeps only SO_REUSEADDR of these.
-                    if ty == SOCK_STREAM && name != SO_REUSEADDR {
-                        continue;
-                    }
                     let what = (domain, ty, name);
                     assert_eq!(get_int(&mut s, fd, SOL_SOCKET, name), Ok(0), "{what:?}");
                     assert_eq!(set_int(&mut s, fd, SOL_SOCKET, name, 7), Ok(0), "{what:?}");
@@ -229,7 +225,7 @@ fn linger_is_off_until_it_is_set() {
     on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let mut s = own(sys);
-            let fd = s.sys_socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+            let fd = s.sys_socket(AF_INET, SOCK_STREAM, 0).unwrap();
             assert_eq!(get(&mut s, fd, SOL_SOCKET, SO_LINGER), Ok(vec![0; 8]));
             let mut on = [0u8; 8];
             on[..4].copy_from_slice(&1i32.to_ne_bytes());
@@ -321,9 +317,15 @@ fn the_tcp_options_of_a_tcp_socket() {
             let mut s = own(sys);
             let fd = s.sys_socket(AF_INET, SOCK_STREAM, 0).unwrap();
             assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, TCP_NODELAY), Ok(0));
+            assert_eq!(set_int(&mut s, fd, IPPROTO_TCP, TCP_NODELAY, 1), Ok(0));
+            assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, TCP_NODELAY), Ok(1));
             assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, TCP_KEEPIDLE), Ok(7200));
             assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, TCP_KEEPINTVL), Ok(75));
             assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, TCP_KEEPCNT), Ok(9));
+            for (name, v) in [(TCP_KEEPIDLE, 60), (TCP_KEEPINTVL, 10), (TCP_KEEPCNT, 3)] {
+                assert_eq!(set_int(&mut s, fd, IPPROTO_TCP, name, v), Ok(0));
+                assert_eq!(get_int(&mut s, fd, IPPROTO_TCP, name), Ok(v), "{}", name);
+            }
             let cca = get(&mut s, fd, IPPROTO_TCP, TCP_CONGESTION).unwrap();
             assert_eq!(cca.last(), Some(&0), "a C string");
             assert!(cca.len() > 1);
@@ -381,9 +383,6 @@ fn the_ip_options_of_an_inet_socket() {
                     Ok(0),
                     "{ty}"
                 );
-                if ty == SOCK_STREAM {
-                    continue;
-                }
                 assert_eq!(set_int(&mut s, fd, IPPROTO_IP, IP_TTL, 12), Ok(0));
                 assert_eq!(get_int(&mut s, fd, IPPROTO_IP, IP_TTL), Ok(12), "{ty}");
                 assert_eq!(set_int(&mut s, fd, IPPROTO_IP, IP_TOS, 0x10), Ok(0));
