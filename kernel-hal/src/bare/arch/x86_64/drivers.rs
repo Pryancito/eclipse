@@ -230,6 +230,27 @@ fn init_acpi_power_button(irq: &Arc<Apic>) {
     *ACPI_POWER_BUTTON.lock() = Some(power);
 }
 
+/// The serial console, for [`poll_console_rx`].
+static COM1: spin::Once<Arc<BufferedUart>> = spin::Once::new();
+
+/// Bytes the console's receive interrupt left behind, drained from the
+/// timer: see [`BufferedUart::poll`] for how an edge-triggered 16550 goes
+/// deaf without it. Counted, and said the first few times, because every
+/// one is an interrupt that was lost.
+pub(super) fn poll_console_rx() {
+    static RESCUES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let Some(com1) = COM1.get() else {
+        return;
+    };
+    let n = com1.poll();
+    if n > 0 && RESCUES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3 {
+        crate::klog_warn!(
+            "[uart] {} byte(s) waited with no receive interrupt; the timer took them",
+            n
+        );
+    }
+}
+
 pub(super) fn init_early() -> DeviceResult {
     // Before any probe, so that a driver which finds a hot-pluggable device
     // during its own bring-up has somewhere to publish it. A USB disk
@@ -237,7 +258,9 @@ pub(super) fn init_early() -> DeviceResult {
     // the honest outcome, but a useless one.
     drivers::install_hotplug_sink();
     let uart = Arc::new(Uart16550Pmio::new(0x3F8));
-    drivers::add_device(Device::Uart(BufferedUart::new(uart)));
+    let com1 = BufferedUart::new(uart);
+    COM1.call_once(|| com1.clone());
+    drivers::add_device(Device::Uart(com1));
     let uart = Arc::new(Uart16550Pmio::new(0x2F8));
     drivers::add_device(Device::Uart(BufferedUart::new(uart)));
     Ok(())

@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::Mutex;
 
@@ -22,6 +23,9 @@ use crate::utils::{bounded_drain, DRAIN_BURST};
 
 pub struct BufferedUart {
     inner: Arc<dyn UartScheme>,
+    /// One drain at a time, so the interrupt and [`BufferedUart::poll`] on two
+    /// CPUs cannot interleave their bytes in `buf`.
+    draining: AtomicBool,
     buf: Mutex<VecDeque<u8>>,
     listener: EventListener,
     name: String,
@@ -33,6 +37,7 @@ impl BufferedUart {
     pub fn new(uart: Arc<dyn UartScheme>) -> Arc<Self> {
         let ret = Arc::new(Self {
             inner: uart.clone(),
+            draining: AtomicBool::new(false),
             name: alloc::format!("{}-buffered", uart.name()),
             buf: Mutex::new(VecDeque::with_capacity(BUF_CAPACITY)),
             listener: EventListener::new(),
@@ -49,6 +54,36 @@ impl Scheme for BufferedUart {
     }
 
     fn handle_irq(&self, _unused: usize) {
+        self.drain();
+    }
+}
+
+impl BufferedUart {
+    /// Drain what the device holds now, as the interrupt does, and say how
+    /// many bytes that was.
+    ///
+    /// For a periodic caller. A 16550 holds its receive interrupt asserted
+    /// for as long as its FIFO has data, and an edge-triggered line (ISA
+    /// IRQ 4 behind the I/O APIC) only interrupts on the rising edge: if one
+    /// interrupt's drain takes nothing -- the device lock held on this CPU,
+    /// or another drain under way -- the bytes stay, the line stays high,
+    /// and no interrupt ever comes again. The console is then deaf for good,
+    /// which is what a long `tools/sysfuzz` round left behind. A poll that
+    /// finds bytes is that case.
+    pub fn poll(&self) -> usize {
+        self.drain()
+    }
+
+    fn drain(&self) -> usize {
+        if self.draining.swap(true, Ordering::Acquire) {
+            return 0;
+        }
+        let n = self.drain_locked();
+        self.draining.store(false, Ordering::Release);
+        n
+    }
+
+    fn drain_locked(&self) -> usize {
         // Drain the hardware FIFO first (lock-free on our side; the inner
         // UART driver acquires its own lock per byte), for at most one burst.
         let mut drained = alloc::vec::Vec::with_capacity(DRAIN_BURST.min(16));
@@ -62,7 +97,7 @@ impl Scheme for BufferedUart {
             }
         });
         if drained.is_empty() {
-            return;
+            return 0;
         }
         // Batch-insert into the ring buffer under a single lock acquisition
         // to minimise push_off/pop_off churn.
@@ -85,6 +120,7 @@ impl Scheme for BufferedUart {
             );
         }
         self.listener.trigger(());
+        drained.len()
     }
 }
 
@@ -188,6 +224,27 @@ mod buffered_uart_tests {
         // Exactly one burst came out of the device, no more.
         assert_eq!(fake.reads.load(Ordering::SeqCst), DRAIN_BURST);
         assert_eq!(read_all(&uart).len(), DRAIN_BURST);
+    }
+
+    /// Bytes no interrupt came for (an edge-triggered line that stayed high)
+    /// are drained by `poll`, which says how many, and wakes the listeners
+    /// like the interrupt would.
+    #[test]
+    fn poll_takes_what_no_interrupt_came_for() {
+        let fake = FakeUart::new(b"echo", false);
+        let uart = BufferedUart::new(fake.clone());
+        let woke = Arc::new(AtomicUsize::new(0));
+        let w = woke.clone();
+        uart.subscribe(
+            Box::new(move |_| {
+                w.fetch_add(1, Ordering::SeqCst);
+            }),
+            false,
+        );
+        assert_eq!(uart.poll(), 4);
+        assert_eq!(woke.load(Ordering::SeqCst), 1, "the console was not told");
+        assert_eq!(read_all(&uart), b"echo".to_vec());
+        assert_eq!(uart.poll(), 0, "an empty FIFO is nothing to report");
     }
 
     #[test]
