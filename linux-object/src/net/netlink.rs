@@ -194,6 +194,11 @@ impl Socket for NetlinkSocketState {
                 }
                 None if non_block => return (Err(LxError::EAGAIN), endpoint),
                 None => {
+                    // A signal ends the wait (EINTR), as in `packet.rs`: this
+                    // loop polls, so nothing else would (blocking_read_signal_tests).
+                    if let Err(e) = crate::process::check_signals() {
+                        return (Err(e), endpoint);
+                    }
                     kernel_hal::deferred_job::drain_deferred_jobs();
                     thread::sleep_until(
                         kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
