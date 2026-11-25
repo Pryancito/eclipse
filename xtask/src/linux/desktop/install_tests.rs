@@ -565,6 +565,8 @@ fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
         .collect();
     let elsewhere = source("xtask/src/linux/mod.rs")
         + &source("tools/lunarbar/src/open.rs")
+        // The panel's devices page runs the driver installer by its path.
+        + &source("tools/lunarbar/src/dispositivos.rs")
         + &source("tools/eclipse-init/src/main.rs");
     for name in d.wrappers() {
         if by_path.contains_key(name) {
