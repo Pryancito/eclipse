@@ -48,6 +48,14 @@ fn kernel_trap_name(trap_num: usize) -> &'static str {
 
 pub(super) fn super_timer() {
     crate::timer::timer_tick();
+    // Ten times a second across all CPUs, whichever ticks: one status read.
+    static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if TICKS
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(25)
+    {
+        super::drivers::poll_console_rx();
+    }
 }
 
 /// Resume after skipping a corrupt timer callback: the faulting `call` already
