@@ -285,7 +285,7 @@ pub(super) fn draw(cv: &mut Canvas, l: &Layout, p: &Panel, ci: usize) {
         let (x, y, fw, fh) = *r;
         if focused {
             glass::cell(cv, x - 6, y + 1, fw + 12, fh - 2, ink().cyan, 0.08);
-            glass::brackets(cv, x - 8, y - 1, fw + 16, fh + 2, 8, 2, ink().gold);
+            cv.brackets(x - 8, y - 1, fw + 16, fh + 2, 8, 2, ink().gold);
         }
         let name_w = d.cols[1] - x - PAD;
         cv.text(
@@ -453,7 +453,7 @@ fn draw_instala(cv: &mut Canvas, l: &Layout, p: &Panel) {
     let (x, y, w, h) = il.caja;
     glass::panel(cv, x, y, w, h, ink().surface);
     frame(cv, il.caja, ink().hairline);
-    glass::brackets(cv, x - 3, y - 3, w + 6, h + 6, 12, 2, ink().gold);
+    cv.brackets(x - 3, y - 3, w + 6, h + 6, 12, 2, ink().gold);
     let lx = x + 3 * PAD / 2;
     let room = w - 3 * PAD;
     cv.text_bold(lang.s(Key::panel_inst_title), lx, y + 20, ink().gold);

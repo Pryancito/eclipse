@@ -614,7 +614,7 @@ fn draw_fila_marco(cv: &mut Canvas, r: Rect, focused: bool) {
     let (x, y, fw, fh) = r;
     if focused {
         glass::cell(cv, x - 6, y + 1, fw + 12, fh - 2, ink().cyan, 0.08);
-        glass::brackets(cv, x - 8, y - 1, fw + 16, fh + 2, 8, 2, ink().gold);
+        cv.brackets(x - 8, y - 1, fw + 16, fh + 2, 8, 2, ink().gold);
     }
     cv.hline(x, y + fh - 1, fw, ink().hairline, 0.5);
 }

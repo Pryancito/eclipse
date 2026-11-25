@@ -48,26 +48,6 @@ pub(super) const GLOW: Rgb = rgb(0x07, 0x22, 0x2b);
 pub(super) const GLOW_R: f32 = 620.0;
 
 const CYAN: Rgb = rgb(0x38, 0xe1, 0xff);
-
-/// The `abyss` look's face: the same instrument, recoloured to the Abyss
-/// session's warm black. Rings and ticks in warm white instead of cyan, the
-/// crescent in Abyss gold, a dim amber wash behind it instead of the teal.
-pub(super) const ABYSS_GROUND_TOP: Rgb = rgb(0x0b, 0x09, 0x06);
-pub(super) const ABYSS_GROUND_BOTTOM: Rgb = rgb(0x10, 0x0d, 0x09);
-pub(super) const ABYSS_GLOW: Rgb = rgb(0x24, 0x1b, 0x0c);
-const ABYSS_LINE: Rgb = rgb(0xf4, 0xf1, 0xea);
-const ABYSS_GOLD: Rgb = rgb(0xf2, 0xc3, 0x3c);
-const ABYSS_MUTED: Rgb = rgb(0xa7, 0xa6, 0xa5);
-const ABYSS_VOID: Rgb = rgb(0x0b, 0x09, 0x06);
-
-/// The four inks of the face, for the style being drawn.
-fn inks(style: Style) -> (Rgb, Rgb, Rgb, Rgb) {
-    if style == Style::Abyss {
-        (ABYSS_LINE, ABYSS_GOLD, ABYSS_MUTED, ABYSS_VOID)
-    } else {
-        (CYAN, GOLD, MUTED, VOID)
-    }
-}
 const GOLD: Rgb = rgb(0xf2, 0xc1, 0x4e);
 const MUTED: Rgb = rgb(0x8a, 0xa4, 0xc2);
 /// The moon: darker than the ground, so the eclipse reads as a body.
@@ -197,7 +177,7 @@ pub(super) const REACH: f32 = 340.0;
 pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
     let known = |n: &str| {
         let n = n.trim().to_ascii_lowercase();
-        matches!(n.as_str(), "eclipse" | "kde" | "win11" | "gnome" | "tecno" | "abyss").then_some(n)
+        matches!(n.as_str(), "eclipse" | "kde" | "win11" | "gnome" | "tecno").then_some(n)
     };
     let from_file = || {
         file?.lines().find_map(|l| {
@@ -211,7 +191,6 @@ pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
     };
     match env.and_then(known).or_else(from_file).as_deref() {
         Some("tecno") | None => Style::Tecno,
-        Some("abyss") => Style::Abyss,
         Some(_) => Style::Cosmic,
     }
 }
@@ -219,7 +198,7 @@ pub fn style_from(env: Option<&str>, file: Option<&str>) -> Style {
 pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
     let (cx, cy, s, px) = (lay.cx, lay.cy, lay.s, lay.px);
     let hair = 1.0 * px;
-    let (cyan, gold, muted, void) = inks(lay.style);
+    let (cyan, gold, muted, void) = (CYAN, GOLD, MUTED, VOID);
 
     pb.ring(cx, cy, R_OUTER * s, hair, cyan, 0.07);
     pb.ring(cx, cy, R_SOLID * s, hair, cyan, 0.20);
@@ -406,8 +385,8 @@ mod tests {
     #[test]
     fn the_look_picks_the_face_and_tecno_is_the_default() {
         assert_eq!(style_from(None, None), Style::Tecno);
-        assert_eq!(style_from(None, Some("look=abyss\n")), Style::Abyss);
-        assert_eq!(style_from(Some("ABYSS"), Some("look=tecno")), Style::Abyss);
+        // The Abyss session's look is gone: what it left behind is no look.
+        assert_eq!(style_from(None, Some("look=abyss\n")), Style::Tecno);
         assert_eq!(style_from(None, Some("look=eclipse\n")), Style::Cosmic);
         assert_eq!(style_from(None, Some("# x\nlook = tecno\n")), Style::Tecno);
         assert_eq!(style_from(Some("KDE"), Some("look=tecno")), Style::Cosmic);

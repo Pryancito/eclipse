@@ -59,7 +59,6 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
-use lunarbar::glass;
 use lunarbar::hunter::{self, MediaState, Mode, SendError, Shield, DOMAINS};
 use lunarbar::hunter_export::{self as export, civil_time};
 use lunarbar::hunter_media as media;
@@ -187,21 +186,6 @@ const PAL_WIN11: Palette = Palette {
     border: (0x3d, 0x3d, 0x3d),
 };
 
-/// `abyss`: the Abyss session's warm-black glass (see `lunarbar::glass`).
-/// The rail is a shade off the ground, so it frosts a step clearer.
-const PAL_ABYSS: Palette = Palette {
-    bg: glass::GROUND,
-    rail: (0x0f, 0x0d, 0x09),
-    field: glass::CARD,
-    text: glass::TEXT,
-    dim: glass::MUTED,
-    accent: glass::GOLD_TEXT,
-    sel: glass::SELECT,
-    sel_text: glass::GOLD_TEXT,
-    on_accent: glass::GROUND,
-    border: glass::HAIRLINE,
-};
-
 fn palette(look: Look) -> &'static Palette {
     match look {
         Look::Win11 => &PAL_WIN11,
@@ -211,7 +195,6 @@ fn palette(look: Look) -> &'static Palette {
             static T: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
             lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
         }
-        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -686,10 +669,7 @@ impl State {
             next: 0,
             generation: 0,
             configured: false,
-            pal: {
-                glass::enter(look);
-                palette(look)
-            },
+            pal: palette(look),
             lang,
             root: unsafe { libc::geteuid() } == 0,
             tab,
@@ -1266,9 +1246,6 @@ impl State {
             return;
         };
         self.frame = draw(&mut cv, w as i32, h as i32, self);
-        if std::ptr::eq(self.pal, &PAL_ABYSS) {
-            glass::frost(&mut cv);
-        }
         self.scroll = self.scroll.min(self.frame.max_scroll);
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(self.map.add(i * frame_size), frame_size) };
@@ -3143,9 +3120,6 @@ fn main() {
             std::process::exit(1);
         };
         let _ = draw(&mut cv, w as i32, h as i32, &st);
-        if std::ptr::eq(st.pal, &PAL_ABYSS) {
-            glass::frost(&mut cv);
-        }
         let mut buf = vec![0u8; w * h * 4];
         if !cv.blit_argb(&mut buf) {
             eprintln!("lunarhunter: blit failed");
