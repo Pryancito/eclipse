@@ -26,9 +26,44 @@ fn building_for_kernel() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none")
 }
 
-/// Applies the freestanding kernel flags shared by every C translation
-/// unit compiled into Eclipse's kernel binary.
+/// True when building the driver into a process (`udrv-nvidia`): the
+/// `user` feature, on an x86_64 Linux target (the process runs on Eclipse's
+/// Linux personality). The NVIDIA C is the same as the kernel's; only the
+/// flags that exist for ring 0 are left out.
+fn building_for_process() -> bool {
+    std::env::var_os("CARGO_FEATURE_USER").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+}
+
+/// Whether the real NVIDIA C is compiled and linked: into the kernel, or
+/// into the process. The Rust side reads it as `cfg(nvrm_real)`.
+fn building_real_c() -> bool {
+    building_for_kernel() || building_for_process()
+}
+
+/// Applies the freestanding flags shared by every C translation unit: the
+/// kernel's, or, in a process, the ones that are not about ring 0.
 fn apply_kernel_flags(build: &mut cc::Build) {
+    if building_for_process() {
+        // The C has no libc of its own to call (it reaches the system only
+        // through the os-interface the Rust side gives it), so the host's
+        // compiler builds it for the musl process as well as for the kernel.
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl")
+            && std::env::var_os("CC_x86_64_unknown_linux_musl").is_none()
+            && std::env::var_os("CC").is_none()
+        {
+            build.compiler("cc");
+        }
+        build
+            .flag("-ffreestanding")
+            .flag("-fno-builtin")
+            .flag("-fno-stack-protector")
+            .flag("-fPIC")
+            .flag("-w")
+            .flag("-nostdlib");
+        return;
+    }
     if !building_for_kernel() {
         return;
     }
@@ -76,6 +111,11 @@ fn apply_kernel_flags(build: &mut cc::Build) {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(nvrm_real)");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_USER");
+    if building_real_c() {
+        println!("cargo:rustc-cfg=nvrm_real");
+    }
     let mut build = cc::Build::new();
     build.file("vendor/smoketest.c").flag_if_supported("-Wall");
     apply_kernel_flags(&mut build);
@@ -109,7 +149,7 @@ fn build_first_real_nvidia_file() -> bool {
     // beside those yields `duplicate symbol: eclipse_rm_*`. Kernel builds
     // (`target_os = "none"`) are the only ones that need the real C.
     // Matches the hosted stubs in `rm_init.rs` for edid / hdmi_audio.
-    if !building_for_kernel() {
+    if !building_real_c() {
         println!(
             "cargo:warning=nvidia-rm-sys: skipping real NVIDIA C source for hosted build (os={})",
             std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string())
@@ -129,10 +169,12 @@ fn build_first_real_nvidia_file() -> bool {
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
     let nvidia = vendor.join("src/nvidia");
     if !nvidia.join("srcs.mk").exists() {
-        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
+        // Here the real C was asked for: the x86_64 kernel, or the
+        // `udrv-nvidia` process, and neither links without it.
+        if building_real_c() {
             panic!(
                 "nvidia-rm-sys: the open-gpu-kernel-modules submodule is not checked out \
-                 ({} is missing), and the x86_64 kernel cannot link without it.\n\
+                 ({} is missing), and the x86_64 kernel and udrv-nvidia cannot link without it.\n\
                  \n\
                  Run:\n    git submodule update --init --recursive\n\
                  \n\

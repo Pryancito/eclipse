@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     /// `nvKmsKapiGetFunctionsTable` (kapi/interface/nvkms-kapi.h). Only its
     /// address is taken here.
@@ -94,12 +94,12 @@ extern "C" {
 /// kernel link instead of hiding in an archive nobody looked into. Hosted
 /// builds compile no NVIDIA C and answer `false`.
 pub fn linked() -> bool {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let entry: unsafe extern "C" fn(*mut c_void) -> u8 = nvKmsKapiGetFunctionsTable;
         core::hint::black_box(entry as usize) != 0
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         false
     }
@@ -204,7 +204,7 @@ impl KmsInfo {
 /// `nv_drm_device` holds one in Linux.
 pub struct KmsDevice(
     // Only handed back to the C side, which a hosted build does not compile.
-    #[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>,
+    #[cfg_attr(not(nvrm_real), allow(dead_code))] NonNull<c_void>,
 );
 
 // The pointer is only ever handed back to kapi, which serialises every entry
@@ -218,11 +218,11 @@ impl KmsDevice {
     /// what is on its screen. `None` when kapi refused (its reason is in the
     /// log); always `None` in a hosted build.
     pub fn alloc(gpu_id: u32) -> Option<Self> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             NonNull::new(unsafe { eclipse_kms_alloc_device(gpu_id) }).map(Self)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = gpu_id;
             None
@@ -232,14 +232,14 @@ impl KmsDevice {
     /// Heads, connectors, displays, EDID and modes, as nvkms sees them now.
     pub fn probe(&self) -> Option<Box<KmsInfo>> {
         let mut info = Box::new(KmsInfo::zeroed());
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             if unsafe { eclipse_kms_probe(self.0.as_ptr(), &mut *info) } == 0 {
                 return None;
             }
             Some(info)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = &mut info;
             None
@@ -251,14 +251,14 @@ impl KmsDevice {
     /// modeset does not. `None` when the device has none.
     pub fn default_lut(&self) -> Option<KmsLut> {
         let mut lut = KmsLut::default();
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             if unsafe { eclipse_kms_default_lut(self.0.as_ptr(), &mut lut) } == 0 {
                 return None;
             }
             Some(lut)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = &mut lut;
             None
@@ -267,7 +267,7 @@ impl KmsDevice {
 
     /// Frees the reference [`Self::default_lut`] built.
     pub fn release_default_lut(&self, lut: &mut KmsLut) {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         unsafe {
             eclipse_kms_default_lut_release(lut)
         };
@@ -278,7 +278,7 @@ impl KmsDevice {
     /// here is the index [`KmsHeadSet::mode_index`] names.
     pub fn modes(&self, display: u32) -> Vec<KmsMode> {
         let mut modes = Vec::new();
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         for index in 0..MAX_MODES as u32 {
             let mut mode = KmsMode::default();
             let more = unsafe { eclipse_kms_mode(self.0.as_ptr(), display, index, &mut mode) };
@@ -290,7 +290,7 @@ impl KmsDevice {
                 break;
             }
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         let _ = (display, &mut modes);
         modes
     }
@@ -305,14 +305,14 @@ impl KmsDevice {
         pitch: u32,
         depth: u32,
     ) -> Option<KmsSurface> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             NonNull::new(unsafe {
                 eclipse_kms_console_surface(self.0.as_ptr(), width, height, pitch, depth)
             })
             .map(KmsSurface)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (width, height, pitch, depth);
             None
@@ -336,7 +336,7 @@ impl KmsDevice {
         pitch: u32,
         block_linear: Option<u8>,
     ) -> Option<KmsSurface> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             NonNull::new(unsafe {
                 eclipse_kms_import_surface(
@@ -353,7 +353,7 @@ impl KmsDevice {
             })
             .map(KmsSurface)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (h_client, h_memory, size, width, height, pitch, block_linear);
             None
@@ -370,7 +370,7 @@ impl KmsDevice {
         sets: &[KmsHeadSet],
         num_heads: u32,
     ) -> Result<KmsScanout, ShowError> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             let mut out = core::ptr::null_mut();
             let code = unsafe {
@@ -388,7 +388,7 @@ impl KmsDevice {
                 .map(KmsScanout)
                 .ok_or(ShowError::BadRequest)
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (console, sets, num_heads);
             Err(ShowError::BadRequest)
@@ -399,13 +399,13 @@ impl KmsDevice {
     /// flip is queued; [`ShowError::FlipPending`] while the previous one has
     /// not landed, with nothing changed.
     pub fn flip(&self, scanout: &KmsScanout, surface: &KmsSurface) -> Result<(), ShowError> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             ShowError::from_code(unsafe {
                 eclipse_kms_flip(self.0.as_ptr(), scanout.0.as_ptr(), surface.0.as_ptr())
             })
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (scanout, surface);
             Err(ShowError::BadRequest)
@@ -415,7 +415,7 @@ impl KmsDevice {
     /// Whether a flip has yet to land on any lit head; `None` when kapi
     /// could not say.
     pub fn flip_pending(&self, scanout: &KmsScanout) -> Option<bool> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             match unsafe { eclipse_kms_flip_pending(self.0.as_ptr(), scanout.0.as_ptr()) } {
                 0 => Some(false),
@@ -423,7 +423,7 @@ impl KmsDevice {
                 _ => None,
             }
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = scanout;
             None
@@ -442,7 +442,7 @@ impl KmsDevice {
         sets: &[KmsHeadSet],
         test_only: bool,
     ) -> Result<(), ShowError> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             ShowError::from_code(unsafe {
                 eclipse_kms_set_mode(
@@ -455,7 +455,7 @@ impl KmsDevice {
                 )
             })
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (scanout, surface, sets, test_only);
             Err(ShowError::BadRequest)
@@ -466,7 +466,7 @@ impl KmsDevice {
     /// video memory, with the RM client and handle its image is written
     /// through ([`crate::rm_init::write_memory`]).
     pub fn cursor_surface(&self) -> Option<(KmsSurface, u32, u32)> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             let (mut h_client, mut h_memory) = (0, 0);
             let s = unsafe {
@@ -474,7 +474,7 @@ impl KmsDevice {
             };
             NonNull::new(s).map(|s| (KmsSurface(s), h_client, h_memory))
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         None
     }
 
@@ -489,14 +489,14 @@ impl KmsDevice {
         y: i32,
         changed: bool,
     ) -> Result<(), ShowError> {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         {
             let s = surface.map_or(core::ptr::null(), |s| s.0.as_ptr() as *const c_void);
             ShowError::from_code(unsafe {
                 eclipse_kms_cursor(self.0.as_ptr(), scanout.0.as_ptr(), s, x, y, changed as u8)
             })
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         {
             let _ = (scanout, surface, x, y, changed);
             Err(ShowError::BadRequest)
@@ -505,17 +505,17 @@ impl KmsDevice {
 
     /// Destroy a surface. It must not be on screen.
     pub fn free_surface(&self, surface: KmsSurface) {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         unsafe {
             eclipse_kms_surface_free(self.0.as_ptr(), surface.0.as_ptr())
         };
-        #[cfg(not(target_os = "none"))]
+        #[cfg(not(nvrm_real))]
         let _ = surface;
     }
 
     /// kapi's `freeDevice`.
     pub fn free(self) {
-        #[cfg(target_os = "none")]
+        #[cfg(nvrm_real)]
         unsafe {
             eclipse_kms_free_device(self.0.as_ptr())
         };
@@ -523,11 +523,11 @@ impl KmsDevice {
 }
 
 /// A kapi surface and its memory: `struct EclipseKmsSurface`.
-pub struct KmsSurface(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
+pub struct KmsSurface(#[cfg_attr(not(nvrm_real), allow(dead_code))] NonNull<c_void>);
 
 /// The configuration nvkms scans out since the console modeset:
 /// `struct EclipseKmsScanout`. Lives as long as the device.
-pub struct KmsScanout(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
+pub struct KmsScanout(#[cfg_attr(not(nvrm_real), allow(dead_code))] NonNull<c_void>);
 
 // Like `KmsDevice`, only ever handed back to kapi.
 unsafe impl Send for KmsSurface {}
@@ -617,7 +617,7 @@ pub enum ShowError {
 }
 
 impl ShowError {
-    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    #[cfg_attr(not(nvrm_real), allow(dead_code))]
     fn from_code(code: i32) -> Result<(), Self> {
         match code {
             0 => Ok(()),
@@ -834,11 +834,11 @@ fn plan_heads(
 /// loaded: what `nv_drm_event_callback` turns into a hotplug uevent. A
 /// change is a reason to probe the cards again. 0 in a hosted build.
 pub fn hotplug_count() -> u32 {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         unsafe { eclipse_kms_hotplug_count() }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         0
     }

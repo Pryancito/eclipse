@@ -1279,17 +1279,17 @@ pub struct GrEdid {
     pub conn_type: [NvU32; 16],
 }
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_edid(device_instance: NvU32, out: *mut GrEdid) -> NV_STATUS;
 }
 
 /// Hosted (libos) builds have no RM C objects to link: `build.rs` only
-/// compiles the NVIDIA sources for `target_os = "none"`. These two entry
+/// compiles the NVIDIA sources for `nvrm_real`. These two entry
 /// points are the only ones reachable from hosted code (procfs `gpuedid`
 /// and the HDA driver's HDMI audio kick), so they get an explicit
 /// "no GPU here" answer instead of an undefined symbol at link time.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_edid(_device_instance: NvU32, _out: *mut GrEdid) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
@@ -1324,7 +1324,7 @@ pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_connect_state(device_instance: NvU32, connected: *mut NvU32) -> NV_STATUS;
     fn eclipse_rm_edid_forget(device_instance: NvU32);
@@ -1335,7 +1335,7 @@ extern "C" {
 /// poll runs to see a monitor come or go. Fails until [`edid`] has answered
 /// once for this GPU; always fails in a hosted build.
 pub fn connect_state(device_instance: u32) -> Result<u32, NV_STATUS> {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     {
         let _gate = RmGate::lock();
         let mut mask = 0;
@@ -1346,7 +1346,7 @@ pub fn connect_state(device_instance: u32) -> Result<u32, NV_STATUS> {
             Err(status)
         }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     {
         let _ = device_instance;
         Err(NV_ERR_NOT_SUPPORTED)
@@ -1356,11 +1356,11 @@ pub fn connect_state(device_instance: u32) -> Result<u32, NV_STATUS> {
 /// A monitor came or went: the next [`edid`] asks the RM again instead of
 /// replaying the answer it cached for the boot.
 pub fn edid_forget(device_instance: u32) {
-    #[cfg(target_os = "none")]
+    #[cfg(nvrm_real)]
     unsafe {
         eclipse_rm_edid_forget(device_instance)
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(nvrm_real))]
     let _ = device_instance;
 }
 
@@ -1379,7 +1379,7 @@ pub struct HdmiAudioOut {
     pub max_freq: NvU32,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_hdmi_audio(
         device_instance: NvU32,
@@ -1391,7 +1391,7 @@ extern "C" {
 }
 
 /// See [`eclipse_rm_edid`]'s hosted stub.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_hdmi_audio(
     _device_instance: NvU32,
     _display_mask: NvU32,

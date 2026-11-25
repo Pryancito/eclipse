@@ -221,7 +221,7 @@ impl MmapContext {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(nvrm_real)]
 extern "C" {
     fn eclipse_rm_frontend_escape(
         cmd: NvU32,
@@ -253,7 +253,7 @@ extern "C" {
 // The tests can have RM_MAP_MEMORY answer with a record of their own, and
 // see what was unmapped, to check what this file does with the C's answer,
 // or run an escape body of their own inside the call.
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_escape(
     _cmd: NvU32,
     _data: *mut c_void,
@@ -273,7 +273,7 @@ unsafe fn eclipse_rm_frontend_escape(
     }
     NV_ERR_NOT_SUPPORTED
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_map_unrecorded(
     _data: *mut c_void,
     _size: NvU32,
@@ -284,25 +284,25 @@ unsafe fn eclipse_rm_frontend_map_unrecorded(
     #[cfg(test)]
     tests::stand_in_unmapped(_why);
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_release(_os_info: *mut c_void) {}
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_version() -> *const c_char {
     core::ptr::null()
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_gpu_id(_gpu_instance: NvU32) -> NvU32 {
     u32::MAX
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_gpu_uuid(_gpu_instance: NvU32, _uuid: *mut NvU8) -> NV_STATUS {
     NV_ERR_GPU_UUID_NOT_FOUND
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_gpu_instance(_gpu: *mut c_void) -> NvU32 {
     u32::MAX
 }
-#[cfg(not(target_os = "none"))]
+#[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_layout(which: NvU32) -> NvU32 {
     // No C to ask: answer with our own table, so a hosted build agrees with
     // itself and the comparison below is only ever a real one in the kernel.

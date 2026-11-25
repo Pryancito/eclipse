@@ -135,6 +135,16 @@ jobs:
           fi
           scripts/qemu-ktest.sh ${{ matrix.arch }}
 
+      # The kernel's NVIDIA driver, unchanged, linked into a process
+      # (tools/udrv-nvidia): the first step of moving it out of the kernel.
+      # It needs the same submodule as the x86_64 kernel, which is why it
+      # lives in this job. The tests are the process's side of the system
+      # (clock, log, DMA ranges); linking them is what proves that the
+      # NVIDIA C builds for a process and asks for nothing else.
+      - name: udrv-nvidia (the NVIDIA driver as a process)
+        if: matrix.arch == 'x86_64'
+        run: cargo test --release --manifest-path tools/udrv-nvidia/Cargo.toml
+
   # The memory-debugging build, in a job of its own.
   #
   # `MEM_DEBUG=1` turns on the redzone canary after every allocation, the
