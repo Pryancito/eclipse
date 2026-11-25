@@ -815,7 +815,7 @@ fn a_bad_claim_pointer_does_not_cost_the_device() {
 fn a_claim_of_an_unknown_kind_or_a_device_not_reserved_is_refused() {
     let proc = a_process();
     let mut words = [0xaau64; CLAIM_WORDS];
-    for kind in [0, 12, usize::MAX] {
+    for kind in [0, 13, usize::MAX] {
         assert_eq!(
             claim(&proc, kind, 0, ptr(&mut words)),
             zx(ZxError::INVALID_ARGS)
@@ -1013,4 +1013,74 @@ fn the_gateway_lets_through_exactly_the_syscalls_its_comment_names() {
             );
         }
     }
+}
+
+#[test]
+fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_driver_may_write() {
+    use super::device_pci::{ECLIPSE_DEVICE_PCI_FN, OP_BAR, OP_CONFIG_WRITE};
+    // The only test that names a reservation: NVIDIA GPUs are left to
+    // userspace only when asked for.
+    udev::set_reservation(Some("nvidia@0"), false);
+    let regs = a_paddr();
+    let aperture = a_paddr();
+    let mut bars = [(0, 0); 6];
+    bars[0] = (regs, 0x10_0000);
+    bars[1] = (aperture, 0x10_0000);
+    let place = udev::PciPlace {
+        bus: 1,
+        device: 0,
+        function: 0,
+        bars,
+    };
+    assert!(udev::reserve_pci_fn(
+        udev::NVIDIA,
+        true,
+        0x10de_1e89,
+        place,
+        regs,
+        0x10_0000,
+        || Wiring::default()
+    ));
+    let driver = a_process();
+    let other = a_process();
+    let kind = device_claim::ECLIPSE_DEVICE_NVIDIA;
+    let pci = |proc: &Arc<Process>, op: usize, a: usize, b: usize, c: usize| {
+        call(proc, ECLIPSE_DEVICE_PCI_FN, [kind, 0, op, a, b, c])
+    };
+    // Not claimed yet: nobody's.
+    assert_eq!(pci(&driver, OP_BAR, 1, 0, 0), zx(ZxError::ACCESS_DENIED));
+    let mut words = [0u64; CLAIM_WORDS];
+    assert_eq!(claim(&driver, kind, 0, ptr(&mut words)), 0);
+    assert_eq!(words[4], 0x10de_1e89, "the claim says which GPU it is");
+    assert_eq!(pci(&other, OP_BAR, 1, 0, 0), zx(ZxError::ACCESS_DENIED));
+    // BAR 1, write-combining: a VMO of its memory.
+    let handle = pci(&driver, OP_BAR, 1, 1, 0);
+    assert!(handle > 0, "{}", handle);
+    let vmo = driver
+        .get_object_with_rights::<VmObject>(handle as u32, Rights::MAP)
+        .unwrap();
+    assert_eq!(vmo.len(), 0x10_0000);
+    // A BAR it does not have, and an unknown cache choice.
+    assert_eq!(pci(&driver, OP_BAR, 2, 0, 0), zx(ZxError::OUT_OF_RANGE));
+    assert_eq!(pci(&driver, OP_BAR, 6, 0, 0), zx(ZxError::OUT_OF_RANGE));
+    assert_eq!(pci(&driver, OP_BAR, 0, 2, 0), zx(ZxError::INVALID_ARGS));
+    // The registers that place the function are the kernel's: refused
+    // before anything reaches the bus.
+    for (offset, width) in [(0x00, 4), (0x10, 4), (0x14, 2), (0x30, 4), (0x0e, 1)] {
+        assert_eq!(
+            pci(&driver, OP_CONFIG_WRITE, offset, width, 0),
+            zx(ZxError::ACCESS_DENIED),
+            "a write at {:#x}",
+            offset
+        );
+    }
+    assert_eq!(
+        pci(&driver, OP_CONFIG_WRITE, 0x41, 2, 0),
+        zx(ZxError::OUT_OF_RANGE)
+    );
+    assert_eq!(
+        pci(&driver, OP_CONFIG_WRITE, 0x100, 4, 0),
+        zx(ZxError::OUT_OF_RANGE)
+    );
+    assert_eq!(pci(&driver, 9, 0, 0, 0), zx(ZxError::INVALID_ARGS));
 }

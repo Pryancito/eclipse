@@ -78,8 +78,14 @@ pub const XHCI: &str = "xhci";
 /// A PCI function named by its identity, `pci-VVVV-DDDD@N`: see
 /// [`parse_pci_spec`]. Not one of [`KINDS`]: it is counted per identity.
 pub const PCI: &str = "pci";
+/// An NVIDIA GPU (vendor `10de`, a display controller), which the kernel
+/// drives itself unless `udriver=nvidia@N` asks for it: its driver in
+/// userspace (`tools/udrv-nvidia`) is the kernel's own, linked into a
+/// process, and reaches every memory BAR and the configuration space
+/// ([`UserDevice::pci`]).
+pub const NVIDIA: &str = "nvidia";
 /// The kinds that can be reserved.
-const KINDS: [&str; 10] = [
+const KINDS: [&str; 11] = [
     VIRTIO_BLK,
     VIRTIO_NET,
     E1000E,
@@ -90,6 +96,7 @@ const KINDS: [&str; 10] = [
     I8042_AUX,
     HDA,
     XHCI,
+    NVIDIA,
 ];
 
 /// How the device is reached.
@@ -143,7 +150,145 @@ pub struct UserDevice {
     /// that drives more than one part (the e1000e's); 0 when not known or
     /// not asked for. The claim hands it over ([`reserve_pci_if`]).
     pub pci_id: u32,
+    /// Where a PCI function is and every memory BAR it has, for a driver
+    /// that reaches more of it than one window ([`PciPlace`]): set for
+    /// [`NVIDIA`] and the functions named by identity, `None` otherwise.
+    pub pci: Option<PciPlace>,
     claimed: AtomicBool,
+}
+
+/// A PCI function's place on the bus and its memory BARs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PciPlace {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    /// Each BAR by its number: the physical address and length of a memory
+    /// BAR, `(0, 0)` for an I/O BAR, the upper half of a 64-bit one, or
+    /// none.
+    pub bars: [(usize, usize); 6],
+}
+
+/// Whether `width` bytes at `offset` are an access the configuration space
+/// takes: 1, 2 or 4 bytes, aligned to them, in its first 256 bytes.
+fn in_space(offset: usize, width: usize) -> bool {
+    matches!(width, 1 | 2 | 4) && offset.is_multiple_of(width) && offset + width <= 256
+}
+
+/// Why a write to a function's configuration space was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRefused {
+    /// Outside the space, or not aligned to its width.
+    Range,
+    /// A register only the kernel sets: the identity, the BARs, the
+    /// expansion ROM, the bus numbers. Moving a BAR would point the
+    /// device at memory the driver was never given.
+    Kernel,
+    /// There is no configuration space to reach on this machine.
+    NotHere,
+}
+
+impl PciPlace {
+    /// Whether the driver may write `width` bytes at `offset`: the command
+    /// and status registers, the cache line, the latency and interrupt
+    /// fields, and everything from the capabilities on (power management,
+    /// MSI, PCI Express), as Linux's `pci_user_write_config_*` lets a
+    /// driver; never the identity, the BARs or the ROM.
+    pub fn may_write(offset: usize, width: usize) -> Result<(), ConfigRefused> {
+        if !in_space(offset, width) {
+            return Err(ConfigRefused::Range);
+        }
+        let end = offset + width;
+        let kernels = [
+            (0x00, 0x04),
+            (0x08, 0x0c),
+            (0x0e, 0x0f),
+            (0x10, 0x34),
+            (0x34, 0x3c),
+        ];
+        if kernels.iter().any(|&(a, b)| offset < b && a < end) {
+            return Err(ConfigRefused::Kernel);
+        }
+        Ok(())
+    }
+
+    fn loc(&self) -> pci::Location {
+        pci::Location {
+            bus: self.bus,
+            device: self.device,
+            function: self.function,
+        }
+    }
+
+    /// `width` bytes (1, 2 or 4) of the configuration space at `offset`,
+    /// which must be aligned to them. `None` outside the 256 bytes every
+    /// machine here reaches, or on a machine with no PCI.
+    pub fn config_read(&self, offset: usize, width: usize) -> Option<u32> {
+        if !in_space(offset, width) {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            // SAFETY: a read of the configuration space of a function the
+            // bus found.
+            let word = unsafe { PCI_ACCESS.read32(&PortOpsImpl, self.loc(), (offset & !3) as u16) };
+            let shift = (offset & 3) * 8;
+            let mask = if width == 4 {
+                u32::MAX
+            } else {
+                (1 << (width * 8)) - 1
+            };
+            Some((word >> shift) & mask)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = self.loc();
+            None
+        }
+    }
+
+    /// Write `width` bytes of `value` at `offset`, when [`Self::may_write`]
+    /// lets a driver.
+    pub fn config_write(
+        &self,
+        offset: usize,
+        width: usize,
+        value: u32,
+    ) -> Result<(), ConfigRefused> {
+        Self::may_write(offset, width)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            let at = (offset & !3) as u16;
+            let shift = (offset & 3) * 8;
+            let mask = if width == 4 {
+                u32::MAX
+            } else {
+                ((1u32 << (width * 8)) - 1) << shift
+            };
+            // SAFETY: a read-modify-write of the dword holding registers
+            // [`Self::may_write`] let through. The status register's bits
+            // are cleared by writing ones, so a byte or a word written next
+            // to it writes zeros there, which leaves them as they are.
+            unsafe {
+                let old = PCI_ACCESS.read32(&PortOpsImpl, self.loc(), at);
+                let old = if at == 0x04 && width < 4 {
+                    old & 0x0000_ffff
+                } else {
+                    old
+                };
+                let new = (old & !mask) | ((value << shift) & mask);
+                PCI_ACCESS.write32(&PortOpsImpl, self.loc(), at, new);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (self.loc(), value);
+            Err(ConfigRefused::NotHere)
+        }
+    }
 }
 
 /// What a bus knows of a device it hands over beyond its window.
@@ -632,7 +777,7 @@ pub fn reserve_hda(
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
     let unasked = !gpu && HDA_UNASKED.swap(false, Ordering::AcqRel);
-    reserve_with(HDA, true, unasked, transport, 0, paddr, size, wiring)
+    reserve_with(HDA, true, unasked, transport, 0, None, paddr, size, wiring)
 }
 
 /// Whether the virtio input devices are left to userspace without the
@@ -807,6 +952,7 @@ pub fn reserve_i8042() -> bool {
             irq: Some(irq),
             vaddr: None,
             pci_id: 0,
+            pci: None,
             claimed: AtomicBool::new(false),
         }));
     }
@@ -838,7 +984,7 @@ pub fn reserve_if(
     size: usize,
     wiring: impl FnOnce() -> Wiring,
 ) -> bool {
-    reserve_with(kind, usable, false, transport, 0, paddr, size, wiring)
+    reserve_with(kind, usable, false, transport, 0, None, paddr, size, wiring)
 }
 
 /// [`reserve_if`] for a PCI function whose driver needs to know which part
@@ -858,6 +1004,33 @@ pub fn reserve_pci_if(
         false,
         Transport::Pci,
         pci_id,
+        None,
+        paddr,
+        size,
+        wiring,
+    )
+}
+
+/// [`reserve_pci_if`] for a function whose driver reaches all of it: its
+/// place on the bus and every memory BAR go with the claim
+/// ([`UserDevice::pci`]). The window is still the first memory BAR.
+#[allow(clippy::too_many_arguments)]
+pub fn reserve_pci_fn(
+    kind: &'static str,
+    usable: bool,
+    pci_id: u32,
+    place: PciPlace,
+    paddr: usize,
+    size: usize,
+    wiring: impl FnOnce() -> Wiring,
+) -> bool {
+    reserve_with(
+        kind,
+        usable,
+        false,
+        Transport::Pci,
+        pci_id,
+        Some(place),
         paddr,
         size,
         wiring,
@@ -872,6 +1045,7 @@ fn reserve_with(
     unasked: bool,
     transport: Transport,
     pci_id: u32,
+    pci: Option<PciPlace>,
     paddr: usize,
     size: usize,
     wiring: impl FnOnce() -> Wiring,
@@ -916,6 +1090,7 @@ fn reserve_with(
         irq,
         vaddr,
         pci_id,
+        pci,
         claimed: AtomicBool::new(false),
     }));
     true
@@ -952,6 +1127,7 @@ fn next_pci_index(pci_id: u32) -> usize {
 /// it counted and the kernel's.
 pub fn reserve_pci_by_id(
     pci_id: u32,
+    pci: Option<PciPlace>,
     usable: bool,
     paddr: usize,
     size: usize,
@@ -983,6 +1159,7 @@ pub fn reserve_pci_by_id(
         irq,
         vaddr,
         pci_id,
+        pci,
         claimed: AtomicBool::new(false),
     }));
     true
@@ -1018,6 +1195,59 @@ pub fn find(kind: &str, index: usize) -> Option<Arc<UserDevice>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_driver_writes_the_command_register_and_the_capabilities_never_the_bars() {
+        use super::{ConfigRefused, PciPlace};
+        for (offset, width) in [
+            (0x04, 2),
+            (0x04, 4),
+            (0x0c, 1),
+            (0x0d, 1),
+            (0x3c, 1),
+            (0x3d, 1),
+            (0x40, 4),
+            (0x68, 2),
+            (0xfc, 4),
+        ] {
+            assert_eq!(
+                PciPlace::may_write(offset, width),
+                Ok(()),
+                "{offset:#x}/{width}"
+            );
+        }
+        for (offset, width) in [
+            (0x00, 2),
+            (0x02, 2),
+            (0x08, 4),
+            (0x0e, 1),
+            (0x10, 4),
+            (0x24, 4),
+            (0x30, 4),
+            (0x34, 1),
+            (0x18, 1),
+        ] {
+            assert_eq!(
+                PciPlace::may_write(offset, width),
+                Err(ConfigRefused::Kernel),
+                "{offset:#x}/{width}"
+            );
+        }
+        for (offset, width) in [
+            (0x41, 2),
+            (0x42, 4),
+            (0x100, 4),
+            (0xfe, 4),
+            (0x40, 3),
+            (0x40, 8),
+        ] {
+            assert_eq!(
+                PciPlace::may_write(offset, width),
+                Err(ConfigRefused::Range),
+                "{offset:#x}/{width}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -1099,6 +1329,7 @@ mod tests {
             irq: None,
             vaddr: Some(window.as_mut_ptr() as usize),
             pci_id: 0,
+            pci: None,
             claimed: AtomicBool::new(false),
         }
     }
@@ -1281,6 +1512,7 @@ mod tests {
             irq: Some(I8042_KBD_IRQ),
             vaddr: None,
             pci_id: 0,
+            pci: None,
             claimed: AtomicBool::new(false),
         };
         assert_eq!(ports.port(0, 1), Some(0x60));

@@ -500,6 +500,11 @@ pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> Devic
     if reserve_by_id(dev, mapper, irq) {
         return Err(DeviceError::NotSupported);
     }
+    // An NVIDIA GPU the boot leaves to its driver as a process
+    // (`udriver=nvidia@N`): the kernel's own NVIDIA driver never sees it.
+    if reserve_nvidia(dev, mapper, irq) {
+        return Err(DeviceError::NotSupported);
+    }
 
     // Try modular PCI drivers (ArceOS style)
     if let Ok(device) = super::pci_drivers::probe_pci_device(dev, mapper, irq) {
@@ -526,10 +531,56 @@ fn reserve_by_id(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Optio
             _ => None,
         })
         .unwrap_or((0, 0));
-    crate::user::reserve_pci_by_id(pci_id, addr != 0, addr, len, || crate::user::Wiring {
-        irq: crate::pci_disks::vector(irq),
-        vaddr: mapper.as_ref().and_then(|m| m.query_or_map(addr, len)),
+    crate::user::reserve_pci_by_id(pci_id, Some(place_of(dev)), addr != 0, addr, len, || {
+        crate::user::Wiring {
+            irq: crate::pci_disks::vector(irq),
+            vaddr: mapper.as_ref().and_then(|m| m.query_or_map(addr, len)),
+        }
     })
+}
+
+/// `dev`'s place on the bus and its memory BARs, as a claim hands them on.
+fn place_of(dev: &PCIDevice) -> crate::user::PciPlace {
+    let mut bars = [(0, 0); 6];
+    for (slot, bar) in bars.iter_mut().zip(dev.bars.iter()) {
+        if let Some(BAR::Memory(addr, len, _, _)) = bar {
+            *slot = (*addr as usize, *len as usize);
+        }
+    }
+    crate::user::PciPlace {
+        bus: dev.loc.bus,
+        device: dev.loc.device,
+        function: dev.loc.function,
+        bars,
+    }
+}
+
+/// NVIDIA's PCI vendor and the display controller class.
+const NVIDIA_VENDOR: u16 = 0x10de;
+const CLASS_DISPLAY: u8 = 0x03;
+
+/// [`crate::user::reserve_pci_fn`] for an NVIDIA GPU: counted among the
+/// GPUs whatever the boot asks, and left to userspace when it asks for it
+/// (`udriver=nvidia@N`). The window is BAR 0, the GPU's registers.
+fn reserve_nvidia(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>, irq: Option<usize>) -> bool {
+    if dev.id.vendor_id != NVIDIA_VENDOR || dev.id.class != CLASS_DISPLAY {
+        return false;
+    }
+    let place = place_of(dev);
+    let (addr, len) = place.bars[0];
+    let pci_id = (dev.id.vendor_id as u32) << 16 | dev.id.device_id as u32;
+    crate::user::reserve_pci_fn(
+        crate::user::NVIDIA,
+        addr != 0,
+        pci_id,
+        place,
+        addr,
+        len,
+        || crate::user::Wiring {
+            irq: crate::pci_disks::vector(irq),
+            vaddr: mapper.as_ref().and_then(|m| m.query_or_map(addr, len)),
+        },
+    )
 }
 
 pub fn detach_driver(_loc: &Location) -> bool {

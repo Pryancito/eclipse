@@ -69,6 +69,13 @@ pub const ECLIPSE_DEVICE_XHCI: usize = 10;
 /// its driver is gone it stays out of use until the next boot.
 pub const ECLIPSE_DEVICE_PCI: usize = 11;
 
+/// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) kind: an NVIDIA
+/// GPU, left to userspace by `udriver=nvidia@N`. Its window is BAR 0, the
+/// GPU's registers ([`ECLIPSE_TRANSPORT_PCI`], word 4 its identity); its
+/// other BARs and its configuration space are reached through
+/// `ECLIPSE_DEVICE_PCI_FN`.
+pub const ECLIPSE_DEVICE_NVIDIA: usize = 12;
+
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM) transport: I/O
 /// ports. The window is `size` ports from port `offset` (words 2 and 3),
 /// which the driver reaches through `ECLIPSE_DEVICE_PORT`; there is no
@@ -159,7 +166,9 @@ const THREADS_STEP: Duration = Duration::from_millis(1);
 
 /// Which process has which device: `(process, kind, index)`, from the claim
 /// until the device is taken back.
-static HOLDERS: lock::Mutex<Vec<(KoID, &'static str, usize)>> = lock::Mutex::new(Vec::new());
+/// Who holds what: the holder, the device's kind and index, and its PCI
+/// identity (what tells apart two `pci` functions of the same index).
+static HOLDERS: lock::Mutex<Vec<(KoID, &'static str, usize, u32)>> = lock::Mutex::new(Vec::new());
 
 /// The device of `kind` that `proc` holds, by its place among the reserved
 /// ones of that kind. What a driver serves to the kernel is known by this:
@@ -169,8 +178,50 @@ pub(super) fn held_by(proc: &Arc<Process>, kind: &str) -> Option<usize> {
     let holders = HOLDERS.lock();
     holders
         .iter()
-        .find(|(holder, k, _)| *holder == id && *k == kind)
-        .map(|(_, _, index)| *index)
+        .find(|(holder, k, _, _)| *holder == id && *k == kind)
+        .map(|(_, _, index, _)| *index)
+}
+
+/// The device `index` of `kind` that `proc` holds, of identity `pci_id` for
+/// a function named by its identity ([`ECLIPSE_DEVICE_PCI`]).
+pub(super) fn held_device(
+    proc: &Arc<Process>,
+    kind: &str,
+    index: usize,
+    pci_id: u32,
+) -> Option<Arc<user::UserDevice>> {
+    let id = proc.id();
+    let held = HOLDERS.lock().iter().any(|&(holder, k, i, p)| {
+        holder == id && k == kind && i == index && (kind != user::PCI || p == pci_id)
+    });
+    if !held {
+        return None;
+    }
+    if kind == user::PCI {
+        user::find_pci(pci_id, index)
+    } else {
+        user::find(kind, index)
+    }
+}
+
+/// The claim kind of [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM)'s
+/// number.
+pub(super) fn kind_of(number: usize) -> Option<&'static str> {
+    Some(match number {
+        ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
+        ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
+        ECLIPSE_DEVICE_E1000E => user::E1000E,
+        ECLIPSE_DEVICE_NVME => user::NVME,
+        ECLIPSE_DEVICE_AHCI => user::AHCI,
+        ECLIPSE_DEVICE_VIRTIO_INPUT => user::VIRTIO_INPUT,
+        ECLIPSE_DEVICE_I8042 => user::I8042,
+        ECLIPSE_DEVICE_I8042_AUX => user::I8042_AUX,
+        ECLIPSE_DEVICE_HDA => user::HDA,
+        ECLIPSE_DEVICE_XHCI => user::XHCI,
+        ECLIPSE_DEVICE_PCI => user::PCI,
+        ECLIPSE_DEVICE_NVIDIA => user::NVIDIA,
+        _ => return None,
+    })
 }
 
 /// What a driver was given of its device, kept by the kernel as well so it
@@ -201,9 +252,10 @@ impl Held {
     /// The driver is gone: stop the device and make it claimable again.
     fn take_back(self) {
         let (kind, index) = (self.device.kind, self.device.index);
+        let pci_id = self.device.pci_id;
         HOLDERS
             .lock()
-            .retain(|held| *held != (self.holder, kind, index));
+            .retain(|held| *held != (self.holder, kind, index, pci_id));
         self.silence();
         if !self.device.reset() {
             // It may still be writing to what it was given, so that stays
@@ -243,20 +295,7 @@ impl Held {
 
 /// [`ECLIPSE_DEVICE_CLAIM`](super::ECLIPSE_DEVICE_CLAIM).
 pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
-    let kind = match args[0] {
-        ECLIPSE_DEVICE_VIRTIO_BLK => user::VIRTIO_BLK,
-        ECLIPSE_DEVICE_VIRTIO_NET => user::VIRTIO_NET,
-        ECLIPSE_DEVICE_E1000E => user::E1000E,
-        ECLIPSE_DEVICE_NVME => user::NVME,
-        ECLIPSE_DEVICE_AHCI => user::AHCI,
-        ECLIPSE_DEVICE_VIRTIO_INPUT => user::VIRTIO_INPUT,
-        ECLIPSE_DEVICE_I8042 => user::I8042,
-        ECLIPSE_DEVICE_I8042_AUX => user::I8042_AUX,
-        ECLIPSE_DEVICE_HDA => user::HDA,
-        ECLIPSE_DEVICE_XHCI => user::XHCI,
-        ECLIPSE_DEVICE_PCI => user::PCI,
-        _ => return Err(ZxError::INVALID_ARGS),
-    };
+    let kind = kind_of(args[0]).ok_or(ZxError::INVALID_ARGS)?;
     let mut out = kernel_hal::user::UserOutPtr::<u64>::from(args[2]);
     // Look before taking anything: a bad pointer must not cost the device.
     out.write_array(&[0; CLAIM_WORDS])
@@ -352,7 +391,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     }
     HOLDERS
         .lock()
-        .push((held.holder, device.kind, device.index));
+        .push((held.holder, device.kind, device.index, device.pci_id));
     held.until_gone(proc);
     Ok(())
 }
