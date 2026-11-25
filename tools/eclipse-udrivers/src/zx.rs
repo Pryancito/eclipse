@@ -190,6 +190,33 @@ pub fn shared_memory(len: usize) -> Result<(*mut u8, Handle), String> {
     Ok((map(vmo, len)?, other))
 }
 
+/// The rights of a handle: read it, write it, map it, duplicate it.
+pub const RIGHT_DUPLICATE: u32 = 1 << 0;
+pub const RIGHT_TRANSFER: u32 = 1 << 1;
+pub const RIGHT_READ: u32 = 1 << 2;
+pub const RIGHT_WRITE: u32 = 1 << 3;
+pub const RIGHT_MAP: u32 = 1 << 5;
+
+/// A second handle to what `handle` names, with only `rights`.
+pub fn duplicate(handle: Handle, rights: u32) -> Result<Handle, Status> {
+    let mut other: Handle = 0;
+    // SAFETY: the kernel writes a handle into `other`.
+    unsafe {
+        call(
+            nr::HANDLE_DUPLICATE,
+            [
+                handle as usize,
+                rights as usize,
+                &mut other as *mut Handle as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    }?;
+    Ok(other)
+}
+
 /// Map all `len` bytes of the VMO `vmo`, readable and writable, shared
 /// with whoever else has it. The handle is gone afterwards: it moves into
 /// the descriptor the mapping is made from. The mapping is never taken

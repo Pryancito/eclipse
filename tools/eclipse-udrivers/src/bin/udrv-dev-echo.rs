@@ -5,7 +5,8 @@
 //! is written to it is what it reads back, and two `ioctl`s answer
 //! (`REVERSE`, `PLUS_ONE`). `check` starts a `serve` of its own and checks,
 //! as a program would see them, the open, `poll`, a read with nothing there
-//! and one that waits, writes, the `ioctl`s and the server's going and
+//! and one that waits, writes, the `ioctl`s, `mmap` of the device's memory
+//! (a writable page and a read-only one) and the server's going and
 //! coming back; then it times `ROUNDS` (default 2000) write-and-read turns.
 //! It prints `dev-echo: ok` when everything held.
 
@@ -16,6 +17,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use udrivers::served::{self, Device, Node, EAGAIN, ENOTTY, POLLIN, POLLOUT};
+use udrivers::zx;
 
 const NAME: &str = "udrv-dev-echo";
 
@@ -26,6 +28,12 @@ const PLUS_ONE: u32 = 0x5402;
 /// `_IO('T', 3)`: say no more readiness of this open (to time what saying
 /// it costs).
 const QUIET: u32 = 0x5403;
+/// `_IO('T', 5)`: the byte of the device's memory at the argument.
+const PEEK: u32 = 0x5405;
+
+/// What a mapping of the device shows: its first page, writable, starts
+/// `eco`; its second, read-only, starts `solo`.
+const PAGE: usize = 4096;
 
 fn die(what: impl std::fmt::Display) -> ! {
     println!("{NAME}: {what}");
@@ -38,6 +46,35 @@ struct Echo {
     next: u32,
     /// Opens that asked for no readiness (`QUIET`).
     quiet: std::collections::BTreeSet<u32>,
+    /// The device's memory: two pages mapped here, a handle that writes
+    /// them and one that only reads.
+    mem: Option<Mem>,
+}
+
+struct Mem {
+    at: *mut u8,
+    rw: zx::Handle,
+    ro: zx::Handle,
+}
+
+// SAFETY: the pages are this process's for its whole life.
+unsafe impl Send for Mem {}
+
+impl Mem {
+    fn new() -> Mem {
+        let (at, rw) = zx::shared_memory(2 * PAGE).unwrap_or_else(|e| die(e));
+        let ro = zx::duplicate(
+            rw,
+            zx::RIGHT_READ | zx::RIGHT_MAP | zx::RIGHT_DUPLICATE | zx::RIGHT_TRANSFER,
+        )
+        .unwrap_or_else(|e| die(format!("handle_duplicate: {e}")));
+        // SAFETY: two pages, mapped for good.
+        unsafe {
+            core::ptr::copy_nonoverlapping(b"eco".as_ptr(), at, 3);
+            core::ptr::copy_nonoverlapping(b"solo".as_ptr(), at.add(PAGE), 4);
+        }
+        Mem { at, rw, ro }
+    }
 }
 
 impl Device for Echo {
@@ -94,7 +131,31 @@ impl Device for Echo {
                 self.quiet.insert(fh);
                 Ok((0, 0))
             }
+            PEEK => match &self.mem {
+                // SAFETY: inside the two pages.
+                Some(m) if (arg as usize) < 2 * PAGE => {
+                    Ok((unsafe { *m.at.add(arg as usize) } as i64, 0))
+                }
+                _ => Err(served::EINVAL),
+            },
             _ => Err(ENOTTY),
+        }
+    }
+
+    fn mmap(
+        &mut self,
+        _node: &Node,
+        _fh: u32,
+        offset: u64,
+        len: u64,
+        _how: u32,
+    ) -> Result<(u32, u64), i32> {
+        let m = self.mem.get_or_insert_with(Mem::new);
+        match offset as usize {
+            _ if len as usize > PAGE => Err(served::EINVAL),
+            0 => Ok((m.rw, 0)),
+            PAGE => Ok((m.ro, PAGE as u64)),
+            _ => Err(served::EINVAL),
         }
     }
 }
@@ -241,6 +302,59 @@ fn run_check(name: &str, rounds: usize) {
         r == -1 && e == Some(libc::ENOTTY),
     );
 
+    // The device's memory, mapped.
+    let map = |offset: usize, prot: i32| -> Result<*mut u8, i32> {
+        // SAFETY: a fresh mapping of a descriptor this process owns.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                prot,
+                libc::MAP_SHARED,
+                fd,
+                offset as libc::off_t,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(p as *mut u8)
+        }
+    };
+    let rw = map(0, libc::PROT_READ | libc::PROT_WRITE)
+        .unwrap_or_else(|e| die(format!("mmap: errno {e}")));
+    // SAFETY: a page mapped above.
+    let first = unsafe { core::slice::from_raw_parts(rw, 3) };
+    check("an mmap shows the device's memory", first == b"eco");
+    // SAFETY: as above, and writable.
+    unsafe { *rw.add(100) = 0x5a };
+    // SAFETY: a number for an argument.
+    let seen = unsafe { libc::ioctl(fd, PEEK as _, 100usize) };
+    check("what is written through it is the server's", seen == 0x5a);
+    let ro = map(PAGE, libc::PROT_READ).unwrap_or_else(|e| die(format!("mmap: errno {e}")));
+    // SAFETY: a page mapped above.
+    let second = unsafe { core::slice::from_raw_parts(ro, 4) };
+    check("a read-only window maps for reading", second == b"solo");
+    check(
+        "and is EACCES shared and writable",
+        map(PAGE, libc::PROT_READ | libc::PROT_WRITE) == Err(libc::EACCES),
+    );
+    check(
+        "a window the server refuses is its errno",
+        map(2 * PAGE, libc::PROT_READ) == Err(libc::EINVAL),
+    );
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let p = map(0, libc::PROT_READ).unwrap_or_else(|e| die(format!("mmap: errno {e}")));
+        // SAFETY: the page just mapped.
+        unsafe { libc::munmap(p as *mut _, PAGE) };
+    }
+    let us = started.elapsed().as_micros() as usize;
+    println!(
+        "{NAME}: {rounds} mmap+munmap: {us} us, {} us each",
+        us / rounds.max(1)
+    );
+
     // The cost of a turn: a write and a read.
     let started = Instant::now();
     for i in 0..rounds {
@@ -343,6 +457,14 @@ fn run_check(name: &str, rounds: usize) {
         ev & (libc::POLLHUP | libc::POLLERR) != 0,
     );
     check("a read is ENODEV", read(fd, &mut buf) == Err(libc::ENODEV));
+    // SAFETY: the page mapped above.
+    let still = unsafe { core::slice::from_raw_parts(rw, 3) };
+    check("a mapping outlives the server", still == b"eco");
+    // SAFETY: pages mapped above.
+    unsafe {
+        libc::munmap(rw as *mut _, PAGE);
+        libc::munmap(ro as *mut _, PAGE);
+    }
     check("the node is gone", !std::path::Path::new(&path).exists());
     // SAFETY: fds of this process.
     unsafe {

@@ -52,8 +52,8 @@ use zircon_object::vm::VmObject;
 pub use self::link::LEFT as SERVER_LEFT;
 use self::link::{Fail, Link};
 use self::wire::{
-    OP_IOCTL, OP_IOCTL_IOV, OP_OPEN, OP_READ, OP_RELEASE, OP_WRITE, POLLERR, POLLHUP, POLLIN,
-    POLLOUT, SLOT_LEN,
+    MMAP_SHARED, MMAP_WRITE, OP_IOCTL, OP_IOCTL_IOV, OP_MMAP, OP_OPEN, OP_READ, OP_RELEASE,
+    OP_WRITE, POLLERR, POLLHUP, POLLIN, POLLOUT, SLOT_LEN,
 };
 use crate::error::{LxError, LxResult};
 use crate::process::LinuxProcess;
@@ -72,6 +72,12 @@ const EARLY_KEPT: usize = 64;
 /// A node in `/dev` that a process serves.
 pub struct ServedNode(Arc<Core>);
 
+/// How a handle the server names in its answer to an `mmap`
+/// ([`wire::OP_MMAP`]) is found in its table: the VMO, and whether the
+/// handle lets it be written. `None` for a handle that is not a VMO the
+/// server may map. The loader gives it, knowing the server's process.
+pub type VmoOf = alloc::boxed::Box<dyn Fn(u64) -> Option<(Arc<VmObject>, bool)> + Send + Sync>;
+
 /// What the node and its opens share.
 struct Core {
     link: Arc<Link>,
@@ -84,6 +90,9 @@ struct Core {
     opens: Mutex<BTreeMap<u32, Weak<Mutex<EventBus>>>>,
     /// Readiness said of opens not in `opens` yet.
     early: Mutex<Vec<(u32, u64)>>,
+    /// The server's VMOs, for its answers to an `mmap`: none, and the node
+    /// cannot be mapped.
+    vmos: Mutex<Option<Arc<VmoOf>>>,
 }
 
 /// What a request's failure is to the program.
@@ -166,6 +175,7 @@ impl ServedNode {
             mode,
             opens: Mutex::new(BTreeMap::new()),
             early: Mutex::new(Vec::new()),
+            vmos: Mutex::new(None),
         });
         let weak = Arc::downgrade(&node);
         link.ready_to(alloc::boxed::Box::new(move |fh, mask| {
@@ -201,6 +211,11 @@ impl ServedNode {
     /// How the server is ended when it hangs.
     pub fn killed_with(&self, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
         self.0.link.killed_with(kill);
+    }
+
+    /// Where the VMOs the server answers an `mmap` with are found.
+    pub fn vmos_from(&self, vmos: VmoOf) {
+        *self.0.vmos.lock() = Some(Arc::new(vmos));
     }
 }
 
@@ -327,6 +342,58 @@ impl ServedOpen {
     /// Where its readiness is: what a reader, `poll` or `epoll` waits on.
     pub fn bus(&self) -> Arc<Mutex<EventBus>> {
         self.bus.clone()
+    }
+
+    /// `mmap(offset, len)` of this open, `shared` or not, with `write`
+    /// asked for: the VMO the server answered with, where the window starts
+    /// in it, and whether the mapping is read-only (the server's handle
+    /// does not let the VMO be written). `ENODEV` when the server has
+    /// nothing to map, or the node no way to find its VMOs; `EIO` for an
+    /// answer that names no VMO the server may map; `ENXIO` for a VMO too
+    /// short for the window, or a window that does not start on a page;
+    /// `EACCES` for a shared, writable mapping of a read-only one.
+    pub fn map(
+        &self,
+        offset: usize,
+        len: usize,
+        shared: bool,
+        write: bool,
+    ) -> LxResult<(Arc<VmObject>, usize, bool)> {
+        let vmos = self.node.vmos.lock().clone().ok_or(LxError::ENODEV)?;
+        let how = if shared { MMAP_SHARED } else { 0 } | if write { MMAP_WRITE } else { 0 };
+        let answer = self
+            .node
+            .link
+            .call(
+                OP_MMAP,
+                self.fh,
+                how as usize,
+                offset as u64,
+                len as u64,
+                &[],
+            )
+            .map_err(lx_of)?;
+        let at = if answer.len >= 8 {
+            let mut b = [0u8; 8];
+            answer.data(&mut b).map_err(lx_of)?;
+            u64::from_ne_bytes(b)
+        } else {
+            0
+        };
+        let handle = answer.a;
+        drop(answer);
+        let (vmo, writable) = vmos(handle).ok_or(LxError::EIO)?;
+        let at: usize = core::convert::TryFrom::try_from(at).map_err(|_| LxError::ENXIO)?;
+        let end = at
+            .checked_add(len.div_ceil(zircon_object::vm::PAGE_SIZE) * zircon_object::vm::PAGE_SIZE)
+            .ok_or(LxError::ENXIO)?;
+        if !at.is_multiple_of(zircon_object::vm::PAGE_SIZE) || end > vmo.len() {
+            return Err(LxError::ENXIO);
+        }
+        if shared && write && !writable {
+            return Err(LxError::EACCES);
+        }
+        Ok((vmo, at, !writable))
     }
 
     /// `ioctl(cmd, arg)`, with what the command carries copied in from the
