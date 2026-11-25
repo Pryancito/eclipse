@@ -1,6 +1,9 @@
 /// The CPU time a thread hands its process; see the module notes.
 #[cfg(test)]
 mod cpu_time_tests;
+/// A wake that lands as the deadline fires; see the module notes.
+#[cfg(test)]
+mod deadline_race_tests;
 mod faults;
 /// What a resolved page fault counts; see the module notes.
 #[cfg(test)]
@@ -1877,19 +1880,34 @@ impl CurrentThread {
             inner.change_state(state, &self.base);
             (old_state, receiver)
         };
+        let mut future = future.fuse();
         let ret = if let Some(cancel_token) = cancel_token {
             select_biased! {
-                ret = future.fuse() => ret.into_result(),
+                ret = future => ret.into_result(),
                 _ = killed.fuse() => Err(ZxError::STOP),
                 _ = kernel_hal::thread::sleep_until(deadline).fuse() => Err(ZxError::TIMED_OUT),
                 _ = cancel_token.fuse() => Err(ZxError::CANCELED),
             }
         } else {
             select_biased! {
-                ret = future.fuse() => ret.into_result(),
+                ret = future => ret.into_result(),
                 _ = killed.fuse() => Err(ZxError::STOP),
                 _ = kernel_hal::thread::sleep_until(deadline).fuse() => Err(ZxError::TIMED_OUT),
             }
+        };
+        // The future is polled before the timer, but another CPU can complete
+        // it between the two polls: a FUTEX_WAKE that counted this waiter as
+        // woken, then the deadline found expired. Dropping it then loses that
+        // wake (Linux answers 0 when the waiter is already woken). One more
+        // poll takes a success that landed in that window (only a success: a
+        // signal noticed now must not turn ETIMEDOUT into EINTR); see
+        // deadline_race_tests.
+        let ret = match ret {
+            Err(ZxError::TIMED_OUT) => match futures::poll!(&mut future) {
+                Poll::Ready(done) => done.into_result().or(Err(ZxError::TIMED_OUT)),
+                Poll::Pending => Err(ZxError::TIMED_OUT),
+            },
+            ret => ret,
         };
         let mut inner = self.lock_inner();
         inner.killer = None;
