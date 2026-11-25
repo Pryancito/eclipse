@@ -237,27 +237,6 @@ const PAL_TECNO: Pal = Pal {
     menu_hover: (0x0c, 0x2a, 0x3a), // hovered menu row
 };
 
-/// `abyss`: the Abyss session's warm-black glass (see `lunarbar::glass`).
-/// Abyss draws its own bar, so this only dresses the panel when someone
-/// runs it there by hand: the colours, rounded plates, gold kept for the
-/// focused task's label.
-const PAL_ABYSS: Pal = Pal {
-    bar_bg: lunarbar::glass::GROUND,
-    rule: lunarbar::glass::HAIRLINE,
-    text: lunarbar::glass::TEXT,
-    muted: (0xd8, 0xd6, 0xd3),
-    dim: lunarbar::glass::MUTED,
-    warn: lunarbar::glass::DANGER,
-    accent: lunarbar::glass::GOLD_TEXT,
-    pill: lunarbar::glass::CARD,
-    pill_hover: lunarbar::glass::HOVER,
-    btn_active: lunarbar::glass::SELECT,
-    white: lunarbar::glass::TEXT,
-    on_accent: lunarbar::glass::GROUND,
-    menu_panel: lunarbar::glass::GROUND,
-    menu_hover: lunarbar::glass::SELECT,
-};
-
 /// The look, resolved once. Every draw reads it through `pal()`; it cannot
 /// change without restarting the panel, which is exactly what `eclipse-look`
 /// does (eclipse-init respawns it immediately).
@@ -288,7 +267,6 @@ fn pal_of(look: Look) -> &'static Pal {
             static T: std::sync::OnceLock<Pal> = std::sync::OnceLock::new();
             lunarbar::acento::tenida(&T, &PAL_TECNO, |p| p.accent = lunarbar::acento::tinta(p.accent))
         }
-        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -4253,7 +4231,7 @@ fn main() {
             Look::Kde => 44,   // Plasma's default panel height
             // Two bars and a 34px height, exactly as `eclipse`: the tecno
             // look changes how the bars are DRAWN, not how much room they take.
-            Look::Eclipse | Look::Tecno | Look::Abyss => 34,
+            Look::Eclipse | Look::Tecno => 34,
         });
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());

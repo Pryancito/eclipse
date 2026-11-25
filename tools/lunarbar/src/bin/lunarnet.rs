@@ -331,7 +331,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
     cv.fill_rect_a(0, 0, w, h, ink().ground, ink().veil);
     glass::panel(cv, px, py, pw, ph, ink().surface);
     frame(cv, l.panel, ink().hairline);
-    glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
+    cv.brackets(px, py, pw, ph, 16, 2, ink().gold);
 
     // Head.
     let hy = py + (HEAD_H - GLYPH_H) / 2;
@@ -358,7 +358,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
             cv.fill_rect_a(r.0, r.1 + 8, 2, r.3 - 16, ink().cyan, 1.0);
         }
         if on && s.focus == Focus::List {
-            glass::brackets(cv, r.0 + 4, r.1 + 2, r.2 - 8, r.3 - 4, 8, 1, ink().gold);
+            cv.brackets(r.0 + 4, r.1 + 2, r.2 - 8, r.3 - 4, 8, 1, ink().gold);
         }
         let x = px + PAD;
         let y1 = r.1 + 10;
@@ -519,7 +519,7 @@ fn segments(
     if focused {
         let (x0, y0) = (segs[0].0, segs[0].1);
         let x1 = segs[2].0 + segs[2].2;
-        glass::brackets(cv, x0 - 4, y0 - 4, x1 - x0 + 8, FIELD_H + 8, 8, 2, ink().gold);
+        cv.brackets(x0 - 4, y0 - 4, x1 - x0 + 8, FIELD_H + 8, 8, 2, ink().gold);
     }
 }
 
@@ -591,7 +591,7 @@ fn button(cv: &mut Canvas, r: Rect, label: &str, lit: bool, focused: bool) {
         cv.text(label, tx, ty, ink().muted);
     }
     if focused {
-        glass::brackets(cv, r.0 - 4, r.1 - 4, r.2 + 8, r.3 + 8, 8, 2, ink().cyan);
+        cv.brackets(r.0 - 4, r.1 - 4, r.2 + 8, r.3 + 8, 8, 2, ink().cyan);
     }
 }
 
@@ -1390,11 +1390,10 @@ impl State {
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else {
             return;
         };
-        cv.set_square(!glass::on());
+        cv.set_square(true);
         self.ed.draw(&mut cv, self.w as i32, self.h as i32);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -1601,10 +1600,9 @@ fn dump(spec: &str) -> ! {
     }
     let ed = sample();
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     ed.draw(&mut cv, w as i32, h as i32);
     let mut buf = vec![0u8; w * h * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarnet: could not write {path}");
         std::process::exit(1);

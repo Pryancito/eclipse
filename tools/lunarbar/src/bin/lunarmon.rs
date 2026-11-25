@@ -676,16 +676,6 @@ fn button(cv: &mut Canvas, r: Rect, label: &str, col: Rgb, lit: bool) {
 }
 
 fn bar(cv: &mut Canvas, x: i32, y: i32, w: i32, frac: f32, c: Rgb) {
-    if glass::on() {
-        // The guide's meter: a thin rounded track, the run in white.
-        cv.round_rect(x, y + 1, w, BAR_H - 2, (BAR_H - 2) / 2, ink().hairline);
-        let f = ((w as f32) * frac.clamp(0.0, 1.0)).round() as i32;
-        if f > 0 {
-            cv.round_rect(x, y + 1, f.max(BAR_H - 2), BAR_H - 2, (BAR_H - 2) / 2, glass::METER);
-        }
-        let _ = c;
-        return;
-    }
     cv.fill_rect_a(x, y, w, BAR_H, ink().well, 1.0);
     frame(cv, (x, y, w, BAR_H), ink().hairline);
     let f = ((w - 2) as f32 * frac.clamp(0.0, 1.0)) as i32;
@@ -707,7 +697,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let tx = r.0 + (r.2 - Canvas::text_width(label)) / 2;
         let ty = r.1 + (r.3 - GLYPH_H) / 2;
         if on {
-            cv.text_bold(label, tx, ty, if glass::on() { ink().gold } else { ink().cyan });
+            cv.text_bold(label, tx, ty, ink().cyan);
         } else {
             cv.text(label, tx, ty, ink().muted);
         }
@@ -986,20 +976,17 @@ fn draw_procs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let ty = y + (ROW_H - GLYPH_H) / 2;
         match it {
             Item::Section(s) => {
-                cv.text(s, PAD, ty + 2, if glass::on() { ink().muted } else { ink().gold });
+                cv.text(s, PAD, ty + 2, ink().gold);
             }
             Item::Proc(i) => {
                 let r = &m.rows[*i];
                 let sel = m.sel_pid == Some(r.pid);
-                if sel && glass::on() {
-                    glass::cell(cv, PAD / 2, y + 1, w - PAD, ROW_H - 2, ink().sel, 1.0);
-                    glass::outline(cv, PAD / 2, y + 1, w - PAD, ROW_H - 2, glass::RIM);
-                } else if sel {
+                if sel {
                     cv.fill_rect_a(0, y, w, ROW_H, ink().cyan, 0.08);
                     cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
                 }
                 cv.text(&r.pid.to_string(), PAD, ty, ink().muted);
-                let name_c = if sel && glass::on() { ink().gold } else { ink().text };
+                let name_c = ink().text;
                 let adv = cv.text(&fit(&r.name, name_w), PAD + PID_W, ty, name_c);
                 if let Some(t) = &r.window {
                     let room = name_w - adv - 16;
@@ -1062,13 +1049,8 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let y = ry + (k - first) as i32 * ROW_H;
         let ty = y + (ROW_H - GLYPH_H) / 2;
         if k == m.sel_svc {
-            if glass::on() {
-                glass::cell(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, ink().sel, 1.0);
-                glass::outline(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, glass::RIM);
-            } else {
-                cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
-                cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
-            }
+            cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
+            cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
         }
         cv.text(&fit(&s.name, 160), cols[0], ty, ink().text);
         cv.text(if s.kind == "respawn" { m.lang.s(Key::mon_respawn) } else { m.lang.s(Key::mon_once) }, cols[1], ty, ink().muted);
@@ -1211,13 +1193,8 @@ fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         let y = ry + (k - first) as i32 * ROW_H;
         let ty = y + (ROW_H - GLYPH_H) / 2;
         if k == m.sel_srv {
-            if glass::on() {
-                glass::cell(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, ink().sel, 1.0);
-                glass::outline(cv, PAD / 2, y + 1, PAD / 2 + lw, ROW_H - 2, glass::RIM);
-            } else {
-                cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
-                cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
-            }
+            cv.fill_rect_a(0, y, PAD + lw, ROW_H, ink().cyan, 0.08);
+            cv.fill_rect_a(0, y + 4, 2, ROW_H - 8, ink().cyan, 1.0);
         }
         cv.text(&fit(&s.service, cols[1] - cols[0] - 8), cols[0], ty, ink().text);
         cv.text(&fit(&s.device, cols[2] - cols[1] - 8), cols[1], ty, ink().muted);
@@ -1488,11 +1465,10 @@ impl State {
             return;
         }
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else { return };
-        cv.set_square(!glass::on());
+        cv.set_square(true);
         draw(&mut cv, self.w as i32, self.h as i32, &self.mon);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -1762,10 +1738,9 @@ fn dump(spec: &str) -> ! {
         _ => {}
     }
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     draw(&mut cv, w as i32, h as i32, &m);
     let mut buf = vec![0u8; w * h * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarmon: could not write {path}");
         std::process::exit(1);

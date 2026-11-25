@@ -605,7 +605,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
     cv.fill_rect_a(0, 0, w, h, ink().ground, ink().veil);
     glass::panel(cv, px, py, pw, ph, ink().surface);
     frame(cv, l.panel, ink().hairline);
-    glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
+    cv.brackets(px, py, pw, ph, 16, 2, ink().gold);
 
     // Head: the crescent, the title, the keys.
     let hy = py + (HEAD_H - GLYPH_H) / 2;
@@ -767,7 +767,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, p: &Panel) {
             if held { ink().gold } else { ink().dim },
         );
         if focused {
-            glass::brackets(cv, cb.0 - 4, cb.1 - 4, cb.2 + 8, cb.3 + 8, 8, 2, ink().gold);
+            cv.brackets(cb.0 - 4, cb.1 - 4, cb.2 + 8, cb.3 + 8, 8, 2, ink().gold);
         }
         cv.hline(x, y + fh - 1, fw, ink().hairline, 0.5);
     }
@@ -932,11 +932,10 @@ impl State {
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else {
             return;
         };
-        cv.set_square(!glass::on());
+        cv.set_square(true);
         draw(&mut cv, self.w as i32, self.h as i32, &self.panel);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -1355,10 +1354,9 @@ fn dump(spec: &str, grupo: Option<&str>) -> ! {
     }
     let p = sample(grupo);
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     draw(&mut cv, w as i32, h as i32, &p);
     let mut buf = vec![0u8; w * h * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarpanel: could not write {path}");
         std::process::exit(1);

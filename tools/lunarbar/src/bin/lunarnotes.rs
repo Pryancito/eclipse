@@ -104,7 +104,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
     ] {
         cv.fill_rect_a(x, y, rw, rh, ink().hairline, 1.0);
     }
-    glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
+    cv.brackets(px, py, pw, ph, 16, 2, ink().gold);
 
     let new = notes::unseen(s.entries, s.seen);
     let (title, empty, keys, fresh) = (
@@ -224,7 +224,7 @@ impl State {
         let Some(mut cv) = Canvas::try_new(self.w as usize, self.h as usize) else {
             return;
         };
-        cv.set_square(!glass::on());
+        cv.set_square(true);
         let scene = Scene {
             entries: &self.entries,
             seen: self.seen,
@@ -235,7 +235,6 @@ impl State {
         draw(&mut cv, self.w as i32, self.h as i32, &scene);
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -534,10 +533,9 @@ fn dump(spec: &str) -> ! {
         lang: Lang::current(),
     };
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     draw(&mut cv, w as i32, h as i32, &scene);
     let mut buf = vec![0u8; w * h * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunarnotes: could not write {path}");
         std::process::exit(1);

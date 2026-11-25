@@ -99,17 +99,6 @@ const PAL_WIN11: Palette = Palette {
     gold: None,
 };
 
-/// `abyss`: the Abyss session's warm black. The lock screen stays OPAQUE
-/// (no glass): what is behind it is exactly what it hides.
-const PAL_ABYSS: Palette = Palette {
-    ground: lunarbar::glass::GROUND,
-    text: lunarbar::glass::TEXT,
-    dim: lunarbar::glass::MUTED,
-    accent: lunarbar::glass::GOLD,
-    hairline: lunarbar::glass::HAIRLINE,
-    gold: None,
-};
-
 fn palette(look: Look) -> &'static Palette {
     match look {
         Look::Tecno => {
@@ -119,7 +108,6 @@ fn palette(look: Look) -> &'static Palette {
         Look::Eclipse => &PAL_ECLIPSE,
         Look::Kde => &PAL_KDE,
         Look::Win11 => &PAL_WIN11,
-        Look::Abyss => &PAL_ABYSS,
     }
 }
 
@@ -377,11 +365,7 @@ impl State {
             pointer: None,
             outputs: Vec::new(),
             screens: Vec::new(),
-            pal: palette({
-                let look = Look::current();
-                lunarbar::glass::enter(look);
-                look
-            }),
+            pal: palette(Look::current()),
             lang: Lang::current(),
             who: user_at_host(),
             locked_at: now(),
@@ -827,7 +811,7 @@ mod tests {
 
     #[test]
     fn every_look_draws_a_whole_screen_without_leaving_it() {
-        for look in [Look::Tecno, Look::Eclipse, Look::Kde, Look::Win11, Look::Abyss] {
+        for look in [Look::Tecno, Look::Eclipse, Look::Kde, Look::Win11] {
             for (w, h) in [(1920, 1080), (1280, 720), (640, 480)] {
                 let mut cv = Canvas::new(w, h);
                 let f = Face {

@@ -207,7 +207,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene, icons: &mut IconCache) {
             cv.fill_rect_a(x, y, rw, rh, edge, 1.0);
         }
         if d == s.current {
-            glass::brackets(cv, px, py, pw, ph, 16, 2, ink().gold);
+            cv.brackets(px, py, pw, ph, 16, 2, ink().gold);
         }
         // Head: the number, how many windows, and "actual".
         let num = format!("{:02}", d + 1);
@@ -326,7 +326,6 @@ impl State {
         self.icons = icons;
         // SAFETY: `map` is the `len` bytes mapped for this surface's buffer.
         let data = unsafe { std::slice::from_raw_parts_mut(self.map, self.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             surface.attach(Some(&buf), 0, 0);
             surface.damage_buffer(0, 0, self.w as i32, self.h as i32);
@@ -610,11 +609,10 @@ fn dump(spec: &str) -> ! {
     let hover = std::env::var("LUNARDESK_HOVER").ok().and_then(|v| v.parse().ok()).map(|i: usize| Hit::Win(desk_of[i], i));
     let scene = Scene { wins: &wins, desk_of: &desk_of, n: 4, current: 0, sel: 0, hover, lang: Lang::current() };
     let mut cv = Canvas::try_new(w, h).unwrap_or_else(|| std::process::exit(1));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     let mut icons = IconCache::default();
     draw(&mut cv, w as i32, h as i32, &scene, &mut icons);
     let mut buf = vec![0u8; w * h * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         eprintln!("lunardesk: could not write {path}");
         std::process::exit(1);

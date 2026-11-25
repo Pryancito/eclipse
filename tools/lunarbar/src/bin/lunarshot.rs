@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use lunarbar::draw::{Canvas, GLYPH_H};
 use lunarbar::fill_guard;
-use lunarbar::glass::{self, ink};
+use lunarbar::glass::ink;
 use lunarbar::hunter_notify::{self, Action as NotifyAction, Alert, Severity};
 use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL};
@@ -260,7 +260,7 @@ fn draw_overlay(cv: &mut Canvas, w: i32, h: i32, v: &View) {
             for (x, y, rw, rh) in [(s.x, s.y, s.w, 1), (s.x, s.y + s.h - 1, s.w, 1), (s.x, s.y, 1, s.h), (s.x + s.w - 1, s.y, 1, s.h)] {
                 cv.fill_rect_a(x, y, rw, rh, ink().cyan, 1.0);
             }
-            glass::brackets(cv, s.x, s.y, s.w, s.h, BRACKET_LEN, 2, ink().gold);
+            cv.brackets(s.x, s.y, s.w, s.h, BRACKET_LEN, 2, ink().gold);
             // The readout, under the selection or above it near the bottom.
             let label = format!("{} × {}", v.real.0, v.real.1);
             let pw = Canvas::text_width(&label) + 2 * PLATE_PAD;
@@ -282,7 +282,7 @@ fn draw_overlay(cv: &mut Canvas, w: i32, h: i32, v: &View) {
         let ph = 2 * GLYPH_H + 4 + 2 * PLATE_PAD;
         let (px, py) = ((w - pw) / 2, 48);
         plate(cv, px, py, pw, ph);
-        glass::brackets(cv, px, py, pw, ph, 8, 1, ink().gold);
+        cv.brackets(px, py, pw, ph, 8, 1, ink().gold);
         cv.text_bold(a, px + (pw - Canvas::text_width(a)) / 2, py + PLATE_PAD, ink().text);
         cv.text(b, px + (pw - Canvas::text_width(b)) / 2, py + PLATE_PAD + GLYPH_H + 4, ink().muted);
     }
@@ -538,7 +538,6 @@ impl State {
         draw_overlay(&mut cv, c.w as i32, c.h as i32, &View { shot: scaled, sel, real, hint, lang });
         // SAFETY: `map` is the frame this cover mapped, `len` bytes.
         let data = unsafe { std::slice::from_raw_parts_mut(c.map, c.len) };
-        glass::finish(&mut cv);
         if cv.blit_argb(data) {
             c.surface.attach(Some(buf), 0, 0);
             c.surface.damage_buffer(0, 0, c.w as i32, c.h as i32);
@@ -810,11 +809,10 @@ fn dump(spec: &str) -> ! {
         (v.len() == 4).then(|| Rect { x: v[0], y: v[1], w: v[2], h: v[3] })
     });
     let mut cv = Canvas::try_new(w as usize, h as usize).unwrap_or_else(|| fail("no canvas"));
-    cv.set_square(!glass::on());
+    cv.set_square(true);
     let real = sel.map(|r| (r.w, r.h)).unwrap_or((0, 0));
     draw_overlay(&mut cv, w as i32, h as i32, &View { shot: &shot, sel, real, hint: sel.is_none(), lang: Lang::current() });
     let mut buf = vec![0u8; w as usize * h as usize * 4];
-    glass::finish(&mut cv);
     if !cv.blit_argb(&mut buf) || std::fs::write(path, &buf).is_err() {
         fail("could not write the dump");
     }
