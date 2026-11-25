@@ -2639,3 +2639,7 @@ mod connect_tests {
         );
     }
 }
+
+/// The dumps and the changes, asked of a machine with cards in it.
+#[cfg(test)]
+mod dump_tests;
