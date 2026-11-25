@@ -2,6 +2,7 @@
 //! leave out (attributes, growing, refusals, a failing device), and fsck
 //! fed the damage it looks for.
 
+use alloc::format;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;

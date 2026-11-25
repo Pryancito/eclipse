@@ -28,12 +28,20 @@ use rcore_fs::{
 
 pub use structs::*;
 
-#[cfg(test)]
+// The tests build their filesystem on rcore-fs' `Device` impl for
+// `Mutex<File>`, which exists only with `std`. A dev-dependency asking for it
+// would leak `std` into the kernel's no_std build under the workspace's
+// resolver 1, so say what to type instead of failing on a missing impl.
+#[cfg(all(test, not(feature = "std")))]
+compile_error!(
+    "rcore-fs-sfs tests need `--features std`: cargo test -p rcore-fs-sfs --features std"
+);
+#[cfg(all(test, feature = "std"))]
 mod dot_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod space_tests;
 mod structs;
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;
 
 trait DeviceExt: Device {
