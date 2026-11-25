@@ -5,7 +5,8 @@
 //! its memory BARs beyond the claim's window. QEMU's standard VGA
 //! (`1234 1111`) is the function it is run on: BAR 0 is its framebuffer
 //! and BAR 2 its registers, where the Bochs display interface answers its
-//! version at 0x500.
+//! version at 0x500. Where the function is and how long its BARs are
+//! is the kernel's to say too.
 use std::process::exit;
 use udrivers::claim::{claim_pci, PciFn};
 use udrivers::zx::{self, Status};
@@ -99,6 +100,16 @@ fn main() {
     check(
         "a BAR the function lacks",
         f.bar(1, false) == Err(Status::OUT_OF_RANGE),
+    );
+    // Where it is and how long its BARs are, which a driver cannot size
+    // itself: QEMU's standard VGA has 16 MiB of video memory and a page of
+    // registers, and no BAR 1.
+    let place = f.place();
+    println!("{NAME}: place {place:x?}");
+    check("it says where it is", place.is_ok());
+    check(
+        "its BARs are as long as the kernel found them",
+        f.bar_len(0) == Ok(16 << 20) && f.bar_len(2) == Ok(4096) && f.bar_len(1) == Ok(0),
     );
     let _ = claim;
     println!("{NAME}: pci-fn: ok");

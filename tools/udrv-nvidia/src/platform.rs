@@ -38,8 +38,7 @@ static RANGES: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 const PAGE: usize = 4096;
 
 /// Set where DMA memory comes from. Only once: a second call is refused.
-/// Its caller is the GPU claim, which comes in a later step.
-#[allow(dead_code)]
+/// Its caller is the GPU claim (`gpu`).
 pub fn install_dma(alloc: DmaAlloc, free: DmaFree) -> Result<(), ()> {
     DMA.set(Dma { alloc, free }).map_err(|_| ())
 }

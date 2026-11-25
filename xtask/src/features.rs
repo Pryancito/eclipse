@@ -267,6 +267,16 @@ pub(crate) const LIBRO: &[(&str, &str, Veredicto)] = &[
     ),
     (
         "zcore-drivers",
+        "process",
+        Nadie(
+            "la enciende solo tools/udrv-nvidia (el driver NVIDIA como \
+             proceso, un paquete aparte que make no construye): sus puertos \
+             de E/S los contesta el proceso. El nucleo nunca la pide, y el CI \
+             la prueba en test-bare-metal",
+        ),
+    ),
+    (
+        "zcore-drivers",
         "board_malta",
         Nadie(
             "su unico uso es cfg(all(feature = \"board_malta\", target_arch = \

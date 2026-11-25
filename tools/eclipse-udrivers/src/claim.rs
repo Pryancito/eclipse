@@ -55,6 +55,8 @@ pub struct PciFn {
 const PCI_FN_BAR: usize = 0;
 const PCI_FN_CONFIG_READ: usize = 1;
 const PCI_FN_CONFIG_WRITE: usize = 2;
+const PCI_FN_PLACE: usize = 3;
+const PCI_FN_BAR_LEN: usize = 4;
 
 impl PciFn {
     /// Device `index` of claim `kind` ([`KIND_NVIDIA`]).
@@ -100,6 +102,19 @@ impl PciFn {
     pub fn config_write(&self, offset: usize, width: usize, value: u32) -> Result<(), Status> {
         self.call(PCI_FN_CONFIG_WRITE, offset, width, value as usize)
             .map(|_| ())
+    }
+
+    /// Where the function is: `(bus, device, function)`.
+    pub fn place(&self) -> Result<(u8, u8, u8), Status> {
+        self.call(PCI_FN_PLACE, 0, 0, 0)
+            .map(|v| ((v >> 8) as u8, (v >> 3 & 0x1f) as u8, (v & 7) as u8))
+    }
+
+    /// The length of memory BAR `bar`, 0 when it is not one (an I/O BAR,
+    /// the upper half of a 64-bit one, none): what sizing it would say,
+    /// which only the kernel may do.
+    pub fn bar_len(&self, bar: usize) -> Result<usize, Status> {
+        self.call(PCI_FN_BAR_LEN, bar, 0, 0)
     }
 }
 

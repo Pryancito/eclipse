@@ -1017,7 +1017,7 @@ fn the_gateway_lets_through_exactly_the_syscalls_its_comment_names() {
 
 #[test]
 fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_driver_may_write() {
-    use super::device_pci::{ECLIPSE_DEVICE_PCI_FN, OP_BAR, OP_CONFIG_WRITE};
+    use super::device_pci::{ECLIPSE_DEVICE_PCI_FN, OP_BAR, OP_BAR_LEN, OP_CONFIG_WRITE, OP_PLACE};
     // The only test that names a reservation: NVIDIA GPUs are left to
     // userspace only when asked for.
     udev::set_reservation(Some("nvidia@0"), false);
@@ -1028,8 +1028,8 @@ fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_drive
     bars[1] = (aperture, 0x10_0000);
     let place = udev::PciPlace {
         bus: 1,
-        device: 0,
-        function: 0,
+        device: 2,
+        function: 1,
         bars,
     };
     assert!(udev::reserve_pci_fn(
@@ -1064,6 +1064,13 @@ fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_drive
     assert_eq!(pci(&driver, OP_BAR, 2, 0, 0), zx(ZxError::OUT_OF_RANGE));
     assert_eq!(pci(&driver, OP_BAR, 6, 0, 0), zx(ZxError::OUT_OF_RANGE));
     assert_eq!(pci(&driver, OP_BAR, 0, 2, 0), zx(ZxError::INVALID_ARGS));
+    // Where the function is, and how long each BAR is: what its driver
+    // cannot find out by sizing the BARs itself.
+    assert_eq!(pci(&driver, OP_PLACE, 0, 0, 0), 1 << 8 | 2 << 3 | 1);
+    assert_eq!(pci(&driver, OP_BAR_LEN, 1, 0, 0), 0x10_0000);
+    assert_eq!(pci(&driver, OP_BAR_LEN, 2, 0, 0), 0);
+    assert_eq!(pci(&driver, OP_BAR_LEN, 6, 0, 0), zx(ZxError::OUT_OF_RANGE));
+    assert_eq!(pci(&other, OP_PLACE, 0, 0, 0), zx(ZxError::ACCESS_DENIED));
     // The registers that place the function are the kernel's: refused
     // before anything reaches the bus.
     for (offset, width) in [(0x00, 4), (0x10, 4), (0x14, 2), (0x30, 4), (0x0e, 1)] {
