@@ -108,10 +108,23 @@ fn a_flag_of_the_socket_level_reads_back_what_was_set() {
     on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let mut s = own(sys);
-            // An AF_UNIX socket takes them and keeps none.
-            for (domain, ty) in [(AF_INET, SOCK_STREAM), (AF_INET, SOCK_DGRAM)] {
+            for (domain, ty) in [
+                (AF_INET, SOCK_STREAM),
+                (AF_INET, SOCK_DGRAM),
+                (AF_UNIX, SOCK_STREAM),
+                (AF_UNIX, SOCK_DGRAM),
+            ] {
                 let fd = s.sys_socket(domain, ty, 0).unwrap();
                 for name in [SO_REUSEADDR, SO_KEEPALIVE, SO_BROADCAST, SO_REUSEPORT] {
+                    // `sock_setsockopt`: SO_REUSEPORT is inet's.
+                    if domain == AF_UNIX && name == SO_REUSEPORT {
+                        assert_eq!(
+                            set_int(&mut s, fd, SOL_SOCKET, name, 1),
+                            Err(LxError::EOPNOTSUPP)
+                        );
+                        assert_eq!(get_int(&mut s, fd, SOL_SOCKET, name), Ok(0));
+                        continue;
+                    }
                     let what = (domain, ty, name);
                     assert_eq!(get_int(&mut s, fd, SOL_SOCKET, name), Ok(0), "{what:?}");
                     assert_eq!(set_int(&mut s, fd, SOL_SOCKET, name, 7), Ok(0), "{what:?}");
@@ -249,9 +262,12 @@ fn a_timeout_reads_back_the_timeval_that_was_set() {
     on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let mut s = own(sys);
-            // An AF_UNIX socket takes both and keeps neither: its reads and
-            // writes wait for ever whatever they were told.
-            for (domain, ty) in [(AF_INET, SOCK_STREAM), (AF_INET, SOCK_DGRAM)] {
+            for (domain, ty) in [
+                (AF_INET, SOCK_STREAM),
+                (AF_INET, SOCK_DGRAM),
+                (AF_UNIX, SOCK_STREAM),
+                (AF_UNIX, SOCK_DGRAM),
+            ] {
                 let fd = s.sys_socket(domain, ty, 0).unwrap();
                 for name in [SO_RCVTIMEO, SO_SNDTIMEO] {
                     let what = (domain, ty, name);

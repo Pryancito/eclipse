@@ -1,3 +1,4 @@
+use super::user_stack::{Patience, Until};
 use crate::fs::{FileLike, OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
@@ -175,6 +176,16 @@ struct UnixInner {
     /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
     /// asks for it, as in Linux.
     passcred: bool,
+    /// `SO_REUSEADDR`, `SO_KEEPALIVE` and `SO_BROADCAST`, kept for
+    /// `getsockopt` as `sock_setsockopt` keeps them for every family. A unix
+    /// socket does nothing else with them.
+    reuse_addr: bool,
+    keepalive: bool,
+    broadcast: bool,
+    /// `SO_RCVTIMEO` and `SO_SNDTIMEO`: how long a read or an `accept`
+    /// (the first), or a write that found no room (the second), waits
+    /// before it answers `EAGAIN`. Zero waits for as long as it takes.
+    patience: Patience,
     /// The sender's `struct ucred` for each message sitting in `buffer`, tagged
     /// with the `total_written` offset of its first byte, exactly as
     /// `pending_fds` is. Linux samples credentials in `scm_send`, at SEND time,
@@ -301,6 +312,10 @@ impl Default for UnixSocketState {
                 owner_pid: 0,
                 pending_fds: VecDeque::new(),
                 passcred: false,
+                reuse_addr: false,
+                keepalive: false,
+                broadcast: false,
+                patience: Patience::default(),
                 pending_creds: VecDeque::new(),
                 last_creds: None,
                 room_waiters: Vec::new(),
@@ -636,6 +651,8 @@ struct UnixEventWait {
     /// Whether the last poll left the waker with the thread, so that a wake
     /// the tick finds is a lost one and not a look for a signal.
     parked: bool,
+    /// When the wait gives up with `EAGAIN` (`SO_RCVTIMEO`), if it does.
+    until: Option<Duration>,
 }
 
 impl Drop for UnixEventWait {
@@ -708,6 +725,16 @@ impl Future for UnixEventWait {
             return Poll::Ready(Err(err));
         }
         this.parked = parked;
+        // `SO_RCVTIMEO` ran out: `sock_rcvtimeo`'s answer is `EAGAIN`.
+        if let Some(until) = this.until {
+            if kernel_hal::timer::timer_now() >= until {
+                if let Some(id) = this.sub_id.take() {
+                    this.inner.lock().eventbus.unsubscribe(id);
+                }
+                kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                return Poll::Ready(Err(LxError::EAGAIN));
+            }
+        }
         // Backstop. For a wait the thread did not take, nothing on the bus
         // ever fires for a signal, so this tick is what bounds how late a
         // `kill` can be. For one it took, the signal wakes it by itself, but
@@ -723,7 +750,10 @@ impl Future for UnixEventWait {
         } else {
             20
         };
-        let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(tick_ms));
+        let mut deadline = kernel_hal::timer::deadline_after(Duration::from_millis(tick_ms));
+        if let Some(until) = this.until {
+            deadline = deadline.min(until);
+        }
         if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
             cx.waker().wake_by_ref();
         }
@@ -746,6 +776,11 @@ struct UnixPollWait<'a> {
     /// scan — filling the bus and corrupting the heap (observed as #DF in
     /// `__from_user` when labwc started parking for real).
     sub_id: Option<u64>,
+    /// When the wait gives up with `EAGAIN`: `SO_SNDTIMEO` for a write
+    /// that found no room, `SO_RCVTIMEO` for a read (`splice`).
+    until: Option<Duration>,
+    /// What wakes the wait at `until`.
+    timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
 }
 
 impl Drop for UnixPollWait<'_> {
@@ -753,6 +788,7 @@ impl Drop for UnixPollWait<'_> {
         if let Some(id) = self.sub_id.take() {
             self.sock.inner.lock().eventbus.unsubscribe(id);
         }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
     }
 }
 
@@ -829,11 +865,26 @@ impl Future for UnixPollWait<'_> {
                 write_would_not_block(write_closed, Some(queue))
             });
         if !ready {
-            return Poll::Pending;
+            let Some(until) = this.until else {
+                return Poll::Pending;
+            };
+            if kernel_hal::timer::timer_now() < until {
+                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, until, cx) {
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Pending;
+            }
+            // `sock_sndtimeo` / `sock_rcvtimeo` ran out.
+            if let Some(id) = this.sub_id.take() {
+                this.sock.inner.lock().eventbus.unsubscribe(id);
+            }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Ready(Err(LxError::EAGAIN));
         }
         if let Some(id) = this.sub_id.take() {
             this.sock.inner.lock().eventbus.unsubscribe(id);
         }
+        kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
         let (read, write, error) = Socket::poll(this.sock, this.events);
         Poll::Ready(Ok(PollStatus {
             read,
@@ -850,6 +901,7 @@ impl Socket for UnixSocketState {
     // read — dequeue bytes from our inbound buffer
     // -----------------------------------------------------------------------
     async fn read(&self, data: &mut [u8]) -> (LxResult<usize>, Endpoint) {
+        let mut until = Until::default();
         loop {
             let mut inner = self.inner.lock();
             // Who sent a message is named where one is read; an EOF or an
@@ -956,6 +1008,7 @@ impl Socket for UnixSocketState {
             if inner.flags.contains(OpenFlags::NON_BLOCK) {
                 return (Err(LxError::EAGAIN), Endpoint::Unix(String::new()));
             }
+            let until = until.of(&inner.patience.receive);
 
             drop(inner);
             // Park on the eventbus until a peer write / shutdown / close flips
@@ -969,6 +1022,7 @@ impl Socket for UnixSocketState {
                 timer: None,
                 signal: crate::sync::SignalWake::new(),
                 parked: false,
+                until,
             })
             .await
             {
@@ -1263,6 +1317,7 @@ impl Socket for UnixSocketState {
                 return Err(LxError::EINVAL);
             }
         }
+        let mut until = Until::default();
         loop {
             let mut inner = self.inner.lock();
             if let Some(server_side) = inner.accept_queue.pop_front() {
@@ -1287,6 +1342,7 @@ impl Socket for UnixSocketState {
             if inner.flags.contains(OpenFlags::NON_BLOCK) {
                 return Err(LxError::EAGAIN);
             }
+            let until = until.of(&inner.patience.receive);
             drop(inner);
             // Park on the eventbus: `push_accept` sets READABLE when a client
             // connects, so a blocked accept resumes immediately.
@@ -1297,6 +1353,7 @@ impl Socket for UnixSocketState {
                 timer: None,
                 signal: crate::sync::SignalWake::new(),
                 parked: false,
+                until,
             }
             .await?;
         }
@@ -1374,6 +1431,62 @@ impl Socket for UnixSocketState {
 
     fn passcred(&self) -> bool {
         self.inner.lock().passcred
+    }
+
+    /// The `SOL_SOCKET` options a unix socket keeps: `SO_RCVTIMEO` and
+    /// `SO_SNDTIMEO` (which its waits honour), and the flags
+    /// `SO_REUSEADDR`, `SO_KEEPALIVE` and `SO_BROADCAST`. `SO_REUSEPORT` on
+    /// is `EOPNOTSUPP`, as `sock_setsockopt` answers for a socket that is
+    /// not inet. The rest are taken and checked as before.
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const SO_REUSEADDR: usize = 2;
+        const SO_KEEPALIVE: usize = 9;
+        const SO_BROADCAST: usize = 6;
+        const SO_REUSEPORT: usize = 15;
+        if let Some(kept) = self.inner.lock().patience.set(level, opt, data) {
+            return kept;
+        }
+        let r = super::setsockopt_unstored(self, level, opt, data)?;
+        if level == SOL_SOCKET
+            && matches!(
+                opt,
+                SO_REUSEADDR | SO_KEEPALIVE | SO_BROADCAST | SO_REUSEPORT
+            )
+        {
+            let mut word = [0u8; 4];
+            word.copy_from_slice(&data[..4]);
+            let on = i32::from_ne_bytes(word) != 0;
+            let mut inner = self.inner.lock();
+            match opt {
+                SO_REUSEADDR => inner.reuse_addr = on,
+                SO_KEEPALIVE => inner.keepalive = on,
+                SO_BROADCAST => inner.broadcast = on,
+                _ if on => return Err(LxError::EOPNOTSUPP),
+                _ => {}
+            }
+        }
+        Ok(r)
+    }
+
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().reuse_addr
+    }
+
+    fn so_keepalive(&self) -> bool {
+        self.inner.lock().keepalive
+    }
+
+    fn so_broadcast(&self) -> bool {
+        self.inner.lock().broadcast
+    }
+
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.lock().patience.receive
+    }
+
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.lock().patience.send
     }
 
     fn set_passcred(&self, on: bool) -> SysResult {
@@ -1614,10 +1727,20 @@ impl FileLike for UnixSocketState {
         // report the status. `sys_poll`/`select`/`epoll` poll this future with
         // their own Context, so a peer write wakes them immediately — the same
         // contract the pipe implementation follows.
+        let until = {
+            let inner = self.inner.lock();
+            crate::net::sockopt_deadline(if events.wants_write() {
+                &inner.patience.send
+            } else {
+                &inner.patience.receive
+            })
+        };
         UnixPollWait {
             sock: self,
             events,
             sub_id: None,
+            until,
+            timer: None,
         }
         .await
     }
@@ -2059,6 +2182,8 @@ mod tests {
             sock: &a,
             events: PollEvents::IN,
             sub_id: None,
+            until: None,
+            timer: None,
         };
         match Pin::new(&mut fut).poll(&mut cx) {
             Poll::Pending => {}
@@ -2092,6 +2217,8 @@ mod tests {
             sock: &a,
             events: PollEvents::OUT,
             sub_id: None,
+            until: None,
+            timer: None,
         };
         match Pin::new(&mut fut_out).poll(&mut cx) {
             Poll::Ready(Ok(status)) => {
@@ -2128,6 +2255,8 @@ mod tests {
             sock: &a,
             events: PollEvents::RDNORM,
             sub_id: None,
+            until: None,
+            timer: None,
         };
         match Pin::new(&mut fut).poll(&mut cx) {
             Poll::Pending => {}
@@ -2446,6 +2575,8 @@ mod write_room_tests {
             sock,
             events: PollEvents::OUT,
             sub_id: None,
+            until: None,
+            timer: None,
         };
         let mut cx = Context::from_waker(waker);
         let polled = Pin::new(&mut fut).poll(&mut cx);
@@ -3029,6 +3160,7 @@ mod signal_wake_tests {
             timer: None,
             signal: crate::sync::SignalWake::new(),
             parked: false,
+            until: None,
         }
     }
 
@@ -3309,3 +3441,6 @@ mod dgram_address_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sockopt_tests;
