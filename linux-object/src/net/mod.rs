@@ -1123,7 +1123,13 @@ fn net_ioctl_held(
             let buf_bytes = ifc.ifc_len as usize;
             let req_size = size_of::<IfReq>();
 
-            let ifaces = get_net_device();
+            // `inet_gifconf`: one `ifreq` per IPv4 address, so a card that
+            // has none is not in the list (ifconfig shows it from
+            // /proc/net/dev instead).
+            let ifaces: alloc::vec::Vec<_> = get_net_device()
+                .into_iter()
+                .filter(|iface| iface_ipv4_cidr(&**iface).is_some())
+                .collect();
             let max = if buf_bytes >= req_size {
                 buf_bytes / req_size
             } else {
@@ -1237,10 +1243,12 @@ fn net_ioctl_held(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let iface = iface_by_name(ifname)?;
-            let addr = iface_ipv4_cidr(&*iface)
-                .map(|cidr| ipv4_sockaddr(cidr.address()))
-                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
-            ifr.ifr_ifru = IfReqUnion { addr };
+            // `devinet_ioctl`: a card with no IPv4 address has none to
+            // give, which is EADDRNOTAVAIL and not 0.0.0.0.
+            let cidr = iface_ipv4_cidr(&*iface).ok_or(LxError::EADDRNOTAVAIL)?;
+            ifr.ifr_ifru = IfReqUnion {
+                addr: ipv4_sockaddr(cidr.address()),
+            };
             Ok(0)
         }
 
@@ -1272,25 +1280,25 @@ fn net_ioctl_held(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let iface = iface_by_name(ifname)?;
-            let addr = iface_ipv4_cidr(&*iface)
-                .map(|cidr| ipv4_sockaddr(ipv4_broadcast(cidr.address(), cidr.prefix_len())))
-                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
-            ifr.ifr_ifru = IfReqUnion { addr };
+            let cidr = iface_ipv4_cidr(&*iface).ok_or(LxError::EADDRNOTAVAIL)?;
+            ifr.ifr_ifru = IfReqUnion {
+                addr: ipv4_sockaddr(ipv4_broadcast(cidr.address(), cidr.prefix_len())),
+            };
             Ok(0)
         }
 
-        // SIOCGIFDSTADDR: get point-to-point destination address. Our
-        // interfaces are not point-to-point, so the destination is
-        // unspecified (0.0.0.0) — exactly what Linux reports for a plain
-        // ethernet link. busybox `ifconfig` probes this for every iface;
-        // answering it (rather than ENOTTY) keeps the log clean.
+        // SIOCGIFDSTADDR: the point-to-point peer. `devinet_ioctl` answers
+        // `ifa_address`, which on a card that is not point-to-point is the
+        // card's own address (`ifa_address == ifa_local`), and
+        // EADDRNOTAVAIL on a card with none. It answered 0.0.0.0 always.
         SIOCGIFDSTADDR => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
-            let _ = iface_by_name(ifname)?;
+            let iface = iface_by_name(ifname)?;
+            let cidr = iface_ipv4_cidr(&*iface).ok_or(LxError::EADDRNOTAVAIL)?;
             ifr.ifr_ifru = IfReqUnion {
-                addr: ipv4_sockaddr(Ipv4Address::UNSPECIFIED),
+                addr: ipv4_sockaddr(cidr.address()),
             };
             Ok(0)
         }
@@ -1300,10 +1308,10 @@ fn net_ioctl_held(
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let iface = iface_by_name(ifname)?;
-            let addr = iface_ipv4_cidr(&*iface)
-                .map(|cidr| ipv4_sockaddr(ipv4_netmask(cidr.prefix_len())))
-                .unwrap_or_else(|| ipv4_sockaddr(Ipv4Address::UNSPECIFIED));
-            ifr.ifr_ifru = IfReqUnion { addr };
+            let cidr = iface_ipv4_cidr(&*iface).ok_or(LxError::EADDRNOTAVAIL)?;
+            ifr.ifr_ifru = IfReqUnion {
+                addr: ipv4_sockaddr(ipv4_netmask(cidr.prefix_len())),
+            };
             Ok(0)
         }
 
@@ -1347,7 +1355,8 @@ fn net_ioctl_held(
         SIOCGIFTXQLEN => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
-            let _ = ifreq_name(&ifr.ifr_name)?;
+            // `dev_ifsioc_locked`: a card the machine has not is ENODEV.
+            let _ = iface_by_name(ifreq_name(&ifr.ifr_name)?)?;
             ifr.ifr_ifru = IfReqUnion { ifqlen: 1000 };
             Ok(0)
         }
@@ -1384,6 +1393,8 @@ fn net_ioctl_held(
         SIOCGIFMETRIC => {
             #[allow(unsafe_code)]
             let ifr = unsafe { &mut *(arg1 as *mut IfReq) };
+            // `dev_ifsioc_locked`: a card the machine has not is ENODEV.
+            let _ = iface_by_name(ifreq_name(&ifr.ifr_name)?)?;
             ifr.ifr_ifru = IfReqUnion { ifmetric: 0 };
             Ok(0)
         }
@@ -2732,8 +2743,10 @@ mod ioctl_arg_tests {
 
     #[test]
     fn the_answer_goes_into_the_callers_structure() {
+        let _m = super::test_card::a_machine();
         #[allow(unsafe_code)]
         let mut ifr: IfReq = unsafe { core::mem::zeroed() };
+        ifr.ifr_name[..4].copy_from_slice(b"eth0");
         ifr.ifr_ifru.ifmetric = 7;
         let at = &mut ifr as *mut IfReq as usize;
         assert_eq!(handle_net_ioctl(SIOCGIFMETRIC, at, 0, 0, false), Ok(0));
