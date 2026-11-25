@@ -1090,4 +1090,92 @@ fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_drive
         zx(ZxError::OUT_OF_RANGE)
     );
     assert_eq!(pci(&driver, 9, 0, 0, 0), zx(ZxError::INVALID_ARGS));
+    the_gem_table_takes_a_gpu_holder_at_its_word_on_its_own(&driver, &other, &words, aperture);
+}
+
+/// `eclipse_gem`, for the holder of a GPU (`udrv-nvidia`): its own handles,
+/// its own memory, and nothing of the table once it is gone.
+fn the_gem_table_takes_a_gpu_holder_at_its_word_on_its_own(
+    driver: &Arc<Process>,
+    other: &Arc<Process>,
+    claim: &[u64; CLAIM_WORDS],
+    aperture: usize,
+) {
+    use super::gem_serve::ECLIPSE_GEM;
+    use kernel_hal::drivers::scheme::gem_mmap::{self, wire};
+    use zircon_object::dev::{BusTransactionInitiator, IommuPerms};
+    let mut out = [0u64; 4];
+    let at = ptr(&mut out);
+    let gem = |proc: &Arc<Process>, op: u32, a: u64, b: u64, c: u64, d: u64, out: usize| {
+        call(
+            proc,
+            ECLIPSE_GEM,
+            [
+                op as usize,
+                a as usize,
+                b as usize,
+                c as usize,
+                d as usize,
+                out,
+            ],
+        )
+    };
+    // Only a GPU's holder.
+    assert_eq!(
+        gem(other, wire::SLICE, 0, 0, 0, 0, at),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    assert_eq!(gem(driver, wire::SLICE, 0, 0, 0, 0, at), 0);
+    let (base, end) = (out[0] as u32, out[1] as u32);
+    assert!(base >= gem_mmap::DRIVER_HANDLE_BASE && end > base);
+    // Memory it pinned through its GPU's initiator.
+    let bti = (claim[0] >> 32) as u32;
+    let bti = driver.get_object::<BusTransactionInitiator>(bti).unwrap();
+    let vmo = VmObject::new_contiguous(2, kernel_hal::PAGE_SIZE.trailing_zeros() as usize).unwrap();
+    let pmt = bti
+        .pin(vmo, 0, 2 * kernel_hal::PAGE_SIZE, IommuPerms::PERM_READ)
+        .unwrap();
+    let phys = pmt.encode_addrs(false, true).unwrap()[0] as u64;
+    let h = base as u64;
+    let page = kernel_hal::PAGE_SIZE as u64;
+    assert_eq!(gem(driver, wire::REGISTER, h, phys, 2 * page, 7, 0), 0);
+    // Not past its end, nor memory it did not pin, nor another card's handle.
+    assert_eq!(
+        gem(driver, wire::REGISTER, h + 1, phys, 3 * page, 7, 0),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    assert_eq!(
+        gem(driver, wire::REGISTER, h + 1, phys + 2 * page, page, 7, 0),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    assert_eq!(
+        gem(driver, wire::REGISTER, base as u64 - 1, phys, page, 7, 0),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    // Its BAR is device memory, whatever the driver calls it.
+    assert_eq!(
+        gem(driver, wire::REGISTER, h + 2, aperture as u64, page, 7, 0),
+        0
+    );
+    assert!(gem_mmap::is_device_memory(base + 2));
+    // The kernel's table has them: what mmap and PRIME read.
+    assert_eq!(gem_mmap::lookup(base), Some((phys, 2 * page)));
+    assert_eq!(gem(driver, wire::LOOKUP, h, 0, 0, 0, at), 0);
+    assert_eq!(out[..2], [phys, 2 * page]);
+    assert_eq!(gem(driver, wire::ADD_REF, h, 8, 0, 0, 0), 2);
+    assert_eq!(gem(driver, wire::HOLDS, h, 8, 0, 0, 0), 1);
+    assert_eq!(gem(driver, wire::DEC_REF, h, 8, 0, 0, 0), 3 + 1);
+    let mut list = [0u64; 4];
+    assert_eq!(gem(driver, wire::HOLDERS, h, 0, 0, 4, ptr(&mut list)), 1);
+    assert_eq!(list[0], 7);
+    assert_eq!(
+        gem(driver, wire::LOOKUP_BY_PHYS_WITHIN, phys + 16, 0, 0, 0, 0),
+        h as isize
+    );
+    // Gone: its objects leave the table.
+    driver.exit(0);
+    eventually("its objects leave the table", || {
+        gem_mmap::lookup(base).is_none()
+    });
+    assert!(!gem_mmap::is_device_memory(base + 2));
 }

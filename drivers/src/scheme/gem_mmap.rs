@@ -36,10 +36,21 @@
 //! [`alloc_handle_slice`] fixes that at the source: each GPU reserves a
 //! disjoint slice of the driver-private half at construction and never
 //! hands out an id outside it, which makes the global key unique again.
+#![cfg_attr(feature = "process", allow(dead_code))]
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use lock::Mutex;
+
+pub mod wire;
+
+// A driver in a process (`udrv-nvidia`) keeps none of this itself: the
+// table is the kernel's, where the mmap, PRIME and KMS paths read it, and
+// each of these calls goes there (`wire`).
+#[cfg(feature = "process")]
+mod remote;
+#[cfg(feature = "process")]
+pub use remote::*;
 
 /// First id of the driver-private handle range: the high half of `u32`,
 /// disjoint from `linux-object`'s own sequential-from-1 handle ids.
@@ -92,6 +103,7 @@ impl HandleSlice {
 
 /// Reserve the next per-GPU slice of the driver-private handle range. Called
 /// once per GPU, from `NvidiaGpu::new`.
+#[cfg(not(feature = "process"))]
 pub fn alloc_handle_slice() -> HandleSlice {
     alloc_handle_slice_from(&NEXT_SLICE)
 }
@@ -240,6 +252,7 @@ static HOST_PA_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// `lookup_for` itself is not the seam: `gem_handle_mappable` and the ADDFB2
 /// and cursor validity checks go through it to answer a yes/no question and
 /// take no address, so counting there would count probes.
+#[cfg(not(feature = "process"))]
 pub fn note_host_pa_handed_out(handle: u32) {
     let mut table = MAPPINGS.lock();
     if let Some(e) = table.iter_mut().find(|e| e.handle == handle) {
@@ -254,6 +267,7 @@ pub fn note_host_pa_handed_out(handle: u32) {
 
 /// `(objects, bytes)` whose host physical address has been handed out since
 /// boot.
+#[cfg(not(feature = "process"))]
 pub fn host_pa_totals() -> (u32, u64) {
     (
         HOST_PA_COUNT.load(Ordering::Relaxed),
@@ -280,6 +294,7 @@ pub const DMABUF_HOLDER: u64 = u64::MAX - 1;
 /// holder. If `handle` is already present (re-registration of the same id)
 /// only the physical range is updated -- the existing holders are preserved
 /// so a stray re-register can never resurrect a freed reference.
+#[cfg(not(feature = "process"))]
 pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
     register_as(handle, phys_addr, size, owner_pid, false);
 }
@@ -289,6 +304,7 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
 /// mmap take it the same way -- but the CPU must reach it uncached or
 /// write-combining: a write-back mapping of device memory is undefined
 /// behaviour on x86. See [`is_device_memory`].
+#[cfg(not(feature = "process"))]
 pub fn register_device_memory(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
     register_as(handle, phys_addr, size, owner_pid, true);
 }
@@ -313,6 +329,7 @@ fn register_as(handle: u32, phys_addr: u64, size: u64, owner_pid: u64, device_me
 
 /// Whether `handle`'s range is device memory (VRAM through BAR1), which a CPU
 /// mapping must not cache. False for an unknown handle.
+#[cfg(not(feature = "process"))]
 pub fn is_device_memory(handle: u32) -> bool {
     MAPPINGS
         .lock()
@@ -324,6 +341,7 @@ pub fn is_device_memory(handle: u32) -> bool {
 /// back to this original nouveau handle). Returns the new reference count, or
 /// `None` if the handle is not tracked here. Pairs with [`dec_ref`] on
 /// `GEM_CLOSE`.
+#[cfg(not(feature = "process"))]
 pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
     let mut table = MAPPINGS.lock();
     table.iter_mut().find(|e| e.handle == handle).map(|e| {
@@ -334,6 +352,7 @@ pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
 
 /// Who holds `handle` (pids, `DMABUF_HOLDER`, a KMS framebuffer's holder),
 /// or `None` if it is not tracked here. For the GEM quota's report.
+#[cfg(not(feature = "process"))]
 pub fn holders(handle: u32) -> Option<Vec<u64>> {
     MAPPINGS
         .lock()
@@ -343,6 +362,7 @@ pub fn holders(handle: u32) -> Option<Vec<u64>> {
 }
 
 /// How many references `handle` has, or `None` if it is not tracked here.
+#[cfg(not(feature = "process"))]
 pub fn ref_count(handle: u32) -> Option<u32> {
     MAPPINGS
         .lock()
@@ -356,6 +376,7 @@ pub fn ref_count(handle: u32) -> Option<u32> {
 /// handle (`>= 0x8000_0000`) answers `false` so a guess cannot map/bind/close
 /// someone else's GEM; untracked low-range (dumb/generic) handles still
 /// answer `true` so `linux-object`'s own table remains authoritative there.
+#[cfg(not(feature = "process"))]
 pub fn holds(handle: u32, pid: u64) -> bool {
     if pid == 0 {
         return true;
@@ -390,6 +411,7 @@ fn holds_entry(entry: Option<&MappedGem>, handle: u32, pid: u64) -> bool {
 /// reference goes the entry is removed here BEFORE the caller frees the
 /// backing memory, preserving the "no mmap-able mapping can outlive the VRAM
 /// it points at" invariant `GEM_CLOSE` has always kept.
+#[cfg(not(feature = "process"))]
 pub fn dec_ref(handle: u32, pid: u64) -> DecRef {
     let mut table = MAPPINGS.lock();
     let Some(pos) = table.iter().position(|e| e.handle == handle) else {
@@ -412,15 +434,28 @@ pub fn dec_ref(handle: u32, pid: u64) -> DecRef {
 /// Returns each touched handle with `true` when that was its last reference
 /// (entry removed, caller frees the object) or `false` when other holders
 /// remain.
+#[cfg(not(feature = "process"))]
 pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
+    release_pid_where(pid, |_| true)
+}
+
+/// [`release_pid`] over only the handles `mine` says yes to: those of one
+/// GPU, for a driver in a process, whose word is good for its own objects
+/// and no other card's.
+pub fn release_pid_where(pid: u64, mine: impl Fn(u32) -> bool) -> Vec<(u32, bool)> {
     let mut out = Vec::new();
     if pid == 0 {
         return out;
     }
     // Its NO_SHARE objects go with it: each is its creator's alone.
-    NO_SHARE.lock().retain(|&(_, owner)| owner != pid);
+    NO_SHARE
+        .lock()
+        .retain(|&(h, owner)| owner != pid || !mine(h));
     let mut table = MAPPINGS.lock();
     table.retain_mut(|e| {
+        if !mine(e.handle) {
+            return true;
+        }
         let before = e.holders.len();
         e.holders.retain(|h| *h != pid);
         if e.holders.len() == before {
@@ -439,6 +474,7 @@ pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
 /// physical address: the record was a flag on the mapping entry, so a
 /// VRAM-only NO_SHARE object was never marked and its export said the handle
 /// did not exist.
+#[cfg(not(feature = "process"))]
 pub fn mark_no_share(handle: u32, owner_pid: u64) {
     let mut set = NO_SHARE.lock();
     if !set.iter().any(|&(h, _)| h == handle) {
@@ -451,6 +487,7 @@ pub fn mark_no_share(handle: u32, owner_pid: u64) {
 /// object, as [`holds`] does; another process's NO_SHARE object answers
 /// `false`, so the export path tells it nothing a `drm_gem_object_lookup`
 /// in its own file would not.
+#[cfg(not(feature = "process"))]
 pub fn no_share(handle: u32, pid: u64) -> bool {
     NO_SHARE
         .lock()
@@ -460,6 +497,7 @@ pub fn no_share(handle: u32, pid: u64) -> bool {
 
 /// Drops `handle`'s NO_SHARE record: the object is gone (`GEM_CLOSE` by its
 /// one holder). Returns whether there was one.
+#[cfg(not(feature = "process"))]
 pub fn clear_no_share(handle: u32) -> bool {
     let mut set = NO_SHARE.lock();
     let before = set.len();
@@ -472,12 +510,19 @@ pub fn clear_no_share(handle: u32) -> bool {
 /// (`NvidiaGpu::rekey_zombie_wearing`), so [`release_pid`] of the zombie's
 /// teardown later drops the zombie's references and none of the new
 /// process's. Returns how many moved.
+#[cfg(not(feature = "process"))]
 pub fn rekey_pid(from: u64, to: u64) -> usize {
+    rekey_pid_where(from, to, |_| true)
+}
+
+/// [`rekey_pid`] over only the handles `mine` says yes to (see
+/// [`release_pid_where`]).
+pub fn rekey_pid_where(from: u64, to: u64, mine: impl Fn(u32) -> bool) -> usize {
     if from == 0 {
         return 0;
     }
     let mut n = 0;
-    for e in MAPPINGS.lock().iter_mut() {
+    for e in MAPPINGS.lock().iter_mut().filter(|e| mine(e.handle)) {
         for h in e.holders.iter_mut() {
             if *h == from {
                 *h = to;
@@ -488,7 +533,7 @@ pub fn rekey_pid(from: u64, to: u64) -> usize {
     // The NO_SHARE records are keyed by owner too, so the zombie's follow
     // its references and the teardown of the old pid takes none of the new
     // process's.
-    for (_, owner) in NO_SHARE.lock().iter_mut() {
+    for (_, owner) in NO_SHARE.lock().iter_mut().filter(|(h, _)| mine(*h)) {
         if *owner == from {
             *owner = to;
             n += 1;
@@ -507,6 +552,7 @@ pub fn rekey_pid(from: u64, to: u64) -> usize {
 /// to free the buffer out from under the compositor -> its next GEM_INFO/VM_BIND
 /// on that handle faulted. Kept as a last-resort primitive; currently unused.
 #[allow(dead_code)]
+#[cfg(not(feature = "process"))]
 pub fn unregister(handle: u32) -> bool {
     let mut table = MAPPINGS.lock();
     if let Some(pos) = table.iter().position(|e| e.handle == handle) {
@@ -517,7 +563,19 @@ pub fn unregister(handle: u32) -> bool {
     }
 }
 
+/// Drops every entry and NO_SHARE record whose handle `mine` says yes to,
+/// whoever holds it: the driver of those objects is gone, and what they
+/// named is not to be mapped again. Returns how many objects went.
+pub fn forget_where(mine: impl Fn(u32) -> bool) -> usize {
+    NO_SHARE.lock().retain(|&(h, _)| !mine(h));
+    let mut table = MAPPINGS.lock();
+    let before = table.len();
+    table.retain(|e| !mine(e.handle));
+    before - table.len()
+}
+
 /// Looks up `handle`'s `(phys_addr, size)`, e.g. from `DrmDev::get_vmo`.
+#[cfg(not(feature = "process"))]
 pub fn lookup(handle: u32) -> Option<(u64, u64)> {
     MAPPINGS
         .lock()
@@ -539,6 +597,7 @@ pub fn lookup(handle: u32) -> Option<(u64, u64)> {
 /// So say it, loudly and at most a few times per boot: an entry that EXISTS but
 /// is not held by the caller is the only case worth reporting -- an unknown
 /// handle is an ordinary miss, not an ownership decision.
+#[cfg(not(feature = "process"))]
 pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
     // ONE pass: the scan that decides ownership is the scan that reads the
     // range. This used to call `holds` and then `lookup`, walking the table
@@ -583,6 +642,7 @@ pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
 /// GEM object), because only that handle works with the nouveau-uAPI
 /// `GEM_INFO`/`VM_BIND`/`EXEC`. A fresh generic handle over the same memory
 /// looks fine to the generic ioctls and then fails every driver-private one.
+#[cfg(not(feature = "process"))]
 pub fn lookup_by_phys(phys_addr: u64) -> Option<(u32, u64)> {
     MAPPINGS
         .lock()
@@ -594,6 +654,7 @@ pub fn lookup_by_phys(phys_addr: u64) -> Option<(u32, u64)> {
 /// The handle whose range holds `phys_addr` anywhere inside it, not only at
 /// its start (that is [`lookup_by_phys`]): what a present needs to tell a
 /// row in the middle of a buffer from host RAM.
+#[cfg(not(feature = "process"))]
 pub fn lookup_by_phys_within(phys_addr: u64) -> Option<u32> {
     MAPPINGS
         .lock()

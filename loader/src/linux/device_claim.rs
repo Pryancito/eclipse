@@ -170,6 +170,61 @@ const THREADS_STEP: Duration = Duration::from_millis(1);
 /// identity (what tells apart two `pci` functions of the same index).
 static HOLDERS: lock::Mutex<Vec<(KoID, &'static str, usize, u32)>> = lock::Mutex::new(Vec::new());
 
+/// Each holder's bus transaction initiator: what it pinned through it is
+/// its own memory, which it may name to the kernel ([`owns_memory`]).
+static PINS: lock::Mutex<Vec<(KoID, alloc::sync::Weak<BusTransactionInitiator>)>> =
+    lock::Mutex::new(Vec::new());
+
+/// Whether `proc` holds a GPU: a device of kind `nvidia`, or a PCI
+/// function by identity (what `udrv-nvidia check` claims).
+pub(super) fn holds_gpu(proc: &Arc<Process>) -> bool {
+    let id = proc.id();
+    HOLDERS
+        .lock()
+        .iter()
+        .any(|&(holder, k, _, _)| holder == id && (k == user::NVIDIA || k == user::PCI))
+}
+
+/// Whose `len` bytes of physical memory at `phys` are, as far as `proc`
+/// may say: `Some(false)` for memory it pinned through a device it holds,
+/// `Some(true)` for one of that device's memory BARs (device memory, to be
+/// mapped write-combining), `None` for memory that is not its own.
+pub(super) fn owns_memory(proc: &Arc<Process>, phys: u64, len: u64) -> Option<bool> {
+    let id = proc.id();
+    let end = phys.checked_add(len)?;
+    let pins: Vec<_> = PINS
+        .lock()
+        .iter()
+        .filter(|(holder, _)| *holder == id)
+        .filter_map(|(_, bti)| bti.upgrade())
+        .collect();
+    if pins
+        .iter()
+        .any(|bti| bti.pins_cover(phys as usize, len as usize))
+    {
+        return Some(false);
+    }
+    let held: Vec<_> = HOLDERS
+        .lock()
+        .iter()
+        .filter(|(holder, ..)| *holder == id)
+        .map(|&(_, kind, index, pci_id)| (kind, index, pci_id))
+        .collect();
+    let in_a_bar = held.into_iter().any(|(kind, index, pci_id)| {
+        let device = if kind == user::PCI {
+            user::find_pci(pci_id, index)
+        } else {
+            user::find(kind, index)
+        };
+        device.and_then(|d| d.pci).is_some_and(|place| {
+            place.bars.iter().any(|&(base, size)| {
+                size > 0 && phys >= base as u64 && end <= base as u64 + size as u64
+            })
+        })
+    });
+    in_a_bar.then_some(true)
+}
+
 /// The device of `kind` that `proc` holds, by its place among the reserved
 /// ones of that kind. What a driver serves to the kernel is known by this:
 /// the next driver of the same device is the same disk's.
@@ -256,7 +311,21 @@ impl Held {
         HOLDERS
             .lock()
             .retain(|held| *held != (self.holder, kind, index, pci_id));
+        PINS.lock().retain(|(holder, bti)| {
+            *holder != self.holder || bti.upgrade().is_some_and(|b| !Arc::ptr_eq(&b, &self.bti))
+        });
         self.silence();
+        // GEM objects it named are in memory it pinned, and a client may
+        // still have one mapped: the pins stay, for good, so that memory
+        // is never anyone else's while a mapping of it lives.
+        if super::gem_serve::driver_gone(self.holder) {
+            warn!("udriver: {kind} #{index}: its driver named GEM objects; what it pinned stays pinned");
+            if self.device.reset() {
+                self.device.release();
+            }
+            core::mem::forget(self.bti);
+            return;
+        }
         if !self.device.reset() {
             // It may still be writing to what it was given, so that stays
             // pinned for good, and nobody else gets a device in that state.
@@ -392,6 +461,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     HOLDERS
         .lock()
         .push((held.holder, device.kind, device.index, device.pci_id));
+    PINS.lock().push((held.holder, Arc::downgrade(&held.bti)));
     held.until_gone(proc);
     Ok(())
 }

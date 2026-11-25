@@ -164,6 +164,20 @@ impl BusTransactionInitiator {
         self.iommu.clone()
     }
 
+    /// Whether `len` bytes from device address `addr` lie in ONE run of
+    /// memory this initiator holds pinned: what lets the kernel take a
+    /// driver process's word that a range it names is its own (a GEM object
+    /// a user-mode GPU driver registers for mapping), rather than any
+    /// physical memory at all.
+    pub fn pins_cover(&self, addr: DevVAddr, len: usize) -> bool {
+        let min_contig = self.iommu.minimum_contiguity();
+        self.inner
+            .lock()
+            .pmts
+            .iter()
+            .any(|pmt| pmt.covers(min_contig, addr, len))
+    }
+
     /// The tokens this initiator holds that nothing else names any more: the
     /// pin outlived every handle to it, which is what quarantine means here.
     /// Takes a borrow of the locked state rather than the lock, so a caller
@@ -193,6 +207,25 @@ mod tests {
     use super::*;
     use crate::dev::Iommu;
     use crate::vm::PAGE_SIZE;
+
+    /// A range is the initiator's when it lies in one of its pins, and only
+    /// then: not past a pin's end, not after the pin is gone.
+    #[test]
+    fn only_a_range_inside_a_pin_is_covered() {
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        let vmo = VmObject::new_contiguous(2, crate::vm::PAGE_SIZE_LOG2).unwrap();
+        let pmt = bti
+            .pin(vmo, 0, 2 * PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let base = pmt.encode_addrs(false, true).unwrap()[0];
+        assert!(bti.pins_cover(base, 2 * PAGE_SIZE));
+        assert!(bti.pins_cover(base + PAGE_SIZE, 16));
+        assert!(!bti.pins_cover(base + PAGE_SIZE, PAGE_SIZE + 1));
+        assert!(!bti.pins_cover(base.wrapping_sub(1), 2));
+        assert!(!bti.pins_cover(base, 0));
+        pmt.unpin();
+        assert!(!bti.pins_cover(base, 16));
+    }
 
     /// The two counts of `ZX_INFO_BTI` are a total and a subset of it, so they
     /// have to come out of one snapshot. They used to be two separate locks.

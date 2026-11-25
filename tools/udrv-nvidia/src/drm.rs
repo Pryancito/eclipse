@@ -85,6 +85,9 @@ pub mod check {
     #[derive(Default)]
     pub struct Card {
         pub flips: AtomicU32,
+        /// Buffers the kernel made and told it of, and then freed.
+        pub imported: AtomicU32,
+        pub freed: AtomicU32,
     }
 
     impl Scheme for Card {
@@ -109,6 +112,13 @@ pub mod check {
         }
         fn create_fb(&self, handle: u32, _w: u32, _h: u32, _pitch: u32) -> Option<u32> {
             Some(0x5a_0000 + handle)
+        }
+        fn import_buffer(&self, h: zcore_drivers::scheme::drm::GemHandle) -> bool {
+            self.imported.fetch_add(1, Ordering::Relaxed);
+            h.phys_addr != 0
+        }
+        fn free_buffer(&self, _h: zcore_drivers::scheme::drm::GemHandle) {
+            self.freed.fetch_add(1, Ordering::Relaxed);
         }
         fn page_flip(&self, _fb: u32) -> bool {
             self.flips.fetch_add(1, Ordering::Relaxed);

@@ -21,7 +21,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::drm::{DisplayMode, DrmCaps, DrmConnector, DrmCrtc, DrmPlane, DrmScheme};
+use super::drm::{
+    DisplayMode, DrmCaps, DrmConnector, DrmCrtc, DrmPlane, DrmScheme, GemAperture, GemHandle,
+};
 use super::Scheme;
 
 /// The ops, numbered past those of a served device node (`OP_OPEN` and
@@ -55,6 +57,15 @@ pub mod op {
     pub const FILE_CLOSED: u32 = 84;
     /// A process (`a`) is gone. Told, not asked.
     pub const RELEASE_PROCESS: u32 = 85;
+    /// `nouveau_gem_close` of handle `a` by holder `b`: 1 if it was the
+    /// driver's.
+    pub const GEM_CLOSE: u32 = 86;
+    /// `gem_aperture` of handle `a` for `b`: 0 unknown, 1 sysmem, 2 VRAM.
+    pub const GEM_APERTURE: u32 = 87;
+    /// `import_buffer` and `free_buffer` of handle `a`, `b` bytes, at the
+    /// physical address in the bytes (u64).
+    pub const IMPORT_BUFFER: u32 = 88;
+    pub const FREE_BUFFER: u32 = 89;
 }
 
 pub mod ioctl;
@@ -346,6 +357,29 @@ pub fn answer(
             gpu.nouveau_release_process(a);
             Ok(0)
         }
+        op::GEM_CLOSE => found(gpu.nouveau_gem_close(a as u32, b)),
+        op::GEM_APERTURE => Ok(match gpu.gem_aperture(a as u32, b) {
+            GemAperture::Unknown => 0,
+            GemAperture::Sysmem => 1,
+            GemAperture::Vram => 2,
+        }),
+        op::IMPORT_BUFFER | op::FREE_BUFFER => {
+            let phys = data
+                .get(..8)
+                .map(|w| u64::from_le_bytes(core::convert::TryFrom::try_from(w).unwrap()))
+                .ok_or(EINVAL)?;
+            let handle = GemHandle {
+                id: a as u32,
+                size: b as usize,
+                phys_addr: phys,
+            };
+            if op == op::IMPORT_BUFFER {
+                found(gpu.import_buffer(handle))
+            } else {
+                gpu.free_buffer(handle);
+                Ok(0)
+            }
+        }
         _ => Err(EINVAL),
     }
 }
@@ -548,6 +582,33 @@ impl<T: Transport> DrmScheme for Remote<T> {
                 .map(|(_, back)| back)
         };
         ioctl::call(&self.to, send, request, arg, file)
+    }
+
+    fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
+        self.yes(op::GEM_CLOSE, handle as u64, owner_pid, &[])
+    }
+
+    fn gem_aperture(&self, handle_id: u32, pid: u64) -> GemAperture {
+        match self.word(op::GEM_APERTURE, handle_id as u64, pid, &[]) {
+            Some(1) => GemAperture::Sysmem,
+            Some(2) => GemAperture::Vram,
+            _ => GemAperture::Unknown,
+        }
+    }
+
+    fn import_buffer(&self, handle: GemHandle) -> bool {
+        let phys = handle.phys_addr.to_le_bytes();
+        self.yes(
+            op::IMPORT_BUFFER,
+            handle.id as u64,
+            handle.size as u64,
+            &phys,
+        )
+    }
+
+    fn free_buffer(&self, handle: GemHandle) {
+        let phys = handle.phys_addr.to_le_bytes();
+        let _ = self.call(op::FREE_BUFFER, handle.id as u64, handle.size as u64, &phys);
     }
 
     fn nouveau_file_closed(&self, file: usize) {
