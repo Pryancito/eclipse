@@ -3914,3 +3914,8 @@ mod free_list_tests;
 #[cfg(all(test, not(feature = "mem-debug")))]
 #[path = "memory/pcp_tests.rs"]
 mod pcp_tests;
+
+// Every sequence of six allocator calls on a six-frame pool, against a model.
+#[cfg(all(test, not(feature = "mem-debug")))]
+#[path = "memory/frame_sequence_tests.rs"]
+mod frame_sequence_tests;
