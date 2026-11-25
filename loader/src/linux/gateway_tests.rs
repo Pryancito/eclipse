@@ -20,14 +20,14 @@ use zircon_object::vm::{VmObject, PAGE_SIZE};
 
 /// A pid no other test is using: `Process::create_linux` takes its pid
 /// from the caller, and the tests share one process table.
-fn a_pid() -> KoID {
+pub(super) fn a_pid() -> KoID {
     use core::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0x5000_0000);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A Linux process with the capabilities the first one has (all of them).
-fn a_process() -> Arc<Process> {
+pub(super) fn a_process() -> Arc<Process> {
     let job = zircon_object::task::ROOT_JOB.clone();
     Process::create_linux(&job, RamFS::new(), 0, None, a_pid())
         .expect("a Linux process on an empty ramfs")
@@ -35,7 +35,7 @@ fn a_process() -> Arc<Process> {
 
 /// A Linux process without `CAP_SYS_ADMIN` in its effective set: an
 /// ordinary program.
-fn an_unprivileged_process() -> Arc<Process> {
+pub(super) fn an_unprivileged_process() -> Arc<Process> {
     let proc = a_process();
     proc.linux()
         .change_capabilities(|caps| {
@@ -47,22 +47,22 @@ fn an_unprivileged_process() -> Arc<Process> {
     proc
 }
 
-fn call(proc: &Arc<Process>, num: u32, args: [usize; 6]) -> isize {
+pub(super) fn call(proc: &Arc<Process>, num: u32, args: [usize; 6]) -> isize {
     eclipse_gateway_call(proc, num, &args)
 }
 
-fn zx(e: ZxError) -> isize {
+pub(super) fn zx(e: ZxError) -> isize {
     e as isize
 }
 
 /// One end of a fresh channel in `proc`'s table with `rights`, and the
 /// other end, kept by the test.
-fn a_channel(proc: &Arc<Process>, rights: Rights) -> (u32, Arc<Channel>) {
+pub(super) fn a_channel(proc: &Arc<Process>, rights: Rights) -> (u32, Arc<Channel>) {
     let (ours, theirs) = Channel::create();
     (proc.add_handle(Handle::new(ours, rights)), theirs)
 }
 
-fn ptr<T>(x: &mut T) -> usize {
+pub(super) fn ptr<T>(x: &mut T) -> usize {
     x as *mut T as usize
 }
 
@@ -857,7 +857,7 @@ fn a_claim_of_an_unknown_kind_or_a_device_not_reserved_is_refused() {
 }
 
 /// Wait, a while at most, for `done`.
-fn eventually(what: &str, done: impl Fn() -> bool) {
+pub(super) fn eventually(what: &str, done: impl Fn() -> bool) {
     for _ in 0..2000 {
         if done() {
             return;
