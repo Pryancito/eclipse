@@ -7,6 +7,7 @@
 use super::*;
 use crate::net::ipv6_link_local_from_mac;
 use crate::net::test_card::{a_machine, plug, Card};
+use crate::net::IFF_NOARP;
 use alloc::vec;
 use zcore_drivers::wire::{EthernetAddress, Ipv6Cidr};
 
@@ -168,6 +169,31 @@ fn a_links_index_is_the_one_the_ioctl_gives() {
         let card = crate::net::iface_by_linux_ifindex(index as u32).unwrap();
         assert_eq!(card.ifname(), name);
     }
+}
+
+/// `IFLA_MTU` is the card's own (`rtnl_fill_ifinfo` puts `dev->mtu`), the
+/// one `SIOCGIFMTU` gives: 65536 for `lo`, a jumbo card's 9000. `lo` is
+/// `<LOOPBACK,UP,LOWER_UP>`: `loopback_setup` gives it no `IFF_NOARP`.
+#[test]
+fn a_links_mtu_is_the_cards_own_and_lo_has_no_noarp() {
+    let _m = plug(vec![
+        Card::ether("eth0", [2, 0, 0, 0, 0, 1]).with_mtu(9000),
+        Card::loopback(),
+    ]);
+    let nl = NetlinkSocketState::default();
+    let replies = dump(&nl, NetlinkMessageType::GetLink, 0);
+    assert_eq!(check_dump(&replies, NetlinkMessageType::NewLink), 2);
+    let mtu = |msg: &[u8]| {
+        let a = attrs(msg, size_of::<IfaceInfoMsg>());
+        let v = attr(&a, RouteAttrTypes::MTU.into()).expect("IFLA_MTU");
+        u32::from_ne_bytes(core::convert::TryInto::try_into(v).unwrap())
+    };
+    assert_eq!(mtu(&replies[0]), 9000);
+    assert_eq!(mtu(&replies[1]), 65536);
+    let lo = info_of(&replies[1]);
+    assert_eq!(lo.ifi_flags & IFF_NOARP, 0);
+    let want = IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP;
+    assert_eq!(lo.ifi_flags & want, want);
 }
 
 /// With no card at all, a dump is its `DONE` alone.
