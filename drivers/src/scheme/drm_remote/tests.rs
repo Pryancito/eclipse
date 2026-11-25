@@ -205,6 +205,29 @@ impl DrmScheme for Card {
     fn nouveau_file_closed(&self, file: usize) {
         self.told.lock().push(("closed", file as u64));
     }
+    /// Handle 7 is the driver's, VRAM for pid 3 and sysmem for the rest.
+    fn nouveau_gem_close(&self, handle: u32, pid: u64) -> bool {
+        self.told.lock().push(("gem_close", pid));
+        handle == 7
+    }
+    fn gem_aperture(&self, handle: u32, pid: u64) -> GemAperture {
+        match (handle, pid) {
+            (7, 3) => GemAperture::Vram,
+            (7, _) => GemAperture::Sysmem,
+            _ => GemAperture::Unknown,
+        }
+    }
+    fn import_buffer(&self, h: GemHandle) -> bool {
+        self.told
+            .lock()
+            .push(("import", h.phys_addr + h.size as u64 + h.id as u64));
+        h.size > 0
+    }
+    fn free_buffer(&self, h: GemHandle) {
+        self.told
+            .lock()
+            .push(("free", h.phys_addr + h.size as u64 + h.id as u64));
+    }
     fn nouveau_release_process(&self, pid: u64) {
         self.told.lock().push(("released", pid));
     }
@@ -541,4 +564,33 @@ fn an_ioctl_to_a_gone_driver_is_its_errno() {
         Err(ioctl::EFAULT)
     );
     assert_eq!(remote.ioctl(0x6450, 1), Err(ENODEV));
+}
+
+#[test]
+fn the_driver_s_gem_objects_are_its_own_to_answer_for() {
+    let (card, remote) = pair();
+    assert!(remote.nouveau_gem_close(7, 42));
+    assert!(!remote.nouveau_gem_close(8, 42));
+    assert_eq!(remote.gem_aperture(7, 3), GemAperture::Vram);
+    assert_eq!(remote.gem_aperture(7, 4), GemAperture::Sysmem);
+    assert_eq!(remote.gem_aperture(9, 4), GemAperture::Unknown);
+    let h = GemHandle {
+        id: 5,
+        size: 0x1000,
+        phys_addr: 0x1_0000_0000,
+    };
+    assert!(remote.import_buffer(h));
+    assert!(!remote.import_buffer(GemHandle { size: 0, ..h }));
+    remote.free_buffer(h);
+    let sum = 0x1_0000_0000 + 0x1000 + 5;
+    assert_eq!(
+        *card.told.lock(),
+        vec![
+            ("gem_close", 42),
+            ("gem_close", 42),
+            ("import", sum),
+            ("import", sum - 0x1000),
+            ("free", sum)
+        ]
+    );
 }

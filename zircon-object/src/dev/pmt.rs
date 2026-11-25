@@ -158,6 +158,25 @@ impl PinnedMemoryToken {
         }
     }
 
+    /// Whether `len` bytes from `addr` lie in one contiguous run of this
+    /// pin: the whole pin for a contiguous VMO, one run of `min_contig`
+    /// bytes otherwise. An empty range is in none.
+    pub(super) fn covers(&self, min_contig: usize, addr: DevVAddr, len: usize) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let run = if self.vmo.is_contiguous() {
+            self.size
+        } else {
+            min_contig
+        };
+        len > 0
+            && self
+                .mapped_addrs
+                .iter()
+                .any(|&base| addr >= base && end <= base + run)
+    }
+
     /// Unpin pages and revoke device access to them.
     pub fn unpin(&self) {
         if let Some(bti) = self.bti.upgrade() {

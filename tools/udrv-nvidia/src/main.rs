@@ -14,6 +14,7 @@
 //!   through the mapper, DMA memory through the claim. The driver itself
 //!   is not run.
 mod drm;
+mod gem;
 mod gpu;
 mod mapper;
 mod platform;
@@ -99,6 +100,23 @@ fn open_rw(path: &str) -> Option<std::fs::File> {
         .write(true)
         .open(path)
         .ok()
+}
+
+/// `CREATE_DUMB` of a 64x64 buffer on `file`, then `DESTROY_DUMB` of it.
+fn dumb_buffer(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    const CREATE_DUMB: u64 = 0xc020_64b2;
+    const DESTROY_DUMB: u64 = 0xc004_64b4;
+    // `struct drm_mode_create_dumb`: height, width, bpp, flags, then the
+    // handle, pitch and size the kernel answers.
+    let mut c = [64u32, 64, 32, 0, 0, 0, 0, 0];
+    // SAFETY: `c` is the 32 bytes of the struct.
+    if unsafe { libc::ioctl(file.as_raw_fd(), CREATE_DUMB as _, c.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let mut handle = c[4];
+    // SAFETY: `handle` is the struct, a u32.
+    unsafe { libc::ioctl(file.as_raw_fd(), DESTROY_DUMB as _, &mut handle) == 0 }
 }
 
 /// `DRM_IOCTL_VERSION` with no buffers: the lengths only.
@@ -189,6 +207,13 @@ fn drm_check() {
                     channel: 12,
                     ..asked
                 },
+    );
+    // A dumb buffer the kernel makes is told to the card, and its end too.
+    let dumb = dumb_buffer(&file);
+    ok(
+        "a dumb buffer is imported by the card, and freed",
+        dumb && card.imported.load(std::sync::atomic::Ordering::Relaxed) == 1
+            && card.freed.load(std::sync::atomic::Ordering::Relaxed) == 1,
     );
     // What a call to the card costs, there and back, beside an ioctl the
     // kernel answers alone (`DRM_IOCTL_VERSION`, of the cached name).
@@ -288,5 +313,33 @@ fn check(vendor: u16, device: u16) {
     );
     // SAFETY: two pages just allocated, this process's.
     unsafe { (virt as *mut u64).add(1023).write_volatile(7) };
+    // The GEM objects the driver makes are in the kernel's table, and only
+    // in memory that is its own.
+    use zcore_drivers::scheme::gem_mmap::{self, DecRef, HandleSlice};
+    let slice = gem_mmap::alloc_handle_slice();
+    ok(
+        "the kernel gives the driver a slice of GEM handles",
+        slice != HandleSlice::exhausted(),
+    );
+    let (h, pid, size) = (slice.base(), 4242, 2 * 4096);
+    gem_mmap::register(h, dma as u64, size, pid);
+    ok(
+        "a GEM object in its DMA memory is in the kernel's table",
+        gem_mmap::lookup(h) == Some((dma as u64, size)) && gem_mmap::holds(h, pid),
+    );
+    gem_mmap::register(h + 1, dma as u64 + size, 4096, pid);
+    ok(
+        "...and one in memory that is not its own is refused",
+        gem_mmap::lookup(h + 1).is_none(),
+    );
+    gem_mmap::register_device_memory(h + 2, first.phys as u64, 4096, pid);
+    ok(
+        "a GEM object in its BAR is device memory",
+        gem_mmap::is_device_memory(h + 2),
+    );
+    ok(
+        "its last reference closed, it leaves the table",
+        gem_mmap::dec_ref(h, pid) == DecRef::Freed && gem_mmap::lookup(h).is_none(),
+    );
     println!("{NAME}: check: ok");
 }
