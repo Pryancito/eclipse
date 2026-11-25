@@ -3,14 +3,14 @@
 use core::{
     cell::UnsafeCell,
     fmt,
-    hint::spin_loop,
     // marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::Ordering,
 };
 
 use crate::interrupt::{pop_off, push_off};
+use crate::prims::{loom_const_fn, spin_loop, AtomicUsize};
 
 pub struct RwLock<T: ?Sized> {
     lock: AtomicUsize,
@@ -105,27 +105,29 @@ unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 
 impl<T> RwLock<T> {
-    /// Creates a new spinlock wrapping the supplied data.
-    ///
-    /// May be used statically:
-    ///
-    /// ```
-    /// use spin;
-    ///
-    /// static RW_LOCK: spin::RwLock<()> = spin::RwLock::new(());
-    ///
-    /// fn demo() {
-    ///     let lock = RW_LOCK.read();
-    ///     // do something with lock
-    ///     drop(lock);
-    /// }
-    /// ```
-    #[inline]
-    pub const fn new(data: T) -> Self {
-        RwLock {
-            // phantom: PhantomData,
-            lock: AtomicUsize::new(0),
-            data: UnsafeCell::new(data),
+    loom_const_fn! {
+        /// Creates a new spinlock wrapping the supplied data.
+        ///
+        /// May be used statically:
+        ///
+        /// ```
+        /// use spin;
+        ///
+        /// static RW_LOCK: spin::RwLock<()> = spin::RwLock::new(());
+        ///
+        /// fn demo() {
+        ///     let lock = RW_LOCK.read();
+        ///     // do something with lock
+        ///     drop(lock);
+        /// }
+        /// ```
+        #[inline]
+        pub fn new(data: T) -> Self {
+            RwLock {
+                // phantom: PhantomData,
+                lock: AtomicUsize::new(0),
+                data: UnsafeCell::new(data),
+            }
         }
     }
 
@@ -866,7 +868,7 @@ fn compare_exchange(
 /// those tests cannot see from outside: how often a waiter drains its own
 /// shootdown queue, and that the stuck call site is named once and not on
 /// every turn afterwards.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod spin_discipline_tests {
     use super::*;
     use core::sync::atomic::AtomicU32;

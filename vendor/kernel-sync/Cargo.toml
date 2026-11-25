@@ -30,3 +30,8 @@ cortex-a = "7.2.0"
 # LibOS mode
 [target.'cfg(not(target_os = "none"))'.dependencies]
 spin = "0.9"
+
+# `cfg(loom)` is set only by `loom/build.rs`, the model crate that compiles
+# these sources against loom (see `loom/models.rs`).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

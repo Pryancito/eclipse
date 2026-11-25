@@ -34,11 +34,12 @@ use core::{
     cell::UnsafeCell,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::Ordering,
 };
 
 use crate::deadlock::report_deadlock;
 use crate::interrupt::{pop_off, push_off};
+use crate::prims::{loom_const_fn, spin_loop, AtomicUsize};
 
 /// Which side of the machine holds the lock. A label on the guard; both
 /// channels exclude each other, because there is one `T`.
@@ -97,11 +98,13 @@ unsafe impl<T: ?Sized + Send> Sync for MCSLock<T> {}
 unsafe impl<T: ?Sized + Send> Send for MCSLock<T> {}
 
 impl<T> MCSLock<T> {
-    #[inline(always)]
-    pub const fn new(data: T) -> Self {
-        MCSLock {
-            holder: AtomicUsize::new(NOBODY),
-            data: UnsafeCell::new(data),
+    loom_const_fn! {
+        #[inline(always)]
+        pub fn new(data: T) -> Self {
+            MCSLock {
+                holder: AtomicUsize::new(NOBODY),
+                data: UnsafeCell::new(data),
+            }
         }
     }
 
@@ -124,7 +127,7 @@ impl<T: ?Sized> MCSLock<T> {
     /// The same cadence the other flavours keep — see `spin::SpinMutex`.
     #[inline(always)]
     fn wait_turn(&self, spins: &mut u64, caller: &'static core::panic::Location<'static>) {
-        core::hint::spin_loop();
+        spin_loop();
         *spins += 1;
         // Spinning with IRQs off makes this CPU deaf to TLB-shootdown IPIs, and
         // a peer may be spin-waiting for our ack.
@@ -277,7 +280,7 @@ impl<T: ?Sized> fmt::Display for MCSLock<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::interrupt::{intr_get_for_test, intr_on_for_test, lock_depth};

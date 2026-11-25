@@ -20,6 +20,8 @@ pub mod cpuid;
 // every build including the host one, so it lives where all three can reach it.
 pub mod fn_slot;
 
+mod prims;
+
 // ── the kernel locks, on the host, under `cargo test` ────────────────────────
 //
 // `KERNEL_LOCKS_ON_HOST`: everything below this line used to be behind
