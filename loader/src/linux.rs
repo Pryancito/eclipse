@@ -906,6 +906,19 @@ fn copy_client_memory(
     Ok(done)
 }
 
+/// The extension calls only a process with `CAP_SYS_ADMIN` may make: the
+/// ones that hand out a device (its registers, its interrupt and memory
+/// it can do DMA to), put a disk under `/dev`, or stand between every
+/// program and the network. The filesystem and device-node ones check for
+/// themselves, where they also answer `mount(2)`.
+#[cfg(feature = "zircon-gateway")]
+fn gateway_call_is_admins(num: u32) -> bool {
+    matches!(
+        num,
+        ECLIPSE_DEVICE_CLAIM | ECLIPSE_BLOCK_SERVE | ECLIPSE_NETSTACK_SERVE | ECLIPSE_NET_BORROW
+    )
+}
+
 /// The Eclipse extension calls ([`ECLIPSE_GATEWAY_EXT`] and up), answering
 /// a Zircon status or, for `handle_to_fd`, the new fd.
 #[cfg(feature = "zircon-gateway")]
@@ -913,6 +926,13 @@ fn eclipse_gateway_call(proc: &Arc<Process>, num: u32, args: &[usize; 6]) -> isi
     use linux_object::fs::{FileDesc, HandleFd, OpenFlags};
     use zircon_object::object::Rights;
     let status = |e: ZxError| e as isize;
+    // Taking a device, serving a disk and being the machine's network are
+    // the administrator's, as serving a filesystem or a device node is
+    // (`linux_object::fs::served::serve`): the gateway is open to every
+    // process, and none of these asks who calls.
+    if gateway_call_is_admins(num) && !proc.linux().capable(linux_object::process::CAP_SYS_ADMIN) {
+        return status(ZxError::ACCESS_DENIED);
+    }
     match num {
         ECLIPSE_HANDLE_TO_FD => {
             let allowed = OpenFlags::CLOEXEC | OpenFlags::NON_BLOCK;

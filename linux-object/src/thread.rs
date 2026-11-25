@@ -1158,9 +1158,12 @@ impl LinuxThread {
         old_ctx: &UserContext,
         siginfo_ptr: usize,
         uctx_ptr: usize,
-    ) {
-        let siginfo = unsafe { &*(siginfo_ptr as *const SigInfo) };
-        let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext) };
+    ) -> crate::error::LxResult {
+        // Read as user memory is, and before anything is put back: the
+        // frame is the handler's to unmap, and its address is then one
+        // with nothing behind it (see `restore_after_an_old_handler32`).
+        let siginfo = &UserInPtr::<SigInfo>::from(siginfo_ptr).read_unaligned()?;
+        let user_ctx = &UserInPtr::<SignalUserContext>::from(uctx_ptr).read_unaligned()?;
         let check = unmodified_check(siginfo, &self.handling_info, user_ctx);
         // This gate decides one log line and nothing else -- see the
         // tolerance note below -- so the mutation that turns it into
@@ -1189,6 +1192,7 @@ impl LinuxThread {
         // without the filter a handler could return with SIGKILL blocked.
         self.set_signal_mask(Sigset::new(user_ctx.sig_mask.val()));
         self.handling_signal = None;
+        Ok(())
     }
 
     /// The same, for a 32-bit process, whose frame is Linux's
@@ -1207,9 +1211,10 @@ impl LinuxThread {
         old_ctx: &UserContext,
         siginfo_ptr: usize,
         uctx_ptr: usize,
-    ) {
-        let info_bytes = unsafe { &*(siginfo_ptr as *const [u8; crate::signal::SIGINFO_LEN]) };
-        let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext32) };
+    ) -> crate::error::LxResult {
+        let info_bytes =
+            &UserInPtr::<[u8; crate::signal::SIGINFO_LEN]>::from(siginfo_ptr).read_unaligned()?;
+        let user_ctx = &UserInPtr::<SignalUserContext32>::from(uctx_ptr).read_unaligned()?;
         // The `siginfo` a 32-bit handler was given is the narrowed one, so
         // the comparison is against that and not against the native struct:
         // the handler cannot have left the native bytes there, and comparing
@@ -1229,6 +1234,7 @@ impl LinuxThread {
         user_ctx.context.restore_into(ctx);
         self.set_signal_mask(user_ctx.mask());
         self.handling_signal = None;
+        Ok(())
     }
 
     /// The `sigreturn` of an **old** i386 frame, the one an action without
@@ -1261,10 +1267,9 @@ impl LinuxThread {
     /// it is 4-aligned and not 8, and Linux's own `__get_user` asks nothing
     /// of either.
     ///
-    /// Pointed out by Copilot on the #2424. The two OLDER `sigreturn` paths
-    /// --- this one's `rt_` sibling and the native one --- still dereference
-    /// their frame raw, which is the same hole and was there before this
-    /// change; closing it for all three is a change of its own.
+    /// Pointed out by Copilot on the #2424. The two older `sigreturn` paths
+    /// --- this one's `rt_` sibling and the native one --- read theirs the
+    /// same way since.
     #[cfg(target_arch = "x86_64")]
     pub fn restore_after_an_old_handler32(
         &mut self,
@@ -1299,7 +1304,7 @@ impl LinuxThread {
         siginfo_ptr: usize,
         uctx_ptr: usize,
         narrow: bool,
-    ) {
+    ) -> crate::error::LxResult {
         #[cfg(target_arch = "x86_64")]
         if narrow {
             return self.restore_after_handle_signal32(ctx, old_ctx, siginfo_ptr, uctx_ptr);
@@ -2167,7 +2172,8 @@ mod signal_delivery_tests {
             &old_ctx,
             &info as *const SigInfo as usize,
             &uctx as *const SignalUserContext as usize,
-        );
+        )
+        .unwrap();
         assert_eq!(
             t.signal_alternate_stack, alt,
             "sigreturn did not put the auto-disarmed stack back"
@@ -2206,7 +2212,8 @@ mod signal_delivery_tests {
             &old_ctx,
             &info as *const SigInfo as usize,
             &uctx as *const SignalUserContext as usize,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             ctx.general().rsp,
@@ -2256,7 +2263,8 @@ mod signal_delivery_tests {
             &old_ctx,
             info.as_ptr() as usize,
             &uctx as *const SignalUserContext32 as usize,
-        );
+        )
+        .unwrap();
 
         assert_eq!(ctx.general().rsp, 0xffff_cff8);
         assert_eq!(ctx.general().rip, 0x0804_9100);
@@ -2295,7 +2303,8 @@ mod signal_delivery_tests {
             &old_ctx,
             info.as_ptr() as usize,
             &uctx as *const SignalUserContext32 as usize,
-        );
+        )
+        .unwrap();
 
         assert!(
             !t.signal_mask().contains(Signal::SIGKILL),
@@ -2342,7 +2351,8 @@ mod signal_delivery_tests {
             &old_ctx,
             info.as_ptr() as usize,
             &uctx as *const SignalUserContext32 as usize,
-        );
+        )
+        .unwrap();
         assert_eq!(
             t.signal_alternate_stack, alt,
             "a 32-bit sigreturn did not put the auto-disarmed stack back"
@@ -2380,7 +2390,8 @@ mod signal_delivery_tests {
             &old_ctx,
             &info as *const SigInfo as usize,
             &uctx as *const SignalUserContext as usize,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             ctx.get_field(UserContextField::InstrPointer),
