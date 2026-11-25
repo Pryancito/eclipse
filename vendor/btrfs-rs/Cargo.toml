@@ -16,3 +16,7 @@ log = "0.4"
 # the disk, so this is one of the few places where a fuzzed, widely used
 # implementation is worth a dependency over 400 lines of our own.
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+# `cfg(kani)` is set by `cargo kani` (see `src/kani_proofs.rs`).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

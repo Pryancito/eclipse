@@ -10,3 +10,7 @@ description = "Eclipse OS NFSv3 client (no_std): XDR, ONC RPC, portmap, MOUNT v3
 rcore-fs = { path = "../rcore-fs" }
 # The scripted connector's log (`dialer`).
 spin = "0.9"
+
+# `cfg(kani)` is set by `cargo kani` (see `src/kani_proofs.rs`).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
