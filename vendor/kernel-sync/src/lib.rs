@@ -20,6 +20,9 @@ pub mod cpuid;
 // every build including the host one, so it lives where all three can reach it.
 pub mod fn_slot;
 
+// What the locks below are built from; a host build that is not a test has
+// no locks of its own (it re-exports `spin`), so no `prims` either.
+#[cfg(any(test, target_os = "none"))]
 mod prims;
 
 // ── the kernel locks, on the host, under `cargo test` ────────────────────────
