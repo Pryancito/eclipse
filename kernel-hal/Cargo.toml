@@ -63,6 +63,11 @@ bitmap-allocator = { git = "https://github.com/rcore-os/bitmap-allocator.git", r
 [target.'cfg(target_os = "none")'.dependencies]
 executor = { path = "../vendor/PreemptiveScheduler" }
 
+# The host tests of `bare/stack_guard.rs` (see `lib.rs`) use the scheduler's
+# stack layout, which only a bare build otherwise links.
+[dev-dependencies]
+executor = { path = "../vendor/PreemptiveScheduler" }
+
 # For riscv
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.10.1"
