@@ -2111,6 +2111,41 @@ fn served_consoles_for_nvkms(
     scanning.max(1)
 }
 
+/// Before the deferred console bring-up opens its window: wait for
+/// udrv-nvidia to serve the cards of the GPUs the boot left to it, for as
+/// long as `/proc/gpuready` holds the session for them (`serve_overdue`).
+///
+/// The window asks every card's driver to bring up the console GPU, the
+/// cards a process serves among them, once. The task used to open it four
+/// seconds after init's first read of `/proc/gpuready`, whatever that read
+/// had answered; when it answered "not served yet" the window asked nobody,
+/// and the console GPU of the process stayed cold for the boot, or came up
+/// later with the scanout live.
+#[cfg(feature = "linux")]
+async fn wait_for_served_gpus(reason: &str) {
+    use core::time::Duration;
+    use kernel_hal::timer::timer_now;
+    use linux_object::fs::devfs::served::card;
+
+    let left = card::left_to_udrv_nvidia();
+    if card::served_gpus() >= left {
+        return;
+    }
+    let began = timer_now();
+    while card::served_gpus() < left && !card::serve_overdue() {
+        kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
+    }
+    let waited = timer_now().saturating_sub(began);
+    kernel_hal::klog_info!(
+        "Eclipse: {} — udrv-nvidia sirve {} de sus {} GPUs tras {}.{:03} s de espera",
+        reason,
+        card::served_gpus(),
+        left,
+        waited.as_secs(),
+        waited.subsec_millis()
+    );
+}
+
 /// `nvidia.nvkms` for the console GPU a process drives (`udriver=nvidia@N`,
 /// udrv-nvidia). That process loads nvidia-modeset itself, for the card the
 /// kernel asks it to, and the kernel asks when it would give its own cards
@@ -2240,6 +2275,11 @@ fn schedule_deferred_console_bringup(
             );
         }
 
+        // The GPUs left to udrv-nvidia are brought up where their driver is,
+        // through the cards it serves, and it serves them only once its
+        // other GPUs have their RM: seconds after init reached the session.
+        wait_for_served_gpus(reason).await;
+
         // Paint the kernel console over the compositor's VT while scanout is
         // paused (KD_GRAPHICS would otherwise suppress presentation). Restored
         // to whatever `console.overgraphics` left it at when the window closes.
@@ -2267,6 +2307,9 @@ fn schedule_deferred_console_bringup(
         // scanout is parked. From here on a first client racing us is harmless:
         // the bring-up is one-shot and the pause is already ours.
         if open_console_gsp {
+            // For this window: a driver's process is told with the bring-up's
+            // own request, not by what it reads when it starts.
+            linux_object::fs::devfs::served::card::console_gate_opened_for_its_window();
             kernel_hal::drivers::set_console_gsp_enabled(true);
             kernel_hal::klog_info!(
                 "Eclipse: {} — gate console-GSP abierto con el scanout ya pausado",

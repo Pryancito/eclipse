@@ -276,24 +276,43 @@ fn a_hello_that_does_not_parse_makes_no_card() {
 }
 
 /// `/proc/gpuready` waits for every NVIDIA GPU the boot leaves to
-/// `udrv-nvidia` until a card of a GPU is served for each.
+/// `udrv-nvidia` until a card of a GPU is served for each, and no longer
+/// than their time to be served: a driver that never serves holds no
+/// session for good.
 #[test]
 fn gpus_left_to_udrv_nvidia_are_waited_for_until_served() {
-    let ready = |left, served| -> alloc::vec::Vec<bool> {
-        left_to_userspace(left, served).map(|(up, _)| up).collect()
+    let ready = |left, served, overdue| -> alloc::vec::Vec<bool> {
+        left_to_userspace(left, served, overdue)
+            .map(|(up, _)| up)
+            .collect()
     };
-    assert_eq!(ready(2, 0), [false, false]);
-    assert_eq!(ready(2, 1), [true, false]);
-    assert_eq!(ready(2, 2), [true, true]);
-    assert!(ready(0, 0).is_empty());
-    let lines: alloc::vec::Vec<_> = left_to_userspace(2, 1).map(|(_, l)| l).collect();
+    assert_eq!(ready(2, 0, false), [false, false]);
+    assert_eq!(ready(2, 1, false), [true, false]);
+    assert_eq!(ready(2, 2, false), [true, true]);
+    assert!(ready(0, 0, false).is_empty());
+    assert_eq!(ready(2, 1, true), [true, true], "nothing more is coming");
+    let lines = |overdue| -> alloc::vec::Vec<_> {
+        left_to_userspace(2, 1, overdue).map(|(_, l)| l).collect()
+    };
     assert_eq!(
-        lines,
+        lines(false),
         [
             "nvidia@0: left to udrv-nvidia, served",
             "nvidia@1: left to udrv-nvidia, not served yet"
         ]
     );
+    assert_eq!(
+        lines(true),
+        [
+            "nvidia@0: left to udrv-nvidia, served",
+            "nvidia@1: left to udrv-nvidia, never served"
+        ]
+    );
+    // From the first time anything asked, not from the boot.
+    assert!(!overdue(5_000, 5_000));
+    assert!(!overdue(5_000, 5_000 + SERVE_PATIENCE_MS - 1));
+    assert!(overdue(5_000, 5_000 + SERVE_PATIENCE_MS));
+    assert!(!overdue(5_000, 1), "a clock read before the first asking");
 }
 
 /// The console bring-up's scanout pause outlasts a served card's patience,
@@ -596,4 +615,28 @@ fn behind_an_iommu_a_card_copies_only_its_own_vram_to_its_own_monitor() {
         "a card that would write another card's framebuffer"
     );
     assert!(!copy_offered(false, false, false));
+}
+
+/// A console GPU a process drives holds the session as the kernel's own
+/// does: while the boot's bring-up of it is still to come, and once up,
+/// until nvidia-modeset has been given it.
+#[test]
+fn a_console_gpu_of_a_process_is_waited_for_until_a_client_can_use_it() {
+    let line = "17:00.0 nvidia: rm=no gr=no";
+    let said = |more: &str| alloc::format!("{line}, in udrv-nvidia{more}");
+    // Its bring-up is still ahead: the session waits.
+    assert_eq!(waited_for(true, false, true, line), Some((false, said(""))));
+    // The bring-up is over and left it cold, or the boot scheduled none:
+    // nothing more is coming, and it holds nobody.
+    assert_eq!(waited_for(false, false, true, line), None);
+    assert_eq!(waited_for(false, false, false, line), None);
+    // It came up: ready, once nvidia-modeset has it on a boot that loads
+    // it, whether the bring-up has been declared over yet or not.
+    for coming in [true, false] {
+        assert_eq!(
+            waited_for(coming, true, false, line),
+            Some((false, said(", nvidia-modeset not loaded yet")))
+        );
+        assert_eq!(waited_for(coming, true, true, line), Some((true, said(""))));
+    }
 }

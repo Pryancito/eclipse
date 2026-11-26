@@ -20,6 +20,9 @@ struct Card {
     copied: lock::Mutex<Option<[u64; 6]>>,
     /// Its nvkms has more to say than an answer carries.
     wordy: core::sync::atomic::AtomicBool,
+    /// It scans out the console, and its GR ladder is built.
+    console: core::sync::atomic::AtomicBool,
+    ladder: core::sync::atomic::AtomicBool,
 }
 
 /// `DRM_IOCTL_NOUVEAU_EXEC`: `_IOWR('d', 0x52, struct drm_nouveau_exec)`.
@@ -64,6 +67,19 @@ impl DrmScheme for Card {
     }
     fn nouveau_uapi_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
+    }
+    fn is_console_gpu(&self) -> bool {
+        self.console.load(Ordering::Relaxed)
+    }
+    /// As the NVIDIA driver answers: nothing for a GPU that does not scan
+    /// out the console, and ready with its RM up and its ladder built.
+    fn console_gpu_ready(&self) -> Option<(bool, String)> {
+        let (rm, gr) = (
+            self.ready.load(Ordering::Relaxed),
+            self.ladder.load(Ordering::Relaxed),
+        );
+        self.is_console_gpu()
+            .then(|| (rm && gr, alloc::format!("the driver's own line {rm} {gr}")))
     }
     fn create_fb(&self, handle: u32, w: u32, h: u32, pitch: u32) -> Option<u32> {
         (pitch >= w * 4 && h > 0).then_some(1000 + handle)
@@ -397,6 +413,34 @@ fn the_remote_card_is_who_the_driver_says() {
         (b.has_3d, b.has_cursor, b.max_width, b.max_height)
     );
     assert_eq!(remote.pci_bdf(), Some((0, 1, 0, 0)));
+}
+
+#[test]
+fn a_console_gpu_says_when_a_client_can_use_it_without_being_asked() {
+    // A GPU that does not scan out the console has nothing to wait for.
+    let (_, remote) = pair();
+    assert_eq!(remote.console_gpu_ready(), None);
+
+    let card = Arc::new(Card::default());
+    card.console.store(true, Ordering::Relaxed);
+    let remote = Remote::new(Direct::new(card.clone())).expect("the card says who it is");
+    let cold = Some((false, String::from("01:00.0 card-for-test: rm=no gr=no")));
+    assert_eq!(remote.console_gpu_ready(), cold);
+    // Its RM comes up: nothing has said so yet, and asking is not a call.
+    card.ready.store(true, Ordering::Relaxed);
+    assert_eq!(remote.console_gpu_ready(), cold);
+    // The bring-up's own answer says it, and the GR ladder's the rest.
+    let _ = remote.deferred_console_bringup();
+    assert_eq!(
+        remote.console_gpu_ready(),
+        Some((false, String::from("01:00.0 card-for-test: rm=yes gr=no")))
+    );
+    card.ladder.store(true, Ordering::Relaxed);
+    let _ = remote.build_console_gr_ladder();
+    assert_eq!(
+        remote.console_gpu_ready(),
+        Some((true, String::from("01:00.0 card-for-test: rm=yes gr=yes")))
+    );
 }
 
 #[test]

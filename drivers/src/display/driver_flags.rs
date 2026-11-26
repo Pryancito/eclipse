@@ -25,7 +25,7 @@ const SWITCHES: [(u64, fn() -> bool, fn(bool)); 14] = [
         nouveau_uapi::set_requested,
     ),
     (
-        1 << 1,
+        CONSOLE_GSP,
         nouveau_uapi::console_gsp_enabled,
         nouveau_uapi::set_console_gsp_enabled,
     ),
@@ -69,6 +69,11 @@ const SWITCHES: [(u64, fn() -> bool, fn(bool)); 14] = [
 
 /// `nvidia.nouveau_uapi`: asked for, which a process's card takes as on.
 pub const NOUVEAU_UAPI: u64 = 1;
+
+/// The console-GSP gate (`nvidia.console_gsp`, or the deferred console
+/// bring-up for its window): a first GPU client may bring the console GPU
+/// up.
+pub const CONSOLE_GSP: u64 = 1 << 1;
 
 /// `nvidia.hwflip`: a flip is the GPU's copy engine copying the frame out
 /// of the memory the kernel holds it in.

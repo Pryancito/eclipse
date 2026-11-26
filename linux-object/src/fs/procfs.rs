@@ -3618,7 +3618,7 @@ fn proc_gpuready_content() -> String {
             .as_vec()
             .iter()
             .filter_map(|d| d.console_gpu_ready())
-            .chain(card::left_to_userspace(left, card::served_gpus())),
+            .chain(card::gpuready_lines(left)),
     )
 }
 

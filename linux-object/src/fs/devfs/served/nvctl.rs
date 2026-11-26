@@ -187,7 +187,7 @@ pub fn boot_display() -> [u8; BOOT_DISPLAY_LEN] {
 
 /// The most bytes of [`driver_flags`].
 pub use zcore_drivers::display::driver_flags::MAX as DRIVER_FLAGS_MAX;
-use zcore_drivers::display::driver_flags::{DriverFlags, HWFLIP};
+use zcore_drivers::display::driver_flags::{DriverFlags, CONSOLE_GSP, HWFLIP};
 
 /// `ECLIPSE_DRIVER_FLAGS`'s bytes: the boot line's `nvidia.*` switches as
 /// the kernel's NVIDIA driver was told them, for the same driver in a
@@ -196,22 +196,38 @@ pub fn driver_flags() -> alloc::vec::Vec<u8> {
     for_a_process(
         DriverFlags::this_boot(),
         !super::card::ce_presents_allowed(),
+        super::card::console_gate_is_the_windows(),
     )
     .encode()
 }
 
-/// Of the switches the kernel's driver was told, those a driver in a
-/// process is: all of them, but `nvidia.hwflip` when its GPUs are each
-/// behind an IOMMU domain of their own (`behind_an_iommu`). With that
-/// switch a flip is the GPU's copy engine copying the frame out of the
-/// kernel's memory, which is not in such a GPU's domain: the copy reads
-/// nothing and is said done, the kernel then leaves its own copy out, and
-/// no frame reaches the monitor. Without it the driver declines those
-/// flips and the kernel copies the frame, as it does for a card whose RM
-/// is not up.
-fn for_a_process(mut flags: DriverFlags, behind_an_iommu: bool) -> DriverFlags {
+/// Of the switches the kernel's driver has now, those a driver in a
+/// process is told when it starts: all of them, but two.
+///
+/// `nvidia.hwflip`, when its GPUs are each behind an IOMMU domain of their
+/// own (`behind_an_iommu`). With that switch a flip is the GPU's copy
+/// engine copying the frame out of the kernel's memory, which is not in
+/// such a GPU's domain: the copy reads nothing and is said done, the
+/// kernel then leaves its own copy out, and no frame reaches the monitor.
+/// Without it the driver declines those flips and the kernel copies the
+/// frame, as it does for a card whose RM is not up.
+///
+/// The console-GSP gate, when the boot's deferred bring-up opened it
+/// (`gate_is_the_windows`). That one is not the boot line's: it is open
+/// for a window, and the bring-up's own request carries it to the driver
+/// that is there then. A driver that starts afterwards and read it open
+/// would bring the console GPU up for its first client, with the scanout
+/// live and nothing held: what the window is there to prevent.
+fn for_a_process(
+    mut flags: DriverFlags,
+    behind_an_iommu: bool,
+    gate_is_the_windows: bool,
+) -> DriverFlags {
     if behind_an_iommu {
         flags.bits &= !HWFLIP;
+    }
+    if gate_is_the_windows {
+        flags.bits &= !CONSOLE_GSP;
     }
     flags
 }
@@ -221,18 +237,34 @@ mod tests {
     use super::*;
     use zcore_drivers::display::driver_flags::NOUVEAU_UAPI;
 
+    fn told() -> DriverFlags {
+        DriverFlags {
+            bits: NOUVEAU_UAPI | CONSOLE_GSP | HWFLIP | 1 << 5 | 1 << 12,
+            registry: alloc::string::String::from("RMKey=0x1;"),
+        }
+    }
+
     /// A GPU behind an IOMMU cannot read the kernel's frames, so its
     /// driver is not told to flip by copying them; every other switch is
     /// told as it is, and so is that one to a GPU that reaches all memory.
     #[test]
     fn a_driver_behind_an_iommu_is_not_told_to_flip_by_copying_the_kernels_frames() {
-        let told = DriverFlags {
-            bits: NOUVEAU_UAPI | HWFLIP | 1 << 5 | 1 << 12,
-            registry: alloc::string::String::from("RMKey=0x1;"),
-        };
-        let isolated = for_a_process(told.clone(), true);
-        assert_eq!(isolated.bits, NOUVEAU_UAPI | 1 << 5 | 1 << 12);
-        assert_eq!(isolated.registry, told.registry);
-        assert_eq!(for_a_process(told.clone(), false), told);
+        let isolated = for_a_process(told(), true, false);
+        assert_eq!(isolated.bits, told().bits & !HWFLIP);
+        assert_eq!(isolated.registry, told().registry);
+        assert_eq!(for_a_process(told(), false, false), told());
+    }
+
+    /// The gate the boot line opened (`nvidia.console_gsp`) is told as it
+    /// is. The one the deferred bring-up opened for its window is not: a
+    /// driver that starts after the window must not bring the console GPU
+    /// up by itself, at its first client.
+    #[test]
+    fn a_driver_is_not_told_the_gate_that_was_opened_for_the_bring_ups_window() {
+        let late = for_a_process(told(), false, true);
+        assert_eq!(late.bits, told().bits & !CONSOLE_GSP);
+        assert_eq!(late.registry, told().registry);
+        let both = for_a_process(told(), true, true);
+        assert_eq!(both.bits, told().bits & !(HWFLIP | CONSOLE_GSP));
     }
 }

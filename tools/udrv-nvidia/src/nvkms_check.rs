@@ -21,12 +21,17 @@
 //!   each at a place on the bus (`drm::check::Card`), one of which says it
 //!   scans out the console. The kernel asks that one for nvidia-modeset,
 //!   once, after the console's bring-up, logs what it answers, and asks for
-//!   its heads. The other is never asked.
+//!   its heads. The other is never asked. Meanwhile `/proc/gpuready` holds
+//!   the session (init starts it on "ready") from before the bring-up until
+//!   nvidia-modeset has been asked for: a session that started earlier was
+//!   running when the window opened, which the window cannot have.
 //! - `udrv-nvidia nvkms-check again`, after it: a driver that started
-//!   again serves the same GPU, and is not asked a second time in the boot.
+//!   again serves the same GPU, and is not asked a second time in the boot;
+//!   its console GPU, cold now, holds no session back.
 //! - On a boot with `udriver=nvidia@0:nvidia.nvkms` and no
 //!   `nvidia.console_gpu`, `udrv-nvidia nvkms-check never`: the card that
-//!   says it scans out the console is not asked at all.
+//!   says it scans out the console is not asked at all, and holds no
+//!   session back.
 use std::process::exit;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -94,7 +99,9 @@ pub fn nvkms_check(arg: Option<&str>) {
     }
     // What init's wait for the GPU reads, and what starts a console
     // bring-up that is waiting for a compositor.
-    let _ = std::fs::read_to_string("/proc/gpuready");
+    let gpuready = || std::fs::read_to_string("/proc/gpuready").unwrap_or_default();
+    let _ = gpuready();
+    let waiting = |report: &str| report.starts_with("gpuready: waiting");
     let loads = |card: &Card| card.nvkms_loads.load(Ordering::Relaxed);
     let after_nvkms = || {
         let phases = console.liveness.lock().unwrap();
@@ -113,17 +120,51 @@ pub fn nvkms_check(arg: Option<&str>) {
             "a driver that started again is not asked for nvidia-modeset twice in a boot",
             loads(&console) == 0 && after_nvkms() == 0,
         );
+        // Its console GPU is cold and no bring-up is coming: it holds no
+        // session, which starts on what there is.
+        ok(
+            "...and its cold console GPU holds no session back",
+            !waiting(&gpuready()),
+        );
     } else if never {
         until(NOT_ASKED_FOR, &|| loads(&console) != 0);
         ok(
             "on a boot that leaves the console GPU cold no card is asked for nvidia-modeset",
             loads(&console) == 0 && loads(&compute) == 0 && after_nvkms() == 0,
         );
+        ok(
+            "...and that GPU holds no session back",
+            !waiting(&gpuready()),
+        );
     } else {
+        // The session is init's to start when /proc/gpuready says ready:
+        // not while the console GPU of this driver is still to be brought
+        // up, nor before nvidia-modeset has it.
+        let held =
+            |report: &str| waiting(report) && report.lines().any(|l| l.contains("in udrv-nvidia"));
+        ok(
+            "the session is held back for the console GPU this driver is to bring up",
+            until(NOT_ASKED_FOR, &|| held(&gpuready())),
+        );
+        ok(
+            "...which the kernel asks it to, and for its GR ladder",
+            until(ASKED_WITHIN, &|| {
+                console.brought_up.load(Ordering::Relaxed) && console.ladder.load(Ordering::Relaxed)
+            }),
+        );
+        ok(
+            "...and it is still held then, until nvidia-modeset has been asked for",
+            held(&gpuready()) || loads(&console) == 1,
+        );
         ok(
             "the kernel asks the console card's driver to load nvidia-modeset",
             until(ASKED_WITHIN, &|| loads(&console) == 1),
         );
+        ok(
+            "...and the session may start: /proc/gpuready says ready",
+            until(NOT_ASKED_FOR, &|| gpuready().starts_with("gpuready: ready")),
+        );
+        print!("{}", gpuready());
         ok(
             "...and then what its heads say",
             until(ASKED_WITHIN, &|| after_nvkms() == 1),
