@@ -87,6 +87,29 @@ impl Transport for OverLink {
     }
 }
 
+/// The cards processes drive, in the order they were served. The kernel's
+/// own device list (`kernel_hal::drivers::all_drm`) does not have them, so
+/// whoever asks for every card asks here too (`drm::every_card`).
+static CARDS: lock::Mutex<Vec<Arc<dyn DrmScheme>>> = lock::Mutex::new(Vec::new());
+
+/// The cards processes drive now.
+pub fn served_cards() -> Vec<Arc<dyn DrmScheme>> {
+    CARDS.lock().clone()
+}
+
+/// `card` is one a process drives, from now on.
+pub(crate) fn note_served(card: &Arc<dyn DrmScheme>) {
+    let mut cards = CARDS.lock();
+    if !cards.iter().any(|c| Arc::ptr_eq(c, card)) {
+        cards.push(card.clone());
+    }
+}
+
+/// `card`'s process is gone.
+pub(crate) fn forget_served(card: &Arc<dyn DrmScheme>) {
+    CARDS.lock().retain(|c| !Arc::ptr_eq(c, card));
+}
+
 /// What [`serve_card`] made: the card, for whoever watches its server.
 /// The cards of a GPU (one a nouveau client can use) a process serves now:
 /// what `/proc/gpuready` waits for on a boot that leaves its NVIDIA GPUs to
@@ -142,6 +165,7 @@ impl ServedCard {
     /// answers no more.
     pub fn gone(&self) {
         self.link.close();
+        forget_served(&self.card);
         if self.card.nouveau_uapi_capable() {
             SERVED_GPUS.fetch_sub(1, Ordering::SeqCst);
         }
@@ -175,6 +199,7 @@ pub fn serve_card(
     super::remember(koid, &link);
     let card: Arc<dyn DrmScheme> = Arc::new(remote);
     enable_nouveau_uapi(&*card);
+    note_served(&card);
     if card.nouveau_uapi_capable() {
         SERVED_GPUS.fetch_add(1, Ordering::SeqCst);
     }
