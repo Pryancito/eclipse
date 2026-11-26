@@ -18,6 +18,8 @@ struct Card {
     told: lock::Mutex<Vec<(&'static str, u64)>>,
     /// The last copy-engine present it was asked for, as its arguments.
     copied: lock::Mutex<Option<[u64; 6]>>,
+    /// Its nvkms has more to say than an answer carries.
+    wordy: core::sync::atomic::AtomicBool,
 }
 
 /// `DRM_IOCTL_NOUVEAU_EXEC`: `_IOWR('d', 0x52, struct drm_nouveau_exec)`.
@@ -108,6 +110,20 @@ impl DrmScheme for Card {
     }
     fn build_console_gr_ladder(&self) -> String {
         String::from("console GPU 17:00.0: GR ladder built")
+    }
+    fn scanout_liveness(&self, phase: &str) -> String {
+        alloc::format!("[gpu-consola] {phase} head0 AWAKE ADVANCING\n")
+    }
+    /// What nvkms says of the card it took; `wordy`, more text than an
+    /// answer carries.
+    fn nvkms_load(&self) -> Vec<String> {
+        if self.wordy.load(Ordering::Relaxed) {
+            return vec!["x".repeat(1000); 40];
+        }
+        vec![
+            String::from("17:00.0: nvkms tiene el display (gpu id 0x1700)"),
+            String::from("17:00.0: modeset hecho: pantalla 0x1 en la cabeza 0"),
+        ]
     }
     fn ce_present_2d_pitched(
         &self,
@@ -777,7 +793,7 @@ fn a_present_reaches_the_driver_s_copy_engine() {
 
 #[test]
 fn the_console_gpu_of_a_process_is_brought_up_through_the_link() {
-    let (_card, remote) = pair();
+    let (card, remote) = pair();
     assert_eq!(
         remote.deferred_console_bringup(),
         "console GPU 17:00.0: RM up"
@@ -785,5 +801,52 @@ fn the_console_gpu_of_a_process_is_brought_up_through_the_link() {
     assert_eq!(
         remote.build_console_gr_ladder(),
         "console GPU 17:00.0: GR ladder built"
+    );
+    // What its heads say at a phase of the boot, for the log.
+    assert_eq!(
+        remote.scanout_liveness("post-nvkms"),
+        "[gpu-consola] post-nvkms head0 AWAKE ADVANCING\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        answer(&*card, op::SCANOUT_LIVENESS, 0, 0, &[0xff, 0xfe], &mut out),
+        Err(EINVAL),
+        "a phase that is no text"
+    );
+}
+
+/// `nvidia.nvkms` on a card whose driver is a process: nvidia-modeset is
+/// loaded there, and what it says of the card comes back line by line.
+#[test]
+fn nvkms_is_loaded_where_the_driver_is_and_its_lines_come_back() {
+    let (card, remote) = pair();
+    assert_eq!(
+        remote.nvkms_load(),
+        [
+            "17:00.0: nvkms tiene el display (gpu id 0x1700)",
+            "17:00.0: modeset hecho: pantalla 0x1 en la cabeza 0"
+        ]
+    );
+    // Its timers are the process's to run: the kernel is told of none.
+    assert_eq!(remote.nvkms_service(), None);
+    // More text than an answer carries: what fits, and that there was more.
+    card.wordy.store(true, Ordering::Relaxed);
+    let lines = remote.nvkms_load();
+    assert_eq!(lines.len(), 33);
+    assert!(lines[..32].iter().all(|l| l.len() == 1000));
+    assert_eq!(lines[32], "...");
+    // A driver that is gone says nothing: the log says that it did not.
+    let mut out = Vec::new();
+    answer(&*card, op::HELLO, 0, 0, &[], &mut out).unwrap();
+    struct Once(lock::Mutex<Option<Vec<u8>>>);
+    impl Transport for Once {
+        fn call(&self, _: u32, _: u64, _: u64, _: &[u8]) -> Result<(u64, Vec<u8>), i32> {
+            self.0.lock().take().map(|b| (0, b)).ok_or(ENODEV)
+        }
+    }
+    let gone = Remote::new(Once(lock::Mutex::new(Some(out)))).unwrap();
+    assert_eq!(
+        gone.nvkms_load(),
+        ["card-for-test: its driver's process did not load nvkms (errno 19)"]
     );
 }

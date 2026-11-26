@@ -5047,11 +5047,7 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
         // The display-engine plane (if it owned the pointer) must actually
         // switch off, or the last image stays composited by hardware forever.
         if was_hw {
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.hw_cursor_hide() {
-                    break;
-                }
-            }
+            cursor_plane(|d| d.hw_cursor_hide());
         }
         return was_visible;
     }
@@ -5114,17 +5110,16 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     if hw_cursor_wanted() {
         let (cx, cy, bmp) = (state.cursor.x, state.cursor.y, state.cursor.bitmap.clone());
         drop(state);
-        let mut hw_ok = false;
-        if let Some(bmp) = bmp {
-            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-                if d.hw_cursor_set(&bmp, w, h) {
+        let hw_ok = bmp.is_some_and(|bmp| {
+            cursor_plane(|d| {
+                let took = d.hw_cursor_set(&bmp, w, h);
+                if took {
                     // Land the plane on the pointer's current position.
                     let _ = d.hw_cursor_move(cx, cy);
-                    hw_ok = true;
-                    break;
                 }
-            }
-        }
+                took
+            })
+        });
         let mut state = DRM_STATE.lock();
         state.cursor.hw = hw_ok;
         if hw_ok {
@@ -5182,11 +5177,7 @@ pub fn move_cursor(x: i32, y: i32) {
     };
     // Hardware plane: one PIO write in the driver, outside the DRM lock.
     if hw {
-        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-            if d.hw_cursor_move(x, y) {
-                break;
-            }
-        }
+        cursor_plane(|d| d.hw_cursor_move(x, y));
     }
 }
 
@@ -5264,9 +5255,9 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
     true
 }
 
-mod cursor_blit;
+pub(crate) mod cursor_blit;
 pub(crate) mod fb_handle;
-use cursor_blit::{blit_cursor_patch, repaint_cursor_from_panel};
+use cursor_blit::{blit_cursor_patch, cursor_plane, repaint_cursor_from_panel};
 
 /// Make a cursor set/move take effect immediately (the legacy cursor ioctls
 /// carry no page-flip of their own) WITHOUT re-blitting the whole frame.
@@ -6823,7 +6814,9 @@ pub fn present_now_checked(
     // of the NVIDIA driver's `page_flip` has no `drives_boot_display()` guard
     // of its own, so this is the only thing standing between `nvidia.hwflip`
     // and a copy-engine blit submitted on the wrong card.
-    let hw = get_display_driver().and_then(|driver| {
+    // And not a card a process drives before nvidia-modeset has taken it.
+    let offered = get_display_driver().filter(crate::fs::devfs::served::card::flip_offered);
+    let hw = offered.and_then(|driver| {
         let driver_fb_id = DRM_STATE
             .lock()
             .framebuffers

@@ -1683,7 +1683,12 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // console card, as nvidia-drm's is; until then, and on any
                 // failure, the software cursor stays in charge.
                 linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
-                schedule_nvkms();
+                schedule_nvkms(served_consoles_for_nvkms(
+                    want_console_gpu,
+                    kernel_hal::drivers::user::nvidia_left(),
+                    kernel_hal::cmdline::value(&options.cmdline, "udriver")
+                        .is_some_and(|left| left.split(',').any(|d| d.starts_with("nvidia@"))),
+                ));
                 // Linux's output poll, for the monitors of every card: no
                 // driver here detects its connectors again but nvkms's, so
                 // without `nvidia.nvkms` it would only ever find nothing.
@@ -1989,7 +1994,8 @@ fn auto_bringup_compute_gpus() -> bool {
 /// the unpause, which is where it stopped.
 #[cfg(feature = "linux")]
 fn log_scanout_liveness(phase: &str) {
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+    // The cards a process serves too: its console GPU's heads are read there.
+    for d in linux_object::fs::devfs::drm::every_card().iter() {
         for line in d.scanout_liveness(phase).lines() {
             kernel_hal::klog_info!("{}", line);
         }
@@ -2028,9 +2034,18 @@ fn log_scanout_liveness(phase: &str) {
 /// the boot -- Linux runs those from nvidia-modeset's kthread. The console
 /// card is RM-attached only after the deferred bring-up above, so this waits
 /// for it when one was scheduled; the other cards have theirs since boot.
+///
+/// `served_consoles`: how many console GPUs a process is going to be asked
+/// to load it for ([`served_consoles_for_nvkms`]).
 #[cfg(feature = "linux")]
-fn schedule_nvkms() {
+fn schedule_nvkms(served_consoles: usize) {
     klog_info!("Eclipse: nvidia.nvkms — nvkms se carga cuando las GPUs tengan el RM");
+    // A console GPU left to udrv-nvidia is no card of the kernel's, and
+    // comes when that process serves it: a task of its own asks for it.
+    if served_consoles > 0 {
+        linux_object::fs::devfs::served::card::expect_nvkms();
+        kernel_hal::thread::spawn(nvkms_for_served_cards(served_consoles));
+    }
     kernel_hal::thread::spawn(async move {
         use core::time::Duration;
         use kernel_hal::timer::timer_now;
@@ -2063,6 +2078,77 @@ fn schedule_nvkms() {
             kernel_hal::thread::sleep_until(timer_now() + wait).await;
         }
     });
+}
+
+/// How many console GPUs a process (udrv-nvidia, `udriver=nvidia@N`) is
+/// going to be asked to load nvidia-modeset for.
+///
+/// None on a boot that leaves the console GPU cold (`want_console_gpu` is
+/// not set): that boot loads no nvidia-modeset in the process, for any of
+/// its GPUs. It is the boot a machine falls back to while the console GPU's
+/// bring-up in the process is not confirmed on hardware, and it is to stay
+/// as it is.
+///
+/// On a boot that brings it up: the GPUs left to the process that show the
+/// boot framebuffer, the second of `left`'s counts (`user::nvidia_left`),
+/// and one at least. Which card scans out the console is its driver's to
+/// say when it serves it, and the one that says so is asked even where the
+/// boot framebuffer was found in no BAR here.
+///
+/// `udrv_nvidia_asked`: the boot line leaves an NVIDIA GPU to userspace. On
+/// a machine with no such GPU (a test's) the card that driver serves as the
+/// console's is still asked.
+#[cfg(any(feature = "linux", test))]
+fn served_consoles_for_nvkms(
+    want_console_gpu: bool,
+    left: (usize, usize),
+    udrv_nvidia_asked: bool,
+) -> usize {
+    let (gpus, scanning) = left;
+    if !want_console_gpu || (gpus == 0 && !udrv_nvidia_asked) {
+        return 0;
+    }
+    scanning.max(1)
+}
+
+/// `nvidia.nvkms` for the console GPU a process drives (`udriver=nvidia@N`,
+/// udrv-nvidia). That process loads nvidia-modeset itself, for the card the
+/// kernel asks it to, and the kernel asks when it would give its own cards
+/// to it: once the console GPU's deferred bring-up is over. Its timers run
+/// in the process.
+///
+/// On the card that scans out the console this load is the modeset that
+/// puts the console back on the monitor: the GPU's state load hands the
+/// display to the RM and programs no mode. Nothing asked the process for
+/// it, so a console GPU brought up there left the monitor black, with
+/// signal, where the kernel's driver showed the desktop.
+///
+/// Over once `consoles` GPUs have been asked: a GPU whose driver never
+/// serves its card keeps this looking, twice a second. It waits for the
+/// bring-up however long that takes, where the kernel's own cards are given
+/// to nvidia-modeset after three minutes whatever happened: the bring-up
+/// always ends (its waits are bounded, the driver's answer by the link's
+/// patience), and a load asked before it would only wait behind it on the
+/// card's one thread.
+#[cfg(feature = "linux")]
+async fn nvkms_for_served_cards(consoles: usize) {
+    use core::time::Duration;
+    use kernel_hal::timer::timer_now;
+    use linux_object::fs::devfs::served::card;
+
+    while card::nvkms_asked() < consoles {
+        if !linux_object::fs::devfs::drm::console_bringup_unfinished() {
+            let lines = card::nvkms_load_due();
+            for line in lines.iter() {
+                kernel_hal::klog_info!("Eclipse: [nvkms] {}", line);
+            }
+            // Whether the console's raster runs again after the modeset.
+            if !lines.is_empty() {
+                log_scanout_liveness("post-nvkms");
+            }
+        }
+        kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
+    }
 }
 
 #[cfg(feature = "linux")]
@@ -2298,10 +2384,33 @@ fn secondary_main() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{deadlock_spins, multigpu_verdict, scanout_gpu_bringup_asked, MultiGpu};
+    use super::{
+        deadlock_spins, multigpu_verdict, scanout_gpu_bringup_asked, served_consoles_for_nvkms,
+        MultiGpu,
+    };
 
     /// The line a live Eclipse boots with, which mentions no threshold.
     const REAL: &str = "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2";
+
+    /// nvidia-modeset is loaded in udrv-nvidia only for the console GPU, on
+    /// a boot that brings it up. The boot that leaves it cold asks no card
+    /// of that process, however many GPUs it was left: it is the one that
+    /// works today, and must go on as it does.
+    #[test]
+    fn nvkms_is_asked_of_a_process_only_for_the_console_gpu_a_boot_brings_up() {
+        // Two GPUs left, one with the boot framebuffer (2x RTX 2060).
+        let left = (2, 1);
+        assert_eq!(served_consoles_for_nvkms(false, left, true), 0);
+        assert_eq!(served_consoles_for_nvkms(true, left, true), 1);
+        // The framebuffer found in no BAR of theirs: the card that says it
+        // scans out the console is still asked.
+        assert_eq!(served_consoles_for_nvkms(true, (2, 0), true), 1);
+        // No GPU left to a process, and none asked for: nothing to wait for.
+        assert_eq!(served_consoles_for_nvkms(true, (0, 0), false), 0);
+        // A test's boot: the driver is asked for on a machine with no GPU.
+        assert_eq!(served_consoles_for_nvkms(true, (0, 0), true), 1);
+        assert_eq!(served_consoles_for_nvkms(false, (0, 0), true), 0);
+    }
 
     #[test]
     fn the_count_written_is_the_count_asked_for() {

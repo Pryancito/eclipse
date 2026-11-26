@@ -95,9 +95,10 @@ impl ServedRm {
         !self.link.is_dead()
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: Kill) {
-        self.link.killed_with(kill);
+    /// The process that serves the RM (`server`, its id), and how it is
+    /// ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: Kill) {
+        self.link.killed_with(server, kill);
     }
 
     /// The server is gone, and its RM: the device files find none again.
@@ -186,10 +187,52 @@ pub fn boot_display() -> [u8; BOOT_DISPLAY_LEN] {
 
 /// The most bytes of [`driver_flags`].
 pub use zcore_drivers::display::driver_flags::MAX as DRIVER_FLAGS_MAX;
+use zcore_drivers::display::driver_flags::{DriverFlags, HWFLIP};
 
 /// `ECLIPSE_DRIVER_FLAGS`'s bytes: the boot line's `nvidia.*` switches as
 /// the kernel's NVIDIA driver was told them, for the same driver in a
-/// process.
+/// process ([`for_a_process`]).
 pub fn driver_flags() -> alloc::vec::Vec<u8> {
-    zcore_drivers::display::driver_flags::DriverFlags::this_boot().encode()
+    for_a_process(
+        DriverFlags::this_boot(),
+        !super::card::ce_presents_allowed(),
+    )
+    .encode()
+}
+
+/// Of the switches the kernel's driver was told, those a driver in a
+/// process is: all of them, but `nvidia.hwflip` when its GPUs are each
+/// behind an IOMMU domain of their own (`behind_an_iommu`). With that
+/// switch a flip is the GPU's copy engine copying the frame out of the
+/// kernel's memory, which is not in such a GPU's domain: the copy reads
+/// nothing and is said done, the kernel then leaves its own copy out, and
+/// no frame reaches the monitor. Without it the driver declines those
+/// flips and the kernel copies the frame, as it does for a card whose RM
+/// is not up.
+fn for_a_process(mut flags: DriverFlags, behind_an_iommu: bool) -> DriverFlags {
+    if behind_an_iommu {
+        flags.bits &= !HWFLIP;
+    }
+    flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcore_drivers::display::driver_flags::NOUVEAU_UAPI;
+
+    /// A GPU behind an IOMMU cannot read the kernel's frames, so its
+    /// driver is not told to flip by copying them; every other switch is
+    /// told as it is, and so is that one to a GPU that reaches all memory.
+    #[test]
+    fn a_driver_behind_an_iommu_is_not_told_to_flip_by_copying_the_kernels_frames() {
+        let told = DriverFlags {
+            bits: NOUVEAU_UAPI | HWFLIP | 1 << 5 | 1 << 12,
+            registry: alloc::string::String::from("RMKey=0x1;"),
+        };
+        let isolated = for_a_process(told.clone(), true);
+        assert_eq!(isolated.bits, NOUVEAU_UAPI | 1 << 5 | 1 << 12);
+        assert_eq!(isolated.registry, told.registry);
+        assert_eq!(for_a_process(told.clone(), false), told);
+    }
 }

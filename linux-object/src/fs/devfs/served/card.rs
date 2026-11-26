@@ -76,13 +76,18 @@ impl Transport for OverLink {
     fn call(&self, op: u32, a: u64, b: u64, data: &[u8]) -> Result<(u64, Vec<u8>), i32> {
         // A console GPU's bring-up boots its GSP firmware, which takes longer
         // than the link waits before it calls the driver hung: killing the
-        // driver halfway through that boot left the monitor black.
-        if matches!(
+        // driver halfway through that boot left the monitor black. So does
+        // nvidia-modeset's load, with its first modeset. The patience is for
+        // every link of the driver, and for as long as this request waits:
+        // what its other threads are asked meanwhile waits for the RM this
+        // request holds.
+        let _long = matches!(
             op,
-            drm_remote::op::CONSOLE_BRINGUP | drm_remote::op::CONSOLE_GR_LADDER
-        ) {
-            self.0.be_patient_for(BRINGUP_PATIENCE_MS);
-        }
+            drm_remote::op::CONSOLE_BRINGUP
+                | drm_remote::op::CONSOLE_GR_LADDER
+                | drm_remote::op::NVKMS_LOAD
+        )
+        .then(|| super::long_request(&self.0, BRINGUP_PATIENCE_MS));
         // The message's `len` is the bytes it carries; the answer has the
         // whole slot.
         match self.0.call(op, 0, 0, a, b, data) {
@@ -127,11 +132,26 @@ impl Transport for OverLink {
 /// The cards processes drive, in the order they were served. The kernel's
 /// own device list (`kernel_hal::drivers::all_drm`) does not have them, so
 /// whoever asks for every card asks here too (`drm::every_card`).
-static CARDS: lock::Mutex<Vec<Arc<dyn DrmScheme>>> = lock::Mutex::new(Vec::new());
+static CARDS: lock::Mutex<Vec<Driven>> = lock::Mutex::new(Vec::new());
+
+/// One of [`CARDS`]: the card, and the link its driver answers on (a card a
+/// test put there has none).
+#[derive(Clone)]
+struct Driven {
+    card: Arc<dyn DrmScheme>,
+    link: Option<Arc<Link>>,
+}
+
+impl Driven {
+    /// Whether its driver is still at the other end of the link.
+    fn answers(&self) -> bool {
+        self.link.as_ref().is_none_or(|link| !link.is_dead())
+    }
+}
 
 /// The cards processes drive now.
 pub fn served_cards() -> Vec<Arc<dyn DrmScheme>> {
-    CARDS.lock().clone()
+    CARDS.lock().iter().map(|s| s.card.clone()).collect()
 }
 
 /// The most cards [`served_snapshot`] holds.
@@ -172,23 +192,168 @@ pub fn ce_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
 /// which runs every frame and must not allocate.
 pub fn served_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
     let mut snapshot: [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] = Default::default();
-    for (slot, card) in snapshot.iter_mut().zip(CARDS.lock().iter()) {
-        *slot = Some(card.clone());
+    for (slot, served) in snapshot.iter_mut().zip(CARDS.lock().iter()) {
+        *slot = Some(served.card.clone());
     }
     snapshot
 }
 
-/// `card` is one a process drives, from now on.
+/// A GPU's place on the bus (`DrmScheme::pci_bdf`).
+type Place = (u32, u8, u8, u8);
+
+/// What the boot keeps of nvidia-modeset and the console GPU a process
+/// drives.
+struct Nvkms {
+    /// The boot gives that GPU to nvidia-modeset ([`expect_nvkms`]).
+    expected: bool,
+    /// The GPUs whose driver was asked to load it ([`nvkms_load_due`]).
+    asked: Vec<Place>,
+    /// Those whose driver answered.
+    answered: Vec<Place>,
+}
+
+static NVKMS: lock::Mutex<Nvkms> = lock::Mutex::new(Nvkms {
+    expected: false,
+    asked: Vec::new(),
+    answered: Vec::new(),
+});
+
+/// The boot is going to ask the driver of the GPU that scans out the
+/// console, one a process drives, to load nvidia-modeset
+/// ([`nvkms_load_due`]): `nvidia.nvkms` on a boot that brings that GPU up.
+/// Until its driver has answered, that card is offered no frame to flip to
+/// ([`flip_offered`]).
+pub fn expect_nvkms() {
+    NVKMS.lock().expected = true;
+}
+
+/// `nvidia.nvkms` for the console GPU of a process: ask the driver of each
+/// served card that scans out the console, and was not asked yet, to load
+/// nvidia-modeset and take the card, and say what each answered. The boot
+/// gives the kernel's own cards to nvidia-modeset out of the kernel's
+/// device list; these are not in it, and come when their process serves
+/// them.
+///
+/// Only the card with the console: there this load is the modeset that
+/// puts the console back on the monitor after the GPU's bring-up. The other
+/// GPUs of a process stay as they are on a boot that brings no console GPU
+/// up, where nvidia-modeset is not loaded in the process at all.
+///
+/// Once a boot for each GPU, whatever became of it: a driver that started
+/// again serves the same GPUs, and a load that killed it would kill each
+/// new one in turn.
+pub fn nvkms_load_due() -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some((served, place)) = next_due() {
+        // With no lock held: a call to the driver, of seconds.
+        lines.extend(served.card.nvkms_load());
+        // An answer is a driver's that is still there. One the load killed
+        // answered nothing, and the card that comes after it at this place
+        // is offered neither the pointer nor a frame.
+        if served.answers() {
+            NVKMS.lock().answered.push(place);
+        }
+    }
+    lines
+}
+
+/// The next card [`nvkms_load_due`] asks, its place marked asked. One at a
+/// time, each marked when its own turn comes: a card whose driver died of
+/// an earlier card's load is left for the driver that starts again.
+fn next_due() -> Option<(Driven, Place)> {
+    // Dropped after the guard below: one of these may be a card's last
+    // reference, which is not for dropping under a lock.
+    let cards = CARDS.lock().clone();
+    let mut nvkms = NVKMS.lock();
+    let (served, place) = due(&cards, &nvkms.asked)?;
+    nvkms.asked.push(place);
+    drop(nvkms);
+    Some((served.clone(), place))
+}
+
+/// Of `cards`, the first that scans out the console, whose driver is
+/// there, at a place not in `asked`. A card with no place on the bus is no
+/// GPU's.
+fn due<'a>(cards: &'a [Driven], asked: &[Place]) -> Option<(&'a Driven, Place)> {
+    cards.iter().find_map(|served| {
+        let place = served.card.pci_bdf()?;
+        let due = served.card.is_console_gpu() && served.answers() && !asked.contains(&place);
+        due.then_some((served, place))
+    })
+}
+
+/// How many GPUs [`nvkms_load_due`] has asked for.
+pub fn nvkms_asked() -> usize {
+    NVKMS.lock().asked.len()
+}
+
+/// Whether the cursor plane of `card`, one a process drives, may be
+/// offered the pointer: once its driver has answered nvidia-modeset's load
+/// ([`nvkms_load_due`]), whatever it answered. The plane is
+/// nvidia-modeset's then, and the only pointer there is on a card it flips
+/// to the compositor's own buffers.
+///
+/// Not before: a GPU whose RM is up and that nvidia-modeset has not taken
+/// yet brings up its own cursor channel when it is handed a pointer, on
+/// the display's one core channel, and nvidia-modeset then refuses the
+/// card: no console modeset, and the monitor stays black. And never on a
+/// boot that asks for no load, where the kernel draws the pointer of a
+/// served card, as it always has.
+pub fn cursor_plane_offered(card: &dyn DrmScheme) -> bool {
+    card.pci_bdf()
+        .is_some_and(|place| NVKMS.lock().answered.contains(&place))
+}
+
+/// Whether `card` may be offered a frame to flip to
+/// (`DrmScheme::page_flip`): any card but the one nvidia-modeset is still
+/// to take ([`awaited`]). Handed a frame, a GPU whose RM is up brings up a
+/// window channel of its own on the display's one core channel, and
+/// nvidia-modeset then refuses the card. Until its driver has answered
+/// the load, the kernel copies that card's frames itself.
+pub fn flip_offered(card: &Arc<dyn DrmScheme>) -> bool {
+    let served = CARDS.lock().iter().any(|s| Arc::ptr_eq(&s.card, card));
+    if !served {
+        return true;
+    }
+    let nvkms = NVKMS.lock();
+    !awaited(
+        nvkms.expected,
+        card.is_console_gpu(),
+        card.pci_bdf(),
+        &nvkms.answered,
+    )
+}
+
+/// Whether nvidia-modeset is still to take a served card: on a boot that
+/// gives the console GPU of a process to it (`expected`), the card that
+/// scans out the console (`console`), until the driver of the GPU at its
+/// `place` has answered the load.
+fn awaited(expected: bool, console: bool, place: Option<Place>, answered: &[Place]) -> bool {
+    expected && console && !place.is_some_and(|place| answered.contains(&place))
+}
+
+/// `card` is one a process drives, from now on: a test's, with no driver
+/// at the other end of anything.
+#[cfg(test)]
 pub(crate) fn note_served(card: &Arc<dyn DrmScheme>) {
+    note_served_over(card, None);
+}
+
+/// `card` is one a process drives, from now on, its driver answering on
+/// `link`.
+fn note_served_over(card: &Arc<dyn DrmScheme>, link: Option<Arc<Link>>) {
     let mut cards = CARDS.lock();
-    if !cards.iter().any(|c| Arc::ptr_eq(c, card)) {
-        cards.push(card.clone());
+    if !cards.iter().any(|s| Arc::ptr_eq(&s.card, card)) {
+        cards.push(Driven {
+            card: card.clone(),
+            link,
+        });
     }
 }
 
 /// `card`'s process is gone.
 pub(crate) fn forget_served(card: &Arc<dyn DrmScheme>) {
-    CARDS.lock().retain(|c| !Arc::ptr_eq(c, card));
+    CARDS.lock().retain(|s| !Arc::ptr_eq(&s.card, card));
 }
 
 /// What [`serve_card`] made: the card, for whoever watches its server.
@@ -237,9 +402,10 @@ impl ServedCard {
         !self.link.is_dead()
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: Kill) {
-        self.link.killed_with(kill);
+    /// The process that drives the card (`server`, its id), and how it is
+    /// ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: Kill) {
+        self.link.killed_with(server, kill);
     }
 
     /// The server is gone: the card leaves the DRM core, and its node
@@ -250,7 +416,15 @@ impl ServedCard {
         if self.card.nouveau_uapi_capable() {
             SERVED_GPUS.fetch_sub(1, Ordering::SeqCst);
         }
+        // The pointer this card's cursor plane had is the kernel's to draw
+        // again: nothing else says so before the compositor next sets an
+        // image.
+        let had_the_monitor =
+            drm::get_display_driver().is_some_and(|panel| Arc::ptr_eq(&panel, &self.card));
         drm::unregister_driver(&self.card);
+        if had_the_monitor {
+            drm::cursor_blit::pointer_plane_lost();
+        }
         drm::build_gpu_nodes();
         info!("served drm: the card {} is gone", self.card.name());
     }
@@ -280,7 +454,7 @@ pub fn serve_card(
     super::remember(koid, &link);
     let card: Arc<dyn DrmScheme> = Arc::new(remote);
     enable_nouveau_uapi(&*card);
-    note_served(&card);
+    note_served_over(&card, Some(link.clone()));
     if card.nouveau_uapi_capable() {
         SERVED_GPUS.fetch_add(1, Ordering::SeqCst);
     }

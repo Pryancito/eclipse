@@ -214,9 +214,10 @@ impl ServedNode {
         !self.0.link.is_dead()
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
-        self.0.link.killed_with(kill);
+    /// The process that serves the node (`server`, its id), and how it is
+    /// ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
+        self.0.link.killed_with(server, kill);
     }
 
     /// Where the VMOs the server answers an `mmap` with are found.
@@ -773,6 +774,82 @@ fn remember(koid: u64, link: &Arc<Link>) {
     // The links of servers that are gone go as new ones come.
     links.retain(|_, l| l.strong_count() > 0);
     links.insert(koid, Arc::downgrade(link));
+}
+
+/// The requests known to take long that are waiting now ([`long_request`]):
+/// each with the link it was asked on, and until when (`link::now_ms`) its
+/// silence is no hang.
+static LONG_REQUESTS: Mutex<Vec<(u64, Arc<Link>, u64)>> = Mutex::new(Vec::new());
+
+/// A request known to take long, waiting on a link until this is dropped.
+struct LongRequest {
+    id: u64,
+    link: Arc<Link>,
+}
+
+/// A request that may take `ms` is about to be asked on `link` (a GPU's
+/// firmware boot, nvidia-modeset's first modeset). While it waits, and no
+/// longer than `ms`, silence is not a hang on any link its server answers.
+///
+/// Such a request holds the driver's RM for as long, and what the driver's
+/// other threads were asked meanwhile, on the links of its other cards and
+/// of `/dev/nvidiactl`, waits for the RM unanswered. Each link counts its
+/// own silence: ten seconds of that on any of them had the driver killed
+/// halfway through the boot of the console GPU, which leaves its monitor
+/// black for the rest of the boot.
+///
+/// The patience is the request's, and ends with it: when what this returns
+/// is dropped, every link of the server counts its silence from then, and
+/// a driver that hangs afterwards is found as soon as any other.
+fn long_request(link: &Arc<Link>, ms: u64) -> LongRequest {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let until = link::now_ms().saturating_add(ms);
+    LONG_REQUESTS.lock().push((id, link.clone(), until));
+    LongRequest {
+        id,
+        link: link.clone(),
+    }
+}
+
+impl Drop for LongRequest {
+    fn drop(&mut self) {
+        // Before the request stops waiting, so that no link finds neither
+        // the request nor the time it ended: the server was busy until now,
+        // not silent.
+        self.link.heard_now();
+        let server = self.link.server();
+        if server != 0 {
+            // Looked at outside the lock: one of these may be a link's last
+            // reference.
+            let links: Vec<Arc<Link>> = LINKS.lock().values().filter_map(Weak::upgrade).collect();
+            for other in links.iter().filter(|other| other.server() == server) {
+                other.heard_now();
+            }
+        }
+        let over = {
+            let mut waiting = LONG_REQUESTS.lock();
+            let at = waiting.iter().position(|(id, ..)| *id == self.id);
+            at.map(|at| waiting.swap_remove(at))
+        };
+        // Outside the lock, for the same reason.
+        drop(over);
+    }
+}
+
+/// Whether a request known to take long is waiting at `now`
+/// ([`long_request`]), on `link` or on another link of its server: the
+/// silence is that request's.
+///
+/// Each link's server is read now, not when the request was asked: a link
+/// is covered from the moment its server is said, whenever it was made.
+fn long_request_waits(link: &Link, now: u64) -> bool {
+    let server = link.server();
+    LONG_REQUESTS.lock().iter().any(|(_, asked, until)| {
+        now < *until
+            && (core::ptr::eq(Arc::as_ptr(asked), link)
+                || (server != 0 && asked.server() == server))
+    })
 }
 
 /// The address space of the program whose `ioctl` is request `reqid` of

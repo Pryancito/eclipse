@@ -40,7 +40,7 @@ const SWITCHES: [(u64, fn() -> bool, fn(bool)); 14] = [
         nouveau_uapi::set_scanout_gpu_bringup,
     ),
     (
-        1 << 4,
+        HWFLIP,
         nouveau_uapi::hwflip_enabled,
         nouveau_uapi::set_hwflip_enabled,
     ),
@@ -69,6 +69,10 @@ const SWITCHES: [(u64, fn() -> bool, fn(bool)); 14] = [
 
 /// `nvidia.nouveau_uapi`: asked for, which a process's card takes as on.
 pub const NOUVEAU_UAPI: u64 = 1;
+
+/// `nvidia.hwflip`: a flip is the GPU's copy engine copying the frame out
+/// of the memory the kernel holds it in.
+pub const HWFLIP: u64 = 1 << 4;
 
 /// The longest registry text carried.
 pub const REGISTRY_MAX: usize = 4096;
