@@ -106,12 +106,15 @@ pub(super) fn drm_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         _ => ZxError::INVALID_ARGS,
     })?;
     let pid = proc.id() as usize;
-    card.killed_with(alloc::boxed::Box::new(move || {
-        let kill = linux_object::signal::Signal::SIGKILL;
-        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
-            warn!("served drm: the hung server {pid} was not killed: {e:?}");
-        }
-    }));
+    card.killed_with(
+        proc.id(),
+        alloc::boxed::Box::new(move || {
+            let kill = linux_object::signal::Signal::SIGKILL;
+            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                warn!("served drm: the hung server {pid} was not killed: {e:?}");
+            }
+        }),
+    );
     // Its going is read here, as a served node's is.
     kernel_hal::thread::spawn(async move {
         let wire: Arc<dyn KernelObject> = fifo;
@@ -193,12 +196,15 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         },
     )?;
     let pid = proc.id() as usize;
-    rm.killed_with(alloc::boxed::Box::new(move || {
-        let kill = linux_object::signal::Signal::SIGKILL;
-        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
-            warn!("[nvidiactl] the hung RM server {pid} was not killed: {e:?}");
-        }
-    }));
+    rm.killed_with(
+        proc.id(),
+        alloc::boxed::Box::new(move || {
+            let kill = linux_object::signal::Signal::SIGKILL;
+            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                warn!("[nvidiactl] the hung RM server {pid} was not killed: {e:?}");
+            }
+        }),
+    );
     kernel_hal::thread::spawn(async move {
         let wire: Arc<dyn KernelObject> = fifo;
         loop {
@@ -405,12 +411,15 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     // A server that stops answering is killed, by its pid, which is its
     // own for as long as it holds the other end of the FIFO.
     let pid = proc.id() as usize;
-    node.killed_with(alloc::boxed::Box::new(move || {
-        let kill = linux_object::signal::Signal::SIGKILL;
-        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
-            warn!("served dev: the hung server {pid} was not killed: {e:?}");
-        }
-    }));
+    node.killed_with(
+        proc.id(),
+        alloc::boxed::Box::new(move || {
+            let kill = linux_object::signal::Signal::SIGKILL;
+            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                warn!("served dev: the hung server {pid} was not killed: {e:?}");
+            }
+        }),
+    );
     // What the server says while nobody asks it anything -- an open became
     // readable -- and its going are read here.
     kernel_hal::thread::spawn(async move {

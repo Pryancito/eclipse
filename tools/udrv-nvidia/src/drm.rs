@@ -14,6 +14,9 @@ pub fn serve(card: Arc<dyn DrmScheme>) -> Result<String, String> {
     let node = Node::serve_drm(&drm_remote::hello(&*card))?;
     let why = node.run_with(&Mutex::new(()), |_, node, req| {
         let answer = reply(&*card, node, req);
+        if req.op == drm_remote::op::NVKMS_LOAD {
+            nvkms_timers(&card);
+        }
         // A file closing, a process gone: told, and answered by nothing.
         (req.reqid != NO_REPLY).then_some(answer)
     });
@@ -23,6 +26,39 @@ pub fn serve(card: Arc<dyn DrmScheme>) -> Result<String, String> {
 /// The `reqid` of a message the kernel waits on no answer for
 /// (`served::link::NO_REPLY`).
 const NO_REPLY: u32 = u32::MAX;
+
+/// The cards nvidia-modeset was asked to take (`drm_remote::op::NVKMS_LOAD`).
+static NVKMS_CARDS: Mutex<Vec<Arc<dyn DrmScheme>>> = Mutex::new(Vec::new());
+
+/// Between two looks at nvidia-modeset's timers: no less, so a timer due at
+/// once does not spin a thread; no more, for a timer a later call queues
+/// while the thread sleeps, since nothing wakes it.
+const TIMERS_EVERY: std::ops::RangeInclusive<u64> = 1_000..=100_000;
+
+/// Run nvidia-modeset's timers from now on, on a thread of their own: Linux
+/// runs them from nvidia-modeset's kthread, and the kernel's driver from
+/// the task that loaded it. They are one queue for every card, so one
+/// thread, started by the first card asked; a card nvidia-modeset did not
+/// take runs none (`nvkms_service` is `None`), and the next is asked.
+fn nvkms_timers(card: &Arc<dyn DrmScheme>) {
+    let mut cards = NVKMS_CARDS.lock().unwrap();
+    let first = cards.is_empty();
+    if !cards.iter().any(|c| Arc::ptr_eq(c, card)) {
+        cards.push(card.clone());
+    }
+    drop(cards);
+    if !first {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        let cards = NVKMS_CARDS.lock().unwrap().clone();
+        let next = cards.iter().filter_map(|card| card.nvkms_service()).min();
+        let wait = next
+            .unwrap_or(*TIMERS_EVERY.end())
+            .clamp(*TIMERS_EVERY.start(), *TIMERS_EVERY.end());
+        std::thread::sleep(std::time::Duration::from_micros(wait));
+    });
+}
 
 /// The requests answered so far, for `drm-check` to say how many calls an
 /// ioctl costs.
@@ -90,6 +126,13 @@ pub mod check {
         pub freed: AtomicU32,
         /// The kernel asked which of an EXEC's waits are the CPU's.
         pub waits_asked: AtomicU32,
+        /// Where it says it is on the bus: nowhere, but for `nvkms-check`,
+        /// which the kernel asks what it asks the card of a GPU.
+        pub place: Option<(u32, u8, u8, u8)>,
+        /// The times nvidia-modeset was asked for, and the phases of the
+        /// boot its heads were asked at.
+        pub nvkms_loads: AtomicU32,
+        pub liveness: std::sync::Mutex<Vec<String>>,
     }
 
     impl Scheme for Card {
@@ -111,6 +154,19 @@ pub mod check {
         // so the panel stays where it is.
         fn drives_own_display(&self) -> bool {
             true
+        }
+        fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
+            self.place
+        }
+        fn nvkms_load(&self) -> Vec<String> {
+            let time = self.nvkms_loads.fetch_add(1, Ordering::Relaxed) + 1;
+            vec![format!(
+                "udrv-nvidia-check: asked for nvidia-modeset, time {time}"
+            )]
+        }
+        fn scanout_liveness(&self, phase: &str) -> String {
+            self.liveness.lock().unwrap().push(phase.into());
+            format!("[udrv-nvidia-check] {phase}: a card with no head\n")
         }
         fn create_fb(&self, handle: u32, _w: u32, _h: u32, _pitch: u32) -> Option<u32> {
             Some(0x5a_0000 + handle)

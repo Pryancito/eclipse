@@ -1683,7 +1683,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 // console card, as nvidia-drm's is; until then, and on any
                 // failure, the software cursor stays in charge.
                 linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
-                schedule_nvkms();
+                schedule_nvkms(
+                    kernel_hal::cmdline::value(&options.cmdline, "udriver")
+                        .is_some_and(|left| left.split(',').any(|d| d.starts_with("nvidia@"))),
+                );
                 // Linux's output poll, for the monitors of every card: no
                 // driver here detects its connectors again but nvkms's, so
                 // without `nvidia.nvkms` it would only ever find nothing.
@@ -1989,7 +1992,8 @@ fn auto_bringup_compute_gpus() -> bool {
 /// the unpause, which is where it stopped.
 #[cfg(feature = "linux")]
 fn log_scanout_liveness(phase: &str) {
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+    // The cards a process serves too: its console GPU's heads are read there.
+    for d in linux_object::fs::devfs::drm::every_card().iter() {
         for line in d.scanout_liveness(phase).lines() {
             kernel_hal::klog_info!("{}", line);
         }
@@ -2028,9 +2032,21 @@ fn log_scanout_liveness(phase: &str) {
 /// the boot -- Linux runs those from nvidia-modeset's kthread. The console
 /// card is RM-attached only after the deferred bring-up above, so this waits
 /// for it when one was scheduled; the other cards have theirs since boot.
+///
+/// `udrv_nvidia_asked`: the boot line leaves an NVIDIA GPU to userspace
+/// (`udriver=nvidia@N`).
 #[cfg(feature = "linux")]
-fn schedule_nvkms() {
+fn schedule_nvkms(udrv_nvidia_asked: bool) {
     klog_info!("Eclipse: nvidia.nvkms — nvkms se carga cuando las GPUs tengan el RM");
+    // The GPUs left to udrv-nvidia are no card of the kernel's, and come
+    // when that process serves them: a task of their own asks for each.
+    // A boot that asks for that driver on a machine with no such GPU (a
+    // test's) still has the one card it serves asked.
+    let left = linux_object::fs::devfs::served::card::left_to_udrv_nvidia();
+    if left > 0 || udrv_nvidia_asked {
+        linux_object::fs::devfs::served::card::expect_nvkms();
+        kernel_hal::thread::spawn(nvkms_for_served_cards(left.max(1)));
+    }
     kernel_hal::thread::spawn(async move {
         use core::time::Duration;
         use kernel_hal::timer::timer_now;
@@ -2063,6 +2079,41 @@ fn schedule_nvkms() {
             kernel_hal::thread::sleep_until(timer_now() + wait).await;
         }
     });
+}
+
+/// `nvidia.nvkms` for the GPUs a process drives (`udriver=nvidia@N`,
+/// udrv-nvidia). That process loads nvidia-modeset itself, for each card the
+/// kernel asks it to, and the kernel asks when it would give its own cards
+/// to it: once the console GPU's deferred bring-up is over, when one is
+/// coming. Its timers run in the process.
+///
+/// On the card that scans out the console this load is the modeset that
+/// puts the console back on the monitor: the GPU's state load hands the
+/// display to the RM and programs no mode. Nothing asked the process for
+/// it, so a console GPU brought up there left the monitor black, with
+/// signal, where the kernel's driver showed the desktop.
+///
+/// Over once `left` GPUs have been asked: a GPU whose driver never serves
+/// its card keeps this looking, twice a second.
+#[cfg(feature = "linux")]
+async fn nvkms_for_served_cards(left: usize) {
+    use core::time::Duration;
+    use kernel_hal::timer::timer_now;
+    use linux_object::fs::devfs::served::card;
+
+    while card::nvkms_asked() < left {
+        if !linux_object::fs::devfs::drm::console_bringup_unfinished() {
+            let lines = card::nvkms_load_due();
+            for line in lines.iter() {
+                kernel_hal::klog_info!("Eclipse: [nvkms] {}", line);
+            }
+            // Whether the console's raster runs again after the modeset.
+            if !lines.is_empty() {
+                log_scanout_liveness("post-nvkms");
+            }
+        }
+        kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
+    }
 }
 
 #[cfg(feature = "linux")]

@@ -289,3 +289,36 @@ pub(super) fn blend_cursor_into(
         }
     }
 }
+
+/// Ask the cards whose display engine may have the pointer's plane, until
+/// one says yes: the kernel's cards, in the kernel's order, and then the
+/// card with the monitor when a process drives it (`udrv-nvidia`'s console
+/// GPU), which the kernel's device list does not hold. With nvidia-modeset
+/// flipping that card to the compositor's own buffers, its cursor plane is
+/// the only pointer there is: the software one is drawn into a console
+/// nobody is looking at.
+///
+/// Only that one of a process's cards: the plane is the monitor's card's,
+/// and each card asked is a call to its driver, on every pointer motion.
+pub(super) fn cursor_plane(mut ask: impl FnMut(&dyn DrmScheme) -> bool) -> bool {
+    if kernel_hal::drivers::all_drm()
+        .as_vec()
+        .iter()
+        .any(|d| ask(&**d))
+    {
+        return true;
+    }
+    served_panel_card().is_some_and(|card| ask(&*card))
+}
+
+/// The card with the monitor, when it is one a process drives and its
+/// cursor plane may be offered the pointer (`card::cursor_plane_offered`).
+fn served_panel_card() -> Option<Arc<dyn DrmScheme>> {
+    use crate::fs::devfs::served::card;
+    let panel = get_display_driver()?;
+    let served = card::served_snapshot()
+        .iter()
+        .flatten()
+        .any(|card| Arc::ptr_eq(card, &panel));
+    (served && card::cursor_plane_offered(&*panel)).then_some(panel)
+}

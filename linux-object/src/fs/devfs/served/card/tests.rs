@@ -51,6 +51,12 @@ impl DrmScheme for Card {
         self.flipped.store(fb, Ordering::SeqCst);
         true
     }
+    fn nvkms_load(&self) -> Vec<String> {
+        vec![
+            String::from("nvkms tiene el display"),
+            String::from("modeset hecho"),
+        ]
+    }
     fn set_cursor(&self, _: u32, _: i32, _: i32, _: u32, _: u32) -> bool {
         false
     }
@@ -249,4 +255,133 @@ fn the_bringup_pause_outlasts_a_served_cards_patience() {
     let served = pause_for(2);
     assert!(served > core::time::Duration::from_millis(BRINGUP_PATIENCE_MS));
     assert!(served >= SCANOUT_PAUSE_MAX);
+}
+
+/// `nvidia.nvkms` reaches the card's driver over the link, and what
+/// nvidia-modeset says there comes back to the boot log.
+#[test]
+fn nvkms_is_loaded_by_the_driver_over_the_link() {
+    let s = served();
+    assert_eq!(
+        s.remote.nvkms_load(),
+        ["nvkms tiene el display", "modeset hecho"]
+    );
+    assert_eq!(
+        s.remote.nvkms_service(),
+        None,
+        "its timers are the driver's"
+    );
+}
+
+/// A card at a place on the bus, and nothing else.
+struct At(Option<Place>);
+
+impl Scheme for At {
+    fn name(&self) -> &str {
+        "served-test-gpu"
+    }
+}
+
+impl DrmScheme for At {
+    fn get_caps(&self) -> DrmCaps {
+        Card::default().get_caps()
+    }
+    fn pci_bdf(&self) -> Option<Place> {
+        self.0
+    }
+    fn create_fb(&self, _: u32, _: u32, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn page_flip(&self, _: u32) -> bool {
+        false
+    }
+    fn set_cursor(&self, _: u32, _: i32, _: i32, _: u32, _: u32) -> bool {
+        false
+    }
+    fn wait_vblank(&self, _: u32) -> bool {
+        false
+    }
+    fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        (vec![], vec![], vec![])
+    }
+    fn get_connector(&self, _: u32) -> Option<DrmConnector> {
+        None
+    }
+    fn get_crtc(&self, _: u32) -> Option<DrmCrtc> {
+        None
+    }
+    fn get_plane(&self, _: u32) -> Option<DrmPlane> {
+        None
+    }
+    fn get_planes(&self) -> Vec<u32> {
+        vec![]
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn set_plane(
+        &self,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: i32,
+        _: i32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) -> bool {
+        false
+    }
+}
+
+/// nvidia-modeset is loaded once a boot for each GPU a process drives: for
+/// a card served later, and not again for the cards of a driver that
+/// started over.
+#[test]
+fn nvkms_is_due_once_for_each_served_gpu() {
+    let card = |place| -> Arc<dyn DrmScheme> { Arc::new(At(place)) };
+    let places = |cards: &[Arc<dyn DrmScheme>]| -> Vec<Option<Place>> {
+        cards.iter().map(|c| c.pci_bdf()).collect()
+    };
+    let (console, compute) = (Some((0, 0x17, 0, 0)), Some((0, 0x65, 0, 0)));
+    let mut asked = Vec::new();
+    assert!(due(vec![], &mut asked).is_empty(), "none served yet");
+    // The first card is served, then both: only the new one is due.
+    assert_eq!(places(&due(vec![card(console)], &mut asked)), [console]);
+    assert_eq!(
+        places(&due(vec![card(console), card(compute)], &mut asked)),
+        [compute]
+    );
+    // The driver started again: other cards, the same GPUs.
+    assert!(due(vec![card(console), card(compute)], &mut asked).is_empty());
+    // A card with no place on the bus (`udrv-nvidia drm-check`) is no GPU.
+    assert!(due(vec![card(None)], &mut asked).is_empty());
+    assert_eq!(asked.len(), 2);
+}
+
+/// The pointer is not offered to a served card's cursor plane while
+/// nvidia-modeset is still to take the card: its driver would bring up a
+/// cursor channel of its own, and nvidia-modeset could not take the card.
+#[test]
+fn the_cursor_plane_waits_for_nvkms_on_a_boot_that_loads_it() {
+    let (console, compute) = ((0, 0x17, 0, 0), (0, 0x65, 0, 0));
+    // No `nvidia.nvkms`: the plane is the driver's own, from the start.
+    assert!(offered(false, Some(console), &[]));
+    assert!(offered(false, None, &[]));
+    // With it: once that GPU's driver has answered the load, whatever it
+    // answered, and not for another GPU's answer.
+    assert!(!offered(true, Some(console), &[]));
+    assert!(!offered(true, Some(console), &[compute]));
+    assert!(offered(true, Some(console), &[compute, console]));
+    assert!(!offered(true, None, &[console]));
+}
+
+/// A card of the kernel's is offered every frame to flip to, whatever the
+/// boot expects of nvidia-modeset: only the cards processes drive wait
+/// for it.
+#[test]
+fn a_card_of_the_kernels_is_always_offered_the_flip() {
+    let kernels: Arc<dyn DrmScheme> = Arc::new(At(Some((0, 0x17, 0, 0))));
+    assert!(flip_offered(&kernels));
 }

@@ -90,6 +90,12 @@ pub mod op {
     pub const CONSOLE_BRINGUP: u32 = 96;
     /// `build_console_gr_ladder`: the line it says, in the bytes.
     pub const CONSOLE_GR_LADDER: u32 = 97;
+    /// `nvkms_load`: the lines it says, each ended by a newline, in the
+    /// bytes.
+    pub const NVKMS_LOAD: u32 = 98;
+    /// `scanout_liveness`: the phase's name in the bytes, and what the
+    /// driver says of its heads in the answer's.
+    pub const SCANOUT_LIVENESS: u32 = 99;
 }
 
 pub mod ioctl;
@@ -444,6 +450,15 @@ pub fn answer(
             o.0.extend_from_slice(gpu.build_console_gr_ladder().as_bytes());
             Ok(0)
         }
+        op::NVKMS_LOAD => {
+            lines_out(o.0, &gpu.nvkms_load());
+            Ok(0)
+        }
+        op::SCANOUT_LIVENESS => {
+            let phase = core::str::from_utf8(data).map_err(|_| EINVAL)?;
+            o.0.extend_from_slice(gpu.scanout_liveness(phase).as_bytes());
+            Ok(0)
+        }
         op::HW_CURSOR_HIDE => found(gpu.hw_cursor_hide()),
         op::POLL => found(gpu.poll_connectors()),
         op::EDID => {
@@ -528,6 +543,22 @@ pub fn answer(
             Ok(0)
         }
         _ => Err(EINVAL),
+    }
+}
+
+/// The most text an answer of lines carries: half a slot of the link.
+const LINES_MAX: usize = 32 * 1024;
+
+/// Lines of text as an answer carries them, each ended by a newline. What
+/// does not fit in [`LINES_MAX`] bytes is left out, and a last line says so.
+fn lines_out(out: &mut Vec<u8>, lines: &[String]) {
+    for line in lines {
+        if out.len() + line.len() + 1 > LINES_MAX {
+            out.extend_from_slice(b"...\n");
+            break;
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
     }
 }
 
@@ -769,6 +800,37 @@ impl<T: Transport> DrmScheme for Remote<T> {
 
     fn build_console_gr_ladder(&self) -> String {
         self.line(op::CONSOLE_GR_LADDER, 0)
+    }
+
+    /// The heads of the driver's console GPU, read where the driver is:
+    /// whether its raster still runs after the bring-up, and after
+    /// nvidia-modeset's modeset, is what the log of a boot whose monitor
+    /// went black has to say.
+    fn scanout_liveness(&self, phase: &str) -> String {
+        self.call(op::SCANOUT_LIVENESS, 0, 0, phase.as_bytes())
+            .map(|(_, text)| String::from_utf8_lossy(&text).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// `nvidia.nvkms`: nvidia-modeset is loaded where the driver is, and
+    /// takes this card there; what it says of it comes back. On the card
+    /// that scans out the console this is the modeset that puts the
+    /// console back on the monitor after the GPU's bring-up, which nothing
+    /// else does. Its timers run in the driver's process, as Linux runs
+    /// them from its own thread, so [`DrmScheme::nvkms_service`] stays
+    /// `None` here.
+    fn nvkms_load(&self) -> Vec<String> {
+        match self.call(op::NVKMS_LOAD, 0, 0, &[]) {
+            Ok((_, text)) => String::from_utf8_lossy(&text)
+                .lines()
+                .map(String::from)
+                .collect(),
+            Err(errno) => alloc::vec![alloc::format!(
+                "{}: its driver's process did not load nvkms (errno {})",
+                self.name,
+                errno
+            )],
+        }
     }
 
     fn ce_present_2d_pitched(

@@ -71,6 +71,9 @@ pub(super) struct Link {
     /// Until when (`now_ms`) silence is not a hang: a request known to take
     /// long is waiting ([`Link::be_patient_for`]).
     patient_until: AtomicU64,
+    /// The process that answers on this link, 0 until it is said
+    /// ([`Link::killed_with`]): what a server's other links are found by.
+    server: AtomicU64,
     ready: lock::Mutex<Option<Ready>>,
     kill: lock::Mutex<Option<Kill>>,
     next_id: AtomicU32,
@@ -143,6 +146,7 @@ impl Link {
             answered_at: AtomicU64::new(0),
             hung_after_ms: AtomicU64::new(HUNG_AFTER_MS),
             patient_until: AtomicU64::new(0),
+            server: AtomicU64::new(0),
             ready: lock::Mutex::new(None),
             kill: lock::Mutex::new(None),
             next_id: AtomicU32::new(0),
@@ -158,9 +162,16 @@ impl Link {
         *self.ready.lock() = Some(ready);
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: Kill) {
+    /// The process that answers on this link (`server`, its id), and how
+    /// it is ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: Kill) {
+        self.server.store(server, Ordering::Release);
         *self.kill.lock() = Some(kill);
+    }
+
+    /// The process that answers on this link; 0 when nobody said.
+    pub fn server(&self) -> u64 {
+        self.server.load(Ordering::Acquire)
     }
 
     /// The server has said nothing for as long as a request waits.
@@ -189,8 +200,19 @@ impl Link {
     /// long (a GPU's firmware boot) is about to be asked, and the server
     /// answers nothing else on the thread it runs on meanwhile.
     pub fn be_patient_for(&self, ms: u64) {
-        self.patient_until
-            .fetch_max(now_ms().saturating_add(ms), Ordering::AcqRel);
+        self.be_patient_until(now_ms().saturating_add(ms));
+    }
+
+    /// Until when silence is not a hang, as [`Link::be_patient_for`] left
+    /// it.
+    pub fn patient_until(&self) -> u64 {
+        self.patient_until.load(Ordering::Acquire)
+    }
+
+    /// Silence is not a hang before `until` (`now_ms`): the patience of
+    /// another link of the same server (`super::be_patient_with_server_of`).
+    pub fn be_patient_until(&self, until: u64) {
+        self.patient_until.fetch_max(until, Ordering::AcqRel);
     }
 
     /// Nothing is asked on this link again. Whether this was the first to
@@ -506,5 +528,49 @@ mod patience_tests {
         assert!(link.silent_since(long_ago), "past the wait: hung");
         link.be_patient_for(60_000);
         assert!(!link.silent_since(long_ago), "a firmware boot is waiting");
+    }
+
+    /// A link of process `server`, hung the moment a request waits on it.
+    fn link_of(server: u64) -> (Arc<Link>, Arc<Fifo>) {
+        let (ours, theirs) = Fifo::create(SLOTS * 2, MSG);
+        let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+        let koid = ours.id();
+        let link = Arc::new(Link::new(ours, window).unwrap());
+        link.hung_after_ms.store(0, Ordering::Relaxed);
+        if server != 0 {
+            link.killed_with(server, Box::new(|| {}));
+        }
+        super::super::remember(koid, &link);
+        (link, theirs)
+    }
+
+    /// The GPU driver answers on a link for each card and one for the RM,
+    /// each on a thread of its own. While a card's thread boots the GPU's
+    /// firmware it holds the RM, and what the other threads were asked
+    /// meanwhile waits for it unanswered: that is no hang either, on any
+    /// link of that process, and still one on every other server's.
+    #[test]
+    fn a_long_request_makes_every_link_of_its_server_patient() {
+        let (card0, _a) = link_of(4101);
+        let (card1, _b) = link_of(4101);
+        let (rm, _c) = link_of(4101);
+        let (other, _d) = link_of(4102);
+        let (nobodys, _e) = link_of(0);
+        let long_ago = 0;
+        while now_ms() == long_ago {
+            core::hint::spin_loop();
+        }
+        assert!(card1.silent_since(long_ago) && rm.silent_since(long_ago));
+        super::super::be_patient_with_server_of(&card0, 60_000);
+        assert!(!card0.silent_since(long_ago), "the link that was asked");
+        assert!(!card1.silent_since(long_ago), "the other card's");
+        assert!(!rm.silent_since(long_ago), "the RM's");
+        assert_eq!(card1.patient_until(), card0.patient_until());
+        assert!(other.silent_since(long_ago), "another server hangs as ever");
+        assert!(nobodys.silent_since(long_ago));
+        // A link nobody said the server of is patient alone.
+        super::super::be_patient_with_server_of(&nobodys, 60_000);
+        assert!(!nobodys.silent_since(long_ago));
+        assert!(other.silent_since(long_ago));
     }
 }

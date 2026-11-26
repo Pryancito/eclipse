@@ -214,9 +214,10 @@ impl ServedNode {
         !self.0.link.is_dead()
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
-        self.0.link.killed_with(kill);
+    /// The process that serves the node (`server`, its id), and how it is
+    /// ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
+        self.0.link.killed_with(server, kill);
     }
 
     /// Where the VMOs the server answers an `mmap` with are found.
@@ -773,6 +774,31 @@ fn remember(koid: u64, link: &Arc<Link>) {
     // The links of servers that are gone go as new ones come.
     links.retain(|_, l| l.strong_count() > 0);
     links.insert(koid, Arc::downgrade(link));
+}
+
+/// The next `ms` of silence are not a hang on any link the server of `link`
+/// answers.
+///
+/// A request that takes that long (a GPU's firmware boot, nvidia-modeset's
+/// first modeset) holds the driver's RM for as long, and what the driver's
+/// other threads were asked meanwhile, on the links of its other cards and
+/// of `/dev/nvidiactl`, waits for the RM unanswered. Each link counts its
+/// own silence: ten seconds of that on any of them had the driver killed
+/// halfway through the boot of the console GPU, which leaves its monitor
+/// black for the rest of the boot.
+fn be_patient_with_server_of(link: &Link, ms: u64) {
+    link.be_patient_for(ms);
+    let server = link.server();
+    if server == 0 {
+        return;
+    }
+    let until = link.patient_until();
+    // Looked at outside the lock: one of these may be a link's last
+    // reference.
+    let links: Vec<Arc<Link>> = LINKS.lock().values().filter_map(Weak::upgrade).collect();
+    for other in links.iter().filter(|other| other.server() == server) {
+        other.be_patient_until(until);
+    }
 }
 
 /// The address space of the program whose `ioctl` is request `reqid` of

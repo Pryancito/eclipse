@@ -76,12 +76,17 @@ impl Transport for OverLink {
     fn call(&self, op: u32, a: u64, b: u64, data: &[u8]) -> Result<(u64, Vec<u8>), i32> {
         // A console GPU's bring-up boots its GSP firmware, which takes longer
         // than the link waits before it calls the driver hung: killing the
-        // driver halfway through that boot left the monitor black.
+        // driver halfway through that boot left the monitor black. So does
+        // nvidia-modeset's load, with its first modeset. The patience is for
+        // every link of the driver: what its other threads are asked
+        // meanwhile waits for the RM this request holds.
         if matches!(
             op,
-            drm_remote::op::CONSOLE_BRINGUP | drm_remote::op::CONSOLE_GR_LADDER
+            drm_remote::op::CONSOLE_BRINGUP
+                | drm_remote::op::CONSOLE_GR_LADDER
+                | drm_remote::op::NVKMS_LOAD
         ) {
-            self.0.be_patient_for(BRINGUP_PATIENCE_MS);
+            super::be_patient_with_server_of(&self.0, BRINGUP_PATIENCE_MS);
         }
         // The message's `len` is the bytes it carries; the answer has the
         // whole slot.
@@ -178,6 +183,105 @@ pub fn served_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
     snapshot
 }
 
+/// A GPU's place on the bus (`DrmScheme::pci_bdf`).
+type Place = (u32, u8, u8, u8);
+
+/// What the boot keeps of nvidia-modeset and the GPUs processes drive.
+struct Nvkms {
+    /// `nvidia.nvkms` is on the boot line ([`expect_nvkms`]): each of
+    /// those GPUs is nvidia-modeset's to take.
+    expected: bool,
+    /// The GPUs whose driver was asked to load it ([`nvkms_load_due`]).
+    asked: Vec<Place>,
+    /// Those whose driver has answered.
+    answered: Vec<Place>,
+}
+
+static NVKMS: lock::Mutex<Nvkms> = lock::Mutex::new(Nvkms {
+    expected: false,
+    asked: Vec::new(),
+    answered: Vec::new(),
+});
+
+/// `nvidia.nvkms` is on the boot line: the boot is going to ask the driver
+/// of each GPU a process drives to load nvidia-modeset
+/// ([`nvkms_load_due`]). Until it has, that card's cursor plane is not
+/// offered the pointer ([`cursor_plane_offered`]).
+pub fn expect_nvkms() {
+    NVKMS.lock().expected = true;
+}
+
+/// `nvidia.nvkms` for the cards processes drive: ask the driver of each
+/// one nvidia-modeset has not been loaded for yet to load it and take the
+/// card, and say what each answered. The boot gives the kernel's own cards
+/// to nvidia-modeset out of the kernel's device list; these are not in it,
+/// and come when their process serves them.
+///
+/// Once a boot for each GPU, whatever became of it: a driver that started
+/// again serves the same GPUs, and a load that killed it would kill each
+/// new one in turn.
+pub fn nvkms_load_due() -> Vec<String> {
+    let cards = due(served_cards(), &mut NVKMS.lock().asked);
+    let mut lines = Vec::new();
+    for card in cards {
+        // With no lock held: a call to the driver, of seconds.
+        lines.extend(card.nvkms_load());
+        if let Some(place) = card.pci_bdf() {
+            NVKMS.lock().answered.push(place);
+        }
+    }
+    lines
+}
+
+/// How many GPUs [`nvkms_load_due`] has asked for.
+pub fn nvkms_asked() -> usize {
+    NVKMS.lock().asked.len()
+}
+
+/// Whether the cursor plane of `card`, one a process drives, may be
+/// offered the pointer. With `nvidia.nvkms` the plane is nvidia-modeset's,
+/// and not before its driver has answered the load: a GPU whose RM is up
+/// and that nvidia-modeset has not taken yet brings up its own cursor
+/// channel when it is handed a pointer, on the display's one core channel,
+/// and nvidia-modeset then refuses the card: no console modeset, and the
+/// monitor stays black.
+pub fn cursor_plane_offered(card: &dyn DrmScheme) -> bool {
+    let nvkms = NVKMS.lock();
+    offered(nvkms.expected, card.pci_bdf(), &nvkms.answered)
+}
+
+/// Whether `card` may be offered a frame to flip to
+/// (`DrmScheme::page_flip`): any card but one a process drives that
+/// nvidia-modeset is still to take, for the pointer's reason
+/// ([`cursor_plane_offered`]). Handed a frame, a GPU whose RM is up
+/// brings up a window channel of its own on the display's one core
+/// channel, and nvidia-modeset then refuses the card. Until its driver
+/// has answered the load, the kernel copies that card's frames itself.
+pub fn flip_offered(card: &Arc<dyn DrmScheme>) -> bool {
+    let served = CARDS.lock().iter().any(|served| Arc::ptr_eq(served, card));
+    !served || cursor_plane_offered(&**card)
+}
+
+/// [`cursor_plane_offered`] for a card at `place`.
+fn offered(expected: bool, place: Option<Place>, answered: &[Place]) -> bool {
+    !expected || place.is_some_and(|place| answered.contains(&place))
+}
+
+/// Of `cards`, those at a place not in `asked`, which they join. A card
+/// with no place on the bus is no GPU's.
+fn due(cards: Vec<Arc<dyn DrmScheme>>, asked: &mut Vec<Place>) -> Vec<Arc<dyn DrmScheme>> {
+    cards
+        .into_iter()
+        .filter(|card| match card.pci_bdf() {
+            Some(place) if !asked.contains(&place) => {
+                asked.push(place);
+                true
+            }
+            _ => false,
+        })
+        .collect()
+}
+
 /// `card` is one a process drives, from now on.
 pub(crate) fn note_served(card: &Arc<dyn DrmScheme>) {
     let mut cards = CARDS.lock();
@@ -237,9 +341,10 @@ impl ServedCard {
         !self.link.is_dead()
     }
 
-    /// How the server is ended when it hangs.
-    pub fn killed_with(&self, kill: Kill) {
-        self.link.killed_with(kill);
+    /// The process that drives the card (`server`, its id), and how it is
+    /// ended when it hangs.
+    pub fn killed_with(&self, server: u64, kill: Kill) {
+        self.link.killed_with(server, kill);
     }
 
     /// The server is gone: the card leaves the DRM core, and its node
