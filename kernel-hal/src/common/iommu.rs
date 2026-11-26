@@ -15,10 +15,11 @@
 //! fence zones) hold either way. What changes is that everything else is
 //! absent from the device's view.
 //!
-//! Nothing installs a unit yet: [`domain_for`] answers `None` and every
-//! device is in passthrough, as before. A hardware backend calls [`install`]
-//! once it has found and programmed its unit; with `iommu=off` on the command
-//! line it never does.
+//! A hardware backend (VT-d, AMD-Vi on x86_64) calls [`install`] once it
+//! has found and programmed its units, on every boot whose firmware
+//! describes one; with `iommu=off` on the command line it never does. With
+//! no unit installed [`domain_for`] answers `None` and every device is in
+//! passthrough, as on a machine without an IOMMU.
 
 use alloc::sync::Arc;
 use lock::Mutex;

@@ -1,8 +1,8 @@
 //! AMD-Vi, the hardware half: find the IOMMUs the IVRS table names, give
 //! every requester a pass-through device table entry, turn them on, and
 //! give a device a domain of its own when a process claims it. The
-//! arithmetic is `common/amdvi.rs`; the opt-in and the all-or-nothing rule
-//! are VT-d's (`vtd.rs`).
+//! arithmetic is `common/amdvi.rs`; the default (on, `iommu=off` leaves
+//! it off) and the all-or-nothing rule are VT-d's (`vtd.rs`).
 
 use alloc::{sync::Arc, vec::Vec};
 use core::ptr::{read_volatile, write_volatile};
@@ -386,16 +386,18 @@ fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
     Ok(unit)
 }
 
-/// Find and take over the machine's AMD-Vi units, when the command line
-/// asks and VT-d did not.
+/// Find and take over the machine's AMD-Vi units, unless the command line
+/// says `iommu=off` or VT-d took the machine.
 pub(super) fn init() {
-    if crate::cmdline::value(KCONFIG.cmdline, "iommu") != Some("on")
+    if crate::cmdline::value(KCONFIG.cmdline, "iommu") == Some("off")
         || crate::common::iommu::unit().is_some()
     {
         return;
     }
     let Some(ivrs) = super::drivers::acpi_table(Signature::IVRS).and_then(amdvi::parse_ivrs) else {
-        crate::klog_warn!("iommu: iommu=on, but the firmware describes no IOMMU (no DMAR, no IVRS): devices keep full DMA");
+        crate::klog_info!(
+            "iommu: the firmware describes no IOMMU (no DMAR, no IVRS): devices keep full DMA"
+        );
         return;
     };
     if ivrs.units.is_empty() {
