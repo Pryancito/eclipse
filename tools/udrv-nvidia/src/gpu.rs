@@ -14,7 +14,7 @@ use zcore_drivers::bus::pci::{PortOpsImpl, PCI_ACCESS};
 
 use crate::mapper::{Bar, BarMapper};
 use crate::platform::{self, Range};
-use crate::ports::{self, Ports, Refused, Space};
+use crate::ports::{self, Refused, Space};
 
 const PAGE: usize = 4096;
 
@@ -40,7 +40,11 @@ impl Space for Kernel {
 #[derive(Debug, Clone, Copy)]
 pub enum Which {
     Nvidia(usize),
-    Pci { vendor: u16, device: u16 },
+    Pci {
+        vendor: u16,
+        device: u16,
+        index: usize,
+    },
 }
 
 pub struct Gpu {
@@ -55,17 +59,44 @@ pub struct Gpu {
 
 /// Claim the GPU and put its configuration space behind the ports.
 pub fn claim(which: Which) -> Result<Gpu, String> {
+    claim_one(which)?.ok_or_else(|| format!("claim {which:?}: no such device"))
+}
+
+/// Claim every GPU `which` numbers, from 0 up to the first the kernel
+/// does not have, each behind the ports: the GPUs of one RM. An error for
+/// one the kernel has and refuses, or for none at all.
+pub fn claim_all(which: impl Fn(usize) -> Which) -> Result<Vec<Gpu>, String> {
+    let mut gpus = Vec::new();
+    while let Some(gpu) = claim_one(which(gpus.len()))? {
+        gpus.push(gpu);
+    }
+    if gpus.is_empty() {
+        return Err(format!("claim {:?}: no such device", which(0)));
+    }
+    Ok(gpus)
+}
+
+/// [`claim`], `None` for a GPU the kernel does not have.
+fn claim_one(which: Which) -> Result<Option<Gpu>, String> {
     let (claim, pci) = match which {
         Which::Nvidia(index) => (
             claim::claim(KIND_NVIDIA, index, 50),
             PciFn::of(KIND_NVIDIA, index),
         ),
-        Which::Pci { vendor, device } => (
-            claim::claim_pci(vendor, device, 0, 50),
-            PciFn::of_pci(vendor, device, 0),
+        Which::Pci {
+            vendor,
+            device,
+            index,
+        } => (
+            claim::claim_pci(vendor, device, index, 50),
+            PciFn::of_pci(vendor, device, index),
         ),
     };
-    let claim = claim.map_err(|e| format!("claim {which:?}: {e}"))?;
+    let claim = match claim {
+        Ok(claim) => claim,
+        Err(Status::NOT_FOUND) => return Ok(None),
+        Err(e) => return Err(format!("claim {which:?}: {e}")),
+    };
     let place = pci.place().map_err(|e| format!("place: {e}"))?;
     let mut lens = [0usize; 6];
     for (i, len) in lens.iter_mut().enumerate() {
@@ -90,8 +121,8 @@ pub fn claim(which: Which) -> Result<Gpu, String> {
             len,
         });
     }
-    ports::install(Ports::new(Box::new(Kernel(pci)), place, lens))
-        .map_err(|_| "the ports are already some other function's".to_string())?;
+    ports::install(Box::new(Kernel(pci)), place, lens)
+        .map_err(|_| format!("{place:x?} is behind the ports already"))?;
     let loc = Location {
         bus: place.0,
         device: place.1,
@@ -100,13 +131,13 @@ pub fn claim(which: Which) -> Result<Gpu, String> {
     // SAFETY: every port the probe touches is answered by `ports`.
     let dev = unsafe { pci::probe_function(&PortOpsImpl, loc, PCI_ACCESS) }
         .ok_or_else(|| format!("nothing at {loc:?}"))?;
-    Ok(Gpu {
+    Ok(Some(Gpu {
         claim,
         pci,
         loc,
         bars,
         dev,
-    })
+    }))
 }
 
 impl Gpu {
@@ -123,48 +154,56 @@ impl Gpu {
             }),
         )
     }
+}
 
-    /// DMA memory from now on comes through this GPU's bus transaction
-    /// initiator: contiguous, pinned, at the device address the GPU uses.
-    /// What the driver frees stays with the process, pinned, until it
-    /// exits (the claim's memory has no way back yet).
-    pub fn install_dma(&self) -> Result<(), String> {
-        let bti = self.claim.bti;
-        // The pin of every buffer handed out, by its device address, so its
-        // free can give it back. The free used to do nothing: every GEM
-        // object the driver ever made stayed pinned, which a video (buffers
-        // made and freed every frame) turns into the whole of RAM within
-        // seconds, and then every contiguous allocation in the system fails.
-        let pins: &'static Mutex<HashMap<usize, Handle>> =
-            Box::leak(Box::new(Mutex::new(HashMap::new())));
-        platform::install_dma(
-            Box::new(move |pages| {
-                let dma = match Dma::new(bti, pages * PAGE, None) {
-                    Ok(dma) => dma,
-                    Err(e) => {
-                        dma_refused(pages, &e);
-                        return None;
-                    }
-                };
-                pins.lock().unwrap().insert(dma.daddr as usize, dma.pmt);
-                Some(Range {
-                    phys: dma.daddr as usize,
-                    virt: dma.ptr as usize,
-                    len: dma.len,
-                })
-            }),
-            Box::new(move |range| {
-                let Some(pmt) = pins.lock().unwrap().remove(&range.phys) else {
-                    eprintln!("udrv-nvidia: DMA free of {:#x}, which was never handed out", range.phys);
-                    return;
-                };
-                if let Err(e) = Dma::release(range.virt as *mut u8, range.len, pmt) {
-                    eprintln!("udrv-nvidia: DMA free of {:#x}: pmt_unpin {e}", range.phys);
-                }
-            }),
-        )
-        .map_err(|_| "DMA memory already comes from somewhere".to_string())
+/// DMA memory from now on comes through the bus transaction initiators
+/// of `gpus`, every GPU of this process: contiguous, pinned in each, so
+/// any of them reaches it, at the device address each GPU uses (the same
+/// for all, as one RM drives them all and hands any buffer to any of them).
+pub fn install_dma(gpus: &[Gpu]) -> Result<(), String> {
+    let btis: Vec<Handle> = gpus.iter().map(|g| g.claim.bti).collect();
+    if btis.is_empty() {
+        return Err("no GPU to give DMA memory to".into());
     }
+    // The pins of every buffer handed out, by its device address, so its
+    // free can give it back. The free used to do nothing: every GEM object
+    // the driver ever made stayed pinned, which a video (buffers made and
+    // freed every frame) turns into the whole of RAM within seconds, and
+    // then every contiguous allocation in the system fails.
+    type Pins = Mutex<HashMap<usize, (Handle, Vec<Handle>)>>;
+    let pins: &'static Pins = Box::leak(Box::new(Mutex::new(HashMap::new())));
+    platform::install_dma(
+        Box::new(move |pages| {
+            let dma = match Dma::new_on(&btis, pages * PAGE, None) {
+                Ok(dma) => dma,
+                Err(e) => {
+                    dma_refused(pages, &e);
+                    return None;
+                }
+            };
+            pins.lock()
+                .unwrap()
+                .insert(dma.daddr as usize, (dma.pmt, dma.also));
+            Some(Range {
+                phys: dma.daddr as usize,
+                virt: dma.ptr as usize,
+                len: dma.len,
+            })
+        }),
+        Box::new(move |range| {
+            let Some((pmt, also)) = pins.lock().unwrap().remove(&range.phys) else {
+                eprintln!(
+                    "udrv-nvidia: DMA free of {:#x}, which was never handed out",
+                    range.phys
+                );
+                return;
+            };
+            if let Err(e) = Dma::release_on(range.virt as *mut u8, range.len, pmt, also) {
+                eprintln!("udrv-nvidia: DMA free of {:#x}: pmt_unpin {e}", range.phys);
+            }
+        }),
+    )
+    .map_err(|_| "DMA memory already comes from somewhere".to_string())
 }
 
 /// A DMA allocation the kernel refused: the driver answers `ENOMEM` for it.

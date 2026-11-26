@@ -265,6 +265,9 @@ pub struct Dma {
     pub window: Option<Handle>,
     /// The pin that gives the device its address, for [`Dma::release`].
     pub pmt: Handle,
+    /// The pins that give the other devices of [`Dma::new_on`] the same
+    /// address, for [`Dma::release_on`].
+    pub also: Vec<Handle>,
 }
 
 impl Dma {
@@ -276,7 +279,22 @@ impl Dma {
     /// VMO of its own. It is asked for here because it has to be cut before
     /// the memory is mapped: mapping moves the VMO's handle away.
     pub fn new(bti: Handle, len: usize, window: Option<(usize, usize)>) -> Result<Dma, String> {
+        Dma::new_on(&[bti], len, window)
+    }
+
+    /// The same, for every device of `btis`, the first one's: one process
+    /// driving several (a GPU per initiator) whose memory any of them may
+    /// reach. Each pin is a grant of the device's IOMMU, and each must
+    /// give the same device address, the one the first gives (the kernel
+    /// maps device memory at its physical address), or the memory is
+    /// refused.
+    pub fn new_on(
+        btis: &[Handle],
+        len: usize,
+        window: Option<(usize, usize)>,
+    ) -> Result<Dma, String> {
         assert!(len.is_multiple_of(PAGE));
+        let (&bti, others) = btis.split_first().expect("at least one device");
         let mut vmo: Handle = 0;
         // SAFETY: the kernel writes a handle into `vmo`.
         unsafe {
@@ -286,26 +304,51 @@ impl Dma {
             )
         }
         .map_err(|e| format!("vmo_create_contiguous: {e}"))?;
-        let mut daddr: u64 = 0;
-        let mut pmt: Handle = 0;
-        // SAFETY: the kernel writes one address into `daddr` (a contiguous
-        // pin has one) and a handle into `pmt`.
-        unsafe {
-            zx::call8(
-                nr::BTI_PIN,
-                [
-                    bti as usize,
-                    BTI_PERM_READ | BTI_PERM_WRITE | BTI_CONTIGUOUS,
-                    vmo as usize,
-                    0,
-                    len,
-                    &mut daddr as *mut u64 as usize,
-                    1,
-                    &mut pmt as *mut Handle as usize,
-                ],
-            )
+        let pin = |bti: Handle| -> Result<(u64, Handle), String> {
+            let mut daddr: u64 = 0;
+            let mut pmt: Handle = 0;
+            // SAFETY: the kernel writes one address into `daddr` (a
+            // contiguous pin has one) and a handle into `pmt`.
+            unsafe {
+                zx::call8(
+                    nr::BTI_PIN,
+                    [
+                        bti as usize,
+                        BTI_PERM_READ | BTI_PERM_WRITE | BTI_CONTIGUOUS,
+                        vmo as usize,
+                        0,
+                        len,
+                        &mut daddr as *mut u64 as usize,
+                        1,
+                        &mut pmt as *mut Handle as usize,
+                    ],
+                )
+            }
+            .map_err(|e| format!("bti_pin: {e}"))?;
+            Ok((daddr, pmt))
+        };
+        let unpin = |pmt: Handle| {
+            // SAFETY: no pointers; `pmt` is consumed.
+            let _ = unsafe { zx::call(nr::PMT_UNPIN, [pmt as usize, 0, 0, 0, 0, 0]) };
+        };
+        let (daddr, pmt) = pin(bti).inspect_err(|_| zx::close(vmo))?;
+        let mut also = Vec::with_capacity(others.len());
+        for &other in others {
+            let refused = match pin(other) {
+                Ok((there, pmt)) if there == daddr => {
+                    also.push(pmt);
+                    continue;
+                }
+                Ok((there, pmt)) => {
+                    unpin(pmt);
+                    format!("another device sees it at {there:#x}, not {daddr:#x}")
+                }
+                Err(e) => e,
+            };
+            also.into_iter().chain([pmt]).for_each(unpin);
+            zx::close(vmo);
+            return Err(refused);
         }
-        .map_err(|e| format!("bti_pin: {e}"))?;
         let window = match window {
             Some((offset, part)) => {
                 assert!(offset + part <= len);
@@ -322,6 +365,7 @@ impl Dma {
             daddr,
             window,
             pmt,
+            also,
         })
     }
 
@@ -336,6 +380,26 @@ impl Dma {
     /// someone else may hold, and handing the pages back under it is not
     /// this call's to decide.
     pub fn release(ptr: *mut u8, len: usize, pmt: Handle) -> Result<(), Status> {
+        Dma::release_on(ptr, len, pmt, Vec::new())
+    }
+
+    /// The same for memory of [`Dma::new_on`]: every device loses it
+    /// before it goes. One pin refused leaves the memory mapped here (a
+    /// device may still reach it), its error returned.
+    pub fn release_on(
+        ptr: *mut u8,
+        len: usize,
+        pmt: Handle,
+        also: Vec<Handle>,
+    ) -> Result<(), Status> {
+        let mut failed = Ok(());
+        for other in also {
+            // SAFETY: no pointers; `other` is consumed.
+            if let Err(e) = unsafe { zx::call(nr::PMT_UNPIN, [other as usize, 0, 0, 0, 0, 0]) } {
+                failed = Err(e);
+            }
+        }
+        failed?;
         // SAFETY: no pointers; `pmt` is consumed.
         unsafe { zx::call(nr::PMT_UNPIN, [pmt as usize, 0, 0, 0, 0, 0]) }?;
         // SAFETY: `ptr..ptr+len` is the mapping `new` made, which the caller
