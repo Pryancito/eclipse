@@ -498,8 +498,8 @@ endif
 qemu_opts += -no-reboot
 
 # IOMMU=intel: an Intel IOMMU (VT-d, QEMU `intel-iommu`) in front of the PCI
-# devices. The kernel only uses it with `KOPTS=iommu=on`; without that the
-# devices are as without one. It has to come before every other device.
+# devices. The kernel uses it unless `KOPTS=iommu=off`, which leaves the
+# devices as without one. It has to come before every other device.
 # virtio devices bypass it unless they are given `iommu_platform=on`.
 # IOMMU=amd: the AMD one (QEMU `amd-iommu`, interrupt remapping off).
 ifeq ($(IOMMU),intel)
