@@ -15,7 +15,7 @@
 // not decommit), so on a machine with no IOMMU the stray write lands on
 // nothing but this test.
 //
-//   zx-iommu-probe [N] [expect] [ro]
+//   zx-iommu-probe [N] [expect] [ro|msi]
 //                                 N: the controller's place among those
 //                                 left to userspace (default 2);
 //                                 expect: "blocked" or "reached";
@@ -23,7 +23,11 @@
 //                                 for the device to read only, so the
 //                                 write is a permission fault rather than
 //                                 a missing page (QEMU's AMD IOMMU logs
-//                                 only the first kind)
+//                                 only the first kind);
+//                                 msi: the second transfer goes to the
+//                                 interrupt window (0xfee00000) instead,
+//                                 as a driver forging interrupts would
+//                                 have it: only the status is reported
 //
 // Exit status: 0 when what happened is what was expected (or, with no
 // expectation, when the pinned transfer worked), 1 otherwise, 2 when the
@@ -178,6 +182,7 @@ int main(int argc, char **argv) {
     long index = argc > 1 ? atol(argv[1]) : 2;
     const char *expect = argc > 2 ? argv[2] : NULL;
     int read_only = argc > 3 && strcmp(argv[3], "ro") == 0;
+    int forge = argc > 3 && strcmp(argv[3], "msi") == 0;
     const uint32_t rw = ZX_BTI_PERM_READ | ZX_BTI_PERM_WRITE;
     struct claim c;
     long r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_NVME, index, (long)&c, 0));
@@ -229,6 +234,14 @@ int main(int argc, char **argv) {
     uint16_t vid = good[0] | good[1] << 8;
     printf("zx-iommu-probe: identify into the pinned page %#llx: status %#x, vendor %#06x\n",
            (unsigned long long)good_d, ok, vid);
+    if (forge) {
+        int s = identify(2, 0xfee00000ull);
+        printf("zx-iommu-probe: identify into the interrupt window: status %#x\n", s);
+        w32(NVME_CC, 0);
+        wait_ready(0);
+        printf("zx-iommu-probe: RESULT pinned=%s forged=sent\n", ok == 0 && vid ? "ok" : "FAILED");
+        return ok == 0 && vid ? 0 : 1;
+    }
     int stray_status = identify(2, stray_d);
     int written = !all_zero(stray, PAGE);
     printf("zx-iommu-probe: identify into the %s page %#llx: status %#x, page %s\n",

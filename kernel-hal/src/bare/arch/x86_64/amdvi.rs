@@ -5,6 +5,7 @@
 //! it off) and the all-or-nothing rule are VT-d's (`vtd.rs`).
 
 use alloc::{sync::Arc, vec::Vec};
+use core::convert::TryFrom;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,6 +45,9 @@ struct Unit {
     stamp: AtomicU64,
     dids: Mutex<Vec<u16>>,
     faults: AtomicU64,
+    /// It remaps interrupts: the IVRS names an IOAPIC behind it
+    /// ([`Ivhd::ioapic`](amdvi::Ivhd)).
+    remaps: bool,
 }
 
 impl Unit {
@@ -103,6 +107,20 @@ impl Unit {
         ]);
     }
 
+    /// Write the interrupt qword of `rid`'s device table entry, and have
+    /// the unit forget the entry and its interrupt table.
+    fn set_interrupts(&self, rid: u16, qword: u64) {
+        let at = rid as usize * 32;
+        let frame = &self.devtab[at / PAGE_SIZE];
+        let va = phys_to_virt(frame.paddr()) + at % PAGE_SIZE;
+        // SAFETY: an entry of the device table.
+        unsafe { write_volatile((va + 16) as *mut u64, qword) };
+        self.run(&[
+            amdvi::cmd_invalidate_dte(rid),
+            amdvi::cmd_invalidate_interrupts(rid),
+        ]);
+    }
+
     fn take_did(&self) -> Option<u16> {
         let mut used = self.dids.lock();
         let did = (PASS_THROUGH_DID + 1..DOMAINS).find(|d| !used.contains(d))?;
@@ -157,6 +175,8 @@ struct Domain {
     did: u16,
     root: PhysAddr,
     tables: Mutex<Vec<PhysFrame>>,
+    /// Its interrupt remapping table, once its interrupts are limited.
+    interrupts: Mutex<Vec<PhysFrame>>,
 }
 
 /// The tables of one domain. The unit's walks are coherent (the control
@@ -228,10 +248,40 @@ impl DmaDomain for Domain {
         drop(frames);
         self.unit.run(&[amdvi::cmd_invalidate_domain(self.did)]);
     }
+
+    fn limit_interrupts(&self, vectors: &[u8]) -> bool {
+        if !self.unit.remaps {
+            return false;
+        }
+        let dest = zcore_drivers::irq::x86::Apic::bsp_apic_id();
+        let mut table = self.interrupts.lock();
+        if table.is_empty() {
+            *table = PhysFrame::new_contiguous(amdvi::IRT_FRAMES, 12);
+        }
+        let Some(base) = table.first().map(|f| f.paddr()) else {
+            return false;
+        };
+        let entries = phys_to_virt(base) as *mut u32;
+        for index in 0..amdvi::IRT_ENTRIES {
+            let entry = match u8::try_from(index) {
+                Ok(v) if vectors.contains(&v) => amdvi::irte(v, dest),
+                _ => 0,
+            };
+            // SAFETY: the frames are contiguous and hold IRT_ENTRIES
+            // 4-byte entries; the linear map covers them.
+            unsafe { write_volatile(entries.add(index), entry) };
+        }
+        self.unit
+            .set_interrupts(self.rid, amdvi::dte_interrupts(base));
+        true
+    }
 }
 
 impl Drop for Domain {
     fn drop(&mut self) {
+        // No interrupts either, before the table they went through goes.
+        self.unit
+            .set_interrupts(self.rid, amdvi::dte_no_interrupts());
         // Blocked, not back to pass-through, before a single table frame
         // goes: the device must never walk a freed table, and one that had
         // a driver of its own never reaches every byte again. Its next
@@ -273,6 +323,7 @@ impl IommuUnit for AmdVi {
             did,
             root: root_pa,
             tables: Mutex::new(alloc::vec![root]),
+            interrupts: Mutex::new(Vec::new()),
         };
         for (start, len) in self.ivrs.reserved_for(rid) {
             if domain
@@ -306,7 +357,7 @@ impl IommuUnit for AmdVi {
     }
 }
 
-fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
+fn bring_up(index: usize, base: u64, remaps: bool) -> Result<Unit, &'static str> {
     let regs = map_registers(base as PhysAddr, REGS).ok_or("its registers could not be mapped")?;
     // SAFETY: just mapped.
     let control = unsafe { read_volatile((regs + reg::CONTROL) as *const u64) };
@@ -339,6 +390,7 @@ fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
         stamp: AtomicU64::new(0),
         dids: Mutex::new(Vec::new()),
         faults: AtomicU64::new(0),
+        remaps,
     };
     // Every requester in pass-through.
     let pt = amdvi::dte_pass_through(PASS_THROUGH_DID);
@@ -416,12 +468,17 @@ pub(super) fn init() {
     }
     let mut units = Vec::new();
     for (i, ivhd) in ivrs.units.iter().enumerate() {
-        match bring_up(i, ivhd.base) {
+        match bring_up(i, ivhd.base, ivhd.ioapic) {
             Ok(unit) => {
                 crate::klog_info!(
-                    "iommu: amd-vi unit {i} at {:#x}: 4 levels, 48 address bits, {} device ranges",
+                    "iommu: amd-vi unit {i} at {:#x}: 4 levels, 48 address bits, {} device ranges{}",
                     ivhd.base,
-                    ivhd.devices.len()
+                    ivhd.devices.len(),
+                    if ivhd.ioapic {
+                        ", interrupts remapped per claimed device"
+                    } else {
+                        ", no interrupt remapping (the IVRS names no IOAPIC)"
+                    }
                 );
                 units.push(Arc::new(unit));
             }

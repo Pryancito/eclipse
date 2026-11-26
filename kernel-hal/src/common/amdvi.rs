@@ -37,6 +37,10 @@ pub struct Ivhd {
     pub base: u64,
     /// The requester ids it translates, as inclusive ranges.
     pub devices: Vec<(u16, u16)>,
+    /// Its device entries name an IOAPIC (a special entry, 0x48, of
+    /// variety 1): the firmware's sign that the unit remaps interrupts.
+    /// Linux too remaps none without one.
+    pub ioapic: bool,
 }
 
 /// A memory region some devices keep reaching untranslated (IVMD with the
@@ -54,10 +58,15 @@ pub struct Ivrs {
     pub unity: Vec<Ivmd>,
 }
 
-/// The requester ids an IVHD's device entries name. Entries of a kind
+/// A special device entry, and the variety of one that is an IOAPIC.
+const SPECIAL: u8 = 0x48;
+const SPECIAL_IOAPIC: u8 = 1;
+
+/// The requester ids an IVHD's device entries name, and in `ioapic` whether
+/// one is an IOAPIC. Entries of a kind
 /// this does not know are passed over by their size (4 bytes below 64, 8
 /// below 128, and a length byte for the rest).
-fn devices(mut e: &[u8]) -> Vec<(u16, u16)> {
+fn devices(mut e: &[u8], ioapic: &mut bool) -> Vec<(u16, u16)> {
     let mut out = Vec::new();
     let mut start: Option<u16> = None;
     while !e.is_empty() {
@@ -74,6 +83,9 @@ fn devices(mut e: &[u8]) -> Vec<(u16, u16)> {
             break;
         }
         let id = u16_at(e, 1).unwrap_or(0);
+        if kind == SPECIAL && e[7] == SPECIAL_IOAPIC {
+            *ioapic = true;
+        }
         match kind {
             // Every device.
             1 => out.push((0, 0xffff)),
@@ -115,15 +127,22 @@ pub fn parse_ivrs(table: &[u8]) -> Option<Ivrs> {
         match kind {
             0x10 | 0x11 | 0x40 if len >= 24 => {
                 let entries = if kind == 0x10 { 24 } else { 40 };
+                let mut ioapic = false;
                 let unit = Ivhd {
                     kind,
                     base: u64_at(b, 8)?,
                     segment: u16_at(b, 16)?,
-                    devices: devices(b.get(entries..).unwrap_or(&[])),
+                    devices: devices(b.get(entries..).unwrap_or(&[]), &mut ioapic),
+                    ioapic,
                 };
                 match ivrs.units.iter_mut().find(|u| u.base == unit.base) {
-                    Some(old) if old.kind < unit.kind && unit.kind <= 0x11 => *old = unit,
-                    Some(_) => {}
+                    Some(old) => {
+                        let ioapic = old.ioapic || unit.ioapic;
+                        if old.kind < unit.kind && unit.kind <= 0x11 {
+                            *old = unit;
+                        }
+                        old.ioapic = ioapic;
+                    }
                     None => ivrs.units.push(unit),
                 }
             }
@@ -223,6 +242,43 @@ pub fn dte_pass_through(did: u16) -> [u64; 2] {
 /// device whose driver died is left, so it never gets every byte back.
 pub fn dte_blocked(did: u16) -> [u64; 2] {
     [DTE_V | DTE_TV, did as u64]
+}
+
+/// The third qword of a device table entry: interrupts valid (IV), and
+/// how they are handled (IntCtl, bits 61:60 of the qword).
+const DTE_IV: u64 = 1 << 0;
+const INTCTL_REMAPPED: u64 = 2 << 60;
+/// Entries of an interrupt remapping table here: every index an MSI's data
+/// can carry (bits 10:0), so whatever a device writes picks an entry of
+/// this table and never memory past its end. The kernel's own MSIs carry
+/// their vector, which picks the entry of that vector.
+pub const IRT_ENTRIES: usize = 2048;
+const IRT_LEN_LOG2: u64 = 11;
+/// The table's frames: 2048 4-byte entries.
+pub const IRT_FRAMES: usize = IRT_ENTRIES * 4 / PAGE_SIZE;
+
+/// A device table entry's interrupt qword that drops every interrupt the
+/// device sends (IntCtl 00b: target abort).
+pub fn dte_no_interrupts() -> u64 {
+    DTE_IV
+}
+
+/// A device table entry's interrupt qword that remaps the device's
+/// interrupts through the table at `table` (128-byte aligned,
+/// [`IRT_ENTRIES`] entries).
+pub fn dte_interrupts(table: PhysAddr) -> u64 {
+    DTE_IV | IRT_LEN_LOG2 << 1 | (table as u64 & 0x000f_ffff_ffff_ffc0) | INTCTL_REMAPPED
+}
+
+/// A 32-bit interrupt remapping table entry: fixed delivery of `vector` to
+/// the APIC `dest`, physical mode.
+pub fn irte(vector: u8, dest: u8) -> u32 {
+    1 | (dest as u32) << 8 | (vector as u32) << 16
+}
+
+/// Have the unit forget what it cached of `rid`'s interrupt table.
+pub fn cmd_invalidate_interrupts(rid: u16) -> [u32; 4] {
+    [rid as u32, 5 << 28, 0, 0]
 }
 
 /// A device table entry that translates through the table at `root`.
@@ -386,6 +442,12 @@ mod tests {
         t.extend(ivhd(0x11, 0xfeb9_0000, &[1, 0, 0, 0]));
         // An 8-byte special entry (IOAPIC) in a third block, passed over.
         t.extend(ivhd(0x40, 0xfeba_0000, &[72, 0, 0, 0, 0, 0, 0, 0]));
+        // Unit B's IOAPIC, in a fourth block of the same unit.
+        t.extend(ivhd(
+            0x40,
+            0xfeb9_0000,
+            &[1, 0, 0, 0, 72, 0, 0, 0, 0, 0xa0, 0, 1],
+        ));
         // IVMD type 0x21, unity, for 00:14.0 (rid 0x00a0).
         let mut m = vec![0u8; 32];
         m[0] = 0x21;
@@ -409,6 +471,9 @@ mod tests {
         assert_eq!(r.units[0].devices, [(0, 0xff), (0x300, 0x300)]);
         assert_eq!(r.units[1].devices, [(0, 0xffff)]);
         assert!(r.units[2].devices.is_empty());
+        assert!(!r.units[0].ioapic && !r.units[2].ioapic);
+        assert!(r.units[1].ioapic, "named in another block of the same unit");
+        assert_eq!(r.units[1].devices, [(0, 0xffff)]);
         assert_eq!(r.unity.len(), 1);
     }
 
@@ -447,6 +512,13 @@ mod tests {
         assert_eq!(ring_register(0x5000, 8), 0x5000 | 8 << 56);
         assert_eq!(dte_pass_through(1), [0b11 | 3 << 61, 1]);
         assert_eq!(dte_blocked(7), [0b11, 7]);
+        assert_eq!(dte_no_interrupts(), 1);
+        assert_eq!(
+            dte_interrupts(0x1234_5000),
+            1 | 11 << 1 | 0x1234_5000 | 2 << 60
+        );
+        assert_eq!(irte(0x41, 3), 1 | 3 << 8 | 0x41 << 16);
+        assert_eq!(cmd_invalidate_interrupts(0x0108), [0x0108, 5 << 28, 0, 0]);
         let t = dte_translate(0xabc_d000, 7);
         assert_eq!(t[0] >> 9 & 7, 4, "four levels");
         assert_eq!(t[0] & PTE_ADDR, 0xabc_d000);
