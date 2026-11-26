@@ -222,6 +222,10 @@ pub fn serve(
         loans: Mutex::new(BTreeMap::new()),
         next_loan: AtomicU64::new(1),
     }));
+    drop(served);
+    // A digital stream already running asked the display engine for audio
+    // before anyone served it: it asks again.
+    crate::display::note_display_driver_arrived();
     Ok(cards)
 }
 

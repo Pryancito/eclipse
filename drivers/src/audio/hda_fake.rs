@@ -1975,6 +1975,18 @@ mod hdmi_tests {
         let t1 = test_clock::now();
         s.write(&constant(1000, 4096)).unwrap();
         assert_eq!(dev.inner.lock().last_kick_us, t1, "due again");
+        // Running, nothing new: no kick, however long it runs.
+        hw.run_for_us(2 * HDMI_KICK_MIN_US);
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(dev.inner.lock().last_kick_us, t1, "a running stream");
+        // A driver of the monitor's GPU turns up under it: one more kick.
+        crate::display::note_display_driver_arrived();
+        let t2 = test_clock::now();
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(dev.inner.lock().last_kick_us, t2, "the new driver is told");
+        hw.run_for_us(2 * HDMI_KICK_MIN_US);
+        s.write(&constant(1000, 4096)).unwrap();
+        assert_eq!(dev.inner.lock().last_kick_us, t2, "only once");
         // A live pin never kicks.
         let (hw2, dev2) = device_with(&[HDMI_PIN]);
         hw2.run_for_us(10_000);
