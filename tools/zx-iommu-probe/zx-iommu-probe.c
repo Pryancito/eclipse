@@ -8,7 +8,7 @@
 //   1. into a pinned page: the transfer must succeed, so a device with a
 //      domain still reaches what its driver gave it;
 //   2. into a page that was pinned, handed to nobody, and unpinned again:
-//      with the IOMMU on (`iommu=on`) the device must fail the transfer and
+//      with an IOMMU (unless `iommu=off`) the device must fail the transfer and
 //      the page must stay untouched; without it the device writes there.
 //
 // The second page stays the process's own memory throughout (an unpin does

@@ -3,7 +3,9 @@
 //! domain of its own when a process claims it. The arithmetic (the table,
 //! the entries, the page walk) is `common/vtd.rs`.
 //!
-//! Opt-in for now: only `iommu=on` on the command line turns it on. Any
+//! On by default on x86_64: `iommu=off` on the command line leaves it off,
+//! and every device with full DMA, as before. A unit that covers only a
+//! graphics device is left off (see [`graphics_only`]). Any other
 //! unit this cannot drive (no pass-through, no table depth it walks) leaves
 //! the whole IOMMU off, as before: a half-enabled IOMMU is a machine where
 //! some claimed devices are isolated and some are not, without saying so.
@@ -364,7 +366,8 @@ impl Drop for Domain {
 /// Every unit of the machine.
 struct VtD {
     dmar: Dmar,
-    units: Vec<Arc<Unit>>,
+    /// One per DMAR unit, in its order; `None` for a unit left off.
+    units: Vec<Option<Arc<Unit>>>,
 }
 
 impl IommuUnit for VtD {
@@ -376,7 +379,7 @@ impl IommuUnit for VtD {
         let index = self
             .dmar
             .unit_for(r.segment, r.bus, r.device, r.function, cfg_read)?;
-        let unit = self.units[index].clone();
+        let unit = self.units[index].clone()?;
         let did = unit.take_did()?;
         let Some(root) = PhysFrame::new_zero() else {
             unit.give_did(did);
@@ -429,7 +432,7 @@ impl IommuUnit for VtD {
     }
 
     fn poll_faults(&self) {
-        for unit in &self.units {
+        for unit in self.units.iter().flatten() {
             unit.poll_faults();
         }
     }
@@ -525,10 +528,33 @@ fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
     Ok(unit)
 }
 
-/// Find and take over the machine's VT-d units, when the command line asks.
+/// PCI class of display controllers.
+const CLASS_DISPLAY: u8 = 0x03;
+/// Configuration offset of the base class byte.
+const CLASS_OFFSET: u16 = 0x0b;
+
+/// Whether `drhd` is a unit for an integrated GPU alone: not the catch-all
+/// unit, and every device it lists a display controller. Such a unit is
+/// left off, as Linux does by default on many chipsets (`igfx_off`): the
+/// GPU is the kernel's, never a process's, and turning translation on in
+/// front of it, even in pass-through, is where firmware and chipset quirks
+/// live. Nothing of what a process drives is behind it.
+fn graphics_only(drhd: &vtd::Drhd) -> bool {
+    !drhd.include_all
+        && !drhd.scopes.is_empty()
+        && drhd.scopes.iter().all(|scope| {
+            matches!(
+                scope.resolve(cfg_read),
+                Some(vtd::Target::Function(bus, dev, func))
+                    if cfg_read(bus, dev, func, CLASS_OFFSET) == CLASS_DISPLAY
+            )
+        })
+}
+
+/// Find and take over the machine's VT-d units, unless the command line
+/// says `iommu=off`.
 pub(super) fn init() {
-    let asked = crate::cmdline::value(KCONFIG.cmdline, "iommu");
-    if asked != Some("on") {
+    if crate::cmdline::value(KCONFIG.cmdline, "iommu") == Some("off") {
         return;
     }
     let Some(dmar) = super::drivers::acpi_table(Signature::DMAR).and_then(vtd::parse_dmar) else {
@@ -546,6 +572,14 @@ pub(super) fn init() {
     // Check every unit can be driven before turning any on.
     let mut units = Vec::new();
     for (i, drhd) in dmar.units.iter().enumerate() {
+        if graphics_only(drhd) {
+            crate::klog_info!(
+                "iommu: vt-d unit {i} at {:#x} covers only a GPU; left off",
+                drhd.base
+            );
+            units.push(None);
+            continue;
+        }
         match bring_up(i, drhd.base) {
             Ok(unit) => {
                 crate::klog_info!(
@@ -560,14 +594,14 @@ pub(super) fn init() {
                         ", non-coherent walks"
                     }
                 );
-                units.push(Arc::new(unit));
+                units.push(Some(Arc::new(unit)));
             }
             Err(why) => {
                 crate::klog_warn!(
                     "iommu: vt-d unit {i} at {:#x}: {why}; IOMMU left off",
                     drhd.base
                 );
-                for unit in &units {
+                for unit in units.iter().flatten() {
                     unit.gcmd(gcmd::TE, false);
                 }
                 return;
