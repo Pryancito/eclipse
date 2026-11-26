@@ -68,6 +68,11 @@ pub trait IommuUnit: Send + Sync {
     /// `None` when this unit does not cover that function, or cannot give it
     /// a domain: the device then stays in passthrough.
     fn domain_for(&self, requester: PciRequester) -> Option<Arc<dyn DmaDomain>>;
+
+    /// Write to the log the DMA faults recorded since the last call (a
+    /// device reaching for memory it was not given), and clear them. Called
+    /// from a slow kernel task: faults raise no interrupt here.
+    fn poll_faults(&self) {}
 }
 
 static UNIT: Mutex<Option<Arc<dyn IommuUnit>>> = Mutex::new(None);
@@ -75,7 +80,7 @@ static UNIT: Mutex<Option<Arc<dyn IommuUnit>>> = Mutex::new(None);
 /// Make `unit` the one that hands out domains. Called once, by the backend
 /// that found it, before any device is claimed.
 pub fn install(unit: Arc<dyn IommuUnit>) {
-    info!("iommu: {} translating claimed devices", unit.name());
+    crate::klog_info!("iommu: {} translating claimed devices", unit.name());
     *UNIT.lock() = Some(unit);
 }
 
