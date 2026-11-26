@@ -295,6 +295,35 @@ pub(super) fn boot_display(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         .map_err(|_| ZxError::INVALID_ARGS)
 }
 
+/// `eclipse_driver_flags(out, len)`: the boot line's `nvidia.*` switches
+/// as the kernel's NVIDIA driver was told them, written to `out` as
+/// `zcore_drivers::display::driver_flags` lays them out, for the driver of
+/// a GPU this process holds to be told the same. The bytes written.
+/// `ACCESS_DENIED` to a process that holds no GPU; `BUFFER_TOO_SMALL` for a
+/// `len` short of them; `INVALID_ARGS` for an `out` that cannot be written.
+pub const ECLIPSE_DRIVER_FLAGS: u32 = super::ECLIPSE_GATEWAY_EXT + 29;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn driver_flags(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<usize> {
+    use linux_object::fs::devfs::served::nvctl;
+    if !super::device_claim::holds_gpu(proc) {
+        return Err(ZxError::ACCESS_DENIED);
+    }
+    let flags = nvctl::driver_flags();
+    if args[1] < flags.len() {
+        return Err(ZxError::BUFFER_TOO_SMALL);
+    }
+    kernel_hal::user::UserOutPtr::<u8>::from(args[0])
+        .write_array(&flags)
+        .map_err(|_| ZxError::INVALID_ARGS)?;
+    Ok(flags.len())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn driver_flags(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult<usize> {
+    Err(ZxError::NOT_SUPPORTED)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub(super) fn boot_display(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
     Err(ZxError::NOT_SUPPORTED)

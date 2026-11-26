@@ -1413,6 +1413,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
             if nv.nouveau_uapi {
+                // Asked for, whether or not a card here takes it: a card a
+                // process serves later (`udrv-nvidia`) is enabled for it
+                // when it comes.
+                kernel_hal::drivers::set_nouveau_uapi_requested(true);
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()
                     .iter()

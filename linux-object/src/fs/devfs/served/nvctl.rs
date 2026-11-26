@@ -183,3 +183,13 @@ pub use zcore_drivers::display::boot_display::LEN as BOOT_DISPLAY_LEN;
 pub fn boot_display() -> [u8; BOOT_DISPLAY_LEN] {
     zcore_drivers::display::boot_display::BootDisplay::this_boot().encode()
 }
+
+/// The most bytes of [`driver_flags`].
+pub use zcore_drivers::display::driver_flags::MAX as DRIVER_FLAGS_MAX;
+
+/// `ECLIPSE_DRIVER_FLAGS`'s bytes: the boot line's `nvidia.*` switches as
+/// the kernel's NVIDIA driver was told them, for the same driver in a
+/// process.
+pub fn driver_flags() -> alloc::vec::Vec<u8> {
+    zcore_drivers::display::driver_flags::DriverFlags::this_boot().encode()
+}

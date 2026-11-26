@@ -755,6 +755,7 @@ fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
 mod eld;
 use eld::build_eld_from_base_edid;
 mod nvkms_takeover;
+pub(super) use nvkms_takeover::requested as nvkms_requested;
 pub use nvkms_takeover::set_requested as set_nvkms_requested;
 
 impl NvidiaGpu {

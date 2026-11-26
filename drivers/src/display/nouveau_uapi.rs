@@ -61,6 +61,21 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// `nvidia.nouveau_uapi` is on the boot line, whether or not a card could
+/// take it then: a card served by a process later (`udrv-nvidia`) is
+/// enabled for it when it comes, as the kernel's cards are at boot.
+static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Record that `nvidia.nouveau_uapi` was asked for.
+pub fn set_requested(v: bool) {
+    REQUESTED.store(v, Ordering::Relaxed);
+}
+
+/// Whether `nvidia.nouveau_uapi` was asked for ([`set_requested`]).
+pub fn requested() -> bool {
+    REQUESTED.load(Ordering::Relaxed)
+}
+
 /// Opt-in for on-demand console-GPU GSP bring-up (`ensure_console_gpu_brought_up`).
 /// Default **off**: safer boot (manual `cat /proc/gpustep14`). Enable with
 /// `nvidia.console_gsp` on the kernel cmdline.

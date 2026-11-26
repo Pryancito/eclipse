@@ -268,6 +268,21 @@ pub fn boot_display(out: &mut [u8]) -> Result<(), Status> {
     .map(|_| ())
 }
 
+/// The boot line's `nvidia.*` switches as the kernel's NVIDIA driver was
+/// told them (`ECLIPSE_DRIVER_FLAGS`), into `out`, as
+/// `zcore_drivers::display::driver_flags` lays them out: for the driver of
+/// a GPU this process holds. The bytes written. `ACCESS_DENIED` to a
+/// process that holds no GPU.
+pub fn driver_flags(out: &mut [u8]) -> Result<usize, Status> {
+    // SAFETY: the kernel writes at most `out.len()` bytes into `out`.
+    unsafe {
+        zx::call(
+            nr::ECLIPSE_DRIVER_FLAGS,
+            [out.as_mut_ptr() as usize, out.len(), 0, 0, 0, 0],
+        )
+    }
+}
+
 /// DMA memory: contiguous, pinned, and mapped here.
 pub struct Dma {
     /// Where this process sees it.
