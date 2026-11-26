@@ -1,0 +1,180 @@
+# Eclipse OS: el fondo de escritorio (lunarbg). Todo va a
+# /etc/eclipse/entorno con eclipse-entorno, que reinicia el fondo.
+# Las lecturas se colocan solas sobre el anillo exterior del reloj
+# (tools/lunarbg/src/scene/lecturas.rs): una lectura apagada, o que esta
+# máquina no puede medir, deja su sitio y la columna se recalcula.
+# Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:fondo]
+es = Fondo de escritorio
+en = Wallpaper
+
+[fondo.animado]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_STATIC
+tipo    = si-no
+valores = 0 1
+defecto = 0
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_STATIC {}
+es      = Fondo animado
+en      = Animated wallpaper
+ayuda   = Quieto gasta menos CPU; el fondo se reinicia
+ayuda.en = Still uses less CPU; the wallpaper restarts
+
+[fondo.fps]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_FPS
+tipo    = elegir
+valores = 4 8 15 24 30
+defecto = 8
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_FPS {}
+es      = Imágenes por segundo del fondo
+en      = Wallpaper frame rate
+ayuda   = Más es más suave y gasta más CPU; el fondo se reinicia
+ayuda.en = More is smoother and uses more CPU; the wallpaper restarts
+
+[fondo.reloj]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_RELOJ
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_RELOJ {}
+es      = Reloj en los anillos
+en      = Clock on the rings
+ayuda   = Oro la hora, cian el minuto, los puntos los segundos
+ayuda.en = Gold the hour, cyan the minute, the dots the seconds
+
+[fondo.fecha]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_FECHA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_FECHA {}
+es      = Fecha y fase lunar
+en      = Date and Moon phase
+ayuda   = La línea bajo ECLIPSE · SYSTEM
+ayuda.en = The line under ECLIPSE · SYSTEM
+
+[fondo.lecturas]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURAS
+tipo    = elegir
+valores = derecha:A_la_derecha izquierda:A_la_izquierda no:Ocultas
+valores.en = derecha:On_the_right izquierda:On_the_left no:Hidden
+defecto = derecha
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURAS {}
+es      = Lecturas del sistema
+en      = System readings
+ayuda   = La columna ECLIPSE · LECTURAS junto al reloj
+ayuda.en = The ECLIPSE · LECTURAS column beside the clock
+
+[lectura.carga]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_CARGA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_CARGA {}
+es      = Lectura: carga
+en      = Reading: load
+ayuda   = Carga media de 1, 5 y 15 minutos
+ayuda.en = 1, 5 and 15 minute load average
+
+[lectura.cpu]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_CPU
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_CPU {}
+es      = Lectura: CPU
+en      = Reading: CPU
+ayuda   = Uso de CPU e hilos
+ayuda.en = CPU use and threads
+
+[lectura.memoria]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_MEMORIA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_MEMORIA {}
+es      = Lectura: memoria
+en      = Reading: memory
+ayuda   = Usada y total
+ayuda.en = Used and total
+
+[lectura.red]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_RED
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_RED {}
+es      = Lectura: red
+en      = Reading: network
+ayuda   = Bajada y subida, con su traza
+ayuda.en = Down and up, with its trace
+
+[lectura.disco]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_DISCO
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_DISCO {}
+es      = Lectura: disco
+en      = Reading: disk
+ayuda   = Ocupación de /
+ayuda.en = How full / is
+
+[lectura.temperatura]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_TEMPERATURA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_TEMPERATURA {}
+es      = Lectura: temperatura
+en      = Reading: temperature
+ayuda   = La zona térmica más caliente, si la hay
+ayuda.en = The hottest thermal zone, if any
+
+[lectura.en_marcha]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_EN_MARCHA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_EN_MARCHA {}
+es      = Lectura: tiempo en marcha
+en      = Reading: uptime
+ayuda   = Desde el arranque
+ayuda.en = Since boot
+
+[lectura.procesos]
+grupo   = fondo
+fichero = /etc/eclipse/entorno
+clave   = LUNARBG_LECTURA_PROCESOS
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBG_LECTURA_PROCESOS {}
+es      = Lectura: procesos
+en      = Reading: processes
+ayuda   = Cuántos hay
+ayuda.en = How many there are

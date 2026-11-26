@@ -84,6 +84,14 @@ pub const DE_SERIE: &[(&str, &str)] = &[
         include_str!("../claves.d/60-escritorio.claves"),
     ),
     (
+        "62-fondo.claves",
+        include_str!("../claves.d/62-fondo.claves"),
+    ),
+    (
+        "64-barra.claves",
+        include_str!("../claves.d/64-barra.claves"),
+    ),
+    (
         "70-avanzado.claves",
         include_str!("../claves.d/70-avanzado.claves"),
     ),

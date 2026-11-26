@@ -5,6 +5,7 @@
 //! [`draw_info_tecno`].
 
 use super::*;
+use lunarbar::barra::{muestra as on, Modulo};
 
 /// Cells in a segmented meter, and the width both meters occupy. Seven cells
 /// of 3px with a 1px gap come to 27, one over the continuous gauge's 26, so
@@ -138,13 +139,13 @@ pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover:
     cv.crescent(10, ly, d, pal().accent);
     lx += cv.text_bold(&wordmark, lx, ty, if tecno() { pal().accent } else { pal().text });
 
-    if let Some(up) = &m.uptime {
+    if let Some(up) = m.uptime.as_ref().filter(|_| on(Modulo::EnMarcha)) {
         lx += 12;
         cv.vrule(lx, hi, pal().rule);
         lx += 12;
         lx += cv.text(&cap(&format!("up {up}")), lx, ty, pal().muted);
     }
-    if let Some(load) = m.load {
+    if let Some(load) = m.load.filter(|_| on(Modulo::Carga)) {
         lx += 12;
         cv.vrule(lx, hi, pal().rule);
         lx += 12;
@@ -178,7 +179,7 @@ pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover:
             rx -= 10;
         }
     }
-    if let Some((b, ch)) = m.batt {
+    if let Some((b, ch)) = m.batt.filter(|_| on(Modulo::Bateria)) {
         let label = cap(&if ch { format!("bat {b}% +") } else { format!("bat {b}%") });
         let col = if b < 15 && !ch { pal().warn } else { pal().muted };
         if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &label, Some(b as f32 / 100.0), col) {
@@ -186,14 +187,14 @@ pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover:
             cv.vrule(rx, hi, pal().rule);
         }
     }
-    if let Some(t) = m.temp {
+    if let Some(t) = m.temp.filter(|_| on(Modulo::Temperatura)) {
         let col = if t >= 85 { pal().warn } else { pal().muted };
         if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &cap(&format!("{t}°c")), None, col) {
             rx = x - 12;
             cv.vrule(rx, hi, pal().rule);
         }
     }
-    if let Some(dk) = m.disk {
+    if let Some(dk) = m.disk.filter(|_| on(Modulo::Disco)) {
         if let Some(x) = metric(
             cv,
             rx - 10,
@@ -208,7 +209,7 @@ pub(crate) fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover:
             cv.vrule(rx, hi, pal().rule);
         }
     }
-    if let Some(n) = &m.net {
+    if let Some(n) = m.net.as_ref().filter(|_| on(Modulo::Red)) {
         if n.link {
             net_module(cv, rx - 10, min_x, ty, hi, n, &m.net_hist);
         }
@@ -255,7 +256,8 @@ pub(crate) fn draw_info_tecno(
     // Desktop chips: square, hairline, the current one lit. Only as many as
     // leave half the bar to everything else.
     let mut ws_hits = Vec::new();
-    for (label, active) in &m.workspaces {
+    let chips: &[_] = if on(Modulo::Escritorios) { &m.workspaces } else { &[] };
+    for (label, active) in chips {
         let cw = Canvas::text_width(label) + 12;
         if min_x + cw > w as i32 / 2 {
             break;
@@ -298,22 +300,26 @@ pub(crate) fn draw_info_tecno(
 
     // Right to left: TEMP, NET, MEM, CPU, then the battery if there is one.
     let hot = |v: Option<u32>, at: u32| if v.unwrap_or(0) >= at { p.warn } else { p.text };
-    if let Some(t) = m.temp {
+    if let Some(t) = m.temp.filter(|_| on(Modulo::Temperatura)) {
         let col = if t >= 85 { p.warn } else { TECNO_GOLD };
         rx = readout(cv, rx, min_x, ty, hi, "TEMP", None, &format!("{t}°"), col).unwrap_or(rx);
     }
-    if let Some(n) = m.net.as_ref().filter(|n| n.link) {
+    if let Some(n) = m.net.as_ref().filter(|n| n.link && on(Modulo::Red)) {
         let lw = Canvas::text_width("NET") + 8;
         if let Some(x) = net_module(cv, rx, min_x + lw, ty, hi, n, &meter::Ring::default()) {
             cv.text("NET", x - lw, ty, p.dim);
             rx = x - lw - 18;
         }
     }
-    let mem = m.mem.map(|v| v as f32 / 100.0);
-    rx = readout(cv, rx, min_x, ty, hi, "MEM", mem, &format!("{}%", opt(m.mem)), hot(m.mem, 90)).unwrap_or(rx);
-    let cpu = m.cpu.map(|v| v as f32 / 100.0);
-    rx = readout(cv, rx, min_x, ty, hi, "CPU", cpu, &format!("{}%", opt(m.cpu)), hot(m.cpu, 90)).unwrap_or(rx);
-    if let Some((b, ch)) = m.batt {
+    if on(Modulo::Memoria) {
+        let mem = m.mem.map(|v| v as f32 / 100.0);
+        rx = readout(cv, rx, min_x, ty, hi, "MEM", mem, &format!("{}%", opt(m.mem)), hot(m.mem, 90)).unwrap_or(rx);
+    }
+    if on(Modulo::Cpu) {
+        let cpu = m.cpu.map(|v| v as f32 / 100.0);
+        rx = readout(cv, rx, min_x, ty, hi, "CPU", cpu, &format!("{}%", opt(m.cpu)), hot(m.cpu, 90)).unwrap_or(rx);
+    }
+    if let Some((b, ch)) = m.batt.filter(|_| on(Modulo::Bateria)) {
         let v = if ch { format!("{b}% +") } else { format!("{b}%") };
         let col = if b < 15 && !ch { p.warn } else { p.text };
         rx = readout(cv, rx, min_x, ty, hi, "BAT", Some(b as f32 / 100.0), &v, col).unwrap_or(rx);
@@ -327,7 +333,7 @@ pub(crate) fn draw_info_tecno(
         title.pop();
         title.push('.');
     }
-    if !title.is_empty() && max_chars > 3 {
+    if !title.is_empty() && max_chars > 3 && on(Modulo::Titulo) {
         let tw = Canvas::text_width(&title);
         let tx = ((w as i32 - tw) / 2).clamp(min_x, (rx + 2 - tw).max(min_x));
         cv.text(&title, tx, ty, p.dim);

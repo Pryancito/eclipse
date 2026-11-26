@@ -1,0 +1,152 @@
+# Eclipse OS: la barra superior (lunarbar). Todo va a
+# /etc/eclipse/entorno con eclipse-entorno, que reinicia la barra. Un
+# módulo apagado deja su sitio a los demás (tools/lunarbar/src/barra.rs).
+# Formato: tools/lunarbar/src/claves.rs.
+
+[grupo:barra]
+es = Barra superior
+en = Top bar
+
+[barra.alto]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_HEIGHT
+tipo    = elegir
+valores = auto:Automática 28 32 36 40 44 48 56 64
+valores.en = auto:Automatic
+defecto = auto
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_HEIGHT {}
+es      = Altura de la barra
+en      = Bar height
+ayuda   = Automática sigue al aspecto; la barra se reinicia
+ayuda.en = Automatic follows the look; the bar restarts
+
+[barra.escritorios]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_ESCRITORIOS
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_ESCRITORIOS {}
+es      = Escritorios
+en      = Desktops
+ayuda   = Los botones 01 02 03 04 (aspecto tecno)
+ayuda.en = The 01 02 03 04 chips (tecno look)
+
+[barra.titulo]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_TITULO
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_TITULO {}
+es      = Título de la ventana
+en      = Window title
+ayuda   = La ventana activa, en el centro (aspecto tecno)
+ayuda.en = The focused window, centred (tecno look)
+
+[barra.cpu]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_CPU
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_CPU {}
+es      = CPU
+en      = CPU
+ayuda   = Medidor y porcentaje (aspecto tecno)
+ayuda.en = Meter and percentage (tecno look)
+
+[barra.memoria]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_MEMORIA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_MEMORIA {}
+es      = Memoria
+en      = Memory
+ayuda   = Medidor y porcentaje (aspecto tecno)
+ayuda.en = Meter and percentage (tecno look)
+
+[barra.red]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_RED
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_RED {}
+es      = Red
+en      = Network
+ayuda   = Bajada y subida
+ayuda.en = Down and up
+
+[barra.temperatura]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_TEMPERATURA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_TEMPERATURA {}
+es      = Temperatura
+en      = Temperature
+ayuda   = Solo si la máquina tiene sensor
+ayuda.en = Only if the machine has a sensor
+
+[barra.bateria]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_BATERIA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_BATERIA {}
+es      = Batería
+en      = Battery
+ayuda   = Solo si la máquina tiene batería
+ayuda.en = Only if the machine has a battery
+
+[barra.disco]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_DISCO
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_DISCO {}
+es      = Disco
+en      = Disk
+ayuda   = Otros aspectos; tecno no la muestra
+ayuda.en = Other looks; tecno does not show it
+
+[barra.en_marcha]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_EN_MARCHA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_EN_MARCHA {}
+es      = Tiempo en marcha
+en      = Uptime
+ayuda   = Otros aspectos; tecno no la muestra
+ayuda.en = Other looks; tecno does not show it
+
+[barra.carga]
+grupo   = barra
+fichero = /etc/eclipse/entorno
+clave   = LUNARBAR_CARGA
+tipo    = si-no
+valores = si no
+defecto = si
+aplicar = /usr/local/bin/eclipse-entorno LUNARBAR_CARGA {}
+es      = Carga
+en      = Load
+ayuda   = Otros aspectos; tecno no la muestra
+ayuda.en = Other looks; tecno does not show it

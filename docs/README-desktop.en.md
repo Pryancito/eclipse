@@ -448,6 +448,20 @@ lunar tools; the gold brackets do not change), and so does `LUNAR_CLOCK`
 (`24` or `12`, the clock of the bar and the lock screen). labwc's borders
 and the wallpaper keep their colour for now.
 
+The panel's "Wallpaper" and "Top bar" groups live there too. The `tecno`
+wallpaper reads `LUNARBG_RELOJ` and `LUNARBG_FECHA` (`si`/`no`: the clock on
+the rings and the date line) and `LUNARBG_LECTURAS` (`derecha`, `izquierda`
+or `no`), the "ECLIPSE · LECTURAS" column of live data from `/proc` and
+`/sys`: load, CPU, memory, network, disk, temperature, uptime and processes,
+each with its own `LUNARBG_LECTURA_*`. Its placement is computed: rows 32 px
+apart centred on the face, each tick on the outer ring at `asin(dy/R)` and a
+level line to the column, 42 px outside the ring
+(`tools/lunarbg/src/scene/lecturas.rs`). A reading the machine cannot measure
+is left out and the column is recomputed. The bar reads `LUNARBAR_*`
+(`ESCRITORIOS`, `TITULO`, `CPU`, `MEMORIA`, `RED`, `TEMPERATURA`, `BATERIA`,
+`DISCO`, `EN_MARCHA`, `CARGA`; `no` removes the module, see
+`tools/lunarbar/src/barra.rs`).
+
 `arranque = KEY` edits one option inside the kernel command line that `clave`
 holds (`rboot.conf`'s `cmdline=`, whose last line is the one rboot reads): it
 writes `KEY=value` where the key first appears and drops later spellings,

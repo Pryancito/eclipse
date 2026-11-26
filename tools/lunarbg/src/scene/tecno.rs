@@ -61,7 +61,7 @@ const SUN_DY: f32 = 15.0;
 const R_INNER: f32 = 165.0;
 const R_DOTS: f32 = 215.0;
 const R_SOLID: f32 = 255.0;
-const R_OUTER: f32 = 330.0;
+pub(super) const R_OUTER: f32 = 330.0;
 const CAPTION_DY: f32 = 293.0;
 const CAPTION: &str = "ECLIPSE · SYSTEM · KERNEL · ZCORE";
 const CAPTION_ADV: f32 = 13.5;
@@ -216,24 +216,27 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
         (cx + cos * r * s * sxk, cy + sin * r * s)
     };
 
-    // Dotted ring: the sixty minutes, every fifth a little larger, and the
-    // current second lit.
-    for k in 0..60 {
-        let (x, y) = at(R_DOTS, up + k as f32 * 6.0);
-        let (r, a) = if k == ss { (1.4, 0.95) } else if k % 5 == 0 { (1.0, 0.45) } else { (0.7, 0.25) };
-        pb.dot(x, y, r * px, cyan, a);
-    }
-
-    // The hands, as arcs from the top: gold the hour on the inner ring, cyan
-    // the minute on the solid one, each with a dot where it stands.
-    let hour = (hh as f32 + mm as f32 / 60.0) * 30.0;
-    let minute = (mm as f32 + ss as f32 / 60.0) * 6.0;
-    for (r, span, c) in [(R_INNER, hour, gold), (R_SOLID, minute, cyan)] {
-        if span >= 0.5 {
-            pb.sweep(cx, cy, r * s, up, span, 1.2 * px, c, 0.4);
+    let aj = super::lecturas::ajustes();
+    if aj.reloj {
+        // Dotted ring: the sixty minutes, every fifth a little larger, and the
+        // current second lit.
+        for k in 0..60 {
+            let (x, y) = at(R_DOTS, up + k as f32 * 6.0);
+            let (r, a) = if k == ss { (1.4, 0.95) } else if k % 5 == 0 { (1.0, 0.45) } else { (0.7, 0.25) };
+            pb.dot(x, y, r * px, cyan, a);
         }
-        let (x, y) = at(r, up + span);
-        pb.dot(x, y, 2.2 * px, c, 0.9);
+
+        // The hands, as arcs from the top: gold the hour on the inner ring, cyan
+        // the minute on the solid one, each with a dot where it stands.
+        let hour = (hh as f32 + mm as f32 / 60.0) * 30.0;
+        let minute = (mm as f32 + ss as f32 / 60.0) * 6.0;
+        for (r, span, c) in [(R_INNER, hour, gold), (R_SOLID, minute, cyan)] {
+            if span >= 0.5 {
+                pb.sweep(cx, cy, r * s, up, span, 1.2 * px, c, 0.4);
+            }
+            let (x, y) = at(r, up + span);
+            pb.dot(x, y, 2.2 * px, c, 0.9);
+        }
     }
 
     // The eclipse: the gold sun, then the dark moon over it, with a faint
@@ -259,19 +262,27 @@ pub(super) fn frame(pb: &mut PixBuf, lay: &Layout, t_ms: u64) {
         }
     }
 
-    // The date and today's Moon, smaller and dimmer than the caption.
-    let line = date_line(local, t, lang());
-    let adv = LINE_ADV * s;
-    let n = line.chars().count() as f32;
-    let left = cx - (n - 1.0) * adv / 2.0;
-    let ty = cy + LINE_DY * s;
-    for (i, ch) in line.chars().enumerate() {
-        let gx = left + i as f32 * adv;
-        match ch {
-            ' ' => {}
-            '·' => pb.dot(gx, ty, 1.0 * px, gold, 0.5),
-            _ => pb.glyph(ch, gx, ty, scale, muted, 0.5),
+    if aj.fecha {
+        // The date and today's Moon, smaller and dimmer than the caption.
+        let line = date_line(local, t, lang());
+        let adv = LINE_ADV * s;
+        let n = line.chars().count() as f32;
+        let left = cx - (n - 1.0) * adv / 2.0;
+        let ty = cy + LINE_DY * s;
+        for (i, ch) in line.chars().enumerate() {
+            let gx = left + i as f32 * adv;
+            match ch {
+                ' ' => {}
+                '·' => pb.dot(gx, ty, 1.0 * px, gold, 0.5),
+                _ => pb.glyph(ch, gx, ty, scale, muted, 0.5),
+            }
         }
+    }
+
+    // The readings column beside the face (super::lecturas).
+    if let Some(lado) = lay.lecturas {
+        let rows = super::lecturas::filas(&super::lecturas::muestra(t), &aj.filas, lang());
+        super::lecturas::dibujar(pb, cx, cy, s, lado, &rows, cyan, gold, muted);
     }
 }
 
@@ -300,7 +311,7 @@ impl PixBuf<'_> {
 
     /// An arc without the cosmic scene's glowing end dots: a plain stroke.
     #[allow(clippy::too_many_arguments)]
-    fn sweep(&mut self, cx: f32, cy: f32, r: f32, start: f32, span: f32, t: f32, c: Rgb, a: f32) {
+    pub(super) fn sweep(&mut self, cx: f32, cy: f32, r: f32, start: f32, span: f32, t: f32, c: Rgb, a: f32) {
         // One segment per 3 degrees, so a long arc stays round.
         let segs = ((span.abs() / 3.0).ceil() as usize).max(4);
         let sx = self.sx;
@@ -355,7 +366,7 @@ impl PixBuf<'_> {
 
     /// The 5x7 glyph centred at (gx, gy) with no outline: the caption sits on
     /// a flat ground and an outline would only thicken it.
-    fn glyph5x7(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32) {
+    pub(super) fn glyph5x7(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32) {
         let left = (gx - (5 * scale) as f32 / 2.0) as i32;
         let top = (gy - (7 * scale) as f32 / 2.0) as i32;
         for (row, bits) in super::glyph5x7(ch).iter().enumerate() {
