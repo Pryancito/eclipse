@@ -92,6 +92,13 @@ pub fn free_os_event(h_client: u32, fd: u32) -> NV_STATUS {
     nvidia_rm_sys::frontend::events::free_os_event(h_client, fd)
 }
 
+/// HDMI/DP audio on the GPUs a process serves: the process enables it
+/// on the one that drives the monitor and says what it did. `None` when no
+/// process serves an RM.
+pub fn kick_served_hdmi_audio() -> Option<alloc::string::String> {
+    remote::served().map(|served| served.kick_hdmi_audio())
+}
+
 pub use nvidia_rm_sys::frontend::events::NonstallPoll;
 
 /// `nvidia_rm_sys::frontend::events::service_nonstall`: service the nonstall
