@@ -12,7 +12,9 @@
 //! - the handles it names are those of the slices the kernel gave it
 //!   ([`wire::SLICE`]), never another card's;
 //! - the memory it registers is memory it pinned through that GPU's
-//!   initiator, or one of the GPU's memory BARs.
+//!   initiator, or one of the GPU's memory BARs. The kernel maps its own
+//!   window onto a range of a BAR before it takes it
+//!   (`user::window::map`): it reads those objects where they are.
 //!
 //! When it is gone, its objects leave the table, and what it pinned stays
 //! pinned for good (`device_claim`): a client may still have one mapped.
@@ -32,8 +34,9 @@ use super::device_claim::{holds_gpu, owns_memory};
 ///
 /// `ACCESS_DENIED` for a process that holds no GPU, a handle outside its
 /// slices or memory not its own; `NOT_FOUND` for a handle the table does
-/// not have where the op needs one; `INVALID_ARGS` for an unknown op or a
-/// bad `out`.
+/// not have where the op needs one; `NO_RESOURCES` for an object in a BAR
+/// the kernel has no window onto; `INVALID_ARGS` for an unknown op or a bad
+/// `out`.
 pub const ECLIPSE_GEM: u32 = super::ECLIPSE_GATEWAY_EXT + 23;
 
 /// The slices each driver was given, by its process.
@@ -57,6 +60,13 @@ pub(super) fn driver_gone(id: KoID) -> bool {
     }
     SLICES.lock().retain(|(holder, _)| *holder != id);
     gem_mmap::forget_where(|h| mine.iter().any(|s| s.contains(h))) > 0
+}
+
+/// Make sure the kernel's own window onto the device memory at
+/// `[phys, phys + len)` is mapped (`user::window::map`): where the kernel
+/// reads an object a driver placed there. Whether it is.
+fn kernel_window(phys: u64, len: u64) -> bool {
+    kernel_hal::drivers::user::window::map(phys, len, kernel_hal::mem::phys_to_virt)
 }
 
 /// [`ECLIPSE_GEM`].
@@ -114,6 +124,14 @@ fn gem_op(proc: &Arc<Process>, args: &[usize; 6]) -> Result<u64, ZxError> {
             // What the memory is decides how it is mapped, not what the
             // driver calls it: a BAR is never mapped write-back.
             if device {
+                // The kernel reads the object where it is (a frame copied
+                // to the panel, the pointer's image, PRIME), through its
+                // own window, and the driver mapped only its own. An
+                // object the kernel cannot read is not in its table: a
+                // client is refused it, where the kernel would fault.
+                if !kernel_window(b, c) {
+                    return Err(ZxError::NO_RESOURCES);
+                }
                 gem_mmap::register_device_memory(handle, b, c, d);
             } else if op == wire::REGISTER {
                 gem_mmap::register(handle, b, c, d);
@@ -200,6 +218,15 @@ fn gem_op(proc: &Arc<Process>, args: &[usize; 6]) -> Result<u64, ZxError> {
             own()?;
             gem_mmap::note_host_pa_handed_out(handle);
             Ok(0)
+        }
+        wire::WINDOW => {
+            // Of a BAR of its own GPU only. Asked before an object is
+            // placed there, so that one the kernel could not read is
+            // placed in host memory instead of being refused later.
+            if owns_memory(proc, a, b) != Some(true) {
+                return Err(ZxError::ACCESS_DENIED);
+            }
+            yes(kernel_window(a, b))
         }
         wire::HOST_PA_TOTALS => {
             let (n, bytes) = gem_mmap::host_pa_totals();

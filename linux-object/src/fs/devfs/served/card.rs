@@ -177,15 +177,33 @@ pub fn ce_presents_allowed() -> bool {
     !DMA_ISOLATED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// [`served_snapshot`], empty when their copy engines may not take the
-/// kernel's frames ([`ce_presents_allowed`]): what the present path offers
-/// a copy to.
-pub fn ce_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
-    if ce_presents_allowed() {
-        served_snapshot()
-    } else {
-        Default::default()
+/// Of the cards processes drive, those the present path offers the copy
+/// of a frame to. All of them, when their copy engines may take the
+/// kernel's frames ([`ce_presents_allowed`]). Behind an IOMMU, none for a
+/// frame in the kernel's memory; and for one in a card's own (`in_vram`: a
+/// buffer its driver placed in VRAM), the cards with the monitor. Such a
+/// card copies its own VRAM to its own framebuffer and reads nothing of
+/// the kernel's, which is how the kernel's driver presents those frames;
+/// a card without the monitor would write the frame into another card's
+/// memory, and that is not in its domain either. Whose VRAM the frame is
+/// in is the driver's to say: it declines another card's.
+pub fn ce_snapshot(in_vram: bool) -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
+    let mut snapshot = served_snapshot();
+    let allowed = ce_presents_allowed();
+    for slot in snapshot.iter_mut() {
+        let console = slot.as_ref().is_some_and(|card| card.is_console_gpu());
+        if !copy_offered(allowed, in_vram, console) {
+            *slot = None;
+        }
     }
+    snapshot
+}
+
+/// [`ce_snapshot`] for one card: `allowed`, the cards may copy the
+/// kernel's frames; `in_vram`, the frame is in a card's own memory;
+/// `console`, this card has the monitor.
+fn copy_offered(allowed: bool, in_vram: bool, console: bool) -> bool {
+    allowed || (in_vram && console)
 }
 
 /// The cards processes drive now, without the heap: for the present path,

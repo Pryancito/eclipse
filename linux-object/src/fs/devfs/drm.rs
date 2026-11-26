@@ -3790,11 +3790,13 @@ fn blit_chunked(
 /// guard is held across the calls, exactly as the plain
 /// `for d in all_drm().as_vec().iter()` loops it replaced did.
 fn ce_try_in_order(
+    in_vram: bool,
     mut try_one: impl FnMut(&Arc<dyn zcore_drivers::scheme::DrmScheme>) -> bool,
 ) -> bool {
     // The cards a process drives (`udrv-nvidia`'s) are not in the kernel's
     // device list; each takes its place by the same rule, after its own.
-    let served = crate::fs::devfs::served::card::ce_snapshot();
+    // Behind an IOMMU, only for a frame in VRAM (`in_vram`).
+    let served = crate::fs::devfs::served::card::ce_snapshot(in_vram);
     let served = served.iter().flatten();
     let all = kernel_hal::drivers::all_drm();
     let all = all.as_vec();
@@ -4377,7 +4379,7 @@ pub fn scanout_region_checked(
             // FromDevice + repack+flat CE → CPU blit.
             let row_bytes = (blit_w as usize).saturating_mul(4) as u32;
             let src_pa = fb.phys_addr.saturating_add(src_byte_off);
-            blitted_by_ce = ce_try_in_order(|d| {
+            blitted_by_ce = ce_try_in_order(in_vram, |d| {
                 d.ce_present_2d_pitched(
                     src_pa,
                     fb.pitch,
@@ -4416,14 +4418,14 @@ pub fn scanout_region_checked(
                 )
                 .unwrap_or((0, 0));
                 if ce_src_pa != 0 && ce_size != 0 {
-                    blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
+                    blitted_by_ce = ce_try_in_order(false, |d| d.ce_present(ce_src_pa, ce_size));
                 }
             }
         } else {
             // Flat CE path: pitches match, a single flat copy covers the frame.
             let ce_src_pa = fb.phys_addr;
             let ce_size = (info.pitch as u64) * (blit_h as u64);
-            blitted_by_ce = ce_try_in_order(|d| d.ce_present(ce_src_pa, ce_size));
+            blitted_by_ce = ce_try_in_order(false, |d| d.ce_present(ce_src_pa, ce_size));
         }
         if !blitted_by_ce && !CE_NO_TAKER_LOGGED.swap(true, Ordering::Relaxed) {
             // Every GPU declined (wedged, not state-loaded, or no boot FB):

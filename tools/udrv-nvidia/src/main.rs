@@ -14,6 +14,9 @@
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
 //!   through the mapper, what the boot knows of the display, DMA memory
 //!   through the claim. The driver itself is not run.
+//! - `udrv-nvidia window-check VVVV DDDD [unasked]`: the kernel's own
+//!   window onto device memory the boot mapped none of, on any PCI function
+//!   with a memory BAR past the machine's RAM (`window_check`).
 //! - `udrv-nvidia bridge-check VVVV DDDD`: what the driver does above its
 //!   GPU (the walk to the root port, VGA routing, a bus reset), on any PCI
 //!   function behind a bridge (`bridge_check`).
@@ -44,6 +47,7 @@ mod platform;
 mod ports;
 mod stderr_log;
 mod syncobj;
+mod window_check;
 
 use std::process::exit;
 
@@ -78,6 +82,17 @@ fn main() {
                     .unwrap_or_else(|| fail("usage: udrv-nvidia bridge-check VVVV DDDD".into()))
             };
             bridge_check::bridge_check(hex(1), hex(2))
+        }
+        Some("window-check") => {
+            let hex = |i: usize| {
+                args.get(i)
+                    .and_then(|s| u16::from_str_radix(s, 16).ok())
+                    .unwrap_or_else(|| {
+                        fail("usage: udrv-nvidia window-check VVVV DDDD [unasked]".into())
+                    })
+            };
+            let asked = args.get(3).map(String::as_str) != Some("unasked");
+            window_check::window_check(hex(1), hex(2), asked)
         }
         Some("drm-check") => drm_check(),
         Some("nvkms-check") => nvkms_check::nvkms_check(args.get(1).map(String::as_str)),
@@ -980,6 +995,30 @@ fn drm_check() {
     println!("{NAME}: drm-check: ok");
 }
 
+/// Whether the kernel takes the 64x64 image in GEM object `handle` for the
+/// pointer (`DRM_IOCTL_MODE_CURSOR`, `_IOWR('d', 0xA3, struct
+/// drm_mode_cursor)`), on the first node of /dev/dri with a CRTC; the
+/// pointer is hidden again after. It copies the image out of the object to
+/// take it. `None` when no node has a CRTC.
+fn pointer_image_from(handle: u32) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    const CURSOR: u64 = 0xc01c_64a3;
+    const CURSOR_BO: u32 = 1;
+    let (file, crtc) = (0..8).find_map(|n| {
+        let file = open_rw(&format!("/dev/dri/card{n}"))?;
+        let crtc = *resources_of(&file)?.0.first()?;
+        Some((file, crtc))
+    })?;
+    // `struct drm_mode_cursor`: flags, crtc_id, x, y, width, height, handle.
+    let mut show = [CURSOR_BO, crtc, 0, 0, 64, 64, handle];
+    // SAFETY: `show` is the 28 bytes of the struct, alive for the call.
+    let shown = unsafe { libc::ioctl(file.as_raw_fd(), CURSOR as _, show.as_mut_ptr()) } == 0;
+    let mut hide = [CURSOR_BO, crtc, 0, 0, 0, 0, 0];
+    // SAFETY: as above.
+    unsafe { libc::ioctl(file.as_raw_fd(), CURSOR as _, hide.as_mut_ptr()) };
+    Some(shown)
+}
+
 /// A syncobj of `file`'s, made signaled (`DRM_IOCTL_SYNCOBJ_CREATE`).
 fn syncobj_signaled(file: &std::fs::File) -> Option<u32> {
     use std::os::fd::AsRawFd;
@@ -1135,6 +1174,39 @@ fn check(vendor: u16, device: u16) {
         "a GEM object in its BAR is device memory",
         gem_mmap::is_device_memory(h + 2),
     );
+    // One far into the BAR, where the boot mapped nothing of it for the
+    // kernel: its map of memory ends with the firmware's framebuffer, at
+    // the BAR's base. The kernel maps its own window onto the object when
+    // it is registered, and reads it there. The pointer's image is what it
+    // reads at once, with no client and no monitor.
+    let far = first.len.saturating_sub(0x10_0000);
+    if far >= 0x10_0000 {
+        let (deep, image) = ((first.phys + far) as u64, 64 * 64 * 4);
+        // What the driver asks before it places an object there: placed in
+        // host memory when the kernel says no.
+        ok(
+            "the kernel has a window onto a range far into its BAR, when asked",
+            gem_mmap::window(deep, image),
+        );
+        ok(
+            "...and none onto memory that is no BAR of its own",
+            !gem_mmap::window(dma as u64, 4096),
+        );
+        gem_mmap::register_device_memory(h + 3, deep, image, std::process::id() as u64);
+        ok(
+            "a GEM object far into its BAR is device memory too",
+            gem_mmap::is_device_memory(h + 3),
+        );
+        match pointer_image_from(h + 3) {
+            Some(read) => ok(
+                "...and the kernel reads it where it is, for the pointer's image",
+                read,
+            ),
+            None => {
+                println!("{NAME}: no node of /dev/dri has a CRTC: the kernel's read is not tried")
+            }
+        }
+    }
     ok(
         "its last reference closed, it leaves the table",
         gem_mmap::dec_ref(h, pid) == DecRef::Freed && gem_mmap::lookup(h).is_none(),

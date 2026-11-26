@@ -695,6 +695,9 @@ pub fn detach_driver(_loc: &Location) -> bool {
 pub fn init(mapper: Option<Arc<dyn IoMapper>>) -> DeviceResult<Vec<Device>> {
     let _mapper_driver = if let Some(m) = mapper.clone() {
         m.query_or_map(PCI_BASE, PAGE_SIZE * 256 * 32 * 8);
+        // What maps the kernel's window onto the memory of a device a
+        // process drives, when its driver says where a buffer of its is.
+        crate::user::window::keep_mapper(&m);
         Some(m)
     } else {
         None

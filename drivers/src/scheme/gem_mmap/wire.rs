@@ -25,6 +25,12 @@ pub const NOTE_HOST_PA: u32 = 17;
 pub const HOST_PA_TOTALS: u32 = 18;
 pub const REF_COUNT: u32 = 19;
 pub const LOOKUP_FOR: u32 = 20;
+/// Whether the kernel's own window onto `[a, a + b)` is mapped, once it
+/// has tried: a range of a memory BAR of the driver's GPU. The kernel reads
+/// an object placed there through that window, and takes none it has no
+/// window onto ([`REGISTER_DEVICE`]); asked first, a driver places such an
+/// object elsewhere.
+pub const WINDOW: u32 = 21;
 
 /// The most words a list answer carries ([`HOLDERS`], [`RELEASE_PID`]).
 pub const LIST_MAX: usize = 256;

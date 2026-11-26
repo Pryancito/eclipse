@@ -1187,7 +1187,42 @@ fn the_gem_table_takes_a_gpu_holder_at_its_word_on_its_own(
         gem(driver, wire::REGISTER, base as u64 - 1, phys, page, 7, 0),
         zx(ZxError::ACCESS_DENIED)
     );
-    // Its BAR is device memory, whatever the driver calls it.
+    // Its BAR is device memory, whatever the driver calls it. The kernel
+    // reads such an object where it is, through its own window, so it maps
+    // that first and takes no object it cannot map: here no bus scan has
+    // left it a mapper yet.
+    use kernel_hal::drivers::user::window;
+    assert_eq!(
+        gem(driver, wire::REGISTER, h + 2, aperture as u64, page, 7, 0),
+        zx(ZxError::NO_RESOURCES)
+    );
+    assert!(!gem_mmap::is_device_memory(base + 2));
+    assert_eq!(gem_mmap::lookup(base + 2), None);
+    // Asked first, the kernel says so, and the driver places the object in
+    // host memory instead. Only of its own BAR: not of what it pinned,
+    // which is no device memory, nor of anyone else's.
+    let window_onto = |phys: u64| gem(driver, wire::WINDOW, phys, page, 0, 0, 0);
+    assert_eq!(window_onto(aperture as u64), 0);
+    assert_eq!(window_onto(phys), zx(ZxError::ACCESS_DENIED));
+    assert_eq!(window_onto(phys + 2 * page), zx(ZxError::ACCESS_DENIED));
+    assert_eq!(
+        gem(other, wire::WINDOW, aperture as u64, page, 0, 0, 0),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    // A mapper for this BAR alone: it stays kept, and every function the
+    // other tests reserve is reached through it (`window::reach`).
+    struct AtItsAlias(core::ops::Range<usize>);
+    impl window::IoMapper for AtItsAlias {
+        fn query_or_map(&self, paddr: usize, _size: usize) -> Option<usize> {
+            self.0
+                .contains(&paddr)
+                .then(|| kernel_hal::mem::phys_to_virt(paddr))
+        }
+    }
+    let bar = aperture..aperture + kernel_hal::PAGE_SIZE;
+    let mapper: Arc<dyn window::IoMapper> = Arc::new(AtItsAlias(bar));
+    window::keep_mapper(&mapper);
+    assert_eq!(window_onto(aperture as u64), 1);
     assert_eq!(
         gem(driver, wire::REGISTER, h + 2, aperture as u64, page, 7, 0),
         0
