@@ -462,6 +462,20 @@ panel y las herramientas lunar; los corchetes dorados no cambian) y
 `LUNAR_CLOCK` (`24` o `12`, el reloj de la barra y de la pantalla de bloqueo).
 Los bordes de labwc y el fondo conservan su color por ahora.
 
+Los grupos «Fondo de escritorio» y «Barra superior» del panel también van
+ahí. El fondo `tecno` lee `LUNARBG_RELOJ` y `LUNARBG_FECHA` (`si`/`no`: el
+reloj de los anillos y la línea de la fecha) y `LUNARBG_LECTURAS`
+(`derecha`, `izquierda` o `no`), la columna «ECLIPSE · LECTURAS» con datos de
+`/proc` y `/sys`: carga, CPU, memoria, red, disco, temperatura, tiempo en
+marcha y procesos, cada una con su `LUNARBG_LECTURA_*`. Su sitio se calcula:
+filas cada 32 px centradas en la esfera, cada marca en el anillo exterior a
+`asin(dy/R)` y una guía horizontal hasta la columna, a 42 px del anillo
+(`tools/lunarbg/src/scene/lecturas.rs`). Una lectura que la máquina no puede
+medir no sale y la columna se recalcula. La barra lee `LUNARBAR_*`
+(`ESCRITORIOS`, `TITULO`, `CPU`, `MEMORIA`, `RED`, `TEMPERATURA`, `BATERIA`,
+`DISCO`, `EN_MARCHA`, `CARGA`; `no` quita el módulo, ver
+`tools/lunarbar/src/barra.rs`).
+
 `arranque = CLAVE` edita una opción dentro de la línea de órdenes del núcleo
 que guarda `clave` (el `cmdline=` de `rboot.conf`, cuya última línea es la que
 lee rboot): escribe `CLAVE=valor` en el sitio de la primera vez que aparece y

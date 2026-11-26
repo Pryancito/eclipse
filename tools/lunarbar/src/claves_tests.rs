@@ -42,11 +42,32 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "seguridad",
             "sesion",
             "resolucion",
-            "fondo.animado",
-            "fondo.fps",
-            "barra.alto",
             "efectos",
             "texto",
+            "fondo.animado",
+            "fondo.fps",
+            "fondo.reloj",
+            "fondo.fecha",
+            "fondo.lecturas",
+            "lectura.carga",
+            "lectura.cpu",
+            "lectura.memoria",
+            "lectura.red",
+            "lectura.disco",
+            "lectura.temperatura",
+            "lectura.en_marcha",
+            "lectura.procesos",
+            "barra.alto",
+            "barra.escritorios",
+            "barra.titulo",
+            "barra.cpu",
+            "barra.memoria",
+            "barra.red",
+            "barra.temperatura",
+            "barra.bateria",
+            "barra.disco",
+            "barra.en_marcha",
+            "barra.carga",
             "arranque.log",
             "arranque.smp",
             "arranque.renderer",
@@ -60,7 +81,7 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
         ]
     );
     let groups: Vec<&str> = c.grupos.iter().map(|g| g.id.as_str()).collect();
-    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "avanzado", "dispositivos", "servicios", "aperturas"]);
+    assert_eq!(groups, ["apariencia", "idioma", "fecha", "red", "sistema", "arranque", "escritorio", "fondo", "barra", "avanzado", "dispositivos", "servicios", "aperturas"]);
     for k in &c.claves {
         assert!(!k.en.is_empty(), "[{}] has no English name", k.id);
         assert!(c.grupos.iter().any(|g| g.id == k.grupo && !g.en.is_empty()));
@@ -265,9 +286,12 @@ fn the_boot_blocks_say_they_are_read_at_boot() {
 #[test]
 fn the_desktop_blocks_go_through_eclipse_entorno_and_read_its_file() {
     let c = shipped();
-    let g = c.grupos.iter().position(|g| g.id == "escritorio").unwrap();
-    let desk = c.del_grupo(g);
-    assert_eq!(desk.len(), 5);
+    let mut desk = Vec::new();
+    for (id, n) in [("escritorio", 2), ("fondo", 13), ("barra", 11)] {
+        let g = c.grupos.iter().position(|g| g.id == id).unwrap();
+        assert_eq!(c.del_grupo(g).len(), n, "{id}");
+        desk.extend(c.del_grupo(g));
+    }
     for &i in &desk {
         let k = &c.claves[i];
         let var = k.clave.as_deref().unwrap();

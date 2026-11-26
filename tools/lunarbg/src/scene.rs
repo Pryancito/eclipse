@@ -50,6 +50,7 @@ const TEXT_RING: &str = "ECLIPSE-SYSTEM-KERNEL-6.X-STABLE-LINK-ACTIVE-";
 
 type Rgb = (f32, f32, f32);
 
+mod lecturas;
 mod tecno;
 pub use tecno::style_from;
 
@@ -91,6 +92,9 @@ pub struct Layout {
     pub px: f32,
     /// (x, y, w, h) of the rect that the animation redraws each frame.
     pub region: (usize, usize, usize, usize),
+    /// The side of the tecno face's readings column, when it is on and fits
+    /// the output (see [`lecturas`]).
+    pub lecturas: Option<lecturas::Lado>,
     pub style: Style,
 }
 
@@ -157,9 +161,24 @@ pub fn layout_styled(
         Style::Cosmic => (300.0 * s).max(215.0 * s + 40.0 * sc) + 8.0 * sc,
         Style::Tecno => tecno::REACH * s + 8.0 * sc,
     };
-    let x0 = ((cx - reach * sx).floor().max(0.0)) as usize;
+    let (mut fx0, mut fx1) = (cx - reach * sx, cx + reach * sx);
+    // The readings column widens the redrawn rect, on its side only, and is
+    // left out on an output too narrow to hold it.
+    let lecturas = match style {
+        Style::Tecno => lecturas::ajustes().lado.filter(|&lado| {
+            let (a, b) = lecturas::extension(lado, cx, s, sx);
+            a >= 0.0 && b <= w as f32
+        }),
+        Style::Cosmic => None,
+    };
+    if let Some(lado) = lecturas {
+        let (a, b) = lecturas::extension(lado, cx, s, sx);
+        fx0 = fx0.min(a);
+        fx1 = fx1.max(b);
+    }
+    let x0 = (fx0.floor().max(0.0)) as usize;
     let y0 = ((cy - reach).floor().max(0.0)) as usize;
-    let x1 = ((cx + reach * sx).ceil() as usize).min(w);
+    let x1 = (fx1.ceil() as usize).min(w);
     let y1 = ((cy + reach).ceil() as usize).min(h);
     Layout {
         cx,
@@ -168,6 +187,7 @@ pub fn layout_styled(
         sx,
         px: sc,
         region: (x0, y0, x1 - x0, y1 - y0),
+        lecturas,
         style,
     }
 }

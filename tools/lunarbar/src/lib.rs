@@ -25,6 +25,7 @@
 
 pub mod acento;
 pub mod apps;
+pub mod barra;
 pub mod clip;
 pub mod calc;
 pub mod claves;

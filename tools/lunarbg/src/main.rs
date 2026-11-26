@@ -1677,7 +1677,7 @@ fn main() {
 
     // Timer-paced animation loop; see `tick` for how frame callbacks keep the
     // real rate at or below what the compositor can composite.
-    let fps = fps_from(cli.fps, std::env::var("LUNARBG_FPS").ok().as_deref());
+    let fps = fps_from(cli.fps, lunartext::entorno::var("LUNARBG_FPS").as_deref());
     let interval = Duration::from_micros(1_000_000 / fps as u64);
     let mut next_tick = Instant::now() + interval;
 

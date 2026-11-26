@@ -133,8 +133,11 @@ fn write_entorno(localbin: &Path) {
           CTL=\"${ECLIPSE_INIT_CTL:-/run/eclipse-init/ctl}\"\n\
           name=\"$1\"; value=\"$2\"\n\
           case \"$name\" in\n\
-          \x20 LUNARBG_FPS|LUNARBG_STATIC) restart=lunarbg ;;\n\
-          \x20 LUNARBAR_HEIGHT) restart=lunarbar ;;\n\
+          \x20 LUNARBG_FPS|LUNARBG_STATIC|LUNARBG_RELOJ|LUNARBG_FECHA|LUNARBG_LECTURAS) restart=lunarbg ;;\n\
+          \x20 LUNARBG_LECTURA_CARGA|LUNARBG_LECTURA_CPU|LUNARBG_LECTURA_MEMORIA|LUNARBG_LECTURA_RED) restart=lunarbg ;;\n\
+          \x20 LUNARBG_LECTURA_DISCO|LUNARBG_LECTURA_TEMPERATURA|LUNARBG_LECTURA_EN_MARCHA|LUNARBG_LECTURA_PROCESOS) restart=lunarbg ;;\n\
+          \x20 LUNARBAR_HEIGHT|LUNARBAR_ESCRITORIOS|LUNARBAR_TITULO|LUNARBAR_CPU|LUNARBAR_MEMORIA) restart=lunarbar ;;\n\
+          \x20 LUNARBAR_RED|LUNARBAR_TEMPERATURA|LUNARBAR_BATERIA|LUNARBAR_DISCO|LUNARBAR_EN_MARCHA|LUNARBAR_CARGA) restart=lunarbar ;;\n\
           \x20 LUNAR_FX|LUNAR_TEXT) restart='lunarbar lunarbg' ;;\n\
           \x20 LUNAR_ACCENT) restart=lunarbar ;;\n\
           \x20 LUNAR_CLOCK) restart=lunarbar ;;\n\
@@ -212,6 +215,65 @@ mod tests {
             "{names:?}"
         );
         assert!(!names.iter().any(|n| n == "99-vieja.claves"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `(clave, defecto)` of every block in the shipped claves that lives in
+    /// `/etc/eclipse/entorno`.
+    fn claves_del_entorno() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let dir = PROJECT_DIR.join("tools/lunarbar/claves.d");
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let text = fs::read_to_string(e.path()).unwrap();
+            for block in text.split("\n[") {
+                let get = |k: &str| {
+                    block.lines().find_map(|l| {
+                        let (a, b) = l.split_once('=')?;
+                        (a.trim() == k).then(|| b.trim().to_string())
+                    })
+                };
+                if get("fichero").as_deref() == Some("/etc/eclipse/entorno") {
+                    out.push((get("clave").unwrap(), get("defecto").unwrap()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn eclipse_entorno_takes_every_clave_the_panel_offers_and_each_program_reads() {
+        let tmp = std::env::temp_dir().join(format!("xtask-entorno-todas-{}", std::process::id()));
+        let bin = tmp.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        write_entorno(&bin);
+        let claves = claves_del_entorno();
+        for (name, value) in &claves {
+            let ok = std::process::Command::new("/bin/sh")
+                .arg(bin.join("eclipse-entorno"))
+                .args([name, value])
+                .env("ECLIPSE_ENTORNO", tmp.join("entorno"))
+                .env("ECLIPSE_INIT_CTL", tmp.join("no-ctl"))
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "eclipse-entorno refuses {name}={value}");
+        }
+        // Every clave the wallpaper and the bar read has its block in the
+        // panel, so none of them is a setting only a text editor reaches.
+        for (src, prefix) in [
+            ("tools/lunarbg/src/scene/lecturas.rs", "\"LUNARBG_"),
+            ("tools/lunarbar/src/barra.rs", "\"LUNARBAR_"),
+        ] {
+            let text = fs::read_to_string(PROJECT_DIR.join(src)).unwrap();
+            for part in text.split(prefix).skip(1) {
+                let rest = part.split('"').next().unwrap();
+                if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+                    continue;
+                }
+                let name = format!("{}{rest}", &prefix[1..]);
+                assert!(claves.iter().any(|(n, _)| *n == name), "{name} ({src}) has no clave");
+            }
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
