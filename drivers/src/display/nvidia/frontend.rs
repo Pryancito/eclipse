@@ -65,6 +65,18 @@ pub fn rm_up() -> bool {
     *RM_CORE_INIT_STATUS.lock() == Some(NV_OK)
 }
 
+pub use nvidia_rm_sys::frontend::events::NonstallPoll;
+
+/// `nvidia_rm_sys::frontend::events::service_nonstall`: service the nonstall
+/// interrupts pending on every GPU, which posts the OS events bound to them.
+/// With no RM core there is nothing to look at.
+pub fn service_nonstall() -> NonstallPoll {
+    if !rm_up() {
+        return NonstallPoll::Serviced(0);
+    }
+    nvidia_rm_sys::frontend::events::service_nonstall()
+}
+
 /// `nvidia_rm_sys::frontend::rm_escape`, refused with `NV_ERR_NOT_READY`
 /// while there is no RM core to run it.
 pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
