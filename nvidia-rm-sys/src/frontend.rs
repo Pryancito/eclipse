@@ -186,6 +186,25 @@ impl MmapContext {
         })
     }
 
+    /// The C's record of it, which [`MmapContext::from_raw`] reads back:
+    /// how it travels to a kernel the RM is not in.
+    pub fn to_raw(&self) -> RawMmapContext {
+        RawMmapContext {
+            valid: 1,
+            ctl: self.on_ctl() as NvU32,
+            gpu_instance: self.gpu_instance,
+            memory_type: match self.memory {
+                MmapMemory::System => 0,
+                MmapMemory::Registers => 1,
+                MmapMemory::Framebuffer => 2,
+            },
+            caching: self.caching,
+            prot: if self.writable { PROTECT_WRITEABLE } else { 0 },
+            start: self.start,
+            size: self.size,
+        }
+    }
+
     /// Whether it is recorded on `/dev/nvidiactl` rather than a GPU's node.
     pub fn on_ctl(&self) -> bool {
         self.memory == MmapMemory::System
@@ -345,6 +364,30 @@ pub fn set_user_range_validator(f: fn(usize, usize) -> bool) {
     USER_RANGE_OK.store(f as usize, Ordering::Release);
 }
 
+/// `fn(to_user, user, ours, len) -> bool`: the copy itself, for an RM that
+/// does not share the caller's address space (the driver as a process,
+/// where the kernel copies for it while the call waits). 0 = none: the
+/// caller's memory is this address space's, checked by `USER_RANGE_OK`.
+static USER_COPY: AtomicUsize = AtomicUsize::new(0);
+
+/// [`set_user_copy`]'s copy: `(to_user, user, ours, len) -> all copied`.
+pub type UserCopy = fn(bool, usize, *mut u8, usize) -> bool;
+
+/// Register the copy of a user range for an RM in a process of its own:
+/// `f(to_user, user, ours, len)` copies `len` bytes between the caller's
+/// `user` and this address space's `ours`, `ours` to `user` when
+/// `to_user`, and says whether all of them were.
+pub fn set_user_copy(f: UserCopy) {
+    USER_COPY.store(f as usize, Ordering::Release);
+}
+
+/// The registered [`set_user_copy`], if any.
+fn user_copy() -> Option<UserCopy> {
+    let f = USER_COPY.load(Ordering::Acquire);
+    // SAFETY: only ever stored from `set_user_copy`.
+    (f != 0).then(|| unsafe { core::mem::transmute::<usize, UserCopy>(f) })
+}
+
 fn user_range_ok(addr: usize, len: usize) -> bool {
     let f = USER_RANGE_OK.load(Ordering::Acquire);
     if f == 0 {
@@ -375,8 +418,32 @@ impl CallScope {
         CallScope::with(0, false, 0, &[0u8; CALLER_NAME_LEN])
     }
 
+    /// [`CallScope::enter_kernel`] only if nobody is inside the RM: `None`
+    /// means the gate is taken, and a caller that can come back later (the
+    /// nonstall poll) does instead of waiting behind a long call.
+    fn try_enter_kernel() -> Option<CallScope> {
+        let gate = crate::rm_init::RmGate::try_lock()?;
+        Some(CallScope::with_gate(
+            gate,
+            0,
+            false,
+            0,
+            &[0u8; CALLER_NAME_LEN],
+        ))
+    }
+
     fn with(gpu_mask: u32, admin: bool, pid: u32, name: &[u8; CALLER_NAME_LEN]) -> CallScope {
         let gate = crate::rm_init::RmGate::lock();
+        CallScope::with_gate(gate, gpu_mask, admin, pid, name)
+    }
+
+    fn with_gate(
+        gate: crate::rm_init::RmGate,
+        gpu_mask: u32,
+        admin: bool,
+        pid: u32,
+        name: &[u8; CALLER_NAME_LEN],
+    ) -> CallScope {
         CALLER_GPUS.store(gpu_mask, Ordering::SeqCst);
         CALLER_ADMIN.store(admin, Ordering::SeqCst);
         CALLER_PID.store(pid, Ordering::SeqCst);
@@ -473,6 +540,13 @@ pub(crate) fn copy_from_user(to: *mut u8, from: *const u8, n: usize) -> NV_STATU
     if !IN_CALL.load(Ordering::SeqCst) {
         return NV_ERR_NOT_SUPPORTED;
     }
+    if let Some(copy) = user_copy() {
+        return if !to.is_null() && copy(false, from as usize, to, n) {
+            NV_OK
+        } else {
+            NV_ERR_INVALID_ADDRESS
+        };
+    }
     if to.is_null() || !user_range_ok(from as usize, n) {
         return NV_ERR_INVALID_ADDRESS;
     }
@@ -487,6 +561,13 @@ pub(crate) fn copy_from_user(to: *mut u8, from: *const u8, n: usize) -> NV_STATU
 pub(crate) fn copy_to_user(to: *mut u8, from: *const u8, n: usize) -> NV_STATUS {
     if !IN_CALL.load(Ordering::SeqCst) {
         return NV_ERR_NOT_SUPPORTED;
+    }
+    if let Some(copy) = user_copy() {
+        return if !from.is_null() && copy(true, to as usize, from as *mut u8, n) {
+            NV_OK
+        } else {
+            NV_ERR_INVALID_ADDRESS
+        };
     }
     if from.is_null() || !user_range_ok(to as usize, n) {
         return NV_ERR_INVALID_ADDRESS;

@@ -292,13 +292,29 @@ fn free_gives_back_the_pool_and_its_pages() {
 /// once it is unmapped, it is.
 #[test]
 fn a_pool_mapped_on_the_cpu_is_not_freed() {
+    extern crate std;
     let process = with_both();
     assert_eq!(alloc(&process, &[]), NV_OK);
-    let mapping = cpu_map(&process).unwrap();
+    let vmo = cpu_map(&process).unwrap();
+    // Held is not mapped: what a served RM's GPUs are granted holds it too.
+    assert!(!process.uvm.va_space.lock().pools[&POOL].mapped_on_cpu());
+    let len = LENGTH as usize;
+    let vmar = zircon_object::vm::VmAddressRegion::new_root();
+    let layout = core::alloc::Layout::from_size_align(len, 4096).unwrap();
+    let user = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
+    vmar.map_at(
+        user - vmar.addr(),
+        vmo,
+        0,
+        len,
+        MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+    )
+    .unwrap();
     assert_eq!(process.free(POOL, LENGTH), NV_ERR_INVALID_ARGUMENT);
     assert_eq!(process.rm.state().lent.len(), 2);
-    drop(mapping);
+    vmar.unmap(user, len).unwrap();
     assert_eq!(process.free(POOL, LENGTH), NV_OK);
+    core::mem::forget(vmar);
 }
 
 /// An mmap maps exactly a pool, as its own pages; a range that only

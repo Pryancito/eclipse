@@ -236,6 +236,11 @@ impl Dsp {
             SNDCTL_DSP_GETODELAY => put(data, self.client_bytes(s.queued()) as i32),
             SNDCTL_DSP_GETOPTR => {
                 let played = s.ring.played;
+                // A stream stopped for having nothing to play (or by the
+                // PCM node) counts from 0 again, and so does this.
+                if played < self.optr_played {
+                    self.optr_played = 0;
+                }
                 let blocks = ((played - self.optr_played) / FRAGMENT as u64) as i32;
                 self.optr_played = played - (played - self.optr_played) % FRAGMENT as u64;
                 let fields = [

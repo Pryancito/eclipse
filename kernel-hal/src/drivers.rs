@@ -799,21 +799,89 @@ pub(crate) fn dma_quarantine_release_held(paddr: crate::PhysAddr, pages: usize) 
 /// block larger than `MAX_BLOCK_PAGES` still returns immediately (its own UAF
 /// window is comparatively tiny and holding it would blow the budget alone).
 #[cfg(not(feature = "libos"))]
+const DMA_POISON: u64 = 0xDEAD_D3AD_F0F0_F0F0;
+
+/// Which block to evict and when is `crate::dma_quarantine`, which compiles
+/// everywhere and is tested; what is left here is the frame pool, the poison
+/// and the report.
+#[cfg(not(feature = "libos"))]
+static DMA_QUAR: lock::Mutex<crate::dma_quarantine::Quarantine> =
+    lock::Mutex::new(crate::dma_quarantine::Quarantine::new());
+
+#[cfg(not(feature = "libos"))]
+fn dma_free_now(base: usize, n: usize) {
+    for i in 0..n {
+        crate::KHANDLER.frame_dealloc(base + i * crate::PAGE_SIZE);
+    }
+}
+
+/// Hand every block the DMA quarantine holds back to the frame pool, poison
+/// checked as on an eviction, and say how many pages that was.
+///
+/// For a contiguous allocation that found no free run of its size. A video
+/// frees a GPU buffer of several MiB every frame, and the quarantine keeps up
+/// to 64 MiB of them out of the pool for a while; the allocation of the next
+/// frame's buffer then found nothing of that order, though the same memory
+/// was sitting there waiting to go back. Losing the quarantine's window once
+/// is far cheaper than the `ENOMEM` (Firefox does not survive it).
+#[cfg(not(feature = "libos"))]
+pub(crate) fn dma_quarantine_flush() -> usize {
+    let mut evicted: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    DMA_QUAR.lock().drain(&mut evicted);
+    let pages = evicted.iter().map(|&(_, n)| n).sum();
+    dma_release_evicted(evicted);
+    pages
+}
+
+/// [`dma_quarantine_flush`] where there is no quarantine.
+#[cfg(feature = "libos")]
+pub(crate) fn dma_quarantine_flush() -> usize {
+    0
+}
+
+/// `frame_alloc_contiguous`, and when it finds nothing, once more after
+/// [`dma_quarantine_flush`]. `who` names the caller for the log.
+pub(crate) fn frame_alloc_contiguous_flushing(
+    who: &str,
+    pages: usize,
+    align_log2: usize,
+) -> Option<crate::PhysAddr> {
+    if let Some(p) = crate::KHANDLER.frame_alloc_contiguous(pages, align_log2) {
+        return Some(p);
+    }
+    let flushed = dma_quarantine_flush();
+    if flushed == 0 {
+        return None;
+    }
+    let got = crate::KHANDLER.frame_alloc_contiguous(pages, align_log2);
+    DMA_FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let n = DMA_FLUSHES.load(core::sync::atomic::Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(64) {
+        info!(
+            "{}: no {} contiguous pages free; the DMA quarantine gave back {} pages and the \
+             retry {} ({} flushes since boot)",
+            who,
+            pages,
+            flushed,
+            if got.is_some() {
+                "found them"
+            } else {
+                "found nothing either"
+            },
+            n
+        );
+    }
+    got
+}
+
+/// Times [`frame_alloc_contiguous_flushing`] had to flush the quarantine.
+static DMA_FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(feature = "libos"))]
 fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
-    use crate::dma_quarantine::{Quarantine, Verdict};
-    use lock::Mutex;
-    const POISON: u64 = 0xDEAD_D3AD_F0F0_F0F0;
-
-    // Which block to evict and when is `crate::dma_quarantine`, which compiles
-    // everywhere and is tested; what is left here is the frame pool, the
-    // poison and the report.
-    static QUAR: Mutex<Quarantine> = Mutex::new(Quarantine::new());
-
-    let free_now = |base: usize, n: usize| {
-        for i in 0..n {
-            crate::KHANDLER.frame_dealloc(base + i * crate::PAGE_SIZE);
-        }
-    };
+    use crate::dma_quarantine::Verdict;
+    const POISON: u64 = DMA_POISON;
+    let free_now = dma_free_now;
     if pages == 0 {
         return;
     }
@@ -838,7 +906,7 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
             core::ptr::write_volatile(phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64, POISON);
         }
     };
-    match QUAR.lock().push(paddr, pages, &mut evicted, poison) {
+    match DMA_QUAR.lock().push(paddr, pages, &mut evicted, poison) {
         Verdict::Held => {}
         Verdict::TooBig => {
             free_now(paddr, pages);
@@ -858,6 +926,16 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
             return;
         }
     }
+    dma_release_evicted(evicted);
+}
+
+/// Check the poison of blocks the quarantine let go of, and return them to
+/// the frame pool. Never under the quarantine's lock.
+#[cfg(not(feature = "libos"))]
+fn dma_release_evicted(evicted: alloc::vec::Vec<(usize, usize)>) {
+    const POISON: u64 = DMA_POISON;
+    let phys_to_va = |pa: usize| pa + crate::KCONFIG.phys_to_virt_offset;
+    let free_now = dma_free_now;
     for (old_base, old_pages) in evicted {
         // Verify the evicted block's poison. Flush the sentinel line first so a
         // (cache-coherent) device DMA that overwrote it is not masked by a stale
@@ -892,12 +970,13 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
 
 #[cfg(not(feature = "libos"))]
 mod virtio_drivers_ffi {
-    use crate::{PhysAddr, VirtAddr, KCONFIG, KHANDLER};
+    use crate::{PhysAddr, VirtAddr, KCONFIG};
 
     #[unsafe(no_mangle)]
     extern "C" fn virtio_dma_alloc(pages: usize) -> PhysAddr {
         // 0, not a panic, as `drivers_dma_alloc`: the virtio queues check it.
-        let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
+        let Some(paddr) = super::frame_alloc_contiguous_flushing("virtio_dma_alloc", pages, 0)
+        else {
             super::dma_alloc_failed("virtio_dma_alloc", pages);
             return 0;
         };
@@ -1044,7 +1123,7 @@ pub fn dma_alloc_failures() -> u64 {
 
 #[cfg(not(feature = "libos"))]
 mod drivers_ffi {
-    use crate::{PhysAddr, VirtAddr, KCONFIG, KHANDLER, PAGE_SIZE};
+    use crate::{PhysAddr, VirtAddr, KCONFIG, PAGE_SIZE};
 
     /// Contiguous DMA memory, or 0 when there is none of that size.
     ///
@@ -1059,7 +1138,8 @@ mod drivers_ffi {
     /// `ENOMEM` for the one `GEM_NEW`, which Mesa answers by itself.
     #[unsafe(no_mangle)]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
-        let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
+        let Some(paddr) = super::frame_alloc_contiguous_flushing("drivers_dma_alloc", pages, 0)
+        else {
             super::dma_alloc_failed("drivers_dma_alloc", pages);
             return 0;
         };

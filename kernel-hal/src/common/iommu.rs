@@ -15,10 +15,11 @@
 //! fence zones) hold either way. What changes is that everything else is
 //! absent from the device's view.
 //!
-//! Nothing installs a unit yet: [`domain_for`] answers `None` and every
-//! device is in passthrough, as before. A hardware backend calls [`install`]
-//! once it has found and programmed its unit; with `iommu=off` on the command
-//! line it never does.
+//! A hardware backend (VT-d, AMD-Vi on x86_64) calls [`install`] once it
+//! has found and programmed its units, on every boot whose firmware
+//! describes one; with `iommu=off` on the command line it never does. With
+//! no unit installed [`domain_for`] answers `None` and every device is in
+//! passthrough, as on a machine without an IOMMU.
 
 use alloc::sync::Arc;
 use lock::Mutex;
@@ -68,6 +69,11 @@ pub trait IommuUnit: Send + Sync {
     /// `None` when this unit does not cover that function, or cannot give it
     /// a domain: the device then stays in passthrough.
     fn domain_for(&self, requester: PciRequester) -> Option<Arc<dyn DmaDomain>>;
+
+    /// Write to the log the DMA faults recorded since the last call (a
+    /// device reaching for memory it was not given), and clear them. Called
+    /// from a slow kernel task: faults raise no interrupt here.
+    fn poll_faults(&self) {}
 }
 
 static UNIT: Mutex<Option<Arc<dyn IommuUnit>>> = Mutex::new(None);
@@ -75,7 +81,7 @@ static UNIT: Mutex<Option<Arc<dyn IommuUnit>>> = Mutex::new(None);
 /// Make `unit` the one that hands out domains. Called once, by the backend
 /// that found it, before any device is claimed.
 pub fn install(unit: Arc<dyn IommuUnit>) {
-    info!("iommu: {} translating claimed devices", unit.name());
+    crate::klog_info!("iommu: {} translating claimed devices", unit.name());
     *UNIT.lock() = Some(unit);
 }
 

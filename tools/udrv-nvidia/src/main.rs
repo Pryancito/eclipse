@@ -16,11 +16,20 @@
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
+//! - `udrv-nvidia nvctl-check VVVV DDDD`: `/dev/nvidiactl` served with an
+//!   RM that only checks the way there (`nvidia.nvidiactl` on the kernel's
+//!   cmdline, and a PCI function claimed as for `check`, for its BAR and
+//!   DMA memory): an escape's parameters reached through its pointer, the
+//!   GPU node, mappings of its memory and its BAR, pages of the caller's
+//!   lent to it and given back, an OS event posted from its nonstall
+//!   interrupt waking a `poll`, a UVM semaphore pool lent to it while it
+//!   has memory of it (`nvidia.uvm` too), the close.
 mod drm;
 mod gem;
 mod gpu;
 mod irq;
 mod mapper;
+mod nvctl;
 mod platform;
 mod ports;
 mod syncobj;
@@ -50,6 +59,14 @@ fn main() {
         }
         Some("drm-check") => drm_check(),
         Some("irq-check") => irq_check(&args[1..]),
+        Some("nvctl-check") => {
+            let hex = |i: usize| {
+                args.get(i)
+                    .and_then(|s| u16::from_str_radix(s, 16).ok())
+                    .unwrap_or_else(|| fail("usage: udrv-nvidia nvctl-check VVVV DDDD".into()))
+            };
+            nvctl_check(hex(1), hex(2))
+        }
         n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
     }
 }
@@ -70,6 +87,19 @@ fn run(index: usize) {
         Err(e) => fail(format!("{}: {e:?}", drv.name())),
     };
     println!("{NAME}: {} up, serving it", drv.name());
+    // `/dev/nvidiactl`, on its own thread: its escapes wait in the RM, not
+    // behind the card's calls.
+    std::thread::spawn(|| {
+        let rm = zcore_drivers::display::nvctl::remote::ThisRm;
+        let hello = zcore_drivers::display::nvctl::remote::hello();
+        match nvctl::serve(&rm, &hello) {
+            Ok(why) => eprintln!("{NAME}: the kernel let go of the RM: {why}"),
+            Err((udrivers::zx::Status::NOT_SUPPORTED, _)) => {
+                println!("{NAME}: no /dev/nvidiactl (nvidia.nvidiactl is off)")
+            }
+            Err((_, e)) => eprintln!("{NAME}: {e}"),
+        }
+    });
     match drm::serve(card) {
         Ok(why) => fail(format!("the kernel let go of the card: {why}")),
         Err(e) => fail(e),
@@ -162,6 +192,401 @@ fn irq_check(args: &[String]) {
         fail("irq-check FAILED".into());
     }
     println!("{NAME}: irq-check ok");
+}
+
+/// `udrv-nvidia nvctl-check`: see the top of this file.
+fn nvctl_check(vendor: u16, device: u16) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let ok = |what: &str, ok: bool| {
+        println!("{NAME}: {what}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            exit(1);
+        }
+    };
+    static RM: std::sync::OnceLock<nvctl::check::CheckRm> = std::sync::OnceLock::new();
+    let rm = RM.get_or_init(Default::default);
+    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
+    gpu.install_dma().unwrap_or_else(|e| fail(e));
+    let mapper = gpu.mapper();
+    let bar = gpu
+        .bars
+        .first()
+        .copied()
+        .unwrap_or_else(|| fail("no BAR".into()));
+    extern "C" {
+        fn drivers_dma_alloc(pages: usize) -> usize;
+        fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
+        fn drivers_phys_to_virt(paddr: usize) -> usize;
+    }
+    // SAFETY: the driver's own allocation and lookup calls.
+    let system = unsafe { drivers_dma_alloc(1) };
+    let system_virt = unsafe { drivers_phys_to_virt(system) };
+    // SAFETY: the page just allocated, this process's.
+    unsafe { (system_virt as *mut u64).write_volatile(0x5eed_0000_0000_0001) };
+    rm.system.store(system as u64, Ordering::Relaxed);
+    rm.bar.store(bar.phys as u64, Ordering::Relaxed);
+    std::thread::spawn(move || match nvctl::serve(rm, &nvctl::check::hello()) {
+        Ok(why) => eprintln!("{NAME}: the kernel let go of the RM: {why}"),
+        Err((_, e)) => fail(e),
+    });
+    let start = Instant::now();
+    while std::fs::metadata("/dev/nvidia0").is_err() && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ok(
+        "the served RM's GPU has its node",
+        std::fs::metadata("/dev/nvidia0").is_ok(),
+    );
+    let ctl = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    // `_IOWR('F', NV_ESC_RM_CONTROL, NVOS54_PARAMETERS)`.
+    const CONTROL: u64 = 0xc020_462a;
+    let mut params = [10u32, 20, 30, 40];
+    let mut control = [0u8; nvctl::check::NVOS54_LEN];
+    control[16..24].copy_from_slice(&(params.as_mut_ptr() as u64).to_le_bytes());
+    control[24..28].copy_from_slice(&16u32.to_le_bytes());
+    let escape = |control: &mut [u8]| {
+        // SAFETY: `control` is the 32 bytes of NVOS54_PARAMETERS, whose
+        // pointer is to `params`, alive for the call.
+        unsafe { libc::ioctl(ctl.as_raw_fd(), CONTROL as _, control.as_mut_ptr()) }
+    };
+    let ret = escape(&mut control);
+    ok(
+        "an RM_CONTROL's parameters are read and written where it points",
+        ret == 0 && params == [11, 21, 31, 41] && control[28..32] == [0; 4],
+    );
+    const N: u32 = 100;
+    let t = Instant::now();
+    for _ in 0..N {
+        escape(&mut control);
+    }
+    println!(
+        "{NAME}: RM_CONTROL through the served RM: {} us",
+        t.elapsed().as_micros() / N as u128
+    );
+    ok("...each of them", params == [111, 121, 131, 141]);
+    // A pointer the caller does not have: the RM is told so.
+    control[16..24].copy_from_slice(&8u64.to_le_bytes());
+    ok("a pointer to nothing is refused", escape(&mut control) != 0);
+    ok("the GPU node opens", open_rw("/dev/nvidia0").is_some());
+
+    // RM_MAP_MEMORY, then mmap of the open the mapping is recorded on.
+    const MAP_MEMORY: u64 = 0xc038_464e;
+    let map = |h_memory: u32, on: &std::fs::File| {
+        let mut p = [0u8; 56];
+        p[8..12].copy_from_slice(&h_memory.to_le_bytes());
+        p[48..52].copy_from_slice(&on.as_raw_fd().to_le_bytes());
+        // SAFETY: `p` is the 56 bytes of NVOS33_PARAMETERS.
+        unsafe { libc::ioctl(ctl.as_raw_fd(), MAP_MEMORY as _, p.as_mut_ptr()) }
+    };
+    let mmap = |on: &std::fs::File| {
+        // SAFETY: a new shared mapping of one page of `on`.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                on.as_raw_fd(),
+                0,
+            )
+        };
+        (at != libc::MAP_FAILED).then_some(at as *mut u64)
+    };
+    let on_ctl = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    ok(
+        "the RM's system memory is granted",
+        map(nvctl::check::grant::SYSTEM, &on_ctl) == 0,
+    );
+    let seen = mmap(&on_ctl).unwrap_or_else(|| fail("mmap of its system memory".into()));
+    // SAFETY: the page mapped above.
+    let word = unsafe { seen.read_volatile() };
+    ok(
+        "...and mapped, the same memory",
+        word == 0x5eed_0000_0000_0001,
+    );
+    // The driver frees it: the mapping keeps its pages.
+    // SAFETY: the page it allocated, freed once.
+    unsafe { drivers_dma_dealloc(system, 1) };
+    unsafe { seen.add(1).write_volatile(42) };
+    ok(
+        "a mapping outlives the driver's free of its memory",
+        unsafe {
+            seen.read_volatile() == 0x5eed_0000_0000_0001 && seen.add(1).read_volatile() == 42
+        },
+    );
+    let on_gpu = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    ok(
+        "an aperture in its BAR is granted",
+        map(nvctl::check::grant::APERTURE, &on_gpu) == 0,
+    );
+    let window = mmap(&on_gpu).unwrap_or_else(|| fail("mmap of its aperture".into()));
+    let driver_side = mapper
+        .query_or_map(bar.phys, 4096)
+        .unwrap_or_else(|| fail("BAR not mapped".into())) as *mut u64;
+    // SAFETY: the same page of the BAR, mapped twice.
+    unsafe { window.add(3).write_volatile(0xa9e7_7e50) };
+    ok(
+        "...and mapped, the BAR itself",
+        unsafe { driver_side.add(3).read_volatile() } == 0xa9e7_7e50,
+    );
+    let refused = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    ok(
+        "memory the RM's process never pinned is refused",
+        map(nvctl::check::grant::NOT_OURS, &refused) != 0 && mmap(&refused).is_none(),
+    );
+    ok(
+        "...and the RM told so",
+        rm.unrecorded.load(Ordering::Relaxed) != 0,
+    );
+    lent_pages_check(rm, &map, &ok);
+    os_event_check(rm, &ok);
+    uvm_check(rm, &ctl, &ok);
+    drop(ctl);
+    let start = Instant::now();
+    while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ok(
+        "a close reaches the RM",
+        rm.released.load(Ordering::Relaxed) != 0,
+    );
+    println!(
+        "{NAME}: nvctl-check ok ({} escapes)",
+        rm.escapes.load(Ordering::Relaxed)
+    );
+}
+
+/// `nvctl-check`'s OS descriptors: an `RM_ALLOC_MEMORY` of the caller's
+/// own pages lends them to the RM, which the process's devices are granted
+/// (so the kernel takes a mapping of them as the process's), until
+/// `RM_FREE` gives them back; refused, they come back at once.
+fn lent_pages_check(
+    rm: &nvctl::check::CheckRm,
+    map: &dyn Fn(u32, &std::fs::File) -> i32,
+    ok: &dyn Fn(&str, bool),
+) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use udrivers::served::Node;
+    const PAGES: usize = 3;
+    // SAFETY: a new private mapping of this process's.
+    let buf = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGES * 4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if buf == libc::MAP_FAILED {
+        fail("mmap of the client's buffer".into());
+    }
+    let gpu = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    // `_IOWR('F', NV_ESC_RM_ALLOC_MEMORY, NVOS02_PARAMETERS)` and
+    // `_IOWR('F', NV_ESC_RM_FREE, NVOS00_PARAMETERS)`.
+    const ALLOC_MEMORY: u64 = 0xc038_4627;
+    const FREE: u64 = 0xc010_4629;
+    let alloc = |h: u32| {
+        let mut p = [0u8; 56];
+        p[8..12].copy_from_slice(&h.to_le_bytes());
+        // NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, its address and its limit.
+        p[12..16].copy_from_slice(&0x71u32.to_le_bytes());
+        p[24..32].copy_from_slice(&(buf as u64).to_le_bytes());
+        p[32..40].copy_from_slice(&((PAGES * 4096 - 1) as u64).to_le_bytes());
+        // SAFETY: `p` is the 56 bytes of NVOS02_PARAMETERS.
+        let ret = unsafe { libc::ioctl(gpu.as_raw_fd(), ALLOC_MEMORY as _, p.as_mut_ptr()) };
+        (ret, u32::from_le_bytes(p[40..44].try_into().unwrap()))
+    };
+    let free = |h: u32| {
+        let mut p = [0u8; 16];
+        p[8..12].copy_from_slice(&h.to_le_bytes());
+        // SAFETY: `p` is the 16 bytes of NVOS00_PARAMETERS.
+        let ret = unsafe { libc::ioctl(gpu.as_raw_fd(), FREE as _, p.as_mut_ptr()) };
+        (ret, u32::from_le_bytes(p[12..16].try_into().unwrap()))
+    };
+    let on = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    let before = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    ok(
+        "an OS descriptor's pages are lent to the RM",
+        alloc(0x700) == (0, 0),
+    );
+    let first = rm.lent.load(Ordering::Relaxed);
+    ok(
+        "...all of them, by their physical addresses",
+        rm.lent_pages.load(Ordering::Relaxed) == PAGES && first != 0 && first.is_multiple_of(4096),
+    );
+    ok(
+        "...kept while the RM holds them",
+        nvctl::GIVEN_BACK.load(Ordering::Relaxed) == before,
+    );
+    ok(
+        "...granted to its devices (a mapping of them is its process's)",
+        map(nvctl::check::grant::LENT, &on) == 0,
+    );
+    ok("...and freed", free(0x700) == (0, 0));
+    let given = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    ok("...given back to the kernel", given != before);
+    ok(
+        "...and no longer its devices'",
+        map(nvctl::check::grant::LENT, &on) != 0,
+    );
+    ok(
+        "a loan goes back once",
+        Node::give_back_nvctl(given).is_err(),
+    );
+    let (ret, status) = alloc(nvctl::check::REFUSED);
+    ok(
+        "pages the RM does not take come back at once",
+        ret == 0 && status != 0 && nvctl::GIVEN_BACK.load(Ordering::Relaxed) > given,
+    );
+    ok(
+        "...and the kernel took every one",
+        nvctl::GIVE_BACK_REFUSED.load(Ordering::Relaxed) == 0,
+    );
+    // SAFETY: the mapping made above, no longer used.
+    unsafe { libc::munmap(buf, PAGES * 4096) };
+}
+
+/// `nvctl-check`'s OS events: an open registered with `ALLOC_OS_EVENT` is
+/// polled, which has the kernel ask the RM to look at its nonstall
+/// interrupts; the RM posts what it finds, and the poll wakes with it on
+/// the queue (`RM_GET_EVENT_DATA`).
+fn os_event_check(rm: &nvctl::check::CheckRm, ok: &dyn Fn(&str, bool)) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    // `_IOWR('F', NV_ESC_ALLOC_OS_EVENT, 16)`, `..._FREE_OS_EVENT` and
+    // `NV_ESC_RM_GET_EVENT_DATA`.
+    const ALLOC_OS_EVENT: u64 = 0xc010_46ce;
+    const FREE_OS_EVENT: u64 = 0xc010_46cf;
+    const GET_EVENT_DATA: u64 = 0xc010_4652;
+    const CLIENT: u32 = 0xc1d0_0001;
+    let ev = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    let fd = ev.as_raw_fd();
+    let ioctl = |nr: u64, p: &mut [u8; 16]| {
+        // SAFETY: `p` is the 16 bytes of each of the three payloads.
+        unsafe { libc::ioctl(fd, nr as _, p.as_mut_ptr()) }
+    };
+    let status = |p: &[u8; 16]| u32::from_le_bytes(p[12..16].try_into().unwrap());
+    let mut p = [0u8; 16];
+    p[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+    p[8..12].copy_from_slice(&(fd as u32).to_le_bytes());
+    ok(
+        "an OS event is registered with the RM",
+        ioctl(ALLOC_OS_EVENT, &mut p) == 0 && status(&p) == 0,
+    );
+    let posted = nvctl::POSTED.load(Ordering::Relaxed);
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let t = Instant::now();
+    // SAFETY: one pollfd, this process's.
+    let ready = unsafe { libc::poll(&mut poll, 1, 5000) };
+    let took = t.elapsed();
+    ok(
+        "a poll on it wakes with what the RM's nonstall interrupt posted",
+        ready == 1 && poll.revents & libc::POLLIN != 0,
+    );
+    println!(
+        "{NAME}: OS event through the served RM: {} us from poll to wake, {} looks",
+        took.as_micros(),
+        rm.looks.load(Ordering::Relaxed)
+    );
+    ok(
+        "...posted to the kernel by the RM's process",
+        nvctl::POSTED.load(Ordering::Relaxed) == posted + 1
+            && nvctl::POST_REFUSED.load(Ordering::Relaxed) == 0,
+    );
+    let mut event = [0u8; 16];
+    let mut get = [0u8; 16];
+    get[0..8].copy_from_slice(&(event.as_mut_ptr() as u64).to_le_bytes());
+    ok(
+        "...and read back as the RM said it",
+        ioctl(GET_EVENT_DATA, &mut get) == 0 && status(&get) == 0 && {
+            let (h, index, info32, info16) = nvctl::check::EVENT;
+            let word = |at: usize| u32::from_le_bytes(event[at..at + 4].try_into().unwrap());
+            word(0) == h
+                && word(4) == index
+                && word(8) == info32
+                && u16::from_le_bytes([event[12], event[13]]) == info16
+        },
+    );
+    ok(
+        "...once",
+        ioctl(GET_EVENT_DATA, &mut get) == 0 && status(&get) != 0,
+    );
+    let mut free = [0u8; 16];
+    free[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+    free[8..12].copy_from_slice(&(fd as u32).to_le_bytes());
+    ok(
+        "...and freed in the RM",
+        ioctl(FREE_OS_EVENT, &mut free) == 0 && status(&free) == 0,
+    );
+    ok(
+        "...once",
+        ioctl(FREE_OS_EVENT, &mut free) == 0 && status(&free) != 0,
+    );
+}
+
+/// `nvctl-check`'s UVM: a VA space with the served RM's GPU and a GPU VA
+/// space on it, then a semaphore pool, whose pages are lent to the RM
+/// for the memory it makes of them and given back when the pool is freed.
+fn uvm_check(rm: &nvctl::check::CheckRm, ctl: &std::fs::File, ok: &dyn Fn(&str, bool)) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    let Some(uvm) = open_rw("/dev/nvidia-uvm") else {
+        println!("{NAME}: no /dev/nvidia-uvm (nvidia.uvm is off): UVM not checked");
+        return;
+    };
+    let call = |cmd: u64, p: &mut [u8], status_at: usize| {
+        // SAFETY: `p` is the whole of the command's params.
+        let ret = unsafe { libc::ioctl(uvm.as_raw_fd(), cmd as _, p.as_mut_ptr()) };
+        ret == 0 && p[status_at..status_at + 4] == [0; 4]
+    };
+    let uuid = [0x5au8; 16];
+    ok("UVM initializes", call(0x3000_0001, &mut [0u8; 16], 8));
+    let mut gpu = [0u8; 40];
+    gpu[..16].copy_from_slice(&uuid);
+    ok("...with the served RM's GPU", call(37, &mut gpu, 36));
+    let mut vas = [0u8; 32];
+    vas[..16].copy_from_slice(&uuid);
+    vas[16..20].copy_from_slice(&ctl.as_raw_fd().to_le_bytes());
+    vas[20..24].copy_from_slice(&0xc1d0_0002u32.to_le_bytes());
+    vas[24..28].copy_from_slice(&0x5c00_0007u32.to_le_bytes());
+    ok("...and a GPU VA space on it", call(25, &mut vas, 28));
+    let given = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    const BASE: u64 = 0x7e00_0000_0000;
+    const LEN: u64 = 2 * 4096;
+    let mut pool = vec![0u8; 9248];
+    pool[0..8].copy_from_slice(&BASE.to_le_bytes());
+    pool[8..16].copy_from_slice(&LEN.to_le_bytes());
+    ok("a semaphore pool is made", call(68, &mut pool, 9240));
+    ok(
+        "...its pages lent to the RM, held while it has memory of them",
+        rm.pool_size.load(Ordering::Relaxed) == LEN
+            && rm.pools.lock().unwrap().len() == 1
+            && nvctl::GIVEN_BACK.load(Ordering::Relaxed) == given,
+    );
+    ok(
+        "...and mapped on the GPU",
+        rm.mapped.load(Ordering::Relaxed) == 1,
+    );
+    let mut free = [0u8; 24];
+    free[0..8].copy_from_slice(&BASE.to_le_bytes());
+    free[8..16].copy_from_slice(&LEN.to_le_bytes());
+    ok("...and freed", call(34, &mut free, 16));
+    ok(
+        "...its pages given back with the memory",
+        rm.pools.lock().unwrap().is_empty()
+            && nvctl::GIVEN_BACK.load(Ordering::Relaxed) != given
+            && nvctl::GIVE_BACK_REFUSED.load(Ordering::Relaxed) == 0,
+    );
 }
 
 /// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.

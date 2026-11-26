@@ -145,6 +145,30 @@ pub(super) fn enter_s5() {
     }
 }
 
+/// The bytes of the ACPI table with signature `sig`, as the firmware left
+/// them in memory.
+pub(super) fn acpi_table(sig: Signature) -> Option<&'static [u8]> {
+    let rsdp = super::special::pc_firmware_tables().0 as usize;
+    if rsdp == 0 {
+        return None;
+    }
+    let tables = unsafe {
+        AcpiTables::from_rsdp(
+            AcpiMapHandler {
+                phys_to_virt: crate::mem::phys_to_virt,
+            },
+            rsdp,
+        )
+        .ok()?
+    };
+    let sdt = tables.sdts.get(&sig)?;
+    let va = crate::mem::phys_to_virt(sdt.physical_address);
+    // SAFETY: the firmware's tables stay where they are for the life of
+    // the machine, and the linear map covers them (every ACPI read here
+    // goes through it).
+    Some(unsafe { core::slice::from_raw_parts(va as *const u8, sdt.length as usize) })
+}
+
 fn pm1_control_ports_from_fadt() -> Option<(u16, Option<u16>)> {
     let rsdp = super::special::pc_firmware_tables().0 as usize;
     if rsdp == 0 {
@@ -530,6 +554,11 @@ pub(super) fn init() -> DeviceResult {
     }
 
     boot_progress(88);
+
+    // The IOMMU, with every device the kernel drives already found and left
+    // in passthrough; only a device a process claims later gets a domain.
+    super::vtd::init();
+    super::amdvi::init();
 
     // Re-assert write-combining on the boot framebuffer AFTER the PCI scan.
     // The early retype in `primary_init` runs before PCI bring-up: on real

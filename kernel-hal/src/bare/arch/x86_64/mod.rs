@@ -1,3 +1,4 @@
+mod amdvi;
 mod drivers;
 #[cfg(feature = "graphic")]
 pub(crate) mod early_fb_console;
@@ -6,8 +7,10 @@ pub(crate) mod early_fb_console;
 pub(crate) mod power;
 // `vm.rs` consults `pat::pat_wc_ready` when emitting WriteCombining PTEs.
 pub(crate) mod pat;
+mod pcie;
 mod smp;
 mod trap;
+mod vtd;
 
 pub mod config;
 pub mod cpu;

@@ -38,11 +38,13 @@
 //             products (dp4a, a decoded token), int8 and f16 tensor cores
 //             (mma, a prompt), and a CUDA graph (how llama.cpp decodes).
 //   latency   what a launch costs, and a launch and the wait for it.
-//   peer      with two GPUs or more, after them: 64 MiB GPU 0 -> GPU 1 with
-//             cuMemcpyPeer, and again with peer access when the RM gives it.
+//   peer      with two GPUs or more, before the last one's run: 64 MiB
+//             GPU 0 -> GPU 1 with cuMemcpyPeer, and again with peer access
+//             when the RM gives it.
 //   sleeping  a launch and a wait that sleeps (CU_EVENT_BLOCKING_SYNC)
-//             instead of spinning: the wake needs the GPU's interrupt. Last
-//             GPU only, at the very end.
+//             instead of spinning: the wake needs the GPU's nonstall
+//             interrupt, which the kernel polls for while somebody waits
+//             (`dmesg | grep nonstall`). Last GPU only, at the very end.
 //
 // A wrong answer prints where it went wrong; a GPU that never finishes is
 // named after 60 s instead of hanging the probe. Its kernels are
@@ -330,9 +332,14 @@ static void deep_hung(int sig)
 {
     static const char a[] = "  ";
     static const char b[] = " HUNG: the GPU never finished it in 60 s. dmesg | grep -E 'nvidia|NVRM'\n";
+    // The sleeping wait is woken by the kernel servicing the GPU's nonstall
+    // interrupt, which it polls for: dmesg says whether it ever saw one.
+    static const char c[] = "  the wake never came: dmesg | grep nonstall\n";
     (void)sig;
     if (write(1, a, sizeof a - 1) < 0 || write(1, deep_step, strlen(deep_step)) < 0 ||
         write(1, b, sizeof b - 1) < 0)
+        _exit(4);
+    if (strcmp(deep_step, "sleeping wait") == 0 && write(1, c, sizeof c - 1) < 0)
         _exit(4);
     _exit(3);
 }
@@ -1046,12 +1053,14 @@ static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
     int failed = 0;
     for (int i = 0; i < gpus; i++) {
         CUdevice dev;
+        // Peer before the last GPU's run, which ends with the sleeping
+        // wait: a wake that never comes ends the probe, and peer with it.
+        if (i == gpus - 1 && peers_known && !deep_peer(d0, d1, peer != 0))
+            failed++;
         deep_step = "device";
         if (!deep_call("cuDeviceGet", get(&dev, i)) || !deep_gpu(dev, i, i == gpus - 1))
             failed++;
     }
-    if (peers_known && !deep_peer(d0, d1, peer != 0))
-        failed++;
     alarm(0);
     if (failed) {
         printf("DEEP FAILED on %d of %d GPU(s); the line above each FAILED names the check\n", failed, gpus);

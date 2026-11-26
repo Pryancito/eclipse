@@ -73,6 +73,20 @@ pub fn pin_user_pages(
     })
 }
 
+/// The runs of pages lent to the RM, in order, as `(object, offset,
+/// length)`: what the RM's process's GPUs are granted when the RM is a
+/// process's. Those [`pin_user_pages`] pinned, or a semaphore pool's (one
+/// object, whole: `/dev/nvidia-uvm`'s). `None` for pages of anything else.
+pub fn runs_of(pages: &nvctl::UserPages) -> Option<Vec<(Arc<VmObject>, usize, usize)>> {
+    if let Some(pins) = pages.keep.downcast_ref::<Pins>() {
+        return Some(pins.0.clone());
+    }
+    let pool = pages.keep.downcast_ref::<nvctl::remote::KernelPages>()?;
+    let vmo = pool.0.downcast_ref::<Arc<VmObject>>()?;
+    let len = pages.phys.len().checked_mul(PAGE_SIZE)?;
+    (len == vmo.len()).then(|| alloc::vec![(vmo.clone(), 0, len)])
+}
+
 /// The physical address of the page at `page`, pinned into `pins`.
 fn pin_page(vmar: &VmAddressRegion, page: usize, write: bool, pins: &mut Pins) -> LxResult<u64> {
     let mut access = MMUFlags::READ;

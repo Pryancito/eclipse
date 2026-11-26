@@ -130,6 +130,168 @@ pub(super) fn drm_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     Ok(())
 }
 
+/// `eclipse_nvctl_serve(fifo, window, hello, hello_len)`: the NVIDIA RM
+/// this process runs, as the one `/dev/nvidiactl` and `/dev/nvidia<N>`
+/// reach. The device files stay the kernel's; each escape they pass to
+/// the RM is a message on `fifo`, through `window`, as with
+/// [`ECLIPSE_DEV_SERVE`], and lends this process the caller's memory while
+/// it waits ([`ECLIPSE_DEV_MEMORY`]), where the RM follows the pointers in
+/// its parameters. `hello` is `hello_len` bytes, what the RM says of itself
+/// and its GPUs (`zcore_drivers::display::nvctl::remote::hello`). Both
+/// handles go to the kernel, whatever the answer.
+///
+/// When the process is gone so is the RM; one that answers nothing for ten
+/// seconds while a call waits is killed.
+///
+/// `ACCESS_DENIED` to a process that may not `mount(2)`; `NOT_SUPPORTED`
+/// with no `/dev/nvidiactl` (`nvidia.nvidiactl` is off, or not x86_64);
+/// `ALREADY_EXISTS` while the kernel's own RM is up or another process
+/// serves one; `INVALID_ARGS` for a `hello` that does not parse, a window
+/// that does not hold a slot or a FIFO of another message size.
+pub const ECLIPSE_NVCTL_SERVE: u32 = super::ECLIPSE_GATEWAY_EXT + 25;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use linux_object::fs::devfs::served::nvctl;
+    let fifo = proc.get_object_with_rights::<Fifo>(args[0] as u32, Rights::READ | Rights::WRITE);
+    let window =
+        proc.get_object_with_rights::<VmObject>(args[1] as u32, Rights::READ | Rights::WRITE);
+    for handle in [args[0], args[1]] {
+        if handle != 0 {
+            let _ = proc.remove_handle(handle as u32);
+        }
+    }
+    let (fifo, window) = (fifo?, window?);
+    if args[3] == 0 || args[3] > HELLO_MAX {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let hello = kernel_hal::user::UserInPtr::<u8>::from(args[2])
+        .read_array(args[3])
+        .map_err(|_| ZxError::INVALID_ARGS)?;
+    let (whose, pinned, lender) = (proc.clone(), proc.clone(), proc.clone());
+    let owns: nvctl::Owns =
+        Arc::new(move |start, size| super::device_claim::owns_memory(&whose, start, size));
+    let system: nvctl::SystemVmo =
+        Arc::new(move |start, len| super::device_claim::pinned_slice(&pinned, start, len));
+    let lend: nvctl::Lender = Arc::new(move |pages| {
+        let runs = linux_object::fs::devfs::nvidia::runs_of(pages)?;
+        let loan =
+            super::device_claim::lend_to_devices(&lender, &runs, &pages.phys, pages.writable)?;
+        Some(alloc::boxed::Box::new(loan) as alloc::boxed::Box<dyn nvctl::Loan>)
+    });
+    let server = nvctl::Server {
+        owns,
+        lend,
+        id: proc.id(),
+    };
+    let rm = nvctl::serve_rm(proc.linux(), fifo.clone(), window, &hello, server, system).map_err(
+        |e| match e {
+            LxError::EPERM => ZxError::ACCESS_DENIED,
+            LxError::ENODEV => ZxError::NOT_SUPPORTED,
+            LxError::EEXIST => ZxError::ALREADY_EXISTS,
+            _ => ZxError::INVALID_ARGS,
+        },
+    )?;
+    let pid = proc.id() as usize;
+    rm.killed_with(alloc::boxed::Box::new(move || {
+        let kill = linux_object::signal::Signal::SIGKILL;
+        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            warn!("[nvidiactl] the hung RM server {pid} was not killed: {e:?}");
+        }
+    }));
+    kernel_hal::thread::spawn(async move {
+        let wire: Arc<dyn KernelObject> = fifo;
+        loop {
+            let seen = wire
+                .wait_signal(Signal::READABLE | Signal::PEER_CLOSED | SERVER_LEFT)
+                .await;
+            if seen.contains(Signal::READABLE) && rm.look() {
+                continue;
+            }
+            break;
+        }
+        drop(wire);
+        rm.gone();
+    });
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+impl linux_object::fs::devfs::served::nvctl::Loan for super::device_claim::GpuLoan {
+    fn give_back(mut self: alloc::boxed::Box<Self>) {
+        self.give_back_now();
+    }
+}
+
+/// `eclipse_nvctl_return(loan)`: the RM this process serves is done with
+/// the pages of `loan`, which [`ECLIPSE_NVCTL_SERVE`] lent it with an
+/// escape: its devices lose them, and the kernel unpins them. `NOT_FOUND`
+/// for a loan it does not have (given back already, or never its), and to
+/// a process that serves no RM.
+pub const ECLIPSE_NVCTL_RETURN: u32 = super::ECLIPSE_GATEWAY_EXT + 26;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn nvctl_return(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use linux_object::fs::devfs::served::nvctl;
+    if nvctl::give_back(proc.id(), args[0] as u64) {
+        Ok(())
+    } else {
+        Err(ZxError::NOT_FOUND)
+    }
+}
+
+/// `eclipse_nvctl_event(os_info, flags, h_object, notify_index, info32,
+/// info16)`: the RM this process serves posts an OS event to the open
+/// `os_info` ([`ECLIPSE_NVCTL_SERVE`] told it of in the caller of its
+/// `ALLOC_OS_EVENT`), queued there for `poll` and `RM_GET_EVENT_DATA`.
+/// `flags` bit 0 says the other words are the event's data (`NvUnixEvent`);
+/// with it clear they are zero, an event with no data. An open that has
+/// closed takes nothing. `NOT_FOUND` to a process that serves no RM;
+/// `INVALID_ARGS` for other flags, or a word too wide for its field.
+pub const ECLIPSE_NVCTL_EVENT: u32 = super::ECLIPSE_GATEWAY_EXT + 27;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn nvctl_event(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use core::convert::TryFrom;
+    use linux_object::fs::devfs::served::nvctl;
+    let word = |v: usize| u32::try_from(v).map_err(|_| ZxError::INVALID_ARGS);
+    let event = match args[1] {
+        0 if args[2..].iter().all(|&w| w == 0) => None,
+        1 => Some(nvctl::UnixEvent {
+            h_object: word(args[2])?,
+            notify_index: word(args[3])?,
+            info32: word(args[4])?,
+            info16: u16::try_from(args[5]).map_err(|_| ZxError::INVALID_ARGS)?,
+        }),
+        _ => return Err(ZxError::INVALID_ARGS),
+    };
+    if nvctl::post_event(proc.id(), args[0], event) {
+        Ok(())
+    } else {
+        Err(ZxError::NOT_FOUND)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn nvctl_event(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
+    Err(ZxError::NOT_SUPPORTED)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn nvctl_return(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
+    Err(ZxError::NOT_SUPPORTED)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    for handle in [args[0], args[1]] {
+        if handle != 0 {
+            let _ = proc.remove_handle(handle as u32);
+        }
+    }
+    Err(ZxError::NOT_SUPPORTED)
+}
+
 /// [`ECLIPSE_DEV_MEMORY`]'s program: the address space of the one that
 /// made request `args[1]` on the server's FIFO `args[0]`.
 pub(super) fn asker(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Arc<VmAddressRegion>> {

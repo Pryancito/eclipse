@@ -51,7 +51,10 @@ impl PhysFrame {
     }
 
     fn alloc_contiguous_base(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-        KHANDLER.frame_alloc_contiguous(frame_count, align_log2)
+        // The DMA quarantine gives back what it holds before this gives up:
+        // a driver in a process (`udrv-nvidia`) gets its GPU buffers here,
+        // as contiguous VMOs, and needs the same second try as the kernel's.
+        crate::drivers::frame_alloc_contiguous_flushing("contiguous VMO", frame_count, align_log2)
     }
 
     /// Allocate contiguous physical frames.

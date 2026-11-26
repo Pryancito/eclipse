@@ -48,6 +48,10 @@ pub(crate) fn write_firefox_wrapper(rootfs: &Path) {
           case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=es_ES.UTF-8 ;; esac\n\
           export MOZ_ENABLE_WAYLAND=1\n\
           export GDK_PIXBUF_MODULE_FILE=\"${GDK_PIXBUF_MODULE_FILE:-/root/.cache/pixbuf-loaders.cache}\"\n\
+          # glycin (gdk-pixbuf 2.44 decodes every image through it) runs its\n\
+          # loaders under bwrap; that fails here, GTK asserts on image-missing\n\
+          # and Firefox dies. Eclipse has no namespaces to sandbox with anyway.\n\
+          export GLYCIN_DISABLE_SANDBOX=i-know-the-risks\n\
           export GSETTINGS_BACKEND=\"${GSETTINGS_BACKEND:-memory}\"\n\
           export MOZ_FORCE_DISABLE_E10S=1\n\
           export MOZ_DISABLE_CONTENT_SANDBOX=1\n\

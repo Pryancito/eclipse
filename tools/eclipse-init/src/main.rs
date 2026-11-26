@@ -554,6 +554,10 @@ const CHILD_ENV: &[&str] = &[
     // wrote the system loaders.cache). /etc/profile and the wrapper carry
     // the same two.
     "GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache",
+    // gdk-pixbuf 2.44 decodes every image through glycin, whose loaders run
+    // under bwrap. That fails on Eclipse (no namespaces), GTK then asserts on
+    // its image-missing icon and kills the app. glycin wants this exact value.
+    "GLYCIN_DISABLE_SANDBOX=i-know-the-risks",
     "GSETTINGS_BACKEND=memory",
     // SDL (sdl12-compat / SDL2 / SDL3) backends, the renderer-independent half
     // of the session's SDL policy (the labwc wrapper and /etc/profile assert

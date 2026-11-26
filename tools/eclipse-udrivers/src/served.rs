@@ -391,6 +391,69 @@ impl Node {
         })
     }
 
+    /// Serve the NVIDIA RM this process runs (`ECLIPSE_NVCTL_SERVE`): the
+    /// kernel's `/dev/nvidiactl` and `/dev/nvidia<N>` pass what they ask of
+    /// the RM here. `hello` is what the RM says of itself
+    /// (`zcore_drivers::display::nvctl::remote::hello`).
+    pub fn serve_nvctl(hello: &[u8]) -> Result<Node, (Status, String)> {
+        let (fifo, theirs) = Fifo::<Msg>::create(SLOTS * 4)
+            .map_err(|e| (Status::NO_MEMORY, format!("fifo_create: {e}")))?;
+        let (window, vmo) =
+            zx::shared_memory(SLOTS * SLOT_LEN).map_err(|e| (Status::NO_MEMORY, e))?;
+        // SAFETY: the kernel reads `hello.len()` bytes of `hello`; both
+        // handles go to it.
+        unsafe {
+            zx::call(
+                nr::ECLIPSE_NVCTL_SERVE,
+                [
+                    theirs as usize,
+                    vmo as usize,
+                    hello.as_ptr() as usize,
+                    hello.len(),
+                    0,
+                    0,
+                ],
+            )
+        }
+        .map_err(|e| (e, format!("nvctl_serve: {e}")))?;
+        Ok(Node {
+            fifo,
+            window,
+            held: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Give the kernel back the pages of `loan`, which it lent the RM this
+    /// process serves with an escape (`ECLIPSE_NVCTL_RETURN`): the RM is
+    /// done with them.
+    pub fn give_back_nvctl(loan: u64) -> Result<(), Status> {
+        // SAFETY: no memory is passed.
+        unsafe { zx::call(nr::ECLIPSE_NVCTL_RETURN, [loan as usize, 0, 0, 0, 0, 0]) }.map(|_| ())
+    }
+
+    /// Post an OS event of the RM this process serves to the open
+    /// `os_info` (`ECLIPSE_NVCTL_EVENT`): `data` is the event's `hObject`,
+    /// notifier index, `info32` and `info16`, none for an event with no
+    /// data.
+    pub fn post_nvctl_event(os_info: usize, data: Option<(u32, u32, u32, u16)>) -> Result<(), Status> {
+        let words = match data {
+            Some((h, index, info32, info16)) => {
+                [os_info, 1, h as usize, index as usize, info32 as usize, info16 as usize]
+            }
+            None => [os_info, 0, 0, 0, 0, 0],
+        };
+        // SAFETY: no memory is passed.
+        unsafe { zx::call(nr::ECLIPSE_NVCTL_EVENT, words) }.map(|_| ())
+    }
+
+    /// While the value lives, [`caller_read`] and [`caller_write`] reach
+    /// the memory of the program whose request `req` is: for an answer
+    /// not made through [`Node::answer`] whose request lends it (the
+    /// kernel says which do).
+    pub fn reaching(&self, req: &Msg) -> impl Drop {
+        Asking::new(self.fifo.handle(), req.reqid)
+    }
+
     /// The bytes of request `req`'s slot: what it carries in, and where its
     /// answer goes out. Only while it is being answered.
     #[allow(clippy::mut_from_ref)]

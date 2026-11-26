@@ -11,9 +11,9 @@
 //! fixed-point multiply is easy to get subtly wrong in a way that only shows up
 //! at large TSC values (the whole reason it is not plain 64-bit arithmetic), so
 //! it is checked against an independent computation at a realistic uptime. And
-//! every path this image cannot serve must return something musl treats as
-//! "fall back to the syscall" — never `-EINVAL`, which musl passes straight to
-//! the caller as a hard error.
+//! every path this image cannot serve must make the system call itself and
+//! return the kernel's answer: glibc, unlike musl, does not fall back on its
+//! own, so an error code from here is an error in the program.
 //!
 //! Only meaningful where the host can execute the image, i.e. x86_64 Linux.
 
@@ -24,7 +24,6 @@ use std::sync::atomic::{compiler_fence, Ordering};
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
-const ENOSYS: i32 = -38;
 
 /// The `struct timespec` the image writes through.
 #[repr(C)]
@@ -377,49 +376,126 @@ fn realtime_is_monotonic_plus_the_offset() {
     assert!(real.tv_nsec >= 0 && real.tv_nsec < 1_000_000_000);
 }
 
-/// Every unserved path must be one musl retries as a syscall.
+/// The host's own clock, by the real system call: what an unserved path of
+/// the image has to answer with, since the image makes that call itself.
+fn host_clock_gettime(clk: i32) -> (isize, Timespec) {
+    let mut ts = Timespec::default();
+    let r: isize;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 228isize => r,   // SYS_clock_gettime
+            in("rdi") clk as isize,
+            in("rsi") &mut ts as *mut Timespec,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    (r, ts)
+}
+
+/// Every unserved path makes the system call itself and returns the kernel's
+/// answer.
 ///
-/// musl returns `-EINVAL` straight to the caller and falls through on anything
-/// else, so an unsupported clock reported as `-EINVAL` would turn "the vDSO
-/// cannot do this one" into "this clock does not exist" for the whole process.
+/// It used to return `-ENOSYS`, which musl and Go read as "ask the kernel" and
+/// glibc reads as the answer: `clock_gettime(CLOCK_BOOTTIME)` failed with
+/// ENOSYS in every glibc program, and Firefox release-asserts on that clock
+/// the moment a tab turns audible. Here the "kernel" is the host's, so the
+/// image has to agree with a direct system call for the same clock.
 #[test]
-fn unserved_paths_fall_back_instead_of_failing() {
+fn unserved_paths_ask_the_kernel_themselves() {
     const EINVAL: i32 = -22;
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    const CLOCK_BOOTTIME: i32 = 7;
+    const CLOCK_TAI: i32 = 11;
 
-    // Disabled by the kernel: nothing may be answered, including clocks the
-    // image otherwise implements.
+    // Disabled by the kernel, and enabled: the clocks the image never serves
+    // (both) and the ones it serves only when enabled (the first).
     let off = Mapping::new(linux_vdso::VdsoData::default());
-    let clock_gettime: ClockGettime = off.sym("__vdso_clock_gettime");
-    for clk in [CLOCK_REALTIME, CLOCK_MONOTONIC] {
-        let mut ts = Timespec {
-            tv_sec: -1,
-            tv_nsec: -1,
-        };
-        let r = unsafe { clock_gettime(clk, &mut ts) };
-        assert_eq!(
-            r, ENOSYS,
-            "con enabled=0 el reloj {} debe delegar al kernel",
-            clk
-        );
-        assert_ne!(r, EINVAL, "-EINVAL romperia el reloj para todo el proceso");
-        assert_eq!(
-            ts,
-            Timespec {
-                tv_sec: -1,
-                tv_nsec: -1
-            },
-            "no debe tocar el timespec"
-        );
-    }
-
-    // Enabled, but a clock this image does not implement.
     let on = Mapping::new(enabled(0));
-    let clock_gettime: ClockGettime = on.sym("__vdso_clock_gettime");
-    for clk in [CLOCK_PROCESS_CPUTIME_ID, 3, 7, 11, -1, 0x4000_0000] {
-        let mut ts = Timespec::default();
-        let r = unsafe { clock_gettime(clk, &mut ts) };
-        assert_eq!(r, ENOSYS, "el reloj {} debe delegar al kernel", clk);
+    let cases: [(&Mapping, &[i32]); 2] = [
+        (
+            &off,
+            &[CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI],
+        ),
+        (
+            &on,
+            &[
+                CLOCK_PROCESS_CPUTIME_ID,
+                CLOCK_THREAD_CPUTIME_ID,
+                CLOCK_BOOTTIME,
+                CLOCK_TAI,
+            ],
+        ),
+    ];
+    for (mapping, clocks) in cases {
+        let clock_gettime: ClockGettime = mapping.sym("__vdso_clock_gettime");
+        for &clk in clocks {
+            let (r0, before) = host_clock_gettime(clk);
+            let mut ts = Timespec {
+                tv_sec: -1,
+                tv_nsec: -1,
+            };
+            let r = unsafe { clock_gettime(clk, &mut ts) };
+            let (_, after) = host_clock_gettime(clk);
+            assert_eq!(r0, 0, "el host deberia tener el reloj {}", clk);
+            assert_eq!(r, 0, "el reloj {} debe responderlo el kernel", clk);
+            assert!(
+                before.as_ns() <= ts.as_ns() && ts.as_ns() <= after.as_ns(),
+                "reloj {}: {:?} fuera de [{:?}, {:?}]",
+                clk,
+                ts,
+                before,
+                after
+            );
+        }
+        // A number that names no clock is the kernel's to refuse, with the
+        // kernel's errno, and nothing is written.
+        for clk in [-1, 0x4000_0000] {
+            let mut ts = Timespec {
+                tv_sec: -1,
+                tv_nsec: -1,
+            };
+            let r = unsafe { clock_gettime(clk, &mut ts) };
+            assert_eq!(r, EINVAL, "el reloj {} no existe", clk);
+            assert_eq!(ts.tv_sec, -1, "no debe tocar el timespec");
+        }
     }
+}
+
+/// `time` and `gettimeofday` are IFUNCs in glibc, bound straight to the image
+/// with nothing behind them: with the clock disabled they returned -38, as the
+/// time. They make the system call too.
+#[test]
+fn time_and_gettimeofday_ask_the_kernel_when_the_clock_is_disabled() {
+    let off = Mapping::new(linux_vdso::VdsoData::default());
+    let gettimeofday: Gettimeofday = off.sym("__vdso_gettimeofday");
+    let time: Time = off.sym("__vdso_time");
+
+    let (_, before) = host_clock_gettime(CLOCK_REALTIME);
+    let mut tv = Timeval::default();
+    assert_eq!(unsafe { gettimeofday(&mut tv, std::ptr::null_mut()) }, 0);
+    let mut t_out = 0i64;
+    let t = unsafe { time(&mut t_out) };
+    let (_, after) = host_clock_gettime(CLOCK_REALTIME);
+
+    assert!(
+        (before.tv_sec..=after.tv_sec).contains(&tv.tv_sec),
+        "gettimeofday dio {} y el host [{}, {}]",
+        tv.tv_sec,
+        before.tv_sec,
+        after.tv_sec
+    );
+    assert!(tv.tv_usec >= 0 && tv.tv_usec < 1_000_000);
+    assert!(
+        (before.tv_sec..=after.tv_sec).contains(&t),
+        "time() dio {} y el host [{}, {}]",
+        t,
+        before.tv_sec,
+        after.tv_sec
+    );
+    assert_eq!(t_out, t, "time() no escribio su argumento");
+    assert_eq!(unsafe { time(std::ptr::null_mut()) } / 2, t / 2);
 }
 
 #[test]
@@ -508,19 +584,20 @@ fn host_getcpu() -> (u32, u32) {
     (cpu, node)
 }
 
-/// With the flag off the image declines, and musl's contract turns that into the
-/// syscall. This is the whole safety net: a machine without `rdtscp`, or a
-/// kernel that could not encode some CPU's id, must never get a guess.
+/// With the flag off the image takes the trap itself. This is the whole safety
+/// net: a machine without `rdtscp`, or a kernel that could not encode some
+/// CPU's id, must never get a guess -- it gets the kernel's answer.
 #[test]
-fn getcpu_declines_until_the_kernel_says_the_register_is_set() {
+fn getcpu_asks_the_kernel_until_it_says_the_register_is_set() {
+    let _ = pin_to_one_cpu();
     let m = Mapping::new(enabled(0));
     let getcpu: Getcpu = m.sym("__vdso_getcpu");
     let mut cpu = 0xdead_beefu32;
     let mut node = 0xdead_beefu32;
     let r = unsafe { getcpu(&mut cpu, &mut node, core::ptr::null_mut()) };
-    assert_eq!(r, -38, "sin el flag tiene que devolver -ENOSYS");
-    assert_eq!(cpu, 0xdead_beef, "y no tocar lo que le pasaron");
-    assert_eq!(node, 0xdead_beef);
+    let host = host_getcpu();
+    assert_eq!(r, 0, "sin el flag tiene que responder el kernel");
+    assert_eq!((cpu, node), host);
 }
 
 /// With the flag on it answers in userspace, and the answer is the one the

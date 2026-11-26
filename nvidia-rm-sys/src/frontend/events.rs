@@ -353,5 +353,47 @@ pub extern "C" fn eclipse_rm_frontend_post_event(
     post(event as usize as u64, data);
 }
 
+#[cfg(nvrm_real)]
+extern "C" {
+    fn eclipse_rm_frontend_service_nonstall(serviced_mask: *mut NvU32) -> NV_STATUS;
+}
+
+// Hosted builds compile no RM C (build.rs): there is no GPU to service.
+#[cfg(not(nvrm_real))]
+unsafe fn eclipse_rm_frontend_service_nonstall(serviced_mask: *mut NvU32) -> NV_STATUS {
+    *serviced_mask = 0;
+    NV_OK
+}
+
+/// What one [`service_nonstall`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonstallPoll {
+    /// Somebody else was inside the RM: nothing was looked at.
+    Busy,
+    /// The RM looked, and these GPU instances (a bit each) had a nonstall
+    /// interrupt pending, now serviced: the OS events bound to it are posted.
+    Serviced(u32),
+    /// The RM could not take its locks.
+    Failed(NV_STATUS),
+}
+
+/// The servicing half of `rm_isr`, for nonstall interrupts only, on every
+/// GPU: what posts the OS events a sleeping CUDA wait polls for. This port
+/// has no GPU interrupt, so the kernel side calls this while somebody waits
+/// on an OS event (see eclipse_rm_frontend.c). It never waits for the RM
+/// gate: a call already inside the RM answers [`NonstallPoll::Busy`].
+pub fn service_nonstall() -> NonstallPoll {
+    let Some(_scope) = super::CallScope::try_enter_kernel() else {
+        return NonstallPoll::Busy;
+    };
+    let mut mask: NvU32 = 0;
+    let status = unsafe { eclipse_rm_frontend_service_nonstall(&mut mask) };
+    if status == NV_OK {
+        NonstallPoll::Serviced(mask)
+    } else {
+        NonstallPoll::Failed(status)
+    }
+}
+
 #[cfg(test)]
 mod tests;
