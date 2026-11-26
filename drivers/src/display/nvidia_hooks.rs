@@ -257,6 +257,15 @@ pub fn map_device_window(phys: u64, len: u64) -> bool {
         }
         pa += PAGE;
     }
+    // In a process that was the driver's own window. The kernel reads the
+    // buffer too (the frame it copies to the panel, the pointer's image,
+    // PRIME), through a window of its own that only it can map, and takes
+    // no object it has none onto: asked here, a refusal places the object
+    // in host memory, as a failure above does.
+    #[cfg(feature = "process")]
+    if !crate::scheme::gem_mmap::window(phys, len) {
+        return false;
+    }
     true
 }
 

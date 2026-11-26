@@ -41,6 +41,8 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
+pub mod window;
+
 /// A virtio block device.
 pub const VIRTIO_BLK: &str = "virtio-blk";
 /// A virtio network card.
@@ -1347,6 +1349,9 @@ fn reserve_with(
     }
     let Wiring { irq, vaddr } = wiring();
     info!("udriver: {kind} #{index} at {paddr:#x} (+{size:#x}, irq {irq:?}) left to userspace");
+    if let Some(place) = &pci {
+        window::reach(&place.bars);
+    }
     if vaddr.is_none() {
         warn!("udriver: {kind} #{index} is not mapped in the kernel: it cannot be reset, so it will have one driver and no second");
     }
@@ -1419,6 +1424,9 @@ pub fn reserve_pci_by_id(
     }
     let Wiring { irq, vaddr } = wiring();
     info!("udriver: {name} at {paddr:#x} (+{size:#x}, irq {irq:?}) left to userspace");
+    if let Some(place) = &pci {
+        window::reach(&place.bars);
+    }
     RESERVED.lock().push(Arc::new(UserDevice {
         kind: PCI,
         index,

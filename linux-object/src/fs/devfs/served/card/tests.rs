@@ -574,3 +574,26 @@ fn the_pointer_is_the_kernels_again_when_the_card_that_had_it_goes() {
     panel.gone();
     assert!(!plane_has_pointer(None));
 }
+
+/// Behind an IOMMU a served card is offered the copy of a frame only when
+/// the frame is in a card's own VRAM and the card has the monitor: its
+/// copy engine then reads nothing of the kernel's and writes its own
+/// framebuffer. Without an IOMMU every card is offered every frame.
+#[test]
+fn behind_an_iommu_a_card_copies_only_its_own_vram_to_its_own_monitor() {
+    for in_vram in [false, true] {
+        for console in [false, true] {
+            assert!(copy_offered(true, in_vram, console));
+        }
+    }
+    assert!(copy_offered(false, true, true));
+    assert!(
+        !copy_offered(false, false, true),
+        "a frame in the kernel's memory, which the GPU cannot read"
+    );
+    assert!(
+        !copy_offered(false, true, false),
+        "a card that would write another card's framebuffer"
+    );
+    assert!(!copy_offered(false, false, false));
+}

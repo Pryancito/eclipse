@@ -493,9 +493,18 @@ pub(super) fn init() -> DeviceResult {
         use zcore_drivers::bus::pci;
 
         struct IoMapperImpl;
+        /// One mapping at a time. The scan below runs alone, but device
+        /// memory is also mapped once processes run, by whichever thread
+        /// registers a buffer in it (`user::window`, the NVIDIA driver's
+        /// VRAM objects): two that walked the tables at once would each
+        /// make the table both found missing, and one of the two would be
+        /// lost with what was mapped under it. The other two architectures
+        /// map under the lock of the kernel's table.
+        static MAPPING: lock::Mutex<()> = lock::Mutex::new(());
         impl IoMapper for IoMapperImpl {
             fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
                 let vaddr = crate::mem::phys_to_virt(paddr);
+                let _one_at_a_time = MAPPING.lock();
                 let mut pt = PageTable::from_current();
 
                 if let Ok((paddr_mapped, _, _)) = pt.query(vaddr) {

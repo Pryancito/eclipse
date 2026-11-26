@@ -76,6 +76,14 @@ pub fn register_device_memory(handle: u32, phys_addr: u64, size: u64, owner_pid:
     note(REGISTER_DEVICE, word(REGISTER_DEVICE, args));
 }
 
+/// Whether the kernel has its own window onto `[phys, phys + len)` of this
+/// driver's GPU's memory ([`wire::WINDOW`]): it maps it now if it had not.
+/// The kernel reads an object placed there where it is, and one it has no
+/// window onto it refuses when it is registered.
+pub fn window(phys: u64, len: u64) -> bool {
+    said(WINDOW, [phys, len, 0, 0])
+}
+
 pub fn is_device_memory(handle: u32) -> bool {
     said(IS_DEVICE, [handle as u64, 0, 0, 0])
 }
