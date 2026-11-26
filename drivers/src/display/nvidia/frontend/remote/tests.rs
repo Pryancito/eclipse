@@ -119,6 +119,9 @@ struct Mirror {
     uvm_lent: lock::Mutex<Option<(usize, Vec<u64>, u32, bool)>>,
     /// How many times it was asked to enable HDMI audio.
     kicked: AtomicUsize,
+    /// What it says it has now, and how many times it was asked.
+    hello: lock::Mutex<Vec<u8>>,
+    hellos: AtomicUsize,
 }
 
 impl Rm for Mirror {
@@ -174,6 +177,11 @@ impl Rm for Mirror {
     fn kick_hdmi_audio(&self) -> String {
         let n = self.kicked.fetch_add(1, Ordering::SeqCst) + 1;
         alloc::format!("[hdmi-audio] 2d:00.0 [console GPU, drives the monitor]: kick {n}\n")
+    }
+
+    fn hello(&self) -> Vec<u8> {
+        self.hellos.fetch_add(1, Ordering::SeqCst);
+        self.hello.lock().clone()
     }
 
     fn uvm_va_space_device(
@@ -818,4 +826,44 @@ fn the_hdmi_audio_kick_reaches_a_served_rm_and_says_what_it_did() {
     gone(&link);
     assert_eq!(super::super::kick_served_hdmi_audio(), None);
     *HDMI_AUDIO_STATUS.lock() = saved;
+}
+
+/// The console GPU the process brings up after it started (`nvidia.console_gpu`)
+/// is in the RM's cards from then on: listed with its id and UUID, as
+/// `nvidia-smi` needs it. Before, the cards stayed as the first `hello` had
+/// them and the console GPU was never seen. The process is asked again only
+/// once it may have changed, and a `hello` that names other GPUs is not
+/// taken.
+#[test]
+fn a_gpu_the_process_brings_up_later_is_in_the_cards_from_then_on() {
+    let _g = crate::test_globals::LOCK.lock();
+    let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
+    let link: Arc<dyn Link> = direct.clone();
+    let at_start = vec![card(0, None), card(1, Some(0))];
+    assert!(serve(link.clone(), &hello_of(true, &at_start), server()).is_ok());
+    assert_eq!(cards()[0].gpu_id(), u32::MAX, "the console GPU, cold");
+
+    let up = vec![card(0, Some(1)), card(1, Some(0))];
+    *direct.0.hello.lock() = hello_of(true, &up);
+    assert_eq!(
+        cards()[0].instance,
+        None,
+        "not asked before it may have changed"
+    );
+    assert_eq!(direct.0.hellos.load(Ordering::SeqCst), 0);
+
+    cards_may_have_changed();
+    let listed = cards();
+    assert_eq!(listed[0].instance, Some(1));
+    assert_eq!(listed[0].gpu_id(), 0x2d00, "the process's RM's id");
+    assert_eq!(listed[0].uuid(), Some([2; GPU_UUID_LEN]));
+    assert_eq!(listed[1].gpu_id(), 0x2d01);
+    assert_eq!(direct.0.hellos.load(Ordering::SeqCst), 1, "asked once");
+
+    // Other GPUs than the first hello named: kept as they were.
+    *direct.0.hello.lock() = hello_of(true, &[card(0, Some(1))]);
+    cards_may_have_changed();
+    assert_eq!(cards().len(), 2);
+    assert_eq!(cards()[0].instance, Some(1));
+    gone(&link);
 }

@@ -825,11 +825,19 @@ impl<T: Transport> DrmScheme for Remote<T> {
         let gate = crate::display::console_gsp_enabled() as u64;
         #[cfg(not(target_arch = "x86_64"))]
         let gate = 0;
-        self.line(op::CONSOLE_BRINGUP, gate)
+        let said = self.line(op::CONSOLE_BRINGUP, gate);
+        // The GPU has an RM instance in the process from now on, which
+        // the RM's device files learn when they next read the cards.
+        #[cfg(target_arch = "x86_64")]
+        crate::display::nvctl::remote::cards_may_have_changed();
+        said
     }
 
     fn build_console_gr_ladder(&self) -> String {
-        self.line(op::CONSOLE_GR_LADDER, 0)
+        let said = self.line(op::CONSOLE_GR_LADDER, 0);
+        #[cfg(target_arch = "x86_64")]
+        crate::display::nvctl::remote::cards_may_have_changed();
+        said
     }
 
     /// The heads of the driver's console GPU, read where the driver is:

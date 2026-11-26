@@ -58,7 +58,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lock::Mutex;
 use nvidia_rm_sys::types::{
     NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_NOT_SUPPORTED,
@@ -120,6 +120,11 @@ pub mod op {
     /// push the ELD and unmute on the GPU that drives the monitor. No
     /// message; the answer's bytes are what was done, in words.
     pub const KICK_HDMI_AUDIO: u32 = 143;
+    /// What the RM says of itself now: no message; the answer's bytes are
+    /// a `hello` ([`super::hello_of`]). A GPU the process brings up after
+    /// it started (the console GPU, `nvidia.console_gpu`) has an RM
+    /// instance, an id and a UUID only from then on.
+    pub const HELLO: u32 = 144;
 }
 
 /// The most bytes a message carries: a slot of the link.
@@ -173,8 +178,11 @@ pub struct Server {
 pub(super) struct Served {
     link: Arc<dyn Link>,
     server: Server,
-    rm_up: bool,
-    cards: Vec<ServedCard>,
+    rm_up: AtomicBool,
+    /// The GPUs as the process last said, read again ([`op::HELLO`]) after
+    /// [`cards_may_have_changed`].
+    cards: Mutex<Vec<ServedCard>>,
+    stale: AtomicBool,
     /// Pages lent to the process, by loan, until it gives them back. Those
     /// it never gives back are dropped with it ungiven: what the GPUs were
     /// granted stays theirs until the loader resets them.
@@ -217,8 +225,9 @@ pub fn serve(
     *served = Some(Arc::new(Served {
         link,
         server,
-        rm_up,
-        cards: cards.clone(),
+        rm_up: AtomicBool::new(rm_up),
+        cards: Mutex::new(cards.clone()),
+        stale: AtomicBool::new(false),
         loans: Mutex::new(BTreeMap::new()),
         next_loan: AtomicU64::new(1),
     }));
@@ -271,20 +280,67 @@ pub fn gone(link: &Arc<dyn Link>) {
     drop(was);
 }
 
+/// The process may have brought up a GPU since it said what it has (the
+/// console GPU's bring-up, ops 96 and 97 of its card): the cards are asked
+/// for again before they are next read. Before, the console GPU stayed as
+/// the process's first `hello` had it, with no RM instance: not listed, its
+/// node not to be opened, and `nvidia-smi` saw the other GPU alone.
+pub fn cards_may_have_changed() {
+    if let Some(served) = served() {
+        served.stale.store(true, Ordering::Release);
+    }
+}
+
 impl Served {
     pub(super) fn rm_up(&self) -> bool {
-        self.rm_up
+        self.rm_up.load(Ordering::Acquire)
     }
 
     pub(super) fn cards(&self) -> Vec<Card> {
-        self.cards.iter().map(|c| c.card).collect()
+        self.fresh().iter().map(|c| c.card).collect()
     }
 
     /// The card whose RM instance is `instance`.
-    pub(super) fn by_instance(&self, instance: u32) -> Option<&ServedCard> {
-        self.cards
-            .iter()
+    pub(super) fn by_instance(&self, instance: u32) -> Option<ServedCard> {
+        self.fresh()
+            .into_iter()
             .find(|c| c.card.instance == Some(instance))
+    }
+
+    /// The cards, asked for again first when they may have changed. A
+    /// `hello` that does not parse, or names other GPUs than the first did
+    /// (another count, other places), leaves them as they were.
+    fn fresh(&self) -> Vec<ServedCard> {
+        if self.stale.swap(false, Ordering::AcqRel) {
+            match self.link.call(op::HELLO, 0, &[]) {
+                Ok((_, hello)) => self.take_hello(&hello),
+                Err(errno) => {
+                    warn!(
+                        "[nvidiactl] the RM's process did not say what it has now (errno {errno})"
+                    )
+                }
+            }
+        }
+        self.cards.lock().clone()
+    }
+
+    fn take_hello(&self, hello: &[u8]) {
+        let Some((rm_up, now)) = parse_hello(hello) else {
+            warn!("[nvidiactl] the RM's process said what it has in words that do not parse");
+            return;
+        };
+        let mut cards = self.cards.lock();
+        let same_gpus = now.len() == cards.len()
+            && now.iter().zip(cards.iter()).all(|(n, c)| {
+                (n.card.domain, n.card.bus, n.card.slot) == (c.card.domain, c.card.bus, c.card.slot)
+            });
+        if !same_gpus {
+            warn!("[nvidiactl] the RM's process names other GPUs than it did: kept as they were");
+            return;
+        }
+        *cards = now;
+        drop(cards);
+        self.rm_up.fetch_or(rm_up, Ordering::AcqRel);
     }
 
     pub(super) fn rm_escape(&self, cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
@@ -873,6 +929,10 @@ pub trait Rm {
     fn kick_hdmi_audio(&self) -> String {
         String::new()
     }
+    /// What the RM has now, as a `hello` ([`op::HELLO`]).
+    fn hello(&self) -> Vec<u8> {
+        Vec::new()
+    }
 
     // UVM's calls, refused unless an RM takes them.
     fn uvm_va_space_device(
@@ -973,6 +1033,10 @@ impl Rm for ThisRm {
         }
         said.truncate(end);
         said
+    }
+
+    fn hello(&self) -> Vec<u8> {
+        hello()
     }
 
     fn uvm_va_space_device(
@@ -1087,6 +1151,11 @@ pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> R
         op::KICK_HDMI_AUDIO => {
             out.clear();
             out.extend_from_slice(rm.kick_hdmi_audio().as_bytes());
+            Ok(0)
+        }
+        op::HELLO => {
+            out.clear();
+            out.extend_from_slice(&rm.hello());
             Ok(0)
         }
         op::UVM_P2P_CAPS => {
