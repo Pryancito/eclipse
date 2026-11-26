@@ -35,6 +35,7 @@ pub mod cfgwrite;
 pub mod flr;
 pub mod host;
 pub mod msix;
+pub mod upstream;
 
 pub struct PortOpsImpl;
 

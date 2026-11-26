@@ -1090,6 +1090,41 @@ fn an_nvidia_gpu_s_holder_reaches_its_bars_and_only_the_config_registers_a_drive
         zx(ZxError::OUT_OF_RANGE)
     );
     assert_eq!(pci(&driver, 9, 0, 0, 0), zx(ZxError::INVALID_ARGS));
+    // The functions it does not hold: read for a holder, and a bridge
+    // above its own written for it. Refused before anything reaches the
+    // bus for anybody else, and for a place, a width or a value that is
+    // none.
+    use super::device_pci::{OP_BRIDGE_CONTROL, OP_CONFIG_READ_AT, OP_RESTORE_BARS};
+    let port = 0x16 << 8;
+    for op in [OP_CONFIG_READ_AT, OP_BRIDGE_CONTROL, OP_RESTORE_BARS] {
+        assert_eq!(
+            pci(&other, op, port, 0, 4),
+            zx(ZxError::ACCESS_DENIED),
+            "op {} for a process that holds nothing",
+            op
+        );
+    }
+    for op in [OP_CONFIG_READ_AT, OP_BRIDGE_CONTROL] {
+        assert_eq!(
+            pci(&driver, op, 0x1_0000, 0, 4),
+            zx(ZxError::INVALID_ARGS),
+            "op {} at a place above every bus",
+            op
+        );
+    }
+    assert_eq!(
+        pci(&driver, OP_CONFIG_READ_AT, port, 1, 2),
+        zx(ZxError::OUT_OF_RANGE)
+    );
+    assert_eq!(
+        pci(&driver, OP_CONFIG_READ_AT, port, 0x100, 4),
+        zx(ZxError::OUT_OF_RANGE)
+    );
+    assert_eq!(
+        pci(&driver, OP_BRIDGE_CONTROL, port, 0x1_0000, 0),
+        zx(ZxError::INVALID_ARGS),
+        "Bridge Control is 16 bits"
+    );
     the_gem_table_takes_a_gpu_holder_at_its_word_on_its_own(&driver, &other, &words, aperture);
 }
 

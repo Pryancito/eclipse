@@ -4,12 +4,21 @@
 //!
 //! What the driver reaches through ports is, almost all of it, the PCI
 //! configuration mechanism: an address in 0xCF8, then the dword at
-//! 0xCFC. Here 0xCF8 is a latch, and a dword of a function this process
-//! holds (one per GPU) is read and written by the kernel for it ([`Space`]);
-//! every other function reads as absent (all ones, as a slot with nothing
-//! in it does) and its writes go nowhere. So a walk up to the GPU's root
-//! port finds nothing to change, which is what the driver, unchanged,
-//! already copes with on a machine whose bridges it cannot see.
+//! 0xCFC. Here 0xCF8 is a latch, one for each thread (two threads of the
+//! driver must not finish each other's accesses), and a dword of a
+//! function this process holds (one per GPU) is read and written by the
+//! kernel for it ([`Space`]).
+//!
+//! Every other function is read by the kernel too ([`Space::read_at`]),
+//! so the driver's walk up to its GPU's root port finds the port, as it
+//! did in the kernel. It used to find nothing (every other function read
+//! as absent), and what the driver does there was skipped without a
+//! word: matching the GPU's Max Payload Size to the port's, the fix for
+//! the console card's firmware boot wedging the link; taking VGA routing
+//! off the bridges for that boot; resetting the bus when it wedges
+//! anyway. Of writes to a function not held, only Bridge Control of a
+//! bridge above a GPU reaches the kernel, which takes two bits of it
+//! ([`Space::bridge_control`]); the rest go nowhere, as before.
 //!
 //! The BARs are the kernel's to write, so they are kept here, as a
 //! hypervisor keeps them: a write of all ones reads back the size mask,
@@ -19,7 +28,9 @@
 //!
 //! Any other port (the VGA registers, say) reads as all ones and takes
 //! nothing; the first time each is touched it is logged.
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Where the configuration mechanism's address goes, and its data.
@@ -28,6 +39,18 @@ const CONFIG_DATA: u32 = 0xcfc;
 const ENABLE: u32 = 1 << 31;
 /// The BARs, 0x10 to 0x27.
 const BARS: core::ops::Range<u8> = 0x10..0x28;
+/// Bridge Control, in a PCI-PCI bridge's header, and its Secondary Bus
+/// Reset bit.
+const BRIDGE_CONTROL: u8 = 0x3e;
+const BUS_RESET: u16 = 1 << 6;
+
+thread_local! {
+    /// 0xCF8 as this thread last wrote it. The real port is one for the
+    /// whole machine, and the kernel's driver had it to itself for the
+    /// length of an access; here another thread of the driver (the other
+    /// card's, an interrupt's) may run between the address and the data.
+    static ADDRESS: Cell<u32> = const { Cell::new(0) };
+}
 
 /// Why a write did not reach the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +68,25 @@ pub trait Space: Send + Sync {
     fn read(&self, offset: u8, width: u8) -> Option<u32>;
     /// The low `width` bytes of `value` at `offset`.
     fn write(&self, offset: u8, width: u8, value: u32) -> Result<(), Refused>;
+    /// `width` bytes at `offset` of the function at `place`
+    /// (`bus, device, function`), one this process does not hold, which
+    /// the kernel reads for the holder of this one. `None` when it does
+    /// not: that function then reads as absent.
+    fn read_at(&self, _place: (u8, u8, u8), _offset: u8, _width: u8) -> Option<u32> {
+        None
+    }
+    /// Write `value` to Bridge Control of the bridge at `place`, for a
+    /// bridge above this function; the kernel takes VGA Enable and, of a
+    /// bridge that leads only here, Secondary Bus Reset. What the register
+    /// holds afterwards.
+    fn bridge_control(&self, _place: (u8, u8, u8), _value: u16) -> Result<u16, Refused> {
+        Err(Refused::Other)
+    }
+    /// Have the kernel write this function's BARs again, which a bus
+    /// reset cleared: they are the kernel's to write.
+    fn restore_bars(&self) -> Result<(), Refused> {
+        Ok(())
+    }
 }
 
 /// One BAR register as the function's driver sees it.
@@ -88,12 +130,14 @@ struct Function {
     /// The function's address as 0xCF8 carries it (bits 23:8).
     place: u32,
     bars: Mutex<[Bar; 6]>,
+    /// The bus above it was reset through here and its BARs have not been
+    /// written since: the device holds none, whatever `bars` says.
+    reset: AtomicBool,
 }
 
 /// The ports: the configuration mechanism's latch, and every function
 /// this process holds behind it, one per GPU.
 pub struct Ports {
-    address: Mutex<u32>,
     functions: RwLock<Vec<Function>>,
     /// Ports and refused registers already logged.
     told: Mutex<BTreeSet<u32>>,
@@ -104,11 +148,19 @@ fn place_bits((bus, device, function): (u8, u8, u8)) -> u32 {
     (bus as u32) << 16 | (device as u32 & 0x1f) << 11 | (function as u32 & 7) << 8
 }
 
+/// `bus, device, function` of an address in 0xCF8.
+fn place_of(address: u32) -> (u8, u8, u8) {
+    (
+        (address >> 16) as u8,
+        (address >> 11 & 0x1f) as u8,
+        (address >> 8 & 7) as u8,
+    )
+}
+
 impl Ports {
     /// The ports, with the one function at `place` behind them.
     pub fn new(space: Box<dyn Space>, place: (u8, u8, u8), bar_len: [usize; 6]) -> Ports {
         let ports = Ports {
-            address: Mutex::new(0),
             functions: RwLock::new(Vec::new()),
             told: Mutex::new(BTreeSet::new()),
         };
@@ -132,6 +184,7 @@ impl Ports {
             space,
             place,
             bars: Mutex::new(bars(raw, bar_len)),
+            reset: AtomicBool::new(false),
         });
         true
     }
@@ -139,30 +192,83 @@ impl Ports {
     /// The function the latch names, and the configuration register
     /// `port` reaches in it.
     fn ours(&self, port: u32) -> Option<(usize, u8)> {
-        let address = *self.address.lock().unwrap();
-        if address & ENABLE == 0 {
-            return None;
-        }
+        let (address, offset) = named(port)?;
         let at = self
             .functions
             .read()
             .unwrap()
             .iter()
             .position(|f| f.place == address & 0x00ff_ff00)?;
-        Some((at, (address & 0xfc) as u8 + (port - CONFIG_DATA) as u8))
+        Some((at, offset))
+    }
+
+    /// A read of a function this process does not hold: by the kernel,
+    /// for the holder of any function here. All ones when it reads none.
+    fn read_beyond(&self, port: u32, width: u8) -> u32 {
+        let Some((address, offset)) = named(port) else {
+            return ones(width);
+        };
+        self.functions
+            .read()
+            .unwrap()
+            .first()
+            .and_then(|f| f.space.read_at(place_of(address), offset, width))
+            .unwrap_or(ones(width))
+    }
+
+    /// A write to a function this process does not hold. One that covers
+    /// Bridge Control is offered to the kernel as each function's holder,
+    /// which takes it for a bridge above that function; anything else
+    /// goes nowhere.
+    fn write_beyond(&self, port: u32, width: u8, value: u32) {
+        let Some((address, offset)) = named(port) else {
+            return;
+        };
+        let covers = offset <= BRIDGE_CONTROL && BRIDGE_CONTROL + 2 <= offset + width;
+        if !covers {
+            return;
+        }
+        let control = (value >> (8 * (BRIDGE_CONTROL - offset))) as u16;
+        let reset = control & BUS_RESET != 0;
+        let place = place_of(address);
+        let functions = self.functions.read().unwrap();
+        for function in functions.iter() {
+            if function.space.bridge_control(place, control).is_ok() {
+                // The kernel held the reset and let it go before it
+                // answered: the bus was reset, and the bit is off again.
+                if reset {
+                    function.reset.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+        }
+        let (bus, device, function) = place;
+        if reset {
+            // Each time: the recovery that asked for it goes on as if the
+            // bus had been reset, and what it then reports is not a reset
+            // that failed but one that was never done.
+            eprintln!(
+                "udrv-nvidia: bus reset at {bus:02x}:{device:02x}.{function} refused: \
+                 the bridge leads to more than the GPU, or is not above it"
+            );
+            return;
+        }
+        self.tell(0x2_0000 | address >> 8 & 0xffff, || {
+            format!("Bridge Control write at {bus:02x}:{device:02x}.{function} refused")
+        });
     }
 
     pub fn read(&self, port: u32, width: u8) -> u32 {
         let ones = ones(width);
         if port == CONFIG_ADDRESS && width == 4 {
-            return *self.address.lock().unwrap();
+            return ADDRESS.get();
         }
         if !(CONFIG_DATA..CONFIG_DATA + 4).contains(&port) {
             self.tell(port, || format!("port {port:#x} read: not here"));
             return ones;
         }
         let Some((at, offset)) = self.ours(port) else {
-            return ones;
+            return self.read_beyond(port, width);
         };
         let functions = self.functions.read().unwrap();
         let function = &functions[at];
@@ -176,7 +282,7 @@ impl Ports {
 
     pub fn write(&self, port: u32, width: u8, value: u32) {
         if port == CONFIG_ADDRESS && width == 4 {
-            *self.address.lock().unwrap() = value;
+            ADDRESS.set(value);
             return;
         }
         if !(CONFIG_DATA..CONFIG_DATA + 4).contains(&port) {
@@ -184,11 +290,20 @@ impl Ports {
             return;
         }
         let Some((at, offset)) = self.ours(port) else {
+            self.write_beyond(port, width, value);
             return;
         };
         let functions = self.functions.read().unwrap();
         let function = &functions[at];
         if BARS.contains(&offset) {
+            // The driver puts its BARs back after the bus reset it asked
+            // for. They are the kernel's to write, so its first write of
+            // one has the kernel write them all, to what it recorded.
+            if function.reset.swap(false, Ordering::SeqCst)
+                && function.space.restore_bars().is_err()
+            {
+                self.refused(offset);
+            }
             let i = (offset - BARS.start) as usize / 4;
             let shift = (offset % 4) * 8;
             let lanes = ones(width) << shift;
@@ -227,6 +342,14 @@ impl Ports {
             eprintln!("udrv-nvidia: {}", what());
         }
     }
+}
+
+/// The address this thread latched, when it enables the mechanism, and
+/// the configuration register `port` (0xCFC to 0xCFF) reaches at it.
+fn named(port: u32) -> Option<(u32, u8)> {
+    let address = ADDRESS.get();
+    (address & ENABLE != 0)
+        .then_some((address, (address & 0xfc) as u8 + (port - CONFIG_DATA) as u8))
 }
 
 fn ones(width: u8) -> u32 {
@@ -477,5 +600,258 @@ mod tests {
         }
         assert_eq!(other.lock().unwrap()[4], 2);
         assert_eq!(one.lock().unwrap()[4], 7);
+    }
+
+    /// `bus, device, function`.
+    type Place = (u8, u8, u8);
+
+    /// The machine around the GPUs, as the kernel answers for it: the
+    /// functions this process does not hold, the Bridge Control writes it
+    /// took, and how many times it wrote a GPU's BARs again.
+    #[derive(Default)]
+    struct Around {
+        functions: Mutex<std::collections::HashMap<Place, [u8; 256]>>,
+        control: Mutex<Vec<(Place, u16)>>,
+        restored: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Around {
+        /// A PCI-PCI bridge at `place` with only `bus` behind it.
+        fn bridge(&self, place: (u8, u8, u8), bus: u8, control: u16) {
+            let mut b = [0u8; 256];
+            b[0..4].copy_from_slice(&0x2030_8086u32.to_le_bytes());
+            b[0x0e] = 0x01;
+            b[0x18..0x1c].copy_from_slice(&[place.0, bus, bus, 0]);
+            b[0x3c..0x40].copy_from_slice(&((control as u32) << 16 | 0x01ff).to_le_bytes());
+            self.functions.lock().unwrap().insert(place, b);
+        }
+
+        fn control_of(&self, place: (u8, u8, u8)) -> u16 {
+            let f = self.functions.lock().unwrap();
+            u16::from_le_bytes([f[&place][0x3e], f[&place][0x3f]])
+        }
+    }
+
+    /// A GPU's space with the kernel's answers for the rest of the machine:
+    /// reads of any function, and Bridge Control of the bridge `above`.
+    struct Held {
+        own: Fake,
+        around: Arc<Around>,
+        above: (u8, u8, u8),
+    }
+
+    impl Space for Held {
+        fn read(&self, offset: u8, width: u8) -> Option<u32> {
+            self.own.read(offset, width)
+        }
+        fn write(&self, offset: u8, width: u8, value: u32) -> Result<(), Refused> {
+            self.own.write(offset, width, value)
+        }
+        fn read_at(&self, place: (u8, u8, u8), offset: u8, width: u8) -> Option<u32> {
+            let f = self.around.functions.lock().unwrap();
+            let Some(b) = f.get(&place) else {
+                return Some(ones(width));
+            };
+            let mut v = 0u32;
+            for k in 0..width {
+                v |= (b[(offset + k) as usize] as u32) << (8 * k);
+            }
+            Some(v)
+        }
+        fn bridge_control(&self, place: (u8, u8, u8), value: u16) -> Result<u16, Refused> {
+            if place != self.above {
+                return Err(Refused::Kernel);
+            }
+            let old = self.around.control_of(place);
+            // As the kernel: VGA Enable is taken, and a bus reset is a
+            // pulse it has ended by the time it answers.
+            let new = (old & !0x48) | (value & 0x08);
+            let mut f = self.around.functions.lock().unwrap();
+            f.get_mut(&place).unwrap()[0x3e..0x40].copy_from_slice(&new.to_le_bytes());
+            self.around.control.lock().unwrap().push((place, value));
+            Ok(new)
+        }
+        fn restore_bars(&self) -> Result<(), Refused> {
+            self.around
+                .restored
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    const PORT: (u8, u8, u8) = (0, 1, 0);
+    const OTHER_PORT: (u8, u8, u8) = (0, 2, 0);
+
+    /// The GPU at 01:00.0 under a root port at 00:01.0, a second GPU at
+    /// 02:00.0 under 00:02.0, and the kernel answering for the ports.
+    fn machine() -> (Ports, Arc<Around>, Arc<Mutex<[u8; 256]>>) {
+        let (_, bytes) = gpu();
+        let around = Arc::new(Around::default());
+        around.bridge(PORT, 1, 0x001a);
+        around.bridge(OTHER_PORT, 2, 0x0002);
+        let lens = [16 << 20, 256 << 20, 0, 32 << 20, 0, 0];
+        let held = |bytes: &Arc<Mutex<[u8; 256]>>, above| {
+            Box::new(Held {
+                own: Fake {
+                    bytes: bytes.clone(),
+                },
+                around: around.clone(),
+                above,
+            })
+        };
+        let ports = Ports::new(held(&bytes, PORT), (1, 0, 0), lens);
+        let second = Arc::new(Mutex::new(*bytes.lock().unwrap()));
+        assert!(ports.add(held(&second, OTHER_PORT), (2, 0, 0), lens));
+        (ports, around, bytes)
+    }
+
+    fn loc((bus, device, function): (u8, u8, u8)) -> Location {
+        Location {
+            bus,
+            device,
+            function,
+        }
+    }
+
+    /// The driver's own walk (`NvidiaGpu::find_parent_bridge`): the first
+    /// PCI-PCI bridge whose secondary bus is the GPU's.
+    fn parent_bridge(ops: &Through, bus: u8) -> Option<(u8, u8, u8)> {
+        let am = CSpaceAccessMethod::IO;
+        for b in 0..=bus {
+            for device in 0..32u8 {
+                for function in 0..8u8 {
+                    let at = loc((b, device, function));
+                    // SAFETY: every port goes to the `Ports` behind `ops`.
+                    unsafe {
+                        if am.read16(ops, at, 0x00) == 0xffff
+                            || am.read8(ops, at, 0x0e) & 0x7f != 0x01
+                        {
+                            continue;
+                        }
+                        if am.read8(ops, at, 0x19) == bus {
+                            return Some((b, device, function));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_walk_to_the_root_port_finds_it_through_the_kernel() {
+        let (ports, _, _) = machine();
+        let ops = Through(&ports);
+        assert_eq!(parent_bridge(&ops, 1), Some(PORT));
+        assert_eq!(parent_bridge(&ops, 2), Some(OTHER_PORT));
+        // With a kernel that reads nothing for it, as before: no port.
+        let (alone, _) = gpu();
+        assert_eq!(parent_bridge(&Through(&alone), 1), None);
+        // The port's registers are the port's, BARs and bus numbers too:
+        // nothing of them is kept here.
+        // SAFETY: as above.
+        unsafe {
+            let am = CSpaceAccessMethod::IO;
+            assert_eq!(am.read32(&ops, loc(PORT), 0x18), 0x0001_0100);
+            assert_eq!(am.read16(&ops, loc(PORT), 0x3e), 0x001a);
+        }
+    }
+
+    #[test]
+    fn vga_routing_of_the_port_above_is_the_kernel_s_to_write_and_nothing_else_is() {
+        use zcore_drivers::bus::pci::cfgwrite::cfg_write16;
+        let (ports, around, _) = machine();
+        let ops = Through(&ports);
+        let am = CSpaceAccessMethod::IO;
+        // SAFETY: every port goes to `ports`.
+        unsafe {
+            // As `set_path_vga_routing` clears VGA Enable and puts it back.
+            cfg_write16(&ops, am, loc(PORT), 0x3e, 0x001a & !0x0008);
+            assert_eq!(am.read16(&ops, loc(PORT), 0x3e), 0x0012);
+            cfg_write16(&ops, am, loc(PORT), 0x3e, 0x001a);
+            assert_eq!(am.read16(&ops, loc(PORT), 0x3e), 0x001a);
+            // The second GPU's port is written as that GPU's holder.
+            cfg_write16(&ops, am, loc(OTHER_PORT), 0x3e, 0x000a);
+            assert_eq!(around.control_of(OTHER_PORT), 0x000a);
+            // Any other register of the port: nowhere.
+            let command = am.read32(&ops, loc(PORT), 0x04);
+            am.write32(&ops, loc(PORT), 0x04, !command);
+            am.write32(&ops, loc(PORT), 0x18, 0);
+            assert_eq!(am.read32(&ops, loc(PORT), 0x04), command);
+            assert_eq!(am.read32(&ops, loc(PORT), 0x18), 0x0001_0100);
+            // A bridge above no GPU of this process: refused, and as it was.
+            around.bridge((0, 3, 0), 9, 0x0008);
+            cfg_write16(&ops, am, loc((0, 3, 0)), 0x3e, 0);
+            assert_eq!(around.control_of((0, 3, 0)), 0x0008);
+        }
+        assert_eq!(
+            *around.control.lock().unwrap(),
+            [(PORT, 0x0012), (PORT, 0x001a), (OTHER_PORT, 0x000a)]
+        );
+    }
+
+    #[test]
+    fn after_a_bus_reset_the_first_bar_write_has_the_kernel_write_the_bars() {
+        use std::sync::atomic::Ordering;
+        use zcore_drivers::bus::pci::cfgwrite::cfg_write16;
+        let (ports, around, _) = machine();
+        let ops = Through(&ports);
+        let am = CSpaceAccessMethod::IO;
+        // SAFETY: every port goes to `ports`.
+        unsafe {
+            // A BAR written with no reset before: kept here, as always.
+            am.write32(&ops, GPU, 0x10, 0xf600_0000);
+            assert_eq!(around.restored.load(Ordering::SeqCst), 0);
+            // As `sbr_recover` pulses Secondary Bus Reset on the port:
+            // the kernel does the whole pulse at the first write, and the
+            // second finds the bit off...
+            cfg_write16(&ops, am, loc(PORT), 0x3e, 0x001a | 0x0040);
+            assert_eq!(around.control_of(PORT), 0x001a);
+            cfg_write16(&ops, am, loc(PORT), 0x3e, 0x001a);
+            assert_eq!(around.control_of(PORT), 0x001a);
+            assert_eq!(
+                *around.control.lock().unwrap(),
+                [(PORT, 0x005a), (PORT, 0x001a)]
+            );
+            assert_eq!(around.restored.load(Ordering::SeqCst), 0);
+            // ...and writes the GPU's BARs back: the kernel does, once.
+            am.write32(&ops, GPU, 0x10, 0xf600_0000);
+            assert_eq!(around.restored.load(Ordering::SeqCst), 1);
+            am.write32(&ops, GPU, 0x14, 0x0000_000c);
+            am.write32(&ops, GPU, 0x18, 0x0000_0040);
+            assert_eq!(around.restored.load(Ordering::SeqCst), 1);
+            // The other GPU was not under that port: its BARs are not
+            // written by anybody.
+            am.write32(&ops, loc((2, 0, 0)), 0x10, 0xf600_0000);
+            assert_eq!(around.restored.load(Ordering::SeqCst), 1);
+            // A reset the kernel refuses (a bridge above no GPU of this
+            // process) reset nothing: no BARs to write again after it.
+            around.bridge((0, 3, 0), 9, 0x0002);
+            cfg_write16(&ops, am, loc((0, 3, 0)), 0x3e, 0x0002 | 0x0040);
+            assert_eq!(around.control_of((0, 3, 0)), 0x0002);
+            am.write32(&ops, GPU, 0x10, 0xf600_0000);
+            am.write32(&ops, loc((2, 0, 0)), 0x10, 0xf600_0000);
+            assert_eq!(around.restored.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn each_thread_latches_its_own_address() {
+        let (ports, _, _) = machine();
+        let ports = Arc::new(ports);
+        // This thread names the GPU's identity...
+        ports.write(CONFIG_ADDRESS, 4, ENABLE | 1 << 16);
+        // ...another names the port's, and reads it, in between...
+        let theirs = ports.clone();
+        let seen = std::thread::spawn(move || {
+            theirs.write(CONFIG_ADDRESS, 4, ENABLE | 1 << 11);
+            theirs.read(CONFIG_DATA, 4)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, 0x2030_8086);
+        // ...and this one still reads what it named.
+        assert_eq!(ports.read(CONFIG_DATA, 4), 0x1e89_10de);
+        assert_eq!(ports.read(CONFIG_ADDRESS, 4), ENABLE | 1 << 16);
     }
 }
