@@ -217,3 +217,24 @@ fn a_hello_that_does_not_parse_makes_no_card() {
     let link = Arc::new(Link::new(ours, window).unwrap());
     assert!(Remote::with_hello(OverLink::new(link, None), &[1, 2, 3]).is_err());
 }
+
+/// `/proc/gpuready` waits for every NVIDIA GPU the boot leaves to
+/// `udrv-nvidia` until a card of a GPU is served for each.
+#[test]
+fn gpus_left_to_udrv_nvidia_are_waited_for_until_served() {
+    let ready = |left, served| -> alloc::vec::Vec<bool> {
+        left_to_userspace(left, served).map(|(up, _)| up).collect()
+    };
+    assert_eq!(ready(2, 0), [false, false]);
+    assert_eq!(ready(2, 1), [true, false]);
+    assert_eq!(ready(2, 2), [true, true]);
+    assert!(ready(0, 0).is_empty());
+    let lines: alloc::vec::Vec<_> = left_to_userspace(2, 1).map(|(_, l)| l).collect();
+    assert_eq!(
+        lines,
+        [
+            "nvidia@0: left to udrv-nvidia, served",
+            "nvidia@1: left to udrv-nvidia, not served yet"
+        ]
+    );
+}

@@ -724,6 +724,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
         ("uinput3", "respawn", "/usr/local/bin/eclipse-uinput 3", ""),
         ("uinput4", "respawn", "/usr/local/bin/eclipse-uinput 4", ""),
         ("unet", "respawn", "/usr/local/bin/eclipse-unet", ""),
+        ("unvidia", "respawn", "/usr/local/bin/eclipse-unvidia", ""),
         ("unvme", "respawn", "/usr/local/bin/eclipse-unvme 1", ""),
         ("unvme2", "respawn", "/usr/local/bin/eclipse-unvme 2", ""),
         ("ups2", "respawn", "/usr/local/bin/eclipse-ups2", ""),
@@ -953,7 +954,7 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
         gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         [
             "enet", "knet", "uahci", "uahci2", "ublk", "ublk2", "ublk3", "ublk4", "uhda", "uinput",
-            "uinput2", "uinput3", "uinput4", "unet", "unvme", "unvme2", "ups2", "uxhci"
+            "uinput2", "uinput3", "uinput4", "unet", "unvidia", "unvme", "unvme2", "ups2", "uxhci"
         ],
         "a boot service gated on `udriver=` does not run on an ordinary boot"
     );
@@ -965,6 +966,13 @@ fn only_the_drivers_are_gated_on_a_device_left_to_userspace() {
     let (hda, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "uhda");
     // The xHCI controller: the first one, its keyboards and pointers.
     let (xhci, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "uxhci");
+    // Every NVIDIA GPU, to one process.
+    let (nvidia, gated): (Vec<_>, Vec<_>) = gated.into_iter().partition(|(n, _)| n == "unvidia");
+    assert_eq!(field(&nvidia[0].1, "udriver"), Some("nvidia"));
+    assert_eq!(
+        field(&nvidia[0].1, "exec"),
+        Some("/usr/local/bin/eclipse-unvidia")
+    );
     assert_eq!(field(&xhci[0].1, "udriver"), Some("xhci"));
     assert_eq!(
         field(&xhci[0].1, "exec"),
@@ -1755,6 +1763,7 @@ fn the_two_sessions_never_start_each_others_clients() {
         "ups2",
         "uhda",
         "uxhci",
+        "unvidia",
     ];
     let rootfs = init_rootfs("desktops");
     for (name, body) in services(&rootfs) {
