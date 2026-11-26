@@ -58,7 +58,9 @@ fn pause_for(served: usize) -> core::time::Duration {
     if served == 0 {
         return kernel;
     }
-    kernel.max(core::time::Duration::from_millis(BRINGUP_PATIENCE_MS + 10_000))
+    kernel.max(core::time::Duration::from_millis(
+        BRINGUP_PATIENCE_MS + 10_000,
+    ))
 }
 
 /// No answer has carried flags yet.

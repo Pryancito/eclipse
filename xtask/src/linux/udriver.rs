@@ -504,6 +504,14 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           # See tools/udrv-nvidia.\n\
           grep -q '^nvidia@' /proc/udrivers || { echo 'eclipse-unvidia: the kernel left no NVIDIA GPU to userspace' >&2; sleep 5; exit 1; }\n\
           [ -x /bin/udrv-nvidia ] || { echo 'eclipse-unvidia: /bin/udrv-nvidia is not in this image (it is built on x86_64 only; or its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          # A console GPU that leaves the monitor black can only be read on\n\
+          # the next boot: keep this boot's driver log and kernel log on the\n\
+          # disk for ten minutes, once a boot, the previous boot's as .prev.\n\
+          if [ ! -e /tmp/unvidia-saver ] && mkdir -p /var/log 2>/dev/null; then\n\
+          \x20 : > /tmp/unvidia-saver\n\
+          \x20 for f in unvidia dmesg-nvidia; do [ -f /var/log/$f.log ] && mv -f /var/log/$f.log /var/log/$f.prev.log; done\n\
+          \x20 ( i=0; while [ $i -lt 60 ]; do sleep 10; cp /tmp/unvidia.log /var/log/unvidia.log; dmesg > /var/log/dmesg-nvidia.log; sync; i=$((i+1)); done ) </dev/null >/dev/null 2>&1 &\n\
+          fi\n\
           exec /bin/udrv-nvidia\n",
     )
     .unwrap();
