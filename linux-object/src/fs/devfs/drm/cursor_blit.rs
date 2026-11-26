@@ -322,3 +322,27 @@ fn served_panel_card() -> Option<Arc<dyn DrmScheme>> {
         .any(|card| Arc::ptr_eq(card, &panel));
     (served && card::cursor_plane_offered(&*panel)).then_some(panel)
 }
+
+/// The card whose cursor plane had the pointer is gone: its driver was a
+/// process, and that process is (`served::card::ServedCard::gone`). The
+/// kernel draws the pointer again from its next motion; left as it was, it
+/// would stand down for a plane no card shows, until the compositor next
+/// set an image.
+pub(crate) fn pointer_plane_lost() {
+    let mut state = DRM_STATE.lock();
+    if state.cursor.hw {
+        state.cursor.hw = false;
+        state.cursor.drawn = None;
+    }
+}
+
+/// For the tests of what goes with a served card: say whether a cursor
+/// plane has the pointer (`Some`), and whether one has.
+#[cfg(test)]
+pub(crate) fn plane_has_pointer_for_test(set: Option<bool>) -> bool {
+    let mut state = DRM_STATE.lock();
+    if let Some(has) = set {
+        state.cursor.hw = has;
+    }
+    state.cursor.hw
+}

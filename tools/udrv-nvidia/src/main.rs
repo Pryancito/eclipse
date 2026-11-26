@@ -17,9 +17,10 @@
 //! - `udrv-nvidia bridge-check VVVV DDDD`: what the driver does above its
 //!   GPU (the walk to the root port, VGA routing, a bus reset), on any PCI
 //!   function behind a bridge (`bridge_check`).
-//! - `udrv-nvidia nvkms-check [again]`: on a boot with `nvidia.nvkms` that
-//!   leaves a GPU to this driver, the kernel asks the card of that GPU to
-//!   load nvidia-modeset, once for the boot (`nvkms_check`).
+//! - `udrv-nvidia nvkms-check [again|never]`: on a boot with `nvidia.nvkms`
+//!   that leaves a GPU to this driver and brings the console one up, the
+//!   kernel asks the card of that one to load nvidia-modeset, once for the
+//!   boot, and on any other boot it asks none (`nvkms_check`).
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).

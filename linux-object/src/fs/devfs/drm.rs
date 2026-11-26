@@ -5255,7 +5255,7 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
     true
 }
 
-mod cursor_blit;
+pub(crate) mod cursor_blit;
 pub(crate) mod fb_handle;
 use cursor_blit::{blit_cursor_patch, cursor_plane, repaint_cursor_from_panel};
 

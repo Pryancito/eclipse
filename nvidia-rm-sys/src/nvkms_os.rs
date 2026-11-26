@@ -347,42 +347,71 @@ pub extern "C" fn nvkms_free_timer(handle: *mut TimerHandle) {
     TIMERS.lock().queued.retain(|t| t.id != handle.id);
 }
 
+/// Whether the oldest entry due at `now_us` runs under `nvkms_lock`; `None`
+/// when nothing is due.
+fn next_due_is_locked(now_us: u64) -> Option<bool> {
+    let t = TIMERS.lock();
+    t.queued
+        .iter()
+        .filter(|x| x.deadline_us <= now_us)
+        .min_by_key(|x| (x.deadline_us, x.id))
+        .map(|x| x.locked)
+}
+
+/// Takes the oldest entry due at `now_us` that is `locked`, or is not, off
+/// the queue.
+fn take_due(now_us: u64, locked: bool) -> Option<Timer> {
+    let mut t = TIMERS.lock();
+    let next = t
+        .queued
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.locked == locked && x.deadline_us <= now_us)
+        .min_by_key(|(_, x)| (x.deadline_us, x.id))
+        .map(|(i, _)| i);
+    next.map(|i| t.queued.remove(i))
+}
+
+/// Runs `timer`, off the queue: with what its ref pointer reads now, and
+/// not at all once the object is gone.
+fn run(timer: Timer) {
+    let data_ptr = match timer.data {
+        TimerData::Ptr(p) => p as *mut c_void,
+        TimerData::Ref(r) => nvkms_dec_ref(r as *mut RefPtr),
+    };
+    // A ref-ptr timer whose object is gone has nothing to run on.
+    if matches!(timer.data, TimerData::Ref(_)) && data_ptr.is_null() {
+        return;
+    }
+    (timer.proc_)(data_ptr, timer.data_u32);
+}
+
 /// Runs every timer due at `now_us`, oldest deadline first, each under
 /// `nvkms_lock` as in Linux. Returns the next deadline still queued, for the
 /// caller to come back at.
 ///
+/// A timer is taken off the queue only once `nvkms_lock` is held, and its
+/// ref pointer is read under it, as Linux's `nvkms_kthread_q_callback` does:
+/// nvkms cancels a timer, and frees a ref pointer, with that lock held, and
+/// what it cancelled must not run afterwards (`nvkms_free_timer` "will
+/// guarantee that it is not called"). Taken off first, a timer the thread
+/// in nvkms cancelled while this one waited for the lock ran all the same:
+/// for the DisplayPort library's, on an object already deleted.
+///
 /// The queue lock is not held while a callback runs: callbacks queue and
 /// cancel timers of their own.
 pub fn service(now_us: u64) -> Option<u64> {
-    loop {
-        let due = {
-            let mut t = TIMERS.lock();
-            let next = t
-                .queued
-                .iter()
-                .enumerate()
-                .filter(|(_, x)| x.deadline_us <= now_us)
-                .min_by_key(|(_, x)| (x.deadline_us, x.id))
-                .map(|(i, _)| i);
-            next.map(|i| t.queued.remove(i))
-        };
-        let Some(timer) = due else {
-            break;
-        };
-        let data_ptr = match timer.data {
-            TimerData::Ptr(p) => p as *mut c_void,
-            TimerData::Ref(r) => nvkms_dec_ref(r as *mut RefPtr),
-        };
-        // A ref-ptr timer whose object is gone has nothing to run on.
-        if matches!(timer.data, TimerData::Ref(_)) && data_ptr.is_null() {
-            continue;
-        }
-        if timer.locked {
+    while let Some(locked) = next_due_is_locked(now_us) {
+        if locked {
             NVKMS_LOCK.down();
-            (timer.proc_)(data_ptr, timer.data_u32);
+            // The one seen may have been cancelled meanwhile: whatever is
+            // due now, or nothing.
+            if let Some(timer) = take_due(now_us, true) {
+                run(timer);
+            }
             NVKMS_LOCK.up();
-        } else {
-            (timer.proc_)(data_ptr, timer.data_u32);
+        } else if let Some(work) = take_due(now_us, false) {
+            run(work);
         }
     }
     TIMERS.lock().queued.iter().map(|t| t.deadline_us).min()
@@ -967,6 +996,45 @@ mod tests {
         service(u64::MAX);
         nvkms_free_timer(h);
         assert_eq!(*HELD.lock().unwrap(), vec![false, true]);
+    }
+
+    /// nvkms cancels a timer with `nvkms_lock` held. One that was due, and
+    /// that the servicing thread was already waiting for the lock to run,
+    /// is cancelled all the same: it never runs.
+    #[test]
+    fn a_timer_cancelled_while_its_run_waits_for_the_lock_never_runs() {
+        let _t = TURN.lock().unwrap();
+        reset();
+        let doomed = nvkms_alloc_timer(record, 0x70 as *mut c_void, 1, 0);
+        let kept = nvkms_alloc_timer(record, 0x80 as *mut c_void, 2, 0);
+        // The thread in nvkms: an ioctl, a modeset.
+        NVKMS_LOCK.down();
+        let servicing = std::thread::spawn(|| service(u64::MAX));
+        // Long enough for the servicing thread to be waiting for the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(RAN.lock().unwrap().is_empty(), "ran beside nvkms");
+        nvkms_free_timer(doomed);
+        NVKMS_LOCK.up();
+        assert_eq!(servicing.join().unwrap(), None);
+        assert_eq!(*RAN.lock().unwrap(), vec![(0x80, 2)]);
+        nvkms_free_timer(kept);
+    }
+
+    /// The same for a ref pointer freed under the lock: its timer finds the
+    /// object gone, whenever the servicing thread had seen it due.
+    #[test]
+    fn a_ref_ptr_freed_while_its_timer_waits_for_the_lock_is_not_handed_out() {
+        let _t = TURN.lock().unwrap();
+        reset();
+        let object = nvkms_alloc_ref_ptr(0x90 as *mut c_void);
+        nvkms_alloc_timer_with_ref_ptr(record, object, 3, 0);
+        NVKMS_LOCK.down();
+        let servicing = std::thread::spawn(|| service(u64::MAX));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        nvkms_free_ref_ptr(object);
+        NVKMS_LOCK.up();
+        assert_eq!(servicing.join().unwrap(), None);
+        assert!(RAN.lock().unwrap().is_empty(), "ran on a freed object");
     }
 
     #[test]

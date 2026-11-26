@@ -129,6 +129,9 @@ pub mod check {
         /// Where it says it is on the bus: nowhere, but for `nvkms-check`,
         /// which the kernel asks what it asks the card of a GPU.
         pub place: Option<(u32, u8, u8, u8)>,
+        /// It says it scans out the console: the card nvidia-modeset is
+        /// asked for.
+        pub console: bool,
         /// The times nvidia-modeset was asked for, and the phases of the
         /// boot its heads were asked at.
         pub nvkms_loads: AtomicU32,
@@ -157,6 +160,9 @@ pub mod check {
         }
         fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
             self.place
+        }
+        fn is_console_gpu(&self) -> bool {
+            self.console
         }
         fn nvkms_load(&self) -> Vec<String> {
             let time = self.nvkms_loads.fetch_add(1, Ordering::Relaxed) + 1;

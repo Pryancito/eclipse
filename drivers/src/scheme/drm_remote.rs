@@ -1059,8 +1059,14 @@ impl<T: Transport> DrmScheme for Remote<T> {
         self.yes(op::HW_CURSOR_SET, 0, 0, &data)
     }
 
+    /// Told, not asked: the pointer moves with every event of the mouse,
+    /// its plane already has the image (the only time this is called), and
+    /// nothing is done with the answer. Asked, the compositor's ioctl
+    /// waited for the driver's process on each motion.
     fn hw_cursor_move(&self, x: i32, y: i32) -> bool {
-        self.yes(op::HW_CURSOR_MOVE, x as u32 as u64, y as u32 as u64, &[])
+        self.to
+            .tell(op::HW_CURSOR_MOVE, x as u32 as u64, y as u32 as u64);
+        true
     }
 
     fn hw_cursor_hide(&self) -> bool {
