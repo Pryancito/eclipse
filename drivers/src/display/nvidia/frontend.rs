@@ -97,6 +97,20 @@ pub fn free_os_event(h_client: u32, fd: u32) -> NV_STATUS {
     nvidia_rm_sys::frontend::events::free_os_event(h_client, fd)
 }
 
+pub use nvidia_rm_sys::frontend::events::NonstallPoll;
+
+/// `nvidia_rm_sys::frontend::events::service_nonstall`: service the nonstall
+/// interrupts pending on every GPU, which posts the OS events bound to them.
+/// With no RM core there is nothing to look at, and an RM a process serves
+/// is not this address space's to look at (its OS events are not carried
+/// yet).
+pub fn service_nonstall() -> NonstallPoll {
+    if !local_rm_up() {
+        return NonstallPoll::Serviced(0);
+    }
+    nvidia_rm_sys::frontend::events::service_nonstall()
+}
+
 /// `nvidia_rm_sys::frontend::rm_escape`, refused with `NV_ERR_NOT_READY`
 /// while there is no RM core to run it.
 pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {

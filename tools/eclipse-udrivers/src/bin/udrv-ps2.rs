@@ -80,7 +80,15 @@ fn serve(info: evdev::Info, place: &str) -> Served {
 /// Take what the controller has, and give it to the two devices: the lock
 /// of the controller is let go before a device's is taken, since writing
 /// LEDs takes them the other way round.
+///
+/// Two threads come here, one per interrupt, and either takes the bytes of
+/// both devices. [`IN_ORDER`] is held from the taking to the giving, so
+/// that what one thread took first is given first: without it a key's
+/// release, taken second, could reach the device before its press, and the
+/// key stayed down for good. Nothing that holds another lock takes it.
 fn service(ctl: &Mutex<Controller>, keyboard: &Served, mouse: &Served) {
+    static IN_ORDER: Mutex<()> = Mutex::new(());
+    let _in_order = IN_ORDER.lock().unwrap_or_else(|p| p.into_inner());
     let mut keys = Vec::new();
     let mut packets = Vec::new();
     {

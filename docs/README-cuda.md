@@ -76,6 +76,15 @@ Linux; `nvidia.registry=ForceP2P=0x11` (como `NVreg_RegistryDwords`) le pide
 que lo intente. Sin P2P, `cuMemcpyPeer` copia pasando por la memoria del
 sistema. `cuda-probe -d` prueba las dos cosas (paso `peer`).
 
+**Esperas que duermen** (`CU_EVENT_BLOCKING_SYNC`, `CU_CTX_SCHED_BLOCKING_SYNC`):
+libcuda pone un NON_STALL_INTERRUPT tras el trabajo y duerme en el fichero de
+un OS event. En Linux lo despierta la ISR del RM al llegar la MSI; aquí el RM
+no tiene interrupción, así que mientras alguien espera un OS event el núcleo
+le pide al RM que atienda las interrupciones nonstall pendientes (el mismo
+`intrServiceNonStall_HAL` de `rm_isr`): cada 100 µs justo tras empezar a
+esperar, alargando hasta cada 4 ms si no llega ninguna. `dmesg | grep nonstall`
+dice la primera que atendió, o que alguien esperó 2 s sin ver ninguna.
+
 **Aún no:** page tables UVM propias / GPU page faults / HMM; el resto de ioctls
 UVM → `ENOSYS` (una línea en dmesg la primera vez).
 
@@ -104,7 +113,7 @@ llama.cpp (una reserva de 32 GiB con memoria mapeada a trozos por
 y memoria compartida, 64 KiB de compartida dinámica, memoria local, atómicos,
 `dp4a`, tensor cores int8 y f16, un CUDA graph; y la latencia de lanzar un
 kernel y de esperarlo, dando vueltas y durmiendo (`CU_EVENT_BLOCKING_SYNC`, que
-para despertar necesita la interrupción de la GPU). Una respuesta mal dice
+para despertar necesita la interrupción nonstall de la GPU, ver arriba). Una respuesta mal dice
 dónde; una GPU que no termina se nombra a los 60 s en vez de colgar. Los
 kernels están en `tools/cuda-probe/kernels.cu` y viajan como PTX en
 `kernels_ptx.h` (`gen-kernels.sh` lo regenera). En una 2060 SUPER con Linux,
