@@ -572,6 +572,10 @@ fn pages_lent_to_a_served_rm_come_back_when_it_lets_them_go() {
 /// A loan on the link goes whole, and one that is not is refused.
 #[test]
 fn a_loan_goes_whole() {
+    // The loans `answer` makes here are given back when they drop, through
+    // whatever give-back a test set last (`pages_lent_...`'s, to the RM it
+    // serves): not while one serves.
+    let _g = crate::test_globals::LOCK.lock();
     let rm = Mirror::default();
     let pages = pinned(0x7000_0000, vec![0x1000, 0x5000]);
     let mut msg = encode_caller(&a_caller()).to_vec();
@@ -720,6 +724,8 @@ fn uvm_reaches_a_served_rm() {
 /// A UVM call's words go whole, and a message that is not one is refused.
 #[test]
 fn uvm_calls_go_whole() {
+    // Lends pages, as `a_loan_goes_whole` does: not while a test serves.
+    let _g = crate::test_globals::LOCK.lock();
     for r in [Ok(0), Ok(u32::MAX), Err(0x56)] {
         assert_eq!(decode_result(encode_result(r)), Some(r));
     }
