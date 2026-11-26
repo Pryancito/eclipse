@@ -13,9 +13,13 @@
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
 //!   through the mapper, DMA memory through the claim. The driver itself
 //!   is not run.
+//! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
+//!   the driver's GSP boot, on any PCI function that raises one when its
+//!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
 mod drm;
 mod gem;
 mod gpu;
+mod irq;
 mod mapper;
 mod platform;
 mod ports;
@@ -45,6 +49,7 @@ fn main() {
             check(hex(1), hex(2))
         }
         Some("drm-check") => drm_check(),
+        Some("irq-check") => irq_check(&args[1..]),
         n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
     }
 }
@@ -58,7 +63,8 @@ fn run(index: usize) {
         "{NAME}: {:04x}:{:04x} at {:02x}:{:02x}.{}",
         gpu.dev.id.vendor_id, gpu.dev.id.device_id, gpu.loc.bus, gpu.loc.device, gpu.loc.function
     );
-    let card = match drv.init(&gpu.dev, &Some(mapper), None) {
+    let irq = gpu_irq(&gpu);
+    let card = match drv.init(&gpu.dev, &Some(mapper), irq) {
         Ok(zcore_drivers::Device::DrmDisplay(card, _)) => card,
         Ok(_) => fail(format!("{}: not a DRM card", drv.name())),
         Err(e) => fail(format!("{}: {e:?}", drv.name())),
@@ -68,6 +74,94 @@ fn run(index: usize) {
         Ok(why) => fail(format!("the kernel let go of the card: {why}")),
         Err(e) => fail(e),
     }
+}
+
+/// The GPU's MSI, for the driver's GSP boot of the GPU that scans out the
+/// console: the claim's interrupt, behind the scheme `zcore_drivers::net`
+/// hands the driver, numbered as the kernel's scan numbers it (`irq + 32`).
+/// The line the driver is given, `None` when the claim has none.
+fn gpu_irq(gpu: &gpu::Gpu) -> Option<usize> {
+    match (gpu.claim.interrupt, gpu.claim.irq) {
+        (Some(interrupt), irq) if irq != u32::MAX => {
+            irq::install(irq::ClaimIrq::new(
+                irq as usize + 32,
+                Box::new(move || udrivers::claim::interrupt_wait(interrupt)),
+            ));
+            Some(irq as usize)
+        }
+        _ => {
+            println!("{NAME}: the claim has no interrupt; the GSP boot runs without MSIs");
+            None
+        }
+    }
+}
+
+/// `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path the
+/// driver's GSP boot uses, on any PCI function that can be made to raise
+/// one by writing its first BAR (an e1000e: `d0=4 c8=4`, a link-status
+/// cause unmasked, then set). The handler goes in through
+/// `msi_register_and_unmask` as the driver's does, and has to run.
+fn irq_check(args: &[String]) {
+    fn usage<T>() -> T {
+        fail("usage: udrv-nvidia irq-check VVVV DDDD OFF=VAL...".into())
+    }
+    let hex16 = |s: Option<&String>| {
+        s.and_then(|s| u16::from_str_radix(s, 16).ok())
+            .unwrap_or_else(usage)
+    };
+    let (vendor, device) = (hex16(args.first()), hex16(args.get(1)));
+    let writes: Vec<(usize, u32)> = args[2..]
+        .iter()
+        .map(|w| {
+            w.split_once('=')
+                .and_then(|(o, v)| {
+                    Some((
+                        usize::from_str_radix(o, 16).ok()?,
+                        u32::from_str_radix(v, 16).ok()?,
+                    ))
+                })
+                .unwrap_or_else(usage)
+        })
+        .collect();
+    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
+    let irq = gpu_irq(&gpu).unwrap_or_else(|| fail("the claim has no interrupt".into()));
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = count.clone();
+    let handler: zcore_drivers::scheme::IrqHandler = std::sync::Arc::new(move || {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let vector = irq + 32;
+    let registered = zcore_drivers::net::msi_register_and_unmask(vector, handler);
+    println!("{NAME}: vector {vector} registered: {registered}");
+    let bar = gpu
+        .bars
+        .first()
+        .copied()
+        .unwrap_or_else(|| fail("no BAR".into()));
+    let at = gpu
+        .mapper()
+        .query_or_map(bar.phys, bar.len)
+        .unwrap_or_else(|| fail("BAR not mapped".into()));
+    let start = std::time::Instant::now();
+    for (offset, value) in writes {
+        // SAFETY: inside the first BAR, mapped above.
+        unsafe { ((at + offset) as *mut u32).write_volatile(value) };
+    }
+    while count.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && start.elapsed() < std::time::Duration::from_secs(2)
+    {
+        std::thread::yield_now();
+    }
+    let n = count.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "{NAME}: handler ran {n} time(s), first after {} us",
+        start.elapsed().as_micros()
+    );
+    zcore_drivers::net::msi_mask_and_unregister(vector);
+    if !registered || n == 0 {
+        fail("irq-check FAILED".into());
+    }
+    println!("{NAME}: irq-check ok");
 }
 
 /// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.
