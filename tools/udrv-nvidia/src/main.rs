@@ -137,6 +137,11 @@ fn run(only: Option<usize>) {
     gsp_firmware(&cards);
     if cmdline_has("nvidia.noautoboot") {
         println!("{NAME}: nvidia.noautoboot: no GPU's RM is brought up");
+    } else if !bringup_guard::enter() {
+        eprintln!(
+            "{NAME}: the last bring-up of the RM killed this process; \
+             serving the cards without it this time"
+        );
     } else {
         for card in &cards {
             let line = card.auto_bringup_compute();
@@ -144,6 +149,7 @@ fn run(only: Option<usize>) {
                 println!("{NAME}: {line}");
             }
         }
+        bringup_guard::leave();
     }
     println!(
         "{NAME}: {} up on {} GPU(s), serving them",
@@ -1194,5 +1200,51 @@ mod tests {
         assert!(has_flag(line, "nvidia.cuda"));
         assert!(!has_flag(line, "nvidia.noauto"));
         assert!(!has_flag("nvidia.noautobootx", "nvidia.noautoboot"));
+    }
+}
+
+/// A bring-up of the RM that kills the process (a fault in the C) must
+/// not kill the desktop with it: the service starts the process again,
+/// and that run serves the cards without trying the RM a second time.
+/// A mark in `/tmp` says a bring-up is under way; the run that finds it
+/// left behind takes it away and skips the bring-up, so the one after
+/// tries again.
+mod bringup_guard {
+    const MARK: &str = "/tmp/udrv-nvidia.bringup";
+
+    /// Whether to bring the RM up now.
+    pub fn enter() -> bool {
+        enter_at(std::path::Path::new(MARK))
+    }
+
+    /// The bring-up came back.
+    pub fn leave() {
+        let _ = std::fs::remove_file(MARK);
+    }
+
+    pub(super) fn enter_at(mark: &std::path::Path) -> bool {
+        if std::fs::remove_file(mark).is_ok() {
+            return false;
+        }
+        // Without a mark there is no guard, but the bring-up still runs.
+        let _ = std::fs::write(mark, b"");
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::enter_at;
+
+        #[test]
+        fn a_bring_up_that_never_came_back_is_skipped_once() {
+            let mark =
+                std::env::temp_dir().join(format!("udrv-nvidia-guard-{}", std::process::id()));
+            let _ = std::fs::remove_file(&mark);
+            assert!(enter_at(&mark), "first run brings the RM up");
+            // It died: the mark is still there.
+            assert!(!enter_at(&mark), "the next run skips it");
+            assert!(enter_at(&mark), "and the one after tries again");
+            let _ = std::fs::remove_file(&mark);
+        }
     }
 }
