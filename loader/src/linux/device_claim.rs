@@ -173,7 +173,10 @@ fn dma_view(device: &user::UserDevice) -> Arc<Iommu> {
         })
     });
     match domain {
-        Some(domain) => Iommu::with_domain(domain),
+        Some(domain) => {
+            limit_interrupts(device, domain.as_ref());
+            Iommu::with_domain(domain)
+        }
         None => {
             if kernel_hal::iommu::unit().is_some() {
                 let (kind, index) = (device.kind, device.index);
@@ -181,6 +184,27 @@ fn dma_view(device: &user::UserDevice) -> Arc<Iommu> {
             }
             Iommu::create()
         }
+    }
+}
+
+/// Let the device raise only the interrupt the kernel gave it: on x86_64
+/// its `irq` is the vector its MSI carries (`bus::pci`, `pci_disks::vector`).
+/// Any other message its driver might program it with is dropped, where the
+/// unit can do that per device.
+fn limit_interrupts(device: &user::UserDevice, domain: &dyn kernel_hal::iommu::DmaDomain) {
+    let vectors: Vec<u8> = if cfg!(target_arch = "x86_64") && device.transport != Transport::Ports {
+        device
+            .irq
+            .filter(|&v| (0x20..=0xff).contains(&v))
+            .map(|v| v as u8)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if domain.limit_interrupts(&vectors) {
+        let (kind, index) = (device.kind, device.index);
+        info!("udriver: {kind} #{index} may raise only vector(s) {vectors:x?}");
     }
 }
 

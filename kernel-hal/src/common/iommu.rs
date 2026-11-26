@@ -57,6 +57,17 @@ pub trait DmaDomain: Send + Sync {
     /// returns, the device can no longer reach them (its translation caches
     /// have been invalidated), so the frames may go back to the pool.
     fn unmap(&self, paddr: PhysAddr, len: usize);
+
+    /// Let the device raise only the interrupts whose vectors are in
+    /// `vectors` (sent to the CPU the kernel routes device interrupts to),
+    /// and drop every other message it writes to the interrupt window: a
+    /// driver that programs its device with any MSI it likes can no longer
+    /// fire any vector on any CPU. `false` when this unit cannot limit
+    /// them per device, which leaves them as they were.
+    fn limit_interrupts(&self, vectors: &[u8]) -> bool {
+        let _ = vectors;
+        false
+    }
 }
 
 /// The IOMMU hardware the kernel found and took over.
