@@ -1338,3 +1338,40 @@ fn the_roster_names_the_node_whose_rm_never_came_up() {
     let up_line = card_roster_line(&up);
     assert_eq!(up_line, "/dev/nvidia1 0000:2d:00.0 id=1f06 RM instancia=0");
 }
+
+/// A poller parked on an open with an OS event registered starts the
+/// nonstall poll (what wakes a sleeping CUDA wait here), and the poll stands
+/// down once nobody waits. One parked on an open that registered nothing
+/// starts nothing.
+#[test]
+fn a_wait_on_an_os_event_runs_the_nonstall_poll_until_it_ends() {
+    extern crate std;
+    const CLIENT: u32 = 0xc1e0_0009;
+    let plain = gpu(0);
+    let (_, waker) = counting_waker();
+    let sub = plain.subscribe_readiness(PollEvents::IN, &waker);
+    assert!(!sub.is_noop());
+    assert!(
+        !EVENT_OPENS.lock().contains_key(&plain.os_info()),
+        "no OS event here: nothing for the poll to post"
+    );
+    drop(sub);
+
+    let open = Arc::new(ctl());
+    let mut p = os_event_payload(CLIENT, 7);
+    assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+    let (_, waker) = counting_waker();
+    let sub = open.subscribe_readiness(PollEvents::IN, &waker);
+    assert!(nonstall_waiter());
+    assert!(NONSTALL_POLLING.load(Ordering::Acquire));
+    drop(sub);
+    assert!(!nonstall_waiter());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while NONSTALL_POLLING.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the poll kept running with nobody waiting"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}

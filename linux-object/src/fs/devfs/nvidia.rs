@@ -39,9 +39,11 @@
 //! `NV01_EVENT_OS_EVENT` in the RM to that number. What the RM posts to it
 //! is queued on that open ([`post_event`], `nv_post_event`): it polls
 //! readable, and RM_GET_EVENT_DATA reads the queue back. The registrations
-//! are `nvidia_rm_sys::frontend::events`. The RM here is polled, so an event
-//! fires only inside some RM call (a control that triggers one, or an RPC
-//! that drains one the GSP queued); none arrives on an interrupt.
+//! are `nvidia_rm_sys::frontend::events`. The RM here has no interrupt, so
+//! an event fires inside some RM call (a control that triggers one, or an
+//! RPC that drains one the GSP queued), or from the nonstall poll
+//! ([`arm_nonstall_poll`]) that runs while somebody waits on one: that is
+//! the RM servicing the nonstall interrupts its ISR would on Linux.
 //!
 //! The ioctl arrives from `sys_ioctl` (linux-syscall), not from
 //! `INode::io_control`: it needs the caller's fd table (REGISTER_FD names a
@@ -817,8 +819,146 @@ impl NvidiaOpen {
 
 impl NvidiaOpen {
     /// Park a poller until there is an OS event to report on this open.
+    ///
+    /// The GPU has no interrupt here, so a wait on an open with OS events
+    /// registered also starts the [nonstall poll](arm_nonstall_poll): what
+    /// the RM would post from its ISR on Linux, it posts from there.
     pub fn subscribe_readiness(&self, events: PollEvents, waker: &Waker) -> ReadinessSub {
-        subscribe_readiness_on(&self.events.bus, poll_events_to_bus_mask(events), waker)
+        let sub = subscribe_readiness_on(&self.events.bus, poll_events_to_bus_mask(events), waker);
+        if !sub.is_noop() && EVENT_OPENS.lock().contains_key(&self.os_info()) {
+            NONSTALL_KICK.store(true, Ordering::Release);
+            arm_nonstall_poll();
+        }
+        sub
+    }
+}
+
+/// How often the [nonstall poll](arm_nonstall_poll) has the RM look right
+/// after somebody starts waiting, or after a look that found one. On Linux
+/// the MSI wakes a sleeping CUDA wait some microseconds after the GPU gets
+/// there; this is the latency it gets here instead, at the cost of a few
+/// register reads per look.
+const NONSTALL_POLL: core::time::Duration = core::time::Duration::from_micros(100);
+
+/// The longest the poll goes between looks: each look that finds nothing
+/// doubles the gap up to this. libcuda keeps a thread waiting on its OS
+/// events for as long as a program lives, so a CUDA program that is not
+/// waiting for the GPU costs a look every this long, not every
+/// [`NONSTALL_POLL`].
+const NONSTALL_POLL_IDLE: core::time::Duration = core::time::Duration::from_millis(4);
+
+/// Set by every new wait: the next look comes [`NONSTALL_POLL`] after it.
+static NONSTALL_KICK: AtomicBool = AtomicBool::new(false);
+
+/// How long the poll may run with somebody waiting and no nonstall
+/// interrupt at all before it says so in dmesg, once a boot.
+const NONSTALL_SILENT: core::time::Duration = core::time::Duration::from_secs(2);
+
+/// Whether the nonstall poll's task is running.
+static NONSTALL_POLLING: AtomicBool = AtomicBool::new(false);
+
+/// Whether any open with OS events registered has a poller parked on it.
+fn nonstall_waiter() -> bool {
+    EVENT_OPENS
+        .lock()
+        .values()
+        .any(|events| events.bus.lock().get_callback_len() > 0)
+}
+
+/// The GPU's nonstall interrupts, polled: what `rm_isr` does on Linux when
+/// the MSI comes, for nonstall only. That is how a CUDA thread sleeping on a
+/// `CU_EVENT_BLOCKING_SYNC` event (or in a context made with
+/// `CU_CTX_SCHED_BLOCKING_SYNC`) is woken: libcuda puts a NON_STALL_INTERRUPT
+/// after the work, binds an OS event to the engine's notifier and polls that
+/// event's file. This RM runs with interrupts disabled and no ISR
+/// (`eclipse_rm_state_init`), so without this nothing ever posts that event
+/// and the wait never ends.
+///
+/// A kernel task asks the RM every [`NONSTALL_POLL`] while some poller is
+/// parked on an open with OS events registered, and stops when none is. It
+/// never waits for the RM: a look that finds another call inside it is
+/// skipped. Started by [`NvidiaOpen::subscribe_readiness`].
+fn arm_nonstall_poll() {
+    if NONSTALL_POLLING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    kernel_hal::thread::spawn(async {
+        loop {
+            let mut silent_since = kernel_hal::timer::timer_now();
+            let mut gap = NONSTALL_POLL;
+            while nonstall_waiter() {
+                let now = kernel_hal::timer::timer_now();
+                if NONSTALL_KICK.swap(false, Ordering::AcqRel) {
+                    gap = NONSTALL_POLL;
+                }
+                match nvctl::service_nonstall() {
+                    nvctl::NonstallPoll::Serviced(0) | nvctl::NonstallPoll::Busy => {
+                        gap = (gap * 2).min(NONSTALL_POLL_IDLE);
+                        if now.saturating_sub(silent_since) >= NONSTALL_SILENT {
+                            nonstall_silent();
+                            silent_since = now;
+                        }
+                    }
+                    nvctl::NonstallPoll::Serviced(gpus) => {
+                        nonstall_serviced(gpus);
+                        gap = NONSTALL_POLL;
+                        silent_since = now;
+                    }
+                    nvctl::NonstallPoll::Failed(status) => {
+                        nonstall_failed(status);
+                        gap = NONSTALL_POLL_IDLE;
+                    }
+                }
+                if NONSTALL_KICK.load(Ordering::Acquire) {
+                    gap = NONSTALL_POLL;
+                }
+                kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + gap).await;
+            }
+            NONSTALL_POLLING.store(false, Ordering::Release);
+            // A wait that came after the last look found the flag still set
+            // and left it to this task: look once more before going.
+            if !nonstall_waiter() || NONSTALL_POLLING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
+    });
+}
+
+/// One dmesg line the first time a nonstall interrupt is serviced: the
+/// sleeping waits of this boot can wake.
+fn nonstall_serviced(gpus: u32) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidiactl] nonstall interrupt serviced (GPU instances {:#x}): sleeping CUDA waits wake by polling every {} us",
+            gpus,
+            NONSTALL_POLL.as_micros()
+        );
+    }
+}
+
+/// One dmesg line, once a boot, when somebody has waited on an OS event for
+/// [`NONSTALL_SILENT`] with no nonstall interrupt on any GPU: if a CUDA
+/// program hangs in a sleeping wait, this says the GPU never raised the
+/// interrupt (or this RM did not see it), not that the wake was lost here.
+fn nonstall_silent() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidiactl] an NVIDIA OS event has been waited on for {} s with no nonstall interrupt on any GPU (normal for an idle CUDA program; a sleeping CUDA wait that hangs is this)",
+            NONSTALL_SILENT.as_secs()
+        );
+    }
+}
+
+/// One dmesg line the first time the RM cannot take its locks to look.
+fn nonstall_failed(status: u32) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidiactl] nonstall poll: the RM refused to look: {:#x}",
+            status
+        );
     }
 }
 

@@ -100,6 +100,7 @@
 #include "eclipse_rm_mem.h"
 #include "platform/p2p/p2p_caps.h" /* p2pGetCapsStatus */
 #include "ctrl/ctrl0000/ctrl0000system.h" /* NV0000_P2P_CAPS_STATUS_* */
+#include "gpu/intr/intr.h"     /* intrServiceNonStall_HAL */
 
 extern RsServer g_resServ;
 
@@ -2296,6 +2297,80 @@ NV_STATUS eclipse_rm_frontend_uvm_free(
         gpumgrThreadDisableExpandedGpuVisibility();
     }
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * Nonstall interrupts, polled.
+ *
+ * A nonstall interrupt is how the GPU tells the RM that a channel's work got
+ * somewhere a client asked to hear about: a NON_STALL_INTERRUPT method in
+ * its pushbuffer, or a copy or graphics engine's notification. On Linux it
+ * arrives on the GPU's MSI, and rm_isr (unix_intr.c) services it at once:
+ * intrServiceNonStall_HAL clears the leaf and walks the engine's
+ * notification records, which post the OS events bound to them
+ * (osNotifyEvent, then nv_post_event). That is what wakes a CUDA thread
+ * sleeping on a CU_EVENT_BLOCKING_SYNC event or a context made with
+ * CU_CTX_SCHED_BLOCKING_SYNC: libcuda polls the event's file.
+ *
+ * This port runs with its interrupt enable at DISABLED (eclipse_rm_state_init)
+ * and no ISR, so the nonstall leaves the state load enabled latch with the
+ * top level masked and nothing ever services them. This is the servicing
+ * half of rm_isr, for nonstall only, called by the kernel side while
+ * someone waits on an OS event: the same intrServiceNonStall_HAL, under the
+ * API lock and the GPUs lock as RmIsrBottomHalf takes them.
+ *
+ * `*pServicedMask` gets the GPU instances that had one pending.
+ */
+NV_STATUS eclipse_rm_frontend_service_nonstall(NvU32 *pServicedMask)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS status;
+    NvU32 gpuCount = 0, gpuMask = 0, gpuInstance = 0, serviced = 0;
+    OBJGPU *pGpu;
+
+    if (pServicedMask == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    *pServicedMask = 0;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_ISR);
+        if (status == NV_OK)
+        {
+            status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_ISR);
+            if (status == NV_OK)
+            {
+                (void)gpumgrGetGpuAttachInfo(&gpuCount, &gpuMask);
+                while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+                {
+                    Intr *pIntr = GPU_GET_INTR(pGpu);
+                    MC_ENGINE_BITVECTOR engines;
+
+                    if ((pIntr == NULL) || !FULL_GPU_SANITY_CHECK(pGpu))
+                    {
+                        continue;
+                    }
+                    bitVectorClrAll(&engines);
+                    (void)intrServiceNonStall_HAL(pGpu, pIntr, &engines, &threadState);
+                    if (!bitVectorTestAllCleared(&engines))
+                    {
+                        serviced |= NVBIT(pGpu->gpuInstance);
+                    }
+                }
+                rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+            }
+            rmapiLockRelease();
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    *pServicedMask = serviced;
     return status;
 }
 

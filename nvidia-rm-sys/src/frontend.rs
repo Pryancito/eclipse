@@ -375,8 +375,32 @@ impl CallScope {
         CallScope::with(0, false, 0, &[0u8; CALLER_NAME_LEN])
     }
 
+    /// [`CallScope::enter_kernel`] only if nobody is inside the RM: `None`
+    /// means the gate is taken, and a caller that can come back later (the
+    /// nonstall poll) does instead of waiting behind a long call.
+    fn try_enter_kernel() -> Option<CallScope> {
+        let gate = crate::rm_init::RmGate::try_lock()?;
+        Some(CallScope::with_gate(
+            gate,
+            0,
+            false,
+            0,
+            &[0u8; CALLER_NAME_LEN],
+        ))
+    }
+
     fn with(gpu_mask: u32, admin: bool, pid: u32, name: &[u8; CALLER_NAME_LEN]) -> CallScope {
         let gate = crate::rm_init::RmGate::lock();
+        CallScope::with_gate(gate, gpu_mask, admin, pid, name)
+    }
+
+    fn with_gate(
+        gate: crate::rm_init::RmGate,
+        gpu_mask: u32,
+        admin: bool,
+        pid: u32,
+        name: &[u8; CALLER_NAME_LEN],
+    ) -> CallScope {
         CALLER_GPUS.store(gpu_mask, Ordering::SeqCst);
         CALLER_ADMIN.store(admin, Ordering::SeqCst);
         CALLER_PID.store(pid, Ordering::SeqCst);

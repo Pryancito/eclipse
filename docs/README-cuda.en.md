@@ -53,6 +53,15 @@ OS-descriptor `RM_ALLOC_MEMORY`, etc.
 `REGISTER`/`UNREGISTER_GPU`, range groups, GPU VA space, channels, external
 map/unmap/free, semaphore pool (+ CPU mmap), reflected SKED, `VALIDATE_VA_RANGE`.
 
+**Sleeping waits** (`CU_EVENT_BLOCKING_SYNC`, `CU_CTX_SCHED_BLOCKING_SYNC`):
+libcuda puts a NON_STALL_INTERRUPT after the work and sleeps on an OS event's
+file. On Linux the RM's ISR wakes it when the MSI comes; this RM has no
+interrupt, so while somebody waits on an OS event the kernel has the RM
+service the pending nonstall interrupts (the same `intrServiceNonStall_HAL`
+as `rm_isr`): every 100 µs right after a wait starts, stretching to every
+4 ms while none comes. `dmesg | grep nonstall` names the first one serviced,
+or says somebody waited 2 s without seeing one.
+
 **Not yet:** UVM's own page tables / GPU page faults / HMM;
 `cudaMallocManaged` (managed mmap → `ENODEV`); the remaining UVM ioctls →
 `ENOSYS` (one line in dmesg the first time).
@@ -81,8 +90,8 @@ file the way llama.cpp maps the model) with their MB/s; llama.cpp's pool (a
 many-block kernels, reductions with shuffles and shared memory, 64 KiB of
 dynamic shared memory, local memory, atomics, `dp4a`, int8 and f16 tensor
 cores, a CUDA graph; and the latency of launching a kernel and of waiting for
-it, both spinning and sleeping (`CU_EVENT_BLOCKING_SYNC`, which needs the GPU
-interrupt to wake up). A wrong answer says where; a GPU that never finishes is
+it, both spinning and sleeping (`CU_EVENT_BLOCKING_SYNC`, which needs the GPU's
+nonstall interrupt to wake up, see above). A wrong answer says where; a GPU that never finishes is
 named after 60 s instead of hanging. The kernels are in
 `tools/cuda-probe/kernels.cu` and ship as PTX in `kernels_ptx.h`
 (`gen-kernels.sh` regenerates it). For reference, on a 2060 SUPER under Linux:
