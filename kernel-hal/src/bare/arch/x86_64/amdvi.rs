@@ -285,6 +285,8 @@ impl IommuUnit for AmdVi {
                 return None;
             }
         }
+        // Its ways around the domain closed before the domain is on.
+        super::pcie::isolate(r);
         unit.set_dte(rid, amdvi::dte_translate(root_pa, did), PASS_THROUGH_DID);
         crate::klog_info!(
             "iommu: {:02x}:{:02x}.{} has a domain of its own (unit {}, id {})",

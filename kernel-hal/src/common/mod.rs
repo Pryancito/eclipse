@@ -34,6 +34,7 @@ pub mod ksyms;
 pub mod ktop;
 pub mod oops_log;
 pub mod panic_lock;
+pub mod pcie;
 pub mod phys_watch;
 pub mod rand;
 pub mod rtc;

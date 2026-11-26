@@ -32,7 +32,7 @@ const SPINS: usize = 10_000_000;
 
 /// One byte of PCI configuration space, through the legacy ports, for the
 /// bridges a DMAR device scope walks through.
-fn cfg_read(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
+pub(super) fn cfg_read(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
     let addr = 0x8000_0000u32
         | (bus as u32) << 16
         | ((dev as u32) & 0x1f) << 11
@@ -415,6 +415,8 @@ impl IommuUnit for VtD {
                 r.rid()
             );
         }
+        // Its ways around the domain closed before the domain is on.
+        super::pcie::isolate(r);
         unit.set_context(
             r.rid(),
             vtd::context_entry(vtd::TT_TRANSLATE, root_pa, unit.aw, did),
