@@ -398,7 +398,7 @@ fn surfaceflip_stats_line_for(state: u8, dev: Option<u32>) -> String {
 /// and the line the boot prints about them live together. Out of this file
 /// for size only; a child module still reaches its private items.
 mod boot_fb;
-pub use boot_fb::set_boot_fb_info;
+pub use boot_fb::{boot_fb_info, set_boot_fb_info};
 use boot_fb::{boot_fb_phys, boot_fb_size, BootFbInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

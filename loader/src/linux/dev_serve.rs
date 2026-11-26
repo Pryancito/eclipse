@@ -272,6 +272,34 @@ pub(super) fn nvctl_event(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     }
 }
 
+/// `eclipse_boot_display(out, len)`: what the boot knows of the display
+/// (the UEFI framebuffer, the monitor's EDID, `resolution=WxH`), written to
+/// `out` as `zcore_drivers::display::boot_display` lays it out, for the
+/// driver of a GPU this process holds to be told what the kernel's is told
+/// at boot. `ACCESS_DENIED` to a process that holds no GPU;
+/// `BUFFER_TOO_SMALL` for a `len` short of the layout; `INVALID_ARGS` for
+/// an `out` that cannot be written.
+pub const ECLIPSE_BOOT_DISPLAY: u32 = super::ECLIPSE_GATEWAY_EXT + 28;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn boot_display(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use linux_object::fs::devfs::served::nvctl;
+    if !super::device_claim::holds_gpu(proc) {
+        return Err(ZxError::ACCESS_DENIED);
+    }
+    if args[1] < nvctl::BOOT_DISPLAY_LEN {
+        return Err(ZxError::BUFFER_TOO_SMALL);
+    }
+    kernel_hal::user::UserOutPtr::<u8>::from(args[0])
+        .write_array(&nvctl::boot_display())
+        .map_err(|_| ZxError::INVALID_ARGS)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn boot_display(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
+    Err(ZxError::NOT_SUPPORTED)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub(super) fn nvctl_event(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
     Err(ZxError::NOT_SUPPORTED)

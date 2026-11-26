@@ -14,6 +14,8 @@ mod requested_mode;
 pub use requested_mode::{prefer_requested, requested_mode, set_requested_mode};
 
 #[cfg(target_arch = "x86_64")]
+pub mod boot_display;
+#[cfg(target_arch = "x86_64")]
 mod nouveau_uapi;
 #[cfg(target_arch = "x86_64")]
 mod nvidia;
@@ -88,8 +90,8 @@ pub use nvidia::pushbuf::set_enabled as set_gem_pushbuf_enabled;
 pub use nvidia::set_nvkms_requested;
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
-    boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,
-    NvidiaGpu, NvidiaGpuDriverPci,
+    boot_edid, boot_fb_info, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid,
+    set_boot_fb_info, NvidiaGpu, NvidiaGpuDriverPci,
 };
 
 /// Re-export of `nvidia_rm_sys::os_interface::set_thread_id_provider`, so
