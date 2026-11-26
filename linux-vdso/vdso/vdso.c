@@ -44,10 +44,28 @@
 //      if (r == -EINVAL) return __syscall_ret(r);
 //      /* Fall through on errors other than EINVAL. */
 //
-// That is what makes this safe to ship. Every path this file cannot serve —
-// the kernel having disabled it, a clock id it does not implement — returns
-// -ENOSYS and the caller transparently gets the kernel's answer. The worst
-// outcome of a bug here is no speedup; it is never a wrong time.
+// glibc makes no such promise, and it is the C library of the Ubuntu rootfs.
+// Its `clock_gettime` trusts the vDSO the way it may on Linux, whose vDSO
+// issues the syscall itself for whatever it cannot answer:
+//
+//      r = INTERNAL_VSYSCALL_CALL (vdso_time64, 2, clock_id, tp);
+//      if (r == 0) return 0;
+//      return INLINE_SYSCALL_ERROR_RETURN_VALUE (-r);
+//
+// and its `time` and `gettimeofday` are IFUNCs bound straight to the symbols
+// here, with no fallback of any kind. So a -ENOSYS returned from this file was
+// not "ask the kernel" to a glibc program: it was `clock_gettime(
+// CLOCK_BOOTTIME)` failing with ENOSYS, for every clock outside the five
+// below, and every clock at all on a machine whose TSC is unusable. Firefox
+// reads CLOCK_BOOTTIME for its process uptime and release-asserts on the
+// answer the moment a tab turns audible (`ProcessUptimeMs().value()`), which
+// is what closed it a second into every video.
+//
+// So this file does what Linux's does. Every path it cannot serve — the kernel
+// having disabled it, a clock id it does not implement — makes the system call
+// from here (`vdso_syscall`) and returns the kernel's own answer, errno and
+// all. No reader has to know how to fall back; the worst outcome of a bug here
+// is no speedup, never a wrong time.
 //
 // ## Position independence without a dynamic linker
 //
@@ -103,7 +121,23 @@ __attribute__((section(".vdso_data"), aligned(64))) struct vdso_data _vdso_data;
 #define VDSO_CLOCK_REALTIME_COARSE 5
 #define VDSO_CLOCK_MONOTONIC_COARSE 6
 
-#define VDSO_ENOSYS (-38)
+// The calls this image stands in for, by x86_64 syscall number.
+#define VDSO_NR_GETTIMEOFDAY 96
+#define VDSO_NR_TIME 201
+#define VDSO_NR_CLOCK_GETTIME 228
+#define VDSO_NR_GETCPU 309
+
+// The real system call, for whatever cannot be answered here. Returns what the
+// kernel returned: 0 or a value, or a negative errno -- the same convention
+// every entry point of this file already has. `syscall` clobbers rcx and r11.
+static inline long vdso_syscall(long nr, long a0, long a1, long a2) {
+    long ret;
+    __asm__ __volatile__("syscall"
+                         : "=a"(ret)
+                         : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
+                         : "rcx", "r11", "memory");
+    return ret;
+}
 
 struct vdso_timespec {
     long tv_sec;
@@ -138,11 +172,12 @@ static inline uint64_t vdso_tsc_to_ns(uint64_t tsc, uint64_t base, uint64_t mult
     return (uint64_t)(((unsigned __int128)ticks * (unsigned __int128)mult) >> 32);
 }
 
-// Returns 0 and fills `ns`, or non-zero if this clock cannot be served here.
+// Returns 0 and fills `ns`, or non-zero if this clock cannot be served here
+// and the caller has to make the system call instead.
 static inline int vdso_now_ns(int clk, uint64_t *ns) {
     struct vdso_data *d = &_vdso_data;
     if (!d->enabled)
-        return VDSO_ENOSYS;
+        return 1;
     uint64_t mono = vdso_tsc_to_ns(vdso_rdtsc(), d->tsc_base, d->tsc_mult);
     switch (clk) {
     case VDSO_CLOCK_MONOTONIC:
@@ -155,19 +190,17 @@ static inline int vdso_now_ns(int clk, uint64_t *ns) {
         *ns = mono + d->wall_off_ns;
         return 0;
     default:
-        // Deliberately not -EINVAL: musl returns -EINVAL straight to the
-        // caller as an error, so claiming a clock is invalid here would break
-        // every clock the kernel supports and this file does not (per-process
-        // CPU-time clocks, for instance). -ENOSYS means "ask the kernel".
-        return VDSO_ENOSYS;
+        // Not an error: the kernel serves clocks this file does not
+        // (CLOCK_BOOTTIME, the CPU-time clocks, CLOCK_TAI), and only the
+        // kernel knows which numbers name no clock at all.
+        return 1;
     }
 }
 
 VDSO_EXPORT int __vdso_clock_gettime(int clk, struct vdso_timespec *ts) {
     uint64_t ns;
-    int err = vdso_now_ns(clk, &ns);
-    if (err)
-        return err;
+    if (vdso_now_ns(clk, &ns))
+        return (int)vdso_syscall(VDSO_NR_CLOCK_GETTIME, clk, (long)ts, 0);
     ts->tv_sec = (long)(ns / 1000000000ull);
     ts->tv_nsec = (long)(ns % 1000000000ull);
     return 0;
@@ -180,13 +213,11 @@ VDSO_EXPORT int __vdso_clock_gettime(int clk, struct vdso_timespec *ts) {
 // hands that word back in ECX without leaving ring 3. The CPU is the low 12
 // bits, the NUMA node above them (`kernel_hal::getcpu`).
 //
-// musl's `sched_getcpu` looks this symbol up and, exactly like the clock, falls
-// through to the syscall on -ENOSYS, so a machine without `rdtscp` -- or a
-// kernel that could not encode some CPU's id -- simply keeps the trap.
+// A machine without `rdtscp` -- or a kernel that could not encode some CPU's
+// id -- keeps the trap: it is taken from here, like the clock's.
 VDSO_EXPORT int __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused) {
-    (void)unused;
     if (!_vdso_data.getcpu_enabled)
-        return VDSO_ENOSYS;
+        return (int)vdso_syscall(VDSO_NR_GETCPU, (long)cpu, (long)node, (long)unused);
     uint32_t aux;
     uint32_t lo, hi;
     __asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
@@ -205,9 +236,8 @@ VDSO_EXPORT int __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused) {
 VDSO_EXPORT int __vdso_gettimeofday(struct vdso_timeval *tv, struct vdso_timezone *tz) {
     if (tv) {
         uint64_t ns;
-        int err = vdso_now_ns(VDSO_CLOCK_REALTIME, &ns);
-        if (err)
-            return err;
+        if (vdso_now_ns(VDSO_CLOCK_REALTIME, &ns))
+            return (int)vdso_syscall(VDSO_NR_GETTIMEOFDAY, (long)tv, (long)tz, 0);
         tv->tv_sec = (long)(ns / 1000000000ull);
         tv->tv_usec = (long)((ns % 1000000000ull) / 1000ull);
     }
@@ -224,9 +254,8 @@ VDSO_EXPORT int __vdso_gettimeofday(struct vdso_timeval *tv, struct vdso_timezon
 // failure returns a negative errno, which the caller checks the same way.
 VDSO_EXPORT long __vdso_time(long *t) {
     uint64_t ns;
-    int err = vdso_now_ns(VDSO_CLOCK_REALTIME, &ns);
-    if (err)
-        return err;
+    if (vdso_now_ns(VDSO_CLOCK_REALTIME, &ns))
+        return vdso_syscall(VDSO_NR_TIME, (long)t, 0, 0);
     long secs = (long)(ns / 1000000000ull);
     if (t)
         *t = secs;
