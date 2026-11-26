@@ -1263,7 +1263,9 @@ fn nvme_cc_shutdown(cc: u32) -> u32 {
 /// Called with whatever was to be written already flushed. A list someone
 /// holds the lock of is left alone: this runs where nothing may wait.
 pub fn shutdown_for_reboot() -> usize {
-    let Some(reserved) = RESERVED.try_lock() else {
+    // The list is copied and let go: a shutdown may take a second, which
+    // is no time to keep a lock others spin on.
+    let Some(reserved) = RESERVED.try_lock().map(|r| r.clone()) else {
         return 0;
     };
     reserved.iter().filter(|d| d.nvme_shutdown()).count()
