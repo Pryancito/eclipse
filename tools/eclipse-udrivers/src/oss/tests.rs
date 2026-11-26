@@ -231,6 +231,25 @@ fn the_play_pointer_counts_bytes_and_fragments_played() {
     assert_eq!(field(&info, 1), 0);
 }
 
+/// A stream left idle is stopped and counts what it played from 0 again:
+/// the fragments since the last call are then none, not the difference of
+/// the two counts wrapped round (some four billion).
+#[test]
+fn the_play_pointer_starts_again_with_a_stream_that_was_stopped() {
+    let mut d = dsp();
+    s16_stereo(&mut d);
+    d.play(&vec![0u8; 3 * FRAGMENT]).unwrap();
+    d.s.out.pos = 2 * FRAGMENT + 8;
+    d.tick(None);
+    let mut info = [0u8; 12];
+    d.control(SNDCTL_DSP_GETOPTR, &mut info).unwrap();
+    d.s.reset();
+    d.control(SNDCTL_DSP_GETOPTR, &mut info).unwrap();
+    let field = |b: &[u8], i: usize| i32::from_ne_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+    assert_eq!(field(&info, 0), 0);
+    assert_eq!(field(&info, 1), 0);
+}
+
 #[test]
 fn another_rate_drops_what_was_queued_at_the_last() {
     let mut d = dsp();
