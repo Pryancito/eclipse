@@ -358,7 +358,7 @@ cfg_if! {
                 if prev != n {
                     crate::klog_info!("[vt] switch_vt_impl {} -> {}", prev, n);
                 }
-                if kd_mode_vt(n) == KD_TEXT {
+                if switch_repaints(kd_mode_vt(n), presents_held()) {
                     let _ = with_vt_try(n, |g| {
                         g.repaint();
                     });
@@ -523,6 +523,19 @@ fn held_at(until_ns: u64, now_ns: u64) -> bool {
 pub fn presents_held() -> bool {
     let until = PRESENTS_HELD_UNTIL_NS.load(Ordering::SeqCst);
     until != 0 && held_at(until, crate::hal_fn::timer::timer_now().as_nanos() as u64)
+}
+
+/// Whether making a VT in mode `kd_mode` the active one repaints it: a text
+/// VT, and not while the display is held ([`hold_presents_for`]). The hold
+/// is the console GPU's bring-up, and a repaint is a screenful of writes
+/// through that GPU's BAR1, which is what the hold keeps away from it: the
+/// compositor being started takes its VT in that window (`VT_ACTIVATE` to a
+/// VT still in text mode) often enough. Whoever ends the hold repaints the
+/// VT that is active by then.
+#[inline]
+#[allow(dead_code)]
+fn switch_repaints(kd_mode: u32, held: bool) -> bool {
+    kd_mode == KD_TEXT && !held
 }
 
 /// Whether a write to VT `vt` should be pushed to the display now: always in
@@ -1235,6 +1248,17 @@ mod kd_mode_tests {
         assert!(held_at(100, 99), "inside the hold");
         assert!(!held_at(100, 100), "the hold ends at its deadline");
         assert!(!held_at(100, 5_000), "and stays ended");
+    }
+
+    /// A VT switch repaints a text VT, and nothing while the display is held
+    /// for the console GPU's bring-up: that repaint was a screenful written
+    /// through the GPU's BAR1 in the middle of it.
+    #[test]
+    fn a_vt_switch_does_not_repaint_while_the_display_is_held() {
+        assert!(switch_repaints(KD_TEXT, false));
+        assert!(!switch_repaints(KD_TEXT, true), "held: nothing is written");
+        assert!(!switch_repaints(KD_GRAPHICS, false), "a compositor's VT");
+        assert!(!switch_repaints(KD_GRAPHICS, true));
     }
 
     /// The graphics VT is the last one, and `zCore/src/main.rs` spawns no login

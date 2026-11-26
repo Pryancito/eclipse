@@ -380,19 +380,136 @@ pub(crate) fn forget_served(card: &Arc<dyn DrmScheme>) {
 /// `udrv-nvidia`.
 static SERVED_GPUS: AtomicUsize = AtomicUsize::new(0);
 
+/// How long the GPUs the boot leaves to `udrv-nvidia` are waited for to be
+/// served, from the first time anything asked whether they were
+/// ([`serve_overdue`]). That driver serves no card before its GPUs have
+/// their RM (8 s for one RTX 2060); one that never serves must hold
+/// neither a session nor the console GPU's bring-up for good.
+const SERVE_PATIENCE_MS: u64 = 60_000;
+
+/// When [`serve_overdue`] was first asked, in ms since boot. 0: not yet.
+static SERVE_ASKED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the GPUs left to `udrv-nvidia` have had their time to be
+/// served ([`SERVE_PATIENCE_MS`]): whoever waits for one stops then. The
+/// first to ask starts the clock: init, asking `/proc/gpuready` whether
+/// its session can start, or the console GPU's deferred bring-up.
+pub fn serve_overdue() -> bool {
+    let now = (kernel_hal::timer::timer_now().as_millis() as u64).max(1);
+    let since = match SERVE_ASKED_MS.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => now,
+        Err(since) => since,
+    };
+    overdue(since, now)
+}
+
+/// [`serve_overdue`] at `now_ms`, first asked at `since_ms`.
+fn overdue(since_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(since_ms) >= SERVE_PATIENCE_MS
+}
+
 /// `/proc/gpuready`'s lines for the `left` NVIDIA GPUs the boot leaves to
 /// `udrv-nvidia` (`udriver=nvidia@N`), of which processes serve `served`
 /// cards now: one not served yet is one a GPU session must wait for, as
-/// for the kernel's console GPU, or the compositor starts on no GPU.
-pub fn left_to_userspace(left: usize, served: usize) -> impl Iterator<Item = (bool, String)> {
+/// for the kernel's console GPU, or the compositor starts on no GPU. Not
+/// once they are `overdue` ([`serve_overdue`]): nothing is coming.
+pub fn left_to_userspace(
+    left: usize,
+    served: usize,
+    overdue: bool,
+) -> impl Iterator<Item = (bool, String)> {
     (0..left).map(move |n| {
         let up = n < served;
-        let state = if up { "served" } else { "not served yet" };
+        let state = match (up, overdue) {
+            (true, _) => "served",
+            (false, false) => "not served yet",
+            (false, true) => "never served",
+        };
         (
-            up,
+            up || overdue,
             alloc::format!("nvidia@{n}: left to udrv-nvidia, {state}"),
         )
     })
+}
+
+/// The console-GSP gate was opened by the boot's deferred console
+/// bring-up, for its window ([`console_gate_opened_for_its_window`]).
+static GATE_IS_THE_WINDOWS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The deferred console bring-up is opening the console-GSP gate, with the
+/// scanout parked. A driver's process is told with the bring-up's own
+/// request (`drm_remote::op::CONSOLE_BRINGUP`), so from here on the
+/// switches it reads when it starts say the gate is shut
+/// ([`console_gate_is_the_windows`]): a driver that started again after
+/// the window found it open, and brought the console GPU up for its first
+/// client with the scanout live and nothing held, which is what the window
+/// is there to prevent.
+pub fn console_gate_opened_for_its_window() {
+    GATE_IS_THE_WINDOWS.store(true, Ordering::Release);
+}
+
+/// Whether the console-GSP gate, if open, is open only for the deferred
+/// bring-up's window.
+pub fn console_gate_is_the_windows() -> bool {
+    GATE_IS_THE_WINDOWS.load(Ordering::Acquire)
+}
+
+/// `/proc/gpuready`'s lines for the `left` NVIDIA GPUs the boot leaves to
+/// `udrv-nvidia`: whether each is served ([`left_to_userspace`]), and
+/// whether a client can use the one that scans out the console
+/// ([`console_gpus_ready`]).
+pub fn gpuready_lines(left: usize) -> Vec<(bool, String)> {
+    left_to_userspace(left, served_gpus(), serve_overdue())
+        .chain(console_gpus_ready())
+        .collect()
+}
+
+/// How `/proc/gpuready` marks the line of a console GPU a process drives.
+pub const IN_A_PROCESS: &str = "in udrv-nvidia";
+
+/// `/proc/gpuready`'s lines for the console GPUs processes drive.
+///
+/// The session waits for one the boot is still to bring up, as it waits
+/// for the kernel's own. Started before, the compositor finds a GPU with no
+/// RM and falls back to the CPU for the whole session, and its start (a VT
+/// switch, a modeset) lands in the window the bring-up needs silent: the
+/// driver's process said nothing of where its console GPU was, so the boot
+/// read "served" as "ready" and started the session at once.
+pub fn console_gpus_ready() -> Vec<(bool, String)> {
+    let coming = drm::console_bringup_unfinished();
+    let (expected, answered) = {
+        let nvkms = NVKMS.lock();
+        (nvkms.expected, nvkms.answered.clone())
+    };
+    served_cards()
+        .iter()
+        .filter_map(|card| {
+            let (ready, line) = card.console_gpu_ready()?;
+            let modeset = !awaited(expected, card.is_console_gpu(), card.pci_bdf(), &answered);
+            waited_for(coming, ready, modeset, &line)
+        })
+        .collect()
+}
+
+/// One console GPU's line of [`console_gpus_ready`], when it has one, from
+/// the driver's own `line`: `coming`, the boot's bring-up of it is still
+/// ahead; `ready`, a client can use it; `modeset`, nvidia-modeset has been
+/// given it, or is not going to be.
+///
+/// One a bring-up left cold holds nobody, like one no bring-up was
+/// scheduled for: nothing more is coming. One that came up is waited for
+/// until nvidia-modeset has it: a compositor's first pointer on a GPU with
+/// its RM up takes the display's core channel, and nvidia-modeset is then
+/// refused the card ([`cursor_plane_offered`]).
+fn waited_for(coming: bool, ready: bool, modeset: bool, line: &str) -> Option<(bool, String)> {
+    let line = alloc::format!("{line}, {IN_A_PROCESS}");
+    match (ready, modeset) {
+        (true, true) => Some((true, line)),
+        (true, false) => Some((false, line + ", nvidia-modeset not loaded yet")),
+        (false, _) if coming => Some((false, line)),
+        (false, _) => None,
+    }
 }
 
 /// How many NVIDIA GPUs the boot leaves to userspace (`udriver=nvidia@N`).

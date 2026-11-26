@@ -220,6 +220,34 @@ const GPU_READY: &str = "/proc/gpuready";
 /// whatever is left of the bring-up, not this number.
 const GPU_READY_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// The same, when the report names a GPU whose driver is a process
+/// ([`GPU_OF_A_PROCESS`]). That driver serves its cards only once it has
+/// brought its other GPUs up, the kernel asks it for the console GPU after
+/// that, and then for the modeset that puts the picture back: on real
+/// hardware (2x RTX 2060) that was past the 25 s that are plenty for the
+/// kernel's own driver, and the session that started meanwhile ran on
+/// pixman, with the console GPU brought up under it. The kernel ends the
+/// wait itself when a step gives up, each within its own bound; this one is
+/// only for a kernel that never answers.
+const GPU_READY_TIMEOUT_PROCESS: Duration = Duration::from_secs(240);
+
+/// What `/proc/gpuready` calls the process that drives the NVIDIA GPUs a
+/// boot leaves to userspace (`udriver=nvidia@N`), in the line of each.
+const GPU_OF_A_PROCESS: &str = "udrv-nvidia";
+
+/// How long to wait on a `/proc/gpuready` that says `report`.
+fn gpu_ready_timeout(report: &str) -> Duration {
+    if report
+        .lines()
+        .skip(1)
+        .any(|line| line.contains(GPU_OF_A_PROCESS))
+    {
+        GPU_READY_TIMEOUT_PROCESS
+    } else {
+        GPU_READY_TIMEOUT
+    }
+}
+
 /// At most once per boot: a card that never comes up must not add this to
 /// every respawn of a compositor that is already failing.
 static GPU_WAITED: AtomicBool = AtomicBool::new(false);
@@ -264,19 +292,19 @@ fn wait_for_gpu_ready(name: &str) {
         return;
     }
     // Nothing to wait for: no file, or no console GPU on this box.
-    match fs::read_to_string(GPU_READY).ok().as_deref() {
+    let timeout = match fs::read_to_string(GPU_READY).ok().as_deref() {
         Some(text) => match gpuready_verdict(text) {
             None | Some("none") => return,
             Some("ready") => return,
-            _ => {}
+            _ => gpu_ready_timeout(text),
         },
         None => return,
-    }
+    };
     let outcome = timed(
         format!("{name}: wait for the console GPU to be usable"),
         || {
             wait_until(
-                GPU_READY_TIMEOUT,
+                timeout,
                 || {
                     fs::read_to_string(GPU_READY)
                         .ok()
@@ -294,7 +322,7 @@ fn wait_for_gpu_ready(name: &str) {
         // the cause is in the kernel log, not here.
         log(&format!(
             "warning: {name}: the console GPU was still not usable after \
-             {GPU_READY_TIMEOUT:?} ({GPU_READY} says waiting); starting anyway, so \
+             {timeout:?} ({GPU_READY} says waiting); starting anyway, so \
              the compositor will almost certainly fall back to pixman. See \
              `dmesg | grep nouveau-uapi` and `cat {GPU_READY}`."
         ));

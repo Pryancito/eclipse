@@ -95,7 +95,7 @@ fn reply(card: &dyn DrmScheme, node: &Node, req: &Msg) -> Msg {
 /// and one connector, by numbers no other card uses, and framebuffers
 /// and flips it only counts.
 pub mod check {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane};
     use zcore_drivers::scheme::{DrmScheme, Scheme};
 
@@ -136,6 +136,10 @@ pub mod check {
         /// boot its heads were asked at.
         pub nvkms_loads: AtomicU32,
         pub liveness: std::sync::Mutex<Vec<String>>,
+        /// The kernel asked it to bring the console GPU up, and then for
+        /// its GR ladder: a client can use it, as far as it says.
+        pub brought_up: AtomicBool,
+        pub ladder: AtomicBool,
     }
 
     impl Scheme for Card {
@@ -163,6 +167,26 @@ pub mod check {
         }
         fn is_console_gpu(&self) -> bool {
             self.console
+        }
+        /// As the NVIDIA driver answers: nothing for a GPU that does not
+        /// scan out the console, and ready once the boot brought it up.
+        fn console_gpu_ready(&self) -> Option<(bool, String)> {
+            let up = self.brought_up.load(Ordering::Relaxed) && self.ladder.load(Ordering::Relaxed);
+            self.console.then(|| (up, String::new()))
+        }
+        fn deferred_console_bringup(&self) -> String {
+            if !self.console {
+                return String::new();
+            }
+            self.brought_up.store(true, Ordering::Relaxed);
+            "udrv-nvidia-check: asked to bring the console GPU up".into()
+        }
+        fn build_console_gr_ladder(&self) -> String {
+            if !self.console {
+                return String::new();
+            }
+            self.ladder.store(true, Ordering::Relaxed);
+            "udrv-nvidia-check: asked for the console GPU's GR ladder".into()
         }
         fn nvkms_load(&self) -> Vec<String> {
             let time = self.nvkms_loads.fetch_add(1, Ordering::Relaxed) + 1;

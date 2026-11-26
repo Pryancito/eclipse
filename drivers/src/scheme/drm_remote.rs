@@ -173,6 +173,9 @@ impl Flags {
     pub const HW_VBLANK: u64 = 1 << 6;
     pub const BLOCK_LINEAR: u64 = 1 << 7;
     pub const CE_PRESENT_READY: u64 = 1 << 8;
+    /// A client can use the console GPU: its RM is up and its GR ladder
+    /// built ([`DrmScheme::console_gpu_ready`]).
+    pub const CONSOLE_READY: u64 = 1 << 9;
 
     /// What `gpu` answers now. The driver's end sends it with every
     /// answer ([`Transport::flags`]).
@@ -187,6 +190,10 @@ impl Flags {
             (gpu.has_hw_vblank(), Self::HW_VBLANK),
             (gpu.scans_out_block_linear(), Self::BLOCK_LINEAR),
             (gpu.ce_present_ready(), Self::CE_PRESENT_READY),
+            (
+                gpu.console_gpu_ready().is_some_and(|(ready, _)| ready),
+                Self::CONSOLE_READY,
+            ),
         ];
         Flags(
             bits.iter()
@@ -785,6 +792,29 @@ impl<T: Transport> DrmScheme for Remote<T> {
         // A card that is not ready declines without a call: the kernel
         // offers every frame to every card.
         self.ce_present_ready() && self.yes(op::CE_PRESENT, src_sysmem_pa, size, &[])
+    }
+
+    /// Whether a client can use the driver's console GPU yet, as its last
+    /// answer said and never by a call: the boot polls this in a loop
+    /// (`/proc/gpuready`) and the DRM core asks it before every ioctl it
+    /// may have to hold back, of a driver that is busy bringing that very
+    /// GPU up. The answers that change it carry it: the bring-up's and the
+    /// GR ladder's.
+    fn console_gpu_ready(&self) -> Option<(bool, String)> {
+        if !self.flag(Flags::CONSOLE_GPU) {
+            return None;
+        }
+        let ready = self.flag(Flags::CONSOLE_READY);
+        let rm = ready || self.flag(Flags::NOUVEAU_READY);
+        let yes = |on: bool| if on { "yes" } else { "no" };
+        let place = self
+            .bdf
+            .map(|(_, bus, dev, func)| alloc::format!("{bus:02x}:{dev:02x}.{func} "))
+            .unwrap_or_default();
+        Some((
+            ready,
+            alloc::format!("{place}{}: rm={} gr={}", self.name, yes(rm), yes(ready)),
+        ))
     }
 
     /// The console GPU of the process brought up as the kernel's would

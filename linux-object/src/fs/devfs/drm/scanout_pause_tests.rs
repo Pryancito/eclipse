@@ -337,3 +337,123 @@ fn the_reset_between_tests_lifts_a_leaked_pause() {
     assert_eq!(SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst), 0);
     assert!(!SCANOUT_STALE.load(Ordering::SeqCst));
 }
+
+// --- nothing reaches the panel while the pause holds ---
+
+/// A CRTC turned off paints the panel black, and the panel is the console
+/// GPU's BAR1: inside the pause that is a write the bring-up asks for none
+/// of. The black is owed until the pause lifts.
+#[test]
+fn a_crtc_turned_off_during_the_pause_is_painted_black_when_it_lifts() {
+    let _restored = serialised();
+    set_scanout_paused(true);
+
+    set_crtc_blanked(true);
+
+    assert!(crtc_blanked(), "the CRTC is off for everyone who asks");
+    assert!(
+        quiet_window::black_is_owed(),
+        "the black was painted through BAR1 inside the pause"
+    );
+    set_scanout_paused(false);
+    assert!(
+        !quiet_window::black_is_owed(),
+        "the pause lifted and the panel never went black"
+    );
+    assert!(crtc_blanked());
+}
+
+/// One that came back on before the pause lifted is owed nothing: the frame
+/// that turned it on covers the panel.
+#[test]
+fn a_crtc_that_came_back_on_during_the_pause_is_owed_no_black() {
+    let _restored = serialised();
+    set_scanout_paused(true);
+    set_crtc_blanked(true);
+
+    set_crtc_blanked(false);
+
+    assert!(!quiet_window::black_is_owed());
+}
+
+/// With no pause the black is painted at once, as it always was.
+#[test]
+fn a_crtc_turned_off_with_no_pause_owes_nothing() {
+    let _restored = serialised();
+    set_crtc_blanked(true);
+    assert!(crtc_blanked() && !quiet_window::black_is_owed());
+}
+
+/// A compositor that turns its CRTC off and then presents, all inside the
+/// pause, was told its frame is up. The resume leaves a CRTC that is off
+/// alone, so the present has to turn it on although it draws nothing: it
+/// did not, and the panel stayed black until the next frame of a desktop
+/// with nothing to redraw.
+#[test]
+fn a_present_the_pause_drops_still_turns_the_crtc_on() {
+    let _restored = serialised();
+    set_crtc_blanked(true);
+    set_crtc_enabled(false);
+    set_scanout_paused(true);
+
+    assert!(present_now_checked(0x7171, SYNTH_CRTC_ID, None).is_ok());
+
+    assert!(!crtc_blanked() && crtc_enabled());
+    assert!(
+        SCANOUT_STALE.load(Ordering::SeqCst),
+        "and the resume owes the panel that frame"
+    );
+}
+
+/// Coming back to the compositor's VT puts its last frame up again: inside
+/// the pause that frame is owed, not painted.
+#[test]
+fn the_frame_put_back_after_a_vt_switch_waits_for_the_pause_to_lift() {
+    let _restored = serialised();
+    set_graphics_vt_for_test(Some(kernel_hal::console::active_vt()));
+    DRM_STATE.lock().crtc_fb.set(PANEL_CARD, 0x8181);
+    set_scanout_paused(true);
+
+    assert!(!represent_if_owner_active(), "it painted inside the pause");
+
+    assert!(SCANOUT_STALE.load(Ordering::SeqCst));
+    set_graphics_vt_for_test(None);
+}
+
+/// The window paints the kernel's console over the compositor's frame. An
+/// idle compositor presents nothing while it lasts: nothing was dropped,
+/// so nothing put its frame back, and the desktop stayed behind an empty
+/// console. The pause itself owes that frame.
+#[test]
+fn a_pause_that_begins_over_a_compositors_frame_owes_it_back() {
+    let _restored = serialised();
+    set_graphics_vt_for_test(Some(kernel_hal::console::active_vt()));
+    DRM_STATE.lock().crtc_fb.set(PANEL_CARD, 0x8282);
+
+    set_scanout_paused_for(Duration::from_secs(60));
+
+    let owed = SCANOUT_STALE.load(Ordering::SeqCst);
+    set_graphics_vt_for_test(None);
+    assert!(
+        owed,
+        "the desktop stays behind the console the window painted"
+    );
+}
+
+/// With no compositor on the active VT there is no frame to owe: the
+/// session is held back until the GPU is up, and the window opens over the
+/// text console. Nor is one owed for a compositor that has shown nothing.
+#[test]
+fn a_pause_over_the_text_console_owes_no_frame() {
+    let _restored = serialised();
+    DRM_STATE.lock().crtc_fb.set(PANEL_CARD, 0x8383);
+    set_scanout_paused_for(Duration::from_secs(60));
+    assert!(!SCANOUT_STALE.load(Ordering::SeqCst), "another VT's frame");
+
+    reset_output_state_for_test();
+    set_graphics_vt_for_test(Some(kernel_hal::console::active_vt()));
+    set_scanout_paused(true);
+    let owed = SCANOUT_STALE.load(Ordering::SeqCst);
+    set_graphics_vt_for_test(None);
+    assert!(!owed, "a compositor with no frame on the panel");
+}

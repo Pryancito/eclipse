@@ -334,10 +334,7 @@ pub fn set_crtc_blanked(on: bool) {
         // pipe, now, with the count there is: a pipe that is off has no
         // vblank to wait for.
         send_pending_vblank_events_on_off();
-        if let Some(display) = primary_display() {
-            display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
-            let _ = display.flush();
-        }
+        quiet_window::crtc_went_off();
         // Black pixels are not a framebuffer's pixels. Without this the present
         // that un-blanks honours its damage box and leaves a black screen with
         // one rectangle of desktop in it. See [`panel_state`].
@@ -350,6 +347,7 @@ pub fn set_crtc_blanked(on: bool) {
         forget_cursor_under();
         kernel_hal::klog_info!("[drm] CRTC off: panel blanked");
     } else {
+        quiet_window::crtc_came_on();
         kernel_hal::klog_info!("[drm] CRTC on");
     }
 }
@@ -568,6 +566,7 @@ pub fn set_scanout_paused(on: bool) {
         SCANOUT_PAUSED.store(false, Ordering::SeqCst);
         SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
         kernel_hal::klog_info!("[drm] scanout RESUMED");
+        quiet_window::pause_lifted();
         repaint_if_scanout_stale();
         return;
     }
@@ -579,6 +578,7 @@ pub fn set_scanout_paused(on: bool) {
         Ordering::SeqCst,
     );
     SCANOUT_PAUSED.store(true, Ordering::SeqCst);
+    quiet_window::pause_began();
     kernel_hal::klog_info!("[drm] scanout PAUSED (console GSP bring-up window)");
 }
 
@@ -596,6 +596,7 @@ pub fn set_scanout_paused(on: bool) {
 pub fn set_scanout_paused_for(max: core::time::Duration) {
     SCANOUT_PAUSE_DEADLINE_NS.store(pause_deadline_ns(timer_now_ns(), max), Ordering::SeqCst);
     SCANOUT_PAUSED.store(true, Ordering::SeqCst);
+    quiet_window::pause_began();
     kernel_hal::klog_info!(
         "[drm] scanout PAUSED (console GSP bring-up window, watchdog {}s)",
         max.as_secs()
@@ -5259,7 +5260,9 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
 
 pub(crate) mod cursor_blit;
 pub(crate) mod fb_handle;
+mod quiet_window;
 use cursor_blit::{blit_cursor_patch, cursor_plane, repaint_cursor_from_panel};
+pub use quiet_window::represent_if_owner_active;
 
 /// Make a cursor set/move take effect immediately (the legacy cursor ioctls
 /// carry no page-flip of their own) WITHOUT re-blitting the whole frame.
@@ -6629,26 +6632,6 @@ fn next_vblank_deadline() -> Duration {
     }
 }
 
-/// Present a framebuffer immediately on `crtc_id` without queuing a DRM flip
-/// event. Used by SETCRTC/SETPLANE paths that are not page-flip ioctls.
-/// Re-blit the compositor's last frame IF its VT is the active one. Called
-/// right after a VT switch so returning to the compositor (Ctrl+Alt+F1) shows
-/// its last frame immediately instead of a stale/blank screen; a no-op when the
-/// switch was TO a text console (which the kernel repaints itself).
-pub fn represent_if_owner_active() -> bool {
-    let fb = {
-        let st = DRM_STATE.lock();
-        if st.graphics_vt != Some(kernel_hal::console::active_vt()) {
-            return false;
-        }
-        st.crtc_fb.panel()
-    };
-    if fb == 0 {
-        return false;
-    }
-    scanout(fb)
-}
-
 /// Forget the compositor's VT ownership (on DROP_MASTER / compositor exit) so a
 /// subsequent text-only session is never gated off the display or input.
 pub fn clear_graphics_owner() {
@@ -6688,6 +6671,16 @@ pub fn present_now_checked(
     rect: Option<(u32, u32, u32, u32)>,
 ) -> Result<(), PresentError> {
     let asked_for_a_rect = rect.is_some();
+    // An explicit present is a client putting pixels on this CRTC, so it is on
+    // again. See `set_crtc_blanked` for why this un-blanks rather than failing
+    // the flip the way Linux does for a disabled CRTC; and a pipe showing a
+    // frame has a mode, so a `SETCRTC` that disabled it is undone too.
+    // Before the pause is looked at: one the pause drops turns the CRTC on
+    // like any other, or the resume, which leaves a CRTC that is off alone,
+    // kept the panel black under a compositor that had been told its frame
+    // was up.
+    set_crtc_blanked(false);
+    set_crtc_enabled(true);
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
     if scanout_paused() {
@@ -6697,12 +6690,6 @@ pub fn present_now_checked(
         SCANOUT_STALE.store(true, Ordering::SeqCst);
         return Ok(());
     }
-    // An explicit present is a client putting pixels on this CRTC, so it is on
-    // again. See `set_crtc_blanked` for why this un-blanks rather than failing
-    // the flip the way Linux does for a disabled CRTC; and a pipe showing a
-    // frame has a mode, so a `SETCRTC` that disabled it is undone too.
-    set_crtc_blanked(false);
-    set_crtc_enabled(true);
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
         // argument to `warn!` keeps the MutexGuard temporary alive for the

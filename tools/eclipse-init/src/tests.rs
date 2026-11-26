@@ -3233,6 +3233,28 @@ fn un_gpuready_que_no_se_entiende_no_hace_esperar() {
     );
 }
 
+/// A la GPU que lleva un proceso se la espera mas que a la del nucleo: el
+/// proceso sirve sus tarjetas cuando ha levantado las otras GPUs, y solo
+/// entonces el nucleo le pide la de consola y el modeset. Con los 25 s del
+/// driver del nucleo la sesion arrancaba en mitad de eso, en pixman.
+#[test]
+fn a_la_gpu_de_un_proceso_se_la_espera_mas() {
+    let del_nucleo = "gpuready: waiting\n17:00.0 GeForce RTX 2060: rm=yes gr=no\n";
+    assert_eq!(gpu_ready_timeout(del_nucleo), GPU_READY_TIMEOUT);
+    let sin_servir = "gpuready: waiting\nnvidia@0: left to udrv-nvidia, not served yet\n\
+                      nvidia@1: left to udrv-nvidia, not served yet\n";
+    assert_eq!(gpu_ready_timeout(sin_servir), GPU_READY_TIMEOUT_PROCESS);
+    let servida = "gpuready: waiting\nnvidia@0: left to udrv-nvidia, served\n\
+                   17:00.0 nvidia: rm=yes gr=no, in a driver's process\n";
+    assert_eq!(gpu_ready_timeout(servida), GPU_READY_TIMEOUT_PROCESS);
+    // El veredicto no cuenta: solo las lineas de detalle nombran al proceso.
+    assert_eq!(
+        gpu_ready_timeout("gpuready: udrv-nvidia\n"),
+        GPU_READY_TIMEOUT
+    );
+    assert!(GPU_READY_TIMEOUT_PROCESS > GPU_READY_TIMEOUT);
+}
+
 /// `nvidia.nogpuwait` devuelve el arranque de antes, sin espera ninguna.
 #[test]
 fn nogpuwait_apaga_la_espera() {
