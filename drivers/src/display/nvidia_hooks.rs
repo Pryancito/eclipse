@@ -17,6 +17,7 @@ use crate::bus::pci::PortOpsImpl;
 use crate::bus::pci::PCI_ACCESS;
 use crate::bus::{drivers_timer_now_as_micros, phys_to_virt};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::hint::spin_loop;
 use lock::Mutex;
 use nvidia_rm_sys::hooks::KernelHooks;
@@ -48,19 +49,50 @@ fn port_ops() -> &'static fake_ports::FakePorts {
     &fake_ports::PORTS
 }
 
+/// The hooks, with every `IoMapper` a GPU's init handed over.
+///
+/// In the kernel every GPU hands over the same mapper, which maps any
+/// physical address, so one would do. In the udrv-nvidia process each GPU
+/// brings its own mapper, which knows only that GPU's BARs: keeping just the
+/// last one left every other GPU unable to map a BAR the PCI scan had not
+/// registered (the console card's BAR2, so its state load failed and the
+/// screen stayed black). So all of them are kept, and the newest is asked
+/// first, which is the mapper the hooks used alone before.
 pub struct EclipseNvrmHooks {
-    mapper: Mutex<Option<Arc<dyn IoMapper>>>,
+    mappers: Mutex<Vec<Arc<dyn IoMapper>>>,
 }
 
 impl EclipseNvrmHooks {
     const fn new() -> Self {
         Self {
-            mapper: Mutex::new(None),
+            mappers: Mutex::new(Vec::new()),
         }
     }
 
     pub fn set_mapper(&self, mapper: Arc<dyn IoMapper>) {
-        *self.mapper.lock() = Some(mapper);
+        let mut mappers = self.mappers.lock();
+        let same = |m: &Arc<dyn IoMapper>| {
+            Arc::as_ptr(m) as *const u8 == Arc::as_ptr(&mapper) as *const u8
+        };
+        if let Some(at) = mappers.iter().position(same) {
+            mappers.remove(at);
+        }
+        mappers.push(mapper);
+    }
+
+    /// The first answer of a kept mapper for `[paddr, paddr + size)`, the
+    /// newest mapper asked first.
+    fn query_or_map(&self, paddr: usize, size: usize) -> Option<usize> {
+        self.mappers
+            .lock()
+            .iter()
+            .rev()
+            .find_map(|m| m.query_or_map(paddr, size))
+    }
+
+    /// Whether any mapper was handed over.
+    fn has_mapper(&self) -> bool {
+        !self.mappers.lock().is_empty()
     }
 }
 
@@ -142,13 +174,9 @@ impl KernelHooks for EclipseNvrmHooks {
     }
 
     fn map_kernel_space(&self, phys: u64, size: u64) -> u64 {
-        let guard = self.mapper.lock();
-        if let Some(mapper) = guard.as_ref() {
-            if let Some(vaddr) = mapper.query_or_map(phys as usize, size as usize) {
-                return vaddr as u64;
-            }
+        if let Some(vaddr) = self.query_or_map(phys as usize, size as usize) {
+            return vaddr as u64;
         }
-        drop(guard);
         phys_to_virt(phys as usize) as u64
     }
 
@@ -194,7 +222,7 @@ static ECLIPSE_NVRM_HOOKS: EclipseNvrmHooks = EclipseNvrmHooks::new();
 /// Registers Eclipse's real `KernelHooks` with `nvidia-rm-sys` and stashes
 /// the `IoMapper` so `map_kernel_space` can use it. Idempotent -- safe to
 /// call once per matched GPU (`register_hooks` just overwrites the global
-/// pointer; the mapper is shared across all NVIDIA devices).
+/// pointer; every GPU's mapper is kept, see [`EclipseNvrmHooks`]).
 pub fn install(mapper: &Option<Arc<dyn IoMapper>>) {
     if let Some(m) = mapper {
         ECLIPSE_NVRM_HOOKS.set_mapper(m.clone());
@@ -215,16 +243,15 @@ pub fn install(mapper: &Option<Arc<dyn IoMapper>>) {
 /// BAR the PCI scan did map) is left as it is.
 pub fn map_device_window(phys: u64, len: u64) -> bool {
     const PAGE: u64 = 4096;
-    let guard = ECLIPSE_NVRM_HOOKS.mapper.lock();
-    let Some(mapper) = guard.as_ref() else {
+    if !ECLIPSE_NVRM_HOOKS.has_mapper() {
         return false;
-    };
+    }
     let Some(end) = phys.checked_add(len) else {
         return false;
     };
     let mut pa = phys & !(PAGE - 1);
     while pa < end {
-        match mapper.query_or_map(pa as usize, PAGE as usize) {
+        match ECLIPSE_NVRM_HOOKS.query_or_map(pa as usize, PAGE as usize) {
             Some(va) if va == phys_to_virt(pa as usize) => {}
             _ => return false,
         }
@@ -515,16 +542,78 @@ mod nvidia_hooks_tests {
             (0xF000_0000 + OFFSET) as u64
         );
         assert_eq!(mapper.calls.load(Ordering::Relaxed), 1);
-        hooks.set_mapper(Arc::new(FakeMapper {
+        hooks.unmap_kernel_space(0xF000_0000, 0x1000);
+
+        let refusing = EclipseNvrmHooks::new();
+        refusing.set_mapper(Arc::new(FakeMapper {
             calls: AtomicUsize::new(0),
             refuse: true,
         }));
         assert_eq!(
-            hooks.map_kernel_space(0xF000_0000, 0x1000),
+            refusing.map_kernel_space(0xF000_0000, 0x1000),
             0xF000_0000,
             "a mapper with nothing for the range: the identity window"
         );
-        hooks.unmap_kernel_space(0xF000_0000, 0x1000);
+    }
+
+    /// An `IoMapper` that knows one range only, as the udrv-nvidia process's
+    /// per-GPU BAR mapper does.
+    struct RangeMapper {
+        base: usize,
+        len: usize,
+        virt: usize,
+        calls: AtomicUsize,
+    }
+    impl IoMapper for RangeMapper {
+        fn query_or_map(&self, paddr: usize, size: usize) -> Option<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            (paddr >= self.base && paddr - self.base + size <= self.len)
+                .then(|| self.virt + (paddr - self.base))
+        }
+    }
+
+    /// Each GPU's init hands over its own mapper in the process: the first
+    /// GPU's BARs must still map after the second GPU's init, newest asked
+    /// first, and the same mapper handed over twice is kept once.
+    #[test]
+    fn every_gpus_mapper_is_kept_and_the_newest_is_asked_first() {
+        let hooks = EclipseNvrmHooks::new();
+        let console = Arc::new(RangeMapper {
+            base: 0xA000_0000,
+            len: 0x10_0000,
+            virt: 0x1_0000_0000,
+            calls: AtomicUsize::new(0),
+        });
+        let compute = Arc::new(RangeMapper {
+            base: 0xB000_0000,
+            len: 0x10_0000,
+            virt: 0x2_0000_0000,
+            calls: AtomicUsize::new(0),
+        });
+        hooks.set_mapper(console.clone());
+        hooks.set_mapper(compute.clone());
+        hooks.set_mapper(compute.clone());
+        assert_eq!(hooks.mappers.lock().len(), 2, "the same mapper once");
+        assert_eq!(
+            hooks.map_kernel_space(0xA000_2000, 0x1000),
+            0x1_0000_2000,
+            "the console card's BAR, through its own mapper"
+        );
+        assert_eq!(
+            hooks.map_kernel_space(0xB000_3000, 0x1000),
+            0x2_0000_3000
+        );
+        assert_eq!(console.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            compute.calls.load(Ordering::Relaxed),
+            2,
+            "the newest mapper is asked first, every time"
+        );
+        assert_eq!(
+            hooks.map_kernel_space(0xC000_0000, 0x1000),
+            0xC000_0000,
+            "nobody's range: the identity window"
+        );
     }
 
     fn ports_log() -> Vec<(bool, u32, u32, u32)> {

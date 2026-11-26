@@ -2164,15 +2164,15 @@ fn schedule_deferred_console_bringup(
         // the one known way this hardware wedges, and a latched pause freezes
         // the desktop forever (flips keep being acknowledged, nothing is
         // drawn). The pause lifts by itself if we never get back here.
-        linux_object::fs::devfs::drm::set_scanout_paused_for(
-            linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX,
-        );
+        // A card a process serves waits longer than the kernel's own.
+        let pause = linux_object::fs::devfs::served::card::bringup_pause();
+        linux_object::fs::devfs::drm::set_scanout_paused_for(pause);
         // Hold console presents across the window: the state load rebinds the
         // console card's BAR1 (its framebuffer), and a present landing in that
         // bind left BAR1 faulted for the rest of the boot. Flush pending work
         // first; a hold drops presents still in the throttle.
         kernel_hal::console::redraw_active_console();
-        kernel_hal::console::hold_presents_for(linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX);
+        kernel_hal::console::hold_presents_for(pause);
         // Brief settle so in-flight blits/CE finish before SEC2.
         kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(200)).await;
 

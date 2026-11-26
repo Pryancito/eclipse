@@ -40,6 +40,27 @@ pub struct OverLink(Arc<Link>, AtomicU64, Option<FenceCheck>);
 /// boot that never comes back is still a hang past this.
 const BRINGUP_PATIENCE_MS: u64 = 180_000;
 
+/// How long the deferred console bring-up keeps scanout paused and console
+/// presents held: the kernel's own [`SCANOUT_PAUSE_MAX`] for its GPUs, and
+/// while a process serves a GPU, that card's bring-up patience plus a margin.
+/// A shorter pause lifted while the process's state load was still rebinding
+/// the console card's BAR1, and a present landing in that bind faults BAR1
+/// for the rest of the boot.
+///
+/// [`SCANOUT_PAUSE_MAX`]: crate::fs::devfs::drm::SCANOUT_PAUSE_MAX
+pub fn bringup_pause() -> core::time::Duration {
+    pause_for(served_gpus())
+}
+
+/// [`bringup_pause`] with `served` cards of a GPU served.
+fn pause_for(served: usize) -> core::time::Duration {
+    let kernel = crate::fs::devfs::drm::SCANOUT_PAUSE_MAX;
+    if served == 0 {
+        return kernel;
+    }
+    kernel.max(core::time::Duration::from_millis(BRINGUP_PATIENCE_MS + 10_000))
+}
+
 /// No answer has carried flags yet.
 const NO_FLAGS: u64 = u64::MAX;
 
