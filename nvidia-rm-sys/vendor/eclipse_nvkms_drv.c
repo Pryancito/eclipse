@@ -22,6 +22,8 @@
 #include "nvkms-kapi-internal.h"
 #include "nvkms-types.h"          /* nvEvoGlobal, NVDevEvoRec: the default LUT */
 #include "nvkms-utils.h"          /* nvCalloc, nvFree */
+#include "nvkms-kapi-notifiers.h" /* the flip notifiers kapi programs */
+#include "nvkms-sync.h"           /* nvKmsParseNotifier */
 #include <class/cl0076.h> /* NV01_MEMORY_FRAMEBUFFER_CONSOLE */
 
 #define ECLIPSE_KMS_MAX_DISPLAYS 8
@@ -702,6 +704,162 @@ static void eclipse_kms_primary(struct NvKmsKapiHeadRequestedConfig *h,
     primary->flags.surfaceChanged = NV_TRUE;
 }
 
+/*
+ * Whether a flip is still pending: kapi's getFlipPendingStatus, which the
+ * function table of this release (580) no longer fills. nvidia-drm of 580
+ * tracks its flips through FLIP_OCCURRED events instead, so kapi dropped the
+ * call, and the member is left NULL: calling it was a jump to address 0 on
+ * the first flip to another surface, any modeset, and any wait for a flip.
+ *
+ * It is done here the way kapi did it before (nvKmsKapiIsNotifierFinish and
+ * nvKmsKapiNotifierSetNotBegun, declared in nvkms-kapi-notifiers.h and
+ * defined nowhere now): every commit names a completion notifier for the
+ * primary layer of each lit head, at the slot after the current one, which
+ * the display writes BEGUN when the flip latches. The slot is set NOT_BEGUN
+ * before the commit (eclipse_kms_arm_notifiers), and the flip is pending
+ * while the current slot still reads NOT_BEGUN.
+ *
+ * The three below take the slot's place in kapi's notifier surface and the
+ * surface itself, so they can be checked on memory of their own. A slot is
+ * NVKMS_KAPI_NOTIFIER_SIZE bytes, as kapi gives the display its offset,
+ * whatever the format.
+ */
+static void *eclipse_kms_notifier_at(void *base, NvU32 slot)
+{
+    return (char *)base + (NvU64)slot * NVKMS_KAPI_NOTIFIER_SIZE;
+}
+
+int eclipse_kms_notifier_pending(NvU32 format, NvBool overlay, NvU32 slot, const void *base)
+{
+    struct nvKmsParsedNotifier parsed = { 0 };
+
+    /* No notifier to read: nothing can be waited for. */
+    if (base == NULL)
+        return 0;
+    nvKmsParseNotifier((enum NvKmsNIsoFormat)format, overlay, 0,
+                       eclipse_kms_notifier_at((void *)base, slot), &parsed);
+    return parsed.status == NVKMS_NOTIFIER_STATUS_NOT_BEGUN;
+}
+
+void eclipse_kms_notifier_arm(NvU32 format, NvBool overlay, NvU32 slot, void *base)
+{
+    if (base != NULL)
+        nvKmsResetNotifier((enum NvKmsNIsoFormat)format, overlay, 0,
+                           eclipse_kms_notifier_at(base, slot));
+}
+
+/* What the display writes when a flip latches; also what a slot no flip
+ * will ever write is set to, so it is not waited for. */
+void eclipse_kms_notifier_latch(NvU32 format, NvBool overlay, NvU32 slot, void *base)
+{
+    if (base != NULL)
+        nvKmsSetNotifier((enum NvKmsNIsoFormat)format, overlay, 0,
+                         eclipse_kms_notifier_at(base, slot), 0);
+}
+
+static NvU32 eclipse_kms_slot(NvU32 head, NvU32 index)
+{
+    return NVKMS_KAPI_NOTIFIER_INDEX(head, NVKMS_KAPI_LAYER_PRIMARY_IDX, index);
+}
+
+/* kapi's getFlipPendingStatus for the primary layer of `head`: NV_FALSE
+ * for a head the device does not have. */
+static NvBool eclipse_kms_primary_pending(const struct NvKmsKapiDevice *device, NvU32 head,
+                                          NvBool *pending)
+{
+    NvU32 index;
+
+    if (head >= NVKMS_KAPI_MAX_HEADS || head >= device->numHeads)
+        return NV_FALSE;
+    /* A release whose table has it again answers for itself. */
+    if (g_nvKms.getFlipPendingStatus != NULL)
+        return g_nvKms.getFlipPendingStatus(device, head, NVKMS_KAPI_LAYER_PRIMARY_IDX,
+                                            pending);
+    index = device->layerState[head][NVKMS_KAPI_LAYER_PRIMARY_IDX].currFlipNotifierIndex;
+    *pending = eclipse_kms_notifier_pending(device->notifier.format, NV_FALSE,
+                                            eclipse_kms_slot(head, index),
+                                            device->notifier.pLinearAddress) != 0;
+    return NV_TRUE;
+}
+
+/* Before a commit: the slot each lit head's primary layer flips to next
+ * reads NOT_BEGUN until the flip latches. A commit that leaves the primary
+ * layer alone does not move to that slot, and nothing waits on it. */
+static void eclipse_kms_arm_notifiers(struct NvKmsKapiDevice *device, NvU32 litMask)
+{
+    NvU32 head;
+
+    if (g_nvKms.getFlipPendingStatus != NULL)
+        return;
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS && head < device->numHeads; head++) {
+        NvU32 index =
+            device->layerState[head][NVKMS_KAPI_LAYER_PRIMARY_IDX].currFlipNotifierIndex;
+
+        if ((litMask & (1u << head)) == 0)
+            continue;
+        eclipse_kms_notifier_arm(device->notifier.format, NV_FALSE,
+                                 eclipse_kms_slot(head, NVKMS_KAPI_INC_NOTIFIER_INDEX(index)),
+                                 device->notifier.pLinearAddress);
+    }
+}
+
+/* After a commit that failed: kapi may have moved to the slot armed for
+ * it with no flip behind it. That slot is said latched, or every later
+ * flip on the head would wait for it. */
+static void eclipse_kms_disarm_notifiers(struct NvKmsKapiDevice *device, NvU32 litMask)
+{
+    NvU32 head;
+
+    if (g_nvKms.getFlipPendingStatus != NULL)
+        return;
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS && head < device->numHeads; head++) {
+        NvU32 index =
+            device->layerState[head][NVKMS_KAPI_LAYER_PRIMARY_IDX].currFlipNotifierIndex;
+
+        if ((litMask & (1u << head)) == 0)
+            continue;
+        eclipse_kms_notifier_latch(device->notifier.format, NV_FALSE,
+                                   eclipse_kms_slot(head, index),
+                                   device->notifier.pLinearAddress);
+    }
+}
+
+/* Which members of kapi's table this file calls are missing: a bit per
+ * member, in the order below; 0 when the table is complete. A missing one
+ * would be a jump to address 0. getFlipPendingStatus is not among them:
+ * it is done here when kapi has none. */
+NvU32 eclipse_kms_table_gaps(void)
+{
+    NvU32 gaps = 0, bit = 0;
+
+    if (!eclipse_kms_table())
+        return ~0u;
+#define ECLIPSE_KMS_NEEDS(member) \
+    do { \
+        if (g_nvKms.member == NULL) \
+            gaps |= 1u << bit; \
+        bit++; \
+    } while (0)
+    ECLIPSE_KMS_NEEDS(allocateDevice);
+    ECLIPSE_KMS_NEEDS(freeDevice);
+    ECLIPSE_KMS_NEEDS(validateDisplayMode);
+    ECLIPSE_KMS_NEEDS(getDisplayMode);
+    ECLIPSE_KMS_NEEDS(getDeviceResourcesInfo);
+    ECLIPSE_KMS_NEEDS(getDisplays);
+    ECLIPSE_KMS_NEEDS(getStaticDisplayInfo);
+    ECLIPSE_KMS_NEEDS(getConnectorInfo);
+    ECLIPSE_KMS_NEEDS(getDynamicDisplayInfo);
+    ECLIPSE_KMS_NEEDS(freeMemory);
+    ECLIPSE_KMS_NEEDS(createSurface);
+    ECLIPSE_KMS_NEEDS(destroySurface);
+    ECLIPSE_KMS_NEEDS(grabOwnership);
+    ECLIPSE_KMS_NEEDS(releaseOwnership);
+    ECLIPSE_KMS_NEEDS(applyModeSetConfig);
+    ECLIPSE_KMS_NEEDS(allocateMemory);
+#undef ECLIPSE_KMS_NEEDS
+    return gaps;
+}
+
 /* After a commit: nothing has changed since. */
 static void eclipse_kms_settled(struct NvKmsKapiRequestedModeSetConfig *req)
 {
@@ -812,7 +970,9 @@ int eclipse_kms_show_console(struct NvKmsKapiDevice *device,
         goto done;
     }
     nvkms_memset(reply, 0, sizeof(*reply));
+    eclipse_kms_arm_notifiers(device, scanout->litMask);
     if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        eclipse_kms_disarm_notifiers(device, scanout->litMask);
         result = ECLIPSE_KMS_COMMIT_FAILED;
         goto done;
     }
@@ -859,8 +1019,7 @@ int eclipse_kms_flip(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *s
 
         if ((scanout->litMask & (1u << head)) == 0)
             continue;
-        if (!g_nvKms.getFlipPendingStatus(device, head, NVKMS_KAPI_LAYER_PRIMARY_IDX,
-                                          &pending))
+        if (!eclipse_kms_primary_pending(device, head, &pending))
             return ECLIPSE_KMS_REFUSED;
         if (pending)
             return ECLIPSE_KMS_FLIP_PENDING;
@@ -876,7 +1035,9 @@ int eclipse_kms_flip(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *s
         if (scanout->litMask & (1u << head))
             eclipse_kms_primary(h, s);
     }
+    eclipse_kms_arm_notifiers(device, scanout->litMask);
     if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        eclipse_kms_disarm_notifiers(device, scanout->litMask);
         /* What is on screen is still the old configuration. */
         for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++)
             req->headRequestedConfig[head]
@@ -927,8 +1088,7 @@ int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanou
 
             if ((scanout->litMask & (1u << head)) == 0)
                 continue;
-            if (!g_nvKms.getFlipPendingStatus(device, head,
-                                              NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending))
+            if (!eclipse_kms_primary_pending(device, head, &pending))
                 return ECLIPSE_KMS_REFUSED;
             if (pending)
                 return ECLIPSE_KMS_FLIP_PENDING;
@@ -1000,7 +1160,9 @@ int eclipse_kms_set_mode(struct NvKmsKapiDevice *device, struct EclipseKmsScanou
         goto restore;
     }
     nvkms_memset(reply, 0, sizeof(*reply));
+    eclipse_kms_arm_notifiers(device, newLit);
     if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        eclipse_kms_disarm_notifiers(device, newLit);
         result = ECLIPSE_KMS_COMMIT_FAILED;
         goto restore;
     }
@@ -1033,8 +1195,7 @@ int eclipse_kms_flip_pending(struct NvKmsKapiDevice *device,
 
         if ((scanout->litMask & (1u << head)) == 0)
             continue;
-        if (!g_nvKms.getFlipPendingStatus(device, head, NVKMS_KAPI_LAYER_PRIMARY_IDX,
-                                          &pending))
+        if (!eclipse_kms_primary_pending(device, head, &pending))
             return -1;
         if (pending)
             return 1;
