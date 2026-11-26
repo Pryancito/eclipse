@@ -3795,7 +3795,7 @@ fn ce_try_in_order(
     // The cards a process drives (`udrv-nvidia`'s) are not in the kernel's
     // device list; each takes its place by the same rule, after the
     // kernel's own.
-    let served = crate::fs::devfs::served::card::served_snapshot();
+    let served = crate::fs::devfs::served::card::ce_snapshot();
     let served = served.iter().flatten();
     let all = kernel_hal::drivers::all_drm();
     let all = all.as_vec();
