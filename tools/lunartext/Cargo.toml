@@ -5,7 +5,7 @@ edition = "2021"
 description = "Eclipse OS: anti-aliased vector text (DejaVu Sans Mono) for the Lunar clients"
 publish = false
 
-# Standalone like the clients that use it (lunarbar, lunarbg, SilverSurfer):
+# Standalone like the clients that use it (lunarbar, lunarbg):
 # userspace, NOT a member of the zCore workspace.
 [workspace]
 

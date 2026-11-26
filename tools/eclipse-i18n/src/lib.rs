@@ -2,8 +2,8 @@
 //!
 //! One table, linked by every client that draws text: the panel and its
 //! binaries (lunarbar, lunarrun, lunarfile, lunarclip, lunarnet, lunardesk,
-//! lunarlock, lunarshot, lunarnotes, lunarhunter), the wallpaper client
-//! (lunarbg) and the browser (SilverSurfer). GTK and Firefox use gettext via
+//! lunarlock, lunarshot, lunarnotes, lunarhunter) and the wallpaper client
+//! (lunarbg). GTK and Firefox use gettext via
 //! `$LANG`; these do not -- no libintl, no `setlocale`, nothing to install in
 //! the rootfs.
 //!

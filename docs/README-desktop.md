@@ -31,7 +31,7 @@ eclipse-look win11      # Windows 11
 | Reloj | abajo, grande y en negrita (10x20); fecha arriba | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
 | Terminal | paleta tecno (oro como amarillo) | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
 | Fondo | eclipse dorado sobre negro con halo verdoso, anillos finos y la leyenda `ECLIPSE · SYSTEM · KERNEL · ZCORE` | cosmos animado con estrellas, rejilla y anillo de texto | cosmos animado | cosmos animado |
-| Archivos y navegador | lunarfile recto, columnas en mayúsculas y carpetas en oro; SilverSurfer con la paleta de A | paleta violeta | paleta Breeze | paleta Windows 11 |
+| Archivos | lunarfile recto, columnas en mayúsculas y carpetas en oro | paleta violeta | paleta Breeze | paleta Windows 11 |
 | Lanzador | en el tercio superior, recto y con escuadras doradas | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
 
 `tecno` es el aspecto «Orbital HUD» de la maqueta que eligió Moebius (ver
@@ -450,8 +450,8 @@ ESP como dice `/etc/fstab` (`eclipse-fs-mounts`) antes de tocar
 `rboot.conf`; `reinicio = si` marca lo que se lee al arrancar.
 
 Los ajustes del escritorio que antes solo eran variables de entorno
-(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`,
-`SILVERSURFER_ADBLOCK`) viven en `/etc/eclipse/entorno`, líneas `NOMBRE=valor`.
+(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`)
+viven en `/etc/eclipse/entorno`, líneas `NOMBRE=valor`.
 Los escribe `eclipse-entorno NOMBRE VALOR`, que solo admite esos nombres y
 palabras sencillas, borra la línea con `auto` y pide a eclipse-init que
 reinicie el fondo o la barra. Los programas lo leen al arrancar

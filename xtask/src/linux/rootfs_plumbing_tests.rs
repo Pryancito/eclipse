@@ -3128,51 +3128,6 @@ fn both_make_paths_install_the_lunar_clients() {
     }
 }
 
-/// SilverSurfer is hundreds of MiB. `/bin` is copied into the RAM-resident
-/// root with a 16 MiB cap, so a binary installed there never reaches the
-/// image QEMU boots. Both `make` paths have to put it in `usr/bin`, which
-/// `copy_into_live` copies uncapped with the rest of the desktop, and take
-/// away a copy left in `/bin` by an older build.
-#[test]
-fn both_make_paths_install_silversurfer_with_the_desktop_binaries() {
-    let src = include_str!("mod.rs");
-    let make = src
-        .split("    pub fn make(&self, clear: bool) {")
-        .nth(1)
-        .expect("LinuxRootfs::make moved");
-    let (incremental, scratch) = make
-        .split_once("            return;\n        }\n")
-        .expect("the incremental branch no longer ends in `return;`");
-    assert!(
-        incremental.contains("self.install_silversurfer(&dir);"),
-        "the incremental branch does not install silversurfer into the rootfs"
-    );
-    let scratch = scratch.split("\n    }\n").next().unwrap();
-    assert!(
-        scratch.contains("self.install_silversurfer(&dir);"),
-        "the from-scratch branch does not install silversurfer into the rootfs"
-    );
-    let install = src
-        .split("fn install_silversurfer(&self, rootfs: &Path) {")
-        .nth(1)
-        .expect("install_silversurfer moved")
-        .split("\n    fn lunar_tools(")
-        .next()
-        .unwrap();
-    assert!(
-        install.contains("rootfs.join(\"usr/bin\").join(\"silversurfer\")"),
-        "silversurfer has to land in usr/bin, which the live root keeps"
-    );
-    assert!(
-        install.contains("rootfs.join(\"bin\").join(\"silversurfer\")"),
-        "a copy left in /bin has to be removed"
-    );
-    assert!(
-        !install.contains("fs::copy(&executable, bin.join(\"silversurfer\"))"),
-        "installing into /bin is what the 16 MiB cap drops"
-    );
-}
-
 /// The loader's name is not a convention we are free to pick: it is the exact
 /// string in the `PT_INTERP` of every dynamically linked binary the musl
 /// toolchain produces, so the file in `/lib` has to be named this and nothing
@@ -3217,182 +3172,56 @@ fn a_toolchain_without_a_libc_so_installs_nothing() {
     );
 }
 
-/// Una cabecera ELF64 little-endian con la maquina que se le pida. Solo los
-/// 20 primeros bytes se leen (`verify::elf_machine`), asi que con la cabecera
-/// basta: lo que se prueba es la decision, no el binario.
-fn elf64_de(machine: u16, path: &Path) {
-    let mut v = vec![0u8; 64];
-    v[..4].copy_from_slice(b"\x7fELF");
-    v[4] = 2;
-    v[5] = 1;
-    v[16..18].copy_from_slice(&2u16.to_le_bytes());
-    v[18..20].copy_from_slice(&machine.to_le_bytes());
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
+/// SilverSurfer is gone, and both `make` paths take its pieces out of a
+/// rootfs kept from an older build: the binary (in `usr/bin` or `/bin`), the
+/// `eclipse-browser` wrapper, the `.desktop` and the http(s) handler rows,
+/// keeping every other row of `mimeapps.list`.
+#[test]
+fn a_kept_rootfs_loses_silversurfer() {
+    let mod_rs = include_str!("mod.rs");
+    assert_eq!(mod_rs.matches("drop_silversurfer(&dir);").count(), 2);
+    let root = scratch("sin-silversurfer");
+    for leftover in [
+        "usr/bin/silversurfer",
+        "bin/silversurfer",
+        "usr/local/bin/eclipse-browser",
+        "root/.local/share/applications/silversurfer.desktop",
+    ] {
+        let path = root.join(leftover);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"x").unwrap();
     }
-    fs::write(path, v).unwrap();
-}
-
-/// SilverSurfer es el UNICO binario propio que se construye para el
-/// ANFITRION y no para el objetivo (Servo se enlaza contra la Mesa y la
-/// GStreamer del anfitrion y aqui no hay sysroot cruzado). Se copiaba a la
-/// rootfs del objetivo igual, y `verify::check_elf_machines` abortaba la
-/// imagen de aarch64 --- «es un ELF de x86_64 y la rootfs es de aarch64» ---,
-/// que es lo que se llevaba la mitad arm64 de `make release`.
-///
-/// Dos cosas, entonces, en un build cruzado: no instalar nada, y QUITAR la
-/// copia del arco equivocado que dejo un build anterior. La segunda importa
-/// tanto como la primera porque `rootfs/<arco>` se preserva entre builds: sin
-/// ella, un arbol que una vez construyo la imagen de arm64 seguiria
-/// enrojeciendo el verificador para siempre.
-#[test]
-fn un_build_cruzado_no_deja_silversurfer_del_anfitrion_en_la_rootfs() {
-    // El arco que NO es el del anfitrion, sea cual sea el anfitrion: en un
-    // anfitrion de aarch64 este test tiene que seguir probando un cruce, no
-    // caer al camino nativo y arrancar una compilacion de Servo.
-    let ajeno = if std::env::consts::ARCH == "aarch64" {
-        Arch::X86_64
-    } else {
-        Arch::Aarch64
-    };
-    let maquina_del_anfitrion = verify::expected_machine(
-        std::env::consts::ARCH
-            .parse::<Arch>()
-            .unwrap_or(Arch::X86_64),
-    );
-
-    let root = scratch("silversurfer-cruzado");
-    let usrbin = root.join("usr/bin").join("silversurfer");
-    let bin = root.join("bin").join("silversurfer");
-    elf64_de(maquina_del_anfitrion, &usrbin);
-    elf64_de(maquina_del_anfitrion, &bin);
-    // Y un vecino del arco bueno, para que se vea que no se barre el
-    // directorio entero: solo el binario del arco equivocado.
-    let vecino = root.join("usr/bin").join("algo-del-objetivo");
-    elf64_de(verify::expected_machine(ajeno), &vecino);
-
-    LinuxRootfs(ajeno, Variant::Minimal).install_silversurfer(&root);
-
-    assert!(
-        !usrbin.exists(),
-        "el silversurfer del anfitrion sigue en la rootfs de {}: el verificador \
-         abortara la imagen",
-        ajeno.name()
-    );
-    assert!(
-        !bin.exists(),
-        "la copia vieja de /bin sigue ahi, y el verificador la mira igual"
-    );
-    assert!(
-        vecino.exists(),
-        "se llevo por delante un binario del arco correcto"
-    );
-}
-
-/// Y que la decision se tome ANTES de compilar: un `make release` de arm64 que
-/// se pasara media hora construyendo Servo para el anfitrion y luego tirara el
-/// resultado seria el mismo fallo con mejor cara.
-#[test]
-fn el_cruce_se_decide_antes_de_compilar_servo() {
-    let src = include_str!("mod.rs");
-    let install = src
-        .split("fn install_silversurfer(&self, rootfs: &Path) {")
-        .nth(1)
-        .expect("install_silversurfer moved")
-        .split("\n    }\n")
-        .next()
-        .unwrap();
-    let (antes, _) = install
-        .split_once("if self.needs_cross_linker() {")
-        .expect("install_silversurfer ya no mira si el build es cruzado");
-    assert!(
-        !antes.contains("Ext::new(\"cargo\")"),
-        "la compilacion de SilverSurfer esta por encima de la comprobacion del \
-         arco: un build cruzado compilaria para el anfitrion y tiraria el binario"
-    );
-}
-
-/// Y en un build NATIVO: ahi lo que puede estar rancio no es solo la rootfs,
-/// es el arbol. `tools/SilverSurfer/target/release/` no lleva el arco en la
-/// ruta, asi que un binario de otro arbol --- o de este mismo antes de cambiar
-/// de anfitrion --- se reutilizaba por la mtime a secas. Con la puerta puesta,
-/// ese binario ya no se instala; sin esta limpieza, la copia del arco
-/// equivocado que hubiera en la rootfs se quedaba donde estaba y el
-/// verificador seguia abortando la imagen.
-#[test]
-fn las_copias_ajenas_se_quitan_tambien_en_un_build_nativo() {
-    let anfitrion = std::env::consts::ARCH
-        .parse::<Arch>()
-        .unwrap_or(Arch::X86_64);
-    let ajeno = if anfitrion.name() == "x86_64" {
-        Arch::Aarch64
-    } else {
-        Arch::X86_64
-    };
-
-    let root = scratch("silversurfer-nativo");
-    let usrbin = root.join("usr/bin").join("silversurfer");
-    let bin = root.join("bin").join("silversurfer");
-    elf64_de(verify::expected_machine(ajeno), &usrbin);
-    elf64_de(verify::expected_machine(ajeno), &bin);
-    let bueno = root.join("usr/bin").join("algo-del-objetivo");
-    elf64_de(verify::expected_machine(anfitrion), &bueno);
-
-    LinuxRootfs(anfitrion, Variant::Minimal).drop_foreign_silversurfer(&root);
-
-    assert!(
-        !usrbin.exists() && !bin.exists(),
-        "una copia del arco equivocado sobrevivio a un build nativo de {}",
-        anfitrion.name()
-    );
-    assert!(
-        bueno.exists(),
-        "se llevo por delante un binario del arco correcto"
-    );
-
-    // Y al contrario: el silversurfer del arco BUENO se queda. Un barrido a
-    // ciegas de esas dos rutas obligaria a recompilar Servo en cada tirada,
-    // que es media hora, y es la razon de que la limpieza mire el arco en vez
-    // de borrar por nombre.
-    let otra = scratch("silversurfer-nativo-bueno");
-    let suyo = otra.join("usr/bin").join("silversurfer");
-    elf64_de(verify::expected_machine(anfitrion), &suyo);
-    LinuxRootfs(anfitrion, Variant::Minimal).drop_foreign_silversurfer(&otra);
-    assert!(
-        suyo.exists(),
-        "la limpieza borro el silversurfer del arco bueno: la siguiente tirada \
-         se pasa media hora recompilando Servo"
-    );
-}
-
-/// Las dos puertas que faltaban en el camino nativo, y que no se pueden probar
-/// corriendo la funcion porque el camino nativo COMPILA SERVO:
-///
-/// - `needs_build` tiene que mirar el arco. Un binario del arco equivocado mas
-///   nuevo que las fuentes pasaba por al dia, no se reconstruia, y la puerta
-///   de la copia se quedaba sin nada que instalar.
-/// - el rescate de `/bin/silversurfer` tambien. Ese brazo lo alcanza ahora un
-///   `executable` rechazado por la puerta, asi que sin comprobar el arco
-///   ascendia a `usr/bin/` justo el binario que el verificador rechaza.
-#[test]
-fn el_camino_nativo_mira_el_arco_al_reconstruir_y_al_rescatar_de_bin() {
-    let src = include_str!("mod.rs");
-    let install = src
-        .split("fn install_silversurfer(&self, rootfs: &Path) {")
-        .nth(1)
-        .expect("install_silversurfer moved")
-        .split("\n    }\n")
-        .next()
-        .unwrap();
-    let junta = install.replace('\n', " ");
-    assert!(
-        junta.contains("let needs_build = !self.cached_for_target(&executable)"),
-        "`needs_build` no mira el arco: un binario del arco equivocado mas nuevo \
-         que las fuentes suprime la reconstruccion"
-    );
-    assert!(
-        junta.contains("stale.is_file() && self.cached_for_target(&stale)"),
-        "el rescate de /bin/silversurfer no mira el arco: ascenderia a usr/bin/ \
-         el binario que el verificador rechaza"
-    );
+    let mime = root.join("root/.config/mimeapps.list");
+    fs::create_dir_all(mime.parent().unwrap()).unwrap();
+    fs::write(
+        &mime,
+        "[Default Applications]\n\
+         image/png=swayimg.desktop\n\
+         text/html=silversurfer.desktop\n\
+         x-scheme-handler/https=silversurfer.desktop\n",
+    )
+    .unwrap();
+    drop_silversurfer(&root);
+    for leftover in [
+        "usr/bin/silversurfer",
+        "bin/silversurfer",
+        "usr/local/bin/eclipse-browser",
+    ] {
+        assert!(!root.join(leftover).exists(), "{leftover} survived");
+    }
+    assert!(!root
+        .join("root/.local/share/applications/silversurfer.desktop")
+        .exists());
+    let kept = fs::read_to_string(&mime).unwrap();
+    assert!(!kept.contains("silversurfer"));
+    assert!(kept.contains("image/png=swayimg.desktop"));
+    // Only the handler rows: with nothing else left the file goes.
+    fs::write(
+        &mime,
+        "[Default Applications]\ntext/html=silversurfer.desktop\n",
+    )
+    .unwrap();
+    drop_silversurfer(&root);
+    assert!(!mime.exists());
+    let _ = fs::remove_dir_all(&root);
 }

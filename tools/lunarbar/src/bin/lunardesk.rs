@@ -588,7 +588,7 @@ fn sample() -> (Vec<Win>, Vec<usize>) {
             w("firefox", "labwc - window switcher - Mozilla Firefox", true, false),
             w("org.gnome.TextEditor", "notas.txt - ~/Documentos", false, false),
             w("foot", "htop", false, true),
-            w("silversurfer", "Eclipse OS - inicio", false, false),
+            w("firefox", "Eclipse OS - inicio", false, false),
             w("gimp", "captura-2026-11-05-053112.png - GIMP", false, false),
             w("lunarhunter", "hunter - Resumen", false, false),
         ],

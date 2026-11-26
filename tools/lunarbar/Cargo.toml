@@ -34,10 +34,10 @@ libc = "0.2"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 embedded-graphics = "0.8"
 # The vector text face (DejaVu Sans Mono outlines as tiny-skia paths), shared
-# with lunarbg and SilverSurfer; see src/vtext.rs. Pure Rust, so the binaries
+# with lunarbg; see src/vtext.rs. Pure Rust, so the binaries
 # stay static; the bitmap face is the fallback.
 lunartext = { path = "../lunartext" }
-# The UI strings, in Spanish and English, shared with SilverSurfer and lunarbg
+# The UI strings, in Spanish and English, shared with lunarbg
 # (separate crates, so a module inside lunarbar could not serve them). Zero
 # dependencies of its own; see its Cargo.toml for why it is not gettext.
 eclipse-i18n = { path = "../eclipse-i18n" }

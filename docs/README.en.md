@@ -50,8 +50,7 @@ has a link at the top to switch language. The starting point is the
 ## Tools
 
 Every tool under `tools/` has its own README in both languages, for example
-[eclipse-bench](../tools/eclipse-bench/README.md),
-[SilverSurfer](../tools/SilverSurfer/README.en.md) or
+[eclipse-bench](../tools/eclipse-bench/README.md) or
 [Docker](../tools/docker/README.md). So do [rboot](../rboot/README.md) and the
 [prebuilt binaries](../prebuilt/README.md).
 

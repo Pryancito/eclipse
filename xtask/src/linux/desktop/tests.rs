@@ -2803,7 +2803,7 @@ fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
     // EVERY crate that links the strings, not just the first one: each is a
     // separate staleness check, and the one that is forgotten ships the old
     // text with nothing in any log to say so.
-    for crate_dir in ["lunarbar", "SilverSurfer"] {
+    for crate_dir in ["lunarbar"] {
         let toml = fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../tools/{crate_dir}/Cargo.toml")),
@@ -2833,9 +2833,9 @@ fn a_client_that_links_the_shared_strings_rebuilds_when_they_change() {
     // only way to catch the second crate being left out, since the first one
     // already satisfies the check above.
     assert!(
-        mod_rs.matches("eclipse_i18n_mtime()").count() >= 3,
+        mod_rs.matches("eclipse_i18n_mtime()").count() >= 2,
         "eclipse_i18n_mtime is not in every client's staleness check \
-         (lunarbar, lunarbg, silversurfer)"
+         (lunarbar, lunarbg)"
     );
 }
 
