@@ -3792,10 +3792,17 @@ fn blit_chunked(
 fn ce_try_in_order(
     mut try_one: impl FnMut(&Arc<dyn zcore_drivers::scheme::DrmScheme>) -> bool,
 ) -> bool {
+    // The cards a process drives (`udrv-nvidia`'s) are not in the kernel's
+    // device list; each takes its place by the same rule, after the
+    // kernel's own.
+    let served = crate::fs::devfs::served::card::served_snapshot();
+    let served = served.iter().flatten();
     let all = kernel_hal::drivers::all_drm();
     let all = all.as_vec();
     all.iter().filter(|d| d.is_console_gpu()).any(&mut try_one)
+        || served.clone().filter(|d| d.is_console_gpu()).any(&mut try_one)
         || all.iter().filter(|d| !d.is_console_gpu()).any(&mut try_one)
+        || served.filter(|d| !d.is_console_gpu()).any(&mut try_one)
 }
 
 /// FromDevice clflush of the CPU-mapped GEM span covering a scanout damage

@@ -77,6 +77,13 @@ pub mod op {
     pub const RENDER_FENCE: u32 = 92;
     /// `queued_fences` of handle `a`: a fence list.
     pub const QUEUED_FENCES: u32 = 93;
+    /// `ce_present` of `b` bytes at physical address `a`: 1 if the GPU's
+    /// copy engine copied them.
+    pub const CE_PRESENT: u32 = 94;
+    /// `ce_present_2d_pitched` from physical address `a` to scanout offset
+    /// `b`; the bytes are the source pitch, the scanout pitch, the bytes of
+    /// a row and the rows (u32 each).
+    pub const CE_PRESENT_2D: u32 = 95;
 }
 
 pub mod ioctl;
@@ -410,6 +417,15 @@ pub fn answer(
             found(gpu.hw_cursor_set(&argb, w, h))
         }
         op::HW_CURSOR_MOVE => found(gpu.hw_cursor_move(a as i32, b as i32)),
+        op::CE_PRESENT => found(gpu.ce_present(a, b)),
+        op::CE_PRESENT_2D => {
+            let (Some(src_pitch), Some(dst_pitch), Some(row_bytes), Some(rows)) =
+                (i.u32(), i.u32(), i.u32(), i.u32())
+            else {
+                return Err(EINVAL);
+            };
+            found(gpu.ce_present_2d_pitched(a, src_pitch, b, dst_pitch, row_bytes, rows))
+        }
         op::HW_CURSOR_HIDE => found(gpu.hw_cursor_hide()),
         op::POLL => found(gpu.poll_connectors()),
         op::EDID => {
@@ -701,14 +717,39 @@ impl<T: Transport> DrmScheme for Remote<T> {
         self.flag(Flags::BLOCK_LINEAR)
     }
 
-    /// Never, from a card in a process: `ce_present` and
-    /// `ce_present_2d_pitched` are not forwarded yet, so their defaults
-    /// (false) answered every frame. Saying ready only had the kernel turn CE
-    /// present on and then pay, per frame, the clflush and the repack into
-    /// staging for a copy that never happened, before the CPU blit it falls
-    /// back to anyway. The bit stays in [`Flags`] for when they are.
+    /// What the driver last said: a GPU of the process's whose RM is up
+    /// copies the frame with its copy engine ([`op::CE_PRESENT`]).
     fn ce_present_ready(&self) -> bool {
-        false
+        self.flag(Flags::CE_PRESENT_READY)
+    }
+
+    /// The copy is the process's GPU's: one call a frame, for the copy the
+    /// CPU would otherwise make of the whole frame.
+    fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
+        // A card that is not ready declines without a call: the kernel
+        // offers every frame to every card.
+        self.ce_present_ready() && self.yes(op::CE_PRESENT, src_sysmem_pa, size, &[])
+    }
+
+    fn ce_present_2d_pitched(
+        &self,
+        src_sysmem_pa: u64,
+        src_pitch: u32,
+        dst_byte_offset: u64,
+        dst_pitch: u32,
+        row_bytes: u32,
+        line_count: u32,
+    ) -> bool {
+        if !self.ce_present_ready() {
+            return false;
+        }
+        let mut data = Vec::new();
+        Out(&mut data)
+            .u32(src_pitch)
+            .u32(dst_pitch)
+            .u32(row_bytes)
+            .u32(line_count);
+        self.yes(op::CE_PRESENT_2D, src_sysmem_pa, dst_byte_offset, &data)
     }
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {

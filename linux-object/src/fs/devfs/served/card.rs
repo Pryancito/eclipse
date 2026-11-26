@@ -97,6 +97,19 @@ pub fn served_cards() -> Vec<Arc<dyn DrmScheme>> {
     CARDS.lock().clone()
 }
 
+/// The most cards [`served_snapshot`] holds.
+pub const SNAPSHOT_MAX: usize = 8;
+
+/// The cards processes drive now, without the heap: for the present path,
+/// which runs every frame and must not allocate.
+pub fn served_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
+    let mut snapshot: [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] = Default::default();
+    for (slot, card) in snapshot.iter_mut().zip(CARDS.lock().iter()) {
+        *slot = Some(card.clone());
+    }
+    snapshot
+}
+
 /// `card` is one a process drives, from now on.
 pub(crate) fn note_served(card: &Arc<dyn DrmScheme>) {
     let mut cards = CARDS.lock();

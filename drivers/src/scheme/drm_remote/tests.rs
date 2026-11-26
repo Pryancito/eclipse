@@ -16,6 +16,8 @@ struct Card {
     /// The last ioctl's (cmd, pid, file, arg), and what was told.
     asked: lock::Mutex<Option<(u32, u64, usize, usize)>>,
     told: lock::Mutex<Vec<(&'static str, u64)>>,
+    /// The last copy-engine present it was asked for, as its arguments.
+    copied: lock::Mutex<Option<[u64; 6]>>,
 }
 
 /// `DRM_IOCTL_NOUVEAU_EXEC`: `_IOWR('d', 0x52, struct drm_nouveau_exec)`.
@@ -92,6 +94,33 @@ impl DrmScheme for Card {
     fn hw_cursor_move(&self, x: i32, y: i32) -> bool {
         *self.cursor.lock() = Some((x, y));
         true
+    }
+    /// Ready with its RM up, as the flag says; copies whatever is not at 0.
+    fn ce_present_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+    fn ce_present(&self, src: u64, size: u64) -> bool {
+        *self.copied.lock() = Some([src, size, 0, 0, 0, 0]);
+        src != 0
+    }
+    fn ce_present_2d_pitched(
+        &self,
+        src: u64,
+        src_pitch: u32,
+        dst_off: u64,
+        dst_pitch: u32,
+        row_bytes: u32,
+        rows: u32,
+    ) -> bool {
+        *self.copied.lock() = Some([
+            src,
+            src_pitch as u64,
+            dst_off,
+            dst_pitch as u64,
+            row_bytes as u64,
+            rows as u64,
+        ]);
+        src != 0
     }
     fn wait_vblank(&self, crtc: u32) -> bool {
         crtc == 40
@@ -702,4 +731,40 @@ fn the_driver_s_fences_reach_the_kernel_where_the_kernel_maps_them() {
     let gone = Remote::with_hello(Gone, &hello(&Card::default())).unwrap();
     assert!(gone.cpu_prep_fences(7, 33).is_empty());
     assert!(gone.queued_fences(7).is_empty());
+}
+
+/// A frame the kernel would copy is the driver's GPU's to copy, flat or
+/// pitched, with every argument as the kernel gave it; and the card says
+/// it is ready to only once the driver does.
+#[test]
+fn a_present_reaches_the_driver_s_copy_engine() {
+    let (card, remote) = pair();
+    assert!(!remote.ce_present_ready());
+    assert!(
+        !remote.ce_present(0x1000, 4096),
+        "not ready: not even asked"
+    );
+    assert_eq!(*card.copied.lock(), None);
+    card.ready.store(true, Ordering::Relaxed);
+    remote.refresh();
+    assert!(remote.ce_present_ready());
+
+    assert!(remote.ce_present(0x1_2345_6000, 8 << 20));
+    assert_eq!(
+        *card.copied.lock(),
+        Some([0x1_2345_6000, 8 << 20, 0, 0, 0, 0])
+    );
+    assert!(!remote.ce_present(0, 4096), "the driver's no");
+
+    assert!(remote.ce_present_2d_pitched(0x8000_0000, 5504, 0x40_1000, 8192, 4096, 720));
+    assert_eq!(
+        *card.copied.lock(),
+        Some([0x8000_0000, 5504, 0x40_1000, 8192, 4096, 720])
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        answer(&*card, op::CE_PRESENT_2D, 1, 0, &[0; 12], &mut out),
+        Err(EINVAL),
+        "a row count short"
+    );
 }
