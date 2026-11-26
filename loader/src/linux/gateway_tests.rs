@@ -1172,10 +1172,96 @@ fn the_gem_table_takes_a_gpu_holder_at_its_word_on_its_own(
         gem(driver, wire::LOOKUP_BY_PHYS_WITHIN, phys + 16, 0, 0, 0, 0),
         h as isize
     );
+    let left = the_syncobj_table_reads_only_a_gpu_holder_s_own_memory(driver, other, phys);
     // Gone: its objects leave the table.
     driver.exit(0);
     eventually("its objects leave the table", || {
         gem_mmap::lookup(base).is_none()
     });
     assert!(!gem_mmap::is_device_memory(base + 2));
+    // And the fence it left in flight is let go.
+    use kernel_hal::drivers::scheme::syncobj;
+    eventually("its fence is abandoned", || syncobj::query(left) == Some(1));
+    syncobj::destroy(left);
+}
+
+/// `eclipse_syncobj`, for the holder of a GPU: fences in memory it pinned,
+/// on the kernel's syncobjs, and its own channels told apart from every
+/// other driver's. What it leaves in flight: the handle of a fence that
+/// never lands.
+fn the_syncobj_table_reads_only_a_gpu_holder_s_own_memory(
+    driver: &Arc<Process>,
+    other: &Arc<Process>,
+    phys: u64,
+) -> u32 {
+    use super::syncobj_serve::ECLIPSE_SYNCOBJ;
+    use kernel_hal::drivers::scheme::syncobj::{self, wire};
+    let sync = |proc: &Arc<Process>, op: u32, inp: &[u64], out: &mut [u64]| {
+        call(
+            proc,
+            ECLIPSE_SYNCOBJ,
+            [
+                op as usize,
+                inp.as_ptr() as usize,
+                inp.len(),
+                out.as_mut_ptr() as usize,
+                out.len(),
+                0,
+            ],
+        )
+    };
+    let page = kernel_hal::PAGE_SIZE as u64;
+    let zone = kernel_hal::mem::phys_to_virt(phys as usize + 64) as *mut u32;
+    // SAFETY: the driver's pinned page, which the test writes as the GPU
+    // would.
+    let land = |v: u32| unsafe { core::ptr::write_volatile(zone, v) };
+    land(0);
+    let h = syncobj::create(false);
+    let attach = |proc: &Arc<Process>, phys: u64, payload: u64, ctx: u64| {
+        sync(
+            proc,
+            wire::ATTACH,
+            &[h as u64, 1, phys, 0x1000, payload, ctx, 1],
+            &mut [],
+        )
+    };
+    // Only a GPU's holder, and only memory it pinned.
+    assert_eq!(attach(other, phys + 64, 5, 3), zx(ZxError::ACCESS_DENIED));
+    assert_eq!(
+        attach(driver, phys + 2 * page, 5, 3),
+        zx(ZxError::ACCESS_DENIED)
+    );
+    assert_eq!(attach(driver, phys + 66, 5, 3), zx(ZxError::ACCESS_DENIED));
+    assert_eq!(
+        attach(driver, phys + 64, 5, 1 << 16),
+        zx(ZxError::INVALID_ARGS)
+    );
+    assert_eq!(attach(driver, phys + 64, 5, 3), 1);
+    // Its fence, as it named it; the kernel's ctx is told apart.
+    let mut out = [0u64; 8];
+    assert_eq!(sync(driver, wire::PENDING_HW, &[h as u64, 1], &mut out), 1);
+    assert_eq!(out[..4], [phys + 64, 0x1000, 5, 3]);
+    let kernel = syncobj::pending_hw_fences(h, 1);
+    assert_eq!(kernel.len(), 1);
+    assert_ne!(kernel[0].3, 3, "a served ctx is never a kernel driver's");
+    // Waiting is the driver's: the kernel only says whether it is over.
+    let mut ready = alloc::vec![1u64];
+    ready.extend(wire::waits(&[h], None));
+    assert_eq!(sync(driver, wire::WAIT_READY, &ready, &mut []), 0);
+    land(5);
+    assert_eq!(sync(driver, wire::POLL_PENDING, &[], &mut []), 0);
+    assert_eq!(sync(driver, wire::WAIT_READY, &ready, &mut []), 1);
+    assert_eq!(syncobj::query(h), Some(1));
+    // A line of the table, in words.
+    let mut line = [0u64; 8];
+    let len = sync(driver, wire::DESCRIBE, &wire::waits(&[h], None), &mut line);
+    assert!(len > 0);
+    let text = wire::bytes_of_words(&line, len as usize);
+    assert!(core::str::from_utf8(&text).unwrap().contains("/1"));
+    // One more, that never lands: the driver dies first.
+    land(0);
+    syncobj::reset(h);
+    assert_eq!(attach(driver, phys + 64, 9, 3), 1);
+    assert_eq!(syncobj::query(h), Some(0));
+    h
 }

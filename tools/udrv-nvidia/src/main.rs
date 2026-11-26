@@ -19,6 +19,7 @@ mod gpu;
 mod mapper;
 mod platform;
 mod ports;
+mod syncobj;
 
 use std::process::exit;
 
@@ -341,5 +342,69 @@ fn check(vendor: u16, device: u16) {
         "its last reference closed, it leaves the table",
         gem_mmap::dec_ref(h, pid) == DecRef::Freed && gem_mmap::lookup(h).is_none(),
     );
+    syncobj_check(dma as u64, size, ok);
     println!("{NAME}: check: ok");
+}
+
+/// The fences the driver attaches are in the kernel's table, and only in
+/// memory that is its own (`size` bytes of DMA memory at `dma`). There is
+/// no client here to make a syncobj, so the handle is one the table does
+/// not have: the kernel takes the fence's memory and answers that.
+fn syncobj_check(dma: u64, size: u64, ok: impl Fn(&str, bool)) {
+    use zcore_drivers::scheme::syncobj::{self, wire, WaitOutcome};
+    extern "C" {
+        fn drivers_syncobj(
+            op: u32,
+            inp: *const u64,
+            in_len: usize,
+            out: *mut u64,
+            out_len: usize,
+        ) -> i64;
+        fn drivers_timer_now_as_micros() -> u64;
+    }
+    let attach = |phys: u64| {
+        let inp = [0, 1, phys, 0, 5, 3, 1];
+        // SAFETY: seven words in, none out.
+        unsafe {
+            drivers_syncobj(
+                wire::ATTACH,
+                inp.as_ptr(),
+                inp.len(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+    };
+    ok(
+        "a fence in its DMA memory is taken by the kernel's table",
+        attach(dma + 64) == 0,
+    );
+    ok(
+        "...and one in memory that is not its own is refused",
+        attach(dma + size) == -(libc::EPERM as i64),
+    );
+    ok(
+        "the kernel's table answers the driver's calls",
+        syncobj::pending_hw_fences(0, 1).is_empty()
+            && !syncobj::timeline_signal(0, 1)
+            && syncobj::describe(&[0], None).contains("/-1"),
+    );
+    // SAFETY: the process's clock.
+    let soon = unsafe { drivers_timer_now_as_micros() } + 1_000;
+    let t = std::time::Instant::now();
+    let r = syncobj::wait(&[0], None, true, soon);
+    println!(
+        "{NAME}: a wait on a handle the table lacks: {:.1} us",
+        t.elapsed().as_secs_f64() * 1e6
+    );
+    ok("a wait on it is invalid", matches!(r, WaitOutcome::Invalid));
+    let t = std::time::Instant::now();
+    const N: u32 = 200;
+    for _ in 0..N {
+        syncobj::poll_pending();
+    }
+    println!(
+        "{NAME}: poll_pending through the kernel: {:.1} us",
+        t.elapsed().as_secs_f64() * 1e6 / N as f64
+    );
 }

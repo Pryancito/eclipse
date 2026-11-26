@@ -49,6 +49,7 @@ pub mod nr {
     pub const ECLIPSE_DEVICE_PCI_FN: i64 = 0x4015;
     pub const ECLIPSE_DRM_SERVE: i64 = 0x4016;
     pub const ECLIPSE_GEM: i64 = 0x4017;
+    pub const ECLIPSE_SYNCOBJ: i64 = 0x4018;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.
@@ -59,6 +60,7 @@ impl Status {
     pub const INTERNAL_INTR_RETRY: Status = Status(-6);
     pub const NOT_SUPPORTED: Status = Status(-2);
     pub const NO_MEMORY: Status = Status(-4);
+    pub const NO_RESOURCES: Status = Status(-3);
     pub const INVALID_ARGS: Status = Status(-10);
     pub const OUT_OF_RANGE: Status = Status(-14);
     pub const TIMED_OUT: Status = Status(-21);

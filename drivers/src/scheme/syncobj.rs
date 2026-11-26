@@ -38,9 +38,22 @@
 //! inode path itself, but `sys_ioctl` now sleeps first for
 //! `SYNCOBJ_WAIT`/`TIMELINE_WAIT` the same way it does for `WAIT_VBLANK`.
 
+// A driver in a process keeps its fences in the kernel's table, not in one
+// of its own: the calls it makes are the kernel's (`remote`), and the rest
+// of this table is the kernel's alone.
+#![cfg_attr(feature = "process", allow(dead_code, unused_imports))]
+
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use lock::Mutex;
+
+/// The calls of the table as a driver in a process makes them.
+pub mod wire;
+
+#[cfg(feature = "process")]
+pub(crate) mod remote;
+#[cfg(feature = "process")]
+pub use remote::*;
 
 struct Syncobj {
     handle: u32,
@@ -651,16 +664,31 @@ static SIGNAL_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// [`FENCE_TIMEOUT_US`]: `(ctx_idx, fence_va, payload, handle, point)`. The
 /// GPU driver registers it to latch the context wedged and capture its
 /// hang probe -- the work its synchronous EXEC used to do inline.
-static FENCE_TIMEOUT_HOOK: AtomicUsize = AtomicUsize::new(0);
+///
+/// Two slots: the kernel's own GPU driver registers one, and the gateway of
+/// a driver in a process the other, for the fences that driver attached.
+static FENCE_TIMEOUT_HOOK: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 /// Register the point-advance upcall (see [`SIGNAL_HOOK`]). Called once at boot.
+#[cfg(not(feature = "process"))]
 pub fn set_signal_hook(f: fn(u32, u64)) {
     SIGNAL_HOOK.store(f as usize, Ordering::SeqCst);
 }
 
 /// Register the fence-timeout upcall (see [`FENCE_TIMEOUT_HOOK`]).
+#[cfg(not(feature = "process"))]
+/// Registering the same hook again keeps one copy of it; a third one is
+/// not registered.
 pub fn set_fence_timeout_hook(f: fn(u32, usize, u32, u32, u64)) {
-    FENCE_TIMEOUT_HOOK.store(f as usize, Ordering::SeqCst);
+    let f = f as usize;
+    for slot in &FENCE_TIMEOUT_HOOK {
+        match slot.compare_exchange(0, f, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(held) if held == f => return,
+            Err(_) => {}
+        }
+    }
+    log::warn!("[syncobj] no slot left for a fence-timeout hook");
 }
 
 /// Fire the point-advance upcall, if one is registered. Must be called with the
@@ -946,6 +974,7 @@ static FENCE_LATENCY_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic:
 
 /// One line of cumulative syncobj statistics (waits, spin time, hardware
 /// fence latency) for the GPU driver's `/proc/gpudbg` profile section.
+#[cfg(not(feature = "process"))]
 pub fn stats_line() -> alloc::string::String {
     let calls = WAIT_CALLS.load(Ordering::Relaxed);
     let landed = FENCES_LANDED.load(Ordering::Relaxed);
@@ -990,12 +1019,14 @@ impl Deferred {
         for (h, p) in self.notify {
             notify_signal(h, p);
         }
-        let hook = FENCE_TIMEOUT_HOOK.load(Ordering::Relaxed);
         for f in self.timed_out {
-            if hook != 0 {
-                // SAFETY: stored by `set_fence_timeout_hook` from this type.
-                let cb: fn(u32, usize, u32, u32, u64) = unsafe { core::mem::transmute(hook) };
-                cb(f.ctx_idx, f.fence_va, f.payload, f.handle, f.point);
+            for slot in &FENCE_TIMEOUT_HOOK {
+                let hook = slot.load(Ordering::Relaxed);
+                if hook != 0 {
+                    // SAFETY: stored by `set_fence_timeout_hook` from this type.
+                    let cb: fn(u32, usize, u32, u32, u64) = unsafe { core::mem::transmute(hook) };
+                    cb(f.ctx_idx, f.fence_va, f.payload, f.handle, f.point);
+                }
             }
         }
     }
@@ -1221,6 +1252,7 @@ fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
 
 /// Resolve pending hardware fences now. Returns how many are still pending.
 /// Cheap when nothing is pending (one relaxed load, no lock).
+#[cfg(not(feature = "process"))]
 pub fn poll_pending() -> usize {
     if PENDING_COUNT.load(Ordering::Relaxed) == 0 {
         return 0;
@@ -1235,6 +1267,7 @@ pub fn poll_pending() -> usize {
 }
 
 /// Whether any hardware fence is still pending (lock-free).
+#[cfg(not(feature = "process"))]
 pub fn has_pending() -> bool {
     PENDING_COUNT.load(Ordering::Relaxed) != 0
 }
@@ -1262,6 +1295,7 @@ pub fn has_pending() -> bool {
 ///   userspace has already driven past 1 as a timeline takes the timeline
 ///   branch instead, fence and all, so a stray binary signal cannot un-signal
 ///   it or discard the timeline fences still in flight on it.
+#[cfg(not(feature = "process"))]
 pub fn attach_hw_fence(
     handle: u32,
     point: u64,
@@ -1363,13 +1397,23 @@ pub fn attach_hw_fence(
 /// channel's fences would be (signaled, so a compositor waiting on a dead
 /// client's buffer moves on) without invoking the timeout hook. Returns how
 /// many were abandoned.
+#[cfg(not(feature = "process"))]
 pub fn abandon_fences(fence_va: usize) -> usize {
+    abandon_fences_where(|va, _| va == fence_va)
+}
+
+/// [`abandon_fences`] for every fence whose `(fence_va, ctx_idx)` `which`
+/// names: the fences of a driver in a process that is gone, whose landing
+/// zones are about to be no one's.
+#[cfg(not(feature = "process"))]
+pub fn abandon_fences_where(which: impl Fn(usize, u32) -> bool) -> usize {
     let notify = {
         let mut table = TABLE.lock();
         let mut notify = Vec::new();
         let mut i = 0;
         while i < table.pending.len() {
-            if table.pending[i].fence_va != fence_va {
+            let f = &table.pending[i];
+            if !which(f.fence_va, f.ctx_idx) {
                 i += 1;
                 continue;
             }
@@ -1408,6 +1452,7 @@ pub fn table_len() -> usize {
 
 /// Creates a syncobj, initially at point 0 (or 1 if `signaled`). Returns the
 /// new handle.
+#[cfg(not(feature = "process"))]
 pub fn create(signaled: bool) -> u32 {
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     TABLE.lock().objects.push(Syncobj {
@@ -1422,6 +1467,7 @@ pub fn create(signaled: bool) -> u32 {
 
 /// Adds one reference to `handle` (an fd export / `dup`). Returns `false` if
 /// the handle is unknown.
+#[cfg(not(feature = "process"))]
 pub fn add_ref(handle: u32) -> bool {
     let mut table = TABLE.lock();
     let Some(obj) = table
@@ -1438,6 +1484,7 @@ pub fn add_ref(handle: u32) -> bool {
 /// Drops one reference to `handle`. If other refs remain the object stays;
 /// only the last reference removes it (and its pending fences). Returns
 /// `false` if `handle` is unknown.
+#[cfg(not(feature = "process"))]
 pub fn destroy(handle: u32) -> bool {
     let notify = {
         let mut table = TABLE.lock();
@@ -1525,6 +1572,7 @@ fn destroy_locked(table: &mut SyncobjTable, handle: u32) -> Option<Vec<(u32, u64
 /// recorded as `pid`'s so that [`release_owner`] can drop it when the
 /// process dies. A `pid` of 0 (no process: the kernel, or a test) records
 /// nothing, as [`create`] does.
+#[cfg(not(feature = "process"))]
 pub fn create_for(pid: u64, signaled: bool) -> u32 {
     let handle = create(signaled);
     if pid != 0 {
@@ -1538,6 +1586,7 @@ pub fn create_for(pid: u64, signaled: bool) -> u32 {
 
 /// An opaque `SYNCOBJ_FD_TO_HANDLE` by process `pid`: [`add_ref`], with the
 /// new reference recorded as `pid`'s. A `pid` of 0 records nothing.
+#[cfg(not(feature = "process"))]
 pub fn add_ref_for(pid: u64, handle: u32) -> bool {
     let mut table = TABLE.lock();
     let Some(obj) = table
@@ -1561,6 +1610,7 @@ pub fn add_ref_for(pid: u64, handle: u32) -> bool {
 /// process's table (Linux), and a client that guesses the compositor's
 /// handle numbers must not be able to free its timelines. A `pid` of 0
 /// destroys as the kernel would ([`destroy`]).
+#[cfg(not(feature = "process"))]
 pub fn destroy_for(pid: u64, handle: u32) -> bool {
     if pid == 0 {
         return destroy(handle);
@@ -1594,6 +1644,7 @@ pub fn destroy_for(pid: u64, handle: u32) -> bool {
 /// otherwise). Returns how many references were given back. Without this a
 /// crashed or killed client's syncobjs stayed in the table for the rest of
 /// the boot, and every lookup walks that table.
+#[cfg(not(feature = "process"))]
 pub fn release_owner(pid: u64) -> usize {
     if pid == 0 {
         return 0;
@@ -1623,6 +1674,7 @@ pub fn release_owner(pid: u64) -> usize {
 }
 
 /// Whether process `pid` holds a reference on `handle`.
+#[cfg(not(feature = "process"))]
 pub fn held_by(pid: u64, handle: u32) -> bool {
     TABLE
         .lock()
@@ -1643,6 +1695,7 @@ pub fn held_by(pid: u64, handle: u32) -> bool {
 /// live handle. Before this, `destroy` was the only ioctl that asked, and
 /// a client guessing the compositor's handle numbers could signal its
 /// release timelines early, reset its acquire fences, or wait on them.
+#[cfg(not(feature = "process"))]
 pub fn usable_by(pid: u64, handle: u32) -> bool {
     all_usable_by(pid, &[handle])
 }
@@ -1650,6 +1703,7 @@ pub fn usable_by(pid: u64, handle: u32) -> bool {
 /// [`usable_by`] for a whole handle array, in ONE take of the lock: the
 /// array lookup Linux does first (`drm_syncobj_array_find`), so an ioctl
 /// over `[good, bad]` touches neither.
+#[cfg(not(feature = "process"))]
 pub fn all_usable_by(pid: u64, handles: &[u32]) -> bool {
     first_unusable_by(pid, handles.iter().copied()).is_none()
 }
@@ -1666,6 +1720,7 @@ pub fn all_usable_by(pid: u64, handles: &[u32]) -> bool {
 /// syncs of its own, so a real Vulkan client paid 512 round-trips through the
 /// lock the signalling side is waiting for, per submit, before anything was
 /// submitted at all. `glxgears` carries one or two and never showed it.
+#[cfg(not(feature = "process"))]
 pub fn first_unusable_by(pid: u64, handles: impl IntoIterator<Item = u32>) -> Option<u32> {
     let table = TABLE.lock();
     handles.into_iter().find(|&h| {
@@ -1685,6 +1740,7 @@ pub fn first_unusable_by(pid: u64, handles: impl IntoIterator<Item = u32>) -> Op
 /// own, and the ones behind its link are returned, one per source still in
 /// flight ([`fences_through_link`]). Empty means nothing to acquire: either
 /// nothing is owed, or a source has nothing submitted yet.
+#[cfg(not(feature = "process"))]
 pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64, u32, u32)> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
@@ -1759,6 +1815,7 @@ fn has_fence_locked(table: &SyncobjTable, handle: u32, target: u64) -> bool {
 /// one, which the ioctl answers with EINVAL at once; a wait that simply
 /// ran to its deadline on such a handle (as this did) is ETIME or EIO,
 /// the codes for "the fence exists and has not signaled".
+#[cfg(not(feature = "process"))]
 pub fn without_fence(handles: &[u32], points: Option<&[u64]>) -> Option<usize> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
@@ -1774,6 +1831,7 @@ pub fn without_fence(handles: &[u32], points: Option<&[u64]>) -> Option<usize> {
 }
 
 /// Binary signal (point = 1). Returns `false` if `handle` is unknown.
+#[cfg(not(feature = "process"))]
 pub fn signal(handle: u32) -> bool {
     timeline_signal(handle, 1)
 }
@@ -1783,6 +1841,7 @@ pub fn signal(handle: u32) -> bool {
 /// `sig` list). Monotonic: never moves the point backwards, matching real
 /// `drm_syncobj` semantics (a stale/reordered signal can't un-signal a
 /// later one). Returns `false` if `handle` is unknown.
+#[cfg(not(feature = "process"))]
 pub fn timeline_signal(handle: u32, point: u64) -> bool {
     let (new_point, deferred) = {
         let mut table = TABLE.lock();
@@ -1845,6 +1904,7 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
 /// instead refuses to export a fence-less syncobj with EINVAL; accepting it
 /// as the next-signal fence is the closer fit here, where "attached but
 /// unsignaled" and "no fence" are the same state.)
+#[cfg(not(feature = "process"))]
 pub fn export_snapshot(handle: u32) -> Option<u64> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
@@ -1880,6 +1940,7 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
 /// source's next signal when it has none (Linux refuses that export;
 /// [`export_snapshot`] explains why it is accepted here). `None` for an
 /// unknown handle.
+#[cfg(not(feature = "process"))]
 pub fn export_fence(handle: u32) -> Option<u32> {
     let point = export_snapshot(handle)?;
     let carrier = create(false);
@@ -1898,6 +1959,7 @@ pub fn export_fence(handle: u32) -> Option<u32> {
 /// case, see [`export_snapshot`]); otherwise the dependency is recorded and
 /// resolves on its own as `src` advances, so a waiter never has to know an
 /// import happened.
+#[cfg(not(feature = "process"))]
 pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
     let (advanced, deferred) = {
         let mut table = TABLE.lock();
@@ -1977,6 +2039,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
 /// resolves on its own as `src` catches up, carrying `dst_point` with it: a
 /// still-pending software timeline→timeline transfer reaches exactly the point
 /// that was asked for, the way `drm_syncobj_add_point` does.
+#[cfg(not(feature = "process"))]
 pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
     let (outcome, deferred) = {
         let mut table = TABLE.lock();
@@ -2153,6 +2216,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
 /// each exported as a sync_file and merged. Without the ioctl the acquire
 /// fails, and zink kills the GLX swapchain after the first `image_count`
 /// frames -- a window that opens and closes in under a second.
+#[cfg(not(feature = "process"))]
 pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let deferred = {
@@ -2221,6 +2285,7 @@ pub struct HwFence {
 /// the merge names it ([`destroy`]'s orphan rule), so nothing has to own it,
 /// and one that has landed already is simply not a dependency. The one
 /// reference of the merged object is the caller's to `destroy`.
+#[cfg(not(feature = "process"))]
 pub fn bundle_fence(hw: &[HwFence], deps: &[(u32, u64)]) -> u32 {
     let mut sources: Vec<(u32, u64)> = Vec::with_capacity(hw.len() + deps.len());
     let mut own: Vec<u32> = Vec::with_capacity(hw.len());
@@ -2250,6 +2315,7 @@ pub fn bundle_fence(hw: &[HwFence], deps: &[(u32, u64)]) -> u32 {
 /// Resets a syncobj to point 0 (`SYNCOBJ_RESET`). Returns `false` if
 /// `handle` is unknown. Drops any pending hardware fence it carried (the
 /// fence is replaced, as in Linux).
+#[cfg(not(feature = "process"))]
 pub fn reset(handle: u32) -> bool {
     let deferred = {
         let mut table = TABLE.lock();
@@ -2294,6 +2360,7 @@ pub fn reset(handle: u32) -> bool {
 /// sig handle before it queues anything (`drm_syncobj_find` in Linux). A
 /// plain lookup, on purpose: unlike [`query`] it resolves no landed fence,
 /// so refusing a bad list changes nothing about the good handles in it.
+#[cfg(not(feature = "process"))]
 pub fn exists(handle: u32) -> bool {
     TABLE.lock().objects.iter().any(|o| o.handle == handle)
 }
@@ -2305,6 +2372,7 @@ pub fn exists(handle: u32) -> bool {
 /// release it waited for never happened, and its EXEC contract for that is
 /// EIO, not a push behind a buffer nobody let go of. A point of 0 is the
 /// binary fence, as everywhere else.
+#[cfg(not(feature = "process"))]
 pub fn reached_by_timeout(handles: &[u32], points: Option<&[u64]>) -> bool {
     let (r, deferred) = {
         let mut table = TABLE.lock();
@@ -2321,6 +2389,7 @@ pub fn reached_by_timeout(handles: &[u32], points: Option<&[u64]>) -> bool {
 
 /// Current timeline point (`SYNCOBJ_QUERY`), or `None` if `handle` is
 /// unknown. Signaled point only — not in-flight hardware fences.
+#[cfg(not(feature = "process"))]
 pub fn query(handle: u32) -> Option<u64> {
     query_inner(handle, false)
 }
@@ -2329,6 +2398,7 @@ pub fn query(handle: u32) -> Option<u64> {
 /// signaled counter, or the highest pending hardware fence, whichever is
 /// larger. EXEC's fast path attaches a fence and returns without waiting;
 /// NVK then queries this to learn the timeline value of that submit.
+#[cfg(not(feature = "process"))]
 pub fn query_submitted(handle: u32) -> Option<u64> {
     query_inner(handle, true)
 }
@@ -2387,6 +2457,7 @@ pub enum WaitOutcome {
 /// (binary `SYNCOBJ_WAIT`). After the async pre-wait in `sys_ioctl`, this
 /// normally returns on the first iteration; the loop is the fallback when
 /// called without that sleep (e.g. EXEC's CPU wait path).
+#[cfg(not(feature = "process"))]
 pub fn wait(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -2399,6 +2470,7 @@ pub fn wait(
 /// [`wait`] but `WAIT_AVAILABLE`: a pending hardware fence that covers the
 /// target counts as satisfied (fence submitted, not necessarily signaled),
 /// through a link as well ([`submitted_locked`]).
+#[cfg(not(feature = "process"))]
 pub fn wait_available(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -2416,6 +2488,7 @@ pub fn wait_available(
 /// own or every one behind its link ([`fences_through_link`]). Fences on other
 /// channels (another process's work) are still waited for on the CPU. The
 /// syncobj itself stays pending until the fence really lands.
+#[cfg(not(feature = "process"))]
 pub fn wait_ordered(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -2432,6 +2505,7 @@ pub fn wait_ordered(
 /// - `Some(Err(WaitOutcome::Timeout))` if past `deadline_us` and still unmet
 /// - `Some(Err(WaitOutcome::Invalid))` if a handle is unknown
 /// - `None` if the caller should sleep (~1 ms or until the deadline) and retry
+#[cfg(not(feature = "process"))]
 pub fn wait_ready(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -2443,6 +2517,7 @@ pub fn wait_ready(
 
 /// [`wait_ready`] with `WAIT_AVAILABLE`: a pending hardware fence covering the
 /// target counts as satisfied.
+#[cfg(not(feature = "process"))]
 pub fn wait_available_ready(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -2740,6 +2815,7 @@ fn stall_report_number(budget: &AtomicU32) -> Option<u32> {
 /// stall reporter above, and the driver's own `EXEC` timeout, whose 10 s
 /// deadline expires long after this reporter's 2 s threshold and used to
 /// report nothing but a count.
+#[cfg(not(feature = "process"))]
 pub fn describe(handles: &[u32], points: Option<&[u64]>) -> alloc::string::String {
     let mut list = alloc::string::String::new();
     let table = TABLE.lock();
