@@ -103,6 +103,12 @@ impl DrmScheme for Card {
         *self.copied.lock() = Some([src, size, 0, 0, 0, 0]);
         src != 0
     }
+    fn deferred_console_bringup(&self) -> String {
+        String::from("console GPU 17:00.0: RM up")
+    }
+    fn build_console_gr_ladder(&self) -> String {
+        String::from("console GPU 17:00.0: GR ladder built")
+    }
     fn ce_present_2d_pitched(
         &self,
         src: u64,
@@ -766,5 +772,18 @@ fn a_present_reaches_the_driver_s_copy_engine() {
         answer(&*card, op::CE_PRESENT_2D, 1, 0, &[0; 12], &mut out),
         Err(EINVAL),
         "a row count short"
+    );
+}
+
+#[test]
+fn the_console_gpu_of_a_process_is_brought_up_through_the_link() {
+    let (_card, remote) = pair();
+    assert_eq!(
+        remote.deferred_console_bringup(),
+        "console GPU 17:00.0: RM up"
+    );
+    assert_eq!(
+        remote.build_console_gr_ladder(),
+        "console GPU 17:00.0: GR ladder built"
     );
 }
