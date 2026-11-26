@@ -125,6 +125,23 @@ pub fn kick_hdmi_audio() {
     nvidia::NvidiaGpu::kick_hdmi_audio_all();
 }
 
+/// How many times a driver of the monitor's GPU has turned up since boot:
+/// a process that starts to serve the GPUs' RM counts one. The HDA driver
+/// kicks HDMI/DP audio again when this moves under a running stream, whose
+/// first kick (at its start) found nobody to tell.
+static DISPLAY_DRIVERS_ARRIVED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// A driver of the monitor's GPU turned up ([`display_drivers_arrived`]).
+pub fn note_display_driver_arrived() {
+    DISPLAY_DRIVERS_ARRIVED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+/// See [`DISPLAY_DRIVERS_ARRIVED`].
+pub fn display_drivers_arrived() -> u64 {
+    DISPLAY_DRIVERS_ARRIVED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Whether this NVIDIA HDA function (`bus:dev.1`) belongs to the GPU that
 /// scans out the GOP framebuffer. Extra GPUs are left unbound, like Linux
 /// leaving their HDMI pins without ELD. Always `true` off x86_64 (no NVIDIA

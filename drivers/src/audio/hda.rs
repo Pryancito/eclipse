@@ -712,6 +712,10 @@ struct HdaInner {
     /// `timer_now_as_micros()` at the last `kick_hdmi_audio` asked for by the
     /// write path, for [`HDMI_KICK_MIN_US`]. 0 = never.
     last_kick_us: u64,
+    /// [`crate::display::display_drivers_arrived`] at that kick: when it
+    /// moves, a running stream kicks once more, for the driver that came
+    /// after its start.
+    kick_drivers: u64,
 
     /// `WALCLK` when the current stream started.
     stream_start_wall: u32,
@@ -2583,6 +2587,7 @@ impl HdaInner {
             last_reroute: (0, 0, 0),
             sense_probe: Vec::new(),
             last_kick_us: 0,
+            kick_drivers: 0,
             stream_start_wall: 0,
             stream_start_us: 0,
             stops: [StopEvent::default(); STOP_HISTORY],
@@ -2883,9 +2888,12 @@ impl AudioScheme for HdaStream {
             let now = timer_now_as_micros();
             let due =
                 inner.last_kick_us == 0 || now.wrapping_sub(inner.last_kick_us) >= HDMI_KICK_MIN_US;
-            let kick = due && !inner.running && inner.digital && !inner.active_pin_live();
+            let drivers = crate::display::display_drivers_arrived();
+            let fresh = !inner.running || drivers != inner.kick_drivers;
+            let kick = due && fresh && inner.digital && !inner.active_pin_live();
             if kick {
                 inner.last_kick_us = now;
+                inner.kick_drivers = drivers;
             }
             kick
         };
