@@ -640,6 +640,17 @@ impl Evdev {
             bytes.push(0);
             give(data, &bytes)
         };
+        // The kernel sizes `data` from the command alone, which the program
+        // wrote: `EVIOCGVERSION` with a size of 0 comes with no bytes at
+        // all. Linux answers such a call EINVAL too.
+        let fixed = match nr {
+            0x01 => 4,
+            0x02 | 0x03 => 8,
+            _ => 0,
+        };
+        if size < fixed || data.len() < fixed {
+            return Err(EINVAL);
+        }
         match nr {
             0x01 => {
                 data[..4].copy_from_slice(&VERSION.to_ne_bytes());
