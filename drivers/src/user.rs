@@ -462,6 +462,16 @@ impl UserDevice {
         }
     }
 
+    /// Whether this is the GPU whose memory BAR holds the boot (UEFI)
+    /// framebuffer: the one the screen shows, reset or not.
+    pub fn holds_boot_framebuffer(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        let fb = crate::display::boot_fb_info().map(|(phys, ..)| phys as usize);
+        #[cfg(not(target_arch = "x86_64"))]
+        let fb: Option<usize> = None;
+        self.kind == NVIDIA && bars_hold(self.pci.as_ref(), fb)
+    }
+
     /// Reset an NVIDIA GPU left to userspace (PCIe FLR) before a warm
     /// reboot: its process may have brought its GSP-RM up, and a warm reset
     /// leaves that running, with WPR2 locked, for the firmware's POST to
@@ -648,6 +658,14 @@ impl UserDevice {
                 }
                 halted
             }
+            // An NVIDIA GPU whose process died: a function level reset,
+            // as before a warm reboot, so the next udrv-nvidia brings its
+            // GSP-RM up from cold. Not the GPU that shows the boot
+            // framebuffer: a reset would take the picture with it, and
+            // nothing brings it back ([`holds_boot_framebuffer`]).
+            Transport::Pci if self.kind == NVIDIA => {
+                !self.holds_boot_framebuffer() && self.gpu_reset_for_reboot()
+            }
             // A PCI function of a kind this does not know how to stop,
             // and one named by its identity (`pci-VVVV-DDDD@N`): it stays
             // out of use, with what it was given, until the next boot.
@@ -739,6 +757,17 @@ impl UserDevice {
     pub fn release(&self) {
         self.claimed.store(false, Ordering::Release);
     }
+}
+
+/// Whether one of the memory BARs of `place` holds the address `fb`.
+fn bars_hold(place: Option<&PciPlace>, fb: Option<usize>) -> bool {
+    let (Some(place), Some(fb)) = (place, fb) else {
+        return false;
+    };
+    place
+        .bars
+        .iter()
+        .any(|&(base, len)| len != 0 && (base..base.saturating_add(len)).contains(&fb))
 }
 
 /// What the command line asked for: each a `(kind, index)`.
@@ -1719,6 +1748,20 @@ mod tests {
         let ctrl = UserDevice { kind: AHCI, ..ctrl };
         assert!(!ctrl.nvme_shutdown());
         assert_eq!(reg(NVME_CC), 0x0046_0001);
+    }
+
+    #[test]
+    fn the_boot_framebuffer_is_found_in_the_gpu_bar_that_holds_it() {
+        let mut place = PciPlace::default();
+        place.bars[0] = (0xde00_0000, 0x100_0000);
+        // A GeForce BAR1 is 64-bit: BAR 2 is its upper half.
+        place.bars[1] = (0xc000_0000, 0x1000_0000);
+        assert!(bars_hold(Some(&place), Some(0xc000_0000)));
+        assert!(bars_hold(Some(&place), Some(0xc0ff_f000)));
+        assert!(!bars_hold(Some(&place), Some(0xd000_0000)), "past BAR1");
+        assert!(!bars_hold(Some(&place), Some(0x8000_0000)), "another GPU's");
+        assert!(!bars_hold(Some(&place), None), "no framebuffer");
+        assert!(!bars_hold(None, Some(0xc000_0000)), "no PCI place");
     }
 
     #[test]

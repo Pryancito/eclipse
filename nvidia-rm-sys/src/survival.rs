@@ -84,7 +84,9 @@ pub fn milestone_label(m: u8) -> &'static str {
 // `cfg(test)` reads the breadcrumb through `test_cmos` instead (see
 // `read_breadcrumb`), so on a host test build these three compile but nobody
 // calls them; they are the real path and must keep compiling.
-#[cfg(target_arch = "x86_64")]
+// Port I/O is privileged, so udrv-nvidia (feature `user`) never has it:
+// the process reads every CMOS byte as 0 and reports "no breadcrumb".
+#[cfg(all(target_arch = "x86_64", not(feature = "user")))]
 #[inline]
 #[cfg_attr(test, allow(dead_code))]
 unsafe fn outb(port: u16, val: u8) {
@@ -92,7 +94,7 @@ unsafe fn outb(port: u16, val: u8) {
         options(nomem, nostack, preserves_flags));
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "user")))]
 #[inline]
 #[cfg_attr(test, allow(dead_code))]
 unsafe fn inb(port: u16) -> u8 {
@@ -105,7 +107,7 @@ unsafe fn inb(port: u16) -> u8 {
 /// Read one CMOS byte. Bit 7 of the index port disables NMI for the duration of
 /// the access (the standard idiom); we re-select register 0x0D (read-only,
 /// harmless) with NMI re-enabled afterwards so we never leave NMI masked.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "user")))]
 #[cfg_attr(test, allow(dead_code))]
 unsafe fn cmos_read(idx: u8) -> u8 {
     outb(0x70, 0x80 | (idx & 0x7f));
@@ -128,7 +130,8 @@ unsafe fn cmos_read(idx: u8) -> u8 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn cmos_write(_idx: u8, _val: u8) {}
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(any(not(target_arch = "x86_64"), feature = "user"))]
+#[cfg_attr(test, allow(dead_code))]
 unsafe fn cmos_read(_idx: u8) -> u8 {
     0
 }

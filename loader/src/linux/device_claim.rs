@@ -451,6 +451,9 @@ struct Held {
     /// pins live as long as it does.
     bti: Arc<BusTransactionInitiator>,
     interrupt: Option<Arc<Interrupt>>,
+    /// Whether the device reaches memory only through an IOMMU domain of
+    /// its own, which shuts once what was pinned in it is let go.
+    isolated: bool,
 }
 
 impl Held {
@@ -464,6 +467,13 @@ impl Held {
                 debug!("udriver: {kind} #{index}: its interrupt was already gone ({e:?})");
             }
         }
+    }
+
+    /// Whether this is the GPU the boot screen is on, kept behind an IOMMU
+    /// domain of its own: it is given out again without a reset, which
+    /// would take the picture with it.
+    fn shows_boot_screen(&self) -> bool {
+        self.isolated && self.device.holds_boot_framebuffer()
     }
 
     /// The driver is gone: stop the device and make it claimable again.
@@ -489,13 +499,27 @@ impl Held {
         // is never anyone else's while a mapping of it lives.
         if super::gem_serve::driver_gone(self.holder) {
             warn!("udriver: {kind} #{index}: its driver named GEM objects; what it pinned stays pinned");
-            if self.device.reset() {
+            // The GPU the screen shows is not reset (see below); what it
+            // can reach through its IOMMU domain is only what stays pinned.
+            if self.device.reset() || self.shows_boot_screen() {
                 self.device.release();
             }
             core::mem::forget(self.bti);
             return;
         }
-        if !self.device.reset() {
+        let reset = self.device.reset();
+        if !reset && self.shows_boot_screen() {
+            // The GPU the screen shows is not reset, or the picture would
+            // go with it. Its DMA ends when the IOMMU domain shuts, as the
+            // pins are let go; its next driver starts from what is on it.
+            drop(self.bti);
+            self.device.release();
+            info!(
+                "udriver: {kind} #{index} lost its driver; not reset (it shows the boot screen), its DMA cut by the IOMMU, free to be claimed again"
+            );
+            return;
+        }
+        if !reset {
             // It may still be writing to what it was given, so that stays
             // pinned for good, and nobody else gets a device in that state.
             warn!("udriver: {kind} #{index} lost its driver and could not be reset; it stays out of use");
@@ -566,11 +590,14 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         regs.set_cache_policy(CachePolicy::UncachedDevice)?;
         Some(regs)
     };
+    let view = dma_view(&device);
+    let isolated = view.is_translating();
     let held = Held {
         holder: proc.id(),
-        bti: BusTransactionInitiator::create(dma_view(&device), 0),
+        bti: BusTransactionInitiator::create(view, 0),
         interrupt: device_interrupt(&device),
         device: device.clone(),
+        isolated,
     };
     let regs: HandleValue = regs.map_or(0, |regs| {
         proc.add_handle(Handle::new(regs, Rights::DEFAULT_VMO))

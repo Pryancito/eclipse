@@ -2668,7 +2668,17 @@ pub extern "C" fn osNv_rdcr4() -> NvU32 {
     // On non-x86_64 architectures there is no CR4 equivalent; return 0
     // so RM's CPU feature detection sees a clear register (no unexpected
     // bits set) rather than an undefined value.
-    #[cfg(target_arch = "x86_64")]
+    //
+    // In udrv-nvidia (feature `user`) CR4 cannot be read: `mov cr4` is
+    // privileged and the #GP kills the process. RM only looks at
+    // OSFXSR (bit 9) and OSXSAVE (bit 18), and a process can tell both
+    // without CR4: it already runs SSE code, so the OS saves that
+    // state, and CPUID.1:ECX bit 27 mirrors CR4.OSXSAVE.
+    #[cfg(all(target_arch = "x86_64", feature = "user"))]
+    {
+        user_cr4()
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "user")))]
     {
         let value: u64;
         unsafe {
@@ -2678,6 +2688,44 @@ pub extern "C" fn osNv_rdcr4() -> NvU32 {
     }
     #[cfg(not(target_arch = "x86_64"))]
     0
+}
+
+/// The CR4 bits RM reads, as a process can tell them: OSFXSR (bit 9)
+/// whenever the CPU has FXSR, OSXSAVE (bit 18) when CPUID.1:ECX bit 27
+/// says the OS set it.
+#[cfg(all(target_arch = "x86_64", feature = "user"))]
+fn user_cr4() -> NvU32 {
+    // SAFETY: CPUID is unprivileged and leaf 1 exists on every x86_64.
+    let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+    cr4_from_cpuid(leaf1.ecx, leaf1.edx)
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", feature = "user")))]
+fn cr4_from_cpuid(ecx: u32, edx: u32) -> NvU32 {
+    const CPUID_EDX_FXSR: u32 = 1 << 24;
+    const CPUID_ECX_OSXSAVE: u32 = 1 << 27;
+    let mut cr4 = 0;
+    if edx & CPUID_EDX_FXSR != 0 {
+        cr4 |= 1 << 9;
+    }
+    if ecx & CPUID_ECX_OSXSAVE != 0 {
+        cr4 |= 1 << 18;
+    }
+    cr4
+}
+
+#[cfg(test)]
+mod cr4_tests {
+    use super::cr4_from_cpuid;
+
+    #[test]
+    fn a_process_reports_only_the_bits_cpuid_backs() {
+        assert_eq!(cr4_from_cpuid(0, 0), 0);
+        assert_eq!(cr4_from_cpuid(0, 1 << 24), 1 << 9);
+        assert_eq!(cr4_from_cpuid(1 << 27, 1 << 24), (1 << 9) | (1 << 18));
+        // The real host (rax=bfebfbff in the crash is CPUID.1:EDX).
+        assert_eq!(cr4_from_cpuid(0, 0xbfebfbff) & (1 << 9), 1 << 9);
+    }
 }
 
 #[no_mangle]
