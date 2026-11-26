@@ -41,6 +41,10 @@
 //! [`KernelPages`]) the same way, held by the process's RM for as long as
 //! it has memory made of them.
 //!
+//! A digital stream starting on the HDMI/DP audio function of a served GPU
+//! asks the process to push the ELD and unmute ([`op::KICK_HDMI_AUDIO`]),
+//! as the kernel's driver does on its own GPUs.
+//!
 //! Everything the device files ask of the RM is carried.
 
 use super::{
@@ -49,6 +53,7 @@ use super::{
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -111,6 +116,10 @@ pub mod op {
     pub const UVM_PAGES: u32 = 141;
     /// A managed range's pages, lent: as [`UVM_PAGES`].
     pub const UVM_USER_PAGES: u32 = 142;
+    /// A digital stream is starting on an NVIDIA HDMI/DP audio function:
+    /// push the ELD and unmute on the GPU that drives the monitor. No
+    /// message; the answer's bytes are what was done, in words.
+    pub const KICK_HDMI_AUDIO: u32 = 143;
 }
 
 /// The most bytes a message carries: a slot of the link.
@@ -314,6 +323,17 @@ impl Served {
                 warn!("[nvidiactl] OS event op {op}: the RM's process did not answer ({errno})");
                 NV_ERR_OPERATING_SYSTEM
             }
+        }
+    }
+
+    /// Ask the process to enable HDMI/DP audio on its GPU that drives the
+    /// monitor: what it did, or why the process did not say.
+    pub(super) fn kick_hdmi_audio(&self) -> String {
+        match self.link.call(op::KICK_HDMI_AUDIO, 0, &[]) {
+            Ok((_, said)) => String::from_utf8_lossy(&said).into_owned(),
+            Err(errno) => alloc::format!(
+                "[hdmi-audio] the RM's process (udrv-nvidia) did not answer ({errno})"
+            ),
         }
     }
 
@@ -844,6 +864,11 @@ pub trait Rm {
     fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS;
     fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS;
     fn service_nonstall(&self) -> NonstallPoll;
+    /// Enable HDMI/DP audio on the GPU that drives the monitor, and say
+    /// what was done.
+    fn kick_hdmi_audio(&self) -> String {
+        String::new()
+    }
 
     // UVM's calls, refused unless an RM takes them.
     fn uvm_va_space_device(
@@ -933,6 +958,17 @@ impl Rm for ThisRm {
 
     fn service_nonstall(&self) -> NonstallPoll {
         super::service_nonstall()
+    }
+
+    fn kick_hdmi_audio(&self) -> String {
+        crate::display::nvidia::NvidiaGpu::kick_hdmi_audio_all();
+        let mut said = crate::display::nvidia::hdmi_audio_status();
+        let mut end = said.len().min(MESSAGE_MAX);
+        while !said.is_char_boundary(end) {
+            end -= 1;
+        }
+        said.truncate(end);
+        said
     }
 
     fn uvm_va_space_device(
@@ -1043,6 +1079,11 @@ pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> R
         op::SERVICE_NONSTALL => {
             out.clear();
             Ok(encode_nonstall(rm.service_nonstall()))
+        }
+        op::KICK_HDMI_AUDIO => {
+            out.clear();
+            out.extend_from_slice(rm.kick_hdmi_audio().as_bytes());
+            Ok(0)
         }
         op::UVM_P2P_CAPS => {
             out.clear();

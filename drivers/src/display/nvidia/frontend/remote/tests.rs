@@ -117,6 +117,8 @@ struct Mirror {
     uvm_freed: lock::Mutex<Option<(u32, u32)>>,
     held: lock::Mutex<Option<(u64, u64, Arc<dyn core::any::Any + Send + Sync>)>>,
     uvm_lent: lock::Mutex<Option<(usize, Vec<u64>, u32, bool)>>,
+    /// How many times it was asked to enable HDMI audio.
+    kicked: AtomicUsize,
 }
 
 impl Rm for Mirror {
@@ -167,6 +169,11 @@ impl Rm for Mirror {
 
     fn service_nonstall(&self) -> NonstallPoll {
         self.nonstall.lock().unwrap_or(NonstallPoll::Serviced(0))
+    }
+
+    fn kick_hdmi_audio(&self) -> String {
+        let n = self.kicked.fetch_add(1, Ordering::SeqCst) + 1;
+        alloc::format!("[hdmi-audio] 2d:00.0 [console GPU, drives the monitor]: kick {n}\n")
     }
 
     fn uvm_va_space_device(
@@ -768,4 +775,41 @@ fn uvm_calls_go_whole() {
     }
     lent.extend_from_slice(&words(&[1, 2, 1, 0]));
     assert_eq!(answer(&rm, op::UVM_PAGES, 0, &lent, &mut out), Err(EINVAL));
+}
+
+/// A digital stream starting on a served GPU's HDMI function asks the
+/// process to enable the audio, and what it says is the kernel's
+/// `/proc/gpusnd` line; with nobody serving, nothing is asked.
+#[test]
+fn the_hdmi_audio_kick_reaches_a_served_rm_and_says_what_it_did() {
+    use crate::display::nvidia::{hdmi_audio_status, NvidiaGpu, HDMI_AUDIO_STATUS, NVIDIA_GPUS};
+    let _g = crate::test_globals::LOCK.lock();
+    let saved = HDMI_AUDIO_STATUS.lock().take();
+    assert!(NVIDIA_GPUS.lock().is_empty(), "no GPU of the kernel's own");
+    assert_eq!(super::super::kick_served_hdmi_audio(), None);
+
+    let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
+    let link: Arc<dyn Link> = direct.clone();
+    serve(link.clone(), &hello_of(true, &[card(0, Some(0))]), server()).unwrap();
+    NvidiaGpu::kick_hdmi_audio_all();
+    assert_eq!(direct.0.kicked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        hdmi_audio_status(),
+        "[hdmi-audio] served by udrv-nvidia:\n\
+         [hdmi-audio] 2d:00.0 [console GPU, drives the monitor]: kick 1\n"
+    );
+    // The answer is the words, whole.
+    let mut out = Vec::new();
+    assert_eq!(
+        answer(&direct.0, op::KICK_HDMI_AUDIO, 0, &[], &mut out),
+        Ok(0)
+    );
+    assert_eq!(
+        out,
+        b"[hdmi-audio] 2d:00.0 [console GPU, drives the monitor]: kick 2\n"
+    );
+
+    gone(&link);
+    assert_eq!(super::super::kick_served_hdmi_audio(), None);
+    *HDMI_AUDIO_STATUS.lock() = saved;
 }

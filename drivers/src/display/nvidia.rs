@@ -2533,7 +2533,12 @@ impl NvidiaGpu {
         use core::fmt::Write;
         let gpus: Vec<Arc<NvidiaGpu>> = NVIDIA_GPUS.lock().clone();
         let mut report = String::new();
-        if gpus.is_empty() {
+        // The GPUs udrv-nvidia holds are not this driver's: their display
+        // engines are the process's to tell.
+        if let Some(said) = frontend::kick_served_hdmi_audio() {
+            report.push_str("[hdmi-audio] served by udrv-nvidia:\n");
+            report.push_str(said.trim_end());
+        } else if gpus.is_empty() {
             report.push_str("[hdmi-audio] stream start: no NVIDIA GPU probed");
         }
         for gpu in gpus.iter() {
