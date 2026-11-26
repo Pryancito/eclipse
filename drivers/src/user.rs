@@ -388,6 +388,14 @@ pub fn record_pci_function(place: PciPlace) {
     }
 }
 
+/// The buses on which the scan found a function, each once, in order.
+pub fn pci_buses() -> Vec<u8> {
+    let mut buses: Vec<u8> = PCI_FUNCTIONS.lock().iter().map(|p| p.bus).collect();
+    buses.sort_unstable();
+    buses.dedup();
+    buses
+}
+
 /// The function among `functions` with a memory BAR holding `paddr`.
 fn function_with_bar(functions: &[PciPlace], paddr: usize) -> Option<PciPlace> {
     functions.iter().copied().find(|place| {

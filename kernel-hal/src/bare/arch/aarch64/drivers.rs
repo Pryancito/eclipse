@@ -64,7 +64,92 @@ pub fn init() {
             unsafe { &mut *(phys_to_virt(VIRTIO_BASE + slot * VIRTIO_SLOT) as *mut VirtIOHeader) };
         reserved_for_userspace(header, slot);
     }
-    probe_devicetree();
+    let found = probe_devicetree();
+    #[cfg(not(feature = "no-pci"))]
+    probe_pci(found);
+    #[cfg(feature = "no-pci")]
+    let _ = found;
+}
+
+/// Where QEMU's `virt` puts its device tree for a firmware boot: the base
+/// of RAM.
+const QEMU_DTB: usize = 0x4000_0000;
+
+/// What the device tree says of the PCIe bridge and the SMMU, for
+/// [`probe_pci`].
+#[derive(Default)]
+struct Found {
+    pci: Option<zcore_drivers::bus::pci::host::PciHost>,
+    /// Base, length and phandle.
+    smmu: Option<(u64, u64, u32)>,
+}
+
+/// The phandle of the SMMU in use: the bridge's `iommu-map` names it.
+static SMMU_PHANDLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The stream id the SMMU sees requester `rid` with, by the bridge's
+/// `iommu-map`. `None` for one the map gives to no SMMU, or another one.
+#[cfg(not(feature = "no-pci"))]
+fn stream_of(rid: u16) -> Option<u32> {
+    let (iommu, sid) = zcore_drivers::bus::pci::host()?.stream_for(rid)?;
+    (iommu == SMMU_PHANDLE.load(core::sync::atomic::Ordering::Relaxed)).then_some(sid)
+}
+
+/// The PCIe bus, when the device tree describes a bridge where this kernel
+/// reaches it (QEMU `virt`'s high ECAM window), and the SMMUv3 in front of
+/// it, unless `iommu=off`.
+#[cfg(not(feature = "no-pci"))]
+fn probe_pci(found: Found) {
+    use zcore_drivers::bus::pci::{self, PCI_BASE, PCI_CONFIG_SIZE};
+    let Some(host) = found.pci else {
+        return;
+    };
+    if host.ecam.0 as usize != PCI_BASE || (host.ecam.1 as usize) < PCI_CONFIG_SIZE {
+        warn!(
+            "pci: the bridge's window is {:#x}+{:#x}, not the {PCI_BASE:#x}+{PCI_CONFIG_SIZE:#x} this kernel reaches; PCI left alone",
+            host.ecam.0, host.ecam.1
+        );
+        return;
+    }
+    if IoMapperImpl
+        .query_or_map(PCI_BASE, PCI_CONFIG_SIZE)
+        .is_none()
+    {
+        warn!("pci: failed to map the ECAM window at {PCI_BASE:#x}");
+        return;
+    }
+    info!(
+        "pci: bridge at {PCI_BASE:#x}, buses {}..={}, {} INTx routes",
+        host.buses.0,
+        host.buses.1,
+        host.intx.len()
+    );
+    pci::set_host(host);
+    // Only what is left to userspace: the kernel drives no PCI function
+    // here.
+    zcore_drivers::bus::pci_drivers::init_for_userspace();
+    match pci::init(Some(Arc::new(IoMapperImpl))) {
+        Ok(devices) => devices.into_iter().for_each(drivers::add_device),
+        Err(err) => warn!("pci: the scan failed: {err:?}"),
+    }
+    let Some((base, len, phandle)) = found.smmu else {
+        return;
+    };
+    if crate::cmdline::value(&super::cmdline(), "iommu") == Some("off") {
+        crate::klog_info!("iommu: iommu=off: SMMUv3 at {base:#x} left off");
+        return;
+    }
+    let span = crate::common::smmuv3::reg::SPAN;
+    if (len as usize) < span {
+        warn!("iommu: smmuv3 at {base:#x}: a window of {len:#x} bytes is too small");
+        return;
+    }
+    let Some(regs) = IoMapperImpl.query_or_map(base as usize, span) else {
+        warn!("iommu: smmuv3 at {base:#x}: its registers cannot be mapped");
+        return;
+    };
+    SMMU_PHANDLE.store(phandle, core::sync::atomic::Ordering::Relaxed);
+    super::smmuv3::init(regs, base as usize, stream_of);
 }
 
 /// The stride of QEMU `virt`'s bank of virtio-mmio transports.
@@ -177,10 +262,12 @@ fn map_memory(paddr: PhysAddr, len: usize) -> Option<VirtAddr> {
 /// Walks a device tree blob, if the command line said where one is, and adds
 /// what it finds.
 ///
-/// **Nothing happens without `dtb=0x…`.** `rayboot` passes no device tree
-/// pointer, so without the hatch there is no address to walk and this returns
-/// having done nothing: the boot is exactly the one above, on the bases in
-/// `KCONFIG`. That is deliberate --- the hardcoded bases stay the fallback,
+/// **Nothing is walked without `dtb=0x…`.** `rayboot` passes no device tree
+/// pointer, so without the hatch there is no address to walk and the boot is
+/// exactly the one above, on the bases in `KCONFIG`. The one exception reads
+/// and walks nothing: under QEMU (`firmware_type`), the tree `virt` leaves
+/// at the base of RAM is read for the PCIe bridge and the SMMU only, which
+/// [`probe_pci`] uses. That is deliberate --- the hardcoded bases stay the fallback,
 /// and a tree that is missing, unreadable or wrong must not cost the machine
 /// the console it already has.
 ///
@@ -210,19 +297,31 @@ fn map_memory(paddr: PhysAddr, len: usize) -> Option<VirtAddr> {
 /// The fault came before the `dtb=` test could fail, so it did not need the
 /// hatch to be open: every aarch64 boot died here. See
 /// `cmdline::aarch64_boot_cmdline_tests` for the regression guard.
-fn probe_devicetree() {
+fn probe_devicetree() -> Found {
     let cmdline = super::cmdline();
-    let Some(paddr) = crate::cmdline::dtb_paddr(&cmdline) else {
-        return;
+    let (paddr, walk) = match crate::cmdline::dtb_paddr(&cmdline) {
+        Some(paddr) => {
+            info!("dtb: the command line puts a device tree blob at {paddr:#x}");
+            (paddr, true)
+        }
+        // QEMU's `virt` leaves the tree it made at the start of RAM for the
+        // firmware, and the firmware leaves it there. The header is
+        // checked before anything is believed.
+        // Only the PCIe bridge and the SMMU are read from that one: the
+        // devices the boot always had stay as they were.
+        None if super::firmware_type() == "QEMU" => {
+            info!("dtb: QEMU: looking for the device tree blob at {QEMU_DTB:#x}");
+            (QEMU_DTB, false)
+        }
+        None => return Found::default(),
     };
-    info!("dtb: the command line puts a device tree blob at {paddr:#x}");
     // The header first, and only as much as it says afterwards: `map_memory`
     // is the one thing here that touches the page table, and the blob decides
     // how much of it. Mapping the header alone and handing the address
     // straight to the builder would fault on the first byte past it, because
     // the builder reads `totalsize` and walks all of it.
     let Some(vaddr) = map_memory(paddr, FDT_HEADER_SIZE) else {
-        return;
+        return Found::default();
     };
     // SAFETY: `map_memory` just made these bytes readable.
     let header = unsafe { core::slice::from_raw_parts(vaddr as *const u8, FDT_HEADER_SIZE) };
@@ -230,17 +329,25 @@ fn probe_devicetree() {
         Ok(totalsize) => totalsize,
         Err(err) => {
             warn!("dtb: {paddr:#x} does not hold a blob this kernel can read: {err:?}");
-            return;
+            return Found::default();
         }
     };
     if map_memory(paddr, totalsize).is_none() {
-        return;
+        return Found::default();
+    }
+    let tree = zcore_drivers::utils::devicetree::Devicetree::from(vaddr).ok();
+    let found = Found {
+        pci: tree.as_ref().and_then(|t| t.pci_host()),
+        smmu: tree.as_ref().and_then(|t| t.smmuv3()),
+    };
+    if !walk {
+        return found;
     }
     let gic: Arc<dyn IrqScheme> = match drivers::all_irq().first() {
         Some(gic) => gic.clone(),
         None => {
             warn!("dtb: no interrupt controller is up yet, so the tree cannot be walked");
-            return;
+            return found;
         }
     };
     let builder = match DevicetreeDriverBuilder::new(vaddr, IoMapperImpl) {
@@ -251,14 +358,14 @@ fn probe_devicetree() {
             .adopt_intc("arm,cortex-a15-gic", gic),
         Err(err) => {
             warn!("dtb: {vaddr:#x} does not hold a blob this kernel can read: {err:?}");
-            return;
+            return found;
         }
     };
     let devices = match builder.build() {
         Ok(devices) => devices,
         Err(err) => {
             warn!("dtb: the walk failed: {err:?}");
-            return;
+            return found;
         }
     };
     for dev in devices {
@@ -272,6 +379,7 @@ fn probe_devicetree() {
             }
         }
     }
+    found
 }
 
 /// The SGI `send_ipi` raises for a TLB shootdown (GICD_SGIR with SGIINTID 0).

@@ -500,6 +500,40 @@ impl Devicetree {
         self.walk_inner(&self.0.root, InheritProps::default(), device_node_op)
     }
 
+    /// The first PCIe host bridge (`pci-host-ecam-generic`) the tree
+    /// describes under its root.
+    pub fn pci_host(&self) -> Option<crate::bus::pci::host::PciHost> {
+        let root = &self.0.root;
+        let host = crate::bus::pci::host::find(root)?;
+        let a = root.prop_u32("#address-cells").unwrap_or(2);
+        let s = root.prop_u32("#size-cells").unwrap_or(1);
+        crate::bus::pci::host::parse(root, host, a, s)
+    }
+
+    /// The register window and phandle of the first `arm,smmu-v3` node
+    /// under the root.
+    pub fn smmuv3(&self) -> Option<(u64, u64, u32)> {
+        let root = &self.0.root;
+        let a = root.prop_u32("#address-cells").unwrap_or(2) as usize;
+        let s = root.prop_u32("#size-cells").unwrap_or(1) as usize;
+        let node = root.children.iter().find(|n| {
+            n.prop_str_list("compatible")
+                .is_ok_and(|c| c.contains("arm,smmu-v3"))
+                && n.prop_str("status")
+                    .map_or(true, |st| st == "okay" || st == "ok")
+        })?;
+        let reg = node.prop_cells("reg").ok()?;
+        let cells = |c: &[u32]| c.iter().fold(0u64, |acc, &x| acc << 32 | x as u64);
+        if reg.len() < a + s {
+            return None;
+        }
+        Some((
+            cells(&reg[..a]),
+            cells(&reg[a..a + s]),
+            node.prop_u32("phandle").unwrap_or(0),
+        ))
+    }
+
     /// Returns the `bootargs` property in the `/chosen` node, as the kernel
     /// command line.
     pub fn bootargs(&self) -> Option<&str> {
