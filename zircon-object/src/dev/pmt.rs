@@ -205,6 +205,21 @@ impl PinnedMemoryToken {
                 .any(|&base| addr >= base && end <= base + run)
     }
 
+    /// For a pin of a contiguous VMO that [`Self::covers`] `len` bytes from
+    /// `addr`: the VMO, and the offset in it of `addr`.
+    pub(super) fn contiguous_at(
+        &self,
+        min_contig: usize,
+        addr: DevVAddr,
+        len: usize,
+    ) -> Option<(Arc<VmObject>, usize)> {
+        if !self.vmo.is_contiguous() || !self.covers(min_contig, addr, len) {
+            return None;
+        }
+        let base = *self.mapped_addrs.first()?;
+        Some((self.vmo.clone(), self.offset + (addr - base)))
+    }
+
     /// Unpin pages and revoke device access to them.
     pub fn unpin(&self) {
         if let Some(bti) = self.bti.upgrade() {

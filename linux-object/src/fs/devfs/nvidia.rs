@@ -755,6 +755,12 @@ impl NvidiaOpen {
             return Err(LxError::EINVAL);
         };
         let (start, pages, policy) = mmap_window(&mapping, offset, len)?;
+        if mapping.memory == nvctl::MmapMemory::System {
+            if let Some(served) = super::served::nvctl::system_vmo(start as u64, pages * PAGE_SIZE)
+            {
+                return served_system(served, policy);
+            }
+        }
         let vmo = VmObject::new_physical(start, pages);
         // A VMO nobody has mapped yet always takes a policy; Linux answers a
         // caching it cannot encode with ENXIO.
@@ -1205,6 +1211,26 @@ fn record_mapping(
     }
     state.mapping = Some(mapping);
     Ok(())
+}
+
+/// A system-memory mapping of an RM a process serves: the memory it
+/// pinned, as it is mapped there (write-back). Any other caching would
+/// change it under the process's own mapping too, so it is not mapped
+/// (ENXIO, as a caching Linux cannot encode), and neither is memory the
+/// process does not have pinned any more (EINVAL).
+fn served_system(vmo: Option<Arc<VmObject>>, policy: CachePolicy) -> LxResult<Arc<VmObject>> {
+    let vmo = vmo.ok_or(LxError::EINVAL)?;
+    if policy != CachePolicy::Cached {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            zcore_drivers::klog_warn!(
+                "[nvidiactl] system memory of the RM's process mapped {:?}: only write-back is, ENXIO",
+                policy
+            );
+        }
+        return Err(LxError::ENXIO);
+    }
+    Ok(vmo)
 }
 
 /// `nvidia_mmap_helper`'s checks, and what they leave to map: the physical

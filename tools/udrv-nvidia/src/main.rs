@@ -16,10 +16,11 @@
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
-//! - `udrv-nvidia nvctl-check`: `/dev/nvidiactl` served with an RM that
-//!   only checks the way there (`nvidia.nvidiactl` on the kernel's
-//!   cmdline): an escape's parameters reached through its pointer, the
-//!   GPU node, the close.
+//! - `udrv-nvidia nvctl-check VVVV DDDD`: `/dev/nvidiactl` served with an
+//!   RM that only checks the way there (`nvidia.nvidiactl` on the kernel's
+//!   cmdline, and a PCI function claimed as for `check`, for its BAR and
+//!   DMA memory): an escape's parameters reached through its pointer, the
+//!   GPU node, mappings of its memory and its BAR, the close.
 mod drm;
 mod gem;
 mod gpu;
@@ -55,7 +56,14 @@ fn main() {
         }
         Some("drm-check") => drm_check(),
         Some("irq-check") => irq_check(&args[1..]),
-        Some("nvctl-check") => nvctl_check(),
+        Some("nvctl-check") => {
+            let hex = |i: usize| {
+                args.get(i)
+                    .and_then(|s| u16::from_str_radix(s, 16).ok())
+                    .unwrap_or_else(|| fail("usage: udrv-nvidia nvctl-check VVVV DDDD".into()))
+            };
+            nvctl_check(hex(1), hex(2))
+        }
         n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
     }
 }
@@ -184,7 +192,7 @@ fn irq_check(args: &[String]) {
 }
 
 /// `udrv-nvidia nvctl-check`: see the top of this file.
-fn nvctl_check() {
+fn nvctl_check(vendor: u16, device: u16) {
     use std::os::fd::AsRawFd;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -196,6 +204,26 @@ fn nvctl_check() {
     };
     static RM: std::sync::OnceLock<nvctl::check::CheckRm> = std::sync::OnceLock::new();
     let rm = RM.get_or_init(Default::default);
+    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
+    gpu.install_dma().unwrap_or_else(|e| fail(e));
+    let mapper = gpu.mapper();
+    let bar = gpu
+        .bars
+        .first()
+        .copied()
+        .unwrap_or_else(|| fail("no BAR".into()));
+    extern "C" {
+        fn drivers_dma_alloc(pages: usize) -> usize;
+        fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
+        fn drivers_phys_to_virt(paddr: usize) -> usize;
+    }
+    // SAFETY: the driver's own allocation and lookup calls.
+    let system = unsafe { drivers_dma_alloc(1) };
+    let system_virt = unsafe { drivers_phys_to_virt(system) };
+    // SAFETY: the page just allocated, this process's.
+    unsafe { (system_virt as *mut u64).write_volatile(0x5eed_0000_0000_0001) };
+    rm.system.store(system as u64, Ordering::Relaxed);
+    rm.bar.store(bar.phys as u64, Ordering::Relaxed);
     std::thread::spawn(move || match nvctl::serve(rm, &nvctl::check::hello()) {
         Ok(why) => eprintln!("{NAME}: the kernel let go of the RM: {why}"),
         Err((_, e)) => fail(e),
@@ -239,6 +267,76 @@ fn nvctl_check() {
     control[16..24].copy_from_slice(&8u64.to_le_bytes());
     ok("a pointer to nothing is refused", escape(&mut control) != 0);
     ok("the GPU node opens", open_rw("/dev/nvidia0").is_some());
+
+    // RM_MAP_MEMORY, then mmap of the open the mapping is recorded on.
+    const MAP_MEMORY: u64 = 0xc038_464e;
+    let map = |h_memory: u32, on: &std::fs::File| {
+        let mut p = [0u8; 56];
+        p[8..12].copy_from_slice(&h_memory.to_le_bytes());
+        p[48..52].copy_from_slice(&on.as_raw_fd().to_le_bytes());
+        // SAFETY: `p` is the 56 bytes of NVOS33_PARAMETERS.
+        unsafe { libc::ioctl(ctl.as_raw_fd(), MAP_MEMORY as _, p.as_mut_ptr()) }
+    };
+    let mmap = |on: &std::fs::File| {
+        // SAFETY: a new shared mapping of one page of `on`.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                on.as_raw_fd(),
+                0,
+            )
+        };
+        (at != libc::MAP_FAILED).then_some(at as *mut u64)
+    };
+    let on_ctl = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    ok(
+        "the RM's system memory is granted",
+        map(nvctl::check::grant::SYSTEM, &on_ctl) == 0,
+    );
+    let seen = mmap(&on_ctl).unwrap_or_else(|| fail("mmap of its system memory".into()));
+    // SAFETY: the page mapped above.
+    let word = unsafe { seen.read_volatile() };
+    ok(
+        "...and mapped, the same memory",
+        word == 0x5eed_0000_0000_0001,
+    );
+    // The driver frees it: the mapping keeps its pages.
+    // SAFETY: the page it allocated, freed once.
+    unsafe { drivers_dma_dealloc(system, 1) };
+    unsafe { seen.add(1).write_volatile(42) };
+    ok(
+        "a mapping outlives the driver's free of its memory",
+        unsafe {
+            seen.read_volatile() == 0x5eed_0000_0000_0001 && seen.add(1).read_volatile() == 42
+        },
+    );
+    let on_gpu = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    ok(
+        "an aperture in its BAR is granted",
+        map(nvctl::check::grant::APERTURE, &on_gpu) == 0,
+    );
+    let window = mmap(&on_gpu).unwrap_or_else(|| fail("mmap of its aperture".into()));
+    let driver_side = mapper
+        .query_or_map(bar.phys, 4096)
+        .unwrap_or_else(|| fail("BAR not mapped".into())) as *mut u64;
+    // SAFETY: the same page of the BAR, mapped twice.
+    unsafe { window.add(3).write_volatile(0xa9e7_7e50) };
+    ok(
+        "...and mapped, the BAR itself",
+        unsafe { driver_side.add(3).read_volatile() } == 0xa9e7_7e50,
+    );
+    let refused = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    ok(
+        "memory the RM's process never pinned is refused",
+        map(nvctl::check::grant::NOT_OURS, &refused) != 0 && mmap(&refused).is_none(),
+    );
+    ok(
+        "...and the RM told so",
+        rm.unrecorded.load(Ordering::Relaxed) != 0,
+    );
     drop(ctl);
     let start = Instant::now();
     while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {

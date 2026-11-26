@@ -186,6 +186,25 @@ impl MmapContext {
         })
     }
 
+    /// The C's record of it, which [`MmapContext::from_raw`] reads back:
+    /// how it travels to a kernel the RM is not in.
+    pub fn to_raw(&self) -> RawMmapContext {
+        RawMmapContext {
+            valid: 1,
+            ctl: self.on_ctl() as NvU32,
+            gpu_instance: self.gpu_instance,
+            memory_type: match self.memory {
+                MmapMemory::System => 0,
+                MmapMemory::Registers => 1,
+                MmapMemory::Framebuffer => 2,
+            },
+            caching: self.caching,
+            prot: if self.writable { PROTECT_WRITEABLE } else { 0 },
+            start: self.start,
+            size: self.size,
+        }
+    }
+
     /// Whether it is recorded on `/dev/nvidiactl` rather than a GPU's node.
     pub fn on_ctl(&self) -> bool {
         self.memory == MmapMemory::System

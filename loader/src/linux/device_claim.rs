@@ -271,6 +271,25 @@ pub(super) fn owns_memory(proc: &Arc<Process>, phys: u64, len: u64) -> Option<bo
     in_a_bar.then_some(true)
 }
 
+/// `len` bytes of memory `proc` pinned at `phys`, through a device it
+/// holds, as a VMO of their own: a slice of the contiguous VMO the pin is
+/// of, which keeps the pages for as long as it lives, whatever the driver
+/// unpins or frees meanwhile. `None` for memory it did not pin, or did not
+/// pin in one contiguous VMO.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn pinned_slice(proc: &Arc<Process>, phys: u64, len: usize) -> Option<Arc<VmObject>> {
+    let id = proc.id();
+    let pins: Vec<_> = PINS
+        .lock()
+        .iter()
+        .filter(|(holder, _)| *holder == id)
+        .filter_map(|(_, bti)| bti.upgrade())
+        .collect();
+    let phys = <usize as core::convert::TryFrom<u64>>::try_from(phys).ok()?;
+    let (vmo, offset) = pins.iter().find_map(|bti| bti.pinned_vmo(phys, len))?;
+    vmo.create_slice(offset, len).ok()
+}
+
 /// The device of `kind` that `proc` holds, by its place among the reserved
 /// ones of that kind. What a driver serves to the kernel is known by this:
 /// the next driver of the same device is the same disk's.

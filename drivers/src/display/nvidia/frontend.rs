@@ -28,8 +28,9 @@ pub use nvidia_rm_sys::frontend::uvm::{
 };
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
-    Caller, CpuCaching, MmapContext, MmapMemory, CALLER_NAME_LEN, GPU_UUID_LEN, LAYOUT,
-    NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
+    Caller, CpuCaching, MmapContext, MmapMemory, RawMmapContext, CALLER_NAME_LEN, GPU_UUID_LEN,
+    LAYOUT, NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED,
+    VERSION_STRING_LENGTH,
 };
 use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED, NV_OK, NV_STATUS};
 
@@ -147,8 +148,11 @@ pub fn rm_escape_lending(
 /// `nvidia_rm_sys::frontend::rm_map_memory`, refused with `NV_ERR_NOT_READY`
 /// while there is no RM core to run it.
 pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
-    if served_elsewhere() {
-        return (NV_ERR_NOT_SUPPORTED, None);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return (NV_ERR_NOT_READY, None);
+        }
+        return served.rm_map_memory(payload, caller);
     }
     if !rm_up() {
         return (NV_ERR_NOT_READY, None);
@@ -160,7 +164,11 @@ pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<
 /// [`rm_map_memory`] returned is ever handed back, and with no RM core it
 /// returns none.
 pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
-    if !served_elsewhere() && rm_up() {
+    if let Some(served) = remote::served() {
+        served.map_unrecorded(payload, caller, why);
+        return;
+    }
+    if rm_up() {
         nvidia_rm_sys::frontend::map_unrecorded(payload, caller, why);
     }
 }

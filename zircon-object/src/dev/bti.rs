@@ -178,6 +178,20 @@ impl BusTransactionInitiator {
             .any(|pmt| pmt.covers(min_contig, addr, len))
     }
 
+    /// The memory behind `len` bytes from device address `addr`, when they
+    /// lie in one pin of a contiguous VMO: that VMO, and where in it they
+    /// start. What lets the kernel map a driver's memory into another
+    /// process as the VMO itself (a slice of it), which keeps the pages
+    /// for as long as that mapping lives, whatever the driver frees.
+    pub fn pinned_vmo(&self, addr: DevVAddr, len: usize) -> Option<(Arc<VmObject>, usize)> {
+        let min_contig = self.iommu.minimum_contiguity();
+        let inner = self.inner.lock();
+        inner
+            .pmts
+            .iter()
+            .find_map(|pmt| pmt.contiguous_at(min_contig, addr, len))
+    }
+
     /// The tokens this initiator holds that nothing else names any more: the
     /// pin outlived every handle to it, which is what quarantine means here.
     /// Takes a borrow of the locked state rather than the lock, so a caller
@@ -225,6 +239,38 @@ mod tests {
         assert!(!bti.pins_cover(base, 0));
         pmt.unpin();
         assert!(!bti.pins_cover(base, 16));
+    }
+
+    /// The VMO behind a range in a contiguous pin, at the range's offset in
+    /// it, and nothing for a paged pin or a range outside every pin. A
+    /// slice of it keeps the pages after the pin is gone.
+    #[test]
+    fn a_contiguous_pin_names_its_vmo() {
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        let vmo = VmObject::new_contiguous(4, crate::vm::PAGE_SIZE_LOG2).unwrap();
+        let pmt = bti
+            .pin(vmo.clone(), PAGE_SIZE, 2 * PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let base = pmt.encode_addrs(false, true).unwrap()[0];
+        let (found, offset) = bti.pinned_vmo(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(Arc::ptr_eq(&found, &vmo));
+        assert_eq!(offset, 2 * PAGE_SIZE, "the pin starts a page in");
+        assert!(bti.pinned_vmo(base + PAGE_SIZE, PAGE_SIZE + 1).is_none());
+
+        let paged = VmObject::new_paged(1);
+        paged.commit(0, PAGE_SIZE).unwrap();
+        let ppmt = bti.pin(paged, 0, PAGE_SIZE, IommuPerms::PERM_READ).unwrap();
+        let paddr = ppmt.encode_addrs(false, false).unwrap()[0];
+        assert!(bti.pinned_vmo(paddr, 16).is_none(), "not contiguous");
+
+        let slice = found.create_slice(offset, PAGE_SIZE).unwrap();
+        pmt.unpin();
+        drop((found, vmo));
+        assert!(bti.pinned_vmo(base, 16).is_none());
+        slice.write(0, &[7]).unwrap();
+        let mut back = [0u8];
+        slice.read(0, &mut back).unwrap();
+        assert_eq!(back, [7], "the slice still has its pages");
     }
 
     /// The two counts of `ZX_INFO_BTI` are a total and a subset of it, so they
