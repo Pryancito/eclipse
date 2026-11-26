@@ -324,6 +324,16 @@ const NVME_CC: usize = 0x14;
 const NVME_CSTS: usize = 0x1c;
 const NVME_CC_EN: u32 = 1;
 const NVME_CSTS_RDY: u32 = 1;
+/// `CC.SHN` (§3.1.5), and its "normal shutdown"; `CSTS.SHST` (§3.1.6),
+/// and its "shutdown processing complete".
+const NVME_CC_SHN: u32 = 3 << 14;
+const NVME_CC_SHN_NORMAL: u32 = 1 << 14;
+const NVME_CSTS_SHST: u32 = 3 << 2;
+const NVME_CSTS_SHST_DONE: u32 = 2 << 2;
+/// How many times `CSTS` is read back for the shutdown to be done. A real
+/// SSD takes from milliseconds to about a second; the wait is best effort,
+/// and bounded: it runs when a driver dies and on the way to a reboot.
+const NVME_SHUTDOWN_READS: usize = 4_000_000;
 /// How many times `CSTS` is read back after `CC.EN` is cleared. A real
 /// controller may take up to `CAP.TO` half-seconds; QEMU's is done at once.
 const NVME_RESET_READS: usize = 1_000_000;
@@ -416,6 +426,34 @@ impl UserDevice {
         self.claimed.load(Ordering::Acquire)
     }
 
+    /// Tell an NVMe controller that runs that the power is about to go
+    /// (`CC.SHN` = normal), and wait, bounded, for it to say it has put
+    /// away what it kept in memory (`CSTS.SHST` = complete). After it the
+    /// controller takes no more commands until it is reset. Whether it
+    /// said so; `false` too for a controller that is not running (there is
+    /// nothing to put away), is gone (it reads all ones), or is not NVMe.
+    pub fn nvme_shutdown(&self) -> bool {
+        let Some(vaddr) = self.vaddr else {
+            return false;
+        };
+        if self.transport != Transport::Pci || self.kind != NVME || self.size < NVME_CSTS + 4 {
+            return false;
+        }
+        let reg = |off: usize| (vaddr + off) as *mut u32;
+        // SAFETY: `vaddr` is the bus's mapping of the `size` bytes of the
+        // window, and both registers are inside it.
+        unsafe {
+            let cc = reg(NVME_CC).read_volatile();
+            let csts = reg(NVME_CSTS).read_volatile();
+            if cc == u32::MAX || cc & NVME_CC_EN == 0 || csts & NVME_CSTS_RDY == 0 {
+                return false;
+            }
+            reg(NVME_CC).write_volatile(nvme_cc_shutdown(cc));
+            (0..NVME_SHUTDOWN_READS)
+                .any(|_| reg(NVME_CSTS).read_volatile() & NVME_CSTS_SHST == NVME_CSTS_SHST_DONE)
+        }
+    }
+
     /// Stop the device: write zero to its status register, which is how a
     /// virtio device is reset (spec 1.1 §2.1.1), and wait for it to read
     /// back zero. From then on it touches none of the memory its queues
@@ -490,9 +528,16 @@ impl UserDevice {
                 // Clearing `CC.EN` is the controller reset (§7.6.2): every
                 // queue is gone and nothing more is read or written of the
                 // memory they named.
+                //
+                // Before it, the orderly shutdown (§7.6.2 too): a
+                // controller reset with no shutdown notice is, to the SSD,
+                // the power lost. One with no DRAM keeps its mapping
+                // tables then by scanning at the next start, and counts an
+                // unsafe shutdown.
+                self.nvme_shutdown();
                 unsafe {
                     let cc = reg(NVME_CC).read_volatile();
-                    reg(NVME_CC).write_volatile(cc & !NVME_CC_EN);
+                    reg(NVME_CC).write_volatile(cc & !(NVME_CC_EN | NVME_CC_SHN));
                 }
                 (0..NVME_RESET_READS)
                     .any(|_| unsafe { reg(NVME_CSTS).read_volatile() } & NVME_CSTS_RDY == 0)
@@ -1205,6 +1250,25 @@ pub fn reserve_pci_by_id(
     true
 }
 
+/// `cc` with a normal shutdown asked for, and nothing else changed.
+fn nvme_cc_shutdown(cc: u32) -> u32 {
+    cc & !NVME_CC_SHN | NVME_CC_SHN_NORMAL
+}
+
+/// The machine is about to reboot or power off: every NVMe controller left
+/// to userspace is shut down in order ([`UserDevice::nvme_shutdown`]),
+/// whether a driver has it or not, as the kernel's own NVMe driver does
+/// with its disks. How many said they were done.
+///
+/// Called with whatever was to be written already flushed. A list someone
+/// holds the lock of is left alone: this runs where nothing may wait.
+pub fn shutdown_for_reboot() -> usize {
+    let Some(reserved) = RESERVED.try_lock() else {
+        return 0;
+    };
+    reserved.iter().filter(|d| d.nvme_shutdown()).count()
+}
+
 /// The devices left to userspace, as `udriver=` would name each
 /// (`virtio-net@0`, `pci-14c3-0616@0`), in the order the buses found them.
 pub fn reserved() -> Vec<alloc::string::String> {
@@ -1560,6 +1624,48 @@ mod tests {
         };
         assert!(!ctrl.reset());
         assert!(short.iter().all(|b| *b == 0xff));
+    }
+
+    #[test]
+    fn a_running_nvme_controller_is_shut_down_in_order_before_its_reset() {
+        assert_eq!(nvme_cc_shutdown(0x0046_0001), 0x0046_4001);
+        assert_eq!(nvme_cc_shutdown(0x0046_8001), 0x0046_4001, "not abrupt");
+        let nvme = |cc: u32, csts: u32| {
+            let window: &'static mut [u32] =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new([0u32; 0x40 / 4]));
+            window[NVME_CC / 4] = cc;
+            window[NVME_CSTS / 4] = csts;
+            let p = window.as_mut_ptr();
+            let bytes = unsafe { core::slice::from_raw_parts_mut(p as *mut u8, 0x40) };
+            let ctrl = UserDevice {
+                kind: NVME,
+                ..device(Transport::Pci, bytes)
+            };
+            (ctrl, move |off: usize| unsafe { p.add(off / 4).read() })
+        };
+        // Running, and (plain memory) already saying the shutdown is done.
+        let (ctrl, reg) = nvme(0x0046_0001, NVME_CSTS_RDY | NVME_CSTS_SHST_DONE);
+        assert!(ctrl.nvme_shutdown());
+        assert_eq!(reg(NVME_CC), 0x0046_4001, "SHN = normal, still enabled");
+        // The reset after it leaves neither bit.
+        ctrl.reset();
+        assert_eq!(reg(NVME_CC), 0x0046_0000);
+        // Not enabled, not ready, or gone: nothing to shut down, nothing
+        // written.
+        for (cc, csts) in [
+            (0x0046_0000, NVME_CSTS_RDY),
+            (0x0046_0001, 0),
+            (u32::MAX, u32::MAX),
+        ] {
+            let (ctrl, reg) = nvme(cc, csts);
+            assert!(!ctrl.nvme_shutdown());
+            assert_eq!(reg(NVME_CC), cc);
+        }
+        // Another kind of device is not touched.
+        let (ctrl, reg) = nvme(0x0046_0001, NVME_CSTS_RDY | NVME_CSTS_SHST_DONE);
+        let ctrl = UserDevice { kind: AHCI, ..ctrl };
+        assert!(!ctrl.nvme_shutdown());
+        assert_eq!(reg(NVME_CC), 0x0046_0001);
     }
 
     #[test]
