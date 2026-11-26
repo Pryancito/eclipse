@@ -94,11 +94,17 @@ pub(super) fn drm_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let hello = kernel_hal::user::UserInPtr::<u8>::from(args[2])
         .read_array(args[3])
         .map_err(|_| ZxError::INVALID_ARGS)?;
-    let card =
-        card::serve_card(proc.linux(), fifo.clone(), window, &hello).map_err(|e| match e {
-            LxError::EPERM => ZxError::ACCESS_DENIED,
-            _ => ZxError::INVALID_ARGS,
-        })?;
+    let card = card::serve_card(
+        proc.linux(),
+        fifo.clone(),
+        window,
+        &hello,
+        fence_check(proc),
+    )
+    .map_err(|e| match e {
+        LxError::EPERM => ZxError::ACCESS_DENIED,
+        _ => ZxError::INVALID_ARGS,
+    })?;
     let pid = proc.id() as usize;
     card.killed_with(alloc::boxed::Box::new(move || {
         let kill = linux_object::signal::Signal::SIGKILL;
@@ -208,4 +214,14 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         served::unserve(&node);
     });
     Ok(())
+}
+
+/// Where the kernel reads a fence of the card `proc` serves: memory it
+/// pinned, never anyone else's (`syncobj_serve`).
+fn fence_check(proc: &Arc<Process>) -> card::FenceCheck {
+    let proc = Arc::downgrade(proc);
+    Arc::new(move |f| {
+        let proc = proc.upgrade()?;
+        super::syncobj_serve::served_fence(&proc, f.phys, f.ctx)
+    })
 }

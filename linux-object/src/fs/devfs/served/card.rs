@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rcore_fs::vfs::INode;
-use zcore_drivers::scheme::drm_remote::{self, Remote, Transport};
+use zcore_drivers::scheme::drm_remote::{self, Fence, Remote, Transport};
 use zcore_drivers::scheme::DrmScheme;
 use zircon_object::ipc::Fifo;
 use zircon_object::object::KernelObject;
@@ -23,17 +23,23 @@ use crate::error::{LxError, LxResult};
 use crate::fs::devfs::drm;
 use crate::process::LinuxProcess;
 
+/// Where the kernel reads a fence of the driver's, and the ctx its table
+/// knows the channel by, if the landing zone is the driver's own memory
+/// (`Transport::fence`): the gateway that served the card knows what the
+/// driver holds.
+pub type FenceCheck = Arc<dyn Fn(&Fence) -> Option<(usize, u32)> + Send + Sync>;
+
 /// The link, as the card's transport. Each answer carries the card's
 /// flags in its `fh`, kept here so the DRM core can read them under its
 /// lock without a call (a call waits, and must not wait holding a lock).
-pub struct OverLink(Arc<Link>, AtomicU64);
+pub struct OverLink(Arc<Link>, AtomicU64, Option<FenceCheck>);
 
 /// No answer has carried flags yet.
 const NO_FLAGS: u64 = u64::MAX;
 
 impl OverLink {
-    pub(super) fn new(link: Arc<Link>) -> Self {
-        Self(link, AtomicU64::new(NO_FLAGS))
+    pub(super) fn new(link: Arc<Link>, fence: Option<FenceCheck>) -> Self {
+        Self(link, AtomicU64::new(NO_FLAGS), fence)
     }
 }
 
@@ -66,6 +72,10 @@ impl Transport for OverLink {
     fn write_user(&self, addr: usize, bytes: &[u8]) -> Result<(), i32> {
         let mut to = kernel_hal::user::UserOutPtr::<u8>::from(addr);
         to.write_array(bytes).map_err(|_| drm_remote::ioctl::EFAULT)
+    }
+
+    fn fence(&self, f: &Fence) -> Option<(usize, u32)> {
+        self.2.as_ref().and_then(|check| check(f))
     }
 
     fn flags(&self) -> Option<drm_remote::Flags> {
@@ -108,6 +118,7 @@ impl ServedCard {
 /// beside the others: in the DRM core's list and as a node in `/dev/dri`.
 /// `hello` is what the driver says of itself (`drm_remote::op::HELLO`'s
 /// answer, sent with the call: the server cannot answer while it makes it).
+/// `fence` says where the kernel reads the driver's fences ([`FenceCheck`]).
 /// `EPERM` for a process that may not; `EINVAL` for a window that holds no
 /// slot, a FIFO of other messages or a `hello` that does not parse.
 pub fn serve_card(
@@ -115,14 +126,15 @@ pub fn serve_card(
     fifo: Arc<Fifo>,
     window: Arc<VmObject>,
     hello: &[u8],
+    fence: FenceCheck,
 ) -> LxResult<ServedCard> {
     if !proc.capable(crate::process::CAP_SYS_ADMIN) {
         return Err(LxError::EPERM);
     }
     let koid = fifo.id();
     let link = Arc::new(Link::new(fifo, window).map_err(|_| LxError::EINVAL)?);
-    let remote =
-        Remote::with_hello(OverLink::new(link.clone()), hello).map_err(|_| LxError::EINVAL)?;
+    let remote = Remote::with_hello(OverLink::new(link.clone(), Some(fence)), hello)
+        .map_err(|_| LxError::EINVAL)?;
     super::remember(koid, &link);
     let card: Arc<dyn DrmScheme> = Arc::new(remote);
     drm::register_driver(card.clone());

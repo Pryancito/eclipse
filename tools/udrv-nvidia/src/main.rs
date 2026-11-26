@@ -209,6 +209,37 @@ fn drm_check() {
                     ..asked
                 },
     );
+    // An EXEC that waits: the kernel asks the card which waits are the
+    // CPU's, and sleeps on them before the call (with the nouveau uAPI on).
+    let uapi =
+        std::fs::read_to_string("/proc/cmdline").is_ok_and(|c| c.contains("nvidia.nouveau_uapi"));
+    match syncobj_signaled(&file) {
+        Some(handle) => {
+            let waits = [[0u32, handle, 0, 0]];
+            let mut e = drm::check::Exec {
+                wait_count: 1,
+                wait_ptr: waits.as_ptr() as u64,
+                ..Default::default()
+            };
+            let r = {
+                use std::os::fd::AsRawFd;
+                // SAFETY: `e` and the waits it points at outlive the call.
+                unsafe { libc::ioctl(file.as_raw_fd(), drm::check::EXEC as _, &mut e) }
+            };
+            let asked = card.waits_asked.load(std::sync::atomic::Ordering::Relaxed);
+            if uapi {
+                ok(
+                    "the kernel asks the card for an EXEC's CPU waits, and waits",
+                    r == 0 && asked == 1,
+                );
+            } else {
+                println!(
+                    "{NAME}: an EXEC's CPU waits: not asked without nvidia.nouveau_uapi ({asked})"
+                );
+            }
+        }
+        None => println!("{NAME}: no syncobj from the node: the EXEC waits are not tried"),
+    }
     // A dumb buffer the kernel makes is told to the card, and its end too.
     let dumb = dumb_buffer(&file);
     ok(
@@ -240,6 +271,15 @@ fn drm_check() {
         unsafe { libc::ioctl(file.as_raw_fd(), drm::check::EXEC as _, &mut e) };
     });
     println!("{NAME}: drm-check: ok");
+}
+
+/// A syncobj of `file`'s, made signaled (`DRM_IOCTL_SYNCOBJ_CREATE`).
+fn syncobj_signaled(file: &std::fs::File) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut create = [0u32, 1]; // handle, DRM_SYNCOBJ_CREATE_SIGNALED
+                                // SAFETY: `create` is the ioctl's struct, alive for the call.
+    let r = unsafe { libc::ioctl(file.as_raw_fd(), 0xc008_64bf_u32 as _, create.as_mut_ptr()) };
+    (r == 0 && create[0] != 0).then_some(create[0])
 }
 
 fn check(vendor: u16, device: u16) {
@@ -391,11 +431,14 @@ fn syncobj_check(dma: u64, size: u64, ok: impl Fn(&str, bool)) {
     );
     // SAFETY: the process's clock.
     let soon = unsafe { drivers_timer_now_as_micros() } + 1_000;
-    let t = std::time::Instant::now();
     let r = syncobj::wait(&[0], None, true, soon);
+    let t = std::time::Instant::now();
+    for _ in 0..100 {
+        syncobj::wait(&[0], None, true, soon);
+    }
     println!(
         "{NAME}: a wait on a handle the table lacks: {:.1} us",
-        t.elapsed().as_secs_f64() * 1e6
+        t.elapsed().as_secs_f64() * 1e6 / 100.0
     );
     ok("a wait on it is invalid", matches!(r, WaitOutcome::Invalid));
     let t = std::time::Instant::now();

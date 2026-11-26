@@ -231,6 +231,43 @@ impl DrmScheme for Card {
     fn nouveau_release_process(&self, pid: u64) {
         self.told.lock().push(("released", pid));
     }
+    /// The handles of the waits, each at its value's low word plus one;
+    /// none for pid 9.
+    fn exec_cpu_waits(&self, arg: usize, pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+        if pid == 9 {
+            return None;
+        }
+        // SAFETY: the copy `answer` made of the caller's struct and array.
+        let e = unsafe { &*(arg as *const Exec) };
+        let waits = unsafe {
+            core::slice::from_raw_parts(e.wait_ptr as *const [u32; 4], e.wait_count as usize)
+        };
+        Some((
+            waits.iter().map(|w| w[1]).collect(),
+            waits.iter().map(|w| w[2] as u64 + 1).collect(),
+        ))
+    }
+    /// Two fences for handle 7, the second outside the driver's memory.
+    fn cpu_prep_fences(&self, handle: u32, pid: u64) -> Vec<(usize, u32)> {
+        if handle != 7 {
+            return Vec::new();
+        }
+        vec![(FENCES + 0x40, pid as u32), (0xdead_0000, 1)]
+    }
+    fn render_fence_for_scanout(&self, handle: u32, _pid: u64) -> Option<(usize, u32)> {
+        (handle == 7).then_some((FENCES + 0x80, 9))
+    }
+    fn queued_fences(&self, handle: u32) -> Vec<crate::scheme::syncobj::HwFence> {
+        if handle != 7 {
+            return Vec::new();
+        }
+        vec![crate::scheme::syncobj::HwFence {
+            fence_va: FENCES + 0xc0,
+            fence_gpu_va: 0x10_0000,
+            payload: 12,
+            ctx_idx: 3,
+        }]
+    }
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
         (id == 50).then(|| {
             let mut e = [0u8; 128];
@@ -266,12 +303,23 @@ impl Transport for Direct {
         }
         Ok(unsafe { core::slice::from_raw_parts(addr as *const u8, len) }.to_vec())
     }
+    fn fence(&self, f: &Fence) -> Option<(usize, u32)> {
+        let off = (f.phys as usize)
+            .checked_sub(FENCES)
+            .filter(|&o| o < 4096)?;
+        Some((KERNEL_FENCES + off, 100 + f.ctx))
+    }
     fn write_user(&self, addr: usize, bytes: &[u8]) -> Result<(), i32> {
         self.1.fetch_add(1, Ordering::Relaxed);
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
         Ok(())
     }
 }
+
+/// Where the test driver's fences are: a page the kernel maps at
+/// [`KERNEL_FENCES`], and the channels it numbers from 100.
+const FENCES: usize = 0x5000_0000;
+const KERNEL_FENCES: usize = 0xffff_8000_0000_0000;
 
 /// A driver that is gone: every call is ENODEV.
 struct Gone;
@@ -593,4 +641,49 @@ fn the_driver_s_gem_objects_are_its_own_to_answer_for() {
             ("free", sum)
         ]
     );
+}
+
+#[test]
+fn the_kernel_asks_the_driver_for_an_exec_s_cpu_waits_with_the_caller_s_arrays() {
+    let (_card, remote) = pair();
+    assert_eq!(ioctl::exec_cmd(), EXEC);
+    let pushes = [[3u64, 0]];
+    let waits = [[0u32, 10, 4, 0], [0, 11, 0, 0]];
+    let mut e = exec_of(&pushes, &waits);
+    let asked = e;
+    let arg = &mut e as *mut Exec as usize;
+    assert_eq!(
+        remote.exec_cpu_waits(arg, 77),
+        Some((vec![10, 11], vec![5, 1]))
+    );
+    assert_eq!(e, asked, "the caller's struct is only read");
+    assert_eq!(remote.exec_cpu_waits(arg, 9), None);
+    // A caller's struct that is not there asks nothing.
+    assert_eq!(remote.exec_cpu_waits(0, 77), None);
+}
+
+#[test]
+fn the_driver_s_fences_reach_the_kernel_where_the_kernel_maps_them() {
+    let (_card, remote) = pair();
+    // The one outside the driver's memory is left out.
+    assert_eq!(
+        remote.cpu_prep_fences(7, 33),
+        vec![(KERNEL_FENCES + 0x40, 33)]
+    );
+    assert!(remote.cpu_prep_fences(8, 33).is_empty());
+    assert_eq!(
+        remote.render_fence_for_scanout(7, 1),
+        Some((KERNEL_FENCES + 0x80, 9))
+    );
+    assert_eq!(remote.render_fence_for_scanout(8, 1), None);
+    let q = remote.queued_fences(7);
+    assert_eq!(q.len(), 1);
+    assert_eq!(
+        (q[0].fence_va, q[0].fence_gpu_va, q[0].payload, q[0].ctx_idx),
+        (KERNEL_FENCES + 0xc0, 0x10_0000, 12, 103)
+    );
+    // A transport that cannot say where a fence is waits for none.
+    let gone = Remote::with_hello(Gone, &hello(&Card::default())).unwrap();
+    assert!(gone.cpu_prep_fences(7, 33).is_empty());
+    assert!(gone.queued_fences(7).is_empty());
 }

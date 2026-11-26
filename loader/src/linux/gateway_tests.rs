@@ -1258,6 +1258,24 @@ fn the_syncobj_table_reads_only_a_gpu_holder_s_own_memory(
     assert!(len > 0);
     let text = wire::bytes_of_words(&line, len as usize);
     assert!(core::str::from_utf8(&text).unwrap().contains("/1"));
+    // A fence the card it serves names: read where the kernel maps it, on
+    // the same channel as the driver's own, and never in another's memory.
+    let served = super::syncobj_serve::served_fence(driver, phys + 64, 3);
+    assert_eq!(
+        served,
+        Some((
+            kernel_hal::mem::phys_to_virt(phys as usize + 64),
+            kernel[0].3
+        ))
+    );
+    assert_eq!(
+        super::syncobj_serve::served_fence(driver, phys + 2 * page, 3),
+        None
+    );
+    assert_eq!(
+        super::syncobj_serve::served_fence(other, phys + 64, 3),
+        None
+    );
     // One more, that never lands: the driver dies first.
     land(0);
     syncobj::reset(h);

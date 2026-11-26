@@ -75,6 +75,13 @@ pub const NESTED: &[(u32, &[Array])] = &[
     (0x40 + 0x41, &[array(4, 8, 40), array(20, 32, 24)]),
 ];
 
+/// `DRM_IOCTL_NOUVEAU_EXEC`, the command whose waits the kernel asks for
+/// ahead of the call ([`super::op::EXEC_CPU_WAITS`]).
+pub fn exec_cmd() -> u32 {
+    let size = crate::display::EXEC_REQUEST_BYTES as u32;
+    (3 << 30) | (size << 16) | (0x64 << 8) | (0x40 + 0x12)
+}
+
 /// The arrays of command `cmd`'s struct, none for most.
 pub fn nested(cmd: u32) -> &'static [Array] {
     let nr = cmd & 0xff;
@@ -115,15 +122,14 @@ fn extent(top: &[u8], a: &Array) -> Option<(usize, u64)> {
     Some((count.checked_mul(a.elem)?, ptr))
 }
 
-/// The kernel's end: ioctl `cmd` on `arg`, by the caller `pid` on DRM file
-/// `file`, sent to the driver over `to`.
-pub fn call<T: Transport>(
+/// The message of ioctl `cmd` on `arg` (the caller's), by DRM file
+/// `file`, and the struct as the caller had it.
+pub fn message<T: Transport>(
     to: &T,
-    send: impl FnOnce(&[u8]) -> Result<Vec<u8>, i32>,
     cmd: u32,
     arg: usize,
     file: usize,
-) -> Result<usize, i32> {
+) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let size = ioc_size(cmd);
     let mut msg = Vec::with_capacity(16 + size);
     msg.extend_from_slice(&(file as u64).to_le_bytes());
@@ -143,6 +149,19 @@ pub fn call<T: Transport>(
             msg.extend_from_slice(&to.read_user(ptr as usize, len)?);
         }
     }
+    Ok((msg, top))
+}
+
+/// The kernel's end: ioctl `cmd` on `arg`, by the caller `pid` on DRM file
+/// `file`, sent to the driver over `to`.
+pub fn call<T: Transport>(
+    to: &T,
+    send: impl FnOnce(&[u8]) -> Result<Vec<u8>, i32>,
+    cmd: u32,
+    arg: usize,
+    file: usize,
+) -> Result<usize, i32> {
+    let (msg, top) = message(to, cmd, arg, file)?;
     let back = send(&msg)?;
     let ret = u64_at(&back, 0).ok_or(EINVAL)? as i64;
     let after = &back[8..];
@@ -192,6 +211,23 @@ fn aligned(bytes: &[u8]) -> Vec<u64> {
 }
 
 fn run(gpu: &dyn DrmScheme, cmd: u32, pid: u64, data: &[u8]) -> Result<(i64, Vec<u8>), i32> {
+    unpacked(cmd, data, |at, file| {
+        match gpu.ioctl_file(cmd, at, pid, file) {
+            Ok(v) => v as i64,
+            Err(errno) => -(errno as i64),
+        }
+    })
+}
+
+/// The message `data` of command `cmd` unpacked as [`answer`] does, and
+/// `f` called with the driver's pointer to its copy of the struct (or the
+/// argument word, for a command with none) and the DRM file: what `f`
+/// said, and the struct after it, with the caller's pointers.
+pub fn unpacked<R>(
+    cmd: u32,
+    data: &[u8],
+    f: impl FnOnce(usize, usize) -> R,
+) -> Result<(R, Vec<u8>), i32> {
     let size = ioc_size(cmd);
     let file = u64_at(data, 0).ok_or(EINVAL)? as usize;
     let arg = u64_at(data, 8).ok_or(EINVAL)? as usize;
@@ -225,10 +261,7 @@ fn run(gpu: &dyn DrmScheme, cmd: u32, pid: u64, data: &[u8]) -> Result<(i64, Vec
     } else {
         arg
     };
-    let ret = match gpu.ioctl_file(cmd, at, pid, file) {
-        Ok(v) => v as i64,
-        Err(errno) => -(errno as i64),
-    };
+    let ret = f(at, file);
     drop(arrays);
     // SAFETY: as above.
     let mut after =
