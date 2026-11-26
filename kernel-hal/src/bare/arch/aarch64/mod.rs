@@ -3,6 +3,7 @@ pub mod cpu;
 pub mod drivers;
 pub mod interrupt;
 pub mod mem;
+pub mod smmuv3;
 pub mod smp;
 pub mod timer;
 pub mod trap;
@@ -20,6 +21,14 @@ static CMDLINE: InitOnce<String> = InitOnce::new_with_default(String::new());
 
 pub fn cmdline() -> String {
     CMDLINE.clone()
+}
+
+/// The boot's `firmware_type` (`Boot.json`), copied while it can still be
+/// read: like the command line, it lives in the loader's memory.
+static FIRMWARE: InitOnce<String> = InitOnce::new_with_default(String::new());
+
+pub fn firmware_type() -> String {
+    FIRMWARE.clone()
 }
 
 pub fn init_ram_disk() -> Option<&'static mut [u8]> {
@@ -52,6 +61,7 @@ fn init_percpu_control_regs() {
 pub fn primary_init_early() {
     init_percpu_control_regs();
     CMDLINE.init_once_by(KCONFIG.cmdline.to_string());
+    FIRMWARE.init_once_by(KCONFIG.firmware_type.to_string());
     drivers::init_early();
 }
 

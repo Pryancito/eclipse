@@ -62,6 +62,17 @@ fn claim_registration() -> bool {
     !REGISTERED.swap(true, Ordering::SeqCst)
 }
 
+/// Register only the PCI "drivers" that leave a controller to its driver in
+/// userspace (NVMe, AHCI): for a bus, aarch64's, where the kernel drove
+/// nothing before and takes nothing on now.
+pub fn init_for_userspace() {
+    if !claim_registration() {
+        return;
+    }
+    register(&crate::pci_disks::NvmeForUser);
+    register(&crate::pci_disks::AhciForUser);
+}
+
 /// Registra todos los drivers PCI conocidos.
 ///
 /// Debe llamarse una vez en tiempo de inicialización, antes de enumerar el bus

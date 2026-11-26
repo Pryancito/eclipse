@@ -3610,12 +3610,15 @@ fn proc_gpuready_content() -> String {
     // A read is the signal the deferred bring-up actually wanted: init has got
     // as far as starting a GPU session. See `drm::gpu_ready_was_read`.
     crate::fs::devfs::drm::note_gpu_ready_read();
+    use crate::fs::devfs::served::card;
+    let left = card::left_to_udrv_nvidia();
     gpuready_report(
-        crate::fs::devfs::drm::console_bringup_expected(),
+        crate::fs::devfs::drm::console_bringup_expected() || left > 0,
         kernel_hal::drivers::all_drm()
             .as_vec()
             .iter()
-            .filter_map(|d| d.console_gpu_ready()),
+            .filter_map(|d| d.console_gpu_ready())
+            .chain(card::left_to_userspace(left, card::served_gpus())),
     )
 }
 

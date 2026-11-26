@@ -6,10 +6,11 @@
 //! (`scheme::drm_remote`): this is only the link under it, and the card's
 //! place in the DRM core's list and in `/dev/dri`.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use rcore_fs::vfs::INode;
 use zcore_drivers::scheme::drm_remote::{self, Fence, Remote, Transport};
@@ -110,6 +111,39 @@ pub(crate) fn forget_served(card: &Arc<dyn DrmScheme>) {
 }
 
 /// What [`serve_card`] made: the card, for whoever watches its server.
+/// The cards of a GPU (one a nouveau client can use) a process serves now:
+/// what `/proc/gpuready` waits for on a boot that leaves its NVIDIA GPUs to
+/// `udrv-nvidia`.
+static SERVED_GPUS: AtomicUsize = AtomicUsize::new(0);
+
+/// `/proc/gpuready`'s lines for the `left` NVIDIA GPUs the boot leaves to
+/// `udrv-nvidia` (`udriver=nvidia@N`), of which processes serve `served`
+/// cards now: one not served yet is one a GPU session must wait for, as
+/// for the kernel's console GPU, or the compositor starts on no GPU.
+pub fn left_to_userspace(left: usize, served: usize) -> impl Iterator<Item = (bool, String)> {
+    (0..left).map(move |n| {
+        let up = n < served;
+        let state = if up { "served" } else { "not served yet" };
+        (
+            up,
+            alloc::format!("nvidia@{n}: left to udrv-nvidia, {state}"),
+        )
+    })
+}
+
+/// How many NVIDIA GPUs the boot leaves to userspace (`udriver=nvidia@N`).
+pub fn left_to_udrv_nvidia() -> usize {
+    kernel_hal::drivers::user::reserved()
+        .iter()
+        .filter(|d| d.starts_with("nvidia@"))
+        .count()
+}
+
+/// How many cards of a GPU processes serve now ([`SERVED_GPUS`]).
+pub fn served_gpus() -> usize {
+    SERVED_GPUS.load(Ordering::SeqCst)
+}
+
 pub struct ServedCard {
     link: Arc<Link>,
     card: Arc<dyn DrmScheme>,
@@ -132,6 +166,9 @@ impl ServedCard {
     pub fn gone(&self) {
         self.link.close();
         forget_served(&self.card);
+        if self.card.nouveau_uapi_capable() {
+            SERVED_GPUS.fetch_sub(1, Ordering::SeqCst);
+        }
         drm::unregister_driver(&self.card);
         drm::build_gpu_nodes();
         info!("served drm: the card {} is gone", self.card.name());
@@ -163,6 +200,9 @@ pub fn serve_card(
     let card: Arc<dyn DrmScheme> = Arc::new(remote);
     enable_nouveau_uapi(&*card);
     note_served(&card);
+    if card.nouveau_uapi_capable() {
+        SERVED_GPUS.fetch_add(1, Ordering::SeqCst);
+    }
     drm::register_driver(card.clone());
     drm::build_gpu_nodes();
     add_nodes();

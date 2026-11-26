@@ -39,6 +39,7 @@ pub mod phys_watch;
 pub mod rand;
 pub mod rtc;
 pub mod shrinker;
+pub mod smmuv3;
 pub mod stop_screen;
 pub mod timer_waker;
 pub mod tsc_cal;
