@@ -41,4 +41,5 @@ pub mod stop_screen;
 pub mod timer_waker;
 pub mod tsc_cal;
 pub mod user;
+pub mod vtd;
 pub mod watchpoint;

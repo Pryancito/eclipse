@@ -163,6 +163,7 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
 /// when an IOMMU is in use and covers it, so it sees only what its driver
 /// pins; otherwise passthrough, every byte, as on a machine without one.
 fn dma_view(device: &user::UserDevice) -> Arc<Iommu> {
+    watch_faults();
     let domain = device.pci_place().and_then(|place| {
         kernel_hal::iommu::domain_for(kernel_hal::iommu::PciRequester {
             segment: 0,
@@ -181,6 +182,27 @@ fn dma_view(device: &user::UserDevice) -> Arc<Iommu> {
             Iommu::create()
         }
     }
+}
+
+/// How often the IOMMU's fault records are read: it raises no interrupt.
+const FAULT_POLL: Duration = Duration::from_millis(250);
+
+/// Start reading the IOMMU's fault records into the log, once, when there
+/// is an IOMMU and a device is first claimed.
+fn watch_faults() {
+    static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let Some(unit) = kernel_hal::iommu::unit() else {
+        return;
+    };
+    if STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    kernel_hal::thread::spawn(async move {
+        loop {
+            unit.poll_faults();
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + FAULT_POLL).await;
+        }
+    });
 }
 
 /// How long a dead driver's threads are given to be gone before its device

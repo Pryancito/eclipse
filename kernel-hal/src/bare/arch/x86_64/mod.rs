@@ -8,6 +8,7 @@ pub(crate) mod power;
 pub(crate) mod pat;
 mod smp;
 mod trap;
+mod vtd;
 
 pub mod config;
 pub mod cpu;

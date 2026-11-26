@@ -497,6 +497,14 @@ ifneq ($(NIC2),)
 endif
 qemu_opts += -no-reboot
 
+# IOMMU=intel: an Intel IOMMU (VT-d, QEMU `intel-iommu`) in front of the PCI
+# devices. The kernel only uses it with `KOPTS=iommu=on`; without that the
+# devices are as without one. It has to come before every other device.
+# virtio devices bypass it unless they are given `iommu_platform=on`.
+ifeq ($(IOMMU),intel)
+  qemu_opts := -device intel-iommu $(qemu_opts)
+endif
+
 # Capture packets to dump.pcap only when explicitly requested (PCAP=on).
 # The filter-dump hook adds a synchronous disk write per packet and can
 # reduce bulk-download throughput by an order of magnitude.
