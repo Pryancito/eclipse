@@ -31,7 +31,7 @@ eclipse-look win11      # Windows 11
 | Clock | at the bottom, big and bold (10x20); date on top | one line at the bottom, date on top | two lines, time over date | two lines, time over date |
 | Terminal | tecno palette (gold as yellow) | violet palette | Breeze palette (Konsole) | Campbell palette (Windows Terminal) |
 | Wallpaper | golden eclipse on black with a greenish halo, thin rings and the caption `ECLIPSE · SYSTEM · KERNEL · ZCORE` | animated cosmos with stars, grid and a text ring | animated cosmos | animated cosmos |
-| Files and browser | straight lunarfile, upper-case columns and gold folders; SilverSurfer with the same palette | violet palette | Breeze palette | Windows 11 palette |
+| Files | straight lunarfile, upper-case columns and gold folders | violet palette | Breeze palette | Windows 11 palette |
 | Launcher | in the top third, straight, with gold corner brackets | in the top third | in the top third | Start menu above the bar |
 
 `tecno` is the "Orbital HUD" look from the mock-up Moebius picked (see
@@ -436,8 +436,8 @@ the ESP as `/etc/fstab` says (`eclipse-fs-mounts`) before touching
 `rboot.conf`; `reinicio = si` marks what is read at boot.
 
 The desktop settings that used to be environment variables only
-(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`,
-`SILVERSURFER_ADBLOCK`) live in `/etc/eclipse/entorno`, `NAME=value` lines.
+(`LUNARBG_STATIC`, `LUNARBG_FPS`, `LUNARBAR_HEIGHT`, `LUNAR_FX`, `LUNAR_TEXT`)
+live in `/etc/eclipse/entorno`, `NAME=value` lines.
 `eclipse-entorno NAME VALUE` writes them: it takes those names and plain
 words only, removes the line for `auto`, and asks eclipse-init to restart
 the wallpaper or the bar. Programs read the file when they start

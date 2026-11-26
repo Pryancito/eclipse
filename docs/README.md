@@ -50,8 +50,7 @@ lleva arriba un enlace para cambiar de idioma. El punto de partida es el
 ## Herramientas
 
 Cada herramienta de `tools/` tiene su propio README en los dos idiomas, por
-ejemplo [eclipse-bench](../tools/eclipse-bench/README.es.md),
-[SilverSurfer](../tools/SilverSurfer/README.md) o
+ejemplo [eclipse-bench](../tools/eclipse-bench/README.es.md) o
 [Docker](../tools/docker/README.es.md). También [rboot](../rboot/README.es.md)
 y los [binarios precompilados](../prebuilt/README.es.md).
 

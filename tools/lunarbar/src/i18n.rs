@@ -1,8 +1,7 @@
 //! The panel's UI language, which is [`eclipse_i18n`]'s.
 //!
 //! The table itself lives in `tools/eclipse-i18n`, because lunarbar is not the
-//! only client that draws Spanish: SilverSurfer and lunarbg are separate
-//! crates and cannot link a module inside lunarbar. This module is the
+//! only client that draws Spanish: lunarbg is a separate crate and cannot link a module inside lunarbar. This module is the
 //! re-export, so the seventy-odd `i18n::Lang` call sites in the panel did not
 //! have to change when the strings moved.
 //!

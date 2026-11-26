@@ -1,6 +1,6 @@
 //! `/etc/eclipse/entorno`: the desktop settings that used to live only in
 //! environment variables (`LUNAR_TEXT`, `LUNAR_FX`, `LUNARBAR_HEIGHT`,
-//! `LUNARBG_STATIC`, `SILVERSURFER_ADBLOCK`; and `LUNAR_ACCENT`,
+//! `LUNARBG_STATIC`; and `LUNAR_ACCENT`,
 //! `LUNAR_CLOCK`, which never were variables), kept in a file so that the
 //! control panel can change them.
 //!
@@ -10,8 +10,7 @@
 //! test; otherwise the program reads the file when it starts, and a setting
 //! changed in the panel holds for every program opened after it.
 //!
-//! It lives in this crate because every Lunar client and SilverSurfer
-//! already links it.
+//! It lives in this crate because every Lunar client already links it.
 
 /// Where the settings are.
 pub const FICHERO: &str = "/etc/eclipse/entorno";

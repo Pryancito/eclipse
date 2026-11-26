@@ -47,7 +47,6 @@ fn every_shipped_block_is_used_and_none_is_left_out() {
             "barra.alto",
             "efectos",
             "texto",
-            "navegador.anuncios",
             "arranque.log",
             "arranque.smp",
             "arranque.renderer",
@@ -268,7 +267,7 @@ fn the_desktop_blocks_go_through_eclipse_entorno_and_read_its_file() {
     let c = shipped();
     let g = c.grupos.iter().position(|g| g.id == "escritorio").unwrap();
     let desk = c.del_grupo(g);
-    assert_eq!(desk.len(), 6);
+    assert_eq!(desk.len(), 5);
     for &i in &desk {
         let k = &c.claves[i];
         let var = k.clave.as_deref().unwrap();

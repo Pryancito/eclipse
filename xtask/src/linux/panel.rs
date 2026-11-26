@@ -138,7 +138,6 @@ fn write_entorno(localbin: &Path) {
           \x20 LUNAR_FX|LUNAR_TEXT) restart='lunarbar lunarbg' ;;\n\
           \x20 LUNAR_ACCENT) restart=lunarbar ;;\n\
           \x20 LUNAR_CLOCK) restart=lunarbar ;;\n\
-          \x20 SILVERSURFER_ADBLOCK) restart= ;;\n\
           \x20 *) echo \"eclipse-entorno: $name no es un ajuste del entorno\" >&2; exit 2 ;;\n\
           esac\n\
           case \"$value\" in\n\

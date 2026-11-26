@@ -75,16 +75,3 @@ es      = Texto suavizado
 en      = Smooth text
 ayuda   = Sin él, letra de mapa de bits, más nítida en pantallas pequeñas
 ayuda.en = Without it, a bitmap face, crisper on small screens
-
-[navegador.anuncios]
-grupo   = escritorio
-fichero = /etc/eclipse/entorno
-clave   = SILVERSURFER_ADBLOCK
-tipo    = si-no
-valores = 1 0
-defecto = 1
-aplicar = /usr/local/bin/eclipse-entorno SILVERSURFER_ADBLOCK {}
-es      = SilverSurfer bloquea anuncios
-en      = SilverSurfer blocks ads
-ayuda   = Vale para las ventanas que se abran después
-ayuda.en = Holds for the windows opened after it

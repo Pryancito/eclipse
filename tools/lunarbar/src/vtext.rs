@@ -6,7 +6,7 @@
 //! advances exactly `GLYPH_W` (or `BIG_W`) pixels in a `GLYPH_H` (or `BIG_H`)
 //! cell, so every layout computed in cells stays where it was and only the
 //! ink inside each cell changes. The face, the cache and the fallback rules
-//! live in `tools/lunartext`, shared with lunarbg and SilverSurfer.
+//! live in `tools/lunartext`, shared with lunarbg.
 
 pub use lunartext::{Glyph, Weight};
 

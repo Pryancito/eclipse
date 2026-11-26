@@ -1214,11 +1214,12 @@ mod cableado_tests {
 
         // Y la cuenta, para que quitar una puerta se note aunque su `if`
         // cambie de forma. Si añades una cache nueva --con su puerta-- sube
-        // este numero.
+        // este numero. (Eran 27; las cuatro de SilverSurfer se fueron con
+        // el navegador el 26-nov-2026.)
         let puertas = src.matches("self.cached_for_target(").count();
         assert_eq!(
-            puertas, 27,
-            "las puertas del arco eran 27 y ahora son {puertas}: si has añadido \
+            puertas, 23,
+            "las puertas del arco eran 23 y ahora son {puertas}: si has añadido \
              una cache con la suya, sube el numero; si has quitado una puerta, no"
         );
 

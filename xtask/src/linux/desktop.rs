@@ -35,12 +35,10 @@ use std::{fs, path::Path};
 mod firefox;
 mod locale;
 mod look;
-mod silversurfer;
 mod tecno;
 mod upstream;
 
 pub(crate) use firefox::*;
-pub(crate) use silversurfer::*;
 
 /// Install the whole desktop into the rootfs. Called from the rootfs build;
 /// everything is plain file writes, so it is safe on incremental rebuilds.
@@ -64,8 +62,6 @@ pub fn install(rootfs: &Path) {
     // The firefox .desktop override is written after apk has run (mod.rs),
     // next to the default prefs: which id to shadow depends on which
     // package landed.
-    write_silversurfer_wrapper(rootfs);
-    write_silversurfer_desktop_entry(rootfs);
     write_freedoom_wrapper(rootfs);
     write_freedoom_desktop_entries(rootfs);
     write_files_desktop_entry(rootfs);
@@ -2502,7 +2498,6 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Archivos"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
     <item label="Portapapeles (Super+V)"><action name="Execute"><command>/usr/local/bin/eclipse-clipboard</command></action></item>
-    <item label="SilverSurfer"><action name="Execute"><command>/usr/local/bin/eclipse-browser</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -2533,7 +2528,6 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Files"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
     <item label="Clipboard (Super+V)"><action name="Execute"><command>/usr/local/bin/eclipse-clipboard</command></action></item>
-    <item label="SilverSurfer"><action name="Execute"><command>/usr/local/bin/eclipse-browser</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
