@@ -321,6 +321,12 @@ fn quiesce_devices() {
     if done > 0 {
         info!("{} NVMe controller(s) of userspace drivers shut down", done);
     }
+    // The GPUs a process drives (`udrv-nvidia`), likewise not told: reset
+    // so a GSP-RM it brought up does not stall the firmware's POST.
+    let reset = zcore_drivers::user::reset_gpus_for_reboot();
+    if reset > 0 {
+        info!("{} NVIDIA GPU(s) of userspace drivers reset (FLR)", reset);
+    }
 }
 
 hal_fn_impl! {
