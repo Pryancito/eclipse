@@ -22,7 +22,8 @@
 //!   DMA memory): an escape's parameters reached through its pointer, the
 //!   GPU node, mappings of its memory and its BAR, pages of the caller's
 //!   lent to it and given back, an OS event posted from its nonstall
-//!   interrupt waking a `poll`, the close.
+//!   interrupt waking a `poll`, a UVM semaphore pool lent to it while it
+//!   has memory of it (`nvidia.uvm` too), the close.
 mod drm;
 mod gem;
 mod gpu;
@@ -341,6 +342,7 @@ fn nvctl_check(vendor: u16, device: u16) {
     );
     lent_pages_check(rm, &map, &ok);
     os_event_check(rm, &ok);
+    uvm_check(rm, &ctl, &ok);
     drop(ctl);
     let start = Instant::now();
     while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {
@@ -529,6 +531,61 @@ fn os_event_check(rm: &nvctl::check::CheckRm, ok: &dyn Fn(&str, bool)) {
     ok(
         "...once",
         ioctl(FREE_OS_EVENT, &mut free) == 0 && status(&free) != 0,
+    );
+}
+
+/// `nvctl-check`'s UVM: a VA space with the served RM's GPU and a GPU VA
+/// space on it, then a semaphore pool, whose pages are lent to the RM
+/// for the memory it makes of them and given back when the pool is freed.
+fn uvm_check(rm: &nvctl::check::CheckRm, ctl: &std::fs::File, ok: &dyn Fn(&str, bool)) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    let Some(uvm) = open_rw("/dev/nvidia-uvm") else {
+        println!("{NAME}: no /dev/nvidia-uvm (nvidia.uvm is off): UVM not checked");
+        return;
+    };
+    let call = |cmd: u64, p: &mut [u8], status_at: usize| {
+        // SAFETY: `p` is the whole of the command's params.
+        let ret = unsafe { libc::ioctl(uvm.as_raw_fd(), cmd as _, p.as_mut_ptr()) };
+        ret == 0 && p[status_at..status_at + 4] == [0; 4]
+    };
+    let uuid = [0x5au8; 16];
+    ok("UVM initializes", call(0x3000_0001, &mut [0u8; 16], 8));
+    let mut gpu = [0u8; 40];
+    gpu[..16].copy_from_slice(&uuid);
+    ok("...with the served RM's GPU", call(37, &mut gpu, 36));
+    let mut vas = [0u8; 32];
+    vas[..16].copy_from_slice(&uuid);
+    vas[16..20].copy_from_slice(&ctl.as_raw_fd().to_le_bytes());
+    vas[20..24].copy_from_slice(&0xc1d0_0002u32.to_le_bytes());
+    vas[24..28].copy_from_slice(&0x5c00_0007u32.to_le_bytes());
+    ok("...and a GPU VA space on it", call(25, &mut vas, 28));
+    let given = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    const BASE: u64 = 0x7e00_0000_0000;
+    const LEN: u64 = 2 * 4096;
+    let mut pool = vec![0u8; 9248];
+    pool[0..8].copy_from_slice(&BASE.to_le_bytes());
+    pool[8..16].copy_from_slice(&LEN.to_le_bytes());
+    ok("a semaphore pool is made", call(68, &mut pool, 9240));
+    ok(
+        "...its pages lent to the RM, held while it has memory of them",
+        rm.pool_size.load(Ordering::Relaxed) == LEN
+            && rm.pools.lock().unwrap().len() == 1
+            && nvctl::GIVEN_BACK.load(Ordering::Relaxed) == given,
+    );
+    ok(
+        "...and mapped on the GPU",
+        rm.mapped.load(Ordering::Relaxed) == 1,
+    );
+    let mut free = [0u8; 24];
+    free[0..8].copy_from_slice(&BASE.to_le_bytes());
+    free[8..16].copy_from_slice(&LEN.to_le_bytes());
+    ok("...and freed", call(34, &mut free, 16));
+    ok(
+        "...its pages given back with the memory",
+        rm.pools.lock().unwrap().is_empty()
+            && nvctl::GIVEN_BACK.load(Ordering::Relaxed) != given
+            && nvctl::GIVE_BACK_REFUSED.load(Ordering::Relaxed) == 0,
     );
 }
 

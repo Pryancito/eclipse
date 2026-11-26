@@ -176,7 +176,7 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let lend: nvctl::Lender = Arc::new(move |pages| {
         let runs = linux_object::fs::devfs::nvidia::runs_of(pages)?;
         let loan =
-            super::device_claim::lend_to_devices(&lender, runs, &pages.phys, pages.writable)?;
+            super::device_claim::lend_to_devices(&lender, &runs, &pages.phys, pages.writable)?;
         Some(alloc::boxed::Box::new(loan) as alloc::boxed::Box<dyn nvctl::Loan>)
     });
     let server = nvctl::Server {

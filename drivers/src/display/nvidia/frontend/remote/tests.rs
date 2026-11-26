@@ -1,6 +1,7 @@
 use super::super::{
     alloc_os_event, cards, free_os_event, map_unrecorded, release, rm_escape, rm_escape_lending,
-    rm_map_memory, rm_up, service_nonstall,
+    rm_map_memory, rm_up, service_nonstall, uvm_free, uvm_map_external, uvm_p2p_caps, uvm_pages,
+    uvm_sked_reflected, uvm_user_pages, uvm_va_space_device,
 };
 use super::*;
 use alloc::vec;
@@ -110,6 +111,12 @@ struct Mirror {
     freed: lock::Mutex<Option<(u32, u32)>>,
     /// What a look at the nonstall interrupts finds.
     nonstall: lock::Mutex<Option<NonstallPoll>>,
+    /// UVM: the last mapping, object freed, block of pages (held while
+    /// the RM would have memory of them) and user pages it was given.
+    mapped: lock::Mutex<Option<ExternalMapping>>,
+    uvm_freed: lock::Mutex<Option<(u32, u32)>>,
+    held: lock::Mutex<Option<(u64, u64, Arc<dyn core::any::Any + Send + Sync>)>>,
+    uvm_lent: lock::Mutex<Option<(usize, Vec<u64>, u32, bool)>>,
 }
 
 impl Rm for Mirror {
@@ -160,6 +167,75 @@ impl Rm for Mirror {
 
     fn service_nonstall(&self) -> NonstallPoll {
         self.nonstall.lock().unwrap_or(NonstallPoll::Serviced(0))
+    }
+
+    fn uvm_va_space_device(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_va_space: u32,
+        gpu_instance: u32,
+    ) -> Result<u32, NV_STATUS> {
+        assert_eq!(caller.pid, 4242);
+        match gpu_instance {
+            0 => Ok(h_client ^ h_va_space),
+            _ => Err(0x33),
+        }
+    }
+
+    fn uvm_map_external(&self, _caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
+        *self.mapped.lock() = Some(*m);
+        Ok(0x7171)
+    }
+
+    fn uvm_free(&self, _caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
+        *self.uvm_freed.lock() = Some((h_client, h_object));
+        if h_object == 0x9191 {
+            // The memory made of the pool: the RM lets the pages go.
+            *self.held.lock() = None;
+        }
+        NV_OK
+    }
+
+    fn uvm_sked_reflected(&self, _caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
+        Ok((r.h_client + 1, r.h_device + 1))
+    }
+
+    fn uvm_p2p_caps(&self, a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+        if a == b {
+            return Err(0x44);
+        }
+        Ok(P2pCaps {
+            read: 1,
+            write: 1,
+            atomics: 0,
+            connectivity: a << 8 | b,
+        })
+    }
+
+    fn uvm_pages(
+        &self,
+        _caller: &Caller,
+        _h_client: u32,
+        _h_device: u32,
+        pages: &Pages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        assert!(gpu_cached);
+        *self.held.lock() = Some((pages.phys, pages.size, pages.keep.clone()));
+        Ok(0x9191)
+    }
+
+    fn uvm_user_pages(
+        &self,
+        _caller: &Caller,
+        h_client: u32,
+        _h_device: u32,
+        pages: UserPages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        *self.uvm_lent.lock() = Some((pages.va, pages.phys.clone(), h_client, gpu_cached));
+        Ok(0xa1a1)
     }
 }
 
@@ -557,4 +633,139 @@ fn a_nonstall_look_and_an_os_event_go_whole() {
         answer(&rm, op::FREE_OS_EVENT, 1 << 40, &msg, &mut out),
         Err(EINVAL)
     );
+}
+
+/// What `/dev/nvidia-uvm` asks of a served RM reaches the process's and
+/// comes back: its calls, a managed range's pages lent and given back, and
+/// a semaphore pool's pages lent to it and held for as long as it has
+/// memory of them.
+#[test]
+fn uvm_reaches_a_served_rm() {
+    let _g = crate::test_globals::LOCK.lock();
+    set_give_back(give_back_as_server);
+    let given = || GIVEN.load(Ordering::SeqCst);
+    let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
+    let link: Arc<dyn Link> = direct.clone();
+    serve(link.clone(), &hello_of(true, &[card(0, Some(0))]), server()).unwrap();
+    let c = a_caller();
+
+    assert_eq!(uvm_va_space_device(&c, 0xc1, 0x5c, 0), Ok(0xc1 ^ 0x5c));
+    assert_eq!(uvm_va_space_device(&c, 0xc1, 0x5c, 1), Err(0x33));
+    let m = ExternalMapping {
+        h_client: 1,
+        h_device: 2,
+        h_va_space: 3,
+        h_memory: 4,
+        offset: 0x1000,
+        base: 0x2_0000_0000,
+        length: 0x20_0000,
+        read_only: true,
+    };
+    assert_eq!(uvm_map_external(&c, &m), Ok(0x7171));
+    assert_eq!(*direct.0.mapped.lock(), Some(m));
+    let r = SkedRange {
+        h_client: 5,
+        h_device: 6,
+        h_va_space: 7,
+        base: 0x3_0000_0000,
+        length: 0x1000,
+    };
+    assert_eq!(uvm_sked_reflected(&c, &r), Ok((6, 7)));
+    assert_eq!(
+        uvm_p2p_caps(1, 2),
+        Ok(P2pCaps {
+            read: 1,
+            write: 1,
+            atomics: 0,
+            connectivity: 0x102
+        })
+    );
+    assert_eq!(uvm_p2p_caps(1, 1), Err(0x44));
+
+    // A managed range's pages: lent, and back when the RM lets them go.
+    let before = given();
+    let pages = pinned(0x7000_0000, vec![0x5000, 0x9000]);
+    assert_eq!(uvm_user_pages(&c, 8, 9, pages, false), Ok(0xa1a1));
+    assert_eq!(
+        *direct.0.uvm_lent.lock(),
+        Some((0x7000_0000, vec![0x5000, 0x9000], 8, false))
+    );
+    assert_eq!(given(), before + 1, "the Mirror did not keep them");
+
+    // A pool's pages: one block, held by the RM until its memory goes.
+    let keep: Arc<dyn core::any::Any + Send + Sync> = Arc::new(7u32);
+    let block = Pages {
+        phys: 0x10_0000,
+        size: 0x3000,
+        keep: &keep,
+    };
+    assert_eq!(uvm_pages(&c, 8, 9, &block, true), Ok(0x9191));
+    let held = direct.0.held.lock().as_ref().map(|(p, s, _)| (*p, *s));
+    assert_eq!(held, Some((0x10_0000, 0x3000)));
+    assert_eq!(given(), before + 1, "held");
+    assert_eq!(Arc::strong_count(&keep), 2, "the loan keeps them allocated");
+    assert_eq!(uvm_free(&c, 8, 0x9191), NV_OK);
+    assert_eq!(*direct.0.uvm_freed.lock(), Some((8, 0x9191)));
+    assert_eq!(given(), before + 2, "given back with the memory");
+    assert_eq!(Arc::strong_count(&keep), 1);
+    let odd = Pages {
+        phys: 0x10_0000,
+        size: 0x1800,
+        keep: &keep,
+    };
+    assert!(uvm_pages(&c, 8, 9, &odd, true).is_err());
+    gone(&link);
+}
+
+/// A UVM call's words go whole, and a message that is not one is refused.
+#[test]
+fn uvm_calls_go_whole() {
+    for r in [Ok(0), Ok(u32::MAX), Err(0x56)] {
+        assert_eq!(decode_result(encode_result(r)), Some(r));
+    }
+    assert_eq!(decode_result(2 << 32), None);
+    let rm = Mirror::default();
+    let mut out = Vec::new();
+    let mut msg = encode_caller(&a_caller()).to_vec();
+    msg.extend_from_slice(&words(&[1, 2, 0, 0]));
+    assert_eq!(
+        answer(&rm, op::UVM_VA_SPACE_DEVICE, 0, &msg, &mut out),
+        Ok(3)
+    );
+    let n = msg.len();
+    msg[n - 1] = 1;
+    assert_eq!(
+        answer(&rm, op::UVM_VA_SPACE_DEVICE, 0, &msg, &mut out),
+        Err(EINVAL)
+    );
+    let mut bad = encode_caller(&a_caller()).to_vec();
+    let mut m = encode_external(&ExternalMapping {
+        h_client: 1,
+        h_device: 2,
+        h_va_space: 3,
+        h_memory: 4,
+        offset: 0,
+        base: 0,
+        length: 0,
+        read_only: false,
+    });
+    m[40] = 2;
+    bad.extend_from_slice(&m);
+    assert_eq!(
+        answer(&rm, op::UVM_MAP_EXTERNAL, 0, &bad, &mut out),
+        Err(EINVAL)
+    );
+    assert_eq!(
+        answer(&rm, op::UVM_FREE, 0, &msg[..CALLER_LEN + 4], &mut out),
+        Err(EINVAL)
+    );
+    // Pool pages that are not one block.
+    let pages = pinned(0, vec![0x1000, 0x5000]);
+    let mut lent = encode_caller(&a_caller()).to_vec();
+    lent.extend_from_slice(&encode_loan(3, &pages));
+    for p in &pages.phys {
+        lent.extend_from_slice(&p.to_le_bytes());
+    }
+    lent.extend_from_slice(&words(&[1, 2, 1, 0]));
+    assert_eq!(answer(&rm, op::UVM_PAGES, 0, &lent, &mut out), Err(EINVAL));
 }

@@ -113,14 +113,17 @@ fn reply(rm: &dyn Rm, node: &Node, req: &Msg) -> Msg {
 /// `RM_FREE` of its handle or the close, or refuses them for handle
 /// [`REFUSED`]. Its OS events are the RM's own registrations, and its
 /// nonstall interrupt is pending once after each: a look at it posts
-/// [`EVENT`] to the last one registered, as an engine's would.
+/// [`EVENT`] to the last one registered, as an engine's would. UVM's
+/// calls each make a handle; a semaphore pool's pages are held from the
+/// memory made of them until it is freed.
 pub mod check {
     use nvidia_rm_sys::frontend::events;
     use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use zcore_drivers::display::nvctl::remote::{hello_of, Rm, ServedCard};
     use zcore_drivers::display::nvctl::{
-        Caller, Card, MmapContext, NonstallPoll, RawMmapContext, UserPages,
+        Caller, Card, ExternalMapping, MmapContext, NonstallPoll, Pages, RawMmapContext, UserPages,
     };
 
     /// `NV_ESC_RM_CONTROL`, and `NVOS54_PARAMETERS`' size.
@@ -170,6 +173,18 @@ pub mod check {
         /// nonstall interrupt is pending; and how many looks it has had.
         pub pending: Mutex<Option<(u32, u32)>>,
         pub looks: AtomicU32,
+        /// UVM: handles made, the pool's pages it holds by the memory's
+        /// handle, and the size of the last block.
+        pub uvm_handles: AtomicU32,
+        pub pools: Mutex<Vec<(u32, Arc<dyn std::any::Any + Send + Sync>)>>,
+        pub pool_size: AtomicU64,
+        pub mapped: AtomicU32,
+    }
+
+    impl CheckRm {
+        fn handle(&self) -> u32 {
+            0xd000 + self.uvm_handles.fetch_add(1, Ordering::Relaxed)
+        }
     }
 
     fn mapping(ctl: bool, memory_type: u32, caching: u32, start: u64) -> Option<MmapContext> {
@@ -327,6 +342,41 @@ pub mod check {
             events::eclipse_rm_frontend_post_event(event, h, index, info32, info16, 1);
             events::osDereferenceObjectCount(event);
             NonstallPoll::Serviced(1)
+        }
+
+        fn uvm_va_space_device(
+            &self,
+            _caller: &Caller,
+            _h_client: u32,
+            _h_va_space: u32,
+            _gpu_instance: u32,
+        ) -> Result<u32, u32> {
+            Ok(self.handle())
+        }
+
+        fn uvm_map_external(&self, _caller: &Caller, _m: &ExternalMapping) -> Result<u32, u32> {
+            self.mapped.fetch_add(1, Ordering::Relaxed);
+            Ok(self.handle())
+        }
+
+        fn uvm_free(&self, _caller: &Caller, _h_client: u32, h_object: u32) -> u32 {
+            // The memory made of a pool goes, and the RM's hold on its pages.
+            self.pools.lock().unwrap().retain(|(h, _)| *h != h_object);
+            NV_OK
+        }
+
+        fn uvm_pages(
+            &self,
+            _caller: &Caller,
+            _h_client: u32,
+            _h_device: u32,
+            pages: &Pages,
+            _gpu_cached: bool,
+        ) -> Result<u32, u32> {
+            let h = self.handle();
+            self.pool_size.store(pages.size, Ordering::Relaxed);
+            self.pools.lock().unwrap().push((h, pages.keep.clone()));
+            Ok(h)
         }
     }
 }
