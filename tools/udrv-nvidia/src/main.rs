@@ -1293,6 +1293,37 @@ mod tests {
         assert!(!has_flag(line, "nvidia.noauto"));
         assert!(!has_flag("nvidia.noautobootx", "nvidia.noautoboot"));
     }
+
+    /// Every member of kapi's function table the driver calls is there in
+    /// the nvkms linked here. `getFlipPendingStatus` is not: this release
+    /// leaves it NULL, and calling it was the first flip through
+    /// nvidia-modeset jumping to address 0.
+    #[test]
+    fn the_driver_calls_no_member_of_kapis_table_that_is_missing() {
+        assert_eq!(nvidia_rm_sys::nvkms::table_gaps(), Some(0));
+    }
+
+    /// The notifier the driver reads in its place: armed before a commit,
+    /// the flip is pending until the display writes that it latched, and
+    /// a slot's neighbours are not touched. In both layouts.
+    #[test]
+    fn a_flip_is_pending_from_its_commit_until_it_latches() {
+        use nvidia_rm_sys::nvkms::notifier::{self, LEGACY, NVDISPLAY, SLOT};
+        for format in [NVDISPLAY, LEGACY] {
+            let mut mem = vec![0u8; 4 * SLOT];
+            for slot in 0..4 {
+                notifier::latch(format, slot, &mut mem);
+            }
+            assert_eq!(notifier::pending(format, 2, &mem), Some(false));
+            notifier::arm(format, 2, &mut mem);
+            assert_eq!(notifier::pending(format, 2, &mem), Some(true));
+            for other in [0, 1, 3] {
+                assert_eq!(notifier::pending(format, other, &mem), Some(false));
+            }
+            notifier::latch(format, 2, &mut mem);
+            assert_eq!(notifier::pending(format, 2, &mem), Some(false));
+        }
+    }
 }
 
 /// A bring-up of the RM that kills the process (a fault in the C) must

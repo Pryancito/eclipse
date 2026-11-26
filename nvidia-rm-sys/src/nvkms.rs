@@ -62,6 +62,15 @@ extern "C" {
     ) -> i32;
     fn eclipse_kms_flip(device: *mut c_void, scanout: *mut c_void, surface: *const c_void) -> i32;
     fn eclipse_kms_flip_pending(device: *mut c_void, scanout: *const c_void) -> i32;
+    fn eclipse_kms_table_gaps() -> u32;
+    fn eclipse_kms_notifier_pending(
+        format: u32,
+        overlay: u8,
+        slot: u32,
+        base: *const c_void,
+    ) -> i32;
+    fn eclipse_kms_notifier_arm(format: u32, overlay: u8, slot: u32, base: *mut c_void);
+    fn eclipse_kms_notifier_latch(format: u32, overlay: u8, slot: u32, base: *mut c_void);
     fn eclipse_kms_set_mode(
         device: *mut c_void,
         scanout: *mut c_void,
@@ -102,6 +111,95 @@ pub fn linked() -> bool {
     #[cfg(not(nvrm_real))]
     {
         false
+    }
+}
+
+/// Which members of kapi's function table the driver calls are missing,
+/// a bit each (`vendor/eclipse_nvkms_drv.c`, `eclipse_kms_table_gaps`):
+/// one would be a jump to address 0. `Some(0)` when none is; `None` in a
+/// hosted build, which has no nvkms.
+pub fn table_gaps() -> Option<u32> {
+    #[cfg(nvrm_real)]
+    {
+        // SAFETY: fills the C side's own copy of the table, nothing else.
+        Some(unsafe { eclipse_kms_table_gaps() })
+    }
+    #[cfg(not(nvrm_real))]
+    {
+        None
+    }
+}
+
+/// The flip notifiers the driver reads in place of kapi's
+/// `getFlipPendingStatus`, which this release's table leaves out: on
+/// memory of the caller's, as the display reads and writes kapi's.
+/// `format` is an `enum NvKmsNIsoFormat`; a slot is 16 bytes. `None` in a
+/// hosted build.
+pub mod notifier {
+    #[cfg(nvrm_real)]
+    use core::ffi::c_void;
+
+    /// `NVKMS_NISO_FORMAT_FOUR_WORD_NVDISPLAY`, Volta and later.
+    pub const NVDISPLAY: u32 = 2;
+    /// `NVKMS_NISO_FORMAT_LEGACY`.
+    pub const LEGACY: u32 = 0;
+    /// The bytes of a slot (`NVKMS_KAPI_NOTIFIER_SIZE`).
+    pub const SLOT: usize = 16;
+
+    fn fits(mem: &[u8], slot: u32) {
+        assert!(
+            (slot as usize + 1) * SLOT <= mem.len(),
+            "slot {} out of the memory",
+            slot
+        );
+    }
+
+    /// Whether the flip of `slot` has yet to latch.
+    pub fn pending(format: u32, slot: u32, mem: &[u8]) -> Option<bool> {
+        fits(mem, slot);
+        #[cfg(nvrm_real)]
+        {
+            // SAFETY: the slot is inside `mem`, checked above.
+            Some(
+                unsafe {
+                    super::eclipse_kms_notifier_pending(
+                        format,
+                        0,
+                        slot,
+                        mem.as_ptr().cast::<c_void>(),
+                    )
+                } != 0,
+            )
+        }
+        #[cfg(not(nvrm_real))]
+        {
+            let _ = format;
+            None
+        }
+    }
+
+    /// What the driver does before a commit: the slot reads not begun.
+    pub fn arm(format: u32, slot: u32, mem: &mut [u8]) {
+        fits(mem, slot);
+        #[cfg(nvrm_real)]
+        // SAFETY: as above.
+        unsafe {
+            super::eclipse_kms_notifier_arm(format, 0, slot, mem.as_mut_ptr().cast::<c_void>())
+        };
+        #[cfg(not(nvrm_real))]
+        let _ = format;
+    }
+
+    /// What the display writes when the flip latches.
+    pub fn latch(format: u32, slot: u32, mem: &mut [u8]) {
+        fits(mem, slot);
+        #[cfg(nvrm_real)]
+        // SAFETY: as above.
+        unsafe {
+            super::eclipse_kms_notifier_latch(format, 0, slot, mem.as_mut_ptr().cast::<c_void>())
+        };
+        #[cfg(not(nvrm_real))]
+        let _ = format;
     }
 }
 
